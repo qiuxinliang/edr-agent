@@ -1589,20 +1589,26 @@ static int split_addr_port(const char *addr, char *ip, size_t ip_cap, int *port)
     ip[0] = '\0';
     *port = 0;
     char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s", addr);
+    size_t addr_len = strlen(addr);
+    if (addr_len >= sizeof(tmp)) return 0;
+    memcpy(tmp, addr, addr_len + 1u);
 
     char *sep = strrchr(tmp, ':');
     if (!sep || !sep[1] || !is_port_text(sep + 1)) {
         sep = strrchr(tmp, '.');
     }
     if (!sep || !sep[1] || !is_port_text(sep + 1)) {
-        snprintf(ip, ip_cap, "%s", tmp);
+        size_t ip_len = strlen(tmp);
+        if (ip_len >= ip_cap) return 0;
+        memcpy(ip, tmp, ip_len + 1u);
         strip_brackets(ip);
         return 0;
     }
 
     *sep = '\0';
-    snprintf(ip, ip_cap, "%s", tmp);
+    size_t ip_len = strlen(tmp);
+    if (ip_len >= ip_cap) return 0;
+    memcpy(ip, tmp, ip_len + 1u);
     strip_brackets(ip);
     if (strcmp(sep + 1, "*") != 0) *port = atoi(sep + 1);
     return *port > 0;

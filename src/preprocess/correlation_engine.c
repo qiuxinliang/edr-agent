@@ -773,7 +773,9 @@ static int corr_distinct_add(CorrStateSlot *s, uint32_t fp) {
 }
 
 static void corr_evidence_push(CorrStateSlot *s, uint32_t type, uint32_t pid,
-                               int64_t ns, const char *key_field) {
+                               int64_t ns, const char *key_field, size_t key_field_cap) {
+  const char *end;
+  size_t key_field_len;
   if (s->ev_count >= CORR_EVIDENCE_MAX) {
     return;
   }
@@ -781,8 +783,27 @@ static void corr_evidence_push(CorrStateSlot *s, uint32_t type, uint32_t pid,
   e->type = type;
   e->pid = pid;
   e->event_time_ns = ns;
-  if (key_field && key_field[0]) {
-    snprintf(e->key_field, sizeof(e->key_field), "%s", key_field);
+  if (!key_field || key_field_cap == 0u || key_field[0] == '\0') {
+    return;
+  }
+  end = (const char *)memchr(key_field, '\0', key_field_cap);
+  if (!end) {
+    snprintf(e->key_field, sizeof(e->key_field), "%s", "unavailable:unterminated");
+    return;
+  }
+  key_field_len = (size_t)(end - key_field);
+  if (key_field_len < sizeof(e->key_field)) {
+    memcpy(e->key_field, key_field, key_field_len + 1u);
+    return;
+  }
+  {
+    char digest[65];
+    if (edr_sha256_hex((const uint8_t *)key_field, key_field_len, digest) == 0) {
+      memcpy(e->key_field, "sha256:", sizeof("sha256:") - 1u);
+      memcpy(e->key_field + sizeof("sha256:") - 1u, digest, sizeof(digest));
+    } else {
+      snprintf(e->key_field, sizeof(e->key_field), "%s", "unavailable:oversize");
+    }
   }
 }
 
@@ -1094,7 +1115,7 @@ void edr_correlation_observe_interest(const EdrSensorInterestEvent *ev) {
       hit = slot->count;
     }
     if (is_new) {
-      corr_evidence_push(slot, (uint32_t)ev->type, ev->pid, now_ns, dim);
+      corr_evidence_push(slot, (uint32_t)ev->type, ev->pid, now_ns, dim, sizeof(dim));
     }
     if (hit >= rule->th_threshold) {
       corr_emit(rule, slot, ev->pid, ev->process_name);
@@ -1488,8 +1509,9 @@ static uint32_t corr_popcount(uint32_t v) {
 /* 对一条记录跑所有序列规则的推进/命中。仅由预处理线程调用（含排空注入 pending 时）。
  * evidence_detail 非空时作为本记录各步的证据 detail（用于注入回灌携带子技法）；否则用进程名。 */
 static void corr_run_sequences(const EdrBehaviorRecord *br, int64_t now_ns,
-                               const char *evidence_detail) {
+                               const char *evidence_detail, size_t evidence_detail_cap) {
   const char *detail = (evidence_detail && evidence_detail[0]) ? evidence_detail : br->process_name;
+  size_t detail_cap = (evidence_detail && evidence_detail[0]) ? evidence_detail_cap : sizeof(br->process_name);
   for (uint32_t r = 0; r < s_rule_count; r++) {
     CorrRule *rule = &s_rules[r];
     CorrStateSlot *slot = NULL;
@@ -1518,7 +1540,7 @@ static void corr_run_sequences(const EdrBehaviorRecord *br, int64_t now_ns,
       if (corr_seq_step_matches(rule, (int)slot->step, br)) {
         slot->last_seen_ns = now_ns;
         slot->step++;
-        corr_evidence_push(slot, (uint32_t)br->type, br->pid, now_ns, detail);
+        corr_evidence_push(slot, (uint32_t)br->type, br->pid, now_ns, detail, detail_cap);
         if (slot->step >= (uint16_t)rule->n_steps) {
           corr_emit(rule, slot, br->pid, br->process_name);
         }
@@ -1534,7 +1556,7 @@ static void corr_run_sequences(const EdrBehaviorRecord *br, int64_t now_ns,
       slot->last_seen_ns = now_ns;
       if ((slot->count & (1u << mi)) == 0u) {
         slot->count |= (1u << mi);
-        corr_evidence_push(slot, (uint32_t)br->type, br->pid, now_ns, detail);
+        corr_evidence_push(slot, (uint32_t)br->type, br->pid, now_ns, detail, detail_cap);
       }
       if (corr_popcount(slot->count) >= (uint32_t)rule->n_steps) {
         corr_emit(rule, slot, br->pid, br->process_name);
@@ -1549,7 +1571,7 @@ static void corr_drain_injections(int64_t now_ns) {
   for (uint32_t i = 0; i < CORR_INJECT_PENDING_SLOTS; i++) {
     CorrInjectPending *p = &s_inject_pending[i];
     EdrBehaviorRecord br;
-    char detail[CORR_EV_FIELD];
+    char detail[EDR_BR_STR_SHORT + sizeof("credaccess:")];
     const char *tech;
     if (p->ready == 0u) {
       continue;
@@ -1571,7 +1593,7 @@ static void corr_drain_injections(int64_t now_ns) {
       snprintf(detail, sizeof(detail), "inject:%s", tech);
     }
     p->ready = 0u; /* 先清可读位再处理，避免重复消费 */
-    corr_run_sequences(&br, br.event_time_ns, detail);
+    corr_run_sequences(&br, br.event_time_ns, detail, sizeof(detail));
     corr_inc64(&s_stat_inject_fed);
   }
 }
@@ -1588,7 +1610,7 @@ void edr_correlation_evaluate(const EdrBehaviorRecord *br) {
   }
   now_ns = br->event_time_ns > 0 ? br->event_time_ns : (int64_t)edr_monotonic_ns();
   corr_drain_injections(now_ns); /* 先并入 AVE 注入回灌，再处理本事件 */
-  corr_run_sequences(br, now_ns, NULL);
+  corr_run_sequences(br, now_ns, NULL, 0u);
 }
 
 /* AVE 裁决回灌的共用写入器：原子领取 pending 槽并发布。由 AVE 裁决线程调用。 */

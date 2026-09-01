@@ -1,22 +1,91 @@
 #include "edr/behavior_record.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/process_tree_cache.h"
+#include "cJSON.h"
 
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+#if defined(EDR_HAVE_SQLITE)
+#include <sqlite3.h>
+#endif
+
 bool edr_resource_preprocess_throttle_active(void) { return false; }
 uint64_t edr_monotonic_ns(void) { return 1000000000ull; }
+
+static int make_test_sqlite_path(char *out, size_t cap) {
+#if defined(_WIN32)
+  char temp[MAX_PATH];
+  char file[MAX_PATH];
+  DWORD temp_len = GetTempPathA((DWORD)sizeof(temp), temp);
+  if (!out || cap == 0u || !temp_len || temp_len >= sizeof(temp) ||
+      !GetTempFileNameA(temp, "edr", 0u, file)) {
+    return -1;
+  }
+  if ((size_t)snprintf(out, cap, "%s", file) >= cap) {
+    (void)remove(file);
+    return -1;
+  }
+  return 0;
+#else
+  char pattern[] = "/tmp/edr-local-evidence-XXXXXX";
+  int fd;
+  if (!out || cap == 0u || (fd = mkstemp(pattern)) < 0) return -1;
+  close(fd);
+  if ((size_t)snprintf(out, cap, "%s", pattern) >= cap) {
+    (void)remove(pattern);
+    return -1;
+  }
+  return 0;
+#endif
+}
+
+static void cleanup_test_sqlite_path(const char *db) {
+  char sidecar[640];
+  int n;
+  if (!db || !db[0]) return;
+  (void)remove(db);
+  n = snprintf(sidecar, sizeof(sidecar), "%s-wal", db);
+  if (n > 0 && (size_t)n < sizeof(sidecar)) (void)remove(sidecar);
+  n = snprintf(sidecar, sizeof(sidecar), "%s-shm", db);
+  if (n > 0 && (size_t)n < sizeof(sidecar)) (void)remove(sidecar);
+}
 
 static void init_record(EdrBehaviorRecord *r, EdrEventType t) {
   edr_behavior_record_init(r);
   r->type = t;
   r->priority = 1u;
   r->pid = 4242u;
+}
+
+/* Local-cache enrichment requires the same authoritative tuple as production
+ * P0 records.  Legacy PID-only process-tree entries are deliberately unknown
+ * and must not make these tests accidentally prove a cross-generation copy. */
+static int put_generation(uint32_t pid, uint32_t ppid, const char *name,
+                          const char *cmdline, const char *path,
+                          const char *parent_name, uint64_t start_time_ns,
+                          uint64_t start_key) {
+  return edr_pt_cache_put_generation(
+      pid, ppid, name, cmdline, path, parent_name, start_time_ns, start_key,
+      133700000000000000ULL + start_key);
+}
+
+static void set_record_generation(EdrBehaviorRecord *r, uint64_t start_key) {
+  assert(r != NULL);
+  r->process_start_key = start_key;
+  r->process_creation_filetime_100ns = 133700000000000000ULL + start_key;
 }
 
 static void test_checknetisolation_standard_low_risk_is_not_candidate(void) {
@@ -90,6 +159,11 @@ static int g_summary_count;
 static EdrBehaviorRecord g_summary_last;
 
 static void summary_capture(const EdrBehaviorRecord *r) {
+  /* The aggregate is copied before this callback. Re-entering the cache
+   * proves flush does not retain the cache mutex across caller code. */
+  char status[512];
+  edr_local_evidence_cache_status_json(status, sizeof(status));
+  assert(status[0] != '\0');
   g_summary_count++;
   if (r) {
     g_summary_last = *r;
@@ -151,7 +225,8 @@ static void test_identity_status_counter_basics(void) {
   assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   const int64_t generation_start = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec - 1000LL;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(91002u, 1u, "identity.exe", "", "", "", (uint64_t)generation_start) == 0);
+  assert(put_generation(91002u, 1u, "identity.exe", "", "", "",
+                        (uint64_t)generation_start, 0x91002u) == 0);
   EdrEvidenceCacheStatus st;
   edr_local_evidence_cache_get_status(&st);
   assert(st.identity_observations_total == 0u && st.process_slots_used <= st.process_slots_capacity);
@@ -183,13 +258,1224 @@ static void test_identity_status_counter_basics(void) {
   edr_local_evidence_cache_close();
 }
 
+#if defined(EDR_HAVE_SQLITE)
+static uint64_t sqlite_table_count(const char *path, const char *table) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  char sql[96];
+  uint64_t count = 0u;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s;", table) > 0);
+  assert(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  count = (uint64_t)sqlite3_column_int64(stmt, 0);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  return count;
+}
+
+static int sqlite_table_has_column(const char *path, const char *table, const char *column) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  char sql[128];
+  int found = 0;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table) > 0);
+  assert(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(stmt, 1);
+    if (name && strcmp(name, column) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  return found;
+}
+
+static void sqlite_exec_create_legacy_cache(const char *path) {
+  sqlite3 *db = NULL;
+  char *error = NULL;
+  const char *sql =
+      "CREATE TABLE process_cache ("
+      "endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,ppid INTEGER,"
+      "name TEXT,path TEXT,cmdline TEXT,parent_name TEXT,parent_path TEXT,"
+      "first_seen_ns INTEGER,last_seen_ns INTEGER,PRIMARY KEY(endpoint_id,pid));"
+      "CREATE TABLE p0_candidates ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_id TEXT UNIQUE,endpoint_id TEXT,tenant_id TEXT,"
+      "event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,"
+      "cmdline TEXT,file_path TEXT,dns_query TEXT,net_dst TEXT,net_dport INTEGER,reg_key_path TEXT,"
+      "reg_value_name TEXT,reg_op TEXT,detection_context TEXT,context_pre_count INTEGER,"
+      "context_post_until_ns INTEGER,created_ns INTEGER);";
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_exec(db, sql, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static void sqlite_candidate_id_for_source_event(const char *path, const char *source_event_id,
+                                                 char *out, size_t out_cap) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  unsigned matches = 0u;
+  assert(out && out_cap > 0u);
+  out[0] = '\0';
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT candidate_id,manifest_json FROM artifacts WHERE artifact_type='p0_context_bundle';",
+      -1, &stmt, NULL) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *candidate_id = (const char *)sqlite3_column_text(stmt, 0);
+    const char *manifest = (const char *)sqlite3_column_text(stmt, 1);
+    cJSON *json = cJSON_Parse(manifest ? manifest : "");
+    cJSON *source = json ? cJSON_GetObjectItemCaseSensitive(json, "source_event_id") : NULL;
+    if (cJSON_IsString(source) && source->valuestring &&
+        strcmp(source->valuestring, source_event_id) == 0) {
+      assert(candidate_id != NULL);
+      snprintf(out, out_cap, "%s", candidate_id);
+      matches++;
+    }
+    cJSON_Delete(json);
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(matches == 1u && out[0] != '\0');
+}
+
+static uint64_t sqlite_post_artifact_count(const char *path, const char *candidate_id,
+                                           const char *source_event_id) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  uint64_t count = 0u;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *manifest = (const char *)sqlite3_column_text(stmt, 0);
+    cJSON *json = cJSON_Parse(manifest ? manifest : "");
+    cJSON *source = json ? cJSON_GetObjectItemCaseSensitive(json, "source_event_id") : NULL;
+    assert(json != NULL);
+    if (cJSON_IsString(source) && source->valuestring &&
+        strcmp(source->valuestring, source_event_id) == 0) {
+      count++;
+    }
+    cJSON_Delete(json);
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  return count;
+}
+
+static uint64_t sqlite_post_artifact_total(const char *path, const char *candidate_id) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  uint64_t count = 0u;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT COUNT(*) FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  count = (uint64_t)sqlite3_column_int64(stmt, 0);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  return count;
+}
+
+static void sqlite_assert_all_artifact_manifests_parse(const char *path) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT manifest_json FROM artifacts;", -1, &stmt, NULL) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *manifest = (const char *)sqlite3_column_text(stmt, 0);
+    cJSON *json = cJSON_Parse(manifest ? manifest : "");
+    assert(json != NULL);
+    cJSON_Delete(json);
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static void sqlite_bundle_manifest_for_source_event(const char *path, const char *source_event_id,
+                                                    char *out, size_t out_cap) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  unsigned matches = 0u;
+  assert(out && out_cap > 0u);
+  out[0] = '\0';
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT manifest_json FROM artifacts WHERE artifact_type='p0_context_bundle';",
+      -1, &stmt, NULL) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *manifest = (const char *)sqlite3_column_text(stmt, 0);
+    cJSON *json = cJSON_Parse(manifest ? manifest : "");
+    cJSON *source = json ? cJSON_GetObjectItemCaseSensitive(json, "source_event_id") : NULL;
+    if (cJSON_IsString(source) && source->valuestring &&
+        strcmp(source->valuestring, source_event_id) == 0) {
+      snprintf(out, out_cap, "%s", manifest ? manifest : "");
+      matches++;
+    }
+    cJSON_Delete(json);
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(matches == 1u && out[0] != '\0');
+}
+
+static void assert_manifest_generation(const char *manifest, const char *start_key,
+                                       const char *creation, const char *source) {
+  cJSON *root = cJSON_Parse(manifest ? manifest : "");
+  cJSON *actual_start;
+  cJSON *actual_creation;
+  cJSON *actual_source;
+  assert(root != NULL);
+  actual_start = cJSON_GetObjectItemCaseSensitive(root, "process_start_key");
+  actual_creation = cJSON_GetObjectItemCaseSensitive(
+      root, "process_creation_filetime_100ns");
+  actual_source = cJSON_GetObjectItemCaseSensitive(root, "process_generation_source");
+  assert(cJSON_IsString(actual_start) && actual_start->valuestring &&
+         strcmp(actual_start->valuestring, start_key) == 0);
+  assert(cJSON_IsString(actual_creation) && actual_creation->valuestring &&
+         strcmp(actual_creation->valuestring, creation) == 0);
+  assert(cJSON_IsString(actual_source) && actual_source->valuestring &&
+         strcmp(actual_source->valuestring, source) == 0);
+  cJSON_Delete(root);
+}
+
+static void assert_manifest_source_truncation(const char *manifest,
+                                              const char *source_completeness,
+                                              const char *source_fields) {
+  cJSON *root = cJSON_Parse(manifest ? manifest : "");
+  cJSON *actual_completeness;
+  cJSON *actual_fields;
+  assert(root != NULL);
+  actual_completeness = cJSON_GetObjectItemCaseSensitive(root, "source_completeness");
+  actual_fields = cJSON_GetObjectItemCaseSensitive(root, "source_truncated_fields");
+  assert(cJSON_IsString(actual_completeness) && actual_completeness->valuestring &&
+         strcmp(actual_completeness->valuestring, source_completeness) == 0);
+  assert(cJSON_IsString(actual_fields) && actual_fields->valuestring &&
+         strcmp(actual_fields->valuestring, source_fields) == 0);
+  cJSON_Delete(root);
+}
+
+static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void) {
+  const char *db = "local_evidence_cache_commit_failure.sqlite";
+  (void)remove(db);
+  (void)remove("local_evidence_cache_commit_failure.sqlite-wal");
+  (void)remove("local_evidence_cache_commit_failure.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  struct timespec ts;
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  EdrBehaviorRecord candidate;
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 73101u;
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-commit-boundary");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "commit-boundary-event");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.0.0.55");
+  candidate.net_dport = 445u;
+  candidate.process_start_key = 0x73101u;
+  candidate.process_creation_filetime_100ns = 133700000000000001ULL;
+
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  edr_local_evidence_cache_record_behavior(&candidate);
+  EdrEvidenceCacheStatus failed;
+  edr_local_evidence_cache_get_status(&failed);
+  assert(failed.candidate_requests == 1u);
+  assert(failed.candidate_reused == 0u);
+  assert(failed.candidate_admission_attempts == 1u);
+  assert(failed.candidate_admitted == 0u);
+  assert(failed.candidate_rejected == 1u);
+  assert(failed.candidate_transaction_failures == 1u);
+  assert(failed.records_written == 0u && failed.p0_candidates_written == 0u);
+  assert(failed.artifacts_written == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 0u);
+  assert(sqlite_table_count(db, "artifacts") == 0u);
+
+  /* A failed candidate must not leave a post-context window that upgrades a
+   * following ordinary event into a persisted artifact. */
+  EdrBehaviorRecord ordinary = candidate;
+  ordinary.priority = 1u;
+  ordinary.event_time_ns += 1000000LL;
+  snprintf(ordinary.process_name, sizeof(ordinary.process_name), "telemetry.exe");
+  ordinary.net_dport = 80u;
+  edr_local_evidence_cache_record_behavior(&ordinary);
+  EdrEvidenceCacheStatus after_ordinary;
+  edr_local_evidence_cache_get_status(&after_ordinary);
+  assert(after_ordinary.artifacts_written == 0u);
+  assert(sqlite_table_count(db, "artifacts") == 0u);
+
+  /* The identical candidate is an admission retry, not a reuse, because the
+   * failed transaction was never allowed to populate the short-window index. */
+  edr_local_evidence_cache_record_behavior(&candidate);
+  EdrEvidenceCacheStatus committed;
+  edr_local_evidence_cache_get_status(&committed);
+  assert(committed.candidate_requests == 2u);
+  assert(committed.candidate_reused == 0u);
+  assert(committed.candidate_admission_attempts == 2u);
+  assert(committed.candidate_admitted == 1u);
+  assert(committed.candidate_rejected == 1u);
+  assert(committed.candidate_transaction_failures == 1u);
+  assert(committed.records_written == 1u && committed.p0_candidates_written == 1u);
+  assert(committed.artifacts_written == 1u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  assert(sqlite_table_count(db, "artifacts") == 1u);
+
+  /* This is deliberately only current-process, in-memory short-window reuse.
+   * It makes no claim that a reopened database produces a cache hit. */
+  edr_local_evidence_cache_record_behavior(&candidate);
+  EdrEvidenceCacheStatus reused;
+  edr_local_evidence_cache_get_status(&reused);
+  assert(reused.candidate_requests == 3u);
+  assert(reused.candidate_reused == 1u);
+  assert(reused.candidate_admission_attempts == 2u);
+  assert(reused.candidate_admitted == 1u);
+  assert(reused.candidate_rejected == 1u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+
+  char full_json[4096];
+  edr_local_evidence_cache_status_json(full_json, sizeof(full_json));
+  assert(strstr(full_json, "\"candidate_admission\"") != NULL);
+  assert(strstr(full_json, "\"reuse_scope\":\"local_in_process_evidence\"") != NULL);
+  assert(strstr(full_json, "\"utilization_bps\"") != NULL);
+  assert(strstr(full_json, "\"oldest\"") != NULL);
+  char full_document[4200];
+  assert(snprintf(full_document, sizeof(full_document), "{%s}", full_json) > 0);
+  cJSON *full_root = cJSON_Parse(full_document);
+  assert(full_root != NULL);
+  cJSON *full_cache = cJSON_GetObjectItemCaseSensitive(full_root, "evidence_cache");
+  assert(cJSON_IsObject(full_cache));
+  assert(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(full_cache, "candidate_admission")));
+  assert(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(full_cache, "utilization_bps")));
+  cJSON_Delete(full_root);
+  char small_json[1600];
+  edr_local_evidence_cache_status_json(small_json, sizeof(small_json));
+  assert(small_json[0] != '\0');
+  assert(small_json[strlen(small_json) - 1u] == '}');
+  char small_document[1700];
+  assert(snprintf(small_document, sizeof(small_document), "{%s}", small_json) > 0);
+  cJSON *small_root = cJSON_Parse(small_document);
+  assert(small_root != NULL);
+  cJSON *small_cache = cJSON_GetObjectItemCaseSensitive(small_root, "evidence_cache");
+  cJSON *small_status = cJSON_GetObjectItemCaseSensitive(small_cache, "status");
+  assert(cJSON_IsObject(small_cache));
+  assert(cJSON_IsString(small_status) && strcmp(small_status->valuestring, "truncated") == 0);
+  cJSON_Delete(small_root);
+
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_commit_failure.sqlite-wal");
+  (void)remove("local_evidence_cache_commit_failure.sqlite-shm");
+}
+
+/* A rule id is classification metadata, not sufficient candidate identity.
+ * Distinct source evidence under the same rule/PID must all commit; only the
+ * exact same source record in one process lifetime may use the local reuse
+ * slot. */
+static void test_candidate_reuse_requires_generation_and_full_semantics(void) {
+  const char *db = "local_evidence_cache_semantic_reuse.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord base;
+  EdrEvidenceCacheStatus st;
+  (void)remove(db);
+  (void)remove("local_evidence_cache_semantic_reuse.sqlite-wal");
+  (void)remove("local_evidence_cache_semantic_reuse.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  init_record(&base, EDR_EVENT_NET_CONNECT);
+  base.priority = 3u;
+  base.pid = 81100u;
+  base.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  base.process_start_key = 0x81100u;
+  base.process_creation_filetime_100ns = 133700000000081100ULL;
+  snprintf(base.event_id, sizeof(base.event_id), "semantic-source-event");
+  snprintf(base.endpoint_id, sizeof(base.endpoint_id), "ep-semantic-reuse");
+  snprintf(base.process_name, sizeof(base.process_name), "powershell.exe");
+  snprintf(base.image_path_canonical, sizeof(base.image_path_canonical),
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(base.process_path_hash, sizeof(base.process_path_hash),
+           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+  snprintf(base.cmdline, sizeof(base.cmdline), "powershell.exe -EncodedCommand AAAAAA");
+  snprintf(base.file_path, sizeof(base.file_path), "C:\\Temp\\candidate-a.ps1");
+  snprintf(base.net_dst, sizeof(base.net_dst), "10.10.0.5");
+  base.net_dport = 445u;
+  snprintf(base.reg_key_path, sizeof(base.reg_key_path),
+           "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+  snprintf(base.reg_value_name, sizeof(base.reg_value_name), "candidate-a");
+  snprintf(base.reg_value_data, sizeof(base.reg_value_data), "powershell -enc AAAAAA");
+  snprintf(base.script_snippet, sizeof(base.script_snippet), "Invoke-WebRequest A");
+  snprintf(base.detection_context, sizeof(base.detection_context),
+           "{\"rule_id\":\"R-SAME-RULE\",\"severity\":\"P0\"}");
+
+  edr_local_evidence_cache_record_behavior(&base);
+  EdrBehaviorRecord different_cmd = base;
+  snprintf(different_cmd.cmdline, sizeof(different_cmd.cmdline),
+           "powershell.exe -EncodedCommand BBBBBB");
+  edr_local_evidence_cache_record_behavior(&different_cmd);
+  EdrBehaviorRecord different_path = base;
+  snprintf(different_path.file_path, sizeof(different_path.file_path), "C:\\Temp\\candidate-b.ps1");
+  edr_local_evidence_cache_record_behavior(&different_path);
+  EdrBehaviorRecord different_net = base;
+  snprintf(different_net.net_dst, sizeof(different_net.net_dst), "10.10.0.6");
+  different_net.net_dport = 8443u;
+  edr_local_evidence_cache_record_behavior(&different_net);
+  EdrBehaviorRecord different_registry = base;
+  snprintf(different_registry.reg_value_data, sizeof(different_registry.reg_value_data),
+           "powershell -enc BBBBBB");
+  edr_local_evidence_cache_record_behavior(&different_registry);
+  EdrBehaviorRecord different_source_omission = base;
+  snprintf(different_source_omission.source_completeness,
+           sizeof(different_source_omission.source_completeness), "TRUNCATED");
+  snprintf(different_source_omission.source_truncated_fields,
+           sizeof(different_source_omission.source_truncated_fields),
+           "source.process_name,source.exe_hash");
+  edr_local_evidence_cache_record_behavior(&different_source_omission);
+  EdrBehaviorRecord pid_reused = base;
+  pid_reused.process_start_key = 0x81101u;
+  pid_reused.process_creation_filetime_100ns = 133700000000081101ULL;
+  edr_local_evidence_cache_record_behavior(&pid_reused);
+
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.candidate_requests == 7u && st.candidate_reused == 0u);
+  assert(st.candidate_admission_attempts == 7u && st.candidate_admitted == 7u);
+  assert(sqlite_table_count(db, "p0_candidates") == 7u);
+
+  edr_local_evidence_cache_record_behavior(&base);
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.candidate_requests == 8u && st.candidate_reused == 1u);
+  assert(st.candidate_admission_attempts == 7u && st.candidate_admitted == 7u);
+  assert(sqlite_table_count(db, "p0_candidates") == 7u);
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_semantic_reuse.sqlite-wal");
+  (void)remove("local_evidence_cache_semantic_reuse.sqlite-shm");
+}
+
+/* An upgrade preserves one current PID row, but its tuple is durable proof:
+ * a newer PID lifetime replaces every old field, an unknown record cannot
+ * overwrite it, and both RTQ candidate rows retain their own >2^63 tuples. */
+static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
+  char db[512];
+  const uint32_t pid = 96700u;
+  const uint64_t a_start = UINT64_C(18446744073709551500);
+  const uint64_t a_creation = UINT64_C(18446744073709551501);
+  const uint64_t b_start = UINT64_C(18446744073709551502);
+  const uint64_t b_creation = UINT64_C(18446744073709551503);
+  const char *a_start_text = "18446744073709551500";
+  const char *a_creation_text = "18446744073709551501";
+  const char *b_start_text = "18446744073709551502";
+  const char *b_creation_text = "18446744073709551503";
+  struct timespec ts;
+  EdrBehaviorRecord a, b, unknown;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  cleanup_test_sqlite_path(db);
+  sqlite_exec_create_legacy_cache(db);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(sqlite_table_has_column(db, "process_cache", "process_start_key"));
+  assert(sqlite_table_has_column(db, "process_cache", "process_creation_filetime_100ns"));
+  assert(sqlite_table_has_column(db, "process_cache", "process_generation_source"));
+  assert(sqlite_table_has_column(db, "process_cache", "parent_process_start_key"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "process_start_key"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "process_creation_filetime_100ns"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "process_generation_source"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "source_completeness"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "source_truncated_fields"));
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+
+  init_record(&a, EDR_EVENT_NET_CONNECT);
+  a.priority = 3u; a.pid = pid; a.event_time_ns = base - 2000000000LL;
+  a.process_start_key = a_start;
+  a.process_creation_filetime_100ns = a_creation;
+  snprintf(a.process_generation_source, sizeof(a.process_generation_source),
+           "etw_start_key_live_telemetry");
+  snprintf(a.source_completeness, sizeof(a.source_completeness), "TRUNCATED");
+  snprintf(a.source_truncated_fields, sizeof(a.source_truncated_fields),
+           "source.process_name,source.exe_hash");
+  snprintf(a.endpoint_id, sizeof(a.endpoint_id), "ep-persistent-generation");
+  snprintf(a.event_id, sizeof(a.event_id), "persistent-A");
+  snprintf(a.process_name, sizeof(a.process_name), "a.exe");
+  snprintf(a.exe_path, sizeof(a.exe_path), "C:\\A-path.exe");
+  snprintf(a.cmdline, sizeof(a.cmdline), "a.exe --old");
+  snprintf(a.parent_name, sizeof(a.parent_name), "A-parent");
+  snprintf(a.parent_path, sizeof(a.parent_path), "C:\\A-parent.exe");
+  snprintf(a.file_path, sizeof(a.file_path), "C:\\A-candidate.bin");
+  snprintf(a.net_dst, sizeof(a.net_dst), "10.96.0.1");
+  a.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&a);
+
+  b = a;
+  b.event_time_ns = base;
+  b.process_start_key = b_start;
+  b.process_creation_filetime_100ns = b_creation;
+  snprintf(b.event_id, sizeof(b.event_id), "persistent-B");
+  snprintf(b.process_name, sizeof(b.process_name), "b.exe");
+  snprintf(b.exe_path, sizeof(b.exe_path), "C:\\B-path.exe");
+  snprintf(b.cmdline, sizeof(b.cmdline), "b.exe --new");
+  snprintf(b.parent_name, sizeof(b.parent_name), "B-parent");
+  snprintf(b.parent_path, sizeof(b.parent_path), "C:\\B-parent.exe");
+  snprintf(b.file_path, sizeof(b.file_path), "C:\\B-candidate.bin");
+  snprintf(b.net_dst, sizeof(b.net_dst), "10.96.0.2");
+  edr_local_evidence_cache_record_behavior(&b);
+
+  /* This is deliberately a high-priority candidate so it reaches the SQLite
+   * upsert boundary. Its missing tuple must not replace durable B metadata. */
+  unknown = b;
+  unknown.event_time_ns = base + 1000000LL;
+  unknown.process_start_key = 0u;
+  unknown.process_creation_filetime_100ns = 0u;
+  unknown.process_generation_source[0] = '\0';
+  snprintf(unknown.event_id, sizeof(unknown.event_id), "persistent-unknown");
+  snprintf(unknown.file_path, sizeof(unknown.file_path), "C:\\unknown-candidate.bin");
+  edr_local_evidence_cache_record_behavior(&unknown);
+  edr_local_evidence_cache_close();
+
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(
+               raw, "SELECT process_start_key,process_creation_filetime_100ns,"
+                    "process_generation_source,path,cmdline,parent_name FROM process_cache "
+                    "WHERE endpoint_id=? AND pid=?;", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(st, 1, "ep-persistent-generation", -1, SQLITE_TRANSIENT) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 2, (sqlite3_int64)pid) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), b_start_text) == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 1), b_creation_text) == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 2), "etw_start_key_live_telemetry") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 3), "C:\\B-path.exe") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 4), "b.exe --new") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 5), "B-parent") == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_close(raw) == SQLITE_OK);
+  }
+  {
+    char tree[8192];
+    assert(edr_local_evidence_cache_process_tree_json(
+               pid, "ep-persistent-generation", tree, sizeof(tree)) == 0);
+    assert(strstr(tree, "B-path.exe") != NULL);
+    assert(strstr(tree, "A-path.exe") == NULL);
+    assert(strstr(tree, b_start_text) != NULL && strstr(tree, b_creation_text) != NULL);
+  }
+  {
+    char output[16384];
+    cJSON *document;
+    cJSON *rows;
+    int saw_a = 0;
+    int saw_b = 0;
+    assert(edr_local_evidence_cache_query_json("{\"limit\":10,\"time_window_s\":600}", output,
+                                               sizeof(output)) == 0);
+    document = cJSON_Parse(output);
+    assert(document != NULL);
+    rows = cJSON_GetObjectItemCaseSensitive(document, "rows");
+    assert(cJSON_IsArray(rows));
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+      cJSON *path = cJSON_GetObjectItemCaseSensitive(row, "file_path");
+      cJSON *start = cJSON_GetObjectItemCaseSensitive(row, "process_start_key");
+      cJSON *creation = cJSON_GetObjectItemCaseSensitive(
+          row, "process_creation_filetime_100ns");
+      cJSON *source_completeness = cJSON_GetObjectItemCaseSensitive(
+          row, "source_completeness");
+      cJSON *source_fields = cJSON_GetObjectItemCaseSensitive(
+          row, "source_truncated_fields");
+      if (!cJSON_IsString(path) || !path->valuestring) continue;
+      if (strcmp(path->valuestring, "C:\\A-candidate.bin") == 0) {
+        assert(cJSON_IsString(start) && cJSON_IsString(creation));
+        assert(strcmp(start->valuestring, a_start_text) == 0);
+        assert(strcmp(creation->valuestring, a_creation_text) == 0);
+        assert(cJSON_IsString(source_completeness) &&
+               strcmp(source_completeness->valuestring, "TRUNCATED") == 0);
+        assert(cJSON_IsString(source_fields) &&
+               strcmp(source_fields->valuestring,
+                      "source.process_name,source.exe_hash") == 0);
+        saw_a = 1;
+      } else if (strcmp(path->valuestring, "C:\\B-candidate.bin") == 0) {
+        assert(cJSON_IsString(start) && cJSON_IsString(creation));
+        assert(strcmp(start->valuestring, b_start_text) == 0);
+        assert(strcmp(creation->valuestring, b_creation_text) == 0);
+        assert(cJSON_IsString(source_completeness) &&
+               strcmp(source_completeness->valuestring, "TRUNCATED") == 0);
+        assert(cJSON_IsString(source_fields) &&
+               strcmp(source_fields->valuestring,
+                      "source.process_name,source.exe_hash") == 0);
+        saw_b = 1;
+      }
+    }
+    assert(saw_a && saw_b);
+    cJSON_Delete(document);
+  }
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+}
+
+/* A source record without a raw tuple may be bound by the event-time process
+ * tree snapshot.  Persist that resolved tuple rather than serializing zeroes
+ * from the original record, so a reopened RTQ query and both manifest forms
+ * prove exactly which process lifetime supplied the evidence. */
+static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) {
+  const char *db = "local_evidence_cache_snapshot_generation.sqlite";
+  const uint32_t pid = 97301u;
+  const uint64_t start_key = UINT64_C(0x97301);
+  const uint64_t creation = UINT64_C(133700000000062721);
+  const char *start_key_text = "619265";
+  const char *creation_text = "133700000000062721";
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  EdrBehaviorRecord post;
+  char candidate_id[200];
+  char bundle[16384];
+  (void)remove(db);
+  (void)remove("local_evidence_cache_snapshot_generation.sqlite-wal");
+  (void)remove("local_evidence_cache_snapshot_generation.sqlite-shm");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(
+             pid, 1u, "snapshot.exe", "snapshot --p0", "C:\\snapshot.exe", "parent.exe",
+             (uint64_t)(base - 2000000000LL), start_key, creation) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = pid;
+  candidate.event_time_ns = base;
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-snapshot-generation");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "snapshot-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "snapshot.exe");
+  snprintf(candidate.exe_path, sizeof(candidate.exe_path), "C:\\snapshot.exe");
+  snprintf(candidate.file_path, sizeof(candidate.file_path), "C:\\snapshot-candidate.bin");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.97.30.1");
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness), "TRUNCATED");
+  snprintf(candidate.source_truncated_fields, sizeof(candidate.source_truncated_fields),
+           "source.process_name,source.exe_hash,source.parent_path");
+  candidate.net_dport = 445u;
+  /* Deliberately no raw tuple/source: only the historical snapshot is
+   * authoritative for this event-time association. */
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  post = candidate;
+  post.priority = 1u;
+  post.type = EDR_EVENT_FILE_WRITE;
+  post.event_time_ns = base + 1000000LL;
+  snprintf(post.event_id, sizeof(post.event_id), "snapshot-post");
+  snprintf(post.file_path, sizeof(post.file_path), "C:\\snapshot-post.bin");
+  post.net_dport = 0u;
+  edr_local_evidence_cache_record_behavior(&post);
+  edr_local_evidence_cache_close();
+
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(
+               raw, "SELECT process_start_key,process_creation_filetime_100ns,"
+                    "process_generation_source,source_completeness,source_truncated_fields "
+                    "FROM p0_candidates WHERE event_time_ns=?;",
+               -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, (sqlite3_int64)base) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), start_key_text) == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 1), creation_text) == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 2), "process_tree_snapshot") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 3), "TRUNCATED") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 4),
+                  "source.process_name,source.exe_hash,source.parent_path") == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_close(raw) == SQLITE_OK);
+  }
+  sqlite_candidate_id_for_source_event(db, "snapshot-candidate", candidate_id,
+                                       sizeof(candidate_id));
+  sqlite_bundle_manifest_for_source_event(db, "snapshot-candidate", bundle, sizeof(bundle));
+  assert_manifest_generation(bundle, start_key_text, creation_text, "process_tree_snapshot");
+  assert_manifest_source_truncation(bundle, "TRUNCATED",
+                                    "source.process_name,source.exe_hash,source.parent_path");
+  assert(sqlite_post_artifact_count(db, candidate_id, "snapshot-post") == 1u);
+  {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(
+               raw, "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context';",
+               -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert_manifest_generation((const char *)sqlite3_column_text(st, 0), start_key_text,
+                               creation_text, "process_tree_snapshot");
+    assert_manifest_source_truncation((const char *)sqlite3_column_text(st, 0), "TRUNCATED",
+                                      "source.process_name,source.exe_hash,source.parent_path");
+    sqlite3_finalize(st);
+    assert(sqlite3_close(raw) == SQLITE_OK);
+  }
+  {
+    char output[8192];
+    cJSON *document;
+    cJSON *rows;
+    int saw_candidate = 0;
+    assert(edr_local_evidence_cache_query_json("{\"limit\":10,\"time_window_s\":600}",
+                                               output, sizeof(output)) == 0);
+    document = cJSON_Parse(output);
+    assert(document != NULL);
+    rows = cJSON_GetObjectItemCaseSensitive(document, "rows");
+    assert(cJSON_IsArray(rows));
+    cJSON *row = NULL;
+    cJSON_ArrayForEach(row, rows) {
+      cJSON *path = cJSON_GetObjectItemCaseSensitive(row, "file_path");
+      cJSON *start = cJSON_GetObjectItemCaseSensitive(row, "process_start_key");
+      cJSON *filetime = cJSON_GetObjectItemCaseSensitive(
+          row, "process_creation_filetime_100ns");
+      cJSON *source = cJSON_GetObjectItemCaseSensitive(row, "process_generation_source");
+      cJSON *source_completeness = cJSON_GetObjectItemCaseSensitive(
+          row, "source_completeness");
+      cJSON *source_fields = cJSON_GetObjectItemCaseSensitive(
+          row, "source_truncated_fields");
+      if (!cJSON_IsString(path) || !path->valuestring ||
+          strcmp(path->valuestring, "C:\\snapshot-candidate.bin") != 0) {
+        continue;
+      }
+      assert(cJSON_IsString(start) && start->valuestring &&
+             strcmp(start->valuestring, start_key_text) == 0);
+      assert(cJSON_IsString(filetime) && filetime->valuestring &&
+             strcmp(filetime->valuestring, creation_text) == 0);
+      assert(cJSON_IsString(source) && source->valuestring &&
+             strcmp(source->valuestring, "process_tree_snapshot") == 0);
+      assert(cJSON_IsString(source_completeness) && source_completeness->valuestring &&
+             strcmp(source_completeness->valuestring, "TRUNCATED") == 0);
+      assert(cJSON_IsString(source_fields) && source_fields->valuestring &&
+             strcmp(source_fields->valuestring,
+                    "source.process_name,source.exe_hash,source.parent_path") == 0);
+      saw_candidate = 1;
+    }
+    assert(saw_candidate);
+    cJSON_Delete(document);
+  }
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_snapshot_generation.sqlite-wal");
+  (void)remove("local_evidence_cache_snapshot_generation.sqlite-shm");
+}
+
+/* PID reuse must never attach B evidence to A's live window.  The same test
+ * also proves two distinct B candidates retain separate post-context windows,
+ * a semantic fallback artifact id does not collide at same timestamp/type,
+ * and a late-old ring arrival cannot hide a recent pre-context record. */
+static void test_context_generation_multicandidate_and_artifact_identity(void) {
+  const char *db = "local_evidence_cache_generation_context.sqlite";
+  const uint32_t pid = 96101u;
+  const uint64_t generation_a = 0x96101u;
+  const uint64_t generation_b = 0x96102u;
+  struct timespec ts;
+  EdrBehaviorRecord a, b, b2, event;
+  char candidate_a[200], candidate_b[200], candidate_b2[200], bundle[4096];
+  (void)remove(db);
+  (void)remove("local_evidence_cache_generation_context.sqlite-wal");
+  (void)remove("local_evidence_cache_generation_context.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(pid, 4u, "a.exe", "a", "C:\\A.exe", "parent-a",
+                        (uint64_t)(base - 2000000000LL), generation_a) == 0);
+
+  init_record(&a, EDR_EVENT_NET_CONNECT);
+  a.priority = 3u; a.pid = pid; a.event_time_ns = base;
+  set_record_generation(&a, generation_a);
+  snprintf(a.endpoint_id, sizeof(a.endpoint_id), "ep-generation-context");
+  snprintf(a.event_id, sizeof(a.event_id), "candidate-A");
+  snprintf(a.process_name, sizeof(a.process_name), "a.exe");
+  snprintf(a.net_dst, sizeof(a.net_dst), "10.0.0.1");
+  a.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&a);
+  assert(edr_pt_cache_mark_exit_generation(pid, generation_a,
+                                            (uint64_t)(base + 1000000000LL)) == 0);
+  assert(put_generation(pid, 4u, "b.exe", "b", "C:\\B.exe", "parent-b",
+                        (uint64_t)(base + 2000000000LL), generation_b) == 0);
+
+  b = a;
+  b.event_time_ns = base + 3000000000LL;
+  set_record_generation(&b, generation_b);
+  snprintf(b.event_id, sizeof(b.event_id), "candidate-B");
+  snprintf(b.process_name, sizeof(b.process_name), "b.exe");
+  snprintf(b.net_dst, sizeof(b.net_dst), "10.0.0.2");
+  edr_local_evidence_cache_record_behavior(&b);
+  b2 = b;
+  b2.event_time_ns = base + 4000000000LL;
+  snprintf(b2.event_id, sizeof(b2.event_id), "candidate-B2");
+  snprintf(b2.net_dst, sizeof(b2.net_dst), "10.0.0.3");
+  edr_local_evidence_cache_record_behavior(&b2);
+
+  sqlite_candidate_id_for_source_event(db, "candidate-A", candidate_a, sizeof(candidate_a));
+  sqlite_candidate_id_for_source_event(db, "candidate-B", candidate_b, sizeof(candidate_b));
+  sqlite_candidate_id_for_source_event(db, "candidate-B2", candidate_b2, sizeof(candidate_b2));
+
+  event = b;
+  event.priority = 1u; event.event_time_ns = base + 5000000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "B-file");
+  event.type = EDR_EVENT_FILE_WRITE;
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\B-file.dll");
+  event.net_dport = 0u;
+  edr_local_evidence_cache_record_behavior(&event);
+  event.event_time_ns++;
+  snprintf(event.event_id, sizeof(event.event_id), "B-net");
+  event.type = EDR_EVENT_NET_CONNECT;
+  event.file_path[0] = '\0';
+  snprintf(event.net_dst, sizeof(event.net_dst), "198.51.100.10");
+  event.net_dport = 80u;
+  edr_local_evidence_cache_record_behavior(&event);
+  event.event_time_ns++;
+  snprintf(event.event_id, sizeof(event.event_id), "B-registry");
+  event.type = EDR_EVENT_REG_SET_VALUE;
+  snprintf(event.reg_key_path, sizeof(event.reg_key_path), "HKCU\\Software\\B");
+  snprintf(event.reg_value_name, sizeof(event.reg_value_name), "ValueB");
+  snprintf(event.reg_op, sizeof(event.reg_op), "set");
+  event.net_dst[0] = '\0'; event.net_dport = 0u;
+  edr_local_evidence_cache_record_behavior(&event);
+  assert(sqlite_post_artifact_count(db, candidate_a, "B-file") == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_a, "B-net") == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_a, "B-registry") == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_b, "B-file") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b2, "B-file") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b, "B-net") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b2, "B-registry") == 1u);
+
+  /* No source id exercises the existing length-delimited semantic digest.
+   * Same timestamp/type/PID but distinct paths must retain two rows. */
+  event = b;
+  event.priority = 1u; event.type = EDR_EVENT_FILE_WRITE;
+  event.event_time_ns = base + 6000000000LL;
+  event.event_id[0] = '\0'; event.net_dst[0] = '\0'; event.net_dport = 0u;
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\semantic-one.dll");
+  edr_local_evidence_cache_record_behavior(&event);
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\semantic-two.dll");
+  edr_local_evidence_cache_record_behavior(&event);
+  assert(sqlite_post_artifact_total(db, candidate_b) == 6u);
+  assert(sqlite_post_artifact_total(db, candidate_b2) == 5u);
+
+  /* Arrival order X then late-old Y must not cause Y to stop a full bounded
+   * pre-context scan before it reaches recent X. */
+  event = b;
+  event.priority = 1u; event.type = EDR_EVENT_FILE_WRITE;
+  event.event_time_ns = base + 7000000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "recent-X");
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\recent-X.bin");
+  edr_local_evidence_cache_record_behavior(&event);
+  event.event_time_ns = base - 120000000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "late-old-Y");
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\late-old-Y.bin");
+  edr_local_evidence_cache_record_behavior(&event);
+  /* A delayed event from before B/B2's creation is not post-context merely
+   * because it shares their generation and arrives late. */
+  assert(sqlite_post_artifact_count(db, candidate_b, "late-old-Y") == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_b2, "late-old-Y") == 0u);
+  /* Arrival before B3 with a future event timestamp must not make it pre
+   * context for B3; it remains a valid post event for already-live B/B2. */
+  event = b;
+  event.priority = 1u; event.type = EDR_EVENT_FILE_WRITE;
+  event.event_time_ns = base + 9000000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "future-Z");
+  snprintf(event.file_path, sizeof(event.file_path), "C:\\Temp\\future-Z.bin");
+  event.net_dst[0] = '\0'; event.net_dport = 0u;
+  edr_local_evidence_cache_record_behavior(&event);
+  assert(sqlite_post_artifact_count(db, candidate_b, "future-Z") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b2, "future-Z") == 1u);
+  event = b;
+  event.priority = 3u; event.event_time_ns = base + 8000000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "candidate-B3");
+  snprintf(event.net_dst, sizeof(event.net_dst), "10.0.0.4");
+  event.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&event);
+  sqlite_bundle_manifest_for_source_event(db, "candidate-B3", bundle, sizeof(bundle));
+  assert(strstr(bundle, "recent-X.bin") != NULL);
+  assert(strstr(bundle, "late-old-Y.bin") == NULL);
+  assert(strstr(bundle, "future-Z.bin") == NULL);
+  sqlite_assert_all_artifact_manifests_parse(db);
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_generation_context.sqlite-wal");
+  (void)remove("local_evidence_cache_generation_context.sqlite-shm");
+}
+
+/* cJSON owns quoting/structure.  The fixed module bound covers the maximum
+ * escaped record fields; only truly invalid UTF-8 is rejected pre-commit. */
+static void test_context_manifest_utf8_backslash_and_invalid_rejection(void) {
+  const char *db = "local_evidence_cache_manifest_contract.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate, event;
+  EdrEvidenceCacheStatus before, after;
+  char candidate_id[200];
+  (void)remove(db);
+  (void)remove("local_evidence_cache_manifest_contract.sqlite-wal");
+  (void)remove("local_evidence_cache_manifest_contract.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u; candidate.pid = 96150u; candidate.event_time_ns = base;
+  set_record_generation(&candidate, 0x96150u);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-manifest-contract");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "manifest-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "json.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.0.0.50");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_candidate_id_for_source_event(db, "manifest-candidate", candidate_id,
+                                       sizeof(candidate_id));
+
+  event = candidate;
+  event.priority = 1u; event.type = EDR_EVENT_FILE_WRITE;
+  event.event_time_ns = base + 1000000LL;
+  snprintf(event.event_id, sizeof(event.event_id), "manifest-valid-utf8");
+  event.net_dst[0] = '\0'; event.net_dport = 0u;
+  size_t off = 0u;
+  while (off + 4u < 1800u) {
+    event.file_path[off++] = '\\';
+    event.file_path[off++] = 'x';
+  }
+  snprintf(event.file_path + off, sizeof(event.file_path) - off,
+           "-utf8-\xE6\xB5\x8B\xE8\xAF\x95");
+  snprintf(event.dns_query, sizeof(event.dns_query), "example-\xE6\xB5\x8B\xE8\xAF\x95.invalid");
+  snprintf(event.reg_key_path, sizeof(event.reg_key_path), "HKCU\\Software\\\\\\valid-utf8");
+  edr_local_evidence_cache_record_behavior(&event);
+  assert(sqlite_post_artifact_count(db, candidate_id, "manifest-valid-utf8") == 1u);
+  sqlite_assert_all_artifact_manifests_parse(db);
+
+  edr_local_evidence_cache_get_status(&before);
+  event.event_time_ns++;
+  snprintf(event.event_id, sizeof(event.event_id), "manifest-max-valid");
+  memset(event.file_path, '\\', sizeof(event.file_path) - 1u);
+  event.file_path[sizeof(event.file_path) - 1u] = '\0';
+  memset(event.dns_query, '\\', sizeof(event.dns_query) - 1u);
+  event.dns_query[sizeof(event.dns_query) - 1u] = '\0';
+  memset(event.reg_key_path, '\\', sizeof(event.reg_key_path) - 1u);
+  event.reg_key_path[sizeof(event.reg_key_path) - 1u] = '\0';
+  memset(event.reg_value_name, '\\', sizeof(event.reg_value_name) - 1u);
+  event.reg_value_name[sizeof(event.reg_value_name) - 1u] = '\0';
+  edr_local_evidence_cache_record_behavior(&event);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.manifest_rejections == before.manifest_rejections);
+  assert(sqlite_post_artifact_count(db, candidate_id, "manifest-max-valid") == 1u);
+  sqlite_assert_all_artifact_manifests_parse(db);
+
+  event.event_time_ns++;
+  snprintf(event.event_id, sizeof(event.event_id), "manifest-invalid-utf8");
+  snprintf(event.file_path, sizeof(event.file_path), "bad-\xC3\x28");
+  event.dns_query[0] = '\0';
+  event.reg_key_path[0] = '\0';
+  event.reg_value_name[0] = '\0';
+  edr_local_evidence_cache_record_behavior(&event);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.manifest_rejections == before.manifest_rejections + 1u);
+  assert(after.records_dropped == before.records_dropped + 1u);
+  assert(sqlite_post_artifact_count(db, candidate_id, "manifest-invalid-utf8") == 0u);
+  sqlite_assert_all_artifact_manifests_parse(db);
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_manifest_contract.sqlite-wal");
+  (void)remove("local_evidence_cache_manifest_contract.sqlite-shm");
+}
+
+static void fill_max_backslash_utf8(char *dst, size_t cap) {
+  assert(dst != NULL && cap >= 5u);
+  dst[0] = (char)0xe6;
+  dst[1] = (char)0xb5;
+  dst[2] = (char)0x8b; /* U+6D4B, valid three-byte UTF-8. */
+  memset(dst + 3u, '\\', cap - 4u);
+  dst[cap - 1u] = '\0';
+}
+
+static void fill_max_backslash_utf8_tagged(char *dst, size_t cap, unsigned tag) {
+  int prefix;
+  assert(dst != NULL && cap >= 32u);
+  prefix = snprintf(dst, cap, "\xE6\xB5\x8B\\context-%02u\\", tag);
+  assert(prefix > 0 && (size_t)prefix + 1u < cap);
+  memset(dst + (size_t)prefix, '\\', cap - (size_t)prefix - 1u);
+  dst[cap - 1u] = '\0';
+}
+
+/* The manifest envelope is sized for every selectable context slot, not only
+ * one maximum event.  All 32 pre-context entries include maximum source text
+ * with both heavy escaping and UTF-8, and the committed SQLite JSON remains
+ * parseable and complete. */
+static void test_context_manifest_32_maximum_ring_items_persist(void) {
+  const char *db = "local_evidence_cache_manifest_32.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord pre, candidate;
+  char bundle[131072];
+  size_t source_fields_len = 0u;
+  (void)remove(db);
+  (void)remove("local_evidence_cache_manifest_32.sqlite-wal");
+  (void)remove("local_evidence_cache_manifest_32.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(96150u, 0u, "parent-32.exe", "", "", "",
+                        (uint64_t)(base - 2000000000LL), 0x96150u) == 0);
+  init_record(&pre, EDR_EVENT_FILE_WRITE);
+  pre.priority = 1u; pre.pid = 96151u; pre.ppid = 96150u;
+  set_record_generation(&pre, 0x96151u);
+  fill_max_backslash_utf8(pre.endpoint_id, sizeof(pre.endpoint_id));
+  fill_max_backslash_utf8(pre.process_name, sizeof(pre.process_name));
+  fill_max_backslash_utf8(pre.process_generation_source,
+                          sizeof(pre.process_generation_source));
+  fill_max_backslash_utf8(pre.net_dst, sizeof(pre.net_dst));
+  fill_max_backslash_utf8(pre.file_path, sizeof(pre.file_path));
+  snprintf(pre.source_completeness, sizeof(pre.source_completeness), "TRUNCATED");
+  for (unsigned i = 0u; i < 32u; ++i) {
+    const int written = snprintf(pre.source_truncated_fields + source_fields_len,
+                                 sizeof(pre.source_truncated_fields) - source_fields_len,
+                                 "%ssource.x%03u", source_fields_len ? "," : "", i);
+    assert(written > 0 &&
+           (size_t)written < sizeof(pre.source_truncated_fields) - source_fields_len);
+    source_fields_len += (size_t)written;
+  }
+  assert(source_fields_len == sizeof(pre.source_truncated_fields) - 1u);
+  for (unsigned i = 0u; i < 32u; ++i) {
+    pre.event_time_ns = base - (int64_t)(32u - i) * 1000000LL;
+    snprintf(pre.event_id, sizeof(pre.event_id), "manifest-32-pre-%u", i);
+    /* Vary the parent-prefix key so ordinary-event aggregation cannot hide
+     * 31 input slots before the context-ring contract is exercised. */
+    fill_max_backslash_utf8_tagged(pre.file_path, sizeof(pre.file_path), i);
+    edr_local_evidence_cache_record_behavior(&pre);
+  }
+  candidate = pre;
+  candidate.type = EDR_EVENT_NET_CONNECT;
+  candidate.priority = 3u;
+  candidate.event_time_ns = base;
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "manifest-32-candidate");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.96.15.1");
+  candidate.net_dport = 445u;
+  fill_max_backslash_utf8(candidate.file_path, sizeof(candidate.file_path));
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_bundle_manifest_for_source_event(db, "manifest-32-candidate", bundle, sizeof(bundle));
+  assert(strlen(bundle) > 40000u);
+  {
+    cJSON *root = cJSON_Parse(bundle);
+    cJSON *context;
+    assert(root != NULL);
+    context = cJSON_GetObjectItemCaseSensitive(root, "context");
+    assert(cJSON_IsArray(context) && cJSON_GetArraySize(context) == 32);
+    for (int i = 0; i < cJSON_GetArraySize(context); ++i) {
+      cJSON *item = cJSON_GetArrayItem(context, i);
+      cJSON *path = cJSON_GetObjectItemCaseSensitive(item, "file_path");
+      cJSON *source_completeness = cJSON_GetObjectItemCaseSensitive(
+          item, "source_completeness");
+      cJSON *source_fields = cJSON_GetObjectItemCaseSensitive(
+          item, "source_truncated_fields");
+      assert(cJSON_IsString(path) && path->valuestring);
+      assert(strstr(path->valuestring, "\xE6\xB5\x8B") != NULL);
+      assert(strchr(path->valuestring, '\\') != NULL);
+      assert(cJSON_IsString(source_completeness) && source_completeness->valuestring &&
+             strcmp(source_completeness->valuestring, "TRUNCATED") == 0);
+      assert(cJSON_IsString(source_fields) && source_fields->valuestring &&
+             strcmp(source_fields->valuestring, pre.source_truncated_fields) == 0);
+    }
+    cJSON_Delete(root);
+  }
+  sqlite_assert_all_artifact_manifests_parse(db);
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_manifest_32.sqlite-wal");
+  (void)remove("local_evidence_cache_manifest_32.sqlite-shm");
+}
+
+#if !defined(_WIN32)
+typedef struct {
+  const char *path;
+} EvidenceCacheConcurrencyContext;
+
+static void *evidence_cache_concurrent_writer(void *opaque) {
+  EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
+  (void)ctx;
+  for (unsigned i = 0u; i < 80u; ++i) {
+    EdrBehaviorRecord r;
+    init_record(&r, EDR_EVENT_NET_CONNECT);
+    r.priority = 3u;
+    r.pid = 88000u + (i % 4u);
+    r.event_time_ns = 1779340000000000000LL + (int64_t)i * 1000000LL;
+    r.process_start_key = 0x88000u + (uint64_t)i;
+    r.process_creation_filetime_100ns = 133700000000088000ULL + (uint64_t)i;
+    snprintf(r.event_id, sizeof(r.event_id), "concurrent-event-%u", i);
+    snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-concurrent");
+    snprintf(r.process_name, sizeof(r.process_name), "concurrent.exe");
+    snprintf(r.image_path_canonical, sizeof(r.image_path_canonical), "C:\\Temp\\concurrent.exe");
+    snprintf(r.cmdline, sizeof(r.cmdline), "concurrent.exe --%u", i);
+    snprintf(r.file_path, sizeof(r.file_path), "C:\\Temp\\concurrent-%u.bin", i);
+    snprintf(r.exe_hash, sizeof(r.exe_hash),
+             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    snprintf(r.net_dst, sizeof(r.net_dst), "10.20.0.%u", i % 200u + 1u);
+    r.net_dport = 445u;
+    snprintf(r.detection_context, sizeof(r.detection_context),
+             "{\"rule_id\":\"R-CONCURRENT\",\"sequence\":%u}", i);
+    edr_local_evidence_cache_observe_process(&r);
+    edr_local_evidence_cache_enrich_behavior(&r);
+    edr_local_evidence_cache_record_behavior(&r);
+    edr_local_evidence_cache_poll_maintenance();
+  }
+  return NULL;
+}
+
+static void *evidence_cache_concurrent_reader(void *opaque) {
+  EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
+  (void)ctx;
+  for (unsigned i = 0u; i < 80u; ++i) {
+    char status[8192], query[8192], rows[4096], tree[4096];
+    uint32_t returned = 0u, scanned = 0u;
+    int truncated = 0;
+    edr_local_evidence_cache_status_json(status, sizeof(status));
+    assert(status[0] != '\0');
+    assert(edr_local_evidence_cache_query_json("{\"limit\":10,\"time_window_s\":600}",
+                                               query, sizeof(query)) == 0);
+    assert(edr_local_evidence_cache_query_file_hash_json(
+               "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "", ".bin", 10u, rows, sizeof(rows), &returned, &scanned, &truncated) == 0);
+    (void)edr_local_evidence_cache_process_tree_json(88000u, "ep-concurrent", tree,
+                                                      sizeof(tree));
+  }
+  return NULL;
+}
+
+static void *evidence_cache_concurrent_lifecycle(void *opaque) {
+  EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
+  for (unsigned i = 0u; i < 20u; ++i) {
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(ctx->path, 8u, 24u) == 0);
+  }
+  return NULL;
+}
+
+/* Preprocess writers, main-thread health/RTQ readers, and close/reopen must
+ * serialize one bounded cache state and one SQLite handle. This is a real
+ * lifecycle race test, not an external SQLite connection test. */
+static void test_concurrent_cache_lifecycle_snapshot_and_queries(void) {
+  const char *db = "local_evidence_cache_concurrent.sqlite";
+  EvidenceCacheConcurrencyContext ctx = {db};
+  pthread_t writer, reader, lifecycle;
+  (void)remove(db);
+  (void)remove("local_evidence_cache_concurrent.sqlite-wal");
+  (void)remove("local_evidence_cache_concurrent.sqlite-shm");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_pt_cache_init();
+  assert(pthread_create(&writer, NULL, evidence_cache_concurrent_writer, &ctx) == 0);
+  assert(pthread_create(&reader, NULL, evidence_cache_concurrent_reader, &ctx) == 0);
+  assert(pthread_create(&lifecycle, NULL, evidence_cache_concurrent_lifecycle, &ctx) == 0);
+  assert(pthread_join(writer, NULL) == 0);
+  assert(pthread_join(reader, NULL) == 0);
+  assert(pthread_join(lifecycle, NULL) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_concurrent.sqlite-wal");
+  (void)remove("local_evidence_cache_concurrent.sqlite-shm");
+}
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  unsigned ready;
+  int go;
+} EvidenceCacheMutexTimingContext;
+
+static void *evidence_cache_mutex_timing_worker(void *opaque) {
+  EvidenceCacheMutexTimingContext *ctx = (EvidenceCacheMutexTimingContext *)opaque;
+  pthread_mutex_lock(&ctx->mutex);
+  ctx->ready++;
+  pthread_cond_broadcast(&ctx->cond);
+  while (!ctx->go) pthread_cond_wait(&ctx->cond, &ctx->mutex);
+  pthread_mutex_unlock(&ctx->mutex);
+  for (unsigned i = 0u; i < 8u; ++i) {
+    edr_local_evidence_cache_test_hold_mutex(1u);
+  }
+  return NULL;
+}
+
+/* Fixed log2 telemetry must distinguish a genuine zero-sample startup from
+ * saturated high values, and concurrent writers must accumulate without a
+ * second lock or a racy health read. */
+static void test_mutex_lock_observability_contract(void) {
+  EdrEvidenceCacheStatus st;
+  char fragment[8192];
+  char document[8300];
+  cJSON *root;
+  cJSON *cache;
+  cJSON *lock;
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+
+  edr_local_evidence_cache_test_reset_mutex_timing();
+  edr_local_evidence_cache_status_json(fragment, sizeof(fragment));
+  assert(snprintf(document, sizeof(document), "{%s}", fragment) > 0);
+  root = cJSON_Parse(document);
+  assert(root != NULL);
+  cache = cJSON_GetObjectItemCaseSensitive(root, "evidence_cache");
+  lock = cJSON_GetObjectItemCaseSensitive(cache, "lock_observability");
+  assert(cJSON_IsObject(lock));
+  assert(cJSON_GetObjectItemCaseSensitive(lock, "samples")->valuedouble == 0.0);
+  assert(cJSON_GetObjectItemCaseSensitive(lock, "wait_p95_ns")->valuedouble == 0.0);
+  assert(cJSON_GetObjectItemCaseSensitive(lock, "hold_p99_ns")->valuedouble == 0.0);
+  cJSON_Delete(root);
+
+  edr_local_evidence_cache_test_reset_mutex_timing();
+  edr_local_evidence_cache_test_record_mutex_timing(UINT64_MAX, UINT64_MAX);
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.mutex_lock_samples == 1u);
+  assert(st.mutex_wait_total_ns == UINT64_MAX && st.mutex_hold_total_ns == UINT64_MAX);
+  assert(st.mutex_wait_max_ns == UINT64_MAX && st.mutex_hold_max_ns == UINT64_MAX);
+  assert(st.mutex_wait_p95_ns == UINT64_MAX && st.mutex_wait_p99_ns == UINT64_MAX);
+  assert(st.mutex_hold_p95_ns == UINT64_MAX && st.mutex_hold_p99_ns == UINT64_MAX);
+  edr_local_evidence_cache_status_json(fragment, sizeof(fragment));
+  assert(strstr(fragment, "\"lock_observability\"") != NULL);
+  assert(strstr(fragment, "\"wait_max_ns\":18446744073709551615") != NULL);
+
+  edr_local_evidence_cache_test_reset_mutex_timing();
+  EvidenceCacheMutexTimingContext ctx = {
+      PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0u, 0};
+  pthread_t workers[4];
+  for (size_t i = 0u; i < sizeof(workers) / sizeof(workers[0]); ++i) {
+    assert(pthread_create(&workers[i], NULL, evidence_cache_mutex_timing_worker, &ctx) == 0);
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  while (ctx.ready < sizeof(workers) / sizeof(workers[0])) {
+    pthread_cond_wait(&ctx.cond, &ctx.mutex);
+  }
+  ctx.go = 1;
+  pthread_cond_broadcast(&ctx.cond);
+  pthread_mutex_unlock(&ctx.mutex);
+  for (size_t i = 0u; i < sizeof(workers) / sizeof(workers[0]); ++i) {
+    assert(pthread_join(workers[i], NULL) == 0);
+  }
+  assert(pthread_cond_destroy(&ctx.cond) == 0);
+  assert(pthread_mutex_destroy(&ctx.mutex) == 0);
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.mutex_lock_samples == 32u);
+  assert(st.mutex_hold_total_ns > 0u && st.mutex_hold_max_ns > 0u);
+  assert(st.mutex_wait_total_ns > 0u && st.mutex_wait_max_ns > 0u);
+  edr_local_evidence_cache_close();
+}
+#endif
+#endif
+
 static void test_identity_generation_match_delta(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts;
   assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(92001u, 1u, "x.exe", "x", "x", "p", now - 1000u) == 0);
+  assert(put_generation(92001u, 1u, "x.exe", "x", "x", "p", now - 1000u,
+                        0x92001u) == 0);
   EdrBehaviorRecord observed;
   init_record(&observed, EDR_EVENT_PROCESS_CREATE);
   observed.pid = 92001u; observed.event_time_ns = (int64_t)now;
@@ -214,7 +1500,8 @@ static void test_sid_only_identity_enriches_same_generation(void) {
   struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(92501u, 1u, "sid.exe", "sid", "sid", "p", now - 1000u) == 0);
+  assert(put_generation(92501u, 1u, "sid.exe", "sid", "sid", "p", now - 1000u,
+                        0x92501u) == 0);
   EdrBehaviorRecord observed; init_record(&observed, EDR_EVENT_PROCESS_CREATE);
   observed.pid = 92501u; observed.event_time_ns = (int64_t)now;
   snprintf(observed.user_sid, sizeof(observed.user_sid), "S-1-5-18");
@@ -239,7 +1526,8 @@ static void test_unknown_generation_identity_never_survives_to_later_kernel_gene
   snprintf(security.user_sid, sizeof(security.user_sid), "S-1-5-21-unknown");
   snprintf(security.identity_quality, sizeof(security.identity_quality), "target_4688");
   edr_local_evidence_cache_observe_process(&security);
-  assert(edr_pt_cache_put(92502u, 1u, "kernel.exe", "", "", "", now + 1000u) == 0);
+  assert(put_generation(92502u, 1u, "kernel.exe", "", "", "", now + 1000u,
+                        0x92502u) == 0);
   EdrBehaviorRecord later; init_record(&later, EDR_EVENT_NET_CONNECT);
   later.pid = 92502u; later.event_time_ns = (int64_t)(now + 2000u);
   edr_local_evidence_cache_enrich_behavior(&later);
@@ -253,7 +1541,8 @@ static void test_security_4688_identity_none_is_not_lifecycle_authoritative(void
   struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t start = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - 1000u;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(92503u, 1u, "kernel.exe", "", "", "", start) == 0);
+  assert(put_generation(92503u, 1u, "kernel.exe", "", "", "", start,
+                        0x92503u) == 0);
   EdrBehaviorRecord security; init_record(&security, EDR_EVENT_PROCESS_CREATE);
   security.pid = 92503u; security.event_time_ns = (int64_t)(start + 10u); security.is_security_4688 = 1u;
   /* Target/Subject placeholders have already parsed to empty fields. */
@@ -272,18 +1561,21 @@ static void test_known_generation_rejects_late_and_zero_time_identity_updates(vo
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t start = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - 1000000000ULL;
-  edr_pt_cache_init(); assert(edr_pt_cache_put(94501u, 1u, "b.exe", "b", "b", "p", start) == 0);
+  edr_pt_cache_init(); assert(put_generation(94501u, 1u, "b.exe", "b", "b", "p", start,
+                                              0x94501u) == 0);
   EdrBehaviorRecord b; init_record(&b, EDR_EVENT_PROCESS_CREATE); b.pid=94501u; b.event_time_ns=(int64_t)(start+1000u);
   snprintf(b.user_sid,sizeof(b.user_sid),"S-B"); snprintf(b.creator_sid,sizeof(b.creator_sid),"C-B"); snprintf(b.exe_path,sizeof(b.exe_path),"B-path"); snprintf(b.identity_quality,sizeof(b.identity_quality),"target_4688"); edr_local_evidence_cache_observe_process(&b);
   EdrEvidenceCacheStatus before; edr_local_evidence_cache_get_status(&before);
   EdrBehaviorRecord late=b; late.event_time_ns=(int64_t)(start-1000u); snprintf(late.user_sid,sizeof(late.user_sid),"S-A"); snprintf(late.creator_sid,sizeof(late.creator_sid),"C-A"); snprintf(late.exe_path,sizeof(late.exe_path),"A-path"); edr_local_evidence_cache_observe_process(&late);
   EdrEvidenceCacheStatus after; edr_local_evidence_cache_get_status(&after);
-  assert(after.late_generation_rejects == before.late_generation_rejects + 1u);
-  assert(after.generation_unknown_update_rejects == before.generation_unknown_update_rejects);
+  /* A pre-lifecycle timestamp has no authoritative source tuple, so it is
+   * withheld rather than treated as the cached process generation. */
+  assert(after.generation_unknown_update_rejects ==
+         before.generation_unknown_update_rejects + 1u);
   EdrBehaviorRecord hit; init_record(&hit, EDR_EVENT_NET_CONNECT); hit.pid=94501u; hit.event_time_ns=(int64_t)(start+2000u); edr_local_evidence_cache_enrich_behavior(&hit);
   assert(strcmp(hit.user_sid,"S-B")==0 && strcmp(hit.creator_sid,"C-B")==0 && strcmp(hit.exe_path,"B-path")==0);
   EdrBehaviorRecord zero=b; zero.event_time_ns=0; snprintf(zero.user_sid,sizeof(zero.user_sid),"S-zero"); edr_local_evidence_cache_observe_process(&zero);
-  edr_local_evidence_cache_get_status(&after); assert(after.generation_unknown_update_rejects == before.generation_unknown_update_rejects + 1u);
+  edr_local_evidence_cache_get_status(&after); assert(after.generation_unknown_update_rejects == before.generation_unknown_update_rejects + 2u);
   edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
 }
 
@@ -292,7 +1584,8 @@ static void test_identity_generation_mismatch_and_quality_order(void) {
   struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(93001u, 1u, "a.exe", "a", "a", "p", now - 3000000000ULL) == 0);
+  assert(put_generation(93001u, 1u, "a.exe", "a", "a", "p", now - 3000000000ULL,
+                        0x93001u) == 0);
   EdrBehaviorRecord creator;
   init_record(&creator, EDR_EVENT_PROCESS_CREATE); creator.pid = 93001u; creator.event_time_ns = (int64_t)(now - 2000000000ULL);
   snprintf(creator.username, sizeof(creator.username), "ACME\\creator");
@@ -314,7 +1607,8 @@ static void test_identity_generation_mismatch_and_quality_order(void) {
   assert(strcmp(same.username, "ACME\\target") == 0 && strcmp(same.user_sid, "S-target") == 0);
   assert(strcmp(same.identity_quality, "target_4688") == 0);
   assert(edr_pt_cache_mark_exit(93001u, now - 1000000000ULL) == 0);
-  assert(edr_pt_cache_put(93001u, 2u, "b.exe", "b", "b", "p", now) == 0);
+  assert(put_generation(93001u, 2u, "b.exe", "b", "b", "p", now,
+                        0x93002u) == 0);
   EdrBehaviorRecord reused;
   init_record(&reused, EDR_EVENT_NET_CONNECT); reused.pid = 93001u; reused.event_time_ns = (int64_t)(now + 1000u);
   edr_local_evidence_cache_enrich_behavior(&reused);
@@ -333,7 +1627,8 @@ static void test_kernel_generation_a_to_b_resets_cached_identity_once(void) {
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   const uint32_t pid = 93002u;
   edr_pt_cache_init();
-  assert(edr_pt_cache_put(pid, 1u, "a.exe", "cmd-A", "A-path", "p", now - 3000000000ULL) == 0);
+  assert(put_generation(pid, 1u, "a.exe", "cmd-A", "A-path", "p",
+                        now - 3000000000ULL, 0x93021u) == 0);
   EdrBehaviorRecord a; init_record(&a, EDR_EVENT_PROCESS_CREATE);
   a.pid = pid; a.event_time_ns = (int64_t)(now - 2000000000ULL);
   snprintf(a.username, sizeof(a.username), "A-user"); snprintf(a.user_sid, sizeof(a.user_sid), "S-A");
@@ -341,7 +1636,8 @@ static void test_kernel_generation_a_to_b_resets_cached_identity_once(void) {
   snprintf(a.cmdline, sizeof(a.cmdline), "cmd-A"); snprintf(a.identity_quality, sizeof(a.identity_quality), "target_4688");
   edr_local_evidence_cache_observe_process(&a);
   assert(edr_pt_cache_mark_exit(pid, now - 1000000000ULL) == 0);
-  assert(edr_pt_cache_put(pid, 2u, "b.exe", "cmd-B", "B-path", "p", now) == 0);
+  assert(put_generation(pid, 2u, "b.exe", "cmd-B", "B-path", "p", now,
+                        0x93022u) == 0);
   EdrEvidenceCacheStatus before, after; edr_local_evidence_cache_get_status(&before);
   EdrBehaviorRecord b; init_record(&b, EDR_EVENT_PROCESS_CREATE);
   b.pid = pid; b.event_time_ns = (int64_t)(now + 1000u);
@@ -359,6 +1655,116 @@ static void test_kernel_generation_a_to_b_resets_cached_identity_once(void) {
   assert(strcmp(hit.exe_path, "B-path") == 0 && strcmp(hit.cmdline, "cmd-B") == 0);
   assert(strstr(hit.user_sid, "S-A") == NULL && strstr(hit.creator_sid, "C-A") == NULL && strstr(hit.exe_path, "A-path") == NULL);
   edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
+}
+
+/* A delayed A record must not borrow any B cache field after PID reuse.  The
+ * before/after candidate check makes this an observable P0-classification
+ * invariant, not merely a cosmetic enrichment assertion. */
+static void test_delayed_generation_mismatch_withholds_all_process_enrichment(void) {
+  const uint32_t pid = 96201u;
+  const uint64_t generation_a = 0x96201u;
+  const uint64_t generation_b = 0x96202u;
+  struct timespec ts;
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(pid, 701u, "a.exe", "a", "C:\\A.exe", "parent-a",
+                        (uint64_t)(base - 3000000000LL), generation_a) == 0);
+  EdrBehaviorRecord a;
+  init_record(&a, EDR_EVENT_PROCESS_CREATE);
+  a.pid = pid; a.ppid = 701u; a.event_time_ns = base - 2000000000LL;
+  set_record_generation(&a, generation_a);
+  snprintf(a.endpoint_id, sizeof(a.endpoint_id), "ep-delayed-generation");
+  snprintf(a.process_name, sizeof(a.process_name), "a.exe");
+  snprintf(a.exe_path, sizeof(a.exe_path), "C:\\A.exe");
+  snprintf(a.cmdline, sizeof(a.cmdline), "a.exe --old");
+  snprintf(a.username, sizeof(a.username), "A-user");
+  snprintf(a.user_sid, sizeof(a.user_sid), "S-A");
+  snprintf(a.identity_quality, sizeof(a.identity_quality), "target_4688");
+  edr_local_evidence_cache_observe_process(&a);
+  assert(edr_pt_cache_mark_exit_generation(pid, generation_a,
+                                            (uint64_t)(base - 1000000000LL)) == 0);
+  assert(put_generation(pid, 702u, "b.exe", "powershell.exe -EncodedCommand B",
+                        "C:\\B.exe", "parent-b", (uint64_t)base,
+                        generation_b) == 0);
+  EdrBehaviorRecord b;
+  init_record(&b, EDR_EVENT_PROCESS_CREATE);
+  b.pid = pid; b.ppid = 702u; b.event_time_ns = base + 1000000LL;
+  set_record_generation(&b, generation_b);
+  snprintf(b.endpoint_id, sizeof(b.endpoint_id), "ep-delayed-generation");
+  snprintf(b.process_name, sizeof(b.process_name), "b.exe");
+  snprintf(b.exe_path, sizeof(b.exe_path), "C:\\B.exe");
+  snprintf(b.cmdline, sizeof(b.cmdline), "powershell.exe -EncodedCommand B");
+  snprintf(b.parent_name, sizeof(b.parent_name), "parent-b");
+  snprintf(b.parent_path, sizeof(b.parent_path), "C:\\Parent-B.exe");
+  snprintf(b.username, sizeof(b.username), "B-user");
+  snprintf(b.user_sid, sizeof(b.user_sid), "S-B");
+  snprintf(b.identity_quality, sizeof(b.identity_quality), "target_4688");
+  edr_local_evidence_cache_observe_process(&b);
+
+  EdrBehaviorRecord delayed;
+  init_record(&delayed, EDR_EVENT_NET_CONNECT);
+  delayed.pid = pid; delayed.event_time_ns = base - 1500000000LL;
+  set_record_generation(&delayed, generation_a);
+  snprintf(delayed.endpoint_id, sizeof(delayed.endpoint_id), "ep-delayed-generation");
+  snprintf(delayed.net_dst, sizeof(delayed.net_dst), "198.51.100.77");
+  delayed.net_dport = 80u;
+  assert(edr_local_evidence_cache_is_candidate(&delayed) == 0);
+  edr_local_evidence_cache_enrich_behavior(&delayed);
+  assert(delayed.ppid == 0u && !delayed.process_name[0] && !delayed.exe_path[0] &&
+         !delayed.cmdline[0] && !delayed.parent_name[0] && !delayed.parent_path[0] &&
+         !delayed.parent_cmdline[0] && !delayed.username[0] && !delayed.user_sid[0]);
+  assert(edr_local_evidence_cache_is_candidate(&delayed) == 0);
+  EdrEvidenceCacheStatus st;
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.identity_generation_mismatch_rejects >= 1u);
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
+}
+
+/* A provisional unknown-generation slot can retain no metadata when its PID
+ * first becomes bound.  Sparse B must be rebuilt only from B's own record. */
+static void test_unknown_to_bound_generation_clears_provisional_metadata(void) {
+  const uint32_t pid = 96202u;
+  const uint64_t generation_b = 0x96212u;
+  struct timespec ts;
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  EdrBehaviorRecord unknown_a;
+  init_record(&unknown_a, EDR_EVENT_PROCESS_CREATE);
+  unknown_a.pid = pid; unknown_a.event_time_ns = base - 1000000LL;
+  snprintf(unknown_a.endpoint_id, sizeof(unknown_a.endpoint_id), "ep-unknown-bound");
+  snprintf(unknown_a.process_name, sizeof(unknown_a.process_name), "unknown-a.exe");
+  snprintf(unknown_a.exe_path, sizeof(unknown_a.exe_path), "C:\\Unknown-A.exe");
+  snprintf(unknown_a.cmdline, sizeof(unknown_a.cmdline), "unknown-a.exe --secret");
+  snprintf(unknown_a.parent_name, sizeof(unknown_a.parent_name), "unknown-parent");
+  edr_local_evidence_cache_observe_process(&unknown_a);
+  assert(put_generation(pid, 0u, "b-sparse.exe", "", "", "", (uint64_t)base,
+                        generation_b) == 0);
+  EdrBehaviorRecord b;
+  init_record(&b, EDR_EVENT_PROCESS_CREATE);
+  b.pid = pid; b.event_time_ns = base + 1000000LL;
+  set_record_generation(&b, generation_b);
+  snprintf(b.endpoint_id, sizeof(b.endpoint_id), "ep-unknown-bound");
+  snprintf(b.process_name, sizeof(b.process_name), "b-sparse.exe");
+  edr_local_evidence_cache_observe_process(&b);
+  EdrBehaviorRecord hit;
+  init_record(&hit, EDR_EVENT_NET_CONNECT);
+  hit.pid = pid; hit.event_time_ns = base + 2000000LL;
+  set_record_generation(&hit, generation_b);
+  snprintf(hit.endpoint_id, sizeof(hit.endpoint_id), "ep-unknown-bound");
+  edr_local_evidence_cache_enrich_behavior(&hit);
+  assert(strcmp(hit.process_name, "b-sparse.exe") == 0);
+  assert(!hit.exe_path[0] && !hit.cmdline[0] && !hit.parent_name[0] &&
+         !hit.parent_path[0] && !hit.username[0] && !hit.user_sid[0]);
+  EdrEvidenceCacheStatus st;
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.generation_resets >= 1u);
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
 }
 
 static void test_file_sha256_query_uses_file_evidence_cache(void) {
@@ -445,6 +1851,19 @@ int main(void) {
   test_behavior_summary_flush_coalesced_events();
   test_behavior_summary_below_threshold_no_emit();
   test_identity_status_counter_basics();
+#if defined(EDR_HAVE_SQLITE)
+  test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+  test_candidate_reuse_requires_generation_and_full_semantics();
+  test_process_cache_generation_migration_and_restart_safe_rtq();
+  test_snapshot_generation_persists_candidate_manifests_and_rtq();
+  test_context_generation_multicandidate_and_artifact_identity();
+  test_context_manifest_utf8_backslash_and_invalid_rejection();
+  test_context_manifest_32_maximum_ring_items_persist();
+#if !defined(_WIN32)
+  test_concurrent_cache_lifecycle_snapshot_and_queries();
+  test_mutex_lock_observability_contract();
+#endif
+#endif
   test_identity_generation_match_delta();
   test_sid_only_identity_enriches_same_generation();
   test_unknown_generation_identity_never_survives_to_later_kernel_generation();
@@ -452,6 +1871,8 @@ int main(void) {
   test_known_generation_rejects_late_and_zero_time_identity_updates();
   test_identity_generation_mismatch_and_quality_order();
   test_kernel_generation_a_to_b_resets_cached_identity_once();
+  test_delayed_generation_mismatch_withholds_all_process_enrichment();
+  test_unknown_to_bound_generation_clears_provisional_metadata();
   test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");
   return 0;

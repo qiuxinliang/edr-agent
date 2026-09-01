@@ -82,7 +82,7 @@ typedef struct {
   char last_error[160];
   char data_plane_encoding[32];
   char data_plane_compression[32];
-  char envelope_format[32];
+  char envelope_format[64];
   char dict_ver[64];
   char schema_ver[64];
   char profile_id[64];

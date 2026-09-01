@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 static int persist_strategy_on_fail_only(void) {
   const char *s = getenv("EDR_PERSIST_STRATEGY");
@@ -43,7 +44,8 @@ static size_t s_cap;
 static uint32_t s_max_frames;
 static size_t s_used;
 static uint32_t s_frame_count;
-static uint64_t s_batch_seq;
+static atomic_uint_fast64_t s_batch_seq = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t s_batch_boot_nonce = ATOMIC_VAR_INIT(0);
 static int s_flush_timeout_s;
 static uint64_t s_deadline_ns;
 static uint64_t s_timeout_flush_count;
@@ -69,9 +71,18 @@ static void wr_u32_le(uint8_t *p, uint32_t v) {
 }
 
 static void make_batch_id(char *out, size_t cap) {
-  uint64_t k = ++s_batch_seq;
-  unsigned long t = (unsigned long)time(NULL);
-  snprintf(out, cap, "b-%lx-%llx", t, (unsigned long long)k);
+  uint64_t k = atomic_fetch_add_explicit(&s_batch_seq, 1u, memory_order_relaxed) + 1u;
+  uint64_t nonce = atomic_load_explicit(&s_batch_boot_nonce, memory_order_acquire);
+  if (nonce == 0u) {
+    uint64_t candidate = edr_monotonic_ns() ^ (uint64_t)(uintptr_t)&s_batch_seq ^
+                         ((uint64_t)time(NULL) << 19u);
+    if (candidate == 0u) candidate = 1u;
+    (void)atomic_compare_exchange_strong_explicit(&s_batch_boot_nonce, &nonce, candidate,
+                                                   memory_order_release, memory_order_acquire);
+    nonce = atomic_load_explicit(&s_batch_boot_nonce, memory_order_acquire);
+  }
+  snprintf(out, cap, "b-%016llx-%016llx", (unsigned long long)nonce,
+           (unsigned long long)k);
 }
 
 static void maybe_persist(const char *batch_id, const uint8_t *header12, const uint8_t *payload,
@@ -348,11 +359,13 @@ static int append_frame(const uint8_t *data, size_t len) {
 }
 
 int edr_event_batch_push(const uint8_t *wire, size_t wire_len) {
-  edr_transport_on_behavior_wire(wire, wire_len);
   int r = append_frame(wire, wire_len);
   if (r == 1) {
     flush_locked();
     r = append_frame(wire, wire_len);
+  }
+  if (r == 0) {
+    edr_transport_on_behavior_wire(wire, wire_len);
   }
   return r;
 }

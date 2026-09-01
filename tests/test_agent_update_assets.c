@@ -305,6 +305,14 @@ int main(void) {
            "CMake exposes per-target MSVC runtime selection");
   contains(cmake, "MSVC_RUNTIME_LIBRARY \"MultiThreaded$<$<CONFIG:Debug>:Debug>\"",
            "detached uninstaller is statically linked to the MSVC runtime");
+  contains(cmake, "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>",
+           "shared MSVC warnings select UTF-8 decoding only for C and C++ translation units");
+  contains(cmake, "$<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>",
+           "shared MSVC warnings enable C11 atomics only for C translation units");
+  contains_adjacent_lines(cmake,
+                          "      \"$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>\"",
+                          "      \"$<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>\")",
+                          "shared MSVC encoding and atomics options are both language-scoped");
   free(cmake);
 
   snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
@@ -859,9 +867,35 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/tests/CMakeLists.txt", root);
   char *test_cmake = read_file(path);
   require_true(test_cmake != NULL, "read test CMake configuration");
-  contains(test_cmake, "if(NOT MSVC)",
-           "C11 atomic stress test is excluded from MSVC builds");
+  contains(test_cmake, "add_executable(test_event_bus_mpmc_stress",
+           "C11 atomic stress test is configured");
+  require_true(!strstr(test_cmake,
+                       "if(NOT MSVC)\n  add_executable(test_event_bus_mpmc_stress"),
+               "C11 atomic stress test is not excluded from MSVC builds");
+  contains(test_cmake, "set_tests_properties(event_bus_wait_and_mpmc PROPERTIES TIMEOUT 90)",
+           "C11 atomic stress test has an outer bounded CTest timeout");
   free(test_cmake);
+
+  snprintf(path, sizeof(path), "%s/tests/test_event_bus_mpmc_stress.c", root);
+  char *event_bus_stress = read_file(path);
+  require_true(event_bus_stress != NULL, "read event bus MPMC stress test");
+  contains(event_bus_stress, "static unsigned __stdcall edr_stress_producer(void *p)",
+           "Windows _beginthreadex callback has the exact unsigned __stdcall signature");
+  contains(event_bus_stress, "nprod > (int)MAXIMUM_WAIT_OBJECTS",
+           "Windows MPMC stress test bounds producer count for wait-all");
+  contains(event_bus_stress, "WaitForMultipleObjects(count, handles, TRUE, timeout_ms)",
+           "Windows MPMC stress test joins producers with one wait-all call");
+  contains(event_bus_stress, "if (wait_result != WAIT_OBJECT_0)",
+           "Windows MPMC stress test checks the wait-all result");
+  contains(event_bus_stress, "GetLastError()",
+           "Windows MPMC stress test records wait diagnostics");
+  contains(event_bus_stress, "const int create_error = errno;",
+           "Windows MPMC stress test records _beginthreadex failures through errno");
+  contains(event_bus_stress, "_beginthreadex failed index=%d errno=%d\\n",
+           "Windows MPMC stress test emits a newline-terminated CRT creation diagnostic");
+  require_true(!strstr(event_bus_stress, "WaitForSingleObject("),
+               "Windows MPMC stress test no longer ignores serial single-thread waits");
+  free(event_bus_stress);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_release_lifecycle_smoke.ps1", root);
   char *lifecycle_smoke = read_file(path);

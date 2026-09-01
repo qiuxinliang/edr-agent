@@ -52,10 +52,50 @@ if (-not (Test-Path -LiteralPath $releaseExe)) {
   Write-Error "FDSensor.exe not found under build\Release or build (Ninja). Build first."
   exit 1
 }
+$cmakeCache = Join-Path $EdrRoot "build\CMakeCache.txt"
+if (-not (Test-Path -LiteralPath $cmakeCache)) {
+  Write-Error "Verified static PCRE2 release staging requires CMakeCache.txt from the production configure"
+  exit 1
+}
+$contractBindings = @(
+  Get-Content -LiteralPath $cmakeCache |
+    Where-Object { $_.StartsWith('EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH:INTERNAL=', [System.StringComparison]::Ordinal) }
+)
+if ($contractBindings.Count -ne 1) {
+  Write-Error "Verified static PCRE2 release staging requires exactly one CMake-owned matcher contract audit binding"
+  exit 1
+}
+$matcherContract = $contractBindings[0].Substring('EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH:INTERNAL='.Length)
+if (-not (Test-Path -LiteralPath $matcherContract -PathType Leaf)) {
+  Write-Error "CMake-owned static PCRE2 matcher contract is missing: $matcherContract"
+  exit 1
+}
 $n = 0
 Get-ChildItem -Path $bin -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object {
+  if ($_.Name -match '^(?i:lib)?pcre2-8\.dll$') {
+    # Release CMake links the separately verified static producer archive.
+    # Keeping the ordinary manifest's dynamic PCRE2 DLL beside FDSensor would
+    # weaken the package proof and could mask an unintended import regression.
+    Write-Host "Skipping dynamic PCRE2 runtime DLL for verified static matcher: $($_.Name)"
+    return
+  }
   Copy-Item -LiteralPath $_.FullName -Destination $releaseDir -Force
   $n++
+}
+if ($matcherContract) {
+  Get-ChildItem -LiteralPath $releaseDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(?i:lib)?pcre2-8\.dll$' } |
+    Remove-Item -Force
+  if (-not (Get-Command dumpbin.exe -ErrorAction SilentlyContinue)) {
+    throw "Verified static PCRE2 release staging requires dumpbin.exe to prove FDSensor has no PCRE2 DLL import"
+  }
+  $imports = & dumpbin.exe /DEPENDENTS $releaseExe
+  if ($LASTEXITCODE -ne 0) {
+    throw "dumpbin /DEPENDENTS failed for $releaseExe"
+  }
+  if (($imports -join "`n") -match '(?i)(lib)?pcre2-8\.dll') {
+    throw "FDSensor unexpectedly imports a dynamic PCRE2 DLL after static matcher linking"
+  }
 }
 Write-Host "Staged $n vcpkg DLL(s) from $bin into $releaseDir"
 $stagedYaraRuntimeDlls = @(Get-ChildItem -Path $releaseDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })

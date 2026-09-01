@@ -91,7 +91,7 @@ int enrich_parent_info_by_pid(uint32_t ppid, char *parent_name, size_t name_len,
             base = base ? base + 1 : parent_path;
             snprintf(parent_name, name_len, "%s", base);
         } else {
-            snprintf(parent_name, name_len, "pid-%u", ppid);
+            parent_name[0] = 0;
         }
     }
 
@@ -140,7 +140,7 @@ int enrich_parent_info_by_pid(uint32_t ppid, char *parent_name, size_t name_len,
     } else {
         PARENT_INC(s_parent_other_failed);
     }
-    if (parent_name && name_len > 0) snprintf(parent_name, name_len, "pid-%u", ppid);
+    if (parent_name && name_len > 0) parent_name[0] = 0;
     if (parent_path && path_len > 0) parent_path[0] = 0;
     return -1;
 }
@@ -149,7 +149,7 @@ int enrich_parent_info_by_pid(uint32_t ppid, char *parent_name, size_t name_len,
 
 int enrich_parent_info_by_pid(uint32_t ppid, char *parent_name, size_t name_len,
                              char *parent_path, size_t path_len) {
-    if (parent_name && name_len > 0) snprintf(parent_name, name_len, "pid-%u", ppid);
+    if (parent_name && name_len > 0) parent_name[0] = 0;
     if (parent_path && path_len > 0) parent_path[0] = 0;
     return 0;
 }

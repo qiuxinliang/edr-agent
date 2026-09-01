@@ -1568,6 +1568,31 @@ typedef struct {
   uint64_t hi;
 } PmfeLinuxImod;
 
+/* PMFE detail fields are narrower than a captured domain or module path.
+ * A raw prefix would falsely look like a complete indicator, so preserve a
+ * full value only when it fits and otherwise expose an explicitly labelled
+ * stable digest. */
+static int pmfe_linux_copy_detail_value(char *out, size_t out_cap, const char *value,
+                                        size_t value_len) {
+  char digest[65];
+  if (!out || out_cap == 0u || !value) {
+    return 0;
+  }
+  if (value_len < out_cap) {
+    memcpy(out, value, value_len);
+    out[value_len] = '\0';
+    return 1;
+  }
+  if (sizeof("sha256:") - 1u + sizeof(digest) > out_cap ||
+      edr_sha256_hex((const uint8_t *)value, value_len, digest) != 0) {
+    out[0] = '\0';
+    return 0;
+  }
+  memcpy(out, "sha256:", sizeof("sha256:") - 1u);
+  memcpy(out + sizeof("sha256:") - 1u, digest, sizeof(digest));
+  return 1;
+}
+
 static float pmfe_linux_entropy_bytes(const uint8_t *b, size_t n) {
   if (n == 0u) {
     return 0.f;
@@ -1699,8 +1724,9 @@ static void pmfe_linux_scan_dns_ascii_buf(const uint8_t *buf, size_t len, unsign
     }
     (*hits)++;
     if (sc > *best_score) {
-      *best_score = sc;
-      snprintf(best_dom, best_cap, "%s", tmp);
+      if (pmfe_linux_copy_detail_value(best_dom, best_cap, tmp, dlen)) {
+        *best_score = sc;
+      }
     }
   }
 }
@@ -1823,7 +1849,11 @@ static void pmfe_linux_run_module_integrity(pid_t pid, const PmfeLinuxImod *mods
       if (memcmp(mem_head, disk_head, cmp) != 0) {
         (*stomp_out)++;
         if (!first_stomp[0]) {
-          snprintf(first_stomp, first_cap, "%s", modpath);
+          size_t modpath_len = strnlen(modpath, sizeof(mods[i].path));
+          if (modpath_len == sizeof(mods[i].path) ||
+              !pmfe_linux_copy_detail_value(first_stomp, first_cap, modpath, modpath_len)) {
+            snprintf(first_stomp, first_cap, "%s", "unavailable:module_path");
+          }
         }
       }
     }

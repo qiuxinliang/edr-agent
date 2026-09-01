@@ -1,10 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r276-2b3b6a19",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r276-39c53800",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 173,
+  "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
+  "sensor_interest_manifest_sha256": "db785773c13c52eab3359db05048c00be60afc380d1385916fd444143315d7ae",
   "rules": [
     {
       "id": "R-EXEC-001",

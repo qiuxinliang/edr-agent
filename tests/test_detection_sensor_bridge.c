@@ -638,6 +638,160 @@ static void test_pmfe_structured_signals_reach_detection_context(void) {
   assert(strstr(r.detection_context, "\"injection_observed\":true") != NULL);
 }
 
+static void test_kernel_file_read_generation_bridge(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+
+  /* Windows collector seam: a manifest Read is emitted only after the
+   * NameCreate FileKey binding and exact StartKey actor cache have populated
+   * this typed payload. */
+  fill_slot(&slot, EDR_EVENT_FILE_READ,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=7211\n"
+            "img=C:\\ProgramData\\P0Validation\\reader.exe\n"
+            "img_canonical=C:\\ProgramData\\P0Validation\\reader.exe\n"
+            "img_resolution_status=RESOLVED\n"
+            "img_resolution_source=exact_process_start_key_cache\n"
+            "cmd=reader.exe --read-once\n"
+            "file=C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data\n"
+            "file_key=0x7f00aa11\n"
+            "file_read_binding_quality=etw_filekey_namecreate\n"
+            "process_start_key=723401\n"
+            "process_creation_filetime_100ns=133777777770000000\n"
+            "process_generation_source=etw_start_key_live_telemetry\n"
+            "file_read_actor_quality=exact_process_start_key_cache\n"
+            "source_completeness=COALESCED\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(r.type == EDR_EVENT_FILE_READ);
+  assert(strcmp(r.file_op, "read") == 0);
+  assert(strcmp(r.file_path,
+                "C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data") == 0);
+  assert(r.pid == 7211u);
+  assert(r.process_start_key == 723401u);
+  assert(r.process_creation_filetime_100ns == 133777777770000000ULL);
+  assert(strcmp(r.process_generation_source, "etw_start_key_live_telemetry") == 0);
+  assert(strcmp(r.image_path_canonical, "C:\\ProgramData\\P0Validation\\reader.exe") == 0);
+  assert(strcmp(r.source_completeness, "COALESCED") == 0);
+
+  /* A provider that cannot return ProcessStartKey remains source-only.  It
+   * must not acquire a fabricated generation from PID or callback time. */
+  fill_slot(&slot, EDR_EVENT_FILE_READ,
+            "ETW1\n"
+            "prov=kfile\n"
+            "pid=7211\n"
+            "file=C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data\n"
+            "file_key=0x7f00aa11\n"
+            "file_read_binding_quality=etw_filekey_namecreate\n"
+            "process_generation_source=etw_process_start_key_unavailable\n"
+            "file_read_generation_quality=process_start_key_unavailable\n"
+            "source_completeness=NOT_EVALUABLE\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(r.process_start_key == 0u);
+  assert(r.process_creation_filetime_100ns == 0u);
+  assert(strcmp(r.source_completeness, "NOT_EVALUABLE") == 0);
+}
+
+static void test_windows_image_resolution_and_4688_identity(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\n"
+            "prov=sec\n"
+            "eid=4688\n"
+            "epid=4096\n"
+            "img=\\Device\\HarddiskVolume7\\Windows\\Temp\\powershell.exe\n"
+            "img_raw=\\Device\\HarddiskVolume7\\Windows\\Temp\\powershell.exe\n"
+            "img_canonical=C:\\Windows\\Temp\\powershell.exe\n"
+            "img_namespace=nt_device\n"
+            "img_resolution_status=RESOLVED\n"
+            "img_resolution_source=querydosdevice_cache\n"
+            "source_completeness=ENRICHMENT_ONLY\n"
+            "evidence_revision=2\n"
+            "process_creation_time=2026-08-30T00:00:00Z\n"
+            "process_creation_filetime_100ns=0x1d0000000000000\n"
+            "user=alice\n"
+            "user_domain=CONTOSO\n"
+            "user_sid=S-1-5-21-100\n"
+            "logon_id=0xabc\n"
+            "creator_user=svc\n"
+            "creator_domain=CONTOSO\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(r.is_security_4688 == 1u);
+  assert(strcmp(r.exe_path, "C:\\Windows\\Temp\\powershell.exe") == 0);
+  assert(strcmp(r.image_path_raw, "\\Device\\HarddiskVolume7\\Windows\\Temp\\powershell.exe") == 0);
+  assert(strcmp(r.image_path_resolution_status, "RESOLVED") == 0);
+  assert(strcmp(r.source_completeness, "ENRICHMENT_ONLY") == 0);
+  assert(r.evidence_revision == 2u);
+  assert(r.process_creation_filetime_100ns == 0x1d0000000000000ULL);
+  assert(strcmp(r.username, "CONTOSO\\alice") == 0);
+  assert(strcmp(r.creator_username, "svc") == 0);
+
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\nprov=sec\neid=4688\nepid=4096\n"
+            "img=C:\\Windows\\Temp\\cmd.exe\n"
+            "creator_user=launcher\ncreator_domain=CONTOSO\ncreator_sid=S-1-5-21-creator\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(strcmp(r.creator_username, "launcher") == 0);
+  assert(strcmp(r.creator_sid, "S-1-5-21-creator") == 0);
+  assert(!r.username[0] && !r.user_sid[0]);
+  assert(strcmp(r.identity_quality, "creator_fallback") == 0);
+
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\nprov=kproc\npid=4097\n"
+            "img=\\Device\\HarddiskVolume99\\Temp\\powershell.exe\n"
+            "img_raw=\\Device\\HarddiskVolume99\\Temp\\powershell.exe\n"
+            "img_namespace=nt_device\n"
+            "img_resolution_status=NOT_EVALUABLE\n"
+            "img_resolution_source=device_map_miss\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(strcmp(r.image_path_resolution_status, "NOT_EVALUABLE") == 0);
+  assert(strcmp(r.exe_path, "\\Device\\HarddiskVolume99\\Temp\\powershell.exe") == 0);
+}
+
+static void test_source_truncation_withholds_and_names_rule_fields(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  char payload[sizeof(slot.data)];
+  char long_basename[320];
+  char long_generation[96];
+  char long_hash[80];
+  char long_registry_key[1600];
+  int written;
+
+  memset(long_basename, 'p', sizeof(long_basename) - 1u);
+  long_basename[sizeof(long_basename) - 1u] = '\0';
+  memset(long_generation, 'g', sizeof(long_generation) - 1u);
+  long_generation[sizeof(long_generation) - 1u] = '\0';
+  memset(long_hash, 'a', sizeof(long_hash) - 1u);
+  long_hash[sizeof(long_hash) - 1u] = '\0';
+  memset(long_registry_key, 'k', sizeof(long_registry_key) - 1u);
+  long_registry_key[sizeof(long_registry_key) - 1u] = '\0';
+
+  written = snprintf(payload, sizeof(payload),
+                     "ETW1\n"
+                     "prov=kproc\n"
+                     "pid=9001\n"
+                     "img=C:\\Temp\\%s\n"
+                     "process_generation_source=%s\n"
+                     "sha256=%s\n"
+                     "regkey=%s\n",
+                     long_basename, long_generation, long_hash, long_registry_key);
+  assert(written > 0 && (size_t)written < sizeof(payload));
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE, payload);
+  edr_behavior_from_slot(&slot, &r);
+
+  assert(r.process_name[0] == '\0');
+  assert(r.process_generation_source[0] == '\0');
+  assert(r.exe_hash[0] == '\0');
+  assert(r.reg_key_path[0] == '\0');
+  assert(strcmp(r.source_completeness, "TRUNCATED") == 0);
+  assert(strstr(r.source_truncated_fields, "source.process_name") != NULL);
+  assert(strstr(r.source_truncated_fields, "source.process_generation_source") != NULL);
+  assert(strstr(r.source_truncated_fields, "source.exe_hash") != NULL);
+  assert(strstr(r.source_truncated_fields, "source.reg_key_path") != NULL);
+}
+
 int main(void) {
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
@@ -661,6 +815,9 @@ int main(void) {
   test_registry_persistence_alias_bridge();
   test_pmfe_followup_bridge_preserves_link_without_false_mitre();
   test_pmfe_structured_signals_reach_detection_context();
+  test_kernel_file_read_generation_bridge();
+  test_windows_image_resolution_and_4688_identity();
+  test_source_truncation_withholds_and_names_rule_fields();
   puts("detection_sensor_bridge ok");
   return 0;
 }

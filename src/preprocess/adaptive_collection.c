@@ -39,6 +39,27 @@ static EdrAdaptivePidEntry s_pid_cache[EDR_ADAPTIVE_PID_CACHE];
 static volatile uint32_t s_pid_next;
 static char s_last_rule_id[64];
 
+/* Sensor-interest matching must never run against a prefix that looks like a
+ * complete record value. */
+static int adaptive_copy_cstr_exact(char *out, size_t out_cap, const char *source,
+                                    size_t source_cap) {
+  const char *end;
+  size_t length;
+  if (!out || out_cap == 0u || !source || source_cap == 0u) {
+    return 0;
+  }
+  end = (const char *)memchr(source, '\0', source_cap);
+  if (!end) {
+    return 0;
+  }
+  length = (size_t)(end - source);
+  if (length >= out_cap) {
+    return 0;
+  }
+  memcpy(out, source, length + 1u);
+  return 1;
+}
+
 static int adaptive_env_bool(const char *name, int fallback) {
   const char *v = getenv(name);
   if (!v || !v[0]) {
@@ -411,6 +432,8 @@ int edr_adaptive_collection_should_admit_interest(const EdrSensorInterestEvent *
 
 int edr_adaptive_collection_should_admit_record(const EdrBehaviorRecord *record) {
   EdrSensorInterestEvent event;
+  const char *path;
+  size_t path_cap;
   if (!record) {
     return 0;
   }
@@ -419,11 +442,24 @@ int edr_adaptive_collection_should_admit_record(const EdrBehaviorRecord *record)
   event.pid = record->pid;
   event.parent_pid = record->ppid;
   event.remote_port = (uint32_t)record->net_dport;
-  snprintf(event.process_name, sizeof(event.process_name), "%s", record->process_name);
-  snprintf(event.path, sizeof(event.path), "%s",
-           record->file_path[0] ? record->file_path :
-           (record->network_aux_path[0] ? record->network_aux_path : record->exe_path));
-  snprintf(event.registry_path, sizeof(event.registry_path), "%s", record->reg_key_path);
+  if (record->file_path[0]) {
+    path = record->file_path;
+    path_cap = sizeof(record->file_path);
+  } else if (record->network_aux_path[0]) {
+    path = record->network_aux_path;
+    path_cap = sizeof(record->network_aux_path);
+  } else {
+    path = record->exe_path;
+    path_cap = sizeof(record->exe_path);
+  }
+  if (!adaptive_copy_cstr_exact(event.process_name, sizeof(event.process_name),
+                                record->process_name, sizeof(record->process_name)) ||
+      !adaptive_copy_cstr_exact(event.path, sizeof(event.path), path, path_cap) ||
+      !adaptive_copy_cstr_exact(event.registry_path, sizeof(event.registry_path),
+                                record->reg_key_path, sizeof(record->reg_key_path))) {
+    fprintf(stderr, "[adaptive_collection] record rejected: interest field is not losslessly representable\n");
+    return 0;
+  }
   return edr_adaptive_collection_should_admit_interest(&event);
 }
 

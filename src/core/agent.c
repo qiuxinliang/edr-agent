@@ -35,6 +35,8 @@
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/enrich_parent_info.h"
 #include "edr/process_tree_cache.h"
+#include "edr/process_create_coalescer.h"
+#include "edr/process_evidence_worker.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/policy_v2.h"
 #include "edr/pmfe.h"
@@ -47,14 +49,21 @@
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
 #else
+#include <errno.h>
+#include <time.h>
 #include <unistd.h>
-static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
+static void edr_ms_sleep(unsigned ms) {
+  struct timespec request;
+  request.tv_sec = (time_t)(ms / 1000u);
+  request.tv_nsec = (long)(ms % 1000u) * 1000000L;
+  while (nanosleep(&request, &request) != 0 && errno == EINTR) { }
+}
 #endif
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <sys/stat.h>
 
@@ -76,6 +85,21 @@ static void edr_ms_sleep(unsigned ms) { usleep(ms * 1000u); }
 #endif
 
 #define EDR_REMOTE_POLICY_COLLECTION_CHANGED 0x01
+
+/* Build optional JSON fragments all-or-nothing.  A partial fragment would
+ * corrupt the enclosing health payload, so callers discard it on truncation. */
+static int edr_agent_append_json_fragment(char *dst, size_t capacity, size_t *used,
+                                          const char *format, ...) {
+  va_list args;
+  int written;
+  if (!dst || !used || !format || capacity == 0u || *used >= capacity) return 0;
+  va_start(args, format);
+  written = vsnprintf(dst + *used, capacity - *used, format, args);
+  va_end(args);
+  if (written < 0 || (size_t)written >= capacity - *used) return 0;
+  *used += (size_t)written;
+  return 1;
+}
 #define EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED 0x02
 #define EDR_REMOTE_POLICY_DETECTION_CHANGED 0x04
 #define EDR_REMOTE_POLICY_PMFE_LIFECYCLE_CHANGED 0x08
@@ -444,7 +468,11 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
   }
   trusted_key_id = edr_agent_config_signing_key_id(cfg);
   if (trusted_key_id && trusted_key_id[0] && strcmp(trusted_key_id, headers->signing_key_id) != 0) {
-    snprintf(reason, reason_cap, "untrusted signing key id expected=%s got=%s", trusted_key_id, headers->signing_key_id);
+    /* Key identifiers can originate in an unbounded environment variable.
+     * Do not turn a rejection explanation into a partially copied identifier:
+     * the received key id remains in the signed-config failure report, while
+     * this stable reason is safe for every bounded caller. */
+    snprintf(reason, reason_cap, "untrusted signing key id");
     return -1;
   }
   if (edr_agent_rfc3339_expired(headers->expires_at)) {
@@ -512,60 +540,6 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
   return 0;
 }
 
-static int edr_agent_file_has_magic(const char *path, const char *magic, size_t magic_len) {
-  char buf[8];
-  FILE *f;
-  size_t n;
-  if (!path || !path[0] || !magic || magic_len == 0u || magic_len > sizeof(buf)) {
-    return 0;
-  }
-  f = fopen(path, "rb");
-  if (!f) {
-    return 0;
-  }
-  n = fread(buf, 1u, magic_len, f);
-  fclose(f);
-  return n == magic_len && memcmp(buf, magic, magic_len) == 0 ? 1 : 0;
-}
-
-static int edr_agent_files_equal(const char *a, const char *b) {
-  FILE *fa;
-  FILE *fb;
-  unsigned char ba[8192];
-  unsigned char bb[8192];
-  int equal = 0;
-  if (!a || !a[0] || !b || !b[0]) {
-    return 0;
-  }
-  fa = fopen(a, "rb");
-  if (!fa) {
-    return 0;
-  }
-  fb = fopen(b, "rb");
-  if (!fb) {
-    fclose(fa);
-    return 0;
-  }
-  equal = 1;
-  for (;;) {
-    size_t na = fread(ba, 1u, sizeof(ba), fa);
-    size_t nb = fread(bb, 1u, sizeof(bb), fb);
-    if (na != nb || (na > 0u && memcmp(ba, bb, na) != 0)) {
-      equal = 0;
-      break;
-    }
-    if (na == 0u) {
-      if (ferror(fa) || ferror(fb)) {
-        equal = 0;
-      }
-      break;
-    }
-  }
-  fclose(fa);
-  fclose(fb);
-  return equal;
-}
-
 static int edr_agent_replace_file(const char *src, const char *dst) {
   if (!src || !src[0] || !dst || !dst[0]) {
     return -1;
@@ -628,10 +602,19 @@ static void edr_agent_clear_config_recovery(EdrAgent *agent) {
 }
 
 static void edr_agent_copy_string(char *dst, size_t cap, const char *src) {
+  size_t length;
+  const char *value = src ? src : "";
   if (!dst || cap == 0u) {
     return;
   }
-  snprintf(dst, cap, "%s", src ? src : "");
+  length = strlen(value);
+  if (length >= cap) {
+    length = cap - 1u;
+  }
+  if (length > 0u) {
+    memcpy(dst, value, length);
+  }
+  dst[length] = '\0';
 }
 
 static const char *edr_agent_path_sep_for(const char *path) {
@@ -1348,6 +1331,7 @@ void edr_agent_destroy(EdrAgent *agent) {
     return;
   }
   edr_preprocess_stop();
+  edr_p0_rule_ir_shutdown();
   edr_self_protect_shutdown();
   edr_resource_shutdown();
   AVE_Shutdown();
@@ -1533,7 +1517,6 @@ static const char *edr_agent_native_architecture(const char *process_architectur
 
 static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                               const EdrIngestHttpRuntime *http_rt,
-                                              const AVEStatus *avst, int ave_ok,
                                               char *out, size_t out_cap) {
   if (!out || out_cap == 0u) return -1;
 #ifdef _WIN32
@@ -1561,6 +1544,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
 #else
   const int pcre2_build = 0;
 #endif
+  const char *pcre2_release_class = pcre2_build ? "production" : "nonproduction_stub";
 #ifdef EDR_HAVE_YARA
   const int yara_build = 1;
 #else
@@ -1756,7 +1740,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"summaries\":%llu,\"critical_bypassed\":%llu}},"
       "%s"
       "\"features\":{"
-      "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"pcre2\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"production_ready\":%s,\"release_class\":\"%s\"},"
       "\"yara\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,"
       "\"runtime_status\":\"%s\",\"rules_ready\":%s,\"rules_count\":%u,\"rules_source\":\"%s\"},"
       "\"shellcode_network\":{\"code_supported\":%s,\"build_supported\":%s,\"policy_enabled\":%s,"
@@ -1803,6 +1787,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       (unsigned long long)alert_stats.critical_bypassed,
       endpoint_policy_capability,
       pcre2_build ? "true" : "false", pcre2_build ? "true" : "false", pcre2_build ? "healthy" : "unavailable",
+      pcre2_build ? "true" : "false", pcre2_release_class,
       yara_build ? "true" : "false", yara_build ? "true" : "false", yara_runtime,
       yara_rules_ready ? "true" : "false", (unsigned)yara_rules_count,
       yara_rules_source[0] ? yara_rules_source : "unavailable",
@@ -1866,6 +1851,7 @@ static int edr_agent_collection_enabled(const EdrConfig *cfg) {
 }
 
 static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns);
+static int edr_agent_restart_collector(EdrAgent *agent);
 
 EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
@@ -1889,6 +1875,9 @@ EdrError edr_agent_run(EdrAgent *agent) {
     uint64_t last_heartbeat_ns = 0;
     uint64_t last_health_ns = 0;
     uint64_t last_forensic_refresh_ns = 0;
+#ifdef _WIN32
+    uint64_t last_file_read_gate_restart_ns = 0;
+#endif
     uint32_t maintenance_slot = 0u;
     {
       EdrError e = edr_collector_start(agent->event_bus, edr_agent_get_config(agent));
@@ -1920,6 +1909,25 @@ EdrError edr_agent_run(EdrAgent *agent) {
         edr_ms_sleep(200u);
         edr_health_beat(EDR_HEALTH_MAIN_LOOP);
         edr_watchdog_agent_tick(&agent->cfg);
+#ifdef _WIN32
+        /* A durable FileRead metadata gate has no safe per-handle recovery:
+         * stop/join invalidates every old FileKey, then only a successfully
+         * started new ETW epoch clears the collector fuse.  Bound retries so
+         * a provider-start failure remains observable without stalling the
+         * main loop. */
+        if (edr_collector_file_read_metadata_gate_restart_required()) {
+          uint64_t restart_now_ns = edr_monotonic_ns();
+          if (last_file_read_gate_restart_ns == 0u ||
+              restart_now_ns - last_file_read_gate_restart_ns >= 5000000000ULL) {
+            last_file_read_gate_restart_ns = restart_now_ns;
+            edr_collector_file_read_metadata_gate_restart_attempted();
+            int restart_result = edr_agent_restart_collector(agent);
+            if (restart_result == 0) {
+              edr_collector_file_read_metadata_gate_restart_failed();
+            }
+          }
+        }
+#endif
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_RESOURCE, edr_resource_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
@@ -1977,8 +1985,12 @@ EdrError edr_agent_run(EdrAgent *agent) {
       edr_response_forensic_async_abort_shutdown();
       edr_watchdog_agent_on_shutdown(&agent->cfg);
       if (agent->collector_started) {
-        edr_collector_stop();
-        agent->collector_started = 0;
+        if (edr_collector_stop()) {
+          agent->collector_started = 0;
+        } else {
+          fprintf(stderr,
+                  "[collector] shutdown join timed out; retained collector-owned resources\n");
+        }
       }
     }
   }
@@ -2155,8 +2167,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
-  char http_err[192], command_result_error[192], evidence_json[1600], sensor_interest_ver[160], sensor_interest_rules[160];
-  char corr_health_json[600], p0_health_json[320];
+  char http_err[192], command_result_error[192], evidence_json[4096], sensor_interest_ver[160], sensor_interest_rules[160];
+  char sensor_interest_artifact_sha[80], sensor_interest_coverage_sha[80];
+  char sensor_interest_manifest_sha[80], sensor_interest_manifest_hash_mode[80];
+  char corr_health_json[600], p0_health_json[8192];
   char event_filter_ver[96];
   char event_filter_last_reason[128], event_filter_last_process[128];
   char event_filter_last_path[320], event_filter_last_cmdline[320];
@@ -2185,6 +2199,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrCollectorHealth ch;
   EdrParentEnrichmentMetrics parent_metrics;
   EdrProcessTreeCacheMetrics process_cache_metrics;
+  EdrProcessCoalescerMetrics process_coalescer_metrics;
+  EdrProcessEvidenceMetrics process_evidence_metrics;
   EdrCommandDeliveryHealth cdh;
   EdrCommandExecutorHealth ceh;
   EdrWindowsEventFilterStatus event_filter_status;
@@ -2194,6 +2210,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&ch, 0, sizeof(ch));
   memset(&parent_metrics, 0, sizeof(parent_metrics));
   memset(&process_cache_metrics, 0, sizeof(process_cache_metrics));
+  memset(&process_coalescer_metrics, 0, sizeof(process_coalescer_metrics));
+  memset(&process_evidence_metrics, 0, sizeof(process_evidence_metrics));
   memset(&cdh, 0, sizeof(cdh));
   memset(&ceh, 0, sizeof(ceh));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
@@ -2203,11 +2221,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   (void)edr_collector_get_health(&ch);
   edr_parent_enrichment_get_metrics(&parent_metrics);
   edr_pt_cache_get_metrics(&process_cache_metrics);
+  edr_process_coalescer_get_metrics(&process_coalescer_metrics);
+  edr_process_evidence_worker_get_metrics(&process_evidence_metrics);
   edr_command_get_delivery_health(&cdh);
   edr_command_executor_get_health(&ceh);
   ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
   int capability_manifest_ok = edr_agent_capability_manifest_json(
-      agent, &http_rt, &avst, ave_ok, capability_manifest_json,
+      agent, &http_rt, capability_manifest_json,
       sizeof(capability_manifest_json));
   if (capability_manifest_ok != 0) {
     snprintf(capability_manifest_json, sizeof(capability_manifest_json),
@@ -2339,7 +2359,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"resume_count\":%lu,\"control_frames\":%lu,"
         "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
         "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
-        "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
+        "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
+        "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
         "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
         "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
@@ -2373,6 +2394,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
         "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+        "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
+        "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
+        "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+        "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
+        "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
         "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
         "\"snapshot_rejects\":%llu},"
@@ -2463,6 +2489,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
+        edr_event_bus_p0_reserved_slots(agent->event_bus),
+        (unsigned long long)edr_event_bus_ordinary_reserve_rejected_total(agent->event_bus),
+        (unsigned long long)edr_event_bus_p0_reserve_rejected_total(agent->event_bus),
         (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
         (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
         (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
@@ -2513,6 +2542,27 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)ch.etw_prefilter_dropped,
         (unsigned long long)ch.collector_dropped,
         (unsigned long long)ch.queue_dropped,
+        (unsigned long long)ch.file_read_name_bindings,
+        (unsigned long long)ch.file_read_name_cache_misses,
+        (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,
+        (unsigned long long)ch.file_read_generation_unavailable,
+        (unsigned long long)ch.file_read_actor_generation_unavailable,
+        ch.file_read_p0_capability_healthy ? "true" : "false",
+        ch.file_read_p0_capability_reason[0] ? ch.file_read_p0_capability_reason : "healthy",
+        (unsigned long long)ch.file_read_metadata_gate_staged,
+        (unsigned long long)ch.file_read_metadata_gate_enqueue_attempts,
+        (unsigned long long)ch.file_read_metadata_gate_queue_rejected,
+        (unsigned long long)ch.file_read_metadata_gate_durable_successes,
+        (unsigned long long)ch.file_read_metadata_gate_durable_failures,
+        (unsigned long long)ch.file_read_metadata_gate_retry_attempts,
+        (unsigned long long)ch.file_read_metadata_gate_paused_events,
+        (unsigned long long)ch.file_read_metadata_gate_epoch_restart_attempts,
+        (unsigned long long)ch.file_read_metadata_gate_epoch_restart_successes,
+        (unsigned long long)ch.file_read_metadata_gate_epoch_restart_failures,
+        ch.kernel_file_start_key_requested ? "true" : "false",
+        ch.kernel_file_start_key_enabled ? "true" : "false",
+        (unsigned long long)ch.kernel_file_start_key_enable_failures,
+        ch.kernel_file_start_key_reason[0] ? ch.kernel_file_start_key_reason : "not_requested",
         (unsigned long long)ch.process_create_missing_identity,
         (unsigned long long)ch.process_identity_cache_hits,
         (unsigned long long)ch.process_identity_cache_misses,
@@ -2578,16 +2628,136 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_p0_rule_get_dedup_metrics(&p0_metrics);
   EdrP0EmitMetrics p0_emit_metrics;
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
-  (void)snprintf(p0_health_json, sizeof(p0_health_json),
-                 ",\"p0_dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,\"equal_quality_suppressed\":%llu,\"identity_upgrade_allowed\":%llu,\"lower_quality_suppressed\":%llu,\"intermediate_upgrade_suppressed\":%llu,\"pre_rule_event_duplicates\":%llu}",
+  EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
+  edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
+  EdrStorageQueueCapacityMetrics queue_capacity_metrics;
+  edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
+  const char *p0_bundle_sha256 = "";
+  char p0_artifact_reason[96];
+  int p0_artifact_healthy;
+  (void)edr_p0_rule_ir_get_bundle_info(NULL, NULL, &p0_bundle_sha256);
+  p0_artifact_healthy = edr_p0_rule_ir_artifact_healthy(
+      p0_artifact_reason, sizeof(p0_artifact_reason));
+  size_t p0_health_used = 0u;
+  int p0_health_ok;
+  p0_health_json[0] = '\0';
+  p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,\"equal_quality_suppressed\":%llu,\"identity_upgrade_allowed\":%llu,\"lower_quality_suppressed\":%llu,\"intermediate_upgrade_suppressed\":%llu,\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu}",
                  (unsigned long long)p0_metrics.suppressed_total, (unsigned long long)p0_metrics.exact_suppressed,
                  (unsigned long long)p0_metrics.equal_quality_suppressed, (unsigned long long)p0_metrics.identity_upgrade_seen,
-                 (unsigned long long)p0_metrics.lower_quality_suppressed, (unsigned long long)p0_metrics.intermediate_upgrade_suppressed, (unsigned long long)p0_metrics.pre_rule_event_duplicates);
-  (void)snprintf(p0_health_json + strlen(p0_health_json), sizeof(p0_health_json) - strlen(p0_health_json),
+                 (unsigned long long)p0_metrics.lower_quality_suppressed, (unsigned long long)p0_metrics.intermediate_upgrade_suppressed, (unsigned long long)p0_metrics.pre_rule_event_duplicates, (unsigned long long)p0_metrics.pending_backpressure);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"process_create_coalescer\":{\"slots_used\":%u,\"capacity\":%u,\"security_stored\":%llu,\"security_backpressure\":%llu,\"kernel_backpressure\":%llu,\"timeouts\":%llu,\"stale_rejects\":%llu,\"ambiguous_rejects\":%llu}",
+                 process_coalescer_metrics.slots_used, process_coalescer_metrics.capacity,
+                 (unsigned long long)process_coalescer_metrics.security_stored,
+                 (unsigned long long)process_coalescer_metrics.security_backpressure,
+                 (unsigned long long)process_coalescer_metrics.kernel_backpressure,
+                 (unsigned long long)process_coalescer_metrics.timed_out,
+                 (unsigned long long)process_coalescer_metrics.stale_rejects,
+                 (unsigned long long)process_coalescer_metrics.ambiguous_rejects);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,\"requests_total\":%llu,\"queued\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,\"stale_rejected\":%llu,\"hash_admissions\":%llu,\"hash_attempts\":%llu,\"signature_admissions\":%llu,\"signature_attempts\":%llu,\"shutdown_timeouts\":%llu,\"terminal_unhealthy\":%u,\"worker_stalled\":%u}",
+                 process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
+                 (unsigned long long)process_evidence_metrics.requests_total,
+                 (unsigned long long)process_evidence_metrics.queued,
+                 (unsigned long long)process_evidence_metrics.ready_hits,
+                 (unsigned long long)process_evidence_metrics.pending_reuse,
+                 (unsigned long long)process_evidence_metrics.misses,
+                 (unsigned long long)process_evidence_metrics.backpressure,
+                 (unsigned long long)process_evidence_metrics.cache_evictions,
+                 (unsigned long long)process_evidence_metrics.stale_rejected,
+                 (unsigned long long)process_evidence_metrics.hash_admissions,
+                 (unsigned long long)process_evidence_metrics.hash_attempts,
+                 (unsigned long long)process_evidence_metrics.signature_admissions,
+                 (unsigned long long)process_evidence_metrics.signature_attempts,
+                 (unsigned long long)process_evidence_metrics.shutdown_timeouts,
+                 process_evidence_metrics.terminal_unhealthy,
+                 process_evidence_metrics.worker_stalled);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
                  ",\"p0_emit_context\":{\"user_subject_full\":%llu,\"user_subject_degraded\":%llu,\"alerts_with_optional_omission\":%llu,\"values_truncated\":%llu,\"escape_overflow_values\":%llu,\"minimal_failures\":%llu,\"emitted_without_full_context\":%llu}",
                  (unsigned long long)p0_emit_metrics.user_subject_full, (unsigned long long)p0_emit_metrics.user_subject_degraded,
                  (unsigned long long)p0_emit_metrics.alerts_with_optional_omission, (unsigned long long)p0_emit_metrics.values_truncated,
                  (unsigned long long)p0_emit_metrics.escape_overflow_values, (unsigned long long)p0_emit_metrics.minimal_failures, (unsigned long long)p0_emit_metrics.emitted_without_full_context);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+                 p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_enforcement_admission\":{\"critical_reservations\":%llu,\"governor_suppressed\":%llu,\"source_only_backpressure_emitted\":%llu,\"source_only_backpressure_failed\":%llu}",
+                 (unsigned long long)p0_emit_metrics.critical_reservations,
+                 (unsigned long long)p0_emit_metrics.governor_suppressed,
+                 (unsigned long long)p0_emit_metrics.source_only_backpressure_emitted,
+                 (unsigned long long)p0_emit_metrics.source_only_backpressure_failed);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+                 p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_source_only_durability\":{\"retry_pending\":%llu,\"retry_attempts\":%llu,\"retry_committed\":%llu,\"retry_capacity_exhausted\":%llu,\"terminal_unhealthy\":%s}",
+                 (unsigned long long)p0_emit_metrics.source_only_retry_pending,
+                 (unsigned long long)p0_emit_metrics.source_only_retry_attempts,
+                 (unsigned long long)p0_emit_metrics.source_only_retry_committed,
+                 (unsigned long long)p0_emit_metrics.source_only_retry_capacity_exhausted,
+                 p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false");
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_rule_bundle\":{\"plaintext_sha256\":\"%s\"}",
+                 p0_bundle_sha256 ? p0_bundle_sha256 : "");
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+                 p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_artifact_recovery\":{\"healthy\":%s,\"reason\":\"%s\"}",
+                 p0_artifact_healthy ? "true" : "false", p0_artifact_reason);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_queue_dead_letter\":%llu",
+                 (unsigned long long)edr_storage_queue_dead_letter_count());
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+                 p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_enforcement_terminal_journal\":{\"pending\":%llu,\"backpressure\":%llu,\"failed\":%llu,\"outcome_unknown\":%llu,\"replay_selection_transient_failures\":%llu,\"replay_metadata_corruption_failures\":%llu,\"precreate_metadata_corruption_failures\":%llu,\"owner_metadata_unresolved\":%llu,\"precreate\":{\"requests\":%llu,\"attempts\":%llu,\"created\":%llu,\"existing\":%llu,\"conflicts\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu}}",
+                 (unsigned long long)terminal_journal_metrics.pending,
+                 (unsigned long long)terminal_journal_metrics.backpressure,
+                 (unsigned long long)terminal_journal_metrics.failed,
+                 (unsigned long long)terminal_journal_metrics.outcome_unknown,
+                 (unsigned long long)terminal_journal_metrics.replay_selection_transient_failures,
+                 (unsigned long long)terminal_journal_metrics.replay_metadata_corruption_failures,
+                 (unsigned long long)terminal_journal_metrics.precreate_metadata_corruption_failures,
+                 (unsigned long long)terminal_journal_metrics.owner_metadata_unresolved,
+                 (unsigned long long)terminal_journal_metrics.precreate_requests,
+                 (unsigned long long)terminal_journal_metrics.precreate_attempts,
+                 (unsigned long long)terminal_journal_metrics.precreate_created,
+                 (unsigned long long)terminal_journal_metrics.precreate_existing,
+                 (unsigned long long)terminal_journal_metrics.precreate_conflicts,
+                 (unsigned long long)terminal_journal_metrics.precreate_rejected,
+                 (unsigned long long)terminal_journal_metrics.precreate_transaction_failures,
+                 (unsigned long long)terminal_journal_metrics.precreate_commit_failures);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+                 p0_health_json, sizeof(p0_health_json), &p0_health_used,
+                 ",\"p0_offline_queue_capacity\":{\"used_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
+                 (unsigned long long)queue_capacity_metrics.used_bytes,
+                 (unsigned long long)queue_capacity_metrics.max_bytes,
+                 queue_capacity_metrics.utilization_bps,
+                 (unsigned long long)queue_capacity_metrics.ordinary_limit_bytes,
+                 (unsigned long long)queue_capacity_metrics.critical_reserve_bytes,
+                 (unsigned long long)queue_capacity_metrics.terminal_reserve_bytes,
+                 (unsigned long long)queue_capacity_metrics.p0_source_only_reserve_bytes,
+                 (unsigned long long)queue_capacity_metrics.ordinary_rejected,
+                 (unsigned long long)queue_capacity_metrics.high_priority_rejected,
+                 (unsigned long long)queue_capacity_metrics.p0_source_only_rejected,
+                 (unsigned long long)queue_capacity_metrics.event_queue_metadata_corruption_failures,
+                 (unsigned long long)queue_capacity_metrics.retention_evicted_rows,
+                 (unsigned long long)queue_capacity_metrics.pending_rows,
+                 (unsigned long long)queue_capacity_metrics.oldest_pending_created_unix_s,
+                 (unsigned long long)queue_capacity_metrics.oldest_pending_age_s,
+                 (unsigned long long)queue_capacity_metrics.enqueue_requests,
+                 (unsigned long long)queue_capacity_metrics.enqueue_reused,
+                 (unsigned long long)queue_capacity_metrics.enqueue_conflicts,
+                 (unsigned long long)queue_capacity_metrics.enqueue_admission_attempts,
+                 (unsigned long long)queue_capacity_metrics.enqueue_admitted,
+                 (unsigned long long)queue_capacity_metrics.enqueue_capacity_rejected,
+                 (unsigned long long)queue_capacity_metrics.enqueue_transaction_failures,
+                 (unsigned long long)queue_capacity_metrics.enqueue_commit_failures,
+                 (unsigned long long)queue_capacity_metrics.db_bytes,
+                 (unsigned long long)queue_capacity_metrics.wal_bytes,
+                 (unsigned long long)queue_capacity_metrics.shm_bytes,
+                 (unsigned long long)queue_capacity_metrics.physical_bytes,
+                 queue_capacity_metrics.accounting_available);
+  if (!p0_health_ok) {
+    /* Omit optional P0 metrics rather than append a syntactically incomplete
+     * fragment to the enclosing engine-health JSON document. */
+    p0_health_json[0] = '\0';
+  }
   /* 关联引擎状态（含注入回灌/发射限流指标）随健康周期上报，供后端看板评估误报/数据量。
    * 拼成 `,"correlation":{...}` 片段挂到 body 末尾（evidence_cache 之后）；关闭时留空，
    * 既不改 body 结构也不产生悬挂逗号。同时打一行 stderr 便于本地/验证脚本读取。 */
@@ -2648,6 +2818,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(ch.ebpf_last_error, ebpf_err, sizeof(ebpf_err));
   json_escape_small(ch.sensor_interest_version, sensor_interest_ver, sizeof(sensor_interest_ver));
   json_escape_small(ch.sensor_interest_rules_version, sensor_interest_rules, sizeof(sensor_interest_rules));
+  json_escape_small(ch.sensor_interest_p0_artifact_sha256, sensor_interest_artifact_sha,
+                    sizeof(sensor_interest_artifact_sha));
+  json_escape_small(ch.sensor_interest_p0_rule_coverage_sha256, sensor_interest_coverage_sha,
+                    sizeof(sensor_interest_coverage_sha));
+  json_escape_small(ch.sensor_interest_manifest_sha256, sensor_interest_manifest_sha,
+                    sizeof(sensor_interest_manifest_sha));
+  json_escape_small(ch.sensor_interest_manifest_hash_mode, sensor_interest_manifest_hash_mode,
+                    sizeof(sensor_interest_manifest_hash_mode));
   json_escape_small(ch.adaptive_collection_last_rule_id, adaptive_last_rule, sizeof(adaptive_last_rule));
   json_escape_small(event_filter_status.version, event_filter_ver, sizeof(event_filter_ver));
   json_escape_small(event_filter_status.last_drop_reason, event_filter_last_reason,
@@ -2743,7 +2921,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
       "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
       "%s"
-      "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"pushed\":%llu,"
+      "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
+      "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
       "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
       "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
       "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
@@ -2803,6 +2982,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
       "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+      "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
+      "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
+      "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+      "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
+      "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
       "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
       "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
       "\"snapshot_rejects\":%llu,\"cache_entries\":%u,\"cache_puts\":%llu,"
@@ -2835,6 +3019,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"ports\":%u,\"file_prefixes\":%u,\"file_contains\":%u,"
       "\"registry_prefixes\":%u,\"registry_contains\":%u,\"cmd_tokens\":%u,"
       "\"parent_child_pairs\":%u,\"required_fields\":%u,"
+      "\"full_admission\":{\"file_read\":%s,\"file_write\":%s,\"registry_set\":%s,"
+      "\"contract_valid\":%s,\"p0_binding_valid\":%s},"
+      "\"p0_artifact_sha256\":\"%s\",\"p0_rule_coverage_sha256\":\"%s\","
+      "\"manifest_sha256\":\"%s\",\"manifest_hash_mode\":\"%s\","
+      "\"p0_artifact_rule_count\":%u,\"snapshot_epoch\":%llu,"
       "\"checked\":%llu,\"matched\":%llu,\"dropped\":%llu,"
       "\"provider_hits\":%llu,\"adaptive_hits\":%llu,\"process_hits\":%llu,\"port_hits\":%llu,"
       "\"path_hits\":%llu,\"registry_hits\":%llu,\"parent_child_hits\":%llu}},"
@@ -2977,6 +3166,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       poll_probe_json,
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
+      edr_event_bus_p0_reserved_slots(agent->event_bus),
+      (unsigned long long)edr_event_bus_ordinary_reserve_rejected_total(agent->event_bus),
+      (unsigned long long)edr_event_bus_p0_reserve_rejected_total(agent->event_bus),
       (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
       (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
       (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
@@ -3075,6 +3267,27 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.etw_prefilter_dropped,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
+      (unsigned long long)ch.file_read_name_bindings,
+      (unsigned long long)ch.file_read_name_cache_misses,
+      (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,
+      (unsigned long long)ch.file_read_generation_unavailable,
+      (unsigned long long)ch.file_read_actor_generation_unavailable,
+      ch.file_read_p0_capability_healthy ? "true" : "false",
+      ch.file_read_p0_capability_reason[0] ? ch.file_read_p0_capability_reason : "healthy",
+      (unsigned long long)ch.file_read_metadata_gate_staged,
+      (unsigned long long)ch.file_read_metadata_gate_enqueue_attempts,
+      (unsigned long long)ch.file_read_metadata_gate_queue_rejected,
+      (unsigned long long)ch.file_read_metadata_gate_durable_successes,
+      (unsigned long long)ch.file_read_metadata_gate_durable_failures,
+      (unsigned long long)ch.file_read_metadata_gate_retry_attempts,
+      (unsigned long long)ch.file_read_metadata_gate_paused_events,
+      (unsigned long long)ch.file_read_metadata_gate_epoch_restart_attempts,
+      (unsigned long long)ch.file_read_metadata_gate_epoch_restart_successes,
+      (unsigned long long)ch.file_read_metadata_gate_epoch_restart_failures,
+      ch.kernel_file_start_key_requested ? "true" : "false",
+      ch.kernel_file_start_key_enabled ? "true" : "false",
+      (unsigned long long)ch.kernel_file_start_key_enable_failures,
+      ch.kernel_file_start_key_reason[0] ? ch.kernel_file_start_key_reason : "not_requested",
       (unsigned long long)ch.process_create_missing_identity,
       (unsigned long long)ch.process_identity_cache_hits,
       (unsigned long long)ch.process_identity_cache_misses,
@@ -3146,7 +3359,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.sensor_interest_ports, ch.sensor_interest_file_prefixes, ch.sensor_interest_file_contains,
       ch.sensor_interest_registry_prefixes, ch.sensor_interest_registry_contains,
       ch.sensor_interest_cmd_tokens, ch.sensor_interest_parent_child_pairs,
-      ch.sensor_interest_required_fields, (unsigned long long)ch.sensor_interest_checked,
+      ch.sensor_interest_required_fields,
+      ch.sensor_interest_file_read_full_admission ? "true" : "false",
+      ch.sensor_interest_file_write_full_admission ? "true" : "false",
+      ch.sensor_interest_registry_set_full_admission ? "true" : "false",
+      ch.sensor_interest_full_admission_contract_valid ? "true" : "false",
+      ch.sensor_interest_p0_binding_valid ? "true" : "false",
+      sensor_interest_artifact_sha, sensor_interest_coverage_sha,
+      sensor_interest_manifest_sha, sensor_interest_manifest_hash_mode,
+      ch.sensor_interest_p0_artifact_rule_count,
+      (unsigned long long)ch.sensor_interest_snapshot_epoch,
+      (unsigned long long)ch.sensor_interest_checked,
       (unsigned long long)ch.sensor_interest_matched, (unsigned long long)ch.sensor_interest_dropped,
       (unsigned long long)ch.sensor_interest_provider_hits,
       (unsigned long long)ch.sensor_interest_adaptive_hits,
@@ -3448,26 +3671,34 @@ static int edr_collection_policy_changed(const EdrConfig *current, const EdrConf
          current->collection.etw_firewall_provider != remote->collection.etw_firewall_provider;
 }
 
-static void edr_agent_restart_collector(EdrAgent *agent) {
+static int edr_agent_restart_collector(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
-    return;
+    return 0;
   }
   if (agent->collector_started) {
-    edr_collector_stop();
+    if (!edr_collector_stop()) {
+      /* A timed-out ETW/A4.4 join retains thread-owned buffers.  It is not a
+       * recoverable start failure: do not create a second provider epoch. */
+#ifdef _WIN32
+      edr_collector_file_read_metadata_gate_restart_timeout();
+#endif
+      return -1;
+    }
     agent->collector_started = 0;
   }
   if (!edr_agent_collection_enabled(&agent->cfg)) {
     fprintf(stderr, "[collector] remote policy disabled collection; collector stopped\n");
-    return;
+    return 0;
   }
   {
     EdrError e = edr_collector_start(agent->event_bus, &agent->cfg);
     if (e != EDR_OK) {
       fprintf(stderr, "[collector] remote policy restart failed: %d; continuing in degraded mode\n", (int)e);
-      return;
+      return 0;
     }
     agent->collector_started = 1;
     fprintf(stderr, "[collector] remote policy applied; collector restarted\n");
+    return 1;
   }
 }
 
@@ -3804,7 +4035,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   *last_remote_ns = now;
 
-  char tmp[520];
+  char tmp[2304];
 #ifdef _WIN32
   const char *t = getenv("TEMP");
   if (!t || !t[0]) {
@@ -3878,7 +4109,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_config_free_heap(&remote);
   (void)remove(tmp);
   if ((changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0) {
-    edr_agent_restart_collector(agent);
+    (void)edr_agent_restart_collector(agent);
   }
   if ((changed & EDR_REMOTE_POLICY_DETECTION_CHANGED) != 0) {
     edr_shellcode_detector_shutdown();
@@ -4129,41 +4360,30 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
   }
   *last_p0_bundle_ns = now;
 
-#ifdef _WIN32
-  {
-    const char *t = getenv("TEMP");
-    if (!t || !t[0]) {
-      t = ".";
-    }
-    snprintf(tmp, sizeof(tmp), "%s\\edr_p0_bundle_%lu.enc", t, (unsigned long)GetCurrentProcessId());
+  if (edr_p0_bundle_dst_path(dst, sizeof(dst)) != 0 || !dst[0]) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: cannot resolve destination path\n");
+    return;
   }
+#ifdef _WIN32
+  if ((size_t)snprintf(tmp, sizeof(tmp), "%s.staged.%lu.%llu", dst,
+                       (unsigned long)GetCurrentProcessId(),
+                       (unsigned long long)edr_monotonic_ns()) >= sizeof(tmp)) {
 #else
-  snprintf(tmp, sizeof(tmp), "/tmp/edr_p0_bundle_%d.enc", (int)getpid());
+  if ((size_t)snprintf(tmp, sizeof(tmp), "%s.staged.%ld.%llu", dst, (long)getpid(),
+                       (unsigned long long)edr_monotonic_ns()) >= sizeof(tmp)) {
 #endif
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: staged path too long\n");
+    return;
+  }
 
   if (edr_agent_download_text_file(url, tmp, 4u * 1024u * 1024u, "P0 bundle", NULL) != 0) {
     return;
   }
-  if (!edr_agent_file_has_magic(tmp, "EDR1", 4u)) {
-    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: missing EDR1 header\n");
+  if (!edr_p0_rule_ir_install_staged_bundle(tmp, dst)) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected or install failed: %s\n", dst);
     (void)remove(tmp);
     return;
   }
-  if (edr_p0_bundle_dst_path(dst, sizeof(dst)) != 0 || !dst[0]) {
-    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: cannot resolve destination path\n");
-    (void)remove(tmp);
-    return;
-  }
-  if (edr_agent_files_equal(tmp, dst)) {
-    (void)remove(tmp);
-    return;
-  }
-  if (edr_agent_replace_file(tmp, dst) != 0) {
-    fprintf(stderr, "[p0_rule_ir] remote bundle install failed: %s\n", dst);
-    (void)remove(tmp);
-    return;
-  }
-  edr_p0_rule_ir_reload();
   {
     const char *source = "";
     const char *sha = "";

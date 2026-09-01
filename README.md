@@ -106,7 +106,6 @@ cmake --build build
 
 | 选项 | 含义 |
 |------|------|
-| `EDR_WITH_GRPC` | 已废弃。设为 `ON` 会在 CMake 阶段失败；端侧产品构建统一使用 HTTPS REST ingest/control。 |
 | `EDR_WITH_INGEST_HTTPS_OPENSSL` | 启用 native HTTPS REST 上报路径；Windows 产品构建默认要求可用。 |
 | `EDR_WITH_HTTP2_CURL` / `EDR_REQUIRE_CURL_HTTP2` | 启用 libcurl HTTP/2 控制/上报能力；需要 curl headers 暴露 `CURL_VERSION_HTTP2`。 |
 | `EDR_WITH_LINUX_COLLECTOR`（默认 `ON`，**仅 Linux**） | 为 `ON` 时编入 `src/collector/collector_linux.c`；为 `OFF` 时在 Linux 上退回 `collector_stub.c`（与其它 POSIX 一致）。**Windows 不受影响**（始终使用 `collector_win.c`）。 |
@@ -272,7 +271,7 @@ cmake --build build
 | `EDR_P0_MAX_EMITS_PER_MIN` | P0 直出**全进程**滑动 60s 内条数上限；`0` 或未设=不限制。 |
 | `EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT` | 按 **tenant_id** 独立滑动 60s 内条数上限；**默认 60/分**；`0` 为关闭**每租户**限流（仍受上项全局限制，若有）。`tenant_id` 空串视为同桶。 |
 | `EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT` | 按 **endpoint_id** 独立滑动 60s 内条数上限；**默认 0=关闭**；与上两项叠加。`endpoint_id` 空串同桶。 |
-| （编译期）`EDR_P0_RULES_BUNDLE_VERSION` | 由 **CMake** `-D` / 默认串 注入 `p0_rule_direct_emit.c`，须与 `config/p0_rule_bundle_manifest.json`、**`p0_rule_bundle_ir_v1.json`** 及平台 `dynamic_rules_v1.json` 根 `version` **一致**；发版前跑 **`edr-backend/scripts/verify_p0_bundle_version_alignment.sh`**（四处对账）。 |
+| P0 rule-bundle identity | 不使用环境变量或编译期常量。P0 直出在一次保留的、已验证 IR 快照中同时取得匹配规则、`rules_bundle_version`、SHA-256 与 epoch；同一帧链只使用该副本，避免规则重载时混用不同代际。 |
 | （CMake）`EDR_P0_IR_EMBED` | 默认 **ON**（需 **Python3**）：构建时从 `config/p0_rule_bundle_ir_v1.json` 生成 `edr_p0_rule_ir_embed.c` 并入链接；运行期**先**读外置 JSON（`EDR_P0_IR_PATH` / `edr_config/`），读失败或**无可求值** P0 规则时再 **回退** 到嵌入字节。`p0_rule_bundle_ir_v1` 中 `event_type` 与 Go `dynamicrules` 同构（如 `process_create` / `file_write` / `network_connect` / `registry_set`）。设为 **OFF** 可跳过生成（无 Python 的极简环境）。 |
 | （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
 | （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |

@@ -3,7 +3,9 @@
 #include "edr/resource.h"
 #include "edr/attack_surface_report.h"
 #include "edr/config.h"
+#include "edr/collector.h"
 #include "edr/behavior_from_slot.h"
+#include "edr/behavior_alert_emit.h"
 #include "edr/behavior_proto.h"
 #include "edr/behavior_proto_c.h"
 #include "edr/behavior_wire.h"
@@ -21,15 +23,18 @@
 #include "edr/correlation_engine.h"
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
 #include "edr/process_tree_cache.h"
-#include "edr/sha256.h"
 #include "edr/storage_queue.h"
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
 #include "edr/windows_event_policy.h"
-#include "edr/enrich_parent_info.h"
+#include "edr/process_create_coalescer.h"
+#include "edr/process_evidence_worker.h"
+#include "edr/process_generation.h"
+#include "edr/windows_file_identity.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -40,6 +45,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <sddl.h>
 static HANDLE s_thread;
 static volatile LONG s_stop_preprocess;
 #else
@@ -49,16 +55,29 @@ static pthread_t s_thread;
 static volatile int s_stop_preprocess;
 #endif
 
-#ifndef EDR_P0_RULES_BUNDLE_VERSION
-#define EDR_P0_RULES_BUNDLE_VERSION "unknown"
-#endif
-
 static int s_preprocess_active;
 
 static EdrEventBus *s_bus;
 static unsigned s_telemetry_sampling_pct = 100u;
 static uint64_t s_sampling_dropped;
 static uint64_t s_sampling_kept;
+
+#ifdef _WIN32
+#define EDR_P0_TOKEN_IDENTITY_CACHE 128u
+typedef struct {
+  uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
+  char canonical_path[EDR_BR_STR_LONG];
+  char username[EDR_BR_STR_SHORT];
+  char domain[EDR_BR_STR_SHORT];
+  char user_sid[EDR_BR_STR_SHORT];
+  char logon_id[64];
+  uint8_t valid;
+} EdrP0TokenIdentityCacheEntry;
+static EdrP0TokenIdentityCacheEntry s_p0_token_identity_cache[EDR_P0_TOKEN_IDENTITY_CACHE];
+static uint32_t s_p0_token_identity_next;
+#endif
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 endpoint_id 一致） */
 static char s_cfg_endpoint_id[128];
@@ -228,143 +247,550 @@ static void format_record_time_ns(int64_t ns, char *out, size_t cap) {
   (void)strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
-static int process_hash_enabled(void) {
-  const char *v = getenv("EDR_PROCESS_EXE_HASH");
-  if (!v || !v[0]) {
-    return 1;
-  }
-  return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'o' || v[0] == 'O');
+static uint64_t filetime_100ns_to_unix_ns(uint64_t filetime_100ns) {
+  const uint64_t unix_epoch_100ns = 116444736000000000ULL;
+  if (filetime_100ns <= unix_epoch_100ns) return 0u;
+  return (filetime_100ns - unix_epoch_100ns) * 100u;
 }
 
-static uint64_t process_hash_max_bytes(void) {
-  const char *v = getenv("EDR_PROCESS_EXE_HASH_MAX_MB");
-  long mb = v && v[0] ? strtol(v, NULL, 10) : 64L;
-  if (mb < 1L) {
-    mb = 1L;
+#ifdef _WIN32
+static int evidence_json_escape(const char *in, char *out, size_t cap) {
+  static const char hex[] = "0123456789abcdef";
+  size_t used = 0u;
+  if (!out || cap == 0u) return 0;
+  if (!in) in = "";
+  for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+    size_t need = 1u;
+    if (*p == '"' || *p == '\\') need = 2u;
+    else if (*p < 0x20u) need = 6u;
+    if (used + need >= cap) {
+      out[0] = '\0';
+      return 0;
+    }
+    if (*p == '"' || *p == '\\') {
+      out[used++] = '\\';
+      out[used++] = (char)*p;
+    } else if (*p < 0x20u) {
+      out[used++] = '\\'; out[used++] = 'u'; out[used++] = '0'; out[used++] = '0';
+      out[used++] = hex[*p >> 4u]; out[used++] = hex[*p & 0x0fu];
+    } else {
+      out[used++] = (char)*p;
+    }
   }
-  if (mb > 512L) {
-    mb = 512L;
-  }
-  return (uint64_t)mb * 1024ULL * 1024ULL;
+  out[used] = '\0';
+  return 1;
 }
+#endif
 
-static int is_drive_path(const char *path) {
-  return path && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
-         path[1] == ':' && (path[2] == '\\' || path[2] == '/');
-}
-
-static int file_size_within_limit(FILE *f, uint64_t limit) {
-  if (!f) {
+#ifdef _WIN32
+static int p0_token_identity_cache_same_generation(const EdrP0TokenIdentityCacheEntry *entry,
+                                                    const EdrBehaviorRecord *br) {
+  const char *path;
+  EdrWindowsUtf8PathCompareResult path_compare;
+  if (!entry || !entry->valid || !br || entry->pid != br->pid ||
+      !br->process_start_key || !br->process_creation_filetime_100ns ||
+      entry->process_start_key != br->process_start_key ||
+      entry->process_creation_filetime_100ns != br->process_creation_filetime_100ns) {
     return 0;
   }
-#ifdef _WIN32
-  if (_fseeki64(f, 0, SEEK_END) != 0) {
-    rewind(f);
-    return 1;
+  path = br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path;
+  if (!path[0] || !entry->canonical_path[0]) {
+    return 0;
   }
-  __int64 sz = _ftelli64(f);
-  rewind(f);
-  if (sz < 0) {
-    return 1;
+  path_compare = edr_windows_utf8_path_compare_ci(entry->canonical_path, path);
+  if (path_compare != EDR_WINDOWS_UTF8_PATH_COMPARE_MATCH) {
+    return 0;
   }
-  return (uint64_t)sz <= limit;
-#else
-  if (fseeko(f, 0, SEEK_END) != 0) {
-    rewind(f);
-    return 1;
-  }
-  off_t sz = ftello(f);
-  rewind(f);
-  if (sz < 0) {
-    return 1;
-  }
-  return (uint64_t)sz <= limit;
-#endif
+  return 1;
 }
 
-static int hash_file_sha256_bounded(const char *path, char out65[65]) {
-  if (!out65) {
-    return -1;
+static void p0_mark_file_read_collector_evidence(EdrBehaviorRecord *br, const char *reason) {
+  const EdrP0SourceOnlyReason *contract;
+  if (!br || br->type != EDR_EVENT_FILE_READ || !reason || !reason[0]) return;
+  /* A missing file path cannot support a truthful target-path assertion.  The
+   * one registered nullable-path reason retains the source identity without
+   * fabricating a filename. */
+  if (!br->file_path[0]) reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
+  contract = edr_p0_source_only_reason_find(reason);
+  if (!contract || contract->stage != EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE ||
+      strcmp(contract->gate_id, EDR_P0_FILE_READ_METADATA_GATE) != 0) {
+    return;
   }
-  out65[0] = '\0';
-  if (!process_hash_enabled() || !is_drive_path(path)) {
-    return -1;
+  snprintf(br->source_completeness, sizeof(br->source_completeness), "%s",
+           "NOT_EVALUABLE");
+  snprintf(br->collector_evidence_gate, sizeof(br->collector_evidence_gate), "%s",
+           EDR_P0_FILE_READ_METADATA_GATE);
+  snprintf(br->collector_evidence_reason, sizeof(br->collector_evidence_reason), "%s",
+           reason);
+}
+
+static const char *p0_file_read_live_generation_reason(const char *live_reason) {
+  if (!live_reason || !live_reason[0] ||
+      strcmp(live_reason, "etw_process_start_key_unavailable") == 0) {
+    return EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
   }
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    return -1;
+  if (strcmp(live_reason, "process_start_key_mismatch") == 0 ||
+      strcmp(live_reason, "telemetry_pid_mismatch") == 0 ||
+      strcmp(live_reason, "live_creation_filetime_mismatch") == 0) {
+    return EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH;
   }
-  if (!file_size_within_limit(f, process_hash_max_bytes())) {
-    fclose(f);
-    return -1;
+  return EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE;
+}
+
+/* Bind the ETW raw ProcessStartKey to the current process before accepting a
+ * creation FILETIME. EventHeader.TimeStamp is never a creation surrogate.
+ * The native telemetry contract is Windows 10+; unsupported systems stay
+ * source-only and are marked NOT_EVALUABLE by the P0 gate. */
+static int p0_bind_process_generation(EdrBehaviorRecord *br) {
+  HANDLE process = NULL;
+  FILETIME created, exited, kernel, user;
+  ULARGE_INTEGER observed;
+  uint64_t telemetry_creation = 0u;
+  char reason[64];
+  if (!br || br->is_security_4688 ||
+      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ) ||
+      (br->type == EDR_EVENT_PROCESS_CREATE &&
+       !edr_process_create_is_lifecycle_authoritative(br))) {
+    return 0;
   }
-  EdrSha256Ctx ctx;
-  edr_sha256_init(&ctx);
-  uint8_t buf[32768];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    edr_sha256_update(&ctx, buf, n);
+  /* Never retain a payload-provided creation time until the live key binding
+   * below has proven it belongs to this exact PID generation. */
+  br->process_creation_filetime_100ns = 0u;
+  if (!br->pid || !br->process_start_key) {
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             "etw_process_start_key_unavailable");
+    p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
+    return 0;
   }
-  if (ferror(f)) {
-    fclose(f);
-    out65[0] = '\0';
-    return -1;
+  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
+  if (!process) {
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             "live_process_open_failed");
+    p0_mark_file_read_collector_evidence(br,
+                                         EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE);
+    return 0;
   }
-  fclose(f);
-  uint8_t d[EDR_SHA256_DIGEST_LEN];
-  edr_sha256_final(&ctx, d);
-  static const char hx[] = "0123456789abcdef";
-  for (size_t i = 0; i < EDR_SHA256_DIGEST_LEN; i++) {
-    out65[i * 2u] = hx[(d[i] >> 4) & 0xfu];
-    out65[i * 2u + 1u] = hx[d[i] & 0xfu];
+  reason[0] = '\0';
+  if (!edr_process_generation_validate_live(process, br->pid, br->process_start_key,
+                                            &telemetry_creation, reason, sizeof(reason)) ||
+      !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    CloseHandle(process);
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             reason[0] ? reason : "live_generation_query_failed");
+    p0_mark_file_read_collector_evidence(br, p0_file_read_live_generation_reason(reason));
+    return 0;
   }
-  out65[64] = '\0';
-  return 0;
+  CloseHandle(process);
+  observed.LowPart = created.dwLowDateTime;
+  observed.HighPart = created.dwHighDateTime;
+  if (!telemetry_creation || observed.QuadPart != telemetry_creation) {
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             "live_creation_filetime_mismatch");
+    p0_mark_file_read_collector_evidence(br,
+                                         EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH);
+    return 0;
+  }
+  br->process_creation_filetime_100ns = telemetry_creation;
+  snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+           "etw_start_key_live_telemetry");
+  return 1;
+}
+
+static int enrich_process_token_identity(EdrBehaviorRecord *br) {
+  HANDLE process = NULL;
+  HANDLE token = NULL;
+  TOKEN_USER *token_user = NULL;
+  DWORD required = 0u;
+  TOKEN_STATISTICS statistics;
+  DWORD statistics_size = 0u;
+  LPSTR sid = NULL;
+  char account[EDR_BR_STR_SHORT];
+  char domain[EDR_BR_STR_SHORT];
+  DWORD account_cap = (DWORD)sizeof(account);
+  DWORD domain_cap = (DWORD)sizeof(domain);
+  SID_NAME_USE sid_use;
+  int resolved = 0;
+  uint64_t actual_creation_filetime = 0u;
+  char live_path[EDR_BR_STR_LONG];
+  char correlated_target_sid[EDR_BR_STR_SHORT];
+  char correlated_target_logon[64];
+  DWORD open_error = ERROR_SUCCESS;
+  int validate_4688_target = 0;
+  int target_4688_mismatch = 0;
+  int path_invalid_utf8 = 0;
+
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->is_security_4688 || br->pid == 0u) {
+    return 0;
+  }
+  memset(correlated_target_sid, 0, sizeof(correlated_target_sid));
+  memset(correlated_target_logon, 0, sizeof(correlated_target_logon));
+  validate_4688_target = strcmp(br->identity_quality, "target_4688") == 0;
+  if (validate_4688_target) {
+    /* A 4688 has no raw ProcessStartKey.  It is only advisory until the live
+     * token of the already StartKey/FILETIME/path-bound process agrees
+     * with both Target Subject values.  This prevents delayed A/then-PID-reuse
+     * B 4688 records from lending B an A identity. */
+    snprintf(correlated_target_sid, sizeof(correlated_target_sid), "%s", br->user_sid);
+    snprintf(correlated_target_logon, sizeof(correlated_target_logon), "%s", br->logon_id);
+    /* Do not let raw Security data survive a failed live validation.  The
+     * fields below are repopulated only from the exact-bound process token. */
+    br->username[0] = '\0';
+    br->domain[0] = '\0';
+    br->user_sid[0] = '\0';
+    br->logon_id[0] = '\0';
+    if (!correlated_target_sid[0] || !correlated_target_logon[0]) {
+      snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+               "target_4688_incomplete");
+      snprintf(br->identity_quality, sizeof(br->identity_quality), "%s", "unavailable");
+      snprintf(br->source_completeness, sizeof(br->source_completeness), "%s",
+               "NOT_EVALUABLE");
+      return 0;
+    }
+  }
+  if (br->image_path_canonical[0] &&
+      edr_windows_utf8_path_compare_ci(br->image_path_canonical,
+                                        br->image_path_canonical) ==
+          EDR_WINDOWS_UTF8_PATH_COMPARE_INVALID_UTF8) {
+    path_invalid_utf8 = 1;
+    goto done;
+  }
+  if (!validate_4688_target && (br->username[0] || br->user_sid[0])) {
+    return 0;
+  }
+  if (!br->process_start_key || !br->process_creation_filetime_100ns ||
+      !br->image_path_canonical[0]) {
+    open_error = ERROR_INVALID_PARAMETER;
+    goto done;
+  }
+  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
+  if (!process) {
+    open_error = GetLastError();
+    goto done;
+  }
+  {
+    FILETIME created, exited, kernel, user;
+    ULARGE_INTEGER created_value;
+    uint64_t telemetry_creation = 0u;
+    char generation_reason[64];
+    generation_reason[0] = '\0';
+    if (!edr_process_generation_validate_live(process, br->pid, br->process_start_key,
+                                              &telemetry_creation, generation_reason,
+                                              sizeof(generation_reason)) ||
+        !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+      open_error = GetLastError();
+      goto done;
+    }
+    created_value.LowPart = created.dwLowDateTime;
+    created_value.HighPart = created.dwHighDateTime;
+    actual_creation_filetime = created_value.QuadPart;
+    if (!actual_creation_filetime || actual_creation_filetime != telemetry_creation ||
+        actual_creation_filetime != br->process_creation_filetime_100ns) {
+      open_error = ERROR_INVALID_PARAMETER;
+      goto done;
+    }
+    if (!edr_windows_process_image_path_utf8(process, live_path, sizeof(live_path))) {
+      open_error = GetLastError();
+      path_invalid_utf8 = open_error == ERROR_NO_UNICODE_TRANSLATION;
+      goto done;
+    }
+    {
+      EdrWindowsUtf8PathCompareResult path_compare =
+          edr_windows_utf8_path_compare_ci(live_path, br->image_path_canonical);
+      if (path_compare != EDR_WINDOWS_UTF8_PATH_COMPARE_MATCH) {
+        path_invalid_utf8 = path_compare == EDR_WINDOWS_UTF8_PATH_COMPARE_INVALID_UTF8;
+        open_error = path_invalid_utf8 ? ERROR_NO_UNICODE_TRANSLATION : ERROR_INVALID_PARAMETER;
+        goto done;
+      }
+    }
+  }
+  for (uint32_t i = 0u; i < EDR_P0_TOKEN_IDENTITY_CACHE; i++) {
+    EdrP0TokenIdentityCacheEntry *entry = &s_p0_token_identity_cache[i];
+    if (!p0_token_identity_cache_same_generation(entry, br)) {
+      continue;
+    }
+    if (validate_4688_target &&
+        (strcmp(entry->user_sid, correlated_target_sid) != 0 ||
+         strcmp(entry->logon_id, correlated_target_logon) != 0)) {
+      target_4688_mismatch = 1;
+      open_error = ERROR_INVALID_DATA;
+      goto done;
+    }
+    snprintf(br->username, sizeof(br->username), "%s", entry->username);
+    snprintf(br->domain, sizeof(br->domain), "%s", entry->domain);
+    snprintf(br->user_sid, sizeof(br->user_sid), "%s", entry->user_sid);
+    snprintf(br->logon_id, sizeof(br->logon_id), "%s", entry->logon_id);
+    snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+             validate_4688_target ? "token_cache_4688_validated" : "token_cache");
+    snprintf(br->identity_quality, sizeof(br->identity_quality), "%s", "token_sid");
+    resolved = 1;
+    goto done;
+  }
+  if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+    open_error = GetLastError();
+    goto done;
+  }
+  (void)GetTokenInformation(token, TokenUser, NULL, 0u, &required);
+  if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required == 0u) {
+    goto done;
+  }
+  token_user = (TOKEN_USER *)malloc(required);
+  if (!token_user || !GetTokenInformation(token, TokenUser, token_user, required, &required) ||
+      !ConvertSidToStringSidA(token_user->User.Sid, &sid) || !sid || !sid[0]) {
+    goto done;
+  }
+  snprintf(br->user_sid, sizeof(br->user_sid), "%s", sid);
+  if (LookupAccountSidA(NULL, token_user->User.Sid, account, &account_cap, domain, &domain_cap,
+                        &sid_use)) {
+    snprintf(br->domain, sizeof(br->domain), "%s", domain);
+    if (domain[0]) {
+      snprintf(br->username, sizeof(br->username), "%s\\%s", domain, account);
+    } else {
+      snprintf(br->username, sizeof(br->username), "%s", account);
+    }
+  }
+  if (GetTokenInformation(token, TokenStatistics, &statistics, sizeof(statistics), &statistics_size)) {
+    snprintf(br->logon_id, sizeof(br->logon_id), "0x%08lx%08lx",
+             (unsigned long)statistics.AuthenticationId.HighPart,
+             (unsigned long)statistics.AuthenticationId.LowPart);
+  }
+  if (validate_4688_target &&
+      (strcmp(br->user_sid, correlated_target_sid) != 0 ||
+       strcmp(br->logon_id, correlated_target_logon) != 0)) {
+    target_4688_mismatch = 1;
+    open_error = ERROR_INVALID_DATA;
+    goto done;
+  }
+  snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+           validate_4688_target ? "token_query_4688_validated" : "token_query");
+  snprintf(br->identity_quality, sizeof(br->identity_quality), "%s", "token_sid");
+  resolved = 1;
+done:
+  if (sid) {
+    LocalFree(sid);
+  }
+  free(token_user);
+  if (token) {
+    CloseHandle(token);
+  }
+  if (process) {
+    CloseHandle(process);
+  }
+  if (resolved) {
+    EdrP0TokenIdentityCacheEntry *entry =
+        &s_p0_token_identity_cache[s_p0_token_identity_next++ % EDR_P0_TOKEN_IDENTITY_CACHE];
+    memset(entry, 0, sizeof(*entry));
+    entry->pid = br->pid;
+    entry->process_start_key = br->process_start_key;
+    entry->process_creation_filetime_100ns = actual_creation_filetime;
+    snprintf(entry->canonical_path, sizeof(entry->canonical_path), "%s", br->image_path_canonical);
+    snprintf(entry->username, sizeof(entry->username), "%s", br->username);
+    snprintf(entry->domain, sizeof(entry->domain), "%s", br->domain);
+    snprintf(entry->user_sid, sizeof(entry->user_sid), "%s", br->user_sid);
+    snprintf(entry->logon_id, sizeof(entry->logon_id), "%s", br->logon_id);
+    entry->valid = 1u;
+  } else {
+    if (path_invalid_utf8) {
+      br->username[0] = '\0';
+      br->domain[0] = '\0';
+      br->user_sid[0] = '\0';
+      br->logon_id[0] = '\0';
+      snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+               validate_4688_target ? "target_4688_live_path_invalid_utf8" :
+                                      "token_path_invalid_utf8");
+      snprintf(br->identity_quality, sizeof(br->identity_quality), "%s", "unavailable");
+      snprintf(br->image_path_resolution_source, sizeof(br->image_path_resolution_source),
+               "%s", "invalid_utf8");
+      snprintf(br->image_path_resolution_status, sizeof(br->image_path_resolution_status),
+               "%s", "NOT_EVALUABLE");
+      snprintf(br->source_completeness, sizeof(br->source_completeness), "%s",
+               "NOT_EVALUABLE");
+    } else if (validate_4688_target) {
+      br->username[0] = '\0';
+      br->domain[0] = '\0';
+      br->user_sid[0] = '\0';
+      br->logon_id[0] = '\0';
+      snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+               target_4688_mismatch ? "target_4688_live_mismatch" :
+                                       "target_4688_live_unavailable");
+      snprintf(br->identity_quality, sizeof(br->identity_quality), "%s", "unavailable");
+      snprintf(br->source_completeness, sizeof(br->source_completeness), "%s",
+               "NOT_EVALUABLE");
+    } else {
+      snprintf(br->identity_source, sizeof(br->identity_source), "%s",
+               open_error == ERROR_ACCESS_DENIED ? "token_access_denied" : "token_query");
+      snprintf(br->identity_quality, sizeof(br->identity_quality), "%s",
+               open_error == ERROR_ACCESS_DENIED ? "access_denied" : "unavailable");
+    }
+  }
+  return resolved;
+}
+#endif
+
+static const char *p0_process_create_not_evaluable_reason(const EdrBehaviorRecord *br) {
+#ifdef _WIN32
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE) {
+    return NULL;
+  }
+  if (br->is_security_4688) {
+    return "security_4688_enrichment";
+  }
+  /* The current authenticated IR has no artifact hash/signature/file-id
+   * predicates.  A background pathname-snapshot timeout therefore cannot
+   * suppress an otherwise complete chain/cmd/user detection.  Terminal block
+   * authority is separately rejected in the direct emitter and policy layer. */
+  if (strcmp(br->identity_source, "target_4688_live_mismatch") == 0) {
+    return "target_4688_live_identity_mismatch";
+  }
+  if (strcmp(br->identity_source, "target_4688_incomplete") == 0) {
+    return "target_4688_identity_incomplete";
+  }
+  if (strcmp(br->identity_source, "target_4688_live_unavailable") == 0) {
+    return "target_4688_live_identity_unavailable";
+  }
+  if (strcmp(br->identity_source, "target_4688_live_path_invalid_utf8") == 0) {
+    return "target_4688_live_identity_unavailable";
+  }
+  if (strcmp(br->identity_source, "token_path_invalid_utf8") == 0) {
+    return "image_path_not_resolved";
+  }
+  /* A parser or record-boundary omission is named in source_truncated_fields.
+   * It remains authoritative even if a later coalescer stage records a
+   * correlation status in source_completeness. */
+  if (strcmp(br->source_completeness, "TRUNCATED") == 0 ||
+      br->source_truncated_fields[0] != '\0') {
+    return "source_fields_truncated";
+  }
+  if (strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) {
+    return "process_generation_or_correlation_unavailable";
+  }
+  if (strcmp(br->source_completeness, "COALESCE_BACKPRESSURE") == 0) {
+    return "coalescer_backpressure";
+  }
+  if (!br->process_creation_filetime_100ns) {
+    return "missing_process_generation";
+  }
+  if ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
+      strcmp(br->image_path_resolution_status, "NOT_EVALUABLE") == 0) {
+    return "image_path_not_resolved";
+  }
+  if (!br->process_name[0] || !br->exe_path[0]) {
+    return "missing_process_identity";
+  }
+  if (!br->cmdline[0]) {
+    return "missing_cmdline";
+  }
+  if (br->ppid == 0u || strcmp(br->parent_resolution_status, "RESOLVED") != 0 ||
+      !br->parent_path[0] || !br->parent_creation_time[0]) {
+    return "missing_parent_generation";
+  }
+  if (strcmp(br->identity_quality, "target_4688") != 0 &&
+      strcmp(br->identity_quality, "token_sid") != 0) {
+    return strcmp(br->identity_quality, "creator_fallback") == 0
+        ? "creator_only_identity" : "missing_target_identity";
+  }
+  if (!br->username[0] && !br->user_sid[0]) {
+    return "missing_target_identity";
+  }
+#else
+  (void)br;
+#endif
+  return NULL;
+}
+
+static void p0_mark_not_evaluable(EdrBehaviorRecord *br, const char *reason) {
+  EdrBehaviorRecord built;
+  if (!br || !reason) return;
+  if (!edr_p0_source_only_build_pre_evaluation_record(br, reason, &built)) {
+    fprintf(stderr, "[P0] unregistered or malformed pre-evaluation reason rejected: %s\n",
+            reason);
+    return;
+  }
+  *br = built;
 }
 
 static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->pid == 0u) {
     return;
   }
-  if (!br->parent_name[0] && br->ppid > 0u) {
-    (void)enrich_parent_info_by_pid(br->ppid, br->parent_name, sizeof(br->parent_name),
-                                    br->parent_path, sizeof(br->parent_path));
+  if (br->ppid > 0u) {
+    ProcessTreeEntry parent;
+    if (edr_pt_cache_snapshot_at(br->ppid,
+                                 (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0),
+                                 &parent) == 0 &&
+        parent.process_start_key != 0u &&
+        parent.creation_filetime_100ns != 0u && parent.start_time_ns != 0u) {
+      /* The historical cache, not raw 4688 fields or a current PID lookup,
+       * owns the parent generation.  Overwrite any earlier unbound display
+       * values so an A->B PID reuse cannot borrow B's path or FILETIME. */
+      snprintf(br->parent_name, sizeof(br->parent_name), "%s", parent.process_name);
+      snprintf(br->parent_path, sizeof(br->parent_path), "%s", parent.exe_path);
+      format_record_time_ns((int64_t)filetime_100ns_to_unix_ns(
+                                parent.creation_filetime_100ns), br->parent_creation_time,
+                            sizeof(br->parent_creation_time));
+      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s", "process_tree_cache");
+      snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
+               parent.process_name[0] && parent.exe_path[0] && br->parent_creation_time[0] ?
+                   "RESOLVED" : "NOT_EVALUABLE");
+    } else {
+      /* A PID-only lookup cannot establish a parent generation.  Keep the
+       * source record and let the P0 pre-evaluation gate emit the registered
+       * missing_parent_generation disposition instead of borrowing a current
+       * process that may have reused this PID. */
+      br->parent_creation_time[0] = '\0';
+      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s",
+               "generation_unavailable");
+      snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
+               "NOT_EVALUABLE");
+    }
   }
-  if (edr_process_create_is_lifecycle_authoritative(br)) {
-    (void)edr_pt_cache_put(br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path,
-                           br->parent_name, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0));
+  if (edr_process_create_is_lifecycle_authoritative(br) && br->process_start_key != 0u &&
+      br->process_creation_filetime_100ns != 0u) {
+    (void)edr_pt_cache_put_generation(
+        br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path, br->parent_name,
+        (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), br->process_start_key,
+        br->process_creation_filetime_100ns);
   }
   {
     uint32_t chain_depth = 0u;
-    edr_pt_cache_fill_record(br->pid,
-                             br->grandparent_name, sizeof(br->grandparent_name),
-                             br->grandparent_path, sizeof(br->grandparent_path),
-                             &br->grandparent_pid,
-                             br->parent_cmdline, sizeof(br->parent_cmdline),
-                             &chain_depth);
+    edr_pt_cache_fill_record_at(
+        br->pid, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0),
+        br->grandparent_name, sizeof(br->grandparent_name), br->grandparent_path,
+        sizeof(br->grandparent_path), &br->grandparent_pid, br->parent_cmdline,
+        sizeof(br->parent_cmdline), &chain_depth);
     if (chain_depth > 0u) {
       br->process_chain_depth = chain_depth;
     }
   }
   if (!br->process_creation_time[0]) {
-    format_record_time_ns(br->event_time_ns, br->process_creation_time, sizeof(br->process_creation_time));
+    format_record_time_ns((int64_t)(br->process_creation_filetime_100ns
+                                        ? filetime_100ns_to_unix_ns(
+                                              br->process_creation_filetime_100ns)
+                                        : (uint64_t)(br->event_time_ns > 0 ?
+                                                         br->event_time_ns : 0)),
+                          br->process_creation_time, sizeof(br->process_creation_time));
   }
-  if (!br->exe_hash[0] && br->exe_path[0]) {
-    (void)hash_file_sha256_bounded(br->exe_path, br->exe_hash);
-  }
+  /* Hashing and Authenticode verification run in process_evidence_worker.
+   * This worker is also used by the coalescer deadline, never by an ETW
+   * callback or this hot preprocess path. */
+#ifdef _WIN32
+  (void)enrich_process_token_identity(br);
+#endif
 }
 
 static void log_p0_runtime_state(void) {
+  EdrP0RuleIrBinding binding;
   edr_p0_rule_ir_lazy_init();
   const char *ir_source = "";
   const char *ir_sha256 = "";
   size_t ir_plain_size = 0u;
   (void)edr_p0_rule_ir_get_bundle_info(&ir_source, &ir_plain_size, &ir_sha256);
+  memset(&binding, 0, sizeof(binding));
+  (void)edr_p0_rule_ir_get_binding(&binding);
   fprintf(stderr, "[P0] direct_emit=%s ir_ready=%d rules=%d bundle=%s ir_plain_size=%zu ir_sha256=%s ir_source=%s\n",
           p0_direct_emit_enabled() ? "on" : "off",
           edr_p0_rule_ir_is_ready(),
           edr_p0_rule_ir_rule_count(),
-          EDR_P0_RULES_BUNDLE_VERSION,
+          binding.rules_bundle_version[0] ? binding.rules_bundle_version : "unknown",
           ir_plain_size,
           (ir_sha256 && ir_sha256[0]) ? ir_sha256 : "unknown",
           (ir_source && ir_source[0]) ? ir_source : "unknown");
@@ -414,12 +840,150 @@ static void poll_summary_flush(void) {
   edr_local_evidence_cache_flush_summaries(now_ns, emit_summary_record);
 }
 
-static void process_one_slot(const EdrEventSlot *slot) {
-  /* AGT-010：资源压力下跳过低优先级槽位；保留 priority==0 与 §19.10 attack_surface_hint */
-  if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
-      slot->attack_surface_hint == 0u) {
+static int p0_process_create_candidate(const EdrBehaviorRecord *br) {
+#ifdef _WIN32
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE) return 0;
+  /* Fast manifest-backed prefilter.  A full rule match is allowed when all
+   * fields are present; otherwise only a process/path interest match may
+   * reserve bounded coalescer capacity. */
+  if (edr_p0_rule_ir_br_matches_any(br)) return 1;
+  return edr_p0_rule_ir_is_interesting_process_name(br->process_name) ||
+         edr_p0_rule_ir_is_interesting_process_name(br->exe_path) ||
+         edr_p0_rule_ir_is_interesting_process_name(br->image_path_canonical);
+#else
+  (void)br;
+  return 0;
+#endif
+}
+
+static void apply_process_evidence(EdrBehaviorRecord *br) {
+#ifdef _WIN32
+  EdrProcessEvidence requested;
+  EdrProcessEvidence evidence;
+  uint64_t generation;
+  int evidence_ready;
+  int identity_evaluable;
+  const char *artifact_quality;
+  const char *artifact_reason;
+  char file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP * 2u];
+  char hash_value[96], hash_quality[64], hash_reason[160], signature_status[64], signature_source[96];
+  char signer[1024], thumbprint[192], revocation[64], signature_quality[64], signature_reason[160];
+  int n;
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->is_security_4688) return;
+  /* Never spend the bounded wait on ordinary ProcessCreate traffic.  The
+   * coalescer already admits only P0-interest records to this evidence path;
+   * non-candidates proceed without a synchronous hash/WVT wait. */
+  if (!p0_process_create_candidate(br)) return;
+  generation = br->process_start_key;
+  memset(&requested, 0, sizeof(requested));
+  (void)edr_process_evidence_request(br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
+                                     generation, edr_monotonic_ns(), &requested);
+  evidence = requested;
+  evidence_ready = edr_process_evidence_wait(br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
+                                             generation, edr_monotonic_ns(),
+                                             250ULL * 1000000ULL, &evidence);
+  if (!evidence_ready && !evidence.file_identity[0]) {
+    snprintf(evidence.file_identity, sizeof(evidence.file_identity), "%s",
+             requested.file_identity);
+    evidence.file_write_time = requested.file_write_time;
+  }
+  /* The worker owns one handle for this pathname snapshot, but that handle is
+   * first opened after the ProcessCreate event.  Do not promote its hash into
+   * the process image field: A may already be running while path P now names
+   * B.  Keep the snapshot only in explicitly non-authoritative evidence. */
+  identity_evaluable = edr_windows_file_identity_valid(evidence.file_identity);
+  if (!evidence.file_identity[0]) {
+    artifact_quality = "NOT_EVALUABLE";
+    artifact_reason = "file_identity_unavailable";
+  } else if (!identity_evaluable) {
+    /* Retain an old XOR-shaped value only as telemetry. It cannot become
+     * image/action authority or an evaluable artifact identity. */
+    artifact_quality = "NOT_EVALUABLE";
+    artifact_reason = "legacy_file_identity_non_authoritative";
+  } else {
+    artifact_quality = "non_authoritative";
+    artifact_reason = "process_image_section_unavailable";
+  }
+  if (!evidence_json_escape(evidence.file_identity, file_identity, sizeof(file_identity)) ||
+      !evidence_json_escape(evidence.sha256, hash_value, sizeof(hash_value)) ||
+      !evidence_json_escape(evidence.hash_quality, hash_quality, sizeof(hash_quality)) ||
+      !evidence_json_escape(evidence.hash_reason, hash_reason, sizeof(hash_reason)) ||
+      !evidence_json_escape(evidence.signature_status, signature_status, sizeof(signature_status)) ||
+      !evidence_json_escape(evidence.signature_source, signature_source, sizeof(signature_source)) ||
+      !evidence_json_escape(evidence.signer, signer, sizeof(signer)) ||
+      !evidence_json_escape(evidence.thumbprint, thumbprint, sizeof(thumbprint)) ||
+      !evidence_json_escape(evidence.revocation, revocation, sizeof(revocation)) ||
+      !evidence_json_escape(evidence.signature_quality, signature_quality, sizeof(signature_quality)) ||
+      !evidence_json_escape(evidence.signature_reason, signature_reason, sizeof(signature_reason))) {
+    snprintf(br->detection_context, sizeof(br->detection_context),
+             "%s", "{\"evidence\":{\"omitted\":true,\"reason\":\"evidence_json_escape_overflow\"}}");
     return;
   }
+  n = snprintf(br->detection_context, sizeof(br->detection_context),
+               "{\"evidence\":{\"artifact\":{\"source\":\"post_event_path_snapshot\",\"quality\":\"%s\",\"reason\":\"%s\"},\"file_identity\":\"%s\",\"hash\":{\"value\":\"%s\",\"source\":\"background_file_hash\",\"quality\":\"%s\",\"reason\":\"%s\"},"
+               "\"signature\":{\"status\":\"%s\",\"source\":\"%s\",\"signer\":\"%s\",\"thumbprint\":\"%s\",\"revocation\":\"%s\",\"quality\":\"%s\",\"reason\":\"%s\"}}}",
+               artifact_quality, artifact_reason, file_identity, hash_value, hash_quality,
+               hash_reason, signature_status,
+               signature_source, signer, thumbprint, revocation, signature_quality, signature_reason);
+  if (n < 0 || (size_t)n >= sizeof(br->detection_context)) {
+    snprintf(br->detection_context, sizeof(br->detection_context),
+             "%s", "{\"evidence\":{\"omitted\":true,\"reason\":\"evidence_json_capacity\"}}");
+  }
+#else
+  (void)br;
+#endif
+}
+
+/* Resource pressure may shed ordinary telemetry, but it is never authority to
+ * discard a potential P0 input.  A drop is safe only after the active,
+ * verified IR has evaluated the actual record and proved it matches no rule.
+ * If the IR is unavailable, preserving the record is the fail-closed choice:
+ * a legacy/process fallback or a later ruleset-not-evaluable disposition must
+ * still be able to observe it. */
+static int p0_resource_throttle_proven_miss(const EdrBehaviorRecord *br) {
+  if (!br) {
+    return 0;
+  }
+  edr_p0_rule_ir_lazy_init();
+  if (!edr_p0_rule_ir_is_ready()) {
+    return 0;
+  }
+  return edr_p0_rule_ir_br_matches_any(br) ? 0 : 1;
+}
+
+/* Collector evidence gates are an authority boundary, not ordinary telemetry:
+ * once marked, they bypass rule matching, generic admission and enforcement.
+ * The return value is intentionally ignored here because the common durable
+ * source-only owner latches unhealthy/retry state on failure. */
+static int p0_process_collector_evidence_gate(EdrBehaviorRecord *br) {
+  int outcome;
+  if (!br || !br->collector_evidence_gate[0]) return 0;
+  outcome = edr_p0_rule_emit_collector_evidence_gate(br);
+#ifdef _WIN32
+  edr_collector_file_read_metadata_gate_delivery_result(br->event_id, outcome);
+#else
+  (void)outcome;
+#endif
+  return 1;
+}
+
+#ifdef _WIN32
+static const char *p0_file_read_unavailable_reason(const EdrBehaviorRecord *br) {
+  if (!br || br->type != EDR_EVENT_FILE_READ || br->collector_evidence_gate[0]) return NULL;
+  if (!br->file_path[0] || !br->image_path_canonical[0] ||
+      strcmp(br->image_path_resolution_status, "RESOLVED") != 0) {
+    return EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
+  }
+  if (!br->process_start_key) return EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
+  if (!br->process_creation_filetime_100ns ||
+      strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0) {
+    return p0_file_read_live_generation_reason(br->process_generation_source);
+  }
+  return NULL;
+}
+#endif
+
+static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   if (slot && slot->attack_surface_hint) {
     edr_attack_surface_etw_signal();
   }
@@ -429,14 +993,53 @@ static void process_one_slot(const EdrEventSlot *slot) {
     edr_pmfe_on_process_lifecycle_hint();
   }
 #endif
-  EdrBehaviorRecord br;
-  edr_behavior_from_slot(slot, &br);
   apply_agent_ids_to_record(&br);
+  if (p0_process_collector_evidence_gate(&br)) {
+    /* A collector capability assertion is intentionally source-only.  It may
+     * not flow through matching, alert admission, correlation, or action. */
+    return;
+  }
+  apply_process_evidence(&br);
+  /* Token identity is bound to the same live ProcessStartKey/FILETIME handle,
+   * not to a pathname artifact reopened after ProcessCreate. */
   enrich_process_integrity_context(&br);
   edr_local_evidence_cache_observe_process(&br);
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
+#ifdef _WIN32
+  {
+    const char *file_read_reason = p0_file_read_unavailable_reason(&br);
+    if (file_read_reason) p0_mark_file_read_collector_evidence(&br, file_read_reason);
+  }
+#endif
+  if (p0_process_collector_evidence_gate(&br)) {
+    return;
+  }
+  {
+    const char *not_evaluable_reason = p0_process_create_not_evaluable_reason(&br);
+    if (not_evaluable_reason && p0_process_create_candidate(&br)) {
+      p0_mark_not_evaluable(&br, not_evaluable_reason);
+      edr_local_evidence_cache_record_behavior(&br);
+      /* Required Windows P0 evidence is absent: retain a source-only,
+       * high-priority record through the one bounded retry handoff rather
+       * than matching a partial record or silently dropping a SQLite fault. */
+      (void)edr_p0_rule_emit_pre_evaluation_gate(&br, not_evaluable_reason);
+      return;
+    }
+  }
+  /* AGT-010: low-priority records can be shed only after all fields on which
+   * P0 matching depends have been enriched and the active IR has proved a
+   * miss.  Inotify intentionally uses priority=1; doing this before parent
+   * or chain enrichment would silently erase valid file/process P0 inputs. */
+  if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
+      slot->attack_surface_hint == 0u && p0_resource_throttle_proven_miss(&br)) {
+    return;
+  }
+  /* P0 owns its hard-invalid, registry-attribution, internal-command, and
+   * policy guards. Evaluate before generic admission so a local-only source
+   * can still be represented by one combined source+alert frame. */
+  int p0_emitted = edr_p0_rule_try_emit(&br);
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   {
@@ -455,12 +1058,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
     }
   }
   if (!edr_preprocess_should_emit(&br)) {
+    if (p0_emitted > 0) {
+      edr_local_evidence_cache_record_behavior(&br);
+    }
     return;
   }
-  /* P0 direct emit must honor detection admission and preprocessing
-   * drop/emit rules.  Calling it earlier allowed dropped registry events to
-   * create alerts even though their telemetry was rejected. */
-  edr_p0_rule_try_emit(&br);
   edr_local_evidence_cache_record_behavior(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */
@@ -474,7 +1076,100 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (!edr_preprocess_sampling_allow(&br)) {
     return;
   }
+  if (p0_emitted > 0) {
+    return;
+  }
   emit_behavior_record(&br);
+}
+
+static void process_pending_process_creates(void) {
+#ifdef _WIN32
+  EdrBehaviorRecord ready;
+  while (edr_process_coalescer_poll(edr_monotonic_ns(), &ready)) {
+    /* Deadline represents one candidate generation; this is the sole
+     * NOT_EVALUABLE path when Security 4688 never arrives. */
+    process_one_record(ready, NULL);
+  }
+#endif
+}
+
+static void poll_p0_source_only_durable_retry(void) {
+  EdrBehaviorRecord committed;
+  /* Startup may see the queue before the authenticated IR becomes ready; run
+   * the idempotent lifecycle recovery on each preprocess turn so it can emit
+   * the required loss audit later without reopening a P0 action window. */
+  (void)edr_p0_rule_source_only_recover_after_queue_open();
+  /* The retry lane is bounded to eight records; draining all immediately
+   * avoids a recovered SQLite queue unnecessarily holding FileRead P0 paused.
+   * Each attempt still occurs outside collector/A4.4 locks. */
+  while (edr_p0_rule_poll_source_only_durable_retry(&committed)) {
+#ifdef _WIN32
+    if (strcmp(committed.collector_evidence_gate,
+               EDR_P0_FILE_READ_METADATA_GATE) == 0) {
+      edr_collector_file_read_metadata_gate_delivery_result(committed.event_id, 1);
+    }
+#endif
+  }
+#ifdef _WIN32
+  /* Staged FileKey-capacity records use the existing event bus and arrive
+   * back here for the one SQLite durable write above. */
+  edr_collector_file_read_metadata_gate_retry();
+#endif
+  /* A retry may have just committed the restart-loss audit (or the final
+   * retained source assertion). Re-evaluate the latch only after that commit. */
+  (void)edr_p0_rule_source_only_recover_after_queue_open();
+}
+
+static void process_one_slot(const EdrEventSlot *slot) {
+  EdrBehaviorRecord br;
+#ifdef _WIN32
+  /* Expiry is checked before an arriving record can observe a prior slot, so
+   * a delayed 4688/PID reuse event can never join an expired generation. */
+  process_pending_process_creates();
+#endif
+  edr_behavior_from_slot(slot, &br);
+  if (br.collector_evidence_gate[0]) {
+    process_one_record(br, slot);
+    return;
+  }
+#ifdef _WIN32
+  if (br.type == EDR_EVENT_PROCESS_CREATE) {
+    EdrBehaviorRecord ready;
+    if (!br.is_security_4688) {
+      (void)p0_bind_process_generation(&br);
+      /* Publish the exact lifecycle generation before a coalesced 4688 wait.
+       * A child can arrive after A exits and PID B begins; keeping A's
+       * StartKey/FILETIME interval now prevents later parent enrichment from
+       * replacing that historical parent with B. */
+      if (edr_process_create_is_lifecycle_authoritative(&br) && br.pid != 0u &&
+          br.process_start_key != 0u && br.process_creation_filetime_100ns != 0u) {
+        (void)edr_pt_cache_put_generation(
+            br.pid, br.ppid, br.process_name, br.cmdline, br.exe_path, br.parent_name,
+            (uint64_t)(br.event_time_ns > 0 ? br.event_time_ns : 0), br.process_start_key,
+            br.process_creation_filetime_100ns);
+      }
+    }
+    int candidate = p0_process_create_candidate(&br);
+    /* Start bounded evidence work before waiting for an out-of-order 4688. */
+    if (candidate && !br.is_security_4688) {
+      EdrProcessEvidence ignored;
+      (void)edr_process_evidence_request(br.image_path_canonical[0] ? br.image_path_canonical : br.exe_path,
+                                         br.process_start_key,
+                                         edr_monotonic_ns(), &ignored);
+    }
+    switch (edr_process_coalescer_submit(&br, candidate, edr_monotonic_ns(), &ready)) {
+      case EDR_PROCESS_COALESCE_HOLD: return;
+      case EDR_PROCESS_COALESCE_READY: process_one_record(ready, slot); return;
+      default: break;
+    }
+  } else if (br.type == EDR_EVENT_FILE_READ) {
+    /* File reads are tied to the actor only after its ETW ProcessStartKey
+     * agrees with a live telemetry creation FILETIME.  PID-only collection is
+     * retained as source-only and never becomes P0 authority. */
+    (void)p0_bind_process_generation(&br);
+  }
+#endif
+  process_one_record(br, slot);
 }
 
 #ifdef _WIN32
@@ -488,6 +1183,8 @@ static void *preprocess_main(void *arg) {
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
       process_one_slot(&slot);
+      process_pending_process_creates();
+      poll_p0_source_only_durable_retry();
       edr_event_batch_poll_timeout();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
@@ -496,6 +1193,8 @@ static void *preprocess_main(void *arg) {
       continue;
     }
     edr_event_batch_poll_timeout();
+    process_pending_process_creates();
+    poll_p0_source_only_durable_retry();
     edr_storage_queue_poll_drain();
     edr_local_evidence_cache_poll_maintenance();
     edr_correlation_poll_maintenance(0); /* 空闲期兜底排空注入 + 定期清扫 */
@@ -505,6 +1204,7 @@ static void *preprocess_main(void *arg) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
       }
+      poll_p0_source_only_durable_retry();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
       break;
@@ -515,6 +1215,7 @@ static void *preprocess_main(void *arg) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
       }
+      poll_p0_source_only_durable_retry();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
       break;
@@ -560,6 +1261,12 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_dedup_init();
   edr_pt_cache_init();
   (void)edr_pt_cache_warmup();
+  edr_process_coalescer_reset();
+  if (!edr_process_evidence_worker_start()) {
+    edr_pt_cache_shutdown();
+    edr_event_batch_shutdown();
+    return EDR_ERR_INTERNAL;
+  }
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
 #ifdef _WIN32
@@ -567,6 +1274,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_thread = CreateThread(NULL, 0, preprocess_main, NULL, 0, NULL);
   if (!s_thread) {
     s_bus = NULL;
+    edr_process_evidence_worker_stop();
     edr_event_batch_shutdown();
     return EDR_ERR_INTERNAL;
   }
@@ -574,6 +1282,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   s_stop_preprocess = 0;
   if (pthread_create(&s_thread, NULL, preprocess_main, NULL) != 0) {
     s_bus = NULL;
+    edr_process_evidence_worker_stop();
     edr_event_batch_shutdown();
     return EDR_ERR_INTERNAL;
   }
@@ -619,6 +1328,8 @@ void edr_preprocess_stop(void) {
   pthread_join(s_thread, NULL);
 #endif
   s_bus = NULL;
+  edr_process_evidence_worker_stop();
+  edr_process_coalescer_reset();
   s_preprocess_active = 0;
   edr_pt_cache_shutdown();
   edr_event_batch_shutdown();

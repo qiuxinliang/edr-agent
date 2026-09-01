@@ -16,12 +16,20 @@
 size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *out,
                                            size_t out_cap);
 
-struct AVEBehaviorAlert;
+typedef struct AVEBehaviorAlert AVEBehaviorAlert;
 /**
  * 将主机行为告警编码为带 `behavior_alert` 的 BehaviorEvent。
  * endpoint_id / tenant_id 可为空串（由调用方从配置填入）。
  */
-size_t edr_behavior_alert_encode_protobuf(const struct AVEBehaviorAlert *a, const char *endpoint_id,
-                                            const char *tenant_id, uint8_t *out, size_t out_cap);
+size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char *endpoint_id,
+                                          const char *tenant_id, uint8_t *out, size_t out_cap);
+
+/**
+ * 将行为记录与主机行为告警编码到同一个 BehaviorEvent 中。
+ * 顶层字段全部来自 r；behavior_alert 嵌套字段全部来自 a。
+ */
+size_t edr_behavior_record_alert_encode_protobuf(const EdrBehaviorRecord *r,
+                                                 const AVEBehaviorAlert *a, uint8_t *out,
+                                                 size_t out_cap);
 
 #endif

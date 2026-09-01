@@ -3,15 +3,25 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/process_tree_cache.h"
 #include "edr/resource.h"
+#include "edr/sha256.h"
 #include "edr/time_util.h"
 #include "edr/windows_event_policy.h"
 
+#include "cJSON.h"
+
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
@@ -25,11 +35,36 @@
 #define EDR_EVIDENCE_METRIC_SLOTS 180u
 #define EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS 512u
 #define EDR_EVIDENCE_AGG_SLOTS 512u
+/* Context has at most 32 RingSlot records. Escape expansion is at most six
+ * bytes/source byte. One item has <=1032 bytes of variable text
+ * (47 endpoint + 63 self source + 63 parent source + 31 source status +
+ * 383 source omissions + 127 name + 255 path + 63 network), and <=450 bytes
+ * of fixed keys, quotes, commas, and decimal fields. Thus
+ * 32 * 6 * 1482 < 279 KiB. The pre root is <6 KiB before escaping (<36 KiB),
+ * so a maximum pre manifest remains <315 KiB. The post root (4095 path +
+ * 511 DNS + 1023 registry key + 511 registry value + source omissions and
+ * all remaining fields) is <8 KiB before escaping, or <48 KiB. Retain a
+ * fixed 1 MiB envelope (well below the 4 MiB cap) for cJSON allocation and
+ * structural headroom; never use a 4096-B truncation path. */
+#define EDR_EVIDENCE_MANIFEST_MAX_BYTES (1024u * 1024u)
+
+/* A PID is only a routing hint.  Every cross-record association in this
+ * module uses this exact ProcessStartKey + creation FILETIME tuple; the
+ * event-time selector is retained only to decide whether an incoming ProcSlot
+ * update is newer than the one already stored. */
+typedef struct {
+  uint64_t process_start_key;
+  uint64_t creation_filetime_100ns;
+  uint64_t start_time_ns;
+} EvidenceProcessGeneration;
 
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
-  uint64_t generation_start_ns;
+  EvidenceProcessGeneration generation;
+  EvidenceProcessGeneration parent_generation;
+  char process_generation_source[64];
+  char parent_process_generation_source[64];
   int64_t last_seen_ns;
   char endpoint_id[48];
   char tenant_id[64];
@@ -62,7 +97,13 @@ typedef struct {
   uint32_t type;
   uint32_t pid;
   uint32_t ppid;
+  EvidenceProcessGeneration generation;
+  EvidenceProcessGeneration parent_generation;
   char endpoint_id[48];
+  char process_generation_source[64];
+  char parent_process_generation_source[64];
+  char source_completeness[32];
+  char source_truncated_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
   char process_name[128];
   char file_path[256];
   char net_dst[64];
@@ -71,7 +112,9 @@ typedef struct {
 
 typedef struct {
   uint32_t pid;
+  int64_t from_ns;
   int64_t until_ns;
+  EvidenceProcessGeneration generation;
   char endpoint_id[48];
   char candidate_id[160];
 } ContextWindowSlot;
@@ -91,7 +134,10 @@ typedef struct {
   uint32_t pid;
   uint32_t type;
   char endpoint_id[48];
-  char signal[160];
+  /* SHA-256 commitment over the source record's stable process generation
+   * and candidate semantics. It is an exact local-evidence reuse key, not an
+   * alert-suppression or cross-restart cache key. */
+  char signal[65];
 } CandidateDedupeSlot;
 
 typedef struct {
@@ -128,8 +174,194 @@ static uint64_t s_last_maintenance_ns;
 static int64_t s_write_budget_minute;
 static uint32_t s_write_budget_count;
 
+#define EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS 64u
+
+typedef struct {
+  uint64_t samples;
+  uint64_t wait_total_ns;
+  uint64_t wait_max_ns;
+  uint64_t hold_total_ns;
+  uint64_t hold_max_ns;
+  uint64_t wait_histogram[EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS];
+  uint64_t hold_histogram[EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS];
+} EvidenceCacheLockTiming;
+
+typedef struct {
+  uint64_t acquired_ns;
+  uint64_t wait_ns;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  uint8_t suppress_sample;
+#endif
+} EvidenceCacheLockTls;
+
+static EvidenceCacheLockTiming s_evidence_cache_lock_timing;
+#ifdef _MSC_VER
+static __declspec(thread) EvidenceCacheLockTls s_evidence_cache_lock_tls;
+#else
+static _Thread_local EvidenceCacheLockTls s_evidence_cache_lock_tls;
+#endif
+
+static uint64_t evidence_cache_clock_ns(void) {
+#if defined(_WIN32)
+  LARGE_INTEGER frequency;
+  LARGE_INTEGER counter;
+  if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter) ||
+      frequency.QuadPart <= 0 || counter.QuadPart < 0) {
+    return 0u;
+  }
+  return (uint64_t)(((long double)counter.QuadPart * 1000000000.0L) /
+                    (long double)frequency.QuadPart);
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0u;
+  }
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static uint64_t evidence_cache_elapsed_ns(uint64_t start_ns, uint64_t end_ns) {
+  return end_ns >= start_ns ? end_ns - start_ns : 0u;
+}
+
+static void evidence_cache_add_saturating(uint64_t *value, uint64_t addend) {
+  if (!value || UINT64_MAX - *value < addend) {
+    if (value) *value = UINT64_MAX;
+    return;
+  }
+  *value += addend;
+}
+
+static unsigned evidence_cache_log2_bucket(uint64_t value) {
+  unsigned bucket = 0u;
+  while (value > 1u && bucket + 1u < EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS) {
+    value >>= 1u;
+    bucket++;
+  }
+  return bucket;
+}
+
+static uint64_t evidence_cache_histogram_percentile(const uint64_t *histogram,
+                                                     uint64_t samples,
+                                                     unsigned percentile) {
+  uint64_t base;
+  uint64_t extra;
+  uint64_t rank;
+  uint64_t cumulative = 0u;
+  if (!histogram || samples == 0u || percentile == 0u) {
+    return 0u;
+  }
+  if (percentile > 100u) percentile = 100u;
+  base = (samples / 100u) * (uint64_t)percentile;
+  extra = ((samples % 100u) * (uint64_t)percentile + 99u) / 100u;
+  rank = UINT64_MAX - base < extra ? UINT64_MAX : base + extra;
+  if (rank == 0u) rank = 1u;
+  for (unsigned i = 0u; i < EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS; ++i) {
+    if (UINT64_MAX - cumulative < histogram[i]) {
+      cumulative = UINT64_MAX;
+    } else {
+      cumulative += histogram[i];
+    }
+    if (cumulative >= rank) {
+      return i + 1u >= EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS
+                 ? UINT64_MAX
+                 : (UINT64_C(1) << (i + 1u)) - 1u;
+    }
+  }
+  return UINT64_MAX;
+}
+
+/* Called while the owner mutex is held. Keeping fixed buckets avoids a
+ * second allocator, worker, configuration surface, or persistent metric. */
+static void evidence_cache_record_lock_timing_locked(uint64_t wait_ns, uint64_t hold_ns) {
+  EvidenceCacheLockTiming *timing = &s_evidence_cache_lock_timing;
+  evidence_cache_add_saturating(&timing->samples, 1u);
+  evidence_cache_add_saturating(&timing->wait_total_ns, wait_ns);
+  evidence_cache_add_saturating(&timing->hold_total_ns, hold_ns);
+  if (wait_ns > timing->wait_max_ns) timing->wait_max_ns = wait_ns;
+  if (hold_ns > timing->hold_max_ns) timing->hold_max_ns = hold_ns;
+  evidence_cache_add_saturating(
+      &timing->wait_histogram[evidence_cache_log2_bucket(wait_ns)], 1u);
+  evidence_cache_add_saturating(
+      &timing->hold_histogram[evidence_cache_log2_bucket(hold_ns)], 1u);
+}
+
+/* This is the sole owner lock for the cache's bounded memory state and its
+ * single SQLite connection. Collectors never call this module directly: the
+ * public writers run from preprocess/worker paths, while health and RTQ read
+ * through the same lock. No external callback or transport runs while held.
+ * Lock timing is recorded on release, so a status snapshot reports only
+ * completed samples and retains a genuine zero-sample state at startup. */
+#if defined(_WIN32)
+static SRWLOCK s_evidence_cache_lock = SRWLOCK_INIT;
+static void evidence_cache_lock(void) {
+  uint64_t started_ns = evidence_cache_clock_ns();
+  AcquireSRWLockExclusive(&s_evidence_cache_lock);
+  uint64_t acquired_ns = evidence_cache_clock_ns();
+  s_evidence_cache_lock_tls.wait_ns = evidence_cache_elapsed_ns(started_ns, acquired_ns);
+  s_evidence_cache_lock_tls.acquired_ns = acquired_ns;
+}
+static void evidence_cache_unlock(void) {
+  uint64_t released_ns = evidence_cache_clock_ns();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_evidence_cache_lock_tls.suppress_sample) {
+    s_evidence_cache_lock_tls.suppress_sample = 0u;
+  } else
+#endif
+  {
+    evidence_cache_record_lock_timing_locked(
+        s_evidence_cache_lock_tls.wait_ns,
+        evidence_cache_elapsed_ns(s_evidence_cache_lock_tls.acquired_ns, released_ns));
+  }
+  s_evidence_cache_lock_tls.acquired_ns = 0u;
+  s_evidence_cache_lock_tls.wait_ns = 0u;
+  ReleaseSRWLockExclusive(&s_evidence_cache_lock);
+}
+#else
+static pthread_mutex_t s_evidence_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static void evidence_cache_lock(void) {
+  uint64_t started_ns = evidence_cache_clock_ns();
+  (void)pthread_mutex_lock(&s_evidence_cache_lock);
+  uint64_t acquired_ns = evidence_cache_clock_ns();
+  s_evidence_cache_lock_tls.wait_ns = evidence_cache_elapsed_ns(started_ns, acquired_ns);
+  s_evidence_cache_lock_tls.acquired_ns = acquired_ns;
+}
+static void evidence_cache_unlock(void) {
+  uint64_t released_ns = evidence_cache_clock_ns();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_evidence_cache_lock_tls.suppress_sample) {
+    s_evidence_cache_lock_tls.suppress_sample = 0u;
+  } else
+#endif
+  {
+    evidence_cache_record_lock_timing_locked(
+        s_evidence_cache_lock_tls.wait_ns,
+        evidence_cache_elapsed_ns(s_evidence_cache_lock_tls.acquired_ns, released_ns));
+  }
+  s_evidence_cache_lock_tls.acquired_ns = 0u;
+  s_evidence_cache_lock_tls.wait_ns = 0u;
+  (void)pthread_mutex_unlock(&s_evidence_cache_lock);
+}
+#endif
+
 #if defined(EDR_HAVE_SQLITE)
 static sqlite3 *s_db;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+static unsigned s_test_commit_failures;
+static int s_test_commit_active;
+
+/* SQLite calls this synchronously from COMMIT. Returning non-zero aborts the
+ * actual commit, so tests exercise the same accounting boundary as a durable
+ * storage failure rather than a synthetic post-commit error. */
+static int evidence_cache_test_commit_hook(void *opaque) {
+  (void)opaque;
+  if (s_test_commit_active && s_test_commit_failures > 0u) {
+    s_test_commit_failures--;
+    return 1;
+  }
+  return 0;
+}
+#endif
 #endif
 
 static void json_escape(char *dst, size_t cap, const char *s);
@@ -151,11 +383,24 @@ static const char *base_name(const char *path) {
   return b;
 }
 
-static void copy_s(char *dst, size_t cap, const char *src) {
+static int copy_s(char *dst, size_t cap, const char *src) {
+  const char *value = src ? src : "";
+  size_t source_len;
+  size_t copied;
   if (!dst || cap == 0u) {
-    return;
+    return 0;
   }
-  snprintf(dst, cap, "%s", src ? src : "");
+  source_len = strlen(value);
+  copied = source_len < cap ? source_len : cap - 1u;
+  if (copied > 0u) {
+    memmove(dst, value, copied);
+  }
+  dst[copied] = '\0';
+  if (copied != source_len) {
+    s_status.bounded_string_truncations++;
+    return 0;
+  }
+  return 1;
 }
 
 static int identity_quality_rank(const char *q) {
@@ -177,6 +422,105 @@ static int64_t record_time_ns(const EdrBehaviorRecord *r) {
     return r->event_time_ns;
   }
   return now_unix_ns();
+}
+
+static int generation_bound(const EvidenceProcessGeneration *generation) {
+  return generation && generation->process_start_key != 0u &&
+         generation->creation_filetime_100ns != 0u;
+}
+
+static int generation_equal(const EvidenceProcessGeneration *a,
+                            const EvidenceProcessGeneration *b) {
+  return generation_bound(a) && generation_bound(b) &&
+         a->process_start_key == b->process_start_key &&
+         a->creation_filetime_100ns == b->creation_filetime_100ns;
+}
+
+static int generation_from_snapshot(uint32_t pid, int64_t event_time_ns,
+                                    EvidenceProcessGeneration *out) {
+  ProcessTreeEntry entry;
+  if (!out || pid == 0u || event_time_ns <= 0 ||
+      edr_pt_cache_snapshot_at(pid, (uint64_t)event_time_ns, &entry) != 0 ||
+      entry.process_start_key == 0u || entry.creation_filetime_100ns == 0u) {
+    return 0;
+  }
+  out->process_start_key = entry.process_start_key;
+  out->creation_filetime_100ns = entry.creation_filetime_100ns;
+  out->start_time_ns = entry.start_time_ns;
+  return 1;
+}
+
+/* Source-record generation wins when present; the historical process-tree
+ * snapshot is an event-time fallback, never a current-PID lookup.  A partial
+ * source tuple is deliberately not upgraded from another source. */
+static int record_process_generation(const EdrBehaviorRecord *r,
+                                     EvidenceProcessGeneration *out) {
+  if (!r || !out || r->pid == 0u) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  if (r->process_start_key != 0u || r->process_creation_filetime_100ns != 0u) {
+    if (r->process_start_key == 0u || r->process_creation_filetime_100ns == 0u) {
+      return 0;
+    }
+    out->process_start_key = r->process_start_key;
+    out->creation_filetime_100ns = r->process_creation_filetime_100ns;
+    /* Keep an event-time interval only when it independently proves the same
+     * source tuple; it is not allowed to replace source generation facts. */
+    {
+      EvidenceProcessGeneration historical;
+      if (generation_from_snapshot(r->pid, r->event_time_ns, &historical) &&
+          generation_equal(out, &historical)) {
+        out->start_time_ns = historical.start_time_ns;
+      }
+    }
+    return 1;
+  }
+  return generation_from_snapshot(r->pid, r->event_time_ns, out);
+}
+
+static int record_parent_generation(const EdrBehaviorRecord *r,
+                                    EvidenceProcessGeneration *out) {
+  if (!r || !out || r->ppid == 0u) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  return generation_from_snapshot(r->ppid, r->event_time_ns, out);
+}
+
+/* The source label is evidence metadata too: do not turn an event-time
+ * process-tree lookup into a claim that the collector supplied a live ETW
+ * start key.  A raw tuple without a label remains explicitly identifiable. */
+static const char *record_process_generation_source(const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  if (!r) return "";
+  if (r->process_start_key != 0u && r->process_creation_filetime_100ns != 0u) {
+    return r->process_generation_source[0] ? r->process_generation_source : "source_record_tuple";
+  }
+  return generation_from_snapshot(r->pid, r->event_time_ns, &generation)
+             ? "process_tree_snapshot"
+             : "";
+}
+
+static const char *record_parent_generation_source(const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  return r && generation_from_snapshot(r->ppid, r->event_time_ns, &generation)
+             ? "event_time_parent_snapshot"
+             : "";
+}
+
+static int proc_generation_matches_record(const ProcSlot *p,
+                                          const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  return p && record_process_generation(r, &generation) &&
+         generation_equal(&p->generation, &generation);
+}
+
+static int proc_parent_generation_matches_record(const ProcSlot *p,
+                                                 const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  return p && record_parent_generation(r, &generation) &&
+         generation_equal(&p->parent_generation, &generation);
 }
 
 static int same_endpoint(const ProcSlot *p, const EdrBehaviorRecord *r) {
@@ -245,39 +589,79 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   }
   int has_identity = r->username[0] || r->domain[0] || r->user_sid[0] || r->logon_id[0] ||
                      r->creator_username[0] || r->creator_domain[0] || r->creator_sid[0] || r->creator_logon_id[0];
-  ProcessTreeEntry generation;
-  uint64_t incoming_generation = 0u;
-  int snapshot_ok = edr_pt_cache_snapshot_at(r->pid, (uint64_t)record_time_ns(r), &generation) == 0;
-  if (snapshot_ok) incoming_generation = generation.start_time_ns;
+  EvidenceProcessGeneration incoming_generation;
+  EvidenceProcessGeneration incoming_parent_generation;
+  int incoming_generation_known = record_process_generation(r, &incoming_generation);
+  int incoming_parent_generation_known = record_parent_generation(r, &incoming_parent_generation);
+  int64_t incoming_time_ns = r->event_time_ns;
   if (strcmp(r->identity_quality, "target_4688") == 0) s_status.identity_target_4688++;
   else if (strcmp(r->identity_quality, "creator_fallback") == 0) s_status.identity_creator_fallback++;
   else if (strcmp(r->identity_quality, "token_sid") == 0) s_status.identity_token_sid++;
   else if (!r->identity_quality[0]) s_status.identity_none++;
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
-  if (!p && has_identity && (!snapshot_ok || incoming_generation == 0u)) {
+  if (!p && has_identity && !incoming_generation_known) {
     /* Do not create a generation-zero identity slot that a later PID reuse can inherit. */
     s_status.generation_unknown_update_rejects++;
     return;
   }
   if (!p) p = alloc_proc(r->pid, r);
   if (!p) return;
-  if (p->generation_start_ns != 0u && record_time_ns(r) > 0 && (uint64_t)record_time_ns(r) < p->generation_start_ns) { s_status.late_generation_rejects++; return; }
-  if (p->generation_start_ns != 0u && r->event_time_ns == 0 && (r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0])) { s_status.generation_unknown_update_rejects++; return; }
-  if (p->generation_start_ns != 0u && (incoming_generation == 0u || !snapshot_ok)) {
-    if (r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0]) s_status.generation_unknown_update_rejects++;
+  if (generation_bound(&p->generation) && !incoming_generation_known) {
+    s_status.generation_unknown_update_rejects++;
     return;
   }
-  if (p->generation_start_ns != 0u && incoming_generation != 0u && incoming_generation != p->generation_start_ns) {
-    if (incoming_generation < p->generation_start_ns) { s_status.late_generation_rejects++; return; }
-    memset(p, 0, sizeof(*p)); p->pid = r->pid; p->generation_start_ns = incoming_generation; s_status.generation_resets++;
-  } else if (p->generation_start_ns == 0u && incoming_generation != 0u) {
-    p->generation_start_ns = incoming_generation;
+  if (generation_bound(&p->generation) && incoming_generation_known &&
+      !generation_equal(&p->generation, &incoming_generation)) {
+    /* A source tuple differs.  Only a strictly later event may replace this
+     * bounded slot; a delayed A event must never overwrite PID-reused B. */
+    if (incoming_time_ns <= 0 || p->last_seen_ns <= 0 ||
+        incoming_time_ns <= p->last_seen_ns ||
+        (incoming_generation.start_time_ns != 0u && p->generation.start_time_ns != 0u &&
+         incoming_generation.start_time_ns < p->generation.start_time_ns)) {
+      s_status.generation_mismatch_update_rejects++;
+      s_status.late_generation_rejects++;
+      return;
+    }
+    memset(p, 0, sizeof(*p));
+    p->pid = r->pid;
+    p->generation = incoming_generation;
+    s_status.generation_resets++;
+  } else if (!generation_bound(&p->generation) && incoming_generation_known) {
+    /* An unknown lifetime may contain only provisional display metadata.  A
+     * first authoritative tuple starts a clean slot, never upgrades it. */
+    int had_provisional_state = p->last_seen_ns != 0 || p->name[0] || p->path[0] ||
+                                p->cmdline[0] || p->ppid != 0u || p->username[0] ||
+                                p->user_sid[0] || p->creator_username[0] ||
+                                p->creator_sid[0] || p->exe_hash[0];
+    memset(p, 0, sizeof(*p));
+    p->pid = r->pid;
+    p->generation = incoming_generation;
+    if (had_provisional_state) s_status.generation_resets++;
+  } else if (incoming_generation_known) {
+    p->generation = incoming_generation;
   }
   p->pid = r->pid;
   if (r->ppid != 0u) {
+    if (p->ppid != 0u && p->ppid != r->ppid) {
+      p->parent_name[0] = '\0';
+      p->parent_path[0] = '\0';
+      p->parent_cmdline[0] = '\0';
+      memset(&p->parent_generation, 0, sizeof(p->parent_generation));
+      p->parent_process_generation_source[0] = '\0';
+    }
     p->ppid = r->ppid;
   }
   p->last_seen_ns = record_time_ns(r);
+  if (incoming_parent_generation_known) {
+    p->parent_generation = incoming_parent_generation;
+    copy_s(p->parent_process_generation_source,
+           sizeof(p->parent_process_generation_source),
+           record_parent_generation_source(r));
+  }
+  if (incoming_generation_known) {
+    copy_s(p->process_generation_source, sizeof(p->process_generation_source),
+           record_process_generation_source(r));
+  }
   if (r->endpoint_id[0]) {
     copy_s(p->endpoint_id, sizeof(p->endpoint_id), r->endpoint_id);
   }
@@ -346,134 +730,159 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
 
 void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
   if (!r) return;
+  evidence_cache_lock();
   s_status.identity_observations_total++;
   process_cache_update(r);
+  evidence_cache_unlock();
 }
 
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
   if (!r) {
     return;
   }
+  evidence_cache_lock();
   s_status.identity_enrich_attempts++;
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
   if (p) {
-    /* PID is not a process identity. When both sides carry creation evidence
-     * and it differs, do not transfer cached identity into a reused PID. */
-    ProcessTreeEntry generation;
-    int identity_safe = p->generation_start_ns != 0u &&
-                        edr_pt_cache_snapshot_at(r->pid, (uint64_t)record_time_ns(r), &generation) == 0 &&
-                        generation.start_time_ns == p->generation_start_ns;
-    if (!identity_safe && !r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0])) {
-      if (p->generation_start_ns == 0u) s_status.identity_generation_unknown_rejects++;
-      else s_status.identity_generation_mismatch_rejects++;
-      s_status.identity_stale_rejects++;
-    }
     s_status.process_cache_hits++;
-    if (r->ppid == 0u && p->ppid != 0u) {
-      r->ppid = p->ppid;
-    }
-    if (!r->process_name[0] && p->name[0]) {
-      copy_s(r->process_name, sizeof(r->process_name), p->name);
-    }
-    if (!r->exe_path[0] && p->path[0]) {
-      copy_s(r->exe_path, sizeof(r->exe_path), p->path);
-    }
-    if (!r->cmdline[0] && p->cmdline[0]) {
-      copy_s(r->cmdline, sizeof(r->cmdline), p->cmdline);
-    }
-    if (!r->parent_name[0] && p->parent_name[0]) {
-      copy_s(r->parent_name, sizeof(r->parent_name), p->parent_name);
-    }
-    if (!r->parent_path[0] && p->parent_path[0]) {
-      copy_s(r->parent_path, sizeof(r->parent_path), p->parent_path);
-    }
-    if (!r->parent_cmdline[0] && p->parent_cmdline[0]) {
-      copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), p->parent_cmdline);
-    }
-    if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0]) && identity_safe) {
-      copy_s(r->username, sizeof(r->username), p->username);
-      copy_s(r->domain, sizeof(r->domain), p->domain);
-      copy_s(r->user_sid, sizeof(r->user_sid), p->user_sid);
-      copy_s(r->logon_id, sizeof(r->logon_id), p->logon_id);
-      /* Cache describes transport provenance, not evidence quality. */
-      copy_s(r->identity_source, sizeof(r->identity_source), "cache");
-      copy_s(r->identity_quality, sizeof(r->identity_quality), p->identity_quality);
-      s_status.identity_cache_hits++;
-    } else if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0]) && !identity_safe) {
-      s_status.identity_cache_misses++;
-    }
-    if (identity_safe) {
+    int process_safe = proc_generation_matches_record(p, r);
+    if (!process_safe) {
+      if (!generation_bound(&p->generation)) s_status.identity_generation_unknown_rejects++;
+      else s_status.identity_generation_mismatch_rejects++;
+      if (p->username[0] || p->user_sid[0]) {
+        s_status.identity_stale_rejects++;
+        if (!r->username[0] && !r->user_sid[0]) s_status.identity_cache_misses++;
+      }
+    } else {
+      if (r->ppid == 0u && p->ppid != 0u) {
+        r->ppid = p->ppid;
+      }
+      if (!r->process_name[0] && p->name[0]) {
+        copy_s(r->process_name, sizeof(r->process_name), p->name);
+      }
+      if (!r->exe_path[0] && p->path[0]) {
+        copy_s(r->exe_path, sizeof(r->exe_path), p->path);
+      }
+      if (!r->cmdline[0] && p->cmdline[0]) {
+        copy_s(r->cmdline, sizeof(r->cmdline), p->cmdline);
+      }
+      /* Parent display fields are a separate identity.  A self-generation
+       * match is not permission to copy a PID-only parent observation. */
+      if (proc_parent_generation_matches_record(p, r)) {
+        if (!r->parent_name[0] && p->parent_name[0]) {
+          copy_s(r->parent_name, sizeof(r->parent_name), p->parent_name);
+        }
+        if (!r->parent_path[0] && p->parent_path[0]) {
+          copy_s(r->parent_path, sizeof(r->parent_path), p->parent_path);
+        }
+        if (!r->parent_cmdline[0] && p->parent_cmdline[0]) {
+          copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), p->parent_cmdline);
+        }
+      }
+      if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0])) {
+        copy_s(r->username, sizeof(r->username), p->username);
+        copy_s(r->domain, sizeof(r->domain), p->domain);
+        copy_s(r->user_sid, sizeof(r->user_sid), p->user_sid);
+        copy_s(r->logon_id, sizeof(r->logon_id), p->logon_id);
+        /* Cache describes transport provenance, not evidence quality. */
+        copy_s(r->identity_source, sizeof(r->identity_source), "cache");
+        copy_s(r->identity_quality, sizeof(r->identity_quality), p->identity_quality);
+        s_status.identity_cache_hits++;
+      }
       if (!r->creator_username[0]) copy_s(r->creator_username, sizeof(r->creator_username), p->creator_username);
       if (!r->creator_domain[0]) copy_s(r->creator_domain, sizeof(r->creator_domain), p->creator_domain);
       if (!r->creator_sid[0]) copy_s(r->creator_sid, sizeof(r->creator_sid), p->creator_sid);
       if (!r->creator_logon_id[0]) copy_s(r->creator_logon_id, sizeof(r->creator_logon_id), p->creator_logon_id);
-    }
-    if (!r->integrity_level[0] && p->integrity_level[0]) {
-      copy_s(r->integrity_level, sizeof(r->integrity_level), p->integrity_level);
-    }
-    if (r->token_elevation == 0u && p->token_elevation != 0u) {
-      r->token_elevation = p->token_elevation;
-    }
-    if (!r->exe_hash[0] && p->exe_hash[0]) {
-      copy_s(r->exe_hash, sizeof(r->exe_hash), p->exe_hash);
-    }
-    if (!r->current_directory[0] && p->current_directory[0]) {
-      copy_s(r->current_directory, sizeof(r->current_directory), p->current_directory);
-    }
-    if (!r->process_creation_time[0] && p->process_creation_time[0]) {
-      copy_s(r->process_creation_time, sizeof(r->process_creation_time), p->process_creation_time);
+      if (!r->integrity_level[0] && p->integrity_level[0]) {
+        copy_s(r->integrity_level, sizeof(r->integrity_level), p->integrity_level);
+      }
+      if (r->token_elevation == 0u && p->token_elevation != 0u) {
+        r->token_elevation = p->token_elevation;
+      }
+      if (!r->exe_hash[0] && p->exe_hash[0]) {
+        copy_s(r->exe_hash, sizeof(r->exe_hash), p->exe_hash);
+      }
+      if (!r->current_directory[0] && p->current_directory[0]) {
+        copy_s(r->current_directory, sizeof(r->current_directory), p->current_directory);
+      }
+      if (!r->process_creation_time[0] && p->process_creation_time[0]) {
+        copy_s(r->process_creation_time, sizeof(r->process_creation_time), p->process_creation_time);
+      }
     }
   } else { s_status.process_cache_misses++; s_status.identity_cache_misses++; }
-  if (!r->parent_name[0] && r->ppid != 0u) {
+  if ((!r->parent_name[0] || !r->parent_path[0] || !r->parent_cmdline[0]) && r->ppid != 0u) {
     ProcSlot *pp = find_proc(r->ppid, r->endpoint_id);
-    if (pp) {
+    EvidenceProcessGeneration parent_generation;
+    if (pp && record_parent_generation(r, &parent_generation) &&
+        generation_equal(&pp->generation, &parent_generation)) {
       if (pp->name[0]) {
-        copy_s(r->parent_name, sizeof(r->parent_name), pp->name);
+        if (!r->parent_name[0]) copy_s(r->parent_name, sizeof(r->parent_name), pp->name);
       }
       if (pp->path[0]) {
-        copy_s(r->parent_path, sizeof(r->parent_path), pp->path);
+        if (!r->parent_path[0]) copy_s(r->parent_path, sizeof(r->parent_path), pp->path);
       }
+      if (pp->cmdline[0] && !r->parent_cmdline[0])
+        copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), pp->cmdline);
     }
   }
   if (!r->process_name[0] && r->exe_path[0]) {
     copy_s(r->process_name, sizeof(r->process_name), base_name(r->exe_path));
   }
+  evidence_cache_unlock();
 }
 
-static void ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
-                           const EdrBehaviorRecord *r) {
+static int ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
+                          const EdrBehaviorRecord *r) {
   if (!ring || slots == 0u || !pos || !r) {
-    return;
+    return 0;
   }
   RingSlot *s = &ring[(*pos)++ % slots];
+  int evicted = s->used ? 1 : 0;
   memset(s, 0, sizeof(*s));
   s->used = 1u;
   s->event_time_ns = record_time_ns(r);
   s->type = (uint32_t)r->type;
   s->pid = r->pid;
   s->ppid = r->ppid;
+  (void)record_process_generation(r, &s->generation);
+  (void)record_parent_generation(r, &s->parent_generation);
   s->net_dport = r->net_dport;
   copy_s(s->endpoint_id, sizeof(s->endpoint_id), r->endpoint_id);
+  copy_s(s->process_generation_source, sizeof(s->process_generation_source),
+         record_process_generation_source(r));
+  copy_s(s->parent_process_generation_source,
+         sizeof(s->parent_process_generation_source),
+         record_parent_generation_source(r));
+  copy_s(s->source_completeness, sizeof(s->source_completeness), r->source_completeness);
+  copy_s(s->source_truncated_fields, sizeof(s->source_truncated_fields),
+         r->source_truncated_fields);
   copy_s(s->process_name, sizeof(s->process_name), r->process_name);
   copy_s(s->file_path, sizeof(s->file_path), r->file_path);
   copy_s(s->net_dst, sizeof(s->net_dst), r->net_dst);
+  return evicted;
 }
 
-static void ring_copy_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
-                         const RingSlot *src) {
+static int ring_copy_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
+                        const RingSlot *src) {
   if (!ring || slots == 0u || !pos || !src || !src->used) {
-    return;
+    return 0;
   }
   RingSlot *dst = &ring[(*pos)++ % slots];
+  int evicted = dst->used ? 1 : 0;
   *dst = *src;
+  return evicted;
 }
 
 static void ring_record(const EdrBehaviorRecord *r) {
-  ring_record_to(s_ring, EDR_EVIDENCE_RING_SLOTS, &s_ring_pos, r);
+  if (ring_record_to(s_ring, EDR_EVIDENCE_RING_SLOTS, &s_ring_pos, r)) {
+    s_status.ring_evictions++;
+  }
 }
 
 static void context_ring_capture(const EdrBehaviorRecord *r) {
-  ring_record_to(s_context_ring, EDR_EVIDENCE_CONTEXT_RING_SLOTS, &s_context_ring_pos, r);
+  if (ring_record_to(s_context_ring, EDR_EVIDENCE_CONTEXT_RING_SLOTS, &s_context_ring_pos, r)) {
+    s_status.hot_ring_evictions++;
+  }
 }
 
 static const char *engine_from_context(const char *ctx) {
@@ -535,6 +944,9 @@ static MetricSlot *metric_slot_for(const EdrBehaviorRecord *r, int64_t event_tim
     }
   }
   MetricSlot *m = empty ? empty : oldest;
+  if (!empty && m->minute_unix != 0) {
+    s_status.metric_slot_evictions++;
+  }
   memset(m, 0, sizeof(*m));
   m->minute_unix = minute;
   copy_s(m->endpoint_id, sizeof(m->endpoint_id), endpoint_id);
@@ -578,37 +990,44 @@ static uint32_t candidate_dedupe_window_s(void) {
                          60u, 1u, 600u);
 }
 
-static uint64_t evidence_hash_ci(const char *s) {
-  uint64_t h = 1469598103934665603ULL;
-  if (!s) {
-    return h;
+static void candidate_digest_text(EdrSha256Ctx *ctx, const char *value) {
+  uint32_t length = value ? (uint32_t)strlen(value) : 0u;
+  uint8_t length_le[4];
+  length_le[0] = (uint8_t)(length & 0xffu);
+  length_le[1] = (uint8_t)((length >> 8u) & 0xffu);
+  length_le[2] = (uint8_t)((length >> 16u) & 0xffu);
+  length_le[3] = (uint8_t)((length >> 24u) & 0xffu);
+  edr_sha256_update(ctx, length_le, sizeof(length_le));
+  if (length) edr_sha256_update(ctx, (const uint8_t *)value, length);
+}
+
+static void candidate_digest_u64(EdrSha256Ctx *ctx, uint64_t value) {
+  uint8_t bytes[8];
+  for (size_t i = 0u; i < sizeof(bytes); ++i) {
+    bytes[i] = (uint8_t)(value >> (i * 8u));
   }
-  for (; *s; s++) {
-    unsigned char c = (unsigned char)*s;
-    if (c == '/' || c == '\\') {
-      c = '\\';
-    } else {
-      c = (unsigned char)tolower(c);
-    }
-    h ^= (uint64_t)c;
-    h *= 1099511628211ULL;
-  }
-  return h;
+  edr_sha256_update(ctx, bytes, sizeof(bytes));
+}
+
+/* PID is reusable. Do not turn a generation-less candidate into a local
+ * reuse hit: retaining a duplicate is safer than silently sharing evidence
+ * across a later process lifetime. */
+static int candidate_generation_bound(const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  return record_process_generation(r, &generation);
 }
 
 static void candidate_id_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
   }
-  char signal[160];
+  char signal[65];
   candidate_signal_for(r, signal, sizeof(signal));
   uint32_t win_s = candidate_dedupe_window_s();
   int64_t bucket = record_time_ns(r) / ((int64_t)win_s * 1000000000LL);
-  unsigned long long sig_hash = (unsigned long long)evidence_hash_ci(signal);
-  snprintf(out, cap, "p0-%s-%lld-%u-%u-%016llx",
+  snprintf(out, cap, "p0-%s-%lld-%s",
            (r && r->endpoint_id[0]) ? r->endpoint_id : "unknown",
-           (long long)bucket, r ? r->pid : 0u, r ? (uint32_t)r->type : 0u,
-           sig_hash);
+           (long long)bucket, signal[0] ? signal : "invalid");
 }
 
 static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
@@ -651,27 +1070,60 @@ static int extract_json_string_field(const char *s, const char *key, char *out, 
 }
 
 static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[] = "0123456789abcdef";
+  const char *canonical_image;
+  const char *path_hash;
+  EvidenceProcessGeneration generation;
+  int generation_known;
   if (!out || cap == 0u) {
     return;
   }
   out[0] = '\0';
-  if (!r) {
+  if (!r || cap < 65u) {
     return;
   }
-  if (extract_json_string_field(r->detection_context, "\"rule_id\":\"", out, cap) ||
-      extract_json_string_field(r->detection_context, "\"rid\":\"", out, cap) ||
-      extract_json_string_field(r->detection_context, "\"rule\":\"", out, cap)) {
-    return;
+  canonical_image = r->image_path_canonical[0] ? r->image_path_canonical : r->exe_path;
+  path_hash = r->process_path_hash[0] ? r->process_path_hash : r->exe_hash;
+  generation_known = record_process_generation(r, &generation);
+  /* This is deliberately a length-delimited exact commitment, not another
+   * path/cmd/script normalizer. Upstream canonical image/path-hash fields are
+   * consumed where present; raw semantic fields are retained verbatim so a
+   * changed command, path, script, hash, network, or registry assertion is
+   * never reused merely because it shares a rule and PID. */
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, "edr-local-evidence-candidate-v2");
+#define CANDIDATE_TEXT(field) candidate_digest_text(&ctx, r->field)
+#define CANDIDATE_U64(field) candidate_digest_u64(&ctx, (uint64_t)r->field)
+  CANDIDATE_TEXT(event_id); CANDIDATE_TEXT(endpoint_id); CANDIDATE_TEXT(tenant_id);
+  CANDIDATE_U64(event_time_ns); CANDIDATE_U64(pid); CANDIDATE_U64(ppid);
+  CANDIDATE_U64(type); CANDIDATE_U64(priority); CANDIDATE_U64(evidence_revision);
+  candidate_digest_u64(&ctx, generation_known ? generation.process_start_key : 0u);
+  candidate_digest_u64(&ctx, generation_known ? generation.creation_filetime_100ns : 0u);
+  candidate_digest_text(&ctx, generation_known ? record_process_generation_source(r) : "");
+  CANDIDATE_TEXT(source_completeness); CANDIDATE_TEXT(source_truncated_fields);
+  CANDIDATE_TEXT(process_name);
+  candidate_digest_text(&ctx, canonical_image); candidate_digest_text(&ctx, path_hash);
+  CANDIDATE_TEXT(exe_hash); CANDIDATE_TEXT(image_path_raw); CANDIDATE_TEXT(cmdline);
+  CANDIDATE_TEXT(file_op); CANDIDATE_TEXT(file_path); CANDIDATE_U64(file_key);
+  CANDIDATE_U64(file_target_has_motw); CANDIDATE_TEXT(dns_query);
+  CANDIDATE_TEXT(net_src); CANDIDATE_TEXT(net_dst); CANDIDATE_U64(net_sport);
+  CANDIDATE_U64(net_dport); CANDIDATE_TEXT(net_proto); CANDIDATE_TEXT(network_aux_path);
+  CANDIDATE_TEXT(reg_key_path); CANDIDATE_TEXT(reg_value_name); CANDIDATE_TEXT(reg_value_data);
+  CANDIDATE_TEXT(reg_old_value_data); CANDIDATE_TEXT(reg_op); CANDIDATE_TEXT(reg_source);
+  CANDIDATE_TEXT(reg_attribution); CANDIDATE_TEXT(reg_detail_status);
+  CANDIDATE_TEXT(script_snippet); CANDIDATE_TEXT(powershell_script_block);
+  CANDIDATE_TEXT(wmi_filter); CANDIDATE_TEXT(scheduled_task_path);
+  CANDIDATE_TEXT(detection_context);
+#undef CANDIDATE_TEXT
+#undef CANDIDATE_U64
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); ++i) {
+    out[i * 2u] = hex[digest[i] >> 4u];
+    out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
   }
-  const char *target = r->cmdline[0] ? r->cmdline :
-                       r->script_snippet[0] ? r->script_snippet :
-                       r->file_path[0] ? r->file_path :
-                       r->reg_key_path[0] ? r->reg_key_path :
-                       r->net_dst[0] ? r->net_dst :
-                       r->exe_path[0] ? r->exe_path : r->process_name;
-  unsigned long long target_hash = (unsigned long long)evidence_hash_ci(target);
-  snprintf(out, cap, "type=%u;proc=%s;target_hash=%016llx;port=%u",
-           (uint32_t)r->type, r->process_name, target_hash, r->net_dport);
+  out[64] = '\0';
 }
 
 static int ordinary_aggregate_kind(const EdrBehaviorRecord *r, uint32_t *kind_out) {
@@ -736,14 +1188,14 @@ static void path_parent_prefix(char *out, size_t cap, const char *path) {
   copy_s(out, cap, tmp);
 }
 
-static void ordinary_aggregate_prefix(const EdrBehaviorRecord *r, uint32_t kind,
-                                      char *out, size_t cap) {
+static int ordinary_aggregate_prefix(const EdrBehaviorRecord *r, uint32_t kind,
+                                     char *out, size_t cap) {
   if (!out || cap == 0u) {
-    return;
+    return 0;
   }
   out[0] = '\0';
   if (!r) {
-    return;
+    return 0;
   }
   if (kind == 1u) {
     path_parent_prefix(out, cap, r->file_path[0] ? r->file_path : r->exe_path);
@@ -751,12 +1203,34 @@ static void ordinary_aggregate_prefix(const EdrBehaviorRecord *r, uint32_t kind,
     normalize_prefix_copy(out, cap, r->reg_key_path);
   } else if (kind == 3u) {
     char tmp[220];
-    snprintf(tmp, sizeof(tmp), "%s:%u:%s", r->net_dst, r->net_dport, r->dns_query);
+    char port[16];
+    size_t net_len = strlen(r->net_dst);
+    size_t dns_len = strlen(r->dns_query);
+    int port_len = snprintf(port, sizeof(port), "%u", r->net_dport);
+    if (port_len < 0 || (size_t)port_len >= sizeof(port) ||
+        net_len > sizeof(tmp) - 1u ||
+        (size_t)port_len > sizeof(tmp) - net_len - 1u ||
+        dns_len > sizeof(tmp) - net_len - 1u - (size_t)port_len - 1u) {
+      s_status.bounded_string_truncations++;
+      return 0;
+    }
+    memcpy(tmp, r->net_dst, net_len);
+    tmp[net_len] = ':';
+    memcpy(tmp + net_len + 1u, port, (size_t)port_len);
+    tmp[net_len + 1u + (size_t)port_len] = ':';
+    memcpy(tmp + net_len + 2u + (size_t)port_len, r->dns_query, dns_len);
+    tmp[net_len + 2u + (size_t)port_len + dns_len] = '\0';
     normalize_prefix_copy(out, cap, tmp);
   }
   if (!out[0]) {
-    snprintf(out, cap, "kind=%u;type=%u", kind, (uint32_t)r->type);
+    int n = snprintf(out, cap, "kind=%u;type=%u", kind, (uint32_t)r->type);
+    if (n < 0 || (size_t)n >= cap) {
+      s_status.bounded_string_truncations++;
+      out[0] = '\0';
+      return 0;
+    }
   }
+  return 1;
 }
 
 static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_t ts) {
@@ -765,7 +1239,9 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
     return 0;
   }
   char prefix[160];
-  ordinary_aggregate_prefix(r, kind, prefix, sizeof(prefix));
+  if (!ordinary_aggregate_prefix(r, kind, prefix, sizeof(prefix))) {
+    return 0;
+  }
   int64_t minute = (ts / 1000000000LL) / 60LL;
   size_t replace_i = 0u;
   int64_t oldest = INT64_MAX;
@@ -806,6 +1282,9 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
     }
   }
   OrdinaryAggregateSlot *slot = &s_ordinary_agg[replace_i];
+  if (slot->used) {
+    s_status.aggregate_slot_evictions++;
+  }
   memset(slot, 0, sizeof(*slot));
   slot->used = 1u;
   slot->minute_unix = minute;
@@ -849,17 +1328,23 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
   int64_t cur_minute = (now_ns / 1000000000LL) / 60LL;
   unsigned threshold = summary_flush_min_count();
   for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
+    EdrBehaviorRecord rec;
+    int emit_one = 0;
+    evidence_cache_lock();
     OrdinaryAggregateSlot *s = &s_ordinary_agg[i];
     if (!s->used) {
+      evidence_cache_unlock();
       continue;
     }
     /* 仅 flush 已关闭的窗口（早于当前分钟），避免截断仍在累积的聚合。 */
     if (s->minute_unix >= cur_minute) {
+      evidence_cache_unlock();
       continue;
     }
     if (s->count < (uint64_t)threshold) {
       /* 计数不足以成一条摘要：直接释放槽位，明细此前已被 coalesce 丢弃。 */
       memset(s, 0, sizeof(*s));
+      evidence_cache_unlock();
       continue;
     }
     char prefix_esc[200];
@@ -869,7 +1354,6 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
     json_escape(reason_esc, sizeof(reason_esc), s->suppression_reason);
     json_escape(proc_esc, sizeof(proc_esc), s->process_name);
 
-    EdrBehaviorRecord rec;
     memset(&rec, 0, sizeof(rec));
     rec.type = EDR_EVENT_BEHAVIOR_SUMMARY;
     rec.priority = 2u; /* 低优先级，不进告警链路 */
@@ -888,27 +1372,61 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
              (unsigned)s->kind, (unsigned)s->event_type, (unsigned)s->pid,
              (unsigned long long)s->count, (long long)s->first_seen_ns,
              (long long)s->last_seen_ns, proc_esc, prefix_esc, reason_esc);
-    emit(&rec);
     s_status.summaries_emitted++;
     memset(s, 0, sizeof(*s));
+    emit_one = 1;
+    evidence_cache_unlock();
+    /* The caller may encode/enqueue or otherwise re-enter cache APIs. The
+     * aggregate slot was copied and released above, so no module lock spans
+     * this external callback. */
+    if (emit_one) emit(&rec);
   }
 }
 
-static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) {
-  if (!r) {
+/* Only already-committed candidates may satisfy a reuse.  A failed write must
+ * not populate this in-memory index, otherwise the next copy of the alert
+ * could be hidden for the whole dedupe window. */
+static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts) {
+  if (!candidate_generation_bound(r)) {
     return 0;
   }
   uint32_t win_s = candidate_dedupe_window_s();
   if (win_s == 0u) {
     return 0;
   }
-  char signal[160];
+  char signal[65];
   candidate_signal_for(r, signal, sizeof(signal));
   int64_t cutoff = ts - (int64_t)win_s * 1000000000LL;
-  size_t replace_i = 0;
+  for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
+    CandidateDedupeSlot *s = &s_candidate_dedupe[i];
+    if (s->last_ns >= cutoff && s->pid == r->pid && s->type == (uint32_t)r->type &&
+        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
+        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
+      s->last_ns = ts;
+      s_status.candidate_deduped++;
+      s_status.candidate_reused++;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts) {
+  if (!candidate_generation_bound(r) || candidate_dedupe_window_s() == 0u) {
+    return;
+  }
+  char signal[65];
+  candidate_signal_for(r, signal, sizeof(signal));
+  size_t replace_i = 0u;
   int64_t oldest = INT64_MAX;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
+    if (s->used && s->pid == r->pid && s->type == (uint32_t)r->type &&
+        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
+        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
+      s->last_ns = ts;
+      return;
+    }
     if (!s->used) {
       replace_i = i;
       oldest = INT64_MIN;
@@ -918,15 +1436,11 @@ static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) 
       oldest = s->last_ns;
       replace_i = i;
     }
-    if (s->last_ns >= cutoff && s->pid == r->pid && s->type == (uint32_t)r->type &&
-        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
-        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
-      s->last_ns = ts;
-      s_status.candidate_deduped++;
-      return 1;
-    }
   }
   CandidateDedupeSlot *slot = &s_candidate_dedupe[replace_i];
+  if (slot->used) {
+    s_status.candidate_dedup_evictions++;
+  }
   memset(slot, 0, sizeof(*slot));
   slot->used = 1u;
   slot->last_ns = ts;
@@ -934,7 +1448,6 @@ static int candidate_dedupe_should_skip(const EdrBehaviorRecord *r, int64_t ts) 
   slot->type = (uint32_t)r->type;
   copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r->endpoint_id);
   copy_s(slot->signal, sizeof(slot->signal), signal);
-  return 0;
 }
 
 #if defined(EDR_HAVE_SQLITE)
@@ -952,6 +1465,166 @@ static int exec_sql(const char *sql) {
     return -1;
   }
   return 0;
+}
+
+/* Old on-disk caches predate durable process-generation proof and explicit
+ * source omission provenance. Use PRAGMA discovery before each deterministic
+ * ALTER so reopening an existing cache is restart-safe and never drops
+ * candidate evidence. */
+static int sqlite_p0_candidates_has_column(const char *column) {
+  sqlite3_stmt *st = NULL;
+  int found = 0;
+  if (!s_db || !column ||
+      sqlite3_prepare_v2(s_db, "PRAGMA table_info(p0_candidates);", -1, &st, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(st, 1);
+    if (name && strcmp(name, column) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+static int sqlite_ensure_p0_candidate_columns(void) {
+  static const struct {
+    const char *name;
+    const char *alter;
+  } columns[] = {
+      {"process_start_key", "ALTER TABLE p0_candidates ADD COLUMN process_start_key TEXT;"},
+      {"process_creation_filetime_100ns",
+       "ALTER TABLE p0_candidates ADD COLUMN process_creation_filetime_100ns TEXT;"},
+      {"process_generation_source",
+       "ALTER TABLE p0_candidates ADD COLUMN process_generation_source TEXT;"},
+      {"source_completeness",
+       "ALTER TABLE p0_candidates ADD COLUMN source_completeness TEXT;"},
+      {"source_truncated_fields",
+       "ALTER TABLE p0_candidates ADD COLUMN source_truncated_fields TEXT;"},
+  };
+  for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
+    int has_column = sqlite_p0_candidates_has_column(columns[i].name);
+    if (has_column < 0 || (has_column == 0 && exec_sql(columns[i].alter) != 0)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* `process_cache` keeps only the most recent known generation for a PID, but
+ * it must never silently reinterpret that row as a PID-only identity after a
+ * restart.  These append-only ALTERs are safe for every previously shipped
+ * schema and leave historical rows explicitly generation-unknown. */
+static int sqlite_process_cache_has_column(const char *column) {
+  sqlite3_stmt *st = NULL;
+  int found = 0;
+  if (!s_db || !column ||
+      sqlite3_prepare_v2(s_db, "PRAGMA table_info(process_cache);", -1, &st, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(st, 1);
+    if (name && strcmp(name, column) == 0) {
+      found = 1;
+      break;
+    }
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+static int sqlite_ensure_process_cache_generation_columns(void) {
+  static const struct {
+    const char *name;
+    const char *alter;
+  } columns[] = {
+      {"process_start_key", "ALTER TABLE process_cache ADD COLUMN process_start_key TEXT;"},
+      {"process_creation_filetime_100ns",
+       "ALTER TABLE process_cache ADD COLUMN process_creation_filetime_100ns TEXT;"},
+      {"process_generation_source",
+       "ALTER TABLE process_cache ADD COLUMN process_generation_source TEXT;"},
+      {"parent_process_start_key",
+       "ALTER TABLE process_cache ADD COLUMN parent_process_start_key TEXT;"},
+      {"parent_process_creation_filetime_100ns",
+       "ALTER TABLE process_cache ADD COLUMN parent_process_creation_filetime_100ns TEXT;"},
+      {"parent_process_generation_source",
+       "ALTER TABLE process_cache ADD COLUMN parent_process_generation_source TEXT;"},
+  };
+  for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
+    int has_column = sqlite_process_cache_has_column(columns[i].name);
+    if (has_column < 0 || (has_column == 0 && exec_sql(columns[i].alter) != 0)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static void sqlite_u64_decimal(uint64_t value, char out[32]) {
+  if (out) (void)snprintf(out, 32u, "%llu", (unsigned long long)value);
+}
+
+static int sqlite_decimal_u64(const char *text, uint64_t *out) {
+  uint64_t value = 0u;
+  if (!text || !text[0] || !out) return 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+    if (*p < (unsigned char)'0' || *p > (unsigned char)'9' ||
+        value > (UINT64_MAX - (uint64_t)(*p - (unsigned char)'0')) / 10u) {
+      return 0;
+    }
+    value = value * 10u + (uint64_t)(*p - (unsigned char)'0');
+  }
+  *out = value;
+  return value != 0u;
+}
+
+/* All process-cache readers use this one projection.  A pre-migration row
+ * with NULL/empty tuple is intentionally invisible to authoritative tree
+ * joins instead of being treated as a PID-only parent. */
+static int sqlite_read_process_cache_row(sqlite3_stmt *st, ProcSlot *out) {
+  const char *start_key;
+  const char *creation;
+  const char *parent_start_key;
+  const char *parent_creation;
+  if (!st || !out) return 0;
+  memset(out, 0, sizeof(*out));
+  copy_s(out->endpoint_id, sizeof(out->endpoint_id),
+         (const char *)sqlite3_column_text(st, 0));
+  copy_s(out->tenant_id, sizeof(out->tenant_id),
+         (const char *)sqlite3_column_text(st, 1));
+  out->pid = (uint32_t)sqlite3_column_int64(st, 2);
+  out->ppid = (uint32_t)sqlite3_column_int64(st, 3);
+  copy_s(out->name, sizeof(out->name), (const char *)sqlite3_column_text(st, 4));
+  copy_s(out->path, sizeof(out->path), (const char *)sqlite3_column_text(st, 5));
+  copy_s(out->cmdline, sizeof(out->cmdline), (const char *)sqlite3_column_text(st, 6));
+  copy_s(out->parent_name, sizeof(out->parent_name),
+         (const char *)sqlite3_column_text(st, 7));
+  copy_s(out->parent_path, sizeof(out->parent_path),
+         (const char *)sqlite3_column_text(st, 8));
+  out->last_seen_ns = sqlite3_column_int64(st, 9);
+  start_key = (const char *)sqlite3_column_text(st, 10);
+  creation = (const char *)sqlite3_column_text(st, 11);
+  if (!sqlite_decimal_u64(start_key, &out->generation.process_start_key) ||
+      !sqlite_decimal_u64(creation, &out->generation.creation_filetime_100ns) ||
+      !generation_bound(&out->generation)) {
+    return 0;
+  }
+  copy_s(out->process_generation_source, sizeof(out->process_generation_source),
+         (const char *)sqlite3_column_text(st, 12));
+  parent_start_key = (const char *)sqlite3_column_text(st, 13);
+  parent_creation = (const char *)sqlite3_column_text(st, 14);
+  if (sqlite_decimal_u64(parent_start_key, &out->parent_generation.process_start_key) &&
+      sqlite_decimal_u64(parent_creation,
+                         &out->parent_generation.creation_filetime_100ns) &&
+      generation_bound(&out->parent_generation)) {
+    copy_s(out->parent_process_generation_source,
+           sizeof(out->parent_process_generation_source),
+           (const char *)sqlite3_column_text(st, 15));
+  } else {
+    memset(&out->parent_generation, 0, sizeof(out->parent_generation));
+  }
+  return 1;
 }
 
 static uint64_t path_size_bytes(const char *path) {
@@ -974,6 +1647,23 @@ static void refresh_db_size_status(void) {
   char wal_path[640];
   snprintf(wal_path, sizeof(wal_path), "%s-wal", s_status.path);
   s_status.wal_bytes = path_size_bytes(wal_path);
+}
+
+static void refresh_candidate_inventory_status(EdrEvidenceCacheStatus *st) {
+  sqlite3_stmt *stmt = NULL;
+  if (!st || !s_db ||
+      sqlite3_prepare_v2(s_db,
+                         "SELECT COUNT(*),COALESCE(MIN(event_time_ns),0) FROM p0_candidates;",
+                         -1, &stmt, NULL) != SQLITE_OK) {
+    return;
+  }
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    sqlite3_int64 rows = sqlite3_column_int64(stmt, 0);
+    sqlite3_int64 oldest = sqlite3_column_int64(stmt, 1);
+    st->p0_candidate_rows = rows > 0 ? (uint64_t)rows : 0u;
+    st->oldest_p0_candidate_event_time_ns = oldest > 0 ? (int64_t)oldest : 0;
+  }
+  sqlite3_finalize(stmt);
 }
 
 static int db_size_over_limit(void) {
@@ -1026,29 +1716,116 @@ static int sqlite_write_budget_allow(uint32_t units, int64_t ts) {
   return 1;
 }
 
+/* A reservation becomes consumption only when the enclosing write commits.
+ * This keeps an injected/disk commit failure from exhausting the next
+ * candidate's minute budget and hiding a retried alert. */
+static void sqlite_write_budget_release(uint32_t units, int64_t ts) {
+  uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
+                                   80u, 0u, 100000u);
+  if (limit == 0u) {
+    return;
+  }
+  if (units == 0u) {
+    units = 1u;
+  }
+  int64_t minute = (ts / 1000000000LL) / 60LL;
+  if (minute == s_write_budget_minute && s_write_budget_count >= units) {
+    s_write_budget_count -= units;
+  }
+}
+
 static void bind_text(sqlite3_stmt *st, int idx, const char *s) {
   sqlite3_bind_text(st, idx, s ? s : "", -1, SQLITE_TRANSIENT);
 }
 
-static void upsert_process_sqlite(const EdrBehaviorRecord *r) {
-  if (!s_db || !r || r->pid == 0u) {
-    return;
+static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  EvidenceProcessGeneration parent_generation;
+  char start_key[32], creation[32], parent_start_key[32], parent_creation[32];
+  int parent_known;
+  if (!s_db || !r || r->pid == 0u || !record_process_generation(r, &generation)) {
+    /* Unknown PID-only metadata is never durable authority. It may remain in
+     * the bounded in-memory display cache, but must not overwrite a known
+     * restarted lifetime in SQLite. */
+    return 0;
+  }
+  parent_known = record_parent_generation(r, &parent_generation);
+  sqlite_u64_decimal(generation.process_start_key, start_key);
+  sqlite_u64_decimal(generation.creation_filetime_100ns, creation);
+  if (parent_known) {
+    sqlite_u64_decimal(parent_generation.process_start_key, parent_start_key);
+    sqlite_u64_decimal(parent_generation.creation_filetime_100ns, parent_creation);
+  } else {
+    parent_start_key[0] = '\0';
+    parent_creation[0] = '\0';
   }
   const char *sql =
       "INSERT INTO process_cache(endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,"
-      "first_seen_ns,last_seen_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+      "first_seen_ns,last_seen_ns,process_start_key,process_creation_filetime_100ns,"
+      "process_generation_source,parent_process_start_key,parent_process_creation_filetime_100ns,"
+      "parent_process_generation_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(endpoint_id,pid) DO UPDATE SET "
-      "tenant_id=excluded.tenant_id,ppid=CASE WHEN excluded.ppid<>0 THEN excluded.ppid ELSE process_cache.ppid END,"
-      "name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE process_cache.name END,"
-      "path=CASE WHEN excluded.path<>'' THEN excluded.path ELSE process_cache.path END,"
-      "cmdline=CASE WHEN excluded.cmdline<>'' THEN excluded.cmdline ELSE process_cache.cmdline END,"
-      "parent_name=CASE WHEN excluded.parent_name<>'' THEN excluded.parent_name ELSE process_cache.parent_name END,"
-      "parent_path=CASE WHEN excluded.parent_path<>'' THEN excluded.parent_path ELSE process_cache.parent_path END,"
-      "last_seen_ns=excluded.last_seen_ns;";
+      "tenant_id=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.tenant_id WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE process_cache.tenant_id END,"
+      "ppid=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.ppid WHEN excluded.ppid<>0 THEN excluded.ppid ELSE process_cache.ppid END,"
+      "name=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.name WHEN excluded.name<>'' THEN excluded.name ELSE process_cache.name END,"
+      "path=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.path WHEN excluded.path<>'' THEN excluded.path ELSE process_cache.path END,"
+      "cmdline=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.cmdline WHEN excluded.cmdline<>'' THEN excluded.cmdline ELSE process_cache.cmdline END,"
+      "parent_name=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
+      "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
+      "(excluded.parent_process_start_key<>'' AND (process_cache.ppid IS NOT excluded.ppid OR "
+      "process_cache.parent_process_start_key IS NOT excluded.parent_process_start_key OR "
+      "process_cache.parent_process_creation_filetime_100ns IS NOT excluded.parent_process_creation_filetime_100ns)) "
+      "THEN excluded.parent_name WHEN excluded.parent_name<>'' THEN excluded.parent_name ELSE process_cache.parent_name END,"
+      "parent_path=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
+      "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
+      "(excluded.parent_process_start_key<>'' AND (process_cache.ppid IS NOT excluded.ppid OR "
+      "process_cache.parent_process_start_key IS NOT excluded.parent_process_start_key OR "
+      "process_cache.parent_process_creation_filetime_100ns IS NOT excluded.parent_process_creation_filetime_100ns)) "
+      "THEN excluded.parent_path WHEN excluded.parent_path<>'' THEN excluded.parent_path ELSE process_cache.parent_path END,"
+      "first_seen_ns=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.first_seen_ns ELSE MIN(process_cache.first_seen_ns,excluded.first_seen_ns) END,"
+      "last_seen_ns=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.last_seen_ns ELSE MAX(process_cache.last_seen_ns,excluded.last_seen_ns) END,"
+      "process_start_key=excluded.process_start_key,"
+      "process_creation_filetime_100ns=excluded.process_creation_filetime_100ns,"
+      "process_generation_source=CASE WHEN excluded.process_generation_source<>'' THEN "
+      "excluded.process_generation_source ELSE process_cache.process_generation_source END,"
+      "parent_process_start_key=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
+      "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
+      "excluded.parent_process_start_key<>'' THEN excluded.parent_process_start_key ELSE process_cache.parent_process_start_key END,"
+      "parent_process_creation_filetime_100ns=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
+      "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
+      "excluded.parent_process_start_key<>'' THEN excluded.parent_process_creation_filetime_100ns ELSE process_cache.parent_process_creation_filetime_100ns END,"
+      "parent_process_generation_source=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
+      "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
+      "excluded.parent_process_start_key<>'' THEN excluded.parent_process_generation_source ELSE process_cache.parent_process_generation_source END "
+      "WHERE process_cache.process_start_key IS NULL OR process_cache.process_start_key='' OR "
+      "process_cache.process_creation_filetime_100ns IS NULL OR "
+      "process_cache.process_creation_filetime_100ns='' OR "
+      "(process_cache.process_start_key=excluded.process_start_key AND "
+      "process_cache.process_creation_filetime_100ns=excluded.process_creation_filetime_100ns) OR "
+      "excluded.last_seen_ns>process_cache.last_seen_ns;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare process_cache failed");
-    return;
+    return -1;
   }
   int64_t ts = record_time_ns(r);
   bind_text(st, 1, r->endpoint_id);
@@ -1062,15 +1839,23 @@ static void upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 9, r->parent_path);
   sqlite3_bind_int64(st, 10, (sqlite3_int64)ts);
   sqlite3_bind_int64(st, 11, (sqlite3_int64)ts);
-  if (sqlite3_step(st) != SQLITE_DONE) {
+  bind_text(st, 12, start_key);
+  bind_text(st, 13, creation);
+  bind_text(st, 14, record_process_generation_source(r));
+  bind_text(st, 15, parent_start_key);
+  bind_text(st, 16, parent_creation);
+  bind_text(st, 17, parent_known ? record_parent_generation_source(r) : "");
+  int rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) {
     set_error("upsert process_cache failed");
   }
   sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void upsert_file_sqlite(const EdrBehaviorRecord *r) {
+static int upsert_file_sqlite(const EdrBehaviorRecord *r) {
   if (!s_db || !r || (!r->file_path[0] && !r->exe_path[0])) {
-    return;
+    return 0;
   }
   const char *sql =
       "INSERT INTO file_evidence(endpoint_id,path,sha256,pid,last_seen_ns) VALUES(?,?,?,?,?) "
@@ -1078,20 +1863,25 @@ static void upsert_file_sqlite(const EdrBehaviorRecord *r) {
       "last_seen_ns=excluded.last_seen_ns;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-    return;
+    set_error("prepare file_evidence failed");
+    return -1;
   }
   bind_text(st, 1, r->endpoint_id);
   bind_text(st, 2, r->file_path[0] ? r->file_path : r->exe_path);
   bind_text(st, 3, r->exe_hash);
   sqlite3_bind_int64(st, 4, (sqlite3_int64)r->pid);
   sqlite3_bind_int64(st, 5, (sqlite3_int64)record_time_ns(r));
-  (void)sqlite3_step(st);
+  int rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) {
+    set_error("upsert file_evidence failed");
+  }
   sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void upsert_network_sqlite(const EdrBehaviorRecord *r) {
+static int upsert_network_sqlite(const EdrBehaviorRecord *r) {
   if (!s_db || !r || (!r->net_dst[0] && !r->dns_query[0])) {
-    return;
+    return 0;
   }
   const char *sql =
       "INSERT INTO network_ioc(endpoint_id,remote_ip,remote_url,dst_port,pid,last_seen_ns) "
@@ -1100,7 +1890,8 @@ static void upsert_network_sqlite(const EdrBehaviorRecord *r) {
       "last_seen_ns=excluded.last_seen_ns;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-    return;
+    set_error("prepare network_ioc failed");
+    return -1;
   }
   bind_text(st, 1, r->endpoint_id);
   bind_text(st, 2, r->net_dst);
@@ -1108,13 +1899,17 @@ static void upsert_network_sqlite(const EdrBehaviorRecord *r) {
   sqlite3_bind_int64(st, 4, (sqlite3_int64)r->net_dport);
   sqlite3_bind_int64(st, 5, (sqlite3_int64)r->pid);
   sqlite3_bind_int64(st, 6, (sqlite3_int64)record_time_ns(r));
-  (void)sqlite3_step(st);
+  int rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) {
+    set_error("upsert network_ioc failed");
+  }
   sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void upsert_registry_sqlite(const EdrBehaviorRecord *r) {
+static int upsert_registry_sqlite(const EdrBehaviorRecord *r) {
   if (!s_db || !r || !r->reg_key_path[0]) {
-    return;
+    return 0;
   }
   const char *sql =
       "INSERT INTO registry_evidence(endpoint_id,key_path,value_name,op,pid,last_seen_ns) "
@@ -1122,7 +1917,8 @@ static void upsert_registry_sqlite(const EdrBehaviorRecord *r) {
       "ON CONFLICT(endpoint_id,key_path,value_name,op,pid) DO UPDATE SET last_seen_ns=excluded.last_seen_ns;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-    return;
+    set_error("prepare registry_evidence failed");
+    return -1;
   }
   bind_text(st, 1, r->endpoint_id);
   bind_text(st, 2, r->reg_key_path);
@@ -1130,73 +1926,272 @@ static void upsert_registry_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 4, r->reg_op);
   sqlite3_bind_int64(st, 5, (sqlite3_int64)r->pid);
   sqlite3_bind_int64(st, 6, (sqlite3_int64)record_time_ns(r));
-  (void)sqlite3_step(st);
+  int rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) {
+    set_error("upsert registry_evidence failed");
+  }
   sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void build_context_manifest_json(const EdrBehaviorRecord *r, const char *candidate_id,
-                                        uint32_t pre_count, int64_t post_until_ns,
-                                        char *out, size_t cap) {
-  if (!out || cap == 0u) {
-    return;
+static int manifest_utf8_valid(const char *text) {
+  const unsigned char *p = (const unsigned char *)(text ? text : "");
+  const unsigned char *end = p + strlen((const char *)p);
+  while (p < end) {
+    unsigned char c = *p++;
+    if (c <= 0x7fu) continue;
+    if (c >= 0xc2u && c <= 0xdfu) {
+      if ((size_t)(end - p) < 1u || (p[0] & 0xc0u) != 0x80u) return 0;
+      p += 1;
+    } else if (c >= 0xe0u && c <= 0xefu) {
+      if ((size_t)(end - p) < 2u || (p[0] & 0xc0u) != 0x80u ||
+          (p[1] & 0xc0u) != 0x80u ||
+          (c == 0xe0u && p[0] < 0xa0u) || (c == 0xedu && p[0] > 0x9fu)) return 0;
+      p += 2;
+    } else if (c >= 0xf0u && c <= 0xf4u) {
+      if ((size_t)(end - p) < 3u || (p[0] & 0xc0u) != 0x80u ||
+          (p[1] & 0xc0u) != 0x80u ||
+          (p[2] & 0xc0u) != 0x80u || (c == 0xf0u && p[0] < 0x90u) ||
+          (c == 0xf4u && p[0] > 0x8fu)) return 0;
+      p += 3;
+    } else {
+      return 0;
+    }
   }
-  size_t off = 0;
-  char cid[160], ep[140], pn[320], fp[1200], nd[120];
-  json_escape(cid, sizeof(cid), candidate_id);
-  json_escape(ep, sizeof(ep), r ? r->endpoint_id : "");
-  json_escape(pn, sizeof(pn), r ? r->process_name : "");
-  json_escape(fp, sizeof(fp), r ? (r->file_path[0] ? r->file_path : r->exe_path) : "");
-  json_escape(nd, sizeof(nd), r ? r->net_dst : "");
-  appendf(out, cap, &off,
-          "{\"schema\":\"p0_context_bundle.v1\",\"candidate_id\":%s,"
-          "\"endpoint_id\":%s,\"event_time_ns\":%lld,\"pid\":%u,\"type\":%u,"
-          "\"process_name\":%s,\"path\":%s,\"remote_ip\":%s,\"remote_port\":%u,"
-          "\"pre_window_s\":%u,\"post_window_s\":%u,\"pre_context_count\":%u,"
-          "\"post_until_ns\":%lld,\"context\":[",
-          cid, ep, (long long)record_time_ns(r), r ? r->pid : 0u,
-          r ? (uint32_t)r->type : 0u, pn, fp, nd, r ? r->net_dport : 0u,
-          evidence_context_window_s(), evidence_context_window_s(), pre_count,
-          (long long)post_until_ns);
-  int first = 1;
+  return 1;
+}
+
+static void manifest_rejected(const char *reason) {
+  s_status.manifest_rejections++;
+  set_error(reason ? reason : "context manifest rejected");
+}
+
+static int manifest_add_text(cJSON *object, const char *name, const char *value) {
+  return object && name && manifest_utf8_valid(value) &&
+         cJSON_AddStringToObject(object, name, value ? value : "") != NULL;
+}
+
+/* cJSON's number representation is a double.  Preserve source event times
+ * and FILETIME-derived values exactly by attaching trusted decimal digits as
+ * a cJSON raw number, while cJSON still owns all JSON structure/escaping. */
+static int manifest_add_i64(cJSON *object, const char *name, int64_t value) {
+  char decimal[32];
+  int written;
+  cJSON *number;
+  if (!object || !name) return 0;
+  written = snprintf(decimal, sizeof(decimal), "%lld", (long long)value);
+  if (written < 0 || (size_t)written >= sizeof(decimal)) return 0;
+  number = cJSON_CreateRaw(decimal);
+  return number && cJSON_AddItemToObject(object, name, number);
+}
+
+static int manifest_add_u64(cJSON *object, const char *name, uint64_t value) {
+  char decimal[32];
+  int written;
+  cJSON *number;
+  if (!object || !name) return 0;
+  written = snprintf(decimal, sizeof(decimal), "%llu", (unsigned long long)value);
+  if (written < 0 || (size_t)written >= sizeof(decimal)) return 0;
+  number = cJSON_CreateRaw(decimal);
+  return number && cJSON_AddItemToObject(object, name, number);
+}
+
+/* Process generation is an exact identifier, not a JavaScript number.  Emit
+ * it as canonical decimal text so every consumer preserves all 64 bits. */
+static int manifest_add_u64_text(cJSON *object, const char *name, uint64_t value) {
+  char decimal[32];
+  int written = snprintf(decimal, sizeof(decimal), "%llu", (unsigned long long)value);
+  return written >= 0 && (size_t)written < sizeof(decimal) &&
+         manifest_add_text(object, name, decimal);
+}
+
+static int manifest_finish(cJSON *root, char **out) {
+  char *printed;
+  if (!root || !out) {
+    manifest_rejected("context manifest missing output");
+    return -1;
+  }
+  *out = NULL;
+  printed = cJSON_PrintUnformatted(root);
+  if (!printed || strlen(printed) > EDR_EVIDENCE_MANIFEST_MAX_BYTES) {
+    if (printed) cJSON_free(printed);
+    manifest_rejected("context manifest allocation or bounded-size failure");
+    return -1;
+  }
+  *out = printed;
+  return 0;
+}
+
+static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *candidate_id,
+                                       uint32_t pre_count, int64_t post_until_ns,
+                                       char **out) {
+  cJSON *root = NULL;
+  cJSON *context = NULL;
+  EvidenceProcessGeneration generation;
+  int generation_known;
+  const char *generation_source;
+  int ok;
+  int rc = -1;
+  if (!r || !out) {
+    manifest_rejected("context manifest missing source record");
+    return -1;
+  }
+  generation_known = record_process_generation(r, &generation);
+  generation_source = generation_known ? record_process_generation_source(r) : "";
+  root = cJSON_CreateObject();
+  context = root ? cJSON_AddArrayToObject(root, "context") : NULL;
+  ok = root && context &&
+       manifest_add_text(root, "schema", "p0_context_bundle.v1") &&
+       manifest_add_text(root, "candidate_id", candidate_id) &&
+       manifest_add_text(root, "source_event_id", r->event_id) &&
+       manifest_add_text(root, "endpoint_id", r->endpoint_id) &&
+       manifest_add_i64(root, "event_time_ns", record_time_ns(r)) &&
+       manifest_add_u64(root, "pid", r->pid) &&
+       manifest_add_u64_text(root, "process_start_key",
+                             generation_known ? generation.process_start_key : 0u) &&
+       manifest_add_u64_text(root, "process_creation_filetime_100ns",
+                             generation_known ? generation.creation_filetime_100ns : 0u) &&
+       manifest_add_text(root, "process_generation_source", generation_source) &&
+       manifest_add_text(root, "source_completeness", r->source_completeness) &&
+       manifest_add_text(root, "source_truncated_fields", r->source_truncated_fields) &&
+       manifest_add_u64(root, "type", (uint32_t)r->type) &&
+       manifest_add_text(root, "process_name", r->process_name) &&
+       manifest_add_text(root, "path", r->file_path[0] ? r->file_path : r->exe_path) &&
+       manifest_add_text(root, "remote_ip", r->net_dst) &&
+       manifest_add_u64(root, "remote_port", r->net_dport) &&
+       manifest_add_u64(root, "pre_window_s", evidence_context_window_s()) &&
+       manifest_add_u64(root, "post_window_s", evidence_context_window_s()) &&
+       manifest_add_u64(root, "pre_context_count", pre_count) &&
+       manifest_add_i64(root, "post_until_ns", post_until_ns);
   int64_t cutoff = record_time_ns(r) - (int64_t)evidence_context_window_s() * 1000000000LL;
   uint32_t pos = s_context_ring_pos;
-  uint32_t added = 0;
-  for (uint32_t i = 0; i < EDR_EVIDENCE_CONTEXT_RING_SLOTS && added < 32u; i++) {
+  uint32_t added = 0u;
+  for (uint32_t i = 0u; ok && i < EDR_EVIDENCE_CONTEXT_RING_SLOTS && added < 32u; ++i) {
     const RingSlot *s = &s_context_ring[(pos + EDR_EVIDENCE_CONTEXT_RING_SLOTS - 1u - i) %
                                         EDR_EVIDENCE_CONTEXT_RING_SLOTS];
-    if (!s->used) {
+    cJSON *item;
+    if (!s->used || s->event_time_ns < cutoff ||
+        s->event_time_ns > record_time_ns(r) || !ring_related_to_record(s, r)) {
       continue;
     }
-    if (s->event_time_ns < cutoff) {
+    item = cJSON_CreateObject();
+    ok = item &&
+         manifest_add_i64(item, "event_time_ns", s->event_time_ns) &&
+         manifest_add_u64(item, "type", s->type) &&
+         manifest_add_u64(item, "pid", s->pid) &&
+         manifest_add_u64(item, "ppid", s->ppid) &&
+         manifest_add_u64_text(item, "process_start_key", s->generation.process_start_key) &&
+         manifest_add_u64_text(item, "process_creation_filetime_100ns",
+                               s->generation.creation_filetime_100ns) &&
+         manifest_add_text(item, "process_generation_source",
+                           s->process_generation_source) &&
+         manifest_add_text(item, "source_completeness", s->source_completeness) &&
+         manifest_add_text(item, "source_truncated_fields", s->source_truncated_fields) &&
+         manifest_add_u64_text(item, "parent_process_start_key",
+                               s->parent_generation.process_start_key) &&
+         manifest_add_u64_text(item, "parent_creation_filetime_100ns",
+                               s->parent_generation.creation_filetime_100ns) &&
+         manifest_add_text(item, "parent_process_generation_source",
+                           s->parent_process_generation_source) &&
+         manifest_add_text(item, "endpoint_id", s->endpoint_id) &&
+         manifest_add_text(item, "process_name", s->process_name) &&
+         manifest_add_text(item, "file_path", s->file_path) &&
+         manifest_add_text(item, "remote_ip", s->net_dst) &&
+         manifest_add_u64(item, "remote_port", s->net_dport) &&
+         cJSON_AddItemToArray(context, item);
+    if (!ok) {
+      cJSON_Delete(item);
       break;
     }
-    if (!ring_related_to_record(s, r)) {
-      continue;
-    }
-    char spn[320], sfp[640], snd[120], sep[140];
-    json_escape(sep, sizeof(sep), s->endpoint_id);
-    json_escape(spn, sizeof(spn), s->process_name);
-    json_escape(sfp, sizeof(sfp), s->file_path);
-    json_escape(snd, sizeof(snd), s->net_dst);
-    appendf(out, cap, &off,
-            "%s{\"event_time_ns\":%lld,\"type\":%u,\"pid\":%u,\"ppid\":%u,"
-            "\"endpoint_id\":%s,\"process_name\":%s,\"file_path\":%s,"
-            "\"remote_ip\":%s,\"remote_port\":%u}",
-            first ? "" : ",", (long long)s->event_time_ns, s->type, s->pid, s->ppid,
-            sep, spn, sfp, snd, s->net_dport);
-    first = 0;
     added++;
   }
-  appendf(out, cap, &off, "]}");
-  out[cap - 1u] = '\0';
+  if (!ok) {
+    manifest_rejected("context manifest allocation or UTF-8 validation failed");
+  } else {
+    rc = manifest_finish(root, out);
+  }
+  cJSON_Delete(root);
+  return rc;
 }
 
-static void insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candidate_id,
-                                   const char *artifact_type, const char *path,
-                                   const char *sha256, const char *manifest_json,
-                                   const char *upload_status) {
-  if (!s_db || !candidate_id || !candidate_id[0]) {
+static int build_post_context_manifest_json(const EdrBehaviorRecord *r,
+                                            const char *candidate_id,
+                                            char **out) {
+  cJSON *root = NULL;
+  EvidenceProcessGeneration generation;
+  int generation_known;
+  const char *generation_source;
+  int ok;
+  int rc = -1;
+  if (!r || !out) {
+    manifest_rejected("post-context manifest missing source record");
+    return -1;
+  }
+  generation_known = record_process_generation(r, &generation);
+  generation_source = generation_known ? record_process_generation_source(r) : "";
+  root = cJSON_CreateObject();
+  ok = root &&
+       manifest_add_text(root, "schema", "p0_post_context_event.v1") &&
+       manifest_add_text(root, "candidate_id", candidate_id) &&
+       manifest_add_text(root, "source_event_id", r->event_id) &&
+       manifest_add_i64(root, "event_time_ns", record_time_ns(r)) &&
+       manifest_add_u64(root, "type", (uint32_t)r->type) &&
+       manifest_add_u64(root, "pid", r->pid) &&
+       manifest_add_u64(root, "ppid", r->ppid) &&
+       manifest_add_u64_text(root, "process_start_key",
+                             generation_known ? generation.process_start_key : 0u) &&
+       manifest_add_u64_text(root, "process_creation_filetime_100ns",
+                             generation_known ? generation.creation_filetime_100ns : 0u) &&
+       manifest_add_text(root, "process_generation_source", generation_source) &&
+       manifest_add_text(root, "source_completeness", r->source_completeness) &&
+       manifest_add_text(root, "source_truncated_fields", r->source_truncated_fields) &&
+       manifest_add_text(root, "process_name", r->process_name) &&
+       manifest_add_text(root, "path", r->file_path[0] ? r->file_path : r->exe_path) &&
+       manifest_add_text(root, "dns_query", r->dns_query) &&
+       manifest_add_text(root, "remote_ip", r->net_dst) &&
+       manifest_add_u64(root, "remote_port", r->net_dport) &&
+       manifest_add_text(root, "registry_key", r->reg_key_path) &&
+       manifest_add_text(root, "registry_value", r->reg_value_name) &&
+       manifest_add_text(root, "registry_op", r->reg_op);
+  if (!ok) {
+    manifest_rejected("post-context manifest allocation or UTF-8 validation failed");
+  } else {
+    rc = manifest_finish(root, out);
+  }
+  cJSON_Delete(root);
+  return rc;
+}
+
+static void artifact_source_identity_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[] = "0123456789abcdef";
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  if (!r || cap < 65u) return;
+  if (!r->event_id[0]) {
+    /* candidate_signal_for is already the module's length-delimited semantic
+     * commitment.  Reuse it rather than adding a second normalizer. */
+    candidate_signal_for(r, out, cap);
     return;
+  }
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, "edr-local-evidence-artifact-source-id-v1");
+  candidate_digest_text(&ctx, r->event_id);
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); ++i) {
+    out[i * 2u] = hex[digest[i] >> 4u];
+    out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out[64] = '\0';
+}
+
+static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candidate_id,
+                                  const char *artifact_type, const char *path,
+                                  const char *sha256, const char *manifest_json,
+                                  const char *upload_status) {
+  if (!s_db || !candidate_id || !candidate_id[0]) {
+    return -1;
   }
   const char *sql =
       "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,"
@@ -1206,11 +2201,20 @@ static void insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candi
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare artifacts failed");
-    return;
+    return -1;
   }
-  char artifact_id[256];
-  snprintf(artifact_id, sizeof(artifact_id), "%s:%s", candidate_id,
-           artifact_type && artifact_type[0] ? artifact_type : "artifact");
+  char artifact_id[384];
+  char source_identity[65];
+  const char *type_name = artifact_type && artifact_type[0] ? artifact_type : "artifact";
+  artifact_source_identity_for(r, source_identity, sizeof(source_identity));
+  int artifact_id_written = snprintf(artifact_id, sizeof(artifact_id), "%s:%s:%s",
+                                     candidate_id, type_name, source_identity);
+  if (!source_identity[0] || artifact_id_written < 0 ||
+      (size_t)artifact_id_written >= sizeof(artifact_id)) {
+    set_error("artifact source identity unavailable");
+    sqlite3_finalize(st);
+    return -1;
+  }
   bind_text(st, 1, artifact_id);
   bind_text(st, 2, r ? r->endpoint_id : "");
   bind_text(st, 3, r ? r->tenant_id : "");
@@ -1222,63 +2226,118 @@ static void insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candi
   sqlite3_bind_int64(st, 9, (sqlite3_int64)now_unix_ns());
   bind_text(st, 10, upload_status ? upload_status : "local");
   bind_text(st, 11, "");
-  if (sqlite3_step(st) == SQLITE_DONE) {
-    s_status.artifacts_written++;
-  } else {
+  int rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) {
     set_error("insert artifacts failed");
   }
   sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static void sqlite_record_context_artifact(const EdrBehaviorRecord *r, const char *candidate_id) {
+static int sqlite_record_context_artifact(const EdrBehaviorRecord *r, const char *candidate_id) {
   if (!s_db || !r || !candidate_id || !candidate_id[0]) {
-    return;
+    return -1;
   }
-  char cid[220], pn[320], fp[1200], dns[640], nd[120], rk[1200], rv[640], ro[80];
-  char manifest[4096];
-  json_escape(cid, sizeof(cid), candidate_id);
-  json_escape(pn, sizeof(pn), r->process_name);
-  json_escape(fp, sizeof(fp), r->file_path[0] ? r->file_path : r->exe_path);
-  json_escape(dns, sizeof(dns), r->dns_query);
-  json_escape(nd, sizeof(nd), r->net_dst);
-  json_escape(rk, sizeof(rk), r->reg_key_path);
-  json_escape(rv, sizeof(rv), r->reg_value_name);
-  json_escape(ro, sizeof(ro), r->reg_op);
-  snprintf(manifest, sizeof(manifest),
-           "{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":%s,"
-           "\"event_time_ns\":%lld,\"type\":%u,\"pid\":%u,\"ppid\":%u,"
-           "\"process_name\":%s,\"path\":%s,\"dns_query\":%s,\"remote_ip\":%s,"
-           "\"remote_port\":%u,\"registry_key\":%s,\"registry_value\":%s,\"registry_op\":%s}",
-           cid, (long long)record_time_ns(r), (uint32_t)r->type, r->pid, r->ppid,
-           pn, fp, dns, nd, r->net_dport, rk, rv, ro);
-  char artifact_type[96];
-  snprintf(artifact_type, sizeof(artifact_type), "post_context_%lld_%u_%u",
-           (long long)record_time_ns(r), r->pid, (uint32_t)r->type);
-  insert_artifact_sqlite(r, candidate_id, artifact_type, "", "", manifest, "local_manifest");
+  char *manifest = NULL;
+  if (build_post_context_manifest_json(r, candidate_id, &manifest) != 0) {
+    return -1;
+  }
+  int rc = insert_artifact_sqlite(r, candidate_id, "post_context", "", "", manifest,
+                                  "local_manifest");
+  cJSON_free(manifest);
+  return rc;
 }
 
-static void sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_count,
-                                    int64_t post_until_ns) {
-  if (!s_db) {
-    return;
+/* Preserve all-or-none post-context attribution when one event belongs to
+ * multiple live candidate windows.  A failed row cannot leave an arbitrary
+ * prefix of candidates looking complete. */
+static void sqlite_rollback_silent(void);
+static int sqlite_commit_candidate_transaction(void);
+
+static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
+                                           char candidate_ids[][160],
+                                           uint32_t candidate_count) {
+  if (!r || !candidate_ids || candidate_count == 0u ||
+      exec_sql("BEGIN IMMEDIATE;") != 0) {
+    return -1;
   }
+  for (uint32_t i = 0u; i < candidate_count; ++i) {
+    if (!candidate_ids[i][0] ||
+        sqlite_record_context_artifact(r, candidate_ids[i]) != 0) {
+      sqlite_rollback_silent();
+      return -1;
+    }
+  }
+  if (sqlite_commit_candidate_transaction() != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
+  return 0;
+}
+
+static void sqlite_rollback_silent(void) {
+  char *err = NULL;
+  if (s_db) {
+    (void)sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, &err);
+  }
+  sqlite3_free(err);
+}
+
+static int sqlite_commit_candidate_transaction(void) {
+  int rc;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  s_test_commit_active = 1;
+#endif
+  rc = exec_sql("COMMIT;");
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  s_test_commit_active = 0;
+#endif
+  if (rc != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
+  return 0;
+}
+
+static int sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_count,
+                                   int64_t post_until_ns) {
+  EvidenceProcessGeneration generation;
+  int generation_known;
+  const char *generation_source;
+  if (!s_db || !r) {
+    set_error("evidence cache database unavailable");
+    return -1;
+  }
+  generation_known = record_process_generation(r, &generation);
+  generation_source = generation_known ? record_process_generation_source(r) : "";
   char candidate_id[160];
   candidate_id_for(r, candidate_id, sizeof(candidate_id));
-  (void)exec_sql("BEGIN IMMEDIATE;");
-  upsert_process_sqlite(r);
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) {
+    return -1;
+  }
+  if (upsert_process_sqlite(r) != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
   const char *sql =
       "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,type,pid,ppid,"
       "process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,reg_key_path,"
-      "reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns,"
+      "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+      "source_completeness,source_truncated_fields) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(candidate_id) DO UPDATE SET context_pre_count=excluded.context_pre_count,"
-      "context_post_until_ns=excluded.context_post_until_ns,created_ns=excluded.created_ns;";
+      "context_post_until_ns=excluded.context_post_until_ns,created_ns=excluded.created_ns,"
+      "process_start_key=excluded.process_start_key,"
+      "process_creation_filetime_100ns=excluded.process_creation_filetime_100ns,"
+      "process_generation_source=excluded.process_generation_source,"
+      "source_completeness=excluded.source_completeness,"
+      "source_truncated_fields=excluded.source_truncated_fields;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare p0_candidates failed");
-    (void)exec_sql("ROLLBACK;");
-    s_status.records_dropped++;
-    return;
+    sqlite_rollback_silent();
+    return -1;
   }
   bind_text(st, 1, candidate_id);
   bind_text(st, 2, r ? r->endpoint_id : "");
@@ -1301,23 +2360,46 @@ static void sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_cou
   sqlite3_bind_int64(st, 19, (sqlite3_int64)pre_count);
   sqlite3_bind_int64(st, 20, (sqlite3_int64)post_until_ns);
   sqlite3_bind_int64(st, 21, (sqlite3_int64)now_unix_ns());
+  char start_key_text[32];
+  char creation_text[32];
+  sqlite_u64_decimal(generation_known ? generation.process_start_key : 0u, start_key_text);
+  sqlite_u64_decimal(generation_known ? generation.creation_filetime_100ns : 0u,
+                     creation_text);
+  bind_text(st, 22, start_key_text);
+  bind_text(st, 23, creation_text);
+  bind_text(st, 24, generation_source);
+  bind_text(st, 25, r->source_completeness);
+  bind_text(st, 26, r->source_truncated_fields);
   if (sqlite3_step(st) != SQLITE_DONE) {
     set_error("insert p0_candidates failed");
-    s_status.records_dropped++;
     sqlite3_finalize(st);
-    (void)exec_sql("ROLLBACK;");
-    return;
+    sqlite_rollback_silent();
+    return -1;
   }
   sqlite3_finalize(st);
+  if (upsert_file_sqlite(r) != 0 || upsert_network_sqlite(r) != 0 ||
+      upsert_registry_sqlite(r) != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
+  char *manifest = NULL;
+  if (build_context_manifest_json(r, candidate_id, pre_count, post_until_ns, &manifest) != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
+  int artifact_rc = insert_artifact_sqlite(r, candidate_id, "p0_context_bundle", "", "", manifest,
+                                           "local_manifest");
+  cJSON_free(manifest);
+  if (artifact_rc != 0 || sqlite_commit_candidate_transaction() != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
+  /* These counters describe durable candidate commits, never a statement
+   * that was later rolled back. */
   s_status.records_written++;
   s_status.p0_candidates_written++;
-  upsert_file_sqlite(r);
-  upsert_network_sqlite(r);
-  upsert_registry_sqlite(r);
-  char manifest[4096];
-  build_context_manifest_json(r, candidate_id, pre_count, post_until_ns, manifest, sizeof(manifest));
-  insert_artifact_sqlite(r, candidate_id, "p0_context_bundle", "", "", manifest, "local_manifest");
-  (void)exec_sql("COMMIT;");
+  s_status.artifacts_written++;
+  return 0;
 }
 
 static void sqlite_flush_metrics(void) {
@@ -1377,21 +2459,35 @@ static void sqlite_maintenance(void) {
     snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
       sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
-      (void)sqlite3_step(st);
+      int rc = sqlite3_step(st);
+      int changes = rc == SQLITE_DONE ? sqlite3_changes(s_db) : 0;
       sqlite3_finalize(st);
       st = NULL;
+      if (changes > 0) {
+        s_status.db_retention_evicted += (uint64_t)changes;
+      }
     }
   }
   if (sqlite3_prepare_v2(s_db, "DELETE FROM metrics WHERE minute_unix < ?;", -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff_minute);
-    (void)sqlite3_step(st);
+    int rc = sqlite3_step(st);
+    int changes = rc == SQLITE_DONE ? sqlite3_changes(s_db) : 0;
     sqlite3_finalize(st);
     st = NULL;
+    if (changes > 0) {
+      s_status.db_retention_evicted += (uint64_t)changes;
+    }
   }
   if (db_size_over_limit()) {
     for (int pass = 0; pass < 4 && db_size_over_limit(); pass++) {
-      (void)exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);");
-      (void)exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);");
+      if (exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);") == 0) {
+        int changes = sqlite3_changes(s_db);
+        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
+      }
+      if (exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);") == 0) {
+        int changes = sqlite3_changes(s_db);
+        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
+      }
     }
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     if (db_size_over_limit()) {
@@ -1410,8 +2506,10 @@ static void sqlite_maintenance(void) {
 void edr_local_evidence_cache_record_command_result(
     const char *command_id, const char *command_type, const char *status,
     int execution_status, int exit_code, const char *detail, const char *artifacts) {
+  evidence_cache_lock();
 #if defined(EDR_HAVE_SQLITE)
   if (!s_db || !command_id || !command_id[0]) {
+    evidence_cache_unlock();
     return;
   }
   const char *sql =
@@ -1424,6 +2522,7 @@ void edr_local_evidence_cache_record_command_result(
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare command_results failed");
+    evidence_cache_unlock();
     return;
   }
   bind_text(st, 1, command_id);
@@ -1440,6 +2539,7 @@ void edr_local_evidence_cache_record_command_result(
     set_error("upsert command_results failed");
   }
   sqlite3_finalize(st);
+  evidence_cache_unlock();
 #else
   (void)command_id;
   (void)command_type;
@@ -1448,11 +2548,25 @@ void edr_local_evidence_cache_record_command_result(
   (void)exit_code;
   (void)detail;
   (void)artifacts;
+  evidence_cache_unlock();
 #endif
+}
+
+static void evidence_cache_close_locked(void) {
+#if defined(EDR_HAVE_SQLITE)
+  if (s_db) {
+    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    sqlite3_close(s_db);
+    s_db = NULL;
+  }
+#endif
+  s_status.db_open = 0;
 }
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours) {
+  evidence_cache_lock();
+  evidence_cache_close_locked();
   memset(&s_status, 0, sizeof(s_status));
   memset(s_proc, 0, sizeof(s_proc));
   memset(s_ring, 0, sizeof(s_ring));
@@ -1464,6 +2578,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_ring_pos = 0;
   s_context_ring_pos = 0;
   s_context_window_next = 0;
+  s_last_maintenance_ns = 0u;
   s_write_budget_minute = 0;
   s_write_budget_count = 0u;
   s_status.max_db_mb = max_db_mb ? max_db_mb : 128u;
@@ -1480,9 +2595,15 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     }
     s_db = NULL;
     set_error(err);
+    evidence_cache_unlock();
     return -1;
   }
   s_status.db_open = 1;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  s_test_commit_failures = 0u;
+  s_test_commit_active = 0;
+  (void)sqlite3_commit_hook(s_db, evidence_cache_test_commit_hook, NULL);
+#endif
   (void)exec_sql("PRAGMA journal_mode=WAL;");
   (void)exec_sql("PRAGMA synchronous=NORMAL;");
   (void)exec_sql("PRAGMA cache_size=-1024;");
@@ -1491,7 +2612,10 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "CREATE TABLE IF NOT EXISTS process_cache ("
       "endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,ppid INTEGER,"
       "name TEXT,path TEXT,cmdline TEXT,parent_name TEXT,parent_path TEXT,"
-      "first_seen_ns INTEGER,last_seen_ns INTEGER,PRIMARY KEY(endpoint_id,pid));"
+      "first_seen_ns INTEGER,last_seen_ns INTEGER,process_start_key TEXT,"
+      "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
+      "parent_process_start_key TEXT,parent_process_creation_filetime_100ns TEXT,"
+      "parent_process_generation_source TEXT,PRIMARY KEY(endpoint_id,pid));"
       "CREATE TABLE IF NOT EXISTS event_cache ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT,endpoint_id TEXT,tenant_id TEXT,"
       "event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,"
@@ -1504,7 +2628,9 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,"
       "cmdline TEXT,file_path TEXT,dns_query TEXT,net_dst TEXT,net_dport INTEGER,reg_key_path TEXT,"
       "reg_value_name TEXT,reg_op TEXT,detection_context TEXT,context_pre_count INTEGER,"
-      "context_post_until_ns INTEGER,created_ns INTEGER);"
+      "context_post_until_ns INTEGER,created_ns INTEGER,process_start_key TEXT,"
+      "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
+      "source_completeness TEXT,source_truncated_fields TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_p0_candidates_ep_time ON p0_candidates(endpoint_id,event_time_ns);"
       "CREATE INDEX IF NOT EXISTS idx_p0_candidates_pid_time ON p0_candidates(endpoint_id,pid,event_time_ns);"
       "CREATE TABLE IF NOT EXISTS artifacts ("
@@ -1534,28 +2660,72 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "task_id TEXT PRIMARY KEY,status TEXT,evidence_refs TEXT,upload_refs TEXT,error TEXT,"
       "retryable INTEGER,updated_ns INTEGER);";
   if (exec_sql(schema) != 0) {
-    edr_local_evidence_cache_close();
+    evidence_cache_close_locked();
+    evidence_cache_unlock();
+    return -1;
+  }
+  if (sqlite_ensure_process_cache_generation_columns() != 0 ||
+      sqlite_ensure_p0_candidate_columns() != 0) {
+    evidence_cache_close_locked();
+    evidence_cache_unlock();
     return -1;
   }
   sqlite_maintenance();
+  evidence_cache_unlock();
   return 0;
 #else
   (void)path;
   set_error("sqlite disabled");
+  evidence_cache_unlock();
   return -1;
 #endif
 }
 
 void edr_local_evidence_cache_close(void) {
-#if defined(EDR_HAVE_SQLITE)
-  if (s_db) {
-    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
-    sqlite3_close(s_db);
-    s_db = NULL;
-  }
-#endif
-  s_status.db_open = 0;
+  evidence_cache_lock();
+  evidence_cache_close_locked();
+  evidence_cache_unlock();
 }
+
+#if defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+void edr_local_evidence_cache_test_fail_next_commits(unsigned count) {
+  evidence_cache_lock();
+  s_test_commit_failures = count;
+  evidence_cache_unlock();
+}
+#endif
+
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+void edr_local_evidence_cache_test_reset_mutex_timing(void) {
+  evidence_cache_lock();
+  memset(&s_evidence_cache_lock_timing, 0, sizeof(s_evidence_cache_lock_timing));
+  /* Reset must leave a true zero-sample snapshot for the next status call. */
+  s_evidence_cache_lock_tls.suppress_sample = 1u;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,
+                                                        uint64_t hold_ns) {
+  evidence_cache_lock();
+  evidence_cache_record_lock_timing_locked(wait_ns, hold_ns);
+  /* Do not add this helper's implementation overhead as a second sample. */
+  s_evidence_cache_lock_tls.suppress_sample = 1u;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms) {
+  evidence_cache_lock();
+#if defined(_WIN32)
+  Sleep((DWORD)hold_ms);
+#else
+  struct timespec delay;
+  delay.tv_sec = (time_t)(hold_ms / 1000u);
+  delay.tv_nsec = (long)(hold_ms % 1000u) * 1000000L;
+  (void)nanosleep(&delay, NULL);
+#endif
+  evidence_cache_unlock();
+}
+#endif
 
 static uint32_t evidence_context_window_s(void) {
   const char *v = getenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
@@ -1863,219 +3033,439 @@ static int same_ep_window(const ContextWindowSlot *w, const EdrBehaviorRecord *r
   return 1;
 }
 
-static void mark_one_context_window(uint32_t pid, const char *endpoint_id,
-                                    const char *candidate_id, int64_t until_ns) {
-  if (pid == 0u) {
+static void mark_one_context_window(uint32_t pid,
+                                    const EvidenceProcessGeneration *generation,
+                                    const char *endpoint_id,
+                                    const char *candidate_id, int64_t from_ns,
+                                    int64_t until_ns) {
+  if (pid == 0u || !generation_bound(generation) || !candidate_id || !candidate_id[0]) {
     return;
   }
   for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; i++) {
     if (s_context_windows[i].pid == pid &&
+        generation_equal(&s_context_windows[i].generation, generation) &&
         (!s_context_windows[i].endpoint_id[0] || !endpoint_id || !endpoint_id[0] ||
-         strcmp(s_context_windows[i].endpoint_id, endpoint_id) == 0)) {
+         strcmp(s_context_windows[i].endpoint_id, endpoint_id) == 0) &&
+        strncmp(s_context_windows[i].candidate_id, candidate_id,
+                sizeof(s_context_windows[i].candidate_id)) == 0) {
       s_context_windows[i].until_ns = until_ns;
+      s_context_windows[i].from_ns = from_ns;
       copy_s(s_context_windows[i].endpoint_id, sizeof(s_context_windows[i].endpoint_id), endpoint_id);
-      copy_s(s_context_windows[i].candidate_id, sizeof(s_context_windows[i].candidate_id), candidate_id);
       return;
     }
   }
   ContextWindowSlot *w = &s_context_windows[s_context_window_next++ % EDR_EVIDENCE_CONTEXT_WINDOWS];
+  if (w->pid != 0u) {
+    s_status.context_window_evictions++;
+  }
   memset(w, 0, sizeof(*w));
   w->pid = pid;
+  w->from_ns = from_ns;
   w->until_ns = until_ns;
+  w->generation = *generation;
   copy_s(w->endpoint_id, sizeof(w->endpoint_id), endpoint_id);
   copy_s(w->candidate_id, sizeof(w->candidate_id), candidate_id);
 }
 
-static int64_t mark_context_window(const EdrBehaviorRecord *r, int64_t now_ns,
-                                   const char *candidate_id) {
+static int64_t context_window_until(int64_t now_ns) {
   uint32_t win_s = evidence_context_window_s();
-  int64_t until_ns = now_ns + (int64_t)win_s * 1000000000LL;
-  mark_one_context_window(r ? r->pid : 0u, r ? r->endpoint_id : "", candidate_id, until_ns);
-  mark_one_context_window(r ? r->ppid : 0u, r ? r->endpoint_id : "", candidate_id, until_ns);
-  return until_ns;
+  return now_ns + (int64_t)win_s * 1000000000LL;
 }
 
-static int in_context_window(const EdrBehaviorRecord *r, int64_t now_ns,
-                             char *candidate_id, size_t candidate_id_cap) {
-  if (!r || (r->pid == 0u && r->ppid == 0u)) {
-    return 0;
+static void mark_context_window(const EdrBehaviorRecord *r, int64_t until_ns,
+                                const char *candidate_id) {
+  EvidenceProcessGeneration generation;
+  int64_t from_ns = record_time_ns(r);
+  if (record_process_generation(r, &generation)) {
+    mark_one_context_window(r->pid, &generation, r->endpoint_id, candidate_id, from_ns, until_ns);
+  }
+  if (record_parent_generation(r, &generation)) {
+    mark_one_context_window(r->ppid, &generation, r->endpoint_id, candidate_id, from_ns, until_ns);
+  }
+}
+
+/* One post-context record can belong to several distinct committed candidates.
+ * The fixed 256-slot table is intentionally multi-keyed by candidate+process
+ * generation; when it evicts a live entry the existing health eviction counter
+ * makes that bounded completeness loss visible instead of silently replacing a
+ * prior candidate for the same PID. */
+static uint32_t context_window_matches(const EdrBehaviorRecord *r, int64_t now_ns,
+                                       char candidate_ids[][160], uint32_t cap) {
+  EvidenceProcessGeneration generation;
+  EvidenceProcessGeneration parent_generation;
+  int have_generation = record_process_generation(r, &generation);
+  int have_parent_generation = record_parent_generation(r, &parent_generation);
+  uint32_t count = 0u;
+  if (!r || !candidate_ids || cap == 0u || (!have_generation && !have_parent_generation)) {
+    return 0u;
   }
   for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; i++) {
     ContextWindowSlot *w = &s_context_windows[i];
-    if (w->pid == 0u || w->until_ns < now_ns || !same_ep_window(w, r)) {
+    if (w->pid == 0u || w->from_ns > now_ns || w->until_ns < now_ns ||
+        !same_ep_window(w, r)) {
       continue;
     }
-    if (w->pid == r->pid || (r->ppid != 0u && w->pid == r->ppid)) {
-      if (candidate_id && candidate_id_cap > 0u) {
-        copy_s(candidate_id, candidate_id_cap, w->candidate_id);
+    if (!((have_generation && w->pid == r->pid && generation_equal(&w->generation, &generation)) ||
+          (have_parent_generation && w->pid == r->ppid &&
+           generation_equal(&w->generation, &parent_generation)))) {
+      continue;
+    }
+    if (!w->candidate_id[0]) {
+      continue;
+    }
+    int duplicate = 0;
+    for (uint32_t n = 0u; n < count; ++n) {
+      if (strncmp(candidate_ids[n], w->candidate_id, sizeof(w->candidate_id)) == 0) {
+        duplicate = 1;
+        break;
       }
-      return 1;
+    }
+    if (!duplicate && count < cap) {
+      copy_s(candidate_ids[count], sizeof(candidate_ids[count]), w->candidate_id);
+      count++;
     }
   }
-  return 0;
+  return count;
 }
 
 static int ring_related_to_record(const RingSlot *s, const EdrBehaviorRecord *r) {
+  EvidenceProcessGeneration generation;
+  EvidenceProcessGeneration parent_generation;
+  int have_generation;
+  int have_parent_generation;
   if (!s || !s->used || !r) {
     return 0;
   }
   if (s->endpoint_id[0] && r->endpoint_id[0] && strcmp(s->endpoint_id, r->endpoint_id) != 0) {
     return 0;
   }
-  if (r->pid != 0u && (s->pid == r->pid || s->ppid == r->pid)) {
+  have_generation = record_process_generation(r, &generation);
+  have_parent_generation = record_parent_generation(r, &parent_generation);
+  if (have_generation && s->pid == r->pid && generation_equal(&s->generation, &generation)) {
     return 1;
   }
-  if (r->ppid != 0u && (s->pid == r->ppid || s->ppid == r->ppid)) {
+  if (have_generation && s->ppid == r->pid &&
+      generation_equal(&s->parent_generation, &generation)) {
+    return 1;
+  }
+  if (have_parent_generation && s->pid == r->ppid &&
+      generation_equal(&s->generation, &parent_generation)) {
+    return 1;
+  }
+  if (have_parent_generation && s->ppid == r->ppid &&
+      generation_equal(&s->parent_generation, &parent_generation)) {
     return 1;
   }
   return 0;
 }
 
-static uint32_t promote_context_before_window(const EdrBehaviorRecord *r, int64_t now_ns) {
+static uint32_t context_before_count(const EdrBehaviorRecord *r, int64_t now_ns) {
   uint32_t win_s = evidence_context_window_s();
   int64_t cutoff = now_ns - (int64_t)win_s * 1000000000LL;
   uint32_t pos = s_context_ring_pos;
-  uint32_t copied = 0;
+  uint32_t count = 0;
   for (uint32_t i = 0; i < EDR_EVIDENCE_CONTEXT_RING_SLOTS; i++) {
     const RingSlot *s = &s_context_ring[(pos + EDR_EVIDENCE_CONTEXT_RING_SLOTS - 1u - i) %
                                         EDR_EVIDENCE_CONTEXT_RING_SLOTS];
     if (!s->used) {
       continue;
     }
-    if (s->event_time_ns < cutoff) {
-      break;
+    if (s->event_time_ns < cutoff || s->event_time_ns > now_ns) {
+      continue;
     }
     if (ring_related_to_record(s, r)) {
-      ring_copy_to(s_ring, EDR_EVIDENCE_RING_SLOTS, &s_ring_pos, s);
-      copied++;
+      count++;
     }
   }
-  return copied;
+  return count;
+}
+
+static void promote_context_before_window(const EdrBehaviorRecord *r, int64_t now_ns) {
+  uint32_t win_s = evidence_context_window_s();
+  int64_t cutoff = now_ns - (int64_t)win_s * 1000000000LL;
+  uint32_t pos = s_context_ring_pos;
+  for (uint32_t i = 0; i < EDR_EVIDENCE_CONTEXT_RING_SLOTS; i++) {
+    const RingSlot *s = &s_context_ring[(pos + EDR_EVIDENCE_CONTEXT_RING_SLOTS - 1u - i) %
+                                        EDR_EVIDENCE_CONTEXT_RING_SLOTS];
+    if (!s->used) {
+      continue;
+    }
+    if (s->event_time_ns < cutoff || s->event_time_ns > now_ns) {
+      continue;
+    }
+    if (ring_related_to_record(s, r) &&
+        ring_copy_to(s_ring, EDR_EVIDENCE_RING_SLOTS, &s_ring_pos, s)) {
+      s_status.ring_evictions++;
+    }
+  }
 }
 
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (!r) {
     return;
   }
+  evidence_cache_lock();
   int64_t ts = record_time_ns(r);
   int store_candidate = evidence_should_store_record(r);
   int low_value_file_noise = evidence_is_low_value_file_noise(r);
-  if (store_candidate && candidate_dedupe_should_skip(r, ts)) {
+  if (store_candidate) {
+    s_status.candidate_requests++;
+  }
+  if (store_candidate && candidate_dedupe_reuse(r, ts)) {
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
     record_metric_drop(r, ts);
     s_status.records_skipped++;
-    return;
+    goto done;
   }
   char candidate_id[160] = "";
-  char context_candidate_id[160] = "";
+  char context_candidate_ids[EDR_EVIDENCE_CONTEXT_WINDOWS][160];
+  memset(context_candidate_ids, 0, sizeof(context_candidate_ids));
   if (store_candidate) {
     candidate_id_for(r, candidate_id, sizeof(candidate_id));
   }
-  int store_context = low_value_file_noise
-                          ? 0
-                          : in_context_window(r, ts, context_candidate_id,
-                                              sizeof(context_candidate_id));
+  uint32_t context_candidate_count = low_value_file_noise
+      ? 0u
+      : context_window_matches(r, ts, context_candidate_ids,
+                               EDR_EVIDENCE_CONTEXT_WINDOWS);
+  int store_context = context_candidate_count != 0u;
   uint32_t pre_count = 0;
   int64_t post_until_ns = 0;
   if (store_candidate) {
-    pre_count = promote_context_before_window(r, ts);
-    post_until_ns = mark_context_window(r, ts, candidate_id);
+    /* Both are pure at this point. The ring promotion and post window only
+     * become visible after the candidate transaction commits. */
+    pre_count = context_before_count(r, ts);
+    post_until_ns = context_window_until(ts);
   }
   if (!store_candidate && !store_context && low_value_file_noise) {
     record_metric_drop(r, ts);
     s_status.records_skipped++;
-    return;
+    goto done;
   }
   if (!store_candidate && !store_context && evidence_cache_pressure_active()) {
     record_metric_drop(r, ts);
     s_status.pressure_dropped++;
     s_status.records_skipped++;
-    return;
+    goto done;
   }
   if (!store_candidate && !store_context && ordinary_aggregate_should_coalesce(r, ts)) {
     record_metric_drop(r, ts);
     s_status.records_skipped++;
-    return;
+    goto done;
   }
-  context_ring_capture(r);
-  s_status.hot_ring_ingested++;
   if (!store_candidate && !store_context) {
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
     record_metric_drop(r, ts);
     s_status.records_skipped++;
-    return;
+    goto done;
   }
-  ring_record(r);
   const char *eng = engine_from_context(r->detection_context);
   if (eng[0]) {
     copy_s(s_status.last_engine, sizeof(s_status.last_engine), eng);
   }
   s_status.last_event_time_ns = ts;
 #if defined(EDR_HAVE_SQLITE)
-  if (s_db && store_candidate) {
+  if (store_candidate) {
+    s_status.candidate_admission_attempts++;
+    if (!s_db) {
+      s_status.candidate_rejected++;
+      s_status.records_dropped++;
+      context_ring_capture(r);
+      s_status.hot_ring_ingested++;
+      goto done;
+    }
     if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts)) {
+      s_status.candidate_rejected++;
       s_status.records_dropped++;
-      return;
+      context_ring_capture(r);
+      s_status.hot_ring_ingested++;
+      goto done;
     }
-    sqlite_record_candidate(r, pre_count, post_until_ns);
-  } else if (!s_db && store_candidate) {
-    s_status.records_dropped++;
-  } else if (s_db && store_context && context_candidate_id[0]) {
-    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(1u, ts)) {
+    if (sqlite_record_candidate(r, pre_count, post_until_ns) != 0) {
+      sqlite_write_budget_release(2u, ts);
+      s_status.candidate_rejected++;
+      s_status.candidate_transaction_failures++;
       s_status.records_dropped++;
-      return;
+      context_ring_capture(r);
+      s_status.hot_ring_ingested++;
+      goto done;
     }
-    sqlite_record_context_artifact(r, context_candidate_id);
+    s_status.candidate_admitted++;
+    candidate_dedupe_admit(r, ts);
+    promote_context_before_window(r, ts);
+    mark_context_window(r, post_until_ns, candidate_id);
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+    ring_record(r);
+    /* A high-priority event can itself be post-context evidence for every
+     * earlier live candidate.  The candidate commit remains durable even if a
+     * separately budgeted context bundle cannot be admitted. */
+    if (context_candidate_count > 0u) {
+      if (!sqlite_size_budget_allow() ||
+          !sqlite_write_budget_allow(context_candidate_count, ts)) {
+        s_status.records_dropped++;
+      } else if (sqlite_record_context_artifacts(r, context_candidate_ids,
+                                                  context_candidate_count) != 0) {
+        sqlite_write_budget_release(context_candidate_count, ts);
+        s_status.records_dropped++;
+      } else {
+        s_status.artifacts_written += context_candidate_count;
+      }
+    }
+  } else if (s_db && store_context) {
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+    ring_record(r);
+    if (!sqlite_size_budget_allow() ||
+        !sqlite_write_budget_allow(context_candidate_count, ts)) {
+      s_status.records_dropped++;
+      goto done;
+    }
+    if (sqlite_record_context_artifacts(r, context_candidate_ids,
+                                        context_candidate_count) != 0) {
+      sqlite_write_budget_release(context_candidate_count, ts);
+      s_status.records_dropped++;
+      goto done;
+    }
+    s_status.artifacts_written += context_candidate_count;
+  } else if (store_context) {
+    /* SQLite being unavailable never pretends that a context artifact was
+     * admitted; retain only the bounded in-memory view. */
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+    ring_record(r);
   }
 #else
   (void)candidate_id;
-  (void)context_candidate_id;
+  (void)context_candidate_ids;
+  (void)context_candidate_count;
   (void)pre_count;
   (void)post_until_ns;
   if (store_candidate) {
+    s_status.candidate_admission_attempts++;
+    s_status.candidate_rejected++;
     s_status.records_dropped++;
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+  } else if (store_context) {
+    context_ring_capture(r);
+    s_status.hot_ring_ingested++;
+    ring_record(r);
   }
 #endif
+done:
+  evidence_cache_unlock();
 }
 
 void edr_local_evidence_cache_poll_maintenance(void) {
   uint64_t now = edr_monotonic_ns();
+  evidence_cache_lock();
   if (now - s_last_maintenance_ns < 60000000000ULL) {
+    evidence_cache_unlock();
     return;
   }
   s_last_maintenance_ns = now;
 #if defined(EDR_HAVE_SQLITE)
   sqlite_maintenance();
 #endif
+  evidence_cache_unlock();
+}
+
+static uint32_t utilization_bps(uint64_t used, uint64_t capacity) {
+  if (capacity == 0u) {
+    return 0u;
+  }
+  /* Avoid overflowing `used * 10000`, while retaining an observable value
+   * for a legacy/on-disk cache that is already over its configured limit. */
+  uint64_t whole = used / capacity;
+  uint64_t remainder = used % capacity;
+  uint64_t bps = whole >= UINT32_MAX / 10000u ? UINT32_MAX : whole * 10000u;
+  uint64_t fractional = remainder >= UINT64_MAX / 10000u ? UINT32_MAX :
+      (remainder * 10000u) / capacity;
+  if (UINT32_MAX - bps < fractional) {
+    return UINT32_MAX;
+  }
+  bps += fractional;
+  return bps > UINT32_MAX ? UINT32_MAX : (uint32_t)bps;
 }
 
 void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   if (!out) {
     return;
   }
+  evidence_cache_lock();
   EdrEvidenceCacheStatus st = s_status;
+  const EvidenceCacheLockTiming *lock_timing = &s_evidence_cache_lock_timing;
+  st.mutex_lock_samples = lock_timing->samples;
+  st.mutex_wait_total_ns = lock_timing->wait_total_ns;
+  st.mutex_wait_max_ns = lock_timing->wait_max_ns;
+  st.mutex_wait_p95_ns = evidence_cache_histogram_percentile(
+      lock_timing->wait_histogram, lock_timing->samples, 95u);
+  st.mutex_wait_p99_ns = evidence_cache_histogram_percentile(
+      lock_timing->wait_histogram, lock_timing->samples, 99u);
+  st.mutex_hold_total_ns = lock_timing->hold_total_ns;
+  st.mutex_hold_max_ns = lock_timing->hold_max_ns;
+  st.mutex_hold_p95_ns = evidence_cache_histogram_percentile(
+      lock_timing->hold_histogram, lock_timing->samples, 95u);
+  st.mutex_hold_p99_ns = evidence_cache_histogram_percentile(
+      lock_timing->hold_histogram, lock_timing->samples, 99u);
   uint32_t proc_n = 0;
   uint32_t ring_n = 0;
   uint32_t hot_n = 0;
   uint32_t agg_n = 0;
+  uint32_t window_n = 0;
+  uint32_t dedupe_n = 0;
+  int64_t oldest_proc = 0;
+  int64_t oldest_ring = 0;
+  int64_t oldest_hot = 0;
+  int64_t oldest_dedupe = 0;
+  int64_t now = now_unix_ns();
+  int64_t dedupe_cutoff = now - (int64_t)candidate_dedupe_window_s() * 1000000000LL;
   for (size_t i = 0; i < EDR_EVIDENCE_PROC_SLOTS; i++) {
     if (s_proc[i].pid != 0u) {
       proc_n++;
+      if (s_proc[i].last_seen_ns > 0 &&
+          (oldest_proc == 0 || s_proc[i].last_seen_ns < oldest_proc)) {
+        oldest_proc = s_proc[i].last_seen_ns;
+      }
     }
   }
   for (size_t i = 0; i < EDR_EVIDENCE_RING_SLOTS; i++) {
     if (s_ring[i].used) {
       ring_n++;
+      if (s_ring[i].event_time_ns > 0 &&
+          (oldest_ring == 0 || s_ring[i].event_time_ns < oldest_ring)) {
+        oldest_ring = s_ring[i].event_time_ns;
+      }
     }
   }
   for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_RING_SLOTS; i++) {
     if (s_context_ring[i].used) {
       hot_n++;
+      if (s_context_ring[i].event_time_ns > 0 &&
+          (oldest_hot == 0 || s_context_ring[i].event_time_ns < oldest_hot)) {
+        oldest_hot = s_context_ring[i].event_time_ns;
+      }
     }
   }
   for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
     if (s_ordinary_agg[i].used) {
       agg_n++;
+    }
+  }
+  for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; i++) {
+    if (s_context_windows[i].pid != 0u && s_context_windows[i].until_ns >= now) {
+      window_n++;
+    }
+  }
+  for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
+    if (s_candidate_dedupe[i].used && s_candidate_dedupe[i].last_ns >= dedupe_cutoff) {
+      dedupe_n++;
+      if (s_candidate_dedupe[i].last_ns > 0 &&
+          (oldest_dedupe == 0 || s_candidate_dedupe[i].last_ns < oldest_dedupe)) {
+        oldest_dedupe = s_candidate_dedupe[i].last_ns;
+      }
     }
   }
   st.process_slots_used = proc_n;
@@ -2088,8 +3478,22 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   st.metrics_capacity = EDR_EVIDENCE_METRIC_SLOTS;
   st.aggregate_slots_used = agg_n;
   st.aggregate_slots_capacity = EDR_EVIDENCE_AGG_SLOTS;
+  st.context_windows_used = window_n;
   st.context_windows_capacity = EDR_EVIDENCE_CONTEXT_WINDOWS;
+  st.candidate_dedup_slots_used = dedupe_n;
   st.candidate_dedup_capacity = EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS;
+  st.process_slots_utilization_bps = utilization_bps(proc_n, EDR_EVIDENCE_PROC_SLOTS);
+  st.ring_utilization_bps = utilization_bps(ring_n, EDR_EVIDENCE_RING_SLOTS);
+  st.hot_ring_utilization_bps = utilization_bps(hot_n, EDR_EVIDENCE_CONTEXT_RING_SLOTS);
+  st.metrics_utilization_bps = utilization_bps(st.metrics_minutes, EDR_EVIDENCE_METRIC_SLOTS);
+  st.aggregate_utilization_bps = utilization_bps(agg_n, EDR_EVIDENCE_AGG_SLOTS);
+  st.context_windows_utilization_bps = utilization_bps(window_n, EDR_EVIDENCE_CONTEXT_WINDOWS);
+  st.candidate_dedup_utilization_bps =
+      utilization_bps(dedupe_n, EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS);
+  st.oldest_process_last_seen_ns = oldest_proc;
+  st.oldest_ring_event_time_ns = oldest_ring;
+  st.oldest_hot_ring_event_time_ns = oldest_hot;
+  st.oldest_candidate_dedup_ns = oldest_dedupe;
   st.static_bytes = (uint64_t)sizeof(s_proc) + (uint64_t)sizeof(s_ring) +
                     (uint64_t)sizeof(s_context_ring) + (uint64_t)sizeof(s_context_windows) +
                     (uint64_t)sizeof(s_metrics) + (uint64_t)sizeof(s_candidate_dedupe) +
@@ -2099,8 +3503,12 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   refresh_db_size_status();
   st.db_bytes = s_status.db_bytes;
   st.wal_bytes = s_status.wal_bytes;
+  st.db_utilization_bps = utilization_bps(st.db_bytes + st.wal_bytes,
+                                          (uint64_t)st.max_db_mb * 1024ULL * 1024ULL);
+  refresh_candidate_inventory_status(&st);
 #endif
   *out = st;
+  evidence_cache_unlock();
 }
 
 static void json_escape(char *dst, size_t cap, const char *s) {
@@ -2422,8 +3830,15 @@ static void append_event_json(char *out, size_t cap, size_t *off, int *first,
                               const char *file_path, const char *dns_query,
                               const char *remote_ip, uint32_t dst_port,
                               const char *registry_key, const char *registry_value,
-                              const char *registry_op) {
+                              const char *registry_op,
+                              const char *process_start_key,
+                              const char *process_creation_filetime_100ns,
+                              const char *process_generation_source,
+                              const char *source_completeness,
+                              const char *source_truncated_fields) {
   char ep[120], pn[320], xp[1200], cl[1200], fp[1200], dns[640], rip[120], rk[1200], rv[640], ro[80];
+  char start_key[48], creation[48], generation_source[160], source_state[80];
+  char source_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN * 2u + 3u];
   json_escape(ep, sizeof(ep), endpoint_id);
   json_escape(pn, sizeof(pn), process_name);
   json_escape(xp, sizeof(xp), exe_path);
@@ -2434,24 +3849,32 @@ static void append_event_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(rk, sizeof(rk), registry_key);
   json_escape(rv, sizeof(rv), registry_value);
   json_escape(ro, sizeof(ro), registry_op);
+  json_escape(start_key, sizeof(start_key), process_start_key);
+  json_escape(creation, sizeof(creation), process_creation_filetime_100ns);
+  json_escape(generation_source, sizeof(generation_source), process_generation_source);
+  json_escape(source_state, sizeof(source_state), source_completeness);
+  json_escape(source_fields, sizeof(source_fields), source_truncated_fields);
   appendf(out, cap, off, "%s{\"source\":\"%s\",\"event_time_ns\":%lld,\"type\":%u,"
                           "\"pid\":%u,\"ppid\":%u,\"endpoint_id\":%s,\"process_name\":%s,"
                           "\"exe_path\":%s,\"cmdline\":%s,\"file_path\":%s,\"dns_query\":%s,"
                           "\"remote_ip\":%s,\"dst_port\":%u,\"registry_key\":%s,"
-                          "\"registry_value\":%s,\"registry_op\":%s}",
+                          "\"registry_value\":%s,\"registry_op\":%s,\"process_start_key\":%s,"
+                          "\"process_creation_filetime_100ns\":%s,\"process_generation_source\":%s,"
+                          "\"source_completeness\":%s,\"source_truncated_fields\":%s}",
           *first ? "" : ",", source ? source : "", (long long)event_time_ns, type, pid, ppid,
-          ep, pn, xp, cl, fp, dns, rip, dst_port, rk, rv, ro);
+          ep, pn, xp, cl, fp, dns, rip, dst_port, rk, rv, ro, start_key, creation,
+          generation_source, source_state, source_fields);
   *first = 0;
 }
 
-int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
-                                                  const char *file_path_contains,
-                                                  const char *file_ext,
-                                                  uint32_t limit,
-                                                  char *out, size_t cap,
-                                                  uint32_t *returned,
-                                                  uint32_t *scanned,
-                                                  int *truncated) {
+static int evidence_cache_query_file_hash_json_locked(const char *file_sha256,
+                                                       const char *file_path_contains,
+                                                       const char *file_ext,
+                                                       uint32_t limit,
+                                                       char *out, size_t cap,
+                                                       uint32_t *returned,
+                                                       uint32_t *scanned,
+                                                       int *truncated) {
   if (!out || cap == 0u) {
     return -1;
   }
@@ -2529,6 +3952,23 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
   return 0;
 }
 
+int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
+                                                  const char *file_path_contains,
+                                                  const char *file_ext,
+                                                  uint32_t limit,
+                                                  char *out, size_t cap,
+                                                  uint32_t *returned,
+                                                  uint32_t *scanned,
+                                                  int *truncated) {
+  int rc;
+  if (!out || cap == 0u) return -1;
+  evidence_cache_lock();
+  rc = evidence_cache_query_file_hash_json_locked(file_sha256, file_path_contains, file_ext,
+                                                   limit, out, cap, returned, scanned, truncated);
+  evidence_cache_unlock();
+  return rc;
+}
+
 static void append_json_array_items(char *out, size_t cap, size_t *off, int *first,
                                     const char *array_json) {
   if (!out || !off || !first || !array_json) {
@@ -2568,6 +4008,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
   }
   RtqFilter f;
   parse_rtq_filter(payload_json, &f);
+  evidence_cache_lock();
   size_t off = 0;
   int first = 1;
   uint32_t returned = 0;
@@ -2586,9 +4027,17 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
                             r->process_name, "", r->file_path, r->net_dst, "")) {
         continue;
       }
+      char start_key[32];
+      char creation[32];
+      (void)snprintf(start_key, sizeof(start_key), "%llu",
+                     (unsigned long long)r->generation.process_start_key);
+      (void)snprintf(creation, sizeof(creation), "%llu",
+                     (unsigned long long)r->generation.creation_filetime_100ns);
       append_event_json(out, cap, &off, &first, "ring", r->event_time_ns, r->type, r->pid,
                         r->ppid, r->endpoint_id, r->process_name, "", "", r->file_path,
-                        "", r->net_dst, r->net_dport, "", "", "");
+                        "", r->net_dst, r->net_dport, "", "", "", start_key, creation,
+                        r->process_generation_source, r->source_completeness,
+                        r->source_truncated_fields);
       returned++;
     }
   }
@@ -2600,11 +4049,11 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
     uint32_t cache_scanned = 0;
     int cache_truncated = 0;
     if (rows &&
-        edr_local_evidence_cache_query_file_hash_json(f.file_sha256, f.file_path_contains,
-                                                      f.file_ext, f.limit - returned,
-                                                      rows, rows_cap,
-                                                      &cache_returned, &cache_scanned,
-                                                      &cache_truncated) == 0) {
+        evidence_cache_query_file_hash_json_locked(f.file_sha256, f.file_path_contains,
+                                                    f.file_ext, f.limit - returned,
+                                                    rows, rows_cap,
+                                                    &cache_returned, &cache_scanned,
+                                                    &cache_truncated) == 0) {
       append_json_array_items(out, cap, &off, &first, rows);
       returned += cache_returned;
       scanned += cache_scanned;
@@ -2620,7 +4069,9 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
   if (s_db && !hash_query && returned < f.limit) {
     const char *sql =
         "SELECT event_time_ns,type,pid,ppid,endpoint_id,process_name,exe_path,cmdline,"
-        "file_path,dns_query,net_dst,net_dport,reg_key_path,reg_value_name,reg_op "
+        "file_path,dns_query,net_dst,net_dport,reg_key_path,reg_value_name,reg_op,"
+        "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+        "source_completeness,source_truncated_fields "
         "FROM p0_candidates WHERE event_time_ns>=? ORDER BY event_time_ns DESC LIMIT ?;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -2644,11 +4095,17 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
         const char *rk = (const char *)sqlite3_column_text(st, 12);
         const char *rv = (const char *)sqlite3_column_text(st, 13);
         const char *ro = (const char *)sqlite3_column_text(st, 14);
+        const char *start_key = (const char *)sqlite3_column_text(st, 15);
+        const char *creation = (const char *)sqlite3_column_text(st, 16);
+        const char *generation_source = (const char *)sqlite3_column_text(st, 17);
+        const char *source_completeness = (const char *)sqlite3_column_text(st, 18);
+        const char *source_truncated_fields = (const char *)sqlite3_column_text(st, 19);
         if (!rtq_match_common(&f, ty, pid, ts, ep, pn, cl, fp, rip, rk)) {
           continue;
         }
         append_event_json(out, cap, &off, &first, "p0_candidates", ts, ty, pid, ppid, ep, pn,
-                          xp, cl, fp, dns, rip, dport, rk, rv, ro);
+                          xp, cl, fp, dns, rip, dport, rk, rv, ro, start_key, creation,
+                          generation_source, source_completeness, source_truncated_fields);
         returned++;
       }
       sqlite3_finalize(st);
@@ -2657,12 +4114,15 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
 #endif
   appendf(out, cap, &off, "],\"rows_scanned\":%u,\"rows_returned\":%u}", scanned, returned);
   out[cap - 1u] = '\0';
+  evidence_cache_unlock();
   return 0;
 }
 
 static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
                              const char *source, const ProcSlot *p) {
   char ep[120], tn[160], nm[320], path[1200], cmd[1200], pn[320], pp[640];
+  char generation_start[32], generation_creation[32], generation_source[160];
+  char parent_generation_start[32], parent_generation_creation[32], parent_generation_source[160];
   json_escape(ep, sizeof(ep), p ? p->endpoint_id : "");
   json_escape(tn, sizeof(tn), p ? p->tenant_id : "");
   json_escape(nm, sizeof(nm), p ? p->name : "");
@@ -2670,11 +4130,28 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(cmd, sizeof(cmd), p ? p->cmdline : "");
   json_escape(pn, sizeof(pn), p ? p->parent_name : "");
   json_escape(pp, sizeof(pp), p ? p->parent_path : "");
+  (void)snprintf(generation_start, sizeof(generation_start), "%llu",
+                 (unsigned long long)(p ? p->generation.process_start_key : 0u));
+  (void)snprintf(generation_creation, sizeof(generation_creation), "%llu",
+                 (unsigned long long)(p ? p->generation.creation_filetime_100ns : 0u));
+  (void)snprintf(parent_generation_start, sizeof(parent_generation_start), "%llu",
+                 (unsigned long long)(p ? p->parent_generation.process_start_key : 0u));
+  (void)snprintf(parent_generation_creation, sizeof(parent_generation_creation), "%llu",
+                 (unsigned long long)(p ? p->parent_generation.creation_filetime_100ns : 0u));
+  json_escape(generation_source, sizeof(generation_source),
+              p ? p->process_generation_source : "");
+  json_escape(parent_generation_source, sizeof(parent_generation_source),
+              p ? p->parent_process_generation_source : "");
   appendf(out, cap, off, "%s{\"source\":\"%s\",\"endpoint_id\":%s,\"tenant_id\":%s,"
                           "\"pid\":%u,\"ppid\":%u,\"name\":%s,\"path\":%s,\"cmdline\":%s,"
-                          "\"parent_name\":%s,\"parent_path\":%s,\"last_seen_ns\":%lld}",
+                          "\"parent_name\":%s,\"parent_path\":%s,\"process_start_key\":\"%s\","
+                          "\"process_creation_filetime_100ns\":\"%s\",\"process_generation_source\":%s,"
+                          "\"parent_process_start_key\":\"%s\",\"parent_process_creation_filetime_100ns\":\"%s\","
+                          "\"parent_process_generation_source\":%s,\"last_seen_ns\":%lld}",
           *first ? "" : ",", source ? source : "", ep, tn, p ? p->pid : 0u,
-          p ? p->ppid : 0u, nm, path, cmd, pn, pp, p ? (long long)p->last_seen_ns : 0LL);
+          p ? p->ppid : 0u, nm, path, cmd, pn, pp, generation_start, generation_creation,
+          generation_source, parent_generation_start, parent_generation_creation,
+          parent_generation_source, p ? (long long)p->last_seen_ns : 0LL);
   *first = 0;
 }
 
@@ -2683,21 +4160,50 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
   if (!out || cap == 0u || pid == 0u) {
     return -1;
   }
-  ProcSlot *root = find_proc(pid, endpoint_id);
+  evidence_cache_lock();
+  ProcSlot *memory_root = find_proc(pid, endpoint_id);
+  const ProcSlot *root = memory_root;
+  const char *root_source = "memory";
+#if defined(EDR_HAVE_SQLITE)
+  ProcSlot durable_root;
+  if (s_db && (!root || !generation_bound(&root->generation)) && endpoint_id && endpoint_id[0]) {
+    const char *root_sql =
+        "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
+        "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source "
+        "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
+    sqlite3_stmt *root_st = NULL;
+    if (sqlite3_prepare_v2(s_db, root_sql, -1, &root_st, NULL) == SQLITE_OK) {
+      sqlite3_bind_text(root_st, 1, endpoint_id, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(root_st, 2, (sqlite3_int64)pid);
+      if (sqlite3_step(root_st) == SQLITE_ROW && sqlite_read_process_cache_row(root_st, &durable_root)) {
+        root = &durable_root;
+        root_source = "sqlite";
+      }
+      sqlite3_finalize(root_st);
+    }
+  }
+#endif
+  /* A legacy PID-only row is not a process-tree identity.  Withhold it from
+   * this RTQ view rather than presenting it as a restart-safe root. */
+  if (root && !generation_bound(&root->generation)) {
+    root = NULL;
+  }
   size_t off = 0;
   int first = 1;
   uint32_t children = 0;
   appendf(out, cap, &off, "{\"pid\":%u,\"root\":", pid);
   if (root) {
     int only = 1;
-    append_proc_json(out, cap, &off, &only, "memory", root);
+    append_proc_json(out, cap, &off, &only, root_source, root);
   } else {
     appendf(out, cap, &off, "null");
   }
   appendf(out, cap, &off, ",\"children\":[");
   for (size_t i = 0; i < EDR_EVIDENCE_PROC_SLOTS && children < 64u; i++) {
     ProcSlot *p = &s_proc[i];
-    if (p->pid == 0u || p->ppid != pid) {
+    if (!root || !generation_bound(&root->generation) || p->pid == 0u || p->ppid != pid ||
+        !generation_equal(&p->parent_generation, &root->generation)) {
       continue;
     }
     if (endpoint_id && endpoint_id[0] && p->endpoint_id[0] && strcmp(endpoint_id, p->endpoint_id) != 0) {
@@ -2707,29 +4213,29 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
     children++;
   }
 #if defined(EDR_HAVE_SQLITE)
-  if (s_db && children < 64u) {
+  if (s_db && root && generation_bound(&root->generation) && root->endpoint_id[0] && children < 64u) {
     const char *sql =
-        "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns "
-        "FROM process_cache WHERE ppid=? ORDER BY last_seen_ns DESC LIMIT 64;";
+        "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
+        "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source "
+        "FROM process_cache WHERE endpoint_id=? AND ppid=? AND parent_process_start_key=? "
+        "AND parent_process_creation_filetime_100ns=? ORDER BY last_seen_ns DESC LIMIT 64;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
-      sqlite3_bind_int64(st, 1, (sqlite3_int64)pid);
+      char parent_start[32];
+      char parent_creation[32];
+      sqlite_u64_decimal(root->generation.process_start_key, parent_start);
+      sqlite_u64_decimal(root->generation.creation_filetime_100ns, parent_creation);
+      sqlite3_bind_text(st, 1, root->endpoint_id, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st, 2, (sqlite3_int64)pid);
+      sqlite3_bind_text(st, 3, parent_start, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(st, 4, parent_creation, -1, SQLITE_TRANSIENT);
       while (sqlite3_step(st) == SQLITE_ROW && children < 64u) {
         ProcSlot tmp;
-        memset(&tmp, 0, sizeof(tmp));
-        copy_s(tmp.endpoint_id, sizeof(tmp.endpoint_id), (const char *)sqlite3_column_text(st, 0));
-        if (endpoint_id && endpoint_id[0] && tmp.endpoint_id[0] && strcmp(endpoint_id, tmp.endpoint_id) != 0) {
+        if (!sqlite_read_process_cache_row(st, &tmp) ||
+            !generation_equal(&tmp.parent_generation, &root->generation)) {
           continue;
         }
-        copy_s(tmp.tenant_id, sizeof(tmp.tenant_id), (const char *)sqlite3_column_text(st, 1));
-        tmp.pid = (uint32_t)sqlite3_column_int64(st, 2);
-        tmp.ppid = (uint32_t)sqlite3_column_int64(st, 3);
-        copy_s(tmp.name, sizeof(tmp.name), (const char *)sqlite3_column_text(st, 4));
-        copy_s(tmp.path, sizeof(tmp.path), (const char *)sqlite3_column_text(st, 5));
-        copy_s(tmp.cmdline, sizeof(tmp.cmdline), (const char *)sqlite3_column_text(st, 6));
-        copy_s(tmp.parent_name, sizeof(tmp.parent_name), (const char *)sqlite3_column_text(st, 7));
-        copy_s(tmp.parent_path, sizeof(tmp.parent_path), (const char *)sqlite3_column_text(st, 8));
-        tmp.last_seen_ns = sqlite3_column_int64(st, 9);
         append_proc_json(out, cap, &off, &first, "sqlite", &tmp);
         children++;
       }
@@ -2739,7 +4245,9 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
 #endif
   appendf(out, cap, &off, "],\"child_count\":%u}", children);
   out[cap - 1u] = '\0';
-  return root || children ? 0 : -2;
+  int found = root || children;
+  evidence_cache_unlock();
+  return found ? 0 : -2;
 }
 
 void edr_local_evidence_cache_status_json(char *out, size_t cap) {
@@ -2754,24 +4262,27 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   json_escape(path, sizeof(path), st.path);
   json_escape(err, sizeof(err), st.last_error);
   json_escape(eng, sizeof(eng), st.last_engine);
-  snprintf(out, cap,
+  int written = snprintf(out, cap,
            "\"evidence_cache\":{\"db_open\":%s,\"path\":%s,\"max_db_mb\":%u,"
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
-           "\"candidate_deduped\":%llu,\"write_budget_dropped\":%llu,"
+           "\"candidate_deduped\":%llu,\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,"
            "\"process_cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"used\":%u,\"capacity\":%u},"
            "\"identity\":{\"observations_total\":%llu,\"none\":%llu,\"hits\":%llu,\"misses\":%llu,\"enrich_attempts\":%llu,\"upgrades\":%llu,\"stale_rejects\":%llu,\"generation_unknown_rejects\":%llu,\"generation_mismatch_rejects\":%llu,\"generation_unknown_update_rejects\":%llu,\"generation_mismatch_update_rejects\":%llu,\"generation_resets\":%llu,\"late_generation_rejects\":%llu,\"target_4688\":%llu,\"creator_fallback\":%llu,\"token_sid\":%llu},"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
-           "\"pressure_active\":%s,\"ordinary_coalesced\":%llu,"
+           "\"pressure_active\":%s,\"lock_observability\":{\"histogram\":\"log2_ns_64\",\"samples\":%llu,\"wait_total_ns\":%llu,\"wait_max_ns\":%llu,\"wait_p95_ns\":%llu,\"wait_p99_ns\":%llu,\"hold_total_ns\":%llu,\"hold_max_ns\":%llu,\"hold_p95_ns\":%llu,\"hold_p99_ns\":%llu},\"ordinary_coalesced\":%llu,"
            "\"aggregate_slots_used\":%u,\"static_bytes\":%llu,"
            "\"capacity\":{\"process_slots\":%u,\"ring_events\":%u,"
            "\"hot_ring_events\":%u,\"context_windows\":%u,\"metrics\":%u,"
            "\"candidate_dedup\":%u,\"aggregate_slots\":%u},"
+           "\"utilization_bps\":{\"db\":%u,\"process_slots\":%u,\"ring\":%u,\"hot_ring\":%u,\"metrics\":%u,\"aggregate\":%u,\"context_windows\":%u,\"candidate_dedup\":%u},"
+           "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"metrics\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
+           "\"oldest\":{\"process_last_seen_ns\":%lld,\"ring_event_time_ns\":%lld,\"hot_ring_event_time_ns\":%lld,\"candidate_dedup_ns\":%lld,\"p0_candidate_event_time_ns\":%lld},"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
-           "\"p0_candidates\":{\"written\":%llu},\"artifacts\":{\"written\":%llu},"
+           "\"p0_candidates\":{\"written\":%llu,\"rows\":%llu},\"artifacts\":{\"written\":%llu},"
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
@@ -2780,6 +4291,14 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,
            (unsigned long long)st.candidate_deduped,
+           (unsigned long long)st.candidate_requests,
+           (unsigned long long)st.candidate_reused,
+           (unsigned long long)st.candidate_admission_attempts,
+           (unsigned long long)st.candidate_admitted,
+           (unsigned long long)st.candidate_rejected,
+           (unsigned long long)st.candidate_transaction_failures,
+           (unsigned long long)st.bounded_string_truncations,
+           (unsigned long long)st.manifest_rejections,
            (unsigned long long)st.write_budget_dropped,
            (unsigned long long)st.process_cache_hits, (unsigned long long)st.process_cache_misses,
            (unsigned long long)st.process_cache_evictions, st.process_slots_used, st.process_slots_capacity,
@@ -2794,14 +4313,41 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.db_budget_dropped,
            (unsigned long long)st.pressure_dropped,
            st.pressure_active ? "true" : "false",
+           (unsigned long long)st.mutex_lock_samples,
+           (unsigned long long)st.mutex_wait_total_ns,
+           (unsigned long long)st.mutex_wait_max_ns,
+           (unsigned long long)st.mutex_wait_p95_ns,
+           (unsigned long long)st.mutex_wait_p99_ns,
+           (unsigned long long)st.mutex_hold_total_ns,
+           (unsigned long long)st.mutex_hold_max_ns,
+           (unsigned long long)st.mutex_hold_p95_ns,
+           (unsigned long long)st.mutex_hold_p99_ns,
            (unsigned long long)st.ordinary_coalesced, st.aggregate_slots_used,
            (unsigned long long)st.static_bytes,
            st.process_slots_capacity, st.ring_capacity, st.hot_ring_capacity,
            st.context_windows_capacity, st.metrics_capacity, st.candidate_dedup_capacity,
            st.aggregate_slots_capacity,
+           st.db_utilization_bps, st.process_slots_utilization_bps,
+           st.ring_utilization_bps, st.hot_ring_utilization_bps,
+           st.metrics_utilization_bps, st.aggregate_utilization_bps,
+           st.context_windows_utilization_bps, st.candidate_dedup_utilization_bps,
+           (unsigned long long)st.ring_evictions,
+           (unsigned long long)st.hot_ring_evictions,
+           (unsigned long long)st.context_window_evictions,
+           (unsigned long long)st.metric_slot_evictions,
+           (unsigned long long)st.candidate_dedup_evictions,
+           (unsigned long long)st.aggregate_slot_evictions,
+           (unsigned long long)st.db_retention_evicted,
+           (unsigned long long)st.db_capacity_evicted,
+           (long long)st.oldest_process_last_seen_ns,
+           (long long)st.oldest_ring_event_time_ns,
+           (long long)st.oldest_hot_ring_event_time_ns,
+           (long long)st.oldest_candidate_dedup_ns,
+           (long long)st.oldest_p0_candidate_event_time_ns,
            (unsigned long long)st.maintenance_runs, st.process_slots_used, st.ring_events,
            eng, (long long)st.last_event_time_ns, err, st.hot_ring_events,
            (unsigned long long)st.p0_candidates_written,
+           (unsigned long long)st.p0_candidate_rows,
            (unsigned long long)st.artifacts_written,
            (unsigned long long)st.command_results_written, st.metrics_minutes,
            (unsigned long long)st.file_coalesced,
@@ -2811,4 +4357,11 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.metric_registry_drops,
            (unsigned long long)st.metric_network_drops,
            (unsigned long long)st.metric_other_drops);
+  if (written < 0 || (size_t)written >= cap) {
+    /* This function supplies a JSON member, not a complete document.  Keep
+     * that member syntactically valid for older callers with a small buffer
+     * instead of handing the enclosing health document a cut-off fragment. */
+    (void)snprintf(out, cap, "\"evidence_cache\":{\"db_open\":%s,\"status\":\"truncated\"}",
+                   st.db_open ? "true" : "false");
+  }
 }

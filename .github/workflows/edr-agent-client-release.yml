@@ -424,7 +424,8 @@ jobs:
             "-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-            -DEDR_WITH_GRPC=OFF `
+            "-DEDR_PCRE2_PRODUCER_TARGET=windows/$env:EDR_RELEASE_ARCH" `
+            "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
@@ -630,6 +631,59 @@ jobs:
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "VERSION"), $env:EDR_AGENT_VERSION)
           [System.IO.File]::WriteAllText((Join-Path $outDir "VERSION"), $env:EDR_AGENT_VERSION)
           $packageCapabilitiesPath = Join-Path $env:GITHUB_WORKSPACE "package-capabilities.json"
+          $cmakeCache = Join-Path $env:GITHUB_WORKSPACE 'build\CMakeCache.txt'
+          if (-not (Test-Path -LiteralPath $cmakeCache)) {
+            throw 'release package has no CMake matcher audit cache'
+          }
+          function Get-CMakeInternal([string]$name) {
+            $prefix = "$name`:INTERNAL="
+            $matches = @(
+              Get-Content -LiteralPath $cmakeCache |
+                Where-Object { $_.StartsWith($prefix, [System.StringComparison]::Ordinal) }
+            )
+            if ($matches.Count -ne 1) {
+              throw "CMake cache must contain exactly one internal $name binding"
+            }
+            return $matches[0].Substring($prefix.Length)
+          }
+          $pcre2Contract = Get-CMakeInternal 'EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH'
+          $pcre2Prefix = Get-CMakeInternal 'EDR_PCRE2_STATIC_PREFIX_AUDIT_PATH'
+          $pcre2ProducerRoot = Get-CMakeInternal 'EDR_PCRE2_PRODUCER_ROOT_AUDIT_PATH'
+          $pcre2BoundSha256 = Get-CMakeInternal 'EDR_PCRE2_MATCHER_CONTRACT_SHA256'
+          $targetPrefix = 'EDR_PCRE2_PRODUCER_TARGET:STRING='
+          $targetMatches = @(
+            Get-Content -LiteralPath $cmakeCache |
+              Where-Object { $_.StartsWith($targetPrefix, [System.StringComparison]::Ordinal) }
+          )
+          $pcre2Target = "windows/$env:EDR_RELEASE_ARCH"
+          if ($targetMatches.Count -ne 1 -or $targetMatches[0] -ne "$targetPrefix$pcre2Target") {
+            throw 'CMake cache does not bind the expected Windows PCRE2 producer target'
+          }
+          $buildRoot = (Resolve-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'build')).Path
+          $expectedProducerRoot = Join-Path $buildRoot 'edr-pcre2-producer'
+          $resolvedProducerRoot = (Resolve-Path -LiteralPath $pcre2ProducerRoot).Path
+          if (-not [string]::Equals($resolvedProducerRoot, $expectedProducerRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'CMake matcher producer audit root is not the build-owned root'
+          }
+          $producerRootPrefix = $resolvedProducerRoot.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+          foreach ($candidate in @($pcre2Contract, $pcre2Prefix)) {
+            $resolvedCandidate = (Resolve-Path -LiteralPath $candidate).Path
+            if (-not $resolvedCandidate.StartsWith($producerRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+              throw 'CMake matcher audit artifact escapes the build-owned producer root'
+            }
+          }
+          python .\scripts\produce_pcre2_matcher_contract.py `
+            --verify-contract $pcre2Contract `
+            --prefix $pcre2Prefix `
+            --target $pcre2Target `
+            --vcpkg-root $env:VCPKG_ROOT
+          if ($LASTEXITCODE -ne 0) { throw 'release package PCRE2 matcher contract re-verification failed' }
+          $pcre2ContractSha256 = (Get-FileHash -LiteralPath $pcre2Contract -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($pcre2ContractSha256 -ne $pcre2BoundSha256) {
+            throw 'CMake cache does not bind this exact verified PCRE2 matcher contract'
+          }
+          $pcre2ContractPackagePath = Join-Path $outDir 'p0_matcher_contract.json'
+          Copy-Item -LiteralPath $pcre2Contract -Destination $pcre2ContractPackagePath -Force
           $signatureStatus = if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') { 'signed' } else { 'unsigned' }
           & ".\scripts\write_windows_package_capabilities.ps1" `
             -OutputPath $packageCapabilitiesPath `
@@ -656,6 +710,10 @@ jobs:
               sha256 = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
             })
           }
+          $null = $nativeIntegrityFiles.Add([ordered]@{
+            name = [System.IO.Path]::GetFileName($pcre2ContractPackagePath)
+            sha256 = $pcre2ContractSha256
+          })
           Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
             Sort-Object Name | ForEach-Object {
               $null = $nativeIntegrityFiles.Add([ordered]@{
@@ -677,6 +735,7 @@ jobs:
           $nativeIntegrityManifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
 
           $null = $items.Add($nativeIntegrityPath)
+          $null = $items.Add($pcre2ContractPackagePath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           $null = $items.Add($packageCapabilitiesPath)
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
@@ -793,6 +852,25 @@ jobs:
             if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
               throw "encrypted P0 rule bundle missing from package"
             }
+            $pcre2ContractEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'p0_matcher_contract.json' })
+            if ($pcre2ContractEntries.Count -ne 1) {
+              throw "package root must contain exactly one verified p0_matcher_contract.json; found $($pcre2ContractEntries.Count)"
+            }
+            $pcre2ContractStream = $pcre2ContractEntries[0].Open()
+            $pcre2ContractHasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              $packagedPcre2ContractSha256 = -join ($pcre2ContractHasher.ComputeHash($pcre2ContractStream) | ForEach-Object { $_.ToString('x2') })
+            }
+            finally {
+              $pcre2ContractHasher.Dispose()
+              $pcre2ContractStream.Dispose()
+            }
+            if ($packagedPcre2ContractSha256 -ne $pcre2ContractSha256) {
+              throw "packaged PCRE2 matcher contract hash does not match the CMake-bound producer contract"
+            }
+            if ($entries -match '(?i)(^|/|\\)(lib)?pcre2-8\.dll$') {
+              throw "static PCRE2 release must not package a dynamic pcre2-8 DLL"
+            }
             $forensicEntries = @($entries | Where-Object { $_ -match '(?i)^rules[/\\]forensic[/\\][^/\\]+\.yar(a)?$' })
             if ($forensicEntries.Count -lt 1) {
               throw "rules/forensic/*.yar missing from headless package"
@@ -873,6 +951,7 @@ jobs:
               'FDSecurityInstallerWorker\.exe',
               'uninstall\.exe',
               'native-package-integrity\.json',
+              'p0_matcher_contract\.json',
               'agent_windows_production\.example\.toml',
               'sensor_interest_manifest\.json'
             )

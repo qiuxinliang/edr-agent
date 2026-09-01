@@ -42,15 +42,47 @@ int main(void) {
   int i_cred3 = find_rule_index("R-CRED-003");
   int i_web = find_rule_index("R-WEBSHELL-001");
   int i_lmove = find_rule_index("R-LMOVE-001");
+  int i_net = find_rule_index("R-NET-001");
+  int i_lmove015 = find_rule_index("R-LMOVE-015");
   int i_def = find_rule_index("R-DEFENSE-001");
   int i_t1138 = find_rule_index("R-MITRE-WIN-T1138");
   int i_lolbin10 = find_rule_index("R-LOLBIN-010");
-  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_def < 0 || i_t1138 < 0 || i_lolbin10 < 0) {
+  int i_exec3 = find_rule_index("R-EXEC-003");
+  int i_anom = find_rule_index("R-ANOM-001");
+  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_net < 0 || i_lmove015 < 0 || i_def < 0 ||
+      i_t1138 < 0 || i_lolbin10 < 0 || i_exec3 < 0 || i_anom < 0) {
     fprintf(stderr, "[p0_ir_record] missing expected rule in bundle (indices)\n");
     return 1;
   }
   EdrBehaviorRecord br;
+  uint64_t path_projection_epoch = 0u;
+  uint64_t reloaded_path_projection_epoch = 0u;
   edr_behavior_record_init(&br);
+
+  /* Kernel-File NameCreate sees a path before reliable process identity.  Its
+   * projection must retain every file_read P0 path while safely proving an
+   * unrelated path ordinary; it intentionally ignores later process/user
+   * predicates. */
+  if (!edr_p0_rule_ir_file_read_path_may_match(
+          "C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data",
+          &path_projection_epoch) ||
+      !edr_p0_rule_ir_file_read_path_may_match("C:\\ntds.dit", NULL) ||
+      !edr_p0_rule_ir_file_read_path_may_match("C:\\Google\\Chrome\\ \\Cookies", NULL) ||
+      !edr_p0_rule_ir_file_read_path_may_match("C:\\Windows\\System32\\config\\SAM", NULL) ||
+      !edr_p0_rule_ir_file_read_path_may_match("C:\\Users\\x\\.aws\\credentials", NULL) ||
+      edr_p0_rule_ir_file_read_path_may_match("C:\\safe\\ordinary.txt", NULL) ||
+      path_projection_epoch == 0u) {
+    fprintf(stderr, "[p0_ir_record] FileRead path projection violated\n");
+    return 1;
+  }
+  edr_p0_rule_ir_reload();
+  if (!edr_p0_rule_ir_file_read_path_may_match(
+          "C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data",
+          &reloaded_path_projection_epoch) ||
+      reloaded_path_projection_epoch <= path_projection_epoch) {
+    fprintf(stderr, "[p0_ir_record] FileRead path projection did not bind a new IR epoch\n");
+    return 1;
+  }
 
   /* R-CRED-003 file_read */
   edr_behavior_record_init(&br);
@@ -66,6 +98,46 @@ int main(void) {
   br.type = EDR_EVENT_FILE_READ;
   snprintf(br.file_path, sizeof(br.file_path), "%s", "C:\\safe\\notes.txt");
   if (!check_br("CRED-003 miss", &br, i_cred3, 0)) {
+    return 1;
+  }
+
+  /* Linux inotify maps file modifications to priority=1 FILE_WRITE records.
+   * Under resource pressure the preprocess gate must retain a real IR hit,
+   * rather than returning before P0 evaluation.  R-PERSIST-008 is path-only
+   * and therefore a valid inotify-style positive case. */
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_FILE_WRITE;
+  snprintf(br.file_path, sizeof(br.file_path), "%s",
+           "C:\\Users\\x\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\dropper.ps1");
+  if (!edr_p0_rule_ir_br_matches_any(&br)) {
+    fprintf(stderr, "[p0_ir_record] Linux inotify-style startup write must remain a P0 candidate under pressure\n");
+    return 1;
+  }
+
+  /* The pressure gate runs after enrichment: parent and chain fields may turn
+   * an otherwise raw-looking ProcessCreate into a P0 positive. */
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  snprintf(br.process_name, sizeof(br.process_name), "cmd.exe");
+  snprintf(br.parent_name, sizeof(br.parent_name), "winword.exe");
+  if (!check_br("EXEC-003 enriched parent hit", &br, i_exec3, 1) ||
+      !edr_p0_rule_ir_br_matches_any(&br)) {
+    fprintf(stderr, "[p0_ir_record] enriched parent must not be pressure-shed\n");
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_PROCESS_CREATE;
+  br.process_chain_depth = 81u;
+  if (!check_br("ANOM-001 enriched chain hit", &br, i_anom, 1) ||
+      !edr_p0_rule_ir_br_matches_any(&br)) {
+    fprintf(stderr, "[p0_ir_record] enriched chain must not be pressure-shed\n");
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_FILE_WRITE;
+  snprintf(br.file_path, sizeof(br.file_path), "C:\\safe\\ordinary.txt");
+  if (edr_p0_rule_ir_br_matches_any(&br)) {
+    fprintf(stderr, "[p0_ir_record] ordinary pressure record must remain a proven IR miss\n");
     return 1;
   }
 
@@ -96,6 +168,38 @@ int main(void) {
   br.type = EDR_EVENT_NET_CONNECT;
   br.net_dport = 80u;
   if (!check_br("LMOVE-001 miss", &br, i_lmove, 0)) {
+    return 1;
+  }
+
+  /* Network rules combine their process predicate and port predicate. A
+   * benign executable at the same port must not inherit a tunnelling or data
+   * service rule solely from that port. */
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_NET_CONNECT;
+  br.net_dport = 1080u;
+  snprintf(br.process_name, sizeof(br.process_name), "chisel.exe");
+  if (!check_br("NET-001 named tool hit", &br, i_net, 1)) {
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_NET_CONNECT;
+  br.net_dport = 1080u;
+  snprintf(br.process_name, sizeof(br.process_name), "svchost.exe");
+  if (!check_br("NET-001 ordinary process miss", &br, i_net, 0)) {
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_NET_CONNECT;
+  br.net_dport = 1433u;
+  snprintf(br.process_name, sizeof(br.process_name), "sqlcmd.exe");
+  if (!check_br("LMOVE-015 named tool hit", &br, i_lmove015, 1)) {
+    return 1;
+  }
+  edr_behavior_record_init(&br);
+  br.type = EDR_EVENT_NET_CONNECT;
+  br.net_dport = 1433u;
+  snprintf(br.process_name, sizeof(br.process_name), "svchost.exe");
+  if (!check_br("LMOVE-015 ordinary process miss", &br, i_lmove015, 0)) {
     return 1;
   }
 

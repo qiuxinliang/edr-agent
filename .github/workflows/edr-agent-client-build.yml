@@ -191,7 +191,8 @@ jobs:
             "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-            -DEDR_WITH_GRPC=OFF `
+            "-DEDR_PCRE2_PRODUCER_TARGET=windows/amd64" `
+            "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `

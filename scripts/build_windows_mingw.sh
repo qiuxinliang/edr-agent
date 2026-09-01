@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # 无 MSVC 时用 MinGW-w64 交叉编译 Windows 版 FDSensor，验证 iphlpapi / MIB_TCP6* 等能否通过编译。
+# 这是显式非生产 source-only 检查：MSVC 生产/Release 必须由锁定 vcpkg
+# producer 生成静态 PCRE2 contract，不能把该 MinGW 产物用于发布。
 # 依赖（任选其一）：
 #   - 本机 PATH 中有 x86_64-w64-mingw32-gcc（如 brew / MacPorts 等）
 #   - 环境变量 MINGW_PREFIX 指向工具链根目录（其下须有 bin/x86_64-w64-mingw32-gcc），可不依赖 Homebrew
@@ -77,8 +79,10 @@ build_local() {
     -B "$OUTDIR"
     -G Ninja
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
-    -DCMAKE_BUILD_TYPE=Release
-    -DEDR_WITH_GRPC=OFF
+    -DCMAKE_BUILD_TYPE=Debug
+    -DEDR_BUILD_TESTS=ON
+    -DEDR_REQUIRE_PCRE2=OFF
+    -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON
     -DEDR_WITH_HTTP2_CURL=ON
     -DEDR_REQUIRE_CURL_HTTP2=ON
     -DEDR_WITH_YARA=ON
@@ -103,7 +107,7 @@ build_local() {
   cmake_args+=("-Dzstd_DIR=$DEPS_PREFIX/share/zstd")
   cmake "${cmake_args[@]}"
   cmake --build "$OUTDIR" --target edr_agent -j"${NPROC:-4}"
-  echo "OK: $OUTDIR/FDSensor.exe (MinGW)"
+  echo "OK: $OUTDIR/FDSensor.exe (MinGW explicit non-production P0 source-only build)"
   ls -la "$OUTDIR"/FDSensor.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent.exe 2>/dev/null || ls -la "$OUTDIR"/edr_agent 2>/dev/null || true
   if [[ -f "$OUTDIR/FDSensor.exe" ]]; then
     bin_path="$OUTDIR/FDSensor.exe"

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # 用容器（Docker / Podman 等）交叉编译 Windows 版 edr_agent（不依赖 Homebrew ghcr / 本机 MinGW）。
+# 该路径是显式 non-production source-only 检查；生产 Windows Release 仅允许锁定
+# vcpkg producer 的静态 PCRE2 contract 通过 CMake 门。
 # 在 ubuntu 镜像内用 apt 安装 mingw-w64 + cmake + ninja，与 ghcr.io 无关。
 #
 # 用法：
@@ -113,10 +115,10 @@ if [[ ${#yara_dlls[@]} -lt 1 && ${#yara_static[@]} -lt 1 ]]; then
   exit 2
 fi
 rm -rf build-mingw
-cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_ROOT_DIR="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_USE_STATIC_LIBS=OFF -DOPENSSL_SSL_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DOPENSSL_CRYPTO_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -DSSL_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DLIB_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -DPCRE2_DIR="${EDR_MINGW_DEPS_PREFIX}/share/pcre2" -Dzstd_DIR="${EDR_MINGW_DEPS_PREFIX}/share/zstd" -DEDR_WITH_GRPC=OFF -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON -DVCPKG_MANIFEST_FEATURES=yara -S .
+cmake -B build-mingw -G Ninja -DCMAKE_TOOLCHAIN_FILE='"$TOOLCHAIN"' -DCMAKE_BUILD_TYPE=Debug -DEDR_BUILD_TESTS=ON -DCMAKE_PREFIX_PATH="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_ROOT_DIR="${EDR_MINGW_DEPS_PREFIX}" -DOPENSSL_USE_STATIC_LIBS=OFF -DOPENSSL_SSL_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DOPENSSL_CRYPTO_LIBRARY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -DSSL_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libssl.dll.a" -DLIB_EAY="${EDR_MINGW_DEPS_PREFIX}/lib/libcrypto.dll.a" -Dzstd_DIR="${EDR_MINGW_DEPS_PREFIX}/share/zstd" -DEDR_REQUIRE_PCRE2=OFF -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON -DEDR_WITH_HTTP2_CURL=ON -DEDR_REQUIRE_CURL_HTTP2=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON -DVCPKG_MANIFEST_FEATURES=yara -S .
 cmake --build build-mingw --target edr_agent -j4
 bash scripts/stage_mingw_runtime_dlls.sh build-mingw/FDSensor.exe "${EDR_MINGW_DEPS_PREFIX}" x86_64-w64-mingw32-gcc x86_64-w64-mingw32-objdump
 '
 
-echo "OK: ${ROOT}/${OUTDIR}/ 下生成 Windows 目标（见 FDSensor.exe 或构建日志）"
+echo "OK: ${ROOT}/${OUTDIR}/ 下生成 Windows 非生产 source-only 目标（见 FDSensor.exe 或构建日志）"
 ls -la "${ROOT}/${OUTDIR}/"FDSensor.exe 2>/dev/null || ls -la "${ROOT}/${OUTDIR}/"edr_agent.exe 2>/dev/null || ls -la "${ROOT}/${OUTDIR}/"edr_agent 2>/dev/null || true

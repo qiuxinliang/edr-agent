@@ -9,7 +9,7 @@ const EdrConfig *edr_command_get_config(void) { return NULL; }
 
 static unsigned char b64val(char c) { if(c>='A'&&c<='Z')return (unsigned char)(c-'A'); if(c>='a'&&c<='z')return (unsigned char)(c-'a'+26); if(c>='0'&&c<='9')return (unsigned char)(c-'0'+52); if(c=='-')return 62; return 63; }
 static size_t b64decode(const char *s, unsigned char *out, size_t cap) { size_t n=0; unsigned acc=0,bits=0; for(;*s;s++){ if(*s=='=')break; acc=(acc<<6)|b64val(*s); bits+=6; if(bits>=8){bits-=8;if(n<cap)out[n++]=(unsigned char)((acc>>bits)&255u);}} return n; }
-static char *read_all(const char *path) { FILE *f=fopen(path,"rb"); if(!f)return NULL; fseek(f,0,SEEK_END); long n=ftell(f); rewind(f); char *p=(char*)calloc((size_t)n+1,1); if(p)fread(p,1,(size_t)n,f); fclose(f); return p; }
+static char *read_all(const char *path) { FILE *f=fopen(path,"rb"); if(!f)return NULL; if(fseek(f,0,SEEK_END)!=0){fclose(f);return NULL;} long n=ftell(f); if(n<0){fclose(f);return NULL;} rewind(f); char *p=(char*)calloc((size_t)n+1,1); if(p && n>0 && fread(p,1,(size_t)n,f)!=(size_t)n){free(p);p=NULL;} fclose(f); return p; }
 
 int main(int argc, char **argv) {
   const char *fixture = argc > 1 ? argv[1] : "command_sigv2_fixture.json";

@@ -1476,17 +1476,38 @@ int edr_a44_pipeline_span_record(const EdrA44PipelineSpan *span) {
     return 0;
 }
 
-void edr_a44_split_path_stop(void) {
+int edr_a44_split_path_stop(void) {
   if (!s_a44_threads) {
-    return;
+    return 1;
   }
   (void)InterlockedExchange(&s_a44_life, 0);
+  if (s_a44_hData) {
+    for (int i = 0; i < s_a44_num_threads; i++) {
+      (void)ReleaseSemaphore(s_a44_hData, 1, NULL);
+    }
+  }
+  /* Do not close a single handle or free shared queue state until every
+   * worker has actually stopped.  A timeout is retriable: keep the complete
+   * ownership graph intact so the collector can remain terminal-unhealthy
+   * instead of racing a surviving decoder with a new provider epoch. */
   for (int i = 0; i < s_a44_num_threads; i++) {
-    (void)ReleaseSemaphore(s_a44_hData, 1, NULL);
+    DWORD wait_status;
+    if (!s_a44_threads[i]) {
+      continue;
+    }
+    wait_status = WaitForSingleObject(s_a44_threads[i], 25000);
+    if (wait_status != WAIT_OBJECT_0) {
+      fprintf(stderr,
+              "[collector_win] A4.4 decoder join incomplete status=%lu; retaining resources\n",
+              (unsigned long)wait_status);
+      return 0;
+    }
   }
   for (int i = 0; i < s_a44_num_threads; i++) {
-    (void)WaitForSingleObject(s_a44_threads[i], 25000);
-    CloseHandle(s_a44_threads[i]);
+    if (s_a44_threads[i]) {
+      CloseHandle(s_a44_threads[i]);
+      s_a44_threads[i] = NULL;
+    }
   }
   free(s_a44_threads);
   s_a44_threads = NULL;
@@ -1512,6 +1533,7 @@ void edr_a44_split_path_stop(void) {
   s_a44_buf = NULL;
   fprintf(stderr, "[collector_win] A4.4 split: decode joined (a44_drop=%" PRId64 " a44_backoff=%" PRId64 ")\n",
           (int64_t)s_a44_drop, (int64_t)s_a44_backoff_sync);
+  return 1;
 }
 
 #endif

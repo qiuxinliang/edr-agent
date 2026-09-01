@@ -36,7 +36,6 @@
 | `EDR_HAVE_LZ4` | OFF | 备用压缩 |
 | `EDR_HAVE_KAFKA` | OFF | Kafka |
 | `EDR_WITH_P0_IR` | ON | P0 规则 |
-| `EDR_WITH_GRPC` | OFF | gRPC |
 | `EDR_WITH_DEEP_COLLECTOR` | ON | 深度取证 |
 | `EDR_WITH_ETW_OBSERVABILITY` | ON (Win) | ETW |
 | `EDR_WITH_PROCESS_TREE_CACHE` | ON | 进程树 |

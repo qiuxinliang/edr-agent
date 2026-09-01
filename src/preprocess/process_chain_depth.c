@@ -15,6 +15,7 @@
 #define EDR_PCHAIN_MAX_REASONABLE 10u
 #define EDR_PCHAIN_MAX_TRACE 32u
 
+#ifdef _WIN32
 static const char *basename_c(const char *path) {
   if (!path || !path[0]) return "";
   const char *p = path;
@@ -49,7 +50,6 @@ static int is_untrusted_depth(const char *exe_path) {
   return 0;
 }
 
-#ifdef _WIN32
 static int lookup_process_name_path(uint32_t pid, char *name_out, size_t name_cap,
                                      char *path_out, size_t path_cap) {
   if (pid == 0u) {

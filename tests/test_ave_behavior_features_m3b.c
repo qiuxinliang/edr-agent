@@ -235,7 +235,7 @@ int main(void) {
   /* C32：非 Run 键默认 0.3 */
   e.event_type = AVE_EVT_REG_WRITE;
   e.target_port = 0u;
-  snprintf(e.target_ip, sizeof(e.target_ip), "");
+  e.target_ip[0] = '\0';
   snprintf(e.target_path, sizeof(e.target_path), "HKLM\\SOFTWARE\\Vendor\\App");
   edr_ave_behavior_encode_m3b(&e, &ex, &s, feat, 64u);
   if (expect_near("C32 reg default risk", feat[32], 0.3f, 0.001f) != 0) {

@@ -18,6 +18,9 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
     steps:
       - uses: actions/checkout@v6
+      - name: Validate release scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: .\scripts\validate_windows_powershell_syntax.ps1
       - name: AVE / behavior chain invariants (no vcpkg, bash)
         shell: bash
         run: |
@@ -81,7 +84,8 @@ jobs:
             "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
-            -DEDR_WITH_GRPC=OFF `
+            "-DEDR_PCRE2_PRODUCER_TARGET=windows/amd64" `
+            "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_YARA=ON `
@@ -145,15 +149,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build ccache
-      - name: Configure
+      - name: Configure explicit non-production stub check
         env:
           CC: ccache gcc
           CXX: ccache g++
         run: |
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DEDR_WITH_GRPC=OFF \
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DEDR_WITH_YARA=ON \
-            -DEDR_BUILD_TESTS=OFF
+            -DEDR_BUILD_TESTS=ON \
+            -DEDR_REQUIRE_PCRE2=OFF \
+            -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON
       - name: Build
         run: cmake --build build --parallel $(nproc)
       - name: ccache stats

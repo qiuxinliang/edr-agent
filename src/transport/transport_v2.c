@@ -24,11 +24,34 @@ static EdrTransportV2Config s_cfg;
 static EdrTransportV2Runtime s_rt;
 static int s_next_stream_id = 1;
 
-static void tv2_copy(char *dst, size_t cap, const char *src, const char *fallback) {
+static int tv2_copy(char *dst, size_t cap, const char *src, const char *fallback) {
   if (!dst || cap == 0u) {
-    return;
+    return 0;
   }
-  snprintf(dst, cap, "%s", (src && src[0]) ? src : ((fallback && fallback[0]) ? fallback : ""));
+  const char *value = (src && src[0]) ? src : ((fallback && fallback[0]) ? fallback : "");
+  size_t len = strlen(value);
+  if (len >= cap) {
+    dst[0] = '\0';
+    return 0;
+  }
+  memcpy(dst, value, len + 1u);
+  return 1;
+}
+
+static int tv2_value_fits(const char *value, size_t cap) {
+  return !value || !value[0] || strlen(value) < cap;
+}
+
+static int tv2_copy_or_default(char *dst, size_t cap, const char *value, const char *fallback) {
+  if (tv2_copy(dst, cap, value, fallback)) {
+    return 1;
+  }
+  (void)tv2_copy(dst, cap, NULL, fallback);
+  return 0;
+}
+
+static void tv2_set_last_error_locked(const char *message) {
+  (void)tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), message, NULL);
 }
 
 static const char *channel_name(EdrTransportV2Channel channel) {
@@ -81,6 +104,7 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
   s_cfg.backpressure_enabled = 1;
   s_cfg.telemetry_sampling_pct = 100u;
   if (cfg) {
+    int config_text_valid = 1;
     s_cfg.h2_enabled = cfg->platform.http2_enabled ? 1 : 0;
     s_cfg.h2_required = cfg->platform.http2_require ? 1 : 0;
     s_cfg.control_stream_enabled = cfg->platform.control_stream_enabled ? 1 : 0;
@@ -88,18 +112,23 @@ void edr_transport_v2_init_from_config(const struct EdrConfig *cfg) {
     s_cfg.report_events_v2_enabled = cfg->platform.report_events_v2_enabled ? 1 : 0;
     s_cfg.backpressure_enabled = cfg->platform.backpressure_enabled ? 1 : 0;
     s_cfg.telemetry_sampling_pct = cfg->platform.telemetry_sampling_pct;
-    tv2_copy(s_cfg.data_plane_encoding, sizeof(s_cfg.data_plane_encoding),
-             cfg->platform.data_plane_encoding, "protobuf");
-    tv2_copy(s_cfg.data_plane_compression, sizeof(s_cfg.data_plane_compression),
-             cfg->platform.data_plane_compression, "identity");
-    tv2_copy(s_cfg.dict_ver, sizeof(s_cfg.dict_ver), cfg->platform.control_dict_version,
-             "edr-zstd-dict-v1");
-    tv2_copy(s_cfg.schema_ver, sizeof(s_cfg.schema_ver), cfg->platform.control_schema_version,
-             "edr-control-schema-v1");
-    tv2_copy(s_cfg.profile_id, sizeof(s_cfg.profile_id), cfg->platform.control_profile_id,
-             "default-http1-protobuf");
-    tv2_copy(s_cfg.qos_dscp, sizeof(s_cfg.qos_dscp), cfg->platform.qos_dscp, "AF21");
-    tv2_copy(s_cfg.threshold, sizeof(s_cfg.threshold), cfg->platform.telemetry_threshold, "medium");
+    config_text_valid &= tv2_copy_or_default(s_cfg.data_plane_encoding, sizeof(s_cfg.data_plane_encoding),
+                                              cfg->platform.data_plane_encoding, "protobuf");
+    config_text_valid &= tv2_copy_or_default(s_cfg.data_plane_compression, sizeof(s_cfg.data_plane_compression),
+                                              cfg->platform.data_plane_compression, "identity");
+    config_text_valid &= tv2_copy_or_default(s_cfg.dict_ver, sizeof(s_cfg.dict_ver),
+                                              cfg->platform.control_dict_version, "edr-zstd-dict-v1");
+    config_text_valid &= tv2_copy_or_default(s_cfg.schema_ver, sizeof(s_cfg.schema_ver),
+                                              cfg->platform.control_schema_version, "edr-control-schema-v1");
+    config_text_valid &= tv2_copy_or_default(s_cfg.profile_id, sizeof(s_cfg.profile_id),
+                                              cfg->platform.control_profile_id, "default-http1-protobuf");
+    config_text_valid &= tv2_copy_or_default(s_cfg.qos_dscp, sizeof(s_cfg.qos_dscp), cfg->platform.qos_dscp,
+                                              "AF21");
+    config_text_valid &= tv2_copy_or_default(s_cfg.threshold, sizeof(s_cfg.threshold),
+                                              cfg->platform.telemetry_threshold, "medium");
+    if (!config_text_valid) {
+      tv2_set_last_error_locked("transport config value exceeds field capacity");
+    }
     s_cfg.zstd_requested = strcmp(s_cfg.data_plane_compression, "zstd") == 0 ? 1 : 0;
   } else {
     tv2_copy(s_cfg.data_plane_encoding, sizeof(s_cfg.data_plane_encoding), NULL, "protobuf");
@@ -162,6 +191,15 @@ void edr_transport_v2_apply_profile(const char *dict_ver, const char *schema_ver
                                     const char *qos_dscp, unsigned sampling_pct,
                                     const char *threshold, int backpressure_enabled) {
   tv2_lock();
+  if (!tv2_value_fits(dict_ver, sizeof(s_cfg.dict_ver)) ||
+      !tv2_value_fits(schema_ver, sizeof(s_cfg.schema_ver)) ||
+      !tv2_value_fits(profile_id, sizeof(s_cfg.profile_id)) ||
+      !tv2_value_fits(qos_dscp, sizeof(s_cfg.qos_dscp)) ||
+      !tv2_value_fits(threshold, sizeof(s_cfg.threshold))) {
+    tv2_set_last_error_locked("transport profile value exceeds field capacity");
+    tv2_unlock();
+    return;
+  }
   if (backpressure_enabled >= 0) {
     s_cfg.backpressure_enabled = backpressure_enabled ? 1 : 0;
   }
@@ -227,7 +265,10 @@ void edr_transport_v2_on_control(const char *frame_type) {
   tv2_lock();
   s_rt.control_frames++;
   tv2_copy(s_rt.active_channel, sizeof(s_rt.active_channel), NULL, "control");
-  tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), frame_type, "control_frame");
+  if (!tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), frame_type, "control_frame")) {
+    (void)tv2_copy(s_rt.last_operation, sizeof(s_rt.last_operation), NULL, "overlong_control_frame");
+    tv2_set_last_error_locked("control frame type exceeds status capacity");
+  }
   tv2_unlock();
 }
 
@@ -266,8 +307,10 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
     edr_ingest_http_get_runtime(&http_rt);
     tv2_lock();
     s_rt.send_fail++;
-    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), http_rt.last_error,
-             "report_events failed");
+    if (!tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), http_rt.last_error,
+                  "report_events failed")) {
+      tv2_set_last_error_locked("report-events error exceeds status capacity");
+    }
     tv2_unlock();
   }
   return rc;
@@ -291,7 +334,9 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
     edr_ingest_http_get_last_command_result_delivery_error(error, sizeof(error), NULL);
     tv2_lock();
     s_rt.send_fail++;
-    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), error, "command_result failed");
+    if (!tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), error, "command_result failed")) {
+      tv2_set_last_error_locked("command-result error exceeds status capacity");
+    }
     tv2_unlock();
   } else {
     tv2_lock();

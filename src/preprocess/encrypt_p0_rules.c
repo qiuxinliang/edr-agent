@@ -1,5 +1,6 @@
 #include "edr/encrypt_p0_rules.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -95,6 +96,9 @@ int edr_p0_encrypt_decrypt_edr1(const uint8_t *in, size_t in_len, uint8_t **out,
   if (in_len < EDR_P0_ENCRYPT_OVERHEAD) {
     return -2;
   }
+  if (in_len > EDR_P0_ENCRYPT_ENVELOPE_MAX_BYTES) {
+    return -2;
+  }
   if (memcmp(in, EDR_P0_ENCRYPT_MAGIC, EDR_P0_ENCRYPT_MAGIC_LEN) != 0) {
     return -1;
   }
@@ -154,6 +158,10 @@ int edr_p0_encrypt_decrypt_edr1(const uint8_t *in, size_t in_len, uint8_t **out,
     free(plain);
     return ret;
   }
+  if (plain_len > EDR_P0_ENCRYPT_PLAINTEXT_MAX_BYTES) {
+    free(plain);
+    return -2;
+  }
 
   plain[plain_len] = 0;
   *out = plain;
@@ -164,3 +172,54 @@ int edr_p0_encrypt_decrypt_edr1(const uint8_t *in, size_t in_len, uint8_t **out,
   return -4;
 #endif
 }
+
+#if defined(EDR_P0_ENCRYPT_TESTING) && defined(EDR_HAVE_OPENSSL_FL)
+int edr_p0_encrypt_encrypt_edr1_for_test(const uint8_t *plain, size_t plain_len,
+                                         uint8_t **out, size_t *out_len) {
+  uint8_t key[32];
+  uint8_t *envelope;
+  EVP_CIPHER_CTX *ctx;
+  int outl = 0;
+  int finl = 0;
+  int ret = -4;
+  /* Deliberately permits one-byte-over-limit envelopes so the boundary test
+   * proves the deployed loader rejects them before decryption. */
+  if (!plain || !out || !out_len || plain_len > (size_t)INT_MAX ||
+      plain_len > SIZE_MAX - EDR_P0_ENCRYPT_OVERHEAD) {
+    return -2;
+  }
+  *out = NULL;
+  *out_len = 0u;
+  envelope = (uint8_t *)malloc(EDR_P0_ENCRYPT_OVERHEAD + plain_len);
+  if (!envelope) return -2;
+  memcpy(envelope, EDR_P0_ENCRYPT_MAGIC, EDR_P0_ENCRYPT_MAGIC_LEN);
+  for (size_t i = 0u; i < EDR_P0_ENCRYPT_NONCE_LEN; ++i) {
+    envelope[EDR_P0_ENCRYPT_MAGIC_LEN + i] = (uint8_t)(0xa0u + i);
+  }
+  derive_key(key);
+  ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    free(envelope);
+    return -4;
+  }
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, EDR_P0_ENCRYPT_NONCE_LEN, NULL) == 1 &&
+      EVP_EncryptInit_ex(ctx, NULL, NULL, key,
+                         envelope + EDR_P0_ENCRYPT_MAGIC_LEN) == 1 &&
+      EVP_EncryptUpdate(ctx, envelope + EDR_P0_ENCRYPT_MAGIC_LEN + EDR_P0_ENCRYPT_NONCE_LEN,
+                        &outl, plain, (int)plain_len) == 1 &&
+      EVP_EncryptFinal_ex(ctx, envelope + EDR_P0_ENCRYPT_MAGIC_LEN +
+                           EDR_P0_ENCRYPT_NONCE_LEN + outl, &finl) == 1 &&
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, EDR_P0_ENCRYPT_TAG_LEN,
+                          envelope + EDR_P0_ENCRYPT_MAGIC_LEN +
+                          EDR_P0_ENCRYPT_NONCE_LEN + plain_len) == 1 &&
+      (size_t)(outl + finl) == plain_len) {
+    *out = envelope;
+    *out_len = EDR_P0_ENCRYPT_OVERHEAD + plain_len;
+    ret = 0;
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  if (ret != 0) free(envelope);
+  return ret;
+}
+#endif

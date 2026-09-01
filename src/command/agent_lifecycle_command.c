@@ -28,7 +28,6 @@ static DWORD lifecycle_child_creation_flags(DWORD base_flags) {
   }
   return base_flags;
 }
-#endif
 
 typedef struct EdrAgentLifecycleRequest {
   char task_id[129];
@@ -165,7 +164,6 @@ cleanup:
   return ok;
 }
 
-#ifdef _WIN32
 static int lifecycle_install_dir(char *directory, size_t cap) {
   char module[MAX_PATH];
   DWORD length = GetModuleFileNameA(NULL, module, (DWORD)sizeof(module));

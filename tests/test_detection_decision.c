@@ -288,7 +288,7 @@ static void test_process_tree_context_correlates_parent_child(void) {
 static void test_file_policy_allowlist_suppresses_known_rmm(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
-  const char *path = "/private/tmp/edr_detection_rmm_allowlist.txt";
+  const char *path = "edr_detection_rmm_allowlist.txt";
   FILE *f = fopen(path, "wb");
   assert(f != NULL);
   fputs("ScreenConnect.ClientService.exe\nC:\\Program Files\\ScreenConnect\\\n", f);

@@ -7,7 +7,16 @@
 #define EDR_EVENT_FILTER_VERSION_DEFAULT "agent-event-filter-v1"
 
 static EdrWindowsEventFilterConfig g_event_filter_cfg = {
-    1u, 1u, 1u, 1u, 1u, EDR_EVENT_FILTER_VERSION_DEFAULT,
+    .enabled = 1u,
+    .agent_internal_forensic = 1u,
+    .low_value_file_process = 1u,
+    .low_value_file_suffix = 1u,
+    .temp_xml = 1u,
+    .version = EDR_EVENT_FILTER_VERSION_DEFAULT,
+    .low_value_process_names = "",
+    .low_value_suffixes = "",
+    .temp_xml_patterns = "",
+    .agent_internal_patterns = "",
 };
 static uint64_t g_event_filter_evaluated = 0u;
 static uint64_t g_event_filter_dropped = 0u;
@@ -731,6 +740,32 @@ static const char *event_filter_record_path(const EdrBehaviorRecord *r) {
   return "";
 }
 
+/* Filter status is an operator-facing explanation, not a second evidence
+ * payload.  Retaining an arbitrary prefix here would make a long path or
+ * command look complete, so surface a stable omission marker instead. */
+static void copy_event_filter_status_text(char *dst, size_t cap, const char *src) {
+  static const char overlong[] = "<overlong>";
+  size_t len;
+  if (!dst || cap == 0u) {
+    return;
+  }
+  dst[0] = '\0';
+  if (!src) {
+    return;
+  }
+  len = strlen(src);
+  if (len >= cap) {
+    if (sizeof(overlong) <= cap) {
+      memcpy(dst, overlong, sizeof(overlong));
+    }
+    return;
+  }
+  if (len > 0u) {
+    memcpy(dst, src, len);
+  }
+  dst[len] = '\0';
+}
+
 static void record_event_filter_decision(const EdrBehaviorRecord *r,
                                          const EdrWindowsEventPolicy *p) {
   if (!p || !p->applies) {
@@ -758,14 +793,17 @@ static void record_event_filter_decision(const EdrBehaviorRecord *r,
              has_ci_path(p->reason, "invalid_file_path_metadata")) {
     g_event_filter_metadata_only++;
   }
-  snprintf(g_event_filter_last_drop_reason, sizeof(g_event_filter_last_drop_reason), "%s",
-           p->reason);
-  snprintf(g_event_filter_last_drop_process, sizeof(g_event_filter_last_drop_process), "%s",
-           r ? r->process_name : "");
-  snprintf(g_event_filter_last_drop_path, sizeof(g_event_filter_last_drop_path), "%s",
-           event_filter_record_path(r));
-  snprintf(g_event_filter_last_drop_cmdline, sizeof(g_event_filter_last_drop_cmdline), "%s",
-           r ? r->cmdline : "");
+  copy_event_filter_status_text(g_event_filter_last_drop_reason,
+                                sizeof(g_event_filter_last_drop_reason), p->reason);
+  copy_event_filter_status_text(g_event_filter_last_drop_process,
+                                sizeof(g_event_filter_last_drop_process),
+                                r ? r->process_name : "");
+  copy_event_filter_status_text(g_event_filter_last_drop_path,
+                                sizeof(g_event_filter_last_drop_path),
+                                event_filter_record_path(r));
+  copy_event_filter_status_text(g_event_filter_last_drop_cmdline,
+                                sizeof(g_event_filter_last_drop_cmdline),
+                                r ? r->cmdline : "");
 }
 
 int edr_windows_event_policy_should_emit(const EdrBehaviorRecord *r) {

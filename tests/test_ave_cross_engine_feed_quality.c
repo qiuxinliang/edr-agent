@@ -22,6 +22,37 @@ static void reset_capture(void) {
   g_feed_count = 0;
 }
 
+static void make_enriched_record(EdrBehaviorRecord *r, EdrEventType type, uint32_t pid) {
+  edr_behavior_record_init(r);
+  r->type = type;
+  r->pid = pid;
+  r->ppid = 100u;
+  snprintf(r->process_name, sizeof(r->process_name), "%s", "powershell.exe");
+  snprintf(r->exe_path, sizeof(r->exe_path), "%s",
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(r->cmdline, sizeof(r->cmdline), "%s", "powershell.exe -NoP -Command hostname");
+}
+
+static void make_long_text(char *out, size_t out_cap, char fill) {
+  assert(out != NULL);
+  assert(out_cap > 1u);
+  memset(out, (unsigned char)fill, out_cap - 1u);
+  out[out_cap - 1u] = '\0';
+}
+
+static void expect_atomic_reject(const EdrBehaviorRecord *r) {
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(r);
+  assert(g_feed_count == 0);
+  assert(g_last_event.pid == 0u);
+  assert(g_last_event.process_name[0] == '\0');
+  assert(g_last_event.process_path[0] == '\0');
+  assert(g_last_event.cmdline[0] == '\0');
+  assert(g_last_event.target_path[0] == '\0');
+  assert(g_last_event.target_ip[0] == '\0');
+  assert(g_last_event.target_domain[0] == '\0');
+}
+
 static void test_rejects_pid_only_process_create(void) {
   EdrBehaviorRecord r;
   edr_behavior_record_init(&r);
@@ -100,12 +131,52 @@ static void test_ransom_ext_requires_final_extension(void) {
   assert(g_last_event.ransom_counter_score == 0.f);
 }
 
+static void test_rejects_oversized_event_fields_atomically_and_recovers(void) {
+  EdrBehaviorRecord r;
+
+  make_enriched_record(&r, EDR_EVENT_PROCESS_CREATE, 5100u);
+  make_long_text(r.exe_path, sizeof(r.exe_path), 'x');
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_PROCESS_CREATE, 5101u);
+  make_long_text(r.cmdline, sizeof(r.cmdline), 'c');
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_FILE_WRITE, 5102u);
+  snprintf(r.file_op, sizeof(r.file_op), "%s", "write");
+  make_long_text(r.file_path, sizeof(r.file_path), 'f');
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_NET_CONNECT, 5103u);
+  make_long_text(r.net_dst, sizeof(r.net_dst), '1');
+  r.net_dport = 443u;
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_NET_DNS_QUERY, 5104u);
+  make_long_text(r.dns_query, sizeof(r.dns_query), 'd');
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_REG_SET_VALUE, 5105u);
+  make_long_text(r.reg_key_path, sizeof(r.reg_key_path), 'r');
+  expect_atomic_reject(&r);
+
+  make_enriched_record(&r, EDR_EVENT_PROCESS_CREATE, 5106u);
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1);
+  assert(g_last_event.pid == 5106u);
+  assert(strcmp(g_last_event.process_name, "powershell.exe") == 0);
+  assert(strstr(g_last_event.process_path, "powershell.exe") != NULL);
+  assert(strstr(g_last_event.cmdline, "hostname") != NULL);
+}
+
 int main(void) {
   test_rejects_pid_only_process_create();
   test_accepts_enriched_process_create();
   test_rejects_file_without_process_identity();
   test_accepts_enriched_file_signal();
   test_ransom_ext_requires_final_extension();
+  test_rejects_oversized_event_fields_atomically_and_recovers();
   puts("ave_cross_engine_feed_quality ok");
   return 0;
 }

@@ -119,7 +119,9 @@ static unsigned long s_report_events_v2_ok;
 static unsigned long s_report_events_v2_fail;
 
 static int ascii_eq_ci(const char *a, const char *b);
+#ifdef EDR_HAVE_CURL_HTTP2
 static int ascii_contains_ci(const char *s, const char *needle);
+#endif
 
 static unsigned long s_zstd_compress_ok;
 static unsigned long s_zstd_compress_fail;
@@ -178,10 +180,9 @@ static unsigned long s_http2_multiplex_ok;
 static unsigned long s_http2_multiplex_fail;
 static volatile int s_http2_multiplex_active;
 static volatile int s_http2_negotiated;
+#ifdef EDR_HAVE_CURL_HTTP2
 static int64_t s_http2_cert_problem_retry_after_ms;
 static int s_http2_cert_problem_warned;
-static char s_negotiated_protocol[16];
-static int s_transport_capability_logged;
 static int s_schannel_pem_warned;
 #ifdef _WIN32
 static volatile LONG s_schannel_ssl_options_logged;
@@ -189,6 +190,9 @@ static volatile LONG s_schannel_ssl_options_logged;
 static volatile int s_schannel_ssl_options_logged;
 #endif
 static int s_alpn_log_state;
+#endif
+static char s_negotiated_protocol[16];
+static int s_transport_capability_logged;
 static int64_t s_native_post_fail_log_until_ms;
 static unsigned long s_native_post_fail_log_suppressed;
 static int64_t s_last_success_ms;
@@ -217,7 +221,6 @@ static volatile int s_transfer_shutdown;
 #endif
 static int s_poll_started;
 static int s_poll_thread_created;
-static volatile int s_ws_ready;
 static volatile int s_stream_ready;
 static volatile int s_stream_verified;
 static int s_ws_started;
@@ -225,7 +228,9 @@ static volatile int s_poll_thread_exited = 1;
 static volatile int s_ws_thread_exited = 1;
 static volatile int s_control_hello_ok;
 static int64_t s_control_hello_last_ms;
+#ifdef EDR_HAVE_CURL_HTTP2
 static int64_t s_h2_stream_retry_after_ms;
+#endif
 static int s_control_h2;
 static int s_control_zstd;
 static char s_route_bases[8][512];
@@ -241,12 +246,9 @@ static unsigned long s_route_failover_count;
 #ifdef _WIN32
 static HANDLE s_poll_thread;
 static HANDLE s_ws_thread;
-static CRITICAL_SECTION s_ws_mu;
-static int s_ws_mu_init;
 #else
 static pthread_t s_poll_thread;
 static pthread_t s_ws_thread;
-static pthread_mutex_t s_ws_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static int edr_ingest_http_refresh_route_profile(int force);
@@ -266,8 +268,6 @@ typedef struct EdrWsConn {
   SSL *ssl;
 #endif
 } EdrWsConn;
-
-static EdrWsConn *s_ws_conn;
 
 typedef struct EdrHttpConn {
   int active;
@@ -328,13 +328,29 @@ static void runtime_state_unlock(void) {
 #endif
 }
 
-static void runtime_string_set(char *dst, size_t cap, const char *value) {
+static int copy_text_exact(char *dst, size_t cap, const char *value) {
   if (!dst || cap == 0u) {
-    return;
+    return 0;
+  }
+  const char *src = value ? value : "";
+  size_t len = strlen(src);
+  if (len >= cap) {
+    dst[0] = '\0';
+    return 0;
+  }
+  memcpy(dst, src, len + 1u);
+  return 1;
+}
+
+static int runtime_string_set(char *dst, size_t cap, const char *value) {
+  int copied;
+  if (!dst || cap == 0u) {
+    return 0;
   }
   runtime_state_lock();
-  snprintf(dst, cap, "%s", value ? value : "");
+  copied = copy_text_exact(dst, cap, value);
   runtime_state_unlock();
+  return copied;
 }
 
 static int runtime_string_empty(const char *src) {
@@ -345,13 +361,15 @@ static int runtime_string_empty(const char *src) {
   return empty;
 }
 
-static void runtime_string_copy(char *dst, size_t cap, const char *src) {
+static int runtime_string_copy(char *dst, size_t cap, const char *src) {
+  int copied;
   if (!dst || cap == 0u) {
-    return;
+    return 0;
   }
   runtime_state_lock();
-  snprintf(dst, cap, "%s", src ? src : "");
+  copied = copy_text_exact(dst, cap, src);
   runtime_state_unlock();
+  return copied;
 }
 
 static void runtime_int_set(volatile int *dst, int value) {
@@ -416,10 +434,12 @@ static int env_bool_default(const char *name, int fallback) {
   return fallback ? 1 : 0;
 }
 
+#ifdef EDR_HAVE_CURL_HTTP2
 static long http_socket_timeout_s(void) {
   unsigned long ms = env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul);
   return (long)((ms + 999ul) / 1000ul);
 }
+#endif
 
 static long command_poll_timeout_s(int wait_s) {
   unsigned long wait = wait_s > 0 ? (unsigned long)wait_s : 25ul;
@@ -435,6 +455,7 @@ static long command_poll_timeout_s(int wait_s) {
   return (long)v;
 }
 
+#ifdef EDR_HAVE_CURL_HTTP2
 static int schannel_ssl_options_log_once(void) {
 #ifdef _WIN32
   return InterlockedCompareExchange(&s_schannel_ssl_options_logged, 1, 0) == 0;
@@ -448,14 +469,15 @@ static int schannel_ssl_options_log_once(void) {
   return 1;
 #endif
 }
+#endif
 
 static int env_present(const char *name) {
   const char *e = getenv(name);
   return (e && e[0]) ? 1 : 0;
 }
 
-static int curl_runtime_supports_http2(void) {
 #ifdef EDR_HAVE_CURL_HTTP2
+static int curl_runtime_supports_http2(void) {
   curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
 #ifdef CURL_VERSION_HTTP2
   return info && (((long)info->features & (long)CURL_VERSION_HTTP2) != 0L);
@@ -463,10 +485,8 @@ static int curl_runtime_supports_http2(void) {
   (void)info;
   return 0;
 #endif
-#else
-  return 0;
-#endif
 }
+#endif
 
 static const char *env_str_default(const char *name, const char *fallback) {
   const char *e = getenv(name);
@@ -551,16 +571,15 @@ static int http2_required_for_url(const char *url) {
   return url_uses_control_http2_policy(url) ? control_http2_required() : http2_required();
 }
 
-static int curl_ssl_backend_is_schannel(void) {
 #ifdef EDR_HAVE_CURL_HTTP2
+static int curl_ssl_backend_is_schannel(void) {
   curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
   const char *ssl = (info && info->ssl_version) ? info->ssl_version : "";
   return ascii_contains_ci(ssl, "schannel");
-#else
-  return 0;
-#endif
 }
+#endif
 
+#ifdef EDR_HAVE_CURL_HTTP2
 static int str_ends_with_ci(const char *s, const char *suffix) {
   size_t slen, tlen;
   if (!s || !suffix) {
@@ -573,6 +592,7 @@ static int str_ends_with_ci(const char *s, const char *suffix) {
   }
   return ascii_eq_ci(s + slen - tlen, suffix);
 }
+#endif
 
 static void compact_thumbprint(char *dst, size_t cap, const char *src) {
   size_t n = 0u;
@@ -618,6 +638,7 @@ static void normalize_cert_store_path(char *s) {
   snprintf(s, 256, "%s", out);
 }
 
+#ifdef EDR_HAVE_CURL_HTTP2
 static int build_schannel_cert_selector(char *dst, size_t cap) {
   char thumb[128];
   char store_buf[256];
@@ -636,6 +657,7 @@ static int build_schannel_cert_selector(char *dst, size_t cap) {
   }
   return dst[0] != '\0';
 }
+#endif
 
 static int schannel_store_mtls_configured(void) {
   return s_client_cert_thumbprint[0] != '\0';
@@ -962,20 +984,6 @@ static void note_http_request_failure(void) {
   runtime_state_unlock();
 }
 
-static void note_ws_message_success(void) {
-  runtime_state_lock();
-  s_ws_message_ok++;
-  runtime_state_unlock();
-  runtime_success();
-}
-
-static void note_ws_message_failure(const char *msg) {
-  runtime_state_lock();
-  s_ws_message_fail++;
-  runtime_state_unlock();
-  runtime_failure(msg);
-}
-
 static void note_command_result_success(void) {
   runtime_state_lock();
   s_command_result_ok++;
@@ -1118,32 +1126,6 @@ static void log_native_post_failure(const char *label, int rc) {
   }
   fprintf(stderr, "[ingest-http] %s native post failed rc=%d (rest=%s err=%s)\n",
           label ? label : "request", rc, rest, error);
-}
-
-static void ws_mu_init_once(void) {
-#ifdef _WIN32
-  if (!s_ws_mu_init) {
-    InitializeCriticalSection(&s_ws_mu);
-    s_ws_mu_init = 1;
-  }
-#endif
-}
-
-static void ws_lock(void) {
-  ws_mu_init_once();
-#ifdef _WIN32
-  EnterCriticalSection(&s_ws_mu);
-#else
-  pthread_mutex_lock(&s_ws_mu);
-#endif
-}
-
-static void ws_unlock(void) {
-#ifdef _WIN32
-  LeaveCriticalSection(&s_ws_mu);
-#else
-  pthread_mutex_unlock(&s_ws_mu);
-#endif
 }
 
 static void http_mu_init_once(void) {
@@ -1493,7 +1475,12 @@ void edr_ingest_http_get_rest_base(char *out, size_t cap) {
   if (!out || cap == 0) {
     return;
   }
-  runtime_string_copy(out, cap, s_rest);
+  if (!runtime_string_copy(out, cap, s_rest)) {
+    runtime_state_lock();
+    (void)copy_text_exact(s_last_error, sizeof(s_last_error),
+                          "rest base exceeds caller output capacity");
+    runtime_state_unlock();
+  }
 }
 
 void edr_ingest_http_configure_transport_options(int http2_enabled, int http2_required,
@@ -1593,7 +1580,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->insecure_http = s_insecure_http;
   out->mtls_configured = (schannel_store_mtls_configured() ||
                           (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
-  out->websocket_ready = (s_ws_ready || stream_lease_valid) ? 1 : 0;
+  out->websocket_ready = stream_lease_valid ? 1 : 0;
   out->http2_enabled = data_http2_enabled;
   out->http2_required = data_http2_required;
   out->http2_negotiated = s_http2_negotiated ? 1 : 0;
@@ -2424,6 +2411,7 @@ static int ascii_eq_ci(const char *a, const char *b) {
   return *a == 0 && *b == 0;
 }
 
+#ifdef EDR_HAVE_CURL_HTTP2
 static int ascii_contains_ci(const char *s, const char *needle) {
   size_t nlen;
   if (!s || !needle) {
@@ -2446,6 +2434,7 @@ static int ascii_contains_ci(const char *s, const char *needle) {
   }
   return 0;
 }
+#endif
 
 static void set_proxy_status(const char *status, const char *active_url) {
   runtime_state_lock();
@@ -3348,19 +3337,7 @@ static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *b
   return 0;
 }
 
-static int plain_recv_adapter(void *ctx, char *buf, int cap) {
-#ifdef _WIN32
-  return recv(*(EdrSocket *)ctx, buf, cap, 0);
-#else
-  return (int)recv(*(EdrSocket *)ctx, buf, (size_t)cap, 0);
-#endif
-}
-
 #ifdef EDR_HAVE_OPENSSL_HTTP
-static int ssl_recv_adapter(void *ctx, char *buf, int cap) {
-  return SSL_read((SSL *)ctx, buf, cap);
-}
-
 static int write_all_ssl(SSL *ssl, const char *p, size_t n) {
   size_t off = 0;
   while (off < n) {
@@ -3373,11 +3350,8 @@ static int write_all_ssl(SSL *ssl, const char *p, size_t n) {
   return 0;
 }
 
-static SSL_CTX *new_https_ctx(char *active_cafile, size_t active_cafile_cap) {
+static SSL_CTX *new_https_ctx(void) {
   SSL_CTX *ctx;
-  if (active_cafile && active_cafile_cap > 0u) {
-    active_cafile[0] = '\0';
-  }
   OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
   ctx = SSL_CTX_new(TLS_client_method());
   if (!ctx) {
@@ -3390,13 +3364,8 @@ static SSL_CTX *new_https_ctx(char *active_cafile, size_t active_cafile_cap) {
       cafile = s_ca_file;
     }
     if (cafile && cafile[0]) {
-      if (active_cafile && active_cafile_cap > 0u) {
-        snprintf(active_cafile, active_cafile_cap, "%s", cafile);
-      }
       if (SSL_CTX_load_verify_locations(ctx, cafile, NULL) != 1) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "https ca load failed: %s", cafile);
-        runtime_failure(msg);
+        runtime_failure_openssl("https ca load failed");
         SSL_CTX_free(ctx);
         return NULL;
       }
@@ -3504,8 +3473,7 @@ static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int
   conn->https = https;
 #ifdef EDR_HAVE_OPENSSL_HTTP
   if (https) {
-    char active_cafile[1024];
-    conn->ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
+    conn->ctx = new_https_ctx();
     if (!conn->ctx) {
       http_conn_close(conn);
       return -1;
@@ -3525,11 +3493,17 @@ static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int
     if (SSL_connect(conn->ssl) != 1) {
       long verify = SSL_get_verify_result(conn->ssl);
       if (verify != X509_V_OK) {
+        char verify_reason[96];
         char msg[160];
-        snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
-                 X509_verify_cert_error_string(verify),
-                 active_cafile[0] ? active_cafile : "<default>");
-        runtime_failure(msg);
+        if (!copy_text_exact(verify_reason, sizeof(verify_reason),
+                             X509_verify_cert_error_string(verify))) {
+          (void)copy_text_exact(verify_reason, sizeof(verify_reason), "verify reason unavailable");
+        }
+        if (snprintf(msg, sizeof(msg), "https tls verify failed: %s", verify_reason) < 0) {
+          runtime_failure("https tls verify failed");
+        } else {
+          runtime_failure(msg);
+        }
       } else {
         runtime_failure_openssl("https tls connect failed");
       }
@@ -3559,129 +3533,6 @@ static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) 
   }
   return &s_http_conn;
 }
-
-static int append_headers(char *req, size_t cap, const char *path, const char *host,
-                          const char *body, size_t body_len) {
-  int n = snprintf(req, cap,
-                   "POST %s HTTP/1.1\r\n"
-                   "Host: %s\r\n"
-                   "Content-Type: application/json\r\n"
-                   "Content-Length: %zu\r\n"
-		                   "X-Tenant-ID: %s\r\n"
-		                   "X-Endpoint-ID: %s\r\n"
-		                   "X-User-ID: %s\r\n"
-		                   "X-Permission-Set: telemetry:write,endpoint:attack_surface_report\r\n",
-	                   path, host, body_len, s_tenant[0] ? s_tenant : "demo-tenant",
-	                   s_endpoint[0] ? s_endpoint : "",
-	                   s_user[0] ? s_user : "edr-agent");
-  if (n <= 0 || (size_t)n >= cap) {
-    return -1;
-  }
-  if (s_bearer[0]) {
-    size_t used = (size_t)n;
-    int m = snprintf(req + used, cap - used, "Authorization: Bearer %s\r\n", s_bearer);
-    if (m <= 0 || (size_t)m >= cap - used) {
-      return -1;
-    }
-    n += m;
-  }
-  {
-    size_t used = (size_t)n;
-	    int m = snprintf(req + used, cap - used, "Connection: %s\r\n\r\n",
-	                     http_keepalive_enabled() ? "keep-alive" : "close");
-    if (m <= 0 || (size_t)m >= cap - used) {
-      return -1;
-    }
-    n += m;
-  }
-  (void)body;
-  return n;
-}
-
-#ifdef EDR_HAVE_OPENSSL_HTTP
-static int post_https_openssl(const char *host, int port, const char *path, const char *body, size_t body_len) {
-  EdrSocket fd = EDR_SOCKET_INVALID;
-  int ret = -1;
-  SSL_CTX *ctx = NULL;
-  SSL *ssl = NULL;
-  char req[8192];
-  char active_cafile[1024];
-  int rn = append_headers(req, sizeof(req), path, host, body, body_len);
-  if (rn <= 0) {
-    return -1;
-  }
-  ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
-  if (!ctx) {
-    return -1;
-  }
-  if (tcp_connect_http_route(host, port, 1, &fd) != 0) {
-    runtime_failure("https tcp connect failed");
-    goto done;
-  }
-  ssl = SSL_new(ctx);
-  if (!ssl) {
-    runtime_failure_openssl("https ssl new failed");
-    goto done;
-  }
-#ifdef _WIN32
-  SSL_set_fd(ssl, (int)fd);
-#else
-  SSL_set_fd(ssl, fd);
-#endif
-  (void)SSL_set_tlsext_host_name(ssl, host);
-  if (SSL_connect(ssl) != 1) {
-    long verify = SSL_get_verify_result(ssl);
-    if (verify != X509_V_OK) {
-      char msg[160];
-      snprintf(msg, sizeof(msg), "https tls verify failed: %s ca=%s",
-               X509_verify_cert_error_string(verify),
-               active_cafile[0] ? active_cafile : "<default>");
-      runtime_failure(msg);
-    } else {
-      runtime_failure_openssl("https tls connect failed");
-    }
-    goto done;
-  }
-  if (write_all_ssl(ssl, req, (size_t)rn) != 0 ||
-      (body_len > 0u && write_all_ssl(ssl, body, body_len) != 0)) {
-    runtime_failure_openssl("https write failed");
-    goto done;
-  }
-  {
-    char resp[256];
-    int n = SSL_read(ssl, resp, (int)sizeof(resp) - 1);
-    if (n > 0) {
-      resp[n] = '\0';
-      ret = (strncmp(resp, "HTTP/1.1 2", 10u) == 0 || strncmp(resp, "HTTP/1.0 2", 10u) == 0) ? 0 : -1;
-      if (ret != 0) {
-        char *eol = strstr(resp, "\r\n");
-        if (eol) {
-          *eol = '\0';
-        }
-        {
-          char msg[160];
-          snprintf(msg, sizeof(msg), "https http status: %s", resp);
-          runtime_failure(msg);
-        }
-      }
-    } else {
-      runtime_failure_openssl("https read failed");
-    }
-  }
-done:
-  if (ssl) {
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-  }
-  if (fd != EDR_SOCKET_INVALID) {
-    close_fd(fd);
-  }
-  if (ctx) {
-    SSL_CTX_free(ctx);
-  }
-  return ret;
-}
-#endif
 
 static int native_request(const char *method, const char *url, const char *content_type,
                           const char *body, size_t body_len, char *resp_body,
@@ -4657,66 +4508,6 @@ static int curl_h1_stream_loop(const char *url) {
 }
 #endif
 
-static int native_post_json_legacy(const char *url, const char *body, size_t body_len) {
-  char host[256];
-  char path[1024];
-  int port = 0;
-  int https = 0;
-  EdrSocket fd = EDR_SOCKET_INVALID;
-  int rc = -1;
-  char req[8192];
-  if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
-    runtime_failure("invalid ingest url");
-    return -1;
-  }
-  if (!https) {
-    const char *allow = getenv("EDR_ALLOW_INSECURE_HTTP");
-    if ((!allow || allow[0] != '1') && !is_local_or_private_host(host)) {
-      runtime_failure("plain http denied for non-local host");
-      return -1;
-    }
-  }
-  if (!comm_circuit_allows()) {
-    return -1;
-  }
-  if (!comm_budget_try(body_len + 512u, https)) {
-    return -1;
-  }
-  if (net_init() != 0) {
-    runtime_failure("network init failed");
-    return -1;
-  }
-  if (https) {
-#ifdef EDR_HAVE_OPENSSL_HTTP
-    rc = post_https_openssl(host, port, path, body, body_len);
-#else
-    runtime_failure("https requested but OpenSSL disabled");
-    rc = -1;
-#endif
-    net_done();
-    return rc;
-  }
-  {
-    int rn = append_headers(req, sizeof(req), path, host, body, body_len);
-    if (rn <= 0 || tcp_connect_host(host, port, &fd) != 0) {
-      runtime_failure("http connect failed");
-      net_done();
-      return -1;
-    }
-    if (write_all_plain(fd, req, (size_t)rn) == 0 &&
-        (body_len == 0u || write_all_plain(fd, body, body_len) == 0) &&
-        read_status_plain(fd) == 0) {
-      rc = 0;
-    }
-    close_fd(fd);
-  }
-  net_done();
-  if (rc != 0) {
-    runtime_failure("http post failed");
-  }
-  return rc;
-}
-
 static int native_request_ex(const char *method, const char *url, const char *content_type,
                              const char *body, size_t body_len, char *resp_body,
                              size_t resp_body_cap, long timeout_s) {
@@ -4812,12 +4603,41 @@ static int native_request(const char *method, const char *url, const char *conte
   return native_request_ex(method, url, content_type, body, body_len, resp_body, resp_body_cap, 0L);
 }
 
-static void build_suffix_url(char *url, size_t cap, const char *suffix) {
+static int build_suffix_url(char *url, size_t cap, const char *suffix) {
   char rest[sizeof(s_rest)];
-  runtime_string_copy(rest, sizeof(rest), s_rest);
-  size_t rb = strlen(rest);
-  snprintf(url, cap, "%s%s%s", rest, (rb > 0u && rest[rb - 1u] == '/') ? "" : "/",
-           suffix ? suffix : "");
+  const char *tail = suffix ? suffix : "";
+  size_t rest_len;
+  size_t tail_len;
+  size_t used;
+  int add_separator;
+  if (!url || cap == 0u || !runtime_string_copy(rest, sizeof(rest), s_rest)) {
+    if (url && cap > 0u) {
+      url[0] = '\0';
+    }
+    return 0;
+  }
+  rest_len = strlen(rest);
+  tail_len = strlen(tail);
+  if (rest_len >= cap) {
+    url[0] = '\0';
+    return 0;
+  }
+  memcpy(url, rest, rest_len);
+  used = rest_len;
+  add_separator = rest_len == 0u || rest[rest_len - 1u] != '/';
+  if (add_separator) {
+    if (used + 1u >= cap) {
+      url[0] = '\0';
+      return 0;
+    }
+    url[used++] = '/';
+  }
+  if (tail_len >= cap - used) {
+    url[0] = '\0';
+    return 0;
+  }
+  memcpy(url + used, tail, tail_len + 1u);
+  return 1;
 }
 
 static int request_to_suffix_ex(const char *method, const char *suffix, const char *content_type,
@@ -4833,7 +4653,10 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
     out_body = fail_resp;
     out_cap = sizeof(fail_resp);
   }
-  build_suffix_url(url, sizeof(url), suffix);
+  if (!build_suffix_url(url, sizeof(url), suffix)) {
+    runtime_failure("request URL exceeds capacity");
+    return -1;
+  }
   rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
   if (rc == 0) {
     route_note_success();
@@ -4847,7 +4670,10 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
   if (route_note_failure(last_error[0] ? last_error : "request_failed") &&
       method && strcmp(method, "GET") == 0) {
     if (out_body && out_cap > 0u) out_body[0] = '\0';
-    build_suffix_url(url, sizeof(url), suffix);
+    if (!build_suffix_url(url, sizeof(url), suffix)) {
+      runtime_failure("retry request URL exceeds capacity");
+      return -1;
+    }
     rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
     if (rc == 0) {
       route_note_success();
@@ -5081,9 +4907,15 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
     http_conn_close_locked();
     if (fseek(out, 0L, SEEK_SET) == 0) {
 #if defined(_WIN32)
-      (void)_chsize(_fileno(out), 0);
+      if (_chsize(_fileno(out), 0) != 0) {
+        runtime_failure("http get output truncate failed");
+        break;
+      }
 #else
-      (void)ftruncate(fileno(out), 0);
+      if (ftruncate(fileno(out), 0) != 0) {
+        runtime_failure("http get output truncate failed");
+        break;
+      }
 #endif
     }
     if (client_error) {
@@ -5211,25 +5043,6 @@ static int ws_recv_some(EdrWsConn *c, char *buf, int cap) {
 #endif
 }
 
-static int ws_read_exact(EdrWsConn *c, uint8_t *buf, size_t len) {
-  size_t off = 0;
-  while (off < len && runtime_int_get(&s_poll_run)) {
-    int n = ws_recv_some(c, (char *)buf + off, (int)(len - off));
-    if (n == -2) {
-      if (off == 0u) {
-        return -2;
-      }
-      sleep_poll_ms(10);
-      continue;
-    }
-    if (n <= 0) {
-      return -1;
-    }
-    off += (size_t)n;
-  }
-  return off == len ? 0 : -1;
-}
-
 static int ws_write_all(EdrWsConn *c, const uint8_t *buf, size_t len) {
   size_t off = 0;
   if (!c || !buf) {
@@ -5297,295 +5110,28 @@ static void ws_close_conn(EdrWsConn *c) {
   }
 }
 
-static void ws_random_bytes(uint8_t *out, size_t n) {
-  static int seeded;
-  if (!seeded) {
-    srand((unsigned)time(NULL) ^ (unsigned)(uintptr_t)out);
-    seeded = 1;
-  }
-#ifdef EDR_HAVE_OPENSSL_HTTP
-  if (RAND_bytes(out, (int)n) == 1) {
-    return;
-  }
-#endif
-  for (size_t i = 0; i < n; i++) {
-    out[i] = (uint8_t)(rand() & 0xff);
-  }
-}
-
-static int ws_send_frame(EdrWsConn *c, int opcode, const uint8_t *payload, size_t len) {
-  uint8_t hdr[14];
-  uint8_t mask[4];
-  uint8_t *masked = NULL;
-  size_t h = 0;
-  if (!c || (len > 0u && !payload)) {
-    return -1;
-  }
-  hdr[h++] = (uint8_t)(0x80u | (opcode & 0x0f));
-  if (len < 126u) {
-    hdr[h++] = (uint8_t)(0x80u | len);
-  } else if (len <= 0xffffu) {
-    hdr[h++] = 0x80u | 126u;
-    hdr[h++] = (uint8_t)((len >> 8) & 0xffu);
-    hdr[h++] = (uint8_t)(len & 0xffu);
-  } else {
-    hdr[h++] = 0x80u | 127u;
-    for (int i = 7; i >= 0; i--) {
-      hdr[h++] = (uint8_t)(((uint64_t)len >> (unsigned)(i * 8)) & 0xffu);
-    }
-  }
-  ws_random_bytes(mask, sizeof(mask));
-  memcpy(hdr + h, mask, sizeof(mask));
-  h += sizeof(mask);
-  if (ws_write_all(c, hdr, h) != 0) {
-    return -1;
-  }
-  if (len == 0u) {
-    return 0;
-  }
-  masked = (uint8_t *)malloc(len);
-  if (!masked) {
-    return -1;
-  }
-  for (size_t i = 0; i < len; i++) {
-    masked[i] = payload[i] ^ mask[i & 3u];
-  }
-  {
-    int rc = ws_write_all(c, masked, len);
-    free(masked);
-    return rc;
-  }
-}
-
-static int ws_send_text_conn(EdrWsConn *c, const char *text) {
-  return ws_send_frame(c, 1, (const uint8_t *)(text ? text : ""), text ? strlen(text) : 0u);
-}
-
-static int ws_send_text_active(const char *text) {
-  int rc = -1;
-  ws_lock();
-  if (runtime_int_get(&s_ws_ready) && s_ws_conn) {
-    rc = ws_send_text_conn(s_ws_conn, text);
-    if (rc != 0) {
-      runtime_int_set(&s_ws_ready, 0);
-    }
-  }
-  ws_unlock();
-  return rc;
-}
-
-static int ws_read_frame(EdrWsConn *c, int *opcode, char **payload, size_t *payload_len) {
-  uint8_t h[2];
-  uint64_t len;
-  int masked;
-  uint8_t mask[4] = {0, 0, 0, 0};
-  char *buf = NULL;
-  int rc;
-  if (!opcode || !payload || !payload_len) {
-    return -1;
-  }
-  *opcode = 0;
-  *payload = NULL;
-  *payload_len = 0;
-  rc = ws_read_exact(c, h, sizeof(h));
-  if (rc != 0) {
-    return rc;
-  }
-  *opcode = h[0] & 0x0f;
-  masked = (h[1] & 0x80u) != 0;
-  len = (uint64_t)(h[1] & 0x7fu);
-  if (len == 126u) {
-    uint8_t ext[2];
-    if (ws_read_exact(c, ext, sizeof(ext)) != 0) {
-      return -1;
-    }
-    len = ((uint64_t)ext[0] << 8) | ext[1];
-  } else if (len == 127u) {
-    uint8_t ext[8];
-    if (ws_read_exact(c, ext, sizeof(ext)) != 0) {
-      return -1;
-    }
-    len = 0;
-    for (size_t i = 0; i < sizeof(ext); i++) {
-      len = (len << 8) | ext[i];
-    }
-  }
-  if (len > 1024u * 1024u) {
-    return -1;
-  }
-  if (masked && ws_read_exact(c, mask, sizeof(mask)) != 0) {
-    return -1;
-  }
-  buf = (char *)malloc((size_t)len + 1u);
-  if (!buf) {
-    return -1;
-  }
-  if (len > 0u && ws_read_exact(c, (uint8_t *)buf, (size_t)len) != 0) {
-    free(buf);
-    return -1;
-  }
-  if (masked) {
-    for (size_t i = 0; i < (size_t)len; i++) {
-      buf[i] = (char)((uint8_t)buf[i] ^ mask[i & 3u]);
-    }
-  }
-  buf[len] = '\0';
-  *payload = buf;
-  *payload_len = (size_t)len;
-  return 0;
-}
-
-static int ws_read_handshake(EdrWsConn *c) {
-  char buf[4096];
-  size_t used = 0;
-  while (used + 1u < sizeof(buf)) {
-    int n = ws_recv_some(c, buf + used, (int)(sizeof(buf) - 1u - used));
-    if (n == -2) {
-      continue;
-    }
-    if (n <= 0) {
-      return -1;
-    }
-    used += (size_t)n;
-    buf[used] = '\0';
-    if (strstr(buf, "\r\n\r\n")) {
-      return (strncmp(buf, "HTTP/1.1 101", 12u) == 0 || strncmp(buf, "HTTP/1.0 101", 12u) == 0) ? 0 : -1;
-    }
-  }
-  return -1;
-}
-
-static int ws_connect_once(EdrWsConn *out) {
-  char url[1400];
-  char host[256];
-  char path[1024];
-  char req[4096];
-  uint8_t nonce[16];
-  char key[64];
-  char suffix[1200];
-  int port = 0;
-  int https = 0;
-  int rn;
-  int h2_cap = control_http2_client_enabled();
-  if (!out || !edr_ingest_http_configured()) {
-    return -1;
-  }
-  memset(out, 0, sizeof(*out));
-  out->fd = EDR_SOCKET_INVALID;
-  runtime_state_lock();
-  snprintf(suffix, sizeof(suffix),
-           "ingest/control/ws?endpoint_id=%s&agent_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
-           s_endpoint,
-           s_agent_ver, s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-           h2_cap ? 1 : 0, s_control_zstd ? 1 : 0);
-  runtime_state_unlock();
-  build_suffix_url(url, sizeof(url), suffix);
-  if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
-    return -1;
-  }
-  if (!comm_circuit_allows()) {
-    return -1;
-  }
-  if (!comm_budget_try(2048u, https)) {
-    return -1;
-  }
-  if (net_init() != 0) {
-    return -1;
-  }
-  if (tcp_connect_http_route(host, port, https, &out->fd) != 0) {
-    net_done();
-    return -1;
-  }
-  socket_set_timeout_ms(out->fd, 1000);
-  if (https) {
-#ifdef EDR_HAVE_OPENSSL_HTTP
-    char active_cafile[1024];
-    out->ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
-    if (!out->ctx) {
-      ws_close_conn(out);
-      net_done();
-      return -1;
-    }
-    out->ssl = SSL_new(out->ctx);
-    if (!out->ssl) {
-      ws_close_conn(out);
-      net_done();
-      return -1;
-    }
-#ifdef _WIN32
-    SSL_set_fd(out->ssl, (int)out->fd);
-#else
-    SSL_set_fd(out->ssl, out->fd);
-#endif
-    (void)SSL_set_tlsext_host_name(out->ssl, host);
-    if (SSL_connect(out->ssl) != 1) {
-      runtime_failure_openssl("control ws tls connect failed");
-      ws_close_conn(out);
-      net_done();
-      return -1;
-    }
-#else
-    runtime_failure("control ws https requested but OpenSSL disabled");
-    ws_close_conn(out);
-    net_done();
-    return -1;
-#endif
-  }
-  ws_random_bytes(nonce, sizeof(nonce));
-  if (b64_encode(nonce, sizeof(nonce), key, sizeof(key)) < 0) {
-    ws_close_conn(out);
-    net_done();
-    return -1;
-  }
-  rn = snprintf(req, sizeof(req),
-                "GET %s HTTP/1.1\r\n"
-                "Host: %s\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Key: %s\r\n"
-                "Sec-WebSocket-Version: 13\r\n",
-                path, host, key);
-  if (rn <= 0 || (size_t)rn >= sizeof(req)) {
-    ws_close_conn(out);
-    net_done();
-    return -1;
-  }
-  rn = append_common_headers(req, sizeof(req), (size_t)rn);
-  if (rn <= 0) {
-    ws_close_conn(out);
-    net_done();
-    return -1;
-  }
-  {
-    size_t used = (size_t)rn;
-    int m = snprintf(req + used, sizeof(req) - used, "\r\n");
-    if (m <= 0 || (size_t)m >= sizeof(req) - used ||
-        ws_write_all(out, (const uint8_t *)req, used + (size_t)m) != 0 ||
-        ws_read_handshake(out) != 0) {
-      ws_close_conn(out);
-      net_done();
-      return -1;
-    }
-  }
-  return 0;
-}
-
-static void build_control_stream_url(char *url, size_t cap) {
+static int build_control_stream_url(char *url, size_t cap) {
   char suffix[1200];
   int h2_cap;
+  int n;
   if (!url || cap == 0u) {
-    return;
+    return 0;
   }
   h2_cap = control_http2_client_enabled();
   runtime_state_lock();
-  snprintf(suffix, sizeof(suffix),
-           "ingest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
-           s_endpoint,
-           s_agent_ver, s_policy_version[0] ? s_policy_version : "local",
-           s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
-           h2_cap ? 1 : 0, s_control_zstd ? 1 : 0);
+  n = snprintf(suffix, sizeof(suffix),
+               "ingest/control/stream?endpoint_id=%s&agent_version=%s&policy_version=%s&dict_ver=%s&schema_ver=%s&profile_id=%s&h2=%d&zstd=%d",
+               s_endpoint,
+               s_agent_ver, s_policy_version[0] ? s_policy_version : "local",
+               s_control_dict_ver, s_control_schema_ver, s_control_profile_id,
+               h2_cap ? 1 : 0, s_control_zstd ? 1 : 0);
   runtime_state_unlock();
-  build_suffix_url(url, cap, suffix);
+  if (n < 0 || (size_t)n >= sizeof(suffix) || !build_suffix_url(url, cap, suffix)) {
+    url[0] = '\0';
+    runtime_failure("control stream URL exceeds capacity");
+    return 0;
+  }
+  return 1;
 }
 
 static int stream_connect_once(EdrWsConn *out) {
@@ -5601,7 +5147,9 @@ static int stream_connect_once(EdrWsConn *out) {
   }
   memset(out, 0, sizeof(*out));
   out->fd = EDR_SOCKET_INVALID;
-  build_control_stream_url(url, sizeof(url));
+  if (!build_control_stream_url(url, sizeof(url))) {
+    return -1;
+  }
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     return -1;
   }
@@ -5615,8 +5163,7 @@ static int stream_connect_once(EdrWsConn *out) {
   socket_set_timeout_ms(out->fd, 1000);
   if (https) {
 #ifdef EDR_HAVE_OPENSSL_HTTP
-    char active_cafile[1024];
-    out->ctx = new_https_ctx(active_cafile, sizeof(active_cafile));
+    out->ctx = new_https_ctx();
     if (!out->ctx) {
       ws_close_conn(out);
       net_done();
@@ -5868,37 +5415,13 @@ static int stream_read_loop(EdrWsConn *conn) {
   return 0;
 }
 
-static int ws_send_agent_message(EdrWsConn *c, const char *command_type) {
-  char payload[512];
-  char payload_b64[1024];
-  char env[1600];
-  int hb = 45;
-  const char *hbe = getenv("EDR_WS_HEARTBEAT_S");
-  if (hbe && hbe[0]) {
-    int v = atoi(hbe);
-    if (v >= 30 && v <= 60) {
-      hb = v;
-    }
-  }
-  snprintf(payload, sizeof(payload),
-           "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
-           "\"transport\":\"websocket\",\"heartbeat_sec\":%d,"
-           "\"supports_rtr\":true,\"supports_rtq\":true,\"supports_results\":true}",
-           s_endpoint, s_agent_ver, s_policy_version[0] ? s_policy_version : "local", hb);
-  if (b64_encode((const uint8_t *)payload, strlen(payload), payload_b64, sizeof(payload_b64)) < 0) {
-    return -1;
-  }
-  snprintf(env, sizeof(env),
-           "{\"command_id\":\"agent-%s\",\"command_type\":\"%s\","
-           "\"issued_at_unix_ms\":%lld,\"payload_b64\":\"%s\"}",
-           strcmp(command_type, "agent_hello") == 0 ? "hello" : "heartbeat",
-           command_type, (long long)unix_ms_now(), payload_b64);
-  return ws_send_text_conn(c, env);
-}
-
 static int post_to_suffix(const char *suffix, const char *body) {
   char url[1024];
-  build_suffix_url(url, sizeof(url), suffix);
+  if (!build_suffix_url(url, sizeof(url), suffix)) {
+    runtime_failure("post URL exceeds capacity");
+    note_http_request_failure();
+    return -1;
+  }
   int rc = native_post_json(url, body, strlen(body));
   if (rc == 0) {
     note_http_request_success();
@@ -6456,7 +5979,10 @@ static int curl_upload_multipart_file(const char *command_id, const char *upload
   int h2;
   int force_mtls_http1 = 0;
   const char *filename;
-  build_suffix_url(url, sizeof(url), "ingest/upload-file");
+  if (!build_suffix_url(url, sizeof(url), "ingest/upload-file")) {
+    runtime_failure("upload URL exceeds capacity");
+    return -1;
+  }
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0] ||
       !http2_client_enabled() || strncmp(url, "https://", 8u) != 0 || !curl_global_ready()) {
     return -2;
@@ -6624,7 +6150,10 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   char req[8192];
   int rn;
   size_t body_len = pre_len + file_len + post_len;
-  build_suffix_url(url, sizeof(url), suffix);
+  if (!build_suffix_url(url, sizeof(url), suffix)) {
+    runtime_failure("upload URL exceeds capacity");
+    return -1;
+  }
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid upload url");
     return -1;
@@ -7000,18 +6529,6 @@ static int poll_dispatch_commands(const char *resp) {
   return count;
 }
 
-static int ws_heartbeat_seconds(void) {
-  int hb = 45;
-  const char *e = getenv("EDR_WS_HEARTBEAT_S");
-  if (e && e[0]) {
-    int v = atoi(e);
-    if (v >= 30 && v <= 60) {
-      hb = v;
-    }
-  }
-  return hb;
-}
-
 static int edr_ingest_http_control_hello_once(void) {
   char resp[8192];
   char *endpoint = NULL;
@@ -7198,7 +6715,9 @@ static int control_stream_try_schannel_http1(int *backoff_ms, const char *fallba
   if (!backoff_ms || !control_http1_fallback_enabled()) {
     return 0;
   }
-  build_control_stream_url(stream_url, sizeof(stream_url));
+  if (!build_control_stream_url(stream_url, sizeof(stream_url))) {
+    return 0;
+  }
   if (!curl_schannel_store_mtls_needs_libcurl_http1(stream_url)) {
     return 0;
   }
@@ -7273,7 +6792,7 @@ static void *control_ws_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
-    if (control_stream_ready_lease_valid() || runtime_int_get(&s_ws_ready)) {
+    if (control_stream_ready_lease_valid()) {
       sleep_poll_ms(5000);
       continue;
     }
@@ -7292,7 +6811,16 @@ static void *control_ws_thread(void *arg)
     if (control_http2_client_enabled() && unix_ms_now() >= s_h2_stream_retry_after_ms) {
       char stream_url[1400];
       int h2rc;
-      build_control_stream_url(stream_url, sizeof(stream_url));
+      if (!build_control_stream_url(stream_url, sizeof(stream_url))) {
+        runtime_stream_state_set(0, 0);
+        runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "url_too_long");
+        note_control_stream_failure();
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
+        sleep_poll_ms(control_stream_reconnect_sleep_ms(backoff_ms));
+        backoff_ms = control_stream_next_backoff_ms(backoff_ms);
+        runtime_int_set(&s_ws_backoff_ms, backoff_ms);
+        continue;
+      }
       runtime_stream_state_set(0, 0);
       runtime_string_set(s_control_stream_status, sizeof(s_control_stream_status), "connecting_h2");
       backoff_ms = 5000;
@@ -7511,7 +7039,7 @@ static void *command_poll_thread(void *arg)
       sleep_poll_ms(5000);
       continue;
     }
-    if (control_stream_ready_lease_valid() || runtime_int_get(&s_ws_ready)) {
+    if (control_stream_ready_lease_valid()) {
       runtime_int_set(&s_poll_backoff_ms, 0);
       sleep_poll_ms(5000);
       continue;
@@ -7562,7 +7090,6 @@ void edr_ingest_http_start_command_poll(void) {
   runtime_int_set(&s_poll_thread_exited, 0);
   runtime_int_set(&s_ws_thread_exited, 1);
   s_poll_thread_created = 0;
-  ws_mu_init_once();
   if (runtime_int_get(&s_control_stream_enabled_cfg) &&
       (!streamoff || strcmp(streamoff, "0") != 0)) {
     runtime_int_set(&s_ws_thread_exited, 0);
@@ -7640,13 +7167,6 @@ int edr_ingest_http_stop_command_poll_timeout(uint32_t timeout_ms) {
   uint64_t started_ms = ingest_stop_monotonic_ms();
   runtime_int_set(&s_poll_run, 0);
   runtime_stream_state_set(0, 0);
-  ws_lock();
-  if (s_ws_conn && s_ws_conn->fd != EDR_SOCKET_INVALID) {
-    close_fd(s_ws_conn->fd);
-    s_ws_conn->fd = EDR_SOCKET_INVALID;
-  }
-  runtime_int_set(&s_ws_ready, 0);
-  ws_unlock();
 #ifdef _WIN32
   if (s_poll_thread_created && s_poll_thread) {
     DWORD poll_wait = WaitForSingleObject(

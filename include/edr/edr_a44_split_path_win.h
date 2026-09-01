@@ -94,7 +94,10 @@ typedef struct {
 
 int edr_a44_split_path_enabled(void);
 EdrError edr_a44_split_path_start(EdrEventBus *bus);
-void edr_a44_split_path_stop(void);
+/* Returns 1 only after every decoder thread has joined and all A4.4-owned
+ * memory is safe to release.  A timeout deliberately retains handles, locks
+ * and buffers so a caller can leave collection fail-closed without a UAF. */
+int edr_a44_split_path_stop(void);
 
 /**
  * 填 `out`。reason_sync：0=可入队 1=ExtendedData 非 0 须同步 2=UserData 超长须同步

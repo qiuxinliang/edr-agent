@@ -600,18 +600,56 @@ static int forensic_cancel_check(void *user) {
   return edr_command_cancel_requested((const char *)user);
 }
 
+/* Async job state is later used for cancellation, terminal reporting, and
+ * collector arguments.  It is exact-or-empty: retaining a prefix would turn a
+ * failed request into a differently scoped action. */
+static int forensic_copy_exact(char *dst, size_t dst_cap, const char *src) {
+  size_t len = 0u;
+  if (!dst || dst_cap == 0u || !src) {
+    return -1;
+  }
+  while (len < dst_cap && src[len]) {
+    len++;
+  }
+  if (len == dst_cap) {
+    dst[0] = '\0';
+    return -1;
+  }
+  memcpy(dst, src, len + 1u);
+  return 0;
+}
+
+static int forensic_join_path_exact(char *dst, size_t dst_cap, const char *base,
+                                    char separator, const char *leaf) {
+  int written;
+  if (!dst || dst_cap == 0u) {
+    return -1;
+  }
+  dst[0] = '\0';
+  if (!base || !base[0] || !leaf || !leaf[0]) {
+    return -1;
+  }
+  written = snprintf(dst, dst_cap, "%s%c%s", base, separator, leaf);
+  if (written < 0 || (size_t)written >= dst_cap) {
+    dst[0] = '\0';
+    return -1;
+  }
+  return 0;
+}
+
 /* P1/P2 共享:跑外部 collector 生成产物,成功后由 agent 经 transport v2 上传(通信只走 agent)。
  * 统一契约:把命令 payload 写成 .req 文件交给 collector;collector 读 --request、落 --out-file;agent 上传 out-file。
- * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/崩溃;-100=本地准备失败。 */
+ * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/崩溃;
+ * -100=可回退的本地准备失败;-101=路径/元数据无法完整表达，必须 fail-closed。 */
 static int forensic_external_run(const char *cmd_id, const char *scope, const uint8_t *payload,
                                  size_t payload_len, const char *artifact_ext, int do_upload,
                                  char *minio_key, size_t key_cap, char *detail, size_t detail_cap) {
   const char *outdir = forensic_output_dir();
-  if (response_mkdir_p(outdir) != 0) {
-    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
-    return -100;
-  }
   char job[96];
+  if (forensic_copy_exact(job, sizeof(job), cmd_id ? cmd_id : "job") != 0) {
+    if (detail) snprintf(detail, detail_cap, "forensic collector command id exceeds bounded limit");
+    return EDR_FORENSIC_EXTERNAL_ERR_BOUNDS;
+  }
   response_sanitize_job_name(cmd_id ? cmd_id : "job", job, sizeof(job));
   long long ts = (long long)time(NULL);
 #ifdef _WIN32
@@ -621,9 +659,17 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
 #endif
   char reqpath[900];
   char artifact[900];
-  snprintf(reqpath, sizeof(reqpath), "%s%c%s_%s_%lld.req", outdir, sep, scope, job, ts);
-  snprintf(artifact, sizeof(artifact), "%s%c%s_%s_%lld.%s", outdir, sep, scope, job, ts,
-           artifact_ext ? artifact_ext : "bin");
+  char extra[2048];
+  if (response_forensic_build_collector_paths(
+          outdir, sep, scope, job, ts, artifact_ext ? artifact_ext : "bin",
+          reqpath, sizeof(reqpath), artifact, sizeof(artifact), extra, sizeof(extra)) != 0) {
+    if (detail) snprintf(detail, detail_cap, "forensic collector paths exceed bounded limits");
+    return EDR_FORENSIC_EXTERNAL_ERR_BOUNDS;
+  }
+  if (response_mkdir_p(outdir) != 0) {
+    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
+    return -100;
+  }
 
   FILE *rf = fopen(reqpath, "wb");
   if (!rf) {
@@ -636,8 +682,6 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
   fclose(rf);
 
   /* 注意:路径不加引号,collector 参数走空格分词(POSIX)/cmdline(Windows);取证目录约定无空格。 */
-  char extra[2048];
-  snprintf(extra, sizeof(extra), "--request=%s --out-file=%s", reqpath, artifact);
 
   EdrCollectorRunSpec spec = {0};
   spec.scope = scope;
@@ -774,10 +818,6 @@ static int fx_start_monitor(void) {
 static int fx_spawn_locked(const char *scope, const uint8_t *payload, size_t payload_len,
                            const char *artifact_ext, char *detail, size_t detail_cap) {
   const char *outdir = forensic_output_dir();
-  if (response_mkdir_p(outdir) != 0) {
-    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
-    return -100;
-  }
   char job[96];
   response_sanitize_job_name(g_fx.cmd_id[0] ? g_fx.cmd_id : "job", job, sizeof(job));
   long long ts = (long long)time(NULL);
@@ -786,15 +826,23 @@ static int fx_spawn_locked(const char *scope, const uint8_t *payload, size_t pay
 #else
   const char sep = '/';
 #endif
-  snprintf(g_fx.outdir, sizeof(g_fx.outdir), "%s", outdir);
-  snprintf(g_fx.reqpath, sizeof(g_fx.reqpath), "%s%c%s_%s_%lld.req", outdir, sep, scope, job, ts);
-  snprintf(g_fx.artifact, sizeof(g_fx.artifact), "%s%c%s_%s_%lld.%s", outdir, sep, scope, job, ts,
-           artifact_ext ? artifact_ext : "bin");
+  if (forensic_copy_exact(g_fx.outdir, sizeof(g_fx.outdir), outdir) != 0 ||
+      response_forensic_build_collector_paths(
+          g_fx.outdir, sep, scope, job, ts, artifact_ext ? artifact_ext : "bin",
+          g_fx.reqpath, sizeof(g_fx.reqpath), g_fx.artifact, sizeof(g_fx.artifact),
+          g_fx.extra, sizeof(g_fx.extra)) != 0) {
+    (void)memset(g_fx.outdir, 0, sizeof(g_fx.outdir));
+    if (detail) snprintf(detail, detail_cap, "forensic collector paths exceed bounded limits");
+    return EDR_FORENSIC_EXTERNAL_ERR_BOUNDS;
+  }
+  if (response_mkdir_p(g_fx.outdir) != 0) {
+    if (detail) snprintf(detail, detail_cap, "mkdir output dir failed");
+    return -100;
+  }
   FILE *rf = fopen(g_fx.reqpath, "wb");
   if (!rf) { if (detail) snprintf(detail, detail_cap, "write request file failed"); return -100; }
   if (payload && payload_len) fwrite(payload, 1, payload_len, rf);
   fclose(rf);
-  snprintf(g_fx.extra, sizeof(g_fx.extra), "--request=%s --out-file=%s", g_fx.reqpath, g_fx.artifact);
 
   EdrCollectorRunSpec spec = {0};
   spec.scope = scope;
@@ -824,18 +872,23 @@ int edr_response_forensic_async_accept(const char *cmd_id, const char *command_t
   fx_lock();
   if (g_fx.active) { fx_unlock(); if (detail) snprintf(detail, detail_cap, "collector busy"); return 1; }
   (void)memset(&g_fx, 0, sizeof(g_fx));
-  snprintf(g_fx.cmd_id, sizeof(g_fx.cmd_id), "%s", cmd_id ? cmd_id : "");
-  snprintf(g_fx.command_type, sizeof(g_fx.command_type), "%s", command_type ? command_type : "collect_forensic");
+  if (forensic_copy_exact(g_fx.cmd_id, sizeof(g_fx.cmd_id), cmd_id ? cmd_id : "") != 0 ||
+      forensic_copy_exact(g_fx.command_type, sizeof(g_fx.command_type),
+                          command_type ? command_type : "collect_forensic") != 0 ||
+      forensic_copy_exact(g_fx.scope, sizeof(g_fx.scope), scope ? scope : "standard") != 0) {
+    (void)memset(&g_fx, 0, sizeof(g_fx));
+    fx_unlock();
+    if (detail) snprintf(detail, detail_cap, "forensic collector request metadata exceeds bounded limit");
+    return EDR_FORENSIC_EXTERNAL_ERR_BOUNDS;
+  }
   if (sm) g_fx.sm = *sm;
-  snprintf(g_fx.scope, sizeof(g_fx.scope), "%s", scope ? scope : "standard");
   g_fx.do_upload = do_upload;
   g_fx.strict = forensic_external_required();
   g_fx.phase = 0; /* velo */
-  snprintf(g_fx.artifact, sizeof(g_fx.artifact), "%s", ""); /* 由 fx_spawn_locked 填 */
-  char art_ext[16];
-  snprintf(art_ext, sizeof(art_ext), "%s", artifact_ext ? artifact_ext : "bin");
+  g_fx.artifact[0] = '\0'; /* 由 fx_spawn_locked 填 */
   /* spawn(含首次 manifest 下载,持锁;首跑较慢,后续即时) */
-  int rc = fx_spawn_locked(g_fx.scope, payload, payload_len, art_ext, detail, detail_cap);
+  int rc = fx_spawn_locked(g_fx.scope, payload, payload_len,
+                           artifact_ext ? artifact_ext : "bin", detail, detail_cap);
   if (rc != EDR_DC_OK) { (void)memset(&g_fx, 0, sizeof(g_fx)); fx_unlock(); return rc < 0 ? rc : -3; }
   /* 复用 artifact_ext 供 phase2 同名约定:重存 ext 到 scope 后缀不需要;artifact 路径已定 */
   g_fx.active = 1;
@@ -1085,6 +1138,13 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
+    if (response_forensic_external_failure_must_not_fallback(ar)) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "collect_forensic: external request exceeds bounded path or metadata limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic request exceeds bounded path or metadata limit");
+      return;
+    }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
@@ -1098,7 +1158,13 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   char base[512];
   const char *o = getenv("EDR_FORENSIC_OUT");
   if (o && o[0]) {
-    snprintf(base, sizeof(base), "%s", o);
+    if (forensic_copy_exact(base, sizeof(base), o) != 0) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "collect_forensic: output path exceeds bounded limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic output path exceeds bounded limit");
+      return;
+    }
   } else {
 #ifdef _WIN32
     const char *tmp = getenv("TEMP");
@@ -1108,19 +1174,38 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     if (!tmp || !tmp[0]) {
       tmp = ".";
     }
-    snprintf(base, sizeof(base), "%s\\edr_forensic", tmp);
+    if (forensic_join_path_exact(base, sizeof(base), tmp, '\\', "edr_forensic") != 0) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "collect_forensic: output path exceeds bounded limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic output path exceeds bounded limit");
+      return;
+    }
 #else
-    snprintf(base, sizeof(base), "%s", "/tmp/edr_forensic");
+    memcpy(base, "/tmp/edr_forensic", sizeof("/tmp/edr_forensic"));
 #endif
   }
   char job[96];
+  if (forensic_copy_exact(job, sizeof(job), cmd_id ? cmd_id : "job") != 0) {
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "collect_forensic: command id exceeds bounded limit");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                            "forensic command id exceeds bounded limit");
+    return;
+  }
   response_sanitize_job_name(cmd_id, job, sizeof(job));
   char dir[700];
 #ifdef _WIN32
-  snprintf(dir, sizeof(dir), "%s\\%s", base, job);
+  if (forensic_join_path_exact(dir, sizeof(dir), base, '\\', job) != 0) {
 #else
-  snprintf(dir, sizeof(dir), "%s/%s", base, job);
+  if (forensic_join_path_exact(dir, sizeof(dir), base, '/', job) != 0) {
 #endif
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "collect_forensic: output path exceeds bounded limit");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                            "forensic output path exceeds bounded limit");
+    return;
+  }
   if (response_mkdir_p(dir) != 0) {
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "forensic: 创建输出目录失败");
@@ -1129,10 +1214,16 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   }
   char manifest[800];
 #ifdef _WIN32
-  snprintf(manifest, sizeof(manifest), "%s\\manifest.txt", dir);
+  if (forensic_join_path_exact(manifest, sizeof(manifest), dir, '\\', "manifest.txt") != 0) {
 #else
-  snprintf(manifest, sizeof(manifest), "%s/manifest.txt", dir);
+  if (forensic_join_path_exact(manifest, sizeof(manifest), dir, '/', "manifest.txt") != 0) {
 #endif
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "collect_forensic: manifest path exceeds bounded limit");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                            "forensic manifest path exceeds bounded limit");
+    return;
+  }
   FILE *f = fopen(manifest, "w");
   if (!f) {
     edr_cmd_inc_exec_fail();
@@ -1180,11 +1271,17 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   response_forensic_copy_lines(dir, pl, len);
 #ifdef _WIN32
   char bundle[1100];
-  snprintf(bundle, sizeof(bundle), "%s\\bundle.tgz", dir);
+  if (forensic_join_path_exact(bundle, sizeof(bundle), dir, '\\', "bundle.tgz") != 0) {
 #else
   char bundle[1000];
-  snprintf(bundle, sizeof(bundle), "%s/bundle.tgz", dir);
+  if (forensic_join_path_exact(bundle, sizeof(bundle), dir, '/', "bundle.tgz") != 0) {
 #endif
+    edr_cmd_inc_exec_fail();
+    edr_command_audit_both(cmd_id, "collect_forensic: bundle path exceeds bounded limit");
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                            "forensic bundle path exceeds bounded limit");
+    return;
+  }
   if (response_make_tar_bundle(dir, bundle) == 0) {
     edr_cmd_inc_exec_ok();
     edr_command_audit_both(cmd_id, "forensic: manifest + bundle.tgz");
@@ -1339,6 +1436,13 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
       return;
     }
+    if (response_forensic_external_failure_must_not_fallback(ar)) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "targeted_forensic: external request exceeds bounded path or metadata limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic request exceeds bounded path or metadata limit");
+      return;
+    }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
       char fail[600];
@@ -1392,7 +1496,10 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
       if (!fbname) fbname = strrchr(path->valuestring, '\\');
       if (!fbname) fbname = path->valuestring; else fbname++;
       char dest[800];
-      snprintf(dest, sizeof(dest), "files/%s", fbname);
+      if (forensic_join_path_exact(dest, sizeof(dest), "files", '/', fbname) != 0) {
+        copy_failures++;
+        continue;
+      }
       if (response_forensic_copy_one_file(path->valuestring, dest) == 0) {
         count++;
       } else {
@@ -1474,6 +1581,13 @@ void edr_response_memory_dump(const char *cmd_id, const uint8_t *pl, size_t len,
     if (ar == 1) {
       edr_cmd_inc_exec_fail();
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
+      return;
+    }
+    if (response_forensic_external_failure_must_not_fallback(ar)) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "memory_dump: external request exceeds bounded path or metadata limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic request exceeds bounded path or metadata limit");
       return;
     }
     if (forensic_external_required()) {
@@ -1943,6 +2057,13 @@ void edr_response_yara_scan(const char *cmd_id, const uint8_t *pl, size_t len, c
     if (ar == 1) {
       edr_cmd_inc_exec_fail();
       edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
+      return;
+    }
+    if (response_forensic_external_failure_must_not_fallback(ar)) {
+      edr_cmd_inc_exec_fail();
+      edr_command_audit_both(cmd_id, "yara_scan: external request exceeds bounded path or metadata limit");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
+                              "forensic request exceeds bounded path or metadata limit");
       return;
     }
     if (forensic_external_required()) {

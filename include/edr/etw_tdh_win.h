@@ -35,6 +35,14 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
                                         const char *prov_tag,
                                         EdrSensorInterestEvent *out_event);
 
+/* Kernel-File Read does not carry a filename.  These typed helpers expose
+ * only the documented FileKey / FileName schema used by the collector's
+ * bounded NameCreate-to-Read binding cache; callers must first verify the
+ * event descriptor (Id/Task/Opcode/keywords). */
+int edr_tdh_kernel_file_extract_file_key(PEVENT_RECORD rec, uint64_t *out_file_key);
+int edr_tdh_kernel_file_extract_name_binding(PEVENT_RECORD rec, uint64_t *out_file_key,
+                                             char *path_out, size_t path_cap);
+
 /**
  * 从网络/DNS 类 ETW 记录提取远端 IP、DNS 查询名（UTF-8），供 `AVEBehaviorEvent.target_*` 与 IOC 匹配。
  * 无则保持空串。返回非 0 表示已尝试解析。

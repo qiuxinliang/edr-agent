@@ -1,9 +1,44 @@
 /* 端侧网络扇出/扫描检测器核心逻辑单测(纯逻辑,跨平台)。 */
 
 #include "edr/net_fanout_detector.h"
+#include "edr/ave_sdk.h"
+#include "edr/behavior_alert_emit.h"
+#include "edr/behavior_record.h"
+#include "edr/resource.h"
+#include "edr/time_util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+static void set_env_value(const char *name, const char *value) {
+  _putenv_s(name, value ? value : "");
+}
+#else
+static void set_env_value(const char *name, const char *value) {
+  setenv(name, value ? value : "", 1);
+}
+#endif
+
+static unsigned s_emitted_alerts;
+static AVEBehaviorAlert s_last_alert;
+
+void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *alert) {
+  if (!alert) {
+    return;
+  }
+  s_last_alert = *alert;
+  s_emitted_alerts++;
+}
+
+bool edr_resource_preprocess_throttle_active(void) {
+  return false;
+}
+
+uint64_t edr_monotonic_ns(void) {
+  return 1000000000ULL;
+}
 
 static int fail(const char *m) {
   fprintf(stderr, "fail: %s\n", m);
@@ -25,6 +60,47 @@ static EdrNetFanoutState *mk(void) {
 static const char *ip(int i, char *buf) {
   sprintf(buf, "10.0.%d.%d", i / 256, i % 256);
   return buf;
+}
+
+static int test_detector_rejects_unrepresentable_alert_identity(void) {
+  EdrBehaviorRecord record;
+  memset(&record, 0, sizeof(record));
+  record.type = EDR_EVENT_NET_CONNECT;
+  record.pid = 4242u;
+  record.net_dport = 445u;
+  snprintf(record.net_dst, sizeof(record.net_dst), "%s", "198.51.100.10");
+  snprintf(record.process_name, sizeof(record.process_name), "%s", "scanner.exe");
+  memset(record.exe_path, 'x', sizeof(record.exe_path) - 1u);
+  record.exe_path[sizeof(record.exe_path) - 1u] = '\0';
+
+  set_env_value("EDR_NET_FANOUT_ENABLE", "1");
+  set_env_value("EDR_NET_FANOUT_THRESHOLD", "1");
+  set_env_value("EDR_NET_FANOUT_PORTS", "445");
+  s_emitted_alerts = 0u;
+  memset(&s_last_alert, 0, sizeof(s_last_alert));
+  if (edr_net_fanout_init(NULL) != EDR_OK) {
+    return fail("detector init failed");
+  }
+
+  edr_net_fanout_on_event(&record);
+  if (s_emitted_alerts != 0u) {
+    edr_net_fanout_shutdown();
+    return fail("overlong process path must not produce a truncated alert");
+  }
+
+  snprintf(record.exe_path, sizeof(record.exe_path), "%s", "/usr/bin/scanner");
+  snprintf(record.net_dst, sizeof(record.net_dst), "%s", "198.51.100.11");
+  edr_net_fanout_on_event(&record);
+  if (s_emitted_alerts != 1u || strcmp(s_last_alert.process_path, "/usr/bin/scanner") != 0) {
+    edr_net_fanout_shutdown();
+    return fail("losslessly representable process path must emit unchanged");
+  }
+
+  edr_net_fanout_shutdown();
+  set_env_value("EDR_NET_FANOUT_ENABLE", "");
+  set_env_value("EDR_NET_FANOUT_THRESHOLD", "");
+  set_env_value("EDR_NET_FANOUT_PORTS", "");
+  return 0;
 }
 
 int main(void) {
@@ -105,7 +181,10 @@ int main(void) {
   if (edr_net_fanout_observe(NULL, 1, 445, "1.2.3.4", t) != 0) {
     return fail("null state must be safe");
   }
+  if (test_detector_rejects_unrepresentable_alert_identity() != 0) {
+    return 1;
+  }
 
-  printf("ok: net_fanout distinct/window/key-isolation/port-filter/cooldown\n");
+  printf("ok: net_fanout distinct/window/key-isolation/port-filter/cooldown/lossless-alert\n");
   return 0;
 }

@@ -23,8 +23,19 @@ typedef struct {
 typedef struct {
   int enabled;
   int loaded;
+  int file_read_full_admission;
+  int file_write_full_admission;
+  int registry_set_full_admission;
+  int full_admission_contract_valid;
+  int p0_binding_valid;
   char version[128];
   char rules_version[128];
+  char p0_artifact_sha256[65];
+  char p0_rule_coverage_sha256[65];
+  char sensor_interest_manifest_sha256[65];
+  char sensor_interest_manifest_hash_mode[64];
+  uint32_t p0_artifact_rule_count;
+  uint64_t snapshot_epoch;
   uint32_t process_name_count;
   uint32_t process_prefix_count;
   uint32_t port_count;
@@ -50,8 +61,16 @@ typedef struct {
 void edr_sensor_interest_lazy_init(void);
 void edr_sensor_interest_reload(void);
 int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event);
+/* Pure path classification for collector metadata that must be retained
+ * before a full behavioral event exists.  It intentionally does not update
+ * admission/correlation counters. */
+int edr_sensor_interest_is_file_candidate_path(const char *path);
 void edr_sensor_interest_get_status(EdrSensorInterestStatus *out_status);
 int edr_sensor_interest_default_path(char *out, size_t cap);
 int edr_sensor_interest_replace_manifest_from_file(const char *src_path);
+
+#if defined(EDR_SENSOR_INTEREST_TESTING)
+void edr_sensor_interest_test_fail_parent_sync_after(unsigned int nth_call);
+#endif
 
 #endif

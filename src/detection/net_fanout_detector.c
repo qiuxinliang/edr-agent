@@ -15,6 +15,28 @@
 
 static EdrNetFanoutState *s_inst;
 
+/* The alert ABI has narrower identity fields than BehaviorRecord.  Never
+ * turn an overlong source value into a different, apparently complete alert
+ * identity. */
+static int nf_copy_cstr_exact(char *out, size_t out_cap, const char *source,
+                              size_t source_cap) {
+  const char *end;
+  size_t length;
+  if (!out || out_cap == 0u || !source || source_cap == 0u) {
+    return 0;
+  }
+  end = (const char *)memchr(source, '\0', source_cap);
+  if (!end) {
+    return 0;
+  }
+  length = (size_t)(end - source);
+  if (length >= out_cap) {
+    return 0;
+  }
+  memcpy(out, source, length + 1u);
+  return 1;
+}
+
 static unsigned long nf_env_ulong(const char *name, unsigned long defv) {
   const char *v = getenv(name);
   if (!v || !v[0]) {
@@ -88,6 +110,8 @@ EdrError edr_net_fanout_init(const EdrConfig *cfg) {
 }
 
 void edr_net_fanout_on_event(const EdrBehaviorRecord *br) {
+  char process_name[sizeof(((AVEBehaviorAlert *)0)->process_name)] = {0};
+  char process_path[sizeof(((AVEBehaviorAlert *)0)->process_path)] = {0};
   if (!s_inst || !br || br->type != EDR_EVENT_NET_CONNECT) {
     return;
   }
@@ -97,6 +121,15 @@ void edr_net_fanout_on_event(const EdrBehaviorRecord *br) {
   if (edr_resource_preprocess_throttle_active()) {
     return; /* 资源压力下不累计 */
   }
+  if (!nf_copy_cstr_exact(process_name, sizeof(process_name), br->process_name,
+                          sizeof(br->process_name)) ||
+      !nf_copy_cstr_exact(process_path, sizeof(process_path), br->exe_path,
+                          sizeof(br->exe_path))) {
+    /* Do not let an unrepresentable process identity contribute to an alert
+     * window whose eventual output would otherwise look authoritative. */
+    fprintf(stderr, "[net_fanout] rejected event: process identity is not representable in alert\n");
+    return;
+  }
   uint64_t now = br->event_time_ns ? (uint64_t)br->event_time_ns : edr_monotonic_ns();
   int distinct = edr_net_fanout_observe(s_inst, br->pid, (uint16_t)br->net_dport, br->net_dst, now);
   if (distinct <= 0) {
@@ -105,8 +138,8 @@ void edr_net_fanout_on_event(const EdrBehaviorRecord *br) {
   AVEBehaviorAlert a;
   memset(&a, 0, sizeof(a));
   a.pid = br->pid;
-  snprintf(a.process_name, sizeof(a.process_name), "%s", br->process_name);
-  snprintf(a.process_path, sizeof(a.process_path), "%s", br->exe_path);
+  memcpy(a.process_name, process_name, sizeof(a.process_name));
+  memcpy(a.process_path, process_path, sizeof(a.process_path));
   a.anomaly_score = 0.8f;
   a.needs_l2_review = true;
   a.timestamp_ns = br->event_time_ns;

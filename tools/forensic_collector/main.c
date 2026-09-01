@@ -43,45 +43,89 @@ static char g_request[MAXPATH] = "";
 static char g_out_file[MAXPATH] = "";
 static char g_reason[256] = "";
 static long g_timeout = 300;
+static unsigned g_partial_failures;
 
 static int has_prefix(const char *s, const char *pfx) {
   return strncmp(s, pfx, strlen(pfx)) == 0;
 }
 
+static int copy_text_exact(char *dst, size_t cap, const char *value) {
+  size_t len;
+  if (!dst || cap == 0u || !value) return -1;
+  len = strlen(value);
+  if (len >= cap) {
+    dst[0] = '\0';
+    return -1;
+  }
+  memcpy(dst, value, len + 1u);
+  return 0;
+}
+
+/* Form an output path only when every component fits.  A truncated output
+ * path could make a collection appear to belong to a different case. */
+static int join_path_exact(char *out, size_t cap, const char *dir, const char *name) {
+  size_t dir_len;
+  size_t name_len;
+  int add_sep;
+  if (!out || cap == 0u || !dir || !name || !dir[0] || !name[0]) return -1;
+  dir_len = strlen(dir);
+  name_len = strlen(name);
+  if (dir_len >= cap) return -1;
+  add_sep = dir[dir_len - 1u] != EDR_PATH_SEP;
+  if (add_sep) {
+    if (dir_len + 1u >= cap) return -1;
+    out[dir_len++] = EDR_PATH_SEP;
+  }
+  if (name_len >= cap - dir_len) return -1;
+  memcpy(out, dir, dir_len - (add_sep ? 1u : 0u));
+  if (add_sep) out[dir_len - 1u] = EDR_PATH_SEP;
+  memcpy(out + dir_len, name, name_len + 1u);
+  return 0;
+}
+
 /* 设置 dst=value；支持 "--key=value"（value 在 eq 之后）或单独 value（next）。
- * 返回消费的额外 argv 数（0 或 1）。 */
+ * 返回消费的额外 argv 数（0 或 1）；-2 表示匹配的值无法完整保存。 */
 static int take_kv(const char *arg, const char *key, char *dst, size_t cap, const char *next) {
   size_t klen = strlen(key);
   if (strncmp(arg, key, klen) != 0) {
     return -1; /* 不匹配 */
   }
   if (arg[klen] == '=') {
-    snprintf(dst, cap, "%s", arg + klen + 1);
+    if (copy_text_exact(dst, cap, arg + klen + 1) != 0) return -2;
     return 0;
   }
   if (arg[klen] == '\0' && next) {
-    snprintf(dst, cap, "%s", next);
+    if (copy_text_exact(dst, cap, next) != 0) return -2;
     return 1;
   }
   return -1;
 }
 
-static void default_output_dir(char *out, size_t cap) {
+static int default_output_dir(char *out, size_t cap) {
 #if defined(_WIN32)
   const char *tmp = getenv("TEMP");
   if (!tmp || !tmp[0]) tmp = getenv("TMP");
   if (!tmp || !tmp[0]) tmp = ".";
-  snprintf(out, cap, "%s\\edr_forensic", tmp);
+  return join_path_exact(out, cap, tmp, "edr_forensic");
 #else
-  snprintf(out, cap, "%s", "/tmp/edr_forensic");
+  return copy_text_exact(out, cap, "/tmp/edr_forensic");
 #endif
 }
 
 static int make_dir(const char *path) {
 #if defined(_WIN32)
-  return (_mkdir(path) == 0 || GetLastError() == ERROR_ALREADY_EXISTS) ? 0 : -1;
+  if (_mkdir(path) == 0) return 0;
+  {
+    DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+                   (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+               ? 0
+               : -1;
+  }
 #else
-  return (mkdir(path, 0700) == 0 || 1) ? 0 : -1; /* 已存在也算成功 */
+  struct stat st;
+  if (mkdir(path, 0700) == 0) return 0;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? 0 : -1;
 #endif
 }
 
@@ -103,91 +147,194 @@ static void now_iso(char *out, size_t cap) {
   strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
-/* 把命令 stdout 落到 output-dir/<name>。失败不致命（产物缺失即可）。 */
-static void run_to_file(const char *cmd, const char *name) {
+/* 把命令 stdout 落到 output-dir/<name>。任何不完整的输出都不保留为完整产物，
+ * 但收集可降级继续，最终由 manifest/collected.json 记录。 */
+static int run_to_file(const char *cmd, const char *name) {
   char path[MAXPATH];
-  snprintf(path, sizeof(path), "%s%c%s", g_output_dir, EDR_PATH_SEP, name);
+  int failed = 0;
+  if (join_path_exact(path, sizeof(path), g_output_dir, name) != 0) {
+    g_partial_failures++;
+    return -1;
+  }
   FILE *out = fopen(path, "wb");
-  if (!out) return;
+  if (!out) {
+    g_partial_failures++;
+    return -1;
+  }
 #if defined(_WIN32)
   FILE *p = _popen(cmd, "rb");
 #else
   FILE *p = popen(cmd, "r");
 #endif
-  if (p) {
+  if (!p) {
+    failed = 1;
+  } else {
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0) {
-      fwrite(buf, 1, n, out);
+      if (fwrite(buf, 1, n, out) != n) {
+        failed = 1;
+        break;
+      }
     }
+    if (ferror(p)) failed = 1;
 #if defined(_WIN32)
-    _pclose(p);
+    if (_pclose(p) != 0) failed = 1;
 #else
-    pclose(p);
+    if (pclose(p) != 0) failed = 1;
 #endif
   }
-  fclose(out);
+  if (fclose(out) != 0) failed = 1;
+  if (failed) {
+    remove(path);
+    g_partial_failures++;
+    return -1;
+  }
+  return 0;
 }
 
-static void write_str_file(const char *name, const char *content) {
+static int write_str_file(const char *name, const char *content) {
   char path[MAXPATH];
-  snprintf(path, sizeof(path), "%s%c%s", g_output_dir, EDR_PATH_SEP, name);
+  size_t len;
+  int failed = 0;
+  if (!content || join_path_exact(path, sizeof(path), g_output_dir, name) != 0) return -1;
+  len = strlen(content);
   FILE *f = fopen(path, "wb");
-  if (!f) return;
-  fputs(content, f);
-  fclose(f);
+  if (!f) return -1;
+  if (fwrite(content, 1, len, f) != len) failed = 1;
+  if (fclose(f) != 0) failed = 1;
+  if (failed) {
+    remove(path);
+    return -1;
+  }
+  return 0;
+}
+
+/* Copy targeted evidence without constructing a shell command from request
+ * data.  A read/write failure removes the partial destination. */
+static int copy_target_file(const char *source, const char *name) {
+  char path[MAXPATH];
+  char buf[8192];
+  FILE *in;
+  FILE *out;
+  size_t n;
+  int failed = 0;
+  if (join_path_exact(path, sizeof(path), g_output_dir, name) != 0) return -1;
+  in = fopen(source, "rb");
+  if (!in) return -1;
+  out = fopen(path, "wb");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) {
+      failed = 1;
+      break;
+    }
+  }
+  if (ferror(in)) failed = 1;
+  if (fclose(in) != 0) failed = 1;
+  if (fclose(out) != 0) failed = 1;
+  if (failed) {
+    remove(path);
+    return -1;
+  }
+  return 0;
 }
 
 /* 从 --request 文件中尽力提取 "path":"..." 目标并拷贝到 output-dir（targeted/full）。 */
 static void collect_request_targets(void) {
   if (!g_request[0] || !file_exists(g_request)) return;
   FILE *f = fopen(g_request, "rb");
-  if (!f) return;
+  if (!f) {
+    g_partial_failures++;
+    return;
+  }
   char buf[16384];
   size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-  fclose(f);
+  int request_failed = ferror(f);
+  if (!request_failed && n == sizeof(buf) - 1u) {
+    if (fgetc(f) != EOF || ferror(f)) request_failed = 1;
+  }
+  if (fclose(f) != 0) request_failed = 1;
+  if (request_failed) {
+    g_partial_failures++;
+    return;
+  }
   buf[n] = '\0';
 
   int idx = 0;
   const char *p = buf;
   while ((p = strstr(p, "\"path\"")) != NULL) {
     p += 6;
-    while (*p == ' ' || *p == ':' || *p == '"') p++;
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p != '"') {
+      g_partial_failures++;
+      continue;
+    }
+    p++;
     char target[MAXPATH];
     size_t ti = 0;
-    while (*p && *p != '"' && ti < sizeof(target) - 1) {
-      if (*p == '\\' && p[1]) { /* 反转义 JSON \\ */
+    int target_too_long = 0;
+    while (*p && *p != '"') {
+      if (*p == '\\') { /* 反转义 JSON \\ */
+        if (!p[1]) break;
         p++;
+      }
+      if (ti + 1u >= sizeof(target)) {
+        target_too_long = 1;
+        while (*p && *p != '"') {
+          if (*p == '\\' && p[1]) p++;
+          p++;
+        }
+        break;
       }
       target[ti++] = *p++;
     }
     target[ti] = '\0';
+    if (*p != '"') {
+      g_partial_failures++;
+      break;
+    }
+    p++;
+    if (target_too_long) {
+      g_partial_failures++;
+      continue;
+    }
     if (target[0]) {
-      char dst[MAXPATH];
-      snprintf(dst, sizeof(dst), "copied_%02d", idx++);
-      char cmd[MAXPATH * 2];
-#if defined(_WIN32)
-      snprintf(cmd, sizeof(cmd), "copy /Y \"%s\" \"%s%c%s\" >nul 2>&1", target, g_output_dir, EDR_PATH_SEP, dst);
-      (void)system(cmd);
-#else
-      snprintf(cmd, sizeof(cmd), "cp -f \"%s\" \"%s/%s\" 2>/dev/null", target, g_output_dir, dst);
-      (void)system(cmd);
-#endif
+      char dst[32];
+      int written = snprintf(dst, sizeof(dst), "copied_%02d", idx++);
+      if (written <= 0 || (size_t)written >= sizeof(dst) ||
+          copy_target_file(target, dst) != 0) {
+        g_partial_failures++;
+      }
     }
   }
 }
 
 static int is_scope(const char *s) { return strcmp(g_scope, s) == 0; }
 
-static void collect(void) {
+static int format_manifest(char *out, size_t cap, const char *started_at) {
+  int written = snprintf(out, cap,
+                         "{\"collector\":\"edr-forensic-collector\",\"version\":\"1.0.0\",\"scope\":\"%s\","
+                         "\"reason\":\"%s\",\"started_at\":\"%s\",\"partial_failures\":%u}\n",
+                         g_scope, g_reason, started_at, g_partial_failures);
+  return written > 0 && (size_t)written < cap ? 0 : -1;
+}
+
+static int format_collected_status(char *out, size_t cap, const char *finished_at) {
+  int written = snprintf(out, cap,
+                         "{\"finished_at\":\"%s\",\"status\":\"%s\",\"partial_failures\":%u}\n",
+                         finished_at, g_partial_failures ? "degraded" : "ok",
+                         g_partial_failures);
+  return written > 0 && (size_t)written < cap ? 0 : -1;
+}
+
+static int collect(void) {
   char ts[64];
   now_iso(ts, sizeof(ts));
   char manifest[1024];
-  snprintf(manifest, sizeof(manifest),
-           "{\"collector\":\"edr-forensic-collector\",\"version\":\"1.0.0\",\"scope\":\"%s\","
-           "\"reason\":\"%s\",\"started_at\":\"%s\"}\n",
-           g_scope, g_reason, ts);
-  write_str_file("manifest.json", manifest);
 
 #if defined(_WIN32)
   run_to_file("systeminfo", "system_info.txt");
@@ -221,27 +368,41 @@ static void collect(void) {
     collect_request_targets();
   }
 
+  /* Target-copy failures are non-fatal collection degradation, but the
+   * manifest must report their final count rather than the initial zero. */
+  if (format_manifest(manifest, sizeof(manifest), ts) != 0 ||
+      write_str_file("manifest.json", manifest) != 0) {
+    return -1;
+  }
+
   now_iso(ts, sizeof(ts));
   char done[256];
-  snprintf(done, sizeof(done), "{\"finished_at\":\"%s\",\"status\":\"ok\"}\n", ts);
-  write_str_file("collected.json", done);
+  if (format_collected_status(done, sizeof(done), ts) != 0 ||
+      write_str_file("collected.json", done) != 0) {
+    return -1;
+  }
+  return 0;
 }
 
 /* 把 output-dir 打包为 out-file（tar.gz）。返回 0 成功。 */
 static int make_bundle(void) {
   char cmd[MAXPATH * 3];
+  int written;
 #if defined(_WIN32)
   /* Windows 10+ 自带 bsdtar（tar.exe）。 */
-  snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\" . 2>nul", g_out_file, g_output_dir);
+  written = snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\" . 2>nul", g_out_file, g_output_dir);
+  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
   if (system(cmd) == 0 && file_exists(g_out_file)) return 0;
   /* 回退 PowerShell Compress-Archive（产物为 .zip 语义，但路径按 out-file 给定）。 */
-  snprintf(cmd, sizeof(cmd),
-           "powershell -NoProfile -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\" >nul 2>&1",
-           g_output_dir, g_out_file);
+  written = snprintf(cmd, sizeof(cmd),
+                     "powershell -NoProfile -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\" >nul 2>&1",
+                     g_output_dir, g_out_file);
+  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
   (void)system(cmd);
 #else
-  snprintf(cmd, sizeof(cmd), "tar czf \"%s\" -C \"%s\" . 2>/dev/null", g_out_file, g_output_dir);
-  (void)system(cmd);
+  written = snprintf(cmd, sizeof(cmd), "tar czf \"%s\" -C \"%s\" . 2>/dev/null", g_out_file, g_output_dir);
+  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
+  if (system(cmd) != 0) return -1;
 #endif
   return file_exists(g_out_file) ? 0 : -1;
 }
@@ -251,14 +412,26 @@ int main(int argc, char **argv) {
     const char *a = argv[i];
     const char *next = (i + 1 < argc) ? argv[i + 1] : NULL;
     int adv;
-    if ((adv = take_kv(a, "--scope", g_scope, sizeof(g_scope), next)) >= 0) { i += adv; continue; }
-    if ((adv = take_kv(a, "--output-dir", g_output_dir, sizeof(g_output_dir), next)) >= 0) { i += adv; continue; }
-    if ((adv = take_kv(a, "--request", g_request, sizeof(g_request), next)) >= 0) { i += adv; continue; }
-    if ((adv = take_kv(a, "--out-file", g_out_file, sizeof(g_out_file), next)) >= 0) { i += adv; continue; }
-    if ((adv = take_kv(a, "--reason", g_reason, sizeof(g_reason), next)) >= 0) { i += adv; continue; }
+    adv = take_kv(a, "--scope", g_scope, sizeof(g_scope), next);
+    if (adv == -2) { fputs("forensic_collector: --scope value exceeds supported length\n", stderr); return 2; }
+    if (adv >= 0) { i += adv; continue; }
+    adv = take_kv(a, "--output-dir", g_output_dir, sizeof(g_output_dir), next);
+    if (adv == -2) { fputs("forensic_collector: --output-dir value exceeds supported length\n", stderr); return 2; }
+    if (adv >= 0) { i += adv; continue; }
+    adv = take_kv(a, "--request", g_request, sizeof(g_request), next);
+    if (adv == -2) { fputs("forensic_collector: --request value exceeds supported length\n", stderr); return 2; }
+    if (adv >= 0) { i += adv; continue; }
+    adv = take_kv(a, "--out-file", g_out_file, sizeof(g_out_file), next);
+    if (adv == -2) { fputs("forensic_collector: --out-file value exceeds supported length\n", stderr); return 2; }
+    if (adv >= 0) { i += adv; continue; }
+    adv = take_kv(a, "--reason", g_reason, sizeof(g_reason), next);
+    if (adv == -2) { fputs("forensic_collector: --reason value exceeds supported length\n", stderr); return 2; }
+    if (adv >= 0) { i += adv; continue; }
     if (has_prefix(a, "--timeout")) {
       char tbuf[32] = "";
-      if ((adv = take_kv(a, "--timeout", tbuf, sizeof(tbuf), next)) >= 0) {
+      adv = take_kv(a, "--timeout", tbuf, sizeof(tbuf), next);
+      if (adv == -2) { fputs("forensic_collector: --timeout value exceeds supported length\n", stderr); return 2; }
+      if (adv >= 0) {
         g_timeout = strtol(tbuf, NULL, 10);
         if (g_timeout <= 0) g_timeout = 300;
         i += adv;
@@ -269,18 +442,24 @@ int main(int argc, char **argv) {
   }
 
   if (!g_output_dir[0]) {
-    default_output_dir(g_output_dir, sizeof(g_output_dir));
+    if (default_output_dir(g_output_dir, sizeof(g_output_dir)) != 0) {
+      fputs("forensic_collector: default output directory exceeds supported length\n", stderr);
+      return 2;
+    }
   }
   if (make_dir(g_output_dir) != 0) {
-    fprintf(stderr, "forensic_collector: cannot create output dir: %s\n", g_output_dir);
+    fputs("forensic_collector: cannot create output directory\n", stderr);
     return 2;
   }
 
-  collect();
+  if (collect() != 0) {
+    fputs("forensic_collector: cannot record complete collection status\n", stderr);
+    return 3;
+  }
 
   if (g_out_file[0]) {
     if (make_bundle() != 0) {
-      fprintf(stderr, "forensic_collector: bundle create failed: %s\n", g_out_file);
+      fputs("forensic_collector: bundle create failed\n", stderr);
       return 3;
     }
   }

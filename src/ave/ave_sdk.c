@@ -111,6 +111,22 @@ static int64_t mono_ms(void) {
 #endif
 }
 
+/* Result fields are authoritative scan evidence.  A caller must not receive a
+ * prefix that looks like a complete path or model version. */
+static int copy_cstr_exact(char *out, size_t out_cap, const char *value) {
+  size_t value_len;
+  if (!out || out_cap == 0u || !value) {
+    return 0;
+  }
+  value_len = strlen(value);
+  if (value_len >= out_cap) {
+    out[0] = '\0';
+    return 0;
+  }
+  memcpy(out, value, value_len + 1u);
+  return 1;
+}
+
 static int hash_file_sha256(const char *path, char out65[65]) {
   FILE *f = fopen(path, "rb");
   if (!f) {
@@ -185,9 +201,11 @@ static void apply_tenant_noise_policy(const EdrConfig *pcfg, AVEScanResult *out)
   char model_version[64];
   const char *override = getenv("EDR_AVE_POLICY_MODEL_VERSION");
   if (override && override[0]) {
-    snprintf(model_version, sizeof(model_version), "%s", override);
+    if (!copy_cstr_exact(model_version, sizeof(model_version), override)) {
+      return;
+    }
   } else {
-    snprintf(model_version, sizeof(model_version), "%s", "rules-only-v1");
+    (void)copy_cstr_exact(model_version, sizeof(model_version), "rules-only-v1");
   }
   EdrAveTenantNoiseDecision dec;
   if (!edr_ave_tenant_noise_lookup(pcfg, pcfg->agent.tenant_id, model_version, out->rule_name,
@@ -199,12 +217,12 @@ static void apply_tenant_noise_policy(const EdrConfig *pcfg, AVEScanResult *out)
     out->final_verdict = VERDICT_WHITELISTED;
     out->final_confidence = dec.adjusted_confidence;
     out->skip_ai_analysis = true;
-    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_POLICY");
-    snprintf(out->rule_name, sizeof(out->rule_name), "tenant_noise_suppressed:%s", dec.policy_version);
+    (void)copy_cstr_exact(out->verification_layer, sizeof(out->verification_layer), "TP");
+    (void)copy_cstr_exact(out->rule_name, sizeof(out->rule_name), "tenant_noise_suppressed");
   } else if (dec.needs_review) {
     out->needs_l2_review = true;
     out->final_confidence = dec.adjusted_confidence;
-    snprintf(out->verification_layer, sizeof(out->verification_layer), "TENANT_REVIEW");
+    (void)copy_cstr_exact(out->verification_layer, sizeof(out->verification_layer), "TR");
   } else if (!dec.observe_only) {
     out->final_confidence = dec.adjusted_confidence;
   }
@@ -478,7 +496,9 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
   }
 
   memset(result_out, 0, sizeof(*result_out));
-  snprintf(result_out->scanned_path, sizeof(result_out->scanned_path), "%s", file_path);
+  if (!copy_cstr_exact(result_out->scanned_path, sizeof(result_out->scanned_path), file_path)) {
+    return AVE_ERR_INVALID_PARAM;
+  }
 
   if (env_skip_ext_enabled()) {
     const char *ext = safe_file_ext(file_path);
@@ -486,7 +506,10 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
       result_out->final_verdict = VERDICT_WHITELISTED;
       result_out->final_confidence = 0.01f;
       result_out->scan_duration_ms = 0;
-      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "ext_filter");
+      (void)copy_cstr_exact(result_out->verification_layer,
+                            sizeof(result_out->verification_layer), "L2");
+      (void)copy_cstr_exact(result_out->rule_name, sizeof(result_out->rule_name),
+                            "extension_filter");
       return AVE_OK;
     }
   }
@@ -528,7 +551,9 @@ static int ave_scan_file_impl(const char *file_path, uint32_t subject_pid, AVESc
     } else {
       result_out->final_verdict = VERDICT_WHITELISTED;
       result_out->final_confidence = 0.0f;
-      snprintf(result_out->verification_layer, sizeof(result_out->verification_layer), "empty_file");
+      (void)copy_cstr_exact(result_out->verification_layer,
+                            sizeof(result_out->verification_layer), "L2");
+      (void)copy_cstr_exact(result_out->rule_name, sizeof(result_out->rule_name), "empty_file");
     }
     result_out->scan_duration_ms = 0;
     ave_bp_merge_static_if_subject(subject_pid, result_out);

@@ -5,7 +5,11 @@
     {
       "name": "base",
       "hidden": true,
-      "binaryDir": "${sourceDir}/out/build/${presetName}"
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "EDR_PCRE2_PRODUCER_TARGET": "$env{EDR_PCRE2_PRODUCER_TARGET}",
+        "EDR_PCRE2_VCPKG_ROOT": "$env{EDR_PCRE2_VCPKG_ROOT}"
+      }
     },
     {
       "name": "w-vcpkg-ninja-dev",
@@ -17,7 +21,6 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
@@ -38,7 +41,6 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
@@ -59,7 +61,6 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
@@ -83,7 +84,6 @@
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_YARA": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
@@ -96,7 +96,6 @@
       "description": "不限 Windows/Linux，便于在其它系统上 `cmake --list-presets` 可见、快速冒烟。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_YARA": "OFF",
         "EDR_BUILD_TESTS": "OFF"
       }
@@ -108,7 +107,6 @@
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_YARA": "OFF",
         "EDR_BUILD_TESTS": "OFF",
         "EDR_ENABLE_COMPILER_CACHE": "ON",
@@ -123,7 +121,6 @@
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "EDR_WITH_GRPC": "OFF",
         "EDR_WITH_YARA": "OFF",
         "EDR_BUILD_TESTS": "OFF",
         "EDR_ENABLE_COMPILER_CACHE": "ON",

@@ -62,6 +62,9 @@ typedef enum {
   EDR_EVENT_BEHAVIOR_ONNX_ALERT = 70,
   /** 行为簇摘要：端侧把被 coalesce 压制的同类低价值事件聚合成一条上报，替代重复明细。 */
   EDR_EVENT_BEHAVIOR_SUMMARY = 71,
+  /* Non-rule source-only capability audit. Never matches P0 rules or
+   * authorizes alerting/enforcement. */
+  EDR_EVENT_CAPABILITY_AUDIT = 72,
 } EdrEventType;
 
 /** 优先级：0=高 1=中 2=低（§2.3） */
@@ -73,6 +76,10 @@ typedef struct {
   uint64_t timestamp_ns;
   EdrEventType type;
   uint8_t priority;
+  /* Explicit admission class for the in-process event bus.  This is not a
+   * wire priority: ordinary producers may never consume the bus capacity
+   * reserved for a P0-capable record. */
+  uint8_t p0_critical;
   /** §19.10：来自 Microsoft-Windows-TCPIP / WFAS 的 ETW，供攻击面增量刷新去抖联动 */
   uint8_t attack_surface_hint;
   bool consumed;

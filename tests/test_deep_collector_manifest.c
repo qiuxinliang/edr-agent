@@ -40,6 +40,25 @@ static int write_file_bytes(const char *path, const char *data) {
   return 0;
 }
 
+static int path_exists(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  fclose(f);
+  return 1;
+}
+
+static int join_test_path(char *out, size_t cap, const char *base, const char *suffix) {
+  size_t base_len;
+  size_t suffix_len;
+  if (!out || cap == 0u || !base || !suffix) return -1;
+  base_len = strlen(base);
+  suffix_len = strlen(suffix);
+  if (base_len >= cap || suffix_len >= cap - base_len) return -1;
+  memcpy(out, base, base_len);
+  memcpy(out + base_len, suffix, suffix_len + 1u);
+  return 0;
+}
+
 static int make_temp_dir(char *out, size_t cap) {
 #ifdef _WIN32
   const char *base = getenv("TEMP");
@@ -121,6 +140,24 @@ static void test_json_url_unescape(void) {
               "json url should unescape unicode ampersands");
 }
 
+static void test_json_str_rejects_oversized_manifest_value(void) {
+  char out[8];
+  int rc = dc_json_str("{\"url\":\"https://forensic.example.invalid/collector\"}",
+                       "url", out, sizeof(out));
+  expect_true(rc != 0, "oversized manifest value must be rejected, not prefix-truncated");
+  expect_true(out[0] == '\0', "rejected manifest value must not leave a usable prefix");
+}
+
+static void test_download_detail_keeps_curl_exit_when_prior_detail_is_full(void) {
+  memset(g_dc_download_detail, 'x', sizeof(g_dc_download_detail) - 1u);
+  g_dc_download_detail[sizeof(g_dc_download_detail) - 1u] = '\0';
+  dc_note_curl_exit(23ul);
+  expect_true(strstr(g_dc_download_detail, "previous_download_detail_sha256=") != NULL,
+              "full download detail should become an explicit digest");
+  expect_true(strstr(g_dc_download_detail, "curl exit=23") != NULL,
+              "curl exit must remain visible after detail compaction");
+}
+
 static void test_native_http_client_error_detection(void) {
   snprintf(g_dc_download_detail, sizeof(g_dc_download_detail),
            "native http: http get status: HTTP/1.1 404 Not Found");
@@ -134,7 +171,11 @@ static void test_artifact_failure_keeps_existing_dest(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
   expect_true(write_file_bytes(dest, "existing-good") == 0, "write existing dest");
 
   g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact bad\",\"sha256\":\"\"}";
@@ -147,8 +188,13 @@ static void test_artifact_failure_keeps_existing_dest(void) {
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "existing dest should remain readable");
   expect_true(strcmp(got, "existing-good") == 0, "failed artifact download must not delete existing dest");
   char part[512];
-  snprintf(part, sizeof(part), "%s.part", dest);
-  expect_true(!dc_file_exists(part), "failed artifact download should not leave .part");
+  if (join_test_path(part, sizeof(part), dest, ".part") != 0) {
+    expect_true(0, "build artifact part path without truncation");
+    remove(dest);
+    rmdir(dir);
+    return;
+  }
+  expect_true(!path_exists(part), "failed artifact download should not leave .part");
   remove(dest);
   rmdir(dir);
 }
@@ -157,7 +203,11 @@ static void test_success_installs_part_atomically(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
   g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact\",\"sha256\":\"\"}";
   g_artifact_body = "new-good";
   char detail[256];
@@ -167,8 +217,13 @@ static void test_success_installs_part_atomically(void) {
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "installed dest should be readable");
   expect_true(strcmp(got, "new-good") == 0, "installed dest should contain artifact body");
   char part[512];
-  snprintf(part, sizeof(part), "%s.part", dest);
-  expect_true(!dc_file_exists(part), "successful install should not leave .part");
+  if (join_test_path(part, sizeof(part), dest, ".part") != 0) {
+    expect_true(0, "build artifact part path without truncation");
+    remove(dest);
+    rmdir(dir);
+    return;
+  }
+  expect_true(!path_exists(part), "successful install should not leave .part");
   remove(dest);
   rmdir(dir);
 }
@@ -177,7 +232,11 @@ static void test_artifact_download_fallback_uses_manifest_origin(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
 
   g_manifest_body = "{\"enabled\":true,\"url\":\"https://public.invalid/api/v1/agent/forensic-collector/download?kind=adapter\\u0026os=windows\\u0026arch=amd64\",\"sha256\":\"\"}";
   g_artifact_body = "fallback-good";
@@ -197,8 +256,13 @@ static void test_artifact_download_fallback_uses_manifest_origin(void) {
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "fallback dest should be readable");
   expect_true(strcmp(got, "fallback-good") == 0, "fallback should use manifest-origin download URL");
   char part[512];
-  snprintf(part, sizeof(part), "%s.part", dest);
-  expect_true(!dc_file_exists(part), "fallback install should not leave .part");
+  if (join_test_path(part, sizeof(part), dest, ".part") != 0) {
+    expect_true(0, "build artifact part path without truncation");
+    remove(dest);
+    rmdir(dir);
+    return;
+  }
+  expect_true(!path_exists(part), "fallback install should not leave .part");
 
 #ifdef _WIN32
   _putenv_s("EDR_FORENSIC_DOWNLOAD_NO_CURL", "");
@@ -214,7 +278,11 @@ static void test_ensure_adapter_derives_manifest_from_rest_base(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
   g_rest_base = "https://reachable.local/api/v1/";
   g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/artifact\",\"sha256\":\"\"}";
   g_artifact_body = "downloaded-adapter";
@@ -278,7 +346,11 @@ static void test_maybe_refresh_replaces_on_sha_change(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
   expect_true(write_file_bytes(dest, "old-adapter-body") == 0, "write existing old adapter");
 
   /* manifest 广告一个新 sha(= new-adapter-body 的 sha),artifact 下载返回新体。 */
@@ -322,7 +394,11 @@ static void test_maybe_refresh_keeps_current_when_sha_matches(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
   char dest[512];
-  snprintf(dest, sizeof(dest), "%s/forensic_collector.exe", dir);
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector.exe") != 0) {
+    expect_true(0, "build artifact destination without truncation");
+    rmdir(dir);
+    return;
+  }
   expect_true(write_file_bytes(dest, "current-body") == 0, "write current adapter");
   char cursha[65];
   expect_true(edr_sha256_hex((const unsigned char *)"current-body", 12, cursha) == 0, "hash current");
@@ -388,6 +464,8 @@ static void test_blocking_collector_cancels_process_group(void) {
 
 int main(void) {
   test_json_url_unescape();
+  test_json_str_rejects_oversized_manifest_value();
+  test_download_detail_keeps_curl_exit_when_prior_detail_is_full();
   test_native_http_client_error_detection();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();

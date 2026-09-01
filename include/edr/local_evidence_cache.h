@@ -21,6 +21,24 @@ typedef struct {
   uint64_t p0_candidates_written;
   uint64_t artifacts_written;
   uint64_t command_results_written;
+  /* Candidate accounting has non-overlapping denominators:
+   * requests = reused + admission_attempts;
+   * admission_attempts = admitted + rejected.
+   * `admitted` advances only after the containing SQLite transaction commits. */
+  uint64_t candidate_requests;
+  /* Current-process, short-window local evidence reuse only. It is neither
+   * alert suppression nor a persistent/cross-restart cache-hit metric. */
+  uint64_t candidate_reused;
+  uint64_t candidate_admission_attempts;
+  uint64_t candidate_admitted;
+  uint64_t candidate_rejected;
+  uint64_t candidate_transaction_failures;
+  /* A fixed in-memory field received a longer source value. The retained
+   * prefix is explicitly counted so evidence degradation is observable. */
+  uint64_t bounded_string_truncations;
+  /* A bounded pre/post context manifest was rejected before any artifact row
+   * committed (invalid UTF-8, allocation failure, or insufficient buffer). */
+  uint64_t manifest_rejections;
   uint64_t candidate_deduped;
   uint64_t write_budget_dropped;
   uint64_t db_budget_dropped;
@@ -44,6 +62,14 @@ typedef struct {
   uint64_t identity_upgrades;
   uint64_t identity_stale_rejects;
   uint64_t process_cache_evictions;
+  uint64_t ring_evictions;
+  uint64_t hot_ring_evictions;
+  uint64_t context_window_evictions;
+  uint64_t metric_slot_evictions;
+  uint64_t candidate_dedup_evictions;
+  uint64_t aggregate_slot_evictions;
+  uint64_t db_retention_evicted;
+  uint64_t db_capacity_evicted;
   uint64_t identity_target_4688;
   uint64_t identity_creator_fallback;
   uint64_t identity_cache;
@@ -65,14 +91,42 @@ typedef struct {
   uint32_t metrics_capacity;
   uint32_t aggregate_slots_used;
   uint32_t aggregate_slots_capacity;
+  uint32_t context_windows_used;
   uint32_t context_windows_capacity;
+  uint32_t candidate_dedup_slots_used;
   uint32_t candidate_dedup_capacity;
+  uint32_t process_slots_utilization_bps;
+  uint32_t ring_utilization_bps;
+  uint32_t hot_ring_utilization_bps;
+  uint32_t metrics_utilization_bps;
+  uint32_t aggregate_utilization_bps;
+  uint32_t context_windows_utilization_bps;
+  uint32_t candidate_dedup_utilization_bps;
+  uint32_t db_utilization_bps;
   uint32_t pressure_active;
+  /* Completed module-mutex samples for this process. Wait/hold percentiles
+   * are conservative upper bounds from a fixed 64-bucket log2(ns)
+   * histogram; every percentile is 0 when there are no completed samples. */
+  uint64_t mutex_lock_samples;
+  uint64_t mutex_wait_total_ns;
+  uint64_t mutex_wait_max_ns;
+  uint64_t mutex_wait_p95_ns;
+  uint64_t mutex_wait_p99_ns;
+  uint64_t mutex_hold_total_ns;
+  uint64_t mutex_hold_max_ns;
+  uint64_t mutex_hold_p95_ns;
+  uint64_t mutex_hold_p99_ns;
   uint64_t static_bytes;
   uint32_t max_db_mb;
   uint32_t retention_hours;
   uint64_t db_bytes;
   uint64_t wal_bytes;
+  uint64_t p0_candidate_rows;
+  int64_t oldest_process_last_seen_ns;
+  int64_t oldest_ring_event_time_ns;
+  int64_t oldest_hot_ring_event_time_ns;
+  int64_t oldest_candidate_dedup_ns;
+  int64_t oldest_p0_candidate_event_time_ns;
   char path[512];
   char last_engine[32];
   int64_t last_event_time_ns;
@@ -112,6 +166,18 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
                                               void (*emit)(const EdrBehaviorRecord *));
 
 void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out);
+
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+/* Aborts the next candidate-cache transaction commits from SQLite's commit
+ * hook. This is test-only evidence that counters and dedupe state move only
+ * after the durable boundary succeeds. */
+void edr_local_evidence_cache_test_fail_next_commits(unsigned count);
+/* Test-only mutex timing controls. They never exist in production builds. */
+void edr_local_evidence_cache_test_reset_mutex_timing(void);
+void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,
+                                                        uint64_t hold_ns);
+void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms);
+#endif
 
 /** 追加 engine_health JSON 片段，形如 `"evidence_cache":{...}`。 */
 void edr_local_evidence_cache_status_json(char *out, size_t cap);

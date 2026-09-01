@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.19)
 cmake_policy(SET CMP0091 NEW)
 project(edr_agent
   VERSION 0.1.0
@@ -11,6 +11,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Strict C11 mode intentionally disables compiler extensions.  On Linux,
+# glibc only declares the POSIX clock/environment APIs used by the Agent when
+# their feature-test contract is supplied before every system header.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_compile_definitions(_POSIX_C_SOURCE=200809L _GNU_SOURCE=1)
+endif()
 
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
@@ -36,17 +43,27 @@ endif()
 
 function(edr_apply_common_warnings target_name)
   if(MSVC)
-    target_compile_options(${target_name} PRIVATE /W4 /WX-)
+    # Current C11 atomic use stays within MSVC's <=8-byte lock-free builtin scope.
+    target_compile_options(${target_name} PRIVATE
+      /W4 /WX-
+      "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+      "$<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>")
   else()
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endif()
 endfunction()
 
+function(edr_apply_test_warnings target_name)
+  edr_apply_common_warnings(${target_name})
+  if(MSVC)
+    target_compile_options(${target_name} PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(${target_name} PRIVATE -UNDEBUG)
+  endif()
+endfunction()
+
 option(EDR_BUILD_TESTS "Build CTest smoke/regression targets" ON)
 option(EDR_WITH_LINUX_COLLECTOR "On Linux, build collector_linux.c instead of collector_stub.c" ON)
-set(EDR_P0_RULES_BUNDLE_VERSION
-  "edr-dynamic-rules-v1-r276-2b3b6a19"
-  CACHE STRING "P0/dynamic rule bundle version")
 set(EDR_AGENT_VERSION_STRING
   "${PROJECT_VERSION}"
   CACHE STRING "Agent version string reported to the platform")
@@ -57,40 +74,241 @@ option(EDR_CREATE_LEGACY_AGENT_ALIAS "Create legacy edr_agent.exe alias next to 
 option(EDR_WITH_YARA "Enable libyara for known exploit rules" ON)
 option(EDR_REQUIRE_YARA "Fail configure when libyara is unavailable" OFF)
 option(EDR_REQUIRE_SQLITE "Fail configure when SQLite3 is unavailable" OFF)
+option(EDR_REQUIRE_PCRE2 "Fail configure when PCRE2 is unavailable for the P0 matcher" ON)
+set(EDR_PCRE2_PRODUCER_TARGET "" CACHE STRING
+  "Fresh static PCRE2 target (linux/amd64, linux/arm64, windows/amd64, windows/arm64)")
+set(EDR_PCRE2_VCPKG_ROOT "" CACHE PATH
+  "Clean locked vcpkg checkout used to rebuild the production PCRE2 matcher")
+option(EDR_P0_RULE_IR_ALLOW_TEST_STUB
+  "Allow p0_rule_ir_stub.c only in an explicit non-production CTest build" OFF)
 option(EDR_WITH_FORENSIC_COLLECTOR "Build the standalone forensic_collector binary" ON)
 if(EDR_REQUIRE_YARA AND NOT EDR_WITH_YARA)
   message(FATAL_ERROR "EDR_REQUIRE_YARA=ON requires EDR_WITH_YARA=ON")
 endif()
 
-set(EDR_PCRE2_AVAILABLE 0)
-set(EDR_PCRE2_TARGET "")
-find_package(PCRE2 CONFIG QUIET)
-if(TARGET PCRE2::8BIT)
-  set(EDR_PCRE2_AVAILABLE 1)
-  set(EDR_PCRE2_TARGET PCRE2::8BIT)
-elseif(TARGET PCRE2::pcre2-8)
-  set(EDR_PCRE2_AVAILABLE 1)
-  set(EDR_PCRE2_TARGET PCRE2::pcre2-8)
+set(_edr_p0_rule_ir_release_or_production FALSE)
+if(CMAKE_CONFIGURATION_TYPES)
+  foreach(_edr_p0_rule_ir_config IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOLOWER "${_edr_p0_rule_ir_config}" _edr_p0_rule_ir_config_lc)
+    if(_edr_p0_rule_ir_config_lc MATCHES "^(release|relwithdebinfo|minsizerel|production)$")
+      set(_edr_p0_rule_ir_release_or_production TRUE)
+    endif()
+  endforeach()
 else()
-  find_path(EDR_PCRE2_INCLUDE_DIR NAMES pcre2.h
-    PATHS
-      ENV PCRE2_ROOT
-      "$ENV{PCRE2_ROOT}/include"
-      /opt/homebrew/include
-      /usr/local/include
-      "C:/vcpkg/installed/x64-windows/include")
-  find_library(EDR_PCRE2_LIBRARY NAMES pcre2-8 pcre2-8-static
-    PATHS
-      ENV PCRE2_ROOT
-      "$ENV{PCRE2_ROOT}/lib"
-      /opt/homebrew/lib
-      /usr/local/lib
-      "C:/vcpkg/installed/x64-windows/lib")
-  if(EDR_PCRE2_INCLUDE_DIR AND EDR_PCRE2_LIBRARY)
-    set(EDR_PCRE2_AVAILABLE 1)
+  string(TOLOWER "${CMAKE_BUILD_TYPE}" _edr_p0_rule_ir_config_lc)
+  if(_edr_p0_rule_ir_config_lc MATCHES "^(release|relwithdebinfo|minsizerel|production)$")
+    set(_edr_p0_rule_ir_release_or_production TRUE)
   endif()
 endif()
-message(STATUS "P0 IR rule engine PCRE2 support: ${EDR_PCRE2_AVAILABLE}")
+
+set(_edr_pcre2_explicit_test_stub FALSE)
+if(EDR_BUILD_TESTS AND EDR_P0_RULE_IR_ALLOW_TEST_STUB AND NOT EDR_REQUIRE_PCRE2 AND
+   NOT _edr_p0_rule_ir_release_or_production)
+  set(_edr_pcre2_explicit_test_stub TRUE)
+endif()
+
+set(EDR_PCRE2_AVAILABLE 0)
+set(EDR_PCRE2_TARGET "")
+
+function(_edr_pcre2_require_below root_path candidate_path label output_variable)
+  file(TO_CMAKE_PATH "${candidate_path}" _edr_pcre2_candidate_cmake_path)
+  if(NOT EXISTS "${_edr_pcre2_candidate_cmake_path}")
+    message(FATAL_ERROR "Production PCRE2 ${label} does not exist")
+  endif()
+  get_filename_component(_edr_pcre2_root_real "${root_path}" REALPATH)
+  get_filename_component(_edr_pcre2_candidate_real "${_edr_pcre2_candidate_cmake_path}" REALPATH)
+  file(RELATIVE_PATH _edr_pcre2_relative
+    "${_edr_pcre2_root_real}" "${_edr_pcre2_candidate_real}")
+  if(_edr_pcre2_relative STREQUAL "" OR
+     _edr_pcre2_relative MATCHES "^\\.\\.($|[/\\\\])" OR
+     IS_ABSOLUTE "${_edr_pcre2_relative}")
+    message(FATAL_ERROR "Production PCRE2 ${label} escapes the build-owned producer root")
+  endif()
+  set(${output_variable} "${_edr_pcre2_candidate_real}" PARENT_SCOPE)
+endfunction()
+
+function(_edr_pcre2_json_member json member output_variable)
+  string(JSON _edr_pcre2_member_value ERROR_VARIABLE _edr_pcre2_json_error
+    GET "${json}" "${member}")
+  if(NOT "${_edr_pcre2_json_error}" STREQUAL "NOTFOUND")
+    message(FATAL_ERROR
+      "Production PCRE2 producer returned invalid structured result for ${member}: ${_edr_pcre2_json_error}")
+  endif()
+  set(${output_variable} "${_edr_pcre2_member_value}" PARENT_SCOPE)
+endfunction()
+
+if(_edr_pcre2_explicit_test_stub)
+  message(WARNING "P0 IR rule engine PCRE2 support: explicit NON-PRODUCTION CTest stub selected; this build cannot publish or enforce P0 rules")
+else()
+  if(EDR_P0_RULE_IR_ALLOW_TEST_STUB AND NOT EDR_REQUIRE_PCRE2)
+    message(FATAL_ERROR
+      "p0_rule_ir_stub.c is allowed only with EDR_BUILD_TESTS=ON, "
+      "EDR_REQUIRE_PCRE2=OFF, EDR_P0_RULE_IR_ALLOW_TEST_STUB=ON, and a non-production configuration.")
+  endif()
+  if(NOT EDR_REQUIRE_PCRE2)
+    message(FATAL_ERROR
+      "PCRE2 8-bit support is required for production/release P0 matcher builds. "
+      "p0_rule_ir_stub.c is allowed only with EDR_BUILD_TESTS=ON, "
+      "EDR_REQUIRE_PCRE2=OFF, EDR_P0_RULE_IR_ALLOW_TEST_STUB=ON, and a non-production configuration.")
+  endif()
+  if(DEFINED EDR_PCRE2_MATCHER_CONTRACT_PATH OR DEFINED EDR_PCRE2_STATIC_PREFIX)
+    message(FATAL_ERROR
+      "Production PCRE2 matcher builds reject caller-supplied "
+      "EDR_PCRE2_MATCHER_CONTRACT_PATH and EDR_PCRE2_STATIC_PREFIX. "
+      "CMake rebuilds and verifies the static matcher in its build-owned producer root.")
+  endif()
+  if(NOT EDR_PCRE2_PRODUCER_TARGET OR NOT EDR_PCRE2_VCPKG_ROOT)
+    message(FATAL_ERROR
+      "Production PCRE2 matcher builds require EDR_PCRE2_PRODUCER_TARGET and "
+      "EDR_PCRE2_VCPKG_ROOT. System PCRE2 discovery is not accepted by this production gate.")
+  endif()
+  if(NOT IS_DIRECTORY "${EDR_PCRE2_VCPKG_ROOT}")
+    message(FATAL_ERROR "Production PCRE2 locked vcpkg root does not exist")
+  endif()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  # This is the only mutable producer root accepted by production CMake.  It
+  # is reconstructed on *every* configure, so an archive from a prior
+  # invocation cannot be relinked merely by self-reporting matching hashes.
+  get_filename_component(_edr_pcre2_binary_dir_real "${CMAKE_BINARY_DIR}" REALPATH)
+  set(_edr_pcre2_producer_root "${_edr_pcre2_binary_dir_real}/edr-pcre2-producer")
+  get_filename_component(_edr_pcre2_producer_parent "${_edr_pcre2_producer_root}" DIRECTORY)
+  if(NOT "${_edr_pcre2_producer_parent}" STREQUAL "${_edr_pcre2_binary_dir_real}")
+    message(FATAL_ERROR "Production PCRE2 producer root must be an exact child of CMAKE_BINARY_DIR")
+  endif()
+  if(EXISTS "${_edr_pcre2_producer_root}" OR IS_SYMLINK "${_edr_pcre2_producer_root}")
+    if(IS_SYMLINK "${_edr_pcre2_producer_root}")
+      message(FATAL_ERROR "Production PCRE2 producer root must not be a symlink")
+    endif()
+    get_filename_component(_edr_pcre2_existing_root_real
+      "${_edr_pcre2_producer_root}" REALPATH)
+    if(NOT "${_edr_pcre2_existing_root_real}" STREQUAL "${_edr_pcre2_producer_root}")
+      message(FATAL_ERROR "Production PCRE2 producer root realpath is unsafe")
+    endif()
+    file(REMOVE_RECURSE "${_edr_pcre2_producer_root}")
+  endif()
+  file(MAKE_DIRECTORY "${_edr_pcre2_producer_root}")
+  if(IS_SYMLINK "${_edr_pcre2_producer_root}")
+    message(FATAL_ERROR "Production PCRE2 producer root must not be a symlink")
+  endif()
+  set(_edr_pcre2_contract_path "${_edr_pcre2_producer_root}/p0_matcher_contract.json")
+
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/produce_pcre2_matcher_contract.py"
+      --vcpkg-root "${EDR_PCRE2_VCPKG_ROOT}"
+      --producer-root "${_edr_pcre2_producer_root}"
+      --output "${_edr_pcre2_contract_path}"
+      --target "${EDR_PCRE2_PRODUCER_TARGET}"
+    RESULT_VARIABLE _edr_pcre2_produce_result
+    OUTPUT_VARIABLE _edr_pcre2_produce_output
+    ERROR_VARIABLE _edr_pcre2_produce_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT _edr_pcre2_produce_result EQUAL 0 OR NOT _edr_pcre2_produce_output)
+    message(FATAL_ERROR
+      "Production PCRE2 matcher source build failed: ${_edr_pcre2_produce_error}")
+  endif()
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "schema" _edr_pcre2_produce_schema)
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "mode" _edr_pcre2_produce_mode)
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "target" _edr_pcre2_produce_target)
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "contract_path" _edr_pcre2_result_contract)
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "prefix" _edr_pcre2_result_prefix)
+  _edr_pcre2_json_member("${_edr_pcre2_produce_output}" "contract_sha256" _edr_pcre2_result_contract_sha256)
+  if(NOT "${_edr_pcre2_produce_schema}" STREQUAL "edr.p0.matcher-producer-result.v1" OR
+     NOT "${_edr_pcre2_produce_mode}" STREQUAL "build" OR
+     NOT "${_edr_pcre2_produce_target}" STREQUAL "${EDR_PCRE2_PRODUCER_TARGET}")
+    message(FATAL_ERROR "Production PCRE2 producer returned an unexpected structured build result")
+  endif()
+  _edr_pcre2_require_below("${_edr_pcre2_producer_root}" "${_edr_pcre2_result_contract}"
+    "matcher contract" _edr_pcre2_contract_real)
+  _edr_pcre2_require_below("${_edr_pcre2_producer_root}" "${_edr_pcre2_result_prefix}"
+    "static prefix" _edr_pcre2_prefix_real)
+  if(NOT "${_edr_pcre2_contract_real}" STREQUAL "${_edr_pcre2_contract_path}")
+    message(FATAL_ERROR "Production PCRE2 producer returned an unexpected matcher contract path")
+  endif()
+  file(SHA256 "${_edr_pcre2_contract_real}" _edr_pcre2_contract_sha256)
+  if(NOT "${_edr_pcre2_contract_sha256}" STREQUAL "${_edr_pcre2_result_contract_sha256}")
+    message(FATAL_ERROR "Production PCRE2 producer result contract hash does not match its build-owned contract")
+  endif()
+
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/produce_pcre2_matcher_contract.py"
+      --verify-contract "${_edr_pcre2_contract_real}"
+      --prefix "${_edr_pcre2_prefix_real}"
+      --target "${EDR_PCRE2_PRODUCER_TARGET}"
+      --vcpkg-root "${EDR_PCRE2_VCPKG_ROOT}"
+    RESULT_VARIABLE _edr_pcre2_verify_result
+    OUTPUT_VARIABLE _edr_pcre2_verify_output
+    ERROR_VARIABLE _edr_pcre2_verify_error
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT _edr_pcre2_verify_result EQUAL 0 OR NOT _edr_pcre2_verify_output)
+    message(FATAL_ERROR
+      "Production PCRE2 matcher provenance verification failed: ${_edr_pcre2_verify_error}")
+  endif()
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "schema" _edr_pcre2_verify_schema)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "mode" _edr_pcre2_verify_mode)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "target" _edr_pcre2_verify_target)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "contract_path" _edr_pcre2_verify_contract)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "prefix" _edr_pcre2_verify_prefix)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "library" _edr_pcre2_verify_library)
+  _edr_pcre2_json_member("${_edr_pcre2_verify_output}" "contract_sha256" _edr_pcre2_verify_contract_sha256)
+  _edr_pcre2_require_below("${_edr_pcre2_producer_root}" "${_edr_pcre2_verify_contract}"
+    "verified matcher contract" _edr_pcre2_verify_contract_real)
+  _edr_pcre2_require_below("${_edr_pcre2_producer_root}" "${_edr_pcre2_verify_prefix}"
+    "verified static prefix" _edr_pcre2_verify_prefix_real)
+  if(NOT "${_edr_pcre2_verify_schema}" STREQUAL "edr.p0.matcher-producer-result.v1" OR
+     NOT "${_edr_pcre2_verify_mode}" STREQUAL "verify" OR
+     NOT "${_edr_pcre2_verify_target}" STREQUAL "${EDR_PCRE2_PRODUCER_TARGET}" OR
+     NOT "${_edr_pcre2_verify_contract_real}" STREQUAL "${_edr_pcre2_contract_real}" OR
+     NOT "${_edr_pcre2_verify_prefix_real}" STREQUAL "${_edr_pcre2_prefix_real}" OR
+     NOT "${_edr_pcre2_verify_contract_sha256}" STREQUAL "${_edr_pcre2_contract_sha256}")
+    message(FATAL_ERROR "Production PCRE2 producer returned an unexpected structured verification result")
+  endif()
+  _edr_pcre2_require_below("${_edr_pcre2_prefix_real}" "${_edr_pcre2_verify_library}"
+    "static library" _edr_pcre2_library_real)
+  if(NOT EXISTS "${_edr_pcre2_prefix_real}/include/pcre2.h")
+    message(FATAL_ERROR "Production PCRE2 producer returned an unsafe static prefix")
+  endif()
+  add_library(edr_pcre2_static STATIC IMPORTED GLOBAL)
+  set_target_properties(edr_pcre2_static PROPERTIES
+    IMPORTED_LOCATION "${_edr_pcre2_library_real}"
+    INTERFACE_INCLUDE_DIRECTORIES "${_edr_pcre2_prefix_real}/include")
+  if(WIN32)
+    # The isolated Windows prefix is a static vcpkg archive; avoid importing
+    # a similarly named DLL from the ordinary product dependency prefix.
+    set_property(TARGET edr_pcre2_static APPEND PROPERTY
+      INTERFACE_COMPILE_DEFINITIONS PCRE2_STATIC)
+  endif()
+  set(EDR_PCRE2_MATCHER_CONTRACT_SHA256 "${_edr_pcre2_contract_sha256}"
+    CACHE INTERNAL "Verified producer matcher contract hash bound to this build" FORCE)
+  set(EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH "${_edr_pcre2_contract_real}"
+    CACHE INTERNAL "Build-owned PCRE2 matcher contract audit artifact" FORCE)
+  set(EDR_PCRE2_STATIC_PREFIX_AUDIT_PATH "${_edr_pcre2_prefix_real}"
+    CACHE INTERNAL "Build-owned static PCRE2 prefix audit artifact" FORCE)
+  set(EDR_PCRE2_PRODUCER_ROOT_AUDIT_PATH "${_edr_pcre2_producer_root}"
+    CACHE INTERNAL "Build-owned fresh PCRE2 producer root" FORCE)
+  set(EDR_PCRE2_AVAILABLE 1)
+  set(EDR_PCRE2_TARGET edr_pcre2_static)
+  message(STATUS
+    "P0 IR rule engine PCRE2 support: fresh build-owned static producer contract "
+    "${EDR_PCRE2_MATCHER_CONTRACT_SHA256} (${EDR_PCRE2_PRODUCER_TARGET})")
+endif()
+
+if(NOT _edr_pcre2_explicit_test_stub AND NOT EDR_PCRE2_AVAILABLE)
+  message(FATAL_ERROR
+    "PCRE2 8-bit support is required for production/release P0 matcher builds. "
+    "p0_rule_ir_stub.c is allowed only with EDR_BUILD_TESTS=ON, "
+    "EDR_REQUIRE_PCRE2=OFF, EDR_P0_RULE_IR_ALLOW_TEST_STUB=ON, and a non-production configuration.")
+endif()
+if(EDR_PCRE2_AVAILABLE)
+  set(EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess/p0_rule_ir.c")
+else()
+  # This is reachable only through the explicit non-production CTest stub
+  # gate above.  Tests must use this same source selector rather than naming
+  # the real PCRE2 implementation directly.
+  set(EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c")
+endif()
 
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
@@ -282,7 +500,12 @@ set(EDR_AGENT_SOURCES
   src/preprocess/enrich_parent_info.c
   src/preprocess/emit_rules.c
   src/preprocess/encrypt_p0_rules.c
+  src/preprocess/p0_source_only_contract.c
   src/preprocess/p0_rule_direct_emit.c
+  src/preprocess/process_create_coalescer.c
+  src/preprocess/process_generation.c
+  src/preprocess/windows_file_identity.c
+  src/preprocess/process_evidence_worker.c
   src/preprocess/p0_rule_match.c
   src/preprocess/process_chain_depth.c
   src/preprocess/preprocess_env.c
@@ -363,13 +586,7 @@ set(EDR_AGENT_SOURCES
   src/ave/ave_db_update.c
   third_party/cjson/cJSON.c
 )
-if(EDR_PCRE2_AVAILABLE)
-  list(APPEND EDR_AGENT_SOURCES
-    src/preprocess/p0_rule_ir.c
-  )
-else()
-  list(APPEND EDR_AGENT_SOURCES src/preprocess/p0_rule_ir_stub.c)
-endif()
+list(APPEND EDR_AGENT_SOURCES ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE})
 if(WIN32)
   list(APPEND EDR_AGENT_SOURCES src/ave/ave_sign_whitelist_win.c)
   list(APPEND EDR_AGENT_SOURCES resources/FDSensor.rc)
@@ -562,7 +779,6 @@ target_compile_definitions(edr_agent PRIVATE
   EDR_HAVE_NANOPB=1
   "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
   "EDR_AGENT_UPDATE_SCRIPT_PATH=\"edr_agent_inplace_update.ps1\""
-  "EDR_P0_RULES_BUNDLE_VERSION=\"${EDR_P0_RULES_BUNDLE_VERSION}\""
 )
 if(MSVC)
   target_compile_definitions(edr_agent PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)

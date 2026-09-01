@@ -16,6 +16,11 @@
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  /* A parent may be selected only when these are captured from the same
+   * lifecycle generation.  `start_time_ns` is the ETW event-time interval
+   * selector; it is not a substitute for either generation fact. */
+  uint64_t process_start_key;
+  uint64_t creation_filetime_100ns;
   uint64_t start_time_ns;
   uint64_t last_seen_ns;
   uint64_t exit_time_ns;
@@ -37,6 +42,17 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      const char *exe_path, const char *parent_name,
                      uint64_t start_time_ns);
 
+/* Insert or update one exact process generation.  Unlike the legacy cache
+ * helper above, this never lets a later PID reuse overwrite an earlier
+ * generation that can still be selected by a delayed child event's source
+ * timestamp.  Both generation values must be non-zero. */
+int edr_pt_cache_put_generation(uint32_t pid, uint32_t ppid,
+                                const char *process_name, const char *cmdline,
+                                const char *exe_path, const char *parent_name,
+                                uint64_t start_time_ns,
+                                uint64_t process_start_key,
+                                uint64_t creation_filetime_100ns);
+
 /** 根据 PID 查找内部条目；仅可在缓存实现内部持锁调用。 */
 const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid);
 
@@ -52,6 +68,11 @@ int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEn
 /** 标记进程退出，保留短暂迟到告警宽限。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns);
 
+/* Mark only the matching ProcessStartKey generation exited.  PID-only exit
+ * notifications are intentionally not an authority to close a newer reuse. */
+int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t process_start_key,
+                                      uint64_t exit_time_ns);
+
 /** 移除条目。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_remove(uint32_t pid);
 
@@ -65,6 +86,16 @@ void edr_pt_cache_fill_record(uint32_t pid,
                               uint32_t *out_grandparent_pid,
                               char *parent_cmdline,    size_t pc_cap,
                               uint32_t *out_chain_depth);
+
+/* Event-time variant used by P0 enrichment.  It traverses the same historical
+ * generation interval for every parent hop, so a delayed child cannot borrow
+ * a later PID reuse's parent chain. */
+void edr_pt_cache_fill_record_at(uint32_t pid, uint64_t event_time_ns,
+                                 char *grandparent_name, size_t gn_cap,
+                                 char *grandparent_path, size_t gp_cap,
+                                 uint32_t *out_grandparent_pid,
+                                 char *parent_cmdline, size_t pc_cap,
+                                 uint32_t *out_chain_depth);
 
 typedef struct {
   uint64_t puts;

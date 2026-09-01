@@ -1,4 +1,5 @@
 #include "edr/response.h"
+#include "edr/response_utils.h"
 #include "edr/command_util.h"
 #include "edr/config.h"
 #include "edr/deep_collector.h"
@@ -124,6 +125,53 @@ void response_sanitize_job_name(const char *src, char *dst, size_t cap) {
     return;
   }
   dst[j] = '\0';
+}
+
+int response_forensic_build_collector_paths(const char *outdir, char separator,
+                                            const char *scope, const char *job,
+                                            long long timestamp, const char *artifact_ext,
+                                            char *reqpath, size_t reqpath_cap,
+                                            char *artifact, size_t artifact_cap,
+                                            char *extra_args, size_t extra_args_cap) {
+  int written;
+  if (!reqpath || reqpath_cap == 0u || !artifact || artifact_cap == 0u ||
+      !extra_args || extra_args_cap == 0u) {
+    return -1;
+  }
+  reqpath[0] = '\0';
+  artifact[0] = '\0';
+  extra_args[0] = '\0';
+  if (!outdir || !outdir[0] || !scope || !scope[0] || !job || !job[0] ||
+      !artifact_ext || !artifact_ext[0]) {
+    return -1;
+  }
+
+  written = snprintf(reqpath, reqpath_cap, "%s%c%s_%s_%lld.req",
+                     outdir, separator, scope, job, timestamp);
+  if (written < 0 || (size_t)written >= reqpath_cap) {
+    goto invalid;
+  }
+  written = snprintf(artifact, artifact_cap, "%s%c%s_%s_%lld.%s",
+                     outdir, separator, scope, job, timestamp, artifact_ext);
+  if (written < 0 || (size_t)written >= artifact_cap) {
+    goto invalid;
+  }
+  written = snprintf(extra_args, extra_args_cap, "--request=%s --out-file=%s",
+                     reqpath, artifact);
+  if (written < 0 || (size_t)written >= extra_args_cap) {
+    goto invalid;
+  }
+  return 0;
+
+invalid:
+  reqpath[0] = '\0';
+  artifact[0] = '\0';
+  extra_args[0] = '\0';
+  return -1;
+}
+
+int response_forensic_external_failure_must_not_fallback(int collector_rc) {
+  return collector_rc == EDR_FORENSIC_EXTERNAL_ERR_BOUNDS;
 }
 
 int response_mkdir_p(const char *path) {

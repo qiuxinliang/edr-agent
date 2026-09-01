@@ -14,7 +14,7 @@ fi
 BIN="${BDIR}/test_event_bus_mpmc_stress"
 if [[ ! -e "$BIN" ]]; then
   echo "缺少: $BIN" >&2
-  echo "请先: cmake -S \"${ROOT}\" -B \"${BDIR}\" -G Ninja -DEDR_WITH_GRPC=OFF && cmake --build \"${BDIR}\" --target test_event_bus_mpmc_stress" >&2
+  echo "请先: cmake -S \"${ROOT}\" -B \"${BDIR}\" -G Ninja && cmake --build \"${BDIR}\" --target test_event_bus_mpmc_stress" >&2
   exit 1
 fi
 if [[ $# -eq 0 ]]; then

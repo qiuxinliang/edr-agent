@@ -17,6 +17,11 @@ extern "C" {
 #define EDR_P0_ENCRYPT_NONCE_LEN 12u
 #define EDR_P0_ENCRYPT_TAG_LEN 16u
 #define EDR_P0_ENCRYPT_OVERHEAD (EDR_P0_ENCRYPT_MAGIC_LEN + EDR_P0_ENCRYPT_NONCE_LEN + EDR_P0_ENCRYPT_TAG_LEN)
+/* Release contract shared with the backend publisher: the full EDR1 envelope
+ * is bounded at 4 MiB, so AES-GCM plaintext is bounded at envelope - 32 B. */
+#define EDR_P0_ENCRYPT_ENVELOPE_MAX_BYTES (4u * 1024u * 1024u)
+#define EDR_P0_ENCRYPT_PLAINTEXT_MAX_BYTES \
+  (EDR_P0_ENCRYPT_ENVELOPE_MAX_BYTES - EDR_P0_ENCRYPT_OVERHEAD)
 
 /**
  * 判断字节序列是否以 EDR1 魔数开头。
@@ -32,6 +37,13 @@ int edr_p0_encrypt_is_edr1(const uint8_t *data, size_t data_len);
  * @return 0 成功，-1 参数无效，-2 缓冲区/长度，-3 解密或认证失败，-4 未编译加密支持
  */
 int edr_p0_encrypt_decrypt_edr1(const uint8_t *in, size_t in_len, uint8_t **out, size_t *out_len);
+
+#ifdef EDR_P0_ENCRYPT_TESTING
+/* Test-only producer keeps the envelope boundary fixture on the exact same
+ * AES-GCM implementation as the deployed decryptor. */
+int edr_p0_encrypt_encrypt_edr1_for_test(const uint8_t *plain, size_t plain_len,
+                                         uint8_t **out, size_t *out_len);
+#endif
 
 #ifdef __cplusplus
 }

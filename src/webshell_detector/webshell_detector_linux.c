@@ -253,28 +253,79 @@ static void normalize_path(char *s) {
   }
 }
 
-static void infer_web_url(const WebRoot *root, const char *file_path, char *out, size_t out_cap) {
-  if (!root || !out || out_cap == 0u) {
-    return;
-  }
+static int infer_web_url(const WebRoot *root, const char *file_path, char *out, size_t out_cap) {
+  const char *rel;
+  const char *scheme;
+  size_t root_len;
+  size_t scheme_len;
+  size_t host_len;
+  size_t rel_len;
+  size_t port_len = 0u;
+  size_t used;
   char host[128] = "localhost";
-  (void)gethostname(host, sizeof(host));
-  const char *rel = file_path + strlen(root->root);
+  char port_text[6];
+  char rel_norm[PATH_MAX];
+  int n;
+  if (!root || !file_path || !out || out_cap == 0u || !root->root[0]) {
+    return 0;
+  }
+  out[0] = '\0';
+  root_len = strlen(root->root);
+  if (strncmp(file_path, root->root, root_len) != 0 ||
+      (file_path[root_len] != '\0' && file_path[root_len] != '/' && file_path[root_len] != '\\')) {
+    return 0;
+  }
+  if (gethostname(host, sizeof(host)) != 0) {
+    memcpy(host, "localhost", sizeof("localhost"));
+  } else {
+    host[sizeof(host) - 1u] = '\0';
+  }
+  rel = file_path + root_len;
   if (*rel == '/' || *rel == '\\') {
     rel++;
   }
-  char rel_norm[PATH_MAX];
-  snprintf(rel_norm, sizeof(rel_norm), "/%s", rel);
-  normalize_path(rel_norm);
-  if (root->port == 80u) {
-    snprintf(out, out_cap, "http://%s%s", host, rel_norm);
-  } else if (root->port == 443u) {
-    snprintf(out, out_cap, "https://%s%s", host, rel_norm);
-  } else {
-    snprintf(out, out_cap, "http://%s:%u%s", host, (unsigned)root->port, rel_norm);
+  if (strlen(rel) > sizeof(rel_norm) - 2u) {
+    return 0;
   }
+  rel_norm[0] = '/';
+  memcpy(rel_norm + 1u, rel, strlen(rel) + 1u);
+  normalize_path(rel_norm);
+  if (root->port == 443u) {
+    scheme = "https://";
+  } else {
+    scheme = "http://";
+  }
+  scheme_len = strlen(scheme);
+  host_len = strlen(host);
+  rel_len = strlen(rel_norm);
+  if (root->port != 80u && root->port != 443u) {
+    n = snprintf(port_text, sizeof(port_text), "%u", (unsigned)root->port);
+    if (n < 0 || (size_t)n >= sizeof(port_text)) {
+      return 0;
+    }
+    port_len = (size_t)n;
+  }
+  if (scheme_len > out_cap - 1u || host_len > out_cap - 1u - scheme_len ||
+      port_len > out_cap - 1u - scheme_len - host_len ||
+      rel_len > out_cap - 1u - scheme_len - host_len - port_len ||
+      (port_len && out_cap - 1u - scheme_len - host_len - port_len - rel_len < 1u)) {
+    return 0;
+  }
+  used = 0u;
+  memcpy(out + used, scheme, scheme_len);
+  used += scheme_len;
+  memcpy(out + used, host, host_len);
+  used += host_len;
+  if (port_len) {
+    out[used++] = ':';
+    memcpy(out + used, port_text, port_len);
+    used += port_len;
+  }
+  memcpy(out + used, rel_norm, rel_len + 1u);
+  return 1;
 }
 
+#ifdef EDR_HAVE_YARA
 static float confidence_for_rule(const char *rule) {
   if (!rule || !rule[0]) {
     return 0.0f;
@@ -305,6 +356,7 @@ static float confidence_for_rule(const char *rule) {
   }
   return 0.60f;
 }
+#endif
 
 static int read_file_small(const char *path, char **out_buf, size_t *out_len) {
   *out_buf = NULL;
@@ -546,6 +598,7 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
   char object_key[512];
   char staged_path[1024];
   int file_uploaded = 0;
+  const char *url_status;
   edr_webshell_make_alert_id(alert_id, sizeof(alert_id));
   if (edr_webshell_file_fingerprint(path, fp, sizeof(fp)) != 0) {
     fp[0] = '\0';
@@ -571,7 +624,15 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
       }
     }
   }
-  infer_web_url(root, path, url, sizeof(url));
+  if (!infer_web_url(root, path, url, sizeof(url))) {
+    /* Keep the detection durable even when its optional display URL cannot
+     * fit without truncation.  The emitted status makes that degradation
+     * visible instead of presenting an ambiguous partial URL. */
+    snprintf(url, sizeof(url), "%s", "unavailable");
+    url_status = "unavailable";
+  } else {
+    url_status = "complete";
+  }
   EdrEventSlot slot;
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = now_ns();
@@ -580,10 +641,10 @@ static int push_alert_event(const char *path, const char *action, const WebRoot 
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
                    "ETW1\nprov=webshell\ndetector=%s\nrule=%s\nscore=%.6f\nfile=%s\nscript=service=%s action=%s "
-                   "url=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s ast_score=%.3f "
+                   "url=%s url_status=%s alert_id=%s file_fp=%s file_uploaded=%d object_key=%s local_path=%s ast_score=%.3f "
                    "token_score=%.3f\n",
                    strncmp(m->rule_name, "WebShell_AST_Token_", 19u) == 0 ? "semantic" : "yara", m->rule_name,
-                   m->confidence, path, root->service_name, action ? action : "-", url, alert_id, fp[0] ? fp : "-",
+                   m->confidence, path, root->service_name, action ? action : "-", url, url_status, alert_id, fp[0] ? fp : "-",
                    file_uploaded, object_key[0] ? object_key : "-", staged_path[0] ? staged_path : "-", m->ast_score,
                    m->token_score);
   if (n < 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
@@ -824,7 +885,9 @@ void edr_webshell_detector_shutdown(void) {
   s_stop = 1;
   if (s_pipe[1] >= 0) {
     char b = 0;
-    (void)write(s_pipe[1], &b, 1);
+    if (write(s_pipe[1], &b, 1) != 1 && errno != EAGAIN && errno != EINTR) {
+      fprintf(stderr, "[webshell_detector] shutdown pipe write failed: %s\n", strerror(errno));
+    }
   }
   (void)pthread_join(s_thread, NULL);
   if (s_ifd >= 0) {

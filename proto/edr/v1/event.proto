@@ -79,6 +79,10 @@ message BehaviorAlert {
   // 进程快照冗余：同时写入 BehaviorEvent.ppid/cmdline，兼容只解析外层事件的旧平台。
   uint32 ppid = 12;
   string cmdline = 13;
+  // user_subject_json is the sole subject JSON authority. Its availability is
+  // explicit for pure alerts that have no subject context to serialize.
+  string user_subject_status = 14;
+  string user_subject_withheld_reason = 15;
 }
 
 // BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。
@@ -130,6 +134,39 @@ message BehaviorEvent {
   string creator_logon_id = 48;
   string identity_source = 49;
   string identity_quality = 50;
+
+  // Lossless process-generation and image-resolution evidence. These mirror
+  // EdrBehaviorRecord directly so ordinary alerts and source-only P0 records
+  // carry the same event-time provenance.
+  uint64 process_start_key = 51;
+  uint64 process_creation_filetime_100ns = 52;
+  string process_generation_source = 53;
+  string image_path_raw = 54;
+  string image_path_canonical = 55;
+  string image_path_namespace = 56;
+  string image_path_resolution_status = 57;
+  string image_path_resolution_source = 58;
+  string source_completeness = 59;
+  uint32 evidence_revision = 60;
+  string parent_resolution_status = 61;
+  string parent_resolution_source = 62;
+  // Parent creation time is a captured string only. No parent StartKey or
+  // FILETIME is implied when the Agent did not observe one.
+  string parent_creation_time = 63;
+
+  // Transport completeness is separate from source collection completeness.
+  // `truncated_fields` is a bounded, de-duplicated comma list: source-side
+  // withheld fields are qualified as `source.<field>`, while encoder-side
+  // projection clips keep their historic field names. An explicit `*.list_overflow`
+  // marker means the list of named fields is itself incomplete.
+  string transport_completeness = 64;
+  string truncated_fields = 65;
+
+  // Raw parent identity remains top-level so a file/network/registry detail
+  // does not displace it through the detail oneof. ProcessDetail remains the
+  // explicit legacy location for older producers and consumers.
+  string parent_name = 66;
+  string parent_path = 67;
 }
 
 message ProcessDetail {

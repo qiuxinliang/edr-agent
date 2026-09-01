@@ -61,12 +61,19 @@ static int only_velo(const char *command_type, void *user) {
 
 int main(void) {
   char state_dir[512];
-  char state_path[512];
+  char state_path[sizeof(state_dir) + sizeof("/command_state.jsonl")];
   char inbox_dir[512];
   char ack_dir[512];
   long long suffix = ((long long)time(NULL) * 100000LL) + (long long)TEST_PID;
   snprintf(state_dir, sizeof(state_dir), "./test_command_state_%lld", suffix);
-  snprintf(state_path, sizeof(state_path), "%s/command_state.jsonl", state_dir);
+  {
+    static const char state_filename[] = "/command_state.jsonl";
+    size_t state_dir_len = strlen(state_dir);
+    require_true(state_dir_len + sizeof(state_filename) <= sizeof(state_path),
+                 "state path fixture fits exactly");
+    memcpy(state_path, state_dir, state_dir_len);
+    memcpy(state_path + state_dir_len, state_filename, sizeof(state_filename));
+  }
   snprintf(inbox_dir, sizeof(inbox_dir), "./test_command_inbox_%lld", suffix);
   snprintf(ack_dir, sizeof(ack_dir), "./test_command_ack_%lld", suffix);
   test_setenv("EDR_COMMAND_STATE_DB", state_path);

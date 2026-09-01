@@ -22,8 +22,13 @@ void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_
 void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                 const EdrSoarCommandMeta *sm);
 
+/* A request which cannot be represented without truncating a collector path or
+ * metadata must fail closed rather than be retried through another action. */
+#define EDR_FORENSIC_EXTERNAL_ERR_BOUNDS (-101)
+
 /* 取证外移共享入口:跑外部 collector 生成产物,成功后由 agent 经 transport v2 上传(通信只走 agent)。
- * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/验签失败。 */
+ * 返回 0=成功(do_upload 时 minio_key 已填);>0=collector 非0退出;<0=启动/超时/验签失败；
+ * EDR_FORENSIC_EXTERNAL_ERR_BOUNDS 表示不可回退的完整性失败。 */
 int edr_response_forensic_run_external(const char *cmd_id, const char *scope, const uint8_t *payload,
                                        size_t payload_len, const char *artifact_ext, int do_upload,
                                        char *minio_key, size_t key_cap, char *detail,
@@ -38,7 +43,8 @@ int edr_response_yara_runtime_status(char *rules_dir, size_t rules_dir_cap,
 
 /* ── 取证异步生命周期(velo 采集硬取消支持)──
  * 受理:由 5 个 forensic 处理器在外移启用时调用,非阻塞 spawn + 登记单槽任务。
- *   返回 0=已受理(完成由 poll 上报终态); 1=busy(已有采集在跑); <0=spawn/解析/下载失败(调用方据此决定 in-process 回退)。 */
+ *   返回 0=已受理(完成由 poll 上报终态); 1=busy(已有采集在跑); <0=spawn/解析/下载失败；
+ *   仅非 EDR_FORENSIC_EXTERNAL_ERR_BOUNDS 的失败可按既有策略回退 in-process。 */
 int edr_response_forensic_async_accept(const char *cmd_id, const char *command_type,
                                        const EdrSoarCommandMeta *sm, const char *scope,
                                        const uint8_t *payload, size_t payload_len,

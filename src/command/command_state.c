@@ -2016,7 +2016,7 @@ int edr_command_state_request_cancel(const char *command_id,
     return EDR_COMMAND_STATE_CANCEL_ALREADY_FINAL;
   }
 
-  char cid[300], ctype[180], idem[1100], boot[100], line[1800];
+  char cid[300], ctype[180], idem[1100], boot[100], line[EDR_COMMAND_STATE_LINE_CAP];
   json_escape_to(cid, sizeof(cid), latest.command_id);
   json_escape_to(ctype, sizeof(ctype), latest.command_type);
   json_escape_to(idem, sizeof(idem), latest.idempotency_key);
@@ -2030,12 +2030,16 @@ int edr_command_state_request_cancel(const char *command_id,
 #else
   int pid = (int)getpid();
 #endif
-  snprintf(line, sizeof(line),
-           "{\"record\":\"command_state\",\"final\":0,\"command_id\":%s,\"command_type\":%s,"
-           "\"idempotency_key\":%s,\"response_status\":\"cancelling\",\"execution_status\":0,"
-           "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
-           "\"agent_boot_id\":%s,\"process_id\":%d}",
-           cid, ctype, idem, latest.retry_count, (long long)state_now_ms(), boot, pid);
+  int line_len = snprintf(line, sizeof(line),
+                          "{\"record\":\"command_state\",\"final\":0,\"command_id\":%s,\"command_type\":%s,"
+                          "\"idempotency_key\":%s,\"response_status\":\"cancelling\",\"execution_status\":0,"
+                          "\"exit_code\":0,\"retry_count\":%d,\"report_pending\":0,\"updated_unix_ms\":%lld,"
+                          "\"agent_boot_id\":%s,\"process_id\":%d}",
+                          cid, ctype, idem, latest.retry_count, (long long)state_now_ms(), boot, pid);
+  if (line_len < 0 || (size_t)line_len >= sizeof(line)) {
+    state_lock_release(lock);
+    return EDR_COMMAND_STATE_CANCEL_ERROR;
+  }
   int rc = append_state_line(line);
   state_lock_release(lock);
   return rc == 0 ? EDR_COMMAND_STATE_CANCEL_REQUESTED : EDR_COMMAND_STATE_CANCEL_ERROR;

@@ -27,6 +27,7 @@
 #include "edr/shellcode_detector.h"
 #include "edr/webshell_detector.h"
 #include "edr/preprocess.h"
+#include "edr/p0_rule_direct_emit.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -466,6 +467,8 @@ static int edr_agent_run_main(const char *config) {
     const EdrConfig *ac = edr_agent_get_config(agent);
     if (ac) {
       edr_storage_queue_configure(ac->offline.max_queue_size_mb, ac->offline.retention_hours);
+      edr_p0_rule_source_only_set_runtime_identity(ac->agent.tenant_id,
+                                                    ac->agent.endpoint_id);
     }
     if ((!qpath || !qpath[0]) && ac && ac->offline.queue_db_path[0]) {
       qpath = ac->offline.queue_db_path;
@@ -505,6 +508,13 @@ static int edr_agent_run_main(const char *config) {
         edr_agent_destroy(agent);
         return 1;
       }
+    }
+    /* A process restart starts P0 source-only capability fused. A historic
+     * latch first writes its deterministic loss audit through event_queue;
+     * only that commit plus queue/IR health can re-enable direct P0 work. */
+    if (!edr_p0_rule_source_only_recover_after_queue_open()) {
+      fprintf(stderr,
+              "[p0] source-only durable recovery pending; P0 enforcement remains disabled\n");
     }
   }
   {

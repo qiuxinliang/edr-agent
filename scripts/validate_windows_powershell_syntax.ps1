@@ -27,6 +27,7 @@ $relativePaths = @(
   "scripts\Initialize-VS2022Environment.ps1",
   "scripts\Assert-WindowsPeArchitecture.ps1",
   "scripts\Assert-WindowsInstallerBootstrapArchitecture.ps1",
+  "scripts\stage_vcpkg_runtime_dlls_build_release.ps1",
   "scripts\stage_msvc_runtime_dlls_build_release.ps1",
   "scripts\write_windows_package_capabilities.ps1",
   "scripts\test_windows_package_capabilities_contract.ps1",

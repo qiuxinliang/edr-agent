@@ -43,13 +43,6 @@ static int dc_sha256_file(const char *path, char out65[65]) {
   return rc;
 }
 
-/* 文件是否存在。 */
-static int dc_file_exists(const char *path) {
-  FILE *f = fopen(path, "rb");
-  if (f) { fclose(f); return 1; }
-  return 0;
-}
-
 /* 文件大小(字节);不存在/不可读返回 -1。可移植(fseek/ftell),无平台分支。 */
 static long dc_file_size(const char *path) {
   FILE *f = fopen(path, "rb");
@@ -60,7 +53,7 @@ static long dc_file_size(const char *path) {
   return sz;
 }
 
-/* 非空文件视为"就绪"。下载失败/中断常留 0 字节坏件,若仅用 dc_file_exists 会被当成已装而永不自愈。 */
+/* 非空文件视为"就绪"。下载失败/中断常留 0 字节坏件,仅检查存在会使其被当成已装而永不自愈。 */
 static int dc_file_nonempty(const char *path) { return dc_file_size(path) > 0; }
 
 /* url 基本合法性:必须 http(s):// 开头,且不含控制字符/引号/shell 元字符(纵深防御)。 */
@@ -100,6 +93,41 @@ static void dc_set_download_detail(const char *fmt, const char *a, unsigned long
   } else {
     snprintf(g_dc_download_detail, sizeof(g_dc_download_detail), fmt, b);
   }
+}
+
+/* The download detail is audit evidence.  Preserve an exit status even when
+ * the preceding diagnostic fills the bounded field; a labelled digest is
+ * preferable to silently dropping or prefix-truncating that diagnostic. */
+static void dc_note_curl_exit(unsigned long exit_code) {
+  const char *end = (const char *)memchr(g_dc_download_detail, '\0',
+                                         sizeof(g_dc_download_detail));
+  size_t previous_len = end ? (size_t)(end - g_dc_download_detail)
+                            : sizeof(g_dc_download_detail);
+  char suffix[32];
+  int suffix_len = snprintf(suffix, sizeof(suffix), "; curl exit=%lu", exit_code);
+  if (suffix_len <= 0 || (size_t)suffix_len >= sizeof(suffix)) {
+    dc_set_download_detail("curl exit=%lu", NULL, exit_code);
+    return;
+  }
+  if (previous_len == 0u) {
+    dc_set_download_detail("curl exit=%lu", NULL, exit_code);
+    return;
+  }
+  if (end && previous_len + (size_t)suffix_len < sizeof(g_dc_download_detail)) {
+    memcpy(g_dc_download_detail + previous_len, suffix, (size_t)suffix_len + 1u);
+    return;
+  }
+  {
+    char digest[65];
+    if (edr_sha256_hex((const uint8_t *)g_dc_download_detail, previous_len, digest) == 0) {
+      int n = snprintf(g_dc_download_detail, sizeof(g_dc_download_detail),
+                       "previous_download_detail_sha256=%s; curl exit=%lu", digest, exit_code);
+      if (n > 0 && (size_t)n < sizeof(g_dc_download_detail)) {
+        return;
+      }
+    }
+  }
+  dc_set_download_detail("curl exit=%lu", NULL, exit_code);
 }
 
 static const char *dc_last_download_detail(void) {
@@ -278,10 +306,7 @@ static int dc_download(const char *url, const char *dest) {
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   if (ec != 0) {
-    char prev[sizeof(g_dc_download_detail)];
-    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
-    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
-                           prev[0] ? prev : NULL, (unsigned long)ec);
+    dc_note_curl_exit((unsigned long)ec);
   }
   return ec == 0 ? 0 : -1;
 #else
@@ -319,10 +344,7 @@ static int dc_download(const char *url, const char *dest) {
     return 0;
   }
   if (WIFEXITED(st)) {
-    char prev[sizeof(g_dc_download_detail)];
-    snprintf(prev, sizeof(prev), "%s", g_dc_download_detail);
-    dc_set_download_detail(prev[0] ? "%s; curl exit=%lu" : "curl exit=%lu",
-                           prev[0] ? prev : NULL, (unsigned long)WEXITSTATUS(st));
+    dc_note_curl_exit((unsigned long)WEXITSTATUS(st));
   } else if (WIFSIGNALED(st)) {
     dc_set_download_detail("curl signal=%lu", NULL, (unsigned long)WTERMSIG(st));
   }
@@ -335,68 +357,110 @@ static int dc_hex64_ieq(const char *a, const char *b);
 /* 从小型 manifest JSON 中提取字符串字段 "key":"value"，并做标准 JSON 反转义。成功返回 0。
  * 关键:Go 的 json 编码默认把 URL 里的 '&' 转义成 &(还有 </>),
  * 若按字面照抄会得到含反斜杠的坏 URL(下载失败)。这里解码 \"、\\、\/、\n\t\r\b\f 及 \uXXXX(ASCII 直出/UTF-8)。 */
+static int dc_json_append(char *out, size_t cap, size_t *used, const char *data, size_t data_len) {
+  if (!out || !used || !data || *used >= cap || data_len >= cap - *used) {
+    return -1;
+  }
+  memcpy(out + *used, data, data_len);
+  *used += data_len;
+  return 0;
+}
+
 static int dc_json_str(const char *json, const char *key, char *out, size_t cap) {
   if (!json || !key || !out || cap == 0) return -1;
   out[0] = '\0';
   char needle[64];
-  snprintf(needle, sizeof(needle), "\"%s\"", key);
+  int needle_len = snprintf(needle, sizeof(needle), "\"%s\"", key);
+  if (needle_len <= 0 || (size_t)needle_len >= sizeof(needle)) goto invalid;
   const char *p = strstr(json, needle);
-  if (!p) return -1;
+  if (!p) goto invalid;
   p += strlen(needle);
   while (*p == ' ' || *p == ':' || *p == '\t') p++;
-  if (*p != '"') return -1; /* 仅取字符串值 */
+  if (*p != '"') goto invalid; /* 仅取字符串值 */
   p++;
   size_t i = 0;
-  while (*p && *p != '"' && i + 1 < cap) {
+  while (*p && *p != '"') {
     if (*p != '\\') {
-      out[i++] = *p++;
+      if (dc_json_append(out, cap, &i, p, 1u) != 0) goto invalid;
+      p++;
       continue;
     }
     /* 转义序列 */
     p++;
     char e = *p;
-    if (e == '\0') break;
+    if (e == '\0') goto invalid;
     switch (e) {
-      case '"': out[i++] = '"'; p++; break;
-      case '\\': out[i++] = '\\'; p++; break;
-      case '/': out[i++] = '/'; p++; break;
-      case 'n': out[i++] = '\n'; p++; break;
-      case 't': out[i++] = '\t'; p++; break;
-      case 'r': out[i++] = '\r'; p++; break;
-      case 'b': out[i++] = '\b'; p++; break;
-      case 'f': out[i++] = '\f'; p++; break;
+      case '"':
+        if (dc_json_append(out, cap, &i, "\"", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case '\\':
+        if (dc_json_append(out, cap, &i, "\\", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case '/':
+        if (dc_json_append(out, cap, &i, "/", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case 'n':
+        if (dc_json_append(out, cap, &i, "\n", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case 't':
+        if (dc_json_append(out, cap, &i, "\t", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case 'r':
+        if (dc_json_append(out, cap, &i, "\r", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case 'b':
+        if (dc_json_append(out, cap, &i, "\b", 1u) != 0) goto invalid;
+        p++;
+        break;
+      case 'f':
+        if (dc_json_append(out, cap, &i, "\f", 1u) != 0) goto invalid;
+        p++;
+        break;
       case 'u': {
         p++; /* 跳过 'u' */
         int v = 0, ok = 1;
         for (int k = 0; k < 4; k++) {
           char h = p[k];
           int d;
+          if (h == '\0') { ok = 0; break; }
           if (h >= '0' && h <= '9') d = h - '0';
           else if (h >= 'a' && h <= 'f') d = h - 'a' + 10;
           else if (h >= 'A' && h <= 'F') d = h - 'A' + 10;
           else { ok = 0; break; }
           v = v * 16 + d;
         }
-        if (!ok) { out[i++] = 'u'; break; } /* 非法 \u,退化保留 */
+        if (!ok || v == 0 || (v >= 0xD800 && v <= 0xDFFF)) goto invalid;
         p += 4;
         if (v < 0x80) {
-          out[i++] = (char)v;
+          char byte = (char)v;
+          if (dc_json_append(out, cap, &i, &byte, 1u) != 0) goto invalid;
         } else if (v < 0x800) {
-          if (i + 2 < cap) { out[i++] = (char)(0xC0 | (v >> 6)); out[i++] = (char)(0x80 | (v & 0x3F)); }
+          char bytes[2] = {(char)(0xC0 | (v >> 6)), (char)(0x80 | (v & 0x3F))};
+          if (dc_json_append(out, cap, &i, bytes, sizeof(bytes)) != 0) goto invalid;
         } else {
-          if (i + 3 < cap) {
-            out[i++] = (char)(0xE0 | (v >> 12));
-            out[i++] = (char)(0x80 | ((v >> 6) & 0x3F));
-            out[i++] = (char)(0x80 | (v & 0x3F));
-          }
+          char bytes[3] = {(char)(0xE0 | (v >> 12)),
+                           (char)(0x80 | ((v >> 6) & 0x3F)), (char)(0x80 | (v & 0x3F))};
+          if (dc_json_append(out, cap, &i, bytes, sizeof(bytes)) != 0) goto invalid;
         }
         break;
       }
-      default: out[i++] = e; p++; break;
+      default:
+        goto invalid;
     }
   }
+  if (*p != '"') goto invalid;
   out[i] = '\0';
-  return out[0] ? 0 : -1;
+  if (out[0]) return 0;
+
+invalid:
+  out[0] = '\0';
+  return -1;
 }
 
 /* manifest 是否标记 enabled:true(粗匹配,容忍空格)。 */

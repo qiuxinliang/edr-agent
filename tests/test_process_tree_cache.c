@@ -93,6 +93,42 @@ int main(void) {
   }
 
   {
+    /* A delayed child event must continue to select parent generation A after
+     * A exits and its PID is reused by B.  The real StartKey/FILETIME pair is
+     * stored with each historical entry; event time chooses the only valid
+     * parent interval instead of overwriting A with B. */
+    const uint32_t parent_pid = 7100u;
+    const uint32_t child_pid = 7101u;
+    uint64_t now = test_wall_ns();
+    uint64_t a_start = now - 800000000ULL;
+    uint64_t child_time = a_start + 100000000ULL;
+    uint64_t a_exit = a_start + 200000000ULL;
+    uint64_t b_start = a_start + 400000000ULL;
+    char parent_cmdline[EDR_PTC_STR_LONG];
+    assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-A.exe", "A --parent",
+                                       "C:/A.exe", "System", a_start,
+                                       0xa001u, 133700000000000001ULL) == 0);
+    assert(edr_pt_cache_put_generation(child_pid, parent_pid, "child.exe", "child --late",
+                                       "C:/child.exe", "parent-A.exe", child_time,
+                                       0xc001u, 133700000000000003ULL) == 0);
+    assert(edr_pt_cache_mark_exit_generation(parent_pid, 0xa001u, a_exit) == 0);
+    assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-B.exe", "B --parent",
+                                       "C:/B.exe", "System", b_start,
+                                       0xb001u, 133700000000000002ULL) == 0);
+    assert(edr_pt_cache_snapshot_at(parent_pid, child_time, &entry) == 0);
+    assert(entry.process_start_key == 0xa001u);
+    assert(entry.creation_filetime_100ns == 133700000000000001ULL);
+    assert(strcmp(entry.process_name, "parent-A.exe") == 0);
+    memset(parent_cmdline, 0, sizeof(parent_cmdline));
+    edr_pt_cache_fill_record_at(child_pid, child_time, NULL, 0u, NULL, 0u,
+                                NULL, parent_cmdline, sizeof(parent_cmdline), NULL);
+    assert(strcmp(parent_cmdline, "A --parent") == 0);
+    assert(edr_pt_cache_snapshot_at(parent_pid, b_start + 1000000ULL, &entry) == 0);
+    assert(entry.process_start_key == 0xb001u);
+    assert(strcmp(entry.process_name, "parent-B.exe") == 0);
+  }
+
+  {
     EdrProcessTreeCacheMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
     edr_pt_cache_get_metrics(&metrics);

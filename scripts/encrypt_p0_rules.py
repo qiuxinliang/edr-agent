@@ -39,6 +39,9 @@ HKDF_INFO = b"aes-256-gcm-rule"
 KEY_LEN = 32
 NONCE_LEN = 12
 TAG_LEN = 16
+ENVELOPE_MAX_BYTES = 4 * 1024 * 1024
+ENVELOPE_OVERHEAD = len(MAGIC) + NONCE_LEN + TAG_LEN
+PLAINTEXT_MAX_BYTES = ENVELOPE_MAX_BYTES - ENVELOPE_OVERHEAD
 
 
 def hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int) -> bytes:
@@ -81,12 +84,22 @@ def main() -> int:
             return 1
 
     data = args.input.read_bytes()
-    if len(data) > 4 * 1024 * 1024:
-        print("ERROR: input too large (>4 MiB)", file=sys.stderr)
+    # Keep the full EDR1 envelope at 4 MiB.  AES-GCM adds magic, nonce and
+    # tag, so publishing a 4 MiB plaintext would produce an Agent-rejected
+    # ciphertext.  This is the shared Agent/backend release contract.
+    if len(data) > PLAINTEXT_MAX_BYTES:
+        print(
+            f"ERROR: input too large (>{PLAINTEXT_MAX_BYTES} bytes plaintext; "
+            f"EDR1 envelope limit is {ENVELOPE_MAX_BYTES} bytes)",
+            file=sys.stderr,
+        )
         return 2
 
     key = hkdf_sha256(HKDF_SALT, SEED, HKDF_INFO, KEY_LEN)
     encrypted = aes_256_gcm_encrypt(data, key)
+    if len(encrypted) > ENVELOPE_MAX_BYTES:
+        print("ERROR: encrypted EDR1 envelope exceeds release limit", file=sys.stderr)
+        return 2
 
     if args.output == "-":
         sys.stdout.buffer.write(encrypted)

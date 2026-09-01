@@ -3,9 +3,9 @@ edr.v1.BehaviorEvent.event_id max_size:48
 edr.v1.BehaviorEvent.endpoint_id max_size:48
 edr.v1.BehaviorEvent.tenant_id max_size:64
 edr.v1.BehaviorEvent.process_name max_size:256
-edr.v1.BehaviorEvent.cmdline max_size:1024
+edr.v1.BehaviorEvent.cmdline max_size:4096
 edr.v1.BehaviorEvent.exe_hash max_size:65
-edr.v1.BehaviorEvent.exe_path max_size:1024
+edr.v1.BehaviorEvent.exe_path max_size:4096
 edr.v1.BehaviorEvent.username max_size:256
 edr.v1.BehaviorEvent.domain max_size:256
 edr.v1.BehaviorEvent.user_sid max_size:256
@@ -16,29 +16,43 @@ edr.v1.BehaviorEvent.creator_sid max_size:256
 edr.v1.BehaviorEvent.creator_logon_id max_size:64
 edr.v1.BehaviorEvent.identity_source max_size:32
 edr.v1.BehaviorEvent.identity_quality max_size:32
+edr.v1.BehaviorEvent.process_generation_source max_size:64
+edr.v1.BehaviorEvent.image_path_raw max_size:4096
+edr.v1.BehaviorEvent.image_path_canonical max_size:4096
+edr.v1.BehaviorEvent.image_path_namespace max_size:32
+edr.v1.BehaviorEvent.image_path_resolution_status max_size:32
+edr.v1.BehaviorEvent.image_path_resolution_source max_size:32
+edr.v1.BehaviorEvent.source_completeness max_size:32
+edr.v1.BehaviorEvent.parent_resolution_status max_size:32
+edr.v1.BehaviorEvent.parent_resolution_source max_size:32
+edr.v1.BehaviorEvent.parent_creation_time max_size:64
+edr.v1.BehaviorEvent.transport_completeness max_size:32
+edr.v1.BehaviorEvent.truncated_fields max_size:512
+edr.v1.BehaviorEvent.parent_name max_size:256
+edr.v1.BehaviorEvent.parent_path max_size:512
 edr.v1.BehaviorEvent.ave_result_json max_size:4096
 edr.v1.BehaviorEvent.mitre_ttps max_count:8 max_size:16
 
 edr.v1.ProcessDetail.parent_name max_size:256
 edr.v1.ProcessDetail.parent_path max_size:512
 edr.v1.ProcessDetail.integrity_level max_size:64
-edr.v1.ProcessDetail.parent_cmdline max_size:1024
-edr.v1.ProcessDetail.current_directory max_size:1024
+edr.v1.ProcessDetail.parent_cmdline max_size:4096
+edr.v1.ProcessDetail.current_directory max_size:4096
 edr.v1.ProcessDetail.process_creation_time max_size:64
 edr.v1.ProcessDetail.grandparent_name max_size:256
 edr.v1.ProcessDetail.grandparent_path max_size:512
 
 edr.v1.FileDetail.operation max_size:32
-edr.v1.FileDetail.target_path max_size:1024
+edr.v1.FileDetail.target_path max_size:4096
 
 edr.v1.NetworkDetail.src_ip max_size:64
 edr.v1.NetworkDetail.dst_ip max_size:64
 edr.v1.NetworkDetail.protocol max_size:16
-edr.v1.NetworkDetail.network_aux_path max_size:1024
+edr.v1.NetworkDetail.network_aux_path max_size:4096
 
 edr.v1.DnsDetail.query_name max_size:512
 
-edr.v1.ScriptDetail.snippet max_size:1024
+edr.v1.ScriptDetail.snippet max_size:4096
 
 edr.v1.RegistryDetail.key_path max_size:1024
 edr.v1.RegistryDetail.value_name max_size:512
@@ -53,10 +67,12 @@ edr.v1.BehaviorAlert.process_path max_size:1024
 # 受 nanopb PB_FIELDINFO width=2 下 `data_size` 12 位上界约 4KiB-1 约束
 edr.v1.BehaviorAlert.related_iocs_json max_size:4090
 edr.v1.BehaviorAlert.user_subject_json max_size:4090
+edr.v1.BehaviorAlert.user_subject_status max_size:16
+edr.v1.BehaviorAlert.user_subject_withheld_reason max_size:64
 edr.v1.BehaviorAlert.cmdline max_size:1024
 
 # 《11》§4.1 / `AVEBehaviorEvent` — `AveBehaviorEventFeed`
-edr.v1.AveBehaviorEventFeed.target_path max_size:1024
+edr.v1.AveBehaviorEventFeed.target_path max_size:4096
 edr.v1.AveBehaviorEventFeed.target_ip max_size:64
 edr.v1.AveBehaviorEventFeed.target_domain max_size:512
 edr.v1.AveBehaviorEventFeed.file_sha256_hex max_size:65

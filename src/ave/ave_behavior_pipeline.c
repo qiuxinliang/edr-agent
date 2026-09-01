@@ -48,6 +48,39 @@ static EdrBpMetric64 s_bp_feed_sync_bypass;
 static EdrBpMetric64 s_bp_worker_dequeued;
 static EdrBpMetric64 s_bp_pressure_feed_dropped;
 
+/* `pid:<id>` is already the pipeline's explicit no-name sentinel.  Preserve
+ * that state when a path basename cannot be represented rather than emitting
+ * a partial name as if it were complete. */
+static void bp_copy_path_basename_or_pid(char *out, size_t out_cap, const char *path,
+                                         size_t path_cap, uint32_t pid) {
+  char fallback[16];
+  size_t base = 0u;
+  size_t length = 0u;
+  if (!out || out_cap == 0u) {
+    return;
+  }
+  out[0] = '\0';
+  if (path && path_cap > 0u) {
+    while (length < path_cap && path[length]) {
+      if (path[length] == '/' || path[length] == '\\') {
+        base = length + 1u;
+      }
+      length++;
+    }
+    if (length < path_cap && length > base && length - base < out_cap) {
+      memcpy(out, path + base, length - base);
+      out[length - base] = '\0';
+      return;
+    }
+  }
+  {
+    int written = snprintf(fallback, sizeof(fallback), "pid:%u", (unsigned)pid);
+    if (written > 0 && (size_t)written < out_cap) {
+      memcpy(out, fallback, (size_t)written + 1u);
+    }
+  }
+}
+
 static void bp_reset_metrics(void) {
   bp_metric_store(&s_bp_feed_total, 0u);
   bp_metric_store(&s_bp_queue_enqueued, 0u);
@@ -721,11 +754,8 @@ static void ph_reset_lifecycle_for_pid_reuse(EdrPidHistory *sl, const AVEBehavio
   if (e->process_name[0]) {
     snprintf(sl->process_name, sizeof(sl->process_name), "%s", e->process_name);
   } else if (e->process_path[0]) {
-    const char *base = e->process_path;
-    for (const char *p = e->process_path; *p; p++) {
-      if (*p == '/' || *p == '\\') base = p + 1;
-    }
-    snprintf(sl->process_name, sizeof(sl->process_name), "%s", base);
+    bp_copy_path_basename_or_pid(sl->process_name, sizeof(sl->process_name), e->process_path,
+                                 sizeof(e->process_path), e->pid);
   } else {
     snprintf(sl->process_name, sizeof(sl->process_name), "pid:%u", e->pid);
   }
@@ -770,11 +800,8 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     if (e->process_name[0]) {
       snprintf(sl->process_name, sizeof(sl->process_name), "%s", e->process_name);
     } else if (e->process_path[0]) {
-      const char *base = e->process_path;
-      for (const char *p = e->process_path; *p; p++) {
-        if (*p == '/' || *p == '\\') base = p + 1;
-      }
-      snprintf(sl->process_name, sizeof(sl->process_name), "%s", base);
+      bp_copy_path_basename_or_pid(sl->process_name, sizeof(sl->process_name), e->process_path,
+                                   sizeof(e->process_path), e->pid);
     } else {
       snprintf(sl->process_name, sizeof(sl->process_name), "pid:%u", e->pid);
     }
@@ -932,8 +959,8 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   memcpy(tactic_copy, last_tactic_probs, sizeof(tactic_copy));
   char sl_proc_name[256];
   memcpy(sl_proc_name, sl->process_name, sizeof(sl_proc_name));
-  char ev_tgt_path[1024];
-  snprintf(ev_tgt_path, sizeof(ev_tgt_path), "%s", e->target_path);
+  char ev_tgt_path[sizeof(e->target_path)];
+  memcpy(ev_tgt_path, e->target_path, sizeof(ev_tgt_path));
   char ev_proc_path[512];
   snprintf(ev_proc_path, sizeof(ev_proc_path), "%s", e->process_path);
   char ev_cmdline[1024];
@@ -982,18 +1009,15 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     if (sl_proc_name[0] && strncmp(sl_proc_name, "pid:", 4) != 0) {
       snprintf(al.process_name, sizeof(al.process_name), "%s", sl_proc_name);
     } else if (ev_tgt_path[0]) {
-      const char *bn = ev_tgt_path;
-      for (const char *c = ev_tgt_path; *c; c++) {
-        if (*c == '\\' || *c == '/') bn = c + 1;
-      }
-      snprintf(al.process_name, sizeof(al.process_name), "%s", bn);
+      bp_copy_path_basename_or_pid(al.process_name, sizeof(al.process_name), ev_tgt_path,
+                                   sizeof(ev_tgt_path), pid_copy);
     } else {
       snprintf(al.process_name, sizeof(al.process_name), "pid:%u", (unsigned)pid_copy);
     }
     if (ev_proc_path[0]) {
       snprintf(al.process_path, sizeof(al.process_path), "%s", ev_proc_path);
     } else if (ev_tgt_path[0] && evt_copy == AVE_EVT_PROCESS_CREATE) {
-      snprintf(al.process_path, sizeof(al.process_path), "%s", ev_tgt_path);
+      memcpy(al.process_path, ev_tgt_path, sizeof(al.process_path));
     }
     /* 可选：与平台 alerts.user_subject_json 对齐的 JSON 真源（调试用/专线注入；生产建议由策略填 AVEBehaviorAlert） */
     {

@@ -15,6 +15,7 @@
 #include <string.h>
 
 #ifdef _WIN32
+#include <errno.h>
 #include <process.h>
 #include <windows.h>
 static uint64_t edr_stress_ms_now(void) { return (uint64_t)GetTickCount64(); }
@@ -93,8 +94,69 @@ static void make_dummy_slot(EdrEventSlot *o) {
   memcpy(o->data, "ABCD", 4u);
 }
 
+/* Ordinary flood must never consume the P0 reservation.  This is deliberately
+ * a cap=1 seam: it proves the invariant without relying on queue timing. */
+static int test_p0_reserve(void) {
+  EdrEventSlot ordinary;
+  EdrEventSlot critical;
+  EdrEventSlot out;
+  EdrEventBus *one = edr_event_bus_create(1u);
+  if (!one) {
+    fprintf(stderr, "p0 reserve: cap=1 create failed\n");
+    return 1;
+  }
+  make_dummy_slot(&ordinary);
+  make_dummy_slot(&critical);
+  critical.p0_critical = 1u;
+  if (edr_event_bus_p0_reserved_slots(one) != 1u ||
+      edr_event_bus_try_push(one, &ordinary) ||
+      !edr_event_bus_try_push(one, &critical) ||
+      !edr_event_bus_try_pop(one, &out) || !out.p0_critical ||
+      edr_event_bus_ordinary_reserve_rejected_total(one) != 1u) {
+    fprintf(stderr, "p0 reserve: cap=1 invariant failed\n");
+    edr_event_bus_destroy(one);
+    return 1;
+  }
+  edr_event_bus_destroy(one);
+
+  EdrEventBus *bus = edr_event_bus_create(16u);
+  if (!bus) {
+    fprintf(stderr, "p0 reserve: create failed\n");
+    return 1;
+  }
+  for (uint32_t i = 0u; i < 15u; ++i) {
+    if (!edr_event_bus_try_push(bus, &ordinary)) {
+      fprintf(stderr, "p0 reserve: ordinary slot %u rejected early\n", i);
+      edr_event_bus_destroy(bus);
+      return 1;
+    }
+  }
+  if (edr_event_bus_try_push(bus, &ordinary) ||
+      !edr_event_bus_try_push(bus, &critical) ||
+      edr_event_bus_try_push(bus, &critical) ||
+      edr_event_bus_p0_reserve_rejected_total(bus) != 1u) {
+    fprintf(stderr, "p0 reserve: logical reservation invariant failed\n");
+    edr_event_bus_destroy(bus);
+    return 1;
+  }
+  for (uint32_t i = 0u; i < 16u; ++i) {
+    if (!edr_event_bus_try_pop(bus, &out)) {
+      fprintf(stderr, "p0 reserve: pop %u failed\n", i);
+      edr_event_bus_destroy(bus);
+      return 1;
+    }
+  }
+  if (edr_event_bus_used_approx(bus) != 0u) {
+    fprintf(stderr, "p0 reserve: queue did not drain\n");
+    edr_event_bus_destroy(bus);
+    return 1;
+  }
+  edr_event_bus_destroy(bus);
+  return 0;
+}
+
 #ifdef _WIN32
-static DWORD WINAPI edr_stress_producer(void *p) {
+static unsigned __stdcall edr_stress_producer(void *p) {
   TArg *a = (TArg *)p;
   EdrEventSlot s;
   make_dummy_slot(&s);
@@ -102,6 +164,31 @@ static DWORD WINAPI edr_stress_producer(void *p) {
     (void)edr_event_bus_try_push(a->bus, &s);
   }
   return 0;
+}
+
+static void edr_stress_wait_all_or_abort(HANDLE *handles, DWORD count,
+                                         DWORD timeout_ms, const char *phase) {
+  const DWORD wait_result = WaitForMultipleObjects(count, handles, TRUE, timeout_ms);
+  if (wait_result != WAIT_OBJECT_0) {
+    const DWORD error = GetLastError();
+    fprintf(stderr,
+            "mpmc: %s wait-all failed result=%lu error=%lu count=%lu timeout_ms=%lu\n",
+            phase, (unsigned long)wait_result, (unsigned long)error,
+            (unsigned long)count, (unsigned long)timeout_ms);
+    abort();
+  }
+}
+
+static void edr_stress_close_handles_or_abort(HANDLE *handles, DWORD count,
+                                              const char *phase) {
+  for (DWORD i = 0u; i < count; ++i) {
+    if (!CloseHandle(handles[i])) {
+      const DWORD error = GetLastError();
+      fprintf(stderr, "mpmc: %s CloseHandle failed index=%lu error=%lu\n",
+              phase, (unsigned long)i, (unsigned long)error);
+      abort();
+    }
+  }
 }
 #else
 static void *edr_stress_producer(void *p) {
@@ -116,6 +203,13 @@ static void *edr_stress_producer(void *p) {
 #endif
 
 static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
+#ifdef _WIN32
+  if (nprod < 1 || nprod > (int)MAXIMUM_WAIT_OBJECTS) {
+    fprintf(stderr, "mpmc: Windows producer count must be in 1..%u (got %d)\n",
+            (unsigned)MAXIMUM_WAIT_OBJECTS, nprod);
+    return 1;
+  }
+#endif
   if (cap < 8u) {
     cap = 8u;
   }
@@ -134,15 +228,18 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
     return 1;
   }
   for (int i = 0; i < nprod; i++) {
+    errno = 0;
     hp[i] = (HANDLE)_beginthreadex(NULL, 0, edr_stress_producer, &arg, 0, NULL);
     if (!hp[i]) {
+      const int create_error = errno;
       atomic_store(&arg.go, 0);
-      for (int j = 0; j < i; j++) {
-        (void)WaitForSingleObject(hp[j], 20000u);
-        CloseHandle(hp[j]);
+      if (i > 0) {
+        edr_stress_wait_all_or_abort(hp, (DWORD)i, 60000u, "producer creation cleanup");
+        edr_stress_close_handles_or_abort(hp, (DWORD)i, "producer creation cleanup");
       }
       free(hp);
       edr_event_bus_destroy(bus);
+      fprintf(stderr, "mpmc: _beginthreadex failed index=%d errno=%d\n", i, create_error);
       return 1;
     }
   }
@@ -177,10 +274,8 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
   atomic_store(&arg.go, 0);
 
 #ifdef _WIN32
-  for (int i = 0; i < nprod; i++) {
-    (void)WaitForSingleObject(hp[i], 60000u);
-    CloseHandle(hp[i]);
-  }
+  edr_stress_wait_all_or_abort(hp, (DWORD)nprod, 60000u, "producer join");
+  edr_stress_close_handles_or_abort(hp, (DWORD)nprod, "producer join");
   free(hp);
 #else
   for (int i = 0; i < nprod; i++) {
@@ -220,6 +315,9 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
 
 int main(int argc, char **argv) {
   if (test_seq() != 0) {
+    return 1;
+  }
+  if (test_p0_reserve() != 0) {
     return 1;
   }
   uint32_t dms = 300u;

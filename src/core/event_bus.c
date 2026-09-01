@@ -20,6 +20,25 @@
  * 见 `include/edr/event_bus.h` 无锁设计说明。
  */
 
+/* Keep the reservation small but nonzero: one critical record must always be
+ * able to displace ordinary flood pressure, including the cap=1 seam used by
+ * the fail-safe FileRead tests.  Critical producers may use all physical
+ * slots; only ordinary producers are constrained by this logical limit. */
+static uint32_t edr_event_bus_p0_reserve_for_capacity(uint32_t cap) {
+  uint32_t reserve;
+  if (cap == 0u) {
+    return 0u;
+  }
+  reserve = cap / 16u;
+  if (reserve == 0u) {
+    reserve = 1u;
+  }
+  if (reserve > 64u) {
+    reserve = 64u;
+  }
+  return reserve > cap ? cap : reserve;
+}
+
 #ifdef _WIN32
 
 typedef struct {
@@ -32,7 +51,11 @@ struct EdrEventBus {
   uint32_t head;
   uint32_t tail;
   uint32_t count;
+  uint32_t normal_count;
+  uint32_t p0_reserved;
   uint64_t dropped;
+  uint64_t ordinary_reserve_rejected;
+  uint64_t p0_reserve_rejected;
   uint64_t pushed;
   uint64_t high_water_hits;
   CRITICAL_SECTION mu;
@@ -41,7 +64,7 @@ struct EdrEventBus {
 };
 
 EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
-  if (slot_count < 2u) {
+  if (slot_count == 0u) {
     return NULL;
   }
   EdrEventBus *bus = (EdrEventBus *)calloc(1, sizeof(EdrEventBus));
@@ -54,6 +77,7 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
     return NULL;
   }
   bus->cap = slot_count;
+  bus->p0_reserved = edr_event_bus_p0_reserve_for_capacity(slot_count);
   InitializeCriticalSection(&bus->mu);
   InitializeConditionVariable(&bus->nonempty);
   bus->mu_inited = 1;
@@ -76,8 +100,20 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
     return false;
   }
   EnterCriticalSection(&bus->mu);
+  if (!slot->p0_critical &&
+      bus->normal_count >= bus->cap - bus->p0_reserved) {
+    bus->dropped++;
+    bus->ordinary_reserve_rejected++;
+    LeaveCriticalSection(&bus->mu);
+    return false;
+  }
   if (bus->count >= bus->cap) {
     bus->dropped++;
+    if (slot->p0_critical) {
+      bus->p0_reserve_rejected++;
+    } else {
+      bus->ordinary_reserve_rejected++;
+    }
     LeaveCriticalSection(&bus->mu);
     return false;
   }
@@ -85,6 +121,9 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
   memcpy(&bus->cells[bus->tail].data, slot, sizeof(EdrEventSlot));
   bus->tail = (bus->tail + 1u) % bus->cap;
   bus->count++;
+  if (!slot->p0_critical) {
+    bus->normal_count++;
+  }
   bus->pushed++;
   if ((uint64_t)bus->count * 100u >= (uint64_t)bus->cap * 80u) {
     bus->high_water_hits++;
@@ -108,6 +147,9 @@ bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
   memcpy(out_slot, &bus->cells[bus->head].data, sizeof(EdrEventSlot));
   bus->head = (bus->head + 1u) % bus->cap;
   bus->count--;
+  if (!out_slot->p0_critical && bus->normal_count > 0u) {
+    bus->normal_count--;
+  }
   LeaveCriticalSection(&bus->mu);
   return true;
 }
@@ -147,6 +189,30 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 }
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus) { return bus ? bus->cap : 0u; }
+
+uint32_t edr_event_bus_p0_reserved_slots(const EdrEventBus *bus) {
+  return bus ? bus->p0_reserved : 0u;
+}
+
+uint64_t edr_event_bus_ordinary_reserve_rejected_total(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint64_t n = bus->ordinary_reserve_rejected;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
+
+uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus) {
+  if (!bus || !bus->mu_inited) {
+    return 0u;
+  }
+  EnterCriticalSection(&bus->mu);
+  uint64_t n = bus->p0_reserve_rejected;
+  LeaveCriticalSection(&bus->mu);
+  return n;
+}
 
 uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {
   return bus ? (uint64_t)sizeof(*bus) + (uint64_t)bus->cap * (uint64_t)sizeof(EdrEventBusCell) : 0u;
@@ -202,9 +268,13 @@ typedef struct {
 struct EdrEventBus {
   EdrEventBusCell *cells;
   uint32_t cap;
+  uint32_t p0_reserved;
   _Alignas(64) _Atomic uint64_t head;
   _Alignas(64) _Atomic uint64_t tail;
+  _Alignas(64) _Atomic uint32_t normal_count;
   _Atomic uint64_t dropped;
+  _Atomic uint64_t ordinary_reserve_rejected;
+  _Atomic uint64_t p0_reserve_rejected;
   _Atomic uint64_t pushed;
   _Atomic uint64_t high_water_hits;
 };
@@ -214,7 +284,7 @@ static inline uint64_t bus_lap(uint64_t pos, uint32_t cap) { return pos / (uint6
 static inline uint32_t bus_idx(uint64_t pos, uint32_t cap) { return (uint32_t)(pos % (uint64_t)cap); }
 
 EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
-  if (slot_count < 2u) {
+  if (slot_count == 0u) {
     return NULL;
   }
   EdrEventBus *bus = (EdrEventBus *)calloc(1, sizeof(EdrEventBus));
@@ -227,12 +297,16 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
     return NULL;
   }
   bus->cap = slot_count;
+  bus->p0_reserved = edr_event_bus_p0_reserve_for_capacity(slot_count);
   for (uint32_t i = 0; i < slot_count; i++) {
     atomic_init(&bus->cells[i].turn, 0u);
   }
   atomic_init(&bus->head, 0u);
   atomic_init(&bus->tail, 0u);
+  atomic_init(&bus->normal_count, 0u);
   atomic_init(&bus->dropped, 0u);
+  atomic_init(&bus->ordinary_reserve_rejected, 0u);
+  atomic_init(&bus->p0_reserve_rejected, 0u);
   atomic_init(&bus->pushed, 0u);
   atomic_init(&bus->high_water_hits, 0u);
   return bus;
@@ -251,6 +325,25 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
     return false;
   }
   const uint32_t cap = bus->cap;
+  int normal_reserved = 0;
+  if (!slot->p0_critical) {
+    const uint32_t normal_limit = cap - bus->p0_reserved;
+    uint32_t normal_count = atomic_load_explicit(&bus->normal_count, memory_order_acquire);
+    for (;;) {
+      if (normal_count >= normal_limit) {
+        (void)atomic_fetch_add_explicit(&bus->dropped, 1u, memory_order_relaxed);
+        (void)atomic_fetch_add_explicit(&bus->ordinary_reserve_rejected, 1u,
+                                        memory_order_relaxed);
+        return false;
+      }
+      if (atomic_compare_exchange_weak_explicit(&bus->normal_count, &normal_count,
+                                                normal_count + 1u, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+        normal_reserved = 1;
+        break;
+      }
+    }
+  }
   uint64_t pos = atomic_load_explicit(&bus->head, memory_order_acquire);
   for (;;) {
     EdrEventBusCell *cell = &bus->cells[bus_idx(pos, cap)];
@@ -278,7 +371,17 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
       const uint64_t prev = pos;
       pos = atomic_load_explicit(&bus->head, memory_order_acquire);
       if (pos == prev) {
+        if (normal_reserved) {
+          (void)atomic_fetch_sub_explicit(&bus->normal_count, 1u, memory_order_acq_rel);
+        }
         (void)atomic_fetch_add_explicit(&bus->dropped, 1u, memory_order_relaxed);
+        if (slot->p0_critical) {
+          (void)atomic_fetch_add_explicit(&bus->p0_reserve_rejected, 1u,
+                                          memory_order_relaxed);
+        } else {
+          (void)atomic_fetch_add_explicit(&bus->ordinary_reserve_rejected, 1u,
+                                          memory_order_relaxed);
+        }
         return false;
       }
     }
@@ -299,6 +402,9 @@ bool edr_event_bus_try_pop(EdrEventBus *bus, EdrEventSlot *out_slot) {
       if (atomic_compare_exchange_strong_explicit(&bus->tail, &pos, pos + 1u, memory_order_acq_rel,
                                                   memory_order_acquire)) {
         memcpy(out_slot, &cell->data, sizeof(EdrEventSlot));
+        if (!out_slot->p0_critical) {
+          (void)atomic_fetch_sub_explicit(&bus->normal_count, 1u, memory_order_acq_rel);
+        }
         atomic_store_explicit(&cell->turn, lap * 2u + 2u, memory_order_release);
         return true;
       }
@@ -343,6 +449,18 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 }
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus) { return bus ? bus->cap : 0u; }
+
+uint32_t edr_event_bus_p0_reserved_slots(const EdrEventBus *bus) {
+  return bus ? bus->p0_reserved : 0u;
+}
+
+uint64_t edr_event_bus_ordinary_reserve_rejected_total(EdrEventBus *bus) {
+  return bus ? atomic_load_explicit(&bus->ordinary_reserve_rejected, memory_order_relaxed) : 0u;
+}
+
+uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus) {
+  return bus ? atomic_load_explicit(&bus->p0_reserve_rejected, memory_order_relaxed) : 0u;
+}
 
 uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {
   return bus ? (uint64_t)sizeof(*bus) + (uint64_t)bus->cap * (uint64_t)sizeof(EdrEventBusCell) : 0u;

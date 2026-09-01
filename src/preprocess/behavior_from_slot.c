@@ -2,15 +2,19 @@
 
 #include "edr/command.h"
 #include "edr/policy_v2.h"
+#include "edr/p0_source_only_contract.h"
 
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <string.h>
+#include <time.h>
 
-static uint64_t g_event_seq;
+static atomic_uint_fast64_t g_event_seq = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t g_event_boot_nonce = ATOMIC_VAR_INIT(0);
 
 #define RANSOM_COUNTER_BUCKETS 128u
 #define RANSOM_COUNTER_EXTS 24u
@@ -54,9 +58,18 @@ static int identity_value_present(const char *s) {
 }
 
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
-  uint64_t s = ++g_event_seq;
-  snprintf(out, cap, "e-%llx-%llx", (unsigned long long)(uint64_t)time_ns,
-           (unsigned long long)s);
+  uint64_t s = atomic_fetch_add_explicit(&g_event_seq, 1u, memory_order_relaxed) + 1u;
+  uint64_t nonce = atomic_load_explicit(&g_event_boot_nonce, memory_order_acquire);
+  if (nonce == 0u) {
+    uint64_t candidate = ((uint64_t)clock() << 32u) ^ (uint64_t)(uintptr_t)&g_event_seq ^
+                         ((uint64_t)time(NULL) << 17u);
+    if (candidate == 0u) candidate = 1u;
+    (void)atomic_compare_exchange_strong_explicit(&g_event_boot_nonce, &nonce, candidate,
+                                                   memory_order_release, memory_order_acquire);
+    nonce = atomic_load_explicit(&g_event_boot_nonce, memory_order_acquire);
+  }
+  snprintf(out, cap, "e-%llx-%llx-%llx", (unsigned long long)nonce,
+           (unsigned long long)(uint64_t)time_ns, (unsigned long long)s);
 }
 
 static const char *basename_c(const char *path) {
@@ -99,6 +112,26 @@ static void first_cmd_token(const char *cmd, char *out, size_t cap) {
     out[n++] = *cmd++;
   }
   out[n] = '\0';
+}
+
+/* cmd.exe is the actor.  A batch file supplied to /c is a separate artifact;
+ * never overwrite process_name/exe_path with it or P0 process identity drifts. */
+static void cmd_script_artifact(const char *cmd, char *out, size_t cap) {
+  const char *hit = NULL;
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  if (!cmd) return;
+  for (const char *p = cmd; p[0] && p[1] && p[2] && p[3]; ++p) {
+    if (p[0] == '.' && (p[1] == 'c' || p[1] == 'C') &&
+        (p[2] == 'm' || p[2] == 'M') && (p[3] == 'd' || p[3] == 'D') &&
+        (p[4] == '\0' || p[4] == ' ' || p[4] == '\t' || p[4] == '"')) { hit = p + 4; break; }
+  }
+  if (!hit) return;
+  const char *begin = hit;
+  while (begin > cmd && begin[-1] != ' ' && begin[-1] != '\t' && begin[-1] != '"') --begin;
+  size_t n = (size_t)(hit - begin);
+  if (n >= cap) n = cap - 1u;
+  memcpy(out, begin, n); out[n] = '\0';
 }
 
 static int is_file_activity_event(EdrEventType t) {
@@ -914,6 +947,21 @@ typedef struct {
   char integrity[64];
   char token_elevation[64];
   char process_creation_time[96];
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
+  uint64_t file_key;
+  char process_generation_source[64];
+  char image_raw[EDR_BR_STR_LONG];
+  char image_canonical[EDR_BR_STR_LONG];
+  char image_namespace[32];
+  char image_resolution_status[32];
+  char image_resolution_source[32];
+  char source_completeness[32];
+  char collector_evidence_gate[64];
+  char collector_evidence_reason[96];
+  char collector_event_id[EDR_BR_ID_LEN];
+  unsigned long evidence_revision;
+  uint64_t truncation_mask;
   int has_fw;
   unsigned long forensic_frames;
   int has_forensic_frames;
@@ -935,9 +983,234 @@ typedef struct {
   int has_integrity;
   int has_token_elevation;
   int has_process_creation_time;
+  int has_process_start_key;
+  int has_process_creation_filetime;
+  int has_process_generation_source;
+  int has_file_key;
 } Etw1Fields;
 
 static void etw1_clear(Etw1Fields *f) { memset(f, 0, sizeof(*f)); }
+
+enum {
+  EDR_ETW_TRUNC_IMAGE = 1ull << 0,
+  EDR_ETW_TRUNC_IMAGE_RAW = 1ull << 1,
+  EDR_ETW_TRUNC_IMAGE_CANONICAL = 1ull << 2,
+  EDR_ETW_TRUNC_CMDLINE = 1ull << 3,
+  EDR_ETW_TRUNC_USERNAME = 1ull << 4,
+  EDR_ETW_TRUNC_DOMAIN = 1ull << 5,
+  EDR_ETW_TRUNC_USER_SID = 1ull << 6,
+  EDR_ETW_TRUNC_LOGON_ID = 1ull << 7,
+  EDR_ETW_TRUNC_CREATOR_USERNAME = 1ull << 8,
+  EDR_ETW_TRUNC_CREATOR_DOMAIN = 1ull << 9,
+  EDR_ETW_TRUNC_CREATOR_SID = 1ull << 10,
+  EDR_ETW_TRUNC_CREATOR_LOGON_ID = 1ull << 11,
+  EDR_ETW_TRUNC_PARENT_IMAGE = 1ull << 12,
+  EDR_ETW_TRUNC_PARENT_CMDLINE = 1ull << 13,
+  EDR_ETW_TRUNC_CURRENT_DIRECTORY = 1ull << 14,
+  EDR_ETW_TRUNC_INTEGRITY = 1ull << 15,
+  EDR_ETW_TRUNC_TOKEN_ELEVATION = 1ull << 16,
+  EDR_ETW_TRUNC_PROCESS_CREATION_TIME = 1ull << 17,
+  EDR_ETW_TRUNC_PROCESS_GENERATION_SOURCE = 1ull << 18,
+  EDR_ETW_TRUNC_SOURCE_COMPLETENESS = 1ull << 19,
+  EDR_ETW_TRUNC_FILE_PATH = 1ull << 20,
+  EDR_ETW_TRUNC_OLD_FILE_PATH = 1ull << 21,
+  EDR_ETW_TRUNC_EXE_HASH = 1ull << 22,
+  EDR_ETW_TRUNC_NET_PROTO = 1ull << 23,
+  EDR_ETW_TRUNC_REG_OP = 1ull << 24,
+  EDR_ETW_TRUNC_IMAGE_NAMESPACE = 1ull << 25,
+  EDR_ETW_TRUNC_IMAGE_RESOLUTION_STATUS = 1ull << 26,
+  EDR_ETW_TRUNC_IMAGE_RESOLUTION_SOURCE = 1ull << 27,
+  EDR_ETW_TRUNC_REG_KEY_PATH = 1ull << 28,
+  EDR_ETW_TRUNC_REG_VALUE_NAME = 1ull << 29,
+  EDR_ETW_TRUNC_REG_OLD_VALUE_DATA = 1ull << 30,
+  EDR_ETW_TRUNC_DNS_QUERY = 1ull << 31,
+};
+
+static int copy_text_exact(char *dst, size_t cap, const char *src) {
+  size_t len;
+  if (!dst || cap == 0u) {
+    return 0;
+  }
+  dst[0] = '\0';
+  if (!src) {
+    return 1;
+  }
+  len = strlen(src);
+  if (len >= cap) {
+    return 0;
+  }
+  if (len > 0u) {
+    memcpy(dst, src, len);
+  }
+  dst[len] = '\0';
+  return 1;
+}
+
+static int etw1_copy_text(Etw1Fields *f, char *dst, size_t cap, const char *src,
+                          uint64_t truncation_bit) {
+  if (copy_text_exact(dst, cap, src)) {
+    return 1;
+  }
+  if (f) {
+    f->truncation_mask |= truncation_bit;
+  }
+  return 0;
+}
+
+static int comma_list_has_exact(const char *list, const char *item) {
+  const char *start;
+  size_t item_len;
+  if (!list || !item || !item[0]) {
+    return 0;
+  }
+  item_len = strlen(item);
+  start = list;
+  while (*start) {
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len == item_len && memcmp(start, item, len) == 0) {
+      return 1;
+    }
+    if (!end) {
+      break;
+    }
+    start = end + 1;
+  }
+  return 0;
+}
+
+static void mark_source_truncation(EdrBehaviorRecord *r, const char *field) {
+  static const char prefix[] = "source.";
+  static const char overflow[] = "source.list_overflow";
+  char item[64];
+  size_t field_len;
+  size_t item_len;
+  size_t used;
+  if (!r || !field || !field[0]) {
+    return;
+  }
+  (void)copy_text_exact(r->source_completeness, sizeof(r->source_completeness), "TRUNCATED");
+  field_len = strlen(field);
+  if (field_len + sizeof(prefix) > sizeof(item)) {
+    (void)copy_text_exact(r->source_truncated_fields,
+                          sizeof(r->source_truncated_fields), overflow);
+    return;
+  }
+  memcpy(item, prefix, sizeof(prefix) - 1u);
+  memcpy(item + sizeof(prefix) - 1u, field, field_len + 1u);
+  if (comma_list_has_exact(r->source_truncated_fields, item)) {
+    return;
+  }
+  item_len = strlen(item);
+  used = strlen(r->source_truncated_fields);
+  if (used + (used ? 1u : 0u) + item_len < sizeof(r->source_truncated_fields)) {
+    if (used > 0u) {
+      r->source_truncated_fields[used++] = ',';
+    }
+    memcpy(r->source_truncated_fields + used, item, item_len + 1u);
+    return;
+  }
+  if (comma_list_has_exact(r->source_truncated_fields, overflow)) {
+    return;
+  }
+  item_len = sizeof(overflow) - 1u;
+  if (used + (used ? 1u : 0u) + item_len < sizeof(r->source_truncated_fields)) {
+    if (used > 0u) {
+      r->source_truncated_fields[used++] = ',';
+    }
+    memcpy(r->source_truncated_fields + used, overflow, item_len + 1u);
+  } else {
+    /* A bounded list must never look complete after it runs out of room. */
+    (void)copy_text_exact(r->source_truncated_fields,
+                          sizeof(r->source_truncated_fields), overflow);
+  }
+}
+
+static int copy_record_source_text(EdrBehaviorRecord *r, char *dst, size_t cap,
+                                   const char *src, const char *field) {
+  if (copy_text_exact(dst, cap, src)) {
+    return 1;
+  }
+  mark_source_truncation(r, field);
+  return 0;
+}
+
+static int copy_record_username(EdrBehaviorRecord *r, const char *domain, const char *user) {
+  size_t domain_len;
+  size_t user_len;
+  if (!r || !user) {
+    return 0;
+  }
+  if (!domain || !domain[0]) {
+    return copy_record_source_text(r, r->username, sizeof(r->username), user, "username");
+  }
+  domain_len = strlen(domain);
+  user_len = strlen(user);
+  r->username[0] = '\0';
+  if (domain_len + 1u >= sizeof(r->username) ||
+      user_len >= sizeof(r->username) - domain_len - 1u) {
+    mark_source_truncation(r, "username");
+    return 0;
+  }
+  memcpy(r->username, domain, domain_len);
+  r->username[domain_len] = '\\';
+  memcpy(r->username + domain_len + 1u, user, user_len + 1u);
+  return 1;
+}
+
+static void mark_etw1_input_truncations(EdrBehaviorRecord *r, uint64_t mask) {
+  if (mask & EDR_ETW_TRUNC_IMAGE) {
+    mark_source_truncation(r, "exe_path");
+    mark_source_truncation(r, "process_name");
+    mark_source_truncation(r, "image_path_raw");
+  }
+  if (mask & EDR_ETW_TRUNC_IMAGE_RAW) mark_source_truncation(r, "image_path_raw");
+  if (mask & EDR_ETW_TRUNC_IMAGE_CANONICAL) mark_source_truncation(r, "image_path_canonical");
+  if (mask & EDR_ETW_TRUNC_IMAGE_NAMESPACE) mark_source_truncation(r, "image_path_namespace");
+  if (mask & EDR_ETW_TRUNC_IMAGE_RESOLUTION_STATUS) {
+    mark_source_truncation(r, "image_path_resolution_status");
+  }
+  if (mask & EDR_ETW_TRUNC_IMAGE_RESOLUTION_SOURCE) {
+    mark_source_truncation(r, "image_path_resolution_source");
+  }
+  if (mask & EDR_ETW_TRUNC_CMDLINE) mark_source_truncation(r, "cmdline");
+  if (mask & EDR_ETW_TRUNC_USERNAME) mark_source_truncation(r, "username");
+  if (mask & EDR_ETW_TRUNC_DOMAIN) mark_source_truncation(r, "domain");
+  if (mask & EDR_ETW_TRUNC_USER_SID) mark_source_truncation(r, "user_sid");
+  if (mask & EDR_ETW_TRUNC_LOGON_ID) mark_source_truncation(r, "logon_id");
+  if (mask & EDR_ETW_TRUNC_CREATOR_USERNAME) mark_source_truncation(r, "creator_username");
+  if (mask & EDR_ETW_TRUNC_CREATOR_DOMAIN) mark_source_truncation(r, "creator_domain");
+  if (mask & EDR_ETW_TRUNC_CREATOR_SID) mark_source_truncation(r, "creator_sid");
+  if (mask & EDR_ETW_TRUNC_CREATOR_LOGON_ID) mark_source_truncation(r, "creator_logon_id");
+  if (mask & EDR_ETW_TRUNC_PARENT_IMAGE) {
+    mark_source_truncation(r, "parent_path");
+    mark_source_truncation(r, "parent_name");
+  }
+  if (mask & EDR_ETW_TRUNC_PARENT_CMDLINE) mark_source_truncation(r, "parent_cmdline");
+  if (mask & EDR_ETW_TRUNC_CURRENT_DIRECTORY) mark_source_truncation(r, "current_directory");
+  if (mask & EDR_ETW_TRUNC_INTEGRITY) mark_source_truncation(r, "integrity_level");
+  if (mask & EDR_ETW_TRUNC_TOKEN_ELEVATION) mark_source_truncation(r, "token_elevation");
+  if (mask & EDR_ETW_TRUNC_PROCESS_CREATION_TIME) {
+    mark_source_truncation(r, "process_creation_time");
+  }
+  if (mask & EDR_ETW_TRUNC_PROCESS_GENERATION_SOURCE) {
+    mark_source_truncation(r, "process_generation_source");
+  }
+  if (mask & EDR_ETW_TRUNC_SOURCE_COMPLETENESS) {
+    mark_source_truncation(r, "source_completeness");
+  }
+  if (mask & EDR_ETW_TRUNC_FILE_PATH) mark_source_truncation(r, "file_path");
+  if (mask & EDR_ETW_TRUNC_OLD_FILE_PATH) mark_source_truncation(r, "old_file_path");
+  if (mask & EDR_ETW_TRUNC_EXE_HASH) mark_source_truncation(r, "exe_hash");
+  if (mask & EDR_ETW_TRUNC_NET_PROTO) mark_source_truncation(r, "net_proto");
+  if (mask & EDR_ETW_TRUNC_REG_OP) mark_source_truncation(r, "reg_op");
+  if (mask & EDR_ETW_TRUNC_REG_KEY_PATH) mark_source_truncation(r, "reg_key_path");
+  if (mask & EDR_ETW_TRUNC_REG_VALUE_NAME) mark_source_truncation(r, "reg_value_name");
+  if (mask & EDR_ETW_TRUNC_REG_OLD_VALUE_DATA) {
+    mark_source_truncation(r, "reg_old_value_data");
+  }
+  if (mask & EDR_ETW_TRUNC_DNS_QUERY) mark_source_truncation(r, "dns_query");
+}
 
 static void append_sensor_kv(Etw1Fields *f, const char *key, const char *val) {
   if (!f || !key || !key[0] || !val || !val[0]) {
@@ -1075,45 +1348,99 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "ppid") == 0) {
     f->ppid = parse_ulong_auto(val);
   } else if (strcmp(key, "user") == 0 || strcmp(key, "username") == 0) {
-    snprintf(f->user, sizeof(f->user), "%s", val);
+    (void)etw1_copy_text(f, f->user, sizeof(f->user), val, EDR_ETW_TRUNC_USERNAME);
   } else if (strcmp(key, "user_sid") == 0 || strcmp(key, "target_user_sid") == 0) {
-    snprintf(f->user_sid, sizeof(f->user_sid), "%s", val);
+    (void)etw1_copy_text(f, f->user_sid, sizeof(f->user_sid), val, EDR_ETW_TRUNC_USER_SID);
   } else if (strcmp(key, "logon_id") == 0 || strcmp(key, "target_logon_id") == 0) {
-    snprintf(f->logon_id, sizeof(f->logon_id), "%s", val);
+    (void)etw1_copy_text(f, f->logon_id, sizeof(f->logon_id), val, EDR_ETW_TRUNC_LOGON_ID);
   } else if (strcmp(key, "user_domain") == 0 || strcmp(key, "subject_domain") == 0) {
-    snprintf(f->domain, sizeof(f->domain), "%s", val);
+    (void)etw1_copy_text(f, f->domain, sizeof(f->domain), val, EDR_ETW_TRUNC_DOMAIN);
   } else if (strcmp(key, "creator_user") == 0) {
-    snprintf(f->creator_user, sizeof(f->creator_user), "%s", val);
+    (void)etw1_copy_text(f, f->creator_user, sizeof(f->creator_user), val,
+                         EDR_ETW_TRUNC_CREATOR_USERNAME);
   } else if (strcmp(key, "creator_domain") == 0) {
-    snprintf(f->creator_domain, sizeof(f->creator_domain), "%s", val);
+    (void)etw1_copy_text(f, f->creator_domain, sizeof(f->creator_domain), val,
+                         EDR_ETW_TRUNC_CREATOR_DOMAIN);
   } else if (strcmp(key, "creator_sid") == 0) {
-    snprintf(f->creator_sid, sizeof(f->creator_sid), "%s", val);
+    (void)etw1_copy_text(f, f->creator_sid, sizeof(f->creator_sid), val,
+                         EDR_ETW_TRUNC_CREATOR_SID);
   } else if (strcmp(key, "creator_logon_id") == 0) {
-    snprintf(f->creator_logon_id, sizeof(f->creator_logon_id), "%s", val);
+    (void)etw1_copy_text(f, f->creator_logon_id, sizeof(f->creator_logon_id), val,
+                         EDR_ETW_TRUNC_CREATOR_LOGON_ID);
   } else if (strcmp(key, "parent_img") == 0 || strcmp(key, "parent_path") == 0) {
-    snprintf(f->parent_img, sizeof(f->parent_img), "%s", val);
-    f->has_parent_img = 1;
+    f->has_parent_img = etw1_copy_text(f, f->parent_img, sizeof(f->parent_img), val,
+                                       EDR_ETW_TRUNC_PARENT_IMAGE);
   } else if (strcmp(key, "parent_cmdline") == 0 || strcmp(key, "parent_cmd") == 0) {
-    snprintf(f->parent_cmdline, sizeof(f->parent_cmdline), "%s", val);
-    f->has_parent_cmdline = 1;
+    f->has_parent_cmdline = etw1_copy_text(f, f->parent_cmdline, sizeof(f->parent_cmdline), val,
+                                           EDR_ETW_TRUNC_PARENT_CMDLINE);
   } else if (strcmp(key, "current_directory") == 0 || strcmp(key, "cwd") == 0) {
-    snprintf(f->cwd, sizeof(f->cwd), "%s", val);
-    f->has_cwd = 1;
+    f->has_cwd = etw1_copy_text(f, f->cwd, sizeof(f->cwd), val,
+                                 EDR_ETW_TRUNC_CURRENT_DIRECTORY);
   } else if (strcmp(key, "integrity") == 0 || strcmp(key, "mandatory_label") == 0) {
-    snprintf(f->integrity, sizeof(f->integrity), "%s", val);
-    f->has_integrity = 1;
+    f->has_integrity = etw1_copy_text(f, f->integrity, sizeof(f->integrity), val,
+                                       EDR_ETW_TRUNC_INTEGRITY);
   } else if (strcmp(key, "token_elevation") == 0 || strcmp(key, "token_elevation_type") == 0) {
-    snprintf(f->token_elevation, sizeof(f->token_elevation), "%s", val);
-    f->has_token_elevation = 1;
+    f->has_token_elevation = etw1_copy_text(f, f->token_elevation, sizeof(f->token_elevation), val,
+                                             EDR_ETW_TRUNC_TOKEN_ELEVATION);
+  } else if (strcmp(key, "process_start_key") == 0) {
+    char *end = NULL;
+    unsigned long long value = strtoull(val, &end, 0);
+    if (end && *end == '\0' && value != 0u) {
+      f->process_start_key = (uint64_t)value;
+      f->has_process_start_key = 1;
+    }
+  } else if (strcmp(key, "process_creation_filetime_100ns") == 0 ||
+             strcmp(key, "create_filetime_100ns") == 0) {
+    char *end = NULL;
+    unsigned long long value = strtoull(val, &end, 0);
+    if (end && *end == '\0' && value != 0u) {
+      f->process_creation_filetime_100ns = (uint64_t)value;
+      f->has_process_creation_filetime = 1;
+    }
   } else if (strcmp(key, "process_creation_time") == 0 || strcmp(key, "create_time") == 0) {
-    snprintf(f->process_creation_time, sizeof(f->process_creation_time), "%s", val);
-    f->has_process_creation_time = 1;
+    f->has_process_creation_time = etw1_copy_text(
+        f, f->process_creation_time, sizeof(f->process_creation_time), val,
+        EDR_ETW_TRUNC_PROCESS_CREATION_TIME);
+  } else if (strcmp(key, "process_generation_source") == 0) {
+    f->has_process_generation_source = etw1_copy_text(
+        f, f->process_generation_source, sizeof(f->process_generation_source), val,
+        EDR_ETW_TRUNC_PROCESS_GENERATION_SOURCE);
   } else if (strcmp(key, "img") == 0) {
-    snprintf(f->img, sizeof(f->img), "%s", val);
-    f->has_img = 1;
+    f->has_img = etw1_copy_text(f, f->img, sizeof(f->img), val, EDR_ETW_TRUNC_IMAGE);
+  } else if (strcmp(key, "img_raw") == 0) {
+    (void)etw1_copy_text(f, f->image_raw, sizeof(f->image_raw), val, EDR_ETW_TRUNC_IMAGE_RAW);
+  } else if (strcmp(key, "img_canonical") == 0) {
+    (void)etw1_copy_text(f, f->image_canonical, sizeof(f->image_canonical), val,
+                         EDR_ETW_TRUNC_IMAGE_CANONICAL);
+  } else if (strcmp(key, "img_namespace") == 0) {
+    (void)etw1_copy_text(f, f->image_namespace, sizeof(f->image_namespace), val,
+                         EDR_ETW_TRUNC_IMAGE_NAMESPACE);
+  } else if (strcmp(key, "img_resolution_status") == 0) {
+    (void)etw1_copy_text(f, f->image_resolution_status, sizeof(f->image_resolution_status), val,
+                         EDR_ETW_TRUNC_IMAGE_RESOLUTION_STATUS);
+  } else if (strcmp(key, "img_resolution_source") == 0) {
+    (void)etw1_copy_text(f, f->image_resolution_source, sizeof(f->image_resolution_source), val,
+                         EDR_ETW_TRUNC_IMAGE_RESOLUTION_SOURCE);
+  } else if (strcmp(key, "source_completeness") == 0) {
+    (void)etw1_copy_text(f, f->source_completeness, sizeof(f->source_completeness), val,
+                         EDR_ETW_TRUNC_SOURCE_COMPLETENESS);
+  } else if (strcmp(key, "file_key") == 0) {
+    char *end = NULL;
+    unsigned long long value = strtoull(val, &end, 0);
+    if (end && *end == '\0' && value != 0u) {
+      f->file_key = (uint64_t)value;
+      f->has_file_key = 1;
+    }
+  } else if (strcmp(key, "collector_evidence_gate") == 0) {
+    snprintf(f->collector_evidence_gate, sizeof(f->collector_evidence_gate), "%s", val);
+  } else if (strcmp(key, "collector_evidence_reason") == 0) {
+    snprintf(f->collector_evidence_reason, sizeof(f->collector_evidence_reason), "%s", val);
+  } else if (strcmp(key, "collector_event_id") == 0) {
+    snprintf(f->collector_event_id, sizeof(f->collector_event_id), "%s", val);
+  } else if (strcmp(key, "evidence_revision") == 0) {
+    f->evidence_revision = parse_ulong_auto(val);
   } else if (strcmp(key, "cmd") == 0) {
-    snprintf(f->cmd, sizeof(f->cmd), "%s", val);
-    f->has_cmd = 1;
+    f->has_cmd = etw1_copy_text(f, f->cmd, sizeof(f->cmd), val, EDR_ETW_TRUNC_CMDLINE);
   } else if (strcmp(key, "cmd_id") == 0 || strcmp(key, "alert_id") == 0 ||
              strcmp(key, "pmfe_recommended") == 0 || strcmp(key, "pmfe_trigger") == 0 ||
              strcmp(key, "followup_only") == 0 ||
@@ -1127,21 +1454,22 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "sensor") == 0) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "path") == 0 && !f->file[0]) {
-    snprintf(f->file, sizeof(f->file), "%s", val);
+    (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);
   } else if (strcmp(key, "old_file") == 0 || strcmp(key, "old_path") == 0 ||
              strcmp(key, "source_file") == 0 || strcmp(key, "source_path") == 0 ||
              strcmp(key, "previous_file") == 0 || strcmp(key, "previous_path") == 0 ||
              strcmp(key, "rename_from") == 0) {
-    snprintf(f->old_file, sizeof(f->old_file), "%s", val);
+    (void)etw1_copy_text(f, f->old_file, sizeof(f->old_file), val,
+                         EDR_ETW_TRUNC_OLD_FILE_PATH);
   } else if (strcmp(key, "new_file") == 0 || strcmp(key, "new_path") == 0 ||
              strcmp(key, "target_file") == 0 || strcmp(key, "target_path") == 0 ||
              strcmp(key, "rename_to") == 0) {
-    snprintf(f->file, sizeof(f->file), "%s", val);
+    (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
   } else if (strcmp(key, "file") == 0) {
-    snprintf(f->file, sizeof(f->file), "%s", val);
+    (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);
   } else if (strcmp(key, "signer") == 0 || strcmp(key, "publisher") == 0 ||
              strcmp(key, "signature_publisher") == 0 || strcmp(key, "cert_subject") == 0) {
     snprintf(f->signer, sizeof(f->signer), "%s", val);
@@ -1151,7 +1479,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->signature_status, sizeof(f->signature_status), "%s", val);
     append_sensor_kv(f, "signature_status", val);
   } else if (strcmp(key, "qname") == 0) {
-    snprintf(f->qname, sizeof(f->qname), "%s", val);
+    (void)etw1_copy_text(f, f->qname, sizeof(f->qname), val, EDR_ETW_TRUNC_DNS_QUERY);
   } else if ((strcmp(key, "ip") == 0 || strcmp(key, "dest_ip") == 0 ||
               strcmp(key, "dst_ip") == 0 || strcmp(key, "remote_ip") == 0 ||
               strcmp(key, "remote_addr") == 0) && !f->dst[0]) {
@@ -1178,15 +1506,14 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "app_name") == 0) {
     if (!f->has_img && val[0]) {
-      snprintf(f->img, sizeof(f->img), "%s", val);
-      f->has_img = 1;
+      f->has_img = etw1_copy_text(f, f->img, sizeof(f->img), val, EDR_ETW_TRUNC_IMAGE);
     }
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "url") == 0 || strcmp(key, "remote_url") == 0 || strcmp(key, "domain") == 0) {
-    snprintf(f->url, sizeof(f->url), "%s", val);
+    (void)etw1_copy_text(f, f->url, sizeof(f->url), val, EDR_ETW_TRUNC_DNS_QUERY);
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "sha256") == 0 || strcmp(key, "file_sha256") == 0 || strcmp(key, "file_hash") == 0) {
-    snprintf(f->sha256, sizeof(f->sha256), "%s", val);
+    (void)etw1_copy_text(f, f->sha256, sizeof(f->sha256), val, EDR_ETW_TRUNC_EXE_HASH);
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "sensor") == 0 || strcmp(key, "provider") == 0 || strcmp(key, "scriptblock_id") == 0 ||
              strcmp(key, "amsi_result") == 0 || strcmp(key, "script_hash") == 0 ||
@@ -1253,7 +1580,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "score") == 0) {
     snprintf(f->score, sizeof(f->score), "%s", val);
   } else if (strcmp(key, "proto") == 0) {
-    snprintf(f->proto, sizeof(f->proto), "%s", val);
+    (void)etw1_copy_text(f, f->proto, sizeof(f->proto), val, EDR_ETW_TRUNC_NET_PROTO);
   } else if (strcmp(key, "detector") == 0) {
     snprintf(f->detector, sizeof(f->detector), "%s", val);
   } else if (strcmp(key, "rule") == 0) {
@@ -1319,21 +1646,25 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     snprintf(f->shellcode_json, sizeof(f->shellcode_json), "%s", val);
   } else if (strcmp(key, "regkey") == 0 || strcmp(key, "registry_key") == 0 ||
              strcmp(key, "registry_path") == 0 || strcmp(key, "target_object") == 0) {
-    snprintf(f->regkey, sizeof(f->regkey), "%s", val);
+    (void)etw1_copy_text(f, f->regkey, sizeof(f->regkey), val,
+                         EDR_ETW_TRUNC_REG_KEY_PATH);
   } else if ((strcmp(key, "regpath") == 0 || strcmp(key, "key_path") == 0) && !f->regkey[0]) {
-    snprintf(f->regkey, sizeof(f->regkey), "%s", val);
+    (void)etw1_copy_text(f, f->regkey, sizeof(f->regkey), val,
+                         EDR_ETW_TRUNC_REG_KEY_PATH);
   } else if (strcmp(key, "regname") == 0 || strcmp(key, "registry_value") == 0 ||
              strcmp(key, "value_name") == 0) {
-    snprintf(f->regname, sizeof(f->regname), "%s", val);
+    (void)etw1_copy_text(f, f->regname, sizeof(f->regname), val,
+                         EDR_ETW_TRUNC_REG_VALUE_NAME);
   } else if (strcmp(key, "regdata") == 0 || strcmp(key, "registry_data") == 0 ||
              strcmp(key, "value_data") == 0 || strcmp(key, "details") == 0) {
     snprintf(f->regdata, sizeof(f->regdata), "%s", val);
   } else if (strcmp(key, "regold") == 0 || strcmp(key, "registry_old_data") == 0 ||
              strcmp(key, "old_value_data") == 0) {
-    snprintf(f->regold, sizeof(f->regold), "%s", val);
+    (void)etw1_copy_text(f, f->regold, sizeof(f->regold), val,
+                         EDR_ETW_TRUNC_REG_OLD_VALUE_DATA);
   } else if (strcmp(key, "regop") == 0 || strcmp(key, "registry_op") == 0 ||
              strcmp(key, "operation") == 0) {
-    snprintf(f->regop, sizeof(f->regop), "%s", val);
+    (void)etw1_copy_text(f, f->regop, sizeof(f->regop), val, EDR_ETW_TRUNC_REG_OP);
   } else if (strcmp(key, "registry_source") == 0) {
     snprintf(f->regsource, sizeof(f->regsource), "%s", val);
   } else if (strcmp(key, "registry_attribution") == 0) {
@@ -1436,6 +1767,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 
   Etw1Fields ef;
   if (slot->size > 0 && etw1_parse(slot->data, slot->size, &ef) == 0) {
+    mark_etw1_input_truncations(r, ef.truncation_mask);
     if (strcmp(ef.prov, "sec") == 0 && ef.eid == 4688u) {
       r->is_security_4688 = 1u;
     }
@@ -1449,83 +1781,152 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       r->ppid = (uint32_t)ef.ppid;
     }
     if (ef.has_img) {
-      snprintf(r->exe_path, sizeof(r->exe_path), "%s", ef.img);
-      snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(ef.img));
+      (void)copy_record_source_text(r, r->exe_path, sizeof(r->exe_path), ef.img, "exe_path");
+      (void)copy_record_source_text(r, r->process_name, sizeof(r->process_name),
+                                    basename_c(ef.img), "process_name");
+    }
+    if (ef.image_raw[0]) {
+      (void)copy_record_source_text(r, r->image_path_raw, sizeof(r->image_path_raw),
+                                    ef.image_raw, "image_path_raw");
+    } else if (ef.img[0]) {
+      (void)copy_record_source_text(r, r->image_path_raw, sizeof(r->image_path_raw), ef.img,
+                                    "image_path_raw");
+    }
+    (void)copy_record_source_text(r, r->image_path_canonical,
+                                  sizeof(r->image_path_canonical), ef.image_canonical,
+                                  "image_path_canonical");
+    (void)copy_record_source_text(r, r->image_path_namespace,
+                                  sizeof(r->image_path_namespace), ef.image_namespace,
+                                  "image_path_namespace");
+    (void)copy_record_source_text(r, r->image_path_resolution_status,
+                                  sizeof(r->image_path_resolution_status),
+                                  ef.image_resolution_status, "image_path_resolution_status");
+    (void)copy_record_source_text(r, r->image_path_resolution_source,
+                                  sizeof(r->image_path_resolution_source),
+                                  ef.image_resolution_source, "image_path_resolution_source");
+    (void)copy_record_source_text(r, r->source_completeness,
+                                  sizeof(r->source_completeness), ef.source_completeness,
+                                  "source_completeness");
+    if (ef.has_file_key) {
+      r->file_key = ef.file_key;
+    }
+    if (strcmp(ef.collector_evidence_gate, EDR_P0_FILE_READ_METADATA_GATE) == 0) {
+      snprintf(r->collector_evidence_gate, sizeof(r->collector_evidence_gate), "%s",
+               ef.collector_evidence_gate);
+      snprintf(r->collector_evidence_reason, sizeof(r->collector_evidence_reason), "%s",
+               ef.collector_evidence_reason);
+      /* This identifier originates only in the collector's synthetic
+       * NameCreate capacity gate.  Reusing it across retries lets the
+       * existing durable queue apply its normal exact-idempotency behavior. */
+      if (strncmp(ef.collector_event_id, "filemeta-", 9u) == 0) {
+        snprintf(r->event_id, sizeof(r->event_id), "%s", ef.collector_event_id);
+      }
+    }
+    r->evidence_revision = (uint32_t)ef.evidence_revision;
+    if (ef.image_canonical[0] && strcmp(ef.image_resolution_status, "RESOLVED") == 0) {
+      (void)copy_record_source_text(r, r->exe_path, sizeof(r->exe_path),
+                                    ef.image_canonical, "exe_path");
+      (void)copy_record_source_text(r, r->process_name, sizeof(r->process_name),
+                                    basename_c(ef.image_canonical), "process_name");
     }
     if (ef.has_cmd) {
-      snprintf(r->cmdline, sizeof(r->cmdline), "%s", ef.cmd);
+      (void)copy_record_source_text(r, r->cmdline, sizeof(r->cmdline), ef.cmd, "cmdline");
       if (!r->exe_path[0]) {
         char first[EDR_BR_STR_LONG];
         first_cmd_token(ef.cmd, first, sizeof(first));
         if (first[0]) {
-          snprintf(r->exe_path, sizeof(r->exe_path), "%s", first);
-          snprintf(r->process_name, sizeof(r->process_name), "%s", basename_c(first));
+          (void)copy_record_source_text(r, r->exe_path, sizeof(r->exe_path), first, "exe_path");
+          (void)copy_record_source_text(r, r->process_name, sizeof(r->process_name),
+                                        basename_c(first), "process_name");
         }
       }
     }
+    if (has_ci_ascii(r->process_name, "cmd.exe") || has_ci_ascii(r->exe_path, "cmd.exe")) {
+      char artifact[EDR_BR_STR_LONG];
+      cmd_script_artifact(r->cmdline, artifact, sizeof(artifact));
+      if (artifact[0]) snprintf(r->file_path, sizeof(r->file_path), "%s", artifact);
+    }
     if (identity_value_present(ef.creator_user) || identity_value_present(ef.creator_domain) ||
         identity_value_present(ef.creator_sid) || identity_value_present(ef.creator_logon_id)) {
-      snprintf(r->creator_username, sizeof(r->creator_username), "%s", ef.creator_user);
-      snprintf(r->creator_domain, sizeof(r->creator_domain), "%s", ef.creator_domain);
-      snprintf(r->creator_sid, sizeof(r->creator_sid), "%s", ef.creator_sid);
-      snprintf(r->creator_logon_id, sizeof(r->creator_logon_id), "%s", ef.creator_logon_id);
+      (void)copy_record_source_text(r, r->creator_username, sizeof(r->creator_username),
+                                    ef.creator_user, "creator_username");
+      (void)copy_record_source_text(r, r->creator_domain, sizeof(r->creator_domain),
+                                    ef.creator_domain, "creator_domain");
+      (void)copy_record_source_text(r, r->creator_sid, sizeof(r->creator_sid),
+                                    ef.creator_sid, "creator_sid");
+      (void)copy_record_source_text(r, r->creator_logon_id, sizeof(r->creator_logon_id),
+                                    ef.creator_logon_id, "creator_logon_id");
     }
     int target_present = identity_value_present(ef.user) || identity_value_present(ef.domain) ||
                          identity_value_present(ef.user_sid) || identity_value_present(ef.logon_id);
     if (identity_value_present(ef.user)) {
       if (ef.domain[0]) {
-        snprintf(r->username, sizeof(r->username), "%s\\%s", ef.domain, ef.user);
+        (void)copy_record_username(r, ef.domain, ef.user);
       } else {
-        snprintf(r->username, sizeof(r->username), "%s", ef.user);
+        (void)copy_record_source_text(r, r->username, sizeof(r->username), ef.user, "username");
       }
     }
     if (identity_value_present(ef.domain)) {
-      snprintf(r->domain, sizeof(r->domain), "%s", ef.domain);
+      (void)copy_record_source_text(r, r->domain, sizeof(r->domain), ef.domain, "domain");
     }
     if (identity_value_present(ef.user_sid)) {
-      snprintf(r->user_sid, sizeof(r->user_sid), "%s", ef.user_sid);
+      (void)copy_record_source_text(r, r->user_sid, sizeof(r->user_sid), ef.user_sid, "user_sid");
     }
     if (identity_value_present(ef.logon_id)) {
-      snprintf(r->logon_id, sizeof(r->logon_id), "%s", ef.logon_id);
+      (void)copy_record_source_text(r, r->logon_id, sizeof(r->logon_id), ef.logon_id, "logon_id");
     }
     if (target_present) {
       snprintf(r->identity_source, sizeof(r->identity_source), "%s", "target_4688");
       snprintf(r->identity_quality, sizeof(r->identity_quality), "%s", "target_4688");
     } else if (identity_value_present(r->creator_username) || identity_value_present(r->creator_domain) ||
                identity_value_present(r->creator_sid) || identity_value_present(r->creator_logon_id)) {
-      if (r->creator_domain[0]) {
-        snprintf(r->username, sizeof(r->username), "%s\\%s", r->creator_domain, r->creator_username);
-      } else {
-        snprintf(r->username, sizeof(r->username), "%s", r->creator_username);
-      }
-      snprintf(r->domain, sizeof(r->domain), "%s", r->creator_domain);
-      snprintf(r->user_sid, sizeof(r->user_sid), "%s", r->creator_sid);
-      snprintf(r->logon_id, sizeof(r->logon_id), "%s", r->creator_logon_id);
+      /* Security 4688 Creator Subject is the launching principal, not the
+       * created process token.  Preserve it only in creator_* fields; never
+       * promote it into the effective process identity. */
       snprintf(r->identity_source, sizeof(r->identity_source), "%s", "creator_fallback");
       snprintf(r->identity_quality, sizeof(r->identity_quality), "%s", "creator_fallback");
     }
     if (ef.has_parent_img) {
-      snprintf(r->parent_path, sizeof(r->parent_path), "%s", ef.parent_img);
-      snprintf(r->parent_name, sizeof(r->parent_name), "%s", basename_c(ef.parent_img));
+      (void)copy_record_source_text(r, r->parent_path, sizeof(r->parent_path),
+                                    ef.parent_img, "parent_path");
+      (void)copy_record_source_text(r, r->parent_name, sizeof(r->parent_name),
+                                    basename_c(ef.parent_img), "parent_name");
     }
     if (ef.has_parent_cmdline) {
-      snprintf(r->parent_cmdline, sizeof(r->parent_cmdline), "%s", ef.parent_cmdline);
+      (void)copy_record_source_text(r, r->parent_cmdline, sizeof(r->parent_cmdline),
+                                    ef.parent_cmdline, "parent_cmdline");
     }
     if (ef.has_cwd) {
-      snprintf(r->current_directory, sizeof(r->current_directory), "%s", ef.cwd);
+      (void)copy_record_source_text(r, r->current_directory, sizeof(r->current_directory),
+                                    ef.cwd, "current_directory");
     }
     if (ef.has_integrity) {
-      snprintf(r->integrity_level, sizeof(r->integrity_level), "%s", ef.integrity);
+      (void)copy_record_source_text(r, r->integrity_level, sizeof(r->integrity_level),
+                                    ef.integrity, "integrity_level");
     }
     if (ef.has_token_elevation) {
       r->token_elevation = parse_token_elevation_type(ef.token_elevation);
     }
     if (ef.has_process_creation_time) {
-      snprintf(r->process_creation_time, sizeof(r->process_creation_time), "%s", ef.process_creation_time);
+      (void)copy_record_source_text(r, r->process_creation_time,
+                                    sizeof(r->process_creation_time), ef.process_creation_time,
+                                    "process_creation_time");
+    }
+    if (ef.has_process_start_key) {
+      r->process_start_key = ef.process_start_key;
+    }
+    if (ef.has_process_creation_filetime) {
+      r->process_creation_filetime_100ns = ef.process_creation_filetime_100ns;
+    }
+    if (ef.has_process_generation_source) {
+      (void)copy_record_source_text(r, r->process_generation_source,
+                                    sizeof(r->process_generation_source),
+                                    ef.process_generation_source, "process_generation_source");
     }
     if (ef.file[0]) {
-      snprintf(r->file_path, sizeof(r->file_path), "%s", ef.file);
-      snprintf(r->file_op, sizeof(r->file_op), "event");
+      (void)copy_record_source_text(r, r->file_path, sizeof(r->file_path), ef.file, "file_path");
+      snprintf(r->file_op, sizeof(r->file_op), "%s",
+               r->type == EDR_EVENT_FILE_READ ? "read" : "event");
     }
     if (ef.old_file[0]) {
       char old_ext[16];
@@ -1536,13 +1937,16 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                        old_ext, new_ext, strcmp(old_ext, new_ext) != 0 ? 1 : 0);
     }
     if (ef.qname[0]) {
-      snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.qname);
+      (void)copy_record_source_text(r, r->dns_query, sizeof(r->dns_query), ef.qname,
+                                    "dns_query");
     }
     if (ef.url[0] && !r->dns_query[0]) {
-      snprintf(r->dns_query, sizeof(r->dns_query), "%s", ef.url);
+      (void)copy_record_source_text(r, r->dns_query, sizeof(r->dns_query), ef.url,
+                                    "dns_query");
     }
     if (ef.sha256[0]) {
-      snprintf(r->exe_hash, sizeof(r->exe_hash), "%s", ef.sha256);
+      (void)copy_record_source_text(r, r->exe_hash, sizeof(r->exe_hash), ef.sha256,
+                                    "exe_hash");
     }
     if (ef.script[0]) {
       snprintf(r->script_snippet, sizeof(r->script_snippet), "%s", ef.script);
@@ -1566,25 +1970,31 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->file_op, sizeof(r->file_op), "%s", "firewall_etw");
     }
     if (ef.proto[0]) {
-      snprintf(r->net_proto, sizeof(r->net_proto), "%s", ef.proto);
+      (void)copy_record_source_text(r, r->net_proto, sizeof(r->net_proto), ef.proto,
+                                    "net_proto");
     }
     if (ef.has_cert_revoked_ancestor) {
       r->cert_revoked_ancestor = ef.cert_revoked_ancestor;
     }
     if (ef.regkey[0]) {
-      snprintf(r->reg_key_path, sizeof(r->reg_key_path), "%s", ef.regkey);
+      (void)copy_record_source_text(r, r->reg_key_path, sizeof(r->reg_key_path), ef.regkey,
+                                    "reg_key_path");
     }
     if (ef.regname[0]) {
-      snprintf(r->reg_value_name, sizeof(r->reg_value_name), "%s", ef.regname);
+      (void)copy_record_source_text(r, r->reg_value_name, sizeof(r->reg_value_name),
+                                    ef.regname, "reg_value_name");
     }
     if (ef.regdata[0]) {
       snprintf(r->reg_value_data, sizeof(r->reg_value_data), "%s", ef.regdata);
     }
     if (ef.regold[0]) {
-      snprintf(r->reg_old_value_data, sizeof(r->reg_old_value_data), "%s", ef.regold);
+      (void)copy_record_source_text(r, r->reg_old_value_data,
+                                    sizeof(r->reg_old_value_data), ef.regold,
+                                    "reg_old_value_data");
     }
     if (ef.regop[0]) {
-      snprintf(r->reg_op, sizeof(r->reg_op), "%s", ef.regop);
+      (void)copy_record_source_text(r, r->reg_op, sizeof(r->reg_op), ef.regop,
+                                    "reg_op");
     }
     snprintf(r->reg_source, sizeof(r->reg_source), "%s",
              ef.regsource[0] ? ef.regsource : ef.prov);
@@ -1652,6 +2062,12 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       size_t L = strlen(r->script_snippet);
       snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, "%s%s",
                L > 0u ? " " : "", ef.sensor_detail);
+    }
+    /* Later ETW metadata can describe a normal source state, but it cannot
+     * erase a field omission detected while parsing this same record. */
+    if (ef.truncation_mask != 0u) {
+      (void)copy_text_exact(r->source_completeness, sizeof(r->source_completeness),
+                            "TRUNCATED");
     }
   } else if (slot->size > 0) {
     size_t n = slot->size;

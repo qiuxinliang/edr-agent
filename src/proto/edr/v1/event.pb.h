@@ -16,7 +16,7 @@
 typedef struct _edr_v1_AveBehaviorEventFeed {
     uint32_t severity_hint;
     /* 文件 / 注册表 / DLL 等路径类目标（§4.1 目标字段） */
-    char target_path[1024];
+    char target_path[4096];
     float target_path_entropy;
     bool target_is_system_dir;
     bool target_is_temp_dir;
@@ -76,6 +76,10 @@ typedef struct _edr_v1_BehaviorAlert {
     /* 进程快照冗余：同时写入 BehaviorEvent.ppid/cmdline，兼容只解析外层事件的旧平台。 */
     uint32_t ppid;
     char cmdline[1024];
+    /* user_subject_json is the sole subject JSON authority. Its availability is
+ explicit for pure alerts that have no subject context to serialize. */
+    char user_subject_status[16];
+    char user_subject_withheld_reason[64];
 } edr_v1_BehaviorAlert;
 
 typedef struct _edr_v1_ProcessDetail {
@@ -84,8 +88,8 @@ typedef struct _edr_v1_ProcessDetail {
     char integrity_level[64];
     /* 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
  端侧已采集，补齐上报供服务端进程链/研判使用。 */
-    char parent_cmdline[1024];
-    char current_directory[1024];
+    char parent_cmdline[4096];
+    char current_directory[4096];
     char process_creation_time[64];
     uint32_t token_elevation;
     uint32_t grandparent_pid;
@@ -95,7 +99,7 @@ typedef struct _edr_v1_ProcessDetail {
 
 typedef struct _edr_v1_FileDetail {
     char operation[32];
-    char target_path[1024];
+    char target_path[4096];
     uint64_t file_size;
     /* * 《11》§5.3 维 35：与 `AVEBehaviorEvent.target_has_motw` 对齐（MOTW / Zone.Identifier 等） */
     bool target_has_motw;
@@ -118,7 +122,7 @@ typedef struct _edr_v1_NetworkDetail {
     uint32_t dst_port;
     char protocol[16];
     /* 与 EdrBehaviorRecord.network_aux_path / 平台 `network_aux_path` 一致（如进程映像路径，供规则侧与 ingest 对拍） */
-    char network_aux_path[1024];
+    char network_aux_path[4096];
 } edr_v1_NetworkDetail;
 
 typedef struct _edr_v1_DnsDetail {
@@ -126,7 +130,7 @@ typedef struct _edr_v1_DnsDetail {
 } edr_v1_DnsDetail;
 
 typedef struct _edr_v1_ScriptDetail {
-    char snippet[1024];
+    char snippet[4096];
 } edr_v1_ScriptDetail;
 
 /* BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。 */
@@ -139,9 +143,9 @@ typedef struct _edr_v1_BehaviorEvent {
     uint32_t pid;
     uint32_t ppid;
     char process_name[256];
-    char cmdline[1024];
+    char cmdline[4096];
     char exe_hash[65];
-    char exe_path[1024];
+    char exe_path[4096];
     char username[256];
     uint32_t session_id;
     /* 自根进程向上的父链跳数（与平台 dynamic_rules `process_chain_depth_gt` 对齐；0 表示未计算/未携带） */
@@ -177,6 +181,36 @@ typedef struct _edr_v1_BehaviorEvent {
     char creator_logon_id[64];
     char identity_source[32];
     char identity_quality[32];
+    /* Lossless process-generation and image-resolution evidence. These mirror
+ EdrBehaviorRecord directly so ordinary alerts and source-only P0 records
+ carry the same event-time provenance. */
+    uint64_t process_start_key;
+    uint64_t process_creation_filetime_100ns;
+    char process_generation_source[64];
+    char image_path_raw[4096];
+    char image_path_canonical[4096];
+    char image_path_namespace[32];
+    char image_path_resolution_status[32];
+    char image_path_resolution_source[32];
+    char source_completeness[32];
+    uint32_t evidence_revision;
+    char parent_resolution_status[32];
+    char parent_resolution_source[32];
+    /* Parent creation time is a captured string only. No parent StartKey or
+ FILETIME is implied when the Agent did not observe one. */
+    char parent_creation_time[64];
+    /* Transport completeness is separate from source collection completeness.
+ `truncated_fields` is a bounded, de-duplicated comma list: source-side
+ withheld fields are qualified as `source.<field>`, while encoder-side
+ projection clips keep their historic field names. An explicit `*.list_overflow`
+ marker means the list of named fields is itself incomplete. */
+    char transport_completeness[32];
+    char truncated_fields[512];
+    /* Raw parent identity remains top-level so a file/network/registry detail
+ does not displace it through the detail oneof. ProcessDetail remains the
+ explicit legacy location for older producers and consumers. */
+    char parent_name[256];
+    char parent_path[512];
 } edr_v1_BehaviorEvent;
 
 
@@ -186,8 +220,8 @@ extern "C" {
 
 /* Initializer values for message structs */
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
-#define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
-#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", ""}
+#define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
+#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", ""}
 #define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
@@ -195,8 +229,8 @@ extern "C" {
 #define edr_v1_DnsDetail_init_default            {""}
 #define edr_v1_ScriptDetail_init_default         {""}
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
-#define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, ""}
-#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", ""}
+#define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
+#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", ""}
 #define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
@@ -247,6 +281,8 @@ extern "C" {
 #define edr_v1_BehaviorAlert_user_subject_json_tag 11
 #define edr_v1_BehaviorAlert_ppid_tag            12
 #define edr_v1_BehaviorAlert_cmdline_tag         13
+#define edr_v1_BehaviorAlert_user_subject_status_tag 14
+#define edr_v1_BehaviorAlert_user_subject_withheld_reason_tag 15
 #define edr_v1_ProcessDetail_parent_name_tag     1
 #define edr_v1_ProcessDetail_parent_path_tag     2
 #define edr_v1_ProcessDetail_integrity_level_tag 3
@@ -307,6 +343,23 @@ extern "C" {
 #define edr_v1_BehaviorEvent_creator_logon_id_tag 48
 #define edr_v1_BehaviorEvent_identity_source_tag 49
 #define edr_v1_BehaviorEvent_identity_quality_tag 50
+#define edr_v1_BehaviorEvent_process_start_key_tag 51
+#define edr_v1_BehaviorEvent_process_creation_filetime_100ns_tag 52
+#define edr_v1_BehaviorEvent_process_generation_source_tag 53
+#define edr_v1_BehaviorEvent_image_path_raw_tag  54
+#define edr_v1_BehaviorEvent_image_path_canonical_tag 55
+#define edr_v1_BehaviorEvent_image_path_namespace_tag 56
+#define edr_v1_BehaviorEvent_image_path_resolution_status_tag 57
+#define edr_v1_BehaviorEvent_image_path_resolution_source_tag 58
+#define edr_v1_BehaviorEvent_source_completeness_tag 59
+#define edr_v1_BehaviorEvent_evidence_revision_tag 60
+#define edr_v1_BehaviorEvent_parent_resolution_status_tag 61
+#define edr_v1_BehaviorEvent_parent_resolution_source_tag 62
+#define edr_v1_BehaviorEvent_parent_creation_time_tag 63
+#define edr_v1_BehaviorEvent_transport_completeness_tag 64
+#define edr_v1_BehaviorEvent_truncated_fields_tag 65
+#define edr_v1_BehaviorEvent_parent_name_tag     66
+#define edr_v1_BehaviorEvent_parent_path_tag     67
 
 /* Struct field encoding specification for nanopb */
 #define edr_v1_AveBehaviorEventFeed_FIELDLIST(X, a) \
@@ -355,7 +408,9 @@ X(a, STATIC,   SINGULAR, STRING,   process_path,      9) \
 X(a, STATIC,   SINGULAR, STRING,   related_iocs_json,  10) \
 X(a, STATIC,   SINGULAR, STRING,   user_subject_json,  11) \
 X(a, STATIC,   SINGULAR, UINT32,   ppid,             12) \
-X(a, STATIC,   SINGULAR, STRING,   cmdline,          13)
+X(a, STATIC,   SINGULAR, STRING,   cmdline,          13) \
+X(a, STATIC,   SINGULAR, STRING,   user_subject_status,  14) \
+X(a, STATIC,   SINGULAR, STRING,   user_subject_withheld_reason,  15)
 #define edr_v1_BehaviorAlert_CALLBACK NULL
 #define edr_v1_BehaviorAlert_DEFAULT NULL
 
@@ -393,7 +448,24 @@ X(a, STATIC,   SINGULAR, STRING,   creator_domain,   46) \
 X(a, STATIC,   SINGULAR, STRING,   creator_sid,      47) \
 X(a, STATIC,   SINGULAR, STRING,   creator_logon_id,  48) \
 X(a, STATIC,   SINGULAR, STRING,   identity_source,  49) \
-X(a, STATIC,   SINGULAR, STRING,   identity_quality,  50)
+X(a, STATIC,   SINGULAR, STRING,   identity_quality,  50) \
+X(a, STATIC,   SINGULAR, UINT64,   process_start_key,  51) \
+X(a, STATIC,   SINGULAR, UINT64,   process_creation_filetime_100ns,  52) \
+X(a, STATIC,   SINGULAR, STRING,   process_generation_source,  53) \
+X(a, STATIC,   SINGULAR, STRING,   image_path_raw,   54) \
+X(a, STATIC,   SINGULAR, STRING,   image_path_canonical,  55) \
+X(a, STATIC,   SINGULAR, STRING,   image_path_namespace,  56) \
+X(a, STATIC,   SINGULAR, STRING,   image_path_resolution_status,  57) \
+X(a, STATIC,   SINGULAR, STRING,   image_path_resolution_source,  58) \
+X(a, STATIC,   SINGULAR, STRING,   source_completeness,  59) \
+X(a, STATIC,   SINGULAR, UINT32,   evidence_revision,  60) \
+X(a, STATIC,   SINGULAR, STRING,   parent_resolution_status,  61) \
+X(a, STATIC,   SINGULAR, STRING,   parent_resolution_source,  62) \
+X(a, STATIC,   SINGULAR, STRING,   parent_creation_time,  63) \
+X(a, STATIC,   SINGULAR, STRING,   transport_completeness,  64) \
+X(a, STATIC,   SINGULAR, STRING,   truncated_fields,  65) \
+X(a, STATIC,   SINGULAR, STRING,   parent_name,      66) \
+X(a, STATIC,   SINGULAR, STRING,   parent_path,      67)
 #define edr_v1_BehaviorEvent_CALLBACK NULL
 #define edr_v1_BehaviorEvent_DEFAULT NULL
 #define edr_v1_BehaviorEvent_detail_process_MSGTYPE edr_v1_ProcessDetail
@@ -478,15 +550,15 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
-#define edr_v1_AveBehaviorEventFeed_size         1792
-#define edr_v1_BehaviorAlert_size                11110
-#define edr_v1_BehaviorEvent_size                31269
+#define edr_v1_AveBehaviorEventFeed_size         4864
+#define edr_v1_BehaviorAlert_size                11192
+#define edr_v1_BehaviorEvent_size                50570
 #define edr_v1_DnsDetail_size                    514
-#define edr_v1_FileDetail_size                   1072
-#define edr_v1_NetworkDetail_size                1185
-#define edr_v1_ProcessDetail_size                3738
+#define edr_v1_FileDetail_size                   4144
+#define edr_v1_NetworkDetail_size                4257
+#define edr_v1_ProcessDetail_size                9882
 #define edr_v1_RegistryDetail_size               9767
-#define edr_v1_ScriptDetail_size                 1026
+#define edr_v1_ScriptDetail_size                 4098
 
 #ifdef __cplusplus
 } /* extern "C" */

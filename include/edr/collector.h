@@ -107,14 +107,57 @@ typedef struct {
     uint64_t process_create_missing_identity;
     uint64_t process_identity_cache_hits;
     uint64_t process_identity_cache_misses;
+    int process_start_key_requested;
+    int process_start_key_enabled;
+    uint64_t process_start_key_enable_failures;
+    uint64_t process_start_key_missing_events;
+    char process_start_key_reason[96];
+    /* Kernel-File Id/Task 15 read path: FileKey→NameCreate binding plus
+     * exact ProcessStartKey actor generation.  Misses are fail-closed. */
+    uint64_t file_read_name_bindings;
+    uint64_t file_read_name_cache_misses;
+    uint64_t file_read_critical_binding_capacity_exhausted;
+    /* A protected FileKey cache failure is held in a single non-overwrite
+     * source-only gate slot until the existing SQLite queue accepts it. */
+    int file_read_p0_capability_healthy;
+    uint64_t file_read_metadata_gate_staged;
+    uint64_t file_read_metadata_gate_enqueue_attempts;
+    uint64_t file_read_metadata_gate_queue_rejected;
+    uint64_t file_read_metadata_gate_durable_successes;
+    uint64_t file_read_metadata_gate_durable_failures;
+    uint64_t file_read_metadata_gate_retry_attempts;
+    uint64_t file_read_metadata_gate_paused_events;
+    uint64_t file_read_metadata_gate_epoch_restart_attempts;
+    uint64_t file_read_metadata_gate_epoch_restart_successes;
+    uint64_t file_read_metadata_gate_epoch_restart_failures;
+    char file_read_p0_capability_reason[96];
+    uint64_t file_read_generation_unavailable;
+    uint64_t file_read_actor_generation_unavailable;
+    /* Kernel-File has its own EnableTraceEx2 request; do not infer this from
+     * the separate Kernel-Process provider health. */
+    int kernel_file_start_key_requested;
+    int kernel_file_start_key_enabled;
+    uint64_t kernel_file_start_key_enable_failures;
+    char kernel_file_start_key_reason[96];
     uint64_t ordinary_file_dropped;
     uint64_t ordinary_registry_dropped;
     uint64_t ordinary_network_dropped;
     uint64_t metadata_dropped;
     int sensor_interest_enabled;
     int sensor_interest_loaded;
+    int sensor_interest_file_read_full_admission;
+    int sensor_interest_file_write_full_admission;
+    int sensor_interest_registry_set_full_admission;
+    int sensor_interest_full_admission_contract_valid;
+    int sensor_interest_p0_binding_valid;
     char sensor_interest_version[128];
     char sensor_interest_rules_version[128];
+    char sensor_interest_p0_artifact_sha256[65];
+    char sensor_interest_p0_rule_coverage_sha256[65];
+    char sensor_interest_manifest_sha256[65];
+    char sensor_interest_manifest_hash_mode[64];
+    uint32_t sensor_interest_p0_artifact_rule_count;
+    uint64_t sensor_interest_snapshot_epoch;
     uint32_t sensor_interest_process_names;
     uint32_t sensor_interest_process_prefixes;
     uint32_t sensor_interest_ports;
@@ -163,6 +206,26 @@ int edr_collector_get_health(EdrCollectorHealth *out_health);
  */
 void edr_collector_register_policy_canary_process(uint32_t pid, const char *command);
 
+#ifdef _WIN32
+/* The collector owns the FileKey gate slot.  Preprocess calls retry from its
+ * normal loop and reports the existing SQLite durable-write result; neither
+ * function creates a new queue or persistent table. `outcome` is 1 for a
+ * committed record, 2 for a retained source-only retry owner, and 0 for an
+ * unhealthy/lost admission that must keep FileRead P0 disabled. */
+void edr_collector_file_read_metadata_gate_retry(void);
+void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
+                                                            int outcome);
+/* The Agent lifecycle owns the stop/join/start orchestration.  The collector
+ * exposes only the latched requirement and records its outcome so a failed
+ * restart cannot make FileRead P0 appear healthy. */
+int edr_collector_file_read_metadata_gate_restart_required(void);
+void edr_collector_file_read_metadata_gate_restart_attempted(void);
+void edr_collector_file_read_metadata_gate_restart_failed(void);
+/* A stop/join timeout retains the old ETW/A4.4 resources.  It is terminal for
+ * automatic recovery: a later start would otherwise overlap provider epochs. */
+void edr_collector_file_read_metadata_gate_restart_timeout(void);
+#endif
+
 /**
  * 启动采集：Windows 为 ETW 会话（Kernel-Process / File / Network 等）；Linux（M1）为 inotify 目录监视；其它 POSIX 为 stub。
  * 使用 `cfg->collection.etw_enabled`；Windows 另读 `etw_*_provider` 系列（见 `config.h` 与 §19.10，含 A4.3 四项可选 Provider）。
@@ -170,8 +233,11 @@ void edr_collector_register_policy_canary_process(uint32_t pid, const char *comm
  */
 EdrError edr_collector_start(struct EdrEventBus *bus, const struct EdrConfig *cfg);
 
-/** 停止会话并 join 消费线程（可重复调用）。 */
-void edr_collector_stop(void);
+/**
+ * 停止会话并 join 消费线程（可重复调用）。仅在线程和 A4.4 已全部 join
+ * 后返回 1；超时返回 0 并保留所有仍被线程引用的资源。
+ */
+int edr_collector_stop(void);
 
 /**
  * 按固定会话名尝试停止可能残留的 ETW 实时会话（无需本进程曾 StartTrace）。

@@ -21,9 +21,36 @@ print_build_fingerprint() {
 }
 
 BUILD_DIR="$ROOT/build-product"
+VCPKG_ROOT="${EDR_PCRE2_VCPKG_ROOT:-}"
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "ERROR: ci_build.sh is a native Linux production path. Use scripts/build_linux_native_docker.sh outside Linux." >&2
+  exit 2
+fi
+if [[ -z "$VCPKG_ROOT" || ! -d "$VCPKG_ROOT/.git" ]]; then
+  echo "ERROR: set EDR_PCRE2_VCPKG_ROOT to a clean vcpkg checkout pinned by dependencies.lock.json." >&2
+  exit 2
+fi
+case "$(uname -m)" in
+  x86_64|amd64)
+    PCRE2_TARGET="linux/amd64"
+    ;;
+  aarch64|arm64)
+    PCRE2_TARGET="linux/arm64"
+    ;;
+  *)
+    echo "ERROR: unsupported native Linux CPU for the production matcher: $(uname -m)" >&2
+    exit 2
+    ;;
+esac
+mkdir -p "$BUILD_DIR"
 
 echo "=== CMake: product build (HTTP ingest/control, no gRPC) ==="
-cmake -B "$BUILD_DIR" -DEDR_WITH_GRPC=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -B "$BUILD_DIR" -DEDR_REQUIRE_PCRE2=ON \
+  -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON -DEDR_REQUIRE_HTTPS_REST=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  "-DEDR_PCRE2_PRODUCER_TARGET=$PCRE2_TARGET" \
+  "-DEDR_PCRE2_VCPKG_ROOT=$VCPKG_ROOT"
 cmake --build "$BUILD_DIR" -j "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 if [[ -f "$BUILD_DIR/FDSensor.exe" ]]; then
   print_build_fingerprint "$BUILD_DIR/FDSensor.exe"
@@ -34,4 +61,5 @@ elif [[ -f "$BUILD_DIR/edr_agent.exe" ]]; then
 fi
 ctest --test-dir "$BUILD_DIR" --output-on-failure
 
-echo "ci_build.sh 完成"
+PCRE2_CONTRACT="$(sed -n 's/^EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH:INTERNAL=//p' "$BUILD_DIR/CMakeCache.txt")"
+echo "ci_build.sh 完成（CMake build-owned PCRE2 matcher contract: ${PCRE2_CONTRACT:-unavailable}）"

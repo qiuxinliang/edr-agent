@@ -169,6 +169,63 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   return ERROR_NOT_FOUND;
 }
 
+/* Typed extraction is intentionally separate from the UTF-8 helper: a
+ * two-character string also occupies eight bytes, so generic size-based
+ * conversion would corrupt normal ETW text fields. */
+static ULONG edr_prop_u64(PEVENT_RECORD rec, PCWSTR prop_name, uint64_t *out) {
+  PROPERTY_DATA_DESCRIPTOR pdd;
+  BYTE raw[sizeof(uint64_t)];
+  uint64_t value = 0u;
+  ULONG cb = 0u;
+  ULONG st;
+  if (out) *out = 0u;
+  if (!rec || !prop_name || !out) return ERROR_INVALID_PARAMETER;
+  memset(&pdd, 0, sizeof(pdd));
+  pdd.PropertyName = (ULONGLONG)(ULONG_PTR)prop_name;
+  pdd.ArrayIndex = ULONG_MAX;
+  st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
+  /* FileKey is a win:Pointer, so it is four bytes on 32-bit ETW consumers
+   * and eight bytes on x64/ARM64.  Accept only those exact typed widths. */
+  if (st != ERROR_SUCCESS || (cb != sizeof(uint32_t) && cb != sizeof(uint64_t))) {
+    st = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    edr_tdh_note_property_status(st);
+    return st;
+  }
+  memset(raw, 0, sizeof(raw));
+  st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, raw);
+  if (st == ERROR_SUCCESS) {
+    if (cb == sizeof(uint32_t)) {
+      uint32_t value32 = 0u;
+      memcpy(&value32, raw, sizeof(value32));
+      value = value32;
+    } else {
+      memcpy(&value, raw, sizeof(value));
+    }
+  }
+  if (st != ERROR_SUCCESS || value == 0u) {
+    st = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    edr_tdh_note_property_status(st);
+    return st;
+  }
+  *out = (uint64_t)value;
+  edr_tdh_note_property_status(ERROR_SUCCESS);
+  return ERROR_SUCCESS;
+}
+
+int edr_tdh_kernel_file_extract_file_key(PEVENT_RECORD rec, uint64_t *out_file_key) {
+  return edr_prop_u64(rec, L"FileKey", out_file_key) == ERROR_SUCCESS;
+}
+
+int edr_tdh_kernel_file_extract_name_binding(PEVENT_RECORD rec, uint64_t *out_file_key,
+                                             char *path_out, size_t path_cap) {
+  if (out_file_key) *out_file_key = 0u;
+  if (!rec || !out_file_key || !path_out || path_cap == 0u) return 0;
+  path_out[0] = '\0';
+  return edr_tdh_kernel_file_extract_file_key(rec, out_file_key) &&
+         edr_prop_utf8(rec, L"FileName", path_out, path_cap) == ERROR_SUCCESS &&
+         path_out[0] != '\0';
+}
+
 typedef struct {
   PCWSTR name;
   const char *key;
@@ -417,6 +474,8 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   };
   static const EdrPropTry file_try[] = {
       {L"FileName", "file"},
+      {L"FilePath", "file"},
+      {L"Path", "file"},
       {L"FileObject", "file"},
       {L"OpenPath", "file"},
   };
@@ -534,6 +593,17 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
+    {
+      static const PCWSTR process_key_names[] = {L"UniqueProcessKey", L"ProcessKey"};
+      uint64_t process_key = 0u;
+      for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {
+        if (edr_prop_u64(rec, process_key_names[i], &process_key) == ERROR_SUCCESS) {
+          append_utf8((char *)out, out_cap, &off, "kernel_unique_process_key=%llu\n",
+                      (unsigned long long)process_key);
+          break;
+        }
+      }
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, file_try, sizeof(file_try) / sizeof(file_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);

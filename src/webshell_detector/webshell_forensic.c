@@ -157,14 +157,23 @@ int edr_webshell_stage_file(const char *src_path, const char *forensic_root, con
     return 0;
   }
   time_t t = time(NULL);
+  if (t == (time_t)-1) {
+    return 0;
+  }
   struct tm tmv;
 #ifdef _WIN32
-  localtime_s(&tmv, &t);
+  if (localtime_s(&tmv, &t) != 0) {
+    return 0;
+  }
 #else
-  localtime_r(&t, &tmv);
+  if (!localtime_r(&t, &tmv)) {
+    return 0;
+  }
 #endif
   char date[16];
-  snprintf(date, sizeof(date), "%04d-%02d-%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
+  if (strftime(date, sizeof(date), "%Y-%m-%d", &tmv) == 0u) {
+    return 0;
+  }
   const char *fn = basename_c(src_path);
   if (!fn[0]) {
     fn = "sample.bin";

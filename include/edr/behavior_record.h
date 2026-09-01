@@ -13,6 +13,10 @@
 #define EDR_BR_STR_MID 512u
 #define EDR_BR_ID_LEN 48u
 #define EDR_BR_MAX_MITRE 8u
+/* Source-side omissions are named explicitly before any protobuf projection.
+ * Keep this below the wire field capacity so a complete bounded list can be
+ * carried alongside independently detected transport clipping. */
+#define EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN 384u
 
 typedef struct {
   char event_id[EDR_BR_ID_LEN];
@@ -25,6 +29,18 @@ typedef struct {
   char cmdline[EDR_BR_STR_LONG];
   char exe_hash[65];
   char exe_path[EDR_BR_STR_LONG];
+  /* Original Windows path and its resolution state are retained separately.
+   * An unresolved device namespace path is not safe for path-rule evaluation. */
+  char image_path_raw[EDR_BR_STR_LONG];
+  char image_path_canonical[EDR_BR_STR_LONG];
+  char image_path_namespace[32];
+  char image_path_resolution_status[32];
+  char image_path_resolution_source[32];
+  char source_completeness[32];
+  /* Comma-delimited `source.<field>` names withheld before rule evaluation.
+   * This is source provenance, distinct from encoder-side clipping. */
+  char source_truncated_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
+  uint32_t evidence_revision;
   char username[EDR_BR_STR_SHORT];
   /* effective process identity; username/domain retain their legacy meaning. */
   char user_sid[EDR_BR_STR_SHORT];
@@ -47,11 +63,23 @@ typedef struct {
 
   char parent_name[EDR_BR_STR_SHORT];
   char parent_path[EDR_BR_STR_MID];
+  char parent_resolution_status[32];
+  char parent_resolution_source[32];
 
   char file_op[32];
   /** 《11》§5.3 维 35：文件类事件 MOTW；上报 `FileDetail.target_has_motw` */
   uint8_t file_target_has_motw;
   char file_path[EDR_BR_STR_LONG];
+  /* Kernel-File FileKey is meaningful only with the event-time NameCreate
+   * binding.  It is retained internally so a collector evidence gate can
+   * report precisely which binding could not be held; it is not a rule
+   * predicate and is serialized only inside that typed gate context. */
+  uint64_t file_key;
+  /* A collector capability gate is source-only metadata, never a rule hit.
+   * The reason is constrained by p0_source_only_contract.h before it crosses
+   * the durable queue. */
+  char collector_evidence_gate[64];
+  char collector_evidence_reason[96];
   char net_src[64];
   char net_dst[64];
   uint32_t net_sport;
@@ -105,6 +133,12 @@ typedef struct {
   char child_pids[256];
   char network_isolation_level[32];
   char process_creation_time[64];
+  /* ETW extended ProcessStartKey: unique per boot and never callback time. */
+  uint64_t process_start_key;
+  /* Raw Windows FILETIME is populated only after the ProcessStartKey is
+   * matched to a live ProcessTelemetryIdInformation query. */
+  uint64_t process_creation_filetime_100ns;
+  char process_generation_source[64];
   char parent_creation_time[64];
   char command_line_origin[64];
   char encoded_command_type[32];

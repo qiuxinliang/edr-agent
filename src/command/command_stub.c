@@ -253,6 +253,78 @@ static void delivery_health_upload_pending(uint32_t pending_seen) {
 
 static int streq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
 
+/* Command and forensic output are evidence.  Never hand a prefix to a shell,
+ * state store, or caller as if it were the complete value. */
+static int command_bounded_cstr_len(const char *source, size_t source_cap, size_t *length_out) {
+  size_t length = 0u;
+  if (!source || !length_out || source_cap == 0u) {
+    return 0;
+  }
+  while (length < source_cap && source[length]) {
+    length++;
+  }
+  if (length == source_cap) {
+    return 0;
+  }
+  *length_out = length;
+  return 1;
+}
+
+static int command_copy_bounded_cstr_exact(char *out, size_t out_cap,
+                                           const char *source, size_t source_cap) {
+  size_t length = 0u;
+  if (!out || out_cap == 0u ||
+      !command_bounded_cstr_len(source, source_cap, &length) || length >= out_cap) {
+    if (out && out_cap > 0u) {
+      out[0] = '\0';
+    }
+    return 0;
+  }
+  memcpy(out, source, length + 1u);
+  return 1;
+}
+
+static int command_bounded_cstr_sha256(const char *source, size_t source_cap,
+                                       char out65[65], size_t *length_out) {
+  size_t length = 0u;
+  if (!out65 || !command_bounded_cstr_len(source, source_cap, &length) ||
+      edr_sha256_hex((const uint8_t *)source, length, out65) != 0) {
+    if (out65) {
+      out65[0] = '\0';
+    }
+    return 0;
+  }
+  if (length_out) {
+    *length_out = length;
+  }
+  return 1;
+}
+
+/* The parts passed here are locally constructed C strings. */
+static int command_join_cstrs(char *out, size_t out_cap,
+                              const char *const *parts, size_t part_count) {
+  size_t used = 0u;
+  if (!out || out_cap == 0u || !parts) {
+    return 0;
+  }
+  out[0] = '\0';
+  for (size_t i = 0u; i < part_count; i++) {
+    size_t length;
+    if (!parts[i]) {
+      return 0;
+    }
+    length = strlen(parts[i]);
+    if (length > out_cap - 1u - used) {
+      out[0] = '\0';
+      return 0;
+    }
+    memcpy(out + used, parts[i], length);
+    used += length;
+  }
+  out[used] = '\0';
+  return 1;
+}
+
 static int dangerous_enabled(void) {
   const char *e = getenv("EDR_CMD_ENABLED");
   if (e && e[0] == '1') {
@@ -266,23 +338,6 @@ static int dangerous_enabled(void) {
     return 1;
   }
   return 0;
-}
-
-static int rtq_readonly_enabled(void) {
-  const char *e = getenv("EDR_RTQ_READONLY_ENABLED");
-  if (e && e[0] == '1') {
-    return 1;
-  }
-  if (e && e[0] == '0') {
-    return 0;
-  }
-  if (dangerous_enabled()) {
-    return 1;
-  }
-  if (edr_command_get_config()) {
-    return edr_command_get_config()->command.allow_rtq_readonly ? 1 : 0;
-  }
-  return 1;
 }
 
 /** 未设置 `EDR_CMD_KILL_ALLOWLIST` 时不限制；设置后仅允许列表内 pid（逗号分隔） */
@@ -412,11 +467,10 @@ static void json_escape_to(char *dst, size_t cap, const char *s) {
   dst[o < cap ? o : cap - 1u] = '\0';
 }
 
-static char *json_escape_alloc_cmd(const char *s) {
-  if (!s) {
-    s = "";
+static char *json_escape_alloc_bytes_cmd(const uint8_t *data, size_t len) {
+  if (!data && len != 0u) {
+    return NULL;
   }
-  size_t len = strlen(s);
   if (len > (((size_t)-1) - 3u) / 6u) {
     return NULL;
   }
@@ -427,8 +481,8 @@ static char *json_escape_alloc_cmd(const char *s) {
   }
   size_t o = 0;
   out[o++] = '"';
-  for (; *s; s++) {
-    unsigned char c = (unsigned char)*s;
+  for (size_t i = 0u; i < len; i++) {
+    unsigned char c = data[i];
     if (c == '"' || c == '\\') {
       out[o++] = '\\';
       out[o++] = (char)c;
@@ -449,6 +503,53 @@ static char *json_escape_alloc_cmd(const char *s) {
   }
   out[o++] = '"';
   out[o] = '\0';
+  return out;
+}
+
+static char *json_escape_alloc_cmd(const char *s) {
+  if (!s) {
+    s = "";
+  }
+  return json_escape_alloc_bytes_cmd((const uint8_t *)s, strlen(s));
+}
+
+/* Autorun rows are written to an artifact and optionally inlined.  Allocate
+ * their exact JSON representation so a long command line is either complete
+ * or rejected by the caller; never emit an apparently complete prefix. */
+static char *command_autorun_json_alloc(const char *type, const char *name,
+                                        const char *command, const char *location) {
+  char *typej = json_escape_alloc_cmd(type);
+  char *namej = json_escape_alloc_cmd(name);
+  char *commandj = json_escape_alloc_cmd(command);
+  char *locationj = json_escape_alloc_cmd(location);
+  char *out = NULL;
+  if (!typej || !namej || !commandj || !locationj) {
+    goto done;
+  }
+  const char *fields[] = {typej, namej, commandj, locationj};
+  size_t need = sizeof("{\"type\":,\"name\":,\"command\":,\"location\":}");
+  for (size_t i = 0u; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    size_t length = strlen(fields[i]);
+    if (length > ((size_t)-1) - need) {
+      goto done;
+    }
+    need += length;
+  }
+  out = (char *)malloc(need);
+  if (out) {
+    int written = snprintf(out, need,
+                           "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}",
+                           typej, namej, commandj, locationj);
+    if (written < 0 || (size_t)written >= need) {
+      free(out);
+      out = NULL;
+    }
+  }
+done:
+  free(typej);
+  free(namej);
+  free(commandj);
+  free(locationj);
   return out;
 }
 
@@ -1122,10 +1223,11 @@ static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const Edr
 #endif
 }
 
-static void isolate_stamp_path(char *path, size_t cap) {
+static int isolate_stamp_path(char *path, size_t cap) {
   const char *stamp = getenv("EDR_ISOLATE_STAMP_PATH");
   if (stamp && stamp[0]) {
-    snprintf(path, cap, "%s", stamp);
+    const char *parts[] = {stamp};
+    return command_join_cstrs(path, cap, parts, sizeof(parts) / sizeof(parts[0])) ? 0 : -1;
   } else {
 #ifdef _WIN32
     const char *tmp = getenv("TEMP");
@@ -1135,9 +1237,13 @@ static void isolate_stamp_path(char *path, size_t cap) {
     if (!tmp || !tmp[0]) {
       tmp = ".";
     }
-    snprintf(path, cap, "%s\\edr_isolated.state", tmp);
+    {
+      const char *parts[] = {tmp, "\\edr_isolated.state"};
+      return command_join_cstrs(path, cap, parts, sizeof(parts) / sizeof(parts[0])) ? 0 : -1;
+    }
 #else
-    snprintf(path, cap, "%s", "/tmp/edr_isolated.state");
+    const char *parts[] = {"/tmp/edr_isolated.state"};
+    return command_join_cstrs(path, cap, parts, sizeof(parts) / sizeof(parts[0])) ? 0 : -1;
 #endif
   }
 }
@@ -1163,8 +1269,7 @@ static int isolate_self_dir(char *out, size_t cap) {
     return -1;
   }
   *slash = '\0';
-  snprintf(out, cap, "%s", buf);
-  return 0;
+  return command_copy_bounded_cstr_exact(out, cap, buf, sizeof(buf)) ? 0 : -1;
 #else
   char buf[1024];
   ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1u);
@@ -1177,8 +1282,7 @@ static int isolate_self_dir(char *out, size_t cap) {
     return -1;
   }
   *slash = '\0';
-  snprintf(out, cap, "%s", buf);
-  return 0;
+  return command_copy_bounded_cstr_exact(out, cap, buf, sizeof(buf)) ? 0 : -1;
 #endif
 }
 
@@ -1186,7 +1290,10 @@ static int isolate_self_dir(char *out, size_t cap) {
 static int isolate_resolve_script(char *out, size_t cap) {
   const char *ov = getenv("EDR_ISOLATE_SCRIPT");
   if (ov && ov[0]) {
-    snprintf(out, cap, "%s", ov);
+    const char *parts[] = {ov};
+    if (!command_join_cstrs(out, cap, parts, sizeof(parts) / sizeof(parts[0]))) {
+      return -1;
+    }
     return file_exists_c(out) ? 0 : -1;
   }
   char dir[1024];
@@ -1195,15 +1302,27 @@ static int isolate_resolve_script(char *out, size_t cap) {
   }
 #ifdef _WIN32
   const char *name = "windows_isolate_host.ps1";
-  snprintf(out, cap, "%s\\%s", dir, name);
+  const char *direct_parts[] = {dir, "\\", name};
+  if (!command_join_cstrs(out, cap, direct_parts, sizeof(direct_parts) / sizeof(direct_parts[0]))) {
+    return -1;
+  }
   if (file_exists_c(out)) return 0;
-  snprintf(out, cap, "%s\\scripts\\%s", dir, name);
+  const char *script_parts[] = {dir, "\\scripts\\", name};
+  if (!command_join_cstrs(out, cap, script_parts, sizeof(script_parts) / sizeof(script_parts[0]))) {
+    return -1;
+  }
   if (file_exists_c(out)) return 0;
 #else
   const char *name = "linux_isolate_host.sh";
-  snprintf(out, cap, "%s/%s", dir, name);
+  const char *direct_parts[] = {dir, "/", name};
+  if (!command_join_cstrs(out, cap, direct_parts, sizeof(direct_parts) / sizeof(direct_parts[0]))) {
+    return -1;
+  }
   if (file_exists_c(out)) return 0;
-  snprintf(out, cap, "%s/scripts/%s", dir, name);
+  const char *script_parts[] = {dir, "/scripts/", name};
+  if (!command_join_cstrs(out, cap, script_parts, sizeof(script_parts) / sizeof(script_parts[0]))) {
+    return -1;
+  }
   if (file_exists_c(out)) return 0;
 #endif
   return -1;
@@ -1309,12 +1428,14 @@ static int isolate_run(int enable, const char *cmd_id) {
   }
   char cmd[1400];
 #ifdef _WIN32
-  snprintf(cmd, sizeof(cmd),
-           "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Action %s", script,
-           enable ? "Enable" : "Remove");
+  const char *parts[] = {"powershell -NoProfile -ExecutionPolicy Bypass -File \"", script,
+                         "\" -Action ", enable ? "Enable" : "Remove"};
 #else
-  snprintf(cmd, sizeof(cmd), "/bin/sh \"%s\" %s", script, enable ? "enable" : "remove");
+  const char *parts[] = {"/bin/sh \"", script, "\" ", enable ? "enable" : "remove"};
 #endif
+  if (!command_join_cstrs(cmd, sizeof(cmd), parts, sizeof(parts) / sizeof(parts[0]))) {
+    return -1;
+  }
   return (system(cmd) == 0) ? 0 : -1;
 }
 
@@ -1334,16 +1455,26 @@ static int isolate_run_status(char *evidence, size_t evidence_cap) {
     return -2;
   }
   char stamp[512];
-  isolate_stamp_path(stamp, sizeof(stamp));
+  if (isolate_stamp_path(stamp, sizeof(stamp)) != 0) {
+    return -1;
+  }
   char outpath[700];
-  snprintf(outpath, sizeof(outpath), "%s.status", stamp);
+  {
+    const char *parts[] = {stamp, ".status"};
+    if (!command_join_cstrs(outpath, sizeof(outpath), parts, sizeof(parts) / sizeof(parts[0]))) {
+      return -1;
+    }
+  }
   char cmd[1500];
 #ifdef _WIN32
-  snprintf(cmd, sizeof(cmd), "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Action Status > \"%s\" 2>&1",
-           script, outpath);
+  const char *parts[] = {"powershell -NoProfile -ExecutionPolicy Bypass -File \"", script,
+                         "\" -Action Status > \"", outpath, "\" 2>&1"};
 #else
-  snprintf(cmd, sizeof(cmd), "/bin/sh \"%s\" status > \"%s\" 2>&1", script, outpath);
+  const char *parts[] = {"/bin/sh \"", script, "\" status > \"", outpath, "\" 2>&1"};
 #endif
+  if (!command_join_cstrs(cmd, sizeof(cmd), parts, sizeof(parts) / sizeof(parts[0]))) {
+    return -1;
+  }
   int rc = system(cmd) == 0 ? 0 : -1;
   if (evidence && evidence_cap > 1u) {
     FILE *f = fopen(outpath, "rb");
@@ -1380,7 +1511,12 @@ static int do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   }
   /* 写状态标记(供 isolate_status / 响应查询;非 enforcement 本身)。 */
   char path[512];
-  isolate_stamp_path(path, sizeof(path));
+  if (isolate_stamp_path(path, sizeof(path)) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "isolate: isolation state path is too long");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
+    return -2;
+  }
   int stamp_written = 0;
   FILE *f = fopen(path, "w");
   if (f) {
@@ -1478,7 +1614,12 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
     return;
   }
   char path[512];
-  isolate_stamp_path(path, sizeof(path));
+  if (isolate_stamp_path(path, sizeof(path)) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "restore_host: isolation state path is too long");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
+    return;
+  }
 
   int rc = 0;
   if (isolate_stamp_only_mode()) {
@@ -1518,7 +1659,12 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
 
 static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   char path[512];
-  isolate_stamp_path(path, sizeof(path));
+  if (isolate_stamp_path(path, sizeof(path)) != 0) {
+    s_exec_fail++;
+    audit_both(cmd_id, "isolate_status: isolation state path is too long");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
+    return;
+  }
   int exists = 0;
   FILE *f = fopen(path, "r");
   if (f) {
@@ -2438,40 +2584,88 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
 static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *data, size_t len,
                                    int exit_code, bool closed, void *user) {
   (void)user;
-  if (!sid || !sid[0]) {
+  char sid_copy[EDR_SS_ID_LEN];
+  if (!command_copy_bounded_cstr_exact(sid_copy, sizeof(sid_copy), sid, EDR_SS_ID_LEN) ||
+      !sid_copy[0]) {
+    audit_both("", "shell_stream rejected: invalid session id");
     return;
   }
   char cmd_id[160];
-  snprintf(cmd_id, sizeof(cmd_id), "%s.s%06llu", sid, (unsigned long long)seq);
-
-  char sessionj[300], streamj[40], dataj[EDR_COMMAND_STATE_DETAIL_CAP], detail[EDR_COMMAND_STATE_DETAIL_CAP];
-  json_escape_to(sessionj, sizeof(sessionj), sid);
-  json_escape_to(streamj, sizeof(streamj), "stdout");
-  if (closed && !data) {
-    json_escape_to(dataj, sizeof(dataj), "");
-  } else if (data && len > 0u) {
-    size_t cp = len < EDR_SS_STREAM_CHUNK_BYTES ? len : EDR_SS_STREAM_CHUNK_BYTES;
-    char raw[EDR_SS_STREAM_CHUNK_BYTES + 1u];
-    memcpy(raw, data, cp);
-    raw[cp] = '\0';
-    json_escape_to(dataj, sizeof(dataj), raw);
-  } else {
+  int cmd_id_written = snprintf(cmd_id, sizeof(cmd_id), "%s.s%06llu", sid_copy,
+                                (unsigned long long)seq);
+  if (cmd_id_written < 0 || (size_t)cmd_id_written >= sizeof(cmd_id)) {
+    audit_both("", "shell_stream rejected: stream command id is too long");
     return;
   }
-  snprintf(detail, sizeof(detail),
-           "{\"schema\":\"edr.shell.stream.v1\",\"session_id\":%s,\"seq\":%llu,"
-           "\"stream\":%s,\"data\":%s,\"exit_code\":%d,\"closed\":%s}",
-           sessionj, (unsigned long long)seq, streamj, dataj, exit_code,
-           closed ? "true" : "false");
+
+  char *sessionj = json_escape_alloc_cmd(sid_copy);
+  char *dataj = NULL;
+  if (closed && !data) {
+    dataj = json_escape_alloc_cmd("");
+  } else if (data && len > 0u && len <= EDR_SS_STREAM_CHUNK_BYTES) {
+    dataj = json_escape_alloc_bytes_cmd((const uint8_t *)data, len);
+  } else {
+    audit_both(cmd_id, "shell_stream rejected: stream chunk exceeds durable limit");
+    goto persist_failure;
+  }
+  if (!sessionj || !dataj) {
+    audit_both(cmd_id, "shell_stream rejected: JSON serialization allocation failed");
+    goto persist_failure;
+  }
+  int detail_written = snprintf(
+      NULL, 0,
+      "{\"schema\":\"edr.shell.stream.v1\",\"session_id\":%s,\"seq\":%llu,"
+      "\"stream\":\"stdout\",\"data\":%s,\"exit_code\":%d,\"closed\":%s}",
+      sessionj, (unsigned long long)seq, dataj, exit_code, closed ? "true" : "false");
+  if (detail_written < 0 || (size_t)detail_written >= EDR_COMMAND_STATE_DETAIL_CAP) {
+    audit_both(cmd_id, "shell_stream rejected: JSON record exceeds durable limit");
+    goto persist_failure;
+  }
+  char *detail = (char *)malloc((size_t)detail_written + 1u);
+  if (!detail) {
+    audit_both(cmd_id, "shell_stream rejected: JSON record allocation failed");
+    goto persist_failure;
+  }
+  if (snprintf(detail, (size_t)detail_written + 1u,
+               "{\"schema\":\"edr.shell.stream.v1\",\"session_id\":%s,\"seq\":%llu,"
+               "\"stream\":\"stdout\",\"data\":%s,\"exit_code\":%d,\"closed\":%s}",
+               sessionj, (unsigned long long)seq, dataj, exit_code,
+               closed ? "true" : "false") != detail_written) {
+    free(detail);
+    audit_both(cmd_id, "shell_stream rejected: JSON record formatting failed");
+    goto persist_failure;
+  }
 
   EdrSoarCommandMeta dummy;
   memset(&dummy, 0, sizeof(dummy));
-  snprintf(dummy.soar_correlation_id, sizeof(dummy.soar_correlation_id), "%s", sid);
+  (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
+                                         sizeof(dummy.soar_correlation_id), sid_copy,
+                                         sizeof(sid_copy));
   if (edr_command_state_finish(cmd_id, "shell_stream", &dummy, closed ? "closed" : "ok",
                                (int)EdrCmdExecOk, exit_code, detail, "", 1) == 0) {
     edr_command_state_delete_inbox(cmd_id);
   } else {
     audit_both(cmd_id, "shell_stream state persist failed");
+  }
+  free(detail);
+  free(sessionj);
+  free(dataj);
+  return;
+
+persist_failure:
+  free(sessionj);
+  free(dataj);
+  {
+    EdrSoarCommandMeta dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
+                                           sizeof(dummy.soar_correlation_id), sid_copy,
+                                           sizeof(sid_copy));
+    if (edr_command_state_finish(cmd_id, "shell_stream", &dummy, "failed",
+                                 (int)EdrCmdExecFailed, 5,
+                                 "shell stream chunk was rejected before durable serialization", "", 1) != 0) {
+      audit_both(cmd_id, "shell_stream failure state persist failed");
+    }
   }
 }
 
@@ -3778,7 +3972,12 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   {
     char cmdline[800];
     snprintf(cmdline, sizeof(cmdline), "mkdir -p \"%s\" 2>/dev/null", dir);
-    (void)system(cmdline);
+    if (system(cmdline) != 0) {
+      s_exec_fail++;
+      audit_both(cmd_id, "forensic: output directory create failed");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "forensic output directory create failed");
+      return;
+    }
   }
 #endif
   char manifest[800];
@@ -3842,7 +4041,12 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   {
     char tarcmd[1700];
     snprintf(tarcmd, sizeof(tarcmd), "tar czf \"%s\" -C \"%s\" . 2>/dev/null", bundle, dir);
-    (void)system(tarcmd);
+    if (system(tarcmd) != 0) {
+      s_exec_fail++;
+      audit_both(cmd_id, "forensic: bundle archive command failed");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "forensic bundle create failed");
+      return;
+    }
   }
 #endif
   if (!file_exists_c(bundle)) {
@@ -4338,12 +4542,22 @@ static void do_host_process_tree(const char *cmd_id, const uint8_t *pl, size_t l
       if (!isnum) {
         continue;
       }
+      /* Linux PIDs are decimal values.  Do not form a truncated /proc path
+       * from an untrusted directory name. */
+      if (strlen(nm) > 20u) {
+        continue;
+      }
       long pid = strtol(nm, NULL, 10);
       long ppid = 0;
       char comm[256];
       comm[0] = '\0';
       char statp[80];
-      snprintf(statp, sizeof(statp), "/proc/%s/stat", nm);
+      {
+        const char *parts[] = {"/proc/", nm, "/stat"};
+        if (!command_join_cstrs(statp, sizeof(statp), parts, sizeof(parts) / sizeof(parts[0]))) {
+          continue;
+        }
+      }
       FILE *sf = fopen(statp, "r");
       if (sf) {
         char line[4096];
@@ -4984,6 +5198,7 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
   fputs("{\"autoruns\":[\n", f);
   int count = 0;
   int cancelled = 0;
+  int serialization_failed = 0;
   char inl[24000];
   size_t io = 0;
   int inl_n = 0;
@@ -5011,13 +5226,13 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
       { HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce", "HKCU\\...\\RunOnce" },
       { HKEY_LOCAL_MACHINE, "Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Wow6432\\Run" },
     };
-    for (size_t ki = 0; ki < sizeof(RUN_KEYS) / sizeof(RUN_KEYS[0]) && count < max_rows; ki++) {
+    for (size_t ki = 0; ki < sizeof(RUN_KEYS) / sizeof(RUN_KEYS[0]) && count < max_rows && !serialization_failed; ki++) {
       if (edr_command_cancel_requested(cmd_id)) { cancelled = 1; break; }
       HKEY hk;
       if (RegOpenKeyExA(RUN_KEYS[ki].root, RUN_KEYS[ki].sub, 0, KEY_READ, &hk) != ERROR_SUCCESS) {
         continue;
       }
-      for (DWORD idx = 0; count < max_rows; idx++) {
+      for (DWORD idx = 0; count < max_rows && !serialization_failed; idx++) {
         if (edr_command_cancel_requested(cmd_id)) { cancelled = 1; break; }
         char name[512];
         BYTE data[4096];
@@ -5033,12 +5248,13 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
         DWORD cl = ds < (DWORD)(sizeof(cmd) - 1) ? ds : (DWORD)(sizeof(cmd) - 1);
         memcpy(cmd, data, cl);
         cmd[cl] = '\0'; /* REG_SZ data 末尾含 NUL；此处再兜底终止 */
-        char nmj[700], cmj[4200], locj[200], obj[5400];
-        json_escape_to(nmj, sizeof(nmj), name);
-        json_escape_to(cmj, sizeof(cmj), cmd);
-        json_escape_to(locj, sizeof(locj), RUN_KEYS[ki].label);
-        snprintf(obj, sizeof(obj), "{\"type\":\"run_key\",\"name\":%s,\"command\":%s,\"location\":%s}", nmj, cmj, locj);
+        char *obj = command_autorun_json_alloc("run_key", name, cmd, RUN_KEYS[ki].label);
+        if (!obj) {
+          serialization_failed = 1;
+          break;
+        }
         EDR_AR_EMIT(obj);
+        free(obj);
       }
       RegCloseKey(hk);
       if (cancelled) break;
@@ -5048,7 +5264,8 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
       { "schtasks /query /fo csv /nh 2>nul", "scheduled_task", "schtasks" },
       { "wmic startup get Caption,Command /format:csv 2>nul", "startup_item", "wmic_startup" },
     };
-    for (size_t ci = 0; !cancelled && ci < sizeof(WIN_CMDS) / sizeof(WIN_CMDS[0]) && count < max_rows; ci++) {
+    for (size_t ci = 0; !cancelled && !serialization_failed &&
+                        ci < sizeof(WIN_CMDS) / sizeof(WIN_CMDS[0]) && count < max_rows; ci++) {
       char *output = (char *)calloc(1u, 65536u);
       int exit_code = 0;
       if (!output) { continue; }
@@ -5063,7 +5280,7 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
         break;
       }
       char *line = output;
-      while (*line && count < max_rows) {
+      while (*line && count < max_rows && !serialization_failed) {
         char *next = strpbrk(line, "\r\n");
         if (next) {
           *next = '\0';
@@ -5072,12 +5289,13 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
           next = after;
         }
         if (!line[0]) { line = next ? next : line + strlen(line); continue; }
-        char lj[2200], tj[64], loj[64], obj[2500];
-        json_escape_to(lj, sizeof(lj), line);
-        json_escape_to(tj, sizeof(tj), WIN_CMDS[ci].type);
-        json_escape_to(loj, sizeof(loj), WIN_CMDS[ci].loc);
-        snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
+        char *obj = command_autorun_json_alloc(WIN_CMDS[ci].type, line, line, WIN_CMDS[ci].loc);
+        if (!obj) {
+          serialization_failed = 1;
+          break;
+        }
         EDR_AR_EMIT(obj);
+        free(obj);
         if (!next) break;
         line = next;
       }
@@ -5093,7 +5311,8 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
       { "cat /etc/rc.local 2>/dev/null", "rc_local", "/etc/rc.local" },
       { "ls -1 ~/.config/autostart /etc/xdg/autostart 2>/dev/null", "autostart", "autostart" },
     };
-    for (size_t ci = 0; !cancelled && ci < sizeof(NIX_CMDS) / sizeof(NIX_CMDS[0]) && count < max_rows; ci++) {
+    for (size_t ci = 0; !cancelled && !serialization_failed &&
+                        ci < sizeof(NIX_CMDS) / sizeof(NIX_CMDS[0]) && count < max_rows; ci++) {
       char *output = (char *)calloc(1u, 65536u);
       int exit_code = 0;
       if (!output) { continue; }
@@ -5108,7 +5327,7 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
         break;
       }
       char *line = output;
-      while (*line && count < max_rows) {
+      while (*line && count < max_rows && !serialization_failed) {
         char *next = strpbrk(line, "\r\n");
         if (next) {
           *next = '\0';
@@ -5117,12 +5336,13 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
           next = after;
         }
         if (!line[0] || line[0] == '#') { line = next ? next : line + strlen(line); continue; }
-        char lj[2200], tj[64], loj[64], obj[2500];
-        json_escape_to(lj, sizeof(lj), line);
-        json_escape_to(tj, sizeof(tj), NIX_CMDS[ci].type);
-        json_escape_to(loj, sizeof(loj), NIX_CMDS[ci].loc);
-        snprintf(obj, sizeof(obj), "{\"type\":%s,\"name\":%s,\"command\":%s,\"location\":%s}", tj, lj, lj, loj);
+        char *obj = command_autorun_json_alloc(NIX_CMDS[ci].type, line, line, NIX_CMDS[ci].loc);
+        if (!obj) {
+          serialization_failed = 1;
+          break;
+        }
         EDR_AR_EMIT(obj);
+        free(obj);
         if (!next) break;
         line = next;
       }
@@ -5131,6 +5351,15 @@ static void do_list_autoruns(const char *cmd_id, const uint8_t *pl, size_t len,
   }
 #endif
 #undef EDR_AR_EMIT
+  if (serialization_failed) {
+    fclose(f);
+    (void)remove(path);
+    s_exec_fail++;
+    audit_both(cmd_id, "list_autoruns: result row rejected before lossless JSON serialization");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecFailed, 5,
+                 "autoruns result row could not be serialized losslessly", "failed", NULL);
+    return;
+  }
   if (cancelled || edr_command_cancel_requested(cmd_id)) {
     fclose(f);
     (void)remove(path);
@@ -5359,11 +5588,33 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
         work_done = 1;
         break;
       }
+      char duplicate_id[sizeof(dup.command_id)];
+      char duplicate_type[sizeof(dup.command_type)];
+      const char *source_id = dup.command_id[0] ? dup.command_id : inbox[i].command_id;
+      size_t source_id_cap = dup.command_id[0] ? sizeof(dup.command_id) : sizeof(inbox[i].command_id);
+      const char *source_type = dup.command_type[0] ? dup.command_type : inbox[i].command_type;
+      size_t source_type_cap = dup.command_type[0] ? sizeof(dup.command_type) : sizeof(inbox[i].command_type);
+      if (!command_copy_bounded_cstr_exact(duplicate_id, sizeof(duplicate_id), source_id,
+                                            source_id_cap) ||
+          !command_copy_bounded_cstr_exact(duplicate_type, sizeof(duplicate_type), source_type,
+                                            source_type_cap)) {
+        audit_both(inbox[i].command_id,
+                   "persisted command replay deferred: duplicate identity is malformed");
+        edr_command_cancel_end(inbox[i].command_id);
+        saw_error = 1;
+        continue;
+      }
       char detail[320];
-      snprintf(detail, sizeof(detail), "persisted command replay deferred; command already running id=%s type=%s retry=%d",
-               dup.command_id[0] ? dup.command_id : inbox[i].command_id,
-               dup.command_type[0] ? dup.command_type : inbox[i].command_type,
-               retry_count);
+      int detail_written = snprintf(detail, sizeof(detail),
+                                    "persisted command replay deferred; command already running id=%s type=%s retry=%d",
+                                    duplicate_id, duplicate_type, retry_count);
+      if (detail_written < 0 || (size_t)detail_written >= sizeof(detail)) {
+        audit_both(inbox[i].command_id,
+                   "persisted command replay deferred: duplicate audit detail is unrepresentable");
+        edr_command_cancel_end(inbox[i].command_id);
+        saw_error = 1;
+        continue;
+      }
       audit_both(inbox[i].command_id, detail);
       edr_command_cancel_end(inbox[i].command_id);
       continue;
@@ -6187,12 +6438,38 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
       soar_emit_ex(id, sm, EdrCmdExecFailed, 17, detail, "failed", NULL);
       return 0;
     }
-    snprintf(detail, sizeof(detail), "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail=%s",
-             dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code,
-             dup.detail[0] ? dup.detail : "");
+    char previous_status[sizeof(dup.response_status)];
+    const char *status = "unknown";
+    char previous_detail_sha256[65];
+    size_t previous_detail_bytes = 0u;
+    if ((dup.response_status[0] &&
+         !command_copy_bounded_cstr_exact(previous_status, sizeof(previous_status),
+                                          dup.response_status, sizeof(dup.response_status))) ||
+        !command_bounded_cstr_sha256(dup.detail, sizeof(dup.detail), previous_detail_sha256,
+                                     &previous_detail_bytes)) {
+      s_exec_fail++;
+      audit_both(id, "duplicate command state contains unrepresentable provenance");
+      soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
+                   "duplicate command state provenance is invalid", "failed", NULL);
+      return 0;
+    }
+    if (dup.response_status[0]) {
+      status = previous_status;
+    }
+    int detail_written = snprintf(
+        detail, sizeof(detail),
+        "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail_sha256=%s previous_detail_bytes=%zu",
+        status, dup.exit_code, previous_detail_sha256, previous_detail_bytes);
+    if (detail_written < 0 || (size_t)detail_written >= sizeof(detail)) {
+      s_exec_fail++;
+      audit_both(id, "duplicate command state summary is unrepresentable");
+      soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
+                   "duplicate command state summary is unrepresentable", "failed", NULL);
+      return 0;
+    }
     audit_both(id, "duplicate command suppressed by local idempotency state");
     soar_emit_ex(id, sm, (EdrCommandExecutionStatus)(dup.execution_status ? dup.execution_status : EdrCmdExecOk),
-                 dup.exit_code, detail, dup.response_status[0] ? dup.response_status : "ok", NULL);
+                 dup.exit_code, detail, dup.response_status[0] ? status : "ok", NULL);
     return 0;
   }
   if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
@@ -6315,17 +6592,36 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
       if (state_rc == EDR_COMMAND_STATE_CANCEL_REQUESTED &&
           strcmp(target_state.response_status, "queued") == 0 && !active_hit && !forensic_hit) {
         EdrSoarCommandMeta target_meta;
+        char target_type[sizeof(target_state.command_type)];
         memset(&target_meta, 0, sizeof(target_meta));
-        snprintf(target_meta.idempotency_key, sizeof(target_meta.idempotency_key), "%s",
-                 target_state.idempotency_key);
-        snprintf(target_meta.soar_correlation_id, sizeof(target_meta.soar_correlation_id), "%s",
-                 target_state.soar_correlation_id);
-        snprintf(target_meta.playbook_run_id, sizeof(target_meta.playbook_run_id), "%s",
-                 target_state.playbook_run_id);
-        snprintf(target_meta.playbook_step_id, sizeof(target_meta.playbook_step_id), "%s",
-                 target_state.playbook_step_id);
+        if (!command_copy_bounded_cstr_exact(target_meta.idempotency_key,
+                                             sizeof(target_meta.idempotency_key),
+                                             target_state.idempotency_key,
+                                             sizeof(target_state.idempotency_key)) ||
+            !command_copy_bounded_cstr_exact(target_meta.soar_correlation_id,
+                                             sizeof(target_meta.soar_correlation_id),
+                                             target_state.soar_correlation_id,
+                                             sizeof(target_state.soar_correlation_id)) ||
+            !command_copy_bounded_cstr_exact(target_meta.playbook_run_id,
+                                             sizeof(target_meta.playbook_run_id),
+                                             target_state.playbook_run_id,
+                                             sizeof(target_state.playbook_run_id)) ||
+            !command_copy_bounded_cstr_exact(target_meta.playbook_step_id,
+                                             sizeof(target_meta.playbook_step_id),
+                                             target_state.playbook_step_id,
+                                             sizeof(target_state.playbook_step_id)) ||
+            !command_copy_bounded_cstr_exact(target_type, sizeof(target_type),
+                                             target_state.command_type,
+                                             sizeof(target_state.command_type))) {
+          edr_cmd_inc_exec_fail();
+          audit_both(id,
+                     "forensic_cancel: target state metadata is unrepresentable; target result withheld");
+          edr_command_emit_always(id, sm, EdrCmdExecFailed, 5,
+                                  "target cancellation was recorded but target metadata is invalid");
+          return;
+        }
         edr_command_emit_always_typed_status(
-            target, target_state.command_type, &target_meta, EdrCmdExecFailed, 130,
+            target, target_type, &target_meta, EdrCmdExecFailed, 130,
             "command cancelled before execution", "cancelled");
       }
       char detail[384];

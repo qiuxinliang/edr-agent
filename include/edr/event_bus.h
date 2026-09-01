@@ -17,7 +17,10 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count);
 void edr_event_bus_destroy(EdrEventBus *bus);
 
 /**
- * 非阻塞推送。满则返回 false，调用方应累计 dropped（§2.3 背压）。
+ * Nonblocking push.  Slots marked `p0_critical` use the logical P0 reserve;
+ * ordinary producers cannot consume that reserve.  A false result always
+ * means the caller must account for the rejected subject rather than silently
+ * treating it as an ordinary sample drop.
  */
 bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot);
 
@@ -44,6 +47,9 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus);
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus);
+uint32_t edr_event_bus_p0_reserved_slots(const EdrEventBus *bus);
+uint64_t edr_event_bus_ordinary_reserve_rejected_total(EdrEventBus *bus);
+uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus);
 uint64_t edr_event_bus_dropped_total(EdrEventBus *bus);
 uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus);
 

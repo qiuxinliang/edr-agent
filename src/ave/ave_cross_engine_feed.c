@@ -143,6 +143,26 @@ static int has_text(const char *s) {
   return s && s[0];
 }
 
+/* Cross-engine events feed behavioral features and must therefore retain the
+ * complete source field.  A prefix would look like an authoritative path or
+ * command line to the downstream engine, so reject that event instead. */
+static int copy_record_text_exact(char *out, size_t out_cap, const char *source,
+                                  size_t source_cap) {
+  size_t source_len = 0u;
+  if (!out || out_cap == 0u || !source || source_cap == 0u) {
+    return 0;
+  }
+  while (source_len < source_cap && source[source_len]) {
+    source_len++;
+  }
+  if (source_len == source_cap || source_len >= out_cap) {
+    out[0] = '\0';
+    return 0;
+  }
+  memcpy(out, source, source_len + 1u);
+  return 1;
+}
+
 static int has_process_identity(const EdrBehaviorRecord *br) {
   return br && (has_text(br->process_name) || has_text(br->exe_path));
 }
@@ -307,24 +327,34 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   if (!br || br->pid == 0u) {
     return;
   }
+  AVEEventType avt;
+  if (!ave_event_type_from_record(br->type, &avt)) {
+    return;
+  }
+
+  AVEBehaviorEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  if (!copy_record_text_exact(ev.process_name, sizeof(ev.process_name), br->process_name,
+                              sizeof(br->process_name)) ||
+      !copy_record_text_exact(ev.process_path, sizeof(ev.process_path), br->exe_path,
+                              sizeof(br->exe_path)) ||
+      !copy_record_text_exact(ev.cmdline, sizeof(ev.cmdline), br->cmdline,
+                              sizeof(br->cmdline))) {
+    return;
+  }
+
   float script_score = script_score_from_record(br);
   int ransom_ext = edr_policy_v2_ransomware_enabled("mass_write") && path_has_ransom_ext(br->file_path);
   int shadow_delete = edr_policy_v2_ransomware_enabled("vss") &&
                       ((ace_str_has_ci(br->cmdline, "vssadmin") && ace_str_has_ci(br->cmdline, "delete") && ace_str_has_ci(br->cmdline, "shadows")) ||
                       (ace_str_has_ci(br->cmdline, "wmic") && ace_str_has_ci(br->cmdline, "shadowcopy") && ace_str_has_ci(br->cmdline, "delete")));
   int cert_anom = br->cert_revoked_ancestor ? 1 : 0;
-  AVEEventType avt;
-  if (!ave_event_type_from_record(br->type, &avt)) {
-    return;
-  }
   int high_signal = record_is_high_signal(br, script_score, ransom_ext, shadow_delete, cert_anom);
   int q = ave_record_input_quality(br, avt, high_signal);
   if (q < record_feed_min_quality()) {
     return;
   }
 
-  AVEBehaviorEvent ev;
-  memset(&ev, 0, sizeof(ev));
   ev.pid = br->pid;
   ev.ppid = br->ppid;
   ev.event_type = avt;
@@ -340,22 +370,31 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   if (ransom_ext && shadow_delete) ev.ransom_counter_score += 0.20f;
   if (ev.ransom_counter_score > 1.f) ev.ransom_counter_score = 1.f;
   ev.timestamp_ns = br->event_time_ns;
-  snprintf(ev.process_name, sizeof(ev.process_name), "%s", br->process_name);
-  snprintf(ev.process_path, sizeof(ev.process_path), "%s", br->exe_path);
-  snprintf(ev.cmdline, sizeof(ev.cmdline), "%s", br->cmdline);
   if (br->priority <= 255u) {
     ev.severity_hint = (uint8_t)br->priority;
   }
   if (br->exe_path[0]) {
-    snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->exe_path);
+    if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->exe_path,
+                                sizeof(br->exe_path))) {
+      return;
+    }
   } else if (br->file_path[0]) {
-    snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+    if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->file_path,
+                                sizeof(br->file_path))) {
+      return;
+    }
   }
   if (br->net_dst[0]) {
-    snprintf(ev.target_ip, sizeof(ev.target_ip), "%s", br->net_dst);
+    if (!copy_record_text_exact(ev.target_ip, sizeof(ev.target_ip), br->net_dst,
+                                sizeof(br->net_dst))) {
+      return;
+    }
   }
   if (br->dns_query[0]) {
-    snprintf(ev.target_domain, sizeof(ev.target_domain), "%s", br->dns_query);
+    if (!copy_record_text_exact(ev.target_domain, sizeof(ev.target_domain), br->dns_query,
+                                sizeof(br->dns_query))) {
+      return;
+    }
   }
   if (br->net_dport != 0u) {
     ev.target_port = (uint16_t)(br->net_dport > 65535u ? 0u : br->net_dport);
@@ -385,16 +424,31 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     break;
   default:
     if (avt == AVE_EVT_FILE_WRITE && br->file_path[0]) {
-      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+      if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->file_path,
+                                  sizeof(br->file_path))) {
+        return;
+      }
     } else if (avt == AVE_EVT_REG_WRITE && br->reg_key_path[0]) {
-      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->reg_key_path);
+      if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->reg_key_path,
+                                  sizeof(br->reg_key_path))) {
+        return;
+      }
     } else if (avt == AVE_EVT_DLL_LOAD && br->file_path[0]) {
-      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+      if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->file_path,
+                                  sizeof(br->file_path))) {
+        return;
+      }
     } else if (script_score > 0.f && br->exe_path[0]) {
-      snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->exe_path);
+      if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->exe_path,
+                                  sizeof(br->exe_path))) {
+        return;
+      }
     } else if (ransom_ext || shadow_delete) {
       if (br->file_path[0]) {
-        snprintf(ev.target_path, sizeof(ev.target_path), "%s", br->file_path);
+        if (!copy_record_text_exact(ev.target_path, sizeof(ev.target_path), br->file_path,
+                                    sizeof(br->file_path))) {
+          return;
+        }
       }
     }
     break;

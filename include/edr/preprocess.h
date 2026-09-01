@@ -2,6 +2,7 @@
 #define EDR_PREPROCESS_H
 
 #include "edr/config.h"
+#include "edr/behavior_record.h"
 #include "edr/error.h"
 
 #include <stdint.h>

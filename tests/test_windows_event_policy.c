@@ -488,6 +488,25 @@ static void test_policy_status_counts_drop_reasons(void) {
   assert(strstr(st.last_drop_path, "xml_file_42.xml") != NULL);
 }
 
+static void test_policy_status_marks_overlong_drop_context(void) {
+  EdrBehaviorRecord r;
+  EdrWindowsEventFilterStatus st;
+  edr_windows_event_policy_configure(NULL);
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  memset(r.process_name, 'p', sizeof(r.process_name) - 1u);
+  r.process_name[sizeof(r.process_name) - 1u] = '\0';
+  memset(r.cmdline, 'c', sizeof(r.cmdline) - 1u);
+  r.cmdline[sizeof(r.cmdline) - 1u] = '\0';
+  memset(r.file_path, 'x', sizeof(r.file_path) - 1u);
+  memcpy(r.file_path, "C:\\", 3u);
+  memcpy(r.file_path + sizeof(r.file_path) - 5u, ".tmp", 5u);
+  assert(edr_windows_event_policy_should_emit(&r) == 0);
+  edr_windows_event_policy_get_status(&st);
+  assert(strcmp(st.last_drop_process, "<overlong>") == 0);
+  assert(strcmp(st.last_drop_path, "<overlong>") == 0);
+  assert(strcmp(st.last_drop_cmdline, "<overlong>") == 0);
+}
+
 int main(void) {
   edr_windows_event_policy_configure(NULL);
   test_webshell_path_is_high_signal();
@@ -517,6 +536,7 @@ int main(void) {
   test_search_protocolhost_cmdline_file_noise_is_not_emitted();
   test_policy_can_be_disabled_by_runtime_config();
   test_policy_status_counts_drop_reasons();
+  test_policy_status_marks_overlong_drop_context();
   puts("windows_event_policy ok");
   return 0;
 }
