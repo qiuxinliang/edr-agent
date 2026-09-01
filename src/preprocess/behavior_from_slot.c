@@ -13,6 +13,10 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef ATOMIC_VAR_INIT
+#define ATOMIC_VAR_INIT(value) (value)
+#endif
+
 static atomic_uint_fast64_t g_event_seq = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t g_event_boot_nonce = ATOMIC_VAR_INIT(0);
 

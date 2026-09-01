@@ -175,6 +175,9 @@ static void p0_ir_sensor_pair_advance_locked(void) {
 
 #if defined(EDR_P0_RULE_IR_TESTING)
 #include <stdatomic.h>
+#ifndef ATOMIC_VAR_INIT
+#define ATOMIC_VAR_INIT(value) (value)
+#endif
 static unsigned int s_test_fail_parent_sync_after;
 static unsigned int s_test_fail_parent_sync_remaining;
 static atomic_int s_test_preparation_pause = ATOMIC_VAR_INIT(0);

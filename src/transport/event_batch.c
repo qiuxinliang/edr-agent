@@ -11,6 +11,10 @@
 #include <time.h>
 #include <stdatomic.h>
 
+#ifndef ATOMIC_VAR_INIT
+#define ATOMIC_VAR_INIT(value) (value)
+#endif
+
 static int persist_strategy_on_fail_only(void) {
   const char *s = getenv("EDR_PERSIST_STRATEGY");
   return s && strcmp(s, "on_fail") == 0;
