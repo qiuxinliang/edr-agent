@@ -407,15 +407,25 @@ jobs:
             "scripts\edr_agent_zip_deploy.ps1",
             "scripts\windows_service_install.ps1",
             "scripts\windows_isolate_host.ps1",
-            "config\agent_windows_production.example.toml",
-            "config\p0_rule_bundle_ir_v1.json.enc",
-            "config\sensor_interest_manifest.json"
+            "config\agent_windows_production.example.toml"
           )) {
             if (Test-Path $p) { $null = $items.Add($p) }
           }
-          if (-not (Test-Path "config\p0_rule_bundle_ir_v1.json.enc")) {
-            throw "missing encrypted P0 rule bundle: config\p0_rule_bundle_ir_v1.json.enc"
+          $runtimeDetectionStagingRoot = Join-Path $env:RUNNER_TEMP "edr-runtime-detection"
+          $runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot "edr_config"
+          Remove-Item -LiteralPath $runtimeDetectionStagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $runtimeDetectionDir -Force | Out-Null
+          foreach ($detectionAssetName in @("p0_rule_bundle_ir_v1.json.enc", "sensor_interest_manifest.json")) {
+            $detectionAssetSource = Join-Path "config" $detectionAssetName
+            if (-not (Test-Path -LiteralPath $detectionAssetSource -PathType Leaf)) {
+              throw "missing required detection asset: $detectionAssetSource"
+            }
+            if ((Get-Item -LiteralPath $detectionAssetSource).Length -le 0) {
+              throw "required detection asset is empty: $detectionAssetSource"
+            }
+            Copy-Item -LiteralPath $detectionAssetSource -Destination (Join-Path $runtimeDetectionDir $detectionAssetName) -Force
           }
+          $null = $items.Add($runtimeDetectionDir)
           $forensicRulesDir = "rules\forensic"
           $requiredForensicRules = @(
             "credential_theft.yar",
@@ -462,14 +472,20 @@ jobs:
           $zipObj = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip))
           try {
             $entries = $zipObj.Entries.FullName
+            $normalizedEntries = @($entries | ForEach-Object { $_.Replace('\', '/') })
             if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
               throw "plaintext P0 rule bundle must not be packaged"
             }
             if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
               throw "plaintext P0 rule manifest must not be packaged"
             }
-            if (-not ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json\.enc$')) {
-              throw "encrypted P0 rule bundle missing from package"
+            $encryptedP0Entries = @($normalizedEntries | Where-Object { $_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc' })
+            if ($encryptedP0Entries.Count -ne 1) {
+              throw "package must contain exactly one edr_config/p0_rule_bundle_ir_v1.json.enc; found $($encryptedP0Entries.Count)"
+            }
+            $sensorManifestEntries = @($normalizedEntries | Where-Object { $_ -eq 'edr_config/sensor_interest_manifest.json' })
+            if ($sensorManifestEntries.Count -ne 1) {
+              throw "package must contain exactly one edr_config/sensor_interest_manifest.json; found $($sensorManifestEntries.Count)"
             }
             $forensicEntries = @($entries | Where-Object { $_ -match '(?i)^rules[/\\]forensic[/\\][^/\\]+\.yar(a)?$' })
             if ($forensicEntries.Count -lt 1) {
@@ -523,8 +539,7 @@ jobs:
               'WinDivert\.dll',
               'WinDivert64\.sys',
               'WinDivert-LICENSE\.txt',
-              'agent_windows_production\.example\.toml',
-              'sensor_interest_manifest\.json'
+              'agent_windows_production\.example\.toml'
             )) {
               if (-not ($entries -match "(^|/|\\)${required}$")) {
                 throw "required package entry missing: $required"

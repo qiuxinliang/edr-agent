@@ -398,6 +398,12 @@ int main(void) {
            "release materializes the Runtime component list before ordered-manifest serialization");
   require_true(!strstr(workflow, "files = @($nativeIntegrityFiles)"),
                "release must not trigger PowerShell generic-list expansion inside an ordered manifest");
+  contains(workflow, "$runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot \"edr_config\"",
+           "release stages detection assets under the canonical edr_config package directory");
+  contains(workflow, "$_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc'",
+           "release package gate requires the encrypted P0 bundle at its canonical path");
+  contains(workflow, "$_ -eq 'edr_config/sensor_interest_manifest.json'",
+           "release package gate requires the sensor-interest manifest at its canonical path");
   contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
@@ -765,6 +771,12 @@ int main(void) {
            "client build workflow packages native component SHA-256 identities");
   contains(client_build, "'native-package-integrity\\.json'",
            "client build workflow rejects packages missing native component integrity metadata");
+  contains(client_build, "$runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot \"edr_config\"",
+           "client build stages detection assets under the canonical edr_config package directory");
+  contains(client_build, "$_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc'",
+           "client build package gate requires the encrypted P0 bundle at its canonical path");
+  contains(client_build, "$_ -eq 'edr_config/sensor_interest_manifest.json'",
+           "client build package gate requires the sensor-interest manifest at its canonical path");
   require_true(!strstr(client_build, "uninstall\\.ps1"),
                "client build package gate must not require the removed PowerShell uninstaller");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
@@ -956,6 +968,10 @@ int main(void) {
            "lifecycle resolves the complete target package root independently of the binary location");
   contains(lifecycle_smoke, "candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName",
            "lifecycle resolves detection assets recursively from package roots");
+  contains(lifecycle_smoke, "$isPackageRoot = [string]::Equals($candidateDirectory, $normalizedPackageRoot",
+           "lifecycle accepts detection assets flattened by historical runtime ZIP producers");
+  contains(lifecycle_smoke, "$isDetectionConfigDirectory = $_.Directory.Name -eq \"edr_config\" -or $_.Directory.Name -eq \"config\"",
+           "lifecycle accepts canonical and legacy nested detection configuration directories");
   contains(lifecycle_smoke, "$baselinePackageRoot, $targetPackageRoot",
            "lifecycle can complete the installed fixture from the verified target detection assets when a legacy baseline omits them");
   contains(lifecycle_smoke, "target and baseline packages are missing required detection artifact",

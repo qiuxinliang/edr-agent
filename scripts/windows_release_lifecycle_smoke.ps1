@@ -353,10 +353,9 @@ try {
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   Copy-Item -Path (Join-Path $baselineRoot "*") -Destination $installDir -Recurse -Force
-  # The runtime ZIP keeps package assets under config\, while the Windows
-  # installer places protected detection assets under the installed
-  # edr_config\ directory. Mirror that installer mapping for this direct-copy
-  # lifecycle fixture before the Agent starts.
+  # Runtime ZIPs before the canonical edr_config\ layout flattened these
+  # assets at the archive root. Normalize either verified package layout into
+  # the installed directory before the Agent starts.
   $installedDetectionConfigDir = Join-Path $installDir "edr_config"
   New-Item -ItemType Directory -Path $installedDetectionConfigDir -Force | Out-Null
   foreach ($detectionAssetName in @("p0_rule_bundle_ir_v1.json.enc", "sensor_interest_manifest.json")) {
@@ -366,18 +365,21 @@ try {
     }
     $packagedDetectionAsset = $null
     foreach ($packageRoot in @($baselinePackageRoot, $targetPackageRoot)) {
-      foreach ($packageConfigDir in @("edr_config", "config")) {
-        $candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName |
-          Where-Object { $_.Directory.Name -eq $packageConfigDir -and $_.Length -gt 0 })
-        if ($candidateDetectionAssets.Count -gt 1) {
-          throw "package contains multiple candidate detection artifacts: $packageConfigDir\$detectionAssetName"
-        }
-        if ($candidateDetectionAssets.Count -eq 1) {
-          $packagedDetectionAsset = $candidateDetectionAssets[0].FullName
-          break
-        }
+      $normalizedPackageRoot = [IO.Path]::GetFullPath($packageRoot).TrimEnd([char[]]@('\', '/'))
+      $candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName |
+        Where-Object {
+          $candidateDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd([char[]]@('\', '/'))
+          $isPackageRoot = [string]::Equals($candidateDirectory, $normalizedPackageRoot, [StringComparison]::OrdinalIgnoreCase)
+          $isDetectionConfigDirectory = $_.Directory.Name -eq "edr_config" -or $_.Directory.Name -eq "config"
+          $_.Length -gt 0 -and ($isPackageRoot -or $isDetectionConfigDirectory)
+        })
+      if ($candidateDetectionAssets.Count -gt 1) {
+        throw "package contains multiple candidate detection artifacts: $detectionAssetName"
       }
-      if ($packagedDetectionAsset) { break }
+      if ($candidateDetectionAssets.Count -eq 1) {
+        $packagedDetectionAsset = $candidateDetectionAssets[0].FullName
+        break
+      }
     }
     if (-not $packagedDetectionAsset) {
       throw "target and baseline packages are missing required detection artifact: $detectionAssetName"
