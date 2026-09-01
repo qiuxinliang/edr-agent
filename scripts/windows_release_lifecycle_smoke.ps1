@@ -393,6 +393,12 @@ try {
   if ($installedNativeIntegrity.schema -ne "edr.windows.native-package-integrity.v1") {
     throw "installed baseline native integrity manifest schema mismatch"
   }
+  # Releases 3.2.383 and earlier could list the standalone PCRE2 contract in
+  # this native-only manifest. Keep the legacy baseline package usable while
+  # leaving production package generation and native validation strict.
+  $installedNativeIntegrity.files = @($installedNativeIntegrity.files | Where-Object {
+    $_.name -ne "p0_matcher_contract.json"
+  })
   foreach ($componentName in @("FDSecurityInstallerWorker.exe", "uninstall.exe")) {
     $installedEntry = @($installedNativeIntegrity.files | Where-Object { $_.name -eq $componentName })
     if ($installedEntry.Count -ne 1) {

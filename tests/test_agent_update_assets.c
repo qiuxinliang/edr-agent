@@ -940,6 +940,8 @@ int main(void) {
                   "lifecycle captures the running Agent PID before verifying native uninstall cleanup");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
+  contains(lifecycle_smoke, "$_.name -ne \"p0_matcher_contract.json\"",
+           "lifecycle removes the legacy PCRE2 contract entry from old baseline native manifests");
   contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
            "lifecycle retains the target manifest hashes after validating native components");
   contains(lifecycle_smoke, "$installedEntry[0].sha256 = $targetNativeHashes[$componentName]",
