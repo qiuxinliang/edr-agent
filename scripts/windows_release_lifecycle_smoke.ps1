@@ -269,6 +269,8 @@ $baselineBinary = Find-OneFile -Root $BaselinePackageDir -Name "FDSensor.exe"
 $targetBinary = Find-OneFile -Root $TargetPackageDir -Name "FDSensor.exe"
 $baselineRoot = Split-Path -Parent $baselineBinary
 $targetRoot = Split-Path -Parent $targetBinary
+$baselinePackageRoot = [IO.Path]::GetFullPath($BaselinePackageDir)
+$targetPackageRoot = [IO.Path]::GetFullPath($TargetPackageDir)
 $targetInstaller = Find-OneFile -Root $TargetPackageDir -Name "windows_service_install.ps1"
 $targetUpdater = Find-OneFile -Root $TargetPackageDir -Name "edr_agent_inplace_update.ps1"
 $targetLifecycleWorker = Find-OneFile -Root $TargetPackageDir -Name "FDSecurityInstallerWorker.exe"
@@ -363,15 +365,16 @@ try {
       continue
     }
     $packagedDetectionAsset = $null
-    foreach ($packageRoot in @($baselineRoot, $targetRoot)) {
+    foreach ($packageRoot in @($baselinePackageRoot, $targetPackageRoot)) {
       foreach ($packageConfigDir in @("edr_config", "config")) {
-        $candidateDetectionAsset = Join-Path (Join-Path $packageRoot $packageConfigDir) $detectionAssetName
-        if (Test-Path -LiteralPath $candidateDetectionAsset -PathType Leaf) {
-          $candidateDetectionAssetLength = (Get-Item -LiteralPath $candidateDetectionAsset).Length
-          if ($candidateDetectionAssetLength -gt 0) {
-            $packagedDetectionAsset = $candidateDetectionAsset
-            break
-          }
+        $candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName |
+          Where-Object { $_.Directory.Name -eq $packageConfigDir -and $_.Length -gt 0 })
+        if ($candidateDetectionAssets.Count -gt 1) {
+          throw "package contains multiple candidate detection artifacts: $packageConfigDir\$detectionAssetName"
+        }
+        if ($candidateDetectionAssets.Count -eq 1) {
+          $packagedDetectionAsset = $candidateDetectionAssets[0].FullName
+          break
         }
       }
       if ($packagedDetectionAsset) { break }
@@ -380,8 +383,8 @@ try {
       throw "target and baseline packages are missing required detection artifact: $detectionAssetName"
     }
     $packagedDetectionAssetFullPath = [IO.Path]::GetFullPath($packagedDetectionAsset)
-    $targetRootFullPath = [IO.Path]::GetFullPath($targetRoot)
-    if ($packagedDetectionAssetFullPath.StartsWith($targetRootFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+    $targetPackageRootWithSeparator = $targetPackageRoot.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    if ($packagedDetectionAssetFullPath.StartsWith($targetPackageRootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) {
       Write-Warning "baseline package omitted $detectionAssetName; using the target package's verified detection asset for the installed lifecycle fixture"
     }
     Copy-Item -LiteralPath $packagedDetectionAsset -Destination $installedDetectionAsset -Force
