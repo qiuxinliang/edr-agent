@@ -351,6 +351,24 @@ try {
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   Copy-Item -Path (Join-Path $baselineRoot "*") -Destination $installDir -Recurse -Force
+  # The runtime ZIP keeps package assets under config\, while the Windows
+  # installer places protected detection assets under the installed
+  # edr_config\ directory. Mirror that installer mapping for this direct-copy
+  # lifecycle fixture before the Agent starts.
+  $installedDetectionConfigDir = Join-Path $installDir "edr_config"
+  New-Item -ItemType Directory -Path $installedDetectionConfigDir -Force | Out-Null
+  foreach ($detectionAssetName in @("p0_rule_bundle_ir_v1.json.enc", "sensor_interest_manifest.json")) {
+    $installedDetectionAsset = Join-Path $installedDetectionConfigDir $detectionAssetName
+    if (Test-Path -LiteralPath $installedDetectionAsset -PathType Leaf) {
+      continue
+    }
+    $packagedDetectionAsset = Join-Path (Join-Path $installDir "config") $detectionAssetName
+    if (-not (Test-Path -LiteralPath $packagedDetectionAsset -PathType Leaf) -or
+        (Get-Item -LiteralPath $packagedDetectionAsset).Length -le 0) {
+      throw "baseline package is missing required detection artifact: config\\$detectionAssetName"
+    }
+    Copy-Item -LiteralPath $packagedDetectionAsset -Destination $installedDetectionAsset -Force
+  }
 
   $template = [IO.File]::ReadAllText($baselineTemplate)
   $escapedInstallDir = $installDir.Replace("\", "\\")

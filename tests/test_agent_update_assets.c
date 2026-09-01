@@ -948,6 +948,10 @@ int main(void) {
                   "lifecycle captures the running Agent PID before verifying native uninstall cleanup");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
+  contains(lifecycle_smoke, "installedDetectionConfigDir = Join-Path $installDir \"edr_config\"",
+           "lifecycle maps package detection assets into the installed edr_config directory");
+  contains(lifecycle_smoke, "packagedDetectionAsset = Join-Path (Join-Path $installDir \"config\")",
+           "lifecycle sources detection assets from the runtime package config directory");
   contains(lifecycle_smoke, "$_.name -ne \"p0_matcher_contract.json\"",
            "lifecycle removes the legacy PCRE2 contract entry from old baseline native manifests");
   contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
