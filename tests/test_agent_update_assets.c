@@ -381,6 +381,11 @@ int main(void) {
            "explicit binary-hot releases prove runtime component identity after build");
   contains(workflow, "Get-ChildItem -LiteralPath $outDir -Filter \"*.dll\"",
            "release Runtime identity binds every root app-local DLL");
+  require_true(!strstr(workflow,
+                       "name = [System.IO.Path]::GetFileName($pcre2ContractPackagePath)"),
+               "PCRE2 matcher contract remains a package asset and is not treated as a native lifecycle component");
+  contains(workflow, "$null = $items.Add($pcre2ContractPackagePath)",
+           "release package still publishes the verified PCRE2 matcher contract");
   contains(workflow, "$nativeIntegrityFiles.ToArray()",
            "release materializes the Runtime component list before ordered-manifest serialization");
   require_true(!strstr(workflow, "files = @($nativeIntegrityFiles)"),

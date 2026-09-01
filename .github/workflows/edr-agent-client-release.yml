@@ -710,10 +710,6 @@ jobs:
               sha256 = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
             })
           }
-          $null = $nativeIntegrityFiles.Add([ordered]@{
-            name = [System.IO.Path]::GetFileName($pcre2ContractPackagePath)
-            sha256 = $pcre2ContractSha256
-          })
           Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
             Sort-Object Name | ForEach-Object {
               $null = $nativeIntegrityFiles.Add([ordered]@{
