@@ -18,7 +18,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+import shutil
 
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
@@ -91,8 +93,13 @@ def load_authority() -> tuple[str, dict]:
     return baseline, manifest
 
 
+def is_vcpkg_checkout(vcpkg_root: Path) -> bool:
+    git = vcpkg_root / ".git"
+    return git.is_dir() or git.is_file()
+
+
 def verify_clean_pinned_vcpkg(vcpkg_root: Path, baseline: str) -> str:
-    if not (vcpkg_root / ".git").is_dir():
+    if not is_vcpkg_checkout(vcpkg_root):
         raise ContractError(f"vcpkg root is not a checkout: {vcpkg_root}")
     try:
         inside = run_checked(["git", "-C", str(vcpkg_root), "rev-parse", "--is-inside-work-tree"])
@@ -115,6 +122,40 @@ def verify_clean_pinned_vcpkg(vcpkg_root: Path, baseline: str) -> str:
     if normalized_origin not in allowed_origins:
         raise ContractError("vcpkg checkout origin is not the official microsoft/vcpkg repository")
     return origin
+
+
+def bootstrap_pinned_vcpkg(vcpkg_root: Path, baseline: str) -> None:
+    vcpkg_root.mkdir(parents=True, exist_ok=True)
+    run_checked(["git", "-C", str(vcpkg_root), "init", "--quiet"])
+    run_checked([
+        "git", "-C", str(vcpkg_root), "remote", "add", "origin",
+        "https://github.com/microsoft/vcpkg.git",
+    ])
+    run_checked(["git", "-C", str(vcpkg_root), "fetch", "--depth", "1", "origin", baseline])
+    run_checked(["git", "-C", str(vcpkg_root), "checkout", "--detach", "--force", "FETCH_HEAD"])
+    bootstrap = vcpkg_root / "bootstrap-vcpkg.bat" if os.name == "nt" else vcpkg_root / "bootstrap-vcpkg.sh"
+    if not bootstrap.is_file():
+        raise ContractError(f"bootstrap-vcpkg script missing in pinned vcpkg: {vcpkg_root}")
+    command = ["cmd", "/c", str(bootstrap), "-disableMetrics"] if os.name == "nt" else [str(bootstrap), "-disableMetrics"]
+    run_checked(command)
+
+
+def resolve_source_vcpkg_root(vcpkg_root: Path, baseline: str) -> tuple[Path, Path | None]:
+    source_mode = os.environ.get("VCPKG_SOURCE", "").strip().lower() == "source"
+    vcpkg_root = vcpkg_root.resolve()
+    if is_vcpkg_checkout(vcpkg_root):
+        verify_clean_pinned_vcpkg(vcpkg_root, baseline)
+        return vcpkg_root, None
+    if not source_mode:
+        verify_clean_pinned_vcpkg(vcpkg_root, baseline)
+    temporary_root = Path(tempfile.mkdtemp(prefix="edr-pinned-vcpkg-"))
+    try:
+        bootstrap_pinned_vcpkg(temporary_root, baseline)
+        verify_clean_pinned_vcpkg(temporary_root, baseline)
+    except Exception:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
+    return temporary_root, temporary_root
 
 
 def vcpkg_from_github_blocks(text: str) -> list[str]:
@@ -832,15 +873,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    resolved_vcpkg_root: Path | None = None
+    temporary_root: Path | None = None
     try:
         if args.verify_contract:
             if not args.prefix or not args.vcpkg_root:
                 raise ContractError("--verify-contract requires --prefix and --vcpkg-root")
             if args.producer_root or args.output or args.cc:
                 raise ContractError("--verify-contract cannot be combined with producer build arguments")
+            baseline, _ = load_authority()
+            resolved_vcpkg_root, temporary_root = resolve_source_vcpkg_root(args.vcpkg_root, baseline)
             library = verify_contract(
                 args.verify_contract, args.prefix, args.target, args.library,
-                vcpkg_root=args.vcpkg_root,
+                vcpkg_root=resolved_vcpkg_root,
             )
             emit_result(
                 mode="verify",
@@ -853,16 +898,16 @@ def main() -> int:
         if not args.vcpkg_root or not args.producer_root or not args.output:
             raise ContractError("producer build requires --vcpkg-root, --producer-root, and --output")
         baseline, _ = load_authority()
-        vcpkg_root = args.vcpkg_root.resolve()
-        origin = verify_clean_pinned_vcpkg(vcpkg_root, baseline)
+        resolved_vcpkg_root, temporary_root = resolve_source_vcpkg_root(args.vcpkg_root, baseline)
+        origin = verify_clean_pinned_vcpkg(resolved_vcpkg_root, baseline)
         triplet = TARGET_TRIPLETS[args.target]
-        portfile = vcpkg_root / PORTFILE_RELATIVE
+        portfile = resolved_vcpkg_root / PORTFILE_RELATIVE
         # Parse every source and patch before spending time in vcpkg.  The
         # same authority is parsed again after the build below, after the
         # checkout has been re-checked for modifications.
         port_source_authority(portfile)
-        prefix = build_static_pcre2(vcpkg_root, args.producer_root.resolve(), triplet, args.cc)
-        if verify_clean_pinned_vcpkg(vcpkg_root, baseline).rstrip("/").lower() != origin.rstrip("/").lower():
+        prefix = build_static_pcre2(resolved_vcpkg_root, args.producer_root.resolve(), triplet, args.cc)
+        if verify_clean_pinned_vcpkg(resolved_vcpkg_root, baseline).rstrip("/").lower() != origin.rstrip("/").lower():
             raise ContractError("pinned vcpkg checkout changed while building PCRE2")
         contract = contract_for(prefix, baseline=baseline, origin=origin, triplet=triplet,
                                 portfile=portfile, target=args.target)
@@ -870,6 +915,9 @@ def main() -> int:
     except ContractError as exc:
         print(f"PCRE2 matcher contract producer: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if temporary_root is not None:
+            shutil.rmtree(temporary_root, ignore_errors=True)
     emit_result(
         mode="build",
         contract_path=args.output,
