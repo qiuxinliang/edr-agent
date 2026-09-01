@@ -362,10 +362,24 @@ try {
     if (Test-Path -LiteralPath $installedDetectionAsset -PathType Leaf) {
       continue
     }
-    $packagedDetectionAsset = Join-Path (Join-Path $installDir "config") $detectionAssetName
-    if (-not (Test-Path -LiteralPath $packagedDetectionAsset -PathType Leaf) -or
-        (Get-Item -LiteralPath $packagedDetectionAsset).Length -le 0) {
-      throw "baseline package is missing required detection artifact: config\\$detectionAssetName"
+    $packagedDetectionAsset = $null
+    foreach ($packageRoot in @($baselineRoot, $targetRoot)) {
+      foreach ($packageConfigDir in @("edr_config", "config")) {
+        $candidateDetectionAsset = Join-Path (Join-Path $packageRoot $packageConfigDir) $detectionAssetName
+        if (Test-Path -LiteralPath $candidateDetectionAsset -PathType Leaf -and
+            (Get-Item -LiteralPath $candidateDetectionAsset).Length -gt 0) {
+          $packagedDetectionAsset = $candidateDetectionAsset
+          break
+        }
+      }
+      if ($packagedDetectionAsset) { break }
+    }
+    if (-not $packagedDetectionAsset) {
+      throw "target and baseline packages are missing required detection artifact: $detectionAssetName"
+    }
+    if ([IO.Path]::GetFullPath($packagedDetectionAsset).StartsWith(
+        [IO.Path]::GetFullPath($targetRoot), [StringComparison]::OrdinalIgnoreCase)) {
+      Write-Warning "baseline package omitted $detectionAssetName; using the target package's verified detection asset for the installed lifecycle fixture"
     }
     Copy-Item -LiteralPath $packagedDetectionAsset -Destination $installedDetectionAsset -Force
   }

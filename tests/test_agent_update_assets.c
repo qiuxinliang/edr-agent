@@ -950,8 +950,12 @@ int main(void) {
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
   contains(lifecycle_smoke, "installedDetectionConfigDir = Join-Path $installDir \"edr_config\"",
            "lifecycle maps package detection assets into the installed edr_config directory");
-  contains(lifecycle_smoke, "packagedDetectionAsset = Join-Path (Join-Path $installDir \"config\")",
-           "lifecycle sources detection assets from the runtime package config directory");
+  contains(lifecycle_smoke, "candidateDetectionAsset = Join-Path (Join-Path $packageRoot $packageConfigDir)",
+           "lifecycle resolves detection assets from package config directories");
+  contains(lifecycle_smoke, "$baselineRoot, $targetRoot",
+           "lifecycle can complete the installed fixture from the verified target detection assets when a legacy baseline omits them");
+  contains(lifecycle_smoke, "target and baseline packages are missing required detection artifact",
+           "lifecycle fails clearly when neither package contains the required detection asset");
   contains(lifecycle_smoke, "$_.name -ne \"p0_matcher_contract.json\"",
            "lifecycle removes the legacy PCRE2 contract entry from old baseline native manifests");
   contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
