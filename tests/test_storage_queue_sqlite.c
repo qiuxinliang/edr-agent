@@ -1801,6 +1801,50 @@ static void test_p0_source_only_latch_persists_until_central_ack(void) {
   (void)remove(path);
 }
 
+static void test_p0_source_only_multiple_durable_rows_do_not_create_false_loss(void) {
+  char path[256];
+  uint8_t first_wire[20];
+  uint8_t second_wire[20];
+  EdrStorageQueueP0SourceOnlyLatch first;
+  EdrStorageQueueP0SourceOnlyLatch second;
+  EdrStorageQueueP0SourceOnlyLatch reopened;
+  snprintf(path, sizeof(path), "/tmp/edr-source-only-multi-%ld.db", (long)getpid());
+  (void)remove(path);
+  make_wire(first_wire, 0xe8u);
+  make_wire(second_wire, 0xe9u);
+
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare(&first) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_enqueue_bound(
+             &first, "source-only-event-a", "source-only-batch-a", first_wire,
+             sizeof(first_wire), 0, 0) == EDR_OK);
+
+  /* A prior bound row is already durable. Preparing a second assertion must
+   * rotate to a new crash-gap tuple, not manufacture a delivery loss. */
+  assert(edr_storage_queue_p0_source_only_latch_prepare(&second) == EDR_OK);
+  assert(second.latched == 1 && second.recovery_required == 0 &&
+         second.latch_counter > first.latch_counter);
+  assert(edr_storage_queue_p0_source_only_enqueue_bound(
+             &second, "source-only-event-b", "source-only-batch-b", second_wire,
+             sizeof(second_wire), 0, 0) == EDR_OK);
+  assert(status_count(path, "pending") == 2);
+
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_get(&reopened) == EDR_OK);
+  assert(reopened.latched == 1 && reopened.recovery_required == 0 &&
+         strcmp(reopened.recovery_batch_id, "source-only-batch-b") == 0);
+
+  reset_send_state(1);
+  edr_storage_queue_poll_drain();
+  edr_storage_queue_poll_drain();
+  assert(status_count(path, "pending") == 0);
+  assert(edr_storage_queue_p0_source_only_latch_get(&reopened) == EDR_OK);
+  assert(reopened.latched == 0 && reopened.recovery_required == 0);
+  edr_storage_queue_close();
+  (void)remove(path);
+}
+
 /* Source-only evidence is a capability assertion, not disposable telemetry.
  * It must survive the ordinary retry and retention policies, and a malformed
  * durable wire must preserve an explicit recovery-required latch instead of
@@ -2246,6 +2290,7 @@ int main(void) {
   test_queue_and_terminal_metric_denominators();
   test_unbounded_queue_reports_no_utilization_percentage();
   test_p0_source_only_latch_persists_until_central_ack();
+  test_p0_source_only_multiple_durable_rows_do_not_create_false_loss();
   test_p0_source_only_retry_retention_corruption_and_identity();
   test_p0_source_only_legacy_and_corrupt_meta_recover();
 #if !defined(_WIN32)

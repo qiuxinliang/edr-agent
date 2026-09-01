@@ -337,15 +337,20 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
   return EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE;
 }
 
-/* Bind the ETW raw ProcessStartKey to the current process before accepting a
- * creation FILETIME. EventHeader.TimeStamp is never a creation surrogate.
- * The native telemetry contract is Windows 10+; unsupported systems stay
- * source-only and are marked NOT_EVALUABLE by the P0 gate. */
+/* A live target query validates the target PID generation.  Kernel-Process
+ * Start supplies the target key in its payload; EVENT_HEADER extended data is
+ * intentionally not used here because it identifies the logging process.
+ * Kernel-File actor events still arrive with their actor key in the header.
+ * EventHeader.TimeStamp remains event time and is never a creation surrogate. */
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
   ULARGE_INTEGER observed;
-  uint64_t telemetry_creation = 0u;
+  EdrLiveProcessGeneration live;
+  uint64_t source_start_key;
+  uint64_t source_creation;
+  uint64_t event_unix_ns;
+  uint64_t creation_unix_ns;
   char reason[64];
   if (!br || br->is_security_4688 ||
       (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ) ||
@@ -353,10 +358,9 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
        !edr_process_create_is_lifecycle_authoritative(br))) {
     return 0;
   }
-  /* Never retain a payload-provided creation time until the live key binding
-   * below has proven it belongs to this exact PID generation. */
-  br->process_creation_filetime_100ns = 0u;
-  if (!br->pid || !br->process_start_key) {
+  source_start_key = br->process_start_key;
+  source_creation = br->process_creation_filetime_100ns;
+  if (!br->pid || (br->type == EDR_EVENT_FILE_READ && !source_start_key)) {
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "etw_process_start_key_unavailable");
     p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
@@ -371,28 +375,55 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
     return 0;
   }
   reason[0] = '\0';
-  if (!edr_process_generation_validate_live(process, br->pid, br->process_start_key,
-                                            &telemetry_creation, reason, sizeof(reason)) ||
+  memset(&live, 0, sizeof(live));
+  if (!edr_process_generation_query_live(process, &live, reason, sizeof(reason)) ||
+      live.pid != br->pid ||
+      (source_start_key != 0u && live.process_start_key != source_start_key) ||
       !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    const char *failure_reason =
+        live.pid != 0u && live.pid != br->pid ? "telemetry_pid_mismatch" :
+        (source_start_key != 0u && live.process_start_key != 0u &&
+         live.process_start_key != source_start_key ? "process_start_key_mismatch" :
+         (reason[0] ? reason : "live_generation_query_failed"));
     CloseHandle(process);
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
-             reason[0] ? reason : "live_generation_query_failed");
-    p0_mark_file_read_collector_evidence(br, p0_file_read_live_generation_reason(reason));
+             failure_reason);
+    p0_mark_file_read_collector_evidence(
+        br, p0_file_read_live_generation_reason(failure_reason));
     return 0;
   }
   CloseHandle(process);
   observed.LowPart = created.dwLowDateTime;
   observed.HighPart = created.dwHighDateTime;
-  if (!telemetry_creation || observed.QuadPart != telemetry_creation) {
+  if (!live.creation_filetime_100ns || observed.QuadPart != live.creation_filetime_100ns ||
+      (source_creation != 0u && source_creation != live.creation_filetime_100ns)) {
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "live_creation_filetime_mismatch");
     p0_mark_file_read_collector_evidence(br,
                                          EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH);
     return 0;
   }
-  br->process_creation_filetime_100ns = telemetry_creation;
+  creation_unix_ns = filetime_100ns_to_unix_ns(live.creation_filetime_100ns);
+  event_unix_ns = br->event_time_ns > 0 ? (uint64_t)br->event_time_ns : 0u;
+  /* A process-start event may be delivered late, but its recorded timestamp
+   * must stay close to and never materially predate the queried creation. A
+   * five-second bound covers observed Security/Kernel delivery skew without
+   * accepting an arbitrary current occupant of a reused PID. */
+  if (br->type == EDR_EVENT_PROCESS_CREATE &&
+      (!event_unix_ns || !creation_unix_ns ||
+       event_unix_ns + 100000000ULL < creation_unix_ns ||
+       event_unix_ns > creation_unix_ns + 5000000000ULL)) {
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             "live_generation_event_time_mismatch");
+    return 0;
+  }
+  br->process_start_key = live.process_start_key;
+  br->process_creation_filetime_100ns = live.creation_filetime_100ns;
   snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
-           "etw_start_key_live_telemetry");
+           br->type == EDR_EVENT_PROCESS_CREATE
+               ? (source_start_key != 0u ? "kernel_payload_live_telemetry"
+                                         : "target_live_telemetry")
+               : "etw_start_key_live_telemetry");
   return 1;
 }
 
@@ -1137,6 +1168,14 @@ static void process_one_slot(const EdrEventSlot *slot) {
     EdrBehaviorRecord ready;
     if (!br.is_security_4688) {
       (void)p0_bind_process_generation(&br);
+      /* Capture the target token while the newly-created process is most
+       * likely still alive.  Waiting for the bounded 4688 correlation window
+       * made short-lived processes lose user identity even when their target
+       * generation was valid.  The later enrichment call is idempotent. */
+      if (br.process_start_key != 0u &&
+          br.process_creation_filetime_100ns != 0u) {
+        (void)enrich_process_token_identity(&br);
+      }
       /* Publish the exact lifecycle generation before a coalesced 4688 wait.
        * A child can arrive after A exits and PID B begins; keeping A's
        * StartKey/FILETIME interval now prevents later parent enrichment from

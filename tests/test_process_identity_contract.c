@@ -113,12 +113,14 @@ int main(void) {
   int ok = 1;
 
   char *collector = read_source(root, "src/collector/collector_win.c");
+  char *tdh = read_source(root, "src/collector/etw_tdh_win.c");
   char *direct_feed = read_source(root, "src/collector/ave_etw_feed_win.c");
   char *alert_emit = read_source(root, "src/serialize/behavior_alert_emit.c");
   char *agent = read_source(root, "src/core/agent.c");
   char *process_cache = read_source(root, "src/forensic/process_tree_cache.c");
-  if (!collector || !direct_feed || !alert_emit || !agent || !process_cache) {
+  if (!collector || !tdh || !direct_feed || !alert_emit || !agent || !process_cache) {
     free(collector);
+    free(tdh);
     free(direct_feed);
     free(alert_emit);
     free(agent);
@@ -164,7 +166,15 @@ int main(void) {
   ok &= require_contains(collector, "edr_collector_pid_cache_same_generation",
                          "collector PID enrichment must require a process-generation match");
   ok &= require_contains(collector, "edr_collector_event_process_start_key",
-                         "collector must read the ETW ProcessStartKey extension for generation binding");
+                         "collector must read the ETW actor ProcessStartKey extension for file-read binding");
+  ok &= require_contains(tdh, "L\"UniqueProcessKey\"",
+                         "Kernel-Process TDH must read the target process key from the payload");
+  ok &= require_contains(tdh, "process_generation_source=%s",
+                         "Kernel-Process TDH must report target-generation availability");
+  ok &= require_contains(collector, "if (is_kernel_process)",
+                         "Kernel-Process generation handling must have a target-specific branch");
+  ok &= require_contains(collector, "Never overwrite it with the event",
+                         "the target key must not be replaced by the logging process header key");
   ok &= require_contains(collector, "EVENT_ENABLE_PROPERTY_PROCESS_START_KEY",
                          "collector must request documented ProcessStartKey extended data");
   ok &= require_contains(collector, "EDR_ETW_CLIENT_CONTEXT_SYSTEM_TIME",
@@ -194,6 +204,11 @@ int main(void) {
                            "incomplete process-create evidence must use the production pre-evaluation source-only gate");
     ok &= require_contains(pipeline, "enrich_process_token_identity",
                            "Windows process identity must have a bounded token SID fallback");
+    ok &= require_contains(pipeline, "edr_process_generation_query_live",
+                           "target generation must be validated against a live target handle");
+    ok &= require_before(pipeline, "(void)enrich_process_token_identity(&br);",
+                         "switch (edr_process_coalescer_submit",
+                         "short-lived target token identity must be captured before the 4688 wait");
     ok &= require_contains(pipeline, "LookupAccountSidA",
                            "token fallback must retain username and domain when Windows resolves the SID");
     ok &= require_contains(pipeline, "parent_creation_time",
@@ -258,6 +273,12 @@ int main(void) {
                          "process cache must retain exact StartKey/FILETIME generations");
   ok &= require_contains(process_cache, "edr_pt_cache_mark_exit_generation",
                          "process cache must close only an exact StartKey generation");
+  ok &= require_contains(agent, "\\\"p0_acceptance\\\":{",
+                         "basic health must expose P0 acceptance counters");
+  ok &= require_contains(agent, "\\\"evidence_cache\\\":{\\\"db_open\\\":%s,\\\"utilization_bps\\\":%u",
+                         "basic health must expose evidence-cache utilization");
+  ok &= require_contains(agent, "\\\"retry_pending\\\":%llu",
+                         "basic health must expose restart-durable source-only backlog");
   ok &= require_contains(process_cache, "pt_get_at_locked",
                          "process cache must select historical generations at source event time");
   ok &= require_contains(process_cache, "Old and new generations intentionally coexist",
@@ -439,6 +460,7 @@ int main(void) {
   free(admission);
   free(decode);
   free(collector);
+  free(tdh);
   free(direct_feed);
   free(alert_emit);
   free(agent);

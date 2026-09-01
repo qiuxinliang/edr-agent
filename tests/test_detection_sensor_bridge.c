@@ -738,6 +738,17 @@ static void test_windows_image_resolution_and_4688_identity(void) {
   assert(strcmp(r.identity_quality, "creator_fallback") == 0);
 
   fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\nprov=sec\neid=4688\nepid=4098\n"
+            "img=C:\\Windows\\Temp\\placeholder.exe\n"
+            "user=-\nuser_domain=-\nuser_sid=S-1-0-0\nlogon_id=0x0\n"
+            "creator_user=SYSTEM\ncreator_domain=NT AUTHORITY\n"
+            "creator_sid=S-1-5-18\ncreator_logon_id=0x3e7\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(!r.username[0] && !r.user_sid[0] && !r.logon_id[0]);
+  assert(strcmp(r.creator_sid, "S-1-5-18") == 0);
+  assert(strcmp(r.identity_quality, "creator_fallback") == 0);
+
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
             "ETW1\nprov=kproc\npid=4097\n"
             "img=\\Device\\HarddiskVolume99\\Temp\\powershell.exe\n"
             "img_raw=\\Device\\HarddiskVolume99\\Temp\\powershell.exe\n"

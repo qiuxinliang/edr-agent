@@ -7,7 +7,7 @@
 #include <pthread.h>
 #endif
 
-#define WINDOW_NS (300ULL * 1000000ULL)
+#define WINDOW_NS (3000ULL * 1000000ULL)
 
 static EdrBehaviorRecord rec(uint32_t pid, int security, uint64_t start_key,
                              const char *path, int64_t event_time_ns) {
@@ -114,6 +114,41 @@ int main(void) {
                    strcmp(out.source_completeness, "COALESCED") == 0 &&
                    strcmp(out.user_sid, "S-1-5-21-target") == 0,
                "kernel to 4688 emits one target-subject correlation at deadline");
+  }
+
+  /* Windows Security audit delivery was observed roughly two seconds after
+   * Kernel-Process on ARM64.  That source-time skew must still form one
+   * generation-bound record. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord kernel = rec(19u, 0, 0xa19u, "C:\\slow4688.exe", 1000000000LL);
+    EdrBehaviorRecord security = rec(19u, 1, 0u, "C:\\slow4688.exe", 3000000000LL);
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.source_completeness, "COALESCED") == 0,
+               "two-second ARM64 Security audit skew coalesces within the bounded window");
+  }
+
+  /* An already validated target token is stronger than advisory 4688 Target
+   * Subject data and must survive the merge. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord kernel = rec(29u, 0, 0xa29u, "C:\\token.exe", 1000000000LL);
+    EdrBehaviorRecord security = rec(29u, 1, 0u, "C:\\token.exe", 1000000100LL);
+    snprintf(kernel.user_sid, sizeof(kernel.user_sid), "%s", "S-1-5-21-live-token");
+    snprintf(kernel.identity_source, sizeof(kernel.identity_source), "%s", "token_query");
+    snprintf(kernel.identity_quality, sizeof(kernel.identity_quality), "%s", "token_sid");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.user_sid, "S-1-5-21-live-token") == 0 &&
+                   strcmp(out.identity_quality, "token_sid") == 0,
+               "coalescing preserves stronger live token identity");
   }
 
   /* A merge intentionally records `COALESCED`, but it must preserve source

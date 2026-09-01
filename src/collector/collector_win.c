@@ -1827,6 +1827,16 @@ static int edr_security_identity_value_present(const char *value) {
   return end > value && !(end == value + 1 && value[0] == '-');
 }
 
+static int edr_security_target_sid_present(const char *value) {
+  return edr_security_identity_value_present(value) &&
+         _stricmp(value, "S-1-0-0") != 0;
+}
+
+static int edr_security_target_logon_present(const char *value) {
+  return edr_security_identity_value_present(value) &&
+         _stricmp(value, "0x0") != 0 && strcmp(value, "0") != 0;
+}
+
 /* Security EventLog callbacks can be delayed; use the event's recorded system
  * FILETIME instead of callback wall time for the bounded coalescer window. */
 static uint64_t edr_security_event_time_ns(EVT_HANDLE event) {
@@ -1944,9 +1954,10 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   for (size_t oi = 0; oi < sizeof(identity)/sizeof(identity[0]); oi++) if (identity[oi] == EDR_SLOT_KV_NO_SPACE || identity[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) { degraded = 1; s_health.security_4688_identity_capacity_omitted_fields++; }
   for (size_t oi = 0; oi < sizeof(optional)/sizeof(optional[0]); oi++) if (optional[oi] == EDR_SLOT_KV_NO_SPACE || optional[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) degraded = 1;
   if (ri == EDR_SLOT_KV_VALUE_TOO_LONG || rc == EDR_SLOT_KV_VALUE_TOO_LONG) s_health.security_4688_values_rejected++;
-  if (edr_security_identity_value_present(user_sid) || edr_security_identity_value_present(user) || edr_security_identity_value_present(domain) || edr_security_identity_value_present(logon_id)) s_health.security_4688_effective_identity_present_events++;
+  if (edr_security_target_sid_present(user_sid) && edr_security_target_logon_present(logon_id)) s_health.security_4688_effective_identity_present_events++;
   if (edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id)) s_health.security_4688_creator_identity_present_events++;
-  if (!(edr_security_identity_value_present(user_sid) || edr_security_identity_value_present(user) || edr_security_identity_value_present(domain) || edr_security_identity_value_present(logon_id) || edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id))) s_health.security_4688_identity_none_events++;
+  if (!(edr_security_target_sid_present(user_sid) && edr_security_target_logon_present(logon_id)) &&
+      !(edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id))) s_health.security_4688_identity_none_events++;
   if (degraded) s_health.security_4688_payload_degraded++; else s_health.security_4688_payload_full++;
   s_health.security_audit_visible = 1;
   (void)edr_collector_slot_append_kv(&slot, "source_completeness", "ENRICHMENT_ONLY");
@@ -2959,9 +2970,11 @@ static int edr_collector_event_process_start_key(const EVENT_RECORD *record,
   return 0;
 }
 
-/* EventHeader.TimeStamp is retained strictly as source event time.  Process
- * generation comes only from the documented ProcessStartKey extended item;
- * creation FILETIME is added later only after a live telemetry key match. */
+/* EventHeader.TimeStamp is retained strictly as source event time.  For a
+ * Kernel-Process Start, target generation comes from the TDH event payload
+ * and is validated against a handle for that target PID.  The extended
+ * ProcessStartKey belongs to the process logging the event, so it is used
+ * only for actor events such as Kernel-File Read. */
 static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
                                                            const EVENT_RECORD *record) {
   char value[32];
@@ -2986,11 +2999,17 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
     snprintf(value, sizeof(value), "%llu", (unsigned long long)event_filetime);
     (void)edr_collector_slot_append_kv(slot, "event_time_filetime_100ns", value);
   }
+  if (is_kernel_process) {
+    /* etw_tdh_win.c already appended the target payload key/create time and
+     * an explicit availability source.  Never overwrite it with the event
+     * header key, which describes the logging process. */
+    return;
+  }
   if (edr_collector_event_process_start_key(record, &start_key)) {
     snprintf(value, sizeof(value), "%llu", (unsigned long long)start_key);
     (void)edr_collector_slot_append_kv(slot, "process_start_key", value);
     (void)edr_collector_slot_append_kv(slot, "process_generation_source",
-                                       "etw_extended_process_start_key");
+                                       "etw_actor_process_start_key");
     if (is_kernel_file_read) {
       (void)edr_collector_slot_append_kv(slot, "file_read_generation_quality",
                                          "etw_process_start_key");

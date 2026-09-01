@@ -2295,6 +2295,21 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(tv2_rt.envelope_format, tv2_envelope_format, sizeof(tv2_envelope_format));
   json_escape_small(rs.pressure_reason, resource_pressure_reason, sizeof(resource_pressure_reason));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
+  /* P0 acceptance metrics are required in every health profile.  The basic
+   * profile is the normal production profile and cannot hide the exact
+   * dedup/cache/durability state used by release validation. */
+  EdrEvidenceCacheStatus evidence_status;
+  EdrP0DedupMetrics p0_metrics;
+  EdrP0EmitMetrics p0_emit_metrics;
+  EdrStorageQueueCapacityMetrics queue_capacity_metrics;
+  memset(&evidence_status, 0, sizeof(evidence_status));
+  memset(&p0_metrics, 0, sizeof(p0_metrics));
+  memset(&p0_emit_metrics, 0, sizeof(p0_emit_metrics));
+  memset(&queue_capacity_metrics, 0, sizeof(queue_capacity_metrics));
+  edr_local_evidence_cache_get_status(&evidence_status);
+  edr_p0_rule_get_dedup_metrics(&p0_metrics);
+  edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
+  edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
   if (strcmp(health_profile, "diagnostic") != 0) {
     char body_basic[49152];
     int n_basic = snprintf(
@@ -2388,6 +2403,18 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"p0_rule\":{\"enabled\":true,\"mode\":\"resident\","
         "\"rule_version\":\"%s\",\"rules_count\":%u,"
         "\"last_degrade_reason\":\"%s\"},"
+        "\"p0_acceptance\":{"
+        "\"dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,"
+        "\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu},"
+        "\"source_only\":{\"terminal_unhealthy\":%s,\"loss_detected\":%s,"
+        "\"retry_pending\":%llu,\"retry_committed\":%llu},"
+        "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
+        "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
+        "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
+        "\"max_db_mb\":%u},"
+        "\"offline_queue\":{\"accounting_available\":%s,\"utilization_bps\":%u,"
+        "\"used_bytes\":%llu,\"max_bytes\":%llu,\"pending_rows\":%llu,"
+        "\"p0_source_only_rejected\":%llu}},"
         "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
@@ -2531,6 +2558,26 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)rs.sample_count, (unsigned long long)rs.sampler_reset_count,
         rules_ver, agent->cfg.preprocessing.rules_count,
         rs.throttle_active ? "resource_throttle" : "",
+        (unsigned long long)p0_metrics.suppressed_total,
+        (unsigned long long)p0_metrics.exact_suppressed,
+        (unsigned long long)p0_metrics.pre_rule_event_duplicates,
+        (unsigned long long)p0_metrics.pending_backpressure,
+        p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false",
+        p0_emit_metrics.source_only_loss_detected ? "true" : "false",
+        (unsigned long long)p0_emit_metrics.source_only_retry_pending,
+        (unsigned long long)p0_emit_metrics.source_only_retry_committed,
+        evidence_status.db_open ? "true" : "false", evidence_status.db_utilization_bps,
+        (unsigned long long)evidence_status.candidate_requests,
+        (unsigned long long)evidence_status.candidate_reused,
+        (unsigned long long)evidence_status.p0_candidate_rows,
+        (unsigned long long)evidence_status.db_bytes,
+        (unsigned long long)evidence_status.wal_bytes, evidence_status.max_db_mb,
+        queue_capacity_metrics.accounting_available ? "true" : "false",
+        queue_capacity_metrics.utilization_bps,
+        (unsigned long long)queue_capacity_metrics.used_bytes,
+        (unsigned long long)queue_capacity_metrics.max_bytes,
+        (unsigned long long)queue_capacity_metrics.pending_rows,
+        (unsigned long long)queue_capacity_metrics.p0_source_only_rejected,
         ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
         ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
         ch.collector_thread_id,
@@ -2624,14 +2671,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   pmfe_q = edr_pmfe_queue_depth();
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
-  EdrP0DedupMetrics p0_metrics;
-  edr_p0_rule_get_dedup_metrics(&p0_metrics);
-  EdrP0EmitMetrics p0_emit_metrics;
-  edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
   EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
   edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
-  EdrStorageQueueCapacityMetrics queue_capacity_metrics;
-  edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
   const char *p0_bundle_sha256 = "";
   char p0_artifact_reason[96];
   int p0_artifact_healthy;

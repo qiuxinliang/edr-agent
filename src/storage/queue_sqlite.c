@@ -1326,6 +1326,33 @@ static int queue_meta_pending_source_only_locked(void) {
   return count < 0 ? -1 : (count > 0 ? 1 : 0);
 }
 
+static int queue_meta_bound_batch_pending_locked(const QueueMetaRow *row) {
+  sqlite3_stmt *st = NULL;
+  sqlite3_int64 count = -1;
+  if (!s_db || !row || strcmp(row->latch_state, EDR_QUEUE_META_STATE_BOUND) != 0 ||
+      !row->recovery_batch_id[0] ||
+      sqlite3_prepare_v2(
+          s_db,
+          "SELECT COUNT(*) FROM event_queue WHERE batch_id=? AND severity=2 AND status='pending';",
+          -1, &st, NULL) != SQLITE_OK) {
+    return -1;
+  }
+  sqlite3_bind_text(st, 1, row->recovery_batch_id, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  return count == 1 ? 1 : (count == 0 ? 0 : -1);
+}
+
+static void queue_meta_clear_latch_locked(QueueMetaRow *row) {
+  if (!row) return;
+  row->epoch = 0u;
+  row->loss_detected = 0;
+  snprintf(row->latch_state, sizeof(row->latch_state), "%s", EDR_QUEUE_META_STATE_CLEAR);
+  row->recovery_event_id[0] = '\0';
+  row->recovery_batch_id[0] = '\0';
+  row->last_error[0] = '\0';
+}
+
 /* Only a clean severity-2 backlog may rotate a saturated counter.  The nonce
  * changes first, so a database recreation or counter wrap cannot replay an
  * old capability-audit identity into the new latch. */
@@ -1444,10 +1471,13 @@ static int queue_meta_ensure_open_locked(void) {
 
 static void queue_meta_mark_clean_before_close_locked(void) {
   QueueMetaRow row;
-  if (!s_db || queue_meta_read_locked(&row) != 0 || queue_meta_is_latched(&row) ||
+  int bound_pending;
+  if (!s_db || queue_meta_read_locked(&row) != 0 ||
       strcmp(row.session_state, EDR_QUEUE_META_SESSION_CLEAN) == 0) {
     return;
   }
+  bound_pending = queue_meta_bound_batch_pending_locked(&row);
+  if (queue_meta_is_latched(&row) && bound_pending != 1) return;
   snprintf(row.session_state, sizeof(row.session_state), "%s", EDR_QUEUE_META_SESSION_CLEAN);
   if (queue_p0_latch_begin_durable_locked() != 0) return;
   if (queue_meta_write_locked(&row) != 0 || queue_p0_latch_end_durable_locked(1) != 0) {
@@ -2285,6 +2315,7 @@ EdrError edr_storage_queue_p0_source_only_latch_prepare(
     EdrStorageQueueP0SourceOnlyLatch *out) {
   QueueMetaRow row;
   int changed = 0;
+  int bound_pending = 0;
   if (!out) return EDR_ERR_INVALID_ARG;
   memset(out, 0, sizeof(*out));
   queue_state_lock();
@@ -2298,14 +2329,29 @@ EdrError edr_storage_queue_p0_source_only_latch_prepare(
       return EDR_ERR_SQLITE_WRITE;
     }
     changed = 1;
-  } else {
-    /* A fresh assertion while a prior one still awaits ACK cannot safely
-     * borrow that ACK. Persist recovery-required before its source insert. */
-    if (queue_meta_convert_to_recovery_locked(&row, "concurrent_source_only_assertion") != 0) {
+  } else if (strcmp(row.latch_state, EDR_QUEUE_META_STATE_BOUND) == 0 &&
+             (bound_pending = queue_meta_bound_batch_pending_locked(&row)) == 1) {
+    /* The prior assertion already has an immutable severity-2 queue owner.
+     * Rotate the single crash-gap latch to the next assertion instead of
+     * declaring the durable prior row lost.  A later ACK for the older row
+     * cannot clear the new tuple because ACK clearing is batch-id bound. */
+    queue_meta_clear_latch_locked(&row);
+    if (queue_meta_begin_new_latch_locked(&row, 0, "") != 0) {
       queue_state_unlock();
       return EDR_ERR_SQLITE_WRITE;
     }
     changed = 1;
+  } else if (bound_pending >= 0) {
+    /* Prepared/recovery metadata has no exact durable queue owner. */
+    if (queue_meta_convert_to_recovery_locked(&row,
+                                              "source_only_assertion_unresolved") != 0) {
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+    changed = 1;
+  } else {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
   }
   if (changed) {
     if (queue_p0_latch_begin_durable_locked() != 0 || queue_meta_write_locked(&row) != 0 ||

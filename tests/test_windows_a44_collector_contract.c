@@ -152,8 +152,10 @@ int main(void) {
                          "4688 must append identity fields before image and command fields");
   ok &= require_contains(collector, "security_4688_identity_capacity_omitted_fields",
                          "4688 health must distinguish capacity identity omissions");
-  ok &= require_contains(collector, "edr_security_identity_value_present(user_sid)",
-                         "4688 identity presence must reject blank and dash placeholders");
+  ok &= require_contains(collector, "edr_security_target_sid_present(user_sid)",
+                         "4688 target SID presence must reject anonymous placeholders");
+  ok &= require_contains(collector, "edr_security_target_logon_present(logon_id)",
+                         "4688 target logon presence must reject zero placeholders");
   ok &= require_contains(preprocess, "edr_process_create_is_lifecycle_authoritative(br)",
                          "all Security 4688 observations must not overwrite process-tree generation");
 

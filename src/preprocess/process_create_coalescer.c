@@ -16,10 +16,10 @@ static void coalescer_unlock(void) { (void)pthread_mutex_unlock(&s_coalescer_loc
 #endif
 
 #define EDR_PROCESS_COALESCE_SLOTS 128u
-#define EDR_PROCESS_COALESCE_DEADLINE_NS (300ULL * 1000000ULL)
+#define EDR_PROCESS_COALESCE_DEADLINE_NS (3000ULL * 1000000ULL)
 
-/* A kernel record has a raw ProcessStartKey; a 4688 record deliberately does
- * not. Keep a pair pending through the entire 300ms window so a same-PID,
+/* A kernel record has a target ProcessStartKey; a 4688 record deliberately
+ * does not. Keep a pair pending through the entire three-second window so a same-PID,
  * same-path reuse with a different raw key makes the association ambiguous
  * before any token lookup or action can use the 4688 identity. */
 typedef struct {
@@ -106,7 +106,8 @@ static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *secur
                                             sizeof(kernel->creator_logon_id));
   /* Creator identity is provenance only. Only Target Subject may become the
    * created process identity. */
-  if (strcmp(security->identity_quality, "target_4688") == 0) {
+  if (strcmp(security->identity_quality, "target_4688") == 0 &&
+      strcmp(kernel->identity_quality, "token_sid") != 0) {
     if (!kernel->username[0]) memcpy(kernel->username, security->username,
                                      sizeof(kernel->username));
     if (!kernel->domain[0]) memcpy(kernel->domain, security->domain, sizeof(kernel->domain));

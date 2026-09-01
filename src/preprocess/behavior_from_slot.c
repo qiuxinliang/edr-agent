@@ -61,6 +61,15 @@ static int identity_value_present(const char *s) {
   return *s != '\0';
 }
 
+static int identity_sid_present(const char *s) {
+  return identity_value_present(s) && strcmp(s, "S-1-0-0") != 0;
+}
+
+static int identity_logon_present(const char *s) {
+  return identity_value_present(s) && strcmp(s, "0") != 0 &&
+         strcmp(s, "0x0") != 0 && strcmp(s, "0X0") != 0;
+}
+
 static void edr_gen_event_id(char *out, size_t cap, int64_t time_ns) {
   uint64_t s = atomic_fetch_add_explicit(&g_event_seq, 1u, memory_order_relaxed) + 1u;
   uint64_t nonce = atomic_load_explicit(&g_event_boot_nonce, memory_order_acquire);
@@ -1861,8 +1870,12 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       (void)copy_record_source_text(r, r->creator_logon_id, sizeof(r->creator_logon_id),
                                     ef.creator_logon_id, "creator_logon_id");
     }
-    int target_present = identity_value_present(ef.user) || identity_value_present(ef.domain) ||
-                         identity_value_present(ef.user_sid) || identity_value_present(ef.logon_id);
+    /* TargetUserSid=S-1-0-0 and TargetLogonId=0x0 are Security 4688
+     * placeholders, not a created-process identity.  Only the complete
+     * SID/logon tuple may request target-4688 validation; otherwise the live
+     * token query remains the authority. */
+    int target_present = identity_sid_present(ef.user_sid) &&
+                         identity_logon_present(ef.logon_id);
     if (identity_value_present(ef.user)) {
       if (ef.domain[0]) {
         (void)copy_record_username(r, ef.domain, ef.user);
@@ -1873,10 +1886,10 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (identity_value_present(ef.domain)) {
       (void)copy_record_source_text(r, r->domain, sizeof(r->domain), ef.domain, "domain");
     }
-    if (identity_value_present(ef.user_sid)) {
+    if (identity_sid_present(ef.user_sid)) {
       (void)copy_record_source_text(r, r->user_sid, sizeof(r->user_sid), ef.user_sid, "user_sid");
     }
-    if (identity_value_present(ef.logon_id)) {
+    if (identity_logon_present(ef.logon_id)) {
       (void)copy_record_source_text(r, r->logon_id, sizeof(r->logon_id), ef.logon_id, "logon_id");
     }
     if (target_present) {

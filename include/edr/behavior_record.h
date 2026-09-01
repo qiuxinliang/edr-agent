@@ -133,10 +133,12 @@ typedef struct {
   char child_pids[256];
   char network_isolation_level[32];
   char process_creation_time[64];
-  /* ETW extended ProcessStartKey: unique per boot and never callback time. */
+  /* Target process generation key. For Kernel-Process Start this comes from
+   * the event payload; for actor events it may come from the ETW extended
+   * header. The two sources are never interchangeable. */
   uint64_t process_start_key;
-  /* Raw Windows FILETIME is populated only after the ProcessStartKey is
-   * matched to a live ProcessTelemetryIdInformation query. */
+  /* Raw Windows FILETIME from the target process payload or a validated live
+   * ProcessTelemetryIdInformation query. */
   uint64_t process_creation_filetime_100ns;
   char process_generation_source[64];
   char parent_creation_time[64];

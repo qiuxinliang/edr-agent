@@ -594,15 +594,35 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_all(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
     {
-      static const PCWSTR process_key_names[] = {L"UniqueProcessKey", L"ProcessKey"};
+      static const PCWSTR process_key_names[] = {
+          L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
+      static const PCWSTR create_time_names[] = {
+          L"CreateTime", L"ProcessCreateTime", L"CreationTime"};
       uint64_t process_key = 0u;
+      uint64_t create_time = 0u;
       for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {
         if (edr_prop_u64(rec, process_key_names[i], &process_key) == ERROR_SUCCESS) {
-          append_utf8((char *)out, out_cap, &off, "kernel_unique_process_key=%llu\n",
+          /* This is the target process key from the Kernel-Process payload.
+           * EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY identifies the process
+           * that logged the event and must never replace this value. */
+          append_utf8((char *)out, out_cap, &off, "process_start_key=%llu\n",
                       (unsigned long long)process_key);
           break;
         }
       }
+      for (size_t i = 0u; i < sizeof(create_time_names) / sizeof(create_time_names[0]); ++i) {
+        if (edr_prop_u64(rec, create_time_names[i], &create_time) == ERROR_SUCCESS) {
+          append_utf8((char *)out, out_cap, &off,
+                      "process_creation_filetime_100ns=%llu\n",
+                      (unsigned long long)create_time);
+          break;
+        }
+      }
+      append_utf8((char *)out, out_cap, &off, "process_generation_source=%s\n",
+                  process_key != 0u && create_time != 0u
+                      ? "kernel_process_payload"
+                      : (process_key != 0u ? "kernel_process_payload_key_only"
+                                           : "kernel_process_payload_unavailable"));
     }
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, file_try, sizeof(file_try) / sizeof(file_try[0]), line,
