@@ -1,4 +1,4 @@
-# 将当前目标架构 vcpkg triplet 的 bin\*.dll 复制到 build\Release\。
+﻿# 将当前目标架构 vcpkg triplet 的 bin\*.dll 复制到 build\Release\。
 # 在 edr-agent 根目录、Release 已生成 FDSensor.exe 后执行。
 # 由 CI 在构建后调用；优先使用 VCPKG_INSTALLED_ROOT，兼容旧的 VCPKG_INSTALLED_X64。
 $ErrorActionPreference = "Stop"
