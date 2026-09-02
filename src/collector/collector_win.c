@@ -3020,6 +3020,22 @@ static int edr_collector_append_file_read_binding(EdrEventSlot *slot, uint64_t f
                                       "etw_filekey_namecreate") == EDR_SLOT_KV_APPENDED;
 }
 
+/* FileRead authority comes from the typed FileKey/NameCreate binding below,
+ * not from arbitrary provider properties.  A compact base payload reserves
+ * enough room for the canonical path and generation tuple under ETW load. */
+static size_t edr_collector_build_file_read_slot_payload(const EVENT_RECORD *record,
+                                                         const char *tag,
+                                                         uint8_t *out,
+                                                         size_t cap) {
+  if (!record || !tag || !out || cap == 0u) return 0u;
+  int n = snprintf((char *)out, cap, "ETW1\nprov=%s\npid=%lu\neid=%u\nop=%u\n",
+                   tag, (unsigned long)record->EventHeader.ProcessId,
+                   (unsigned)record->EventHeader.EventDescriptor.Id,
+                   (unsigned)record->EventHeader.EventDescriptor.Opcode);
+  if (n < 0 || (size_t)n >= cap) return 0u;
+  return (size_t)n + 1u;
+}
+
 static int edr_collector_starts_with_ci(const char *s, const char *prefix) {
   if (!s || !prefix) return 0;
   while (*prefix) {
@@ -3452,6 +3468,17 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     }
     return keep;
   }
+  /* An exact rule match may still be unavailable until command/path
+   * enrichment completes.  Reserve the bounded P0 lane for manifest-backed
+   * process interest so short-lived candidates cannot be displaced by
+   * ordinary telemetry before preprocess performs generation validation. */
+  if (slot->type == EDR_EVENT_PROCESS_CREATE &&
+      edr_collector_valid_process_create_record(&br) &&
+      edr_collector_process_is_suspicious(&br)) {
+    slot->priority = 0u;
+    slot->p0_critical = 1u;
+    return 1;
+  }
   if (br.priority == 0u) {
     slot->priority = 0u;
     return 1;
@@ -3466,12 +3493,6 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     return 1;
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
-    /* Keep a plausible Security 4688 enrichment long enough for the
-     * preprocess worker to join it with an out-of-order kernel create. */
-    if (br.is_security_4688 && edr_collector_process_is_suspicious(&br)) {
-      slot->priority = 0u;
-      return 1;
-    }
     if (!edr_collector_valid_process_create_record(&br)) {
       s_health.invalid_process_dropped++;
       if (br.pid != 0u && !br.process_name[0] && !br.exe_path[0] && !br.cmdline[0]) {
@@ -3623,8 +3644,11 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   slot.type = ty;
   slot.consumed = false;
 
-  size_t plen =
-      edr_tdh_build_slot_payload(event_record, tag, slot.data, EDR_MAX_EVENT_PAYLOAD);
+  size_t plen = ty == EDR_EVENT_FILE_READ
+                    ? edr_collector_build_file_read_slot_payload(
+                          event_record, tag, slot.data, EDR_MAX_EVENT_PAYLOAD)
+                    : edr_tdh_build_slot_payload(event_record, tag, slot.data,
+                                                 EDR_MAX_EVENT_PAYLOAD);
   if (plen == 0) {
     edr_etw_observability_on_slot_payload_empty();
     if (ty == EDR_EVENT_FILE_READ) {

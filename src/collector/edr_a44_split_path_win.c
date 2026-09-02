@@ -73,7 +73,13 @@ int edr_a44_item_pack(PEVENT_RECORD r, uint64_t ts_ns, EdrEventType ty, const ch
   if (reason_sync) {
     *reason_sync = 0;
   }
-  if (r->ExtendedDataCount != 0) {
+  /* Kernel-Process target generation is carried in the TDH UserData payload;
+   * its EVENT_HEADER extended StartKey describes the logging process and is
+   * deliberately not consumed by process-create decoding.  Dropping only
+   * those unused descriptors lets short-lived process starts leave the ETW
+   * callback promptly.  Actor events such as FileRead still require their
+   * extended StartKey and therefore remain on the synchronous path. */
+  if (r->ExtendedDataCount != 0 && ty != EDR_EVENT_PROCESS_CREATE) {
     if (reason_sync) {
       *reason_sync = 1;
     }
@@ -93,7 +99,7 @@ int edr_a44_item_pack(PEVENT_RECORD r, uint64_t ts_ns, EdrEventType ty, const ch
   }
   memcpy(&out->evh, &r->EventHeader, sizeof(out->evh));
   out->udlen = r->UserDataLength;
-  out->edcount = 0;
+  out->edcount = 0; /* PROCESS_CREATE extended descriptors are intentionally unused. */
   out->buffer_context = r->BufferContext;
   if (r->UserData && r->UserDataLength > 0) {
     memcpy(out->ud, r->UserData, (size_t)r->UserDataLength);

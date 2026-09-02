@@ -576,9 +576,15 @@ static int should_update_process_cache(const EdrBehaviorRecord *r) {
   if (!r || r->pid == 0u) {
     return 0;
   }
-  return r->process_name[0] || r->exe_path[0] || r->cmdline[0] || r->ppid != 0u ||
-         r->parent_name[0] || r->parent_path[0] || r->parent_cmdline[0] ||
-         r->username[0] || r->user_sid[0] || r->creator_username[0] || r->creator_sid[0] || r->identity_quality[0] || r->domain[0] || r->integrity_level[0] ||
+  if (r->type == EDR_EVENT_PROCESS_CREATE) {
+    return 1;
+  }
+  /* PPID and parent fields describe another process and cannot establish an
+   * actor cache entry on their own.  Require metadata about this PID. */
+  return r->process_name[0] || r->exe_path[0] || r->cmdline[0] ||
+         r->username[0] || r->user_sid[0] || r->creator_username[0] ||
+         r->creator_sid[0] || r->identity_quality[0] || r->domain[0] ||
+         r->integrity_level[0] ||
          r->token_elevation != 0u || r->exe_hash[0] || r->current_directory[0] ||
          r->process_creation_time[0];
 }
@@ -1743,7 +1749,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   EvidenceProcessGeneration parent_generation;
   char start_key[32], creation[32], parent_start_key[32], parent_creation[32];
   int parent_known;
-  if (!s_db || !r || r->pid == 0u || !record_process_generation(r, &generation)) {
+  if (!s_db || !should_update_process_cache(r) ||
+      !record_process_generation(r, &generation)) {
     /* Unknown PID-only metadata is never durable authority. It may remain in
      * the bounded in-memory display cache, but must not overwrite a known
      * restarted lifetime in SQLite. */

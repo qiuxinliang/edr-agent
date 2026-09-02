@@ -769,6 +769,8 @@ static int conditional_suppression_match(const EdrBehaviorRecord *r, char *reaso
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
   int64_t last_ns;
   uint32_t events;
   uint8_t remote;
@@ -827,14 +829,22 @@ static int64_t record_time_or_seq(const EdrBehaviorRecord *r) {
   return (int64_t)(++g_process_context_seq);
 }
 
-static const EdrProcessContextSlot *process_context_lookup_pid(uint32_t pid, int64_t now_ns) {
-  if (pid == 0u) {
+static int process_context_record_generation_known(const EdrBehaviorRecord *r) {
+  return r && r->pid != 0u && r->process_start_key != 0u &&
+         r->process_creation_filetime_100ns != 0u;
+}
+
+static const EdrProcessContextSlot *process_context_lookup(const EdrBehaviorRecord *r,
+                                                           int64_t now_ns) {
+  if (!process_context_record_generation_known(r)) {
     return NULL;
   }
   int64_t win = process_context_window_ns();
   for (size_t i = 0; i < EDR_PROCESS_CONTEXT_SLOTS; i++) {
     const EdrProcessContextSlot *s = &g_process_context[i];
-    if (s->pid != pid || s->events == 0u) {
+    if (s->pid != r->pid || s->process_start_key != r->process_start_key ||
+        s->process_creation_filetime_100ns != r->process_creation_filetime_100ns ||
+        s->events == 0u) {
       continue;
     }
     if (s->last_ns <= 0 || now_ns <= 0 || now_ns - s->last_ns <= win) {
@@ -842,10 +852,6 @@ static const EdrProcessContextSlot *process_context_lookup_pid(uint32_t pid, int
     }
   }
   return NULL;
-}
-
-static const EdrProcessContextSlot *process_context_lookup(const EdrBehaviorRecord *r, int64_t now_ns) {
-  return r ? process_context_lookup_pid(r->pid, now_ns) : NULL;
 }
 
 static uint32_t ransomware_tree_root_pid(const EdrBehaviorRecord *r, const EdrProcessContextSlot *parent_ctx) {
@@ -868,14 +874,15 @@ static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, i
                                    int tls_anomaly, int ransom_behavior, int ransom_recovery, int ransom_note,
                                    int security_product_kill, int webshell_semantic, int credential,
                                    int injection, int persistence) {
-  if (!r || r->pid == 0u) {
+  if (!process_context_record_generation_known(r)) {
     return;
   }
   EdrProcessContextSlot *empty = NULL;
   EdrProcessContextSlot *oldest = &g_process_context[0];
   for (size_t i = 0; i < EDR_PROCESS_CONTEXT_SLOTS; i++) {
     EdrProcessContextSlot *s = &g_process_context[i];
-    if (s->pid == r->pid) {
+    if (s->pid == r->pid && s->process_start_key == r->process_start_key &&
+        s->process_creation_filetime_100ns == r->process_creation_filetime_100ns) {
       if (r->ppid != 0u) {
         s->ppid = r->ppid;
       }
@@ -907,6 +914,8 @@ static void process_context_update(const EdrBehaviorRecord *r, int64_t now_ns, i
   memset(s, 0, sizeof(*s));
   s->pid = r->pid;
   s->ppid = r->ppid;
+  s->process_start_key = r->process_start_key;
+  s->process_creation_filetime_100ns = r->process_creation_filetime_100ns;
   s->last_ns = now_ns;
   s->events = 1u;
   s->remote = remote ? 1u : 0u;
@@ -1092,7 +1101,8 @@ static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecisi
   /* P0(priority==0) 强制至少告警；已 suppress 时不高于 emit_context。 */
   if (!out->drop && r && r->priority == 0u) {
     action = "emit_alert";
-  } else if (out->suppress && strcmp(action, "emit_alert") == 0) {
+  }
+  if (out->suppress && strcmp(action, "emit_alert") == 0) {
     action = "emit_context";
   }
   /* PMFE 跟进结果必须回传以关闭/更新源告警；非可疑结果只发上下文，不产生新告警。 */
@@ -1423,7 +1433,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   int silverfox = has_silverfox_indicator(r);
   int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 0;
   const EdrProcessContextSlot *ctx = process_context_lookup(r, now_ns);
-  const EdrProcessContextSlot *parent_ctx = r->ppid ? process_context_lookup_pid(r->ppid, now_ns) : NULL;
+  /* BehaviorRecord does not carry the parent's immutable generation tuple.
+   * A PID-only parent lookup can cross PID reuse, so parent correlation must
+   * use only parent evidence already bound to this record by the process tree. */
+  const EdrProcessContextSlot *parent_ctx = NULL;
   uint32_t tree_root_pid = ransomware_tree_root_pid(r, parent_ctx);
   int chain_candidate_score = ransom_chain_candidate_threshold();
   int chain_p0_score = ransom_chain_p0_threshold();
@@ -1935,7 +1948,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   int fp_feedback = false_positive_feedback_match(r);
   int64_t now_ns = record_time_or_seq(r);
   const EdrProcessContextSlot *ctx = process_context_lookup(r, now_ns);
-  const EdrProcessContextSlot *parent_ctx = r->ppid ? process_context_lookup_pid(r->ppid, now_ns) : NULL;
+  /* Never infer a parent lifetime from PPID alone. */
+  const EdrProcessContextSlot *parent_ctx = NULL;
   int chain_candidate_score = ransom_chain_candidate_threshold();
   int chain_p0_score = ransom_chain_p0_threshold();
   EdrRansomChainSignal ransom_chain =

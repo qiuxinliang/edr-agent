@@ -430,6 +430,21 @@ int main(void) {
                "non-P0 process avoids coalescer/evidence hold");
   }
 
+  /* A missing Kernel-Process callback must not erase the only observation.
+   * 4688 stays explicitly non-authoritative and cannot independently trigger
+   * a P0 action, but remains available for collection-gap diagnosis. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord security = rec(17u, 1, 0u, "C:\\security-only.exe", 8100000000LL);
+    ok &= need(edr_process_coalescer_submit(&security, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
+                   out.is_security_4688 && out.process_start_key == 0u &&
+                   strcmp(out.source_completeness, "ENRICHMENT_ONLY") == 0 &&
+                   strcmp(out.user_sid, "S-1-5-21-target") == 0,
+               "Security-only process evidence remains visible but non-authoritative");
+  }
+
   edr_process_coalescer_reset();
   for (uint32_t i = 0u; i < 128u; ++i) {
     EdrBehaviorRecord fill = rec(1000u + i, 0, 0x1000u + i, "C:\\bounded.exe",

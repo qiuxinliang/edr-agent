@@ -100,7 +100,8 @@ EdrError edr_a44_split_path_start(EdrEventBus *bus);
 int edr_a44_split_path_stop(void);
 
 /**
- * 填 `out`。reason_sync：0=可入队 1=ExtendedData 非 0 须同步 2=UserData 超长须同步
+ * 填 `out`。reason_sync：0=可入队 1=需要的 ExtendedData 非 0 须同步
+ * 2=UserData 超长须同步。PROCESS_CREATE 不消费扩展项，其目标代际来自 UserData。
  * 成功返回 0；否则不填可入队字段。
  */
 int edr_a44_item_pack(PEVENT_RECORD r, uint64_t ts_ns, EdrEventType ty, const char *tag, EdrA44QueueItem *out,

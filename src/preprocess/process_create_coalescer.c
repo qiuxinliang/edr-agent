@@ -392,7 +392,7 @@ int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_rea
     }
     if (monotonic_ns < slot->deadline_ns) continue;
     if (!slot->have_kernel) {
-      memset(slot, 0, sizeof(*slot)); /* Security source-only observation. */
+      /* Lifecycle-authoritative kernel records always drain first. */
       continue;
     }
     *out_ready = slot->kernel;
@@ -417,6 +417,24 @@ int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_rea
     slot->ambiguous = 0u;
     slot->tombstone = 1u;
     slot->deadline_ns = monotonic_ns + EDR_PROCESS_COALESCE_DEADLINE_NS;
+    s_metrics.timed_out++;
+    coalescer_unlock();
+    return 1;
+  }
+  for (uint32_t i = 0u; i < EDR_PROCESS_COALESCE_SLOTS; ++i) {
+    EdrProcessCoalesceSlot *slot = &s_slots[i];
+    if (!slot->occupied || slot->tombstone || slot->have_kernel ||
+        monotonic_ns < slot->deadline_ns) {
+      continue;
+    }
+    /* Security 4688 is not lifecycle authority, but silently deleting the
+     * only observation makes short-lived processes disappear completely.
+     * Preserve it as enrichment-only evidence; direct P0 evaluation still
+     * rejects this source until a raw generation is available. */
+    *out_ready = slot->security;
+    snprintf(out_ready->source_completeness, sizeof(out_ready->source_completeness), "%s",
+             "ENRICHMENT_ONLY");
+    memset(slot, 0, sizeof(*slot));
     s_metrics.timed_out++;
     coalescer_unlock();
     return 1;

@@ -1767,6 +1767,26 @@ static void test_unknown_to_bound_generation_clears_provisional_metadata(void) {
   edr_local_evidence_cache_close();
 }
 
+static void test_parent_only_nonprocess_record_does_not_create_process_slot(void) {
+  EdrEvidenceCacheStatus before;
+  EdrEvidenceCacheStatus after;
+  EdrBehaviorRecord r;
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  init_record(&r, EDR_EVENT_FILE_DELETE);
+  r.pid = 96203u;
+  r.ppid = 4u;
+  r.event_time_ns = 1779340000000000000LL;
+  r.process_start_key = 0x96203u;
+  r.process_creation_filetime_100ns = 133801632000096203ULL;
+  snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-parent-only");
+  snprintf(r.parent_name, sizeof(r.parent_name), "System");
+  edr_local_evidence_cache_get_status(&before);
+  edr_local_evidence_cache_observe_process(&r);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.process_slots_used == before.process_slots_used);
+  edr_local_evidence_cache_close();
+}
+
 static void test_file_sha256_query_uses_file_evidence_cache(void) {
 #if defined(EDR_HAVE_SQLITE)
   const char *db = "rtq_file_hash_cache_test.sqlite";
@@ -1873,6 +1893,7 @@ int main(void) {
   test_kernel_generation_a_to_b_resets_cached_identity_once();
   test_delayed_generation_mismatch_withholds_all_process_enrichment();
   test_unknown_to_bound_generation_clears_provisional_metadata();
+  test_parent_only_nonprocess_record_does_not_create_process_slot();
   test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");
   return 0;

@@ -129,6 +129,12 @@ int main(void) {
                          "A4.4 stop must retain resources when a decoder does not join");
   ok &= require_after(a44, "wait_status != WAIT_OBJECT_0", "free(s_a44_threads);",
                        "A4.4 frees its worker array only after every join succeeds");
+  ok &= require_contains(a44,
+                         "r->ExtendedDataCount != 0 && ty != EDR_EVENT_PROCESS_CREATE",
+                         "ProcessCreate must not synchronously decode unused header extensions");
+  ok &= require_contains(a44,
+                         "PROCESS_CREATE extended descriptors are intentionally unused",
+                         "A4.4 must document why ProcessCreate may omit header extensions");
   ok &= require_contains(tdh, "void edr_tdh_win_get_property_stats_ext(",
                          "ETW observability extended TDH statistics must be implemented");
   /* Source-contract only: macOS cannot compile the Windows EventLog callback. */
@@ -308,12 +314,24 @@ int main(void) {
                        "FileRead IR path projection must retain candidates before Windows noise policy");
   ok &= require_contains(collector, "slot.p0_critical = 1u;",
                          "retained FileRead P0 candidates must use the event-bus critical lane");
+  ok &= require_contains(collector,
+                         "slot->type == EDR_EVENT_PROCESS_CREATE &&\n"
+                         "      edr_collector_valid_process_create_record(&br) &&\n"
+                         "      edr_collector_process_is_suspicious(&br)",
+                         "short-lived P0-interest processes must use the event-bus critical lane");
   ok &= require_contains(event_bus, "p0_reserved",
                          "event bus must reserve capacity for P0-critical records");
   ok &= require_contains(event_bus, "ordinary_reserve_rejected",
                          "ordinary flood must be observable when it cannot consume the P0 reserve");
   ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE",
                          "empty FileRead TDH payload must be source-only, not silently dropped");
+  ok &= require_contains(collector, "edr_collector_build_file_read_slot_payload",
+                         "FileRead must reserve payload capacity for authoritative binding fields");
+  ok &= require_contains(collector, "size_t plen = ty == EDR_EVENT_FILE_READ",
+                         "FileRead must use its compact payload path before checked field appends");
+  ok &= require_before(collector, "edr_collector_build_file_read_slot_payload(",
+                       "edr_collector_append_file_read_binding(&slot",
+                       "FileRead base payload must be built before canonical binding append");
   ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE",
                          "zero FileRead event time must be source-only, not callback-time substituted");
   ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE",
