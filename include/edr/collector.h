@@ -121,6 +121,7 @@ typedef struct {
      * source-only gate slot until the existing SQLite queue accepts it. */
     int file_read_p0_capability_healthy;
     uint64_t file_read_metadata_gate_staged;
+    uint64_t file_read_metadata_gate_coalesced;
     uint64_t file_read_metadata_gate_enqueue_attempts;
     uint64_t file_read_metadata_gate_queue_rejected;
     uint64_t file_read_metadata_gate_durable_successes;

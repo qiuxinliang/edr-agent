@@ -13,9 +13,17 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+static void test_setenv(const char *name, const char *value) {
+  assert(_putenv_s(name, value) == 0);
+}
+static void test_unsetenv(const char *name) { assert(_putenv_s(name, "") == 0); }
 #else
 #include <pthread.h>
 #include <unistd.h>
+static void test_setenv(const char *name, const char *value) {
+  assert(setenv(name, value, 1) == 0);
+}
+static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #endif
 
 #if defined(EDR_HAVE_SQLITE)
@@ -574,6 +582,67 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   (void)remove(db);
   (void)remove("local_evidence_cache_commit_failure.sqlite-wal");
   (void)remove("local_evidence_cache_commit_failure.sqlite-shm");
+}
+
+static void test_context_write_budget_cannot_starve_later_candidate(void) {
+  const char *db = "local_evidence_cache_write_budget.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  EdrBehaviorRecord context;
+  EdrEvidenceCacheStatus status;
+  int64_t base;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_write_budget.sqlite-wal");
+  (void)remove("local_evidence_cache_write_budget.sqlite-shm");
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "8");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74101u;
+  candidate.event_time_ns = base;
+  candidate.process_start_key = UINT64_C(0x74101);
+  candidate.process_creation_filetime_100ns = UINT64_C(133700000000074101);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-budget-reserve");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "budget-candidate-a");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.0.0.74");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  context = candidate;
+  context.priority = 1u;
+  context.net_dport = 80u;
+  snprintf(context.process_name, sizeof(context.process_name), "telemetry.exe");
+  for (unsigned i = 0u; i < 6u; ++i) {
+    context.event_time_ns = base + (int64_t)(i + 1u) * 1000000LL;
+    snprintf(context.event_id, sizeof(context.event_id), "budget-context-%u", i);
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+
+  candidate.pid = 74102u;
+  candidate.event_time_ns = base + 10000000LL;
+  candidate.process_start_key = UINT64_C(0x74102);
+  candidate.process_creation_filetime_100ns = UINT64_C(133700000000074102);
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "budget-candidate-b");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.write_budget_limit == 8u);
+  assert(status.write_budget_used == 8u);
+  assert(status.write_budget_context_dropped >= 2u);
+  assert(status.write_budget_candidate_dropped == 0u);
+  assert(status.candidate_admitted == 2u);
+  assert(status.candidate_rejected == 0u);
+
+  edr_local_evidence_cache_close();
+  test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_write_budget.sqlite-wal");
+  (void)remove("local_evidence_cache_write_budget.sqlite-shm");
 }
 
 /* A rule id is classification metadata, not sufficient candidate identity.
@@ -1873,6 +1942,7 @@ int main(void) {
   test_identity_status_counter_basics();
 #if defined(EDR_HAVE_SQLITE)
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+  test_context_write_budget_cannot_starve_later_candidate();
   test_candidate_reuse_requires_generation_and_full_semantics();
   test_process_cache_generation_migration_and_restart_safe_rtq();
   test_snapshot_generation_persists_candidate_manifests_and_rtq();

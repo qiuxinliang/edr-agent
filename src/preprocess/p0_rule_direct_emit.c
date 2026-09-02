@@ -110,6 +110,10 @@ static int s_p0_source_only_persistent_latch_active;
 static int s_p0_source_only_recovery_verified;
 static int s_p0_source_only_loss_detected;
 static int s_p0_source_only_loss_audit_durable;
+/* A restart cannot reconstruct which event families an existing durable
+ * latch covered, so startup begins globally fused. During one process
+ * lifetime, known source-only faults only pause their owning family. */
+static uint32_t s_p0_source_only_unhealthy_families = UINT32_MAX;
 static uint64_t s_p0_source_only_latch_counter;
 static uint64_t s_p0_source_only_latch_epoch;
 static char s_p0_source_only_queue_nonce[33];
@@ -146,6 +150,7 @@ void edr_p0_rule_test_reset_dedup(void) {
   s_p0_source_only_recovery_verified = 1;
   s_p0_source_only_loss_detected = 0;
   s_p0_source_only_loss_audit_durable = 0;
+  s_p0_source_only_unhealthy_families = 0u;
   s_p0_source_only_latch_counter = 0u;
   s_p0_source_only_latch_epoch = 0u;
   s_p0_source_only_queue_nonce[0] = '\0';
@@ -171,6 +176,7 @@ void edr_p0_rule_test_force_source_only_startup(void) {
   s_p0_source_only_recovery_verified = 0;
   s_p0_source_only_loss_detected = 0;
   s_p0_source_only_loss_audit_durable = 0;
+  s_p0_source_only_unhealthy_families = UINT32_MAX;
   s_p0_source_only_latch_counter = 0u;
   s_p0_source_only_latch_epoch = 0u;
   s_p0_source_only_queue_nonce[0] = '\0';
@@ -217,6 +223,7 @@ void edr_p0_rule_get_emit_metrics(EdrP0EmitMetrics *out) {
   out->source_only_retry_committed = s_p0_source_only_retry_committed;
   out->source_only_retry_capacity_exhausted = s_p0_source_only_retry_capacity_exhausted;
   out->source_only_terminal_unhealthy = s_p0_source_only_terminal_unhealthy;
+  out->source_only_unhealthy_families = s_p0_source_only_unhealthy_families;
   out->source_only_loss_detected = s_p0_source_only_loss_detected;
   out->source_only_latch_counter = s_p0_source_only_latch_counter;
   out->source_only_latch_epoch = s_p0_source_only_latch_epoch;
@@ -1191,6 +1198,47 @@ static int p0_source_only_retry_has_pending_locked(void) {
   return 0;
 }
 
+enum {
+  P0_SOURCE_ONLY_FAMILY_PROCESS = 1u << 0,
+  P0_SOURCE_ONLY_FAMILY_FILE = 1u << 1,
+  P0_SOURCE_ONLY_FAMILY_NETWORK = 1u << 2,
+  P0_SOURCE_ONLY_FAMILY_REGISTRY = 1u << 3,
+  P0_SOURCE_ONLY_FAMILY_ALL = UINT32_MAX
+};
+
+static uint32_t p0_source_only_family_for_event(EdrEventType type) {
+  switch (type) {
+  case EDR_EVENT_PROCESS_CREATE:
+  case EDR_EVENT_PROCESS_TERMINATE:
+  case EDR_EVENT_PROCESS_INJECT:
+  case EDR_EVENT_DLL_LOAD:
+  case EDR_EVENT_THREAD_CREATE_REMOTE:
+  case EDR_EVENT_SCRIPT_POWERSHELL:
+  case EDR_EVENT_SCRIPT_BASH:
+  case EDR_EVENT_SCRIPT_PYTHON:
+  case EDR_EVENT_SCRIPT_WMI:
+    return P0_SOURCE_ONLY_FAMILY_PROCESS;
+  case EDR_EVENT_FILE_READ:
+  case EDR_EVENT_FILE_CREATE:
+  case EDR_EVENT_FILE_WRITE:
+  case EDR_EVENT_FILE_DELETE:
+  case EDR_EVENT_FILE_RENAME:
+  case EDR_EVENT_FILE_PERMISSION_CHANGE:
+    return P0_SOURCE_ONLY_FAMILY_FILE;
+  case EDR_EVENT_NET_CONNECT:
+  case EDR_EVENT_NET_LISTEN:
+  case EDR_EVENT_NET_DNS_QUERY:
+  case EDR_EVENT_NET_TLS_HANDSHAKE:
+    return P0_SOURCE_ONLY_FAMILY_NETWORK;
+  case EDR_EVENT_REG_CREATE_KEY:
+  case EDR_EVENT_REG_SET_VALUE:
+  case EDR_EVENT_REG_DELETE_KEY:
+    return P0_SOURCE_ONLY_FAMILY_REGISTRY;
+  default:
+    return P0_SOURCE_ONLY_FAMILY_ALL;
+  }
+}
+
 static void p0_source_only_nonce_hex(const uint8_t nonce[16], char out[33]) {
   static const char hex[] = "0123456789abcdef";
   size_t i;
@@ -1235,12 +1283,24 @@ static void p0_source_only_mark_unhealthy_locked(const char *reason, int unrecov
   }
 }
 
+static void p0_source_only_mark_unhealthy_for_event_locked(
+    const char *reason, int unrecoverable, EdrEventType type) {
+  uint32_t family = p0_source_only_family_for_event(type);
+  if (s_p0_source_only_unhealthy_families != P0_SOURCE_ONLY_FAMILY_ALL) {
+    s_p0_source_only_unhealthy_families |= family;
+  }
+  p0_source_only_mark_unhealthy_locked(reason, unrecoverable);
+}
+
 /* IR/bootstrap unavailability is not itself a lost source assertion.  Keep
  * the capability fused without manufacturing a persistent latch; a later
  * recovery will use an already-existing latch, if any, as the loss boundary. */
 static void p0_source_only_wait_for_recovery_locked(const char *reason) {
   s_p0_source_only_terminal_unhealthy = 1;
   s_p0_source_only_recovery_verified = 0;
+  /* Queue/IR/latch recovery is shared infrastructure. Unlike a record-bound
+   * failure, its unavailable authority cannot be attributed to one family. */
+  s_p0_source_only_unhealthy_families = P0_SOURCE_ONLY_FAMILY_ALL;
   if (reason && reason[0]) {
     snprintf(s_p0_source_only_terminal_reason,
              sizeof(s_p0_source_only_terminal_reason), "%s", reason);
@@ -1256,6 +1316,7 @@ static void p0_source_only_note_ack_observed_locked(void) {
       !s_p0_source_only_persistent_latch_active &&
       !s_p0_source_only_unrecoverable && !p0_source_only_retry_has_pending_locked()) {
     s_p0_source_only_terminal_unhealthy = 0;
+    s_p0_source_only_unhealthy_families = 0u;
     s_p0_source_only_terminal_reason[0] = '\0';
   }
 }
@@ -1390,7 +1451,8 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
   }
   if (free_index == P0_SOURCE_ONLY_RETRY_SLOTS) {
     s_p0_source_only_retry_capacity_exhausted++;
-    p0_source_only_mark_unhealthy_locked("source_only_retry_capacity_exhausted", 1);
+    p0_source_only_mark_unhealthy_for_event_locked(
+        "source_only_retry_capacity_exhausted", 1, record->type);
     p0_state_unlock();
     p0_source_only_sync_persistent_latch();
     return P0_SOURCE_ONLY_DURABLE_UNHEALTHY;
@@ -1410,7 +1472,8 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
     slot->pending = 1u;
     s_p0_source_only_retry_next = (free_index + 1u) % P0_SOURCE_ONLY_RETRY_SLOTS;
   }
-  p0_source_only_mark_unhealthy_locked("source_only_durable_unavailable", 0);
+  p0_source_only_mark_unhealthy_for_event_locked(
+      "source_only_durable_unavailable", 0, record->type);
   p0_state_unlock();
   return P0_SOURCE_ONLY_DURABLE_PENDING;
 }
@@ -1422,7 +1485,8 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
   if (!p0_source_only_prepare_record(record, &durable, semantic_sha256)) {
     p0_state_lock();
     s_p0_emit_source_only_backpressure_failed++;
-    p0_source_only_mark_unhealthy_locked("source_only_identity_unavailable", 1);
+    p0_source_only_mark_unhealthy_for_event_locked(
+        "source_only_identity_unavailable", 1, record ? record->type : 0);
     p0_state_unlock();
     p0_source_only_sync_persistent_latch();
     return P0_SOURCE_ONLY_DURABLE_UNHEALTHY;
@@ -1448,7 +1512,8 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
        * matching severity-2 row is centrally ACKed and queue_meta clears it
        * in that same FULL transaction. */
       p0_source_only_set_latch_locked(&latch);
-      p0_source_only_mark_unhealthy_locked("source_only_delivery_pending_ack", 0);
+      p0_source_only_mark_unhealthy_for_event_locked(
+          "source_only_delivery_pending_ack", 0, durable.type);
       p0_source_only_remember_committed_locked(durable.event_id, semantic_sha256);
       p0_source_only_note_delivery_loss_durable_locked(&durable);
       s_p0_emit_source_only_backpressure_emitted++;
@@ -1457,14 +1522,16 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
     }
     p0_state_lock();
     s_p0_emit_source_only_backpressure_failed++;
-    p0_source_only_mark_unhealthy_locked("source_only_durable_unavailable", 0);
+    p0_source_only_mark_unhealthy_for_event_locked(
+        "source_only_durable_unavailable", 0, durable.type);
     p0_state_unlock();
     return p0_source_only_store_retry(&durable, semantic_sha256, &latch, 1, recovery_audit);
   }
 
   p0_state_lock();
   s_p0_emit_source_only_backpressure_failed++;
-  p0_source_only_mark_unhealthy_locked("source_only_latch_prepare_failed", 0);
+  p0_source_only_mark_unhealthy_for_event_locked(
+      "source_only_latch_prepare_failed", 0, durable.type);
   p0_state_unlock();
   return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0, recovery_audit);
 }
@@ -1512,7 +1579,8 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
       if (s_p0_source_only_retry[selected].pending &&
           s_p0_source_only_retry[selected].generation == generation) {
         s_p0_emit_source_only_backpressure_failed++;
-        p0_source_only_mark_unhealthy_locked("source_only_latch_prepare_failed", 0);
+        p0_source_only_mark_unhealthy_for_event_locked(
+            "source_only_latch_prepare_failed", 0, record.type);
       }
       p0_state_unlock();
       return 0;
@@ -1539,7 +1607,8 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
       if (s_p0_source_only_retry[selected].pending &&
           s_p0_source_only_retry[selected].generation == generation) {
         s_p0_emit_source_only_backpressure_failed++;
-        p0_source_only_mark_unhealthy_locked("source_only_recovery_latch_prepare_failed", 0);
+        p0_source_only_mark_unhealthy_for_event_locked(
+            "source_only_recovery_latch_prepare_failed", 0, record.type);
       }
       p0_state_unlock();
       return 0;
@@ -1577,7 +1646,8 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
     if (s_p0_source_only_retry[selected].pending &&
         s_p0_source_only_retry[selected].generation == generation) {
       s_p0_emit_source_only_backpressure_failed++;
-      p0_source_only_mark_unhealthy_locked("source_only_durable_unavailable", 0);
+      p0_source_only_mark_unhealthy_for_event_locked(
+          "source_only_durable_unavailable", 0, record.type);
     }
     p0_state_unlock();
     return 0;
@@ -1607,6 +1677,22 @@ int edr_p0_rule_source_only_capability_healthy(char *reason, size_t reason_cap) 
   if (reason && reason_cap > 0u) reason[0] = '\0';
   p0_state_lock();
   healthy = !s_p0_source_only_terminal_unhealthy;
+  if (!healthy && reason && reason_cap > 0u) {
+    snprintf(reason, reason_cap, "%s", s_p0_source_only_terminal_reason);
+  }
+  p0_state_unlock();
+  return healthy;
+}
+
+int edr_p0_rule_source_only_capability_healthy_for_event(
+    EdrEventType type, char *reason, size_t reason_cap) {
+  int healthy;
+  uint32_t family = p0_source_only_family_for_event(type);
+  if (reason && reason_cap > 0u) reason[0] = '\0';
+  p0_state_lock();
+  healthy = !s_p0_source_only_terminal_unhealthy ||
+            (s_p0_source_only_unhealthy_families != P0_SOURCE_ONLY_FAMILY_ALL &&
+             (s_p0_source_only_unhealthy_families & family) == 0u);
   if (!healthy && reason && reason_cap > 0u) {
     snprintf(reason, reason_cap, "%s", s_p0_source_only_terminal_reason);
   }
@@ -3548,7 +3634,8 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record) {
   EdrBehaviorRecord evidence;
   if (!record || !p0_build_source_only_collector_evidence_record(record, &evidence)) {
     p0_state_lock();
-    p0_source_only_mark_unhealthy_locked("source_only_collector_record_invalid", 1);
+    p0_source_only_mark_unhealthy_for_event_locked(
+        "source_only_collector_record_invalid", 1, record ? record->type : 0);
     p0_state_unlock();
     p0_source_only_sync_persistent_latch();
     return 0;
@@ -3557,7 +3644,8 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record) {
    * an unknown handle existed. Persist a restart latch before its source is
    * accepted; the collector owns the stricter session-reset fuse. */
   p0_state_lock();
-  p0_source_only_mark_unhealthy_locked("source_only_collector_gate_pending", 0);
+  p0_source_only_mark_unhealthy_for_event_locked(
+      "source_only_collector_gate_pending", 0, record->type);
   p0_state_unlock();
   return p0_source_only_submit(&evidence);
 }
@@ -3662,12 +3750,12 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     memset(&evaluation, 0, sizeof(evaluation));
     if (edr_p0_rule_ir_evaluate_record(br, &evaluation)) {
       /* A previously-retained source-only assertion has not crossed the
-       * durable boundary yet.  It is still safe (and necessary) to build a
+       * durable boundary yet. It is still safe (and necessary) to build a
        * ruleset-evaluation gate below on a new evaluator failure, but a
        * successfully evaluated rule may not create an alert or action while
-       * that original capability fault remains unresolved. */
+       * a source-only fault in the same event family remains unresolved. */
       if (p0_is_ruleset_evaluation_event(br->type) &&
-          !edr_p0_rule_source_only_capability_healthy(NULL, 0u)) {
+          !edr_p0_rule_source_only_capability_healthy_for_event(br->type, NULL, 0u)) {
         edr_p0_rule_ir_evaluation_free(&evaluation);
         return 0;
       }

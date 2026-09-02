@@ -97,6 +97,7 @@ static const EdrConfig *s_collector_cfg;
 #define EDR_COLLECTOR_DEVICE_MAP 26u
 #define EDR_AGENT_SELF_PID_CACHE 128u
 #define EDR_POLICY_CANARY_PID_CACHE 32u
+#define EDR_FILE_READ_METADATA_COALESCE_SLOTS 64u
 
 /* Microsoft-Windows-Kernel-File manifest constants.  Read is event/task 15
  * with FILEIO|READ; NameCreate carries the FileKey→FileName binding used to
@@ -122,6 +123,13 @@ static const EdrConfig *s_collector_cfg;
    EDR_KERNEL_FILE_KEYWORD_CREATE | EDR_KERNEL_FILE_KEYWORD_READ | \
    EDR_KERNEL_FILE_KEYWORD_WRITE | EDR_KERNEL_FILE_KEYWORD_DELETE_PATH | \
    EDR_KERNEL_FILE_KEYWORD_RENAME_SETLINK_PATH | EDR_KERNEL_FILE_KEYWORD_CREATE_NEW_FILE)
+/* Microsoft-Windows-Kernel-Process manifest keywords. The mapper consumes
+ * only process lifecycle and image-load classes, so thread/priority/job
+ * production must not be enabled in the kernel. */
+#define EDR_KERNEL_PROCESS_KEYWORD_PROCESS 0x00000010ULL
+#define EDR_KERNEL_PROCESS_KEYWORD_IMAGE 0x00000040ULL
+#define EDR_KERNEL_PROCESS_PROVIDER_KEYWORDS \
+  (EDR_KERNEL_PROCESS_KEYWORD_PROCESS | EDR_KERNEL_PROCESS_KEYWORD_IMAGE)
 
 typedef struct {
   uint32_t pid;
@@ -211,6 +219,11 @@ typedef struct {
   char reason[96];
 } EdrFileReadMetadataGate;
 
+typedef struct {
+  char key_sha256[65];
+  uint8_t valid;
+} EdrFileReadMetadataCoalesceEntry;
+
 static EdrCollectorPidCacheEntry s_pid_cache[EDR_COLLECTOR_PID_CACHE];
 static uint32_t s_pid_cache_next;
 /* Security EventLog delivery and ETW decode can run on different threads.
@@ -221,6 +234,9 @@ static uint32_t s_file_key_cache_next;
 static uint64_t s_file_key_session_epoch;
 static SRWLOCK s_file_key_cache_lock = SRWLOCK_INIT;
 static EdrFileReadMetadataGate s_file_read_metadata_gate;
+static EdrFileReadMetadataCoalesceEntry
+    s_file_read_metadata_coalesce[EDR_FILE_READ_METADATA_COALESCE_SLOTS];
+static uint32_t s_file_read_metadata_coalesce_next;
 static SRWLOCK s_file_read_metadata_gate_lock = SRWLOCK_INIT;
 static EdrCollectorDeviceMap s_device_map[EDR_COLLECTOR_DEVICE_MAP];
 static uint32_t s_device_map_count;
@@ -2224,6 +2240,8 @@ static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth
   out->file_read_p0_capability_healthy =
       s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_HEALTHY ? 1 : 0;
   out->file_read_metadata_gate_staged = s_health.file_read_metadata_gate_staged;
+  out->file_read_metadata_gate_coalesced =
+      s_health.file_read_metadata_gate_coalesced;
   out->file_read_metadata_gate_enqueue_attempts =
       s_health.file_read_metadata_gate_enqueue_attempts;
   out->file_read_metadata_gate_queue_rejected =
@@ -2269,6 +2287,8 @@ static int edr_collector_file_read_p0_capability_healthy(void) {
  * advance that terminal state in start_succeeded(). */
 static void edr_collector_file_read_metadata_gate_session_starting(void) {
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  memset(s_file_read_metadata_coalesce, 0, sizeof(s_file_read_metadata_coalesce));
+  s_file_read_metadata_coalesce_next = 0u;
   if (s_file_read_metadata_gate.slot_valid) {
     ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
     return;
@@ -2291,6 +2311,28 @@ static void edr_collector_file_read_metadata_gate_session_starting(void) {
            sizeof(s_health.file_read_p0_capability_reason), "%s",
            s_file_read_metadata_gate.reason);
   ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+}
+
+/* One unresolved handle/generation/reason is one capability fact for a
+ * provider epoch. Preserve its first durable source and count subsequent
+ * reads instead of manufacturing an unbounded stream of critical records. */
+static int edr_collector_file_read_metadata_gate_coalesce_locked(
+    const char *key_sha256) {
+  EdrFileReadMetadataCoalesceEntry *entry;
+  if (!key_sha256 || !key_sha256[0]) return 0;
+  for (uint32_t i = 0u; i < EDR_FILE_READ_METADATA_COALESCE_SLOTS; ++i) {
+    if (s_file_read_metadata_coalesce[i].valid &&
+        strcmp(s_file_read_metadata_coalesce[i].key_sha256, key_sha256) == 0) {
+      s_health.file_read_metadata_gate_coalesced++;
+      return 1;
+    }
+  }
+  entry = &s_file_read_metadata_coalesce[
+      s_file_read_metadata_coalesce_next++ % EDR_FILE_READ_METADATA_COALESCE_SLOTS];
+  memset(entry, 0, sizeof(*entry));
+  snprintf(entry->key_sha256, sizeof(entry->key_sha256), "%s", key_sha256);
+  entry->valid = 1u;
+  return 0;
 }
 
 /* After an epoch reset the cache starts in DEGRADED because pre-existing
@@ -2388,12 +2430,15 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   char path_sha256[65];
   char commitment[256];
   char commitment_sha256[65];
+  char coalesce_commitment[256];
+  char coalesce_sha256[65];
   uint64_t session_epoch;
   uint64_t start_key = 0u;
   int have_canonical_path = 0;
   int slot_complete = 1;
   canonical_path[0] = '\0';
   path_sha256[0] = '\0';
+  coalesce_sha256[0] = '\0';
   if (!record) {
     AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
     edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
@@ -2461,6 +2506,24 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
       return;
     }
   }
+  {
+    int coalesce_len = snprintf(
+        coalesce_commitment, sizeof(coalesce_commitment),
+        "file-read-metadata-coalesce-v1|%016llx|%016llx|%08lx|%016llx|%s|%s",
+        (unsigned long long)session_epoch, (unsigned long long)file_key,
+        (unsigned long)record->EventHeader.ProcessId,
+        (unsigned long long)start_key, reason, path_sha256);
+    if (coalesce_len < 0 || (size_t)coalesce_len >= sizeof(coalesce_commitment) ||
+        edr_sha256_hex((const uint8_t *)coalesce_commitment,
+                       (size_t)coalesce_len, coalesce_sha256) != 0) {
+      AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+      edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
+          "file_read_metadata_event_identity_unavailable");
+      s_health.file_read_metadata_gate_durable_failures++;
+      ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+      return;
+    }
+  }
   /* `event_id` is intentionally a fixed-length SHA-256 commitment rather
    * than a low timestamp fragment: PID/FileKey reuse after 4.29 seconds must
    * never alias an old source-only gate.  152 bits fit EDR_BR_ID_LEN. */
@@ -2510,6 +2573,10 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   if (s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_HEALTHY &&
       s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_DEGRADED) {
     s_health.file_read_metadata_gate_paused_events++;
+    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+    return;
+  }
+  if (edr_collector_file_read_metadata_gate_coalesce_locked(coalesce_sha256)) {
     ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
     return;
   }
@@ -3885,6 +3952,9 @@ static UCHAR edr_trace_provider_level(const GUID *guid) {
 }
 
 static ULONGLONG edr_trace_provider_keywords(const GUID *guid) {
+  if (guid && memcmp(guid, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
+    return EDR_KERNEL_PROCESS_PROVIDER_KEYWORDS;
+  }
   if (guid && memcmp(guid, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     return EDR_KERNEL_FILE_PROVIDER_KEYWORDS;
   }

@@ -189,6 +189,14 @@ int main(void) {
                          "same-timestamp NameCreate delivery must compare the whole binding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_note_resolved",
                          "a complete post-reset FileKey binding must restore FileRead health");
+  ok &= require_contains(collector, "file-read-metadata-coalesce-v1",
+                         "repeated unresolved reads must share one epoch-scoped capability fact");
+  ok &= require_contains(collector_header, "file_read_metadata_gate_coalesced",
+                         "coalesced FileRead capability facts must be observable");
+  ok &= require_contains(agent, "\\\"coalesced\\\":%llu",
+                         "engine health must expose FileRead gate coalescing");
+  ok &= require_contains(agent, "\\\"write_budget\\\":{\\\"used\\\":%u",
+                         "compact acceptance health must expose evidence-cache rate admission loss");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_session_starting();",
                          "every new FileKey provider epoch must begin in degraded attribution mode");
   ok &= require_contains(collector, "file_read_metadata_new_session_degraded",
@@ -254,6 +262,8 @@ int main(void) {
                        "NameCreate/Cleanup metadata must run before type map and A4.4 queueing");
   ok &= require_contains(collector, "return EDR_KERNEL_FILE_PROVIDER_KEYWORDS;",
                          "Kernel-File must use its bounded provider keyword set");
+  ok &= require_contains(collector, "return EDR_KERNEL_PROCESS_PROVIDER_KEYWORDS;",
+                         "Kernel-Process must request only process and image keyword classes");
   ok &= require_contains(collector, "if (is_kernel_process || is_kernel_file)",
                          "Kernel-File must request its own StartKey extended item");
   ok &= require_contains(collector, "params.EnableProperty = EVENT_ENABLE_PROPERTY_PROCESS_START_KEY;",

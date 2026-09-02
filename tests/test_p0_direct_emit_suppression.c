@@ -1292,6 +1292,69 @@ static void test_ir_not_ready_durably_preserves_every_p0_event_group(void) {
   g_ir_ready = 1;
 }
 
+/* A FileRead attribution fault must fail closed for file rules without
+ * disabling an independently authoritative process rule. The persistent
+ * global latch remains visible for operations/upgrade safety; only runtime
+ * rule admission is scoped to the known owning event family. */
+static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
+  EdrBehaviorRecord file_source;
+  EdrBehaviorRecord process_match;
+  EdrBehaviorRecord file_match;
+  EdrP0EmitMetrics metrics;
+  char reason[96];
+
+  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_test_set_monotonic_ms(2850u);
+  g_source_latch = 0;
+  g_source_ack = 0;
+  g_durable_emit_allowed = 1;
+  g_combined_emit_allowed = 1;
+  g_emit_count = 0;
+  g_durable_count = 0;
+  g_ir_ready = 1;
+  g_ir_evaluation_available = 0;
+
+  init_record(&file_source);
+  file_source.type = EDR_EVENT_FILE_READ;
+  file_source.pid = 99030u;
+  file_source.event_time_ns = 130u;
+  snprintf(file_source.event_id, sizeof(file_source.event_id), "%s", "file-source-only");
+  snprintf(file_source.process_name, sizeof(file_source.process_name), "%s", "reader.exe");
+  assert(edr_p0_rule_try_emit(&file_source) == 0);
+  assert(atomic_load(&g_durable_count) == 1);
+  assert(edr_p0_rule_source_only_capability_healthy(reason, sizeof(reason)) == 0);
+  assert(edr_p0_rule_source_only_capability_healthy_for_event(
+             EDR_EVENT_FILE_READ, reason, sizeof(reason)) == 0);
+  assert(edr_p0_rule_source_only_capability_healthy_for_event(
+             EDR_EVENT_PROCESS_CREATE, reason, sizeof(reason)) == 1);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.source_only_unhealthy_families == 2u);
+
+  g_ir_evaluation_available = 1;
+  init_record(&process_match);
+  process_match.pid = 99031u;
+  process_match.event_time_ns = 131u;
+  snprintf(process_match.event_id, sizeof(process_match.event_id), "%s", "process-after-file-fault");
+  snprintf(process_match.process_name, sizeof(process_match.process_name), "%s", "dedup-test.exe");
+  assert(edr_p0_rule_try_emit(&process_match) == 1);
+  assert(atomic_load(&g_emit_count) == 1);
+
+  file_match = process_match;
+  file_match.type = EDR_EVENT_FILE_READ;
+  file_match.pid = 99032u;
+  file_match.event_time_ns = 132u;
+  snprintf(file_match.event_id, sizeof(file_match.event_id), "%s", "file-after-file-fault");
+  assert(edr_p0_rule_try_emit(&file_match) == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+
+  g_source_ack = 1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  assert(edr_p0_rule_source_only_capability_healthy_for_event(
+             EDR_EVENT_FILE_READ, reason, sizeof(reason)) == 1);
+}
+
 static void test_p0_escape_overflow_degrades_without_silent_core_loss(void) {
   EdrBehaviorRecord r;
   EdrP0EmitMetrics before, after;
@@ -2144,6 +2207,7 @@ int main(void) {
   test_source_only_retry_lane_is_exact_and_overflow_latched();
   test_restart_latch_requires_durable_loss_audit();
   test_ir_not_ready_durably_preserves_every_p0_event_group();
+  test_source_only_fault_is_scoped_to_owning_event_family();
   test_p0_escape_overflow_degrades_without_silent_core_loss();
   test_p0_user_subject_overflow_degrades_without_losing_alert();
 #if !defined(_WIN32)

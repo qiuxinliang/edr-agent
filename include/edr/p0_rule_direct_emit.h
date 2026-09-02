@@ -37,6 +37,13 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
  * direct enforcement may run while this returns false. */
 int edr_p0_rule_source_only_capability_healthy(char *reason, size_t reason_cap);
 
+/* Runtime source-only faults are scoped to the P0 event family which lost
+ * authority. A historic latch recovered after restart has no trustworthy
+ * in-memory family and therefore remains global until its central ACK is
+ * observed. */
+int edr_p0_rule_source_only_capability_healthy_for_event(
+    EdrEventType type, char *reason, size_t reason_cap);
+
 /* Supplies the durable capability-audit identity after agent configuration is
  * available. `endpoint_id=auto` is intentionally not sufficient to recover. */
 void edr_p0_rule_source_only_set_runtime_identity(const char *tenant_id,
@@ -72,6 +79,7 @@ typedef struct {
   uint64_t source_only_retry_pending, source_only_retry_attempts;
   uint64_t source_only_retry_committed, source_only_retry_capacity_exhausted;
   int source_only_terminal_unhealthy;
+  uint32_t source_only_unhealthy_families;
   int source_only_loss_detected;
   uint64_t source_only_latch_counter;
   uint64_t source_only_latch_epoch;

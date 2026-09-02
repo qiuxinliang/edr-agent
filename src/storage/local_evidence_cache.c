@@ -173,6 +173,7 @@ static EdrEvidenceCacheStatus s_status;
 static uint64_t s_last_maintenance_ns;
 static int64_t s_write_budget_minute;
 static uint32_t s_write_budget_count;
+static uint32_t s_write_budget_context_count;
 
 #define EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS 64u
 
@@ -1699,7 +1700,7 @@ static int sqlite_size_budget_allow(void) {
   return 0;
 }
 
-static int sqlite_write_budget_allow(uint32_t units, int64_t ts) {
+static int sqlite_write_budget_allow(uint32_t units, int64_t ts, int candidate) {
   uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
                                    80u, 0u, 100000u);
   if (limit == 0u) {
@@ -1712,20 +1713,30 @@ static int sqlite_write_budget_allow(uint32_t units, int64_t ts) {
   if (minute != s_write_budget_minute) {
     s_write_budget_minute = minute;
     s_write_budget_count = 0u;
+    s_write_budget_context_count = 0u;
   }
-  if (s_write_budget_count >= limit || units > limit - s_write_budget_count) {
+  /* Context fan-out may consume at most half of the minute budget. Candidates
+   * may use the whole budget, so optional context cannot starve later P0/P1
+   * candidate rows while total writes remain strictly bounded. */
+  uint32_t context_limit = limit / 2u;
+  if (s_write_budget_count >= limit || units > limit - s_write_budget_count ||
+      (!candidate && (s_write_budget_context_count >= context_limit ||
+                      units > context_limit - s_write_budget_context_count))) {
     s_status.write_budget_dropped++;
+    if (candidate) s_status.write_budget_candidate_dropped++;
+    else s_status.write_budget_context_dropped++;
     set_error("evidence cache write budget exceeded");
     return 0;
   }
   s_write_budget_count += units;
+  if (!candidate) s_write_budget_context_count += units;
   return 1;
 }
 
 /* A reservation becomes consumption only when the enclosing write commits.
  * This keeps an injected/disk commit failure from exhausting the next
  * candidate's minute budget and hiding a retried alert. */
-static void sqlite_write_budget_release(uint32_t units, int64_t ts) {
+static void sqlite_write_budget_release(uint32_t units, int64_t ts, int candidate) {
   uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
                                    80u, 0u, 100000u);
   if (limit == 0u) {
@@ -1737,6 +1748,9 @@ static void sqlite_write_budget_release(uint32_t units, int64_t ts) {
   int64_t minute = (ts / 1000000000LL) / 60LL;
   if (minute == s_write_budget_minute && s_write_budget_count >= units) {
     s_write_budget_count -= units;
+    if (!candidate && s_write_budget_context_count >= units) {
+      s_write_budget_context_count -= units;
+    }
   }
 }
 
@@ -2588,6 +2602,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_last_maintenance_ns = 0u;
   s_write_budget_minute = 0;
   s_write_budget_count = 0u;
+  s_write_budget_context_count = 0u;
   s_status.max_db_mb = max_db_mb ? max_db_mb : 128u;
   s_status.retention_hours = retention_hours ? retention_hours : 24u;
   copy_s(s_status.path, sizeof(s_status.path), (path && path[0]) ? path : "local_evidence_cache.db");
@@ -3282,7 +3297,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.hot_ring_ingested++;
       goto done;
     }
-    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts)) {
+    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts, 1)) {
       s_status.candidate_rejected++;
       s_status.records_dropped++;
       context_ring_capture(r);
@@ -3290,7 +3305,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       goto done;
     }
     if (sqlite_record_candidate(r, pre_count, post_until_ns) != 0) {
-      sqlite_write_budget_release(2u, ts);
+      sqlite_write_budget_release(2u, ts, 1);
       s_status.candidate_rejected++;
       s_status.candidate_transaction_failures++;
       s_status.records_dropped++;
@@ -3310,11 +3325,11 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
      * separately budgeted context bundle cannot be admitted. */
     if (context_candidate_count > 0u) {
       if (!sqlite_size_budget_allow() ||
-          !sqlite_write_budget_allow(context_candidate_count, ts)) {
+          !sqlite_write_budget_allow(context_candidate_count, ts, 0)) {
         s_status.records_dropped++;
       } else if (sqlite_record_context_artifacts(r, context_candidate_ids,
                                                   context_candidate_count) != 0) {
-        sqlite_write_budget_release(context_candidate_count, ts);
+        sqlite_write_budget_release(context_candidate_count, ts, 0);
         s_status.records_dropped++;
       } else {
         s_status.artifacts_written += context_candidate_count;
@@ -3325,13 +3340,13 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     s_status.hot_ring_ingested++;
     ring_record(r);
     if (!sqlite_size_budget_allow() ||
-        !sqlite_write_budget_allow(context_candidate_count, ts)) {
+        !sqlite_write_budget_allow(context_candidate_count, ts, 0)) {
       s_status.records_dropped++;
       goto done;
     }
     if (sqlite_record_context_artifacts(r, context_candidate_ids,
                                         context_candidate_count) != 0) {
-      sqlite_write_budget_release(context_candidate_count, ts);
+      sqlite_write_budget_release(context_candidate_count, ts, 0);
       s_status.records_dropped++;
       goto done;
     }
@@ -3403,6 +3418,9 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   }
   evidence_cache_lock();
   EdrEvidenceCacheStatus st = s_status;
+  st.write_budget_used = s_write_budget_count;
+  st.write_budget_limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
+                                          80u, 0u, 100000u);
   const EvidenceCacheLockTiming *lock_timing = &s_evidence_cache_lock_timing;
   st.mutex_lock_samples = lock_timing->samples;
   st.mutex_wait_total_ns = lock_timing->wait_total_ns;
@@ -4274,7 +4292,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
-           "\"candidate_deduped\":%llu,\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,"
+           "\"candidate_deduped\":%llu,\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
            "\"process_cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"used\":%u,\"capacity\":%u},"
            "\"identity\":{\"observations_total\":%llu,\"none\":%llu,\"hits\":%llu,\"misses\":%llu,\"enrich_attempts\":%llu,\"upgrades\":%llu,\"stale_rejects\":%llu,\"generation_unknown_rejects\":%llu,\"generation_mismatch_rejects\":%llu,\"generation_unknown_update_rejects\":%llu,\"generation_mismatch_update_rejects\":%llu,\"generation_resets\":%llu,\"late_generation_rejects\":%llu,\"target_4688\":%llu,\"creator_fallback\":%llu,\"token_sid\":%llu},"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
@@ -4307,6 +4325,10 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.bounded_string_truncations,
            (unsigned long long)st.manifest_rejections,
            (unsigned long long)st.write_budget_dropped,
+           st.write_budget_used, st.write_budget_limit,
+           (unsigned long long)st.write_budget_dropped,
+           (unsigned long long)st.write_budget_candidate_dropped,
+           (unsigned long long)st.write_budget_context_dropped,
            (unsigned long long)st.process_cache_hits, (unsigned long long)st.process_cache_misses,
            (unsigned long long)st.process_cache_evictions, st.process_slots_used, st.process_slots_capacity,
            (unsigned long long)st.identity_observations_total, (unsigned long long)st.identity_none,

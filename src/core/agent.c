@@ -2435,10 +2435,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"p0_acceptance\":{"
         "\"dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,"
         "\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu},"
-        "\"source_only\":{\"terminal_unhealthy\":%s,\"loss_detected\":%s,"
+        "\"source_only\":{\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u,\"loss_detected\":%s,"
         "\"retry_pending\":%llu,\"retry_committed\":%llu},"
         "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
+        "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
+        "\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,"
+        "\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
         "\"max_db_mb\":%u},"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
@@ -2456,7 +2459,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
         "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
         "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
-        "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+        "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
         "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
         "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
@@ -2600,12 +2603,19 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)p0_metrics.pre_rule_event_duplicates,
         (unsigned long long)p0_metrics.pending_backpressure,
         p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false",
+        p0_emit_metrics.source_only_unhealthy_families,
         p0_emit_metrics.source_only_loss_detected ? "true" : "false",
         (unsigned long long)p0_emit_metrics.source_only_retry_pending,
         (unsigned long long)p0_emit_metrics.source_only_retry_committed,
         evidence_status.db_open ? "true" : "false", evidence_status.db_utilization_bps,
         (unsigned long long)evidence_status.candidate_requests,
         (unsigned long long)evidence_status.candidate_reused,
+        (unsigned long long)evidence_status.candidate_admitted,
+        (unsigned long long)evidence_status.candidate_rejected,
+        evidence_status.write_budget_used, evidence_status.write_budget_limit,
+        (unsigned long long)evidence_status.write_budget_dropped,
+        (unsigned long long)evidence_status.write_budget_candidate_dropped,
+        (unsigned long long)evidence_status.write_budget_context_dropped,
         (unsigned long long)evidence_status.p0_candidate_rows,
         (unsigned long long)evidence_status.db_bytes,
         (unsigned long long)evidence_status.wal_bytes, evidence_status.max_db_mb,
@@ -2642,6 +2652,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         ch.file_read_p0_capability_healthy ? "true" : "false",
         ch.file_read_p0_capability_reason[0] ? ch.file_read_p0_capability_reason : "healthy",
         (unsigned long long)ch.file_read_metadata_gate_staged,
+        (unsigned long long)ch.file_read_metadata_gate_coalesced,
         (unsigned long long)ch.file_read_metadata_gate_enqueue_attempts,
         (unsigned long long)ch.file_read_metadata_gate_queue_rejected,
         (unsigned long long)ch.file_read_metadata_gate_durable_successes,
@@ -2767,12 +2778,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)p0_emit_metrics.source_only_backpressure_failed);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
                  p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"p0_source_only_durability\":{\"retry_pending\":%llu,\"retry_attempts\":%llu,\"retry_committed\":%llu,\"retry_capacity_exhausted\":%llu,\"terminal_unhealthy\":%s}",
+                 ",\"p0_source_only_durability\":{\"retry_pending\":%llu,\"retry_attempts\":%llu,\"retry_committed\":%llu,\"retry_capacity_exhausted\":%llu,\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u}",
                  (unsigned long long)p0_emit_metrics.source_only_retry_pending,
                  (unsigned long long)p0_emit_metrics.source_only_retry_attempts,
                  (unsigned long long)p0_emit_metrics.source_only_retry_committed,
                  (unsigned long long)p0_emit_metrics.source_only_retry_capacity_exhausted,
-                 p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false");
+                 p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false",
+                 p0_emit_metrics.source_only_unhealthy_families);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
                  ",\"p0_rule_bundle\":{\"plaintext_sha256\":\"%s\"}",
                  p0_bundle_sha256 ? p0_bundle_sha256 : "");
@@ -3069,7 +3081,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
       "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
-      "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+      "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
       "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
       "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
       "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
@@ -3364,6 +3376,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       ch.file_read_p0_capability_healthy ? "true" : "false",
       ch.file_read_p0_capability_reason[0] ? ch.file_read_p0_capability_reason : "healthy",
       (unsigned long long)ch.file_read_metadata_gate_staged,
+      (unsigned long long)ch.file_read_metadata_gate_coalesced,
       (unsigned long long)ch.file_read_metadata_gate_enqueue_attempts,
       (unsigned long long)ch.file_read_metadata_gate_queue_rejected,
       (unsigned long long)ch.file_read_metadata_gate_durable_successes,

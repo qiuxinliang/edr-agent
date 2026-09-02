@@ -41,6 +41,10 @@ typedef struct {
   uint64_t manifest_rejections;
   uint64_t candidate_deduped;
   uint64_t write_budget_dropped;
+  uint64_t write_budget_candidate_dropped;
+  uint64_t write_budget_context_dropped;
+  uint32_t write_budget_used;
+  uint32_t write_budget_limit;
   uint64_t db_budget_dropped;
   uint64_t pressure_dropped;
   uint64_t ordinary_coalesced;
