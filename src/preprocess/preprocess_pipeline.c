@@ -392,11 +392,11 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
         br, p0_file_read_live_generation_reason(failure_reason));
     return 0;
   }
-  CloseHandle(process);
   observed.LowPart = created.dwLowDateTime;
   observed.HighPart = created.dwHighDateTime;
   if (!live.creation_filetime_100ns || observed.QuadPart != live.creation_filetime_100ns ||
       (source_creation != 0u && source_creation != live.creation_filetime_100ns)) {
+    CloseHandle(process);
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "live_creation_filetime_mismatch");
     p0_mark_file_read_collector_evidence(br,
@@ -413,10 +413,27 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
       (!event_unix_ns || !creation_unix_ns ||
        event_unix_ns + 100000000ULL < creation_unix_ns ||
        event_unix_ns > creation_unix_ns + 5000000000ULL)) {
+    CloseHandle(process);
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "live_generation_event_time_mismatch");
     return 0;
   }
+  if (br->type == EDR_EVENT_PROCESS_CREATE && !br->cmdline[0]) {
+    reason[0] = '\0';
+    if (edr_process_command_line_query_live(process, br->cmdline, sizeof(br->cmdline),
+                                            reason, sizeof(reason))) {
+      snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
+               "live_same_generation");
+    } else {
+      /* The process may exit between ETW delivery and this bounded query.
+       * Keep the raw source, but never borrow a PID-only command line from a
+       * new process occupant or present an incomplete string as evaluable. */
+      br->cmdline[0] = '\0';
+      snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
+               "live_same_generation_unavailable");
+    }
+  }
+  CloseHandle(process);
   br->process_start_key = live.process_start_key;
   br->process_creation_filetime_100ns = live.creation_filetime_100ns;
   snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",

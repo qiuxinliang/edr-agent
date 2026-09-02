@@ -255,6 +255,14 @@ int main(void) {
                          "FileKey resolver must surface an attribution-failure reason");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_stage(\n        event_record, timestamp_ns, file_read_key",
                          "unresolved FileReads must stage durable metadata evidence instead of dropping");
+  ok &= require_contains(
+      collector,
+      "edr_sha256_hex((const uint8_t *)canonical_path, strlen(canonical_path), path_sha256) != 0",
+      "successful path commitments must not be mistaken for hash failures");
+  ok &= require_contains(
+      collector,
+      "edr_sha256_hex((const uint8_t *)commitment, (size_t)commitment_len,\n                       commitment_sha256) != 0",
+      "successful event-identity commitments must pass the FileRead metadata gate");
   ok &= require_contains(collector, "!entry->pid || !entry->process_start_key || !read_pid || !read_start_key",
                          "NameCreate and Read must both carry nonzero actor generation facts");
   ok &= require_contains(collector, "read_pid != entry->pid || read_start_key != entry->process_start_key",

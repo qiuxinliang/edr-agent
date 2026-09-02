@@ -30,4 +30,11 @@ int edr_process_generation_validate_live(void *native_process_handle,
                                          uint64_t *out_creation_filetime_100ns,
                                          char *reason, size_t reason_cap);
 
+/* Read the command line from the already-open process object.  Callers that
+ * use this as detection evidence must validate the generation on this same
+ * handle before accepting the returned text. */
+int edr_process_command_line_query_live(void *native_process_handle,
+                                        char *out, size_t out_cap,
+                                        char *reason, size_t reason_cap);
+
 #endif

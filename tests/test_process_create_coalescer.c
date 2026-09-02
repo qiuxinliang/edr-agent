@@ -15,6 +15,7 @@ static EdrBehaviorRecord rec(uint32_t pid, int security, uint64_t start_key,
   memset(&record, 0, sizeof(record));
   record.type = EDR_EVENT_PROCESS_CREATE;
   record.pid = pid;
+  record.ppid = 4u;
   record.is_security_4688 = (uint8_t)security;
   record.event_time_ns = event_time_ns;
   if (!security) record.process_start_key = start_key;
@@ -30,6 +31,21 @@ static EdrBehaviorRecord rec(uint32_t pid, int security, uint64_t start_key,
     snprintf(record.identity_quality, sizeof(record.identity_quality), "%s", "target_4688");
   }
   return record;
+}
+
+static void make_kernel_independent(EdrBehaviorRecord *record) {
+  if (!record) return;
+  record->process_creation_filetime_100ns = 133801632000000000ULL;
+  snprintf(record->cmdline, sizeof(record->cmdline), "%s", "trusted.exe --same-generation");
+  snprintf(record->command_line_origin, sizeof(record->command_line_origin), "%s",
+           "live_same_generation");
+  snprintf(record->parent_path, sizeof(record->parent_path), "%s", "C:\\parent.exe");
+  snprintf(record->parent_creation_time, sizeof(record->parent_creation_time), "%s",
+           "2026-09-02T00:00:00Z");
+  snprintf(record->username, sizeof(record->username), "%s", "SYSTEM");
+  snprintf(record->user_sid, sizeof(record->user_sid), "%s", "S-1-5-18");
+  snprintf(record->identity_source, sizeof(record->identity_source), "%s", "token_query");
+  snprintf(record->identity_quality, sizeof(record->identity_quality), "%s", "token_sid");
 }
 
 static int need(int value, const char *what) {
@@ -130,6 +146,68 @@ int main(void) {
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
                    strcmp(out.source_completeness, "COALESCED") == 0,
                "two-second ARM64 Security audit skew coalesces within the bounded window");
+  }
+
+  /* PID and normalized path are not unique across process generations.  The
+   * creator/parent PID must also agree before 4688 may enrich a raw start. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord kernel = rec(20u, 0, 0xa20u, "C:\\parent-bound.exe", 1000000000LL);
+    EdrBehaviorRecord wrong_parent =
+        rec(20u, 1, 0u, "C:\\parent-bound.exe", 1000000100LL);
+    wrong_parent.ppid = 5u;
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&wrong_parent, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.source_completeness, "CORRELATION_MISSING") == 0 &&
+                   !out.user_sid[0] && !out.cmdline[0],
+               "4688 with a different parent PID remains separate source-only evidence");
+  }
+
+  /* On the affected ARM64 host Security 4688 source time preceded the Kernel
+   * ProcessStart by up to 2.8 seconds.  That advisory record is rejected, but
+   * it cannot revoke command/token/parent evidence captured from the exact
+   * live StartKey/FILETIME generation. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord kernel = rec(119u, 0, 0xa119u, "C:\\complete.exe", 4000000000LL);
+    EdrBehaviorRecord older_security =
+        rec(119u, 1, 0u, "C:\\complete.exe", 1300000000LL);
+    EdrProcessCoalescerMetrics metrics;
+    make_kernel_independent(&kernel);
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&older_security, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_PASS &&
+                   edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
+                   strcmp(out.source_completeness, "CORRELATION_MISSING") == 0 &&
+                   strcmp(out.command_line_origin, "live_same_generation") == 0 &&
+                   strcmp(out.user_sid, "S-1-5-18") == 0,
+               "negative 4688 skew cannot downgrade independently complete kernel evidence");
+    edr_process_coalescer_get_metrics(&metrics);
+    ok &= need(metrics.ambiguous_rejects >= 1u,
+               "rejected negative-skew enrichment remains observable");
+  }
+
+  /* The same invariant holds when the negatively-skewed audit callback is
+   * delivered first: it stays source-only in its own slot. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord older_security =
+        rec(120u, 1, 0u, "C:\\arrival-complete.exe", 1300000000LL);
+    EdrBehaviorRecord kernel =
+        rec(120u, 0, 0xa120u, "C:\\arrival-complete.exe", 4000000000LL);
+    make_kernel_independent(&kernel);
+    ok &= need(edr_process_coalescer_submit(&older_security, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&kernel, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.source_completeness, "CORRELATION_MISSING") == 0 &&
+                   strcmp(out.command_line_origin, "live_same_generation") == 0,
+               "arrival-first negative 4688 cannot contaminate complete kernel evidence");
   }
 
   /* An already validated target token is stronger than advisory 4688 Target

@@ -2286,7 +2286,7 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
     reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
   }
   if (have_canonical_path &&
-      !edr_sha256_hex((const uint8_t *)canonical_path, strlen(canonical_path), path_sha256)) {
+      edr_sha256_hex((const uint8_t *)canonical_path, strlen(canonical_path), path_sha256) != 0) {
     AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
     edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
         "file_read_metadata_path_commitment_unavailable");
@@ -2312,8 +2312,8 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
         (unsigned long long)file_key, (unsigned long)record->EventHeader.ProcessId,
         (unsigned long long)start_key, reason, path_sha256);
     if (commitment_len < 0 || (size_t)commitment_len >= sizeof(commitment) ||
-        !edr_sha256_hex((const uint8_t *)commitment, (size_t)commitment_len,
-                        commitment_sha256)) {
+        edr_sha256_hex((const uint8_t *)commitment, (size_t)commitment_len,
+                       commitment_sha256) != 0) {
       AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
       edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
           "file_read_metadata_event_identity_unavailable");

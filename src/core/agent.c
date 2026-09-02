@@ -2441,6 +2441,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
         "\"max_db_mb\":%u},"
+        "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
+        "\"requests_total\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,"
+        "\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,"
+        "\"stale_rejected\":%llu},"
         "\"offline_queue\":{\"accounting_available\":%s,\"utilization_bps\":%u,"
         "\"used_bytes\":%llu,\"max_bytes\":%llu,\"pending_rows\":%llu,"
         "\"p0_source_only_rejected\":%llu}},"
@@ -2605,6 +2609,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.p0_candidate_rows,
         (unsigned long long)evidence_status.db_bytes,
         (unsigned long long)evidence_status.wal_bytes, evidence_status.max_db_mb,
+        process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
+        (unsigned long long)process_evidence_metrics.requests_total,
+        (unsigned long long)process_evidence_metrics.ready_hits,
+        (unsigned long long)process_evidence_metrics.pending_reuse,
+        (unsigned long long)process_evidence_metrics.misses,
+        (unsigned long long)process_evidence_metrics.backpressure,
+        (unsigned long long)process_evidence_metrics.cache_evictions,
+        (unsigned long long)process_evidence_metrics.stale_rejected,
         queue_capacity_metrics.accounting_available ? "true" : "false",
         queue_capacity_metrics.utilization_bps,
         (unsigned long long)queue_capacity_metrics.used_bytes,

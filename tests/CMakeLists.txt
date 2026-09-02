@@ -244,6 +244,15 @@ if(WIN32)
   edr_apply_test_warnings(test_process_evidence_worker_windows)
   add_test(NAME process_evidence_worker_windows_toctou
     COMMAND test_process_evidence_worker_windows)
+
+  add_executable(test_process_generation_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_process_generation_windows.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
+  target_include_directories(test_process_generation_windows PRIVATE
+    ${CMAKE_SOURCE_DIR}/include)
+  edr_apply_test_warnings(test_process_generation_windows)
+  add_test(NAME process_generation_same_handle_command_line
+    COMMAND test_process_generation_windows)
 endif()
 
 add_executable(test_process_create_coalescer

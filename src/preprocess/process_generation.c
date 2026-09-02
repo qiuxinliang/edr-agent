@@ -1,5 +1,6 @@
 #include "edr/process_generation.h"
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,20 @@ typedef struct {
 
 /* Documented PROCESSINFOCLASS value: ProcessTelemetryIdInformation. */
 #define EDR_PROCESS_INFO_CLASS_TELEMETRY_ID 64u
+#define EDR_PROCESS_INFO_CLASS_COMMAND_LINE 60u
 typedef LONG (WINAPI *EdrNtQueryInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+typedef struct {
+  USHORT Length;
+  USHORT MaximumLength;
+  PWSTR Buffer;
+} EdrUnicodeString;
+
+static EdrNtQueryInformationProcessFn resolve_native_query(void) {
+  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  return ntdll ? (EdrNtQueryInformationProcessFn)(void *)GetProcAddress(
+                     ntdll, "NtQueryInformationProcess")
+               : NULL;
+}
 
 int edr_process_generation_query_live(void *native_process_handle,
                                       EdrLiveProcessGeneration *out,
@@ -49,7 +63,6 @@ int edr_process_generation_query_live(void *native_process_handle,
   EdrProcessTelemetryIdInformation info;
   EdrProcessTelemetryIdInformation *reply = &info;
   EdrNtQueryInformationProcessFn query;
-  HMODULE ntdll;
   ULONG returned = 0u;
   ULONG capacity = (ULONG)sizeof(info);
   LONG status;
@@ -58,9 +71,7 @@ int edr_process_generation_query_live(void *native_process_handle,
     set_reason(reason, reason_cap, "invalid_process_handle");
     return 0;
   }
-  ntdll = GetModuleHandleA("ntdll.dll");
-  query = ntdll ? (EdrNtQueryInformationProcessFn)(void *)GetProcAddress(
-      ntdll, "NtQueryInformationProcess") : NULL;
+  query = resolve_native_query();
   if (!query) {
     set_reason(reason, reason_cap, "telemetry_id_api_unavailable");
     return 0;
@@ -104,6 +115,90 @@ int edr_process_generation_query_live(void *native_process_handle,
   out->process_start_key = (uint64_t)reply->ProcessStartKey;
   out->creation_filetime_100ns = (uint64_t)reply->CreateTime;
   if (reply != &info) free(reply);
+  set_reason(reason, reason_cap, "ok");
+  return 1;
+}
+
+int edr_process_command_line_query_live(void *native_process_handle,
+                                        char *out, size_t out_cap,
+                                        char *reason, size_t reason_cap) {
+  EdrNtQueryInformationProcessFn query;
+  EdrUnicodeString *value;
+  unsigned char *raw;
+  uintptr_t raw_begin;
+  uintptr_t raw_end;
+  uintptr_t text_begin;
+  ULONG needed = 0u;
+  ULONG capacity;
+  LONG status;
+  size_t chars;
+  int utf8_needed;
+  int written;
+
+  if (out && out_cap > 0u) out[0] = '\0';
+  if (!native_process_handle || !out || out_cap < 2u) {
+    set_reason(reason, reason_cap, "invalid_command_line_output");
+    return 0;
+  }
+  query = resolve_native_query();
+  if (!query) {
+    set_reason(reason, reason_cap, "command_line_api_unavailable");
+    return 0;
+  }
+  (void)query((HANDLE)native_process_handle, EDR_PROCESS_INFO_CLASS_COMMAND_LINE,
+              NULL, 0u, &needed);
+  if (needed < (ULONG)sizeof(EdrUnicodeString) || needed > 1024u * 1024u) {
+    set_reason(reason, reason_cap, "command_line_size_unavailable");
+    return 0;
+  }
+  capacity = needed;
+  raw = (unsigned char *)calloc(1u, (size_t)capacity + sizeof(wchar_t));
+  if (!raw) {
+    set_reason(reason, reason_cap, "command_line_buffer_unavailable");
+    return 0;
+  }
+  status = query((HANDLE)native_process_handle, EDR_PROCESS_INFO_CLASS_COMMAND_LINE,
+                 raw, capacity, &needed);
+  if (status < 0) {
+    free(raw);
+    set_reason(reason, reason_cap, "command_line_query_failed");
+    return 0;
+  }
+  value = (EdrUnicodeString *)raw;
+  raw_begin = (uintptr_t)raw;
+  raw_end = raw_begin + (uintptr_t)capacity;
+  text_begin = (uintptr_t)value->Buffer;
+  if (!value->Buffer || value->Length == 0u ||
+      (value->Length % sizeof(wchar_t)) != 0u ||
+      value->MaximumLength < value->Length || text_begin < raw_begin ||
+      text_begin > raw_end || (uintptr_t)value->Length > raw_end - text_begin) {
+    free(raw);
+    set_reason(reason, reason_cap, "command_line_reply_invalid");
+    return 0;
+  }
+  chars = (size_t)value->Length / sizeof(wchar_t);
+  if (chars > (size_t)INT_MAX) {
+    free(raw);
+    set_reason(reason, reason_cap, "command_line_too_long");
+    return 0;
+  }
+  utf8_needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value->Buffer,
+                                    (int)chars, NULL, 0, NULL, NULL);
+  if (utf8_needed <= 0 || (size_t)utf8_needed >= out_cap) {
+    free(raw);
+    set_reason(reason, reason_cap,
+               utf8_needed > 0 ? "command_line_too_long" : "command_line_encoding_invalid");
+    return 0;
+  }
+  written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value->Buffer,
+                                (int)chars, out, utf8_needed, NULL, NULL);
+  free(raw);
+  if (written != utf8_needed) {
+    out[0] = '\0';
+    set_reason(reason, reason_cap, "command_line_encoding_failed");
+    return 0;
+  }
+  out[written] = '\0';
   set_reason(reason, reason_cap, "ok");
   return 1;
 }
@@ -154,6 +249,15 @@ int edr_process_generation_validate_live(void *native_process_handle,
   (void)expected_pid;
   (void)expected_process_start_key;
   if (out_creation_filetime_100ns) *out_creation_filetime_100ns = 0u;
+  set_reason(reason, reason_cap, "unsupported_platform");
+  return 0;
+}
+
+int edr_process_command_line_query_live(void *native_process_handle,
+                                        char *out, size_t out_cap,
+                                        char *reason, size_t reason_cap) {
+  (void)native_process_handle;
+  if (out && out_cap > 0u) out[0] = '\0';
   set_reason(reason, reason_cap, "unsupported_platform");
   return 0;
 }

@@ -224,6 +224,15 @@ int main(void) {
                            "Windows process identity must have a bounded token SID fallback");
     ok &= require_contains(pipeline, "edr_process_generation_query_live",
                            "target generation must be validated against a live target handle");
+    ok &= require_contains(pipeline,
+                           "edr_process_command_line_query_live(process, br->cmdline",
+                           "Kernel ProcessStart must read command line from its validated handle");
+    ok &= require_before(pipeline,
+                         "edr_process_command_line_query_live(process, br->cmdline",
+                         "CloseHandle(process);\n  br->process_start_key = live.process_start_key;",
+                         "same-generation command line must be read before closing the validated handle");
+    ok &= require_contains(pipeline, "live_same_generation_unavailable",
+                           "failed live command-line queries must remain explicit and source-only");
     ok &= require_before(pipeline, "(void)enrich_process_token_identity(&br);",
                          "switch (edr_process_coalescer_submit",
                          "short-lived target token identity must be captured before the 4688 wait");
@@ -295,6 +304,11 @@ int main(void) {
                          "basic health must expose P0 acceptance counters");
   ok &= require_contains(agent, "\\\"evidence_cache\\\":{\\\"db_open\\\":%s,\\\"utilization_bps\\\":%u",
                          "basic health must expose evidence-cache utilization");
+  ok &= require_before(
+      agent,
+      "\\\"process_evidence_worker\\\":{\\\"slots_used\\\":%u,\\\"capacity\\\":%u",
+      "\\\"sensor_health\\\":{",
+      "basic P0 acceptance health must expose evidence-worker cache occupancy and reuse metrics");
   ok &= require_contains(agent, "\\\"retry_pending\\\":%llu",
                          "basic health must expose restart-durable source-only backlog");
   ok &= require_contains(process_cache, "pt_get_at_locked",

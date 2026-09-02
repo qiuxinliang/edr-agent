@@ -57,6 +57,7 @@ static int same_correlation_window(const EdrBehaviorRecord *a,
                                    const EdrBehaviorRecord *b) {
   uint64_t at, bt, delta;
   if (!a || !b || !a->pid || a->pid != b->pid ||
+      !a->ppid || !b->ppid || a->ppid != b->ppid ||
       !record_path(a)[0] || !record_path(b)[0] ||
       !same_ci(record_path(a), record_path(b))) {
     return 0;
@@ -85,7 +86,22 @@ static int security_follows_kernel(const EdrBehaviorRecord *kernel,
 }
 
 static int record_has_correlation_fields(const EdrBehaviorRecord *record) {
-  return record && record->pid && record_path(record)[0] && record->event_time_ns > 0;
+  return record && record->pid && record->ppid && record_path(record)[0] &&
+         record->event_time_ns > 0;
+}
+
+/* A negatively-skewed or multiply-matching 4688 is never safe enrichment.
+ * It also must not revoke a Kernel-Process record that already obtained every
+ * 4688-owned mandatory field from the exact StartKey/FILETIME-bound process
+ * and its cached parent generation. */
+static int kernel_independent_of_4688(const EdrBehaviorRecord *record) {
+  return record && !record->is_security_4688 && record->pid && record->ppid &&
+         record->process_start_key && record->process_creation_filetime_100ns &&
+         record->process_name[0] && record_path(record)[0] && record->cmdline[0] &&
+         strcmp(record->command_line_origin, "live_same_generation") == 0 &&
+         record->parent_path[0] && record->parent_creation_time[0] &&
+         (record->username[0] || record->user_sid[0]) &&
+         strcmp(record->identity_quality, "token_sid") == 0;
 }
 
 static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *security) {
@@ -162,6 +178,7 @@ static EdrProcessCoalesceResult submit_kernel(const EdrBehaviorRecord *record,
   EdrProcessCoalesceSlot *free_slot;
   uint32_t security_matches = 0u;
   int conflict = 0;
+  int rejected_enrichment = 0;
   int stale = 0;
   int duplicate_tombstone = 0;
 
@@ -200,8 +217,10 @@ static EdrProcessCoalesceResult submit_kernel(const EdrBehaviorRecord *record,
         /* A tombstone is still a raw generation in the correlation window.
          * Mark the incoming B as permanently ambiguous now, before A's
          * delayed 4688 can arrive after the tombstone deadline. */
-        if (!slot->tombstone) mark_kernel_ambiguity(slot);
-        conflict = 1;
+        if (!slot->tombstone && !kernel_independent_of_4688(&slot->kernel)) {
+          mark_kernel_ambiguity(slot);
+        }
+        if (!kernel_independent_of_4688(record)) conflict = 1;
       }
     }
     if (!slot->have_kernel && slot->have_security &&
@@ -212,8 +231,11 @@ static EdrProcessCoalesceResult submit_kernel(const EdrBehaviorRecord *record,
       } else {
         /* Security may arrive before kernel delivery, but its recorded event
          * time may not predate the raw ProcessStart it enriches.  Preserve it
-         * as source-only and permanently reject the incoming generation. */
-        conflict = 1;
+         * as source-only. Exact live command/token/parent evidence remains
+         * independently evaluable and is not downgraded by this advisory
+         * record. */
+        if (kernel_independent_of_4688(record)) rejected_enrichment = 1;
+        else conflict = 1;
       }
     }
   }
@@ -226,8 +248,12 @@ static EdrProcessCoalesceResult submit_kernel(const EdrBehaviorRecord *record,
     coalescer_unlock();
     return EDR_PROCESS_COALESCE_PASS;
   }
-  if (security_matches > 1u) conflict = 1;
+  if (security_matches > 1u) {
+    if (kernel_independent_of_4688(record)) rejected_enrichment = 1;
+    else conflict = 1;
+  }
   if (conflict) s_metrics.ambiguous_rejects++;
+  else if (rejected_enrichment) s_metrics.ambiguous_rejects++;
   if (stale) s_metrics.stale_rejects++;
   free_slot = security_matches == 1u && !conflict ? security_match : reserve_slot();
   if (!free_slot) {
@@ -277,9 +303,9 @@ static EdrProcessCoalesceResult submit_security(const EdrBehaviorRecord *record,
         kernel_matches++;
       } else if (!slot->tombstone) {
         /* The apparent 4688 predates this raw StartKey.  It could be a
-         * delayed prior PID generation, so this generation is permanently
-         * source-only even if a later token query happens to succeed. */
-        mark_kernel_ambiguity(slot);
+         * delayed prior PID generation. Reject the advisory record without
+         * revoking exact same-generation command/token/parent evidence. */
+        if (!kernel_independent_of_4688(&slot->kernel)) mark_kernel_ambiguity(slot);
         direction_conflict = 1;
       }
     }
@@ -312,7 +338,8 @@ static EdrProcessCoalesceResult submit_security(const EdrBehaviorRecord *record,
     for (uint32_t i = 0u; i < EDR_PROCESS_COALESCE_SLOTS; ++i) {
       EdrProcessCoalesceSlot *slot = &s_slots[i];
       if (slot->occupied && !slot->tombstone && slot->have_kernel &&
-          same_correlation_window(&slot->kernel, record)) mark_kernel_ambiguity(slot);
+          same_correlation_window(&slot->kernel, record) &&
+          !kernel_independent_of_4688(&slot->kernel)) mark_kernel_ambiguity(slot);
     }
     s_metrics.ambiguous_rejects++;
     coalescer_unlock();
