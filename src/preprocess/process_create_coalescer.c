@@ -246,7 +246,11 @@ static EdrProcessCoalesceResult submit_kernel(const EdrBehaviorRecord *record,
   if (duplicate_tombstone) {
     s_metrics.stale_rejects++;
     coalescer_unlock();
-    return EDR_PROCESS_COALESCE_PASS;
+    /* HOLD also means consumed: the raw generation already emitted and the
+     * tombstone proves this is not a new process observation.  PASS would
+     * send the duplicate through process_one_record and create a second
+     * endpoint event for the same generation. */
+    return EDR_PROCESS_COALESCE_HOLD;
   }
   if (security_matches > 1u) {
     if (kernel_independent_of_4688(record)) rejected_enrichment = 1;
@@ -325,7 +329,7 @@ static EdrProcessCoalesceResult submit_security(const EdrBehaviorRecord *record,
      * late 4688 into a fresh process observation. */
     s_metrics.stale_rejects++;
     coalescer_unlock();
-    return EDR_PROCESS_COALESCE_PASS;
+    return EDR_PROCESS_COALESCE_HOLD;
   }
   if (kernel_matches == 1u && !kernel_match->ambiguous) {
     kernel_match->security = *record;

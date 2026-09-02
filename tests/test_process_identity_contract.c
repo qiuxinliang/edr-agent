@@ -238,6 +238,11 @@ int main(void) {
     ok &= require_before(pipeline, "(void)enrich_process_token_identity(&br);",
                          "switch (edr_process_coalescer_submit",
                          "short-lived target token identity must be captured before the 4688 wait");
+    ok &= require_contains(
+        pipeline,
+        "not_evaluable_reason && p0_process_create_candidate(&br) &&\n"
+        "        !edr_p0_rule_ir_br_matches_any(&br)",
+        "a complete authenticated-IR match must not be suppressed by unrelated short-lived-process enrichment loss");
     ok &= require_contains(pipeline, "LookupAccountSidA",
                            "token fallback must retain username and domain when Windows resolves the SID");
     ok &= require_contains(pipeline, "parent_creation_time",

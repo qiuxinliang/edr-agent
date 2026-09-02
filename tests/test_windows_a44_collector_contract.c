@@ -276,6 +276,13 @@ int main(void) {
                          "FileKey resolver must surface an attribution-failure reason");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_stage(\n        event_record, timestamp_ns, file_read_key",
                          "unresolved FileReads must stage durable metadata evidence instead of dropping");
+  ok &= require_before(
+      collector,
+      "memcpy(slot.data, \"ETW1\\n\", sizeof(\"ETW1\\n\") - 1u);",
+      "edr_collector_slot_append_kv(&slot, \"collector_event_id\", event_id)",
+      "synthetic FileRead gate records must carry the ETW1 header before metadata fields");
+  ok &= require_contains(collector, "slot.size = (uint32_t)(sizeof(\"ETW1\\n\") - 1u);",
+                         "synthetic FileRead gate records must expose their ETW1 header length");
   ok &= require_contains(
       collector,
       "edr_sha256_hex((const uint8_t *)canonical_path, strlen(canonical_path), path_sha256) != 0",

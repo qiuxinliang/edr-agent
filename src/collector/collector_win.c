@@ -2437,6 +2437,12 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   slot.type = EDR_EVENT_FILE_READ;
   slot.priority = 0u;
   slot.p0_critical = 1u;
+  /* Synthetic collector records must obey the same ETW1 wire contract as
+   * TDH-built slots.  Without the header, behavior_from_slot treats every
+   * collector_evidence_* member as absent, generates a different event_id,
+   * and the metadata gate can never receive its matching durable result. */
+  memcpy(slot.data, "ETW1\n", sizeof("ETW1\n") - 1u);
+  slot.size = (uint32_t)(sizeof("ETW1\n") - 1u);
   session_epoch = edr_collector_file_key_session_epoch();
   (void)edr_collector_event_process_start_key(record, &start_key);
   {

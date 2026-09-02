@@ -1156,7 +1156,16 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
   {
     const char *not_evaluable_reason = p0_process_create_not_evaluable_reason(&br);
-    if (not_evaluable_reason && p0_process_create_candidate(&br)) {
+    /* A rule whose complete predicate already matched the authenticated IR
+     * does not become unevaluable merely because unrelated enrichment (for
+     * example user, parent, or asynchronous artifact evidence) was lost when
+     * a short-lived process exited.  Preserve the missing-field provenance on
+     * the combined source+alert frame.  Records which only look interesting,
+     * but do not yet satisfy a rule, still take the durable source-only gate.
+     * Block/action authority remains independently fail-closed on an exact
+     * generation and action-authoritative file identity. */
+    if (not_evaluable_reason && p0_process_create_candidate(&br) &&
+        !edr_p0_rule_ir_br_matches_any(&br)) {
       p0_mark_not_evaluable(&br, not_evaluable_reason);
       edr_local_evidence_cache_record_behavior(&br);
       /* Required Windows P0 evidence is absent: retain a source-only,

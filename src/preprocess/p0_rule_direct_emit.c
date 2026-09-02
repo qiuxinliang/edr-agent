@@ -1086,6 +1086,7 @@ static int p0_ends_with_ci(const char *s, const char *suffix) {
 
 static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
   const char *name;
+  int complete_rule_match = 0;
   if (!br) {
     return 1;
   }
@@ -1128,15 +1129,26 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
     return 0;
   }
 #ifdef _WIN32
+  /* The authenticated IR is the authority for predicate completeness.  A
+   * short-lived process may exit before optional user/parent/cmd enrichment
+   * completes; if the active rule already matched without those fields, keep
+   * the detection and declare the missing evidence instead of suppressing it.
+   * This never authorizes enforcement, whose generation/file-identity gates
+   * are checked separately below the matcher. */
+  complete_rule_match = edr_p0_rule_ir_is_ready() &&
+                        edr_p0_rule_ir_br_matches_any(br);
   /* P0 path rules require a coalesced Windows process generation.  The
    * preprocess pipeline emits a durable source-only disposition when these
    * fields are unavailable; this guard also protects direct callers. */
-  if ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
-      !br->process_name[0] || !br->exe_path[0] || !br->cmdline[0] || br->ppid == 0u ||
-      !br->parent_path[0] || !br->parent_creation_time[0] ||
-      (!br->username[0] && !br->user_sid[0])) {
+  if (!complete_rule_match &&
+      ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
+       !br->process_name[0] || !br->exe_path[0] || !br->cmdline[0] || br->ppid == 0u ||
+       !br->parent_path[0] || !br->parent_creation_time[0] ||
+       (!br->username[0] && !br->user_sid[0]))) {
     return 0;
   }
+#else
+  (void)complete_rule_match;
 #endif
   if (br->pid == 0u) {
     return 0;

@@ -130,6 +130,12 @@ int main(void) {
                    strcmp(out.source_completeness, "COALESCED") == 0 &&
                    strcmp(out.user_sid, "S-1-5-21-target") == 0,
                "kernel to 4688 emits one target-subject correlation at deadline");
+    ok &= need(edr_process_coalescer_submit(&security, 1, WINDOW_NS + 30u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&kernel, 1, WINDOW_NS + 40u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 40u, &out) == 0,
+               "late 4688 and duplicate kernel callbacks are consumed by the emitted-generation tombstone");
   }
 
   /* Windows Security audit delivery was observed roughly two seconds after
