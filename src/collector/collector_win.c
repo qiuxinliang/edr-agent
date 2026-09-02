@@ -819,6 +819,7 @@ typedef enum {
 } EdrAgentSelfDropSource;
 
 static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSource source) {
+  int fuse_eligible = source != EDR_AGENT_SELF_DROP_DIRECT_PID;
   s_health.agent_self_suppressed++;
   /* Agent-owned activity is intentionally filtered before it reaches the
    * event bus.  It is not collector loss and must not inflate the commercial
@@ -840,7 +841,11 @@ static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSo
   default:
     break;
   }
-  edr_agent_self_note_suppressed(now_ns, 1);
+  /* The callback already discards the Agent's own PID before TDH parsing, so
+   * that expected volume is not a failure signal and must not keep the fuse
+   * permanently active. Only self activity discovered after the direct-PID
+   * boundary can justify the ancestry-cache fast path. */
+  edr_agent_self_note_suppressed(now_ns, fuse_eligible);
 }
 
 static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
@@ -2132,6 +2137,28 @@ static void edr_collector_file_key_cache_reset(void) {
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
 }
 
+/* A metadata event which cannot establish its FileKey must never leave an old
+ * binding available for a later reuse. Invalidate the known key, or the whole
+ * logical cache epoch when the key itself is unavailable. This preserves
+ * fail-closed attribution without turning metadata-only noise into a global
+ * FileRead capability outage. */
+static void edr_collector_file_key_cache_invalidate(uint64_t file_key) {
+  AcquireSRWLockExclusive(&s_file_key_cache_lock);
+  if (file_key == 0u) {
+    memset(s_file_key_cache, 0, sizeof(s_file_key_cache));
+    s_file_key_cache_next = 0u;
+    s_file_key_session_epoch++;
+    if (s_file_key_session_epoch == 0u) s_file_key_session_epoch = 1u;
+  } else {
+    for (size_t i = 0u; i < EDR_COLLECTOR_FILE_KEY_CACHE; ++i) {
+      if (s_file_key_cache[i].file_key == file_key) {
+        memset(&s_file_key_cache[i], 0, sizeof(s_file_key_cache[i]));
+      }
+    }
+  }
+  ReleaseSRWLockExclusive(&s_file_key_cache_lock);
+}
+
 static uint64_t edr_collector_file_key_session_epoch(void) {
   uint64_t epoch;
   AcquireSRWLockShared(&s_file_key_cache_lock);
@@ -2182,6 +2209,22 @@ static int edr_collector_file_read_p0_capability_healthy(void) {
   return healthy;
 }
 
+/* After an epoch reset the cache starts in DEGRADED because pre-existing
+ * handles have no NameCreate in the new session. One exact new-session
+ * NameCreate->Read binding proves the collector path is operational again;
+ * unresolved old handles remain source-only if they are observed later. */
+static void edr_collector_file_read_metadata_gate_note_resolved(void) {
+  AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
+      !s_file_read_metadata_gate.slot_valid) {
+    s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
+    s_file_read_metadata_gate.reason[0] = '\0';
+    s_health.file_read_p0_capability_healthy = 1;
+    s_health.file_read_p0_capability_reason[0] = '\0';
+  }
+  ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+}
+
 /* Kernel-File names are normally already DOS paths.  If the provider gives a
  * device namespace path, reuse the startup-only device map rather than doing
  * a callback-time QueryDosDevice. An unresolved path cannot be claimed as a
@@ -2190,15 +2233,21 @@ static int edr_collector_canonicalize_file_path(const char *raw, char *out, size
   int n;
   if (!raw || !raw[0] || !out || out_cap == 0u) return 0;
   if (edr_collector_starts_with_ci(raw, "\\Device\\HarddiskVolume")) {
+    const EdrCollectorDeviceMap *best = NULL;
+    size_t best_len = 0u;
     for (uint32_t i = 0u; i < s_device_map_count; ++i) {
       const EdrCollectorDeviceMap *map = &s_device_map[i];
-      if (!map->device_prefix[0] || !edr_collector_starts_with_ci(raw, map->device_prefix)) {
+      size_t prefix_len = strlen(map->device_prefix);
+      if (!map->device_prefix[0] || !edr_collector_starts_with_ci(raw, map->device_prefix) ||
+          (raw[prefix_len] != '\0' && raw[prefix_len] != '\\') || prefix_len <= best_len) {
         continue;
       }
-      n = snprintf(out, out_cap, "%s%s", map->drive, raw + strlen(map->device_prefix));
-      return n > 0 && (size_t)n < out_cap;
+      best = map;
+      best_len = prefix_len;
     }
-    return 0;
+    if (!best) return 0;
+    n = snprintf(out, out_cap, "%s%s", best->drive, raw + best_len);
+    return n > 0 && (size_t)n < out_cap;
   }
   if (edr_collector_starts_with_ci(raw, "\\??\\")) raw += 4u;
   else if (edr_collector_starts_with_ci(raw, "\\Global??\\")) raw += 10u;
@@ -2669,18 +2718,15 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     if (!edr_tdh_kernel_file_extract_name_binding((PEVENT_RECORD)record, &file_key, path,
                                                   sizeof(path))) {
       s_health.file_read_name_cache_misses++;
-      edr_collector_file_read_metadata_gate_stage(
-          record, event_ns, file_key, NULL,
-          EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+      /* This is a metadata-only NameCreate, not an attributed Read. A later
+       * Read for this FileKey retains its own source-only assertion; globally
+       * fusing here made ordinary provider schema noise permanent. */
+      edr_collector_file_key_cache_invalidate(file_key);
       return 1;
     }
     if (!edr_collector_canonicalize_file_path(path, canonical_path, sizeof(canonical_path))) {
-      /* The gate retains the original path only when it can canonicalize it;
-       * otherwise it latches FileRead P0 unavailable rather than binding an
-       * untrusted device namespace string. */
-      edr_collector_file_read_metadata_gate_stage(
-          record, event_ns, file_key, path,
-          EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+      s_health.file_read_name_cache_misses++;
+      edr_collector_file_key_cache_invalidate(file_key);
       return 1;
     }
     /* `full_admission_event_types` intentionally retains all FileRead events
@@ -2691,9 +2737,13 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     critical = edr_p0_rule_ir_file_read_path_may_match(canonical_path, NULL);
     (void)edr_collector_event_process_start_key(record, &process_start_key);
     if (!pid || !process_start_key) {
-      edr_collector_file_read_metadata_gate_stage(
-          record, event_ns, file_key, canonical_path,
-          EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
+      s_health.file_read_generation_unavailable++;
+      edr_collector_file_key_cache_invalidate(file_key);
+      if (critical) {
+        edr_collector_file_read_metadata_gate_stage(
+            record, event_ns, file_key, canonical_path,
+            EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
+      }
       return 1;
     }
     AcquireSRWLockExclusive(&s_file_key_cache_lock);
@@ -2759,9 +2809,8 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
       if (latest) latest->close_event_ns = event_ns;
       ReleaseSRWLockExclusive(&s_file_key_cache_lock);
     } else {
-      edr_collector_file_read_metadata_gate_stage(
-          record, event_ns, file_key, NULL,
-          EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+      s_health.file_read_name_cache_misses++;
+      edr_collector_file_key_cache_invalidate(0u);
     }
     return 1;
   }
@@ -2862,6 +2911,7 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
     return 0;
   }
   *out_file_key = file_key;
+  edr_collector_file_read_metadata_gate_note_resolved();
   return 1;
 }
 

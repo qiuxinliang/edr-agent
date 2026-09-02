@@ -119,8 +119,9 @@ int main(void) {
   char *agent = read_source(root, "src/core/agent.c");
   char *p0_rule_ir = read_source(root, "src/preprocess/p0_rule_ir.c");
   char *process_cache = read_source(root, "src/forensic/process_tree_cache.c");
+  char *evidence_worker = read_source(root, "src/preprocess/process_evidence_worker.c");
   if (!collector || !tdh || !direct_feed || !alert_emit || !agent || !p0_rule_ir ||
-      !process_cache) {
+      !process_cache || !evidence_worker) {
     free(collector);
     free(tdh);
     free(direct_feed);
@@ -128,6 +129,7 @@ int main(void) {
     free(agent);
     free(p0_rule_ir);
     free(process_cache);
+    free(evidence_worker);
     return 1;
   }
 
@@ -242,8 +244,15 @@ int main(void) {
                            "P0 parent matching must retain a parent generation timestamp");
     ok &= require_contains(pipeline, "missing_parent_generation",
                            "a missing parent generation must use the registered source-only reason");
-    ok &= require_contains(pipeline, "generation_unavailable",
-                           "cache misses must be marked as generation-unavailable, not live PID-resolved");
+    ok &= require_contains(pipeline, "p0_resolve_live_parent_generation",
+                           "a warmup-only parent must use exact live generation recovery");
+    ok &= require_contains(pipeline,
+                           "live.creation_filetime_100ns > child->process_creation_filetime_100ns",
+                           "a PID reused after child creation must be rejected as its parent");
+    ok &= require_contains(pipeline, "observed.QuadPart != live.creation_filetime_100ns",
+                           "live parent telemetry and GetProcessTimes must agree on one handle");
+    ok &= require_contains(pipeline, "live_parent_generation",
+                           "validated parent recovery must expose distinct provenance");
     ok &= require_absent(pipeline, "enrich_parent_info_by_pid(",
                            "P0 parent enrichment must not fall back to a PID-only live lookup");
     ok &= require_contains(pipeline, "edr_pt_cache_put_generation",
@@ -317,6 +326,16 @@ int main(void) {
                          "PID reuse must retain history for delayed child events");
   ok &= require_contains(process_cache, "Wall-clock observation\n   * is not the process creation generation",
                          "warmup wall-clock data must not masquerade as a creation generation");
+  ok &= require_contains(evidence_worker, "EDR_EVIDENCE_HASH_MAX_NS",
+                         "evidence hashing needs a budget independent of queue latency");
+  ok &= require_contains(evidence_worker, "EDR_EVIDENCE_QUEUE_MAX_NS",
+                         "queued evidence jobs need a bounded burst budget");
+  ok &= require_contains(evidence_worker, "EDR_EVIDENCE_STALL_NS",
+                         "worker stall detection must not reuse the caller wait budget");
+  ok &= require_contains(evidence_worker, "WTD_CACHE_ONLY_URL_RETRIEVAL",
+                         "WinVerifyTrust must not add certificate network latency to P0 preprocessing");
+  ok &= require_contains(evidence_worker, "Do not reopen the pathname here",
+                         "completed short-lived evidence must survive pathname cleanup");
 
   char *parent_enrichment = read_source(root, "src/preprocess/enrich_parent_info.c");
   if (!parent_enrichment) {
@@ -498,5 +517,6 @@ int main(void) {
   free(agent);
   free(p0_rule_ir);
   free(process_cache);
+  free(evidence_worker);
   return ok ? 0 : 1;
 }

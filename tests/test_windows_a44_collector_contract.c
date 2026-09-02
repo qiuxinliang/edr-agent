@@ -181,6 +181,16 @@ int main(void) {
                          "FileKey reuse must choose the matching newest event-time binding");
   ok &= require_contains(collector, "edr_collector_file_key_binding_exact",
                          "same-timestamp NameCreate delivery must compare the whole binding");
+  ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_note_resolved",
+                         "a complete post-reset FileKey binding must restore FileRead health");
+  ok &= require_contains(collector, "This is a metadata-only NameCreate, not an attributed Read",
+                         "metadata-only schema misses must not globally fuse FileRead");
+  ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(file_key)",
+                         "a malformed metadata binding must invalidate any reused FileKey");
+  ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(0u)",
+                         "an unidentifiable close must invalidate the logical FileKey epoch");
+  ok &= require_contains(collector, "raw[prefix_len] != '\\\\'",
+                         "device-volume mapping must enforce a path-component boundary");
   ok &= require_contains(collector, "entry->session_epoch != session_epoch",
                          "a FileKey binding must never cross a provider session");
   ok &= require_contains(collector, "read_start_key != entry->process_start_key",

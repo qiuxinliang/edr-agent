@@ -17,7 +17,12 @@
 
 #define EDR_EVIDENCE_SLOTS 32u
 #define EDR_EVIDENCE_MAX_BYTES (16ULL * 1024ULL * 1024ULL)
-#define EDR_EVIDENCE_MAX_NS (250ULL * 1000000ULL)
+#define EDR_EVIDENCE_HASH_MAX_NS (1000ULL * 1000000ULL)
+#define EDR_EVIDENCE_QUEUE_MAX_NS (5000ULL * 1000000ULL)
+#define EDR_EVIDENCE_STALL_NS (10000ULL * 1000000ULL)
+#ifndef WTD_CACHE_ONLY_URL_RETRIEVAL
+#define WTD_CACHE_ONLY_URL_RETRIEVAL 0x00001000u
+#endif
 typedef struct {
   char path[1024]; uint64_t generation; uint64_t queued_ns;
   char file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
@@ -74,7 +79,7 @@ void edr_process_evidence_test_set_synthetic_wvt_result(int enabled) {
 static int evidence_worker_stalled(uint64_t now) {
   LONGLONG started = InterlockedCompareExchange64(&s_active_started_ns, 0, 0);
   return started > 0 && now >= (uint64_t)started &&
-         now - (uint64_t)started >= EDR_EVIDENCE_MAX_NS;
+         now - (uint64_t)started >= EDR_EVIDENCE_STALL_NS;
 }
 
 static void evidence_mark_stalled(void) {
@@ -179,7 +184,8 @@ static int hash_file_same_handle(HANDLE file, uint64_t started,
     }
     if (read == 0u) break;
     total += read;
-    if (total > EDR_EVIDENCE_MAX_BYTES || edr_monotonic_ns() - started > EDR_EVIDENCE_MAX_NS) {
+    if (total > EDR_EVIDENCE_MAX_BYTES ||
+        edr_monotonic_ns() - started > EDR_EVIDENCE_HASH_MAX_NS) {
       strcpy(e->hash_reason, total > EDR_EVIDENCE_MAX_BYTES ? "file_size_limit" : "hash_deadline"); return 0;
     }
     edr_sha256_update(&ctx, buf, read);
@@ -268,7 +274,12 @@ static void verify_signature(const char *path, HANDLE file,
   fi.cbStruct=sizeof(fi); fi.pcwszFilePath=wide; fi.hFile=file;
   wd.cbStruct=sizeof(wd); wd.dwUIChoice=WTD_UI_NONE;
   wd.fdwRevocationChecks=WTD_REVOKE_WHOLECHAIN; wd.dwUnionChoice=WTD_CHOICE_FILE; wd.pFile=&fi;
-  wd.dwProvFlags=WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT; wd.dwStateAction=WTD_STATEACTION_VERIFY;
+  /* P0 preprocess must not inherit network latency from certificate URL
+   * retrieval. Cache-only chain/revocation evaluation is deterministic and
+   * its reduced freshness is reported explicitly in the evidence tuple. */
+  wd.dwProvFlags=WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+                 WTD_CACHE_ONLY_URL_RETRIEVAL;
+  wd.dwStateAction=WTD_STATEACTION_VERIFY;
 #ifdef EDR_PROCESS_EVIDENCE_TESTING
   if (s_test_wvt_path_hook.synthetic_wvt_result) {
     strcpy(e->revocation, "checked");
@@ -282,9 +293,11 @@ static void verify_signature(const char *path, HANDLE file,
   {
     LONG rc=WinVerifyTrust(NULL,&action,&wd);
     if (rc==ERROR_SUCCESS) {
-      strcpy(e->revocation,"checked");
+      strcpy(e->revocation,"cache_only");
       if (signature_subject_and_thumbprint_from_wvt(wd.hWVTStateData,e)) {
-        strcpy(e->signature_status,"verified"); strcpy(e->signature_quality,"verified_chain"); strcpy(e->signature_reason,"verified");
+        strcpy(e->signature_status,"verified");
+        strcpy(e->signature_quality,"verified_cache_chain");
+        strcpy(e->signature_reason,"verified_cache_only");
       } else {
         strcpy(e->signature_status,"unknown"); strcpy(e->signature_quality,"unknown"); strcpy(e->signature_reason,"signer_info_not_found");
       }
@@ -292,7 +305,7 @@ static void verify_signature(const char *path, HANDLE file,
     else {
       snprintf(e->signature_reason,sizeof(e->signature_reason),"winverifytrust_%08lx",(unsigned long)rc);
       if (rc == CERT_E_REVOKED || rc == CRYPT_E_REVOKED) strcpy(e->revocation,"revoked");
-      else strcpy(e->revocation,"attempted");
+      else strcpy(e->revocation,"cache_only_failed");
     }
     wd.dwStateAction=WTD_STATEACTION_CLOSE;
     (void)WinVerifyTrust(NULL,&action,&wd);
@@ -333,7 +346,7 @@ static DWORD WINAPI worker(void *unused) {
     snprintf(job.evidence.file_identity, sizeof(job.evidence.file_identity), "%s",
              job.file_identity);
     job.evidence.file_write_time=job.file_write_time;
-    if (now - job.queued_ns > EDR_EVIDENCE_MAX_NS) {
+    if (now - job.queued_ns > EDR_EVIDENCE_QUEUE_MAX_NS) {
       strcpy(job.evidence.hash_reason,"worker_deadline");
       strcpy(job.evidence.signature_reason,"worker_deadline");
     }
@@ -541,22 +554,16 @@ int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t n
 
 static int evidence_lookup_ready(const char *path, uint64_t generation, uint64_t now,
                                  EdrProcessEvidence *out) {
-  EdrProcessEvidence current;
   if (!path || !path[0] || !generation || !out) return 0;
-  memset(&current, 0, sizeof(current));
-  if (!edr_windows_file_identity_from_path(path, current.file_identity,
-                                           sizeof(current.file_identity),
-                                           &current.file_write_time)) {
-    strcpy(out->hash_reason, "file_identity_unavailable");
-    strcpy(out->signature_reason, "file_identity_unavailable");
-    return 0;
-  }
+  /* The result was captured and revalidated through the worker-owned handle.
+   * Do not reopen the pathname here: a short-lived process may already have
+   * deleted it, and a replacement pathname is not the owner of this
+   * process-generation snapshot. */
   AcquireSRWLockExclusive(&s_lock);
   for (uint32_t i = 0u; i < EDR_EVIDENCE_SLOTS; ++i) {
     EvidenceSlot *slot = &s_slots[i];
     if (slot->generation != generation || strcmp(slot->path, path) != 0) continue;
-    if (slot->ready && file_identity_equal(slot->file_identity, current.file_identity) &&
-        slot->file_write_time == current.file_write_time) {
+    if (slot->ready) {
       *out = slot->evidence;
       slot->last_used_ns = now;
       s_metrics.ready_hits++;

@@ -127,6 +127,8 @@ int main(void) {
   if (!collector) return 1;
   ok &= require_contains(collector, "return edr_agent_self_pid_seen(",
                          "self-noise fuse must be scoped to Agent-owned PIDs");
+  ok &= require_contains(collector, "source != EDR_AGENT_SELF_DROP_DIRECT_PID",
+                         "expected direct Agent PID drops must not trip the self-noise fuse");
   ok &= require_contains(collector, "s_health.etw_prefilter_dropped++",
                          "uninteresting ETW schemas must be observable before payload parsing");
   ok &= require_range_absent(collector, "static void edr_agent_self_count_drop_source",

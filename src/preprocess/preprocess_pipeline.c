@@ -444,6 +444,86 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   return 1;
 }
 
+static const char *p0_process_path_basename(const char *path) {
+  const char *base = path;
+  if (!path) return "";
+  for (const char *cursor = path; *cursor; ++cursor) {
+    if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
+  }
+  return base;
+}
+
+/* A parent which predates Agent startup has only a Toolhelp PID/name warmup
+ * entry.  Recover its generation from one live process handle, never from the
+ * PID alone: telemetry StartKey, telemetry/CreateProcess FILETIME and the
+ * queried image path all belong to that handle.  A replacement which reused
+ * the PID after the child was created is rejected by the creation-time order. */
+static int p0_resolve_live_parent_generation(const EdrBehaviorRecord *child,
+                                             ProcessTreeEntry *out_parent) {
+  HANDLE process = NULL;
+  FILETIME created, exited, kernel, user;
+  ULARGE_INTEGER observed;
+  EdrLiveProcessGeneration live;
+  char path[EDR_BR_STR_LONG];
+  char cmdline[EDR_BR_STR_LONG];
+  char reason[64];
+  uint64_t parent_creation_ns;
+  uint64_t child_event_ns;
+  if (out_parent) memset(out_parent, 0, sizeof(*out_parent));
+  if (!child || !out_parent || child->type != EDR_EVENT_PROCESS_CREATE ||
+      child->ppid == 0u || child->process_creation_filetime_100ns == 0u) {
+    return 0;
+  }
+  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, child->ppid);
+  if (!process) return 0;
+  memset(&live, 0, sizeof(live));
+  reason[0] = '\0';
+  if (!edr_process_generation_query_live(process, &live, reason, sizeof(reason)) ||
+      live.pid != child->ppid || live.process_start_key == 0u ||
+      live.creation_filetime_100ns == 0u ||
+      !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    CloseHandle(process);
+    return 0;
+  }
+  observed.LowPart = created.dwLowDateTime;
+  observed.HighPart = created.dwHighDateTime;
+  if (observed.QuadPart != live.creation_filetime_100ns ||
+      live.creation_filetime_100ns > child->process_creation_filetime_100ns ||
+      !edr_windows_process_image_path_utf8(process, path, sizeof(path)) || !path[0]) {
+    CloseHandle(process);
+    return 0;
+  }
+  parent_creation_ns = filetime_100ns_to_unix_ns(live.creation_filetime_100ns);
+  child_event_ns = child->event_time_ns > 0 ? (uint64_t)child->event_time_ns : 0u;
+  if (parent_creation_ns == 0u || child_event_ns == 0u ||
+      parent_creation_ns > child_event_ns + 100000000ULL) {
+    CloseHandle(process);
+    return 0;
+  }
+  cmdline[0] = '\0';
+  reason[0] = '\0';
+  (void)edr_process_command_line_query_live(process, cmdline, sizeof(cmdline),
+                                            reason, sizeof(reason));
+  CloseHandle(process);
+  memset(out_parent, 0, sizeof(*out_parent));
+  out_parent->pid = child->ppid;
+  out_parent->process_start_key = live.process_start_key;
+  out_parent->creation_filetime_100ns = live.creation_filetime_100ns;
+  out_parent->start_time_ns = parent_creation_ns;
+  out_parent->last_seen_ns = child_event_ns;
+  snprintf(out_parent->process_name, sizeof(out_parent->process_name), "%s",
+           p0_process_path_basename(path));
+  snprintf(out_parent->cmdline, sizeof(out_parent->cmdline), "%s", cmdline);
+  snprintf(out_parent->exe_path, sizeof(out_parent->exe_path), "%s", path);
+  (void)edr_pt_cache_put_generation(
+      child->ppid, 0u, p0_process_path_basename(path), cmdline, path, NULL,
+      parent_creation_ns, live.process_start_key, live.creation_filetime_100ns);
+  /* The current record is already bound by the validated live handle. Cache
+   * pressure or an older same-generation timestamp must not erase that fact;
+   * insertion is best-effort only for later descendants. */
+  return 1;
+}
+
 static int enrich_process_token_identity(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
   HANDLE token = NULL;
@@ -762,9 +842,18 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   }
   if (br->ppid > 0u) {
     ProcessTreeEntry parent;
-    if (edr_pt_cache_snapshot_at(br->ppid,
-                                 (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0),
-                                 &parent) == 0 &&
+    int parent_from_live = 0;
+    int parent_snapshot = edr_pt_cache_snapshot_at(
+        br->ppid, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), &parent);
+#ifdef _WIN32
+    if ((parent_snapshot != 0 || parent.process_start_key == 0u ||
+         parent.creation_filetime_100ns == 0u || parent.start_time_ns == 0u) &&
+        p0_resolve_live_parent_generation(br, &parent)) {
+      parent_snapshot = 0;
+      parent_from_live = 1;
+    }
+#endif
+    if (parent_snapshot == 0 &&
         parent.process_start_key != 0u &&
         parent.creation_filetime_100ns != 0u && parent.start_time_ns != 0u) {
       /* The historical cache, not raw 4688 fields or a current PID lookup,
@@ -775,7 +864,8 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
       format_record_time_ns((int64_t)filetime_100ns_to_unix_ns(
                                 parent.creation_filetime_100ns), br->parent_creation_time,
                             sizeof(br->parent_creation_time));
-      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s", "process_tree_cache");
+      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s",
+               parent_from_live ? "live_parent_generation" : "process_tree_cache");
       snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
                parent.process_name[0] && parent.exe_path[0] && br->parent_creation_time[0] ?
                    "RESOLVED" : "NOT_EVALUABLE");
@@ -929,7 +1019,7 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
   evidence = requested;
   evidence_ready = edr_process_evidence_wait(br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
                                              generation, edr_monotonic_ns(),
-                                             250ULL * 1000000ULL, &evidence);
+                                             1000ULL * 1000000ULL, &evidence);
   if (!evidence_ready && !evidence.file_identity[0]) {
     snprintf(evidence.file_identity, sizeof(evidence.file_identity), "%s",
              requested.file_identity);

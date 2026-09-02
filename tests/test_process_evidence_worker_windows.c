@@ -141,6 +141,28 @@ static void test_missing_identity_stays_unavailable(void) {
   assert(strcmp(evidence.signature_reason, "file_identity_unavailable") == 0);
 }
 
+static void test_ready_snapshot_survives_short_lived_path_cleanup(void) {
+  char a_path[MAX_PATH], b_path[MAX_PATH];
+  EdrProcessEvidence request, first, cached;
+  make_fixture_paths(a_path, b_path);
+  assert(edr_process_evidence_worker_start());
+  edr_process_evidence_test_set_synthetic_wvt_result(1);
+  memset(&request, 0, sizeof(request));
+  assert(edr_process_evidence_request(a_path, 2001u, edr_monotonic_ns(), &request) == 0);
+  memset(&first, 0, sizeof(first));
+  assert(edr_process_evidence_wait(a_path, 2001u, edr_monotonic_ns(),
+                                   1000ULL * 1000000ULL, &first));
+  assert(first.sha256[0] != '\0');
+  assert(DeleteFileA(a_path));
+  memset(&cached, 0, sizeof(cached));
+  assert(edr_process_evidence_wait(a_path, 2001u, edr_monotonic_ns(),
+                                   50ULL * 1000000ULL, &cached));
+  assert(strcmp(cached.file_identity, first.file_identity) == 0);
+  assert(strcmp(cached.sha256, first.sha256) == 0);
+  edr_process_evidence_worker_stop();
+  (void)DeleteFileA(b_path);
+}
+
 static void test_share_and_reparse_denial_stay_not_evaluable(void) {
   char a_path[MAX_PATH], b_path[MAX_PATH];
   void *owner = NULL;
@@ -176,6 +198,7 @@ static void test_share_and_reparse_denial_stay_not_evaluable(void) {
 int main(void) {
   test_held_owner_denies_modify_restore_and_swap();
   test_injected_wvt_path_swaps_never_publish_b();
+  test_ready_snapshot_survives_short_lived_path_cleanup();
   test_missing_identity_stays_unavailable();
   test_share_and_reparse_denial_stay_not_evaluable();
   puts("process evidence worker Windows TOCTOU contract: ok");
