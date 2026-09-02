@@ -1060,6 +1060,7 @@ $report = [ordered]@{
 $resumeCommitted = $false
 $resumeRollback = $false
 $resumeHealthObservation = $false
+$resumeHealthObservationPassed = $false
 $priorLastStatus = ''
 
 try {
@@ -1150,6 +1151,12 @@ try {
     $binaryCommitDetected = $currentMatchesCandidate -or ([bool]$prior.replacement_committed -and -not $currentMatchesBackup)
     $resumeHealthObservation = [string]$prior.stage -eq 'health_observation' -and
       [UInt64]$journal['health_observation_deadline_unix_ms'] -gt 0
+    $expectedRecoveredHealthStatus = if ($Operation -eq 'rollback') {
+      'rollback_health_check'
+    } else {
+      'health_check'
+    }
+    $resumeHealthObservationPassed = $priorLastStatus -eq $expectedRecoveredHealthStatus
     $resumeRollback = [string]$prior.stage -like 'rollback_*' -or
       ($currentMatchesBackup -and $replacementMayHaveStarted) -or
       ($runtimeCommitDetected -and -not $binaryCommitDetected)
@@ -1192,6 +1199,20 @@ try {
 	}
     Set-UpdateStage -Stage 'resume_after_commit'
     $running = @(Get-AgentProcesses -ExecutablePath $currentPath).Count -gt 0
+    if ($resumeHealthObservationPassed) {
+      if (-not $running) {
+        throw 'Agent exited after the durable local health observation passed'
+      }
+      # health_check is a durable terminal platform transition.  A crash
+      # between that event and the local completed checkpoint must finish
+      # idempotently; reopening observation would emit restarting after
+      # health_check and create an invalid backward state transition.
+      $report['installed_sha256'] = Get-Sha256 -Path $currentPath
+      $report['status'] = 'succeeded'
+      Set-UpdateStage -Stage 'completed' -Status 'succeeded'
+      Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+      return
+    }
     if ($resumeHealthObservation -and -not $running) {
       throw 'Agent exited while recovering the local health observation window'
     }

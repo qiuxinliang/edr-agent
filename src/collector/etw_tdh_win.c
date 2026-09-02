@@ -398,6 +398,16 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
     out_event->parent_pid = edr_parse_u32_ascii(tmp);
   }
   g = &rec->EventHeader.ProviderId;
+  if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
+    static const PCWSTR process_key_names[] = {
+        L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
+    for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {
+      if (edr_prop_u64(rec, process_key_names[i], &out_event->process_start_key) ==
+          ERROR_SUCCESS) {
+        break;
+      }
+    }
+  }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     (void)edr_prop_first_utf8(rec, file_try, sizeof(file_try) / sizeof(file_try[0]),
                               out_event->path, sizeof(out_event->path));

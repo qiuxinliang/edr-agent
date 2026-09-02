@@ -227,8 +227,10 @@ static SRWLOCK s_file_read_metadata_gate_lock = SRWLOCK_INIT;
 static EdrCollectorDeviceMap s_device_map[EDR_COLLECTOR_DEVICE_MAP];
 static uint32_t s_device_map_count;
 static uint32_t s_agent_self_pid_cache[EDR_AGENT_SELF_PID_CACHE];
+static uint64_t s_agent_self_start_key_cache[EDR_AGENT_SELF_PID_CACHE];
 static uint64_t s_agent_self_seen_ns[EDR_AGENT_SELF_PID_CACHE];
 static uint32_t s_agent_self_pid_next;
+static SRWLOCK s_agent_self_pid_cache_lock = SRWLOCK_INIT;
 static uint32_t s_policy_canary_pid_cache[EDR_POLICY_CANARY_PID_CACHE];
 static uint64_t s_policy_canary_seen_ns[EDR_POLICY_CANARY_PID_CACHE];
 static uint32_t s_policy_canary_pid_next;
@@ -266,6 +268,7 @@ static int edr_collector_starts_with_ci(const char *s, const char *prefix);
 static int edr_collector_equal_ci(const char *a, const char *b);
 static int edr_collector_event_process_start_key(const EVENT_RECORD *record,
                                                  uint64_t *out_start_key);
+static void edr_collector_file_read_metadata_gate_session_starting(void);
 static void edr_collector_file_read_metadata_gate_session_reset(void);
 static void edr_collector_file_read_metadata_gate_start_succeeded(void);
 
@@ -818,8 +821,8 @@ typedef enum {
   EDR_AGENT_SELF_DROP_INTEREST = 4,
 } EdrAgentSelfDropSource;
 
-static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSource source) {
-  int fuse_eligible = source != EDR_AGENT_SELF_DROP_DIRECT_PID;
+static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSource source,
+                                             int fuse_eligible) {
   s_health.agent_self_suppressed++;
   /* Agent-owned activity is intentionally filtered before it reaches the
    * event bus.  It is not collector loss and must not inflate the commercial
@@ -841,48 +844,67 @@ static void edr_agent_self_count_drop_source(uint64_t now_ns, EdrAgentSelfDropSo
   default:
     break;
   }
-  /* The callback already discards the Agent's own PID before TDH parsing, so
-   * that expected volume is not a failure signal and must not keep the fuse
-   * permanently active. Only self activity discovered after the direct-PID
-   * boundary can justify the ancestry-cache fast path. */
+  /* Expected repeated events from an already-known Agent generation are not
+   * a failure signal.  Only discovery of a new, exact descendant generation
+   * can move the fuse; PID-only observations fail open because Windows can
+   * reuse a PID while the cache entry is still inside its TTL. */
   edr_agent_self_note_suppressed(now_ns, fuse_eligible);
 }
 
-static void edr_agent_self_mark_pid(uint32_t pid, uint64_t now_ns) {
-  if (pid == 0u) {
-    return;
+static int edr_agent_self_mark_pid(uint32_t pid, uint64_t process_start_key,
+                                   uint64_t now_ns) {
+  int newly_discovered = 0;
+  if (pid == 0u || process_start_key == 0u) {
+    return 0;
   }
+  AcquireSRWLockExclusive(&s_agent_self_pid_cache_lock);
   for (size_t i = 0; i < EDR_AGENT_SELF_PID_CACHE; i++) {
-    if (s_agent_self_pid_cache[i] == pid) {
+    if (s_agent_self_pid_cache[i] == pid &&
+        s_agent_self_start_key_cache[i] == process_start_key) {
       s_agent_self_seen_ns[i] = now_ns;
-      return;
+      ReleaseSRWLockExclusive(&s_agent_self_pid_cache_lock);
+      return 0;
+    }
+    if (s_agent_self_pid_cache[i] == pid) {
+      s_agent_self_start_key_cache[i] = process_start_key;
+      s_agent_self_seen_ns[i] = now_ns;
+      newly_discovered = 1;
+      ReleaseSRWLockExclusive(&s_agent_self_pid_cache_lock);
+      return newly_discovered;
     }
   }
   uint32_t idx = s_agent_self_pid_next++ % EDR_AGENT_SELF_PID_CACHE;
   s_agent_self_pid_cache[idx] = pid;
+  s_agent_self_start_key_cache[idx] = process_start_key;
   s_agent_self_seen_ns[idx] = now_ns;
+  newly_discovered = 1;
+  ReleaseSRWLockExclusive(&s_agent_self_pid_cache_lock);
+  return newly_discovered;
 }
 
-static int edr_agent_self_pid_seen(uint32_t pid, uint64_t now_ns) {
+static int edr_agent_self_pid_seen(uint32_t pid, uint64_t process_start_key,
+                                   uint64_t now_ns) {
   uint64_t ttl = edr_agent_self_ttl_ns();
-  if (pid == 0u) {
+  int seen = 0;
+  if (pid == 0u || process_start_key == 0u) {
     return 0;
   }
   if (pid == s_agent_pid) {
     return 1;
   }
+  AcquireSRWLockShared(&s_agent_self_pid_cache_lock);
   for (size_t i = 0; i < EDR_AGENT_SELF_PID_CACHE; i++) {
-    if (s_agent_self_pid_cache[i] != pid) {
+    if (s_agent_self_pid_cache[i] != pid ||
+        s_agent_self_start_key_cache[i] != process_start_key) {
       continue;
     }
     if (now_ns >= s_agent_self_seen_ns[i] && now_ns - s_agent_self_seen_ns[i] <= ttl) {
-      return 1;
+      seen = 1;
     }
-    s_agent_self_pid_cache[i] = 0u;
-    s_agent_self_seen_ns[i] = 0u;
-    return 0;
+    break;
   }
-  return 0;
+  ReleaseSRWLockShared(&s_agent_self_pid_cache_lock);
+  return seen;
 }
 
 static int edr_agent_self_text_marker(const char *s) {
@@ -981,7 +1003,9 @@ static uint32_t edr_parse_pid_text(const char *s) {
   return (uint32_t)strtoul(s, NULL, 0);
 }
 
-static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
+static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev,
+                                            int *out_new_generation) {
+  if (out_new_generation) *out_new_generation = 0;
   if (!ev || edr_collector_keep_agent_self_events()) {
     return 0;
   }
@@ -995,14 +1019,21 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
     edr_policy_canary_mark_pid(ev->pid, now);
     return 0;
   }
-  if (ev->pid == s_agent_pid || ev->parent_pid == s_agent_pid ||
-      edr_agent_self_pid_seen(ev->pid, now) || edr_agent_self_pid_seen(ev->parent_pid, now)) {
-    edr_agent_self_mark_pid(ev->pid, now);
+  if (ev->pid == s_agent_pid) {
+    return 1;
+  }
+  if (ev->parent_pid == s_agent_pid ||
+      edr_agent_self_pid_seen(ev->pid, ev->process_start_key, now)) {
+    int newly_discovered =
+        edr_agent_self_mark_pid(ev->pid, ev->process_start_key, now);
+    if (out_new_generation) *out_new_generation = newly_discovered;
     return 1;
   }
   if (edr_agent_self_process_name(ev->process_name) || edr_agent_self_text_marker(ev->path) ||
       edr_agent_self_text_marker(ev->registry_path)) {
-    edr_agent_self_mark_pid(ev->pid, now);
+    int newly_discovered =
+        edr_agent_self_mark_pid(ev->pid, ev->process_start_key, now);
+    if (out_new_generation) *out_new_generation = newly_discovered;
     return 1;
   }
   return 0;
@@ -1010,7 +1041,9 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
 
 static int edr_agent_self_suppress_security_event(const char *img, const char *cmd,
                                                   const char *epid, const char *ppid,
-                                                  const char *parent_img) {
+                                                  const char *parent_img,
+                                                  int *out_new_generation) {
+  if (out_new_generation) *out_new_generation = 0;
   if (edr_collector_keep_agent_self_events()) {
     return 0;
   }
@@ -1025,21 +1058,23 @@ static int edr_agent_self_suppress_security_event(const char *img, const char *c
     edr_policy_canary_mark_pid(pid, now);
     return 0;
   }
-  if (pid == s_agent_pid || parent_pid == s_agent_pid ||
-      edr_agent_self_pid_seen(pid, now) || edr_agent_self_pid_seen(parent_pid, now)) {
-    edr_agent_self_mark_pid(pid, now);
+  /* Security 4688 does not expose a trustworthy ProcessStartKey.  Direct
+   * Agent parent/name markers may suppress this one duplicate observation,
+   * but must not seed a PID-only descendant cache entry. */
+  if (pid == s_agent_pid || parent_pid == s_agent_pid) {
     return 1;
   }
   if (edr_agent_self_process_name(img) || edr_agent_self_process_name(parent_img) ||
       edr_agent_self_text_marker(img) || edr_agent_self_text_marker(cmd) ||
       edr_agent_self_text_marker(parent_img)) {
-    edr_agent_self_mark_pid(pid, now);
     return 1;
   }
   return 0;
 }
 
-static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
+static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br,
+                                          int *out_new_generation) {
+  if (out_new_generation) *out_new_generation = 0;
   if (!br || edr_collector_keep_agent_self_events()) {
     return 0;
   }
@@ -1052,15 +1087,22 @@ static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
     edr_policy_canary_mark_pid(br->pid, now);
     return 0;
   }
-  if (br->pid == s_agent_pid || br->ppid == s_agent_pid ||
-      edr_agent_self_pid_seen(br->pid, now) || edr_agent_self_pid_seen(br->ppid, now)) {
-    edr_agent_self_mark_pid(br->pid, now);
+  if (br->pid == s_agent_pid) {
+    return 1;
+  }
+  if (br->ppid == s_agent_pid ||
+      edr_agent_self_pid_seen(br->pid, br->process_start_key, now)) {
+    int newly_discovered =
+        edr_agent_self_mark_pid(br->pid, br->process_start_key, now);
+    if (out_new_generation) *out_new_generation = newly_discovered;
     return 1;
   }
   if (edr_agent_self_process_name(br->process_name) || edr_agent_self_text_marker(br->exe_path) ||
       edr_agent_self_text_marker(br->cmdline) || edr_agent_self_text_marker(br->file_path) ||
       edr_agent_self_text_marker(br->reg_key_path) || edr_agent_self_text_marker(br->network_aux_path)) {
-    edr_agent_self_mark_pid(br->pid, now);
+    int newly_discovered =
+        edr_agent_self_mark_pid(br->pid, br->process_start_key, now);
+    if (out_new_generation) *out_new_generation = newly_discovered;
     return 1;
   }
   return 0;
@@ -1079,8 +1121,14 @@ static int edr_agent_self_fuse_should_drop_event(PEVENT_RECORD event_record,
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 && op == 1u) {
     return 0;
   }
-  return edr_agent_self_pid_seen((uint32_t)event_record->EventHeader.ProcessId,
-                                 now_ns);
+  {
+    uint64_t process_start_key = 0u;
+    if (!edr_collector_event_process_start_key(event_record, &process_start_key)) {
+      return 0;
+    }
+    return edr_agent_self_pid_seen((uint32_t)event_record->EventHeader.ProcessId,
+                                   process_start_key, now_ns);
+  }
 }
 
 static int edr_ends_with_ci(const char *s, const char *suffix) {
@@ -1924,9 +1972,14 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   (void)edr_xml_get_data_utf8(xml, "MandatoryLabel", integrity, sizeof(integrity));
   (void)edr_xml_get_data_utf8(xml, "TokenElevationType", token_elev, sizeof(token_elev));
   free(xml);
-  if (edr_agent_self_suppress_security_event(img, cmd, epid, ppid, parent_img)) {
-    edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_SECURITY_EVENT);
-    return ERROR_SUCCESS;
+  {
+    int new_self_generation = 0;
+    if (edr_agent_self_suppress_security_event(img, cmd, epid, ppid, parent_img,
+                                               &new_self_generation)) {
+      edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_SECURITY_EVENT,
+                                       new_self_generation);
+      return ERROR_SUCCESS;
+    }
   }
 
   EdrEventSlot slot;
@@ -2207,6 +2260,39 @@ static int edr_collector_file_read_p0_capability_healthy(void) {
             s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED;
   ReleaseSRWLockShared(&s_file_read_metadata_gate_lock);
   return healthy;
+}
+
+/* Every provider epoch starts without names for handles opened before that
+ * epoch.  DEGRADED is therefore the truthful initial state as well as the
+ * post-restart state: exact new-session NameCreate->Read bindings may pass,
+ * while an unresolved old handle is retained through the source-only gate.
+ * If a previous failed epoch already requires reset, the freshly cleared
+ * FileKey map is the observed reset; only a ready OpenTrace consumer may
+ * advance that terminal state in start_succeeded(). */
+static void edr_collector_file_read_metadata_gate_session_starting(void) {
+  AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  if (s_file_read_metadata_gate.slot_valid) {
+    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+    return;
+  }
+  if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY &&
+      s_file_read_metadata_gate.requires_session_reset) {
+    s_file_read_metadata_gate.session_reset_observed = 1u;
+    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+    return;
+  }
+  s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_DEGRADED;
+  s_file_read_metadata_gate.requires_session_reset = 0u;
+  s_file_read_metadata_gate.session_reset_observed = 0u;
+  s_file_read_metadata_gate.resume_degraded = 0u;
+  s_file_read_metadata_gate.restart_blocked = 0u;
+  snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
+           "file_read_metadata_new_session_degraded");
+  s_health.file_read_p0_capability_healthy = 0;
+  snprintf(s_health.file_read_p0_capability_reason,
+           sizeof(s_health.file_read_p0_capability_reason), "%s",
+           s_file_read_metadata_gate.reason);
+  ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
 }
 
 /* After an epoch reset the cache starts in DEGRADED because pre-existing
@@ -3293,10 +3379,14 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   if (slot->type == EDR_EVENT_PROCESS_CREATE && edr_collector_valid_process_create_record(&br)) {
     edr_collector_pid_cache_update(&br);
   }
-  if (edr_agent_self_suppress_record(&br)) {
-    edr_agent_self_count_drop_source(br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns(),
-                                     EDR_AGENT_SELF_DROP_RECORD);
-    return 0;
+  {
+    int new_self_generation = 0;
+    if (edr_agent_self_suppress_record(&br, &new_self_generation)) {
+      edr_agent_self_count_drop_source(
+          br.event_time_ns > 0 ? (uint64_t)br.event_time_ns : edr_unix_ns(),
+          EDR_AGENT_SELF_DROP_RECORD, new_self_generation);
+      return 0;
+    }
   }
   if (slot->type == EDR_EVENT_FILE_READ) {
     /* Windows noise policy is intentionally downstream of the verified IR
@@ -3472,6 +3562,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   {
     EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
+      if (ty != EDR_EVENT_PROCESS_CREATE && ty != EDR_EVENT_PROCESS_TERMINATE) {
+        (void)edr_collector_event_process_start_key(event_record,
+                                                    &interest_event.process_start_key);
+      }
       if (ty == EDR_EVENT_PROCESS_TERMINATE && interest_event.pid != 0u) {
         uint64_t exit_start_key = 0u;
         /* A delayed terminate for A must never close a later PID reuse B.
@@ -3502,9 +3596,13 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         }
         memcpy(interest_event.path, file_read_path, file_read_path_len + 1u);
       }
-      if (edr_agent_self_suppress_interest(&interest_event)) {
-        edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_INTEREST);
-        return;
+      {
+        int new_self_generation = 0;
+        if (edr_agent_self_suppress_interest(&interest_event, &new_self_generation)) {
+          edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_INTEREST,
+                                           new_self_generation);
+          return;
+        }
       }
       if (!edr_sensor_interest_should_admit(&interest_event)) {
         s_health.collector_dropped++;
@@ -3622,13 +3720,13 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
       event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
       !(memcmp(provider, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
         event_record->EventHeader.EventDescriptor.Opcode == 1u)) {
-    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID, 0);
     return;
   }
   if (edr_agent_self_fuse_should_drop_event(event_record, now_ns)) {
     s_agent_self_fuse_suppressed++;
     s_health.agent_self_fuse_provider_suppressed++;
-    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID);
+    edr_agent_self_count_drop_source(now_ns, EDR_AGENT_SELF_DROP_DIRECT_PID, 0);
     return;
   }
   /* A record without the session's converted UTC timestamp has no safe
@@ -3935,9 +4033,11 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   memset(s_pid_cache, 0, sizeof(s_pid_cache));
   s_pid_cache_next = 0u;
   edr_collector_file_key_cache_reset();
+  edr_collector_file_read_metadata_gate_session_starting();
   memset(s_device_map, 0, sizeof(s_device_map));
   edr_collector_init_device_map();
   memset(s_agent_self_pid_cache, 0, sizeof(s_agent_self_pid_cache));
+  memset(s_agent_self_start_key_cache, 0, sizeof(s_agent_self_start_key_cache));
   memset(s_agent_self_seen_ns, 0, sizeof(s_agent_self_seen_ns));
   s_agent_self_pid_next = 0u;
   memset(s_policy_canary_pid_cache, 0, sizeof(s_policy_canary_pid_cache));
@@ -3959,6 +4059,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
       (EVENT_TRACE_PROPERTIES *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, buffer_size);
   if (!prop) {
     /* Keep a failed start from retaining a previous provider-session namespace. */
+    edr_collector_file_read_metadata_gate_consumer_unavailable(
+        "file_read_metadata_session_allocation_failed");
     edr_collector_file_key_cache_reset();
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_INTERNAL;
@@ -3990,6 +4092,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     fprintf(stderr, "[collector_win] StartTraceW failed session=EDR_Agent_RT_001 status=%lu\n",
             (unsigned long)status);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
+    edr_collector_file_read_metadata_gate_consumer_unavailable(
+        "file_read_metadata_start_trace_failed");
     edr_collector_file_key_cache_reset();
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_ETW_SESSION_CREATE;
@@ -4003,6 +4107,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     stop.Wnode.BufferSize = sizeof(stop);
     ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
+    edr_collector_file_read_metadata_gate_consumer_unavailable(
+        "file_read_metadata_provider_enable_failed");
     edr_collector_file_key_cache_reset();
     InterlockedExchange(&s_started, 0);
     return EDR_ERR_ETW_PROVIDER_ENABLE;
@@ -4030,6 +4136,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   if (!s_consumer_ready_event) {
     fprintf(stderr, "[collector_win] consumer ready event create failed err=%lu\n",
             (unsigned long)GetLastError());
+    edr_collector_file_read_metadata_gate_consumer_unavailable(
+        "file_read_metadata_consumer_ready_event_failed");
     (void)edr_collector_stop();
     return EDR_ERR_INTERNAL;
   }
@@ -4041,6 +4149,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     /* Use the same join-safe stop path as recovery.  A registry/A4.4 timeout
      * must retain its resources; resetting the FileKey epoch here would make
      * a later surviving decoder dereference freed/repurposed state. */
+    edr_collector_file_read_metadata_gate_consumer_unavailable(
+        "file_read_metadata_consumer_thread_failed");
     (void)edr_collector_stop();
     return EDR_ERR_INTERNAL;
   }

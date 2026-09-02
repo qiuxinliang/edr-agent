@@ -14,6 +14,10 @@ typedef struct {
   uint32_t pid;
   uint32_t parent_pid;
   uint32_t remote_port;
+  /* Kernel-Process target StartKey from the TDH payload, or the exact
+   * extended actor StartKey for non-lifecycle events.  A PID alone is never
+   * sufficient for self-noise ancestry because Windows reuses PIDs. */
+  uint64_t process_start_key;
   char process_name[256];
   char parent_process_name[256];
   char path[1024];

@@ -186,6 +186,15 @@ int main(void) {
   contains(script, "local_health_observation_passed", "platform health check starts only after the local watchdog passes");
   contains(script, "local_watchdog = 'observing'", "local observation is reported as nonterminal runtime progress");
   contains(script, "$resumeHealthObservation -and -not $running", "Agent exit during recovered health observation forces rollback");
+  contains(script, "$resumeHealthObservationPassed = $priorLastStatus -eq $expectedRecoveredHealthStatus",
+           "a durable health-check event is recognized as an idempotent recovery terminal");
+  contains(script, "if ($resumeHealthObservationPassed)",
+           "recovery after a durable health check must finish without reopening restart progress");
+  contains_before(script, "if ($resumeHealthObservationPassed)",
+                  "if ($resumeHealthObservation -and -not $running)",
+                  "terminal health recovery must return before any restart-observation branch");
+  contains(script, "Agent exited after the durable local health observation passed",
+           "terminal health recovery still verifies the installed Agent is alive");
   contains(script, "resume_after_commit", "committed replacement can resume after updater interruption");
   contains(script, "Restore-RuntimePlanFromJournal", "runtime DLL rollback plan survives updater interruption");
   contains(script, "$item.Committed = $false", "runtime rollback checkpoints cannot be applied twice after a crash");

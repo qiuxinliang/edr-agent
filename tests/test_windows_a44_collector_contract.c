@@ -183,6 +183,15 @@ int main(void) {
                          "same-timestamp NameCreate delivery must compare the whole binding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_note_resolved",
                          "a complete post-reset FileKey binding must restore FileRead health");
+  ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_session_starting();",
+                         "every new FileKey provider epoch must begin in degraded attribution mode");
+  ok &= require_contains(collector, "file_read_metadata_new_session_degraded",
+                         "initial FileRead health must expose missing pre-session handle names");
+  ok &= require_contains(tdh, "&out_event->process_start_key",
+                         "interest filtering must carry the Kernel-Process target generation");
+  ok &= require_contains(collector,
+                         "edr_agent_self_pid_seen(ev->pid, ev->process_start_key, now)",
+                         "interest self-noise filtering must reject PID-only ancestry matches");
   ok &= require_contains(collector, "This is a metadata-only NameCreate, not an attributed Read",
                          "metadata-only schema misses must not globally fuse FileRead");
   ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(file_key)",
@@ -226,7 +235,9 @@ int main(void) {
   ok &= require_after(collector, "wait_status != WAIT_OBJECT_0",
                        "return 0;",
                        "a failed collector join must retain thread-owned resources");
-  ok &= require_before(collector, "edr_collector_file_key_cache_reset();\n  memset(s_device_map",
+  ok &= require_before(collector,
+                       "edr_collector_file_key_cache_reset();\n"
+                       "  edr_collector_file_read_metadata_gate_session_starting();",
                        "StartTraceW(&s_session_handle",
                        "start must clear FileKey state before a new ETW session can emit");
   ok &= require_contains(collector, "Keep a failed start from retaining a previous provider-session namespace",

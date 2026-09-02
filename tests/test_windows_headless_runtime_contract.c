@@ -125,14 +125,16 @@ int main(void) {
 
   char *collector = read_source(root, "src/collector/collector_win.c");
   if (!collector) return 1;
-  ok &= require_contains(collector, "return edr_agent_self_pid_seen(",
-                         "self-noise fuse must be scoped to Agent-owned PIDs");
-  ok &= require_contains(collector, "source != EDR_AGENT_SELF_DROP_DIRECT_PID",
-                         "expected direct Agent PID drops must not trip the self-noise fuse");
+  ok &= require_contains(collector, "s_agent_self_start_key_cache[i] != process_start_key",
+                         "self-noise ancestry must bind PID entries to an exact process generation");
+  ok &= require_contains(collector, "pid == 0u || process_start_key == 0u",
+                         "self-noise ancestry must fail open when generation is unavailable");
+  ok &= require_contains(collector, "Only discovery of a new, exact descendant generation",
+                         "repeated expected Agent events must not keep moving the self-noise fuse");
   ok &= require_contains(collector, "s_health.etw_prefilter_dropped++",
                          "uninteresting ETW schemas must be observable before payload parsing");
   ok &= require_range_absent(collector, "static void edr_agent_self_count_drop_source",
-                             "static void edr_agent_self_mark_pid", "s_health.collector_dropped++",
+                             "static int edr_agent_self_mark_pid", "s_health.collector_dropped++",
                              "intentional Agent self filtering must not count as collector loss");
   ok &= require_range_absent(collector, "if (!edr_map_type_and_tag(event_record, &ty, &tag))",
                              "if (edr_a44_split_path_enabled())", "s_health.collector_dropped++",
