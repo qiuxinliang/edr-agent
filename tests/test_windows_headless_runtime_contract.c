@@ -361,8 +361,49 @@ int main(void) {
                          "native finalizer must retain the SCM-owned service process identity");
   ok &= require_contains(headless_uninstaller, "edr_native_stop_sensor(install_dir, service_pid)",
                          "sensor teardown must target the service PID instead of arbitrary same-name processes");
-  ok &= require_contains(headless_uninstaller, "_wcsicmp(canonical_process, canonical_sensor) == 0",
-                         "sensor teardown must validate the target PID image path before termination");
+  ok &= require_contains(headless_uninstaller, "_wcsicmp(canonical_process, canonical_sensor) != 0",
+                         "sensor teardown must reject a reused PID before requesting termination");
+  ok &= require_contains(headless_uninstaller,
+                         "HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, target_pid)",
+                         "normal sensor shutdown verification must require only wait access");
+  ok &= require_contains(headless_uninstaller,
+                         "identity = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target_pid)",
+                         "hung sensor identity must be queried separately before termination");
+  ok &= require_contains(headless_uninstaller,
+                         "terminator = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE",
+                         "sensor teardown may request terminate access only after the graceful wait expires");
+  ok &= require_contains(headless_uninstaller, "wait_result = WaitForSingleObject(process, 5000)",
+                         "sensor teardown must allow the SCM-stopped process a bounded exit window");
+  {
+    const char *stop_sensor = strstr(headless_uninstaller, "static int edr_native_stop_sensor(");
+    const char *fallback_scan = stop_sensor ? strstr(stop_sensor, "snapshot = CreateToolhelp32Snapshot") : NULL;
+    const char *wait_open = stop_sensor
+                                 ? strstr(stop_sensor,
+                                          "HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, target_pid)")
+                                 : NULL;
+    const char *graceful_wait = stop_sensor
+                                    ? strstr(stop_sensor,
+                                             "wait_result = WaitForSingleObject(process, 5000)")
+                                    : NULL;
+    const char *identity_open = stop_sensor
+                                    ? strstr(stop_sensor,
+                                             "identity = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target_pid)")
+                                    : NULL;
+    const char *terminate_open = stop_sensor
+                                     ? strstr(stop_sensor,
+                                              "terminator = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE")
+                                     : NULL;
+    const char *eager_terminate = stop_sensor
+                                      ? strstr(stop_sensor,
+                                               "PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE")
+                                      : NULL;
+    ok &= require_true(stop_sensor && fallback_scan && wait_open && graceful_wait && identity_open &&
+                           terminate_open && wait_open < graceful_wait && graceful_wait < identity_open &&
+                           identity_open < terminate_open &&
+                           terminate_open < fallback_scan &&
+                           (!eager_terminate || eager_terminate >= fallback_scan),
+                       "SCM PID teardown must wait with least privilege before its termination fallback");
+  }
   ok &= require_contains(headless_uninstaller, "FILE_ATTRIBUTE_REPARSE_POINT",
                          "historical finalizer cleanup must not follow reparse-point entries");
   ok &= require_contains(headless_uninstaller, "error == 429 || (error >= 500 && error <= 599)",

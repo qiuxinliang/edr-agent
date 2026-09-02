@@ -1363,28 +1363,67 @@ static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid) 
    * reject OpenProcess and must never turn this uninstall into a false
    * access-denied failure (or be terminated accidentally). */
   if (target_pid != 0u) {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
-                                     SYNCHRONIZE,
-                                 FALSE, target_pid);
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, target_pid);
+    HANDLE identity = NULL;
+    HANDLE terminator = NULL;
     wchar_t process_path[MAX_PATH_LONG];
     DWORD process_path_length = (DWORD)(sizeof(process_path) / sizeof(process_path[0]));
     wchar_t canonical_process[MAX_PATH_LONG];
+    DWORD wait_result;
     if (!process) {
       DWORD error = GetLastError();
       return error == ERROR_INVALID_PARAMETER ? ERROR_SUCCESS : (int)error;
     }
-    if (!QueryFullProcessImageNameW(process, 0, process_path, &process_path_length) ||
+    /* A successful SCM stop normally leaves the process in its final exit
+     * window. Waiting requires no query or termination rights and therefore
+     * cannot turn a completed graceful stop into ACCESS_DENIED. */
+    wait_result = WaitForSingleObject(process, 5000);
+    if (wait_result == WAIT_OBJECT_0) {
+      CloseHandle(process);
+      return ERROR_SUCCESS;
+    }
+    if (wait_result != WAIT_TIMEOUT) {
+      DWORD error = edr_finalizer_last_error();
+      CloseHandle(process);
+      return (int)error;
+    }
+    identity = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target_pid);
+    if (!identity) {
+      DWORD error = edr_finalizer_last_error();
+      wait_result = WaitForSingleObject(process, 0);
+      CloseHandle(process);
+      return wait_result == WAIT_OBJECT_0 ? ERROR_SUCCESS : (int)error;
+    }
+    if (!QueryFullProcessImageNameW(identity, 0, process_path, &process_path_length) ||
         !edr_finalizer_canonical_path(process_path, canonical_process,
                                       (DWORD)(sizeof(canonical_process) / sizeof(canonical_process[0])))) {
+      DWORD error = edr_finalizer_last_error();
+      wait_result = WaitForSingleObject(process, 0);
+      CloseHandle(identity);
       CloseHandle(process);
-      return ERROR_ACCESS_DENIED;
+      return wait_result == WAIT_OBJECT_0 ? ERROR_SUCCESS : (int)error;
     }
-    if (_wcsicmp(canonical_process, canonical_sensor) == 0 &&
-        (!TerminateProcess(process, ERROR_CANCELLED) ||
-         WaitForSingleObject(process, 5000) != WAIT_OBJECT_0)) {
+    CloseHandle(identity);
+    if (_wcsicmp(canonical_process, canonical_sensor) != 0) {
+      CloseHandle(process);
+      return ERROR_SUCCESS;
+    }
+    /* Request termination only after the grace period and exact image-path
+     * validation. Keeping the synchronize handle open pins process identity,
+     * so target_pid cannot silently redirect this action to a reused PID. */
+    terminator = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, target_pid);
+    if (!terminator) {
+      DWORD error = edr_finalizer_last_error();
+      CloseHandle(process);
+      return (int)error;
+    }
+    if (!TerminateProcess(terminator, ERROR_CANCELLED) ||
+        WaitForSingleObject(terminator, 5000) != WAIT_OBJECT_0) {
+      CloseHandle(terminator);
       CloseHandle(process);
       return ERROR_TIMEOUT;
     }
+    CloseHandle(terminator);
     CloseHandle(process);
     return ERROR_SUCCESS;
   }
