@@ -905,7 +905,8 @@ static int edr_native_restore_service_and_start(const wchar_t *service_name) {
   return ok;
 }
 
-static int edr_native_stop_delete_service(const wchar_t *service_name) {
+static int edr_native_stop_delete_service(const wchar_t *service_name,
+                                          DWORD *service_pid_out) {
   SC_HANDLE manager;
   SC_HANDLE service;
   SERVICE_STATUS_PROCESS status;
@@ -913,6 +914,7 @@ static int edr_native_stop_delete_service(const wchar_t *service_name) {
   DWORD started = GetTickCount();
   int deleted = 0;
 
+  if (service_pid_out) *service_pid_out = 0;
   if (!service_name || !service_name[0]) return 1;
   manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
   if (manager == NULL) return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
@@ -927,6 +929,7 @@ static int edr_native_stop_delete_service(const wchar_t *service_name) {
   if (!edr_native_disable_service_recovery(service)) goto cleanup;
   if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
                             (LPBYTE)&status, sizeof(status), &bytes)) goto cleanup;
+  if (service_pid_out) *service_pid_out = status.dwProcessId;
   if (status.dwCurrentState != SERVICE_STOPPED) {
     SERVICE_STATUS ignored;
     ControlService(service, SERVICE_CONTROL_STOP, &ignored);
@@ -1343,7 +1346,7 @@ static int edr_native_cleanup_stale_finalizers(const wchar_t *state_dir) {
   return 1;
 }
 
-static int edr_native_stop_sensor(const wchar_t *install_dir) {
+static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid) {
   wchar_t sensor[MAX_PATH_LONG];
   wchar_t canonical_sensor[MAX_PATH_LONG];
   HANDLE snapshot;
@@ -1354,6 +1357,36 @@ static int edr_native_stop_sensor(const wchar_t *install_dir) {
       !edr_finalizer_canonical_path(sensor, canonical_sensor,
                                     (DWORD)(sizeof(canonical_sensor) / sizeof(canonical_sensor[0])))) {
     return ERROR_INVALID_PARAMETER;
+  }
+  /* The SCM process id is the authoritative target.  Do not scan every
+   * FDSensor.exe on the host: a protected, unrelated same-name process can
+   * reject OpenProcess and must never turn this uninstall into a false
+   * access-denied failure (or be terminated accidentally). */
+  if (target_pid != 0u) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
+                                     SYNCHRONIZE,
+                                 FALSE, target_pid);
+    wchar_t process_path[MAX_PATH_LONG];
+    DWORD process_path_length = (DWORD)(sizeof(process_path) / sizeof(process_path[0]));
+    wchar_t canonical_process[MAX_PATH_LONG];
+    if (!process) {
+      DWORD error = GetLastError();
+      return error == ERROR_INVALID_PARAMETER ? ERROR_SUCCESS : (int)error;
+    }
+    if (!QueryFullProcessImageNameW(process, 0, process_path, &process_path_length) ||
+        !edr_finalizer_canonical_path(process_path, canonical_process,
+                                      (DWORD)(sizeof(canonical_process) / sizeof(canonical_process[0])))) {
+      CloseHandle(process);
+      return ERROR_ACCESS_DENIED;
+    }
+    if (_wcsicmp(canonical_process, canonical_sensor) == 0 &&
+        (!TerminateProcess(process, ERROR_CANCELLED) ||
+         WaitForSingleObject(process, 5000) != WAIT_OBJECT_0)) {
+      CloseHandle(process);
+      return ERROR_TIMEOUT;
+    }
+    CloseHandle(process);
+    return ERROR_SUCCESS;
   }
   snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snapshot == INVALID_HANDLE_VALUE) return (int)GetLastError();
@@ -2132,6 +2165,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   int handoff_acknowledged = 0;
   int self_delete_attempted = 0;
   DWORD self_delete_error = ERROR_SUCCESS;
+  DWORD service_pid = 0;
   const char *failure_stage = "preflight";
   const char *attestation_failure_stage = "attestation";
   DWORD parent_pid = 0;
@@ -2236,7 +2270,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     int service_result;
     failure_stage = "delete-service";
     service_touched = 1;
-    service_result = edr_native_stop_delete_service(service_name);
+    service_result = edr_native_stop_delete_service(service_name, &service_pid);
     if (service_result < 0) {
       service_deleted = 1;
       result = ERROR_TIMEOUT;
@@ -2249,7 +2283,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   }
   service_deleted = 1;
   failure_stage = "stop-sensor";
-  result = edr_native_stop_sensor(install_dir);
+  result = edr_native_stop_sensor(install_dir, service_pid);
   if (result != ERROR_SUCCESS) goto cleanup;
   failure_stage = "etw-cleanup";
   result = edr_native_run_etw_cleanup(install_dir);
