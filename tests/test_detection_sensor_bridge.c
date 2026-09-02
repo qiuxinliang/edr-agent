@@ -758,6 +758,21 @@ static void test_windows_image_resolution_and_4688_identity(void) {
   edr_behavior_from_slot(&slot, &r);
   assert(strcmp(r.image_path_resolution_status, "NOT_EVALUABLE") == 0);
   assert(strcmp(r.exe_path, "\\Device\\HarddiskVolume99\\Temp\\powershell.exe") == 0);
+
+  /* The generic EventHeader PID is not target-process authority.  Preserve
+   * the Kernel Process payload target PID end to end. */
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\nprov=kproc\npid=3764\nepid=8200\nppid=3764\n"
+            "img=C:\\Windows\\Temp\\P0CASE\\powershell.exe\n"
+            "cmd=powershell.exe -NoProfile -Command exit 0\n"
+            "process_start_key=6473924464403231\n"
+            "process_creation_filetime_100ns=134170000000000000\n"
+            "process_generation_source=kernel_process_payload\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(r.pid == 8200u);
+  assert(r.ppid == 3764u);
+  assert(r.process_start_key == 6473924464403231ULL);
+  assert(strcmp(r.process_name, "powershell.exe") == 0);
 }
 
 static void test_source_truncation_withholds_and_names_rule_fields(void) {

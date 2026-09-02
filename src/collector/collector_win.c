@@ -158,8 +158,6 @@ typedef struct {
    * rules snapshot, while this binding remains valid until its ETW interval
    * closes or the provider session is reset. */
   uint64_t session_epoch;
-  uint64_t process_start_key;
-  uint32_t pid;
   uint8_t critical;
   char path[EDR_BR_STR_LONG];
 } EdrCollectorFileKeyCacheEntry;
@@ -2774,12 +2772,10 @@ static EdrCollectorFileKeyCacheEntry *edr_collector_file_key_cache_alloc_locked(
  * would let a later Read inherit another handle's identity. */
 static int edr_collector_file_key_binding_exact(const EdrCollectorFileKeyCacheEntry *entry,
                                                 uint64_t file_key, uint64_t event_ns,
-                                                uint64_t session_epoch, uint32_t pid,
-                                                uint64_t process_start_key,
+                                                uint64_t session_epoch,
                                                 const char *canonical_path) {
   return entry && entry->file_key == file_key && entry->name_event_ns == event_ns &&
          entry->session_epoch == session_epoch && entry->close_event_ns == 0u &&
-         entry->pid == pid && entry->process_start_key == process_start_key &&
          canonical_path && canonical_path[0] && entry->path[0] &&
          edr_collector_equal_ci(entry->path, canonical_path);
 }
@@ -2802,8 +2798,6 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     char path[EDR_BR_STR_LONG];
     char canonical_path[EDR_BR_STR_LONG];
     uint64_t session_epoch;
-    uint64_t process_start_key = 0u;
-    uint32_t pid = (uint32_t)record->EventHeader.ProcessId;
     int critical;
     int existing = 0;
     int ambiguous = 0;
@@ -2827,17 +2821,11 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
      * snapshot's path-only projection instead.  Process/user predicates are
      * deliberately ignored here, so this can only over-retain metadata. */
     critical = edr_p0_rule_ir_file_read_path_may_match(canonical_path, NULL);
-    (void)edr_collector_event_process_start_key(record, &process_start_key);
-    if (!pid || !process_start_key) {
-      s_health.file_read_generation_unavailable++;
-      edr_collector_file_key_cache_invalidate(file_key);
-      if (critical) {
-        edr_collector_file_read_metadata_gate_stage(
-            record, event_ns, file_key, canonical_path,
-            EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
-      }
-      return 1;
-    }
+    /* NameCreate owns only the FileKey -> path fact.  Its EventHeader actor
+     * is not the eventual reader: handles can be inherited or duplicated,
+     * and some provider builds omit ProcessStartKey on this metadata event.
+     * Bind the actual actor from the Read event below, then validate that
+     * generation live in preprocess. */
     AcquireSRWLockExclusive(&s_file_key_cache_lock);
     session_epoch = s_file_key_session_epoch;
     edr_collector_file_key_cache_purge_locked(event_ns);
@@ -2846,7 +2834,7 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
       if (s_file_key_cache[i].file_key == file_key &&
           s_file_key_cache[i].name_event_ns == event_ns) {
         if (edr_collector_file_key_binding_exact(&s_file_key_cache[i], file_key, event_ns,
-                                                 session_epoch, pid, process_start_key,
+                                                 session_epoch,
                                                  canonical_path)) {
           entry = &s_file_key_cache[i];
           existing = 1;
@@ -2873,8 +2861,6 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
       entry->file_key = file_key;
       entry->name_event_ns = event_ns;
       entry->session_epoch = session_epoch;
-      entry->process_start_key = process_start_key;
-      entry->pid = pid;
       entry->critical = critical ? 1u : 0u;
       snprintf(entry->path, sizeof(entry->path), "%s", canonical_path);
     }
@@ -2964,23 +2950,15 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
       }
       continue;
     }
-    /* A FileKey/path fact is P0-eligible only with exact, nonzero actor
-     * generation on both NameCreate and Read.  PID-only or one-sided StartKey
-     * would let a recycled process inherit another handle's path. */
-    if (!entry->pid || !entry->process_start_key || !read_pid || !read_start_key) {
+    /* NameCreate binds the file object, not the process that will eventually
+     * read it.  Require the actor tuple on the Read itself; preprocess then
+     * validates this StartKey against the live creation FILETIME before P0
+     * matching. */
+    if (!read_pid || !read_start_key) {
       if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
         snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
         have_problem = 1;
         problem_reason = EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
-        best_problem_event_ns = entry->name_event_ns;
-      }
-      continue;
-    }
-    if (read_pid != entry->pid || read_start_key != entry->process_start_key) {
-      if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
-        snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
-        have_problem = 1;
-        problem_reason = EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH;
         best_problem_event_ns = entry->name_event_ns;
       }
       continue;
@@ -3673,7 +3651,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     edr_collector_file_read_metadata_gate_stage(
         event_record, timestamp_ns, file_read_key,
         file_read_path[0] ? file_read_path : NULL,
-        EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE);
+        EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE);
     return;
   }
   edr_collector_debug_tdh_payload(&slot, tag);

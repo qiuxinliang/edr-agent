@@ -130,11 +130,11 @@ int main(void) {
   ok &= require_after(a44, "wait_status != WAIT_OBJECT_0", "free(s_a44_threads);",
                        "A4.4 frees its worker array only after every join succeeds");
   ok &= require_contains(a44,
-                         "r->ExtendedDataCount != 0 && ty != EDR_EVENT_PROCESS_CREATE",
-                         "ProcessCreate must not synchronously decode unused header extensions");
+                         "ty == EDR_EVENT_PROCESS_CREATE || r->ExtendedDataCount != 0",
+                         "ProcessCreate must bypass ordinary A4.4 latency for live generation checks");
   ok &= require_contains(a44,
-                         "PROCESS_CREATE extended descriptors are intentionally unused",
-                         "A4.4 must document why ProcessCreate may omit header extensions");
+                         "valid sub-second processes to lose",
+                         "A4.4 must document the short-lived ProcessCreate race");
   ok &= require_contains(tdh, "void edr_tdh_win_get_property_stats_ext(",
                          "ETW observability extended TDH statistics must be implemented");
   /* Source-contract only: macOS cannot compile the Windows EventLog callback. */
@@ -208,8 +208,8 @@ int main(void) {
                          "device-volume mapping must enforce a path-component boundary");
   ok &= require_contains(collector, "entry->session_epoch != session_epoch",
                          "a FileKey binding must never cross a provider session");
-  ok &= require_contains(collector, "read_start_key != entry->process_start_key",
-                         "a Read with a different ProcessStartKey must not resolve another actor path");
+  ok &= require_absent(collector, "read_start_key != entry->process_start_key",
+                       "NameCreate must not bind a later Read to the metadata event actor");
   ok &= require_absent(collector, "p0_snapshot_epoch",
                        "FileKey path facts must not be bound to a mutable rule epoch");
   ok &= require_contains(collector, "file_read_path_len >= sizeof(interest_event.path)",
@@ -297,12 +297,14 @@ int main(void) {
       collector,
       "edr_sha256_hex((const uint8_t *)commitment, (size_t)commitment_len,\n                       commitment_sha256) != 0",
       "successful event-identity commitments must pass the FileRead metadata gate");
-  ok &= require_contains(collector, "!entry->pid || !entry->process_start_key || !read_pid || !read_start_key",
-                         "NameCreate and Read must both carry nonzero actor generation facts");
-  ok &= require_contains(collector, "read_pid != entry->pid || read_start_key != entry->process_start_key",
-                         "NameCreate and Read actor generation must be exact");
+  ok &= require_contains(collector, "if (!read_pid || !read_start_key)",
+                         "the attributed Read must carry a nonzero actor generation");
+  ok &= require_contains(collector, "NameCreate binds the file object, not the process",
+                         "FileKey path identity must be independent from the NameCreate actor");
   ok &= require_contains(preprocess, "br.type == EDR_EVENT_FILE_READ",
                          "preprocess must live-validate the file-read actor generation");
+  ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE);",
+                         "a bound FileRead that cannot fit its slot must report payload capacity");
   ok &= require_contains(direct, "br->type == EDR_EVENT_FILE_READ",
                          "direct P0 must gate file reads independently of process creates");
   ok &= require_contains(direct, "etw_start_key_live_telemetry",
