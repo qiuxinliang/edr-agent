@@ -908,6 +908,122 @@ static void test_candidate_known_to_unknown_keeps_generation_and_completeness(vo
   (void)remove("local_evidence_cache_known_to_unknown.sqlite-shm");
 }
 
+static void test_candidate_distinct_source_ids_bridge_only_known_to_unknown(void) {
+  const char *db = "local_evidence_cache_cross_source_bridge.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord known;
+  EdrBehaviorRecord unknown;
+  EdrBehaviorRecord second_known;
+  EdrBehaviorRecord unknown_first;
+  EdrBehaviorRecord known_later;
+  EdrEvidenceCacheStatus status;
+  char candidate_id[160];
+  char bundle[4096];
+  int64_t now;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_cross_source_bridge.sqlite-wal");
+  (void)remove("local_evidence_cache_cross_source_bridge.sqlite-shm");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_record(&known, EDR_EVENT_PROCESS_CREATE);
+  known.priority = 3u;
+  known.pid = 74109u;
+  known.ppid = 400u;
+  known.event_time_ns = now;
+  set_record_generation(&known, UINT64_C(0x74109));
+  snprintf(known.event_id, sizeof(known.event_id), "kernel-provider-source");
+  snprintf(known.endpoint_id, sizeof(known.endpoint_id), "ep-cross-source-bridge");
+  snprintf(known.process_name, sizeof(known.process_name), "powershell.exe");
+  snprintf(known.image_path_canonical, sizeof(known.image_path_canonical),
+           "C:\\Tools\\powershell.exe");
+  snprintf(known.exe_path, sizeof(known.exe_path), "C:\\Tools\\powershell.exe");
+  snprintf(known.cmdline, sizeof(known.cmdline),
+           "powershell.exe -File C:\\Ops\\maint.ps1");
+  snprintf(known.process_generation_source, sizeof(known.process_generation_source),
+           "target_live_telemetry");
+  snprintf(known.source_completeness, sizeof(known.source_completeness),
+           "CORRELATION_MISSING");
+  snprintf(known.detection_context, sizeof(known.detection_context),
+           "{\"priority\":\"P1\"}");
+  edr_local_evidence_cache_record_behavior(&known);
+
+  unknown = known;
+  unknown.event_time_ns = now + 500000000LL;
+  unknown.process_start_key = 0u;
+  unknown.process_creation_filetime_100ns = 0u;
+  unknown.process_generation_source[0] = '\0';
+  snprintf(unknown.event_id, sizeof(unknown.event_id), "security-provider-source");
+  snprintf(unknown.source_completeness, sizeof(unknown.source_completeness),
+           "ENRICHMENT_ONLY");
+  edr_local_evidence_cache_record_behavior(&unknown);
+
+  /* A second fully bound event with the same command is a distinct atomic
+   * observation, even when the PID and generation happen to be identical. */
+  second_known = known;
+  second_known.event_time_ns = now + 750000000LL;
+  snprintf(second_known.event_id, sizeof(second_known.event_id),
+           "second-kernel-source");
+  edr_local_evidence_cache_record_behavior(&second_known);
+
+  /* Provider arrival order is not stable.  The same narrow bridge must also
+   * preserve an initially generation-missing candidate when the authoritative
+   * process copy arrives second. */
+  unknown_first = known;
+  unknown_first.pid = 74110u;
+  unknown_first.event_time_ns = now + 1000000000LL;
+  unknown_first.process_start_key = 0u;
+  unknown_first.process_creation_filetime_100ns = 0u;
+  unknown_first.process_generation_source[0] = '\0';
+  snprintf(unknown_first.event_id, sizeof(unknown_first.event_id),
+           "security-provider-first");
+  snprintf(unknown_first.source_completeness,
+           sizeof(unknown_first.source_completeness), "ENRICHMENT_ONLY");
+  edr_local_evidence_cache_record_behavior(&unknown_first);
+
+  known_later = unknown_first;
+  known_later.event_time_ns = now + 1500000000LL;
+  set_record_generation(&known_later, UINT64_C(0x74110));
+  snprintf(known_later.process_generation_source,
+           sizeof(known_later.process_generation_source),
+           "target_live_telemetry");
+  snprintf(known_later.event_id, sizeof(known_later.event_id),
+           "kernel-provider-later");
+  snprintf(known_later.source_completeness,
+           sizeof(known_later.source_completeness), "CORRELATION_MISSING");
+  edr_local_evidence_cache_record_behavior(&known_later);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 5u && status.candidate_reused == 2u);
+  assert(status.candidate_admitted == 3u && status.candidate_rejected == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 3u);
+  edr_local_evidence_cache_close();
+  sqlite_candidate_id_for_source_event(db, "security-provider-source",
+                                       candidate_id, sizeof(candidate_id));
+  sqlite_bundle_manifest_for_source_event(db, "security-provider-source",
+                                          bundle, sizeof(bundle));
+  assert(strstr(bundle,
+                "\"source_event_ids\":[\"kernel-provider-source\","
+                "\"security-provider-source\"]") != NULL);
+  sqlite_assert_candidate_enrichment(db, candidate_id, "C:\\Tools\\powershell.exe",
+                                      "475401", "target_live_telemetry",
+                                      "CORRELATION_MISSING");
+  sqlite_candidate_id_for_source_event(db, "kernel-provider-later",
+                                       candidate_id, sizeof(candidate_id));
+  sqlite_bundle_manifest_for_source_event(db, "kernel-provider-later",
+                                          bundle, sizeof(bundle));
+  assert(strstr(bundle,
+                "\"source_event_ids\":[\"security-provider-first\","
+                "\"kernel-provider-later\"]") != NULL);
+  sqlite_assert_candidate_enrichment(db, candidate_id, "C:\\Tools\\powershell.exe",
+                                      "475408", "target_live_telemetry",
+                                      "CORRELATION_MISSING");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_cross_source_bridge.sqlite-wal");
+  (void)remove("local_evidence_cache_cross_source_bridge.sqlite-shm");
+}
+
 static void test_candidate_completeness_monotonically_upgrades(void) {
   const char *db = "local_evidence_cache_completeness.sqlite";
   struct timespec ts;
@@ -2270,6 +2386,7 @@ int main(void) {
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
   test_candidate_fallback_preserves_path_and_generation_boundaries();
   test_candidate_known_to_unknown_keeps_generation_and_completeness();
+  test_candidate_distinct_source_ids_bridge_only_known_to_unknown();
   test_candidate_completeness_monotonically_upgrades();
   test_candidate_reuse_requires_generation_and_full_semantics();
   test_process_cache_generation_migration_and_restart_safe_rtq();

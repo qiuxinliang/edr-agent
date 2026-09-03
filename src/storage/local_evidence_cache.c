@@ -140,6 +140,13 @@ typedef struct {
   /* Exact source-event or atomic-behavior commitment.  It is a local
    * evidence reuse key, not an alert-suppression or cross-restart cache key. */
   char signal[65];
+  /* Different providers may emit the same atomic process observation with
+   * different event ids while only one copy has a bound generation.  Keep a
+   * second, enrichment-insensitive commitment for that narrow two-second
+   * bridge; the source commitment above remains authoritative for exact
+   * replay, and two known generations are never bridged. */
+  char semantic_signal[65];
+  char source_event_id[EDR_BR_ID_LEN];
 } CandidateDedupeSlot;
 
 typedef struct {
@@ -991,6 +998,8 @@ static uint32_t metric_slots_used(void) {
 }
 
 static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t cap);
+static void candidate_semantic_signal_for(const EdrBehaviorRecord *r, char *out,
+                                          size_t cap);
 static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
                                 uint32_t max_v);
 
@@ -1138,6 +1147,56 @@ static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t c
 #undef CANDIDATE_TEXT
 #undef CANDIDATE_U64
 finish:
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); ++i) {
+    out[i * 2u] = hex[digest[i] >> 4u];
+    out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out[64] = '\0';
+}
+
+/* Stable behavior identity used only to join a generation-bearing source to
+ * its generation-missing enrichment copy.  Mutable enrichment (hashes,
+ * resolution provenance, completeness and evidence revision) is excluded;
+ * event-specific file/network/registry facts remain included so two real
+ * actions by one process cannot collapse into one candidate. */
+static void candidate_semantic_signal_for(const EdrBehaviorRecord *r, char *out,
+                                          size_t cap) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[] = "0123456789abcdef";
+  const char *canonical_image;
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  if (!r || cap < 65u) return;
+  canonical_image = r->image_path_canonical[0] ? r->image_path_canonical : r->exe_path;
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, "edr-local-evidence-enrichment-bridge-v1");
+  candidate_digest_text(&ctx, r->tenant_id);
+  candidate_digest_u64(&ctx, (uint64_t)r->type);
+  candidate_digest_u64(&ctx, (uint64_t)r->ppid);
+  candidate_digest_text(&ctx, r->process_name);
+  candidate_digest_text(&ctx, canonical_image);
+  candidate_digest_text(&ctx, r->cmdline);
+  candidate_digest_text(&ctx, r->file_op);
+  candidate_digest_text(&ctx, r->file_path);
+  candidate_digest_u64(&ctx, r->file_key);
+  candidate_digest_u64(&ctx, r->file_target_has_motw);
+  candidate_digest_text(&ctx, r->dns_query);
+  candidate_digest_text(&ctx, r->net_src);
+  candidate_digest_text(&ctx, r->net_dst);
+  candidate_digest_u64(&ctx, r->net_sport);
+  candidate_digest_u64(&ctx, r->net_dport);
+  candidate_digest_text(&ctx, r->net_proto);
+  candidate_digest_text(&ctx, r->network_aux_path);
+  candidate_digest_text(&ctx, r->reg_key_path);
+  candidate_digest_text(&ctx, r->reg_value_name);
+  candidate_digest_text(&ctx, r->reg_value_data);
+  candidate_digest_text(&ctx, r->reg_old_value_data);
+  candidate_digest_text(&ctx, r->reg_op);
+  candidate_digest_text(&ctx, r->reg_source);
+  candidate_digest_text(&ctx, r->reg_attribution);
+  candidate_digest_text(&ctx, r->reg_detail_status);
   edr_sha256_final(&ctx, digest);
   for (size_t i = 0u; i < sizeof(digest); ++i) {
     out[i * 2u] = hex[digest[i] >> 4u];
@@ -1406,6 +1465,45 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
 /* Only already-committed candidates may satisfy a reuse.  A failed write must
  * not populate this in-memory index, otherwise the next copy of the alert
  * could be hidden for the whole dedupe window. */
+static int candidate_dedupe_slot_matches(
+    const CandidateDedupeSlot *slot, const EdrBehaviorRecord *r, int64_t ts,
+    const EvidenceProcessGeneration *generation, int generation_known,
+    const char *signal, const char *semantic_signal) {
+  int same_source_event;
+  if (!slot || !slot->used || !r || slot->pid != r->pid ||
+      slot->type != (uint32_t)r->type ||
+      strncmp(slot->endpoint_id, r->endpoint_id, sizeof(slot->endpoint_id)) != 0) {
+    return 0;
+  }
+  /* A source replay may enrich fields, but it may never rewrite a source id
+   * onto another known process lifetime. */
+  if (generation_known && slot->generation_known &&
+      !generation_equal(&slot->generation, generation)) {
+    return 0;
+  }
+  same_source_event = r->event_id[0] && slot->source_event_id[0] &&
+                      strncmp(slot->source_event_id, r->event_id,
+                              sizeof(slot->source_event_id)) == 0;
+  if (same_source_event) {
+    return signal && signal[0] &&
+           strncmp(slot->signal, signal, sizeof(slot->signal)) == 0;
+  }
+  if (!r->event_id[0] && !slot->source_event_id[0] &&
+      generation_known && slot->generation_known) {
+    return signal && signal[0] &&
+           strncmp(slot->signal, signal, sizeof(slot->signal)) == 0;
+  }
+  /* Distinct source events bridge only the observed provider-enrichment
+   * shape: exactly one side knows the generation, the atomic semantics are
+   * identical, and delivery skew is tightly bounded. Unknown/unknown and
+   * known/known events remain independent evidence. */
+  return generation_known != (int)slot->generation_known && semantic_signal &&
+         semantic_signal[0] &&
+         strncmp(slot->semantic_signal, semantic_signal,
+                 sizeof(slot->semantic_signal)) == 0 &&
+         llabs(ts - slot->last_ns) <= EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS;
+}
+
 static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
                                   char *candidate_id, size_t candidate_id_cap) {
   EvidenceProcessGeneration generation;
@@ -1418,30 +1516,16 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
     return 0;
   }
   char signal[65];
+  char semantic_signal[65];
   generation_known = record_process_generation(r, &generation);
   candidate_signal_for(r, signal, sizeof(signal));
+  candidate_semantic_signal_for(r, semantic_signal, sizeof(semantic_signal));
   int64_t cutoff = ts - (int64_t)win_s * 1000000000LL;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
-    if (s->last_ns >= cutoff && s->pid == r->pid && s->type == (uint32_t)r->type &&
-        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
-        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
-      /* A direct source id is authoritative.  The semantic fallback may
-       * bridge an unknown tuple to a later discovered tuple, but never two
-       * known, different lifetimes sharing a reused PID. */
-      if (!r->event_id[0]) {
-        if (generation_known && s->generation_known &&
-            !generation_equal(&s->generation, &generation)) {
-          continue;
-        }
-        if (!generation_known && !s->generation_known) {
-          continue;
-        }
-        if (generation_known != (int)s->generation_known &&
-            llabs(ts - s->last_ns) > EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS) {
-          continue;
-        }
-      }
+    if (s->last_ns >= cutoff &&
+        candidate_dedupe_slot_matches(s, r, ts, &generation, generation_known,
+                                      signal, semantic_signal)) {
       s->last_ns = ts;
       if (generation_known && !s->generation_known) {
         s->generation = generation;
@@ -1466,28 +1550,16 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
     return;
   }
   char signal[65];
+  char semantic_signal[65];
   generation_known = record_process_generation(r, &generation);
   candidate_signal_for(r, signal, sizeof(signal));
+  candidate_semantic_signal_for(r, semantic_signal, sizeof(semantic_signal));
   size_t replace_i = 0u;
   int64_t oldest = INT64_MAX;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
-    if (s->used && s->pid == r->pid && s->type == (uint32_t)r->type &&
-        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
-        strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
-      if (!r->event_id[0]) {
-        if (generation_known && s->generation_known &&
-            !generation_equal(&s->generation, &generation)) {
-          continue;
-        }
-        if (!generation_known && !s->generation_known) {
-          continue;
-        }
-        if (generation_known != (int)s->generation_known &&
-            llabs(ts - s->last_ns) > EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS) {
-          continue;
-        }
-      }
+    if (candidate_dedupe_slot_matches(s, r, ts, &generation, generation_known,
+                                      signal, semantic_signal)) {
       s->last_ns = ts;
       if (generation_known && !s->generation_known) {
         s->generation = generation;
@@ -1524,6 +1596,8 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
   copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r->endpoint_id);
   copy_s(slot->candidate_id, sizeof(slot->candidate_id), candidate_id);
   copy_s(slot->signal, sizeof(slot->signal), signal);
+  copy_s(slot->semantic_signal, sizeof(slot->semantic_signal), semantic_signal);
+  copy_s(slot->source_event_id, sizeof(slot->source_event_id), r->event_id);
 }
 
 #if defined(EDR_HAVE_SQLITE)
@@ -2112,6 +2186,96 @@ static int manifest_finish(cJSON *root, char **out) {
   return 0;
 }
 
+#if defined(EDR_HAVE_SQLITE)
+#define EDR_EVIDENCE_SOURCE_EVENT_ALIASES_MAX 16u
+
+static int manifest_array_add_unique_source(cJSON *array, const char *value,
+                                            uint32_t *count) {
+  cJSON *item;
+  if (!array || !count || !value || !value[0]) return 1;
+  if (!manifest_utf8_valid(value)) return 0;
+  cJSON_ArrayForEach(item, array) {
+    if (cJSON_IsString(item) && item->valuestring &&
+        strcmp(item->valuestring, value) == 0) {
+      return 1;
+    }
+  }
+  if (*count >= EDR_EVIDENCE_SOURCE_EVENT_ALIASES_MAX) return 0;
+  item = cJSON_CreateString(value);
+  if (!item || !cJSON_AddItemToArray(array, item)) {
+    cJSON_Delete(item);
+    return 0;
+  }
+  (*count)++;
+  return 1;
+}
+
+/* The candidate bundle is mutable, so retain every bounded provider source
+ * id before replacing its latest enrichment view. This reuses the existing
+ * artifact row and transaction rather than creating another persistence
+ * path or charging extra cache writes. */
+static int manifest_add_source_event_aliases(cJSON *root, const char *candidate_id,
+                                             const char *current_event_id) {
+  cJSON *aliases = NULL;
+  sqlite3_stmt *st = NULL;
+  uint32_t count = 0u;
+  int ok = 1;
+  aliases = cJSON_CreateArray();
+  if (!root || !aliases || !candidate_id || !candidate_id[0]) {
+    cJSON_Delete(aliases);
+    return 0;
+  }
+  if (s_db && sqlite3_prepare_v2(
+                  s_db,
+                  "SELECT manifest_json FROM artifacts WHERE candidate_id=? "
+                  "AND artifact_type='p0_context_bundle' LIMIT 1;",
+                  -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, candidate_id, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      const char *raw = (const char *)sqlite3_column_text(st, 0);
+      cJSON *previous = cJSON_Parse(raw ? raw : "");
+      if (!previous) {
+        ok = 0;
+      } else {
+        cJSON *previous_aliases =
+            cJSON_GetObjectItemCaseSensitive(previous, "source_event_ids");
+        if (cJSON_IsArray(previous_aliases)) {
+          cJSON *item;
+          cJSON_ArrayForEach(item, previous_aliases) {
+            if (!cJSON_IsString(item) || !item->valuestring ||
+                !manifest_array_add_unique_source(aliases, item->valuestring,
+                                                  &count)) {
+              ok = 0;
+              break;
+            }
+          }
+        } else {
+          cJSON *previous_source =
+              cJSON_GetObjectItemCaseSensitive(previous, "source_event_id");
+          if (cJSON_IsString(previous_source) && previous_source->valuestring) {
+            ok = manifest_array_add_unique_source(
+                aliases, previous_source->valuestring, &count);
+          }
+        }
+        cJSON_Delete(previous);
+      }
+    }
+    sqlite3_finalize(st);
+  } else if (s_db) {
+    cJSON_Delete(aliases);
+    return 0;
+  }
+  if (ok) {
+    ok = manifest_array_add_unique_source(aliases, current_event_id, &count);
+  }
+  if (!ok || !cJSON_AddItemToObject(root, "source_event_ids", aliases)) {
+    cJSON_Delete(aliases);
+    return 0;
+  }
+  return 1;
+}
+#endif
+
 static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *candidate_id,
                                        uint32_t pre_count, int64_t post_until_ns,
                                        char **out) {
@@ -2131,6 +2295,9 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   root = cJSON_CreateObject();
   context = root ? cJSON_AddArrayToObject(root, "context") : NULL;
   ok = root && context &&
+#if defined(EDR_HAVE_SQLITE)
+       manifest_add_source_event_aliases(root, candidate_id, r->event_id) &&
+#endif
        manifest_add_text(root, "schema", "p0_context_bundle.v1") &&
        manifest_add_text(root, "candidate_id", candidate_id) &&
        manifest_add_text(root, "source_event_id", r->event_id) &&

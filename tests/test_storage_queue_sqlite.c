@@ -1360,6 +1360,11 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   edr_storage_queue_get_capacity_metrics(&after);
   assert(after.event_queue_metadata_corruption_failures ==
          before.event_queue_metadata_corruption_failures + 2u);
+  assert(after.delivery_selected == before.delivery_selected + 3u);
+  assert(after.delivery_sent == before.delivery_sent + 1u);
+  assert(after.delivery_acked == before.delivery_acked + 1u);
+  assert(after.delivery_requeued == before.delivery_requeued);
+  assert(after.delivery_failed == before.delivery_failed + 2u);
   assert(after.used_bytes == 0u);
   assert(before.used_bytes > after.used_bytes + 400000u);
 
@@ -1386,6 +1391,11 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   edr_storage_queue_get_capacity_metrics(&after_transient);
   assert(after_transient.event_queue_metadata_corruption_failures ==
          after_reopen.event_queue_metadata_corruption_failures);
+  assert(after_transient.delivery_selected == after_reopen.delivery_selected + 1u);
+  assert(after_transient.delivery_sent == after_reopen.delivery_sent + 1u);
+  assert(after_transient.delivery_acked == after_reopen.delivery_acked);
+  assert(after_transient.delivery_requeued == after_reopen.delivery_requeued + 1u);
+  assert(after_transient.delivery_failed == after_reopen.delivery_failed);
 
   /* Dead-letter audit payloads are excluded from logical admission, so a
    * later ordinary batch can admit despite their retained physical bytes. */
@@ -1649,6 +1659,14 @@ static void test_logical_capacity_recovers_and_reserves_terminal(void) {
   edr_storage_queue_get_capacity_metrics(&after_drain);
   assert(after_drain.accounting_available == 1u);
   assert(after_drain.used_bytes == 0u);
+  assert(after_drain.delivery_selected - before_drain.delivery_selected ==
+         ordinary_before_drain + 2u);
+  assert(after_drain.delivery_sent - before_drain.delivery_sent ==
+         ordinary_before_drain + 2u);
+  assert(after_drain.delivery_acked - before_drain.delivery_acked ==
+         ordinary_before_drain + 2u);
+  assert(after_drain.delivery_requeued == before_drain.delivery_requeued);
+  assert(after_drain.delivery_failed == before_drain.delivery_failed);
   /* Physical sidecars may remain allocated, which is precisely why they are
    * only diagnostics; a fresh ordinary event must be accepted now. */
   assert(edr_storage_queue_enqueue("capacity-after-drain", large_wire, 65536u, 0, 0) == EDR_OK);

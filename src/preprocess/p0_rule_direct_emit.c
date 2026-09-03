@@ -1115,7 +1115,9 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
         !br->process_creation_filetime_100ns || !br->process_name[0] ||
         !br->exe_path[0] ||
         strcmp(br->image_path_resolution_status, "RESOLVED") != 0 ||
-        strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 ||
+        (strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 &&
+         strcmp(br->process_generation_source,
+                "file_read_pid_event_time_live_telemetry") != 0) ||
         strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) {
       return 0;
     }

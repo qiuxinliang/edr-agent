@@ -340,8 +340,9 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
 /* A live target query validates the target PID generation.  Kernel-Process
  * Start supplies the target key in its payload; EVENT_HEADER extended data is
  * intentionally not used here because it identifies the logging process.
- * Kernel-File actor events still arrive with their actor key in the header.
- * EventHeader.TimeStamp remains event time and is never a creation surrogate. */
+ * Kernel-File actor events use that key when the provider exposes it; the
+ * ARM64 schema may omit it. EventHeader.TimeStamp remains event time and is
+ * never a creation surrogate. */
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
@@ -360,10 +361,11 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   }
   source_start_key = br->process_start_key;
   source_creation = br->process_creation_filetime_100ns;
-  if (!br->pid || (br->type == EDR_EVENT_FILE_READ && !source_start_key)) {
+  if (!br->pid) {
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
-             "etw_process_start_key_unavailable");
-    p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_START_KEY_MISSING);
+             "live_process_pid_unavailable");
+    p0_mark_file_read_collector_evidence(
+        br, EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE);
     return 0;
   }
   process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
@@ -418,6 +420,20 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
              "live_generation_event_time_mismatch");
     return 0;
   }
+  /* Kernel-File Read does not carry ProcessStartKey on every supported
+   * provider architecture. A live query is still generation-safe when the
+   * ETW event timestamp proves the current PID lifetime already existed at
+   * the time of the Read. A reused PID necessarily has a later creation
+   * FILETIME and is rejected here. */
+  if (br->type == EDR_EVENT_FILE_READ &&
+      (!event_unix_ns || !creation_unix_ns || event_unix_ns < creation_unix_ns)) {
+    CloseHandle(process);
+    snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
+             "file_read_live_generation_event_time_mismatch");
+    p0_mark_file_read_collector_evidence(
+        br, EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH);
+    return 0;
+  }
   if (br->type == EDR_EVENT_PROCESS_CREATE && !br->cmdline[0]) {
     reason[0] = '\0';
     if (edr_process_command_line_query_live(process, br->cmdline, sizeof(br->cmdline),
@@ -440,7 +456,9 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
            br->type == EDR_EVENT_PROCESS_CREATE
                ? (source_start_key != 0u ? "kernel_payload_live_telemetry"
                                          : "target_live_telemetry")
-               : "etw_start_key_live_telemetry");
+               : (source_start_key != 0u
+                      ? "etw_start_key_live_telemetry"
+                      : "file_read_pid_event_time_live_telemetry"));
   return 1;
 }
 
@@ -1114,7 +1132,9 @@ static const char *p0_file_read_unavailable_reason(const EdrBehaviorRecord *br) 
   }
   if (!br->process_start_key) return EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
   if (!br->process_creation_filetime_100ns ||
-      strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0) {
+      (strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 &&
+       strcmp(br->process_generation_source,
+              "file_read_pid_event_time_live_telemetry") != 0)) {
     return p0_file_read_live_generation_reason(br->process_generation_source);
   }
   return NULL;
@@ -1318,9 +1338,9 @@ static void process_one_slot(const EdrEventSlot *slot) {
       default: break;
     }
   } else if (br.type == EDR_EVENT_FILE_READ) {
-    /* File reads are tied to the actor only after its ETW ProcessStartKey
-     * agrees with a live telemetry creation FILETIME.  PID-only collection is
-     * retained as source-only and never becomes P0 authority. */
+    /* File reads are tied to the actor only after a live StartKey/creation
+     * tuple agrees with an available ETW StartKey, or the event timestamp
+     * proves that the queried live PID generation already existed. */
     (void)p0_bind_process_generation(&br);
   }
 #endif

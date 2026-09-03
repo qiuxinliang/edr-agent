@@ -155,6 +155,14 @@ typedef struct {
   uint64_t enqueue_capacity_rejected;
   uint64_t enqueue_transaction_failures;
   uint64_t enqueue_commit_failures;
+  /* Replay lifecycle counters make every durable handoff stage observable:
+   * selected rows either remain pending, are ACK-deleted, or receive an
+   * explicit terminal disposition. `sent` counts actual transport calls. */
+  uint64_t delivery_selected;
+  uint64_t delivery_sent;
+  uint64_t delivery_acked;
+  uint64_t delivery_requeued;
+  uint64_t delivery_failed;
   /* Durable event_queue batch metadata that cannot safely cross SQLite TEXT
    * to the C-string transport boundary is terminally isolated by row id.
    * This is a process-lifetime counter; the row's status/reason is durable. */

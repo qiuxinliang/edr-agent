@@ -1851,7 +1851,7 @@ static int edr_agent_collection_enabled(const EdrConfig *cfg) {
 }
 
 static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns);
-static int edr_agent_restart_collector(EdrAgent *agent);
+static int edr_agent_restart_collector(EdrAgent *agent, const char *reason);
 
 EdrError edr_agent_run(EdrAgent *agent) {
   if (!agent || !agent->event_bus) {
@@ -1921,7 +1921,8 @@ EdrError edr_agent_run(EdrAgent *agent) {
               restart_now_ns - last_file_read_gate_restart_ns >= 5000000000ULL) {
             last_file_read_gate_restart_ns = restart_now_ns;
             edr_collector_file_read_metadata_gate_restart_attempted();
-            int restart_result = edr_agent_restart_collector(agent);
+            int restart_result =
+                edr_agent_restart_collector(agent, "file_read_metadata_recovery");
             if (restart_result == 0) {
               edr_collector_file_read_metadata_gate_restart_failed();
             }
@@ -2820,7 +2821,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)terminal_journal_metrics.precreate_commit_failures);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
                  p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"p0_offline_queue_capacity\":{\"used_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
+                 ",\"p0_offline_queue_capacity\":{\"used_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
                  (unsigned long long)queue_capacity_metrics.used_bytes,
                  (unsigned long long)queue_capacity_metrics.max_bytes,
                  queue_capacity_metrics.utilization_bps,
@@ -2844,6 +2845,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)queue_capacity_metrics.enqueue_capacity_rejected,
                  (unsigned long long)queue_capacity_metrics.enqueue_transaction_failures,
                  (unsigned long long)queue_capacity_metrics.enqueue_commit_failures,
+                 (unsigned long long)queue_capacity_metrics.delivery_selected,
+                 (unsigned long long)queue_capacity_metrics.delivery_sent,
+                 (unsigned long long)queue_capacity_metrics.delivery_acked,
+                 (unsigned long long)queue_capacity_metrics.delivery_requeued,
+                 (unsigned long long)queue_capacity_metrics.delivery_failed,
                  (unsigned long long)queue_capacity_metrics.db_bytes,
                  (unsigned long long)queue_capacity_metrics.wal_bytes,
                  (unsigned long long)queue_capacity_metrics.shm_bytes,
@@ -3781,7 +3787,8 @@ static int edr_collection_policy_changed(const EdrConfig *current, const EdrConf
          current->collection.etw_firewall_provider != remote->collection.etw_firewall_provider;
 }
 
-static int edr_agent_restart_collector(EdrAgent *agent) {
+static int edr_agent_restart_collector(EdrAgent *agent, const char *reason) {
+  const char *restart_reason = reason && reason[0] ? reason : "unspecified";
   if (!agent || !agent->event_bus) {
     return 0;
   }
@@ -3792,22 +3799,27 @@ static int edr_agent_restart_collector(EdrAgent *agent) {
 #ifdef _WIN32
       edr_collector_file_read_metadata_gate_restart_timeout();
 #endif
+      fprintf(stderr, "[collector] restart failed reason=%s stage=stop_join_timeout\n",
+              restart_reason);
       return -1;
     }
     agent->collector_started = 0;
   }
   if (!edr_agent_collection_enabled(&agent->cfg)) {
-    fprintf(stderr, "[collector] remote policy disabled collection; collector stopped\n");
+    fprintf(stderr, "[collector] stopped reason=%s collection_disabled=true\n",
+            restart_reason);
     return 0;
   }
   {
     EdrError e = edr_collector_start(agent->event_bus, &agent->cfg);
     if (e != EDR_OK) {
-      fprintf(stderr, "[collector] remote policy restart failed: %d; continuing in degraded mode\n", (int)e);
+      fprintf(stderr,
+              "[collector] restart failed reason=%s stage=start error=%d; continuing in degraded mode\n",
+              restart_reason, (int)e);
       return 0;
     }
     agent->collector_started = 1;
-    fprintf(stderr, "[collector] remote policy applied; collector restarted\n");
+    fprintf(stderr, "[collector] restarted reason=%s\n", restart_reason);
     return 1;
   }
 }
@@ -4230,7 +4242,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_config_free_heap(&remote);
   (void)remove(tmp);
   if ((changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0) {
-    (void)edr_agent_restart_collector(agent);
+    (void)edr_agent_restart_collector(agent, "remote_policy_changed");
   }
   if ((changed & EDR_REMOTE_POLICY_DETECTION_CHANGED) != 0) {
     edr_shellcode_detector_shutdown();

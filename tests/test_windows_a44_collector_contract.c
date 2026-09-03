@@ -351,8 +351,13 @@ int main(void) {
       collector,
       "edr_sha256_hex((const uint8_t *)commitment, (size_t)commitment_len,\n                       commitment_sha256) != 0",
       "successful event-identity commitments must pass the FileRead metadata gate");
-  ok &= require_contains(collector, "if (!read_pid || !read_start_key)",
-                         "the attributed Read must carry a nonzero actor generation");
+  ok &= require_contains(collector, "if (!read_pid)",
+                         "the attributed Read must carry an actor PID for live generation binding");
+  ok &= require_absent_in_function(
+      collector, "static int edr_collector_kernel_file_read_resolve(",
+      "static int edr_collector_append_file_read_binding(",
+      "if (!read_pid || !read_start_key)",
+      "ARM64 FileRead schemas without an extended StartKey must reach live generation binding");
   ok &= require_contains(collector, "NameCreate binds the file object, not the process",
                          "FileKey path identity must be independent from the NameCreate actor");
   ok &= require_contains(preprocess, "br.type == EDR_EVENT_FILE_READ",
@@ -363,6 +368,10 @@ int main(void) {
                          "direct P0 must gate file reads independently of process creates");
   ok &= require_contains(direct, "etw_start_key_live_telemetry",
                          "direct P0 must require a live StartKey/FILETIME binding");
+  ok &= require_contains(preprocess, "file_read_pid_event_time_live_telemetry",
+                         "FileRead without an extended StartKey must use the timestamp-bound live tuple");
+  ok &= require_contains(direct, "file_read_pid_event_time_live_telemetry",
+                         "direct P0 must accept the timestamp-bound live FileRead generation");
   ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" : \"event\"",
                          "typed record mapping must preserve read semantics");
   ok &= require_before(collector, "if (slot->type == EDR_EVENT_FILE_READ) {",
@@ -403,6 +412,16 @@ int main(void) {
                          "an early ProcessTrace return must revoke FileRead readiness");
   ok &= require_contains(agent, "edr_collector_file_read_metadata_gate_restart_timeout();",
                          "a collector join timeout must block automatic epoch overlap");
+  ok &= require_contains(collector,
+                         "EDR_FILE_READ_METADATA_MAX_CONSECUTIVE_RESTARTS",
+                         "automatic FileRead recovery must have a bounded restart limit");
+  ok &= require_contains(collector,
+                         "file_read_metadata_epoch_restart_limit_reached",
+                         "restart exhaustion must retain an explicit terminal reason");
+  ok &= require_contains(agent, "file_read_metadata_recovery",
+                         "collector restart logs must identify FileRead recovery");
+  ok &= require_contains(agent, "remote_policy_changed",
+                         "collector restart logs must identify policy changes separately");
   ok &= require_contains(agent, "if (!edr_collector_stop())",
                          "agent restart must require a complete collector join before a new epoch");
 

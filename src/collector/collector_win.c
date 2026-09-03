@@ -98,6 +98,7 @@ static const EdrConfig *s_collector_cfg;
 #define EDR_AGENT_SELF_PID_CACHE 128u
 #define EDR_POLICY_CANARY_PID_CACHE 32u
 #define EDR_FILE_READ_METADATA_COALESCE_SLOTS 64u
+#define EDR_FILE_READ_METADATA_MAX_CONSECUTIVE_RESTARTS 3u
 
 /* Microsoft-Windows-Kernel-File manifest constants.  Read is event/task 15
  * with FILEIO|READ; NameCreate carries the FileKey→FileName binding used to
@@ -216,6 +217,7 @@ typedef struct {
    * decoder state, so automatic restart must remain disabled until an
    * explicit lifecycle owner has observed a clean stop. */
   uint8_t restart_blocked;
+  uint32_t consecutive_restart_attempts;
   uint64_t epoch_restart_attempts;
   uint64_t epoch_restart_successes;
   uint64_t epoch_restart_failures;
@@ -2316,6 +2318,7 @@ static void edr_collector_file_read_metadata_gate_session_starting(void) {
   s_file_read_metadata_gate.session_reset_observed = 0u;
   s_file_read_metadata_gate.resume_degraded = 0u;
   s_file_read_metadata_gate.restart_blocked = 0u;
+  s_file_read_metadata_gate.consecutive_restart_attempts = 0u;
   snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
            "file_read_metadata_new_session_degraded");
   s_health.file_read_p0_capability_healthy = 0;
@@ -2358,6 +2361,7 @@ static void edr_collector_file_read_metadata_gate_note_resolved(void) {
     s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
     s_file_read_metadata_gate.reason[0] = '\0';
     s_file_read_metadata_gate.post_reset_recovery_reason[0] = '\0';
+    s_file_read_metadata_gate.consecutive_restart_attempts = 0u;
     s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
     s_health.file_read_p0_capability_healthy = 1;
     s_health.file_read_p0_capability_reason[0] = '\0';
@@ -2607,12 +2611,16 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
     uint64_t restart_attempts = s_file_read_metadata_gate.epoch_restart_attempts;
     uint64_t restart_successes = s_file_read_metadata_gate.epoch_restart_successes;
     uint64_t restart_failures = s_file_read_metadata_gate.epoch_restart_failures;
+    uint32_t consecutive_restart_attempts =
+        s_file_read_metadata_gate.consecutive_restart_attempts;
     uint8_t resume_degraded =
         s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED;
     memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
     s_file_read_metadata_gate.epoch_restart_attempts = restart_attempts;
     s_file_read_metadata_gate.epoch_restart_successes = restart_successes;
     s_file_read_metadata_gate.epoch_restart_failures = restart_failures;
+    s_file_read_metadata_gate.consecutive_restart_attempts =
+        consecutive_restart_attempts;
     s_file_read_metadata_gate.resume_degraded = resume_degraded;
   }
   s_file_read_metadata_gate.slot = slot;
@@ -2715,6 +2723,7 @@ void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
         s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
         s_file_read_metadata_gate.reason[0] = '\0';
         s_file_read_metadata_gate.post_reset_recovery_reason[0] = '\0';
+        s_file_read_metadata_gate.consecutive_restart_attempts = 0u;
         s_health.file_read_p0_capability_healthy = 1;
         s_health.file_read_p0_capability_reason[0] = '\0';
       } else {
@@ -2758,12 +2767,19 @@ void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
 
 int edr_collector_file_read_metadata_gate_restart_required(void) {
   int required = 0;
-  AcquireSRWLockShared(&s_file_read_metadata_gate_lock);
+  AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
   required = s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY &&
              s_file_read_metadata_gate.requires_session_reset &&
              !s_file_read_metadata_gate.slot_valid &&
              !s_file_read_metadata_gate.restart_blocked;
-  ReleaseSRWLockShared(&s_file_read_metadata_gate_lock);
+  if (required && s_file_read_metadata_gate.consecutive_restart_attempts >=
+                      EDR_FILE_READ_METADATA_MAX_CONSECUTIVE_RESTARTS) {
+    s_file_read_metadata_gate.restart_blocked = 1u;
+    edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
+        "file_read_metadata_epoch_restart_limit_reached");
+    required = 0;
+  }
+  ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
   return required;
 }
 
@@ -2773,6 +2789,7 @@ void edr_collector_file_read_metadata_gate_restart_attempted(void) {
       s_file_read_metadata_gate.requires_session_reset &&
       !s_file_read_metadata_gate.slot_valid) {
     s_file_read_metadata_gate.epoch_restart_attempts++;
+    s_file_read_metadata_gate.consecutive_restart_attempts++;
   }
   ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
 }
@@ -3007,7 +3024,6 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
   uint64_t file_key = 0u;
   uint64_t best_name_event_ns = 0u;
   uint64_t best_problem_event_ns = 0u;
-  uint64_t read_start_key = 0u;
   uint64_t session_epoch;
   uint32_t read_pid;
   int resolved = 0;
@@ -3030,7 +3046,6 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
   }
   *out_file_key = file_key;
   read_pid = (uint32_t)record->EventHeader.ProcessId;
-  (void)edr_collector_event_process_start_key(record, &read_start_key);
   AcquireSRWLockExclusive(&s_file_key_cache_lock);
   session_epoch = s_file_key_session_epoch;
   edr_collector_file_key_cache_purge_locked(event_ns);
@@ -3055,14 +3070,16 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
       continue;
     }
     /* NameCreate binds the file object, not the process that will eventually
-     * read it.  Require the actor tuple on the Read itself; preprocess then
-     * validates this StartKey against the live creation FILETIME before P0
-     * matching. */
-    if (!read_pid || !read_start_key) {
+     * read it. Some supported Kernel-File schemas omit the actor StartKey on
+     * Read, including the observed Windows ARM64 provider. Retain the exact
+     * FileKey/name/epoch fact when PID is present; preprocess binds that PID
+     * to a live StartKey + creation FILETIME and proves the event timestamp
+     * is not from an older PID lifetime before P0 matching. */
+    if (!read_pid) {
       if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
         snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
         have_problem = 1;
-        problem_reason = EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
+        problem_reason = EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE;
         best_problem_event_ns = entry->name_event_ns;
       }
       continue;

@@ -98,6 +98,11 @@ static uint64_t s_enqueue_admitted;
 static uint64_t s_enqueue_capacity_rejected;
 static uint64_t s_enqueue_transaction_failures;
 static uint64_t s_enqueue_commit_failures;
+static uint64_t s_delivery_selected;
+static uint64_t s_delivery_sent;
+static uint64_t s_delivery_acked;
+static uint64_t s_delivery_requeued;
+static uint64_t s_delivery_failed;
 static uint64_t s_event_queue_metadata_corruption_failures;
 static uint64_t s_retention_evicted_rows;
 static uint64_t s_last_cleanup_ns;
@@ -378,6 +383,11 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   out->enqueue_capacity_rejected = s_enqueue_capacity_rejected;
   out->enqueue_transaction_failures = s_enqueue_transaction_failures;
   out->enqueue_commit_failures = s_enqueue_commit_failures;
+  out->delivery_selected = s_delivery_selected;
+  out->delivery_sent = s_delivery_sent;
+  out->delivery_acked = s_delivery_acked;
+  out->delivery_requeued = s_delivery_requeued;
+  out->delivery_failed = s_delivery_failed;
   out->event_queue_metadata_corruption_failures =
       s_event_queue_metadata_corruption_failures;
   out->retention_evicted_rows = s_retention_evicted_rows;
@@ -914,6 +924,7 @@ static int drain_one_row(void) {
   int severity = sqlite3_column_int(st, 4);
   uint8_t *blob_copy = NULL;
   char *batch_id_copy = NULL;
+  s_delivery_selected++;
   int metadata_invalid = !queue_sql_text_valid(batch_id, batch_id_len);
   if (metadata_invalid) {
     int quarantined;
@@ -925,7 +936,10 @@ static int drain_one_row(void) {
                       ? queue_meta_quarantine_source_only_locked(
                             id, "source_only_invalid_batch_id_metadata")
                       : dead_letter_row_by_id(id, "invalid_batch_id_metadata");
-    if (quarantined == 0) s_event_queue_metadata_corruption_failures++;
+    if (quarantined == 0) {
+      s_event_queue_metadata_corruption_failures++;
+      s_delivery_failed++;
+    }
     queue_state_unlock();
     return quarantined == 0 ? 0 : 2;
   }
@@ -952,55 +966,83 @@ static int drain_one_row(void) {
      * collector/ruleset source cannot be evaluated. It never expires through
      * the ordinary retry policy: only a central ACK may remove it. */
     if (severity != EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY && lim > 0 && retry_count >= lim) {
+      int disposed;
       if (severity > EDR_STORAGE_QUEUE_SEVERITY_ORDINARY) {
-        (void)dead_letter_row_by_id(id, "max_retries");
+        disposed = dead_letter_row_by_id(id, "max_retries") == 0;
       } else {
-        (void)delete_row_by_id(id);
+        disposed = delete_row_by_id(id) == 0;
       }
+      if (disposed) s_delivery_failed++;
       free(batch_id_copy);
       free(blob_copy);
       queue_state_unlock();
-      return 0;
+      return disposed ? 0 : 2;
     }
   }
 
   if (!batch_id_copy || !blob_copy || blob_len < 12) {
+    int disposed;
     if (severity == EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY) {
-      (void)queue_meta_quarantine_source_only_locked(id, "source_only_corrupt_payload");
+      disposed = queue_meta_quarantine_source_only_locked(
+                     id, "source_only_corrupt_payload") == 0;
     } else {
-      (void)dead_letter_row_by_id(id, "corrupt_payload");
+      disposed = dead_letter_row_by_id(id, "corrupt_payload") == 0;
     }
+    if (disposed) s_delivery_failed++;
     free(batch_id_copy);
     free(blob_copy);
     queue_state_unlock();
-    return 0;
+    return disposed ? 0 : 2;
   }
 
   const uint8_t *b = blob_copy;
   if (!batch_header_valid(b)) {
+    int disposed;
     if (severity == EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY) {
-      (void)queue_meta_quarantine_source_only_locked(id, "source_only_invalid_wire_header");
+      disposed = queue_meta_quarantine_source_only_locked(
+                     id, "source_only_invalid_wire_header") == 0;
     } else {
       log_legacy_drop(id);
-      (void)dead_letter_row_by_id(id, "invalid_wire_header");
+      disposed = dead_letter_row_by_id(id, "invalid_wire_header") == 0;
     }
+    if (disposed) s_delivery_failed++;
     free(batch_id_copy);
     free(blob_copy);
     queue_state_unlock();
-    return 0;
+    return disposed ? 0 : 2;
   }
 
   /* Network transport is intentionally outside the queue lock. `blob_copy`
    * owns the row bytes across this boundary and close cannot invalidate it. */
+  if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
+    fprintf(stderr, "[queue_delivery] state=selected row_id=%lld batch_id=%s retry=%d\n",
+            (long long)id, batch_id_copy, retry_count);
+  }
   queue_state_unlock();
   int send = -1;
   if (edr_ingest_http_configured()) {
     if (edr_ingest_http_circuit_open()) {
+      queue_state_lock();
+      s_delivery_requeued++;
+      queue_state_unlock();
+      if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
+        fprintf(stderr,
+                "[queue_delivery] state=requeued row_id=%lld batch_id=%s send=circuit_open\n",
+                (long long)id, batch_id_copy);
+      }
       free(batch_id_copy);
       free(blob_copy);
       return 2;
     }
-    send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12, (size_t)blob_len - 12u);
+    queue_state_lock();
+    s_delivery_sent++;
+    queue_state_unlock();
+    if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
+      fprintf(stderr, "[queue_delivery] state=sent row_id=%lld batch_id=%s\n",
+              (long long)id, batch_id_copy);
+    }
+    send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12,
+                                          (size_t)blob_len - 12u);
   }
   if (send == 0) {
     int acknowledged = 0;
@@ -1008,8 +1050,14 @@ static int drain_one_row(void) {
     if (s_db == selected_db && s_db_generation == selected_generation) {
       acknowledged =
           delete_selected_row(selected_db, id, batch_id_copy, blob_copy, blob_len, severity) == 0;
+      if (acknowledged) s_delivery_acked++;
     }
     queue_state_unlock();
+    if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
+      fprintf(stderr, "[queue_delivery] state=%s row_id=%lld batch_id=%s\n",
+              acknowledged ? "acked" : "ack_state_race", (long long)id,
+              batch_id_copy);
+    }
     free(batch_id_copy);
     free(blob_copy);
     /* A close/reopen can install a new queue while this send is in flight.
@@ -1017,10 +1065,18 @@ static int drain_one_row(void) {
     return acknowledged ? 0 : 2;
   }
   queue_state_lock();
+  int requeued = 0;
   if (s_db == selected_db && s_db_generation == selected_generation) {
     bump_selected_retry(selected_db, id, batch_id_copy, blob_copy, blob_len);
+    s_delivery_requeued++;
+    requeued = 1;
   }
   queue_state_unlock();
+  if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
+    fprintf(stderr, "[queue_delivery] state=%s row_id=%lld batch_id=%s send=%d\n",
+            requeued ? "requeued" : "retry_state_race", (long long)id,
+            batch_id_copy, send);
+  }
   free(batch_id_copy);
   free(blob_copy);
   return 2;
