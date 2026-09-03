@@ -134,9 +134,11 @@ typedef struct {
   uint32_t pid;
   uint32_t type;
   char endpoint_id[48];
-  /* SHA-256 commitment over the source record's stable process generation
-   * and candidate semantics. It is an exact local-evidence reuse key, not an
-   * alert-suppression or cross-restart cache key. */
+  uint8_t generation_known;
+  EvidenceProcessGeneration generation;
+  char candidate_id[160];
+  /* Exact source-event or atomic-behavior commitment.  It is a local
+   * evidence reuse key, not an alert-suppression or cross-restart cache key. */
   char signal[65];
 } CandidateDedupeSlot;
 
@@ -997,6 +999,8 @@ static uint32_t candidate_dedupe_window_s(void) {
                          60u, 1u, 600u);
 }
 
+#define EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS 2000000000LL
+
 static void candidate_digest_text(EdrSha256Ctx *ctx, const char *value) {
   uint32_t length = value ? (uint32_t)strlen(value) : 0u;
   uint8_t length_le[4];
@@ -1016,12 +1020,10 @@ static void candidate_digest_u64(EdrSha256Ctx *ctx, uint64_t value) {
   edr_sha256_update(ctx, bytes, sizeof(bytes));
 }
 
-/* PID is reusable. Do not turn a generation-less candidate into a local
- * reuse hit: retaining a duplicate is safer than silently sharing evidence
- * across a later process lifetime. */
-static int candidate_generation_bound(const EdrBehaviorRecord *r) {
-  EvidenceProcessGeneration generation;
-  return record_process_generation(r, &generation);
+/* A source event id is sufficient when carried through enrichment.  Without
+ * it, fallback reuse is strictly local, PID-scoped, and generation-checked. */
+static int candidate_identity_bound(const EdrBehaviorRecord *r) {
+  return r && r->pid != 0u;
 }
 
 static void candidate_id_for(const EdrBehaviorRecord *r, char *out, size_t cap) {
@@ -1029,12 +1031,22 @@ static void candidate_id_for(const EdrBehaviorRecord *r, char *out, size_t cap) 
     return;
   }
   char signal[65];
+  EvidenceProcessGeneration generation;
   candidate_signal_for(r, signal, sizeof(signal));
-  uint32_t win_s = candidate_dedupe_window_s();
-  int64_t bucket = record_time_ns(r) / ((int64_t)win_s * 1000000000LL);
-  snprintf(out, cap, "p0-%s-%lld-%s",
-           (r && r->endpoint_id[0]) ? r->endpoint_id : "unknown",
-           (long long)bucket, signal[0] ? signal : "invalid");
+  const char *endpoint = (r && r->endpoint_id[0]) ? r->endpoint_id : "unknown";
+  if (r && r->event_id[0]) {
+    snprintf(out, cap, "p0-%s-e-%s", endpoint, signal[0] ? signal : "invalid");
+  } else if (record_process_generation(r, &generation)) {
+    snprintf(out, cap, "p0-%s-g-%016llx-%016llx-%s", endpoint,
+             (unsigned long long)generation.process_start_key,
+             (unsigned long long)generation.creation_filetime_100ns,
+             signal[0] ? signal : "invalid");
+  } else {
+    /* Unknown lifetimes must not durably collide.  A later known tuple can
+     * reuse this id only through the short, in-memory skew bridge below. */
+    snprintf(out, cap, "p0-%s-u-%lld-%s", endpoint, (long long)record_time_ns(r),
+             signal[0] ? signal : "invalid");
+  }
 }
 
 static uint32_t env_u32_clamped(const char *name, uint32_t fallback, uint32_t min_v,
@@ -1082,8 +1094,6 @@ static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t c
   static const char hex[] = "0123456789abcdef";
   const char *canonical_image;
   const char *path_hash;
-  EvidenceProcessGeneration generation;
-  int generation_known;
   if (!out || cap == 0u) {
     return;
   }
@@ -1093,23 +1103,26 @@ static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t c
   }
   canonical_image = r->image_path_canonical[0] ? r->image_path_canonical : r->exe_path;
   path_hash = r->process_path_hash[0] ? r->process_path_hash : r->exe_hash;
-  generation_known = record_process_generation(r, &generation);
-  /* This is deliberately a length-delimited exact commitment, not another
-   * path/cmd/script normalizer. Upstream canonical image/path-hash fields are
-   * consumed where present; raw semantic fields are retained verbatim so a
-   * changed command, path, script, hash, network, or registry assertion is
-   * never reused merely because it shares a rule and PID. */
+  /* A source event id is the preferred stable identity.  Its surrounding
+   * enrichment (timestamps, revisions, source labels and completeness) must
+   * not manufacture another P0 candidate for the same source event. */
   edr_sha256_init(&ctx);
-  candidate_digest_text(&ctx, "edr-local-evidence-candidate-v2");
+  candidate_digest_text(&ctx, "edr-local-evidence-candidate-v3");
+  candidate_digest_text(&ctx, r->endpoint_id);
+  candidate_digest_text(&ctx, r->tenant_id);
+  if (r->event_id[0]) {
+    candidate_digest_text(&ctx, "source-event");
+    candidate_digest_text(&ctx, r->event_id);
+    goto finish;
+  }
+  /* A source without an event id may only reuse within a proven process
+   * lifetime.  Retain the immutable atomic behavior semantics so two distinct
+   * commands, file, network, or registry events in that lifetime remain
+   * distinct candidates. */
+  candidate_digest_text(&ctx, "atomic-semantic-source");
 #define CANDIDATE_TEXT(field) candidate_digest_text(&ctx, r->field)
 #define CANDIDATE_U64(field) candidate_digest_u64(&ctx, (uint64_t)r->field)
-  CANDIDATE_TEXT(event_id); CANDIDATE_TEXT(endpoint_id); CANDIDATE_TEXT(tenant_id);
-  CANDIDATE_U64(event_time_ns); CANDIDATE_U64(pid); CANDIDATE_U64(ppid);
-  CANDIDATE_U64(type); CANDIDATE_U64(priority); CANDIDATE_U64(evidence_revision);
-  candidate_digest_u64(&ctx, generation_known ? generation.process_start_key : 0u);
-  candidate_digest_u64(&ctx, generation_known ? generation.creation_filetime_100ns : 0u);
-  candidate_digest_text(&ctx, generation_known ? record_process_generation_source(r) : "");
-  CANDIDATE_TEXT(source_completeness); CANDIDATE_TEXT(source_truncated_fields);
+  CANDIDATE_U64(pid); CANDIDATE_U64(ppid); CANDIDATE_U64(type);
   CANDIDATE_TEXT(process_name);
   candidate_digest_text(&ctx, canonical_image); candidate_digest_text(&ctx, path_hash);
   CANDIDATE_TEXT(exe_hash); CANDIDATE_TEXT(image_path_raw); CANDIDATE_TEXT(cmdline);
@@ -1122,9 +1135,9 @@ static void candidate_signal_for(const EdrBehaviorRecord *r, char *out, size_t c
   CANDIDATE_TEXT(reg_attribution); CANDIDATE_TEXT(reg_detail_status);
   CANDIDATE_TEXT(script_snippet); CANDIDATE_TEXT(powershell_script_block);
   CANDIDATE_TEXT(wmi_filter); CANDIDATE_TEXT(scheduled_task_path);
-  CANDIDATE_TEXT(detection_context);
 #undef CANDIDATE_TEXT
 #undef CANDIDATE_U64
+finish:
   edr_sha256_final(&ctx, digest);
   for (size_t i = 0u; i < sizeof(digest); ++i) {
     out[i * 2u] = hex[digest[i] >> 4u];
@@ -1393,8 +1406,11 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
 /* Only already-committed candidates may satisfy a reuse.  A failed write must
  * not populate this in-memory index, otherwise the next copy of the alert
  * could be hidden for the whole dedupe window. */
-static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts) {
-  if (!candidate_generation_bound(r)) {
+static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
+                                  char *candidate_id, size_t candidate_id_cap) {
+  EvidenceProcessGeneration generation;
+  int generation_known;
+  if (!candidate_identity_bound(r)) {
     return 0;
   }
   uint32_t win_s = candidate_dedupe_window_s();
@@ -1402,6 +1418,7 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts) {
     return 0;
   }
   char signal[65];
+  generation_known = record_process_generation(r, &generation);
   candidate_signal_for(r, signal, sizeof(signal));
   int64_t cutoff = ts - (int64_t)win_s * 1000000000LL;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
@@ -1409,7 +1426,30 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts) {
     if (s->last_ns >= cutoff && s->pid == r->pid && s->type == (uint32_t)r->type &&
         strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
         strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
+      /* A direct source id is authoritative.  The semantic fallback may
+       * bridge an unknown tuple to a later discovered tuple, but never two
+       * known, different lifetimes sharing a reused PID. */
+      if (!r->event_id[0]) {
+        if (generation_known && s->generation_known &&
+            !generation_equal(&s->generation, &generation)) {
+          continue;
+        }
+        if (!generation_known && !s->generation_known) {
+          continue;
+        }
+        if (generation_known != (int)s->generation_known &&
+            llabs(ts - s->last_ns) > EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS) {
+          continue;
+        }
+      }
       s->last_ns = ts;
+      if (generation_known && !s->generation_known) {
+        s->generation = generation;
+        s->generation_known = 1u;
+      }
+      if (candidate_id && candidate_id_cap > 0u && s->candidate_id[0]) {
+        copy_s(candidate_id, candidate_id_cap, s->candidate_id);
+      }
       s_status.candidate_deduped++;
       s_status.candidate_reused++;
       return 1;
@@ -1418,11 +1458,15 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts) {
   return 0;
 }
 
-static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts) {
-  if (!candidate_generation_bound(r) || candidate_dedupe_window_s() == 0u) {
+static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
+                                   const char *candidate_id) {
+  EvidenceProcessGeneration generation;
+  int generation_known;
+  if (!candidate_identity_bound(r) || candidate_dedupe_window_s() == 0u) {
     return;
   }
   char signal[65];
+  generation_known = record_process_generation(r, &generation);
   candidate_signal_for(r, signal, sizeof(signal));
   size_t replace_i = 0u;
   int64_t oldest = INT64_MAX;
@@ -1431,7 +1475,27 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts) {
     if (s->used && s->pid == r->pid && s->type == (uint32_t)r->type &&
         strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
         strncmp(s->signal, signal, sizeof(s->signal)) == 0) {
+      if (!r->event_id[0]) {
+        if (generation_known && s->generation_known &&
+            !generation_equal(&s->generation, &generation)) {
+          continue;
+        }
+        if (!generation_known && !s->generation_known) {
+          continue;
+        }
+        if (generation_known != (int)s->generation_known &&
+            llabs(ts - s->last_ns) > EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS) {
+          continue;
+        }
+      }
       s->last_ns = ts;
+      if (generation_known && !s->generation_known) {
+        s->generation = generation;
+        s->generation_known = 1u;
+      }
+      if (candidate_id && candidate_id[0]) {
+        copy_s(s->candidate_id, sizeof(s->candidate_id), candidate_id);
+      }
       return;
     }
     if (!s->used) {
@@ -1453,7 +1517,12 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts) {
   slot->last_ns = ts;
   slot->pid = r->pid;
   slot->type = (uint32_t)r->type;
+  slot->generation_known = generation_known ? 1u : 0u;
+  if (generation_known) {
+    slot->generation = generation;
+  }
   copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r->endpoint_id);
+  copy_s(slot->candidate_id, sizeof(slot->candidate_id), candidate_id);
   copy_s(slot->signal, sizeof(slot->signal), signal);
 }
 
@@ -1715,16 +1784,16 @@ static int sqlite_write_budget_allow(uint32_t units, int64_t ts, int candidate) 
     s_write_budget_count = 0u;
     s_write_budget_context_count = 0u;
   }
-  /* Context fan-out may consume at most half of the minute budget. Candidates
-   * may use the whole budget, so optional context cannot starve later P0/P1
-   * candidate rows while total writes remain strictly bounded. */
+  /* The minute rate limit applies to optional context fan-out only.  P0/P1
+   * candidates remain subject to the durable size limit and transaction
+   * failures, but telemetry pressure must not turn an alert into a soft-rate
+   * drop. */
   uint32_t context_limit = limit / 2u;
-  if (s_write_budget_count >= limit || units > limit - s_write_budget_count ||
-      (!candidate && (s_write_budget_context_count >= context_limit ||
-                      units > context_limit - s_write_budget_context_count))) {
+  if (!candidate && (s_write_budget_count >= limit || units > limit - s_write_budget_count ||
+                     s_write_budget_context_count >= context_limit ||
+                     units > context_limit - s_write_budget_context_count)) {
     s_status.write_budget_dropped++;
-    if (candidate) s_status.write_budget_candidate_dropped++;
-    else s_status.write_budget_context_dropped++;
+    s_status.write_budget_context_dropped++;
     set_error("evidence cache write budget exceeded");
     return 0;
   }
@@ -2227,7 +2296,14 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
   char artifact_id[384];
   char source_identity[65];
   const char *type_name = artifact_type && artifact_type[0] ? artifact_type : "artifact";
-  artifact_source_identity_for(r, source_identity, sizeof(source_identity));
+  /* The candidate bundle is a mutable representation of one candidate, not
+   * another source event.  Give its UPSERT a candidate-stable artifact id so
+   * enrichment replaces the manifest instead of accumulating sibling bundles. */
+  if (strcmp(type_name, "p0_context_bundle") == 0) {
+    copy_s(source_identity, sizeof(source_identity), "candidate");
+  } else {
+    artifact_source_identity_for(r, source_identity, sizeof(source_identity));
+  }
   int artifact_id_written = snprintf(artifact_id, sizeof(artifact_id), "%s:%s:%s",
                                      candidate_id, type_name, source_identity);
   if (!source_identity[0] || artifact_id_written < 0 ||
@@ -2320,8 +2396,28 @@ static int sqlite_commit_candidate_transaction(void) {
   return 0;
 }
 
-static int sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_count,
-                                   int64_t post_until_ns) {
+/* A durable candidate is updated even after the small in-memory reuse window
+ * expires (or after a restart).  This avoids treating an enrichment replay as
+ * a fresh admission and charging it against the bounded new-candidate budget. */
+static int sqlite_candidate_exists(const char *candidate_id) {
+  sqlite3_stmt *st = NULL;
+  int exists = 0;
+  if (!s_db || !candidate_id || !candidate_id[0]) {
+    return 0;
+  }
+  if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE candidate_id=? LIMIT 1;",
+                         -1, &st, NULL) != SQLITE_OK) {
+    set_error("prepare p0_candidates lookup failed");
+    return -1;
+  }
+  sqlite3_bind_text(st, 1, candidate_id, -1, SQLITE_TRANSIENT);
+  exists = sqlite3_step(st) == SQLITE_ROW;
+  sqlite3_finalize(st);
+  return exists;
+}
+
+static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candidate_id,
+                                   uint32_t pre_count, int64_t post_until_ns) {
   EvidenceProcessGeneration generation;
   int generation_known;
   const char *generation_source;
@@ -2331,8 +2427,11 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_coun
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
-  char candidate_id[160];
-  candidate_id_for(r, candidate_id, sizeof(candidate_id));
+  char computed_candidate_id[160];
+  if (!candidate_id || !candidate_id[0]) {
+    candidate_id_for(r, computed_candidate_id, sizeof(computed_candidate_id));
+    candidate_id = computed_candidate_id;
+  }
   if (exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
@@ -2347,13 +2446,47 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, uint32_t pre_coun
       "process_start_key,process_creation_filetime_100ns,process_generation_source,"
       "source_completeness,source_truncated_fields) "
       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-      "ON CONFLICT(candidate_id) DO UPDATE SET context_pre_count=excluded.context_pre_count,"
-      "context_post_until_ns=excluded.context_post_until_ns,created_ns=excluded.created_ns,"
-      "process_start_key=excluded.process_start_key,"
-      "process_creation_filetime_100ns=excluded.process_creation_filetime_100ns,"
-      "process_generation_source=excluded.process_generation_source,"
-      "source_completeness=excluded.source_completeness,"
-      "source_truncated_fields=excluded.source_truncated_fields;";
+      "ON CONFLICT(candidate_id) DO UPDATE SET "
+      "tenant_id=CASE WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE p0_candidates.tenant_id END,"
+      "event_time_ns=CASE WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
+      "WHEN excluded.event_time_ns=0 THEN p0_candidates.event_time_ns "
+      "ELSE MIN(p0_candidates.event_time_ns,excluded.event_time_ns) END,"
+      "type=CASE WHEN excluded.type<>0 THEN excluded.type ELSE p0_candidates.type END,"
+      "pid=CASE WHEN excluded.pid<>0 THEN excluded.pid ELSE p0_candidates.pid END,"
+      "ppid=CASE WHEN excluded.ppid<>0 THEN excluded.ppid ELSE p0_candidates.ppid END,"
+      "process_name=CASE WHEN excluded.process_name<>'' THEN excluded.process_name ELSE p0_candidates.process_name END,"
+      "exe_path=CASE WHEN excluded.exe_path<>'' THEN excluded.exe_path ELSE p0_candidates.exe_path END,"
+      "cmdline=CASE WHEN excluded.cmdline<>'' THEN excluded.cmdline ELSE p0_candidates.cmdline END,"
+      "file_path=CASE WHEN excluded.file_path<>'' THEN excluded.file_path ELSE p0_candidates.file_path END,"
+      "dns_query=CASE WHEN excluded.dns_query<>'' THEN excluded.dns_query ELSE p0_candidates.dns_query END,"
+      "net_dst=CASE WHEN excluded.net_dst<>'' THEN excluded.net_dst ELSE p0_candidates.net_dst END,"
+      "net_dport=CASE WHEN excluded.net_dport<>0 THEN excluded.net_dport ELSE p0_candidates.net_dport END,"
+      "reg_key_path=CASE WHEN excluded.reg_key_path<>'' THEN excluded.reg_key_path ELSE p0_candidates.reg_key_path END,"
+      "reg_value_name=CASE WHEN excluded.reg_value_name<>'' THEN excluded.reg_value_name ELSE p0_candidates.reg_value_name END,"
+      "reg_op=CASE WHEN excluded.reg_op<>'' THEN excluded.reg_op ELSE p0_candidates.reg_op END,"
+      "detection_context=CASE WHEN excluded.detection_context<>'' THEN excluded.detection_context ELSE p0_candidates.detection_context END,"
+      "context_pre_count=MAX(p0_candidates.context_pre_count,excluded.context_pre_count),"
+      "context_post_until_ns=MAX(p0_candidates.context_post_until_ns,excluded.context_post_until_ns),"
+      "created_ns=excluded.created_ns,"
+      "process_start_key=CASE WHEN excluded.process_start_key<>'' AND excluded.process_start_key<>'0' THEN excluded.process_start_key ELSE p0_candidates.process_start_key END,"
+      "process_creation_filetime_100ns=CASE WHEN excluded.process_creation_filetime_100ns<>'' AND excluded.process_creation_filetime_100ns<>'0' THEN excluded.process_creation_filetime_100ns ELSE p0_candidates.process_creation_filetime_100ns END,"
+      "process_generation_source=CASE WHEN excluded.process_generation_source<>'' THEN excluded.process_generation_source ELSE p0_candidates.process_generation_source END,"
+      "source_completeness=CASE WHEN p0_candidates.source_completeness='' THEN excluded.source_completeness "
+      "WHEN (CASE excluded.source_completeness WHEN 'COMPLETE' THEN 7 WHEN 'COALESCED' THEN 6 "
+      "WHEN 'CORRELATION_MISSING' THEN 5 WHEN 'ENRICHMENT_ONLY' THEN 4 WHEN 'TRUNCATED' THEN 3 "
+      "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) > "
+      "(CASE p0_candidates.source_completeness WHEN 'COMPLETE' THEN 7 WHEN 'COALESCED' THEN 6 "
+      "WHEN 'CORRELATION_MISSING' THEN 5 WHEN 'ENRICHMENT_ONLY' THEN 4 WHEN 'TRUNCATED' THEN 3 "
+      "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) "
+      "THEN excluded.source_completeness ELSE p0_candidates.source_completeness END,"
+      "source_truncated_fields=CASE WHEN p0_candidates.source_completeness='' THEN excluded.source_truncated_fields "
+      "WHEN (CASE excluded.source_completeness WHEN 'COMPLETE' THEN 7 WHEN 'COALESCED' THEN 6 "
+      "WHEN 'CORRELATION_MISSING' THEN 5 WHEN 'ENRICHMENT_ONLY' THEN 4 WHEN 'TRUNCATED' THEN 3 "
+      "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) > "
+      "(CASE p0_candidates.source_completeness WHEN 'COMPLETE' THEN 7 WHEN 'COALESCED' THEN 6 "
+      "WHEN 'CORRELATION_MISSING' THEN 5 WHEN 'ENRICHMENT_ONLY' THEN 4 WHEN 'TRUNCATED' THEN 3 "
+      "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) "
+      "THEN excluded.source_truncated_fields ELSE p0_candidates.source_truncated_fields END;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare p0_candidates failed");
@@ -3230,22 +3363,15 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   int64_t ts = record_time_ns(r);
   int store_candidate = evidence_should_store_record(r);
   int low_value_file_noise = evidence_is_low_value_file_noise(r);
+  char candidate_id[160] = "";
+  int candidate_reused = 0;
   if (store_candidate) {
     s_status.candidate_requests++;
+    candidate_id_for(r, candidate_id, sizeof(candidate_id));
+    candidate_reused = candidate_dedupe_reuse(r, ts, candidate_id, sizeof(candidate_id));
   }
-  if (store_candidate && candidate_dedupe_reuse(r, ts)) {
-    context_ring_capture(r);
-    s_status.hot_ring_ingested++;
-    record_metric_drop(r, ts);
-    s_status.records_skipped++;
-    goto done;
-  }
-  char candidate_id[160] = "";
   char context_candidate_ids[EDR_EVIDENCE_CONTEXT_WINDOWS][160];
   memset(context_candidate_ids, 0, sizeof(context_candidate_ids));
-  if (store_candidate) {
-    candidate_id_for(r, candidate_id, sizeof(candidate_id));
-  }
   uint32_t context_candidate_count = low_value_file_noise
       ? 0u
       : context_window_matches(r, ts, context_candidate_ids,
@@ -3289,7 +3415,8 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   s_status.last_event_time_ns = ts;
 #if defined(EDR_HAVE_SQLITE)
   if (store_candidate) {
-    s_status.candidate_admission_attempts++;
+    int candidate_existing = candidate_reused;
+    int candidate_budget_reserved = 0;
     if (!s_db) {
       s_status.candidate_rejected++;
       s_status.records_dropped++;
@@ -3297,15 +3424,33 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.hot_ring_ingested++;
       goto done;
     }
-    if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts, 1)) {
-      s_status.candidate_rejected++;
-      s_status.records_dropped++;
-      context_ring_capture(r);
-      s_status.hot_ring_ingested++;
-      goto done;
+    if (!candidate_existing && r->event_id[0]) {
+      int exists = sqlite_candidate_exists(candidate_id);
+      if (exists < 0) {
+        s_status.candidate_rejected++;
+        s_status.candidate_transaction_failures++;
+        s_status.records_dropped++;
+        context_ring_capture(r);
+        s_status.hot_ring_ingested++;
+        goto done;
+      }
+      candidate_existing = exists;
     }
-    if (sqlite_record_candidate(r, pre_count, post_until_ns) != 0) {
-      sqlite_write_budget_release(2u, ts, 1);
+    if (!candidate_existing) {
+      s_status.candidate_admission_attempts++;
+      if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts, 1)) {
+        s_status.candidate_rejected++;
+        s_status.records_dropped++;
+        context_ring_capture(r);
+        s_status.hot_ring_ingested++;
+        goto done;
+      }
+      candidate_budget_reserved = 1;
+    }
+    if (sqlite_record_candidate(r, candidate_id, pre_count, post_until_ns) != 0) {
+      if (candidate_budget_reserved) {
+        sqlite_write_budget_release(2u, ts, 1);
+      }
       s_status.candidate_rejected++;
       s_status.candidate_transaction_failures++;
       s_status.records_dropped++;
@@ -3313,10 +3458,14 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.hot_ring_ingested++;
       goto done;
     }
-    s_status.candidate_admitted++;
-    candidate_dedupe_admit(r, ts);
-    promote_context_before_window(r, ts);
-    mark_context_window(r, post_until_ns, candidate_id);
+    if (!candidate_existing) {
+      s_status.candidate_admitted++;
+      promote_context_before_window(r, ts);
+      mark_context_window(r, post_until_ns, candidate_id);
+    }
+    if (!candidate_reused) {
+      candidate_dedupe_admit(r, ts, candidate_id);
+    }
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
     ring_record(r);

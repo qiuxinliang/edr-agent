@@ -208,6 +208,10 @@ typedef struct {
    * to DEGRADED after commit, not incorrectly prove that all old handles are
    * now known. */
   uint8_t resume_degraded;
+  /* A complete NameCreate->Read binding observed while the source-only
+   * record is still pending.  It is evidence for recovery, not permission to
+   * bypass the pending durable gate. */
+  uint8_t post_reset_binding_observed;
   /* A stop/join timeout is not a retryable provider fault.  It retains old
    * decoder state, so automatic restart must remain disabled until an
    * explicit lifecycle owner has observed a clean stop. */
@@ -217,6 +221,7 @@ typedef struct {
   uint64_t epoch_restart_failures;
   EdrFileReadMetadataGateState state;
   char reason[96];
+  char post_reset_recovery_reason[96];
 } EdrFileReadMetadataGate;
 
 typedef struct {
@@ -2260,6 +2265,13 @@ static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth
       s_file_read_metadata_gate.epoch_restart_successes;
   out->file_read_metadata_gate_epoch_restart_failures =
       s_file_read_metadata_gate.epoch_restart_failures;
+  out->file_read_metadata_gate_post_reset_recovery_bindings =
+      s_health.file_read_metadata_gate_post_reset_recovery_bindings;
+  out->file_read_metadata_gate_post_reset_recovery_failures =
+      s_health.file_read_metadata_gate_post_reset_recovery_failures;
+  snprintf(out->file_read_metadata_gate_post_reset_recovery_reason,
+           sizeof(out->file_read_metadata_gate_post_reset_recovery_reason), "%s",
+           s_file_read_metadata_gate.post_reset_recovery_reason);
   snprintf(out->file_read_p0_capability_reason,
            sizeof(out->file_read_p0_capability_reason), "%s",
            s_file_read_metadata_gate.reason);
@@ -2345,8 +2357,19 @@ static void edr_collector_file_read_metadata_gate_note_resolved(void) {
       !s_file_read_metadata_gate.slot_valid) {
     s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
     s_file_read_metadata_gate.reason[0] = '\0';
+    s_file_read_metadata_gate.post_reset_recovery_reason[0] = '\0';
+    s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
     s_health.file_read_p0_capability_healthy = 1;
     s_health.file_read_p0_capability_reason[0] = '\0';
+  } else if ((s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_PENDING ||
+              s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_QUEUED) &&
+             s_file_read_metadata_gate.resume_degraded &&
+             !s_file_read_metadata_gate.post_reset_binding_observed) {
+    /* Do not revive FileRead yet: the unresolved source-only assertion must
+     * still cross the durable boundary.  Retain this exact new-session proof
+     * so delivery_result() can recover without waiting for another read. */
+    s_file_read_metadata_gate.post_reset_binding_observed = 1u;
+    s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
   }
   ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
 }
@@ -2681,18 +2704,32 @@ void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
                sizeof(s_health.file_read_p0_capability_reason), "%s",
                s_file_read_metadata_gate.reason);
     } else if (s_file_read_metadata_gate.resume_degraded) {
+      int recovered = s_file_read_metadata_gate.post_reset_binding_observed != 0u;
       memset(&s_file_read_metadata_gate.slot, 0, sizeof(s_file_read_metadata_gate.slot));
       s_file_read_metadata_gate.event_id[0] = '\0';
       s_file_read_metadata_gate.slot_valid = 0u;
       s_file_read_metadata_gate.retryable = 0u;
       s_file_read_metadata_gate.resume_degraded = 0u;
-      s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_DEGRADED;
-      snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
-               "file_read_metadata_post_reset_degraded");
-      s_health.file_read_p0_capability_healthy = 0;
-      snprintf(s_health.file_read_p0_capability_reason,
-               sizeof(s_health.file_read_p0_capability_reason), "%s",
-               s_file_read_metadata_gate.reason);
+      s_file_read_metadata_gate.post_reset_binding_observed = 0u;
+      if (recovered) {
+        s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
+        s_file_read_metadata_gate.reason[0] = '\0';
+        s_file_read_metadata_gate.post_reset_recovery_reason[0] = '\0';
+        s_health.file_read_p0_capability_healthy = 1;
+        s_health.file_read_p0_capability_reason[0] = '\0';
+      } else {
+        s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_DEGRADED;
+        snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
+                 "file_read_metadata_post_reset_degraded");
+        snprintf(s_file_read_metadata_gate.post_reset_recovery_reason,
+                 sizeof(s_file_read_metadata_gate.post_reset_recovery_reason), "%s",
+                 "file_read_metadata_post_reset_exact_binding_not_observed");
+        s_health.file_read_metadata_gate_post_reset_recovery_failures++;
+        s_health.file_read_p0_capability_healthy = 0;
+        snprintf(s_health.file_read_p0_capability_reason,
+                 sizeof(s_health.file_read_p0_capability_reason), "%s",
+                 s_file_read_metadata_gate.reason);
+      }
     } else {
       memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
       s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
@@ -3603,16 +3640,6 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   if (!s_bus || !event_record || !tag) {
     return;
   }
-  /* A protected FileKey binding was lost or its source-only assertion is not
-   * durable yet.  This is a capability boundary, not a normal sampling drop:
-   * no FILE_READ can reach matcher, terminal intent, or action until recovery
-   * reports the exact gate record committed. */
-  if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy()) {
-    AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    s_health.file_read_metadata_gate_paused_events++;
-    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    return;
-  }
   file_read_path[0] = '\0';
   if (ty == EDR_EVENT_FILE_READ &&
       !edr_collector_kernel_file_read_resolve(event_record, timestamp_ns, &file_read_key,
@@ -3626,6 +3653,16 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         file_read_path[0] ? file_read_path : NULL,
         file_read_gate_reason ? file_read_gate_reason
                               : EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+    return;
+  }
+  /* An exact new-session NameCreate->Read may arrive while an older
+   * source-only assertion is pending. Resolve it first so it can become
+   * recovery evidence, then keep the Read itself paused until that assertion
+   * is durable. This never admits an unbound Read. */
+  if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy()) {
+    AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+    s_health.file_read_metadata_gate_paused_events++;
+    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
     return;
   }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
@@ -3841,16 +3878,8 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     return;
   }
 
-  /* Keep metadata tracking ahead of type admission, but ensure a gate that
-   * has not crossed the existing queue's FULL transaction boundary stops all
-   * later FileRead processing on both synchronous and A4.4 decode paths. */
-  if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy()) {
-    AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    s_health.file_read_metadata_gate_paused_events++;
-    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    return;
-  }
-
+  /* The shared decode path resolves exact new-session bindings before it
+   * enforces a pending gate, allowing only recovery evidence through here. */
   if (edr_a44_split_path_enabled()) {
     EdrA44QueueItem item;
     int reason_sync = 0;

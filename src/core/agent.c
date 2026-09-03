@@ -2459,7 +2459,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
         "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
         "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
-        "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+        "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
         "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
         "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
@@ -2662,6 +2662,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)ch.file_read_metadata_gate_epoch_restart_attempts,
         (unsigned long long)ch.file_read_metadata_gate_epoch_restart_successes,
         (unsigned long long)ch.file_read_metadata_gate_epoch_restart_failures,
+        (unsigned long long)ch.file_read_metadata_gate_post_reset_recovery_bindings,
+        (unsigned long long)ch.file_read_metadata_gate_post_reset_recovery_failures,
+        ch.file_read_metadata_gate_post_reset_recovery_reason[0] ?
+            ch.file_read_metadata_gate_post_reset_recovery_reason : "none",
         ch.kernel_file_start_key_requested ? "true" : "false",
         ch.kernel_file_start_key_enabled ? "true" : "false",
         (unsigned long long)ch.kernel_file_start_key_enable_failures,
@@ -3081,7 +3085,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
       "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
       "\"critical_binding_capacity_exhausted\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
-      "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu},"
+      "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
       "\"kernel_file_start_key\":{\"requested\":%s,\"enabled\":%s,"
       "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
       "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
@@ -3386,6 +3390,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.file_read_metadata_gate_epoch_restart_attempts,
       (unsigned long long)ch.file_read_metadata_gate_epoch_restart_successes,
       (unsigned long long)ch.file_read_metadata_gate_epoch_restart_failures,
+      (unsigned long long)ch.file_read_metadata_gate_post_reset_recovery_bindings,
+      (unsigned long long)ch.file_read_metadata_gate_post_reset_recovery_failures,
+      ch.file_read_metadata_gate_post_reset_recovery_reason[0] ?
+          ch.file_read_metadata_gate_post_reset_recovery_reason : "none",
       ch.kernel_file_start_key_requested ? "true" : "false",
       ch.kernel_file_start_key_enabled ? "true" : "false",
       (unsigned long long)ch.kernel_file_start_key_enable_failures,
@@ -4163,9 +4171,20 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     }
   }
 
-  if (config_headers.config_hash[0] && config_headers.sequence[0] &&
-      strcmp(agent->applied_remote_config_hash, config_headers.config_hash) == 0 &&
-      strcmp(agent->applied_remote_config_sequence, config_headers.sequence) == 0) {
+  if (config_headers.config_hash[0] &&
+      strcmp(agent->applied_remote_config_hash, config_headers.config_hash) == 0) {
+    long long sequence = atoll(config_headers.sequence);
+    /* The authenticated content hash is the policy identity. A newer
+     * delivery sequence still advances anti-rollback state and may be acked,
+     * but must not reapply identical collection settings or restart ETW. */
+    if (sequence > 0) {
+      edr_agent_write_config_sequence_state(agent->cfg.offline.queue_db_path, sequence);
+    }
+    if (strcmp(agent->applied_remote_config_sequence, config_headers.sequence) != 0) {
+      snprintf(agent->applied_remote_config_sequence,
+               sizeof(agent->applied_remote_config_sequence), "%s", config_headers.sequence);
+      agent->applied_remote_config_status_reported = 0;
+    }
     if (!agent->applied_remote_config_status_reported &&
         edr_ingest_http_post_config_status(
             agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,

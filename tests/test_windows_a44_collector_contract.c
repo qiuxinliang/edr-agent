@@ -67,6 +67,29 @@ static int require_after(const char *text, const char *first, const char *second
   return 0;
 }
 
+static int require_order_in_function(const char *text, const char *function_start,
+                                     const char *function_end, const char *first,
+                                     const char *second, const char *message) {
+  const char *start = text ? strstr(text, function_start) : NULL;
+  const char *end = start ? strstr(start, function_end) : NULL;
+  const char *a = start ? strstr(start, first) : NULL;
+  const char *b = start ? strstr(start, second) : NULL;
+  if (start && end && a && b && a < end && b < end && a < b) return 1;
+  fprintf(stderr, "FAIL: %s\n", message);
+  return 0;
+}
+
+static int require_absent_in_function(const char *text, const char *function_start,
+                                      const char *function_end, const char *needle,
+                                      const char *message) {
+  const char *start = text ? strstr(text, function_start) : NULL;
+  const char *end = start ? strstr(start, function_end) : NULL;
+  const char *match = start ? strstr(start, needle) : NULL;
+  if (start && end && (!match || match >= end)) return 1;
+  fprintf(stderr, "FAIL: %s\n", message);
+  return 0;
+}
+
 int main(void) {
   const char *root = getenv("EDR_SOURCE_DIR");
   if (!root || !root[0]) root = ".";
@@ -189,6 +212,27 @@ int main(void) {
                          "same-timestamp NameCreate delivery must compare the whole binding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_note_resolved",
                          "a complete post-reset FileKey binding must restore FileRead health");
+  ok &= require_order_in_function(
+      collector, "static void edr_collector_decode_mapped_event(",
+      "static VOID WINAPI edr_event_record_callback(",
+      "edr_collector_kernel_file_read_resolve(",
+      "if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy())",
+      "decode must resolve an exact FileKey NameCreate binding before the pending-gate drop");
+  ok &= require_absent_in_function(
+      collector, "static VOID WINAPI edr_event_record_callback(",
+      "static DWORD WINAPI edr_etw_consumer_thread(",
+      "edr_collector_file_read_p0_capability_healthy()",
+      "callback must delegate pending FileRead gate enforcement to decode after resolution");
+  ok &= require_contains(collector, "post_reset_binding_observed",
+                         "a bound Read during a pending post-reset gate must be retained as recovery evidence");
+  ok &= require_contains(collector,
+                         "file_read_metadata_post_reset_exact_binding_not_observed",
+                         "post-reset recovery must count the explicit missing exact-binding reason");
+  ok &= require_contains(collector_header,
+                         "file_read_metadata_gate_post_reset_recovery_failures",
+                         "collector health must expose post-reset exact-binding recovery failures");
+  ok &= require_contains(agent, "post_reset_recovery",
+                         "agent health must serialize post-reset FileRead recovery evidence");
   ok &= require_contains(collector, "file-read-metadata-coalesce-v1",
                          "repeated unresolved reads must share one epoch-scoped capability fact");
   ok &= require_contains(collector_header, "file_read_metadata_gate_coalesced",

