@@ -277,6 +277,40 @@ int wmain(void) {
         worker_hash, uninstall_hash, extra_hash);
     ok &= validate_bytes(root, negative, (size_t)length, 0,
                          "non-DLL extra must fail");
+    length = _snprintf(negative, sizeof(negative),
+        "{\"schema\":\"edr.windows.native-package-integrity.v1\",\"files\":["
+        "{\"name\":\"FDSecurityInstallerWorker.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"uninstall.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"unknown_contract.json\",\"sha256\":\"%s\"}]}",
+        worker_hash, uninstall_hash, extra_hash);
+    ok &= validate_bytes(root, negative, (size_t)length, 0,
+                         "unknown json entry must fail (legacy whitelist is exact-name)");
+  }
+  {
+    wchar_t legacy_path[32768];
+    char legacy_hash[65];
+    char positive[4096];
+    int length;
+    if (!join_path(root, L"p0_matcher_contract.json", legacy_path,
+                   sizeof(legacy_path) / sizeof(legacy_path[0])) ||
+        !CopyFileW(source, legacy_path, FALSE)) ok &= fail("create legacy contract file");
+    if (!sha256_file(legacy_path, legacy_hash)) ok &= fail("hash legacy contract");
+    length = _snprintf(positive, sizeof(positive),
+        "{\"schema\":\"edr.windows.native-package-integrity.v1\",\"files\":["
+        "{\"name\":\"FDSecurityInstallerWorker.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"uninstall.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"p0_matcher_contract.json\",\"sha256\":\"%s\"}]}",
+        worker_hash, uninstall_hash, legacy_hash);
+    ok &= validate_bytes(root, positive, (size_t)length, 1,
+                         "legacy p0_matcher_contract.json entry (hash-verified) must pass");
+    length = _snprintf(positive, sizeof(positive),
+        "{\"schema\":\"edr.windows.native-package-integrity.v1\",\"files\":["
+        "{\"name\":\"FDSecurityInstallerWorker.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"uninstall.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"p0_matcher_contract.json\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}]}",
+        worker_hash, uninstall_hash);
+    ok &= validate_bytes(root, positive, (size_t)length, 0,
+                         "legacy entry with wrong hash must still fail");
   }
   {
     wchar_t manifest_path[32768];

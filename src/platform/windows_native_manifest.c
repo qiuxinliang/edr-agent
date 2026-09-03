@@ -264,7 +264,14 @@ int edr_windows_native_manifest_validate(const wchar_t *install_dir,
         const char *extension = strrchr(name->valuestring, '.');
         int required_name = !strcmp(name->valuestring, required[0]) ||
                             !strcmp(name->valuestring, required[1]);
-        if (!required_name && (!extension || _stricmp(extension, ".dll") != 0)) {
+        /* Releases 3.2.379..3.2.383 listed the standalone PCRE2 matcher
+         * contract in this manifest. Those installed packages must stay
+         * uninstallable-clean by newer coordinators, so the exact legacy
+         * name is admitted here. The entry is still hash-verified below;
+         * only the .dll/.exe extension policy is relaxed for it. */
+        int legacy_contract = !_stricmp(name->valuestring, "p0_matcher_contract.json");
+        if (!required_name && !legacy_contract &&
+            (!extension || _stricmp(extension, ".dll") != 0)) {
           cJSON_Delete(root);
           goto cleanup;
         }
