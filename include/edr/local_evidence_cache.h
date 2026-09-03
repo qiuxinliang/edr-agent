@@ -40,6 +40,13 @@ typedef struct {
    * committed (invalid UTF-8, allocation failure, or insufficient buffer). */
   uint64_t manifest_rejections;
   uint64_t candidate_deduped;
+  /* Rejection reasons count comparable dedupe-slot checks, not candidate
+   * requests. A single rejected check may increment more than one reason so
+   * compound guard failures remain observable without per-event logging. */
+  uint64_t candidate_dedup_generation_conflict_rejects;
+  uint64_t candidate_dedup_source_shape_rejects;
+  uint64_t candidate_dedup_semantic_mismatch_rejects;
+  uint64_t candidate_dedup_skew_rejects;
   uint64_t write_budget_dropped;
   uint64_t write_budget_candidate_dropped;
   uint64_t write_budget_context_dropped;

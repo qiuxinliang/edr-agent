@@ -134,6 +134,10 @@ typedef struct {
   uint32_t pid;
   uint32_t type;
   char endpoint_id[48];
+  /* Raw source-record tuple presence is distinct from a generation resolved
+   * through the event-time process-tree snapshot. Cross-provider enrichment
+   * uses these shape bits; PID-reuse safety continues to use `generation`. */
+  uint8_t source_generation_shapes;
   uint8_t generation_known;
   EvidenceProcessGeneration generation;
   char candidate_id[160];
@@ -141,13 +145,30 @@ typedef struct {
    * evidence reuse key, not an alert-suppression or cross-restart cache key. */
   char signal[65];
   /* Different providers may emit the same atomic process observation with
-   * different event ids while only one copy has a bound generation.  Keep a
+   * different event ids while only one source carries a raw generation. Keep a
    * second, enrichment-insensitive commitment for that narrow two-second
    * bridge; the source commitment above remains authoritative for exact
    * replay, and two known generations are never bridged. */
   char semantic_signal[65];
   char source_event_id[EDR_BR_ID_LEN];
+  /* The bridge is deliberately limited to one cross-provider pair. Retaining
+   * the second id lets either source replay reuse the pair without allowing a
+   * third distinct atomic event to collapse into it. */
+  char bridged_source_event_id[EDR_BR_ID_LEN];
+  char bridged_signal[65];
 } CandidateDedupeSlot;
+
+enum {
+  CANDIDATE_DEDUPE_REJECT_GENERATION_CONFLICT = 1u << 0,
+  CANDIDATE_DEDUPE_REJECT_SOURCE_SHAPE = 1u << 1,
+  CANDIDATE_DEDUPE_REJECT_SEMANTIC_MISMATCH = 1u << 2,
+  CANDIDATE_DEDUPE_REJECT_SKEW = 1u << 3
+};
+
+enum {
+  CANDIDATE_SOURCE_GENERATION_MISSING = 1u << 0,
+  CANDIDATE_SOURCE_GENERATION_BOUND = 1u << 1
+};
 
 typedef struct {
   uint8_t used;
@@ -444,6 +465,14 @@ static int generation_equal(const EvidenceProcessGeneration *a,
   return generation_bound(a) && generation_bound(b) &&
          a->process_start_key == b->process_start_key &&
          a->creation_filetime_100ns == b->creation_filetime_100ns;
+}
+
+static uint8_t record_source_generation_shape(const EdrBehaviorRecord *r) {
+  if (r && r->process_start_key != 0u &&
+      r->process_creation_filetime_100ns != 0u) {
+    return CANDIDATE_SOURCE_GENERATION_BOUND;
+  }
+  return CANDIDATE_SOURCE_GENERATION_MISSING;
 }
 
 static int generation_from_snapshot(uint32_t pid, int64_t event_time_ns,
@@ -1194,7 +1223,9 @@ static void candidate_semantic_signal_for(const EdrBehaviorRecord *r, char *out,
   candidate_digest_text(&ctx, r->reg_value_data);
   candidate_digest_text(&ctx, r->reg_old_value_data);
   candidate_digest_text(&ctx, r->reg_op);
-  candidate_digest_text(&ctx, r->reg_source);
+  /* Provider provenance is expected to differ between copies of the same
+   * atomic event (for example sec vs kproc); it is evidence metadata, not
+   * behavior identity. */
   candidate_digest_text(&ctx, r->reg_attribution);
   candidate_digest_text(&ctx, r->reg_detail_status);
   edr_sha256_final(&ctx, digest);
@@ -1465,11 +1496,19 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
 /* Only already-committed candidates may satisfy a reuse.  A failed write must
  * not populate this in-memory index, otherwise the next copy of the alert
  * could be hidden for the whole dedupe window. */
-static int candidate_dedupe_slot_matches(
+/* Returns 1 for a match, 0 for an unrelated slot, and -1 for a comparable
+ * slot rejected by one or more guards. `reject_reasons` is a bitset and may
+ * contain multiple failures from the same comparison. */
+static int candidate_dedupe_slot_evaluate(
     const CandidateDedupeSlot *slot, const EdrBehaviorRecord *r, int64_t ts,
     const EvidenceProcessGeneration *generation, int generation_known,
-    const char *signal, const char *semantic_signal) {
-  int same_source_event;
+    uint8_t source_generation_shape,
+    const char *signal, const char *semantic_signal, uint32_t *reject_reasons) {
+  const char *expected_source_signal = NULL;
+  uint32_t reasons = 0u;
+  if (reject_reasons) {
+    *reject_reasons = 0u;
+  }
   if (!slot || !slot->used || !r || slot->pid != r->pid ||
       slot->type != (uint32_t)r->type ||
       strncmp(slot->endpoint_id, r->endpoint_id, sizeof(slot->endpoint_id)) != 0) {
@@ -1479,35 +1518,80 @@ static int candidate_dedupe_slot_matches(
    * onto another known process lifetime. */
   if (generation_known && slot->generation_known &&
       !generation_equal(&slot->generation, generation)) {
-    return 0;
+    reasons |= CANDIDATE_DEDUPE_REJECT_GENERATION_CONFLICT;
   }
-  same_source_event = r->event_id[0] && slot->source_event_id[0] &&
-                      strncmp(slot->source_event_id, r->event_id,
-                              sizeof(slot->source_event_id)) == 0;
-  if (same_source_event) {
-    return signal && signal[0] &&
-           strncmp(slot->signal, signal, sizeof(slot->signal)) == 0;
+  if (r->event_id[0] && slot->source_event_id[0] &&
+      strncmp(slot->source_event_id, r->event_id,
+              sizeof(slot->source_event_id)) == 0) {
+    expected_source_signal = slot->signal;
+  } else if (r->event_id[0] && slot->bridged_source_event_id[0] &&
+             strncmp(slot->bridged_source_event_id, r->event_id,
+                     sizeof(slot->bridged_source_event_id)) == 0) {
+    expected_source_signal = slot->bridged_signal;
+  }
+  if (expected_source_signal) {
+    if (!signal || !signal[0] ||
+        strncmp(expected_source_signal, signal, sizeof(slot->signal)) != 0) {
+      reasons |= CANDIDATE_DEDUPE_REJECT_SEMANTIC_MISMATCH;
+    }
+    if (reject_reasons) *reject_reasons = reasons;
+    return reasons ? -1 : 1;
   }
   if (!r->event_id[0] && !slot->source_event_id[0] &&
       generation_known && slot->generation_known) {
-    return signal && signal[0] &&
-           strncmp(slot->signal, signal, sizeof(slot->signal)) == 0;
+    if (!signal || !signal[0] ||
+        strncmp(slot->signal, signal, sizeof(slot->signal)) != 0) {
+      reasons |= CANDIDATE_DEDUPE_REJECT_SEMANTIC_MISMATCH;
+    }
+    if (reject_reasons) *reject_reasons = reasons;
+    return reasons ? -1 : 1;
   }
   /* Distinct source events bridge only the observed provider-enrichment
-   * shape: exactly one side knows the generation, the atomic semantics are
-   * identical, and delivery skew is tightly bounded. Unknown/unknown and
-   * known/known events remain independent evidence. */
-  return generation_known != (int)slot->generation_known && semantic_signal &&
-         semantic_signal[0] &&
-         strncmp(slot->semantic_signal, semantic_signal,
-                 sizeof(slot->semantic_signal)) == 0 &&
-         llabs(ts - slot->last_ns) <= EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS;
+   * shape: exactly one source record carries the raw generation tuple, the
+   * atomic semantics are identical, and delivery skew is tightly bounded.
+   * Snapshot resolution may prove PID lifetime equality, but must not rewrite
+   * this source-shape fact. */
+  if (slot->source_generation_shapes ==
+          (CANDIDATE_SOURCE_GENERATION_MISSING |
+           CANDIDATE_SOURCE_GENERATION_BOUND) ||
+      (slot->source_generation_shapes &
+       (source_generation_shape == CANDIDATE_SOURCE_GENERATION_BOUND
+            ? CANDIDATE_SOURCE_GENERATION_MISSING
+            : CANDIDATE_SOURCE_GENERATION_BOUND)) == 0u) {
+    reasons |= CANDIDATE_DEDUPE_REJECT_SOURCE_SHAPE;
+  }
+  if (!semantic_signal || !semantic_signal[0] ||
+      strncmp(slot->semantic_signal, semantic_signal,
+              sizeof(slot->semantic_signal)) != 0) {
+    reasons |= CANDIDATE_DEDUPE_REJECT_SEMANTIC_MISMATCH;
+  }
+  if (llabs(ts - slot->last_ns) > EDR_EVIDENCE_CANDIDATE_ENRICHMENT_SKEW_NS) {
+    reasons |= CANDIDATE_DEDUPE_REJECT_SKEW;
+  }
+  if (reject_reasons) *reject_reasons = reasons;
+  return reasons ? -1 : 1;
+}
+
+static void candidate_dedupe_observe_reject_reasons(uint32_t reasons) {
+  if (reasons & CANDIDATE_DEDUPE_REJECT_GENERATION_CONFLICT) {
+    s_status.candidate_dedup_generation_conflict_rejects++;
+  }
+  if (reasons & CANDIDATE_DEDUPE_REJECT_SOURCE_SHAPE) {
+    s_status.candidate_dedup_source_shape_rejects++;
+  }
+  if (reasons & CANDIDATE_DEDUPE_REJECT_SEMANTIC_MISMATCH) {
+    s_status.candidate_dedup_semantic_mismatch_rejects++;
+  }
+  if (reasons & CANDIDATE_DEDUPE_REJECT_SKEW) {
+    s_status.candidate_dedup_skew_rejects++;
+  }
 }
 
 static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
                                   char *candidate_id, size_t candidate_id_cap) {
   EvidenceProcessGeneration generation;
   int generation_known;
+  uint8_t source_generation_shape;
   if (!candidate_identity_bound(r)) {
     return 0;
   }
@@ -1518,18 +1602,33 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
   char signal[65];
   char semantic_signal[65];
   generation_known = record_process_generation(r, &generation);
+  source_generation_shape = record_source_generation_shape(r);
   candidate_signal_for(r, signal, sizeof(signal));
   candidate_semantic_signal_for(r, semantic_signal, sizeof(semantic_signal));
   int64_t cutoff = ts - (int64_t)win_s * 1000000000LL;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
-    if (s->last_ns >= cutoff &&
-        candidate_dedupe_slot_matches(s, r, ts, &generation, generation_known,
-                                      signal, semantic_signal)) {
+    uint32_t reject_reasons = 0u;
+    int evaluation = s->last_ns >= cutoff
+                         ? candidate_dedupe_slot_evaluate(
+                               s, r, ts, &generation, generation_known,
+                               source_generation_shape, signal, semantic_signal,
+                               &reject_reasons)
+                         : 0;
+    if (evaluation > 0) {
       s->last_ns = ts;
       if (generation_known && !s->generation_known) {
         s->generation = generation;
         s->generation_known = 1u;
+      }
+      s->source_generation_shapes |= source_generation_shape;
+      if (r->event_id[0] && s->source_event_id[0] &&
+          strncmp(s->source_event_id, r->event_id,
+                  sizeof(s->source_event_id)) != 0 &&
+          !s->bridged_source_event_id[0]) {
+        copy_s(s->bridged_source_event_id,
+               sizeof(s->bridged_source_event_id), r->event_id);
+        copy_s(s->bridged_signal, sizeof(s->bridged_signal), signal);
       }
       if (candidate_id && candidate_id_cap > 0u && s->candidate_id[0]) {
         copy_s(candidate_id, candidate_id_cap, s->candidate_id);
@@ -1537,6 +1636,9 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
       s_status.candidate_deduped++;
       s_status.candidate_reused++;
       return 1;
+    }
+    if (evaluation < 0) {
+      candidate_dedupe_observe_reject_reasons(reject_reasons);
     }
   }
   return 0;
@@ -1546,24 +1648,36 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
                                    const char *candidate_id) {
   EvidenceProcessGeneration generation;
   int generation_known;
+  uint8_t source_generation_shape;
   if (!candidate_identity_bound(r) || candidate_dedupe_window_s() == 0u) {
     return;
   }
   char signal[65];
   char semantic_signal[65];
   generation_known = record_process_generation(r, &generation);
+  source_generation_shape = record_source_generation_shape(r);
   candidate_signal_for(r, signal, sizeof(signal));
   candidate_semantic_signal_for(r, semantic_signal, sizeof(semantic_signal));
   size_t replace_i = 0u;
   int64_t oldest = INT64_MAX;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
-    if (candidate_dedupe_slot_matches(s, r, ts, &generation, generation_known,
-                                      signal, semantic_signal)) {
+    if (candidate_dedupe_slot_evaluate(
+            s, r, ts, &generation, generation_known, source_generation_shape,
+            signal, semantic_signal, NULL) > 0) {
       s->last_ns = ts;
       if (generation_known && !s->generation_known) {
         s->generation = generation;
         s->generation_known = 1u;
+      }
+      s->source_generation_shapes |= source_generation_shape;
+      if (r->event_id[0] && s->source_event_id[0] &&
+          strncmp(s->source_event_id, r->event_id,
+                  sizeof(s->source_event_id)) != 0 &&
+          !s->bridged_source_event_id[0]) {
+        copy_s(s->bridged_source_event_id,
+               sizeof(s->bridged_source_event_id), r->event_id);
+        copy_s(s->bridged_signal, sizeof(s->bridged_signal), signal);
       }
       if (candidate_id && candidate_id[0]) {
         copy_s(s->candidate_id, sizeof(s->candidate_id), candidate_id);
@@ -1589,6 +1703,7 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
   slot->last_ns = ts;
   slot->pid = r->pid;
   slot->type = (uint32_t)r->type;
+  slot->source_generation_shapes = source_generation_shape;
   slot->generation_known = generation_known ? 1u : 0u;
   if (generation_known) {
     slot->generation = generation;
@@ -4608,7 +4723,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
-           "\"candidate_deduped\":%llu,\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
+           "\"candidate_deduped\":%llu,\"candidate_dedup_reject_reasons\":{\"scope\":\"comparable_slot_checks\",\"overlapping\":true,\"generation_conflict\":%llu,\"source_shape\":%llu,\"semantic_mismatch\":%llu,\"skew\":%llu},\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
            "\"process_cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"used\":%u,\"capacity\":%u},"
            "\"identity\":{\"observations_total\":%llu,\"none\":%llu,\"hits\":%llu,\"misses\":%llu,\"enrich_attempts\":%llu,\"upgrades\":%llu,\"stale_rejects\":%llu,\"generation_unknown_rejects\":%llu,\"generation_mismatch_rejects\":%llu,\"generation_unknown_update_rejects\":%llu,\"generation_mismatch_update_rejects\":%llu,\"generation_resets\":%llu,\"late_generation_rejects\":%llu,\"target_4688\":%llu,\"creator_fallback\":%llu,\"token_sid\":%llu},"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
@@ -4632,6 +4747,10 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,
            (unsigned long long)st.candidate_deduped,
+           (unsigned long long)st.candidate_dedup_generation_conflict_rejects,
+           (unsigned long long)st.candidate_dedup_source_shape_rejects,
+           (unsigned long long)st.candidate_dedup_semantic_mismatch_rejects,
+           (unsigned long long)st.candidate_dedup_skew_rejects,
            (unsigned long long)st.candidate_requests,
            (unsigned long long)st.candidate_reused,
            (unsigned long long)st.candidate_admission_attempts,

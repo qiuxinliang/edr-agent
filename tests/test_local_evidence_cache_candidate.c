@@ -1024,6 +1024,267 @@ static void test_candidate_distinct_source_ids_bridge_only_known_to_unknown(void
   (void)remove("local_evidence_cache_cross_source_bridge.sqlite-shm");
 }
 
+static void init_cross_provider_process_pair(EdrBehaviorRecord *kernel,
+                                             EdrBehaviorRecord *security,
+                                             uint32_t pid, uint32_t ppid,
+                                             int64_t now, uint64_t start_key) {
+  assert(kernel != NULL && security != NULL);
+  init_record(kernel, EDR_EVENT_PROCESS_CREATE);
+  kernel->priority = 3u;
+  kernel->pid = pid;
+  kernel->ppid = ppid;
+  kernel->event_time_ns = now;
+  set_record_generation(kernel, start_key);
+  snprintf(kernel->event_id, sizeof(kernel->event_id), "kproc-provider-%u", pid);
+  snprintf(kernel->endpoint_id, sizeof(kernel->endpoint_id),
+           "ep-cross-provider-ablation");
+  snprintf(kernel->process_name, sizeof(kernel->process_name), "powershell.exe");
+  snprintf(kernel->image_path_canonical, sizeof(kernel->image_path_canonical),
+           "C:\\Tools\\powershell.exe");
+  snprintf(kernel->exe_path, sizeof(kernel->exe_path), "C:\\Tools\\powershell.exe");
+  snprintf(kernel->cmdline, sizeof(kernel->cmdline),
+           "powershell.exe -File C:\\Ops\\controlled.ps1");
+  snprintf(kernel->reg_source, sizeof(kernel->reg_source), "kproc");
+  snprintf(kernel->reg_attribution, sizeof(kernel->reg_attribution), "process_id");
+  snprintf(kernel->detection_context, sizeof(kernel->detection_context),
+           "{\"priority\":\"P1\"}");
+  snprintf(kernel->process_generation_source,
+           sizeof(kernel->process_generation_source), "target_live_telemetry");
+  snprintf(kernel->source_completeness, sizeof(kernel->source_completeness),
+           "CORRELATION_MISSING");
+
+  *security = *kernel;
+  security->event_time_ns = now + 500000000LL;
+  security->process_start_key = 0u;
+  security->process_creation_filetime_100ns = 0u;
+  security->process_generation_source[0] = '\0';
+  snprintf(security->event_id, sizeof(security->event_id), "sec-provider-%u", pid);
+  snprintf(security->reg_source, sizeof(security->reg_source), "sec");
+  snprintf(security->source_completeness, sizeof(security->source_completeness),
+           "ENRICHMENT_ONLY");
+}
+
+/* Ablation A: provider semantics are held equal. The Security copy resolves
+ * through the process-tree snapshot, but only the Kernel-Process source
+ * carries the raw tuple. Source-shape matching must use that raw fact. */
+static void test_candidate_source_generation_presence_ablation(void) {
+  const char *db = "local_evidence_cache_source_generation_ablation.sqlite";
+  const uint32_t pid = 74111u;
+  const uint32_t ppid = 4868u;
+  const uint64_t start_key = UINT64_C(0x74111);
+  struct timespec ts;
+  EdrBehaviorRecord kernel, security;
+  EdrEvidenceCacheStatus status;
+  int64_t now;
+
+  cleanup_test_sqlite_path(db);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(pid, ppid, "powershell.exe",
+                        "powershell.exe -File C:\\Ops\\controlled.ps1",
+                        "C:\\Tools\\powershell.exe", "powershell.exe",
+                        (uint64_t)(now - 2000000000LL), start_key) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_cross_provider_process_pair(&kernel, &security, pid, ppid, now, start_key);
+  snprintf(security.reg_source, sizeof(security.reg_source), "kproc");
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 2u && status.candidate_reused == 1u);
+  assert(status.candidate_admitted == 1u);
+  assert(status.candidate_dedup_source_shape_rejects == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+}
+
+/* Ablation B: no process-tree snapshot exists, so the old source-shape check
+ * already sees known/unknown. Differing sec/kproc provenance must not alter
+ * the enrichment semantic identity. */
+static void test_candidate_provider_provenance_semantic_ablation(void) {
+  const char *db = "local_evidence_cache_provider_provenance_ablation.sqlite";
+  const uint32_t pid = 74112u;
+  const uint32_t ppid = 4868u;
+  const uint64_t start_key = UINT64_C(0x74112);
+  struct timespec ts;
+  EdrBehaviorRecord kernel, security;
+  EdrEvidenceCacheStatus status;
+  int64_t now;
+
+  cleanup_test_sqlite_path(db);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_cross_provider_process_pair(&kernel, &security, pid, ppid, now, start_key);
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 2u && status.candidate_reused == 1u);
+  assert(status.candidate_admitted == 1u);
+  assert(status.candidate_dedup_semantic_mismatch_rejects == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+}
+
+/* Combined real shape from ARM64 3.2.403: snapshot resolution and differing
+ * provider provenance coexist. The two source ids must now converge on one
+ * generation-bound candidate. */
+static void test_candidate_cross_provider_snapshot_and_provenance_converge(void) {
+  const char *db = "local_evidence_cache_cross_provider_combined.sqlite";
+  const uint32_t pid = 74113u;
+  const uint32_t ppid = 4868u;
+  const uint64_t start_key = UINT64_C(0x74113);
+  struct timespec ts;
+  EdrBehaviorRecord kernel, security;
+  EdrEvidenceCacheStatus status;
+  char candidate_id[160];
+  char bundle[4096];
+  int64_t now;
+
+  cleanup_test_sqlite_path(db);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(pid, ppid, "powershell.exe",
+                        "powershell.exe -File C:\\Ops\\controlled.ps1",
+                        "C:\\Tools\\powershell.exe", "powershell.exe",
+                        (uint64_t)(now - 2000000000LL), start_key) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_cross_provider_process_pair(&kernel, &security, pid, ppid, now, start_key);
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+  /* Replays from either provider must keep using the same aggregate slot after
+   * that slot has observed both raw-generation shapes. */
+  edr_local_evidence_cache_record_behavior(&security);
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 4u);
+  assert(status.candidate_reused == 3u);
+  assert(status.candidate_admitted == 1u && status.candidate_deduped == 3u);
+  assert(status.candidate_dedup_generation_conflict_rejects == 0u);
+  assert(status.candidate_dedup_source_shape_rejects == 0u);
+  assert(status.candidate_dedup_semantic_mismatch_rejects == 0u);
+  assert(status.candidate_dedup_skew_rejects == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  sqlite_candidate_id_for_source_event(db, "kproc-provider-74113",
+                                       candidate_id, sizeof(candidate_id));
+  sqlite_bundle_manifest_for_source_event(db, "kproc-provider-74113",
+                                          bundle, sizeof(bundle));
+  assert(strstr(bundle,
+                "\"source_event_ids\":[\"kproc-provider-74113\","
+                "\"sec-provider-74113\"]") != NULL);
+  sqlite_assert_candidate_enrichment(db, candidate_id, "C:\\Tools\\powershell.exe",
+                                      "475411", "target_live_telemetry",
+                                      "CORRELATION_MISSING");
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+}
+
+static void test_candidate_dedupe_rejection_reason_observability(void) {
+  const char *db = "local_evidence_cache_dedupe_reject_reasons.sqlite";
+  const uint32_t ppid = 4868u;
+  struct timespec ts;
+  EdrBehaviorRecord kernel, security;
+  EdrEvidenceCacheStatus status;
+  char status_json[4096];
+  char status_document[4160];
+  int64_t now;
+
+  cleanup_test_sqlite_path(db);
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  /* Both sources carry the same raw tuple: not an enrichment pair. */
+  init_cross_provider_process_pair(&kernel, &security, 74120u, ppid, now,
+                                   UINT64_C(0x74120));
+  set_record_generation(&security, UINT64_C(0x74120));
+  snprintf(security.process_generation_source,
+           sizeof(security.process_generation_source), "target_live_telemetry");
+  snprintf(security.reg_source, sizeof(security.reg_source), "kproc");
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+
+  /* A true command difference remains a semantic boundary. */
+  init_cross_provider_process_pair(&kernel, &security, 74121u, ppid,
+                                   now + 1000000000LL, UINT64_C(0x74121));
+  snprintf(security.cmdline, sizeof(security.cmdline),
+           "powershell.exe -File C:\\Ops\\different.ps1");
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+
+  /* Same enrichment pair outside the two-second bridge remains distinct. */
+  init_cross_provider_process_pair(&kernel, &security, 74122u, ppid,
+                                   now + 2000000000LL, UINT64_C(0x74122));
+  security.event_time_ns = kernel.event_time_ns + 3000000000LL;
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+
+  /* A conflicting bound lifetime is rejected independently of source shape. */
+  init_cross_provider_process_pair(&kernel, &security, 74123u, ppid,
+                                   now + 6000000000LL, UINT64_C(0x74123));
+  set_record_generation(&security, UINT64_C(0x84123));
+  snprintf(security.process_generation_source,
+           sizeof(security.process_generation_source), "target_live_telemetry");
+  snprintf(security.reg_source, sizeof(security.reg_source), "kproc");
+  edr_local_evidence_cache_record_behavior(&kernel);
+  edr_local_evidence_cache_record_behavior(&security);
+
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_requests == 8u && status.candidate_reused == 0u);
+  assert(status.candidate_admitted == 8u);
+  assert(status.candidate_dedup_generation_conflict_rejects == 1u);
+  assert(status.candidate_dedup_source_shape_rejects == 2u);
+  assert(status.candidate_dedup_semantic_mismatch_rejects == 1u);
+  assert(status.candidate_dedup_skew_rejects == 1u);
+  assert(sqlite_table_count(db, "p0_candidates") == 8u);
+
+  edr_local_evidence_cache_status_json(status_json, sizeof(status_json));
+  assert((size_t)snprintf(status_document, sizeof(status_document), "{%s}", status_json) <
+         sizeof(status_document));
+  {
+    cJSON *root = cJSON_Parse(status_document);
+    cJSON *cache = root ? cJSON_GetObjectItemCaseSensitive(root, "evidence_cache") : NULL;
+    cJSON *reasons = cache ? cJSON_GetObjectItemCaseSensitive(
+                                 cache, "candidate_dedup_reject_reasons")
+                           : NULL;
+    cJSON *scope = reasons ? cJSON_GetObjectItemCaseSensitive(reasons, "scope") : NULL;
+    cJSON *overlapping = reasons ? cJSON_GetObjectItemCaseSensitive(
+                                       reasons, "overlapping")
+                                 : NULL;
+    cJSON *generation = reasons ? cJSON_GetObjectItemCaseSensitive(
+                                      reasons, "generation_conflict")
+                                : NULL;
+    cJSON *source_shape = reasons ? cJSON_GetObjectItemCaseSensitive(
+                                        reasons, "source_shape")
+                                  : NULL;
+    cJSON *semantic = reasons ? cJSON_GetObjectItemCaseSensitive(
+                                    reasons, "semantic_mismatch")
+                              : NULL;
+    cJSON *skew = reasons ? cJSON_GetObjectItemCaseSensitive(reasons, "skew") : NULL;
+    assert(root != NULL && cJSON_IsObject(cache) && cJSON_IsObject(reasons));
+    assert(cJSON_IsString(scope) && scope->valuestring &&
+           strcmp(scope->valuestring, "comparable_slot_checks") == 0);
+    assert(cJSON_IsTrue(overlapping));
+    assert(cJSON_IsNumber(generation) && generation->valuedouble == 1.0);
+    assert(cJSON_IsNumber(source_shape) && source_shape->valuedouble == 2.0);
+    assert(cJSON_IsNumber(semantic) && semantic->valuedouble == 1.0);
+    assert(cJSON_IsNumber(skew) && skew->valuedouble == 1.0);
+    cJSON_Delete(root);
+  }
+
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_candidate_completeness_monotonically_upgrades(void) {
   const char *db = "local_evidence_cache_completeness.sqlite";
   struct timespec ts;
@@ -2387,6 +2648,10 @@ int main(void) {
   test_candidate_fallback_preserves_path_and_generation_boundaries();
   test_candidate_known_to_unknown_keeps_generation_and_completeness();
   test_candidate_distinct_source_ids_bridge_only_known_to_unknown();
+  test_candidate_source_generation_presence_ablation();
+  test_candidate_provider_provenance_semantic_ablation();
+  test_candidate_cross_provider_snapshot_and_provenance_converge();
+  test_candidate_dedupe_rejection_reason_observability();
   test_candidate_completeness_monotonically_upgrades();
   test_candidate_reuse_requires_generation_and_full_semantics();
   test_process_cache_generation_migration_and_restart_safe_rtq();
