@@ -608,39 +608,6 @@ static int p0_is_sha256_hex(const char *value) {
 
 /* 仅用于维护基线匹配：统一大小写、路径分隔符、引号和连续空白，
  * 避免同一签名命令因转义/空格差异形成重复基线。 */
-static void p0_normalize_maintenance_command(const char *input, char *out, size_t cap) {
-  size_t used = 0u;
-  int pending_space = 0;
-  if (!out || cap == 0u) {
-    return;
-  }
-  out[0] = '\0';
-  if (!input) {
-    return;
-  }
-  for (const char *p = input; *p && used + 1u < cap; p++) {
-    char c = *p;
-    if (c == '"' || c == '\'') {
-      continue;
-    }
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-      pending_space = used > 0u ? 1 : 0;
-      continue;
-    }
-    if (pending_space && used + 1u < cap) {
-      out[used++] = ' ';
-      pending_space = 0;
-    }
-    if (c == '\\') {
-      c = '/';
-    } else if (c >= 'A' && c <= 'Z') {
-      c = (char)(c - 'A' + 'a');
-    }
-    out[used++] = c;
-  }
-  out[used] = '\0';
-}
-
 static int p0_has_trusted_signature_evidence(const EdrBehaviorRecord *br, const char *signer_fragment) {
   int trusted;
   int signer_ok;
@@ -779,7 +746,7 @@ static int p0_is_edge_update_temp_baseline(const EdrBehaviorRecord *br, const ch
   if (!br || br->type != EDR_EVENT_PROCESS_CREATE || !cmd || !cmd[0]) {
     return 0;
   }
-  p0_normalize_maintenance_command(cmd, normalized, sizeof(normalized));
+  edr_p0_normalize_command_for_evidence(cmd, normalized, sizeof(normalized));
   if (!p0_equals_ci(br->process_name, "MicrosoftEdgeUpdate.exe") ||
       !p0_path_ends_with_ci(br->exe_path, "\\MicrosoftEdgeUpdate.exe") ||
       !p0_contains_ci(br->exe_path, "\\Program Files (x86)\\Microsoft\\Temp\\EU")) {
@@ -1844,13 +1811,15 @@ static void p0_dedup_claim(p0_dedup_reservation *reservation) {
  * its combined frame. Suppression state belongs to already accepted frames. */
 static int p0_dedup_reserve(const char *rule_id, const EdrBehaviorRecord *br,
                             p0_dedup_reservation *reservation,
-                            int *out_pending_backpressure) {
+                            int *out_pending_backpressure,
+                            uint32_t *out_exact_replay_count) {
   const char *v = getenv("EDR_P0_DEDUP_SEC");
   unsigned long window_s;
   uint64_t window_ms;
   if (!reservation) return 0;
   memset(reservation, 0, sizeof(*reservation));
   if (out_pending_backpressure) *out_pending_backpressure = 0;
+  if (out_exact_replay_count) *out_exact_replay_count = 0u;
   window_s = (v && v[0]) ? strtoul(v, NULL, 10) : 30u;
   if (window_s == 0u) {
     return 1;
@@ -1895,6 +1864,9 @@ static int p0_dedup_reserve(const char *rule_id, const EdrBehaviorRecord *br,
       s_p0_dedup[i].suppressed_count++;
       s_p0_dedup_suppressed_total++;
       s_p0_dedup_exact_suppressed++;
+      if (out_exact_replay_count) {
+        *out_exact_replay_count = s_p0_dedup[i].suppressed_count;
+      }
       if (p0_should_log_dedup(s_p0_dedup[i].suppressed_count)) {
         fprintf(stderr,
                 "[P0 DEBUG] dedup: skip exact source replay (rule=%s pid=%u event=%s suppressed=%u total=%llu)\n",
@@ -3125,13 +3097,92 @@ static int p0_finish_enforcement_terminal(const p0_enforcement_prepare *prepare,
   return 1;
 }
 
+static const char *p0_find_ci(const char *haystack, const char *needle) {
+  size_t needle_len;
+  if (!haystack || !needle || !needle[0]) return NULL;
+  needle_len = strlen(needle);
+  for (const char *p = haystack; *p; ++p) {
+    size_t i = 0u;
+    while (i < needle_len && p[i]) {
+      char a = p[i];
+      char b = needle[i];
+      if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+      if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+      if (a != b) break;
+      ++i;
+    }
+    if (i == needle_len) return p;
+  }
+  return NULL;
+}
+
+static void p0_disposition_marker(const EdrBehaviorRecord *br, char *out,
+                                  size_t out_cap) {
+  static const char *keys[] = {"-Marker", "--edr-p0-case"};
+  const char *cmdline = br ? br->cmdline : NULL;
+  if (!out || out_cap == 0u) return;
+  out[0] = '\0';
+  if (!cmdline) return;
+  for (size_t i = 0u; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+    const char *p = p0_find_ci(cmdline, keys[i]);
+    size_t used = 0u;
+    if (!p) continue;
+    p += strlen(keys[i]);
+    while (*p == ' ' || *p == '\t' || *p == '=' || *p == ':' || *p == '"' || *p == '\'') ++p;
+    while (*p && used + 1u < out_cap) {
+      unsigned char c = (unsigned char)*p++;
+      if (!(c == '-' || c == '_' || c == '.' ||
+            (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z'))) break;
+      out[used++] = (char)c;
+    }
+    out[used] = '\0';
+    if (used > 0u) return;
+  }
+}
+
+/* A grep-stable, bounded observation is emitted for every marked validation
+ * event and every non-replay disposition. Unmarked exact replays use a
+ * logarithmic sample because aggregate replay counters remain authoritative
+ * and per-replay stderr would itself become endpoint noise. It intentionally
+ * excludes command lines and user data; the source event id is the durable
+ * candidate join. */
+static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
+                                        const char *rule_id,
+                                        const char *disposition,
+                                        const char *reason,
+                                        const char *known_fp_reason,
+                                        uint32_t repetition) {
+  char marker[96];
+  p0_disposition_marker(br, marker, sizeof(marker));
+  if (repetition > 0u && !marker[0] &&
+      !(repetition == 1u || repetition == 2u || repetition == 4u ||
+        repetition == 8u || repetition == 16u || (repetition % 64u) == 0u)) {
+    return;
+  }
+  fprintf(stderr,
+          "[p0_rule_disposition] rule_id=%s disposition=%s reason=%s "
+          "pid=%u process_start_key=%llu source_event_id=%s marker=%s "
+          "known_fp_hint=%s repetition=%u\n",
+          rule_id && rule_id[0] ? rule_id : "none",
+          disposition && disposition[0] ? disposition : "unknown",
+          reason && reason[0] ? reason : "unknown", br ? br->pid : 0u,
+          (unsigned long long)(br ? br->process_start_key : 0u),
+          br && br->event_id[0] ? br->event_id : "none",
+          marker[0] ? marker : "none",
+          known_fp_reason && known_fp_reason[0] ? known_fp_reason : "none",
+          repetition);
+}
+
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
-                        const char *mitre_comma, const EdrP0RuleIrBinding *binding) {
+                        const char *mitre_comma, const EdrP0RuleIrBinding *binding,
+                        const char *known_fp_reason) {
   EdrPolicyEnforcementResult enforcement;
   EdrP0EmitMetrics emitted_metrics = {0};
   p0_dedup_reservation dedup_reservation = {0};
   p0_rate_reservation rate_reservation = {0};
   int dedup_pending_backpressure = 0;
+  uint32_t exact_replay_count = 0u;
   unsigned alert_abi_value_omissions = 0u;
   static int s_debug_enabled = -1;
   if (s_debug_enabled < 0) {
@@ -3148,6 +3199,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
       if (strstr(cl, "edr_forensic") != NULL) {
         if (s_debug_enabled)
           fprintf(stderr, "[P0 DEBUG] emit blocked: cmdline contains forensic path (pid=%u)\n", br->pid);
+        p0_observe_rule_disposition(br, rule_id, "rejected",
+                                    "agent_forensic_command", known_fp_reason, 0u);
         return 0;
       }
       while (*cl == ' ' || *cl == '"') cl++;
@@ -3171,6 +3224,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   }
 
   if (edr_policy_v2_mode_for_alert(mitre_comma, rule_id) < EDR_POLICY_MODE_ALERT) {
+    p0_observe_rule_disposition(br, rule_id, "rejected", "policy_below_alert",
+                                known_fp_reason, 0u);
     return 0;
   }
   if (!binding || !binding->rules_bundle_version[0] ||
@@ -3178,6 +3233,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     if (s_debug_enabled) {
       fprintf(stderr, "[P0 DEBUG] emit blocked: loaded IR plaintext SHA-256 is unavailable or invalid\n");
     }
+    p0_observe_rule_disposition(br, rule_id, "rejected",
+                                "invalid_ir_binding", known_fp_reason, 0u);
     return 0;
   }
   /* Planning has no side effect.  The owner claim and durable intent below
@@ -3209,8 +3266,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   } else if (!p0_rate_reserve(br->tenant_id, br->endpoint_id, &rate_reservation)) {
     p0_state_unlock();
     if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: rate limit\n");
+    p0_observe_rule_disposition(br, rule_id, "rejected", "rate_limit",
+                                known_fp_reason, 0u);
     return 0;
-  } else if (!p0_dedup_reserve(rule_id, br, &dedup_reservation, &dedup_pending_backpressure)) {
+  } else if (!p0_dedup_reserve(rule_id, br, &dedup_reservation,
+                               &dedup_pending_backpressure, &exact_replay_count)) {
     if (!enforcement.requested) {
       p0_rate_rollback(&rate_reservation);
     }
@@ -3220,6 +3280,10 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
                                                "p0_dedup_pending_backpressure", binding);
     }
     if (s_debug_enabled) fprintf(stderr, "[P0 DEBUG] emit blocked: dedup (rule=%s pid=%u)\n", rule_id, br->pid);
+    p0_observe_rule_disposition(
+        br, rule_id, dedup_pending_backpressure ? "source_only" : "rejected",
+        dedup_pending_backpressure ? "p0_dedup_pending_backpressure" : "exact_replay_dedup",
+        known_fp_reason, exact_replay_count);
     return 0;
   } else {
     p0_state_unlock();
@@ -3244,6 +3308,15 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           br, rule_id, enforcement_prepare.failure_reason[0] ?
               enforcement_prepare.failure_reason : "terminal_journal_unavailable", binding);
     }
+    p0_observe_rule_disposition(
+        br, rule_id,
+        strcmp(enforcement_prepare.failure_reason, "terminal_intent_existing") == 0
+            ? "rejected"
+            : "source_only",
+        enforcement_prepare.failure_reason[0]
+            ? enforcement_prepare.failure_reason
+            : "terminal_journal_unavailable",
+        known_fp_reason, 0u);
     return 0;
   }
 
@@ -3565,6 +3638,15 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
                emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED) {
       (void)p0_emit_source_only_not_evaluable(br, rule_id, "p0_alert_queue_backpressure", binding);
     }
+    p0_observe_rule_disposition(
+        br, rule_id,
+        emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_GOVERNOR_SUPPRESSED
+            ? "governor_suppressed"
+            : "source_only",
+        emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_GOVERNOR_SUPPRESSED
+            ? "alert_governor"
+            : "p0_alert_queue_backpressure",
+        known_fp_reason, 0u);
     return 0;
   }
   p0_state_lock();
@@ -3577,6 +3659,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   s_p0_emit_minimal_failures += emitted_metrics.minimal_failures;
   s_p0_emit_emitted_without_full_context += emitted_metrics.emitted_without_full_context;
   p0_state_unlock();
+  p0_observe_rule_disposition(br, rule_id, "emitted", "queue_accepted",
+                              known_fp_reason, 0u);
   return 1;
 }
 
@@ -3788,20 +3872,18 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         if (registry_best_index >= 0 && i != registry_best_index) {
           continue;
         }
-        {
-          const char *reason = "";
-          if (p0_should_suppress_known_false_positive(rid, br, detail, &reason) &&
-              p0_debug_enabled()) {
-            fprintf(stderr, "[P0 DEBUG] known-fp hint forwarded for backend disposition: rule=%s pid=%u reason=%s\n",
-                    rid, br->pid, reason && reason[0] ? reason : "unknown");
-          }
+        const char *known_fp_reason = "";
+        if (!p0_should_suppress_known_false_positive(
+                rid, br, detail, &known_fp_reason)) {
+          known_fp_reason = "";
         }
         if (p0_debug_enabled()) {
           p0_debug_event(rid, br, pn, detail);
         }
         if (emit_for_rule(br, rid, match.severity,
                           match.title[0] ? match.title : rid,
-                          match.mitre_csv, &evaluation.binding)) {
+                          match.mitre_csv, &evaluation.binding,
+                          known_fp_reason)) {
           emitted_count++;
           edr_adaptive_collection_raise(match.severity, rid, br->pid, br->ppid,
                                         (pn && pn[0]) ? pn : br->process_name);

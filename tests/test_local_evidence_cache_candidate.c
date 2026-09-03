@@ -1,5 +1,6 @@
 #include "edr/behavior_record.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "cJSON.h"
 
@@ -150,6 +151,24 @@ static void test_high_signal_process_is_candidate(void) {
   snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
   snprintf(r.cmdline, sizeof(r.cmdline), "powershell.exe -NoProfile -EncodedCommand SQBFAFgA");
   assert(edr_local_evidence_cache_is_candidate(&r) == 1);
+}
+
+static void test_command_evidence_normalization_and_script_path(void) {
+  char normalized[1024];
+  char script_path[1024];
+  const char *command =
+      "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"  "
+      "-NoProfile -File \"C:\\Ops\\Maintenance Script.ps1\"";
+  edr_p0_normalize_command_for_evidence(command, normalized,
+                                        sizeof(normalized));
+  assert(strcmp(normalized,
+                "c:/windows/system32/windowspowershell/v1.0/powershell.exe "
+                "-noprofile -file c:/ops/maintenance script.ps1") == 0);
+  assert(edr_p0_extract_script_path(command, script_path,
+                                    sizeof(script_path)) == 1);
+  assert(strcmp(script_path, "C:\\Ops\\Maintenance Script.ps1") == 0);
+  assert(edr_p0_extract_script_path("powershell.exe -Command Get-Process",
+                                    script_path, sizeof(script_path)) == 0);
 }
 
 static void test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise(void) {
@@ -1458,6 +1477,13 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
   assert(sqlite_table_has_column(db, "p0_candidates", "process_generation_source"));
   assert(sqlite_table_has_column(db, "p0_candidates", "source_completeness"));
   assert(sqlite_table_has_column(db, "p0_candidates", "source_truncated_fields"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "normalized_command"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "script_path"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "exe_hash"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "username"));
+  assert(sqlite_table_has_column(db, "p0_candidates", "user_sid"));
+  assert(sqlite_table_has_column(db, "process_cache", "identity_source"));
+  assert(sqlite_table_has_column(db, "process_cache", "identity_quality"));
   assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
@@ -2630,6 +2656,152 @@ static void test_file_sha256_query_uses_file_evidence_cache(void) {
 #endif
 }
 
+#if defined(EDR_HAVE_SQLITE)
+static void test_candidate_structured_evidence_and_durable_identity(void) {
+  const char *db_path = "local_evidence_cache_structured_evidence.sqlite";
+  const char *hash =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  struct timespec ts;
+  EdrBehaviorRecord r;
+  EdrBehaviorRecord lower_identity;
+  EdrBehaviorRecord reused_pid;
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  char candidate_id[160];
+  char manifest_raw[16384];
+  char process_tree[8192];
+  cJSON *manifest = NULL;
+  cJSON *command = NULL;
+  cJSON *identity = NULL;
+  cJSON *artifact = NULL;
+  cJSON *signature = NULL;
+
+  cleanup_test_sqlite_path(db_path);
+  assert(edr_local_evidence_cache_open(db_path, 8u, 24u) == 0);
+  init_record(&r, EDR_EVENT_PROCESS_CREATE);
+  r.priority = 3u;
+  r.pid = 75201u;
+  r.ppid = 400u;
+  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  r.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&r, UINT64_C(0x75201));
+  snprintf(r.event_id, sizeof(r.event_id), "structured-evidence-source");
+  snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-structured-evidence");
+  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+  snprintf(r.exe_path, sizeof(r.exe_path),
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline),
+           "powershell.exe -NoProfile -File \"C:\\Ops\\Maintenance Script.ps1\"");
+  snprintf(r.exe_hash, sizeof(r.exe_hash), "%s", hash);
+  snprintf(r.username, sizeof(r.username), "operator");
+  snprintf(r.domain, sizeof(r.domain), "CONTOSO");
+  snprintf(r.user_sid, sizeof(r.user_sid), "S-1-5-21-1000");
+  snprintf(r.logon_id, sizeof(r.logon_id), "0x1234");
+  snprintf(r.identity_source, sizeof(r.identity_source), "target_4688");
+  snprintf(r.identity_quality, sizeof(r.identity_quality), "target_4688");
+  snprintf(r.process_generation_source, sizeof(r.process_generation_source),
+           "target_live_telemetry");
+  snprintf(r.source_completeness, sizeof(r.source_completeness), "COMPLETE");
+  snprintf(r.detection_context, sizeof(r.detection_context),
+           "{\"priority\":\"P0\",\"evidence\":{\"signature\":{"
+           "\"status\":\"verified\",\"signer\":\"Contoso Code Signing\","
+           "\"thumbprint\":\"ABCD\"}}}");
+  edr_local_evidence_cache_record_behavior(&r);
+  lower_identity = r;
+  lower_identity.event_time_ns++;
+  snprintf(lower_identity.event_id, sizeof(lower_identity.event_id),
+           "structured-evidence-lower-identity-source");
+  snprintf(lower_identity.username, sizeof(lower_identity.username), "creator");
+  snprintf(lower_identity.user_sid, sizeof(lower_identity.user_sid),
+           "S-1-5-21-9999");
+  snprintf(lower_identity.identity_source,
+           sizeof(lower_identity.identity_source), "creator_fallback");
+  snprintf(lower_identity.identity_quality,
+           sizeof(lower_identity.identity_quality), "creator_fallback");
+  edr_local_evidence_cache_record_behavior(&lower_identity);
+  edr_local_evidence_cache_close();
+
+  sqlite_candidate_id_for_source_event(db_path, r.event_id, candidate_id,
+                                       sizeof(candidate_id));
+  sqlite_bundle_manifest_for_source_event(db_path, r.event_id, manifest_raw,
+                                          sizeof(manifest_raw));
+  manifest = cJSON_Parse(manifest_raw);
+  assert(manifest != NULL);
+  command = cJSON_GetObjectItemCaseSensitive(manifest, "command");
+  identity = cJSON_GetObjectItemCaseSensitive(manifest, "identity");
+  artifact = cJSON_GetObjectItemCaseSensitive(manifest, "artifact");
+  signature = cJSON_IsObject(artifact)
+                  ? cJSON_GetObjectItemCaseSensitive(artifact, "signature")
+                  : NULL;
+  assert(cJSON_IsObject(command) && cJSON_IsObject(identity) &&
+         cJSON_IsObject(artifact) && cJSON_IsObject(signature));
+  assert(strcmp(cJSON_GetObjectItemCaseSensitive(command, "script_path")->valuestring,
+                "C:\\Ops\\Maintenance Script.ps1") == 0);
+  assert(strstr(cJSON_GetObjectItemCaseSensitive(command, "normalized")->valuestring,
+                "-file c:/ops/maintenance script.ps1") != NULL);
+  assert(strcmp(cJSON_GetObjectItemCaseSensitive(identity, "user_sid")->valuestring,
+                "S-1-5-21-1000") == 0);
+  assert(strcmp(cJSON_GetObjectItemCaseSensitive(artifact, "sha256")->valuestring,
+                hash) == 0);
+  assert(strcmp(cJSON_GetObjectItemCaseSensitive(signature, "status")->valuestring,
+                "verified") == 0);
+  cJSON_Delete(manifest);
+
+  assert(sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "SELECT normalized_command,script_path,exe_hash,username,user_sid,"
+             "identity_source,identity_quality FROM p0_candidates WHERE candidate_id=?;",
+             -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  assert(strstr((const char *)sqlite3_column_text(stmt, 0),
+                "-file c:/ops/maintenance script.ps1") != NULL);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 1),
+                "C:\\Ops\\Maintenance Script.ps1") == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 2), hash) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 3), "operator") == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 4), "S-1-5-21-1000") == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 5), "target_4688") == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 6), "target_4688") == 0);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+
+  assert(edr_local_evidence_cache_open(db_path, 8u, 24u) == 0);
+  assert(edr_local_evidence_cache_process_tree_json(
+             r.pid, r.endpoint_id, process_tree, sizeof(process_tree)) == 0);
+  assert(strstr(process_tree, "\"username\":\"operator\"") != NULL);
+  assert(strstr(process_tree, "\"user_sid\":\"S-1-5-21-1000\"") != NULL);
+  assert(strstr(process_tree, "\"identity_quality\":\"target_4688\"") != NULL);
+  assert(strstr(process_tree, hash) != NULL);
+
+  /* A durable identity belongs to one process generation, not the numeric
+   * PID. A newer generation with no identity must clear the old subject. */
+  reused_pid = r;
+  reused_pid.event_time_ns += 2;
+  set_record_generation(&reused_pid, UINT64_C(0x75202));
+  snprintf(reused_pid.event_id, sizeof(reused_pid.event_id),
+           "structured-evidence-reused-pid");
+  reused_pid.username[0] = '\0';
+  reused_pid.domain[0] = '\0';
+  reused_pid.user_sid[0] = '\0';
+  reused_pid.logon_id[0] = '\0';
+  reused_pid.identity_source[0] = '\0';
+  reused_pid.identity_quality[0] = '\0';
+  reused_pid.exe_hash[0] = '\0';
+  edr_local_evidence_cache_record_behavior(&reused_pid);
+  assert(edr_local_evidence_cache_process_tree_json(
+             reused_pid.pid, reused_pid.endpoint_id, process_tree,
+             sizeof(process_tree)) == 0);
+  assert(strstr(process_tree, "\"process_start_key\":\"479746\"") != NULL);
+  assert(strstr(process_tree, "operator") == NULL);
+  assert(strstr(process_tree, "S-1-5-21-1000") == NULL);
+  assert(strstr(process_tree, hash) == NULL);
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db_path);
+}
+#endif
+
 int main(void) {
   test_checknetisolation_standard_low_risk_is_not_candidate();
   test_checknetisolation_high_risk_port_is_candidate();
@@ -2637,6 +2809,7 @@ int main(void) {
   test_weak_file_event_is_not_candidate();
   test_weak_file_event_p1_context_is_candidate();
   test_high_signal_process_is_candidate();
+  test_command_evidence_normalization_and_script_path();
   test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise();
   test_behavior_summary_flush_coalesced_events();
   test_behavior_summary_below_threshold_no_emit();
@@ -2659,6 +2832,7 @@ int main(void) {
   test_context_generation_multicandidate_and_artifact_identity();
   test_context_manifest_utf8_backslash_and_invalid_rejection();
   test_context_manifest_32_maximum_ring_items_persist();
+  test_candidate_structured_evidence_and_durable_identity();
 #if !defined(_WIN32)
   test_concurrent_cache_lifecycle_snapshot_and_queries();
   test_mutex_lock_observability_contract();

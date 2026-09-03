@@ -1,6 +1,7 @@
 #include "edr/local_evidence_cache.h"
 
 #include "edr/p0_rule_ir.h"
+#include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "edr/resource.h"
 #include "edr/sha256.h"
@@ -1768,6 +1769,16 @@ static int sqlite_ensure_p0_candidate_columns(void) {
        "ALTER TABLE p0_candidates ADD COLUMN source_completeness TEXT;"},
       {"source_truncated_fields",
        "ALTER TABLE p0_candidates ADD COLUMN source_truncated_fields TEXT;"},
+      {"normalized_command",
+       "ALTER TABLE p0_candidates ADD COLUMN normalized_command TEXT;"},
+      {"script_path", "ALTER TABLE p0_candidates ADD COLUMN script_path TEXT;"},
+      {"exe_hash", "ALTER TABLE p0_candidates ADD COLUMN exe_hash TEXT;"},
+      {"username", "ALTER TABLE p0_candidates ADD COLUMN username TEXT;"},
+      {"user_sid", "ALTER TABLE p0_candidates ADD COLUMN user_sid TEXT;"},
+      {"identity_source",
+       "ALTER TABLE p0_candidates ADD COLUMN identity_source TEXT;"},
+      {"identity_quality",
+       "ALTER TABLE p0_candidates ADD COLUMN identity_quality TEXT;"},
   };
   for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
     int has_column = sqlite_p0_candidates_has_column(columns[i].name);
@@ -1816,6 +1827,15 @@ static int sqlite_ensure_process_cache_generation_columns(void) {
        "ALTER TABLE process_cache ADD COLUMN parent_process_creation_filetime_100ns TEXT;"},
       {"parent_process_generation_source",
        "ALTER TABLE process_cache ADD COLUMN parent_process_generation_source TEXT;"},
+      {"username", "ALTER TABLE process_cache ADD COLUMN username TEXT;"},
+      {"domain", "ALTER TABLE process_cache ADD COLUMN domain TEXT;"},
+      {"user_sid", "ALTER TABLE process_cache ADD COLUMN user_sid TEXT;"},
+      {"logon_id", "ALTER TABLE process_cache ADD COLUMN logon_id TEXT;"},
+      {"identity_source",
+       "ALTER TABLE process_cache ADD COLUMN identity_source TEXT;"},
+      {"identity_quality",
+       "ALTER TABLE process_cache ADD COLUMN identity_quality TEXT;"},
+      {"exe_hash", "ALTER TABLE process_cache ADD COLUMN exe_hash TEXT;"},
   };
   for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
     int has_column = sqlite_process_cache_has_column(columns[i].name);
@@ -1889,6 +1909,20 @@ static int sqlite_read_process_cache_row(sqlite3_stmt *st, ProcSlot *out) {
   } else {
     memset(&out->parent_generation, 0, sizeof(out->parent_generation));
   }
+  copy_s(out->username, sizeof(out->username),
+         (const char *)sqlite3_column_text(st, 16));
+  copy_s(out->domain, sizeof(out->domain),
+         (const char *)sqlite3_column_text(st, 17));
+  copy_s(out->user_sid, sizeof(out->user_sid),
+         (const char *)sqlite3_column_text(st, 18));
+  copy_s(out->logon_id, sizeof(out->logon_id),
+         (const char *)sqlite3_column_text(st, 19));
+  copy_s(out->identity_source, sizeof(out->identity_source),
+         (const char *)sqlite3_column_text(st, 20));
+  copy_s(out->identity_quality, sizeof(out->identity_quality),
+         (const char *)sqlite3_column_text(st, 21));
+  copy_s(out->exe_hash, sizeof(out->exe_hash),
+         (const char *)sqlite3_column_text(st, 22));
   return 1;
 }
 
@@ -2021,6 +2055,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   EvidenceProcessGeneration parent_generation;
   char start_key[32], creation[32], parent_start_key[32], parent_creation[32];
   int parent_known;
+  int preserve_stronger_identity = 0;
   if (!s_db || !should_update_process_cache(r) ||
       !record_process_generation(r, &generation)) {
     /* Unknown PID-only metadata is never durable authority. It may remain in
@@ -2038,11 +2073,35 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
     parent_start_key[0] = '\0';
     parent_creation[0] = '\0';
   }
+  {
+    sqlite3_stmt *identity_st = NULL;
+    const char *identity_sql =
+        "SELECT identity_quality FROM process_cache WHERE endpoint_id=? AND pid=? "
+        "AND process_start_key=? AND process_creation_filetime_100ns=? LIMIT 1;";
+    if (sqlite3_prepare_v2(s_db, identity_sql, -1, &identity_st, NULL) !=
+        SQLITE_OK) {
+      set_error("prepare process_cache identity quality failed");
+      return -1;
+    }
+    bind_text(identity_st, 1, r->endpoint_id);
+    sqlite3_bind_int64(identity_st, 2, (sqlite3_int64)r->pid);
+    bind_text(identity_st, 3, start_key);
+    bind_text(identity_st, 4, creation);
+    if (sqlite3_step(identity_st) == SQLITE_ROW) {
+      const char *current_quality =
+          (const char *)sqlite3_column_text(identity_st, 0);
+      preserve_stronger_identity =
+          identity_quality_rank(current_quality) >
+          identity_quality_rank(r->identity_quality);
+    }
+    sqlite3_finalize(identity_st);
+  }
   const char *sql =
       "INSERT INTO process_cache(endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,"
       "first_seen_ns,last_seen_ns,process_start_key,process_creation_filetime_100ns,"
       "process_generation_source,parent_process_start_key,parent_process_creation_filetime_100ns,"
-      "parent_process_generation_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "parent_process_generation_source,username,domain,user_sid,logon_id,identity_source,"
+      "identity_quality,exe_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(endpoint_id,pid) DO UPDATE SET "
       "tenant_id=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
@@ -2094,7 +2153,14 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "parent_process_generation_source=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
-      "excluded.parent_process_start_key<>'' THEN excluded.parent_process_generation_source ELSE process_cache.parent_process_generation_source END "
+      "excluded.parent_process_start_key<>'' THEN excluded.parent_process_generation_source ELSE process_cache.parent_process_generation_source END,"
+      "username=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.username WHEN excluded.username<>'' THEN excluded.username ELSE process_cache.username END,"
+      "domain=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.domain WHEN excluded.domain<>'' THEN excluded.domain ELSE process_cache.domain END,"
+      "user_sid=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.user_sid WHEN excluded.user_sid<>'' THEN excluded.user_sid ELSE process_cache.user_sid END,"
+      "logon_id=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.logon_id WHEN excluded.logon_id<>'' THEN excluded.logon_id ELSE process_cache.logon_id END,"
+      "identity_source=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.identity_source WHEN excluded.identity_source<>'' THEN excluded.identity_source ELSE process_cache.identity_source END,"
+      "identity_quality=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.identity_quality WHEN excluded.identity_quality<>'' THEN excluded.identity_quality ELSE process_cache.identity_quality END,"
+      "exe_hash=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns THEN excluded.exe_hash WHEN excluded.exe_hash<>'' THEN excluded.exe_hash ELSE process_cache.exe_hash END "
       "WHERE process_cache.process_start_key IS NULL OR process_cache.process_start_key='' OR "
       "process_cache.process_creation_filetime_100ns IS NULL OR "
       "process_cache.process_creation_filetime_100ns='' OR "
@@ -2124,6 +2190,13 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 15, parent_start_key);
   bind_text(st, 16, parent_creation);
   bind_text(st, 17, parent_known ? record_parent_generation_source(r) : "");
+  bind_text(st, 18, preserve_stronger_identity ? "" : r->username);
+  bind_text(st, 19, preserve_stronger_identity ? "" : r->domain);
+  bind_text(st, 20, preserve_stronger_identity ? "" : r->user_sid);
+  bind_text(st, 21, preserve_stronger_identity ? "" : r->logon_id);
+  bind_text(st, 22, preserve_stronger_identity ? "" : r->identity_source);
+  bind_text(st, 23, preserve_stronger_identity ? "" : r->identity_quality);
+  bind_text(st, 24, r->exe_hash);
   int rc = sqlite3_step(st);
   if (rc != SQLITE_DONE) {
     set_error("upsert process_cache failed");
@@ -2301,6 +2374,87 @@ static int manifest_finish(cJSON *root, char **out) {
   return 0;
 }
 
+static int manifest_add_candidate_evidence(cJSON *root,
+                                           const EdrBehaviorRecord *r) {
+  cJSON *command = NULL;
+  cJSON *identity = NULL;
+  cJSON *artifact = NULL;
+  cJSON *context = NULL;
+  cJSON *evidence = NULL;
+  cJSON *file = NULL;
+  cJSON *signature = NULL;
+  cJSON *signature_copy = NULL;
+  char normalized[EDR_BR_STR_LONG];
+  char script_path[EDR_BR_STR_LONG];
+  int ok;
+  if (!root || !r) return 0;
+  edr_p0_normalize_command_for_evidence(r->cmdline, normalized,
+                                        sizeof(normalized));
+  (void)edr_p0_extract_script_path(r->cmdline, script_path,
+                                   sizeof(script_path));
+  command = cJSON_CreateObject();
+  identity = cJSON_CreateObject();
+  artifact = cJSON_CreateObject();
+  if (!command || !identity || !artifact) goto fail;
+  ok = manifest_add_text(command, "raw", r->cmdline) &&
+       manifest_add_text(command, "normalized", normalized) &&
+       manifest_add_text(command, "script_path", script_path) &&
+       manifest_add_text(identity, "username", r->username) &&
+       manifest_add_text(identity, "domain", r->domain) &&
+       manifest_add_text(identity, "user_sid", r->user_sid) &&
+       manifest_add_text(identity, "logon_id", r->logon_id) &&
+       manifest_add_text(identity, "source", r->identity_source) &&
+       manifest_add_text(identity, "quality", r->identity_quality) &&
+       manifest_add_text(artifact, "path", r->exe_path) &&
+       manifest_add_text(artifact, "sha256", r->exe_hash);
+  if (!ok) goto fail;
+  if (r->detection_context[0]) {
+    context = cJSON_Parse(r->detection_context);
+    evidence = context ? cJSON_GetObjectItemCaseSensitive(context, "evidence") : NULL;
+    signature = cJSON_IsObject(evidence)
+                    ? cJSON_GetObjectItemCaseSensitive(evidence, "signature")
+                    : NULL;
+    if (!cJSON_IsObject(signature)) {
+      file = context ? cJSON_GetObjectItemCaseSensitive(context, "file") : NULL;
+      signature = cJSON_IsObject(file)
+                      ? cJSON_GetObjectItemCaseSensitive(file,
+                                                         "signature_trust")
+                      : NULL;
+    }
+    if (!cJSON_IsObject(signature)) {
+      signature = context ? cJSON_GetObjectItemCaseSensitive(
+                                context, "signature_trust")
+                          : NULL;
+    }
+  }
+  if (cJSON_IsObject(signature)) {
+    signature_copy = cJSON_Duplicate(signature, 1);
+    if (!signature_copy ||
+        !cJSON_AddItemToObject(artifact, "signature", signature_copy)) {
+      cJSON_Delete(signature_copy);
+      goto fail;
+    }
+    signature_copy = NULL;
+  } else if (!cJSON_AddNullToObject(artifact, "signature")) {
+    goto fail;
+  }
+  if (!cJSON_AddItemToObject(root, "command", command)) goto fail;
+  command = NULL;
+  if (!cJSON_AddItemToObject(root, "identity", identity)) goto fail;
+  identity = NULL;
+  if (!cJSON_AddItemToObject(root, "artifact", artifact)) goto fail;
+  artifact = NULL;
+  cJSON_Delete(context);
+  return 1;
+
+fail:
+  cJSON_Delete(command);
+  cJSON_Delete(identity);
+  cJSON_Delete(artifact);
+  cJSON_Delete(context);
+  return 0;
+}
+
 #if defined(EDR_HAVE_SQLITE)
 #define EDR_EVIDENCE_SOURCE_EVENT_ALIASES_MAX 16u
 
@@ -2416,6 +2570,7 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
        manifest_add_text(root, "schema", "p0_context_bundle.v1") &&
        manifest_add_text(root, "candidate_id", candidate_id) &&
        manifest_add_text(root, "source_event_id", r->event_id) &&
+       manifest_add_candidate_evidence(root, r) &&
        manifest_add_text(root, "endpoint_id", r->endpoint_id) &&
        manifest_add_i64(root, "event_time_ns", record_time_ns(r)) &&
        manifest_add_u64(root, "pid", r->pid) &&
@@ -2703,12 +2858,18 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   EvidenceProcessGeneration generation;
   int generation_known;
   const char *generation_source;
+  char normalized_command[EDR_BR_STR_LONG];
+  char script_path[EDR_BR_STR_LONG];
   if (!s_db || !r) {
     set_error("evidence cache database unavailable");
     return -1;
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
+  edr_p0_normalize_command_for_evidence(r->cmdline, normalized_command,
+                                        sizeof(normalized_command));
+  (void)edr_p0_extract_script_path(r->cmdline, script_path,
+                                   sizeof(script_path));
   char computed_candidate_id[160];
   if (!candidate_id || !candidate_id[0]) {
     candidate_id_for(r, computed_candidate_id, sizeof(computed_candidate_id));
@@ -2726,8 +2887,9 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,reg_key_path,"
       "reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns,"
       "process_start_key,process_creation_filetime_100ns,process_generation_source,"
-      "source_completeness,source_truncated_fields) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "source_completeness,source_truncated_fields,normalized_command,script_path,exe_hash,"
+      "username,user_sid,identity_source,identity_quality) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(candidate_id) DO UPDATE SET "
       "tenant_id=CASE WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE p0_candidates.tenant_id END,"
       "event_time_ns=CASE WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
@@ -2768,7 +2930,14 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "(CASE p0_candidates.source_completeness WHEN 'COMPLETE' THEN 7 WHEN 'COALESCED' THEN 6 "
       "WHEN 'CORRELATION_MISSING' THEN 5 WHEN 'ENRICHMENT_ONLY' THEN 4 WHEN 'TRUNCATED' THEN 3 "
       "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) "
-      "THEN excluded.source_truncated_fields ELSE p0_candidates.source_truncated_fields END;";
+      "THEN excluded.source_truncated_fields ELSE p0_candidates.source_truncated_fields END,"
+      "normalized_command=CASE WHEN excluded.normalized_command<>'' THEN excluded.normalized_command ELSE p0_candidates.normalized_command END,"
+      "script_path=CASE WHEN excluded.script_path<>'' THEN excluded.script_path ELSE p0_candidates.script_path END,"
+      "exe_hash=CASE WHEN excluded.exe_hash<>'' THEN excluded.exe_hash ELSE p0_candidates.exe_hash END,"
+      "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE p0_candidates.username END,"
+      "user_sid=CASE WHEN excluded.user_sid<>'' THEN excluded.user_sid ELSE p0_candidates.user_sid END,"
+      "identity_source=CASE WHEN excluded.identity_source<>'' THEN excluded.identity_source ELSE p0_candidates.identity_source END,"
+      "identity_quality=CASE WHEN excluded.identity_quality<>'' THEN excluded.identity_quality ELSE p0_candidates.identity_quality END;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare p0_candidates failed");
@@ -2806,6 +2975,13 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   bind_text(st, 24, generation_source);
   bind_text(st, 25, r->source_completeness);
   bind_text(st, 26, r->source_truncated_fields);
+  bind_text(st, 27, normalized_command);
+  bind_text(st, 28, script_path);
+  bind_text(st, 29, r->exe_hash);
+  bind_text(st, 30, r->username);
+  bind_text(st, 31, r->user_sid);
+  bind_text(st, 32, r->identity_source);
+  bind_text(st, 33, r->identity_quality);
   if (sqlite3_step(st) != SQLITE_DONE) {
     set_error("insert p0_candidates failed");
     sqlite3_finalize(st);
@@ -3052,7 +3228,9 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "first_seen_ns INTEGER,last_seen_ns INTEGER,process_start_key TEXT,"
       "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
       "parent_process_start_key TEXT,parent_process_creation_filetime_100ns TEXT,"
-      "parent_process_generation_source TEXT,PRIMARY KEY(endpoint_id,pid));"
+      "parent_process_generation_source TEXT,username TEXT,domain TEXT,user_sid TEXT,"
+      "logon_id TEXT,identity_source TEXT,identity_quality TEXT,exe_hash TEXT,"
+      "PRIMARY KEY(endpoint_id,pid));"
       "CREATE TABLE IF NOT EXISTS event_cache ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT,endpoint_id TEXT,tenant_id TEXT,"
       "event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,"
@@ -3067,7 +3245,9 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "reg_value_name TEXT,reg_op TEXT,detection_context TEXT,context_pre_count INTEGER,"
       "context_post_until_ns INTEGER,created_ns INTEGER,process_start_key TEXT,"
       "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
-      "source_completeness TEXT,source_truncated_fields TEXT);"
+      "source_completeness TEXT,source_truncated_fields TEXT,normalized_command TEXT,"
+      "script_path TEXT,exe_hash TEXT,username TEXT,user_sid TEXT,identity_source TEXT,"
+      "identity_quality TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_p0_candidates_ep_time ON p0_candidates(endpoint_id,event_time_ns);"
       "CREATE INDEX IF NOT EXISTS idx_p0_candidates_pid_time ON p0_candidates(endpoint_id,pid,event_time_ns);"
       "CREATE TABLE IF NOT EXISTS artifacts ("
@@ -4577,6 +4757,8 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
 static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
                              const char *source, const ProcSlot *p) {
   char ep[120], tn[160], nm[320], path[1200], cmd[1200], pn[320], pp[640];
+  char username[640], domain[640], user_sid[640], logon_id[160];
+  char identity_source[96], identity_quality[96], exe_hash[160];
   char generation_start[32], generation_creation[32], generation_source[160];
   char parent_generation_start[32], parent_generation_creation[32], parent_generation_source[160];
   json_escape(ep, sizeof(ep), p ? p->endpoint_id : "");
@@ -4586,6 +4768,15 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(cmd, sizeof(cmd), p ? p->cmdline : "");
   json_escape(pn, sizeof(pn), p ? p->parent_name : "");
   json_escape(pp, sizeof(pp), p ? p->parent_path : "");
+  json_escape(username, sizeof(username), p ? p->username : "");
+  json_escape(domain, sizeof(domain), p ? p->domain : "");
+  json_escape(user_sid, sizeof(user_sid), p ? p->user_sid : "");
+  json_escape(logon_id, sizeof(logon_id), p ? p->logon_id : "");
+  json_escape(identity_source, sizeof(identity_source),
+              p ? p->identity_source : "");
+  json_escape(identity_quality, sizeof(identity_quality),
+              p ? p->identity_quality : "");
+  json_escape(exe_hash, sizeof(exe_hash), p ? p->exe_hash : "");
   (void)snprintf(generation_start, sizeof(generation_start), "%llu",
                  (unsigned long long)(p ? p->generation.process_start_key : 0u));
   (void)snprintf(generation_creation, sizeof(generation_creation), "%llu",
@@ -4603,11 +4794,15 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
                           "\"parent_name\":%s,\"parent_path\":%s,\"process_start_key\":\"%s\","
                           "\"process_creation_filetime_100ns\":\"%s\",\"process_generation_source\":%s,"
                           "\"parent_process_start_key\":\"%s\",\"parent_process_creation_filetime_100ns\":\"%s\","
-                          "\"parent_process_generation_source\":%s,\"last_seen_ns\":%lld}",
+                          "\"parent_process_generation_source\":%s,\"username\":%s,\"domain\":%s,"
+                          "\"user_sid\":%s,\"logon_id\":%s,\"identity_source\":%s,"
+                          "\"identity_quality\":%s,\"exe_hash\":%s,\"last_seen_ns\":%lld}",
           *first ? "" : ",", source ? source : "", ep, tn, p ? p->pid : 0u,
           p ? p->ppid : 0u, nm, path, cmd, pn, pp, generation_start, generation_creation,
           generation_source, parent_generation_start, parent_generation_creation,
-          parent_generation_source, p ? (long long)p->last_seen_ns : 0LL);
+          parent_generation_source, username, domain, user_sid, logon_id,
+          identity_source, identity_quality, exe_hash,
+          p ? (long long)p->last_seen_ns : 0LL);
   *first = 0;
 }
 
@@ -4626,7 +4821,8 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
     const char *root_sql =
         "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
         "process_start_key,process_creation_filetime_100ns,process_generation_source,"
-        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source "
+        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
+        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash "
         "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
     sqlite3_stmt *root_st = NULL;
     if (sqlite3_prepare_v2(s_db, root_sql, -1, &root_st, NULL) == SQLITE_OK) {
@@ -4673,7 +4869,8 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
     const char *sql =
         "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
         "process_start_key,process_creation_filetime_100ns,process_generation_source,"
-        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source "
+        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
+        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash "
         "FROM process_cache WHERE endpoint_id=? AND ppid=? AND parent_process_start_key=? "
         "AND parent_process_creation_filetime_100ns=? ORDER BY last_seen_ns DESC LIMIT 64;";
     sqlite3_stmt *st = NULL;

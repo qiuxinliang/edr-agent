@@ -32,6 +32,7 @@
 #include "edr/process_tree_cache.h"
 #include "edr/sensor_interest.h"
 #include "edr/sha256.h"
+#include "edr/time_util.h"
 #include "edr/ave_sdk.h"
 #include "edr/types.h"
 #include "edr/windows_event_policy.h"
@@ -100,6 +101,7 @@ static const EdrConfig *s_collector_cfg;
 #define EDR_FILE_READ_METADATA_COALESCE_SLOTS 64u
 #define EDR_FILE_READ_METADATA_MAX_CONSECUTIVE_RESTARTS 3u
 #define EDR_FILE_READ_METADATA_MARKER_LEN 96u
+#define EDR_FILE_READ_METADATA_RECOVERY_TIMEOUT_NS (60ULL * 1000000000ULL)
 
 /* Microsoft-Windows-Kernel-File manifest constants.  Read is event/task 15
  * with FILEIO|READ; NameCreate carries the FileKey→FileName binding used to
@@ -227,7 +229,9 @@ typedef struct {
   char post_reset_recovery_reason[96];
   /* Recovery observation retains only the exact affected generation and a
    * bounded validation marker.  Never retain or log the full command line. */
+  char recovery_event_id[EDR_BR_ID_LEN];
   char recovery_trigger_reason[96];
+  uint64_t recovery_deadline_ns;
   uint32_t recovery_pid;
   char recovery_marker[EDR_FILE_READ_METADATA_MARKER_LEN];
 } EdrFileReadMetadataGate;
@@ -2517,15 +2521,16 @@ static void edr_collector_file_read_metadata_recovery_observe_locked(
           (unsigned long)s_file_read_metadata_gate.recovery_pid,
           s_file_read_metadata_gate.recovery_marker[0]
               ? s_file_read_metadata_gate.recovery_marker : "none",
-          s_file_read_metadata_gate.event_id[0]
-              ? s_file_read_metadata_gate.event_id : "none",
+          s_file_read_metadata_gate.recovery_event_id[0]
+              ? s_file_read_metadata_gate.recovery_event_id : "none",
           (unsigned)s_file_read_metadata_gate.consecutive_restart_attempts,
           (unsigned)EDR_FILE_READ_METADATA_MAX_CONSECUTIVE_RESTARTS);
 }
 
 static void edr_collector_file_read_metadata_recovery_clear_subject_locked(void) {
-  s_file_read_metadata_gate.event_id[0] = '\0';
+  s_file_read_metadata_gate.recovery_event_id[0] = '\0';
   s_file_read_metadata_gate.recovery_trigger_reason[0] = '\0';
+  s_file_read_metadata_gate.recovery_deadline_ns = 0u;
   s_file_read_metadata_gate.recovery_pid = 0u;
   s_file_read_metadata_gate.recovery_marker[0] = '\0';
 }
@@ -2543,6 +2548,10 @@ static void edr_collector_file_read_metadata_gate_consumer_unavailable(const cha
   if (new_recovery) {
     if (!s_file_read_metadata_gate.slot_valid) {
       edr_collector_file_read_metadata_recovery_clear_subject_locked();
+    } else {
+      snprintf(s_file_read_metadata_gate.recovery_event_id,
+               sizeof(s_file_read_metadata_gate.recovery_event_id), "%s",
+               s_file_read_metadata_gate.event_id);
     }
     snprintf(s_file_read_metadata_gate.recovery_trigger_reason,
              sizeof(s_file_read_metadata_gate.recovery_trigger_reason), "%s",
@@ -2559,6 +2568,15 @@ static int edr_collector_file_read_metadata_gate_reason_valid(const char *reason
   const EdrP0SourceOnlyReason *contract = edr_p0_source_only_reason_find(reason);
   return contract && contract->stage == EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE &&
          strcmp(contract->gate_id, EDR_P0_FILE_READ_METADATA_GATE) == 0;
+}
+
+/* Only a lost/ambiguous protected FileKey binding invalidates the provider
+ * session.  Missing facts on one Read, or local delivery pressure, remain
+ * source-only event dispositions and must not restart ETW. */
+static int edr_collector_file_read_metadata_gate_reason_requires_session_reset(
+    const char *reason) {
+  return reason &&
+         strcmp(reason, EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) == 0;
 }
 
 /* Stage the first FileKey metadata assertion that cannot remain authoritative.
@@ -2742,6 +2760,18 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
         s_file_read_metadata_gate.consecutive_restart_attempts;
     uint8_t resume_degraded =
         s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED;
+    char active_recovery_event_id[EDR_BR_ID_LEN];
+    char active_recovery_reason[96];
+    char active_recovery_marker[EDR_FILE_READ_METADATA_MARKER_LEN];
+    uint32_t active_recovery_pid = s_file_read_metadata_gate.recovery_pid;
+    uint64_t active_recovery_deadline_ns =
+        s_file_read_metadata_gate.recovery_deadline_ns;
+    snprintf(active_recovery_event_id, sizeof(active_recovery_event_id), "%s",
+             s_file_read_metadata_gate.recovery_event_id);
+    snprintf(active_recovery_reason, sizeof(active_recovery_reason), "%s",
+             s_file_read_metadata_gate.recovery_trigger_reason);
+    snprintf(active_recovery_marker, sizeof(active_recovery_marker), "%s",
+             s_file_read_metadata_gate.recovery_marker);
     memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
     s_file_read_metadata_gate.epoch_restart_attempts = restart_attempts;
     s_file_read_metadata_gate.epoch_restart_successes = restart_successes;
@@ -2749,6 +2779,18 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
     s_file_read_metadata_gate.consecutive_restart_attempts =
         consecutive_restart_attempts;
     s_file_read_metadata_gate.resume_degraded = resume_degraded;
+    snprintf(s_file_read_metadata_gate.recovery_event_id,
+             sizeof(s_file_read_metadata_gate.recovery_event_id), "%s",
+             active_recovery_event_id);
+    snprintf(s_file_read_metadata_gate.recovery_trigger_reason,
+             sizeof(s_file_read_metadata_gate.recovery_trigger_reason), "%s",
+             active_recovery_reason);
+    s_file_read_metadata_gate.recovery_pid = active_recovery_pid;
+    s_file_read_metadata_gate.recovery_deadline_ns =
+        active_recovery_deadline_ns;
+    snprintf(s_file_read_metadata_gate.recovery_marker,
+             sizeof(s_file_read_metadata_gate.recovery_marker), "%s",
+             active_recovery_marker);
   }
   s_file_read_metadata_gate.slot = slot;
   snprintf(s_file_read_metadata_gate.event_id, sizeof(s_file_read_metadata_gate.event_id),
@@ -2756,16 +2798,22 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   s_file_read_metadata_gate.slot_valid = 1u;
   s_file_read_metadata_gate.retryable = 1u;
   s_file_read_metadata_gate.requires_session_reset =
-      s_file_read_metadata_gate.resume_degraded ? 0u : 1u;
+      edr_collector_file_read_metadata_gate_reason_requires_session_reset(reason) ? 1u : 0u;
   s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_PENDING;
   s_file_read_metadata_gate.next_retry_ns = 0u;
   snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
            reason);
-  snprintf(s_file_read_metadata_gate.recovery_trigger_reason,
-           sizeof(s_file_read_metadata_gate.recovery_trigger_reason), "%s", reason);
-  s_file_read_metadata_gate.recovery_pid = (uint32_t)record->EventHeader.ProcessId;
-  snprintf(s_file_read_metadata_gate.recovery_marker,
-           sizeof(s_file_read_metadata_gate.recovery_marker), "%s", recovery_marker);
+  if (s_file_read_metadata_gate.requires_session_reset &&
+      !s_file_read_metadata_gate.recovery_trigger_reason[0]) {
+    snprintf(s_file_read_metadata_gate.recovery_event_id,
+             sizeof(s_file_read_metadata_gate.recovery_event_id), "%s", event_id);
+    snprintf(s_file_read_metadata_gate.recovery_trigger_reason,
+             sizeof(s_file_read_metadata_gate.recovery_trigger_reason), "%s", reason);
+    s_file_read_metadata_gate.recovery_pid =
+        (uint32_t)record->EventHeader.ProcessId;
+    snprintf(s_file_read_metadata_gate.recovery_marker,
+             sizeof(s_file_read_metadata_gate.recovery_marker), "%s", recovery_marker);
+  }
   s_health.file_read_p0_capability_healthy = 0;
   snprintf(s_health.file_read_p0_capability_reason,
            sizeof(s_health.file_read_p0_capability_reason), "%s",
@@ -2778,9 +2826,32 @@ void edr_collector_file_read_metadata_gate_retry(void) {
   EdrEventSlot slot;
   char event_id[EDR_BR_ID_LEN];
   uint64_t now_ns = edr_unix_ns();
+  uint64_t now_monotonic_ns = edr_monotonic_ns();
   int should_push = 0;
   if (!s_bus) return;
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
+      !s_file_read_metadata_gate.slot_valid &&
+      s_file_read_metadata_gate.recovery_deadline_ns != 0u &&
+      now_monotonic_ns != 0u &&
+      now_monotonic_ns >= s_file_read_metadata_gate.recovery_deadline_ns) {
+    s_file_read_metadata_gate.state =
+        EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY;
+    s_file_read_metadata_gate.restart_blocked = 1u;
+    s_file_read_metadata_gate.recovery_deadline_ns = 0u;
+    snprintf(s_file_read_metadata_gate.reason,
+             sizeof(s_file_read_metadata_gate.reason), "%s",
+             "file_read_metadata_post_reset_exact_binding_timeout");
+    snprintf(s_file_read_metadata_gate.post_reset_recovery_reason,
+             sizeof(s_file_read_metadata_gate.post_reset_recovery_reason), "%s",
+             s_file_read_metadata_gate.reason);
+    s_health.file_read_metadata_gate_post_reset_recovery_failures++;
+    s_health.file_read_p0_capability_healthy = 0;
+    snprintf(s_health.file_read_p0_capability_reason,
+             sizeof(s_health.file_read_p0_capability_reason), "%s",
+             s_file_read_metadata_gate.reason);
+    edr_collector_file_read_metadata_recovery_observe_locked("result", "timeout");
+  }
   if (s_file_read_metadata_gate.slot_valid && s_file_read_metadata_gate.retryable &&
       (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_PENDING ||
        s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY) &&
@@ -2866,14 +2937,11 @@ void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
                  "file_read_metadata_post_reset_degraded");
         snprintf(s_file_read_metadata_gate.post_reset_recovery_reason,
                  sizeof(s_file_read_metadata_gate.post_reset_recovery_reason), "%s",
-                 "file_read_metadata_post_reset_exact_binding_not_observed");
-        s_health.file_read_metadata_gate_post_reset_recovery_failures++;
+                 "file_read_metadata_post_reset_exact_binding_pending");
         s_health.file_read_p0_capability_healthy = 0;
         snprintf(s_health.file_read_p0_capability_reason,
                  sizeof(s_health.file_read_p0_capability_reason), "%s",
                  s_file_read_metadata_gate.reason);
-        edr_collector_file_read_metadata_recovery_observe_locked(
-            "result", "exact_binding_not_observed");
       }
     } else {
       memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
@@ -2995,6 +3063,12 @@ static void edr_collector_file_read_metadata_gate_start_succeeded(void) {
     snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
              "file_read_metadata_post_reset_degraded");
     s_file_read_metadata_gate.epoch_restart_successes++;
+    {
+      uint64_t now_ns = edr_monotonic_ns();
+      s_file_read_metadata_gate.recovery_deadline_ns =
+          now_ns == 0u ? 0u
+                       : now_ns + EDR_FILE_READ_METADATA_RECOVERY_TIMEOUT_NS;
+    }
     s_health.file_read_p0_capability_healthy = 0;
     snprintf(s_health.file_read_p0_capability_reason,
              sizeof(s_health.file_read_p0_capability_reason), "%s",

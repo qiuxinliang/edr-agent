@@ -6,7 +6,19 @@
 #ifndef EDR_P0_RULE_MATCH_H
 #define EDR_P0_RULE_MATCH_H
 
+#include <stddef.h>
 #include <stdint.h>
+
+/* Canonical command evidence shared by maintenance-baseline matching and the
+ * durable candidate manifest.  The normalizer is intentionally syntactic: it
+ * never expands variables or resolves paths under an event actor's identity. */
+void edr_p0_normalize_command_for_evidence(const char *input, char *out,
+                                           size_t out_cap);
+
+/* Extracts the first explicit script argument from a Windows command line.
+ * Returns 1 only for a bounded token ending in a supported script extension. */
+int edr_p0_extract_script_path(const char *command_line, char *out,
+                               size_t out_cap);
 
 /**
  * 若 (process_name, cmdline) 对给定 rule_id 应命中则返回 1，否则 0。未知 rule_id 恒为 0。

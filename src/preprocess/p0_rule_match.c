@@ -64,6 +64,123 @@ static int cistr_find(const char *hay, const char *needle) {
   return strstr(hbuf, nbuf) != NULL;
 }
 
+void edr_p0_normalize_command_for_evidence(const char *input, char *out,
+                                           size_t out_cap) {
+  size_t used = 0u;
+  int pending_space = 0;
+  if (!out || out_cap == 0u) return;
+  out[0] = '\0';
+  if (!input) return;
+  for (const char *p = input; *p && used + 1u < out_cap; ++p) {
+    char c = *p;
+    if (c == '"' || c == '\'') continue;
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      pending_space = used > 0u ? 1 : 0;
+      continue;
+    }
+    if (pending_space && used + 1u < out_cap) {
+      out[used++] = ' ';
+      pending_space = 0;
+    }
+    if (c == '\\') c = '/';
+    else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    out[used++] = c;
+  }
+  out[used] = '\0';
+}
+
+static int p0_command_token_next(const char **cursor, char *out,
+                                 size_t out_cap) {
+  const char *p;
+  char quote = '\0';
+  size_t used = 0u;
+  int overflow = 0;
+  if (!cursor || !*cursor || !out || out_cap == 0u) return 0;
+  p = *cursor;
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  if (!*p) {
+    out[0] = '\0';
+    *cursor = p;
+    return 0;
+  }
+  if (*p == '"' || *p == '\'') quote = *p++;
+  while (*p) {
+    if (quote) {
+      if (*p == quote) {
+        ++p;
+        break;
+      }
+    } else if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      break;
+    }
+    if (used + 1u < out_cap) out[used++] = *p;
+    else overflow = 1;
+    ++p;
+  }
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+  out[used] = '\0';
+  *cursor = p;
+  return !overflow && used > 0u;
+}
+
+static int p0_command_token_equals_ci(const char *value, const char *expected) {
+  if (!value || !expected) return 0;
+  while (*value && *expected) {
+    char a = *value++;
+    char b = *expected++;
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if (a != b) return 0;
+  }
+  return *value == '\0' && *expected == '\0';
+}
+
+static int p0_command_token_is_script(const char *value) {
+  static const char *extensions[] = {".ps1", ".psm1", ".psd1", ".bat",
+                                     ".cmd", ".vbs", ".vbe", ".js", ".jse",
+                                     ".wsf", ".wsh"};
+  size_t value_len;
+  if (!value || !value[0]) return 0;
+  value_len = strlen(value);
+  for (size_t i = 0u; i < sizeof(extensions) / sizeof(extensions[0]); ++i) {
+    size_t ext_len = strlen(extensions[i]);
+    if (value_len >= ext_len &&
+        p0_command_token_equals_ci(value + value_len - ext_len, extensions[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int edr_p0_extract_script_path(const char *command_line, char *out,
+                               size_t out_cap) {
+  const char *cursor = command_line;
+  char token[1024];
+  int first = 1;
+  int next_is_script = 0;
+  if (!out || out_cap == 0u) return 0;
+  out[0] = '\0';
+  if (!command_line) return 0;
+  while (p0_command_token_next(&cursor, token, sizeof(token))) {
+    if (next_is_script) {
+      if (!p0_command_token_is_script(token) || strlen(token) >= out_cap) return 0;
+      memcpy(out, token, strlen(token) + 1u);
+      return 1;
+    }
+    if (!first && (p0_command_token_equals_ci(token, "-file") ||
+                   p0_command_token_equals_ci(token, "/file") ||
+                   p0_command_token_equals_ci(token, "-f"))) {
+      next_is_script = 1;
+    } else if (!first && p0_command_token_is_script(token)) {
+      if (strlen(token) >= out_cap) return 0;
+      memcpy(out, token, strlen(token) + 1u);
+      return 1;
+    }
+    first = 0;
+  }
+  return 0;
+}
+
 static int proc_name_ends(const char *name, const char *exe) {
   if (!name || !*name || !exe || !*exe) {
     return 0;

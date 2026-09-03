@@ -226,8 +226,27 @@ int main(void) {
   ok &= require_contains(collector, "post_reset_binding_observed",
                          "a bound Read during a pending post-reset gate must be retained as recovery evidence");
   ok &= require_contains(collector,
-                         "file_read_metadata_post_reset_exact_binding_not_observed",
-                         "post-reset recovery must count the explicit missing exact-binding reason");
+                         "file_read_metadata_post_reset_exact_binding_pending",
+                         "post-reset recovery must remain pending until an exact binding arrives");
+  ok &= require_contains(collector,
+                         "file_read_metadata_post_reset_exact_binding_timeout",
+                         "post-reset recovery must end in an explicit bounded terminal state");
+  ok &= require_contains(collector,
+                         "recovery_observe_locked(\"result\", \"timeout\")",
+                         "post-reset recovery timeout must use the stable lifecycle observation");
+  ok &= require_contains(
+      collector,
+      "edr_collector_file_read_metadata_gate_reason_requires_session_reset",
+      "FileRead recovery must classify provider-session faults separately from per-event gaps");
+  ok &= require_contains(
+      collector,
+      "strcmp(reason, EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) == 0",
+      "only an ambiguous or lost protected FileKey binding may request a provider reset");
+  ok &= require_absent_in_function(
+      collector, "static int edr_collector_file_read_metadata_gate_reason_requires_session_reset(",
+      "/* Stage the first FileKey metadata assertion",
+      "EVENT_BUS_UNAVAILABLE",
+      "local source-only delivery pressure must not restart the ETW provider");
   ok &= require_contains(collector_header,
                          "file_read_metadata_gate_post_reset_recovery_failures",
                          "collector health must expose post-reset exact-binding recovery failures");
@@ -426,6 +445,8 @@ int main(void) {
   ok &= require_contains(collector,
                          "recovery_result=%s gate_state=%s breaker_state=%s pid=%lu",
                          "recovery observation must expose result, fuse, and affected PID");
+  ok &= require_contains(collector, "recovery_event_id",
+                         "recovery observation must retain its original source independently of staged events");
   ok &= require_contains(collector, "marker=%s event_id=%s attempt=%u/%u",
                          "recovery observation must correlate marker and source commitment");
   ok &= require_contains(collector, "{\"-Marker\", \"--edr-p0-case\"}",
@@ -462,6 +483,16 @@ int main(void) {
   ok &= require_contains(collector,
                          "recovery_observe_locked(\"result\", \"blocked\")",
                          "restart exhaustion must expose the open breaker result");
+  ok &= require_contains(direct,
+                         "[p0_rule_disposition] rule_id=%s disposition=%s reason=%s",
+                         "every matched P0 rule must expose one stable final disposition");
+  ok &= require_contains(direct,
+                         "process_start_key=%llu source_event_id=%s marker=%s",
+                         "P0 disposition must join to process generation and durable source evidence");
+  ok &= require_absent_in_function(
+      direct, "static void p0_observe_rule_disposition(",
+      "static int emit_for_rule(", "cmdline",
+      "P0 disposition observations must never log the complete command line");
   ok &= require_contains(agent, "remote_policy_changed",
                          "collector restart logs must identify policy changes separately");
   ok &= require_contains(agent, "if (!edr_collector_stop())",
