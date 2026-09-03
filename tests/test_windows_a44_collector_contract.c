@@ -420,6 +420,48 @@ int main(void) {
                          "restart exhaustion must retain an explicit terminal reason");
   ok &= require_contains(agent, "file_read_metadata_recovery",
                          "collector restart logs must identify FileRead recovery");
+  ok &= require_contains(collector,
+                         "[file_read_metadata_recovery] phase=%s trigger_reason=%s",
+                         "FileRead recovery must use one grep-stable observation schema");
+  ok &= require_contains(collector,
+                         "recovery_result=%s gate_state=%s breaker_state=%s pid=%lu",
+                         "recovery observation must expose result, fuse, and affected PID");
+  ok &= require_contains(collector, "marker=%s event_id=%s attempt=%u/%u",
+                         "recovery observation must correlate marker and source commitment");
+  ok &= require_contains(collector, "{\"-Marker\", \"--edr-p0-case\"}",
+                         "recovery observation must recognize both live and matrix markers");
+  ok &= require_contains(collector,
+                         "entry->pid == pid && entry->process_start_key == process_start_key",
+                         "recovery marker must require an exact process generation");
+  ok &= require_absent_in_function(
+      collector, "static void edr_collector_file_read_metadata_recovery_observe_locked(\n"
+                 "    const char *phase, const char *result) {",
+      "static void edr_collector_file_read_metadata_gate_consumer_unavailable(",
+      "cmdline",
+      "recovery observation must never log the complete command line");
+  ok &= require_contains(collector,
+                         "recovery_observe_locked(\"trigger\", \"required\")",
+                         "recovery trigger must be observable after durable source commit");
+  ok &= require_contains(collector,
+                         "recovery_observe_locked(\"start\", \"in_progress\")",
+                         "recovery start must be observable with the attempt count");
+  ok &= require_contains(collector,
+                         "\"result\", \"provider_epoch_started\");",
+                         "a ready replacement provider epoch must be observable");
+  ok &= require_absent_in_function(
+      collector, "static void edr_collector_file_read_metadata_gate_start_succeeded(void) {",
+      "static EdrCollectorFileKeyCacheEntry *edr_collector_file_key_cache_alloc_locked(",
+      "event_id[0] = '\\0'",
+      "provider restart must retain the triggering event commitment until final recovery");
+  ok &= require_contains(collector,
+                         "recovery_observe_locked(\"result\", \"healthy\")",
+                         "an exact post-reset binding must close the recovery observation");
+  ok &= require_contains(collector,
+                         "\"result\", \"stop_join_timeout\");",
+                         "a join timeout must expose the open breaker result");
+  ok &= require_contains(collector,
+                         "recovery_observe_locked(\"result\", \"blocked\")",
+                         "restart exhaustion must expose the open breaker result");
   ok &= require_contains(agent, "remote_policy_changed",
                          "collector restart logs must identify policy changes separately");
   ok &= require_contains(agent, "if (!edr_collector_stop())",
