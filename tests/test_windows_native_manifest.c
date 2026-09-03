@@ -129,11 +129,11 @@ static int create_test_root(wchar_t root[32768]) {
   return 1;
 }
 
-static void remove_tree(const wchar_t *root) {
+static int remove_tree(const wchar_t *root) {
   wchar_t path[32768];
   const wchar_t *names[] = {
       L"native-package-integrity.json", L"FDSecurityInstallerWorker.exe", L"uninstall.exe",
-      L"source.exe", L"extra.exe", L"COM9.dll"};
+      L"source.exe", L"extra.exe", L"COM9.dll", L"p0_matcher_contract.json"};
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
     if (join_path(root, names[i], path, sizeof(path) / sizeof(path[0]))) DeleteFileW(path);
   }
@@ -142,7 +142,7 @@ static void remove_tree(const wchar_t *root) {
     if (_snwprintf(name, sizeof(name) / sizeof(name[0]), L"x%02u.dll", i) >= 0 &&
         join_path(root, name, path, sizeof(path) / sizeof(path[0]))) DeleteFileW(path);
   }
-  RemoveDirectoryW(root);
+  return RemoveDirectoryW(root) != 0;
 }
 
 int wmain(void) {
@@ -422,9 +422,10 @@ int wmain(void) {
         !write_bytes(sibling_manifest, valid_manifest, (size_t)valid_length)) {
       ok &= fail("create root reparse target");
     } else {
-      remove_tree(root);
-      if (!CreateSymbolicLinkW(root, sibling, SYMBOLIC_LINK_FLAG_DIRECTORY |
-                               SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+      if (!remove_tree(root)) {
+        ok &= fail("root directory must be removable before reparse test");
+      } else if (!CreateSymbolicLinkW(root, sibling, SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                      SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
         ok &= fail("root reparse link must be creatable in Windows CI");
       } else {
         char identity[65];
@@ -445,7 +446,7 @@ int wmain(void) {
       return ok ? 0 : 1;
     }
   }
-  remove_tree(root);
+  (void)remove_tree(root);
   return ok ? 0 : 1;
 }
 
