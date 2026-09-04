@@ -46,8 +46,12 @@ RUNTIME_BUNDLE_FILES: set[str] = set()
 # runtime from the current Windows runner. The post-build Release gate may
 # permit an explicit binary_hot override only after comparing those immutable
 # runtime components with the previous published Release.
-RUNTIME_SOURCE_PREFIXES = ("src/", "tests/")
-RUNTIME_SOURCE_FILES = {"readme.md", "version"}
+RUNTIME_SOURCE_PREFIXES = ("include/", "src/", "tests/")
+RUNTIME_SOURCE_FILES = {
+    "readme.md",
+    "scripts/classify_windows_upgrade.py",
+    "version",
+}
 
 
 def normalize_path(value: str) -> str:
