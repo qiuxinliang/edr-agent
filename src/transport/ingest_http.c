@@ -80,7 +80,7 @@ static char s_user[128];
 static char s_bearer[512];
 static char s_endpoint[128];
 static char s_agent_ver[64];
-static char s_policy_version[64];
+static char s_policy_version[128];
 static char s_ca_file[1024];
 static char s_client_cert_file[1024];
 static char s_client_key_file[1024];
@@ -3175,6 +3175,7 @@ static void parse_agent_config_headers(const char *headers, EdrAgentConfigHeader
     return;
   }
   memset(out, 0, sizeof(*out));
+  copy_header_value(headers, "X-Rules-Version", out->policy_version, sizeof(out->policy_version));
   copy_header_value(headers, "X-Agent-Config-Hash", out->config_hash, sizeof(out->config_hash));
   copy_header_value(headers, "X-Agent-Config-Sequence", out->sequence, sizeof(out->sequence));
   copy_header_value(headers, "X-Agent-Config-Previous-Hash", out->previous_hash, sizeof(out->previous_hash));

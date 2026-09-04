@@ -226,6 +226,15 @@ int main(void) {
   ok &= require_contains(collector, "post_reset_binding_observed",
                          "a bound Read during a pending post-reset gate must be retained as recovery evidence");
   ok &= require_contains(collector,
+                         "s_file_read_metadata_gate.recovery_deadline_ns != 0u &&",
+                         "only an active bounded post-reset recovery may suppress another epoch reset");
+  ok &= require_contains(collector,
+                         "!s_file_read_metadata_gate.resume_degraded &&",
+                         "a post-reset source-only record must not immediately request another provider restart");
+  ok &= require_contains(collector,
+                         "int post_reset_recovery =",
+                         "normal startup binding must not be counted as post-reset recovery evidence");
+  ok &= require_contains(collector,
                          "file_read_metadata_post_reset_exact_binding_pending",
                          "post-reset recovery must remain pending until an exact binding arrives");
   ok &= require_contains(collector,

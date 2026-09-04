@@ -35,17 +35,22 @@ int main(void) {
   const char *root = getenv("EDR_SOURCE_DIR");
   char agent_path[1024];
   char ingest_path[1024];
+  char transport_path[1024];
   char *agent;
   char *ingest;
+  char *transport;
   if (!root || !root[0]) root = ".";
   snprintf(agent_path, sizeof(agent_path), "%s/src/core/agent.c", root);
   snprintf(ingest_path, sizeof(ingest_path), "%s/src/transport/ingest_http.c", root);
+  snprintf(transport_path, sizeof(transport_path), "%s/src/transport/transport_stub.c", root);
   agent = read_file(agent_path);
   ingest = read_file(ingest_path);
-  if (!agent || !ingest) {
+  transport = read_file(transport_path);
+  if (!agent || !ingest || !transport) {
     fprintf(stderr, "failed to read remote config sources\n");
     free(agent);
     free(ingest);
+    free(transport);
     return 1;
   }
   if (!contains(agent, "edr_agent_report_remote_config_failure(agent, NULL, \"remote_config_download_failed\", now)") ||
@@ -57,7 +62,20 @@ int main(void) {
       !contains(agent, "edr_agent_poll_rules(agent, &last_rules_ns)") ||
       !contains(agent, "\"%s/agent/rules.toml\"") ||
       !contains(agent, "edr_config_load_preprocessing_rules(tmp, &agent->cfg)") ||
+      !contains(agent, "edr_agent_signed_config_identity_matches_headers") ||
+      !contains(agent, "edr_agent_parse_config_sequence") ||
+      contains(agent, "atoll(config_headers.sequence)") ||
+      contains(agent, "atoll(headers->sequence)") ||
+      !contains(agent, "signed payload identity mismatch") ||
+      !contains(agent, "config_headers.policy_version") ||
+      !contains(agent, "edr_ingest_http_set_policy_version(config_headers.policy_version)") ||
+      contains(agent, "\"rules_applied\"") ||
+      contains(agent, "\"rules_failed\"") ||
       !contains(agent, "15ULL * 60ULL * 1000000000ULL") ||
+      !contains(ingest, "X-Rules-Version\", out->policy_version") ||
+      !contains(ingest, "static char s_policy_version[128]") ||
+      !contains(transport, "edr_ingest_http_set_policy_version(NULL)") ||
+      contains(transport, "edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version)") ||
       !contains(ingest, "desired_version && desired_version[0] ? desired_version : \"\"") ||
       !ordered_before(agent, "edr_agent_verify_config_headers(&agent->cfg",
                       "if (config_headers.config_hash[0] &&") ||
@@ -70,9 +88,11 @@ int main(void) {
     fprintf(stderr, "remote config status/retry contract missing\n");
     free(agent);
     free(ingest);
+    free(transport);
     return 1;
   }
   free(agent);
   free(ingest);
+  free(transport);
   return 0;
 }

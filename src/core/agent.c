@@ -45,6 +45,7 @@
 #include "edr/transport_v2.h"
 #include "edr/windows_event_policy.h"
 #include "edr/webshell_detector.h"
+#include "cJSON.h"
 #ifdef _WIN32
 #include <windows.h>
 static void edr_ms_sleep(unsigned ms) { Sleep(ms); }
@@ -62,6 +63,7 @@ static void edr_ms_sleep(unsigned ms) {
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -448,6 +450,92 @@ static void edr_agent_write_config_sequence_state(const char *queue_db_path, lon
   fclose(fp);
 }
 
+static int edr_agent_parse_config_sequence(const char *text, long long *out) {
+  unsigned long long value = 0u;
+  const unsigned char *p = (const unsigned char *)text;
+  if (!p || !*p || !out) return -1;
+  while (*p) {
+    const unsigned digit = (unsigned)(*p - (unsigned char)'0');
+    if (*p < (unsigned char)'0' || *p > (unsigned char)'9' ||
+        value > ((unsigned long long)LLONG_MAX - digit) / 10u) {
+      return -1;
+    }
+    value = value * 10u + digit;
+    ++p;
+  }
+  if (value == 0u) return -1;
+  *out = (long long)value;
+  return 0;
+}
+
+static int edr_agent_signed_config_identity_matches_headers(
+    const EdrAgentConfigHeaders *headers, char *reason, size_t reason_cap) {
+  unsigned char payload[2049];
+  size_t payload_len = 0u;
+  cJSON *root = NULL;
+  const cJSON *schema;
+  const cJSON *version;
+  const cJSON *sequence;
+  const cJSON *config_hash;
+  const cJSON *previous_hash;
+  const cJSON *nonce;
+  const cJSON *expires_at;
+  const cJSON *signing_key_id;
+  long long signed_sequence;
+  char signed_sequence_text[32];
+  int matched = 0;
+  if (!headers ||
+      b64url_decode(headers->signed_payload_b64, payload, sizeof(payload) - 1u,
+                    &payload_len) != 0 ||
+      payload_len == 0u || payload_len >= sizeof(payload)) {
+    snprintf(reason, reason_cap, "signed payload decode failed");
+    return -1;
+  }
+  payload[payload_len] = '\0';
+  root = cJSON_Parse((const char *)payload);
+  if (!cJSON_IsObject(root)) {
+    snprintf(reason, reason_cap, "signed payload JSON invalid");
+    goto done;
+  }
+  schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+  version = cJSON_GetObjectItemCaseSensitive(root, "version");
+  sequence = cJSON_GetObjectItemCaseSensitive(root, "sequence");
+  config_hash = cJSON_GetObjectItemCaseSensitive(root, "configHash");
+  previous_hash = cJSON_GetObjectItemCaseSensitive(root, "previousHash");
+  nonce = cJSON_GetObjectItemCaseSensitive(root, "nonce");
+  expires_at = cJSON_GetObjectItemCaseSensitive(root, "expiresAt");
+  signing_key_id = cJSON_GetObjectItemCaseSensitive(root, "signingKeyId");
+  signed_sequence = cJSON_IsNumber(sequence) && sequence->valuedouble > 0.0 &&
+                            sequence->valuedouble <= 9007199254740991.0
+                        ? (long long)sequence->valuedouble
+                        : 0;
+  snprintf(signed_sequence_text, sizeof(signed_sequence_text), "%lld", signed_sequence);
+  if (!cJSON_IsString(schema) || !schema->valuestring ||
+      strcmp(schema->valuestring, "agent-config-signature-v1") != 0 ||
+      !cJSON_IsString(version) || !version->valuestring || !headers->policy_version[0] ||
+      strcmp(version->valuestring, headers->policy_version) != 0 ||
+      !cJSON_IsNumber(sequence) || signed_sequence <= 0 ||
+      sequence->valuedouble != (double)signed_sequence ||
+      strcmp(signed_sequence_text, headers->sequence) != 0 ||
+      !cJSON_IsString(config_hash) || !config_hash->valuestring ||
+      strcmp(config_hash->valuestring, headers->config_hash) != 0 ||
+      !cJSON_IsString(previous_hash) || !previous_hash->valuestring ||
+      strcmp(previous_hash->valuestring, headers->previous_hash) != 0 ||
+      !cJSON_IsString(nonce) || !nonce->valuestring ||
+      strcmp(nonce->valuestring, headers->nonce) != 0 ||
+      !cJSON_IsString(expires_at) || !expires_at->valuestring ||
+      strcmp(expires_at->valuestring, headers->expires_at) != 0 ||
+      !cJSON_IsString(signing_key_id) || !signing_key_id->valuestring ||
+      strcmp(signing_key_id->valuestring, headers->signing_key_id) != 0) {
+    snprintf(reason, reason_cap, "signed payload identity mismatch");
+    goto done;
+  }
+  matched = 1;
+done:
+  cJSON_Delete(root);
+  return matched ? 0 : -1;
+}
+
 static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *queue_db_path, const char *tmp,
                                            const EdrAgentConfigHeaders *headers,
                                            char *reason, size_t reason_cap) {
@@ -483,7 +571,10 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
     snprintf(reason, reason_cap, "config hash mismatch");
     return -1;
   }
-  seq = atoll(headers->sequence);
+  if (edr_agent_parse_config_sequence(headers->sequence, &seq) != 0) {
+    snprintf(reason, reason_cap, "config sequence invalid");
+    return -1;
+  }
   seen = edr_agent_read_config_sequence_state(queue_db_path);
   if (seq > 0 && seen > 0 && seq < seen) {
     snprintf(reason, reason_cap, "config rollback detected sequence=%lld seen=%lld", seq, seen);
@@ -508,7 +599,7 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
       snprintf(reason, reason_cap, "ed25519 signature mismatch");
       return -1;
     }
-    return 0;
+    return edr_agent_signed_config_identity_matches_headers(headers, reason, reason_cap);
   }
   {
     unsigned char payload[2048];
@@ -537,7 +628,7 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
     return -1;
   }
 #endif
-  return 0;
+  return edr_agent_signed_config_identity_matches_headers(headers, reason, reason_cap);
 }
 
 static int edr_agent_replace_file(const char *src, const char *dst) {
@@ -4079,12 +4170,15 @@ static void edr_agent_report_remote_config_failure(EdrAgent *agent,
                                                    uint64_t now) {
   EdrIngestHttpRuntime runtime;
   char detail[192];
+  char applied_policy_version[128];
   const char *failure = reason && reason[0] ? reason : "remote_config_failed";
   const uint64_t repeat_ns = 15ULL * 60ULL * 1000000000ULL;
   if (!agent) {
     return;
   }
   memset(&runtime, 0, sizeof(runtime));
+  edr_ingest_http_copy_policy_version(applied_policy_version,
+                                      sizeof(applied_policy_version));
   edr_ingest_http_get_runtime(&runtime);
   if (runtime.last_error[0] && strcmp(failure, "remote_config_download_failed") == 0) {
     snprintf(detail, sizeof(detail), "%.64s: %.116s", failure, runtime.last_error);
@@ -4099,15 +4193,15 @@ static void edr_agent_report_remote_config_failure(EdrAgent *agent,
           agent->cfg.agent.tenant_id,
           agent->cfg.agent.endpoint_id,
           EDR_AGENT_VERSION_STRING,
-          agent->cfg.preprocessing.rules_version,
-          headers ? headers->config_hash : "",
+          applied_policy_version,
+          agent->applied_remote_config_hash,
           headers ? headers->sequence : "",
           headers ? headers->nonce : "",
           headers ? headers->signature : "",
           headers ? headers->signing_key_id : "",
           0,
           failure,
-          "",
+          headers ? headers->policy_version : "",
           headers ? headers->config_hash : "",
           "failed",
           0) == 0) {
@@ -4185,7 +4279,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
 
   if (config_headers.config_hash[0] &&
       strcmp(agent->applied_remote_config_hash, config_headers.config_hash) == 0) {
-    long long sequence = atoll(config_headers.sequence);
+    long long sequence = 0;
+    (void)edr_agent_parse_config_sequence(config_headers.sequence, &sequence);
     /* The authenticated content hash is the policy identity. A newer
      * delivery sequence still advances anti-rollback state and may be acked,
      * but must not reapply identical collection settings or restart ETW. */
@@ -4200,10 +4295,10 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     if (!agent->applied_remote_config_status_reported &&
         edr_ingest_http_post_config_status(
             agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
-            EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
+            EDR_AGENT_VERSION_STRING, config_headers.policy_version,
             config_headers.config_hash, config_headers.sequence, config_headers.nonce,
             config_headers.signature, config_headers.signing_key_id, 1, "",
-            agent->cfg.preprocessing.rules_version, config_headers.config_hash,
+            config_headers.policy_version, config_headers.config_hash,
             "applied", 0) == 0) {
       agent->applied_remote_config_status_reported = 1;
     }
@@ -4274,7 +4369,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_reconfigure(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
-  edr_ingest_http_set_policy_version(agent->cfg.preprocessing.rules_version);
+  edr_ingest_http_set_policy_version(config_headers.policy_version);
   if ((changed & EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED) != 0 &&
       agent->cfg.health_monitor.enabled && last_health_ns) {
     *last_health_ns = 0u;
@@ -4294,7 +4389,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     }
   }
   if (config_headers.sequence[0] || config_headers.config_hash[0]) {
-    long long seq = atoll(config_headers.sequence);
+    long long seq = 0;
+    (void)edr_agent_parse_config_sequence(config_headers.sequence, &seq);
     if (seq > 0) {
       edr_agent_write_config_sequence_state(agent->cfg.offline.queue_db_path, seq);
     }
@@ -4306,7 +4402,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
         edr_ingest_http_post_config_status(agent->cfg.agent.tenant_id,
                                            agent->cfg.agent.endpoint_id,
                                            EDR_AGENT_VERSION_STRING,
-                                           agent->cfg.preprocessing.rules_version,
+                                           config_headers.policy_version,
                                            config_headers.config_hash,
                                            config_headers.sequence,
                                            config_headers.nonce,
@@ -4314,7 +4410,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
                                            config_headers.signing_key_id,
                                            1,
                                            "",
-                                           agent->cfg.preprocessing.rules_version,
+                                           config_headers.policy_version,
                                            config_headers.config_hash,
                                            "applied",
                                            0) == 0;
@@ -4422,12 +4518,6 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
   }
   if (verify_reason[0]) {
     fprintf(stderr, "[emit_rules] remote rules signature rejected: %s\n", verify_reason);
-    (void)edr_ingest_http_post_config_status(
-        agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
-        EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
-        rules_headers.config_hash, rules_headers.sequence, rules_headers.nonce,
-        rules_headers.signature, rules_headers.signing_key_id, 0, verify_reason,
-        "", rules_headers.config_hash, "rules_failed", 0);
     (void)remove(tmp);
     return;
   }
@@ -4440,13 +4530,6 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
     return;
   }
   edr_preprocess_apply_config(&agent->cfg);
-  (void)edr_ingest_http_post_config_status(
-      agent->cfg.agent.tenant_id, agent->cfg.agent.endpoint_id,
-      EDR_AGENT_VERSION_STRING, agent->cfg.preprocessing.rules_version,
-      rules_headers.config_hash, rules_headers.sequence, rules_headers.nonce,
-      rules_headers.signature, rules_headers.signing_key_id, 1, "",
-      agent->cfg.preprocessing.rules_version, rules_headers.config_hash,
-      "rules_applied", 0);
   fprintf(stderr, "[emit_rules] remote rules hot-reloaded: version=%s rules=%u fingerprint=%s\n",
           agent->cfg.preprocessing.rules_version[0]
               ? agent->cfg.preprocessing.rules_version

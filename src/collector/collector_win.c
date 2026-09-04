@@ -2425,14 +2425,17 @@ static void edr_collector_file_read_metadata_gate_note_resolved(void) {
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
   if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
       !s_file_read_metadata_gate.slot_valid) {
+    int post_reset_recovery =
+        s_file_read_metadata_gate.recovery_deadline_ns != 0u &&
+        s_file_read_metadata_gate.recovery_trigger_reason[0] != '\0';
     s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
     s_file_read_metadata_gate.reason[0] = '\0';
     s_file_read_metadata_gate.post_reset_recovery_reason[0] = '\0';
     s_file_read_metadata_gate.consecutive_restart_attempts = 0u;
-    s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
     s_health.file_read_p0_capability_healthy = 1;
     s_health.file_read_p0_capability_reason[0] = '\0';
-    if (s_file_read_metadata_gate.recovery_trigger_reason[0]) {
+    if (post_reset_recovery) {
+      s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
       edr_collector_file_read_metadata_recovery_observe_locked("result", "healthy");
       edr_collector_file_read_metadata_recovery_clear_subject_locked();
     }
@@ -2759,7 +2762,9 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
     uint32_t consecutive_restart_attempts =
         s_file_read_metadata_gate.consecutive_restart_attempts;
     uint8_t resume_degraded =
-        s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED;
+        s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
+        s_file_read_metadata_gate.recovery_deadline_ns != 0u &&
+        s_file_read_metadata_gate.recovery_trigger_reason[0] != '\0';
     char active_recovery_event_id[EDR_BR_ID_LEN];
     char active_recovery_reason[96];
     char active_recovery_marker[EDR_FILE_READ_METADATA_MARKER_LEN];
@@ -2798,6 +2803,7 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   s_file_read_metadata_gate.slot_valid = 1u;
   s_file_read_metadata_gate.retryable = 1u;
   s_file_read_metadata_gate.requires_session_reset =
+      !s_file_read_metadata_gate.resume_degraded &&
       edr_collector_file_read_metadata_gate_reason_requires_session_reset(reason) ? 1u : 0u;
   s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_PENDING;
   s_file_read_metadata_gate.next_retry_ns = 0u;

@@ -384,7 +384,11 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
     snprintf(reqsig.secret, sizeof(reqsig.secret), "%s", cfg->platform.request_signing.secret);
     edr_ingest_http_configure_request_signing(&reqsig);
   }
-  edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version);
+  /* Runtime policy and preprocessing rules have independent identities.  The
+   * signed runtime-policy pull sets this value after verification; until then
+   * report the explicit local fallback instead of mislabeling a rules bundle
+   * as the applied endpoint policy. */
+  edr_ingest_http_set_policy_version(NULL);
   edr_ingest_http_configure_transport_options(
       cfg->platform.http2_enabled ? 1 : 0,
       cfg->platform.http2_require ? 1 : 0,

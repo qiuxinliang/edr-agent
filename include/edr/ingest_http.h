@@ -190,6 +190,7 @@ void edr_ingest_http_apply_control_transport_flags(int http2_enabled, int http2_
                                                    int http1_fallback);
 
 typedef struct {
+  char policy_version[128];
   char config_hash[65];
   char sequence[32];
   char previous_hash[65];
