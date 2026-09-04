@@ -101,6 +101,7 @@ static int p0_collector_metadata_is_valid(const EdrP0SourceOnlyReason *contract,
   const cJSON *pid;
   const cJSON *start_key;
   const cJSON *event_time;
+  const cJSON *rejected_field;
   int path_may_be_null;
   if (!contract) return 0;
   metadata = p0_json_unique_member(root, "collector_metadata");
@@ -110,6 +111,7 @@ static int p0_collector_metadata_is_valid(const EdrP0SourceOnlyReason *contract,
   pid = p0_json_unique_member(metadata, "pid");
   start_key = p0_json_unique_member(metadata, "process_start_key");
   event_time = p0_json_unique_member(metadata, "event_time_ns");
+  rejected_field = p0_json_unique_member(metadata, "rejected_field");
   path_may_be_null = strcmp(contract->reason,
                             EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED) == 0 ||
                      strcmp(contract->reason,
@@ -120,7 +122,10 @@ static int p0_collector_metadata_is_valid(const EdrP0SourceOnlyReason *contract,
       !(cJSON_IsString(file_key) || cJSON_IsNull(file_key)) ||
       !(cJSON_IsString(pid) || cJSON_IsNumber(pid) || cJSON_IsNull(pid)) ||
       !(cJSON_IsString(start_key) || cJSON_IsNumber(start_key) || cJSON_IsNull(start_key)) ||
-      !cJSON_IsString(event_time) || !event_time->valuestring) {
+      !cJSON_IsString(event_time) || !event_time->valuestring ||
+      !cJSON_IsString(rejected_field) || !rejected_field->valuestring ||
+      !contract->rejected_field ||
+      strcmp(rejected_field->valuestring, contract->rejected_field) != 0) {
     return 0;
   }
   if (strcmp(contract->reason, EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE) == 0) {

@@ -59,6 +59,10 @@ typedef struct EdrP0SourceOnlyReason {
   const char *reason;
   EdrP0SourceOnlyStage stage;
   const char *gate_id;
+  /* Collector evidence-gate reasons bind to the exact field or bounded
+   * collector resource that prevented evaluation. Other stages leave this
+   * empty because their reason already identifies the owning boundary. */
+  const char *rejected_field;
 } EdrP0SourceOnlyReason;
 
 #define EDR_P0_SOURCE_ONLY_PRE_EVALUATION_REASONS(X) \
@@ -98,33 +102,33 @@ typedef struct EdrP0SourceOnlyReason {
  * metadata only. These dispositions must never be relabelled as FILE_READ
  * rule hits merely because a later read cannot be safely correlated. */
 #define EDR_P0_SOURCE_ONLY_COLLECTOR_EVIDENCE_GATE_REASONS(X) \
-  X(EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) \
-  X(EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY) \
-  X(EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS) \
-  X(EDR_P0_FILE_READ_REASON_START_KEY_MISSING) \
-  X(EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE) \
-  X(EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH) \
-  X(EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED) \
-  X(EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE) \
-  X(EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE) \
-  X(EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE)
+  X(EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE, "collector_queue") \
+  X(EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY, "critical_binding") \
+  X(EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS, "file_key") \
+  X(EDR_P0_FILE_READ_REASON_START_KEY_MISSING, "process_start_key") \
+  X(EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE, "process_generation") \
+  X(EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH, "process_generation") \
+  X(EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED, "canonical_path") \
+  X(EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE, "payload") \
+  X(EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE, "event_time_ns") \
+  X(EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE, "event_bus")
 
 #define EDR_P0_SOURCE_ONLY_DELIVERY_REASONS(X) \
   X("pending_assertion_lost_on_restart")
 
 #define EDR_P0_SOURCE_ONLY_PRE_ENTRY(reason_value) \
-  {reason_value, EDR_P0_SOURCE_ONLY_STAGE_PRE_EVALUATION, EDR_P0_PROCESS_EVIDENCE_GATE},
+  {reason_value, EDR_P0_SOURCE_ONLY_STAGE_PRE_EVALUATION, EDR_P0_PROCESS_EVIDENCE_GATE, ""},
 #define EDR_P0_SOURCE_ONLY_DIRECT_ENTRY(reason_value) \
-  {reason_value, EDR_P0_SOURCE_ONLY_STAGE_DIRECT, ""},
+  {reason_value, EDR_P0_SOURCE_ONLY_STAGE_DIRECT, "", ""},
 #define EDR_P0_SOURCE_ONLY_RULESET_EVALUATION_ENTRY(reason_value) \
   {reason_value, EDR_P0_SOURCE_ONLY_STAGE_RULESET_EVALUATION, \
-   EDR_P0_RULESET_EVALUATION_GATE},
-#define EDR_P0_SOURCE_ONLY_COLLECTOR_EVIDENCE_GATE_ENTRY(reason_value) \
+   EDR_P0_RULESET_EVALUATION_GATE, ""},
+#define EDR_P0_SOURCE_ONLY_COLLECTOR_EVIDENCE_GATE_ENTRY(reason_value, rejected_field_value) \
   {reason_value, EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE, \
-   EDR_P0_FILE_READ_METADATA_GATE},
+   EDR_P0_FILE_READ_METADATA_GATE, rejected_field_value},
 #define EDR_P0_SOURCE_ONLY_DELIVERY_ENTRY(reason_value) \
   {reason_value, EDR_P0_SOURCE_ONLY_STAGE_SOURCE_ONLY_DELIVERY, \
-   EDR_P0_SOURCE_ONLY_DURABILITY_GATE},
+   EDR_P0_SOURCE_ONLY_DURABILITY_GATE, ""},
 
 static const EdrP0SourceOnlyReason edr_p0_source_only_reason_table[] = {
     EDR_P0_SOURCE_ONLY_PRE_EVALUATION_REASONS(EDR_P0_SOURCE_ONLY_PRE_ENTRY)

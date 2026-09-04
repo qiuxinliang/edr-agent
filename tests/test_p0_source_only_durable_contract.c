@@ -702,6 +702,9 @@ static int verify_collector_evidence_fixture(const SourceFixtureCase *fixture,
   EdrBehaviorRecord input;
   EdrBehaviorRecord built;
   edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+  const EdrP0SourceOnlyReason *contract =
+      edr_p0_source_only_reason_find(fixture->reason);
+  char rejected_field_binding[96];
   pb_istream_t stream;
   make_record(&input, fixture, index);
   input.file_key = 0xabcULL;
@@ -727,7 +730,10 @@ static int verify_collector_evidence_fixture(const SourceFixtureCase *fixture,
            EDR_P0_FILE_READ_METADATA_GATE);
   snprintf(input.collector_evidence_reason, sizeof(input.collector_evidence_reason), "%s",
            fixture->reason);
-  if (!edr_p0_rule_test_build_source_only_collector_evidence_record(&input, &built) ||
+  if (!contract || !contract->rejected_field || !contract->rejected_field[0] ||
+      snprintf(rejected_field_binding, sizeof(rejected_field_binding),
+               "\"rejected_field\":\"%s\"", contract->rejected_field) < 0 ||
+      !edr_p0_rule_test_build_source_only_collector_evidence_record(&input, &built) ||
       !edr_behavior_record_emit_durable(&built)) {
     return 0;
   }
@@ -744,6 +750,7 @@ static int verify_collector_evidence_fixture(const SourceFixtureCase *fixture,
              "\"gate_id\":\"P0_FILE_READ_METADATA_GATE\"") == NULL ||
       strstr(decoded.ave_result_json, fixture->reason) == NULL ||
       strstr(decoded.ave_result_json, "\"canonical_path\":") == NULL ||
+      strstr(decoded.ave_result_json, rejected_field_binding) == NULL ||
       strstr(decoded.ave_result_json, "\"rule_id\"") != NULL ||
       strstr(decoded.ave_result_json, "\"rules_bundle_") != NULL) {
     return 0;
@@ -904,8 +911,17 @@ static void print_authority_contract(void) {
     first = 0;
   }
   printf("]},\n");
-  printf("    \"collector_evidence_gate\": {\"event_types\": [\"file_read\"], \"gate_id\": \"%s\", \"forbids\": [\"rule_id\", \"rules_bundle_version\", \"rules_bundle_sha256\", \"alert\", \"action\"], \"collector_metadata\": {\"canonical_path\":\"required_or_null_only_for_registered_unresolved_reason\",\"null_canonical_path_reasons\":[\"file_read_canonical_path_unresolved\",\"file_read_payload_unavailable\",\"file_read_event_time_unavailable\"],\"file_key\":\"nullable_hex64\",\"pid\":\"nullable_uint32\",\"process_start_key\":\"nullable_decimal_u64\",\"event_time_ns\":\"required_decimal_i64_zero_only_for_file_read_event_time_unavailable\"}, \"reasons\": [",
+  printf("    \"collector_evidence_gate\": {\"event_types\": [\"file_read\"], \"gate_id\": \"%s\", \"forbids\": [\"rule_id\", \"rules_bundle_version\", \"rules_bundle_sha256\", \"alert\", \"action\"], \"collector_metadata\": {\"canonical_path\":\"required_or_null_only_for_registered_unresolved_reason\",\"null_canonical_path_reasons\":[\"file_read_canonical_path_unresolved\",\"file_read_payload_unavailable\",\"file_read_event_time_unavailable\"],\"file_key\":\"nullable_hex64\",\"pid\":\"nullable_uint32\",\"process_start_key\":\"nullable_decimal_u64\",\"event_time_ns\":\"required_decimal_i64_zero_only_for_file_read_event_time_unavailable\",\"rejected_field\":{",
          EDR_P0_FILE_READ_METADATA_GATE);
+  first = 1;
+  for (i = 0u; i < edr_p0_source_only_reason_count(); ++i) {
+    const EdrP0SourceOnlyReason *reason = &edr_p0_source_only_reason_table[i];
+    if (reason->stage != EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE) continue;
+    printf("%s\"%s\":\"%s\"", first ? "" : ",", reason->reason,
+           reason->rejected_field);
+    first = 0;
+  }
+  printf("}}, \"reasons\": [");
   first = 1;
   for (i = 0u; i < edr_p0_source_only_reason_count(); ++i) {
     const EdrP0SourceOnlyReason *reason = &edr_p0_source_only_reason_table[i];

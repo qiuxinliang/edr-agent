@@ -2560,6 +2560,7 @@ static int p0_build_source_only_collector_evidence_record(const EdrBehaviorRecor
   const EdrP0SourceOnlyReason *contract;
   char escaped_reason[192];
   char escaped_gate[96];
+  char escaped_rejected_field[64];
   char escaped_path[sizeof(record->file_path) * 2u + 1u];
   char canonical_path_json[sizeof(escaped_path) + 3u];
   char file_key[32];
@@ -2578,9 +2579,12 @@ static int p0_build_source_only_collector_evidence_record(const EdrBehaviorRecor
   contract = edr_p0_source_only_reason_find(record->collector_evidence_reason);
   if (!contract || contract->stage != EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE ||
       strcmp(contract->gate_id, EDR_P0_FILE_READ_METADATA_GATE) != 0 ||
+      !contract->rejected_field || !contract->rejected_field[0] ||
       !p0_json_escape(record->collector_evidence_reason, escaped_reason,
                       sizeof(escaped_reason), 96u) ||
-      !p0_json_escape(contract->gate_id, escaped_gate, sizeof(escaped_gate), 64u)) {
+      !p0_json_escape(contract->gate_id, escaped_gate, sizeof(escaped_gate), 64u) ||
+      !p0_json_escape(contract->rejected_field, escaped_rejected_field,
+                      sizeof(escaped_rejected_field), 48u)) {
     return 0;
   }
   if (record->file_path[0]) {
@@ -2624,10 +2628,10 @@ static int p0_build_source_only_collector_evidence_record(const EdrBehaviorRecor
                      "\"stage\":\"collector_evidence_gate\",\"gate_id\":\"%s\","
                      "\"collector_metadata\":{\"canonical_path\":%s,"
                      "\"file_key\":%s,\"pid\":%s,\"process_start_key\":%s,"
-                     "\"event_time_ns\":%s}}",
+                     "\"event_time_ns\":%s,\"rejected_field\":\"%s\"}}",
                      escaped_reason, EDR_P0_SOURCE_ONLY_CONTRACT_VERSION, escaped_gate,
                      canonical_path_json, file_key_json, pid_json, start_key_json,
-                     event_time_ns);
+                     event_time_ns, escaped_rejected_field);
   return written >= 0 && (size_t)written < sizeof(out->detection_context);
 }
 

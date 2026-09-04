@@ -863,6 +863,34 @@ static void test_source_only_direct_contract_uses_production_builder(void) {
              &input, EDR_P0_PROCESS_EVIDENCE_GATE, "p0_alert_queue_backpressure", &out) == 0);
 }
 
+static void test_file_read_source_only_binds_rejected_field(void) {
+  static const char marker[] = "\"rejected_field\":\"canonical_path\"";
+  EdrBehaviorRecord input;
+  EdrBehaviorRecord out;
+  char *bound_field;
+
+  init_record(&input);
+  input.type = EDR_EVENT_FILE_READ;
+  input.pid = 99008u;
+  input.event_time_ns = 123456789;
+  input.file_key = 0xabcULL;
+  input.process_start_key = 0x6104u;
+  input.file_path[0] = '\0';
+  snprintf(input.collector_evidence_gate, sizeof(input.collector_evidence_gate), "%s",
+           EDR_P0_FILE_READ_METADATA_GATE);
+  snprintf(input.collector_evidence_reason, sizeof(input.collector_evidence_reason), "%s",
+           EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+
+  assert(edr_p0_rule_test_build_source_only_collector_evidence_record(&input, &out) == 1);
+  assert(strstr(out.detection_context, marker) != NULL);
+  assert(edr_p0_source_only_validate_record(&out) == 1);
+
+  bound_field = strstr(out.detection_context, marker);
+  assert(bound_field != NULL);
+  bound_field[strlen("\"rejected_field\":\"")] = 'x';
+  assert(edr_p0_source_only_validate_record(&out) == 0);
+}
+
 static void fill_escaped(char *out, size_t cap) {
   size_t i;
   assert(cap > 2u);
@@ -2196,6 +2224,7 @@ int main(void) {
   test_p0_exact_replay_window_rearms_only_that_source();
   test_p0_dedup_never_suppresses_semantic_mutations();
   test_source_only_direct_contract_uses_production_builder();
+  test_file_read_source_only_binds_rejected_field();
   test_p0_full_context_counts_capped_value_once();
   test_p0_abi_fields_mark_omission_without_losing_record();
   test_p0_push_failure_does_not_commit_emit_counters();
