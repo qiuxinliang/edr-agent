@@ -322,6 +322,10 @@ int main(void) {
            "CMake exposes per-target MSVC runtime selection");
   contains(cmake, "MSVC_RUNTIME_LIBRARY \"MultiThreaded$<$<CONFIG:Debug>:Debug>\"",
            "detached uninstaller is statically linked to the MSVC runtime");
+  contains(cmake, "target_link_options(fd_installer_worker PRIVATE /Brepro)",
+           "installer worker has deterministic MSVC link identity");
+  contains(cmake, "target_link_options(fd_headless_uninstaller PRIVATE /Brepro)",
+           "detached uninstaller has deterministic MSVC link identity");
   contains(cmake, "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>",
            "shared MSVC warnings select UTF-8 decoding only for C and C++ translation units");
   contains(cmake, "$<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>",

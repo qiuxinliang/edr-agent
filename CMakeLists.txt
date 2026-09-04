@@ -724,6 +724,11 @@ if(WIN32)
   target_sources(fd_installer_worker PRIVATE src/platform/windows_handoff.c src/platform/windows_spawn.c)
   target_include_directories(fd_installer_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(fd_installer_worker PRIVATE advapi32 shell32 user32)
+  if(MSVC)
+    # binary_hot requires unchanged lifecycle helpers to retain byte-identical
+    # Runtime identity across otherwise source-only releases.
+    target_link_options(fd_installer_worker PRIVATE /Brepro)
+  endif()
   edr_apply_common_warnings(fd_installer_worker)
 
   add_executable(fd_headless_uninstaller WIN32 src/installer_worker/headless_uninstaller_win.c)
@@ -737,6 +742,9 @@ if(WIN32)
     # explicit source charset, MSVC decodes this file through the runner's ACP
     # and the resulting uninstall prompts are permanently mojibaked.
     target_compile_options(fd_headless_uninstaller PRIVATE /utf-8)
+    # Keep the detached finalizer byte-identical when its inputs are unchanged;
+    # the release gate compares this exact component before binary replacement.
+    target_link_options(fd_headless_uninstaller PRIVATE /Brepro)
     # The detached finalizer must remain runnable after it starts deleting the
     # installation directory. A dynamic CRT would keep DLLs in that directory
     # loaded and make the finalizer lock the tree it is responsible for removing.
