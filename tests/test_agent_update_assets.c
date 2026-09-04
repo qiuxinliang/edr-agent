@@ -336,6 +336,15 @@ int main(void) {
                           "shared MSVC encoding and atomics options are both language-scoped");
   free(cmake);
 
+  snprintf(path, sizeof(path), "%s/scripts/update-version.ps1", root);
+  char *version_update = read_file(path);
+  require_true(version_update != NULL, "read release version update script");
+  require_true(!strstr(version_update, "File        = 'vcpkg.json'"),
+               "Agent version updates do not invalidate the dependency closure hash");
+  contains(version_update, "dependency closure identity must remain release-invariant",
+           "version update fails if the dependency manifest changes during execution");
+  free(version_update);
+
   snprintf(path, sizeof(path), "%s/src/installer_worker/headless_uninstaller_win.c", root);
   char *native_uninstaller = read_file(path);
   require_true(native_uninstaller != NULL, "read native Windows uninstaller implementation");

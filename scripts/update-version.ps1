@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    更新 edr-agent 项目中所有版本号引用为指定版本。
+    更新 edr-agent 项目的发布版本，保持依赖闭包标识不变。
 
 .DESCRIPTION
-    接收 a.b.c 格式的版本号作为唯一参数，自动扫描并更新以下文件中的版本号：
-      - vcpkg.json                  (version-string)
-      - CMakeLists.txt              (project VERSION)
+    接收 a.b.c 格式的版本号作为唯一参数，更新 CMakeLists.txt 中的
+    project VERSION。vcpkg.json 描述的是锁定依赖闭包，必须在不同 Agent
+    发布版本之间保持不变，否则会使预构建制品永远无法命中。
     EDR_AGENT_VERSION_STRING 运行时版本由 CMake/CI 注入；源码 fallback 必须保持 unknown，
     避免漏注入时伪装成真实旧版本。
     支持干跑模式（-DryRun），仅报告将会修改的内容而不实际修改文件。
@@ -42,12 +42,6 @@ $Patch = [int]$parts[2]
 # 每项包含: File (相对路径), Pattern (regex), Replacement (替换文本), Desc (描述)
 $Rules = @(
     @{
-        File        = 'vcpkg.json'
-        Pattern     = '("version-string"\s*:\s*)"[^"]*"'
-        Replacement = "`$1`"$Version`""
-        Desc        = 'vcpkg manifest version-string'
-    },
-    @{
         File        = 'CMakeLists.txt'
         Pattern     = '(?s)(project\(\s*edr_agent\b.*?\bVERSION\s+)[0-9]+\.[0-9]+\.[0-9]+(.*?\))'
         Replacement = '${1}' + $Version + '${2}'
@@ -62,6 +56,12 @@ $Report = @()
 
 Push-Location $PSScriptRoot/..
 try {
+    $DependencyManifest = 'vcpkg.json'
+    $DependencyManifestHashBefore = $null
+    if (Test-Path -LiteralPath $DependencyManifest -PathType Leaf) {
+        $DependencyManifestHashBefore = (Get-FileHash -LiteralPath $DependencyManifest -Algorithm SHA256).Hash
+    }
+
     foreach ($Rule in $Rules) {
         $File = $Rule.File
         $Desc = $Rule.Desc
@@ -121,6 +121,13 @@ try {
         if ($FallbackText -match '#define\s+EDR_AGENT_VERSION_STRING\s+"(?!unknown")[^"]+"') {
             Write-Error "$FallbackFile contains a concrete EDR_AGENT_VERSION_STRING fallback. Keep fallbacks as `"unknown`" and inject the real version from CMake/CI."
             exit 1
+        }
+    }
+
+    if ($DependencyManifestHashBefore) {
+        $DependencyManifestHashAfter = (Get-FileHash -LiteralPath $DependencyManifest -Algorithm SHA256).Hash
+        if ($DependencyManifestHashAfter -ne $DependencyManifestHashBefore) {
+            throw 'vcpkg.json changed while updating the Agent version; dependency closure identity must remain release-invariant'
         }
     }
 }
