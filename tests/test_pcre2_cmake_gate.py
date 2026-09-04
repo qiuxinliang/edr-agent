@@ -773,6 +773,50 @@ class PCRE2CMakeGateTests(unittest.TestCase):
         with self.assertRaisesRegex(FIXTURE_GATE.FixtureError, "terminal fixture semantic IDs changed"):
             FIXTURE_GATE.require_same_semantic_ids(source_fixture, source_fixture, mutated, terminal_fixture)
 
+    def test_durable_wire_gate_allows_only_reviewed_file_read_reason_split(self):
+        source_fixture = json.loads((REPO_ROOT / "edr-backend" / "platform" / "internal" /
+                                     "handler" / "testdata" /
+                                     "p0_source_only_durable_wire_golden.json").read_text(encoding="utf-8"))
+        terminal_fixture = json.loads((REPO_ROOT / "edr-backend" / "platform" / "internal" /
+                                       "handler" / "testdata" /
+                                       "enforcement_terminal_authority_durable_wire_golden.json").read_text(encoding="utf-8"))
+        additions = set(FIXTURE_GATE.APPROVED_SOURCE_SEMANTIC_ADDITIONS)
+        before = json.loads(json.dumps(source_fixture))
+        before["fixtures"] = [
+            item for item in before["fixtures"]
+            if (
+                item.get("stage"), item.get("event_type"), item.get("event_id"),
+                item.get("reason"), item.get("rule_id", ""), item.get("gate_id", ""),
+                item.get("loss_detected"),
+            ) not in additions
+        ]
+        self.assertEqual(len(source_fixture["fixtures"]), len(before["fixtures"]) + 2)
+        self.assertEqual(
+            "split FileRead metadata backpressure causes",
+            FIXTURE_GATE.require_same_semantic_ids(
+                source_fixture, before, terminal_fixture, terminal_fixture,
+                allow_approved_transition=True,
+            ),
+        )
+        with self.assertRaisesRegex(FIXTURE_GATE.FixtureError, "source fixture semantic IDs changed"):
+            FIXTURE_GATE.require_same_semantic_ids(
+                source_fixture, before, terminal_fixture, terminal_fixture
+            )
+        unknown = json.loads(json.dumps(source_fixture))
+        unknown["fixtures"][10]["reason"] = "file_read_unreviewed_reason"
+        reordered = json.loads(json.dumps(source_fixture))
+        reordered["fixtures"][0], reordered["fixtures"][1] = (
+            reordered["fixtures"][1], reordered["fixtures"][0]
+        )
+        removed = json.loads(json.dumps(source_fixture))
+        del removed["fixtures"][0]
+        for drifted in (unknown, reordered, removed):
+            with self.assertRaisesRegex(FIXTURE_GATE.FixtureError, "source fixture semantic IDs changed"):
+                FIXTURE_GATE.require_same_semantic_ids(
+                    drifted, before, terminal_fixture, terminal_fixture,
+                    allow_approved_transition=True,
+                )
+
     def test_durable_wire_gate_allows_only_the_committed_source_fields_truncated_transition(self):
         source_fixture = json.loads((REPO_ROOT / "edr-backend" / "platform" / "internal" /
                                      "handler" / "testdata" /

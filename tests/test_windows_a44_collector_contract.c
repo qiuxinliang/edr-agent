@@ -229,9 +229,6 @@ int main(void) {
                          "s_file_read_metadata_gate.recovery_deadline_ns != 0u &&",
                          "only an active bounded post-reset recovery may suppress another epoch reset");
   ok &= require_contains(collector,
-                         "!s_file_read_metadata_gate.resume_degraded &&",
-                         "a post-reset source-only record must not immediately request another provider restart");
-  ok &= require_contains(collector,
                          "int post_reset_recovery =",
                          "normal startup binding must not be counted as post-reset recovery evidence");
   ok &= require_contains(collector,
@@ -243,19 +240,36 @@ int main(void) {
   ok &= require_contains(collector,
                          "recovery_observe_locked(\"result\", \"timeout\")",
                          "post-reset recovery timeout must use the stable lifecycle observation");
-  ok &= require_contains(
-      collector,
-      "edr_collector_file_read_metadata_gate_reason_requires_session_reset",
-      "FileRead recovery must classify provider-session faults separately from per-event gaps");
-  ok &= require_contains(
-      collector,
-      "strcmp(reason, EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) == 0",
-      "only an ambiguous or lost protected FileKey binding may request a provider reset");
   ok &= require_absent_in_function(
-      collector, "static int edr_collector_file_read_metadata_gate_reason_requires_session_reset(",
-      "/* Stage the first FileKey metadata assertion",
-      "EVENT_BUS_UNAVAILABLE",
-      "local source-only delivery pressure must not restart the ETW provider");
+      collector, "static void edr_collector_file_read_metadata_gate_stage(",
+      "void edr_collector_file_read_metadata_gate_retry(void)",
+      "reason_requires_session_reset",
+      "no per-binding FileRead disposition may classify itself as a provider restart");
+  ok &= require_contains(
+      collector, "s_file_read_metadata_gate.requires_session_reset = 0u;",
+      "per-binding FileRead dispositions must explicitly leave provider restart disabled");
+  ok &= require_contains(collector,
+                         "ambiguous ? EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS",
+                         "same-time FileKey ambiguity must have a distinct local disposition");
+  ok &= require_contains(
+      collector, "edr_collector_file_key_cache_invalidate_locked(file_key);",
+      "a conflicting FileKey must be quarantined while the cache lock is still held");
+  ok &= require_contains(collector,
+                         "EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY",
+                         "protected cache exhaustion must have a distinct capacity disposition");
+  ok &= require_contains(collector_header, "file_read_file_key_ambiguities",
+                         "FileKey ambiguity must be independently observable");
+  ok &= require_contains(collector_header, "file_read_metadata_gate_recovery_episodes",
+                         "provider recovery episodes must survive healthy-state resets");
+  ok &= require_contains(
+      collector, "!s_file_read_metadata_gate.capacity_recovery_pending",
+      "an unrelated cached Read must not claim that protected binding capacity recovered");
+  ok &= require_contains(
+      collector, "if (critical && allocated) {",
+      "protected capacity recovery must require a successful new critical binding allocation");
+  ok &= require_contains(
+      collector, "edr_collector_file_read_metadata_gate_note_capacity_recovered();",
+      "successful protected allocation must clear the capacity degradation");
   ok &= require_contains(collector_header,
                          "file_read_metadata_gate_post_reset_recovery_failures",
                          "collector health must expose post-reset exact-binding recovery failures");
@@ -267,6 +281,18 @@ int main(void) {
                          "coalesced FileRead capability facts must be observable");
   ok &= require_contains(agent, "\\\"coalesced\\\":%llu",
                          "engine health must expose FileRead gate coalescing");
+  ok &= require_order_in_function(
+      collector, "static void edr_collector_file_read_metadata_gate_stage(",
+      "void edr_collector_file_read_metadata_gate_retry(void)",
+      "edr_collector_file_read_metadata_gate_coalesce_locked(coalesce_sha256)",
+      "s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_HEALTHY",
+      "same-subject FileRead failures must coalesce before the single-slot pending gate");
+  ok &= require_order_in_function(
+      collector, "static void edr_collector_file_read_metadata_gate_stage(",
+      "void edr_collector_file_read_metadata_gate_retry(void)",
+      "s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_HEALTHY",
+      "edr_collector_file_read_metadata_gate_remember_locked(coalesce_sha256)",
+      "a distinct FileRead failure must be remembered only after the gate accepts it");
   ok &= require_contains(agent, "\\\"write_budget\\\":{\\\"used\\\":%u",
                          "compact acceptance health must expose evidence-cache rate admission loss");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_session_starting();",
@@ -498,6 +524,16 @@ int main(void) {
   ok &= require_contains(direct,
                          "process_start_key=%llu source_event_id=%s marker=%s",
                          "P0 disposition must join to process generation and durable source evidence");
+  ok &= require_contains(direct,
+                         "candidate = strncmp(marker, \"P0CASE-\", 7u) == 0 ? marker + 7u : marker",
+                         "validation must recognize both embedded and explicit rule markers");
+  ok &= require_contains(direct, "return p0_copy_marker_rule_id(candidate",
+                         "IR-not-ready observations must retain a bounded canonical rule id");
+  ok &= require_contains(direct,
+                         "[p0_rule_stage] target_rule=%s stage=%s reason=%s pid=%u",
+                         "marked P0 validation must expose the rejecting stage and reason");
+  ok &= require_contains(direct, "? \"target_match\" : \"target_no_match\"",
+                         "matcher observation must distinguish a tested rule from other matches");
   ok &= require_absent_in_function(
       direct, "static void p0_observe_rule_disposition(",
       "static int emit_for_rule(", "cmdline",

@@ -1032,12 +1032,18 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
   if (!p0_process_create_candidate(br)) return;
   generation = br->process_start_key;
   memset(&requested, 0, sizeof(requested));
-  (void)edr_process_evidence_request(br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
-                                     generation, edr_monotonic_ns(), &requested);
+  evidence_ready = edr_process_evidence_request(
+      br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
+      generation, edr_monotonic_ns(), &requested);
   evidence = requested;
-  evidence_ready = edr_process_evidence_wait(br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
-                                             generation, edr_monotonic_ns(),
-                                             1000ULL * 1000000ULL, &evidence);
+  if (!evidence_ready &&
+      (strcmp(requested.hash_reason, "queued") == 0 ||
+       strcmp(requested.hash_reason, "requeued_identity_change") == 0 ||
+       strcmp(requested.hash_reason, "identity_revalidation_pending") == 0)) {
+    evidence_ready = edr_process_evidence_wait(
+        br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
+        generation, edr_monotonic_ns(), 1000ULL * 1000000ULL, &evidence);
+  }
   if (!evidence_ready && !evidence.file_identity[0]) {
     snprintf(evidence.file_identity, sizeof(evidence.file_identity), "%s",
              requested.file_identity);
@@ -1176,6 +1182,9 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
   {
     const char *not_evaluable_reason = p0_process_create_not_evaluable_reason(&br);
+    edr_p0_rule_observe_validation_stage(
+        &br, "process_evidence",
+        not_evaluable_reason ? not_evaluable_reason : "complete");
     /* A rule whose complete predicate already matched the authenticated IR
      * does not become unevaluable merely because unrelated enrichment (for
      * example user, parent, or asynchronous artifact evidence) was lost when

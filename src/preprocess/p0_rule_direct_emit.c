@@ -3116,29 +3116,136 @@ static const char *p0_find_ci(const char *haystack, const char *needle) {
   return NULL;
 }
 
+static void p0_copy_marker_token(const char *start, char *out, size_t out_cap) {
+  size_t used = 0u;
+  if (!start || !out || out_cap == 0u) return;
+  while (*start && used + 1u < out_cap) {
+    unsigned char c = (unsigned char)*start++;
+    if (!(c == '-' || c == '_' || c == '.' ||
+          (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+          (c >= 'a' && c <= 'z'))) break;
+    out[used++] = (char)c;
+  }
+  out[used] = '\0';
+}
+
 static void p0_disposition_marker(const EdrBehaviorRecord *br, char *out,
                                   size_t out_cap) {
   static const char *keys[] = {"-Marker", "--edr-p0-case"};
   const char *cmdline = br ? br->cmdline : NULL;
   if (!out || out_cap == 0u) return;
   out[0] = '\0';
-  if (!cmdline) return;
   for (size_t i = 0u; i < sizeof(keys) / sizeof(keys[0]); ++i) {
     const char *p = p0_find_ci(cmdline, keys[i]);
-    size_t used = 0u;
     if (!p) continue;
     p += strlen(keys[i]);
     while (*p == ' ' || *p == '\t' || *p == '=' || *p == ':' || *p == '"' || *p == '\'') ++p;
-    while (*p && used + 1u < out_cap) {
-      unsigned char c = (unsigned char)*p++;
-      if (!(c == '-' || c == '_' || c == '.' ||
-            (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z'))) break;
-      out[used++] = (char)c;
-    }
-    out[used] = '\0';
-    if (used > 0u) return;
+    p0_copy_marker_token(p, out, out_cap);
+    if (out[0]) return;
   }
+  /* The ARM64 acceptance harness embeds P0CASE-* in the copied image path
+   * and command line without a dedicated flag. Recognize only this fixed
+   * test prefix; arbitrary production arguments must never enable logging. */
+  {
+    const char *texts[] = {
+        br ? br->cmdline : NULL,
+        br ? br->image_path_canonical : NULL,
+        br ? br->exe_path : NULL,
+    };
+    for (size_t i = 0u; i < sizeof(texts) / sizeof(texts[0]); ++i) {
+      const char *p = p0_find_ci(texts[i], "P0CASE-");
+      if (!p) continue;
+      p0_copy_marker_token(p, out, out_cap);
+      if (out[0]) return;
+    }
+  }
+}
+
+static int p0_copy_marker_rule_id(const char *candidate, char *rule_id,
+                                  size_t rule_id_cap) {
+  const char *category_end;
+  const char *number_end;
+  size_t rule_len;
+  if (!candidate || candidate[0] != 'R' || candidate[1] != '-' ||
+      !rule_id || rule_id_cap == 0u) {
+    return 0;
+  }
+  category_end = strchr(candidate + 2u, '-');
+  if (!category_end || category_end == candidate + 2u) return 0;
+  number_end = category_end + 1u;
+  if (*number_end < '0' || *number_end > '9') return 0;
+  while (*number_end >= '0' && *number_end <= '9') ++number_end;
+  if (*number_end != '\0' && *number_end != '-') return 0;
+  rule_len = (size_t)(number_end - candidate);
+  if (rule_len >= rule_id_cap) return 0;
+  memcpy(rule_id, candidate, rule_len);
+  rule_id[rule_len] = '\0';
+  return 1;
+}
+
+static int p0_validation_target_rule(const EdrBehaviorRecord *br,
+                                     char *rule_id, size_t rule_id_cap,
+                                     char *marker, size_t marker_cap) {
+  int count;
+  size_t best = 0u;
+  const char *candidate;
+  if (!rule_id || rule_id_cap == 0u || !marker || marker_cap == 0u) return 0;
+  rule_id[0] = '\0';
+  p0_disposition_marker(br, marker, marker_cap);
+  candidate = strncmp(marker, "P0CASE-", 7u) == 0 ? marker + 7u : marker;
+  if (candidate[0] != 'R' || candidate[1] != '-') return 0;
+  count = edr_p0_rule_ir_rule_count();
+  for (int i = 0; i < count; ++i) {
+    const char *loaded = NULL;
+    size_t n;
+    if (!edr_p0_rule_ir_rule_id_at(i, &loaded) || !loaded || !loaded[0]) continue;
+    n = strlen(loaded);
+    if (n <= best || strncmp(candidate, loaded, n) != 0 ||
+        (candidate[n] != '\0' && candidate[n] != '-')) continue;
+    if (n >= rule_id_cap) continue;
+    memcpy(rule_id, loaded, n + 1u);
+    best = n;
+  }
+  if (best > 0u) return 1;
+  /* When the authenticated IR is unavailable, the loaded rule list is empty.
+   * Retain a bounded target in the failure observation by accepting only the
+   * canonical R-<family>-<number> prefix from an explicit test marker. */
+  return p0_copy_marker_rule_id(candidate, rule_id, rule_id_cap);
+}
+
+void edr_p0_rule_observe_validation_stage(const EdrBehaviorRecord *br,
+                                          const char *stage,
+                                          const char *reason) {
+  char marker[96];
+  char rule_id[64];
+  if (!p0_validation_target_rule(br, rule_id, sizeof(rule_id), marker, sizeof(marker))) {
+    return;
+  }
+  fprintf(stderr,
+          "[p0_rule_stage] target_rule=%s stage=%s reason=%s pid=%u "
+          "process_start_key=%llu source_event_id=%s marker=%s\n",
+          rule_id, stage && stage[0] ? stage : "unknown",
+          reason && reason[0] ? reason : "unknown", br ? br->pid : 0u,
+          (unsigned long long)(br ? br->process_start_key : 0u),
+          br && br->event_id[0] ? br->event_id : "none", marker);
+}
+
+static int p0_validation_target_matched(const EdrBehaviorRecord *br,
+                                        const EdrP0RuleIrEvaluation *evaluation) {
+  char marker[96];
+  char target[64];
+  if (!evaluation ||
+      !p0_validation_target_rule(br, target, sizeof(target), marker, sizeof(marker))) {
+    return 0;
+  }
+  for (uint32_t i = 0u; i < evaluation->match_count; ++i) {
+    EdrP0RuleIrMatch match;
+    if (edr_p0_rule_ir_evaluation_get_match(evaluation, i, &match) &&
+        strcmp(match.rule_id, target) == 0) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* A grep-stable, bounded observation is emitted for every marked validation
@@ -3752,6 +3859,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     }
     return 0;
   }
+  edr_p0_rule_observe_validation_stage(br, "direct_enter", "accepted");
 
   /* No active authenticated IR is a capability failure for every collector
    * event group the P0 bundle can evaluate.  This gate deliberately runs
@@ -3759,11 +3867,13 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
    * normally shed telemetry, but cannot erase the fact that the current P0
    * authority was unavailable. */
   if (p0_is_ruleset_evaluation_event(br->type) && !edr_p0_rule_ir_is_ready()) {
+    edr_p0_rule_observe_validation_stage(br, "ruleset", "p0_ir_not_ready");
     (void)emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
     return 0;
   }
 
   if (!p0_valid_process_create_record(br)) {
+    edr_p0_rule_observe_validation_stage(br, "precondition", "invalid_process_create");
     static uint64_t s_invalid_process_create;
     s_invalid_process_create++;
     if (p0_debug_enabled() &&
@@ -3835,6 +3945,9 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     int registry_best_severity = -1;
     memset(&evaluation, 0, sizeof(evaluation));
     if (edr_p0_rule_ir_evaluate_record(br, &evaluation)) {
+      edr_p0_rule_observe_validation_stage(
+          br, "matcher",
+          p0_validation_target_matched(br, &evaluation) ? "target_match" : "target_no_match");
       /* A previously-retained source-only assertion has not crossed the
        * durable boundary yet. It is still safe (and necessary) to build a
        * ruleset-evaluation gate below on a new evaluator failure, but a
@@ -3842,6 +3955,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
        * a source-only fault in the same event family remains unresolved. */
       if (p0_is_ruleset_evaluation_event(br->type) &&
           !edr_p0_rule_source_only_capability_healthy_for_event(br->type, NULL, 0u)) {
+        edr_p0_rule_observe_validation_stage(br, "family_gate", "source_only_pending");
         edr_p0_rule_ir_evaluation_free(&evaluation);
         return 0;
       }
@@ -3900,6 +4014,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
      * authority.  Record the registered source-only gate before returning;
      * it intentionally has no rule/bundle/action claim. */
     if (p0_is_ruleset_evaluation_event(br->type) && edr_p0_rule_ir_is_ready()) {
+      edr_p0_rule_observe_validation_stage(br, "matcher", "p0_ir_evaluation_unavailable");
       (void)emit_ruleset_evaluation_gate(br, "p0_ir_evaluation_unavailable");
       return 0;
     }

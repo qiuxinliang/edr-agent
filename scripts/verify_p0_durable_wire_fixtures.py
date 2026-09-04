@@ -44,8 +44,27 @@ FIXTURE_GENERATOR_COMMAND = (
     "python3 edr-agent/scripts/verify_p0_durable_wire_fixtures.py "
     "--emitter <compiled-test_p0_source_only_durable_contract> --regenerate"
 )
-SOURCE_FIXTURE_CASE_COUNT = 18
+SOURCE_FIXTURE_CASE_COUNT = 20
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# One reviewed source-contract expansion: keep the legacy aggregate reason for
+# queued <=3.2.408 events and add precise causes for new collectors. The
+# regeneration gate permits exactly these two additions, with every previous
+# semantic ID retained in order; it is not a general fixture-drift bypass.
+APPROVED_SOURCE_SEMANTIC_ADDITIONS = (
+    (
+        "collector_evidence_gate", "file_read",
+        "filemeta-critical-capacity-0001",
+        "file_read_critical_binding_capacity_exhausted", "",
+        "P0_FILE_READ_METADATA_GATE", None,
+    ),
+    (
+        "collector_evidence_gate", "file_read",
+        "filemeta-file-key-ambiguous-0001",
+        "file_read_file_key_ambiguous", "",
+        "P0_FILE_READ_METADATA_GATE", None,
+    ),
+)
 
 # This is an intentionally narrow, reviewed transition in the terminal
 # source-only reason catalog.  It is not a general bypass for semantic fixture
@@ -54,7 +73,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # terminal manifest hash pair may be regenerated.
 APPROVED_TERMINAL_SEMANTIC_TRANSITION = {
     "reason": "append source_fields_truncated",
-    "source_semantic_manifest_sha256": "a9617757fba9229275eff0649609ebff92cde64705fc1f3fb602b7d8f8198ca1",
+    "source_semantic_manifest_sha256": "3f804065d8364871c4a3ed9fbb94c3fc5293e71b3b69be004a3f9d592b434ca3",
     "terminal_before_sha256": "209edf89d42ac7c5ec1c1f7ec8fde19f148b30948024e234a835491295c66c6c",
     "terminal_after_sha256": "64803237e7d13f29ea9c99d617f170a6f7fa71cbab9003ba19c869a39f5098dc",
     "terminal_authority_identity_sha256": "6313248207c7861b900a3071dad4850b5e63edc33fe0d5d3e4a20e7f2447f526",
@@ -182,13 +201,16 @@ def terminal_rule_binding(value: dict[str, Any], *, label: str) -> tuple[str, st
     )
 
 
-def validate_source_fixture(value: Any, *, label: str, require_generator: bool) -> dict[str, Any]:
+def validate_source_fixture(value: Any, *, label: str, require_generator: bool,
+                            expected_count: int | None = SOURCE_FIXTURE_CASE_COUNT) -> dict[str, Any]:
     fixture = require_object(value, label=label)
     if fixture.get("fixture_version") != 1:
         raise FixtureError(f"{label} is not fixture version 1")
     fixtures = fixture.get("fixtures")
-    if not isinstance(fixtures, list) or len(fixtures) != SOURCE_FIXTURE_CASE_COUNT:
-        raise FixtureError(f"{label} must contain exactly {SOURCE_FIXTURE_CASE_COUNT} emitted source-only frames")
+    if not isinstance(fixtures, list) or not fixtures:
+        raise FixtureError(f"{label} must contain emitted source-only frames")
+    if expected_count is not None and len(fixtures) != expected_count:
+        raise FixtureError(f"{label} must contain exactly {expected_count} emitted source-only frames")
     semantic_ids: set[tuple[str, str, str]] = set()
     for index, item_value in enumerate(fixtures):
         item = require_object(item_value, label=f"{label}.fixtures[{index}]")
@@ -324,30 +346,40 @@ def terminal_authority_identity_sha256(value: dict[str, Any]) -> str:
 def require_same_semantic_ids(emitted_source: dict[str, Any], source_fixture: dict[str, Any],
                               emitted_terminal: dict[str, Any], terminal_fixture: dict[str, Any], *,
                               allow_approved_transition: bool = False) -> str | None:
+    transition_notes: list[str] = []
     source_before = source_semantic_manifest_sha256(source_fixture)
     source_after = source_semantic_manifest_sha256(emitted_source)
     terminal_before = terminal_semantic_manifest_sha256(terminal_fixture)
     terminal_after = terminal_semantic_manifest_sha256(emitted_terminal)
     if source_before == source_after and terminal_before == terminal_after:
         return None
-    approval = APPROVED_TERMINAL_SEMANTIC_TRANSITION
-    if (allow_approved_transition and
-            source_before == approval["source_semantic_manifest_sha256"] and
-            source_after == approval["source_semantic_manifest_sha256"] and
-            terminal_before == approval["terminal_before_sha256"] and
-            terminal_after == approval["terminal_after_sha256"] and
-            terminal_authority_identity_sha256(terminal_fixture) ==
-            approval["terminal_authority_identity_sha256"] and
-            terminal_authority_identity_sha256(emitted_terminal) ==
-            approval["terminal_authority_identity_sha256"]):
-        return approval["reason"]
     if source_before != source_after:
-        raise FixtureError(
-            "Agent source fixture semantic IDs changed; update the C contract intentionally before regeneration"
-        )
-    raise FixtureError(
-        "Agent terminal fixture semantic IDs changed; update the C contract intentionally before regeneration"
-    )
+        before_ids = source_semantic_ids(source_fixture)
+        after_ids = source_semantic_ids(emitted_source)
+        additions = set(APPROVED_SOURCE_SEMANTIC_ADDITIONS)
+        retained_ids = tuple(item for item in after_ids if item not in additions)
+        added_ids = tuple(item for item in after_ids if item in additions)
+        if (not allow_approved_transition or retained_ids != before_ids or
+                len(added_ids) != len(additions) or set(added_ids) != additions):
+            raise FixtureError(
+                "Agent source fixture semantic IDs changed; update the C contract intentionally before regeneration"
+            )
+        transition_notes.append("split FileRead metadata backpressure causes")
+    approval = APPROVED_TERMINAL_SEMANTIC_TRANSITION
+    if terminal_before != terminal_after:
+        if (not allow_approved_transition or
+                source_before != approval["source_semantic_manifest_sha256"] or
+                terminal_before != approval["terminal_before_sha256"] or
+                terminal_after != approval["terminal_after_sha256"] or
+                terminal_authority_identity_sha256(terminal_fixture) !=
+                approval["terminal_authority_identity_sha256"] or
+                terminal_authority_identity_sha256(emitted_terminal) !=
+                approval["terminal_authority_identity_sha256"]):
+            raise FixtureError(
+                "Agent terminal fixture semantic IDs changed; update the C contract intentionally before regeneration"
+            )
+        transition_notes.append(approval["reason"])
+    return "; ".join(transition_notes) or None
 
 
 def load_ir_binding(p0_ir: Path) -> tuple[str, str]:
@@ -555,8 +587,11 @@ def main() -> int:
         p0_ir = args.p0_ir.resolve()
         source_path = args.source_fixture.resolve()
         terminal_path = args.terminal_fixture.resolve()
-        source_fixture = validate_source_fixture(load_json(source_path), label="source fixture",
-                                                  require_generator=not args.regenerate)
+        source_fixture = validate_source_fixture(
+            load_json(source_path), label="source fixture",
+            require_generator=not args.regenerate,
+            expected_count=None if args.regenerate else SOURCE_FIXTURE_CASE_COUNT,
+        )
         terminal_fixture = validate_terminal_fixture(load_json(terminal_path), label="terminal fixture",
                                                       require_generator=not args.regenerate)
         if not args.regenerate:

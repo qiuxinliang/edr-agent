@@ -120,8 +120,11 @@ int main(void) {
   char *p0_rule_ir = read_source(root, "src/preprocess/p0_rule_ir.c");
   char *process_cache = read_source(root, "src/forensic/process_tree_cache.c");
   char *evidence_worker = read_source(root, "src/preprocess/process_evidence_worker.c");
+  char *evidence_wait = slice_between(
+      evidence_worker, "int edr_process_evidence_wait(",
+      "void edr_process_evidence_worker_get_metrics(");
   if (!collector || !tdh || !direct_feed || !alert_emit || !agent || !p0_rule_ir ||
-      !process_cache || !evidence_worker) {
+      !process_cache || !evidence_worker || !evidence_wait) {
     free(collector);
     free(tdh);
     free(direct_feed);
@@ -130,6 +133,7 @@ int main(void) {
     free(p0_rule_ir);
     free(process_cache);
     free(evidence_worker);
+    free(evidence_wait);
     return 1;
   }
 
@@ -337,10 +341,28 @@ int main(void) {
                          "queued evidence jobs need a bounded burst budget");
   ok &= require_contains(evidence_worker, "EDR_EVIDENCE_STALL_NS",
                          "worker stall detection must not reuse the caller wait budget");
+  ok &= require_contains(agent, "\\\"wait_timeouts\\\":%llu",
+                         "health must distinguish caller evidence wait timeouts");
+  ok &= require_contains(agent, "\\\"queue_deadlines\\\":%llu",
+                         "health must distinguish expired queued evidence work");
   ok &= require_contains(evidence_worker, "WTD_CACHE_ONLY_URL_RETRIEVAL",
                          "WinVerifyTrust must not add certificate network latency to P0 preprocessing");
   ok &= require_contains(evidence_worker, "Do not reopen the pathname here",
                          "completed short-lived evidence must survive pathname cleanup");
+  ok &= require_contains(evidence_wait, "Sleep(wait_ms);",
+                         "evidence waiters must poll independently of the work event");
+  ok &= require_absent(evidence_wait, "WaitForSingleObject(s_wake",
+                       "only the evidence worker may consume the auto-reset work event");
+  ok &= require_contains(evidence_worker, "identity_change_pending",
+                         "a changed pathname object must not reuse an in-flight result");
+  ok &= require_contains(
+      pipeline,
+      "strcmp(requested.hash_reason, \"identity_revalidation_pending\") == 0",
+      "preprocess must wait only when the requested file object has work in flight");
+  ok &= require_absent(
+      pipeline,
+      "(void)edr_process_evidence_request(br->image_path_canonical",
+      "preprocess must preserve the immediate ready/failed request disposition");
 
   char *parent_enrichment = read_source(root, "src/preprocess/enrich_parent_info.c");
   if (!parent_enrichment) {
@@ -442,9 +464,9 @@ int main(void) {
                                ",\"process_create_coalescer\":{\"slots_used\":%u,\"capacity\":%u,\"security_stored\":%llu,\"security_backpressure\":%llu,\"kernel_backpressure\":%llu,\"timeouts\":%llu,\"stale_rejects\":%llu,\"ambiguous_rejects\":%llu}",
                                UINT32_MAX, UINT32_MAX, max, max, max, max, max, max);
     ok &= append_json_fragment(fragment, sizeof(fragment), &used,
-                               ",\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,\"requests_total\":%llu,\"queued\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,\"stale_rejected\":%llu,\"hash_admissions\":%llu,\"hash_attempts\":%llu,\"signature_admissions\":%llu,\"signature_attempts\":%llu,\"shutdown_timeouts\":%llu,\"terminal_unhealthy\":%u,\"worker_stalled\":%u}",
+                               ",\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,\"requests_total\":%llu,\"queued\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,\"stale_rejected\":%llu,\"hash_admissions\":%llu,\"hash_attempts\":%llu,\"signature_admissions\":%llu,\"signature_attempts\":%llu,\"wait_timeouts\":%llu,\"queue_deadlines\":%llu,\"shutdown_timeouts\":%llu,\"terminal_unhealthy\":%u,\"worker_stalled\":%u}",
                                UINT32_MAX, UINT32_MAX, max, max, max, max, max, max, max, max,
-                               max, max, max, max, max, UINT32_MAX, UINT32_MAX);
+                               max, max, max, max, max, max, max, UINT32_MAX, UINT32_MAX);
     ok &= append_json_fragment(
         fragment, sizeof(fragment), &used,
         ",\"p0_emit_context\":{\"user_subject_full\":%llu,\"user_subject_degraded\":%llu,\"alerts_with_optional_omission\":%llu,\"values_truncated\":%llu,\"escape_overflow_values\":%llu,\"minimal_failures\":%llu,\"emitted_without_full_context\":%llu}",
@@ -523,5 +545,6 @@ int main(void) {
   free(p0_rule_ir);
   free(process_cache);
   free(evidence_worker);
+  free(evidence_wait);
   return ok ? 0 : 1;
 }

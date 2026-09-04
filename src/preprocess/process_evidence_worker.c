@@ -323,6 +323,7 @@ static DWORD WINAPI worker(void *unused) {
     int hash_attempted = 0;
     int signature_attempted = 0;
     int hash_ok = 0;
+    int queue_deadline = 0;
     memset(&job, 0, sizeof(job));
     AcquireSRWLockExclusive(&s_lock);
     for (uint32_t i=0;i<EDR_EVIDENCE_SLOTS;i++) if (s_slots[i].queued) {
@@ -347,6 +348,7 @@ static DWORD WINAPI worker(void *unused) {
              job.file_identity);
     job.evidence.file_write_time=job.file_write_time;
     if (now - job.queued_ns > EDR_EVIDENCE_QUEUE_MAX_NS) {
+      queue_deadline = 1;
       strcpy(job.evidence.hash_reason,"worker_deadline");
       strcpy(job.evidence.signature_reason,"worker_deadline");
     }
@@ -376,6 +378,7 @@ static DWORD WINAPI worker(void *unused) {
     AcquireSRWLockExclusive(&s_lock);
     if (hash_attempted) s_metrics.hash_attempts++;
     if (signature_attempted) s_metrics.signature_attempts++;
+    if (queue_deadline) s_metrics.queue_deadlines++;
     /* A reused cache slot or PID generation is stale work; do not publish it. */
     if (chosen->inflight && chosen->generation==job.generation &&
         strcmp(chosen->path,job.path)==0 &&
@@ -492,12 +495,16 @@ int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t n
       return 1;
     }
     if (slot->queued || slot->inflight) {
+      int same_identity =
+          file_identity_equal(slot->file_identity, current.file_identity) &&
+          slot->file_write_time == current.file_write_time;
       /* The slot owns A until its worker returns. A fresh B request never
-       * overwrites that owner; callers receive B's identity and source-only
-       * status until B can be queued on a later request. */
+       * overwrites that owner and must not wait for or consume A's result;
+       * callers retain B's identity until B can be queued later. */
       s_metrics.pending_reuse++;
-      strcpy(out->hash_reason,"identity_revalidation_pending");
-      strcpy(out->signature_reason,"identity_revalidation_pending");
+      strcpy(out->hash_reason, same_identity ? "identity_revalidation_pending"
+                                             : "identity_change_pending");
+      strcpy(out->signature_reason, out->hash_reason);
       ReleaseSRWLockExclusive(&s_lock);
       CloseHandle((HANDLE)opened_file);
       return 0;
@@ -608,6 +615,9 @@ int edr_process_evidence_wait(const char *path, uint64_t generation, uint64_t no
     }
     if (evidence_lookup_ready(path, generation, current, out)) return 1;
     if (current >= deadline) {
+      AcquireSRWLockExclusive(&s_lock);
+      s_metrics.wait_timeouts++;
+      ReleaseSRWLockExclusive(&s_lock);
       strcpy(out->hash_reason, "evidence_wait_timeout");
       strcpy(out->signature_reason, "evidence_wait_timeout");
       return 0;
@@ -616,8 +626,11 @@ int edr_process_evidence_wait(const char *path, uint64_t generation, uint64_t no
       uint64_t remaining_ns = deadline - current;
       DWORD wait_ms = (DWORD)((remaining_ns + 999999ULL) / 1000000ULL);
       if (wait_ms > 5u) wait_ms = 5u;
-      if (s_wake) (void)WaitForSingleObject(s_wake, wait_ms);
-      else Sleep(wait_ms);
+      /* s_wake is an auto-reset work-queue event with exactly one consumer:
+       * the evidence worker. A request waiter must not steal that signal and
+       * delay the very work it is waiting for. Bounded polling is independent
+       * of queue wake ownership and still observes ready results promptly. */
+      Sleep(wait_ms);
     }
   }
 }

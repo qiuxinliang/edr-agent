@@ -117,6 +117,7 @@ typedef struct {
     uint64_t file_read_name_bindings;
     uint64_t file_read_name_cache_misses;
     uint64_t file_read_critical_binding_capacity_exhausted;
+    uint64_t file_read_file_key_ambiguities;
     /* A protected FileKey cache failure is held in a single non-overwrite
      * source-only gate slot until the existing SQLite queue accepts it. */
     int file_read_p0_capability_healthy;
@@ -131,6 +132,7 @@ typedef struct {
     uint64_t file_read_metadata_gate_epoch_restart_attempts;
     uint64_t file_read_metadata_gate_epoch_restart_successes;
     uint64_t file_read_metadata_gate_epoch_restart_failures;
+    uint64_t file_read_metadata_gate_recovery_episodes;
     /* Post-reset recovery remains fail-closed until a new-session exact
      * NameCreate->Read binding has been observed.  Keep the failure count and
      * reason distinct from durable delivery failures so an operational queue

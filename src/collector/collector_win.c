@@ -199,10 +199,8 @@ typedef struct {
    * overflow/identity failure is not safe to retry by inventing another
    * source, so it latches unhealthy instead. */
   uint8_t retryable;
-  /* A capacity fault can leave later NameCreate events unbound while the
-   * first gate is pending.  One durable X record cannot prove Y's handle is
-   * known, so successful delivery requires an explicit Kernel-File session
-   * epoch reset before FileRead P0 may resume. */
+  /* Only a consumer lifecycle failure may request a provider-session reset.
+   * Per-binding ambiguity/capacity faults remain local source-only facts. */
   uint8_t requires_session_reset;
   /* Stop/join has cleared all session-scoped FileKeys, but this alone is not
    * recovery: only a subsequently successful collector start may re-enable
@@ -216,14 +214,15 @@ typedef struct {
    * record is still pending.  It is evidence for recovery, not permission to
    * bypass the pending durable gate. */
   uint8_t post_reset_binding_observed;
+  /* Protected-cache exhaustion is a local capacity degradation, not a
+   * corrupt provider epoch. After its source-only record is durable, keep
+   * DEGRADED until a later exact binding proves capacity is available. */
+  uint8_t capacity_recovery_pending;
   /* A stop/join timeout is not a retryable provider fault.  It retains old
    * decoder state, so automatic restart must remain disabled until an
    * explicit lifecycle owner has observed a clean stop. */
   uint8_t restart_blocked;
   uint32_t consecutive_restart_attempts;
-  uint64_t epoch_restart_attempts;
-  uint64_t epoch_restart_successes;
-  uint64_t epoch_restart_failures;
   EdrFileReadMetadataGateState state;
   char reason[96];
   char post_reset_recovery_reason[96];
@@ -2278,13 +2277,8 @@ static void edr_collector_file_key_cache_reset(void) {
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
 }
 
-/* A metadata event which cannot establish its FileKey must never leave an old
- * binding available for a later reuse. Invalidate the known key, or the whole
- * logical cache epoch when the key itself is unavailable. This preserves
- * fail-closed attribution without turning metadata-only noise into a global
- * FileRead capability outage. */
-static void edr_collector_file_key_cache_invalidate(uint64_t file_key) {
-  AcquireSRWLockExclusive(&s_file_key_cache_lock);
+/* Caller holds s_file_key_cache_lock exclusively. */
+static void edr_collector_file_key_cache_invalidate_locked(uint64_t file_key) {
   if (file_key == 0u) {
     memset(s_file_key_cache, 0, sizeof(s_file_key_cache));
     s_file_key_cache_next = 0u;
@@ -2297,6 +2291,16 @@ static void edr_collector_file_key_cache_invalidate(uint64_t file_key) {
       }
     }
   }
+}
+
+/* A metadata event which cannot establish its FileKey must never leave an old
+ * binding available for a later reuse. Invalidate the known key, or the whole
+ * logical cache epoch when the key itself is unavailable. This preserves
+ * fail-closed attribution without turning metadata-only noise into a global
+ * FileRead capability outage. */
+static void edr_collector_file_key_cache_invalidate(uint64_t file_key) {
+  AcquireSRWLockExclusive(&s_file_key_cache_lock);
+  edr_collector_file_key_cache_invalidate_locked(file_key);
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
 }
 
@@ -2329,11 +2333,13 @@ static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth
   out->file_read_metadata_gate_paused_events =
       s_health.file_read_metadata_gate_paused_events;
   out->file_read_metadata_gate_epoch_restart_attempts =
-      s_file_read_metadata_gate.epoch_restart_attempts;
+      s_health.file_read_metadata_gate_epoch_restart_attempts;
   out->file_read_metadata_gate_epoch_restart_successes =
-      s_file_read_metadata_gate.epoch_restart_successes;
+      s_health.file_read_metadata_gate_epoch_restart_successes;
   out->file_read_metadata_gate_epoch_restart_failures =
-      s_file_read_metadata_gate.epoch_restart_failures;
+      s_health.file_read_metadata_gate_epoch_restart_failures;
+  out->file_read_metadata_gate_recovery_episodes =
+      s_health.file_read_metadata_gate_recovery_episodes;
   out->file_read_metadata_gate_post_reset_recovery_bindings =
       s_health.file_read_metadata_gate_post_reset_recovery_bindings;
   out->file_read_metadata_gate_post_reset_recovery_failures =
@@ -2400,7 +2406,6 @@ static void edr_collector_file_read_metadata_gate_session_starting(void) {
  * reads instead of manufacturing an unbounded stream of critical records. */
 static int edr_collector_file_read_metadata_gate_coalesce_locked(
     const char *key_sha256) {
-  EdrFileReadMetadataCoalesceEntry *entry;
   if (!key_sha256 || !key_sha256[0]) return 0;
   for (uint32_t i = 0u; i < EDR_FILE_READ_METADATA_COALESCE_SLOTS; ++i) {
     if (s_file_read_metadata_coalesce[i].valid &&
@@ -2409,12 +2414,18 @@ static int edr_collector_file_read_metadata_gate_coalesce_locked(
       return 1;
     }
   }
+  return 0;
+}
+
+static void edr_collector_file_read_metadata_gate_remember_locked(
+    const char *key_sha256) {
+  EdrFileReadMetadataCoalesceEntry *entry;
+  if (!key_sha256 || !key_sha256[0]) return;
   entry = &s_file_read_metadata_coalesce[
       s_file_read_metadata_coalesce_next++ % EDR_FILE_READ_METADATA_COALESCE_SLOTS];
   memset(entry, 0, sizeof(*entry));
   snprintf(entry->key_sha256, sizeof(entry->key_sha256), "%s", key_sha256);
   entry->valid = 1u;
-  return 0;
 }
 
 /* After an epoch reset the cache starts in DEGRADED because pre-existing
@@ -2424,7 +2435,8 @@ static int edr_collector_file_read_metadata_gate_coalesce_locked(
 static void edr_collector_file_read_metadata_gate_note_resolved(void) {
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
   if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
-      !s_file_read_metadata_gate.slot_valid) {
+      !s_file_read_metadata_gate.slot_valid &&
+      !s_file_read_metadata_gate.capacity_recovery_pending) {
     int post_reset_recovery =
         s_file_read_metadata_gate.recovery_deadline_ns != 0u &&
         s_file_read_metadata_gate.recovery_trigger_reason[0] != '\0';
@@ -2448,6 +2460,21 @@ static void edr_collector_file_read_metadata_gate_note_resolved(void) {
      * so delivery_result() can recover without waiting for another read. */
     s_file_read_metadata_gate.post_reset_binding_observed = 1u;
     s_health.file_read_metadata_gate_post_reset_recovery_bindings++;
+  }
+  ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+}
+
+static void edr_collector_file_read_metadata_gate_note_capacity_recovered(void) {
+  AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  if (s_file_read_metadata_gate.capacity_recovery_pending) {
+    s_file_read_metadata_gate.capacity_recovery_pending = 0u;
+    if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
+        !s_file_read_metadata_gate.slot_valid) {
+      s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
+      s_file_read_metadata_gate.reason[0] = '\0';
+      s_health.file_read_p0_capability_healthy = 1;
+      s_health.file_read_p0_capability_reason[0] = '\0';
+    }
   }
   ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
 }
@@ -2549,6 +2576,7 @@ static void edr_collector_file_read_metadata_gate_consumer_unavailable(const cha
   s_file_read_metadata_gate.session_reset_observed = 0u;
   s_file_read_metadata_gate.resume_degraded = 0u;
   if (new_recovery) {
+    s_health.file_read_metadata_gate_recovery_episodes++;
     if (!s_file_read_metadata_gate.slot_valid) {
       edr_collector_file_read_metadata_recovery_clear_subject_locked();
     } else {
@@ -2571,15 +2599,6 @@ static int edr_collector_file_read_metadata_gate_reason_valid(const char *reason
   const EdrP0SourceOnlyReason *contract = edr_p0_source_only_reason_find(reason);
   return contract && contract->stage == EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE &&
          strcmp(contract->gate_id, EDR_P0_FILE_READ_METADATA_GATE) == 0;
-}
-
-/* Only a lost/ambiguous protected FileKey binding invalidates the provider
- * session.  Missing facts on one Read, or local delivery pressure, remain
- * source-only event dispositions and must not restart ETW. */
-static int edr_collector_file_read_metadata_gate_reason_requires_session_reset(
-    const char *reason) {
-  return reason &&
-         strcmp(reason, EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) == 0;
 }
 
 /* Stage the first FileKey metadata assertion that cannot remain authoritative.
@@ -2745,26 +2764,34 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
   }
 
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
+  /* Check the epoch-scoped subject before applying the single-slot gate.
+   * Otherwise an identical unresolved read arriving while its first source is
+   * PENDING/QUEUED is miscounted as a distinct paused event and the coalescing
+   * contract is never exercised during the only interval where it matters. */
+  if (edr_collector_file_read_metadata_gate_coalesce_locked(coalesce_sha256)) {
+    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
+    return;
+  }
   if (s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_HEALTHY &&
       s_file_read_metadata_gate.state != EDR_FILE_READ_METADATA_GATE_DEGRADED) {
     s_health.file_read_metadata_gate_paused_events++;
     ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
     return;
   }
-  if (edr_collector_file_read_metadata_gate_coalesce_locked(coalesce_sha256)) {
-    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    return;
-  }
+  /* Only a subject which is actually accepted by the one-slot bridge may be
+   * remembered. A distinct subject seen while the slot is occupied must be
+   * observable as paused and remain eligible after the durable transition. */
+  edr_collector_file_read_metadata_gate_remember_locked(coalesce_sha256);
   {
-    uint64_t restart_attempts = s_file_read_metadata_gate.epoch_restart_attempts;
-    uint64_t restart_successes = s_file_read_metadata_gate.epoch_restart_successes;
-    uint64_t restart_failures = s_file_read_metadata_gate.epoch_restart_failures;
     uint32_t consecutive_restart_attempts =
         s_file_read_metadata_gate.consecutive_restart_attempts;
     uint8_t resume_degraded =
         s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED &&
         s_file_read_metadata_gate.recovery_deadline_ns != 0u &&
         s_file_read_metadata_gate.recovery_trigger_reason[0] != '\0';
+    uint8_t capacity_recovery_pending =
+        s_file_read_metadata_gate.capacity_recovery_pending ||
+        strcmp(reason, EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY) == 0;
     char active_recovery_event_id[EDR_BR_ID_LEN];
     char active_recovery_reason[96];
     char active_recovery_marker[EDR_FILE_READ_METADATA_MARKER_LEN];
@@ -2778,12 +2805,11 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
     snprintf(active_recovery_marker, sizeof(active_recovery_marker), "%s",
              s_file_read_metadata_gate.recovery_marker);
     memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
-    s_file_read_metadata_gate.epoch_restart_attempts = restart_attempts;
-    s_file_read_metadata_gate.epoch_restart_successes = restart_successes;
-    s_file_read_metadata_gate.epoch_restart_failures = restart_failures;
     s_file_read_metadata_gate.consecutive_restart_attempts =
         consecutive_restart_attempts;
     s_file_read_metadata_gate.resume_degraded = resume_degraded;
+    s_file_read_metadata_gate.capacity_recovery_pending =
+        capacity_recovery_pending;
     snprintf(s_file_read_metadata_gate.recovery_event_id,
              sizeof(s_file_read_metadata_gate.recovery_event_id), "%s",
              active_recovery_event_id);
@@ -2802,9 +2828,9 @@ static void edr_collector_file_read_metadata_gate_stage(const EVENT_RECORD *reco
            "%s", event_id);
   s_file_read_metadata_gate.slot_valid = 1u;
   s_file_read_metadata_gate.retryable = 1u;
-  s_file_read_metadata_gate.requires_session_reset =
-      !s_file_read_metadata_gate.resume_degraded &&
-      edr_collector_file_read_metadata_gate_reason_requires_session_reset(reason) ? 1u : 0u;
+  /* A per-binding disposition cannot prove provider corruption. Only the
+   * consumer lifecycle owner may request a joined provider-session reset. */
+  s_file_read_metadata_gate.requires_session_reset = 0u;
   s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_PENDING;
   s_file_read_metadata_gate.next_retry_ns = 0u;
   snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
@@ -2949,6 +2975,17 @@ void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
                  sizeof(s_health.file_read_p0_capability_reason), "%s",
                  s_file_read_metadata_gate.reason);
       }
+    } else if (s_file_read_metadata_gate.capacity_recovery_pending) {
+      memset(&s_file_read_metadata_gate.slot, 0, sizeof(s_file_read_metadata_gate.slot));
+      s_file_read_metadata_gate.slot_valid = 0u;
+      s_file_read_metadata_gate.retryable = 0u;
+      s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_DEGRADED;
+      snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
+               "file_read_critical_binding_capacity_recovery_pending");
+      s_health.file_read_p0_capability_healthy = 0;
+      snprintf(s_health.file_read_p0_capability_reason,
+               sizeof(s_health.file_read_p0_capability_reason), "%s",
+               s_file_read_metadata_gate.reason);
     } else {
       memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
       s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_HEALTHY;
@@ -2999,7 +3036,7 @@ void edr_collector_file_read_metadata_gate_restart_attempted(void) {
   if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY &&
       s_file_read_metadata_gate.requires_session_reset &&
       !s_file_read_metadata_gate.slot_valid) {
-    s_file_read_metadata_gate.epoch_restart_attempts++;
+    s_health.file_read_metadata_gate_epoch_restart_attempts++;
     s_file_read_metadata_gate.consecutive_restart_attempts++;
     edr_collector_file_read_metadata_recovery_observe_locked("start", "in_progress");
   }
@@ -3011,7 +3048,7 @@ void edr_collector_file_read_metadata_gate_restart_failed(void) {
   if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY &&
       s_file_read_metadata_gate.requires_session_reset &&
       !s_file_read_metadata_gate.slot_valid) {
-    s_file_read_metadata_gate.epoch_restart_failures++;
+    s_health.file_read_metadata_gate_epoch_restart_failures++;
     edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
         "file_read_metadata_epoch_restart_failed");
     edr_collector_file_read_metadata_recovery_observe_locked("result", "start_failed");
@@ -3024,7 +3061,7 @@ void edr_collector_file_read_metadata_gate_restart_timeout(void) {
   if (s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_TERMINAL_UNHEALTHY &&
       s_file_read_metadata_gate.requires_session_reset &&
       !s_file_read_metadata_gate.slot_valid) {
-    s_file_read_metadata_gate.epoch_restart_failures++;
+    s_health.file_read_metadata_gate_epoch_restart_failures++;
     s_file_read_metadata_gate.restart_blocked = 1u;
     edr_collector_file_read_metadata_gate_mark_unhealthy_locked(
         "file_read_metadata_epoch_restart_join_timeout");
@@ -3068,7 +3105,7 @@ static void edr_collector_file_read_metadata_gate_start_succeeded(void) {
     s_file_read_metadata_gate.state = EDR_FILE_READ_METADATA_GATE_DEGRADED;
     snprintf(s_file_read_metadata_gate.reason, sizeof(s_file_read_metadata_gate.reason), "%s",
              "file_read_metadata_post_reset_degraded");
-    s_file_read_metadata_gate.epoch_restart_successes++;
+    s_health.file_read_metadata_gate_epoch_restart_successes++;
     {
       uint64_t now_ns = edr_monotonic_ns();
       s_file_read_metadata_gate.recovery_deadline_ns =
@@ -3144,6 +3181,7 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     int critical;
     int existing = 0;
     int ambiguous = 0;
+    int allocated = 0;
     if (!edr_tdh_kernel_file_extract_name_binding((PEVENT_RECORD)record, &file_key, path,
                                                   sizeof(path))) {
       s_health.file_read_name_cache_misses++;
@@ -3187,16 +3225,30 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
         break;
       }
     }
-    if (!entry && !ambiguous) entry = edr_collector_file_key_cache_alloc_locked(critical);
+    if (!entry && !ambiguous) {
+      entry = edr_collector_file_key_cache_alloc_locked(critical);
+      allocated = entry != NULL;
+    }
+    if (ambiguous) {
+      /* Quarantine the conflicting key before another A4.4 decoder can read
+       * the previously cached path. Reporting ambiguity while leaving the old
+       * binding visible would turn a fail-closed disposition into false
+       * attribution. */
+      edr_collector_file_key_cache_invalidate_locked(file_key);
+    }
     if (!entry) {
       ReleaseSRWLockExclusive(&s_file_key_cache_lock);
-      /* A protected partition fault or same-time FileKey reuse cannot be
-       * resolved from event time alone.  Do not overwrite a closed/live
-       * binding; stage one exact source-only capability gate and fuse FileRead
-       * P0 until the provider session is reset. */
+      /* Keep the two causes distinct. A same-time FileKey reuse quarantines
+       * only that key; protected-capacity exhaustion leaves the collector
+       * degraded until a later exact binding proves capacity recovered.
+       * Neither condition discards the otherwise healthy provider epoch. */
+      if (ambiguous) {
+        s_health.file_read_file_key_ambiguities++;
+      }
       edr_collector_file_read_metadata_gate_stage(
           record, event_ns, file_key, canonical_path,
-          EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE);
+          ambiguous ? EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS
+                    : EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY);
       return 1;
     }
     if (!existing) {
@@ -3208,6 +3260,11 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
       snprintf(entry->path, sizeof(entry->path), "%s", canonical_path);
     }
     ReleaseSRWLockExclusive(&s_file_key_cache_lock);
+    if (critical && allocated) {
+      /* A successful new protected allocation, not an unrelated cached Read,
+       * is the proof that the protected partition recovered capacity. */
+      edr_collector_file_read_metadata_gate_note_capacity_recovered();
+    }
     s_health.file_read_name_bindings++;
     return 1;
   }
@@ -3286,7 +3343,7 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
       if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
         snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
         have_problem = 1;
-        problem_reason = EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE;
+        problem_reason = EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS;
         best_problem_event_ns = entry->name_event_ns;
       }
       continue;
@@ -3317,6 +3374,10 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
     if (have_problem) {
       snprintf(path_out, path_cap, "%s", problem_path);
       if (out_gate_reason) *out_gate_reason = problem_reason;
+      if (problem_reason &&
+          strcmp(problem_reason, EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS) == 0) {
+        s_health.file_read_file_key_ambiguities++;
+      }
     } else if (out_gate_reason) {
       *out_gate_reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
     }

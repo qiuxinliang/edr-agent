@@ -36,6 +36,8 @@ typedef struct {
   uint64_t hash_attempts;
   uint64_t signature_admissions;
   uint64_t signature_attempts;
+  uint64_t wait_timeouts;
+  uint64_t queue_deadlines;
   uint64_t shutdown_timeouts;
   uint32_t terminal_unhealthy;
   uint32_t worker_stalled;

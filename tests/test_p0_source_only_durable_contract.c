@@ -21,7 +21,7 @@
 
 #define SOURCE_FIXTURE_CASES 3u
 #define RULESET_EVALUATION_FIXTURE_CASES 6u
-#define COLLECTOR_EVIDENCE_FIXTURE_CASES 8u
+#define COLLECTOR_EVIDENCE_FIXTURE_CASES 10u
 #define SOURCE_ONLY_DELIVERY_FIXTURE_CASES 1u
 #define TOTAL_SOURCE_FIXTURE_CASES \
   (SOURCE_FIXTURE_CASES + RULESET_EVALUATION_FIXTURE_CASES + \
@@ -59,6 +59,10 @@ static const SourceFixtureCase k_ruleset_evaluation_cases[RULESET_EVALUATION_FIX
 static const SourceFixtureCase k_collector_evidence_cases[COLLECTOR_EVIDENCE_FIXTURE_CASES] = {
     {EDR_EVENT_FILE_READ, "filemeta-backpressure-0001", "",
      EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE},
+    {EDR_EVENT_FILE_READ, "filemeta-critical-capacity-0001", "",
+     EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY},
+    {EDR_EVENT_FILE_READ, "filemeta-file-key-ambiguous-0001", "",
+     EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS},
     {EDR_EVENT_FILE_READ, "filemeta-start-key-missing-0001", "",
      EDR_P0_FILE_READ_REASON_START_KEY_MISSING},
     {EDR_EVENT_FILE_READ, "filemeta-live-generation-unavailable-0001", "",
@@ -593,9 +597,20 @@ static int verify_fixture_case(const SourceFixtureCase *fixture, size_t index) {
   edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
   pb_istream_t stream;
   make_record(&input, fixture, index);
-  if (!edr_p0_rule_test_build_source_only_direct_record(&input, fixture->rule_id,
-                                                         fixture->reason, &built) ||
-      !edr_behavior_record_emit_durable(&built)) {
+  if (!edr_p0_rule_test_build_source_only_direct_record(
+          &input, fixture->rule_id, fixture->reason, &built)) {
+    fprintf(stderr, "direct fixture build failed: index=%zu reason=%s\n",
+            index, fixture->reason);
+    return 0;
+  }
+  if (!edr_p0_source_only_validate_record(&built)) {
+    fprintf(stderr, "direct fixture validation failed: index=%zu reason=%s context=%s\n",
+            index, fixture->reason, built.detection_context);
+    return 0;
+  }
+  if (!edr_behavior_record_emit_durable(&built)) {
+    fprintf(stderr, "direct fixture durable emit failed: index=%zu reason=%s\n",
+            index, fixture->reason);
     return 0;
   }
   if (s_enqueue_count != index + 1u || s_wire_lens[index] <= 20u ||
@@ -605,6 +620,13 @@ static int verify_fixture_case(const SourceFixtureCase *fixture, size_t index) {
       read_le32(s_wires[index] + 8u) != s_wire_lens[index] - 12u ||
       read_le32(s_wires[index] + 12u) != s_wire_lens[index] - 16u ||
       strncmp(s_batch_ids[index], "p0-source-", 10u) != 0) {
+    fprintf(stderr,
+            "direct fixture envelope failed: index=%zu enqueue=%zu wire_len=%zu "
+            "magic=%02x%02x%02x%02x frames=%u body=%u frame=%u batch=%s\n",
+            index, s_enqueue_count, s_wire_lens[index], s_wires[index][0],
+            s_wires[index][1], s_wires[index][2], s_wires[index][3],
+            read_le32(s_wires[index] + 4u), read_le32(s_wires[index] + 8u),
+            read_le32(s_wires[index] + 12u), s_batch_ids[index]);
     return 0;
   }
   stream = pb_istream_from_buffer(s_wires[index] + 16u, s_wire_lens[index] - 16u);
@@ -616,6 +638,12 @@ static int verify_fixture_case(const SourceFixtureCase *fixture, size_t index) {
       strstr(decoded.ave_result_json, s_binding.rules_bundle_version) == NULL ||
       strstr(decoded.ave_result_json, s_binding.artifact_sha256) == NULL ||
       strstr(decoded.ave_result_json, fixture->reason) == NULL) {
+    fprintf(stderr,
+            "direct fixture payload failed: index=%zu decoded=%d pid=%u/%u "
+            "event_id=%s/%s alert=%d context=%s\n",
+            index, stream.errmsg == NULL, decoded.pid, input.pid,
+            decoded.event_id, input.event_id, decoded.has_behavior_alert,
+            decoded.ave_result_json);
     return 0;
   }
   return 1;

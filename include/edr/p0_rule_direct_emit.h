@@ -12,6 +12,11 @@
 /* Returns the number of P0 combined frames synchronously accepted by the
  * persistent high-priority offline queue. */
 int edr_p0_rule_try_emit(const EdrBehaviorRecord *br);
+/* Emits one bounded, marker-only validation stage line. Production traffic
+ * without an explicit P0CASE marker is a no-op. */
+void edr_p0_rule_observe_validation_stage(const EdrBehaviorRecord *br,
+                                          const char *stage,
+                                          const char *reason);
 
 /* Collector capability gates have no rule/bundle/action authority.  Return
  * 1 only after the source-only record is durably accepted; return 2 when it

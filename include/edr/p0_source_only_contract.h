@@ -19,7 +19,13 @@
 #define EDR_P0_RULESET_EVALUATION_GATE "P0_RULESET_EVALUATION_GATE"
 #define EDR_P0_FILE_READ_METADATA_GATE "P0_FILE_READ_METADATA_GATE"
 #define EDR_P0_SOURCE_ONLY_DURABILITY_GATE "P0_SOURCE_ONLY_DURABILITY_GATE"
+/* Retained for Agent <=3.2.408 durable-queue compatibility. New collectors
+ * emit one of the two precise causes below. */
 #define EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE "file_read_metadata_backpressure"
+#define EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY \
+  "file_read_critical_binding_capacity_exhausted"
+#define EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS \
+  "file_read_file_key_ambiguous"
 #define EDR_P0_FILE_READ_REASON_START_KEY_MISSING "file_read_process_start_key_missing"
 #define EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE \
   "file_read_live_generation_unavailable"
@@ -93,6 +99,8 @@ typedef struct EdrP0SourceOnlyReason {
  * rule hits merely because a later read cannot be safely correlated. */
 #define EDR_P0_SOURCE_ONLY_COLLECTOR_EVIDENCE_GATE_REASONS(X) \
   X(EDR_P0_FILE_READ_REASON_METADATA_BACKPRESSURE) \
+  X(EDR_P0_FILE_READ_REASON_CRITICAL_BINDING_CAPACITY) \
+  X(EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS) \
   X(EDR_P0_FILE_READ_REASON_START_KEY_MISSING) \
   X(EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE) \
   X(EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH) \
