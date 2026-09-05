@@ -17,7 +17,10 @@ typedef struct {
   char signer[256];
   char thumbprint[80];
   char revocation[24];
-  char signature_quality[24];
+  /* Longest current value is "verified_catalog_cache_chain". Keep this
+   * independent from signature_reason so a future quality value cannot
+   * overwrite the adjacent evidence field. */
+  char signature_quality[40];
   char signature_reason[64];
 } EdrProcessEvidence;
 

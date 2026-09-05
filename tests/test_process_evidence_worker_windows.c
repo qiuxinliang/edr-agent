@@ -268,6 +268,13 @@ static void test_real_windows_snapshot_then_delete(void) {
   assert(strcmp(first.revocation, "cache_only") == 0);
   assert(strcmp(first.signature_source, "WinVerifyTrust_handle") == 0 ||
          strcmp(first.signature_source, "WinVerifyTrust_handle_catalog") == 0);
+  if (strcmp(first.signature_source, "WinVerifyTrust_handle_catalog") == 0) {
+    assert(strcmp(first.signature_quality, "verified_catalog_cache_chain") == 0);
+    assert(strcmp(first.signature_reason, "verified_catalog_cache_only") == 0);
+  } else {
+    assert(strcmp(first.signature_quality, "verified_cache_chain") == 0);
+    assert(strcmp(first.signature_reason, "verified_cache_only") == 0);
+  }
   assert(DeleteFileA(a_path));
   assert(edr_process_evidence_request(a_path, 5001u, edr_monotonic_ns(), &retained));
   assert(memcmp(&first, &retained, sizeof(first)) == 0);

@@ -296,8 +296,10 @@ static LONG verify_catalog_signature(const WCHAR *path, HANDLE file,
     strcpy(e->revocation, "cache_only");
     if (signature_subject_and_thumbprint_from_wvt(wd.hWVTStateData, e)) {
       strcpy(e->signature_status, "verified");
-      strcpy(e->signature_quality, "verified_catalog_cache_chain");
-      strcpy(e->signature_reason, "verified_catalog_cache_only");
+      snprintf(e->signature_quality, sizeof(e->signature_quality), "%s",
+               "verified_catalog_cache_chain");
+      snprintf(e->signature_reason, sizeof(e->signature_reason), "%s",
+               "verified_catalog_cache_only");
       strcpy(e->signature_source, "WinVerifyTrust_handle_catalog");
     } else {
       result = TRUST_E_SUBJECT_NOT_TRUSTED;
