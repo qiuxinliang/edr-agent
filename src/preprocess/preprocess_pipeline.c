@@ -1437,6 +1437,17 @@ static void process_one_slot(const EdrEventSlot *slot) {
       default: break;
     }
   } else if (br.type == EDR_EVENT_FILE_READ) {
+    /* Use the authenticated path projection before opening the actor: an
+     * exited reader of a proven unrelated file must not create a P0 source
+     * failure or pause the family. Unknown paths/unavailable IR stay in the
+     * existing fail-closed path; collector assertions were handled above. */
+    if (br.file_path[0] &&
+        !edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)) {
+      apply_agent_ids_to_record(&br);
+      edr_p0_rule_observe_validation_stage(&br, "file_read_interest", "verified_path_miss");
+      edr_local_evidence_cache_record_behavior(&br);
+      return;
+    }
     /* File reads are tied to the actor only after a live StartKey/creation
      * tuple agrees with an available ETW StartKey, or the event timestamp
      * proves that the queried live PID generation already existed. */

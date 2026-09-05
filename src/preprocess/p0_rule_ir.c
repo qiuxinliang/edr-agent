@@ -2606,7 +2606,8 @@ int edr_p0_rule_ir_file_read_path_may_match(const char *path, uint64_t *out_snap
   }
   edr_p0_rule_ir_lazy_init();
   snapshot = p0_ir_snapshot_acquire();
-  if (!snapshot || !snapshot->ready || snapshot->epoch == 0u) {
+  if (!snapshot || !snapshot->ready || snapshot->epoch == 0u ||
+      !edr_p0_rule_ir_artifact_healthy(NULL, 0u)) {
     p0_ir_snapshot_release(snapshot);
     return 1;
   }

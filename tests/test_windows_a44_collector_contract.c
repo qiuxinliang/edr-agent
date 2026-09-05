@@ -252,6 +252,16 @@ int main(void) {
       "FileRead actor path must be queried from the same validated live handle");
   ok &= require_contains(preprocess, "edr_file_read_deferred_push(&s_file_read_deferred, &br",
       "FileRead waits must retain the owned validated record");
+  ok &= require_order_in_function(
+      preprocess, "} else if (br.type == EDR_EVENT_FILE_READ) {",
+      "static DWORD WINAPI preprocess_main(",
+      "edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)",
+      "p0_bind_process_generation(&br)",
+      "proven unrelated FileReads must be excluded before live actor failure can latch P0");
+  ok &= require_order_in_function(
+      preprocess, "static void process_one_slot(", "static DWORD WINAPI preprocess_main(",
+      "if (br.collector_evidence_gate[0])", "\"verified_path_miss\"",
+      "path filtering must never discard an existing collector failure assertion");
   ok &= require_contains(preprocess, "edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_FILE_READ",
       "deferred FileReads must also wait for the durable event-family gate");
   ok &= require_contains(preprocess, "process_pending_file_reads(1);",

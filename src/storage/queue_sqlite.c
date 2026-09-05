@@ -1021,13 +1021,13 @@ static int drain_one_row(void) {
   queue_state_unlock();
   int send = -1;
   if (edr_ingest_http_configured()) {
-    if (edr_ingest_http_circuit_open()) {
+    if (edr_ingest_http_circuit_open() || edr_ingest_http_telemetry_deferred()) {
       queue_state_lock();
       s_delivery_requeued++;
       queue_state_unlock();
       if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
         fprintf(stderr,
-                "[queue_delivery] state=requeued row_id=%lld batch_id=%s send=circuit_open\n",
+                "[queue_delivery] state=requeued row_id=%lld batch_id=%s send=transport_deferred\n",
                 (long long)id, batch_id_copy);
       }
       free(batch_id_copy);
@@ -1067,7 +1067,10 @@ static int drain_one_row(void) {
   queue_state_lock();
   int requeued = 0;
   if (s_db == selected_db && s_db_generation == selected_generation) {
-    bump_selected_retry(selected_db, id, batch_id_copy, blob_copy, blob_len);
+    /* Local budget refusal did not send the bytes. It must not consume the
+     * retry allowance and eventually discard a durable ordinary batch. */
+    if (!edr_ingest_http_telemetry_deferred())
+      bump_selected_retry(selected_db, id, batch_id_copy, blob_copy, blob_len);
     s_delivery_requeued++;
     requeued = 1;
   }
@@ -3533,7 +3536,8 @@ static int drain_one_terminal_journal_frame(void) {
   queue_state_unlock();
 
   int send = -1;
-  if (edr_ingest_http_configured() && !edr_ingest_http_circuit_open()) {
+  if (edr_ingest_http_configured() && !edr_ingest_http_circuit_open() &&
+      !edr_ingest_http_telemetry_deferred()) {
     send = edr_transport_v2_report_events(batch_id, wire, 12u, wire + 12u,
                                           (size_t)wire_len - 12u);
   }
@@ -3553,7 +3557,8 @@ static int drain_one_terminal_journal_frame(void) {
     return acknowledged ? 0 : 2;
   }
   queue_state_lock();
-  if (s_db == selected_db && s_db_generation == selected_generation) {
+  if (s_db == selected_db && s_db_generation == selected_generation &&
+      !edr_ingest_http_telemetry_deferred()) {
     if (frame_kind == 0) {
       /* The only pre-action evidence must remain replayable. Unlike final
        * frames, retry exhaustion may not discard this unknown outcome. */
@@ -3584,7 +3589,7 @@ void edr_storage_queue_poll_drain(void) {
     queue_state_unlock();
     return;
   }
-  if (edr_ingest_http_circuit_open()) {
+  if (edr_ingest_http_circuit_open() || edr_ingest_http_telemetry_deferred()) {
     uint64_t circuit_interval_ns = (uint64_t)queue_circuit_backoff_ms() * 1000000ULL;
     if (now - s_last_drain_ns < circuit_interval_ns) {
       queue_state_unlock();

@@ -334,6 +334,11 @@ add_test(NAME mtls_upload_transport_contract COMMAND test_mtls_upload_contract
 set_tests_properties(mtls_upload_transport_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_http_budget ${CMAKE_CURRENT_SOURCE_DIR}/test_http_budget.c)
+target_include_directories(test_http_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/transport)
+edr_apply_test_warnings(test_http_budget)
+add_test(NAME http_telemetry_budget COMMAND test_http_budget)
+
 add_executable(test_yara_delivery_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_delivery_contract.c)
 edr_apply_test_warnings(test_yara_delivery_contract)
 add_test(NAME yara_delivery_contract COMMAND test_yara_delivery_contract

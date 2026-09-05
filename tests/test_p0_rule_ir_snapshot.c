@@ -173,6 +173,19 @@ int main(void) {
   }
   source = source_path;
   edr_p0_rule_ir_lazy_init(); if (!active_sha(before_sha)) { fprintf(stderr, "snapshot test no active SHA\n"); return 1; }
+  failed_stage = "FileRead authenticated path projection";
+  {
+    const char *ordinary = "C:\\Users\\testpc\\AppData\\Local\\Temp\\MicrosoftEdge_ARM64_152.0.4191.66_152.0.4191.64.exe";
+    uint64_t epoch = 0u;
+    if (edr_p0_rule_ir_file_read_path_may_match(ordinary, &epoch) || epoch == 0u ||
+        !edr_p0_rule_ir_file_read_path_may_match("C:\\Windows\\Temp\\Login Data", NULL) ||
+        !edr_p0_rule_ir_file_read_path_may_match("", NULL) ||
+        !edr_p0_rule_ir_file_read_path_may_match(NULL, NULL)) goto fail;
+    edr_p0_rule_ir_set_sensor_artifact_terminal_unhealthy("test_sensor_identity_unavailable");
+    if (!edr_p0_rule_ir_file_read_path_may_match(ordinary, &epoch) || epoch != 0u) goto fail;
+    edr_p0_rule_ir_clear_sensor_artifact_terminal_unhealthy();
+    if (edr_p0_rule_ir_file_read_path_may_match(ordinary, NULL)) goto fail;
+  }
   for (int i = 0; i < WORKERS; ++i) if (pthread_create(&workers[i], NULL, evaluate_rules, NULL) != 0) { fprintf(stderr, "snapshot worker create failed\n"); return 1; }
   for (int i = 0; i < 20; ++i) edr_p0_rule_ir_reload();
   for (int i = 0; i < WORKERS; ++i) (void)pthread_join(workers[i], NULL);

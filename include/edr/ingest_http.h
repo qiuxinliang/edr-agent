@@ -46,6 +46,9 @@ void edr_ingest_http_get_rest_base(char *out, size_t cap);
 /** 当前 native HTTP circuit 是否仍处于打开状态；到期时自动复位。 */
 int edr_ingest_http_circuit_open(void);
 
+/** Telemetry budget wait only; does not disable heartbeat/control or discard queued evidence. */
+int edr_ingest_http_telemetry_deferred(void);
+
 typedef struct {
   int configured;
   int http_fallback_available;

@@ -1,4 +1,5 @@
 #include "edr/ingest_http.h"
+#include "http_budget.h"
 
 #include "edr/command.h"
 #include "edr/command_executor.h"
@@ -207,10 +208,7 @@ static int64_t s_circuit_until_ms;
 static char s_circuit_reason[128];
 static unsigned s_consecutive_failures;
 static unsigned long s_budget_drop_count;
-static int64_t s_budget_window_minute;
-static unsigned long s_budget_requests;
-static uint64_t s_budget_bytes;
-static unsigned long s_budget_tls_handshakes;
+static EdrHttpBudget s_http_budget;
 static volatile int s_poll_backoff_ms;
 static volatile int s_ws_backoff_ms;
 static volatile int s_poll_run;
@@ -811,67 +809,39 @@ static void apply_effective_preprocess_sampling(void) {
 }
 
 static void budget_refresh_window_locked(void) {
-  int64_t minute = unix_ms_now() / 60000LL;
-  if (minute != s_budget_window_minute) {
-    s_budget_window_minute = minute;
-    s_budget_requests = 0;
-    s_budget_bytes = 0;
-    s_budget_tls_handshakes = 0;
-  }
+  edr_http_budget_refresh(&s_http_budget, unix_ms_now());
 }
 
-static int comm_budget_try(size_t bytes, int tls_handshake) {
-  unsigned long req_lim;
-  uint64_t byte_lim;
-  unsigned long tls_lim;
-  int exceeded = 0;
+static int comm_budget_try(size_t bytes, int request, int tls_handshake, int telemetry) {
+  EdrHttpBudgetLimits limits;
+  int result;
   runtime_state_lock();
-  budget_refresh_window_locked();
-  req_lim = request_limit_per_minute();
-  byte_lim = byte_limit_per_minute();
-  tls_lim = tls_handshake_limit_per_minute();
-  if (s_budget_requests + 1ul > req_lim ||
-      s_budget_bytes + (uint64_t)bytes > byte_lim ||
-      (tls_handshake && s_budget_tls_handshakes + 1ul > tls_lim)) {
+  limits.requests = request_limit_per_minute();
+  limits.bytes = byte_limit_per_minute();
+  limits.tls_handshakes = tls_handshake_limit_per_minute();
+  result = edr_http_budget_admit(&s_http_budget, unix_ms_now(), limits, bytes,
+                                 request, tls_handshake, telemetry);
+  if (result != EDR_HTTP_BUDGET_ADMITTED) {
     s_budget_drop_count++;
-    snprintf(s_last_error, sizeof(s_last_error), "%s", "communication budget exceeded");
+    snprintf(s_last_error, sizeof(s_last_error), "%s",
+             result == EDR_HTTP_BUDGET_DEFERRED
+                 ? "telemetry budget deferred; control reserve retained"
+                 : "communication budget exceeded");
     s_last_failure_ms = unix_ms_now();
-    exceeded = 1;
-  } else {
-    s_budget_requests++;
-    s_budget_bytes += (uint64_t)bytes;
-    if (tls_handshake) {
-      s_budget_tls_handshakes++;
-    }
   }
   runtime_state_unlock();
-  if (exceeded) {
+  if (result == EDR_HTTP_BUDGET_EXHAUSTED) {
     comm_open_circuit("communication budget exceeded");
-    return 0;
   }
-  return 1;
+  return result == EDR_HTTP_BUDGET_ADMITTED;
 }
 
-static int comm_tls_handshake_budget_try(void) {
-  unsigned long tls_lim;
-  int exceeded = 0;
+int edr_ingest_http_telemetry_deferred(void) {
+  int deferred;
   runtime_state_lock();
-  budget_refresh_window_locked();
-  tls_lim = tls_handshake_limit_per_minute();
-  if (s_budget_tls_handshakes + 1ul > tls_lim) {
-    s_budget_drop_count++;
-    snprintf(s_last_error, sizeof(s_last_error), "%s", "tls handshake budget exceeded");
-    s_last_failure_ms = unix_ms_now();
-    exceeded = 1;
-  } else {
-    s_budget_tls_handshakes++;
-  }
+  deferred = unix_ms_now() < s_http_budget.telemetry_deferred_until_ms;
   runtime_state_unlock();
-  if (exceeded) {
-    comm_open_circuit("tls handshake budget exceeded");
-    return 0;
-  }
-  return 1;
+  return deferred;
 }
 
 static int failure_should_open_circuit(const char *msg) {
@@ -1722,11 +1692,11 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->zstd_wire_bytes = s_zstd_wire_bytes;
   out->zstd_dict_bytes = s_zstd_dict_bytes;
   budget_refresh_window_locked();
-  out->requests_this_minute = s_budget_requests;
+  out->requests_this_minute = (unsigned long)s_http_budget.requests;
   out->request_limit_per_minute = request_limit_per_minute();
-  out->bytes_this_minute = s_budget_bytes;
+  out->bytes_this_minute = s_http_budget.bytes;
   out->byte_limit_per_minute = byte_limit_per_minute();
-  out->tls_handshakes_this_minute = s_budget_tls_handshakes;
+  out->tls_handshakes_this_minute = (unsigned long)s_http_budget.tls_handshakes;
   out->tls_handshake_limit_per_minute = tls_handshake_limit_per_minute();
   {
     unsigned long total = s_http_ok + s_http_fail;
@@ -3455,11 +3425,11 @@ static int http_conn_matches_locked(const char *host, int port, int https) {
          strcmp(s_http_conn.host, host ? host : "") == 0;
 }
 
-static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int https) {
+static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int https, int telemetry) {
   if (!conn) return -1;
   memset(conn, 0, sizeof(*conn));
   conn->fd = EDR_SOCKET_INVALID;
-  if (https && !comm_tls_handshake_budget_try()) {
+  if (https && !comm_budget_try(0u, 0, 1, telemetry)) {
     return -1;
   }
   if (tcp_connect_http_route(host, port, https, &conn->fd) != 0) {
@@ -3524,12 +3494,12 @@ static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int
   return 0;
 }
 
-static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https) {
+static EdrHttpConn *http_conn_get_locked(const char *host, int port, int https, int telemetry) {
   if (http_conn_matches_locked(host, port, https)) {
     return &s_http_conn;
   }
   http_conn_close_locked();
-  if (http_conn_open_new(&s_http_conn, host, port, https) != 0) {
+  if (http_conn_open_new(&s_http_conn, host, port, https, telemetry) != 0) {
     return NULL;
   }
   return &s_http_conn;
@@ -4242,7 +4212,7 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
     return -2;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(body_len + 512u, 1)) {
+  if (!comm_circuit_allows() || !comm_budget_try(body_len + 512u, 1, 1, edr_http_budget_is_telemetry(url))) {
     return -1;
   }
   curl = curl_easy_init();
@@ -4323,7 +4293,8 @@ static int curl_h1_request(const char *method, const char *url, const char *cont
     runtime_failure("libcurl not initialized");
     return -1;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(body_len + 512u, strncmp(url, "https://", 8u) == 0)) {
+  if (!comm_circuit_allows() || !comm_budget_try(body_len + 512u, 1, strncmp(url, "https://", 8u) == 0,
+                                               edr_http_budget_is_telemetry(url))) {
     return -1;
   }
   curl = curl_easy_init();
@@ -4395,7 +4366,7 @@ static int curl_h2_stream_loop(const char *url) {
   if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
     return -2;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(2048u, 1)) {
+  if (!comm_circuit_allows() || !comm_budget_try(2048u, 1, 1, 0)) {
     return -1;
   }
   memset(&ctx, 0, sizeof(ctx));
@@ -4462,7 +4433,7 @@ static int curl_h1_stream_loop(const char *url) {
   if (!url || strncmp(url, "https://", 8u) != 0 || !curl_global_ready()) {
     return -2;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(2048u, 1)) {
+  if (!comm_circuit_allows() || !comm_budget_try(2048u, 1, 1, 0)) {
     return -1;
   }
   memset(&ctx, 0, sizeof(ctx));
@@ -4529,6 +4500,9 @@ static int native_request_ex(const char *method, const char *url, const char *co
     if (h2rc == 0) {
       return 0;
     }
+    if (edr_http_budget_is_telemetry(url) && edr_ingest_http_telemetry_deferred()) {
+      return -1;
+    }
     if (h2rc != -2) {
       if (http2_required_for_url(url)) {
         runtime_failure("HTTP/2 required but h2 request failed");
@@ -4560,7 +4534,8 @@ static int native_request_ex(const char *method, const char *url, const char *co
   if (!comm_circuit_allows()) {
     return -1;
   }
-  if (!comm_budget_try(body_len + 512u, https)) {
+  /* The native keepalive pool charges TLS only when opening a connection. */
+  if (!comm_budget_try(body_len + 512u, 1, 0, edr_http_budget_is_telemetry(url))) {
     return -1;
   }
   if (net_init() != 0) {
@@ -4575,7 +4550,7 @@ static int native_request_ex(const char *method, const char *url, const char *co
   http_lock();
   for (int attempt = 0; attempt < 2; attempt++) {
     int reusable = 0;
-    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https, edr_http_budget_is_telemetry(url));
     if (!conn) {
       break;
     }
@@ -4662,6 +4637,10 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
   if (rc == 0) {
     route_note_success();
     return 0;
+  }
+  /* Local admission refusal is not evidence of an unhealthy server route. */
+  if (edr_http_budget_is_telemetry(url) && edr_ingest_http_telemetry_deferred()) {
+    return rc;
   }
   char last_error[sizeof(s_last_error)];
   runtime_string_copy(last_error, sizeof(last_error), s_last_error);
@@ -4864,7 +4843,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   if (!comm_circuit_allows()) {
     return -1;
   }
-  if (!comm_budget_try(512u, https)) {
+  if (!comm_budget_try(512u, 1, 0, 0)) {
     return -1;
   }
   if (net_init() != 0) {
@@ -4888,7 +4867,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   for (int attempt = 0; attempt < max_attempts; attempt++) {
     int reusable = 0;
     int client_error = 0;
-    EdrHttpConn *conn = http_conn_get_locked(host, port, https);
+    EdrHttpConn *conn = http_conn_get_locked(host, port, https, 0);
     if (!conn) {
       break;
     }
@@ -5154,7 +5133,7 @@ static int stream_connect_once(EdrWsConn *out) {
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     return -1;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(2048u, https) || net_init() != 0) {
+  if (!comm_circuit_allows() || !comm_budget_try(2048u, 1, https, 0) || net_init() != 0) {
     return -1;
   }
   if (tcp_connect_http_route(host, port, https, &out->fd) != 0) {
@@ -5988,7 +5967,7 @@ static int curl_upload_multipart_file(const char *command_id, const char *upload
       !http2_client_enabled() || strncmp(url, "https://", 8u) != 0 || !curl_global_ready()) {
     return -2;
   }
-  if (!comm_circuit_allows() || !comm_budget_try(4096u, 1)) {
+  if (!comm_circuit_allows() || !comm_budget_try(4096u, 1, 1, 0)) {
     return -1;
   }
   curl = curl_easy_init();
@@ -6169,7 +6148,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   if (!comm_circuit_allows()) {
     return -1;
   }
-  if (!comm_budget_try(4096u, https)) {
+  if (!comm_budget_try(4096u, 1, 0, 0)) {
     return -1;
   }
   if (net_init() != 0) {
@@ -6190,7 +6169,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     if (fseek(file, 0, SEEK_SET) != 0) {
       break;
     }
-    if (http_conn_open_new(&local_conn, host, port, https) != 0) {
+    if (http_conn_open_new(&local_conn, host, port, https, 0) != 0) {
       break;
     }
     if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
