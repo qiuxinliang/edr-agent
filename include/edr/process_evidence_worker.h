@@ -44,7 +44,9 @@ typedef struct {
 } EdrProcessEvidenceMetrics;
 
 /* A bounded asynchronous cache. generation is the raw ETW ProcessStartKey;
- * results from a different process instance are deliberately invisible. */
+ * results from a different process instance are deliberately invisible.
+ * Repeated requests retrieve the first captured pathname snapshot even if
+ * that path is deleted/replaced. This does not prove the process image. */
 int edr_process_evidence_worker_start(void);
 void edr_process_evidence_worker_stop(void);
 int edr_process_evidence_request(const char *canonical_path, uint64_t generation,

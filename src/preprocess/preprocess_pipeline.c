@@ -1038,7 +1038,6 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
   evidence = requested;
   if (!evidence_ready &&
       (strcmp(requested.hash_reason, "queued") == 0 ||
-       strcmp(requested.hash_reason, "requeued_identity_change") == 0 ||
        strcmp(requested.hash_reason, "identity_revalidation_pending") == 0)) {
     evidence_ready = edr_process_evidence_wait(
         br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
@@ -1312,6 +1311,9 @@ static void process_one_slot(const EdrEventSlot *slot) {
   if (br.type == EDR_EVENT_PROCESS_CREATE) {
     EdrBehaviorRecord ready;
     if (!br.is_security_4688) {
+      /* Revision one identifies the initial kernel observation, including
+       * partial evidence. A later 4688 join increments it independently. */
+      if (br.evidence_revision == 0u) br.evidence_revision = 1u;
       (void)p0_bind_process_generation(&br);
       /* Capture the target token while the newly-created process is most
        * likely still alive.  Waiting for the bounded 4688 correlation window

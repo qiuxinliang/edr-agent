@@ -200,18 +200,38 @@ int main(void) {
                          "Read must be task/opcode/keyword classified, not text inferred");
   ok &= require_contains(collector, "edr_tdh_kernel_file_extract_name_binding",
                          "NameCreate must provide a typed FileKey/FileName binding");
+  ok &= require_order_in_function(
+      collector, "static VOID WINAPI edr_event_record_callback(",
+      "static DWORD WINAPI edr_etw_consumer_thread(",
+      "edr_collector_kernel_file_track_metadata(event_record, event_ns)",
+      "if (!edr_collector_keep_agent_self_events()",
+      "provider-wide name metadata must precede Agent self-event filtering");
+  ok &= require_order_in_function(
+      collector, "static VOID WINAPI edr_event_record_callback(",
+      "static DWORD WINAPI edr_etw_consumer_thread(",
+      "edr_collector_kernel_file_track_metadata(event_record, event_ns)",
+      "edr_agent_self_fuse_should_drop_event",
+      "self-fuse must not drop shared FileKey NameDelete or NameCreate");
   ok &= require_contains(collector, "edr_tdh_kernel_file_extract_file_key",
                          "Read must resolve its typed FileKey");
-  ok &= require_contains(collector, "name_delete_event_ns",
-                         "NameDelete must retain an event-time upper bound for FileKey reuse");
+  ok &= require_contains(collector, "name_end_event_ns",
+                         "NameDelete and a newer name must retain an event-time upper bound");
+  ok &= require_contains(collector, "other->name_end_event_ns = edr_file_key_lifetime_end(",
+                         "a newer name must bound older history before its own history expires");
+  ok &= require_contains(collector, "entry->name_end_event_ns = edr_file_key_lifetime_end(",
+                         "a late older NameCreate must also be bounded by newer history");
   ok &= require_contains(collector, "edr_file_key_lifetime_contains(entry->name_event_ns",
                          "a Read at or after NameDelete must not use the old binding");
   ok &= require_contains(collector, "EDR_KERNEL_FILE_EVENT_NAME_DELETE 11u",
                          "name invalidation must use NameDelete, not another handle's Close");
   ok &= require_absent(collector, "edr_kernel_file_cleanup_or_close_descriptor",
                        "individual FileObject closure must not invalidate a shared FileKey name");
-  ok &= require_contains(collector, "entry->name_event_ns > best_name_event_ns",
-                         "FileKey reuse must choose the matching newest event-time binding");
+  ok &= require_order_in_function(
+      collector, "static int edr_collector_kernel_file_read_resolve(",
+      "static int edr_collector_append_file_read_binding(",
+      "edr_file_key_lifetime_is_newer(entry->name_event_ns",
+      "edr_file_key_lifetime_contains(entry->name_event_ns",
+      "FileKey reuse must select the newest name before rejecting its closed lifetime");
   ok &= require_contains(collector, "edr_collector_file_key_binding_exact",
                          "same-timestamp NameCreate delivery must compare the whole binding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_note_resolved",

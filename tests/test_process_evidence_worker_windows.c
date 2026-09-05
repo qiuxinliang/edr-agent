@@ -146,6 +146,7 @@ static void test_ready_snapshot_survives_short_lived_path_cleanup(void) {
   EdrProcessEvidence request, first, cached;
   make_fixture_paths(a_path, b_path);
   assert(edr_process_evidence_worker_start());
+  edr_process_evidence_test_set_wvt_path_sequence(NULL, 0u, NULL, 0u);
   edr_process_evidence_test_set_synthetic_wvt_result(1);
   memset(&request, 0, sizeof(request));
   assert(edr_process_evidence_request(a_path, 2001u, edr_monotonic_ns(), &request) == 0);
@@ -159,8 +160,58 @@ static void test_ready_snapshot_survives_short_lived_path_cleanup(void) {
                                    50ULL * 1000000ULL, &cached));
   assert(strcmp(cached.file_identity, first.file_identity) == 0);
   assert(strcmp(cached.sha256, first.sha256) == 0);
+  /* The real preprocess path calls request again after the 4688 deadline,
+   * not wait directly. That second request must not reopen the deleted path. */
+  assert(edr_process_evidence_request(a_path, 2001u, edr_monotonic_ns(), &cached));
+  assert(strcmp(cached.file_identity, first.file_identity) == 0);
+  assert(strcmp(cached.sha256, first.sha256) == 0);
+  /* A replacement B is not the owner of generation A's historical snapshot.
+   * Only a new generation may capture B. Neither snapshot is image authority. */
+  assert(MoveFileExA(b_path, a_path, 0u));
+  assert(edr_process_evidence_request(a_path, 2001u, edr_monotonic_ns(), &cached));
+  assert(strcmp(cached.file_identity, first.file_identity) == 0);
+  assert(strcmp(cached.sha256, first.sha256) == 0);
+  assert(!edr_process_evidence_request(a_path, 2002u, edr_monotonic_ns(), &request));
+  assert(edr_process_evidence_wait(a_path, 2002u, edr_monotonic_ns(),
+                                   1000ULL * 1000000ULL, &cached));
+  assert(strcmp(cached.file_identity, first.file_identity) != 0);
+  assert(strcmp(cached.sha256, first.sha256) != 0);
   edr_process_evidence_worker_stop();
+  assert(DeleteFileA(a_path));
   (void)DeleteFileA(b_path);
+}
+
+static void test_snapshot_burst_retention_is_bounded(void) {
+  char a_path[MAX_PATH], b_path[MAX_PATH];
+  EdrProcessEvidence request, result;
+  EdrProcessEvidenceMetrics metrics;
+  uint64_t started = edr_monotonic_ns();
+  make_fixture_paths(a_path, b_path);
+  assert(edr_process_evidence_worker_start());
+  edr_process_evidence_test_set_wvt_path_sequence(NULL, 0u, NULL, 0u);
+  edr_process_evidence_test_set_synthetic_wvt_result(1);
+  for (uint64_t i = 1u; i <= 32u; ++i) {
+    assert(!edr_process_evidence_request(a_path, 3000u+i, started, &request));
+    assert(edr_process_evidence_wait(a_path, 3000u+i, edr_monotonic_ns(),
+                                     1000ULL * 1000000ULL, &result));
+    assert(result.sha256[0]);
+  }
+  assert(!edr_process_evidence_request(a_path, 4000u, started, &request));
+  assert(strcmp(request.hash_reason, "evidence_backpressure") == 0);
+  assert(edr_process_evidence_request(a_path, 3001u, started, &result));
+  edr_process_evidence_worker_get_metrics(&metrics);
+  assert(metrics.capacity == 32u && metrics.slots_used == 32u);
+  assert(metrics.cache_evictions == 0u && metrics.backpressure == 1u);
+  Sleep(5100u);
+  assert(!edr_process_evidence_request(a_path, 4000u, edr_monotonic_ns(), &request));
+  assert(strcmp(request.hash_reason, "queued") == 0);
+  assert(edr_process_evidence_wait(a_path, 4000u, edr_monotonic_ns(),
+                                   1000ULL * 1000000ULL, &result));
+  edr_process_evidence_worker_get_metrics(&metrics);
+  assert(metrics.cache_evictions == 1u && metrics.slots_used == 32u);
+  edr_process_evidence_worker_stop();
+  assert(DeleteFileA(a_path));
+  assert(DeleteFileA(b_path));
 }
 
 static void test_share_and_reparse_denial_stay_not_evaluable(void) {
@@ -195,12 +246,49 @@ static void test_share_and_reparse_denial_stay_not_evaluable(void) {
   (void)DeleteFileA(b_path);
 }
 
+static void test_real_windows_snapshot_then_delete(void) {
+  char a_path[MAX_PATH], b_path[MAX_PATH], system_dir[MAX_PATH], source[MAX_PATH];
+  EdrProcessEvidence request, first, retained;
+  make_fixture_paths(a_path, b_path);
+  assert(GetSystemDirectoryA(system_dir, (UINT)sizeof(system_dir)) > 0u);
+  assert(snprintf(source, sizeof(source), "%s\\WindowsPowerShell\\v1.0\\powershell.exe",
+                   system_dir) < (int)sizeof(source));
+  /* Only read/copy a genuine system binary. Never execute the copy. */
+  assert(CopyFileA(source, a_path, FALSE));
+  assert(edr_process_evidence_worker_start());
+  edr_process_evidence_test_set_wvt_path_sequence(NULL, 0u, NULL, 0u);
+  edr_process_evidence_test_set_synthetic_wvt_result(0);
+  assert(!edr_process_evidence_request(a_path, 5001u, edr_monotonic_ns(), &request));
+  assert(edr_process_evidence_wait(a_path, 5001u, edr_monotonic_ns(),
+                                   5000ULL * 1000000ULL, &first));
+  assert(strlen(first.sha256) == 64u);
+  assert(strcmp(first.hash_quality, "captured") == 0);
+  assert(strcmp(first.signature_source, "WinVerifyTrust_handle") == 0);
+  /* Offline revocation can remain unknown; never turn that into verified. */
+  if (strcmp(first.signature_status, "verified") == 0) {
+    assert(first.signer[0] && first.thumbprint[0]);
+    assert(strcmp(first.revocation, "cache_only") == 0);
+  } else {
+    assert(strcmp(first.signature_status, "unknown") == 0);
+    assert(strncmp(first.signature_reason, "winverifytrust_", 15u) == 0);
+  }
+  assert(DeleteFileA(a_path));
+  assert(edr_process_evidence_request(a_path, 5001u, edr_monotonic_ns(), &retained));
+  assert(memcmp(&first, &retained, sizeof(first)) == 0);
+  printf("real Windows snapshot retained: sha256=%s signature=%s reason=%s\n",
+         retained.sha256, retained.signature_status, retained.signature_reason);
+  edr_process_evidence_worker_stop();
+  assert(DeleteFileA(b_path));
+}
+
 int main(void) {
   test_held_owner_denies_modify_restore_and_swap();
   test_injected_wvt_path_swaps_never_publish_b();
   test_ready_snapshot_survives_short_lived_path_cleanup();
+  test_snapshot_burst_retention_is_bounded();
   test_missing_identity_stays_unavailable();
   test_share_and_reparse_denial_stay_not_evaluable();
+  test_real_windows_snapshot_then_delete();
   puts("process evidence worker Windows TOCTOU contract: ok");
   return 0;
 }

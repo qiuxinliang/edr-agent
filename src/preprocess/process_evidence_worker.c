@@ -20,6 +20,9 @@
 #define EDR_EVIDENCE_HASH_MAX_NS (1000ULL * 1000000ULL)
 #define EDR_EVIDENCE_QUEUE_MAX_NS (5000ULL * 1000000ULL)
 #define EDR_EVIDENCE_STALL_NS (10000ULL * 1000000ULL)
+/* Cover the three-second 4688 join plus the bounded evidence wait. Ready
+ * results, not file handles, are protected from burst eviction here. */
+#define EDR_EVIDENCE_RETAIN_NS (5000ULL * 1000000ULL)
 #ifndef WTD_CACHE_ONLY_URL_RETRIEVAL
 #define WTD_CACHE_ONLY_URL_RETRIEVAL 0x00001000u
 #endif
@@ -449,13 +452,47 @@ void edr_process_evidence_worker_stop(void) {
   s_thread=NULL;
   s_wake=NULL;
 }
+/* Caller holds s_lock. The first successful capture owns this generation's
+ * pathname snapshot; a later request is a retrieval, not a new observation
+ * of whatever now happens to occupy that path. It is never image authority. */
+static int evidence_find_snapshot_locked(const char *path, uint64_t generation,
+                                          uint64_t now, EdrProcessEvidence *out,
+                                          int *ready) {
+  for (uint32_t i = 0u; i < EDR_EVIDENCE_SLOTS; ++i) {
+    EvidenceSlot *slot = &s_slots[i];
+    if (slot->generation != generation || strcmp(slot->path, path) != 0) continue;
+    if (slot->ready) {
+      *out = slot->evidence;
+      slot->last_used_ns = now;
+      s_metrics.ready_hits++;
+      *ready = 1;
+      return 1;
+    }
+    if (slot->queued || slot->inflight) {
+      snprintf(out->file_identity, sizeof(out->file_identity), "%s", slot->file_identity);
+      out->file_write_time = slot->file_write_time;
+      strcpy(out->hash_reason, "identity_revalidation_pending");
+      strcpy(out->signature_reason, "identity_revalidation_pending");
+      s_metrics.pending_reuse++;
+      *ready = 0;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t now,EdrProcessEvidence *out) {
   EdrProcessEvidence current;
   void *opened_file = NULL;
   EvidenceSlot *slot = NULL;
+  int ready = 0;
   if (!out) return 0;
   evidence_clear(out, "not_requested");
   if (!path || !path[0] || !generation) { strcpy(out->hash_reason,"missing_identity"); strcpy(out->signature_reason,"missing_identity"); return 0; }
+  if (strlen(path) >= sizeof(s_slots[0].path)) {
+    evidence_clear(out, "path_capacity");
+    return 0;
+  }
   if (InterlockedCompareExchange(&s_terminal_unhealthy, 0, 0)) {
     strcpy(out->hash_reason, "worker_terminal_unhealthy");
     strcpy(out->signature_reason, "worker_terminal_unhealthy");
@@ -467,6 +504,14 @@ int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t n
     strcpy(out->signature_reason, "evidence_worker_stalled");
     return 0;
   }
+  AcquireSRWLockExclusive(&s_lock);
+  s_metrics.requests_total++;
+  if (evidence_find_snapshot_locked(path, generation, now, out, &ready)) {
+    ReleaseSRWLockExclusive(&s_lock);
+    return ready;
+  }
+  s_metrics.misses++;
+  ReleaseSRWLockExclusive(&s_lock);
   memset(&current, 0, sizeof(current));
   if (!edr_windows_file_identity_open_readonly(path, &opened_file,
                                                current.file_identity,
@@ -476,61 +521,25 @@ int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t n
     strcpy(out->signature_reason, "file_identity_unavailable");
     return 0;
   }
-  /* File identity is a cheap synchronous handle query, not hashing.  Return
-   * it on the first queued request so a single ProcessCreate can safely bind
-   * its enforcement intent without waiting for a duplicate event. */
+  /* Return the snapshot identity before hashing, but never use it to bind an
+   * enforcement target: the process's image section has not been captured. */
   snprintf(out->file_identity, sizeof(out->file_identity), "%s", current.file_identity);
   out->file_write_time = current.file_write_time;
   AcquireSRWLockExclusive(&s_lock);
-  s_metrics.requests_total++;
-  for (uint32_t i=0;i<EDR_EVIDENCE_SLOTS;i++) if (s_slots[i].generation==generation && strcmp(s_slots[i].path,path)==0) {
-    slot = &s_slots[i];
-    if (slot->ready && file_identity_equal(slot->file_identity, current.file_identity) &&
-        slot->file_write_time == current.file_write_time) {
-      *out=slot->evidence;
-      slot->last_used_ns=now;
-      s_metrics.ready_hits++;
-      ReleaseSRWLockExclusive(&s_lock);
-      CloseHandle((HANDLE)opened_file);
-      return 1;
-    }
-    if (slot->queued || slot->inflight) {
-      int same_identity =
-          file_identity_equal(slot->file_identity, current.file_identity) &&
-          slot->file_write_time == current.file_write_time;
-      /* The slot owns A until its worker returns. A fresh B request never
-       * overwrites that owner and must not wait for or consume A's result;
-       * callers retain B's identity until B can be queued later. */
-      s_metrics.pending_reuse++;
-      strcpy(out->hash_reason, same_identity ? "identity_revalidation_pending"
-                                             : "identity_change_pending");
-      strcpy(out->signature_reason, out->hash_reason);
-      ReleaseSRWLockExclusive(&s_lock);
-      CloseHandle((HANDLE)opened_file);
-      return 0;
-    }
-    s_metrics.misses++;
-    evidence_slot_reset(slot);
-    snprintf(slot->path,sizeof(slot->path),"%s",path);
-    slot->generation=generation;
-    snprintf(slot->file_identity, sizeof(slot->file_identity), "%s", current.file_identity);
-    slot->file_write_time=current.file_write_time;
-    slot->owned_file=(HANDLE)opened_file;
-    opened_file=NULL;
-    slot->queued_ns=now;
-    slot->last_used_ns=now;
-    slot->queued=1;
-    s_metrics.queued++;
-    strcpy(out->hash_reason,"requeued_identity_change");
-    strcpy(out->signature_reason,"requeued_identity_change");
+  /* Another producer may have captured the generation while the handle was
+   * opened outside the lock. It remains the owner; close this losing handle. */
+  if (evidence_find_snapshot_locked(path, generation, now, out, &ready)) {
     ReleaseSRWLockExclusive(&s_lock);
-    SetEvent(s_wake);
-    return 0;
+    CloseHandle((HANDLE)opened_file);
+    return ready;
   }
-  s_metrics.misses++;
   for (uint32_t i=0;i<EDR_EVIDENCE_SLOTS;i++) if (!s_slots[i].queued && !s_slots[i].inflight && !s_slots[i].ready) { slot=&s_slots[i]; break; }
   if (!slot) {
-    for (uint32_t i=0;i<EDR_EVIDENCE_SLOTS;i++) if (s_slots[i].ready && (!slot || s_slots[i].last_used_ns < slot->last_used_ns)) slot=&s_slots[i];
+    for (uint32_t i=0;i<EDR_EVIDENCE_SLOTS;i++) {
+      if (s_slots[i].ready && now >= s_slots[i].queued_ns &&
+          now - s_slots[i].queued_ns >= EDR_EVIDENCE_RETAIN_NS &&
+          (!slot || s_slots[i].last_used_ns < slot->last_used_ns)) slot=&s_slots[i];
+    }
     if (slot) s_metrics.cache_evictions++;
   }
   if (!slot) {

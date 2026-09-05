@@ -164,7 +164,7 @@ typedef struct {
   /* NameDelete is retained as an event-time upper bound rather than
    * erasing the binding immediately.  A4.4 can decode an older Read after
    * the callback has already observed NameDelete and a reused FileKey. */
-  uint64_t name_delete_event_ns;
+  uint64_t name_end_event_ns;
   /* FileKey names are provider-session local facts.  They deliberately do
    * not carry an IR epoch: the Read is evaluated under the current immutable
    * rules snapshot, while this binding remains valid until its ETW interval
@@ -2253,7 +2253,7 @@ static void edr_collector_file_key_cache_purge_locked(uint64_t event_ns) {
     if (entry->file_key == 0u || entry->name_event_ns == 0u) {
       continue;
     }
-    if (!edr_file_key_lifetime_expired(entry->name_delete_event_ns, event_ns,
+    if (!edr_file_key_lifetime_expired(entry->name_end_event_ns, event_ns,
                                       EDR_COLLECTOR_FILE_KEY_TTL_NS)) {
       continue;
     }
@@ -3151,7 +3151,7 @@ static int edr_collector_file_key_binding_exact(const EdrCollectorFileKeyCacheEn
                                                 uint64_t session_epoch,
                                                 const char *canonical_path) {
   return entry && entry->file_key == file_key && entry->name_event_ns == event_ns &&
-         entry->session_epoch == session_epoch && entry->name_delete_event_ns == 0u &&
+         entry->session_epoch == session_epoch && entry->name_end_event_ns == 0u &&
          canonical_path && canonical_path[0] && entry->path[0] &&
          edr_collector_equal_ci(entry->path, canonical_path);
 }
@@ -3255,6 +3255,17 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
       entry->session_epoch = session_epoch;
       entry->critical = critical ? 1u : 0u;
       snprintf(entry->path, sizeof(entry->path), "%s", canonical_path);
+      /* Bound both directions because callbacks can arrive out of order.
+       * Retain the earlier path for delayed Reads, never for a newer lifetime. */
+      for (size_t i = 0u; i < EDR_COLLECTOR_FILE_KEY_CACHE; ++i) {
+        EdrCollectorFileKeyCacheEntry *other = &s_file_key_cache[i];
+        if (other == entry || other->file_key != file_key ||
+            other->session_epoch != session_epoch) continue;
+        other->name_end_event_ns = edr_file_key_lifetime_end(
+            other->name_event_ns, other->name_end_event_ns, entry->name_event_ns);
+        entry->name_end_event_ns = edr_file_key_lifetime_end(
+            entry->name_event_ns, entry->name_end_event_ns, other->name_event_ns);
+      }
     }
     ReleaseSRWLockExclusive(&s_file_key_cache_lock);
     if (critical && allocated) {
@@ -3274,14 +3285,14 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
         if (entry->file_key != file_key || entry->session_epoch != s_file_key_session_epoch ||
             !entry->path[0] ||
             entry->name_event_ns > event_ns ||
-            (entry->name_delete_event_ns != 0u && event_ns >= entry->name_delete_event_ns)) {
+            (entry->name_end_event_ns != 0u && event_ns >= entry->name_end_event_ns)) {
           continue;
         }
         if (!latest || entry->name_event_ns > latest->name_event_ns) {
           latest = entry;
         }
       }
-      if (latest) latest->name_delete_event_ns = event_ns;
+      if (latest) latest->name_end_event_ns = event_ns;
       ReleaseSRWLockExclusive(&s_file_key_cache_lock);
     } else {
       s_health.file_read_name_cache_misses++;
@@ -3299,7 +3310,6 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
   const EVENT_DESCRIPTOR *descriptor;
   uint64_t file_key = 0u;
   uint64_t best_name_event_ns = 0u;
-  uint64_t best_problem_event_ns = 0u;
   uint64_t session_epoch;
   uint32_t read_pid;
   int resolved = 0;
@@ -3329,20 +3339,21 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
     const EdrCollectorFileKeyCacheEntry *entry = &s_file_key_cache[i];
     if (entry->file_key != file_key || !entry->path[0] ||
         entry->session_epoch != session_epoch ||
-        event_ns < entry->name_event_ns) {
+        !edr_file_key_lifetime_is_newer(entry->name_event_ns, event_ns,
+                                       best_name_event_ns)) {
       continue;
     }
+    best_name_event_ns = entry->name_event_ns;
+    resolved = 0;
+    have_problem = 0;
     /* Equal timestamps have no documented ordering across callbacks, so they
      * cannot resolve a Read against a closed/reused handle.  Preserve the
      * known path only to make the resulting source-only gate attributable. */
     if (!edr_file_key_lifetime_contains(entry->name_event_ns,
-                                        entry->name_delete_event_ns, event_ns)) {
-      if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
-        snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
-        have_problem = 1;
-        problem_reason = EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS;
-        best_problem_event_ns = entry->name_event_ns;
-      }
+                                        entry->name_end_event_ns, event_ns)) {
+      snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
+      have_problem = 1;
+      problem_reason = EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS;
       continue;
     }
     /* NameCreate binds the file object, not the process that will eventually
@@ -3352,19 +3363,13 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
      * to a live StartKey + creation FILETIME and proves the event timestamp
      * is not from an older PID lifetime before P0 matching. */
     if (!read_pid) {
-      if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
-        snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
-        have_problem = 1;
-        problem_reason = EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE;
-        best_problem_event_ns = entry->name_event_ns;
-      }
+      snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
+      have_problem = 1;
+      problem_reason = EDR_P0_FILE_READ_REASON_LIVE_GENERATION_UNAVAILABLE;
       continue;
     }
-    if (!resolved || entry->name_event_ns > best_name_event_ns) {
-      snprintf(path_out, path_cap, "%s", entry->path);
-      best_name_event_ns = entry->name_event_ns;
-      resolved = 1;
-    }
+    snprintf(path_out, path_cap, "%s", entry->path);
+    resolved = 1;
   }
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
   if (!resolved) {
@@ -4125,6 +4130,15 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   edr_note_provider_callback(provider);
   edr_etw_observability_on_callback(provider_tag);
 
+  /* Name metadata belongs to the provider-wide FileKey namespace, not the
+   * logging process. An Agent-opened file can later be read by another
+   * process. Filtering its NameCreate/NameDelete as self telemetry loses the
+   * shared binding (or retains a stale one after reuse). Metadata never
+   * becomes a behavioral event and still requires a valid event timestamp. */
+  if (memcmp(provider, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 &&
+      edr_collector_kernel_file_track_metadata(event_record, event_ns)) {
+    return;
+  }
   if (!edr_collector_keep_agent_self_events() &&
       event_record->EventHeader.ProcessId == (ULONG)s_agent_pid &&
       !(memcmp(provider, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
@@ -4156,14 +4170,6 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
           EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE);
     }
     s_health.etw_prefilter_dropped++;
-    return;
-  }
-  /* NameCreate/NameDelete are metadata-only Kernel-File records. They
-   * maintain the bounded FileKey path map and must not be misclassified as a
-   * behavioral Create/Delete event merely because their localized text has a
-   * similar word. */
-  if (memcmp(provider, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0 &&
-      edr_collector_kernel_file_track_metadata(event_record, event_ns)) {
     return;
   }
   EdrEventType ty;

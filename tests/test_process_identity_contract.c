@@ -353,8 +353,16 @@ int main(void) {
                          "evidence waiters must poll independently of the work event");
   ok &= require_absent(evidence_wait, "WaitForSingleObject(s_wake",
                        "only the evidence worker may consume the auto-reset work event");
-  ok &= require_contains(evidence_worker, "identity_change_pending",
-                         "a changed pathname object must not reuse an in-flight result");
+  ok &= require_before(evidence_worker,
+                       "if (evidence_find_snapshot_locked(path, generation, now, out, &ready))",
+                       "if (!edr_windows_file_identity_open_readonly(path",
+                       "generation snapshot retrieval must precede any pathname reopen");
+  ok &= require_contains(evidence_worker, "EDR_EVIDENCE_RETAIN_NS",
+                         "burst eviction must preserve snapshots through the coalescer window");
+  ok &= require_before(pipeline,
+                       "if (br.evidence_revision == 0u) br.evidence_revision = 1u;",
+                       "switch (edr_process_coalescer_submit",
+                       "kernel source needs an initial revision without a 4688 merge");
   ok &= require_contains(
       pipeline,
       "strcmp(requested.hash_reason, \"identity_revalidation_pending\") == 0",
