@@ -290,6 +290,11 @@ if(NOT MSVC)
 endif()
 add_test(NAME cmd_actor_and_script_artifact COMMAND test_cmd_actor_artifact)
 
+add_executable(test_file_key_lifetime ${CMAKE_CURRENT_SOURCE_DIR}/test_file_key_lifetime.c)
+target_include_directories(test_file_key_lifetime PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_file_key_lifetime)
+add_test(NAME file_key_lifetime COMMAND test_file_key_lifetime)
+
 add_executable(test_windows_a44_collector_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_a44_collector_contract.c)
 edr_apply_test_warnings(test_windows_a44_collector_contract)
@@ -678,6 +683,24 @@ endif()
 add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 if(EDR_PCRE2_AVAILABLE)
+  add_executable(test_p0_candidate_replay
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_candidate_replay.c
+    ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_p0_candidate_replay PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(test_p0_candidate_replay PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(test_p0_candidate_replay PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(test_p0_candidate_replay PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
+  edr_apply_test_warnings(test_p0_candidate_replay)
+
   add_executable(test_p0_rule_ir_record_golden
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c
     ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}

@@ -26,6 +26,7 @@
 #include "edr/etw_tdh_win.h"
 #include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
+#include "edr/file_key_lifetime.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
@@ -107,8 +108,7 @@ static const EdrConfig *s_collector_cfg;
  * with FILEIO|READ; NameCreate carries the FileKey→FileName binding used to
  * resolve the read payload, which itself intentionally has no filename. */
 #define EDR_KERNEL_FILE_EVENT_NAME_CREATE 10u
-#define EDR_KERNEL_FILE_EVENT_CLEANUP 13u
-#define EDR_KERNEL_FILE_EVENT_CLOSE 14u
+#define EDR_KERNEL_FILE_EVENT_NAME_DELETE 11u
 #define EDR_KERNEL_FILE_EVENT_READ 15u
 #define EDR_KERNEL_FILE_KEYWORD_FILENAME 0x00000010ULL
 #define EDR_KERNEL_FILE_KEYWORD_FILEIO 0x00000020ULL
@@ -161,10 +161,10 @@ typedef struct {
 typedef struct {
   uint64_t file_key;
   uint64_t name_event_ns;
-  /* Cleanup/Close is retained as an event-time upper bound rather than
+  /* NameDelete is retained as an event-time upper bound rather than
    * erasing the binding immediately.  A4.4 can decode an older Read after
-   * the callback has already observed Close and a reused FileKey. */
-  uint64_t close_event_ns;
+   * the callback has already observed NameDelete and a reused FileKey. */
+  uint64_t name_delete_event_ns;
   /* FileKey names are provider-session local facts.  They deliberately do
    * not carry an IR epoch: the Read is evaluated under the current immutable
    * rules snapshot, while this binding remains valid until its ETW interval
@@ -428,13 +428,10 @@ static int edr_kernel_file_read_descriptor(const EVENT_DESCRIPTOR *descriptor) {
                                             EDR_KERNEL_FILE_READ_REQUIRED_KEYWORDS);
 }
 
-static int edr_kernel_file_cleanup_or_close_descriptor(const EVENT_DESCRIPTOR *descriptor) {
-  return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CLEANUP,
-                                            EDR_KERNEL_FILE_EVENT_CLEANUP,
-                                            EDR_KERNEL_FILE_KEYWORD_FILEIO) ||
-         edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CLOSE,
-                                            EDR_KERNEL_FILE_EVENT_CLOSE,
-                                            EDR_KERNEL_FILE_KEYWORD_FILEIO);
+static int edr_kernel_file_name_delete_descriptor(const EVENT_DESCRIPTOR *descriptor) {
+  return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_NAME_DELETE,
+                                            EDR_KERNEL_FILE_EVENT_NAME_DELETE,
+                                            EDR_KERNEL_FILE_KEYWORD_FILENAME);
 }
 
 static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_kind,
@@ -2253,12 +2250,11 @@ static void edr_collector_file_key_cache_purge_locked(uint64_t event_ns) {
   if (event_ns == 0u) return;
   for (size_t i = 0u; i < EDR_COLLECTOR_FILE_KEY_CACHE; ++i) {
     EdrCollectorFileKeyCacheEntry *entry = &s_file_key_cache[i];
-    uint64_t expiry_base;
     if (entry->file_key == 0u || entry->name_event_ns == 0u) {
       continue;
     }
-    expiry_base = entry->close_event_ns ? entry->close_event_ns : entry->name_event_ns;
-    if (event_ns < expiry_base || event_ns - expiry_base <= EDR_COLLECTOR_FILE_KEY_TTL_NS) {
+    if (!edr_file_key_lifetime_expired(entry->name_delete_event_ns, event_ns,
+                                      EDR_COLLECTOR_FILE_KEY_TTL_NS)) {
       continue;
     }
     memset(entry, 0, sizeof(*entry));
@@ -3125,7 +3121,7 @@ static void edr_collector_file_read_metadata_gate_start_succeeded(void) {
 /* Caller holds s_file_key_cache_lock exclusively.  Critical bindings use a
  * dedicated range.  A full critical range is explicit fail-closed pressure;
  * no closed binding is reused before its event-time TTL, because A4.4 may
- * still hold a Read that precedes Close. */
+ * still hold a Read that precedes NameDelete. */
 static EdrCollectorFileKeyCacheEntry *edr_collector_file_key_cache_alloc_locked(int critical) {
   const uint32_t first = critical ? 0u : EDR_COLLECTOR_FILE_KEY_CRITICAL_CACHE;
   const uint32_t count = critical ? EDR_COLLECTOR_FILE_KEY_CRITICAL_CACHE
@@ -3155,15 +3151,16 @@ static int edr_collector_file_key_binding_exact(const EdrCollectorFileKeyCacheEn
                                                 uint64_t session_epoch,
                                                 const char *canonical_path) {
   return entry && entry->file_key == file_key && entry->name_event_ns == event_ns &&
-         entry->session_epoch == session_epoch && entry->close_event_ns == 0u &&
+         entry->session_epoch == session_epoch && entry->name_delete_event_ns == 0u &&
          canonical_path && canonical_path[0] && entry->path[0] &&
          edr_collector_equal_ci(entry->path, canonical_path);
 }
 
-/* NameCreate has the only documented FileName for a later Read.  Preserve a
- * short FileKey history with a Cleanup/Close upper bound: delayed A4.4 decode
+/* NameCreate has the typed FileName for a later Read. Preserve a
+ * short FileKey history with a NameDelete upper bound: delayed A4.4 decode
  * can still resolve an old Read, while a reused FileKey never escapes its
- * original [NameCreate, Cleanup/Close] event-time interval. */
+ * original [NameCreate, NameDelete) event-time interval. Individual
+ * FileObject Cleanup/Close events do not end the shared FileKey name. */
 static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
                                                     uint64_t event_ns) {
   const EVENT_DESCRIPTOR *descriptor;
@@ -3268,7 +3265,7 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     s_health.file_read_name_bindings++;
     return 1;
   }
-  if (edr_kernel_file_cleanup_or_close_descriptor(descriptor)) {
+  if (edr_kernel_file_name_delete_descriptor(descriptor)) {
     if (edr_tdh_kernel_file_extract_file_key((PEVENT_RECORD)record, &file_key) && file_key) {
       EdrCollectorFileKeyCacheEntry *latest = NULL;
       AcquireSRWLockExclusive(&s_file_key_cache_lock);
@@ -3277,14 +3274,14 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
         if (entry->file_key != file_key || entry->session_epoch != s_file_key_session_epoch ||
             !entry->path[0] ||
             entry->name_event_ns > event_ns ||
-            (entry->close_event_ns != 0u && event_ns >= entry->close_event_ns)) {
+            (entry->name_delete_event_ns != 0u && event_ns >= entry->name_delete_event_ns)) {
           continue;
         }
         if (!latest || entry->name_event_ns > latest->name_event_ns) {
           latest = entry;
         }
       }
-      if (latest) latest->close_event_ns = event_ns;
+      if (latest) latest->name_delete_event_ns = event_ns;
       ReleaseSRWLockExclusive(&s_file_key_cache_lock);
     } else {
       s_health.file_read_name_cache_misses++;
@@ -3332,14 +3329,14 @@ static int edr_collector_kernel_file_read_resolve(const EVENT_RECORD *record,
     const EdrCollectorFileKeyCacheEntry *entry = &s_file_key_cache[i];
     if (entry->file_key != file_key || !entry->path[0] ||
         entry->session_epoch != session_epoch ||
-        event_ns < entry->name_event_ns ||
-        event_ns - entry->name_event_ns > EDR_COLLECTOR_FILE_KEY_TTL_NS) {
+        event_ns < entry->name_event_ns) {
       continue;
     }
     /* Equal timestamps have no documented ordering across callbacks, so they
      * cannot resolve a Read against a closed/reused handle.  Preserve the
      * known path only to make the resulting source-only gate attributable. */
-    if (entry->close_event_ns != 0u && event_ns >= entry->close_event_ns) {
+    if (!edr_file_key_lifetime_contains(entry->name_event_ns,
+                                        entry->name_delete_event_ns, event_ns)) {
       if (!have_problem || entry->name_event_ns > best_problem_event_ns) {
         snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
         have_problem = 1;
@@ -4161,7 +4158,7 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     s_health.etw_prefilter_dropped++;
     return;
   }
-  /* NameCreate/Cleanup/Close are metadata-only Kernel-File records.  They
+  /* NameCreate/NameDelete are metadata-only Kernel-File records. They
    * maintain the bounded FileKey path map and must not be misclassified as a
    * behavioral Create/Delete event merely because their localized text has a
    * similar word. */

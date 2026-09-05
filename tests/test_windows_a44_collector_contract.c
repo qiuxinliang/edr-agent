@@ -202,10 +202,14 @@ int main(void) {
                          "NameCreate must provide a typed FileKey/FileName binding");
   ok &= require_contains(collector, "edr_tdh_kernel_file_extract_file_key",
                          "Read must resolve its typed FileKey");
-  ok &= require_contains(collector, "close_event_ns",
-                         "Cleanup/Close must retain an event-time upper bound for FileKey reuse");
-  ok &= require_contains(collector, "event_ns >= entry->close_event_ns",
-                         "a Read at or after Cleanup/Close must not use the old binding");
+  ok &= require_contains(collector, "name_delete_event_ns",
+                         "NameDelete must retain an event-time upper bound for FileKey reuse");
+  ok &= require_contains(collector, "edr_file_key_lifetime_contains(entry->name_event_ns",
+                         "a Read at or after NameDelete must not use the old binding");
+  ok &= require_contains(collector, "EDR_KERNEL_FILE_EVENT_NAME_DELETE 11u",
+                         "name invalidation must use NameDelete, not another handle's Close");
+  ok &= require_absent(collector, "edr_kernel_file_cleanup_or_close_descriptor",
+                       "individual FileObject closure must not invalidate a shared FileKey name");
   ok &= require_contains(collector, "entry->name_event_ns > best_name_event_ns",
                          "FileKey reuse must choose the matching newest event-time binding");
   ok &= require_contains(collector, "edr_collector_file_key_binding_exact",
@@ -309,7 +313,7 @@ int main(void) {
   ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(file_key)",
                          "a malformed metadata binding must invalidate any reused FileKey");
   ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(0u)",
-                         "an unidentifiable close must invalidate the logical FileKey epoch");
+                         "an unidentifiable NameDelete must invalidate the logical FileKey epoch");
   ok &= require_contains(collector, "raw[prefix_len] != '\\\\'",
                          "device-volume mapping must enforce a path-component boundary");
   ok &= require_contains(collector, "entry->session_epoch != session_epoch",
