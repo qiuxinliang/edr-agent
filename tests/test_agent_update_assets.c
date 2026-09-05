@@ -296,6 +296,10 @@ int main(void) {
   contains(command, "updater_info.error_code", "runtime failure reports the exact updater readiness error before download");
   contains(command, "describe_http_download_failure", "download failures preserve the bounded transport diagnostic");
   contains(command, "runtime package download failed", "runtime package errors no longer mislabel every failure as authentication");
+  contains(command, "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1",
+           "readiness reads the exact Inno uninstall registration");
+  contains(command, "KEY_READ | KEY_WOW64_64KEY",
+           "readiness reads the native 64-bit uninstall registry view");
   free(command);
 
   snprintf(path, sizeof(path), "%s/tests/test_agent_update_contract.c", root);

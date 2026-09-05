@@ -8,7 +8,7 @@ static void test_uninstall_identity(void) {
   EdrFullInstallerUninstallIdentity identity = {
       "C:\\Program Files\\FDSecurity\\",
       "\"C:\\Program Files\\FDSecurity\\unins000.exe\" /SILENT",
-      "FDSecurity Endpoint Agent",
+      "FDSecurity version 3.2.424",
       "FDSecurity",
       "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
   assert(edr_full_installer_uninstall_identity_matches(directory, &identity));
@@ -19,9 +19,11 @@ static void test_uninstall_identity(void) {
   identity.uninstall_command = "\"C:\\Temp\\unins000.exe\" /SILENT";
   assert(!edr_full_installer_uninstall_identity_matches(directory, &identity));
   identity.uninstall_command = "\"C:\\Program Files\\FDSecurity\\unins000.exe\" /SILENT";
-  identity.display_name = "FDSecurity Endpoint Agent (forged)";
-  assert(!edr_full_installer_uninstall_identity_matches(directory, &identity));
   identity.display_name = "FDSecurity Endpoint Agent";
+  assert(!edr_full_installer_uninstall_identity_matches(directory, &identity));
+  identity.display_name = "FDSecurity version 3.2.424 forged";
+  assert(!edr_full_installer_uninstall_identity_matches(directory, &identity));
+  identity.display_name = "FDSecurity version 3.2.424";
   identity.publisher = "Unknown";
   assert(!edr_full_installer_uninstall_identity_matches(directory, &identity));
   identity.publisher = "FDSecurity";

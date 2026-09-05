@@ -82,6 +82,23 @@ static int string_contains_ci(const char *haystack, const char *needle) {
   return 0;
 }
 
+static int inno_display_name_matches(const char *display_name) {
+  static const char prefix[] = "FDSecurity version ";
+  const char *cursor;
+  unsigned components = 0u;
+  if (!display_name || strncmp(display_name, prefix, sizeof(prefix) - 1u) != 0) return 0;
+  cursor = display_name + sizeof(prefix) - 1u;
+  for (;;) {
+    const char *digits = cursor;
+    while (isdigit((unsigned char)*cursor)) ++cursor;
+    if (cursor == digits) return 0;
+    ++components;
+    if (*cursor == '\0') return components == 3u;
+    if (*cursor != '.' || components >= 3u) return 0;
+    ++cursor;
+  }
+}
+
 static int code_line_contains_ci(const char *contents, const char *needle) {
   if (!contents || !needle || !needle[0]) return 0;
   const char *line = contents;
@@ -126,7 +143,7 @@ int edr_full_installer_uninstall_identity_matches(
   if (identity->app_id && edr_stricmp(identity->app_id, "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}") != 0) return 0;
   return path_matches(install_directory, identity->install_location) &&
          path_matches(expected_uninstaller, executable) &&
-         edr_stricmp(identity->display_name, "FDSecurity Endpoint Agent") == 0 &&
+         inno_display_name_matches(identity->display_name) &&
          edr_stricmp(identity->publisher, "FDSecurity") == 0;
 }
 

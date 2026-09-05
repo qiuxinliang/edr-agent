@@ -263,24 +263,22 @@ static int read_registry_string(HKEY key, const char *name, char *output, DWORD 
 }
 
 static int uninstall_provenance_matches(const char *directory) {
-  const char *subkeys[] = {
-      "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}",
-      "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
+  const char *subkey =
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+      "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1";
   char uninstaller[2 * MAX_PATH], install[MAX_PATH], display_name[256], publisher[256];
-  for (size_t i = 0; i < sizeof(subkeys) / sizeof(subkeys[0]); ++i) {
-    HKEY key = NULL;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkeys[i], 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
-    int complete = read_registry_string(key, "InstallLocation", install, sizeof(install)) &&
-                   read_registry_string(key, "UninstallString", uninstaller, sizeof(uninstaller)) &&
-                   read_registry_string(key, "DisplayName", display_name, sizeof(display_name)) &&
-                   read_registry_string(key, "Publisher", publisher, sizeof(publisher));
-    RegCloseKey(key);
-    EdrFullInstallerUninstallIdentity identity = {
-        install, uninstaller, display_name, publisher,
-        "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
-    if (complete && edr_full_installer_uninstall_identity_matches(directory, &identity)) return 1;
-  }
-  return 0;
+  HKEY key = NULL;
+  if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0,
+                    KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) return 0;
+  int complete = read_registry_string(key, "InstallLocation", install, sizeof(install)) &&
+                 read_registry_string(key, "UninstallString", uninstaller, sizeof(uninstaller)) &&
+                 read_registry_string(key, "DisplayName", display_name, sizeof(display_name)) &&
+                 read_registry_string(key, "Publisher", publisher, sizeof(publisher));
+  RegCloseKey(key);
+  EdrFullInstallerUninstallIdentity identity = {
+      install, uninstaller, display_name, publisher,
+      "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
+  return complete && edr_full_installer_uninstall_identity_matches(directory, &identity);
 }
 
 static int readiness_regular_file(void *ctx, const char *path) {

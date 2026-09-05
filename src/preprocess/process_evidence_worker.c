@@ -11,9 +11,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <wincrypt.h>
+#include <mscat.h>
 #include <wintrust.h>
 #include <softpub.h>
-#include <wincrypt.h>
 
 #define EDR_EVIDENCE_SLOTS 32u
 #define EDR_EVIDENCE_MAX_BYTES (16ULL * 1024ULL * 1024ULL)
@@ -235,6 +236,85 @@ static int signature_subject_and_thumbprint_from_wvt(HANDLE state, EdrProcessEvi
   return e->signer[0] && e->thumbprint[0];
 }
 
+/* Windows system binaries may be signed through a system catalog rather than
+ * carrying an embedded PKCS#7 blob. Resolve that catalog from the hash of the
+ * same held file object; never reopen the mutable pathname as evidence owner. */
+static LONG verify_catalog_signature(const WCHAR *path, HANDLE file,
+                                     EdrProcessEvidence *e) {
+  HCATADMIN admin = NULL;
+  HCATINFO catalog = NULL;
+  BYTE hash[64];
+  DWORD hash_size = (DWORD)sizeof(hash);
+  WCHAR member_tag[sizeof(hash) * 2u + 1u];
+  CATALOG_INFO catalog_info;
+  WINTRUST_CATALOG_INFO ci;
+  WINTRUST_DATA wd;
+  GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  LONG result = TRUST_E_NOSIGNATURE;
+  LARGE_INTEGER zero;
+
+  memset(&catalog_info, 0, sizeof(catalog_info));
+  memset(&ci, 0, sizeof(ci));
+  memset(&wd, 0, sizeof(wd));
+  zero.QuadPart = 0;
+  if (!path || !file || file == INVALID_HANDLE_VALUE || !e ||
+      !SetFilePointerEx(file, zero, NULL, FILE_BEGIN) ||
+      !CryptCATAdminAcquireContext2(&admin, NULL, L"SHA256", NULL, 0u) ||
+      !CryptCATAdminCalcHashFromFileHandle2(admin, file, &hash_size, hash, 0u) ||
+      hash_size == 0u || hash_size > (DWORD)sizeof(hash)) {
+    goto cleanup;
+  }
+  static const WCHAR hex[] = L"0123456789ABCDEF";
+  for (DWORD i = 0u; i < hash_size; ++i) {
+    member_tag[i * 2u] = hex[hash[i] >> 4];
+    member_tag[i * 2u + 1u] = hex[hash[i] & 15u];
+  }
+  member_tag[hash_size * 2u] = L'\0';
+  catalog = CryptCATAdminEnumCatalogFromHash(admin, hash, hash_size, 0u, NULL);
+  if (!catalog) goto cleanup;
+  catalog_info.cbStruct = sizeof(catalog_info);
+  if (!CryptCATCatalogInfoFromContext(catalog, &catalog_info, 0u)) goto cleanup;
+
+  ci.cbStruct = sizeof(ci);
+  ci.pcwszCatalogFilePath = catalog_info.wszCatalogFile;
+  ci.pcwszMemberTag = member_tag;
+  ci.pcwszMemberFilePath = path;
+  ci.hMemberFile = file;
+  ci.pbCalculatedFileHash = hash;
+  ci.cbCalculatedFileHash = hash_size;
+  ci.hCatAdmin = admin;
+  wd.cbStruct = sizeof(wd);
+  wd.dwUIChoice = WTD_UI_NONE;
+  wd.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+  wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+  wd.pCatalog = &ci;
+  wd.dwProvFlags = WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+                   WTD_CACHE_ONLY_URL_RETRIEVAL;
+  wd.dwStateAction = WTD_STATEACTION_VERIFY;
+  result = WinVerifyTrust(NULL, &action, &wd);
+  if (result == ERROR_SUCCESS) {
+    strcpy(e->revocation, "cache_only");
+    if (signature_subject_and_thumbprint_from_wvt(wd.hWVTStateData, e)) {
+      strcpy(e->signature_status, "verified");
+      strcpy(e->signature_quality, "verified_catalog_cache_chain");
+      strcpy(e->signature_reason, "verified_catalog_cache_only");
+      strcpy(e->signature_source, "WinVerifyTrust_handle_catalog");
+    } else {
+      result = TRUST_E_SUBJECT_NOT_TRUSTED;
+      strcpy(e->signature_status, "unknown");
+      strcpy(e->signature_quality, "unknown");
+      strcpy(e->signature_reason, "catalog_signer_info_not_found");
+    }
+  }
+  wd.dwStateAction = WTD_STATEACTION_CLOSE;
+  (void)WinVerifyTrust(NULL, &action, &wd);
+
+cleanup:
+  if (catalog) CryptCATAdminReleaseCatalogContext(admin, catalog, 0u);
+  if (admin) CryptCATAdminReleaseContext(admin, 0u);
+  return result;
+}
+
 static void evidence_mark_path_or_handle_changed(EdrProcessEvidence *e, const char *reason) {
   if (!e) return;
   e->sha256[0] = '\0';
@@ -305,13 +385,25 @@ static void verify_signature(const char *path, HANDLE file,
         strcpy(e->signature_status,"unknown"); strcpy(e->signature_quality,"unknown"); strcpy(e->signature_reason,"signer_info_not_found");
       }
     }
+    else if (rc == TRUST_E_NOSIGNATURE) {
+      wd.dwStateAction=WTD_STATEACTION_CLOSE;
+      (void)WinVerifyTrust(NULL,&action,&wd);
+      memset(&wd, 0, sizeof(wd));
+      rc = verify_catalog_signature(wide, file, e);
+      if (rc != ERROR_SUCCESS && strcmp(e->signature_reason, "catalog_signer_info_not_found") != 0) {
+        snprintf(e->signature_reason,sizeof(e->signature_reason),"winverifytrust_%08lx",(unsigned long)rc);
+        strcpy(e->revocation,"cache_only_failed");
+      }
+    }
     else {
       snprintf(e->signature_reason,sizeof(e->signature_reason),"winverifytrust_%08lx",(unsigned long)rc);
       if (rc == CERT_E_REVOKED || rc == CRYPT_E_REVOKED) strcpy(e->revocation,"revoked");
       else strcpy(e->revocation,"cache_only_failed");
     }
-    wd.dwStateAction=WTD_STATEACTION_CLOSE;
-    (void)WinVerifyTrust(NULL,&action,&wd);
+    if (wd.cbStruct != 0u) {
+      wd.dwStateAction=WTD_STATEACTION_CLOSE;
+      (void)WinVerifyTrust(NULL,&action,&wd);
+    }
   }
   if (!evidence_path_and_handle_match(path, file, expected_identity, expected_write_time)) {
     evidence_mark_path_or_handle_changed(e, "file_changed_during_wvt");
@@ -366,7 +458,8 @@ static DWORD WINAPI worker(void *unused) {
         if (!evidence_handle_matches(held_file, job.file_identity, job.file_write_time)) {
           evidence_mark_path_or_handle_changed(&job.evidence,
                                                "file_changed_during_verification");
-        } else if (strcmp(job.evidence.hash_quality, "captured") == 0) {
+        } else if (strcmp(job.evidence.hash_quality, "captured") == 0 &&
+                   strcmp(job.evidence.signature_source, "WinVerifyTrust") == 0) {
           strcpy(job.evidence.signature_source, "WinVerifyTrust_handle");
         }
       } else {

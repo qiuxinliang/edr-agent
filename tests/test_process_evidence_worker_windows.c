@@ -263,15 +263,11 @@ static void test_real_windows_snapshot_then_delete(void) {
                                    5000ULL * 1000000ULL, &first));
   assert(strlen(first.sha256) == 64u);
   assert(strcmp(first.hash_quality, "captured") == 0);
-  assert(strcmp(first.signature_source, "WinVerifyTrust_handle") == 0);
-  /* Offline revocation can remain unknown; never turn that into verified. */
-  if (strcmp(first.signature_status, "verified") == 0) {
-    assert(first.signer[0] && first.thumbprint[0]);
-    assert(strcmp(first.revocation, "cache_only") == 0);
-  } else {
-    assert(strcmp(first.signature_status, "unknown") == 0);
-    assert(strncmp(first.signature_reason, "winverifytrust_", 15u) == 0);
-  }
+  assert(strcmp(first.signature_status, "verified") == 0);
+  assert(first.signer[0] && first.thumbprint[0]);
+  assert(strcmp(first.revocation, "cache_only") == 0);
+  assert(strcmp(first.signature_source, "WinVerifyTrust_handle") == 0 ||
+         strcmp(first.signature_source, "WinVerifyTrust_handle_catalog") == 0);
   assert(DeleteFileA(a_path));
   assert(edr_process_evidence_request(a_path, 5001u, edr_monotonic_ns(), &retained));
   assert(memcmp(&first, &retained, sizeof(first)) == 0);

@@ -50,7 +50,7 @@ static int test_identity_matrix(void) {
       "Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd";
   EdrFullInstallerUninstallIdentity uninstall_identity = {
       "C:\\Program Files\\FDSecurity\\", "\"C:\\Program Files\\FDSecurity\\unins000.exe\" /SILENT",
-      "FDSecurity Endpoint Agent", "FDSecurity",
+      "FDSecurity version 3.2.424", "FDSecurity",
       "{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}"};
   if (!edr_full_installer_uninstall_identity_matches(dir, &uninstall_identity)) return 0;
   uninstall_identity.publisher = "Other Publisher";

@@ -343,10 +343,13 @@ int main(void) {
   const char *installed_baseline = getenv("EDR_FULL_INSTALLER_ACCEPTANCE_DIR");
   if (installed_baseline && installed_baseline[0]) {
     memset(readiness_reason, 0, sizeof(readiness_reason));
-    require_true(edr_agent_update_probe_full_installer_baseline(
-                     installed_baseline, readiness_reason,
-                     sizeof(readiness_reason)) &&
-                     strcmp(readiness_reason, "ready") == 0,
+    int installed_ready = edr_agent_update_probe_full_installer_baseline(
+        installed_baseline, readiness_reason, sizeof(readiness_reason));
+    if (!installed_ready || strcmp(readiness_reason, "ready") != 0) {
+      fprintf(stderr, "installed baseline readiness: ready=%d reason=%s\n",
+              installed_ready, readiness_reason);
+    }
+    require_true(installed_ready && strcmp(readiness_reason, "ready") == 0,
                  "real installed Windows baseline is accepted by production adapters");
   }
   for (size_t i = 0; i < sizeof(baseline_files) / sizeof(baseline_files[0]); ++i) {
