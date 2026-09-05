@@ -563,6 +563,17 @@ int main(void) {
            "release lifecycle resolves target drafts from the authenticated release list");
   contains(lifecycle, "Invoke-WebRequest -Uri $apiUrl",
            "release lifecycle downloads draft and published assets through the authenticated asset API");
+  contains(lifecycle, "test_windows_immutable_download.ps1",
+           "release lifecycle executes download failure-path tests before fetching assets");
+  contains(lifecycle, "-ConnectionTimeoutSeconds 30 -OperationTimeoutSeconds 60 -ErrorAction Stop",
+           "release asset download bounds connection and stalled transfer waits");
+  contains(lifecycle, "$attempt -le 4", "release asset transport retries are bounded");
+  contains(lifecycle, "$cause = $cause.InnerException", "download diagnostics retain the TLS cause chain");
+  contains_before(lifecycle, "runtime '$($asset.name)' SHA-256 mismatch", "Move-Item -LiteralPath $partialPath",
+                  "download verifies integrity before replacing the final package");
+  require_true(!strstr(lifecycle, "-SkipCertificateCheck") &&
+               !strstr(lifecycle, "-PreserveAuthorizationOnRedirect"),
+               "download keeps certificate validation and redirect credential stripping enabled");
   contains(lifecycle, "runtime '$($asset.name)' SHA-256 mismatch",
            "release lifecycle verifies the GitHub asset digest when available");
   require_true(!strstr(lifecycle, "actions/download-artifact"),
