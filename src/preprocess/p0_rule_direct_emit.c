@@ -1075,16 +1075,19 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
   if (br->type == EDR_EVENT_FILE_READ) {
 #ifdef _WIN32
     /* Kernel-File Read is P0-eligible only after both the FileKey path and
-     * actor generation have survived exact StartKey/live-creation binding.
-     * A missing extended item or a stale PID is source-only, never a direct
-     * alert/action authority. */
+     * actor generation have survived exact StartKey/creation binding from a
+     * live handle or event-time historical generation. A missing extended
+     * item or an unbound stale PID is source-only, never a direct alert/action
+     * authority. */
     if (!br->file_path[0] || !br->process_start_key ||
         !br->process_creation_filetime_100ns || !br->process_name[0] ||
         !br->exe_path[0] ||
         strcmp(br->image_path_resolution_status, "RESOLVED") != 0 ||
         (strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 &&
          strcmp(br->process_generation_source,
-                "file_read_pid_event_time_live_telemetry") != 0) ||
+                "file_read_pid_event_time_live_telemetry") != 0 &&
+         strcmp(br->process_generation_source,
+                "file_read_process_tree_cache_generation") != 0) ||
         strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) {
       return 0;
     }

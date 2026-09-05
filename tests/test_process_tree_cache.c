@@ -129,6 +129,32 @@ int main(void) {
   }
 
   {
+    /* A delayed FileRead keeps its exited actor generation, while an event
+     * from the reused PID's interval selects only the replacement. */
+    const uint32_t actor_pid = 7200u;
+    uint64_t now = test_wall_ns();
+    uint64_t a_start = now - 700000000ULL;
+    uint64_t read_time = a_start + 100000000ULL;
+    uint64_t a_exit = a_start + 200000000ULL;
+    uint64_t b_start = a_start + 400000000ULL;
+    assert(edr_pt_cache_put_generation(actor_pid, 400u, "reader-A.exe", "A --read",
+                                       "C:/reader-A.exe", "parent.exe", a_start,
+                                       0xa7200u, 133700000000000720ULL) == 0);
+    assert(edr_pt_cache_mark_exit_generation(actor_pid, 0xa7200u, a_exit) == 0);
+    assert(edr_pt_cache_put_generation(actor_pid, 401u, "reader-B.exe", "B --idle",
+                                       "C:/reader-B.exe", "other.exe", b_start,
+                                       0xb7200u, 133700000000000721ULL) == 0);
+    assert(edr_pt_cache_snapshot_at(actor_pid, read_time, &entry) == 0);
+    assert(entry.process_start_key == 0xa7200u);
+    assert(entry.creation_filetime_100ns == 133700000000000720ULL);
+    assert(strcmp(entry.exe_path, "C:/reader-A.exe") == 0);
+    assert(edr_pt_cache_snapshot_at(actor_pid, b_start + 1000000ULL, &entry) == 0);
+    assert(entry.process_start_key == 0xb7200u);
+    assert(strcmp(entry.exe_path, "C:/reader-B.exe") == 0);
+    assert(edr_pt_cache_snapshot_at(actor_pid, a_exit + 1u, &entry) == -2);
+  }
+
+  {
     EdrProcessTreeCacheMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
     edr_pt_cache_get_metrics(&metrics);

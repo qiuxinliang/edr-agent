@@ -476,6 +476,16 @@ int main(void) {
                          "FileRead without an extended StartKey must use the timestamp-bound live tuple");
   ok &= require_contains(direct, "file_read_pid_event_time_live_telemetry",
                          "direct P0 must accept the timestamp-bound live FileRead generation");
+  ok &= require_contains(preprocess, "edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot)",
+                         "short-lived FileRead actors must use an event-time process generation snapshot");
+  ok &= require_contains(preprocess, "source_start_key != snapshot.process_start_key",
+                         "cached FileRead generations must preserve the source StartKey boundary");
+  ok &= require_contains(preprocess, "source_creation != snapshot.creation_filetime_100ns",
+                         "cached FileRead generations must preserve the creation FILETIME boundary");
+  ok &= require_contains(preprocess, "file_read_process_tree_cache_generation",
+                         "preprocess must label an exact historical FileRead generation");
+  ok &= require_contains(direct, "file_read_process_tree_cache_generation",
+                         "direct P0 must accept only the explicit historical FileRead generation source");
   ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" : \"event\"",
                          "typed record mapping must preserve read semantics");
   ok &= require_before(collector, "if (slot->type == EDR_EVENT_FILE_READ) {",

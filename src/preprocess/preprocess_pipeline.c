@@ -347,6 +347,65 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
  * never a creation surrogate. */
 static const char *p0_process_path_basename(const char *path);
 
+/* Kernel-File delivery can trail a short-lived actor's exit.  Recover only
+ * the exact historical generation which contains the source event time; the
+ * cache entry itself must carry both independent generation facts.  This is
+ * deliberately narrower than a PID cache lookup so a reused PID can never
+ * lend its image or command line to an older FileRead. */
+static int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
+                                               uint64_t source_start_key,
+                                               uint64_t source_creation) {
+  ProcessTreeEntry snapshot;
+  uint64_t event_unix_ns;
+  uint64_t creation_unix_ns;
+  if (!br || br->type != EDR_EVENT_FILE_READ || !br->pid || br->event_time_ns <= 0) {
+    return 0;
+  }
+  event_unix_ns = (uint64_t)br->event_time_ns;
+  memset(&snapshot, 0, sizeof(snapshot));
+  if (edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot) != 0 ||
+      !snapshot.process_start_key || !snapshot.creation_filetime_100ns ||
+      !snapshot.start_time_ns || !snapshot.exe_path[0] ||
+      (source_start_key != 0u &&
+       source_start_key != snapshot.process_start_key) ||
+      (source_creation != 0u &&
+       source_creation != snapshot.creation_filetime_100ns)) {
+    return 0;
+  }
+  creation_unix_ns = filetime_100ns_to_unix_ns(snapshot.creation_filetime_100ns);
+  if (!creation_unix_ns || event_unix_ns < creation_unix_ns) {
+    return 0;
+  }
+
+  br->process_start_key = snapshot.process_start_key;
+  br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
+  br->ppid = snapshot.ppid;
+  copy_trunc(br->exe_path, sizeof(br->exe_path), snapshot.exe_path);
+  copy_trunc(br->image_path_canonical, sizeof(br->image_path_canonical),
+             snapshot.exe_path);
+  copy_trunc(br->process_name, sizeof(br->process_name),
+             snapshot.process_name[0]
+                 ? snapshot.process_name
+                 : p0_process_path_basename(snapshot.exe_path));
+  if (!br->cmdline[0] && snapshot.cmdline[0]) {
+    copy_trunc(br->cmdline, sizeof(br->cmdline), snapshot.cmdline);
+    copy_trunc(br->command_line_origin, sizeof(br->command_line_origin),
+               "process_tree_cache_generation");
+  }
+  if (!br->parent_name[0] && snapshot.parent_name[0]) {
+    copy_trunc(br->parent_name, sizeof(br->parent_name), snapshot.parent_name);
+  }
+  copy_trunc(br->image_path_resolution_status,
+             sizeof(br->image_path_resolution_status), "RESOLVED");
+  copy_trunc(br->image_path_resolution_source,
+             sizeof(br->image_path_resolution_source),
+             "process_tree_cache_generation");
+  copy_trunc(br->process_generation_source,
+             sizeof(br->process_generation_source),
+             "file_read_process_tree_cache_generation");
+  return 1;
+}
+
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
@@ -374,6 +433,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   }
   process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
   if (!process) {
+    if (p0_bind_file_read_cached_generation(br, source_start_key,
+                                            source_creation)) {
+      return 1;
+    }
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "live_process_open_failed");
     p0_mark_file_read_collector_evidence(br,
@@ -392,6 +455,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
          live.process_start_key != source_start_key ? "process_start_key_mismatch" :
          (reason[0] ? reason : "live_generation_query_failed"));
     CloseHandle(process);
+    if (p0_bind_file_read_cached_generation(br, source_start_key,
+                                            source_creation)) {
+      return 1;
+    }
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              failure_reason);
     p0_mark_file_read_collector_evidence(
@@ -403,6 +470,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   if (!live.creation_filetime_100ns || observed.QuadPart != live.creation_filetime_100ns ||
       (source_creation != 0u && source_creation != live.creation_filetime_100ns)) {
     CloseHandle(process);
+    if (p0_bind_file_read_cached_generation(br, source_start_key,
+                                            source_creation)) {
+      return 1;
+    }
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "live_creation_filetime_mismatch");
     p0_mark_file_read_collector_evidence(br,
@@ -432,6 +503,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   if (br->type == EDR_EVENT_FILE_READ &&
       (!event_unix_ns || !creation_unix_ns || event_unix_ns < creation_unix_ns)) {
     CloseHandle(process);
+    if (p0_bind_file_read_cached_generation(br, source_start_key,
+                                            source_creation)) {
+      return 1;
+    }
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
              "file_read_live_generation_event_time_mismatch");
     p0_mark_file_read_collector_evidence(
@@ -461,6 +536,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
     if (!edr_windows_process_image_path_utf8(process, actor_path, sizeof(actor_path)) ||
         !actor_path[0]) {
       CloseHandle(process);
+      if (p0_bind_file_read_cached_generation(br, source_start_key,
+                                              source_creation)) {
+        return 1;
+      }
       p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED);
       return 0;
     }
@@ -1161,7 +1240,9 @@ static const char *p0_file_read_unavailable_reason(const EdrBehaviorRecord *br) 
   if (!br->process_creation_filetime_100ns ||
       (strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 &&
        strcmp(br->process_generation_source,
-              "file_read_pid_event_time_live_telemetry") != 0)) {
+              "file_read_pid_event_time_live_telemetry") != 0 &&
+       strcmp(br->process_generation_source,
+              "file_read_process_tree_cache_generation") != 0)) {
     return p0_file_read_live_generation_reason(br->process_generation_source);
   }
   return NULL;
@@ -1449,8 +1530,9 @@ static void process_one_slot(const EdrEventSlot *slot) {
       return;
     }
     /* File reads are tied to the actor only after a live StartKey/creation
-     * tuple agrees with an available ETW StartKey, or the event timestamp
-     * proves that the queried live PID generation already existed. */
+     * tuple agrees with an available ETW StartKey, the event timestamp proves
+     * that the queried live PID generation already existed, or the same event
+     * time selects an exact retained StartKey/FILETIME generation. */
     (void)p0_bind_process_generation(&br);
   }
 #endif
