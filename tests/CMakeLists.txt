@@ -67,9 +67,9 @@ edr_apply_test_warnings(test_response_forensic_paths)
 add_test(NAME response_forensic_path_contract COMMAND test_response_forensic_paths
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+# The test embeds the implementation for Win32 error/readback injection.
 add_executable(test_response_file_security
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_response_file_security.c
-  ${CMAKE_SOURCE_DIR}/src/response/response_file_security.c)
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_response_file_security.c)
 target_include_directories(test_response_file_security PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_test_warnings(test_response_file_security)
 if(WIN32)

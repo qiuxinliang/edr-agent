@@ -6,38 +6,81 @@
 #include <windows.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <stdio.h>
+
+static int security_failure(const char *stage, DWORD error) {
+  fprintf(stderr, "response_file_security: stage=%s win32_error=%lu\n", stage, (unsigned long)error);
+  SetLastError(error);
+  return -1;
+}
+
+static int dacl_matches(const char *actual, const char *expected) {
+  PSECURITY_DESCRIPTOR descriptors[2] = {NULL, NULL};
+  PACL acls[2] = {NULL, NULL};
+  SECURITY_DESCRIPTOR_CONTROL controls[2] = {0, 0};
+  const char *texts[2] = {actual, expected};
+  int matches = 0;
+  for (int i = 0; i < 2; ++i) {
+    BOOL present = FALSE, defaulted = FALSE;
+    DWORD revision = 0;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(texts[i], SDDL_REVISION_1, &descriptors[i], NULL) ||
+        !GetSecurityDescriptorControl(descriptors[i], &controls[i], &revision) ||
+        !GetSecurityDescriptorDacl(descriptors[i], &present, &acls[i], &defaulted) ||
+        !present || !acls[i] || !IsValidAcl(acls[i])) goto done;
+  }
+  /* SetNamedSecurityInfo can add AI bookkeeping. Do not compare SDDL spelling,
+     but retain inheritance protection and every ordered ACE byte (including
+     type, mask, SID and inheritance flags). Null/absent DACLs never match. */
+  if ((controls[0] & SE_DACL_PROTECTED) != (controls[1] & SE_DACL_PROTECTED) ||
+      acls[0]->AceCount != acls[1]->AceCount) goto done;
+  for (DWORD i = 0; i < acls[0]->AceCount; ++i) {
+    ACE_HEADER *a = NULL, *b = NULL;
+    if (!GetAce(acls[0], i, (LPVOID *)&a) || !GetAce(acls[1], i, (LPVOID *)&b) ||
+        a->AceSize != b->AceSize || memcmp(a, b, a->AceSize) != 0) goto done;
+  }
+  matches = 1;
+done:
+  if (descriptors[0]) LocalFree(descriptors[0]);
+  if (descriptors[1]) LocalFree(descriptors[1]);
+  return matches;
+}
 
 static int read_dacl(const char *path, char *out, size_t cap) {
   DWORD required = 0;
   GetFileSecurityA(path, DACL_SECURITY_INFORMATION, NULL, 0, &required);
-  if (!required || required > 65536u) return -1;
+  if (!required) return security_failure("read-dacl-size", GetLastError());
+  if (required > 65536u) return security_failure("read-dacl-size", ERROR_INSUFFICIENT_BUFFER);
   PSECURITY_DESCRIPTOR sd = (PSECURITY_DESCRIPTOR)malloc(required);
+  if (!sd) return security_failure("read-dacl-allocate", ERROR_NOT_ENOUGH_MEMORY);
   LPSTR text = NULL;
-  int ok = sd && GetFileSecurityA(path, DACL_SECURITY_INFORMATION, sd, required, &required) &&
+  int ok = GetFileSecurityA(path, DACL_SECURITY_INFORMATION, sd, required, &required) &&
       ConvertSecurityDescriptorToStringSecurityDescriptorA(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, NULL);
+  DWORD error = ok ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
   if (ok && strlen(text) < cap) memcpy(out, text, strlen(text) + 1u);
   else ok = 0;
   if (text) LocalFree(text);
   free(sd);
-  return ok ? 0 : -1;
+  return ok ? 0 : security_failure("read-dacl", error);
 }
 
 static int apply_dacl(const char *path, const char *text) {
   PSECURITY_DESCRIPTOR sd = NULL;
   PACL dacl = NULL;
   BOOL present = FALSE, defaulted = FALSE;
-  SECURITY_DESCRIPTOR_CONTROL control;
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
-  if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(text, SDDL_REVISION_1, &sd, NULL)) return -1;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(text, SDDL_REVISION_1, &sd, NULL))
+    return security_failure("parse-dacl", GetLastError());
   int ok = GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl &&
       GetSecurityDescriptorControl(sd, &control, &revision);
+  DWORD error = ERROR_INVALID_SECURITY_DESCR;
   if (ok) {
     SECURITY_INFORMATION info = DACL_SECURITY_INFORMATION |
         ((control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION);
-    ok = SetNamedSecurityInfoA((LPSTR)path, SE_FILE_OBJECT, info, NULL, NULL, dacl, NULL) == ERROR_SUCCESS;
+    error = SetNamedSecurityInfoA((LPSTR)path, SE_FILE_OBJECT, info, NULL, NULL, dacl, NULL);
   }
   LocalFree(sd);
-  return ok ? 0 : -1;
+  return error == ERROR_SUCCESS ? 0 : security_failure("set-dacl", error);
 }
 
 int response_file_security_snapshot(const char *path, EdrResponseFileSecurity *out) {
@@ -63,10 +106,14 @@ int response_file_security_lock(const char *path, int directory) {
       (!!(attr & FILE_ATTRIBUTE_DIRECTORY) != !!directory)) return -1;
   const char *dacl = directory ? "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)" : "D:P(A;;FA;;;BA)(A;;FA;;;SY)";
   char actual[8192];
-  if (apply_dacl(path, dacl) != 0 || read_dacl(path, actual, sizeof(actual)) != 0 || strcmp(actual, dacl) != 0) return -1;
+  if (apply_dacl(path, dacl) != 0 || read_dacl(path, actual, sizeof(actual)) != 0) return -1;
+  if (!dacl_matches(actual, dacl)) return security_failure("lock-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
   if (!directory) {
     DWORD wanted = (attr & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
-    if (!SetFileAttributesA(path, wanted) || GetFileAttributesA(path) != wanted) return -1;
+    if (!SetFileAttributesA(path, wanted)) return security_failure("lock-set-attributes", GetLastError());
+    DWORD observed = GetFileAttributesA(path);
+    if (observed == INVALID_FILE_ATTRIBUTES) return security_failure("lock-read-attributes", GetLastError());
+    if (observed != wanted) return security_failure("lock-verify-attributes", ERROR_INVALID_DATA);
   }
   return 0;
 }
@@ -75,9 +122,14 @@ int response_file_security_restore(const char *path, const EdrResponseFileSecuri
   char actual[8192];
   DWORD attr = GetFileAttributesA(path);
   if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) return -1;
-  if (!saved || !saved->dacl[0] || apply_dacl(path, saved->dacl) != 0 ||
-      !SetFileAttributesA(path, saved->attributes) || GetFileAttributesA(path) != saved->attributes ||
-      read_dacl(path, actual, sizeof(actual)) != 0 || strcmp(actual, saved->dacl) != 0) return -1;
+  if (!saved || !saved->dacl[0]) return security_failure("restore-snapshot", ERROR_INVALID_PARAMETER);
+  if (apply_dacl(path, saved->dacl) != 0) return -1;
+  if (!SetFileAttributesA(path, saved->attributes)) return security_failure("restore-set-attributes", GetLastError());
+  DWORD observed = GetFileAttributesA(path);
+  if (observed == INVALID_FILE_ATTRIBUTES) return security_failure("restore-read-attributes", GetLastError());
+  if (observed != saved->attributes) return security_failure("restore-verify-attributes", ERROR_INVALID_DATA);
+  if (read_dacl(path, actual, sizeof(actual)) != 0) return -1;
+  if (!dacl_matches(actual, saved->dacl)) return security_failure("restore-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
   return 0;
 }
 
