@@ -35,6 +35,7 @@
 #include "edr/process_evidence_worker.h"
 #include "edr/process_generation.h"
 #include "edr/windows_file_identity.h"
+#include "edr/file_read_deferred.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -77,6 +78,7 @@ typedef struct {
 } EdrP0TokenIdentityCacheEntry;
 static EdrP0TokenIdentityCacheEntry s_p0_token_identity_cache[EDR_P0_TOKEN_IDENTITY_CACHE];
 static uint32_t s_p0_token_identity_next;
+static EdrFileReadDeferred s_file_read_deferred;
 #endif
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 endpoint_id 一致） */
@@ -343,6 +345,8 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
  * Kernel-File actor events use that key when the provider exposes it; the
  * ARM64 schema may omit it. EventHeader.TimeStamp remains event time and is
  * never a creation surrogate. */
+static const char *p0_process_path_basename(const char *path);
+
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
@@ -448,6 +452,23 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
       snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
                "live_same_generation_unavailable");
     }
+  }
+  if (br->type == EDR_EVENT_FILE_READ) {
+    char actor_path[EDR_BR_STR_LONG];
+    /* The same handle already proved PID, StartKey, FILETIME and event-time
+     * order. A collector-cache miss must not leave a valid actor unnamed,
+     * nor may the target file path be substituted for its executable. */
+    if (!edr_windows_process_image_path_utf8(process, actor_path, sizeof(actor_path)) ||
+        !actor_path[0]) {
+      CloseHandle(process);
+      p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED);
+      return 0;
+    }
+    copy_trunc(br->exe_path, sizeof(br->exe_path), actor_path);
+    copy_trunc(br->image_path_canonical, sizeof(br->image_path_canonical), actor_path);
+    copy_trunc(br->process_name, sizeof(br->process_name), p0_process_path_basename(actor_path));
+    copy_trunc(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "RESOLVED");
+    copy_trunc(br->image_path_resolution_source, sizeof(br->image_path_resolution_source), "live_same_generation");
   }
   CloseHandle(process);
   br->process_start_key = live.process_start_key;
@@ -1131,10 +1152,11 @@ static int p0_process_collector_evidence_gate(EdrBehaviorRecord *br) {
 #ifdef _WIN32
 static const char *p0_file_read_unavailable_reason(const EdrBehaviorRecord *br) {
   if (!br || br->type != EDR_EVENT_FILE_READ || br->collector_evidence_gate[0]) return NULL;
-  if (!br->file_path[0] || !br->image_path_canonical[0] ||
-      strcmp(br->image_path_resolution_status, "RESOLVED") != 0) {
+  if (!br->file_path[0]) {
     return EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
   }
+  if (!br->image_path_canonical[0] || strcmp(br->image_path_resolution_status, "RESOLVED") != 0)
+    return EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED;
   if (!br->process_start_key) return EDR_P0_FILE_READ_REASON_START_KEY_MISSING;
   if (!br->process_creation_filetime_100ns ||
       (strcmp(br->process_generation_source, "etw_start_key_live_telemetry") != 0 &&
@@ -1144,7 +1166,27 @@ static const char *p0_file_read_unavailable_reason(const EdrBehaviorRecord *br) 
   }
   return NULL;
 }
+
+static int p0_file_read_evaluation_ready(void) {
+  return edr_collector_file_read_p0_capability_healthy() &&
+         edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_FILE_READ, NULL, 0u);
+}
+
+static void p0_file_read_deferred_observe(const EdrBehaviorRecord *br, const char *outcome) {
+  uint64_t total = s_file_read_deferred.admitted + s_file_read_deferred.rejected +
+                   s_file_read_deferred.released + s_file_read_deferred.expired;
+  edr_p0_rule_observe_validation_stage(br, "file_read_deferred", outcome);
+  if (total <= 8u || (total & 127u) == 0u) {
+    fprintf(stderr, "[FileRead] deferred=%u admitted=%llu released=%llu expired=%llu rejected=%llu outcome=%s event=%s pid=%u\n",
+            s_file_read_deferred.count, (unsigned long long)s_file_read_deferred.admitted,
+            (unsigned long long)s_file_read_deferred.released,
+            (unsigned long long)s_file_read_deferred.expired,
+            (unsigned long long)s_file_read_deferred.rejected, outcome, br->event_id, br->pid);
+  }
+}
 #endif
+
+static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
 
 static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   if (slot && slot->attack_surface_hint) {
@@ -1203,6 +1245,30 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
       return;
     }
   }
+#ifdef _WIN32
+  if (br.type == EDR_EVENT_FILE_READ && !p0_file_read_evaluation_ready()) {
+    /* Reserve this bounded wait for signed-IR path interest. Ordinary reads
+     * retain the existing local-evidence path and cannot evict P0 candidates. */
+    if (!edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)) {
+      edr_local_evidence_cache_record_behavior(&br);
+      return;
+    }
+    if (edr_file_read_deferred_push(&s_file_read_deferred, &br, edr_monotonic_ns())) {
+      p0_file_read_deferred_observe(&br, "held");
+    } else {
+      p0_file_read_deferred_observe(&br, "capacity_unavailable");
+      p0_mark_file_read_collector_evidence(&br, EDR_P0_FILE_READ_REASON_DEFERRED_CAPACITY);
+      (void)p0_process_collector_evidence_gate(&br);
+    }
+    return;
+  }
+#endif
+  process_ready_record(br, slot);
+}
+
+/* Deferred reads arrive here with their original validated actor/path tuple.
+ * Do not re-open a PID or replace it with a later occupant after the wait. */
+static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   /* AGT-010: low-priority records can be shed only after all fields on which
    * P0 matching depends have been enriched and the active IR has proved a
    * miss.  Inotify intentionally uses priority=1; doing this before parent
@@ -1257,6 +1323,27 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   emit_behavior_record(&br);
 }
 
+static void process_pending_file_reads(int stopping) {
+#ifdef _WIN32
+  EdrBehaviorRecord ready;
+  int result;
+  while ((result = edr_file_read_deferred_pop(&s_file_read_deferred, edr_monotonic_ns(),
+                                              p0_file_read_evaluation_ready(), stopping, &ready)) != 0) {
+    if (result == 1) {
+      p0_file_read_deferred_observe(&ready, "released");
+      process_ready_record(ready, NULL);
+    } else {
+      p0_file_read_deferred_observe(&ready, stopping ? "shutdown" : "timeout");
+      p0_mark_file_read_collector_evidence(&ready, stopping ? EDR_P0_FILE_READ_REASON_DEFERRED_SHUTDOWN
+                                                         : EDR_P0_FILE_READ_REASON_DEFERRED_TIMEOUT);
+      (void)p0_process_collector_evidence_gate(&ready);
+    }
+  }
+#else
+  (void)stopping;
+#endif
+}
+
 static void process_pending_process_creates(void) {
 #ifdef _WIN32
   EdrBehaviorRecord ready;
@@ -1293,6 +1380,7 @@ static void poll_p0_source_only_durable_retry(void) {
   /* A retry may have just committed the restart-loss audit (or the final
    * retained source assertion). Re-evaluate the latch only after that commit. */
   (void)edr_p0_rule_source_only_recover_after_queue_open();
+  process_pending_file_reads(0);
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {
@@ -1390,6 +1478,7 @@ static void *preprocess_main(void *arg) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
       }
+      process_pending_file_reads(1);
       poll_p0_source_only_durable_retry();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
@@ -1456,6 +1545,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
 #ifdef _WIN32
+  memset(&s_file_read_deferred, 0, sizeof(s_file_read_deferred));
   s_stop_preprocess = 0;
   s_thread = CreateThread(NULL, 0, preprocess_main, NULL, 0, NULL);
   if (!s_thread) {

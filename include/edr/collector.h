@@ -223,6 +223,7 @@ void edr_collector_register_policy_canary_process(uint32_t pid, const char *comm
  * committed record, 2 for a retained source-only retry owner, and 0 for an
  * unhealthy/lost admission that must keep FileRead P0 disabled. */
 void edr_collector_file_read_metadata_gate_retry(void);
+int edr_collector_file_read_p0_capability_healthy(void);
 void edr_collector_file_read_metadata_gate_delivery_result(const char *event_id,
                                                             int outcome);
 /* The Agent lifecycle owns the stop/join/start orchestration.  The collector

@@ -2349,7 +2349,7 @@ static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth
   ReleaseSRWLockShared(&s_file_read_metadata_gate_lock);
 }
 
-static int edr_collector_file_read_p0_capability_healthy(void) {
+int edr_collector_file_read_p0_capability_healthy(void) {
   int healthy;
   AcquireSRWLockShared(&s_file_read_metadata_gate_lock);
   /* DEGRADED admits only FileReads which resolve a complete new-session
@@ -3562,7 +3562,8 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
                                        "etw_process_start_key_unavailable");
     if (is_kernel_file_read) {
       s_health.file_read_generation_unavailable++;
-      (void)edr_collector_slot_append_kv(slot, "source_completeness", "NOT_EVALUABLE");
+      /* Preprocess still has the documented live PID/event-time binding
+       * path. Absence of an optional ETW item is not a terminal disposition. */
       (void)edr_collector_slot_append_kv(slot, "file_read_generation_quality",
                                          "process_start_key_unavailable");
     }
@@ -3593,7 +3594,8 @@ static void edr_collector_file_read_writeback_actor(EdrEventSlot *slot,
   if (!slot || !br || slot->type != EDR_EVENT_FILE_READ) return;
   if (!br->process_start_key || !br->process_name[0] || !br->exe_path[0]) {
     s_health.file_read_actor_generation_unavailable++;
-    (void)edr_collector_slot_append_kv(slot, "source_completeness", "NOT_EVALUABLE");
+    /* This cache miss is provisional. Preprocess must query the already
+     * validated live actor handle or emit a precise source-only failure. */
     (void)edr_collector_slot_append_kv(slot, "file_read_actor_quality",
                                        "actor_generation_unavailable");
     return;
@@ -3957,15 +3959,13 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                               : EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
     return;
   }
-  /* An exact new-session NameCreate->Read may arrive while an older
-   * source-only assertion is pending. Resolve it first so it can become
-   * recovery evidence, then keep the Read itself paused until that assertion
-   * is durable. This never admits an unbound Read. */
+  /* Preserve a resolved Read through admission and live actor capture even
+   * when an older assertion is pending. Preprocess holds its owned record
+   * before any rule evaluation until BOTH durable and collector gates clear. */
   if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy()) {
     AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
     s_health.file_read_metadata_gate_paused_events++;
     ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);
-    return;
   }
   if (ty == EDR_EVENT_PROCESS_CREATE || ty == EDR_EVENT_PROCESS_TERMINATE) {
     edr_pmfe_on_process_lifecycle_hint();

@@ -295,6 +295,11 @@ target_include_directories(test_file_key_lifetime PRIVATE ${CMAKE_SOURCE_DIR}/in
 edr_apply_test_warnings(test_file_key_lifetime)
 add_test(NAME file_key_lifetime COMMAND test_file_key_lifetime)
 
+add_executable(test_file_read_deferred ${CMAKE_CURRENT_SOURCE_DIR}/test_file_read_deferred.c)
+target_include_directories(test_file_read_deferred PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_file_read_deferred)
+add_test(NAME file_read_deferred COMMAND test_file_read_deferred)
+
 add_executable(test_windows_a44_collector_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_a44_collector_contract.c)
 edr_apply_test_warnings(test_windows_a44_collector_contract)

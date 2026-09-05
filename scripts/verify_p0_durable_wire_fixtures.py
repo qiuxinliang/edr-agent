@@ -44,24 +44,36 @@ FIXTURE_GENERATOR_COMMAND = (
     "python3 edr-agent/scripts/verify_p0_durable_wire_fixtures.py "
     "--emitter <compiled-test_p0_source_only_durable_contract> --regenerate"
 )
-SOURCE_FIXTURE_CASE_COUNT = 20
+SOURCE_FIXTURE_CASE_COUNT = 24
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
-# One reviewed source-contract expansion: keep the legacy aggregate reason for
-# queued <=3.2.408 events and add precise causes for new collectors. The
-# regeneration gate permits exactly these two additions, with every previous
+# Reviewed source-contract expansion: explicit actor-image and deferred-read
+# failure records. The regeneration gate permits exactly these four additions,
+# with every previous
 # semantic ID retained in order; it is not a general fixture-drift bypass.
 APPROVED_SOURCE_SEMANTIC_ADDITIONS = (
     (
         "collector_evidence_gate", "file_read",
-        "filemeta-critical-capacity-0001",
-        "file_read_critical_binding_capacity_exhausted", "",
+        "filemeta-actor-image-0001",
+        "file_read_actor_image_unresolved", "",
         "P0_FILE_READ_METADATA_GATE", None,
     ),
     (
         "collector_evidence_gate", "file_read",
-        "filemeta-file-key-ambiguous-0001",
-        "file_read_file_key_ambiguous", "",
+        "filemeta-deferred-full-0001",
+        "file_read_deferred_capacity_exhausted", "",
+        "P0_FILE_READ_METADATA_GATE", None,
+    ),
+    (
+        "collector_evidence_gate", "file_read",
+        "filemeta-deferred-timeout-0001",
+        "file_read_deferred_timeout", "",
+        "P0_FILE_READ_METADATA_GATE", None,
+    ),
+    (
+        "collector_evidence_gate", "file_read",
+        "filemeta-deferred-stop-0001",
+        "file_read_deferred_shutdown", "",
         "P0_FILE_READ_METADATA_GATE", None,
     ),
 )
@@ -73,7 +85,7 @@ APPROVED_SOURCE_SEMANTIC_ADDITIONS = (
 # terminal manifest hash pair may be regenerated.
 APPROVED_TERMINAL_SEMANTIC_TRANSITION = {
     "reason": "append source_fields_truncated",
-    "source_semantic_manifest_sha256": "3f804065d8364871c4a3ed9fbb94c3fc5293e71b3b69be004a3f9d592b434ca3",
+    "source_semantic_manifest_sha256": "87405108fd86cc1b628ed1a1655b41fa7c449ede856085ae9edc090c9b7144c9",
     "terminal_before_sha256": "209edf89d42ac7c5ec1c1f7ec8fde19f148b30948024e234a835491295c66c6c",
     "terminal_after_sha256": "64803237e7d13f29ea9c99d617f170a6f7fa71cbab9003ba19c869a39f5098dc",
     "terminal_authority_identity_sha256": "6313248207c7861b900a3071dad4850b5e63edc33fe0d5d3e4a20e7f2447f526",
@@ -364,7 +376,7 @@ def require_same_semantic_ids(emitted_source: dict[str, Any], source_fixture: di
             raise FixtureError(
                 "Agent source fixture semantic IDs changed; update the C contract intentionally before regeneration"
             )
-        transition_notes.append("split FileRead metadata backpressure causes")
+        transition_notes.append("retain deferred FileRead evidence")
     approval = APPROVED_TERMINAL_SEMANTIC_TRANSITION
     if terminal_before != terminal_after:
         if (not allow_approved_transition or

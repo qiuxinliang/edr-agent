@@ -790,9 +790,9 @@ class PCRE2CMakeGateTests(unittest.TestCase):
                 item.get("loss_detected"),
             ) not in additions
         ]
-        self.assertEqual(len(source_fixture["fixtures"]), len(before["fixtures"]) + 2)
+        self.assertEqual(len(source_fixture["fixtures"]), len(before["fixtures"]) + 4)
         self.assertEqual(
-            "split FileRead metadata backpressure causes",
+            "retain deferred FileRead evidence",
             FIXTURE_GATE.require_same_semantic_ids(
                 source_fixture, before, terminal_fixture, terminal_fixture,
                 allow_approved_transition=True,

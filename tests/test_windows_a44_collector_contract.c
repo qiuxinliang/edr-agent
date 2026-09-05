@@ -241,7 +241,23 @@ int main(void) {
       "static VOID WINAPI edr_event_record_callback(",
       "edr_collector_kernel_file_read_resolve(",
       "if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy())",
-      "decode must resolve an exact FileKey NameCreate binding before the pending-gate drop");
+      "decode must resolve an exact FileKey NameCreate binding before observing gate state");
+  ok &= require_contains(collector,
+      "Preprocess holds its owned record",
+      "resolved FileReads must be retained through live actor capture while the gate waits");
+  ok &= require_absent(collector,
+      "s_health.file_read_metadata_gate_paused_events++;\n    ReleaseSRWLockExclusive(&s_file_read_metadata_gate_lock);\n    return;\n  }\n  if (ty",
+      "resolved FileReads must not disappear in the collector pending-gate branch");
+  ok &= require_contains(preprocess, "edr_windows_process_image_path_utf8(process, actor_path",
+      "FileRead actor path must be queried from the same validated live handle");
+  ok &= require_contains(preprocess, "edr_file_read_deferred_push(&s_file_read_deferred, &br",
+      "FileRead waits must retain the owned validated record");
+  ok &= require_contains(preprocess, "edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_FILE_READ",
+      "deferred FileReads must also wait for the durable event-family gate");
+  ok &= require_contains(preprocess, "process_pending_file_reads(1);",
+      "shutdown must flush deferred reads through durable source-only handling");
+  ok &= require_contains(preprocess, "EDR_P0_FILE_READ_REASON_DEFERRED_TIMEOUT",
+      "expired reads must be source-only rather than silently dropped or evaluated");
   ok &= require_absent_in_function(
       collector, "static VOID WINAPI edr_event_record_callback(",
       "static DWORD WINAPI edr_etw_consumer_thread(",

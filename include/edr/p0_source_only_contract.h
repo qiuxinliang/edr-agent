@@ -37,6 +37,10 @@
   "file_read_event_time_unavailable"
 #define EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE \
   "file_read_event_bus_unavailable"
+#define EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED "file_read_actor_image_unresolved"
+#define EDR_P0_FILE_READ_REASON_DEFERRED_CAPACITY "file_read_deferred_capacity_exhausted"
+#define EDR_P0_FILE_READ_REASON_DEFERRED_TIMEOUT "file_read_deferred_timeout"
+#define EDR_P0_FILE_READ_REASON_DEFERRED_SHUTDOWN "file_read_deferred_shutdown"
 
 typedef enum EdrP0SourceOnlyStage {
   EDR_P0_SOURCE_ONLY_STAGE_INVALID = 0,
@@ -111,7 +115,11 @@ typedef struct EdrP0SourceOnlyReason {
   X(EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED, "canonical_path") \
   X(EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE, "payload") \
   X(EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE, "event_time_ns") \
-  X(EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE, "event_bus")
+  X(EDR_P0_FILE_READ_REASON_EVENT_BUS_UNAVAILABLE, "event_bus") \
+  X(EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED, "actor_image") \
+  X(EDR_P0_FILE_READ_REASON_DEFERRED_CAPACITY, "deferred_queue") \
+  X(EDR_P0_FILE_READ_REASON_DEFERRED_TIMEOUT, "deferred_queue") \
+  X(EDR_P0_FILE_READ_REASON_DEFERRED_SHUTDOWN, "deferred_queue")
 
 #define EDR_P0_SOURCE_ONLY_DELIVERY_REASONS(X) \
   X("pending_assertion_lost_on_restart")
