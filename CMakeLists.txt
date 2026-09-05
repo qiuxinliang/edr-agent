@@ -556,6 +556,7 @@ set(EDR_AGENT_SOURCES
   src/command/sha256.c
   src/response/response_actions.c
   src/response/response_file.c
+  src/response/response_file_security.c
   src/response/response_forensic.c
   src/response/response_utils.c
   src/forensic/deep_collector.c

@@ -37,4 +37,9 @@ int edr_process_command_line_query_live(void *native_process_handle,
                                         char *out, size_t out_cap,
                                         char *reason, size_t reason_cap);
 
+/* Bind termination to the observed creation FILETIME and confirm exit using
+ * the same OS process handle. No PID-only fallback is permitted. */
+int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,
+                                  uint32_t timeout_ms, char *reason, size_t reason_cap);
+
 #endif

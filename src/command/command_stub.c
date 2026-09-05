@@ -33,6 +33,8 @@
 #include "edr/policy_v2.h"
 #include "edr/preprocess.h"
 #include "edr/response.h"
+#include "edr/response_utils.h"
+#include "edr/process_generation.h"
 #include "edr/resource.h"
 #include "edr/transport_v2.h"
 #include "edr/self_protect.h"
@@ -68,6 +70,9 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <mscat.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #pragma comment(lib, "wintrust.lib")
 #else
 #include <arpa/inet.h>
@@ -1115,112 +1120,35 @@ static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size
 static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
   if (!dangerous_enabled()) {
     s_rejected++;
-    audit_both(cmd_id, "reject kill: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
-  long pid;
-  if (parse_pid_json(pl, len, &pid) != 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "kill: payload 无有效 pid（JSON 示例 {\"pid\":1234}）");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid payload");
-    return;
-  }
-  if (!kill_pid_allowed(pid)) {
+  long pid = 0;
+  char creation[32];
+  if (parse_pid_json(pl, len, &pid) != 0 ||
+      parse_json_string_field(pl, len, "process_creation_filetime_100ns", creation, sizeof(creation)) != 0 ||
+      !creation[0] || strspn(creation, "0123456789") != strlen(creation)) {
     s_rejected++;
-    audit_both(cmd_id, "kill: pid 不在 EDR_CMD_KILL_ALLOWLIST 中");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 7, "pid not in allowlist");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 2, "observed process creation time is required");
     return;
   }
-#ifdef _WIN32
-  if ((DWORD)pid == GetCurrentProcessId()) {
+  errno = 0;
+  unsigned long long expected = strtoull(creation, NULL, 10);
+  if (errno || !expected || !kill_pid_allowed(pid)) {
     s_rejected++;
-    audit_both(cmd_id, "kill: 拒绝结束本进程");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 5, "refuse self");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 7, "invalid process identity or pid not in allowlist");
     return;
   }
-  {
-    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)pid);
-    if (!h) {
-      s_exec_fail++;
-      audit_both(cmd_id, "kill: OpenProcess 失败");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "OpenProcess failed");
-      return;
-    }
-    BOOL ok = TerminateProcess(h, 1);
-    CloseHandle(h);
-    if (ok) {
-      s_exec_ok++;
-      audit_both(cmd_id, "kill: TerminateProcess 已执行");
-      soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "TerminateProcess ok");
-    } else {
-      s_exec_fail++;
-      audit_both(cmd_id, "kill: TerminateProcess 失败");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "TerminateProcess failed");
-    }
-  }
-#else
-  if (pid == (long)getpid()) {
-    s_rejected++;
-    audit_both(cmd_id, "kill: 拒绝结束本进程");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 5, "refuse self");
-    return;
-  }
-  /* SIGTERM 优雅终止 → 宽限期确认 → 仍存活则升级 SIGKILL。
-     避免进程 trap/忽略 SIGTERM 后存活、却被报成功(假成功)。 */
-  if (kill((pid_t)pid, SIGTERM) != 0) {
-    if (errno == ESRCH) {
-      s_exec_ok++;
-      audit_both(cmd_id, "kill: 进程不存在(视为已终止)");
-      soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "process already gone");
-    } else {
-      s_exec_fail++;
-      audit_both(cmd_id, "kill: kill() 失败");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 6, "kill() failed");
-    }
-    return;
-  }
-  int gone = 0;
-  for (int i = 0; i < 20; i++) { /* 最多 ~2s 等待优雅退出 */
-    struct timespec ts = {0, 100L * 1000L * 1000L};
-    nanosleep(&ts, NULL);
-    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
-      gone = 1;
-      break;
-    }
-  }
-  if (gone) {
-    s_exec_ok++;
-    audit_both(cmd_id, "kill: SIGTERM 后进程已退出");
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "terminated via SIGTERM");
-    return;
-  }
-  /* 仍存活 → 强制 SIGKILL。 */
-  if (kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
+  char reason[160];
+  if (!edr_process_terminate_checked((uint32_t)pid, (uint64_t)expected, 5000u, reason, sizeof(reason))) {
     s_exec_fail++;
-    audit_both(cmd_id, "kill: SIGKILL 失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 8, "SIGKILL failed");
+    audit_both(cmd_id, reason);
+    soar_emit(cmd_id, sm, strcmp(reason, "process_generation_mismatch") == 0 ? EdrCmdExecRejected : EdrCmdExecFailed, 4, reason);
     return;
   }
-  for (int i = 0; i < 10; i++) { /* 最多 ~1s 确认 SIGKILL 生效 */
-    struct timespec ts = {0, 100L * 1000L * 1000L};
-    nanosleep(&ts, NULL);
-    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
-      gone = 1;
-      break;
-    }
-  }
-  if (gone) {
-    s_exec_ok++;
-    audit_both(cmd_id, "kill: SIGTERM 无效,已用 SIGKILL 终止");
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, "terminated via SIGKILL");
-  } else {
-    /* SIGKILL 已送达但仍在进程表(僵尸/不可中断 D 态);如实报失败,不谎报成功。 */
-    s_exec_fail++;
-    audit_both(cmd_id, "kill: SIGKILL 后进程仍存在(僵尸/不可中断)");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 9, "alive after SIGKILL");
-  }
-#endif
+  s_exec_ok++;
+  audit_both(cmd_id, reason);
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, reason);
 }
 
 static int isolate_stamp_path(char *path, size_t cap) {
@@ -1443,260 +1371,157 @@ static int isolate_run(int enable, const char *cmd_id) {
  * of the agent stamp. Built-in scripts are required to report an active rule
  * set; custom hooks may provide EDR_ISOLATE_STATUS_HOOK for the same check. */
 static int isolate_run_status(char *evidence, size_t evidence_cap) {
-  if (evidence && evidence_cap > 0u) {
-    evidence[0] = '\0';
-  }
-  const char *status_hook = getenv("EDR_ISOLATE_STATUS_HOOK");
-  if (status_hook && status_hook[0]) {
-    return system(status_hook) == 0 ? 0 : -1;
-  }
-  char script[1024];
-  if (isolate_resolve_script(script, sizeof(script)) != 0) {
-    return -2;
-  }
-  char stamp[512];
-  if (isolate_stamp_path(stamp, sizeof(stamp)) != 0) {
-    return -1;
-  }
-  char outpath[700];
-  {
-    const char *parts[] = {stamp, ".status"};
-    if (!command_join_cstrs(outpath, sizeof(outpath), parts, sizeof(parts) / sizeof(parts[0]))) {
-      return -1;
-    }
-  }
-  char cmd[1500];
+  if (!evidence || evidence_cap < 2u) return -1;
+  evidence[0] = '\0';
+  const char *hook = getenv("EDR_ISOLATE_STATUS_HOOK");
+  char script[1024], stamp[512], outpath[700], cmd[1800];
+  if ((!hook || !hook[0]) && isolate_resolve_script(script, sizeof(script)) != 0) return -2;
+  if (isolate_stamp_path(stamp, sizeof(stamp)) != 0) return -1;
+  const char *out_parts[] = {stamp, ".status"};
+  if (!command_join_cstrs(outpath, sizeof(outpath), out_parts, 2u)) return -1;
+  int formatted;
+  if (hook && hook[0]) {
+    formatted = snprintf(cmd, sizeof(cmd), "%s > \"%s\" 2>&1", hook, outpath);
+  } else {
 #ifdef _WIN32
-  const char *parts[] = {"powershell -NoProfile -ExecutionPolicy Bypass -File \"", script,
-                         "\" -Action Status > \"", outpath, "\" 2>&1"};
+    formatted = snprintf(cmd, sizeof(cmd), "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\" -Action Status > \"%s\" 2>&1", script, outpath);
 #else
-  const char *parts[] = {"/bin/sh \"", script, "\" status > \"", outpath, "\" 2>&1"};
+    formatted = snprintf(cmd, sizeof(cmd), "/bin/bash \"%s\" status > \"%s\" 2>&1", script, outpath);
 #endif
-  if (!command_join_cstrs(cmd, sizeof(cmd), parts, sizeof(parts) / sizeof(parts[0]))) {
-    return -1;
   }
+  if (formatted < 0 || (size_t)formatted >= sizeof(cmd)) return -1;
   int rc = system(cmd) == 0 ? 0 : -1;
-  if (evidence && evidence_cap > 1u) {
-    FILE *f = fopen(outpath, "rb");
-    if (f) {
-      size_t n = fread(evidence, 1, evidence_cap - 1u, f);
-      evidence[n] = '\0';
-      fclose(f);
-    }
-  }
-  (void)remove(outpath);
+  FILE *f = fopen(outpath, "rb");
+  if (!f) return -1;
+  size_t n = fread(evidence, 1, evidence_cap - 1u, f);
+  evidence[n] = '\0';
+  if (ferror(f) || fgetc(f) != EOF || n == 0u) rc = -1;
+  if (fclose(f) != 0) rc = -1;
+  if (remove(outpath) != 0) rc = -1;
   return rc;
 }
 
 static int isolate_status_reports_active(const char *evidence) {
-  if (!evidence || !evidence[0]) {
-    return 0;
-  }
-  return strstr(evidence, "State file:") != NULL || strstr(evidence, "Isolation enabled") != NULL ||
-         strstr(evidence, "table inet edr_isolate") != NULL || strstr(evidence, "DefaultInboundAction : Block") != NULL ||
-         strstr(evidence, "-P INPUT DROP") != NULL || strstr(evidence, "-P OUTPUT DROP") != NULL;
+#ifdef _WIN32
+  return response_isolation_status_verified(evidence, 1);
+#else
+  /* Existing Linux enforcement emits its actual rules, not the stamp. */
+  return evidence &&
+      ((strstr(evidence, "table inet edr_isolate") && strstr(evidence, "policy drop")) ||
+       (strstr(evidence, "-P INPUT DROP") && strstr(evidence, "-P OUTPUT DROP")));
+#endif
 }
 
 static int isolate_stamp_only_mode(void) {
   const char *mode = getenv("EDR_ISOLATE_MODE");
-  return (mode && strcmp(mode, "stamp") == 0) ? 1 : 0;
+  return mode && strcmp(mode, "stamp") == 0;
 }
 
 static int do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
-  if (!dangerous_enabled()) {
+  if (!dangerous_enabled() || isolate_stamp_only_mode()) {
     s_rejected++;
-    audit_both(cmd_id, "reject isolate: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    audit_both(cmd_id, "isolate: policy disabled or stamp-only mode has no verifiable enforcement");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "verified network enforcement is required");
     return -1;
   }
-  /* 写状态标记(供 isolate_status / 响应查询;非 enforcement 本身)。 */
   char path[512];
   if (isolate_stamp_path(path, sizeof(path)) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "isolate: isolation state path is too long");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
     return -2;
   }
-  int stamp_written = 0;
   FILE *f = fopen(path, "w");
-  if (f) {
-    fprintf(f, "isolated=1\ncommand_id=%s\nupdated_unix_ms=%lld\n", cmd_id ? cmd_id : "",
-            (long long)command_now_ms());
-    stamp_written = fclose(f) == 0 ? 1 : 0;
-  }
-  if (!stamp_written) {
+  int written = f ? fprintf(f, "pending=1\ncommand_id=%s\nupdated_unix_ms=%lld\n",
+                            cmd_id ? cmd_id : "", (long long)command_now_ms()) : -1;
+  int closed = f ? fclose(f) : -1;
+  if (written < 0 || closed != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "isolate: cannot persist isolation state stamp");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "cannot persist isolation state");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "cannot persist isolation intent");
     return -2;
   }
-
-  if (isolate_stamp_only_mode()) {
-    /* 旧行为:仅标记(+可选 hook),用于依赖外部驱动读取标记的部署。 */
-    const char *hook = getenv("EDR_ISOLATE_HOOK");
-    if (hook && hook[0]) {
-      isolate_setenv("EDR_CMD_ID", cmd_id ? cmd_id : "");
-      if (system(hook) != 0) {
-        (void)remove(path);
-        s_exec_fail++;
-        audit_both(cmd_id, "isolate(stamp): EDR_ISOLATE_HOOK 返回非零");
-        soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolate hook non-zero");
-        return -3;
-      }
-    }
-    s_exec_ok++;
-    audit_both(cmd_id, "isolate: stamp-only 模式(未施加网络 enforcement)");
-    char pathj[700], detail[1024];
-    json_escape_to(pathj, sizeof(pathj), path);
-    snprintf(detail, sizeof(detail),
-             "{\"status\":\"isolated\",\"method\":\"stamp\",\"stamp_path\":%s}", pathj);
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
-    return 0;
-  }
-
-  /* 默认:真实网络隔离。先自动放行管理通道,再施加防火墙隔离。 */
   isolate_autofill_allowlist();
   int rc = isolate_run(1, cmd_id);
-  if (rc != 0) {
-    (void)remove(path); /* 不谎报:enforcement 未生效则不留隔离标记 */
+  char evidence[2048];
+  if (rc != 0 || isolate_run_status(evidence, sizeof(evidence)) != 0 ||
+      !isolate_status_reports_active(evidence)) {
+    /* Keep the intent on uncertainty; the OS script retains its recovery
+     * baseline. A failed command may have partially changed enforcement. */
     s_exec_fail++;
-    if (rc == -2) {
-      audit_both(cmd_id,
-                 "isolate: 未找到 enforcement(设 EDR_ISOLATE_HOOK 或随包 isolate 脚本;或 EDR_ISOLATE_MODE=stamp)");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "no isolation enforcement available");
-    } else {
-      audit_both(cmd_id, "isolate: 网络 enforcement 失败");
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "isolation enforcement failed");
-    }
-    return rc == -2 ? -4 : -3;
-  }
-  int verified = 0;
-  const char *verification = "enforcement_status";
-  char status_evidence[2048];
-  status_evidence[0] = '\0';
-  const char *isolate_hook = getenv("EDR_ISOLATE_HOOK");
-  if (isolate_hook && isolate_hook[0]) {
-    verified = 1; /* Custom hook's zero exit is its enforcement contract. */
-    verification = "hook_return_code";
-  } else if (isolate_run_status(status_evidence, sizeof(status_evidence)) == 0 &&
-             isolate_status_reports_active(status_evidence)) {
-    verified = 1;
-  }
-  if (!verified) {
-    (void)remove(path);
-    s_exec_fail++;
-    audit_both(cmd_id, "isolate: enforcement completed but status verification failed");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation enforcement status not verified");
+    audit_both(cmd_id, "isolate: enforcement not verified; recovery baseline retained");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, rc == -2 ? 4 : 5,
+              "isolation enforcement not verified; inspect recovery baseline");
     return -5;
   }
   s_exec_ok++;
-  audit_both(cmd_id, "isolate: 已施加网络隔离");
-  {
-    const char *hook = getenv("EDR_ISOLATE_HOOK");
-    const char *allow = getenv("EDR_ISOLATE_ALLOW_REMOTE_ADDRS");
-    char pathj[700], allowj[600], detail[1500];
-    json_escape_to(pathj, sizeof(pathj), path);
-    json_escape_to(allowj, sizeof(allowj), allow ? allow : "");
-    snprintf(detail, sizeof(detail),
-             "{\"status\":\"isolated\",\"method\":\"%s\",\"verification\":\"%s\","
-             "\"stamp_path\":%s,\"allow_addrs\":%s}",
-             (hook && hook[0]) ? "hook" : "builtin", verification, pathj, allowj);
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
-  }
+  audit_both(cmd_id, "isolate: enforcement verified");
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
+            "{\"status\":\"isolated\",\"enforcement_verified\":true,\"verification\":\"enforcement_status\"}");
   return 0;
 }
 
 static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
-  if (!dangerous_enabled()) {
+  if (!dangerous_enabled() || isolate_stamp_only_mode()) {
     s_rejected++;
-    audit_both(cmd_id, "reject restore_host: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
+    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "verified network enforcement is required");
     return;
   }
   char path[512];
   if (isolate_stamp_path(path, sizeof(path)) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "restore_host: isolation state path is too long");
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
     return;
   }
-
-  int rc = 0;
-  if (isolate_stamp_only_mode()) {
-    const char *hook = getenv("EDR_RESTORE_HOOK");
-    if (!hook || !hook[0]) {
-      hook = getenv("EDR_ISOLATE_RESTORE_HOOK");
-    }
-    if (hook && hook[0]) {
-      isolate_setenv("EDR_CMD_ID", cmd_id ? cmd_id : "");
-      rc = (system(hook) == 0) ? 0 : -1;
-    }
-  } else {
-    rc = isolate_run(0, cmd_id);
-  }
+  int rc = isolate_run(0, cmd_id);
+#ifdef _WIN32
+  char evidence[2048];
+  if (rc == 0 && (isolate_run_status(evidence, sizeof(evidence)) != 0 ||
+                 !response_isolation_status_verified(evidence, 0))) rc = -1;
+#endif
   if (rc != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "restore_host: enforcement 撤销失败");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore enforcement failed");
+    audit_both(cmd_id, "restore: OS restoration not verified; recovery baseline retained");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "restore enforcement not verified");
     return;
   }
   if (remove(path) != 0 && errno != ENOENT) {
     s_exec_fail++;
-    audit_both(cmd_id, "restore_host: stamp remove failed");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "stamp remove failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "restored network but intent cleanup failed");
     return;
   }
   s_handled++;
   s_exec_ok++;
-  {
-    char pathj[700], detail[1024];
-    json_escape_to(pathj, sizeof(pathj), path);
-    snprintf(detail, sizeof(detail), "{\"status\":\"restored\",\"stamp_path\":%s}", pathj);
-    audit_both(cmd_id, "restore_host: ok");
-    soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
-  }
+  audit_both(cmd_id, "restore_host: completed");
+#ifdef _WIN32
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
+            "{\"status\":\"restored\",\"enforcement_verified\":true,\"verification\":\"enforcement_status\"}");
+#else
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
+            "{\"status\":\"restored\",\"verification\":\"enforcement_exit_code\"}");
+#endif
 }
 
 static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
-  char path[512];
-  if (isolate_stamp_path(path, sizeof(path)) != 0) {
+  char evidence[2048];
+  if (isolate_stamp_only_mode() || isolate_run_status(evidence, sizeof(evidence)) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "isolate_status: isolation state path is too long");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "isolation state path is too long");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation state unknown; OS evidence unavailable");
     return;
   }
-  int exists = 0;
-  FILE *f = fopen(path, "r");
-  if (f) {
-    exists = 1;
-    fclose(f);
+#ifdef _WIN32
+  if (!response_isolation_status_verified(evidence, 1) &&
+      !response_isolation_status_verified(evidence, 0)) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation/restoration state not verified");
+    return;
   }
-  int verified = 0;
-  const char *verification = "not_isolated";
-  char evidence[2048];
-  evidence[0] = '\0';
-  if (exists && isolate_stamp_only_mode()) {
-    verification = "stamp_only";
-  } else if (exists) {
-    int rc = isolate_run_status(evidence, sizeof(evidence));
-    const char *status_hook = getenv("EDR_ISOLATE_STATUS_HOOK");
-    if (rc == 0 && ((status_hook && status_hook[0]) || isolate_status_reports_active(evidence))) {
-      verified = 1;
-      verification = "enforcement_status";
-    } else {
-      verification = rc == -2 ? "enforcement_unavailable" : "enforcement_not_active";
-    }
-  }
-  char pathj[700], detail[2600];
-  json_escape_to(pathj, sizeof(pathj), path);
-  snprintf(detail, sizeof(detail),
-           "{\"isolated\":%s,\"stamp_present\":%s,\"enforcement_verified\":%s,"
-           "\"verification\":\"%s\",\"stamp_path\":%s}",
-           (exists && (isolate_stamp_only_mode() || verified)) ? "true" : "false",
-           exists ? "true" : "false", verified ? "true" : "false", verification, pathj);
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, evidence);
+#else
+  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, isolate_status_reports_active(evidence)
+            ? "{\"isolated\":true,\"enforcement_verified\":true}"
+            : "{\"isolated\":false,\"enforcement_verified\":false}");
+#endif
   s_handled++;
   s_exec_ok++;
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
 /* 自动勒索处置只允许结束事件归属的进程，并在 OS 层确认进程确实退出，避免把
@@ -2120,47 +1945,85 @@ static int quarantine_path_allowed(const char *base, const char *path) {
     return 0;
   }
 #endif
-  return path[n] == '/' || path[n] == '\\';
+  if (path[n] != '/' && path[n] != '\\') return 0;
+  const char *leaf = path + n + 1u;
+  return leaf[0] && !strchr(leaf, '/') && !strchr(leaf, '\\') &&
+         strcmp(leaf, ".") != 0 && strcmp(leaf, "..") != 0 && !strchr(leaf, ':');
 }
 
-static int move_file_cross_volume(const char *src, const char *dst) {
+static int quarantine_move_no_replace(const char *src, const char *dst) {
+  /* Do not overwrite a destination or emulate an atomic move with an
+   * unchecked cross-volume copy/delete. Unsupported volumes fail untouched. */
 #ifdef _WIN32
-  return MoveFileExA(src, dst, MOVEFILE_COPY_ALLOWED) ? 0 : -1;
+  return MoveFileExA(src, dst, MOVEFILE_WRITE_THROUGH) ? 0 : -1;
 #else
-  if (rename(src, dst) == 0) {
-    return 0;
-  }
-  if (errno == EXDEV && forensic_copy_one_file(src, dst) == 0 && remove(src) == 0) {
-    return 0;
-  }
+  if (link(src, dst) != 0) return -1;
+  if (unlink(src) == 0) return 0;
+  if (unlink(dst) != 0) return -2; /* Both paths remain: caller must retain recovery metadata. */
   return -1;
 #endif
 }
 
-/* 隔离件加锁:防止被读回 / 再次执行(证据保全)。
-   Windows:受限 DACL(仅 Administrators+SYSTEM 全权,其余因无 ACE 隐式拒绝)+ 只读/隐藏/系统属性;
-   POSIX:chmod 0400(去执行/写位,仅属主可读,以便特权 agent 后续还原)。 */
-static void quarantine_lock(const char *p) {
+static int quarantine_unlock(const char *p) {
 #ifdef _WIN32
-  PSECURITY_DESCRIPTOR sd = NULL;
-  if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-          "D:P(A;;FA;;;BA)(A;;FA;;;SY)", SDDL_REVISION_1, &sd, NULL)) {
-    (void)SetFileSecurityA(p, DACL_SECURITY_INFORMATION, sd);
-    LocalFree(sd);
-  }
-  (void)SetFileAttributesA(p, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+  DWORD attr = GetFileAttributesA(p);
+  if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) return -1;
+  attr &= ~FILE_ATTRIBUTE_READONLY;
+  return SetFileAttributesA(p, attr ? attr : FILE_ATTRIBUTE_NORMAL) ? 0 : -1;
 #else
-  (void)chmod(p, 0400);
+  (void)p; /* rename/unlink require parent permissions, not writable file content. */
+  return 0;
 #endif
 }
 
-/* 还原前解锁:清掉只读/隐藏/系统属性,确保 move/删除可进行。 */
-static void quarantine_unlock(const char *p) {
+static int quarantine_write_metadata(const char *path, cJSON *record) {
+  char *json = cJSON_PrintUnformatted(record);
+  if (!json) return -1;
+  if (strlen(json) >= 16383u) { cJSON_free(json); return -1; }
 #ifdef _WIN32
-  (void)SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);
+  int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+  FILE *f = fd < 0 ? NULL : _fdopen(fd, "wb");
+  if (!f && fd >= 0) _close(fd);
 #else
-  (void)chmod(p, 0600);
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
+  if (!f && fd >= 0) close(fd);
 #endif
+  if (!f) { cJSON_free(json); return -1; }
+  size_t length = strlen(json);
+  int ok = fwrite(json, 1, length, f) == length && fflush(f) == 0;
+#ifdef _WIN32
+  if (ok) ok = _commit(fd) == 0;
+#else
+  if (ok) ok = fsync(fd) == 0;
+#endif
+  if (fclose(f) != 0) ok = 0;
+  cJSON_free(json);
+  return ok ? 0 : -1;
+}
+
+static int quarantine_hash_matches(const char *path, const char *expected) {
+  EdrResponseFileSecurity ignored;
+  char actual[65];
+  return expected && strlen(expected) == 64u &&
+      response_file_security_snapshot(path, &ignored) == 0 &&
+      file_sha256_hex(path, actual) == 0 && strcmp(actual, expected) == 0;
+}
+
+static int quarantine_rollback(const char *qpath, const char *original,
+                               const char *sha, const EdrResponseFileSecurity *saved) {
+  if (quarantine_unlock(qpath) != 0 || quarantine_move_no_replace(qpath, original) != 0) return -1;
+  /* Check content before restoring the original ACL, which may remove Agent access. */
+  return quarantine_hash_matches(original, sha) && response_file_security_restore(original, saved) == 0 ? 0 : -1;
+}
+
+static void quarantine_failure(const char *cmd_id, const EdrSoarCommandMeta *sm, int code,
+                                const char *why, const char *meta, const char *qpath) {
+  char detail[3300];
+  snprintf(detail, sizeof(detail), "%s; recovery_metadata=%s; quarantine_path=%s", why, meta, qpath);
+  s_exec_fail++;
+  audit_both(cmd_id, detail);
+  soar_emit(cmd_id, sm, EdrCmdExecFailed, code, detail);
 }
 
 static void do_file_stat(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
@@ -3457,7 +3320,7 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
   }
   char base[700];
   quarantine_base_dir(base, sizeof(base));
-  if (mkdir_p_quiet(base) != 0) {
+  if (mkdir_p_quiet(base) != 0 || response_file_security_lock(base, 1) != 0) {
     s_exec_fail++;
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine directory create failed");
     return;
@@ -3494,33 +3357,42 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
   long long mt = 0;
   char sha[65];
   sha[0] = '\0';
-  (void)file_size_mtime(path, &sz, &mt);
-  (void)file_sha256_hex(path, sha);
-  if (move_file_cross_volume(path, qpath) != 0) {
+  EdrResponseFileSecurity saved;
+  if (response_file_security_snapshot(path, &saved) != 0 ||
+      file_size_mtime(path, &sz, &mt) != 0 || file_sha256_hex(path, sha) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "quarantine_file: move failed");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "quarantine move failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "source evidence or security snapshot failed; source untouched");
     return;
   }
-  quarantine_lock(qpath); /* 加锁:去执行/限访问,防读回或再执行 */
-  FILE *mf = fopen(meta, "w");
-  if (!mf) {
-    quarantine_unlock(qpath);
-    (void)move_file_cross_volume(qpath, path);
+  cJSON *record = cJSON_CreateObject();
+  int record_ok = record &&
+      cJSON_AddStringToObject(record, "schema", "edr.file.quarantine.v2") &&
+      cJSON_AddStringToObject(record, "original_path", path) &&
+      cJSON_AddStringToObject(record, "sha256", sha) &&
+      cJSON_AddStringToObject(record, "dacl", saved.dacl) &&
+      cJSON_AddNumberToObject(record, "attributes", saved.attributes) &&
+      cJSON_AddNumberToObject(record, "mode", saved.mode) &&
+      cJSON_AddNumberToObject(record, "uid", saved.uid) &&
+      cJSON_AddNumberToObject(record, "gid", saved.gid) &&
+      cJSON_AddStringToObject(record, "reason", reason);
+  int metadata_ok = record_ok && quarantine_write_metadata(meta, record) == 0;
+  cJSON_Delete(record);
+  if (!metadata_ok) {
     s_exec_fail++;
-    audit_both(cmd_id, "quarantine_file: metadata create failed, rollback complete");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "quarantine metadata create failed");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "durable metadata create failed; source untouched");
     return;
   }
-  int meta_rc = fprintf(mf, "quarantine_id=%s\noriginal_path=%s\nquarantine_path=%s\nsha256=%s\nsize=%llu\nmtime=%lld\nreason=%s\n",
-                        stem, path, qpath, sha, sz, mt, reason);
-  if (meta_rc < 0 || fclose(mf) != 0) {
-    quarantine_unlock(qpath);
-    (void)remove(meta);
-    (void)move_file_cross_volume(qpath, path);
-    s_exec_fail++;
-    audit_both(cmd_id, "quarantine_file: metadata write failed, rollback complete");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "quarantine metadata write failed");
+  if (quarantine_move_no_replace(path, qpath) != 0) {
+    quarantine_failure(cmd_id, sm, 4, "no-overwrite move failed (conflict or unsupported volume); metadata retained", meta, qpath);
+    return;
+  }
+  if (!quarantine_hash_matches(qpath, sha) || response_file_security_lock(qpath, 0) != 0 ||
+      !quarantine_hash_matches(qpath, sha) ||
+      file_exists_c(path)) {
+    int rollback_ok = quarantine_rollback(qpath, path, sha, &saved) == 0;
+    quarantine_failure(cmd_id, sm, 5, rollback_ok ?
+              "quarantine verification failed; rollback verified; metadata retained" :
+              "quarantine verification failed; rollback failed; remaining files retained", meta, qpath);
     return;
   }
   char stemj[700], pathj[1400], qpathj[1600], metaj[1600], detail[5600];
@@ -3538,25 +3410,48 @@ static void do_quarantine_file(const char *cmd_id, const uint8_t *pl, size_t len
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
-static int read_meta_value(const char *meta, const char *key, char *out, size_t cap) {
-  FILE *f = fopen(meta, "r");
-  if (!f) {
-    return -1;
+static int quarantine_read_metadata(const char *meta, char *original, size_t cap,
+                                     char *sha, EdrResponseFileSecurity *saved) {
+  EdrResponseFileSecurity ignored;
+  if (response_file_security_snapshot(meta, &ignored) != 0) return -1;
+  FILE *f = fopen(meta, "rb");
+  if (!f) return -1;
+  char raw[16384];
+  size_t n = fread(raw, 1, sizeof(raw) - 1u, f);
+  int ok = !ferror(f) && feof(f);
+  if (fclose(f) != 0) ok = 0;
+  raw[n] = '\0';
+  cJSON *record = ok ? cJSON_ParseWithOpts(raw, NULL, 1) : NULL;
+  if (!cJSON_IsObject(record)) { cJSON_Delete(record); return -1; }
+  const cJSON *item;
+  cJSON_ArrayForEach(item, record) {
+    if (cJSON_GetObjectItemCaseSensitive(record, item->string) != item) ok = 0;
   }
-  char line[1400];
-  size_t kn = strlen(key);
-  int ok = -1;
-  while (fgets(line, sizeof(line), f)) {
-    if (strncmp(line, key, kn) == 0 && line[kn] == '=') {
-      char *v = line + kn + 1u;
-      v[strcspn(v, "\r\n")] = '\0';
-      snprintf(out, cap, "%s", v);
-      ok = 0;
-      break;
-    }
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(record, "schema");
+  const cJSON *path = cJSON_GetObjectItemCaseSensitive(record, "original_path");
+  const cJSON *digest = cJSON_GetObjectItemCaseSensitive(record, "sha256");
+  const cJSON *dacl = cJSON_GetObjectItemCaseSensitive(record, "dacl");
+  ok = ok && cJSON_IsString(schema) && strcmp(schema->valuestring, "edr.file.quarantine.v2") == 0 &&
+      cJSON_IsString(path) && path->valuestring[0] && strlen(path->valuestring) < cap &&
+      cJSON_IsString(digest) && strlen(digest->valuestring) == 64u &&
+      strspn(digest->valuestring, "0123456789abcdef") == 64u &&
+      cJSON_IsString(dacl) && strlen(dacl->valuestring) < sizeof(saved->dacl);
+  const char *keys[] = {"attributes", "mode", "uid", "gid"};
+  uint32_t *fields[] = {&saved->attributes, &saved->mode, &saved->uid, &saved->gid};
+  for (size_t i = 0; i < 4u; ++i) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(record, keys[i]);
+    if (!cJSON_IsNumber(v) || v->valuedouble < 0 || v->valuedouble > UINT32_MAX ||
+        v->valuedouble != (double)(uint32_t)v->valuedouble) { ok = 0; break; }
+    *fields[i] = (uint32_t)v->valuedouble;
   }
-  fclose(f);
-  return ok;
+  if (saved->mode > 07777u) ok = 0;
+  if (ok) {
+    memcpy(original, path->valuestring, strlen(path->valuestring) + 1u);
+    memcpy(sha, digest->valuestring, 65u);
+    memcpy(saved->dacl, dacl->valuestring, strlen(dacl->valuestring) + 1u);
+  }
+  cJSON_Delete(record);
+  return ok ? 0 : -1;
 }
 
 static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t len,
@@ -3567,8 +3462,8 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
     return;
   }
-  char qid[256];
-  char base[700], meta[1200];
+  char qid[512];
+  char base[700], meta[1400];
   quarantine_base_dir(base, sizeof(base));
   char direct_qpath[1400], direct_restore[1400];
   int has_direct_paths = parse_json_string_field(pl, len, "quarantine_path", direct_qpath,
@@ -3599,24 +3494,40 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "missing quarantine_id or quarantine_path/dest");
     return;
   }
-  sanitize_component(qid);
+  if (!qid[0] || strspn(qid, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != strlen(qid) ||
+      strcmp(qid, ".") == 0 || strcmp(qid, "..") == 0 ||
+      response_file_security_lock(base, 1) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "invalid quarantine identity or unsafe directory");
+    return;
+  }
 #ifdef _WIN32
   snprintf(meta, sizeof(meta), "%s\\%s.meta", base, qid);
 #else
   snprintf(meta, sizeof(meta), "%s/%s.meta", base, qid);
 #endif
-  char qpath[1024], original[1024], restore[1024];
+  char qpath[1400], original[1024], restore[1400], sha[65];
+  EdrResponseFileSecurity saved = {0};
+#ifdef _WIN32
+  snprintf(qpath, sizeof(qpath), "%s\\%s.bin", base, qid);
+#else
+  snprintf(qpath, sizeof(qpath), "%s/%s.bin", base, qid);
+#endif
+  if (quarantine_read_metadata(meta, original, sizeof(original), sha, &saved) != 0 ||
+      !quarantine_hash_matches(qpath, sha)) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3,
+              "quarantine metadata/security/hash invalid; legacy metadata requires manual recovery; files retained");
+    return;
+  }
   if (has_direct_paths) {
-    snprintf(qpath, sizeof(qpath), "%s", direct_qpath);
-    snprintf(restore, sizeof(restore), "%s", direct_restore);
-    snprintf(original, sizeof(original), "%s", direct_restore);
-  } else {
-    if (read_meta_value(meta, "quarantine_path", qpath, sizeof(qpath)) != 0 ||
-        read_meta_value(meta, "original_path", original, sizeof(original)) != 0) {
+    if (strcmp(qpath, direct_qpath) != 0) {
       s_exec_fail++;
-      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine metadata not found");
+      soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "quarantine_path does not match metadata identity");
       return;
     }
+    snprintf(restore, sizeof(restore), "%s", direct_restore);
+  } else {
     if (parse_json_string_field(pl, len, "restore_path", restore, sizeof(restore)) != 0) {
       snprintf(restore, sizeof(restore), "%s", original);
     }
@@ -3626,14 +3537,24 @@ static void do_unquarantine_file(const char *cmd_id, const uint8_t *pl, size_t l
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 4, "restore target already exists");
     return;
   }
-  quarantine_unlock(qpath); /* 解锁:清属性,确保还原 move/删除可进行 */
-  if (move_file_cross_volume(qpath, restore) != 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "unquarantine_file: restore failed");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "restore move failed");
+  if (quarantine_unlock(qpath) != 0 || quarantine_move_no_replace(qpath, restore) != 0) {
+    int locked = response_file_security_lock(qpath, 0) == 0;
+    quarantine_failure(cmd_id, sm, 5, locked ? "restore move failed; quarantine relocked; metadata retained" :
+              "restore move failed; relock failed; metadata retained", meta, qpath);
     return;
   }
-  (void)remove(meta);
+  if (!quarantine_hash_matches(restore, sha) || response_file_security_restore(restore, &saved) != 0) {
+    int returned = quarantine_unlock(restore) == 0 && quarantine_move_no_replace(restore, qpath) == 0 && response_file_security_lock(qpath, 0) == 0;
+    quarantine_failure(cmd_id, sm, 5, returned ?
+              "restore evidence/security verification failed; file returned to quarantine; metadata retained" :
+              "restore verification and rollback failed; inspect destination and quarantine; metadata retained", meta, qpath);
+    return;
+  }
+  if (remove(meta) != 0) {
+    s_exec_fail++;
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "file restored and verified but metadata cleanup failed");
+    return;
+  }
   char qidj[700], restorej[1400], originalj[1400], detail[4200];
   json_escape_to(qidj, sizeof(qidj), qid);
   json_escape_to(restorej, sizeof(restorej), restore);
@@ -3783,7 +3704,22 @@ int edr_command_queue_forensic_upload(const char *command_id, const char *comman
 }
 
 static int read_kv_file_value(const char *path, const char *key, char *out, size_t cap) {
-  return read_meta_value(path, key, out, cap);
+  FILE *f = fopen(path, "r");
+  if (!f) return -1;
+  char line[1400];
+  size_t kn = strlen(key);
+  int ok = -1;
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, key, kn) == 0 && line[kn] == '=') {
+      char *value = line + kn + 1u;
+      value[strcspn(value, "\r\n")] = '\0';
+      if (strlen(value) < cap) { memcpy(out, value, strlen(value) + 1u); ok = 0; }
+      break;
+    }
+  }
+  if (ferror(f)) ok = -1;
+  if (fclose(f) != 0) ok = -1;
+  return ok;
 }
 
 static int flush_upload_outbox_one(const char *pending_path) {

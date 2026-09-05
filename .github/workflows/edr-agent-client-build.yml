@@ -309,7 +309,11 @@ jobs:
             'command_registry_and_payload_contract',
             'pmfe_pe_architectures',
             'windows_native_manifest_behavior',
-            'windows_native_uninstall_behavior'
+            'windows_native_uninstall_behavior',
+            'process_generation_same_handle_command_line',
+            'response_file_security_behavior',
+            'response_forensic_path_contract',
+            'windows_isolation_mock_behavior'
           )
           $listedText = $listed -join "`n"
           foreach ($name in $required) {
@@ -317,7 +321,7 @@ jobs:
               throw "Required client build test was not configured: $name"
             }
           }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures|windows_native_manifest_behavior|windows_native_uninstall_behavior)$'
+          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures|windows_native_manifest_behavior|windows_native_uninstall_behavior|process_generation_same_handle_command_line|response_file_security_behavior|response_forensic_path_contract|windows_isolation_mock_behavior)$'
           if ($LASTEXITCODE -ne 0) { throw "Client build gate tests failed" }
 
       - name: "[Timing] Build summary"

@@ -4,6 +4,7 @@
 #include "cJSON.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +73,11 @@ static const CommandFieldRule k_pmfe_rules[] = {
     RULE("region_size", FIELD_NUMBER, 0, 1, 1048576, 0, 0),
     RULE("extract_region", FIELD_BOOL, 0, 0, 0, 0, 0),
     RULE("run_yara", FIELD_BOOL, 0, 0, 0, 0, 0),
+};
+
+static const CommandFieldRule k_kill_rules[] = {
+    RULE("pid", FIELD_NUMBER, 1, 1, 4294967295.0, 0, 0),
+    RULE("process_creation_filetime_100ns", FIELD_STRING, 1, 0, 0, 20, 0),
 };
 
 static const CommandFieldRule k_memory_rules[] = {
@@ -357,6 +363,7 @@ static void command_rules(EdrCommandKind kind, const CommandFieldRule **rules,
     case EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE:
       *rules = k_telemetry_rules; *count = COUNT_OF(k_telemetry_rules); break;
     case EDR_COMMAND_KIND_KILL_PROCESS:
+      *rules = k_kill_rules; *count = COUNT_OF(k_kill_rules); break;
     case EDR_COMMAND_KIND_PMFE_SCAN:
       *rules = k_pmfe_rules; *count = COUNT_OF(k_pmfe_rules); break;
     case EDR_COMMAND_KIND_MEMORY_DUMP:
@@ -430,6 +437,16 @@ static int has_nonempty_string(const cJSON *root, const char *name) {
 
 static int validate_semantics(EdrCommandKind kind, const cJSON *root,
                               char *reason, size_t reason_cap) {
+  if (kind == EDR_COMMAND_KIND_KILL_PROCESS) {
+    const cJSON *creation = cJSON_GetObjectItemCaseSensitive(root, "process_creation_filetime_100ns");
+    const char *value = cJSON_IsString(creation) ? creation->valuestring : "";
+    if (!value[0] || value[0] == '0' || strspn(value, "0123456789") != strlen(value)) {
+      return contract_fail(reason, reason_cap, "process creation time must be a positive decimal uint64 string");
+    }
+    errno = 0;
+    unsigned long long n = strtoull(value, NULL, 10);
+    if (errno || !n) return contract_fail(reason, reason_cap, "process creation time overflows uint64");
+  }
   if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
     const cJSON *registry_mode = cJSON_GetObjectItemCaseSensitive(root, "registry_mode");
     if (registry_mode) {

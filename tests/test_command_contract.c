@@ -135,8 +135,18 @@ int main(void) {
                "shell command can never be unsigned");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED", "0");
 
-  require_true(validate("kill_process", "{\"pid\":42}", reason, sizeof(reason)),
-               "valid pid contract");
+  require_true(validate("kill_process", "{\"pid\":42,\"process_creation_filetime_100ns\":\"134330000000000001\"}", reason, sizeof(reason)),
+               "valid generation-pinned pid contract");
+  const char *bad_identity[] = {
+    "{\"pid\":42}",
+    "{\"pid\":42,\"process_creation_filetime_100ns\":134330000000000001}",
+    "{\"pid\":42,\"process_creation_filetime_100ns\":\"0\"}",
+    "{\"pid\":42,\"process_creation_filetime_100ns\":\"01\"}",
+    "{\"pid\":42,\"process_creation_filetime_100ns\":\"18446744073709551616\"}",
+    "{\"pid\":42,\"process_creation_filetime_100ns\":\"1e17\"}"
+  };
+  for (size_t i = 0; i < sizeof(bad_identity)/sizeof(bad_identity[0]); ++i)
+    require_true(!validate("kill_process", bad_identity[i], reason, sizeof(reason)), "reject missing or lossy generation identity");
   require_true(!validate("kill_process", "{\"pid\":0}", reason, sizeof(reason)),
                "reject non-positive pid");
   require_true(!validate("kill_process", "{\"pid\":\"42\"}", reason, sizeof(reason)),

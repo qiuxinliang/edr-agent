@@ -13,6 +13,21 @@ static void require_true(int ok, const char *message) {
 }
 
 int main(void) {
+  const char *active = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true}";
+  const char *restored = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":false,\"restored\":true,\"enforcement_verified\":true}";
+  require_true(response_isolation_status_verified(active, 1), "accept verified active receipt");
+  require_true(response_isolation_status_verified(restored, 0), "accept verified restored receipt");
+  require_true(!response_isolation_status_verified(active, 0), "active is not restored");
+  const char *bad_receipts[] = {
+    "State file: state.json", "{}", "{\"isolated\":true}",
+    "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":true,\"enforcement_verified\":true}",
+    "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":false}",
+    "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":\"true\",\"restored\":false,\"enforcement_verified\":true}",
+    "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"isolated\":false,\"restored\":false,\"enforcement_verified\":true}",
+    "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true} garbage"
+  };
+  for (size_t i = 0; i < sizeof(bad_receipts)/sizeof(bad_receipts[0]); ++i)
+    require_true(!response_isolation_status_verified(bad_receipts[i], 1), "reject unverified or malformed receipt");
   char reqpath[900];
   char artifact[900];
   char extra[2048];

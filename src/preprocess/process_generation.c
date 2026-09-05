@@ -57,6 +57,38 @@ static EdrNtQueryInformationProcessFn resolve_native_query(void) {
                : NULL;
 }
 
+int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,
+                                  uint32_t timeout_ms, char *reason, size_t reason_cap) {
+  if (!pid || pid == GetCurrentProcessId() || !expected_creation_filetime ||
+      timeout_ms == 0u || timeout_ms > 5000u) {
+    set_reason(reason, reason_cap, "invalid_or_self_process_target");
+    return 0;
+  }
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                                FALSE, (DWORD)pid);
+  if (!process) {
+    DWORD error = GetLastError();
+    set_reason(reason, reason_cap, error == ERROR_INVALID_PARAMETER ? "process_already_gone" : "process_open_failed");
+    return error == ERROR_INVALID_PARAMETER;
+  }
+  FILETIME created, exited, kernel, user;
+  int ok = 0;
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    set_reason(reason, reason_cap, "process_identity_query_failed");
+  } else if ((((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime) != expected_creation_filetime) {
+    set_reason(reason, reason_cap, "process_generation_mismatch");
+  } else if (!TerminateProcess(process, 1u)) {
+    set_reason(reason, reason_cap, "process_terminate_failed");
+  } else {
+    DWORD waited = WaitForSingleObject(process, timeout_ms);
+    ok = waited == WAIT_OBJECT_0;
+    set_reason(reason, reason_cap, ok ? "process_exit_verified" :
+               waited == WAIT_TIMEOUT ? "process_exit_timeout" : "process_exit_wait_failed");
+  }
+  CloseHandle(process);
+  return ok;
+}
+
 int edr_process_generation_query_live(void *native_process_handle,
                                       EdrLiveProcessGeneration *out,
                                       char *reason, size_t reason_cap) {
@@ -230,6 +262,15 @@ int edr_process_generation_validate_live(void *native_process_handle,
 }
 
 #else
+
+int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,
+                                  uint32_t timeout_ms, char *reason, size_t reason_cap) {
+  (void)pid; (void)expected_creation_filetime; (void)timeout_ms;
+  /* No safe process-object binding is implemented by this Windows identity
+   * module on other platforms. Never degrade a signed target to PID-only kill. */
+  set_reason(reason, reason_cap, "verified_termination_unsupported_platform");
+  return 0;
+}
 
 int edr_process_generation_query_live(void *native_process_handle,
                                       EdrLiveProcessGeneration *out,

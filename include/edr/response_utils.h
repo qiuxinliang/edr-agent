@@ -25,6 +25,18 @@ int response_forensic_build_collector_paths(const char *outdir, char separator,
                                             char *extra_args, size_t extra_args_cap);
 /* Bounds/integrity failures must not fall back to another forensic action. */
 int response_forensic_external_failure_must_not_fallback(int collector_rc);
+/* Only a structured, non-contradictory OS-effect receipt is success. */
+int response_isolation_status_verified(const char *json, int expect_isolated);
+typedef struct EdrResponseFileSecurity {
+  char dacl[8192];
+  uint32_t attributes;
+  uint32_t mode;
+  uint32_t uid;
+  uint32_t gid;
+} EdrResponseFileSecurity;
+int response_file_security_snapshot(const char *path, EdrResponseFileSecurity *out);
+int response_file_security_lock(const char *path, int directory);
+int response_file_security_restore(const char *path, const EdrResponseFileSecurity *saved);
 int response_mkdir_p(const char *path);
 int response_make_tar_bundle(const char *dir, const char *bundle_path);
 int response_split_args(char *buf, char *argv[], size_t argv_cap);

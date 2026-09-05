@@ -8,7 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--child") == 0) { Sleep(15000); return 0; }
   char command_line[4096];
   char reason[64];
   char tiny[2];
@@ -29,5 +30,27 @@ int main(void) {
     fprintf(stderr, "bounded output did not fail closed: %s\n", reason);
     return 1;
   }
-  return 0;
+  char executable[MAX_PATH], child_command[MAX_PATH + 32];
+  if (!GetModuleFileNameA(NULL, executable, sizeof(executable))) return 1;
+  snprintf(child_command, sizeof(child_command), "\"%s\" --child", executable);
+  STARTUPINFOA startup = {0};
+  PROCESS_INFORMATION child = {0};
+  startup.cb = sizeof(startup);
+  if (!CreateProcessA(executable, child_command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &startup, &child)) return 1;
+  FILETIME created = {0}, exited, kernel, user;
+  int ok = GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user) != 0;
+  uint64_t identity = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  ok = ok && !edr_process_terminate_checked(child.dwProcessId, identity + 1u, 5000, reason, sizeof(reason)) &&
+      strcmp(reason, "process_generation_mismatch") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;
+  ok = ok && !edr_process_terminate_checked(GetCurrentProcessId(), identity, 5000, reason, sizeof(reason));
+  ok = ok && edr_process_terminate_checked(child.dwProcessId, identity, 5000, reason, sizeof(reason)) &&
+      strcmp(reason, "process_exit_verified") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0;
+  if (!ok) {
+    fprintf(stderr, "generation-pinned termination failed: %s\n", reason);
+    TerminateProcess(child.hProcess, 1); /* Cleanup only our own test child. */
+    WaitForSingleObject(child.hProcess, 5000);
+  }
+  CloseHandle(child.hThread);
+  CloseHandle(child.hProcess);
+  return ok ? 0 : 1;
 }

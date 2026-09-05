@@ -11,6 +11,7 @@
 #include "edr/edr_log.h"
 #include "edr/pe_verify.h"
 #include "edr/shell_exec.h"
+#include "cJSON.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -33,6 +34,32 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+int response_isolation_status_verified(const char *json, int expect_isolated) {
+  const char *end = NULL;
+  cJSON *root = json ? cJSON_ParseWithOpts(json, &end, 1) : NULL;
+  if (!cJSON_IsObject(root)) { cJSON_Delete(root); return 0; }
+  int count = 0;
+  for (const cJSON *p = root->child; p; p = p->next) {
+    for (const cJSON *q = p->next; q; q = q->next) {
+      if (p->string && q->string && strcmp(p->string, q->string) == 0) {
+        cJSON_Delete(root); return 0;
+      }
+    }
+    count++;
+  }
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+  const cJSON *isolated = cJSON_GetObjectItemCaseSensitive(root, "isolated");
+  const cJSON *restored = cJSON_GetObjectItemCaseSensitive(root, "restored");
+  const cJSON *verified = cJSON_GetObjectItemCaseSensitive(root, "enforcement_verified");
+  int ok = count == 4 && cJSON_IsString(schema) &&
+      strcmp(schema->valuestring, "edr.isolation.status.v1") == 0 &&
+      cJSON_IsTrue(verified) && cJSON_IsBool(isolated) && cJSON_IsBool(restored) &&
+      (expect_isolated ? (cJSON_IsTrue(isolated) && cJSON_IsFalse(restored))
+                       : (cJSON_IsFalse(isolated) && cJSON_IsTrue(restored)));
+  cJSON_Delete(root);
+  return ok;
+}
 
 int response_forensic_copy_one_file(const char *src, const char *dst) {
 #ifdef _WIN32

@@ -60,11 +60,24 @@ endif()
 
 add_executable(test_response_forensic_paths
   ${CMAKE_CURRENT_SOURCE_DIR}/test_response_forensic_paths.c
-  ${CMAKE_SOURCE_DIR}/src/response/response_utils.c)
-target_include_directories(test_response_forensic_paths PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_response_forensic_paths PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_response_forensic_paths)
 add_test(NAME response_forensic_path_contract COMMAND test_response_forensic_paths
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_response_file_security
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_response_file_security.c
+  ${CMAKE_SOURCE_DIR}/src/response/response_file_security.c)
+target_include_directories(test_response_file_security PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_response_file_security)
+if(WIN32)
+  target_link_libraries(test_response_file_security PRIVATE advapi32)
+  add_test(NAME windows_isolation_mock_behavior
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_SOURCE_DIR}/scripts/test_windows_isolation_behavior.ps1)
+endif()
+add_test(NAME response_file_security_behavior COMMAND test_response_file_security)
 
 if(NOT WIN32)
   add_executable(test_shell_session_stream
