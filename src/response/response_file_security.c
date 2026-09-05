@@ -14,7 +14,7 @@ static int security_failure(const char *stage, DWORD error) {
   return -1;
 }
 
-static int dacl_matches(const char *actual, const char *expected) {
+static int dacl_matches(const char *actual, const char *expected, SECURITY_DESCRIPTOR_CONTROL control_mask) {
   PSECURITY_DESCRIPTOR descriptors[2] = {NULL, NULL};
   PACL acls[2] = {NULL, NULL};
   SECURITY_DESCRIPTOR_CONTROL controls[2] = {0, 0};
@@ -28,15 +28,25 @@ static int dacl_matches(const char *actual, const char *expected) {
         !GetSecurityDescriptorDacl(descriptors[i], &present, &acls[i], &defaulted) ||
         !present || !acls[i] || !IsValidAcl(acls[i])) goto done;
   }
-  /* SetNamedSecurityInfo can add AI bookkeeping. Do not compare SDDL spelling,
-     but retain inheritance protection and every ordered ACE byte (including
-     type, mask, SID and inheritance flags). Null/absent DACLs never match. */
-  if ((controls[0] & SE_DACL_PROTECTED) != (controls[1] & SE_DACL_PROTECTED) ||
-      acls[0]->AceCount != acls[1]->AceCount) goto done;
+  /* Locking permits OS-generated AI bookkeeping; snapshot restoration must
+     retain it. Both retain every ordered ACE byte and reject null DACLs. */
+  if ((controls[0] & control_mask) != (controls[1] & control_mask)) {
+    fprintf(stderr, "response_file_security: mismatch=control expected=0x%x actual=0x%x\n",
+        (unsigned)(controls[1] & control_mask), (unsigned)(controls[0] & control_mask));
+    goto done;
+  }
+  if (acls[0]->AceCount != acls[1]->AceCount) {
+    fprintf(stderr, "response_file_security: mismatch=ace-count expected=%u actual=%u\n",
+        (unsigned)acls[1]->AceCount, (unsigned)acls[0]->AceCount);
+    goto done;
+  }
   for (DWORD i = 0; i < acls[0]->AceCount; ++i) {
     ACE_HEADER *a = NULL, *b = NULL;
     if (!GetAce(acls[0], i, (LPVOID *)&a) || !GetAce(acls[1], i, (LPVOID *)&b) ||
-        a->AceSize != b->AceSize || memcmp(a, b, a->AceSize) != 0) goto done;
+        a->AceSize != b->AceSize || memcmp(a, b, a->AceSize) != 0) {
+      fprintf(stderr, "response_file_security: mismatch=ace-content index=%lu\n", (unsigned long)i);
+      goto done;
+    }
   }
   matches = 1;
 done:
@@ -107,7 +117,7 @@ int response_file_security_lock(const char *path, int directory) {
   const char *dacl = directory ? "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)" : "D:P(A;;FA;;;BA)(A;;FA;;;SY)";
   char actual[8192];
   if (apply_dacl(path, dacl) != 0 || read_dacl(path, actual, sizeof(actual)) != 0) return -1;
-  if (!dacl_matches(actual, dacl)) return security_failure("lock-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
+  if (!dacl_matches(actual, dacl, SE_DACL_PROTECTED)) return security_failure("lock-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
   if (!directory) {
     DWORD wanted = (attr & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
     if (!SetFileAttributesA(path, wanted)) return security_failure("lock-set-attributes", GetLastError());
@@ -123,13 +133,46 @@ int response_file_security_restore(const char *path, const EdrResponseFileSecuri
   DWORD attr = GetFileAttributesA(path);
   if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) return -1;
   if (!saved || !saved->dacl[0]) return security_failure("restore-snapshot", ERROR_INVALID_PARAMETER);
-  if (apply_dacl(path, saved->dacl) != 0) return -1;
-  if (!SetFileAttributesA(path, saved->attributes)) return security_failure("restore-set-attributes", GetLastError());
+  PSECURITY_DESCRIPTOR sd = NULL;
+  PACL dacl = NULL;
+  BOOL present = FALSE, defaulted = FALSE;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(saved->dacl, SDDL_REVISION_1, &sd, NULL))
+    return security_failure("restore-parse-dacl", GetLastError());
+  DWORD error = ERROR_INVALID_SECURITY_DESCR;
+  const char *stage = "restore-validate-dacl";
+  if (!GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) || !present || !dacl || !IsValidAcl(dacl)) goto done;
+  SECURITY_DESCRIPTOR_CONTROL control = 0;
+  DWORD revision = 0;
+  stage = "restore-prepare-inheritance";
+  /* The low-level setter consumes AR as the request to retain an existing AI
+     state; AI alone is cleared. AR is not added to the saved snapshot. */
+  if (!GetSecurityDescriptorControl(sd, &control, &revision) ||
+      ((control & SE_DACL_AUTO_INHERITED) &&
+       !SetSecurityDescriptorControl(sd, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERIT_REQ))) {
+    error = GetLastError();
+    goto done;
+  }
+
+  /* Restore attributes while the quarantine ACL still permits writing them.
+     A valid original ACL can deny FILE_WRITE_ATTRIBUTES even to SYSTEM. */
+  stage = "restore-set-attributes";
+  if (!SetFileAttributesA(path, saved->attributes)) { error = GetLastError(); goto done; }
+
+  /* Snapshot replay, not a new inheritance policy. SetNamedSecurityInfo with
+     UNPROTECTED_DACL_SECURITY_INFORMATION merges the current parent's ACEs.
+     The low-level file API preserves this saved descriptor without that merge.
+     This path is file-only; directory locking retains SetNamedSecurityInfo. */
+  stage = "restore-set-dacl";
+  error = SetFileSecurityA(path, DACL_SECURITY_INFORMATION, sd) ? ERROR_SUCCESS : GetLastError();
+done:
+  LocalFree(sd);
+  if (error != ERROR_SUCCESS) return security_failure(stage, error);
   DWORD observed = GetFileAttributesA(path);
   if (observed == INVALID_FILE_ATTRIBUTES) return security_failure("restore-read-attributes", GetLastError());
   if (observed != saved->attributes) return security_failure("restore-verify-attributes", ERROR_INVALID_DATA);
   if (read_dacl(path, actual, sizeof(actual)) != 0) return -1;
-  if (!dacl_matches(actual, saved->dacl)) return security_failure("restore-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
+  if (!dacl_matches(actual, saved->dacl, SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ))
+    return security_failure("restore-verify-dacl", ERROR_INVALID_SECURITY_DESCR);
   return 0;
 }
 
