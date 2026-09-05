@@ -593,10 +593,45 @@ static int edr_test_parse_handle_value(const wchar_t *text, HANDLE *handle_out) 
   return 1;
 }
 
+/* A HANDLE is a process-local slot, not an object identity. The loader can
+ * reuse an unlisted slot before wmain; a valid unrelated handle is not a leak.
+ * The explicitly whitelisted duplicate pins the canary's object for comparison. */
+static int edr_test_canary_isolated(HANDLE candidate, HANDLE reference) {
+  DWORD flags = 0;
+  if (!GetHandleInformation(reference, &flags)) return 0;
+  return !CompareObjectHandles(candidate, reference);
+}
+
+static int edr_test_canary_identity(void) {
+  HANDLE canary = CreateEventW(NULL, TRUE, FALSE, NULL);
+  HANDLE unrelated = CreateEventW(NULL, TRUE, FALSE, NULL);
+  HANDLE reference = NULL;
+  int ok = canary && unrelated &&
+           DuplicateHandle(GetCurrentProcess(), canary, GetCurrentProcess(),
+                            &reference, 0, FALSE, DUPLICATE_SAME_ACCESS) &&
+           !edr_test_canary_isolated(canary, reference) &&
+           !edr_test_canary_isolated(reference, reference) &&
+           edr_test_canary_isolated(unrelated, reference) &&
+           edr_test_canary_isolated(NULL, reference) &&
+           !edr_test_canary_isolated(unrelated, NULL);
+  if (reference) CloseHandle(reference);
+  if (unrelated) CloseHandle(unrelated);
+  if (canary) CloseHandle(canary);
+  if (!ok) fprintf(stderr, "canary object identity contract failed\n");
+  return ok;
+}
+
+typedef struct EdrNativeTestFailureFrame {
+  DWORD magic;
+  DWORD error;
+  char stage[64];
+} EdrNativeTestFailureFrame;
+
 static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   HANDLE secret_read = INVALID_HANDLE_VALUE;
   HANDLE acknowledgement = INVALID_HANDLE_VALUE;
   HANDLE canary = INVALID_HANDLE_VALUE;
+  HANDLE canary_reference = INVALID_HANDLE_VALUE;
   EdrWindowsSpawnLock child_spawn_lock = { 0 };
   BYTE secret[EDR_WINDOWS_HANDOFF_MAX_FRAME];
   DWORD secret_length = 0;
@@ -604,6 +639,7 @@ static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   const wchar_t *secret_text = arg_value(argc, argv, L"--secret-handle");
   const wchar_t *ack_text = arg_value(argc, argv, L"--ack-handle");
   const wchar_t *canary_text = arg_value(argc, argv, L"--canary-handle");
+  const wchar_t *reference_text = arg_value(argc, argv, L"--canary-reference");
   const BYTE *expected_secret = EDR_LOCAL_HANDOFF_MARKER;
   DWORD expected_secret_length = sizeof(EDR_LOCAL_HANDOFF_MARKER) - 1;
   static const BYTE ready[] = "edr.finalizer.ready.v1";
@@ -611,15 +647,14 @@ static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   ZeroMemory(secret, sizeof(secret));
   if (!edr_finalizer_parse_handle(secret_text, &secret_read) ||
       !edr_finalizer_parse_handle(ack_text, &acknowledgement) ||
+      !edr_finalizer_parse_handle(reference_text, &canary_reference) ||
       !edr_test_parse_handle_value(canary_text, &canary)) {
     goto cleanup;
   }
   failure_stage = "reject-unlisted-canary";
-  {
-    DWORD canary_flags = 0;
-    if (GetHandleInformation(canary, &canary_flags)) {
-      goto cleanup;
-    }
+  if (!edr_test_canary_isolated(canary, canary_reference)) {
+    SetLastError(ERROR_INVALID_HANDLE);
+    goto cleanup;
   }
   canary = INVALID_HANDLE_VALUE;
   failure_stage = "read-handoff-secret";
@@ -636,13 +671,21 @@ static int edr_finalizer_foundation_child(int argc, wchar_t **argv) {
   ok = 1;
 cleanup:
   if (!ok) {
+    EdrNativeTestFailureFrame failure;
+    ZeroMemory(&failure, sizeof(failure));
+    failure.magic = EDR_FINALIZER_ERROR_MAGIC;
+    failure.error = edr_finalizer_last_error();
+    snprintf(failure.stage, sizeof(failure.stage), "%s", failure_stage);
     fprintf(stderr, "windows native uninstall child failed: stage=%s win32=%lu\n",
-            failure_stage, (unsigned long)GetLastError());
+            failure_stage, (unsigned long)failure.error);
+    (void)edr_windows_handoff_write_frame(acknowledgement,
+                                         (const BYTE *)&failure, sizeof(failure));
   }
   edr_windows_spawn_lock_release(&child_spawn_lock);
   SecureZeroMemory(secret, sizeof(secret));
   if (secret_read != INVALID_HANDLE_VALUE) CloseHandle(secret_read);
   if (acknowledgement != INVALID_HANDLE_VALUE) CloseHandle(acknowledgement);
+  if (canary_reference != INVALID_HANDLE_VALUE) CloseHandle(canary_reference);
   return ok ? ERROR_SUCCESS : ERROR_INVALID_HANDLE;
 }
 
@@ -906,14 +949,16 @@ static int edr_finalizer_foundation_self_test(void) {
   HANDLE ack_read = INVALID_HANDLE_VALUE;
   HANDLE ack_write = INVALID_HANDLE_VALUE;
   HANDLE canary = INVALID_HANDLE_VALUE;
-  HANDLE handles[2];
+  HANDLE canary_reference = INVALID_HANDLE_VALUE;
+  HANDLE handles[3];
   EdrWindowsSpawnLock spawn_lock = { 0 };
   HANDLE probe_thread = NULL;
   EdrSpawnLockProbe probe;
   DWORD cleanup_error = ERROR_SUCCESS;
   DWORD wait_result = WAIT_FAILED;
   DWORD failure_error = ERROR_SUCCESS;
-  DWORD exit_code = ERROR_GEN_FAILURE;
+  DWORD exit_code = STILL_ACTIVE;
+  int child_exit_observed = 0;
   int result = ERROR_GEN_FAILURE;
   int created_link = 0;
   int root_deleted = 0;
@@ -925,6 +970,8 @@ static int edr_finalizer_foundation_self_test(void) {
   ZeroMemory(acknowledgement, sizeof(acknowledgement));
   ZeroMemory(&probe, sizeof(probe));
   if (!edr_test_handoff_frames()) goto cleanup;
+  failure_stage = "canary-object-identity";
+  if (!edr_test_canary_identity()) goto cleanup;
   failure_stage = "inno-uninstall-registry-key";
   if (wcscmp(EDR_INNO_UNINSTALL_REGISTRY_KEY,
              L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
@@ -1080,28 +1127,36 @@ static int edr_finalizer_foundation_self_test(void) {
       !CreatePipe(&secret_read, &secret_write, &pipe_security, 0) ||
       !CreatePipe(&ack_read, &ack_write, &pipe_security, 0)) goto cleanup;
   canary = CreateEventW(&pipe_security, TRUE, FALSE, NULL);
-  if (!canary || !SetHandleInformation(canary, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) goto cleanup;
+  /* Identity comparison needs no event access rights on the reference. */
+  if (!canary || !SetHandleInformation(canary, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) ||
+      !DuplicateHandle(GetCurrentProcess(), canary, GetCurrentProcess(),
+                        &canary_reference, 0, FALSE, 0)) goto cleanup;
   failure_stage = "spawn-foundation-child";
   handles[0] = secret_read;
   handles[1] = ack_write;
+  handles[2] = canary_reference;
   _snwprintf(command, sizeof(command) / sizeof(command[0]),
-             L"\"%ls\" --native-foundation-child --secret-handle %llu --ack-handle %llu --canary-handle %llu --local-marker",
+             L"\"%ls\" --native-foundation-child --secret-handle %llu --ack-handle %llu --canary-handle %llu --canary-reference %llu --local-marker",
              target, (unsigned long long)(ULONG_PTR)secret_read,
              (unsigned long long)(ULONG_PTR)ack_write,
-             (unsigned long long)(ULONG_PTR)canary);
+             (unsigned long long)(ULONG_PTR)canary,
+             (unsigned long long)(ULONG_PTR)canary_reference);
   command[(sizeof(command) / sizeof(command[0])) - 1] = L'\0';
-  if (!edr_windows_spawn_whitelisted(command, root, handles, 2, &process,
+  if (!edr_windows_spawn_whitelisted(command, root, handles, 3, &process,
                                      child_creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS))) goto cleanup;
   failure_stage = "parent-handle-flags";
   {
     DWORD secret_flags = 0;
     DWORD ack_flags = 0;
     DWORD canary_flags = 0;
+    DWORD reference_flags = 0;
     if (!GetHandleInformation(secret_read, &secret_flags) ||
         !GetHandleInformation(ack_write, &ack_flags) ||
         !GetHandleInformation(canary, &canary_flags) ||
+        !GetHandleInformation(canary_reference, &reference_flags) ||
         (secret_flags & HANDLE_FLAG_INHERIT) ||
         (ack_flags & HANDLE_FLAG_INHERIT) ||
+        (reference_flags & HANDLE_FLAG_INHERIT) ||
         !(canary_flags & HANDLE_FLAG_INHERIT)) goto cleanup;
   }
   CloseHandle(secret_read);
@@ -1110,14 +1165,35 @@ static int edr_finalizer_foundation_self_test(void) {
   ack_write = INVALID_HANDLE_VALUE;
   CloseHandle(canary);
   canary = INVALID_HANDLE_VALUE;
+  CloseHandle(canary_reference);
+  canary_reference = INVALID_HANDLE_VALUE;
   edr_windows_spawn_lock_release(&spawn_lock);
   failure_stage = "finalizer-ready-exchange";
-  if (!edr_windows_handoff_write_frame(secret_write, secret, sizeof(secret) - 1) ||
-      !edr_windows_handoff_read_frame(ack_read, acknowledgement,
-                                      sizeof(acknowledgement),
-                                      &acknowledgement_length) ||
-      acknowledgement_length != sizeof(ready) - 1 ||
-      memcmp(acknowledgement, ready, sizeof(ready) - 1) != 0) goto cleanup;
+  {
+    int wrote = edr_windows_handoff_write_frame(secret_write, secret, sizeof(secret) - 1);
+    DWORD write_error = wrote ? ERROR_SUCCESS : edr_finalizer_last_error();
+    int read = edr_windows_handoff_read_frame(ack_read, acknowledgement,
+                                              sizeof(acknowledgement),
+                                              &acknowledgement_length);
+    /* The child has no inherited stderr. Keep its diagnostic on the existing
+     * bounded pipe even if it rejects a handle before reading the secret. */
+    if (read && acknowledgement_length == sizeof(EdrNativeTestFailureFrame)) {
+      EdrNativeTestFailureFrame failure;
+      memcpy(&failure, acknowledgement, sizeof(failure));
+      if (failure.magic == EDR_FINALIZER_ERROR_MAGIC) {
+        failure.stage[sizeof(failure.stage) - 1] = '\0';
+        fprintf(stderr, "windows native uninstall child failed: stage=%s win32=%lu\n",
+                failure.stage, (unsigned long)failure.error);
+        SetLastError(failure.error);
+        goto cleanup;
+      }
+    }
+    if (!wrote || !read || acknowledgement_length != sizeof(ready) - 1 ||
+        memcmp(acknowledgement, ready, sizeof(ready) - 1) != 0) {
+      if (!wrote) SetLastError(write_error);
+      goto cleanup;
+    }
+  }
   CloseHandle(secret_write);
   secret_write = INVALID_HANDLE_VALUE;
   CloseHandle(ack_read);
@@ -1134,9 +1210,9 @@ cleanup:
   edr_windows_spawn_lock_release(&spawn_lock);
   if (probe_thread) CloseHandle(probe_thread);
   if (process.hProcess) {
-    DWORD process_exit = STILL_ACTIVE;
-    if (GetExitCodeProcess(process.hProcess, &process_exit) &&
-        process_exit == STILL_ACTIVE) {
+    wait_result = WaitForSingleObject(process.hProcess, EDR_FINALIZER_IO_TIMEOUT_MS);
+    child_exit_observed = GetExitCodeProcess(process.hProcess, &exit_code) != FALSE;
+    if (child_exit_observed && exit_code == STILL_ACTIVE) {
       TerminateProcess(process.hProcess, ERROR_CANCELLED);
       WaitForSingleObject(process.hProcess, EDR_FINALIZER_IO_TIMEOUT_MS);
     }
@@ -1148,6 +1224,7 @@ cleanup:
   if (ack_read != INVALID_HANDLE_VALUE) CloseHandle(ack_read);
   if (ack_write != INVALID_HANDLE_VALUE) CloseHandle(ack_write);
   if (canary != INVALID_HANDLE_VALUE) CloseHandle(canary);
+  if (canary_reference != INVALID_HANDLE_VALUE) CloseHandle(canary_reference);
   SecureZeroMemory(acknowledgement, sizeof(acknowledgement));
   SecureZeroMemory(secret, sizeof(secret));
   if (root[0]) {
@@ -1174,10 +1251,10 @@ cleanup:
   if (result != ERROR_SUCCESS) {
     fprintf(stderr,
             "windows native uninstall test failed: stage=%s result=%d win32=%lu "
-            "cleanup=%lu wait=%lu child_exit=%lu\n",
+            "cleanup=%lu wait=%lu child_exit_observed=%d child_exit=0x%08lx\n",
             failure_stage, result, (unsigned long)failure_error,
             (unsigned long)cleanup_error, (unsigned long)wait_result,
-            (unsigned long)exit_code);
+            child_exit_observed, (unsigned long)exit_code);
   }
   return result;
 }

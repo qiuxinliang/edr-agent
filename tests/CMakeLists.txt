@@ -380,7 +380,7 @@ if(WIN32)
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_link_libraries(test_windows_native_uninstall PRIVATE
-    shell32 user32 advapi32 rpcrt4 crypt32 ncrypt winhttp ole32 oleaut32 taskschd)
+    shell32 user32 advapi32 rpcrt4 crypt32 ncrypt winhttp ole32 oleaut32 taskschd onecore)
   edr_apply_test_warnings(test_windows_native_uninstall)
   add_test(NAME windows_native_uninstall_behavior COMMAND test_windows_native_uninstall
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
