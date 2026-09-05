@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r276-39c53800",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-0f17fb98",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
-  "rule_count": 173,
+  "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "db785773c13c52eab3359db05048c00be60afc380d1385916fd444143315d7ae",
+  "sensor_interest_manifest_sha256": "525fe482fe0be014c71837154d170d15663fb3e3259eeb91d16877eb75ed191e",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -3641,9 +3641,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1003",
         "T1555",
-        "T1555.003",
-        "T1003"
+        "T1555.003"
       ],
       "description": "检测 LaZagne、SharpDPAPI、Seatbelt 等本地凭据、DPAPI、Windows Vault、浏览器 cookie/session 收集工具。",
       "condition": {
@@ -3712,6 +3712,180 @@
           "(?i)(juicypotato|roguepotato|sweetpotato|godpotato|efspotato|printspoofer)",
           "(?i)(SeImpersonatePrivilege|ImpersonateNamedPipeClient|RpcImpersonateClient)",
           "(?i)(\\\\pipe\\\\spoolss|\\\\pipe\\\\efsrpc).*?(cmd|powershell|whoami)"
+        ]
+      }
+    },
+    {
+      "id": "R-EXEC-006",
+      "title": "脚本解释器内联下载后执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.006",
+        "T1059.007",
+        "T1105"
+      ],
+      "description": "同一解释器命令同时包含内联执行、网络获取和代码执行。仅表示可疑行为，不判断是否由 AI 生成。",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\s-[ce]\\s",
+          "(?i)(urllib\\.request|requests\\.get|https?['\"]\\)|fetch\\s*\\()",
+          "(?i)https?://",
+          "(?i)(\\b(exec|eval)\\s*\\(|child_process)"
+        ],
+        "process_name_in": [
+          "python.exe",
+          "pythonw.exe",
+          "node.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-CRED-011",
+      "title": "脚本解释器读取浏览器会话库",
+      "severity": 2,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1539"
+      ],
+      "description": "解释器读取 Cookie 数据库；保留进程身份与文件路径供云关联，不单独自动阻断合法自动化。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\Network\\\\Cookies$",
+          "(?i)\\\\cookies\\.sqlite$"
+        ],
+        "process_name_in": [
+          "python.exe",
+          "pythonw.exe",
+          "node.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "wscript.exe",
+          "cscript.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-RANSOM-004",
+      "title": "PowerShell 删除卷影副本",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1490"
+      ],
+      "description": "Win32_ShadowCopy 与删除操作必须同时存在，查询和正常清单不匹配；与防护破坏关联后提示勒索前置。",
+      "condition": {
+        "command_regex_all": [
+          "(?i)\\bWin32_ShadowCopy\\b",
+          "(?i)(\\bRemove-(CimInstance|WmiObject)\\b|\\.Delete\\s*\\()"
+        ],
+        "process_name_in": [
+          "powershell.exe",
+          "pwsh.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-DEV-CREDENTIAL-READ-001",
+      "title": "解释器读取开发或 AI 平台凭据文件",
+      "severity": 2,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1552.001"
+      ],
+      "description": "仅采集解释器对明确凭据路径的读取；不采集密钥正文，不单独确认凭据泄露。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\[.](npmrc|pypirc|git-credentials)$",
+          "(?i)\\\\[.](docker\\\\config[.]json|kube\\\\config)$",
+          "(?i)\\\\([.]cache\\\\)?huggingface\\\\(token|stored_tokens)$"
+        ],
+        "process_name_in": [
+          "node.exe",
+          "python.exe",
+          "pythonw.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "wscript.exe",
+          "cscript.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-DEV-PTH-WRITE-001",
+      "title": "非 Python 解释器写入 Python 启动钩子",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.018"
+      ],
+      "description": "脚本宿主向 site-packages 写入 .pth；只证明写入，不证明文件含有自动执行语句。正常 Python/pip 安装不在此规则范围。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\site-packages\\\\[^\\\\]+[.]pth$"
+        ],
+        "process_name_in": [
+          "node.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "wscript.exe",
+          "cscript.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-AI-CONFIG-WRITE-001",
+      "title": "脚本解释器改写 AI 工具连接配置",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [],
+      "description": "记录脚本改写 MCP/桌面 AI 配置，结合凭据读取评估；不能仅由文件写入断言提示注入、二进制篡改或恶意工具执行，暂不赋予 ATT&CK 技术映射。",
+      "condition": {
+        "file_path_regex_any": [
+          "(?i)\\\\[.](cursor|vscode)\\\\mcp[.]json$",
+          "(?i)\\\\Claude\\\\claude_desktop_config[.]json$"
+        ],
+        "process_name_in": [
+          "node.exe",
+          "python.exe",
+          "pythonw.exe",
+          "powershell.exe",
+          "pwsh.exe",
+          "wscript.exe",
+          "cscript.exe"
+        ]
+      }
+    },
+    {
+      "id": "R-IDENTITY-CLI-TOKEN-001",
+      "title": "端点执行云令牌申请或角色切换",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1078.004"
+      ],
+      "description": "只证明特定 CLI 命令被执行，不证明成功签发令牌或云身份被接管；正常授权运维也可能命中，需与前序凭据风险关联。",
+      "condition": {
+        "command_regex_any": [
+          "(?i)\\baws(?:[.]exe)?[\"']?\\s+sts\\s+(assume-role|get-session-token)\\b",
+          "(?i)\\baz(?:[.](cmd|exe))?[\"']?\\s+account\\s+get-access-token\\b",
+          "(?i)\\bgcloud(?:[.](cmd|exe))?[\"']?\\s+auth\\s+print-access-token\\b"
+        ],
+        "process_name_in": [
+          "aws.exe",
+          "az.exe",
+          "gcloud.exe",
+          "python.exe",
+          "cmd.exe",
+          "powershell.exe",
+          "pwsh.exe"
         ]
       }
     }

@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r276-39c53800",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-0f17fb98",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 173,
+  "rule_count": 180,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1792,9 +1792,9 @@
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
+        "T1003",
         "T1555",
-        "T1555.003",
-        "T1003"
+        "T1555.003"
       ]
     },
     {
@@ -1829,6 +1829,76 @@
       "mitre_ttps": [
         "T1068",
         "T1134.001"
+      ]
+    },
+    {
+      "id": "R-EXEC-006",
+      "title": "脚本解释器内联下载后执行",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1059.006",
+        "T1059.007",
+        "T1105"
+      ]
+    },
+    {
+      "id": "R-CRED-011",
+      "title": "脚本解释器读取浏览器会话库",
+      "severity": 2,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1539"
+      ]
+    },
+    {
+      "id": "R-RANSOM-004",
+      "title": "PowerShell 删除卷影副本",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1490"
+      ]
+    },
+    {
+      "id": "R-DEV-CREDENTIAL-READ-001",
+      "title": "解释器读取开发或 AI 平台凭据文件",
+      "severity": 2,
+      "event_type": "file_read",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1552.001"
+      ]
+    },
+    {
+      "id": "R-DEV-PTH-WRITE-001",
+      "title": "非 Python 解释器写入 Python 启动钩子",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1546.018"
+      ]
+    },
+    {
+      "id": "R-AI-CONFIG-WRITE-001",
+      "title": "脚本解释器改写 AI 工具连接配置",
+      "severity": 2,
+      "event_type": "file_write",
+      "enabled": true,
+      "mitre_ttps": []
+    },
+    {
+      "id": "R-IDENTITY-CLI-TOKEN-001",
+      "title": "端点执行云令牌申请或角色切换",
+      "severity": 2,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1078.004"
       ]
     }
   ]
