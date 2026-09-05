@@ -1125,11 +1125,19 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
   char hash_value[96], hash_quality[64], hash_reason[160], signature_status[64], signature_source[96];
   char signer[1024], thumbprint[192], revocation[64], signature_quality[64], signature_reason[160];
   int n;
-  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->is_security_4688) return;
-  /* Never spend the bounded wait on ordinary ProcessCreate traffic.  The
-   * coalescer already admits only P0-interest records to this evidence path;
-   * non-candidates proceed without a synchronous hash/WVT wait. */
-  if (!p0_process_create_candidate(br)) return;
+  if (!br || br->is_security_4688 ||
+      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ)) {
+    return;
+  }
+  /* Never spend the bounded wait on ordinary ProcessCreate or FileRead
+   * traffic. ProcessCreate uses the manifest-backed interest prefilter;
+   * FileRead reaches this point only after its target path and exact actor
+   * generation have been bound, so require a complete authenticated-IR match
+   * before reusing or starting actor evidence work. */
+  if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_create_candidate(br)) ||
+      (br->type == EDR_EVENT_FILE_READ && !edr_p0_rule_ir_br_matches_any(br))) {
+    return;
+  }
   generation = br->process_start_key;
   memset(&requested, 0, sizeof(requested));
   evidence_ready = edr_process_evidence_request(

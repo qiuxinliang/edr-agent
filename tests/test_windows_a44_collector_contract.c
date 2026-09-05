@@ -486,6 +486,10 @@ int main(void) {
                          "preprocess must label an exact historical FileRead generation");
   ok &= require_contains(direct, "file_read_process_tree_cache_generation",
                          "direct P0 must accept only the explicit historical FileRead generation source");
+  ok &= require_contains(
+      preprocess,
+      "br->type == EDR_EVENT_FILE_READ && !edr_p0_rule_ir_br_matches_any(br)",
+      "only an authenticated-IR FileRead match may reuse bounded actor evidence work");
   ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" : \"event\"",
                          "typed record mapping must preserve read semantics");
   ok &= require_before(collector, "if (slot->type == EDR_EVENT_FILE_READ) {",
