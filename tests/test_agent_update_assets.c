@@ -726,14 +726,19 @@ int main(void) {
            "release workflow rejects an uninstaller that imports the installed MSVC runtime");
   contains(client_release, "native-package-integrity.json",
            "release workflow packages native component SHA-256 identities");
-  contains(client_release, "Required release test was not configured",
-           "release workflow rejects a missing lifecycle release gate");
-  contains(client_release, "agent_update_packaging_contract",
-           "release workflow executes the OTA packaging contract gate");
-  contains(client_release, "pmfe_pe_architectures",
-           "release workflow executes the ARM64, ARM64EC, and x64 emulation PE recognition test");
-  contains(client_release, "'test_pmfe_pe_arch'",
-           "release workflow builds the PMFE PE architecture test before CTest executes it");
+  contains(client_release, "'windows_release_gate_tests'",
+           "release workflow builds every executable in the shared gate");
+  contains(client_release, "--no-tests=error --label-regex '^windows-release-gate$'",
+           "release workflow runs the shared gate and rejects an empty selection");
+  snprintf(path, sizeof(path), "%s/cmake/WindowsReleaseGate.cmake", root);
+  char *release_gate = read_file(path);
+  contains(release_gate, "message(FATAL_ERROR \"Windows release gate test is not registered:",
+           "configure rejects missing gate registrations");
+  contains(release_gate, "edr_windows_release_gate(agent_update_packaging_contract test_agent_update_assets)",
+           "OTA packaging contract is both built and executed");
+  contains(release_gate, "edr_windows_release_gate(pmfe_pe_architectures test_pmfe_pe_arch)",
+           "PE architecture contract is both built and executed");
+  free(release_gate);
   contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release native target $nativeTarget failed",
@@ -827,10 +832,10 @@ int main(void) {
            "client build reuses validated vcpkg caches without restoring an installed tree");
   contains(client_build, "$global:LASTEXITCODE = 0",
            "client build clears the handled pre-built cache-miss exit status");
-  contains(client_build, "Client build test configuration has no discoverable tests",
+  contains(client_build, "--no-tests=error --label-regex '^windows-release-gate$'",
            "client build rejects an empty CTest configuration");
-  contains(client_build, "test_pmfe_pe_arch",
-           "client build compiles the PMFE architecture contract test");
+  contains(client_build, "'windows_release_gate_tests'",
+           "client build compiles the shared gate including the PMFE architecture contract");
   contains(client_build, "actions/upload-artifact@v6",
            "client build uses the Node 24 artifact upload action");
   contains(client_build, "$nativeIntegrityFiles.ToArray()",

@@ -446,25 +446,25 @@ jobs:
           }
           if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
 
+      - name: Verify release gate build dependencies
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_windows_release_gate.py -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows release gate dependency regression failed" }
+
       - name: Build (Ninja)
         shell: pwsh
         run: |
           $releaseTargets = @(
             'edr_agent',
-            'test_command_contract',
-            'test_agent_update_contract',
-            'test_agent_update_assets',
-            'test_windows_headless_runtime_contract',
-            'test_windows_native_manifest',
-            'test_windows_native_uninstall',
-            'test_pmfe_pe_arch'
+            'windows_release_gate_tests'
           )
-          cmake --build build --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          cmake --build build --config Release --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
           if ($LASTEXITCODE -ne 0) {
             throw "Windows release product or gate-test build failed with exit code $LASTEXITCODE"
           }
           foreach ($nativeTarget in @('fd_installer_worker', 'fd_headless_uninstaller')) {
-            cmake --build build --target $nativeTarget --parallel $env:NUMBER_OF_PROCESSORS --verbose
+            cmake --build build --config Release --target $nativeTarget --parallel $env:NUMBER_OF_PROCESSORS --verbose
             if ($LASTEXITCODE -ne 0) {
               throw "Windows release native target $nativeTarget failed with exit code $LASTEXITCODE"
             }
@@ -564,30 +564,7 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
-          $listed = & ctest --test-dir build -N
-          if ($LASTEXITCODE -ne 0 -or (($listed -join "`n") -match 'Total Tests:\s*0')) {
-            throw "Release test configuration has no discoverable tests"
-          }
-          $required = @(
-            'agent_update_command_contract',
-            'agent_update_packaging_contract',
-            'windows_headless_runtime_contract',
-            'command_registry_and_payload_contract',
-            'pmfe_pe_architectures',
-            'windows_native_manifest_behavior',
-            'windows_native_uninstall_behavior',
-            'process_generation_same_handle_command_line',
-            'response_file_security_behavior',
-            'response_forensic_path_contract',
-            'windows_isolation_mock_behavior'
-          )
-          $listedText = $listed -join "`n"
-          foreach ($name in $required) {
-            if ($listedText -notmatch [regex]::Escape($name)) {
-              throw "Required release test was not configured: $name"
-            }
-          }
-          & ctest --test-dir build --output-on-failure --tests-regex '^(agent_update_command_contract|agent_update_packaging_contract|windows_headless_runtime_contract|command_registry_and_payload_contract|pmfe_pe_architectures|windows_native_manifest_behavior|windows_native_uninstall_behavior|process_generation_same_handle_command_line|response_file_security_behavior|response_forensic_path_contract|windows_isolation_mock_behavior)$'
+          & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
 
       - name: "[Timing] Build summary"

@@ -1191,3 +1191,7 @@ add_test(NAME event_batch_max_age COMMAND test_event_batch_max_age WORKING_DIREC
 
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
+
+if(WIN32)
+  include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
+endif()
