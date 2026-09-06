@@ -17,6 +17,7 @@ LABEL = "^windows-release-gate$"
 EXPECTED = {
     "agent_update_command_contract", "agent_update_packaging_contract",
     "windows_headless_runtime_contract", "command_registry_and_payload_contract",
+    "command_process_identity_and_receipts",
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
     "response_file_security_behavior", "response_forensic_path_contract",
