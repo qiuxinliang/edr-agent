@@ -907,7 +907,7 @@ int edr_response_forensic_async_accept(const char *cmd_id, const char *command_t
 /* 终态上报(poll 线程):成功/失败/已取消。do_upload 时先上传。 */
 static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm, int do_upload,
                                const char *command_type, const char *artifact, int rc, const char *tier,
-                               int cancelled) {
+                               int cancelled, const char *collector_detail) {
   char minio_key[1024];
   minio_key[0] = '\0';
   if (cancelled) {
@@ -965,7 +965,10 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
   } else {
     edr_cmd_inc_exec_fail();
     char fail[1200], error[300];
-    snprintf(error, sizeof(error), "forensic external failed(%s) rc=%d", tier ? tier : "unknown", rc);
+    snprintf(error, sizeof(error), "forensic external failed(%s) rc=%d%s%s",
+             tier ? tier : "unknown", rc,
+             collector_detail && collector_detail[0] ? " detail=" : "",
+             collector_detail && collector_detail[0] ? collector_detail : "");
     if (command_type && strcmp(command_type, "yara_scan") == 0) {
       yara_artifact_result_json(fail, sizeof(fail), "failed",
                                 tier && strcmp(tier, "velo") == 0 ? "velociraptor" : "builtin",
@@ -1027,7 +1030,7 @@ void edr_response_forensic_async_poll(void) {
     (void)memset(&g_fx, 0, sizeof(g_fx));
     fx_unlock();
     (void)remove(req);
-    fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "cancelled", 1);
+    fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "cancelled", 1, "");
     return;
   }
 
@@ -1062,6 +1065,7 @@ void edr_response_forensic_async_poll(void) {
     int sr = edr_deep_collector_spawn(&spec, bd, sizeof(bd));
     if (sr == EDR_DC_OK) { fx_unlock(); return; } /* builtin 已起,下轮 poll 收割 */
     rc = sr; tier = "builtin"; /* builtin 也起不来 → 失败终态 */
+    snprintf(pd, sizeof(pd), "%s", bd);
   }
 
   /* 终态:快照后出锁上报+上传 */
@@ -1075,7 +1079,7 @@ void edr_response_forensic_async_poll(void) {
   (void)memset(&g_fx, 0, sizeof(g_fx));
   fx_unlock();
   (void)remove(req);
-  fx_report_terminal(cmd_id, &sm, do_upload, command_type, artifact, rc, tier_final, 0);
+  fx_report_terminal(cmd_id, &sm, do_upload, command_type, artifact, rc, tier_final, 0, pd);
 }
 
 int edr_response_forensic_async_cancel(const char *target_cmd_id) {
@@ -1102,7 +1106,7 @@ void edr_response_forensic_async_abort_shutdown(void) {
   (void)memset(&g_fx, 0, sizeof(g_fx));
   fx_unlock();
   (void)remove(req);
-  fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "shutdown", 1);
+  fx_report_terminal(cmd_id, &sm, 0, command_type, "", 0, "shutdown", 1, "");
 }
 
 int edr_response_forensic_async_active(void) {

@@ -183,8 +183,20 @@ int response_forensic_build_collector_paths(const char *outdir, char separator,
   if (written < 0 || (size_t)written >= artifact_cap) {
     goto invalid;
   }
-  written = snprintf(extra_args, extra_args_cap, "--request=%s --out-file=%s",
-                     reqpath, artifact);
+  if (separator == '\\') {
+    /* CreateProcess parses the complete command line. The installed Windows
+     * output directory lives below Program Files, so both values must remain
+     * one argv element when they cross that boundary. Windows paths cannot
+     * contain a double quote; reject one instead of emitting ambiguous args. */
+    if (strchr(reqpath, '"') || strchr(artifact, '"')) {
+      goto invalid;
+    }
+    written = snprintf(extra_args, extra_args_cap,
+                       "--request=\"%s\" --out-file=\"%s\"", reqpath, artifact);
+  } else {
+    written = snprintf(extra_args, extra_args_cap, "--request=%s --out-file=%s",
+                       reqpath, artifact);
+  }
   if (written < 0 || (size_t)written >= extra_args_cap) {
     goto invalid;
   }

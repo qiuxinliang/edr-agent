@@ -1184,6 +1184,14 @@ static HANDLE g_collector_process = NULL;
 static HANDLE g_collector_job = NULL;
 static int g_running = 0;
 static char g_detail[512];
+static char g_collector_stderr_path[1100];
+
+static void dc_async_stderr_cleanup(void) {
+  if (g_collector_stderr_path[0]) {
+    (void)remove(g_collector_stderr_path);
+    g_collector_stderr_path[0] = '\0';
+  }
+}
 
 int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   if (!params) return EDR_DC_ERR_DISABLED;
@@ -1279,17 +1287,22 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
     CloseHandle(g_collector_process);
     g_collector_process = NULL;
     g_running = 0;
+    dc_async_stderr_cleanup();
     return EDR_DC_ERR_CRASH;
   }
 
   if (ec != STILL_ACTIVE) {
     if (out_exit_code) *out_exit_code = (int)ec;
     if (out_detail) {
-      snprintf(out_detail, detail_cap, "%s", g_detail[0] ? g_detail : "completed");
+      snprintf(out_detail, detail_cap, "collector exit=%lu", (unsigned long)ec);
+      if (ec != 0) {
+        dc_append_stderr_tail(g_collector_stderr_path, out_detail, detail_cap);
+      }
     }
     CloseHandle(g_collector_process);
     g_collector_process = NULL;
     g_running = 0;
+    dc_async_stderr_cleanup();
     return 0;
   }
   return 1;
@@ -1298,6 +1311,7 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
 void edr_deep_collector_kill(void) {
   if (g_collector_process) {
     TerminateProcess(g_collector_process, 9);
+    (void)WaitForSingleObject(g_collector_process, 5000u);
     CloseHandle(g_collector_process);
     g_collector_process = NULL;
   }
@@ -1306,6 +1320,7 @@ void edr_deep_collector_kill(void) {
     g_collector_job = NULL;
   }
   g_running = 0;
+  dc_async_stderr_cleanup();
 }
 
 int edr_deep_collector_is_running(void) {
@@ -1494,6 +1509,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   if (g_collector_job) { CloseHandle(g_collector_job); g_collector_job = NULL; }
   g_running = 0;
   g_detail[0] = '\0';
+  dc_async_stderr_cleanup();
 
   char binpath[1024];
   int vr = dc_resolve_verify(spec->collector_bin,
@@ -1507,11 +1523,17 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     }
   }
   uint32_t to = spec->timeout_s ? spec->timeout_s : 300u;
+  EdrWindowsSpawnLock spawn_lock = {0};
 
   char cmdline[2048];
-  snprintf(cmdline, sizeof(cmdline),
-           "\"%s\" --scope=\"%s\" --output-dir=\"%s\" --timeout=%u %s", binpath, spec->scope,
-           spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
+  int cmdline_len = snprintf(
+      cmdline, sizeof(cmdline),
+      "\"%s\" --scope=\"%s\" --output-dir=\"%s\" --timeout=%u %s", binpath, spec->scope,
+      spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
+  if (cmdline_len < 0 || (size_t)cmdline_len >= sizeof(cmdline)) {
+    if (out_detail) snprintf(out_detail, detail_cap, "collector command line exceeds limit");
+    return EDR_DC_ERR_SPAWN;
+  }
 
   HANDLE job = CreateJobObject(NULL, NULL);
   if (!job && spec->cpu_limit_percent) {
@@ -1548,21 +1570,61 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   STARTUPINFO si = {sizeof(si)};
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
+  char errpath[1100];
+  int errpath_len = snprintf(errpath, sizeof(errpath), "%s\\fc_async_stderr_%lu.log",
+                             spec->output_dir ? spec->output_dir : ".",
+                             (unsigned long)GetCurrentProcessId());
+  if (errpath_len < 0 || (size_t)errpath_len >= sizeof(errpath)) {
+    if (job) CloseHandle(job);
+    if (out_detail) snprintf(out_detail, detail_cap, "collector stderr path exceeds limit");
+    return EDR_DC_ERR_SPAWN;
+  }
+  SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+  if (!edr_windows_spawn_lock_acquire(&spawn_lock)) {
+    if (job) CloseHandle(job);
+    if (out_detail) snprintf(out_detail, detail_cap, "child launch lock unavailable");
+    return EDR_DC_ERR_SPAWN;
+  }
+  HANDLE herr = CreateFileA(errpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  BOOL inherit = FALSE;
+  DWORD flags = CREATE_NEW_CONSOLE | CREATE_SUSPENDED;
+  if (herr != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = herr;
+    si.hStdError = herr;
+    si.hStdInput = NULL;
+    inherit = TRUE;
+    flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+  }
   PROCESS_INFORMATION pi = {0};
-  BOOL cr = CreateProcess(binpath, cmdline, NULL, NULL, FALSE,
-                          CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+  BOOL cr = CreateProcess(binpath, cmdline, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi);
+  DWORD create_error = cr ? ERROR_SUCCESS : GetLastError();
+  if (cr && inherit && !SetHandleInformation(herr, HANDLE_FLAG_INHERIT, 0)) {
+    create_error = GetLastError();
+    TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+    (void)WaitForSingleObject(pi.hProcess, 5000u);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    cr = FALSE;
+  }
+  edr_windows_spawn_lock_release(&spawn_lock);
   if (!cr) {
     if (out_detail) snprintf(out_detail, detail_cap, "CreateProcess failed: %lu",
-                             (unsigned long)GetLastError());
+                             (unsigned long)create_error);
+    if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
+    (void)remove(errpath);
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
+  if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
   if (job && !AssignProcessToJobObject(job, pi.hProcess) && spec->cpu_limit_percent) {
     DWORD error = GetLastError();
     TerminateProcess(pi.hProcess, 1u);
     (void)WaitForSingleObject(pi.hProcess, 5000u);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    (void)remove(errpath);
     CloseHandle(job);
     if (out_detail) {
       snprintf(out_detail, detail_cap,
@@ -1576,6 +1638,9 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   CloseHandle(pi.hThread);
   g_collector_process = pi.hProcess;
   g_collector_job = job;
+  if (herr != INVALID_HANDLE_VALUE) {
+    snprintf(g_collector_stderr_path, sizeof(g_collector_stderr_path), "%s", errpath);
+  }
   g_running = 1;
   return EDR_DC_OK;
 }

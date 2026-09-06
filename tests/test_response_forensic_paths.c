@@ -45,6 +45,19 @@ int main(void) {
                        "--out-file=/tmp/edr_forensic/memory_dump_cmd-42_1710000000.dmp") == 0,
                "collector arguments are exact");
 
+  require_true(response_forensic_build_collector_paths(
+                   "C:\\Program Files\\FDSecurity\\forensic", '\\', "collect_forensic",
+                   "cmd-43", 1710000001LL, "tar.gz", reqpath, sizeof(reqpath), artifact,
+                   sizeof(artifact), extra, sizeof(extra)) == 0,
+               "Windows collector paths with spaces build");
+  require_true(strcmp(reqpath,
+                      "C:\\Program Files\\FDSecurity\\forensic\\collect_forensic_cmd-43_1710000001.req") == 0,
+               "Windows request path is exact");
+  require_true(strcmp(extra,
+                      "--request=\"C:\\Program Files\\FDSecurity\\forensic\\collect_forensic_cmd-43_1710000001.req\" "
+                      "--out-file=\"C:\\Program Files\\FDSecurity\\forensic\\collect_forensic_cmd-43_1710000001.tar.gz\"") == 0,
+               "Windows collector path arguments preserve spaces");
+
   char overlong_dir[900];
   memset(overlong_dir, 'x', sizeof(overlong_dir) - 1u);
   overlong_dir[sizeof(overlong_dir) - 1u] = '\0';
