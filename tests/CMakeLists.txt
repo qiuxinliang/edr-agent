@@ -100,6 +100,19 @@ edr_apply_test_warnings(test_command_contract)
 add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_process.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_process.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_util.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_process PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_command_process PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_command_process PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(test_command_process)
+add_test(NAME command_process_identity_and_receipts COMMAND test_command_process)
+
 add_executable(test_agent_update_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/agent_update_command.c

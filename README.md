@@ -295,8 +295,8 @@ cmake --build build
 | `EDR_ISOLATE_SCRIPT` | 覆盖随包隔离脚本路径;默认在 agent 可执行同目录或其 `scripts/` 下查找 `windows_isolate_host.ps1`（Win）/ `linux_isolate_host.sh`（Linux）。 |
 | `EDR_ISOLATE_ALLOW_REMOTE_ADDRS` / `EDR_ISOLATE_ALLOW_REMOTE_PORTS` | 隔离时放行的管理服务器 IP/CIDR 与端口（默认端口 `443,50051`）。**未设置时 agent 自动用后端 rest_base 解析出的 IP 与端口填充**,确保隔离后 agent↔后端 管理通道仍可达（否则收不到 `restore_host`，主机将永久失联）。 |
 | `EDR_RANSOM_CANARY_PATH` / `EDR_RANSOM_CANARY_PATH_FILE` | 勒索 Canary 的**每设备唯一完整路径**，或逐行列出路径的文件；未配置时不启用确定性 Canary，普通 `canary.docx` 等文件不会触发 P0。旧 `EDR_RANSOM_CANARY_TOKENS*` 也仅按完整路径精确匹配。 |
-| `EDR_RANSOM_AUTO_ISOLATE` | `=1` 且高危策略开启时，确认勒索后执行端侧网络隔离；默认关闭，失败按 `EDR_RANSOM_AUTO_ISOLATE_MAX_ATTEMPTS` / `EDR_RANSOM_AUTO_ISOLATE_RETRY_S` 重试，并通过 `cmd_auto_ransom_*` 回传结果。 |
-| `EDR_RANSOM_AUTO_TERMINATE` | `=1` 且自动隔离已开启时，先终止确认事件归属的进程并确认其退出；默认关闭，受 `EDR_CMD_KILL_ALLOWLIST`、自保护 PID 保护和高危策略约束。 |
+| `EDR_RANSOM_AUTO_ISOLATE` | `=1` 或有效 impact=block 时，将隔离写入现有持久化命令队列；执行时仍检查高危策略。通过 `auto-ransom-*` 分别回传终止/隔离结果，同一进程代际重复确认不重复执行。删除旧的进程内重试计数路径，不再使用 `EDR_RANSOM_AUTO_ISOLATE_MAX_ATTEMPTS` / `EDR_RANSOM_AUTO_ISOLATE_RETRY_S`；终态失败不自动反复执行，回执上传由既有 outbox 重试。 |
+| `EDR_RANSOM_AUTO_TERMINATE` | `=1` 且自动隔离已开启时，将终止与隔离分别排队；默认关闭，终止必须有事件中观测到的进程创建 FILETIME，并受 `EDR_CMD_KILL_ALLOWLIST`、自保护/关键进程和高危策略约束。同一 OS 句柄校验身份、终止和验证退出；身份缺失/复用、目标已退出、验证失败均不计为成功阻断。 |
 | `EDR_SHELLCODE_AUTO_ISOLATE` | `=1` 时，若已允许高危指令且 WinDivert 分数 ≥ **`auto_isolate_threshold`**，执行与 **`isolate`** 等价的隔离（每进程最多一次）。亦可由 TOML **`[shellcode_detector] auto_isolate_execute = true`** 开启（仍须高危策略）。 |
 | `EDR_CONFIG_RELOAD_S` | 非 `0` 时每隔 N 秒检测配置文件 mtime，变更则热更 **preprocessing + resource_limit + self_protect**（见 §11.2 初版）。 |
 | `EDR_REMOTE_CONFIG_URL` | 若与 **`EDR_REMOTE_CONFIG_POLL_S`**（秒，≥1）同时设置，则周期性用 **`curl`** 下载 TOML 到临时文件并 **`edr_config_load`**，再应用 **preprocessing + resource_limit + self_protect**（**不**重初始化传输层，需重启进程才能对齐证书与批次参数）。URL 勿含未转义引号（Windows `cmd` 限制）。 |

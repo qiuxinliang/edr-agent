@@ -8,15 +8,18 @@
 #include <string.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <stdlib.h>
 static void test_setenv(const char *k, const char *v) { _putenv_s(k, v); }
 static void test_unsetenv(const char *k) { _putenv_s(k, ""); }
 #else
+#include <unistd.h>
 static void test_setenv(const char *k, const char *v) { setenv(k, v, 1); }
 static void test_unsetenv(const char *k) { unsetenv(k); }
 #endif
 
-void edr_isolate_auto_from_ransom_alarm(uint32_t pid) { (void)pid; }
+static unsigned ransom_response_calls;
+void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { assert(record); ransom_response_calls++; }
 
 static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
   memset(slot, 0, sizeof(*slot));
@@ -188,6 +191,148 @@ static void test_ransom_sliding_window_counter(void) {
   assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
   assert(strstr(signal_record.detection_context, "\"ransom_behavior\":true") != NULL);
   assert(strstr(signal_record.detection_context, "\"state_transition\":true") != NULL);
+  assert(strstr(signal_record.detection_context, "ENCRYPTION_CONFIRMED") == NULL);
+  assert(strstr(signal_record.detection_context, "\"content_changed_file_count\":0") != NULL);
+}
+
+static void test_ransom_repeated_file_and_non_mutations(void) {
+  const EdrEventType types[] = {EDR_EVENT_FILE_WRITE, EDR_EVENT_FILE_CREATE, EDR_EVENT_FILE_DELETE};
+  unsigned before = ransom_response_calls;
+  for (unsigned type = 0; type < sizeof(types) / sizeof(types[0]); ++type) {
+    for (unsigned i = 0; i < 220; ++i) {
+      EdrEventSlot slot;
+      EdrBehaviorRecord r;
+      EdrDetectionDecision d;
+      char payload[768];
+      snprintf(payload, sizeof(payload),
+               "ETW1\nprov=kfile\npid=%u\nimg=C:\\Tools\\copyworker.exe\n"
+               "file=C:\\Fixture\\d%u\\ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.e%u\n",
+               59000u + type, type ? i : 0u, type ? i : 0u);
+      fill_slot(&slot, types[type], payload);
+      slot.timestamp_ns += (int64_t)i * 100000000LL;
+      eval_slot(&slot, &r, &d);
+      assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+      assert(strstr(r.detection_context, "ENCRYPTION_CONFIRMED") == NULL);
+    }
+  }
+  assert(ransom_response_calls == before);
+}
+
+static void test_ransom_generation_and_file_key_dedup(void) {
+  unsigned before = ransom_response_calls;
+  for (unsigned i = 0; i < 100; ++i) {
+    EdrEventSlot slot;
+    EdrBehaviorRecord r;
+    char payload[768];
+    /* One object renamed repeatedly is one file, not a hundred victims. */
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59010\nprocess_start_key=8001\nfile_key=0x12345\n"
+             "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.e%u\n", i, i);
+    fill_slot(&slot, EDR_EVENT_FILE_RENAME, payload);
+    slot.timestamp_ns += (int64_t)i * 100000000LL;
+    edr_behavior_from_slot(&slot, &r);
+    assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+  }
+  for (unsigned i = 0; i < 30; ++i) {
+    EdrEventSlot slot;
+    EdrBehaviorRecord r;
+    char payload[768];
+    /* Each generation has only ten files; PID reuse must not merge them. */
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59011\nprocess_start_key=%u\n"
+             "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.txt\n", 9000u + i / 10u, i);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns += (int64_t)i * 100000000LL;
+    edr_behavior_from_slot(&slot, &r);
+    assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
+  }
+  assert(ransom_response_calls == before);
+}
+
+static void test_ransom_content_change_contract(void) {
+  char dir[512];
+#ifdef _WIN32
+  char temp_path[MAX_PATH];
+  assert(GetTempPathA(sizeof(temp_path), temp_path) > 0);
+  assert(GetTempFileNameA(temp_path, "edr", 0, dir) != 0);
+  assert(DeleteFileA(dir));
+  assert(CreateDirectoryA(dir, NULL));
+#else
+  const char *tmp = getenv("TMPDIR");
+  snprintf(dir, sizeof(dir), "%s/edr-ransom-contract.XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  assert(mkdtemp(dir) != NULL);
+#endif
+  test_setenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", "1");
+  test_setenv("EDR_RANSOM_RATE_CONFIRM_FILES", "20");
+  for (int changed = 0; changed < 2; ++changed) {
+    unsigned before = ransom_response_calls;
+    int confirmations = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+      for (int i = 0; i < 20; ++i) {
+        EdrEventSlot slot;
+        EdrBehaviorRecord r;
+        EdrDetectionDecision d;
+        char path[768], payload[1200];
+        snprintf(path, sizeof(path), "%s/doc%02d.bin", dir, i);
+        if (pass == 0 && changed) {
+          FILE *f = fopen(path, "wb");
+          assert(f != NULL);
+          for (int n = 0; n < 8192; ++n) assert(fputc('a', f) != EOF);
+          assert(fclose(f) == 0);
+        } else {
+          write_high_entropy_fixture(path);
+        }
+        snprintf(payload, sizeof(payload),
+                 "ETW1\nprov=kfile\npid=%u\nprocess_start_key=9500\n"
+                 "img=C:\\Tools\\fixture.exe\nfile=%s\n", 59020u + (unsigned)changed, path);
+        fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+        slot.timestamp_ns += (int64_t)(pass * 20 + i) * 1000000000LL;
+        eval_slot(&slot, &r, &d);
+        if (strstr(r.detection_context, "\"kind\":\"ENCRYPTION_CONFIRMED\"")) {
+          assert(changed && pass > 0);
+          assert(strstr(r.detection_context, "\"evidence_version\":3"));
+          assert(strstr(r.detection_context, "\"confirmation_basis\":\"content_change\""));
+          assert(strstr(r.detection_context, "\"unique_file_count\":20"));
+          assert(strstr(r.detection_context, "\"content_changed_file_count\":20"));
+          confirmations++;
+        }
+      }
+    }
+    assert(changed ? confirmations > 0 : confirmations == 0);
+    assert(ransom_response_calls == before + (unsigned)changed);
+  }
+  test_unsetenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS");
+  test_unsetenv("EDR_RANSOM_RATE_CONFIRM_FILES");
+  for (int i = 0; i < 20; ++i) {
+    char path[768];
+    snprintf(path, sizeof(path), "%s/doc%02d.bin", dir, i);
+    assert(remove(path) == 0);
+  }
+#ifdef _WIN32
+  assert(RemoveDirectoryA(dir));
+#else
+  assert(rmdir(dir) == 0);
+#endif
+}
+
+static void test_ransom_tracking_capacity_is_explicit(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  unsigned before = ransom_response_calls;
+  for (unsigned i = 0; i < 2050; ++i) {
+    char payload[768];
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59030\nimg=C:\\Tools\\copyworker.exe\n"
+             "file=C:\\Fixture\\doc%u.txt\n", i);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns += (int64_t)i * 1000000LL;
+    edr_behavior_from_slot(&slot, &r);
+    assert(strstr(r.script_snippet, "ENCRYPTION_CONFIRMED") == NULL);
+  }
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(r.detection_context, "\"tracking_saturated\":true"));
+  assert(ransom_response_calls == before);
 }
 
 static void test_ransom_alert_volume_is_bounded(void) {
@@ -325,6 +470,14 @@ static void test_ransom_canary_deterministic_context(void) {
   assert(strstr(r.detection_context, "\"kind\":\"DETERMINISTIC_ENCRYPTION\"") != NULL);
   assert(strstr(r.detection_context, "\"canary\":true") != NULL);
   assert(strstr(r.detection_context, "\"severity\":4") != NULL);
+  assert(strstr(r.detection_context, "\"confirmation_basis\":\"canary_mutation\"") != NULL);
+  test_setenv("EDR_RANSOM_CANARY_PATH", "C:\\Users\\Public\\~$canary.docx");
+  unsigned before = ransom_response_calls;
+  slot.type = EDR_EVENT_FILE_CREATE;
+  eval_slot(&slot, &r, &d);
+  test_unsetenv("EDR_RANSOM_CANARY_PATH");
+  assert(strstr(r.detection_context, "\"canary\":true") == NULL);
+  assert(ransom_response_calls == before);
 }
 
 static void test_ransom_generic_canary_filename_is_not_deterministic(void) {
@@ -825,6 +978,10 @@ int main(void) {
   test_schannel_cert_error_bridge();
   test_ransom_counter_bridge();
   test_ransom_sliding_window_counter();
+  test_ransom_repeated_file_and_non_mutations();
+  test_ransom_generation_and_file_key_dedup();
+  test_ransom_content_change_contract();
+  test_ransom_tracking_capacity_is_explicit();
   test_ransom_alert_volume_is_bounded();
   test_invalid_file_path_does_not_raise_ransom_counter();
   test_low_value_process_does_not_raise_ransom_counter();

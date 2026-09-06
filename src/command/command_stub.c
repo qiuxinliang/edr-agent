@@ -331,50 +331,7 @@ static int command_join_cstrs(char *out, size_t out_cap,
 }
 
 static int dangerous_enabled(void) {
-  const char *e = getenv("EDR_CMD_ENABLED");
-  if (e && e[0] == '1') {
-    return 1;
-  }
-  e = getenv("EDR_CMD_DANGEROUS");
-  if (e && e[0] == '1') {
-    return 1;
-  }
-  if (edr_command_get_config() && edr_command_get_config()->command.allow_dangerous) {
-    return 1;
-  }
-  return 0;
-}
-
-/** 未设置 `EDR_CMD_KILL_ALLOWLIST` 时不限制；设置后仅允许列表内 pid（逗号分隔） */
-static int kill_pid_allowed(long pid) {
-  const char *list = getenv("EDR_CMD_KILL_ALLOWLIST");
-  if (!list || !list[0]) {
-    return 1;
-  }
-  char buf[1024];
-  size_t n = strlen(list);
-  if (n >= sizeof(buf)) {
-    n = sizeof(buf) - 1u;
-  }
-  memcpy(buf, list, n);
-  buf[n] = 0;
-  char *p = buf;
-  while (p && *p) {
-    char *comma = strchr(p, ',');
-    if (comma) {
-      *comma++ = 0;
-    }
-    while (*p == ' ' || *p == '\t') {
-      p++;
-    }
-    char *end = NULL;
-    long v = strtol(p, &end, 10);
-    if (end != p && v == pid) {
-      return 1;
-    }
-    p = comma;
-  }
-  return 0;
+  return edr_command_dangerous_enabled();
 }
 
 static void audit_both(const char *cmd_id, const char *msg) {
@@ -1117,40 +1074,6 @@ static void do_update_server_address(const char *cmd_id, const uint8_t *pl, size
   soar_emit(cmd_id, sm, EdrCmdExecFailed, 14, "update_server_address unsupported; use platform.rest_base_url");
 }
 
-static void do_kill(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
-  if (!dangerous_enabled()) {
-    s_rejected++;
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 1, "policy disabled");
-    return;
-  }
-  long pid = 0;
-  char creation[32];
-  if (parse_pid_json(pl, len, &pid) != 0 ||
-      parse_json_string_field(pl, len, "process_creation_filetime_100ns", creation, sizeof(creation)) != 0 ||
-      !creation[0] || strspn(creation, "0123456789") != strlen(creation)) {
-    s_rejected++;
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 2, "observed process creation time is required");
-    return;
-  }
-  errno = 0;
-  unsigned long long expected = strtoull(creation, NULL, 10);
-  if (errno || !expected || !kill_pid_allowed(pid)) {
-    s_rejected++;
-    soar_emit(cmd_id, sm, EdrCmdExecRejected, 7, "invalid process identity or pid not in allowlist");
-    return;
-  }
-  char reason[160];
-  if (!edr_process_terminate_checked((uint32_t)pid, (uint64_t)expected, 5000u, reason, sizeof(reason))) {
-    s_exec_fail++;
-    audit_both(cmd_id, reason);
-    soar_emit(cmd_id, sm, strcmp(reason, "process_generation_mismatch") == 0 ? EdrCmdExecRejected : EdrCmdExecFailed, 4, reason);
-    return;
-  }
-  s_exec_ok++;
-  audit_both(cmd_id, reason);
-  soar_emit(cmd_id, sm, EdrCmdExecOk, 0, reason);
-}
-
 static int isolate_stamp_path(char *path, size_t cap) {
   const char *stamp = getenv("EDR_ISOLATE_STAMP_PATH");
   if (stamp && stamp[0]) {
@@ -1524,129 +1447,6 @@ static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) 
   s_exec_ok++;
 }
 
-/* 自动勒索处置只允许结束事件归属的进程，并在 OS 层确认进程确实退出，避免把
- * “信号已发送”误报成“加密进程已停止”。手工 kill 仍走 do_kill 的完整命令路径。 */
-static int ransom_terminate_pid_checked(uint32_t pid, char *detail, size_t detail_cap) {
-  if (detail && detail_cap > 0u) {
-    detail[0] = '\0';
-  }
-  if (pid <= 4u) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "protected pid=%u", (unsigned)pid);
-    }
-    return -1;
-  }
-  if (!kill_pid_allowed((long)pid)) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "pid=%u blocked by EDR_CMD_KILL_ALLOWLIST", (unsigned)pid);
-    }
-    return -2;
-  }
-#ifdef _WIN32
-  if ((DWORD)pid == GetCurrentProcessId()) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "refuse agent pid=%u", (unsigned)pid);
-    }
-    return -1;
-  }
-  HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
-  if (!h) {
-    if (GetLastError() == ERROR_INVALID_PARAMETER) {
-      if (detail && detail_cap > 0u) {
-        snprintf(detail, detail_cap, "process pid=%u already gone", (unsigned)pid);
-      }
-      return 0;
-    }
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "OpenProcess failed pid=%u error=%lu", (unsigned)pid,
-               (unsigned long)GetLastError());
-    }
-    return -3;
-  }
-  if (!TerminateProcess(h, 1)) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "TerminateProcess failed pid=%u error=%lu", (unsigned)pid,
-               (unsigned long)GetLastError());
-    }
-    CloseHandle(h);
-    return -3;
-  }
-  DWORD wait_rc = WaitForSingleObject(h, 1000u);
-  CloseHandle(h);
-  if (wait_rc != WAIT_OBJECT_0) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "pid=%u still running after TerminateProcess", (unsigned)pid);
-    }
-    return -4;
-  }
-  if (detail && detail_cap > 0u) {
-    snprintf(detail, detail_cap, "pid=%u terminated", (unsigned)pid);
-  }
-  return 0;
-#else
-  if ((pid_t)pid == getpid()) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "refuse agent pid=%u", (unsigned)pid);
-    }
-    return -1;
-  }
-  if (kill((pid_t)pid, SIGTERM) != 0) {
-    if (errno == ESRCH) {
-      if (detail && detail_cap > 0u) {
-        snprintf(detail, detail_cap, "process pid=%u already gone", (unsigned)pid);
-      }
-      return 0;
-    }
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "SIGTERM failed pid=%u errno=%d", (unsigned)pid, errno);
-    }
-    return -3;
-  }
-  for (int i = 0; i < 5; i++) {
-    struct timespec ts = {0, 50L * 1000L * 1000L};
-    nanosleep(&ts, NULL);
-    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
-      if (detail && detail_cap > 0u) {
-        snprintf(detail, detail_cap, "pid=%u terminated via SIGTERM", (unsigned)pid);
-      }
-      return 0;
-    }
-  }
-  if (kill((pid_t)pid, SIGKILL) != 0 && errno != ESRCH) {
-    if (detail && detail_cap > 0u) {
-      snprintf(detail, detail_cap, "SIGKILL failed pid=%u errno=%d", (unsigned)pid, errno);
-    }
-    return -4;
-  }
-  for (int i = 0; i < 10; i++) {
-    struct timespec ts = {0, 50L * 1000L * 1000L};
-    nanosleep(&ts, NULL);
-    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
-      if (detail && detail_cap > 0u) {
-        snprintf(detail, detail_cap, "pid=%u terminated via SIGKILL", (unsigned)pid);
-      }
-      return 0;
-    }
-  }
-  if (detail && detail_cap > 0u) {
-    snprintf(detail, detail_cap, "pid=%u remains visible after SIGKILL", (unsigned)pid);
-  }
-  return -5;
-#endif
-}
-
-static void ransom_auto_meta(uint32_t pid, EdrSoarCommandMeta *sm) {
-  if (!sm) {
-    return;
-  }
-  memset(sm, 0, sizeof(*sm));
-  snprintf(sm->soar_correlation_id, sizeof(sm->soar_correlation_id), "ransom-auto-%u", (unsigned)pid);
-  snprintf(sm->playbook_run_id, sizeof(sm->playbook_run_id), "ransom-auto");
-  snprintf(sm->idempotency_key, sizeof(sm->idempotency_key), "ransom-auto-%u", (unsigned)pid);
-  snprintf(sm->initiated_by, sizeof(sm->initiated_by), "automatic");
-  sm->issued_at_unix_ms = command_now_ms();
-}
-
 void edr_isolate_auto_from_shellcode_alarm(void) {
 #if !defined(_WIN32)
   return;
@@ -1663,70 +1463,6 @@ void edr_isolate_auto_from_shellcode_alarm(void) {
   }
   do_isolate("auto-shellcode", NULL);
 #endif
-}
-
-void edr_isolate_auto_from_ransom_alarm(uint32_t pid) {
-  /* 默认关:显式启用后才执行自动终止/隔离，且仍受高危策略保护。 */
-  const char *eo = getenv("EDR_RANSOM_AUTO_ISOLATE");
-  if ((!eo || eo[0] != '1') && edr_policy_v2_mode_for_category("impact") != EDR_POLICY_MODE_BLOCK) {
-    return;
-  }
-  if (!dangerous_enabled()) {
-    return;
-  }
-  EdrSoarCommandMeta sm;
-  ransom_auto_meta(pid, &sm);
-
-  const char *to = getenv("EDR_RANSOM_AUTO_TERMINATE");
-  if (to && to[0] == '1' && pid > 0u) {
-    static uint32_t s_ransom_auto_terminated_pid;
-    if (s_ransom_auto_terminated_pid != pid) {
-      EdrSoarCommandMeta terminate_sm = sm;
-      snprintf(terminate_sm.idempotency_key, sizeof(terminate_sm.idempotency_key),
-               "ransom-auto-%u-terminate", (unsigned)pid);
-      char detail[256];
-      int rc = ransom_terminate_pid_checked(pid, detail, sizeof(detail));
-      s_ransom_auto_terminated_pid = rc == 0 ? pid : 0u;
-      char cmd_id[96];
-      snprintf(cmd_id, sizeof(cmd_id), "cmd_auto_ransom_%u_terminate", (unsigned)pid);
-      if (rc == 0) {
-        audit_both(cmd_id, detail);
-        soar_emit(cmd_id, &terminate_sm, EdrCmdExecOk, 0, detail);
-      } else if (rc == -2 || rc == -1) {
-        audit_both(cmd_id, detail);
-        soar_emit(cmd_id, &terminate_sm, EdrCmdExecRejected, rc == -2 ? 7 : 5, detail);
-      } else {
-        audit_both(cmd_id, detail);
-        soar_emit(cmd_id, &terminate_sm, EdrCmdExecFailed, -rc, detail);
-      }
-    }
-  }
-
-  static int s_ransom_auto_iso_success;
-  static uint32_t s_ransom_auto_iso_attempts;
-  static int64_t s_ransom_auto_iso_last_attempt_ms;
-  if (s_ransom_auto_iso_success) {
-    return;
-  }
-  uint32_t max_attempts = command_u32_env_clamped("EDR_RANSOM_AUTO_ISOLATE_MAX_ATTEMPTS", 3u, 1u, 10u);
-  uint32_t retry_s = command_u32_env_clamped("EDR_RANSOM_AUTO_ISOLATE_RETRY_S", 5u, 1u, 300u);
-  int64_t now_ms = command_now_ms();
-  if (s_ransom_auto_iso_attempts >= max_attempts ||
-      (s_ransom_auto_iso_last_attempt_ms > 0 &&
-       now_ms - s_ransom_auto_iso_last_attempt_ms < (int64_t)retry_s * 1000LL)) {
-    return;
-  }
-  s_ransom_auto_iso_attempts++;
-  s_ransom_auto_iso_last_attempt_ms = now_ms;
-  char cmd_id[96];
-  snprintf(cmd_id, sizeof(cmd_id), "cmd_auto_ransom_%u_isolate_%u", (unsigned)pid,
-           (unsigned)s_ransom_auto_iso_attempts);
-  EdrSoarCommandMeta isolate_sm = sm;
-  snprintf(isolate_sm.idempotency_key, sizeof(isolate_sm.idempotency_key),
-           "ransom-auto-%u-isolate-%u", (unsigned)pid, (unsigned)s_ransom_auto_iso_attempts);
-  if (do_isolate(cmd_id, &isolate_sm) == 0) {
-    s_ransom_auto_iso_success = 1;
-  }
 }
 
 static int forensic_copy_one_file(const char *src, const char *dst) {
@@ -5491,16 +5227,6 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
         continue;
       }
     }
-    char reason[180];
-    reason[0] = '\0';
-    if (command_deadline_expired(&inbox[i].meta, reason, sizeof(reason))) {
-      audit_both(inbox[i].command_id, reason);
-      soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed, 16,
-                   reason, "timeout", NULL);
-      edr_command_cancel_end(inbox[i].command_id);
-      work_done = 1;
-      break;
-    }
     int retry_count = 0;
     EdrCommandStateRecord dup;
     int allow_replay = edr_command_registry_replay_policy(inbox[i].command_type) ==
@@ -5511,6 +5237,19 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
     if (begin_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
       audit_both(inbox[i].command_id, "persisted command replay suppressed by final idempotency state");
       edr_command_state_delete_inbox(inbox[i].command_id);
+      edr_command_cancel_end(inbox[i].command_id);
+      work_done = 1;
+      break;
+    }
+    /* A leftover inbox may outlive the already persisted terminal receipt.
+     * Preserve that receipt before evaluating an expired execution deadline. */
+    char reason[180];
+    reason[0] = '\0';
+    if (begin_rc != EDR_COMMAND_STATE_BEGIN_ERROR &&
+        command_deadline_expired(&inbox[i].meta, reason, sizeof(reason))) {
+      audit_both(inbox[i].command_id, reason);
+      soar_emit_ex(inbox[i].command_id, &inbox[i].meta, EdrCmdExecFailed, 16,
+                   reason, "timeout", NULL);
       edr_command_cancel_end(inbox[i].command_id);
       work_done = 1;
       break;
@@ -6365,6 +6104,12 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   (void)retry_count;
   if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
     edr_command_state_delete_inbox(id);
+    if (internal_trusted) {
+      /* Retain the original durable action receipt (including target and OS
+       * verification), not a new synthetic success with a hash-only summary. */
+      audit_both(id, "duplicate internal command suppressed; original terminal receipt retained");
+      return 0;
+    }
     char detail[2600];
     if (streq(t, "shell_open")) {
       snprintf(detail, sizeof(detail),
@@ -6469,6 +6214,12 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
       do_telemetry_profile_update(id, payload, payload_len, sm);
       return;
     case EDR_COMMAND_KIND_ISOLATE_HOST:
+      if (strncmp(id, "auto-ransom-", 12u) == 0 &&
+          strcmp(sm->initiated_by, "agent_auto") == 0 && !edr_ransom_auto_response_enabled()) {
+        s_rejected++;
+        soar_emit(id, sm, EdrCmdExecRejected, 1, "ransomware isolation policy disabled before execution");
+        return;
+      }
       do_isolate(id, sm);
       return;
     case EDR_COMMAND_KIND_RESTORE_HOST:
@@ -6477,9 +6228,13 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
     case EDR_COMMAND_KIND_ISOLATE_STATUS:
       do_isolate_status(id, sm);
       return;
-    case EDR_COMMAND_KIND_KILL_PROCESS:
-      do_kill(id, payload, payload_len, sm);
+    case EDR_COMMAND_KIND_KILL_PROCESS: {
+      EdrCommandExecutionStatus status = edr_command_kill_process(id, payload, payload_len, sm);
+      if (status == EdrCmdExecOk) s_exec_ok++;
+      else if (status == EdrCmdExecRejected) s_rejected++;
+      else s_exec_fail++;
       return;
+    }
     case EDR_COMMAND_KIND_COLLECT_FORENSIC:
       edr_response_collect_forensic(id, payload, payload_len, sm);
       return;

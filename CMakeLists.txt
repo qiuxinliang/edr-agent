@@ -535,6 +535,7 @@ set(EDR_AGENT_SOURCES
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
   src/command/command_stub.c
+  src/command/command_process.c
   src/command/command_signature.c
   src/command/command_signature_helpers.c
   src/command/forensic_result_contract.c

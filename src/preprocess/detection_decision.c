@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define EDR_RANSOM_CONTROL_VERSION "ransom-control-v2"
+#define EDR_RANSOM_CONTROL_VERSION "ransom-control-v3"
 
 static int has_ci(const char *hay, const char *needle) {
   if (!needle || !needle[0]) {
@@ -1453,6 +1453,12 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   char path_entropy_buf[32];
   char content_entropy_buf[32];
   char content_sample_bytes_buf[32];
+  char evidence_version_buf[16];
+  char file_event_count_buf[32];
+  char unique_file_count_buf[32];
+  char sampled_file_count_buf[32];
+  char content_changed_file_count_buf[32];
+  char confirmation_basis_buf[32];
   char old_ext_buf[32];
   char new_ext_buf[32];
   char signer_buf[160];
@@ -1524,6 +1530,12 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->script_snippet, "path_entropy", path_entropy_buf, sizeof(path_entropy_buf));
   detail_value(r->script_snippet, "content_entropy", content_entropy_buf, sizeof(content_entropy_buf));
   detail_value(r->script_snippet, "content_sample_bytes", content_sample_bytes_buf, sizeof(content_sample_bytes_buf));
+  detail_value(r->script_snippet, "ransom_evidence_version", evidence_version_buf, sizeof(evidence_version_buf));
+  detail_value(r->script_snippet, "file_event_count", file_event_count_buf, sizeof(file_event_count_buf));
+  detail_value(r->script_snippet, "unique_file_count", unique_file_count_buf, sizeof(unique_file_count_buf));
+  detail_value(r->script_snippet, "sampled_file_count", sampled_file_count_buf, sizeof(sampled_file_count_buf));
+  detail_value(r->script_snippet, "content_changed_file_count", content_changed_file_count_buf, sizeof(content_changed_file_count_buf));
+  detail_value(r->script_snippet, "confirmation_basis", confirmation_basis_buf, sizeof(confirmation_basis_buf));
   detail_value(r->script_snippet, "old_ext", old_ext_buf, sizeof(old_ext_buf));
   detail_value(r->script_snippet, "new_ext", new_ext_buf, sizeof(new_ext_buf));
   detail_value(r->script_snippet, "signer", signer_buf, sizeof(signer_buf));
@@ -1704,7 +1716,8 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   } else if (ransom_canary) {
     json_str(r->detection_context, sizeof(r->detection_context), "DETERMINISTIC_ENCRYPTION", 64u);
   } else if (ransom_chain.score >= chain_p0_score) {
-    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_CONFIRMED", 64u);
+    /* A high-scoring precursor chain does not prove file encryption. */
+    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_SUSPECTED", 64u);
   } else if (ransom_burst || ransom_chain.score >= chain_candidate_score) {
     json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_SUSPECTED", 64u);
   } else {
@@ -1727,6 +1740,18 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   json_str(r->detection_context, sizeof(r->detection_context), old_ext_buf, 24u);
   json_cat(r->detection_context, sizeof(r->detection_context), ",\"new_ext\":");
   json_str(r->detection_context, sizeof(r->detection_context), new_ext_buf, 24u);
+  json_cat(r->detection_context, sizeof(r->detection_context),
+           ",\"evidence_version\":%ld,\"file_event_count\":%ld,\"unique_file_count\":%ld,"
+           "\"sampled_file_count\":%ld,\"content_changed_file_count\":%ld,"
+           "\"tracking_saturated\":%s,\"content_entropy_deferred\":%s,\"confirmation_basis\":",
+           evidence_version_buf[0] ? strtol(evidence_version_buf, NULL, 10) : 0L,
+           file_event_count_buf[0] ? strtol(file_event_count_buf, NULL, 10) : 0L,
+           unique_file_count_buf[0] ? strtol(unique_file_count_buf, NULL, 10) : 0L,
+           sampled_file_count_buf[0] ? strtol(sampled_file_count_buf, NULL, 10) : 0L,
+           content_changed_file_count_buf[0] ? strtol(content_changed_file_count_buf, NULL, 10) : 0L,
+           has_ci(r->script_snippet, "ransom_tracking_saturated=1") ? "true" : "false",
+           has_ci(r->script_snippet, "content_entropy_deferred=1") ? "true" : "false");
+  json_str(r->detection_context, sizeof(r->detection_context), confirmation_basis_buf, 32u);
   json_cat(r->detection_context, sizeof(r->detection_context),
            ",\"entropy_delta\":%.2f,\"high_entropy_ratio\":%.2f,"
            "\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,\"path_entropy\":%.2f,"

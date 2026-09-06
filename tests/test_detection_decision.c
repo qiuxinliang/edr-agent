@@ -503,6 +503,7 @@ static void test_ransom_recovery_plus_file_burst_still_alerts(void) {
   assert(strstr(d.reason, "ransom_behavior_counter") != NULL);
   assert(strstr(r.detection_context, "\"ransom_recovery_tamper\":true") != NULL);
   assert(strstr(r.detection_context, "\"ransom_behavior\":true") != NULL);
+  assert(strstr(r.detection_context, "ENCRYPTION_CONFIRMED") == NULL);
 }
 
 static void test_ransom_control_threshold_context(void) {
@@ -523,7 +524,7 @@ static void test_ransom_control_threshold_context(void) {
   assert(!d.drop);
   assert(strstr(d.reason, "ransom_note_burst") != NULL);
   assert(strstr(r.detection_context, "\"ransom_control\"") != NULL);
-  assert(strstr(r.detection_context, "\"version\":\"ransom-control-v2\"") != NULL);
+  assert(strstr(r.detection_context, "\"version\":\"ransom-control-v3\"") != NULL);
   assert(strstr(r.detection_context, "\"note_count\":3") != NULL);
   assert(strstr(r.detection_context, "\"note_min_files\":3") != NULL);
   assert(strstr(r.detection_context, "\"note_window_s\":600") != NULL);

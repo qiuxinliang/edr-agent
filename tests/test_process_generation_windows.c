@@ -40,11 +40,16 @@ int main(int argc, char **argv) {
   FILETIME created = {0}, exited, kernel, user;
   int ok = GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user) != 0;
   uint64_t identity = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  ok = ok && !edr_process_terminate_checked(child.dwProcessId, 0u, 5000, reason, sizeof(reason)) &&
+      WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;
+  ok = ok && !edr_process_terminate_checked(4u, identity, 5000, reason, sizeof(reason));
   ok = ok && !edr_process_terminate_checked(child.dwProcessId, identity + 1u, 5000, reason, sizeof(reason)) &&
       strcmp(reason, "process_generation_mismatch") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;
   ok = ok && !edr_process_terminate_checked(GetCurrentProcessId(), identity, 5000, reason, sizeof(reason));
   ok = ok && edr_process_terminate_checked(child.dwProcessId, identity, 5000, reason, sizeof(reason)) &&
       strcmp(reason, "process_exit_verified") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0;
+  ok = ok && edr_process_terminate_checked(child.dwProcessId, identity, 5000, reason, sizeof(reason)) &&
+      strcmp(reason, "process_already_gone") == 0;
   if (!ok) {
     fprintf(stderr, "generation-pinned termination failed: %s\n", reason);
     TerminateProcess(child.hProcess, 1); /* Cleanup only our own test child. */

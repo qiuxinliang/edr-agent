@@ -32,10 +32,13 @@ void edr_command_set_active_type(const char *command_type);
  */
 void edr_isolate_auto_from_shellcode_alarm(void);
 /**
- * 确诊勒索时执行端侧处置：可选终止归属进程并执行主机隔离。
- * 默认关闭，需 EDR_RANSOM_AUTO_ISOLATE=1 + 高危策略；终止进程另需 EDR_RANSOM_AUTO_TERMINATE=1。
+ * 确诊勒索时持久化端侧处置命令：终止绑定事件记录的进程创建时间，隔离单独回执。
+ * 默认关闭，需 EDR_RANSOM_AUTO_ISOLATE=1 或有效 impact=block，并通过高危策略；
+ * 终止进程另需 EDR_RANSOM_AUTO_TERMINATE=1。
  */
-void edr_isolate_auto_from_ransom_alarm(uint32_t pid);
+void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record);
+/* Checked again at execution, after a queued automatic action may outlive a policy change. */
+int edr_ransom_auto_response_enabled(void);
 
 /** 与 CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由控制面写入） */
 typedef struct EdrSoarCommandMeta {
@@ -57,6 +60,9 @@ typedef enum EdrCommandExecutionStatus {
   EdrCmdExecFailed = 3,
   EdrCmdExecUnknownType = 4,
 } EdrCommandExecutionStatus;
+
+EdrCommandExecutionStatus edr_command_kill_process(const char *command_id,
+    const uint8_t *payload, size_t payload_len, const EdrSoarCommandMeta *meta);
 
 /**
  * 处理服务端下发的指令（来自 HTTPS control stream / long-poll）。

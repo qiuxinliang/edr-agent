@@ -23,14 +23,30 @@ static atomic_uint_fast64_t g_event_boot_nonce = ATOMIC_VAR_INIT(0);
 #define RANSOM_COUNTER_BUCKETS 128u
 #define RANSOM_COUNTER_EXTS 24u
 #define RANSOM_COUNTER_DIRS 16u
+#define RANSOM_COUNTER_FILES 2048u
 #define RANSOM_NOTE_BUCKETS 128u
 #define RANSOM_NOTE_FILES 16u
 
 typedef struct {
+  uint64_t identity;
+  int64_t last_sample_ns;
+  float baseline_entropy;
+  uint8_t sampled;
+  uint8_t counted;
+  uint8_t content_changed;
+  uint8_t high_entropy;
+} RansomFileObservation;
+
+typedef struct {
   uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t process_creation_time;
   char dir[256];
   int64_t window_start_ns;
   uint32_t file_events;
+  uint32_t unique_files;
+  uint32_t sampled_files;
+  uint32_t content_changed_files;
   uint32_t high_entropy_events;
   char exts[RANSOM_COUNTER_EXTS][16];
   char dirs[RANSOM_COUNTER_DIRS][128];
@@ -39,7 +55,7 @@ typedef struct {
   uint8_t emitted_level;
   int64_t last_signal_ns;
   uint32_t coalesced_events;
-  double entropy_avg;
+  RansomFileObservation files[RANSOM_COUNTER_FILES];
 } RansomCounterBucket;
 
 typedef struct {
@@ -479,7 +495,11 @@ static int file_content_entropy_sample(const char *path, double *out_entropy, si
     }
     total += n;
   }
+  int read_failed = ferror(f);
   fclose(f);
+  if (read_failed) {
+    return 0;
+  }
   if (out_bytes) {
     *out_bytes = total;
   }
@@ -518,16 +538,19 @@ static int64_t ransom_counter_summary_interval_ns(void) {
   return (int64_t)env_int_clamped("EDR_RANSOM_COUNTER_SUMMARY_S", 30, 5, 600) * 1000000000LL;
 }
 
-static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int64_t now_ns, int64_t window_ns) {
+static RansomCounterBucket *ransom_bucket_for(const EdrBehaviorRecord *r, const char *dir, int64_t now_ns, int64_t window_ns) {
   RansomCounterBucket *empty = NULL;
   RansomCounterBucket *oldest = &g_ransom_buckets[0];
-  uint32_t key_pid = pid ? pid : 1u;
+  uint32_t key_pid = r->pid ? r->pid : 1u;
   for (size_t i = 0; i < RANSOM_COUNTER_BUCKETS; i++) {
     RansomCounterBucket *b = &g_ransom_buckets[i];
     if (b->pid == key_pid) {
-      if (b->window_start_ns <= 0 || now_ns - b->window_start_ns > window_ns) {
+      if (b->window_start_ns <= 0 || now_ns < b->window_start_ns || now_ns - b->window_start_ns > window_ns ||
+          b->process_start_key != r->process_start_key || b->process_creation_time != r->process_creation_filetime_100ns) {
         memset(b, 0, sizeof(*b));
         b->pid = key_pid;
+        b->process_start_key = r->process_start_key;
+        b->process_creation_time = r->process_creation_filetime_100ns;
         snprintf(b->dir, sizeof(b->dir), "%s", dir);
         b->window_start_ns = now_ns;
       }
@@ -543,9 +566,40 @@ static RansomCounterBucket *ransom_bucket_for(uint32_t pid, const char *dir, int
   RansomCounterBucket *b = empty ? empty : oldest;
   memset(b, 0, sizeof(*b));
   b->pid = key_pid;
+  b->process_start_key = r->process_start_key;
+  b->process_creation_time = r->process_creation_filetime_100ns;
   snprintf(b->dir, sizeof(b->dir), "%s", dir);
   b->window_start_ns = now_ns;
   return b;
+}
+
+static RansomFileObservation *ransom_file_observation(RansomCounterBucket *b, const EdrBehaviorRecord *r) {
+  uint64_t hash = 1469598103934665603ULL;
+  /* FileKey is collector-bound identity across rename. Without it the full
+   * normalized path is the bounded fallback, never a basename or extension. */
+  if (r->file_key) {
+    hash ^= r->file_key;
+    hash *= 1099511628211ULL;
+  } else {
+    int windows_path = r->file_path[0] == '\\' || (r->file_path[0] && r->file_path[1] == ':');
+    for (const unsigned char *p = (const unsigned char *)r->file_path; *p; ++p) {
+      unsigned char c = *p;
+      if (windows_path) {
+        if (c == '/') c = '\\';
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+      }
+      hash = (hash ^ c) * 1099511628211ULL;
+    }
+  }
+  if (!hash) hash = 1;
+  for (size_t i = 0; i < RANSOM_COUNTER_FILES; ++i) {
+    RansomFileObservation *f = &b->files[(hash + i) % RANSOM_COUNTER_FILES];
+    if (!f->identity || f->identity == hash) {
+      f->identity = hash;
+      return f;
+    }
+  }
+  return NULL;
 }
 
 static int ext_seen_or_add(RansomCounterBucket *b, const char *ext) {
@@ -768,10 +822,6 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
     append_record_kv(r, "invalid_file_path=1 ransom_counter_suppressed=1");
     return;
   }
-  if (known_low_value_ransom_counter_process(r)) {
-    append_record_kv(r, "ransom_counter_suppressed=1 low_value_ransom_process=1");
-    return;
-  }
   const char *env = getenv("EDR_RANSOM_COUNTER_WINDOW_S");
   long window_s = env && env[0] ? strtol(env, NULL, 10) : 60L;
   if (window_s <= 0L) {
@@ -787,80 +837,123 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
   dirname_c(r->file_path, dir, sizeof(dir));
   extension_c(r->file_path, ext, sizeof(ext));
   int ext_changed = has_ci_ascii(r->script_snippet, "ext_changed=1");
-  int canary = honey_enabled && is_ransom_canary_path(r->file_path);
+  int mutation = r->type == EDR_EVENT_FILE_WRITE || r->type == EDR_EVENT_FILE_RENAME;
+  int canary = honey_enabled && (mutation || r->type == EDR_EVENT_FILE_DELETE) && is_ransom_canary_path(r->file_path);
   if (canary) {
     append_record_kv(r, "ransom_canary=1 ransomware_kind=DETERMINISTIC_ENCRYPTION ransomware_severity=4");
   }
   if (!mass_write_enabled && !canary) {
     return;
   }
+  if (!canary && known_low_value_ransom_counter_process(r)) {
+    append_record_kv(r, "ransom_counter_suppressed=1 low_value_ransom_process=1");
+    return;
+  }
   if (!canary && ransom_counter_allowlisted(r)) {
     append_record_kv(r, "ransom_counter_allowlisted=1%s", ransom_signer_allowlisted(r) ? " ransom_signer_allowlisted=1" : "");
     return;
   }
-  RansomCounterBucket *b = ransom_bucket_for(r->pid ? r->pid : 1u, dir, now_ns, window_ns);
-  double path_entropy = path_entropy_score(r->file_path);
+  if ((mutation || r->type == EDR_EVENT_FILE_CREATE) && is_ransom_note_like_path(r->file_path)) {
+    RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
+    (void)note_file_seen_or_add(nb, r->file_path);
+    append_record_kv(r, "ransom_note_count=%u%s", nb->note_count,
+                     nb->note_count >= (uint32_t)ransom_note_threshold() ? " ransom_note_burst=1" : "");
+  }
+  if (r->type == EDR_EVENT_FILE_DELETE && !canary) {
+    append_record_kv(r, "ransom_operation_context=1");
+    return;
+  }
+  RansomCounterBucket *b = ransom_bucket_for(r, dir, now_ns, window_ns);
+  RansomFileObservation *file = ransom_file_observation(b, r);
+  if (!file && !canary) {
+    append_record_kv(r, "ransom_tracking_saturated=1");
+    return;
+  }
   double content_entropy = 0.0;
   size_t content_sample = 0u;
-  double prev = b->entropy_avg;
-  b->file_events++;
-  (void)ext_seen_or_add(b, ext);
-  (void)dir_seen_or_add(b, dir);
-  int content_deferred = !should_sample_ransom_content_entropy(b, ext_changed, canary);
+  if (mutation) {
+    if (b->file_events < UINT32_MAX) b->file_events++;
+    if (file && !file->counted) {
+      file->counted = 1;
+      b->unique_files++;
+      (void)ext_seen_or_add(b, ext);
+      (void)dir_seen_or_add(b, dir);
+    }
+  }
+  int content_deferred = !file || r->type == EDR_EVENT_FILE_DELETE ||
+      !should_sample_ransom_content_entropy(b, ext_changed, canary) ||
+      (file->last_sample_ns > 0 && now_ns - file->last_sample_ns < 1000000000LL && !ext_changed);
   int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
-  double entropy = content_ok ? content_entropy : path_entropy;
-  if (b->file_events == 1u || prev <= 0.0) {
-    b->entropy_avg = entropy;
-  } else {
-    b->entropy_avg = (prev * 0.85) + (entropy * 0.15);
+  double entropy_delta = 0.0;
+  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
+  if (!content_deferred) file->last_sample_ns = now_ns;
+  if (content_ok && content_sample >= 512u) {
+    if (file->sampled) {
+      /* Only a measured change of this same file is an entropy delta. */
+      entropy_delta = content_entropy - file->baseline_entropy;
+      if (entropy_delta < 0.0) entropy_delta = 0.0;
+    } else {
+      file->sampled = 1;
+      file->baseline_entropy = (float)content_entropy;
+      b->sampled_files++;
+    }
+    if (content_high && !file->high_entropy) {
+      file->high_entropy = 1;
+      b->high_entropy_events++;
+    }
+    if (mutation && content_high && entropy_delta >= 1.5 && !file->content_changed) {
+      file->content_changed = 1;
+      b->content_changed_files++;
+    }
+  }
+  if (!mutation && !canary) {
+    append_record_kv(r, "ransom_operation_context=1");
+    return;
   }
   double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
   if (elapsed_s < 1.0) {
     elapsed_s = 1.0;
   }
-  double file_rate = ((double)b->file_events * 60.0) / elapsed_s;
-  double entropy_delta = entropy - prev;
-  if (entropy_delta < 0.0) {
-    entropy_delta = 0.0;
-  }
-  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
-  if (content_high || entropy >= 4.0 || entropy_delta >= 1.5) {
-    b->high_entropy_events++;
-  }
+  double file_rate = ((double)b->unique_files * 60.0) / elapsed_s;
   int warn_files = env_int_clamped("EDR_RANSOM_RATE_WARN_FILES", 60, 8, 500);
   int confirm_files = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_FILES", 200, 20, 2000);
   int warn_dirs = env_int_clamped("EDR_RANSOM_RATE_WARN_DIRS", 4, 1, 32);
   int confirm_dirs = env_int_clamped("EDR_RANSOM_RATE_CONFIRM_DIRS", 8, 1, 64);
-  int enough_volume = b->file_events >= 20u;
+  int enough_volume = b->unique_files >= 20u;
   int suspicious = (enough_volume && file_rate >= 120.0) ||
-                   (b->file_events >= 12u && b->ext_count >= 8u) ||
-                   (b->file_events >= 8u && entropy_delta >= 1.5) ||
+                   (b->unique_files >= 12u && b->ext_count >= 8u) ||
+                   (b->unique_files >= 8u && entropy_delta >= 1.5) ||
                    (ext_changed && content_high) ||
-                   ((int)b->file_events >= warn_files &&
+                   ((int)b->unique_files >= warn_files &&
                     ((int)b->dir_count >= warn_dirs || b->ext_count >= 8u));
-  double high_entropy_ratio = b->file_events > 0u ? (double)b->high_entropy_events / (double)b->file_events : 0.0;
+  double high_entropy_ratio = b->sampled_files > 0u ? (double)b->high_entropy_events / (double)b->sampled_files : 0.0;
+  int content_changed = mutation && content_high && entropy_delta >= 1.5;
   int confirmed = canary ||
-                  ((int)b->file_events >= confirm_files &&
-                   ((int)b->dir_count >= confirm_dirs || b->ext_count >= 12u || high_entropy_ratio >= 0.70)) ||
-                  (suspicious && file_rate >= 300.0 && b->ext_count >= 12u) ||
-                  (suspicious && ext_changed && content_high && b->file_events >= 20u);
+                  (content_changed && b->content_changed_files >= 20u &&
+                   ((int)b->unique_files >= confirm_files || ext_changed || (int)b->dir_count >= confirm_dirs));
   uint8_t level = confirmed ? 2u : (suspicious ? 1u : 0u);
-  int state_changed = level > 0u && level != b->emitted_level;
+  /* Missing follow-up samples must not re-arm automatic response in the
+   * same process-generation window after confirmation. */
+  int state_changed = level > b->emitted_level;
   int periodic_summary = level > 0u && !state_changed && b->last_signal_ns > 0 &&
                          now_ns >= b->last_signal_ns &&
                          now_ns - b->last_signal_ns >= ransom_counter_summary_interval_ns();
   int emit_signal = state_changed || periodic_summary;
   if (emit_signal) {
     uint32_t coalesced = b->coalesced_events;
-    b->emitted_level = level;
+    if (level > b->emitted_level) b->emitted_level = level;
     b->last_signal_ns = now_ns;
     b->coalesced_events = 0u;
     append_record_kv(r,
                      "file_rate=%.0f ext_burst=%u dir_burst=%u entropy_delta=%.2f high_entropy_ratio=%.2f "
                      "path_entropy=%.2f content_entropy=%.2f content_sample_bytes=%u content_entropy_ok=%d "
+                     "ransom_evidence_version=3 file_event_count=%u unique_file_count=%u sampled_file_count=%u "
+                     "content_changed_file_count=%u confirmation_basis=%s "
                      "ransom_counter=1 ransom_counter_level=%u coalesced_events=%u%s%s%s%s",
                      file_rate, (unsigned)b->ext_count, (unsigned)b->dir_count, entropy_delta,
-                     high_entropy_ratio, path_entropy, content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                     high_entropy_ratio, path_entropy_score(r->file_path), content_entropy, (unsigned)content_sample, content_ok ? 1 : 0,
+                     b->file_events, b->unique_files, b->sampled_files, b->content_changed_files,
+                     canary ? "canary_mutation" : (confirmed ? "content_change" : "none"),
                      (unsigned)level, (unsigned)coalesced,
                      content_deferred ? " content_entropy_deferred=1" : "",
                      state_changed ? " ransom_counter_transition=1" : "",
@@ -876,14 +969,7 @@ static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
 
   if (confirmed && state_changed) {
     /* 确诊勒索:端侧处置(默认关,需显式启用自动隔离策略)。 */
-    edr_isolate_auto_from_ransom_alarm(r->pid);
-  }
-
-  if (is_ransom_note_like_path(r->file_path)) {
-    RansomNoteBucket *nb = ransom_note_bucket_for(r->pid ? r->pid : 1u, now_ns, ransom_note_window_ns());
-    (void)note_file_seen_or_add(nb, r->file_path);
-    append_record_kv(r, "ransom_note_count=%u%s", nb->note_count,
-                     nb->note_count >= (uint32_t)ransom_note_threshold() ? " ransom_note_burst=1" : "");
+    edr_isolate_auto_from_ransom_alarm(r);
   }
 }
 

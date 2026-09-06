@@ -4,7 +4,7 @@
 #include <string.h>
 
 /* Link seam required by behavior_from_slot's ransomware policy path. */
-void edr_isolate_auto_from_ransom_alarm(uint32_t pid) { (void)pid; }
+void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
 int main(void) {
   EdrEventSlot slot; EdrBehaviorRecord r;

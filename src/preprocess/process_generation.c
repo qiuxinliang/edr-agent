@@ -59,7 +59,7 @@ static EdrNtQueryInformationProcessFn resolve_native_query(void) {
 
 int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,
                                   uint32_t timeout_ms, char *reason, size_t reason_cap) {
-  if (!pid || pid == GetCurrentProcessId() || !expected_creation_filetime ||
+  if (pid <= 4u || pid == GetCurrentProcessId() || !expected_creation_filetime ||
       timeout_ms == 0u || timeout_ms > 5000u) {
     set_reason(reason, reason_cap, "invalid_or_self_process_target");
     return 0;
@@ -73,10 +73,21 @@ int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filet
   }
   FILETIME created, exited, kernel, user;
   int ok = 0;
+  BOOL critical = FALSE;
+  typedef BOOL (WINAPI *IsCriticalFn)(HANDLE, PBOOL);
+  HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  IsCriticalFn is_critical = kernel32 ? (IsCriticalFn)(void *)GetProcAddress(kernel32, "IsProcessCritical") : NULL;
   if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
     set_reason(reason, reason_cap, "process_identity_query_failed");
   } else if ((((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime) != expected_creation_filetime) {
     set_reason(reason, reason_cap, "process_generation_mismatch");
+  } else if (WaitForSingleObject(process, 0u) == WAIT_OBJECT_0) {
+    set_reason(reason, reason_cap, "process_already_gone");
+    ok = 1;
+  } else if (!is_critical || !is_critical(process, &critical)) {
+    set_reason(reason, reason_cap, "process_protection_query_failed");
+  } else if (critical) {
+    set_reason(reason, reason_cap, "protected_process_target");
   } else if (!TerminateProcess(process, 1u)) {
     set_reason(reason, reason_cap, "process_terminate_failed");
   } else {
