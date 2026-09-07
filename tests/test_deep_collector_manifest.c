@@ -324,6 +324,53 @@ static void test_ensure_adapter_derives_manifest_from_rest_base(void) {
   rmdir(dir);
 }
 
+static void test_fixed_local_collector_is_never_replaced_by_adapter(void) {
+  char dir[512];
+  char dest[512];
+  char resolved[512];
+  char detail[256];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create fixed collector temp dir");
+  if (join_test_path(dest, sizeof(dest), dir, "/forensic_collector_builtin.exe") != 0) {
+    expect_true(0, "build fixed collector destination without truncation");
+    rmdir(dir);
+    return;
+  }
+  g_rest_base = "https://reachable.local/api/v1/";
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/artifact\",\"sha256\":\"\"}";
+  g_artifact_body = "downloaded-adapter";
+  g_last_manifest_url[0] = '\0';
+  g_last_artifact_url[0] = '\0';
+
+  int rc = dc_resolve_verify(dest, dest, 1, resolved, sizeof(resolved), detail, sizeof(detail));
+  expect_true(rc == EDR_DC_ERR_DOWNLOAD, "missing fixed collector must fail closed");
+  expect_true(!path_exists(dest), "missing fixed collector must not be replaced by adapter download");
+  expect_true(g_last_manifest_url[0] == '\0' && g_last_artifact_url[0] == '\0',
+              "fixed collector resolution must not access adapter manifest or artifact");
+  expect_true(strstr(detail, "fixed local collector missing") != NULL,
+              "missing fixed collector should report the recovery boundary failure");
+
+  expect_true(write_file_bytes(dest, "independent-c-baseline") == 0,
+              "write independent fixed collector");
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_ADAPTER_SHA256",
+            "0000000000000000000000000000000000000000000000000000000000000000");
+#else
+  setenv("EDR_FORENSIC_ADAPTER_SHA256",
+         "0000000000000000000000000000000000000000000000000000000000000000", 1);
+#endif
+  rc = dc_resolve_verify(dest, dest, 1, resolved, sizeof(resolved), detail, sizeof(detail));
+  expect_true(rc == EDR_DC_OK,
+              "independent fixed collector must not inherit the adapter SHA-256 pin");
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_ADAPTER_SHA256", "");
+#else
+  unsetenv("EDR_FORENSIC_ADAPTER_SHA256");
+#endif
+  g_rest_base = NULL;
+  remove(dest);
+  rmdir(dir);
+}
+
 static void test_stderr_tail_appended(void) {
   char dir[512];
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create temp dir");
@@ -471,6 +518,7 @@ int main(void) {
   test_success_installs_part_atomically();
   test_artifact_download_fallback_uses_manifest_origin();
   test_ensure_adapter_derives_manifest_from_rest_base();
+  test_fixed_local_collector_is_never_replaced_by_adapter();
   test_stderr_tail_appended();
   test_maybe_refresh_replaces_on_sha_change();
   test_maybe_refresh_keeps_current_when_sha_matches();

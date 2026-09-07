@@ -709,6 +709,7 @@ static int forensic_external_run(const char *cmd_id, const char *scope, const ui
     }
     spec.collector_bin = bbin;
     spec.needs_velociraptor = 0; /* builtin 兜底不依赖 velo,勿在其前拉取 */
+    spec.fixed_local_binary = 1; /* C baseline 必须来自安装包，严禁 adapter manifest 覆盖 */
     char bdetail[512];
     bdetail[0] = '\0';
     int rc2 = edr_deep_collector_run_blocking(&spec, bdetail, sizeof(bdetail));
@@ -860,6 +861,7 @@ static int fx_spawn_locked(const char *scope, const uint8_t *payload, size_t pay
 #endif
     }
     spec.collector_bin = bbin;
+    spec.fixed_local_binary = 1;
   }
   return edr_deep_collector_spawn(&spec, detail, detail_cap);
 }
@@ -1062,6 +1064,7 @@ void edr_response_forensic_async_poll(void) {
 #endif
     }
     spec.collector_bin = bbin;
+    spec.fixed_local_binary = 1;
     int sr = edr_deep_collector_spawn(&spec, bd, sizeof(bd));
     if (sr == EDR_DC_OK) { fx_unlock(); return; } /* builtin 已起,下轮 poll 收割 */
     rc = sr; tier = "builtin"; /* builtin 也起不来 → 失败终态 */

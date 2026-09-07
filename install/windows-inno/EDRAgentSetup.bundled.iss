@@ -124,9 +124,9 @@ Source: "bundle_extra\BUNDLE_README.txt"; DestDir: "{app}"; DestName: "BUNDLE_RE
 ; velociraptor.exe 体积大，standard 包默认不写入 staging，由平台按需下发。
 ; offline/full 构建可显式写入 collector\velociraptor.exe；ARM64 包中该单一文件
 ; 为 AMD64 用户态子进程，由 Windows x64 仿真执行，不允许携带驱动。
-; 缺失不致命(skipifsourcedoesntexist):无 collector 时 agent 自动回退 in-process 取证。
+; C baseline 是独立恢复边界，Build-BundledInstaller.ps1 已验证存在、架构匹配且不与 adapter 同体。
 Source: "{#EDR_BIN_DIR}\collector\forensic_collector.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#EDR_BIN_DIR}\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EDR_BIN_DIR}\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\collector\velociraptor.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\collector\*.LICENSE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_BIN_DIR}\collector\*.SOURCE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist

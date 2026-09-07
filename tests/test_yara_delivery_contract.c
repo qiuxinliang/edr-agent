@@ -86,6 +86,8 @@ int main(void) {
   ok &= require_contains(response, "no eligible readable files completed YARA scanning", "zero-scan failure must be explicit");
   ok &= require_contains(response, "pl, len, \"tar.gz\", 1", "external YARA artifact type must match collector output");
   ok &= require_contains(response, "if (rc == 0 || rc == 2)", "collector partial exit must be a terminal success state");
+  ok &= require_contains(response, "spec.fixed_local_binary = 1;",
+                         "C forensic fallback must be marked as a fixed local recovery binary");
   ok &= require_contains(response, "GetModuleFileNameA(NULL, executable",
                          "Windows YARA must resolve rules relative to the installed executable");
   ok &= require_contains(response, "readlink(\"/proc/self/exe\"",
@@ -163,6 +165,8 @@ int main(void) {
                          "an explicit Velo CPU quota must fail closed when the process cannot join the Job Object");
   ok &= require_contains(collector, "edr_deep_collector_schedule_runtime_refresh",
                          "existing collector binaries must refresh asynchronously");
+  ok &= require_contains(collector, "if (fixed_local_binary)",
+                         "fixed local fallback must bypass adapter autofetch and adapter pins");
   ok &= require_contains(collector, "dc_prepare_velociraptor",
                          "Velo preparation must reuse a ready binary without blocking on version checks");
   ok &= require_contains(collector, "GetMachineTypeAttributes",

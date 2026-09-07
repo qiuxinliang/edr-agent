@@ -224,6 +224,7 @@ jobs:
         run: |
           $buildTargets = @(
             'edr_agent',
+            'forensic_collector',
             'fd_installer_worker',
             'fd_headless_uninstaller',
             'windows_release_gate_tests'

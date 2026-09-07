@@ -236,6 +236,9 @@ int main(void) {
   contains(inno, "[InstallDelete]", "full installer has an explicit release-owned Runtime reconciliation stage");
   contains(inno, "Name: \"{app}\\*.dll\"; Check: ShouldReconcileRuntimeDlls",
            "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
+  contains(inno,
+           "Source: \"{#EDR_BIN_DIR}\\collector\\forensic_collector_builtin.exe\"; DestDir: \"{app}\\collector\"; Flags: ignoreversion",
+           "full installer requires the independently built C forensic fallback");
   contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
            "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
   contains(inno, "Name: \"windowsservice\"; Description: \"Run as the FDSecurity Windows service (recommended)\"",
@@ -265,6 +268,17 @@ int main(void) {
   require_true(!strstr(inno, "Type: filesandordirs; Name: \"{app}\""),
                "Setup uninstall must not recursively erase unknown app-root residue");
   free(inno);
+
+  snprintf(path, sizeof(path), "%s/install/windows-inno/Build-BundledInstaller.ps1", root);
+  char *inno_builder = read_file(path);
+  require_true(inno_builder != NULL, "read Windows bundled installer builder");
+  contains(inno_builder, "Stage-AndAssertForensicCollectorFallback",
+           "installer builder stages and validates the C forensic fallback");
+  contains(inno_builder, "adapter and builtin SHA-256 are identical",
+           "installer builder rejects a duplicated forensic fallback");
+  contains(inno_builder, "Build the forensic_collector CMake target before packaging",
+           "installer builder fails closed when the C forensic fallback is absent");
+  free(inno_builder);
 
   snprintf(path, sizeof(path), "%s/src/command/agent_update_command.c", root);
   char *command = read_file(path);
@@ -515,6 +529,10 @@ int main(void) {
            "legacy bundle layout writes the canonical root capability manifest");
   contains(legacy_layout, "EDR_WINDOWS_SIGNATURE_STATUS",
            "legacy bundle layout records signed versus unsigned state");
+  contains(legacy_layout, "adapter and C baseline must be independent binaries",
+           "legacy bundle layout rejects a duplicated forensic fallback");
+  contains(legacy_layout, "build the forensic_collector CMake target before packaging",
+           "legacy bundle layout fails closed when the C forensic fallback is absent");
   require_true(strstr(legacy_layout, "capabilities/package.json") == NULL,
                "legacy bundle layout no longer emits the incompatible nested capability manifest");
   free(legacy_layout);

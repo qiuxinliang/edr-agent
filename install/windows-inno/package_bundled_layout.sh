@@ -221,7 +221,7 @@ fi
 #                                      Windows x64 仿真用户态子进程，不承载驱动。
 # velo 体积大:**默认不内置**(平台自托管 + agent 按需下载是主路径);
 # 仅 EDR_BUNDLE_VELO=1 时才内置(离线/无平台连通场景)。adapter+builtin 始终内置(小)。
-# 任一缺失仅 Warning(非 strict):agent 三层兜底(velo→builtin→in-process)。
+# C baseline 是外部采集失败后的独立恢复边界，缺失或与 Go adapter 同体时拒绝发布。
 BUNDLE_VELO="${EDR_BUNDLE_VELO:-0}"
 COLLECTOR_OUT="$OUT_DIR/collector"
 mkdir -p "$COLLECTOR_OUT"
@@ -248,7 +248,23 @@ fi
 if [[ -f "$STAGE_DIR/forensic_collector_builtin.exe" ]]; then
   cp -a "$STAGE_DIR/forensic_collector_builtin.exe" "$COLLECTOR_OUT/"
 else
-  echo "Warning: [$ARCH] missing forensic_collector_builtin.exe in STAGE_DIR; C-baseline fallback unavailable." >&2
+  echo "Error: [$ARCH] missing forensic_collector_builtin.exe in STAGE_DIR; build the forensic_collector CMake target before packaging." >&2
+  exit 1
+fi
+if command -v file >/dev/null 2>&1; then
+  BUILTIN_PE_DESC="$(file -b "$COLLECTOR_OUT/forensic_collector_builtin.exe")"
+  case "$ARCH" in
+    amd64) [[ "$BUILTIN_PE_DESC" == *"x86-64"* ]] || { echo "Error: target amd64 but forensic builtin PE is: $BUILTIN_PE_DESC" >&2; exit 1; } ;;
+    arm64) [[ "$BUILTIN_PE_DESC" == *"Aarch64"* || "$BUILTIN_PE_DESC" == *"ARM64"* ]] || { echo "Error: target arm64 but forensic builtin PE is: $BUILTIN_PE_DESC" >&2; exit 1; } ;;
+  esac
+fi
+if [[ -f "$COLLECTOR_OUT/forensic_collector.exe" ]]; then
+  ADAPTER_SHA="$(shasum -a 256 "$COLLECTOR_OUT/forensic_collector.exe" | awk '{print $1}')"
+  BUILTIN_SHA="$(shasum -a 256 "$COLLECTOR_OUT/forensic_collector_builtin.exe" | awk '{print $1}')"
+  if [[ "$ADAPTER_SHA" == "$BUILTIN_SHA" ]]; then
+    echo "Error: forensic adapter and C baseline must be independent binaries; identical SHA-256: $BUILTIN_SHA" >&2
+    exit 1
+  fi
 fi
 if [[ "$BUNDLE_VELO" == "1" ]]; then
   if [[ -f "$VELO_STAGE/velociraptor.exe" ]]; then

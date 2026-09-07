@@ -937,12 +937,14 @@ static const char *dc_posix_default_velociraptor_path(void) {
 }
 #endif
 
-/* 解析适配器(forensic_collector)路径并校验。返回 0 可执行;否则 <0。
+/* 解析 collector 路径并校验。返回 0 可执行;否则 <0。
  * 路径来源:spec_bin > EDR_FORENSIC_COLLECTOR_BIN > platform_default(由调用方传入)。
+ * fixed_local_binary 只接受已存在的显式路径，不访问 adapter manifest、不继承 adapter pin。
  * 适配器为小体积件,随安装包内置:缺失即返回 EDR_DC_ERR_DOWNLOAD(调用方回退 builtin),
  *   **不**经 velo manifest 误下载(velo 由 dc_ensure_velociraptor 拉到独立槽位)。
  * 验签:EDR_FORENSIC_ADAPTER_SHA256 或 legacy EDR_FORENSIC_COLLECTOR_SHA256(env pin)配置时校验,不匹配拒绝执行。 */
-static int dc_resolve_verify(const char *spec_bin, const char *platform_default, char *out_path,
+static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
+                             int fixed_local_binary, char *out_path,
                              size_t cap, char *detail, size_t detail_cap) {
   const char *bin = (spec_bin && spec_bin[0]) ? spec_bin : NULL;
   if (!bin) {
@@ -951,6 +953,16 @@ static int dc_resolve_verify(const char *spec_bin, const char *platform_default,
   }
   if (!bin) bin = platform_default;
   snprintf(out_path, cap, "%s", bin ? bin : "");
+
+  if (fixed_local_binary) {
+    if (!spec_bin || !spec_bin[0] || !dc_file_nonempty(out_path)) {
+      if (detail) {
+        snprintf(detail, detail_cap, "fixed local collector missing: %.300s", out_path);
+      }
+      return EDR_DC_ERR_DOWNLOAD;
+    }
+    return EDR_DC_OK;
+  }
 
   if (!dc_file_nonempty(out_path)) {
     /* 适配器缺失/0 字节坏件 → 经平台 manifest(kind=adapter)按需自动下发到该路径,再复检。 */
@@ -1336,7 +1348,8 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   char binpath[1024];
   int vr = dc_resolve_verify(spec->collector_bin,
                              "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe",
-                             binpath, sizeof(binpath), out_detail, detail_cap);
+                             spec->fixed_local_binary, binpath, sizeof(binpath),
+                             out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
@@ -1514,7 +1527,8 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   char binpath[1024];
   int vr = dc_resolve_verify(spec->collector_bin,
                              "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe",
-                             binpath, sizeof(binpath), out_detail, detail_cap);
+                             spec->fixed_local_binary, binpath, sizeof(binpath),
+                             out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
     char vd[256]; vd[0] = '\0';
@@ -1773,7 +1787,8 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     return EDR_DC_ERR_DISABLED;
   }
   char binpath[1024];
-  int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(), binpath, sizeof(binpath),
+  int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(),
+                             spec->fixed_local_binary, binpath, sizeof(binpath),
                              out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {
@@ -1887,7 +1902,8 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   g_detail[0] = '\0';
 
   char binpath[1024];
-  int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(), binpath, sizeof(binpath),
+  int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(),
+                             spec->fixed_local_binary, binpath, sizeof(binpath),
                              out_detail, detail_cap);
   if (vr != EDR_DC_OK) return vr;
   if (spec->needs_velociraptor) {

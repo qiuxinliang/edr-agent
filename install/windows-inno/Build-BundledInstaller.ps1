@@ -190,6 +190,37 @@ function Build-AndStageForensicCollector {
     Write-Host "Staged forensic_collector.exe: arch=$Arch sha256=$sha path=$dest"
 }
 
+function Stage-AndAssertForensicCollectorFallback {
+    param(
+        [string] $BinDir,
+        [string] $ArchCheck,
+        [string] $TargetArch
+    )
+    $collectorDir = Join-Path $BinDir "collector"
+    New-Item -ItemType Directory -Force -Path $collectorDir | Out-Null
+    $builtinSource = Join-Path $BinDir "forensic_collector_builtin.exe"
+    $builtinDest = Join-Path $collectorDir "forensic_collector_builtin.exe"
+    if (Test-Path -LiteralPath $builtinSource -PathType Leaf) {
+        Copy-Item -LiteralPath $builtinSource -Destination $builtinDest -Force
+    }
+    if (-not (Test-Path -LiteralPath $builtinDest -PathType Leaf)) {
+        throw "Required C forensic fallback is missing: $builtinDest. Build the forensic_collector CMake target before packaging."
+    }
+    & $ArchCheck -Path $builtinDest -Architecture $TargetArch
+
+    $adapter = Join-Path $collectorDir "forensic_collector.exe"
+    if (Test-Path -LiteralPath $adapter -PathType Leaf) {
+        $adapterSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $adapter).Hash.ToLowerInvariant()
+        $builtinSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $builtinDest).Hash.ToLowerInvariant()
+        if ($adapterSha -eq $builtinSha) {
+            throw "Forensic fallback must be an independent C binary; adapter and builtin SHA-256 are identical: $builtinSha"
+        }
+        Write-Host "Verified independent forensic collectors: adapter_sha256=$adapterSha builtin_sha256=$builtinSha"
+    } else {
+        Write-Host "Verified native C forensic fallback: path=$builtinDest (adapter delivered by platform autofetch)"
+    }
+}
+
 $workerExe = Join-Path $BinDir "FDSecurityInstallerWorker.exe"
 if (-not (Test-Path -LiteralPath $workerExe)) {
     $message = "FDSecurityInstallerWorker.exe not found in $BinDir. Release installers require the native worker; pass -AllowPowerShellFallback only for development/lab builds."
@@ -241,6 +272,7 @@ if ($resolvedCollectorArch -ne $TargetArch) {
     throw "CollectorArch '$resolvedCollectorArch' must match TargetArch '$TargetArch'"
 }
 Build-AndStageForensicCollector -RepoRoot $repoRoot -BinDir $BinDir -Arch $resolvedCollectorArch -Skip:$SkipForensicCollectorBuild
+Stage-AndAssertForensicCollectorFallback -BinDir $BinDir -ArchCheck $archCheck -TargetArch $TargetArch
 
 $runtimePeFiles = @(Get-ChildItem -LiteralPath $BinDir -File -ErrorAction Stop | Where-Object {
     $_.Extension -ieq ".exe" -or $_.Extension -ieq ".dll"

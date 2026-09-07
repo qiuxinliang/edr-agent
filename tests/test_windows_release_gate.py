@@ -97,6 +97,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
             targets = re.search(r'\$(?:build|release)Targets = @\((.*?)\)', source, re.DOTALL)
             self.assertIsNotNone(targets)
             self.assertIn("'windows_release_gate_tests'", targets[1])
+            self.assertIn("'forensic_collector'", targets[1])
             self.assertNotIn("'test_", targets[1])
             self.assertIn("cmake --build build --config Release --target", source)
             self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)

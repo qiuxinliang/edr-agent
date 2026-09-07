@@ -78,6 +78,7 @@ typedef struct {
   uint32_t timeout_s;        /* 0 表示默认 300s */
   uint32_t cpu_limit_percent; /* Windows Job CPU 硬上限；0=默认 10，交互式查询可单独提高 */
   int needs_velociraptor;    /* 1=velo 层(运行前确保 velociraptor 就绪到其槽位);0=builtin/其它,不拉 velo */
+  int fixed_local_binary;    /* 1=C baseline 等本地固定件；禁止 adapter manifest 覆盖或套用 adapter pin */
   int (*cancel_requested)(void *user); /* blocking 模式每 100ms 检查；非零时终止整个子进程树 */
   void *cancel_user;
 } EdrCollectorRunSpec;
@@ -97,7 +98,8 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec,
 
 /**
  * 异步 spawn(非阻塞)——用同一 EdrCollectorRunSpec 契约(.req/--out-file 由调用方拼进 extra_args),
- * 复用 dc_resolve_verify(平台固定地址下载 + SHA256 校验),spawn 后立即返回,进程登记到单例。
+ * 主 adapter 复用 dc_resolve_verify(平台固定地址下载 + SHA256 校验)；fixed_local_binary
+ * 仅验证本地固定件存在，绝不由 adapter manifest 替换。spawn 后立即返回,进程登记到单例。
  * 之后由 agent 主循环周期调 edr_deep_collector_poll() 收割,edr_deep_collector_kill() 取消。
  * 返回 EDR_DC_OK 已受理并在后台运行;EDR_DC_ERR_SPAWN 已有采集在跑(busy)或 spawn 失败;
  *      其它<0 为路径解析/下载/校验失败(out_detail 写诊断)。

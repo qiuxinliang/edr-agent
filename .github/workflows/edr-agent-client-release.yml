@@ -457,6 +457,7 @@ jobs:
         run: |
           $releaseTargets = @(
             'edr_agent',
+            'forensic_collector',
             'windows_release_gate_tests'
           )
           cmake --build build --config Release --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
