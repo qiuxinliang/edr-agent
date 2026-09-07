@@ -274,6 +274,8 @@ int main(void) {
   require_true(inno_builder != NULL, "read Windows bundled installer builder");
   contains(inno_builder, "Stage-AndAssertForensicCollectorFallback",
            "installer builder stages and validates the C forensic fallback");
+  contains(inno_builder, "Split-Path -Parent $BinDir",
+           "installer builder resolves single-config Ninja output from the parent build directory");
   contains(inno_builder, "adapter and builtin SHA-256 are identical",
            "installer builder rejects a duplicated forensic fallback");
   contains(inno_builder, "Build the forensic_collector CMake target before packaging",

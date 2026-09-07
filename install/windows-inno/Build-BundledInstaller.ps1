@@ -198,13 +198,28 @@ function Stage-AndAssertForensicCollectorFallback {
     )
     $collectorDir = Join-Path $BinDir "collector"
     New-Item -ItemType Directory -Force -Path $collectorDir | Out-Null
-    $builtinSource = Join-Path $BinDir "forensic_collector_builtin.exe"
+    $builtinCandidates = @(
+        (Join-Path $BinDir "forensic_collector_builtin.exe")
+    )
+    $parentBuildDir = Split-Path -Parent $BinDir
+    if (-not [string]::IsNullOrWhiteSpace($parentBuildDir)) {
+        $builtinCandidates += Join-Path $parentBuildDir "forensic_collector_builtin.exe"
+    }
+    $builtinCandidates = @($builtinCandidates | Select-Object -Unique)
+    $builtinSource = $null
+    foreach ($candidate in $builtinCandidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $builtinSource = $candidate
+            break
+        }
+    }
     $builtinDest = Join-Path $collectorDir "forensic_collector_builtin.exe"
-    if (Test-Path -LiteralPath $builtinSource -PathType Leaf) {
+    if (-not [string]::IsNullOrWhiteSpace($builtinSource)) {
         Copy-Item -LiteralPath $builtinSource -Destination $builtinDest -Force
     }
     if (-not (Test-Path -LiteralPath $builtinDest -PathType Leaf)) {
-        throw "Required C forensic fallback is missing: $builtinDest. Build the forensic_collector CMake target before packaging."
+        $checkedLocations = $builtinCandidates -join ", "
+        throw "Required C forensic fallback is missing: $builtinDest. Build the forensic_collector CMake target before packaging. Checked CMake output locations: $checkedLocations"
     }
     & $ArchCheck -Path $builtinDest -Architecture $TargetArch
 
