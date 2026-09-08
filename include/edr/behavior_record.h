@@ -73,8 +73,12 @@ typedef struct {
   /* Kernel-File FileKey is meaningful only with the event-time NameCreate
    * binding.  It is retained internally so a collector evidence gate can
    * report precisely which binding could not be held; it is not a rule
-   * predicate and is serialized only inside that typed gate context. */
+   * predicate. It is serialized in typed gate or FileWrite provenance only. */
   uint64_t file_key;
+  /* Internal provenance: never accepted from an ETW1 key or serialized. */
+  uint8_t kernel_file_write;
+  uint8_t file_actor_generation_validated;
+  uint8_t file_activity_enriched;
   /* A collector capability gate is source-only metadata, never a rule hit.
    * The reason is constrained by p0_source_only_contract.h before it crosses
    * the durable queue. */

@@ -809,10 +809,29 @@ static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
   va_end(ap);
 }
 
-static void enrich_ransom_file_counters(EdrBehaviorRecord *r) {
+int edr_behavior_file_activity_priority(const EdrBehaviorRecord *r) {
+  if (!r || !file_path_usable_for_ransom(r->file_path)) return -1;
+  int mutation = r->type == EDR_EVENT_FILE_WRITE || r->type == EDR_EVENT_FILE_RENAME;
+  if ((mutation || r->type == EDR_EVENT_FILE_DELETE) &&
+      edr_policy_v2_ransomware_enabled("honey") && is_ransom_canary_path(r->file_path)) {
+    return 0;
+  }
+  return (mutation || r->type == EDR_EVENT_FILE_CREATE) &&
+                 edr_policy_v2_ransomware_enabled("mass_write") ? 1 : -1;
+}
+
+void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
   int mass_write_enabled = edr_policy_v2_ransomware_enabled("mass_write");
   int honey_enabled = edr_policy_v2_ransomware_enabled("honey");
   if (!r || !is_file_activity_event(r->type) || !r->file_path[0]) {
+    return;
+  }
+  if (r->file_activity_enriched) return;
+  r->file_activity_enriched = 1u;
+  if (r->kernel_file_write &&
+      (!r->file_actor_generation_validated || !r->pid || !r->process_start_key ||
+       !r->process_creation_filetime_100ns || !r->exe_path[0])) {
+    append_record_kv(r, "ransom_counter_suppressed=1 file_write_actor_unverified=1");
     return;
   }
   if (!mass_write_enabled && !honey_enabled) {
@@ -1567,6 +1586,8 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
+  } else if (strcmp(key, "file_write_binding_quality") == 0) {
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "file") == 0) {
     (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);
   } else if (strcmp(key, "signer") == 0 || strcmp(key, "publisher") == 0 ||
@@ -1866,6 +1887,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 
   Etw1Fields ef;
   if (slot->size > 0 && etw1_parse(slot->data, slot->size, &ef) == 0) {
+    r->kernel_file_write = slot->type == EDR_EVENT_FILE_WRITE &&
+                           strcmp(ef.prov, "kfile") == 0;
     mark_etw1_input_truncations(r, ef.truncation_mask);
     if (strcmp(ef.prov, "sec") == 0 && ef.eid == 4688u) {
       r->is_security_4688 = 1u;
@@ -2166,6 +2189,9 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
       snprintf(r->script_snippet + L, sizeof(r->script_snippet) - L, "%s%s",
                L > 0u ? " " : "", ef.sensor_detail);
     }
+    if (r->kernel_file_write && r->file_key) {
+      append_record_kv(r, "file_write_file_key=0x%llx", (unsigned long long)r->file_key);
+    }
     /* Later ETW metadata can describe a normal source state, but it cannot
      * erase a field omission detected while parsing this same record. */
     if (ef.truncation_mask != 0u) {
@@ -2181,6 +2207,5 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     r->cmdline[n] = '\0';
   }
 
-  enrich_ransom_file_counters(r);
   apply_mitre_hints(r);
 }

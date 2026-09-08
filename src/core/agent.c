@@ -2549,6 +2549,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
         "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
         "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+        "\"file_write_collection\":{\"path_resolved\":%llu,\"path_unresolved\":%llu,\"payload_incomplete\":%llu},"
         "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
         "\"critical_binding_capacity_exhausted\":%llu,\"file_key_ambiguities\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
         "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"recovery_episodes\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
@@ -2738,6 +2739,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)ch.etw_prefilter_dropped,
         (unsigned long long)ch.collector_dropped,
         (unsigned long long)ch.queue_dropped,
+        (unsigned long long)ch.file_write_path_resolved,
+        (unsigned long long)ch.file_write_path_unresolved,
+        (unsigned long long)ch.file_write_payload_incomplete,
         (unsigned long long)ch.file_read_name_bindings,
         (unsigned long long)ch.file_read_name_cache_misses,
         (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,
@@ -3186,6 +3190,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
       "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
       "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
+      "\"file_write_collection\":{\"path_resolved\":%llu,\"path_unresolved\":%llu,\"payload_incomplete\":%llu},"
       "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
       "\"critical_binding_capacity_exhausted\":%llu,\"file_key_ambiguities\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
       "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"recovery_episodes\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
@@ -3475,6 +3480,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.etw_prefilter_dropped,
       (unsigned long long)ch.collector_dropped,
       (unsigned long long)ch.queue_dropped,
+      (unsigned long long)ch.file_write_path_resolved,
+      (unsigned long long)ch.file_write_path_unresolved,
+      (unsigned long long)ch.file_write_payload_incomplete,
       (unsigned long long)ch.file_read_name_bindings,
       (unsigned long long)ch.file_read_name_cache_misses,
       (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,

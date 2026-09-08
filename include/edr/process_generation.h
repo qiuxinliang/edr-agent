@@ -16,6 +16,16 @@ typedef struct {
   uint64_t creation_filetime_100ns;
 } EdrLiveProcessGeneration;
 
+/* File events have no process-start delivery skew allowance. A replacement
+ * PID created after the event cannot own it. Reject invalid/overflowing time. */
+static inline int edr_process_generation_contains_event(uint64_t creation_filetime,
+                                                         uint64_t event_unix_ns) {
+  const uint64_t epoch = 116444736000000000ULL;
+  if (!event_unix_ns || creation_filetime <= epoch ||
+      creation_filetime - epoch > UINT64_MAX / 100u) return 0;
+  return event_unix_ns >= (creation_filetime - epoch) * 100u;
+}
+
 /* `native_process_handle` is a Windows HANDLE on Windows and intentionally
  * opaque elsewhere.  The implementation runtime-links NtQueryInformationProcess
  * because Microsoft documents no import library for it. */

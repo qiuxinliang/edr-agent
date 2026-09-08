@@ -1,6 +1,7 @@
 #include "edr/behavior_from_slot.h"
 #include "edr/detection_decision.h"
 #include "edr/windows_event_policy.h"
+#include "edr/process_generation.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -30,8 +31,22 @@ static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
   slot->size = (uint32_t)strlen((const char *)slot->data);
 }
 
-static void eval_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r, EdrDetectionDecision *d) {
+/* Counter tests supply an already-bound actor fixture. Separate tests below
+ * exercise raw parsing and rejection before that trusted boundary. */
+static void enrich_slot_fixture(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   edr_behavior_from_slot(slot, r);
+  if (r->kernel_file_write) {
+    r->file_actor_generation_validated = 1u;
+    if (!r->process_start_key) r->process_start_key = ((uint64_t)r->pid << 32u) | 1u;
+    if (!r->process_creation_filetime_100ns) {
+      r->process_creation_filetime_100ns = 116444736000000001ULL;
+    }
+  }
+  edr_behavior_enrich_file_activity(r);
+}
+
+static void eval_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r, EdrDetectionDecision *d) {
+  enrich_slot_fixture(slot, r);
   edr_detection_decision_evaluate(r, d);
   assert(!d->drop);
 }
@@ -174,7 +189,7 @@ static void test_ransom_sliding_window_counter(void) {
              i, i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338500000000000LL + (int64_t)i * 10000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
     if (strstr(r.script_snippet, "ransom_counter=1") != NULL) {
       signal_record = r;
       signal_count++;
@@ -230,7 +245,7 @@ static void test_ransom_generation_and_file_key_dedup(void) {
              "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.e%u\n", i, i);
     fill_slot(&slot, EDR_EVENT_FILE_RENAME, payload);
     slot.timestamp_ns += (int64_t)i * 100000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
     assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
   }
   for (unsigned i = 0; i < 30; ++i) {
@@ -243,7 +258,7 @@ static void test_ransom_generation_and_file_key_dedup(void) {
              "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.txt\n", 9000u + i / 10u, i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns += (int64_t)i * 100000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
     assert(strstr(r.script_snippet, "ransom_counter=1") == NULL);
   }
   assert(ransom_response_calls == before);
@@ -327,7 +342,7 @@ static void test_ransom_tracking_capacity_is_explicit(void) {
              "file=C:\\Fixture\\doc%u.txt\n", i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns += (int64_t)i * 1000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
     assert(strstr(r.script_snippet, "ENCRYPTION_CONFIRMED") == NULL);
   }
   edr_detection_decision_evaluate(&r, &d);
@@ -356,7 +371,7 @@ static void test_ransom_alert_volume_is_bounded(void) {
              i % 16, i, i % 20);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338900000000000LL + (int64_t)i * 100000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
     edr_windows_event_policy_apply(&r);
     if (strstr(r.script_snippet, "ransom_counter=1") == NULL) {
       continue;
@@ -388,7 +403,7 @@ static void test_invalid_file_path_does_not_raise_ransom_counter(void) {
             "pid=4889\n"
             "img=C:\\Program Files (x86)\\Sangfor\\SSL\\ECAgent\\ECAgent.exe\n"
             "file=badname\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   edr_detection_decision_evaluate(&r, &d);
   assert(strstr(r.script_snippet, "invalid_file_path=1") != NULL);
   assert(strstr(r.script_snippet, "ransom_counter_suppressed=1") != NULL);
@@ -413,7 +428,7 @@ static void test_low_value_process_does_not_raise_ransom_counter(void) {
              i, i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338550000000000LL + (int64_t)i * 10000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
   }
 
   edr_detection_decision_evaluate(&r, &d);
@@ -440,7 +455,7 @@ static void test_ransom_note_burst_counter(void) {
              i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338600000000000LL + (int64_t)i * 1000000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
   }
 
   edr_detection_decision_evaluate(&r, &d);
@@ -513,7 +528,7 @@ static void test_ransom_counter_allowlist_suppresses_rate_only(void) {
              i, i);
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns = 1779338700000000000LL + (int64_t)i * 10000000LL;
-    edr_behavior_from_slot(&slot, &r);
+    enrich_slot_fixture(&slot, &r);
   }
   edr_detection_decision_evaluate(&r, &d);
   test_unsetenv("EDR_RANSOM_COUNTER_ALLOWLIST");
@@ -535,7 +550,7 @@ static void test_ransom_allowlist_does_not_match_similar_identity(void) {
             "pid=5019\n"
             "img=C:\\Program Files\\TrustedBackup\\trustedbackup.exe.bak\n"
             "file=C:\\Users\\alice\\Documents\\bulk\\doc01.locked\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   edr_detection_decision_evaluate(&r, &d);
   test_unsetenv("EDR_RANSOM_COUNTER_ALLOWLIST");
   assert(strstr(r.script_snippet, "ransom_counter_allowlisted=1") == NULL);
@@ -815,7 +830,7 @@ static void test_kernel_file_read_generation_bridge(void) {
             "process_generation_source=etw_start_key_live_telemetry\n"
             "file_read_actor_quality=exact_process_start_key_cache\n"
             "source_completeness=COALESCED\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(r.type == EDR_EVENT_FILE_READ);
   assert(strcmp(r.file_op, "read") == 0);
   assert(strcmp(r.file_path,
@@ -839,7 +854,7 @@ static void test_kernel_file_read_generation_bridge(void) {
             "process_generation_source=etw_process_start_key_unavailable\n"
             "file_read_generation_quality=process_start_key_unavailable\n"
             "source_completeness=NOT_EVALUABLE\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(r.process_start_key == 0u);
   assert(r.process_creation_filetime_100ns == 0u);
   assert(strcmp(r.source_completeness, "NOT_EVALUABLE") == 0);
@@ -869,7 +884,7 @@ static void test_windows_image_resolution_and_4688_identity(void) {
             "logon_id=0xabc\n"
             "creator_user=svc\n"
             "creator_domain=CONTOSO\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(r.is_security_4688 == 1u);
   assert(strcmp(r.exe_path, "C:\\Windows\\Temp\\powershell.exe") == 0);
   assert(strcmp(r.image_path_raw, "\\Device\\HarddiskVolume7\\Windows\\Temp\\powershell.exe") == 0);
@@ -884,7 +899,7 @@ static void test_windows_image_resolution_and_4688_identity(void) {
             "ETW1\nprov=sec\neid=4688\nepid=4096\n"
             "img=C:\\Windows\\Temp\\cmd.exe\n"
             "creator_user=launcher\ncreator_domain=CONTOSO\ncreator_sid=S-1-5-21-creator\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(strcmp(r.creator_username, "launcher") == 0);
   assert(strcmp(r.creator_sid, "S-1-5-21-creator") == 0);
   assert(!r.username[0] && !r.user_sid[0]);
@@ -896,7 +911,7 @@ static void test_windows_image_resolution_and_4688_identity(void) {
             "user=-\nuser_domain=-\nuser_sid=S-1-0-0\nlogon_id=0x0\n"
             "creator_user=SYSTEM\ncreator_domain=NT AUTHORITY\n"
             "creator_sid=S-1-5-18\ncreator_logon_id=0x3e7\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(!r.username[0] && !r.user_sid[0] && !r.logon_id[0]);
   assert(strcmp(r.creator_sid, "S-1-5-18") == 0);
   assert(strcmp(r.identity_quality, "creator_fallback") == 0);
@@ -908,7 +923,7 @@ static void test_windows_image_resolution_and_4688_identity(void) {
             "img_namespace=nt_device\n"
             "img_resolution_status=NOT_EVALUABLE\n"
             "img_resolution_source=device_map_miss\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(strcmp(r.image_path_resolution_status, "NOT_EVALUABLE") == 0);
   assert(strcmp(r.exe_path, "\\Device\\HarddiskVolume99\\Temp\\powershell.exe") == 0);
 
@@ -921,7 +936,7 @@ static void test_windows_image_resolution_and_4688_identity(void) {
             "process_start_key=6473924464403231\n"
             "process_creation_filetime_100ns=134170000000000000\n"
             "process_generation_source=kernel_process_payload\n");
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
   assert(r.pid == 8200u);
   assert(r.ppid == 3764u);
   assert(r.process_start_key == 6473924464403231ULL);
@@ -958,7 +973,7 @@ static void test_source_truncation_withholds_and_names_rule_fields(void) {
                      long_basename, long_generation, long_hash, long_registry_key);
   assert(written > 0 && (size_t)written < sizeof(payload));
   fill_slot(&slot, EDR_EVENT_PROCESS_CREATE, payload);
-  edr_behavior_from_slot(&slot, &r);
+  enrich_slot_fixture(&slot, &r);
 
   assert(r.process_name[0] == '\0');
   assert(r.process_generation_source[0] == '\0');
@@ -971,7 +986,63 @@ static void test_source_truncation_withholds_and_names_rule_fields(void) {
   assert(strstr(r.source_truncated_fields, "source.reg_key_path") != NULL);
 }
 
+static void test_file_write_identity_and_parse_purity(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord record;
+  unsigned before = ransom_response_calls;
+  test_setenv("EDR_RANSOM_CANARY_PATH", "C:\\Fixture\\write-canary.txt");
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\nprov=kfile\neid=16\npid=59400\nfile_key=0x987654321\n"
+            "file=C:\\Fixture\\write-canary.txt\n"
+            "file_write_binding_quality=etw_filekey_namecreate\n"
+            "img=C:\\Fixture\\writer.exe\nprocess_start_key=98765\n"
+            "process_creation_filetime_100ns=134238120000000000\n"
+            "file_actor_generation_validated=1\n");
+  for (int i = 0; i < 10; ++i) {
+    edr_behavior_from_slot(&slot, &record);
+    assert(record.kernel_file_write && !record.file_actor_generation_validated);
+    assert(record.pid == 59400u && record.file_key == 0x987654321ULL);
+    assert(edr_behavior_file_activity_priority(&record) == 0);
+    assert(strstr(record.script_snippet, "file_write_binding_quality=etw_filekey_namecreate"));
+    assert(strstr(record.script_snippet, "file_write_file_key=0x987654321"));
+    assert(!strstr(record.script_snippet, "ransom_counter=1"));
+  }
+  assert(ransom_response_calls == before);
+  edr_behavior_enrich_file_activity(&record);
+  assert(strstr(record.script_snippet, "file_write_actor_unverified=1"));
+  assert(!strstr(record.script_snippet, "ransom_canary=1"));
+  assert(ransom_response_calls == before);
+
+  edr_behavior_from_slot(&slot, &record);
+  record.file_actor_generation_validated = 1u; /* Verified-handle boundary. */
+  edr_behavior_enrich_file_activity(&record);
+  assert(strstr(record.script_snippet, "confirmation_basis=canary_mutation"));
+  assert(strstr(record.script_snippet, "file_event_count=1"));
+  assert(ransom_response_calls == before + 1u);
+  edr_behavior_enrich_file_activity(&record);
+  assert(ransom_response_calls == before + 1u);
+  assert(!strstr(record.script_snippet, "file_event_count=2"));
+
+  edr_behavior_from_slot(&slot, &record);
+  record.file_actor_generation_validated = 1u;
+  record.process_creation_filetime_100ns = 0u;
+  edr_behavior_enrich_file_activity(&record);
+  assert(strstr(record.script_snippet, "file_write_actor_unverified=1"));
+  assert(ransom_response_calls == before + 1u);
+  test_unsetenv("EDR_RANSOM_CANARY_PATH");
+
+  const uint64_t epoch = 116444736000000000ULL;
+  assert(edr_process_generation_contains_event(epoch + 20u, 2000u));
+  assert(edr_process_generation_contains_event(epoch + 20u, 2100u));
+  assert(!edr_process_generation_contains_event(epoch + 21u, 2000u));
+  assert(!edr_process_generation_contains_event(0u, 2000u));
+  assert(!edr_process_generation_contains_event(epoch, 2000u));
+  assert(!edr_process_generation_contains_event(UINT64_MAX, 2000u));
+  assert(!edr_process_generation_contains_event(epoch + 20u, 0u));
+}
+
 int main(void) {
+  test_file_write_identity_and_parse_purity();
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
   test_tls_sensor_bridge();

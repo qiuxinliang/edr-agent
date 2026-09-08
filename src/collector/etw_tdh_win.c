@@ -360,7 +360,7 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
       L"CreatorProcessName",
   };
   static const PCWSTR file_try[] = {
-      L"FileName", L"OpenPath", L"Path", L"FileObject",
+      L"FileName", L"OpenPath", L"Path",
   };
   static const PCWSTR reg_try[] = {
       L"KeyName", L"RelativeName", L"ValueName", L"CapturedValueName",
@@ -486,7 +486,6 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"FileName", "file"},
       {L"FilePath", "file"},
       {L"Path", "file"},
-      {L"FileObject", "file"},
       {L"OpenPath", "file"},
   };
   static const EdrPropTry net_try[] = {

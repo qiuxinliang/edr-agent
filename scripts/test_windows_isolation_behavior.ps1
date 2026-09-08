@@ -20,7 +20,8 @@ function Get-DnsClientServerAddress { [pscustomobject]@{ServerAddresses=@('192.0
 function Get-NetFirewallProfile { param($PolicyStore,$ErrorAction) $script:profiles }
 function Get-NetFirewallRule {
   param($PolicyStore,$Name,$Enabled,$Action,$ErrorAction)
-  @($script:rules | Where-Object { (-not $Name -or $_.Name -eq $Name) -and (-not $Enabled -or $_.Enabled -eq [string]$Enabled) -and (-not $Action -or $_.Action -eq $Action) })
+  $script:ruleReads++
+  @($script:rules | Where-Object { (-not $Name -or $_.Name -in @($Name)) -and (-not $Enabled -or $_.Enabled -eq [string]$Enabled) -and (-not $Action -or $_.Action -eq $Action) })
 }
 function Get-NetFirewallAddressFilter {
   [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject)
@@ -35,7 +36,16 @@ function New-NetFirewallRule {
   $script:rules += [pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Direction=$Direction;Action=$Action;Enabled=[string]$Enabled;RemoteAddress=$RemoteAddress;RemotePort=$RemotePort;Protocol=$Protocol;PolicyStoreSourceType='Local'}
 }
 function Disable-NetFirewallRule { param($PolicyStore,$Name,$ErrorAction) ($script:rules | Where-Object Name -eq $Name).Enabled = 'False' }
-function Enable-NetFirewallRule { param($PolicyStore,$Name,$ErrorAction) ($script:rules | Where-Object Name -eq $Name).Enabled = 'True' }
+function Enable-NetFirewallRule {
+  param($PolicyStore,$Name,$ErrorAction)
+  $script:enableCalls++
+  if (@($Name).Count -gt 32) { throw 'firewall_query_quota_exceeded' }
+  foreach ($n in @($Name)) {
+    $matched = @($script:rules | Where-Object Name -eq $n)
+    if ($matched.Count -ne 1) { throw 'firewall_rule_missing' }
+    $matched[0].Enabled = 'True'
+  }
+}
 function Remove-NetFirewallRule { param($PolicyStore,$Name,$ErrorAction) $script:rules = @($script:rules | Where-Object Name -ne $Name) }
 function Set-NetFirewallProfile {
   param($PolicyStore,$Profile,$Enabled,$DefaultInboundAction,$DefaultOutboundAction,$ErrorAction)
@@ -58,6 +68,8 @@ function Reset-TestState {
   if (Test-Path -LiteralPath $StatePath) { Remove-Item -LiteralPath $StatePath }
   $script:reachable = $true
   $script:failProfile = 0
+  $script:ruleReads = 0
+  $script:enableCalls = 0
   $script:profiles = @('Domain','Private','Public' | ForEach-Object {
     [pscustomobject]@{Name=$_;Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Allow'}
   })
@@ -104,6 +116,20 @@ try {
   $legacy = Read-State
   Assert ($legacy.profiles[0].DefaultOutboundAction -eq 'Allow') 'legacy numbers use actual runtime enum mapping'
   Remove-Isolation
+  Reset-TestState
+  $script:rules = @(1..300 | ForEach-Object {
+    [pscustomobject]@{Name="allow-$_";DisplayName="Existing $_";Action='Allow';Enabled='False';PolicyStoreSourceType='Local'}
+  })
+  $large = [pscustomobject]@{schema='edr.isolation.v2';phase='prepared';profiles=$script:profiles;disabled_rules=@($script:rules.Name)}
+  Save-State $large
+  Remove-Isolation
+  Assert (@($script:rules | Where-Object Enabled -ne 'True').Count -eq 0) 'all baseline rules must be restored'
+  Assert ($script:ruleReads -le 4 -and $script:enableCalls -le 10) 'restoration must bound firewall I/O and provider query size for 300 rules'
+  $script:rules[0].Enabled = 'False'
+  Assert (-not (Test-Restored (Read-State))) 'bulk verification must reject a disabled baseline rule'
+  $script:rules = @($script:rules | Select-Object -Skip 1)
+  Assert (-not (Test-Restored (Read-State))) 'bulk verification must reject a missing baseline rule'
+  Expect-Failure { Remove-Isolation } 'firewall_rule_missing'
   Reset-TestState
   $script:reachable = $false
   Expect-Failure { Enable-Isolation } 'management_unreachable'

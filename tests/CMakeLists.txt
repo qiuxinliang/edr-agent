@@ -279,6 +279,14 @@ if(WIN32)
   edr_apply_test_warnings(test_process_generation_windows)
   add_test(NAME process_generation_same_handle_command_line
     COMMAND test_process_generation_windows)
+  add_executable(test_kernel_file_io_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_file_io_windows.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
+  target_include_directories(test_kernel_file_io_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(test_kernel_file_io_windows PRIVATE tdh)
+  edr_apply_test_warnings(test_kernel_file_io_windows)
+  add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
 endif()
 
 add_executable(test_process_create_coalescer

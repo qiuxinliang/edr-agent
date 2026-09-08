@@ -143,6 +143,9 @@ typedef struct {
     char file_read_p0_capability_reason[96];
     uint64_t file_read_generation_unavailable;
     uint64_t file_read_actor_generation_unavailable;
+    uint64_t file_write_path_resolved;
+    uint64_t file_write_path_unresolved;
+    uint64_t file_write_payload_incomplete;
     /* Kernel-File has its own EnableTraceEx2 request; do not infer this from
      * the separate Kernel-Process provider health. */
     int kernel_file_start_key_requested;

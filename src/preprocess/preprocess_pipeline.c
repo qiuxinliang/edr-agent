@@ -357,8 +357,8 @@ static int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
                                                uint64_t source_creation) {
   ProcessTreeEntry snapshot;
   uint64_t event_unix_ns;
-  uint64_t creation_unix_ns;
-  if (!br || br->type != EDR_EVENT_FILE_READ || !br->pid || br->event_time_ns <= 0) {
+  if (!br || (br->type != EDR_EVENT_FILE_READ && !br->kernel_file_write) ||
+      !br->pid || br->event_time_ns <= 0) {
     return 0;
   }
   event_unix_ns = (uint64_t)br->event_time_ns;
@@ -372,8 +372,7 @@ static int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
        source_creation != snapshot.creation_filetime_100ns)) {
     return 0;
   }
-  creation_unix_ns = filetime_100ns_to_unix_ns(snapshot.creation_filetime_100ns);
-  if (!creation_unix_ns || event_unix_ns < creation_unix_ns) {
+  if (!edr_process_generation_contains_event(snapshot.creation_filetime_100ns, event_unix_ns)) {
     return 0;
   }
 
@@ -402,7 +401,9 @@ static int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
              "process_tree_cache_generation");
   copy_trunc(br->process_generation_source,
              sizeof(br->process_generation_source),
-             "file_read_process_tree_cache_generation");
+             br->kernel_file_write ? "file_write_process_tree_cache_generation"
+                                   : "file_read_process_tree_cache_generation");
+  br->file_actor_generation_validated = 1u;
   return 1;
 }
 
@@ -417,7 +418,8 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   uint64_t creation_unix_ns;
   char reason[64];
   if (!br || br->is_security_4688 ||
-      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ) ||
+      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ &&
+       !br->kernel_file_write) ||
       (br->type == EDR_EVENT_PROCESS_CREATE &&
        !edr_process_create_is_lifecycle_authoritative(br))) {
     return 0;
@@ -500,20 +502,21 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
    * ETW event timestamp proves the current PID lifetime already existed at
    * the time of the Read. A reused PID necessarily has a later creation
    * FILETIME and is rejected here. */
-  if (br->type == EDR_EVENT_FILE_READ &&
-      (!event_unix_ns || !creation_unix_ns || event_unix_ns < creation_unix_ns)) {
+  if ((br->type == EDR_EVENT_FILE_READ || br->kernel_file_write) &&
+      !edr_process_generation_contains_event(live.creation_filetime_100ns, event_unix_ns)) {
     CloseHandle(process);
     if (p0_bind_file_read_cached_generation(br, source_start_key,
                                             source_creation)) {
       return 1;
     }
     snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
-             "file_read_live_generation_event_time_mismatch");
+             br->kernel_file_write ? "file_write_live_generation_event_time_mismatch"
+                                   : "file_read_live_generation_event_time_mismatch");
     p0_mark_file_read_collector_evidence(
         br, EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH);
     return 0;
   }
-  if (br->type == EDR_EVENT_PROCESS_CREATE && !br->cmdline[0]) {
+  if ((br->type == EDR_EVENT_PROCESS_CREATE || br->kernel_file_write) && !br->cmdline[0]) {
     reason[0] = '\0';
     if (edr_process_command_line_query_live(process, br->cmdline, sizeof(br->cmdline),
                                             reason, sizeof(reason))) {
@@ -528,7 +531,7 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
                "live_same_generation_unavailable");
     }
   }
-  if (br->type == EDR_EVENT_FILE_READ) {
+  if (br->type == EDR_EVENT_FILE_READ || br->kernel_file_write) {
     char actor_path[EDR_BR_STR_LONG];
     /* The same handle already proved PID, StartKey, FILETIME and event-time
      * order. A collector-cache miss must not leave a valid actor unnamed,
@@ -540,6 +543,8 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
                                               source_creation)) {
         return 1;
       }
+      snprintf(br->process_generation_source, sizeof(br->process_generation_source),
+               "%s", "actor_image_unresolved");
       p0_mark_file_read_collector_evidence(br, EDR_P0_FILE_READ_REASON_ACTOR_IMAGE_UNRESOLVED);
       return 0;
     }
@@ -558,7 +563,11 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
                                          : "target_live_telemetry")
                : (source_start_key != 0u
                       ? "etw_start_key_live_telemetry"
-                      : "file_read_pid_event_time_live_telemetry"));
+                      : (br->kernel_file_write ? "file_write_pid_event_time_live_telemetry"
+                                               : "file_read_pid_event_time_live_telemetry")));
+  if (br->type == EDR_EVENT_FILE_READ || br->kernel_file_write) {
+    br->file_actor_generation_validated = 1u;
+  }
   return 1;
 }
 
@@ -665,7 +674,8 @@ static int enrich_process_token_identity(EdrBehaviorRecord *br) {
   int target_4688_mismatch = 0;
   int path_invalid_utf8 = 0;
 
-  if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->is_security_4688 || br->pid == 0u) {
+  if (!br || (br->type != EDR_EVENT_PROCESS_CREATE && !br->kernel_file_write) ||
+      br->is_security_4688 || br->pid == 0u) {
     return 0;
   }
   memset(correlated_target_sid, 0, sizeof(correlated_target_sid));
@@ -1299,6 +1309,7 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   enrich_process_integrity_context(&br);
   edr_local_evidence_cache_observe_process(&br);
   edr_local_evidence_cache_enrich_behavior(&br);
+  edr_behavior_enrich_file_activity(&br);
   edr_windows_event_policy_apply(&br);
   edr_pid_history_pmfe_fill_record(&br);
 #ifdef _WIN32
@@ -1542,6 +1553,26 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * that the queried live PID generation already existed, or the same event
      * time selects an exact retained StartKey/FILETIME generation. */
     (void)p0_bind_process_generation(&br);
+  } else if (br.kernel_file_write) {
+    if (!p0_bind_process_generation(&br)) {
+      /* Preserve the real writer PID/path and failure reason locally, but
+       * never evaluate or act using a different occupant of that PID. */
+      snprintf(br.source_completeness, sizeof(br.source_completeness), "%s", "NOT_EVALUABLE");
+      static uint64_t actor_unavailable;
+      uint64_t count = ++actor_unavailable;
+      if (count <= 3u || (count & (count - 1u)) == 0u) {
+        fprintf(stderr, "[preprocess] FileWrite actor unavailable pid=%u count=%llu reason=%s\n",
+                br.pid, (unsigned long long)count, br.process_generation_source);
+      }
+      apply_agent_ids_to_record(&br);
+      edr_p0_rule_observe_validation_stage(&br, "file_write_actor", br.process_generation_source);
+      edr_local_evidence_cache_record_behavior(&br);
+      return;
+    }
+    format_record_time_ns((int64_t)filetime_100ns_to_unix_ns(br.process_creation_filetime_100ns),
+                         br.process_creation_time, sizeof(br.process_creation_time));
+    (void)enrich_process_token_identity(&br);
+    edr_p0_rule_observe_validation_stage(&br, "file_write_actor", "complete");
   }
 #endif
   process_one_record(br, slot);

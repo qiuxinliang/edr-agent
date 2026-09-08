@@ -1,4 +1,5 @@
 # kernel-file Provider：file_try[] 顺序（与 etw_tdh_win.c 一致）
 FileName
-FileObject
+FilePath
+Path
 OpenPath

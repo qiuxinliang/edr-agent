@@ -149,9 +149,15 @@ function Test-Restored($State) {
     if ($p.Count -ne 1 -or [string]$p[0].DefaultInboundAction -ne [string]$saved.DefaultInboundAction -or [string]$p[0].DefaultOutboundAction -ne [string]$saved.DefaultOutboundAction) { return $false }
     if ($saved.PSObject.Properties['Enabled'] -and [string]$p[0].Enabled -ne [string]$saved.Enabled) { return $false }
   }
+  # A CIM round trip per rule makes repeated restore/status checks exceed the
+  # command deadline on ordinary Windows hosts with hundreds of allow rules.
+  $rulesByName = @{}
+  foreach ($r in @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop)) {
+    if ($rulesByName.ContainsKey($r.Name)) { return $false }
+    $rulesByName[$r.Name] = $r
+  }
   foreach ($name in @($State.disabled_rules)) {
-    $r = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction Stop)
-    if ($r.Count -ne 1 -or [string]$r[0].Enabled -ne 'True') { return $false }
+    if (-not $rulesByName.ContainsKey($name) -or [string]$rulesByName[$name].Enabled -ne 'True') { return $false }
   }
   return $true
 }
@@ -163,7 +169,12 @@ function Restore-Baseline($State) {
     if ($p.PSObject.Properties['Enabled']) { $args.Enabled = [string]$p.Enabled }
     Set-NetFirewallProfile @args
   }
-  foreach ($name in @($State.disabled_rules)) { Enable-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction Stop | Out-Null }
+  # Name[] becomes a WQL filter; cap each batch below provider query quotas.
+  $names = @($State.disabled_rules)
+  for ($offset = 0; $offset -lt $names.Count; $offset += 32) {
+    $last = [Math]::Min($offset + 31, $names.Count - 1)
+    Enable-NetFirewallRule -PolicyStore PersistentStore -Name $names[$offset..$last] -ErrorAction Stop | Out-Null
+  }
   foreach ($r in @(Get-OwnedRules)) { Remove-NetFirewallRule -PolicyStore PersistentStore -Name $r.Name -ErrorAction Stop }
   if (-not (Test-Restored $State)) { throw "restore_verification_failed" }
   if ($State.PSObject.Properties['management'] -and -not (Test-ManagementReachable $State.management)) { throw "restore_management_unreachable" }

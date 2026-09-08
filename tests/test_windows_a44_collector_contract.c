@@ -198,6 +198,22 @@ int main(void) {
                          "Read classification must require FILEIO and READ keywords");
   ok &= require_contains(collector, "edr_kernel_file_read_descriptor",
                          "Read must be task/opcode/keyword classified, not text inferred");
+  ok &= require_contains(collector, "EDR_KERNEL_FILE_EVENT_WRITE 16u",
+                         "Write must use the documented descriptor, not localized task text");
+  ok &= require_contains(collector, "edr_kernel_file_write_descriptor(descriptor)",
+                         "Write must share the typed FileKey lifetime resolver");
+  ok &= require_absent(tdh, "{L\"FileObject\", \"file\"}",
+                       "opaque FileObject must never be decoded as a path");
+  ok &= require_contains(collector, "if (is_read) edr_collector_file_read_metadata_gate_note_resolved();",
+                         "Write must not clear a pending FileRead recovery gate");
+  ok &= require_contains(collector, "file_write_payload_incomplete++",
+                         "incomplete FileWrite evidence must have a diagnostic counter");
+  ok &= require_contains(preprocess, "else if (br.kernel_file_write)",
+                         "kernel writes must bind their event-time actor before evaluation");
+  ok &= require_order_in_function(preprocess, "static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {",
+      "static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {",
+      "edr_local_evidence_cache_enrich_behavior(&br)", "edr_behavior_enrich_file_activity(&br)",
+      "ransomware counters must run after generation-bound actor enrichment");
   ok &= require_contains(collector, "edr_tdh_kernel_file_extract_name_binding",
                          "NameCreate must provide a typed FileKey/FileName binding");
   ok &= require_order_in_function(
@@ -227,8 +243,8 @@ int main(void) {
   ok &= require_absent(collector, "edr_kernel_file_cleanup_or_close_descriptor",
                        "individual FileObject closure must not invalidate a shared FileKey name");
   ok &= require_order_in_function(
-      collector, "static int edr_collector_kernel_file_read_resolve(",
-      "static int edr_collector_append_file_read_binding(",
+      collector, "static int edr_collector_kernel_file_io_resolve(",
+      "static int edr_collector_append_file_io_binding(",
       "edr_file_key_lifetime_is_newer(entry->name_event_ns",
       "edr_file_key_lifetime_contains(entry->name_event_ns",
       "FileKey reuse must select the newest name before rejecting its closed lifetime");
@@ -239,7 +255,7 @@ int main(void) {
   ok &= require_order_in_function(
       collector, "static void edr_collector_decode_mapped_event(",
       "static VOID WINAPI edr_event_record_callback(",
-      "edr_collector_kernel_file_read_resolve(",
+      "edr_collector_kernel_file_io_resolve(",
       "if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy())",
       "decode must resolve an exact FileKey NameCreate binding before observing gate state");
   ok &= require_contains(collector,
@@ -458,8 +474,8 @@ int main(void) {
   ok &= require_contains(collector, "if (!read_pid)",
                          "the attributed Read must carry an actor PID for live generation binding");
   ok &= require_absent_in_function(
-      collector, "static int edr_collector_kernel_file_read_resolve(",
-      "static int edr_collector_append_file_read_binding(",
+      collector, "static int edr_collector_kernel_file_io_resolve(",
+      "static int edr_collector_append_file_io_binding(",
       "if (!read_pid || !read_start_key)",
       "ARM64 FileRead schemas without an extended StartKey must reach live generation binding");
   ok &= require_contains(collector, "NameCreate binds the file object, not the process",
@@ -508,12 +524,12 @@ int main(void) {
                          "ordinary flood must be observable when it cannot consume the P0 reserve");
   ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE",
                          "empty FileRead TDH payload must be source-only, not silently dropped");
-  ok &= require_contains(collector, "edr_collector_build_file_read_slot_payload",
+  ok &= require_contains(collector, "edr_collector_build_file_io_slot_payload",
                          "FileRead must reserve payload capacity for authoritative binding fields");
-  ok &= require_contains(collector, "size_t plen = ty == EDR_EVENT_FILE_READ",
+  ok &= require_contains(collector, "size_t plen = is_file_io",
                          "FileRead must use its compact payload path before checked field appends");
-  ok &= require_before(collector, "edr_collector_build_file_read_slot_payload(",
-                       "edr_collector_append_file_read_binding(&slot",
+  ok &= require_before(collector, "edr_collector_build_file_io_slot_payload(",
+                       "edr_collector_append_file_io_binding(&slot",
                        "FileRead base payload must be built before canonical binding append");
   ok &= require_contains(collector, "EDR_P0_FILE_READ_REASON_EVENT_TIME_UNAVAILABLE",
                          "zero FileRead event time must be source-only, not callback-time substituted");
