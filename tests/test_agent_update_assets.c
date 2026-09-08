@@ -223,6 +223,15 @@ int main(void) {
   require_true(baseline_repair_lifecycle != NULL, "read Windows Setup lifecycle smoke");
   contains(baseline_repair_lifecycle, "Assert-BaselineRepair", "native Windows lifecycle exercises the missing-uninstaller repair path");
   contains(baseline_repair_lifecycle, "EDR_REPAIR_BASELINE=1", "lifecycle invokes the explicit repair mode");
+  contains(baseline_repair_lifecycle, "New-BaselineRepairBackup $backupDir",
+           "lifecycle creates the repair authorization backup without traversing hardened runtime data");
+  contains(baseline_repair_lifecycle, "foreach ($name in @(\"FDSensor.exe\", \"agent.toml\"))",
+           "repair authorization backup contains the protected Agent and identity configuration");
+  contains(baseline_repair_lifecycle, "repair backup hash mismatch",
+           "repair authorization backup verifies copied file identity");
+  require_true(!strstr(baseline_repair_lifecycle,
+                       "Get-ChildItem -LiteralPath $InstallDir -Force | Copy-Item"),
+               "lifecycle does not traverse ACL-hardened runtime directories for repair authorization");
   contains(baseline_repair_lifecycle, "identity_preserved=true", "lifecycle verifies protected endpoint identity preservation");
   contains(baseline_repair_lifecycle, "queue_preserved=true", "lifecycle verifies offline queue preservation");
   contains(baseline_repair_lifecycle, "evidence_preserved=true", "lifecycle verifies evidence preservation");

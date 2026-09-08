@@ -126,6 +126,30 @@ function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $Backup
   }
   Add-Evidence $Stage "completed" "exit_code=0"
 }
+function New-BaselineRepairBackup([string] $Destination) {
+  if (Test-Path -LiteralPath $Destination) {
+    Remove-Item -LiteralPath $Destination -Recurse -Force
+  }
+  New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+
+  # Repair authorization requires the protected Agent and its identity config.
+  # Do not recursively read hardened runtime-data or collector directories from
+  # the lifecycle harness; their ACL isolation is a separate security contract.
+  foreach ($name in @("FDSensor.exe", "agent.toml")) {
+    $source = Join-Path $InstallDir $name
+    $destination = Join-Path $Destination $name
+    $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+      throw "repair backup source is not a regular file: $source"
+    }
+    $expectedHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    Copy-Item -LiteralPath $source -Destination $destination -Force
+    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne $expectedHash) {
+      throw "repair backup hash mismatch: $name"
+    }
+  }
+}
 function Assert-BaselineRepair([string] $SetupPath) {
   $stage = "repair-baseline"
   $backupDir = Join-Path $EvidenceDir "repair-baseline-backup"
@@ -144,9 +168,7 @@ function Assert-BaselineRepair([string] $SetupPath) {
 
   Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
   Get-Process -Name "FDSensor" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
-  New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-  Get-ChildItem -LiteralPath $InstallDir -Force | Copy-Item -Destination $backupDir -Recurse -Force
+  New-BaselineRepairBackup $backupDir
   foreach ($name in @("unins000.exe", "unins000.dat")) {
     Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force
     if (Test-Path -LiteralPath (Join-Path $InstallDir $name)) { throw "$stage could not remove $name from the repair fixture" }
