@@ -1,6 +1,7 @@
 #include "edr/detection_decision.h"
 #include "edr/detection_profile.h"
 #include "edr/policy_v2.h"
+#include "cJSON.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -365,7 +366,7 @@ static int has_ransom_recovery_tamper_indicator(const EdrBehaviorRecord *r) {
 }
 
 static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
-  const char *path = r->file_path[0] ? r->file_path : r->exe_path;
+  const char *path = base_name(r->file_path[0] ? r->file_path : r->exe_path);
   const char *s = r->script_snippet[0] ? r->script_snippet : r->cmdline;
   if (decision_suppress_ransom_file_signal(r)) {
     return 0;
@@ -373,11 +374,11 @@ static int has_ransom_note_indicator(const EdrBehaviorRecord *r) {
   int note_name = has_ci(path, "readme") || has_ci(path, "decrypt") || has_ci(path, "recover") ||
                   has_ci(path, "restore-files") || has_ci(path, "how_to_decrypt") ||
                   has_ci(path, "how-to-decrypt") || has_ci(path, "ransom");
-  int note_ext = has_ci(path, ".txt") || has_ci(path, ".hta") || has_ci(path, ".htm") ||
-                 has_ci(path, ".html");
-  return (note_name && note_ext) || has_ci(s, "ransom_note_burst=1") ||
-         has_ci(s, "win_policy=ransomware_note_or_file_burst") ||
-         has_ci(s, "win_policy_tags=ransomware_behavior");
+  const char *ext = strrchr(path, '.');
+  int note_ext = ext && ((strlen(ext) == 4u &&
+                          (has_ci(ext, ".txt") || has_ci(ext, ".hta") || has_ci(ext, ".htm"))) ||
+                         (strlen(ext) == 5u && has_ci(ext, ".html")));
+  return (note_name && note_ext) || has_ci(s, "ransom_note_burst=1");
 }
 
 static int has_ransom_note_burst_indicator(const EdrBehaviorRecord *r) {
@@ -1358,8 +1359,8 @@ static void build_recommended_forensics(char *dst, size_t cap, const EdrBehavior
 #undef ADD_ACTION
 }
 
-static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDecision *d, const EdrDetectionTrigger *t) {
-  r->detection_context[0] = '\0';
+static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectionDecision *d, const EdrDetectionTrigger *t, char *context, size_t context_capacity) {
+  context[0] = '\0';
   char evidence_detector[48];
   char evidence_rule[96];
   char evidence_score[32];
@@ -1609,78 +1610,82 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
   detail_value(r->script_snippet, "pmfe_status", pmfe_status, sizeof(pmfe_status));
   detail_value(r->script_snippet, "pmfe_verdict", pmfe_verdict, sizeof(pmfe_verdict));
   detail_value(r->script_snippet, "followup_only", pmfe_followup, sizeof(pmfe_followup));
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_cat(context, context_capacity,
            "{\"engine\":");
-  json_str(r->detection_context, sizeof(r->detection_context), engine_name(r), 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, engine_name(r), 48u);
+  json_cat(context, context_capacity,
            ",\"rule_id\":\"agent_decision_v1\",\"confidence\":%.3f,\"suppressed\":%s,\"reason\":",
            d->confidence, d->suppress ? "true" : "false");
-  json_str(r->detection_context, sizeof(r->detection_context), d->reason, 220u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, d->reason, 220u);
+  json_cat(context, context_capacity,
            ",\"event_quality\":{\"score\":%u,\"suppression_score\":%u,\"selection_action\":",
            (unsigned)d->event_quality_score, (unsigned)d->suppression_score);
-  json_str(r->detection_context, sizeof(r->detection_context), d->selection_action, 16u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"signal_reasons\":");
-  json_reason_array(r->detection_context, sizeof(r->detection_context), d->signal_reasons);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"noise_reasons\":");
-  json_reason_array(r->detection_context, sizeof(r->detection_context), d->noise_reasons);
-  json_cat(r->detection_context, sizeof(r->detection_context), "}");
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, d->selection_action, 16u);
+  json_cat(context, context_capacity, ",\"signal_reasons\":");
+  json_reason_array(context, context_capacity, d->signal_reasons);
+  json_cat(context, context_capacity, ",\"noise_reasons\":");
+  json_reason_array(context, context_capacity, d->noise_reasons);
+  json_cat(context, context_capacity, "}");
+  json_cat(context, context_capacity,
            ",\"process\":{\"pid\":%u,\"name\":", r->pid);
-  json_str(r->detection_context, sizeof(r->detection_context), r->process_name, 96u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"path\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->exe_path, 220u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"cmdline\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->cmdline, 360u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, r->process_name, 96u);
+  json_cat(context, context_capacity, ",\"path\":");
+  json_str(context, context_capacity, r->exe_path, 220u);
+  json_cat(context, context_capacity, ",\"cmdline\":");
+  json_str(context, context_capacity, r->cmdline, 360u);
+  json_cat(context, context_capacity,
            ",\"parent_pid\":%u,\"parent_name\":", r->ppid);
-  json_str(r->detection_context, sizeof(r->detection_context), r->parent_name, 96u);
-  json_cat(r->detection_context, sizeof(r->detection_context), "},\"file\":{\"path\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->file_path[0] ? r->file_path : r->exe_path, 220u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"sha256\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->exe_hash, 80u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, r->parent_name, 96u);
+  json_cat(context, context_capacity, "},\"file\":{\"path\":");
+  json_str(context, context_capacity, r->file_path[0] ? r->file_path : r->exe_path, 220u);
+  if (r->file_old_path[0]) {
+    json_cat(context, context_capacity, ",\"old_path\":");
+    json_str(context, context_capacity, r->file_old_path, 220u);
+  }
+  json_cat(context, context_capacity, ",\"sha256\":");
+  json_str(context, context_capacity, r->exe_hash, 80u);
+  json_cat(context, context_capacity,
            ",\"old_ext\":");
-  json_str(r->detection_context, sizeof(r->detection_context), old_ext_buf, 24u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"new_ext\":");
-  json_str(r->detection_context, sizeof(r->detection_context), new_ext_buf, 24u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, old_ext_buf, 24u);
+  json_cat(context, context_capacity, ",\"new_ext\":");
+  json_str(context, context_capacity, new_ext_buf, 24u);
+  json_cat(context, context_capacity,
            ",\"extension_changed\":%s,\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,"
            "\"path_entropy\":%.2f,\"signed\":null,\"signature_trust\":{\"status\":",
            extension_changed ? "true" : "false",
            content_entropy_buf[0] ? strtod(content_entropy_buf, NULL) : 0.0,
            content_sample_bytes_buf[0] ? strtol(content_sample_bytes_buf, NULL, 10) : 0L,
            path_entropy_buf[0] ? strtod(path_entropy_buf, NULL) : 0.0);
-  json_str(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity,
            signature_status_buf[0] ? signature_status_buf : (r->cert_revoked_ancestor ? "revoked_ancestor" : "unknown"),
            80u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"signer\":");
-  json_str(r->detection_context, sizeof(r->detection_context), signer_buf, 150u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_cat(context, context_capacity, ",\"signer\":");
+  json_str(context, context_capacity, signer_buf, 150u);
+  json_cat(context, context_capacity,
            ",\"signer_allowlisted\":%s,\"cert_revoked_ancestor\":%s}},\"network\":{\"remote_url\":",
            ransom_signer_allowlisted ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false");
-  json_str(r->detection_context, sizeof(r->detection_context), r->dns_query, 180u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"remote_ip\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, r->dns_query, 180u);
+  json_cat(context, context_capacity, ",\"remote_ip\":");
+  json_str(context, context_capacity, r->net_dst, 64u);
+  json_cat(context, context_capacity,
            ",\"dst_port\":%u},\"registry\":{\"key\":",
            r->net_dport);
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_key_path, 220u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"value_name\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_value_name, 120u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"value_data\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_value_data, 260u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"old_value_data\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_old_value_data, 260u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"op\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_op, 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"source\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_source, 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"attribution\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_attribution, 32u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"detail_status\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->reg_detail_status, 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, r->reg_key_path, 220u);
+  json_cat(context, context_capacity, ",\"value_name\":");
+  json_str(context, context_capacity, r->reg_value_name, 120u);
+  json_cat(context, context_capacity, ",\"value_data\":");
+  json_str(context, context_capacity, r->reg_value_data, 260u);
+  json_cat(context, context_capacity, ",\"old_value_data\":");
+  json_str(context, context_capacity, r->reg_old_value_data, 260u);
+  json_cat(context, context_capacity, ",\"op\":");
+  json_str(context, context_capacity, r->reg_op, 48u);
+  json_cat(context, context_capacity, ",\"source\":");
+  json_str(context, context_capacity, r->reg_source, 48u);
+  json_cat(context, context_capacity, ",\"attribution\":");
+  json_str(context, context_capacity, r->reg_attribution, 32u);
+  json_cat(context, context_capacity, ",\"detail_status\":");
+  json_str(context, context_capacity, r->reg_detail_status, 48u);
+  json_cat(context, context_capacity,
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
            "\"ransom_behavior\":%s,\"ransom_canary\":%s,\"ransom_counter_allowlisted\":%s,"
@@ -1703,27 +1708,27 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            persistence ? "true" : "false", silverfox ? "true" : "false", rmm_policy ? "true" : "false",
            fp_feedback ? "true" : "false",
            d->context_correlated ? "true" : "false");
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_cat(context, context_capacity,
            "\"ransom_control\":{\"version\":");
-  json_str(r->detection_context, sizeof(r->detection_context), EDR_RANSOM_CONTROL_VERSION, 40u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, EDR_RANSOM_CONTROL_VERSION, 40u);
+  json_cat(context, context_capacity,
            ",\"phase\":\"%s\",\"kind\":",
            ransom_canary ? "p0" : (ransom_chain.score >= chain_p0_score ? "p0" :
            (ransom_chain.score >= chain_candidate_score ? "candidate" :
             (ransom_note ? "single_note_observed" : "baseline"))));
   if (ransomware_kind_buf[0]) {
-    json_str(r->detection_context, sizeof(r->detection_context), ransomware_kind_buf, 64u);
+    json_str(context, context_capacity, ransomware_kind_buf, 64u);
   } else if (ransom_canary) {
-    json_str(r->detection_context, sizeof(r->detection_context), "DETERMINISTIC_ENCRYPTION", 64u);
+    json_str(context, context_capacity, "DETERMINISTIC_ENCRYPTION", 64u);
   } else if (ransom_chain.score >= chain_p0_score) {
     /* A high-scoring precursor chain does not prove file encryption. */
-    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_SUSPECTED", 64u);
+    json_str(context, context_capacity, "ENCRYPTION_SUSPECTED", 64u);
   } else if (ransom_burst || ransom_chain.score >= chain_candidate_score) {
-    json_str(r->detection_context, sizeof(r->detection_context), "ENCRYPTION_SUSPECTED", 64u);
+    json_str(context, context_capacity, "ENCRYPTION_SUSPECTED", 64u);
   } else {
-    json_str(r->detection_context, sizeof(r->detection_context), "", 64u);
+    json_str(context, context_capacity, "", 64u);
   }
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_cat(context, context_capacity,
            ",\"severity\":%ld,\"canary\":%s,\"allowlisted\":%s,\"counter_suppressed\":%s,"
            "\"file_rate_per_min\":%.0f,\"ext_count\":%ld,\"dir_count\":%ld,"
            "\"extension_changed\":%s,\"old_ext\":",
@@ -1737,10 +1742,10 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            ext_burst_buf[0] ? strtol(ext_burst_buf, NULL, 10) : 0L,
            dir_burst_buf[0] ? strtol(dir_burst_buf, NULL, 10) : 0L,
            extension_changed ? "true" : "false");
-  json_str(r->detection_context, sizeof(r->detection_context), old_ext_buf, 24u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"new_ext\":");
-  json_str(r->detection_context, sizeof(r->detection_context), new_ext_buf, 24u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, old_ext_buf, 24u);
+  json_cat(context, context_capacity, ",\"new_ext\":");
+  json_str(context, context_capacity, new_ext_buf, 24u);
+  json_cat(context, context_capacity,
            ",\"evidence_version\":%ld,\"file_event_count\":%ld,\"unique_file_count\":%ld,"
            "\"sampled_file_count\":%ld,\"content_changed_file_count\":%ld,"
            "\"tracking_saturated\":%s,\"content_entropy_deferred\":%s,\"confirmation_basis\":",
@@ -1751,8 +1756,8 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            content_changed_file_count_buf[0] ? strtol(content_changed_file_count_buf, NULL, 10) : 0L,
            has_ci(r->script_snippet, "ransom_tracking_saturated=1") ? "true" : "false",
            has_ci(r->script_snippet, "content_entropy_deferred=1") ? "true" : "false");
-  json_str(r->detection_context, sizeof(r->detection_context), confirmation_basis_buf, 32u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_str(context, context_capacity, confirmation_basis_buf, 32u);
+  json_cat(context, context_capacity,
            ",\"entropy_delta\":%.2f,\"high_entropy_ratio\":%.2f,"
            "\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,\"path_entropy\":%.2f,"
            "\"signer_allowlisted\":%s,\"tree_root_pid\":%u,"
@@ -1775,108 +1780,108 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
            (unsigned)tree_root_pid);
   if (d->suppress) {
     float before = d->confidence_before_suppression > 0.0f ? d->confidence_before_suppression : d->confidence;
-    json_cat(r->detection_context, sizeof(r->detection_context),
+    json_cat(context, context_capacity,
              "\"suppression\":{\"matched\":true,\"reason\":");
-    json_str(r->detection_context, sizeof(r->detection_context), d->suppression_reason, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context),
+    json_str(context, context_capacity, d->suppression_reason, 96u);
+    json_cat(context, context_capacity,
              ",\"confidence_before\":%.3f,\"confidence_after\":%.3f,\"policy_version\":",
              before, d->confidence);
-    json_str(r->detection_context, sizeof(r->detection_context), d->suppression_policy_version, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"policy_source\":");
-    json_str(r->detection_context, sizeof(r->detection_context), getenv("EDR_DETECTION_POLICY_SOURCE"), 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"audit_id\":");
-    json_str(r->detection_context, sizeof(r->detection_context), getenv("EDR_DETECTION_POLICY_AUDIT_ID"), 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context),
+    json_str(context, context_capacity, d->suppression_policy_version, 64u);
+    json_cat(context, context_capacity, ",\"policy_source\":");
+    json_str(context, context_capacity, getenv("EDR_DETECTION_POLICY_SOURCE"), 64u);
+    json_cat(context, context_capacity, ",\"audit_id\":");
+    json_str(context, context_capacity, getenv("EDR_DETECTION_POLICY_AUDIT_ID"), 96u);
+    json_cat(context, context_capacity,
              ",\"hit_count\":%u,\"rollback_available\":%s,\"rollback_version\":",
              d->suppression_hit_count, d->suppression_rollback_version[0] ? "true" : "false");
-    json_str(r->detection_context, sizeof(r->detection_context), d->suppression_rollback_version, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},");
+    json_str(context, context_capacity, d->suppression_rollback_version, 64u);
+    json_cat(context, context_capacity, "},");
   }
-  json_cat(r->detection_context, sizeof(r->detection_context), "\"detection_profile\":{\"name\":");
-  json_str(r->detection_context, sizeof(r->detection_context), t ? t->profile_name : "", 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"rmm_policy_version\":");
-  json_str(r->detection_context, sizeof(r->detection_context), rmm_policy_version ? rmm_policy_version : "", 64u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"false_positive_policy_version\":");
-  json_str(r->detection_context, sizeof(r->detection_context), fp_policy_version ? fp_policy_version : "", 64u);
-  json_cat(r->detection_context, sizeof(r->detection_context),
+  json_cat(context, context_capacity, "\"detection_profile\":{\"name\":");
+  json_str(context, context_capacity, t ? t->profile_name : "", 48u);
+  json_cat(context, context_capacity, ",\"rmm_policy_version\":");
+  json_str(context, context_capacity, rmm_policy_version ? rmm_policy_version : "", 64u);
+  json_cat(context, context_capacity, ",\"false_positive_policy_version\":");
+  json_str(context, context_capacity, fp_policy_version ? fp_policy_version : "", 64u);
+  json_cat(context, context_capacity,
            "},\"detection_trigger\":{\"pmfe_scan\":%s,\"single_process_minidump\":%s,"
            "\"targeted_files\":%s,\"ioc_lookup\":%s,\"reason\":",
            (t && t->pmfe_scan) ? "true" : "false",
            (t && t->single_process_minidump) ? "true" : "false",
            (t && t->targeted_files) ? "true" : "false",
            (t && t->ioc_lookup) ? "true" : "false");
-  json_str(r->detection_context, sizeof(r->detection_context), t ? t->reason : "", 180u);
-  json_cat(r->detection_context, sizeof(r->detection_context), "},\"engine_evidence\":{");
+  json_str(context, context_capacity, t ? t->reason : "", 180u);
+  json_cat(context, context_capacity, "},\"engine_evidence\":{");
   if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"shellcode_result_v1\",\"alert_id\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_alert_id, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"flow\":{\"src\":");
-    json_str(r->detection_context, sizeof(r->detection_context), r->net_src, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"spt\":%u,\"dst\":", r->net_sport);
-    json_str(r->detection_context, sizeof(r->detection_context), r->net_dst, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dpt\":%u,\"proto\":", r->net_dport);
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_proto[0] ? evidence_proto : r->net_proto, 48u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"owner\":{\"pid\":%u},\"detection\":{\"detector\":", r->pid);
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"mitre\":", evidence_score[0] ? strtod(evidence_score, NULL) : 0.0);
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_mitre[0] ? evidence_mitre : "T1210", 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"payload\":{\"sha256\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"preview_hex\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_preview_hex, 160u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pmfe_followup\":{\"recommended\":%s,\"trigger\":",
+    json_cat(context, context_capacity, "\"schema\":\"shellcode_result_v1\",\"alert_id\":");
+    json_str(context, context_capacity, evidence_alert_id, 64u);
+    json_cat(context, context_capacity, ",\"flow\":{\"src\":");
+    json_str(context, context_capacity, r->net_src, 64u);
+    json_cat(context, context_capacity, ",\"spt\":%u,\"dst\":", r->net_sport);
+    json_str(context, context_capacity, r->net_dst, 64u);
+    json_cat(context, context_capacity, ",\"dpt\":%u,\"proto\":", r->net_dport);
+    json_str(context, context_capacity, evidence_proto[0] ? evidence_proto : r->net_proto, 48u);
+    json_cat(context, context_capacity, "},\"owner\":{\"pid\":%u},\"detection\":{\"detector\":", r->pid);
+    json_str(context, context_capacity, evidence_detector, 48u);
+    json_cat(context, context_capacity, ",\"rule\":");
+    json_str(context, context_capacity, evidence_rule, 96u);
+    json_cat(context, context_capacity, ",\"score\":%.6f,\"mitre\":", evidence_score[0] ? strtod(evidence_score, NULL) : 0.0);
+    json_str(context, context_capacity, evidence_mitre[0] ? evidence_mitre : "T1210", 32u);
+    json_cat(context, context_capacity, "},\"payload\":{\"sha256\":");
+    json_str(context, context_capacity, evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
+    json_cat(context, context_capacity, ",\"preview_hex\":");
+    json_str(context, context_capacity, evidence_preview_hex, 160u);
+    json_cat(context, context_capacity, "},\"pmfe_followup\":{\"recommended\":%s,\"trigger\":",
              evidence_pmfe_recommended[0] && strcmp(evidence_pmfe_recommended, "0") != 0 ? "true" : "false");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_trigger, 48u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_pmfe_status, 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"pcap\":{\"stem\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_stem, 180u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"object_key\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_object_key, 240u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"status\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_pcap_status[0] ? evidence_pcap_status : "disabled", 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"kind\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_forensic, 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"frames\":%ld},\"response\":{\"status\":\"unknown\"},", evidence_frames[0] ? strtol(evidence_frames, NULL, 10) : 0L);
+    json_str(context, context_capacity, evidence_pmfe_trigger, 48u);
+    json_cat(context, context_capacity, ",\"status\":");
+    json_str(context, context_capacity, evidence_pmfe_status, 32u);
+    json_cat(context, context_capacity, "},\"pcap\":{\"stem\":");
+    json_str(context, context_capacity, evidence_stem, 180u);
+    json_cat(context, context_capacity, ",\"object_key\":");
+    json_str(context, context_capacity, evidence_pcap_object_key, 240u);
+    json_cat(context, context_capacity, ",\"status\":");
+    json_str(context, context_capacity, evidence_pcap_status[0] ? evidence_pcap_status : "disabled", 32u);
+    json_cat(context, context_capacity, ",\"kind\":");
+    json_str(context, context_capacity, evidence_forensic, 32u);
+    json_cat(context, context_capacity, ",\"frames\":%ld},\"response\":{\"status\":\"unknown\"},", evidence_frames[0] ? strtol(evidence_frames, NULL, 10) : 0L);
     if (attrib_cve[0] || attrib_family[0] || attrib_vector[0]) {
-      json_cat(r->detection_context, sizeof(r->detection_context), "\"vulnerability_attribution\":{\"schema\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_schema[0] ? attrib_schema : "shellcode_vulnerability_attribution_v1", 64u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"candidate_cve\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_cve, 64u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"family\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_family, 96u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"product\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_product, 96u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"vector\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_vector, 48u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"confidence\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_confidence[0] ? attrib_confidence : "candidate", 24u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"source\":");
-      json_str(r->detection_context, sizeof(r->detection_context), attrib_source, 32u);
-      json_cat(r->detection_context, sizeof(r->detection_context), ",\"evidence_basis\":");
-      json_reason_array(r->detection_context, sizeof(r->detection_context), attrib_basis[0] ? attrib_basis : "known_rule_name,protocol_region,safe_signature_metadata");
-      json_cat(r->detection_context, sizeof(r->detection_context), "},");
+      json_cat(context, context_capacity, "\"vulnerability_attribution\":{\"schema\":");
+      json_str(context, context_capacity, attrib_schema[0] ? attrib_schema : "shellcode_vulnerability_attribution_v1", 64u);
+      json_cat(context, context_capacity, ",\"candidate_cve\":");
+      json_str(context, context_capacity, attrib_cve, 64u);
+      json_cat(context, context_capacity, ",\"family\":");
+      json_str(context, context_capacity, attrib_family, 96u);
+      json_cat(context, context_capacity, ",\"product\":");
+      json_str(context, context_capacity, attrib_product, 96u);
+      json_cat(context, context_capacity, ",\"vector\":");
+      json_str(context, context_capacity, attrib_vector, 48u);
+      json_cat(context, context_capacity, ",\"confidence\":");
+      json_str(context, context_capacity, attrib_confidence[0] ? attrib_confidence : "candidate", 24u);
+      json_cat(context, context_capacity, ",\"source\":");
+      json_str(context, context_capacity, attrib_source, 32u);
+      json_cat(context, context_capacity, ",\"evidence_basis\":");
+      json_reason_array(context, context_capacity, attrib_basis[0] ? attrib_basis : "known_rule_name,protocol_region,safe_signature_metadata");
+      json_cat(context, context_capacity, "},");
     }
   } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"webshell_result_v1\",\"file\":{\"path\":");
-    json_str(r->detection_context, sizeof(r->detection_context), r->file_path, 220u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"sha256\":");
-    json_str(r->detection_context, sizeof(r->detection_context), r->exe_hash[0] ? r->exe_hash : evidence_file_fp, 80u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"sample\":{\"uploaded\":%s,\"object_key\":", (evidence_file_uploaded[0] && strcmp(evidence_file_uploaded, "0") != 0) ? "true" : "false");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_object_key, 240u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"local_path\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_local_path, 240u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"http\":{\"service\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_service, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"url\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_url[0] ? evidence_url : r->dns_query, 180u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"use\":{\"observed\":false},\"detection\":{\"detector\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
-    json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":%.6f,\"ast_score\":%.6f,\"token_score\":%.6f},\"response\":{\"quarantine_status\":\"unknown\"},",
+    json_cat(context, context_capacity, "\"schema\":\"webshell_result_v1\",\"file\":{\"path\":");
+    json_str(context, context_capacity, r->file_path, 220u);
+    json_cat(context, context_capacity, ",\"sha256\":");
+    json_str(context, context_capacity, r->exe_hash[0] ? r->exe_hash : evidence_file_fp, 80u);
+    json_cat(context, context_capacity, "},\"sample\":{\"uploaded\":%s,\"object_key\":", (evidence_file_uploaded[0] && strcmp(evidence_file_uploaded, "0") != 0) ? "true" : "false");
+    json_str(context, context_capacity, evidence_object_key, 240u);
+    json_cat(context, context_capacity, ",\"local_path\":");
+    json_str(context, context_capacity, evidence_local_path, 240u);
+    json_cat(context, context_capacity, "},\"http\":{\"service\":");
+    json_str(context, context_capacity, evidence_service, 96u);
+    json_cat(context, context_capacity, ",\"url\":");
+    json_str(context, context_capacity, evidence_url[0] ? evidence_url : r->dns_query, 180u);
+    json_cat(context, context_capacity, "},\"use\":{\"observed\":false},\"detection\":{\"detector\":");
+    json_str(context, context_capacity, evidence_detector, 48u);
+    json_cat(context, context_capacity, ",\"rule\":");
+    json_str(context, context_capacity, evidence_rule, 96u);
+    json_cat(context, context_capacity, ",\"score\":%.6f,\"ast_score\":%.6f,\"token_score\":%.6f},\"response\":{\"quarantine_status\":\"unknown\"},",
              evidence_score[0] ? strtod(evidence_score, NULL) : 0.0,
              evidence_ast_score[0] ? strtod(evidence_ast_score, NULL) : 0.0,
              evidence_token_score[0] ? strtod(evidence_token_score, NULL) : 0.0);
@@ -1884,14 +1889,14 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
     long dns_hits = (pmfe_dns_ascii[0] ? strtol(pmfe_dns_ascii, NULL, 10) : 0L) +
                     (pmfe_dns_utf16[0] ? strtol(pmfe_dns_utf16, NULL, 10) : 0L) +
                     (pmfe_dns_wire[0] ? strtol(pmfe_dns_wire, NULL, 10) : 0L);
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"pmfe_result_v1\",\"source_alert_id\":");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_source_alert_id, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"followup_only\":%s,\"status\":",
+    json_cat(context, context_capacity, "\"schema\":\"pmfe_result_v1\",\"source_alert_id\":");
+    json_str(context, context_capacity, pmfe_source_alert_id, 64u);
+    json_cat(context, context_capacity, ",\"followup_only\":%s,\"status\":",
              pmfe_followup[0] && strcmp(pmfe_followup, "0") != 0 ? "true" : "false");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_status, 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"verdict\":");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_verdict, 32u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"memfd_exec\":%ld,\"deleted_exec\":%ld,\"thread_start_matches\":%ld,\"read_failures\":%ld,\"injection_observed\":%s,\"module_consistency\":",
+    json_str(context, context_capacity, pmfe_status, 32u);
+    json_cat(context, context_capacity, ",\"verdict\":");
+    json_str(context, context_capacity, pmfe_verdict, 32u);
+    json_cat(context, context_capacity, ",\"signals\":{\"stomp_suspicious\":%ld,\"mz_hits\":%ld,\"elf_hits\":%ld,\"dns_hits\":%ld,\"dns_best\":%.6f,\"ave_max_score\":%.6f,\"entropy_max\":%.6f,\"regions_scanned\":%ld,\"private_exec\":%ld,\"memfd_exec\":%ld,\"deleted_exec\":%ld,\"thread_start_matches\":%ld,\"read_failures\":%ld,\"injection_observed\":%s,\"module_consistency\":",
              pmfe_stomp[0] ? strtol(pmfe_stomp, NULL, 10) : 0L,
              pmfe_mz[0] ? strtol(pmfe_mz, NULL, 10) : 0L,
              pmfe_elf[0] ? strtol(pmfe_elf, NULL, 10) : 0L,
@@ -1906,36 +1911,93 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
              pmfe_thread_start_matches[0] ? strtol(pmfe_thread_start_matches, NULL, 10) : 0L,
              pmfe_read_failures[0] ? strtol(pmfe_read_failures, NULL, 10) : 0L,
              pmfe_injection_observed[0] && strcmp(pmfe_injection_observed, "0") != 0 ? "true" : "false");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_module_consistency, 64u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"samples\":{\"dns_sample\":");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_sample, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context), ",\"dns_owner\":");
-    json_str(r->detection_context, sizeof(r->detection_context), pmfe_dns_owner, 96u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},\"evidence\":{\"pmfe_snapshot\":");
-    json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
-    json_cat(r->detection_context, sizeof(r->detection_context), "},");
+    json_str(context, context_capacity, pmfe_module_consistency, 64u);
+    json_cat(context, context_capacity, "},\"samples\":{\"dns_sample\":");
+    json_str(context, context_capacity, pmfe_dns_sample, 96u);
+    json_cat(context, context_capacity, ",\"dns_owner\":");
+    json_str(context, context_capacity, pmfe_dns_owner, 96u);
+    json_cat(context, context_capacity, "},\"evidence\":{\"pmfe_snapshot\":");
+    json_str(context, context_capacity, r->pmfe_snapshot, 360u);
+    json_cat(context, context_capacity, "},");
   } else {
-    json_cat(r->detection_context, sizeof(r->detection_context), "\"schema\":\"generic_engine_evidence_v1\",");
+    json_cat(context, context_capacity, "\"schema\":\"generic_engine_evidence_v1\",");
   }
-  json_cat(r->detection_context, sizeof(r->detection_context), "\"pmfe_snapshot\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->pmfe_snapshot, 360u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"detector\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_detector, 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"rule\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_rule, 96u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"score\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_score, 32u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"proto\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_proto, 48u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"mitre\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_mitre, 32u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"forensic\":");
-  json_str(r->detection_context, sizeof(r->detection_context), evidence_forensic, 32u);
-  json_cat(r->detection_context, sizeof(r->detection_context), ",\"detail\":");
-  json_str(r->detection_context, sizeof(r->detection_context), r->script_snippet, 420u);
-  json_cat(r->detection_context, sizeof(r->detection_context), "},\"recommended_forensics\":[");
-  build_recommended_forensics(r->detection_context, sizeof(r->detection_context), r, d, t);
-  json_cat(r->detection_context, sizeof(r->detection_context), "]}");
+  json_cat(context, context_capacity, "\"pmfe_snapshot\":");
+  json_str(context, context_capacity, r->pmfe_snapshot, 360u);
+  json_cat(context, context_capacity, ",\"detector\":");
+  json_str(context, context_capacity, evidence_detector, 48u);
+  json_cat(context, context_capacity, ",\"rule\":");
+  json_str(context, context_capacity, evidence_rule, 96u);
+  json_cat(context, context_capacity, ",\"score\":");
+  json_str(context, context_capacity, evidence_score, 32u);
+  json_cat(context, context_capacity, ",\"proto\":");
+  json_str(context, context_capacity, evidence_proto, 48u);
+  json_cat(context, context_capacity, ",\"mitre\":");
+  json_str(context, context_capacity, evidence_mitre, 32u);
+  json_cat(context, context_capacity, ",\"forensic\":");
+  json_str(context, context_capacity, evidence_forensic, 32u);
+  json_cat(context, context_capacity, ",\"detail\":");
+  json_str(context, context_capacity, r->script_snippet, 420u);
+  json_cat(context, context_capacity, "},\"recommended_forensics\":[");
+  build_recommended_forensics(context, context_capacity, r, d, t);
+  json_cat(context, context_capacity, "]}");
+}
+
+static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDecision *d,
+                                      const EdrDetectionTrigger *t) {
+  /* The record remains bounded. Optional duplicated text is removed as whole
+   * JSON values, never by cutting the serialized evidence mid-token. */
+  build_detection_context_full(r, d, t, r->detection_context, sizeof(r->detection_context));
+  if (strlen(r->detection_context) < sizeof(r->detection_context) - 1u) return;
+  const size_t full_capacity = 32768u;
+  char *full = (char *)malloc(full_capacity);
+  cJSON *root = NULL;
+  const char *failure = "allocation_failed";
+  if (!full) goto failed;
+  build_detection_context_full(r, d, t, full, full_capacity);
+  root = cJSON_ParseWithOpts(full, NULL, 1);
+  failure = "invalid_or_oversized_evidence";
+  if (!root) goto failed;
+  if (strlen(full) < sizeof(r->detection_context)) {
+    memcpy(r->detection_context, full, strlen(full) + 1u);
+    cJSON_Delete(root);
+    free(full);
+    return;
+  }
+  cJSON *omitted = cJSON_AddArrayToObject(root, "omitted_fields");
+  if (!omitted) goto failed;
+  const struct { const char *parent; const char *key; } optional[] = {
+    {"engine_evidence", "detail"}, {"engine_evidence", "pmfe_snapshot"},
+    {"process", "cmdline"}, {NULL, "registry"}, {NULL, "network"},
+    {"engine_evidence", "samples"}, {"engine_evidence", "evidence"},
+    {"file", "signature_trust"}, {NULL, "reason"},
+    {"file", "path"}, {"process", "path"}
+  };
+  for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i) {
+    cJSON *parent = optional[i].parent
+        ? cJSON_GetObjectItemCaseSensitive(root, optional[i].parent) : root;
+    if (cJSON_GetObjectItemCaseSensitive(parent, optional[i].key)) {
+      char field[96];
+      snprintf(field, sizeof(field), "%s%s%s", optional[i].parent ? optional[i].parent : "",
+               optional[i].parent ? "." : "", optional[i].key);
+      cJSON_DeleteItemFromObjectCaseSensitive(parent, optional[i].key);
+      if (!cJSON_AddItemToArray(omitted, cJSON_CreateString(field))) goto failed;
+    }
+    if (cJSON_PrintPreallocated(root, r->detection_context,
+                                 (int)sizeof(r->detection_context), 0)) {
+      cJSON_Delete(root);
+      free(full);
+      return;
+    }
+  }
+failed:
+  /* A serialization failure must never resemble a clean/empty verdict. */
+  snprintf(r->detection_context, sizeof(r->detection_context),
+           "{\"schema\":\"agent_decision_v1\",\"context_error\":\"%s\","
+           "\"evidence_complete\":false,\"process\":{\"pid\":%u}}", failure, r->pid);
+  fprintf(stderr, "[detection] context serialization failed pid=%u reason=%s\n", r->pid, failure);
+  cJSON_Delete(root);
+  free(full);
 }
 
 void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision *out) {

@@ -220,6 +220,19 @@ int edr_tdh_kernel_file_extract_file_object(PEVENT_RECORD rec, uint64_t *out_fil
   return edr_prop_u64(rec, L"FileObject", out_file_object) == ERROR_SUCCESS;
 }
 
+int edr_tdh_kernel_file_extract_mutation_path(PEVENT_RECORD rec,
+                                              char *path_out, size_t path_cap) {
+  if (!rec || !path_out || !path_cap) return 0;
+  path_out[0] = '\0';
+  const EVENT_DESCRIPTOR *d = &rec->EventHeader.EventDescriptor;
+  if (memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) ||
+      d->Task != d->Id || d->Opcode != 0u || d->Version > 1u ||
+      !((d->Id == 26u && (d->Keyword & 0x400u)) ||
+        (d->Id == 27u && (d->Keyword & 0x800u)))) return 0;
+  return edr_prop_utf8(rec, L"FilePath", path_out, path_cap) == ERROR_SUCCESS &&
+         path_out[0] != '\0';
+}
+
 int edr_tdh_kernel_file_extract_create_binding(PEVENT_RECORD rec, uint64_t *out_file_object,
                                                char *path_out, size_t path_cap) {
   if (out_file_object) *out_file_object = 0u;

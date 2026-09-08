@@ -43,6 +43,8 @@ int edr_tdh_kernel_file_extract_file_key(PEVENT_RECORD rec, uint64_t *out_file_k
 int edr_tdh_kernel_file_extract_name_binding(PEVENT_RECORD rec, uint64_t *out_file_key,
                                              char *path_out, size_t path_cap);
 int edr_tdh_kernel_file_extract_file_object(PEVENT_RECORD rec, uint64_t *out_file_object);
+int edr_tdh_kernel_file_extract_mutation_path(PEVENT_RECORD rec,
+                                              char *path_out, size_t path_cap);
 int edr_tdh_kernel_file_extract_create_binding(PEVENT_RECORD rec, uint64_t *out_file_object,
                                                char *path_out, size_t path_cap);
 

@@ -208,8 +208,10 @@ int main(void) {
                          "Write must not clear a pending FileRead recovery gate");
   ok &= require_contains(collector, "file_write_payload_incomplete++",
                          "incomplete FileWrite evidence must have a diagnostic counter");
-  ok &= require_contains(preprocess, "else if (br.kernel_file_write)",
-                         "kernel writes must bind their event-time actor before evaluation");
+  ok &= require_contains(preprocess, "else if (br.kernel_file_activity)",
+                         "all kernel file mutations and Create baselines must bind their event-time actor");
+  ok &= require_contains(mapper, "r->kernel_file_activity = is_file_activity_event(slot->type)",
+                         "kernel file identity boundary must include every counted file activity");
   ok &= require_order_in_function(preprocess, "static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {",
       "static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {",
       "edr_local_evidence_cache_enrich_behavior(&br)", "edr_behavior_enrich_file_activity(&br)",
@@ -506,8 +508,12 @@ int main(void) {
       preprocess,
       "br->type == EDR_EVENT_FILE_READ && !edr_p0_rule_ir_br_matches_any(br)",
       "only an authenticated-IR FileRead match may reuse bounded actor evidence work");
-  ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" : \"event\"",
+  ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" :",
                          "typed record mapping must preserve read semantics");
+  ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_RENAME ? \"rename\" :",
+                         "typed record mapping must preserve rename semantics");
+  ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_DELETE ? \"delete\" :",
+                         "typed record mapping must preserve delete semantics");
   ok &= require_before(collector, "if (slot->type == EDR_EVENT_FILE_READ) {",
                        "edr_windows_event_policy_apply(&br)",
                        "FileRead IR path projection must retain candidates before Windows noise policy");

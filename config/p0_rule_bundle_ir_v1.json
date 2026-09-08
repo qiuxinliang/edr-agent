@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-0f17fb98",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-245523c2",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "525fe482fe0be014c71837154d170d15663fb3e3259eeb91d16877eb75ed191e",
+  "sensor_interest_manifest_sha256": "65cc5a6b064302b88474fd1750087e7d19fbd7fa8d1c1a8a4f7bf6732030a8fa",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -615,7 +615,10 @@
           "(?i)delete\\s+shadows",
           "(?i)shadowcopy\\s+delete",
           "(?i)recoveryenabled\\s+no",
-          "(?i)clear\\-log"
+          "(?i)clear\\-log",
+          "(?i)\\bdelete\\s+(catalog|backup|systemstatebackup)\\b",
+          "(?i)\\bbootstatuspolicy\\s+ignoreallfailures\\b",
+          "(?i)(^|[\\\\/\\s\"'])wevtutil(\\.exe)?[\"']?\\s+cl\\s+"
         ],
         "process_name_in": [
           "vssadmin.exe",
@@ -639,7 +642,7 @@
       "condition": {
         "command_regex_all": [
           "(?i)(taskkill|tskill|wmic\\s+process.*terminate|stop\\-process)",
-          "(?i)(msmpeng\\.exe|windefend|sense\\.exe|securityhealthservice\\.exe|csagent\\.exe|sentinelagent\\.exe|sophos|mcshield\\.exe|avp\\.exe|ekrn\\.exe|symantec|xagt\\.exe|elastic\\-endpoint\\.exe|bdservicehost\\.exe|360sd\\.exe)"
+          "(?i)(^|[^a-z0-9_.-])(msmpeng|windefend|sense|securityhealthservice|csagent|sentinelagent|sophos[a-z0-9_-]*|mcshield|avp|ekrn|symantec[a-z0-9_-]*|xagt|elastic-endpoint|bdservicehost|360sd)(\\.exe)?($|[^a-z0-9_.-])"
         ],
         "process_name_in": [
           "taskkill.exe",

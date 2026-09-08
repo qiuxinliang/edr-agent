@@ -129,6 +129,49 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   }
 }
 
+static void test_mutation_schema(unsigned version, size_t pointer_bytes) {
+  for (unsigned id = 26u; id <= 27u; ++id) {
+    BYTE data[512] = {0};
+    EVENT_RECORD record = {0};
+    const WCHAR filename[] = L"\\Device\\HarddiskVolume3\\Fixture\\canary.txt";
+    char path[256];
+    uint64_t key = 0u, object = 0u;
+    size_t used = 0u;
+    record.EventHeader.ProviderId = EDR_ETW_GUID_KERNEL_FILE;
+    record.EventHeader.Flags = pointer_bytes == 8u ? EVENT_HEADER_FLAG_64_BIT_HEADER
+                                                  : EVENT_HEADER_FLAG_32_BIT_HEADER;
+    record.EventHeader.EventDescriptor.Id = (USHORT)id;
+    record.EventHeader.EventDescriptor.Task = (USHORT)id;
+    record.EventHeader.EventDescriptor.Version = (BYTE)version;
+    record.EventHeader.EventDescriptor.Level = 4u;
+    record.EventHeader.EventDescriptor.Keyword = id == 26u ? 0x400u : 0x800u;
+    number(data, &used, 1u, pointer_bytes);
+    if (version == 0u) number(data, &used, 7u, pointer_bytes);
+    number(data, &used, 0x1234u, pointer_bytes);
+    number(data, &used, 0x5678u, pointer_bytes);
+    number(data, &used, 0u, pointer_bytes);
+    if (version == 1u) number(data, &used, 7u, 4u);
+    number(data, &used, 0u, 4u);
+    memcpy(data + used, filename, sizeof(filename));
+    used += sizeof(filename);
+    record.UserData = data;
+    record.UserDataLength = (USHORT)used;
+    assert(edr_tdh_kernel_file_extract_mutation_path(&record, path, sizeof(path)));
+    assert(strcmp(path, "\\Device\\HarddiskVolume3\\Fixture\\canary.txt") == 0);
+    assert(edr_tdh_kernel_file_extract_file_key(&record, &key) && key == 0x5678u);
+    assert(edr_tdh_kernel_file_extract_file_object(&record, &object) && object == 0x1234u);
+    assert(!edr_tdh_kernel_file_extract_mutation_path(&record, path, 4u));
+    record.EventHeader.EventDescriptor.Opcode = 1u;
+    assert(!edr_tdh_kernel_file_extract_mutation_path(&record, path, sizeof(path)));
+    record.EventHeader.EventDescriptor.Opcode = 0u;
+    record.EventHeader.EventDescriptor.Version = 2u;
+    assert(!edr_tdh_kernel_file_extract_mutation_path(&record, path, sizeof(path)));
+    record.EventHeader.EventDescriptor.Version = (BYTE)version;
+    record.UserDataLength = 0u;
+    assert(!edr_tdh_kernel_file_extract_mutation_path(&record, path, sizeof(path)));
+  }
+}
+
 static void test_actor_event_boundary(uint64_t creation) {
   const uint64_t epoch = 116444736000000000ULL;
   assert(creation > epoch && creation - epoch < UINT64_MAX / 100u);
@@ -170,6 +213,8 @@ int main(void) {
   for (unsigned version = 0u; version <= 1u; ++version) {
     test_file_schema(version, 4u);
     test_file_schema(version, 8u);
+    test_mutation_schema(version, 4u);
+    test_mutation_schema(version, 8u);
   }
   test_actor_handle();
   edr_test_file_object_binding_contract();

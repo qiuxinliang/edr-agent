@@ -451,6 +451,13 @@ static int edr_kernel_file_name_delete_descriptor(const EVENT_DESCRIPTOR *descri
                                             EDR_KERNEL_FILE_KEYWORD_FILENAME);
 }
 
+static int edr_kernel_file_mutation_path_descriptor(const EVENT_DESCRIPTOR *descriptor) {
+  return edr_kernel_file_descriptor_matches(descriptor, 26u, 26u,
+                                             EDR_KERNEL_FILE_KEYWORD_DELETE_PATH) ||
+         edr_kernel_file_descriptor_matches(descriptor, 27u, 27u,
+                                             EDR_KERNEL_FILE_KEYWORD_RENAME_SETLINK_PATH);
+}
+
 static int edr_kernel_file_create_descriptor(const EVENT_DESCRIPTOR *descriptor) {
   return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CREATE,
                                             EDR_KERNEL_FILE_EVENT_CREATE,
@@ -496,7 +503,12 @@ static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_k
     event_type = EDR_EVENT_FILE_READ;
   } else if (provider_kind == 1u && edr_kernel_file_write_descriptor(descriptor)) {
     event_type = EDR_EVENT_FILE_WRITE;
-  } else if (!(provider_kind == 1u && edr_kernel_file_name_create_descriptor(descriptor))) {
+  } else if (provider_kind == 1u && edr_kernel_file_mutation_path_descriptor(descriptor)) {
+    event_type = descriptor->Id == 27u ? EDR_EVENT_FILE_RENAME : EDR_EVENT_FILE_DELETE;
+  } else if (!(provider_kind == 1u &&
+               (edr_kernel_file_name_create_descriptor(descriptor) ||
+                edr_kernel_file_name_delete_descriptor(descriptor) ||
+                descriptor->Id == 18u || descriptor->Id == 19u))) {
     ULONG info_size = 0u;
     ULONG status = TdhGetEventInformation(rec, 0u, NULL, NULL, &info_size);
     if (status == ERROR_INSUFFICIENT_BUFFER && info_size >= sizeof(TRACE_EVENT_INFO) &&
@@ -3401,13 +3413,40 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   path_out[0] = '\0';
   descriptor = &record->EventHeader.EventDescriptor;
   is_read = edr_kernel_file_read_descriptor(descriptor);
-  if ((!is_read && !edr_kernel_file_write_descriptor(descriptor)) ||
+  if (edr_kernel_file_create_descriptor(descriptor)) {
+    char reported_path[EDR_BR_STR_LONG];
+    if (record->EventHeader.ProcessId &&
+        edr_tdh_kernel_file_extract_create_binding((PEVENT_RECORD)record, &file_object,
+                                                     reported_path, sizeof(reported_path)) &&
+        edr_collector_canonicalize_file_path(reported_path, path_out, path_cap)) {
+      if (out_file_object) *out_file_object = file_object;
+      if (out_binding_quality) *out_binding_quality = "etw_fileobject_create";
+      return 1;
+    }
+    if (out_gate_reason) *out_gate_reason = "file_create_path_unresolved";
+    return 0;
+  }
+  if ((!is_read && !edr_kernel_file_write_descriptor(descriptor) &&
+       !edr_kernel_file_mutation_path_descriptor(descriptor)) ||
       !edr_tdh_kernel_file_extract_file_key((PEVENT_RECORD)record, &file_key) || !file_key) {
     if (out_gate_reason) *out_gate_reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
     return 0;
   }
   *out_file_key = file_key;
   read_pid = (uint32_t)record->EventHeader.ProcessId;
+  if (descriptor->Id == 26u && read_pid) {
+    char reported_path[EDR_BR_STR_LONG];
+    /* DeletePath carries its own target name. A NameDelete/Close callback
+     * must not invalidate that independent event field through cache order. */
+    if (edr_tdh_kernel_file_extract_mutation_path((PEVENT_RECORD)record,
+                                                   reported_path, sizeof(reported_path)) &&
+        edr_collector_canonicalize_file_path(reported_path, path_out, path_cap)) {
+      if (out_binding_quality) *out_binding_quality = "etw_mutation_path";
+      return 1;
+    }
+    if (out_gate_reason) *out_gate_reason = "file_delete_path_unresolved";
+    return 0;
+  }
   if (!is_read) {
     (void)edr_tdh_kernel_file_extract_file_object((PEVENT_RECORD)record, &file_object);
     if (out_file_object) *out_file_object = file_object;
@@ -3478,6 +3517,17 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     }
   }
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
+  if (!resolved && read_pid &&
+      edr_kernel_file_mutation_path_descriptor(descriptor)) {
+    char reported_path[EDR_BR_STR_LONG];
+    if (edr_tdh_kernel_file_extract_mutation_path((PEVENT_RECORD)record,
+                                                   reported_path, sizeof(reported_path)) &&
+        edr_collector_canonicalize_file_path(reported_path, path_out, path_cap)) {
+      resolved = 1;
+      /* No cache-derived source path is retained in this fallback. */
+      if (out_binding_quality) *out_binding_quality = "etw_mutation_path";
+    }
+  }
   if (!resolved) {
     if (have_problem) {
       snprintf(path_out, path_cap, "%s", problem_path);
@@ -3501,8 +3551,10 @@ static int edr_collector_append_file_io_binding(EdrEventSlot *slot, uint64_t fil
                                                   const char *path, uint64_t file_object,
                                                   const char *binding_quality) {
   char key_text[32];
-  if (!slot || (slot->type != EDR_EVENT_FILE_READ && slot->type != EDR_EVENT_FILE_WRITE) ||
-      !file_key || !path || !path[0]) {
+  if (!slot || (slot->type != EDR_EVENT_FILE_READ && slot->type != EDR_EVENT_FILE_WRITE &&
+                slot->type != EDR_EVENT_FILE_RENAME && slot->type != EDR_EVENT_FILE_DELETE &&
+                slot->type != EDR_EVENT_FILE_CREATE) ||
+      (!file_key && slot->type != EDR_EVENT_FILE_CREATE) || !path || !path[0]) {
     return 0;
   }
   if (slot->type == EDR_EVENT_FILE_WRITE && file_object) {
@@ -3654,7 +3706,12 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
                             memcmp(&record->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_FILE,
                                    sizeof(GUID)) == 0 &&
                             edr_kernel_file_write_descriptor(&record->EventHeader.EventDescriptor);
-  if (!is_kernel_process && !is_kernel_file_read && !is_kernel_file_write) return;
+  int is_kernel_file_context =
+      (slot->type == EDR_EVENT_FILE_CREATE || slot->type == EDR_EVENT_FILE_RENAME ||
+       slot->type == EDR_EVENT_FILE_DELETE) &&
+      memcmp(&record->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0;
+  if (!is_kernel_process && !is_kernel_file_read && !is_kernel_file_write &&
+      !is_kernel_file_context) return;
   event_filetime = edr_collector_event_timestamp_filetime_100ns(record);
   if (event_filetime) {
     snprintf(value, sizeof(value), "%llu", (unsigned long long)event_filetime);
@@ -4063,6 +4120,13 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   }
 }
 
+static void edr_collector_file_context_failure(EdrEventType type, const char *reason) {
+  uint64_t count = ++s_health.metadata_dropped;
+  if (count <= 3u || (count & (count - 1u)) == 0u)
+    fprintf(stderr, "[collector] file context unavailable type=%u count=%llu reason=%s\n",
+            (unsigned)type, (unsigned long long)count, reason ? reason : "binding_unavailable");
+}
+
 static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
                                               const char *tag, uint64_t timestamp_ns) {
   char file_read_path[EDR_BR_STR_LONG];
@@ -4070,7 +4134,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   uint64_t file_read_key = 0u;
   uint64_t file_write_object = 0u;
   const char *file_io_binding_quality = NULL;
-  const int is_file_io = ty == EDR_EVENT_FILE_READ || ty == EDR_EVENT_FILE_WRITE;
+  const int is_file_io = ty == EDR_EVENT_FILE_READ || ty == EDR_EVENT_FILE_WRITE ||
+                        ty == EDR_EVENT_FILE_RENAME || ty == EDR_EVENT_FILE_DELETE ||
+                        (ty == EDR_EVENT_FILE_CREATE && event_record &&
+                         edr_kernel_file_create_descriptor(&event_record->EventHeader.EventDescriptor));
   if (!s_bus || !event_record || !tag) {
     return;
   }
@@ -4091,6 +4158,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                 (unsigned long long)count,
                 file_read_gate_reason ? file_read_gate_reason : "binding_unavailable");
       }
+      return;
+    }
+    if (ty != EDR_EVENT_FILE_READ) {
+      edr_collector_file_context_failure(ty, file_read_gate_reason);
       return;
     }
     /* A read without the manifest FileKey→NameCreate association cannot be
@@ -4143,6 +4214,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
          * could turn a different file into an apparent P0 match, so retain
          * no FileRead whose canonical FileKey binding will not fit intact. */
         if (file_read_path_len == 0u || file_read_path_len >= sizeof(interest_event.path)) {
+          if (ty != EDR_EVENT_FILE_READ && ty != EDR_EVENT_FILE_WRITE) {
+            edr_collector_file_context_failure(ty, "canonical_path_does_not_fit");
+            return;
+          }
           if (ty == EDR_EVENT_FILE_WRITE) {
             s_health.file_write_payload_incomplete++;
             return;
@@ -4183,6 +4258,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                                                  EDR_MAX_EVENT_PAYLOAD);
   if (plen == 0) {
     edr_etw_observability_on_slot_payload_empty();
+    if (is_file_io && ty != EDR_EVENT_FILE_READ && ty != EDR_EVENT_FILE_WRITE)
+      edr_collector_file_context_failure(ty, "payload_unavailable");
     if (ty == EDR_EVENT_FILE_WRITE) s_health.file_write_payload_incomplete++;
     if (ty == EDR_EVENT_FILE_READ) {
       /* FileKey/actor/path were already resolved from the provider record.
@@ -4204,6 +4281,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   if (is_file_io &&
       !edr_collector_append_file_io_binding(&slot, file_read_key, file_read_path,
                                              file_write_object, file_io_binding_quality)) {
+    if (ty != EDR_EVENT_FILE_READ && ty != EDR_EVENT_FILE_WRITE) {
+      edr_collector_file_context_failure(ty, "binding_payload_does_not_fit");
+      return;
+    }
     if (ty == EDR_EVENT_FILE_WRITE) {
       s_health.file_write_payload_incomplete++;
       return;
@@ -4213,6 +4294,19 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         file_read_path[0] ? file_read_path : NULL,
         EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE);
     return;
+  }
+  if (ty == EDR_EVENT_FILE_RENAME) {
+    char reported_path[EDR_BR_STR_LONG], canonical_path[EDR_BR_STR_LONG];
+    /* Keep both the event's path and the preceding object-bound name. Do not
+     * invent a source name when only RenamePath itself supplied the binding. */
+    if (!edr_tdh_kernel_file_extract_mutation_path(event_record, reported_path, sizeof(reported_path)) ||
+        !edr_collector_canonicalize_file_path(reported_path, canonical_path, sizeof(canonical_path)) ||
+        (strcmp(file_io_binding_quality, "etw_mutation_path") != 0 &&
+         edr_collector_slot_append_kv(&slot, "old_file", file_read_path) != EDR_SLOT_KV_APPENDED) ||
+        edr_collector_slot_append_kv(&slot, "file", canonical_path) != EDR_SLOT_KV_APPENDED) {
+      edr_collector_file_context_failure(ty, "rename_path_pair_unavailable");
+      return;
+    }
   }
   edr_collector_debug_tdh_payload(&slot, tag);
   if (ty == EDR_EVENT_FILE_WRITE) s_health.file_write_path_resolved++;

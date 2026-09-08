@@ -70,6 +70,7 @@ typedef struct {
   /** 《11》§5.3 维 35：文件类事件 MOTW；上报 `FileDetail.target_has_motw` */
   uint8_t file_target_has_motw;
   char file_path[EDR_BR_STR_LONG];
+  char file_old_path[EDR_BR_STR_LONG];
   /* Kernel-File FileKey is meaningful only with the event-time NameCreate
    * binding.  It is retained internally so a collector evidence gate can
    * report precisely which binding could not be held; it is not a rule
@@ -77,6 +78,7 @@ typedef struct {
   uint64_t file_key;
   /* Internal provenance: never accepted from an ETW1 key or serialized. */
   uint8_t kernel_file_write;
+  uint8_t kernel_file_activity;
   uint8_t file_actor_generation_validated;
   uint8_t file_activity_enriched;
   /* A collector capability gate is source-only metadata, never a rule hit.

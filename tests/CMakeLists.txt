@@ -720,6 +720,11 @@ if(NOT MSVC)
 endif()
 add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+foreach(target test_detection_decision test_detection_regression test_detection_sensor_bridge)
+  target_sources(${target} PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson)
+endforeach()
+
 if(EDR_PCRE2_AVAILABLE)
   add_executable(test_p0_candidate_replay
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_candidate_replay.c

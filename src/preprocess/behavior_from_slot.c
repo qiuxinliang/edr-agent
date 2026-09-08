@@ -29,6 +29,7 @@ static atomic_uint_fast64_t g_event_boot_nonce = ATOMIC_VAR_INIT(0);
 
 typedef struct {
   uint64_t identity;
+  uint16_t alias_index;
   int64_t last_sample_ns;
   float baseline_entropy;
   uint8_t sampled;
@@ -573,29 +574,38 @@ static RansomCounterBucket *ransom_bucket_for(const EdrBehaviorRecord *r, const 
   return b;
 }
 
-static RansomFileObservation *ransom_file_observation(RansomCounterBucket *b, const EdrBehaviorRecord *r) {
+static uint64_t ransom_path_identity(const char *path) {
   uint64_t hash = 1469598103934665603ULL;
-  /* FileKey is collector-bound identity across rename. Without it the full
-   * normalized path is the bounded fallback, never a basename or extension. */
-  if (r->file_key) {
-    hash ^= r->file_key;
-    hash *= 1099511628211ULL;
-  } else {
-    int windows_path = r->file_path[0] == '\\' || (r->file_path[0] && r->file_path[1] == ':');
-    for (const unsigned char *p = (const unsigned char *)r->file_path; *p; ++p) {
-      unsigned char c = *p;
-      if (windows_path) {
-        if (c == '/') c = '\\';
-        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
-      }
-      hash = (hash ^ c) * 1099511628211ULL;
+  int windows_path = path[0] == '\\' || (path[0] && path[1] == ':');
+  for (const unsigned char *p = (const unsigned char *)path; *p; ++p) {
+    unsigned char c = *p;
+    if (windows_path) {
+      if (c == '/') c = '\\';
+      if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
     }
+    hash = (hash ^ c) * 1099511628211ULL;
   }
-  if (!hash) hash = 1;
+  return hash ? hash : 1u;
+}
+
+static RansomFileObservation *ransom_file_observation(RansomCounterBucket *b, const EdrBehaviorRecord *r) {
+  /* Create has no FileKey and the kernel can reuse a key after close. Only
+   * an attributed Rename with a source path may join two path observations. */
+  uint64_t hash = ransom_path_identity(r->file_path);
   for (size_t i = 0; i < RANSOM_COUNTER_FILES; ++i) {
     RansomFileObservation *f = &b->files[(hash + i) % RANSOM_COUNTER_FILES];
     if (!f->identity || f->identity == hash) {
+      if (!f->identity && r->type == EDR_EVENT_FILE_RENAME && r->file_old_path[0]) {
+        uint64_t old_hash = ransom_path_identity(r->file_old_path);
+        for (size_t j = 0; j < RANSOM_COUNTER_FILES; ++j) {
+          if (b->files[j].identity == old_hash) {
+            f->alias_index = b->files[j].alias_index ? b->files[j].alias_index : (uint16_t)(j + 1u);
+            break;
+          }
+        }
+      }
       f->identity = hash;
+      if (f->alias_index) f = &b->files[f->alias_index - 1u];
       return f;
     }
   }
@@ -813,7 +823,9 @@ int edr_behavior_file_activity_priority(const EdrBehaviorRecord *r) {
   if (!r || !file_path_usable_for_ransom(r->file_path)) return -1;
   int mutation = r->type == EDR_EVENT_FILE_WRITE || r->type == EDR_EVENT_FILE_RENAME;
   if ((mutation || r->type == EDR_EVENT_FILE_DELETE) &&
-      edr_policy_v2_ransomware_enabled("honey") && is_ransom_canary_path(r->file_path)) {
+      edr_policy_v2_ransomware_enabled("honey") &&
+      (is_ransom_canary_path(r->file_path) ||
+       (r->type == EDR_EVENT_FILE_RENAME && is_ransom_canary_path(r->file_old_path)))) {
     return 0;
   }
   return (mutation || r->type == EDR_EVENT_FILE_CREATE) &&
@@ -828,10 +840,11 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
   }
   if (r->file_activity_enriched) return;
   r->file_activity_enriched = 1u;
-  if (r->kernel_file_write &&
+  if (r->kernel_file_activity &&
       (!r->file_actor_generation_validated || !r->pid || !r->process_start_key ||
        !r->process_creation_filetime_100ns || !r->exe_path[0])) {
-    append_record_kv(r, "ransom_counter_suppressed=1 file_write_actor_unverified=1");
+    append_record_kv(r, "ransom_counter_suppressed=1 file_actor_unverified=1%s",
+                     r->kernel_file_write ? " file_write_actor_unverified=1" : "");
     return;
   }
   if (!mass_write_enabled && !honey_enabled) {
@@ -857,7 +870,9 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
   extension_c(r->file_path, ext, sizeof(ext));
   int ext_changed = has_ci_ascii(r->script_snippet, "ext_changed=1");
   int mutation = r->type == EDR_EVENT_FILE_WRITE || r->type == EDR_EVENT_FILE_RENAME;
-  int canary = honey_enabled && (mutation || r->type == EDR_EVENT_FILE_DELETE) && is_ransom_canary_path(r->file_path);
+  int canary = honey_enabled && (mutation || r->type == EDR_EVENT_FILE_DELETE) &&
+      (is_ransom_canary_path(r->file_path) ||
+       (r->type == EDR_EVENT_FILE_RENAME && is_ransom_canary_path(r->file_old_path)));
   if (canary) {
     append_record_kv(r, "ransom_canary=1 ransomware_kind=DETERMINISTIC_ENCRYPTION ransomware_severity=4");
   }
@@ -900,6 +915,7 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
     }
   }
   int content_deferred = !file || r->type == EDR_EVENT_FILE_DELETE ||
+      (!mutation && file->sampled) ||
       !should_sample_ransom_content_entropy(b, ext_changed, canary) ||
       (file->last_sample_ns > 0 && now_ns - file->last_sample_ns < 1000000000LL && !ext_changed);
   int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
@@ -1890,6 +1906,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   if (slot->size > 0 && etw1_parse(slot->data, slot->size, &ef) == 0) {
     r->kernel_file_write = slot->type == EDR_EVENT_FILE_WRITE &&
                            strcmp(ef.prov, "kfile") == 0;
+    r->kernel_file_activity = is_file_activity_event(slot->type) &&
+                              strcmp(ef.prov, "kfile") == 0;
     mark_etw1_input_truncations(r, ef.truncation_mask);
     if (strcmp(ef.prov, "sec") == 0 && ef.eid == 4688u) {
       r->is_security_4688 = 1u;
@@ -2053,9 +2071,15 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.file[0]) {
       (void)copy_record_source_text(r, r->file_path, sizeof(r->file_path), ef.file, "file_path");
       snprintf(r->file_op, sizeof(r->file_op), "%s",
-               r->type == EDR_EVENT_FILE_READ ? "read" : "event");
+               r->type == EDR_EVENT_FILE_READ ? "read" :
+               r->type == EDR_EVENT_FILE_WRITE ? "write" :
+               r->type == EDR_EVENT_FILE_CREATE ? "create" :
+               r->type == EDR_EVENT_FILE_RENAME ? "rename" :
+               r->type == EDR_EVENT_FILE_DELETE ? "delete" : "event");
     }
     if (ef.old_file[0]) {
+      (void)copy_record_source_text(r, r->file_old_path, sizeof(r->file_old_path),
+                                    ef.old_file, "file_old_path");
       char old_ext[16];
       char new_ext[16];
       extension_c(ef.old_file, old_ext, sizeof(old_ext));

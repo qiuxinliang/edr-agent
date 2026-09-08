@@ -2,6 +2,7 @@
 #include "edr/detection_decision.h"
 #include "edr/windows_event_policy.h"
 #include "edr/process_generation.h"
+#include "cJSON.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -35,7 +36,7 @@ static void fill_slot(EdrEventSlot *slot, EdrEventType type, const char *text) {
  * exercise raw parsing and rejection before that trusted boundary. */
 static void enrich_slot_fixture(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   edr_behavior_from_slot(slot, r);
-  if (r->kernel_file_write) {
+  if (r->kernel_file_activity) {
     r->file_actor_generation_validated = 1u;
     if (!r->process_start_key) r->process_start_key = ((uint64_t)r->pid << 32u) | 1u;
     if (!r->process_creation_filetime_100ns) {
@@ -242,7 +243,8 @@ static void test_ransom_generation_and_file_key_dedup(void) {
     /* One object renamed repeatedly is one file, not a hundred victims. */
     snprintf(payload, sizeof(payload),
              "ETW1\nprov=kfile\npid=59010\nprocess_start_key=8001\nfile_key=0x12345\n"
-             "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.e%u\n", i, i);
+             "img=C:\\Tools\\copyworker.exe\nfile=C:\\Fixture\\doc%u.e%u\n"
+             "old_file=C:\\Fixture\\doc%u.e%u\n", i, i, i ? i - 1u : 0u, i ? i - 1u : 0u);
     fill_slot(&slot, EDR_EVENT_FILE_RENAME, payload);
     slot.timestamp_ns += (int64_t)i * 100000000LL;
     enrich_slot_fixture(&slot, &r);
@@ -279,7 +281,7 @@ static void test_ransom_content_change_contract(void) {
 #endif
   test_setenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", "1");
   test_setenv("EDR_RANSOM_RATE_CONFIRM_FILES", "20");
-  for (int changed = 0; changed < 2; ++changed) {
+  for (int changed = 0; changed < 3; ++changed) {
     unsigned before = ransom_response_calls;
     int confirmations = 0;
     for (int pass = 0; pass < 3; ++pass) {
@@ -302,6 +304,18 @@ static void test_ransom_content_change_contract(void) {
                  "img=C:\\Tools\\fixture.exe\nfile=%s\n", 59020u + (unsigned)changed, path);
         fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
         slot.timestamp_ns += (int64_t)(pass * 20 + i) * 1000000000LL;
+        if (changed == 2) {
+          /* Native Create supplies the baseline without a FileKey. Subsequent
+           * opens may reuse the same kernel key for different file paths. */
+          slot.type = EDR_EVENT_FILE_CREATE;
+          enrich_slot_fixture(&slot, &r);
+          if (pass == 0) continue;
+          slot.type = EDR_EVENT_FILE_WRITE;
+          size_t n = strlen((const char *)slot.data);
+          snprintf((char *)slot.data + n, sizeof(slot.data) - n, "file_key=0xabc\n");
+          slot.size = (uint32_t)strlen((const char *)slot.data);
+          slot.timestamp_ns += 1LL;
+        }
         eval_slot(&slot, &r, &d);
         if (strstr(r.detection_context, "\"kind\":\"ENCRYPTION_CONFIRMED\"")) {
           assert(changed && pass > 0);
@@ -314,7 +328,7 @@ static void test_ransom_content_change_contract(void) {
       }
     }
     assert(changed ? confirmations > 0 : confirmations == 0);
-    assert(ransom_response_calls == before + (unsigned)changed);
+    assert(ransom_response_calls == before + (unsigned)(changed != 0));
   }
   test_unsetenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS");
   test_unsetenv("EDR_RANSOM_RATE_CONFIRM_FILES");
@@ -1044,7 +1058,86 @@ static void test_file_write_identity_and_parse_purity(const char *binding_qualit
   assert(!edr_process_generation_contains_event(epoch + 20u, 0u));
 }
 
+static void test_unbound_create_cannot_reset_writer_window(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord record;
+  unsigned before = ransom_response_calls;
+  for (unsigned i = 0; i < 20; ++i) {
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59500\nimg=C:\\Fixture\\writer.exe\n"
+             "file=C:\\Fixture\\mixed%u.dat\n", i);
+    fill_slot(&slot, EDR_EVENT_FILE_CREATE, payload);
+    slot.timestamp_ns += (int64_t)i * 1000000LL;
+    edr_behavior_from_slot(&slot, &record);
+    edr_behavior_enrich_file_activity(&record);
+    slot.type = EDR_EVENT_FILE_WRITE;
+    enrich_slot_fixture(&slot, &record);
+  }
+  assert(strstr(record.script_snippet, "file_event_count=20"));
+  assert(strstr(record.script_snippet, "unique_file_count=20"));
+  assert(ransom_response_calls == before);
+}
+
+static void test_mutation_identity_and_bounded_context(void) {
+  test_setenv("EDR_RANSOM_CANARY_PATH", "C:\\Fixture\\mutation-canary.txt");
+  const EdrEventType types[] = {EDR_EVENT_FILE_RENAME, EDR_EVENT_FILE_DELETE};
+  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+    EdrEventSlot slot;
+    EdrBehaviorRecord r;
+    EdrDetectionDecision d;
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=%u\nimg=C:\\Fixture\\mutator.exe\n"
+             "file=%s\nold_file=%s\n", 59600u + (unsigned)i,
+             i == 0u ? "C:\\Fixture\\renamed.txt" : "C:\\Fixture\\mutation-canary.txt",
+             i == 0u ? "C:\\Fixture\\mutation-canary.txt" : "");
+    fill_slot(&slot, types[i], payload);
+    unsigned before = ransom_response_calls;
+    edr_behavior_from_slot(&slot, &r);
+    assert(r.kernel_file_activity && !r.file_actor_generation_validated);
+    assert(edr_behavior_file_activity_priority(&r) == 0);
+    edr_behavior_enrich_file_activity(&r);
+    assert(strstr(r.script_snippet, "file_actor_unverified=1"));
+    assert(ransom_response_calls == before);
+    enrich_slot_fixture(&slot, &r);
+    assert(ransom_response_calls == before + 1u);
+    memset(r.cmdline, '\\', sizeof(r.cmdline) - 1u);
+    memset(r.reg_key_path, '\\', sizeof(r.reg_key_path) - 1u);
+    memset(r.reg_value_data, '\\', sizeof(r.reg_value_data) - 1u);
+    memset(r.reg_old_value_data, '\\', sizeof(r.reg_old_value_data) - 1u);
+    edr_detection_decision_evaluate(&r, &d);
+    cJSON *root = cJSON_ParseWithOpts(r.detection_context, NULL, 1);
+    assert(root && !cJSON_GetObjectItemCaseSensitive(root, "context_error"));
+    cJSON *control = cJSON_GetObjectItemCaseSensitive(root, "ransom_control");
+    assert(cJSON_IsObject(control));
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(control, "canary")));
+    assert(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields")));
+    assert(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(root, "signals")));
+    cJSON_Delete(root);
+  }
+  test_unsetenv("EDR_RANSOM_CANARY_PATH");
+}
+
+static void test_parent_directory_is_not_a_ransom_note(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\nprov=kfile\npid=59700\nimg=C:\\Fixture\\writer.exe\n"
+            "file=C:\\RansomTests\\invoice.txt\nwin_policy_tags=ransomware_behavior\n");
+  eval_slot(&slot, &r, &d);
+  cJSON *root = cJSON_ParseWithOpts(r.detection_context, NULL, 1);
+  assert(root);
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(
+      cJSON_GetObjectItemCaseSensitive(root, "signals"), "ransom_note")));
+  cJSON_Delete(root);
+}
+
 int main(void) {
+  test_mutation_identity_and_bounded_context();
+  test_parent_directory_is_not_a_ransom_note();
+  test_unbound_create_cannot_reset_writer_window();
   test_file_write_identity_and_parse_purity("etw_filekey_namecreate", 59400u);
   test_file_write_identity_and_parse_purity("etw_fileobject_create", 59401u);
   test_scriptblock_sensor_bridge();
