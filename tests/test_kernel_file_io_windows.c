@@ -1,10 +1,13 @@
 #include "edr/etw_guids_win.h"
 #include "edr/etw_tdh_win.h"
 #include "edr/process_generation.h"
+#include "edr/file_object_binding.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+void edr_test_file_object_binding_contract(void);
 
 static void number(BYTE *buffer, size_t *offset, uint64_t value, size_t bytes) {
   memcpy(buffer + *offset, &value, bytes);
@@ -16,6 +19,7 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   EVENT_RECORD record = {0};
   EdrSensorInterestEvent interest;
   uint64_t key = 0u;
+  uint64_t extracted_object = 0u;
   const uint64_t expected = pointer_bytes == 8u ? 0xffffba876f41a180ULL : 0x6f41a180u;
   const uint64_t object = pointer_bytes == 8u ? 0xffff848901b137c0ULL : 0x01b137c0u;
   size_t used = 0u;
@@ -45,6 +49,9 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   record.UserDataLength = (USHORT)used;
   assert(edr_tdh_kernel_file_extract_file_key(&record, &key));
   assert(key == expected && key != object);
+  assert(edr_tdh_kernel_file_extract_file_object(&record, &extracted_object));
+  assert(extracted_object == object && extracted_object != key);
+  const uint64_t writer_object = extracted_object;
   assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_FILE_WRITE, "kfile", &interest));
   assert(interest.pid == 9416u && interest.path[0] == '\0');
   /* A Write has no generic text properties. Its zero result is why the
@@ -69,6 +76,57 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   assert(!edr_tdh_kernel_file_extract_name_binding(&record, &key, path, 4u));
   memset(data, 0, pointer_bytes);
   assert(!edr_tdh_kernel_file_extract_file_key(&record, &key) && key == 0u);
+
+  /* Existing-file Create carries FileObject/name, but no FileKey. It may
+   * belong to another process that shares the handle with the actual writer. */
+  record.EventHeader.EventDescriptor.Id = 12u;
+  record.EventHeader.EventDescriptor.Task = 12u;
+  record.EventHeader.EventDescriptor.Version = (BYTE)version;
+  record.EventHeader.EventDescriptor.Keyword = 0xa0u;
+  memset(data, 0, sizeof(data)); used = 0u;
+  number(data, &used, 1u, pointer_bytes); /* Irp */
+  if (version == 0u) number(data, &used, 7u, pointer_bytes);
+  number(data, &used, object, pointer_bytes);
+  if (version == 1u) number(data, &used, 7u, 4u);
+  number(data, &used, 0u, 4u); /* CreateOptions */
+  number(data, &used, 0u, 4u); /* CreateAttributes */
+  number(data, &used, 3u, 4u); /* ShareAccess */
+  memcpy(data + used, filename, sizeof(filename)); used += sizeof(filename);
+  record.UserDataLength = (USHORT)used;
+  assert(edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, sizeof(path)));
+  assert(extracted_object == object && strcmp(path, "C:\\Fixture\\write-canary.txt") == 0);
+  EdrFileObjectBinding bindings[8] = {{0}};
+  EdrFileObjectHistory history = {0};
+  edr_file_object_binding_open(bindings, 8, &history, extracted_object, 100, path);
+  assert(strcmp(edr_file_object_binding_resolve(bindings, 8, &history, writer_object, 150),
+                "C:\\Fixture\\write-canary.txt") == 0);
+  assert(!edr_file_object_binding_resolve(bindings, 8, &history, expected, 150));
+  assert(!edr_tdh_kernel_file_extract_file_key(&record, &key));
+  assert(!edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, 4u));
+  /* Invalid names must still expose the typed object so the collector can
+   * quarantine that object's new generation instead of keeping an old path. */
+  assert(extracted_object == object);
+  record.UserDataLength = 0u;
+  assert(!edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, sizeof(path)));
+  assert(extracted_object == 0u);
+
+  for (unsigned event_id = 13u; event_id <= 14u; ++event_id) {
+    record.EventHeader.EventDescriptor.Id = (USHORT)event_id;
+    record.EventHeader.EventDescriptor.Task = (USHORT)event_id;
+    record.EventHeader.EventDescriptor.Keyword = 0x20u;
+    memset(data, 0, sizeof(data)); used = 0u;
+    number(data, &used, 1u, pointer_bytes);
+    if (version == 0u) number(data, &used, 7u, pointer_bytes);
+    number(data, &used, object, pointer_bytes);
+    number(data, &used, expected, pointer_bytes);
+    if (version == 1u) number(data, &used, 7u, 4u);
+    record.UserDataLength = (USHORT)used;
+    assert(edr_tdh_kernel_file_extract_file_object(&record, &extracted_object));
+    assert(extracted_object == object);
+    edr_file_object_binding_close(bindings, 8, &history, extracted_object, 200 + event_id);
+    assert(edr_file_object_binding_resolve(bindings, 8, &history, writer_object, 150));
+    assert(!edr_file_object_binding_resolve(bindings, 8, &history, writer_object, 215));
+  }
 }
 
 static void test_actor_event_boundary(uint64_t creation) {
@@ -114,6 +172,7 @@ int main(void) {
     test_file_schema(version, 8u);
   }
   test_actor_handle();
-  puts("kernel_file_io_windows: v0/v1, 32/64-bit FileKey and same-handle identity passed");
+  edr_test_file_object_binding_contract();
+  puts("kernel_file_io_windows: v0/v1, 32/64-bit FileKey/FileObject, lifetimes and same-handle identity passed");
   return 0;
 }

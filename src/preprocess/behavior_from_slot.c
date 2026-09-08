@@ -1586,7 +1586,8 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "cert_revoked_ancestor") == 0 || strcmp(key, "cert_ra") == 0) {
     f->cert_revoked_ancestor = (strtoul(val, NULL, 10) != 0u) ? 1u : 0u;
     f->has_cert_revoked_ancestor = 1;
-  } else if (strcmp(key, "file_write_binding_quality") == 0) {
+  } else if (strcmp(key, "file_write_binding_quality") == 0 ||
+             strcmp(key, "file_write_file_object") == 0) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "file") == 0) {
     (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);

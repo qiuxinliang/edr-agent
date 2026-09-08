@@ -216,6 +216,20 @@ int edr_tdh_kernel_file_extract_file_key(PEVENT_RECORD rec, uint64_t *out_file_k
   return edr_prop_u64(rec, L"FileKey", out_file_key) == ERROR_SUCCESS;
 }
 
+int edr_tdh_kernel_file_extract_file_object(PEVENT_RECORD rec, uint64_t *out_file_object) {
+  return edr_prop_u64(rec, L"FileObject", out_file_object) == ERROR_SUCCESS;
+}
+
+int edr_tdh_kernel_file_extract_create_binding(PEVENT_RECORD rec, uint64_t *out_file_object,
+                                               char *path_out, size_t path_cap) {
+  if (out_file_object) *out_file_object = 0u;
+  if (!rec || !out_file_object || !path_out || path_cap == 0u) return 0;
+  path_out[0] = '\0';
+  return edr_tdh_kernel_file_extract_file_object(rec, out_file_object) &&
+         edr_prop_utf8(rec, L"FileName", path_out, path_cap) == ERROR_SUCCESS &&
+         path_out[0] != '\0';
+}
+
 int edr_tdh_kernel_file_extract_name_binding(PEVENT_RECORD rec, uint64_t *out_file_key,
                                              char *path_out, size_t path_cap) {
   if (out_file_key) *out_file_key = 0u;

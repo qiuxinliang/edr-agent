@@ -825,6 +825,26 @@ jobs:
           Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
           Write-Host "Setup UI package is uploaded as a separate release asset and is not nested into the runtime zip."
 
+          # Keep the same installer manifest/CMS in Headless without the UI runtime.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $setupUiArchive = [System.IO.Compression.ZipFile]::OpenRead($setupUiZip)
+          try {
+            foreach ($extension in @('json', 'p7s')) {
+              $entry = $setupUiArchive.GetEntry("setup-ui-manifest.$extension")
+              if ($null -eq $entry) {
+                if ($extension -eq 'json' -or $env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+                  throw "missing full installer manifest component: $extension"
+                }
+                continue
+              }
+              $manifestDest = Join-Path $env:GITHUB_WORKSPACE "full-installer-manifest.$extension"
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $manifestDest, $true)
+              $null = $items.Add($manifestDest)
+            }
+          } finally {
+            $setupUiArchive.Dispose()
+          }
+
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
           if (-not (Test-Path -LiteralPath $zip)) { throw "package was not created: $zip" }
           Add-Type -AssemblyName System.IO.Compression.FileSystem

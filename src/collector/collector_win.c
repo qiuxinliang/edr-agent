@@ -27,6 +27,7 @@
 #include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
 #include "edr/file_key_lifetime.h"
+#include "edr/file_object_binding.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
@@ -88,6 +89,7 @@ static const EdrConfig *s_collector_cfg;
 
 #define EDR_COLLECTOR_PID_CACHE 512u
 #define EDR_COLLECTOR_FILE_KEY_CACHE 1024u
+#define EDR_COLLECTOR_FILE_OBJECT_CACHE 4096u
 /* Keep P0-interest NameCreate bindings out of the best-effort ordinary
  * namespace.  Ordinary held handles may churn their own partition but can
  * never evict a live protected binding. */
@@ -109,6 +111,9 @@ static const EdrConfig *s_collector_cfg;
  * resolve the read payload, which itself intentionally has no filename. */
 #define EDR_KERNEL_FILE_EVENT_NAME_CREATE 10u
 #define EDR_KERNEL_FILE_EVENT_NAME_DELETE 11u
+#define EDR_KERNEL_FILE_EVENT_CREATE 12u
+#define EDR_KERNEL_FILE_EVENT_CLEANUP 13u
+#define EDR_KERNEL_FILE_EVENT_CLOSE 14u
 #define EDR_KERNEL_FILE_EVENT_READ 15u
 #define EDR_KERNEL_FILE_EVENT_WRITE 16u
 #define EDR_KERNEL_FILE_KEYWORD_FILENAME 0x00000010ULL
@@ -250,6 +255,9 @@ static EdrCollectorFileKeyCacheEntry s_file_key_cache[EDR_COLLECTOR_FILE_KEY_CAC
 static uint32_t s_file_key_cache_next;
 static uint64_t s_file_key_session_epoch;
 static SRWLOCK s_file_key_cache_lock = SRWLOCK_INIT;
+/* Uses the same lock and joined-session reset as the FileKey cache. */
+static EdrFileObjectBinding s_file_object_cache[EDR_COLLECTOR_FILE_OBJECT_CACHE];
+static EdrFileObjectHistory s_file_object_history;
 static EdrFileReadMetadataGate s_file_read_metadata_gate;
 static EdrFileReadMetadataCoalesceEntry
     s_file_read_metadata_coalesce[EDR_FILE_READ_METADATA_COALESCE_SLOTS];
@@ -441,6 +449,22 @@ static int edr_kernel_file_name_delete_descriptor(const EVENT_DESCRIPTOR *descri
   return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_NAME_DELETE,
                                             EDR_KERNEL_FILE_EVENT_NAME_DELETE,
                                             EDR_KERNEL_FILE_KEYWORD_FILENAME);
+}
+
+static int edr_kernel_file_create_descriptor(const EVENT_DESCRIPTOR *descriptor) {
+  return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CREATE,
+                                            EDR_KERNEL_FILE_EVENT_CREATE,
+                                            EDR_KERNEL_FILE_KEYWORD_FILEIO |
+                                                EDR_KERNEL_FILE_KEYWORD_CREATE);
+}
+
+static int edr_kernel_file_close_descriptor(const EVENT_DESCRIPTOR *descriptor) {
+  return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CLEANUP,
+                                            EDR_KERNEL_FILE_EVENT_CLEANUP,
+                                            EDR_KERNEL_FILE_KEYWORD_FILEIO) ||
+         edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CLOSE,
+                                            EDR_KERNEL_FILE_EVENT_CLOSE,
+                                            EDR_KERNEL_FILE_KEYWORD_FILEIO);
 }
 
 static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_kind,
@@ -2277,6 +2301,8 @@ static void edr_collector_file_key_cache_purge_locked(uint64_t event_ns) {
  * so a stale NameCreate can never cross an ETW session boundary. */
 static void edr_collector_file_key_cache_reset(void) {
   AcquireSRWLockExclusive(&s_file_key_cache_lock);
+  memset(s_file_object_cache, 0, sizeof(s_file_object_cache));
+  memset(&s_file_object_history, 0, sizeof(s_file_object_history));
   memset(s_file_key_cache, 0, sizeof(s_file_key_cache));
   s_file_key_cache_next = 0u;
   s_file_key_session_epoch++;
@@ -3182,6 +3208,38 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     return 0;
   }
   descriptor = &record->EventHeader.EventDescriptor;
+  if (edr_kernel_file_create_descriptor(descriptor) ||
+      edr_kernel_file_close_descriptor(descriptor)) {
+    uint64_t file_object = 0u;
+    char path[EDR_BR_STR_LONG];
+    char canonical_path[EDR_BR_STR_LONG];
+    int is_create = edr_kernel_file_create_descriptor(descriptor);
+    int named = is_create &&
+        edr_tdh_kernel_file_extract_create_binding((PEVENT_RECORD)record, &file_object,
+                                                     path, sizeof(path)) &&
+        edr_collector_canonicalize_file_path(path, canonical_path, sizeof(canonical_path));
+    if (!is_create) {
+      (void)edr_tdh_kernel_file_extract_file_object((PEVENT_RECORD)record, &file_object);
+    }
+    AcquireSRWLockExclusive(&s_file_key_cache_lock);
+    if (!file_object) {
+      /* An unidentifiable boundary makes older object lifetimes unsafe.
+       * Retain the watermark so delayed metadata cannot resurrect them. */
+      if (event_ns > s_file_object_history.discarded_through)
+        s_file_object_history.discarded_through = event_ns;
+    } else if (is_create) {
+      edr_file_object_binding_open(s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE,
+                                  &s_file_object_history, file_object, event_ns,
+                                  named ? canonical_path : NULL);
+    } else {
+      edr_file_object_binding_close(s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE,
+                                   &s_file_object_history, file_object, event_ns);
+    }
+    ReleaseSRWLockExclusive(&s_file_key_cache_lock);
+    /* Opening is metadata, not evidence of mutation. Preserve the existing
+     * generic Create path; only a real Write may use this new association. */
+    return is_create ? 0 : 1;
+  }
   if (edr_kernel_file_name_create_descriptor(descriptor)) {
     char path[EDR_BR_STR_LONG];
     char canonical_path[EDR_BR_STR_LONG];
@@ -3317,9 +3375,12 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
 static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
                                                   uint64_t event_ns, uint64_t *out_file_key,
                                                   char *path_out, size_t path_cap,
-                                                  const char **out_gate_reason) {
+                                                  const char **out_gate_reason,
+                                                  uint64_t *out_file_object,
+                                                  const char **out_binding_quality) {
   const EVENT_DESCRIPTOR *descriptor;
   uint64_t file_key = 0u;
+  uint64_t file_object = 0u;
   uint64_t best_name_event_ns = 0u;
   uint64_t session_epoch;
   uint32_t read_pid;
@@ -3329,6 +3390,8 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   char problem_path[EDR_BR_STR_LONG];
   const char *problem_reason = NULL;
   if (out_file_key) *out_file_key = 0u;
+  if (out_file_object) *out_file_object = 0u;
+  if (out_binding_quality) *out_binding_quality = "etw_filekey_namecreate";
   if (out_gate_reason) *out_gate_reason = NULL;
   problem_path[0] = '\0';
   if (!record || !out_file_key || !path_out || path_cap == 0u || event_ns == 0u ||
@@ -3345,6 +3408,10 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   }
   *out_file_key = file_key;
   read_pid = (uint32_t)record->EventHeader.ProcessId;
+  if (!is_read) {
+    (void)edr_tdh_kernel_file_extract_file_object((PEVENT_RECORD)record, &file_object);
+    if (out_file_object) *out_file_object = file_object;
+  }
   AcquireSRWLockExclusive(&s_file_key_cache_lock);
   session_epoch = s_file_key_session_epoch;
   edr_collector_file_key_cache_purge_locked(event_ns);
@@ -3389,6 +3456,27 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     memcpy(path_out, entry->path, strlen(entry->path) + 1u);
     resolved = 1;
   }
+  if (!is_read && read_pid && file_object) {
+    const char *object_path = edr_file_object_binding_resolve(
+        s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE, &s_file_object_history,
+        file_object, event_ns);
+    if (resolved && object_path && _stricmp(path_out, object_path) != 0) {
+      resolved = 0;
+      have_problem = 1;
+      problem_reason = "file_write_binding_conflict";
+    } else if (!resolved && !have_problem && object_path && strlen(object_path) < path_cap) {
+      /* Existing files may emit Create/Write without NameCreate. Bind the
+       * actual Write's FileObject, not a guessed FileKey or the opener PID.
+       * Preprocess still requires the verified writer generation. */
+      memcpy(path_out, object_path, strlen(object_path) + 1u);
+      if (out_binding_quality) *out_binding_quality = "etw_fileobject_create";
+      resolved = 1;
+    } else if (!resolved && !have_problem &&
+               event_ns <= s_file_object_history.discarded_through) {
+      have_problem = 1;
+      problem_reason = "file_object_history_expired";
+    }
+  }
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
   if (!resolved) {
     if (have_problem) {
@@ -3410,11 +3498,17 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
 }
 
 static int edr_collector_append_file_io_binding(EdrEventSlot *slot, uint64_t file_key,
-                                                  const char *path) {
+                                                  const char *path, uint64_t file_object,
+                                                  const char *binding_quality) {
   char key_text[32];
   if (!slot || (slot->type != EDR_EVENT_FILE_READ && slot->type != EDR_EVENT_FILE_WRITE) ||
       !file_key || !path || !path[0]) {
     return 0;
+  }
+  if (slot->type == EDR_EVENT_FILE_WRITE && file_object) {
+    snprintf(key_text, sizeof(key_text), "0x%llx", (unsigned long long)file_object);
+    if (edr_collector_slot_append_kv(slot, "file_write_file_object", key_text) != EDR_SLOT_KV_APPENDED)
+      return 0;
   }
   snprintf(key_text, sizeof(key_text), "0x%llx", (unsigned long long)file_key);
   return edr_collector_slot_append_kv(slot, "file", path) == EDR_SLOT_KV_APPENDED &&
@@ -3422,10 +3516,10 @@ static int edr_collector_append_file_io_binding(EdrEventSlot *slot, uint64_t fil
          edr_collector_slot_append_kv(slot, slot->type == EDR_EVENT_FILE_READ
                                               ? "file_read_binding_quality"
                                               : "file_write_binding_quality",
-                                      "etw_filekey_namecreate") == EDR_SLOT_KV_APPENDED;
+                                      binding_quality) == EDR_SLOT_KV_APPENDED;
 }
 
-/* File I/O authority comes from the typed FileKey/NameCreate binding,
+/* File I/O authority comes from typed, event-time-bounded name bindings,
  * not from arbitrary provider properties.  A compact base payload reserves
  * enough room for the canonical path and generation tuple under ETW load. */
 static size_t edr_collector_build_file_io_slot_payload(const EVENT_RECORD *record,
@@ -3974,6 +4068,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   char file_read_path[EDR_BR_STR_LONG];
   const char *file_read_gate_reason = NULL;
   uint64_t file_read_key = 0u;
+  uint64_t file_write_object = 0u;
+  const char *file_io_binding_quality = NULL;
   const int is_file_io = ty == EDR_EVENT_FILE_READ || ty == EDR_EVENT_FILE_WRITE;
   if (!s_bus || !event_record || !tag) {
     return;
@@ -3982,15 +4078,17 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   if (is_file_io &&
       !edr_collector_kernel_file_io_resolve(event_record, timestamp_ns, &file_read_key,
                                               file_read_path, sizeof(file_read_path),
-                                              &file_read_gate_reason)) {
+                                              &file_read_gate_reason, &file_write_object,
+                                              &file_io_binding_quality)) {
     if (ty == EDR_EVENT_FILE_WRITE) {
       /* A kernel pointer is not a path. Missing/ambiguous name lifetimes
        * cannot create a ransomware mutation or borrow the NameCreate actor. */
       uint64_t count = ++s_health.file_write_path_unresolved;
       if (count <= 3u || (count & (count - 1u)) == 0u) {
-        fprintf(stderr, "[collector] FileWrite path unavailable pid=%lu file_key=0x%llx count=%llu reason=%s\n",
+        fprintf(stderr, "[collector] FileWrite path unavailable pid=%lu file_key=0x%llx file_object=0x%llx count=%llu reason=%s\n",
                 (unsigned long)event_record->EventHeader.ProcessId,
-                (unsigned long long)file_read_key, (unsigned long long)count,
+                (unsigned long long)file_read_key, (unsigned long long)file_write_object,
+                (unsigned long long)count,
                 file_read_gate_reason ? file_read_gate_reason : "binding_unavailable");
       }
       return;
@@ -4104,7 +4202,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   edr_collector_append_image_path_metadata(&slot);
   edr_collector_append_event_process_generation(&slot, event_record);
   if (is_file_io &&
-      !edr_collector_append_file_io_binding(&slot, file_read_key, file_read_path)) {
+      !edr_collector_append_file_io_binding(&slot, file_read_key, file_read_path,
+                                             file_write_object, file_io_binding_quality)) {
     if (ty == EDR_EVENT_FILE_WRITE) {
       s_health.file_write_payload_incomplete++;
       return;

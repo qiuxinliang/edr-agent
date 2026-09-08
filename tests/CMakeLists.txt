@@ -281,10 +281,12 @@ if(WIN32)
     COMMAND test_process_generation_windows)
   add_executable(test_kernel_file_io_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_file_io_windows.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_file_object_binding.c
     ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
   target_include_directories(test_kernel_file_io_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
   target_link_libraries(test_kernel_file_io_windows PRIVATE tdh)
+  target_compile_definitions(test_kernel_file_io_windows PRIVATE EDR_FILE_OBJECT_BINDING_NO_MAIN=1)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
 endif()
@@ -315,6 +317,11 @@ add_executable(test_file_key_lifetime ${CMAKE_CURRENT_SOURCE_DIR}/test_file_key_
 target_include_directories(test_file_key_lifetime PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_test_warnings(test_file_key_lifetime)
 add_test(NAME file_key_lifetime COMMAND test_file_key_lifetime)
+
+add_executable(test_file_object_binding ${CMAKE_CURRENT_SOURCE_DIR}/test_file_object_binding.c)
+target_include_directories(test_file_object_binding PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_file_object_binding)
+add_test(NAME file_object_binding COMMAND test_file_object_binding)
 
 add_executable(test_file_read_deferred ${CMAKE_CURRENT_SOURCE_DIR}/test_file_read_deferred.c)
 target_include_directories(test_file_read_deferred PRIVATE ${CMAKE_SOURCE_DIR}/include)

@@ -986,24 +986,27 @@ static void test_source_truncation_withholds_and_names_rule_fields(void) {
   assert(strstr(r.source_truncated_fields, "source.reg_key_path") != NULL);
 }
 
-static void test_file_write_identity_and_parse_purity(void) {
+static void test_file_write_identity_and_parse_purity(const char *binding_quality, unsigned pid) {
   EdrEventSlot slot;
   EdrBehaviorRecord record;
   unsigned before = ransom_response_calls;
+  char payload[1024];
   test_setenv("EDR_RANSOM_CANARY_PATH", "C:\\Fixture\\write-canary.txt");
-  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
-            "ETW1\nprov=kfile\neid=16\npid=59400\nfile_key=0x987654321\n"
+  snprintf(payload, sizeof(payload),
+            "ETW1\nprov=kfile\neid=16\npid=%u\nfile_key=0x987654321\n"
             "file=C:\\Fixture\\write-canary.txt\n"
-            "file_write_binding_quality=etw_filekey_namecreate\n"
+            "file_write_binding_quality=%s\nfile_write_file_object=0x123456789\n"
             "img=C:\\Fixture\\writer.exe\nprocess_start_key=98765\n"
             "process_creation_filetime_100ns=134238120000000000\n"
-            "file_actor_generation_validated=1\n");
+            "file_actor_generation_validated=1\n", pid, binding_quality);
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
   for (int i = 0; i < 10; ++i) {
     edr_behavior_from_slot(&slot, &record);
     assert(record.kernel_file_write && !record.file_actor_generation_validated);
-    assert(record.pid == 59400u && record.file_key == 0x987654321ULL);
+    assert(record.pid == pid && record.file_key == 0x987654321ULL);
     assert(edr_behavior_file_activity_priority(&record) == 0);
-    assert(strstr(record.script_snippet, "file_write_binding_quality=etw_filekey_namecreate"));
+    assert(strstr(record.script_snippet, binding_quality));
+    assert(strstr(record.script_snippet, "file_write_file_object=0x123456789"));
     assert(strstr(record.script_snippet, "file_write_file_key=0x987654321"));
     assert(!strstr(record.script_snippet, "ransom_counter=1"));
   }
@@ -1042,7 +1045,8 @@ static void test_file_write_identity_and_parse_purity(void) {
 }
 
 int main(void) {
-  test_file_write_identity_and_parse_purity();
+  test_file_write_identity_and_parse_purity("etw_filekey_namecreate", 59400u);
+  test_file_write_identity_and_parse_purity("etw_fileobject_create", 59401u);
   test_scriptblock_sensor_bridge();
   test_amsi_sensor_bridge();
   test_tls_sensor_bridge();
