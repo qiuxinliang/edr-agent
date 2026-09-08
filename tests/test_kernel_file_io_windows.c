@@ -71,9 +71,28 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   assert(!edr_tdh_kernel_file_extract_file_key(&record, &key) && key == 0u);
 }
 
+static void test_actor_event_boundary(uint64_t creation) {
+  const uint64_t epoch = 116444736000000000ULL;
+  assert(creation > epoch && creation - epoch < UINT64_MAX / 100u);
+  const uint64_t created_ns = (creation - epoch) * 100u;
+
+  /* Anchor event fixtures to the verified creation time. A coarse wall-clock
+   * sample can predate it on fast startup; clock adjustments can do so too. */
+  assert(!edr_process_generation_contains_event(creation, created_ns - 1u));
+  assert(edr_process_generation_contains_event(creation, created_ns));
+  assert(edr_process_generation_contains_event(creation, created_ns + 1u));
+  assert(edr_process_generation_contains_event(creation, created_ns + 100u));
+  assert(!edr_process_generation_contains_event(creation + 1u, created_ns));
+  assert(!edr_process_generation_contains_event(creation + 2u, created_ns + 100u));
+  assert(!edr_process_generation_contains_event(creation, 0u));
+  assert(!edr_process_generation_contains_event(0u, created_ns));
+  assert(!edr_process_generation_contains_event(epoch, created_ns));
+  assert(!edr_process_generation_contains_event(UINT64_MAX, created_ns));
+}
+
 static void test_actor_handle(void) {
   EdrLiveProcessGeneration generation;
-  FILETIME created, exited, kernel, user, now;
+  FILETIME created, exited, kernel, user;
   char reason[64];
   uint64_t verified_creation = 0u;
   assert(edr_process_generation_query_live(GetCurrentProcess(), &generation, reason, sizeof(reason)));
@@ -86,11 +105,7 @@ static void test_actor_handle(void) {
   assert(verified_creation == creation);
   assert(!edr_process_generation_validate_live(GetCurrentProcess(), generation.pid,
       generation.process_start_key + 1u, &verified_creation, reason, sizeof(reason)));
-  GetSystemTimeAsFileTime(&now);
-  uint64_t now_value = ((uint64_t)now.dwHighDateTime << 32u) | now.dwLowDateTime;
-  uint64_t event_ns = (now_value - 116444736000000000ULL) * 100u;
-  assert(edr_process_generation_contains_event(creation, event_ns));
-  assert(!edr_process_generation_contains_event(now_value + 1u, event_ns));
+  test_actor_event_boundary(creation);
 }
 
 int main(void) {
