@@ -5,6 +5,30 @@
 #include <stddef.h>
 #include <string.h>
 
+/* A closed FileKey name is not authority over a newer, independently proven
+ * FileObject lifetime. Conflicting live names must still fail closed. */
+static inline const char *edr_file_mutation_binding_select(
+    const char *key_path, const char *object_path, int key_rejected,
+    int key_expired, int *conflict) {
+  if (conflict) *conflict = 0;
+  if (key_path && object_path) {
+    const unsigned char *a = (const unsigned char *)key_path;
+    const unsigned char *b = (const unsigned char *)object_path;
+    while (*a && *b) {
+      unsigned char ac = (*a >= 'A' && *a <= 'Z') ? (unsigned char)(*a + 32) : *a;
+      unsigned char bc = (*b >= 'A' && *b <= 'Z') ? (unsigned char)(*b + 32) : *b;
+      if (ac != bc) break;
+      ++a; ++b;
+    }
+    if (*a || *b) {
+      if (conflict) *conflict = 1;
+      return NULL;
+    }
+  }
+  if (key_path) return key_path;
+  return (!key_rejected || key_expired) ? object_path : NULL;
+}
+
 /* Matches the maximum intact path admitted by EdrSensorInterestEvent. */
 #define EDR_FILE_OBJECT_PATH_CAP 1024u
 typedef struct {

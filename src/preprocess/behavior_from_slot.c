@@ -921,7 +921,11 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
   int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
   double entropy_delta = 0.0;
   int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
-  if (!content_deferred) file->last_sample_ns = now_ns;
+  /* Create may arrive while overwrite has truncated the file to zero bytes.
+   * An unusable baseline must not consume the following Write's sample slot.
+   * Failed mutation reads still retain their per-file retry interval. */
+  if (!content_deferred && (mutation || (content_ok && content_sample >= 512u)))
+    file->last_sample_ns = now_ns;
   if (content_ok && content_sample >= 512u) {
     if (file->sampled) {
       /* Only a measured change of this same file is an entropy delta. */

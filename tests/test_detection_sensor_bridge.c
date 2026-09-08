@@ -330,6 +330,34 @@ static void test_ransom_content_change_contract(void) {
     assert(changed ? confirmations > 0 : confirmations == 0);
     assert(ransom_response_calls == before + (unsigned)(changed != 0));
   }
+  for (unsigned i = 0; i < 20; ++i) {
+    char path[768], payload[1200];
+    EdrEventSlot slot;
+    EdrBehaviorRecord record;
+    snprintf(path, sizeof(path), "%s/doc%02u.bin", dir, i);
+    FILE *file = fopen(path, "wb");
+    assert(file && fclose(file) == 0);
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59800\nimg=C:\\Tools\\fixture.exe\nfile=%s\n", path);
+    fill_slot(&slot, EDR_EVENT_FILE_CREATE, payload);
+    slot.timestamp_ns += (int64_t)i * 20000000LL;
+    enrich_slot_fixture(&slot, &record);
+    /* CreateNewFile repeats the empty-file notification, not a mutation. */
+    slot.timestamp_ns += 1LL;
+    enrich_slot_fixture(&slot, &record);
+    file = fopen(path, "wb");
+    assert(file);
+    for (unsigned n = 0; n < 8192; ++n) assert(fputc('a', file) != EOF);
+    assert(fclose(file) == 0);
+    slot.type = EDR_EVENT_FILE_WRITE;
+    slot.timestamp_ns += 1LL;
+    enrich_slot_fixture(&slot, &record);
+    if (i == 19u) {
+      assert(strstr(record.script_snippet, "content_entropy_ok=1"));
+      assert(strstr(record.script_snippet, "content_sample_bytes=8192"));
+      assert(strstr(record.script_snippet, "sampled_file_count=20"));
+    }
+  }
   test_unsetenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS");
   test_unsetenv("EDR_RANSOM_RATE_CONFIRM_FILES");
   for (int i = 0; i < 20; ++i) {

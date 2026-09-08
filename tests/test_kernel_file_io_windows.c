@@ -95,6 +95,16 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   record.UserDataLength = (USHORT)used;
   assert(edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, sizeof(path)));
   assert(extracted_object == object && strcmp(path, "C:\\Fixture\\write-canary.txt") == 0);
+  /* A real overwrite emits 12 -> 30 -> 16. CreateNewFile has the same typed
+   * layout but only the CREATE_NEW_FILE keyword; it is not another lifetime. */
+  record.EventHeader.EventDescriptor.Id = 30u;
+  record.EventHeader.EventDescriptor.Task = 30u;
+  record.EventHeader.EventDescriptor.Keyword = 0x1000u;
+  assert(edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, sizeof(path)));
+  assert(extracted_object == object && strcmp(path, "C:\\Fixture\\write-canary.txt") == 0);
+  record.EventHeader.EventDescriptor.Id = 12u;
+  record.EventHeader.EventDescriptor.Task = 12u;
+  record.EventHeader.EventDescriptor.Keyword = 0xa0u;
   EdrFileObjectBinding bindings[8] = {{0}};
   EdrFileObjectHistory history = {0};
   edr_file_object_binding_open(bindings, 8, &history, extracted_object, 100, path);

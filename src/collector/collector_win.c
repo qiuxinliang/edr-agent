@@ -465,6 +465,13 @@ static int edr_kernel_file_create_descriptor(const EVENT_DESCRIPTOR *descriptor)
                                                 EDR_KERNEL_FILE_KEYWORD_CREATE);
 }
 
+static int edr_kernel_file_create_new_descriptor(const EVENT_DESCRIPTOR *descriptor) {
+  /* Overwrite completion carries the same typed name, but is not a second
+   * FileObject open boundary. Only Create(12) updates lifetime history. */
+  return edr_kernel_file_descriptor_matches(descriptor, 30u, 30u,
+                                            EDR_KERNEL_FILE_KEYWORD_CREATE_NEW_FILE);
+}
+
 static int edr_kernel_file_close_descriptor(const EVENT_DESCRIPTOR *descriptor) {
   return edr_kernel_file_descriptor_matches(descriptor, EDR_KERNEL_FILE_EVENT_CLEANUP,
                                             EDR_KERNEL_FILE_EVENT_CLEANUP,
@@ -503,6 +510,10 @@ static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_k
     event_type = EDR_EVENT_FILE_READ;
   } else if (provider_kind == 1u && edr_kernel_file_write_descriptor(descriptor)) {
     event_type = EDR_EVENT_FILE_WRITE;
+  } else if (provider_kind == 1u &&
+             (edr_kernel_file_create_descriptor(descriptor) ||
+              edr_kernel_file_create_new_descriptor(descriptor))) {
+    event_type = EDR_EVENT_FILE_CREATE;
   } else if (provider_kind == 1u && edr_kernel_file_mutation_path_descriptor(descriptor)) {
     event_type = descriptor->Id == 27u ? EDR_EVENT_FILE_RENAME : EDR_EVENT_FILE_DELETE;
   } else if (!(provider_kind == 1u &&
@@ -3399,6 +3410,7 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   int is_read;
   int resolved = 0;
   int have_problem = 0;
+  int key_expired = 0;
   char problem_path[EDR_BR_STR_LONG];
   const char *problem_reason = NULL;
   if (out_file_key) *out_file_key = 0u;
@@ -3413,14 +3425,17 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   path_out[0] = '\0';
   descriptor = &record->EventHeader.EventDescriptor;
   is_read = edr_kernel_file_read_descriptor(descriptor);
-  if (edr_kernel_file_create_descriptor(descriptor)) {
+  if (edr_kernel_file_create_descriptor(descriptor) ||
+      edr_kernel_file_create_new_descriptor(descriptor)) {
     char reported_path[EDR_BR_STR_LONG];
     if (record->EventHeader.ProcessId &&
         edr_tdh_kernel_file_extract_create_binding((PEVENT_RECORD)record, &file_object,
                                                      reported_path, sizeof(reported_path)) &&
         edr_collector_canonicalize_file_path(reported_path, path_out, path_cap)) {
       if (out_file_object) *out_file_object = file_object;
-      if (out_binding_quality) *out_binding_quality = "etw_fileobject_create";
+      if (out_binding_quality)
+        *out_binding_quality = edr_kernel_file_create_new_descriptor(descriptor)
+                                   ? "etw_create_new_path" : "etw_fileobject_create";
       return 1;
     }
     if (out_gate_reason) *out_gate_reason = "file_create_path_unresolved";
@@ -3465,6 +3480,7 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     best_name_event_ns = entry->name_event_ns;
     resolved = 0;
     have_problem = 0;
+    key_expired = 0;
     /* Equal timestamps have no documented ordering across callbacks, so they
      * cannot resolve a Read against a closed/reused handle.  Preserve the
      * known path only to make the resulting source-only gate attributable. */
@@ -3473,6 +3489,8 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
       snprintf(problem_path, sizeof(problem_path), "%s", entry->path);
       have_problem = 1;
       problem_reason = EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS;
+      key_expired = entry->name_end_event_ns != 0u &&
+                    event_ns > entry->name_end_event_ns;
       continue;
     }
     /* NameCreate binds the file object, not the process that will eventually
@@ -3499,15 +3517,20 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     const char *object_path = edr_file_object_binding_resolve(
         s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE, &s_file_object_history,
         file_object, event_ns);
-    if (resolved && object_path && _stricmp(path_out, object_path) != 0) {
+    int conflict = 0;
+    const char *selected = edr_file_mutation_binding_select(
+        resolved ? path_out : NULL, object_path, have_problem, key_expired, &conflict);
+    if (conflict) {
       resolved = 0;
       have_problem = 1;
       problem_reason = "file_write_binding_conflict";
-    } else if (!resolved && !have_problem && object_path && strlen(object_path) < path_cap) {
+    } else if (!resolved && selected && strlen(selected) < path_cap) {
       /* Existing files may emit Create/Write without NameCreate. Bind the
        * actual Write's FileObject, not a guessed FileKey or the opener PID.
        * Preprocess still requires the verified writer generation. */
-      memcpy(path_out, object_path, strlen(object_path) + 1u);
+      memcpy(path_out, selected, strlen(selected) + 1u);
+      have_problem = 0;
+      problem_reason = NULL;
       if (out_binding_quality) *out_binding_quality = "etw_fileobject_create";
       resolved = 1;
     } else if (!resolved && !have_problem &&
@@ -4137,7 +4160,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   const int is_file_io = ty == EDR_EVENT_FILE_READ || ty == EDR_EVENT_FILE_WRITE ||
                         ty == EDR_EVENT_FILE_RENAME || ty == EDR_EVENT_FILE_DELETE ||
                         (ty == EDR_EVENT_FILE_CREATE && event_record &&
-                         edr_kernel_file_create_descriptor(&event_record->EventHeader.EventDescriptor));
+                         (edr_kernel_file_create_descriptor(&event_record->EventHeader.EventDescriptor) ||
+                          edr_kernel_file_create_new_descriptor(&event_record->EventHeader.EventDescriptor)));
   if (!s_bus || !event_record || !tag) {
     return;
   }

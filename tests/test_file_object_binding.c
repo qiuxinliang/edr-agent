@@ -58,6 +58,24 @@ void edr_test_file_object_binding_contract(void) {
   edr_file_object_binding_open(entries, 2, &history, object, 300, path);
   assert(!edr_file_object_binding_resolve(entries, 2, &history, object, 450));
   assert(edr_file_object_binding_resolve(entries, 2, &history, object + 2, 650));
+  /* A retained, closed NameCreate must not shadow a fresh FileObject/Create
+   * on a subsequent write pass. No fallback is allowed for live conflicts. */
+  memset(entries, 0, sizeof(entries)); memset(&history, 0, sizeof(history));
+  edr_file_object_binding_open(entries, count, &history, object, 100, path);
+  edr_file_object_binding_close(entries, count, &history, object, 200);
+  edr_file_object_binding_open(entries, count, &history, object, 300, path);
+  const char *current = edr_file_object_binding_resolve(entries, count, &history, object, 350);
+  int conflict = 0;
+  assert(edr_file_mutation_binding_select(NULL, current, 1, 1, &conflict) == current);
+  assert(!conflict);
+  assert(!edr_file_mutation_binding_select(NULL, current, 1, 0, &conflict));
+  assert(!edr_file_mutation_binding_select("C:\\Other.txt", current, 0, 0, &conflict));
+  assert(conflict);
+  assert(edr_file_mutation_binding_select("c:\\fixture\\existing.txt", current, 0, 0, &conflict));
+  assert(!conflict);
+  edr_file_object_binding_close(entries, count, &history, object, 400);
+  current = edr_file_object_binding_resolve(entries, count, &history, object, 450);
+  assert(!edr_file_mutation_binding_select(NULL, current, 1, 1, &conflict));
   /* Evicting a reused generation must not revive an older open generation. */
   memset(entries, 0, sizeof(entries)); memset(&history, 0, sizeof(history));
   edr_file_object_binding_open(entries, 2, &history, object, 100, path);
