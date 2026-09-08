@@ -126,26 +126,26 @@ function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $Backup
   }
   Add-Evidence $Stage "completed" "exit_code=0"
 }
-function New-BaselineRepairBackup([string] $Destination) {
-  if (Test-Path -LiteralPath $Destination) {
-    Remove-Item -LiteralPath $Destination -Recurse -Force
+function New-BaselineRepairBackup([string] $BackupDirectory) {
+  if (Test-Path -LiteralPath $BackupDirectory) {
+    Remove-Item -LiteralPath $BackupDirectory -Recurse -Force
   }
-  New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+  New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
 
   # Repair authorization requires the protected Agent and its identity config.
   # Do not recursively read hardened runtime-data or collector directories from
   # the lifecycle harness; their ACL isolation is a separate security contract.
   foreach ($name in @("FDSensor.exe", "agent.toml")) {
     $source = Join-Path $InstallDir $name
-    $destination = Join-Path $Destination $name
+    $backupPath = Join-Path $BackupDirectory $name
     $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
     if ($item.PSIsContainer -or
         (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
       throw "repair backup source is not a regular file: $source"
     }
     $expectedHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-    Copy-Item -LiteralPath $source -Destination $destination -Force
-    if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne $expectedHash) {
+    Copy-Item -LiteralPath $source -Destination $backupPath -Force
+    if ((Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash -ne $expectedHash) {
       throw "repair backup hash mismatch: $name"
     }
   }

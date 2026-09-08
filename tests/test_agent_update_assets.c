@@ -225,6 +225,11 @@ int main(void) {
   contains(baseline_repair_lifecycle, "EDR_REPAIR_BASELINE=1", "lifecycle invokes the explicit repair mode");
   contains(baseline_repair_lifecycle, "New-BaselineRepairBackup $backupDir",
            "lifecycle creates the repair authorization backup without traversing hardened runtime data");
+  contains(baseline_repair_lifecycle,
+           "function New-BaselineRepairBackup([string] $BackupDirectory)",
+           "repair backup root has a name distinct from its per-file destination");
+  contains(baseline_repair_lifecycle, "$backupPath = Join-Path $BackupDirectory $name",
+           "each repair backup path derives from the immutable backup root");
   contains(baseline_repair_lifecycle, "foreach ($name in @(\"FDSensor.exe\", \"agent.toml\"))",
            "repair authorization backup contains the protected Agent and identity configuration");
   contains(baseline_repair_lifecycle, "repair backup hash mismatch",
