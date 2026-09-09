@@ -81,6 +81,12 @@ typedef struct {
   uint8_t kernel_file_activity;
   uint8_t file_actor_generation_validated;
   uint8_t file_activity_enriched;
+  /* Internal collector snapshot. The ransomware counter may consume it only
+   * after exact process-generation validation succeeds. */
+  uint64_t ransom_sample_process_start_key;
+  float ransom_content_entropy;
+  uint32_t ransom_content_sample_bytes;
+  uint8_t ransom_content_sampled;
   /* A collector capability gate is source-only metadata, never a rule hit.
    * The reason is constrained by p0_source_only_contract.h before it crosses
    * the durable queue. */

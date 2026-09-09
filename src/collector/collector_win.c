@@ -4011,10 +4011,15 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   }
   if (edr_collector_file_event_type(slot->type) ||
       edr_collector_registry_event_type(slot->type)) {
-    /* Counting here would consume transitions twice and precede the actor
-     * query. Retain policy-selected mutations for the one preprocess owner. */
+    /* Admission observation is bounded and cannot emit a detection or action.
+     * The authoritative counter remains preprocess-owned after exact actor
+     * validation; the internal sample crosses only the in-process queue. */
     int file_priority = edr_behavior_file_activity_priority(&br);
     if (file_priority >= 0) {
+      slot->ransom_sample_process_start_key = br.ransom_sample_process_start_key;
+      slot->ransom_content_entropy = br.ransom_content_entropy;
+      slot->ransom_content_sample_bytes = br.ransom_content_sample_bytes;
+      slot->ransom_content_sampled = br.ransom_content_sampled;
       slot->priority = (uint32_t)file_priority;
       slot->p0_critical = file_priority == 0 ? 1u : 0u;
       return 1;

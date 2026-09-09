@@ -7,8 +7,10 @@
 #include <stdint.h>
 
 void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r);
-/* Read-only admission: -1 unrelated/disabled, 0 exact canary, 1 mass-write input. */
-int edr_behavior_file_activity_priority(const EdrBehaviorRecord *r);
+/* Bounded pre-queue observation: -1 unrelated/disabled, 0 protected canary or
+ * active mass-write burst, 1 ordinary mass-write input. May attach an internal
+ * content snapshot to r; it never emits a detection or response action. */
+int edr_behavior_file_activity_priority(EdrBehaviorRecord *r);
 /* Preprocess-thread only, after actor binding. Parsing a slot has no counters/actions. */
 void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r);
 

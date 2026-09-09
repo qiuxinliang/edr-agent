@@ -52,6 +52,21 @@ static void eval_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r, EdrDetecti
   assert(!d->drop);
 }
 
+static int prepare_file_slot_for_admission(EdrEventSlot *slot) {
+  EdrBehaviorRecord record;
+  edr_behavior_from_slot(slot, &record);
+  int priority = edr_behavior_file_activity_priority(&record);
+  if (priority >= 0) {
+    slot->priority = (uint8_t)priority;
+    slot->p0_critical = priority == 0 ? 1u : 0u;
+    slot->ransom_sample_process_start_key = record.ransom_sample_process_start_key;
+    slot->ransom_content_entropy = record.ransom_content_entropy;
+    slot->ransom_content_sample_bytes = record.ransom_content_sample_bytes;
+    slot->ransom_content_sampled = record.ransom_content_sampled;
+  }
+  return priority;
+}
+
 static void write_high_entropy_fixture(const char *path) {
   FILE *f = fopen(path, "wb");
   assert(f != NULL);
@@ -370,6 +385,87 @@ static void test_ransom_content_change_contract(void) {
 #else
   assert(rmdir(dir) == 0);
 #endif
+}
+
+static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
+  enum { FILE_COUNT = 220, MAX_QUEUED = FILE_COUNT * 2 };
+  char dir[512];
+  EdrEventSlot *queued = (EdrEventSlot *)calloc(MAX_QUEUED, sizeof(*queued));
+  assert(queued != NULL);
+#ifdef _WIN32
+  char temp_path[MAX_PATH];
+  assert(GetTempPathA(sizeof(temp_path), temp_path) > 0);
+  assert(GetTempFileNameA(temp_path, "edr", 0, dir) != 0);
+  assert(DeleteFileA(dir));
+  assert(CreateDirectoryA(dir, NULL));
+#else
+  const char *tmp = getenv("TMPDIR");
+  snprintf(dir, sizeof(dir), "%s/edr-ransom-delayed.XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  assert(mkdtemp(dir) != NULL);
+#endif
+
+  size_t queued_count = 0u;
+  unsigned before = ransom_response_calls;
+  for (int i = 0; i < FILE_COUNT; ++i) {
+    char path[768], payload[1200];
+    FILE *file;
+    EdrEventSlot slot;
+    snprintf(path, sizeof(path), "%s/bulk%03d.bin", dir, i);
+    file = fopen(path, "wb");
+    assert(file != NULL);
+    for (int n = 0; n < 8192; ++n) assert(fputc('a', file) != EOF);
+    assert(fclose(file) == 0);
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59910\nprocess_start_key=9910\n"
+             "img=C:\\Tools\\bulk-writer.exe\nfile=%s\n", path);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns += (uint64_t)i * 10000000ULL;
+    int priority = prepare_file_slot_for_admission(&slot);
+    assert(priority == (i < 19 ? 1 : 0));
+    /* Model a saturated ordinary partition: only burst-promoted records reach
+     * preprocess, and none are consumed until the later overwrite finishes. */
+    if (priority == 0) queued[queued_count++] = slot;
+  }
+  for (int i = 0; i < FILE_COUNT; ++i) {
+    char path[768], payload[1200];
+    EdrEventSlot slot;
+    snprintf(path, sizeof(path), "%s/bulk%03d.bin", dir, i);
+    write_high_entropy_fixture(path);
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=kfile\npid=59910\nprocess_start_key=9910\n"
+             "img=C:\\Tools\\bulk-writer.exe\nfile=%s\n", path);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+    slot.timestamp_ns += 3000000000ULL + (uint64_t)i * 10000000ULL;
+    assert(prepare_file_slot_for_admission(&slot) == 0);
+    queued[queued_count++] = slot;
+  }
+  assert(queued_count == (size_t)(FILE_COUNT - 19 + FILE_COUNT));
+
+  int confirmations = 0;
+  for (size_t i = 0; i < queued_count; ++i) {
+    EdrBehaviorRecord record;
+    EdrDetectionDecision decision;
+    eval_slot(&queued[i], &record, &decision);
+    if (strstr(record.detection_context, "\"kind\":\"ENCRYPTION_CONFIRMED\"")) {
+      assert(strstr(record.detection_context, "\"confirmation_basis\":\"content_change\""));
+      assert(strstr(record.script_snippet, "content_sample_source=collector_admission"));
+      confirmations++;
+    }
+  }
+  assert(confirmations > 0);
+  assert(ransom_response_calls == before + 1u);
+
+  for (int i = 0; i < FILE_COUNT; ++i) {
+    char path[768];
+    snprintf(path, sizeof(path), "%s/bulk%03d.bin", dir, i);
+    assert(remove(path) == 0);
+  }
+#ifdef _WIN32
+  assert(RemoveDirectoryA(dir));
+#else
+  assert(rmdir(dir) == 0);
+#endif
+  free(queued);
 }
 
 static void test_ransom_tracking_capacity_is_explicit(void) {
@@ -1177,6 +1273,7 @@ int main(void) {
   test_ransom_repeated_file_and_non_mutations();
   test_ransom_generation_and_file_key_dedup();
   test_ransom_content_change_contract();
+  test_ransom_delayed_queue_preserves_burst_and_content_change();
   test_ransom_tracking_capacity_is_explicit();
   test_ransom_alert_volume_is_bounded();
   test_invalid_file_path_does_not_raise_ransom_counter();

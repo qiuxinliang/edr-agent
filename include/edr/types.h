@@ -74,12 +74,19 @@ typedef struct {
   uint8_t data[EDR_MAX_EVENT_PAYLOAD];
   uint32_t size;
   uint64_t timestamp_ns;
+  /* Collector-owned, in-memory snapshot captured before queueing a file
+   * mutation. It is accepted only after preprocess proves the same immutable
+   * ProcessStartKey generation; it is never parsed from producer payload. */
+  uint64_t ransom_sample_process_start_key;
+  float ransom_content_entropy;
+  uint32_t ransom_content_sample_bytes;
   EdrEventType type;
   uint8_t priority;
   /* Explicit admission class for the in-process event bus.  This is not a
    * wire priority: ordinary producers may never consume the bus capacity
    * reserved for a P0-capable record. */
   uint8_t p0_critical;
+  uint8_t ransom_content_sampled;
   /** §19.10：来自 Microsoft-Windows-TCPIP / WFAS 的 ETW，供攻击面增量刷新去抖联动 */
   uint8_t attack_surface_hint;
   bool consumed;

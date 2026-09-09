@@ -24,6 +24,9 @@ static atomic_uint_fast64_t g_event_boot_nonce = ATOMIC_VAR_INIT(0);
 #define RANSOM_COUNTER_EXTS 24u
 #define RANSOM_COUNTER_DIRS 16u
 #define RANSOM_COUNTER_FILES 2048u
+#define RANSOM_ADMISSION_BUCKETS 128u
+#define RANSOM_ADMISSION_FILES 256u
+#define RANSOM_ADMISSION_SAMPLE_FILES 64u
 #define RANSOM_NOTE_BUCKETS 128u
 #define RANSOM_NOTE_FILES 16u
 
@@ -60,6 +63,25 @@ typedef struct {
 } RansomCounterBucket;
 
 typedef struct {
+  uint64_t identity;
+  int64_t last_sample_ns;
+  uint8_t sample_count;
+  uint8_t sample_inflight;
+  uint8_t sample_eligible;
+} RansomAdmissionFile;
+
+typedef struct {
+  uint32_t pid;
+  uint64_t process_start_key;
+  int64_t window_start_ns;
+  uint32_t file_events;
+  uint32_t unique_files;
+  uint16_t sample_files;
+  uint8_t promoted;
+  RansomAdmissionFile files[RANSOM_ADMISSION_FILES];
+} RansomAdmissionBucket;
+
+typedef struct {
   uint32_t pid;
   int64_t window_start_ns;
   uint32_t note_count;
@@ -67,7 +89,9 @@ typedef struct {
 } RansomNoteBucket;
 
 static RansomCounterBucket g_ransom_buckets[RANSOM_COUNTER_BUCKETS];
+static RansomAdmissionBucket g_ransom_admission_buckets[RANSOM_ADMISSION_BUCKETS];
 static RansomNoteBucket g_ransom_note_buckets[RANSOM_NOTE_BUCKETS];
+static atomic_flag g_ransom_admission_lock = ATOMIC_FLAG_INIT;
 
 static int detail_token_value(const char *text, const char *key, char *out, size_t cap);
 
@@ -588,6 +612,70 @@ static uint64_t ransom_path_identity(const char *path) {
   return hash ? hash : 1u;
 }
 
+static void ransom_admission_lock(void) {
+  while (atomic_flag_test_and_set_explicit(&g_ransom_admission_lock, memory_order_acquire)) {
+  }
+}
+
+static void ransom_admission_unlock(void) {
+  atomic_flag_clear_explicit(&g_ransom_admission_lock, memory_order_release);
+}
+
+static RansomAdmissionBucket *ransom_admission_bucket_for(const EdrBehaviorRecord *r,
+                                                          int64_t now_ns,
+                                                          int64_t window_ns) {
+  RansomAdmissionBucket *empty = NULL;
+  RansomAdmissionBucket *oldest = &g_ransom_admission_buckets[0];
+  for (size_t i = 0; i < RANSOM_ADMISSION_BUCKETS; ++i) {
+    RansomAdmissionBucket *b = &g_ransom_admission_buckets[i];
+    if (b->pid == r->pid && b->process_start_key == r->process_start_key) {
+      if (b->window_start_ns <= 0 || now_ns < b->window_start_ns ||
+          now_ns - b->window_start_ns > window_ns) {
+        memset(b, 0, sizeof(*b));
+        b->pid = r->pid;
+        b->process_start_key = r->process_start_key;
+        b->window_start_ns = now_ns;
+      }
+      return b;
+    }
+    if (b->pid == 0u && !empty) empty = b;
+    if (b->window_start_ns < oldest->window_start_ns) oldest = b;
+  }
+  RansomAdmissionBucket *b = empty ? empty : oldest;
+  memset(b, 0, sizeof(*b));
+  b->pid = r->pid;
+  b->process_start_key = r->process_start_key;
+  b->window_start_ns = now_ns;
+  return b;
+}
+
+static RansomAdmissionFile *ransom_admission_file_for(RansomAdmissionBucket *b,
+                                                      uint64_t identity,
+                                                      int *added) {
+  if (added) *added = 0;
+  for (size_t i = 0; i < RANSOM_ADMISSION_FILES; ++i) {
+    RansomAdmissionFile *f = &b->files[(identity + i) % RANSOM_ADMISSION_FILES];
+    if (f->identity == identity) return f;
+    if (!f->identity) {
+      f->identity = identity;
+      if (added) *added = 1;
+      return f;
+    }
+  }
+  return NULL;
+}
+
+static RansomAdmissionFile *ransom_admission_file_find(RansomAdmissionBucket *b,
+                                                       uint64_t identity) {
+  if (!b || !identity) return NULL;
+  for (size_t i = 0; i < RANSOM_ADMISSION_FILES; ++i) {
+    RansomAdmissionFile *f = &b->files[(identity + i) % RANSOM_ADMISSION_FILES];
+    if (f->identity == identity) return f;
+    if (!f->identity) return NULL;
+  }
+  return NULL;
+}
+
 static RansomFileObservation *ransom_file_observation(RansomCounterBucket *b, const EdrBehaviorRecord *r) {
   /* Create has no FileKey and the kernel can reuse a key after close. Only
    * an attributed Rename with a source path may join two path observations. */
@@ -819,7 +907,7 @@ static void append_record_kv(EdrBehaviorRecord *r, const char *fmt, ...) {
   va_end(ap);
 }
 
-int edr_behavior_file_activity_priority(const EdrBehaviorRecord *r) {
+int edr_behavior_file_activity_priority(EdrBehaviorRecord *r) {
   if (!r || !file_path_usable_for_ransom(r->file_path)) return -1;
   int mutation = r->type == EDR_EVENT_FILE_WRITE || r->type == EDR_EVENT_FILE_RENAME;
   if ((mutation || r->type == EDR_EVENT_FILE_DELETE) &&
@@ -828,8 +916,80 @@ int edr_behavior_file_activity_priority(const EdrBehaviorRecord *r) {
        (r->type == EDR_EVENT_FILE_RENAME && is_ransom_canary_path(r->file_old_path)))) {
     return 0;
   }
-  return (mutation || r->type == EDR_EVENT_FILE_CREATE) &&
-                 edr_policy_v2_ransomware_enabled("mass_write") ? 1 : -1;
+  if (!(mutation || r->type == EDR_EVENT_FILE_CREATE) ||
+      !edr_policy_v2_ransomware_enabled("mass_write")) {
+    return -1;
+  }
+  /* The real counter remains preprocess-owned. This small admission tracker
+   * only protects a generation-bound candidate burst from the ordinary queue
+   * reservation and captures bounded event-adjacent content snapshots. */
+  if (!mutation || !r->pid || !r->process_start_key ||
+      known_low_value_ransom_counter_process(r) || ransom_counter_allowlisted(r)) {
+    return 1;
+  }
+  const char *window_value = getenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  long window_s = window_value && window_value[0] ? strtol(window_value, NULL, 10) : 60L;
+  if (window_s <= 0L) window_s = 60L;
+  if (window_s > 600L) window_s = 600L;
+  int64_t now_ns = r->event_time_ns > 0 ? r->event_time_ns : 1;
+  int64_t window_ns = (int64_t)window_s * 1000000000LL;
+  uint64_t path_identity = ransom_path_identity(r->file_path);
+  int should_sample = 0;
+  int promoted = 0;
+
+  ransom_admission_lock();
+  RansomAdmissionBucket *b = ransom_admission_bucket_for(r, now_ns, window_ns);
+  int added = 0;
+  RansomAdmissionFile *file = ransom_admission_file_for(b, path_identity, &added);
+  if (b->file_events < UINT32_MAX) b->file_events++;
+  if (added) {
+    if (b->unique_files < UINT32_MAX) b->unique_files++;
+    if (file && b->sample_files < RANSOM_ADMISSION_SAMPLE_FILES) {
+      file->sample_eligible = 1u;
+      b->sample_files++;
+    }
+  }
+  if (file && file->sample_eligible && !file->sample_inflight && file->sample_count < 4u &&
+      (file->last_sample_ns <= 0 || now_ns < file->last_sample_ns ||
+       now_ns - file->last_sample_ns >= 1000000000LL)) {
+    file->sample_inflight = 1u;
+    file->last_sample_ns = now_ns;
+    should_sample = 1;
+  }
+  double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
+  if (elapsed_s < 1.0) elapsed_s = 1.0;
+  if (!b->promoted && b->unique_files >= 20u &&
+      ((double)b->unique_files * 60.0) / elapsed_s >= 120.0) {
+    b->promoted = 1u;
+  }
+  promoted = b->promoted != 0u;
+  ransom_admission_unlock();
+
+  if (should_sample) {
+    double entropy = 0.0;
+    size_t sample_bytes = 0u;
+    int sampled = file_content_entropy_sample(r->file_path, &entropy, &sample_bytes) &&
+                  sample_bytes >= 512u;
+    ransom_admission_lock();
+    b = ransom_admission_bucket_for(r, now_ns, window_ns);
+    file = ransom_admission_file_find(b, path_identity);
+    if (file) {
+      file->sample_inflight = 0u;
+      if (sampled) {
+        if (file->sample_count < UINT8_MAX) file->sample_count++;
+      } else {
+        file->last_sample_ns = 0;
+      }
+    }
+    ransom_admission_unlock();
+    if (sampled) {
+      r->ransom_content_sampled = 1u;
+      r->ransom_content_entropy = (float)entropy;
+      r->ransom_content_sample_bytes = (uint32_t)sample_bytes;
+      r->ransom_sample_process_start_key = r->process_start_key;
+    }
+  }
+  return promoted ? 0 : 1;
 }
 
 void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
@@ -914,11 +1074,23 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
       (void)dir_seen_or_add(b, dir);
     }
   }
+  int admission_content_ok = r->ransom_content_sampled &&
+      r->ransom_content_sample_bytes >= 512u && r->file_actor_generation_validated &&
+      r->ransom_sample_process_start_key != 0u &&
+      r->ransom_sample_process_start_key == r->process_start_key;
   int content_deferred = !file || r->type == EDR_EVENT_FILE_DELETE ||
       (!mutation && file->sampled) ||
-      !should_sample_ransom_content_entropy(b, ext_changed, canary) ||
-      (file->last_sample_ns > 0 && now_ns - file->last_sample_ns < 1000000000LL && !ext_changed);
-  int content_ok = content_deferred ? 0 : file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+      (!admission_content_ok && !should_sample_ransom_content_entropy(b, ext_changed, canary)) ||
+      (!admission_content_ok && file->last_sample_ns > 0 &&
+       now_ns - file->last_sample_ns < 1000000000LL && !ext_changed);
+  int content_ok = 0;
+  if (!content_deferred && admission_content_ok) {
+    content_entropy = r->ransom_content_entropy;
+    content_sample = r->ransom_content_sample_bytes;
+    content_ok = 1;
+  } else if (!content_deferred) {
+    content_ok = file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+  }
   double entropy_delta = 0.0;
   int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
   /* Create may arrive while overwrite has truncated the file to zero bytes.
@@ -999,6 +1171,9 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
                      periodic_summary ? " ransom_counter_summary=1" : "",
                      confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
                      " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3");
+    if (admission_content_ok) {
+      append_record_kv(r, "content_sample_source=collector_admission");
+    }
     if (canary) {
       append_record_kv(r, "canary_counter_bypass=1");
     }
@@ -1904,6 +2079,10 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   r->event_time_ns = (int64_t)slot->timestamp_ns;
   r->type = slot->type;
   r->priority = slot->priority;
+  r->ransom_sample_process_start_key = slot->ransom_sample_process_start_key;
+  r->ransom_content_entropy = slot->ransom_content_entropy;
+  r->ransom_content_sample_bytes = slot->ransom_content_sample_bytes;
+  r->ransom_content_sampled = slot->ransom_content_sampled;
   edr_gen_event_id(r->event_id, sizeof(r->event_id), r->event_time_ns);
 
   Etw1Fields ef;
