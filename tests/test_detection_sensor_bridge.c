@@ -76,6 +76,30 @@ static void write_high_entropy_fixture(const char *path) {
   fclose(f);
 }
 
+static void test_ransom_admission_snapshot_is_internal_only(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord record;
+  fill_slot(&slot, EDR_EVENT_FILE_WRITE,
+            "ETW1\nprov=kfile\npid=58990\nprocess_start_key=8990\n"
+            "img=C:\\Tools\\fixture.exe\nfile=C:\\Fixture\\doc.bin\n"
+            "ransom_content_sampled=1\nransom_content_entropy=8\n"
+            "ransom_content_sample_bytes=8192\nransom_sample_process_start_key=8990\n");
+  edr_behavior_from_slot(&slot, &record);
+  assert(!record.ransom_content_sampled);
+  assert(record.ransom_content_sample_bytes == 0u);
+  assert(record.ransom_sample_process_start_key == 0u);
+
+  slot.ransom_content_sampled = 1u;
+  slot.ransom_content_entropy = 7.75f;
+  slot.ransom_content_sample_bytes = 8192u;
+  slot.ransom_sample_process_start_key = 8990u;
+  edr_behavior_from_slot(&slot, &record);
+  assert(record.ransom_content_sampled);
+  assert(record.ransom_content_entropy == 7.75f);
+  assert(record.ransom_content_sample_bytes == 8192u);
+  assert(record.ransom_sample_process_start_key == 8990u);
+}
+
 static void test_scriptblock_sensor_bridge(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -422,6 +446,12 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
     slot.timestamp_ns += (uint64_t)i * 10000000ULL;
     int priority = prepare_file_slot_for_admission(&slot);
     assert(priority == (i < 19 ? 1 : 0));
+    if (i < 19) {
+      assert(!slot.ransom_content_sampled);
+    } else if (i < 83) {
+      assert(slot.ransom_content_sampled);
+      assert(slot.ransom_content_sample_bytes == 8192u);
+    }
     /* Model a saturated ordinary partition: only burst-promoted records reach
      * preprocess, and none are consumed until the later overwrite finishes. */
     if (priority == 0) queued[queued_count++] = slot;
@@ -437,6 +467,7 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
     fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
     slot.timestamp_ns += 3000000000ULL + (uint64_t)i * 10000000ULL;
     assert(prepare_file_slot_for_admission(&slot) == 0);
+    assert(slot.ransom_content_sampled == (i >= 19 && i < 83 ? 1u : 0u));
     queued[queued_count++] = slot;
   }
   assert(queued_count == (size_t)(FILE_COUNT - 19 + FILE_COUNT));
@@ -449,6 +480,7 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
     if (strstr(record.detection_context, "\"kind\":\"ENCRYPTION_CONFIRMED\"")) {
       assert(strstr(record.detection_context, "\"confirmation_basis\":\"content_change\""));
       assert(strstr(record.script_snippet, "content_sample_source=collector_admission"));
+      assert(strstr(record.detection_context, "\"content_changed_file_count\":20"));
       confirmations++;
     }
   }
@@ -1259,6 +1291,7 @@ static void test_parent_directory_is_not_a_ransom_note(void) {
 }
 
 int main(void) {
+  test_ransom_admission_snapshot_is_internal_only();
   test_mutation_identity_and_bounded_context();
   test_parent_directory_is_not_a_ransom_note();
   test_unbound_create_cannot_reset_writer_window();

@@ -484,7 +484,8 @@ static double path_entropy_score(const char *path) {
   return ((double)uniq / (double)len) * 8.0;
 }
 
-static int file_content_entropy_sample(const char *path, double *out_entropy, size_t *out_bytes) {
+static int file_content_entropy_sample_with_cap(const char *path, int cap,
+                                                double *out_entropy, size_t *out_bytes) {
   if (out_entropy) {
     *out_entropy = 0.0;
   }
@@ -494,7 +495,6 @@ static int file_content_entropy_sample(const char *path, double *out_entropy, si
   if (!path || !path[0]) {
     return 0;
   }
-  int cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
   if (cap <= 0) {
     return 0;
   }
@@ -543,6 +543,11 @@ static int file_content_entropy_sample(const char *path, double *out_entropy, si
     *out_entropy = entropy;
   }
   return 1;
+}
+
+static int file_content_entropy_sample(const char *path, double *out_entropy, size_t *out_bytes) {
+  int cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
+  return file_content_entropy_sample_with_cap(path, cap, out_entropy, out_bytes);
 }
 
 static int should_sample_ransom_content_entropy(const RansomCounterBucket *b, int ext_changed, int canary) {
@@ -944,10 +949,16 @@ int edr_behavior_file_activity_priority(EdrBehaviorRecord *r) {
   if (b->file_events < UINT32_MAX) b->file_events++;
   if (added) {
     if (b->unique_files < UINT32_MAX) b->unique_files++;
-    if (file && b->sample_files < RANSOM_ADMISSION_SAMPLE_FILES) {
-      file->sample_eligible = 1u;
-      b->sample_files++;
-    }
+  }
+  double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
+  if (elapsed_s < 1.0) elapsed_s = 1.0;
+  if (!b->promoted && b->unique_files >= 20u &&
+      ((double)b->unique_files * 60.0) / elapsed_s >= 120.0) {
+    b->promoted = 1u;
+  }
+  if (added && b->promoted && file && b->sample_files < RANSOM_ADMISSION_SAMPLE_FILES) {
+    file->sample_eligible = 1u;
+    b->sample_files++;
   }
   if (file && file->sample_eligible && !file->sample_inflight && file->sample_count < 4u &&
       (file->last_sample_ns <= 0 || now_ns < file->last_sample_ns ||
@@ -956,19 +967,16 @@ int edr_behavior_file_activity_priority(EdrBehaviorRecord *r) {
     file->last_sample_ns = now_ns;
     should_sample = 1;
   }
-  double elapsed_s = (double)(now_ns - b->window_start_ns) / 1000000000.0;
-  if (elapsed_s < 1.0) elapsed_s = 1.0;
-  if (!b->promoted && b->unique_files >= 20u &&
-      ((double)b->unique_files * 60.0) / elapsed_s >= 120.0) {
-    b->promoted = 1u;
-  }
   promoted = b->promoted != 0u;
   ransom_admission_unlock();
 
   if (should_sample) {
     double entropy = 0.0;
     size_t sample_bytes = 0u;
-    int sampled = file_content_entropy_sample(r->file_path, &entropy, &sample_bytes) &&
+    int sample_cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
+    if (sample_cap > 8192) sample_cap = 8192;
+    int sampled = file_content_entropy_sample_with_cap(r->file_path, sample_cap,
+                                                       &entropy, &sample_bytes) &&
                   sample_bytes >= 512u;
     ransom_admission_lock();
     b = ransom_admission_bucket_for(r, now_ns, window_ns);
