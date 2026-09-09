@@ -91,6 +91,14 @@ try {
   $status = Show-Status | ConvertFrom-Json
   Assert ($status.restored -and $status.enforcement_verified -and -not $status.isolated) 'restore must be verified and idempotent'
   Reset-TestState
+  Enable-Isolation
+  $script:reachable = $false
+  Remove-Isolation
+  $state = Read-State
+  $status = Show-Status | ConvertFrom-Json
+  Assert ($state.phase -eq 'restored' -and $state.restore_management_reachable -eq $false) 'stale management target must be diagnostic after verified restore'
+  Assert ($status.restored -and $status.enforcement_verified -and -not $status.isolated) 'verified firewall restoration must not depend on the former management target'
+  Reset-TestState
   $script:rules[0].PolicyStoreSourceType = 'GroupPolicy'
   Expect-Failure { Enable-Isolation } 'nonlocal_allow_rule'
   Assert (-not (Test-Path -LiteralPath $StatePath)) 'GPO rejection precedes mutation/journal'

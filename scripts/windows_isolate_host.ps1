@@ -177,8 +177,22 @@ function Restore-Baseline($State) {
   }
   foreach ($r in @(Get-OwnedRules)) { Remove-NetFirewallRule -PolicyStore PersistentStore -Name $r.Name -ErrorAction Stop }
   if (-not (Test-Restored $State)) { throw "restore_verification_failed" }
-  if ($State.PSObject.Properties['management'] -and -not (Test-ManagementReachable $State.management)) { throw "restore_management_unreachable" }
+  # The recovery contract is the verified firewall baseline, not reachability
+  # of the management address captured when isolation began. That address can
+  # legitimately change while the host is isolated. Treat the bounded probe as
+  # diagnostics so a completed restore is never reported as failed merely
+  # because the former control-plane address is no longer listening.
+  $managementReachable = $null
+  if ($State.PSObject.Properties['management']) {
+    try { $managementReachable = [bool](Test-ManagementReachable $State.management) }
+    catch { $managementReachable = $false }
+  }
   $State.phase = 'restored'
+  if ($State.PSObject.Properties['restore_management_reachable']) {
+    $State.restore_management_reachable = $managementReachable
+  } else {
+    $State | Add-Member restore_management_reachable $managementReachable
+  }
   Save-State $State
 }
 
@@ -236,7 +250,8 @@ function Show-Status {
   $state = Read-State
   $isolated = Test-Isolation $state
   $restored = $null -ne $state -and $state.phase -eq 'restored' -and (Test-Restored $state)
-  [ordered]@{ schema='edr.isolation.status.v1'; isolated=[bool]$isolated; restored=[bool]$restored; enforcement_verified=[bool]($isolated -or $restored) } | ConvertTo-Json -Compress
+  $managementReachable = if ($null -ne $state -and $state.PSObject.Properties['restore_management_reachable']) { $state.restore_management_reachable } else { $null }
+  [ordered]@{ schema='edr.isolation.status.v1'; isolated=[bool]$isolated; restored=[bool]$restored; enforcement_verified=[bool]($isolated -or $restored); management_reachable=$managementReachable } | ConvertTo-Json -Compress
 }
 
 $mutex = New-Object Threading.Mutex($false, 'Global\FDSecurity.Isolation')
