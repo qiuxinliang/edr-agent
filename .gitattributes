@@ -1,0 +1,6 @@
+# P0 publication identity is the SHA-256 of exact plaintext bytes.  Keep the
+# authority documents byte-identical when Git checks them out on Windows.
+config/p0_rule_bundle_ir_v1.json text eol=lf
+config/p0_rule_bundle_manifest.json text eol=lf
+config/sensor_interest_manifest.json text eol=lf
+config/p0_rule_bundle_ir_v1.json.enc -text

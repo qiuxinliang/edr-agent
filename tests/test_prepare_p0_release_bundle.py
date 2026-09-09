@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +71,41 @@ class PublishStagedFilesTest(unittest.TestCase):
 
             self.assertEqual(first_final.read_text(encoding="utf-8"), "old-first")
             self.assertEqual(second_final.read_text(encoding="utf-8"), "old-second")
+
+
+class VerifyBundleTest(unittest.TestCase):
+    def write_bundle(self, root: Path, *, crlf: bool = False, declared_sha: str | None = None) -> tuple[Path, Path, Path]:
+        version = "bundle-v1"
+        plain = root / "p0_rule_bundle_ir_v1.json"
+        manifest = root / "p0_rule_bundle_manifest.json"
+        sensor = root / "sensor_interest_manifest.json"
+        plain_bytes = (json.dumps({"rules_bundle_version": version, "rule_count": 1}, indent=2) + "\n").encode()
+        if crlf:
+            plain_bytes = plain_bytes.replace(b"\n", b"\r\n")
+        plain.write_bytes(plain_bytes)
+        manifest.write_bytes((json.dumps({"rules_bundle_version": version, "rule_count": 1}) + "\n").encode())
+        sensor.write_bytes((json.dumps({
+            "rules_bundle_version": version,
+            "p0_artifact_rule_count": 1,
+            "p0_artifact_sha256": declared_sha or hashlib.sha256(plain_bytes).hexdigest(),
+        }) + "\n").encode())
+        return plain, manifest, sensor
+
+    def test_accepts_exact_lf_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(prepare.verify_bundle(*self.write_bundle(Path(directory))), "bundle-v1")
+
+    def test_rejects_windows_crlf_before_encryption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "must use LF line endings"):
+                prepare.verify_bundle(*self.write_bundle(Path(directory), crlf=True))
+
+    def test_rejects_sensor_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "does not match SensorInterest authority"):
+                prepare.verify_bundle(
+                    *self.write_bundle(Path(directory), declared_sha="0" * 64)
+                )
 
 
 if __name__ == "__main__":

@@ -79,12 +79,44 @@ def verify_bundle(plain: pathlib.Path, manifest: pathlib.Path, sensor: pathlib.P
                 f"{required} (checkout edr-backend too, or regenerate and commit edr-agent/config artifacts)"
             )
 
-    ir_version = json_field(plain, "rules_bundle_version")
-    manifest_version = json_field(manifest, "rules_bundle_version")
-    if not ir_version or not manifest_version or ir_version != manifest_version:
+    plain_bytes = plain.read_bytes()
+    if b"\r" in plain_bytes:
+        raise RuntimeError(
+            "P0 plaintext bundle must use LF line endings; CRLF changes its immutable SHA-256 "
+            "(check .gitattributes and regenerate the release bundle)"
+        )
+    try:
+        ir_doc = json.loads(plain_bytes)
+        manifest_doc = json.loads(manifest.read_bytes())
+        sensor_doc = json.loads(sensor.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid P0 release artifact JSON: {exc}") from exc
+    if not all(isinstance(doc, dict) for doc in (ir_doc, manifest_doc, sensor_doc)):
+        raise RuntimeError("P0 release artifacts must be JSON objects")
+
+    ir_version = str(ir_doc.get("rules_bundle_version", "")).strip()
+    manifest_version = str(manifest_doc.get("rules_bundle_version", "")).strip()
+    sensor_version = str(sensor_doc.get("rules_bundle_version", "")).strip()
+    if not ir_version or ir_version != manifest_version or ir_version != sensor_version:
         raise RuntimeError(
             "P0 bundle version mismatch: "
-            f"{plain.name}={ir_version} {manifest.name}={manifest_version}"
+            f"{plain.name}={ir_version} {manifest.name}={manifest_version} "
+            f"{sensor.name}={sensor_version}"
+        )
+    plain_sha = hashlib.sha256(plain_bytes).hexdigest()
+    declared_sha = str(sensor_doc.get("p0_artifact_sha256", "")).strip().lower()
+    if declared_sha != plain_sha:
+        raise RuntimeError(
+            "P0 plaintext SHA-256 does not match SensorInterest authority: "
+            f"plaintext={plain_sha} declared={declared_sha or '<missing>'}"
+        )
+    ir_count = ir_doc.get("rule_count")
+    manifest_count = manifest_doc.get("rule_count")
+    sensor_count = sensor_doc.get("p0_artifact_rule_count")
+    if not isinstance(ir_count, int) or ir_count <= 0 or ir_count != manifest_count or ir_count != sensor_count:
+        raise RuntimeError(
+            "P0 rule count mismatch: "
+            f"ir={ir_count!r} manifest={manifest_count!r} sensor={sensor_count!r}"
         )
     return ir_version
 
