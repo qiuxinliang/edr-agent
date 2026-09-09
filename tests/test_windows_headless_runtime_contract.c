@@ -267,6 +267,23 @@ int main(void) {
                          "headless enrollment must validate the extended MSVC runtime outside native ARM64");
   ok &= require_contains(installer_ps, "msvcp140.dll",
                          "headless enrollment must validate the C++ runtime dependency");
+  ok &= require_contains(installer_ps,
+                         "$certutil.Source -csp $provider -delkey",
+                         "failed enrollment must remove its provisional CNG machine key with supported certutil syntax");
+  ok &= require_absent(installer_ps,
+                       "$certutil.Source -f -csp $provider -delkey",
+                       "CNG rollback must not pass unsupported force mode to certutil delkey");
+  ok &= require_contains(installer_ps,
+                         "[System.Security.Cryptography.CngKey]::Create",
+                         "headless enrollment must support native non-exportable CNG key creation without certreq");
+  ok &= require_contains(installer_ps,
+                         "$request.CreateSigningRequest()",
+                         "headless enrollment must support native PKCS#10 generation without CertEnroll");
+  ok &= require_contains(installer_ps,
+                         "[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::CopyWithPrivateKey",
+                         "headless enrollment must bind the issued certificate to its native CNG key without certreq");
+  ok &= require_count(installer_ps, "-TimeoutSeconds 30", 2,
+                      "certreq CSR creation and certificate acceptance must both have bounded waits");
   free(installer_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

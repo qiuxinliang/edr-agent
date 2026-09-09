@@ -750,17 +750,30 @@ function Join-ProcessArguments {
 }
 
 function Invoke-CapturedProcess {
-  param([string]$Exe, [string[]]$ArgList)
+  param([string]$Exe, [string[]]$ArgList, [int]$TimeoutSeconds = 0)
   if (-not $Exe) {
     throw "missing executable"
+  }
+  if ($TimeoutSeconds -lt 0) {
+    throw "process timeout must be non-negative"
   }
   $tmpBase = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("fdproc-" + [guid]::NewGuid().ToString("N")))
   $stdoutPath = $tmpBase + ".out"
   $stderrPath = $tmpBase + ".err"
   try {
     $p = Start-Process -FilePath $Exe -ArgumentList (Join-ProcessArguments $ArgList) `
-      -NoNewWindow -Wait -PassThru `
+      -NoNewWindow -PassThru `
       -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    if ($TimeoutSeconds -gt 0) {
+      $finished = $p.WaitForExit($TimeoutSeconds * 1000)
+      if (-not $finished) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        $p.WaitForExit()
+        throw ("process timed out after {0}s: {1}" -f $TimeoutSeconds, $Exe)
+      }
+    } else {
+      $p.WaitForExit()
+    }
     $stdout = if (Test-Path -LiteralPath $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
     $stderr = if (Test-Path -LiteralPath $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
     return [pscustomobject]@{
@@ -774,8 +787,8 @@ function Invoke-CapturedProcess {
 }
 
 function Invoke-Checked {
-  param([string]$Exe, [string[]]$ArgList)
-  $result = Invoke-CapturedProcess -Exe $Exe -ArgList $ArgList
+  param([string]$Exe, [string[]]$ArgList, [int]$TimeoutSeconds = 0)
+  $result = Invoke-CapturedProcess -Exe $Exe -ArgList $ArgList -TimeoutSeconds $TimeoutSeconds
   $combined = @()
   if ($result.Stdout) { $combined += ($result.Stdout -split "`r?`n") }
   if ($result.Stderr) { $combined += ($result.Stderr -split "`r?`n") }
@@ -1152,10 +1165,6 @@ function Try-Ensure-NativePemAgentCSR {
 
 function Ensure-CngAgentCSR {
   param([string]$CsrPath, [string]$SubjectCN, [string]$ProviderName, [string]$KeyName)
-  $certreq = Get-Command "certreq.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $certreq) {
-    Write-Error "certreq.exe is required for Windows CNG/TPM non-exportable key CSR"
-  }
   $csrDir = Split-Path -Parent $CsrPath
   if ($csrDir -and -not (Test-Path $csrDir)) {
     New-Item -ItemType Directory -Path $csrDir -Force | Out-Null
@@ -1174,6 +1183,71 @@ function Ensure-CngAgentCSR {
   $infPath = [System.IO.Path]::ChangeExtension($CsrPath, ".inf")
   foreach ($stalePath in @($CsrPath, $infPath)) {
     Remove-StaleEnrollmentArtifact -Path $stalePath
+  }
+  $nativeKey = $null
+  $nativeRsa = $null
+  $nativeKeyCreated = $false
+  try {
+    $cngProvider = New-Object System.Security.Cryptography.CngProvider($ProviderName)
+    if ($KeyName) {
+      $nativeKey = [System.Security.Cryptography.CngKey]::Open(
+        $safeKeyName,
+        $cngProvider,
+        [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+      )
+    } else {
+      $creation = New-Object System.Security.Cryptography.CngKeyCreationParameters
+      $creation.Provider = $cngProvider
+      $creation.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+      $creation.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::Signing
+      $creation.Parameters.Add((New-Object System.Security.Cryptography.CngProperty(
+        "Length",
+        [BitConverter]::GetBytes(3072),
+        [System.Security.Cryptography.CngPropertyOptions]::None
+      )))
+      $nativeKey = [System.Security.Cryptography.CngKey]::Create(
+        [System.Security.Cryptography.CngAlgorithm]::Rsa,
+        $safeKeyName,
+        $creation
+      )
+      $nativeKeyCreated = $true
+    }
+    $nativeRsa = New-Object System.Security.Cryptography.RSACng($nativeKey)
+    $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName("CN=$safeCN")
+    $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+      $dn,
+      $nativeRsa,
+      [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+      [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+    )
+    $oids = New-Object System.Security.Cryptography.OidCollection
+    [void]$oids.Add((New-Object System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.2")))
+    $request.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension($oids, $false)))
+    $csrDer = $request.CreateSigningRequest()
+    [System.IO.File]::WriteAllText(
+      ([System.IO.Path]::GetFullPath($CsrPath)),
+      (ConvertTo-Pem "CERTIFICATE REQUEST" $csrDer)
+    )
+    return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
+  } catch {
+    $nativeError = $_.Exception.Message
+    if ($nativeKeyCreated -and $nativeKey) {
+      try {
+        $nativeKey.Delete()
+      } catch {
+        throw ("Native CNG CSR generation failed and provisional key cleanup failed: " + $_.Exception.Message)
+      }
+      $script:EDR_CNG_KEY_CREATED_BY_INSTALL = $false
+    }
+    Write-Warning ("Native CNG CSR generation unavailable; trying bounded certreq compatibility path: " + $nativeError)
+  } finally {
+    if ($nativeRsa) { $nativeRsa.Dispose() }
+    if ($nativeKey) { $nativeKey.Dispose() }
+  }
+
+  $certreq = Get-Command "certreq.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $certreq) {
+    Write-Error "Native CNG CSR generation failed and certreq.exe is unavailable"
   }
   $inf = @"
 [Version]
@@ -1196,7 +1270,7 @@ Silent = TRUE
 OID=1.3.6.1.5.5.7.3.2
 "@
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($infPath)), $inf)
-  Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-machine", $infPath, $CsrPath)
+  Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-machine", $infPath, $CsrPath) -TimeoutSeconds 30
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
 
@@ -1313,7 +1387,10 @@ function Remove-ProvisionalEnrollmentMaterial {
       try {
         $certutil = Get-Command "certutil.exe" -ErrorAction Stop | Select-Object -First 1
         $provider = if ($script:EDR_CNG_PROVIDER_USED) { [string]$script:EDR_CNG_PROVIDER_USED } else { "Microsoft Software Key Storage Provider" }
-        $output = & $certutil.Source -f -csp $provider -delkey ([string]$script:EDR_CNG_KEY_CONTAINER) 2>&1
+        # Windows 11 certutil rejects -f for the -delkey verb. Keep the KSP
+        # selection explicit, but use the verb's supported argument contract so
+        # failed enrollment cannot accumulate orphaned machine keys.
+        $output = & $certutil.Source -csp $provider -delkey ([string]$script:EDR_CNG_KEY_CONTAINER) 2>&1
         if ($LASTEXITCODE -eq 0) {
           $keyRemoved = $true
         } else {
@@ -1858,12 +1935,55 @@ function Get-PemCertificateThumbprint([string]$PemText) {
 
 function Accept-CngIssuedCertificate([string]$CertPath, [string]$Provider) {
   if ($Provider -ne "cng" -and $Provider -ne "tpm") { return }
+  $nativeKey = $null
+  $nativeRsa = $null
+  $issuedCert = $null
+  $certWithKey = $null
+  $store = $null
+  try {
+    if (-not $script:EDR_CNG_KEY_CONTAINER) {
+      throw "CNG key container is unavailable"
+    }
+    $pem = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CertPath)))
+    $match = [regex]::Match($pem, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')
+    if (-not $match.Success) {
+      throw "issued client certificate is not valid PEM"
+    }
+    $certBytes = [Convert]::FromBase64String(($match.Groups['b64'].Value -replace '\s+', ''))
+    $issuedCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$certBytes)
+    $providerName = if ($script:EDR_CNG_PROVIDER_USED) {
+      [string]$script:EDR_CNG_PROVIDER_USED
+    } elseif ($Provider -eq "tpm") {
+      "Microsoft Platform Crypto Provider"
+    } else {
+      "Microsoft Software Key Storage Provider"
+    }
+    $nativeKey = [System.Security.Cryptography.CngKey]::Open(
+      [string]$script:EDR_CNG_KEY_CONTAINER,
+      (New-Object System.Security.Cryptography.CngProvider($providerName)),
+      [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+    )
+    $nativeRsa = New-Object System.Security.Cryptography.RSACng($nativeKey)
+    $certWithKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::CopyWithPrivateKey($issuedCert, $nativeRsa)
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "LocalMachine")
+    $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+    $store.Add($certWithKey)
+    return
+  } catch {
+    Write-Warning ("Native CNG certificate binding unavailable; trying bounded certreq compatibility path: " + $_.Exception.Message)
+  } finally {
+    if ($store) { $store.Close() }
+    if ($certWithKey) { $certWithKey.Dispose() }
+    if ($issuedCert) { $issuedCert.Dispose() }
+    if ($nativeRsa) { $nativeRsa.Dispose() }
+    if ($nativeKey) { $nativeKey.Dispose() }
+  }
+
   $certreq = Get-Command "certreq.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $certreq) {
-    Write-Warning "certreq.exe not found; issued certificate was written but not accepted into LocalMachine\\My"
-    return
+    throw "Native CNG certificate binding failed and certreq.exe is unavailable"
   }
-  Invoke-Checked -Exe $certreq.Source -ArgList @("-accept", "-machine", $CertPath)
+  Invoke-Checked -Exe $certreq.Source -ArgList @("-accept", "-machine", $CertPath) -TimeoutSeconds 30
 }
 
 function Write-InstallDiagnosticReport {

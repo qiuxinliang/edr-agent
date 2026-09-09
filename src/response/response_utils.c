@@ -40,11 +40,25 @@ int response_isolation_status_verified(const char *json, int expect_isolated) {
   cJSON *root = json ? cJSON_ParseWithOpts(json, &end, 1) : NULL;
   if (!cJSON_IsObject(root)) { cJSON_Delete(root); return 0; }
   int count = 0;
+  int has_management_reachable = 0;
   for (const cJSON *p = root->child; p; p = p->next) {
+    if (!p->string) {
+      cJSON_Delete(root); return 0;
+    }
     for (const cJSON *q = p->next; q; q = q->next) {
       if (p->string && q->string && strcmp(p->string, q->string) == 0) {
         cJSON_Delete(root); return 0;
       }
+    }
+    if (strcmp(p->string, "schema") != 0 &&
+        strcmp(p->string, "isolated") != 0 &&
+        strcmp(p->string, "restored") != 0 &&
+        strcmp(p->string, "enforcement_verified") != 0) {
+      if (strcmp(p->string, "management_reachable") != 0 ||
+          (!cJSON_IsBool(p) && !cJSON_IsNull(p))) {
+        cJSON_Delete(root); return 0;
+      }
+      has_management_reachable = 1;
     }
     count++;
   }
@@ -52,7 +66,7 @@ int response_isolation_status_verified(const char *json, int expect_isolated) {
   const cJSON *isolated = cJSON_GetObjectItemCaseSensitive(root, "isolated");
   const cJSON *restored = cJSON_GetObjectItemCaseSensitive(root, "restored");
   const cJSON *verified = cJSON_GetObjectItemCaseSensitive(root, "enforcement_verified");
-  int ok = count == 4 && cJSON_IsString(schema) &&
+  int ok = count == 4 + has_management_reachable && cJSON_IsString(schema) &&
       strcmp(schema->valuestring, "edr.isolation.status.v1") == 0 &&
       cJSON_IsTrue(verified) && cJSON_IsBool(isolated) && cJSON_IsBool(restored) &&
       (expect_isolated ? (cJSON_IsTrue(isolated) && cJSON_IsFalse(restored))
