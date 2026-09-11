@@ -385,6 +385,7 @@ jobs:
           }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
+            "install\windows-inno\edr_windows_autorun.ps1",
             "scripts\edr_agent_preflight.ps1",
             "scripts\edr_agent_zip_deploy.ps1",
             "scripts\windows_service_install.ps1",
@@ -497,6 +498,13 @@ jobs:
               throw "VERSION mismatch in package: expected '$env:EDR_AGENT_VERSION', got '$packagedVersion'"
             }
 
+            foreach ($requiredRootScript in @('edr_agent_install.ps1', 'edr_windows_autorun.ps1')) {
+              $rootScriptEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq $requiredRootScript })
+              if ($rootScriptEntries.Count -ne 1) {
+                throw "package root must contain exactly one $requiredRootScript; found $($rootScriptEntries.Count)"
+              }
+            }
+
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
               Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for x64-windows."
             }
@@ -511,6 +519,7 @@ jobs:
             }
             foreach ($required in @(
               'edr_agent_install\.ps1',
+              'edr_windows_autorun\.ps1',
               'edr_agent_preflight\.ps1',
               'edr_agent_zip_deploy\.ps1',
               'windows_service_install\.ps1',
