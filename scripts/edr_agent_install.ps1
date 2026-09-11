@@ -970,10 +970,10 @@ function Get-WindowsInstallCompatibilitySnapshot {
   $languageMode = "unknown"
   try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
   $psVersion = "unknown"
-  $psEdition = "unknown"
+  $detectedPowerShellEdition = "unknown"
   try {
     $psVersion = [string]$PSVersionTable.PSVersion
-    $psEdition = [string]$PSVersionTable.PSEdition
+    $detectedPowerShellEdition = [string]$PSVersionTable.PSEdition
   } catch {
   }
   $tools = [ordered]@{}
@@ -1006,7 +1006,7 @@ function Get-WindowsInstallCompatibilitySnapshot {
     powershell = [ordered]@{
       executable = Get-CurrentPowerShellExecutable
       version = $psVersion
-      edition = $psEdition
+      edition = $detectedPowerShellEdition
       language_mode = $languageMode
       is_64_bit_process = [bool][Environment]::Is64BitProcess
     }
