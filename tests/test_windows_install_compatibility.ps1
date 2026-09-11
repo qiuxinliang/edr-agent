@@ -20,7 +20,49 @@ function Assert-InstallTestEqual {
 }
 
 function Ensure-TestCertificateProvider {
-  Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+  $certDrive = Get-PSDrive -Name Cert -ErrorAction SilentlyContinue
+  if ($certDrive) {
+    if ($certDrive.Provider.Name -ne "Certificate") {
+      throw "The Cert drive is already mapped to an unexpected provider: $($certDrive.Provider.Name)"
+    }
+    return
+  }
+
+  $provider = Get-PSProvider -Name Certificate -ErrorAction SilentlyContinue
+  if (-not $provider -and -not (Get-Module -Name Microsoft.PowerShell.Security)) {
+    # -NoProfile runners can have the provider type data partially registered
+    # by another built-in module. A terminating import can then fail with
+    # FormatXmlUpdateException for duplicate members, even though the provider
+    # can still be used. Preserve the import error and allow only that known
+    # condition after verifying the actual provider below.
+    $importFailure = $null
+    try {
+      Import-Module Microsoft.PowerShell.Security -ErrorAction Stop | Out-Null
+    } catch {
+      $importFailure = $_
+    }
+    $provider = Get-PSProvider -Name Certificate -ErrorAction SilentlyContinue
+    $importMessage = if ($importFailure) { [string]$importFailure.Exception.Message } else { "" }
+    $duplicateTypeData = $importFailure -and
+      ([string]$importFailure.FullyQualifiedErrorId -match "FormatXmlUpdateException") -and
+      ($importMessage -match "(?s)Error in TypeData.*System.Security.AccessControl.ObjectSecurity") -and
+      ($importMessage -match "(?s)member .*already present")
+    if ($importFailure -and (-not $duplicateTypeData -or -not $provider)) {
+      throw ("Microsoft.PowerShell.Security import failed: " + $importFailure.Exception.Message)
+    }
+  }
+  if (-not $provider) {
+    throw "Windows certificate compatibility test requires the Microsoft.PowerShell.Security Certificate provider"
+  }
+
+  $certDrive = Get-PSDrive -Name Cert -ErrorAction SilentlyContinue
+  if ($certDrive) {
+    if ($certDrive.Provider.Name -ne "Certificate") {
+      throw "The Cert drive is already mapped to an unexpected provider: $($certDrive.Provider.Name)"
+    }
+    return
+  }
+  New-PSDrive -Name Cert -PSProvider Certificate -Root "\" -Scope Script -ErrorAction Stop | Out-Null
   Get-PSDrive -Name Cert -PSProvider Certificate -ErrorAction Stop | Out-Null
 }
 
