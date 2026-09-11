@@ -11,6 +11,8 @@ $machineKey = [Security.Cryptography.CngKeyOpenOptions]::MachineKey
 $ownedTestKeys = New-Object 'System.Collections.Generic.List[string]'
 $ownedPublicKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 $savedCompatibility = $script:EDR_INSTALL_COMPATIBILITY
+$cngPrimaryError = $null
+$cngCleanupFailure = $null
 
 function Get-TestRsaPublicIdentity {
   param([Security.Cryptography.RSA]$Rsa)
@@ -174,6 +176,8 @@ try {
     }
   }
   Write-Host "CNG actual CSR/key rollback and injected failure contracts passed."
+} catch {
+  $cngPrimaryError = $_
 } finally {
   $keyCleanupErrors = New-Object 'System.Collections.Generic.List[string]'
   # certreq may leave pending REQUEST certificates after CSR/failed enrollment.
@@ -211,5 +215,15 @@ try {
   }
   $script:EDR_INSTALL_COMPATIBILITY = $savedCompatibility
   $script:EDR_INSTALL_TRANSACTION_ACTIVE = $false
-  if ($keyCleanupErrors.Count -gt 0) { throw ("CNG test-owned key cleanup failed: " + ($keyCleanupErrors -join '; ')) }
+  if ($keyCleanupErrors.Count -gt 0) {
+    $cngCleanupFailure = "CNG test-owned key cleanup failed: " + ($keyCleanupErrors -join '; ')
+  }
 }
+if ($cngPrimaryError) {
+  $primaryMessage = [string]$cngPrimaryError.Exception.Message
+  if ($cngCleanupFailure) {
+    throw ("CNG compatibility test failed: {0}; cleanup also failed: {1}" -f $primaryMessage, $cngCleanupFailure)
+  }
+  throw $cngPrimaryError
+}
+if ($cngCleanupFailure) { throw $cngCleanupFailure }

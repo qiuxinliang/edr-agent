@@ -19,6 +19,11 @@ function Assert-InstallTestEqual {
   }
 }
 
+function Ensure-TestCertificateProvider {
+  Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+  Get-PSDrive -Name Cert -PSProvider Certificate -ErrorAction Stop | Out-Null
+}
+
 if ([string]$PSVersionTable.PSEdition -ne "Desktop") {
   throw "Windows install compatibility test must run under Windows PowerShell 5.1 Desktop; actual edition=$($PSVersionTable.PSEdition)"
 }
@@ -54,6 +59,8 @@ $caPath = Join-Path $diagnosticRoot "bootstrap-ca.cer"
 $caBundlePath = Join-Path $diagnosticRoot "bootstrap-ca-bundle.cer"
 $emptyCaPath = Join-Path $diagnosticRoot "empty-ca.cer"
 $nativeOutputPath = Join-Path $diagnosticRoot "certreq-output.bin"
+$primaryError = $null
+$cleanupFailure = $null
 
 try {
   $snapshot = Get-WindowsInstallCompatibilitySnapshot
@@ -156,6 +163,7 @@ public class NativeOutputFixture {
   Assert-InstallTest ($timedOut -and $watch.Elapsed.TotalSeconds -lt 10) "child timeout and termination are bounded"
 
   Ensure-BootstrapTlsValidatorType
+  Ensure-TestCertificateProvider
   $newSelfSigned = Get-Command New-SelfSignedCertificate -ErrorAction SilentlyContinue
   if (-not $newSelfSigned) { throw "New-SelfSignedCertificate is required by the certificate validator behavior test" }
   $storePath = "Cert:\CurrentUser\My"
@@ -238,10 +246,22 @@ public class NativeOutputFixture {
     if ($usePin) { Enable-BootstrapTlsValidation -CaPath "" -LeafSha256 $serverPin }
     else { Enable-BootstrapTlsValidation -CaPath $caPath -LeafSha256 "" }
     $listener = New-Object InstallTlsFixture -ArgumentList $server
+    $clientFailure = $null
+    $disposeFailure = $null
     try {
-      $response = Invoke-RestMethod -Uri ("https://127.0.0.1:{0}/tls-test" -f $listener.Port) -Method Get -TimeoutSec 8 -Proxy $null
-      Assert-InstallTest ($response.ok -eq $true) "real TLS1.2 GET with pin=$usePin (transport only, not enrollment POST)"
-    } finally { $listener.Dispose() }
+      try {
+        $response = Invoke-RestMethod -Uri ("https://127.0.0.1:{0}/tls-test" -f $listener.Port) -Method Get -TimeoutSec 8 -Proxy $null
+        Assert-InstallTest ($response.ok -eq $true) "real TLS1.2 GET with pin=$usePin (transport only, not enrollment POST)"
+      } catch { $clientFailure = $_ }
+    } finally {
+      try { $listener.Dispose() } catch { $disposeFailure = $_ }
+    }
+    if ($clientFailure -or $disposeFailure -or $listener.Error) {
+      $clientMessage = if ($clientFailure) { [string]$clientFailure.Exception.Message } else { "none" }
+      $disposeMessage = if ($disposeFailure) { [string]$disposeFailure.Exception.Message } else { "none" }
+      $serverMessage = if ($listener.Error) { [string]$listener.Error } else { "none" }
+      throw ("TLS fixture failed for pin={0}; client={1}; server={2}; dispose={3}" -f $usePin, $clientMessage, $serverMessage, $disposeMessage)
+    }
   }
   $hash = [Security.Cryptography.SHA256]::Create()
   try { $wrongIpPin = ([BitConverter]::ToString($hash.ComputeHash($wrongIp.RawData)) -replace '-', '').ToLowerInvariant() } finally { $hash.Dispose() }
@@ -249,13 +269,17 @@ public class NativeOutputFixture {
     if ($usePin) { Enable-BootstrapTlsValidation -CaPath "" -LeafSha256 $wrongIpPin }
     else { Enable-BootstrapTlsValidation -CaPath $caPath -LeafSha256 "" }
     $listener = New-Object InstallTlsFixture -ArgumentList $wrongIp
+    $disposeFailure = $null
     try {
       $rejected = $false
       try { [void](Invoke-RestMethod -Uri ("https://127.0.0.1:{0}" -f $listener.Port) -TimeoutSec 8 -Proxy $null) }
       catch { $rejected = $true }
-      Assert-InstallTest $rejected "actual mismatched IP SAN TLS connection is rejected with pin=$usePin"
-      Assert-InstallTest ([FdsBootstrapTlsValidator]::LastFailure -match 'certificate_name_mismatch') "Schannel supplied identity mismatch"
-    } finally { $listener.Dispose() }
+    } finally {
+      try { $listener.Dispose() } catch { $disposeFailure = $_ }
+    }
+    Assert-InstallTest $rejected "actual mismatched IP SAN TLS connection is rejected with pin=$usePin"
+    Assert-InstallTest ([FdsBootstrapTlsValidator]::LastFailure -match 'certificate_name_mismatch') "Schannel supplied identity mismatch"
+    if ($disposeFailure) { throw ("TLS fixture disposal failed for mismatched IP, pin={0}: {1}" -f $usePin, $disposeFailure.Exception.Message) }
   }
 
   $invalidPinFailed = $false
@@ -263,6 +287,8 @@ public class NativeOutputFixture {
   Assert-InstallTest $invalidPinFailed "invalid bootstrap pin is rejected before HTTP"
   . (Join-Path $RepositoryRoot "tests\test_windows_install_cng_behavior.ps1")
   Write-Host "Windows install compatibility behavior test passed under Windows PowerShell 5.1."
+} catch {
+  $primaryError = $_
 } finally {
   [Net.ServicePointManager]::SecurityProtocol = $oldTls
   [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
@@ -277,5 +303,15 @@ public class NativeOutputFixture {
   Remove-Item -LiteralPath $diagnosticRoot -Recurse -Force -ErrorAction SilentlyContinue
   if ($null -eq $oldDiagnosticRoot) { Remove-Item Env:\EDR_INSTALL_DIAGNOSTICS_DIR -ErrorAction SilentlyContinue }
   else { $env:EDR_INSTALL_DIAGNOSTICS_DIR = $oldDiagnosticRoot }
-  if ($cleanupErrors.Count -gt 0) { throw ("Test certificate cleanup failed: " + ($cleanupErrors -join '; ')) }
+  if ($cleanupErrors.Count -gt 0) {
+    $cleanupFailure = "Test certificate cleanup failed: " + ($cleanupErrors -join '; ')
+  }
 }
+if ($primaryError) {
+  $primaryMessage = [string]$primaryError.Exception.Message
+  if ($cleanupFailure) {
+    throw ("Windows install compatibility test failed: {0}; cleanup also failed: {1}" -f $primaryMessage, $cleanupFailure)
+  }
+  throw $primaryError
+}
+if ($cleanupFailure) { throw $cleanupFailure }
