@@ -14,6 +14,17 @@ $savedCompatibility = $script:EDR_INSTALL_COMPATIBILITY
 $cngPrimaryError = $null
 $cngCleanupFailure = $null
 
+$newKeyInf = New-CngCertreqInfText -SubjectCN "compat-new" -ProviderName $testProviderName `
+  -KeyName "FDS-Compat-New" -UseExistingKeySet $false
+Assert-InstallTest ($newKeyInf -match '(?m)^KeyLength = 3072\r?$') "new certreq key requires 3072 bits"
+Assert-InstallTest ($newKeyInf -match '(?m)^Exportable = FALSE\r?$') "new certreq key is non-exportable"
+Assert-InstallTest (-not ($newKeyInf -match '(?m)^UseExistingKeySet\s*=')) "new certreq key does not request reuse"
+$existingKeyInf = New-CngCertreqInfText -SubjectCN "compat-existing" -ProviderName $testProviderName `
+  -KeyName "FDS-Compat-Existing" -UseExistingKeySet $true
+Assert-InstallTest ($existingKeyInf -match '(?m)^UseExistingKeySet = TRUE\r?$') "existing certreq key explicitly requests reuse"
+Assert-InstallTest (-not ($existingKeyInf -match '(?m)^KeyLength\s*=')) "existing certreq key length is not changed"
+Assert-InstallTest (-not ($existingKeyInf -match '(?m)^Exportable\s*=')) "existing certreq key exportability is not changed"
+
 function Get-TestRsaPublicIdentity {
   param([Security.Cryptography.RSA]$Rsa)
   $public = $Rsa.ExportParameters($false)

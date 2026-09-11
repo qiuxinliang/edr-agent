@@ -1462,6 +1462,42 @@ function Try-Ensure-NativePemAgentCSR {
   }
 }
 
+function New-CngCertreqInfText {
+  param(
+    [string]$SubjectCN,
+    [string]$ProviderName,
+    [string]$KeyName,
+    [bool]$UseExistingKeySet
+  )
+  # certreq forbids changing Exportable on an existing key set. Keep key
+  # creation policy out of the explicit-reuse INF so the caller-owned key is
+  # used as-is; new installer-owned keys remain non-exportable and 3072-bit.
+  $keyPolicyLines = if ($UseExistingKeySet) {
+    "UseExistingKeySet = TRUE"
+  } else {
+    "KeyLength = 3072`r`nExportable = FALSE"
+  }
+  return @"
+[Version]
+Signature="`$Windows NT`$"
+
+[NewRequest]
+Subject = "CN=$SubjectCN"
+KeyAlgorithm = RSA
+$keyPolicyLines
+HashAlgorithm = SHA256
+ProviderName = "$ProviderName"
+KeyContainer = "$KeyName"
+MachineKeySet = TRUE
+KeySpec = 0
+RequestType = PKCS10
+Silent = TRUE
+
+[EnhancedKeyUsageExtension]
+OID=1.3.6.1.5.5.7.3.2
+"@
+}
+
 function Ensure-CngAgentCSR {
   param([string]$CsrPath, [string]$SubjectCN, [string]$ProviderName, [string]$KeyName)
   foreach ($value in @(@{ Name = "ProviderName"; Value = $ProviderName }, @{ Name = "KeyName"; Value = $KeyName })) {
@@ -1582,28 +1618,8 @@ function Ensure-CngAgentCSR {
   if (-not $certreq) {
     Write-Error "Native CNG CSR generation failed and certreq.exe is unavailable"
   }
-  $existingKeySetLine = if ($KeyName) { "UseExistingKeySet = TRUE" } else { "" }
-  $inf = @"
-[Version]
-Signature="`$Windows NT`$"
-
-[NewRequest]
-Subject = "CN=$safeCN"
-KeyAlgorithm = RSA
-KeyLength = 3072
-HashAlgorithm = SHA256
-ProviderName = "$ProviderName"
-KeyContainer = "$safeKeyName"
-MachineKeySet = TRUE
-$existingKeySetLine
-Exportable = FALSE
-KeySpec = 0
-RequestType = PKCS10
-Silent = TRUE
-
-[EnhancedKeyUsageExtension]
-OID=1.3.6.1.5.5.7.3.2
-"@
+  $inf = New-CngCertreqInfText -SubjectCN $safeCN -ProviderName $ProviderName `
+    -KeyName $safeKeyName -UseExistingKeySet ([bool]$KeyName)
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($infPath)), $inf)
   # A generated name is owned by this transaction. An explicitly supplied
   # name remains caller-owned even when certreq is the compatibility path.
@@ -1613,7 +1629,7 @@ OID=1.3.6.1.5.5.7.3.2
     throw "generated key name already exists; refusing to replace an unowned machine key"
   }
   $script:EDR_CNG_KEY_CREATED_BY_INSTALL = -not [bool]$KeyName
-  Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-machine", $infPath, $CsrPath) -TimeoutSeconds 30
+  Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-q", "-machine", $infPath, $CsrPath) -TimeoutSeconds 30
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
 
@@ -2611,7 +2627,7 @@ function Accept-CngIssuedCertificate([string]$CertPath, [string]$Provider) {
   if (-not $certreq) {
     throw "Native CNG certificate binding failed and certreq.exe is unavailable"
   }
-  Invoke-Checked -Exe $certreq.Source -ArgList @("-accept", "-machine", $CertPath) -TimeoutSeconds 30
+  Invoke-Checked -Exe $certreq.Source -ArgList @("-accept", "-q", "-machine", $CertPath) -TimeoutSeconds 30
 }
 
 function Write-InstallDiagnosticReport {

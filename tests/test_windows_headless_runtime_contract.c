@@ -307,6 +307,14 @@ int main(void) {
                          "UseExistingKeySet = TRUE",
                          "certreq fallback must explicitly reuse a caller supplied machine key");
   ok &= require_contains(installer_ps,
+                         "function New-CngCertreqInfText",
+                         "certreq INF policy must have a directly testable owner");
+  ok &= require_contains(installer_ps,
+                         "$keyPolicyLines = if ($UseExistingKeySet)",
+                         "certreq fallback must separate existing-key policy from new-key policy");
+  ok &= require_count(installer_ps, "Exportable = FALSE", 1,
+                      "certreq fallback must set exportability only for a newly created key");
+  ok &= require_contains(installer_ps,
                          "specified machine CNG key",
                          "explicit CNG key names must be verified before certreq fallback");
   ok &= require_contains(installer_ps,
@@ -315,10 +323,10 @@ int main(void) {
   ok &= require_contains(installer_ps,
                          "Enrollment material rollback incomplete",
                          "rollback diagnostics must distinguish partial cleanup from complete cleanup");
-  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-new\", \"-machine\", $infPath, $CsrPath) -TimeoutSeconds 30",
-                         "certreq CSR creation has a bounded wait");
-  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-accept\", \"-machine\", $CertPath) -TimeoutSeconds 30",
-                         "certreq certificate acceptance has a bounded wait");
+  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-new\", \"-q\", \"-machine\", $infPath, $CsrPath) -TimeoutSeconds 30",
+                         "certreq CSR creation must be non-interactive and have a bounded wait");
+  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-accept\", \"-q\", \"-machine\", $CertPath) -TimeoutSeconds 30",
+                         "certreq certificate acceptance must be non-interactive and have a bounded wait");
   ok &= require_contains(installer_ps,
                          "function Write-Utf8NoBomFileWithRetry",
                          "headless enrollment must isolate generated TOML in a same-directory staging file");
