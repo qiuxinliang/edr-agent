@@ -33,6 +33,8 @@ $relativePaths = @(
   "scripts\test_windows_package_capabilities_contract.ps1",
   "scripts\windows_setup_exe_lifecycle_smoke.ps1",
   "scripts\windows_release_lifecycle_smoke.ps1",
+  "tests\test_windows_install_compatibility.ps1",
+  "tests\test_windows_install_cng_behavior.ps1",
   "install\windows-inno\Build-BundledInstaller.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",
   "install\windows-inno\edr_windows_autorun.ps1",

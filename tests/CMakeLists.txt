@@ -383,6 +383,16 @@ set_tests_properties(windows_headless_runtime_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
 if(WIN32)
+  add_test(NAME windows_install_compatibility_behavior
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+      ${CMAKE_SOURCE_DIR}/tests/test_windows_install_compatibility.ps1
+      -RepositoryRoot ${CMAKE_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  # Four bounded TLS clients/servers plus real RSA CSR/certreq and rollback.
+  set_tests_properties(windows_install_compatibility_behavior PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+endif()
+
+if(WIN32)
   add_executable(test_windows_native_manifest
     ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_native_manifest.c
     ${CMAKE_SOURCE_DIR}/src/platform/windows_native_manifest.c

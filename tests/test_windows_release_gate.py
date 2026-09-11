@@ -22,7 +22,7 @@ EXPECTED = {
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
     "kernel_file_io_identity",
     "response_file_security_behavior", "response_forensic_path_contract",
-    "windows_isolation_mock_behavior", "http_telemetry_budget",
+    "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
 }
 PREVIOUSLY_UNBUILT = {
     "test_process_generation_windows", "test_response_file_security",

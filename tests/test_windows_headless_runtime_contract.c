@@ -268,8 +268,8 @@ int main(void) {
   ok &= require_contains(installer_ps, "msvcp140.dll",
                          "headless enrollment must validate the C++ runtime dependency");
   ok &= require_contains(installer_ps,
-                         "$certutil.Source -csp $provider -delkey",
-                         "failed enrollment must remove its provisional CNG machine key with supported certutil syntax");
+                         "Invoke-CapturedProcess -Exe $certutil.Source -ArgList @(\"-csp\", $provider, \"-delkey\", [string]$script:EDR_CNG_KEY_CONTAINER) -TimeoutSeconds 30",
+                         "failed enrollment must capture certutil delkey output with a bounded 30 second wait");
   ok &= require_absent(installer_ps,
                        "$certutil.Source -f -csp $provider -delkey",
                        "CNG rollback must not pass unsupported force mode to certutil delkey");
@@ -282,8 +282,57 @@ int main(void) {
   ok &= require_contains(installer_ps,
                          "[System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::CopyWithPrivateKey",
                          "headless enrollment must bind the issued certificate to its native CNG key without certreq");
-  ok &= require_count(installer_ps, "-TimeoutSeconds 30", 2,
-                      "certreq CSR creation and certificate acceptance must both have bounded waits");
+  ok &= require_contains(installer_ps,
+                         "requires Windows PowerShell 5.1 Desktop",
+                         "Windows enrollment must reject direct PowerShell 7 execution with an actionable runtime error");
+  ok &= require_contains(installer_ps,
+                         "SystemDefault",
+                         "modern .NET Framework must retain process-local SystemDefault TLS negotiation");
+  ok &= require_contains(installer_ps,
+                         "FdsBootstrapTlsValidator",
+                         "bootstrap validation must use a .NET callback delegate rather than a PowerShell ScriptBlock");
+  ok &= require_absent(installer_ps,
+                       "ServerCertificateValidationCallback = {",
+                       "bootstrap validation must not depend on a PowerShell callback ScriptBlock");
+  ok &= require_contains(installer_ps,
+                         "certificate_missing_server_auth_eku",
+                         "bootstrap validation must enforce server authentication EKU");
+  ok &= require_contains(installer_ps,
+                         "certificate_not_time_valid",
+                         "bootstrap validation must enforce certificate validity period");
+  ok &= require_contains(installer_ps,
+                         "certificate_name_mismatch",
+                         "bootstrap validation must preserve hostname or IP identity failures");
+  ok &= require_contains(installer_ps,
+                         "UseExistingKeySet = TRUE",
+                         "certreq fallback must explicitly reuse a caller supplied machine key");
+  ok &= require_contains(installer_ps,
+                         "specified machine CNG key",
+                         "explicit CNG key names must be verified before certreq fallback");
+  ok &= require_contains(installer_ps,
+                         "Read-NativeProcessOutput",
+                         "native command diagnostics must decode captured bytes with a code-page fallback");
+  ok &= require_contains(installer_ps,
+                         "Enrollment material rollback incomplete",
+                         "rollback diagnostics must distinguish partial cleanup from complete cleanup");
+  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-new\", \"-machine\", $infPath, $CsrPath) -TimeoutSeconds 30",
+                         "certreq CSR creation has a bounded wait");
+  ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-accept\", \"-machine\", $CertPath) -TimeoutSeconds 30",
+                         "certreq certificate acceptance has a bounded wait");
+  ok &= require_contains(installer_ps,
+                         "function Write-Utf8NoBomFileWithRetry",
+                         "headless enrollment must isolate generated TOML in a same-directory staging file");
+  ok &= require_contains(installer_ps,
+                         "[System.IO.File]::Replace($stagedPath, $fullPath, $backupPath, $true)",
+                         "headless enrollment must atomically replace an existing agent.toml with a PowerShell 5.1 compatible backup path");
+  ok &= require_contains(installer_ps,
+                         "[int]$MaxAttempts = 40",
+                         "agent.toml replacement must have a bounded retry budget");
+  ok &= require_contains(installer_ps,
+                         "[int]$DelayMilliseconds = 250",
+                         "agent.toml replacement must back off between sharing-violation retries");
+  ok &= require_count(installer_ps, "Write-Utf8NoBomFileWithRetry -Path $outFile -Text $toml", 2,
+                      "both primary and parser-fallback TOML writes must use the atomic retry path");
   free(installer_ps);
 
   char *headless_uninstaller = read_source(root, "src/installer_worker/headless_uninstaller_win.c");

@@ -74,6 +74,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($env:OS -eq "Windows_NT") {
+  if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -lt 1) {
+    throw "Windows enrollment requires Windows PowerShell 5.1 Desktop. Run this script with %WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe; launching the installer EXE from PowerShell 7 is supported."
+  }
+  if ($ExecutionContext.SessionState.LanguageMode -ne "FullLanguage") {
+    throw "Windows enrollment requires FullLanguage mode for signed-package .NET cryptography. Ask the administrator to authorize the installer under the existing application-control policy."
+  }
+}
 try {
   $script:EDR_UTF8_OUTPUT = New-Object System.Text.UTF8Encoding -ArgumentList $false
   [Console]::OutputEncoding = $script:EDR_UTF8_OUTPUT
@@ -380,6 +388,55 @@ function Write-DurableInstallDiagnostic {
   } catch {
     Write-Warning ("failed to persist install diagnostic: " + $_.Exception.Message)
     return ""
+  }
+}
+
+function Write-Utf8NoBomFileWithRetry {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Text,
+    [int]$MaxAttempts = 40,
+    [int]$DelayMilliseconds = 250
+  )
+  if ($MaxAttempts -lt 1) { throw "file write retry count must be positive" }
+  if ($DelayMilliseconds -lt 0) { throw "file write retry delay must be non-negative" }
+
+  $fullPath = [System.IO.Path]::GetFullPath($Path)
+  $dir = Split-Path -Parent $fullPath
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+  $stagedPath = $fullPath + ".write-" + [guid]::NewGuid().ToString("N") + ".tmp"
+  # Windows PowerShell 5.1/.NET Framework rejects a null backup path for the
+  # four-argument File.Replace overload. Keep the backup beside the target so
+  # the swap remains atomic, then remove it after the replacement completes.
+  $backupPath = $fullPath + ".replace-" + [guid]::NewGuid().ToString("N") + ".bak"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+  $lastFailure = $null
+  try {
+    [System.IO.File]::WriteAllText($stagedPath, $Text, $utf8NoBom)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+      try {
+        if (Test-Path -LiteralPath $fullPath) {
+          [System.IO.File]::Replace($stagedPath, $fullPath, $backupPath, $true)
+        } else {
+          [System.IO.File]::Move($stagedPath, $fullPath)
+        }
+        return
+      } catch [System.IO.IOException] {
+        $lastFailure = $_
+      } catch [System.UnauthorizedAccessException] {
+        $lastFailure = $_
+      }
+      if ($attempt -lt $MaxAttempts) {
+        Start-Sleep -Milliseconds $DelayMilliseconds
+      }
+    }
+    $reason = if ($lastFailure) { [string]$lastFailure.Exception.Message } else { "unknown file replacement failure" }
+    throw ("failed to atomically write {0} after {1} attempts: {2}" -f $fullPath, $MaxAttempts, $reason)
+  } finally {
+    Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -749,6 +806,30 @@ function Join-ProcessArguments {
   return (($ArgList | ForEach-Object { Quote-ProcessArgument ([string]$_) }) -join " ")
 }
 
+function Read-NativeProcessOutput {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return "" }
+  try {
+    [byte[]]$bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) { return "" }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+      return (New-Object System.Text.UTF8Encoding -ArgumentList $true).GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+      return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    try {
+      return (New-Object System.Text.UTF8Encoding -ArgumentList @($false, $true)).GetString($bytes)
+    } catch {
+      # certreq/certutil use the active Windows code page for localized output
+      # on older Server images. Preserve the numeric exit code separately.
+      return [System.Text.Encoding]::Default.GetString($bytes)
+    }
+  } catch {
+    return ("<native output read failed: {0}>" -f $_.Exception.Message)
+  }
+}
+
 function Invoke-CapturedProcess {
   param([string]$Exe, [string[]]$ArgList, [int]$TimeoutSeconds = 0)
   if (-not $Exe) {
@@ -760,28 +841,47 @@ function Invoke-CapturedProcess {
   $tmpBase = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("fdproc-" + [guid]::NewGuid().ToString("N")))
   $stdoutPath = $tmpBase + ".out"
   $stderrPath = $tmpBase + ".err"
+  $p = New-Object System.Diagnostics.Process
+  $stdoutFile = $null
+  $stderrFile = $null
   try {
-    $p = Start-Process -FilePath $Exe -ArgumentList (Join-ProcessArguments $ArgList) `
-      -NoNewWindow -PassThru `
-      -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-    if ($TimeoutSeconds -gt 0) {
-      $finished = $p.WaitForExit($TimeoutSeconds * 1000)
-      if (-not $finished) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        $p.WaitForExit()
-        throw ("process timed out after {0}s: {1}" -f $TimeoutSeconds, $Exe)
+    $p.StartInfo.FileName = $Exe
+    $p.StartInfo.Arguments = Join-ProcessArguments $ArgList
+    $p.StartInfo.UseShellExecute = $false
+    $p.StartInfo.CreateNoWindow = $true
+    $p.StartInfo.RedirectStandardOutput = $true
+    $p.StartInfo.RedirectStandardError = $true
+    $stdoutFile = [System.IO.File]::Create($stdoutPath)
+    $stderrFile = [System.IO.File]::Create($stderrPath)
+    [void]$p.Start()
+    # Copy raw pipe bytes concurrently. Start-Process redirection may decode
+    # localized bytes before writing its files, which cannot be repaired later.
+    $stdoutCopy = $p.StandardOutput.BaseStream.CopyToAsync($stdoutFile)
+    $stderrCopy = $p.StandardError.BaseStream.CopyToAsync($stderrFile)
+    $budget = if ($TimeoutSeconds -gt 0) { $TimeoutSeconds } else { 120 }
+    if (-not $p.WaitForExit($budget * 1000)) {
+      $p.Kill()
+      if (-not $p.WaitForExit(5000)) {
+        throw ("native process termination not confirmed; pid={0}; executable={1}" -f $p.Id, $Exe)
       }
-    } else {
-      $p.WaitForExit()
+      throw ("native process timed out after {0}s; pid={1}; executable={2}" -f $budget, $p.Id, $Exe)
     }
-    $stdout = if (Test-Path -LiteralPath $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
-    $stderr = if (Test-Path -LiteralPath $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
+    if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutCopy, $stderrCopy), 5000)) {
+      throw ("native process output drain timed out; executable={0}" -f $Exe)
+    }
+    $stdoutFile.Dispose()
+    $stderrFile.Dispose()
+    $stdout = Read-NativeProcessOutput -Path $stdoutPath
+    $stderr = Read-NativeProcessOutput -Path $stderrPath
     return [pscustomobject]@{
       ExitCode = [int]$p.ExitCode
       Stdout = [string]$stdout
       Stderr = [string]$stderr
     }
   } finally {
+    if ($stdoutFile) { $stdoutFile.Dispose() }
+    if ($stderrFile) { $stderrFile.Dispose() }
+    $p.Dispose()
     Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
   }
 }
@@ -799,9 +899,9 @@ function Invoke-Checked {
     $detail = (($combined | Where-Object { $_ }) -join "`n").Trim()
     $cmd = $Exe + " " + ($ArgList -join " ")
     if ($detail) {
-      throw ("command failed exit_code={0}: {1}`n{2}" -f $result.ExitCode, $cmd, $detail)
+      throw ("native command failed exit_code={0}; executable={1}; args={2}`n{3}" -f $result.ExitCode, $Exe, ($ArgList -join " "), $detail)
     }
-    throw ("command failed exit_code={0}: {1}" -f $result.ExitCode, $cmd)
+    throw ("native command failed exit_code={0}; executable={1}; args={2}" -f $result.ExitCode, $Exe, ($ArgList -join " "))
   }
 }
 
@@ -814,6 +914,205 @@ function Test-IsElevated {
   } catch {
     return $false
   }
+}
+
+function Get-CurrentPowerShellExecutable {
+  try {
+    $path = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ($path) { return [System.IO.Path]::GetFullPath($path) }
+  } catch {
+  }
+  if ($PSHOME) {
+    $candidate = Join-Path $PSHOME "powershell.exe"
+    if (Test-Path -LiteralPath $candidate) { return [System.IO.Path]::GetFullPath($candidate) }
+  }
+  return "unknown"
+}
+
+function Get-RegistryValueOrNull {
+  param([string]$Path, [string]$Name)
+  try {
+    $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+    return $item.$Name
+  } catch {
+    return $null
+  }
+}
+
+function Test-TypeAvailable {
+  param([string]$TypeName)
+  try {
+    return [bool]([System.Management.Automation.PSTypeName]$TypeName).Type
+  } catch {
+    return $false
+  }
+}
+
+function Test-CopyWithPrivateKeyAvailable {
+  if (-not (Test-TypeAvailable "System.Security.Cryptography.X509Certificates.RSACertificateExtensions")) {
+    return $false
+  }
+  try {
+    $type = ([System.Management.Automation.PSTypeName]"System.Security.Cryptography.X509Certificates.RSACertificateExtensions").Type
+    return [bool]$type.GetMethod("CopyWithPrivateKey", [System.Reflection.BindingFlags]"Public,Static")
+  } catch {
+    return $false
+  }
+}
+
+function Get-WindowsInstallCompatibilitySnapshot {
+  $os = $null
+  try {
+    $os = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+  } catch {
+  }
+  $release = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name "Release"
+  $languageMode = "unknown"
+  try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
+  $psVersion = "unknown"
+  $psEdition = "unknown"
+  try {
+    $psVersion = [string]$PSVersionTable.PSVersion
+    $psEdition = [string]$PSVersionTable.PSEdition
+  } catch {
+  }
+  $tools = [ordered]@{}
+  foreach ($name in @("powershell.exe", "certreq.exe", "certutil.exe")) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+    $tools[$name] = if ($command) { [string]$command.Source } else { "missing" }
+  }
+  $tlsRegistry = [ordered]@{}
+  foreach ($path in @(
+    "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319",
+    "HKLM:\SOFTWARE\Wow6432Node\Microsoft\.NETFramework\v4.0.30319"
+  )) {
+    $tlsRegistry[$path] = [ordered]@{
+      SystemDefaultTlsVersions = Get-RegistryValueOrNull -Path $path -Name "SystemDefaultTlsVersions"
+      SchUseStrongCrypto = Get-RegistryValueOrNull -Path $path -Name "SchUseStrongCrypto"
+    }
+  }
+  $securityProtocol = "unknown"
+  try { $securityProtocol = [string][System.Net.ServicePointManager]::SecurityProtocol } catch {}
+  return [ordered]@{
+    os = [ordered]@{
+      product_name = if ($os) { [string]$os.ProductName } else { "unknown" }
+      edition = if ($os) { [string]$os.EditionID } else { "unknown" }
+      installation_type = if ($os) { [string]$os.InstallationType } else { "unknown" }
+      display_version = if ($os) { [string]$os.DisplayVersion } else { "unknown" }
+      build = if ($os) { [string]$os.CurrentBuildNumber } else { "unknown" }
+      ubr = if ($os) { [string]$os.UBR } else { "unknown" }
+      architecture = [string](Get-NativeWindowsArchitecture)
+    }
+    powershell = [ordered]@{
+      executable = Get-CurrentPowerShellExecutable
+      version = $psVersion
+      edition = $psEdition
+      language_mode = $languageMode
+      is_64_bit_process = [bool][Environment]::Is64BitProcess
+    }
+    dotnet_framework_release = if ($null -eq $release) { $null } else { [int]$release }
+    capabilities = [ordered]@{
+      certificate_request = Test-TypeAvailable "System.Security.Cryptography.X509Certificates.CertificateRequest"
+      copy_with_private_key = Test-CopyWithPrivateKeyAvailable
+      cng_key = Test-TypeAvailable "System.Security.Cryptography.CngKey"
+      cng_provider = Test-TypeAvailable "System.Security.Cryptography.CngProvider"
+      rsa_cng = Test-TypeAvailable "System.Security.Cryptography.RSACng"
+    }
+    tools = $tools
+    tls = [ordered]@{
+      process_security_protocol = $securityProtocol
+      registry = $tlsRegistry
+    }
+  }
+}
+
+function Write-WindowsInstallCompatibilityDiagnostic {
+  param([object]$Snapshot, [string]$Failure = "")
+  $report = [ordered]@{
+    schema = "edr.agent.install.compatibility.v1"
+    created_at = (Get-Date).ToUniversalTime().ToString("o")
+    status = if ($Failure) { "failed" } else { "ok" }
+    failure = $Failure
+    snapshot = $Snapshot
+  }
+  return Write-DurableInstallDiagnostic -Name "install-compatibility-last.json" -Report $report
+}
+
+function Assert-WindowsInstallCompatibility {
+  param(
+    [string]$RequestedProvider,
+    [bool]$ExternalTpmKeyUri = $false
+  )
+  if ((Get-EnrollOs) -ne "windows") { return $null }
+  $snapshot = Get-WindowsInstallCompatibilitySnapshot
+  $failures = New-Object System.Collections.Generic.List[string]
+  $ps = $snapshot.powershell
+  if ([string]$ps.edition -ne "Desktop" -or [version][string]$ps.version -lt [version]"5.1") {
+    $failures.Add(("Windows enrollment requires Windows PowerShell 5.1 Desktop; executable={0}, version={1}, edition={2}" -f $ps.executable, $ps.version, $ps.edition)) | Out-Null
+  }
+  if ([string]$ps.language_mode -ne "FullLanguage") {
+    $failures.Add(("Windows enrollment requires FullLanguage mode; language_mode={0}" -f $ps.language_mode)) | Out-Null
+  }
+  if (-not $snapshot.tools["powershell.exe"] -or $snapshot.tools["powershell.exe"] -eq "missing") {
+    $failures.Add("Windows PowerShell executable was not found") | Out-Null
+  }
+  $needsNativeCng = ($RequestedProvider -eq "cng" -or ($RequestedProvider -eq "tpm" -and -not $ExternalTpmKeyUri))
+  $nativeCsrAvailable = [bool]($snapshot.capabilities.certificate_request -and
+    $snapshot.capabilities.cng_key -and $snapshot.capabilities.cng_provider -and $snapshot.capabilities.rsa_cng)
+  $nativeBindingAvailable = [bool]($nativeCsrAvailable -and $snapshot.capabilities.copy_with_private_key)
+  if ($needsNativeCng) {
+    if (-not $snapshot.capabilities.cng_key -or -not $snapshot.capabilities.cng_provider -or -not $snapshot.capabilities.rsa_cng) {
+      $failures.Add("Windows CNG APIs are required to verify machine key identity and rollback; repair the Windows/.NET installation") | Out-Null
+    }
+    if (-not (Test-IsElevated)) {
+      $failures.Add("Run the installer as Administrator for LocalMachine private key and certificate enrollment") | Out-Null
+    }
+    if (-not $snapshot.tools["certutil.exe"] -or $snapshot.tools["certutil.exe"] -eq "missing") {
+      $failures.Add("certutil.exe is required for Windows CNG rollback") | Out-Null
+    }
+    # certreq is a compatibility fallback only. A host with both native CSR
+    # creation and native certificate binding does not need it to enroll.
+    if (-not $nativeBindingAvailable -and (-not $snapshot.tools["certreq.exe"] -or $snapshot.tools["certreq.exe"] -eq "missing")) {
+      $failures.Add("certreq.exe is required because native CNG CSR or certificate binding capability is unavailable") | Out-Null
+    }
+  }
+  if ($TrustCa -and (-not $CaCertPath -or -not (Test-Path -LiteralPath $CaCertPath -PathType Leaf))) {
+    $failures.Add(("TrustCa was requested but the CA file is missing: {0}" -f $CaCertPath)) | Out-Null
+  }
+  $failure = ($failures -join " | ")
+  $diagnostic = Write-WindowsInstallCompatibilityDiagnostic -Snapshot $snapshot -Failure $failure
+  if ($failure) {
+    throw ("Windows install compatibility preflight failed: {0}; diagnostic={1}" -f $failure, $diagnostic)
+  }
+  Write-Host ("Windows install compatibility: OS={0} build={1} arch={2}; PowerShell={3} {4} ({5}); .NET Release={6}; CertificateRequest={7}; CopyWithPrivateKey={8}" -f `
+    $snapshot.os.product_name, $snapshot.os.build, $snapshot.os.architecture, $snapshot.powershell.version, $snapshot.powershell.executable, $snapshot.powershell.edition, `
+    $snapshot.dotnet_framework_release, $snapshot.capabilities.certificate_request, $snapshot.capabilities.copy_with_private_key)
+  return $snapshot
+}
+
+function Set-WindowsInstallTlsCompatibility {
+  if ((Get-EnrollOs) -ne "windows") { return }
+  $release = Get-RegistryValueOrNull -Path "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -Name "Release"
+  $before = "unknown"
+  try { $before = [string][System.Net.ServicePointManager]::SecurityProtocol } catch {}
+  $mode = "system_default"
+  if ($null -eq $release -or [int]$release -lt 461808) {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    $mode = "tls12_process_only"
+  } else {
+    try {
+      $systemDefault = [System.Enum]::Parse([System.Net.SecurityProtocolType], "SystemDefault", $false)
+      [System.Net.ServicePointManager]::SecurityProtocol = $systemDefault
+    } catch {
+      [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+      $mode = "tls12_process_only_enum_unavailable"
+    }
+  }
+  $after = [string][System.Net.ServicePointManager]::SecurityProtocol
+  $script:EDR_TLS_POLICY_MODE = $mode
+  $script:EDR_TLS_POLICY_BEFORE = $before
+  $script:EDR_TLS_POLICY_AFTER = $after
+  Write-Host ("Enrollment TLS policy={0}; process_security_protocol={1}; previous={2}; machine TLS policy unchanged" -f $mode, $after, $before)
 }
 
 function Invoke-AgentPreflightIfNeeded {
@@ -1165,19 +1464,39 @@ function Try-Ensure-NativePemAgentCSR {
 
 function Ensure-CngAgentCSR {
   param([string]$CsrPath, [string]$SubjectCN, [string]$ProviderName, [string]$KeyName)
+  foreach ($value in @(@{ Name = "ProviderName"; Value = $ProviderName }, @{ Name = "KeyName"; Value = $KeyName })) {
+    if ($value.Value -and [regex]::IsMatch([string]$value.Value, '[\x00-\x1f\x7f"]')) {
+      throw ("{0} contains a control character or quote and cannot be used in a certreq INF" -f $value.Name)
+    }
+  }
+  if ($SubjectCN -match '[\x00-\x1f\x7f]') { throw "SubjectCN contains control characters" }
   $csrDir = Split-Path -Parent $CsrPath
   if ($csrDir -and -not (Test-Path $csrDir)) {
     New-Item -ItemType Directory -Path $csrDir -Force | Out-Null
   }
   $safeCN = if ($SubjectCN) { $SubjectCN.Replace("/", "-").Replace("\", "-").Replace('"', '') } else { "edr-agent" }
   $safeKeyName = if ($KeyName) {
+    if (-not (Test-TypeAvailable "System.Security.Cryptography.CngKey")) {
+      throw "an explicit CNG KeyName cannot be verified because the CNG API is unavailable"
+    }
+    try {
+      $existingProvider = New-Object System.Security.Cryptography.CngProvider($ProviderName)
+      $existingKey = [System.Security.Cryptography.CngKey]::Open(
+        $KeyName,
+        $existingProvider,
+        [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+      )
+      $existingKey.Dispose()
+    } catch {
+      throw ("specified machine CNG key '{0}' was not found and will not be replaced by certreq: {1}" -f $KeyName, $_.Exception.Message)
+    }
     $KeyName
   } else {
     $suffix = ([guid]::NewGuid().ToString("N")).Substring(0, 12)
     "FDSecurity-Agent-$safeCN-$suffix"
   }
   $script:EDR_CNG_KEY_CONTAINER = $safeKeyName
-  $script:EDR_CNG_KEY_CREATED_BY_INSTALL = -not [bool]$KeyName
+  $script:EDR_CNG_KEY_CREATED_BY_INSTALL = $false
   $script:EDR_CNG_PROVIDER_USED = $ProviderName
   Write-Host "Using CNG key container: $safeKeyName"
   $infPath = [System.IO.Path]::ChangeExtension($CsrPath, ".inf")
@@ -1187,68 +1506,83 @@ function Ensure-CngAgentCSR {
   $nativeKey = $null
   $nativeRsa = $null
   $nativeKeyCreated = $false
-  try {
-    $cngProvider = New-Object System.Security.Cryptography.CngProvider($ProviderName)
-    if ($KeyName) {
-      $nativeKey = [System.Security.Cryptography.CngKey]::Open(
-        $safeKeyName,
-        $cngProvider,
-        [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
-      )
-    } else {
-      $creation = New-Object System.Security.Cryptography.CngKeyCreationParameters
-      $creation.Provider = $cngProvider
-      $creation.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
-      $creation.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::Signing
-      $creation.Parameters.Add((New-Object System.Security.Cryptography.CngProperty(
-        "Length",
-        [BitConverter]::GetBytes(3072),
-        [System.Security.Cryptography.CngPropertyOptions]::None
-      )))
-      $nativeKey = [System.Security.Cryptography.CngKey]::Create(
-        [System.Security.Cryptography.CngAlgorithm]::Rsa,
-        $safeKeyName,
-        $creation
-      )
-      $nativeKeyCreated = $true
-    }
-    $nativeRsa = New-Object System.Security.Cryptography.RSACng($nativeKey)
-    $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName("CN=$safeCN")
-    $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
-      $dn,
-      $nativeRsa,
-      [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-      [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
-    )
-    $oids = New-Object System.Security.Cryptography.OidCollection
-    [void]$oids.Add((New-Object System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.2")))
-    $request.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension($oids, $false)))
-    $csrDer = $request.CreateSigningRequest()
-    [System.IO.File]::WriteAllText(
-      ([System.IO.Path]::GetFullPath($CsrPath)),
-      (ConvertTo-Pem "CERTIFICATE REQUEST" $csrDer)
-    )
-    return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
-  } catch {
-    $nativeError = $_.Exception.Message
-    if ($nativeKeyCreated -and $nativeKey) {
-      try {
-        $nativeKey.Delete()
-      } catch {
-        throw ("Native CNG CSR generation failed and provisional key cleanup failed: " + $_.Exception.Message)
+  $compatibility = $script:EDR_INSTALL_COMPATIBILITY
+  if (-not $compatibility -and (Get-EnrollOs) -eq "windows") {
+    $compatibility = Get-WindowsInstallCompatibilitySnapshot
+  }
+  $nativeCsrAvailable = [bool]($compatibility -and $compatibility.capabilities.certificate_request -and
+    $compatibility.capabilities.copy_with_private_key -and $compatibility.capabilities.cng_key -and
+    $compatibility.capabilities.cng_provider -and $compatibility.capabilities.rsa_cng)
+  if ($nativeCsrAvailable) {
+    try {
+      $cngProvider = New-Object System.Security.Cryptography.CngProvider($ProviderName)
+      if ($KeyName) {
+        $nativeKey = [System.Security.Cryptography.CngKey]::Open(
+          $safeKeyName,
+          $cngProvider,
+          [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+        )
+      } else {
+        $creation = New-Object System.Security.Cryptography.CngKeyCreationParameters
+        $creation.Provider = $cngProvider
+        $creation.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+        $creation.ExportPolicy = [System.Security.Cryptography.CngExportPolicies]::None
+        $creation.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::Signing
+        $creation.Parameters.Add((New-Object System.Security.Cryptography.CngProperty(
+          "Length",
+          [BitConverter]::GetBytes(3072),
+          [System.Security.Cryptography.CngPropertyOptions]::None
+        )))
+        $nativeKey = [System.Security.Cryptography.CngKey]::Create(
+          [System.Security.Cryptography.CngAlgorithm]::Rsa,
+          $safeKeyName,
+          $creation
+        )
+        $nativeKeyCreated = $true
+        $script:EDR_CNG_KEY_CREATED_BY_INSTALL = $true
       }
-      $script:EDR_CNG_KEY_CREATED_BY_INSTALL = $false
+      $nativeRsa = New-Object System.Security.Cryptography.RSACng($nativeKey)
+      $dn = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName("CN=$safeCN")
+      $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        $dn,
+        $nativeRsa,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+      )
+      $oids = New-Object System.Security.Cryptography.OidCollection
+      [void]$oids.Add((New-Object System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.2")))
+      $request.CertificateExtensions.Add((New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension($oids, $false)))
+      $csrDer = $request.CreateSigningRequest()
+      [System.IO.File]::WriteAllText(
+        ([System.IO.Path]::GetFullPath($CsrPath)),
+        (ConvertTo-Pem "CERTIFICATE REQUEST" $csrDer)
+      )
+      return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
+    } catch {
+      $nativeError = $_.Exception.Message
+      if ($nativeKeyCreated -and $nativeKey) {
+        try {
+          $nativeKey.Delete()
+        } catch {
+          throw ("Native CNG CSR generation failed and provisional key cleanup failed: " + $_.Exception.Message)
+        }
+        $script:EDR_CNG_KEY_CREATED_BY_INSTALL = $false
+      }
+      Write-Warning ("Native CNG CSR generation unavailable; trying bounded certreq compatibility path: " + $nativeError)
+    } finally {
+      if ($nativeRsa) { $nativeRsa.Dispose() }
+      if ($nativeKey) { $nativeKey.Dispose() }
     }
-    Write-Warning ("Native CNG CSR generation unavailable; trying bounded certreq compatibility path: " + $nativeError)
-  } finally {
-    if ($nativeRsa) { $nativeRsa.Dispose() }
-    if ($nativeKey) { $nativeKey.Dispose() }
+  } else {
+    $nativeError = "CertificateRequest/CNG API is unavailable; selecting certreq without creating a provisional native key"
+    Write-Warning $nativeError
   }
 
   $certreq = Get-Command "certreq.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $certreq) {
     Write-Error "Native CNG CSR generation failed and certreq.exe is unavailable"
   }
+  $existingKeySetLine = if ($KeyName) { "UseExistingKeySet = TRUE" } else { "" }
   $inf = @"
 [Version]
 Signature="`$Windows NT`$"
@@ -1261,6 +1595,7 @@ HashAlgorithm = SHA256
 ProviderName = "$ProviderName"
 KeyContainer = "$safeKeyName"
 MachineKeySet = TRUE
+$existingKeySetLine
 Exportable = FALSE
 KeySpec = 0
 RequestType = PKCS10
@@ -1270,6 +1605,14 @@ Silent = TRUE
 OID=1.3.6.1.5.5.7.3.2
 "@
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($infPath)), $inf)
+  # A generated name is owned by this transaction. An explicitly supplied
+  # name remains caller-owned even when certreq is the compatibility path.
+  if (-not $KeyName -and [System.Security.Cryptography.CngKey]::Exists(
+    $safeKeyName, (New-Object System.Security.Cryptography.CngProvider($ProviderName)),
+    [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey)) {
+    throw "generated key name already exists; refusing to replace an unowned machine key"
+  }
+  $script:EDR_CNG_KEY_CREATED_BY_INSTALL = -not [bool]$KeyName
   Invoke-Checked -Exe $certreq.Source -ArgList @("-new", "-machine", $infPath, $CsrPath) -TimeoutSeconds 30
   return [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($CsrPath)))
 }
@@ -1390,11 +1733,12 @@ function Remove-ProvisionalEnrollmentMaterial {
         # Windows 11 certutil rejects -f for the -delkey verb. Keep the KSP
         # selection explicit, but use the verb's supported argument contract so
         # failed enrollment cannot accumulate orphaned machine keys.
-        $output = & $certutil.Source -csp $provider -delkey ([string]$script:EDR_CNG_KEY_CONTAINER) 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        $result = Invoke-CapturedProcess -Exe $certutil.Source -ArgList @("-csp", $provider, "-delkey", [string]$script:EDR_CNG_KEY_CONTAINER) -TimeoutSeconds 30
+        $output = @($result.Stdout, $result.Stderr) | Where-Object { $_ }
+        if ($result.ExitCode -eq 0) {
           $keyRemoved = $true
         } else {
-          $errors.Add(("CNG key cleanup failed exit={0}: {1}" -f $LASTEXITCODE, (($output | Out-String).Trim()))) | Out-Null
+          $errors.Add(("CNG key cleanup failed exit={0}: {1}" -f $result.ExitCode, (($output | Out-String).Trim()))) | Out-Null
         }
       } catch {
         $errors.Add(("CNG key cleanup failed: " + $_.Exception.Message)) | Out-Null
@@ -1416,8 +1760,357 @@ function Remove-ProvisionalEnrollmentMaterial {
     errors = [string[]]$errors
   }
   $path = Write-DurableInstallDiagnostic -Name "install-enrollment-rollback-last.json" -Report $receipt
-  if ($path) { Write-Warning ("Rolled back provisional enrollment material; receipt=" + $path) }
+  if ($path) {
+    if ($errors.Count -eq 0) {
+      Write-Host ("Rolled back provisional enrollment material; receipt=" + $path)
+    } else {
+      Write-Warning ("Enrollment material rollback incomplete; receipt=" + $path)
+    }
+  }
   $script:EDR_INSTALL_TRANSACTION_ACTIVE = $false
+}
+
+function Get-NormalizedSha256List([string]$Value) {
+  $out = New-Object System.Collections.Generic.List[string]
+  if (-not $Value) { return $out.ToArray() }
+  foreach ($part in ($Value -split '[,;\s]+')) {
+    $p = ($part -replace '[:\-]', '').Trim().ToLowerInvariant()
+    if ($p -match '^[0-9a-f]{64}$') {
+      $out.Add($p) | Out-Null
+    }
+  }
+  return $out.ToArray()
+}
+
+function Read-PemCertificates([string]$Path) {
+  $certs = New-Object System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+    return ,([System.Security.Cryptography.X509Certificates.X509Certificate2[]]@())
+  }
+  $raw = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
+  foreach ($m in [regex]::Matches($raw, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')) {
+    try {
+      $bytes = [Convert]::FromBase64String(($m.Groups['b64'].Value -replace '\s+', ''))
+      $certs.Add((New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes))) | Out-Null
+    } catch {
+      Write-Warning ("failed to parse bootstrap CA certificate: " + $_)
+    }
+  }
+  return ,([System.Security.Cryptography.X509Certificates.X509Certificate2[]]$certs.ToArray())
+}
+
+function Ensure-BootstrapTlsValidatorType {
+  if (([System.Management.Automation.PSTypeName]"FdsBootstrapTlsValidator").Type) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+public static class FdsBootstrapTlsValidator
+{
+    private static readonly object Sync = new object();
+    private static X509Certificate2Collection CaCertificates = new X509Certificate2Collection();
+    private static HashSet<string> CaThumbprints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static HashSet<string> LeafPins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static string LastFailureValue = "";
+    private static string LastSuccessValue = "";
+
+    public static readonly RemoteCertificateValidationCallback Callback = Validate;
+
+    public static void Configure(X509Certificate2[] certificates, string[] caThumbprints, string[] leafPins)
+    {
+        lock (Sync)
+        {
+            foreach (X509Certificate2 oldCertificate in CaCertificates)
+            {
+                oldCertificate.Dispose();
+            }
+            CaCertificates = new X509Certificate2Collection();
+            CaThumbprints = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            LeafPins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (certificates != null)
+            {
+                foreach (X509Certificate2 certificate in certificates)
+                {
+                    CaCertificates.Add(new X509Certificate2(certificate));
+                }
+            }
+            if (caThumbprints != null)
+            {
+                foreach (string thumbprint in caThumbprints)
+                {
+                    if (!String.IsNullOrEmpty(thumbprint)) CaThumbprints.Add(thumbprint);
+                }
+            }
+            if (leafPins != null)
+            {
+                foreach (string pin in leafPins)
+                {
+                    if (!String.IsNullOrEmpty(pin)) LeafPins.Add(pin);
+                }
+            }
+            LastFailureValue = "";
+            LastSuccessValue = "";
+        }
+    }
+
+    public static string LastFailure
+    {
+        get { lock (Sync) { return LastFailureValue; } }
+    }
+
+    public static string LastSuccess
+    {
+        get { lock (Sync) { return LastSuccessValue; } }
+    }
+
+    private static bool IsServerAuthenticationCertificate(X509Certificate2 certificate)
+    {
+        bool hasEku = false;
+        bool hasServerAuth = false;
+        bool hasAnyExtendedKeyUsage = false;
+        foreach (X509Extension extension in certificate.Extensions)
+        {
+            if (extension.Oid == null || extension.Oid.Value != "2.5.29.37") continue;
+            hasEku = true;
+            X509EnhancedKeyUsageExtension eku = new X509EnhancedKeyUsageExtension(extension, false);
+            foreach (Oid oid in eku.EnhancedKeyUsages)
+            {
+                if (oid != null && oid.Value == "1.3.6.1.5.5.7.3.1")
+                {
+                    hasServerAuth = true;
+                }
+                if (oid != null && oid.Value == "2.5.29.37.0")
+                {
+                    hasAnyExtendedKeyUsage = true;
+                }
+            }
+        }
+        // No EKU means unrestricted usage. anyExtendedKeyUsage is also an
+        // explicit unrestricted usage marker; an explicit EKU list otherwise
+        // must contain serverAuth for the bootstrap HTTPS server.
+        return !hasEku || hasServerAuth || hasAnyExtendedKeyUsage;
+    }
+
+    private static bool HasOnlyPermittedTrustErrors(X509Chain chain, bool allowPartialChain, bool allowUntrustedRoot, out string status)
+    {
+        List<string> failures = new List<string>();
+        foreach (X509ChainElement element in chain.ChainElements)
+        {
+            foreach (X509ChainStatus chainStatus in element.ChainElementStatus)
+            {
+                X509ChainStatusFlags flags = chainStatus.Status;
+                if (flags != X509ChainStatusFlags.NoError &&
+                    !(allowUntrustedRoot && flags == X509ChainStatusFlags.UntrustedRoot) &&
+                    !(allowPartialChain && flags == X509ChainStatusFlags.PartialChain))
+                {
+                    failures.Add(flags.ToString());
+                }
+            }
+        }
+        status = String.Join(",", failures.ToArray());
+        return failures.Count == 0;
+    }
+
+    private static bool HasConfiguredCaAnchor(X509Chain chain)
+    {
+        int lastIndex = chain.ChainElements.Count - 1;
+        for (int index = 0; index < chain.ChainElements.Count; index++)
+        {
+            if (index != lastIndex) continue;
+            X509ChainElement element = chain.ChainElements[index];
+            string thumbprint = (element.Certificate.Thumbprint ?? "").Replace(" ", "").ToUpperInvariant();
+            if (!CaThumbprints.Contains(thumbprint)) continue;
+            foreach (X509Certificate2 configured in CaCertificates)
+            {
+                string configuredThumbprint = (configured.Thumbprint ?? "").Replace(" ", "").ToUpperInvariant();
+                if (configuredThumbprint != thumbprint) continue;
+                foreach (X509Extension extension in configured.Extensions)
+                {
+                    if (extension.Oid != null && extension.Oid.Value == "2.5.29.19")
+                    {
+                        X509BasicConstraintsExtension constraints = new X509BasicConstraintsExtension(extension, false);
+                        if (constraints.CertificateAuthority) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void SetFailure(string value)
+    {
+        lock (Sync)
+        {
+            LastFailureValue = value;
+            LastSuccessValue = "";
+        }
+    }
+
+    private static void SetSuccess(string value)
+    {
+        lock (Sync)
+        {
+            LastFailureValue = "";
+            LastSuccessValue = value;
+        }
+    }
+
+    public static bool Validate(object sender, X509Certificate certificate, X509Chain peerChain, SslPolicyErrors sslPolicyErrors)
+    {
+        try
+        {
+            if (certificate == null)
+            {
+                SetFailure("certificate_not_available");
+                return false;
+            }
+            if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateNotAvailable) != 0)
+            {
+                SetFailure("certificate_not_available");
+                return false;
+            }
+            if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0)
+            {
+                SetFailure("certificate_name_mismatch");
+                return false;
+            }
+            X509Certificate2 leaf = new X509Certificate2(certificate);
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                if (leaf.NotBefore.ToUniversalTime() > now || leaf.NotAfter.ToUniversalTime() < now)
+                {
+                    SetFailure("certificate_not_time_valid");
+                    return false;
+                }
+                if (!IsServerAuthenticationCertificate(leaf))
+                {
+                    SetFailure("certificate_missing_server_auth_eku");
+                    return false;
+                }
+                X509Chain customChain = new X509Chain();
+                try
+                {
+                    // Offline bootstrap policy: no online CRL/OCSP assertion.
+                    // No other chain errors are ignored.
+                    customChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                    customChain.ChainPolicy.UrlRetrievalTimeout = TimeSpan.FromSeconds(5);
+                    customChain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+                    customChain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"));
+                    // Peer-supplied intermediates are candidates, never anchors.
+                    if (peerChain != null)
+                    {
+                        foreach (X509ChainElement element in peerChain.ChainElements)
+                            customChain.ChainPolicy.ExtraStore.Add(element.Certificate);
+                        customChain.ChainPolicy.ExtraStore.AddRange(peerChain.ChainPolicy.ExtraStore);
+                    }
+                    lock (Sync)
+                    {
+                        foreach (X509Certificate2 ca in CaCertificates)
+                        {
+                            customChain.ChainPolicy.ExtraStore.Add(ca);
+                        }
+                    }
+                    bool built = customChain.Build(leaf);
+                    string chainStatus;
+                    string pinStatus;
+                    bool caStatuses = HasOnlyPermittedTrustErrors(customChain, false, true, out chainStatus);
+                    bool pinStatuses = HasOnlyPermittedTrustErrors(customChain, true, true, out pinStatus);
+                    bool caMatch;
+                    bool pinMatch;
+                    lock (Sync)
+                    {
+                        caMatch = built && caStatuses && HasConfiguredCaAnchor(customChain);
+                        string leafHash = "";
+                        using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                        {
+                            leafHash = BitConverter.ToString(sha.ComputeHash(leaf.RawData)).Replace("-", "").ToLowerInvariant();
+                        }
+                        pinMatch = LeafPins.Contains(leafHash) && pinStatuses;
+                    }
+                    if (caMatch)
+                    {
+                        SetSuccess("ca");
+                        return true;
+                    }
+                    if (pinMatch)
+                    {
+                        SetSuccess("leaf_pin");
+                        return true;
+                    }
+                    SetFailure((built ? "bootstrap_trust_anchor_or_pin_mismatch" : "bootstrap_chain_build_failed") +
+                        (String.IsNullOrEmpty(chainStatus) ? "" : ":" + chainStatus));
+                    return false;
+                }
+                finally
+                {
+                    customChain.Dispose();
+                }
+            }
+            finally
+            {
+                leaf.Dispose();
+            }
+        }
+        catch (Exception error)
+        {
+            SetFailure("validator_exception:" + error.GetType().FullName + ":" + error.Message);
+            return false;
+        }
+    }
+}
+'@
+}
+
+$script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $false
+$script:EDR_BOOTSTRAP_TLS_LAST_FAILURE = ""
+
+function Enable-BootstrapTlsValidation([string]$CaPath, [string]$LeafSha256) {
+  $pins = @(Get-NormalizedSha256List $LeafSha256)
+  if ($LeafSha256 -and $pins.Count -eq 0) {
+    throw "bootstrap leaf pin is not a valid SHA-256 value"
+  }
+  if ($CaPath -and -not (Test-Path -LiteralPath $CaPath -PathType Leaf)) {
+    throw ("bootstrap CA file was not found: {0}" -f $CaPath)
+  }
+  $certs = Read-PemCertificates $CaPath
+  if ($pins.Count -eq 0 -and $certs.Count -eq 0) {
+    throw "bootstrap TLS policy was requested but contained no valid CA certificate or leaf pin"
+  }
+  $thumbprints = New-Object System.Collections.Generic.List[string]
+  foreach ($ca in $certs) {
+    if ($ca.Thumbprint) {
+      $thumbprints.Add(($ca.Thumbprint -replace '\s+', '').ToUpperInvariant()) | Out-Null
+    }
+  }
+  $script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 = @($pins)
+  $script:EDR_BOOTSTRAP_TLS_CA_CERTS = @($certs)
+  $script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS = @($thumbprints)
+  Ensure-BootstrapTlsValidatorType
+  [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$certArray = @($certs)
+  [string[]]$thumbprintArray = @($thumbprints)
+  [string[]]$pinArray = @($pins)
+  [FdsBootstrapTlsValidator]::Configure($certArray, $thumbprintArray, $pinArray)
+  $script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $true
+  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [FdsBootstrapTlsValidator]::Callback
+  Write-Host "Enabled bootstrap TLS validation for enrollment"
+}
+
+if ((Get-EnrollOs) -eq "windows") {
+  $compatibilityProvider = Normalize-KeyProvider $KeyProvider
+  $script:EDR_INSTALL_COMPATIBILITY = Assert-WindowsInstallCompatibility -RequestedProvider $compatibilityProvider -ExternalTpmKeyUri ([bool]$TpmKeyUri)
+  Set-WindowsInstallTlsCompatibility
+  $script:EDR_INSTALL_COMPATIBILITY.tls["selected_policy"] = $script:EDR_TLS_POLICY_MODE
+  $script:EDR_INSTALL_COMPATIBILITY.tls["effective_security_protocol"] = $script:EDR_TLS_POLICY_AFTER
+  [void](Write-WindowsInstallCompatibilityDiagnostic -Snapshot $script:EDR_INSTALL_COMPATIBILITY)
+  # Compile/parse bootstrap policy before preflight stops services or creates keys.
+  if ($BootstrapCaCertPath -or $BootstrapTlsLeafSha256) {
+    Enable-BootstrapTlsValidation -CaPath $BootstrapCaCertPath -LeafSha256 $BootstrapTlsLeafSha256
+  }
 }
 
 Invoke-AgentPreflightIfNeeded
@@ -1493,92 +2186,6 @@ function Write-BootstrapPemNoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText(([System.IO.Path]::GetFullPath($Path)), $Text)
 }
 
-function Get-NormalizedSha256List([string]$Value) {
-  $out = New-Object System.Collections.Generic.List[string]
-  if (-not $Value) { return $out.ToArray() }
-  foreach ($part in ($Value -split '[,;\s]+')) {
-    $p = ($part -replace '[:\-]', '').Trim().ToLowerInvariant()
-    if ($p -match '^[0-9a-f]{64}$') {
-      $out.Add($p) | Out-Null
-    }
-  }
-  return $out.ToArray()
-}
-
-function Read-PemCertificates([string]$Path) {
-  $certs = New-Object System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]
-  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
-    return $certs
-  }
-  $raw = [System.IO.File]::ReadAllText(([System.IO.Path]::GetFullPath($Path)))
-  foreach ($m in [regex]::Matches($raw, '-----BEGIN CERTIFICATE-----\s*(?<b64>.*?)\s*-----END CERTIFICATE-----', 'Singleline')) {
-    try {
-      $bytes = [Convert]::FromBase64String(($m.Groups['b64'].Value -replace '\s+', ''))
-      $certs.Add((New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$bytes))) | Out-Null
-    } catch {
-      Write-Warning ("failed to parse bootstrap CA certificate: " + $_)
-    }
-  }
-  return $certs
-}
-
-$script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $false
-
-function Enable-BootstrapTlsValidation([string]$CaPath, [string]$LeafSha256) {
-  $pins = @(Get-NormalizedSha256List $LeafSha256)
-  $certs = Read-PemCertificates $CaPath
-  if ($pins.Count -eq 0 -and $certs.Count -eq 0) {
-    return
-  }
-  $thumbprints = New-Object System.Collections.Generic.List[string]
-  foreach ($ca in $certs) {
-    if ($ca.Thumbprint) {
-      $thumbprints.Add(($ca.Thumbprint -replace '\s+', '').ToUpperInvariant()) | Out-Null
-    }
-  }
-  $script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 = @($pins)
-  $script:EDR_BOOTSTRAP_TLS_CA_CERTS = @($certs)
-  $script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS = @($thumbprints)
-  $script:EDR_BOOTSTRAP_TLS_VALIDATION_ENABLED = $true
-  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {
-    param($sender, $certificate, $chain, $sslPolicyErrors)
-    try {
-      $cert2 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
-      $sha = [System.Security.Cryptography.SHA256]::Create()
-      try {
-        $leaf = ([BitConverter]::ToString($sha.ComputeHash($cert2.RawData)) -replace '-', '').ToLowerInvariant()
-      } finally {
-        $sha.Dispose()
-      }
-      if ($script:EDR_BOOTSTRAP_TLS_LEAF_SHA256 -contains $leaf) {
-        return $true
-      }
-      if ($script:EDR_BOOTSTRAP_TLS_CA_CERTS.Count -gt 0) {
-        $customChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-        $customChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-        $customChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
-        foreach ($ca in $script:EDR_BOOTSTRAP_TLS_CA_CERTS) {
-          $customChain.ChainPolicy.ExtraStore.Add($ca) | Out-Null
-        }
-        [void]$customChain.Build($cert2)
-        foreach ($el in $customChain.ChainElements) {
-          $tp = ($el.Certificate.Thumbprint -replace '\s+', '').ToUpperInvariant()
-          if ($script:EDR_BOOTSTRAP_TLS_CA_THUMBPRINTS -contains $tp) {
-            return $true
-          }
-        }
-      }
-    } catch {
-      return $false
-    }
-    return $false
-  }
-  Write-Host "Enabled bootstrap TLS validation for enrollment"
-}
-
-if ($BootstrapCaCertPath -or $BootstrapTlsLeafSha256) {
-  Enable-BootstrapTlsValidation -CaPath $BootstrapCaCertPath -LeafSha256 $BootstrapTlsLeafSha256
-}
 
 if ($TrustCa) {
   Install-BootstrapCaTrust -Path $CaCertPath
@@ -1713,8 +2320,17 @@ function Get-EnrollFailureHint {
   if ($text -match "license_blocked|license expired|license suspended|expired/suspended|过期许可|许可") {
     return "Tenant license blocks enrollment; renew or reactivate the tenant license before enrolling new endpoints."
   }
+  if ($text -match "securechannelfailure|could not establish trust relationship|ssl/tls|tls handshake|certificate_name_mismatch|certificate_not_time_valid|missing_server_auth_eku|bootstrap_chain") {
+    if ($BootstrapCaCertPath -or $BootstrapTlsLeafSha256) {
+      return "TLS/bootstrap certificate validation failed under the supplied bootstrap policy; verify Schannel events, the server DNS/IP SAN, validity period, serverAuth EKU, CA chain, and configured leaf pin."
+    }
+    return "TLS/bootstrap certificate validation failed; provide a signed bootstrap manifest with tls_ca_pem or tls_leaf_sha256 and verify the server DNS/IP SAN, validity period, serverAuth EKU, and CA chain."
+  }
   if ($text -match "trust|certificate|ssl|tls|认证|证书") {
-    return "TLS/certificate validation failed; provide a signed bootstrap manifest with tls_ca_pem or tls_leaf_sha256, enable TrustCa for a local CA, or use InsecureTls only for lab testing."
+    if ($BootstrapCaCertPath -or $BootstrapTlsLeafSha256) {
+      return "TLS/bootstrap certificate validation failed under the supplied bootstrap policy; inspect Schannel and the bootstrap certificate metadata."
+    }
+    return "TLS/bootstrap certificate validation failed; provide a signed bootstrap manifest with tls_ca_pem or tls_leaf_sha256 and verify the certificate metadata."
   }
   if ($text -match "proxy|407") {
     return "Proxy failed; verify proxy mode, proxy URL, and optional proxy credentials."
@@ -1741,6 +2357,11 @@ function Format-EnrollFailure {
   $parts.Add(("insecure_tls={0}" -f ($env:EDR_INSECURE_TLS -eq "1"))) | Out-Null
   $parts.Add(("bootstrap_ca={0}" -f [bool]$BootstrapCaCertPath)) | Out-Null
   $parts.Add(("bootstrap_leaf_pin={0}" -f [bool]$BootstrapTlsLeafSha256)) | Out-Null
+  $parts.Add(("tls_policy={0}" -f $(if ($script:EDR_TLS_POLICY_MODE) { $script:EDR_TLS_POLICY_MODE } else { "unknown" }))) | Out-Null
+  if (([System.Management.Automation.PSTypeName]"FdsBootstrapTlsValidator").Type) {
+    $parts.Add(("bootstrap_validator_failure={0}" -f [FdsBootstrapTlsValidator]::LastFailure)) | Out-Null
+    $parts.Add(("bootstrap_validator_success={0}" -f [FdsBootstrapTlsValidator]::LastSuccess)) | Out-Null
+  }
   $apiDetails = New-Object System.Collections.Generic.List[string]
   if ($ex -is [System.Net.WebException]) {
     $parts.Add(("web_status={0}" -f $ex.Status)) | Out-Null
@@ -1934,13 +2555,17 @@ function Get-PemCertificateThumbprint([string]$PemText) {
 }
 
 function Accept-CngIssuedCertificate([string]$CertPath, [string]$Provider) {
-  if ($Provider -ne "cng" -and $Provider -ne "tpm") { return }
+  if (($Provider -ne "cng" -and $Provider -ne "tpm") -or ($Provider -eq "tpm" -and $TpmKeyUri)) { return }
   $nativeKey = $null
   $nativeRsa = $null
   $issuedCert = $null
   $certWithKey = $null
   $store = $null
-  try {
+  $compatibility = $script:EDR_INSTALL_COMPATIBILITY
+  $nativeBindingAvailable = [bool]($compatibility -and $compatibility.capabilities.copy_with_private_key -and
+    $compatibility.capabilities.cng_key -and $compatibility.capabilities.cng_provider -and $compatibility.capabilities.rsa_cng)
+  if ($nativeBindingAvailable) {
+    try {
     if (-not $script:EDR_CNG_KEY_CONTAINER) {
       throw "CNG key container is unavailable"
     }
@@ -1969,14 +2594,17 @@ function Accept-CngIssuedCertificate([string]$CertPath, [string]$Provider) {
     $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
     $store.Add($certWithKey)
     return
-  } catch {
-    Write-Warning ("Native CNG certificate binding unavailable; trying bounded certreq compatibility path: " + $_.Exception.Message)
-  } finally {
-    if ($store) { $store.Close() }
-    if ($certWithKey) { $certWithKey.Dispose() }
-    if ($issuedCert) { $issuedCert.Dispose() }
-    if ($nativeRsa) { $nativeRsa.Dispose() }
-    if ($nativeKey) { $nativeKey.Dispose() }
+    } catch {
+      Write-Warning ("Native CNG certificate binding unavailable; trying bounded certreq compatibility path: " + $_.Exception.Message)
+    } finally {
+      if ($store) { $store.Close() }
+      if ($certWithKey) { $certWithKey.Dispose() }
+      if ($issuedCert) { $issuedCert.Dispose() }
+      if ($nativeRsa) { $nativeRsa.Dispose() }
+      if ($nativeKey) { $nativeKey.Dispose() }
+    }
+  } else {
+    Write-Warning "Certificate binding API is unavailable; selecting certreq compatibility path without native binding"
   }
 
   $certreq = Get-Command "certreq.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2865,8 +3493,7 @@ if ($dir -and -not (Test-Path $dir)) {
   New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 $outFile = [System.IO.Path]::GetFullPath($Output)
-$utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
-[System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
+Write-Utf8NoBomFileWithRetry -Path $outFile -Text $toml
 $generatedTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $InstallDirForToml -ConfigPath $outFile
 if ($generatedTomlIssue) {
   Write-AgentTomlSanityDiagnostic -TomlText $toml -Issue ("source={0}; {1}" -f $tomlSource, $generatedTomlIssue) -OutputPath $Output -ReportPath $HealthReportPath
@@ -2877,7 +3504,7 @@ if ($generatedTomlIssue) {
     if (-not $KeepTemplateComments) {
       $toml = Optimize-GeneratedToml $toml
     }
-    [System.IO.File]::WriteAllText($outFile, $toml, $utf8NoBom)
+    Write-Utf8NoBomFileWithRetry -Path $outFile -Text $toml
     $generatedTomlIssue = Test-ExistingAgentTomlWithAgent -InstallRoot $InstallDirForToml -ConfigPath $outFile
   }
 }

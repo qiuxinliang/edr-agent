@@ -31,3 +31,4 @@ edr_windows_release_gate(response_file_security_behavior test_response_file_secu
 edr_windows_release_gate(response_forensic_path_contract test_response_forensic_paths)
 # This test invokes the checked-in PowerShell script, not a generated EXE.
 edr_windows_release_gate(windows_isolation_mock_behavior "")
+edr_windows_release_gate(windows_install_compatibility_behavior "")
