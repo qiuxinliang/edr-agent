@@ -184,25 +184,38 @@ try {
   # Match the complete RSA public key of a unique fixture-owned machine key,
   # never a subject/CN, and never clear the store. Public identities were saved
   # before production rollback deleted the private keys.
+  $pendingStore = $null
   try {
-    if (Test-Path -LiteralPath "Cert:\LocalMachine\Request") {
-      foreach ($pending in @(Get-ChildItem -LiteralPath "Cert:\LocalMachine\Request" -ErrorAction Stop)) {
-        $publicRsa = $null
-        try {
-          $publicRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($pending)
-          if ($publicRsa -and $ownedPublicKeys.Contains((Get-TestRsaPublicIdentity $publicRsa))) {
-            $pendingPath = "Cert:\LocalMachine\Request\" + $pending.Thumbprint
-            Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $pendingPath) { throw "test-owned pending request remains: $($pending.Thumbprint)" }
+    $pendingStore = New-Object Security.Cryptography.X509Certificates.X509Store -ArgumentList @(
+      "REQUEST", [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+    $openFlags = [Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite -bor
+      [Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly
+    $pendingStore.Open($openFlags)
+    foreach ($pending in @($pendingStore.Certificates)) {
+      $publicRsa = $null
+      try {
+        $publicRsa = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($pending)
+        if ($publicRsa -and $ownedPublicKeys.Contains((Get-TestRsaPublicIdentity $publicRsa))) {
+          $thumbprint = $pending.Thumbprint
+          $pendingStore.Remove($pending)
+          $remaining = $pendingStore.Certificates.Find(
+            [Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $thumbprint, $false)
+          try {
+            if ($remaining.Count -ne 0) { throw "test-owned pending request remains: $thumbprint" }
+          } finally {
+            foreach ($remainingCertificate in @($remaining)) { $remainingCertificate.Dispose() }
           }
-        } catch { $keyCleanupErrors.Add("pending request: $($_.Exception.Message)") }
-        finally {
-          if ($publicRsa) { $publicRsa.Dispose() }
-          $pending.Dispose()
         }
+      } catch { $keyCleanupErrors.Add("pending request: $($_.Exception.Message)") }
+      finally {
+        if ($publicRsa) { $publicRsa.Dispose() }
+        $pending.Dispose()
       }
     }
-  } catch { $keyCleanupErrors.Add("pending request enumeration: $($_.Exception.Message)") }
+  } catch { $keyCleanupErrors.Add("pending REQUEST store: $($_.Exception.Message)") }
+  finally {
+    if ($pendingStore) { $pendingStore.Close() }
+  }
   foreach ($keyName in $ownedTestKeys) {
     $key = $null
     try {

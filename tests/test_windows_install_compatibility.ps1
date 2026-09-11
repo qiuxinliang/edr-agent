@@ -19,53 +19,6 @@ function Assert-InstallTestEqual {
   }
 }
 
-function Ensure-TestCertificateProvider {
-  $certDrive = Get-PSDrive -Name Cert -ErrorAction SilentlyContinue
-  if ($certDrive) {
-    if ($certDrive.Provider.Name -ne "Certificate") {
-      throw "The Cert drive is already mapped to an unexpected provider: $($certDrive.Provider.Name)"
-    }
-    return
-  }
-
-  $provider = Get-PSProvider -PSProvider Certificate -ErrorAction SilentlyContinue
-  if (-not $provider -and -not (Get-Module -Name Microsoft.PowerShell.Security)) {
-    # -NoProfile runners can have the provider type data partially registered
-    # by another built-in module. A terminating import can then fail with
-    # FormatXmlUpdateException for duplicate members, even though the provider
-    # can still be used. Preserve the import error and allow only that known
-    # condition after verifying the actual provider below.
-    $importFailure = $null
-    try {
-      Import-Module Microsoft.PowerShell.Security -ErrorAction Stop | Out-Null
-    } catch {
-      $importFailure = $_
-    }
-    $provider = Get-PSProvider -PSProvider Certificate -ErrorAction SilentlyContinue
-    $importMessage = if ($importFailure) { [string]$importFailure.Exception.Message } else { "" }
-    $duplicateTypeData = $importFailure -and
-      ([string]$importFailure.FullyQualifiedErrorId -match "FormatXmlUpdateException") -and
-      ($importMessage -match "(?s)Error in TypeData.*System.Security.AccessControl.ObjectSecurity") -and
-      ($importMessage -match "(?s)member .*already present")
-    if ($importFailure -and (-not $duplicateTypeData -or -not $provider)) {
-      throw ("Microsoft.PowerShell.Security import failed: " + $importFailure.Exception.Message)
-    }
-  }
-  if (-not $provider) {
-    throw "Windows certificate compatibility test requires the Microsoft.PowerShell.Security Certificate provider"
-  }
-
-  $certDrive = Get-PSDrive -Name Cert -ErrorAction SilentlyContinue
-  if ($certDrive) {
-    if ($certDrive.Provider.Name -ne "Certificate") {
-      throw "The Cert drive is already mapped to an unexpected provider: $($certDrive.Provider.Name)"
-    }
-    return
-  }
-  New-PSDrive -Name Cert -PSProvider Certificate -Root "\" -Scope Script -ErrorAction Stop | Out-Null
-  Get-PSDrive -Name Cert -PSProvider Certificate -ErrorAction Stop | Out-Null
-}
-
 if ([string]$PSVersionTable.PSEdition -ne "Desktop") {
   throw "Windows install compatibility test must run under Windows PowerShell 5.1 Desktop; actual edition=$($PSVersionTable.PSEdition)"
 }
@@ -95,6 +48,7 @@ $expired = $null
 $unrestricted = $null
 $intermediate = $null
 $restrictedLeaf = $null
+$certificateFixtures = New-Object System.Collections.ArrayList
 $oldTls = [Net.ServicePointManager]::SecurityProtocol
 $oldCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
 $caPath = Join-Path $diagnosticRoot "bootstrap-ca.cer"
@@ -205,35 +159,38 @@ public class NativeOutputFixture {
   Assert-InstallTest ($timedOut -and $watch.Elapsed.TotalSeconds -lt 10) "child timeout and termination are bounded"
 
   Ensure-BootstrapTlsValidatorType
-  Ensure-TestCertificateProvider
-  $newSelfSigned = Get-Command New-SelfSignedCertificate -ErrorAction SilentlyContinue
-  if (-not $newSelfSigned) { throw "New-SelfSignedCertificate is required by the certificate validator behavior test" }
-  $storePath = "Cert:\CurrentUser\My"
-  $root = New-SelfSignedCertificate -Type Custom -Subject "CN=FDS Compatibility Test Root" -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage CertSign, CRLSign, DigitalSignature -TextExtension @("2.5.29.19={critical}{text}CA=true") `
-    -CertStoreLocation $storePath -NotBefore (Get-Date).AddDays(-10)
-  $server = New-SelfSignedCertificate -Type Custom -Subject "CN=server.example" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature, KeyEncipherment `
-    -TextExtension @("2.5.29.17={text}DNS=server.example&IPAddress=127.0.0.1", "2.5.29.37={critical}{text}1.3.6.1.5.5.7.3.1") `
-    -CertStoreLocation $storePath -NotAfter (Get-Date).AddDays(30)
-  $wrongEku = New-SelfSignedCertificate -Type Custom -Subject "CN=wrong-eku.example" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature, KeyEncipherment `
-    -TextExtension @("2.5.29.17={text}DNS=wrong-eku.example", "2.5.29.37={critical}{text}1.3.6.1.5.5.7.3.2") `
-    -CertStoreLocation $storePath -NotAfter (Get-Date).AddDays(30)
-  $expired = New-SelfSignedCertificate -Type Custom -Subject "CN=expired.example" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature, KeyEncipherment `
-    -TextExtension @("2.5.29.17={text}DNS=expired.example", "2.5.29.37={critical}{text}1.3.6.1.5.5.7.3.1") `
-    -CertStoreLocation $storePath -NotBefore (Get-Date).AddDays(-3) -NotAfter (Get-Date).AddDays(-1)
-  $wrongIp = New-SelfSignedCertificate -Type Custom -Subject "CN=wrong-ip.example" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature, KeyEncipherment `
-    -TextExtension @("2.5.29.17={text}DNS=wrong-ip.example", "2.5.29.37={critical}{text}1.3.6.1.5.5.7.3.1") `
-    -CertStoreLocation $storePath -NotAfter (Get-Date).AddDays(30)
-  $unrestricted = New-SelfSignedCertificate -Type Custom -Subject "CN=unrestricted.example" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature, KeyEncipherment -CertStoreLocation $storePath -NotAfter (Get-Date).AddDays(30)
-  $intermediate = New-SelfSignedCertificate -Type Custom -Subject "CN=Restricted Intermediate" -Signer $root -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage CertSign, CRLSign -TextExtension @("2.5.29.19={critical}{text}CA=true", "2.5.29.37={text}1.3.6.1.5.5.7.3.2") -CertStoreLocation $storePath
-  $restrictedLeaf = New-SelfSignedCertificate -Type Custom -Subject "CN=restricted.example" -Signer $intermediate -KeyAlgorithm RSA -KeyLength 2048 `
-    -HashAlgorithm SHA256 -KeyUsage DigitalSignature -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") -CertStoreLocation $storePath -NotAfter (Get-Date).AddDays(30)
+  Add-Type -Path (Join-Path $RepositoryRoot "tests\windows_install_tls_fixture.cs")
+  $rootFixture = [InstallCertificateFixtureFactory]::CreateRoot("FDS Compatibility Test Root")
+  [void]$certificateFixtures.Add($rootFixture)
+  $root = $rootFixture.Certificate
+  $serverFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "server.example", $false, "1.3.6.1.5.5.7.3.1", "server.example", "127.0.0.1", -1, 30)
+  [void]$certificateFixtures.Add($serverFixture)
+  $server = $serverFixture.Certificate
+  $wrongEkuFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "wrong-eku.example", $false, "1.3.6.1.5.5.7.3.2", "wrong-eku.example", "", -1, 30)
+  [void]$certificateFixtures.Add($wrongEkuFixture)
+  $wrongEku = $wrongEkuFixture.Certificate
+  $expiredFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "expired.example", $false, "1.3.6.1.5.5.7.3.1", "expired.example", "", -3, -1)
+  [void]$certificateFixtures.Add($expiredFixture)
+  $expired = $expiredFixture.Certificate
+  $wrongIpFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "wrong-ip.example", $false, "1.3.6.1.5.5.7.3.1", "wrong-ip.example", "", -1, 30)
+  [void]$certificateFixtures.Add($wrongIpFixture)
+  $wrongIp = $wrongIpFixture.Certificate
+  $unrestrictedFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "unrestricted.example", $false, "", "unrestricted.example", "", -1, 30)
+  [void]$certificateFixtures.Add($unrestrictedFixture)
+  $unrestricted = $unrestrictedFixture.Certificate
+  $intermediateFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $rootFixture, "Restricted Intermediate", $true, "1.3.6.1.5.5.7.3.2", "", "", -1, 90)
+  [void]$certificateFixtures.Add($intermediateFixture)
+  $intermediate = $intermediateFixture.Certificate
+  $restrictedLeafFixture = [InstallCertificateFixtureFactory]::CreateIssued(
+    $intermediateFixture, "restricted.example", $false, "1.3.6.1.5.5.7.3.1", "restricted.example", "", -1, 30)
+  [void]$certificateFixtures.Add($restrictedLeafFixture)
+  $restrictedLeaf = $restrictedLeafFixture.Certificate
   [IO.File]::WriteAllText($caPath, (ConvertTo-Pem "CERTIFICATE" $root.RawData), [Text.Encoding]::ASCII)
   [IO.File]::WriteAllBytes($emptyCaPath, [byte[]]@())
   [IO.File]::WriteAllBytes($caBundlePath, [IO.File]::ReadAllBytes($caPath) + [IO.File]::ReadAllBytes($caPath))
@@ -283,7 +240,6 @@ public class NativeOutputFixture {
   } finally { $emptyCertificate.Dispose() }
 
   # Actual Invoke-RestMethod -> Schannel -> CLR delegate callbacks over TLS1.2.
-  Add-Type -Path (Join-Path $RepositoryRoot "tests\windows_install_tls_fixture.cs")
   foreach ($usePin in @($false, $true)) {
     if ($usePin) { Enable-BootstrapTlsValidation -CaPath "" -LeafSha256 $serverPin }
     else { Enable-BootstrapTlsValidation -CaPath $caPath -LeafSha256 "" }
@@ -335,12 +291,9 @@ public class NativeOutputFixture {
   [Net.ServicePointManager]::SecurityProtocol = $oldTls
   [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
   $cleanupErrors = New-Object 'System.Collections.Generic.List[string]'
-  foreach ($certificate in @($restrictedLeaf, $intermediate, $unrestricted, $expired, $wrongIp, $wrongEku, $server, $root)) {
-    if ($certificate -and $certificate.Thumbprint) {
-      try { Remove-Item -LiteralPath ("Cert:\CurrentUser\My\" + $certificate.Thumbprint) -DeleteKey -Force -ErrorAction Stop }
-      catch { $cleanupErrors.Add($_.Exception.Message) }
-      finally { $certificate.Dispose() }
-    }
+  for ($fixtureIndex = $certificateFixtures.Count - 1; $fixtureIndex -ge 0; $fixtureIndex--) {
+    try { $certificateFixtures[$fixtureIndex].Dispose() }
+    catch { $cleanupErrors.Add($_.Exception.Message) }
   }
   Remove-Item -LiteralPath $diagnosticRoot -Recurse -Force -ErrorAction SilentlyContinue
   if ($null -eq $oldDiagnosticRoot) { Remove-Item Env:\EDR_INSTALL_DIAGNOSTICS_DIR -ErrorAction SilentlyContinue }
