@@ -28,7 +28,7 @@ function Ensure-TestCertificateProvider {
     return
   }
 
-  $provider = Get-PSProvider -Name Certificate -ErrorAction SilentlyContinue
+  $provider = Get-PSProvider -PSProvider Certificate -ErrorAction SilentlyContinue
   if (-not $provider -and -not (Get-Module -Name Microsoft.PowerShell.Security)) {
     # -NoProfile runners can have the provider type data partially registered
     # by another built-in module. A terminating import can then fail with
@@ -41,7 +41,7 @@ function Ensure-TestCertificateProvider {
     } catch {
       $importFailure = $_
     }
-    $provider = Get-PSProvider -Name Certificate -ErrorAction SilentlyContinue
+    $provider = Get-PSProvider -PSProvider Certificate -ErrorAction SilentlyContinue
     $importMessage = if ($importFailure) { [string]$importFailure.Exception.Message } else { "" }
     $duplicateTypeData = $importFailure -and
       ([string]$importFailure.FullyQualifiedErrorId -match "FormatXmlUpdateException") -and
