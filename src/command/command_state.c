@@ -43,14 +43,37 @@ typedef struct EdrCommandStateFileInfo {
 static EdrCommandStateQuarantineStats s_quarantine_stats;
 static unsigned long s_quarantine_serial;
 
+typedef struct EdrControlAckScanner {
+  char dir[1024];
+  int pass_started;
+  int pass_had_read_error;
+  size_t pass_pending_count;
+  int64_t pass_earliest_retry_ms;
+#ifdef _WIN32
+  HANDLE handle;
+  WIN32_FIND_DATAA current;
+  int current_ready;
+#else
+  DIR *handle;
+#endif
+} EdrControlAckScanner;
+
+static EdrControlAckScanner s_ack_scanner;
+
 #ifdef _WIN32
 static SRWLOCK s_quarantine_lock = SRWLOCK_INIT;
+static SRWLOCK s_ack_scan_lock = SRWLOCK_INIT;
 static void quarantine_lock(void) { AcquireSRWLockExclusive(&s_quarantine_lock); }
 static void quarantine_unlock(void) { ReleaseSRWLockExclusive(&s_quarantine_lock); }
+static void ack_scan_lock(void) { AcquireSRWLockExclusive(&s_ack_scan_lock); }
+static void ack_scan_unlock(void) { ReleaseSRWLockExclusive(&s_ack_scan_lock); }
 #else
 static pthread_mutex_t s_quarantine_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_ack_scan_lock = PTHREAD_MUTEX_INITIALIZER;
 static void quarantine_lock(void) { pthread_mutex_lock(&s_quarantine_lock); }
 static void quarantine_unlock(void) { pthread_mutex_unlock(&s_quarantine_lock); }
+static void ack_scan_lock(void) { pthread_mutex_lock(&s_ack_scan_lock); }
+static void ack_scan_unlock(void) { pthread_mutex_unlock(&s_ack_scan_lock); }
 #endif
 
 static EdrCommandStateFileInfo s_collect_cache_info;
@@ -1164,6 +1187,95 @@ static int control_ack_name_is_record(const char *name) {
   return n > 5u && strcmp(name + n - 5u, ".json") == 0;
 }
 
+static void control_ack_scanner_close_locked(void) {
+#ifdef _WIN32
+  if (s_ack_scanner.handle && s_ack_scanner.handle != INVALID_HANDLE_VALUE) {
+    FindClose(s_ack_scanner.handle);
+  }
+  s_ack_scanner.handle = NULL;
+  s_ack_scanner.current_ready = 0;
+#else
+  if (s_ack_scanner.handle) {
+    closedir(s_ack_scanner.handle);
+  }
+  s_ack_scanner.handle = NULL;
+#endif
+  s_ack_scanner.pass_started = 0;
+}
+
+static int control_ack_scanner_begin_locked(const char *dir) {
+  control_ack_scanner_close_locked();
+  snprintf(s_ack_scanner.dir, sizeof(s_ack_scanner.dir), "%s", dir ? dir : "");
+  s_ack_scanner.pass_pending_count = 0u;
+  s_ack_scanner.pass_earliest_retry_ms = 0;
+  s_ack_scanner.pass_had_read_error = 0;
+  s_ack_scanner.pass_started = 1;
+#ifdef _WIN32
+  {
+    char pattern[1100];
+    snprintf(pattern, sizeof(pattern), "%s\\*", s_ack_scanner.dir);
+    s_ack_scanner.handle = FindFirstFileA(pattern, &s_ack_scanner.current);
+    if (s_ack_scanner.handle == INVALID_HANDLE_VALUE) {
+      DWORD error = GetLastError();
+      s_ack_scanner.handle = NULL;
+      return error == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    }
+    s_ack_scanner.current_ready = 1;
+  }
+#else
+  s_ack_scanner.handle = opendir(s_ack_scanner.dir);
+  if (!s_ack_scanner.handle) {
+    return -1;
+  }
+#endif
+  return 1;
+}
+
+static int control_ack_scanner_next_locked(char *name, size_t name_cap,
+                                           int *out_is_directory) {
+  if (!name || name_cap == 0u) {
+    return 0;
+  }
+#ifdef _WIN32
+  if (!s_ack_scanner.handle) {
+    return 0;
+  }
+  if (!s_ack_scanner.current_ready) {
+    if (!FindNextFileA(s_ack_scanner.handle, &s_ack_scanner.current)) {
+      return GetLastError() == ERROR_NO_MORE_FILES ? 0 : -1;
+    }
+  }
+  s_ack_scanner.current_ready = 0;
+  snprintf(name, name_cap, "%s", s_ack_scanner.current.cFileName);
+  if (out_is_directory) {
+    *out_is_directory =
+        (s_ack_scanner.current.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  }
+#else
+  struct dirent *ent;
+  if (!s_ack_scanner.handle) {
+    return -1;
+  }
+  errno = 0;
+  ent = readdir(s_ack_scanner.handle);
+  if (!ent) {
+    if (errno != 0) {
+      return -1;
+    }
+    return 0;
+  }
+  snprintf(name, name_cap, "%s", ent->d_name);
+  if (out_is_directory) {
+#ifdef DT_DIR
+    *out_is_directory = ent->d_type == DT_DIR;
+#else
+    *out_is_directory = 0;
+#endif
+  }
+#endif
+  return 1;
+}
+
 int edr_command_state_upsert_pending_ack(const EdrControlAckRecord *record) {
   if (!record || !record->command_id[0]) {
     return -1;
@@ -1284,6 +1396,112 @@ int edr_command_state_collect_pending_acks(EdrControlAckRecord *out, size_t cap)
   closedir(d);
 #endif
   return (int)count;
+}
+
+int edr_command_state_collect_due_pending_acks(
+    EdrControlAckRecord *out, size_t out_cap, int64_t now_unix_ms,
+    size_t scan_budget, EdrControlAckScanStats *out_stats) {
+  char dir[1024];
+  size_t selected = 0u;
+  EdrControlAckScanStats stats;
+  memset(&stats, 0, sizeof(stats));
+  if (!out || out_cap == 0u || scan_budget == 0u) {
+    if (out_stats) {
+      *out_stats = stats;
+    }
+    return 0;
+  }
+  if (scan_budget > 4096u) {
+    scan_budget = 4096u;
+  }
+  control_ack_default_dir(dir, sizeof(dir));
+  ack_scan_lock();
+  if (s_ack_scanner.pass_started && strcmp(s_ack_scanner.dir, dir) != 0) {
+    control_ack_scanner_close_locked();
+  }
+  if (state_prepare_dir(dir) != 0) {
+    stats.traversal_error = 1;
+    goto done;
+  }
+
+  if (!s_ack_scanner.pass_started || strcmp(s_ack_scanner.dir, dir) != 0) {
+    int begin_rc = control_ack_scanner_begin_locked(dir);
+    if (begin_rc <= 0) {
+      stats.traversal_complete = begin_rc == 0;
+      stats.traversal_error = begin_rc < 0;
+      control_ack_scanner_close_locked();
+      goto done;
+    }
+  }
+  while (stats.scanned_entry_count < scan_budget && selected < out_cap) {
+    char name[512];
+    char path[1600];
+    int is_directory = 0;
+    int next_rc = control_ack_scanner_next_locked(name, sizeof(name), &is_directory);
+    if (next_rc <= 0) {
+      stats.traversal_complete = next_rc == 0 && !s_ack_scanner.pass_had_read_error;
+      stats.traversal_error = next_rc < 0 || s_ack_scanner.pass_had_read_error;
+      stats.pending_record_count_observed = s_ack_scanner.pass_pending_count;
+      stats.earliest_retry_unix_ms_observed =
+          s_ack_scanner.pass_earliest_retry_ms;
+      control_ack_scanner_close_locked();
+      goto done;
+    }
+    stats.scanned_entry_count++;
+    if (is_directory || !control_ack_name_is_record(name)) {
+      continue;
+    }
+#ifdef _WIN32
+    snprintf(path, sizeof(path), "%s\\%s", dir, name);
+#else
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+#endif
+    EdrControlAckRecord rec;
+    int read_rc = control_ack_read_file(path, &rec);
+    if (read_rc != 0) {
+      if (read_rc < 0) {
+        s_ack_scanner.pass_had_read_error = 1;
+      }
+      if (read_rc > 0) {
+        /* Match the legacy collector's ownership rule: re-read while holding
+         * the writer lock before quarantining a malformed snapshot. */
+        FILE *lock = state_lock_acquire();
+        if (lock) {
+          EdrControlAckRecord confirm;
+          int confirm_rc = control_ack_read_file(path, &confirm);
+          if (confirm_rc > 0) {
+            (void)state_move_to_quarantine(
+                dir, path, "control_ack", "malformed_control_ack_record");
+          } else if (confirm_rc < 0) {
+            s_ack_scanner.pass_had_read_error = 1;
+          }
+          state_lock_release(lock);
+        } else {
+          s_ack_scanner.pass_had_read_error = 1;
+        }
+      }
+      continue;
+    }
+    s_ack_scanner.pass_pending_count++;
+    if (s_ack_scanner.pass_earliest_retry_ms == 0 ||
+        rec.next_retry_unix_ms < s_ack_scanner.pass_earliest_retry_ms) {
+      s_ack_scanner.pass_earliest_retry_ms = rec.next_retry_unix_ms;
+    }
+    if (rec.next_retry_unix_ms <= now_unix_ms) {
+      out[selected++] = rec;
+    }
+  }
+  stats.pending_record_count_observed = s_ack_scanner.pass_pending_count;
+  stats.earliest_retry_unix_ms_observed =
+      s_ack_scanner.pass_earliest_retry_ms;
+
+done:
+  stats.selected_due_count = selected;
+  if (out_stats) {
+    *out_stats = stats;
+  }
+  ack_scan_unlock();
+  return (int)selected;
 }
 
 void edr_command_state_delete_pending_ack(const char *command_id) {

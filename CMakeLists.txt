@@ -530,6 +530,7 @@ set(EDR_AGENT_SOURCES
   src/transport/command_result_json.c
   src/transport/ingest_http.c
   src/transport/request_signing.c
+  src/transport/http_retry.c
   src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c

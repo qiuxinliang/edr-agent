@@ -9,6 +9,7 @@
 #include "edr/command_state.h"
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
+#include "edr/http_retry.h"
 #include "edr/preprocess.h"
 #include "edr/sha256.h"
 #include "edr/transport_v2.h"
@@ -22,7 +23,7 @@
 #include <time.h>
 
 static int json_get_bool(const char *obj, const char *key, int *out);
-static void control_ack_refresh_pending_runtime(void);
+static void control_ack_mark_pending_snapshot_stale(void);
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (void)pct; }
@@ -167,6 +168,7 @@ static unsigned long s_control_ack_retry_ok;
 static unsigned long s_control_ack_retry_fail;
 static unsigned long s_control_ack_outbox_persist_fail;
 static unsigned long s_control_ack_pending;
+static int s_control_ack_pending_complete;
 static int64_t s_last_command_ack_ms;
 static int64_t s_last_command_ack_failure_ms;
 static int64_t s_next_control_ack_retry_ms;
@@ -932,15 +934,6 @@ static void runtime_failure(const char *msg) {
   }
 }
 
-static int runtime_last_error_is_http_client_error(void) {
-  int rejected;
-  runtime_state_lock();
-  rejected = strstr(s_last_error, "http get status: HTTP/1.1 4") != NULL ||
-             strstr(s_last_error, "http get status: HTTP/1.0 4") != NULL;
-  runtime_state_unlock();
-  return rejected;
-}
-
 static void note_http_request_success(void) {
   runtime_state_lock();
   s_http_request_ok++;
@@ -1541,7 +1534,6 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   int control_h2_enabled = control_http2_client_enabled();
   int control_h2_required = control_http2_required();
   int control_h1_fallback = control_http1_fallback_enabled();
-  control_ack_refresh_pending_runtime();
   runtime_state_lock();
   int64_t stream_last_activity_ms = s_control_stream_last_activity_ms;
   memset(out, 0, sizeof(*out));
@@ -1622,6 +1614,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->control_ack_retry_fail_count = s_control_ack_retry_fail;
   out->control_ack_outbox_persist_fail_count = s_control_ack_outbox_persist_fail;
   out->control_ack_pending_count = s_control_ack_pending;
+  out->control_ack_pending_count_complete = s_control_ack_pending_complete;
   out->last_command_ack_unix_ms = s_last_command_ack_ms;
   out->last_command_ack_failure_unix_ms = s_last_command_ack_failure_ms;
   out->next_control_ack_retry_unix_ms = s_next_control_ack_retry_ms;
@@ -2964,43 +2957,22 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
 static int append_request_headers(char *req, size_t cap, const char *method, const char *path,
                                   const char *host, const char *content_type,
                                   const char *body, size_t body_len) {
-  int n;
-  size_t used;
-  n = snprintf(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, host);
-  if (n <= 0 || (size_t)n >= cap) {
-    return -1;
-  }
-  used = (size_t)n;
-  if (content_type && content_type[0]) {
-    n = snprintf(req + used, cap - used, "Content-Type: %s\r\n", content_type);
-    if (n <= 0 || (size_t)n >= cap - used) {
-      return -1;
-    }
-    used += (size_t)n;
-  }
-  if (body_len > 0u || strcmp(method, "POST") == 0) {
-    n = snprintf(req + used, cap - used, "Content-Length: %zu\r\n", body_len);
-    if (n <= 0 || (size_t)n >= cap - used) {
-      return -1;
-    }
-    used += (size_t)n;
-  }
-  n = append_common_headers(req, cap, used);
-  if (n <= 0) {
-    return -1;
-  }
-  used = (size_t)n;
-  n = append_signature_headers(req, cap, used, method, path, body, body_len);
-  if (n <= 0) {
-    return -1;
-  }
-  used = (size_t)n;
-  n = snprintf(req + used, cap - used, "Connection: %s\r\n\r\n",
-               http_keepalive_enabled() ? "keep-alive" : "close");
-  if (n <= 0 || (size_t)n >= cap - used) {
-    return -1;
-  }
-  return (int)(used + (size_t)n);
+  EdrHttpRequestAttemptSpec spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.signing = &s_request_signing;
+  spec.method = method;
+  spec.path = path;
+  spec.host = host;
+  spec.content_type = content_type;
+  spec.body = body;
+  spec.body_len = body_len;
+  spec.tenant_id = s_tenant;
+  spec.endpoint_id = s_endpoint;
+  spec.user_id = s_user;
+  spec.bearer_token = s_bearer;
+  spec.permission_set = "telemetry:write,endpoint:attack_surface_report";
+  spec.keepalive = http_keepalive_enabled();
+  return edr_http_build_request_headers(&spec, unix_ms_now(), req, cap);
 }
 
 static int append_request_headers_hash(char *req, size_t cap, const char *method,
@@ -3172,31 +3144,33 @@ static void append_body_copy(char *body, size_t body_cap, size_t *body_used,
   body[*body_used] = '\0';
 }
 
-static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
-                                        char *body, size_t body_cap, int *out_reusable) {
+static EdrHttpAttemptOutcome read_http_response_from_recv(
+    int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
+    char *body, size_t body_cap, int *out_reusable) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
   size_t body_used = 0;
   long content_len = -1;
-  int status_ok = 0;
+  int status_code = 0;
   int reusable = 0;
   if (body && body_cap > 0u) body[0] = '\0';
   if (out_reusable) *out_reusable = 0;
   for (;;) {
     int n;
-    if (used >= sizeof(buf) - 1u) return -1;
+    if (used >= sizeof(buf) - 1u) return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     n = recvfn(ctx, buf + used, (int)(sizeof(buf) - 1u - used));
-    if (n <= 0) return -1;
+    if (n <= 0) return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     used += (size_t)n;
     buf[used] = '\0';
     {
       char *hdr = strstr(buf, "\r\n\r\n");
       if (!hdr) continue;
       header_len = (size_t)(hdr + 4 - buf);
-      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
+      status_code = edr_http_status_code_from_line(buf);
       content_len = parse_content_length_header(buf);
-      reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
+      reusable = status_code >= 200 && status_code < 300 && content_len >= 0 &&
+                 !headers_connection_close(buf) && !headers_chunked(buf);
       if (used > header_len) {
         append_body_copy(body, body_cap, &body_used, buf + header_len, used - header_len);
       }
@@ -3210,7 +3184,9 @@ static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int 
       long remain = content_len - (long)got;
       int want = remain > (long)sizeof(tmp) ? (int)sizeof(tmp) : (int)remain;
       int n = recvfn(ctx, tmp, want);
-      if (n <= 0) return -1;
+      if (n <= 0) {
+        return edr_http_classify_response(status_code, 0);
+      }
       used += (size_t)n;
       append_body_copy(body, body_cap, &body_used, tmp, (size_t)n);
     }
@@ -3218,7 +3194,7 @@ static int read_http_response_from_recv(int (*recvfn)(void *ctx, char *buf, int 
     reusable = 0;
   }
   if (out_reusable) *out_reusable = reusable;
-  return status_ok ? 0 : -1;
+  return edr_http_classify_response(status_code, 1);
 }
 
 static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_bytes,
@@ -3238,58 +3214,62 @@ static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_byt
   return 0;
 }
 
-static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
-                                                FILE *out, size_t max_bytes, int *out_reusable,
-                                                EdrAgentConfigHeaders *out_agent_config) {
+static EdrHttpAttemptOutcome read_http_response_to_file_from_recv(
+    int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
+    FILE *out, size_t max_bytes, int *out_reusable,
+    EdrAgentConfigHeaders *out_agent_config) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
   size_t written = 0;
   long content_len = -1;
-  int status_ok = 0;
+  int status_code = 0;
   int reusable = 0;
   if (out_reusable) *out_reusable = 0;
-  if (!out || max_bytes == 0u) return -1;
+  if (!out || max_bytes == 0u) return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
   for (;;) {
     int n;
-    if (used >= sizeof(buf) - 1u) return -1;
+    if (used >= sizeof(buf) - 1u) return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     n = recvfn(ctx, buf + used, (int)(sizeof(buf) - 1u - used));
-    if (n <= 0) return -1;
+    if (n <= 0) return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     used += (size_t)n;
     buf[used] = '\0';
     {
       char *hdr = strstr(buf, "\r\n\r\n");
       if (!hdr) continue;
       header_len = (size_t)(hdr + 4 - buf);
-      status_ok = (strncmp(buf, "HTTP/1.1 2", 10u) == 0 || strncmp(buf, "HTTP/1.0 2", 10u) == 0);
+      status_code = edr_http_status_code_from_line(buf);
       content_len = parse_content_length_header(buf);
-      reusable = status_ok && content_len >= 0 && !headers_connection_close(buf) && !headers_chunked(buf);
-      if (status_ok) {
+      reusable = status_code >= 200 && status_code < 300 && content_len >= 0 &&
+                 !headers_connection_close(buf) && !headers_chunked(buf);
+      if (status_code >= 200 && status_code < 300) {
         parse_agent_config_headers(buf, out_agent_config);
       }
-      if (!status_ok) {
+      if (status_code < 200 || status_code >= 300) {
         char line[96];
         char msg[140];
         copy_status_line(buf, line, sizeof(line));
         snprintf(msg, sizeof(msg), "http get status: %s", line[0] ? line : "non-2xx");
         runtime_failure(msg);
-        return -1;
+        return status_code > 0
+                   ? EDR_HTTP_ATTEMPT_RESPONSE_FAILURE
+                   : EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
       }
       if (headers_chunked(buf)) {
         runtime_failure("http get chunked response unsupported");
-        return -1;
+        return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
       }
       if (content_len < 0) {
         runtime_failure("http get missing content-length");
-        return -1;
+        return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
       }
       if ((unsigned long)content_len > (unsigned long)max_bytes) {
         runtime_failure("http get response too large");
-        return -1;
+        return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
       }
       if (used > header_len &&
           write_response_chunk_to_file(out, &written, max_bytes, buf + header_len, used - header_len) != 0) {
-        return -1;
+        return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
       }
       break;
     }
@@ -3299,13 +3279,13 @@ static int read_http_response_to_file_from_recv(int (*recvfn)(void *ctx, char *b
     long remain = content_len - (long)written;
     int want = remain > (long)sizeof(tmp) ? (int)sizeof(tmp) : (int)remain;
     int n = recvfn(ctx, tmp, want);
-    if (n <= 0) return -1;
+    if (n <= 0) return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     if (write_response_chunk_to_file(out, &written, max_bytes, tmp, (size_t)n) != 0) {
-      return -1;
+      return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
     }
   }
   if (out_reusable) *out_reusable = reusable;
-  return 0;
+  return EDR_HTTP_ATTEMPT_SUCCESS;
 }
 
 #ifdef EDR_HAVE_OPENSSL_HTTP
@@ -4480,6 +4460,53 @@ static int curl_h1_stream_loop(const char *url) {
 }
 #endif
 
+typedef struct EdrNativeRequestAttemptContext {
+  char *resp_body;
+  size_t resp_body_cap;
+  const char *host;
+  int port;
+  int https;
+  int telemetry;
+} EdrNativeRequestAttemptContext;
+
+static int64_t native_request_now_ms(void *opaque) {
+  (void)opaque;
+  return unix_ms_now();
+}
+
+static EdrHttpAttemptOutcome native_request_transmit(
+    void *opaque, const char *request_headers, size_t request_headers_len,
+    const char *body, size_t body_len) {
+  EdrNativeRequestAttemptContext *ctx = (EdrNativeRequestAttemptContext *)opaque;
+  EdrHttpConn *conn;
+  EdrHttpAttemptOutcome outcome;
+  int reusable = 0;
+  if (!ctx) {
+    return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
+  }
+  conn = http_conn_get_locked(ctx->host, ctx->port, ctx->https, ctx->telemetry);
+  if (!conn) {
+    return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
+  }
+  if (http_conn_write_all(conn, request_headers, request_headers_len) != 0 ||
+      (body_len > 0u && (!body || http_conn_write_all(conn, body, body_len) != 0))) {
+    http_conn_close_locked();
+    return EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
+  }
+  outcome = read_http_response_from_recv(http_socket_recv_adapter, conn,
+                                         ctx->resp_body, ctx->resp_body_cap,
+                                         &reusable);
+  if (outcome == EDR_HTTP_ATTEMPT_SUCCESS) {
+    conn->last_used_ms = unix_ms_now();
+    if (!reusable || !http_keepalive_enabled()) {
+      http_conn_close_locked();
+    }
+    return outcome;
+  }
+  http_conn_close_locked();
+  return outcome;
+}
+
 static int native_request_ex(const char *method, const char *url, const char *content_type,
                              const char *body, size_t body_len, char *resp_body,
                              size_t resp_body_cap, long timeout_s) {
@@ -4488,8 +4515,6 @@ static int native_request_ex(const char *method, const char *url, const char *co
   int port = 0;
   int https = 0;
   int rc = -1;
-  char req[8192];
-  int rn;
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4542,31 +4567,41 @@ static int native_request_ex(const char *method, const char *url, const char *co
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), method, path, host, content_type, body, body_len);
-  if (rn <= 0) {
-    runtime_failure("http request build failed");
-    return -1;
-  }
+  EdrNativeRequestAttemptContext attempt_ctx;
+  memset(&attempt_ctx, 0, sizeof(attempt_ctx));
+  attempt_ctx.resp_body = resp_body;
+  attempt_ctx.resp_body_cap = resp_body_cap;
+  attempt_ctx.host = host;
+  attempt_ctx.port = port;
+  attempt_ctx.https = https;
+  attempt_ctx.telemetry = edr_http_budget_is_telemetry(url);
+  EdrHttpRequestAttemptSpec request_spec;
+  memset(&request_spec, 0, sizeof(request_spec));
+  request_spec.signing = &s_request_signing;
+  request_spec.method = method;
+  request_spec.path = path;
+  request_spec.host = host;
+  request_spec.content_type = content_type;
+  request_spec.body = body;
+  request_spec.body_len = body_len;
+  request_spec.tenant_id = s_tenant;
+  request_spec.endpoint_id = s_endpoint;
+  request_spec.user_id = s_user;
+  request_spec.bearer_token = s_bearer;
+  request_spec.permission_set = "telemetry:write,endpoint:attack_surface_report";
+  request_spec.keepalive = http_keepalive_enabled();
   http_lock();
-  for (int attempt = 0; attempt < 2; attempt++) {
-    int reusable = 0;
-    EdrHttpConn *conn = http_conn_get_locked(host, port, https, edr_http_budget_is_telemetry(url));
-    if (!conn) {
-      break;
-    }
-    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-        (body_len == 0u || (body && http_conn_write_all(conn, body, body_len) == 0)) &&
-        read_http_response_from_recv(http_socket_recv_adapter, conn, resp_body, resp_body_cap, &reusable) == 0) {
-      rc = 0;
-      conn->last_used_ms = unix_ms_now();
-      if (!reusable || !http_keepalive_enabled()) {
-        http_conn_close_locked();
-      }
-      break;
-    }
-    http_conn_close_locked();
-  }
+  EdrHttpAttemptOutcome outcome =
+      edr_http_execute_request_attempts(&request_spec, 2u,
+                                        native_request_now_ms, NULL,
+                                        native_request_transmit, &attempt_ctx,
+                                        NULL);
   http_unlock();
+  if (outcome == EDR_HTTP_ATTEMPT_SUCCESS) {
+    rc = 0;
+  } else if (outcome == EDR_HTTP_ATTEMPT_RESPONSE_FAILURE) {
+    rc = -2;
+  }
   if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https request failed" : "http request failed");
   }
@@ -4647,7 +4682,7 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
   fprintf(stderr, "[ingest-http] request failed method=%s suffix=%s rc=%d err=%s resp=%.240s\n",
           method ? method : "-", suffix ? suffix : "-", rc, last_error[0] ? last_error : "-",
           out_body && out_body[0] ? out_body : "-");
-  if (route_note_failure(last_error[0] ? last_error : "request_failed") &&
+  if (rc == -1 && route_note_failure(last_error[0] ? last_error : "request_failed") &&
       method && strcmp(method, "GET") == 0) {
     if (out_body && out_cap > 0u) out_body[0] = '\0';
     if (!build_suffix_url(url, sizeof(url), suffix)) {
@@ -4828,7 +4863,6 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   int https = 0;
   int rc = -1;
   char req[8192];
-  int rn;
   if (!out || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4850,12 +4884,6 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, NULL, 0u);
-  if (rn <= 0) {
-    runtime_failure("http request build failed");
-    net_done();
-    return -1;
-  }
   http_lock();
   if (io_timeout_ms <= 0) {
     io_timeout_ms = (int)env_ul_clamped("EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul,
@@ -4866,14 +4894,24 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   s_http_request_timeout_override_ms = io_timeout_ms;
   for (int attempt = 0; attempt < max_attempts; attempt++) {
     int reusable = 0;
-    int client_error = 0;
+    int rn;
     EdrHttpConn *conn = http_conn_get_locked(host, port, https, 0);
     if (!conn) {
-      break;
+      continue;
     }
     socket_set_timeout_ms(conn->fd, io_timeout_ms);
-    if (http_conn_write_all(conn, req, (size_t)rn) == 0 &&
-        read_http_response_to_file_from_recv(http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config) == 0) {
+    rn = append_request_headers(req, sizeof(req), "GET", path, host, NULL, NULL, 0u);
+    if (rn <= 0) {
+      runtime_failure("http request build failed");
+      http_conn_close_locked();
+      break;
+    }
+    EdrHttpAttemptOutcome response_outcome = EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
+    if (http_conn_write_all(conn, req, (size_t)rn) == 0) {
+      response_outcome = read_http_response_to_file_from_recv(
+          http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config);
+    }
+    if (response_outcome == EDR_HTTP_ATTEMPT_SUCCESS) {
       rc = 0;
       conn->last_used_ms = unix_ms_now();
       socket_set_timeout_ms(conn->fd, (int)env_ul_clamped(
@@ -4883,7 +4921,6 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
       }
       break;
     }
-    client_error = runtime_last_error_is_http_client_error();
     http_conn_close_locked();
     if (fseek(out, 0L, SEEK_SET) == 0) {
 #if defined(_WIN32)
@@ -4898,7 +4935,10 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
       }
 #endif
     }
-    if (client_error) {
+    if (response_outcome != EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE) {
+      if (response_outcome == EDR_HTTP_ATTEMPT_RESPONSE_FAILURE) {
+        rc = -2;
+      }
       break;
     }
   }
@@ -5756,19 +5796,9 @@ static uint32_t control_ack_retry_delay_ms(uint32_t attempts) {
   return (uint32_t)delay;
 }
 
-static void control_ack_refresh_pending_runtime(void) {
-  EdrControlAckRecord records[64];
-  memset(records, 0, sizeof(records));
-  int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
-  int64_t next_retry_ms = 0;
-  for (int i = 0; i < n; i++) {
-    if (next_retry_ms == 0 || records[i].next_retry_unix_ms < next_retry_ms) {
-      next_retry_ms = records[i].next_retry_unix_ms;
-    }
-  }
+static void control_ack_mark_pending_snapshot_stale(void) {
   runtime_state_lock();
-  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
-  s_next_control_ack_retry_ms = next_retry_ms;
+  s_control_ack_pending_complete = 0;
   runtime_state_unlock();
 }
 
@@ -5786,7 +5816,7 @@ static void control_ack_schedule_retry(const char *command_id, const char *trans
   record.last_failure_unix_ms = now;
   record.next_retry_unix_ms = now + (int64_t)control_ack_retry_delay_ms(record.attempts);
   if (edr_command_state_upsert_pending_ack(&record) == 0) {
-    control_ack_refresh_pending_runtime();
+    control_ack_mark_pending_snapshot_stale();
     char audit[256];
     snprintf(audit, sizeof(audit),
              "control ACK failed; queued durable retry attempt=%u next_retry_unix_ms=%lld",
@@ -5853,7 +5883,7 @@ static int edr_ingest_http_post_control_ack_with_status(const char *command_id, 
     note_control_ack_success(command_id);
     edr_transport_v2_ack(command_id, 1);
     edr_command_state_delete_pending_ack(command_id);
-    control_ack_refresh_pending_runtime();
+    control_ack_mark_pending_snapshot_stale();
   } else {
     note_http_request_failure();
     note_control_ack_failure(command_id);
@@ -5876,32 +5906,31 @@ static int edr_ingest_http_post_control_ack(const char *command_id, const char *
 
 void edr_ingest_http_retry_pending_control_acks(void) {
   EdrControlAckRecord records[16];
+  EdrControlAckScanStats scan_stats;
   memset(records, 0, sizeof(records));
-  int n = edr_command_state_collect_pending_acks(records, sizeof(records) / sizeof(records[0]));
+  memset(&scan_stats, 0, sizeof(scan_stats));
+  int64_t now = unix_ms_now();
+  unsigned long max_attempts = env_ul_clamped("EDR_CONTROL_ACK_RETRY_PER_CYCLE", 4ul, 1ul, 16ul);
+  unsigned long scan_budget = env_ul_clamped("EDR_CONTROL_ACK_SCAN_PER_CYCLE", 64ul, 16ul, 4096ul);
+  int n = edr_command_state_collect_due_pending_acks(
+      records, (size_t)max_attempts, now, (size_t)scan_budget, &scan_stats);
   runtime_state_lock();
-  s_control_ack_pending = n > 0 ? (unsigned long)n : 0ul;
-  s_next_control_ack_retry_ms = 0;
+  if (scan_stats.traversal_complete) {
+    s_control_ack_pending = (unsigned long)scan_stats.pending_record_count_observed;
+    s_control_ack_pending_complete = 1;
+    s_next_control_ack_retry_ms = scan_stats.earliest_retry_unix_ms_observed;
+  } else if (scan_stats.traversal_error) {
+    s_control_ack_pending_complete = 0;
+  } else if (scan_stats.earliest_retry_unix_ms_observed > 0 &&
+             (s_next_control_ack_retry_ms == 0 ||
+              scan_stats.earliest_retry_unix_ms_observed < s_next_control_ack_retry_ms)) {
+    s_next_control_ack_retry_ms = scan_stats.earliest_retry_unix_ms_observed;
+  }
   runtime_state_unlock();
   if (n <= 0 || !edr_ingest_http_configured()) {
     return;
   }
-  int64_t now = unix_ms_now();
-  unsigned long max_attempts = env_ul_clamped("EDR_CONTROL_ACK_RETRY_PER_CYCLE", 4ul, 1ul, 16ul);
-  unsigned long attempted = 0ul;
   for (int i = 0; i < n; i++) {
-    if (records[i].next_retry_unix_ms > now) {
-      runtime_state_lock();
-      if (s_next_control_ack_retry_ms == 0 ||
-          records[i].next_retry_unix_ms < s_next_control_ack_retry_ms) {
-        s_next_control_ack_retry_ms = records[i].next_retry_unix_ms;
-      }
-      runtime_state_unlock();
-      continue;
-    }
-    if (attempted >= max_attempts) {
-      break;
-    }
-    attempted++;
     runtime_state_lock();
     s_control_ack_retry_attempt++;
     runtime_state_unlock();
@@ -5919,7 +5948,6 @@ void edr_ingest_http_retry_pending_control_acks(void) {
     control_ack_schedule_retry(records[i].command_id, records[i].transport, records[i].last_seq,
                                records[i].attempts + 1u, records[i].first_failure_unix_ms);
   }
-  control_ack_refresh_pending_runtime();
 }
 
 static const char *base_name_ptr(const char *path) {
@@ -6128,7 +6156,6 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
   int https = 0;
   int rc = -1;
   char req[8192];
-  int rn;
   size_t body_len = pre_len + file_len + post_len;
   if (!build_suffix_url(url, sizeof(url), suffix)) {
     runtime_failure("upload URL exceeds capacity");
@@ -6155,14 +6182,9 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure("network init failed");
     return -1;
   }
-  rn = append_request_headers_hash(req, sizeof(req), "POST", path, host, content_type,
-                                   body_len, content_sha256_hex);
-  if (rn <= 0) {
-    runtime_failure("http upload request build failed");
-    return -1;
-  }
   for (int attempt = 0; attempt < 2; attempt++) {
     int reusable = 0;
+    int rn;
     EdrHttpConn local_conn;
     memset(&local_conn, 0, sizeof(local_conn));
     local_conn.fd = EDR_SOCKET_INVALID;
@@ -6170,19 +6192,32 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
       break;
     }
     if (http_conn_open_new(&local_conn, host, port, https, 0) != 0) {
-      break;
+      continue;
     }
-    if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
-        http_conn_write_all(&local_conn, pre, pre_len) == 0 &&
-        http_conn_write_file(&local_conn, file, file_len) == 0 &&
-        http_conn_write_all(&local_conn, post, post_len) == 0 &&
-        read_http_response_from_recv(http_socket_recv_adapter, &local_conn,
-                                     resp_body, resp_body_cap, &reusable) == 0) {
-      rc = 0;
+    rn = append_request_headers_hash(req, sizeof(req), "POST", path, host, content_type,
+                                     body_len, content_sha256_hex);
+    if (rn <= 0) {
+      runtime_failure("http upload request build failed");
       http_conn_close(&local_conn);
       break;
     }
+    EdrHttpAttemptOutcome response_outcome = EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
+    if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
+        http_conn_write_all(&local_conn, pre, pre_len) == 0 &&
+        http_conn_write_file(&local_conn, file, file_len) == 0 &&
+        http_conn_write_all(&local_conn, post, post_len) == 0) {
+      response_outcome = read_http_response_from_recv(
+          http_socket_recv_adapter, &local_conn, resp_body, resp_body_cap, &reusable);
+    }
     http_conn_close(&local_conn);
+    if (response_outcome == EDR_HTTP_ATTEMPT_SUCCESS) {
+      rc = 0;
+      break;
+    }
+    if (response_outcome == EDR_HTTP_ATTEMPT_RESPONSE_FAILURE) {
+      rc = -2;
+      break;
+    }
   }
   if (rc != 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https upload failed" : "http upload failed");

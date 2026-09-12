@@ -108,7 +108,10 @@ typedef struct {
   unsigned long control_ack_retry_ok_count;
   unsigned long control_ack_retry_fail_count;
   unsigned long control_ack_outbox_persist_fail_count;
+  /* Last count from one fully observed traversal. It is not an atomic view
+   * across concurrent ACK mutations; complete=false means stale/unknown. */
   unsigned long control_ack_pending_count;
+  int control_ack_pending_count_complete;
   int64_t last_command_ack_unix_ms;
   int64_t last_command_ack_failure_unix_ms;
   int64_t next_control_ack_retry_unix_ms;

@@ -12,16 +12,14 @@
       }
     },
     {
-      "name": "w-vcpkg-ninja-dev",
-      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA）",
+      "name": "w-vcpkg-ninja-release-yara",
+      "hidden": true,
       "inherits": "base",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
       "generator": "Ninja",
-      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。Windows 构建强制 YARA。",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
         "EDR_WITH_HTTP2_CURL": "ON",
         "EDR_REQUIRE_CURL_HTTP2": "ON",
         "EDR_REQUIRE_SQLITE": "ON",
@@ -29,46 +27,31 @@
         "EDR_WITH_YARA": "ON",
         "EDR_REQUIRE_YARA": "ON",
         "EDR_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "w-vcpkg-ninja-dev",
+      "displayName": "Win vcpkg+Ninja 快编（no-gRPC/HTTPS REST/YARA）",
+      "inherits": "w-vcpkg-ninja-release-yara",
+      "description": "需: 已执行 vcvars 或「x64 本机工具」环境；Ninja 在 PATH；VCPKG_ROOT 已设置；先 vcpkg install --x-feature=yara。Windows 构建强制 YARA。",
+      "cacheVariables": {
+        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON"
       }
     },
     {
       "name": "w-vcpkg-ninja-nogrpc",
       "displayName": "Win vcpkg+Ninja 无 gRPC（HTTPS REST + YARA；先 vcpkg install --x-feature=yara）",
-      "inherits": "base",
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
-      "generator": "Ninja",
+      "inherits": "w-vcpkg-ninja-release-yara",
       "description": "不编 gRPC；须 vcpkg 的 curl+openssl+sqlite+yara，使 HTTPS REST、本地状态库与 libyara 扫描可用。设 VCPKG_ROOT 并先 vcpkg install --x-feature=yara 后 cmake --preset。" ,
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON",
-        "EDR_WITH_HTTP2_CURL": "ON",
-        "EDR_REQUIRE_CURL_HTTP2": "ON",
-        "EDR_REQUIRE_SQLITE": "ON",
-        "VCPKG_MANIFEST_FEATURES": "yara",
-        "EDR_WITH_YARA": "ON",
-        "EDR_REQUIRE_YARA": "ON",
-        "EDR_BUILD_TESTS": "OFF"
+        "EDR_WITH_INGEST_HTTPS_OPENSSL": "ON"
       }
     },
     {
       "name": "w-vcpkg-ninja-ort-yara",
       "displayName": "Win vcpkg+Ninja 全量（HTTPS REST + YARA）",
-      "inherits": "base",
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
-      "generator": "Ninja",
-      "description": "兼容旧 preset 名称；不再下载或链接 ONNX Runtime。",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "EDR_WITH_HTTP2_CURL": "ON",
-        "EDR_REQUIRE_CURL_HTTP2": "ON",
-        "EDR_REQUIRE_SQLITE": "ON",
-        "VCPKG_MANIFEST_FEATURES": "yara",
-        "EDR_WITH_YARA": "ON",
-        "EDR_REQUIRE_YARA": "ON",
-        "EDR_BUILD_TESTS": "OFF"
-      }
+      "inherits": "w-vcpkg-ninja-release-yara",
+      "description": "兼容旧 preset 名称；不再下载或链接 ONNX Runtime。"
     },
     {
       "name": "w-vcpkg-ninja-grpc-ort",

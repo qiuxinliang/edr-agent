@@ -20,10 +20,23 @@
 | 采集主路径 | ETW（内核三通道 + TDH + 扩展 Provider，见下文「ETW 增强」） | **M1**：inotify 文件事件（`collector_linux.c`）；进程/网络等 **§3.2** 见路线图 **P7** | `collector_stub` |
 | 预处理 / 批次 / HTTP ingest / control 指令 | 是 | 是 | 是 |
 | §19 攻击面 HTTP `POST` | 是（监听/出站路径最完整） | 是（监听/出站依赖 `ss`，上传复用系统组选定的内置 ingest HTTP 通信路线，见 §19 长段） | 同 Linux |
-| §17 WinDivert Shellcode | 是 | 否 | 否 |
+| §17 WinDivert Shellcode | AMD64 可选；正式 ARM64 包不含 WinDivert | 否 | 否 |
 | §1.2 API / IAT 用户态 Hook | **本期不做**（**`docs/AGT004_API_MONITOR_DESCope.md`**，AGT-004 descope） | — | — |
 
 **AVE 规则、IOC、证书信任与行为启发式**：行为链、ingest 与告警语义见 **[docs/WP9_BEHAVIOR_AVE.md](docs/WP9_BEHAVIOR_AVE.md)**。端点不再包含 ONNX Runtime、端侧模型或联邦训练链；与平台 + 前端的租户约定仍见 **edr-backend/docs/LOCAL_STACK_INTEGRATION.md**。**管控指令与控制台展示边界**见 **[docs/AVE_PLATFORM_FRONTEND.md](docs/AVE_PLATFORM_FRONTEND.md)**（与 **`docs/SOAR_CONTRACT.md`** 配套）。
+
+#### 检测能力与验收口径
+
+上表描述代码路径，不表示所有发布包或默认策略均开启。以终端上报的
+`edr.agent.capabilities.v1` 为事实源，分别核对 `code_supported`、
+`build_supported`、`policy_enabled`、`runtime_status` 和规则版本/来源；心跳在线不能证明传感器、告警及证据上传均正常。
+
+- 当前配置默认 `shellcode_mode/webshell_mode/pmfe_mode = 0`；`auto_profile = true` 不覆盖显式关闭。启用增强策略需要单独评估误报、资源和取证预算，不能为能力演示一次性全开。
+- Linux 默认 inotify 仅覆盖配置目录（未指定时 `/tmp`）；auditd/eBPF 默认关闭。eBPF 分支消费外部 pipe，不负责安装或加载 producer；pipe 可打开不等于持续有事件。
+- 静态 AVE 的 `CLEAN / rules_only_no_match` 表示当前规则链未命中，不是未知文件安全证明，也不等同所有文件实时杀毒；YARA、按需扫描和专项检测须按各自路径验收。
+- 命令行出现注入 API 名称属于工具/命令迹象，不是观察到了实际内存注入。合成事件测试和 MITRE 标签不能代替真机传感覆盖证明。
+
+采用 [真机行为 E2E 验收](docs/REAL_DEVICE_BEHAVIOR_E2E.md) 的逐段证据标准；可移植 CTest、发布包原生生命周期门禁、受控真机检测实验分别报告，不据单测数量推算实战检出率。
 
 **平台 ingest → `alerts` 先验（WP-1，不依赖本机先跑 Agent）**：**[edr-backend/docs/WP1_ALERT_INGEST_E2E.md](../edr-backend/docs/WP1_ALERT_INGEST_E2E.md)**；脚本 **`edr-backend/scripts/verify_ingest_alert_e2e.sh`** / **`verify_ingest_alert_e2e.ps1`**。真机 P0/告警直出仍见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。
 

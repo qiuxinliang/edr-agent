@@ -1,5 +1,12 @@
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_custom_target(test_python_installer_config_contract DEPENDS edr_agent)
+add_test(NAME python_installer_config_contract
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_python_installer_config_contract.py
+    --agent $<TARGET_FILE:edr_agent>)
+set_tests_properties(python_installer_config_contract PROPERTIES TIMEOUT 120)
+
 if(OpenSSL_FOUND)
   add_executable(test_command_signature_cross_language
     ${CMAKE_CURRENT_SOURCE_DIR}/test_command_signature_cross_language.c
@@ -52,6 +59,7 @@ add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox
 target_include_directories(test_command_inbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_command_inbox PRIVATE Threads::Threads)
 edr_apply_test_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -192,8 +200,23 @@ add_executable(test_request_signing ${CMAKE_CURRENT_SOURCE_DIR}/test_request_sig
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_request_signing PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+  target_link_libraries(test_request_signing PRIVATE advapi32)
+endif()
 edr_apply_test_warnings(test_request_signing)
 add_test(NAME request_signing COMMAND test_request_signing WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_http_retry
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_http_retry.c
+  ${CMAKE_SOURCE_DIR}/src/transport/http_retry.c
+  ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+target_include_directories(test_http_retry PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+  target_link_libraries(test_http_retry PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(test_http_retry)
+add_test(NAME http_retry_contract COMMAND test_http_retry)
 
 add_executable(test_transport_v2_status
   ${CMAKE_CURRENT_SOURCE_DIR}/test_transport_v2_status.c
@@ -545,6 +568,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
+  ${CMAKE_SOURCE_DIR}/src/transport/http_retry.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_v2.c
   ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
   ${CMAKE_SOURCE_DIR}/src/core/time_util.c
@@ -1018,6 +1042,7 @@ add_executable(test_config_fp ${CMAKE_CURRENT_SOURCE_DIR}/test_config_fp.c ${CMA
 target_include_directories(test_config_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/tomlc99)
 
 add_executable(test_pmfe_detail ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_detail.c)
+edr_apply_test_warnings(test_pmfe_detail)
 add_test(NAME pmfe_scan_detail_format COMMAND test_pmfe_detail WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_pmfe_pe_arch
@@ -1245,6 +1270,7 @@ add_test(NAME event_batch_max_age COMMAND test_event_batch_max_age WORKING_DIREC
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
 
+include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
 if(WIN32)
   include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
 endif()

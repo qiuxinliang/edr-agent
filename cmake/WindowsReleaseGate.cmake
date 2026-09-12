@@ -2,6 +2,10 @@
 # Windows workflows build this target and select this label; neither keeps a
 # second executable/test allowlist that can drift when a gate is added.
 add_custom_target(windows_release_gate_tests)
+add_dependencies(windows_release_gate_tests agent_runtime_gate_tests)
+foreach(test_name IN LISTS _edr_agent_runtime_gate_tests)
+  set_property(TEST "${test_name}" APPEND PROPERTY LABELS windows-release-gate)
+endforeach()
 
 function(edr_windows_release_gate test_name executable_target)
   if(NOT TEST "${test_name}")

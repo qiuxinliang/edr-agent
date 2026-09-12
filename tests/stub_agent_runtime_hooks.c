@@ -59,6 +59,20 @@ int edr_command_state_collect_pending_acks(EdrControlAckRecord *out, size_t cap)
   return 0;
 }
 
+int edr_command_state_collect_due_pending_acks(
+    EdrControlAckRecord *out, size_t out_cap, int64_t now_unix_ms,
+    size_t scan_budget, EdrControlAckScanStats *out_stats) {
+  (void)out;
+  (void)out_cap;
+  (void)now_unix_ms;
+  (void)scan_budget;
+  if (out_stats) {
+    EdrControlAckScanStats empty = {0};
+    *out_stats = empty;
+  }
+  return 0;
+}
+
 void edr_command_state_delete_pending_ack(const char *command_id) {
   (void)command_id;
 }

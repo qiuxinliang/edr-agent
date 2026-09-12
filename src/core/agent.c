@@ -2440,7 +2440,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
         "\"communication\":{\"http_fallback\":%s,"
         "\"http_ok\":%lu,\"http_fail\":%lu,"
-        "\"control_ack\":{\"ok\":%lu,\"fail\":%lu,\"pending\":%lu,"
+        "\"control_ack\":{\"ok\":%lu,\"fail\":%lu,\"pending\":%lu,\"pending_count_complete\":%s,"
         "\"retry_attempt\":%lu,\"retry_ok\":%lu,\"retry_fail\":%lu,"
         "\"outbox_persist_fail\":%lu,\"last_failure_unix_ms\":%lld,"
         "\"last_failure_id\":\"%s\",\"next_retry_unix_ms\":%lld},"
@@ -2578,6 +2578,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
         http_rt.http_fallback_available ? "true" : "false", http_rt.ok_count, http_rt.fail_count,
         http_rt.control_ack_ok_count, http_rt.control_ack_fail_count, http_rt.control_ack_pending_count,
+        http_rt.control_ack_pending_count_complete ? "true" : "false",
         http_rt.control_ack_retry_attempt_count, http_rt.control_ack_retry_ok_count,
         http_rt.control_ack_retry_fail_count, http_rt.control_ack_outbox_persist_fail_count,
         (long long)http_rt.last_command_ack_failure_unix_ms, http_last_command_ack_failure_id,
@@ -3065,7 +3066,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"control_ack_ok\":%lu,\"control_ack_fail\":%lu,"
       "\"control_ack_retry_attempt\":%lu,\"control_ack_retry_ok\":%lu,"
       "\"control_ack_retry_fail\":%lu,\"control_ack_outbox_persist_fail\":%lu,"
-      "\"control_ack_pending\":%lu,"
+      "\"control_ack_pending\":%lu,\"control_ack_pending_count_complete\":%s,"
       "\"last_command_ack_unix_ms\":%lld,\"last_command_ack_id\":\"%s\","
       "\"last_command_ack_failure_unix_ms\":%lld,\"last_command_ack_failure_id\":\"%s\","
       "\"next_control_ack_retry_unix_ms\":%lld,"
@@ -3300,6 +3301,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       http_rt.control_ack_retry_attempt_count, http_rt.control_ack_retry_ok_count,
       http_rt.control_ack_retry_fail_count, http_rt.control_ack_outbox_persist_fail_count,
       http_rt.control_ack_pending_count,
+      http_rt.control_ack_pending_count_complete ? "true" : "false",
       (long long)http_rt.last_command_ack_unix_ms, http_last_command_ack_id,
       (long long)http_rt.last_command_ack_failure_unix_ms, http_last_command_ack_failure_id,
       (long long)http_rt.next_control_ack_retry_unix_ms,

@@ -59,6 +59,15 @@ typedef struct EdrControlAckRecord {
   int64_t next_retry_unix_ms;
 } EdrControlAckRecord;
 
+typedef struct EdrControlAckScanStats {
+  size_t scanned_entry_count;
+  size_t selected_due_count;
+  size_t pending_record_count_observed;
+  int traversal_complete;
+  int traversal_error;
+  int64_t earliest_retry_unix_ms_observed;
+} EdrControlAckScanStats;
+
 typedef struct EdrCommandStateQuarantineStats {
   uint64_t inbox_record_count;
   uint64_t ack_record_count;
@@ -116,6 +125,16 @@ int edr_command_state_request_cancel(const char *command_id,
 
 int edr_command_state_upsert_pending_ack(const EdrControlAckRecord *record);
 int edr_command_state_collect_pending_acks(EdrControlAckRecord *out, size_t cap);
+/* Advances a process-lifetime fair directory cursor by at most scan_budget
+ * entries and returns only due records, capped independently by out_cap.
+ * pending_record_count_observed is the cumulative valid-record count for the
+ * current traversal. When traversal_complete is true it describes one fully
+ * observed pass, not an atomic snapshot across concurrent record mutations.
+ * I/O/read uncertainty sets traversal_error and never publishes a completed
+ * zero-count pass. */
+int edr_command_state_collect_due_pending_acks(
+    EdrControlAckRecord *out, size_t out_cap, int64_t now_unix_ms,
+    size_t scan_budget, EdrControlAckScanStats *out_stats);
 void edr_command_state_delete_pending_ack(const char *command_id);
 void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats);
 

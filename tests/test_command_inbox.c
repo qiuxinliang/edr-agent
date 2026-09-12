@@ -232,6 +232,146 @@ int main(void) {
   n = edr_command_state_collect_pending_acks(pending, 4);
   require_true(n == 0, "delete pending ACK after server receipt");
 
+  {
+    static const int64_t scan_now = 1783000100000LL;
+    char ack_ids[24][64];
+    unsigned int due_seen = 0u;
+    EdrControlAckScanStats scan_stats;
+    for (int i = 0; i < 24; i++) {
+      EdrControlAckRecord queued;
+      memset(&queued, 0, sizeof(queued));
+      snprintf(ack_ids[i], sizeof(ack_ids[i]),
+               i < 16 ? "ack-a-future-%02d" : "ack-z-due-%02d", i);
+      snprintf(queued.command_id, sizeof(queued.command_id), "%s", ack_ids[i]);
+      snprintf(queued.transport, sizeof(queued.transport), "%s", "https_control_stream");
+      queued.last_seq = i;
+      queued.attempts = 1u;
+      queued.first_failure_unix_ms = scan_now - 5000LL;
+      queued.last_failure_unix_ms = scan_now - 1000LL;
+      queued.next_retry_unix_ms = i < 16 ? scan_now + 3600000LL : scan_now - 1LL;
+      require_true(edr_command_state_upsert_pending_ack(&queued) == 0,
+                   "store ACK fairness backlog");
+    }
+
+    for (int round = 0; round < 16 && due_seen != 0xffu; round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      n = edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      require_true(n >= 0 && n <= 4, "due ACK selection respects attempt cap");
+      require_true(scan_stats.scanned_entry_count <= 8u,
+                   "due ACK traversal respects scan budget");
+      require_true(scan_stats.selected_due_count == (size_t)n,
+                   "selected due count is distinct and accurate");
+      for (int i = 0; i < n; i++) {
+        int suffix = -1;
+        require_true(pending[i].next_retry_unix_ms <= scan_now,
+                     "future ACK is never selected for transmission");
+        require_true(sscanf(pending[i].command_id, "ack-z-due-%d", &suffix) == 1 &&
+                         suffix >= 16 && suffix < 24,
+                     "selected ACK belongs to the due suffix backlog");
+        due_seen |= 1u << (unsigned)(suffix - 16);
+        pending[i].attempts++;
+        pending[i].last_failure_unix_ms = scan_now;
+        pending[i].next_retry_unix_ms = scan_now - 1LL;
+        require_true(edr_command_state_upsert_pending_ack(&pending[i]) == 0,
+                     "continued ACK failure remains durably retryable");
+      }
+    }
+    require_true(due_seen == 0xffu,
+                 "later due ACKs are served within bounded fair traversal rounds");
+    /* Finish the mutation-overlapped pass, then measure one quiet complete
+     * traversal so atomic replacements cannot make the count a mixed view. */
+    int pass_complete = 0;
+    for (int round = 0; round < 16 && !pass_complete; round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      (void)edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      pass_complete = scan_stats.traversal_complete;
+    }
+    require_true(pass_complete, "mutation-overlapped ACK traversal terminates");
+    pass_complete = 0;
+    for (int round = 0; round < 16 && !pass_complete; round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      (void)edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      pass_complete = scan_stats.traversal_complete;
+    }
+    require_true(pass_complete, "quiet ACK traversal terminates");
+    require_true(scan_stats.pending_record_count_observed == 24u,
+                 "completed quiet traversal reports total pending separately from selection");
+
+    memset(&scan_stats, 0, sizeof(scan_stats));
+    (void)edr_command_state_collect_due_pending_acks(
+        pending, 4u, scan_now, 8u, &scan_stats);
+    require_true(!scan_stats.traversal_complete,
+                 "new ACK traversal remains open before concurrent insert");
+
+    EdrControlAckRecord inserted;
+    memset(&inserted, 0, sizeof(inserted));
+    snprintf(inserted.command_id, sizeof(inserted.command_id), "%s", "cmd-ack-inserted");
+    snprintf(inserted.transport, sizeof(inserted.transport), "%s", "https_control_stream");
+    inserted.last_seq = 99;
+    inserted.attempts = 1u;
+    inserted.first_failure_unix_ms = scan_now;
+    inserted.last_failure_unix_ms = scan_now;
+    inserted.next_retry_unix_ms = scan_now - 1LL;
+    require_true(edr_command_state_upsert_pending_ack(&inserted) == 0,
+                 "insert ACK while fair traversal is active");
+
+    char corrupt_fair_path[1024];
+    snprintf(corrupt_fair_path, sizeof(corrupt_fair_path),
+             "%s/corrupt-fair-ack.json", ack_dir);
+    write_corrupt_record(corrupt_fair_path);
+    int inserted_seen = 0;
+    int complete_25_seen = 0;
+    for (int round = 0; round < 40 && (!inserted_seen || !complete_25_seen); round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      n = edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      for (int i = 0; i < n; i++) {
+        if (strcmp(pending[i].command_id, "cmd-ack-inserted") == 0) {
+          inserted_seen = 1;
+        }
+      }
+      if (scan_stats.traversal_complete &&
+          scan_stats.pending_record_count_observed == 25u) {
+        complete_25_seen = 1;
+      }
+    }
+    require_true(inserted_seen,
+                 "ACK inserted during traversal is discovered after bounded wrap");
+    require_true(!file_exists(corrupt_fair_path),
+                 "corrupt ACK encountered by fair traversal is quarantined");
+    require_true(complete_25_seen,
+                 "post-insert traversal reports all valid pending ACKs");
+
+    /* Reaching end closes the native enumeration handle. The next calls start
+     * a fresh pass, matching process-restart cursor semantics without relying
+     * on an inherited POSIX DIR* or Windows find handle. */
+    int reopened_due_seen = 0;
+    for (int round = 0; round < 8 && !reopened_due_seen; round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      n = edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      reopened_due_seen = n > 0;
+    }
+    require_true(reopened_due_seen,
+                 "fresh traversal after close/restart reaches due ACKs again");
+
+    for (int i = 0; i < 24; i++) {
+      edr_command_state_delete_pending_ack(ack_ids[i]);
+    }
+    edr_command_state_delete_pending_ack("cmd-ack-inserted");
+    for (int round = 0; round < 16; round++) {
+      memset(&scan_stats, 0, sizeof(scan_stats));
+      (void)edr_command_state_collect_due_pending_acks(
+          pending, 4u, scan_now, 8u, &scan_stats);
+      if (scan_stats.traversal_complete) {
+        break;
+      }
+    }
+  }
+
   EdrSoarCommandMeta result_meta = meta;
   snprintf(result_meta.idempotency_key, sizeof(result_meta.idempotency_key), "%s",
            "idem-json-state|sigv1|placeholder");
@@ -344,6 +484,15 @@ int main(void) {
   test_setenv("EDR_COMMAND_ACK_DIR", bad_ack_dir);
   require_true(edr_command_state_upsert_pending_ack(&ack) != 0,
                "reject group/world writable ACK outbox dir");
+  {
+    EdrControlAckScanStats failed_scan;
+    memset(&failed_scan, 0, sizeof(failed_scan));
+    n = edr_command_state_collect_due_pending_acks(
+        pending, 4u, 1783000100000LL, 8u, &failed_scan);
+    require_true(n == 0 && failed_scan.traversal_error &&
+                     !failed_scan.traversal_complete,
+                 "ACK scan permission failure cannot publish an empty completed traversal");
+  }
   (void)chmod(bad_ack_dir, 0700);
   (void)rmdir(bad_ack_dir);
 #endif

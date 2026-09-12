@@ -9,12 +9,13 @@
 可选：
   EDR_OUTPUT              输出路径，默认当前目录 agent.toml
   EDR_AGENT_VERSION       默认读取 VERSION；再否则 unknown
+  EDR_AGENT_EXECUTABLE    指定用于 --config-test 的 Agent 二进制
   EDR_OVERRIDE_SERVER_ADDR  覆盖响应中的 server_addr 写入 [server].address
   EDR_CA_CERT / EDR_CLIENT_CERT / EDR_CLIENT_KEY / EDR_CLIENT_CSR
   EDR_INSECURE_TLS=1      跳过 TLS 证书校验（仅调试）
 
 命令行：
-  python3 edr_agent_install.py [--output PATH] [--dry-run]
+  python3 edr_agent_install.py [--output PATH] [--dry-run] [--generate-only]
 """
 
 from __future__ import annotations
@@ -27,11 +28,26 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+
+_ENROLL_SECRET_FIELDS = {
+    "platform_bearer_token",
+    "agent_access_token",
+    "access_token",
+    "rest_bearer_token",
+    "bearer_token",
+    "request_signing_secret",
+}
+
+
+class ConfigValidationError(RuntimeError):
+    pass
 
 
 def _toml_escape(s: str) -> str:
@@ -62,17 +78,15 @@ def _bearer_from_enroll(data: Dict[str, Any]) -> str:
 
 
 def _redact_enroll_payload(raw: str) -> str:
-    for key in ("platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token"):
-        raw = raw.replace(f'"{key}":', f'"{key}":')
     try:
         obj = json.loads(raw)
     except Exception:
-        return raw
+        return "<non-JSON response omitted>"
 
     def redact(value: Any) -> None:
         if isinstance(value, dict):
             for k, v in list(value.items()):
-                if k in {"platform_bearer_token", "agent_access_token", "access_token", "rest_bearer_token", "bearer_token"}:
+                if k in _ENROLL_SECRET_FIELDS:
                     value[k] = "<redacted>"
                 else:
                     redact(v)
@@ -100,6 +114,47 @@ def _normalize_api_base(raw: str) -> tuple[str, str, str]:
     return server_base, server_base + "/api/v1", server_base + "/api/v1/enroll"
 
 
+def _normalize_enroll_result(data: Dict[str, Any], normalized_rest_base: str) -> Dict[str, Any]:
+    endpoint_id = str(data.get("endpoint_id") or "").strip()
+    tenant_id = str(data.get("tenant_id") or "").strip()
+    server_addr = str(data.get("server_addr") or "").strip()
+    if not endpoint_id or not tenant_id or not server_addr:
+        raise ValueError("missing endpoint_id, tenant_id or server_addr")
+
+    request_signing_enabled = data.get("request_signing_enabled", False)
+    request_signing_required = data.get("request_signing_required", False)
+    if not isinstance(request_signing_enabled, bool) or not isinstance(request_signing_required, bool):
+        raise ValueError("request signing flags must be booleans")
+    if request_signing_required and not request_signing_enabled:
+        raise ValueError("request signing cannot be required while disabled")
+    request_signing_key_id = str(data.get("request_signing_key_id") or "").strip()
+    request_signing_secret = str(data.get("request_signing_secret") or "").strip()
+    if request_signing_enabled or request_signing_required:
+        if not request_signing_key_id or not request_signing_secret:
+            raise ValueError("request signing is enabled but key_id or secret is missing")
+        if len(request_signing_key_id) >= 128 or len(request_signing_secret) >= 256:
+            raise ValueError("request signing credentials exceed Agent configuration limits")
+        if any(ord(ch) <= 32 or ord(ch) == 127 for ch in request_signing_key_id + request_signing_secret):
+            raise ValueError("request signing credentials contain whitespace or control characters")
+
+    override = os.environ.get("EDR_OVERRIDE_SERVER_ADDR", "").strip()
+    if override:
+        server_addr = override
+    return {
+        "endpoint_id": endpoint_id,
+        "tenant_id": tenant_id,
+        "server_addr": server_addr,
+        "rest_base": str(data.get("rest_base_url") or normalized_rest_base).strip().rstrip("/"),
+        "rest_bearer_token": _bearer_from_enroll(data),
+        "ca_cert": data.get("ca_cert") or "",
+        "client_cert": data.get("client_cert") or "",
+        "request_signing_enabled": request_signing_enabled,
+        "request_signing_required": request_signing_required,
+        "request_signing_key_id": request_signing_key_id,
+        "request_signing_secret": request_signing_secret,
+    }
+
+
 def _emit_toml(
     server_addr: str,
     endpoint_id: str,
@@ -115,6 +170,9 @@ def _emit_toml(
     pkcs11_module: str,
     pkcs11_key_uri: str,
     tpm_key_uri: str,
+    request_signing_enabled: bool,
+    request_signing_key_id: str,
+    request_signing_secret: str,
     install_dir: str = "",
 ) -> str:
     lines = [
@@ -152,6 +210,11 @@ def _emit_toml(
         'control_dict_version = "edr-zstd-dict-v1"',
         'control_schema_version = "edr-control-schema-v1"',
         'control_profile_id   = "default-http1-protobuf"',
+        "",
+        "[platform.request_signing]",
+        f"enabled              = {str(request_signing_enabled).lower()}",
+        f'key_id               = "{_toml_escape(request_signing_key_id)}"',
+        f'secret               = "{_toml_escape(request_signing_secret)}"',
         "",
     ]
     # 若安装目录已打包检测规则（package_bundled_layout.sh 落在 rules/{shellcode,webshell}），
@@ -261,24 +324,14 @@ def enroll(api_base: str, token: str, agent_version: str, csr_pem: str) -> Dict[
         print(f"enroll error: {env.get('message', _redact_enroll_payload(raw))}", file=sys.stderr)
         sys.exit(1)
     data_obj = env.get("data") or {}
-    ep = (data_obj.get("endpoint_id") or "").strip()
-    tid = (data_obj.get("tenant_id") or "").strip()
-    saddr = (data_obj.get("server_addr") or "").strip()
-    if not ep or not tid or not saddr:
-        print(f"enroll missing fields: {_redact_enroll_payload(raw)}", file=sys.stderr)
+    if not isinstance(data_obj, dict):
+        print("enroll response data must be an object", file=sys.stderr)
         sys.exit(1)
-    override = os.environ.get("EDR_OVERRIDE_SERVER_ADDR", "").strip()
-    if override:
-        saddr = override
-    return {
-        "endpoint_id": ep,
-        "tenant_id": tid,
-        "server_addr": saddr,
-        "rest_base": (data_obj.get("rest_base_url") or normalized_rest_base).strip().rstrip("/"),
-        "rest_bearer_token": _bearer_from_enroll(data_obj),
-        "ca_cert": data_obj.get("ca_cert") or "",
-        "client_cert": data_obj.get("client_cert") or "",
-    }
+    try:
+        return _normalize_enroll_result(data_obj, normalized_rest_base)
+    except ValueError as exc:
+        print(f"enroll response invalid: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _default_cert_paths() -> tuple[str, str, str]:
@@ -435,6 +488,291 @@ def _write_pem(path: str, text: str) -> None:
         f.write(text)
 
 
+def _resolve_agent_executable(output_path: str) -> Optional[Path]:
+    explicit = os.environ.get("EDR_AGENT_EXECUTABLE", "").strip()
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
+        if not candidate.is_file():
+            raise ConfigValidationError(f"EDR_AGENT_EXECUTABLE is not a file: {candidate}")
+        return candidate
+
+    output_dir = Path(output_path).expanduser().resolve().parent
+    script_dir = Path(__file__).resolve().parent
+    directories = [output_dir, script_dir, script_dir.parent, Path.cwd().resolve()]
+    if sys.platform.lower().startswith("win"):
+        program_files = os.environ.get("ProgramFiles", "").strip()
+        if program_files:
+            directories.extend(
+                [Path(program_files) / "FDSecurity", Path(program_files) / "EDR Agent"]
+            )
+        names = ("FDSensor.exe", "edr_agent.exe")
+    else:
+        directories.append(Path("/usr/local/bin"))
+        names = ("edr_agent", "FDSensor")
+    seen = set()
+    for directory in directories:
+        for name in names:
+            candidate = directory / name
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _validate_config_with_agent(agent_path: Path, config_path: Path) -> None:
+    try:
+        result = subprocess.run(
+            [str(agent_path), "--config", str(config_path), "--config-test"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConfigValidationError(f"could not run Agent config parser: {exc}") from exc
+    if result.returncode == 0:
+        return
+    raise ConfigValidationError(f"Agent rejected generated config (exit {result.returncode})")
+
+
+def _secure_staged_file_windows(path: Path) -> None:
+    import ctypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    convert.restype = ctypes.c_int
+    set_security = advapi32.SetFileSecurityW
+    set_security.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p]
+    set_security.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    descriptor = ctypes.c_void_p()
+    if not convert(
+        "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)", 1, ctypes.byref(descriptor), None
+    ):
+        raise ConfigValidationError(
+            f"could not create protected staged-config ACL (Windows error {ctypes.get_last_error()})"
+        )
+    try:
+        security_information = 0x4 | 0x80000000
+        if not set_security(str(path), security_information, descriptor):
+            raise ConfigValidationError(
+                f"could not protect staged config (Windows error {ctypes.get_last_error()})"
+            )
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _stage_validated_config(
+    path: str, text: str, allow_missing_agent: bool = False
+) -> tuple[Path, Path, Optional[Path]]:
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(prefix=f".{target.name}.config-test-", suffix=".tmp", dir=target.parent)
+    staged = Path(staged_name)
+    try:
+        if os.name == "nt":
+            _secure_staged_file_windows(staged)
+        else:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as config_file:
+            fd = -1
+            config_file.write(text)
+            config_file.flush()
+            os.fsync(config_file.fileno())
+
+        agent_path = _resolve_agent_executable(str(target))
+        if agent_path is None:
+            if not allow_missing_agent:
+                raise ConfigValidationError(
+                    "Agent executable not found; place it beside agent.toml, set "
+                    "EDR_AGENT_EXECUTABLE, or use --generate-only for a script-only bundle"
+                )
+            print(
+                "warning: --generate-only wrote config without Agent parser validation",
+                file=sys.stderr,
+            )
+        else:
+            _validate_config_with_agent(agent_path, staged)
+        return target, staged, agent_path
+    except BaseException:
+        # Windows cannot unlink this staging file while the CRT descriptor is
+        # still open (for example when ACL setup or fdopen itself failed).
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _replace_file_windows(target: Path, staged: Path, replace_file=None, get_last_error=None) -> None:
+    # ReplaceFileW retains the existing destination's ACLs and metadata while
+    # atomically swapping the parser-validated file, matching File.Replace in
+    # the PowerShell installer.
+    import ctypes
+
+    backup_fd, backup_name = tempfile.mkstemp(
+        prefix=f".{target.name}.replace-", suffix=".bak", dir=target.parent
+    )
+    os.close(backup_fd)
+    os.unlink(backup_name)
+    if replace_file is None:
+        replace_file = ctypes.WinDLL("kernel32", use_last_error=True).ReplaceFileW
+        replace_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        replace_file.restype = ctypes.c_int
+    if get_last_error is None:
+        get_last_error = ctypes.get_last_error
+    replaced = replace_file(str(target), str(staged), backup_name, 0, None, None)
+    if not replaced:
+        error_code = int(get_last_error())
+        backup = Path(backup_name)
+        # ReplaceFileW error 1177 means the original may already have moved to
+        # the backup while the replacement was not installed. Restore it before
+        # the caller removes the staged candidate.
+        if error_code == 1177 and not target.exists() and backup.exists():
+            try:
+                os.replace(backup, target)
+            except OSError as rollback_error:
+                raise ConfigValidationError(
+                    f"ReplaceFileW failed with Windows error 1177 and original config "
+                    f"recovery failed; backup retained at {backup}: {rollback_error}"
+                ) from rollback_error
+            raise ConfigValidationError(
+                "ReplaceFileW failed with Windows error 1177; original config restored"
+            )
+        backup_note = f"; backup retained at {backup}" if backup.exists() else ""
+        raise ConfigValidationError(
+            f"ReplaceFileW failed with Windows error {error_code}{backup_note}"
+        )
+    try:
+        Path(backup_name).unlink()
+    except OSError as exc:
+        print(f"warning: validated config backup remains at {backup_name}: {exc}", file=sys.stderr)
+
+
+def _replace_staged_config(target: Path, staged: Path) -> None:
+    if os.name == "nt" and target.exists():
+        _replace_file_windows(target, staged)
+        return
+    if os.name != "nt" and target.exists():
+        os.chmod(staged, target.stat().st_mode & 0o777)
+    os.replace(staged, target)
+
+
+def _write_validated_config(
+    path: str, text: str, allow_missing_agent: bool = False
+) -> Optional[Path]:
+    target, staged, agent_path = _stage_validated_config(
+        path, text, allow_missing_agent=allow_missing_agent
+    )
+    try:
+        _replace_staged_config(target, staged)
+        return agent_path
+    finally:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _restore_certificate_files(snapshots) -> None:
+    failures = []
+    for path, previous in reversed(snapshots):
+        try:
+            if previous is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                with path.open("wb") as certificate_file:
+                    certificate_file.write(previous)
+                    certificate_file.flush()
+                    os.fsync(certificate_file.fileno())
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+    if failures:
+        raise ConfigValidationError(
+            "certificate file rollback failed: " + "; ".join(failures)
+        )
+
+
+def _install_enrollment_config(
+    path: str,
+    text: str,
+    ca_path: str,
+    ca_text: str,
+    client_cert_path: str,
+    client_cert_text: str,
+    key_provider: str,
+    allow_missing_agent: bool = False,
+) -> Optional[Path]:
+    target, staged, agent_path = _stage_validated_config(
+        path, text, allow_missing_agent=allow_missing_agent
+    )
+    certificate_snapshots = []
+    try:
+        if ca_text or client_cert_text:
+            if not (ca_text and client_cert_text):
+                raise ConfigValidationError(
+                    "enroll response returned an incomplete mTLS certificate bundle"
+                )
+            certificate_paths = (Path(ca_path).expanduser().resolve(), Path(client_cert_path).expanduser().resolve())
+            certificate_snapshots = [
+                (certificate_path, certificate_path.read_bytes() if certificate_path.exists() else None)
+                for certificate_path in certificate_paths
+            ]
+            _write_pem(ca_path, ca_text)
+            _write_pem(client_cert_path, client_cert_text)
+            _accept_cng_cert(client_cert_path, key_provider)
+        _replace_staged_config(target, staged)
+        return agent_path
+    except BaseException as install_error:
+        try:
+            _restore_certificate_files(certificate_snapshots)
+        except ConfigValidationError as rollback_error:
+            raise ConfigValidationError(
+                f"installation failed and certificate rollback was incomplete: {rollback_error}"
+            ) from install_error
+        raise
+    finally:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _redact_generated_toml(text: str) -> str:
+    import re
+
+    for key in ("rest_bearer_token", "secret"):
+        text = re.sub(
+            rf'(?m)^(\s*{key}\s*=\s*")(?:\\.|[^"\\])*(")',
+            rf"\1<redacted>\2",
+            text,
+        )
+    return text
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="FDSecurity enroll -> agent.toml")
     p.add_argument(
@@ -446,7 +784,12 @@ def main() -> None:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="print TOML to stdout only",
+        help="print TOML without writing agent.toml/issued certs; key and CSR generation still occurs",
+    )
+    p.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="allow a script-only bundle to write config when no Agent executable is available",
     )
     args = p.parse_args()
 
@@ -488,22 +831,31 @@ def main() -> None:
         os.environ.get("EDR_PKCS11_MODULE", ""),
         os.environ.get("EDR_PKCS11_KEY_URI", ""),
         os.environ.get("EDR_TPM_KEY_URI", ""),
+        out.get("request_signing_enabled", False),
+        out.get("request_signing_key_id", ""),
+        out.get("request_signing_secret", ""),
         str(Path(args.output).expanduser().resolve().parent),
     )
     if args.dry_run:
-        import re
-        print(re.sub(r'(?m)^(\s*rest_bearer_token\s*=\s*")[^"]*(")', r'\1<redacted>\2', text))
+        print(_redact_generated_toml(text))
         return
-    if out["ca_cert"] or out["client_cert"]:
-        if not (out["ca_cert"] and out["client_cert"]):
-            print("enroll response returned an incomplete mTLS certificate bundle", file=sys.stderr)
-            sys.exit(1)
-        _write_pem(ca_path, out["ca_cert"])
-        _write_pem(cert_path, out["client_cert"])
-        _accept_cng_cert(cert_path, key_provider)
     path = args.output
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    try:
+        validated_by = _install_enrollment_config(
+            path,
+            text,
+            ca_path,
+            out["ca_cert"],
+            cert_path,
+            out["client_cert"],
+            key_provider,
+            allow_missing_agent=args.generate_only,
+        )
+    except (ConfigValidationError, OSError) as exc:
+        print(f"generated agent.toml was not installed: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if validated_by is not None:
+        print(f"Validated generated config with {validated_by}")
     print(
         f"Wrote {path} (endpoint_id={out['endpoint_id']} "
         f"tenant_id={out['tenant_id']} server.address={out['server_addr']})"
