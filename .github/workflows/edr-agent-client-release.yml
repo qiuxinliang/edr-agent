@@ -451,6 +451,8 @@ jobs:
         run: |
           python -m unittest discover -s tests -p test_windows_release_gate.py -v
           if ($LASTEXITCODE -ne 0) { throw "Windows release gate dependency regression failed" }
+          python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows PCRE2 header isolation regression failed" }
 
       - name: Build (Ninja)
         shell: pwsh
@@ -458,17 +460,14 @@ jobs:
           $releaseTargets = @(
             'edr_agent',
             'forensic_collector',
+            'fd_installer_worker',
+            'fd_headless_uninstaller',
             'windows_release_gate_tests'
           )
-          cmake --build build --config Release --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          # Report independent build failures together; Ninja still exits nonzero.
+          cmake --build build --config Release --target $releaseTargets --parallel $env:NUMBER_OF_PROCESSORS --verbose -- -k 0
           if ($LASTEXITCODE -ne 0) {
-            throw "Windows release product or gate-test build failed with exit code $LASTEXITCODE"
-          }
-          foreach ($nativeTarget in @('fd_installer_worker', 'fd_headless_uninstaller')) {
-            cmake --build build --config Release --target $nativeTarget --parallel $env:NUMBER_OF_PROCESSORS --verbose
-            if ($LASTEXITCODE -ne 0) {
-              throw "Windows release native target $nativeTarget failed with exit code $LASTEXITCODE"
-            }
+            throw "Windows release product, installer or gate-test build failed with exit code $LASTEXITCODE"
           }
 
       - name: Verify native uninstall attestation capabilities

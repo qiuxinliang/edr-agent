@@ -249,6 +249,81 @@ class PCRE2CMakeGateTests(unittest.TestCase):
         self.assertEqual(0, listed.returncode, listed.stdout)
         self.assertNotIn("p0_source_only_durable_contract", listed.stdout)
 
+    def test_static_matcher_header_wins_over_shared_dependency_prefix(self):
+        """Compile/link the real CMake dependency order, not the P0 matcher itself.
+
+        The pinned vcpkg port hardcodes PCRE2_STATIC to 0 in dynamic headers.
+        A compile definition alone cannot repair selecting that other prefix.
+        The poison header makes this regression observable on non-Windows hosts
+        too; a negative control proves the fixture can detect the collision.
+        """
+        root_source = (AGENT_ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        tests_source = (AGENT_ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        imported_start = root_source.index("add_library(edr_pcre2_static STATIC IMPORTED GLOBAL)")
+        imported_end = root_source.index("set(EDR_PCRE2_MATCHER_CONTRACT_SHA256", imported_start)
+        imported = root_source[imported_start:imported_end]
+        common_start = tests_source.index("add_library(edr_ave_test_common INTERFACE)")
+        common_end = tests_source.index("target_link_libraries(test_ave_fp", common_start)
+        common = tests_source[common_start:common_end]
+        targets = (
+            "test_p0_source_only_durable_contract", "test_p0_rule_ir_record_golden",
+            "test_p0_candidate_replay", "test_p0_validation_matrix",
+        )
+        with tempfile.TemporaryDirectory(prefix="edr-pcre2-header-") as directory:
+            source = Path(directory)
+            for prefix in ("static", "dynamic"):
+                (source / prefix / "include").mkdir(parents=True)
+            (source / "static/include/pcre2.h").write_text(
+                '#ifndef PCRE2_STATIC\n#error "PCRE2_STATIC missing"\n#endif\n'
+                'int pcre2_compile_8(void);\n', encoding="utf-8")
+            (source / "dynamic/include/pcre2.h").write_text(
+                '#error "ordinary dynamic PCRE2 header selected"\n', encoding="utf-8")
+            (source / "archive.c").write_text(
+                'int pcre2_compile_8(void) { return 42; }\n', encoding="utf-8")
+            (source / "probe.c").write_text(
+                '#include <pcre2.h>\nint main(void) { return pcre2_compile_8() != 42; }\n',
+                encoding="utf-8")
+            lines = [
+                'cmake_minimum_required(VERSION 3.20)', 'project(HeaderOrder C)', 'enable_testing()',
+                'add_library(header_archive STATIC archive.c)',
+                'set_target_properties(header_archive PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/archive")',
+                'set(_edr_pcre2_prefix_real "${CMAKE_SOURCE_DIR}/static")',
+                'set(_edr_pcre2_library_real "${CMAKE_BINARY_DIR}/archive/${CMAKE_STATIC_LIBRARY_PREFIX}header_archive${CMAKE_STATIC_LIBRARY_SUFFIX}")',
+                # Exercise Windows compile-definition propagation even on macOS/Linux.
+                'set(native_win32 "${WIN32}")', 'set(WIN32 TRUE)', imported,
+                'set(WIN32 "${native_win32}")',
+                'add_dependencies(edr_pcre2_static header_archive)',
+                'set(EDR_PCRE2_TARGET edr_pcre2_static)',
+                'set(SQLite3_FOUND TRUE)', 'add_library(SQLite3::SQLite3 INTERFACE IMPORTED)',
+                'set_target_properties(SQLite3::SQLite3 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/dynamic/include")',
+                'add_library(Threads::Threads INTERFACE IMPORTED)', common,
+            ]
+            for target in targets:
+                link = re.search(rf'target_link_libraries\({target} PRIVATE[^)]*\)', tests_source)
+                self.assertIsNotNone(link, target)
+                lines += [f'add_executable({target} probe.c)', link[0],
+                          f'add_test(NAME {target} COMMAND {target})']
+            lines += [
+                'add_executable(header_collision_control EXCLUDE_FROM_ALL probe.c)',
+                'target_link_libraries(header_collision_control PRIVATE edr_ave_test_common edr_pcre2_static)',
+            ]
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            build = source / "build"
+            commands = [
+                ["cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"],
+                ["cmake", "--build", str(build), "--target", *targets],
+                ["ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error"],
+            ]
+            for command in commands:
+                completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, timeout=90, check=False)
+                self.assertEqual(0, completed.returncode, completed.stdout)
+            rejected = subprocess.run(
+                ["cmake", "--build", str(build), "--target", "header_collision_control"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, check=False)
+            self.assertNotEqual(0, rejected.returncode, rejected.stdout)
+            self.assertIn("ordinary dynamic PCRE2 header selected", rejected.stdout)
+
     def test_release_rejects_explicit_stub(self):
         completed = self.configure(build_tests=True, require_pcre2=False,
                                   allow_test_stub=True, build_type="Release")

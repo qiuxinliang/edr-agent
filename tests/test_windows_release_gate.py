@@ -138,6 +138,29 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("ctest", "--test-dir", str(build), "-L", "^no-such-gate$",
                              "--no-tests=error", success=False)
 
+    def test_keep_going_builds_independent_targets_but_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            lines = [
+                "cmake_minimum_required(VERSION 3.19)", "project(KeepGoing C)",
+                'add_custom_target(broken COMMAND "${CMAKE_COMMAND}" -E false)',
+            ]
+            targets = ("fd_installer_worker", "fd_headless_uninstaller")
+            for target in targets:
+                lines += [
+                    f"add_executable({target} main.c)",
+                    f'add_custom_command(TARGET {target} POST_BUILD COMMAND "${{CMAKE_COMMAND}}" '
+                    f'-E touch "${{CMAKE_BINARY_DIR}}/{target}.built")',
+                ]
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            self.run_command("cmake", "--build", str(build), "--target", "broken", *targets,
+                             "--parallel", "1", "--", "-k", "0", success=False)
+            for target in targets:
+                self.assertTrue((build / f"{target}.built").is_file(), target)
+
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
             source = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
@@ -145,8 +168,12 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIsNotNone(targets)
             self.assertIn("'windows_release_gate_tests'", targets[1])
             self.assertIn("'forensic_collector'", targets[1])
+            self.assertIn("'fd_installer_worker'", targets[1])
+            self.assertIn("'fd_headless_uninstaller'", targets[1])
             self.assertNotIn("'test_", targets[1])
-            self.assertIn("cmake --build build --config Release --target", source)
+            self.assertRegex(source, r'cmake --build build --config Release --target \$(?:build|release)Targets[^\n]* -- -k 0\n\s+if \(\$LASTEXITCODE -ne 0\)')
+            self.assertIn("python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v", source)
+            self.assertIn('throw "Windows PCRE2 header isolation regression failed"', source)
             self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
 
         source = (ROOT / ".github/workflows/edr-agent-ci.yml").read_text(encoding="utf-8")

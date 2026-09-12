@@ -670,8 +670,11 @@ if(EDR_PCRE2_AVAILABLE)
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_p0_source_only_durable_contract PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
+  # Select the verified static header before SQLite's shared vcpkg include
+  # directory. vcpkg's dynamic pcre2.h hardcodes the static check to 0, so
+  # PCRE2_STATIC alone cannot prevent dllimport declarations from that header.
   target_link_libraries(test_p0_source_only_durable_contract PRIVATE
-    edr_ave_test_common Threads::Threads ${EDR_PCRE2_TARGET})
+    ${EDR_PCRE2_TARGET} edr_ave_test_common Threads::Threads)
   edr_apply_test_warnings(test_p0_source_only_durable_contract)
   add_test(NAME p0_source_only_durable_contract COMMAND test_p0_source_only_durable_contract)
   set_tests_properties(p0_source_only_durable_contract PROPERTIES
