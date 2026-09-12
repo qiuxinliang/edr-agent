@@ -12,10 +12,39 @@
 
 #include <sqlite3.h>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#include <process.h>
+#define TEST_PID _getpid()
+#else
 #include <pthread.h>
 #include <unistd.h>
+#define TEST_PID getpid()
 #endif
+
+static int test_setenv(const char *name, const char *value) {
+#ifdef _WIN32
+  return _putenv_s(name, value);
+#else
+  return setenv(name, value, 1);
+#endif
+}
+
+static int test_unsetenv(const char *name) {
+#ifdef _WIN32
+  return _putenv_s(name, "");
+#else
+  return unsetenv(name);
+#endif
+}
+
+static void test_sleep_ms(unsigned milliseconds) {
+#ifdef _WIN32
+  Sleep(milliseconds);
+#else
+  assert(usleep(milliseconds * 1000u) == 0);
+#endif
+}
 
 static int s_send_ok;
 static int s_telemetry_deferred;
@@ -528,7 +557,7 @@ static void test_terminal_journal_durable_commits_and_exact_replay(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
   EdrEnforcementTerminalJournalMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-journal-commit-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-journal-commit-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0x61u);
   make_wire(source, 0x62u);
@@ -577,7 +606,7 @@ static void test_terminal_journal_durable_commits_and_exact_replay(void) {
 static void test_terminal_journal_recovery_and_independent_acks(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-journal-recovery-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-journal-recovery-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0x71u);
   make_wire(source, 0x72u);
@@ -639,7 +668,7 @@ static void test_terminal_journal_recovery_and_independent_acks(void) {
 static void test_terminal_selected_frame_retry_then_ack(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-selected-frame-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-selected-frame-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0x74u);
   make_wire(source, 0x75u);
@@ -686,8 +715,8 @@ static void test_terminal_selected_frame_allocation_failures_preserve_retry(void
     uint8_t intent_value = (uint8_t)(0x80u + kind);
     uint8_t source_value = (uint8_t)(0x90u + kind);
     uint8_t combined_value = (uint8_t)(0xa0u + kind);
-    snprintf(path, sizeof(path), "/tmp/edr-terminal-select-alloc-%ld-%u.db",
-             (long)getpid(), kind);
+    snprintf(path, sizeof(path), "edr-terminal-select-alloc-%ld-%u.db",
+             (long)TEST_PID, kind);
     snprintf(key, sizeof(key), "select-alloc-%u", kind);
     snprintf(intent_batch, sizeof(intent_batch), "select-alloc-intent-%u", kind);
     snprintf(source_batch, sizeof(source_batch), "select-alloc-source-%u", kind);
@@ -740,7 +769,7 @@ static void test_terminal_selected_frame_invalid_durable_wire_fails(void) {
   uint8_t intent[20], source[20], combined[20];
   sqlite3_int64 source_failure_id;
   EdrEnforcementTerminalJournalMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-invalid-wire-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-invalid-wire-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0xb1u);
   make_wire(source, 0xb2u);
@@ -777,7 +806,7 @@ static void test_terminal_selected_frame_invalid_durable_wire_fails(void) {
 
   /* The intent-only path uses a different state predicate. A malformed
    * pre-action frame must likewise release its future-frame reservation. */
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-invalid-intent-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-invalid-intent-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0xb4u);
   assert(edr_storage_queue_open(path) == EDR_OK);
@@ -813,7 +842,7 @@ static void test_terminal_metadata_corruption_quarantines_without_starvation(voi
     uint8_t poison_intent[20], valid_intent[20], valid_source[20], valid_combined[20];
     sqlite3_int64 poison_id;
     EdrEnforcementTerminalJournalMetrics before, after;
-    snprintf(path, sizeof(path), "/tmp/edr-terminal-empty-key-%ld.db", (long)getpid());
+    snprintf(path, sizeof(path), "edr-terminal-empty-key-%ld.db", (long)TEST_PID);
     (void)remove(path);
     make_wire(poison_intent, 0xc1u);
     make_wire(valid_intent, 0xc2u);
@@ -862,7 +891,7 @@ static void test_terminal_metadata_corruption_quarantines_without_starvation(voi
     uint8_t valid_intent[20], valid_source[20], valid_combined[20];
     sqlite3_int64 poison_id;
     EdrEnforcementTerminalJournalMetrics before, after;
-    snprintf(path, sizeof(path), "/tmp/edr-terminal-empty-source-batch-%ld.db", (long)getpid());
+    snprintf(path, sizeof(path), "edr-terminal-empty-source-batch-%ld.db", (long)TEST_PID);
     (void)remove(path);
     make_wire(poison_intent, 0xd1u);
     make_wire(poison_source, 0xd2u);
@@ -923,13 +952,13 @@ static void test_terminal_failed_rows_release_reserved_capacity(void) {
   EdrStorageQueueCapacityMetrics before_fail, after_fail, after_reopen;
   EdrEnforcementTerminalJournalMetrics before_corruption, after_corruption;
 
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-failed-reserve-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-failed-reserve-%ld.db", (long)TEST_PID);
   (void)remove(path);
   /* The five setup rows need more than the final 1 MiB terminal lane. Reopen
    * under that production-size cap to prove poisoned reservations cannot keep
    * capacity stranded. */
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "2", 1) == 0);
-  assert(setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "8", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "2") == 0);
+  assert(test_setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "8") == 0);
   ordinary_wire = (uint8_t *)malloc(ordinary_wire_len);
   assert(ordinary_wire != NULL);
   make_wire(intent, 0xe1u);
@@ -959,7 +988,7 @@ static void test_terminal_failed_rows_release_reserved_capacity(void) {
              "reserve-valid", "reserve-valid-source", valid_source, sizeof(valid_source),
              "reserve-valid-combined", valid_combined, sizeof(valid_combined)) == EDR_OK);
   edr_storage_queue_close();
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "1", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
 
   /* Exercise key and batch metadata independently: embedded NUL would be
    * truncated by sqlite3_bind_text(..., -1), and 256-byte TEXT exceeds the
@@ -1026,8 +1055,8 @@ static void test_terminal_failed_rows_release_reserved_capacity(void) {
   edr_storage_queue_close();
   free(ordinary_wire);
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
-  assert(unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
 }
 
 /* Replay/update idempotency comparisons also read SQLite TEXT. A corrupt raw
@@ -1036,7 +1065,7 @@ static void test_terminal_corrupt_sql_text_never_matches_exact_replay(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
 
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-raw-text-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-raw-text-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0xe6u);
   make_wire(source, 0xe7u);
@@ -1058,7 +1087,7 @@ static void test_terminal_corrupt_sql_text_never_matches_exact_replay(void) {
   edr_storage_queue_close();
   (void)remove(path);
 
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-raw-update-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-raw-update-%ld.db", (long)TEST_PID);
   (void)remove(path);
   assert(edr_storage_queue_open(path) == EDR_OK);
   assert(edr_storage_queue_enforcement_terminal_precreate(
@@ -1091,7 +1120,7 @@ static void test_terminal_corrupt_owner_never_recreates_action(void) {
   sqlite3_int64 nul_id, overlong_id;
   EdrEnforcementTerminalJournalMetrics before, after, after_reopen;
 
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-owner-corrupt-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-owner-corrupt-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(nul_intent, 0xb6u);
   make_wire(overlong_intent, 0xb7u);
@@ -1227,9 +1256,9 @@ static void test_terminal_owner_digest_migration_and_unresolved_legacy_latch(voi
       "'R-TERMINAL','legacy-poison-generation','pending_intent','legacy-poison-intent',"
       "X'42415431010000000800000004000000BBBCA55A',0,0,131584,'',1,1,0);";
 
-  snprintf(valid_path, sizeof(valid_path), "/tmp/edr-terminal-owner-migrate-%ld.db", (long)getpid());
-  snprintf(corrupt_path, sizeof(corrupt_path), "/tmp/edr-terminal-owner-unresolved-%ld.db",
-           (long)getpid());
+  snprintf(valid_path, sizeof(valid_path), "edr-terminal-owner-migrate-%ld.db", (long)TEST_PID);
+  snprintf(corrupt_path, sizeof(corrupt_path), "edr-terminal-owner-unresolved-%ld.db",
+           (long)TEST_PID);
   (void)remove(valid_path);
   (void)remove(corrupt_path);
   make_wire(intent, 0xb9u);
@@ -1304,10 +1333,10 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   sqlite3_int64 nul_id, overlong_id;
   EdrStorageQueueCapacityMetrics before, after, after_reopen, after_transient;
 
-  snprintf(path, sizeof(path), "/tmp/edr-event-queue-batch-metadata-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-event-queue-batch-metadata-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "1", 1) == 0);
-  assert(setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "8", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
+  assert(test_setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "8") == 0);
   large_wire = (uint8_t *)malloc(large_wire_len);
   assert(large_wire != NULL);
   make_large_wire(large_wire, large_wire_len, 0xe9u);
@@ -1410,8 +1439,8 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   edr_storage_queue_close();
   free(large_wire);
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
-  assert(unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
 }
 
 /* Final terminal frames have a different failure contract from ordinary
@@ -1422,12 +1451,12 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
   EdrEnforcementTerminalJournalMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-journal-final-retry-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-journal-final-retry-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0xa1u);
   make_wire(source, 0xa2u);
   make_wire(combined, 0xa3u);
-  assert(setenv("EDR_QUEUE_RETENTION_HOURS", "1", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_RETENTION_HOURS", "1") == 0);
   assert(edr_storage_queue_open(path) == EDR_OK);
   assert(edr_storage_queue_enforcement_terminal_precreate(
              "final-retry", "event-final-retry", "R-TERMINAL", "generation-final-retry",
@@ -1490,7 +1519,7 @@ static void test_terminal_journal_ordinary_ack_is_atomic_and_reconciles(void) {
   uint8_t intent[20], source[20], combined[20];
   int source_acked, combined_acked;
   EdrEnforcementTerminalJournalMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-journal-ack-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-journal-ack-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0x91u);
   make_wire(source, 0x92u);
@@ -1579,7 +1608,7 @@ static void test_terminal_journal_backpressure_cap(void) {
   char path[256];
   uint8_t intent[20];
   EdrEnforcementTerminalJournalMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-terminal-journal-cap-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-terminal-journal-cap-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0x7au);
   assert(edr_storage_queue_open(path) == EDR_OK);
@@ -1616,10 +1645,10 @@ static void test_logical_capacity_recovers_and_reserves_terminal(void) {
   unsigned ordinary_before_drain = 0u;
   unsigned ordinary_before_terminal = 0u;
   int saw_full = 0;
-  snprintf(path, sizeof(path), "/tmp/edr-storage-queue-capacity-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-storage-queue-capacity-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "1", 1) == 0);
-  assert(setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "128", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
+  assert(test_setenv("EDR_QUEUE_DRAIN_MAX_ROWS", "128") == 0);
   large_wire = (uint8_t *)malloc(65536u);
   assert(large_wire != NULL);
   make_large_wire(large_wire, 65536u, 0xd1u);
@@ -1657,9 +1686,7 @@ static void test_logical_capacity_recovers_and_reserves_terminal(void) {
   assert(edr_storage_queue_pending_count() == ordinary_before_drain + 2u);
 
   reset_send_state(1);
-#if !defined(_WIN32)
-  usleep(250000u);
-#endif
+  test_sleep_ms(250u);
   edr_storage_queue_poll_drain();
   assert(edr_storage_queue_pending_count() == 0u);
   edr_storage_queue_get_capacity_metrics(&after_drain);
@@ -1677,9 +1704,7 @@ static void test_logical_capacity_recovers_and_reserves_terminal(void) {
    * only diagnostics; a fresh ordinary event must be accepted now. */
   assert(edr_storage_queue_enqueue("capacity-after-drain", large_wire, 65536u, 0, 0) == EDR_OK);
   reset_send_state(1);
-#if !defined(_WIN32)
-  usleep(250000u);
-#endif
+  test_sleep_ms(250u);
   edr_storage_queue_poll_drain();
   assert(edr_storage_queue_pending_count() == 0u);
 
@@ -1718,8 +1743,8 @@ static void test_logical_capacity_recovers_and_reserves_terminal(void) {
   edr_storage_queue_close();
   free(large_wire);
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
-  assert(unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_DRAIN_MAX_ROWS") == 0);
 }
 
 /* P0 source-only evidence may consume its own reserve, but it is still
@@ -1731,9 +1756,9 @@ static void test_source_only_capacity_is_distinct_and_bounded(void) {
   EdrStorageQueueCapacityMetrics metrics;
   unsigned admitted = 0u;
   int saw_full = 0;
-  snprintf(path, sizeof(path), "/tmp/edr-storage-queue-source-capacity-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-storage-queue-source-capacity-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "1", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
   large_wire = (uint8_t *)malloc(65536u);
   assert(large_wire != NULL);
   make_large_wire(large_wire, 65536u, 0xd3u);
@@ -1758,7 +1783,7 @@ static void test_source_only_capacity_is_distinct_and_bounded(void) {
   edr_storage_queue_close();
   free(large_wire);
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
 }
 
 static void test_p0_source_only_latch_persists_until_central_ack(void) {
@@ -1766,7 +1791,7 @@ static void test_p0_source_only_latch_persists_until_central_ack(void) {
   uint8_t wire[20];
   EdrStorageQueueP0SourceOnlyLatch latch;
   EdrStorageQueueP0SourceOnlyLatch wrong;
-  snprintf(path, sizeof(path), "/tmp/edr-source-only-latch-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-source-only-latch-%ld.db", (long)TEST_PID);
   (void)remove(path);
   assert(edr_storage_queue_open(path) == EDR_OK);
   assert(edr_storage_queue_p0_source_only_latch_is_set() == 0);
@@ -1840,7 +1865,7 @@ static void test_p0_source_only_multiple_durable_rows_do_not_create_false_loss(v
   EdrStorageQueueP0SourceOnlyLatch first;
   EdrStorageQueueP0SourceOnlyLatch second;
   EdrStorageQueueP0SourceOnlyLatch reopened;
-  snprintf(path, sizeof(path), "/tmp/edr-source-only-multi-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-source-only-multi-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(first_wire, 0xe8u);
   make_wire(second_wire, 0xe9u);
@@ -1889,9 +1914,9 @@ static void test_p0_source_only_retry_retention_corruption_and_identity(void) {
   EdrStorageQueueP0SourceOnlyLatch rotated;
   EdrStorageQueueP0SourceOnlyLatch recreated;
   uint8_t prior_nonce[EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_NONCE_BYTES];
-  snprintf(path, sizeof(path), "/tmp/edr-source-only-retention-%ld.db", (long)getpid());
-  snprintf(recreated_path, sizeof(recreated_path), "/tmp/edr-source-only-recreated-%ld.db",
-           (long)getpid());
+  snprintf(path, sizeof(path), "edr-source-only-retention-%ld.db", (long)TEST_PID);
+  snprintf(recreated_path, sizeof(recreated_path), "edr-source-only-recreated-%ld.db",
+           (long)TEST_PID);
   (void)remove(path);
   (void)remove(recreated_path);
   make_wire(wire, 0xe2u);
@@ -1998,9 +2023,9 @@ static void test_p0_source_only_legacy_and_corrupt_meta_recover(void) {
   uint8_t wire[20];
   EdrStorageQueueP0SourceOnlyLatch latch;
   EdrStorageQueueP0SourceOnlyLatch stale_latch;
-  snprintf(legacy_path, sizeof(legacy_path), "/tmp/edr-source-only-legacy-%ld.db", (long)getpid());
-  snprintf(corrupt_path, sizeof(corrupt_path), "/tmp/edr-source-only-meta-corrupt-%ld.db",
-           (long)getpid());
+  snprintf(legacy_path, sizeof(legacy_path), "edr-source-only-legacy-%ld.db", (long)TEST_PID);
+  snprintf(corrupt_path, sizeof(corrupt_path), "edr-source-only-meta-corrupt-%ld.db",
+           (long)TEST_PID);
   (void)remove(legacy_path);
   (void)remove(corrupt_path);
 
@@ -2042,9 +2067,9 @@ static void test_queue_and_terminal_metric_denominators(void) {
   uint8_t wire_a[20], wire_b[20], intent[20];
   EdrStorageQueueCapacityMetrics before_queue, after_queue;
   EdrEnforcementTerminalJournalMetrics before_terminal, after_terminal;
-  snprintf(path, sizeof(path), "/tmp/edr-storage-queue-metrics-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-storage-queue-metrics-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(setenv("EDR_QUEUE_MAX_DB_MB", "1", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
   make_wire(wire_a, 0xf1u);
   make_wire(wire_b, 0xf2u);
   make_wire(intent, 0xf3u);
@@ -2122,16 +2147,16 @@ static void test_queue_and_terminal_metric_denominators(void) {
 
   edr_storage_queue_close();
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
 }
 
 static void test_unbounded_queue_reports_no_utilization_percentage(void) {
   char path[256];
   uint8_t wire[20];
   EdrStorageQueueCapacityMetrics metrics;
-  snprintf(path, sizeof(path), "/tmp/edr-storage-queue-unbounded-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-storage-queue-unbounded-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
   make_wire(wire, 0xf4u);
   assert(edr_storage_queue_open(path) == EDR_OK);
   assert(edr_storage_queue_enqueue("unbounded", wire, sizeof(wire), 0,
@@ -2152,8 +2177,8 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
   char new_path[256];
   uint8_t intent[20];
   pthread_t stale_drain;
-  snprintf(old_path, sizeof(old_path), "/tmp/edr-terminal-journal-old-%ld.db", (long)getpid());
-  snprintf(new_path, sizeof(new_path), "/tmp/edr-terminal-journal-new-%ld.db", (long)getpid());
+  snprintf(old_path, sizeof(old_path), "edr-terminal-journal-old-%ld.db", (long)TEST_PID);
+  snprintf(new_path, sizeof(new_path), "edr-terminal-journal-new-%ld.db", (long)TEST_PID);
   (void)remove(old_path);
   (void)remove(new_path);
   make_wire(intent, 0x81u);
@@ -2164,7 +2189,7 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
          EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
   reset_send_state(1);
   block_next_send();
-  usleep(250000u);
+  test_sleep_ms(250u);
   assert(pthread_create(&stale_drain, NULL, drain_worker, NULL) == 0);
   wait_for_send();
 
@@ -2182,7 +2207,7 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
   assert(terminal_journal_state_is(new_path, "same-terminal-key", "pending_intent"));
   assert(terminal_journal_intent_acked(new_path, "same-terminal-key") == 0);
 
-  usleep(250000u);
+  test_sleep_ms(250u);
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0x81u) == 2u);
   assert(terminal_journal_intent_acked(new_path, "same-terminal-key") == 1);
@@ -2195,7 +2220,7 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
 static void test_budget_deferral_preserves_terminal_frames(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
-  snprintf(path, sizeof(path), "/tmp/edr-budget-terminal-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-budget-terminal-%ld.db", (long)TEST_PID);
   (void)remove(path);
   make_wire(intent, 0xc9u);
   make_wire(source, 0xcau);
@@ -2231,7 +2256,7 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
 static void test_budget_deferral_preserves_ordinary_retry_allowance(void) {
   char path[256];
   uint8_t wire[20];
-  snprintf(path, sizeof(path), "/tmp/edr-budget-queue-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-budget-queue-%ld.db", (long)TEST_PID);
   (void)remove(path);
   assert(edr_storage_queue_open(path) == EDR_OK);
   make_wire(wire, 0xceu);
@@ -2260,10 +2285,10 @@ int main(void) {
   char old_path[256];
   char new_path[256];
   uint8_t wire_a[20], wire_b[20];
-  snprintf(path, sizeof(path), "/tmp/edr-storage-queue-%ld.db", (long)getpid());
+  snprintf(path, sizeof(path), "edr-storage-queue-%ld.db", (long)TEST_PID);
   (void)remove(path);
-  assert(setenv("EDR_QUEUE_DRAIN_INTERVAL_MS", "200", 1) == 0);
-  assert(setenv("EDR_QUEUE_MAX_RETRIES", "1", 1) == 0);
+  assert(test_setenv("EDR_QUEUE_DRAIN_INTERVAL_MS", "200") == 0);
+  assert(test_setenv("EDR_QUEUE_MAX_RETRIES", "1") == 0);
   assert(edr_storage_queue_open(path) == EDR_OK);
   make_wire(wire_a, 1u);
   make_wire(wire_b, 9u);
@@ -2281,22 +2306,16 @@ int main(void) {
   assert(edr_storage_queue_enqueue("closed", wire_a, sizeof(wire_a), 0, 1) != EDR_OK);
   assert(edr_storage_queue_open(path) == EDR_OK);
   reset_send_state(1);
-#if !defined(_WIN32)
-  usleep(1100000u);
-#endif
+  test_sleep_ms(1100u);
   edr_storage_queue_poll_drain();
   assert(total_send_calls() == 2u && s_last_payload_len == sizeof(wire_b));
   assert(memcmp(s_last_payload, wire_b, sizeof(wire_b)) == 0);
 
   assert(edr_storage_queue_enqueue("p0-dead", wire_b, sizeof(wire_b), 0, 1) == EDR_OK);
   reset_send_state(0);
-#if !defined(_WIN32)
-  usleep(1100000u);
-#endif
+  test_sleep_ms(1100u);
   edr_storage_queue_poll_drain();
-#if !defined(_WIN32)
-  usleep(1100000u);
-#endif
+  test_sleep_ms(1100u);
   edr_storage_queue_poll_drain();
   assert(status_count(path, "dead_letter") == 1);
 
@@ -2311,7 +2330,7 @@ int main(void) {
   for (unsigned i = 0u; i < workers; i++) assert(pthread_join(threads[i], NULL) == 0);
   assert(edr_storage_queue_pending_count() >= workers);
   reset_send_state(1);
-  usleep(250000u);
+  test_sleep_ms(250u);
   pthread_t draining[workers];
   for (unsigned i = 0u; i < workers; i++) {
     assert(pthread_create(&draining[i], NULL, drain_worker, NULL) == 0);
@@ -2319,7 +2338,7 @@ int main(void) {
   for (unsigned i = 0u; i < workers; i++) assert(pthread_join(draining[i], NULL) == 0);
   for (unsigned i = 0u; i < workers; i++) assert(send_calls_for((uint8_t)(i + 32u)) <= 1u);
   for (unsigned round = 0u; round < 3u; round++) {
-    usleep(250000u);
+    test_sleep_ms(250u);
     edr_storage_queue_poll_drain();
   }
   for (unsigned i = 0u; i < workers; i++) assert(send_calls_for((uint8_t)(i + 32u)) == 1u);
@@ -2327,8 +2346,8 @@ int main(void) {
   assert(edr_storage_queue_pending_count() == 0u);
 
   edr_storage_queue_close();
-  snprintf(old_path, sizeof(old_path), "/tmp/edr-storage-queue-old-%ld.db", (long)getpid());
-  snprintf(new_path, sizeof(new_path), "/tmp/edr-storage-queue-new-%ld.db", (long)getpid());
+  snprintf(old_path, sizeof(old_path), "edr-storage-queue-old-%ld.db", (long)TEST_PID);
+  snprintf(new_path, sizeof(new_path), "edr-storage-queue-new-%ld.db", (long)TEST_PID);
   (void)remove(old_path);
   (void)remove(new_path);
   assert(edr_storage_queue_open(old_path) == EDR_OK);
@@ -2336,7 +2355,7 @@ int main(void) {
   assert(batch_row_id(old_path, "old-p0") == 1);
   reset_send_state(1);
   block_next_send();
-  usleep(250000u);
+  test_sleep_ms(250u);
   pthread_t stale_drain;
   assert(pthread_create(&stale_drain, NULL, drain_worker, NULL) == 0);
   wait_for_send();
@@ -2348,11 +2367,11 @@ int main(void) {
   assert(pthread_join(stale_drain, NULL) == 0);
   assert(status_count(new_path, "pending") == 1);
   assert(send_calls_for(1u) == 1u);
-  usleep(250000u);
+  test_sleep_ms(250u);
   edr_storage_queue_poll_drain();
   assert(edr_storage_queue_pending_count() == 0u);
   assert(send_calls_for(9u) == 1u);
-  usleep(250000u);
+  test_sleep_ms(250u);
   edr_storage_queue_poll_drain();
   assert(total_send_calls() == 2u);
   for (unsigned cycle = 0u; cycle < 4u; cycle++) {

@@ -56,7 +56,9 @@ endfunction()
 function(edr_apply_test_warnings target_name)
   edr_apply_common_warnings(${target_name})
   if(MSVC)
-    target_compile_options(${target_name} PRIVATE /UNDEBUG)
+    # Undeclared POSIX calls must fail at compilation, not reach the linker.
+    target_compile_options(${target_name} PRIVATE /UNDEBUG
+      "$<$<COMPILE_LANGUAGE:C>:/we4013>")
   else()
     target_compile_options(${target_name} PRIVATE -UNDEBUG)
   endif()

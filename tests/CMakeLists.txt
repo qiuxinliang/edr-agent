@@ -21,10 +21,6 @@ if(OpenSSL_FOUND)
   target_include_directories(test_command_signature_cross_language PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
   edr_apply_test_warnings(test_command_signature_cross_language)
-  if(MSVC)
-    # Reject undeclared POSIX APIs at compilation, before an MSVC link failure.
-    target_compile_options(test_command_signature_cross_language PRIVATE /we4013)
-  endif()
   target_compile_definitions(test_command_signature_cross_language PRIVATE EDR_HAVE_OPENSSL_HTTP=1)
   target_link_libraries(test_command_signature_cross_language PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   add_test(NAME command_signature_cross_language COMMAND test_command_signature_cross_language
@@ -700,6 +696,9 @@ if(SQLite3_FOUND)
   endif()
   edr_apply_test_warnings(test_storage_queue_sqlite)
   add_test(NAME storage_queue_sqlite_contract COMMAND test_storage_queue_sqlite)
+  # Relative per-process database files work on Windows too; /tmp is POSIX-only.
+  set_tests_properties(storage_queue_sqlite_contract PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 add_executable(test_ave_sdk ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_sdk.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})

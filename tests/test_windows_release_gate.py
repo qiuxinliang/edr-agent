@@ -161,6 +161,58 @@ class WindowsReleaseGateTests(unittest.TestCase):
             for target in targets:
                 self.assertTrue((build / f"{target}.built").is_file(), target)
 
+    def test_storage_queue_windows_branch_rejects_posix_calls(self):
+        """Compile the actual test's Windows branch; not a Windows runtime test.
+
+        Native Windows uses its real CRT/SDK. Other hosts supply declarations
+        only and poison POSIX names their libc would otherwise silently accept.
+        """
+        cmake_source = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        begin = cmake_source.index("function(edr_apply_common_warnings")
+        end = cmake_source.index('option(EDR_BUILD_TESTS', begin)
+        tests_source = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        definitions = re.search(r'target_compile_definitions\(test_storage_queue_sqlite PRIVATE[^)]*\)', tests_source)
+        self.assertIsNotNone(definitions)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "windows.h").write_text(
+                'void Sleep(unsigned long);\n', encoding="utf-8")
+            (source / "process.h").write_text(
+                'int _getpid(void);\nint _putenv_s(const char *, const char *);\n', encoding="utf-8")
+            (source / "no_posix.h").write_text(
+                '#include <stdlib.h>\n#pragma GCC poison setenv unsetenv getpid usleep\n',
+                encoding="utf-8")
+            lines = [
+                'cmake_minimum_required(VERSION 3.20)', 'project(QueueWindowsBranch C)',
+                'set(CMAKE_C_STANDARD 11)', 'set(CMAKE_EXPORT_COMPILE_COMMANDS ON)',
+                'find_package(SQLite3 REQUIRED)', cmake_source[begin:end],
+                f'add_library(queue_probe OBJECT "{(ROOT / "tests/test_storage_queue_sqlite.c").as_posix()}")',
+                definitions[0].replace("test_storage_queue_sqlite", "queue_probe"),
+                f'target_include_directories(queue_probe PRIVATE "{(ROOT / "include").as_posix()}")',
+                'if(TARGET SQLite3::SQLite3)',
+                '  target_link_libraries(queue_probe PRIVATE SQLite3::SQLite3)',
+                'else()', '  target_link_libraries(queue_probe PRIVATE SQLite::SQLite3)', 'endif()',
+                'edr_apply_test_warnings(queue_probe)',
+                'if(NOT WIN32)',
+                '  target_compile_definitions(queue_probe PRIVATE _WIN32)',
+                '  target_include_directories(queue_probe PRIVATE "${CMAKE_SOURCE_DIR}")',
+                '  target_compile_options(queue_probe PRIVATE -Werror=implicit-function-declaration -include "${CMAKE_SOURCE_DIR}/no_posix.h")',
+                'endif()',
+                # Inspect the actual shared MSVC flags without passing them to
+                # a non-MSVC compiler. This target is never built.
+                'set(MSVC TRUE)', 'add_library(msvc_options OBJECT EXCLUDE_FROM_ALL "options.c")',
+                'edr_apply_test_warnings(msvc_options)',
+            ]
+            (source / "options.c").write_text('int options(void) { return 0; }\n', encoding="utf-8")
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            commands = json.loads((build / "compile_commands.json").read_text(encoding="utf-8"))
+            flags = next(row["command"] for row in commands if row["file"].endswith("options.c"))
+            self.assertIn("/we4013", flags)
+            self.assertIn("/UNDEBUG", flags)
+            self.run_command("cmake", "--build", str(build), "--target", "queue_probe")
+
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
             source = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
