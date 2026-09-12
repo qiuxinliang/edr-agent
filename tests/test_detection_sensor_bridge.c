@@ -69,11 +69,37 @@ static int prepare_file_slot_for_admission(EdrEventSlot *slot) {
 
 static void write_high_entropy_fixture(const char *path) {
   FILE *f = fopen(path, "wb");
+  if (!f) perror(path);
   assert(f != NULL);
   for (int i = 0; i < 8192; i++) {
-    fputc(i & 0xff, f);
+    assert(fputc(i & 0xff, f) != EOF);
   }
-  fclose(f);
+  assert(fclose(f) == 0);
+}
+
+static void create_fixture_directory(char *dir, size_t capacity) {
+#ifdef _WIN32
+  char temp_path[MAX_PATH];
+  DWORD length = GetTempPathA(sizeof(temp_path), temp_path);
+  assert(length > 0 && length < sizeof(temp_path));
+  assert(capacity >= MAX_PATH);
+  assert(GetTempFileNameA(temp_path, "edr", 0, dir) != 0);
+  assert(DeleteFileA(dir));
+  assert(CreateDirectoryA(dir, NULL));
+#else
+  const char *tmp = getenv("TMPDIR");
+  int length = snprintf(dir, capacity, "%s/edr-ransom.XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
+  assert(length > 0 && (size_t)length < capacity);
+  assert(mkdtemp(dir) != NULL);
+#endif
+}
+
+static void remove_fixture_directory(const char *dir) {
+#ifdef _WIN32
+  assert(RemoveDirectoryA(dir));
+#else
+  assert(rmdir(dir) == 0);
+#endif
 }
 
 static void test_ransom_admission_snapshot_is_internal_only(void) {
@@ -307,17 +333,7 @@ static void test_ransom_generation_and_file_key_dedup(void) {
 
 static void test_ransom_content_change_contract(void) {
   char dir[512];
-#ifdef _WIN32
-  char temp_path[MAX_PATH];
-  assert(GetTempPathA(sizeof(temp_path), temp_path) > 0);
-  assert(GetTempFileNameA(temp_path, "edr", 0, dir) != 0);
-  assert(DeleteFileA(dir));
-  assert(CreateDirectoryA(dir, NULL));
-#else
-  const char *tmp = getenv("TMPDIR");
-  snprintf(dir, sizeof(dir), "%s/edr-ransom-contract.XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
-  assert(mkdtemp(dir) != NULL);
-#endif
+  create_fixture_directory(dir, sizeof(dir));
   test_setenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", "1");
   test_setenv("EDR_RANSOM_RATE_CONFIRM_FILES", "20");
   for (int changed = 0; changed < 3; ++changed) {
@@ -404,11 +420,7 @@ static void test_ransom_content_change_contract(void) {
     snprintf(path, sizeof(path), "%s/doc%02d.bin", dir, i);
     assert(remove(path) == 0);
   }
-#ifdef _WIN32
-  assert(RemoveDirectoryA(dir));
-#else
-  assert(rmdir(dir) == 0);
-#endif
+  remove_fixture_directory(dir);
 }
 
 static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
@@ -416,17 +428,7 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
   char dir[512];
   EdrEventSlot *queued = (EdrEventSlot *)calloc(MAX_QUEUED, sizeof(*queued));
   assert(queued != NULL);
-#ifdef _WIN32
-  char temp_path[MAX_PATH];
-  assert(GetTempPathA(sizeof(temp_path), temp_path) > 0);
-  assert(GetTempFileNameA(temp_path, "edr", 0, dir) != 0);
-  assert(DeleteFileA(dir));
-  assert(CreateDirectoryA(dir, NULL));
-#else
-  const char *tmp = getenv("TMPDIR");
-  snprintf(dir, sizeof(dir), "%s/edr-ransom-delayed.XXXXXX", tmp && tmp[0] ? tmp : "/tmp");
-  assert(mkdtemp(dir) != NULL);
-#endif
+  create_fixture_directory(dir, sizeof(dir));
 
   size_t queued_count = 0u;
   unsigned before = ransom_response_calls;
@@ -492,11 +494,7 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
     snprintf(path, sizeof(path), "%s/bulk%03d.bin", dir, i);
     assert(remove(path) == 0);
   }
-#ifdef _WIN32
-  assert(RemoveDirectoryA(dir));
-#else
-  assert(rmdir(dir) == 0);
-#endif
+  remove_fixture_directory(dir);
   free(queued);
 }
 
@@ -731,14 +729,11 @@ static void test_ransom_content_entropy_and_extension_change(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
-  const char *tmp = getenv("TMPDIR");
-  if (!tmp || !tmp[0]) {
-    tmp = "/tmp";
-  }
-  char path[512];
-  snprintf(path, sizeof(path), "%s/edr_ransom_entropy_fixture.locked", tmp);
+  char dir[512], path[768];
+  create_fixture_directory(dir, sizeof(dir));
+  snprintf(path, sizeof(path), "%s/edr_ransom_entropy_fixture.locked", dir);
   write_high_entropy_fixture(path);
-  char payload[1024];
+  char payload[1200];
   snprintf(payload, sizeof(payload),
            "ETW1\n"
            "prov=kfile\n"
@@ -751,7 +746,8 @@ static void test_ransom_content_entropy_and_extension_change(void) {
            path);
   fill_slot(&slot, EDR_EVENT_FILE_RENAME, payload);
   eval_slot(&slot, &r, &d);
-  remove(path);
+  assert(remove(path) == 0);
+  remove_fixture_directory(dir);
   assert(strstr(r.script_snippet, "old_ext=docx") != NULL);
   assert(strstr(r.script_snippet, "new_ext=locked") != NULL);
   assert(strstr(r.script_snippet, "ext_changed=1") != NULL);

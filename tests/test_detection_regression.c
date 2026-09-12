@@ -282,24 +282,27 @@ static void run_scenario(const DetectionScenario *s) {
 }
 
 int main(void) {
-  DetectionScenario scenarios[] = {
-      scenario_alert_2001(),
-      scenario_powershell_download_amsi(),
-      scenario_process_injection(),
-      scenario_lsass_dump(),
-      scenario_shellcode_smb(),
-      scenario_webshell(),
-      scenario_ransom_recovery_tamper(),
-      scenario_exfil_staging(),
-      scenario_scriptblock_amsi_etw(),
-      scenario_tls_ja3_sni_cert_anomaly(),
-      scenario_ransom_behavior_counters(),
-      scenario_webshell_ast_token_semantic(),
-      scenario_registry_runkey_persistence(),
-      scenario_silverfox_public501_downloader(),
+  /* Keep only one large behavior record live at a time. An array of all
+   * scenarios plus the evaluator's frame exceeds Windows' 1 MiB stack. */
+  DetectionScenario (*const scenarios[])(void) = {
+      scenario_alert_2001,
+      scenario_powershell_download_amsi,
+      scenario_process_injection,
+      scenario_lsass_dump,
+      scenario_shellcode_smb,
+      scenario_webshell,
+      scenario_ransom_recovery_tamper,
+      scenario_exfil_staging,
+      scenario_scriptblock_amsi_etw,
+      scenario_tls_ja3_sni_cert_anomaly,
+      scenario_ransom_behavior_counters,
+      scenario_webshell_ast_token_semantic,
+      scenario_registry_runkey_persistence,
+      scenario_silverfox_public501_downloader,
   };
   for (size_t i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); i++) {
-    run_scenario(&scenarios[i]);
+    DetectionScenario scenario = scenarios[i]();
+    run_scenario(&scenario);
   }
   puts("detection_regression ok");
   return 0;

@@ -790,8 +790,8 @@ int main(void) {
   free(release_gate);
   contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
-  contains(client_release, "Windows release native target $nativeTarget failed",
-           "release workflow builds native uninstall binaries after gate tests without building unrelated targets");
+  contains(client_release, "Windows release product, installer or gate-test build failed with exit code $LASTEXITCODE",
+           "release workflow reports failures from its explicit product, native installer, and gate-test target allowlist");
   contains(client_release, "$releaseTargets = @(",
            "release workflow uses an explicit Windows build target allowlist");
   contains(client_release, "'native-package-integrity\\.json'",
