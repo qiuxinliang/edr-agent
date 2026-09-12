@@ -44,6 +44,18 @@ PREVIOUSLY_UNBUILT = {
 }
 
 
+def copy_sqlite_header_family(source: Path, destination: Path) -> set[str]:
+    """Copy SQLite's public header and any vcpkg-generated companion headers."""
+    headers = sorted(source.glob("sqlite3*.h"))
+    names = {header.name for header in headers}
+    if "sqlite3.h" not in names:
+        raise AssertionError(f"SQLite include directory has no sqlite3.h: {source}")
+    destination.mkdir(parents=True, exist_ok=True)
+    for header in headers:
+        shutil.copy2(header, destination / header.name)
+    return names
+
+
 class WindowsReleaseGateTests(unittest.TestCase):
     def run_command(self, *args, success=True, env=None):
         result = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
@@ -52,6 +64,21 @@ class WindowsReleaseGateTests(unittest.TestCase):
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
+
+    def test_sqlite_header_relocation_includes_vcpkg_companion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            (source / "sqlite3.h").write_text(
+                '#include "sqlite3-vcpkg-config.h"\n', encoding="utf-8")
+            (source / "sqlite3-vcpkg-config.h").write_text(
+                '#define SQLITE3_VCPKG_TEST 1\n', encoding="utf-8")
+            self.assertEqual(
+                {"sqlite3.h", "sqlite3-vcpkg-config.h"},
+                copy_sqlite_header_family(source, destination))
+            self.assertTrue((destination / "sqlite3-vcpkg-config.h").is_file())
 
     def fixture(self, directory, missing_target="", missing_test="", failing_test=""):
         pairs = re.findall(r'^edr_windows_release_gate\((\w+) (\w+|"")\)$',
@@ -227,9 +254,14 @@ class WindowsReleaseGateTests(unittest.TestCase):
             cache = dict(re.findall(r'^([A-Za-z0-9_]+):[^=\r\n]+=([^\r\n]*)$',
                                    (build / "CMakeCache.txt").read_text(encoding="utf-8"), re.MULTILINE))
             prefix = source / "relocated sqlite"
-            (prefix / "include").mkdir(parents=True)
-            (prefix / "lib").mkdir()
-            shutil.copy2(Path(cache["SQLite3_INCLUDE_DIR"]) / "sqlite3.h", prefix / "include/sqlite3.h")
+            (prefix / "lib").mkdir(parents=True)
+            sqlite_include = Path(cache["SQLite3_INCLUDE_DIR"])
+            copied_headers = copy_sqlite_header_family(sqlite_include, prefix / "include")
+            source_companions = {
+                header.name for header in sqlite_include.glob("sqlite3*.h")
+                if header.name != "sqlite3.h"
+            }
+            self.assertTrue(source_companions.issubset(copied_headers))
             library = Path(cache["SQLite3_LIBRARY"])
             shutil.copy2(library, prefix / "lib" / library.name)
             isolated_env = os.environ.copy()
