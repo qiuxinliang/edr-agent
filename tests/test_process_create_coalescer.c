@@ -116,6 +116,29 @@ int main(void) {
   EdrBehaviorRecord out;
   int ok = 1;
 
+  /* A failed EvtRender must remain non-correlatable. Once the real recorded
+   * timestamp is available, the same source pair may merge; callback time is
+   * never an acceptable substitute and no safety gate is relaxed. */
+  edr_process_coalescer_reset();
+  {
+    EdrBehaviorRecord kernel = rec(4532u, 0, 0xa1u, "C:\\powershell.exe",
+                                    1789252694245704300LL);
+    EdrBehaviorRecord security = rec(4532u, 1, 0u, "C:\\powershell.exe", 0);
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
+               "kernel waits for recorded-time enrichment");
+    ok &= need(edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_PASS,
+               "zero-time Security event cannot participate in correlation");
+    security.event_time_ns = 1789252694245719700LL;
+    ok &= need(edr_process_coalescer_submit(&security, 1, 30u, &out) == EDR_PROCESS_COALESCE_HOLD,
+               "valid recorded time enables generation-bound correlation");
+    ok &= need(edr_process_coalescer_poll(WINDOW_NS + 30u, &out) == 1 &&
+                   strcmp(out.source_completeness, "COALESCED") == 0 &&
+                   out.event_time_ns == kernel.event_time_ns &&
+                   out.process_start_key == kernel.process_start_key &&
+                   strcmp(out.cmdline, security.cmdline) == 0,
+               "recovered source time merges command context without replacing kernel identity");
+  }
+
   /* Kernel -> 4688: keep both pending through the window so another raw
    * StartKey can invalidate an apparent PID/path match. */
   edr_process_coalescer_reset();

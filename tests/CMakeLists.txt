@@ -312,6 +312,14 @@ if(WIN32)
   target_compile_definitions(test_kernel_file_io_windows PRIVATE EDR_FILE_OBJECT_BINDING_NO_MAIN=1)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
+
+  add_executable(test_security_event_time_windows test_security_event_time_windows.c)
+  target_link_libraries(test_security_event_time_windows PRIVATE wevtapi)
+  edr_apply_test_warnings(test_security_event_time_windows)
+  add_test(NAME security_event_time_native COMMAND test_security_event_time_windows)
+  add_executable(test_security_event_time_failures_windows test_security_event_time_failures_windows.c)
+  edr_apply_test_warnings(test_security_event_time_failures_windows)
+  add_test(NAME security_event_time_failures COMMAND test_security_event_time_failures_windows)
 endif()
 
 add_executable(test_process_create_coalescer

@@ -24,6 +24,7 @@ WINDOWS_EXPECTED = {
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
     "kernel_file_io_identity",
+    "security_event_time_native", "security_event_time_failures",
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
 }

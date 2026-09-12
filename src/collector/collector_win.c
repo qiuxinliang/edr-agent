@@ -40,6 +40,7 @@
 #include "edr/windows_event_policy.h"
 
 #include "ave_etw_feed_win.h"
+#include "security_event_time_win.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -1978,30 +1979,6 @@ static int edr_security_target_logon_present(const char *value) {
          _stricmp(value, "0x0") != 0 && strcmp(value, "0") != 0;
 }
 
-/* Security EventLog callbacks can be delayed; use the event's recorded system
- * FILETIME instead of callback wall time for the bounded coalescer window. */
-static uint64_t edr_security_event_time_ns(EVT_HANDLE event) {
-  EVT_VARIANT values[EvtSystemPropertyIdEND];
-  EVT_HANDLE context;
-  DWORD used = 0u;
-  DWORD count = 0u;
-  ULONGLONG filetime;
-  if (!event) return 0u;
-  memset(values, 0, sizeof(values));
-  context = EvtCreateRenderContext(0u, NULL, EvtRenderContextSystem);
-  if (!context) return 0u;
-  if (!EvtRender(context, event, EvtRenderEventValues, (DWORD)sizeof(values), values,
-                 &used, &count) || count <= EvtSystemTimeCreated ||
-      (values[EvtSystemTimeCreated].Type & EVT_VARIANT_TYPE_MASK) != EvtVarTypeFileTime) {
-    EvtClose(context);
-    return 0u;
-  }
-  filetime = values[EvtSystemTimeCreated].FileTimeVal;
-  EvtClose(context);
-  if (filetime <= EDR_COLLECTOR_FILETIME_UNIX_EPOCH_100NS) return 0u;
-  return ((uint64_t)filetime - EDR_COLLECTOR_FILETIME_UNIX_EPOCH_100NS) * 100ULL;
-}
-
 static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
                                                    PVOID user_context,
                                                    EVT_HANDLE event) {
@@ -2009,7 +1986,16 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   if (action != EvtSubscribeActionDeliver || !s_bus || !event) {
     return ERROR_SUCCESS;
   }
-  uint64_t security_event_time_ns = edr_security_event_time_ns(event);
+  DWORD time_error = ERROR_SUCCESS;
+  uint64_t security_event_time_ns = edr_security_event_time_ns(event, &time_error);
+  if (!security_event_time_ns) {
+    static volatile LONG failures;
+    DWORD count = (DWORD)InterlockedIncrement(&failures);
+    if (count <= 3u || (count & (count - 1u)) == 0u) {
+      fprintf(stderr, "[collector] security_event_time_unavailable error=%lu count=%lu; correlation withheld\n",
+              (unsigned long)time_error, (unsigned long)count);
+    }
+  }
   char *xml = NULL;
   if (!edr_evt_render_xml_utf8(event, &xml)) {
     s_health.collector_dropped++;
