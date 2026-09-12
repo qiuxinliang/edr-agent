@@ -13,6 +13,10 @@ on:
       - main
     paths:
       - vcpkg.json
+      - dependencies.lock.json
+      - scripts/vcpkg_cache_key.py
+      - scripts/Initialize-VS2022Environment.ps1
+      - scripts/bootstrap_pinned_vcpkg.ps1
       - .github/workflows/edr-agent-prebuild-packages.yml
 
 permissions:
@@ -69,15 +73,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
 
+      - name: Identify vcpkg cache toolchain
+        id: vcpkg-key
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_vcpkg_cache_key.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache identity regression failed' }
+          python .\scripts\vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
       - name: Cache vcpkg source and binary downloads
-        uses: actions/cache@v5
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
-          key: vcpkg-prebuild-yara-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
+            ${{ steps.vcpkg-key.outputs.restore-prefix }}
             vcpkg-prebuild-yara-${{ matrix.triplet }}-
+            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-
 
       - name: Bootstrap pinned vcpkg
         working-directory: ${{ github.workspace }}
@@ -97,6 +111,15 @@ jobs:
           Write-Host "[Prebuild] Installing production vcpkg packages from source for $env:VCPKG_DEFAULT_TRIPLET..."
           & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           Write-Host "[Prebuild] vcpkg install completed successfully"
+
+      - name: Save completed vcpkg dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Archive vcpkg_installed (7z)
         shell: pwsh

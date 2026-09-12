@@ -26,7 +26,7 @@ $installArgs = @("install") + @($FeatureArgs)
 $previousConcurrency = [Environment]::GetEnvironmentVariable("VCPKG_MAX_CONCURRENCY", "Process")
 $restoreConcurrency = $false
 if ([string]::IsNullOrWhiteSpace($previousConcurrency)) {
-  # The release matrix already serializes AMD64 and ARM64 cold fallbacks.
+  # AMD64 and ARM64 run independently; bound each runner's local fan-out.
   # Keep a small local fan-out for port builds rather than forcing every
   # OpenSSL/YARA dependency to compile one at a time.
   $parallelism = [Math]::Max(1, [Math]::Min(4, [Environment]::ProcessorCount))
@@ -34,6 +34,7 @@ if ([string]::IsNullOrWhiteSpace($previousConcurrency)) {
   $restoreConcurrency = $true
 }
 
+$installTimer = [Diagnostics.Stopwatch]::StartNew()
 try {
   for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     Write-Host "[vcpkg] install attempt $attempt/$MaxAttempts (max parallel build jobs: $env:VCPKG_MAX_CONCURRENCY)"
@@ -67,6 +68,8 @@ try {
   }
 }
 finally {
+  $installTimer.Stop()
+  Write-Host ("[vcpkg] total install elapsed_seconds={0:F1}" -f $installTimer.Elapsed.TotalSeconds)
   if ($restoreConcurrency) {
     Remove-Item Env:VCPKG_MAX_CONCURRENCY -ErrorAction SilentlyContinue
   }

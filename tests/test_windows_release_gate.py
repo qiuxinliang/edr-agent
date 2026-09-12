@@ -363,6 +363,51 @@ class WindowsReleaseGateTests(unittest.TestCase):
         self.assertNotIn("'test_", source)
         self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
 
+    def test_dependency_cache_is_saved_before_product_failures(self):
+        for workflow in ("edr-agent-ci.yml", "edr-agent-client-build.yml",
+                         "edr-agent-client-release.yml", "edr-agent-prebuild-packages.yml"):
+            with self.subTest(workflow=workflow):
+                source = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
+                steps = re.split(r'(?m)^      - ', source)[1:]
+                def step_with(marker):
+                    matches = [step for step in steps if marker in step]
+                    self.assertEqual(len(matches), 1, marker)
+                    return matches[0]
+                initialize = step_with("name: Initialize pinned Visual Studio 2022 environment")
+                identify = step_with("id: vcpkg-key\n")
+                restore = step_with("uses: actions/cache/restore@v5")
+                install = step_with("name: vcpkg install (")
+                save = step_with("uses: actions/cache/save@v5")
+                consumer = step_with("name: Archive vcpkg_installed" if "prebuild" in workflow
+                                     else "name: Configure (")
+                for before, after in zip((initialize, identify, restore, install, save),
+                                         (identify, restore, install, save, consumer)):
+                    self.assertLess(steps.index(before), steps.index(after))
+                self.assertIn("vcpkg_cache_key.py --triplet", identify)
+                self.assertIn("test_vcpkg_cache_key.py", identify)
+                self.assertIn("if ($LASTEXITCODE -ne 0)", identify)
+                self.assertIn("key: ${{ steps.vcpkg-key.outputs.key }}", restore)
+                self.assertIn("${{ steps.vcpkg-key.outputs.restore-prefix }}", restore)
+                self.assertIn("key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}", save)
+                self.assertIn("if: steps.vcpkg-cache.outputs.cache-hit != 'true'", save)
+                self.assertIn("hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''", save)
+                for cache_step in (restore, save):
+                    paths = re.search(r'path: \|\n(.*?)(?=\n\s+key:)', cache_step, re.DOTALL)
+                    self.assertIsNotNone(paths)
+                    self.assertEqual(set(paths[1].split()),
+                                     {".cache/vcpkg-downloads", ".cache/vcpkg-bincache"})
+                self.assertIn('VCPKG_BINARY_SOURCES: "clear;files,', source)
+                self.assertIn("Invoke-VcpkgInstallWithRetry.ps1", install)
+                self.assertNotIn("actions/cache@", source)
+                if workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
+                    prebuilt = step_with("name: Restore vcpkg from pre-built packages")
+                    self.assertLess(steps.index(restore), steps.index(prebuilt))
+                    self.assertLess(steps.index(prebuilt), steps.index(install))
+                    self.assertIn("'${{ steps.vcpkg-cache.outputs.cache-hit }}' -eq 'true'", prebuilt)
+                    self.assertLess(prebuilt.index("outputs.cache-hit"), prebuilt.index("gh release download"))
+                for marker in re.findall(r'(?m)^\s*\$installed_marker = (.*)$', source):
+                    self.assertEqual(marker, 'Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\\vcpkg\\status"')
+
     def test_monorepo_checks_out_pinned_agent_and_runs_nonempty_gates(self):
         workflow = ROOT.parent / ".github/workflows/edr-agent-ci.yml"
         if not (ROOT.parent / ".gitmodules").is_file():

@@ -16,6 +16,8 @@ jobs:
     runs-on: windows-2022
     env:
       VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
     steps:
       - uses: actions/checkout@v6
       - name: Validate release scripts with Windows PowerShell 5.1
@@ -26,18 +28,31 @@ jobs:
         run: |
           chmod +x ./scripts/verify_ave_behavior_chain_invariants.sh
           ./scripts/verify_ave_behavior_chain_invariants.sh
-      - name: Prepare vcpkg download cache
+      - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
-        run: New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
-      - name: Cache vcpkg (manifest：curl)
-        uses: actions/cache@v5
+        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
+      - name: Prepare vcpkg cache directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
+      - name: Identify vcpkg cache toolchain
+        id: vcpkg-key
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_vcpkg_cache_key.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache identity regression failed' }
+          python .\scripts\vcpkg_cache_key.py --triplet x64-windows
+      - name: Cache vcpkg source and binary downloads
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             .cache/vcpkg-downloads
-            vcpkg_installed
-          key: vcpkg-x64-win-https-sqlite-yara-nogrpc-${{ hashFiles('vcpkg.json', 'CMakeLists.txt') }}-${{ runner.os }}
+            .cache/vcpkg-bincache
+          key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
-            vcpkg-x64-win-https-sqlite-yara-nogrpc-${{ hashFiles('vcpkg.json') }}-
+            ${{ steps.vcpkg-key.outputs.restore-prefix }}
       - name: Bootstrap pinned vcpkg
         shell: pwsh
         run: .\scripts\bootstrap_pinned_vcpkg.ps1
@@ -66,9 +81,14 @@ jobs:
           }
 
           Pop-Location
-      - name: Initialize pinned Visual Studio 2022 environment
-        shell: pwsh
-        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
+      - name: Save completed vcpkg dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
       - name: Install Ninja
         shell: pwsh
         run: choco install ninja -y --no-progress

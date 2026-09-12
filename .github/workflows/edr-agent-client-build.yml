@@ -99,23 +99,34 @@ jobs:
       # vcpkg skip validation after a runner/compiler image change. Downloads
       # and the ABI-keyed binary cache are safe to reuse; a complete installed
       # tree must come from the immutable pre-built Release or this job.
+      - name: Identify vcpkg cache toolchain
+        id: vcpkg-key
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_vcpkg_cache_key.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache identity regression failed' }
+          python .\scripts\vcpkg_cache_key.py --triplet x64-windows
       - name: Cache vcpkg source and binary downloads
-        uses: actions/cache@v5
+        id: vcpkg-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             .cache/vcpkg-downloads
             .cache/vcpkg-bincache
-          key: vcpkg-x64-win-yara-${{ hashFiles('vcpkg.json') }}-${{ runner.os }}
+          key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
+            ${{ steps.vcpkg-key.outputs.restore-prefix }}
             vcpkg-x64-win-yara-
+            vcpkg-prebuild-yara-x64-windows-
 
       - name: Restore vcpkg from pre-built packages (if cache miss)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
-          if (Test-Path $installed_marker) {
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\vcpkg\status"
+          # Exact binary-cache hits are materialized and ABI-checked by install.
+          if ('${{ steps.vcpkg-cache.outputs.cache-hit }}' -eq 'true' -or (Test-Path $installed_marker)) {
             Write-Host "[pre-build-packages] vcpkg cache hit, skip download"
             "VCPKG_SOURCE=cache" | Out-File -FilePath $env:GITHUB_ENV -Append
             return
@@ -166,7 +177,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
-          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\vcpkg\status"
           if (Test-Path $installed_marker) {
             Write-Host "[vcpkg] Packages already installed (from $env:VCPKG_SOURCE), verifying..."
           }
@@ -178,6 +189,15 @@ jobs:
           Write-Host "[vcpkg] Windows product build: sqlite + yara (no gRPC)"
           & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
           "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Save completed vcpkg dependencies
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Configure (Ninja, Release)
         env:
@@ -318,7 +338,7 @@ jobs:
             Write-Host "========================================"
             Write-Host "Total elapsed build time: $($elapsed.TotalMinutes.ToString('F1')) minutes ($($elapsed.TotalSeconds)s)"
             Write-Host "vcpkg source : $env:VCPKG_SOURCE"
-            $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows\installed\vcpkg\status"
+            $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\vcpkg\status"
             if (Test-Path $installed_marker) {
               $size = [math]::Round(((Get-ChildItem -Path "vcpkg_installed" -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
               Write-Host "vcpkg installed size: ${size} MB"
