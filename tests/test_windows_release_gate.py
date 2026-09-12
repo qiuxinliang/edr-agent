@@ -4,8 +4,10 @@ Tiny executables isolate the CI scheduling regression from product dependencies.
 The actual response tests still run natively in the normal Windows CTest gate.
 """
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,8 +45,8 @@ PREVIOUSLY_UNBUILT = {
 
 
 class WindowsReleaseGateTests(unittest.TestCase):
-    def run_command(self, *args, success=True):
-        result = subprocess.run(args, capture_output=True, text=True, timeout=90)
+    def run_command(self, *args, success=True, env=None):
+        result = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -186,6 +188,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(QueueWindowsBranch C)',
                 'set(CMAKE_C_STANDARD 11)', 'set(CMAKE_EXPORT_COMPILE_COMMANDS ON)',
+                # Compiler/Ninja discovery has already finished at project().
+                'if(QUEUE_PREFIX_ONLY)',
+                '  set(CMAKE_FIND_USE_CMAKE_SYSTEM_PATH FALSE)',
+                '  set(CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH FALSE)',
+                '  set(CMAKE_FIND_USE_CMAKE_PATH FALSE)',
+                '  set(CMAKE_FIND_USE_PACKAGE_ROOT_PATH FALSE)',
+                'endif()',
                 'find_package(SQLite3 REQUIRED)', cmake_source[begin:end],
                 f'add_library(queue_probe OBJECT "{(ROOT / "tests/test_storage_queue_sqlite.c").as_posix()}")',
                 definitions[0].replace("test_storage_queue_sqlite", "queue_probe"),
@@ -213,6 +222,33 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIn("/UNDEBUG", flags)
             self.run_command("cmake", "--build", str(build), "--target", "queue_probe")
 
+            # Reproduce CI: a real SQLite package exists, but outside every
+            # default search directory. Do not let a host SDK mask lost inputs.
+            cache = dict(re.findall(r'^([A-Za-z0-9_]+):[^=\r\n]+=([^\r\n]*)$',
+                                   (build / "CMakeCache.txt").read_text(encoding="utf-8"), re.MULTILINE))
+            prefix = source / "relocated sqlite"
+            (prefix / "include").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            shutil.copy2(Path(cache["SQLite3_INCLUDE_DIR"]) / "sqlite3.h", prefix / "include/sqlite3.h")
+            library = Path(cache["SQLite3_LIBRARY"])
+            shutil.copy2(library, prefix / "lib" / library.name)
+            isolated_env = os.environ.copy()
+            isolated_env["CMAKE_PREFIX_PATH"] = str(source / "missing-prefix")
+            isolated_env["CMAKE_INCLUDE_PATH"] = ""
+            isolated_env["CMAKE_LIBRARY_PATH"] = ""
+            missing = self.run_command(
+                "cmake", "-S", str(source), "-B", str(source / "missing-build"), "-G", "Ninja",
+                "-DQUEUE_PREFIX_ONLY=ON", env=isolated_env, success=False)
+            self.assertIn("Could NOT find SQLite3", missing.stdout + missing.stderr)
+            isolated_env["CMAKE_PREFIX_PATH"] = str(prefix)
+            isolated_build = source / "isolated-build"
+            self.run_command("cmake", "-S", str(source), "-B", str(isolated_build), "-G", "Ninja",
+                             "-DQUEUE_PREFIX_ONLY=ON", env=isolated_env)
+            self.run_command("cmake", "--build", str(isolated_build), "--target", "queue_probe",
+                             env=isolated_env)
+            isolated_cache = (isolated_build / "CMakeCache.txt").read_text(encoding="utf-8")
+            self.assertIn(f"SQLite3_INCLUDE_DIR:PATH={prefix.as_posix()}/include", isolated_cache)
+
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
             source = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
@@ -226,9 +262,17 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertRegex(source, r'cmake --build build --config Release --target \$(?:build|release)Targets[^\n]* -- -k 0\n\s+if \(\$LASTEXITCODE -ne 0\)')
             self.assertIn("python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v", source)
             self.assertIn('throw "Windows PCRE2 header isolation regression failed"', source)
+            probe_step = re.search(r'- name: Verify release gate build dependencies\n(.*?)(?=\n      - name:)',
+                                   source, re.DOTALL)
+            self.assertIsNotNone(probe_step)
+            prefix_var = "VCPKG_INSTALLED_ROOT" if "release" in workflow else "VCPKG_INSTALLED_X64"
+            self.assertIn('CMAKE_PREFIX_PATH: ${{ env.' + prefix_var + ' }}', probe_step[1])
             self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
 
         source = (ROOT / ".github/workflows/edr-agent-ci.yml").read_text(encoding="utf-8")
+        build_step = re.search(r'- name: Build\n(.*?)(?=\n      - name:)', source, re.DOTALL)
+        self.assertIsNotNone(build_step)
+        self.assertIn('CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows', build_step[1])
         self.assertIn("'windows_release_gate_tests'", source)
         self.assertNotIn("'test_", source)
         self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)

@@ -92,6 +92,8 @@ jobs:
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_BUILD_TESTS=ON
       - name: Build
+        env:
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         shell: pwsh
         run: |
           python -m unittest discover -s tests -p test_windows_release_gate.py -v

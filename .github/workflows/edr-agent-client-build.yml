@@ -214,6 +214,9 @@ jobs:
           if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
 
       - name: Verify release gate build dependencies
+        env:
+          # Nested CMake probes must use the same dependency prefix as Configure.
+          CMAKE_PREFIX_PATH: ${{ env.VCPKG_INSTALLED_X64 }}
         shell: pwsh
         run: |
           python -m unittest discover -s tests -p test_windows_release_gate.py -v
