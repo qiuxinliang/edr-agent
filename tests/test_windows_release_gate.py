@@ -56,6 +56,27 @@ def copy_sqlite_header_family(source: Path, destination: Path) -> set[str]:
     return names
 
 
+def cmake_cache_path(cache_file: Path, key: str) -> Path:
+    values = re.findall(rf'^{re.escape(key)}:[^=\r\n]+=([^\r\n]*)$',
+                        cache_file.read_text(encoding="utf-8"), re.MULTILINE)
+    if len(values) != 1 or not values[0] or values[0].endswith("-NOTFOUND"):
+        raise AssertionError(f"CMake dependency path is missing: {key} in {cache_file}")
+    return Path(values[0])
+
+
+def verify_sqlite_package_location(cache_file: Path, include_dir: Path, library: Path) -> None:
+    # CMake can expand a Windows 8.3 path and change drive/directory casing.
+    # Compare filesystem identities, retaining the check against host fallback.
+    for key, expected in (("SQLite3_INCLUDE_DIR", include_dir), ("SQLite3_LIBRARY", library)):
+        actual = cmake_cache_path(cache_file, key)
+        try:
+            matches = actual.samefile(expected)
+        except OSError as error:
+            raise AssertionError(f"Cannot verify {key}: selected={actual}; expected={expected}") from error
+        if not matches:
+            raise AssertionError(f"Wrong SQLite dependency for {key}: selected={actual}; expected={expected}")
+
+
 class WindowsReleaseGateTests(unittest.TestCase):
     def run_command(self, *args, success=True, env=None):
         result = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
@@ -79,6 +100,38 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 {"sqlite3.h", "sqlite3-vcpkg-config.h"},
                 copy_sqlite_header_family(source, destination))
             self.assertTrue((destination / "sqlite3-vcpkg-config.h").is_file())
+
+    def test_sqlite_package_identity_accepts_aliases_and_rejects_other_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            include = root / "relocated sqlite/include"
+            include.mkdir(parents=True)
+            library = root / "relocated sqlite/lib/sqlite3.lib"
+            library.parent.mkdir()
+            library.touch()
+            wrong_include = root / "other/include"
+            wrong_include.mkdir(parents=True)
+            wrong_library = root / "other/sqlite3.lib"
+            wrong_library.touch()
+            cache = root / "CMakeCache.txt"
+            # Existing aliases exercise identity rather than cache text spelling
+            # on all hosts; the real Windows probe also covers its TEMP 8.3 alias.
+            include_alias = include / ".." / "include"
+            library_alias = library.parent / ".." / "lib" / library.name
+            for selected_include, selected_library, failure_key in (
+                (include_alias, library_alias, None),
+                (wrong_include, library_alias, "SQLite3_INCLUDE_DIR"),
+                (include_alias, wrong_library, "SQLite3_LIBRARY"),
+            ):
+                with self.subTest(failure_key=failure_key):
+                    cache.write_text(
+                        f"SQLite3_INCLUDE_DIR:PATH={selected_include.as_posix()}\n"
+                        f"SQLite3_LIBRARY:FILEPATH={selected_library.as_posix()}\n", encoding="utf-8")
+                    if failure_key:
+                        with self.assertRaisesRegex(AssertionError, f"Wrong SQLite dependency for {failure_key}"):
+                            verify_sqlite_package_location(cache, include, library)
+                    else:
+                        verify_sqlite_package_location(cache, include, library)
 
     def fixture(self, directory, missing_target="", missing_test="", failing_test=""):
         pairs = re.findall(r'^edr_windows_release_gate\((\w+) (\w+|"")\)$',
@@ -251,18 +304,17 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
             # Reproduce CI: a real SQLite package exists, but outside every
             # default search directory. Do not let a host SDK mask lost inputs.
-            cache = dict(re.findall(r'^([A-Za-z0-9_]+):[^=\r\n]+=([^\r\n]*)$',
-                                   (build / "CMakeCache.txt").read_text(encoding="utf-8"), re.MULTILINE))
+            cache_file = build / "CMakeCache.txt"
             prefix = source / "relocated sqlite"
             (prefix / "lib").mkdir(parents=True)
-            sqlite_include = Path(cache["SQLite3_INCLUDE_DIR"])
+            sqlite_include = cmake_cache_path(cache_file, "SQLite3_INCLUDE_DIR")
             copied_headers = copy_sqlite_header_family(sqlite_include, prefix / "include")
             source_companions = {
                 header.name for header in sqlite_include.glob("sqlite3*.h")
                 if header.name != "sqlite3.h"
             }
             self.assertTrue(source_companions.issubset(copied_headers))
-            library = Path(cache["SQLite3_LIBRARY"])
+            library = cmake_cache_path(cache_file, "SQLite3_LIBRARY")
             shutil.copy2(library, prefix / "lib" / library.name)
             isolated_env = os.environ.copy()
             isolated_env["CMAKE_PREFIX_PATH"] = str(source / "missing-prefix")
@@ -278,8 +330,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
                              "-DQUEUE_PREFIX_ONLY=ON", env=isolated_env)
             self.run_command("cmake", "--build", str(isolated_build), "--target", "queue_probe",
                              env=isolated_env)
-            isolated_cache = (isolated_build / "CMakeCache.txt").read_text(encoding="utf-8")
-            self.assertIn(f"SQLite3_INCLUDE_DIR:PATH={prefix.as_posix()}/include", isolated_cache)
+            verify_sqlite_package_location(isolated_build / "CMakeCache.txt",
+                                           prefix / "include", prefix / "lib" / library.name)
 
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
@@ -305,6 +357,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
         build_step = re.search(r'- name: Build\n(.*?)(?=\n      - name:)', source, re.DOTALL)
         self.assertIsNotNone(build_step)
         self.assertIn('CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows', build_step[1])
+        self.assertIn("python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v", build_step[1])
+        self.assertIn('throw "Windows PCRE2 header isolation regression failed"', build_step[1])
         self.assertIn("'windows_release_gate_tests'", source)
         self.assertNotIn("'test_", source)
         self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)

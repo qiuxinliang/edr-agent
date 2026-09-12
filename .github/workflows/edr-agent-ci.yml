@@ -98,6 +98,8 @@ jobs:
         run: |
           python -m unittest discover -s tests -p test_windows_release_gate.py -v
           if ($LASTEXITCODE -ne 0) { throw "CI gate scheduling contract failed" }
+          python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v
+          if ($LASTEXITCODE -ne 0) { throw "Windows PCRE2 header isolation regression failed" }
           $windowsTargets = @(
             'edr_agent',
             'windows_release_gate_tests'
