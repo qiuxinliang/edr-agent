@@ -31,3 +31,6 @@ PB_BIND(edr_v1_DnsDetail, edr_v1_DnsDetail, 2)
 
 
 PB_BIND(edr_v1_ScriptDetail, edr_v1_ScriptDetail, 4)
+
+
+PB_BIND(edr_v1_ProcessContext, edr_v1_ProcessContext, 4)

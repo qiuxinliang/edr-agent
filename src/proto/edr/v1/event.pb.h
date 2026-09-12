@@ -133,6 +133,29 @@ typedef struct _edr_v1_ScriptDetail {
     char snippet[4096];
 } edr_v1_ScriptDetail;
 
+typedef struct _edr_v1_ProcessContext {
+    bool has_parent_name;
+    char parent_name[256];
+    bool has_parent_path;
+    char parent_path[512];
+    bool has_integrity_level;
+    char integrity_level[64];
+    bool has_parent_cmdline;
+    char parent_cmdline[4096];
+    bool has_current_directory;
+    char current_directory[4096];
+    bool has_process_creation_time;
+    char process_creation_time[64];
+    bool has_token_elevation;
+    uint32_t token_elevation;
+    bool has_grandparent_pid;
+    uint32_t grandparent_pid;
+    bool has_grandparent_name;
+    char grandparent_name[256];
+    bool has_grandparent_path;
+    char grandparent_path[512];
+} edr_v1_ProcessContext;
+
 /* BehaviorEvent.type 与 Agent `include/edr/types.h` 中 EdrEventType 数值对齐（示例：66 = PMFE 扫描结果 EDR_EVENT_PMFE_SCAN_RESULT）。 */
 typedef struct _edr_v1_BehaviorEvent {
     char event_id[48];
@@ -211,6 +234,12 @@ typedef struct _edr_v1_BehaviorEvent {
  explicit legacy location for older producers and consumers. */
     char parent_name[256];
     char parent_path[512];
+    /* Event-local process context shared by every detail variant. Presence is
+ authoritative per field: consumers must not fill an absent value from a
+ different event/process generation. ProcessDetail remains the legacy
+ compatibility projection when this message is absent. */
+    bool has_process_context;
+    edr_v1_ProcessContext process_context;
 } edr_v1_BehaviorEvent;
 
 
@@ -221,22 +250,24 @@ extern "C" {
 /* Initializer values for message structs */
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
-#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", ""}
+#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_default}
 #define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
 #define edr_v1_NetworkDetail_init_default        {"", 0, "", 0, "", ""}
 #define edr_v1_DnsDetail_init_default            {""}
 #define edr_v1_ScriptDetail_init_default         {""}
+#define edr_v1_ProcessContext_init_default       {false, "", false, "", false, "", false, "", false, "", false, "", false, 0, false, 0, false, "", false, ""}
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
-#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", ""}
+#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_zero}
 #define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
 #define edr_v1_NetworkDetail_init_zero           {"", 0, "", 0, "", ""}
 #define edr_v1_DnsDetail_init_zero               {""}
 #define edr_v1_ScriptDetail_init_zero            {""}
+#define edr_v1_ProcessContext_init_zero          {false, "", false, "", false, "", false, "", false, "", false, "", false, 0, false, 0, false, "", false, ""}
 
 /* Field tags (for use in manual encoding/decoding) */
 #define edr_v1_AveBehaviorEventFeed_severity_hint_tag 1
@@ -309,6 +340,16 @@ extern "C" {
 #define edr_v1_NetworkDetail_network_aux_path_tag 6
 #define edr_v1_DnsDetail_query_name_tag          1
 #define edr_v1_ScriptDetail_snippet_tag          1
+#define edr_v1_ProcessContext_parent_name_tag    1
+#define edr_v1_ProcessContext_parent_path_tag    2
+#define edr_v1_ProcessContext_integrity_level_tag 3
+#define edr_v1_ProcessContext_parent_cmdline_tag 4
+#define edr_v1_ProcessContext_current_directory_tag 5
+#define edr_v1_ProcessContext_process_creation_time_tag 6
+#define edr_v1_ProcessContext_token_elevation_tag 7
+#define edr_v1_ProcessContext_grandparent_pid_tag 8
+#define edr_v1_ProcessContext_grandparent_name_tag 9
+#define edr_v1_ProcessContext_grandparent_path_tag 10
 #define edr_v1_BehaviorEvent_event_id_tag        1
 #define edr_v1_BehaviorEvent_endpoint_id_tag     2
 #define edr_v1_BehaviorEvent_tenant_id_tag       3
@@ -360,6 +401,7 @@ extern "C" {
 #define edr_v1_BehaviorEvent_truncated_fields_tag 65
 #define edr_v1_BehaviorEvent_parent_name_tag     66
 #define edr_v1_BehaviorEvent_parent_path_tag     67
+#define edr_v1_BehaviorEvent_process_context_tag 68
 
 /* Struct field encoding specification for nanopb */
 #define edr_v1_AveBehaviorEventFeed_FIELDLIST(X, a) \
@@ -465,7 +507,8 @@ X(a, STATIC,   SINGULAR, STRING,   parent_creation_time,  63) \
 X(a, STATIC,   SINGULAR, STRING,   transport_completeness,  64) \
 X(a, STATIC,   SINGULAR, STRING,   truncated_fields,  65) \
 X(a, STATIC,   SINGULAR, STRING,   parent_name,      66) \
-X(a, STATIC,   SINGULAR, STRING,   parent_path,      67)
+X(a, STATIC,   SINGULAR, STRING,   parent_path,      67) \
+X(a, STATIC,   OPTIONAL, MESSAGE,  process_context,  68)
 #define edr_v1_BehaviorEvent_CALLBACK NULL
 #define edr_v1_BehaviorEvent_DEFAULT NULL
 #define edr_v1_BehaviorEvent_detail_process_MSGTYPE edr_v1_ProcessDetail
@@ -476,6 +519,7 @@ X(a, STATIC,   SINGULAR, STRING,   parent_path,      67)
 #define edr_v1_BehaviorEvent_detail_script_MSGTYPE edr_v1_ScriptDetail
 #define edr_v1_BehaviorEvent_behavior_alert_MSGTYPE edr_v1_BehaviorAlert
 #define edr_v1_BehaviorEvent_ave_behavior_feed_MSGTYPE edr_v1_AveBehaviorEventFeed
+#define edr_v1_BehaviorEvent_process_context_MSGTYPE edr_v1_ProcessContext
 
 #define edr_v1_ProcessDetail_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, STRING,   parent_name,       1) \
@@ -527,6 +571,20 @@ X(a, STATIC,   SINGULAR, STRING,   snippet,           1)
 #define edr_v1_ScriptDetail_CALLBACK NULL
 #define edr_v1_ScriptDetail_DEFAULT NULL
 
+#define edr_v1_ProcessContext_FIELDLIST(X, a) \
+X(a, STATIC,   OPTIONAL, STRING,   parent_name,       1) \
+X(a, STATIC,   OPTIONAL, STRING,   parent_path,       2) \
+X(a, STATIC,   OPTIONAL, STRING,   integrity_level,   3) \
+X(a, STATIC,   OPTIONAL, STRING,   parent_cmdline,    4) \
+X(a, STATIC,   OPTIONAL, STRING,   current_directory,   5) \
+X(a, STATIC,   OPTIONAL, STRING,   process_creation_time,   6) \
+X(a, STATIC,   OPTIONAL, UINT32,   token_elevation,   7) \
+X(a, STATIC,   OPTIONAL, UINT32,   grandparent_pid,   8) \
+X(a, STATIC,   OPTIONAL, STRING,   grandparent_name,   9) \
+X(a, STATIC,   OPTIONAL, STRING,   grandparent_path,  10)
+#define edr_v1_ProcessContext_CALLBACK NULL
+#define edr_v1_ProcessContext_DEFAULT NULL
+
 extern const pb_msgdesc_t edr_v1_AveBehaviorEventFeed_msg;
 extern const pb_msgdesc_t edr_v1_BehaviorAlert_msg;
 extern const pb_msgdesc_t edr_v1_BehaviorEvent_msg;
@@ -536,6 +594,7 @@ extern const pb_msgdesc_t edr_v1_RegistryDetail_msg;
 extern const pb_msgdesc_t edr_v1_NetworkDetail_msg;
 extern const pb_msgdesc_t edr_v1_DnsDetail_msg;
 extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
+extern const pb_msgdesc_t edr_v1_ProcessContext_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define edr_v1_AveBehaviorEventFeed_fields &edr_v1_AveBehaviorEventFeed_msg
@@ -547,15 +606,17 @@ extern const pb_msgdesc_t edr_v1_ScriptDetail_msg;
 #define edr_v1_NetworkDetail_fields &edr_v1_NetworkDetail_msg
 #define edr_v1_DnsDetail_fields &edr_v1_DnsDetail_msg
 #define edr_v1_ScriptDetail_fields &edr_v1_ScriptDetail_msg
+#define edr_v1_ProcessContext_fields &edr_v1_ProcessContext_msg
 
 /* Maximum encoded size of messages (where known) */
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         4864
 #define edr_v1_BehaviorAlert_size                11192
-#define edr_v1_BehaviorEvent_size                50570
+#define edr_v1_BehaviorEvent_size                60456
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   4144
 #define edr_v1_NetworkDetail_size                4257
+#define edr_v1_ProcessContext_size               9882
 #define edr_v1_ProcessDetail_size                9882
 #define edr_v1_RegistryDetail_size               9767
 #define edr_v1_ScriptDetail_size                 4098

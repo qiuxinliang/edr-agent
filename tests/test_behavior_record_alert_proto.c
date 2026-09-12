@@ -24,6 +24,22 @@ static void fill_boundary_ascii(char *dst, size_t cap, char value) {
   dst[cap - 1u] = '\0';
 }
 
+static void fill_common_process_context(EdrBehaviorRecord *record, const char *label) {
+  snprintf(record->parent_name, sizeof(record->parent_name), "parent-%s.exe", label);
+  snprintf(record->parent_path, sizeof(record->parent_path), "C:/parent/%s.exe", label);
+  snprintf(record->integrity_level, sizeof(record->integrity_level), "high");
+  snprintf(record->parent_cmdline, sizeof(record->parent_cmdline),
+           "parent-%s.exe --captured", label);
+  snprintf(record->current_directory, sizeof(record->current_directory), "C:/work/%s", label);
+  snprintf(record->process_creation_time, sizeof(record->process_creation_time),
+           "2026-09-12T01:02:03Z");
+  record->token_elevation = 2u;
+  record->grandparent_pid = 77u;
+  snprintf(record->grandparent_name, sizeof(record->grandparent_name), "grandparent.exe");
+  snprintf(record->grandparent_path, sizeof(record->grandparent_path),
+           "C:/parent/grandparent.exe");
+}
+
 typedef size_t (*EdrBehaviorRecordEncoder)(const EdrBehaviorRecord *record, uint8_t *wire,
                                            size_t wire_cap);
 
@@ -62,8 +78,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
     edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
 
     init_transport_record(&record);
-    snprintf(record.parent_name, sizeof(record.parent_name), "parent-%s.exe", cases[i].name);
-    snprintf(record.parent_path, sizeof(record.parent_path), "C:/parent/%s.exe", cases[i].name);
+    fill_common_process_context(&record, cases[i].name);
     switch (cases[i].expected_detail) {
       case edr_v1_BehaviorEvent_file_tag:
         snprintf(record.file_op, sizeof(record.file_op), "write");
@@ -90,6 +105,27 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
         decoded.which_detail != cases[i].expected_detail ||
         strcmp(decoded.parent_name, record.parent_name) != 0 ||
         strcmp(decoded.parent_path, record.parent_path) != 0 ||
+        !decoded.has_process_context ||
+        !decoded.process_context.has_parent_name ||
+        strcmp(decoded.process_context.parent_name, record.parent_name) != 0 ||
+        !decoded.process_context.has_parent_path ||
+        strcmp(decoded.process_context.parent_path, record.parent_path) != 0 ||
+        !decoded.process_context.has_integrity_level ||
+        strcmp(decoded.process_context.integrity_level, record.integrity_level) != 0 ||
+        !decoded.process_context.has_parent_cmdline ||
+        strcmp(decoded.process_context.parent_cmdline, record.parent_cmdline) != 0 ||
+        !decoded.process_context.has_current_directory ||
+        strcmp(decoded.process_context.current_directory, record.current_directory) != 0 ||
+        !decoded.process_context.has_process_creation_time ||
+        strcmp(decoded.process_context.process_creation_time, record.process_creation_time) != 0 ||
+        !decoded.process_context.has_token_elevation ||
+        decoded.process_context.token_elevation != record.token_elevation ||
+        !decoded.process_context.has_grandparent_pid ||
+        decoded.process_context.grandparent_pid != record.grandparent_pid ||
+        !decoded.process_context.has_grandparent_name ||
+        strcmp(decoded.process_context.grandparent_name, record.grandparent_name) != 0 ||
+        !decoded.process_context.has_grandparent_path ||
+        strcmp(decoded.process_context.grandparent_path, record.grandparent_path) != 0 ||
         strcmp(decoded.transport_completeness, "COMPLETE") != 0 ||
         decoded.truncated_fields[0] != '\0') {
       fprintf(stderr, "top-level parent identity lost for %s detail\n", cases[i].name);
@@ -105,14 +141,33 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
     init_transport_record(&record);
     snprintf(record.parent_name, sizeof(record.parent_name), "parent-protobuf-c.exe");
     snprintf(record.parent_path, sizeof(record.parent_path), "C:/parent/protobuf-c.exe");
+    snprintf(record.parent_cmdline, sizeof(record.parent_cmdline),
+             "parent-protobuf-c.exe --captured");
     snprintf(record.net_dst, sizeof(record.net_dst), "198.51.100.11");
     snprintf(record.net_proto, sizeof(record.net_proto), "tcp");
     if (!encode_decode_record_with(edr_behavior_record_encode_protobuf_c, &record, wire,
                                    wire_cap, &decoded) ||
         decoded.which_detail != edr_v1_BehaviorEvent_network_tag ||
         strcmp(decoded.parent_name, record.parent_name) != 0 ||
-        strcmp(decoded.parent_path, record.parent_path) != 0) {
+        strcmp(decoded.parent_path, record.parent_path) != 0 ||
+        !decoded.has_process_context ||
+        strcmp(decoded.process_context.parent_cmdline, record.parent_cmdline) != 0) {
       fprintf(stderr, "protobuf_c parent identity projection failed\n");
+      return 0;
+    }
+  }
+
+  /* Missing input stays missing even when a non-process detail is present. */
+  {
+    EdrBehaviorRecord record;
+    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    init_transport_record(&record);
+    snprintf(record.file_op, sizeof(record.file_op), "create");
+    snprintf(record.file_path, sizeof(record.file_path), "E:/removable/marker.txt");
+    if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
+        decoded.which_detail != edr_v1_BehaviorEvent_file_tag ||
+        decoded.has_process_context) {
+      fprintf(stderr, "absent process context was fabricated\n");
       return 0;
     }
   }
@@ -167,6 +222,9 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
       decoded.which_detail != edr_v1_BehaviorEvent_process_tag ||
       strlen(decoded.detail.process.parent_cmdline) != sizeof(record.parent_cmdline) - 1u ||
       strlen(decoded.detail.process.current_directory) != sizeof(record.current_directory) - 1u ||
+      !decoded.has_process_context ||
+      strlen(decoded.process_context.parent_cmdline) != sizeof(record.parent_cmdline) - 1u ||
+      strlen(decoded.process_context.current_directory) != sizeof(record.current_directory) - 1u ||
       strcmp(decoded.transport_completeness, "COMPLETE") != 0) {
     return 0;
   }
@@ -284,6 +342,75 @@ static void print_base64(const uint8_t *input, size_t input_len) {
   }
 }
 
+static int emit_common_process_context_fixtures(void) {
+  static const struct {
+    const char *name;
+    EdrEventType type;
+    uint32_t detail_tag;
+  } cases[] = {
+      {"process", EDR_EVENT_PROCESS_CREATE, edr_v1_BehaviorEvent_process_tag},
+      {"file", EDR_EVENT_FILE_CREATE, edr_v1_BehaviorEvent_file_tag},
+      {"network", EDR_EVENT_NET_CONNECT, edr_v1_BehaviorEvent_network_tag},
+      {"registry", EDR_EVENT_REG_SET_VALUE, edr_v1_BehaviorEvent_registry_tag},
+      {"dns", EDR_EVENT_NET_DNS_QUERY, edr_v1_BehaviorEvent_dns_tag},
+      {"script", EDR_EVENT_SCRIPT_POWERSHELL, edr_v1_BehaviorEvent_script_tag},
+  };
+  uint8_t wire[edr_v1_BehaviorEvent_size];
+
+  for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    EdrBehaviorRecord record;
+    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    pb_istream_t stream;
+    size_t wire_len;
+
+    init_transport_record(&record);
+    record.type = cases[i].type;
+    snprintf(record.event_id, sizeof(record.event_id), "c-wire-context-%s", cases[i].name);
+    snprintf(record.process_name, sizeof(record.process_name), "actor-%s.exe", cases[i].name);
+    snprintf(record.cmdline, sizeof(record.cmdline), "actor-%s.exe --captured", cases[i].name);
+    fill_common_process_context(&record, cases[i].name);
+    switch (cases[i].detail_tag) {
+      case edr_v1_BehaviorEvent_file_tag:
+        snprintf(record.file_op, sizeof(record.file_op), "create");
+        snprintf(record.file_path, sizeof(record.file_path), "E:/fixture/autorun.inf");
+        break;
+      case edr_v1_BehaviorEvent_network_tag:
+        snprintf(record.net_dst, sizeof(record.net_dst), "203.0.113.20");
+        record.net_dport = 443u;
+        snprintf(record.net_proto, sizeof(record.net_proto), "tcp");
+        break;
+      case edr_v1_BehaviorEvent_registry_tag:
+        snprintf(record.reg_key_path, sizeof(record.reg_key_path), "HKCU/Software/Fixture");
+        snprintf(record.reg_op, sizeof(record.reg_op), "set_value");
+        break;
+      case edr_v1_BehaviorEvent_dns_tag:
+        snprintf(record.dns_query, sizeof(record.dns_query), "fixture.example.invalid");
+        break;
+      case edr_v1_BehaviorEvent_script_tag:
+        snprintf(record.script_snippet, sizeof(record.script_snippet), "Write-Output fixture");
+        break;
+      default:
+        break;
+    }
+
+    wire_len = edr_behavior_record_encode_protobuf(&record, wire, sizeof(wire));
+    stream = pb_istream_from_buffer(wire, wire_len);
+    if (wire_len == 0u ||
+        !pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded) ||
+        decoded.which_detail != cases[i].detail_tag || !decoded.has_process_context ||
+        strcmp(decoded.process_context.parent_cmdline, record.parent_cmdline) != 0 ||
+        !decoded.process_context.has_token_elevation ||
+        decoded.process_context.token_elevation != record.token_elevation) {
+      fprintf(stderr, "cannot produce deterministic %s process-context fixture\n", cases[i].name);
+      return 0;
+    }
+    printf("%s\t", cases[i].name);
+    print_base64(wire, wire_len);
+    putchar('\n');
+  }
+  return 1;
+}
+
 int main(int argc, char **argv) {
   EdrBehaviorRecord record;
   AVEBehaviorAlert alert;
@@ -293,8 +420,10 @@ int main(int argc, char **argv) {
   size_t combined_wire_len = 0u;
   const int emit_combined_frame =
       argc == 2 && strcmp(argv[1], "--emit-combined-frame-base64") == 0;
+  const int emit_process_context_fixtures =
+      argc == 2 && strcmp(argv[1], "--emit-process-context-fixtures") == 0;
 
-  if (argc > 1 && !emit_combined_frame) return 2;
+  if (argc > 1 && !emit_combined_frame && !emit_process_context_fixtures) return 2;
 
   if (edr_v1_BehaviorEvent_size >= EDR_EVENT_BATCH_CAP) {
     fprintf(stderr, "maximum protobuf event no longer fits one event batch\n");
@@ -340,6 +469,7 @@ int main(int argc, char **argv) {
            "generation_cache");
   snprintf(record.parent_creation_time, sizeof(record.parent_creation_time),
            "2026-08-31T01:02:03.456Z");
+  fill_common_process_context(&record, "record");
   snprintf(record.detection_context, sizeof(record.detection_context),
            "{\"engine\":\"agent\",\"evidence\":{\"hash\":{\"quality\":\"captured\"},"
            "\"signature\":{\"status\":\"verified\",\"source\":\"WinVerifyTrust\","
@@ -389,6 +519,12 @@ int main(int argc, char **argv) {
       strcmp(decoded.parent_resolution_status, record.parent_resolution_status) != 0 ||
       strcmp(decoded.parent_resolution_source, record.parent_resolution_source) != 0 ||
       strcmp(decoded.parent_creation_time, record.parent_creation_time) != 0 ||
+      !decoded.has_process_context ||
+      strcmp(decoded.process_context.parent_cmdline, record.parent_cmdline) != 0 ||
+      strcmp(decoded.process_context.current_directory, record.current_directory) != 0 ||
+      strcmp(decoded.process_context.integrity_level, record.integrity_level) != 0 ||
+      !decoded.process_context.has_token_elevation ||
+      decoded.process_context.token_elevation != record.token_elevation ||
       strcmp(decoded.transport_completeness, "COMPLETE") != 0 ||
       decoded.truncated_fields[0] != '\0') {
     fprintf(stderr, "top-level record fields were not preserved\n");
@@ -442,6 +578,9 @@ int main(int argc, char **argv) {
   if (emit_combined_frame) {
     print_base64(combined_wire, combined_wire_len);
     putchar('\n');
+  }
+  if (emit_process_context_fixtures && !emit_common_process_context_fixtures()) {
+    return 11;
   }
   return 0;
 }

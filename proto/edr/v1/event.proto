@@ -167,6 +167,12 @@ message BehaviorEvent {
   // explicit legacy location for older producers and consumers.
   string parent_name = 66;
   string parent_path = 67;
+
+  // Event-local process context shared by every detail variant. Presence is
+  // authoritative per field: consumers must not fill an absent value from a
+  // different event/process generation. ProcessDetail remains the legacy
+  // compatibility projection when this message is absent.
+  ProcessContext process_context = 68;
 }
 
 message ProcessDetail {
@@ -218,4 +224,17 @@ message DnsDetail {
 
 message ScriptDetail {
   string snippet = 1;
+}
+
+message ProcessContext {
+  optional string parent_name = 1;
+  optional string parent_path = 2;
+  optional string integrity_level = 3;
+  optional string parent_cmdline = 4;
+  optional string current_directory = 5;
+  optional string process_creation_time = 6;
+  optional uint32 token_elevation = 7;
+  optional uint32 grandparent_pid = 8;
+  optional string grandparent_name = 9;
+  optional string grandparent_path = 10;
 }

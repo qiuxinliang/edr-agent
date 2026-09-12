@@ -28,6 +28,7 @@ WINDOWS_EXPECTED = {
 RUNTIME_EXPECTED = {
     "command_inbox_persistence", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
+    "behavior_record_alert_proto_contract",
     "python_installer_config_contract",
     "detection_decision_combo", "detection_regression_scenarios",
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",
@@ -119,7 +120,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_security_queue_and_detection_failures_block_both_gate_labels(self):
         # Inject failures in each newly required group, not just check labels in text.
-        for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge"):
+        for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
+                     "behavior_record_alert_proto_contract", "command_signature_cross_language"):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")

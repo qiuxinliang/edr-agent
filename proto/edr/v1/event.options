@@ -42,6 +42,15 @@ edr.v1.ProcessDetail.process_creation_time max_size:64
 edr.v1.ProcessDetail.grandparent_name max_size:256
 edr.v1.ProcessDetail.grandparent_path max_size:512
 
+edr.v1.ProcessContext.parent_name max_size:256
+edr.v1.ProcessContext.parent_path max_size:512
+edr.v1.ProcessContext.integrity_level max_size:64
+edr.v1.ProcessContext.parent_cmdline max_size:4096
+edr.v1.ProcessContext.current_directory max_size:4096
+edr.v1.ProcessContext.process_creation_time max_size:64
+edr.v1.ProcessContext.grandparent_name max_size:256
+edr.v1.ProcessContext.grandparent_path max_size:512
+
 edr.v1.FileDetail.operation max_size:32
 edr.v1.FileDetail.target_path max_size:4096
 

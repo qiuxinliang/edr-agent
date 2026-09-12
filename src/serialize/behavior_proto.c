@@ -362,6 +362,75 @@ static void fill_ave_behavior_feed(edr_v1_BehaviorEvent *m, const EdrBehaviorRec
   fill_pmfe_cross_engine_fields(m, r);
 }
 
+static int record_has_process_context(const EdrBehaviorRecord *r) {
+  return r && (r->parent_name[0] || r->parent_path[0] || r->integrity_level[0] ||
+               r->parent_cmdline[0] || r->current_directory[0] ||
+               r->process_creation_time[0] || r->token_elevation != 0u ||
+               r->grandparent_pid != 0u || r->grandparent_name[0] ||
+               r->grandparent_path[0]);
+}
+
+static void fill_process_context(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r,
+                                 EdrTransportCompleteness *transport) {
+  edr_v1_ProcessContext *ctx = &m->process_context;
+  m->has_process_context = record_has_process_context(r) ? true : false;
+  memset(ctx, 0, sizeof(*ctx));
+  if (!m->has_process_context) return;
+
+  if (r->parent_name[0]) {
+    ctx->has_parent_name = true;
+    copy_record_transport_field(ctx->parent_name, sizeof(ctx->parent_name), r->parent_name,
+                                sizeof(r->parent_name), transport, "parent_name");
+  }
+  if (r->parent_path[0]) {
+    ctx->has_parent_path = true;
+    copy_record_transport_field(ctx->parent_path, sizeof(ctx->parent_path), r->parent_path,
+                                sizeof(r->parent_path), transport, "parent_path");
+  }
+  if (r->integrity_level[0]) {
+    ctx->has_integrity_level = true;
+    copy_str(ctx->integrity_level, sizeof(ctx->integrity_level), r->integrity_level);
+  }
+  if (r->parent_cmdline[0]) {
+    ctx->has_parent_cmdline = true;
+    copy_record_transport_field(ctx->parent_cmdline, sizeof(ctx->parent_cmdline),
+                                r->parent_cmdline, sizeof(r->parent_cmdline), transport,
+                                "parent_cmdline");
+  }
+  if (r->current_directory[0]) {
+    ctx->has_current_directory = true;
+    copy_record_transport_field(ctx->current_directory, sizeof(ctx->current_directory),
+                                r->current_directory, sizeof(r->current_directory), transport,
+                                "current_directory");
+  }
+  if (r->process_creation_time[0]) {
+    ctx->has_process_creation_time = true;
+    copy_str(ctx->process_creation_time, sizeof(ctx->process_creation_time),
+             r->process_creation_time);
+  }
+  /* EdrBehaviorRecord uses 1..3 for captured token elevation and 0 for absent.
+   * The optional wire field still lets consumers preserve an explicit zero
+   * sent by another conforming producer. */
+  if (r->token_elevation != 0u) {
+    ctx->has_token_elevation = true;
+    ctx->token_elevation = r->token_elevation;
+  }
+  if (r->grandparent_pid != 0u) {
+    ctx->has_grandparent_pid = true;
+    ctx->grandparent_pid = r->grandparent_pid;
+  }
+  if (r->grandparent_name[0]) {
+    ctx->has_grandparent_name = true;
+    copy_str(ctx->grandparent_name, sizeof(ctx->grandparent_name), r->grandparent_name);
+  }
+  if (r->grandparent_path[0]) {
+    ctx->has_grandparent_path = true;
+    copy_record_transport_field(ctx->grandparent_path, sizeof(ctx->grandparent_path),
+                                r->grandparent_path, sizeof(r->grandparent_path), transport,
+                                "grandparent_path");
+  }
+}
+
 static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r,
                               EdrTransportCompleteness *transport) {
   m->which_detail = 0;
@@ -412,7 +481,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
                                 "script_snippet");
     return;
   }
-  if (r->parent_name[0] || r->parent_path[0]) {
+  if (record_has_process_context(r)) {
     m->which_detail = edr_v1_BehaviorEvent_process_tag;
     copy_record_transport_field(m->detail.process.parent_name,
                                 sizeof(m->detail.process.parent_name), r->parent_name,
@@ -502,6 +571,7 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
                               sizeof(r->parent_name), &transport, "parent_name");
   copy_record_transport_field(msg->parent_path, sizeof(msg->parent_path), r->parent_path,
                               sizeof(r->parent_path), &transport, "parent_path");
+  fill_process_context(msg, r, &transport);
   msg->session_id = r->session_id;
   if (r->detection_context[0]) {
     copy_record_transport_field(msg->ave_result_json, sizeof(msg->ave_result_json),
