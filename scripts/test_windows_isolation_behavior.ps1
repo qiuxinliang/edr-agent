@@ -29,11 +29,15 @@ function Get-NetFirewallAddressFilter {
 }
 function Get-NetFirewallPortFilter {
   [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject)
-  process { [pscustomobject]@{RemotePort=$InputObject.RemotePort;Protocol=$InputObject.Protocol} }
+  process { [pscustomobject]@{LocalPort=$InputObject.LocalPort;RemotePort=$InputObject.RemotePort;Protocol=$InputObject.Protocol} }
+}
+function Get-NetFirewallServiceFilter {
+  [CmdletBinding()]param([Parameter(ValueFromPipeline=$true)]$InputObject)
+  process { [pscustomobject]@{Service=$InputObject.Service} }
 }
 function New-NetFirewallRule {
-  param($PolicyStore,$Name,$DisplayName,$Direction,$Action,$Enabled,$Profile,$RemoteAddress,$Protocol,$RemotePort,$ErrorAction)
-  $script:rules += [pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Direction=$Direction;Action=$Action;Enabled=[string]$Enabled;RemoteAddress=$RemoteAddress;RemotePort=$RemotePort;Protocol=$Protocol;PolicyStoreSourceType='Local'}
+  param($PolicyStore,$Name,$DisplayName,$Direction,$Action,$Enabled,$Profile,$RemoteAddress,$Protocol,$LocalPort,$RemotePort,$Service,$ErrorAction)
+  $script:rules += [pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Direction=$Direction;Action=$Action;Enabled=[string]$Enabled;RemoteAddress=$RemoteAddress;LocalPort=$LocalPort;RemotePort=$RemotePort;Protocol=$Protocol;Service=$Service;PolicyStoreSourceType='Local'}
 }
 function Disable-NetFirewallRule { param($PolicyStore,$Name,$ErrorAction) ($script:rules | Where-Object Name -eq $Name).Enabled = 'False' }
 function Enable-NetFirewallRule {
@@ -79,6 +83,12 @@ try {
   Reset-TestState
   Enable-Isolation
   $first = Get-Content -LiteralPath $StatePath -Raw
+  $isolationState = Read-State
+  Assert ($isolationState.schema -eq 'edr.isolation.v3') 'new isolation must use the DHCP-safe journal schema'
+  foreach ($name in @("$Prefix DHCPv4 Out","$Prefix DHCPv4 In","$Prefix DHCPv6 Out","$Prefix DHCPv6 In")) {
+    $rule = @($script:rules | Where-Object Name -eq $name)
+    Assert ($rule.Count -eq 1 -and $rule[0].Enabled -eq 'True' -and $rule[0].Service -eq 'Dhcp') "missing constrained DHCP preservation rule: $name"
+  }
   Assert (Test-Isolation (Read-State)) 'isolation must verify actual rules'
   Assert (($script:rules | Where-Object Name -eq 'existing-allow').Enabled -eq 'False') 'explicit allow must be disabled'
   Enable-Isolation

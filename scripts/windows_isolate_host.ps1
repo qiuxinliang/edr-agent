@@ -69,7 +69,7 @@ function Read-State {
     $s | Add-Member schema 'edr.isolation.legacy'
     $s | Add-Member phase 'prepared'
     $s | Add-Member disabled_rules @()
-  } elseif ($s.schema -notin @('edr.isolation.v2','edr.isolation.legacy') -or $s.phase -notin @('prepared','isolated','restored')) {
+  } elseif ($s.schema -notin @('edr.isolation.v3','edr.isolation.v2','edr.isolation.legacy') -or $s.phase -notin @('prepared','isolated','restored')) {
     throw "isolation_state_schema_invalid"
   }
   return $s
@@ -114,7 +114,10 @@ function Test-ManagementReachable($Targets) {
 }
 
 function Test-Isolation($State) {
-  if ($null -eq $State -or $State.schema -ne 'edr.isolation.v2' -or $State.phase -ne 'isolated') { return $false }
+  # v2 did not preserve DHCP. It could appear healthy until the current lease
+  # expired, at which point the endpoint lost its address and could no longer
+  # reconnect for a restore command. Accept v2 only as a recovery baseline.
+  if ($null -eq $State -or $State.schema -ne 'edr.isolation.v3' -or $State.phase -ne 'isolated') { return $false }
   $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
   if ($profiles.Count -ne 3) { return $false }
   foreach ($p in $profiles) {
@@ -131,11 +134,14 @@ function Test-Isolation($State) {
     if ($r.Count -ne 1) { return $false }
     $addressFilter = $r[0] | Get-NetFirewallAddressFilter -ErrorAction Stop
     $portFilter = $r[0] | Get-NetFirewallPortFilter -ErrorAction Stop
+    $serviceFilter = $r[0] | Get-NetFirewallServiceFilter -ErrorAction Stop
     $spec = @($State.allow_specs | Where-Object name -eq $name)
-    if ($spec.Count -ne 1 -or [string]$r[0].Direction -ne 'Outbound' -or
+    if ($spec.Count -ne 1 -or [string]$r[0].Direction -ne [string]$spec[0].direction -or
         (@($addressFilter.RemoteAddress | Sort-Object) -join ',') -ne (@($spec[0].addresses | Sort-Object) -join ',') -or
-        (@($portFilter.RemotePort | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -ne (@($spec[0].ports | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -or
-        ([string]$portFilter.Protocol -replace '^6$','TCP' -replace '^17$','UDP') -ne [string]$spec[0].protocol) { return $false }
+        (@($portFilter.LocalPort | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -ne (@($spec[0].local_ports | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -or
+        (@($portFilter.RemotePort | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -ne (@($spec[0].remote_ports | ForEach-Object { [string]$_ } | Sort-Object) -join ',') -or
+        ([string]$portFilter.Protocol -replace '^6$','TCP' -replace '^17$','UDP') -ne [string]$spec[0].protocol -or
+        [string]$serviceFilter.Service -ne [string]$spec[0].service) { return $false }
   }
   return (Test-ManagementReachable $State.management)
 }
@@ -215,16 +221,25 @@ function Enable-Isolation {
     [pscustomobject]@{ Name=[string]$_.Name; Enabled=[string]$_.Enabled; DefaultInboundAction=[string]$_.DefaultInboundAction; DefaultOutboundAction=[string]$_.DefaultOutboundAction }
   })
   $dns = @(Get-DnsClientServerAddress -ErrorAction Stop | ForEach-Object { $_.ServerAddresses } | Where-Object { $_ } | Sort-Object -Unique)
-  $specs = @([pscustomobject]@{ name="$Prefix Mgmt"; addresses=@($management.addresses); ports=@($management.ports); protocol='TCP' })
+  $specs = @(
+    [pscustomobject]@{ name="$Prefix Mgmt"; direction='Outbound'; addresses=@($management.addresses); local_ports=@('Any'); remote_ports=@($management.ports); protocol='TCP'; service='Any' },
+    # Default-outbound Block must not strand the endpoint when its DHCP lease
+    # renews. These rules are constrained to the Windows DHCP Client service
+    # and the protocol's fixed client/server ports.
+    [pscustomobject]@{ name="$Prefix DHCPv4 Out"; direction='Outbound'; addresses=@('Any'); local_ports=@(68); remote_ports=@(67); protocol='UDP'; service='Dhcp' },
+    [pscustomobject]@{ name="$Prefix DHCPv4 In"; direction='Inbound'; addresses=@('Any'); local_ports=@(68); remote_ports=@(67); protocol='UDP'; service='Dhcp' },
+    [pscustomobject]@{ name="$Prefix DHCPv6 Out"; direction='Outbound'; addresses=@('Any'); local_ports=@(546); remote_ports=@(547); protocol='UDP'; service='Dhcp' },
+    [pscustomobject]@{ name="$Prefix DHCPv6 In"; direction='Inbound'; addresses=@('Any'); local_ports=@(546); remote_ports=@(547); protocol='UDP'; service='Dhcp' }
+  )
   if ($dns.Count -gt 0) {
-    $specs += [pscustomobject]@{ name="$Prefix DNS UDP"; addresses=$dns; ports=@(53); protocol='UDP' }
-    $specs += [pscustomobject]@{ name="$Prefix DNS TCP"; addresses=$dns; ports=@(53); protocol='TCP' }
+    $specs += [pscustomobject]@{ name="$Prefix DNS UDP"; direction='Outbound'; addresses=$dns; local_ports=@('Any'); remote_ports=@(53); protocol='UDP'; service='Any' }
+    $specs += [pscustomobject]@{ name="$Prefix DNS TCP"; direction='Outbound'; addresses=$dns; local_ports=@('Any'); remote_ports=@(53); protocol='TCP'; service='Any' }
   }
-  $state = [pscustomobject]@{ schema='edr.isolation.v2'; phase='prepared'; profiles=$profiles; disabled_rules=@($rules.Name); management=$management; allow_rules=@($specs.name); allow_specs=$specs }
+  $state = [pscustomobject]@{ schema='edr.isolation.v3'; phase='prepared'; profiles=$profiles; disabled_rules=@($rules.Name); management=$management; allow_rules=@($specs.name); allow_specs=$specs }
   Save-State $state
   try {
     foreach ($s in $specs) {
-      New-NetFirewallRule -PolicyStore PersistentStore -Name $s.name -DisplayName $s.name -Direction Outbound -Action Allow -Enabled True -Profile Any -RemoteAddress $s.addresses -Protocol $s.protocol -RemotePort $s.ports -ErrorAction Stop | Out-Null
+      New-NetFirewallRule -PolicyStore PersistentStore -Name $s.name -DisplayName $s.name -Direction $s.direction -Action Allow -Enabled True -Profile Any -RemoteAddress $s.addresses -Protocol $s.protocol -LocalPort $s.local_ports -RemotePort $s.remote_ports -Service $s.service -ErrorAction Stop | Out-Null
     }
     foreach ($r in $rules) { Disable-NetFirewallRule -PolicyStore PersistentStore -Name $r.Name -ErrorAction Stop | Out-Null }
     Set-NetFirewallProfile -PolicyStore PersistentStore -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block -ErrorAction Stop
