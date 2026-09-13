@@ -354,6 +354,12 @@ target_include_directories(test_file_object_binding PRIVATE ${CMAKE_SOURCE_DIR}/
 edr_apply_test_warnings(test_file_object_binding)
 add_test(NAME file_object_binding COMMAND test_file_object_binding)
 
+add_executable(test_kernel_file_semantics
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_file_semantics.c)
+target_include_directories(test_kernel_file_semantics PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_kernel_file_semantics)
+add_test(NAME kernel_file_semantics COMMAND test_kernel_file_semantics)
+
 add_executable(test_file_read_deferred ${CMAKE_CURRENT_SOURCE_DIR}/test_file_read_deferred.c)
 target_include_directories(test_file_read_deferred PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_test_warnings(test_file_read_deferred)

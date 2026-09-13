@@ -2,6 +2,7 @@
 #include "edr/etw_tdh_win.h"
 #include "edr/process_generation.h"
 #include "edr/file_object_binding.h"
+#include "edr/kernel_file_semantics.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -95,6 +96,12 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   record.UserDataLength = (USHORT)used;
   assert(edr_tdh_kernel_file_extract_create_binding(&record, &extracted_object, path, sizeof(path)));
   assert(extracted_object == object && strcmp(path, "C:\\Fixture\\write-canary.txt") == 0);
+  assert(edr_kernel_file_descriptor_is_create_new(30u, 30u, 0u, 1u, UINT64_C(0x1000)));
+  assert(!edr_kernel_file_descriptor_is_create_new(12u, 12u, 0u, 1u, UINT64_C(0xa0)));
+  assert(!edr_kernel_file_descriptor_is_create_new(30u, 12u, 0u, 1u, UINT64_C(0x1000)));
+  assert(!edr_kernel_file_descriptor_is_create_new(30u, 30u, 1u, 1u, UINT64_C(0x1000)));
+  assert(!edr_kernel_file_descriptor_is_create_new(30u, 30u, 0u, 2u, UINT64_C(0x1000)));
+  assert(!edr_kernel_file_descriptor_is_create_new(30u, 30u, 0u, 1u, UINT64_C(0xa0)));
   /* A real overwrite emits 12 -> 30 -> 16. CreateNewFile has the same typed
    * layout but only the CREATE_NEW_FILE keyword; it is not another lifetime. */
   record.EventHeader.EventDescriptor.Id = 30u;

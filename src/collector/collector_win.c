@@ -28,6 +28,7 @@
 #include "edr/event_bus.h"
 #include "edr/file_key_lifetime.h"
 #include "edr/file_object_binding.h"
+#include "edr/kernel_file_semantics.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
@@ -489,8 +490,10 @@ static int edr_kernel_file_create_descriptor(const EVENT_DESCRIPTOR *descriptor)
 static int edr_kernel_file_create_new_descriptor(const EVENT_DESCRIPTOR *descriptor) {
   /* Overwrite completion carries the same typed name, but is not a second
    * FileObject open boundary. Only Create(12) updates lifetime history. */
-  return edr_kernel_file_descriptor_matches(descriptor, 30u, 30u,
-                                            EDR_KERNEL_FILE_KEYWORD_CREATE_NEW_FILE);
+  return descriptor && edr_kernel_file_descriptor_is_create_new(
+                           descriptor->Id, descriptor->Task,
+                           descriptor->Opcode, descriptor->Version,
+                           descriptor->Keyword);
 }
 
 static int edr_kernel_file_close_descriptor(const EVENT_DESCRIPTOR *descriptor) {
@@ -568,14 +571,18 @@ static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_k
   } else if (provider_kind == 1u && edr_kernel_file_write_descriptor(descriptor)) {
     event_type = EDR_EVENT_FILE_WRITE;
   } else if (provider_kind == 1u &&
-             (edr_kernel_file_create_descriptor(descriptor) ||
-              edr_kernel_file_create_new_descriptor(descriptor))) {
+             edr_kernel_file_create_new_descriptor(descriptor)) {
+    /* Kernel File/Create (Id 12) is the open/create request boundary and is
+     * required for FileObject lifetime tracking, but it can also mean opening
+     * an existing file.  Only the typed CreateNewFile notification is exposed
+     * as FILE_CREATE; data mutation remains authoritative on FileWrite. */
     event_type = EDR_EVENT_FILE_CREATE;
   } else if (provider_kind == 1u && edr_kernel_file_mutation_path_descriptor(descriptor)) {
     event_type = descriptor->Id == 27u ? EDR_EVENT_FILE_RENAME : EDR_EVENT_FILE_DELETE;
   } else if (!(provider_kind == 1u &&
                (edr_kernel_file_name_create_descriptor(descriptor) ||
                 edr_kernel_file_name_delete_descriptor(descriptor) ||
+                edr_kernel_file_create_descriptor(descriptor) ||
                 descriptor->Id == 18u || descriptor->Id == 19u))) {
     ULONG info_size = 0u;
     ULONG status = TdhGetEventInformation(rec, 0u, NULL, NULL, &info_size);

@@ -2097,7 +2097,11 @@ static int sqlite_write_budget_allow(uint32_t units, int64_t ts,
   if (units == 0u) {
     units = 1u;
   }
-  int64_t minute = (ts / 1000000000LL) / 60LL;
+  /* This budget protects work performed now.  Event time is attacker- and
+   * transport-influenced and may arrive late or out of order; using it here
+   * allowed an older event to reset the live write budget backwards. */
+  (void)ts;
+  int64_t minute = (now_unix_ns() / 1000000000LL) / 60LL;
   if (minute != s_write_budget_minute) {
     s_write_budget_minute = minute;
     s_write_budget_count = 0u;
@@ -2136,7 +2140,8 @@ static void sqlite_write_budget_release(uint32_t units, int64_t ts,
   if (units == 0u) {
     units = 1u;
   }
-  int64_t minute = (ts / 1000000000LL) / 60LL;
+  (void)ts;
+  int64_t minute = (now_unix_ns() / 1000000000LL) / 60LL;
   if (minute == s_write_budget_minute && s_write_budget_count >= units) {
     uint32_t *class_count = sqlite_write_budget_counter(write_class);
     s_write_budget_count -= units;
@@ -2731,6 +2736,12 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
       break;
     }
     added++;
+  }
+  if (ok) {
+    uint32_t omitted = pre_count > added ? pre_count - added : 0u;
+    ok = manifest_add_u64(root, "serialized_context_count", added) &&
+         manifest_add_u64(root, "omitted_context_count", omitted) &&
+         cJSON_AddBoolToObject(root, "context_truncated", omitted != 0u);
   }
   if (!ok) {
     manifest_rejected("context manifest allocation or UTF-8 validation failed");

@@ -656,6 +656,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   (void)remove("local_evidence_cache_write_budget.sqlite-wal");
   (void)remove("local_evidence_cache_write_budget.sqlite-shm");
   test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "8");
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
   assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
@@ -663,7 +664,9 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
   candidate.priority = 3u;
   candidate.pid = 74101u;
-  candidate.event_time_ns = base;
+  /* Keep this candidate window open across two event-time minutes so a late
+   * record can prove that resource admission uses processing time. */
+  candidate.event_time_ns = base - 90LL * 1000000000LL;
   candidate.process_start_key = UINT64_C(0x74101);
   candidate.process_creation_filetime_100ns = UINT64_C(133700000000074101);
   snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-budget-reserve");
@@ -686,6 +689,18 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
     context.event_time_ns = base + (int64_t)(i + 1u) * 1000000LL;
     snprintf(context.event_id, sizeof(context.event_id), "budget-context-%u", i);
     edr_local_evidence_cache_record_behavior(&context);
+  }
+  {
+    EdrEvidenceCacheStatus before_late, after_late;
+    edr_local_evidence_cache_get_status(&before_late);
+    context.event_time_ns = base - 60LL * 1000000000LL;
+    snprintf(context.event_id, sizeof(context.event_id), "budget-context-late");
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_get_status(&after_late);
+    assert(after_late.write_budget_ordinary_context_used ==
+           before_late.write_budget_ordinary_context_used);
+    assert(after_late.write_budget_ordinary_context_dropped >
+           before_late.write_budget_ordinary_context_dropped);
   }
 
   critical_context = candidate;
@@ -745,6 +760,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
 
   edr_local_evidence_cache_close();
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   (void)remove(db);
   (void)remove("local_evidence_cache_write_budget.sqlite-wal");
   (void)remove("local_evidence_cache_write_budget.sqlite-shm");
@@ -2083,11 +2099,10 @@ static void fill_max_backslash_utf8_tagged(char *dst, size_t cap, unsigned tag) 
   dst[cap - 1u] = '\0';
 }
 
-/* The manifest envelope is sized for every selectable context slot, not only
- * one maximum event.  All 32 pre-context entries include maximum source text
- * with both heavy escaping and UTF-8, and the committed SQLite JSON remains
- * parseable and complete. */
-static void test_context_manifest_32_maximum_ring_items_persist(void) {
+/* Forty eligible records make the 32-entry wire cap observable.  Every
+ * serialized entry still carries maximum source text with heavy escaping and
+ * UTF-8, while the envelope declares the eight omitted records explicitly. */
+static void test_context_manifest_discloses_32_item_truncation(void) {
   const char *db = "local_evidence_cache_manifest_32.sqlite";
   struct timespec ts;
   EdrBehaviorRecord pre, candidate;
@@ -2121,8 +2136,8 @@ static void test_context_manifest_32_maximum_ring_items_persist(void) {
     source_fields_len += (size_t)written;
   }
   assert(source_fields_len == sizeof(pre.source_truncated_fields) - 1u);
-  for (unsigned i = 0u; i < 32u; ++i) {
-    pre.event_time_ns = base - (int64_t)(32u - i) * 1000000LL;
+  for (unsigned i = 0u; i < 40u; ++i) {
+    pre.event_time_ns = base - (int64_t)(40u - i) * 1000000LL;
     snprintf(pre.event_id, sizeof(pre.event_id), "manifest-32-pre-%u", i);
     /* Vary the parent-prefix key so ordinary-event aggregation cannot hide
      * 31 input slots before the context-ring contract is exercised. */
@@ -2143,9 +2158,19 @@ static void test_context_manifest_32_maximum_ring_items_persist(void) {
   {
     cJSON *root = cJSON_Parse(bundle);
     cJSON *context;
+    cJSON *pre_count_json;
+    cJSON *serialized_count_json;
+    cJSON *omitted_count_json;
     assert(root != NULL);
     context = cJSON_GetObjectItemCaseSensitive(root, "context");
     assert(cJSON_IsArray(context) && cJSON_GetArraySize(context) == 32);
+    pre_count_json = cJSON_GetObjectItemCaseSensitive(root, "pre_context_count");
+    serialized_count_json = cJSON_GetObjectItemCaseSensitive(root, "serialized_context_count");
+    omitted_count_json = cJSON_GetObjectItemCaseSensitive(root, "omitted_context_count");
+    assert(cJSON_IsNumber(pre_count_json) && pre_count_json->valuedouble == 40.0);
+    assert(cJSON_IsNumber(serialized_count_json) && serialized_count_json->valuedouble == 32.0);
+    assert(cJSON_IsNumber(omitted_count_json) && omitted_count_json->valuedouble == 8.0);
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "context_truncated")));
     for (int i = 0; i < cJSON_GetArraySize(context); ++i) {
       cJSON *item = cJSON_GetArrayItem(context, i);
       cJSON *path = cJSON_GetObjectItemCaseSensitive(item, "file_path");
@@ -2914,7 +2939,7 @@ int main(void) {
   test_snapshot_generation_persists_candidate_manifests_and_rtq();
   test_context_generation_multicandidate_and_artifact_identity();
   test_context_manifest_utf8_backslash_and_invalid_rejection();
-  test_context_manifest_32_maximum_ring_items_persist();
+  test_context_manifest_discloses_32_item_truncation();
   test_candidate_structured_evidence_and_durable_identity();
 #if !defined(_WIN32)
   test_concurrent_cache_lifecycle_snapshot_and_queries();

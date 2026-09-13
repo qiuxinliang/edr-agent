@@ -209,6 +209,14 @@ int main(void) {
                          "Write must use the documented descriptor, not localized task text");
   ok &= require_contains(collector, "edr_kernel_file_write_descriptor(descriptor)",
                          "Write must share the typed FileKey lifetime resolver");
+  ok &= require_contains(collector,
+                         "Only the typed CreateNewFile notification is exposed",
+                         "ordinary Kernel File/Create opens must remain metadata-only");
+  ok &= require_contains(collector, "edr_kernel_file_descriptor_is_create_new(",
+                         "collector must consume the tested descriptor classifier");
+  ok &= require_contains(collector,
+                         "edr_kernel_file_create_descriptor(descriptor) ||\n                descriptor->Id == 18u",
+                         "localized fallback must not reclassify ordinary Create opens");
   ok &= require_absent(tdh, "{L\"FileObject\", \"file\"}",
                        "opaque FileObject must never be decoded as a path");
   ok &= require_contains(collector, "if (is_read) edr_collector_file_read_metadata_gate_note_resolved();",
