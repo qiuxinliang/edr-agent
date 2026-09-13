@@ -25,13 +25,16 @@
 #include "p0_deferred_queue_fake.h"
 
 #if defined(_WIN32)
-static int setenv(const char *name, const char *value, int overwrite) {
+static int test_setenv(const char *name, const char *value, int overwrite) {
   if (!overwrite && getenv(name) != NULL) return 0;
   return _putenv_s(name, value);
 }
 #else
 #include <pthread.h>
 extern int setenv(const char *, const char *, int);
+static int test_setenv(const char *name, const char *value, int overwrite) {
+  return setenv(name, value, overwrite);
+}
 #endif
 
 int edr_p0_test_should_suppress_known_false_positive(const char *rule_id,
@@ -39,7 +42,7 @@ int edr_p0_test_should_suppress_known_false_positive(const char *rule_id,
                                                      const char *detail,
                                                      const char **out_reason);
 
-static atomic_int g_adaptive_raises = ATOMIC_VAR_INIT(0);
+static atomic_int g_adaptive_raises = 0;
 void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t pid,
                                    uint32_t parent_pid, const char *process_name) {
   (void)severity;
@@ -50,8 +53,8 @@ void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t p
   atomic_fetch_add(&g_adaptive_raises,1);
 }
 
-static atomic_int g_emit_count = ATOMIC_VAR_INIT(0);
-static atomic_int g_durable_count = ATOMIC_VAR_INIT(0);
+static atomic_int g_emit_count = 0;
+static atomic_int g_durable_count = 0;
 static int g_combined_emit_allowed = 1;
 static EdrBehaviorRecordAlertEmitOutcome g_combined_emit_outcome =
     EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED;
@@ -66,17 +69,17 @@ static int g_terminal_update_allowed = 1;
 static int g_terminal_source_enqueue_allowed = 1;
 static int g_ir_ready = 1;
 static int g_ir_evaluation_available = 1;
-static atomic_int g_block_combined = ATOMIC_VAR_INIT(0);
-static atomic_int g_combined_inflight = ATOMIC_VAR_INIT(0);
-static atomic_int g_combined_release = ATOMIC_VAR_INIT(0);
-static atomic_int g_combined_fail_after_release = ATOMIC_VAR_INIT(0);
+static atomic_int g_block_combined = 0;
+static atomic_int g_combined_inflight = 0;
+static atomic_int g_combined_release = 0;
+static atomic_int g_combined_fail_after_release = 0;
 /* A focused delayed producer lets rate-window tests keep one reservation
  * in flight while unrelated records continue through the ordinary path. */
 static const char *g_block_combined_event_id;
-static atomic_int g_parallel_mode = ATOMIC_VAR_INIT(0);
-static atomic_int g_enforcement_side_effects = ATOMIC_VAR_INIT(0);
-static atomic_int g_terminal_precreate_calls = ATOMIC_VAR_INIT(0);
-static atomic_int g_terminal_update_calls = ATOMIC_VAR_INIT(0);
+static atomic_int g_parallel_mode = 0;
+static atomic_int g_enforcement_side_effects = 0;
+static atomic_int g_terminal_precreate_calls = 0;
+static atomic_int g_terminal_update_calls = 0;
 static atomic_flag g_terminal_lock = ATOMIC_FLAG_INIT;
 static const char *g_required_intent_marker;
 
@@ -767,8 +770,8 @@ static void test_searchprotocolhost_no_cmdline_user_path_not_suppressed(void) {
 }
 
 static void test_real_p0_dedup_metric_matrix(void) {
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup(); edr_p0_rule_test_set_monotonic_ms(1000u); g_emit_count = 0;
   EdrBehaviorRecord r; init_record(&r); r.pid=99001u; r.event_time_ns=10; r.type=EDR_EVENT_PROCESS_CREATE;
   snprintf(r.endpoint_id,sizeof(r.endpoint_id),"ep-dedup"); snprintf(r.process_name,sizeof(r.process_name),"dedup-test.exe");
@@ -802,8 +805,8 @@ static void test_real_p0_dedup_metric_matrix(void) {
 static void test_p0_exact_replay_window_rearms_only_that_source(void) {
   EdrBehaviorRecord r;
   EdrP0DedupMetrics before, after;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup(); edr_p0_rule_test_set_monotonic_ms(1000u); g_emit_count = 0;
   init_record(&r); r.pid = 99005u; r.event_time_ns = 100;
   snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-window"); snprintf(r.process_name, sizeof(r.process_name), "dedup-test.exe");
@@ -822,8 +825,8 @@ static void test_p0_exact_replay_window_rearms_only_that_source(void) {
 static void test_p0_dedup_never_suppresses_semantic_mutations(void) {
   EdrBehaviorRecord r;
   EdrP0DedupMetrics m;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(1200u);
   g_emit_count = 0;
@@ -929,8 +932,8 @@ static void fill_escaped(char *out, size_t cap) {
 static void test_p0_full_context_counts_capped_value_once(void) {
   EdrBehaviorRecord r;
   EdrP0EmitMetrics before, after;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup(); edr_p0_rule_test_set_monotonic_ms(1500u); g_emit_count = 0;
   init_record(&r); r.pid = 99003u; r.event_time_ns = 88;
   snprintf(r.process_name, sizeof(r.process_name), "dedup-test.exe");
@@ -950,8 +953,8 @@ static void test_p0_abi_fields_mark_omission_without_losing_record(void) {
   EdrP0EmitMetrics before, after;
   const char *marker = "[omitted: exceeds ABI field]";
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(1550u);
   g_emit_count = 0;
@@ -981,9 +984,9 @@ static void test_p0_push_failure_does_not_commit_emit_counters(void) {
   EdrP0DedupMetrics dedup_before, dedup_after;
   int durable_before;
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2500u);
   g_emit_count = 0;
@@ -1029,7 +1032,7 @@ static void test_p0_push_failure_does_not_commit_emit_counters(void) {
   assert(edr_p0_rule_try_emit(&r) == 1);
   assert(g_emit_count == 1);
   assert(strcmp(g_last_record.event_id, r.event_id) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
 }
 
 static void test_p0_governor_suppression_is_not_queue_backpressure(void) {
@@ -1037,10 +1040,10 @@ static void test_p0_governor_suppression_is_not_queue_backpressure(void) {
   EdrP0EmitMetrics before, after;
   int durable_before;
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2550u);
   g_emit_count = 0;
@@ -1072,8 +1075,8 @@ static void test_p0_governor_suppression_is_not_queue_backpressure(void) {
 static void test_p0_miss_does_not_emit_combined_frame(void) {
   EdrBehaviorRecord r;
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2600u);
   g_emit_count = 0;
@@ -1089,10 +1092,10 @@ static void test_p0_miss_does_not_emit_combined_frame(void) {
 static void test_source_truncation_never_emits_after_coalescer_status(void) {
   EdrBehaviorRecord r;
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2625u);
   g_emit_count = 0;
@@ -1117,8 +1120,8 @@ static void test_source_truncation_never_emits_after_coalescer_status(void) {
 static void test_p0_bundle_sha256_is_required_and_attached(void) {
   EdrBehaviorRecord r;
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2650u);
   g_emit_count = 0;
@@ -1149,8 +1152,8 @@ static void test_p0_bundle_sha256_is_required_and_attached(void) {
 
 static void test_ir_evaluation_failure_durably_preserves_source_without_alert(void) {
   EdrBehaviorRecord r;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2700u);
   g_ir_ready = 1;
@@ -1190,7 +1193,7 @@ static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   EdrP0EmitMetrics metrics;
   char reason[96];
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   g_source_latch = 0;
   edr_p0_rule_test_set_monotonic_ms(1000u);
@@ -1304,8 +1307,8 @@ static void test_ir_not_ready_durably_preserves_every_p0_event_group(void) {
       EDR_EVENT_REG_SET_VALUE,
   };
   size_t i;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2800u);
   g_ir_ready = 0;
@@ -1360,8 +1363,8 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   char reason[96];
   deferred_fake_reset();
 
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2850u);
   edr_p0_rule_source_only_set_runtime_identity("tenant_default","ep-local");
@@ -1417,9 +1420,9 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   /* Healthy incoming exact replay must not race the retained owner. */
   assert(edr_p0_rule_try_emit(&file_match)==0 && deferred_completions==0u);
   edr_p0_rule_test_set_monotonic_ms(3000u);
-  assert(setenv("EDR_P0_DIRECT_EMIT","0",1)==0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT","0",1)==0);
   assert(edr_p0_rule_poll_deferred_match()==0 && deferred_completions==0u);
-  assert(setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
   assert(edr_p0_rule_poll_deferred_match()==1);
   assert(deferred_completions==1u && atomic_load(&g_emit_count)==2);
   assert(!strcmp(g_last_record.event_id,file_match.event_id));
@@ -1464,8 +1467,8 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   alert_policy.policy_v2.script_mode=EDR_POLICY_MODE_ALERT;
   block_policy.policy_v2.script_mode=EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&alert_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
-  assert(setenv("EDR_P0_DEDUP_SEC","0",1)==0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC","0",1)==0);
   retain_deferred_fixture(&record,"deferred-commit-retry");
   g_source_ack=1;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
@@ -1614,8 +1617,8 @@ static void test_script_matches_obey_process_family_gate(void) {
 static void test_p0_escape_overflow_degrades_without_silent_core_loss(void) {
   EdrBehaviorRecord r;
   EdrP0EmitMetrics before, after;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup(); edr_p0_rule_test_set_monotonic_ms(1700u); g_emit_count = 0;
   init_record(&r); r.pid = 99004u; r.event_time_ns = 89;
   snprintf(r.process_name, sizeof(r.process_name), "dedup-test.exe");
@@ -1642,8 +1645,8 @@ static void test_p0_user_subject_overflow_degrades_without_losing_alert(void) {
   EdrP0EmitMetrics before, after;
   uint64_t expected_full_caps;
   uint64_t expected_abi_omissions;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup(); edr_p0_rule_test_set_monotonic_ms(2000u); g_emit_count = 0;
   init_record(&r); r.pid = 99002u; r.event_time_ns = 99; r.type = EDR_EVENT_PROCESS_CREATE;
   snprintf(r.process_name, sizeof(r.process_name), "dedup-test.exe");
@@ -1719,10 +1722,10 @@ static void test_p0_pending_claim_allows_one_same_key(void) {
   enum { workers = 20 };
   pthread_t threads[workers];
   ConcurrentEmit work[workers];
-  atomic_int start = ATOMIC_VAR_INIT(0);
+  atomic_int start = 0;
   int emitted = 0;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3000u);
   g_emit_count = 0;
@@ -1762,16 +1765,16 @@ static void test_rate_rollback_does_not_reopen_new_window(void) {
   EdrBehaviorRecord a, b, c;
   ConcurrentEmit delayed;
   pthread_t delayed_thread;
-  atomic_int start = ATOMIC_VAR_INIT(0);
+  atomic_int start = 0;
 
   memset(&alert_policy, 0, sizeof(alert_policy));
   alert_policy.policy_v2.script_mode = EDR_POLICY_MODE_ALERT;
   edr_policy_v2_configure(&alert_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "1", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "1", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(1000u);
   g_emit_count = 0;
@@ -1825,9 +1828,9 @@ static void test_rate_rollback_does_not_reopen_new_window(void) {
 
   atomic_store(&g_block_combined, 0);
   g_block_combined_event_id = NULL;
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
 }
 
 /* A reservation must also fail closed when its physical tenant/endpoint
@@ -1837,16 +1840,16 @@ static void test_rate_rollback_does_not_decrement_reused_slot(void) {
   EdrBehaviorRecord a, b, c;
   ConcurrentEmit delayed;
   pthread_t delayed_thread;
-  atomic_int start = ATOMIC_VAR_INIT(0);
+  atomic_int start = 0;
 
   memset(&alert_policy, 0, sizeof(alert_policy));
   alert_policy.policy_v2.script_mode = EDR_POLICY_MODE_ALERT;
   edr_policy_v2_configure(&alert_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "1", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "1", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(1000u);
   g_emit_count = 0;
@@ -1902,22 +1905,22 @@ static void test_rate_rollback_does_not_decrement_reused_slot(void) {
 
   atomic_store(&g_block_combined, 0);
   g_block_combined_event_id = NULL;
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
 }
 
 static void test_enforcement_requires_durable_intent_and_one_owner(void) {
   enum { workers = 20 };
   pthread_t threads[workers];
   ConcurrentEmit work[workers];
-  atomic_int start = ATOMIC_VAR_INIT(0);
+  atomic_int start = 0;
   int emitted = 0;
   EdrConfig block_policy;
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&block_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3050u);
   g_combined_emit_allowed = 1;
@@ -1980,11 +1983,11 @@ static void test_enforcement_critical_lane_bypasses_ordinary_alert_rate(void) {
   alert_policy.policy_v2.script_mode = EDR_POLICY_MODE_ALERT;
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3060u);
   g_combined_emit_allowed = 1;
@@ -2020,7 +2023,7 @@ static void test_enforcement_critical_lane_bypasses_ordinary_alert_rate(void) {
   assert(atomic_load(&g_terminal_update_calls) == update_before + 1);
   assert(after.critical_reservations == before.critical_reservations + 1u);
 
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
   edr_policy_enforcement_test_set_execute_hook(NULL);
 }
 
@@ -2030,8 +2033,8 @@ static void test_enforcement_terminal_preserves_evidence_and_never_reexecutes(vo
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&block_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3075u);
   g_durable_emit_allowed = 1;
@@ -2099,8 +2102,8 @@ static void test_enforcement_terminal_rejects_missing_authority(void) {
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&block_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3097u);
   g_durable_emit_allowed = 1;
@@ -2179,8 +2182,8 @@ static void test_enforcement_terminal_survives_normal_enqueue_failures(void) {
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&block_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3090u);
   g_durable_emit_allowed = 1;
@@ -2230,8 +2233,8 @@ static void test_enforcement_terminal_crash_window_never_reexecutes(void) {
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&block_policy);
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3095u);
   g_durable_emit_allowed = 1;
@@ -2278,8 +2281,8 @@ static void test_block_uses_terminal_journal_when_ordinary_pending_table_full(vo
   pthread_t block_thread;
   ConcurrentEmit ordinary[ordinary_workers];
   ConcurrentEmit block_work;
-  atomic_int ordinary_start = ATOMIC_VAR_INIT(0);
-  atomic_int block_start = ATOMIC_VAR_INIT(0);
+  atomic_int ordinary_start = 0;
+  atomic_int block_start = 0;
   EdrConfig alert_policy;
   EdrConfig block_policy;
   int ordinary_emitted = 0;
@@ -2291,11 +2294,11 @@ static void test_block_uses_terminal_journal_when_ordinary_pending_table_full(vo
   alert_policy.policy_v2.script_mode = EDR_POLICY_MODE_ALERT;
   memset(&block_policy, 0, sizeof(block_policy));
   block_policy.policy_v2.script_mode = EDR_POLICY_MODE_BLOCK;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3110u);
   edr_policy_v2_configure(&alert_policy);
@@ -2382,12 +2385,12 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
   enum { workers = 65 };
   pthread_t threads[workers];
   ConcurrentEmit work[workers];
-  atomic_int start = ATOMIC_VAR_INIT(0);
+  atomic_int start = 0;
   int emitted = 0;
-  assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
-  assert(setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
-  assert(setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
+  assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(3100u);
   g_emit_count = 0;

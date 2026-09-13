@@ -336,6 +336,84 @@ class WindowsReleaseGateTests(unittest.TestCase):
             verify_sqlite_package_location(isolated_build / "CMakeCache.txt",
                                            prefix / "include", prefix / "lib" / library.name)
 
+    def test_p0_gate_windows_branches_compile_with_sqlite(self):
+        """Compile real P0 gate tests with the production SQLite branches enabled.
+
+        A host compiler accepting a POSIX API or ATOMIC_VAR_INIT is not evidence
+        that MSVC accepts it. Native Windows uses its CRT/SDK; other hosts remove
+        those conveniences while retaining the actual SQLite headers.
+        """
+        cmake_source = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        begin = cmake_source.index("set(CMAKE_C_STANDARD 11)")
+        end = cmake_source.index('option(EDR_BUILD_TESTS', begin)
+        targets = (
+            "test_p0_direct_emit_suppression", "test_local_evidence_cache_candidate",
+            "test_p0_deferred_snapshot", "test_behavior_record_alert_emit",
+            "test_process_tree_cache",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "windows.h").write_text(
+                '#include <stdint.h>\n#define MAX_PATH 260\n'
+                'typedef uint32_t DWORD;\n'
+                'typedef struct { DWORD dwLowDateTime, dwHighDateTime; } FILETIME;\n'
+                'DWORD GetTempPathA(DWORD, char *);\n'
+                'unsigned GetTempFileNameA(const char *, const char *, unsigned, char *);\n'
+                'void GetSystemTimeAsFileTime(FILETIME *);\n'
+                'int _putenv_s(const char *, const char *);\n', encoding="utf-8")
+            (source / "msvc_surface.h").write_text(
+                '#include <stdlib.h>\n#include <time.h>\n#include <stdatomic.h>\n'
+                '/* Ignore DLL/calling-convention annotations in this compile-only host probe. */\n'
+                '#define __declspec(x)\n#define __stdcall\n#define __cdecl\n'
+                '#undef ATOMIC_VAR_INIT\n#undef CLOCK_REALTIME\n'
+                '#pragma GCC poison ATOMIC_VAR_INIT clock_gettime CLOCK_REALTIME\n'
+                '#pragma GCC poison setenv unsetenv getpid usleep pthread_create pthread_join\n'
+                'int _putenv_s(const char *, const char *);\n', encoding="utf-8")
+            # Fail explicitly if someone accidentally compiles only the empty
+            # no-SQLite test branch again, even when the source still compiles.
+            (source / "require_sqlite.h").write_text(
+                '#if !defined(EDR_HAVE_SQLITE) || !EDR_HAVE_SQLITE\n'
+                '#error P0 Windows probe requires SQLite behavior coverage\n'
+                '#endif\n', encoding="utf-8")
+            lines = [
+                'cmake_minimum_required(VERSION 3.20)', 'project(P0WindowsBranches C)',
+                cmake_source[begin:end], 'find_package(SQLite3 REQUIRED)',
+            ]
+            for target in targets:
+                lines += [
+                    f'add_library({target} OBJECT "{(ROOT / "tests" / (target + ".c")).as_posix()}")',
+                    f'target_include_directories({target} PRIVATE "{(ROOT / "include").as_posix()}" '
+                    f'"{(ROOT / "third_party/cjson").as_posix()}" '
+                    f'"{(ROOT / "third_party/nanopb").as_posix()}" "{(ROOT / "src/proto").as_posix()}")',
+                    f'edr_apply_test_warnings({target})',
+                    'if(NOT WIN32)',
+                    f'  target_compile_definitions({target} PRIVATE _WIN32)',
+                    f'  target_include_directories({target} PRIVATE "${{CMAKE_SOURCE_DIR}}")',
+                    f'  target_compile_options({target} PRIVATE -Werror=implicit-function-declaration '
+                    '-include "${CMAKE_SOURCE_DIR}/msvc_surface.h")',
+                    'endif()',
+                ]
+            lines += [
+                'target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)',
+                'target_compile_definitions(test_behavior_record_alert_emit PRIVATE EDR_HAVE_NANOPB=1 EDR_HAVE_SQLITE=1 EDR_OS_WINDOWS=1)',
+                'target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)',
+                'if(TARGET SQLite3::SQLite3)',
+                '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite3::SQLite3)',
+                'else()',
+                '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite::SQLite3)',
+                'endif()',
+                'if(MSVC)',
+                '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "/FI${CMAKE_SOURCE_DIR}/require_sqlite.h")',
+                'else()',
+                '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "-include${CMAKE_SOURCE_DIR}/require_sqlite.h")',
+                'endif()',
+            ]
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+                             "-DCMAKE_BUILD_TYPE=Release")
+            self.run_command("cmake", "--build", str(build), "--parallel", "2", "--", "-k", "0")
+
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
             source = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")

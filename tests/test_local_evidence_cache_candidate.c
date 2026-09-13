@@ -256,7 +256,7 @@ static void test_behavior_summary_below_threshold_no_emit(void) {
 static void test_identity_status_counter_basics(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts;
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   const int64_t generation_start = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec - 1000LL;
   edr_pt_cache_init();
   assert(put_generation(91002u, 1u, "identity.exe", "", "", "",
@@ -579,7 +579,7 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
   struct timespec ts;
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   EdrBehaviorRecord candidate;
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
   candidate.priority = 3u;
@@ -698,7 +698,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   (void)remove("local_evidence_cache_write_budget.sqlite-shm");
   test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "8");
   test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
@@ -825,7 +825,7 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
   (void)remove("local_evidence_cache_stable_enrichment.sqlite-wal");
   (void)remove("local_evidence_cache_stable_enrichment.sqlite-shm");
   test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "6");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   base = ((int64_t)ts.tv_sec / 60LL) * 60LL * 1000000000LL + 10000000000LL;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
@@ -926,7 +926,7 @@ static void test_candidate_fallback_preserves_path_and_generation_boundaries(voi
   (void)remove(db);
   (void)remove("local_evidence_cache_fallback_boundaries.sqlite-wal");
   (void)remove("local_evidence_cache_fallback_boundaries.sqlite-shm");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
@@ -988,7 +988,7 @@ static void test_candidate_known_to_unknown_keeps_generation_and_completeness(vo
   (void)remove(db);
   (void)remove("local_evidence_cache_known_to_unknown.sqlite-wal");
   (void)remove("local_evidence_cache_known_to_unknown.sqlite-shm");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   init_record(&known, EDR_EVENT_NET_CONNECT);
@@ -1045,7 +1045,7 @@ static void test_candidate_distinct_source_ids_bridge_only_known_to_unknown(void
   (void)remove(db);
   (void)remove("local_evidence_cache_cross_source_bridge.sqlite-wal");
   (void)remove("local_evidence_cache_cross_source_bridge.sqlite-shm");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   init_record(&known, EDR_EVENT_PROCESS_CREATE);
@@ -1199,7 +1199,7 @@ static void test_candidate_source_generation_presence_ablation(void) {
   int64_t now;
 
   cleanup_test_sqlite_path(db);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(pid, ppid, "powershell.exe",
@@ -1235,7 +1235,7 @@ static void test_candidate_provider_provenance_semantic_ablation(void) {
   int64_t now;
 
   cleanup_test_sqlite_path(db);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
@@ -1268,7 +1268,7 @@ static void test_candidate_cross_provider_snapshot_and_provenance_converge(void)
   int64_t now;
 
   cleanup_test_sqlite_path(db);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(pid, ppid, "powershell.exe",
@@ -1318,7 +1318,7 @@ static void test_candidate_dedupe_rejection_reason_observability(void) {
   int64_t now;
 
   cleanup_test_sqlite_path(db);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
@@ -1416,7 +1416,7 @@ static void test_candidate_completeness_monotonically_upgrades(void) {
   (void)remove(db);
   (void)remove("local_evidence_cache_completeness.sqlite-wal");
   (void)remove("local_evidence_cache_completeness.sqlite-shm");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
@@ -1473,7 +1473,7 @@ static void test_candidate_reuse_requires_generation_and_full_semantics(void) {
   (void)remove("local_evidence_cache_semantic_reuse.sqlite-wal");
   (void)remove("local_evidence_cache_semantic_reuse.sqlite-shm");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   init_record(&base, EDR_EVENT_NET_CONNECT);
   base.priority = 3u;
   base.pid = 81100u;
@@ -1586,7 +1586,7 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
   assert(sqlite_table_has_column(db, "p0_candidates", "user_sid"));
   assert(sqlite_table_has_column(db, "process_cache", "identity_source"));
   assert(sqlite_table_has_column(db, "process_cache", "identity_quality"));
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 
   init_record(&a, EDR_EVENT_NET_CONNECT);
@@ -1736,7 +1736,7 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
   (void)remove(db);
   (void)remove("local_evidence_cache_snapshot_generation.sqlite-wal");
   (void)remove("local_evidence_cache_snapshot_generation.sqlite-shm");
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(edr_pt_cache_put_generation(
@@ -1918,7 +1918,7 @@ static void test_context_generation_multicandidate_and_artifact_identity(void) {
   (void)remove("local_evidence_cache_generation_context.sqlite-wal");
   (void)remove("local_evidence_cache_generation_context.sqlite-shm");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(pid, 4u, "a.exe", "a", "C:\\A.exe", "parent-a",
@@ -2055,7 +2055,7 @@ static void test_context_manifest_utf8_backslash_and_invalid_rejection(void) {
   (void)remove("local_evidence_cache_manifest_contract.sqlite-wal");
   (void)remove("local_evidence_cache_manifest_contract.sqlite-shm");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
   candidate.priority = 3u; candidate.pid = 96150u; candidate.event_time_ns = base;
@@ -2153,7 +2153,7 @@ static void test_context_manifest_discloses_32_item_truncation(void) {
   (void)remove("local_evidence_cache_manifest_32.sqlite-wal");
   (void)remove("local_evidence_cache_manifest_32.sqlite-shm");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(96150u, 0u, "parent-32.exe", "", "", "",
@@ -2416,7 +2416,7 @@ static void test_mutex_lock_observability_contract(void) {
 static void test_identity_generation_match_delta(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts;
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(92001u, 1u, "x.exe", "x", "x", "p", now - 1000u,
@@ -2442,7 +2442,7 @@ static void test_identity_generation_match_delta(void) {
 
 static void test_sid_only_identity_enriches_same_generation(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(92501u, 1u, "sid.exe", "sid", "sid", "p", now - 1000u,
@@ -2463,7 +2463,7 @@ static void test_sid_only_identity_enriches_same_generation(void) {
 
 static void test_unknown_generation_identity_never_survives_to_later_kernel_generation(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
   EdrBehaviorRecord security; init_record(&security, EDR_EVENT_PROCESS_CREATE);
@@ -2483,7 +2483,7 @@ static void test_unknown_generation_identity_never_survives_to_later_kernel_gene
 }
 
 static void test_security_4688_identity_none_is_not_lifecycle_authoritative(void) {
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t start = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - 1000u;
   edr_pt_cache_init();
   assert(put_generation(92503u, 1u, "kernel.exe", "", "", "", start,
@@ -2504,7 +2504,7 @@ static void test_security_4688_identity_none_is_not_lifecycle_authoritative(void
 
 static void test_known_generation_rejects_late_and_zero_time_identity_updates(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t start = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - 1000000000ULL;
   edr_pt_cache_init(); assert(put_generation(94501u, 1u, "b.exe", "b", "B-path", "p", start,
                                               0x94501u) == 0);
@@ -2526,7 +2526,7 @@ static void test_known_generation_rejects_late_and_zero_time_identity_updates(vo
 
 static void test_identity_generation_mismatch_and_quality_order(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(93001u, 1u, "a.exe", "a", "a", "p", now - 3000000000ULL,
@@ -2568,7 +2568,7 @@ static void test_identity_generation_mismatch_and_quality_order(void) {
 
 static void test_kernel_generation_a_to_b_resets_cached_identity_once(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   const uint32_t pid = 93002u;
   edr_pt_cache_init();
@@ -2611,7 +2611,7 @@ static void test_delayed_generation_mismatch_withholds_all_process_enrichment(vo
   const uint64_t generation_b = 0x96202u;
   struct timespec ts;
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   assert(put_generation(pid, 701u, "a.exe", "a", "C:\\A.exe", "parent-a",
@@ -2675,7 +2675,7 @@ static void test_unknown_to_bound_generation_clears_provisional_metadata(void) {
   const uint64_t generation_b = 0x96212u;
   struct timespec ts;
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   edr_pt_cache_init();
   EdrBehaviorRecord unknown_a;
@@ -3078,7 +3078,7 @@ static void test_candidate_structured_evidence_and_durable_identity(void) {
   r.priority = 3u;
   r.pid = 75201u;
   r.ppid = 400u;
-  assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   r.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   set_record_generation(&r, UINT64_C(0x75201));
   snprintf(r.event_id, sizeof(r.event_id), "structured-evidence-source");
