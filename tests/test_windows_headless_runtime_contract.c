@@ -323,6 +323,21 @@ int main(void) {
   ok &= require_contains(installer_ps,
                          "Enrollment material rollback incomplete",
                          "rollback diagnostics must distinguish partial cleanup from complete cleanup");
+  ok &= require_contains(installer_ps,
+                         "/subcategory:{0CCE921E-69AE-11D9-BED3-505054503030}",
+                         "headless enrollment must enable Security 4657 Registry auditing");
+  ok &= require_contains(installer_ps,
+                         "System.Security.AccessControl.RegistryAuditRule",
+                         "headless enrollment must add an audit SACL to monitored Run keys");
+  ok &= require_contains(installer_ps,
+                         "[Microsoft.Win32.RegistryRights]::SetValue",
+                         "registry SACL must be scoped to successful value writes");
+  ok &= require_contains(installer_ps,
+                         "if ($StrictHealthCheck) { throw }",
+                         "strict installation health must fail when sensor policy cannot be configured");
+  ok &= require_contains(installer_ps,
+                         "auditpol.exe is required by strict Windows sensor health",
+                         "strict installation health must reject unavailable audit policy tooling");
   ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-new\", \"-q\", \"-machine\", $infPath, $CsrPath) -TimeoutSeconds 30",
                          "certreq CSR creation must be non-interactive and have a bounded wait");
   ok &= require_contains(installer_ps, "Invoke-Checked -Exe $certreq.Source -ArgList @(\"-accept\", \"-q\", \"-machine\", $CertPath) -TimeoutSeconds 30",

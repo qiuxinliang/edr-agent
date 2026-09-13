@@ -50,8 +50,15 @@ typedef struct {
   uint64_t write_budget_dropped;
   uint64_t write_budget_candidate_dropped;
   uint64_t write_budget_context_dropped;
+  uint64_t write_budget_critical_context_dropped;
+  uint64_t write_budget_ordinary_context_dropped;
   uint32_t write_budget_used;
   uint32_t write_budget_limit;
+  uint32_t write_budget_base_limit;
+  uint32_t write_budget_critical_context_used;
+  uint32_t write_budget_critical_context_limit;
+  uint32_t write_budget_ordinary_context_used;
+  uint32_t write_budget_ordinary_context_limit;
   uint64_t db_budget_dropped;
   uint64_t pressure_dropped;
   uint64_t ordinary_coalesced;

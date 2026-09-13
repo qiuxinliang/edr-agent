@@ -27,7 +27,7 @@
     EDR_TPM_KEY_URI              TPM/OpenSSL provider key URI；PowerShell 默认走 Windows Platform Crypto Provider
     EDR_TRUST_CA=1          enroll 前将 EDR_CA_CERT 导入 Windows Root（适合企业私有 CA / lab mkcert）
     EDR_INSECURE_TLS=1      [System.Net.ServicePointManager]::ServerCertificateValidationCallback（仅调试）
-    EDR_CONFIGURE_SENSOR_POLICY=0  跳过 Windows 采集策略配置；默认安装时启用进程命令行审计和 PowerShell ScriptBlock。
+    EDR_CONFIGURE_SENSOR_POLICY=0  跳过 Windows 采集策略配置；默认启用进程命令行、Run/RunOnce 注册表值和 PowerShell ScriptBlock 审计。
 
 .EXAMPLE
   $env:EDR_API_BASE="http://127.0.0.1:8080"
@@ -1135,10 +1135,75 @@ function Invoke-AgentPreflightIfNeeded {
   Invoke-Checked -Exe "powershell.exe" -ArgList $args
 }
 
+function Add-RegistrySetValueAuditRule {
+  param([Parameter(Mandatory = $true)][string]$LiteralPath)
+  if (-not (Test-Path -LiteralPath $LiteralPath)) { return $false }
+
+  $security = Get-Acl -LiteralPath $LiteralPath -Audit -ErrorAction Stop
+  $worldSid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList "S-1-1-0"
+  $rules = @($security.GetAuditRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+  foreach ($existing in $rules) {
+    if ($existing.IdentityReference.Value -eq $worldSid.Value -and
+        (($existing.RegistryRights -band [Microsoft.Win32.RegistryRights]::SetValue) -ne 0) -and
+        (($existing.AuditFlags -band [System.Security.AccessControl.AuditFlags]::Success) -ne 0)) {
+      return $false
+    }
+  }
+  $rule = New-Object System.Security.AccessControl.RegistryAuditRule -ArgumentList @(
+    $worldSid,
+    [Microsoft.Win32.RegistryRights]::SetValue,
+    [System.Security.AccessControl.InheritanceFlags]::None,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AuditFlags]::Success
+  )
+  $security.AddAuditRule($rule)
+  Set-Acl -LiteralPath $LiteralPath -AclObject $security -ErrorAction Stop
+  return $true
+}
+
+function Enable-RegistryValueAuditing {
+  $paths = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($subkey in @(
+    "Software\Microsoft\Windows\CurrentVersion\Run",
+    "Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    "Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+  )) {
+    $paths.Add("Registry::HKEY_LOCAL_MACHINE\$subkey") | Out-Null
+  }
+  foreach ($profile in @(Get-ChildItem -LiteralPath "Registry::HKEY_USERS" -ErrorAction SilentlyContinue)) {
+    $sid = [string]$profile.PSChildName
+    if ($sid -notmatch '^S-1-5-' -or $sid -like '*_Classes') { continue }
+    $paths.Add("Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Run") | Out-Null
+    $paths.Add("Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\RunOnce") | Out-Null
+  }
+
+  $configured = 0
+  $available = 0
+  $failures = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($path in $paths) {
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    $available++
+    try {
+      if (Add-RegistrySetValueAuditRule -LiteralPath $path) { $configured++ }
+    } catch {
+      $failures.Add("$path ($($_.Exception.Message))") | Out-Null
+    }
+  }
+  if ($available -eq 0) {
+    throw "none of the monitored Windows Run/RunOnce registry keys exists"
+  }
+  if ($failures.Count -gt 0) {
+    throw ("failed to configure registry value audit SACL on {0} monitored key(s): {1}" -f
+      $failures.Count, ($failures -join '; '))
+  }
+  return [pscustomobject]@{ Available = $available; Configured = $configured }
+}
+
 function Enable-WindowsSensorPolicy {
   if ((Get-EnrollOs) -ne "windows") { return }
   if (-not (Test-IsElevated)) {
-    Write-Warning "ConfigureSensorPolicy skipped: run the installer as Administrator to enable command line audit and PowerShell ScriptBlock telemetry"
+    Write-Warning "ConfigureSensorPolicy skipped: run the installer as Administrator to enable command line, Registry 4657, and PowerShell ScriptBlock telemetry"
     return
   }
 
@@ -1148,9 +1213,19 @@ function Enable-WindowsSensorPolicy {
       Invoke-Checked -Exe $auditpol.Source -ArgList @("/set", "/subcategory:{0CCE922B-69AE-11D9-BED3-505054503030}", "/success:enable")
     } catch {
       Write-Warning ("failed to enable Process Creation audit policy: " + $_)
+      if ($StrictHealthCheck) { throw }
+    }
+    try {
+      Invoke-Checked -Exe $auditpol.Source -ArgList @("/set", "/subcategory:{0CCE921E-69AE-11D9-BED3-505054503030}", "/success:enable")
+    } catch {
+      Write-Warning ("failed to enable Registry audit policy: " + $_)
+      if ($StrictHealthCheck) { throw }
     }
   } else {
-    Write-Warning "auditpol.exe not found; Security 4688 process creation audit was not enabled"
+    Write-Warning "auditpol.exe not found; Security 4688 process creation and 4657 registry auditing were not enabled"
+    if ($StrictHealthCheck) {
+      throw "auditpol.exe is required by strict Windows sensor health"
+    }
   }
 
   try {
@@ -1162,9 +1237,11 @@ function Enable-WindowsSensorPolicy {
     New-Item -Path $psKey -Force | Out-Null
     New-ItemProperty -Path $psKey -Name "EnableScriptBlockLogging" -Value 1 -PropertyType DWord -Force | Out-Null
 
-    Write-Host "Configured Windows sensor policy: Security 4688 command line + PowerShell ScriptBlock logging"
+    $registryAudit = Enable-RegistryValueAuditing
+    Write-Host ("Configured Windows sensor policy: Security 4688 command line + 4657 registry auditing on {0} monitored key(s) + PowerShell ScriptBlock logging" -f $registryAudit.Available)
   } catch {
     Write-Warning ("failed to configure Windows sensor policy: " + $_)
+    if ($StrictHealthCheck) { throw }
   }
 }
 

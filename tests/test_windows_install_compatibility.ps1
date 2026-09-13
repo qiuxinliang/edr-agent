@@ -125,6 +125,58 @@ try {
     Assert-InstallTest (-not ($tlsAfter -match "Tls$|Tls11")) "old .NET does not enable TLS 1.0 or TLS 1.1"
   }
 
+  & {
+    $script:testSensorPolicyCalls = New-Object 'System.Collections.Generic.List[string]'
+    $script:testRegistryAuditCalls = 0
+    function Get-EnrollOs { return "windows" }
+    function Test-IsElevated { return $true }
+    function Get-Command { return [pscustomobject]@{ Source = "auditpol.exe" } }
+    function Invoke-Checked {
+      param([string]$Exe, [object[]]$ArgList)
+      $script:testSensorPolicyCalls.Add(($ArgList -join " ")) | Out-Null
+    }
+    function Enable-RegistryValueAuditing {
+      $script:testRegistryAuditCalls++
+      return [pscustomobject]@{ Available = 4; Configured = 4 }
+    }
+    function New-Item { param([string]$Path, [switch]$Force) }
+    function New-ItemProperty {
+      param([string]$Path, [string]$Name, [object]$Value, [object]$PropertyType, [switch]$Force)
+    }
+    Enable-WindowsSensorPolicy
+    Assert-InstallTest ($script:testSensorPolicyCalls.Count -eq 2) "sensor policy configures exactly process and registry audit categories"
+    Assert-InstallTest ($script:testSensorPolicyCalls[0] -match '0CCE922B') "sensor policy enables Process Creation audit"
+    Assert-InstallTest ($script:testSensorPolicyCalls[1] -match '0CCE921E') "sensor policy enables Registry audit"
+    Assert-InstallTestEqual $script:testRegistryAuditCalls 1 "sensor policy configures monitored Run-key SACLs"
+  }
+
+  & {
+    $StrictHealthCheck = $true
+    function Get-EnrollOs { return "windows" }
+    function Test-IsElevated { return $true }
+    function Get-Command { return [pscustomobject]@{ Source = "auditpol.exe" } }
+    function Invoke-Checked {
+      param([string]$Exe, [object[]]$ArgList)
+      if (($ArgList -join " ") -match '0CCE921E') {
+        throw "simulated Registry audit policy failure"
+      }
+    }
+    function Enable-RegistryValueAuditing {
+      return [pscustomobject]@{ Available = 4; Configured = 4 }
+    }
+    function New-Item { param([string]$Path, [switch]$Force) }
+    function New-ItemProperty {
+      param([string]$Path, [string]$Name, [object]$Value, [object]$PropertyType, [switch]$Force)
+    }
+    $strictAuditFailed = $false
+    try {
+      Enable-WindowsSensorPolicy
+    } catch {
+      $strictAuditFailed = $_.Exception.Message -match 'simulated Registry audit policy failure'
+    }
+    Assert-InstallTest $strictAuditFailed "strict sensor health rejects missing Registry audit policy"
+  }
+
   $defaultEncoding = [Text.Encoding]::Default
   $nativeFixtureText = "certreq: caf$([char]0xE9)"
   [IO.File]::WriteAllBytes($nativeOutputPath, $defaultEncoding.GetBytes($nativeFixtureText))

@@ -204,7 +204,13 @@ static EdrEvidenceCacheStatus s_status;
 static uint64_t s_last_maintenance_ns;
 static int64_t s_write_budget_minute;
 static uint32_t s_write_budget_count;
-static uint32_t s_write_budget_context_count;
+static uint32_t s_write_budget_critical_context_count;
+static uint32_t s_write_budget_ordinary_context_count;
+
+typedef enum {
+  EVIDENCE_WRITE_CRITICAL_CONTEXT = 0,
+  EVIDENCE_WRITE_ORDINARY_CONTEXT = 1,
+} EvidenceWriteClass;
 
 #define EDR_EVIDENCE_CACHE_LOCK_HIST_BUCKETS 64u
 
@@ -2023,10 +2029,69 @@ static int sqlite_size_budget_allow(void) {
   return 0;
 }
 
-static int sqlite_write_budget_allow(uint32_t units, int64_t ts, int candidate) {
-  uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
-                                   80u, 0u, 100000u);
-  if (limit == 0u) {
+typedef struct {
+  uint32_t base;
+  uint32_t critical_context;
+  uint32_t ordinary_context;
+  uint32_t total;
+} EvidenceWriteBudgetLimits;
+
+static uint32_t write_budget_scaled(uint32_t value, uint32_t multiplier) {
+  return value > 100000u / multiplier ? 100000u : value * multiplier;
+}
+
+static EvidenceWriteBudgetLimits sqlite_write_budget_limits(void) {
+  EvidenceWriteBudgetLimits limits;
+  memset(&limits, 0, sizeof(limits));
+  limits.base = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
+                                80u, 0u, 100000u);
+  if (limits.base == 0u) {
+    return limits;
+  }
+  /* The default base remains 80 for compatibility. Generic file-read context
+   * gets 40 writes/minute, so the observed ~946/min ordinary flood is shed
+   * early. Action/ancestry context gets an independent 160/minute reservation;
+   * neither pool can consume the other's capacity. */
+  limits.critical_context = env_u32_clamped(
+      "EDR_EVIDENCE_CACHE_CRITICAL_CONTEXT_WRITE_BUDGET_PER_MIN",
+      write_budget_scaled(limits.base, 2u), 1u, 100000u);
+  limits.ordinary_context = env_u32_clamped(
+      "EDR_EVIDENCE_CACHE_ORDINARY_CONTEXT_WRITE_BUDGET_PER_MIN",
+      limits.base / 2u ? limits.base / 2u : 1u, 1u, 100000u);
+  limits.total = limits.critical_context + limits.ordinary_context;
+  return limits;
+}
+
+static uint32_t *sqlite_write_budget_counter(EvidenceWriteClass write_class) {
+  switch (write_class) {
+  case EVIDENCE_WRITE_CRITICAL_CONTEXT:
+    return &s_write_budget_critical_context_count;
+  case EVIDENCE_WRITE_ORDINARY_CONTEXT:
+    return &s_write_budget_ordinary_context_count;
+  default:
+    return NULL;
+  }
+}
+
+static uint32_t sqlite_write_budget_class_limit(const EvidenceWriteBudgetLimits *limits,
+                                                EvidenceWriteClass write_class) {
+  if (!limits) {
+    return 0u;
+  }
+  switch (write_class) {
+  case EVIDENCE_WRITE_CRITICAL_CONTEXT:
+    return limits->critical_context;
+  case EVIDENCE_WRITE_ORDINARY_CONTEXT:
+    return limits->ordinary_context;
+  default:
+    return 0u;
+  }
+}
+
+static int sqlite_write_budget_allow(uint32_t units, int64_t ts,
+                                     EvidenceWriteClass write_class) {
+  EvidenceWriteBudgetLimits limits = sqlite_write_budget_limits();
+  if (limits.base == 0u) {
     return 1;
   }
   if (units == 0u) {
@@ -2036,33 +2101,36 @@ static int sqlite_write_budget_allow(uint32_t units, int64_t ts, int candidate) 
   if (minute != s_write_budget_minute) {
     s_write_budget_minute = minute;
     s_write_budget_count = 0u;
-    s_write_budget_context_count = 0u;
+    s_write_budget_critical_context_count = 0u;
+    s_write_budget_ordinary_context_count = 0u;
   }
-  /* The minute rate limit applies to optional context fan-out only.  P0/P1
-   * candidates remain subject to the durable size limit and transaction
-   * failures, but telemetry pressure must not turn an alert into a soft-rate
-   * drop. */
-  uint32_t context_limit = limit / 2u;
-  if (!candidate && (s_write_budget_count >= limit || units > limit - s_write_budget_count ||
-                     s_write_budget_context_count >= context_limit ||
-                     units > context_limit - s_write_budget_context_count)) {
+  uint32_t *class_count = sqlite_write_budget_counter(write_class);
+  uint32_t class_limit = sqlite_write_budget_class_limit(&limits, write_class);
+  if (!class_count || class_limit == 0u || *class_count >= class_limit ||
+      units > class_limit - *class_count) {
     s_status.write_budget_dropped++;
     s_status.write_budget_context_dropped++;
-    set_error("evidence cache write budget exceeded");
+    if (write_class == EVIDENCE_WRITE_CRITICAL_CONTEXT) {
+      s_status.write_budget_critical_context_dropped++;
+      set_error("evidence cache critical context write budget exceeded");
+    } else {
+      s_status.write_budget_ordinary_context_dropped++;
+      set_error("evidence cache ordinary context write budget exceeded");
+    }
     return 0;
   }
   s_write_budget_count += units;
-  if (!candidate) s_write_budget_context_count += units;
+  *class_count += units;
   return 1;
 }
 
-/* A reservation becomes consumption only when the enclosing write commits.
- * This keeps an injected/disk commit failure from exhausting the next
- * candidate's minute budget and hiding a retried alert. */
-static void sqlite_write_budget_release(uint32_t units, int64_t ts, int candidate) {
-  uint32_t limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
-                                   80u, 0u, 100000u);
-  if (limit == 0u) {
+/* A context reservation becomes consumption only when its artifact transaction
+ * commits. An injected/disk failure therefore cannot exhaust the pool for a
+ * later context record. */
+static void sqlite_write_budget_release(uint32_t units, int64_t ts,
+                                        EvidenceWriteClass write_class) {
+  EvidenceWriteBudgetLimits limits = sqlite_write_budget_limits();
+  if (limits.base == 0u) {
     return;
   }
   if (units == 0u) {
@@ -2070,9 +2138,10 @@ static void sqlite_write_budget_release(uint32_t units, int64_t ts, int candidat
   }
   int64_t minute = (ts / 1000000000LL) / 60LL;
   if (minute == s_write_budget_minute && s_write_budget_count >= units) {
+    uint32_t *class_count = sqlite_write_budget_counter(write_class);
     s_write_budget_count -= units;
-    if (!candidate && s_write_budget_context_count >= units) {
-      s_write_budget_context_count -= units;
+    if (class_count && *class_count >= units) {
+      *class_count -= units;
     }
   }
 }
@@ -3224,7 +3293,8 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_last_maintenance_ns = 0u;
   s_write_budget_minute = 0;
   s_write_budget_count = 0u;
-  s_write_budget_context_count = 0u;
+  s_write_budget_critical_context_count = 0u;
+  s_write_budget_ordinary_context_count = 0u;
   s_status.max_db_mb = max_db_mb ? max_db_mb : 128u;
   s_status.retention_hours = retention_hours ? retention_hours : 24u;
   copy_s(s_status.path, sizeof(s_status.path), (path && path[0]) ? path : "local_evidence_cache.db");
@@ -3534,6 +3604,19 @@ static int evidence_has_priority_or_high_confidence_context(const EdrBehaviorRec
          evidence_contains_ci(r->detection_context, "\"confidence\":0.8") ||
          evidence_contains_ci(r->detection_context, "\"confidence\":0.9") ||
          evidence_contains_ci(r->detection_context, "\"confidence\":1");
+}
+
+/* Generic reads can dominate a live context window without adding process
+ * ancestry or action evidence.  They retain a bounded best-effort pool while
+ * process, registry, network, file mutation, and explicitly high-confidence
+ * records consume a separate alert-context reservation. */
+static EvidenceWriteClass evidence_context_write_class(const EdrBehaviorRecord *r) {
+  if (r && r->type == EDR_EVENT_FILE_READ &&
+      !evidence_has_priority_or_high_confidence_context(r) &&
+      !evidence_text_has_high_signal(r)) {
+    return EVIDENCE_WRITE_ORDINARY_CONTEXT;
+  }
+  return EVIDENCE_WRITE_CRITICAL_CONTEXT;
 }
 
 static int evidence_is_file_event(EdrEventType t) {
@@ -3870,6 +3953,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       : context_window_matches(r, ts, context_candidate_ids,
                                EDR_EVIDENCE_CONTEXT_WINDOWS);
   int store_context = context_candidate_count != 0u;
+  EvidenceWriteClass context_write_class = evidence_context_write_class(r);
   uint32_t pre_count = 0;
   int64_t post_until_ns = 0;
   if (store_candidate) {
@@ -3909,7 +3993,6 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
 #if defined(EDR_HAVE_SQLITE)
   if (store_candidate) {
     int candidate_existing = candidate_reused;
-    int candidate_budget_reserved = 0;
     if (!s_db) {
       s_status.candidate_rejected++;
       s_status.records_dropped++;
@@ -3931,19 +4014,18 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     }
     if (!candidate_existing) {
       s_status.candidate_admission_attempts++;
-      if (!sqlite_size_budget_allow() || !sqlite_write_budget_allow(2u, ts, 1)) {
+      /* P0/P1 candidates are deliberately outside the telemetry-rate budget.
+       * Durable size/retention and transaction outcomes remain authoritative
+       * resource and failure bounds. */
+      if (!sqlite_size_budget_allow()) {
         s_status.candidate_rejected++;
         s_status.records_dropped++;
         context_ring_capture(r);
         s_status.hot_ring_ingested++;
         goto done;
       }
-      candidate_budget_reserved = 1;
     }
     if (sqlite_record_candidate(r, candidate_id, pre_count, post_until_ns) != 0) {
-      if (candidate_budget_reserved) {
-        sqlite_write_budget_release(2u, ts, 1);
-      }
       s_status.candidate_rejected++;
       s_status.candidate_transaction_failures++;
       s_status.records_dropped++;
@@ -3967,11 +4049,13 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
      * separately budgeted context bundle cannot be admitted. */
     if (context_candidate_count > 0u) {
       if (!sqlite_size_budget_allow() ||
-          !sqlite_write_budget_allow(context_candidate_count, ts, 0)) {
+          !sqlite_write_budget_allow(context_candidate_count, ts,
+                                     context_write_class)) {
         s_status.records_dropped++;
       } else if (sqlite_record_context_artifacts(r, context_candidate_ids,
                                                   context_candidate_count) != 0) {
-        sqlite_write_budget_release(context_candidate_count, ts, 0);
+        sqlite_write_budget_release(context_candidate_count, ts,
+                                    context_write_class);
         s_status.records_dropped++;
       } else {
         s_status.artifacts_written += context_candidate_count;
@@ -3982,13 +4066,15 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     s_status.hot_ring_ingested++;
     ring_record(r);
     if (!sqlite_size_budget_allow() ||
-        !sqlite_write_budget_allow(context_candidate_count, ts, 0)) {
+        !sqlite_write_budget_allow(context_candidate_count, ts,
+                                   context_write_class)) {
       s_status.records_dropped++;
       goto done;
     }
     if (sqlite_record_context_artifacts(r, context_candidate_ids,
                                         context_candidate_count) != 0) {
-      sqlite_write_budget_release(context_candidate_count, ts, 0);
+      sqlite_write_budget_release(context_candidate_count, ts,
+                                  context_write_class);
       s_status.records_dropped++;
       goto done;
     }
@@ -4004,6 +4090,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   (void)candidate_id;
   (void)context_candidate_ids;
   (void)context_candidate_count;
+  (void)context_write_class;
   (void)pre_count;
   (void)post_until_ns;
   if (store_candidate) {
@@ -4061,8 +4148,18 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   evidence_cache_lock();
   EdrEvidenceCacheStatus st = s_status;
   st.write_budget_used = s_write_budget_count;
-  st.write_budget_limit = env_u32_clamped("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN",
-                                          80u, 0u, 100000u);
+#if defined(EDR_HAVE_SQLITE)
+  EvidenceWriteBudgetLimits write_limits = sqlite_write_budget_limits();
+  st.write_budget_base_limit = write_limits.base;
+  st.write_budget_limit = write_limits.total;
+  st.write_budget_critical_context_used = s_write_budget_critical_context_count;
+  st.write_budget_critical_context_limit = write_limits.critical_context;
+  st.write_budget_ordinary_context_used = s_write_budget_ordinary_context_count;
+  st.write_budget_ordinary_context_limit = write_limits.ordinary_context;
+#else
+  st.write_budget_base_limit = env_u32_clamped(
+      "EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", 80u, 0u, 100000u);
+#endif
   const EvidenceCacheLockTiming *lock_timing = &s_evidence_cache_lock_timing;
   st.mutex_lock_samples = lock_timing->samples;
   st.mutex_wait_total_ns = lock_timing->wait_total_ns;
@@ -4951,7 +5048,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
-           "\"candidate_deduped\":%llu,\"candidate_dedup_reject_reasons\":{\"scope\":\"comparable_slot_checks\",\"overlapping\":true,\"generation_conflict\":%llu,\"source_shape\":%llu,\"semantic_mismatch\":%llu,\"skew\":%llu},\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
+           "\"candidate_deduped\":%llu,\"candidate_dedup_reject_reasons\":{\"scope\":\"comparable_slot_checks\",\"overlapping\":true,\"generation_conflict\":%llu,\"source_shape\":%llu,\"semantic_mismatch\":%llu,\"skew\":%llu},\"candidate_admission\":{\"reuse_scope\":\"local_in_process_evidence\",\"requests\":%llu,\"reused\":%llu,\"attempts\":%llu,\"admitted\":%llu,\"rejected\":%llu,\"transaction_failures\":%llu},\"bounded_string_truncations\":%llu,\"manifest_rejections\":%llu,\"write_budget_dropped\":%llu,\"write_budget\":{\"scope\":\"context_only\",\"used\":%u,\"limit\":%u,\"base_limit\":%u,\"dropped\":%llu,\"candidate\":{\"mode\":\"exempt\",\"dropped\":%llu},\"critical_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},\"ordinary_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},\"context_dropped\":%llu},"
            "\"process_cache\":{\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"used\":%u,\"capacity\":%u},"
            "\"identity\":{\"observations_total\":%llu,\"none\":%llu,\"hits\":%llu,\"misses\":%llu,\"enrich_attempts\":%llu,\"upgrades\":%llu,\"stale_rejects\":%llu,\"generation_unknown_rejects\":%llu,\"generation_mismatch_rejects\":%llu,\"generation_unknown_update_rejects\":%llu,\"generation_mismatch_update_rejects\":%llu,\"generation_resets\":%llu,\"late_generation_rejects\":%llu,\"target_4688\":%llu,\"creator_fallback\":%llu,\"token_sid\":%llu},"
            "\"db_budget_dropped\":%llu,\"pressure_dropped\":%llu,"
@@ -4988,9 +5085,15 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.bounded_string_truncations,
            (unsigned long long)st.manifest_rejections,
            (unsigned long long)st.write_budget_dropped,
-           st.write_budget_used, st.write_budget_limit,
+           st.write_budget_used, st.write_budget_limit, st.write_budget_base_limit,
            (unsigned long long)st.write_budget_dropped,
            (unsigned long long)st.write_budget_candidate_dropped,
+           st.write_budget_critical_context_used,
+           st.write_budget_critical_context_limit,
+           (unsigned long long)st.write_budget_critical_context_dropped,
+           st.write_budget_ordinary_context_used,
+           st.write_budget_ordinary_context_limit,
+           (unsigned long long)st.write_budget_ordinary_context_dropped,
            (unsigned long long)st.write_budget_context_dropped,
            (unsigned long long)st.process_cache_hits, (unsigned long long)st.process_cache_misses,
            (unsigned long long)st.process_cache_evictions, st.process_slots_used, st.process_slots_capacity,

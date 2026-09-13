@@ -648,6 +648,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   struct timespec ts;
   EdrBehaviorRecord candidate;
   EdrBehaviorRecord context;
+  EdrBehaviorRecord critical_context;
   EdrEvidenceCacheStatus status;
   int64_t base;
 
@@ -674,13 +675,34 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
 
   context = candidate;
   context.priority = 1u;
-  context.net_dport = 80u;
+  context.type = EDR_EVENT_FILE_READ;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
   snprintf(context.process_name, sizeof(context.process_name), "telemetry.exe");
   snprintf(context.cmdline, sizeof(context.cmdline), "telemetry.exe --context");
+  snprintf(context.file_path, sizeof(context.file_path), "C:\\Data\\ordinary.txt");
+  assert(edr_local_evidence_cache_is_candidate(&context) == 0);
   for (unsigned i = 0u; i < 6u; ++i) {
     context.event_time_ns = base + (int64_t)(i + 1u) * 1000000LL;
     snprintf(context.event_id, sizeof(context.event_id), "budget-context-%u", i);
     edr_local_evidence_cache_record_behavior(&context);
+  }
+
+  critical_context = candidate;
+  critical_context.priority = 1u;
+  critical_context.type = EDR_EVENT_PROCESS_CREATE;
+  critical_context.net_dst[0] = '\0';
+  critical_context.net_dport = 0u;
+  snprintf(critical_context.process_name, sizeof(critical_context.process_name),
+           "parent-helper.exe");
+  snprintf(critical_context.cmdline, sizeof(critical_context.cmdline),
+           "parent-helper.exe --benign");
+  assert(edr_local_evidence_cache_is_candidate(&critical_context) == 0);
+  for (unsigned i = 0u; i < 18u; ++i) {
+    critical_context.event_time_ns = base + 8000000LL + (int64_t)i * 100000LL;
+    snprintf(critical_context.event_id, sizeof(critical_context.event_id),
+             "budget-critical-context-%u", i);
+    edr_local_evidence_cache_record_behavior(&critical_context);
   }
 
   candidate.pid = 74102u;
@@ -689,7 +711,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   candidate.process_creation_filetime_100ns = UINT64_C(133700000000074102);
   snprintf(candidate.event_id, sizeof(candidate.event_id), "budget-candidate-b");
   edr_local_evidence_cache_record_behavior(&candidate);
-  for (unsigned i = 0u; i < 4u; ++i) {
+  for (unsigned i = 0u; i < 15u; ++i) {
     candidate.pid = 74103u + i;
     candidate.event_time_ns = base + 11000000LL + (int64_t)i * 1000000LL;
     candidate.process_start_key = UINT64_C(0x74103) + i;
@@ -699,12 +721,27 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   }
 
   edr_local_evidence_cache_get_status(&status);
-  assert(status.write_budget_limit == 8u);
-  assert(status.write_budget_used == 16u);
-  assert(status.write_budget_context_dropped >= 2u);
+  assert(status.write_budget_base_limit == 8u);
+  assert(status.write_budget_limit == 20u);
+  assert(status.write_budget_used == 20u);
+  assert(status.write_budget_critical_context_used == 16u);
+  assert(status.write_budget_critical_context_limit == 16u);
+  assert(status.write_budget_ordinary_context_used == 4u);
+  assert(status.write_budget_ordinary_context_limit == 4u);
+  assert(status.write_budget_context_dropped >= 4u);
+  assert(status.write_budget_ordinary_context_dropped >= 2u);
+  assert(status.write_budget_critical_context_dropped >= 2u);
   assert(status.write_budget_candidate_dropped == 0u);
-  assert(status.candidate_admitted == 6u);
+  assert(status.candidate_admitted == 17u);
   assert(status.candidate_rejected == 0u);
+  assert(status.artifacts_written == 37u);
+
+  char health_json[4096];
+  edr_local_evidence_cache_status_json(health_json, sizeof(health_json));
+  assert(strstr(health_json, "\"scope\":\"context_only\"") != NULL);
+  assert(strstr(health_json, "\"candidate\":{\"mode\":\"exempt\",\"dropped\":0}") != NULL);
+  assert(strstr(health_json, "\"critical_context\":{\"used\":16,\"limit\":16") != NULL);
+  assert(strstr(health_json, "\"ordinary_context\":{\"used\":4,\"limit\":4") != NULL);
 
   edr_local_evidence_cache_close();
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
@@ -774,9 +811,13 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
 
   context = pressure_candidate;
   context.priority = 1u;
-  context.net_dport = 12345u;
+  context.type = EDR_EVENT_FILE_READ;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
   snprintf(context.process_name, sizeof(context.process_name), "telemetry.exe");
   snprintf(context.cmdline, sizeof(context.cmdline), "telemetry.exe --context");
+  snprintf(context.file_path, sizeof(context.file_path), "C:\\Data\\stable-context.txt");
+  assert(edr_local_evidence_cache_is_candidate(&context) == 0);
   for (unsigned i = 0u; i < 4u; ++i) {
     context.event_time_ns = base + 1000000000LL + (int64_t)(i + 1u) * 1000000LL;
     snprintf(context.event_id, sizeof(context.event_id), "stable-context-%u", i);
@@ -793,11 +834,13 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
   edr_local_evidence_cache_get_status(&status);
   assert(status.candidate_requests == 4u && status.candidate_reused == 2u);
   assert(status.candidate_admission_attempts == 2u && status.candidate_admitted == 2u);
-  assert(status.write_budget_used == 6u);
-  assert(status.write_budget_context_dropped >= 2u);
+  assert(status.write_budget_used == 3u);
+  assert(status.write_budget_ordinary_context_used == 3u);
+  assert(status.write_budget_context_dropped >= 1u);
+  assert(status.write_budget_ordinary_context_dropped >= 1u);
   assert(status.write_budget_candidate_dropped == 0u);
   assert(sqlite_table_count(db, "p0_candidates") == 2u);
-  assert(sqlite_table_count(db, "artifacts") == 4u);
+  assert(sqlite_table_count(db, "artifacts") == 5u);
 
   edr_local_evidence_cache_close();
   sqlite_candidate_id_for_source_event(db, "", candidate_id, sizeof(candidate_id));

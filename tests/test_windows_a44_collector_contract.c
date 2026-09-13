@@ -126,6 +126,13 @@ int main(void) {
                          "Windows Agent target must include A4.4 split-path implementation");
   ok &= require_contains(cmake, "src/collector/etw_tdh_win.c",
                          "Windows Agent target must include TDH implementation");
+  ok &= require_contains(cmake, "src/preprocess/process_generation.c",
+                         "Windows Agent target must link native process-generation helpers");
+  ok &= require_before(cmake, "src/preprocess/process_generation.c",
+                       "src/collector/collector_win.c",
+                       "collector and process-generation helper must share EDR_AGENT_SOURCES");
+  ok &= require_contains(cmake, "add_executable(edr_agent ${EDR_AGENT_SOURCES})",
+                         "the Windows product must link the complete authoritative source list");
   ok &= require_contains(collector, "void edr_collector_decode_from_a44_item(",
                          "A4.4 worker callback must have a collector decode bridge");
   ok &= require_contains(collector, "edr_a44_item_to_event_record(item, &event_record)",
@@ -363,6 +370,14 @@ int main(void) {
       "a distinct FileRead failure must be remembered only after the gate accepts it");
   ok &= require_contains(agent, "\\\"write_budget\\\":{\\\"used\\\":%u",
                          "compact acceptance health must expose evidence-cache rate admission loss");
+  ok &= require_contains(agent, "\\\"scope\\\":\\\"context_only\\\"",
+                         "compact acceptance health must identify the minute budget as context-only");
+  ok &= require_contains(agent, "\\\"candidate\\\":{\\\"mode\\\":\\\"exempt\\\"",
+                         "compact acceptance health must expose P0 candidate soft-budget exemption");
+  ok &= require_contains(agent, "\\\"critical_context\\\":{\\\"used\\\":%u",
+                         "compact acceptance health must expose the protected context pool");
+  ok &= require_contains(agent, "\\\"ordinary_context\\\":{\\\"used\\\":%u",
+                         "compact acceptance health must expose ordinary FileRead shedding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_session_starting();",
                          "every new FileKey provider epoch must begin in degraded attribution mode");
   ok &= require_contains(collector, "file_read_metadata_new_session_degraded",
@@ -430,6 +445,52 @@ int main(void) {
                          "Kernel-File must use its bounded provider keyword set");
   ok &= require_contains(collector, "return EDR_KERNEL_PROCESS_PROVIDER_KEYWORDS;",
                          "Kernel-Process must request only process and image keyword classes");
+  ok &= require_contains(collector, "return EDR_KERNEL_NETWORK_PROVIDER_KEYWORDS;",
+                         "Kernel-Network must request its documented IPv4 and IPv6 keyword classes");
+  ok &= require_contains(collector, "edr_kernel_network_connection_descriptor(descriptor)",
+                         "Kernel-Network connection mapping must use stable manifest descriptors");
+  ok &= require_contains(collector, "EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV4 12u",
+                         "Kernel-Network IPv4 connect must use its manifest event id");
+  ok &= require_contains(collector, "EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV6 28u",
+                         "Kernel-Network IPv6 connect must use its manifest event id");
+  ok &= require_contains(collector, "edr_kernel_network_inbound_accept_descriptor(descriptor)",
+                         "inbound accepts must bypass outbound connection mapping");
+  ok &= require_contains(collector, "Connectionaccepted is inbound",
+                         "inbound accept direction must remain explicit and fail closed");
+  ok &= require_before(collector,
+                       "edr_kernel_network_inbound_accept_descriptor(descriptor)",
+                       "TdhGetEventInformation(rec, 0u, NULL, NULL, &info_size)",
+                       "inbound accepts must be rejected before localized TDH fallback");
+  ok &= require_contains(collector, "Kernel-Network provider enable status=%lu",
+                         "Kernel-Network provider setup must be observable at runtime");
+  ok &= require_contains(collector, "Kernel-Network callback observed event_id=%u task=%u opcode=%u",
+                         "the first Kernel-Network callback descriptor must be observable");
+  ok &= require_before(collector,
+                       "edr_kernel_network_connection_descriptor(descriptor)",
+                       "TdhGetEventInformation(rec, 0u, NULL, NULL, &info_size)",
+                       "stable network descriptors must be evaluated before localized TDH names");
+  ok &= require_contains(collector, "edr_process_generation_query_live(process, &live",
+                         "Kernel ProcessStart must capture target generation while the process is live");
+  ok &= require_contains(collector,
+                         "live.creation_filetime_100ns ==\n"
+                         "            process_start.process_creation_filetime_100ns",
+                         "live target generation must match the provider creation FILETIME exactly");
+  ok &= require_contains(collector, "kernel_process_live_verified",
+                         "verified Kernel ProcessStart generation must expose its provenance");
+  ok &= require_contains(collector, "edr_process_command_line_query_live(process, command_line",
+                         "Kernel ProcessStart must capture command line on the same verified handle");
+  ok &= require_contains(collector, "\"live_same_generation\"",
+                         "collector command line must retain the existing exact-generation contract");
+  ok &= require_contains(collector, "edr_collector_requires_live_process_snapshot(event_record, ty)",
+                         "Kernel ProcessStart must bypass queued decode for live handle capture");
+  ok &= require_contains(collector, "Kernel ProcessStart is intentionally decoded on the callback thread",
+                         "the short-lived process timing boundary must remain explicit");
+  ok &= require_order_in_function(
+      collector, "static VOID WINAPI edr_event_record_callback(",
+      "static DWORD WINAPI edr_etw_consumer_thread(",
+      "!edr_collector_requires_live_process_snapshot(event_record, ty)",
+      "edr_collector_decode_mapped_event(event_record, ty, tag, event_ns);",
+      "ProcessStart must select synchronous decode before the shared decoder runs");
   ok &= require_contains(collector, "if (is_kernel_process || is_kernel_file)",
                          "Kernel-File must request its own StartKey extended item");
   ok &= require_contains(collector, "params.EnableProperty = EVENT_ENABLE_PROPERTY_PROCESS_START_KEY;",

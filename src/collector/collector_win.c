@@ -31,6 +31,7 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
+#include "edr/process_generation.h"
 #include "edr/process_tree_cache.h"
 #include "edr/sensor_interest.h"
 #include "edr/sha256.h"
@@ -85,6 +86,7 @@ static volatile LONG s_started;
 static volatile LONG s_stopping;
 static volatile LONG s_consumer_open_ok;
 static volatile LONG s_consumer_running;
+static volatile LONG s_network_first_callback_observed;
 static EdrCollectorHealth s_health;
 static const EdrConfig *s_collector_cfg;
 
@@ -141,6 +143,24 @@ static const EdrConfig *s_collector_cfg;
 #define EDR_KERNEL_PROCESS_KEYWORD_IMAGE 0x00000040ULL
 #define EDR_KERNEL_PROCESS_PROVIDER_KEYWORDS \
   (EDR_KERNEL_PROCESS_KEYWORD_PROCESS | EDR_KERNEL_PROCESS_KEYWORD_IMAGE)
+
+/* Microsoft-Windows-Kernel-Network manifest constants. Connection event
+ * descriptors and keyword masks are stable across localized installations;
+ * TDH display names are not and must remain only a compatibility fallback. */
+#define EDR_KERNEL_NETWORK_TASK_TCPIP 10u
+#define EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV4 12u
+#define EDR_KERNEL_NETWORK_EVENT_RECONNECT_IPV4 16u
+#define EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV6 28u
+#define EDR_KERNEL_NETWORK_EVENT_RECONNECT_IPV6 32u
+#define EDR_KERNEL_NETWORK_OPCODE_CONNECT 12u
+#define EDR_KERNEL_NETWORK_OPCODE_RECONNECT 16u
+#define EDR_KERNEL_NETWORK_EVENT_ACCEPT_IPV4 15u
+#define EDR_KERNEL_NETWORK_EVENT_ACCEPT_IPV6 31u
+#define EDR_KERNEL_NETWORK_OPCODE_ACCEPT 15u
+#define EDR_KERNEL_NETWORK_KEYWORD_IPV4 0x00000010ULL
+#define EDR_KERNEL_NETWORK_KEYWORD_IPV6 0x00000020ULL
+#define EDR_KERNEL_NETWORK_PROVIDER_KEYWORDS \
+  (EDR_KERNEL_NETWORK_KEYWORD_IPV4 | EDR_KERNEL_NETWORK_KEYWORD_IPV6)
 
 typedef struct {
   uint32_t pid;
@@ -482,6 +502,33 @@ static int edr_kernel_file_close_descriptor(const EVENT_DESCRIPTOR *descriptor) 
                                             EDR_KERNEL_FILE_KEYWORD_FILEIO);
 }
 
+static int edr_kernel_network_connection_descriptor(
+    const EVENT_DESCRIPTOR *descriptor) {
+  unsigned id;
+  unsigned opcode;
+  if (!descriptor || descriptor->Task != EDR_KERNEL_NETWORK_TASK_TCPIP) {
+    return 0;
+  }
+  id = (unsigned)descriptor->Id;
+  opcode = (unsigned)descriptor->Opcode;
+  return id == EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV4 ||
+         id == EDR_KERNEL_NETWORK_EVENT_RECONNECT_IPV4 ||
+         id == EDR_KERNEL_NETWORK_EVENT_CONNECT_IPV6 ||
+         id == EDR_KERNEL_NETWORK_EVENT_RECONNECT_IPV6 ||
+         opcode == EDR_KERNEL_NETWORK_OPCODE_CONNECT ||
+         opcode == EDR_KERNEL_NETWORK_OPCODE_RECONNECT;
+}
+
+static int edr_kernel_network_inbound_accept_descriptor(
+    const EVENT_DESCRIPTOR *descriptor) {
+  if (!descriptor || descriptor->Task != EDR_KERNEL_NETWORK_TASK_TCPIP) {
+    return 0;
+  }
+  return descriptor->Id == EDR_KERNEL_NETWORK_EVENT_ACCEPT_IPV4 ||
+         descriptor->Id == EDR_KERNEL_NETWORK_EVENT_ACCEPT_IPV6 ||
+         descriptor->Opcode == EDR_KERNEL_NETWORK_OPCODE_ACCEPT;
+}
+
 static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_kind,
                                            EdrEventType *out_type) {
   const EVENT_DESCRIPTOR *descriptor = &rec->EventHeader.EventDescriptor;
@@ -507,7 +554,16 @@ static int edr_classify_manifest_semantics(PEVENT_RECORD rec, uint8_t provider_k
    * infer a read from a localized Task/EventMessage containing "open" or
    * "create": only Id=Task=15, Opcode=0, FILEIO|READ is a read candidate.
    * The decode path additionally requires its typed FileKey schema. */
-  if (provider_kind == 1u && edr_kernel_file_read_descriptor(descriptor)) {
+  if (provider_kind == 2u &&
+      edr_kernel_network_connection_descriptor(descriptor)) {
+    event_type = EDR_EVENT_NET_CONNECT;
+  } else if (provider_kind == 2u &&
+             edr_kernel_network_inbound_accept_descriptor(descriptor)) {
+    /* Connectionaccepted is inbound. Until the record contract carries a
+     * direction field, do not mislabel it as an outbound connect and do not
+     * let localized TDH text route it through the compatibility fallback. */
+    event_type = 0;
+  } else if (provider_kind == 1u && edr_kernel_file_read_descriptor(descriptor)) {
     event_type = EDR_EVENT_FILE_READ;
   } else if (provider_kind == 1u && edr_kernel_file_write_descriptor(descriptor)) {
     event_type = EDR_EVENT_FILE_WRITE;
@@ -3727,9 +3783,65 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
     (void)edr_collector_slot_append_kv(slot, "event_time_filetime_100ns", value);
   }
   if (is_kernel_process) {
-    /* etw_tdh_win.c already appended the target payload key/create time and
-     * an explicit availability source.  Never overwrite it with the event
-     * header key, which describes the logging process. */
+    EdrBehaviorRecord process_start;
+    EdrLiveProcessGeneration live;
+    char reason[96];
+    HANDLE process = NULL;
+    /* The documented Kernel-Process manifest carries target PID/CreateTime,
+     * but no target ProcessStartKey. EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY
+     * identifies the process logging the event (normally System here).
+     * Never overwrite it with the event header key or relabel it as the
+     * target generation. Query the target while
+     * handling ProcessStart, then require both PID and the provider's exact
+     * creation FILETIME before publishing the returned native StartKey. */
+    edr_behavior_from_slot(slot, &process_start);
+    if (process_start.process_start_key != 0u &&
+        process_start.process_creation_filetime_100ns != 0u) {
+      return;
+    }
+    memset(&live, 0, sizeof(live));
+    reason[0] = '\0';
+    if (process_start.pid != 0u &&
+        process_start.process_creation_filetime_100ns != 0u) {
+      process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                            (DWORD)process_start.pid);
+    }
+    if (process &&
+        edr_process_generation_query_live(process, &live, reason,
+                                          sizeof(reason)) &&
+        live.pid == process_start.pid &&
+        live.creation_filetime_100ns ==
+            process_start.process_creation_filetime_100ns &&
+        live.process_start_key != 0u) {
+      snprintf(value, sizeof(value), "%llu",
+               (unsigned long long)live.process_start_key);
+      (void)edr_collector_slot_append_kv(slot, "process_start_key", value);
+      (void)edr_collector_slot_append_kv(slot, "process_generation_source",
+                                         "kernel_process_live_verified");
+      if (!process_start.cmdline[0]) {
+        char command_line[EDR_BR_STR_LONG];
+        if (edr_process_command_line_query_live(process, command_line,
+                                                sizeof(command_line), reason,
+                                                sizeof(reason))) {
+          (void)edr_collector_slot_append_kv(slot, "cmd", command_line);
+          (void)edr_collector_slot_append_kv(slot, "command_line_origin",
+                                             "live_same_generation");
+        }
+      }
+      CloseHandle(process);
+      return;
+    }
+    if (process) {
+      CloseHandle(process);
+    }
+    s_health.process_start_key_missing_events++;
+    (void)edr_collector_slot_append_kv(
+        slot, "process_generation_source",
+        process_start.process_creation_filetime_100ns == 0u
+            ? "kernel_process_create_time_unavailable"
+            : (process_start.pid == 0u
+                   ? "kernel_process_target_pid_unavailable"
+                   : "kernel_process_live_generation_unavailable"));
     return;
   }
   if (edr_collector_event_process_start_key(record, &start_key)) {
@@ -4383,6 +4495,14 @@ void edr_collector_decode_from_a44_item(const EdrA44QueueItem *item) {
   edr_collector_decode_mapped_event(&event_record, item->ty, item->tag, item->ts_ns);
 }
 
+static int edr_collector_requires_live_process_snapshot(
+    const EVENT_RECORD *event_record, EdrEventType type) {
+  return event_record && type == EDR_EVENT_PROCESS_CREATE &&
+         memcmp(&event_record->EventHeader.ProviderId,
+                &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0 &&
+         event_record->EventHeader.EventDescriptor.Opcode == 1u;
+}
+
 static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   if (!s_bus || !event_record || InterlockedCompareExchange(&s_stopping, 0, 0) != 0) {
     return;
@@ -4393,6 +4513,15 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
   uint64_t event_ns = edr_collector_event_unix_ns(event_record);
   edr_note_provider_callback(provider);
   edr_etw_observability_on_callback(provider_tag);
+  if (memcmp(provider, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0 &&
+      InterlockedCompareExchange(&s_network_first_callback_observed, 1, 0) == 0) {
+    fprintf(stderr,
+            "[collector_win] Kernel-Network callback observed event_id=%u task=%u opcode=%u keywords=0x%llx\n",
+            (unsigned)event_record->EventHeader.EventDescriptor.Id,
+            (unsigned)event_record->EventHeader.EventDescriptor.Task,
+            (unsigned)event_record->EventHeader.EventDescriptor.Opcode,
+            (unsigned long long)event_record->EventHeader.EventDescriptor.Keyword);
+  }
 
   /* Name metadata belongs to the provider-wide FileKey namespace, not the
    * logging process. An Agent-opened file can later be read by another
@@ -4447,7 +4576,8 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
 
   /* The shared decode path resolves exact new-session bindings before it
    * enforces a pending gate, allowing only recovery evidence through here. */
-  if (edr_a44_split_path_enabled()) {
+  if (edr_a44_split_path_enabled() &&
+      !edr_collector_requires_live_process_snapshot(event_record, ty)) {
     EdrA44QueueItem item;
     int reason_sync = 0;
     int packed = edr_a44_item_pack(event_record, event_ns, ty, tag, &item, &reason_sync);
@@ -4462,6 +4592,9 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
     (void)reason_sync;
     edr_a44_note_sync_fallback();
   }
+  /* Kernel ProcessStart is intentionally decoded on the callback thread.
+   * Its target handle may disappear before an A4.4 worker runs, and neither
+   * a later Security 4688 nor a reused PID can recover that exact generation. */
   edr_collector_decode_mapped_event(event_record, ty, tag, event_ns);
 }
 
@@ -4554,6 +4687,9 @@ static ULONGLONG edr_trace_provider_keywords(const GUID *guid) {
   if (guid && memcmp(guid, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     return EDR_KERNEL_FILE_PROVIDER_KEYWORDS;
   }
+  if (guid && memcmp(guid, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
+    return EDR_KERNEL_NETWORK_PROVIDER_KEYWORDS;
+  }
   return 0xFFFFFFFFFFFFFFFFULL;
 }
 
@@ -4564,6 +4700,8 @@ static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
                           memcmp(guid, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0;
   int is_kernel_file = guid &&
                        memcmp(guid, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0;
+  int is_kernel_network = guid &&
+                          memcmp(guid, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0;
   ULONGLONG keywords = edr_trace_provider_keywords(guid);
   if (is_kernel_process || is_kernel_file) {
     memset(&params, 0, sizeof(params));
@@ -4606,8 +4744,15 @@ static ULONG edr_enable_trace_provider(TRACEHANDLE session, const GUID *guid) {
                           edr_trace_provider_level(guid),
                           keywords, 0, 0, NULL);
   }
-  return EnableTraceEx2(session, guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                        edr_trace_provider_level(guid), keywords, 0, 0, NULL);
+  status = EnableTraceEx2(session, guid, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                          edr_trace_provider_level(guid), keywords, 0, 0, NULL);
+  if (is_kernel_network) {
+    fprintf(stderr,
+            "[collector_win] Kernel-Network provider enable status=%lu level=%u keywords=0x%llx\n",
+            (unsigned long)status, (unsigned)edr_trace_provider_level(guid),
+            (unsigned long long)keywords);
+  }
+  return status;
 }
 
 static ULONG edr_enable_providers(TRACEHANDLE session, const EdrConfig *cfg) {
@@ -4698,6 +4843,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   InterlockedExchange(&s_stopping, 0);
+  InterlockedExchange(&s_network_first_callback_observed, 0);
 
   s_bus = bus;
   s_collector_cfg = cfg;

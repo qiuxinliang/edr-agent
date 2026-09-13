@@ -2532,8 +2532,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
         "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
-        "\"write_budget\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu,"
-        "\"candidate_dropped\":%llu,\"context_dropped\":%llu},"
+		"\"write_budget\":{\"used\":%u,\"limit\":%u,\"base_limit\":%u,"
+		"\"scope\":\"context_only\",\"dropped\":%llu,"
+		"\"candidate\":{\"mode\":\"exempt\",\"dropped\":%llu},"
+		"\"critical_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
+		"\"ordinary_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
+		"\"context_dropped\":%llu},"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
         "\"max_db_mb\":%u},"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
@@ -2706,10 +2710,17 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.candidate_reused,
         (unsigned long long)evidence_status.candidate_admitted,
         (unsigned long long)evidence_status.candidate_rejected,
-        evidence_status.write_budget_used, evidence_status.write_budget_limit,
-        (unsigned long long)evidence_status.write_budget_dropped,
-        (unsigned long long)evidence_status.write_budget_candidate_dropped,
-        (unsigned long long)evidence_status.write_budget_context_dropped,
+		evidence_status.write_budget_used, evidence_status.write_budget_limit,
+		evidence_status.write_budget_base_limit,
+		(unsigned long long)evidence_status.write_budget_dropped,
+		(unsigned long long)evidence_status.write_budget_candidate_dropped,
+		evidence_status.write_budget_critical_context_used,
+		evidence_status.write_budget_critical_context_limit,
+		(unsigned long long)evidence_status.write_budget_critical_context_dropped,
+		evidence_status.write_budget_ordinary_context_used,
+		evidence_status.write_budget_ordinary_context_limit,
+		(unsigned long long)evidence_status.write_budget_ordinary_context_dropped,
+		(unsigned long long)evidence_status.write_budget_context_dropped,
         (unsigned long long)evidence_status.p0_candidate_rows,
         (unsigned long long)evidence_status.db_bytes,
         (unsigned long long)evidence_status.wal_bytes, evidence_status.max_db_mb,
