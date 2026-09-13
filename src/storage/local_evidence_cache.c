@@ -400,6 +400,7 @@ static void json_escape(char *dst, size_t cap, const char *s);
 static void appendf(char *out, size_t cap, size_t *off, const char *fmt, ...);
 static uint32_t evidence_context_window_s(void);
 static int ring_related_to_record(const RingSlot *s, const EdrBehaviorRecord *r);
+static int same_ci(const char *a, const char *b);
 
 static void set_error(const char *msg) {
   snprintf(s_status.last_error, sizeof(s_status.last_error), "%s", msg ? msg : "");
@@ -490,6 +491,36 @@ static int generation_from_snapshot(uint32_t pid, int64_t event_time_ns,
   return 1;
 }
 
+/* A timestamp can select a stale, still-open process-tree generation when an
+ * exit notification was lost. A source record without its own generation may
+ * use that snapshot only when it independently names the same actor image.
+ * This prevents a reused PID's new display fields from being persisted with
+ * the old process StartKey/creation FILETIME. */
+static int generation_from_matching_record_snapshot(
+    const EdrBehaviorRecord *r, EvidenceProcessGeneration *out) {
+  ProcessTreeEntry entry;
+  const char *record_path;
+  if (!r || !out || r->pid == 0u || r->event_time_ns <= 0 ||
+      edr_pt_cache_snapshot_at(r->pid, (uint64_t)r->event_time_ns, &entry) != 0 ||
+      entry.process_start_key == 0u || entry.creation_filetime_100ns == 0u) {
+    return 0;
+  }
+  record_path = r->image_path_canonical[0] ? r->image_path_canonical : r->exe_path;
+  if (record_path[0] && entry.exe_path[0]) {
+    if (!same_ci(record_path, entry.exe_path)) return 0;
+  }
+  if (r->process_name[0] && entry.process_name[0]) {
+    if (!same_ci(r->process_name, entry.process_name)) return 0;
+  }
+  /* Metadata-only observations cannot overwrite image display fields and
+   * retain the existing event-time fallback contract. Any independently
+   * reported image field, however, must agree with the selected generation. */
+  out->process_start_key = entry.process_start_key;
+  out->creation_filetime_100ns = entry.creation_filetime_100ns;
+  out->start_time_ns = entry.start_time_ns;
+  return 1;
+}
+
 /* Source-record generation wins when present; the historical process-tree
  * snapshot is an event-time fallback, never a current-PID lookup.  A partial
  * source tuple is deliberately not upgraded from another source. */
@@ -516,7 +547,7 @@ static int record_process_generation(const EdrBehaviorRecord *r,
     }
     return 1;
   }
-  return generation_from_snapshot(r->pid, r->event_time_ns, out);
+  return generation_from_matching_record_snapshot(r, out);
 }
 
 static int record_parent_generation(const EdrBehaviorRecord *r,
@@ -537,7 +568,7 @@ static const char *record_process_generation_source(const EdrBehaviorRecord *r) 
   if (r->process_start_key != 0u && r->process_creation_filetime_100ns != 0u) {
     return r->process_generation_source[0] ? r->process_generation_source : "source_record_tuple";
   }
-  return generation_from_snapshot(r->pid, r->event_time_ns, &generation)
+  return record_process_generation(r, &generation)
              ? "process_tree_snapshot"
              : "";
 }

@@ -367,6 +367,14 @@ int main(void) {
       pipeline,
       "strcmp(requested.hash_reason, \"identity_revalidation_pending\") == 0",
       "preprocess must wait only when the requested file object has work in flight");
+  ok &= require_contains(
+      pipeline,
+      "br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ &&\n       !br->kernel_file_activity",
+      "P0 file create/write sources must enter actor-image evidence collection");
+  ok &= require_contains(
+      pipeline,
+      "br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br)",
+      "ordinary file traffic must not spend the bounded evidence wait");
   ok &= require_absent(
       pipeline,
       "(void)edr_process_evidence_request(br->image_path_canonical",

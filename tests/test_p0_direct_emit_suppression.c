@@ -762,6 +762,14 @@ static void test_real_p0_dedup_metric_matrix(void) {
   snprintf(r.cmdline, sizeof(r.cmdline), "dedup-test.exe --source-b");
   edr_p0_rule_try_emit(&r); assert(g_emit_count==2);
   assert(strstr(g_last_alert.user_subject_json, "dedup-source-b"));
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"process_start_key\":\"16962\""));
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"process_creation_filetime_100ns\":\"1\""));
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"canonical_image_path\":\"C:\\\\Test\\\\dedup-test.exe\""));
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"file_identity\":\"win-fileid-v1:0000000000004242:0123456789abcdef0123456789abcdef\""));
   /* Only an exact source-ID + semantic-payload replay is suppressed. */
   edr_p0_rule_try_emit(&r); assert(g_emit_count==2);
   EdrP0DedupMetrics m; edr_p0_rule_get_dedup_metrics(&m);
@@ -1457,6 +1465,12 @@ static void test_p0_user_subject_overflow_degrades_without_losing_alert(void) {
   assert(strstr(g_last_alert.user_subject_json, "\"source_event_id\":\"source-event-\\\"\\\\\\\\-id\"") != NULL);
   assert(strstr(g_last_alert.user_subject_json, "\"user_sid\":\"S-1-5-21-quoted\\\\\\\\sid\"") != NULL);
   assert(strstr(g_last_alert.user_subject_json, "\"identity_quality\":\"target_4688\"") != NULL);
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"process_start_key\":\"16962\"") != NULL);
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"process_creation_filetime_100ns\":\"1\"") != NULL);
+  assert(strstr(g_last_alert.user_subject_json,
+                "\"file_identity\":\"win-fileid-v1:0000000000004242:0123456789abcdef0123456789abcdef\"") != NULL);
   assert(strstr(g_last_alert.user_subject_json, "powershell_script_block") == NULL);
   assert(strcmp(g_last_alert.process_path, "[omitted: exceeds ABI field]") == 0);
   assert(strcmp(g_last_alert.cmdline, "[omitted: exceeds ABI field]") == 0);

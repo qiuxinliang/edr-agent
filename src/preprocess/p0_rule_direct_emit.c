@@ -360,6 +360,8 @@ static int p0_source_semantic_sha256(const EdrBehaviorRecord *br, char *out, siz
 }
 
 /* Defined with the terminal JSON helpers below. */
+static int p0_context_reported_file_identity(const char *context, char *out,
+                                             size_t out_cap);
 static int p0_context_file_identity(const char *context, char *out, size_t out_cap);
 
 static void p0_terminal_commit_text(EdrSha256Ctx *ctx, const char *text) {
@@ -2780,14 +2782,14 @@ int edr_p0_rule_test_build_source_only_delivery_record(
 }
 #endif
 
-static int p0_context_file_identity(const char *context, char *out, size_t out_cap) {
+static int p0_context_reported_file_identity(const char *context, char *out,
+                                             size_t out_cap) {
   static const char field[] = "\"file_identity\":\"";
   const char *value;
   const char *end;
   size_t len;
   if (out && out_cap > 0u) out[0] = '\0';
   if (!context || !out || out_cap < EDR_WINDOWS_FILE_IDENTITY_V1_CAP) return 0;
-  if (!edr_p0_artifact_identity_is_action_authoritative(context)) return 0;
   value = strstr(context, field);
   if (!value) return 0;
   value += sizeof(field) - 1u;
@@ -2798,6 +2800,14 @@ static int p0_context_file_identity(const char *context, char *out, size_t out_c
   memcpy(out, value, len);
   out[len] = '\0';
   return edr_windows_file_identity_valid(out);
+}
+
+static int p0_context_file_identity(const char *context, char *out, size_t out_cap) {
+  if (!edr_p0_artifact_identity_is_action_authoritative(context)) {
+    if (out && out_cap > 0u) out[0] = '\0';
+    return 0;
+  }
+  return p0_context_reported_file_identity(context, out, out_cap);
 }
 
 typedef struct p0_enforcement_prepare {
@@ -3476,6 +3486,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_title[640];
     char esc_proc[384];
     char esc_exe[1024];
+    char esc_canonical_image[1024];
+    char reported_file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
+    char esc_file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP * 2u];
+    char process_start_key_json[40];
+    char process_creation_filetime_json[40];
     char cmdline_esc[2048];
     char esc_exe_hash[160];
     char esc_path_hash[160];
@@ -3507,6 +3522,9 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_creator_sid[320], esc_creator_logon[96], esc_identity_source[64], esc_identity_quality[64], esc_event_id[96];
     char parent_name_buf[sizeof(br->parent_name)];
     char parent_path_buf[sizeof(br->parent_path)];
+    const char *canonical_image_path = br->image_path_canonical[0]
+                                           ? br->image_path_canonical
+                                           : alert_process_path;
 
     snprintf(parent_name_buf, sizeof(parent_name_buf), "%s", br->parent_name);
     snprintf(parent_path_buf, sizeof(parent_path_buf), "%s", br->parent_path);
@@ -3523,6 +3541,27 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     p0_json_escape_or_empty(title ? title : "", esc_title, sizeof(esc_title), 240);
     p0_json_escape_or_empty(pn && pn[0] ? pn : "", esc_proc, sizeof(esc_proc), 160);
     p0_json_escape_or_empty(alert_process_path[0] ? alert_process_path : "", esc_exe, sizeof(esc_exe), 400);
+    p0_json_escape_or_empty(canonical_image_path, esc_canonical_image,
+                            sizeof(esc_canonical_image), 400);
+    reported_file_identity[0] = '\0';
+    (void)p0_context_reported_file_identity(
+        br->detection_context, reported_file_identity,
+        sizeof(reported_file_identity));
+    p0_json_escape_or_empty(reported_file_identity, esc_file_identity,
+                            sizeof(esc_file_identity),
+                            EDR_WINDOWS_FILE_IDENTITY_V1_CAP - 1u);
+    snprintf(process_start_key_json, sizeof(process_start_key_json), "%s", "null");
+    snprintf(process_creation_filetime_json,
+             sizeof(process_creation_filetime_json), "%s", "null");
+    if (br->process_start_key != 0u) {
+      snprintf(process_start_key_json, sizeof(process_start_key_json), "\"%llu\"",
+               (unsigned long long)br->process_start_key);
+    }
+    if (br->process_creation_filetime_100ns != 0u) {
+      snprintf(process_creation_filetime_json,
+               sizeof(process_creation_filetime_json), "\"%llu\"",
+               (unsigned long long)br->process_creation_filetime_100ns);
+    }
     p0_json_escape_or_empty(br->cmdline, cmdline_esc, sizeof(cmdline_esc), 480);
     p0_json_escape_or_empty(br->exe_hash[0] ? br->exe_hash : "", esc_exe_hash, sizeof(esc_exe_hash), 96);
     p0_json_escape_or_empty(br->process_path_hash[0] ? br->process_path_hash : "", esc_path_hash,
@@ -3594,6 +3633,10 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           "\"ppid\":%u,"
           "\"process_name\":\"%s\","
           "\"process_path\":\"%s\","
+          "\"canonical_image_path\":\"%s\","
+          "\"process_start_key\":%s,"
+          "\"process_creation_filetime_100ns\":%s,"
+          "\"file_identity\":\"%s\","
           "\"cmdline\":\"%s\","
           "\"exe_hash\":\"%s\","
           "\"exe_path_hash\":\"%s\","
@@ -3638,6 +3681,10 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         br->ppid,
         esc_proc,
         esc_exe,
+        esc_canonical_image,
+        process_start_key_json,
+        process_creation_filetime_json,
+        esc_file_identity,
         cmdline_esc,
         esc_exe_hash,
         esc_path_hash,
@@ -3679,7 +3726,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     emitted_metrics.escape_overflow_values += full_escape_overflows;
     if (full_escape_overflows != 0u || n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       /* Rebuild from scratch.  Do not emit snprintf's partial JSON. */
-      char crule[128], cbundle[192], cbundle_sha256[80], cproc[384], cpath[768], cep[128], ctenant[128], cevent[192];
+      char crule[128], cbundle[192], cbundle_sha256[80], cproc[384], cpath[768],
+           ccanonical[768], cep[128], ctenant[128], cevent[192];
       char cuser[384], csid[384], csource[128], cquality[128], caction[192], cmessage[384], identity[1152];
       int compact_ok =
           p0_json_escape_compact(rule_id, crule, sizeof(crule), 24) &&
@@ -3687,6 +3735,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           p0_json_escape_compact(binding->artifact_sha256, cbundle_sha256, sizeof(cbundle_sha256), 64) &&
           p0_json_escape_compact(pn ? pn : "", cproc, sizeof(cproc), 96) &&
           p0_json_escape_compact(alert_process_path, cpath, sizeof(cpath), 180) &&
+          p0_json_escape_compact(canonical_image_path, ccanonical,
+                                 sizeof(ccanonical), 180) &&
           p0_json_escape_compact(br->endpoint_id, cep, sizeof(cep), 48) &&
           p0_json_escape_compact(br->tenant_id, ctenant, sizeof(ctenant), 48) &&
           p0_json_escape_compact(br->event_id, cevent, sizeof(cevent), 48) &&
@@ -3707,8 +3757,11 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
       emitted_metrics.alerts_with_optional_omission++;
       if (compact_ok) {
         n = snprintf(a.user_subject_json, sizeof(a.user_subject_json),
-          "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\",\"rules_bundle_version\":\"%s\",\"rules_bundle_sha256\":\"%s\",\"context\":{\"context_degraded\":true,\"pid\":%u,\"ppid\":%u,\"event_type\":%d,\"process_name\":\"%s\",\"process_path\":\"%s\",\"endpoint_id\":\"%s\",\"tenant_id\":\"%s\",\"source_event_id\":\"%s\"%s},\"enforcement\":{\"requested\":%s,\"attempted\":%s,\"succeeded\":%s,\"action\":\"%s\",\"error_code\":%u,\"message\":\"%s\"}}",
-          crule, cbundle, cbundle_sha256, br->pid, br->ppid, (int)br->type, cproc, cpath, cep, ctenant, cevent, identity,
+          "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\",\"rules_bundle_version\":\"%s\",\"rules_bundle_sha256\":\"%s\",\"context\":{\"context_degraded\":true,\"pid\":%u,\"ppid\":%u,\"event_type\":%d,\"process_name\":\"%s\",\"process_path\":\"%s\",\"canonical_image_path\":\"%s\",\"process_start_key\":%s,\"process_creation_filetime_100ns\":%s,\"file_identity\":\"%s\",\"endpoint_id\":\"%s\",\"tenant_id\":\"%s\",\"source_event_id\":\"%s\"%s},\"enforcement\":{\"requested\":%s,\"attempted\":%s,\"succeeded\":%s,\"action\":\"%s\",\"error_code\":%u,\"message\":\"%s\"}}",
+          crule, cbundle, cbundle_sha256, br->pid, br->ppid, (int)br->type,
+          cproc, cpath, ccanonical, process_start_key_json,
+          process_creation_filetime_json, esc_file_identity, cep, ctenant,
+          cevent, identity,
           enforcement.requested ? "true" : "false", enforcement.attempted ? "true" : "false",
           enforcement.succeeded ? "true" : "false", caction, enforcement.error_code, cmessage);
       }

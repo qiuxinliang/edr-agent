@@ -506,8 +506,8 @@ int main(void) {
                          "direct P0 must accept only the explicit historical FileRead generation source");
   ok &= require_contains(
       preprocess,
-      "br->type == EDR_EVENT_FILE_READ && !edr_p0_rule_ir_br_matches_any(br)",
-      "only an authenticated-IR FileRead match may reuse bounded actor evidence work");
+      "br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br)",
+      "only an authenticated-IR file-event match may reuse bounded actor evidence work");
   ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_READ ? \"read\" :",
                          "typed record mapping must preserve read semantics");
   ok &= require_contains(mapper, "r->type == EDR_EVENT_FILE_RENAME ? \"rename\" :",

@@ -267,6 +267,7 @@ static void test_identity_status_counter_basics(void) {
   init_record(&observed, EDR_EVENT_PROCESS_CREATE);
   observed.pid = 91002u;
   observed.event_time_ns = generation_start + 1000000LL;
+  snprintf(observed.process_name, sizeof(observed.process_name), "identity.exe");
   snprintf(observed.username, sizeof(observed.username), "SYSTEM");
   snprintf(observed.identity_quality, sizeof(observed.identity_quality), "target_4688");
   edr_local_evidence_cache_observe_process(&observed);
@@ -274,6 +275,7 @@ static void test_identity_status_counter_basics(void) {
   init_record(&hit, EDR_EVENT_PROCESS_CREATE);
   hit.pid = 91002u;
   hit.event_time_ns = generation_start + 2000000LL;
+  snprintf(hit.process_name, sizeof(hit.process_name), "identity.exe");
   edr_local_evidence_cache_enrich_behavior(&hit);
   edr_local_evidence_cache_get_status(&st);
   assert(st.identity_observations_total == 1u && st.identity_target_4688 == 1u);
@@ -1755,6 +1757,44 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
     assert(saw_candidate);
     cJSON_Delete(document);
   }
+  /* A lost ProcessStop leaves the historical snapshot open. A later occupant
+   * of the same PID must not borrow that tuple merely because its timestamp is
+   * after the old start. */
+  {
+    char process_tree[8192];
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    EdrBehaviorRecord reused = post;
+    reused.event_time_ns = base + 2000000LL;
+    snprintf(reused.event_id, sizeof(reused.event_id), "snapshot-pid-reused");
+    snprintf(reused.process_name, sizeof(reused.process_name),
+             "CheckNetIsolation.exe");
+    snprintf(reused.exe_path, sizeof(reused.exe_path),
+             "C:\\Windows\\System32\\CheckNetIsolation.exe");
+    edr_local_evidence_cache_record_behavior(&reused);
+    assert(edr_local_evidence_cache_process_tree_json(
+               pid, candidate.endpoint_id, process_tree,
+               sizeof(process_tree)) == 0);
+    assert(strstr(process_tree, "snapshot.exe") != NULL);
+    assert(strstr(process_tree, "CheckNetIsolation.exe") == NULL);
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(
+               raw,
+               "SELECT name,path,process_start_key FROM process_cache "
+               "WHERE endpoint_id=? AND pid=?;",
+               -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(st, 1, candidate.endpoint_id, -1,
+                            SQLITE_TRANSIENT) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 2, (sqlite3_int64)pid) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), "snapshot.exe") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 1),
+                  "C:\\snapshot.exe") == 0);
+    assert(strcmp((const char *)sqlite3_column_text(st, 2),
+                  start_key_text) == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_close(raw) == SQLITE_OK);
+  }
   edr_local_evidence_cache_close();
   edr_pt_cache_shutdown();
   (void)remove(db);
@@ -2357,7 +2397,7 @@ static void test_known_generation_rejects_late_and_zero_time_identity_updates(vo
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts; assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
   uint64_t start = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec - 1000000000ULL;
-  edr_pt_cache_init(); assert(put_generation(94501u, 1u, "b.exe", "b", "b", "p", start,
+  edr_pt_cache_init(); assert(put_generation(94501u, 1u, "b.exe", "b", "B-path", "p", start,
                                               0x94501u) == 0);
   EdrBehaviorRecord b; init_record(&b, EDR_EVENT_PROCESS_CREATE); b.pid=94501u; b.event_time_ns=(int64_t)(start+1000u);
   snprintf(b.user_sid,sizeof(b.user_sid),"S-B"); snprintf(b.creator_sid,sizeof(b.creator_sid),"C-B"); snprintf(b.exe_path,sizeof(b.exe_path),"B-path"); snprintf(b.identity_quality,sizeof(b.identity_quality),"target_4688"); edr_local_evidence_cache_observe_process(&b);

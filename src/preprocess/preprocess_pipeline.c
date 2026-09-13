@@ -1136,16 +1136,19 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
   char signer[1024], thumbprint[192], revocation[64], signature_quality[64], signature_reason[160];
   int n;
   if (!br || br->is_security_4688 ||
-      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ)) {
+      (br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ &&
+       !br->kernel_file_activity)) {
     return;
   }
-  /* Never spend the bounded wait on ordinary ProcessCreate or FileRead
-   * traffic. ProcessCreate uses the manifest-backed interest prefilter;
-   * FileRead reaches this point only after its target path and exact actor
-   * generation have been bound, so require a complete authenticated-IR match
-   * before reusing or starting actor evidence work. */
+  /* Never spend the bounded wait on ordinary process or file traffic.
+   * ProcessCreate uses the manifest-backed interest prefilter. File events
+   * reach this point only after their target path and exact actor generation
+   * have been bound, so require a complete authenticated-IR match before
+   * reusing or starting actor evidence work. FILE_CREATE/FILE_WRITE must not
+   * bypass this path: they are direct P0 sources and need the same actor-image
+   * identity as FILE_READ. */
   if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_create_candidate(br)) ||
-      (br->type == EDR_EVENT_FILE_READ && !edr_p0_rule_ir_br_matches_any(br))) {
+      (br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br))) {
     return;
   }
   generation = br->process_start_key;
