@@ -1,7 +1,8 @@
-"""Exercise the real CMake gate dependency graph, not Windows OS behavior.
+"""Exercise the real CMake gate dependency graph and platform branch contracts.
 
 Tiny executables isolate the CI scheduling regression from product dependencies.
-The actual response tests still run natively in the normal Windows CTest gate.
+The host admission probe only adapts OS locks/clock; it is not Windows emulation.
+The actual tests still run natively in the normal Windows CTest gate.
 """
 import json
 import os
@@ -413,6 +414,55 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
                              "-DCMAKE_BUILD_TYPE=Release")
             self.run_command("cmake", "--build", str(build), "--parallel", "2", "--", "-k", "0")
+
+    @unittest.skipIf(os.name == "nt", "the release gate executes the native Windows binary")
+    def test_p0_windows_admission_behavior(self):
+        """Execute the real Windows admission branches, not only compile the test.
+
+        Only the emitter translation unit selects _WIN32. Its three OS calls
+        are locks and a clock, supplied by a host adapter; all admission,
+        matching, deduplication and queue assertions remain the real test.
+        This supplements, but does not replace, native Windows execution.
+        """
+        cmake_source = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        settings = cmake_source[cmake_source.index("set(CMAKE_C_STANDARD 11)"):
+                                cmake_source.index("option(EDR_BUILD_TESTS")]
+        tests_source = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        target = tests_source[tests_source.index("add_executable(test_p0_direct_emit_suppression "):
+                              tests_source.index("add_executable(test_p0_deferred_snapshot ")]
+        target = target.replace("${CMAKE_CURRENT_SOURCE_DIR}", "${EDR_TEST_ROOT}/tests")
+        target = target.replace("${CMAKE_SOURCE_DIR}", "${EDR_TEST_ROOT}")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "windows.h").write_text(
+                '#pragma once\n#ifdef NDEBUG\n#error Admission probe requires assertions\n#endif\n'
+                '#include <assert.h>\n#include <pthread.h>\n'
+                '#include <stdint.h>\n#include <time.h>\n'
+                '#define __declspec(x)\n#define __stdcall\n#define __cdecl\n'
+                'typedef pthread_mutex_t SRWLOCK;\n#define SRWLOCK_INIT PTHREAD_MUTEX_INITIALIZER\n'
+                'static void AcquireSRWLockExclusive(SRWLOCK *lock) { assert(pthread_mutex_lock(lock) == 0); }\n'
+                'static void ReleaseSRWLockExclusive(SRWLOCK *lock) { assert(pthread_mutex_unlock(lock) == 0); }\n'
+                'static uint64_t GetTickCount64(void) { struct timespec ts;\n'
+                '  assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);\n'
+                '  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u; }\n',
+                encoding="utf-8")
+            lines = [
+                'cmake_minimum_required(VERSION 3.20)', 'project(P0WindowsAdmission C)',
+                settings, 'find_package(Threads REQUIRED)', 'enable_testing()',
+                f'set(EDR_TEST_ROOT "{ROOT.as_posix()}")', target,
+                f'set_source_files_properties("{(ROOT / "src/preprocess/p0_rule_direct_emit.c").as_posix()}" '
+                'PROPERTIES COMPILE_DEFINITIONS _WIN32 '
+                'COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/windows.h")',
+                'target_include_directories(test_p0_direct_emit_suppression PRIVATE "${CMAKE_SOURCE_DIR}")',
+                'target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_WINDOWS_ADMISSION_TEST=1)',
+            ]
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+                             "-DCMAKE_BUILD_TYPE=Release")
+            self.run_command("cmake", "--build", str(build), "--parallel", "2")
+            self.run_command("ctest", "--test-dir", str(build), "--output-on-failure",
+                             "--no-tests=error", "-R", "^p0_direct_emit_suppression$")
 
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):

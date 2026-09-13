@@ -69,6 +69,7 @@ static int g_terminal_update_allowed = 1;
 static int g_terminal_source_enqueue_allowed = 1;
 static int g_ir_ready = 1;
 static int g_ir_evaluation_available = 1;
+static atomic_int g_ir_evaluation_calls = 0;
 static atomic_int g_block_combined = 0;
 static atomic_int g_combined_inflight = 0;
 static atomic_int g_combined_release = 0;
@@ -455,6 +456,7 @@ int edr_p0_rule_ir_get_binding(EdrP0RuleIrBinding *out_binding) {
 }
 int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
                                    EdrP0RuleIrEvaluation *out_evaluation) {
+  atomic_fetch_add(&g_ir_evaluation_calls, 1);
   if (!br || !out_evaluation) {
     return 0;
   }
@@ -465,7 +467,7 @@ int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
   if (!edr_p0_rule_ir_get_binding(&out_evaluation->binding)) {
     return 0;
   }
-  if (strcmp(br->process_name, "dedup-test.exe") != 0) {
+  if (!edr_p0_rule_ir_br_matches_any(br)) {
     return 1;
   }
   out_evaluation->match_indices[0] = 0u;
@@ -525,10 +527,11 @@ int edr_p0_rule_ir_rule_id_at(int index, const char **out_id) {
   }
   return 1;
 }
-int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) { return br && index==0 && strcmp(br->process_name,"dedup-test.exe")==0; }
+int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) { return g_ir_ready && br && index==0 && strcmp(br->process_name,"dedup-test.exe")==0; }
 int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
-  (void)br;
-  return 0;
+  /* Admission and snapshot evaluation query the same fake authenticated rule.
+   * Snapshot unavailability is a separate fault, not a predicate miss. */
+  return edr_p0_rule_ir_br_matches_index(br, 0);
 }
 int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) {
   (void)port;
@@ -558,6 +561,103 @@ static void init_record(EdrBehaviorRecord *r) {
   snprintf(r->detection_context, sizeof(r->detection_context),
            "%s", "{\"evidence\":{\"artifact\":{\"source\":\"process_image_section\",\"quality\":\"action_authoritative\",\"reason\":\"fixture\"},\"file_identity\":\"win-fileid-v1:0000000000004242:0123456789abcdef0123456789abcdef\"}}");
 }
+
+/* Tests of evaluation/delivery faults need valid input to reach that stage.
+ * Keep init_record minimal for the missing-evidence/omission tests. */
+static void init_complete_process_record(EdrBehaviorRecord *r, const char *name) {
+  init_record(r);
+  snprintf(r->process_name, sizeof(r->process_name), "%s", name);
+  snprintf(r->exe_path, sizeof(r->exe_path), "C:\\Test\\%s", name);
+  snprintf(r->image_path_canonical, sizeof(r->image_path_canonical), "%s", r->exe_path);
+  snprintf(r->image_path_resolution_status, sizeof(r->image_path_resolution_status), "%s", "RESOLVED");
+  snprintf(r->cmdline, sizeof(r->cmdline), "%s --fixture", name);
+  r->ppid = 4241u;
+  snprintf(r->parent_path, sizeof(r->parent_path), "%s", "C:\\Test\\parent.exe");
+  snprintf(r->parent_creation_time, sizeof(r->parent_creation_time), "%s", "2026-09-14T00:00:00Z");
+  snprintf(r->username, sizeof(r->username), "%s", "fixture-user");
+}
+
+static void init_file_read_record(EdrBehaviorRecord *r, const char *name) {
+  init_complete_process_record(r, name);
+  r->type = EDR_EVENT_FILE_READ;
+  snprintf(r->file_path, sizeof(r->file_path), "%s", "C:\\Test\\fixture.dat");
+  snprintf(r->process_generation_source, sizeof(r->process_generation_source),
+           "%s", "etw_start_key_live_telemetry");
+}
+
+#if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
+static void test_windows_process_admission_uses_rule_predicates(void) {
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = 1;
+  g_ir_evaluation_available = 1;
+  g_combined_emit_allowed = 1;
+  g_emit_count = 0;
+  g_durable_count = 0;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  init_record(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "ordinary-miss.exe");
+  /* Incomplete and no proven predicate: reject before snapshot evaluation. */
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 0);
+  assert(g_emit_count == 0 && g_durable_count == 0);
+  /* A proven rule match remains alertable without optional enrichment.
+   * This also catches a disagreement between the two fake IR query APIs. */
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "dedup-test.exe");
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  assert(g_emit_count == 1 && g_durable_count == 0);
+}
+
+static void test_windows_file_read_admission_requires_bound_evidence(void) {
+  static const char *generation_sources[] = {
+      "etw_start_key_live_telemetry",
+      "file_read_pid_event_time_live_telemetry",
+      "file_read_process_tree_cache_generation",
+  };
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = 1;
+  g_ir_evaluation_available = 1;
+  g_combined_emit_allowed = 1;
+  g_emit_count = 0;
+  g_durable_count = 0;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  for (unsigned i = 0u; i < 11u; ++i) {
+    init_file_read_record(&r, "dedup-test.exe");
+    /* Every required input fails closed, even for a would-match record. */
+    switch (i) {
+      case 0: r.file_path[0] = '\0'; break;
+      case 1: r.process_start_key = 0u; break;
+      case 2: r.process_creation_filetime_100ns = 0u; break;
+      case 3: r.process_name[0] = '\0'; break;
+      case 4: r.exe_path[0] = '\0'; break;
+      case 5: r.image_path_resolution_status[0] = '\0'; break;
+      case 6: r.process_generation_source[0] = '\0'; break;
+      case 7: strcpy(r.process_generation_source, "unbound_pid"); break;
+      case 8: strcpy(r.source_completeness, "NOT_EVALUABLE"); break;
+      case 9: strcpy(r.source_completeness, "TRUNCATED"); break;
+      case 10: strcpy(r.source_truncated_fields, "source.file_path"); break;
+    }
+    assert(edr_p0_rule_try_emit(&r) == 0);
+    assert(atomic_load(&g_ir_evaluation_calls) == 0);
+    assert(g_emit_count == 0 && g_durable_count == 0);
+  }
+  for (size_t i = 0u; i < sizeof(generation_sources) / sizeof(generation_sources[0]); ++i) {
+    init_file_read_record(&r, "dedup-test.exe");
+    snprintf(r.event_id, sizeof(r.event_id), "valid-file-read-%zu", i);
+    snprintf(r.process_generation_source, sizeof(r.process_generation_source),
+             "%s", generation_sources[i]);
+    assert(edr_p0_rule_try_emit(&r) == 1);
+    assert(atomic_load(&g_ir_evaluation_calls) == (int)i + 1);
+    assert(atomic_load(&g_emit_count) == (int)i + 1);
+  }
+}
+#endif
 
 static int suppressed(const char *rule_id, EdrBehaviorRecord *r, const char *detail,
                       const char *want_reason) {
@@ -1081,12 +1181,13 @@ static void test_p0_miss_does_not_emit_combined_frame(void) {
   edr_p0_rule_test_set_monotonic_ms(2600u);
   g_emit_count = 0;
   g_combined_emit_allowed = 1;
-  init_record(&r);
+  init_complete_process_record(&r, "ordinary-miss.exe");
   r.pid = 99007u;
   r.event_time_ns = 107u;
-  snprintf(r.process_name, sizeof(r.process_name), "ordinary-miss.exe");
+  atomic_store(&g_ir_evaluation_calls, 0);
   assert(edr_p0_rule_try_emit(&r) == 0);
   assert(g_emit_count == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1); /* actual miss, not admission rejection */
 }
 
 static void test_source_truncation_never_emits_after_coalescer_status(void) {
@@ -1161,10 +1262,9 @@ static void test_ir_evaluation_failure_durably_preserves_source_without_alert(vo
   g_emit_count = 0;
   g_durable_count = 0;
   g_durable_emit_allowed = 1;
-  init_record(&r);
+  init_complete_process_record(&r, "powershell.exe");
   r.pid = 99011u;
   r.event_time_ns = 111u;
-  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
   snprintf(r.cmdline, sizeof(r.cmdline), "powershell.exe -enc SQBFAFgA");
   /* A durable source-only gate is not an alert/combined frame. */
   assert(edr_p0_rule_try_emit(&r) == 0);
@@ -1202,10 +1302,9 @@ static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   g_durable_emit_allowed = 0;
   g_emit_count = 0;
   g_durable_count = 0;
-  init_record(&r);
+  init_complete_process_record(&r, "powershell.exe");
   r.pid = 99110u;
   r.event_time_ns = 1110u;
-  snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
   snprintf(r.event_id, sizeof(r.event_id), "%s", "source-retry-exact");
   assert(edr_p0_rule_try_emit(&r) == 0);
   edr_p0_rule_get_emit_metrics(&metrics);
@@ -1230,10 +1329,9 @@ static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   edr_p0_rule_test_set_monotonic_ms(2000u);
   g_durable_emit_allowed = 0;
   for (unsigned i = 0u; i < 9u; ++i) {
-    init_record(&r);
+    init_complete_process_record(&r, "powershell.exe");
     r.pid = 99120u + i;
     r.event_time_ns = 1120u + i;
-    snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
     snprintf(r.event_id, sizeof(r.event_id), "source-retry-overflow-%u", i);
     assert(edr_p0_rule_try_emit(&r) == 0);
   }
@@ -1377,12 +1475,10 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   g_ir_ready = 1;
   g_ir_evaluation_available = 0;
 
-  init_record(&file_source);
-  file_source.type = EDR_EVENT_FILE_READ;
+  init_file_read_record(&file_source, "reader.exe");
   file_source.pid = 99030u;
   file_source.event_time_ns = 130u;
   snprintf(file_source.event_id, sizeof(file_source.event_id), "%s", "file-source-only");
-  snprintf(file_source.process_name, sizeof(file_source.process_name), "%s", "reader.exe");
   assert(edr_p0_rule_try_emit(&file_source) == 0);
   assert(atomic_load(&g_durable_count) == 1);
   assert(edr_p0_rule_source_only_capability_healthy(reason, sizeof(reason)) == 0);
@@ -1402,8 +1498,7 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   assert(edr_p0_rule_try_emit(&process_match) == 1);
   assert(atomic_load(&g_emit_count) == 1);
 
-  file_match = process_match;
-  file_match.type = EDR_EVENT_FILE_READ;
+  init_file_read_record(&file_match, "dedup-test.exe");
   file_match.pid = 99032u;
   file_match.event_time_ns = 132u;
   snprintf(file_match.event_id, sizeof(file_match.event_id), "%s", "file-after-file-fault");
@@ -1445,7 +1540,7 @@ static void retain_deferred_fixture(EdrBehaviorRecord *r, const char *event_id) 
   g_combined_emit_outcome=EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED;
   g_emit_count=0;
   atomic_store(&g_adaptive_raises,0);
-  init_record(&source); source.type=EDR_EVENT_FILE_READ;
+  init_file_read_record(&source, "reader.exe");
   strcpy(source.event_id,"deferred-gate-source");
   assert(edr_p0_rule_try_emit(&source)==0);
   g_ir_evaluation_available=1;
@@ -2457,6 +2552,10 @@ int main(void) {
   test_searchprotocolhost_without_pipe_is_not_suppressed();
   test_searchprotocolhost_no_cmdline_system32_is_suppressed();
   test_searchprotocolhost_no_cmdline_user_path_not_suppressed();
+#if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
+  test_windows_process_admission_uses_rule_predicates();
+  test_windows_file_read_admission_requires_bound_evidence();
+#endif
   test_real_p0_dedup_metric_matrix();
   test_p0_exact_replay_window_rearms_only_that_source();
   test_p0_dedup_never_suppresses_semantic_mutations();
