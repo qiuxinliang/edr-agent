@@ -46,6 +46,10 @@ static void *reader_thread(void *raw) {
 }
 #endif
 
+static uint64_t test_unix_ns_to_filetime(uint64_t unix_ns) {
+  return UINT64_C(116444736000000000) + unix_ns / 100u;
+}
+
 int main(void) {
   ProcessTreeEntry entry;
   edr_pt_cache_init();
@@ -93,6 +97,64 @@ int main(void) {
   }
 
   {
+    /* Field shape captured on WIN-FAC3AC1PS5O: an old parent generation was
+     * still open, the real generation arrived around the child birth, then a
+     * same-generation metadata observation arrived later.  The late put must
+     * not move the real birth past the child or clear a known exit. */
+    const uint32_t parent_pid = 3404u;
+    const uint64_t old_key = UINT64_C(11540474045138450);
+    const uint64_t old_creation = UINT64_C(134337831008307727);
+    const uint64_t real_key = UINT64_C(11540474045138506);
+    const uint64_t real_creation = UINT64_C(134337835417985964);
+    const uint64_t child_creation = UINT64_C(134337835418663457);
+    const uint64_t epoch = UINT64_C(116444736000000000);
+    const uint64_t old_birth = (old_creation - epoch) * 100u;
+    const uint64_t real_birth = (real_creation - epoch) * 100u;
+    const uint64_t child_birth = (child_creation - epoch) * 100u;
+    assert(edr_pt_cache_put_generation(parent_pid, 3228u,
+                                       "gspawn-win64-helper.exe", "old-parent",
+                                       "C:/Program Files/Qemu-ga/gspawn-win64-helper.exe",
+                                       "qemu-ga.exe", old_birth, old_key,
+                                       old_creation) == 0);
+    assert(edr_pt_cache_put_generation(parent_pid, 3228u,
+                                       "gspawn-win64-helper.exe", "real-parent",
+                                       "C:/Program Files/Qemu-ga/gspawn-win64-helper.exe",
+                                       "qemu-ga.exe", real_birth, real_key,
+                                       real_creation) == 0);
+    assert(edr_pt_cache_put_generation(parent_pid, 3228u,
+                                       "gspawn-win64-helper.exe", "late-metadata",
+                                       "C:/Program Files/Qemu-ga/gspawn-win64-helper.exe",
+                                       "qemu-ga.exe", child_birth + 2000000000u,
+                                       real_key, real_creation) == 0);
+    assert(edr_pt_cache_snapshot_at(parent_pid, child_birth, &entry) == 0);
+    assert(entry.process_start_key == real_key);
+    assert(entry.creation_filetime_100ns == real_creation);
+    assert(entry.start_time_ns == real_birth);
+    assert(entry.exit_time_ns == 0u);
+    assert(strcmp(entry.cmdline, "late-metadata") == 0);
+  }
+
+  {
+    const uint32_t pid = 3405u;
+    const uint64_t now = test_wall_ns();
+    const uint64_t birth = (now / 100u) * 100u - 1000000000u;
+    const uint64_t exit = now + 100000000u;
+    const uint64_t creation = test_unix_ns_to_filetime(birth);
+    assert(edr_pt_cache_put_generation(pid, 3228u, "short.exe", "initial",
+                                       "C:/short.exe", "parent.exe", birth,
+                                       UINT64_C(0x3405), creation) == 0);
+    assert(edr_pt_cache_mark_exit_generation(pid, UINT64_C(0x3405), exit) == 0);
+    assert(edr_pt_cache_put_generation(pid, 3228u, "short.exe", "late",
+                                       "C:/short.exe", "parent.exe",
+                                       exit + 100000000u, UINT64_C(0x3405),
+                                       creation) == 0);
+    assert(edr_pt_cache_snapshot_at(pid, exit - 1u, &entry) == 0);
+    assert(entry.start_time_ns == birth && entry.exit_time_ns == exit);
+    assert(strcmp(entry.cmdline, "late") == 0);
+    assert(edr_pt_cache_snapshot_at(pid, exit + 1u, &entry) == -2);
+  }
+
+  {
     /* A delayed child event must continue to select parent generation A after
      * A exits and its PID is reused by B.  The real StartKey/FILETIME pair is
      * stored with each historical entry; event time chooses the only valid
@@ -100,24 +162,24 @@ int main(void) {
     const uint32_t parent_pid = 7100u;
     const uint32_t child_pid = 7101u;
     uint64_t now = test_wall_ns();
-    uint64_t a_start = now - 800000000ULL;
+    uint64_t a_start = (now / 100u) * 100u - 800000000ULL;
     uint64_t child_time = a_start + 100000000ULL;
     uint64_t a_exit = a_start + 200000000ULL;
     uint64_t b_start = a_start + 400000000ULL;
     char parent_cmdline[EDR_PTC_STR_LONG];
     assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-A.exe", "A --parent",
                                        "C:/A.exe", "System", a_start,
-                                       0xa001u, 133700000000000001ULL) == 0);
+                                       0xa001u, test_unix_ns_to_filetime(a_start)) == 0);
     assert(edr_pt_cache_put_generation(child_pid, parent_pid, "child.exe", "child --late",
                                        "C:/child.exe", "parent-A.exe", child_time,
-                                       0xc001u, 133700000000000003ULL) == 0);
+                                       0xc001u, test_unix_ns_to_filetime(child_time)) == 0);
     assert(edr_pt_cache_mark_exit_generation(parent_pid, 0xa001u, a_exit) == 0);
     assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-B.exe", "B --parent",
                                        "C:/B.exe", "System", b_start,
-                                       0xb001u, 133700000000000002ULL) == 0);
+                                       0xb001u, test_unix_ns_to_filetime(b_start)) == 0);
     assert(edr_pt_cache_snapshot_at(parent_pid, child_time, &entry) == 0);
     assert(entry.process_start_key == 0xa001u);
-    assert(entry.creation_filetime_100ns == 133700000000000001ULL);
+    assert(entry.creation_filetime_100ns == test_unix_ns_to_filetime(a_start));
     assert(strcmp(entry.process_name, "parent-A.exe") == 0);
     memset(parent_cmdline, 0, sizeof(parent_cmdline));
     edr_pt_cache_fill_record_at(child_pid, child_time, NULL, 0u, NULL, 0u,
@@ -133,20 +195,20 @@ int main(void) {
      * from the reused PID's interval selects only the replacement. */
     const uint32_t actor_pid = 7200u;
     uint64_t now = test_wall_ns();
-    uint64_t a_start = now - 700000000ULL;
+    uint64_t a_start = (now / 100u) * 100u - 700000000ULL;
     uint64_t read_time = a_start + 100000000ULL;
     uint64_t a_exit = a_start + 200000000ULL;
     uint64_t b_start = a_start + 400000000ULL;
     assert(edr_pt_cache_put_generation(actor_pid, 400u, "reader-A.exe", "A --read",
                                        "C:/reader-A.exe", "parent.exe", a_start,
-                                       0xa7200u, 133700000000000720ULL) == 0);
+                                       0xa7200u, test_unix_ns_to_filetime(a_start)) == 0);
     assert(edr_pt_cache_mark_exit_generation(actor_pid, 0xa7200u, a_exit) == 0);
     assert(edr_pt_cache_put_generation(actor_pid, 401u, "reader-B.exe", "B --idle",
                                        "C:/reader-B.exe", "other.exe", b_start,
-                                       0xb7200u, 133700000000000721ULL) == 0);
+                                       0xb7200u, test_unix_ns_to_filetime(b_start)) == 0);
     assert(edr_pt_cache_snapshot_at(actor_pid, read_time, &entry) == 0);
     assert(entry.process_start_key == 0xa7200u);
-    assert(entry.creation_filetime_100ns == 133700000000000720ULL);
+    assert(entry.creation_filetime_100ns == test_unix_ns_to_filetime(a_start));
     assert(strcmp(entry.exe_path, "C:/reader-A.exe") == 0);
     assert(edr_pt_cache_snapshot_at(actor_pid, b_start + 1000000ULL, &entry) == 0);
     assert(entry.process_start_key == 0xb7200u);

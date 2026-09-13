@@ -1,4 +1,5 @@
 #include "edr/error.h"
+#include "edr/sha256.h"
 #include "edr/storage_queue.h"
 
 #ifdef NDEBUG
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <sqlite3.h>
 
@@ -266,6 +268,80 @@ static sqlite3_int64 batch_row_id(const char *path, const char *batch_id) {
   return id;
 }
 
+static void snapshot_key(const uint8_t *payload, size_t payload_len, char key[65]) {
+  assert(payload != NULL && payload_len > 0u);
+  assert(edr_sha256_hex(payload, payload_len, key) == 0);
+}
+
+static int p0_deferred_state_matches(const char *path, const char *key,
+                                     const char *state, int payload_len,
+                                     const char *reason) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  int matches = 0;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "SELECT state,COALESCE(length(payload),0),terminal_reason,last_error "
+             "FROM p0_deferred_match WHERE key_sha256=?;",
+             -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *actual_state = (const char *)sqlite3_column_text(st, 0);
+    const char *terminal_reason = (const char *)sqlite3_column_text(st, 2);
+    const char *last_error = (const char *)sqlite3_column_text(st, 3);
+    const char *actual_reason = strcmp(state, "completed") == 0 ? terminal_reason : last_error;
+    matches = actual_state && actual_reason && strcmp(actual_state, state) == 0 &&
+        sqlite3_column_int(st, 1) == payload_len && strcmp(actual_reason, reason) == 0;
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return matches;
+}
+
+static int p0_deferred_count(const char *path, const char *state) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  int count = -1;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db, "SELECT COUNT(*) FROM p0_deferred_match WHERE state=?;",
+             -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, state, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return count;
+}
+
+static void p0_deferred_retry_values(const char *path, const char *key,
+                                     sqlite3_int64 *retry_count,
+                                     sqlite3_int64 *next_retry_at) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  assert(retry_count && next_retry_at);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "SELECT retry_count,next_retry_at FROM p0_deferred_match WHERE key_sha256=?;",
+             -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  *retry_count = sqlite3_column_int64(st, 0);
+  *next_retry_at = sqlite3_column_int64(st, 1);
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+}
+
+static void p0_deferred_exec_sql(const char *path, const char *sql) {
+  sqlite3 *db = NULL;
+  char *error = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_exec(db, sql, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
 #if !defined(_WIN32)
 typedef struct { unsigned id; } EnqueueWork;
 static void *enqueue_worker(void *arg) {
@@ -281,6 +357,21 @@ static void *enqueue_worker(void *arg) {
 static void *drain_worker(void *arg) {
   (void)arg;
   edr_storage_queue_poll_drain();
+  return NULL;
+}
+
+typedef struct {
+  const char *key;
+  uint32_t family_mask;
+  const uint8_t *payload;
+  size_t payload_len;
+  EdrError result;
+} DeferredRetainWork;
+
+static void *deferred_retain_worker(void *arg) {
+  DeferredRetainWork *work = (DeferredRetainWork *)arg;
+  work->result = edr_storage_queue_p0_deferred_retain(
+      work->key, work->family_mask, work->payload, work->payload_len);
   return NULL;
 }
 #endif
@@ -2280,6 +2371,340 @@ static void test_budget_deferral_preserves_ordinary_retry_allowance(void) {
   (void)remove(path);
 }
 
+static void test_p0_deferred_match_durable_lifecycle(void) {
+  char path[256];
+  const uint8_t snapshot_a[] = "{\"schema\":1,\"rule\":\"R-A\",\"binding\":\"cold\"}";
+  const uint8_t snapshot_b[] = "{\"schema\":1,\"rule\":\"R-B\",\"binding\":\"warm\"}";
+  const uint8_t snapshot_c[] = "{\"schema\":1,\"rule\":\"R-C\",\"binding\":\"late\"}";
+  const uint8_t snapshot_d[] = "{\"schema\":1,\"rule\":\"R-D\",\"binding\":\"poison\"}";
+  const uint8_t snapshot_e[] = "{\"schema\":1,\"rule\":\"R-E\",\"binding\":\"healthy\"}";
+  const uint8_t snapshot_f[] = "{\"schema\":1,\"rule\":\"R-F\",\"binding\":\"bad-family\"}";
+  char key_a[65], key_b[65], key_c[65], key_d[65], key_e[65], key_f[65];
+  char selected_key[65];
+  uint8_t *selected_payload = NULL;
+  size_t selected_len = 0u;
+  uint8_t wire[20];
+  EdrStorageQueueCapacityMetrics metrics;
+  sqlite3 *legacy = NULL;
+  snprintf(path, sizeof(path), "edr-p0-deferred-lifecycle-%ld.db", (long)TEST_PID);
+  (void)remove(path);
+  snapshot_key(snapshot_a, sizeof(snapshot_a) - 1u, key_a);
+  snapshot_key(snapshot_b, sizeof(snapshot_b) - 1u, key_b);
+  snapshot_key(snapshot_c, sizeof(snapshot_c) - 1u, key_c);
+  snapshot_key(snapshot_d, sizeof(snapshot_d) - 1u, key_d);
+  snapshot_key(snapshot_e, sizeof(snapshot_e) - 1u, key_e);
+  snapshot_key(snapshot_f, sizeof(snapshot_f) - 1u, key_f);
+  make_wire(wire, 71u);
+
+  assert(sqlite3_open(path, &legacy) == SQLITE_OK);
+  assert(sqlite3_exec(legacy, "CREATE TABLE legacy_probe(id INTEGER PRIMARY KEY);",
+                      NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(legacy) == SQLITE_OK);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_contains(key_a) == 0);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 16u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_deferred_peek(
+             16u, selected_key, &selected_payload, &selected_len) == -1);
+  edr_storage_queue_test_fail_next_p0_deferred_commits(1u);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 4u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_ERR_SQLITE_WRITE);
+  assert(edr_storage_queue_p0_deferred_contains(key_a) == 0);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 4u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 4u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 8u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 4u, snapshot_b, sizeof(snapshot_b) - 1u) == EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_deferred_contains(key_a) == 1);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.accounting_available == 1u);
+  assert(metrics.p0_deferred_pending_rows == 1u);
+  assert(metrics.p0_deferred_failed_rows == 0u);
+  assert(edr_storage_queue_p0_deferred_peek(
+             2u, selected_key, &selected_payload, &selected_len) == 0);
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 1);
+  assert(strcmp(selected_key, key_a) == 0);
+  assert(selected_len == sizeof(snapshot_a) - 1u);
+  assert(memcmp(selected_payload, snapshot_a, selected_len) == 0);
+  free(selected_payload);
+  selected_payload = NULL;
+
+#if !defined(_WIN32)
+  {
+    enum { workers = 12 };
+    pthread_t threads[workers];
+    DeferredRetainWork work[workers];
+    for (unsigned i = 0u; i < workers; ++i) {
+      work[i].key = key_a;
+      work[i].family_mask = 4u;
+      work[i].payload = snapshot_a;
+      work[i].payload_len = sizeof(snapshot_a) - 1u;
+      work[i].result = EDR_ERR_INTERNAL;
+      assert(pthread_create(&threads[i], NULL, deferred_retain_worker, &work[i]) == 0);
+    }
+    for (unsigned i = 0u; i < workers; ++i) {
+      assert(pthread_join(threads[i], NULL) == 0);
+      assert(work[i].result == EDR_OK);
+    }
+    assert(p0_deferred_count(path, "pending") == 1);
+  }
+#endif
+
+  reset_send_state(1);
+  test_sleep_ms(250u);
+  edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(p0_deferred_count(path, "pending") == 1);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_contains(key_a) == 1);
+
+  assert(edr_storage_queue_p0_deferred_retry(key_a, "family_still_unhealthy") == EDR_OK);
+  {
+    sqlite3_int64 retry_count = 0;
+    sqlite3_int64 next_retry_at = 0;
+    sqlite3_int64 now = (sqlite3_int64)time(NULL);
+    p0_deferred_retry_values(path, key_a, &retry_count, &next_retry_at);
+    assert(retry_count == 1 && next_retry_at >= now && next_retry_at <= now + 1);
+  }
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 0);
+  p0_deferred_exec_sql(path,
+      "UPDATE p0_deferred_match SET retry_count=9,next_retry_at=0 WHERE state='pending';");
+  assert(edr_storage_queue_p0_deferred_retry(key_a, "backoff_cap") == EDR_OK);
+  {
+    sqlite3_int64 retry_count = 0;
+    sqlite3_int64 next_retry_at = 0;
+    sqlite3_int64 now = (sqlite3_int64)time(NULL);
+    p0_deferred_retry_values(path, key_a, &retry_count, &next_retry_at);
+    assert(retry_count == 10 && next_retry_at >= now + 59 && next_retry_at <= now + 60);
+  }
+  p0_deferred_exec_sql(path,
+      "UPDATE p0_deferred_match SET next_retry_at=0 WHERE state='pending';");
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 1);
+  free(selected_payload);
+  selected_payload = NULL;
+
+  edr_storage_queue_test_fail_next_p0_deferred_commits(1u);
+  assert(edr_storage_queue_p0_deferred_complete(
+             key_a, "p0-deferred-batch-a", wire, sizeof(wire),
+             "queue_accepted") == EDR_ERR_SQLITE_WRITE);
+  assert(p0_deferred_state_matches(path, key_a, "pending",
+                                   (int)(sizeof(snapshot_a) - 1u),
+                                   "backoff_cap"));
+  assert(batch_row_id(path, "p0-deferred-batch-a") == -1);
+  assert(edr_storage_queue_p0_deferred_complete(
+             key_a, "p0-deferred-batch-a", wire, sizeof(wire),
+             "queue_accepted") == EDR_OK);
+  assert(p0_deferred_state_matches(path, key_a, "completed", 0, "queue_accepted"));
+  assert(batch_row_id(path, "p0-deferred-batch-a") > 0);
+  reset_send_state(1);
+  test_sleep_ms(250u);
+  edr_storage_queue_poll_drain();
+  assert(batch_row_id(path, "p0-deferred-batch-a") == -1);
+  assert(edr_storage_queue_p0_deferred_contains(key_a) == 1);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.p0_deferred_pending_rows == 0u);
+  assert(metrics.used_bytes >= 512u + 64u + 64u);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_a, 4u, snapshot_a, sizeof(snapshot_a) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_complete(
+             key_a, "must-not-reinsert", wire, sizeof(wire),
+             "queue_accepted") == EDR_OK);
+  assert(batch_row_id(path, "must-not-reinsert") == -1);
+
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_b, 4u, snapshot_b, sizeof(snapshot_b) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_complete(
+             key_b, NULL, NULL, 0u, "policy_denied") == EDR_OK);
+  assert(p0_deferred_state_matches(path, key_b, "completed", 0, "policy_denied"));
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_c, 4u, snapshot_c, sizeof(snapshot_c) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_fail(key_c, "ir_bundle_changed") == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_fail(
+             key_c, "ignored_idempotent_reason") == EDR_OK);
+  assert(p0_deferred_state_matches(path, key_c, "failed",
+                                   (int)(sizeof(snapshot_c) - 1u),
+                                   "ir_bundle_changed"));
+
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_d, 4u, snapshot_d, sizeof(snapshot_d) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_f, 8u, snapshot_f, sizeof(snapshot_f) - 1u) == EDR_OK);
+  {
+    char corrupt_sql[768];
+    snprintf(corrupt_sql, sizeof(corrupt_sql),
+             "UPDATE p0_deferred_match SET payload_sha256='%064d',created_at=1 "
+             "WHERE key_sha256='%s';"
+             "PRAGMA ignore_check_constraints=ON;"
+             "UPDATE p0_deferred_match SET family_mask=16,created_at=1 "
+             "WHERE key_sha256='%s';"
+             "PRAGMA ignore_check_constraints=OFF;",
+             0, key_d, key_f);
+    p0_deferred_exec_sql(path, corrupt_sql);
+  }
+  assert(edr_storage_queue_p0_deferred_retain(
+             key_e, 4u, snapshot_e, sizeof(snapshot_e) - 1u) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 1);
+  assert(strcmp(selected_key, key_e) == 0);
+  assert(memcmp(selected_payload, snapshot_e, selected_len) == 0);
+  free(selected_payload);
+  selected_payload = NULL;
+  assert(p0_deferred_state_matches(path, key_d, "failed",
+                                   (int)(sizeof(snapshot_d) - 1u),
+                                   "deferred_snapshot_sha256_mismatch"));
+  assert(p0_deferred_state_matches(path, key_f, "failed",
+                                   (int)(sizeof(snapshot_f) - 1u),
+                                   "invalid_deferred_snapshot_metadata"));
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.p0_deferred_failed_rows == 3u);
+  assert(metrics.p0_deferred_pending_rows == 1u);
+
+  p0_deferred_exec_sql(
+      path,
+      "UPDATE p0_deferred_match SET completed_at=1,updated_at=1 WHERE state='completed';"
+      "UPDATE p0_deferred_match SET created_at=1,updated_at=1 WHERE state IN ('pending','failed');");
+  edr_storage_queue_test_run_cleanup();
+  assert(p0_deferred_count(path, "completed") == 0);
+  assert(p0_deferred_count(path, "pending") == 1);
+  assert(p0_deferred_count(path, "failed") == 3);
+  edr_storage_queue_close();
+  (void)remove(path);
+}
+
+static void test_p0_deferred_capacity_atomic_handoff(void) {
+  char path[256];
+  uint8_t *snapshot = (uint8_t *)malloc(EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES);
+  uint8_t *ordinary_wire = (uint8_t *)malloc(65536u);
+  uint8_t *alert_wire = (uint8_t *)malloc(65536u);
+  char key[65];
+  EdrStorageQueueCapacityMetrics before;
+  EdrStorageQueueCapacityMetrics after;
+  assert(snapshot && ordinary_wire && alert_wire);
+  memset(snapshot, 'x', EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES);
+  make_large_wire(ordinary_wire, 65536u, 81u);
+  make_large_wire(alert_wire, 65536u, 82u);
+  snapshot_key(snapshot, EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES, key);
+  snprintf(path, sizeof(path), "edr-p0-deferred-capacity-%ld.db", (long)TEST_PID);
+  (void)remove(path);
+  edr_storage_queue_configure(1u, 1u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enqueue("deferred-capacity-ordinary", ordinary_wire,
+                                   65536u, 0, 0) == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_retain(
+             key, 1u, snapshot,
+             EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&before);
+  assert(before.p0_deferred_pending_rows == 1u);
+  assert(edr_storage_queue_p0_deferred_complete(
+             key, "deferred-capacity-alert", alert_wire, 65536u,
+             "queue_accepted") == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&after);
+  assert(after.p0_deferred_pending_rows == 0u);
+  assert(after.used_bytes < before.used_bytes);
+  assert(batch_row_id(path, "deferred-capacity-alert") > 0);
+  edr_storage_queue_close();
+  edr_storage_queue_configure(0u, 0u);
+  (void)remove(path);
+  free(snapshot);
+  free(ordinary_wire);
+  free(alert_wire);
+}
+
+static void test_p0_deferred_retained_payload_cap(void) {
+  char path[256];
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  char payload[64];
+  char key[65];
+  char first_key[65];
+  EdrStorageQueueCapacityMetrics before_fail;
+  EdrStorageQueueCapacityMetrics after_fail;
+  const uint8_t overflow[] = "{\"overflow\":true}";
+  char overflow_key[65];
+  snprintf(path, sizeof(path), "edr-p0-deferred-cap-%ld.db", (long)TEST_PID);
+  (void)remove(path);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "INSERT INTO p0_deferred_match("
+             "key_sha256,family_mask,payload,payload_len,payload_sha256,state,"
+             "created_at,updated_at,next_retry_at,retry_count,last_error,terminal_reason,completed_at) "
+             "VALUES(?,1,?,?,?,'pending',1,1,0,0,'','',0);",
+             -1, &st, NULL) == SQLITE_OK);
+  for (unsigned i = 0u; i < EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED; ++i) {
+    int payload_len = snprintf(payload, sizeof(payload), "{\"fixture\":%u}", i);
+    assert(payload_len > 0);
+    snapshot_key((const uint8_t *)payload, (size_t)payload_len, key);
+    if (i == 0u) memcpy(first_key, key, sizeof(first_key));
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st, 2, payload, payload_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, payload_len);
+    sqlite3_bind_text(st, 4, key, -1, SQLITE_TRANSIENT);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    assert(sqlite3_reset(st) == SQLITE_OK);
+    assert(sqlite3_clear_bindings(st) == SQLITE_OK);
+  }
+  sqlite3_finalize(st);
+  assert(sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  snapshot_key(overflow, sizeof(overflow) - 1u, overflow_key);
+  assert(edr_storage_queue_p0_deferred_retain(
+             overflow_key, 1u, overflow, sizeof(overflow) - 1u) == EDR_ERR_QUEUE_FULL);
+  assert(p0_deferred_count(path, "pending") ==
+         (int)EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED);
+
+  /* Real FULL fail at the cap keeps its existing owner and payload, without
+   * requiring another slot or making room for another retain. */
+  edr_storage_queue_get_capacity_metrics(&before_fail);
+  assert(edr_storage_queue_p0_deferred_fail(key, "ir_bundle_changed") == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&after_fail);
+  assert(after_fail.p0_deferred_pending_rows ==
+         EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED - 1u);
+  assert(after_fail.p0_deferred_failed_rows == 1u);
+  assert(after_fail.used_bytes == before_fail.used_bytes);
+  assert(p0_deferred_state_matches(path, key, "failed", (int)strlen(payload),
+                                   "ir_bundle_changed"));
+  assert(edr_storage_queue_p0_deferred_retain(
+             overflow_key, 1u, overflow, sizeof(overflow) - 1u) == EDR_ERR_QUEUE_FULL);
+  assert(edr_storage_queue_p0_deferred_contains(overflow_key) == 0);
+  /* Existing failed ownership can still be acknowledged exactly at the cap. */
+  assert(edr_storage_queue_p0_deferred_retain(
+             key, 1u, (const uint8_t *)payload, strlen(payload)) == EDR_OK);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_test_run_cleanup();
+  assert(p0_deferred_count(path, "pending") ==
+         (int)EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED - 1);
+  assert(p0_deferred_count(path, "failed") == 1);
+  assert(p0_deferred_state_matches(path, key, "failed", (int)strlen(payload),
+                                   "ir_bundle_changed"));
+  assert(edr_storage_queue_p0_deferred_retain(
+             overflow_key, 1u, overflow, sizeof(overflow) - 1u) == EDR_ERR_QUEUE_FULL);
+
+  /* Only an explicit completion releases a retained-payload slot. Its
+   * metadata tombstone remains owned and counted in the byte budget. */
+  assert(edr_storage_queue_p0_deferred_complete(
+             first_key, NULL, NULL, 0u, "policy_denied") == EDR_OK);
+  assert(edr_storage_queue_p0_deferred_contains(first_key) == 1);
+  assert(edr_storage_queue_p0_deferred_retain(
+             overflow_key, 1u, overflow, sizeof(overflow) - 1u) == EDR_OK);
+  assert(p0_deferred_count(path, "pending") ==
+         (int)EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED - 1);
+  assert(p0_deferred_count(path, "failed") == 1);
+  assert(p0_deferred_count(path, "completed") == 1);
+  edr_storage_queue_close();
+  (void)remove(path);
+}
+
 int main(void) {
   char path[256];
   char old_path[256];
@@ -2409,6 +2834,9 @@ int main(void) {
   test_p0_source_only_multiple_durable_rows_do_not_create_false_loss();
   test_p0_source_only_retry_retention_corruption_and_identity();
   test_p0_source_only_legacy_and_corrupt_meta_recover();
+  test_p0_deferred_match_durable_lifecycle();
+  test_p0_deferred_capacity_atomic_handoff();
+  test_p0_deferred_retained_payload_cap();
 #if !defined(_WIN32)
   test_terminal_journal_stale_generation_cannot_ack_reopened_row();
 #endif

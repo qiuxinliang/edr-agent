@@ -58,6 +58,57 @@ EdrError edr_storage_queue_p0_source_only_enqueue_bound(
  * latch is never cleared by this probe; recovery waits for its central ACK. */
 EdrError edr_storage_queue_p0_source_only_recovery_probe(void);
 
+/* A matched P0 rule that cannot proceed while its owning event family is
+ * unhealthy is retained in the queue database before the live record is
+ * released.  The snapshot is opaque, versioned JSON owned by the P0 codec;
+ * this layer verifies only durable identity, size and SHA-256 integrity.
+ *
+ * Keys are exactly the 64-character SHA-256 of payload_json. Family masks
+ * may contain only the four currently defined family bits (0x01..0x08).
+ * Retaining the same key/family/payload is idempotent in pending, failed and
+ * completed states; reusing a key for different content is rejected.
+ * Pending and failed snapshots share the retained-payload owner limit below;
+ * fail preserves its existing slot and never needs another admission. Neither
+ * state expires. Completed tombstones release the payload slot but still
+ * count toward logical bytes until the configured retention TTL removes them.
+ * Deferred admission shares terminal priority/reserve, excluding the dedicated
+ * P0 source-only reserve. */
+#define EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN 64u
+#define EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE 65u
+#define EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED 1024u
+#define EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES (512u * 1024u)
+EdrError edr_storage_queue_p0_deferred_retain(
+    const char key_hex[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE],
+    uint32_t family_mask, const uint8_t *payload_json, size_t payload_len);
+/* Durable ownership survives event_queue ACK deletion and covers every
+ * deferred state. Returns 0 absent, 1 owned, or -1 on error. */
+int edr_storage_queue_p0_deferred_contains(const char *key_hex);
+/* Returns 1 with malloc-owned payload, 0 when no due healthy-family row is
+ * available, and -1 on error.  Corrupt durable rows are moved to failed while
+ * preserving their payload, then selection continues so poison cannot starve
+ * later snapshots. */
+int edr_storage_queue_p0_deferred_peek(
+    uint32_t healthy_family_mask,
+    char key_out[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE],
+    uint8_t **payload_out, size_t *payload_len_out);
+/* Atomically hands a replay result to severity-1 event_queue storage and
+ * replaces the large snapshot with a completed dedup tombstone.  batch_id and
+ * wire must either both be supplied or both be NULL.  A no-wire completion
+ * requires a non-empty reason such as policy_denied/governor_suppressed. */
+EdrError edr_storage_queue_p0_deferred_complete(
+    const char key_hex[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE],
+    const char *batch_id, const uint8_t *wire, size_t wire_len,
+    const char *reason);
+/* Explicitly terminally isolates a snapshot that cannot be safely replayed.
+ * The original payload and digest remain durable for operator diagnosis. */
+EdrError edr_storage_queue_p0_deferred_fail(
+    const char key_hex[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE],
+    const char *reason);
+/* Schedules another replay using durable exponential backoff capped at 60s. */
+EdrError edr_storage_queue_p0_deferred_retry(
+    const char key_hex[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE],
+    const char *reason);
+
 /**
  * 持久化一批：payload 为 §6.2 完整 wire（12 字节头 + 体），与 ReportEvents 一致，便于出队补传。
  * compressed: 与传输层一致，仅作记录。
@@ -171,6 +222,12 @@ typedef struct {
    * a pending record to make room for a later producer. */
   uint64_t retention_evicted_rows;
   uint64_t pending_rows;
+  /* Matched P0 snapshots awaiting replay or retained after an explicit unsafe
+   * replay decision. Their payload bytes and the metadata-only completed
+   * tombstones contribute to used_bytes; only completed tombstones follow the
+   * configured retention TTL (72h by default). */
+  uint64_t p0_deferred_pending_rows;
+  uint64_t p0_deferred_failed_rows;
   uint64_t oldest_pending_created_unix_s;
   uint64_t oldest_pending_age_s;
   /* 10,000 = 100%. When max_bytes is zero the queue is deliberately
@@ -202,6 +259,8 @@ void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count);
 /* Aborts the next queue_meta FULL commits, exercising the same SQLite
  * durable-failure boundary used by P0 source-only recovery. */
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count);
+/* Aborts the next deferred-match FULL commits, including atomic handoff. */
+void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
 /* Simulates a checked journal ACK statement failure while the normal-row
  * delete is still in the enclosing terminal FULL transaction. */
 void edr_storage_queue_test_fail_next_terminal_ack_steps(unsigned count);

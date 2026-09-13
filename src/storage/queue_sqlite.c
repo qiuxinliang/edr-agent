@@ -63,6 +63,8 @@ static unsigned s_test_enqueue_commit_failures;
 static int s_test_enqueue_commit_active;
 static unsigned s_test_p0_latch_commit_failures;
 static int s_test_p0_latch_commit_active;
+static unsigned s_test_p0_deferred_commit_failures;
+static int s_test_p0_deferred_commit_active;
 
 /* SQLite invokes this synchronously during COMMIT. Returning nonzero makes
  * SQLite abort the actual commit and roll the transaction back, exercising
@@ -79,6 +81,10 @@ static int terminal_journal_test_commit_hook(void *opaque) {
   }
   if (s_test_p0_latch_commit_active && s_test_p0_latch_commit_failures > 0u) {
     s_test_p0_latch_commit_failures--;
+    return 1;
+  }
+  if (s_test_p0_deferred_commit_active && s_test_p0_deferred_commit_failures > 0u) {
+    s_test_p0_deferred_commit_failures--;
     return 1;
   }
   return 0;
@@ -115,6 +121,7 @@ static uint64_t s_db_generation;
 static uint64_t s_drain_generation;
 static uint64_t s_last_drain_ns;
 #define EDR_ENFORCEMENT_TERMINAL_MAX_PENDING 1024u
+static int exec_simple(sqlite3 *db, const char *sql);
 static void queue_lock_release(void);
 static void terminal_journal_refresh_locked(void);
 static int terminal_journal_begin_durable_locked(void);
@@ -205,6 +212,8 @@ static uint64_t queue_add_bytes(uint64_t total, uint64_t value) {
 }
 
 #define EDR_QUEUE_EVENT_LOGICAL_OVERHEAD 512ULL
+#define EDR_P0_DEFERRED_LOGICAL_OVERHEAD 512ULL
+#define EDR_P0_DEFERRED_REASON_RESERVE_BYTES 255ULL
 #define EDR_TERMINAL_LOGICAL_OVERHEAD 1024ULL
 #define EDR_TERMINAL_FRAME_MAX_BYTES (65536ULL + 16ULL)
 #define EDR_TERMINAL_TEXT_MAX_BYTES 255u
@@ -309,13 +318,20 @@ static int queue_logical_live_bytes_locked(uint64_t *out) {
       "THEN length(source_batch_id)+COALESCE(length(source_wire),0)+"
       "length(combined_batch_id)+COALESCE(length(combined_wire),0) "
       "ELSE reserved_bytes END),0) FROM enforcement_terminal_journal;";
+  static const char deferred_sql[] =
+      "SELECT COALESCE(SUM(length(key_sha256)+length(payload_sha256)+"
+      "COALESCE(length(payload),0)+512+CASE WHEN state='completed' "
+      "THEN length(terminal_reason) ELSE 255 END),0) "
+      "FROM p0_deferred_match;";
   uint64_t events;
   uint64_t terminals;
+  uint64_t deferred;
   if (!out || !queue_sql_sum_locked(event_sql, &events) ||
-      !queue_sql_sum_locked(terminal_sql, &terminals)) {
+      !queue_sql_sum_locked(terminal_sql, &terminals) ||
+      !queue_sql_sum_locked(deferred_sql, &deferred)) {
     return 0;
   }
-  *out = queue_add_bytes(events, terminals);
+  *out = queue_add_bytes(queue_add_bytes(events, terminals), deferred);
   return *out != UINT64_MAX;
 }
 
@@ -355,6 +371,30 @@ static int queue_pending_inventory_locked(uint64_t *rows, uint64_t *oldest_creat
   sqlite3_finalize(st);
   *rows = count > 0 ? (uint64_t)count : 0u;
   *oldest_created = oldest > 0 ? (uint64_t)oldest : 0u;
+  return 1;
+}
+
+static int p0_deferred_inventory_locked(uint64_t *pending, uint64_t *failed) {
+  sqlite3_stmt *st = NULL;
+  sqlite3_int64 pending_value;
+  sqlite3_int64 failed_value;
+  if (!pending || !failed || !s_db ||
+      sqlite3_prepare_v2(
+          s_db,
+          "SELECT COALESCE(SUM(state='pending'),0),COALESCE(SUM(state='failed'),0) "
+          "FROM p0_deferred_match;",
+          -1, &st, NULL) != SQLITE_OK) {
+    return 0;
+  }
+  if (sqlite3_step(st) != SQLITE_ROW) {
+    sqlite3_finalize(st);
+    return 0;
+  }
+  pending_value = sqlite3_column_int64(st, 0);
+  failed_value = sqlite3_column_int64(st, 1);
+  sqlite3_finalize(st);
+  *pending = pending_value > 0 ? (uint64_t)pending_value : 0u;
+  *failed = failed_value > 0 ? (uint64_t)failed_value : 0u;
   return 1;
 }
 
@@ -404,7 +444,9 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   out->physical_bytes = queue_add_bytes(queue_add_bytes(out->db_bytes, out->wal_bytes),
                                         out->shm_bytes);
   if (!queue_logical_live_bytes_locked(&out->used_bytes) ||
-      !queue_pending_inventory_locked(&out->pending_rows, &out->oldest_pending_created_unix_s)) {
+      !queue_pending_inventory_locked(&out->pending_rows, &out->oldest_pending_created_unix_s) ||
+      !p0_deferred_inventory_locked(&out->p0_deferred_pending_rows,
+                                    &out->p0_deferred_failed_rows)) {
     return 0;
   }
   if (out->oldest_pending_created_unix_s > 0u) {
@@ -422,6 +464,16 @@ static uint64_t queue_event_live_cost(const char *batch_id, size_t payload_len) 
   uint64_t total = EDR_QUEUE_EVENT_LOGICAL_OVERHEAD;
   total = queue_add_bytes(total, batch_id ? (uint64_t)strlen(batch_id) : 0u);
   return queue_add_bytes(total, (uint64_t)payload_len);
+}
+
+static uint64_t p0_deferred_live_cost(size_t payload_len) {
+  uint64_t total = EDR_P0_DEFERRED_LOGICAL_OVERHEAD;
+  total = queue_add_bytes(total, EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN);
+  total = queue_add_bytes(total, EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN);
+  total = queue_add_bytes(total, (uint64_t)payload_len);
+  /* Pending/failed rows reserve the largest bounded retry/failure reason so
+   * a later state transition cannot grow beyond its original admission. */
+  return queue_add_bytes(total, EDR_P0_DEFERRED_REASON_RESERVE_BYTES);
 }
 
 static uint64_t queue_terminal_precreate_live_cost(const char *idempotency_key,
@@ -545,6 +597,61 @@ static int terminal_wire_valid(const uint8_t *wire, size_t wire_len) {
   body_len = rd_u32_le(wire + 8u);
   frame_len = rd_u32_le(wire + 12u);
   return body_len == frame_len + 4u && (size_t)body_len + 12u == wire_len;
+}
+
+static int p0_deferred_key_normalize(const char *key, char out[65]) {
+  size_t i;
+  if (!key || !out || strlen(key) != EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN) return 0;
+  for (i = 0u; i < EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN; ++i) {
+    unsigned char c = (unsigned char)key[i];
+    if (c >= 'A' && c <= 'F') c = (unsigned char)(c - 'A' + 'a');
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+    out[i] = (char)c;
+  }
+  out[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN] = '\0';
+  return 1;
+}
+
+static int p0_deferred_digest_valid(const unsigned char *digest, int digest_len) {
+  int i;
+  if (!digest || digest_len != (int)EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN ||
+      memchr(digest, '\0', (size_t)digest_len) != NULL) {
+    return 0;
+  }
+  for (i = 0; i < digest_len; ++i) {
+    unsigned char c = digest[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+  }
+  return 1;
+}
+
+static int p0_deferred_begin_durable_locked(void) {
+  if (!s_db || exec_simple(s_db, "PRAGMA synchronous=FULL;") != SQLITE_OK) return -1;
+  if (exec_simple(s_db, "BEGIN IMMEDIATE;") != SQLITE_OK) {
+    (void)exec_simple(s_db, "PRAGMA synchronous=NORMAL;");
+    return -1;
+  }
+  return 0;
+}
+
+static int p0_deferred_end_durable_locked(int commit) {
+  int rc;
+  if (!s_db) return -1;
+  if (!commit) {
+    (void)exec_simple(s_db, "ROLLBACK;");
+    (void)exec_simple(s_db, "PRAGMA synchronous=NORMAL;");
+    return 0;
+  }
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  s_test_p0_deferred_commit_active = 1;
+#endif
+  rc = exec_simple(s_db, "COMMIT;");
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  s_test_p0_deferred_commit_active = 0;
+#endif
+  if (rc != SQLITE_OK) (void)exec_simple(s_db, "ROLLBACK;");
+  (void)exec_simple(s_db, "PRAGMA synchronous=NORMAL;");
+  return rc == SQLITE_OK ? 0 : -1;
 }
 
 /* Producer batch ids are C strings; durable SQLite TEXT must be checked by
@@ -833,6 +940,29 @@ static void cleanup_terminal_journal_rows(void) {
   terminal_journal_refresh_locked();
 }
 
+static void cleanup_p0_deferred_completed_rows(void) {
+  sqlite3_stmt *st = NULL;
+  sqlite3_int64 cutoff;
+  uint32_t hours;
+  if (!s_db) return;
+  hours = retention_hours_effective();
+  if (hours == 0u) return;
+  cutoff = (sqlite3_int64)time(NULL) - (sqlite3_int64)hours * 3600;
+  /* Pending snapshots are replay work and failed snapshots are retained
+   * forensic evidence. Only payload-free completed dedup tombstones expire. */
+  if (sqlite3_prepare_v2(
+          s_db,
+          "DELETE FROM p0_deferred_match WHERE state='completed' AND completed_at < ?;",
+          -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(st, 1, cutoff);
+    if (sqlite3_step(st) == SQLITE_DONE) {
+      int changed = sqlite3_changes(s_db);
+      if (changed > 0) s_retention_evicted_rows += (uint64_t)changed;
+    }
+    sqlite3_finalize(st);
+  }
+}
+
 static void cleanup_expired_rows(void) {
   if (!s_db) {
     return;
@@ -885,6 +1015,7 @@ static void cleanup_expired_rows(void) {
     }
   }
   cleanup_terminal_journal_rows();
+  cleanup_p0_deferred_completed_rows();
 }
 
 /**
@@ -1853,6 +1984,12 @@ void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count) {
   queue_state_unlock();
 }
 
+void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) {
+  queue_state_lock();
+  s_test_p0_deferred_commit_failures = count;
+  queue_state_unlock();
+}
+
 void edr_storage_queue_test_fail_next_terminal_ack_steps(unsigned count) {
   queue_state_lock();
   s_test_terminal_ack_step_failures = count;
@@ -2191,6 +2328,26 @@ EdrError edr_storage_queue_open(const char *path) {
       "session_state TEXT NOT NULL DEFAULT 'clean' CHECK(session_state IN ('clean','open')),"
       "last_error TEXT NOT NULL DEFAULT ''"
       ");"
+      "CREATE TABLE IF NOT EXISTS p0_deferred_match ("
+      "key_sha256 TEXT PRIMARY KEY NOT NULL CHECK(length(key_sha256)=64),"
+      "family_mask INTEGER NOT NULL CHECK(family_mask>0 AND family_mask<=15),"
+      "payload BLOB,"
+      "payload_len INTEGER NOT NULL CHECK(payload_len>0 AND payload_len<=524288),"
+      "payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),"
+      "state TEXT NOT NULL DEFAULT 'pending' "
+      "CHECK(state IN ('pending','completed','failed')),"
+      "created_at INTEGER NOT NULL,"
+      "updated_at INTEGER NOT NULL,"
+      "next_retry_at INTEGER NOT NULL DEFAULT 0,"
+      "retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count>=0),"
+      "last_error TEXT NOT NULL DEFAULT '',"
+      "terminal_reason TEXT NOT NULL DEFAULT '',"
+      "completed_at INTEGER NOT NULL DEFAULT 0,"
+      "CHECK((state='completed' AND payload IS NULL) OR "
+      "(state IN ('pending','failed') AND payload IS NOT NULL))"
+      ");"
+      "CREATE INDEX IF NOT EXISTS idx_p0_deferred_due "
+      "ON p0_deferred_match(state,next_retry_at,created_at,key_sha256);"
       "CREATE TABLE IF NOT EXISTS enforcement_terminal_journal ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT,"
       "idempotency_key TEXT NOT NULL UNIQUE,"
@@ -2606,6 +2763,536 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
   }
   queue_state_unlock();
   return result;
+}
+
+static int p0_deferred_mark_failed_by_id_locked(sqlite3_int64 row_id,
+                                                const char *reason) {
+  sqlite3_stmt *st = NULL;
+  int rc;
+  int changed;
+  if (!s_db || !reason || p0_deferred_begin_durable_locked() != 0) return -1;
+  if (sqlite3_prepare_v2(
+          s_db,
+          "UPDATE p0_deferred_match SET state='failed',last_error=?,updated_at=? "
+          "WHERE rowid=? AND state='pending';",
+          -1, &st, NULL) != SQLITE_OK) {
+    (void)p0_deferred_end_durable_locked(0);
+    return -1;
+  }
+  sqlite3_bind_text(st, 1, reason, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL));
+  sqlite3_bind_int64(st, 3, row_id);
+  rc = sqlite3_step(st);
+  changed = sqlite3_changes(s_db);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE || changed != 1 || p0_deferred_end_durable_locked(1) != 0) {
+    (void)p0_deferred_end_durable_locked(0);
+    return -1;
+  }
+  return 0;
+}
+
+EdrError edr_storage_queue_p0_deferred_retain(const char *key_hex,
+                                               uint32_t family_mask,
+                                               const uint8_t *payload_json,
+                                               size_t payload_len) {
+  char key[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE];
+  char payload_sha[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE];
+  sqlite3_stmt *st = NULL;
+  EdrError result = EDR_ERR_SQLITE_WRITE;
+  int rc;
+  if (!p0_deferred_key_normalize(key_hex, key) || family_mask == 0u ||
+      (family_mask & ~UINT32_C(0x0f)) != 0u || !payload_json ||
+      payload_len == 0u ||
+      payload_len > EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES ||
+      payload_len > (size_t)INT_MAX ||
+      edr_sha256_hex(payload_json, payload_len, payload_sha) != 0 ||
+      memcmp(key, payload_sha, EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE) != 0) {
+    return EDR_ERR_INVALID_ARG;
+  }
+  queue_state_lock();
+  if (!s_db) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_OPEN;
+  }
+  cleanup_expired_rows();
+  if (sqlite3_prepare_v2(
+          s_db,
+          "SELECT family_mask,payload,payload_len,payload_sha256,state "
+          "FROM p0_deferred_match WHERE key_sha256=?;",
+          -1, &st, NULL) != SQLITE_OK) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    sqlite3_int64 stored_family = sqlite3_column_int64(st, 0);
+    const void *stored_payload = sqlite3_column_blob(st, 1);
+    int stored_bytes = sqlite3_column_bytes(st, 1);
+    sqlite3_int64 stored_len = sqlite3_column_int64(st, 2);
+    const unsigned char *stored_sha = sqlite3_column_text(st, 3);
+    int stored_sha_len = sqlite3_column_bytes(st, 3);
+    const unsigned char *stored_state = sqlite3_column_text(st, 4);
+    int completed = stored_state && strcmp((const char *)stored_state, "completed") == 0;
+    int retained = stored_state &&
+        (strcmp((const char *)stored_state, "pending") == 0 ||
+         strcmp((const char *)stored_state, "failed") == 0);
+    int exact = stored_family == (sqlite3_int64)(uint64_t)family_mask &&
+        stored_len == (sqlite3_int64)payload_len &&
+        p0_deferred_digest_valid(stored_sha, stored_sha_len) &&
+        memcmp(stored_sha, payload_sha, EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_HEX_LEN) == 0 &&
+        ((completed && !stored_payload && stored_bytes == 0) ||
+         (retained && stored_payload && stored_bytes == (int)payload_len &&
+          memcmp(stored_payload, payload_json, payload_len) == 0));
+    sqlite3_finalize(st);
+    queue_state_unlock();
+    return exact ? EDR_OK : EDR_ERR_INVALID_ARG;
+  }
+  sqlite3_finalize(st);
+  st = NULL;
+  if (rc != SQLITE_DONE) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  {
+    uint64_t retained_count = 0u;
+    /* Failed snapshots retain forensic payloads indefinitely. They own the
+     * same slot as pending snapshots, so fail cannot reopen admission while
+     * accumulating an unbounded set of non-expiring evidence. */
+    if (!queue_sql_sum_locked(
+            "SELECT COUNT(*) FROM p0_deferred_match WHERE state IN ('pending','failed');",
+            &retained_count)) {
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+    if (retained_count >= EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED) {
+      queue_state_unlock();
+      return EDR_ERR_QUEUE_FULL;
+    }
+  }
+  if (!queue_capacity_admit_locked(p0_deferred_live_cost(payload_len),
+                                   QUEUE_CAPACITY_TERMINAL)) {
+    queue_state_unlock();
+    return EDR_ERR_QUEUE_FULL;
+  }
+  if (p0_deferred_begin_durable_locked() != 0) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  if (sqlite3_prepare_v2(
+          s_db,
+          "INSERT INTO p0_deferred_match("
+          "key_sha256,family_mask,payload,payload_len,payload_sha256,state,"
+          "created_at,updated_at,next_retry_at,retry_count,last_error,terminal_reason,completed_at) "
+          "VALUES(?,?,?,?,?,'pending',?,?,0,0,'','',0);",
+          -1, &st, NULL) != SQLITE_OK) {
+    (void)p0_deferred_end_durable_locked(0);
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 2, (sqlite3_int64)(uint64_t)family_mask);
+  sqlite3_bind_blob(st, 3, payload_json, (int)payload_len, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 4, (sqlite3_int64)payload_len);
+  sqlite3_bind_text(st, 5, payload_sha, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 6, (sqlite3_int64)time(NULL));
+  sqlite3_bind_int64(st, 7, (sqlite3_int64)time(NULL));
+  rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc == SQLITE_DONE && p0_deferred_end_durable_locked(1) == 0) result = EDR_OK;
+  else (void)p0_deferred_end_durable_locked(0);
+  queue_state_unlock();
+  return result;
+}
+
+int edr_storage_queue_p0_deferred_contains(const char *key_hex) {
+  char key[EDR_STORAGE_QUEUE_P0_DEFERRED_KEY_BUFSIZE];
+  sqlite3_stmt *st = NULL;
+  int result = -1;
+  int rc;
+  if (!p0_deferred_key_normalize(key_hex, key)) return -1;
+  queue_state_lock();
+  if (!s_db || sqlite3_prepare_v2(
+          s_db, "SELECT 1 FROM p0_deferred_match WHERE key_sha256=?;",
+          -1, &st, NULL) != SQLITE_OK) {
+    queue_state_unlock();
+    return -1;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) result = 1;
+  else if (rc == SQLITE_DONE) result = 0;
+  sqlite3_finalize(st);
+  queue_state_unlock();
+  return result;
+}
+
+int edr_storage_queue_p0_deferred_peek(uint32_t healthy_family_mask,
+                                       char key_out[65], uint8_t **payload_out,
+                                       size_t *payload_len_out) {
+  unsigned inspected = 0u;
+  if (!key_out || !payload_out || !payload_len_out) return -1;
+  key_out[0] = '\0';
+  *payload_out = NULL;
+  *payload_len_out = 0u;
+  if (healthy_family_mask == 0u) return 0;
+  if ((healthy_family_mask & ~UINT32_C(0x0f)) != 0u) return -1;
+  queue_state_lock();
+  if (!s_db) {
+    queue_state_unlock();
+    return -1;
+  }
+  while (inspected++ < EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_RETAINED) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 row_id;
+    const unsigned char *stored_key;
+    int stored_key_len;
+    sqlite3_int64 stored_family;
+    const void *stored_payload;
+    int stored_bytes;
+    sqlite3_int64 stored_len;
+    const unsigned char *stored_sha;
+    int stored_sha_len;
+    char normalized_key[65];
+    char actual_sha[65];
+    int rc;
+    const char *corruption_reason = NULL;
+    if (sqlite3_prepare_v2(
+            s_db,
+            "SELECT rowid,key_sha256,family_mask,payload,payload_len,payload_sha256 "
+            "FROM p0_deferred_match WHERE state='pending' AND next_retry_at<=? "
+            "AND ((family_mask & -16)!=0 OR family_mask<=0 OR (family_mask & ?)!=0) "
+            "ORDER BY created_at,key_sha256 LIMIT 1;",
+            -1, &st, NULL) != SQLITE_OK) {
+      queue_state_unlock();
+      return -1;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)(uint64_t)healthy_family_mask);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return 0;
+    }
+    if (rc != SQLITE_ROW) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return -1;
+    }
+    row_id = sqlite3_column_int64(st, 0);
+    stored_key = sqlite3_column_text(st, 1);
+    stored_key_len = sqlite3_column_bytes(st, 1);
+    stored_family = sqlite3_column_int64(st, 2);
+    stored_payload = sqlite3_column_blob(st, 3);
+    stored_bytes = sqlite3_column_bytes(st, 3);
+    stored_len = sqlite3_column_int64(st, 4);
+    stored_sha = sqlite3_column_text(st, 5);
+    stored_sha_len = sqlite3_column_bytes(st, 5);
+    if (!stored_key || stored_key_len != 64 ||
+        !p0_deferred_key_normalize((const char *)stored_key, normalized_key) ||
+        stored_family <= 0 || (uint64_t)stored_family > UINT32_C(0x0f) ||
+        (((uint64_t)stored_family & ~UINT64_C(0x0f)) != 0u) ||
+        !stored_payload || stored_bytes <= 0 ||
+        stored_len != (sqlite3_int64)stored_bytes ||
+        stored_len > EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES) {
+      corruption_reason = "invalid_deferred_snapshot_metadata";
+    } else if (!p0_deferred_digest_valid(stored_sha, stored_sha_len) ||
+               edr_sha256_hex((const uint8_t *)stored_payload,
+                              (size_t)stored_bytes, actual_sha) != 0 ||
+               memcmp(stored_sha, actual_sha, 64u) != 0 ||
+               memcmp(normalized_key, actual_sha, 65u) != 0) {
+      corruption_reason = "deferred_snapshot_sha256_mismatch";
+    }
+    if (corruption_reason) {
+      sqlite3_finalize(st);
+      if (p0_deferred_mark_failed_by_id_locked(row_id, corruption_reason) != 0) {
+        queue_state_unlock();
+        return -1;
+      }
+      continue;
+    }
+    *payload_out = (uint8_t *)malloc((size_t)stored_bytes);
+    if (!*payload_out) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return -1;
+    }
+    memcpy(*payload_out, stored_payload, (size_t)stored_bytes);
+    memcpy(key_out, normalized_key, sizeof(normalized_key));
+    *payload_len_out = (size_t)stored_bytes;
+    sqlite3_finalize(st);
+    queue_state_unlock();
+    return 1;
+  }
+  queue_state_unlock();
+  return 0;
+}
+
+EdrError edr_storage_queue_p0_deferred_complete(const char *key_hex,
+                                                 const char *batch_id,
+                                                 const uint8_t *wire,
+                                                 size_t wire_len,
+                                                 const char *reason) {
+  char key[65];
+  sqlite3_stmt *st = NULL;
+  int has_wire = batch_id != NULL || wire != NULL || wire_len != 0u;
+  int inserted = 0;
+  int rc;
+  int compressed = 0;
+  EdrError result = EDR_ERR_SQLITE_WRITE;
+  if (!p0_deferred_key_normalize(key_hex, key) || !queue_text_valid(reason) ||
+      (has_wire && (!queue_text_valid(batch_id) || !wire || wire_len == 0u ||
+                    !terminal_wire_valid(wire, wire_len))) ||
+      (!has_wire && (batch_id || wire || wire_len != 0u))) {
+    return EDR_ERR_INVALID_ARG;
+  }
+  if (has_wire) compressed = rd_u32_le(wire) == EDR_TRANSPORT_BATCH_MAGIC_LZ4 ? 1 : 0;
+  queue_state_lock();
+  if (!s_db) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_OPEN;
+  }
+  if (sqlite3_prepare_v2(s_db,
+                         "SELECT state FROM p0_deferred_match WHERE key_sha256=?;",
+                         -1, &st, NULL) != SQLITE_OK) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    const unsigned char *state = sqlite3_column_text(st, 0);
+    if (state && strcmp((const char *)state, "completed") == 0) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return EDR_OK;
+    }
+    if (!state || strcmp((const char *)state, "pending") != 0) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return EDR_ERR_INVALID_ARG;
+    }
+  } else {
+    sqlite3_finalize(st);
+    queue_state_unlock();
+    return rc == SQLITE_DONE ? EDR_ERR_INVALID_ARG : EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_finalize(st);
+  st = NULL;
+  if (p0_deferred_begin_durable_locked() != 0) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  if (sqlite3_prepare_v2(
+          s_db,
+          "UPDATE p0_deferred_match SET state='completed',payload=NULL,updated_at=?,"
+          "completed_at=?,terminal_reason=?,last_error='' "
+          "WHERE key_sha256=? AND state='pending';",
+          -1, &st, NULL) != SQLITE_OK) {
+    (void)p0_deferred_end_durable_locked(0);
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+  sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL));
+  sqlite3_bind_text(st, 3, reason, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 4, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  {
+    int changed = sqlite3_changes(s_db);
+    sqlite3_finalize(st);
+    st = NULL;
+    if (rc != SQLITE_DONE || changed != 1) {
+      (void)p0_deferred_end_durable_locked(0);
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+  }
+  if (has_wire) {
+    if (sqlite3_prepare_v2(
+            s_db,
+            "SELECT payload,compressed,severity,status FROM event_queue WHERE batch_id=?;",
+            -1, &st, NULL) != SQLITE_OK) {
+      (void)p0_deferred_end_durable_locked(0);
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+    sqlite3_bind_text(st, 1, batch_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+      const void *old_wire = sqlite3_column_blob(st, 0);
+      int old_len = sqlite3_column_bytes(st, 0);
+      const unsigned char *status = sqlite3_column_text(st, 3);
+      int exact = old_wire && old_len == (int)wire_len &&
+          memcmp(old_wire, wire, wire_len) == 0 &&
+          sqlite3_column_int(st, 1) == compressed &&
+          sqlite3_column_int(st, 2) == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL &&
+          status && strcmp((const char *)status, "pending") == 0;
+      sqlite3_finalize(st);
+      st = NULL;
+      if (!exact) {
+        (void)p0_deferred_end_durable_locked(0);
+        queue_state_unlock();
+        return EDR_ERR_INVALID_ARG;
+      }
+    } else if (rc == SQLITE_DONE) {
+      sqlite3_finalize(st);
+      st = NULL;
+      if (!queue_capacity_admit_locked(queue_event_live_cost(batch_id, wire_len),
+                                       QUEUE_CAPACITY_TERMINAL)) {
+        (void)p0_deferred_end_durable_locked(0);
+        queue_state_unlock();
+        return EDR_ERR_QUEUE_FULL;
+      }
+      if (sqlite3_prepare_v2(
+              s_db,
+              "INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,status) "
+              "VALUES(?,?,?,?,1,'pending');",
+              -1, &st, NULL) != SQLITE_OK) {
+        (void)p0_deferred_end_durable_locked(0);
+        queue_state_unlock();
+        return EDR_ERR_SQLITE_WRITE;
+      }
+      sqlite3_bind_text(st, 1, batch_id, -1, SQLITE_TRANSIENT);
+      sqlite3_bind_blob(st, 2, wire, (int)wire_len, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+      sqlite3_bind_int(st, 4, compressed);
+      rc = sqlite3_step(st);
+      sqlite3_finalize(st);
+      st = NULL;
+      if (rc != SQLITE_DONE) {
+        (void)p0_deferred_end_durable_locked(0);
+        queue_state_unlock();
+        return EDR_ERR_SQLITE_WRITE;
+      }
+      inserted = 1;
+    } else {
+      sqlite3_finalize(st);
+      (void)p0_deferred_end_durable_locked(0);
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+  }
+  if (p0_deferred_end_durable_locked(1) == 0) {
+    if (inserted) s_pending++;
+    result = EDR_OK;
+  } else {
+    (void)p0_deferred_end_durable_locked(0);
+  }
+  queue_state_unlock();
+  return result;
+}
+
+EdrError edr_storage_queue_p0_deferred_fail(const char *key_hex,
+                                             const char *reason) {
+  char key[65];
+  sqlite3_stmt *st = NULL;
+  int rc;
+  if (!p0_deferred_key_normalize(key_hex, key) || !queue_text_valid(reason))
+    return EDR_ERR_INVALID_ARG;
+  queue_state_lock();
+  if (!s_db) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_OPEN;
+  }
+  if (sqlite3_prepare_v2(s_db,
+                         "SELECT rowid,state FROM p0_deferred_match WHERE key_sha256=?;",
+                         -1, &st, NULL) != SQLITE_OK) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    sqlite3_int64 row_id = sqlite3_column_int64(st, 0);
+    const unsigned char *state = sqlite3_column_text(st, 1);
+    if (state && strcmp((const char *)state, "failed") == 0) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return EDR_OK;
+    }
+    if (!state || strcmp((const char *)state, "pending") != 0) {
+      sqlite3_finalize(st);
+      queue_state_unlock();
+      return EDR_ERR_INVALID_ARG;
+    }
+    sqlite3_finalize(st);
+    rc = p0_deferred_mark_failed_by_id_locked(row_id, reason);
+    queue_state_unlock();
+    return rc == 0 ? EDR_OK : EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_finalize(st);
+  queue_state_unlock();
+  return rc == SQLITE_DONE ? EDR_ERR_INVALID_ARG : EDR_ERR_SQLITE_WRITE;
+}
+
+EdrError edr_storage_queue_p0_deferred_retry(const char *key_hex,
+                                              const char *reason) {
+  char key[65];
+  sqlite3_stmt *st = NULL;
+  sqlite3_int64 retry_count;
+  sqlite3_int64 next_count;
+  sqlite3_int64 delay;
+  int rc;
+  if (!p0_deferred_key_normalize(key_hex, key) || !queue_text_valid(reason))
+    return EDR_ERR_INVALID_ARG;
+  queue_state_lock();
+  if (!s_db) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_OPEN;
+  }
+  if (sqlite3_prepare_v2(s_db,
+                         "SELECT retry_count FROM p0_deferred_match "
+                         "WHERE key_sha256=? AND state='pending';",
+                         -1, &st, NULL) != SQLITE_OK) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  if (rc != SQLITE_ROW) {
+    sqlite3_finalize(st);
+    queue_state_unlock();
+    return rc == SQLITE_DONE ? EDR_ERR_INVALID_ARG : EDR_ERR_SQLITE_WRITE;
+  }
+  retry_count = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  if (retry_count < 0 || retry_count == INT64_MAX) {
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  next_count = retry_count + 1;
+  delay = retry_count >= 6 ? 60 : ((sqlite3_int64)1 << retry_count);
+  if (delay > 60) delay = 60;
+  if (p0_deferred_begin_durable_locked() != 0 ||
+      sqlite3_prepare_v2(
+          s_db,
+          "UPDATE p0_deferred_match SET retry_count=?,next_retry_at=?,last_error=?,updated_at=? "
+          "WHERE key_sha256=? AND state='pending';",
+          -1, &st, NULL) != SQLITE_OK) {
+    (void)p0_deferred_end_durable_locked(0);
+    queue_state_unlock();
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_int64(st, 1, next_count);
+  sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL) + delay);
+  sqlite3_bind_text(st, 3, reason, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 4, (sqlite3_int64)time(NULL));
+  sqlite3_bind_text(st, 5, key, -1, SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  {
+    int changed = sqlite3_changes(s_db);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE || changed != 1 || p0_deferred_end_durable_locked(1) != 0) {
+      (void)p0_deferred_end_durable_locked(0);
+      queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+  }
+  queue_state_unlock();
+  return EDR_OK;
 }
 
 /* The only severity-2 insert path that may discharge a prepared/recovery
@@ -3654,6 +4341,59 @@ EdrError edr_storage_queue_open(const char *path) {
   return EDR_ERR_SQLITE_OPEN;
 }
 
+EdrError edr_storage_queue_p0_deferred_retain(const char *key_hex,
+                                               uint32_t family_mask,
+                                               const uint8_t *payload_json,
+                                               size_t payload_len) {
+  (void)key_hex;
+  (void)family_mask;
+  (void)payload_json;
+  (void)payload_len;
+  return EDR_ERR_SQLITE_OPEN;
+}
+
+int edr_storage_queue_p0_deferred_contains(const char *key_hex) {
+  (void)key_hex;
+  return -1;
+}
+
+int edr_storage_queue_p0_deferred_peek(uint32_t healthy_family_mask,
+                                       char key_out[65], uint8_t **payload_out,
+                                       size_t *payload_len_out) {
+  (void)healthy_family_mask;
+  if (key_out) key_out[0] = '\0';
+  if (payload_out) *payload_out = NULL;
+  if (payload_len_out) *payload_len_out = 0u;
+  return -1;
+}
+
+EdrError edr_storage_queue_p0_deferred_complete(const char *key_hex,
+                                                 const char *batch_id,
+                                                 const uint8_t *wire,
+                                                 size_t wire_len,
+                                                 const char *reason) {
+  (void)key_hex;
+  (void)batch_id;
+  (void)wire;
+  (void)wire_len;
+  (void)reason;
+  return EDR_ERR_SQLITE_OPEN;
+}
+
+EdrError edr_storage_queue_p0_deferred_fail(const char *key_hex,
+                                             const char *reason) {
+  (void)key_hex;
+  (void)reason;
+  return EDR_ERR_SQLITE_OPEN;
+}
+
+EdrError edr_storage_queue_p0_deferred_retry(const char *key_hex,
+                                              const char *reason) {
+  (void)key_hex;
+  (void)reason;
+  return EDR_ERR_SQLITE_OPEN;
+}
+
 void edr_storage_queue_close(void) {}
 
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
@@ -3745,6 +4485,7 @@ EdrError edr_storage_queue_p0_source_only_recovery_probe(void) {
 #ifdef EDR_STORAGE_QUEUE_TESTING
 void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count) { (void)count; }
+void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_terminal_select_allocations(
     unsigned key_count, unsigned batch_id_count, unsigned wire_count) {
   (void)key_count;

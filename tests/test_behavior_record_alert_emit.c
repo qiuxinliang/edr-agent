@@ -20,6 +20,7 @@ static int s_enqueue_severity;
 static char s_batch_id[128];
 static uint8_t s_wire[edr_v1_BehaviorEvent_size];
 static size_t s_wire_len;
+static unsigned s_snapshot_calls, s_deferred_calls;
 
 int edr_policy_v2_alert_allowed(const char *triggered_tactics, const char *subject_json) {
   (void)triggered_tactics;
@@ -31,6 +32,7 @@ int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEn
   (void)pid;
   (void)event_time_ns;
   (void)out;
+  s_snapshot_calls++;
   return -1;
 }
 
@@ -47,6 +49,13 @@ int edr_event_batch_push(const uint8_t *wire, size_t wire_len) {
 }
 
 int edr_storage_queue_is_open(void) { return s_queue_open; }
+
+EdrError edr_storage_queue_p0_deferred_complete(const char *key,const char *batch,
+    const uint8_t *wire,size_t length,const char *reason) {
+  (void)key; (void)reason;
+  s_deferred_calls++;
+  return edr_storage_queue_enqueue(batch,wire,length,0,EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);
+}
 
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire,
                                    size_t wire_len, int compressed, int severity) {
@@ -153,6 +162,37 @@ int main(void) {
   if (edr_behavior_record_emit_durable(&record) != 0 || s_enqueue_calls != 4u) {
     fprintf(stderr, "malformed source-only P0 disposition bypassed the durable contract\n");
     return 9;
+  }
+  /* Deferred combined frames must use the atomic owner port, and cannot
+   * enrich the retained source from a later PID/time-only cache snapshot. */
+  record.detection_context[0]='\0';
+  snprintf(record.event_id,sizeof(record.event_id),"deferred-source-frame");
+  record.process_start_key=UINT64_C(11540474045138508);
+  record.process_creation_filetime_100ns=UINT64_C(134337835418663457);
+  snprintf(record.parent_name,sizeof(record.parent_name),"captured-parent.exe");
+  edr_alert_governor_reset_for_test();
+  s_snapshot_calls=0u;
+  s_enqueue_result=EDR_ERR_SQLITE_WRITE;
+  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner") !=
+          EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED ||
+      s_deferred_calls!=1u || s_snapshot_calls!=0u) {
+    fprintf(stderr,"failed deferred atomic handoff or immutable source contract violated\n");
+    return 10;
+  }
+  s_enqueue_result=EDR_OK;
+  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner") !=
+          EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED || s_deferred_calls!=2u || s_snapshot_calls!=0u) {
+    fprintf(stderr,"deferred handoff did not recover through its durable owner\n");
+    return 11;
+  }
+  memset(&decoded,0,sizeof(decoded));
+  stream=pb_istream_from_buffer(s_wire,s_wire_len);
+  if (!pb_decode(&stream,edr_v1_BehaviorEvent_fields,&decoded) ||
+      strcmp(decoded.event_id,record.event_id) || !decoded.has_behavior_alert ||
+      !decoded.has_process_context ||
+      strcmp(decoded.process_context.parent_name,record.parent_name)) {
+    fprintf(stderr,"deferred wire lost captured source or parent fields\n");
+    return 12;
   }
   return 0;
 }

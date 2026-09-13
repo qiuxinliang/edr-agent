@@ -504,6 +504,7 @@ set(EDR_AGENT_SOURCES
   src/preprocess/encrypt_p0_rules.c
   src/preprocess/p0_source_only_contract.c
   src/preprocess/p0_rule_direct_emit.c
+  src/preprocess/p0_deferred_snapshot.c
   src/preprocess/process_create_coalescer.c
   src/preprocess/process_generation.c
   src/preprocess/windows_file_identity.c

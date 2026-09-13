@@ -111,6 +111,54 @@ static int pt_generation_equal(const ProcessTreeEntry *entry,
          entry->creation_filetime_100ns == creation_filetime_100ns;
 }
 
+static int pt_creation_birth_unix_ns(uint64_t creation_filetime_100ns,
+                                     uint64_t *out) {
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  if (!out || creation_filetime_100ns <= epoch ||
+      creation_filetime_100ns - epoch > UINT64_MAX / 100u) {
+    return 0;
+  }
+  *out = (creation_filetime_100ns - epoch) * 100u;
+  return *out != 0u;
+}
+
+/* Exact generations form non-overlapping PID-lifetime intervals.  This is
+ * called only for a newly inserted generation: one scan finds its next birth,
+ * and one scan closes older overlapping occupants at this birth. */
+static void pt_bound_new_exact_interval_locked(size_t new_index) {
+  ProcessTreeEntry *inserted = &g_pt_table[new_index].entry;
+  uint64_t next_birth = 0u;
+  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+    const ProcessTreeEntry *other = &g_pt_table[i].entry;
+    if (i == new_index || !g_pt_table[i].occupied ||
+        other->pid != inserted->pid || other->process_start_key == 0u ||
+        other->creation_filetime_100ns == 0u ||
+        other->start_time_ns <= inserted->start_time_ns) {
+      continue;
+    }
+    if (next_birth == 0u || other->start_time_ns < next_birth) {
+      next_birth = other->start_time_ns;
+    }
+  }
+  if (next_birth != 0u &&
+      (inserted->exit_time_ns == 0u || inserted->exit_time_ns > next_birth)) {
+    inserted->exit_time_ns = next_birth;
+  }
+  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+    ProcessTreeEntry *older = &g_pt_table[i].entry;
+    if (i == new_index || !g_pt_table[i].occupied ||
+        older->pid != inserted->pid || older->process_start_key == 0u ||
+        older->creation_filetime_100ns == 0u ||
+        older->start_time_ns >= inserted->start_time_ns) {
+      continue;
+    }
+    if (older->exit_time_ns == 0u ||
+        older->exit_time_ns > inserted->start_time_ns) {
+      older->exit_time_ns = inserted->start_time_ns;
+    }
+  }
+}
+
 static const ProcessTreeEntry *pt_get_latest_locked(uint32_t pid) {
   const ProcessTreeEntry *best = NULL;
   if (!g_pt_initialized) return NULL;
@@ -168,7 +216,8 @@ static const ProcessTreeEntry *pt_get_at_locked(uint32_t pid, uint64_t event_tim
 static int pt_put_locked(uint32_t pid, uint32_t ppid,
                          const char *process_name, const char *cmdline,
                          const char *exe_path, const char *parent_name,
-                         uint64_t start_time_ns, uint64_t process_start_key,
+                         uint64_t birth_time_ns, uint64_t observation_time_ns,
+                         uint64_t process_start_key,
                          uint64_t creation_filetime_100ns) {
   if (!g_pt_initialized) return -1;
   if ((process_start_key == 0u) != (creation_filetime_100ns == 0u)) return -1;
@@ -190,12 +239,16 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
   if (target == PT_HT_CAPACITY) {
     pt_evict_lru();
     return pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
-                         start_time_ns, process_start_key, creation_filetime_100ns);
+                         birth_time_ns, observation_time_ns, process_start_key,
+                         creation_filetime_100ns);
   }
   bool was_occupied = g_pt_table[target].occupied;
   ProcessTreeEntry *e = &g_pt_table[target].entry;
-  if (was_occupied && start_time_ns != 0u && e->start_time_ns != 0u &&
-      start_time_ns < e->start_time_ns) {
+  const int exact_generation = process_start_key != 0u &&
+                               creation_filetime_100ns != 0u;
+  if (was_occupied && !exact_generation && birth_time_ns != 0u &&
+      e->start_time_ns != 0u &&
+      birth_time_ns < e->start_time_ns) {
     g_pt_metrics.put_time_rejects++;
     return -2;
   }
@@ -205,20 +258,41 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
     g_pt_metrics.puts++;
     g_pt_metrics.entries++;
   }
-  e->pid = pid;
-  e->ppid = ppid;
-  e->process_start_key = process_start_key;
-  e->creation_filetime_100ns = creation_filetime_100ns;
-  e->start_time_ns = start_time_ns;
-  e->last_seen_ns = start_time_ns;
-  e->exit_time_ns = 0u;
-  snprintf(e->process_name, sizeof(e->process_name), "%s", process_name ? process_name : "");
-  snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline ? cmdline : "");
-  snprintf(e->exe_path, sizeof(e->exe_path), "%s", exe_path ? exe_path : "");
-  snprintf(e->parent_name, sizeof(e->parent_name), "%s", parent_name ? parent_name : "");
+  if (!was_occupied) {
+    memset(e, 0, sizeof(*e));
+    e->pid = pid;
+    e->ppid = ppid;
+    e->process_start_key = process_start_key;
+    e->creation_filetime_100ns = creation_filetime_100ns;
+    e->start_time_ns = birth_time_ns;
+    e->last_seen_ns = observation_time_ns != 0u ? observation_time_ns
+                                                : birth_time_ns;
+  } else if (exact_generation) {
+    /* Once exact generation birth/exit is present, later metadata may update
+     * observation recency but must neither move birth nor resurrect exit. */
+    if (ppid != 0u) e->ppid = ppid;
+    if (observation_time_ns > e->last_seen_ns)
+      e->last_seen_ns = observation_time_ns;
+  } else {
+    e->pid = pid;
+    e->ppid = ppid;
+    e->start_time_ns = birth_time_ns;
+    e->last_seen_ns = observation_time_ns;
+    e->exit_time_ns = 0u;
+  }
+  if (process_name && process_name[0])
+    snprintf(e->process_name, sizeof(e->process_name), "%s", process_name);
+  if (cmdline && cmdline[0])
+    snprintf(e->cmdline, sizeof(e->cmdline), "%s", cmdline);
+  if (exe_path && exe_path[0])
+    snprintf(e->exe_path, sizeof(e->exe_path), "%s", exe_path);
+  if (parent_name && parent_name[0])
+    snprintf(e->parent_name, sizeof(e->parent_name), "%s", parent_name);
   g_pt_table[target].occupied = true;
-  if (start_time_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
-    g_pt_oldest_ns = start_time_ns;
+  if (exact_generation && !was_occupied)
+    pt_bound_new_exact_interval_locked(target);
+  if (e->last_seen_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
+    g_pt_oldest_ns = e->last_seen_ns;
   }
   return 0;
 }
@@ -229,7 +303,7 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      uint64_t start_time_ns) {
   pt_lock();
   int rc = pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
-                         start_time_ns, 0u, 0u);
+                         start_time_ns, start_time_ns, 0u, 0u);
   pt_unlock();
   return rc;
 }
@@ -237,13 +311,18 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
 int edr_pt_cache_put_generation(uint32_t pid, uint32_t ppid,
                                 const char *process_name, const char *cmdline,
                                 const char *exe_path, const char *parent_name,
-                                uint64_t start_time_ns, uint64_t process_start_key,
+                                uint64_t observation_time_ns,
+                                uint64_t process_start_key,
                                 uint64_t creation_filetime_100ns) {
   int rc;
+  uint64_t birth_time_ns;
   if (!pid || !process_start_key || !creation_filetime_100ns) return -1;
+  if (!pt_creation_birth_unix_ns(creation_filetime_100ns, &birth_time_ns))
+    return -1;
   pt_lock();
   rc = pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
-                     start_time_ns, process_start_key, creation_filetime_100ns);
+                     birth_time_ns, observation_time_ns, process_start_key,
+                     creation_filetime_100ns);
   pt_unlock();
   return rc;
 }

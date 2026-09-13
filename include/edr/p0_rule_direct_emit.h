@@ -38,6 +38,10 @@ int edr_p0_rule_emit_pre_evaluation_gate(const EdrBehaviorRecord *record,
  * its own capability gate was actually accepted by SQLite. */
 int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out);
 
+/* One due, healthy-family deferred match per call; invoked by the existing
+ * preprocess loop. Snapshot and atomic queue handoff survive process restart. */
+int edr_p0_rule_poll_deferred_match(void);
+
 /* A retry-lane capacity or SQLite failure is a P0 capability boundary: no
  * direct enforcement may run while this returns false. */
 int edr_p0_rule_source_only_capability_healthy(char *reason, size_t reason_cap);
@@ -78,6 +82,8 @@ typedef struct {
   /* Normal alert governor suppression is an expected rate-limit outcome,
    * not a source-only durability failure. */
   uint64_t governor_suppressed;
+  uint64_t deferred_storage_failures;
+  int deferred_retry_degraded;
   /* A full dedup/ordinary queue never permits an unrecorded action. These
    * count the source-only NOT_EVALUABLE fallback and its durable-write error. */
   uint64_t source_only_backpressure_emitted, source_only_backpressure_failed;

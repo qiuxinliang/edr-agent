@@ -2546,7 +2546,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"stale_rejected\":%llu,\"wait_timeouts\":%llu,\"queue_deadlines\":%llu},"
         "\"offline_queue\":{\"accounting_available\":%s,\"utilization_bps\":%u,"
         "\"used_bytes\":%llu,\"max_bytes\":%llu,\"pending_rows\":%llu,"
-        "\"p0_source_only_rejected\":%llu}},"
+        "\"p0_source_only_rejected\":%llu,\"deferred_pending\":%llu,\"deferred_failed\":%llu,"
+        "\"deferred_storage_failures\":%llu,\"deferred_retry_degraded\":%s}},"
         "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
@@ -2740,6 +2741,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)queue_capacity_metrics.max_bytes,
         (unsigned long long)queue_capacity_metrics.pending_rows,
         (unsigned long long)queue_capacity_metrics.p0_source_only_rejected,
+        (unsigned long long)queue_capacity_metrics.p0_deferred_pending_rows,
+        (unsigned long long)queue_capacity_metrics.p0_deferred_failed_rows,
+        (unsigned long long)p0_emit_metrics.deferred_storage_failures,
+        p0_emit_metrics.deferred_retry_degraded ? "true" : "false",
         ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
         ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
         ch.collector_thread_id,

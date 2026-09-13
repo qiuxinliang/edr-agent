@@ -174,12 +174,22 @@ typedef struct CombinedEmitContext {
   const AVEBehaviorAlert *alert;
   EdrBehaviorRecordAlertPrepareFn prepare;
   void *prepare_context;
+  const char *deferred_key;
 } CombinedEmitContext;
 
 static int emit_record_alert_callback(void *context) {
   CombinedEmitContext *combined = context;
   if (!combined) return 0;
   if (combined->prepare && !combined->prepare(combined->prepare_context)) return 0;
+  if (combined->deferred_key) {
+    uint8_t wire[65536u + 16u];
+    char batch_id[128];
+    size_t n = edr_behavior_record_alert_encode_durable_wire(
+        combined->record, combined->alert, wire, sizeof(wire));
+    return n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id)) &&
+        edr_storage_queue_p0_deferred_complete(combined->deferred_key,
+            batch_id, wire, n, "queue_accepted") == EDR_OK;
+  }
   return emit_record_alert_raw(combined->record, combined->alert);
 }
 
@@ -274,9 +284,10 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
 #endif
 }
 
-EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(
+static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
-    EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context) {
+    EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context,
+    const char *deferred_key) {
   if (!record || !alert) {
     return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
   }
@@ -289,11 +300,14 @@ EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_p
   CombinedEmitContext combined;
   warn_encoding_once();
   AVEBehaviorAlert enriched = *alert;
-  enrich_alert_process_snapshot(&enriched);
+  /* Deferred sources already own their captured generation. A later cache
+   * lookup by PID/time alone cannot fill an exact-generation record safely. */
+  if (!deferred_key) enrich_alert_process_snapshot(&enriched);
   combined.record = record;
   combined.alert = &enriched;
   combined.prepare = prepare;
   combined.prepare_context = prepare_context;
+  combined.deferred_key = deferred_key;
   governor_outcome = edr_alert_governor_admit_and_emit(
       alert, 0, emit_record_alert_callback, &combined, &decision);
   if (decision.emit_summary) {
@@ -312,8 +326,22 @@ EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_p
 #else
   (void)prepare;
   (void)prepare_context;
+  (void)deferred_key;
   return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
 #endif
+}
+
+EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(
+    const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
+    EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context) {
+  return emit_combined_outcome(record, alert, prepare, prepare_context, NULL);
+}
+
+EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
+    const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
+    const char *deferred_key) {
+  if (!deferred_key || !deferred_key[0]) return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
+  return emit_combined_outcome(record, alert, NULL, NULL, deferred_key);
 }
 
 int edr_behavior_record_alert_emit_to_batch_with_prepare(

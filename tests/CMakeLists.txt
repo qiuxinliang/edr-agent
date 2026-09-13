@@ -659,6 +659,7 @@ if(EDR_PCRE2_AVAILABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_source_only_durable_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
     ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
@@ -909,6 +910,7 @@ add_test(NAME pe_verify COMMAND test_pe_verify WORKING_DIRECTORY ${CMAKE_BINARY_
 add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
@@ -922,6 +924,14 @@ target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT
 target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads)
 edr_apply_test_warnings(test_p0_direct_emit_suppression)
 add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_p0_deferred_snapshot test_p0_deferred_snapshot.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_p0_deferred_snapshot PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_p0_deferred_snapshot)
+add_test(NAME p0_deferred_snapshot COMMAND test_p0_deferred_snapshot)
 
 add_executable(test_preprocess_p0_dispatch_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_preprocess_p0_dispatch_contract.c)

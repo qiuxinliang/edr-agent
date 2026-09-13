@@ -42,6 +42,12 @@ EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_p
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
     EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context);
 
+/* Atomic deferred snapshot -> normal offline wire handoff. Admission and
+ * governor rules remain identical; a committed key cannot emit twice. */
+EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
+    const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
+    const char *deferred_key);
+
 /* Compatibility boolean wrapper for callers that only need durable success. */
 int edr_behavior_record_alert_emit_to_batch_with_prepare(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,

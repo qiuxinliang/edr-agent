@@ -251,7 +251,8 @@ static void format_record_time_ns(int64_t ns, char *out, size_t cap) {
 
 static uint64_t filetime_100ns_to_unix_ns(uint64_t filetime_100ns) {
   const uint64_t unix_epoch_100ns = 116444736000000000ULL;
-  if (filetime_100ns <= unix_epoch_100ns) return 0u;
+  if (filetime_100ns <= unix_epoch_100ns ||
+      filetime_100ns - unix_epoch_100ns > UINT64_MAX / 100u) return 0u;
   return (filetime_100ns - unix_epoch_100ns) * 100u;
 }
 
@@ -968,11 +969,17 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   if (!br || br->type != EDR_EVENT_PROCESS_CREATE || br->pid == 0u) {
     return;
   }
+  uint64_t child_birth_ns = filetime_100ns_to_unix_ns(br->process_creation_filetime_100ns);
+  uint64_t parent_selector_ns = child_birth_ns != 0u ? child_birth_ns
+      : (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0);
   if (br->ppid > 0u) {
     ProcessTreeEntry parent;
     int parent_from_live = 0;
     int parent_snapshot = edr_pt_cache_snapshot_at(
-        br->ppid, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), &parent);
+        br->ppid, parent_selector_ns, &parent);
+    if (parent_snapshot == 0 && br->process_creation_filetime_100ns != 0u &&
+        parent.creation_filetime_100ns > br->process_creation_filetime_100ns)
+      parent_snapshot = -2;
 #ifdef _WIN32
     if ((parent_snapshot != 0 || parent.process_start_key == 0u ||
          parent.creation_filetime_100ns == 0u || parent.start_time_ns == 0u) &&
@@ -1019,7 +1026,7 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   {
     uint32_t chain_depth = 0u;
     edr_pt_cache_fill_record_at(
-        br->pid, (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0),
+        br->pid, parent_selector_ns,
         br->grandparent_name, sizeof(br->grandparent_name), br->grandparent_path,
         sizeof(br->grandparent_path), &br->grandparent_pid, br->parent_cmdline,
         sizeof(br->parent_cmdline), &chain_depth);
@@ -1484,6 +1491,7 @@ static void poll_p0_source_only_durable_retry(void) {
    * retained source assertion). Re-evaluate the latch only after that commit. */
   (void)edr_p0_rule_source_only_recover_after_queue_open();
   process_pending_file_reads(0);
+  (void)edr_p0_rule_poll_deferred_match();
 }
 
 static void process_one_slot(const EdrEventSlot *slot) {

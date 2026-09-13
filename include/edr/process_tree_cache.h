@@ -17,8 +17,9 @@ typedef struct {
   uint32_t pid;
   uint32_t ppid;
   /* A parent may be selected only when these are captured from the same
-   * lifecycle generation.  `start_time_ns` is the ETW event-time interval
-   * selector; it is not a substitute for either generation fact. */
+   * lifecycle generation.  For exact generations `start_time_ns` is the
+   * canonical Unix birth derived from creation_filetime_100ns; observation
+   * time is tracked separately in last_seen_ns. */
   uint64_t process_start_key;
   uint64_t creation_filetime_100ns;
   uint64_t start_time_ns;
@@ -42,14 +43,15 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      const char *exe_path, const char *parent_name,
                      uint64_t start_time_ns);
 
-/* Insert or update one exact process generation.  Unlike the legacy cache
- * helper above, this never lets a later PID reuse overwrite an earlier
- * generation that can still be selected by a delayed child event's source
- * timestamp.  Both generation values must be non-zero. */
+/* Insert or update one exact process generation.  `observation_time_ns` says
+ * when this metadata was observed and only advances last_seen_ns.  The
+ * generation interval birth is canonicalized internally from
+ * creation_filetime_100ns and is immutable on later observations, as is a
+ * known exit.  Both generation values must be non-zero. */
 int edr_pt_cache_put_generation(uint32_t pid, uint32_t ppid,
                                 const char *process_name, const char *cmdline,
                                 const char *exe_path, const char *parent_name,
-                                uint64_t start_time_ns,
+                                uint64_t observation_time_ns,
                                 uint64_t process_start_key,
                                 uint64_t creation_filetime_100ns);
 

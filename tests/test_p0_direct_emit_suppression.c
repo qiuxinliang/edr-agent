@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <time.h>
+#include "p0_deferred_queue_fake.h"
 
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -32,6 +33,7 @@ int edr_p0_test_should_suppress_known_false_positive(const char *rule_id,
                                                      const char *detail,
                                                      const char **out_reason);
 
+static atomic_int g_adaptive_raises = ATOMIC_VAR_INIT(0);
 void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t pid,
                                    uint32_t parent_pid, const char *process_name) {
   (void)severity;
@@ -39,6 +41,7 @@ void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t p
   (void)pid;
   (void)parent_pid;
   (void)process_name;
+  atomic_fetch_add(&g_adaptive_raises,1);
 }
 
 static atomic_int g_emit_count = ATOMIC_VAR_INIT(0);
@@ -121,6 +124,16 @@ static void test_enforcement_execute_hook(const EdrBehaviorRecord *record,
 static const char *g_bundle_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 static AVEBehaviorAlert g_last_alert;
 static EdrBehaviorRecord g_last_record;
+EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
+    const EdrBehaviorRecord *record,const AVEBehaviorAlert *alert,const char *key) {
+  if (!g_combined_emit_allowed || deferred_complete_fails)
+    return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
+  if (g_combined_emit_outcome != EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED) return g_combined_emit_outcome;
+  if (edr_storage_queue_p0_deferred_complete(key,"fake-wire",NULL,0u,"queue_accepted")!=EDR_OK)
+    return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
+  g_emit_count++; g_last_record=*record; g_last_alert=*alert;
+  return EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED;
+}
 void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) { g_emit_count++; if (a) g_last_alert=*a; }
 int edr_behavior_record_alert_emit_to_batch(const EdrBehaviorRecord *record,
                                             const AVEBehaviorAlert *alert) {
@@ -373,6 +386,7 @@ bool edr_resource_preprocess_throttle_active(void) { return false; }
 
 int enrich_parent_info_by_pid(uint32_t ppid, char *parent_name, size_t name_len,
                               char *parent_path, size_t path_len) {
+  assert(!"P0 emission must not resolve a parent by live PID alone");
   (void)ppid;
   if (parent_name && name_len > 0u) {
     parent_name[0] = '\0';
@@ -1338,11 +1352,13 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   EdrBehaviorRecord file_match;
   EdrP0EmitMetrics metrics;
   char reason[96];
+  deferred_fake_reset();
 
   assert(setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
   assert(setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
   edr_p0_rule_test_set_monotonic_ms(2850u);
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default","ep-local");
   g_source_latch = 0;
   g_source_ack = 0;
   g_durable_emit_allowed = 1;
@@ -1384,11 +1400,209 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   snprintf(file_match.event_id, sizeof(file_match.event_id), "%s", "file-after-file-fault");
   assert(edr_p0_rule_try_emit(&file_match) == 0);
   assert(atomic_load(&g_emit_count) == 1);
+  assert(deferred_count==1u && deferred_completions==0u);
+  assert(edr_p0_rule_try_emit(&file_match)==0 && deferred_count==1u);
+  assert(edr_p0_rule_poll_deferred_match()==0); /* cannot bypass the gate */
 
   g_source_ack = 1;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   assert(edr_p0_rule_source_only_capability_healthy_for_event(
              EDR_EVENT_FILE_READ, reason, sizeof(reason)) == 1);
+  /* Healthy incoming exact replay must not race the retained owner. */
+  assert(edr_p0_rule_try_emit(&file_match)==0 && deferred_completions==0u);
+  edr_p0_rule_test_set_monotonic_ms(3000u);
+  assert(setenv("EDR_P0_DIRECT_EMIT","0",1)==0);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_completions==0u);
+  assert(setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(edr_p0_rule_poll_deferred_match()==1);
+  assert(deferred_completions==1u && atomic_load(&g_emit_count)==2);
+  assert(!strcmp(g_last_record.event_id,file_match.event_id));
+  assert(g_last_record.process_start_key==file_match.process_start_key);
+  /* Volatile dedup loss (restart) cannot reopen the completed durable owner. */
+  edr_p0_rule_test_reset_dedup();
+  assert(edr_p0_rule_try_emit(&file_match)==0);
+  assert(edr_p0_rule_poll_deferred_match()==0 && atomic_load(&g_emit_count)==2);
+  deferred_fake_reset();
+}
+
+static void retain_deferred_fixture(EdrBehaviorRecord *r, const char *event_id) {
+  EdrBehaviorRecord source;
+  deferred_fake_reset();
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default","ep-local");
+  edr_p0_rule_test_set_monotonic_ms(3000u);
+  g_ir_ready=1; g_ir_evaluation_available=0; g_source_latch=0; g_source_ack=0;
+  g_durable_emit_allowed=1; g_combined_emit_allowed=1;
+  g_combined_emit_outcome=EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED;
+  g_emit_count=0;
+  atomic_store(&g_adaptive_raises,0);
+  init_record(&source); source.type=EDR_EVENT_FILE_READ;
+  strcpy(source.event_id,"deferred-gate-source");
+  assert(edr_p0_rule_try_emit(&source)==0);
+  g_ir_evaluation_available=1;
+  init_record(r); r->type=EDR_EVENT_FILE_WRITE; r->pid=77001u;
+  snprintf(r->event_id,sizeof(r->event_id),"%s",event_id);
+  strcpy(r->process_name,"dedup-test.exe");
+  strcpy(r->parent_name,"captured-parent.exe");
+  strcpy(r->parent_path,"C:\\captured-parent.exe");
+  r->process_start_key=UINT64_C(11540474045138508);
+  r->event_time_ns=INT64_C(1789309942708556400);
+  assert(edr_p0_rule_try_emit(r)==0);
+  assert(deferred_count==1u && g_emit_count==0);
+}
+
+static void test_deferred_retry_ruleset_change_and_action_owner(void) {
+  EdrBehaviorRecord record;
+  EdrConfig alert_policy={0}, block_policy={0};
+  const char *original_sha=g_bundle_sha256;
+  alert_policy.policy_v2.script_mode=EDR_POLICY_MODE_ALERT;
+  block_policy.policy_v2.script_mode=EDR_POLICY_MODE_BLOCK;
+  edr_policy_v2_configure(&alert_policy);
+  assert(setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(setenv("EDR_P0_DEDUP_SEC","0",1)==0);
+  retain_deferred_fixture(&record,"deferred-commit-retry");
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  deferred_complete_fails=1;
+  assert(edr_p0_rule_poll_deferred_match()==0);
+  assert(deferred_completions==0u && deferred_retries==1u && g_emit_count==0);
+  assert(atomic_load(&g_adaptive_raises)==0);
+  deferred_complete_fails=0;
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  edr_p0_rule_test_set_monotonic_ms(3500u);
+  assert(edr_p0_rule_poll_deferred_match()==1);
+  assert(deferred_completions==1u && g_emit_count==1);
+  assert(atomic_load(&g_adaptive_raises)==1);
+  edr_p0_rule_test_set_monotonic_ms(3700u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && atomic_load(&g_adaptive_raises)==1);
+  assert(!strcmp(g_last_record.parent_path,record.parent_path));
+  assert(g_last_record.event_time_ns==record.event_time_ns);
+
+  retain_deferred_fixture(&record,"deferred-rule-change");
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  g_bundle_sha256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  assert(edr_p0_rule_poll_deferred_match()==0);
+  assert(deferred_rows[0].state==2 && deferred_rows[0].payload && g_emit_count==0);
+  g_bundle_sha256=original_sha;
+
+  retain_deferred_fixture(&record,"deferred-admission-boundary");
+  deferred_write_fails=1;
+  strcpy(record.event_id,"deferred-capacity-rejected");
+  assert(edr_p0_rule_try_emit(&record)==0);
+  EdrP0EmitMetrics loss_metrics;
+  edr_p0_rule_get_emit_metrics(&loss_metrics);
+  assert(loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
+  assert(!strcmp(loss_metrics.source_only_terminal_reason,"p0_deferred_admission_failed"));
+  assert(deferred_count==1u && deferred_rows[0].state==0); /* no overwrite */
+
+  edr_policy_v2_configure(&block_policy);
+  atomic_store(&g_enforcement_side_effects,0);
+  edr_policy_enforcement_test_set_execute_hook(test_enforcement_execute_hook);
+  retain_deferred_fixture(&record,"deferred-action-owner");
+  assert(edr_p0_rule_poll_deferred_match()==0);
+  assert(atomic_load(&g_enforcement_side_effects)==0);
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  edr_p0_rule_test_set_monotonic_ms(3500u);
+  deferred_complete_fails=1; /* journal commits but snapshot completion fails */
+  assert(edr_p0_rule_poll_deferred_match()==1);
+  assert(atomic_load(&g_enforcement_side_effects)==1 && deferred_completions==0u);
+  edr_p0_rule_test_reset_dedup(); /* losing the volatile owner must not act again */
+  deferred_complete_fails=0;
+  edr_p0_rule_test_set_monotonic_ms(4000u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_completions==0u);
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default","ep-local");
+  assert(edr_p0_rule_poll_deferred_match()==0);
+  assert(atomic_load(&g_enforcement_side_effects)==1 && deferred_completions==1u);
+  edr_policy_enforcement_test_set_execute_hook(NULL);
+  edr_policy_v2_configure(&alert_policy);
+  deferred_fake_reset();
+}
+
+static void test_deferred_storage_faults_are_retained_and_backed_off(void) {
+  EdrBehaviorRecord record;
+  EdrP0EmitMetrics metrics;
+  const char *original_sha = g_bundle_sha256;
+  retain_deferred_fixture(&record,"deferred-lookup-fault");
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  strcpy(record.event_id,"healthy-lookup-fault");
+  deferred_contains_fails=1;
+  assert(edr_p0_rule_try_emit(&record)==0);
+  assert(deferred_count==2u && deferred_rows[1].state==0 && g_emit_count==0);
+  deferred_contains_fails=0;
+
+  retain_deferred_fixture(&record,"deferred-fail-write-fault");
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  g_bundle_sha256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  deferred_fail_fails=1;
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_peeks==1u);
+  assert(deferred_rows[0].state==0 && deferred_rows[0].payload);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.deferred_storage_failures==1u && metrics.deferred_retry_degraded);
+  edr_p0_rule_test_set_monotonic_ms(3999u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_peeks==1u);
+  edr_p0_rule_test_set_monotonic_ms(4000u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_peeks==2u);
+  deferred_fail_fails=0;
+  edr_p0_rule_test_set_monotonic_ms(5999u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_peeks==2u);
+  edr_p0_rule_test_set_monotonic_ms(6000u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_rows[0].state==2);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.deferred_storage_failures==2u && !metrics.deferred_retry_degraded);
+  g_bundle_sha256=original_sha;
+
+  retain_deferred_fixture(&record,"deferred-retry-write-fault");
+  g_source_ack=1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  g_ir_evaluation_available=0;
+  deferred_retry_fails=1;
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_retries==1u);
+  edr_p0_rule_test_set_monotonic_ms(3999u);
+  assert(edr_p0_rule_poll_deferred_match()==0 && deferred_retries==1u);
+  assert(deferred_rows[0].state==0 && deferred_rows[0].payload);
+  deferred_retry_fails=0;
+  g_ir_evaluation_available=1;
+  edr_p0_rule_test_set_monotonic_ms(4000u);
+  assert(edr_p0_rule_poll_deferred_match()==1 && deferred_completions==1u);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.deferred_storage_failures==1u && !metrics.deferred_retry_degraded);
+  deferred_fake_reset();
+}
+
+static void test_script_matches_obey_process_family_gate(void) {
+  static const EdrEventType script_types[] = {EDR_EVENT_SCRIPT_POWERSHELL,EDR_EVENT_SCRIPT_WMI};
+  for (size_t i=0;i<sizeof(script_types)/sizeof(script_types[0]);++i) {
+    EdrBehaviorRecord source, record;
+    deferred_fake_reset();
+    edr_p0_rule_test_reset_dedup();
+    edr_p0_rule_source_only_set_runtime_identity("tenant_default","ep-local");
+    edr_p0_rule_test_set_monotonic_ms(5000u);
+    g_source_latch=0; g_source_ack=0; g_durable_emit_allowed=1;
+    g_ir_ready=1; g_ir_evaluation_available=0; g_emit_count=0;
+    atomic_store(&g_adaptive_raises,0);
+    init_record(&source);
+    strcpy(source.process_name,"dedup-test.exe");
+    assert(edr_p0_rule_try_emit(&source)==0);
+    assert(!edr_p0_rule_source_only_capability_healthy_for_event(script_types[i],NULL,0u));
+    g_ir_evaluation_available=1;
+    init_record(&record);
+    record.type=script_types[i];
+    strcpy(record.process_name,"dedup-test.exe");
+    snprintf(record.event_id,sizeof(record.event_id),"script-family-gate-%zu",i);
+    assert(edr_p0_rule_try_emit(&record)==0 && deferred_count==1u && g_emit_count==0);
+    assert(edr_p0_rule_poll_deferred_match()==0 && atomic_load(&g_adaptive_raises)==0);
+    g_source_ack=1;
+    assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+    edr_p0_rule_test_set_monotonic_ms(5100u);
+    assert(edr_p0_rule_poll_deferred_match()==1 && deferred_completions==1u);
+    assert(atomic_load(&g_adaptive_raises)==1);
+  }
+  deferred_fake_reset();
 }
 
 static void test_p0_escape_overflow_degrades_without_silent_core_loss(void) {
@@ -2251,6 +2465,9 @@ int main(void) {
   test_restart_latch_requires_durable_loss_audit();
   test_ir_not_ready_durably_preserves_every_p0_event_group();
   test_source_only_fault_is_scoped_to_owning_event_family();
+  test_deferred_retry_ruleset_change_and_action_owner();
+  test_deferred_storage_faults_are_retained_and_backed_off();
+  test_script_matches_obey_process_family_gate();
   test_p0_escape_overflow_degrades_without_silent_core_loss();
   test_p0_user_subject_overflow_degrades_without_losing_alert();
 #if !defined(_WIN32)

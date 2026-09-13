@@ -97,6 +97,13 @@ static void set_record_generation(EdrBehaviorRecord *r, uint64_t start_key) {
   r->process_creation_filetime_100ns = 133700000000000000ULL + start_key;
 }
 
+static uint64_t test_filetime_unix_ns(uint64_t creation_filetime_100ns) {
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  assert(creation_filetime_100ns > epoch);
+  assert(creation_filetime_100ns - epoch <= UINT64_MAX / 100u);
+  return (creation_filetime_100ns - epoch) * 100u;
+}
+
 static void test_checknetisolation_standard_low_risk_is_not_candidate(void) {
   EdrBehaviorRecord r;
   init_record(&r, EDR_EVENT_NET_CONNECT);
@@ -321,6 +328,40 @@ static int sqlite_table_has_column(const char *path, const char *table, const ch
   sqlite3_finalize(stmt);
   assert(sqlite3_close(db) == SQLITE_OK);
   return found;
+}
+
+static void sqlite_assert_process_parent_edge(
+    const char *path, const char *endpoint_id, uint32_t pid,
+    const char *parent_start_key, const char *parent_creation,
+    const char *parent_source, const char *parent_name,
+    const char *parent_path) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "SELECT parent_process_start_key,"
+             "parent_process_creation_filetime_100ns,"
+             "parent_process_generation_source,parent_name,parent_path "
+             "FROM process_cache WHERE endpoint_id=? AND pid=?;",
+             -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, endpoint_id, -1, SQLITE_TRANSIENT) ==
+         SQLITE_OK);
+  assert(sqlite3_bind_int64(stmt, 2, (sqlite3_int64)pid) == SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 0),
+                parent_start_key) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 1),
+                parent_creation) == 0);
+  if (strcmp((const char *)sqlite3_column_text(stmt, 2),parent_source) != 0)
+    fprintf(stderr,"parent edge source: pid=%u expected=%s actual=%s\n",pid,parent_source,
+            (const char *)sqlite3_column_text(stmt,2));
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 2), parent_source) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 3), parent_name) == 0);
+  assert(strcmp((const char *)sqlite3_column_text(stmt, 4), parent_path) == 0);
+  assert(sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
 }
 
 static void sqlite_exec_create_legacy_cache(const char *path) {
@@ -2691,6 +2732,253 @@ static void test_parent_only_nonprocess_record_does_not_create_process_slot(void
   edr_local_evidence_cache_close();
 }
 
+/* Exact field values captured from WIN-FAC3AC1PS5O.  The child was first
+ * bound to an older still-open generation of PID 3404; the real parent start
+ * then arrived late, and a later observation of that same generation used to
+ * move its birth beyond the child.  Repair must replace the whole edge, while
+ * a subsequent PID reuse must not move it again. */
+static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
+  const uint32_t parent_pid = 3404u;
+  const uint32_t child_pid = 6316u;
+  const uint64_t old_parent_key = UINT64_C(11540474045138450);
+  const uint64_t old_parent_creation = UINT64_C(134337831008307727);
+  const uint64_t real_parent_key = UINT64_C(11540474045138506);
+  const uint64_t real_parent_creation = UINT64_C(134337835417985964);
+  const uint64_t child_key = UINT64_C(11540474045138508);
+  const uint64_t child_creation = UINT64_C(134337835418663457);
+  const uint64_t reused_parent_key = UINT64_C(11540474045138606);
+  const uint64_t reused_parent_creation = child_creation + UINT64_C(100000000);
+  const uint64_t old_birth = test_filetime_unix_ns(old_parent_creation);
+  const uint64_t real_birth = test_filetime_unix_ns(real_parent_creation);
+  const uint64_t child_birth = test_filetime_unix_ns(child_creation);
+  const uint64_t reused_birth = test_filetime_unix_ns(reused_parent_creation);
+  EdrBehaviorRecord child;
+  EdrBehaviorRecord real_parent;
+  EdrBehaviorRecord reused_parent;
+  EdrBehaviorRecord sparse;
+  char tree[8192];
+#if defined(EDR_HAVE_SQLITE)
+  char db[512];
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  cleanup_test_sqlite_path(db);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+#else
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+#endif
+
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(
+             parent_pid, 3228u, "gspawn-win64-helper.exe", "old-generation",
+             "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe",
+             "qemu-ga.exe", old_birth, old_parent_key,
+             old_parent_creation) == 0);
+
+  init_record(&child, EDR_EVENT_PROCESS_CREATE);
+  child.pid = child_pid;
+  child.ppid = parent_pid;
+  child.event_time_ns = (int64_t)(child_birth + 1000000u);
+  child.process_start_key = child_key;
+  child.process_creation_filetime_100ns = child_creation;
+  snprintf(child.endpoint_id, sizeof(child.endpoint_id), "ep-parent-edge-repair");
+  snprintf(child.process_name, sizeof(child.process_name), "powershell.exe");
+  snprintf(child.exe_path, sizeof(child.exe_path),
+           "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(child.parent_name, sizeof(child.parent_name),
+           "gspawn-win64-helper.exe");
+  snprintf(child.parent_path, sizeof(child.parent_path),
+           "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  snprintf(child.parent_cmdline, sizeof(child.parent_cmdline), "old-generation");
+  edr_local_evidence_cache_observe_process(&child);
+  child.priority = 3u;
+  snprintf(child.detection_context,sizeof(child.detection_context),
+           "{\"engine\":\"p0\",\"severity\":\"P0\"}");
+  assert(edr_local_evidence_cache_is_candidate(&child));
+  snprintf(child.event_id, sizeof(child.event_id), "parent-edge-child");
+  edr_local_evidence_cache_record_behavior(&child);
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "11540474045138450") != NULL);
+#if defined(EDR_HAVE_SQLITE)
+  sqlite_assert_process_parent_edge(
+      db, child.endpoint_id, child_pid, "11540474045138450",
+      "134337831008307727", "child_birth_parent_snapshot",
+      "gspawn-win64-helper.exe",
+      "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  sparse=child;
+  sparse.pid=child_pid+1u;
+  sparse.process_start_key++;
+  sparse.process_creation_filetime_100ns++;
+  strcpy(sparse.event_id,"parent-edge-second-child");
+  edr_local_evidence_cache_observe_process(&sparse);
+  edr_local_evidence_cache_record_behavior(&sparse);
+  /* Abort the second child's repair after the first UPDATE. The observation
+   * transaction must roll both back and remain retryable on another exact
+   * parent observation. This exercises SELECT/UPDATE on the real connection. */
+  {
+    sqlite3 *fault_db=NULL;
+    assert(sqlite3_open(db,&fault_db)==SQLITE_OK);
+    assert(sqlite3_exec(fault_db,
+        "CREATE TRIGGER fail_parent_repair BEFORE UPDATE OF parent_process_start_key ON process_cache "
+        "WHEN NEW.pid=6317 AND NEW.parent_process_start_key='11540474045138506' "
+        "BEGIN SELECT RAISE(ABORT,'parent repair regression fault'); END;",NULL,NULL,NULL)==SQLITE_OK);
+    assert(sqlite3_close(fault_db)==SQLITE_OK);
+  }
+#endif
+
+  /* The real parent birth predates the child by 67.7493 ms, but its delivery
+   * and same-generation metadata update occur after the child. */
+  assert(edr_pt_cache_put_generation(
+             parent_pid, 3228u, "gspawn-win64-helper.exe", "real-generation",
+             "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe",
+             "qemu-ga.exe", real_birth, real_parent_key,
+             real_parent_creation) == 0);
+  assert(edr_pt_cache_put_generation(
+             parent_pid, 3228u, "gspawn-win64-helper.exe", "real-late-metadata",
+             "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe",
+             "qemu-ga.exe", child_birth + 2000000000u, real_parent_key,
+             real_parent_creation) == 0);
+  init_record(&real_parent, EDR_EVENT_PROCESS_CREATE);
+  real_parent.pid = parent_pid;
+  real_parent.ppid = 3228u;
+  real_parent.event_time_ns = (int64_t)(child_birth + 2000000000u);
+  real_parent.process_start_key = real_parent_key;
+  real_parent.process_creation_filetime_100ns = real_parent_creation;
+  snprintf(real_parent.endpoint_id, sizeof(real_parent.endpoint_id),
+           "ep-parent-edge-repair");
+  snprintf(real_parent.process_name, sizeof(real_parent.process_name),
+           "gspawn-win64-helper.exe");
+  snprintf(real_parent.exe_path, sizeof(real_parent.exe_path),
+           "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  snprintf(real_parent.cmdline, sizeof(real_parent.cmdline),
+           "real-late-metadata");
+  edr_local_evidence_cache_observe_process(&real_parent);
+#if defined(EDR_HAVE_SQLITE)
+  {
+    EdrEvidenceCacheStatus status;
+    sqlite3 *fault_db=NULL;
+    edr_local_evidence_cache_get_status(&status);
+    assert(strstr(status.last_error,"durable child parent repair update failed"));
+    sqlite_assert_process_parent_edge(db,child.endpoint_id,child_pid,
+        "11540474045138450","134337831008307727","child_birth_parent_snapshot",
+        "gspawn-win64-helper.exe","C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+    assert(sqlite3_open(db,&fault_db)==SQLITE_OK);
+    assert(sqlite3_exec(fault_db,"DROP TRIGGER fail_parent_repair;",NULL,NULL,NULL)==SQLITE_OK);
+    assert(sqlite3_close(fault_db)==SQLITE_OK);
+    edr_local_evidence_cache_observe_process(&real_parent);
+    sqlite_assert_process_parent_edge(db,child.endpoint_id,child_pid+1u,
+        "11540474045138506","134337835417985964","late_child_birth_parent_snapshot",
+        "gspawn-win64-helper.exe","C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  }
+#endif
+  assert(!edr_local_evidence_cache_is_candidate(&real_parent));
+  snprintf(real_parent.event_id, sizeof(real_parent.event_id),
+           "parent-edge-real-parent");
+  edr_local_evidence_cache_record_behavior(&real_parent);
+
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "11540474045138506") != NULL);
+  assert(strstr(tree, "11540474045138450") == NULL);
+#if defined(EDR_HAVE_SQLITE)
+  edr_local_evidence_cache_close();
+  sqlite_assert_process_parent_edge(
+      db, child.endpoint_id, child_pid, "11540474045138506",
+      "134337835417985964", "late_child_birth_parent_snapshot",
+      "gspawn-win64-helper.exe",
+      "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "11540474045138506") != NULL);
+  assert(strstr(tree, "11540474045138450") == NULL);
+#endif
+
+  init_record(&sparse, EDR_EVENT_FILE_WRITE);
+  sparse.pid = child_pid;
+  sparse.ppid = parent_pid;
+  sparse.event_time_ns = (int64_t)(child_birth + 3000000000u);
+  sparse.process_start_key = child_key;
+  sparse.process_creation_filetime_100ns = child_creation;
+  snprintf(sparse.endpoint_id, sizeof(sparse.endpoint_id), "ep-parent-edge-repair");
+  snprintf(sparse.process_name, sizeof(sparse.process_name), "powershell.exe");
+  edr_local_evidence_cache_observe_process(&sparse);
+  edr_local_evidence_cache_enrich_behavior(&sparse);
+  assert(strcmp(sparse.parent_name, "gspawn-win64-helper.exe") == 0);
+  assert(strcmp(sparse.parent_path,
+                "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe") == 0);
+  assert(strcmp(sparse.parent_cmdline, "real-late-metadata") == 0);
+
+  /* A replacement born after the child cannot become that child's parent,
+   * even when a much later file event observes the replacement PID. */
+  assert(edr_pt_cache_put_generation(
+             parent_pid, 3228u, "reused-parent.exe", "reused-generation",
+             "C:\\Reused\\parent.exe", "other.exe", reused_birth,
+             reused_parent_key, reused_parent_creation) == 0);
+  init_record(&reused_parent, EDR_EVENT_PROCESS_CREATE);
+  reused_parent.pid = parent_pid;
+  reused_parent.ppid = 3228u;
+  reused_parent.event_time_ns = (int64_t)(reused_birth + 1000000u);
+  reused_parent.process_start_key = reused_parent_key;
+  reused_parent.process_creation_filetime_100ns = reused_parent_creation;
+  snprintf(reused_parent.endpoint_id, sizeof(reused_parent.endpoint_id),
+           "ep-parent-edge-repair");
+  snprintf(reused_parent.process_name, sizeof(reused_parent.process_name),
+           "reused-parent.exe");
+  snprintf(reused_parent.exe_path, sizeof(reused_parent.exe_path),
+           "C:\\Reused\\parent.exe");
+  snprintf(reused_parent.cmdline, sizeof(reused_parent.cmdline),
+           "reused-generation");
+  edr_local_evidence_cache_observe_process(&reused_parent);
+  assert(!edr_local_evidence_cache_is_candidate(&reused_parent));
+  snprintf(reused_parent.event_id, sizeof(reused_parent.event_id),
+           "parent-edge-reused-parent");
+  edr_local_evidence_cache_record_behavior(&reused_parent);
+
+  memset(&sparse.parent_name, 0, sizeof(sparse.parent_name));
+  memset(&sparse.parent_path, 0, sizeof(sparse.parent_path));
+  memset(&sparse.parent_cmdline, 0, sizeof(sparse.parent_cmdline));
+  sparse.event_time_ns = (int64_t)(reused_birth + 2000000u);
+  edr_local_evidence_cache_observe_process(&sparse);
+  edr_local_evidence_cache_enrich_behavior(&sparse);
+  assert(strcmp(sparse.parent_name, "gspawn-win64-helper.exe") == 0);
+  assert(strcmp(sparse.parent_path,
+                "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe") == 0);
+  assert(strcmp(sparse.parent_cmdline, "real-late-metadata") == 0);
+  assert(strstr(sparse.parent_path, "Reused") == NULL);
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "11540474045138506") != NULL);
+  assert(strstr(tree, "11540474045138606") == NULL);
+
+#if defined(EDR_HAVE_SQLITE)
+  /* Evict short-lived process-tree history explicitly. The sparse update
+   * must preserve the durable repaired edge and its provenance, not claim a
+   * fresh snapshot or depend on wall-clock grace for the captured times. */
+  edr_pt_cache_shutdown();
+  edr_pt_cache_init();
+  sparse.priority = 3u;
+  snprintf(sparse.detection_context,sizeof(sparse.detection_context),
+           "{\"engine\":\"p0\",\"severity\":\"P0\"}");
+  assert(edr_local_evidence_cache_is_candidate(&sparse));
+  snprintf(sparse.event_id, sizeof(sparse.event_id),
+           "parent-edge-sparse-after-reuse");
+  edr_local_evidence_cache_record_behavior(&sparse);
+  edr_local_evidence_cache_close();
+  sqlite_assert_process_parent_edge(
+      db, child.endpoint_id, child_pid, "11540474045138506",
+      "134337835417985964", "late_child_birth_parent_snapshot",
+      "gspawn-win64-helper.exe",
+      "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+#endif
+
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
+#if defined(EDR_HAVE_SQLITE)
+  cleanup_test_sqlite_path(db);
+#endif
+}
+
 static void test_file_sha256_query_uses_file_evidence_cache(void) {
 #if defined(EDR_HAVE_SQLITE)
   const char *db = "rtq_file_hash_cache_test.sqlite";
@@ -2956,6 +3244,7 @@ int main(void) {
   test_delayed_generation_mismatch_withholds_all_process_enrichment();
   test_unknown_to_bound_generation_clears_provisional_metadata();
   test_parent_only_nonprocess_record_does_not_create_process_slot();
+  test_parent_edge_repairs_late_real_generation_at_child_birth();
   test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");
   return 0;

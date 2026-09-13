@@ -475,6 +475,17 @@ static int generation_equal(const EvidenceProcessGeneration *a,
          a->creation_filetime_100ns == b->creation_filetime_100ns;
 }
 
+static int generation_birth_unix_ns(uint64_t creation_filetime_100ns,
+                                    uint64_t *out) {
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  if (!out || creation_filetime_100ns <= epoch ||
+      creation_filetime_100ns - epoch > UINT64_MAX / 100u) {
+    return 0;
+  }
+  *out = (creation_filetime_100ns - epoch) * 100u;
+  return *out != 0u;
+}
+
 static uint8_t record_source_generation_shape(const EdrBehaviorRecord *r) {
   if (r && r->process_start_key != 0u &&
       r->process_creation_filetime_100ns != 0u) {
@@ -556,13 +567,46 @@ static int record_process_generation(const EdrBehaviorRecord *r,
   return generation_from_matching_record_snapshot(r, out);
 }
 
-static int record_parent_generation(const EdrBehaviorRecord *r,
-                                    EvidenceProcessGeneration *out) {
-  if (!r || !out || r->ppid == 0u) {
+/* Parent ownership is a property of the child lifetime.  Later file/network
+ * events can happen after the parent exits and its PID is reused, so their
+ * own event timestamps are not allowed to move an already bound edge. */
+static int record_parent_snapshot(const EdrBehaviorRecord *r,
+                                  ProcessTreeEntry *snapshot) {
+  uint64_t child_birth_ns = 0u;
+  uint64_t selector_ns;
+  if (!r || !snapshot || r->ppid == 0u) {
     return 0;
   }
+  selector_ns = r->event_time_ns > 0 ? (uint64_t)r->event_time_ns : 0u;
+  if (generation_birth_unix_ns(r->process_creation_filetime_100ns,
+                               &child_birth_ns)) {
+    selector_ns = child_birth_ns;
+  }
+  memset(snapshot, 0, sizeof(*snapshot));
+  if (selector_ns == 0u ||
+      edr_pt_cache_snapshot_at(r->ppid, selector_ns, snapshot) != 0 ||
+      snapshot->process_start_key == 0u ||
+      snapshot->creation_filetime_100ns == 0u) {
+    return 0;
+  }
+  if (r->process_creation_filetime_100ns != 0u &&
+      snapshot->creation_filetime_100ns >
+          r->process_creation_filetime_100ns) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    return 0;
+  }
+  return 1;
+}
+
+static int record_parent_generation(const EdrBehaviorRecord *r,
+                                    EvidenceProcessGeneration *out) {
+  ProcessTreeEntry snapshot;
+  if (!out || !record_parent_snapshot(r, &snapshot)) return 0;
   memset(out, 0, sizeof(*out));
-  return generation_from_snapshot(r->ppid, r->event_time_ns, out);
+  out->process_start_key = snapshot.process_start_key;
+  out->creation_filetime_100ns = snapshot.creation_filetime_100ns;
+  out->start_time_ns = snapshot.start_time_ns;
+  return 1;
 }
 
 /* The source label is evidence metadata too: do not turn an event-time
@@ -580,10 +624,11 @@ static const char *record_process_generation_source(const EdrBehaviorRecord *r) 
 }
 
 static const char *record_parent_generation_source(const EdrBehaviorRecord *r) {
-  EvidenceProcessGeneration generation;
-  return r && generation_from_snapshot(r->ppid, r->event_time_ns, &generation)
-             ? "event_time_parent_snapshot"
-             : "";
+  ProcessTreeEntry snapshot;
+  if (!record_parent_snapshot(r, &snapshot)) return "";
+  return r->process_creation_filetime_100ns != 0u
+             ? "child_birth_parent_snapshot"
+             : "event_time_parent_snapshot";
 }
 
 static int proc_generation_matches_record(const ProcSlot *p,
@@ -595,9 +640,13 @@ static int proc_generation_matches_record(const ProcSlot *p,
 
 static int proc_parent_generation_matches_record(const ProcSlot *p,
                                                  const EdrBehaviorRecord *r) {
-  EvidenceProcessGeneration generation;
-  return p && record_parent_generation(r, &generation) &&
-         generation_equal(&p->parent_generation, &generation);
+  /* Once an exact child lifetime owns a parent edge, a later actor event does
+   * not need the parent generation to remain in the short-lived process-tree
+   * history.  Requiring another snapshot here made a valid edge disappear
+   * after the parent exit grace, or change when that PID was reused. */
+  return p && r && proc_generation_matches_record(p, r) &&
+         generation_bound(&p->parent_generation) &&
+         (r->ppid == 0u || p->ppid == r->ppid);
 }
 
 static int same_endpoint(const ProcSlot *p, const EdrBehaviorRecord *r) {
@@ -666,6 +715,79 @@ static int should_update_process_cache(const EdrBehaviorRecord *r) {
          r->process_creation_time[0];
 }
 
+static void proc_slot_bind_parent_snapshot(ProcSlot *child,
+                                           const ProcessTreeEntry *parent,
+                                           const char *source) {
+  EvidenceProcessGeneration generation;
+  int changed;
+  if (!child || !parent || parent->process_start_key == 0u ||
+      parent->creation_filetime_100ns == 0u) {
+    return;
+  }
+  memset(&generation, 0, sizeof(generation));
+  generation.process_start_key = parent->process_start_key;
+  generation.creation_filetime_100ns = parent->creation_filetime_100ns;
+  generation.start_time_ns = parent->start_time_ns;
+  changed = generation_bound(&child->parent_generation) &&
+            !generation_equal(&child->parent_generation, &generation);
+  if (changed) {
+    child->parent_name[0] = '\0';
+    child->parent_path[0] = '\0';
+    child->parent_cmdline[0] = '\0';
+  }
+  child->parent_generation = generation;
+  copy_s(child->parent_process_generation_source,
+         sizeof(child->parent_process_generation_source), source);
+  if (parent->process_name[0])
+    copy_s(child->parent_name, sizeof(child->parent_name),
+           parent->process_name);
+  if (parent->exe_path[0])
+    copy_s(child->parent_path, sizeof(child->parent_path), parent->exe_path);
+  if (parent->cmdline[0])
+    copy_s(child->parent_cmdline, sizeof(child->parent_cmdline),
+           parent->cmdline);
+}
+
+/* A real parent ProcessStart can be delivered after its child.  Repair only
+ * children for which an event-time snapshot at the immutable child birth now
+ * selects this exact parent generation.  Creation ordering prevents a later
+ * PID reuse from being rewritten as the historical parent. */
+static void repair_child_parent_edges(const EdrBehaviorRecord *parent,
+                                      const EvidenceProcessGeneration *generation) {
+  if (!parent || !generation_bound(generation) || parent->pid == 0u ||
+      parent->type != EDR_EVENT_PROCESS_CREATE ||
+      !edr_process_create_is_lifecycle_authoritative(parent)) {
+    return;
+  }
+  for (size_t i = 0u; i < EDR_EVIDENCE_PROC_SLOTS; ++i) {
+    ProcSlot *child = &s_proc[i];
+    ProcessTreeEntry selected;
+    uint64_t child_birth_ns;
+    if (child->pid == 0u || child->pid == parent->pid ||
+        child->ppid != parent->pid || !generation_bound(&child->generation) ||
+        generation->creation_filetime_100ns >
+            child->generation.creation_filetime_100ns ||
+        (child->endpoint_id[0] && parent->endpoint_id[0] &&
+         strcmp(child->endpoint_id, parent->endpoint_id) != 0) ||
+        !generation_birth_unix_ns(
+            child->generation.creation_filetime_100ns, &child_birth_ns) ||
+        edr_pt_cache_snapshot_at(parent->pid, child_birth_ns, &selected) != 0 ||
+        selected.process_start_key != generation->process_start_key ||
+        selected.creation_filetime_100ns !=
+            generation->creation_filetime_100ns) {
+      continue;
+    }
+    if (generation_bound(&child->parent_generation) &&
+        !generation_equal(&child->parent_generation, generation) &&
+        generation->creation_filetime_100ns <=
+            child->parent_generation.creation_filetime_100ns) {
+      continue;
+    }
+    proc_slot_bind_parent_snapshot(child, &selected,
+                                   "late_child_birth_parent_snapshot");
+  }
+}
+
 static void process_cache_update(const EdrBehaviorRecord *r) {
   if (!should_update_process_cache(r)) {
     return;
@@ -674,8 +796,19 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
                      r->creator_username[0] || r->creator_domain[0] || r->creator_sid[0] || r->creator_logon_id[0];
   EvidenceProcessGeneration incoming_generation;
   EvidenceProcessGeneration incoming_parent_generation;
+  ProcessTreeEntry incoming_parent_snapshot;
   int incoming_generation_known = record_process_generation(r, &incoming_generation);
-  int incoming_parent_generation_known = record_parent_generation(r, &incoming_parent_generation);
+  int incoming_parent_generation_known =
+      record_parent_snapshot(r, &incoming_parent_snapshot);
+  memset(&incoming_parent_generation, 0, sizeof(incoming_parent_generation));
+  if (incoming_parent_generation_known) {
+    incoming_parent_generation.process_start_key =
+        incoming_parent_snapshot.process_start_key;
+    incoming_parent_generation.creation_filetime_100ns =
+        incoming_parent_snapshot.creation_filetime_100ns;
+    incoming_parent_generation.start_time_ns =
+        incoming_parent_snapshot.start_time_ns;
+  }
   int64_t incoming_time_ns = r->event_time_ns;
   if (strcmp(r->identity_quality, "target_4688") == 0) s_status.identity_target_4688++;
   else if (strcmp(r->identity_quality, "creator_fallback") == 0) s_status.identity_creator_fallback++;
@@ -735,11 +868,15 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
     p->ppid = r->ppid;
   }
   p->last_seen_ns = record_time_ns(r);
-  if (incoming_parent_generation_known) {
-    p->parent_generation = incoming_parent_generation;
-    copy_s(p->parent_process_generation_source,
-           sizeof(p->parent_process_generation_source),
-           record_parent_generation_source(r));
+  if (incoming_parent_generation_known &&
+      incoming_parent_generation.creation_filetime_100ns <=
+          p->generation.creation_filetime_100ns &&
+      (!generation_bound(&p->parent_generation) ||
+       generation_equal(&p->parent_generation, &incoming_parent_generation) ||
+       incoming_parent_generation.creation_filetime_100ns >
+           p->parent_generation.creation_filetime_100ns)) {
+    proc_slot_bind_parent_snapshot(p, &incoming_parent_snapshot,
+                                   record_parent_generation_source(r));
   }
   if (incoming_generation_known) {
     copy_s(p->process_generation_source, sizeof(p->process_generation_source),
@@ -761,15 +898,6 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   }
   if (r->cmdline[0]) {
     copy_s(p->cmdline, sizeof(p->cmdline), r->cmdline);
-  }
-  if (r->parent_name[0]) {
-    copy_s(p->parent_name, sizeof(p->parent_name), r->parent_name);
-  }
-  if (r->parent_path[0]) {
-    copy_s(p->parent_path, sizeof(p->parent_path), r->parent_path);
-  }
-  if (r->parent_cmdline[0]) {
-    copy_s(p->parent_cmdline, sizeof(p->parent_cmdline), r->parent_cmdline);
   }
   if (r->username[0] || r->user_sid[0]) {
     int incoming = identity_quality_rank(r->identity_quality);
@@ -809,13 +937,27 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   if (r->process_creation_time[0]) {
     copy_s(p->process_creation_time, sizeof(p->process_creation_time), r->process_creation_time);
   }
+  repair_child_parent_edges(r, &incoming_generation);
 }
+
+#if defined(EDR_HAVE_SQLITE)
+static int repair_child_parent_edges_sqlite(const EdrBehaviorRecord *parent,
+                                           const EvidenceProcessGeneration *generation);
+#endif
 
 void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
   if (!r) return;
   evidence_cache_lock();
   s_status.identity_observations_total++;
   process_cache_update(r);
+#if defined(EDR_HAVE_SQLITE)
+  if (r->type == EDR_EVENT_PROCESS_CREATE &&
+      edr_process_create_is_lifecycle_authoritative(r)) {
+    EvidenceProcessGeneration generation;
+    if (record_process_generation(r,&generation))
+      (void)repair_child_parent_edges_sqlite(r,&generation);
+  }
+#endif
   evidence_cache_unlock();
 }
 
@@ -2155,9 +2297,137 @@ static void bind_text(sqlite3_stmt *st, int idx, const char *s) {
   sqlite3_bind_text(st, idx, s ? s : "", -1, SQLITE_TRANSIENT);
 }
 
+/* Persist the same conservative late-parent repair used by the hot cache.
+ * Every child row is revalidated against the process-tree interval at that
+ * child's immutable creation time; PPID alone is never authority.  Parent
+ * tuple and display fields are updated by one statement in one observation
+ * transaction, so a restart cannot expose a mixed old/new edge. */
+static int repair_child_parent_edges_sqlite(
+    const EdrBehaviorRecord *parent,
+    const EvidenceProcessGeneration *parent_generation) {
+  static const char *select_sql =
+      "SELECT pid,process_start_key,process_creation_filetime_100ns,"
+      "parent_process_start_key,parent_process_creation_filetime_100ns "
+      "FROM process_cache WHERE endpoint_id=? AND ppid=? AND pid<>?;";
+  static const char *update_sql =
+      "UPDATE process_cache SET parent_process_start_key=?,"
+      "parent_process_creation_filetime_100ns=?,"
+      "parent_process_generation_source=?,parent_name=?,parent_path=? "
+      "WHERE endpoint_id=? AND pid=? AND ppid=? AND process_start_key=? "
+      "AND process_creation_filetime_100ns=?;";
+  sqlite3_stmt *select_st = NULL;
+  sqlite3_stmt *update_st = NULL;
+  char parent_start_key[32];
+  char parent_creation[32];
+  int step_rc;
+  int result = -1;
+  int transaction_started = 0;
+
+  if (!s_db || !parent || !generation_bound(parent_generation) ||
+      parent->pid == 0u || parent->type != EDR_EVENT_PROCESS_CREATE ||
+      !edr_process_create_is_lifecycle_authoritative(parent)) {
+    return 0;
+  }
+  /* Identity observations need not be detection candidates. Repair existing
+   * durable child rows on the observation path without persisting every
+   * ordinary parent as a new candidate or fabricating high-priority context. */
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+  transaction_started = 1;
+  if (sqlite3_prepare_v2(s_db, select_sql, -1, &select_st, NULL) !=
+      SQLITE_OK) {
+    set_error("prepare durable child parent repair scan failed");
+    goto done;
+  }
+  if (sqlite3_prepare_v2(s_db, update_sql, -1, &update_st, NULL) !=
+      SQLITE_OK) {
+    set_error("prepare durable child parent repair update failed");
+    goto done;
+  }
+  bind_text(select_st, 1, parent->endpoint_id);
+  sqlite3_bind_int64(select_st, 2, (sqlite3_int64)parent->pid);
+  sqlite3_bind_int64(select_st, 3, (sqlite3_int64)parent->pid);
+  sqlite_u64_decimal(parent_generation->process_start_key, parent_start_key);
+  sqlite_u64_decimal(parent_generation->creation_filetime_100ns,
+                     parent_creation);
+
+  while ((step_rc = sqlite3_step(select_st)) == SQLITE_ROW) {
+    const uint32_t child_pid = (uint32_t)sqlite3_column_int64(select_st, 0);
+    const char *child_start_text =
+        (const char *)sqlite3_column_text(select_st, 1);
+    const char *child_creation_text =
+        (const char *)sqlite3_column_text(select_st, 2);
+    const char *old_parent_start_text =
+        (const char *)sqlite3_column_text(select_st, 3);
+    const char *old_parent_creation_text =
+        (const char *)sqlite3_column_text(select_st, 4);
+    uint64_t child_start_key = 0u;
+    uint64_t child_creation = 0u;
+    uint64_t old_parent_start_key = 0u;
+    uint64_t old_parent_creation = 0u;
+    uint64_t child_birth_ns = 0u;
+    ProcessTreeEntry selected;
+    const int old_parent_bound =
+        sqlite_decimal_u64(old_parent_start_text, &old_parent_start_key) &&
+        sqlite_decimal_u64(old_parent_creation_text, &old_parent_creation);
+
+    if (!sqlite_decimal_u64(child_start_text, &child_start_key) ||
+        !sqlite_decimal_u64(child_creation_text, &child_creation) ||
+        parent_generation->creation_filetime_100ns > child_creation ||
+        !generation_birth_unix_ns(child_creation, &child_birth_ns) ||
+        edr_pt_cache_snapshot_at(parent->pid, child_birth_ns, &selected) != 0 ||
+        selected.process_start_key != parent_generation->process_start_key ||
+        selected.creation_filetime_100ns !=
+            parent_generation->creation_filetime_100ns) {
+      continue;
+    }
+    if (old_parent_bound &&
+        (old_parent_start_key != parent_generation->process_start_key ||
+         old_parent_creation !=
+             parent_generation->creation_filetime_100ns) &&
+        parent_generation->creation_filetime_100ns <= old_parent_creation) {
+      continue;
+    }
+
+    sqlite3_reset(update_st);
+    sqlite3_clear_bindings(update_st);
+    bind_text(update_st, 1, parent_start_key);
+    bind_text(update_st, 2, parent_creation);
+    bind_text(update_st, 3, "late_child_birth_parent_snapshot");
+    bind_text(update_st, 4, selected.process_name);
+    bind_text(update_st, 5, selected.exe_path);
+    bind_text(update_st, 6, parent->endpoint_id);
+    sqlite3_bind_int64(update_st, 7, (sqlite3_int64)child_pid);
+    sqlite3_bind_int64(update_st, 8, (sqlite3_int64)parent->pid);
+    bind_text(update_st, 9, child_start_text);
+    bind_text(update_st, 10, child_creation_text);
+    if (sqlite3_step(update_st) != SQLITE_DONE) {
+      set_error("durable child parent repair update failed");
+      goto done;
+    }
+  }
+  if (step_rc != SQLITE_DONE) {
+    set_error("durable child parent repair scan failed");
+    goto done;
+  }
+  if (exec_sql("COMMIT;") != 0) goto done;
+  transaction_started = 0;
+  result = 0;
+
+done:
+  sqlite3_finalize(update_st);
+  sqlite3_finalize(select_st);
+  if (transaction_started) {
+    char *error = NULL;
+    (void)sqlite3_exec(s_db,"ROLLBACK;",NULL,NULL,&error);
+    sqlite3_free(error);
+  }
+  return result;
+}
+
 static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   EvidenceProcessGeneration generation;
   EvidenceProcessGeneration parent_generation;
+  ProcessTreeEntry parent_snapshot;
   char start_key[32], creation[32], parent_start_key[32], parent_creation[32];
   int parent_known;
   int preserve_stronger_identity = 0;
@@ -2168,7 +2438,14 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
      * restarted lifetime in SQLite. */
     return 0;
   }
-  parent_known = record_parent_generation(r, &parent_generation);
+  parent_known = record_parent_snapshot(r, &parent_snapshot);
+  memset(&parent_generation, 0, sizeof(parent_generation));
+  if (parent_known) {
+    parent_generation.process_start_key = parent_snapshot.process_start_key;
+    parent_generation.creation_filetime_100ns =
+        parent_snapshot.creation_filetime_100ns;
+    parent_generation.start_time_ns = parent_snapshot.start_time_ns;
+  }
   sqlite_u64_decimal(generation.process_start_key, start_key);
   sqlite_u64_decimal(generation.creation_filetime_100ns, creation);
   if (parent_known) {
@@ -2285,8 +2562,11 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 5, r->process_name);
   bind_text(st, 6, r->exe_path);
   bind_text(st, 7, r->cmdline);
-  bind_text(st, 8, r->parent_name);
-  bind_text(st, 9, r->parent_path);
+  /* Parent display and generation must come from one child-birth snapshot.
+   * Never persist a newly recomputed tuple beside stale fields carried by an
+   * earlier record revision. */
+  bind_text(st, 8, parent_known ? parent_snapshot.process_name : r->parent_name);
+  bind_text(st, 9, parent_known ? parent_snapshot.exe_path : r->parent_path);
   sqlite3_bind_int64(st, 10, (sqlite3_int64)ts);
   sqlite3_bind_int64(st, 11, (sqlite3_int64)ts);
   bind_text(st, 12, start_key);
@@ -3343,6 +3623,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "parent_process_generation_source TEXT,username TEXT,domain TEXT,user_sid TEXT,"
       "logon_id TEXT,identity_source TEXT,identity_quality TEXT,exe_hash TEXT,"
       "PRIMARY KEY(endpoint_id,pid));"
+      "CREATE INDEX IF NOT EXISTS idx_process_cache_parent ON process_cache(endpoint_id,ppid);"
       "CREATE TABLE IF NOT EXISTS event_cache ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT,endpoint_id TEXT,tenant_id TEXT,"
       "event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,"

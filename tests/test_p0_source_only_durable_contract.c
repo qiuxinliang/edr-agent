@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "p0_deferred_queue_fake.h"
 
 #define SOURCE_FIXTURE_CASES 3u
 #define RULESET_EVALUATION_FIXTURE_CASES 6u
@@ -1073,6 +1074,7 @@ static void print_terminal_durable_fixture(void) {
 
 int main(int argc, char **argv) {
   size_t i;
+  deferred_fake_reset();
   int emit_contract = argc == 2 && strcmp(argv[1], "--emit-p0-source-only-contract") == 0;
   int emit_fixture = argc == 2 && strcmp(argv[1], "--emit-p0-source-only-durable-fixture") == 0;
   int emit_terminal_golden = argc == 2 && strcmp(argv[1], "--emit-terminal-authority-golden") == 0;

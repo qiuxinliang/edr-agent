@@ -6,6 +6,7 @@
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_match.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/p0_deferred_snapshot.h"
 #include "edr/policy_enforcement.h"
 #include "edr/policy_v2.h"
 #include "edr/p0_source_only_contract.h"
@@ -97,6 +98,9 @@ static p0_source_only_committed_slot
 static uint32_t s_p0_source_only_retry_next;
 static uint32_t s_p0_source_only_committed_next;
 static uint64_t s_p0_source_only_retry_generation;
+static uint64_t s_p0_deferred_next_poll_ms;
+static uint64_t s_p0_deferred_storage_failures;
+static unsigned s_p0_deferred_consecutive_failures;
 static uint64_t s_p0_source_only_retry_attempts;
 static uint64_t s_p0_source_only_retry_committed;
 static uint64_t s_p0_source_only_retry_capacity_exhausted;
@@ -140,6 +144,9 @@ void edr_p0_rule_test_reset_dedup(void) {
   s_p0_source_only_retry_next = 0u;
   s_p0_source_only_committed_next = 0u;
   s_p0_source_only_retry_generation = 0u;
+  s_p0_deferred_next_poll_ms = 0u;
+  s_p0_deferred_storage_failures = 0u;
+  s_p0_deferred_consecutive_failures = 0u;
   s_p0_source_only_retry_attempts = 0u;
   s_p0_source_only_retry_committed = 0u;
   s_p0_source_only_retry_capacity_exhausted = 0u;
@@ -213,6 +220,8 @@ void edr_p0_rule_get_emit_metrics(EdrP0EmitMetrics *out) {
   out->minimal_failures=s_p0_emit_minimal_failures; out->emitted_without_full_context=s_p0_emit_emitted_without_full_context;
   out->critical_reservations=s_p0_emit_critical_reservations;
   out->governor_suppressed=s_p0_emit_governor_suppressed;
+  out->deferred_storage_failures=s_p0_deferred_storage_failures;
+  out->deferred_retry_degraded=s_p0_deferred_consecutive_failures != 0u;
   out->source_only_backpressure_emitted=s_p0_emit_source_only_backpressure_emitted;
   out->source_only_backpressure_failed=s_p0_emit_source_only_backpressure_failed;
   out->source_only_retry_pending = 0u;
@@ -3300,7 +3309,8 @@ static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
 
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma, const EdrP0RuleIrBinding *binding,
-                        const char *known_fp_reason) {
+                        const char *known_fp_reason, const char *deferred_key,
+                        const char **terminal_reason) {
   EdrPolicyEnforcementResult enforcement;
   EdrP0EmitMetrics emitted_metrics = {0};
   p0_dedup_reservation dedup_reservation = {0};
@@ -3325,6 +3335,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           fprintf(stderr, "[P0 DEBUG] emit blocked: cmdline contains forensic path (pid=%u)\n", br->pid);
         p0_observe_rule_disposition(br, rule_id, "rejected",
                                     "agent_forensic_command", known_fp_reason, 0u);
+        if (terminal_reason) *terminal_reason = "agent_forensic_command";
         return 0;
       }
       while (*cl == ' ' || *cl == '"') cl++;
@@ -3350,6 +3361,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   if (edr_policy_v2_mode_for_alert(mitre_comma, rule_id) < EDR_POLICY_MODE_ALERT) {
     p0_observe_rule_disposition(br, rule_id, "rejected", "policy_below_alert",
                                 known_fp_reason, 0u);
+    if (terminal_reason) *terminal_reason = "policy_below_alert";
     return 0;
   }
   if (!binding || !binding->rules_bundle_version[0] ||
@@ -3359,6 +3371,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     }
     p0_observe_rule_disposition(br, rule_id, "rejected",
                                 "invalid_ir_binding", known_fp_reason, 0u);
+    if (terminal_reason) *terminal_reason = "invalid_ir_binding";
     return 0;
   }
   /* Planning has no side effect.  The owner claim and durable intent below
@@ -3408,6 +3421,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
         br, rule_id, dedup_pending_backpressure ? "source_only" : "rejected",
         dedup_pending_backpressure ? "p0_dedup_pending_backpressure" : "exact_replay_dedup",
         known_fp_reason, exact_replay_count);
+    if (terminal_reason && !dedup_pending_backpressure)
+      *terminal_reason = "exact_replay_dedup";
     return 0;
   } else {
     p0_state_unlock();
@@ -3423,6 +3438,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   enforcement_prepare.result = &enforcement;
   enforcement_prepare.binding = *binding;
   if (enforcement.requested && !p0_prepare_enforcement(&enforcement_prepare)) {
+    if (terminal_reason && strcmp(enforcement_prepare.failure_reason, "terminal_intent_existing") == 0)
+      *terminal_reason = "terminal_journal_owned";
     p0_state_lock();
     p0_dedup_rollback(&dedup_reservation);
     p0_rate_rollback(&rate_reservation);
@@ -3529,11 +3546,9 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     snprintf(parent_name_buf, sizeof(parent_name_buf), "%s", br->parent_name);
     snprintf(parent_path_buf, sizeof(parent_path_buf), "%s", br->parent_path);
 
-    /* Fill parent metadata before JSON escaping when the ETW record lacks it. */
-    if (!parent_name_buf[0] && br->ppid > 0) {
-      enrich_parent_info_by_pid(br->ppid, parent_name_buf, sizeof(parent_name_buf), parent_path_buf,
-                                sizeof(parent_path_buf));
-    }
+    /* Parent evidence is captured before matching under generation checks.
+     * A live PID lookup here (especially during deferred replay) can describe
+     * a different parent lifetime. Preserve missing fields instead. */
 
     p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 48);
     p0_json_escape_or_empty(binding->rules_bundle_version, esc_bundle, sizeof(esc_bundle), 128);
@@ -3779,7 +3794,15 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
       ? (p0_finish_enforcement_terminal(&enforcement_prepare, &a)
              ? EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED
              : EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED)
-      : edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(br, &a, NULL, NULL);
+      : (deferred_key ? edr_behavior_record_alert_emit_deferred(br, &a, deferred_key)
+                      : edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(br, &a, NULL, NULL));
+  if (terminal_reason && enforcement.requested &&
+      emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED)
+    *terminal_reason = "terminal_journal_owned";
+  if (terminal_reason && emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_GOVERNOR_SUPPRESSED)
+    *terminal_reason = "alert_governor";
+  if (terminal_reason && emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_POLICY_DENIED)
+    *terminal_reason = "policy_denied";
   if (emit_outcome != EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED) {
     p0_state_lock();
     /* A requested enforcement already has a durable intent and may have
@@ -3829,6 +3852,159 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   p0_observe_rule_disposition(br, rule_id, "emitted", "queue_accepted",
                               known_fp_reason, 0u);
   return 1;
+}
+
+/* A gate withholds authority, not the already matched evidence. Ownership
+ * remains in the normal queue database until a healthy-family replay atomically
+ * converts this exact snapshot into a wire, or records an explicit terminal
+ * disposition. No process or SQLite access is performed under s_p0_state_lock. */
+static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
+    const EdrP0RuleIrBinding *binding, const char *rule_id, int gate_closed) {
+  char *json = NULL;
+  size_t length = 0u;
+  char key[65];
+  int owned = -1;
+  if (edr_p0_deferred_snapshot_encode(br,binding,rule_id,&json,&length) &&
+      edr_sha256_hex((const uint8_t *)json,length,key)==0) {
+    owned = gate_closed
+        ? (edr_storage_queue_p0_deferred_retain(key,p0_source_only_family_for_event(br->type),
+               (const uint8_t *)json,length)==EDR_OK ? 1 : -1)
+        : edr_storage_queue_p0_deferred_contains(key);
+    if (owned < 0 && !gate_closed) {
+      /* A failed ownership lookup is not an absent owner. Retain the exact
+       * source idempotently before leaving the healthy direct path. */
+      owned = edr_storage_queue_p0_deferred_retain(key,
+          p0_source_only_family_for_event(br->type),(const uint8_t *)json,length)
+          == EDR_OK ? 1 : -1;
+      gate_closed = 1;
+    }
+  }
+  free(json);
+  if (owned < 0) {
+    p0_state_lock();
+    p0_source_only_mark_unhealthy_for_event_locked("p0_deferred_admission_failed",1,br->type);
+    p0_state_unlock();
+    p0_source_only_sync_persistent_latch();
+    p0_observe_rule_disposition(br,rule_id,"source_only","p0_deferred_admission_failed","",0u);
+    return 1;
+  }
+  if (owned) p0_observe_rule_disposition(br,rule_id,"deferred",
+      gate_closed ? "family_gate_durable" : "durable_owner_exists","",0u);
+  return owned;
+}
+
+static void p0_deferred_storage_result(EdrError result, const char *operation) {
+  uint64_t delay_ms = 0u;
+  p0_state_lock();
+  if (result == EDR_OK) {
+    s_p0_deferred_consecutive_failures = 0u;
+  } else {
+    s_p0_deferred_storage_failures++;
+    if (s_p0_deferred_consecutive_failures < 7u)
+      s_p0_deferred_consecutive_failures++;
+    delay_ms = UINT64_C(1000) << (s_p0_deferred_consecutive_failures - 1u);
+    if (delay_ms > 60000u) delay_ms = 60000u;
+    s_p0_deferred_next_poll_ms = p0_monotonic_ms() + delay_ms;
+  }
+  p0_state_unlock();
+  if (result != EDR_OK)
+    fprintf(stderr,"[P0] deferred recovery degraded: operation=%s error=%d retry_ms=%llu; retained owner unchanged\n",
+        operation,(int)result,(unsigned long long)delay_ms);
+}
+
+int edr_p0_rule_poll_deferred_match(void) {
+  static const EdrEventType family_types[] = {EDR_EVENT_PROCESS_CREATE,
+      EDR_EVENT_FILE_WRITE, EDR_EVENT_NET_CONNECT, EDR_EVENT_REG_SET_VALUE};
+  uint32_t healthy = 0u;
+  uint8_t *json = NULL;
+  size_t length = 0u;
+  char key[65], expected_key[65], rule_id[64];
+  EdrBehaviorRecord *record;
+  EdrP0RuleIrBinding stored;
+  EdrP0RuleIrEvaluation evaluation;
+  const char *terminal = NULL;
+  uint64_t now = p0_monotonic_ms();
+  int selected, emitted = 0, found = 0;
+  if (!getenv_int01_disabled_on_zero("EDR_P0_DIRECT_EMIT")) return 0;
+  p0_state_lock();
+  if (!s_p0_source_only_runtime_tenant[0] || !s_p0_source_only_runtime_endpoint[0] ||
+      !strcmp(s_p0_source_only_runtime_endpoint,"auto")) {
+    p0_state_unlock(); return 0;
+  }
+  if (now < s_p0_deferred_next_poll_ms) { p0_state_unlock(); return 0; }
+  s_p0_deferred_next_poll_ms = now + 100u;
+  p0_state_unlock();
+  for (size_t i=0; i<sizeof(family_types)/sizeof(family_types[0]); ++i)
+    if (edr_p0_rule_source_only_capability_healthy_for_event(family_types[i],NULL,0u))
+      healthy |= p0_source_only_family_for_event(family_types[i]);
+  if (!healthy || !edr_p0_rule_ir_is_ready()) return 0;
+  selected = edr_storage_queue_p0_deferred_peek(healthy,key,&json,&length);
+  if (selected <= 0) {
+    if (selected < 0) p0_deferred_storage_result(EDR_ERR_SQLITE_WRITE,"peek");
+    return 0;
+  }
+  record = malloc(sizeof(*record));
+  if (!record) {
+    free(json);
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,"snapshot_allocation_failed"),"retry_allocation");
+    return 0;
+  }
+  if (!edr_p0_deferred_snapshot_decode((const char *)json,length,record,&stored,rule_id,sizeof(rule_id)) ||
+      edr_sha256_hex(json,length,expected_key)!=0 || strcmp(key,expected_key)!=0) {
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,"snapshot_invalid_or_unsupported"),"fail_invalid");
+    free(json); free(record); return 0;
+  }
+  free(json);
+  if (!edr_p0_rule_source_only_capability_healthy_for_event(record->type,NULL,0u)) {
+    free(record); return 0;
+  }
+  p0_state_lock();
+  if ((s_p0_source_only_runtime_endpoint[0] && strcmp(record->endpoint_id,s_p0_source_only_runtime_endpoint)) ||
+      (s_p0_source_only_runtime_tenant[0] && strcmp(record->tenant_id,s_p0_source_only_runtime_tenant)))
+    terminal = "runtime_identity_changed";
+  p0_state_unlock();
+  if (terminal) {
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,terminal),"fail_identity");
+    free(record); return 0;
+  }
+  memset(&evaluation,0,sizeof(evaluation));
+  if (!edr_p0_rule_ir_evaluate_record(record,&evaluation)) {
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,"p0_ir_evaluation_unavailable"),"retry_evaluation");
+    free(record); return 0;
+  }
+  if (strcmp(stored.artifact_sha256,evaluation.binding.artifact_sha256) ||
+      strcmp(stored.rules_bundle_version,evaluation.binding.rules_bundle_version)) {
+    /* Retain the evidence, but never execute an old rule under a different
+     * signed ruleset. The failed count is an actionable recovery diagnostic. */
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,"ruleset_changed_before_replay"),"fail_ruleset");
+    edr_p0_rule_ir_evaluation_free(&evaluation); free(record); return 0;
+  }
+  for (uint32_t i=0; i<evaluation.match_count; ++i) {
+    EdrP0RuleIrMatch match;
+    if (edr_p0_rule_ir_evaluation_get_match(&evaluation,i,&match) && !strcmp(match.rule_id,rule_id)) {
+      found=1;
+      emitted=emit_for_rule(record,rule_id,match.severity,match.title,match.mitre_csv,
+          &evaluation.binding,"",key,&terminal);
+      if (emitted) {
+        const char *name = record->process_name;
+        if (!name[0] && record->type == EDR_EVENT_SCRIPT_POWERSHELL) name = "powershell.exe";
+        if (!name[0] && record->type == EDR_EVENT_SCRIPT_WMI) name = "wmiprvse.exe";
+        edr_adaptive_collection_raise(match.severity,rule_id,record->pid,record->ppid,name);
+      }
+      break;
+    }
+  }
+  edr_p0_rule_ir_evaluation_free(&evaluation);
+  if (!found) p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,"retained_rule_no_longer_matches"),"fail_no_match");
+  else if (terminal) {
+    if (edr_storage_queue_p0_deferred_complete(key,NULL,NULL,0u,terminal)!=EDR_OK)
+      p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,"terminal_handoff_failed"),"retry_terminal");
+    else p0_deferred_storage_result(EDR_OK,"complete_terminal");
+  } else if (!emitted) p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,"alert_handoff_retry"),"retry_alert");
+  else p0_deferred_storage_result(EDR_OK,"complete_alert");
+  if (emitted) edr_p0_rule_observe_validation_stage(record,"deferred_replay","queue_accepted");
+  free(record);
+  return emitted;
 }
 
 /* A present IR whose evaluation cannot complete is not permission to fall
@@ -4003,6 +4179,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     int descriptor_failure = 0;
     int registry_best_index = -1;
     int registry_best_severity = -1;
+    int gate_closed = 0;
     memset(&evaluation, 0, sizeof(evaluation));
     if (edr_p0_rule_ir_evaluate_record(br, &evaluation)) {
       edr_p0_rule_observe_validation_stage(
@@ -4016,8 +4193,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       if (p0_is_ruleset_evaluation_event(br->type) &&
           !edr_p0_rule_source_only_capability_healthy_for_event(br->type, NULL, 0u)) {
         edr_p0_rule_observe_validation_stage(br, "family_gate", "source_only_pending");
-        edr_p0_rule_ir_evaluation_free(&evaluation);
-        return 0;
+        gate_closed = 1;
       }
       if (br->type == EDR_EVENT_REG_SET_VALUE || br->type == EDR_EVENT_REG_CREATE_KEY) {
         /* A single registry write can match both a canonical persistence rule
@@ -4046,6 +4222,9 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         if (registry_best_index >= 0 && i != registry_best_index) {
           continue;
         }
+        gate_closed = gate_closed ||
+            !edr_p0_rule_source_only_capability_healthy_for_event(br->type,NULL,0u);
+        if (p0_defer_or_already_owned(br,&evaluation.binding,rid,gate_closed)) continue;
         const char *known_fp_reason = "";
         if (!p0_should_suppress_known_false_positive(
                 rid, br, detail, &known_fp_reason)) {
@@ -4057,7 +4236,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         if (emit_for_rule(br, rid, match.severity,
                           match.title[0] ? match.title : rid,
                           match.mitre_csv, &evaluation.binding,
-                          known_fp_reason)) {
+                          known_fp_reason, NULL, NULL)) {
           emitted_count++;
           edr_adaptive_collection_raise(match.severity, rid, br->pid, br->ppid,
                                         (pn && pn[0]) ? pn : br->process_name);
