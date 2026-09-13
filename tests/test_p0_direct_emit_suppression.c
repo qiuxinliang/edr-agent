@@ -18,12 +18,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <time.h>
 #include "p0_deferred_queue_fake.h"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+static int setenv(const char *name, const char *value, int overwrite) {
+  if (!overwrite && getenv(name) != NULL) return 0;
+  return _putenv_s(name, value);
+}
+#else
 #include <pthread.h>
 extern int setenv(const char *, const char *, int);
 #endif
