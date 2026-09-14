@@ -52,6 +52,7 @@ if (-not (Test-Path -LiteralPath $project)) {
     throw "Missing setup UI project: $project"
 }
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $scriptDir "..\..")).Path
+. (Join-Path $repositoryRoot 'scripts\WindowsStoreSigning.ps1')
 $nugetConfig = Join-Path $repositoryRoot "NuGet.Config"
 if (-not (Test-Path -LiteralPath $nugetConfig -PathType Leaf)) {
     throw "Missing repository NuGet source policy: $nugetConfig"
@@ -107,6 +108,10 @@ function Invoke-SignIfConfigured([string] $Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Cannot sign missing file: $Path"
     }
+    if ($env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT) {
+        Invoke-EdRStoreAuthenticodeSign -Path $Path -Thumbprint $env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT
+        return $true
+    }
     $custom = [string]$env:EDR_WINDOWS_SIGN_COMMAND
     if ($custom) {
         $cmd = $custom.Replace('{path}', $Path)
@@ -158,6 +163,9 @@ function Invoke-SignIfConfigured([string] $Path) {
 }
 
 function Get-ManifestPublisherThumbprint {
+    if ($env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT) {
+        return (Get-EdRStoreSigningCertificate -Thumbprint $env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT).Thumbprint
+    }
     $custom = [string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND
     if ($custom) {
         $thumbprint = ([string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGNER_THUMBPRINT -replace '[\s:-]', '').ToUpperInvariant()
@@ -183,6 +191,10 @@ function Get-ManifestPublisherThumbprint {
 }
 
 function Write-DetachedManifestSignature([string] $ManifestPath, [string] $SignaturePath) {
+    if ($env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT) {
+        Write-EdRStoreDetachedCms -ContentPath $ManifestPath -SignaturePath $SignaturePath -Thumbprint $env:EDR_WINDOWS_SIGNING_STORE_THUMBPRINT
+        return $true
+    }
     $custom = [string]$env:EDR_AGENT_RELEASE_MANIFEST_SIGN_COMMAND
     if ($custom) {
         $cmd = $custom.Replace('{content}', $ManifestPath).Replace('{signature}', $SignaturePath)
