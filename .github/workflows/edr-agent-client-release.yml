@@ -1214,6 +1214,10 @@ jobs:
         with:
           name: usb-input-${{ matrix.arch }}
           path: ${{ runner.temp }}/usb-input-${{ matrix.arch }}/
+          # Stage-WindowsUsbSigningInput copies only tracked release sources and
+          # explicit build products. Preserve entries such as .gitignore too:
+          # dropping them would invalidate the signed-input inventory.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
 
