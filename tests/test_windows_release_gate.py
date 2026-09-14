@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -93,6 +94,51 @@ class WindowsReleaseGateTests(unittest.TestCase):
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
+
+    def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
+        """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
+        names = ("windows_release_collector_pe_closure",
+                 "windows_inplace_collector_transaction")
+        definitions = (ROOT / "tests" / "CMakeLists.txt").read_text(encoding="utf-8")
+        declarations = []
+        for name in names:
+            match = re.search(
+                rf"  add_test\(NAME {re.escape(name)}\n.*?"
+                r"(?=\n  (?:add_test|set_tests_properties)\()", definitions, re.DOTALL)
+            self.assertIsNotNone(match, f"Missing CTest declaration for {name}")
+            declarations.append(match.group(0).replace(
+                "${CMAKE_CURRENT_SOURCE_DIR}", (ROOT / "tests").as_posix()).replace(
+                "${CMAKE_SOURCE_DIR}", ROOT.as_posix()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            foreign_modules = source / "foreign modules"
+            foreign_modules.mkdir()
+            inherited = os.environ.copy()
+            inherited["PSModulePath"] = str(foreign_modules)
+            (source / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\n"
+                "project(packaging_launch_boundary NONE)\nenable_testing()\n"
+                + "\n".join(declarations), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            listing = self.run_command("ctest", "--test-dir", str(build),
+                                       "--show-only=json-v1")
+            tests = json.loads(listing.stdout)["tests"]
+            self.assertEqual({test["name"] for test in tests}, set(names))
+            probe = [sys.executable, "-c",
+                     "import os; assert 'PSModulePath' not in os.environ"]
+            # Negative control: the intermediate process inherits the foreign path.
+            self.run_command(*probe, success=False, env=inherited)
+            for test in tests:
+                command = test["command"]
+                host_index = command.index("powershell.exe")
+                # Execute the real wrapper on every host, without simulating Windows.
+                self.run_command(*command[:host_index], *probe, env=inherited)
+            if os.name == "nt":
+                self.run_command("ctest", "--test-dir", str(build),
+                                 "--output-on-failure", "--timeout", "30", env=inherited)
+            self.assertEqual(inherited["PSModulePath"], str(foreign_modules))
 
     def test_sqlite_header_relocation_includes_vcpkg_companion(self):
         with tempfile.TemporaryDirectory() as directory:

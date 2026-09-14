@@ -168,11 +168,13 @@ if(WIN32)
   add_test(NAME agent_update_embedded_resource COMMAND test_agent_update_embedded_resource)
   set_tests_properties(agent_update_embedded_resource PROPERTIES
     ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+  # CTest inherits PSModulePath from CI's pwsh host. Windows PowerShell must
+  # rebuild its own module path before startup (not import PowerShell 7 modules).
   add_test(NAME windows_release_collector_pe_closure
-    COMMAND powershell.exe -NoProfile -Command
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_release_collector_pe_closure.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
   add_test(NAME windows_inplace_collector_transaction
-    COMMAND powershell.exe -NoProfile -Command
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_inplace_collector_transaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
   set_tests_properties(
     windows_release_collector_pe_closure
