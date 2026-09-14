@@ -186,7 +186,12 @@ function Assert-BaselineRepair([string] $SetupPath) {
   Add-Evidence $stage "verified" "uninstaller_restored=true identity_preserved=true queue_preserved=true evidence_preserved=true"
   Remove-Item -LiteralPath $backupDir -Recurse -Force
 }
-function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage, [bool] $RequireModernLifecycleAssets = $true) {
+function Assert-InstalledRuntime(
+  [string] $ExpectedVersion,
+  [string] $Stage,
+  [bool] $RequireModernLifecycleAssets = $true,
+  [bool] $RequireBuiltinCollector = $false
+) {
   $versionPath = Join-Path $InstallDir "VERSION"
   if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
     throw "$Stage did not install VERSION"
@@ -199,6 +204,13 @@ function Assert-InstalledRuntime([string] $ExpectedVersion, [string] $Stage, [bo
     $path = Join-Path $InstallDir $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$Stage is missing $name" }
     & $archVerifier -Path $path -Architecture $Architecture
+  }
+  if ($RequireBuiltinCollector) {
+    $builtinCollector = Join-Path $InstallDir "collector\forensic_collector_builtin.exe"
+    if (-not (Test-Path -LiteralPath $builtinCollector -PathType Leaf)) {
+      throw "$Stage is missing collector\forensic_collector_builtin.exe"
+    }
+    & $archVerifier -Path $builtinCollector -Architecture $Architecture
   }
   foreach ($name in @("package-capabilities.json", "unins000.exe")) {
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDir $name) -PathType Leaf)) {
@@ -282,7 +294,7 @@ try {
   # Validate the target independently first. A broken historical baseline must
   # not hide whether the candidate can install and uninstall on a clean host.
   Invoke-Installer $TargetSetupExe "install-target-fresh" $false
-  Assert-InstalledRuntime $TargetVersion "install-target-fresh"
+  Assert-InstalledRuntime $TargetVersion "install-target-fresh" $true $true
   Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"
 
   # Then verify the cross-version compatibility path using a baseline that is
@@ -291,7 +303,7 @@ try {
   Assert-InstalledRuntime $BaselineVersion "install-baseline" (-not $SkipSetupRollback)
   Assert-BaselineRepair $BaselineSetupExe
   Invoke-Installer $TargetSetupExe "upgrade-target" $true
-  Assert-InstalledRuntime $TargetVersion "upgrade-target"
+  Assert-InstalledRuntime $TargetVersion "upgrade-target" $true $true
   if ($SkipSetupRollback) {
     Add-Evidence "rollback-baseline" "skipped" "legacy baseline predates the immutable full-Setup rollback contract; native runtime rollback remains mandatory"
     Invoke-UninstallerAndAssertCleanup "uninstall-after-upgrade"

@@ -277,6 +277,20 @@ function Get-Sha256 {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Test-SupportedNativeRuntimeComponent {
+  param(
+    [Parameter(Mandatory = $true)][string]$Name,
+    [Parameter(Mandatory = $true)][string[]]$RequiredRootComponents
+  )
+  if ($Name -ceq 'collector/forensic_collector_builtin.exe') {
+    return $true
+  }
+  $normalized = $Name.Replace('\', '/')
+  return $normalized -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe)$' -and
+    [System.IO.Path]::GetFileName($normalized) -eq $normalized -and
+    ($normalized -in $RequiredRootComponents -or [System.IO.Path]::GetExtension($normalized) -ieq '.dll')
+}
+
 function Assert-InstalledRuntimeIdentity {
   param(
     [Parameter(Mandatory = $true)][string]$InstallDirectory,
@@ -292,7 +306,8 @@ function Assert-InstalledRuntimeIdentity {
     throw 'installed Runtime component identity schema is invalid'
   }
   $files = @($manifest.files)
-  $required = @('FDSecurityInstallerWorker.exe','uninstall.exe')
+  $requiredRoot = @('FDSecurityInstallerWorker.exe','uninstall.exe')
+  $required = $requiredRoot
   if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
     throw 'installed Runtime component identity file count is invalid'
   }
@@ -300,9 +315,7 @@ function Assert-InstalledRuntimeIdentity {
   foreach ($componentSpec in $files) {
     $component = [string]$componentSpec.name
     $hash = ([string]$componentSpec.sha256).ToLowerInvariant()
-    if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe)$' -or
-        [System.IO.Path]::GetFileName($component) -ne $component -or
-        ($component -notin $required -and [System.IO.Path]::GetExtension($component) -ine '.dll') -or
+    if (-not (Test-SupportedNativeRuntimeComponent -Name $component -RequiredRootComponents $requiredRoot) -or
         $hash -notmatch '^[0-9a-f]{64}$') {
       throw "installed Runtime component identity entry is invalid: $component"
     }
@@ -466,9 +479,11 @@ function Get-RuntimeUpdatePlan {
           throw "runtime package contains unsafe entry: $name"
         }
         # A Headless base package can contain optional rules and third-party
-        # directories. The updater never extracts those entries: only the
-        # flat, integrity-listed lifecycle helpers below are eligible.
-        if ([string]::IsNullOrWhiteSpace($name) -or $name.EndsWith('/') -or $name.Contains('/')) {
+        # directories. Only root lifecycle components and the fixed native
+        # forensic fallback path can enter the transactional runtime plan.
+        $isBuiltinCollector = $name -ceq 'collector/forensic_collector_builtin.exe'
+        if ([string]::IsNullOrWhiteSpace($name) -or $name.EndsWith('/') -or
+            ($name.Contains('/') -and -not $isBuiltinCollector)) {
           continue
         }
         $key = $name.ToLowerInvariant()
@@ -486,21 +501,18 @@ function Get-RuntimeUpdatePlan {
         throw "unsupported runtime package integrity schema: $($integrity.schema)"
       }
       $files = @($integrity.files)
-      $required = @('FDSecurityInstallerWorker.exe','uninstall.exe')
+      $requiredRoot = @('FDSecurityInstallerWorker.exe','uninstall.exe')
+      $required = $requiredRoot
       if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
-        throw 'runtime package integrity manifest must contain the native uninstall chain and at most 61 app-local DLLs'
+        throw 'runtime package integrity manifest must contain the native uninstall chain and at most 61 app-local DLLs or the fixed forensic fallback'
       }
       $sourceRoot = Join-Path $manifestDirectory 'runtime-components'
       New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
       $declared = @{}
       foreach ($componentSpec in $files) {
         $component = [string]$componentSpec.name
-        if ($component -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe)$' -or
-            [System.IO.Path]::GetFileName($component) -ne $component) {
+        if (-not (Test-SupportedNativeRuntimeComponent -Name $component -RequiredRootComponents $requiredRoot)) {
           throw "runtime package integrity manifest contains an unsupported component: $component"
-        }
-        if ($component -notin $required -and [System.IO.Path]::GetExtension($component) -ine '.dll') {
-          throw "runtime package integrity manifest may only add app-local DLLs: $component"
         }
         $componentKey = $component.ToLowerInvariant()
         if ($declared.ContainsKey($componentKey)) { throw "runtime package integrity manifest contains a duplicate component: $component" }
@@ -510,6 +522,7 @@ function Get-RuntimeUpdatePlan {
           throw "runtime package component is missing or invalid: $component"
         }
         $destination = Join-Path $sourceRoot $component
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
         $input = $entry.Open()
         try {
           $output = [System.IO.File]::Open($destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
@@ -552,8 +565,10 @@ function Get-RuntimeUpdatePlan {
   foreach ($entry in $files) {
     $name = [string]$entry.name
     $hash = ([string]$entry.sha256).ToLowerInvariant()
-    if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1|\.json)$' -or
-        [System.IO.Path]::GetFileName($name) -ne $name) {
+    $isBuiltinCollector = $name -ceq 'collector/forensic_collector_builtin.exe'
+    if ((-not $isBuiltinCollector) -and
+        ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:\.dll|\.exe|\.ps1|\.json)$' -or
+         [System.IO.Path]::GetFileName($name) -ne $name)) {
       throw "invalid runtime component name in manifest: $name"
     }
     if ([System.IO.Path]::GetExtension($name) -ieq '.json' -and $name -ine 'native-package-integrity.json') {
@@ -605,6 +620,7 @@ function Stage-RuntimeUpdatePlan {
   param([object[]]$Plan)
 
   foreach ($item in @($Plan)) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $item.CandidatePath) | Out-Null
     Copy-Item -LiteralPath $item.SourcePath -Destination $item.CandidatePath -Force
     $actualHash = Get-Sha256 -Path $item.CandidatePath
     if ($actualHash -ne $item.ExpectedSha256) {

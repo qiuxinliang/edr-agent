@@ -1008,6 +1008,20 @@ static void test_kernel_file_read_generation_bridge(void) {
   assert(strcmp(r.image_path_canonical, "C:\\ProgramData\\P0Validation\\reader.exe") == 0);
   assert(strcmp(r.source_completeness, "COALESCED") == 0);
 
+  /* FileObject/Create is independent path evidence for an actual Read, not
+   * proof of actor generation. Preserve the binding provenance in the record. */
+  fill_slot(&slot, EDR_EVENT_FILE_READ,
+            "ETW1\nprov=kfile\npid=7211\nfile=C:\\Fixture\\existing.txt\n"
+            "file_key=0x7f00aa11\nfile_read_file_object=0x123456789\n"
+            "file_read_binding_quality=etw_fileobject_create\n");
+  edr_behavior_from_slot(&slot, &r);
+  assert(strcmp(r.file_path, "C:\\Fixture\\existing.txt") == 0);
+  assert(strcmp(r.file_op, "read") == 0);
+  assert(strstr(r.script_snippet, "file_read_binding_quality=etw_fileobject_create"));
+  assert(strstr(r.script_snippet, "file_read_file_object=0x123456789"));
+  assert(r.process_start_key == 0u);
+  assert(r.process_creation_filetime_100ns == 0u);
+
   /* A provider that cannot return ProcessStartKey remains source-only.  It
    * must not acquire a fabricated generation from PID or callback time. */
   fill_slot(&slot, EDR_EVENT_FILE_READ,

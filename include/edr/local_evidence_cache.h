@@ -54,6 +54,11 @@ typedef struct {
   uint64_t write_budget_dropped;
   uint64_t write_budget_candidate_dropped;
   uint64_t write_budget_context_dropped;
+  /* Critical action/ancestry context is capacity-bound rather than governed by
+   * a fixed per-minute counter: used/limit/dropped stay zero. Database size,
+   * retention, bounded context windows, generation/tenant scope, and transaction
+   * failures remain authoritative. The aggregate used/limit fields describe
+   * ordinary context. */
   uint64_t write_budget_critical_context_dropped;
   uint64_t write_budget_ordinary_context_dropped;
   uint32_t write_budget_used;

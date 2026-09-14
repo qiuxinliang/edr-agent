@@ -19,6 +19,18 @@ void edr_test_file_object_binding_contract(void) {
   assert(!edr_file_object_binding_resolve(entries, count, &history, object, 99));
   assert(!edr_file_object_binding_resolve(entries, count, &history, 0, 150));
   assert(!edr_file_object_binding_resolve(entries, count, &history, object + 1, 150));
+  /* The same lifetime contract applies to Read. No NameCreate is needed
+   * when the actual Read's FileObject has an independently observed Create.
+   * Neither an absent binding nor a conflicting live FileKey may be guessed. */
+  int read_conflict = 0;
+  const char *read_path = edr_file_object_binding_resolve(entries, count, &history, object, 150);
+  assert(edr_file_mutation_binding_select(NULL, read_path, 0, 0, &read_conflict) == read_path);
+  assert(!read_conflict);
+  assert(!edr_file_mutation_binding_select("C:\\Wrong.txt", read_path, 0, 0, &read_conflict));
+  assert(read_conflict);
+  assert(!edr_file_mutation_binding_select(NULL,
+      edr_file_object_binding_resolve(entries, count, &history, object, 200),
+      0, 0, &read_conflict));
   edr_file_object_binding_open(entries, count, &history, object, 300, "C:\\Fixture\\new.txt");
   assert(strcmp(edr_file_object_binding_resolve(entries, count, &history, object, 150), path) == 0);
   assert(strstr(edr_file_object_binding_resolve(entries, count, &history, object, 350), "new.txt"));

@@ -79,6 +79,12 @@ foreach ($target in $targets) {
 $integrityPath = Join-Path $runtime 'native-package-integrity.json'
 $integrity = Get-Content -LiteralPath $integrityPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($integrity.schema -ne 'edr.windows.native-package-integrity.v1') { throw 'Unknown native runtime integrity schema' }
+$builtinIdentityName = 'collector/forensic_collector_builtin.exe'
+$builtinIdentityEntries = @($integrity.files | Where-Object { $_.name -ceq $builtinIdentityName })
+if ($builtinIdentityEntries.Count -gt 1) { throw 'Native runtime integrity contains duplicate forensic builtin entries' }
+if ($builtinIdentityEntries.Count -eq 0) {
+    $integrity.files = @($integrity.files) + [pscustomobject]@{ name=$builtinIdentityName; sha256=(Get-Sha (Join-Path $collector 'forensic_collector_builtin.exe')) }
+}
 foreach ($entry in $integrity.files) { $entry.sha256 = Get-Sha (Get-SafeChild $runtime $entry.name) }
 Write-Json $integrityPath $integrity
 # The old bundled installer is not a native runtime component. It must be

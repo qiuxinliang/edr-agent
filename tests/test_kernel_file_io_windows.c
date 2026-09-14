@@ -15,7 +15,7 @@ static void number(BYTE *buffer, size_t *offset, uint64_t value, size_t bytes) {
   *offset += bytes;
 }
 
-static void test_file_schema(unsigned version, size_t pointer_bytes) {
+static void test_file_schema(unsigned version, size_t pointer_bytes, unsigned event_id) {
   BYTE data[256] = {0};
   EVENT_RECORD record = {0};
   EdrSensorInterestEvent interest;
@@ -31,12 +31,12 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   record.EventHeader.Flags = pointer_bytes == 8u ? EVENT_HEADER_FLAG_64_BIT_HEADER
                                                  : EVENT_HEADER_FLAG_32_BIT_HEADER;
   record.EventHeader.ProcessId = 9416u;
-  record.EventHeader.EventDescriptor.Id = 16u;
-  record.EventHeader.EventDescriptor.Task = 16u;
+  record.EventHeader.EventDescriptor.Id = (USHORT)event_id;
+  record.EventHeader.EventDescriptor.Task = (USHORT)event_id;
   record.EventHeader.EventDescriptor.Version = (BYTE)version;
-  record.EventHeader.EventDescriptor.Keyword = 0x220u;
+  record.EventHeader.EventDescriptor.Keyword = event_id == 15u ? 0x120u : 0x220u;
   record.EventHeader.EventDescriptor.Level = 4u;
-  /* Actual Kernel-File Write v0/v1 manifest order, not C struct alignment. */
+  /* Kernel-File Read/Write v0/v1 manifest order, not C struct alignment. */
   number(data, &used, 0u, 8u);       /* ByteOffset */
   number(data, &used, 1u, pointer_bytes); /* Irp */
   if (version == 0u) number(data, &used, 7u, pointer_bytes); /* ThreadId */
@@ -53,7 +53,8 @@ static void test_file_schema(unsigned version, size_t pointer_bytes) {
   assert(edr_tdh_kernel_file_extract_file_object(&record, &extracted_object));
   assert(extracted_object == object && extracted_object != key);
   const uint64_t writer_object = extracted_object;
-  assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_FILE_WRITE, "kfile", &interest));
+  assert(edr_tdh_build_sensor_interest_event(&record,
+      event_id == 15u ? EDR_EVENT_FILE_READ : EDR_EVENT_FILE_WRITE, "kfile", &interest));
   assert(interest.pid == 9416u && interest.path[0] == '\0');
   /* A Write has no generic text properties. Its zero result is why the
    * collector must use the compact FileKey-bound payload builder. */
@@ -228,8 +229,10 @@ static void test_actor_handle(void) {
 
 int main(void) {
   for (unsigned version = 0u; version <= 1u; ++version) {
-    test_file_schema(version, 4u);
-    test_file_schema(version, 8u);
+    test_file_schema(version, 4u, 15u);
+    test_file_schema(version, 8u, 15u);
+    test_file_schema(version, 4u, 16u);
+    test_file_schema(version, 8u, 16u);
     test_mutation_schema(version, 4u);
     test_mutation_schema(version, 8u);
   }

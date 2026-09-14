@@ -20,6 +20,7 @@ REQUIRED_NATIVE = (
     "FDSecurityInstallerWorker.exe",
     "uninstall.exe",
 )
+FORENSIC_BUILTIN = "collector/forensic_collector_builtin.exe"
 RUNTIME_SUFFIXES = (".dll", ".sys")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -64,8 +65,9 @@ def runtime_identity(package: Path) -> dict[str, str]:
         if not isinstance(item, dict) or set(item) != {"name", "sha256"}:
             raise ValueError("native-package-integrity.json contains an invalid file entry")
         name = str(item["name"])
-        if PurePosixPath(name).name != name:
-            raise ValueError(f"native component name must be flat: {name}")
+        normalized_name = _normalized_entry_name(name)
+        if normalized_name != name or (PurePosixPath(name).name != name and name != FORENSIC_BUILTIN):
+            raise ValueError(f"unsupported native component path: {name}")
         sha256 = str(item["sha256"]).strip().lower()
         if not SHA256_PATTERN.fullmatch(sha256):
             raise ValueError(f"native component SHA-256 is invalid: {name}")
@@ -74,7 +76,7 @@ def runtime_identity(package: Path) -> dict[str, str]:
             raise ValueError(f"duplicate native component: {name}")
         declared[key] = sha256
 
-    allowed = {name.lower() for name in REQUIRED_NATIVE}
+    allowed = {name.lower() for name in REQUIRED_NATIVE} | {FORENSIC_BUILTIN.lower()}
     for name in declared:
         if name not in allowed and not name.endswith(".dll"):
             raise ValueError(f"unsupported native component: {name}")
@@ -90,6 +92,17 @@ def runtime_identity(package: Path) -> dict[str, str]:
         if actual != expected:
             raise ValueError(f"native component hash mismatch: {required}")
         identity[key] = actual
+
+    forensic_key = FORENSIC_BUILTIN.lower()
+    forensic_expected = declared.get(forensic_key)
+    forensic_content = entries.get(forensic_key)
+    if forensic_expected is not None or forensic_content is not None:
+        if forensic_expected is None or not forensic_content:
+            raise ValueError(f"forensic runtime component is missing or unbound: {FORENSIC_BUILTIN}")
+        forensic_actual = hashlib.sha256(forensic_content).hexdigest()
+        if forensic_actual != forensic_expected:
+            raise ValueError(f"native component hash mismatch: {FORENSIC_BUILTIN}")
+        identity[forensic_key] = forensic_actual
 
     for name, content in entries.items():
         if "/" not in name and name.endswith(RUNTIME_SUFFIXES):

@@ -168,6 +168,16 @@ if(WIN32)
   add_test(NAME agent_update_embedded_resource COMMAND test_agent_update_embedded_resource)
   set_tests_properties(agent_update_embedded_resource PROPERTIES
     ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
+  add_test(NAME windows_release_collector_pe_closure
+    COMMAND powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_release_collector_pe_closure.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  add_test(NAME windows_inplace_collector_transaction
+    COMMAND powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_inplace_collector_transaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  set_tests_properties(
+    windows_release_collector_pe_closure
+    windows_inplace_collector_transaction
+    PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
@@ -345,6 +355,34 @@ if(WIN32)
   target_compile_definitions(test_kernel_file_io_windows PRIVATE EDR_FILE_OBJECT_BINDING_NO_MAIN=1)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
+
+  # Keep the real collector decoder and discard unrelated service entry points.
+  # MSVC needs packaged functions and non-incremental REF even in Debug builds.
+  add_executable(test_collector_file_read_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_collector_file_read_windows.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/collector_file_read_stubs.c
+    ${CMAKE_SOURCE_DIR}/src/collector/collector_win.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+    ${CMAKE_SOURCE_DIR}/src/core/time_util.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+  target_include_directories(test_collector_file_read_windows PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(test_collector_file_read_windows PRIVATE
+    EDR_COLLECTOR_FILE_IO_TESTING=1)
+  if(MSVC)
+    target_compile_options(test_collector_file_read_windows PRIVATE /Gy /Gw)
+    target_link_options(test_collector_file_read_windows PRIVATE /OPT:REF /INCREMENTAL:NO)
+  else()
+    target_compile_options(test_collector_file_read_windows PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(test_collector_file_read_windows PRIVATE -Wl,--gc-sections)
+  endif()
+  target_link_libraries(test_collector_file_read_windows PRIVATE tdh advapi32 wevtapi)
+  edr_apply_test_warnings(test_collector_file_read_windows)
+  add_test(NAME collector_file_read_windows COMMAND test_collector_file_read_windows)
 
   add_executable(test_etw_network_decode_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c

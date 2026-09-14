@@ -73,6 +73,13 @@ function Write-DeployReport {
 
 Assert-Admin
 $packageRoot = Get-PackageRoot
+$builtinRelativePath = "collector\forensic_collector_builtin.exe"
+$packageBuiltin = Join-Path $packageRoot $builtinRelativePath
+if (-not (Test-Path -LiteralPath $packageBuiltin -PathType Leaf) -or
+    (Get-Item -LiteralPath $packageBuiltin).Length -le 0) {
+  throw "Package is missing required fixed forensic fallback: $builtinRelativePath"
+}
+$packageBuiltinSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $packageBuiltin).Hash.ToLowerInvariant()
 
 if (-not $SkipPreflight) {
   $preflight = Join-Path $packageRoot "scripts\edr_agent_preflight.ps1"
@@ -106,6 +113,12 @@ if (-not $NoCopy -and ($rootFull -ine $installFull)) {
   } | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $InstallDir -Recurse -Force
   }
+}
+
+$installedBuiltin = Join-Path $InstallDir $builtinRelativePath
+if (-not (Test-Path -LiteralPath $installedBuiltin -PathType Leaf) -or
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $installedBuiltin).Hash.ToLowerInvariant() -ne $packageBuiltinSha256) {
+  throw "Installed fixed forensic fallback is missing or does not match the package: $installedBuiltin"
 }
 
 $exe = Join-Path $InstallDir "FDSensor.exe"

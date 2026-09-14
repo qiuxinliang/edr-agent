@@ -399,8 +399,8 @@ int main(void) {
                          "compact acceptance health must identify the minute budget as context-only");
   ok &= require_contains(agent, "\\\"candidate\\\":{\\\"mode\\\":\\\"exempt\\\"",
                          "compact acceptance health must expose P0 candidate soft-budget exemption");
-  ok &= require_contains(agent, "\\\"critical_context\\\":{\\\"used\\\":%u",
-                         "compact acceptance health must expose the protected context pool");
+  ok &= require_contains(agent, "\\\"critical_context\\\":{\\\"mode\\\":\\\"capacity_bound\\\",\\\"used\\\":%u",
+                         "compact acceptance health must distinguish capacity-bound critical context from a minute quota");
   ok &= require_contains(agent, "\\\"ordinary_context\\\":{\\\"used\\\":%u",
                          "compact acceptance health must expose ordinary FileRead shedding");
   ok &= require_contains(collector, "edr_collector_file_read_metadata_gate_session_starting();",

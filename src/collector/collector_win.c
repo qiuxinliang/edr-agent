@@ -45,6 +45,10 @@
 #include "security_event_xml.h"
 #include "security_event_time_win.h"
 
+#ifdef EDR_COLLECTOR_FILE_IO_TESTING
+#include "collector_file_io_test.h"
+#endif
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3289,8 +3293,8 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
                                    &s_file_object_history, file_object, event_ns);
     }
     ReleaseSRWLockExclusive(&s_file_key_cache_lock);
-    /* Opening is metadata, not evidence of mutation. Preserve the existing
-     * generic Create path; only a real Write may use this new association. */
+    /* Opening is metadata, not evidence of access or mutation. A real Read
+     * or Write may use this independently timed FileObject association. */
     return is_create ? 0 : 1;
   }
   if (edr_kernel_file_name_create_descriptor(descriptor)) {
@@ -3492,10 +3496,10 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     if (out_gate_reason) *out_gate_reason = "file_delete_path_unresolved";
     return 0;
   }
-  if (!is_read) {
-    (void)edr_tdh_kernel_file_extract_file_object((PEVENT_RECORD)record, &file_object);
-    if (out_file_object) *out_file_object = file_object;
-  }
+  /* Both Read and Write carry FileObject independently from FileKey. An
+   * existing file may have Create/Read but no NameCreate in this session. */
+  (void)edr_tdh_kernel_file_extract_file_object((PEVENT_RECORD)record, &file_object);
+  if (out_file_object) *out_file_object = file_object;
   AcquireSRWLockExclusive(&s_file_key_cache_lock);
   session_epoch = s_file_key_session_epoch;
   edr_collector_file_key_cache_purge_locked(event_ns);
@@ -3543,7 +3547,7 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     memcpy(path_out, entry->path, strlen(entry->path) + 1u);
     resolved = 1;
   }
-  if (!is_read && read_pid && file_object) {
+  if (read_pid && file_object) {
     const char *object_path = edr_file_object_binding_resolve(
         s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE, &s_file_object_history,
         file_object, event_ns);
@@ -3553,11 +3557,13 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     if (conflict) {
       resolved = 0;
       have_problem = 1;
-      problem_reason = "file_write_binding_conflict";
+      problem_reason = is_read ? EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS
+                               : "file_write_binding_conflict";
     } else if (!resolved && selected && strlen(selected) < path_cap) {
-      /* Existing files may emit Create/Write without NameCreate. Bind the
-       * actual Write's FileObject, not a guessed FileKey or the opener PID.
-       * Preprocess still requires the verified writer generation. */
+      /* Use the actual I/O event's FileObject, not a guessed FileKey or the
+       * opener PID. Preprocess still validates the actual reader/writer's
+       * generation. The object history rejects closed, ambiguous or evicted
+       * lifetimes, including delayed decode after Close and pointer reuse. */
       memcpy(path_out, selected, strlen(selected) + 1u);
       have_problem = 0;
       problem_reason = NULL;
@@ -3566,7 +3572,8 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     } else if (!resolved && !have_problem &&
                event_ns <= s_file_object_history.discarded_through) {
       have_problem = 1;
-      problem_reason = "file_object_history_expired";
+      problem_reason = is_read ? EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED
+                               : "file_object_history_expired";
     }
   }
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
@@ -3610,9 +3617,11 @@ static int edr_collector_append_file_io_binding(EdrEventSlot *slot, uint64_t fil
       (!file_key && slot->type != EDR_EVENT_FILE_CREATE) || !path || !path[0]) {
     return 0;
   }
-  if (slot->type == EDR_EVENT_FILE_WRITE && file_object) {
+  if ((slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE) && file_object) {
     snprintf(key_text, sizeof(key_text), "0x%llx", (unsigned long long)file_object);
-    if (edr_collector_slot_append_kv(slot, "file_write_file_object", key_text) != EDR_SLOT_KV_APPENDED)
+    if (edr_collector_slot_append_kv(slot, slot->type == EDR_EVENT_FILE_READ
+                                              ? "file_read_file_object"
+                                              : "file_write_file_object", key_text) != EDR_SLOT_KV_APPENDED)
       return 0;
   }
   snprintf(key_text, sizeof(key_text), "0x%llx", (unsigned long long)file_key);
@@ -4279,9 +4288,9 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
       edr_collector_file_context_failure(ty, file_read_gate_reason);
       return;
     }
-    /* A read without the manifest FileKey→NameCreate association cannot be
-     * safely attributed to a path.  Stage its real provider subject and fuse
-     * FileRead P0 rather than silently classifying it as an ordinary drop. */
+    /* Neither typed FileKey nor FileObject lifetime could establish a path.
+     * Stage the real provider subject; do not guess a filename or silently
+     * classify missing evidence as an ordinary telemetry drop. */
     edr_collector_file_read_metadata_gate_stage(
         event_record, timestamp_ns, file_read_key,
         file_read_path[0] ? file_read_path : NULL,
@@ -4393,6 +4402,9 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   slot.size = (uint32_t)plen;
   edr_collector_append_image_path_metadata(&slot);
   edr_collector_append_event_process_generation(&slot, event_record);
+#ifdef EDR_COLLECTOR_FILE_IO_TESTING
+  edr_collector_file_io_test_before_binding(&slot);
+#endif
   if (is_file_io &&
       !edr_collector_append_file_io_binding(&slot, file_read_key, file_read_path,
                                              file_write_object, file_io_binding_quality)) {
@@ -4467,6 +4479,46 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     s_health.registry_events_admitted++;
   }
 }
+
+#ifdef EDR_COLLECTOR_FILE_IO_TESTING
+/* Single-threaded fixture only: no ETW session or A4.4 workers are started.
+ * Exercise the production cache reset, metadata tracking and complete Read
+ * decoder, including its source-only gate and event-bus publication. */
+void edr_collector_file_io_test_reset(EdrEventBus *bus) {
+  s_bus = bus;
+  /* Match edr_collector_start: a zero test owner aliases the absent parent
+   * PID on FileRead and incorrectly triggers the production self filter. */
+  s_agent_pid = GetCurrentProcessId();
+  memset(&s_health, 0, sizeof(s_health));
+  memset(s_pid_cache, 0, sizeof(s_pid_cache));
+  memset(&s_file_read_metadata_gate, 0, sizeof(s_file_read_metadata_gate));
+  memset(s_file_read_metadata_coalesce, 0, sizeof(s_file_read_metadata_coalesce));
+  s_file_read_metadata_coalesce_next = 0u;
+  edr_collector_file_key_cache_reset();
+}
+
+uint64_t edr_collector_file_io_test_new_epoch(void) {
+  edr_collector_file_key_cache_reset();
+  return edr_collector_file_key_session_epoch();
+}
+
+void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
+  (void)edr_collector_kernel_file_track_metadata(record, event_ns);
+  if (edr_kernel_file_read_descriptor(&record->EventHeader.EventDescriptor))
+    edr_collector_decode_mapped_event(record, EDR_EVENT_FILE_READ, "kfile", event_ns);
+}
+
+int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
+  if (!s_file_read_metadata_gate.slot_valid) return 0;
+  *slot = s_file_read_metadata_gate.slot;
+  return 1;
+}
+
+void edr_collector_file_io_test_health(EdrCollectorHealth *health) {
+  *health = s_health;
+  edr_collector_file_read_metadata_gate_copy_health(health);
+}
+#endif
 
 /*
  * A4.4 decoder threads use an owned copy of EVENT_RECORD::UserData.  They

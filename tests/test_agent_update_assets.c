@@ -167,8 +167,12 @@ int main(void) {
   contains(script, "$hasInstallerLogEvidence",
            "pre-installer failures do not fabricate an installer log evidence descriptor");
   contains(script, "native-package-integrity.json", "complete runtime package integrity manifest is required");
-  contains(script, "runtime package integrity manifest may only add app-local DLLs",
-           "complete runtime package limits extended components to app-local DLLs");
+  contains(script, "collector/forensic_collector_builtin.exe",
+           "complete runtime package allows only the canonical nested forensic fallback path");
+  contains(script, "Test-SupportedNativeRuntimeComponent",
+           "runtime identity and updater share the native component path allow-list");
+  contains(script, "New-Item -ItemType Directory -Force -Path (Split-Path -Parent $item.CandidatePath)",
+           "runtime staging creates the fixed collector directory before transactional replacement");
   contains(script, "$files += [pscustomobject]@{", "native package integrity manifest joins the transactional runtime plan");
   contains(script, "$integrityInput.CopyTo($integrityOutput)",
            "Runtime identity manifest bytes are preserved exactly during transactional update");
@@ -217,6 +221,15 @@ int main(void) {
   contains(script, "[string]$prior.command_id -ne $CommandId", "prior update journal rejects a mismatched command identity");
   contains(script, "Write-AtomicJson", "journal and report use atomic writes");
   free(script);
+
+  snprintf(path, sizeof(path), "%s/scripts/edr_agent_zip_deploy.ps1", root);
+  char *zip_deploy = read_file(path);
+  require_true(zip_deploy != NULL, "read Windows ZIP deployment script");
+  contains(zip_deploy, "Package is missing required fixed forensic fallback",
+           "ZIP deployment fails before installation when the packaged builtin collector is absent");
+  contains(zip_deploy, "Installed fixed forensic fallback is missing or does not match the package",
+           "ZIP deployment verifies the fixed installed collector bytes before starting the Agent");
+  free(zip_deploy);
 
   snprintf(path, sizeof(path), "%s/scripts/windows_setup_exe_lifecycle_smoke.ps1", root);
   char *baseline_repair_lifecycle = read_file(path);
@@ -452,6 +465,16 @@ int main(void) {
            "release package still publishes the verified PCRE2 matcher contract");
   contains(workflow, "$nativeIntegrityFiles.ToArray()",
            "release materializes the Runtime component list before ordered-manifest serialization");
+  contains(workflow, "name = \"collector/forensic_collector_builtin.exe\"",
+           "release native identity binds the fixed forensic fallback");
+  contains(workflow, "$null = $items.Add($collectorPackageDir)",
+           "release runtime ZIP includes the staged collector directory");
+  contains(workflow, "$runtimePeFiles += Get-Item -LiteralPath $builtinCollectorPackagePath",
+           "release PE closure appends the collector as FileInfo for FullName architecture validation");
+  require_true(!strstr(workflow, "$runtimePeFiles += $builtinCollectorPackagePath"),
+               "release PE closure must not append a string to the FileInfo collection");
+  contains(workflow, "package must contain exactly one collector/forensic_collector_builtin.exe",
+           "release package gate rejects the historical collector omission for every upgrade class");
   require_true(!strstr(workflow, "files = @($nativeIntegrityFiles)"),
                "release must not trigger PowerShell generic-list expansion inside an ordered manifest");
   contains(workflow, "$runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot \"edr_config\"",
@@ -650,6 +673,15 @@ int main(void) {
            "bootstrap lifecycle still removes the upgraded target when legacy Setup rollback is impossible");
   contains(setup_lifecycle, "native runtime rollback remains mandatory",
            "one-time legacy Setup rollback exemption remains explicit and delegates rollback to the native gate");
+  contains(setup_lifecycle, "collector\\forensic_collector_builtin.exe",
+           "Setup lifecycle knows the fixed forensic fallback target path");
+  contains(setup_lifecycle, "Assert-InstalledRuntime $TargetVersion \"install-target-fresh\" $true $true",
+           "fresh target installation requires the fixed forensic fallback");
+  contains(setup_lifecycle, "Assert-InstalledRuntime $TargetVersion \"upgrade-target\" $true $true",
+           "upgraded target requires the fixed forensic fallback");
+  require_true(!strstr(setup_lifecycle,
+                       "Assert-InstalledRuntime $BaselineVersion \"rollback-baseline\" $true $true"),
+               "historical rollback baseline is not retroactively required to contain the new collector");
   free(setup_lifecycle);
   contains(lifecycle, "windows-${{ matrix.arch }}-setup.exe",
            "release lifecycle downloads the architecture-matched immutable Setup EXE");
@@ -889,6 +921,12 @@ int main(void) {
            "client build uses the Node 24 artifact upload action");
   contains(client_build, "$nativeIntegrityFiles.ToArray()",
            "client build materializes the Runtime component list before ordered-manifest serialization");
+  contains(client_build, "name = \"collector/forensic_collector_builtin.exe\"",
+           "client build native identity binds the fixed forensic fallback");
+  contains(client_build, "$null = $items.Add($collectorPackageDir)",
+           "client build runtime ZIP includes the staged collector directory");
+  contains(client_build, "package must contain exactly one collector/forensic_collector_builtin.exe",
+           "client build package gate rejects the historical collector omission");
   require_true(!strstr(client_build, "files = @(\n              [ordered]@{ name = \"FDSecurityInstallerWorker.exe\""),
                "client build must not use inline generic-list expansion inside an ordered manifest");
   free(client_build);

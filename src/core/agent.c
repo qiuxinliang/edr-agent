@@ -2551,7 +2551,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 		"\"write_budget\":{\"used\":%u,\"limit\":%u,\"base_limit\":%u,"
 		"\"scope\":\"context_only\",\"dropped\":%llu,"
 		"\"candidate\":{\"mode\":\"exempt\",\"dropped\":%llu},"
-		"\"critical_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
+		"\"critical_context\":{\"mode\":\"capacity_bound\",\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
 		"\"ordinary_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
 		"\"context_dropped\":%llu},"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"

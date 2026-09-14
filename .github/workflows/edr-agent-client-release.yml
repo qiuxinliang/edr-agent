@@ -625,6 +625,15 @@ jobs:
             }
           }
           if (-not $outDir -or -not $agentExe) { throw "missing FDSensor.exe under build\Release or build" }
+          $builtinCollectorSource = Join-Path $outDir "forensic_collector_builtin.exe"
+          if (-not (Test-Path -LiteralPath $builtinCollectorSource -PathType Leaf)) {
+            throw "forensic_collector CMake target did not produce $builtinCollectorSource"
+          }
+          $collectorPackageDir = Join-Path $outDir "collector"
+          New-Item -ItemType Directory -Path $collectorPackageDir -Force | Out-Null
+          $builtinCollectorPackagePath = Join-Path $collectorPackageDir "forensic_collector_builtin.exe"
+          Copy-Item -LiteralPath $builtinCollectorSource -Destination $builtinCollectorPackagePath -Force
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $builtinCollectorPackagePath -Architecture $env:EDR_RELEASE_ARCH
           $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
           if (-not (Test-Path -LiteralPath $workerExe)) {
             $foundWorker = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
@@ -716,6 +725,10 @@ jobs:
               sha256 = (Get-FileHash -LiteralPath $componentPath -Algorithm SHA256).Hash.ToLowerInvariant()
             })
           }
+          $null = $nativeIntegrityFiles.Add([ordered]@{
+            name = "collector/forensic_collector_builtin.exe"
+            sha256 = (Get-FileHash -LiteralPath $builtinCollectorPackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          })
           Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
             Sort-Object Name | ForEach-Object {
               $null = $nativeIntegrityFiles.Add([ordered]@{
@@ -737,6 +750,7 @@ jobs:
           $nativeIntegrityManifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $nativeIntegrityPath -Encoding UTF8
 
           $null = $items.Add($nativeIntegrityPath)
+          $null = $items.Add($collectorPackageDir)
           $null = $items.Add($pcre2ContractPackagePath)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           $null = $items.Add($packageCapabilitiesPath)
@@ -744,6 +758,7 @@ jobs:
           $runtimePeFiles = @(Get-ChildItem -LiteralPath $outDir -File -ErrorAction Stop | Where-Object {
               $_.Extension -ieq '.exe' -or $_.Extension -ieq '.dll'
             })
+          $runtimePeFiles += Get-Item -LiteralPath $builtinCollectorPackagePath
           if ($runtimePeFiles.Count -lt 1) { throw "Runtime PE closure is empty: $outDir" }
           foreach ($runtimePeFile in $runtimePeFiles) {
             & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $runtimePeFile.FullName -Architecture $env:EDR_RELEASE_ARCH
@@ -891,6 +906,42 @@ jobs:
             if ($sensorManifestEntries.Count -ne 1) {
               throw "package must contain exactly one edr_config/sensor_interest_manifest.json; found $($sensorManifestEntries.Count)"
             }
+            $builtinCollectorEntries = @($zipObj.Entries | Where-Object {
+              $_.FullName.Replace('\', '/') -ceq 'collector/forensic_collector_builtin.exe'
+            })
+            if ($builtinCollectorEntries.Count -ne 1) {
+              throw "package must contain exactly one collector/forensic_collector_builtin.exe; found $($builtinCollectorEntries.Count)"
+            }
+            $nativeIntegrityEntries = @($zipObj.Entries | Where-Object {
+              $_.FullName.Replace('\', '/') -eq 'native-package-integrity.json'
+            })
+            if ($nativeIntegrityEntries.Count -ne 1) {
+              throw "package root must contain exactly one native-package-integrity.json; found $($nativeIntegrityEntries.Count)"
+            }
+            $nativeIntegrityReader = New-Object System.IO.StreamReader($nativeIntegrityEntries[0].Open())
+            try {
+              $packagedNativeIntegrity = $nativeIntegrityReader.ReadToEnd() | ConvertFrom-Json
+            } finally {
+              $nativeIntegrityReader.Dispose()
+            }
+            $builtinCollectorIdentity = @($packagedNativeIntegrity.files | Where-Object {
+              $_.name -ceq 'collector/forensic_collector_builtin.exe'
+            })
+            if ($packagedNativeIntegrity.schema -ne 'edr.windows.native-package-integrity.v1' -or
+                $builtinCollectorIdentity.Count -ne 1) {
+              throw "native package integrity must bind collector/forensic_collector_builtin.exe exactly once"
+            }
+            $builtinCollectorStream = $builtinCollectorEntries[0].Open()
+            $builtinCollectorHasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              $packagedBuiltinCollectorSha256 = -join ($builtinCollectorHasher.ComputeHash($builtinCollectorStream) | ForEach-Object { $_.ToString('x2') })
+            } finally {
+              $builtinCollectorHasher.Dispose()
+              $builtinCollectorStream.Dispose()
+            }
+            if ($packagedBuiltinCollectorSha256 -cne ([string]$builtinCollectorIdentity[0].sha256).ToLowerInvariant()) {
+              throw "packaged forensic builtin hash does not match native-package-integrity.json"
+            }
             $pcre2ContractEntries = @($zipObj.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'p0_matcher_contract.json' })
             if ($pcre2ContractEntries.Count -ne 1) {
               throw "package root must contain exactly one verified p0_matcher_contract.json; found $($pcre2ContractEntries.Count)"
@@ -996,6 +1047,7 @@ jobs:
               'windows_isolate_host\.ps1',
               'FDSecurityInstallerWorker\.exe',
               'uninstall\.exe',
+              'collector[/\\]forensic_collector_builtin\.exe',
               'native-package-integrity\.json',
               'p0_matcher_contract\.json',
               'agent_windows_production\.example\.toml'

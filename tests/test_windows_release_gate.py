@@ -24,10 +24,11 @@ WINDOWS_EXPECTED = {
     "command_process_identity_and_receipts",
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
-    "kernel_file_io_identity", "etw_network_decode_native",
+    "kernel_file_io_identity", "collector_file_read_windows", "etw_network_decode_native",
     "security_event_time_native", "security_event_time_failures",
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
+    "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
 }
 RUNTIME_EXPECTED = {
     "command_inbox_persistence", "request_signing", "http_retry_contract", "command_result_json_contract",
