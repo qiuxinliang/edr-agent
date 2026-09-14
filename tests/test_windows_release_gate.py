@@ -524,7 +524,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
         self.assertIn("python tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v", build_step[1])
         self.assertIn('throw "Windows PCRE2 header isolation regression failed"', build_step[1])
         self.assertIn("'windows_release_gate_tests'", source)
-        self.assertNotIn("'test_", source)
+        # Reject a second CMake target whitelist, not quoted Python
+        # discovery patterns such as 'test_vcpkg_*cache*.py'.
+        self.assertNotRegex(source, r'''["']test_[A-Za-z0-9_]+["']''')
         self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
 
     def test_dependency_cache_is_saved_before_product_failures(self):
@@ -542,13 +544,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 restore = step_with("uses: actions/cache/restore@v5")
                 install = step_with("name: vcpkg install (")
                 save = step_with("uses: actions/cache/save@v5")
-                consumer = step_with("name: Archive vcpkg_installed" if "prebuild" in workflow
+                consumer = step_with("name: Publish shared vcpkg dependency cache" if "prebuild" in workflow
                                      else "name: Configure (")
                 for before, after in zip((initialize, identify, restore, install, save),
                                          (identify, restore, install, save, consumer)):
                     self.assertLess(steps.index(before), steps.index(after))
                 self.assertIn("vcpkg_cache_key.py --triplet", identify)
-                self.assertIn("test_vcpkg_cache_key.py", identify)
+                self.assertIn("test_vcpkg_*cache*.py", identify)
                 self.assertIn("if ($LASTEXITCODE -ne 0)", identify)
                 self.assertIn("key: ${{ steps.vcpkg-key.outputs.key }}", restore)
                 self.assertIn("${{ steps.vcpkg-key.outputs.restore-prefix }}", restore)
@@ -563,12 +565,24 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertIn('VCPKG_BINARY_SOURCES: "clear;files,', source)
                 self.assertIn("Invoke-VcpkgInstallWithRetry.ps1", install)
                 self.assertNotIn("actions/cache@", source)
-                if workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):
-                    prebuilt = step_with("name: Restore vcpkg from pre-built packages")
-                    self.assertLess(steps.index(restore), steps.index(prebuilt))
-                    self.assertLess(steps.index(prebuilt), steps.index(install))
-                    self.assertIn("'${{ steps.vcpkg-cache.outputs.cache-hit }}' -eq 'true'", prebuilt)
-                    self.assertLess(prebuilt.index("outputs.cache-hit"), prebuilt.index("gh release download"))
+                shared = step_with("name: Restore shared vcpkg dependency cache")
+                self.assertLess(steps.index(restore), steps.index(shared))
+                self.assertLess(steps.index(shared), steps.index(install))
+                self.assertIn("vcpkg_release_cache.py restore --key '${{ steps.vcpkg-key.outputs.key }}'", shared)
+                self.assertIn("--actions-cache-hit '${{ steps.vcpkg-cache.outputs.cache-hit }}'", shared)
+                self.assertIn("GH_TOKEN: ${{ github.token }}", shared)
+                self.assertNotIn("vcpkg-installed-", source)
+                self.assertNotIn("gh release delete", source)
+                if workflow in ("edr-agent-ci.yml", "edr-agent-client-build.yml"):
+                    self.assertIn("permissions:\n  contents: read", source)
+                    self.assertNotIn("vcpkg_release_cache.py publish", source)
+                self.assertIn("test_vcpkg_install_retry.ps1", identify)
+                self.assertIn("test_vs2022_host_architecture.ps1", identify)
+                if workflow == "edr-agent-client-release.yml":
+                    publish = step_with("name: Publish shared vcpkg dependency cache")
+                    self.assertLess(steps.index(install), steps.index(publish))
+                    self.assertLess(steps.index(publish), steps.index(consumer))
+                    self.assertIn("steps.shared-vcpkg-publish.outcome == 'failure'", source)
                 for marker in re.findall(r'(?m)^\s*\$installed_marker = (.*)$', source):
                     self.assertEqual(marker, 'Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\\vcpkg\\status"')
 

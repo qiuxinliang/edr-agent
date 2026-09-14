@@ -8,6 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -40,8 +43,10 @@ jobs:
         id: vcpkg-key
         shell: pwsh
         run: |
-          python -m unittest discover -s tests -p test_vcpkg_cache_key.py -v
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache identity regression failed' }
+          python -m unittest discover -s tests -p 'test_vcpkg_*cache*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache regression failed' }
+          & .\tests\test_vcpkg_install_retry.ps1
+          & .\tests\test_vs2022_host_architecture.ps1
           python .\scripts\vcpkg_cache_key.py --triplet x64-windows
       - name: Cache vcpkg source and binary downloads
         id: vcpkg-cache
@@ -53,6 +58,14 @@ jobs:
           key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
             ${{ steps.vcpkg-key.outputs.restore-prefix }}
+      - name: Restore shared vcpkg dependency cache
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .\scripts\vcpkg_release_cache.py restore --key '${{ steps.vcpkg-key.outputs.key }}' --actions-cache-hit '${{ steps.vcpkg-cache.outputs.cache-hit }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Shared dependency cache restore failed' }
+
       - name: Bootstrap pinned vcpkg
         shell: pwsh
         run: .\scripts\bootstrap_pinned_vcpkg.ps1

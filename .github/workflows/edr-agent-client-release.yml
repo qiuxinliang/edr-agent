@@ -311,14 +311,16 @@ jobs:
 
       # Do not restore vcpkg_installed across jobs: its status file can make
       # vcpkg skip validation after a runner/compiler image change. Downloads
-      # and the ABI-keyed binary cache are safe to reuse; a complete installed
-      # tree must come from the immutable pre-built Release or this job.
+      # and ABI-keyed binary packages are reused; installed state is always
+      # materialized by this job through mandatory vcpkg ABI validation.
       - name: Identify vcpkg cache toolchain
         id: vcpkg-key
         shell: pwsh
         run: |
-          python -m unittest discover -s tests -p test_vcpkg_cache_key.py -v
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache identity regression failed' }
+          python -m unittest discover -s tests -p 'test_vcpkg_*cache*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache regression failed' }
+          & .\tests\test_vcpkg_install_retry.ps1
+          & .\tests\test_vs2022_host_architecture.ps1
           python .\scripts\vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
       - name: Cache vcpkg source and binary downloads
         id: vcpkg-cache
@@ -333,46 +335,13 @@ jobs:
             vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-
             vcpkg-prebuild-yara-${{ matrix.triplet }}-
 
-      - name: Restore vcpkg from pre-built packages (if cache miss)
+      - name: Restore shared vcpkg dependency cache
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $installedRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\$env:EDR_VCPKG_TRIPLET"
-          $installed_marker = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\vcpkg\status"
-          # An exact binary snapshot avoids downloading a second installed-tree
-          # archive. The mandatory vcpkg install below still validates each ABI.
-          if ('${{ steps.vcpkg-cache.outputs.cache-hit }}' -eq 'true' -or (Test-Path $installed_marker)) {
-            Write-Host "[pre-build-packages] vcpkg cache hit, skip download"
-            "VCPKG_SOURCE=cache" | Out-File -FilePath $env:GITHUB_ENV -Append
-            return
-          }
-          $hash = (Get-FileHash vcpkg.json -Algorithm SHA256).Hash.Substring(0, 12)
-          $release_tag = "prebuild-yara-$env:EDR_VCPKG_TRIPLET-$hash"
-          $archive = "vcpkg-installed-$env:EDR_VCPKG_TRIPLET.7z"
-          Write-Host "[pre-build-packages] Cache miss, trying authenticated pre-built release: $release_tag/$archive"
-          try {
-            & gh release download $release_tag --repo $env:GITHUB_REPOSITORY --pattern $archive --dir $env:GITHUB_WORKSPACE --clobber
-            if ($LASTEXITCODE -ne 0) { throw "gh release download failed with exit code $LASTEXITCODE" }
-            Write-Host "[pre-build-packages] Download OK, extracting..."
-            7z x $archive -o"$env:GITHUB_WORKSPACE" -y
-            if ($LASTEXITCODE -ne 0) { throw "7z extract failed" }
-            Remove-Item $archive -Force
-            if (Test-Path $installed_marker) {
-              Write-Host "[pre-build-packages] Pre-built packages restored from $release_tag"
-              "VCPKG_SOURCE=prebuilt:$release_tag" | Out-File -FilePath $env:GITHUB_ENV -Append
-            } else {
-              throw "Extracted but marker not found"
-            }
-          } catch {
-            Write-Host "[pre-build-packages] Download/extract failed: $_"
-            Write-Host "[pre-build-packages] Falling back to source build"
-            "VCPKG_SOURCE=source" | Out-File -FilePath $env:GITHUB_ENV -Append
-            if (Test-Path $archive) { Remove-Item $archive -Force -ErrorAction SilentlyContinue }
-            # A missing pre-built release is an expected cache miss. Native
-            # tools leave LASTEXITCODE non-zero even when the miss is handled.
-            $global:LASTEXITCODE = 0
-          }
+          python .\scripts\vcpkg_release_cache.py restore --key '${{ steps.vcpkg-key.outputs.key }}' --actions-cache-hit '${{ steps.vcpkg-cache.outputs.cache-hit }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Shared dependency cache restore failed' }
 
       - name: "[Timing] Build start"
         shell: pwsh
@@ -420,6 +389,21 @@ jobs:
           }
 
           "VCPKG_INSTALLED_ROOT=$installedRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish shared vcpkg dependency cache
+        id: shared-vcpkg-publish
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .\scripts\vcpkg_release_cache.py publish --key '${{ steps.vcpkg-key.outputs.key }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Shared dependency cache publication failed' }
+
+      - name: Report shared cache publication failure
+        if: steps.shared-vcpkg-publish.outcome == 'failure'
+        shell: pwsh
+        run: Write-Warning 'Shared dependency cache was not published; this build may continue, but a later tag may rebuild dependencies. See the publication step.'
 
       # Persist completed dependencies before configure, product builds or tests
       # can fail. Only ABI-keyed packages/downloads are saved, never installed state.

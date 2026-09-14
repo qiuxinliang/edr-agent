@@ -804,12 +804,12 @@ int main(void) {
            "release workflow bootstraps the manifest-pinned vcpkg commit");
   contains(client_release, "Invoke-VcpkgInstallWithRetry.ps1",
            "release workflow retries only a bounded GitHub source-archive rate limit");
-  contains(client_release, "prebuild-yara-$env:EDR_VCPKG_TRIPLET-$hash",
-           "release workflow restores the matching production YARA pre-built dependency closure");
+  contains(client_release, "vcpkg_release_cache.py restore --key '${{ steps.vcpkg-key.outputs.key }}'",
+           "release workflow restores a toolchain-bound ABI cache across tags");
   contains(client_release, "Cache vcpkg source and binary downloads",
            "release workflow reuses validated vcpkg caches without restoring an installed tree");
-  contains(client_release, "$global:LASTEXITCODE = 0",
-           "release workflow clears the handled pre-built cache-miss exit status");
+  contains(client_release, "if ($LASTEXITCODE -ne 0) { throw 'Shared dependency cache restore failed' }",
+           "release workflow does not hide shared cache validation failures");
   contains(client_release, "max-parallel: 2",
            "release builds AMD64 and ARM64 concurrently on isolated native runners");
   contains(client_release, "actions/setup-dotnet@v5",
@@ -875,12 +875,12 @@ int main(void) {
                   "client build fails a bad Setup UI restore or publish before the expensive vcpkg build");
   contains(client_build, "Invoke-VcpkgInstallWithRetry.ps1",
            "client build retries bounded GitHub source-archive rate limits");
-  contains(client_build, "prebuild-yara-x64-windows-$hash",
-           "client build restores the matching production YARA pre-built dependency closure");
+  contains(client_build, "vcpkg_release_cache.py restore --key '${{ steps.vcpkg-key.outputs.key }}'",
+           "client build restores a toolchain-bound ABI cache across tags");
   contains(client_build, "Cache vcpkg source and binary downloads",
            "client build reuses validated vcpkg caches without restoring an installed tree");
-  contains(client_build, "$global:LASTEXITCODE = 0",
-           "client build clears the handled pre-built cache-miss exit status");
+  contains(client_build, "if ($LASTEXITCODE -ne 0) { throw 'Shared dependency cache restore failed' }",
+           "client build does not hide shared cache validation failures");
   contains(client_build, "--no-tests=error --label-regex '^windows-release-gate$'",
            "client build rejects an empty CTest configuration");
   contains(client_build, "'windows_release_gate_tests'",
@@ -900,8 +900,8 @@ int main(void) {
            "vcpkg prebuild workflow publishes a native ARM64 dependency closure");
   contains(vcpkg_prebuild, "--x-feature=yara",
            "vcpkg prebuild workflow matches the production YARA dependency set");
-  contains(vcpkg_prebuild, "prebuild-yara-$env:VCPKG_DEFAULT_TRIPLET-$short",
-           "vcpkg prebuild tag binds the manifest hash and target triplet");
+  contains(vcpkg_prebuild, "vcpkg_release_cache.py publish --key '${{ steps.vcpkg-key.outputs.key }}'",
+           "vcpkg prebuild publishes the shared manifest, toolchain and triplet identity");
   contains(vcpkg_prebuild, "Invoke-VcpkgInstallWithRetry.ps1",
            "vcpkg prebuild uses bounded rate-limit recovery");
   contains(vcpkg_prebuild, "max-parallel: 2",
@@ -916,7 +916,7 @@ int main(void) {
   contains(vcpkg_retry, "response\\s+code\\s+429",
            "vcpkg recovery helper detects HTTP 429 explicitly");
   contains(vcpkg_retry, "not retrying because the failure is not an HTTP 429 rate limit",
-           "vcpkg recovery helper must not mask non-rate-limit build failures");
+           "vcpkg recovery helper must fail errors outside its bounded download allow-list");
   contains(vcpkg_retry, "max parallel build jobs",
            "vcpkg recovery helper reports source-build progress and parallelism live");
   require_true(!strstr(vcpkg_retry, "$env:VCPKG_MAX_CONCURRENCY = \"1\""),

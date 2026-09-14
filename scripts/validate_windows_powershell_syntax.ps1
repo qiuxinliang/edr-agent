@@ -35,6 +35,8 @@ $relativePaths = @(
   "scripts\windows_release_lifecycle_smoke.ps1",
   "tests\test_windows_install_compatibility.ps1",
   "tests\test_windows_install_cng_behavior.ps1",
+  "tests\test_vcpkg_install_retry.ps1",
+  "tests\test_vs2022_host_architecture.ps1",
   "install\windows-inno\Build-BundledInstaller.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",
   "install\windows-inno\edr_windows_autorun.ps1",

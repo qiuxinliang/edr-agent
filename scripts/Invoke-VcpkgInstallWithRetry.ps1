@@ -1,10 +1,11 @@
 #Requires -Version 5.1
 <#
-  Installs a pinned vcpkg manifest with bounded rate-limit recovery.
+  Installs a pinned vcpkg manifest with bounded download recovery.
 
-  GitHub source archive downloads are an external dependency. A 429 must not
-  be mistaken for a port or compiler failure, but non-rate-limit errors must
-  still fail immediately so CI does not hide real build regressions.
+  GitHub source archive downloads are an external dependency. HTTP 429 and a
+  small allow-list of curl transport failures may be retried, but certificate,
+  hash, compiler, and linker failures must fail immediately so CI does not hide
+  security or build regressions.
 #>
 [CmdletBinding()]
 param(
@@ -14,12 +15,72 @@ param(
   [ValidateRange(1, 8)]
   [int] $MaxAttempts = 5,
   [ValidateRange(1, 300)]
-  [int] $InitialBackoffSeconds = 20
+  [int] $InitialBackoffSeconds = 20,
+  [Parameter(DontShow = $true)]
+  [scriptblock] $SleepAction,
+  [Parameter(DontShow = $true)]
+  [scriptblock] $JitterAction
 )
 
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path -LiteralPath $VcpkgExe -PathType Leaf)) {
   throw "vcpkg executable was not found: $VcpkgExe"
+}
+
+function Get-VcpkgFailureDisposition {
+  param([Parameter(Mandatory = $true)][string] $OutputText)
+
+  # Permanent failures take precedence over retryable-looking text. A failed
+  # certificate or integrity check must never be hidden by an earlier network
+  # diagnostic emitted in the same vcpkg invocation.
+  $certificateFailure = $OutputText -match '(?im)(curl operation failed with error code\s+(60|77)\b|ssl certificate problem|certificate verify failed|certificate verification failed|problem with the ssl ca cert|CERT_E_[A-Z_]+)'
+  if ($certificateFailure) {
+    return [pscustomobject]@{ Retry = $false; Reason = 'certificate validation failure' }
+  }
+
+  $integrityFailure = $OutputText -match '(?im)(hash mismatch|sha-?(256|512)[^\r\n]*mismatch|unexpected hash|does not have the expected hash)'
+  if ($integrityFailure) {
+    return [pscustomobject]@{ Retry = $false; Reason = 'download integrity failure' }
+  }
+
+  # BUILD_FAILED by itself is only vcpkg's summary and can follow a source-tool
+  # download failure. Require concrete compiler, linker, or build-tool evidence.
+  $buildFailure = $OutputText -match '(?im)(\b(fatal\s+)?error\s+C\d{4}\b|\b(fatal\s+)?error\s+LNK\d+\b|[^\r\n:]+:\d+:\d+:\s+(fatal\s+)?error:|ninja:\s+build stopped|MSB\d+:\s*error|linker command failed|compilation terminated)'
+  if ($buildFailure) {
+    return [pscustomobject]@{ Retry = $false; Reason = 'compiler or linker failure' }
+  }
+
+  $rateLimited = $OutputText -match '(?im)(response\s+code\s+429|http\s*429|too\s+many\s+requests|rate\s*limit)'
+  $curlMatches = [regex]::Matches($OutputText, '(?im)curl operation failed with error code\s+(\d+)\b')
+  if ($curlMatches.Count -gt 0) {
+    # These codes describe failures before a verified archive is available:
+    # DNS/connect, partial transfer, timeout, TLS connect, or connection I/O.
+    # Local writes (23), certificate checks (60/77), HTTP status failures other
+    # than an explicit 429+curl-22 pair, and unclassified codes remain fail-fast.
+    $retryableCurlCodes = @(5, 6, 7, 18, 28, 35, 52, 55, 56)
+    $observedCodes = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($match in $curlMatches) {
+      $code = [int]$match.Groups[1].Value
+      $null = $observedCodes.Add($code)
+      # curl 22 represents an HTTP status failure. It is retryable only when
+      # the same invocation explicitly identifies that status as HTTP 429.
+      $isExplicitRateLimitCode = $code -eq 22 -and $rateLimited
+      if (($retryableCurlCodes -notcontains $code) -and -not $isExplicitRateLimitCode) {
+        return [pscustomobject]@{ Retry = $false; Reason = "non-retryable curl error $code" }
+      }
+    }
+    if ($rateLimited) {
+      return [pscustomobject]@{ Retry = $true; Reason = 'HTTP 429 rate limit' }
+    }
+    $codeText = ($observedCodes | Sort-Object -Unique) -join ','
+    return [pscustomobject]@{ Retry = $true; Reason = "transient curl transport error $codeText" }
+  }
+
+  if ($rateLimited) {
+    return [pscustomobject]@{ Retry = $true; Reason = 'HTTP 429 rate limit' }
+  }
+
+  return [pscustomobject]@{ Retry = $false; Reason = 'unclassified failure' }
 }
 
 $installArgs = @("install") + @($FeatureArgs)
@@ -39,32 +100,58 @@ try {
   for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     Write-Host "[vcpkg] install attempt $attempt/$MaxAttempts (max parallel build jobs: $env:VCPKG_MAX_CONCURRENCY)"
     $output = New-Object 'System.Collections.Generic.List[string]'
-    & $VcpkgExe @installArgs 2>&1 | ForEach-Object {
-      $line = [string]$_
-      $null = $output.Add($line)
-      Write-Host $line
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativeErrorPreference = $PSVersionTable.PSVersion.Major -ge 7
+    if ($hasNativeErrorPreference) {
+      $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+      $PSNativeCommandUseErrorActionPreference = $false
     }
-    $exitCode = $LASTEXITCODE
+    try {
+      # Windows PowerShell 5.1 turns redirected native stderr into non-terminating
+      # ErrorRecords. Keep those records in the diagnostic stream without letting
+      # the script-level Stop preference abort before $LASTEXITCODE is inspected.
+      $ErrorActionPreference = 'Continue'
+      & $VcpkgExe @installArgs 2>&1 | ForEach-Object {
+        $line = [string]$_
+        $null = $output.Add($line)
+        Write-Host $line
+      }
+      $exitCode = $LASTEXITCODE
+    }
+    finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+      if ($hasNativeErrorPreference) {
+        $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+      }
+    }
     if ($exitCode -eq 0) {
       Write-Host "[vcpkg] install succeeded on attempt $attempt"
       return
     }
 
     $outputText = $output -join [Environment]::NewLine
-    $rateLimited = $outputText -match '(?im)(response\s+code\s+429|http\s*429|too\s+many\s+requests|rate\s*limit)'
-    if (-not $rateLimited) {
-      throw "vcpkg install failed with exit code $exitCode; not retrying because the failure is not an HTTP 429 rate limit"
+    $disposition = Get-VcpkgFailureDisposition -OutputText $outputText
+    if (-not $disposition.Retry) {
+      throw "vcpkg install failed with exit code $exitCode; not retrying because the failure is not an HTTP 429 rate limit or allow-listed transient download transport error ($($disposition.Reason))"
     }
     if ($attempt -eq $MaxAttempts) {
-      throw "vcpkg install remained GitHub-rate-limited after $MaxAttempts attempts (last exit code $exitCode)"
+      throw "vcpkg install exhausted retryable download failures after $MaxAttempts attempts ($($disposition.Reason); last exit code $exitCode)"
     }
 
     $exponent = [Math]::Pow(2, $attempt - 1)
     $backoff = [Math]::Min(300, [int]($InitialBackoffSeconds * $exponent))
-    $jitter = Get-Random -Minimum 0 -Maximum 16
-    $delay = $backoff + $jitter
-    Write-Warning "[vcpkg] GitHub archive rate limit detected; retrying in $delay seconds. Cached downloads are retained."
-    Start-Sleep -Seconds $delay
+    $jitter = if ($null -ne $JitterAction) { [int](& $JitterAction $attempt) } else { Get-Random -Minimum 0 -Maximum 16 }
+    if ($jitter -lt 0 -or $jitter -gt 15) {
+      throw "vcpkg retry jitter must be between 0 and 15 seconds; got $jitter"
+    }
+    $delay = [Math]::Min(300, $backoff + $jitter)
+    Write-Warning "[vcpkg] $($disposition.Reason) detected; retrying in $delay seconds. Cached downloads are retained."
+    if ($null -ne $SleepAction) {
+      & $SleepAction $delay
+    }
+    else {
+      Start-Sleep -Seconds $delay
+    }
   }
 }
 finally {

@@ -19,9 +19,10 @@ def cache_identity(root, triplet, toolchain):
     inputs = {name: digest_file(root / name) for name in (
         "vcpkg.json", "dependencies.lock.json", "scripts/Initialize-VS2022Environment.ps1",
         "scripts/bootstrap_pinned_vcpkg.ps1", "scripts/vcpkg_cache_key.py",
+        "scripts/vcpkg_release_cache.py",
     )}
     encoded = json.dumps({"inputs": inputs, "toolchain": toolchain}, sort_keys=True).encode()
-    prefix = f"edr-vcpkg-v2-{triplet}-"
+    prefix = f"edr-vcpkg-v3-{triplet}-"
     return prefix + hashlib.sha256(encoded).hexdigest(), prefix
 
 
@@ -47,7 +48,9 @@ def windows_toolchain():
         "selected_compiler": digest_file(compiler), "compilers": compilers,
         "cmake": cmake, "runner_arch": os.environ.get("RUNNER_ARCH", ""),
         "image": os.environ.get("ImageOS", ""),
-        "image_version": os.environ.get("ImageVersion", ""),
+        # A runner image republish alone is not a new ABI. Actual compiler
+        # contents, SDK version, host and CMake remain part of the identity;
+        # vcpkg independently verifies its complete per-package ABI inputs.
     }
 
 

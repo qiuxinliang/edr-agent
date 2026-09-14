@@ -21,6 +21,7 @@ KEY_INPUTS = (
     "scripts/Initialize-VS2022Environment.ps1",
     "scripts/bootstrap_pinned_vcpkg.ps1",
     "scripts/vcpkg_cache_key.py",
+    "scripts/vcpkg_release_cache.py",
 )
 
 
@@ -59,8 +60,8 @@ class VcpkgCacheKeyTests(unittest.TestCase):
             arm64_key, arm64_prefix = MODULE.cache_identity(root, "arm64-windows", {})
 
         self.assertNotEqual(x64_key, arm64_key)
-        self.assertEqual("edr-vcpkg-v2-x64-windows-", x64_prefix)
-        self.assertEqual("edr-vcpkg-v2-arm64-windows-", arm64_prefix)
+        self.assertEqual("edr-vcpkg-v3-x64-windows-", x64_prefix)
+        self.assertEqual("edr-vcpkg-v3-arm64-windows-", arm64_prefix)
         self.assertTrue(x64_key.startswith(x64_prefix))
         self.assertTrue(arm64_key.startswith(arm64_prefix))
 
@@ -155,6 +156,9 @@ class VcpkgCacheKeyTests(unittest.TestCase):
                 initial_toolchain = MODULE.windows_toolchain()
                 initial_key, _ = MODULE.cache_identity(root, "x64-windows", initial_toolchain)
 
+                with mock.patch.dict(os.environ, {'ImageVersion': 'new-image', 'GITHUB_REF': 'refs/tags/win_3.2.999'}):
+                    self.assertEqual(initial_toolchain, MODULE.windows_toolchain())
+
                 selected_compiler.write_bytes(b"selected-v2")
                 selected_toolchain = MODULE.windows_toolchain()
                 selected_key, _ = MODULE.cache_identity(root, "x64-windows", selected_toolchain)
@@ -169,7 +173,7 @@ class VcpkgCacheKeyTests(unittest.TestCase):
             self.assertNotEqual(initial_key, selected_key)
             self.assertNotEqual(initial_toolchain["compilers"], host_toolchain["compilers"])
             self.assertNotEqual(initial_key, host_key)
-            self.assertEqual(3, run.call_count)
+            self.assertEqual(4, run.call_count)
             run.assert_called_with(
                 ["cmake", "--version"], check=True, capture_output=True,
                 text=True, timeout=15,
