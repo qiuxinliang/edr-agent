@@ -74,7 +74,10 @@ function Write-EdRStoreDetachedCms {
         $inputFile = Join-Path $scratch 'manifest.json'
         [IO.File]::WriteAllBytes($inputFile, $content.Content)
         Invoke-EdRSignTool -SignTool $SignTool -Arguments @('sign','/fd','SHA256','/s','My','/sha1',$certificate.Thumbprint,'/p7',$scratch,'/p7co','1.2.840.113549.1.7.1','/p7ce','DetachedSignedData',$inputFile)
-        $encoded = [IO.File]::ReadAllBytes($inputFile + '.p7')
+        $signedData = [IO.File]::ReadAllBytes($inputFile + '.p7')
+        # /p7ce DetachedSignedData emits bare SignedData, not ContentInfo.
+        # Encapsulate without modifying the signed bytes or signed attributes.
+        $encoded = Convert-EdRSignedDataToCms -SignedData $signedData
     } finally {
         Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction Stop
     }
@@ -86,4 +89,31 @@ function Write-EdRStoreDetachedCms {
         throw 'Detached CMS does not match the SHA-256 publisher contract'
     }
     [IO.File]::WriteAllBytes($SignaturePath, $encoded)
+}
+
+function Convert-EdRSignedDataToCms {
+    param([Parameter(Mandatory=$true)][byte[]]$SignedData)
+    if ($SignedData.Length -lt 4 -or $SignedData[0] -ne 0x30) { throw 'SignTool returned an invalid SignedData sequence' }
+    function New-EdRDerEnvelope([byte]$Tag, [byte[]]$Body) {
+        $stream = New-Object IO.MemoryStream
+        try {
+            $stream.WriteByte($Tag)
+            if ($Body.Length -lt 128) { $stream.WriteByte([byte]$Body.Length) }
+            else {
+                $lengthBytes = [BitConverter]::GetBytes([uint32]$Body.Length)
+                [Array]::Reverse($lengthBytes)
+                $offset = 0
+                while ($lengthBytes[$offset] -eq 0) { $offset++ }
+                $count = 4 - $offset
+                $stream.WriteByte([byte](0x80 -bor $count))
+                $stream.Write($lengthBytes, $offset, $count)
+            }
+            $stream.Write($Body, 0, $Body.Length)
+            return ,$stream.ToArray()
+        } finally { $stream.Dispose() }
+    }
+    [byte[]]$explicitContent = New-EdRDerEnvelope -Tag 0xA0 -Body $SignedData
+    # id-signedData 1.2.840.113549.1.7.2
+    [byte[]]$body = @(0x06,0x09,0x2A,0x86,0x48,0x86,0xF7,0x0D,0x01,0x07,0x02) + $explicitContent
+    return ,(New-EdRDerEnvelope -Tag 0x30 -Body $body)
 }
