@@ -1,0 +1,54 @@
+name: USB file signing only
+on:
+  workflow_call:
+    inputs:
+      phase:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  sign:
+    # Never run untrusted PR code on the hardware-key host.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/win_'))
+    runs-on: [self-hosted, Windows, edr-usb-signing]
+    timeout-minutes: 20
+    concurrency:
+      group: edr-usb-token
+      cancel-in-progress: false
+    env:
+      USB_PHASE: ${{ inputs.phase }}
+      USB_VERSION: ${{ inputs.version }}
+      USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
+      USB_SIGNTOOL: ${{ vars.WINDOWS_USB_SIGNTOOL_PATH }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/Sign-WindowsReleaseFiles.ps1
+            /scripts/WindowsStoreSigning.ps1
+            /scripts/WindowsUsbSigningExchange.ps1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: usb-${{ inputs.phase }}-request-*
+          path: requests
+      - name: Sign allowlisted EXEs or small manifests only
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          $version=$env:USB_VERSION -replace '^win_',''
+          foreach($arch in @('amd64','arm64')) {
+            .\scripts\Sign-WindowsReleaseFiles.ps1 -Phase $env:USB_PHASE -InputDirectory "$PWD\requests\usb-$env:USB_PHASE-request-$arch" -OutputDirectory "$env:RUNNER_TEMP\response-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:USB_PHASE\$arch" -ExpectedCommit $env:GITHUB_SHA -Version $version -Architecture $arch -Thumbprint $env:USB_THUMBPRINT -SignTool $env:USB_SIGNTOOL
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usb-${{ inputs.phase }}-response
+          path: ${{ runner.temp }}/response-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.phase }}/
+          if-no-files-found: error
+          retention-days: 3

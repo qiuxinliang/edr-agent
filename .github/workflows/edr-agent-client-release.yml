@@ -40,6 +40,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: edr-agent-release-${{ github.ref }}
@@ -152,6 +153,10 @@ jobs:
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
+
+      - name: Validate file-only USB signing exchange
+        shell: powershell
+        run: .\tests\test_windows_usb_exchange.ps1
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
         shell: pwsh
         run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
@@ -1253,68 +1258,89 @@ jobs:
             @($assets.FullName) --clobber
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed" }
 
-      - name: Stage native USB signing input
+      - name: Prepare hosted packaging state and EXE-only signing request
         if: env.WINDOWS_RELEASE_MODE == 'usb'
-        # Stay in the native build's PowerShell 7 environment. Switching to
-        # 5.1 here inherits an incompatible PSModulePath from VS initialization.
         shell: pwsh
-        run: .\scripts\Stage-WindowsUsbSigningInput.ps1 -Architecture $env:EDR_RELEASE_ARCH -Version $env:EDR_AGENT_VERSION -OutputDirectory "$env:RUNNER_TEMP\usb-input-$env:EDR_RELEASE_ARCH"
+        env:
+          USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
+          USB_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
+        run: |
+          .\scripts\Stage-WindowsReleasePackaging.ps1 -Architecture $env:EDR_RELEASE_ARCH -Version $env:EDR_AGENT_VERSION -OutputDirectory "$env:RUNNER_TEMP\host-input"
+          .\scripts\Complete-WindowsUsbRelease.ps1 -Stage Prepare -InputDirectory "$env:RUNNER_TEMP\host-input" -OutputDirectory "$env:RUNNER_TEMP\package-state" -ExpectedCommit $env:GITHUB_SHA -Thumbprint $env:USB_THUMBPRINT -ManifestSignerSubject $env:USB_SUBJECT
 
-      - name: Upload native USB signing input
+      - name: Retain packaging state on GitHub only
         if: env.WINDOWS_RELEASE_MODE == 'usb'
         uses: actions/upload-artifact@v4
         with:
-          name: usb-input-${{ matrix.arch }}
-          path: ${{ runner.temp }}/usb-input-${{ matrix.arch }}/
-          # Stage-WindowsUsbSigningInput copies only tracked release sources and
-          # explicit build products. Preserve entries such as .gitignore too:
-          # dropping them would invalidate the signed-input inventory.
+          name: package-state-native-${{ matrix.arch }}
+          path: ${{ runner.temp }}/package-state/
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
-  usb-sign:
-    name: Sign and repackage on local USB token
+      - name: Send only native EXEs and request inventory to USB
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-native-request-${{ matrix.arch }}
+          path: ${{ runner.temp }}/package-state/native-request/
+          if-no-files-found: error
+          retention-days: 3
+
+  usb-native-sign:
     needs: windows-build
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_mode == 'usb') || (github.event_name == 'push' && vars.WINDOWS_RELEASE_MODE == 'usb') }}
-    # Dedicated, interactive, ephemeral runner. Never route PR jobs to it.
-    runs-on: [self-hosted, Windows, edr-usb-signing]
-    timeout-minutes: 60
-    concurrency:
-      group: edr-usb-token
-      cancel-in-progress: false
-    env:
-      GH_TOKEN: ${{ github.token }}
-      EDR_SIGNTOOL_PATH: ${{ vars.WINDOWS_USB_SIGNTOOL_PATH }}
-      WINDOWS_USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
-      WINDOWS_USB_SIGNER_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
-      WINDOWS_USB_INNO_PATH: ${{ vars.WINDOWS_USB_INNO_PATH }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: usb-input-*
-          path: usb-inputs
-      - name: Verify draft, sign both architectures and upload final assets
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $draft = gh release view $env:EDR_AGENT_RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft
-          if ($LASTEXITCODE -ne 0 -or $draft -ne 'true') { throw 'USB signing must target an unpublished draft' }
-          foreach ($arch in @('amd64','arm64')) {
-            .\scripts\Complete-WindowsUsbRelease.ps1 -InputDirectory "$PWD\usb-inputs\usb-input-$arch" -OutputDirectory "$env:RUNNER_TEMP\usb-signed-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$arch" -ExpectedCommit $env:GITHUB_SHA -Thumbprint $env:WINDOWS_USB_THUMBPRINT -ManifestSignerSubject $env:WINDOWS_USB_SIGNER_SUBJECT -SignTool $env:EDR_SIGNTOOL_PATH -Inno $env:WINDOWS_USB_INNO_PATH
-          }
-          # Nothing is uploaded until both architecture closures have signed.
-          foreach ($arch in @('amd64','arm64')) {
-            $assets = @(Get-ChildItem "$env:RUNNER_TEMP\usb-signed-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$arch\dist" -File)
-            if ($assets.Count -ne 6) { throw 'Incomplete signed release asset set' }
-            $draft = gh release view $env:EDR_AGENT_RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft
-            if ($LASTEXITCODE -ne 0 -or $draft -ne 'true') { throw 'Release was published while signing; refusing replacement' }
-            gh release upload $env:EDR_AGENT_RELEASE_TAG --repo $env:GITHUB_REPOSITORY @($assets.FullName) --clobber
-            if ($LASTEXITCODE -ne 0) { throw 'Signed release asset upload failed' }
-          }
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/windows-usb-sign-files.yml
+    with:
+      phase: native
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+  usb-build-installer:
+    needs: usb-native-sign
+    uses: ./.github/workflows/windows-usb-package.yml
+    with:
+      stage: Installer
+      phase: native
+      next_phase: installer
+
+  usb-installer-sign:
+    needs: usb-build-installer
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/windows-usb-sign-files.yml
+    with:
+      phase: installer
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+  usb-build-bundle:
+    needs: usb-installer-sign
+    uses: ./.github/workflows/windows-usb-package.yml
+    with:
+      stage: Bundle
+      phase: installer
+      next_phase: manifest
+
+  usb-manifest-sign:
+    needs: usb-build-bundle
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/windows-usb-sign-files.yml
+    with:
+      phase: manifest
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+  usb-publish-assets:
+    needs: usb-manifest-sign
+    uses: ./.github/workflows/windows-usb-package.yml
+    with:
+      stage: Verify
+      phase: manifest
+      next_phase: verified
 
   publish-release:
     name: Publish combined Windows Release Bundle
@@ -1379,8 +1405,8 @@ jobs:
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
-    needs: [windows-build, usb-sign]
-    if: ${{ always() && needs.windows-build.result == 'success' && (needs.usb-sign.result == 'success' || needs.usb-sign.result == 'skipped') }}
+    needs: [windows-build, usb-publish-assets]
+    if: ${{ always() && needs.windows-build.result == 'success' && (needs.usb-publish-assets.result == 'success' || ((github.event_name == 'workflow_dispatch' && inputs.release_mode != 'usb' || github.event_name == 'push' && vars.WINDOWS_RELEASE_MODE != 'usb') && needs.usb-publish-assets.result == 'skipped')) }}
     permissions:
       contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
