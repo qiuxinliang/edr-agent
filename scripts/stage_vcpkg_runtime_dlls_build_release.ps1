@@ -57,8 +57,23 @@ if (-not (Test-Path -LiteralPath $cmakeCache)) {
   Write-Error "Verified static PCRE2 release staging requires CMakeCache.txt from the production configure"
   exit 1
 }
+$cacheLines = @(Get-Content -LiteralPath $cmakeCache)
+# build/Release is the packaging directory, not necessarily the CMake output
+# directory. Ninja leaves the collector in build even after FDSensor is staged.
+# Select the actual configured layout; never accept a stale alternate copy.
+$multiConfig = @($cacheLines | Where-Object { $_ -match '^CMAKE_CONFIGURATION_TYPES:[^=]+=.+' }).Count -gt 0
+$collectorOutputDir = if ($multiConfig) { $releaseDir } else { $singleConfigDir }
+$collectorSource = Join-Path $collectorOutputDir 'forensic_collector_builtin.exe'
+$collectorDestination = Join-Path $releaseDir 'forensic_collector_builtin.exe'
+if (-not (Test-Path -LiteralPath $collectorSource -PathType Leaf)) {
+  throw "Required forensic_collector CMake output is missing: $collectorSource. Build the forensic_collector target for Release before staging."
+}
+if (-not $multiConfig) {
+  Copy-Item -LiteralPath $collectorSource -Destination $collectorDestination -Force
+  Write-Host "Normalized Ninja single-config collector: $collectorSource -> $collectorDestination"
+}
 $contractBindings = @(
-  Get-Content -LiteralPath $cmakeCache |
+  $cacheLines |
     Where-Object { $_.StartsWith('EDR_PCRE2_MATCHER_CONTRACT_AUDIT_PATH:INTERNAL=', [System.StringComparison]::Ordinal) }
 )
 if ($contractBindings.Count -ne 1) {
