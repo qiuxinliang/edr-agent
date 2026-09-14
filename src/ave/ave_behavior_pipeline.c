@@ -1,5 +1,6 @@
 /**
- * MPMC 无锁入队 + 单消费线程 + PID 状态；行为分数由本地启发式计算。
+ * MPMC 队列 + 单消费线程 + PID 状态；入队与停机标记使用短临界区同步。
+ * 行为分数由本地启发式计算，关停先排空已接收事件。
  */
 
 #include "ave_behavior_pipeline.h"
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -338,15 +340,22 @@ static AveMpmcQueue *s_q;
 static uint32_t s_q_capacity;
 
 #ifdef _WIN32
-static CRITICAL_SECTION s_mu;
+static SRWLOCK s_mu = SRWLOCK_INIT;
 static HANDLE s_thread;
+static SRWLOCK s_feed_mu = SRWLOCK_INIT;
+static void lock_feed(void) { AcquireSRWLockExclusive(&s_feed_mu); }
+static void unlock_feed(void) { ReleaseSRWLockExclusive(&s_feed_mu); }
 #else
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t s_thread;
+static pthread_mutex_t s_feed_mu = PTHREAD_MUTEX_INITIALIZER;
+static void lock_feed(void) { pthread_mutex_lock(&s_feed_mu); }
+static void unlock_feed(void) { pthread_mutex_unlock(&s_feed_mu); }
 #endif
 
-static volatile int s_worker_stop;
-static volatile int s_monitor_started;
+static atomic_int s_worker_stop;
+static atomic_int s_monitor_started;
+static atomic_int s_worker_exited = 1;
 
 static int bp_hist_ensure(void) {
   if (s_hist) {
@@ -392,7 +401,7 @@ static uint32_t bp_queue_capacity_from_env(void) {
 
 static void lock_bp(void) {
 #ifdef _WIN32
-  EnterCriticalSection(&s_mu);
+  AcquireSRWLockExclusive(&s_mu);
 #else
   (void)pthread_mutex_lock(&s_mu);
 #endif
@@ -400,7 +409,7 @@ static void lock_bp(void) {
 
 static void unlock_bp(void) {
 #ifdef _WIN32
-  LeaveCriticalSection(&s_mu);
+  ReleaseSRWLockExclusive(&s_mu);
 #else
   (void)pthread_mutex_unlock(&s_mu);
 #endif
@@ -1049,7 +1058,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
 #ifdef _WIN32
 static DWORD WINAPI worker_main(LPVOID arg) {
   (void)arg;
-  while (!s_worker_stop) {
+  for (;;) {
     AVEBehaviorEvent ev;
     int drained = 0;
     if (s_q) {
@@ -1059,16 +1068,18 @@ static DWORD WINAPI worker_main(LPVOID arg) {
         drained = 1;
       }
     }
+    if (atomic_load(&s_worker_stop) && (!s_q || ave_mpmc_approx_depth(s_q) == 0u)) break;
     if (!drained) {
       Sleep(20);
     }
   }
+  atomic_store(&s_worker_exited, 1);
   return 0;
 }
 #else
 static void *worker_main(void *arg) {
   (void)arg;
-  while (!s_worker_stop) {
+  for (;;) {
     AVEBehaviorEvent ev;
     int drained = 0;
     if (s_q) {
@@ -1078,10 +1089,12 @@ static void *worker_main(void *arg) {
         drained = 1;
       }
     }
+    if (atomic_load(&s_worker_stop) && (!s_q || ave_mpmc_approx_depth(s_q) == 0u)) break;
     if (!drained) {
       usleep(20000);
     }
   }
+  atomic_store(&s_worker_exited, 1);
   return NULL;
 }
 #endif
@@ -1093,37 +1106,55 @@ void edr_ave_bp_init(void) {
   }
   s_q_capacity = 0u;
 #ifdef _WIN32
-  InitializeCriticalSection(&s_mu);
   s_thread = NULL;
 #endif
   s_worker_stop = 0;
   s_monitor_started = 0;
+  atomic_store(&s_worker_exited, 1);
   bp_hist_free();
   memset(&s_callbacks, 0, sizeof(s_callbacks));
   s_callbacks_set = 0;
   bp_reset_metrics();
 }
 
-void edr_ave_bp_shutdown(void) {
-  s_worker_stop = 1;
+int edr_ave_bp_drain_stop(uint32_t timeout_ms) {
+  /* Serialize the last admitted producer with the stop marker. The worker
+   * drains everything already admitted before observing the terminal state. */
+  lock_feed();
+  atomic_store(&s_worker_stop, 1);
+  unlock_feed();
+  if (!atomic_load(&s_monitor_started)) return AVE_OK;
 #ifdef _WIN32
   if (s_thread) {
-    WaitForSingleObject(s_thread, INFINITE);
+    if (WaitForSingleObject(s_thread, timeout_ms) != WAIT_OBJECT_0) return AVE_ERR_TIMEOUT;
     CloseHandle(s_thread);
     s_thread = NULL;
   }
-  DeleteCriticalSection(&s_mu);
 #else
-  if (s_monitor_started) {
-    (void)pthread_join(s_thread, NULL);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  uint64_t deadline = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u + timeout_ms;
+  while (!atomic_load(&s_worker_exited)) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u >= deadline)
+      return AVE_ERR_TIMEOUT;
+    struct timespec delay = {0, 1000000L};
+    nanosleep(&delay, NULL);
   }
+  if (pthread_join(s_thread, NULL) != 0) return AVE_ERR_INTERNAL;
 #endif
-  s_monitor_started = 0;
+  atomic_store(&s_monitor_started, 0);
+  return AVE_OK;
+}
+
+int edr_ave_bp_shutdown(void) {
+  if (edr_ave_bp_drain_stop(30000u) != AVE_OK) return 0;
   if (s_q) {
     ave_mpmc_destroy(s_q);
     s_q = NULL;
   }
   edr_ave_bp_init();
+  return 1;
 }
 
 void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks) {
@@ -1137,6 +1168,7 @@ void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks) {
 }
 
 int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
+  if (atomic_load(&s_worker_stop)) return AVE_ERR_INTERNAL;
   if (!cfg) {
     return AVE_ERR_INVALID_PARAM;
   }
@@ -1165,6 +1197,7 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
     return AVE_OK;
   }
   s_worker_stop = 0;
+  atomic_store(&s_worker_exited, 0);
 #ifdef _WIN32
   s_thread = CreateThread(NULL, 0, worker_main, NULL, 0, NULL);
   if (!s_thread) {
@@ -1179,30 +1212,42 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
   return AVE_OK;
 }
 
-void edr_ave_bp_feed(const AVEBehaviorEvent *event) {
+int edr_ave_bp_feed(const AVEBehaviorEvent *event) {
   if (!event) {
-    return;
+    return AVE_ERR_INVALID_PARAM;
   }
   (void)bp_metric_inc(&s_bp_feed_total);
+  lock_feed();
+  if (atomic_load(&s_worker_stop)) {
+    (void)bp_metric_inc(&s_bp_feed_sync_bypass);
+    unlock_feed();
+    return AVE_ERR_NOT_INITIALIZED;
+  }
   if (s_monitor_started && bp_pressure_active() && !bp_event_high_value_under_pressure(event)) {
     (void)bp_metric_inc(&s_bp_pressure_feed_dropped);
-    return;
+    unlock_feed();
+    return AVE_OK; /* Existing resource-pressure policy, not queue admission. */
   }
   if (!s_monitor_started) {
     (void)bp_metric_inc(&s_bp_feed_sync_bypass);
-    return;
+    unlock_feed();
+    return AVE_ERR_NOT_INITIALIZED;
   }
   if (s_q) {
     if (ave_mpmc_try_push(s_q, event) != 0) {
       (void)bp_metric_inc(&s_bp_queue_full_dropped);
-      return;
+      unlock_feed();
+      return AVE_ERR_QUEUE_FULL;
     } else {
       (void)bp_metric_inc(&s_bp_queue_enqueued);
     }
   } else {
     (void)bp_metric_inc(&s_bp_feed_sync_bypass);
-    return;
+    unlock_feed();
+    return AVE_ERR_NOT_INITIALIZED;
   }
+  unlock_feed();
+  return AVE_OK;
 }
 
 int edr_ave_bp_get_flags(uint32_t pid, AVEBehaviorFlags *flags_out) {

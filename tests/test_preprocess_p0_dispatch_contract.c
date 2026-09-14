@@ -40,19 +40,26 @@ int main(void) {
   if (!source) return 1;
   p0_call = strstr(source, "int p0_emitted = edr_p0_rule_try_emit(&br);");
   decision = strstr(source, "edr_detection_decision_evaluate(&br, &dd);");
-  local_only = strstr(source, "strcmp(dd.selection_action, \"local_only\") == 0");
+  local_only = strstr(source, "edr_preprocess_admit_telemetry(&br, &dd)");
   p0_guard = strstr(source, "if (p0_emitted > 0) {\n    return;\n  }\n  emit_behavior_record(&br);");
   throttle_proven_miss = strstr(source, "static int p0_resource_throttle_proven_miss");
   throttle_gate = strstr(source, "p0_resource_throttle_proven_miss(&br)");
   p0_enrichment = strstr(source, "edr_pid_history_pmfe_fill_record(&br);");
   standalone = p0_call ? strstr(p0_call, "emit_behavior_record(&br);") : NULL;
-  free(source);
   if (!p0_call || !decision || !local_only || !p0_guard || !standalone ||
       !throttle_proven_miss || !throttle_gate || !p0_enrichment ||
       throttle_gate <= p0_enrichment || throttle_gate >= p0_call ||
       p0_call >= decision || p0_call >= local_only || p0_guard >= standalone) {
     fprintf(stderr, "P0 dispatch must precede local-only admission, and pressure may shed only verified IR misses\n");
+    free(source);
     return 2;
   }
+  if (strstr(source, "edr_storage_queue_poll_drain(") ||
+      strstr(source, "edr_process_evidence_wait(")) {
+    fprintf(stderr, "preprocessing must not synchronously wait for network or optional evidence\n");
+    free(source);
+    return 3;
+  }
+  free(source);
   return 0;
 }

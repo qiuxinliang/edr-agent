@@ -16,7 +16,7 @@
 #include <wintrust.h>
 #include <softpub.h>
 
-#define EDR_EVIDENCE_SLOTS 32u
+#define EDR_EVIDENCE_SLOTS EDR_PROCESS_EVIDENCE_CAPACITY
 #define EDR_EVIDENCE_MAX_BYTES (16ULL * 1024ULL * 1024ULL)
 #define EDR_EVIDENCE_HASH_MAX_NS (1000ULL * 1000000ULL)
 #define EDR_EVIDENCE_QUEUE_MAX_NS (5000ULL * 1000000ULL)
@@ -690,6 +690,35 @@ static int evidence_lookup_ready(const char *path, uint64_t generation, uint64_t
   return 0;
 }
 
+int edr_process_evidence_poll(const char *path, uint64_t generation, uint64_t now,
+                              EdrProcessEvidence *out) {
+  if (!out) return -1;
+  evidence_clear(out, "queued");
+  if (!path || !path[0] || !generation) {
+    strcpy(out->hash_reason, "missing_identity");
+    strcpy(out->signature_reason, "missing_identity");
+    return -1;
+  }
+  if (InterlockedCompareExchange(&s_terminal_unhealthy, 0, 0)) {
+    strcpy(out->hash_reason, "worker_terminal_unhealthy");
+    strcpy(out->signature_reason, "worker_terminal_unhealthy");
+    return -1;
+  }
+  if (evidence_worker_stalled(now)) {
+    evidence_mark_stalled();
+    strcpy(out->hash_reason, "evidence_worker_stalled");
+    strcpy(out->signature_reason, "evidence_worker_stalled");
+    return -1;
+  }
+  return evidence_lookup_ready(path, generation, now, out);
+}
+
+void edr_process_evidence_note_wait_timeout(void) {
+  AcquireSRWLockExclusive(&s_lock);
+  s_metrics.wait_timeouts++;
+  ReleaseSRWLockExclusive(&s_lock);
+}
+
 int edr_process_evidence_wait(const char *path, uint64_t generation, uint64_t now,
                               uint64_t max_wait_ns, EdrProcessEvidence *out) {
   uint64_t deadline;
@@ -722,9 +751,7 @@ int edr_process_evidence_wait(const char *path, uint64_t generation, uint64_t no
     }
     if (evidence_lookup_ready(path, generation, current, out)) return 1;
     if (current >= deadline) {
-      AcquireSRWLockExclusive(&s_lock);
-      s_metrics.wait_timeouts++;
-      ReleaseSRWLockExclusive(&s_lock);
+      edr_process_evidence_note_wait_timeout();
       strcpy(out->hash_reason, "evidence_wait_timeout");
       strcpy(out->signature_reason, "evidence_wait_timeout");
       return 0;
@@ -756,5 +783,10 @@ int edr_process_evidence_worker_start(void) { return 1; }
 void edr_process_evidence_worker_stop(void) {}
 int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t now,EdrProcessEvidence *out) { (void)path;(void)generation;(void)now; if (out) { memset(out,0,sizeof(*out)); strcpy(out->hash_quality,"unknown"); strcpy(out->hash_reason,"windows_only"); strcpy(out->signature_status,"unknown"); strcpy(out->signature_source,"windows_only"); strcpy(out->signature_quality,"unknown"); strcpy(out->signature_reason,"windows_only"); strcpy(out->revocation,"unknown"); } return 0; }
 int edr_process_evidence_wait(const char *path,uint64_t generation,uint64_t now,uint64_t max_wait_ns,EdrProcessEvidence *out) { (void)path;(void)generation;(void)now;(void)max_wait_ns; if (out) { memset(out,0,sizeof(*out)); strcpy(out->hash_quality,"unknown"); strcpy(out->hash_reason,"windows_only"); strcpy(out->signature_status,"unknown"); strcpy(out->signature_source,"windows_only"); strcpy(out->signature_quality,"unknown"); strcpy(out->signature_reason,"windows_only"); strcpy(out->revocation,"unknown"); } return 0; }
+int edr_process_evidence_poll(const char *path,uint64_t generation,uint64_t now,EdrProcessEvidence *out) {
+  (void)edr_process_evidence_wait(path,generation,now,0u,out);
+  return -1;
+}
+void edr_process_evidence_note_wait_timeout(void) {}
 void edr_process_evidence_worker_get_metrics(EdrProcessEvidenceMetrics *out) { if (out) memset(out, 0, sizeof(*out)); }
 #endif

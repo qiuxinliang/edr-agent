@@ -76,10 +76,6 @@ export EDR_A44_LOCKFREE_CAP=4096
 # 事件编码格式: wire, protobuf, protobuf_c
 export EDR_BEHAVIOR_ENCODING=protobuf_c
 
-# LZ4压缩级别 (1-12)
-# 默认: 6
-export EDR_LZ4_COMPRESSION_LEVEL=6
-
 # 批量刷新超时（秒）
 export EDR_BATCH_FLUSH_TIMEOUT_S=5
 

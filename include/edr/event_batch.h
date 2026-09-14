@@ -1,5 +1,7 @@
 /**
  * §6.2 EventBatch 本地聚合：长度前缀帧拼接，达阈值刷写；载荷前加 BAT1 头便于与 HTTP ingest 对接。
+ * All entry points serialize shared batch state. Stop producers before final
+ * shutdown; a push after completed shutdown returns failure, never uses freed memory.
  */
 #ifndef EDR_EVENT_BATCH_H
 #define EDR_EVENT_BATCH_H
@@ -28,8 +30,9 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
  */
 void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s);
 
-/** 刷批并释放缓冲（进程退出 / 预处理线程停止时调用） */
-void edr_event_batch_shutdown(void);
+/** One explicit final handoff attempt (even during automatic backoff); release
+ * only on success. -1 retains pending bytes for a caller-controlled retry. */
+int edr_event_batch_shutdown(void);
 
 /** 按时间条件刷批（预处理线程空闲/轮询时调用） */
 void edr_event_batch_poll_timeout(void);
@@ -39,7 +42,7 @@ uint64_t edr_event_batch_timeout_flush_count(void);
 /** 追加一条线格式事件；内部可能触发刷写。返回 0 成功，-1 失败 */
 int edr_event_batch_push(const uint8_t *wire, size_t wire_len);
 
-/** 刷出当前批次 */
-void edr_event_batch_flush(void);
+/** Explicit flush makes one attempt; automatic push/poll retries are dampened. */
+int edr_event_batch_flush(void);
 
 #endif

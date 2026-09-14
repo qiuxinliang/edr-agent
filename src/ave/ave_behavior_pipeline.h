@@ -10,7 +10,9 @@
 struct EdrConfig;
 
 void edr_ave_bp_init(void);
-void edr_ave_bp_shutdown(void);
+int edr_ave_bp_shutdown(void);
+/** Stop admitting events, drain accepted work, and join; timeout retains state. */
+int edr_ave_bp_drain_stop(uint32_t timeout_ms);
 
 /** 与 RegisterCallbacks 同步；可在监控运行中更新 */
 void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks);
@@ -22,7 +24,7 @@ void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks);
 int edr_ave_bp_start_monitor(const struct EdrConfig *cfg);
 void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg);
 
-void edr_ave_bp_feed(const AVEBehaviorEvent *event);
+int edr_ave_bp_feed(const AVEBehaviorEvent *event);
 
 /**
  * B3b：静态规则扫描结论写入行为 PID 槽，供 §5.5 特征维 44–45（与《11》PidHistory.ave_* 对齐）。

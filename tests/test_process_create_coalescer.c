@@ -638,6 +638,72 @@ int main(void) {
                "Security-only process evidence remains visible but non-authoritative");
   }
 
+  /* Shutdown is an ownership boundary, not a synthetic timeout. Drain an
+   * unexpired merged generation exactly once while preserving the kernel
+   * generation identity and Security-only enrichment contract. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    EdrProcessCoalescerMetrics metrics;
+    rec(&kernel, 18u, 0, 0x181u, "C:\\shutdown-paired.exe", 8200000000LL);
+    rec(&security, 18u, 1, 0u, "C:\\shutdown-paired.exe", 8200000100LL);
+    kernel.process_creation_filetime_100ns = 133801632000000181ULL;
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_drain_stopping(&out) == 1 &&
+                   out.process_start_key == 0x181u &&
+                   out.process_creation_filetime_100ns == 133801632000000181ULL &&
+                   strcmp(out.source_completeness, "COALESCED") == 0 &&
+                   strcmp(out.user_sid, "S-1-5-21-target") == 0 &&
+                   edr_process_coalescer_drain_stopping(&out) == 0,
+               "shutdown drain emits one merged unexpired kernel generation");
+    edr_process_coalescer_get_metrics(&metrics);
+    ok &= need(metrics.shutdown_drained == 1u && metrics.timed_out == 0u &&
+                   metrics.slots_used == 0u,
+               "shutdown drain is distinct from timeout and empties paired state");
+  }
+
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord security;
+    EdrProcessCoalescerMetrics metrics;
+    rec(&security, 21u, 1, 0u, "C:\\shutdown-security.exe", 8300000000LL);
+    ok &= need(edr_process_coalescer_submit(&security, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_drain_stopping(&out) == 1 &&
+                   out.is_security_4688 && out.process_start_key == 0u &&
+                   strcmp(out.source_completeness, "ENRICHMENT_ONLY") == 0 &&
+                   strcmp(out.user_sid, "S-1-5-21-target") == 0 &&
+                   edr_process_coalescer_drain_stopping(&out) == 0,
+               "shutdown drain preserves Security-only enrichment evidence");
+    edr_process_coalescer_get_metrics(&metrics);
+    ok &= need(metrics.shutdown_drained == 1u && metrics.timed_out == 0u &&
+                   metrics.slots_used == 0u,
+               "Security-only shutdown drain has distinct accounting");
+  }
+
+  /* A normal timeout leaves a correlation tombstone. Stop-time drain clears
+   * that tombstone but must not emit the already-delivered generation again. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    EdrProcessCoalescerMetrics metrics;
+    rec(&kernel, 22u, 0, 0x221u, "C:\\shutdown-tombstone.exe", 8400000000LL);
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
+                   EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
+                   out.process_start_key == 0x221u &&
+                   edr_process_coalescer_drain_stopping(&out) == 0,
+               "shutdown drain never duplicates a generation retained as a tombstone");
+    edr_process_coalescer_get_metrics(&metrics);
+    ok &= need(metrics.timed_out == 1u && metrics.shutdown_drained == 0u &&
+                   metrics.slots_used == 0u,
+               "tombstone cleanup is not counted as a shutdown-drained record");
+  }
+
   edr_process_coalescer_reset();
   for (uint32_t i = 0u; i < 128u; ++i) {
     static EdrBehaviorRecord fill;

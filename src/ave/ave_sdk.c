@@ -376,12 +376,20 @@ int AVE_StartBehaviorMonitor(void) {
   return edr_ave_bp_start_monitor(pcfg);
 }
 
+int AVE_DrainBehaviorMonitor(uint32_t timeout_ms) {
+  return g_initialized ? edr_ave_bp_drain_stop(timeout_ms) : AVE_OK;
+}
+
 void AVE_Shutdown(void) {
   if (!g_initialized) {
     return;
   }
   scan_lock();
-  edr_ave_bp_shutdown();
+  if (!edr_ave_bp_shutdown()) {
+    fprintf(stderr, "[ave] shutdown timed out; retaining worker dependencies\n");
+    scan_unlock();
+    return;
+  }
   edr_ave_shutdown();
   if (s_owns_edr_config) {
     edr_config_free_heap(&g_cfg);
@@ -704,8 +712,7 @@ static int ave_feed_event_current(const AVEBehaviorEvent *event) {
   if (pcfg) {
     edr_ave_behavior_event_apply_ioc(pcfg, &ev);
   }
-  edr_ave_bp_feed(&ev);
-  return AVE_OK;
+  return edr_ave_bp_feed(&ev);
 }
 
 void AVE_FeedEvent(const AVEBehaviorEvent *event) {

@@ -1421,7 +1421,21 @@ void edr_agent_destroy(EdrAgent *agent) {
   if (!agent) {
     return;
   }
-  edr_preprocess_stop();
+  if (agent->collector_started) {
+    if (!edr_collector_stop()) {
+      fprintf(stderr, "[agent] destroy deferred: collector still owns dependencies\n");
+      return;
+    }
+    agent->collector_started = 0;
+  }
+  if (!edr_preprocess_stop()) {
+    fprintf(stderr, "[agent] destroy deferred: preprocessing still owns dependencies\n");
+    return;
+  }
+  if (AVE_DrainBehaviorMonitor(30000u) != AVE_OK) {
+    fprintf(stderr, "[agent] destroy deferred: AVE still owns dependencies\n");
+    return;
+  }
   edr_p0_rule_ir_shutdown();
   edr_self_protect_shutdown();
   edr_resource_shutdown();
@@ -2082,11 +2096,12 @@ EdrError edr_agent_run(EdrAgent *agent) {
         } else {
           fprintf(stderr,
                   "[collector] shutdown join timed out; retained collector-owned resources\n");
+          return EDR_ERR_INTERNAL;
         }
       }
     }
   }
-  edr_preprocess_stop();
+  /* main stops control producers before draining preprocessing and AVE. */
   return EDR_OK;
 }
 
@@ -2487,7 +2502,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
         "\"retryable\":%s,\"last_error\":\"%s\"},"
         "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
-        "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
+        "\"send_attempts\":%lu,\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
         "\"resume_count\":%lu,\"control_frames\":%lu,"
         "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
         "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
@@ -2532,6 +2547,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
         "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
+        "\"context_facts_written\":%llu,\"context_refs_written\":%llu,"
 		"\"write_budget\":{\"used\":%u,\"limit\":%u,\"base_limit\":%u,"
 		"\"scope\":\"context_only\",\"dropped\":%llu,"
 		"\"candidate\":{\"mode\":\"exempt\",\"dropped\":%llu},"
@@ -2646,7 +2662,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         http_rt.command_result_last_error_retryable ? "true" : "false",
         command_result_error,
         tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
-        tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
+        tv2_rt.send_attempts, tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
         tv2_rt.resume_count, tv2_rt.control_frames,
         tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
         edr_event_bus_capacity(agent->event_bus),
@@ -2711,6 +2727,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.candidate_reused,
         (unsigned long long)evidence_status.candidate_admitted,
         (unsigned long long)evidence_status.candidate_rejected,
+        (unsigned long long)evidence_status.context_facts_written,
+        (unsigned long long)evidence_status.context_refs_written,
 		evidence_status.write_budget_used, evidence_status.write_budget_limit,
 		evidence_status.write_budget_base_limit,
 		(unsigned long long)evidence_status.write_budget_dropped,
@@ -2859,12 +2877,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)p0_metrics.equal_quality_suppressed, (unsigned long long)p0_metrics.identity_upgrade_seen,
                  (unsigned long long)p0_metrics.lower_quality_suppressed, (unsigned long long)p0_metrics.intermediate_upgrade_suppressed, (unsigned long long)p0_metrics.pre_rule_event_duplicates, (unsigned long long)p0_metrics.pending_backpressure);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"process_create_coalescer\":{\"slots_used\":%u,\"capacity\":%u,\"security_stored\":%llu,\"security_backpressure\":%llu,\"kernel_backpressure\":%llu,\"timeouts\":%llu,\"stale_rejects\":%llu,\"ambiguous_rejects\":%llu}",
+                 ",\"process_create_coalescer\":{\"slots_used\":%u,\"capacity\":%u,\"security_stored\":%llu,\"security_backpressure\":%llu,\"kernel_backpressure\":%llu,\"timeouts\":%llu,\"shutdown_drained\":%llu,\"stale_rejects\":%llu,\"ambiguous_rejects\":%llu}",
                  process_coalescer_metrics.slots_used, process_coalescer_metrics.capacity,
                  (unsigned long long)process_coalescer_metrics.security_stored,
                  (unsigned long long)process_coalescer_metrics.security_backpressure,
                  (unsigned long long)process_coalescer_metrics.kernel_backpressure,
                  (unsigned long long)process_coalescer_metrics.timed_out,
+                 (unsigned long long)process_coalescer_metrics.shutdown_drained,
                  (unsigned long long)process_coalescer_metrics.stale_rejects,
                  (unsigned long long)process_coalescer_metrics.ambiguous_rejects);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
@@ -3090,6 +3109,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"http2_negotiated\":%lu,\"http2_fallback\":%lu,"
       "\"http2_cert_error\":%lu},"
       "\"send_queue_depth\":%llu,\"send_queue_capacity\":%llu,"
+      "\"batch_queue_owner\":\"sqlite\",\"batch_admission_failed\":%lu,"
       "\"queue_full_total\":%lu,\"queue_full_persisted\":%lu,"
       "\"queue_full_sampled\":%lu,\"queue_full_dropped\":%lu,"
       "\"offline_queue_pending\":%llu,\"last_success_unix_ms\":%lld,"
@@ -3133,7 +3153,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"last_success_unix_ms\":%lld,\"last_failure_unix_ms\":%lld,"
       "\"retryable\":%s,\"last_error\":\"%s\"},"
       "\"transport_v2\":{\"enabled\":%s,\"opened_streams\":%lu,"
-      "\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
+      "\"send_attempts\":%lu,\"send_ok\":%lu,\"send_fail\":%lu,\"ack_ok\":%lu,\"ack_fail\":%lu,"
       "\"resume_count\":%lu,\"control_frames\":%lu,"
       "\"channel_control\":%lu,\"channel_high_sev\":%lu,"
       "\"channel_normal\":%lu,\"channel_backfill\":%lu,"
@@ -3326,6 +3346,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 	      http_rt.http2_cert_error_count,
 	      (unsigned long long)edr_transport_send_queue_depth(),
 	      (unsigned long long)edr_transport_send_queue_capacity(),
+	      edr_transport_batch_rejected_count(),
 	      edr_transport_queue_full_count(), edr_transport_queue_full_persisted_count(),
 	      edr_transport_queue_full_sampled_count(), edr_transport_queue_full_dropped_count(),
 	      (unsigned long long)edr_storage_queue_pending_count(),
@@ -3385,7 +3406,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       http_rt.command_result_last_error_retryable ? "true" : "false",
       command_result_error,
       tv2_rt.enabled ? "true" : "false", tv2_rt.opened_streams,
-      tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
+      tv2_rt.send_attempts, tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
       tv2_rt.resume_count, tv2_rt.control_frames,
       tv2_rt.channel_control, tv2_rt.channel_high_sev, tv2_rt.channel_normal,
       tv2_rt.channel_backfill, tv2_rt.channel_upload, tv2_rt.channel_command_result,

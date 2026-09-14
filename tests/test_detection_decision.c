@@ -1,4 +1,5 @@
 #include "edr/detection_decision.h"
+#include "cJSON.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -25,6 +26,63 @@ static void test_unsetenv(const char *k) {
 #else
   unsetenv(k);
 #endif
+}
+
+static cJSON *parse_context(const EdrBehaviorRecord *r) {
+  cJSON *root = cJSON_ParseWithOpts(r->detection_context, NULL, 1);
+  assert(root != NULL);
+  assert(cJSON_IsObject(root));
+  return root;
+}
+
+static cJSON *context_object(cJSON *root, const char *parent, const char *child) {
+  cJSON *value = cJSON_GetObjectItemCaseSensitive(root, parent);
+  assert(cJSON_IsObject(value));
+  if (!child) return value;
+  value = cJSON_GetObjectItemCaseSensitive(value, child);
+  assert(cJSON_IsObject(value));
+  return value;
+}
+
+static int omission_has(const cJSON *root, const char *field, const char *source,
+                        const char *reason) {
+  const cJSON *source_map = cJSON_GetObjectItemCaseSensitive(root, "omission_sources");
+  const cJSON *sources = cJSON_GetObjectItemCaseSensitive(source_map, field);
+  const cJSON *item;
+  int source_found = 0;
+  cJSON_ArrayForEach(item, sources) {
+    if (cJSON_IsString(item) && strcmp(item->valuestring, source) == 0) {
+      source_found = 1;
+      break;
+    }
+  }
+  if (!source_found) return 0;
+  if (strcmp(reason, "invalid_utf8") == 0) {
+    const cJSON *invalid = cJSON_GetObjectItemCaseSensitive(root, "invalid_fields");
+    cJSON_ArrayForEach(item, invalid) {
+      if (cJSON_IsString(item) && strcmp(item->valuestring, field) == 0) return 1;
+    }
+    return 0;
+  }
+  return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "projection_limited"));
+}
+
+static int omission_source_present(const cJSON *root, const char *source) {
+  const cJSON *source_map = cJSON_GetObjectItemCaseSensitive(root, "omission_sources");
+  const cJSON *sources;
+  cJSON_ArrayForEach(sources, source_map) {
+    const cJSON *item;
+    cJSON_ArrayForEach(item, sources) {
+      if (cJSON_IsString(item) && strcmp(item->valuestring, source) == 0) return 1;
+    }
+  }
+  return 0;
+}
+
+static void fill_ascii(char *dst, size_t capacity, char value, size_t length) {
+  assert(length < capacity);
+  memset(dst, value, length);
+  dst[length] = '\0';
 }
 
 static void test_regsvr32_remote_combo_high(void) {
@@ -537,6 +595,177 @@ static void test_ransom_control_threshold_context(void) {
   test_unsetenv("EDR_RANSOM_NOTE_WINDOW_S");
 }
 
+static void test_detection_context_preserves_long_fields_below_total_limit(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  cJSON *root;
+  cJSON *object;
+  cJSON *value;
+
+  init(&r);
+  fill_ascii(r.file_path, sizeof(r.file_path), 'p', 600u);
+  edr_detection_decision_evaluate(&r, &d);
+  root = parse_context(&r);
+  object = context_object(root, "file", NULL);
+  value = cJSON_GetObjectItemCaseSensitive(object, "path");
+  assert(cJSON_IsString(value) && strcmp(value->valuestring, r.file_path) == 0);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields") == NULL);
+  cJSON_Delete(root);
+
+  init(&r);
+  fill_ascii(r.cmdline, sizeof(r.cmdline), 'c', 700u);
+  r.cmdline[100] = '\n';
+  r.cmdline[200] = '\t';
+  r.cmdline[300] = '"';
+  r.cmdline[400] = '\\';
+  edr_detection_decision_evaluate(&r, &d);
+  root = parse_context(&r);
+  object = context_object(root, "process", NULL);
+  value = cJSON_GetObjectItemCaseSensitive(object, "cmdline");
+  assert(cJSON_IsString(value) && strcmp(value->valuestring, r.cmdline) == 0);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields") == NULL);
+  cJSON_Delete(root);
+
+  init(&r);
+  fill_ascii(r.reg_value_data, sizeof(r.reg_value_data), 'r', 700u);
+  edr_detection_decision_evaluate(&r, &d);
+  root = parse_context(&r);
+  object = context_object(root, "registry", NULL);
+  value = cJSON_GetObjectItemCaseSensitive(object, "value_data");
+  assert(cJSON_IsString(value) && strcmp(value->valuestring, r.reg_value_data) == 0);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields") == NULL);
+  cJSON_Delete(root);
+
+  init(&r);
+  fill_ascii(r.pmfe_snapshot, sizeof(r.pmfe_snapshot), 'm', 450u);
+  edr_detection_decision_evaluate(&r, &d);
+  root = parse_context(&r);
+  object = context_object(root, "engine_evidence", NULL);
+  value = cJSON_GetObjectItemCaseSensitive(object, "pmfe_snapshot");
+  assert(cJSON_IsString(value) && strcmp(value->valuestring, r.pmfe_snapshot) == 0);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields") == NULL);
+  cJSON_Delete(root);
+}
+
+static void test_detection_context_preserves_multibyte_field(void) {
+  static const char glyph[] = "\xe6\xb5\x8b";
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  size_t used = 0u;
+  while (used + sizeof(glyph) - 1u <= 600u) {
+    memcpy(r.file_path + used, glyph, sizeof(glyph) - 1u);
+    used += sizeof(glyph) - 1u;
+  }
+  r.file_path[used] = '\0';
+  edr_detection_decision_evaluate(&r, &d);
+  cJSON *root = parse_context(&r);
+  cJSON *file = context_object(root, "file", NULL);
+  cJSON *path = cJSON_GetObjectItemCaseSensitive(file, "path");
+  assert(cJSON_IsString(path) && strcmp(path->valuestring, r.file_path) == 0);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields") == NULL);
+  cJSON_Delete(root);
+}
+
+static void test_detection_context_invalid_utf8_is_explicitly_omitted(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  memcpy(r.source_truncated_fields, "source.cmdline", sizeof("source.cmdline"));
+  memcpy(r.file_path, "valid-prefix-", sizeof("valid-prefix-") - 1u);
+  r.file_path[sizeof("valid-prefix-") - 1u] = (char)0xc3;
+  r.file_path[sizeof("valid-prefix-")] = '(';
+  r.file_path[sizeof("valid-prefix-") + 1u] = '\0';
+  char original[sizeof(r.file_path)];
+  memcpy(original, r.file_path, sizeof(original));
+  edr_detection_decision_evaluate(&r, &d);
+  cJSON *root = parse_context(&r);
+  cJSON *file = context_object(root, "file", NULL);
+  assert(cJSON_GetObjectItemCaseSensitive(file, "path") == NULL);
+  assert(omission_has(root, "file.path", "source.file_path", "invalid_utf8"));
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "evidence_complete")));
+  assert(memcmp(r.file_path, original, sizeof(original)) == 0);
+  assert(strcmp(r.source_truncated_fields, "source.cmdline") == 0);
+  cJSON_Delete(root);
+}
+
+static void test_detection_context_worst_case_record_omits_whole_fields(void) {
+  struct GuardedRecord {
+    unsigned char before[32];
+    EdrBehaviorRecord record;
+    unsigned char after[32];
+  } guarded;
+  EdrDetectionDecision d;
+  memset(&guarded, 0, sizeof(guarded));
+  memset(guarded.before, 0xa5, sizeof(guarded.before));
+  memset(guarded.after, 0x5a, sizeof(guarded.after));
+  init(&guarded.record);
+  EdrBehaviorRecord *r = &guarded.record;
+  fill_ascii(r->cmdline, sizeof(r->cmdline), '\\', sizeof(r->cmdline) - 1u);
+  fill_ascii(r->exe_path, sizeof(r->exe_path), '\\', sizeof(r->exe_path) - 1u);
+  fill_ascii(r->file_path, sizeof(r->file_path), '\\', sizeof(r->file_path) - 1u);
+  fill_ascii(r->file_old_path, sizeof(r->file_old_path), '\\', sizeof(r->file_old_path) - 1u);
+  fill_ascii(r->reg_key_path, sizeof(r->reg_key_path), '\\', sizeof(r->reg_key_path) - 1u);
+  fill_ascii(r->reg_value_name, sizeof(r->reg_value_name), 'n', sizeof(r->reg_value_name) - 1u);
+  fill_ascii(r->reg_value_data, sizeof(r->reg_value_data), '\\', sizeof(r->reg_value_data) - 1u);
+  fill_ascii(r->reg_old_value_data, sizeof(r->reg_old_value_data), '\\', sizeof(r->reg_old_value_data) - 1u);
+  fill_ascii(r->script_snippet, sizeof(r->script_snippet), 's', sizeof(r->script_snippet) - 1u);
+  fill_ascii(r->pmfe_snapshot, sizeof(r->pmfe_snapshot), 'm', sizeof(r->pmfe_snapshot) - 1u);
+  memcpy(r->source_truncated_fields, "source.parent_path", sizeof("source.parent_path"));
+  r->cert_revoked_ancestor = 0xa5u;
+  snprintf(r->hostname, sizeof(r->hostname), "%s", "tail-sentinel");
+
+  edr_detection_decision_evaluate(r, &d);
+  assert(strlen(r->detection_context) < sizeof(r->detection_context));
+  cJSON *root = parse_context(r);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "context_error") == NULL);
+  assert(cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(root, "omitted_fields")));
+  assert(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(root, "omission_sources")));
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "evidence_complete")));
+  assert(omission_has(root, "process.cmdline", "source.cmdline", "context_limit"));
+  assert(omission_source_present(root, "source.exe_path"));
+  assert(omission_source_present(root, "source.file_path"));
+  assert(omission_source_present(root, "source.file_old_path"));
+  assert(omission_source_present(root, "source.reg_value_data"));
+  assert(omission_source_present(root, "source.reg_old_value_data"));
+  assert(omission_source_present(root, "source.pmfe_snapshot"));
+  assert(omission_source_present(root, "source.script_snippet"));
+  assert(strcmp(r->source_truncated_fields, "source.parent_path") == 0);
+  assert(r->cert_revoked_ancestor == 0xa5u);
+  assert(strcmp(r->hostname, "tail-sentinel") == 0);
+  for (size_t i = 0u; i < sizeof(guarded.before); i++) assert(guarded.before[i] == 0xa5u);
+  for (size_t i = 0u; i < sizeof(guarded.after); i++) assert(guarded.after[i] == 0x5au);
+  cJSON_Delete(root);
+}
+
+static void *CJSON_CDECL fail_cjson_malloc(size_t size) {
+  (void)size;
+  return NULL;
+}
+
+static void CJSON_CDECL fail_cjson_free(void *pointer) {
+  free(pointer);
+}
+
+static void test_detection_context_allocation_failure_is_explicit(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  cJSON_Hooks hooks = {fail_cjson_malloc, fail_cjson_free};
+  init(&r);
+  r.pid = 4242u;
+  fill_ascii(r.cmdline, sizeof(r.cmdline), 'x', sizeof(r.cmdline) - 1u);
+  cJSON_InitHooks(&hooks);
+  edr_detection_decision_evaluate(&r, &d);
+  cJSON_InitHooks(NULL);
+  cJSON *root = parse_context(&r);
+  assert(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(root, "context_error")));
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "evidence_complete")));
+  cJSON *process = context_object(root, "process", NULL);
+  cJSON *pid = cJSON_GetObjectItemCaseSensitive(process, "pid");
+  assert(cJSON_IsNumber(pid) && pid->valueint == 4242);
+  cJSON_Delete(root);
+}
+
 int main(void) {
   test_regsvr32_remote_combo_high();
   test_regsvr32_without_combo_suppressed();
@@ -562,6 +791,11 @@ int main(void) {
   test_ransom_single_counter_does_not_emit_burst();
   test_ransom_recovery_plus_file_burst_still_alerts();
   test_ransom_control_threshold_context();
+  test_detection_context_preserves_long_fields_below_total_limit();
+  test_detection_context_preserves_multibyte_field();
+  test_detection_context_invalid_utf8_is_explicitly_omitted();
+  test_detection_context_worst_case_record_omits_whole_fields();
+  test_detection_context_allocation_failure_is_explicit();
   puts("detection_decision ok");
   return 0;
 }

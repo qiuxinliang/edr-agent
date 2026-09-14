@@ -19,6 +19,8 @@
 
 typedef struct {
   uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
   uint64_t last_ns;
   char json[PMFE_PID_JSON_BYTES];
   int valid;
@@ -158,12 +160,15 @@ void edr_pid_history_pmfe_shutdown(void) {
   s_ph_ready = 0;
 }
 
-void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
+void edr_pid_history_pmfe_ingest_scan_detail(
+    uint32_t pid, uint64_t process_start_key,
+    uint64_t process_creation_filetime_100ns, const char *detail) {
   const char *e = getenv("EDR_PMFE_PID_HISTORY");
   if (e && e[0] == '0') {
     return;
   }
-  if (!s_ph_ready || pid == 0u || !detail || !detail[0]) {
+  if (!s_ph_ready || pid == 0u || process_start_key == 0u ||
+      process_creation_filetime_100ns == 0u || !detail || !detail[0]) {
     return;
   }
   if (strstr(detail, "open_process=failed")) {
@@ -200,7 +205,10 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
   int oldest = -1;
   uint64_t oldest_t = UINT64_MAX;
   for (int i = 0; i < EDR_PID_PMFE_SLOTS; i++) {
-    if (s_slots[i].valid && s_slots[i].pid == pid) {
+    if (s_slots[i].valid && s_slots[i].pid == pid &&
+        s_slots[i].process_start_key == process_start_key &&
+        s_slots[i].process_creation_filetime_100ns ==
+            process_creation_filetime_100ns) {
       idx = i;
       break;
     }
@@ -218,6 +226,9 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
   if (idx >= 0) {
     s_slots[idx].valid = 1;
     s_slots[idx].pid = pid;
+    s_slots[idx].process_start_key = process_start_key;
+    s_slots[idx].process_creation_filetime_100ns =
+        process_creation_filetime_100ns;
     s_slots[idx].last_ns = now;
     (void)snprintf(
         s_slots[idx].json, sizeof(s_slots[idx].json),
@@ -232,17 +243,24 @@ void edr_pid_history_pmfe_ingest_scan_detail(uint32_t pid, const char *detail) {
 }
 
 void edr_pid_history_pmfe_fill_record(EdrBehaviorRecord *br) {
+  if (!br) {
+    return;
+  }
+  br->pmfe_snapshot[0] = '\0';
   const char *e = getenv("EDR_PMFE_PID_HISTORY");
   if (e && e[0] == '0') {
     return;
   }
-  if (!s_ph_ready || !br || br->pid == 0u) {
+  if (!s_ph_ready || br->pid == 0u || br->process_start_key == 0u ||
+      br->process_creation_filetime_100ns == 0u) {
     return;
   }
-  br->pmfe_snapshot[0] = '\0';
   lock();
   for (int i = 0; i < EDR_PID_PMFE_SLOTS; i++) {
-    if (s_slots[i].valid && s_slots[i].pid == br->pid) {
+    if (s_slots[i].valid && s_slots[i].pid == br->pid &&
+        s_slots[i].process_start_key == br->process_start_key &&
+        s_slots[i].process_creation_filetime_100ns ==
+            br->process_creation_filetime_100ns) {
       size_t n = strlen(s_slots[i].json);
       if (n >= sizeof(br->pmfe_snapshot)) {
         n = sizeof(br->pmfe_snapshot) - 1u;

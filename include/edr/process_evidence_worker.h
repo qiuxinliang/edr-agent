@@ -50,10 +50,18 @@ typedef struct {
  * results from a different process instance are deliberately invisible.
  * Repeated requests retrieve the first captured pathname snapshot even if
  * that path is deleted/replaced. This does not prove the process image. */
+#define EDR_PROCESS_EVIDENCE_CAPACITY 32u
 int edr_process_evidence_worker_start(void);
 void edr_process_evidence_worker_stop(void);
 int edr_process_evidence_request(const char *canonical_path, uint64_t generation,
                                  uint64_t monotonic_ns, EdrProcessEvidence *out);
+/* Non-blocking: 1 ready, 0 pending, -1 terminally unavailable. Never reopens
+ * a pathname or changes the generation captured by the original request. */
+int edr_process_evidence_poll(const char *canonical_path, uint64_t generation,
+                              uint64_t monotonic_ns, EdrProcessEvidence *out);
+/* Charge the existing observation-timeout metric once when a continuation
+ * expires; a shutdown cancellation is not a timeout. */
+void edr_process_evidence_note_wait_timeout(void);
 /* Wait only from a preprocess worker, never from the ETW callback.  The
  * timeout is caller-bounded; an unfinished job is reported as unknown. */
 int edr_process_evidence_wait(const char *canonical_path, uint64_t generation,

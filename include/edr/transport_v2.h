@@ -65,6 +65,7 @@ typedef struct {
   int backpressure_enabled;
   unsigned telemetry_sampling_pct;
   unsigned long opened_streams;
+  unsigned long send_attempts;
   unsigned long send_ok;
   unsigned long send_fail;
   unsigned long ack_ok;
@@ -99,7 +100,6 @@ void edr_transport_v2_apply_profile(const char *dict_ver, const char *schema_ver
                                     const char *threshold, int backpressure_enabled);
 
 int edr_transport_v2_open_stream(EdrTransportV2Channel channel, EdrTransportV2Operation op);
-int edr_transport_v2_send(int stream_id, const void *data, size_t len);
 void edr_transport_v2_on_control(const char *frame_type);
 void edr_transport_v2_ack(const char *command_id, int ok);
 void edr_transport_v2_resume(const char *cursor);

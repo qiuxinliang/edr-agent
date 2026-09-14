@@ -5,7 +5,7 @@
  * 并由 **`pmfe_try_emit_scan_result`** 推 **ETW1 槽**；**不写 `AVE_FeedEvent`**。预处理线程在 **`edr_behavior_from_slot`**
  * 之后调用 **`edr_ave_cross_engine_feed_from_record`**，将 PMFE / Shellcode / Webshell 标量统一送入 **`EdrPidHistory`**（E 组 53–54 等）。
  *
- * 开关：`EDR_PMFE_DNS_*`、`EDR_PMFE_EMIT_*`（`EDR_PMFE_EMIT_MZ` 仅 PE MZ；`EDR_PMFE_EMIT_ELF` 仅 Linux ELF，互不影响）、`EDR_PMFE_PID_HISTORY`（=0 关闭按 PID 的 PMFE 摘要写回 `EdrBehaviorRecord.pmfe_snapshot`）
+ * 开关：`EDR_PMFE_DNS_*`、`EDR_PMFE_EMIT_*`（`EDR_PMFE_EMIT_MZ` 仅 PE MZ；`EDR_PMFE_EMIT_ELF` 仅 Linux ELF，互不影响）、`EDR_PMFE_PID_HISTORY`（=0 关闭按 PID + 精确进程 generation 的 PMFE 摘要写回 `EdrBehaviorRecord.pmfe_snapshot`）
  * Linux：`EDR_PMFE_LINUX_ANON_EXEC_ONLY=1` 时 maps 候选池仅匿名/`[vdso]` 等可执行段；详情含 `vm_read_failures=`；模块完整性/stomp 与 Windows 共用 `EDR_PMFE_STOMP_BYTES`、`EDR_PMFE_DISK_HASH_MAX`。
  * Linux 采集器：可选 **`EDR_LINUX_PROC_CONNECTOR=1`**（见 `collector_linux.c`）用内核 proc connector 驱动 **`edr_pmfe_on_process_lifecycle_hint`**。
  * 宿主筛选与优先级见 ../Cauld Design/07_进程内存取证引擎PMFE设计-1.md §2.2

@@ -1213,24 +1213,74 @@ static void json_char(char *dst, size_t cap, char c) {
   dst[used + 1u] = '\0';
 }
 
+static size_t json_utf8_sequence_length(const unsigned char *s) {
+  if (s[0] < 0x80u) return 1u;
+  if (s[0] >= 0xc2u && s[0] <= 0xdfu &&
+      (s[1] & 0xc0u) == 0x80u) return 2u;
+  if (s[0] == 0xe0u && s[1] >= 0xa0u && s[1] <= 0xbfu &&
+      (s[2] & 0xc0u) == 0x80u) return 3u;
+  if (((s[0] >= 0xe1u && s[0] <= 0xecu) ||
+       (s[0] >= 0xeeu && s[0] <= 0xefu)) &&
+      (s[1] & 0xc0u) == 0x80u && (s[2] & 0xc0u) == 0x80u) return 3u;
+  if (s[0] == 0xedu && s[1] >= 0x80u && s[1] <= 0x9fu &&
+      (s[2] & 0xc0u) == 0x80u) return 3u;
+  if (s[0] == 0xf0u && s[1] >= 0x90u && s[1] <= 0xbfu &&
+      (s[2] & 0xc0u) == 0x80u && (s[3] & 0xc0u) == 0x80u) return 4u;
+  if (s[0] >= 0xf1u && s[0] <= 0xf3u &&
+      (s[1] & 0xc0u) == 0x80u && (s[2] & 0xc0u) == 0x80u &&
+      (s[3] & 0xc0u) == 0x80u) return 4u;
+  if (s[0] == 0xf4u && s[1] >= 0x80u && s[1] <= 0x8fu &&
+      (s[2] & 0xc0u) == 0x80u && (s[3] & 0xc0u) == 0x80u) return 4u;
+  return 0u;
+}
+
+static int json_utf8_valid(const char *s) {
+  const unsigned char *p = (const unsigned char *)(s ? s : "");
+  while (*p) {
+    size_t n = json_utf8_sequence_length(p);
+    if (n == 0u) return 0;
+    p += n;
+  }
+  return 1;
+}
+
 static void json_str(char *dst, size_t cap, const char *s, size_t max_chars) {
   json_char(dst, cap, '"');
   if (!s) {
     s = "";
   }
   size_t emitted = 0u;
-  for (; *s && emitted < max_chars; s++, emitted++) {
-    unsigned char c = (unsigned char)*s;
+  while (*s && emitted < max_chars) {
+    const unsigned char *u = (const unsigned char *)s;
+    size_t sequence_length = json_utf8_sequence_length(u);
+    if (sequence_length == 0u) {
+      json_cat(dst, cap, "\\ufffd");
+      s++;
+      emitted++;
+      continue;
+    }
+    if (emitted + sequence_length > max_chars) break;
+    unsigned char c = *u;
     if (c == '"' || c == '\\') {
       json_char(dst, cap, '\\');
       json_char(dst, cap, (char)c);
     } else if (c < 0x20u) {
-      json_char(dst, cap, ' ');
+      static const char hex[] = "0123456789abcdef";
+      json_cat(dst, cap, "\\u00%c%c", hex[c >> 4u], hex[c & 0x0fu]);
     } else {
-      json_char(dst, cap, (char)c);
+      for (size_t i = 0u; i < sequence_length; i++) {
+        json_char(dst, cap, s[i]);
+      }
     }
+    s += sequence_length;
+    emitted += sequence_length;
   }
   json_char(dst, cap, '"');
+}
+
+static void json_record_str(char *dst, size_t cap, const char *s,
+                            size_t placeholder_limit, int complete) {
+  json_str(dst, cap, s, complete ? (size_t)-1 : placeholder_limit);
 }
 
 /* 把逗号分隔的 reason 串序列化为 JSON 字符串数组：a,b,c -> ["a","b","c"]。 */
@@ -1359,7 +1409,9 @@ static void build_recommended_forensics(char *dst, size_t cap, const EdrBehavior
 #undef ADD_ACTION
 }
 
-static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectionDecision *d, const EdrDetectionTrigger *t, char *context, size_t context_capacity) {
+static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectionDecision *d,
+                                         const EdrDetectionTrigger *t, char *context,
+                                         size_t context_capacity, int complete_record_text) {
   context[0] = '\0';
   char evidence_detector[48];
   char evidence_rule[96];
@@ -1628,22 +1680,23 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   json_cat(context, context_capacity, "}");
   json_cat(context, context_capacity,
            ",\"process\":{\"pid\":%u,\"name\":", r->pid);
-  json_str(context, context_capacity, r->process_name, 96u);
+  json_record_str(context, context_capacity, r->process_name, 96u, complete_record_text);
   json_cat(context, context_capacity, ",\"path\":");
-  json_str(context, context_capacity, r->exe_path, 220u);
+  json_record_str(context, context_capacity, r->exe_path, 220u, complete_record_text);
   json_cat(context, context_capacity, ",\"cmdline\":");
-  json_str(context, context_capacity, r->cmdline, 360u);
+  json_record_str(context, context_capacity, r->cmdline, 360u, complete_record_text);
   json_cat(context, context_capacity,
            ",\"parent_pid\":%u,\"parent_name\":", r->ppid);
-  json_str(context, context_capacity, r->parent_name, 96u);
+  json_record_str(context, context_capacity, r->parent_name, 96u, complete_record_text);
   json_cat(context, context_capacity, "},\"file\":{\"path\":");
-  json_str(context, context_capacity, r->file_path[0] ? r->file_path : r->exe_path, 220u);
+  json_record_str(context, context_capacity, r->file_path[0] ? r->file_path : r->exe_path,
+                  220u, complete_record_text);
   if (r->file_old_path[0]) {
     json_cat(context, context_capacity, ",\"old_path\":");
-    json_str(context, context_capacity, r->file_old_path, 220u);
+    json_record_str(context, context_capacity, r->file_old_path, 220u, complete_record_text);
   }
   json_cat(context, context_capacity, ",\"sha256\":");
-  json_str(context, context_capacity, r->exe_hash, 80u);
+  json_record_str(context, context_capacity, r->exe_hash, 80u, complete_record_text);
   json_cat(context, context_capacity,
            ",\"old_ext\":");
   json_str(context, context_capacity, old_ext_buf, 24u);
@@ -1664,27 +1717,27 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   json_cat(context, context_capacity,
            ",\"signer_allowlisted\":%s,\"cert_revoked_ancestor\":%s}},\"network\":{\"remote_url\":",
            ransom_signer_allowlisted ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false");
-  json_str(context, context_capacity, r->dns_query, 180u);
+  json_record_str(context, context_capacity, r->dns_query, 180u, complete_record_text);
   json_cat(context, context_capacity, ",\"remote_ip\":");
-  json_str(context, context_capacity, r->net_dst, 64u);
+  json_record_str(context, context_capacity, r->net_dst, 64u, complete_record_text);
   json_cat(context, context_capacity,
            ",\"dst_port\":%u},\"registry\":{\"key\":",
            r->net_dport);
-  json_str(context, context_capacity, r->reg_key_path, 220u);
+  json_record_str(context, context_capacity, r->reg_key_path, 220u, complete_record_text);
   json_cat(context, context_capacity, ",\"value_name\":");
-  json_str(context, context_capacity, r->reg_value_name, 120u);
+  json_record_str(context, context_capacity, r->reg_value_name, 120u, complete_record_text);
   json_cat(context, context_capacity, ",\"value_data\":");
-  json_str(context, context_capacity, r->reg_value_data, 260u);
+  json_record_str(context, context_capacity, r->reg_value_data, 260u, complete_record_text);
   json_cat(context, context_capacity, ",\"old_value_data\":");
-  json_str(context, context_capacity, r->reg_old_value_data, 260u);
+  json_record_str(context, context_capacity, r->reg_old_value_data, 260u, complete_record_text);
   json_cat(context, context_capacity, ",\"op\":");
-  json_str(context, context_capacity, r->reg_op, 48u);
+  json_record_str(context, context_capacity, r->reg_op, 48u, complete_record_text);
   json_cat(context, context_capacity, ",\"source\":");
-  json_str(context, context_capacity, r->reg_source, 48u);
+  json_record_str(context, context_capacity, r->reg_source, 48u, complete_record_text);
   json_cat(context, context_capacity, ",\"attribution\":");
-  json_str(context, context_capacity, r->reg_attribution, 32u);
+  json_record_str(context, context_capacity, r->reg_attribution, 32u, complete_record_text);
   json_cat(context, context_capacity, ",\"detail_status\":");
-  json_str(context, context_capacity, r->reg_detail_status, 48u);
+  json_record_str(context, context_capacity, r->reg_detail_status, 48u, complete_record_text);
   json_cat(context, context_capacity,
            "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
@@ -1816,11 +1869,12 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     json_cat(context, context_capacity, "\"schema\":\"shellcode_result_v1\",\"alert_id\":");
     json_str(context, context_capacity, evidence_alert_id, 64u);
     json_cat(context, context_capacity, ",\"flow\":{\"src\":");
-    json_str(context, context_capacity, r->net_src, 64u);
+    json_record_str(context, context_capacity, r->net_src, 64u, complete_record_text);
     json_cat(context, context_capacity, ",\"spt\":%u,\"dst\":", r->net_sport);
-    json_str(context, context_capacity, r->net_dst, 64u);
+    json_record_str(context, context_capacity, r->net_dst, 64u, complete_record_text);
     json_cat(context, context_capacity, ",\"dpt\":%u,\"proto\":", r->net_dport);
-    json_str(context, context_capacity, evidence_proto[0] ? evidence_proto : r->net_proto, 48u);
+    json_str(context, context_capacity, evidence_proto[0] ? evidence_proto : r->net_proto,
+             (complete_record_text && !evidence_proto[0]) ? (size_t)-1 : 48u);
     json_cat(context, context_capacity, "},\"owner\":{\"pid\":%u},\"detection\":{\"detector\":", r->pid);
     json_str(context, context_capacity, evidence_detector, 48u);
     json_cat(context, context_capacity, ",\"rule\":");
@@ -1828,7 +1882,8 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     json_cat(context, context_capacity, ",\"score\":%.6f,\"mitre\":", evidence_score[0] ? strtod(evidence_score, NULL) : 0.0);
     json_str(context, context_capacity, evidence_mitre[0] ? evidence_mitre : "T1210", 32u);
     json_cat(context, context_capacity, "},\"payload\":{\"sha256\":");
-    json_str(context, context_capacity, evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash, 80u);
+    json_str(context, context_capacity, evidence_payload_sha256[0] ? evidence_payload_sha256 : r->exe_hash,
+             (complete_record_text && !evidence_payload_sha256[0]) ? (size_t)-1 : 80u);
     json_cat(context, context_capacity, ",\"preview_hex\":");
     json_str(context, context_capacity, evidence_preview_hex, 160u);
     json_cat(context, context_capacity, "},\"pmfe_followup\":{\"recommended\":%s,\"trigger\":",
@@ -1866,9 +1921,10 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     }
   } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
     json_cat(context, context_capacity, "\"schema\":\"webshell_result_v1\",\"file\":{\"path\":");
-    json_str(context, context_capacity, r->file_path, 220u);
+    json_record_str(context, context_capacity, r->file_path, 220u, complete_record_text);
     json_cat(context, context_capacity, ",\"sha256\":");
-    json_str(context, context_capacity, r->exe_hash[0] ? r->exe_hash : evidence_file_fp, 80u);
+    json_str(context, context_capacity, r->exe_hash[0] ? r->exe_hash : evidence_file_fp,
+             (complete_record_text && r->exe_hash[0]) ? (size_t)-1 : 80u);
     json_cat(context, context_capacity, "},\"sample\":{\"uploaded\":%s,\"object_key\":", (evidence_file_uploaded[0] && strcmp(evidence_file_uploaded, "0") != 0) ? "true" : "false");
     json_str(context, context_capacity, evidence_object_key, 240u);
     json_cat(context, context_capacity, ",\"local_path\":");
@@ -1876,7 +1932,8 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     json_cat(context, context_capacity, "},\"http\":{\"service\":");
     json_str(context, context_capacity, evidence_service, 96u);
     json_cat(context, context_capacity, ",\"url\":");
-    json_str(context, context_capacity, evidence_url[0] ? evidence_url : r->dns_query, 180u);
+    json_str(context, context_capacity, evidence_url[0] ? evidence_url : r->dns_query,
+             (complete_record_text && !evidence_url[0]) ? (size_t)-1 : 180u);
     json_cat(context, context_capacity, "},\"use\":{\"observed\":false},\"detection\":{\"detector\":");
     json_str(context, context_capacity, evidence_detector, 48u);
     json_cat(context, context_capacity, ",\"rule\":");
@@ -1917,13 +1974,13 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     json_cat(context, context_capacity, ",\"dns_owner\":");
     json_str(context, context_capacity, pmfe_dns_owner, 96u);
     json_cat(context, context_capacity, "},\"evidence\":{\"pmfe_snapshot\":");
-    json_str(context, context_capacity, r->pmfe_snapshot, 360u);
+    json_record_str(context, context_capacity, r->pmfe_snapshot, 360u, complete_record_text);
     json_cat(context, context_capacity, "},");
   } else {
     json_cat(context, context_capacity, "\"schema\":\"generic_engine_evidence_v1\",");
   }
   json_cat(context, context_capacity, "\"pmfe_snapshot\":");
-  json_str(context, context_capacity, r->pmfe_snapshot, 360u);
+  json_record_str(context, context_capacity, r->pmfe_snapshot, 360u, complete_record_text);
   json_cat(context, context_capacity, ",\"detector\":");
   json_str(context, context_capacity, evidence_detector, 48u);
   json_cat(context, context_capacity, ",\"rule\":");
@@ -1937,52 +1994,265 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   json_cat(context, context_capacity, ",\"forensic\":");
   json_str(context, context_capacity, evidence_forensic, 32u);
   json_cat(context, context_capacity, ",\"detail\":");
-  json_str(context, context_capacity, r->script_snippet, 420u);
+  json_record_str(context, context_capacity, r->script_snippet, 420u, complete_record_text);
   json_cat(context, context_capacity, "},\"recommended_forensics\":[");
   build_recommended_forensics(context, context_capacity, r, d, t);
   json_cat(context, context_capacity, "]}");
 }
 
+static cJSON *context_object_at(cJSON *root, const char *path) {
+  cJSON *current = root;
+  const char *cursor = path ? path : "";
+  while (*cursor) {
+    const char *dot = strchr(cursor, '.');
+    size_t length = dot ? (size_t)(dot - cursor) : strlen(cursor);
+    char segment[64];
+    if (length == 0u || length >= sizeof(segment)) return NULL;
+    memcpy(segment, cursor, length);
+    segment[length] = '\0';
+    current = cJSON_GetObjectItemCaseSensitive(current, segment);
+    if (!cJSON_IsObject(current)) return NULL;
+    if (!dot) break;
+    cursor = dot + 1u;
+  }
+  return current;
+}
+
+static int context_array_add_string(cJSON *array, const char *value) {
+  cJSON *item = cJSON_CreateString(value ? value : "");
+  if (!item) return 0;
+  if (!cJSON_AddItemToArray(array, item)) {
+    cJSON_Delete(item);
+    return 0;
+  }
+  return 1;
+}
+
+static int context_add_omission(cJSON *root, const char *field,
+                                const char *sources_csv, const char *reason) {
+  cJSON *omitted = cJSON_GetObjectItemCaseSensitive(root, "omitted_fields");
+  cJSON *source_map = cJSON_GetObjectItemCaseSensitive(root, "omission_sources");
+  cJSON *complete = cJSON_GetObjectItemCaseSensitive(root, "evidence_complete");
+  if (!omitted) omitted = cJSON_AddArrayToObject(root, "omitted_fields");
+  if (!source_map) source_map = cJSON_AddObjectToObject(root, "omission_sources");
+  if (!complete) complete = cJSON_AddBoolToObject(root, "evidence_complete", 0);
+  if (!cJSON_IsArray(omitted) || !cJSON_IsObject(source_map) || !cJSON_IsBool(complete)) return 0;
+  cJSON_SetBoolValue(complete, 0);
+  if (!context_array_add_string(omitted, field)) return 0;
+
+  cJSON *sources = cJSON_AddArrayToObject(source_map, field);
+  if (!sources) return 0;
+  const char *cursor = sources_csv ? sources_csv : "";
+  while (*cursor) {
+    const char *comma = strchr(cursor, ',');
+    size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+    char source[96];
+    if (length == 0u || length >= sizeof(source)) {
+      return 0;
+    }
+    memcpy(source, cursor, length);
+    source[length] = '\0';
+    if (!context_array_add_string(sources, source)) {
+      return 0;
+    }
+    if (!comma) break;
+    cursor = comma + 1u;
+  }
+  if (strcmp(reason, "invalid_utf8") == 0) {
+    cJSON *invalid = cJSON_GetObjectItemCaseSensitive(root, "invalid_fields");
+    if (!invalid) invalid = cJSON_AddArrayToObject(root, "invalid_fields");
+    if (!cJSON_IsArray(invalid) || !context_array_add_string(invalid, field)) return 0;
+  } else {
+    cJSON *limited = cJSON_GetObjectItemCaseSensitive(root, "projection_limited");
+    if (!limited) limited = cJSON_AddBoolToObject(root, "projection_limited", 1);
+    if (!cJSON_IsBool(limited)) return 0;
+    cJSON_SetBoolValue(limited, 1);
+  }
+  return 1;
+}
+
+static int context_project_string(cJSON *root, const char *parent_path,
+                                  const char *key, const char *value,
+                                  const char *field, const char *source) {
+  cJSON *parent = context_object_at(root, parent_path);
+  cJSON *existing = parent ? cJSON_GetObjectItemCaseSensitive(parent, key) : NULL;
+  if (!existing) return 1;
+  if (!json_utf8_valid(value)) {
+    cJSON_DeleteItemFromObjectCaseSensitive(parent, key);
+    return context_add_omission(root, field, source, "invalid_utf8");
+  }
+  cJSON *replacement = cJSON_CreateString(value ? value : "");
+  if (!replacement) return 0;
+  if (!cJSON_ReplaceItemInObjectCaseSensitive(parent, key, replacement)) {
+    cJSON_Delete(replacement);
+    return 0;
+  }
+  return 1;
+}
+
+static int context_remove_field(cJSON *root, const char *parent_path,
+                                const char *key, const char *field,
+                                const char *sources_csv, const char *reason) {
+  cJSON *parent = context_object_at(root, parent_path);
+  if (!parent || !cJSON_GetObjectItemCaseSensitive(parent, key)) return 1;
+  cJSON_DeleteItemFromObjectCaseSensitive(parent, key);
+  return context_add_omission(root, field, sources_csv, reason);
+}
+
+static int context_record_text_valid(const EdrBehaviorRecord *r) {
+  const char *fields[] = {
+    r->process_name, r->exe_path, r->cmdline, r->parent_name,
+    r->file_path, r->file_old_path, r->exe_hash,
+    r->dns_query, r->net_src, r->net_dst, r->net_proto,
+    r->reg_key_path, r->reg_value_name, r->reg_value_data,
+    r->reg_old_value_data, r->reg_op, r->reg_source,
+    r->reg_attribution, r->reg_detail_status,
+    r->pmfe_snapshot, r->script_snippet
+  };
+  for (size_t i = 0u; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    if (!json_utf8_valid(fields[i])) return 0;
+  }
+  return 1;
+}
+
 static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDecision *d,
                                       const EdrDetectionTrigger *t) {
-  /* The record remains bounded. Optional duplicated text is removed as whole
-   * JSON values, never by cutting the serialized evidence mid-token. */
-  build_detection_context_full(r, d, t, r->detection_context, sizeof(r->detection_context));
-  if (strlen(r->detection_context) < sizeof(r->detection_context) - 1u) return;
+  /* The common path is allocation-free: emit complete record-backed values
+   * directly and return only when the whole JSON document fits. */
+  build_detection_context_full(r, d, t, r->detection_context,
+                               sizeof(r->detection_context), 1);
+  if (strlen(r->detection_context) < sizeof(r->detection_context) - 1u &&
+      context_record_text_valid(r)) return;
+
+  /* Overflow and invalid UTF-8 take the explicit projection path. A bounded,
+   * valid template preserves the established shape while cJSON owns complete
+   * values and whole-field omission metadata. */
   const size_t full_capacity = 32768u;
   char *full = (char *)malloc(full_capacity);
   cJSON *root = NULL;
   const char *failure = "allocation_failed";
   if (!full) goto failed;
-  build_detection_context_full(r, d, t, full, full_capacity);
+  build_detection_context_full(r, d, t, full, full_capacity, 0);
+  failure = "context_construction_failed";
   root = cJSON_ParseWithOpts(full, NULL, 1);
-  failure = "invalid_or_oversized_evidence";
   if (!root) goto failed;
-  if (strlen(full) < sizeof(r->detection_context)) {
-    memcpy(r->detection_context, full, strlen(full) + 1u);
+  failure = "allocation_failed";
+#define PROJECT(parent, key, value, field, source) \
+  do { if (!context_project_string(root, parent, key, value, field, source)) goto failed; } while (0)
+  PROJECT("process", "name", r->process_name, "process.name", "source.process_name");
+  PROJECT("process", "path", r->exe_path, "process.path", "source.exe_path");
+  PROJECT("process", "cmdline", r->cmdline, "process.cmdline", "source.cmdline");
+  PROJECT("process", "parent_name", r->parent_name, "process.parent_name", "source.parent_name");
+  PROJECT("file", "path", r->file_path[0] ? r->file_path : r->exe_path, "file.path",
+          r->file_path[0] ? "source.file_path" : "source.exe_path");
+  PROJECT("file", "old_path", r->file_old_path, "file.old_path", "source.file_old_path");
+  PROJECT("file", "sha256", r->exe_hash, "file.sha256", "source.exe_hash");
+  PROJECT("network", "remote_url", r->dns_query, "network.remote_url", "source.dns_query");
+  PROJECT("network", "remote_ip", r->net_dst, "network.remote_ip", "source.net_dst");
+  PROJECT("registry", "key", r->reg_key_path, "registry.key", "source.reg_key_path");
+  PROJECT("registry", "value_name", r->reg_value_name, "registry.value_name", "source.reg_value_name");
+  PROJECT("registry", "value_data", r->reg_value_data, "registry.value_data", "source.reg_value_data");
+  PROJECT("registry", "old_value_data", r->reg_old_value_data, "registry.old_value_data", "source.reg_old_value_data");
+  PROJECT("registry", "op", r->reg_op, "registry.op", "source.reg_op");
+  PROJECT("registry", "source", r->reg_source, "registry.source", "source.reg_source");
+  PROJECT("registry", "attribution", r->reg_attribution, "registry.attribution", "source.reg_attribution");
+  PROJECT("registry", "detail_status", r->reg_detail_status, "registry.detail_status", "source.reg_detail_status");
+  PROJECT("engine_evidence", "pmfe_snapshot", r->pmfe_snapshot,
+          "engine_evidence.pmfe_snapshot", "source.pmfe_snapshot");
+  PROJECT("engine_evidence", "detail", r->script_snippet,
+          "engine_evidence.detail", "source.script_snippet");
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE) {
+    char projected_proto[48];
+    char projected_payload_sha256[96];
+    PROJECT("engine_evidence.flow", "src", r->net_src,
+            "engine_evidence.flow.src", "source.net_src");
+    PROJECT("engine_evidence.flow", "dst", r->net_dst,
+            "engine_evidence.flow.dst", "source.net_dst");
+    if (!detail_value(r->script_snippet, "proto", projected_proto,
+                      sizeof(projected_proto))) {
+      PROJECT("engine_evidence.flow", "proto", r->net_proto,
+              "engine_evidence.flow.proto", "source.net_proto");
+    }
+    if (!detail_value(r->script_snippet, "payload_sha256", projected_payload_sha256,
+                      sizeof(projected_payload_sha256))) {
+      PROJECT("engine_evidence.payload", "sha256", r->exe_hash,
+              "engine_evidence.payload.sha256", "source.exe_hash");
+    }
+  } else if (r->type == EDR_EVENT_WEBSHELL_DETECTED) {
+    char projected_url[256];
+    PROJECT("engine_evidence.file", "path", r->file_path,
+            "engine_evidence.file.path", "source.file_path");
+    if (r->exe_hash[0]) {
+      PROJECT("engine_evidence.file", "sha256", r->exe_hash,
+              "engine_evidence.file.sha256", "source.exe_hash");
+    }
+    if (!detail_value(r->script_snippet, "url", projected_url, sizeof(projected_url))) {
+      PROJECT("engine_evidence.http", "url", r->dns_query,
+              "engine_evidence.http.url", "source.dns_query");
+    }
+  } else if (r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->pmfe_snapshot[0]) {
+    PROJECT("engine_evidence.evidence", "pmfe_snapshot", r->pmfe_snapshot,
+            "engine_evidence.evidence.pmfe_snapshot", "source.pmfe_snapshot");
+  }
+  if (!json_utf8_valid(r->script_snippet) || !json_utf8_valid(r->cmdline)) {
+    const char *sources = !json_utf8_valid(r->script_snippet) && !json_utf8_valid(r->cmdline)
+        ? "source.script_snippet,source.cmdline"
+        : (!json_utf8_valid(r->script_snippet) ? "source.script_snippet" : "source.cmdline");
+    if (!context_remove_field(root, NULL, "engine_evidence", "engine_evidence",
+                              sources, "invalid_utf8")) goto failed;
+  }
+#undef PROJECT
+
+  if (cJSON_PrintPreallocated(root, r->detection_context,
+                              (int)sizeof(r->detection_context), 0)) {
     cJSON_Delete(root);
     free(full);
     return;
   }
-  cJSON *omitted = cJSON_AddArrayToObject(root, "omitted_fields");
-  if (!omitted) goto failed;
-  const struct { const char *parent; const char *key; } optional[] = {
-    {"engine_evidence", "detail"}, {"engine_evidence", "pmfe_snapshot"},
-    {"process", "cmdline"}, {NULL, "registry"}, {NULL, "network"},
-    {"engine_evidence", "samples"}, {"engine_evidence", "evidence"},
-    {"file", "signature_trust"}, {NULL, "reason"},
-    {"file", "path"}, {"process", "path"}
+
+  const char *engine_sources =
+      r->type == EDR_EVENT_PROTOCOL_SHELLCODE
+          ? "source.script_snippet,source.pmfe_snapshot,source.net_src,source.net_dst,source.net_proto,source.exe_hash"
+          : (r->type == EDR_EVENT_WEBSHELL_DETECTED
+                 ? "source.script_snippet,source.pmfe_snapshot,source.file_path,source.exe_hash,source.dns_query"
+                 : ((r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->pmfe_snapshot[0])
+                        ? "source.script_snippet,source.pmfe_snapshot,source.cmdline"
+                        : "source.script_snippet,source.pmfe_snapshot"));
+  const struct {
+    const char *parent;
+    const char *key;
+    const char *field;
+    const char *sources;
+  } optional[] = {
+    {"engine_evidence", "detail", "engine_evidence.detail", "source.script_snippet"},
+    {"engine_evidence", "pmfe_snapshot", "engine_evidence.pmfe_snapshot", "source.pmfe_snapshot"},
+    {"engine_evidence.evidence", "pmfe_snapshot", "engine_evidence.evidence.pmfe_snapshot", "source.pmfe_snapshot"},
+    {"process", "cmdline", "process.cmdline", "source.cmdline"},
+    {"registry", "value_data", "registry.value_data", "source.reg_value_data"},
+    {"registry", "old_value_data", "registry.old_value_data", "source.reg_old_value_data"},
+    {"engine_evidence", "samples", "engine_evidence.samples", "source.cmdline"},
+    {"engine_evidence", "evidence", "engine_evidence.evidence", "source.pmfe_snapshot"},
+    {NULL, "engine_evidence", "engine_evidence", engine_sources},
+    {"file", "signature_trust", "file.signature_trust", "source.script_snippet"},
+    {NULL, "reason", "reason", "decision.reason"},
+    {"file", "old_path", "file.old_path", "source.file_old_path"},
+    {"file", "path", "file.path", r->file_path[0] ? "source.file_path" : "source.exe_path"},
+    {"process", "path", "process.path", "source.exe_path"},
+    {NULL, "registry", "registry",
+     "source.reg_key_path,source.reg_value_name,source.reg_op,source.reg_source,source.reg_attribution,source.reg_detail_status"},
+    {NULL, "network", "network", "source.dns_query,source.net_dst"},
+    {"file", "old_ext", "file.old_ext", "source.script_snippet"},
+    {"file", "new_ext", "file.new_ext", "source.script_snippet"},
+    {NULL, "detection_profile", "detection_profile", "decision.detection_profile"},
+    {NULL, "detection_trigger", "detection_trigger", "decision.trigger"},
+    {NULL, "recommended_forensics", "recommended_forensics", "decision.recommended_forensics"},
+    {"process", "parent_name", "process.parent_name", "source.parent_name"},
+    {"process", "name", "process.name", "source.process_name"}
   };
   for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i) {
-    cJSON *parent = optional[i].parent
-        ? cJSON_GetObjectItemCaseSensitive(root, optional[i].parent) : root;
-    if (cJSON_GetObjectItemCaseSensitive(parent, optional[i].key)) {
-      char field[96];
-      snprintf(field, sizeof(field), "%s%s%s", optional[i].parent ? optional[i].parent : "",
-               optional[i].parent ? "." : "", optional[i].key);
-      cJSON_DeleteItemFromObjectCaseSensitive(parent, optional[i].key);
-      if (!cJSON_AddItemToArray(omitted, cJSON_CreateString(field))) goto failed;
-    }
+    if (!context_remove_field(root, optional[i].parent, optional[i].key,
+                              optional[i].field, optional[i].sources,
+                              "context_limit")) goto failed;
     if (cJSON_PrintPreallocated(root, r->detection_context,
                                  (int)sizeof(r->detection_context), 0)) {
       cJSON_Delete(root);
@@ -1990,6 +2260,7 @@ static void build_detection_context(EdrBehaviorRecord *r, const EdrDetectionDeci
       return;
     }
   }
+  failure = "required_context_oversized";
 failed:
   /* A serialization failure must never resemble a clean/empty verdict. */
   snprintf(r->detection_context, sizeof(r->detection_context),

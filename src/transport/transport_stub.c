@@ -1,352 +1,100 @@
-/**
- * 传输层 — 批次入队、工作线程、HTTP ingest/control 调度、指标计数。
- *
- * EdrTransportCtx 将 15 个 file-scope 全局变量收敛为单一结构体；
- * dispatch 函数指针通过 edr_transport_inject_dispatch 可注入（测试/QUIC/MQTT）。
- */
+/* One durable batch owner, one network drain worker. Control transport keeps
+ * its existing independent lifetime, signing and TLS configuration. */
 #include "edr/transport_sink.h"
-
 #include "edr/config.h"
 #include "edr/edr_log.h"
 #include "edr/ingest_http.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_v2.h"
-
+#include "edr/time_util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdatomic.h>
 #ifndef _WIN32
 #include <pthread.h>
-#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+static pthread_mutex_t s_wake_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_wake_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t s_thread;
 #else
 #include <process.h>
 #include <windows.h>
+static SRWLOCK s_wake_mu = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_wake_cv = CONDITION_VARIABLE_INIT;
+static HANDLE s_thread;
 #endif
 
-/* ---- 内部类型 ---- */
-
-typedef struct EdrSendJob {
-  int use_http;
-  char batch_id[64];
-  uint8_t header12[12];
-  size_t header_len;
-  uint8_t *payload;
-  size_t payload_len;
-  struct EdrSendJob *next;
-} EdrSendJob;
-
-typedef struct EdrTransportCtx {
-  /* --- 调度层 --- */
-  EdrTransportDispatchFn dispatch;
-  void *dispatch_ud;
-
-  /* --- 指标层 --- */
-  unsigned long wire_events;
-  size_t wire_bytes;
-  unsigned long batch_count;
-  size_t batch_bytes;
-  unsigned long batch_lz4;
-  unsigned long queue_full_total;
-  unsigned long queue_full_persisted;
-  unsigned long queue_full_sampled;
-  unsigned long queue_full_dropped;
-
-  /* --- 队列层 --- */
-  EdrSendJob *q_head;
-  EdrSendJob *q_tail;
-  size_t q_len;
-  size_t q_cap;
-  int q_started;
-
-#ifndef _WIN32
-  pthread_mutex_t q_mu;
-  pthread_cond_t q_cv;
-  pthread_t q_thr;
-#else
-  CRITICAL_SECTION q_mu;
-  CONDITION_VARIABLE q_cv;
-  HANDLE q_thr;
+#ifndef EDR_TRANSPORT_STOP_TIMEOUT_MS
+#define EDR_TRANSPORT_STOP_TIMEOUT_MS 15000u
 #endif
-  volatile int q_run;
-} EdrTransportCtx;
-
-/* ---- 单例 ---- */
-
-static EdrTransportCtx g_ctx;
-
-/* ---- dispatch fallback 策略 ---- */
+static atomic_int s_started;
+static atomic_int s_run;
+static atomic_int s_exited = 1;
+static atomic_ulong s_wire_events, s_batch_count, s_batch_lz4, s_batch_rejected;
+static atomic_size_t s_wire_bytes, s_batch_bytes;
 
 static int env_truthy(const char *name) {
   const char *v = getenv(name);
   return v && (strcmp(v, "1") == 0 || strcmp(v, "true") == 0 || strcmp(v, "TRUE") == 0);
 }
-
 static int url_is_loopback_http(const char *s) {
   return s && (strncmp(s, "http://127.0.0.1", 16) == 0 || strncmp(s, "http://localhost", 16) == 0 ||
                strncmp(s, "http://[::1]", 12) == 0);
 }
-
-static int header_lz4(const uint8_t *header12, size_t header_len) {
-  if (!header12 || header_len < 4u) {
-    return 0;
-  }
-  uint32_t m = (uint32_t)header12[0] | ((uint32_t)header12[1] << 8) |
-               ((uint32_t)header12[2] << 16) | ((uint32_t)header12[3] << 24);
-  return m == EDR_TRANSPORT_BATCH_MAGIC_LZ4;
-}
-
-static int persist_wire_batch(const char *batch_id, const uint8_t *header12, size_t header_len,
-                              const uint8_t *payload, size_t payload_len, int severity) {
-  if (!edr_storage_queue_is_open() || !batch_id || !header12 || header_len < 12u || !payload ||
-      payload_len == 0u) {
-    return -1;
-  }
-  size_t wire_len = header_len + payload_len;
-  uint8_t *wire = (uint8_t *)malloc(wire_len);
-  if (!wire) {
-    return -1;
-  }
-  memcpy(wire, header12, header_len);
-  memcpy(wire + header_len, payload, payload_len);
-  EdrError er = edr_storage_queue_enqueue(batch_id, wire, wire_len, header_lz4(header12, header_len), severity);
-  free(wire);
-  return er == EDR_OK ? 0 : -1;
-}
-
-static unsigned low_priority_full_sample_permille(void) {
-  const char *e = getenv("EDR_TRANSPORT_LOWPRI_FULL_SAMPLE_PERMILLE");
-  long v = e && e[0] ? strtol(e, NULL, 10) : 100L;
-  if (v < 0) v = 0;
-  if (v > 1000) v = 1000;
-  return (unsigned)v;
-}
-
-static int default_dispatch(int use_http, const char *batch_id,
-                            const uint8_t *header12, size_t header_len,
-                            const uint8_t *payload, size_t payload_len,
-                            void *userdata) {
-  (void)userdata;
-  int ok = 0;
-
-  /* 路径 1: HTTPS/TLS ingest 默认主路径 */
-  if (edr_ingest_http_configured()) {
-    ok = edr_transport_v2_report_events(batch_id, header12, header_len, payload, payload_len);
-    if (ok == 0) return 0;
-  }
-
-  /* 路径 2: 离线持久化 */
-  {
-    const char *ps = getenv("EDR_PERSIST_STRATEGY");
-    int persist_on_fail = (ps && strcmp(ps, "on_fail") == 0);
-    if (!persist_on_fail || edr_storage_queue_is_open()) {
-      size_t wire_len = header_len + payload_len;
-      uint8_t *wire = (uint8_t *)malloc(wire_len);
-      if (wire) {
-        memcpy(wire, header12, header_len);
-        memcpy(wire + header_len, payload, payload_len);
-        (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, header_lz4(header12, header_len), use_http == 0 ? 1 : 0);
-        free(wire);
-      }
-    }
-  }
-
-  return -1;
-}
-
-/* ---- 队列锁 ---- */
-
-static void q_lock(EdrTransportCtx *ctx) {
+static void wake_worker(void) {
 #ifndef _WIN32
-  pthread_mutex_lock(&ctx->q_mu);
+  pthread_mutex_lock(&s_wake_mu);
+  pthread_cond_signal(&s_wake_cv);
+  pthread_mutex_unlock(&s_wake_mu);
 #else
-  EnterCriticalSection(&ctx->q_mu);
+  AcquireSRWLockExclusive(&s_wake_mu);
+  WakeConditionVariable(&s_wake_cv);
+  ReleaseSRWLockExclusive(&s_wake_mu);
 #endif
 }
-
-static void q_unlock(EdrTransportCtx *ctx) {
+static void wait_for_work(void) {
 #ifndef _WIN32
-  pthread_mutex_unlock(&ctx->q_mu);
+  struct timespec until;
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_nsec += 250000000L;
+  if (until.tv_nsec >= 1000000000L) { until.tv_nsec -= 1000000000L; until.tv_sec++; }
+  pthread_mutex_lock(&s_wake_mu);
+  if (atomic_load(&s_run)) (void)pthread_cond_timedwait(&s_wake_cv, &s_wake_mu, &until);
+  pthread_mutex_unlock(&s_wake_mu);
 #else
-  LeaveCriticalSection(&ctx->q_mu);
+  AcquireSRWLockExclusive(&s_wake_mu);
+  if (atomic_load(&s_run)) (void)SleepConditionVariableSRW(&s_wake_cv, &s_wake_mu, 250u, 0);
+  ReleaseSRWLockExclusive(&s_wake_mu);
 #endif
 }
-
-static void q_wait(EdrTransportCtx *ctx) {
 #ifndef _WIN32
-  pthread_cond_wait(&ctx->q_cv, &ctx->q_mu);
+static void *worker_thread(void *unused) {
 #else
-  SleepConditionVariableCS(&ctx->q_cv, &ctx->q_mu, INFINITE);
+static unsigned __stdcall worker_thread(void *unused) {
 #endif
-}
-
-static void q_signal(EdrTransportCtx *ctx) {
+  (void)unused;
+  while (atomic_load(&s_run)) {
+    edr_storage_queue_poll_drain();
+    wait_for_work();
+  }
+  atomic_store(&s_exited, 1);
 #ifndef _WIN32
-  pthread_cond_signal(&ctx->q_cv);
+  return NULL;
 #else
-  WakeConditionVariable(&ctx->q_cv);
-#endif
-}
-
-/* ---- 队列 push / pop ---- */
-
-static int q_push(EdrTransportCtx *ctx, int use_http, const char *batch_id,
-                  const uint8_t *header12, size_t header_len,
-                  const uint8_t *payload, size_t payload_len) {
-  q_lock(ctx);
-  if (ctx->q_len >= ctx->q_cap) {
-    static unsigned long low_sample_seq;
-    int high_priority = (use_http == 0);
-    int persisted = 0;
-    int sampled = 0;
-    ctx->queue_full_total++;
-    if (high_priority) {
-      persisted = (persist_wire_batch(batch_id, header12, header_len, payload, payload_len, 1) == 0);
-    } else {
-      unsigned ppm = low_priority_full_sample_permille();
-      if (ppm > 0u) {
-        unsigned long seq = ++low_sample_seq;
-        sampled = ((seq % 1000ul) < (unsigned long)ppm);
-        if (sampled) {
-          persisted = (persist_wire_batch(batch_id, header12, header_len, payload, payload_len, 0) == 0);
-        }
-      }
-    }
-    if (persisted) {
-      ctx->queue_full_persisted++;
-      if (sampled) {
-        ctx->queue_full_sampled++;
-      }
-    } else {
-      ctx->queue_full_dropped++;
-    }
-    q_unlock(ctx);
-    EDR_LOGE("[transport] queue full (%zu/%zu), %s batch %s%s\n",
-             ctx->q_len, ctx->q_cap,
-             persisted ? "persisted overflow" : "dropping overflow",
-             batch_id ? batch_id : "",
-             high_priority ? " priority=high" : " priority=low");
-    return -1;
-  }
-
-  EdrSendJob *job = (EdrSendJob *)calloc(1, sizeof(EdrSendJob));
-  if (!job) {
-    q_unlock(ctx);
-    return -1;
-  }
-  job->use_http = use_http;
-  if (batch_id) snprintf(job->batch_id, sizeof(job->batch_id), "%s", batch_id);
-  memcpy(job->header12, header12, header_len < 12 ? header_len : 12);
-  job->header_len = header_len;
-  job->payload = (uint8_t *)malloc(payload_len);
-  if (!job->payload) {
-    free(job);
-    q_unlock(ctx);
-    return -1;
-  }
-  memcpy(job->payload, payload, payload_len);
-  job->payload_len = payload_len;
-
-  if (ctx->q_tail) {
-    ctx->q_tail->next = job;
-  } else {
-    ctx->q_head = job;
-  }
-  ctx->q_tail = job;
-  ctx->q_len++;
-
-  q_signal(ctx);
-  q_unlock(ctx);
   return 0;
-}
-
-static EdrSendJob *q_pop(EdrTransportCtx *ctx) {
-  EdrSendJob *job = ctx->q_head;
-  if (!job) return NULL;
-  ctx->q_head = job->next;
-  if (!ctx->q_head) ctx->q_tail = NULL;
-  ctx->q_len--;
-  return job;
-}
-
-static void q_free_job(EdrSendJob *job) {
-  if (!job) return;
-  free(job->payload);
-  free(job);
-}
-
-/* ---- 工作线程 ---- */
-
-static void process_one_job(EdrTransportCtx *ctx, EdrSendJob *job) {
-  EdrTransportDispatchFn fn = ctx->dispatch ? ctx->dispatch : default_dispatch;
-  (void)fn(job->use_http, job->batch_id, job->header12, job->header_len,
-           job->payload, job->payload_len, ctx->dispatch_ud);
-}
-
-static unsigned read_u32_le(const uint8_t *p, size_t off) {
-  return (unsigned)p[off] | ((unsigned)p[off + 1] << 8) |
-         ((unsigned)p[off + 2] << 16) | ((unsigned)p[off + 3] << 24);
-}
-
-#ifndef _WIN32
-static void *worker_thread(void *arg) {
-#else
-static unsigned __stdcall worker_thread(void *arg) {
 #endif
-  EdrTransportCtx *ctx = (EdrTransportCtx *)arg;
-  while (ctx->q_run) {
-    q_lock(ctx);
-    while (ctx->q_run && ctx->q_head == NULL) {
-      q_wait(ctx);
-    }
-    if (!ctx->q_run) { q_unlock(ctx); break; }
-    EdrSendJob *job = q_pop(ctx);
-    q_unlock(ctx);
-
-    if (job) {
-      process_one_job(ctx, job);
-      q_free_job(job);
-    }
-  }
-  return 0;
 }
 
-/* ---- 公共 API ---- */
-
-void edr_transport_init_from_config(const struct EdrConfig *cfg) {
-  if (!cfg) return;
-
-  EdrTransportCtx *c = &g_ctx;
-
-  /* dispatch 默认为内置实现 */
-  c->dispatch = NULL;  /* NULL → 使用 default_dispatch */
-  c->dispatch_ud = NULL;
-
-  /* 指标清零 */
-  c->wire_events = 0;
-  c->wire_bytes = 0;
-  c->batch_count = 0;
-  c->batch_bytes = 0;
-  c->batch_lz4 = 0;
-  c->queue_full_total = 0;
-  c->queue_full_persisted = 0;
-  c->queue_full_sampled = 0;
-  c->queue_full_dropped = 0;
-
-  /* 队列容量：环境变量可覆盖 */
-  {
-    const char *ecap = getenv("EDR_TRANSPORT_SEND_QUEUE_CAP");
-    unsigned long v = ecap ? strtoul(ecap, NULL, 10) : 256;
-    if (v < 8) v = 8;
-    if (v > 8192) v = 8192;
-    c->q_cap = (size_t)v;
-  }
-  c->q_head = NULL;
-  c->q_tail = NULL;
-  c->q_len = 0;
-  c->q_started = 0;
-  c->q_run = 0;
-
+int edr_transport_init_from_config(const struct EdrConfig *cfg) {
+  if (!cfg || atomic_load(&s_started)) return 0;
+  atomic_store(&s_wire_events, 0);
+  atomic_store(&s_wire_bytes, 0);
+  atomic_store(&s_batch_count, 0);
+  atomic_store(&s_batch_bytes, 0);
+  atomic_store(&s_batch_lz4, 0);
+  atomic_store(&s_batch_rejected, 0);
   const int allow_insecure_env =
       env_truthy("EDR_ALLOW_INSECURE_TRANSPORT") || env_truthy("EDR_DEV_ALLOW_INSECURE_TRANSPORT");
   const char *rest_base_env = getenv("EDR_PLATFORM_REST_BASE");
@@ -403,130 +151,121 @@ void edr_transport_init_from_config(const struct EdrConfig *cfg) {
       cfg->platform.control_http1_fallback ? 1 : 0);
   edr_transport_v2_init_from_config(cfg);
 
-  /* 启动命令轮询 */
-  edr_ingest_http_start_command_poll();
 
-  /* 队列线程 */
+  atomic_store(&s_exited, 0);
+  atomic_store(&s_run, 1);
 #ifndef _WIN32
-  pthread_mutex_init(&c->q_mu, NULL);
-  pthread_cond_init(&c->q_cv, NULL);
-  c->q_run = 1;
-  c->q_started = 1;
-  if (pthread_create(&c->q_thr, NULL, worker_thread, c) != 0) {
-    c->q_run = 0;
-    c->q_started = 0;
-    EDR_LOGE("%s", "[transport] worker thread create failed\n");
-  }
+  if (pthread_create(&s_thread, NULL, worker_thread, NULL) != 0) {
 #else
-  InitializeCriticalSection(&c->q_mu);
-  InitializeConditionVariable(&c->q_cv);
-  c->q_run = 1;
-  c->q_started = 1;
-  c->q_thr = (HANDLE)_beginthreadex(NULL, 0, worker_thread, c, 0, NULL);
-  if (c->q_thr == 0) {
-    c->q_run = 0;
-    c->q_started = 0;
-    EDR_LOGE("%s", "[transport] worker thread create failed\n");
-  }
+  s_thread = (HANDLE)_beginthreadex(NULL, 0, worker_thread, NULL, 0, NULL);
+  if (!s_thread) {
 #endif
+    atomic_store(&s_run, 0);
+    atomic_store(&s_exited, 1);
+    EDR_LOGE("%s", "[transport] durable drain worker create failed\n");
+    return 0;
+  }
+  atomic_store(&s_started, 1);
+  edr_ingest_http_start_command_poll();
+  return 1;
 }
 
-void edr_transport_shutdown(void) {
-  EdrTransportCtx *c = &g_ctx;
-
-  /* Stop accepting control commands before tearing down result transport. */
-  edr_ingest_http_stop_command_poll();
-
-  /* 停止工作线程 */
-  c->q_run = 0;
-  if (c->q_started) {
-    q_lock(c);
-    q_signal(c);
-    q_unlock(c);
-#ifndef _WIN32
-    pthread_join(c->q_thr, NULL);
-    pthread_mutex_destroy(&c->q_mu);
-    pthread_cond_destroy(&c->q_cv);
+int edr_transport_shutdown(void) {
+  if (!atomic_load(&s_started)) return 1;
+  atomic_store(&s_run, 0);
+  wake_worker();
+  /* Existing HTTP cancellation also interrupts a telemetry drain in flight.
+   * The caller stops command/result producers before this final teardown. */
+  edr_ingest_http_cancel_inflight();
+#ifdef _WIN32
+  if (WaitForSingleObject(s_thread, EDR_TRANSPORT_STOP_TIMEOUT_MS) != WAIT_OBJECT_0) {
 #else
-    WaitForSingleObject(c->q_thr, 15000);
-    CloseHandle(c->q_thr);
-    DeleteCriticalSection(&c->q_mu);
+  uint64_t deadline = edr_monotonic_ns() + (uint64_t)EDR_TRANSPORT_STOP_TIMEOUT_MS * 1000000ULL;
+  while (!atomic_load(&s_exited) && edr_monotonic_ns() < deadline) {
+    struct timespec delay = {0, 1000000L};
+    nanosleep(&delay, NULL);
+  }
+  if (!atomic_load(&s_exited)) {
 #endif
-    c->q_started = 0;
+    EDR_LOGE("%s", "[transport] shutdown timed out; retaining worker and queue dependencies\n");
+    return 0;
   }
-
-  /* 释放队列残留 */
-  while (c->q_head) {
-    EdrSendJob *j = c->q_head;
-    c->q_head = j->next;
-    q_free_job(j);
-  }
-  c->q_tail = NULL;
-  c->q_len = 0;
+#ifdef _WIN32
+  CloseHandle(s_thread);
+  s_thread = NULL;
+#else
+  if (pthread_join(s_thread, NULL) != 0) return 0;
+#endif
+  atomic_store(&s_started, 0);
+  return 1;
 }
 
 void edr_transport_on_behavior_wire(const uint8_t *data, size_t len) {
   (void)data;
-  g_ctx.wire_events++;
-  g_ctx.wire_bytes += len;
+  atomic_fetch_add(&s_wire_events, 1);
+  atomic_fetch_add(&s_wire_bytes, len);
 }
 
-/* 内部辅助：从 header 读 MAGIC 类型 */
-static int is_lz4_batch(const uint8_t *header12) {
-  return header12 && read_u32_le(header12, 0) == EDR_TRANSPORT_BATCH_MAGIC_LZ4;
-}
-
-void edr_transport_on_event_batch(const char *batch_id, const uint8_t *header12,
+int edr_transport_on_event_batch(const char *batch_id, const uint8_t *header12,
                                   size_t header_len, const uint8_t *payload,
                                   size_t payload_len) {
-  EdrTransportCtx *c = &g_ctx;
-  if (!batch_id || !header12 || header_len < 12 || !payload || payload_len == 0) return;
-
-  c->batch_count++;
-  c->batch_bytes += payload_len;
-  if (is_lz4_batch(header12)) c->batch_lz4++;
-
-  (void)q_push(c, 0, batch_id, header12, header_len, payload, payload_len);
+  uint8_t *wire;
+  EdrError rc = EDR_ERR_INVALID_ARG;
+  const char *reason = "invalid_batch";
+  uint32_t magic;
+  if (!atomic_load(&s_started) || !atomic_load(&s_run)) {
+    reason = "transport_not_running";
+    goto rejected;
+  }
+  if (!batch_id || !batch_id[0] || !header12 || header_len != 12u ||
+      !payload || !payload_len || payload_len > SIZE_MAX - 12u) goto rejected;
+  if (!edr_storage_queue_is_open()) {
+    reason = "durable_queue_not_open";
+    rc = EDR_ERR_SQLITE_OPEN;
+    goto rejected;
+  }
+  wire = (uint8_t *)malloc(12u + payload_len);
+  if (!wire) {
+    reason = "batch_allocation_failed";
+    rc = EDR_ERR_INTERNAL;
+    goto rejected;
+  }
+  memcpy(wire, header12, 12u);
+  memcpy(wire + 12u, payload, payload_len);
+  magic = (uint32_t)header12[0] | ((uint32_t)header12[1] << 8) |
+          ((uint32_t)header12[2] << 16) | ((uint32_t)header12[3] << 24);
+  /* Keep this lane's established priority; P0 combined/source-only rows retain
+   * their separate admission and ACK contracts in the same durable owner. */
+  rc = edr_storage_queue_enqueue(batch_id, wire, 12u + payload_len,
+                                 magic == EDR_TRANSPORT_BATCH_MAGIC_LZ4, 1);
+  free(wire);
+  if (rc != EDR_OK) {
+    reason = "sqlite_enqueue_failed";
+    goto rejected;
+  }
+  atomic_fetch_add(&s_batch_count, 1);
+  atomic_fetch_add(&s_batch_bytes, payload_len);
+  if (magic == EDR_TRANSPORT_BATCH_MAGIC_LZ4) atomic_fetch_add(&s_batch_lz4, 1);
+  wake_worker();
+  return 0;
+rejected:
+  atomic_fetch_add(&s_batch_rejected, 1);
+  EDR_LOGE("[transport] durable batch handoff failed reason=%s error=%d; caller retains bytes\n",
+           reason, (int)rc);
+  return -1;
 }
 
-void edr_transport_send_ingest_batch(int use_http, const char *batch_id,
-                                     const uint8_t *header12, size_t header_len,
-                                     const uint8_t *payload, size_t payload_len) {
-  EdrTransportCtx *c = &g_ctx;
-  if (!batch_id || !header12 || header_len < 12 || !payload || payload_len == 0) return;
-
-  c->batch_count++;
-  c->batch_bytes += payload_len;
-  if (is_lz4_batch(header12)) c->batch_lz4++;
-
-  (void)q_push(c, use_http, batch_id, header12, header_len, payload, payload_len);
-}
-
-unsigned long edr_transport_wire_events_count(void) { return g_ctx.wire_events; }
-size_t edr_transport_wire_bytes_count(void) { return g_ctx.wire_bytes; }
-unsigned long edr_transport_batch_count(void) { return g_ctx.batch_count; }
-size_t edr_transport_batch_bytes_count(void) { return g_ctx.batch_bytes; }
-unsigned long edr_transport_batch_lz4_count(void) { return g_ctx.batch_lz4; }
-
-size_t edr_transport_send_queue_depth(void) {
-  EdrTransportCtx *c = &g_ctx;
-  size_t n = 0;
-  if (!c->q_started) return 0;
-  q_lock(c);
-  n = c->q_len;
-  q_unlock(c);
-  return n;
-}
-
-size_t edr_transport_send_queue_capacity(void) { return g_ctx.q_cap; }
-unsigned long edr_transport_queue_full_count(void) { return g_ctx.queue_full_total; }
-unsigned long edr_transport_queue_full_persisted_count(void) { return g_ctx.queue_full_persisted; }
-unsigned long edr_transport_queue_full_sampled_count(void) { return g_ctx.queue_full_sampled; }
-unsigned long edr_transport_queue_full_dropped_count(void) { return g_ctx.queue_full_dropped; }
-
-void edr_transport_inject_dispatch(EdrTransportDispatchFn fn, void *userdata) {
-  g_ctx.dispatch = fn;
-  g_ctx.dispatch_ud = userdata;
-}
-
-const EdrTransportCtx *edr_transport_ctx(void) { return &g_ctx; }
+unsigned long edr_transport_wire_events_count(void) { return atomic_load(&s_wire_events); }
+size_t edr_transport_wire_bytes_count(void) { return atomic_load(&s_wire_bytes); }
+unsigned long edr_transport_batch_count(void) { return atomic_load(&s_batch_count); }
+size_t edr_transport_batch_bytes_count(void) { return atomic_load(&s_batch_bytes); }
+unsigned long edr_transport_batch_lz4_count(void) { return atomic_load(&s_batch_lz4); }
+unsigned long edr_transport_batch_rejected_count(void) { return atomic_load(&s_batch_rejected); }
+/* Current server/dashboard fields describe a RAM send queue. It no longer
+ * exists; the already-reported offline_queue_pending describes SQLite. */
+size_t edr_transport_send_queue_depth(void) { return 0; }
+size_t edr_transport_send_queue_capacity(void) { return 0; }
+unsigned long edr_transport_queue_full_count(void) { return 0; }
+unsigned long edr_transport_queue_full_persisted_count(void) { return 0; }
+unsigned long edr_transport_queue_full_sampled_count(void) { return 0; }
+unsigned long edr_transport_queue_full_dropped_count(void) { return 0; }

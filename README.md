@@ -44,13 +44,13 @@
 
 **配置语义与启动 WARN（WP-3）**：**[docs/WP3_CONFIG_VALIDATION.md](docs/WP3_CONFIG_VALIDATION.md)**（`EDR_PLATFORM_REST_BASE` / `[platform].rest_base_url`、**`endpoint_id` / `tenant_id` 在启用平台 REST 时** 的误配提示）。
 
-**HTTP ingest 传输与 `EDR_EVENT_INGEST_SPLIT` 排障（WP-4）**：**[docs/WP4_HTTP_TRANSPORT_OPS.md](docs/WP4_HTTP_TRANSPORT_OPS.md)**（`[transport]` / `[ingest-http]`、回退与队列相关环境变量）。
+**HTTP ingest 与耐久交接**：[Agent 流程 P1/P2 修复说明](docs/AGENT_PIPELINE_P1_P2_REPAIR_2026-09-14.md)（单一 SQLite 所有者、失败退避和关停契约）。
 
 **规则工程化：母版 → 预处理 TOML + P0 IR + 版本对账（WP-5）**：**[docs/WP5_RULES_ENGINEERING.md](docs/WP5_RULES_ENGINEERING.md)**；预处理 **`[[preprocessing.rules]]`** 见 **`[docs/PREPROCESS_RULES.md](docs/PREPROCESS_RULES.md)`**（与 P0 包**并列**）。
 
-**批处理与上送「先量化再调参」（WP-6）**：**[docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md](docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md)**（`[upload]` / `EDR_AGENT_SHUTDOWN_LOG`、`EDR_TRANSPORT_SEND_QUEUE_CAP` 与 **shutdown** 指标）。
+**批处理与上送**：配置使用 `[upload]`；实际耐久积压查看 `offline_queue_pending`，交接失败查看 `batch_admission_failed`。内存发送队列已移除。
 
-**SQLite 离线队列与重试/退避（WP-7）**：**[docs/WP7_OFFLINE_QUEUE_RETRY.md](docs/WP7_OFFLINE_QUEUE_RETRY.md)**（`EDR_PERSIST_STRATEGY` / `EDR_PERSIST_QUEUE`、`EDR_QUEUE_*`、与 HTTP 补传）。
+**SQLite 队列与重试/退避**：见下文「SQLite 离线队列」。所有批次先耐久入队，再由传输线程发送，不再提供“只在失败后落盘”的分支。
 
 **ETW/采集 profile 与 P0 合规底线（WP-8）**：**[docs/WP8_ETW_COLLECTION_PROFILE.md](docs/WP8_ETW_COLLECTION_PROFILE.md)**；合规基线环境示例 **`config/profiles/wp8_compliance_baseline.env.example`**（与 `Cauld Design/EDR_P0_Field_Matrix_Signoff.md` 对表）。
 
@@ -273,8 +273,6 @@ cmake --build build
 | 变量 | 说明（详情见下文对应章节） |
 |------|---------------------------|
 | `EDR_QUEUE_PATH` | 覆盖 TOML 中的 `offline.queue_db_path`。 |
-| `EDR_PERSIST_QUEUE` | `=1` 且策略为 **always** 时，flush 同时将批次写入 SQLite。 |
-| `EDR_PERSIST_STRATEGY` | `always`（默认）或 `on_fail`：见「SQLite」与 HTTP 补传小节。 |
 | `EDR_QUEUE_MAX_RETRIES` | 单条补传最大重试次数，默认 `100`；`0` 表示不限制。 |
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
@@ -383,7 +381,7 @@ cmake --build build
 
 ## SQLite 离线队列（§10）— 落盘与出队补传
 
-SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wire_on_fail`**）：**`edr-backend/docs/AGENT_EVENT_QUEUE_SRE.md`**。
+批次完成本地交接后由 SQLite 持有不可变 wire；HTTP 发送成功和本地交接成功是不同状态。
 
 依赖：编译时 `find_package(SQLite3)` 成功，定义 **`EDR_HAVE_SQLITE`**，并链接 `queue_sqlite.c`。
 
@@ -393,8 +391,7 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 |------|------|
 | `EDR_QUEUE_PATH` | 若设置且非空，**优先于** TOML 中的 `offline.queue_db_path`，作为队列库文件路径。 |
 | `offline.queue_db_path` | 未设置 `EDR_QUEUE_PATH` 时使用；均未设置时 `edr_storage_queue_open` 默认打开当前目录下 **`edr_queue.db`**。 |
-| `EDR_PERSIST_QUEUE=1` | 与 **`EDR_PERSIST_STRATEGY=always`**（或未设置策略）配合：每次 flush 将完整 wire **INSERT**（与当次 HTTP 成败无关）。 |
-| `EDR_PERSIST_STRATEGY` | **`always`**（默认）：见上，需 `EDR_PERSIST_QUEUE=1`。**`on_fail`**：flush 时**不写**库；仅在 HTTP `ReportEvents` 失败且队列已打开时，由传输层把该批写入队列（适合「平时不落盘、失败才缓存」）。 |
+| 固定耐久交接 | 每次 flush 先写完整 wire；写失败则保留聚合器中的原批次和 ID，并进行有界间隔重试。旧的可选落盘环境变量不再生效。 |
 
 ### 库内数据格式
 
@@ -403,14 +400,14 @@ SRE 口径（磁盘上限、重试丢弃、平台 4xx/5xx 解读、**`enqueue_wi
 
 ### 出队补传行为
 
-- 在**预处理线程**中周期性调用 `edr_storage_queue_poll_drain()`（与入队同线程，无需额外线程锁）。
-- 约 **每 200ms** 最多尝试一轮；单轮内连续成功最多 **32** 条；若某次 HTTP 上传失败，则对该行 `retry_count++` 并**结束本轮**（避免在不可用通道上狂重试）。
+- 由**传输线程**周期性调用 `edr_storage_queue_poll_drain()`；预处理线程不执行网络排空。SQLite 状态由既有队列锁保护，网络 I/O 不占用该状态锁。
+- 默认轮询间隔 **1000ms**，单轮普通队列最多 **8** 条；可通过 `EDR_QUEUE_DRAIN_INTERVAL_MS` / `EDR_QUEUE_DRAIN_MAX_ROWS` 在既有边界内调整。失败沿用队列重试、退避与结束当前轮次的处理。
 - 成功上传后删除对应行；**`retry_count` 达到 `EDR_QUEUE_MAX_RETRIES`（默认 100，`0` 表示不限制）** 时丢弃该条并打日志（死信式处理）。
 - **无法识别魔数**的旧数据（仅历史 body、无 12 字节头）会打日志后删除，避免堵塞队列。
 
 ### 无 SQLite 或未链接
 
-`edr_storage_queue_*` 为空实现：不落盘、不补传，`edr_storage_queue_pending_count()` 恒为 0。
+队列无法打开时 Agent 启动失败，不能把无耐久存储状态当作正常运行。显式非生产测试配置不用于发布。
 
 ---
 

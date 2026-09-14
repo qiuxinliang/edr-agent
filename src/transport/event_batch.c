@@ -1,7 +1,5 @@
 #include "edr/event_batch.h"
 
-#include "edr/ingest_http.h"
-#include "edr/storage_queue.h"
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
 
@@ -11,14 +9,21 @@
 #include <time.h>
 #include <stdatomic.h>
 
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_batch_lock = SRWLOCK_INIT;
+static void batch_lock(void) { AcquireSRWLockExclusive(&s_batch_lock); }
+static void batch_unlock(void) { ReleaseSRWLockExclusive(&s_batch_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_batch_lock = PTHREAD_MUTEX_INITIALIZER;
+static void batch_lock(void) { pthread_mutex_lock(&s_batch_lock); }
+static void batch_unlock(void) { pthread_mutex_unlock(&s_batch_lock); }
+#endif
+
 #ifndef ATOMIC_VAR_INIT
 #define ATOMIC_VAR_INIT(value) (value)
 #endif
-
-static int persist_strategy_on_fail_only(void) {
-  const char *s = getenv("EDR_PERSIST_STRATEGY");
-  return s && strcmp(s, "on_fail") == 0;
-}
 
 #ifdef EDR_HAVE_LZ4
 #include "lz4.h"
@@ -27,21 +32,6 @@ static int persist_strategy_on_fail_only(void) {
 #ifndef EDR_LZ4_MIN_IN
 #define EDR_LZ4_MIN_IN 1024u
 #endif
-
-#ifndef EDR_LZ4_COMPRESSION_LEVEL
-#define EDR_LZ4_COMPRESSION_LEVEL 6
-#endif
-
-static int env_lz4_compression_level(void) {
-  const char *e = getenv("EDR_LZ4_COMPRESSION_LEVEL");
-  if (!e || !e[0]) {
-    return EDR_LZ4_COMPRESSION_LEVEL;
-  }
-  int v = atoi(e);
-  if (v < 1) { v = 1; }
-  if (v > 12) { v = 12; }
-  return v;
-}
 
 static uint8_t *s_buf;
 static size_t s_cap;
@@ -53,7 +43,10 @@ static atomic_uint_fast64_t s_batch_boot_nonce = ATOMIC_VAR_INIT(0);
 static int s_flush_timeout_s;
 static uint64_t s_deadline_ns;
 static uint64_t s_timeout_flush_count;
-static int s_lz4_compression_level;
+static char s_pending_batch_id[64];
+static uint8_t s_pending_header[12];
+static uint8_t *s_pending_compressed;
+static size_t s_pending_payload_len;
 
 static void batch_note_write(void) {
   if (s_flush_timeout_s <= 0) {
@@ -89,194 +82,63 @@ static void make_batch_id(char *out, size_t cap) {
            (unsigned long long)k);
 }
 
-static void maybe_persist(const char *batch_id, const uint8_t *header12, const uint8_t *payload,
-                            size_t payload_len, int compressed, int use_http) {
-  if (persist_strategy_on_fail_only()) {
-    return;
-  }
-  const char *e = getenv("EDR_PERSIST_QUEUE");
-  if (!e || e[0] != '1') {
-    return;
-  }
-  int severity = (use_http == 0) ? 1 : 0;
-  size_t wire_len = 12u + payload_len;
-  uint8_t *wire = (uint8_t *)malloc(wire_len);
-  if (!wire) {
-    return;
-  }
-  memcpy(wire, header12, 12u);
-  memcpy(wire + 12u, payload, payload_len);
-  (void)edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed, severity);
-  free(wire);
-}
-
-static uint32_t rd_u32_le(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static int ingest_split_enabled(void) {
-  /* Product builds use one HTTP ingest path. Keep the function so legacy
-   * diagnostics can report the setting without reintroducing gRPC routing. */
-  return 0;
-}
-
-static int append_frame_bytes(uint8_t **buf, size_t *bcap, size_t *used, const uint8_t *frame,
-                              size_t flen) {
-  size_t need = 4u + flen;
-  if (*used + need > *bcap) {
-    size_t nc = *bcap == 0 ? s_cap : *bcap;
-    if (nc < need) {
-      nc = need;
-    }
-    while (*used + need > nc) {
-      nc *= 2u;
-    }
-    uint8_t *nb = (uint8_t *)realloc(*buf, nc);
-    if (!nb) {
-      return -1;
-    }
-    *buf = nb;
-    *bcap = nc;
-  }
-  wr_u32_le(*buf + *used, (uint32_t)flen);
-  memcpy(*buf + *used + 4u, frame, flen);
-  *used += need;
-  return 0;
-}
-
-static uint32_t count_frames_in_buf(const uint8_t *buf, size_t total) {
-  uint32_t n = 0;
-  size_t off = 0;
-  while (off + 4u <= total) {
-    uint32_t fl = rd_u32_le(buf + off);
-    if (fl == 0 || off + 4u + (size_t)fl > total) {
-      break;
-    }
-    off += 4u + (size_t)fl;
-    n++;
-  }
-  return n;
-}
-
-static void emit_one_channel(const char *batch_id, const uint8_t *raw_body, size_t raw_used,
-                             uint32_t frame_count, int use_http) {
-  if (!raw_body || raw_used == 0u || frame_count == 0u) {
-    return;
-  }
-  uint8_t header[12];
-#ifdef EDR_HAVE_LZ4
-  if (raw_used >= EDR_LZ4_MIN_IN) {
-    int dst_cap = LZ4_compressBound((int)raw_used);
-    if (dst_cap > 0) {
-      uint8_t *dst = (uint8_t *)malloc((size_t)dst_cap);
-      if (dst) {
-        int clen =
-            LZ4_compress_default((const char *)raw_body, (char *)dst, (int)raw_used, dst_cap);
-        if (clen > 0 && (size_t)clen < raw_used) {
-          wr_u32_le(header, EDR_TRANSPORT_BATCH_MAGIC_LZ4);
-          wr_u32_le(header + 4, frame_count);
-          wr_u32_le(header + 8, (uint32_t)raw_used);
-          edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), dst,
-                                          (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1, use_http);
-          free(dst);
-          return;
-        }
-        free(dst);
-      }
-    }
-  }
-#endif
-  wr_u32_le(header, EDR_TRANSPORT_BATCH_MAGIC_RAW);
-  wr_u32_le(header + 4, frame_count);
-  wr_u32_le(header + 8, (uint32_t)raw_used);
-  edr_transport_send_ingest_batch(use_http, batch_id, header, sizeof(header), raw_body, raw_used);
-  maybe_persist(batch_id, header, raw_body, raw_used, 0, use_http);
-}
-
-static void flush_split(const char *batch_id_base) {
-  uint8_t *http_acc = NULL;
-  size_t hcap = 0, hused = 0;
-  size_t off = 0;
-  while (off + 4u <= s_used) {
-    uint32_t fl = rd_u32_le(s_buf + off);
-    if (fl == 0 || off + 4u + (size_t)fl > s_used) {
-      break;
-    }
-    const uint8_t *frame = s_buf + off + 4u;
-    if (append_frame_bytes(&http_acc, &hcap, &hused, frame, (size_t)fl) != 0) {
-      break;
-    }
-    off += 4u + (size_t)fl;
-  }
-
-  char bid_h[80];
-  snprintf(bid_h, sizeof(bid_h), "%s-h", batch_id_base);
-
-  uint32_t hfc = count_frames_in_buf(http_acc, hused);
-
-  if (hused > 0u && hfc > 0u) {
-    emit_one_channel(bid_h, http_acc, hused, hfc, 1);
-  }
-  free(http_acc);
-}
-
-static void flush_locked(void) {
+static int flush_locked(void) {
+  int result = -1;
   s_deadline_ns = 0;
   if (!s_buf || s_used == 0u) {
-    return;
+    return 0;
   }
-  uint8_t header[12];
-  char batch_id[64];
-  make_batch_id(batch_id, sizeof(batch_id));
-
-  if (ingest_split_enabled()) {
-    flush_split(batch_id);
-    s_used = 0;
-    s_frame_count = 0;
-    return;
-  }
-
+  if (!s_pending_batch_id[0]) {
+    make_batch_id(s_pending_batch_id, sizeof(s_pending_batch_id));
+    wr_u32_le(s_pending_header, EDR_TRANSPORT_BATCH_MAGIC_RAW);
+    wr_u32_le(s_pending_header + 4u, s_frame_count);
+    wr_u32_le(s_pending_header + 8u, (uint32_t)s_used);
+    s_pending_payload_len = s_used;
 #ifdef EDR_HAVE_LZ4
-  if (s_used >= EDR_LZ4_MIN_IN) {
-    int dst_cap = LZ4_compressBound((int)s_used);
-    if (dst_cap > 0) {
-      uint8_t *dst = (uint8_t *)malloc((size_t)dst_cap);
-      if (dst) {
-        int clen =
-            LZ4_compress_default((const char *)s_buf, (char *)dst, (int)s_used, dst_cap);
-        if (clen > 0 && (size_t)clen < s_used) {
-          wr_u32_le(header, EDR_TRANSPORT_BATCH_MAGIC_LZ4);
-          wr_u32_le(header + 4, s_frame_count);
-          wr_u32_le(header + 8, (uint32_t)s_used);
-          edr_transport_on_event_batch(batch_id, header, sizeof(header), dst, (size_t)clen);
-          maybe_persist(batch_id, header, dst, (size_t)clen, 1, 0);
-          free(dst);
-          s_used = 0;
-          s_frame_count = 0;
-          return;
+    if (s_used >= EDR_LZ4_MIN_IN) {
+      int capacity = LZ4_compressBound((int)s_used);
+      uint8_t *compressed = capacity > 0 ? (uint8_t *)malloc((size_t)capacity) : NULL;
+      if (compressed) {
+        int len = LZ4_compress_default((const char *)s_buf, (char *)compressed,
+                                       (int)s_used, capacity);
+        if (len > 0 && (size_t)len < s_used) {
+          s_pending_compressed = compressed;
+          s_pending_payload_len = (size_t)len;
+          wr_u32_le(s_pending_header, EDR_TRANSPORT_BATCH_MAGIC_LZ4);
+        } else {
+          free(compressed);
         }
-        free(dst);
       }
     }
-  }
 #endif
-  wr_u32_le(header, EDR_TRANSPORT_BATCH_MAGIC_RAW);
-  wr_u32_le(header + 4, s_frame_count);
-  wr_u32_le(header + 8, (uint32_t)s_used);
-  edr_transport_on_event_batch(batch_id, header, sizeof(header), s_buf, s_used);
-  maybe_persist(batch_id, header, s_buf, s_used, 0, 0);
+  }
+  result = edr_transport_on_event_batch(s_pending_batch_id, s_pending_header, 12u,
+                                        s_pending_compressed ? s_pending_compressed : s_buf,
+                                        s_pending_payload_len);
+  if (result != 0) {
+    /* The sealed batch cannot change under the same id on a later retry. */
+    s_deadline_ns = edr_monotonic_ns() + 1000000000ULL;
+    fprintf(stderr, "[batch] durable handoff failed; retained batch=%s frames=%u bytes=%zu\n",
+            s_pending_batch_id, s_frame_count, s_used);
+    return -1;
+  }
   s_used = 0;
   s_frame_count = 0;
+  s_pending_batch_id[0] = '\0';
+  free(s_pending_compressed);
+  s_pending_compressed = NULL;
+  s_pending_payload_len = 0;
+  return 0;
 }
 
-EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
+static int shutdown_locked(void);
+
+static EdrError init_locked(size_t max_bytes, uint32_t max_frames_per_batch,
                               int flush_timeout_s) {
-  edr_event_batch_shutdown();
+  if (shutdown_locked() != 0) return EDR_ERR_INTERNAL;
   s_flush_timeout_s = flush_timeout_s;
   s_deadline_ns = 0;
   s_timeout_flush_count = 0;
-  s_lz4_compression_level = env_lz4_compression_level();
   if (max_bytes < 4096u) {
     max_bytes = 4096u;
   }
@@ -295,7 +157,16 @@ EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
   return EDR_OK;
 }
 
+EdrError edr_event_batch_init(size_t max_bytes, uint32_t max_frames_per_batch,
+                              int flush_timeout_s) {
+  batch_lock();
+  EdrError result = init_locked(max_bytes, max_frames_per_batch, flush_timeout_s);
+  batch_unlock();
+  return result;
+}
+
 void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_timeout_s) {
+  batch_lock();
   if (flush_timeout_s > 300) {
     flush_timeout_s = 300;
   }
@@ -308,13 +179,15 @@ void edr_event_batch_apply_profile(uint32_t max_frames_per_batch, int flush_time
   if (s_used > 0u) {
     batch_note_write();
   }
-  if (s_max_frames > 0u && s_frame_count >= s_max_frames) {
+  if (s_max_frames > 0u && s_frame_count >= s_max_frames &&
+      (!s_pending_batch_id[0] || !s_deadline_ns || edr_monotonic_ns() >= s_deadline_ns)) {
     flush_locked();
   }
+  batch_unlock();
 }
 
-void edr_event_batch_shutdown(void) {
-  flush_locked();
+static int shutdown_locked(void) {
+  if (flush_locked() != 0) return -1;
   free(s_buf);
   s_buf = NULL;
   s_cap = 0;
@@ -323,26 +196,42 @@ void edr_event_batch_shutdown(void) {
   s_max_frames = 0;
   s_flush_timeout_s = 0;
   s_deadline_ns = 0;
+  return 0;
+}
+
+int edr_event_batch_shutdown(void) {
+  batch_lock();
+  int result = shutdown_locked();
+  batch_unlock();
+  return result;
 }
 
 void edr_event_batch_poll_timeout(void) {
-  if (s_flush_timeout_s <= 0 || s_used == 0u || s_deadline_ns == 0u) {
-    return;
+  batch_lock();
+  if (s_used != 0u && s_deadline_ns != 0u && edr_monotonic_ns() >= s_deadline_ns) {
+    if (flush_locked() == 0) s_timeout_flush_count++;
   }
-  if (edr_monotonic_ns() >= s_deadline_ns) {
-    flush_locked();
-    s_timeout_flush_count++;
-  }
+  batch_unlock();
 }
 
-uint64_t edr_event_batch_timeout_flush_count(void) { return s_timeout_flush_count; }
+uint64_t edr_event_batch_timeout_flush_count(void) {
+  batch_lock();
+  uint64_t count = s_timeout_flush_count;
+  batch_unlock();
+  return count;
+}
 
 static int append_frame(const uint8_t *data, size_t len) {
-  if (!s_buf || s_cap == 0) {
+  if (!data || !s_buf || s_cap == 0) {
     return -1;
   }
   if (len > 0xffffffffu || len == 0u) {
     return -1;
+  }
+  if (s_pending_batch_id[0]) {
+    /* Continuous arrivals must not bypass failed-handoff retry dampening. */
+    if (s_deadline_ns && edr_monotonic_ns() < s_deadline_ns) return -1;
+    if (flush_locked() != 0) return -1;
   }
   size_t need = 4u + len;
   if (need > s_cap) {
@@ -363,15 +252,21 @@ static int append_frame(const uint8_t *data, size_t len) {
 }
 
 int edr_event_batch_push(const uint8_t *wire, size_t wire_len) {
+  batch_lock();
   int r = append_frame(wire, wire_len);
   if (r == 1) {
-    flush_locked();
-    r = append_frame(wire, wire_len);
+    r = flush_locked() == 0 ? append_frame(wire, wire_len) : -1;
   }
   if (r == 0) {
     edr_transport_on_behavior_wire(wire, wire_len);
   }
+  batch_unlock();
   return r;
 }
 
-void edr_event_batch_flush(void) { flush_locked(); }
+int edr_event_batch_flush(void) {
+  batch_lock();
+  int result = flush_locked();
+  batch_unlock();
+  return result;
+}

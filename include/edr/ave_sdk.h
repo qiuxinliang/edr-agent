@@ -333,6 +333,9 @@ AVE_EXPORT int AVE_CALL AVE_SyncFromEdrConfig(const struct EdrConfig *cfg);
 AVE_EXPORT int AVE_CALL AVE_RegisterCallbacks(const AVECallbacks *callbacks);
 AVE_EXPORT int AVE_CALL AVE_StartBehaviorMonitor(void);
 AVE_EXPORT void AVE_CALL AVE_Shutdown(void);
+/** Drain the behavior producer before its batch sink is released. AVE_OK or
+ * AVE_ERR_TIMEOUT; timeout retains dependencies for a later retry. */
+AVE_EXPORT int AVE_CALL AVE_DrainBehaviorMonitor(uint32_t timeout_ms);
 AVE_EXPORT const char *AVE_CALL AVE_GetVersion(void);
 AVE_EXPORT int AVE_CALL AVE_GetStatus(AVEStatus *status_out);
 

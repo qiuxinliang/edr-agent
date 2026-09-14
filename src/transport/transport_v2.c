@@ -246,17 +246,16 @@ int edr_transport_v2_open_stream(EdrTransportV2Channel channel, EdrTransportV2Op
   return stream_id;
 }
 
-int edr_transport_v2_send(int stream_id, const void *data, size_t len) {
+static int tv2_prepare_send(int stream_id, const void *data, size_t len) {
   (void)data;
   tv2_lock();
-  if (stream_id <= 0 || len == 0u) {
+  s_rt.send_attempts++;
+  if (stream_id <= 0 || !data || len == 0u) {
     s_rt.send_fail++;
     tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "invalid transport v2 send");
     tv2_unlock();
     return -1;
   }
-  s_rt.send_ok++;
-  s_rt.last_error[0] = '\0';
   tv2_unlock();
   return 0;
 }
@@ -297,7 +296,7 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_NORMAL_TELEMETRY,
                                                EDR_TV2_OP_REPORT_EVENTS);
   int rc;
-  if (edr_transport_v2_send(stream_id, payload, payload_len) != 0) {
+  if (tv2_prepare_send(stream_id, payload, payload_len) != 0) {
     return -1;
   }
   rc = edr_ingest_http_post_report_events(batch_id, header12, header_len, payload, payload_len);
@@ -312,6 +311,11 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
       tv2_set_last_error_locked("report-events error exceeds status capacity");
     }
     tv2_unlock();
+  } else {
+    tv2_lock();
+    s_rt.send_ok++;
+    s_rt.last_error[0] = '\0';
+    tv2_unlock();
   }
   return rc;
 }
@@ -323,7 +327,7 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
   int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_COMMAND_RESULT,
                                                EDR_TV2_OP_COMMAND_RESULT);
   int rc;
-  if (edr_transport_v2_send(stream_id, command_id, command_id ? strlen(command_id) : 0u) != 0) {
+  if (tv2_prepare_send(stream_id, command_id, command_id ? strlen(command_id) : 0u) != 0) {
     return -1;
   }
   rc = edr_ingest_http_post_command_result_typed(command_id, command_type, meta, execution_status, exit_code,
@@ -340,6 +344,7 @@ int edr_transport_v2_command_result_typed(const char *command_id, const char *co
     tv2_unlock();
   } else {
     tv2_lock();
+    s_rt.send_ok++;
     s_rt.last_error[0] = '\0';
     tv2_unlock();
   }
@@ -353,31 +358,29 @@ int edr_transport_v2_command_result(const char *command_id,
   return edr_transport_v2_command_result_typed(command_id, "", meta, execution_status, exit_code, detail_utf8);
 }
 
-int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
-                                 const char *sha256_hex, char *out_minio_key,
-                                 size_t out_minio_key_cap) {
-  int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_UPLOAD, EDR_TV2_OP_UPLOAD_FILE);
-  int rc;
-  if (edr_transport_v2_send(stream_id, upload_id, upload_id ? strlen(upload_id) : 0u) != 0) {
-    return -1;
-  }
-  rc = edr_ingest_http_upload_file_multipart_for_command(upload_id, upload_id, file_path, sha256_hex,
-                                                         out_minio_key, out_minio_key_cap);
-  if (rc != 0) {
-    tv2_lock();
-    s_rt.send_fail++;
-    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "upload_file failed");
-    tv2_unlock();
-  }
-  return rc;
-}
-
 int edr_transport_v2_upload_file_for_command(const char *command_id, const char *upload_id,
                                              const char *file_path, const char *sha256_hex,
                                              char *out_minio_key, size_t out_minio_key_cap) {
   int stream_id = edr_transport_v2_open_stream(EDR_TV2_CHANNEL_UPLOAD, EDR_TV2_OP_UPLOAD_FILE);
-  if (edr_transport_v2_send(stream_id, upload_id, upload_id ? strlen(upload_id) : 0u) != 0) return -1;
-  return edr_ingest_http_upload_file_multipart_for_command(command_id, upload_id, file_path,
+  if (tv2_prepare_send(stream_id, upload_id, upload_id ? strlen(upload_id) : 0u) != 0) return -1;
+  int rc = edr_ingest_http_upload_file_multipart_for_command(command_id, upload_id, file_path,
                                                            sha256_hex, out_minio_key,
                                                            out_minio_key_cap);
+  tv2_lock();
+  if (rc == 0) {
+    s_rt.send_ok++;
+    s_rt.last_error[0] = '\0';
+  } else {
+    s_rt.send_fail++;
+    tv2_copy(s_rt.last_error, sizeof(s_rt.last_error), NULL, "upload_file failed");
+  }
+  tv2_unlock();
+  return rc;
+}
+
+int edr_transport_v2_upload_file(const char *upload_id, const char *file_path,
+                                 const char *sha256_hex, char *out_minio_key,
+                                 size_t out_minio_key_cap) {
+  return edr_transport_v2_upload_file_for_command(upload_id, upload_id, file_path,
+                                                  sha256_hex, out_minio_key, out_minio_key_cap);
 }

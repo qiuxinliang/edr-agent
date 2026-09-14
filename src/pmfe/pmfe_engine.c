@@ -28,6 +28,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #include "edr/config.h"
 #include "edr/edr_log.h"
 #include "edr/error.h"
+#include "edr/process_generation.h"
 #include "edr/sha256.h"
 #include "edr/response.h"
 #include "pmfe_pe_arch.h"
@@ -1502,7 +1503,8 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
 }
 
 static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detail_cap,
-                             EdrPmfeScanResult *result) {
+                             EdrPmfeScanResult *result,
+                             EdrLiveProcessGeneration *scan_generation) {
   uint32_t pid = task->pid;
   int do_mod = task->module_integrity != 0u;
   unsigned peek_cap = task->peek_cap == 0u ? 4u : (unsigned)task->peek_cap;
@@ -1511,6 +1513,22 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
   if (!h) {
     snprintf(detail, detail_cap, "pid=%u open_process=failed err=%lu", pid, (unsigned long)GetLastError());
     return -1;
+  }
+  if (scan_generation) {
+    EdrLiveProcessGeneration observed;
+    FILETIME created, exited, kernel, user;
+    ULARGE_INTEGER created_value;
+    char generation_reason[64];
+    memset(&observed, 0, sizeof(observed));
+    if (edr_process_generation_query_live(h, &observed, generation_reason,
+                                          sizeof(generation_reason)) &&
+        observed.pid == pid && GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+      created_value.LowPart = created.dwLowDateTime;
+      created_value.HighPart = created.dwHighDateTime;
+      if (created_value.QuadPart == observed.creation_filetime_100ns) {
+        *scan_generation = observed;
+      }
+    }
   }
   if (result) {
     DWORD image_len = (DWORD)sizeof(result->image_path);
@@ -1749,16 +1767,61 @@ static int pmfe_linux_map_cand_cmp(const void *a, const void *b) {
   return 0;
 }
 
-static ssize_t pmfe_linux_read_vm(pid_t pid, uint64_t addr, void *buf, size_t len, unsigned *vm_read_failures) {
+static int pmfe_linux_read_start_ticks(int proc_fd, uint64_t *out) {
+  char stat_buf[4096];
+  ssize_t nr;
+  char *p;
+  unsigned field;
+  int fd;
+  if (proc_fd < 0 || !out) {
+    return 0;
+  }
+  *out = 0u;
+  fd = openat(proc_fd, "stat", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  nr = read(fd, stat_buf, sizeof(stat_buf) - 1u);
+  close(fd);
+  if (nr <= 0) {
+    return 0;
+  }
+  stat_buf[nr] = '\0';
+  p = strrchr(stat_buf, ')');
+  if (!p) {
+    return 0;
+  }
+  p++;
+  for (field = 3u; field <= 22u; field++) {
+    char *end;
+    while (*p == ' ' || *p == '\t') {
+      p++;
+    }
+    if (!*p) {
+      return 0;
+    }
+    if (field != 22u) {
+      p += strcspn(p, " \t\r\n");
+      continue;
+    }
+    *out = (uint64_t)strtoull(p, &end, 10);
+    return end != p && (*end == '\0' || *end == ' ' || *end == '\t' ||
+                        *end == '\r' || *end == '\n') &&
+           *out != 0u;
+  }
+  return 0;
+}
+
+static ssize_t pmfe_linux_read_vm(pid_t pid, int proc_fd, uint64_t addr,
+                                  void *buf, size_t len,
+                                  unsigned *vm_read_failures) {
   struct iovec local = {.iov_base = buf, .iov_len = len};
   struct iovec remote = {.iov_base = (void *)(uintptr_t)addr, .iov_len = len};
   ssize_t r = process_vm_readv(pid, &local, 1, &remote, 1, 0);
   if (r >= 0) {
     return r;
   }
-  char mempath[64];
-  snprintf(mempath, sizeof(mempath), "/proc/%d/mem", (int)pid);
-  int fd = open(mempath, O_RDONLY);
+  int fd = openat(proc_fd, "mem", O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     if (vm_read_failures) {
       (*vm_read_failures)++;
@@ -1776,7 +1839,8 @@ static ssize_t pmfe_linux_read_vm(pid_t pid, uint64_t addr, void *buf, size_t le
   return pr;
 }
 
-static void pmfe_linux_dns_scan_region(pid_t pid, uint64_t base, uint64_t region_sz, int full_vad,
+static void pmfe_linux_dns_scan_region(pid_t pid, int proc_fd, uint64_t base,
+                                       uint64_t region_sz, int full_vad,
                                        unsigned *ascii_hits, float *dns_best, char *dns_sample, size_t dns_sample_cap,
                                        unsigned *vm_read_failures) {
   size_t cap_kb = full_vad ? PMFE_LINUX_DNS_CAP_FULL : PMFE_LINUX_DNS_CAP;
@@ -1788,7 +1852,8 @@ static void pmfe_linux_dns_scan_region(pid_t pid, uint64_t base, uint64_t region
     if (want > region_sz - off) {
       want = (size_t)(region_sz - off);
     }
-    ssize_t r = pmfe_linux_read_vm(pid, base + (uint64_t)off, chunk, want, vm_read_failures);
+    ssize_t r = pmfe_linux_read_vm(pid, proc_fd, base + (uint64_t)off, chunk,
+                                   want, vm_read_failures);
     if (r <= 0) {
       break;
     }
@@ -1800,7 +1865,8 @@ static void pmfe_linux_dns_scan_region(pid_t pid, uint64_t base, uint64_t region
   }
 }
 
-static void pmfe_linux_run_module_integrity(pid_t pid, const PmfeLinuxImod *mods, int nmods, unsigned *stomp_out,
+static void pmfe_linux_run_module_integrity(pid_t pid, int proc_fd,
+                                            const PmfeLinuxImod *mods, int nmods, unsigned *stomp_out,
                                             unsigned *disk_ok_out, char *first_stomp, size_t first_cap,
                                             unsigned *vm_read_failures) {
   *stomp_out = 0;
@@ -1832,7 +1898,8 @@ static void pmfe_linux_run_module_integrity(pid_t pid, const PmfeLinuxImod *mods
     }
     uint8_t mem_head[4096];
     uint8_t disk_head[4096];
-    ssize_t br = pmfe_linux_read_vm(pid, lo, mem_head, want_read, vm_read_failures);
+    ssize_t br = pmfe_linux_read_vm(pid, proc_fd, lo, mem_head, want_read,
+                                    vm_read_failures);
     if (br < 4) {
       continue;
     }
@@ -1865,7 +1932,8 @@ static void pmfe_linux_run_module_integrity(pid_t pid, const PmfeLinuxImod *mods
   }
 }
 
-static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_cap) {
+static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_cap,
+                           EdrPmfeScanResult *result) {
   uint32_t pid_u = task->pid;
   pid_t pid = (pid_t)pid_u;
   unsigned peek_cap_req = task->peek_cap == 0u ? 4u : (unsigned)task->peek_cap;
@@ -1875,10 +1943,32 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
   const char *anon_env = getenv("EDR_PMFE_LINUX_ANON_EXEC_ONLY");
   int anon_exec_only = (anon_env && anon_env[0] == '1') ? 1 : 0;
 
-  char mpath[64];
-  snprintf(mpath, sizeof(mpath), "/proc/%u/maps", pid_u);
-  FILE *f = fopen(mpath, "r");
+  char proc_path[64];
+  uint64_t start_ticks = 0u;
+  uint64_t finish_ticks = 0u;
+  snprintf(proc_path, sizeof(proc_path), "/proc/%u", pid_u);
+  int proc_fd = open(proc_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (proc_fd < 0 || !pmfe_linux_read_start_ticks(proc_fd, &start_ticks)) {
+    if (proc_fd >= 0) {
+      close(proc_fd);
+    }
+    snprintf(detail, detail_cap, "pid=%u process_generation_unavailable", pid_u);
+    return -1;
+  }
+  if (result) {
+    ssize_t image_len = readlinkat(proc_fd, "exe", result->image_path,
+                                   sizeof(result->image_path) - 1u);
+    if (image_len > 0) {
+      result->image_path[image_len] = '\0';
+    }
+  }
+  int maps_fd = openat(proc_fd, "maps", O_RDONLY | O_CLOEXEC);
+  FILE *f = maps_fd >= 0 ? fdopen(maps_fd, "r") : NULL;
   if (!f) {
+    if (maps_fd >= 0) {
+      close(maps_fd);
+    }
+    close(proc_fd);
     snprintf(detail, detail_cap, "pid=%u maps_open_failed", pid_u);
     return -1;
   }
@@ -1948,7 +2038,7 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
   char first_stomp[260];
   first_stomp[0] = '\0';
   if (do_integrity && nimods > 0) {
-    pmfe_linux_run_module_integrity(pid, imods, nimods, &stomp, &disk_ok, first_stomp, sizeof(first_stomp),
+    pmfe_linux_run_module_integrity(pid, proc_fd, imods, nimods, &stomp, &disk_ok, first_stomp, sizeof(first_stomp),
                                     &vm_read_failures);
   }
 
@@ -1979,7 +2069,8 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
     if (rsz > 0u && rsz < want) {
       want = (size_t)rsz;
     }
-    ssize_t nr = pmfe_linux_read_vm(pid, base, buf, want, &vm_read_failures);
+    ssize_t nr = pmfe_linux_read_vm(pid, proc_fd, base, buf, want,
+                                    &vm_read_failures);
     if (nr <= 0) {
       continue;
     }
@@ -1993,13 +2084,22 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
       }
     }
     if (dns_path && !(dns_dis && dns_dis[0] == '1')) {
-      pmfe_linux_dns_scan_region(pid, base, rsz, full_vad, &dns_ascii_hits, &dns_best_score, dns_sample,
+      pmfe_linux_dns_scan_region(pid, proc_fd, base, rsz, full_vad,
+                                 &dns_ascii_hits, &dns_best_score, dns_sample,
                                  sizeof(dns_sample), &vm_read_failures);
     }
   }
 
   unsigned baseline_mods_u = do_integrity ? (unsigned)nimods : file_exec_maps;
   const char *stomp_disp = first_stomp[0] ? first_stomp : "-";
+
+  if (!pmfe_linux_read_start_ticks(proc_fd, &finish_ticks) ||
+      finish_ticks != start_ticks) {
+    close(proc_fd);
+    snprintf(detail, detail_cap, "pid=%u process_generation_changed", pid_u);
+    return -1;
+  }
+  close(proc_fd);
 
   char extra[720];
   extra[0] = '\0';
@@ -2035,11 +2135,15 @@ static int pmfe_scan_stub(uint32_t pid, char *detail, size_t detail_cap) {
 #endif
 
 static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_cap,
-                         EdrPmfeScanResult *result) {
+                         EdrPmfeScanResult *result,
+                         EdrLiveProcessGeneration *scan_generation) {
+  if (scan_generation) {
+    memset(scan_generation, 0, sizeof(*scan_generation));
+  }
 #ifdef _WIN32
-  return pmfe_scan_windows(task, detail, detail_cap, result);
+  return pmfe_scan_windows(task, detail, detail_cap, result, scan_generation);
 #elif defined(__linux__)
-  int rc = pmfe_scan_linux(task, detail, detail_cap);
+  int rc = pmfe_scan_linux(task, detail, detail_cap, result);
   if (result) {
     snprintf(result->yara_status, sizeof(result->yara_status), "%s", "unsupported");
     snprintf(result->ave_status, sizeof(result->ave_status), "%s", "unsupported");
@@ -2137,31 +2241,6 @@ static uint64_t pmfe_wall_time_ns(void) {
 #endif
 }
 
-static void pmfe_query_target_image(uint32_t pid, char *out, size_t cap) {
-  out[0] = '\0';
-#ifdef _WIN32
-  HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
-  if (!ph) {
-    return;
-  }
-  wchar_t w[1024];
-  DWORD n = 1024u;
-  if (QueryFullProcessImageNameW(ph, 0, w, &n)) {
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
-  }
-  CloseHandle(ph);
-#elif defined(__linux__)
-  char path[64];
-  snprintf(path, sizeof(path), "/proc/%u/exe", pid);
-  ssize_t nr = readlink(path, out, cap - 1u);
-  if (nr > 0) {
-    out[nr] = '\0';
-  }
-#else
-  (void)pid;
-#endif
-}
-
 static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_max,
                                   unsigned private_exec, unsigned mz_hits, unsigned memfd_exec,
                                   unsigned deleted_exec,
@@ -2181,7 +2260,8 @@ static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_m
  * Linux：`elf_hits=` 仅由 `EDR_PMFE_EMIT_ELF=1` 控制上报，与 `EDR_PMFE_EMIT_MZ` 无关。
  */
 static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detail,
-                                      const EdrPmfeScanResult *scan_result) {
+                                      const EdrPmfeScanResult *scan_result,
+                                      const EdrLiveProcessGeneration *scan_generation) {
   if (!task || !detail || !detail[0]) {
     return;
   }
@@ -2245,8 +2325,9 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
     return;
   }
 
-  char img[1024];
-  pmfe_query_target_image(task->pid, img, sizeof(img));
+  const char *img = scan_result && scan_result->image_path[0]
+                        ? scan_result->image_path
+                        : "-";
 
   /* 长摘要走 `cmd=` → `cmdline`；`detector`/`score` 仍写入 script_snippet（见 behavior_from_slot 合并逻辑） */
   char cmdline_buf[832];
@@ -2318,15 +2399,29 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   const char *status = scan_result && scan_result->status[0] ? scan_result->status : "unknown";
   const char *verdict = scan_result && scan_result->verdict[0] ? scan_result->verdict : "inconclusive";
   int suspicious = strcmp(verdict, "suspicious") == 0;
+  char generation_lines[224];
+  generation_lines[0] = '\0';
+  if (scan_generation && scan_generation->pid == task->pid &&
+      scan_generation->process_start_key != 0u &&
+      scan_generation->creation_filetime_100ns != 0u) {
+    (void)snprintf(generation_lines, sizeof(generation_lines),
+                   "process_start_key=%llu\n"
+                   "process_creation_filetime_100ns=%llu\n"
+                   "process_generation_source=etw_start_key_live_telemetry\n",
+                   (unsigned long long)scan_generation->process_start_key,
+                   (unsigned long long)scan_generation->creation_filetime_100ns);
+  }
   int n = snprintf((char *)slot.data, sizeof(slot.data),
                    "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nfollowup_only=%u\nsource_alert_id=%.63s\n"
+                   "%s"
                    "pmfe_status=%s\npmfe_verdict=%s\nprivate_exec=%u\nmemfd_exec=%u\ndeleted_exec=%u\nmz_hits=%u\n"
                    "stomp_suspicious=%u\nthread_start_matches=%u\nread_failures=%u\n"
                    "injection_observed=%u\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=%s\n"
                    "detector=pmfe\n",
-                   task->pid, cid, (unsigned)shellcode_followup, source_alert_id, status, verdict,
+                   task->pid, cid, (unsigned)shellcode_followup, source_alert_id,
+                   generation_lines, status, verdict,
                    private_exec, memfd_exec, deleted_exec, mz_hits, stomp, thread_start_matches, read_failures,
-                   (unsigned)injection_observed, img[0] ? img : "-", cmdline_buf,
+                   (unsigned)injection_observed, img, cmdline_buf,
                    dns_sample[0] ? dns_sample : "-", score,
                    suspicious ? "T1055" : "-");
   if (n < 0 || (size_t)n >= sizeof(slot.data)) {
@@ -2397,7 +2492,9 @@ static void pmfe_worker_body(void) {
 
     char detail[1024];
     EdrPmfeScanResult scan_result;
+    EdrLiveProcessGeneration scan_generation;
     memset(&scan_result, 0, sizeof(scan_result));
+    memset(&scan_generation, 0, sizeof(scan_generation));
     snprintf(scan_result.schema, sizeof(scan_result.schema), "%s", EDR_PMFE_RESULT_SCHEMA);
     scan_result.pid = task.pid;
     scan_result.started_unix_ms = pmfe_result_unix_ms();
@@ -2410,7 +2507,8 @@ static void pmfe_worker_body(void) {
 #else
     (void)__atomic_add_fetch(&s_stat_active, 1ul, __ATOMIC_RELAXED);
 #endif
-    int sr = pmfe_run_scan(&task, detail, sizeof(detail), &scan_result);
+    int sr = pmfe_run_scan(&task, detail, sizeof(detail), &scan_result,
+                           &scan_generation);
     (void)sr;
     if (detail[0] == '\0') {
       snprintf(detail, sizeof(detail), "pid=%u scan_failed", task.pid);
@@ -2517,8 +2615,10 @@ static void pmfe_worker_body(void) {
     }
     EDR_LOGV("[pmfe] scan_done %s\n", detail);
     audit_pmfe_line(task.cmd_id[0] ? task.cmd_id : "-", detail);
-    edr_pid_history_pmfe_ingest_scan_detail(task.pid, detail);
-    pmfe_try_emit_scan_result(&task, detail, &scan_result);
+    edr_pid_history_pmfe_ingest_scan_detail(
+        task.pid, scan_generation.process_start_key,
+        scan_generation.creation_filetime_100ns, detail);
+    pmfe_try_emit_scan_result(&task, detail, &scan_result, &scan_generation);
     if (task.server_requested && task.cmd_id[0] && s_server_scan_result_callback) {
       s_server_scan_result_callback(task.cmd_id, task.pid, sr, detail, &scan_result,
                                     &task.command_context);

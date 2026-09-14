@@ -2,7 +2,7 @@
 #
 # 使用说明、HTTPS/TLS 采集与控制面、SQLite 队列与环境变量：见同目录 README.md
 # 与平台 REST 联调时的 `endpoint_id` / `tenant_id` / `rest_base_url` 语义与启动 [config] WARN：见 docs/WP3_CONFIG_VALIDATION.md
-# HTTPS/TLS 传输、`EDR_EVENT_INGEST_SPLIT`、ingest 排障：见 docs/WP4_HTTP_TRANSPORT_OPS.md
+# HTTPS/TLS、耐久批次交接与排障：见 docs/AGENT_PIPELINE_P1_P2_REPAIR_2026-09-14.md
 # 规则母版 → 预处理 TOML / P0 IR / 版本对账（WP-5）：见 docs/WP5_RULES_ENGINEERING.md；TOML 子串规则：见 docs/PREPROCESS_RULES.md
 # 批处理/上送先量化后调优（WP-6）：见 docs/WP6_TRANSPORT_BATCH_QUANTIFIED_OPS.md
 # 离线队列、失败落盘与出队重试/退避（WP-7）：见 docs/WP7_OFFLINE_QUEUE_RETRY.md
@@ -204,7 +204,7 @@ batch_max_size_mb    = 2
 batch_timeout_s      = 2
 max_upload_mbps      = 1
 
-# 须与 EDR_PERSIST_STRATEGY / EDR_PERSIST_QUEUE / EDR_QUEUE_* 一起理解，见 docs/WP7_OFFLINE_QUEUE_RETRY.md
+# 批次先耐久入队，再由传输线程发送；EDR_QUEUE_* 控制既有重试/容量边界。
 [offline]
 queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
 max_queue_size_mb    = 512

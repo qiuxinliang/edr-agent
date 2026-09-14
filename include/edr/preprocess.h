@@ -8,10 +8,17 @@
 #include <stdint.h>
 
 struct EdrEventBus;
+struct EdrDetectionDecision;
+/* Evidence owner sees every evaluated record, independent of upload selection
+ * and deduplication. Returns nonzero only for telemetry admission. */
+int edr_preprocess_admit_telemetry(const EdrBehaviorRecord *record,
+                                  const struct EdrDetectionDecision *decision);
 
 /** cfg 为 NULL 时使用 edr_config_apply_defaults 等价默认值 */
 EdrError edr_preprocess_start(struct EdrEventBus *bus, const EdrConfig *cfg);
-void edr_preprocess_stop(void);
+/** 1 only after the worker exited and pending batches were durably handed off.
+ * A 0 result retains resources and forbids restart/owner teardown. */
+int edr_preprocess_stop(void);
 
 /** 运行中更新预处理参数（当前：去重/限流）；不涉及批次缓冲重建。 */
 void edr_preprocess_apply_config(const EdrConfig *cfg);

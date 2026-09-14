@@ -509,6 +509,8 @@ set(EDR_AGENT_SOURCES
   src/preprocess/process_generation.c
   src/preprocess/windows_file_identity.c
   src/preprocess/process_evidence_worker.c
+  src/preprocess/process_evidence_pending.c
+  src/preprocess/telemetry_admission.c
   src/preprocess/p0_rule_match.c
   src/preprocess/process_chain_depth.c
   src/preprocess/preprocess_env.c

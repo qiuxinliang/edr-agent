@@ -2382,10 +2382,10 @@ static EvidenceWriteBudgetLimits sqlite_write_budget_limits(void) {
   if (limits.base == 0u) {
     return limits;
   }
-  /* The default base remains 80 for compatibility. Generic file-read context
-   * gets 40 writes/minute, so the observed ~946/min ordinary flood is shed
-   * early. Action/ancestry context gets an independent 160/minute reservation;
-   * neither pool can consume the other's capacity. */
+  /* The default base remains 80 for compatibility. Count changed source
+   * transactions, not their candidate fanout or physical SQLite statements.
+   * Ordinary context gets 40/minute and action/ancestry context gets an
+   * independent 160/minute reservation; neither pool consumes the other. */
   limits.critical_context = env_u32_clamped(
       "EDR_EVIDENCE_CACHE_CRITICAL_CONTEXT_WRITE_BUDGET_PER_MIN",
       write_budget_scaled(limits.base, 2u), 1u, 100000u);
@@ -2863,11 +2863,14 @@ static int upsert_registry_sqlite(const EdrBehaviorRecord *r) {
   return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static int manifest_utf8_valid(const char *text) {
-  const unsigned char *p = (const unsigned char *)(text ? text : "");
-  const unsigned char *end = p + strlen((const char *)p);
+static int manifest_utf8_bytes_valid(const char *text, size_t length) {
+  const unsigned char *p = (const unsigned char *)text;
+  const unsigned char *end;
+  if (!text && length != 0u) return 0;
+  end = p + length;
   while (p < end) {
     unsigned char c = *p++;
+    if (c == 0u) return 0;
     if (c <= 0x7fu) continue;
     if (c >= 0xc2u && c <= 0xdfu) {
       if ((size_t)(end - p) < 1u || (p[0] & 0xc0u) != 0x80u) return 0;
@@ -2888,6 +2891,11 @@ static int manifest_utf8_valid(const char *text) {
     }
   }
   return 1;
+}
+
+static int manifest_utf8_valid(const char *text) {
+  const char *value = text ? text : "";
+  return manifest_utf8_bytes_valid(value, strlen(value));
 }
 
 static void manifest_rejected(const char *reason) {
@@ -3224,9 +3232,8 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   return rc;
 }
 
-static int build_post_context_manifest_json(const EdrBehaviorRecord *r,
-                                            const char *candidate_id,
-                                            char **out) {
+static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
+                                                     char **out) {
   cJSON *root = NULL;
   EvidenceProcessGeneration generation;
   int generation_known;
@@ -3242,7 +3249,7 @@ static int build_post_context_manifest_json(const EdrBehaviorRecord *r,
   root = cJSON_CreateObject();
   ok = root &&
        manifest_add_text(root, "schema", "p0_post_context_event.v1") &&
-       manifest_add_text(root, "candidate_id", candidate_id) &&
+       cJSON_AddNullToObject(root, "candidate_id") &&
        manifest_add_text(root, "source_event_id", r->event_id) &&
        manifest_add_i64(root, "event_time_ns", record_time_ns(r)) &&
        manifest_add_u64(root, "type", (uint32_t)r->type) &&
@@ -3294,6 +3301,52 @@ static void artifact_source_identity_for(const EdrBehaviorRecord *r, char *out, 
     out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
   }
   out[64] = '\0';
+}
+
+static int context_fact_id_for_identity(const char *endpoint_id,
+                                        const char *tenant_id,
+                                        const char *source_identity,
+                                        const char *manifest_template,
+                                        char out[65]) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[] = "0123456789abcdef";
+  if (!source_identity || !source_identity[0] || !manifest_template || !out) return -1;
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, "edr-local-evidence-context-fact-v1");
+  candidate_digest_text(&ctx, endpoint_id ? endpoint_id : "");
+  candidate_digest_text(&ctx, tenant_id ? tenant_id : "");
+  candidate_digest_text(&ctx, source_identity);
+  candidate_digest_text(&ctx, manifest_template);
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); ++i) {
+    out[i * 2u] = hex[digest[i] >> 4u];
+    out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out[64] = '\0';
+  return 0;
+}
+
+static int context_fact_id_for(const EdrBehaviorRecord *r,
+                               const char *manifest_template, char out[65]) {
+  char source_identity[65];
+  if (!r || !out) return -1;
+  artifact_source_identity_for(r, source_identity, sizeof(source_identity));
+  return context_fact_id_for_identity(r->endpoint_id, r->tenant_id, source_identity,
+                                      manifest_template, out);
+}
+
+static char *context_candidate_id_json(const char *candidate_id) {
+  cJSON *value;
+  char *json;
+  if (!candidate_id || !candidate_id[0] || !manifest_utf8_valid(candidate_id)) {
+    return NULL;
+  }
+  value = cJSON_CreateString(candidate_id);
+  if (!value) return NULL;
+  json = cJSON_PrintUnformatted(value);
+  cJSON_Delete(value);
+  return json;
 }
 
 static int artifact_id_for(const EdrBehaviorRecord *r, const char *candidate_id,
@@ -3364,62 +3417,63 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
 
 typedef struct {
   uint32_t candidate_index;
-  char *manifest;
-} PreparedContextArtifact;
+  char artifact_id[384];
+  char *candidate_id_json;
+} PreparedContextRef;
 
 typedef struct {
-  PreparedContextArtifact *items;
-  uint32_t count;
+  char fact_id[65];
+  char *manifest_template;
+  PreparedContextRef *refs;
+  uint32_t ref_count;
+  uint32_t fact_insert;
 } PreparedContextArtifacts;
 
 static void sqlite_free_prepared_context_artifacts(PreparedContextArtifacts *prepared) {
   if (!prepared) return;
-  for (uint32_t i = 0u; i < prepared->count; ++i) {
-    cJSON_free(prepared->items[i].manifest);
+  for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
+    cJSON_free(prepared->refs[i].candidate_id_json);
   }
-  free(prepared->items);
-  prepared->items = NULL;
-  prepared->count = 0u;
+  cJSON_free(prepared->manifest_template);
+  free(prepared->refs);
+  memset(prepared, 0, sizeof(*prepared));
 }
 
-/* Returns 1 only when the durable artifact has the exact stable manifest,
- * 0 when it is absent or needs enrichment, and -1 on a database failure.
- * build_post_context_manifest_json deliberately contains source event fields
- * only; wall-clock created_ns remains row metadata and cannot make a replay
- * look like new content. */
-static int sqlite_context_artifact_is_exact_replay(const EdrBehaviorRecord *r,
-                                                   const char *candidate_id,
-                                                   const char *manifest) {
-  static const char sql[] = "SELECT manifest_json FROM artifacts WHERE artifact_id=?;";
-  char artifact_id[384];
+static int sqlite_prepare_context_fact(const EdrBehaviorRecord *r,
+                                       PreparedContextArtifacts *prepared) {
+  static const char sql[] =
+      "SELECT manifest_template_json FROM context_facts WHERE fact_id=?;";
   sqlite3_stmt *st = NULL;
-  int result = -1;
-  if (!s_db || !manifest ||
-      artifact_id_for(r, candidate_id, "post_context", artifact_id,
-                      sizeof(artifact_id)) != 0) {
+  int step;
+  if (!s_db || !r || !prepared ||
+      build_post_context_manifest_template_json(r,
+                                                &prepared->manifest_template) != 0 ||
+      context_fact_id_for(r, prepared->manifest_template,
+                          prepared->fact_id) != 0) {
     return -1;
   }
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-    set_error("prepare post-context replay lookup failed");
+    set_error("prepare context fact replay lookup failed");
     return -1;
   }
-  bind_text(st, 1, artifact_id);
-  switch (sqlite3_step(st)) {
-    case SQLITE_ROW: {
-      const char *existing = (const char *)sqlite3_column_text(st, 0);
-      result = existing && strcmp(existing, manifest) == 0 ? 1 : 0;
-      break;
+  bind_text(st, 1, prepared->fact_id);
+  step = sqlite3_step(st);
+  if (step == SQLITE_ROW) {
+    const char *existing = (const char *)sqlite3_column_text(st, 0);
+    if (!existing || strcmp(existing, prepared->manifest_template) != 0) {
+      set_error("context fact hash collision");
+      sqlite3_finalize(st);
+      return -1;
     }
-    case SQLITE_DONE:
-      result = 0;
-      break;
-    default:
-      set_error("read post-context replay manifest failed");
-      result = -1;
-      break;
+  } else if (step == SQLITE_DONE) {
+    prepared->fact_insert = 1u;
+  } else {
+    set_error("read context fact replay manifest failed");
+    sqlite3_finalize(st);
+    return -1;
   }
   sqlite3_finalize(st);
-  return result;
+  return 0;
 }
 
 static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
@@ -3430,34 +3484,67 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
     return -1;
   }
   memset(prepared, 0, sizeof(*prepared));
-  prepared->items = (PreparedContextArtifact *)calloc(
-      candidate_count, sizeof(PreparedContextArtifact));
-  if (!prepared->items) {
+  if (sqlite_prepare_context_fact(r, prepared) != 0) {
+    sqlite_free_prepared_context_artifacts(prepared);
+    return -1;
+  }
+  prepared->refs = (PreparedContextRef *)calloc(
+      candidate_count, sizeof(PreparedContextRef));
+  if (!prepared->refs) {
     set_error("allocate post-context replay plan failed");
+    sqlite_free_prepared_context_artifacts(prepared);
     return -1;
   }
   for (uint32_t i = 0u; i < candidate_count; ++i) {
-    char *manifest = NULL;
-    int exact_replay;
+    PreparedContextRef *ref = &prepared->refs[prepared->ref_count];
+    sqlite3_stmt *st = NULL;
+    int step;
     if (!candidate_ids[i][0] ||
-        build_post_context_manifest_json(r, candidate_ids[i], &manifest) != 0) {
+        artifact_id_for(r, candidate_ids[i], "post_context", ref->artifact_id,
+                        sizeof(ref->artifact_id)) != 0) {
       sqlite_free_prepared_context_artifacts(prepared);
       return -1;
     }
-    exact_replay = sqlite_context_artifact_is_exact_replay(
-        r, candidate_ids[i], manifest);
-    if (exact_replay < 0) {
-      cJSON_free(manifest);
+    if (sqlite3_prepare_v2(
+            s_db,
+            "SELECT candidate_id,fact_id FROM candidate_context_refs WHERE artifact_id=?;",
+            -1, &st, NULL) != SQLITE_OK) {
+      set_error("prepare context reference replay lookup failed");
       sqlite_free_prepared_context_artifacts(prepared);
       return -1;
     }
-    if (exact_replay != 0) {
-      cJSON_free(manifest);
-      continue;
+    bind_text(st, 1, ref->artifact_id);
+    step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+      const char *existing_candidate = (const char *)sqlite3_column_text(st, 0);
+      const char *existing_fact = (const char *)sqlite3_column_text(st, 1);
+      int candidate_matches = existing_candidate &&
+                              strcmp(existing_candidate, candidate_ids[i]) == 0;
+      int exact = candidate_matches && existing_fact &&
+                  strcmp(existing_fact, prepared->fact_id) == 0;
+      sqlite3_finalize(st);
+      if (exact) continue;
+      if (!candidate_matches) {
+        set_error("context reference candidate conflict");
+        sqlite_free_prepared_context_artifacts(prepared);
+        return -1;
+      }
+    } else {
+      sqlite3_finalize(st);
     }
-    prepared->items[prepared->count].candidate_index = i;
-    prepared->items[prepared->count].manifest = manifest;
-    prepared->count++;
+    if (step != SQLITE_ROW && step != SQLITE_DONE) {
+      set_error("read context reference replay state failed");
+      sqlite_free_prepared_context_artifacts(prepared);
+      return -1;
+    }
+    ref->candidate_id_json = context_candidate_id_json(candidate_ids[i]);
+    if (!ref->candidate_id_json) {
+      set_error("encode context reference candidate id failed");
+      sqlite_free_prepared_context_artifacts(prepared);
+      return -1;
+    }
+    ref->candidate_index = i;
+    prepared->ref_count++;
   }
   return 0;
 }
@@ -3471,18 +3558,68 @@ static int sqlite_commit_candidate_transaction(void);
 static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
                                            char candidate_ids[][160],
                                            const PreparedContextArtifacts *prepared) {
-  if (!r || !candidate_ids || !prepared || prepared->count == 0u ||
+  sqlite3_int64 written_ns;
+  if (!r || !candidate_ids || !prepared ||
+      (!prepared->fact_insert && prepared->ref_count == 0u) ||
       exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
-  for (uint32_t i = 0u; i < prepared->count; ++i) {
-    uint32_t candidate_index = prepared->items[i].candidate_index;
-    if (!candidate_ids[candidate_index][0] ||
-        insert_artifact_sqlite(r, candidate_ids[candidate_index], "post_context", "", "",
-                               prepared->items[i].manifest, "local_manifest") != 0) {
+  written_ns = (sqlite3_int64)now_unix_ns();
+  if (prepared->fact_insert) {
+    static const char fact_sql[] =
+        "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,"
+        "created_ns,updated_ns) VALUES(?,?,?,?,?,?);";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(s_db, fact_sql, -1, &st, NULL) != SQLITE_OK) {
+      set_error("prepare context fact upsert failed");
       sqlite_rollback_silent();
       return -1;
     }
+    bind_text(st, 1, prepared->fact_id);
+    bind_text(st, 2, r->endpoint_id);
+    bind_text(st, 3, r->tenant_id);
+    bind_text(st, 4, prepared->manifest_template);
+    sqlite3_bind_int64(st, 5, written_ns);
+    sqlite3_bind_int64(st, 6, written_ns);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+      set_error("upsert context fact failed");
+      sqlite3_finalize(st);
+      sqlite_rollback_silent();
+      return -1;
+    }
+    sqlite3_finalize(st);
+  }
+  for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
+    static const char ref_sql[] =
+        "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
+        "candidate_id_json,created_ns,upload_status,minio_key) "
+        "VALUES(?,?,?,?,?,'local_manifest','') "
+        "ON CONFLICT(artifact_id) DO UPDATE SET fact_id=excluded.fact_id,"
+        "candidate_id_json=excluded.candidate_id_json,"
+        "created_ns=excluded.created_ns,upload_status=excluded.upload_status,"
+        "minio_key=excluded.minio_key;";
+    const PreparedContextRef *ref = &prepared->refs[i];
+    uint32_t candidate_index = ref->candidate_index;
+    sqlite3_stmt *st = NULL;
+    if (!candidate_ids[candidate_index][0] ||
+        sqlite3_prepare_v2(s_db, ref_sql, -1, &st, NULL) != SQLITE_OK) {
+      set_error("prepare context reference insert failed");
+      sqlite3_finalize(st);
+      sqlite_rollback_silent();
+      return -1;
+    }
+    bind_text(st, 1, ref->artifact_id);
+    bind_text(st, 2, candidate_ids[candidate_index]);
+    bind_text(st, 3, prepared->fact_id);
+    bind_text(st, 4, ref->candidate_id_json);
+    sqlite3_bind_int64(st, 5, written_ns);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+      set_error("insert context reference failed");
+      sqlite3_finalize(st);
+      sqlite_rollback_silent();
+      return -1;
+    }
+    sqlite3_finalize(st);
   }
   if (sqlite_commit_candidate_transaction() != 0) {
     sqlite_rollback_silent();
@@ -3498,28 +3635,32 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
                                                     EvidenceWriteClass write_class,
                                                     uint32_t *written) {
   PreparedContextArtifacts prepared;
-  uint32_t changes;
+  uint32_t budget_units;
+  uint32_t materialized_changes;
   if (written) *written = 0u;
   if (sqlite_prepare_context_artifacts(r, candidate_ids, candidate_count,
                                        &prepared) != 0) {
     return -1;
   }
-  changes = prepared.count;
-  if (changes == 0u) {
+  budget_units = (prepared.fact_insert || prepared.ref_count) ? 1u : 0u;
+  materialized_changes = prepared.ref_count;
+  if (budget_units == 0u) {
     sqlite_free_prepared_context_artifacts(&prepared);
     return 0;
   }
   if (!sqlite_size_budget_allow() ||
-      !sqlite_write_budget_allow(changes, ts, write_class)) {
+      !sqlite_write_budget_allow(budget_units, ts, write_class)) {
     sqlite_free_prepared_context_artifacts(&prepared);
     return -1;
   }
   if (sqlite_record_context_artifacts(r, candidate_ids, &prepared) != 0) {
-    sqlite_write_budget_release(changes, ts, write_class);
+    sqlite_write_budget_release(budget_units, ts, write_class);
     sqlite_free_prepared_context_artifacts(&prepared);
     return -1;
   }
-  if (written) *written = changes;
+  s_status.context_facts_written += prepared.fact_insert;
+  s_status.context_refs_written += prepared.ref_count;
+  if (written) *written = materialized_changes;
   sqlite_free_prepared_context_artifacts(&prepared);
   return 0;
 }
@@ -3546,6 +3687,202 @@ static int sqlite_commit_candidate_transaction(void) {
     return -1;
   }
   return 0;
+}
+
+static const char *legacy_context_source_identity(const char *artifact_id) {
+  static const char marker[] = ":post_context:";
+  const char *found = NULL;
+  const char *cursor = artifact_id;
+  if (!artifact_id) return NULL;
+  while ((cursor = strstr(cursor, marker)) != NULL) {
+    found = cursor + sizeof(marker) - 1u;
+    cursor = found;
+  }
+  if (!found || strlen(found) != 64u) return NULL;
+  for (const unsigned char *p = (const unsigned char *)found; *p; ++p) {
+    if (!isxdigit(*p)) return NULL;
+  }
+  return found;
+}
+
+/* Previously shipped databases stored one complete post-context JSON payload
+ * per candidate. Normalize those rows only after every fact and edge has been
+ * rebuilt in the same transaction. Reopening is therefore idempotent after a
+ * success and retries the untouched legacy rows after any failure. */
+static int sqlite_migrate_legacy_context_artifacts(void) {
+  static const char select_sql[] =
+      "SELECT a.artifact_id,a.endpoint_id,a.tenant_id,a.candidate_id,a.manifest_json,"
+      "a.created_ns,a.upload_status,a.minio_key FROM artifacts a "
+      "LEFT JOIN candidate_context_refs r ON r.artifact_id=a.artifact_id "
+      "WHERE a.artifact_type='post_context' AND "
+      "(r.artifact_id IS NULL OR a.created_ns>r.created_ns) "
+      "ORDER BY a.created_ns,a.artifact_id;";
+  static const char fact_sql[] =
+      "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,"
+      "created_ns,updated_ns) VALUES(?,?,?,?,?,?) "
+      "ON CONFLICT(fact_id) DO NOTHING;";
+  static const char normalize_sql[] =
+      "SELECT "
+      "CASE WHEN json_valid(?1) THEN json_type(?1,'$') END,"
+      "CASE WHEN json_valid(?1) THEN json_type(?1,'$.candidate_id') END,"
+      "CASE WHEN json_valid(?1) THEN json_extract(?1,'$.candidate_id') END,"
+      "CASE WHEN json_valid(?1) THEN "
+      "json_set(?1,'$.candidate_id',json('null')) END;";
+  static const char fact_lookup_sql[] =
+      "SELECT endpoint_id,tenant_id,manifest_template_json "
+      "FROM context_facts WHERE fact_id=?;";
+  static const char ref_sql[] =
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
+      "candidate_id_json,created_ns,upload_status,minio_key) VALUES(?,?,?,?,?,?,?) "
+      "ON CONFLICT(artifact_id) DO UPDATE SET "
+      "candidate_id=excluded.candidate_id,fact_id=excluded.fact_id,"
+      "candidate_id_json=excluded.candidate_id_json,"
+      "created_ns=MAX(candidate_context_refs.created_ns,excluded.created_ns),"
+      "upload_status=excluded.upload_status,minio_key=excluded.minio_key;";
+  sqlite3_stmt *select_st = NULL;
+  sqlite3_stmt *normalize_st = NULL;
+  sqlite3_stmt *fact_st = NULL;
+  sqlite3_stmt *fact_lookup_st = NULL;
+  sqlite3_stmt *ref_st = NULL;
+  int result = -1;
+  if (!s_db || exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+  if (sqlite3_prepare_v2(s_db, select_sql, -1, &select_st, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db, normalize_sql, -1, &normalize_st, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db, fact_sql, -1, &fact_st, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db, fact_lookup_sql, -1, &fact_lookup_st, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db, ref_sql, -1, &ref_st, NULL) != SQLITE_OK) {
+    set_error("prepare legacy context normalization failed");
+    goto done;
+  }
+  for (;;) {
+    int step = sqlite3_step(select_st);
+    if (step == SQLITE_DONE) break;
+    if (step != SQLITE_ROW) {
+      set_error("read legacy context artifact failed");
+      goto done;
+    }
+    const char *artifact_id = (const char *)sqlite3_column_text(select_st, 0);
+    const char *endpoint_id = (const char *)sqlite3_column_text(select_st, 1);
+    const char *tenant_id = (const char *)sqlite3_column_text(select_st, 2);
+    const char *candidate_id = (const char *)sqlite3_column_text(select_st, 3);
+    const char *manifest_json = (const char *)sqlite3_column_text(select_st, 4);
+    int manifest_bytes = sqlite3_column_bytes(select_st, 4);
+    sqlite3_int64 created_ns = sqlite3_column_int64(select_st, 5);
+    const char *upload_status = (const char *)sqlite3_column_text(select_st, 6);
+    const char *minio_key = (const char *)sqlite3_column_text(select_st, 7);
+    const char *source_identity = legacy_context_source_identity(artifact_id);
+    const char *manifest_template = NULL;
+    char fact_id[65];
+    char *candidate_json = NULL;
+    if (!artifact_id || !candidate_id || !candidate_id[0] || !source_identity) {
+      set_error("legacy context artifact identity invalid");
+      goto row_done;
+    }
+    if (sqlite3_column_type(select_st, 4) != SQLITE_TEXT || !manifest_json ||
+        manifest_bytes <= 0 ||
+        (size_t)manifest_bytes > EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+        !manifest_utf8_bytes_valid(manifest_json, (size_t)manifest_bytes)) {
+      set_error("legacy context manifest invalid");
+      goto row_done;
+    }
+    sqlite3_reset(normalize_st);
+    sqlite3_clear_bindings(normalize_st);
+    if (sqlite3_bind_text(normalize_st, 1, manifest_json, manifest_bytes,
+                          SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(normalize_st) != SQLITE_ROW) {
+      set_error("normalize legacy context manifest failed");
+      goto row_done;
+    }
+    {
+      const char *root_type = (const char *)sqlite3_column_text(normalize_st, 0);
+      const char *candidate_type = (const char *)sqlite3_column_text(normalize_st, 1);
+      const char *manifest_candidate =
+          (const char *)sqlite3_column_text(normalize_st, 2);
+      manifest_template = (const char *)sqlite3_column_text(normalize_st, 3);
+      if (!root_type || strcmp(root_type, "object") != 0 || !candidate_type ||
+          strcmp(candidate_type, "text") != 0 || !manifest_candidate ||
+          strcmp(manifest_candidate, candidate_id) != 0 || !manifest_template ||
+          sqlite3_column_bytes(normalize_st, 3) <= 0 ||
+          (size_t)sqlite3_column_bytes(normalize_st, 3) >
+              EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+          strstr(manifest_template, "\"candidate_id\":null") == NULL) {
+        set_error("legacy context manifest invalid");
+        goto row_done;
+      }
+    }
+    candidate_json = context_candidate_id_json(candidate_id);
+    if (!candidate_json ||
+        context_fact_id_for_identity(endpoint_id, tenant_id, source_identity,
+                                     manifest_template, fact_id) != 0) {
+      set_error("normalize legacy context manifest failed");
+      goto row_done;
+    }
+    sqlite3_reset(fact_st);
+    sqlite3_clear_bindings(fact_st);
+    bind_text(fact_st, 1, fact_id);
+    bind_text(fact_st, 2, endpoint_id ? endpoint_id : "");
+    bind_text(fact_st, 3, tenant_id ? tenant_id : "");
+    bind_text(fact_st, 4, manifest_template);
+    sqlite3_bind_int64(fact_st, 5, created_ns);
+    sqlite3_bind_int64(fact_st, 6, created_ns);
+    if (sqlite3_step(fact_st) != SQLITE_DONE) {
+      set_error("migrate legacy context fact failed");
+      goto row_done;
+    }
+    sqlite3_reset(fact_lookup_st);
+    sqlite3_clear_bindings(fact_lookup_st);
+    bind_text(fact_lookup_st, 1, fact_id);
+    if (sqlite3_step(fact_lookup_st) != SQLITE_ROW) {
+      set_error("verify migrated legacy context fact failed");
+      goto row_done;
+    }
+    {
+      const char *stored_endpoint =
+          (const char *)sqlite3_column_text(fact_lookup_st, 0);
+      const char *stored_tenant =
+          (const char *)sqlite3_column_text(fact_lookup_st, 1);
+      const char *stored_manifest =
+          (const char *)sqlite3_column_text(fact_lookup_st, 2);
+      if (!stored_endpoint || strcmp(stored_endpoint, endpoint_id ? endpoint_id : "") != 0 ||
+          !stored_tenant || strcmp(stored_tenant, tenant_id ? tenant_id : "") != 0 ||
+          !stored_manifest || strcmp(stored_manifest, manifest_template) != 0) {
+        set_error("legacy context fact hash collision");
+        goto row_done;
+      }
+    }
+    sqlite3_reset(ref_st);
+    sqlite3_clear_bindings(ref_st);
+    bind_text(ref_st, 1, artifact_id);
+    bind_text(ref_st, 2, candidate_id);
+    bind_text(ref_st, 3, fact_id);
+    bind_text(ref_st, 4, candidate_json);
+    sqlite3_bind_int64(ref_st, 5, created_ns);
+    bind_text(ref_st, 6, upload_status ? upload_status : "local_manifest");
+    bind_text(ref_st, 7, minio_key ? minio_key : "");
+    if (sqlite3_step(ref_st) != SQLITE_DONE) {
+      set_error("migrate legacy context reference failed");
+      goto row_done;
+    }
+    cJSON_free(candidate_json);
+    continue;
+
+row_done:
+    cJSON_free(candidate_json);
+    goto done;
+  }
+  if (exec_sql("COMMIT;") != 0) {
+    goto done;
+  }
+  result = 0;
+
+done:
+  sqlite3_finalize(ref_st);
+  sqlite3_finalize(fact_lookup_st);
+  sqlite3_finalize(fact_st);
+  sqlite3_finalize(normalize_st);
+  sqlite3_finalize(select_st);
+  if (result != 0) sqlite_rollback_silent();
+  return result;
 }
 
 /* A durable candidate is updated even after the small in-memory reuse window
@@ -3778,9 +4115,10 @@ static void sqlite_maintenance(void) {
   int64_t cutoff_minute = (cutoff / 1000000000LL) / 60LL;
   sqlite3_stmt *st = NULL;
   const char *tables[] = {"p0_candidates", "process_cache", "file_evidence", "network_ioc",
-                          "registry_evidence", "artifacts", "command_results"};
+                          "registry_evidence", "artifacts", "candidate_context_refs",
+                          "command_results"};
   const char *cols[] = {"event_time_ns", "last_seen_ns", "last_seen_ns", "last_seen_ns",
-                        "last_seen_ns", "created_ns", "updated_ns"};
+                        "last_seen_ns", "created_ns", "created_ns", "updated_ns"};
   for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
     char sql[160];
     snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
@@ -3805,6 +4143,12 @@ static void sqlite_maintenance(void) {
       s_status.db_retention_evicted += (uint64_t)changes;
     }
   }
+  if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
+               "SELECT 1 FROM candidate_context_refs "
+               "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") == 0) {
+    int changes = sqlite3_changes(s_db);
+    if (changes > 0) s_status.db_retention_evicted += (uint64_t)changes;
+  }
   if (db_size_over_limit()) {
     for (int pass = 0; pass < 4 && db_size_over_limit(); pass++) {
       if (exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);") == 0) {
@@ -3812,6 +4156,18 @@ static void sqlite_maintenance(void) {
         if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
       }
       if (exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);") == 0) {
+        int changes = sqlite3_changes(s_db);
+        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
+      }
+      if (exec_sql("DELETE FROM candidate_context_refs WHERE rowid IN ("
+                   "SELECT rowid FROM candidate_context_refs "
+                   "ORDER BY created_ns ASC LIMIT 1000);") == 0) {
+        int changes = sqlite3_changes(s_db);
+        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
+      }
+      if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
+                   "SELECT 1 FROM candidate_context_refs "
+                   "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") == 0) {
         int changes = sqlite3_changes(s_db);
         if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
       }
@@ -3972,6 +4328,31 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "artifact_type TEXT,path TEXT,sha256 TEXT,manifest_json TEXT,created_ns INTEGER,"
       "upload_status TEXT,minio_key TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_artifacts_ep_time ON artifacts(endpoint_id,created_ns);"
+      "CREATE TABLE IF NOT EXISTS context_facts ("
+      "fact_id TEXT PRIMARY KEY,endpoint_id TEXT,tenant_id TEXT,"
+      "manifest_template_json TEXT NOT NULL,created_ns INTEGER,updated_ns INTEGER);"
+      "CREATE INDEX IF NOT EXISTS idx_context_facts_ep_time "
+      "ON context_facts(endpoint_id,updated_ns);"
+      "CREATE TABLE IF NOT EXISTS candidate_context_refs ("
+      "artifact_id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,fact_id TEXT NOT NULL,"
+      "candidate_id_json TEXT NOT NULL,created_ns INTEGER,upload_status TEXT,minio_key TEXT,"
+      "UNIQUE(candidate_id,fact_id));"
+      "CREATE INDEX IF NOT EXISTS idx_candidate_context_refs_candidate "
+      "ON candidate_context_refs(candidate_id,created_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_candidate_context_refs_fact "
+      "ON candidate_context_refs(fact_id);"
+      "CREATE VIEW IF NOT EXISTS materialized_artifacts AS "
+      "SELECT artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,"
+      "manifest_json,created_ns,upload_status,minio_key FROM artifacts a "
+      "WHERE a.artifact_type<>'post_context' OR NOT EXISTS ("
+      "SELECT 1 FROM candidate_context_refs r WHERE r.artifact_id=a.artifact_id) "
+      "UNION ALL "
+      "SELECT r.artifact_id,f.endpoint_id,f.tenant_id,r.candidate_id,'post_context','','',"
+      "replace(f.manifest_template_json,'\"candidate_id\":null',"
+      "'\"candidate_id\":'||r.candidate_id_json),"
+      "CASE WHEN f.updated_ns>r.created_ns THEN f.updated_ns ELSE r.created_ns END,"
+      "r.upload_status,r.minio_key FROM candidate_context_refs r "
+      "JOIN context_facts f ON f.fact_id=r.fact_id;"
       "CREATE TABLE IF NOT EXISTS command_results ("
       "command_id TEXT PRIMARY KEY,command_type TEXT,status TEXT,execution_status INTEGER,"
       "exit_code INTEGER,detail TEXT,artifacts TEXT,updated_ns INTEGER);"
@@ -3999,7 +4380,8 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     return -1;
   }
   if (sqlite_ensure_process_cache_generation_columns() != 0 ||
-      sqlite_ensure_p0_candidate_columns() != 0) {
+      sqlite_ensure_p0_candidate_columns() != 0 ||
+      sqlite_migrate_legacy_context_artifacts() != 0) {
     evidence_cache_close_locked();
     evidence_cache_unlock();
     return -1;
@@ -5669,7 +6051,9 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
-           "\"p0_candidates\":{\"written\":%llu,\"rows\":%llu},\"artifacts\":{\"written\":%llu},"
+           "\"p0_candidates\":{\"written\":%llu,\"rows\":%llu},"
+           "\"artifacts\":{\"written\":%llu,\"context_facts_written\":%llu,"
+           "\"context_refs_written\":%llu},"
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
@@ -5750,6 +6134,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.p0_candidates_written,
            (unsigned long long)st.p0_candidate_rows,
            (unsigned long long)st.artifacts_written,
+           (unsigned long long)st.context_facts_written,
+           (unsigned long long)st.context_refs_written,
            (unsigned long long)st.command_results_written, st.metrics_minutes,
            (unsigned long long)st.file_coalesced,
            (unsigned long long)st.registry_coalesced,

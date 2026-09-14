@@ -568,7 +568,10 @@ static int edr_agent_run_main(const char *config) {
       fprintf(stderr, "edr_pmfe_init failed: %d\n", (int)pe);
     }
   }
-  edr_transport_init_from_config(edr_agent_get_config(agent));
+  if (!edr_transport_init_from_config(edr_agent_get_config(agent))) {
+    fprintf(stderr, "[transport] initialization failed; Agent cannot run without durable delivery\n");
+    return 1;
+  }
   {
     EdrError se =
         edr_shellcode_detector_init(edr_agent_get_config(agent), edr_agent_event_bus(agent));
@@ -592,6 +595,26 @@ static int edr_agent_run_main(const char *config) {
   edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
 #endif
   e = edr_agent_run(agent);
+  if (e != EDR_OK) {
+    fprintf(stderr, "[shutdown] Agent run/collector stop failed; retaining dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_ingest_http_stop_command_poll_timeout(10000u)) {
+    fprintf(stderr, "[shutdown] command transport threads are still active; preserving dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_command_delivery_shutdown_timeout(10000u)) {
+    fprintf(stderr, "[shutdown] result delivery thread is still active; preserving dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_command_executor_shutdown_timeout(30000u)) {
+    fprintf(stderr, "[shutdown] command workers did not stop after cancellation; preserving dependencies for process exit\n");
+    return 1;
+  }
+  if (!edr_preprocess_stop()) {
+    fprintf(stderr, "[shutdown] preprocessing did not finish; retaining dependencies for process exit\n");
+    return 1;
+  }
   {
     uint64_t dd = 0, rr = 0;
     edr_dedup_get_stats(&dd, &rr);
@@ -643,23 +666,14 @@ static int edr_agent_run_main(const char *config) {
       }
     }
   }
-  if (!edr_ingest_http_stop_command_poll_timeout(10000u)) {
-    fprintf(stderr, "[shutdown] command transport threads are still active; preserving dependencies for process exit\n");
-    return 1;
-  }
-  if (!edr_command_delivery_shutdown_timeout(10000u)) {
-    fprintf(stderr, "[shutdown] result delivery thread is still active; preserving dependencies for process exit\n");
-    return 1;
-  }
-  if (!edr_command_executor_shutdown_timeout(30000u)) {
-    fprintf(stderr, "[shutdown] command workers did not stop after cancellation; preserving dependencies for process exit\n");
-    return 1;
-  }
   edr_pmfe_shutdown();
   edr_shellcode_detector_shutdown();
   edr_webshell_detector_shutdown();
   edr_net_fanout_shutdown();
-  edr_transport_shutdown();
+  if (!edr_transport_shutdown()) {
+    fprintf(stderr, "[shutdown] telemetry worker remains active; retaining queue dependencies for process exit\n");
+    return 1;
+  }
   edr_local_evidence_cache_close();
   edr_storage_queue_close();
   edr_agent_destroy(agent);

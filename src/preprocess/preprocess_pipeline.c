@@ -18,6 +18,7 @@
 #include "edr/heartbeat.h"
 #include "edr/net_fanout_detector.h"
 #include "edr/ave_cross_engine_feed.h"
+#include "edr/ave_sdk.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/pid_history_pmfe.h"
 #include "edr/correlation_engine.h"
@@ -33,6 +34,7 @@
 #include "edr/windows_event_policy.h"
 #include "edr/process_create_coalescer.h"
 #include "edr/process_evidence_worker.h"
+#include "edr/process_evidence_pending.h"
 #include "edr/process_generation.h"
 #include "edr/windows_file_identity.h"
 
@@ -42,20 +44,22 @@
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <sddl.h>
 static HANDLE s_thread;
-static volatile LONG s_stop_preprocess;
 #else
 #include <pthread.h>
 #include <unistd.h>
 static pthread_t s_thread;
-static volatile int s_stop_preprocess;
 #endif
 
 static int s_preprocess_active;
+static atomic_int s_stop_preprocess;
+static atomic_int s_preprocess_exited = 1;
+static int s_preprocess_joined;
 
 static EdrEventBus *s_bus;
 static unsigned s_telemetry_sampling_pct = 100u;
@@ -1135,7 +1139,10 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
     n = edr_behavior_wire_encode(br, buf, sizeof(buf));
   }
   if (n > 0) {
-    (void)edr_event_batch_push(buf, n);
+    if (edr_event_batch_push(buf, n) != 0) {
+      fprintf(stderr, "[preprocess] batch admission failed event=%s; local evidence retained where eligible\n",
+              br->event_id);
+    }
   }
 }
 
@@ -1172,51 +1179,15 @@ static int p0_process_create_candidate(const EdrBehaviorRecord *br) {
 #endif
 }
 
-static void apply_process_evidence(EdrBehaviorRecord *br) {
 #ifdef _WIN32
-  EdrProcessEvidence requested;
-  EdrProcessEvidence evidence;
-  uint64_t generation;
-  int evidence_ready;
+static void apply_process_evidence_result(EdrBehaviorRecord *br, const EdrProcessEvidence *result) {
+  EdrProcessEvidence evidence = *result;
   int identity_evaluable;
-  const char *artifact_quality;
-  const char *artifact_reason;
+  const char *artifact_quality, *artifact_reason;
   char file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP * 2u];
   char hash_value[96], hash_quality[64], hash_reason[160], signature_status[64], signature_source[96];
   char signer[1024], thumbprint[192], revocation[64], signature_quality[64], signature_reason[160];
   int n;
-  if (!edr_behavior_has_process_actor(br)) {
-    return;
-  }
-  /* Never spend the bounded wait on ordinary process or file traffic.
-   * ProcessCreate uses the manifest-backed interest prefilter. File events
-   * reach this point only after their target path and exact actor generation
-   * have been bound, so require a complete authenticated-IR match before
-   * reusing or starting actor evidence work. FILE_CREATE/FILE_WRITE must not
-   * bypass this path: they are direct P0 sources and need the same actor-image
-   * identity as FILE_READ. */
-  if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_create_candidate(br)) ||
-      (br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br))) {
-    return;
-  }
-  generation = br->process_start_key;
-  memset(&requested, 0, sizeof(requested));
-  evidence_ready = edr_process_evidence_request(
-      br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
-      generation, edr_monotonic_ns(), &requested);
-  evidence = requested;
-  if (!evidence_ready &&
-      (strcmp(requested.hash_reason, "queued") == 0 ||
-       strcmp(requested.hash_reason, "identity_revalidation_pending") == 0)) {
-    evidence_ready = edr_process_evidence_wait(
-        br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
-        generation, edr_monotonic_ns(), 1000ULL * 1000000ULL, &evidence);
-  }
-  if (!evidence_ready && !evidence.file_identity[0]) {
-    snprintf(evidence.file_identity, sizeof(evidence.file_identity), "%s",
-             requested.file_identity);
-    evidence.file_write_time = requested.file_write_time;
-  }
   /* The worker owns one handle for this pathname snapshot, but that handle is
    * first opened after the ProcessCreate event.  Do not promote its hash into
    * the process image field: A may already be running while path P now names
@@ -1259,9 +1230,34 @@ static void apply_process_evidence(EdrBehaviorRecord *br) {
     snprintf(br->detection_context, sizeof(br->detection_context),
              "%s", "{\"evidence\":{\"omitted\":true,\"reason\":\"evidence_json_capacity\"}}");
   }
-#else
-  (void)br;
+}
 #endif
+
+static int apply_process_evidence(EdrBehaviorRecord *br, const EdrEventSlot *slot) {
+#ifdef _WIN32
+  EdrProcessEvidence evidence;
+  if (!edr_behavior_has_process_actor(br)) return 1;
+  if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_create_candidate(br)) ||
+      (br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br))) return 1;
+  uint64_t now = edr_monotonic_ns();
+  int ready = edr_process_evidence_request(
+      br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path,
+      br->process_start_key, now, &evidence);
+  if (!ready && (strcmp(evidence.hash_reason, "queued") == 0 ||
+                 strcmp(evidence.hash_reason, "identity_revalidation_pending") == 0)) {
+    if (!atomic_load(&s_stop_preprocess) &&
+        edr_process_evidence_pending_add(br, slot, &evidence, now)) return 0;
+    const char *reason = atomic_load(&s_stop_preprocess)
+        ? "shutdown_cancelled" : "preprocess_evidence_backpressure";
+    snprintf(evidence.hash_reason, sizeof(evidence.hash_reason), "%s", reason);
+    snprintf(evidence.signature_reason, sizeof(evidence.signature_reason), "%s", reason);
+    fprintf(stderr, "[preprocess] optional evidence unavailable reason=%s event=%s\n", reason, br->event_id);
+  }
+  apply_process_evidence_result(br, &evidence);
+#else
+  (void)br; (void)slot;
+#endif
+  return 1;
 }
 
 /* Resource pressure may shed ordinary telemetry, but it is never authority to
@@ -1325,6 +1321,7 @@ static int p0_file_read_evaluation_ready(void) {
 #endif
 
 static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
+static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
 
 static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   if (slot && slot->attack_surface_hint) {
@@ -1346,15 +1343,17 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
    * not to a pathname artifact reopened after ProcessCreate. */
   enrich_process_integrity_context(&br);
   edr_local_evidence_cache_observe_process(&br);
-  apply_process_evidence(&br);
+  if (!apply_process_evidence(&br, slot)) return;
+  process_enriched_record(br, slot);
+}
+
+/* Continue from the original captured actor, not a fresh PID/path lookup. */
+static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_behavior_enrich_file_activity(&br);
   edr_windows_event_policy_apply(&br);
-  /* The legacy PMFE history is PID-indexed. A failed network actor bind
-   * must not borrow a memory-scan snapshot from another PID lifetime. */
-  if ((br.type != EDR_EVENT_NET_CONNECT && br.type != EDR_EVENT_NET_LISTEN) ||
-      (br.process_start_key != 0u && br.process_creation_filetime_100ns != 0u))
-    edr_pid_history_pmfe_fill_record(&br);
+  /* The history owner validates the exact generation for every event family. */
+  edr_pid_history_pmfe_fill_record(&br);
 #ifdef _WIN32
   {
     const char *file_read_reason = p0_file_read_unavailable_reason(&br);
@@ -1414,6 +1413,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
    * or chain enrichment would silently erase valid file/process P0 inputs. */
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u && p0_resource_throttle_proven_miss(&br)) {
+    edr_local_evidence_cache_record_behavior(&br);
     return;
   }
   /* P0 owns its hard-invalid, registry-attribution, internal-command, and
@@ -1425,30 +1425,12 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
   {
     EdrDetectionDecision dd;
     edr_detection_decision_evaluate(&br, &dd);
-    if (dd.drop) {
-      edr_local_evidence_cache_record_behavior(&br);
-      return;
-    }
-    /* EQS enforcement：低上传价值（local_only）不投递平台，仅进本地证据缓存
-     * （普通事件在缓存内 coalesce → 由 behavior_summary 周期性以一条摘要替代逐条）。
-     * 仅 emit_context / emit_alert 继续走候选与上传路径。drop 已在上面拦下。 */
-    if (dd.selection_action[0] != '\0' && strcmp(dd.selection_action, "local_only") == 0) {
-      edr_local_evidence_cache_record_behavior(&br);
-      return;
-    }
+    if (!edr_preprocess_admit_telemetry(&br, &dd)) return;
   }
-  if (!edr_preprocess_should_emit(&br)) {
-    if (p0_emitted > 0) {
-      edr_local_evidence_cache_record_behavior(&br);
-    }
-    return;
-  }
-  edr_local_evidence_cache_record_behavior(&br);
   edr_pmfe_on_preprocess_slot(slot, &br);
   /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */
-  if (edr_windows_event_policy_should_emit(&br)) {
-    edr_ave_cross_engine_feed_from_record(&br);
-  }
+  /* should_emit already applied this policy to the unchanged record. */
+  edr_ave_cross_engine_feed_from_record(&br);
   (void)edr_command_dispatch_recommended_forensics(&br);
   if (!edr_local_evidence_cache_is_candidate(&br)) {
     return;
@@ -1462,6 +1444,20 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
   emit_behavior_record(&br);
 }
 
+static void poll_pending_process_evidence(void) {
+#ifdef _WIN32
+  EdrBehaviorRecord record;
+  EdrEventSlot slot;
+  EdrProcessEvidence evidence;
+  int has_slot;
+  while (edr_process_evidence_pending_take(edr_monotonic_ns(),
+      atomic_load(&s_stop_preprocess), &record, &slot, &has_slot, &evidence)) {
+    apply_process_evidence_result(&record, &evidence);
+    process_enriched_record(record, has_slot ? &slot : NULL);
+  }
+#endif
+}
+
 static void process_pending_process_creates(void) {
 #ifdef _WIN32
   EdrBehaviorRecord ready;
@@ -1470,6 +1466,14 @@ static void process_pending_process_creates(void) {
      * NOT_EVALUABLE path when Security 4688 never arrives. */
     process_one_record(ready, NULL);
   }
+#endif
+}
+
+static void drain_stopping_process_creates(void) {
+#ifdef _WIN32
+  EdrBehaviorRecord ready;
+  while (edr_process_coalescer_drain_stopping(&ready))
+    process_one_record(ready, NULL);
 #endif
 }
 
@@ -1612,13 +1616,13 @@ static void *preprocess_main(void *arg) {
   (void)arg;
   for (;;) {
     edr_health_beat(EDR_HEALTH_PREPROCESS);
+    poll_pending_process_evidence();
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
       process_one_slot(&slot);
       process_pending_process_creates();
       poll_p0_source_only_durable_retry();
       edr_event_batch_poll_timeout();
-      edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
       edr_correlation_poll_maintenance(0); /* 内部节流；同预处理线程，满足契约 */
       poll_summary_flush();
@@ -1627,7 +1631,6 @@ static void *preprocess_main(void *arg) {
     edr_event_batch_poll_timeout();
     process_pending_process_creates();
     poll_p0_source_only_durable_retry();
-    edr_storage_queue_poll_drain();
     edr_local_evidence_cache_poll_maintenance();
     edr_correlation_poll_maintenance(0); /* 空闲期兜底排空注入 + 定期清扫 */
     poll_summary_flush();
@@ -1637,7 +1640,6 @@ static void *preprocess_main(void *arg) {
         process_one_slot(&slot);
       }
       poll_p0_source_only_durable_retry();
-      edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
@@ -1648,16 +1650,21 @@ static void *preprocess_main(void *arg) {
         process_one_slot(&slot);
       }
       poll_p0_source_only_durable_retry();
-      edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
     (void)edr_event_bus_wait(s_bus, 10u);
 #endif
   }
+  /* Stop may have arrived after this iteration's first completion poll. */
+  drain_stopping_process_creates();
+  poll_pending_process_evidence();
+  poll_p0_source_only_durable_retry();
 #ifdef _WIN32
+  atomic_store(&s_preprocess_exited, 1);
   return 0;
 #else
+  atomic_store(&s_preprocess_exited, 1);
   return NULL;
 #endif
 }
@@ -1668,7 +1675,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
     return EDR_ERR_INVALID_ARG;
   }
   if (s_preprocess_active) {
-    return EDR_OK;
+    return atomic_load(&s_stop_preprocess) ? EDR_ERR_INTERNAL : EDR_OK;
   }
   if (!cfg) {
     edr_config_apply_defaults(&defaults);
@@ -1701,6 +1708,8 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
+  s_preprocess_joined = 0;
+  atomic_store(&s_preprocess_exited, 0);
 #ifdef _WIN32
   s_stop_preprocess = 0;
   s_thread = CreateThread(NULL, 0, preprocess_main, NULL, 0, NULL);
@@ -1742,29 +1751,47 @@ void edr_preprocess_copy_agent_ids(char *endpoint_id, size_t endpoint_cap, char 
   }
 }
 
-void edr_preprocess_stop(void) {
+int edr_preprocess_stop(void) {
   if (!s_preprocess_active) {
-    return;
+    return 1;
   }
-#ifdef _WIN32
-  InterlockedExchange(&s_stop_preprocess, 1);
+  atomic_store(&s_stop_preprocess, 1);
   edr_event_bus_wake(s_bus);
-  if (s_thread) {
-    WaitForSingleObject(s_thread, 60000);
+  if (!s_preprocess_joined) {
+#ifdef _WIN32
+    if (WaitForSingleObject(s_thread, 60000) != WAIT_OBJECT_0) {
+      fprintf(stderr, "[preprocess] shutdown timed out; retaining worker dependencies\n");
+      return 0;
+    }
     CloseHandle(s_thread);
     s_thread = NULL;
-  }
 #else
-  s_stop_preprocess = 1;
-  edr_event_bus_wake(s_bus);
-  pthread_join(s_thread, NULL);
+    uint64_t deadline = edr_monotonic_ns() + 60000000000ULL;
+    while (!atomic_load(&s_preprocess_exited) && edr_monotonic_ns() < deadline) {
+      struct timespec delay = {0, 1000000L};
+      nanosleep(&delay, NULL);
+    }
+    if (!atomic_load(&s_preprocess_exited) || pthread_join(s_thread, NULL) != 0) {
+      fprintf(stderr, "[preprocess] shutdown timed out; retaining worker dependencies\n");
+      return 0;
+    }
 #endif
+    s_preprocess_joined = 1;
+  }
+  if (AVE_DrainBehaviorMonitor(30000u) != AVE_OK) {
+    fprintf(stderr, "[preprocess] shutdown timed out: AVE still owns the batch sink\n");
+    return 0;
+  }
+  if (edr_event_batch_shutdown() != 0) {
+    fprintf(stderr, "[preprocess] shutdown failed: pending batch has no durable owner\n");
+    return 0;
+  }
   s_bus = NULL;
   edr_process_evidence_worker_stop();
   edr_process_coalescer_reset();
   s_preprocess_active = 0;
   edr_pt_cache_shutdown();
-  edr_event_batch_shutdown();
   edr_emit_rules_configure(NULL);
   edr_dedup_reset();
+  return 1;
 }

@@ -396,6 +396,78 @@ static void sqlite_exec_create_legacy_cache(const char *path) {
   assert(sqlite3_close(db) == SQLITE_OK);
 }
 
+static void sqlite_exec_create_legacy_context_artifacts(const char *path,
+                                                        int include_invalid) {
+  sqlite3 *db = NULL;
+  char *error = NULL;
+  const char *schema =
+      "CREATE TABLE artifacts ("
+      "artifact_id TEXT PRIMARY KEY,endpoint_id TEXT,tenant_id TEXT,candidate_id TEXT,"
+      "artifact_type TEXT,path TEXT,sha256 TEXT,manifest_json TEXT,created_ns INTEGER,"
+      "upload_status TEXT,minio_key TEXT);";
+  const char *rows =
+      "INSERT INTO artifacts VALUES("
+      "'legacy-a:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+      "'ep-legacy-context','tenant','legacy-a','post_context','','',"
+      "'{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-a\","
+      "\"event_time_ns\":9007199254740993,"
+      "\"source_event_id\":\"legacy-source\",\"source_completeness\":\"COMPLETE\"}',"
+      "9000000000000000100,'local_manifest','');"
+      "INSERT INTO artifacts VALUES("
+      "'legacy-b:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+      "'ep-legacy-context','tenant','legacy-b','post_context','','',"
+      "'{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-b\","
+      "\"source_event_id\":\"legacy-source\","
+      "\"source_completeness\":\"CORRELATION_MISSING\"}',"
+      "9000000000000000101,'local_manifest','');"
+      "INSERT INTO artifacts VALUES("
+      "'legacy-c:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+      "'ep-legacy-context','tenant','legacy-c','post_context','','',"
+      "'{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-c\","
+      "\"event_time_ns\":9007199254740993,"
+      "\"source_event_id\":\"legacy-source\",\"source_completeness\":\"COMPLETE\"}',"
+      "9000000000000000102,'local_manifest','');";
+  const char *invalid_row =
+      "INSERT INTO artifacts VALUES("
+      "'legacy-invalid:post_context:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',"
+      "'ep-legacy-context','tenant','legacy-invalid','post_context','','',"
+      "'{\"schema\":\"p0_post_context_event.v1\",\"source_event_id\":\"bad\"}',"
+      "9000000000000000103,'local_manifest','');";
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_exec(db, schema, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  error = NULL;
+  assert(sqlite3_exec(db, rows, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  error = NULL;
+  if (include_invalid) {
+    assert(sqlite3_exec(db, invalid_row, NULL, NULL, &error) == SQLITE_OK);
+    sqlite3_free(error);
+  }
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static void sqlite_set_legacy_context_manifest(const char *path,
+                                               const char *candidate_id,
+                                               const char *manifest,
+                                               size_t manifest_len) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db, "UPDATE artifacts SET manifest_json=? WHERE candidate_id=?;",
+             -1, &stmt, NULL) == SQLITE_OK);
+  assert(manifest_len <= (size_t)INT32_MAX);
+  assert(sqlite3_bind_text(stmt, 1, manifest, (int)manifest_len,
+                           SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 2, candidate_id, -1, SQLITE_TRANSIENT) ==
+         SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_DONE);
+  assert(sqlite3_changes(db) == 1);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
 static void sqlite_candidate_id_for_source_event(const char *path, const char *source_event_id,
                                                  char *out, size_t out_cap) {
   sqlite3 *db = NULL;
@@ -470,7 +542,8 @@ static uint64_t sqlite_post_artifact_count(const char *path, const char *candida
   uint64_t count = 0u;
   assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
   assert(sqlite3_prepare_v2(db,
-      "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      "SELECT manifest_json FROM " EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW " "
+      "WHERE artifact_type='post_context' AND candidate_id=?;",
       -1, &stmt, NULL) == SQLITE_OK);
   assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
   while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -498,7 +571,8 @@ static void sqlite_assert_post_artifact_completeness(const char *path,
   unsigned matches = 0u;
   assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
   assert(sqlite3_prepare_v2(db,
-      "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      "SELECT manifest_json FROM " EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW " "
+      "WHERE artifact_type='post_context' AND candidate_id=?;",
       -1, &stmt, NULL) == SQLITE_OK);
   assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
   while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -521,13 +595,37 @@ static void sqlite_assert_post_artifact_completeness(const char *path,
   assert(matches == 1u);
 }
 
+static void sqlite_assert_materialized_manifest_contains(const char *path,
+                                                         const char *candidate_id,
+                                                         const char *expected) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  const char *manifest;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(
+             db,
+             "SELECT manifest_json FROM "
+             EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW
+             " WHERE artifact_type='post_context' AND candidate_id=?;",
+             -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) ==
+         SQLITE_OK);
+  assert(sqlite3_step(stmt) == SQLITE_ROW);
+  manifest = (const char *)sqlite3_column_text(stmt, 0);
+  assert(manifest && strstr(manifest, expected) != NULL);
+  assert(sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
 static uint64_t sqlite_post_artifact_total(const char *path, const char *candidate_id) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
   uint64_t count = 0u;
   assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
   assert(sqlite3_prepare_v2(db,
-      "SELECT COUNT(*) FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      "SELECT COUNT(*) FROM " EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW " "
+      "WHERE artifact_type='post_context' AND candidate_id=?;",
       -1, &stmt, NULL) == SQLITE_OK);
   assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
   assert(sqlite3_step(stmt) == SQLITE_ROW);
@@ -541,7 +639,9 @@ static void sqlite_assert_all_artifact_manifests_parse(const char *path) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
   assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
-  assert(sqlite3_prepare_v2(db, "SELECT manifest_json FROM artifacts;", -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT manifest_json FROM "
+                                EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW ";",
+                            -1, &stmt, NULL) == SQLITE_OK);
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     const char *manifest = (const char *)sqlite3_column_text(stmt, 0);
     cJSON *json = cJSON_Parse(manifest ? manifest : "");
@@ -728,6 +828,146 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   (void)remove("local_evidence_cache_commit_failure.sqlite-shm");
 }
 
+static void test_legacy_post_context_normalizes_without_losing_variants(void) {
+  const char *db = "local_evidence_cache_legacy_context.sqlite";
+  (void)remove(db);
+  (void)remove("local_evidence_cache_legacy_context.sqlite-wal");
+  (void)remove("local_evidence_cache_legacy_context.sqlite-shm");
+  sqlite_exec_create_legacy_context_artifacts(db, 0);
+
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  /* Legacy rows remain available to an older binary; the materialized view
+   * suppresses their normalized duplicates. */
+  assert(sqlite_table_count(db, "artifacts") == 3u);
+  assert(sqlite_table_count(db, "context_facts") == 2u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 3u);
+  assert(sqlite_table_count(db,
+                            EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) == 3u);
+  sqlite_assert_post_artifact_completeness(db, "legacy-a", "legacy-source",
+                                           "COMPLETE");
+  sqlite_assert_post_artifact_completeness(db, "legacy-b", "legacy-source",
+                                           "CORRELATION_MISSING");
+  sqlite_assert_post_artifact_completeness(db, "legacy-c", "legacy-source",
+                                           "COMPLETE");
+  sqlite_assert_materialized_manifest_contains(
+      db, "legacy-a", "\"event_time_ns\":9007199254740993");
+  sqlite_assert_materialized_manifest_contains(
+      db, "legacy-a", "\"candidate_id\":\"legacy-a\"");
+  edr_local_evidence_cache_close();
+
+  /* Simulate a newer normalized enrichment, then an older binary adding one
+   * legacy row while downgraded. Reopen must not let the retained older B row
+   * overwrite its newer ref, but must import the genuinely new D row. */
+  {
+    sqlite3 *raw = NULL;
+    char *error = NULL;
+    const char *sql =
+        "UPDATE candidate_context_refs SET "
+        "fact_id=(SELECT fact_id FROM candidate_context_refs WHERE candidate_id='legacy-a'),"
+        "created_ns=9000000000000000200 WHERE candidate_id='legacy-b';"
+        "INSERT INTO artifacts VALUES("
+        "'legacy-d:post_context:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',"
+        "'ep-legacy-context','tenant','legacy-d','post_context','','',"
+        "'{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-d\","
+        "\"source_event_id\":\"legacy-downgrade-source\","
+        "\"source_completeness\":\"COMPLETE\"}',"
+        "9000000000000000104,'local_manifest','');";
+    assert(sqlite3_open(db, &raw) == SQLITE_OK);
+    assert(sqlite3_exec(raw, sql, NULL, NULL, &error) == SQLITE_OK);
+    sqlite3_free(error);
+    assert(sqlite3_close(raw) == SQLITE_OK);
+  }
+
+  /* Reopen is idempotent for prior rows and imports the downgrade row. */
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(sqlite_table_count(db, "context_facts") == 2u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 4u);
+  assert(sqlite_table_count(db,
+                            EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) == 4u);
+  sqlite_assert_post_artifact_completeness(db, "legacy-d",
+                                           "legacy-downgrade-source", "COMPLETE");
+  sqlite_assert_post_artifact_completeness(db, "legacy-b", "legacy-source",
+                                           "COMPLETE");
+  edr_local_evidence_cache_close();
+  (void)remove(db);
+  (void)remove("local_evidence_cache_legacy_context.sqlite-wal");
+  (void)remove("local_evidence_cache_legacy_context.sqlite-shm");
+}
+
+static void test_legacy_context_corrupt_fact_blocks_reference(void) {
+  const char *db = "local_evidence_cache_corrupt_context_fact.sqlite";
+  sqlite3 *raw = NULL;
+  char *error = NULL;
+  const char *corrupt_sql =
+      "UPDATE context_facts SET manifest_template_json="
+      "'{\"candidate_id\":null,\"corrupt\":true}' WHERE fact_id=("
+      "SELECT fact_id FROM candidate_context_refs WHERE candidate_id='legacy-b');"
+      "DELETE FROM candidate_context_refs WHERE candidate_id='legacy-b';";
+  cleanup_test_sqlite_path(db);
+  sqlite_exec_create_legacy_context_artifacts(db, 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_local_evidence_cache_close();
+
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw, corrupt_sql, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == -1);
+  assert(sqlite_table_count(db, "context_facts") == 2u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 2u);
+  cleanup_test_sqlite_path(db);
+}
+
+static void test_malformed_legacy_context_manifests_are_rejected(void) {
+  static const char syntax_error[] =
+      "{\"candidate_id\":\"legacy-b\",}";
+  static const char trailing_data[] =
+      "{\"candidate_id\":\"legacy-b\"} trailing";
+  static const char invalid_utf8[] =
+      "{\"candidate_id\":\"legacy-b\",\"path\":\"\xc3(" "\"}";
+  static const struct {
+    const char *path;
+    const char *manifest;
+    size_t length;
+  } cases[] = {
+      {"local_evidence_cache_legacy_syntax.sqlite", syntax_error,
+       sizeof(syntax_error) - 1u},
+      {"local_evidence_cache_legacy_trailing.sqlite", trailing_data,
+       sizeof(trailing_data) - 1u},
+      {"local_evidence_cache_legacy_utf8.sqlite", invalid_utf8,
+       sizeof(invalid_utf8) - 1u},
+  };
+  for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    cleanup_test_sqlite_path(cases[i].path);
+    sqlite_exec_create_legacy_context_artifacts(cases[i].path, 0);
+    sqlite_set_legacy_context_manifest(cases[i].path, "legacy-b",
+                                       cases[i].manifest, cases[i].length);
+    assert(edr_local_evidence_cache_open(cases[i].path, 8u, 24u) == -1);
+    assert(sqlite_table_count(cases[i].path, "context_facts") == 0u);
+    assert(sqlite_table_count(cases[i].path, "candidate_context_refs") == 0u);
+    cleanup_test_sqlite_path(cases[i].path);
+  }
+}
+
+static void test_invalid_legacy_post_context_rolls_back_normalization(void) {
+  const char *db = "local_evidence_cache_invalid_legacy_context.sqlite";
+  (void)remove(db);
+  (void)remove("local_evidence_cache_invalid_legacy_context.sqlite-wal");
+  (void)remove("local_evidence_cache_invalid_legacy_context.sqlite-shm");
+  sqlite_exec_create_legacy_context_artifacts(db, 1);
+
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == -1);
+  /* Schema creation is additive, but all data movement rolls back together:
+   * valid rows processed before the malformed row remain in legacy storage. */
+  assert(sqlite_table_count(db, "artifacts") == 4u);
+  assert(sqlite_table_count(db, "context_facts") == 0u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 0u);
+  (void)remove(db);
+  (void)remove("local_evidence_cache_invalid_legacy_context.sqlite-wal");
+  (void)remove("local_evidence_cache_invalid_legacy_context.sqlite-shm");
+}
+
 static void test_context_write_budget_cannot_starve_later_candidate(void) {
   const char *db = "local_evidence_cache_write_budget.sqlite";
   struct timespec ts;
@@ -857,6 +1097,7 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   EdrBehaviorRecord candidate_a;
   EdrBehaviorRecord candidate_b;
   EdrBehaviorRecord context;
+  EdrEvidenceCacheStatus before_context;
   EdrEvidenceCacheStatus before_replay;
   EdrEvidenceCacheStatus after_replay;
   EdrEvidenceCacheStatus after_update;
@@ -898,8 +1139,9 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
                                        sizeof(candidate_a_id));
   sqlite_candidate_id_for_source_event(db, "replay-candidate-b", candidate_b_id,
                                        sizeof(candidate_b_id));
+  edr_local_evidence_cache_get_status(&before_context);
 
-  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "2");
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "1");
   context = candidate_a;
   context.priority = 1u;
   context.type = EDR_EVENT_PROCESS_CREATE;
@@ -913,13 +1155,17 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
            "CORRELATION_MISSING");
   assert(edr_local_evidence_cache_is_candidate(&context) == 0);
 
-  /* One source event belongs to two candidate windows, so its first durable
-   * version is one atomic two-unit change. */
+  /* One immutable fact plus two bounded candidate edges is one atomic
+   * normalized payload admission, not two duplicated payload writes. */
   edr_local_evidence_cache_record_behavior(&context);
   edr_local_evidence_cache_get_status(&before_replay);
   assert(before_replay.candidate_admitted == 2u);
   assert(before_replay.candidate_rejected == 0u);
-  assert(before_replay.write_budget_critical_context_used == 2u);
+  assert(before_replay.write_budget_critical_context_used == 1u);
+  assert(before_replay.context_facts_written ==
+         before_context.context_facts_written + 1u);
+  assert(before_replay.context_refs_written ==
+         before_context.context_refs_written + 2u);
   assert(sqlite_post_artifact_count(db, candidate_a_id, "post-context-replay") == 1u);
   assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-replay") == 1u);
 
@@ -935,25 +1181,29 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   assert(sqlite_post_artifact_count(db, candidate_a_id, "post-context-replay") == 1u);
   assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-replay") == 1u);
 
-  /* The identity is unchanged but the manifest is richer. Both candidate
-   * copies must update atomically and consume exactly two more units. */
+  /* The identity is unchanged but the manifest is richer. Store an immutable
+   * new fact version and repoint both edges atomically for one payload unit. */
   snprintf(context.source_completeness, sizeof(context.source_completeness), "COMPLETE");
   edr_local_evidence_cache_record_behavior(&context);
   edr_local_evidence_cache_get_status(&after_update);
-  assert(after_update.write_budget_critical_context_used == 4u);
+  assert(after_update.write_budget_critical_context_used == 2u);
+  assert(after_update.context_facts_written ==
+         before_context.context_facts_written + 2u);
+  assert(after_update.context_refs_written ==
+         before_context.context_refs_written + 4u);
   assert(after_update.artifacts_written == after_replay.artifacts_written + 2u);
   sqlite_assert_post_artifact_completeness(db, candidate_a_id, "post-context-replay",
                                            "COMPLETE");
   sqlite_assert_post_artifact_completeness(db, candidate_b_id, "post-context-replay",
                                            "COMPLETE");
 
-  /* Critical limit is base*2 == 4. A new two-candidate artifact cannot fit;
+  /* Critical limit is base*2 == 2. A new normalized fact cannot fit;
    * budget rejection must leave neither candidate with a partial row. */
   context.event_time_ns++;
   snprintf(context.event_id, sizeof(context.event_id), "post-context-over-budget");
   edr_local_evidence_cache_record_behavior(&context);
   edr_local_evidence_cache_get_status(&after_exhaustion);
-  assert(after_exhaustion.write_budget_critical_context_used == 4u);
+  assert(after_exhaustion.write_budget_critical_context_used == 2u);
   assert(after_exhaustion.write_budget_critical_context_dropped ==
          after_update.write_budget_critical_context_dropped + 1u);
   assert(after_exhaustion.artifacts_written == after_update.artifacts_written);
@@ -967,6 +1217,128 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   (void)remove(db);
   (void)remove("local_evidence_cache_post_context_replay.sqlite-wal");
   (void)remove("local_evidence_cache_post_context_replay.sqlite-shm");
+}
+
+static void test_shared_context_fanout_uses_unique_fact_budget(void) {
+  const char *db = "local_evidence_cache_shared_context_fanout.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  EdrBehaviorRecord context;
+  EdrEvidenceCacheStatus baseline;
+  EdrEvidenceCacheStatus after_quota;
+  EdrEvidenceCacheStatus after_drop;
+  EdrEvidenceCacheStatus before_failure;
+  EdrEvidenceCacheStatus after_failure;
+  EdrEvidenceCacheStatus after_retry;
+  char candidate_ids[20][160];
+  uint64_t baseline_facts;
+  uint64_t baseline_refs;
+  uint64_t baseline_materialized;
+  int64_t base;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_shared_context_fanout.sqlite-wal");
+  (void)remove("local_evidence_cache_shared_context_fanout.sqlite-shm");
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "0");
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 16u, 24u) == 0);
+
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74301u;
+  candidate.event_time_ns = base;
+  candidate.process_start_key = UINT64_C(0x74301);
+  candidate.process_creation_filetime_100ns = UINT64_C(133700000000074301);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-shared-fanout");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  candidate.net_dport = 445u;
+  for (unsigned i = 0u; i < 20u; ++i) {
+    candidate.event_time_ns = base + (int64_t)i * 1000LL;
+    snprintf(candidate.event_id, sizeof(candidate.event_id), "fanout-candidate-%u", i);
+    snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.3.%u", i + 1u);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    sqlite_candidate_id_for_source_event(db, candidate.event_id, candidate_ids[i],
+                                         sizeof(candidate_ids[i]));
+  }
+  edr_local_evidence_cache_get_status(&baseline);
+  baseline_facts = sqlite_table_count(db, "context_facts");
+  baseline_refs = sqlite_table_count(db, "candidate_context_refs");
+  baseline_materialized = sqlite_table_count(
+      db, EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW);
+
+  /* Critical quota is four. Twenty associations per source remain bounded by
+   * the context-window table but consume one unique-fact unit per event. */
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "2");
+  context = candidate;
+  context.priority = 1u;
+  context.type = EDR_EVENT_PROCESS_CREATE;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
+  snprintf(context.process_name, sizeof(context.process_name), "parent-helper.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "parent-helper.exe --benign");
+  assert(edr_local_evidence_cache_is_candidate(&context) == 0);
+  for (unsigned i = 0u; i < 4u; ++i) {
+    context.event_time_ns = base + 1000000LL + (int64_t)i;
+    snprintf(context.event_id, sizeof(context.event_id), "fanout-context-%u", i);
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+  edr_local_evidence_cache_get_status(&after_quota);
+  assert(after_quota.write_budget_critical_context_used == 4u);
+  assert(after_quota.context_facts_written == baseline.context_facts_written + 4u);
+  assert(after_quota.context_refs_written == baseline.context_refs_written + 80u);
+  assert(after_quota.artifacts_written == baseline.artifacts_written + 80u);
+  assert(sqlite_table_count(db, "context_facts") == baseline_facts + 4u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 80u);
+  assert(sqlite_table_count(db,
+                            EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) ==
+         baseline_materialized + 80u);
+  for (unsigned i = 0u; i < 20u; ++i) {
+    assert(sqlite_post_artifact_count(db, candidate_ids[i], "fanout-context-3") == 1u);
+  }
+
+  context.event_time_ns++;
+  snprintf(context.event_id, sizeof(context.event_id), "fanout-context-over-quota");
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&after_drop);
+  assert(after_drop.write_budget_critical_context_used == 4u);
+  assert(after_drop.write_budget_critical_context_dropped ==
+         after_quota.write_budget_critical_context_dropped + 1u);
+  assert(after_drop.context_facts_written == after_quota.context_facts_written);
+  assert(after_drop.context_refs_written == after_quota.context_refs_written);
+
+  /* The fact and all twenty refs share the commit boundary. */
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "0");
+  context.event_time_ns++;
+  snprintf(context.event_id, sizeof(context.event_id), "fanout-context-commit-failure");
+  edr_local_evidence_cache_get_status(&before_failure);
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&after_failure);
+  assert(after_failure.context_facts_written == before_failure.context_facts_written);
+  assert(after_failure.context_refs_written == before_failure.context_refs_written);
+  assert(sqlite_table_count(db, "context_facts") == baseline_facts + 4u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 80u);
+  for (unsigned i = 0u; i < 20u; ++i) {
+    assert(sqlite_post_artifact_count(db, candidate_ids[i],
+                                      "fanout-context-commit-failure") == 0u);
+  }
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&after_retry);
+  assert(after_retry.context_facts_written == before_failure.context_facts_written + 1u);
+  assert(after_retry.context_refs_written == before_failure.context_refs_written + 20u);
+  for (unsigned i = 0u; i < 20u; ++i) {
+    assert(sqlite_post_artifact_count(db, candidate_ids[i],
+                                      "fanout-context-commit-failure") == 1u);
+  }
+
+  edr_local_evidence_cache_close();
+  test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_shared_context_fanout.sqlite-wal");
+  (void)remove("local_evidence_cache_shared_context_fanout.sqlite-shm");
 }
 
 /* A generation-less enrichment record and its later live-generation copy are
@@ -1059,7 +1431,9 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
   assert(status.write_budget_ordinary_context_dropped >= 1u);
   assert(status.write_budget_candidate_dropped == 0u);
   assert(sqlite_table_count(db, "p0_candidates") == 2u);
-  assert(sqlite_table_count(db, "artifacts") == 5u);
+  assert(sqlite_table_count(db, "artifacts") == 2u);
+  assert(sqlite_table_count(db,
+                            EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) == 5u);
 
   edr_local_evidence_cache_close();
   sqlite_candidate_id_for_source_event(db, "", candidate_id, sizeof(candidate_id));
@@ -1969,7 +2343,9 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
     sqlite3_stmt *st = NULL;
     assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
     assert(sqlite3_prepare_v2(
-               raw, "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context';",
+               raw, "SELECT manifest_json FROM "
+                    EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW " "
+                    "WHERE artifact_type='post_context';",
                -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_step(st) == SQLITE_ROW);
     assert_manifest_generation((const char *)sqlite3_column_text(st, 0), start_key_text,
@@ -3633,8 +4009,13 @@ int main(void) {
   test_identity_status_counter_basics();
 #if defined(EDR_HAVE_SQLITE)
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+  test_legacy_post_context_normalizes_without_losing_variants();
+  test_legacy_context_corrupt_fact_blocks_reference();
+  test_malformed_legacy_context_manifests_are_rejected();
+  test_invalid_legacy_post_context_rolls_back_normalization();
   test_context_write_budget_cannot_starve_later_candidate();
   test_post_context_exact_replay_charges_only_durable_changes();
+  test_shared_context_fanout_uses_unique_fact_budget();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
   test_candidate_fallback_preserves_path_and_generation_boundaries();
   test_candidate_known_to_unknown_keeps_generation_and_completeness();

@@ -30,7 +30,6 @@ check_env "EDR_PROCNAME_GATE_KEEP_UNKNOWN_PERMILLE" "非白名单保留比例"
 check_env "EDR_DEDUP_WINDOW_SECONDS" "去重窗口(秒)"
 check_env "EDR_RATE_LIMIT_PER_SEC" "速率限制"
 check_env "EDR_BEHAVIOR_ENCODING" "事件编码格式"
-check_env "EDR_LZ4_COMPRESSION_LEVEL" "LZ4压缩级别"
 check_env "EDR_A44_ENABLED" "A44开关"
 check_env "EDR_A44_NUM_THREADS" "A44线程数"
 

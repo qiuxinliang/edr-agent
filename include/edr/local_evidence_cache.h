@@ -20,6 +20,10 @@ typedef struct {
   uint64_t hot_ring_ingested;
   uint64_t p0_candidates_written;
   uint64_t artifacts_written;
+  /* Physical normalized post-context writes. `artifacts_written` remains the
+   * count of candidate-visible materialized artifacts changed. */
+  uint64_t context_facts_written;
+  uint64_t context_refs_written;
   uint64_t command_results_written;
   /* Candidate accounting has non-overlapping denominators:
    * requests = reused + admission_attempts;
@@ -150,6 +154,11 @@ typedef struct {
   int64_t last_event_time_ns;
   char last_error[160];
 } EdrEvidenceCacheStatus;
+
+/* SQLite readers must use this view for artifact delivery. It preserves the
+ * historical artifacts projection while materializing normalized post-context
+ * facts with their candidate attribution. */
+#define EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW "materialized_artifacts"
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours);

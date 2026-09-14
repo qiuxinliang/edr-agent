@@ -557,17 +557,20 @@ EdrProcessCoalesceResult edr_process_coalescer_submit(const EdrBehaviorRecord *r
   return submit_kernel(record, p0_candidate, monotonic_ns, out_ready);
 }
 
-int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_ready) {
+static int coalescer_take_ready(uint64_t monotonic_ns, int stopping,
+                                EdrBehaviorRecord *out_ready) {
   if (!out_ready) return 0;
   coalescer_lock();
   for (uint32_t i = 0u; i < EDR_PROCESS_COALESCE_SLOTS; ++i) {
     EdrProcessCoalesceSlot *slot = &s_slots[i];
     if (!slot->occupied) continue;
     if (slot->tombstone) {
-      if (monotonic_ns >= slot->deadline_ns) memset(slot, 0, sizeof(*slot));
+      if (stopping || monotonic_ns >= slot->deadline_ns) {
+        memset(slot, 0, sizeof(*slot));
+      }
       continue;
     }
-    if (monotonic_ns < slot->deadline_ns) continue;
+    if (!stopping && monotonic_ns < slot->deadline_ns) continue;
     if (!slot->have_kernel) {
       /* Lifecycle-authoritative kernel records always drain first. */
       continue;
@@ -586,22 +589,30 @@ int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_rea
       snprintf(out_ready->source_completeness, sizeof(out_ready->source_completeness), "%s",
                "NOT_EVALUABLE");
     }
-    /* Do not free this raw generation immediately.  The tombstone prevents a
-     * delayed A 4688 from being bound to a same-PID/path B that starts just
-     * after A's deadline. */
-    slot->have_security = 0u;
-    slot->security = (EdrBehaviorRecord){0};
-    slot->ambiguous = 0u;
-    slot->tombstone = 1u;
-    slot->deadline_ns = monotonic_ns + EDR_PROCESS_COALESCE_DEADLINE_NS;
-    s_metrics.timed_out++;
+    if (stopping) {
+      /* No producer may submit after the preprocess worker enters its final
+       * drain. Remove the emitted generation instead of manufacturing a
+       * deadline or retaining a tombstone that reset would later hide. */
+      memset(slot, 0, sizeof(*slot));
+      s_metrics.shutdown_drained++;
+    } else {
+      /* Do not free this raw generation immediately.  The tombstone prevents a
+       * delayed A 4688 from being bound to a same-PID/path B that starts just
+       * after A's deadline. */
+      slot->have_security = 0u;
+      slot->security = (EdrBehaviorRecord){0};
+      slot->ambiguous = 0u;
+      slot->tombstone = 1u;
+      slot->deadline_ns = monotonic_ns + EDR_PROCESS_COALESCE_DEADLINE_NS;
+      s_metrics.timed_out++;
+    }
     coalescer_unlock();
     return 1;
   }
   for (uint32_t i = 0u; i < EDR_PROCESS_COALESCE_SLOTS; ++i) {
     EdrProcessCoalesceSlot *slot = &s_slots[i];
     if (!slot->occupied || slot->tombstone || slot->have_kernel ||
-        monotonic_ns < slot->deadline_ns) {
+        (!stopping && monotonic_ns < slot->deadline_ns)) {
       continue;
     }
     /* Security 4688 is not lifecycle authority, but silently deleting the
@@ -612,10 +623,20 @@ int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_rea
     snprintf(out_ready->source_completeness, sizeof(out_ready->source_completeness), "%s",
              "ENRICHMENT_ONLY");
     memset(slot, 0, sizeof(*slot));
-    s_metrics.timed_out++;
+    if (stopping) s_metrics.shutdown_drained++;
+    else s_metrics.timed_out++;
     coalescer_unlock();
     return 1;
   }
   coalescer_unlock();
   return 0;
+}
+
+int edr_process_coalescer_poll(uint64_t monotonic_ns,
+                               EdrBehaviorRecord *out_ready) {
+  return coalescer_take_ready(monotonic_ns, 0, out_ready);
+}
+
+int edr_process_coalescer_drain_stopping(EdrBehaviorRecord *out_ready) {
+  return coalescer_take_ready(0u, 1, out_ready);
 }

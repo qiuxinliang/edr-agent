@@ -226,6 +226,38 @@ target_link_libraries(test_transport_v2_status PRIVATE Threads::Threads)
 edr_apply_test_warnings(test_transport_v2_status)
 add_test(NAME transport_v2_status_capacity COMMAND test_transport_v2_status)
 
+add_executable(test_transport_durable_owner
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_transport_durable_owner.c
+  ${CMAKE_SOURCE_DIR}/src/transport/transport_stub.c
+  ${CMAKE_SOURCE_DIR}/src/core/time_util.c)
+target_include_directories(test_transport_durable_owner PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_transport_durable_owner PRIVATE EDR_TRANSPORT_STOP_TIMEOUT_MS=25)
+target_link_libraries(test_transport_durable_owner PRIVATE Threads::Threads)
+edr_apply_test_warnings(test_transport_durable_owner)
+add_test(NAME transport_durable_owner COMMAND test_transport_durable_owner)
+
+add_executable(test_process_evidence_pending
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_process_evidence_pending.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/process_evidence_pending.c)
+target_include_directories(test_process_evidence_pending PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_process_evidence_pending)
+add_test(NAME process_evidence_pending COMMAND test_process_evidence_pending)
+
+add_executable(test_telemetry_admission
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_telemetry_admission.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c)
+target_include_directories(test_telemetry_admission PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_telemetry_admission)
+add_test(NAME telemetry_admission COMMAND test_telemetry_admission)
+
+add_executable(test_pid_history_pmfe
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_pid_history_pmfe.c
+  ${CMAKE_SOURCE_DIR}/src/pmfe/pid_history_pmfe.c)
+target_include_directories(test_pid_history_pmfe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_pid_history_pmfe PRIVATE Threads::Threads)
+edr_apply_test_warnings(test_pid_history_pmfe)
+add_test(NAME pid_history_pmfe_generation COMMAND test_pid_history_pmfe)
+
 add_executable(test_command_result_json ${CMAKE_CURRENT_SOURCE_DIR}/test_command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -611,6 +643,7 @@ target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/src/proto
 )
 target_compile_definitions(edr_ave_test_common INTERFACE EDR_HAVE_NANOPB=1)
+target_link_libraries(edr_ave_test_common INTERFACE Threads::Threads)
 if(SQLite3_FOUND)
   if(TARGET SQLite3::SQLite3)
     target_link_libraries(edr_ave_test_common INTERFACE SQLite3::SQLite3)
@@ -729,6 +762,7 @@ endif()
 
 add_executable(test_ave_sdk ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_sdk.c ${_edr_test_ave_sdk_sources} ${_edr_test_behavior_emit_sources})
 target_link_libraries(test_ave_sdk PRIVATE edr_ave_test_common)
+edr_apply_test_warnings(test_ave_sdk)
 if(WIN32)
   target_sources(test_ave_sdk PRIVATE ${CMAKE_SOURCE_DIR}/src/attack_surface/listen_table_win.c)
   target_sources(test_ave_sdk PRIVATE ${CMAKE_SOURCE_DIR}/src/ave/ave_sign_whitelist_win.c)
@@ -1111,6 +1145,7 @@ endforeach()
 
 add_test(NAME ave_file_fingerprint COMMAND test_ave_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_sdk_smoke COMMAND test_ave_sdk WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(ave_sdk_smoke PROPERTIES TIMEOUT 30)
 add_test(NAME ave_suppression_sqlite COMMAND test_ave_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME ave_scan_pipeline COMMAND test_ave_pipeline WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME config_fingerprint COMMAND test_config_fp WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -1306,8 +1341,17 @@ add_executable(test_event_batch_max_age
   ${CMAKE_CURRENT_SOURCE_DIR}/test_event_batch_max_age.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c)
 target_include_directories(test_event_batch_max_age PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(NOT WIN32)
+  target_link_libraries(test_event_batch_max_age PRIVATE Threads::Threads)
+endif()
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/lz4/lz4.c")
+  target_sources(test_event_batch_max_age PRIVATE ${CMAKE_SOURCE_DIR}/third_party/lz4/lz4.c)
+  target_include_directories(test_event_batch_max_age PRIVATE ${CMAKE_SOURCE_DIR}/third_party/lz4)
+  target_compile_definitions(test_event_batch_max_age PRIVATE EDR_HAVE_LZ4=1)
+endif()
 edr_apply_test_warnings(test_event_batch_max_age)
 add_test(NAME event_batch_max_age COMMAND test_event_batch_max_age WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(event_batch_max_age PROPERTIES TIMEOUT 30)
 
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)

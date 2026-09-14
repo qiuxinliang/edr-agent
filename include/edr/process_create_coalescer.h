@@ -21,6 +21,7 @@ typedef struct {
   uint64_t security_backpressure;
   uint64_t kernel_backpressure;
   uint64_t timed_out;
+  uint64_t shutdown_drained;
   uint64_t stale_rejects;
   uint64_t ambiguous_rejects;
 } EdrProcessCoalescerMetrics;
@@ -30,9 +31,15 @@ EdrProcessCoalesceResult edr_process_coalescer_submit(const EdrBehaviorRecord *r
                                                        int p0_candidate,
                                                        uint64_t monotonic_ns,
                                                        EdrBehaviorRecord *out_ready);
-/* Returns one expired kernel candidate at a time.  Security-only observations
- * expire silently: they are enrichment, never an independent process alert. */
+/* Returns one expired captured record at a time. Security-only observations
+ * remain ENRICHMENT_ONLY: they are visible evidence, never an independent
+ * lifecycle-authoritative process alert. */
 int edr_process_coalescer_poll(uint64_t monotonic_ns, EdrBehaviorRecord *out_ready);
+/* Stop-time drain owned by the preprocess worker. Returns one unexpired
+ * captured record at a time without inventing a deadline timestamp. Kernel
+ * generations retain normal merge/ambiguity semantics; Security-only records
+ * remain ENRICHMENT_ONLY. Tombstones are discarded, never re-emitted. */
+int edr_process_coalescer_drain_stopping(EdrBehaviorRecord *out_ready);
 void edr_process_coalescer_get_metrics(EdrProcessCoalescerMetrics *out);
 
 #endif
