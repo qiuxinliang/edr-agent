@@ -104,6 +104,18 @@ static uint64_t test_filetime_unix_ns(uint64_t creation_filetime_100ns) {
   return (creation_filetime_100ns - epoch) * 100u;
 }
 
+static uint64_t test_unix_ns_to_filetime(uint64_t unix_ns) {
+  return UINT64_C(116444736000000000) + unix_ns / 100u;
+}
+
+static void fill_text(char *out, size_t cap, size_t length, char seed) {
+  assert(out != NULL && length < cap);
+  for (size_t i = 0u; i < length; ++i) {
+    out[i] = (char)(seed + (char)(i % 17u));
+  }
+  out[length] = '\0';
+}
+
 static void test_checknetisolation_standard_low_risk_is_not_candidate(void) {
   EdrBehaviorRecord r;
   init_record(&r, EDR_EVENT_NET_CONNECT);
@@ -1867,10 +1879,10 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
   cleanup_test_sqlite_path(db);
 }
 
-/* A source record without a raw tuple may be bound by the event-time process
- * tree snapshot.  Persist that resolved tuple rather than serializing zeroes
- * from the original record, so a reopened RTQ query and both manifest forms
- * prove exactly which process lifetime supplied the evidence. */
+/* A non-network source record without a raw tuple may be bound by the
+ * event-time process tree snapshot.  Persist that resolved tuple rather than
+ * serializing zeroes from the original record, so a reopened RTQ query and
+ * both manifest forms prove exactly which process lifetime supplied it. */
 static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) {
   const char *db = "local_evidence_cache_snapshot_generation.sqlite";
   const uint32_t pid = 97301u;
@@ -1894,7 +1906,7 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
              (uint64_t)(base - 2000000000LL), start_key, creation) == 0);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
-  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  init_record(&candidate, EDR_EVENT_FILE_WRITE);
   candidate.priority = 3u;
   candidate.pid = pid;
   candidate.event_time_ns = base;
@@ -1904,6 +1916,8 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
   snprintf(candidate.exe_path, sizeof(candidate.exe_path), "C:\\snapshot.exe");
   snprintf(candidate.file_path, sizeof(candidate.file_path), "C:\\snapshot-candidate.bin");
   snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.97.30.1");
+  snprintf(candidate.detection_context, sizeof(candidate.detection_context),
+           "{\"severity\":\"P0\"}");
   snprintf(candidate.source_completeness, sizeof(candidate.source_completeness), "TRUNCATED");
   snprintf(candidate.source_truncated_fields, sizeof(candidate.source_truncated_fields),
            "source.process_name,source.exe_hash,source.parent_path");
@@ -2579,6 +2593,7 @@ static void test_identity_generation_match_delta(void) {
   EdrBehaviorRecord hit;
   init_record(&hit, EDR_EVENT_NET_CONNECT);
   hit.pid = 92001u; hit.event_time_ns = (int64_t)now;
+  set_record_generation(&hit, 0x92001u);
   edr_local_evidence_cache_enrich_behavior(&hit);
   EdrEvidenceCacheStatus st;
   edr_local_evidence_cache_get_status(&st);
@@ -2587,6 +2602,111 @@ static void test_identity_generation_match_delta(void) {
   assert(st.identity_cache_hits == 1u && st.identity_cache_misses == 0u);
   edr_pt_cache_shutdown();
   edr_local_evidence_cache_close();
+}
+
+static void test_unbound_network_actor_never_borrows_open_pid_interval(void) {
+  const uint32_t parent_pid = 92490u;
+  const uint32_t actor_pid = 92491u;
+  const uint64_t parent_key = UINT64_C(0x92490);
+  const uint64_t actor_key = UINT64_C(0x92491);
+  struct timespec ts;
+  EdrBehaviorRecord *actor =
+      (EdrBehaviorRecord *)calloc(1u, sizeof(*actor));
+  EdrBehaviorRecord *failed =
+      (EdrBehaviorRecord *)calloc(1u, sizeof(*failed));
+  EdrBehaviorRecord *bound =
+      (EdrBehaviorRecord *)calloc(1u, sizeof(*bound));
+  EdrEvidenceCacheStatus status;
+  assert(actor != NULL && failed != NULL && bound != NULL);
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  const uint64_t now =
+      (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+  edr_pt_cache_init();
+  assert(put_generation(parent_pid, 4u, "parent.exe", "parent --open",
+                        "C:\\Trusted\\parent.exe", "System",
+                        now - UINT64_C(3000000000), parent_key) == 0);
+  assert(put_generation(actor_pid, parent_pid, "actor.exe", "actor --open",
+                        "C:\\Trusted\\actor.exe", "parent.exe",
+                        now - UINT64_C(2000000000), actor_key) == 0);
+
+  init_record(actor, EDR_EVENT_PROCESS_CREATE);
+  actor->pid = actor_pid;
+  actor->ppid = parent_pid;
+  actor->event_time_ns = (int64_t)(now - UINT64_C(1000000000));
+  set_record_generation(actor, actor_key);
+  snprintf(actor->endpoint_id, sizeof(actor->endpoint_id),
+           "ep-network-generation-guard");
+  snprintf(actor->process_name, sizeof(actor->process_name), "actor.exe");
+  snprintf(actor->exe_path, sizeof(actor->exe_path),
+           "C:\\Trusted\\actor.exe");
+  snprintf(actor->cmdline, sizeof(actor->cmdline), "actor --open");
+  snprintf(actor->username, sizeof(actor->username), "ACME\\stale-user");
+  snprintf(actor->user_sid, sizeof(actor->user_sid), "S-1-5-21-stale");
+  snprintf(actor->identity_quality, sizeof(actor->identity_quality),
+           "target_4688");
+  snprintf(actor->integrity_level, sizeof(actor->integrity_level), "High");
+  actor->token_elevation = 1u;
+  memset(actor->exe_hash, 'a', 64u);
+  actor->exe_hash[64] = '\0';
+  edr_local_evidence_cache_observe_process(actor);
+
+  init_record(failed, EDR_EVENT_NET_CONNECT);
+  failed->pid = actor_pid;
+  failed->ppid = parent_pid;
+  failed->event_time_ns = (int64_t)now;
+  snprintf(failed->endpoint_id, sizeof(failed->endpoint_id),
+           "ep-network-generation-guard");
+  snprintf(failed->event_id, sizeof(failed->event_id),
+           "network-bind-failed-open-interval");
+  snprintf(failed->net_src, sizeof(failed->net_src), "192.0.2.10");
+  snprintf(failed->net_dst, sizeof(failed->net_dst), "198.51.100.20");
+  snprintf(failed->net_proto, sizeof(failed->net_proto), "tcp");
+  failed->net_sport = 50123u;
+  failed->net_dport = 445u;
+  /* Simulate p0_bind_process_generation rejecting the stale open interval:
+   * both actor generation fields are intentionally clear. */
+  edr_local_evidence_cache_observe_process(failed);
+  edr_local_evidence_cache_enrich_behavior(failed);
+  assert(failed->process_start_key == 0u &&
+         failed->process_creation_filetime_100ns == 0u);
+  assert(!failed->process_name[0] && !failed->exe_path[0] &&
+         !failed->cmdline[0] && !failed->username[0] &&
+         !failed->user_sid[0] && !failed->exe_hash[0] &&
+         !failed->integrity_level[0] && failed->token_elevation == 0u);
+  assert(!failed->parent_name[0] && !failed->parent_path[0] &&
+         !failed->parent_cmdline[0] && failed->grandparent_pid == 0u);
+  assert(strcmp(failed->net_src, "192.0.2.10") == 0 &&
+         strcmp(failed->net_dst, "198.51.100.20") == 0 &&
+         strcmp(failed->net_proto, "tcp") == 0 &&
+         failed->net_sport == 50123u && failed->net_dport == 445u);
+  assert(edr_local_evidence_cache_is_candidate(failed) == 1);
+  edr_local_evidence_cache_record_behavior(failed);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.p0_candidates_written == 1u &&
+         status.candidate_admitted == 1u);
+
+  *bound = *failed;
+  snprintf(bound->event_id, sizeof(bound->event_id),
+           "network-bind-succeeded-open-interval");
+  bound->event_time_ns++;
+  set_record_generation(bound, actor_key);
+  edr_local_evidence_cache_enrich_behavior(bound);
+  assert(strcmp(bound->username, "ACME\\stale-user") == 0);
+  assert(strcmp(bound->exe_path, "C:\\Trusted\\actor.exe") == 0);
+  assert(strcmp(bound->cmdline, "actor --open") == 0);
+  assert(strcmp(bound->integrity_level, "High") == 0);
+  assert(bound->token_elevation == 1u);
+  assert(strlen(bound->exe_hash) == 64u);
+  assert(strcmp(bound->net_src, "192.0.2.10") == 0 &&
+         strcmp(bound->net_dst, "198.51.100.20") == 0 &&
+         bound->net_dport == 445u);
+
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
+  free(bound);
+  free(failed);
+  free(actor);
 }
 
 static void test_sid_only_identity_enriches_same_generation(void) {
@@ -2627,7 +2747,10 @@ static void test_unknown_generation_identity_never_survives_to_later_kernel_gene
   edr_local_evidence_cache_enrich_behavior(&later);
   EdrEvidenceCacheStatus st; edr_local_evidence_cache_get_status(&st);
   assert(!later.user_sid[0]);
-  assert(st.generation_unknown_update_rejects == 1u && st.identity_cache_misses == 1u);
+  /* The unbound network actor is rejected before cache lookup; it is not a
+   * cache miss and cannot revive the earlier generation-zero identity. */
+  assert(st.generation_unknown_update_rejects == 1u &&
+         st.identity_cache_misses == 0u);
   edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
 }
 
@@ -2666,7 +2789,7 @@ static void test_known_generation_rejects_late_and_zero_time_identity_updates(vo
    * withheld rather than treated as the cached process generation. */
   assert(after.generation_unknown_update_rejects ==
          before.generation_unknown_update_rejects + 1u);
-  EdrBehaviorRecord hit; init_record(&hit, EDR_EVENT_NET_CONNECT); hit.pid=94501u; hit.event_time_ns=(int64_t)(start+2000u); edr_local_evidence_cache_enrich_behavior(&hit);
+  EdrBehaviorRecord hit; init_record(&hit, EDR_EVENT_NET_CONNECT); hit.pid=94501u; hit.event_time_ns=(int64_t)(start+2000u); set_record_generation(&hit, 0x94501u); edr_local_evidence_cache_enrich_behavior(&hit);
   assert(strcmp(hit.user_sid,"S-B")==0 && strcmp(hit.creator_sid,"C-B")==0 && strcmp(hit.exe_path,"B-path")==0);
   EdrBehaviorRecord zero=b; zero.event_time_ns=0; snprintf(zero.user_sid,sizeof(zero.user_sid),"S-zero"); edr_local_evidence_cache_observe_process(&zero);
   edr_local_evidence_cache_get_status(&after); assert(after.generation_unknown_update_rejects == before.generation_unknown_update_rejects + 2u);
@@ -2697,6 +2820,7 @@ static void test_identity_generation_mismatch_and_quality_order(void) {
   edr_local_evidence_cache_observe_process(&lower);
   EdrBehaviorRecord same;
   init_record(&same, EDR_EVENT_NET_CONNECT); same.pid = 93001u; same.event_time_ns = (int64_t)(now - 500000000ULL);
+  set_record_generation(&same, 0x93001u);
   edr_local_evidence_cache_enrich_behavior(&same);
   assert(strcmp(same.username, "ACME\\target") == 0 && strcmp(same.user_sid, "S-target") == 0);
   assert(strcmp(same.identity_quality, "target_4688") == 0);
@@ -2705,6 +2829,7 @@ static void test_identity_generation_mismatch_and_quality_order(void) {
                         0x93002u) == 0);
   EdrBehaviorRecord reused;
   init_record(&reused, EDR_EVENT_NET_CONNECT); reused.pid = 93001u; reused.event_time_ns = (int64_t)(now + 1000u);
+  set_record_generation(&reused, 0x93002u);
   edr_local_evidence_cache_enrich_behavior(&reused);
   EdrEvidenceCacheStatus st; edr_local_evidence_cache_get_status(&st);
   assert(!reused.username[0]);
@@ -2741,6 +2866,7 @@ static void test_kernel_generation_a_to_b_resets_cached_identity_once(void) {
   edr_local_evidence_cache_observe_process(&b);
   EdrBehaviorRecord hit; init_record(&hit, EDR_EVENT_NET_CONNECT);
   hit.pid = pid; hit.event_time_ns = (int64_t)(now + 2000u);
+  set_record_generation(&hit, 0x93022u);
   edr_local_evidence_cache_enrich_behavior(&hit);
   edr_local_evidence_cache_get_status(&after);
   assert(after.generation_resets == before.generation_resets + 1u);
@@ -2879,6 +3005,152 @@ static void test_parent_only_nonprocess_record_does_not_create_process_slot(void
   edr_local_evidence_cache_get_status(&after);
   assert(after.process_slots_used == before.process_slots_used);
   edr_local_evidence_cache_close();
+}
+
+static void test_process_cache_preserves_full_facts_and_source_provenance(void) {
+  EdrBehaviorRecord *observed = (EdrBehaviorRecord *)calloc(1u, sizeof(*observed));
+  EdrBehaviorRecord *sparse = (EdrBehaviorRecord *)calloc(1u, sizeof(*sparse));
+  assert(observed != NULL && sparse != NULL);
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+
+  init_record(observed, EDR_EVENT_PROCESS_CREATE);
+  observed->pid = 96300u;
+  observed->event_time_ns = 1779340000000000000LL;
+  set_record_generation(observed, UINT64_C(0x96300));
+  snprintf(observed->endpoint_id, sizeof(observed->endpoint_id),
+           "ep-full-process-facts");
+  fill_text(observed->cmdline, sizeof(observed->cmdline), 1024u, 'a');
+  fill_text(observed->exe_path, sizeof(observed->exe_path), 1024u, 'A');
+  edr_local_evidence_cache_observe_process(observed);
+
+  init_record(sparse, EDR_EVENT_NET_CONNECT);
+  sparse->pid = observed->pid;
+  sparse->event_time_ns = observed->event_time_ns + 1;
+  set_record_generation(sparse, UINT64_C(0x96300));
+  snprintf(sparse->endpoint_id, sizeof(sparse->endpoint_id),
+           "ep-full-process-facts");
+  edr_local_evidence_cache_enrich_behavior(sparse);
+  assert(strlen(sparse->cmdline) == 1024u);
+  assert(strlen(sparse->exe_path) == 1024u);
+  assert(!sparse->source_truncated_fields[0]);
+
+  fill_text(observed->cmdline, sizeof(observed->cmdline),
+            sizeof(observed->cmdline) - 1u, 'b');
+  fill_text(observed->exe_path, sizeof(observed->exe_path),
+            sizeof(observed->exe_path) - 1u, 'B');
+  snprintf(observed->source_completeness,
+           sizeof(observed->source_completeness), "TRUNCATED");
+  snprintf(observed->source_truncated_fields,
+           sizeof(observed->source_truncated_fields),
+           "source.cmdline,source.image_path_canonical");
+  observed->event_time_ns++;
+  edr_local_evidence_cache_observe_process(observed);
+
+  edr_behavior_record_init(sparse);
+  sparse->type = EDR_EVENT_NET_CONNECT;
+  sparse->pid = observed->pid;
+  sparse->event_time_ns = observed->event_time_ns + 1;
+  set_record_generation(sparse, UINT64_C(0x96300));
+  snprintf(sparse->endpoint_id, sizeof(sparse->endpoint_id),
+           "ep-full-process-facts");
+  edr_local_evidence_cache_enrich_behavior(sparse);
+  assert(strlen(sparse->cmdline) == sizeof(sparse->cmdline) - 1u);
+  assert(strlen(sparse->exe_path) == sizeof(sparse->exe_path) - 1u);
+  assert(strcmp(sparse->source_completeness, "TRUNCATED") == 0);
+  assert(strstr(sparse->source_truncated_fields, "source.cmdline") != NULL);
+  assert(strstr(sparse->source_truncated_fields,
+                "source.image_path_canonical") != NULL);
+
+  edr_local_evidence_cache_close();
+  free(sparse);
+  free(observed);
+}
+
+static void test_grandparent_cache_requires_verified_lifecycle_parent_edge(void) {
+  const uint32_t grandparent_pid = 96310u;
+  const uint32_t parent_pid = 96311u;
+  const uint32_t child_pid = 96312u;
+  const uint64_t grandparent_birth = UINT64_C(1779340100000000000);
+  const uint64_t parent_birth = grandparent_birth + UINT64_C(100000000);
+  const uint64_t child_birth = parent_birth + UINT64_C(100000000);
+  EdrBehaviorRecord *child = (EdrBehaviorRecord *)calloc(1u, sizeof(*child));
+  EdrBehaviorRecord *event = (EdrBehaviorRecord *)calloc(1u, sizeof(*event));
+  assert(child != NULL && event != NULL);
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(
+             grandparent_pid, 4u, "grandparent-a.exe", "grandparent-a",
+             "C:\\Trusted\\grandparent-a.exe", "System", grandparent_birth,
+             UINT64_C(0x96310), test_unix_ns_to_filetime(grandparent_birth)) == 0);
+  assert(edr_pt_cache_put_generation(
+             parent_pid, grandparent_pid, "parent-a.exe", "parent-a",
+             "C:\\Trusted\\parent-a.exe", "grandparent-a.exe", parent_birth,
+             UINT64_C(0x96311), test_unix_ns_to_filetime(parent_birth)) == 0);
+  assert(edr_pt_cache_put_generation(
+             child_pid, parent_pid, "child.exe", "child",
+             "C:\\Trusted\\child.exe", "parent-a.exe", child_birth,
+             UINT64_C(0x96312), test_unix_ns_to_filetime(child_birth)) == 0);
+
+  init_record(child, EDR_EVENT_PROCESS_CREATE);
+  child->pid = child_pid;
+  child->ppid = parent_pid;
+  child->event_time_ns = (int64_t)(child_birth + 1u);
+  child->process_start_key = UINT64_C(0x96312);
+  child->process_creation_filetime_100ns =
+      test_unix_ns_to_filetime(child_birth);
+  snprintf(child->endpoint_id, sizeof(child->endpoint_id), "ep-grandparent");
+  snprintf(child->process_name, sizeof(child->process_name), "child.exe");
+  snprintf(child->exe_path, sizeof(child->exe_path),
+           "C:\\Trusted\\child.exe");
+  child->grandparent_pid = grandparent_pid;
+  snprintf(child->grandparent_name, sizeof(child->grandparent_name),
+           "grandparent-a.exe");
+  snprintf(child->grandparent_path, sizeof(child->grandparent_path),
+           "C:\\Trusted\\grandparent-a.exe");
+  edr_local_evidence_cache_observe_process(child);
+
+  /* Reuse the numeric parent PID after the immutable child birth.  Enrichment
+   * must retain the grandparent captured with parent generation A. */
+  assert(edr_pt_cache_mark_exit_generation(
+             parent_pid, UINT64_C(0x96311), child_birth + UINT64_C(100000000)) == 0);
+  assert(edr_pt_cache_put_generation(
+             parent_pid, 999u, "parent-b.exe", "parent-b",
+             "C:\\Reused\\parent-b.exe", "other.exe",
+             child_birth + UINT64_C(200000000), UINT64_C(0x96321),
+             test_unix_ns_to_filetime(child_birth + UINT64_C(200000000))) == 0);
+
+  init_record(event, EDR_EVENT_FILE_WRITE);
+  event->pid = child_pid;
+  event->ppid = parent_pid;
+  event->event_time_ns = (int64_t)(child_birth + UINT64_C(300000000));
+  event->process_start_key = UINT64_C(0x96312);
+  event->process_creation_filetime_100ns =
+      test_unix_ns_to_filetime(child_birth);
+  snprintf(event->endpoint_id, sizeof(event->endpoint_id), "ep-grandparent");
+  edr_local_evidence_cache_enrich_behavior(event);
+  assert(event->grandparent_pid == grandparent_pid);
+  assert(strcmp(event->grandparent_name, "grandparent-a.exe") == 0);
+  assert(strcmp(event->grandparent_path,
+                "C:\\Trusted\\grandparent-a.exe") == 0);
+  assert(strstr(event->grandparent_path, "Reused") == NULL);
+
+  edr_behavior_record_init(event);
+  event->type = EDR_EVENT_FILE_WRITE;
+  event->pid = child_pid;
+  event->ppid = parent_pid;
+  event->event_time_ns = (int64_t)(child_birth + UINT64_C(300000001));
+  event->process_start_key = UINT64_C(0x96399);
+  event->process_creation_filetime_100ns =
+      test_unix_ns_to_filetime(child_birth + UINT64_C(1));
+  snprintf(event->endpoint_id, sizeof(event->endpoint_id), "ep-grandparent");
+  edr_local_evidence_cache_enrich_behavior(event);
+  assert(event->grandparent_pid == 0u);
+  assert(!event->grandparent_name[0] && !event->grandparent_path[0]);
+
+  edr_pt_cache_shutdown();
+  edr_local_evidence_cache_close();
+  free(event);
+  free(child);
 }
 
 /* Exact field values captured from WIN-FAC3AC1PS5O.  The child was first
@@ -3385,6 +3657,7 @@ int main(void) {
 #endif
 #endif
   test_identity_generation_match_delta();
+  test_unbound_network_actor_never_borrows_open_pid_interval();
   test_sid_only_identity_enriches_same_generation();
   test_unknown_generation_identity_never_survives_to_later_kernel_generation();
   test_security_4688_identity_none_is_not_lifecycle_authoritative();
@@ -3394,6 +3667,8 @@ int main(void) {
   test_delayed_generation_mismatch_withholds_all_process_enrichment();
   test_unknown_to_bound_generation_clears_provisional_metadata();
   test_parent_only_nonprocess_record_does_not_create_process_slot();
+  test_process_cache_preserves_full_facts_and_source_provenance();
+  test_grandparent_cache_requires_verified_lifecycle_parent_edge();
   test_parent_edge_repairs_late_real_generation_at_child_birth();
   test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");

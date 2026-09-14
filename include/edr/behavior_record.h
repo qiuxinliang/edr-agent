@@ -7,6 +7,7 @@
 #include "types.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define EDR_BR_STR_SHORT 256u
 #define EDR_BR_STR_LONG 4096u
@@ -163,10 +164,21 @@ typedef struct {
 
 void edr_behavior_record_init(EdrBehaviorRecord *r);
 
+int edr_behavior_source_field_truncated(const EdrBehaviorRecord *r, const char *field);
+void edr_behavior_mark_source_truncated(EdrBehaviorRecord *r, const char *field);
+
 void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r);
 
 /** Security EventLog process-create observations carry useful identity but are
  * not authoritative process lifecycle evidence for process_tree_cache. */
 int edr_process_create_is_lifecycle_authoritative(const EdrBehaviorRecord *r);
+
+/** Event families whose PID denotes the process actor. This selects context
+ * work only; callers must independently validate the process generation. */
+int edr_behavior_has_process_actor(const EdrBehaviorRecord *r);
+
+/** Preserve the nanosecond representation used by process-generation edges.
+ * Output is empty when the input or destination cannot represent it. */
+void edr_behavior_format_time_ns(int64_t ns, char *out, size_t cap);
 
 #endif

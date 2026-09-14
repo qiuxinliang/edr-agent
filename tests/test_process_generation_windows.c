@@ -7,9 +7,24 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "../src/preprocess/process_token_permissions_win.h"
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--child") == 0) { Sleep(15000); return 0; }
+  HANDLE token = NULL;
+  char integrity[32], too_small[1];
+  uint32_t elevation = 0u;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 1;
+  int permissions_ok = edr_token_permissions_query(token, integrity, sizeof(integrity), &elevation) &&
+      integrity[0] && elevation >= TokenElevationTypeDefault && elevation <= TokenElevationTypeLimited;
+  permissions_ok = permissions_ok &&
+      !edr_token_permissions_query(token, too_small, sizeof(too_small), &elevation) &&
+      too_small[0] == '\0' && elevation == 0u;
+  CloseHandle(token);
+  permissions_ok = permissions_ok &&
+      !edr_token_permissions_query(NULL, integrity, sizeof(integrity), &elevation) &&
+      integrity[0] == '\0' && elevation == 0u;
+  if (!permissions_ok) { fprintf(stderr, "same-token permission contract failed\n"); return 1; }
   char command_line[4096];
   char reason[64];
   char tiny[2];

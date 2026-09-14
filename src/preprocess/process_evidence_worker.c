@@ -608,12 +608,15 @@ int edr_process_evidence_request(const char *path,uint64_t generation,uint64_t n
   s_metrics.misses++;
   ReleaseSRWLockExclusive(&s_lock);
   memset(&current, 0, sizeof(current));
-  if (!edr_windows_file_identity_open_readonly(path, &opened_file,
-                                               current.file_identity,
-                                               sizeof(current.file_identity),
-                                               &current.file_write_time)) {
-    strcpy(out->hash_reason, "file_identity_unavailable");
-    strcpy(out->signature_reason, "file_identity_unavailable");
+  if (!edr_windows_file_identity_open_readonly_diagnostic(
+          path, &opened_file, current.file_identity,
+          sizeof(current.file_identity), &current.file_write_time,
+          out->hash_reason, sizeof(out->hash_reason))) {
+    if (!out->hash_reason[0]) {
+      strcpy(out->hash_reason, "file_identity_unavailable");
+    }
+    snprintf(out->signature_reason, sizeof(out->signature_reason), "%s",
+             out->hash_reason);
     return 0;
   }
   /* Return the snapshot identity before hashing, but never use it to bind an

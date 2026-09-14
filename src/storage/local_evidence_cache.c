@@ -70,11 +70,22 @@ typedef struct {
   char endpoint_id[48];
   char tenant_id[64];
   char name[256];
-  char path[1024];
-  char cmdline[1024];
+  char path[EDR_BR_STR_LONG];
+  char cmdline[EDR_BR_STR_LONG];
   char parent_name[256];
   char parent_path[512];
-  char parent_cmdline[1024];
+  char parent_cmdline[EDR_BR_STR_LONG];
+  /* Only provenance for fields retained by this cache is stored.  Keeping
+   * each origin list separate lets a later complete update replace one fact
+   * without erasing or inheriting another field's omission. */
+  char path_truncated_fields[160];
+  char cmdline_truncated_fields[64];
+  char parent_path_truncated_fields[64];
+  char parent_cmdline_truncated_fields[64];
+  uint32_t grandparent_pid;
+  char grandparent_name[EDR_BR_STR_SHORT];
+  char grandparent_path[EDR_BR_STR_MID];
+  char grandparent_path_truncated_fields[64];
   char username[256];
   char domain[256];
   char user_sid[256];
@@ -442,6 +453,81 @@ static int copy_s(char *dst, size_t cap, const char *src) {
   return 1;
 }
 
+static int source_field_list_has(const char *list, const char *field) {
+  const size_t field_len = field ? strlen(field) : 0u;
+  const char *cursor = list;
+  if (!cursor || !field_len) return 0;
+  while (*cursor) {
+    const char *end = strchr(cursor, ',');
+    const size_t item_len = end ? (size_t)(end - cursor) : strlen(cursor);
+    if (item_len == field_len && memcmp(cursor, field, field_len) == 0) return 1;
+    if (!end) break;
+    cursor = end + 1u;
+  }
+  return 0;
+}
+
+static void source_field_list_append(char *list, size_t cap, const char *field) {
+  size_t used;
+  size_t field_len;
+  if (!list || cap == 0u || !field || !field[0] ||
+      source_field_list_has(list, field)) {
+    return;
+  }
+  used = strlen(list);
+  field_len = strlen(field);
+  if (used + (used ? 1u : 0u) + field_len >= cap) {
+    return;
+  }
+  if (used) list[used++] = ',';
+  memcpy(list + used, field, field_len + 1u);
+}
+
+static void capture_field_provenance(char *out, size_t cap,
+                                     const EdrBehaviorRecord *record,
+                                     const char *const *fields,
+                                     size_t field_count,
+                                     const char *cache_field,
+                                     int copied_exactly) {
+  if (!out || cap == 0u) return;
+  out[0] = '\0';
+  if (record) {
+    for (size_t i = 0u; i < field_count; ++i) {
+      if (source_field_list_has(record->source_truncated_fields, fields[i])) {
+        source_field_list_append(out, cap, fields[i]);
+      }
+    }
+    if (source_field_list_has(record->source_truncated_fields,
+                              "source.list_overflow")) {
+      source_field_list_append(out, cap, "source.list_overflow");
+    }
+  }
+  if (!copied_exactly) source_field_list_append(out, cap, cache_field);
+}
+
+static void apply_cached_field_provenance(EdrBehaviorRecord *record,
+                                          const char *fields) {
+  const char *cursor = fields;
+  if (!record || !cursor || !cursor[0]) return;
+  while (*cursor) {
+    const char *end = strchr(cursor, ',');
+    const size_t item_len = end ? (size_t)(end - cursor) : strlen(cursor);
+    char item[96];
+    if (item_len > 0u && item_len < sizeof(item)) {
+      memcpy(item, cursor, item_len);
+      item[item_len] = '\0';
+      source_field_list_append(record->source_truncated_fields,
+                               sizeof(record->source_truncated_fields), item);
+    }
+    if (!end) break;
+    cursor = end + 1u;
+  }
+  if (strcmp(record->source_completeness, "NOT_EVALUABLE") != 0) {
+    copy_s(record->source_completeness,
+           sizeof(record->source_completeness), "TRUNCATED");
+  }
+}
+
 static int identity_quality_rank(const char *q) {
   if (!q) return 0;
   if (strcmp(q, "target_4688") == 0) return 4;
@@ -538,6 +624,19 @@ static int generation_from_matching_record_snapshot(
   return 1;
 }
 
+/* NET_CONNECT/NET_LISTEN bind the actor generation before entering this
+ * cache.  If that bind failed, the pipeline deliberately clears the tuple.
+ * Treating the cleared tuple as permission to use this cache's historical
+ * PID/time fallback would undo that security decision and could attach a
+ * stale open interval after PID reuse. */
+static int network_actor_generation_unbound(const EdrBehaviorRecord *r) {
+  return r &&
+         (r->type == EDR_EVENT_NET_CONNECT ||
+          r->type == EDR_EVENT_NET_LISTEN) &&
+         (r->process_start_key == 0u ||
+          r->process_creation_filetime_100ns == 0u);
+}
+
 /* Source-record generation wins when present; the historical process-tree
  * snapshot is an event-time fallback, never a current-PID lookup.  A partial
  * source tuple is deliberately not upgraded from another source. */
@@ -547,6 +646,9 @@ static int record_process_generation(const EdrBehaviorRecord *r,
     return 0;
   }
   memset(out, 0, sizeof(*out));
+  if (network_actor_generation_unbound(r)) {
+    return 0;
+  }
   if (r->process_start_key != 0u || r->process_creation_filetime_100ns != 0u) {
     if (r->process_start_key == 0u || r->process_creation_filetime_100ns == 0u) {
       return 0;
@@ -574,7 +676,8 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
                                   ProcessTreeEntry *snapshot) {
   uint64_t child_birth_ns = 0u;
   uint64_t selector_ns;
-  if (!r || !snapshot || r->ppid == 0u) {
+  if (!r || !snapshot || r->ppid == 0u ||
+      network_actor_generation_unbound(r)) {
     return 0;
   }
   selector_ns = r->event_time_ns > 0 ? (uint64_t)r->event_time_ns : 0u;
@@ -699,7 +802,7 @@ static ProcSlot *alloc_proc(uint32_t pid, const EdrBehaviorRecord *r) {
 }
 
 static int should_update_process_cache(const EdrBehaviorRecord *r) {
-  if (!r || r->pid == 0u) {
+  if (!r || r->pid == 0u || network_actor_generation_unbound(r)) {
     return 0;
   }
   if (r->type == EDR_EVENT_PROCESS_CREATE) {
@@ -734,6 +837,12 @@ static void proc_slot_bind_parent_snapshot(ProcSlot *child,
     child->parent_name[0] = '\0';
     child->parent_path[0] = '\0';
     child->parent_cmdline[0] = '\0';
+    child->parent_path_truncated_fields[0] = '\0';
+    child->parent_cmdline_truncated_fields[0] = '\0';
+    child->grandparent_pid = 0u;
+    child->grandparent_name[0] = '\0';
+    child->grandparent_path[0] = '\0';
+    child->grandparent_path_truncated_fields[0] = '\0';
   }
   child->parent_generation = generation;
   copy_s(child->parent_process_generation_source,
@@ -741,11 +850,28 @@ static void proc_slot_bind_parent_snapshot(ProcSlot *child,
   if (parent->process_name[0])
     copy_s(child->parent_name, sizeof(child->parent_name),
            parent->process_name);
-  if (parent->exe_path[0])
-    copy_s(child->parent_path, sizeof(child->parent_path), parent->exe_path);
-  if (parent->cmdline[0])
-    copy_s(child->parent_cmdline, sizeof(child->parent_cmdline),
-           parent->cmdline);
+  if (parent->exe_path[0]) {
+    const int exact = copy_s(child->parent_path, sizeof(child->parent_path),
+                             parent->exe_path);
+    child->parent_path_truncated_fields[0] = '\0';
+    if (!exact || (parent->source_truncation_mask &
+                   EDR_PTC_SOURCE_TRUNC_EXE_PATH) != 0u) {
+      source_field_list_append(child->parent_path_truncated_fields,
+                               sizeof(child->parent_path_truncated_fields),
+                               "source.parent_path");
+    }
+  }
+  if (parent->cmdline[0]) {
+    const int exact = copy_s(child->parent_cmdline,
+                             sizeof(child->parent_cmdline), parent->cmdline);
+    child->parent_cmdline_truncated_fields[0] = '\0';
+    if (!exact || (parent->source_truncation_mask &
+                   EDR_PTC_SOURCE_TRUNC_CMDLINE) != 0u) {
+      source_field_list_append(child->parent_cmdline_truncated_fields,
+                               sizeof(child->parent_cmdline_truncated_fields),
+                               "source.parent_cmdline");
+    }
+  }
 }
 
 /* A real parent ProcessStart can be delivered after its child.  Repair only
@@ -862,6 +988,12 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
       p->parent_name[0] = '\0';
       p->parent_path[0] = '\0';
       p->parent_cmdline[0] = '\0';
+      p->parent_path_truncated_fields[0] = '\0';
+      p->parent_cmdline_truncated_fields[0] = '\0';
+      p->grandparent_pid = 0u;
+      p->grandparent_name[0] = '\0';
+      p->grandparent_path[0] = '\0';
+      p->grandparent_path_truncated_fields[0] = '\0';
       memset(&p->parent_generation, 0, sizeof(p->parent_generation));
       p->parent_process_generation_source[0] = '\0';
     }
@@ -894,10 +1026,45 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
     copy_s(p->name, sizeof(p->name), base_name(r->exe_path));
   }
   if (r->exe_path[0]) {
-    copy_s(p->path, sizeof(p->path), r->exe_path);
+    static const char *const path_fields[] = {
+        "source.exe_path", "source.image_path_raw",
+        "source.image_path_canonical"};
+    const int exact = copy_s(p->path, sizeof(p->path), r->exe_path);
+    capture_field_provenance(p->path_truncated_fields,
+                             sizeof(p->path_truncated_fields), r,
+                             path_fields,
+                             sizeof(path_fields) / sizeof(path_fields[0]),
+                             "source.exe_path", exact);
   }
   if (r->cmdline[0]) {
-    copy_s(p->cmdline, sizeof(p->cmdline), r->cmdline);
+    static const char *const cmdline_fields[] = {"source.cmdline"};
+    const int exact = copy_s(p->cmdline, sizeof(p->cmdline), r->cmdline);
+    capture_field_provenance(p->cmdline_truncated_fields,
+                             sizeof(p->cmdline_truncated_fields), r,
+                             cmdline_fields, 1u, "source.cmdline", exact);
+  }
+  /* Grandparent display is retained only with the child lifecycle and the
+   * exact parent edge selected at that child's birth.  It is never rebuilt
+   * from a current numeric PID during later file/network enrichment. */
+  if (incoming_generation_known && incoming_parent_generation_known &&
+      r->type == EDR_EVENT_PROCESS_CREATE &&
+      edr_process_create_is_lifecycle_authoritative(r) &&
+      (r->grandparent_pid != 0u || r->grandparent_name[0] ||
+       r->grandparent_path[0])) {
+    static const char *const grandparent_path_fields[] = {
+        "source.grandparent_path"};
+    p->grandparent_pid = r->grandparent_pid;
+    copy_s(p->grandparent_name, sizeof(p->grandparent_name),
+           r->grandparent_name);
+    {
+      const int exact = copy_s(p->grandparent_path,
+                               sizeof(p->grandparent_path),
+                               r->grandparent_path);
+      capture_field_provenance(
+          p->grandparent_path_truncated_fields,
+          sizeof(p->grandparent_path_truncated_fields), r,
+          grandparent_path_fields, 1u, "source.grandparent_path", exact);
+    }
   }
   if (r->username[0] || r->user_sid[0]) {
     int incoming = identity_quality_rank(r->identity_quality);
@@ -946,7 +1113,7 @@ static int repair_child_parent_edges_sqlite(const EdrBehaviorRecord *parent,
 #endif
 
 void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
-  if (!r) return;
+  if (!r || network_actor_generation_unbound(r)) return;
   evidence_cache_lock();
   s_status.identity_observations_total++;
   process_cache_update(r);
@@ -962,7 +1129,7 @@ void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
 }
 
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
-  if (!r) {
+  if (!r || network_actor_generation_unbound(r)) {
     return;
   }
   evidence_cache_lock();
@@ -986,10 +1153,14 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         copy_s(r->process_name, sizeof(r->process_name), p->name);
       }
       if (!r->exe_path[0] && p->path[0]) {
-        copy_s(r->exe_path, sizeof(r->exe_path), p->path);
+        const int exact = copy_s(r->exe_path, sizeof(r->exe_path), p->path);
+        apply_cached_field_provenance(r, p->path_truncated_fields);
+        if (!exact) apply_cached_field_provenance(r, "source.exe_path");
       }
       if (!r->cmdline[0] && p->cmdline[0]) {
-        copy_s(r->cmdline, sizeof(r->cmdline), p->cmdline);
+        const int exact = copy_s(r->cmdline, sizeof(r->cmdline), p->cmdline);
+        apply_cached_field_provenance(r, p->cmdline_truncated_fields);
+        if (!exact) apply_cached_field_provenance(r, "source.cmdline");
       }
       /* Parent display fields are a separate identity.  A self-generation
        * match is not permission to copy a PID-only parent observation. */
@@ -999,9 +1170,23 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         }
         if (!r->parent_path[0] && p->parent_path[0]) {
           copy_s(r->parent_path, sizeof(r->parent_path), p->parent_path);
+          apply_cached_field_provenance(r,
+                                        p->parent_path_truncated_fields);
         }
         if (!r->parent_cmdline[0] && p->parent_cmdline[0]) {
           copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), p->parent_cmdline);
+          apply_cached_field_provenance(r,
+                                        p->parent_cmdline_truncated_fields);
+        }
+        if (r->grandparent_pid == 0u) r->grandparent_pid = p->grandparent_pid;
+        if (!r->grandparent_name[0] && p->grandparent_name[0])
+          copy_s(r->grandparent_name, sizeof(r->grandparent_name),
+                 p->grandparent_name);
+        if (!r->grandparent_path[0] && p->grandparent_path[0]) {
+          copy_s(r->grandparent_path, sizeof(r->grandparent_path),
+                 p->grandparent_path);
+          apply_cached_field_provenance(
+              r, p->grandparent_path_truncated_fields);
         }
       }
       if (!r->username[0] && !r->user_sid[0] && (p->username[0] || p->user_sid[0])) {
@@ -1044,10 +1229,17 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         if (!r->parent_name[0]) copy_s(r->parent_name, sizeof(r->parent_name), pp->name);
       }
       if (pp->path[0]) {
-        if (!r->parent_path[0]) copy_s(r->parent_path, sizeof(r->parent_path), pp->path);
+        if (!r->parent_path[0]) {
+          copy_s(r->parent_path, sizeof(r->parent_path), pp->path);
+          if (pp->path_truncated_fields[0])
+            apply_cached_field_provenance(r, "source.parent_path");
+        }
       }
-      if (pp->cmdline[0] && !r->parent_cmdline[0])
+      if (pp->cmdline[0] && !r->parent_cmdline[0]) {
         copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), pp->cmdline);
+        if (pp->cmdline_truncated_fields[0])
+          apply_cached_field_provenance(r, "source.parent_cmdline");
+      }
     }
   }
   if (!r->process_name[0] && r->exe_path[0]) {

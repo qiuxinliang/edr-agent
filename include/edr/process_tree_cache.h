@@ -1,6 +1,8 @@
 /**
  * 进程树缓存 — 线程安全 LRU 哈希表（PID→父链），供 P0 富化和告警发送快照。
- * 4096 条目，~1.5MB 常驻。跨线程调用必须使用复制型 API，禁止持有内部条目指针。
+ * 4096 条目。长命令行/路径由实现使用有界按需存储，避免将最大字段
+ * 容量乘以整个哈希表常驻。跨线程调用必须使用复制型 API，禁止持有
+ * 内部条目指针。
  */
 #ifndef EDR_PROCESS_TREE_CACHE_H
 #define EDR_PROCESS_TREE_CACHE_H
@@ -9,9 +11,19 @@
 #include <stdint.h>
 
 #define EDR_PTC_STR_SHORT 64u
-#define EDR_PTC_STR_LONG  256u
-#define EDR_PTC_STR_PATH  512u
+#define EDR_PTC_STR_LONG  4096u
+#define EDR_PTC_STR_PATH  4096u
 #define EDR_PTC_EXIT_GRACE_NS (30ULL * 1000000000ULL)
+
+enum {
+  EDR_PTC_SOURCE_TRUNC_CMDLINE = 1u << 0,
+  EDR_PTC_SOURCE_TRUNC_EXE_PATH = 1u << 1
+};
+
+enum {
+  EDR_PTC_RECORD_TRUNC_PARENT_CMDLINE = 1u << 0,
+  EDR_PTC_RECORD_TRUNC_GRANDPARENT_PATH = 1u << 1
+};
 
 typedef struct {
   uint32_t pid;
@@ -29,6 +41,10 @@ typedef struct {
   char cmdline[EDR_PTC_STR_LONG];
   char exe_path[EDR_PTC_STR_PATH];
   char parent_name[EDR_PTC_STR_SHORT];
+  /* Named-field provenance for clipping inside this cache.  Callers which
+   * adopt a marked field must add source.cmdline/source.exe_path to the
+   * BehaviorRecord source_truncated_fields and mark it TRUNCATED. */
+  uint8_t source_truncation_mask;
 } ProcessTreeEntry;
 
 void edr_pt_cache_init(void);
@@ -54,6 +70,19 @@ int edr_pt_cache_put_generation(uint32_t pid, uint32_t ppid,
                                 uint64_t observation_time_ns,
                                 uint64_t process_start_key,
                                 uint64_t creation_filetime_100ns);
+
+/* Exact-generation insertion with source provenance.  The mask describes
+ * truncation which happened before this cache received the strings; it is
+ * retained even when the supplied value fits the cache's 4096-byte field.
+ * The legacy API above is equivalent to passing a zero mask. */
+int edr_pt_cache_put_generation_with_provenance(
+    uint32_t pid, uint32_t ppid,
+    const char *process_name, const char *cmdline,
+    const char *exe_path, const char *parent_name,
+    uint64_t observation_time_ns,
+    uint64_t process_start_key,
+    uint64_t creation_filetime_100ns,
+    uint8_t source_truncation_mask);
 
 /** 根据 PID 查找内部条目；仅可在缓存实现内部持锁调用。 */
 const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid);
@@ -98,6 +127,19 @@ void edr_pt_cache_fill_record_at(uint32_t pid, uint64_t event_time_ns,
                                  uint32_t *out_grandparent_pid,
                                  char *parent_cmdline, size_t pc_cap,
                                  uint32_t *out_chain_depth);
+
+/* Same event-time projection with explicit intermediate clipping provenance.
+ * The returned EDR_PTC_RECORD_TRUNC_* mask names only fields actually adopted
+ * by this projection; callers map them to source.parent_cmdline and
+ * source.grandparent_path. */
+void edr_pt_cache_fill_record_at_with_provenance(
+    uint32_t pid, uint64_t event_time_ns,
+    char *grandparent_name, size_t gn_cap,
+    char *grandparent_path, size_t gp_cap,
+    uint32_t *out_grandparent_pid,
+    char *parent_cmdline, size_t pc_cap,
+    uint32_t *out_chain_depth,
+    uint8_t *out_source_truncation_mask);
 
 typedef struct {
   uint64_t puts;

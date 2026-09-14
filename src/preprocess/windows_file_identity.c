@@ -1,5 +1,6 @@
 #include "edr/windows_file_identity.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,7 +64,9 @@ static wchar_t *utf8_to_wide_strict(const char *utf8) {
   }
   if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, wide, wide_chars) !=
       wide_chars) {
+    DWORD error = GetLastError();
     free(wide);
+    SetLastError(error);
     return NULL;
   }
   return wide;
@@ -176,9 +179,25 @@ typedef struct EdrWindowsFileIdInfo {
 
 #define EDR_FILE_INFO_BY_HANDLE_CLASS_FILE_ID 18
 
-int edr_windows_file_identity_from_handle(void *native_file_handle,
-                                          char *identity, size_t identity_cap,
-                                          uint64_t *write_time_100ns) {
+static void file_identity_reason_clear(char *reason, size_t reason_cap) {
+  if (reason && reason_cap > 0u) reason[0] = '\0';
+}
+
+static void file_identity_reason_set(char *reason, size_t reason_cap,
+                                     const char *stage, DWORD error) {
+  if (!reason || reason_cap == 0u) return;
+  if (error != ERROR_SUCCESS) {
+    (void)snprintf(reason, reason_cap, "file_identity_%s_win32_%lu", stage,
+                   (unsigned long)error);
+  } else {
+    (void)snprintf(reason, reason_cap, "file_identity_%s", stage);
+  }
+}
+
+int edr_windows_file_identity_from_handle_diagnostic(
+    void *native_file_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap) {
   static const char hex[] = "0123456789abcdef";
   HANDLE file = (HANDLE)native_file_handle;
   EdrWindowsFileIdInfo file_id;
@@ -186,21 +205,39 @@ int edr_windows_file_identity_from_handle(void *native_file_handle,
   size_t prefix_len;
   size_t used;
   ULARGE_INTEGER write_time;
+  file_identity_reason_clear(failure_reason, failure_reason_cap);
   if (identity && identity_cap > 0u) identity[0] = '\0';
   if (write_time_100ns) *write_time_100ns = 0u;
   if (!file || file == INVALID_HANDLE_VALUE || !identity ||
       identity_cap < EDR_WINDOWS_FILE_IDENTITY_V1_CAP || !write_time_100ns) {
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "invalid_argument", ERROR_INVALID_PARAMETER);
     return 0;
   }
   memset(&file_id, 0, sizeof(file_id));
   memset(&basic, 0, sizeof(basic));
   if (!GetFileInformationByHandleEx(
           file, (FILE_INFO_BY_HANDLE_CLASS)EDR_FILE_INFO_BY_HANDLE_CLASS_FILE_ID,
-          &file_id, (DWORD)sizeof(file_id)) ||
-      !GetFileInformationByHandle(file, &basic)) {
+          &file_id, (DWORD)sizeof(file_id))) {
+    DWORD error = GetLastError();
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "file_id_info_failed", error);
     return 0;
   }
-  if ((basic.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0u) {
+  if (!GetFileInformationByHandle(file, &basic)) {
+    DWORD error = GetLastError();
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "basic_info_failed", error);
+    return 0;
+  }
+  if ((basic.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u) {
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "directory_denied", ERROR_SUCCESS);
+    return 0;
+  }
+  if ((basic.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u) {
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "reparse_denied", ERROR_SUCCESS);
     return 0;
   }
   prefix_len = strlen(EDR_WINDOWS_FILE_IDENTITY_V1_PREFIX);
@@ -218,20 +255,46 @@ int edr_windows_file_identity_from_handle(void *native_file_handle,
   write_time.LowPart = basic.ftLastWriteTime.dwLowDateTime;
   write_time.HighPart = basic.ftLastWriteTime.dwHighDateTime;
   *write_time_100ns = write_time.QuadPart;
-  return edr_windows_file_identity_valid(identity);
+  if (!edr_windows_file_identity_valid(identity)) {
+    identity[0] = '\0';
+    *write_time_100ns = 0u;
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "format_invalid", ERROR_SUCCESS);
+    return 0;
+  }
+  return 1;
 }
 
-int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
-                                            char *identity, size_t identity_cap,
-                                            uint64_t *write_time_100ns) {
+int edr_windows_file_identity_from_handle(void *native_file_handle,
+                                          char *identity, size_t identity_cap,
+                                          uint64_t *write_time_100ns) {
+  return edr_windows_file_identity_from_handle_diagnostic(
+      native_file_handle, identity, identity_cap, write_time_100ns, NULL, 0u);
+}
+
+int edr_windows_file_identity_open_readonly_diagnostic(
+    const char *path, void **out_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap) {
   HANDLE file;
   wchar_t *wide_path;
+  file_identity_reason_clear(failure_reason, failure_reason_cap);
   if (out_handle) *out_handle = NULL;
   if (identity && identity_cap > 0u) identity[0] = '\0';
   if (write_time_100ns) *write_time_100ns = 0u;
-  if (!path || !path[0] || !out_handle) return 0;
+  if (!path || !path[0] || !out_handle || !identity ||
+      identity_cap < EDR_WINDOWS_FILE_IDENTITY_V1_CAP || !write_time_100ns) {
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "invalid_argument", ERROR_INVALID_PARAMETER);
+    return 0;
+  }
   wide_path = utf8_to_wide_strict(path);
-  if (!wide_path) return 0;
+  if (!wide_path) {
+    DWORD error = GetLastError();
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "path_encoding_failed", error);
+    return 0;
+  }
   /* The held file cannot coexist with a writer or deleter. Opening the
    * reparse point itself and rejecting it prevents an indirection from
    * swapping the pathname's object between the capture and WVT checks. */
@@ -239,24 +302,40 @@ int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
                          FILE_FLAG_OPEN_REPARSE_POINT,
                      NULL);
+  if (file == INVALID_HANDLE_VALUE) {
+    DWORD error = GetLastError();
+    free(wide_path);
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "open_failed", error);
+    return 0;
+  }
   free(wide_path);
-  if (file == INVALID_HANDLE_VALUE) return 0;
 #ifdef EDR_WINDOWS_FILE_IDENTITY_TESTING
   /* Exercise the exact deny path deterministically.  Native reparse-point
    * construction is privilege-dependent, while production always relies on
    * FILE_FLAG_OPEN_REPARSE_POINT plus the attribute check below. */
   if (s_test_force_reparse_denied) {
+    file_identity_reason_set(failure_reason, failure_reason_cap,
+                             "reparse_denied", ERROR_SUCCESS);
     CloseHandle(file);
     return 0;
   }
 #endif
-  if (!edr_windows_file_identity_from_handle(file, identity, identity_cap,
-                                             write_time_100ns)) {
+  if (!edr_windows_file_identity_from_handle_diagnostic(
+          file, identity, identity_cap, write_time_100ns, failure_reason,
+          failure_reason_cap)) {
     CloseHandle(file);
     return 0;
   }
   *out_handle = (void *)file;
   return 1;
+}
+
+int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
+                                            char *identity, size_t identity_cap,
+                                            uint64_t *write_time_100ns) {
+  return edr_windows_file_identity_open_readonly_diagnostic(
+      path, out_handle, identity, identity_cap, write_time_100ns, NULL, 0u);
 }
 
 int edr_windows_file_identity_from_path(const char *path, char *identity,
@@ -296,6 +375,18 @@ int edr_windows_file_identity_from_handle(void *native_file_handle,
   return 0;
 }
 
+int edr_windows_file_identity_from_handle_diagnostic(
+    void *native_file_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap) {
+  if (failure_reason && failure_reason_cap > 0u) {
+    snprintf(failure_reason, failure_reason_cap, "%s",
+             "file_identity_windows_only");
+  }
+  return edr_windows_file_identity_from_handle(
+      native_file_handle, identity, identity_cap, write_time_100ns);
+}
+
 int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
                                             char *identity, size_t identity_cap,
                                             uint64_t *write_time_100ns) {
@@ -304,6 +395,18 @@ int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
   if (identity && identity_cap > 0u) identity[0] = '\0';
   if (write_time_100ns) *write_time_100ns = 0u;
   return 0;
+}
+
+int edr_windows_file_identity_open_readonly_diagnostic(
+    const char *path, void **out_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap) {
+  if (failure_reason && failure_reason_cap > 0u) {
+    snprintf(failure_reason, failure_reason_cap, "%s",
+             "file_identity_windows_only");
+  }
+  return edr_windows_file_identity_open_readonly(
+      path, out_handle, identity, identity_cap, write_time_100ns);
 }
 
 int edr_windows_file_identity_from_path(const char *path, char *identity,

@@ -299,6 +299,7 @@ if(WIN32)
     ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
   target_include_directories(test_process_generation_windows PRIVATE
     ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(test_process_generation_windows PRIVATE advapi32)
   edr_apply_test_warnings(test_process_generation_windows)
   add_test(NAME process_generation_same_handle_command_line
     COMMAND test_process_generation_windows)

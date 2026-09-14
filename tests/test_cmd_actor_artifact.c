@@ -8,6 +8,44 @@ void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void
 
 int main(void) {
   EdrEventSlot slot; EdrBehaviorRecord r;
+  char precise[64], tiny[20];
+  edr_behavior_format_time_ns(INT64_C(1789371253913980400), precise, sizeof(precise));
+  if (strcmp(precise, "2026-09-14T07:34:13.913980400Z") != 0) return 1;
+  edr_behavior_format_time_ns(INT64_C(1789371253913980400), tiny, sizeof(tiny));
+  if (tiny[0]) return 1;
+  edr_behavior_format_time_ns(0, precise, sizeof(precise));
+  if (precise[0]) return 1;
+  memset(&r, 0, sizeof(r));
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_behavior_mark_source_truncated(&r, "source.parent_path");
+  if (strcmp(r.source_truncated_fields, "source.cmdline,source.parent_path") != 0 ||
+      strcmp(r.source_completeness, "TRUNCATED") != 0 ||
+      edr_behavior_source_field_truncated(&r, "source.cmd") ||
+      !edr_behavior_source_field_truncated(&r, "source.parent_path")) return 1;
+  snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "NOT_EVALUABLE");
+  edr_behavior_mark_source_truncated(&r, "source.exe_path");
+  if (strcmp(r.source_completeness, "NOT_EVALUABLE") != 0) return 1;
+  memset(r.source_truncated_fields, 'x', sizeof(r.source_truncated_fields) - 1u);
+  r.source_truncated_fields[sizeof(r.source_truncated_fields) - 1u] = '\0';
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  if (strcmp(r.source_truncated_fields, "source.list_overflow") != 0 ||
+      !edr_behavior_source_field_truncated(&r, "source.exe_path")) return 1;
+  memset(&r, 0, sizeof(r));
+  const EdrEventType actors[] = { EDR_EVENT_PROCESS_CREATE, EDR_EVENT_FILE_READ,
+      EDR_EVENT_NET_CONNECT, EDR_EVENT_NET_LISTEN };
+  for (size_t i = 0u; i < sizeof(actors) / sizeof(actors[0]); i++) {
+    r.type = actors[i];
+    if (!edr_behavior_has_process_actor(&r)) return 1;
+    r.is_security_4688 = 1u;
+    if (edr_behavior_has_process_actor(&r)) return 1;
+    r.is_security_4688 = 0u;
+  }
+  r.type = EDR_EVENT_CAPABILITY_AUDIT;
+  if (edr_behavior_has_process_actor(&r)) return 1;
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.kernel_file_activity = 1u;
+  if (!edr_behavior_has_process_actor(&r) || edr_behavior_has_process_actor(NULL)) return 1;
   memset(&slot, 0, sizeof(slot)); slot.type = EDR_EVENT_PROCESS_CREATE; slot.timestamp_ns = 1u;
   snprintf((char *)slot.data, sizeof(slot.data),
            "ETW1\nprov=kproc\npid=77\nimg=C:\\Windows\\System32\\cmd.exe\n"

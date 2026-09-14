@@ -137,8 +137,9 @@ static void test_missing_identity_stays_unavailable(void) {
   assert(evidence.file_identity[0] == '\0');
   assert(strcmp(evidence.hash_quality, "unknown") == 0);
   assert(strcmp(evidence.signature_quality, "unknown") == 0);
-  assert(strcmp(evidence.hash_reason, "file_identity_unavailable") == 0);
-  assert(strcmp(evidence.signature_reason, "file_identity_unavailable") == 0);
+  assert(strncmp(evidence.hash_reason, "file_identity_open_failed_win32_",
+                 strlen("file_identity_open_failed_win32_")) == 0);
+  assert(strcmp(evidence.signature_reason, evidence.hash_reason) == 0);
 }
 
 static void test_ready_snapshot_survives_short_lived_path_cleanup(void) {
@@ -220,7 +221,9 @@ static void test_share_and_reparse_denial_stay_not_evaluable(void) {
   char identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
   uint64_t write_time = 0u;
   HANDLE writer;
+  HANDLE exclusive_reader;
   EdrProcessEvidence evidence;
+  char expected[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
   make_fixture_paths(a_path, b_path);
   assert(edr_windows_file_identity_open_readonly(a_path, &owner, identity,
                                                  sizeof(identity), &write_time));
@@ -231,16 +234,31 @@ static void test_share_and_reparse_denial_stay_not_evaluable(void) {
   assert(writer == INVALID_HANDLE_VALUE);
   assert(CloseHandle((HANDLE)owner));
 
+  /* An existing exclusive reader must still make the evidence open fail;
+   * diagnostics expose that boundary without weakening FILE_SHARE_READ. */
+  exclusive_reader = CreateFileA(a_path, GENERIC_READ, 0u, NULL, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+  assert(exclusive_reader != INVALID_HANDLE_VALUE);
+  memset(&evidence, 0, sizeof(evidence));
+  assert(!edr_process_evidence_request(a_path, 1004u, edr_monotonic_ns(),
+                                       &evidence));
+  assert(snprintf(expected, sizeof(expected),
+                  "file_identity_open_failed_win32_%lu",
+                  (unsigned long)ERROR_SHARING_VIOLATION) > 0);
+  assert(strcmp(evidence.hash_reason, expected) == 0);
+  assert(strcmp(evidence.signature_reason, expected) == 0);
+  assert(CloseHandle(exclusive_reader));
+
   /* The test seam takes the same no-identity branch as a real reparse point;
    * it avoids symlink privilege assumptions in native CI. */
   edr_windows_file_identity_test_force_reparse_denied(1);
   memset(&evidence, 0, sizeof(evidence));
-  assert(edr_process_evidence_request(a_path, 1004u, edr_monotonic_ns(), &evidence) == 0);
+  assert(edr_process_evidence_request(a_path, 1005u, edr_monotonic_ns(), &evidence) == 0);
   assert(evidence.file_identity[0] == '\0');
   assert(strcmp(evidence.hash_quality, "unknown") == 0);
   assert(strcmp(evidence.signature_quality, "unknown") == 0);
-  assert(strcmp(evidence.hash_reason, "file_identity_unavailable") == 0);
-  assert(strcmp(evidence.signature_reason, "file_identity_unavailable") == 0);
+  assert(strcmp(evidence.hash_reason, "file_identity_reparse_denied") == 0);
+  assert(strcmp(evidence.signature_reason, evidence.hash_reason) == 0);
   edr_windows_file_identity_test_force_reparse_denied(0);
   (void)DeleteFileA(a_path);
   (void)DeleteFileA(b_path);

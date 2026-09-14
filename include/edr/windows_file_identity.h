@@ -11,6 +11,7 @@
  */
 #define EDR_WINDOWS_FILE_IDENTITY_V1_PREFIX "win-fileid-v1:"
 #define EDR_WINDOWS_FILE_IDENTITY_V1_CAP 64u
+#define EDR_WINDOWS_FILE_IDENTITY_REASON_CAP 64u
 
 /* Strict Windows pathname comparison has three meaningful outcomes.  Paths
  * arriving from ETW and rule/evidence records are UTF-8; an invalid byte
@@ -51,11 +52,26 @@ int edr_windows_file_identity_from_handle(void *native_file_handle,
                                           char *identity, size_t identity_cap,
                                           uint64_t *write_time_100ns);
 
+/* Compatibility-preserving diagnostic variant. On failure, `failure_reason`
+ * identifies the exact boundary and includes the Win32 error code when a
+ * Windows API supplied one. On success it is empty. */
+int edr_windows_file_identity_from_handle_diagnostic(
+    void *native_file_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap);
+
 /* Open one read-only, no-write/no-delete-share handle. On success the caller
  * exclusively owns `*out_handle` and must close it on every terminal path. */
 int edr_windows_file_identity_open_readonly(const char *path, void **out_handle,
                                             char *identity, size_t identity_cap,
                                             uint64_t *write_time_100ns);
+
+/* Diagnostic variant of the same fail-closed open. It uses identical access,
+ * share, and reparse-point semantics; only failure reporting differs. */
+int edr_windows_file_identity_open_readonly_diagnostic(
+    const char *path, void **out_handle, char *identity, size_t identity_cap,
+    uint64_t *write_time_100ns, char *failure_reason,
+    size_t failure_reason_cap);
 
 /* Snapshot a pathname for a revalidation only; this helper closes its own
  * temporary handle before it returns. */

@@ -47,14 +47,38 @@ static void test_ordinal_compare_preserves_windows_namespace(void) {
 static void test_invalid_utf8_is_not_a_path(void) {
   const char invalid[] = "C:\\bad\\" "\xC3\x28" ".exe";
   char identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
+  char reason[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
+  char expected[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
   uint64_t write_time = 0u;
   void *owner = (void *)1;
 
   assert(edr_windows_utf8_path_compare_ci(invalid, "C:\\bad\\x.exe") ==
          EDR_WINDOWS_UTF8_PATH_COMPARE_INVALID_UTF8);
-  assert(!edr_windows_file_identity_open_readonly(invalid, &owner, identity,
-                                                  sizeof(identity), &write_time));
+  assert(!edr_windows_file_identity_open_readonly_diagnostic(
+      invalid, &owner, identity, sizeof(identity), &write_time, reason,
+      sizeof(reason)));
+  assert(snprintf(expected, sizeof(expected),
+                  "file_identity_path_encoding_failed_win32_%lu",
+                  (unsigned long)ERROR_NO_UNICODE_TRANSLATION) > 0);
+  assert(strcmp(reason, expected) == 0);
   assert(owner == NULL);
+  assert(identity[0] == '\0');
+  assert(write_time == 0u);
+}
+
+static void test_file_info_failure_retains_win32_error(void) {
+  char identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
+  char reason[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
+  char expected[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
+  uint64_t write_time = 0u;
+
+  assert(!edr_windows_file_identity_from_handle_diagnostic(
+      (void *)(uintptr_t)0x1234u, identity, sizeof(identity), &write_time,
+      reason, sizeof(reason)));
+  assert(snprintf(expected, sizeof(expected),
+                  "file_identity_file_id_info_failed_win32_%lu",
+                  (unsigned long)ERROR_INVALID_HANDLE) > 0);
+  assert(strcmp(reason, expected) == 0);
   assert(identity[0] == '\0');
   assert(write_time == 0u);
 }
@@ -69,6 +93,7 @@ static void test_chinese_directory_file_identity_and_process_query(void) {
   char path_utf8[EDR_BR_STR_LONG];
   char self_utf8[EDR_BR_STR_LONG];
   char identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
+  char reason[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
   uint64_t write_time = 0u;
   HANDLE file;
   void *owner = NULL;
@@ -92,8 +117,10 @@ static void test_chinese_directory_file_identity_and_process_query(void) {
   assert(CloseHandle(file));
 
   wide_to_utf8(file_path, path_utf8, sizeof(path_utf8));
-  assert(edr_windows_file_identity_open_readonly(path_utf8, &owner, identity,
-                                                 sizeof(identity), &write_time));
+  assert(edr_windows_file_identity_open_readonly_diagnostic(
+      path_utf8, &owner, identity, sizeof(identity), &write_time, reason,
+      sizeof(reason)));
+  assert(reason[0] == '\0');
   assert(edr_windows_file_identity_valid(identity));
   assert(write_time != 0u);
   assert(CloseHandle((HANDLE)owner));
@@ -111,6 +138,7 @@ static void test_chinese_directory_file_identity_and_process_query(void) {
 int main(void) {
   test_ordinal_compare_preserves_windows_namespace();
   test_invalid_utf8_is_not_a_path();
+  test_file_info_failure_retains_win32_error();
   test_chinese_directory_file_identity_and_process_query();
   puts("windows Unicode path native contract: ok");
   return 0;

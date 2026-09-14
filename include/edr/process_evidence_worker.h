@@ -11,7 +11,7 @@ typedef struct {
   uint64_t file_write_time;
   char sha256[65];
   char hash_quality[24];
-  char hash_reason[64];
+  char hash_reason[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
   char signature_status[24];
   char signature_source[32];
   char signer[256];
@@ -21,7 +21,7 @@ typedef struct {
    * independent from signature_reason so a future quality value cannot
    * overwrite the adjacent evidence field. */
   char signature_quality[40];
-  char signature_reason[64];
+  char signature_reason[EDR_WINDOWS_FILE_IDENTITY_REASON_CAP];
 } EdrProcessEvidence;
 
 typedef struct {

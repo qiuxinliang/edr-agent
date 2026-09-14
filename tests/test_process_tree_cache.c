@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -50,6 +51,16 @@ static uint64_t test_unix_ns_to_filetime(uint64_t unix_ns) {
   return UINT64_C(116444736000000000) + unix_ns / 100u;
 }
 
+static char *make_text(size_t length, char seed) {
+  char *value = (char *)malloc(length + 1u);
+  assert(value != NULL);
+  for (size_t i = 0u; i < length; ++i) {
+    value[i] = (char)(seed + (char)(i % 17u));
+  }
+  value[length] = '\0';
+  return value;
+}
+
 int main(void) {
   ProcessTreeEntry entry;
   edr_pt_cache_init();
@@ -67,6 +78,85 @@ int main(void) {
   assert(edr_pt_cache_remove(4242u) == 0);
   assert(edr_pt_cache_snapshot(4243u, &entry) == 0);
   assert(strcmp(entry.process_name, "cmd.exe") == 0);
+
+  {
+    /* The 256/512 and 1024 intermediate thresholds are not source limits.
+     * A full BehaviorRecord-sized fact survives; only input beyond the public
+     * 4096-byte contract is clipped and named. */
+    char *cmd_256 = make_text(256u, 'a');
+    char *path_1024 = make_text(1024u, 'A');
+    char *full_cmd = make_text(EDR_PTC_STR_LONG - 1u, 'b');
+    char *full_path = make_text(EDR_PTC_STR_PATH - 1u, 'B');
+    char *over_cmd = make_text(EDR_PTC_STR_LONG, 'c');
+    char *over_path = make_text(EDR_PTC_STR_PATH, 'C');
+
+    assert(edr_pt_cache_put(8100u, 1u, "boundary.exe", cmd_256,
+                            path_1024, "parent.exe", 100u) == 0);
+    assert(edr_pt_cache_snapshot(8100u, &entry) == 0);
+    assert(strlen(entry.cmdline) == 256u);
+    assert(strlen(entry.exe_path) == 1024u);
+    assert(entry.source_truncation_mask == 0u);
+
+    assert(edr_pt_cache_put(8101u, 1u, "full.exe", full_cmd,
+                            full_path, "parent.exe", 101u) == 0);
+    assert(edr_pt_cache_snapshot(8101u, &entry) == 0);
+    assert(strlen(entry.cmdline) == EDR_PTC_STR_LONG - 1u);
+    assert(strlen(entry.exe_path) == EDR_PTC_STR_PATH - 1u);
+    assert(entry.source_truncation_mask == 0u);
+
+    assert(edr_pt_cache_put(8102u, 1u, "over.exe", over_cmd,
+                            over_path, "parent.exe", 102u) == 0);
+    assert(edr_pt_cache_snapshot(8102u, &entry) == 0);
+    assert(strlen(entry.cmdline) == EDR_PTC_STR_LONG - 1u);
+    assert(strlen(entry.exe_path) == EDR_PTC_STR_PATH - 1u);
+    assert((entry.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE) != 0u);
+    assert((entry.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) != 0u);
+
+    /* A full-size prefix may already have been clipped by the collector.
+     * Provenance, not strlen, must keep that fact non-resolved. */
+    assert(edr_pt_cache_put_generation_with_provenance(
+               8103u, 1u, "upstream.exe", full_cmd, full_path, "parent.exe",
+               103u, UINT64_C(0x8103), test_unix_ns_to_filetime(103u),
+               EDR_PTC_SOURCE_TRUNC_CMDLINE | EDR_PTC_SOURCE_TRUNC_EXE_PATH) == 0);
+    assert(edr_pt_cache_snapshot(8103u, &entry) == 0);
+    assert(strlen(entry.cmdline) == EDR_PTC_STR_LONG - 1u);
+    assert(strlen(entry.exe_path) == EDR_PTC_STR_PATH - 1u);
+    assert((entry.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE) != 0u);
+    assert((entry.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) != 0u);
+
+    free(cmd_256);
+    free(path_1024);
+    free(full_cmd);
+    free(full_path);
+    free(over_cmd);
+    free(over_path);
+  }
+
+  {
+    char *over_cmd = make_text(EDR_PTC_STR_LONG, 'd');
+    char *over_path = make_text(EDR_PTC_STR_PATH, 'D');
+    char *parent_cmdline = (char *)calloc(EDR_PTC_STR_LONG, 1u);
+    char grandparent_path[512];
+    uint8_t projection_truncation = 0u;
+    assert(parent_cmdline != NULL);
+    assert(edr_pt_cache_put(8200u, 0u, "grandparent.exe", "grandparent",
+                            over_path, "", 200u) == 0);
+    assert(edr_pt_cache_put(8201u, 8200u, "parent.exe", over_cmd,
+                            "C:/parent.exe", "grandparent.exe", 201u) == 0);
+    assert(edr_pt_cache_put(8202u, 8201u, "child.exe", "child",
+                            "C:/child.exe", "parent.exe", 202u) == 0);
+    edr_pt_cache_fill_record_at_with_provenance(
+        8202u, 203u, NULL, 0u, grandparent_path,
+        sizeof(grandparent_path), NULL, parent_cmdline, EDR_PTC_STR_LONG,
+        NULL, &projection_truncation);
+    assert(strlen(parent_cmdline) == EDR_PTC_STR_LONG - 1u);
+    assert(strlen(grandparent_path) == sizeof(grandparent_path) - 1u);
+    assert((projection_truncation & EDR_PTC_RECORD_TRUNC_PARENT_CMDLINE) != 0u);
+    assert((projection_truncation & EDR_PTC_RECORD_TRUNC_GRANDPARENT_PATH) != 0u);
+    free(parent_cmdline);
+    free(over_cmd);
+    free(over_path);
+  }
 
   {
     uint64_t now = test_wall_ns();

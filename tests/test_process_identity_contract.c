@@ -210,8 +210,8 @@ int main(void) {
                          "NT device paths must use the startup device map");
   ok &= require_contains(collector, "NOT_EVALUABLE",
                          "unmapped NT device paths must be explicitly non-evaluable");
-  ok &= require_contains(collector, "source_completeness\", \"ENRICHMENT_ONLY",
-                         "late Security 4688 must be marked as enrichment-only evidence");
+  /* Security-only expiry is owned and behavior-tested by
+   * test_process_create_coalescer; it is not a collector string contract. */
   ok &= require_absent(collector, "pid-%u",
                        "collector must not manufacture a parent name from a PID");
 
@@ -355,8 +355,10 @@ int main(void) {
                        "only the evidence worker may consume the auto-reset work event");
   ok &= require_before(evidence_worker,
                        "if (evidence_find_snapshot_locked(path, generation, now, out, &ready))",
-                       "if (!edr_windows_file_identity_open_readonly(path",
+                       "if (!edr_windows_file_identity_open_readonly_diagnostic(",
                        "generation snapshot retrieval must precede any pathname reopen");
+  ok &= require_contains(evidence_worker, "out->hash_reason, sizeof(out->hash_reason)",
+                         "file identity failure detail must reach existing evidence reasons");
   ok &= require_contains(evidence_worker, "EDR_EVIDENCE_RETAIN_NS",
                          "burst eviction must preserve snapshots through the coalescer window");
   ok &= require_before(pipeline,
@@ -369,8 +371,8 @@ int main(void) {
       "preprocess must wait only when the requested file object has work in flight");
   ok &= require_contains(
       pipeline,
-      "br->type != EDR_EVENT_PROCESS_CREATE && br->type != EDR_EVENT_FILE_READ &&\n       !br->kernel_file_activity",
-      "P0 file create/write sources must enter actor-image evidence collection");
+      "if (!edr_behavior_has_process_actor(br))",
+      "actor-image evidence uses the behavior-tested shared actor-family contract");
   ok &= require_contains(
       pipeline,
       "br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br)",
