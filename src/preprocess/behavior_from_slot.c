@@ -1278,6 +1278,7 @@ typedef struct {
   char image_resolution_status[32];
   char image_resolution_source[32];
   char source_completeness[32];
+  char source_truncated_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
   char collector_evidence_gate[64];
   char collector_evidence_reason[96];
   char collector_event_id[EDR_BR_ID_LEN];
@@ -1345,6 +1346,7 @@ enum {
   EDR_ETW_TRUNC_REG_VALUE_NAME = 1ull << 29,
   EDR_ETW_TRUNC_REG_OLD_VALUE_DATA = 1ull << 30,
   EDR_ETW_TRUNC_DNS_QUERY = 1ull << 31,
+  EDR_ETW_TRUNC_SOURCE_TRUNCATED_FIELDS = 1ull << 32,
 };
 
 static int copy_text_exact(char *dst, size_t cap, const char *src) {
@@ -1531,6 +1533,33 @@ static void mark_etw1_input_truncations(EdrBehaviorRecord *r, uint64_t mask) {
     mark_source_truncation(r, "reg_old_value_data");
   }
   if (mask & EDR_ETW_TRUNC_DNS_QUERY) mark_source_truncation(r, "dns_query");
+  if (mask & EDR_ETW_TRUNC_SOURCE_TRUNCATED_FIELDS) {
+    mark_source_truncation(r, "list_overflow");
+  }
+}
+
+static void merge_explicit_source_truncations(EdrBehaviorRecord *r, const char *list) {
+  const char *start;
+  if (!r || !list || !list[0]) return;
+  start = list;
+  while (*start) {
+    static const char prefix[] = "source.";
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len > sizeof(prefix) - 1u &&
+        memcmp(start, prefix, sizeof(prefix) - 1u) == 0 &&
+        len - (sizeof(prefix) - 1u) < 56u) {
+      char field[56];
+      size_t field_len = len - (sizeof(prefix) - 1u);
+      memcpy(field, start + sizeof(prefix) - 1u, field_len);
+      field[field_len] = '\0';
+      mark_source_truncation(r, field);
+    } else {
+      mark_source_truncation(r, "list_overflow");
+    }
+    if (!end) break;
+    start = end + 1u;
+  }
 }
 
 static void append_sensor_kv(Etw1Fields *f, const char *key, const char *val) {
@@ -1745,6 +1774,10 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "source_completeness") == 0) {
     (void)etw1_copy_text(f, f->source_completeness, sizeof(f->source_completeness), val,
                          EDR_ETW_TRUNC_SOURCE_COMPLETENESS);
+  } else if (strcmp(key, "source_truncated_fields") == 0) {
+    (void)etw1_copy_text(f, f->source_truncated_fields,
+                         sizeof(f->source_truncated_fields), val,
+                         EDR_ETW_TRUNC_SOURCE_TRUNCATED_FIELDS);
   } else if (strcmp(key, "file_key") == 0) {
     char *end = NULL;
     unsigned long long value = strtoull(val, &end, 0);
@@ -2100,6 +2133,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     r->kernel_file_activity = is_file_activity_event(slot->type) &&
                               strcmp(ef.prov, "kfile") == 0;
     mark_etw1_input_truncations(r, ef.truncation_mask);
+    merge_explicit_source_truncations(r, ef.source_truncated_fields);
     if (strcmp(ef.prov, "sec") == 0 && ef.eid == 4688u) {
       r->is_security_4688 = 1u;
     }
@@ -2410,7 +2444,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     /* Later ETW metadata can describe a normal source state, but it cannot
      * erase a field omission detected while parsing this same record. */
-    if (ef.truncation_mask != 0u) {
+    if (ef.truncation_mask != 0u || r->source_truncated_fields[0] != '\0') {
       (void)copy_text_exact(r->source_completeness, sizeof(r->source_completeness),
                             "TRUNCATED");
     }

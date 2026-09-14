@@ -42,6 +42,7 @@
 #include "edr/windows_event_policy.h"
 
 #include "ave_etw_feed_win.h"
+#include "security_event_xml.h"
 #include "security_event_time_win.h"
 
 #include <string.h>
@@ -1382,65 +1383,10 @@ static void edr_collector_debug_tdh_payload(const EdrEventSlot *slot, const char
           tag ? tag : "unknown", (int)slot->type, (int)slot->size, (const char *)slot->data);
 }
 
-static int edr_xml_entity_append(char *out, size_t cap, size_t *off, const char *s, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    char c = s[i];
-    if (c == '&') {
-      if (i + 5u <= n && memcmp(s + i, "&amp;", 5) == 0) {
-        c = '&';
-        i += 4u;
-      } else if (i + 4u <= n && memcmp(s + i, "&lt;", 4) == 0) {
-        c = '<';
-        i += 3u;
-      } else if (i + 4u <= n && memcmp(s + i, "&gt;", 4) == 0) {
-        c = '>';
-        i += 3u;
-      } else if (i + 6u <= n && memcmp(s + i, "&quot;", 6) == 0) {
-        c = '"';
-        i += 5u;
-      } else if (i + 6u <= n && memcmp(s + i, "&apos;", 6) == 0) {
-        c = '\'';
-        i += 5u;
-      }
-    }
-    if (*off + 1u >= cap) {
-      out[cap - 1u] = '\0';
-      return 0;
-    }
-    out[(*off)++] = c;
-  }
-  if (*off < cap) {
-    out[*off] = '\0';
-  }
-  return 1;
-}
-
 static int edr_xml_get_data_utf8(const char *xml, const char *name, char *out, size_t cap) {
-  if (!xml || !name || !out || cap == 0u) {
-    return 0;
-  }
-  out[0] = '\0';
-  char needle1[160];
-  char needle2[160];
-  snprintf(needle1, sizeof(needle1), "<Data Name='%s'>", name);
-  snprintf(needle2, sizeof(needle2), "<Data Name=\"%s\">", name);
-  const char *p = strstr(xml, needle1);
-  size_t prefix = strlen(needle1);
-  if (!p) {
-    p = strstr(xml, needle2);
-    prefix = strlen(needle2);
-  }
-  if (!p) {
-    return 0;
-  }
-  p += prefix;
-  const char *e = strstr(p, "</Data>");
-  if (!e || e <= p) {
-    return 0;
-  }
-  size_t off = 0u;
-  (void)edr_xml_entity_append(out, cap, &off, p, (size_t)(e - p));
-  return out[0] ? 1 : 0;
+  EdrSecurityXmlTextStatus status =
+      edr_security_xml_get_data_utf8(xml, name, out, cap, NULL);
+  return status > EDR_SECURITY_XML_TEXT_MISSING && out[0] != '\0';
 }
 
 static int edr_evt_render_xml_utf8(EVT_HANDLE event, char **out_xml) {
@@ -2093,8 +2039,11 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   char parent_img[1024];
   char integrity[256];
   char token_elev[64];
+  size_t cmd_source_length = 0u;
+  EdrSecurityXmlTextStatus cmd_status;
   (void)edr_xml_get_data_utf8(xml, "NewProcessName", img, sizeof(img));
-  (void)edr_xml_get_data_utf8(xml, "CommandLine", cmd, sizeof(cmd));
+  cmd_status = edr_security_xml_get_data_utf8(xml, "CommandLine", cmd, sizeof(cmd),
+                                               &cmd_source_length);
   (void)edr_xml_get_data_utf8(xml, "NewProcessId", epid, sizeof(epid));
   (void)edr_xml_get_data_utf8(xml, "ProcessId", ppid, sizeof(ppid));
   (void)edr_xml_get_data_utf8(xml, "SubjectUserName", creator_user, sizeof(creator_user));
@@ -2137,25 +2086,39 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
     edr_collector_slot_append_kv(&slot, "creator_sid", creator_sid), edr_collector_slot_append_kv(&slot, "creator_user", creator_user),
     edr_collector_slot_append_kv(&slot, "creator_domain", creator_domain), edr_collector_slot_append_kv(&slot, "creator_logon_id", creator_logon_id)};
   EdrSlotKvResult ri = edr_collector_slot_append_kv(&slot, "img", img);
-  EdrSlotKvResult rc = edr_collector_slot_append_kv(&slot, "cmd", cmd);
   EdrSlotKvResult optional[] = {
     edr_collector_slot_append_kv(&slot, "parent_img", parent_img), edr_collector_slot_append_kv(&slot, "integrity", integrity),
     edr_collector_slot_append_kv(&slot, "token_elevation", token_elev)};
+  int cmd_source_truncated =
+      cmd_status == EDR_SECURITY_XML_TEXT_TRUNCATED || cmd_source_length >= sizeof(cmd);
+  EdrSlotKvResult source_status = edr_collector_slot_append_kv(
+      &slot, "source_completeness", cmd_source_truncated ? "TRUNCATED" : "ENRICHMENT_ONLY");
+  EdrSlotKvResult source_fields = cmd_source_truncated
+      ? edr_collector_slot_append_kv(&slot, "source_truncated_fields", "source.cmdline")
+      : EDR_SLOT_KV_EMPTY;
+  EdrSlotKvResult rc = edr_collector_slot_append_kv(&slot, "cmd", cmd);
+  if (cmd[0] && rc != EDR_SLOT_KV_APPENDED && !cmd_source_truncated) {
+    source_fields = edr_collector_slot_append_kv(
+        &slot, "source_truncated_fields", "source.cmdline");
+    source_status = edr_collector_slot_append_kv(&slot, "source_completeness", "TRUNCATED");
+    cmd_source_truncated = 1;
+  }
   if (rp != EDR_SLOT_KV_APPENDED || re != EDR_SLOT_KV_APPENDED || rpp != EDR_SLOT_KV_APPENDED ||
+      source_status != EDR_SLOT_KV_APPENDED ||
+      (cmd_source_truncated && source_fields != EDR_SLOT_KV_APPENDED) ||
       (ri != EDR_SLOT_KV_APPENDED && rc != EDR_SLOT_KV_APPENDED)) {
     s_health.security_4688_required_overflow_dropped++; s_health.collector_dropped++; return ERROR_SUCCESS;
   }
-  int degraded = 0;
+  int degraded = cmd_source_truncated;
   for (size_t oi = 0; oi < sizeof(identity)/sizeof(identity[0]); oi++) if (identity[oi] == EDR_SLOT_KV_NO_SPACE || identity[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) { degraded = 1; s_health.security_4688_identity_capacity_omitted_fields++; }
   for (size_t oi = 0; oi < sizeof(optional)/sizeof(optional[0]); oi++) if (optional[oi] == EDR_SLOT_KV_NO_SPACE || optional[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) degraded = 1;
-  if (ri == EDR_SLOT_KV_VALUE_TOO_LONG || rc == EDR_SLOT_KV_VALUE_TOO_LONG) s_health.security_4688_values_rejected++;
+  if (cmd_source_truncated || ri == EDR_SLOT_KV_VALUE_TOO_LONG || rc == EDR_SLOT_KV_VALUE_TOO_LONG) s_health.security_4688_values_rejected++;
   if (edr_security_target_sid_present(user_sid) && edr_security_target_logon_present(logon_id)) s_health.security_4688_effective_identity_present_events++;
   if (edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id)) s_health.security_4688_creator_identity_present_events++;
   if (!(edr_security_target_sid_present(user_sid) && edr_security_target_logon_present(logon_id)) &&
       !(edr_security_identity_value_present(creator_sid) || edr_security_identity_value_present(creator_user) || edr_security_identity_value_present(creator_domain) || edr_security_identity_value_present(creator_logon_id))) s_health.security_4688_identity_none_events++;
   if (degraded) s_health.security_4688_payload_degraded++; else s_health.security_4688_payload_full++;
   s_health.security_audit_visible = 1;
-  (void)edr_collector_slot_append_kv(&slot, "source_completeness", "ENRICHMENT_ONLY");
   if (!security_event_time_ns) {
     (void)edr_collector_slot_append_kv(&slot, "process_generation_source",
                                        "security_event_time_unavailable");

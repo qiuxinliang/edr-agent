@@ -342,6 +342,11 @@ if(NOT WIN32)
 endif()
 add_test(NAME process_create_coalescer_state_machine COMMAND test_process_create_coalescer)
 
+add_executable(test_security_event_xml
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_security_event_xml.c)
+edr_apply_test_warnings(test_security_event_xml)
+add_test(NAME security_event_xml_bounded_command_line COMMAND test_security_event_xml)
+
 add_executable(test_cmd_actor_artifact
   ${CMAKE_CURRENT_SOURCE_DIR}/test_cmd_actor_artifact.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c

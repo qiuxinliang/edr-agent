@@ -184,8 +184,16 @@ int main(void) {
                          "4688 must drop incomplete required payloads rather than truncate");
   ok &= require_contains(collector, "EDR_SLOT_KV_VALUE_TOO_LONG",
                          "ETW1 append helper must distinguish oversized values");
+  ok &= require_contains(collector, "cmd_status = edr_security_xml_get_data_utf8",
+                         "4688 must retain the bounded XML extraction status");
+  ok &= require_contains(collector, "cmd_status == EDR_SECURITY_XML_TEXT_TRUNCATED",
+                         "4688 must distinguish a source-truncated command prefix");
+  ok &= require_contains(collector, "\"source_truncated_fields\", \"source.cmdline\"",
+                         "4688 must name a command omitted at the source boundary");
   ok &= require_contains(collector, "EdrSlotKvResult identity[]",
                          "4688 must append identity fields before image and command fields");
+  ok &= require_before(collector, "EdrSlotKvResult optional[]", "EdrSlotKvResult rc =",
+                       "4688 must reserve integrity and elevation before bounded command text");
   ok &= require_contains(collector, "security_4688_identity_capacity_omitted_fields",
                          "4688 health must distinguish capacity identity omissions");
   ok &= require_contains(collector, "edr_security_target_sid_present(user_sid)",

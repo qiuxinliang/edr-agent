@@ -477,6 +477,38 @@ static uint64_t sqlite_post_artifact_count(const char *path, const char *candida
   return count;
 }
 
+static void sqlite_assert_post_artifact_completeness(const char *path,
+                                                      const char *candidate_id,
+                                                      const char *source_event_id,
+                                                      const char *expected) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  unsigned matches = 0u;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT manifest_json FROM artifacts WHERE artifact_type='post_context' AND candidate_id=?;",
+      -1, &stmt, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *manifest = (const char *)sqlite3_column_text(stmt, 0);
+    cJSON *json = cJSON_Parse(manifest ? manifest : "");
+    cJSON *source = json ? cJSON_GetObjectItemCaseSensitive(json, "source_event_id") : NULL;
+    cJSON *completeness = json
+        ? cJSON_GetObjectItemCaseSensitive(json, "source_completeness") : NULL;
+    assert(json != NULL);
+    if (cJSON_IsString(source) && source->valuestring &&
+        strcmp(source->valuestring, source_event_id) == 0) {
+      assert(cJSON_IsString(completeness) && completeness->valuestring);
+      assert(strcmp(completeness->valuestring, expected) == 0);
+      matches++;
+    }
+    cJSON_Delete(json);
+  }
+  sqlite3_finalize(stmt);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(matches == 1u);
+}
+
 static uint64_t sqlite_post_artifact_total(const char *path, const char *candidate_id) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
@@ -805,6 +837,124 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   (void)remove(db);
   (void)remove("local_evidence_cache_write_budget.sqlite-wal");
   (void)remove("local_evidence_cache_write_budget.sqlite-shm");
+}
+
+static void test_post_context_exact_replay_charges_only_durable_changes(void) {
+  const char *db = "local_evidence_cache_post_context_replay.sqlite";
+  struct timespec ts;
+  EdrBehaviorRecord candidate_a;
+  EdrBehaviorRecord candidate_b;
+  EdrBehaviorRecord context;
+  EdrEvidenceCacheStatus before_replay;
+  EdrEvidenceCacheStatus after_replay;
+  EdrEvidenceCacheStatus after_update;
+  EdrEvidenceCacheStatus after_exhaustion;
+  char candidate_a_id[160];
+  char candidate_b_id[160];
+  int64_t base;
+
+  (void)remove(db);
+  (void)remove("local_evidence_cache_post_context_replay.sqlite-wal");
+  (void)remove("local_evidence_cache_post_context_replay.sqlite-shm");
+  /* Candidate setup remains outside the context budget. Enabling the small
+   * budget afterwards isolates exactly the post-context change accounting. */
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "0");
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+
+  init_record(&candidate_a, EDR_EVENT_NET_CONNECT);
+  candidate_a.priority = 3u;
+  candidate_a.pid = 74201u;
+  candidate_a.event_time_ns = base;
+  candidate_a.process_start_key = UINT64_C(0x74201);
+  candidate_a.process_creation_filetime_100ns = UINT64_C(133700000000074201);
+  snprintf(candidate_a.endpoint_id, sizeof(candidate_a.endpoint_id), "ep-context-replay");
+  snprintf(candidate_a.event_id, sizeof(candidate_a.event_id), "replay-candidate-a");
+  snprintf(candidate_a.process_name, sizeof(candidate_a.process_name), "powershell.exe");
+  snprintf(candidate_a.net_dst, sizeof(candidate_a.net_dst), "10.0.0.201");
+  candidate_a.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate_a);
+
+  candidate_b = candidate_a;
+  candidate_b.event_time_ns = base + 1000000LL;
+  snprintf(candidate_b.event_id, sizeof(candidate_b.event_id), "replay-candidate-b");
+  snprintf(candidate_b.net_dst, sizeof(candidate_b.net_dst), "10.0.0.202");
+  edr_local_evidence_cache_record_behavior(&candidate_b);
+  sqlite_candidate_id_for_source_event(db, "replay-candidate-a", candidate_a_id,
+                                       sizeof(candidate_a_id));
+  sqlite_candidate_id_for_source_event(db, "replay-candidate-b", candidate_b_id,
+                                       sizeof(candidate_b_id));
+
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "2");
+  context = candidate_a;
+  context.priority = 1u;
+  context.type = EDR_EVENT_PROCESS_CREATE;
+  context.event_time_ns = base + 2000000LL;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
+  snprintf(context.event_id, sizeof(context.event_id), "post-context-replay");
+  snprintf(context.process_name, sizeof(context.process_name), "parent-helper.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "parent-helper.exe --benign");
+  snprintf(context.source_completeness, sizeof(context.source_completeness),
+           "CORRELATION_MISSING");
+  assert(edr_local_evidence_cache_is_candidate(&context) == 0);
+
+  /* One source event belongs to two candidate windows, so its first durable
+   * version is one atomic two-unit change. */
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&before_replay);
+  assert(before_replay.candidate_admitted == 2u);
+  assert(before_replay.candidate_rejected == 0u);
+  assert(before_replay.write_budget_critical_context_used == 2u);
+  assert(sqlite_post_artifact_count(db, candidate_a_id, "post-context-replay") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-replay") == 1u);
+
+  for (unsigned i = 0u; i < 100u; ++i) {
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+  edr_local_evidence_cache_get_status(&after_replay);
+  assert(after_replay.write_budget_critical_context_used ==
+         before_replay.write_budget_critical_context_used);
+  assert(after_replay.artifacts_written == before_replay.artifacts_written);
+  assert(after_replay.write_budget_critical_context_dropped ==
+         before_replay.write_budget_critical_context_dropped);
+  assert(sqlite_post_artifact_count(db, candidate_a_id, "post-context-replay") == 1u);
+  assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-replay") == 1u);
+
+  /* The identity is unchanged but the manifest is richer. Both candidate
+   * copies must update atomically and consume exactly two more units. */
+  snprintf(context.source_completeness, sizeof(context.source_completeness), "COMPLETE");
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&after_update);
+  assert(after_update.write_budget_critical_context_used == 4u);
+  assert(after_update.artifacts_written == after_replay.artifacts_written + 2u);
+  sqlite_assert_post_artifact_completeness(db, candidate_a_id, "post-context-replay",
+                                           "COMPLETE");
+  sqlite_assert_post_artifact_completeness(db, candidate_b_id, "post-context-replay",
+                                           "COMPLETE");
+
+  /* Critical limit is base*2 == 4. A new two-candidate artifact cannot fit;
+   * budget rejection must leave neither candidate with a partial row. */
+  context.event_time_ns++;
+  snprintf(context.event_id, sizeof(context.event_id), "post-context-over-budget");
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&after_exhaustion);
+  assert(after_exhaustion.write_budget_critical_context_used == 4u);
+  assert(after_exhaustion.write_budget_critical_context_dropped ==
+         after_update.write_budget_critical_context_dropped + 1u);
+  assert(after_exhaustion.artifacts_written == after_update.artifacts_written);
+  assert(after_exhaustion.candidate_rejected == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_a_id, "post-context-over-budget") == 0u);
+  assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-over-budget") == 0u);
+
+  edr_local_evidence_cache_close();
+  test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  (void)remove(db);
+  (void)remove("local_evidence_cache_post_context_replay.sqlite-wal");
+  (void)remove("local_evidence_cache_post_context_replay.sqlite-shm");
 }
 
 /* A generation-less enrichment record and its later live-generation copy are
@@ -3212,6 +3362,7 @@ int main(void) {
 #if defined(EDR_HAVE_SQLITE)
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
   test_context_write_budget_cannot_starve_later_candidate();
+  test_post_context_exact_replay_charges_only_durable_changes();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
   test_candidate_fallback_preserves_path_and_generation_boundaries();
   test_candidate_known_to_unknown_keeps_generation_and_completeness();

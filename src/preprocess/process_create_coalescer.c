@@ -90,6 +90,93 @@ static int record_has_correlation_fields(const EdrBehaviorRecord *record) {
          record->event_time_ns > 0;
 }
 
+static int source_list_has(const char *list, const char *item, size_t item_len) {
+  const char *start = list;
+  while (start && *start) {
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len == item_len && memcmp(start, item, len) == 0) return 1;
+    start = end ? end + 1u : NULL;
+  }
+  return 0;
+}
+
+static int append_source_list_item(char *dst, size_t cap, const char *item,
+                                   size_t item_len) {
+  size_t used;
+  if (!dst || cap == 0u || !item || item_len == 0u ||
+      source_list_has(dst, item, item_len)) return 1;
+  used = strlen(dst);
+  if (used + (used ? 1u : 0u) + item_len >= cap) return 0;
+  if (used) dst[used++] = ',';
+  memcpy(dst + used, item, item_len);
+  dst[used + item_len] = '\0';
+  return 1;
+}
+
+static void merge_source_lists(char *dst, size_t cap, const char *src) {
+  static const char overflow[] = "source.list_overflow";
+  const char *start = src;
+  if (!dst || cap == 0u || !src || !src[0]) return;
+  while (*start) {
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (!append_source_list_item(dst, cap, start, len)) {
+      if (!append_source_list_item(dst, cap, overflow, sizeof(overflow) - 1u)) {
+        snprintf(dst, cap, "%s", overflow);
+      }
+      return;
+    }
+    if (!end) return;
+    start = end + 1u;
+  }
+}
+
+static int source_field_truncated(const char *list, const char *field) {
+  static const char overflow[] = "source.list_overflow";
+  return list && field &&
+         (source_list_has(list, field, strlen(field)) ||
+          source_list_has(list, overflow, sizeof(overflow) - 1u));
+}
+
+static void remove_source_list_item(char *list, size_t cap, const char *item) {
+  char filtered[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
+  const char *start;
+  size_t item_len;
+  if (!list || cap == 0u || !item || !item[0]) return;
+  filtered[0] = '\0';
+  item_len = strlen(item);
+  start = list;
+  while (*start) {
+    const char *end = strchr(start, ',');
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (!(len == item_len && memcmp(start, item, len) == 0) &&
+        !append_source_list_item(filtered, sizeof(filtered), start, len)) {
+      snprintf(filtered, sizeof(filtered), "%s", "source.list_overflow");
+      break;
+    }
+    if (!end) break;
+    start = end + 1u;
+  }
+  snprintf(list, cap, "%s", filtered);
+}
+
+/* Truncation provenance follows the value selected for a field. An overflow
+ * token means the source could no longer name every omitted field, so it must
+ * remain conservative whenever any value from that source is adopted. */
+static void merge_adopted_field_truncation(char *dst, size_t cap,
+                                           const char *src,
+                                           const char *field) {
+  static const char overflow[] = "source.list_overflow";
+  if (!dst || cap == 0u || !src || !field) return;
+  if (source_list_has(src, field, strlen(field))) {
+    merge_source_lists(dst, cap, field);
+  }
+  if (source_list_has(src, overflow, sizeof(overflow) - 1u)) {
+    merge_source_lists(dst, cap, overflow);
+  }
+}
+
 /* A negatively-skewed or multiply-matching 4688 is never safe enrichment.
  * It also must not revoke a Kernel-Process record that already obtained every
  * 4688-owned mandatory field from the exact StartKey/FILETIME-bound process
@@ -105,32 +192,122 @@ static int kernel_independent_of_4688(const EdrBehaviorRecord *record) {
 }
 
 static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *security) {
+  int kernel_cmd_explicitly_truncated;
+  int security_cmd_truncated;
   if (!kernel || !security) return;
-  if (!kernel->cmdline[0]) memcpy(kernel->cmdline, security->cmdline, sizeof(kernel->cmdline));
-  if (!kernel->parent_name[0]) memcpy(kernel->parent_name, security->parent_name,
-                                      sizeof(kernel->parent_name));
-  if (!kernel->parent_path[0]) memcpy(kernel->parent_path, security->parent_path,
-                                      sizeof(kernel->parent_path));
-  if (!kernel->creator_username[0]) memcpy(kernel->creator_username, security->creator_username,
-                                            sizeof(kernel->creator_username));
-  if (!kernel->creator_domain[0]) memcpy(kernel->creator_domain, security->creator_domain,
-                                          sizeof(kernel->creator_domain));
-  if (!kernel->creator_sid[0]) memcpy(kernel->creator_sid, security->creator_sid,
-                                       sizeof(kernel->creator_sid));
-  if (!kernel->creator_logon_id[0]) memcpy(kernel->creator_logon_id,
-                                            security->creator_logon_id,
-                                            sizeof(kernel->creator_logon_id));
+  kernel_cmd_explicitly_truncated =
+      source_list_has(kernel->source_truncated_fields, "source.cmdline",
+                      sizeof("source.cmdline") - 1u);
+  security_cmd_truncated = source_field_truncated(security->source_truncated_fields,
+                                                  "source.cmdline");
+  if (security->cmdline[0] &&
+      (!kernel->cmdline[0] ||
+       (kernel_cmd_explicitly_truncated && !security_cmd_truncated))) {
+    memcpy(kernel->cmdline, security->cmdline, sizeof(kernel->cmdline));
+    memcpy(kernel->command_line_origin, security->command_line_origin,
+           sizeof(kernel->command_line_origin));
+    if (!security_cmd_truncated) {
+      remove_source_list_item(kernel->source_truncated_fields,
+                              sizeof(kernel->source_truncated_fields),
+                              "source.cmdline");
+    }
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.cmdline");
+  }
+  if (!kernel->parent_name[0] && security->parent_name[0]) {
+    memcpy(kernel->parent_name, security->parent_name, sizeof(kernel->parent_name));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.parent_name");
+  }
+  if (!kernel->parent_path[0] && security->parent_path[0]) {
+    memcpy(kernel->parent_path, security->parent_path, sizeof(kernel->parent_path));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.parent_path");
+  }
+  if (!kernel->integrity_level[0] && security->integrity_level[0]) {
+    memcpy(kernel->integrity_level, security->integrity_level,
+           sizeof(kernel->integrity_level));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.integrity_level");
+  }
+  if (kernel->token_elevation == 0u && security->token_elevation != 0u) {
+    kernel->token_elevation = security->token_elevation;
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.token_elevation");
+  }
+  if (!kernel->creator_username[0] && security->creator_username[0]) {
+    memcpy(kernel->creator_username, security->creator_username,
+           sizeof(kernel->creator_username));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.creator_username");
+  }
+  if (!kernel->creator_domain[0] && security->creator_domain[0]) {
+    memcpy(kernel->creator_domain, security->creator_domain,
+           sizeof(kernel->creator_domain));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.creator_domain");
+  }
+  if (!kernel->creator_sid[0] && security->creator_sid[0]) {
+    memcpy(kernel->creator_sid, security->creator_sid, sizeof(kernel->creator_sid));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.creator_sid");
+  }
+  if (!kernel->creator_logon_id[0] && security->creator_logon_id[0]) {
+    memcpy(kernel->creator_logon_id, security->creator_logon_id,
+           sizeof(kernel->creator_logon_id));
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.creator_logon_id");
+  }
   /* Creator identity is provenance only. Only Target Subject may become the
    * created process identity. */
   if (strcmp(security->identity_quality, "target_4688") == 0 &&
       strcmp(kernel->identity_quality, "token_sid") != 0) {
-    if (!kernel->username[0]) memcpy(kernel->username, security->username,
-                                     sizeof(kernel->username));
-    if (!kernel->domain[0]) memcpy(kernel->domain, security->domain, sizeof(kernel->domain));
-    if (!kernel->user_sid[0]) memcpy(kernel->user_sid, security->user_sid,
-                                     sizeof(kernel->user_sid));
-    if (!kernel->logon_id[0]) memcpy(kernel->logon_id, security->logon_id,
-                                     sizeof(kernel->logon_id));
+    if (!kernel->username[0] && security->username[0]) {
+      memcpy(kernel->username, security->username, sizeof(kernel->username));
+      merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                     sizeof(kernel->source_truncated_fields),
+                                     security->source_truncated_fields,
+                                     "source.username");
+    }
+    if (!kernel->domain[0] && security->domain[0]) {
+      memcpy(kernel->domain, security->domain, sizeof(kernel->domain));
+      merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                     sizeof(kernel->source_truncated_fields),
+                                     security->source_truncated_fields,
+                                     "source.domain");
+    }
+    if (!kernel->user_sid[0] && security->user_sid[0]) {
+      memcpy(kernel->user_sid, security->user_sid, sizeof(kernel->user_sid));
+      merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                     sizeof(kernel->source_truncated_fields),
+                                     security->source_truncated_fields,
+                                     "source.user_sid");
+    }
+    if (!kernel->logon_id[0] && security->logon_id[0]) {
+      memcpy(kernel->logon_id, security->logon_id, sizeof(kernel->logon_id));
+      merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                     sizeof(kernel->source_truncated_fields),
+                                     security->source_truncated_fields,
+                                     "source.logon_id");
+    }
     snprintf(kernel->identity_source, sizeof(kernel->identity_source), "%s", "target_4688");
     snprintf(kernel->identity_quality, sizeof(kernel->identity_quality), "%s", "target_4688");
   } else if (!kernel->identity_quality[0] && security->identity_quality[0]) {

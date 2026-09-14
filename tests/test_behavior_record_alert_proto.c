@@ -287,6 +287,22 @@ static int verify_source_truncation_projection(uint8_t *wire, size_t wire_cap) {
     return 0;
   }
 
+  /* Coalescing describes correlation state, while the qualified list remains
+   * the authoritative source-loss declaration on the wire. */
+  init_transport_record(&record);
+  snprintf(record.source_completeness, sizeof(record.source_completeness), "COALESCED");
+  snprintf(record.source_truncated_fields, sizeof(record.source_truncated_fields),
+           "source.cmdline");
+  if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
+      strcmp(decoded.source_completeness, "COALESCED") != 0 ||
+      strcmp(decoded.transport_completeness, "COMPLETE") != 0 ||
+      strcmp(decoded.truncated_fields, "source.cmdline") != 0) {
+    fprintf(stderr, "coalesced source command mismatch: source=%s transport=%s fields=%s\n",
+            decoded.source_completeness, decoded.transport_completeness,
+            decoded.truncated_fields);
+    return 0;
+  }
+
   /* A full source list plus a real encoder omission must not be silently
    * prefix-truncated.  The stable combined overflow token remains parseable
    * and tells the backend that named omissions are incomplete. */

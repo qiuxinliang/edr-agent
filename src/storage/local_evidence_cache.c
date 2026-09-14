@@ -3104,6 +3104,30 @@ static void artifact_source_identity_for(const EdrBehaviorRecord *r, char *out, 
   out[64] = '\0';
 }
 
+static int artifact_id_for(const EdrBehaviorRecord *r, const char *candidate_id,
+                           const char *artifact_type, char *out, size_t out_cap) {
+  char source_identity[65];
+  const char *type_name = artifact_type && artifact_type[0] ? artifact_type : "artifact";
+  int written;
+  if (!candidate_id || !candidate_id[0] || !out || out_cap == 0u) {
+    return -1;
+  }
+  /* The candidate bundle is a mutable representation of one candidate, not
+   * another source event.  Give its UPSERT a candidate-stable artifact id so
+   * enrichment replaces the manifest instead of accumulating sibling bundles. */
+  if (strcmp(type_name, "p0_context_bundle") == 0) {
+    copy_s(source_identity, sizeof(source_identity), "candidate");
+  } else {
+    artifact_source_identity_for(r, source_identity, sizeof(source_identity));
+  }
+  written = snprintf(out, out_cap, "%s:%s:%s", candidate_id, type_name, source_identity);
+  if (!source_identity[0] || written < 0 || (size_t)written >= out_cap) {
+    set_error("artifact source identity unavailable");
+    return -1;
+  }
+  return 0;
+}
+
 static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candidate_id,
                                   const char *artifact_type, const char *path,
                                   const char *sha256, const char *manifest_json,
@@ -3122,21 +3146,8 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
     return -1;
   }
   char artifact_id[384];
-  char source_identity[65];
-  const char *type_name = artifact_type && artifact_type[0] ? artifact_type : "artifact";
-  /* The candidate bundle is a mutable representation of one candidate, not
-   * another source event.  Give its UPSERT a candidate-stable artifact id so
-   * enrichment replaces the manifest instead of accumulating sibling bundles. */
-  if (strcmp(type_name, "p0_context_bundle") == 0) {
-    copy_s(source_identity, sizeof(source_identity), "candidate");
-  } else {
-    artifact_source_identity_for(r, source_identity, sizeof(source_identity));
-  }
-  int artifact_id_written = snprintf(artifact_id, sizeof(artifact_id), "%s:%s:%s",
-                                     candidate_id, type_name, source_identity);
-  if (!source_identity[0] || artifact_id_written < 0 ||
-      (size_t)artifact_id_written >= sizeof(artifact_id)) {
-    set_error("artifact source identity unavailable");
+  if (artifact_id_for(r, candidate_id, artifact_type, artifact_id,
+                      sizeof(artifact_id)) != 0) {
     sqlite3_finalize(st);
     return -1;
   }
@@ -3159,18 +3170,104 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
   return rc == SQLITE_DONE ? 0 : -1;
 }
 
-static int sqlite_record_context_artifact(const EdrBehaviorRecord *r, const char *candidate_id) {
-  if (!s_db || !r || !candidate_id || !candidate_id[0]) {
+typedef struct {
+  uint32_t candidate_index;
+  char *manifest;
+} PreparedContextArtifact;
+
+typedef struct {
+  PreparedContextArtifact *items;
+  uint32_t count;
+} PreparedContextArtifacts;
+
+static void sqlite_free_prepared_context_artifacts(PreparedContextArtifacts *prepared) {
+  if (!prepared) return;
+  for (uint32_t i = 0u; i < prepared->count; ++i) {
+    cJSON_free(prepared->items[i].manifest);
+  }
+  free(prepared->items);
+  prepared->items = NULL;
+  prepared->count = 0u;
+}
+
+/* Returns 1 only when the durable artifact has the exact stable manifest,
+ * 0 when it is absent or needs enrichment, and -1 on a database failure.
+ * build_post_context_manifest_json deliberately contains source event fields
+ * only; wall-clock created_ns remains row metadata and cannot make a replay
+ * look like new content. */
+static int sqlite_context_artifact_is_exact_replay(const EdrBehaviorRecord *r,
+                                                   const char *candidate_id,
+                                                   const char *manifest) {
+  static const char sql[] = "SELECT manifest_json FROM artifacts WHERE artifact_id=?;";
+  char artifact_id[384];
+  sqlite3_stmt *st = NULL;
+  int result = -1;
+  if (!s_db || !manifest ||
+      artifact_id_for(r, candidate_id, "post_context", artifact_id,
+                      sizeof(artifact_id)) != 0) {
     return -1;
   }
-  char *manifest = NULL;
-  if (build_post_context_manifest_json(r, candidate_id, &manifest) != 0) {
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    set_error("prepare post-context replay lookup failed");
     return -1;
   }
-  int rc = insert_artifact_sqlite(r, candidate_id, "post_context", "", "", manifest,
-                                  "local_manifest");
-  cJSON_free(manifest);
-  return rc;
+  bind_text(st, 1, artifact_id);
+  switch (sqlite3_step(st)) {
+    case SQLITE_ROW: {
+      const char *existing = (const char *)sqlite3_column_text(st, 0);
+      result = existing && strcmp(existing, manifest) == 0 ? 1 : 0;
+      break;
+    }
+    case SQLITE_DONE:
+      result = 0;
+      break;
+    default:
+      set_error("read post-context replay manifest failed");
+      result = -1;
+      break;
+  }
+  sqlite3_finalize(st);
+  return result;
+}
+
+static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
+                                            char candidate_ids[][160],
+                                            uint32_t candidate_count,
+                                            PreparedContextArtifacts *prepared) {
+  if (!s_db || !r || !candidate_ids || candidate_count == 0u || !prepared) {
+    return -1;
+  }
+  memset(prepared, 0, sizeof(*prepared));
+  prepared->items = (PreparedContextArtifact *)calloc(
+      candidate_count, sizeof(PreparedContextArtifact));
+  if (!prepared->items) {
+    set_error("allocate post-context replay plan failed");
+    return -1;
+  }
+  for (uint32_t i = 0u; i < candidate_count; ++i) {
+    char *manifest = NULL;
+    int exact_replay;
+    if (!candidate_ids[i][0] ||
+        build_post_context_manifest_json(r, candidate_ids[i], &manifest) != 0) {
+      sqlite_free_prepared_context_artifacts(prepared);
+      return -1;
+    }
+    exact_replay = sqlite_context_artifact_is_exact_replay(
+        r, candidate_ids[i], manifest);
+    if (exact_replay < 0) {
+      cJSON_free(manifest);
+      sqlite_free_prepared_context_artifacts(prepared);
+      return -1;
+    }
+    if (exact_replay != 0) {
+      cJSON_free(manifest);
+      continue;
+    }
+    prepared->items[prepared->count].candidate_index = i;
+    prepared->items[prepared->count].manifest = manifest;
+    prepared->count++;
+  }
+  return 0;
 }
 
 /* Preserve all-or-none post-context attribution when one event belongs to
@@ -3181,14 +3278,16 @@ static int sqlite_commit_candidate_transaction(void);
 
 static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
                                            char candidate_ids[][160],
-                                           uint32_t candidate_count) {
-  if (!r || !candidate_ids || candidate_count == 0u ||
+                                           const PreparedContextArtifacts *prepared) {
+  if (!r || !candidate_ids || !prepared || prepared->count == 0u ||
       exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
-  for (uint32_t i = 0u; i < candidate_count; ++i) {
-    if (!candidate_ids[i][0] ||
-        sqlite_record_context_artifact(r, candidate_ids[i]) != 0) {
+  for (uint32_t i = 0u; i < prepared->count; ++i) {
+    uint32_t candidate_index = prepared->items[i].candidate_index;
+    if (!candidate_ids[candidate_index][0] ||
+        insert_artifact_sqlite(r, candidate_ids[candidate_index], "post_context", "", "",
+                               prepared->items[i].manifest, "local_manifest") != 0) {
       sqlite_rollback_silent();
       return -1;
     }
@@ -3197,6 +3296,39 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
     sqlite_rollback_silent();
     return -1;
   }
+  return 0;
+}
+
+static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
+                                                    char candidate_ids[][160],
+                                                    uint32_t candidate_count,
+                                                    int64_t ts,
+                                                    EvidenceWriteClass write_class,
+                                                    uint32_t *written) {
+  PreparedContextArtifacts prepared;
+  uint32_t changes;
+  if (written) *written = 0u;
+  if (sqlite_prepare_context_artifacts(r, candidate_ids, candidate_count,
+                                       &prepared) != 0) {
+    return -1;
+  }
+  changes = prepared.count;
+  if (changes == 0u) {
+    sqlite_free_prepared_context_artifacts(&prepared);
+    return 0;
+  }
+  if (!sqlite_size_budget_allow() ||
+      !sqlite_write_budget_allow(changes, ts, write_class)) {
+    sqlite_free_prepared_context_artifacts(&prepared);
+    return -1;
+  }
+  if (sqlite_record_context_artifacts(r, candidate_ids, &prepared) != 0) {
+    sqlite_write_budget_release(changes, ts, write_class);
+    sqlite_free_prepared_context_artifacts(&prepared);
+    return -1;
+  }
+  if (written) *written = changes;
+  sqlite_free_prepared_context_artifacts(&prepared);
   return 0;
 }
 
@@ -4340,37 +4472,27 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
      * earlier live candidate.  The candidate commit remains durable even if a
      * separately budgeted context bundle cannot be admitted. */
     if (context_candidate_count > 0u) {
-      if (!sqlite_size_budget_allow() ||
-          !sqlite_write_budget_allow(context_candidate_count, ts,
-                                     context_write_class)) {
-        s_status.records_dropped++;
-      } else if (sqlite_record_context_artifacts(r, context_candidate_ids,
-                                                  context_candidate_count) != 0) {
-        sqlite_write_budget_release(context_candidate_count, ts,
-                                    context_write_class);
+      uint32_t context_artifacts_written = 0u;
+      if (sqlite_record_budgeted_context_artifacts(
+              r, context_candidate_ids, context_candidate_count, ts,
+              context_write_class, &context_artifacts_written) != 0) {
         s_status.records_dropped++;
       } else {
-        s_status.artifacts_written += context_candidate_count;
+        s_status.artifacts_written += context_artifacts_written;
       }
     }
   } else if (s_db && store_context) {
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
     ring_record(r);
-    if (!sqlite_size_budget_allow() ||
-        !sqlite_write_budget_allow(context_candidate_count, ts,
-                                   context_write_class)) {
+    uint32_t context_artifacts_written = 0u;
+    if (sqlite_record_budgeted_context_artifacts(
+            r, context_candidate_ids, context_candidate_count, ts,
+            context_write_class, &context_artifacts_written) != 0) {
       s_status.records_dropped++;
       goto done;
     }
-    if (sqlite_record_context_artifacts(r, context_candidate_ids,
-                                        context_candidate_count) != 0) {
-      sqlite_write_budget_release(context_candidate_count, ts,
-                                  context_write_class);
-      s_status.records_dropped++;
-      goto done;
-    }
-    s_status.artifacts_written += context_candidate_count;
+    s_status.artifacts_written += context_artifacts_written;
   } else if (store_context) {
     /* SQLite being unavailable never pretends that a context artifact was
      * admitted; retain only the bounded in-memory view. */

@@ -9,28 +9,26 @@
 
 #define WINDOW_NS (3000ULL * 1000000ULL)
 
-static EdrBehaviorRecord rec(uint32_t pid, int security, uint64_t start_key,
-                             const char *path, int64_t event_time_ns) {
-  EdrBehaviorRecord record;
-  memset(&record, 0, sizeof(record));
-  record.type = EDR_EVENT_PROCESS_CREATE;
-  record.pid = pid;
-  record.ppid = 4u;
-  record.is_security_4688 = (uint8_t)security;
-  record.event_time_ns = event_time_ns;
-  if (!security) record.process_start_key = start_key;
-  snprintf(record.exe_path, sizeof(record.exe_path), "%s", path ? path : "");
-  snprintf(record.image_path_canonical, sizeof(record.image_path_canonical), "%s",
+static void rec(EdrBehaviorRecord *record, uint32_t pid, int security,
+                uint64_t start_key, const char *path, int64_t event_time_ns) {
+  memset(record, 0, sizeof(*record));
+  record->type = EDR_EVENT_PROCESS_CREATE;
+  record->pid = pid;
+  record->ppid = 4u;
+  record->is_security_4688 = (uint8_t)security;
+  record->event_time_ns = event_time_ns;
+  if (!security) record->process_start_key = start_key;
+  snprintf(record->exe_path, sizeof(record->exe_path), "%s", path ? path : "");
+  snprintf(record->image_path_canonical, sizeof(record->image_path_canonical), "%s",
            path ? path : "");
-  snprintf(record.process_name, sizeof(record.process_name), "%s", "cmd.exe");
+  snprintf(record->process_name, sizeof(record->process_name), "%s", "cmd.exe");
   if (security) {
-    snprintf(record.cmdline, sizeof(record.cmdline), "%s /c x.cmd", path ? path : "");
-    snprintf(record.user_sid, sizeof(record.user_sid), "%s", "S-1-5-21-target");
-    snprintf(record.logon_id, sizeof(record.logon_id), "%s", "0x0000000000000021");
-    snprintf(record.identity_source, sizeof(record.identity_source), "%s", "target_4688");
-    snprintf(record.identity_quality, sizeof(record.identity_quality), "%s", "target_4688");
+    snprintf(record->cmdline, sizeof(record->cmdline), "%s /c x.cmd", path ? path : "");
+    snprintf(record->user_sid, sizeof(record->user_sid), "%s", "S-1-5-21-target");
+    snprintf(record->logon_id, sizeof(record->logon_id), "%s", "0x0000000000000021");
+    snprintf(record->identity_source, sizeof(record->identity_source), "%s", "target_4688");
+    snprintf(record->identity_quality, sizeof(record->identity_quality), "%s", "target_4688");
   }
-  return record;
 }
 
 static void make_kernel_independent(EdrBehaviorRecord *record) {
@@ -65,11 +63,13 @@ typedef struct {
 static void *coalescer_submit_stress(void *opaque) {
   CoalescerStressArgs *args = (CoalescerStressArgs *)opaque;
   for (uint32_t i = 0u; i < 4000u; ++i) {
-    EdrBehaviorRecord kernel = rec(args->pid_base + (i % 32u), 0, i + 1u,
-                                   "C:\\stress.exe", 9000000000LL + (int64_t)i * 10LL);
-    EdrBehaviorRecord security = rec(args->pid_base + (i % 32u), 1, 0u,
-                                     "C:\\stress.exe", 9000000001LL + (int64_t)i * 10LL);
+    EdrBehaviorRecord kernel;
+    EdrBehaviorRecord security;
     EdrBehaviorRecord out;
+    rec(&kernel, args->pid_base + (i % 32u), 0, i + 1u,
+        "C:\\stress.exe", 9000000000LL + (int64_t)i * 10LL);
+    rec(&security, args->pid_base + (i % 32u), 1, 0u,
+        "C:\\stress.exe", 9000000001LL + (int64_t)i * 10LL);
     EdrProcessCoalesceResult first = edr_process_coalescer_submit(&kernel, 1, i, &out);
     EdrProcessCoalesceResult second = edr_process_coalescer_submit(&security, 1, i + 1u, &out);
     if (first < EDR_PROCESS_COALESCE_PASS || first > EDR_PROCESS_COALESCE_READY ||
@@ -113,7 +113,7 @@ static void *coalescer_metrics_stress(void *opaque) {
 #endif
 
 int main(void) {
-  EdrBehaviorRecord out;
+  static EdrBehaviorRecord out;
   int ok = 1;
 
   /* A failed EvtRender must remain non-correlatable. Once the real recorded
@@ -121,9 +121,11 @@ int main(void) {
    * never an acceptable substitute and no safety gate is relaxed. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(4532u, 0, 0xa1u, "C:\\powershell.exe",
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 4532u, 0, 0xa1u, "C:\\powershell.exe",
                                     1789252694245704300LL);
-    EdrBehaviorRecord security = rec(4532u, 1, 0u, "C:\\powershell.exe", 0);
+    rec(&security, 4532u, 1, 0u, "C:\\powershell.exe", 0);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "kernel waits for recorded-time enrichment");
     ok &= need(edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_PASS,
@@ -143,8 +145,10 @@ int main(void) {
    * StartKey can invalidate an apparent PID/path match. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(9u, 0, 0xa1u, "C:\\a.exe", 1000000000LL);
-    EdrBehaviorRecord security = rec(9u, 1, 0u, "C:\\a.exe", 1000000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 9u, 0, 0xa1u, "C:\\a.exe", 1000000000LL);
+    rec(&security, 9u, 1, 0u, "C:\\a.exe", 1000000100LL);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "kernel first holds for raw-generation correlation");
     ok &= need(edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD,
@@ -166,8 +170,10 @@ int main(void) {
    * generation-bound record. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(19u, 0, 0xa19u, "C:\\slow4688.exe", 1000000000LL);
-    EdrBehaviorRecord security = rec(19u, 1, 0u, "C:\\slow4688.exe", 3000000000LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 19u, 0, 0xa19u, "C:\\slow4688.exe", 1000000000LL);
+    rec(&security, 19u, 1, 0u, "C:\\slow4688.exe", 3000000000LL);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
                    EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&security, 1, 20u, &out) ==
@@ -181,9 +187,10 @@ int main(void) {
    * creator/parent PID must also agree before 4688 may enrich a raw start. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(20u, 0, 0xa20u, "C:\\parent-bound.exe", 1000000000LL);
-    EdrBehaviorRecord wrong_parent =
-        rec(20u, 1, 0u, "C:\\parent-bound.exe", 1000000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord wrong_parent;
+    rec(&kernel, 20u, 0, 0xa20u, "C:\\parent-bound.exe", 1000000000LL);
+    rec(&wrong_parent, 20u, 1, 0u, "C:\\parent-bound.exe", 1000000100LL);
     wrong_parent.ppid = 5u;
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
                    EDR_PROCESS_COALESCE_HOLD &&
@@ -201,9 +208,10 @@ int main(void) {
    * live StartKey/FILETIME generation. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(119u, 0, 0xa119u, "C:\\complete.exe", 4000000000LL);
-    EdrBehaviorRecord older_security =
-        rec(119u, 1, 0u, "C:\\complete.exe", 1300000000LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord older_security;
+    rec(&kernel, 119u, 0, 0xa119u, "C:\\complete.exe", 4000000000LL);
+    rec(&older_security, 119u, 1, 0u, "C:\\complete.exe", 1300000000LL);
     EdrProcessCoalescerMetrics metrics;
     make_kernel_independent(&kernel);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) ==
@@ -224,10 +232,10 @@ int main(void) {
    * delivered first: it stays source-only in its own slot. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord older_security =
-        rec(120u, 1, 0u, "C:\\arrival-complete.exe", 1300000000LL);
-    EdrBehaviorRecord kernel =
-        rec(120u, 0, 0xa120u, "C:\\arrival-complete.exe", 4000000000LL);
+    static EdrBehaviorRecord older_security;
+    static EdrBehaviorRecord kernel;
+    rec(&older_security, 120u, 1, 0u, "C:\\arrival-complete.exe", 1300000000LL);
+    rec(&kernel, 120u, 0, 0xa120u, "C:\\arrival-complete.exe", 4000000000LL);
     make_kernel_independent(&kernel);
     ok &= need(edr_process_coalescer_submit(&older_security, 1, 10u, &out) ==
                    EDR_PROCESS_COALESCE_HOLD &&
@@ -243,8 +251,10 @@ int main(void) {
    * Subject data and must survive the merge. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(29u, 0, 0xa29u, "C:\\token.exe", 1000000000LL);
-    EdrBehaviorRecord security = rec(29u, 1, 0u, "C:\\token.exe", 1000000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 29u, 0, 0xa29u, "C:\\token.exe", 1000000000LL);
+    rec(&security, 29u, 1, 0u, "C:\\token.exe", 1000000100LL);
     snprintf(kernel.user_sid, sizeof(kernel.user_sid), "%s", "S-1-5-21-live-token");
     snprintf(kernel.identity_source, sizeof(kernel.identity_source), "%s", "token_query");
     snprintf(kernel.identity_quality, sizeof(kernel.identity_quality), "%s", "token_sid");
@@ -259,29 +269,168 @@ int main(void) {
   }
 
   /* A merge intentionally records `COALESCED`, but it must preserve source
-   * omissions from the raw kernel observation. The direct P0 contract tests
-   * that this retained list remains fail-closed for alert/action evaluation. */
+   * omissions from both observations. Security-owned token fields must follow
+   * the same generation-safe join instead of disappearing at coalescing. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(91u, 0, 0xa11u, "C:\\truncated.exe", 1100000000LL);
-    EdrBehaviorRecord security = rec(91u, 1, 0u, "C:\\truncated.exe", 1100000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 91u, 0, 0xa11u, "C:\\truncated.exe", 1100000000LL);
+    rec(&security, 91u, 1, 0u, "C:\\truncated.exe", 1100000100LL);
     snprintf(kernel.source_completeness, sizeof(kernel.source_completeness), "%s", "TRUNCATED");
     snprintf(kernel.source_truncated_fields, sizeof(kernel.source_truncated_fields), "%s",
              "source.process_name,source.exe_hash");
+    snprintf(security.source_completeness, sizeof(security.source_completeness), "%s", "TRUNCATED");
+    snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
+             "source.cmdline,source.exe_hash");
+    snprintf(security.integrity_level, sizeof(security.integrity_level), "%s", "S-1-16-16384");
+    security.token_elevation = 1u;
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
                    strcmp(out.source_completeness, "COALESCED") == 0 &&
                    strcmp(out.source_truncated_fields,
-                          "source.process_name,source.exe_hash") == 0,
-               "coalescing preserves source omissions after status replacement");
+                          "source.process_name,source.exe_hash,source.cmdline") == 0 &&
+                   strcmp(out.integrity_level, "S-1-16-16384") == 0 &&
+                   out.token_elevation == 1u && out.process_start_key == 0xa11u,
+               "coalescing preserves source omissions and token evidence on the raw generation");
+  }
+
+  /* A complete generation-bound Kernel/live command is the selected value;
+   * a clipped 4688 prefix must not revoke it merely because other 4688 fields
+   * are useful enrichment. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 911u, 0, 0xa111u, "C:\\kernel-complete.exe", 1110000000LL);
+    rec(&security, 911u, 1, 0u, "C:\\kernel-complete.exe", 1110000100LL);
+    snprintf(kernel.cmdline, sizeof(kernel.cmdline), "%s", "kernel-complete.exe --trusted-full-command");
+    snprintf(kernel.command_line_origin, sizeof(kernel.command_line_origin), "%s",
+             "live_same_generation");
+    snprintf(security.cmdline, sizeof(security.cmdline), "%s", "kernel-complete.exe --clipped");
+    snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
+             "source.cmdline,source.exe_hash");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.cmdline, kernel.cmdline) == 0 &&
+                   strcmp(out.command_line_origin, "live_same_generation") == 0 &&
+                   out.source_truncated_fields[0] == '\0',
+               "complete Kernel fields ignore unused 4688 truncation provenance");
+  }
+
+  /* When Kernel has no command, the 4688 prefix becomes the selected value and
+   * its truncation declaration must remain attached to that value. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 912u, 0, 0xa112u, "C:\\security-prefix.exe", 1120000000LL);
+    rec(&security, 912u, 1, 0u, "C:\\security-prefix.exe", 1120000100LL);
+    snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
+             "source.cmdline");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.cmdline, security.cmdline) == 0 &&
+                   strstr(out.source_truncated_fields, "source.cmdline") != NULL,
+               "selected truncated 4688 command keeps source.cmdline provenance");
+  }
+
+  /* A complete 4688 command can replace a clipped Kernel value from the same
+   * bounded correlation. Only the superseded command marker is removed; other
+   * Kernel source omissions remain conservative. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 913u, 0, 0xa113u, "C:\\security-complete.exe", 1130000000LL);
+    rec(&security, 913u, 1, 0u, "C:\\security-complete.exe", 1130000100LL);
+    snprintf(kernel.cmdline, sizeof(kernel.cmdline), "%s", "security-complete.exe --kernel-prefix");
+    snprintf(kernel.source_completeness, sizeof(kernel.source_completeness), "%s", "TRUNCATED");
+    snprintf(kernel.source_truncated_fields, sizeof(kernel.source_truncated_fields), "%s",
+             "source.cmdline");
+    snprintf(security.cmdline, sizeof(security.cmdline), "%s",
+             "security-complete.exe --complete-security-command");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.cmdline, security.cmdline) == 0 &&
+                   !strstr(out.source_truncated_fields, "source.cmdline"),
+               "complete 4688 command replaces truncated Kernel command and clears its marker");
+  }
+
+  /* Overflow cannot prove which field was omitted. It follows an adopted 4688
+   * value and remains a fail-closed declaration for downstream consumers. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 914u, 0, 0xa114u, "C:\\overflow-command.exe", 1140000000LL);
+    rec(&security, 914u, 1, 0u, "C:\\overflow-command.exe", 1140000100LL);
+    snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
+             "source.list_overflow");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.cmdline, security.cmdline) == 0 &&
+                   strcmp(out.source_truncated_fields, "source.list_overflow") == 0,
+               "adopted 4688 command propagates unknown source-list overflow conservatively");
+  }
+
+  /* An overflow on the stronger Kernel record is uncertainty, not proof that
+   * its command was clipped. Keep the generation-bound live command, preserve
+   * overflow, and let downstream policy remain fail-closed. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 915u, 0, 0xa115u, "C:\\kernel-overflow.exe", 1150000000LL);
+    rec(&security, 915u, 1, 0u, "C:\\kernel-overflow.exe", 1150000100LL);
+    snprintf(kernel.cmdline, sizeof(kernel.cmdline), "%s", "kernel-overflow.exe --trusted-live");
+    snprintf(kernel.command_line_origin, sizeof(kernel.command_line_origin), "%s",
+             "live_same_generation");
+    snprintf(kernel.source_truncated_fields, sizeof(kernel.source_truncated_fields), "%s",
+             "source.list_overflow");
+    snprintf(security.cmdline, sizeof(security.cmdline), "%s",
+             "kernel-overflow.exe --security-complete");
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.cmdline, kernel.cmdline) == 0 &&
+                   strcmp(out.command_line_origin, "live_same_generation") == 0 &&
+                   strcmp(out.source_truncated_fields, "source.list_overflow") == 0,
+               "unknown Kernel overflow cannot authorize weaker 4688 command replacement");
+  }
+
+  /* A same-generation Security observation may fill missing token evidence,
+   * but cannot downgrade an already validated kernel/live-token value. */
+  edr_process_coalescer_reset();
+  {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 92u, 0, 0xa12u, "C:\\strong-token.exe", 1200000000LL);
+    rec(&security, 92u, 1, 0u, "C:\\strong-token.exe", 1200000100LL);
+    snprintf(kernel.integrity_level, sizeof(kernel.integrity_level), "%s", "High");
+    kernel.token_elevation = 2u;
+    snprintf(security.integrity_level, sizeof(security.integrity_level), "%s", "S-1-16-8192");
+    security.token_elevation = 1u;
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
+                   strcmp(out.integrity_level, "High") == 0 && out.token_elevation == 2u &&
+                   out.process_start_key == 0xa12u,
+               "4688 merge cannot downgrade stronger same-generation token evidence");
   }
 
   /* 4688 -> kernel must use the same pending-window rule. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord security = rec(10u, 1, 0u, "C:\\b.exe", 2000000200LL);
-    EdrBehaviorRecord kernel = rec(10u, 0, 0xb1u, "C:\\b.exe", 2000000000LL);
+    static EdrBehaviorRecord security;
+    static EdrBehaviorRecord kernel;
+    rec(&security, 10u, 1, 0u, "C:\\b.exe", 2000000200LL);
+    rec(&kernel, 10u, 0, 0xb1u, "C:\\b.exe", 2000000000LL);
     ok &= need(edr_process_coalescer_submit(&security, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "4688 first holds as unbound enrichment");
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD,
@@ -296,8 +445,10 @@ int main(void) {
    * audit must not be adopted when a later raw B generation is received. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord late_a = rec(100u, 1, 0u, "C:\\arrival-first.exe", 2400000050LL);
-    EdrBehaviorRecord kernel_b = rec(100u, 0, 0xb01u, "C:\\arrival-first.exe", 2400000100LL);
+    static EdrBehaviorRecord late_a;
+    static EdrBehaviorRecord kernel_b;
+    rec(&late_a, 100u, 1, 0u, "C:\\arrival-first.exe", 2400000050LL);
+    rec(&kernel_b, 100u, 0, 0xb01u, "C:\\arrival-first.exe", 2400000100LL);
     ok &= need(edr_process_coalescer_submit(&late_a, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&kernel_b, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
@@ -311,8 +462,10 @@ int main(void) {
    * makes PID-reused B source-only instead of lending B A's command/SID. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(101u, 0, 0xb11u, "C:\\direction.exe", 2500000100LL);
-    EdrBehaviorRecord late_a = rec(101u, 1, 0u, "C:\\direction.exe", 2500000050LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord late_a;
+    rec(&kernel, 101u, 0, 0xb11u, "C:\\direction.exe", 2500000100LL);
+    rec(&late_a, 101u, 1, 0u, "C:\\direction.exe", 2500000050LL);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&late_a, 1, 20u, &out) == EDR_PROCESS_COALESCE_PASS &&
                    edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
@@ -325,7 +478,8 @@ int main(void) {
    * StartKey/FILETIME/path/file-id token gate gets the final decision. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(11u, 0, 0xc1u, "C:\\c.exe", 3000000000LL);
+    static EdrBehaviorRecord kernel;
+    rec(&kernel, 11u, 0, 0xc1u, "C:\\c.exe", 3000000000LL);
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "no-4688 kernel starts bounded window");
     ok &= need(edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
@@ -338,9 +492,12 @@ int main(void) {
    * 4688 and makes B non-evaluable without A subject/command/action data. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel_a = rec(132u, 0, 0xe21u, "C:\\late-reuse.exe", 5200000000LL);
-    EdrBehaviorRecord kernel_b = rec(132u, 0, 0xe22u, "C:\\late-reuse.exe", 5200000100LL);
-    EdrBehaviorRecord delayed_a = rec(132u, 1, 0u, "C:\\late-reuse.exe", 5200000050LL);
+    static EdrBehaviorRecord kernel_a;
+    static EdrBehaviorRecord kernel_b;
+    static EdrBehaviorRecord delayed_a;
+    rec(&kernel_a, 132u, 0, 0xe21u, "C:\\late-reuse.exe", 5200000000LL);
+    rec(&kernel_b, 132u, 0, 0xe22u, "C:\\late-reuse.exe", 5200000100LL);
+    rec(&delayed_a, 132u, 1, 0u, "C:\\late-reuse.exe", 5200000050LL);
     ok &= need(edr_process_coalescer_submit(&kernel_a, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
                    edr_process_coalescer_submit(&kernel_b, 1, 2u * WINDOW_NS + 10u, &out) ==
@@ -358,9 +515,12 @@ int main(void) {
    * either raw generation, so neither record obtains target identity. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel_a = rec(12u, 0, 0xd1u, "C:\\reuse.exe", 4000000000LL);
-    EdrBehaviorRecord kernel_b = rec(12u, 0, 0xd2u, "C:\\reuse.exe", 4000000100LL);
-    EdrBehaviorRecord delayed_a_4688 = rec(12u, 1, 0u, "C:\\reuse.exe", 4000000150LL);
+    static EdrBehaviorRecord kernel_a;
+    static EdrBehaviorRecord kernel_b;
+    static EdrBehaviorRecord delayed_a_4688;
+    rec(&kernel_a, 12u, 0, 0xd1u, "C:\\reuse.exe", 4000000000LL);
+    rec(&kernel_b, 12u, 0, 0xd2u, "C:\\reuse.exe", 4000000100LL);
+    rec(&delayed_a_4688, 12u, 1, 0u, "C:\\reuse.exe", 4000000150LL);
     EdrProcessCoalescerMetrics metrics;
     ok &= need(edr_process_coalescer_submit(&kernel_a, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "generation A holds");
@@ -381,8 +541,10 @@ int main(void) {
   /* A late Security event is not allowed to join a slot after its deadline. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(13u, 0, 0xe1u, "C:\\expired.exe", 5000000000LL);
-    EdrBehaviorRecord security = rec(13u, 1, 0u, "C:\\expired.exe", 5000000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    rec(&kernel, 13u, 0, 0xe1u, "C:\\expired.exe", 5000000000LL);
+    rec(&security, 13u, 1, 0u, "C:\\expired.exe", 5000000100LL);
     EdrProcessCoalescerMetrics metrics;
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD,
                "kernel deadline is armed");
@@ -401,9 +563,12 @@ int main(void) {
    * arrives after the tombstone expires but before B reaches its deadline. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel_a = rec(131u, 0, 0xe11u, "C:\\tombstone.exe", 5100000000LL);
-    EdrBehaviorRecord kernel_b = rec(131u, 0, 0xe12u, "C:\\tombstone.exe", 5100000100LL);
-    EdrBehaviorRecord delayed_a = rec(131u, 1, 0u, "C:\\tombstone.exe", 5100000050LL);
+    static EdrBehaviorRecord kernel_a;
+    static EdrBehaviorRecord kernel_b;
+    static EdrBehaviorRecord delayed_a;
+    rec(&kernel_a, 131u, 0, 0xe11u, "C:\\tombstone.exe", 5100000000LL);
+    rec(&kernel_b, 131u, 0, 0xe12u, "C:\\tombstone.exe", 5100000100LL);
+    rec(&delayed_a, 131u, 1, 0u, "C:\\tombstone.exe", 5100000050LL);
     ok &= need(edr_process_coalescer_submit(&kernel_a, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
                    strcmp(out.source_completeness, "CORRELATION_MISSING") == 0,
@@ -424,8 +589,10 @@ int main(void) {
   /* Creator metadata must never become created-process identity. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord kernel = rec(14u, 0, 0xf1u, "C:\\creator.exe", 6000000000LL);
-    EdrBehaviorRecord creator = rec(14u, 1, 0u, "C:\\creator.exe", 6000000100LL);
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord creator;
+    rec(&kernel, 14u, 0, 0xf1u, "C:\\creator.exe", 6000000000LL);
+    rec(&creator, 14u, 1, 0u, "C:\\creator.exe", 6000000100LL);
     creator.user_sid[0] = '\0';
     creator.logon_id[0] = '\0';
     snprintf(creator.creator_sid, sizeof(creator.creator_sid), "%s", "S-1-5-21-creator");
@@ -440,7 +607,8 @@ int main(void) {
 
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord missing_key = rec(15u, 0, 0u, "C:\\missing.exe", 7000000000LL);
+    static EdrBehaviorRecord missing_key;
+    rec(&missing_key, 15u, 0, 0u, "C:\\missing.exe", 7000000000LL);
     ok &= need(edr_process_coalescer_submit(&missing_key, 1, 10u, &out) == EDR_PROCESS_COALESCE_READY &&
                    strcmp(out.source_completeness, "NOT_EVALUABLE") == 0,
                "missing raw ProcessStartKey fails closed");
@@ -448,7 +616,8 @@ int main(void) {
 
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord ordinary = rec(16u, 0, 0x101u, "C:\\ordinary.exe", 8000000000LL);
+    static EdrBehaviorRecord ordinary;
+    rec(&ordinary, 16u, 0, 0x101u, "C:\\ordinary.exe", 8000000000LL);
     ok &= need(edr_process_coalescer_submit(&ordinary, 0, 10u, &out) == EDR_PROCESS_COALESCE_PASS,
                "non-P0 process avoids coalescer/evidence hold");
   }
@@ -458,7 +627,8 @@ int main(void) {
    * a P0 action, but remains available for collection-gap diagnosis. */
   edr_process_coalescer_reset();
   {
-    EdrBehaviorRecord security = rec(17u, 1, 0u, "C:\\security-only.exe", 8100000000LL);
+    static EdrBehaviorRecord security;
+    rec(&security, 17u, 1, 0u, "C:\\security-only.exe", 8100000000LL);
     ok &= need(edr_process_coalescer_submit(&security, 1, 10u, &out) ==
                    EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 10u, &out) == 1 &&
@@ -470,13 +640,15 @@ int main(void) {
 
   edr_process_coalescer_reset();
   for (uint32_t i = 0u; i < 128u; ++i) {
-    EdrBehaviorRecord fill = rec(1000u + i, 0, 0x1000u + i, "C:\\bounded.exe",
-                                 9000000000LL + (int64_t)i);
+    static EdrBehaviorRecord fill;
+    rec(&fill, 1000u + i, 0, 0x1000u + i, "C:\\bounded.exe",
+        9000000000LL + (int64_t)i);
     ok &= need(edr_process_coalescer_submit(&fill, 1, 1u + i, &out) == EDR_PROCESS_COALESCE_HOLD,
                "capacity fill retains each raw generation");
   }
   {
-    EdrBehaviorRecord overflow = rec(3000u, 0, 0x3000u, "C:\\overflow.exe", 10000000000LL);
+    static EdrBehaviorRecord overflow;
+    rec(&overflow, 3000u, 0, 0x3000u, "C:\\overflow.exe", 10000000000LL);
     EdrProcessCoalescerMetrics metrics;
     ok &= need(edr_process_coalescer_submit(&overflow, 1, 200u, &out) == EDR_PROCESS_COALESCE_READY &&
                    strcmp(out.source_completeness, "COALESCE_BACKPRESSURE") == 0,
