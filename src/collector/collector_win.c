@@ -2417,11 +2417,23 @@ static uint64_t edr_collector_file_key_session_epoch(void) {
   return epoch;
 }
 
+/* FileRead metadata is usable only while the ETW consumer has completed its
+ * OpenTrace handshake and remains inside ProcessTrace.  The metadata gate's
+ * zero-initialized state is HEALTHY, so it cannot by itself distinguish an
+ * uninitialized, disabled, starting, stopping, or failed collector. */
+static int edr_collector_file_read_consumer_ready(void) {
+  return InterlockedCompareExchange(&s_started, 0, 0) == 1 &&
+         InterlockedCompareExchange(&s_stopping, 0, 0) == 0 &&
+         InterlockedCompareExchange(&s_consumer_open_ok, 0, 0) == 1 &&
+         InterlockedCompareExchange(&s_consumer_running, 0, 0) == 1;
+}
+
 static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth *out) {
   if (!out) return;
   AcquireSRWLockShared(&s_file_read_metadata_gate_lock);
   out->file_read_p0_capability_healthy =
-      s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_HEALTHY ? 1 : 0;
+      s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_HEALTHY &&
+      edr_collector_file_read_consumer_ready() ? 1 : 0;
   out->file_read_metadata_gate_staged = s_health.file_read_metadata_gate_staged;
   out->file_read_metadata_gate_coalesced =
       s_health.file_read_metadata_gate_coalesced;
@@ -2460,6 +2472,9 @@ static void edr_collector_file_read_metadata_gate_copy_health(EdrCollectorHealth
 
 int edr_collector_file_read_p0_capability_healthy(void) {
   int healthy;
+  if (!edr_collector_file_read_consumer_ready()) {
+    return 0;
+  }
   AcquireSRWLockShared(&s_file_read_metadata_gate_lock);
   /* DEGRADED admits only FileReads which resolve a complete new-session
    * FileKey binding.  Its health bit remains false, but it must not globally
@@ -2467,7 +2482,8 @@ int edr_collector_file_read_p0_capability_healthy(void) {
   healthy = s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_HEALTHY ||
             s_file_read_metadata_gate.state == EDR_FILE_READ_METADATA_GATE_DEGRADED;
   ReleaseSRWLockShared(&s_file_read_metadata_gate_lock);
-  return healthy;
+  /* Close a stop/failure race which began while the gate lock was held. */
+  return healthy && edr_collector_file_read_consumer_ready();
 }
 
 /* Every provider epoch starts without names for handles opened before that
@@ -2675,6 +2691,8 @@ static void edr_collector_file_read_metadata_recovery_clear_subject_locked(void)
  * already-staged source record, but require a full joined restart before
  * FileRead can be evaluated again. */
 static void edr_collector_file_read_metadata_gate_consumer_unavailable(const char *reason) {
+  InterlockedExchange(&s_consumer_open_ok, 0);
+  InterlockedExchange(&s_consumer_running, 0);
   AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
   int new_recovery = !s_file_read_metadata_gate.requires_session_reset;
   s_file_read_metadata_gate.requires_session_reset = 1u;
@@ -4309,8 +4327,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     return;
   }
   /* Preserve a resolved Read through admission and live actor capture even
-   * when an older assertion is pending. Preprocess holds its owned record
-   * before any rule evaluation until BOTH durable and collector gates clear. */
+   * when an older assertion is pending. Preprocess retains matched snapshots
+   * durably; no alert/action may pass until BOTH ACK and collector gates clear. */
   if (ty == EDR_EVENT_FILE_READ && !edr_collector_file_read_p0_capability_healthy()) {
     AcquireSRWLockExclusive(&s_file_read_metadata_gate_lock);
     s_health.file_read_metadata_gate_paused_events++;
@@ -4850,6 +4868,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   }
 
   InterlockedExchange(&s_stopping, 0);
+  InterlockedExchange(&s_consumer_open_ok, 0);
+  InterlockedExchange(&s_consumer_running, 0);
   InterlockedExchange(&s_network_first_callback_observed, 0);
 
   s_bus = bus;
@@ -4968,8 +4988,6 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     (void)edr_collector_stop();
     return EDR_ERR_INTERNAL;
   }
-  InterlockedExchange(&s_consumer_open_ok, 0);
-  InterlockedExchange(&s_consumer_running, 0);
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, &s_consumer_thread_id);
   if (!s_consumer_thread) {

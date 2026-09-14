@@ -313,6 +313,16 @@ if(WIN32)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
 
+  add_executable(test_etw_network_decode_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c)
+  target_include_directories(test_etw_network_decode_windows PRIVATE
+    ${CMAKE_SOURCE_DIR}/include)
+  target_compile_definitions(test_etw_network_decode_windows PRIVATE
+    EDR_TDH_TESTING=1)
+  edr_apply_test_warnings(test_etw_network_decode_windows)
+  add_test(NAME etw_network_decode_native COMMAND test_etw_network_decode_windows)
+
   add_executable(test_security_event_time_windows test_security_event_time_windows.c)
   target_link_libraries(test_security_event_time_windows PRIVATE wevtapi)
   edr_apply_test_warnings(test_security_event_time_windows)
@@ -359,11 +369,6 @@ add_executable(test_kernel_file_semantics
 target_include_directories(test_kernel_file_semantics PRIVATE ${CMAKE_SOURCE_DIR}/include)
 edr_apply_test_warnings(test_kernel_file_semantics)
 add_test(NAME kernel_file_semantics COMMAND test_kernel_file_semantics)
-
-add_executable(test_file_read_deferred ${CMAKE_CURRENT_SOURCE_DIR}/test_file_read_deferred.c)
-target_include_directories(test_file_read_deferred PRIVATE ${CMAKE_SOURCE_DIR}/include)
-edr_apply_test_warnings(test_file_read_deferred)
-add_test(NAME file_read_deferred COMMAND test_file_read_deferred)
 
 add_executable(test_windows_a44_collector_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_a44_collector_contract.c)
@@ -924,6 +929,7 @@ target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT
 target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads)
 edr_apply_test_warnings(test_p0_direct_emit_suppression)
 add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(p0_direct_emit_suppression PROPERTIES TIMEOUT 120)
 
 add_executable(test_p0_deferred_snapshot test_p0_deferred_snapshot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c

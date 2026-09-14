@@ -24,7 +24,7 @@ WINDOWS_EXPECTED = {
     "command_process_identity_and_receipts",
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
-    "kernel_file_io_identity",
+    "kernel_file_io_identity", "etw_network_decode_native",
     "security_event_time_native", "security_event_time_failures",
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
@@ -463,6 +463,39 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("cmake", "--build", str(build), "--parallel", "2")
             self.run_command("ctest", "--test-dir", str(build), "--output-on-failure",
                              "--no-tests=error", "-R", "^p0_direct_emit_suppression$")
+
+    def test_file_read_consumer_lifecycle_gate_behavior(self):
+        """Execute the production readiness predicate for every lifecycle combination.
+
+        Only the atomic Windows read is adapted; this is not an ETW runtime
+        test. The collector wiring contract separately checks its call sites.
+        """
+        collector = (ROOT / "src/collector/collector_win.c").read_text(encoding="utf-8")
+        start = collector.index("static int edr_collector_file_read_consumer_ready(void) {")
+        end = collector.index("static void edr_collector_file_read_metadata_gate_copy_health(", start)
+        predicate = collector[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "probe.c").write_text(
+                '#include <stdint.h>\n'
+                'static volatile int32_t s_started, s_stopping, s_consumer_open_ok, s_consumer_running;\n'
+                'static int32_t InterlockedCompareExchange(volatile int32_t *p, int32_t value, int32_t expected) {\n'
+                '  int32_t before = *p; if (before == expected) *p = value; return before; }\n'
+                + predicate + '\nint main(void) {\n'
+                '  for (unsigned bits = 0; bits < 16; ++bits) {\n'
+                '    s_started = (bits & 1) != 0; s_stopping = (bits & 2) != 0;\n'
+                '    s_consumer_open_ok = (bits & 4) != 0; s_consumer_running = (bits & 8) != 0;\n'
+                '    if (edr_collector_file_read_consumer_ready() != (bits == 13)) return (int)bits + 1;\n'
+                '  }\n  return 0;\n}\n', encoding="utf-8")
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.20)\nproject(FileReadLifecycle C)\n'
+                'set(CMAKE_C_STANDARD 11)\nadd_executable(lifecycle_probe probe.c)\n'
+                'enable_testing()\nadd_test(NAME lifecycle COMMAND lifecycle_probe)\n',
+                encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            self.run_command("cmake", "--build", str(build), "--target", "lifecycle_probe")
+            self.run_command("ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error")
 
     def test_workflows_use_shared_build_and_run_gate(self):
         for workflow in ("edr-agent-client-build.yml", "edr-agent-client-release.yml"):

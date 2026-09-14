@@ -21,6 +21,7 @@
 #include "edr/storage_queue.h"
 #include "edr/types.h"
 #include "edr/enrich_parent_info.h"
+#include "edr/collector.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -132,6 +133,15 @@ static int p0_build_source_only_delivery_record(
 static int p0_source_only_record_is_delivery_loss(const EdrBehaviorRecord *record);
 #ifdef EDR_P0_DIRECT_EMIT_TESTING
 static uint64_t s_p0_test_monotonic_ms;
+static int s_p0_test_file_read_collector_healthy = 1;
+static unsigned s_p0_test_file_read_close_after;
+void edr_p0_rule_test_set_file_read_collector_healthy(int healthy) {
+  s_p0_test_file_read_collector_healthy = healthy != 0;
+  s_p0_test_file_read_close_after = 0u;
+}
+void edr_p0_rule_test_close_file_read_gate_after(unsigned checks) {
+  s_p0_test_file_read_close_after = checks;
+}
 void edr_p0_rule_test_reset_dedup(void) {
   p0_state_lock();
   memset(s_p0_dedup, 0, sizeof(s_p0_dedup));
@@ -1084,6 +1094,10 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
     return 0;
   }
   if (br->type == EDR_EVENT_FILE_READ) {
+    /* A registered collector assertion is immutable source-only evidence,
+     * never a candidate to retain and later upgrade into an alert. */
+    if (br->collector_evidence_gate[0] || br->collector_evidence_reason[0] ||
+        strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) return 0;
 #ifdef _WIN32
     /* Kernel-File Read is P0-eligible only after both the FileKey path and
      * actor generation have survived exact StartKey/creation binding from a
@@ -1098,8 +1112,7 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
          strcmp(br->process_generation_source,
                 "file_read_pid_event_time_live_telemetry") != 0 &&
          strcmp(br->process_generation_source,
-                "file_read_process_tree_cache_generation") != 0) ||
-        strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) {
+                "file_read_process_tree_cache_generation") != 0)) {
       return 0;
     }
 #endif
@@ -1681,6 +1694,24 @@ int edr_p0_rule_source_only_capability_healthy_for_event(
   }
   p0_state_unlock();
   return healthy;
+}
+
+/* Reading a complete immutable record against the IR has no authority or
+ * side effect. Publishing an alert or executing an action requires BOTH the
+ * collector's metadata contract and central ACK recovery. */
+static const char *p0_delivery_gate_reason(EdrEventType type) {
+  if (type == EDR_EVENT_FILE_READ) {
+#ifdef EDR_P0_DIRECT_EMIT_TESTING
+    if (s_p0_test_file_read_close_after && --s_p0_test_file_read_close_after == 0u)
+      s_p0_test_file_read_collector_healthy = 0;
+    if (!s_p0_test_file_read_collector_healthy) return "file_read_collector_pending";
+#elif defined(_WIN32)
+    if (!edr_collector_file_read_p0_capability_healthy()) return "file_read_collector_pending";
+#endif
+  }
+  if (!edr_p0_rule_source_only_capability_healthy_for_event(type, NULL, 0u))
+    return "source_only_pending";
+  return NULL;
 }
 
 static int p0_source_only_ir_recovery_healthy(void) {
@@ -3310,7 +3341,7 @@ static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma, const EdrP0RuleIrBinding *binding,
                         const char *known_fp_reason, const char *deferred_key,
-                        const char **terminal_reason) {
+                        const char **terminal_reason, int *delivery_gated) {
   EdrPolicyEnforcementResult enforcement;
   EdrP0EmitMetrics emitted_metrics = {0};
   p0_dedup_reservation dedup_reservation = {0};
@@ -3318,6 +3349,13 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   int dedup_pending_backpressure = 0;
   uint32_t exact_replay_count = 0u;
   unsigned alert_abi_value_omissions = 0u;
+  /* A gate may close between matching and delivery, including during replay.
+   * Return retryable without consuming an owner, dedup slot or action intent. */
+  if (delivery_gated) *delivery_gated = 0;
+  if (p0_delivery_gate_reason(br->type)) {
+    if (delivery_gated) *delivery_gated = 1;
+    return 0;
+  }
   static int s_debug_enabled = -1;
   if (s_debug_enabled < 0) {
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
@@ -3437,6 +3475,14 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   enforcement_prepare.rule_id = rule_id;
   enforcement_prepare.result = &enforcement;
   enforcement_prepare.binding = *binding;
+  if (p0_delivery_gate_reason(br->type)) {
+    p0_state_lock();
+    p0_dedup_rollback(&dedup_reservation);
+    p0_rate_rollback(&rate_reservation);
+    p0_state_unlock();
+    if (delivery_gated) *delivery_gated = 1;
+    return 0;
+  }
   if (enforcement.requested && !p0_prepare_enforcement(&enforcement_prepare)) {
     if (terminal_reason && strcmp(enforcement_prepare.failure_reason, "terminal_intent_existing") == 0)
       *terminal_reason = "terminal_journal_owned";
@@ -3790,6 +3836,17 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
       emitted_metrics.user_subject_full++;
     }
   }
+  /* Building the full envelope can be expensive. Recheck immediately before
+   * its queue handoff; no-effect refusals leave/recreate the durable owner.
+   * A committed action intent instead remains owned by the terminal journal. */
+  if (!enforcement_prepare.executed && p0_delivery_gate_reason(br->type)) {
+    p0_state_lock();
+    p0_dedup_rollback(&dedup_reservation);
+    p0_rate_rollback(&rate_reservation);
+    p0_state_unlock();
+    if (delivery_gated) *delivery_gated = 1;
+    return 0;
+  }
   EdrBehaviorRecordAlertEmitOutcome emit_outcome = enforcement.requested
       ? (p0_finish_enforcement_terminal(&enforcement_prepare, &a)
              ? EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED
@@ -3824,18 +3881,25 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     if (enforcement_prepare.executed) {
       fprintf(stderr, "[P0] enforcement terminal frame not fully enqueued after durable intent; retained owner claim rule=%s pid=%u\n",
               rule_id, br->pid);
-    } else if (!enforcement.requested &&
+    } else if (!deferred_key && !enforcement.requested &&
                emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED) {
+      /* Only an unowned direct source needs this fallback. Deferred callers
+       * retry their existing snapshot instead of also declaring the same
+       * source permanently NOT_EVALUABLE and upgrading it after ACK. */
       (void)p0_emit_source_only_not_evaluable(br, rule_id, "p0_alert_queue_backpressure", binding);
     }
     p0_observe_rule_disposition(
         br, rule_id,
         emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_GOVERNOR_SUPPRESSED
             ? "governor_suppressed"
-            : "source_only",
+            : (deferred_key && !enforcement_prepare.executed &&
+               emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED
+                   ? "deferred" : "source_only"),
         emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_GOVERNOR_SUPPRESSED
             ? "alert_governor"
-            : "p0_alert_queue_backpressure",
+            : (deferred_key && !enforcement_prepare.executed &&
+               emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED
+                   ? "deferred_alert_handoff_retry" : "p0_alert_queue_backpressure"),
         known_fp_reason, 0u);
     return 0;
   }
@@ -3889,7 +3953,8 @@ static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
     return 1;
   }
   if (owned) p0_observe_rule_disposition(br,rule_id,"deferred",
-      gate_closed ? "family_gate_durable" : "durable_owner_exists","",0u);
+      gate_closed ? (br->type == EDR_EVENT_FILE_READ ? "file_read_gate_durable" : "family_gate_durable")
+                  : "durable_owner_exists","",0u);
   return owned;
 }
 
@@ -3925,6 +3990,7 @@ int edr_p0_rule_poll_deferred_match(void) {
   const char *terminal = NULL;
   uint64_t now = p0_monotonic_ms();
   int selected, emitted = 0, found = 0;
+  const char *delivery_gate;
   if (!getenv_int01_disabled_on_zero("EDR_P0_DIRECT_EMIT")) return 0;
   p0_state_lock();
   if (!s_p0_source_only_runtime_tenant[0] || !s_p0_source_only_runtime_endpoint[0] ||
@@ -3955,7 +4021,17 @@ int edr_p0_rule_poll_deferred_match(void) {
     free(json); free(record); return 0;
   }
   free(json);
-  if (!edr_p0_rule_source_only_capability_healthy_for_event(record->type,NULL,0u)) {
+  delivery_gate = p0_delivery_gate_reason(record->type);
+  if (delivery_gate) {
+    /* Yield this row through the bounded retry scheduler; do not starve
+     * another healthy file event behind a collector-blocked FileRead. */
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,
+        delivery_gate),"retry_delivery_gate");
+    free(record); return 0;
+  }
+  if (!p0_valid_process_create_record(record)) {
+    p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,
+        "retained_evidence_invalid"),"fail_evidence");
     free(record); return 0;
   }
   p0_state_lock();
@@ -3984,7 +4060,7 @@ int edr_p0_rule_poll_deferred_match(void) {
     if (edr_p0_rule_ir_evaluation_get_match(&evaluation,i,&match) && !strcmp(match.rule_id,rule_id)) {
       found=1;
       emitted=emit_for_rule(record,rule_id,match.severity,match.title,match.mitre_csv,
-          &evaluation.binding,"",key,&terminal);
+          &evaluation.binding,"",key,&terminal,NULL);
       if (emitted) {
         const char *name = record->process_name;
         if (!name[0] && record->type == EDR_EVENT_SCRIPT_POWERSHELL) name = "powershell.exe";
@@ -4180,6 +4256,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     int registry_best_index = -1;
     int registry_best_severity = -1;
     int gate_closed = 0;
+    const char *delivery_gate;
     memset(&evaluation, 0, sizeof(evaluation));
     if (edr_p0_rule_ir_evaluate_record(br, &evaluation)) {
       edr_p0_rule_observe_validation_stage(
@@ -4190,9 +4267,9 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
        * ruleset-evaluation gate below on a new evaluator failure, but a
        * successfully evaluated rule may not create an alert or action while
        * a source-only fault in the same event family remains unresolved. */
-      if (p0_is_ruleset_evaluation_event(br->type) &&
-          !edr_p0_rule_source_only_capability_healthy_for_event(br->type, NULL, 0u)) {
-        edr_p0_rule_observe_validation_stage(br, "family_gate", "source_only_pending");
+      delivery_gate = p0_delivery_gate_reason(br->type);
+      if (p0_is_ruleset_evaluation_event(br->type) && delivery_gate) {
+        edr_p0_rule_observe_validation_stage(br, "family_gate", delivery_gate);
         gate_closed = 1;
       }
       if (br->type == EDR_EVENT_REG_SET_VALUE || br->type == EDR_EVENT_REG_CREATE_KEY) {
@@ -4213,6 +4290,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       }
       for (i = 0; !descriptor_failure && i < (int)evaluation.match_count; ++i) {
         EdrP0RuleIrMatch match;
+        int delivery_gated = 0;
         const char *rid;
         if (!edr_p0_rule_ir_evaluation_get_match(&evaluation, (uint32_t)i, &match)) {
           descriptor_failure = 1;
@@ -4222,8 +4300,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         if (registry_best_index >= 0 && i != registry_best_index) {
           continue;
         }
-        gate_closed = gate_closed ||
-            !edr_p0_rule_source_only_capability_healthy_for_event(br->type,NULL,0u);
+        gate_closed = gate_closed || p0_delivery_gate_reason(br->type) != NULL;
         if (p0_defer_or_already_owned(br,&evaluation.binding,rid,gate_closed)) continue;
         const char *known_fp_reason = "";
         if (!p0_should_suppress_known_false_positive(
@@ -4236,11 +4313,15 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         if (emit_for_rule(br, rid, match.severity,
                           match.title[0] ? match.title : rid,
                           match.mitre_csv, &evaluation.binding,
-                          known_fp_reason, NULL, NULL)) {
+                          known_fp_reason, NULL, NULL, &delivery_gated)) {
           emitted_count++;
           edr_adaptive_collection_raise(match.severity, rid, br->pid, br->ppid,
                                         (pn && pn[0]) ? pn : br->process_name);
           fprintf(stderr, "[P0] IR rule emitted: rid=%s\n", rid);
+        } else if (delivery_gated) {
+          /* A late gate closure must not lose a record which did not own a
+           * durable snapshot when matching started. */
+          (void)p0_defer_or_already_owned(br,&evaluation.binding,rid,1);
         }
       }
       edr_p0_rule_ir_evaluation_free(&evaluation);

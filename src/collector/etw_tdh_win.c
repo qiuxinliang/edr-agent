@@ -22,6 +22,23 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <wchar.h>
+
+#if defined(EDR_TDH_TESTING)
+ULONG WINAPI edr_test_tdh_get_property_size(
+    PEVENT_RECORD rec, ULONG context_count, PTDH_CONTEXT context,
+    ULONG property_count, PPROPERTY_DATA_DESCRIPTOR properties,
+    PULONG property_size);
+ULONG WINAPI edr_test_tdh_get_property(
+    PEVENT_RECORD rec, ULONG context_count, PTDH_CONTEXT context,
+    ULONG property_count, PPROPERTY_DATA_DESCRIPTOR properties,
+    ULONG buffer_size, PBYTE buffer);
+#define EDR_TDH_GET_PROPERTY_SIZE edr_test_tdh_get_property_size
+#define EDR_TDH_GET_PROPERTY edr_test_tdh_get_property
+#else
+#define EDR_TDH_GET_PROPERTY_SIZE TdhGetPropertySize
+#define EDR_TDH_GET_PROPERTY TdhGetProperty
+#endif
 
 /* Kept at the TDH boundary so the observability path can distinguish an
  * expected missing property from a failed TDH call without inspecting event
@@ -101,7 +118,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   pdd.ArrayIndex = ULONG_MAX;
 
   ULONG cb = 0;
-  ULONG st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
+  ULONG st = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &pdd, &cb);
   if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
     ULONG result = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
     edr_tdh_note_property_status(result);
@@ -121,7 +138,7 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
     memset(stack_tmp, 0, cb);
   }
 
-  st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, tmp);
+  st = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &pdd, cb, tmp);
   if (st != ERROR_SUCCESS) {
     edr_tdh_note_property_status(st);
     if (heap_tmp) {
@@ -169,6 +186,53 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   return ERROR_NOT_FOUND;
 }
 
+static int edr_kernel_network_port_property(PEVENT_RECORD rec,
+                                            PCWSTR prop_name) {
+  return rec && prop_name &&
+         memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_NETWORK,
+                sizeof(GUID)) == 0 &&
+         (wcscmp(prop_name, L"dport") == 0 ||
+          wcscmp(prop_name, L"sport") == 0);
+}
+
+/* Microsoft-Windows-Kernel-Network declares dport/sport as UInt16/Port.
+ * TdhGetProperty returns the two payload bytes, which remain in network byte
+ * order.  Decode that provider contract at the TDH boundary; other providers
+ * may expose host-order integers or text and must retain the generic path. */
+static ULONG edr_network_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name,
+                                   char *out, size_t out_cap) {
+  PROPERTY_DATA_DESCRIPTOR pdd;
+  BYTE raw[sizeof(uint16_t)];
+  ULONG cb = 0u;
+  ULONG st;
+  uint16_t port;
+  if (!edr_kernel_network_port_property(rec, prop_name)) {
+    return edr_prop_utf8(rec, prop_name, out, out_cap);
+  }
+  if (!out || out_cap == 0u) {
+    return ERROR_INVALID_PARAMETER;
+  }
+  out[0] = '\0';
+  memset(&pdd, 0, sizeof(pdd));
+  pdd.PropertyName = (ULONGLONG)(ULONG_PTR)prop_name;
+  pdd.ArrayIndex = ULONG_MAX;
+  st = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &pdd, &cb);
+  if (st != ERROR_SUCCESS || cb != sizeof(raw)) {
+    st = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    edr_tdh_note_property_status(st);
+    return st;
+  }
+  st = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &pdd, cb, raw);
+  if (st != ERROR_SUCCESS) {
+    edr_tdh_note_property_status(st);
+    return st;
+  }
+  port = (uint16_t)(((uint16_t)raw[0] << 8u) | (uint16_t)raw[1]);
+  snprintf(out, out_cap, "%u", (unsigned)port);
+  edr_tdh_note_property_status(ERROR_SUCCESS);
+  return ERROR_SUCCESS;
+}
+
 /* Typed extraction is intentionally separate from the UTF-8 helper: a
  * two-character string also occupies eight bytes, so generic size-based
  * conversion would corrupt normal ETW text fields. */
@@ -183,7 +247,7 @@ static ULONG edr_prop_u64(PEVENT_RECORD rec, PCWSTR prop_name, uint64_t *out) {
   memset(&pdd, 0, sizeof(pdd));
   pdd.PropertyName = (ULONGLONG)(ULONG_PTR)prop_name;
   pdd.ArrayIndex = ULONG_MAX;
-  st = TdhGetPropertySize(rec, 0, NULL, 1, &pdd, &cb);
+  st = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &pdd, &cb);
   /* FileKey is a win:Pointer, so it is four bytes on 32-bit ETW consumers
    * and eight bytes on x64/ARM64.  Accept only those exact typed widths. */
   if (st != ERROR_SUCCESS || (cb != sizeof(uint32_t) && cb != sizeof(uint64_t))) {
@@ -192,7 +256,7 @@ static ULONG edr_prop_u64(PEVENT_RECORD rec, PCWSTR prop_name, uint64_t *out) {
     return st;
   }
   memset(raw, 0, sizeof(raw));
-  st = TdhGetProperty(rec, 0, NULL, 1, &pdd, cb, raw);
+  st = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &pdd, cb, raw);
   if (st == ERROR_SUCCESS) {
     if (cb == sizeof(uint32_t)) {
       uint32_t value32 = 0u;
@@ -269,6 +333,19 @@ static void edr_try_append_all(PEVENT_RECORD rec, const EdrPropTry *tries, size_
   }
 }
 
+static void edr_try_append_network_all(PEVENT_RECORD rec,
+                                       const EdrPropTry *tries, size_t n,
+                                       char *line_buf, size_t line_cap,
+                                       char *out, size_t out_cap, size_t *off) {
+  for (size_t i = 0; i < n; i++) {
+    if (edr_network_prop_utf8(rec, tries[i].name, line_buf, line_cap) ==
+            ERROR_SUCCESS &&
+        line_buf[0]) {
+      append_utf8(out, out_cap, off, "%s=%s\n", tries[i].key, line_buf);
+    }
+  }
+}
+
 static int edr_prop_first_utf8(PEVENT_RECORD rec, const PCWSTR *names, size_t n,
                                char *out, size_t out_cap) {
   if (!out || out_cap == 0u) {
@@ -277,6 +354,21 @@ static int edr_prop_first_utf8(PEVENT_RECORD rec, const PCWSTR *names, size_t n,
   out[0] = '\0';
   for (size_t i = 0; i < n; i++) {
     if (edr_prop_utf8(rec, names[i], out, out_cap) == ERROR_SUCCESS && out[0]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int edr_prop_first_network_utf8(PEVENT_RECORD rec, const PCWSTR *names,
+                                       size_t n, char *out, size_t out_cap) {
+  if (!out || out_cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  for (size_t i = 0; i < n; i++) {
+    if (edr_network_prop_utf8(rec, names[i], out, out_cap) == ERROR_SUCCESS &&
+        out[0]) {
       return 1;
     }
   }
@@ -451,7 +543,9 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
     }
   } else if (type == EDR_EVENT_NET_CONNECT || type == EDR_EVENT_NET_LISTEN ||
              type == EDR_EVENT_NET_DNS_QUERY || type == EDR_EVENT_NET_TLS_HANDSHAKE) {
-    if (edr_prop_first_utf8(rec, port_try, sizeof(port_try) / sizeof(port_try[0]), tmp, sizeof(tmp))) {
+    if (edr_prop_first_network_utf8(
+            rec, port_try, sizeof(port_try) / sizeof(port_try[0]), tmp,
+            sizeof(tmp))) {
       out_event->remote_port = edr_parse_u32_ascii(tmp);
     }
     /* DNS 查询：优先把查询名填入 path，供关联引擎按查询名做隧道检测；取不到再回退 cmd_try。 */
@@ -664,8 +758,9 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_all(rec, file_try, sizeof(file_try) / sizeof(file_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, net_try, sizeof(net_try) / sizeof(net_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    edr_try_append_network_all(rec, net_try,
+                               sizeof(net_try) / sizeof(net_try[0]), line,
+                               sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
              memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
              memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {

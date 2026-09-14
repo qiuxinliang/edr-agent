@@ -1555,6 +1555,83 @@ static void retain_deferred_fixture(EdrBehaviorRecord *r, const char *event_id) 
   assert(deferred_count==1u && g_emit_count==0);
 }
 
+static void test_file_read_durable_wait_preserves_burst_and_both_gates(void) {
+  /* One source at a time keeps this test below the native Windows stack
+   * limit. Distinct reads of the same file are not exact-source replays. */
+  static EdrBehaviorRecord record;
+  char expected_id[64];
+  int action_count = atomic_load(&g_enforcement_side_effects);
+  deferred_fake_reset();
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  edr_p0_rule_test_set_monotonic_ms(3000u);
+  edr_p0_rule_test_set_file_read_collector_healthy(0);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  g_ir_ready = g_ir_evaluation_available = 1;
+  g_combined_emit_allowed = g_durable_emit_allowed = 1;
+  g_source_latch = g_source_ack = 0;
+  g_emit_count = g_durable_count = 0;
+  for (unsigned i = 0; i < 12u; ++i) {
+    init_file_read_record(&record, "dedup-test.exe");
+    record.process_start_key = UINT64_C(11540474045143213);
+    record.event_time_ns = INT64_C(1789348253050194800) + i;
+    snprintf(record.event_id, sizeof(record.event_id), "file-burst-%u", i);
+    assert(edr_p0_rule_try_emit(&record) == 0);
+    assert(deferred_count == i + 1u && g_emit_count == 0 && g_durable_count == 0);
+  }
+  /* Exact replay retains one owner; a proven predicate miss needs no slot. */
+  assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 12u);
+  init_file_read_record(&record, "ordinary-miss.exe");
+  assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 12u);
+  init_file_read_record(&record, "dedup-test.exe");
+  strcpy(record.collector_evidence_gate, EDR_P0_FILE_READ_METADATA_GATE);
+  assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 12u);
+  record.collector_evidence_gate[0] = '\0';
+  strcpy(record.source_completeness, "NOT_EVALUABLE");
+  assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 12u);
+  init_complete_process_record(&record, "dedup-test.exe");
+  strcpy(record.event_id, "process-outside-file-gate");
+  assert(edr_p0_rule_try_emit(&record) == 1 && g_emit_count == 1);
+
+  /* More than five seconds and volatile-state reset cannot expire evidence
+   * or grant authority while the independent collector gate remains closed. */
+  edr_p0_rule_test_set_monotonic_ms(15000u);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  edr_p0_rule_test_set_monotonic_ms(16000u);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
+  assert(deferred_count == 12u);
+
+  /* Closing ACK authority is independent: collector recovery alone is not
+   * central receipt and cannot publish any retained read. */
+  init_file_read_record(&record, "reader.exe");
+  strcpy(record.event_id, "file-ack-fault");
+  g_ir_evaluation_available = 0;
+  assert(edr_p0_rule_try_emit(&record) == 0 && g_durable_count == 1);
+  g_ir_evaluation_available = 1;
+  edr_p0_rule_test_set_file_read_collector_healthy(1);
+  edr_p0_rule_test_set_monotonic_ms(20000u);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
+  assert(atomic_load(&g_enforcement_side_effects) == action_count);
+  g_source_ack = 1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  for (unsigned i = 0; i < 12u; ++i) {
+    edr_p0_rule_test_set_monotonic_ms(21000u + i * 200u);
+    assert(edr_p0_rule_poll_deferred_match() == 1);
+    snprintf(expected_id, sizeof(expected_id), "file-burst-%u", i);
+    assert(!strcmp(g_last_record.event_id, expected_id));
+    assert(g_last_record.process_start_key == UINT64_C(11540474045143213));
+    assert(g_last_record.event_time_ns == INT64_C(1789348253050194800) + i);
+    assert(!strcmp(g_last_record.file_path, "C:\\Test\\fixture.dat"));
+  }
+  assert(deferred_completions == 12u && g_emit_count == 13);
+  edr_p0_rule_test_set_monotonic_ms(30000u);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && g_emit_count == 13);
+  deferred_fake_reset();
+}
+
 static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   EdrBehaviorRecord record;
   EdrConfig alert_policy={0}, block_policy={0};
@@ -1568,8 +1645,11 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   g_source_ack=1;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   deferred_complete_fails=1;
+  int source_only_before = atomic_load(&g_durable_count);
   assert(edr_p0_rule_poll_deferred_match()==0);
   assert(deferred_completions==0u && deferred_retries==1u && g_emit_count==0);
+  assert(atomic_load(&g_durable_count)==source_only_before);
+  assert(edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_PROCESS_CREATE,NULL,0u));
   assert(atomic_load(&g_adaptive_raises)==0);
   deferred_complete_fails=0;
   g_source_ack=1;
@@ -1675,6 +1755,46 @@ static void test_deferred_storage_faults_are_retained_and_backed_off(void) {
   assert(edr_p0_rule_poll_deferred_match()==1 && deferred_completions==1u);
   edr_p0_rule_get_emit_metrics(&metrics);
   assert(metrics.deferred_storage_failures==1u && !metrics.deferred_retry_degraded);
+  deferred_fake_reset();
+}
+
+static void test_file_read_gate_closing_during_delivery_keeps_one_owner(void) {
+  static EdrBehaviorRecord record;
+  EdrConfig config = {0};
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  for (unsigned block = 0u; block < 2u; ++block) {
+    deferred_fake_reset();
+    edr_p0_rule_test_reset_dedup();
+    edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+    edr_p0_rule_test_set_monotonic_ms(1000u);
+    edr_p0_rule_test_set_file_read_collector_healthy(1);
+    config.policy_v2.script_mode = block ? EDR_POLICY_MODE_BLOCK : EDR_POLICY_MODE_ALERT;
+    edr_policy_v2_configure(&config);
+    edr_policy_enforcement_test_set_execute_hook(test_enforcement_execute_hook);
+    g_ir_ready = g_ir_evaluation_available = g_combined_emit_allowed = 1;
+    g_emit_count = g_durable_count = 0;
+    int actions_before = atomic_load(&g_enforcement_side_effects);
+    int intents_before = atomic_load(&g_terminal_precreate_calls);
+    init_file_read_record(&record, "dedup-test.exe");
+    snprintf(record.event_id, sizeof(record.event_id), "file-late-gate-%u", block);
+    /* Close after matcher and emitter entry: before action intent (4th
+     * observation), or after envelope construction/before queue handoff (5th). */
+    edr_p0_rule_test_close_file_read_gate_after(block ? 4u : 5u);
+    assert(edr_p0_rule_try_emit(&record) == 0);
+    assert(deferred_count == 1u && deferred_completions == 0u);
+    assert(g_emit_count == 0 && g_durable_count == 0);
+    assert(atomic_load(&g_enforcement_side_effects) == actions_before);
+    assert(atomic_load(&g_terminal_precreate_calls) == intents_before);
+    assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 1u);
+    config.policy_v2.script_mode = EDR_POLICY_MODE_ALERT;
+    edr_policy_v2_configure(&config);
+    edr_p0_rule_test_set_file_read_collector_healthy(1);
+    edr_p0_rule_test_set_monotonic_ms(2000u);
+    assert(edr_p0_rule_poll_deferred_match() == 1 && deferred_completions == 1u);
+    assert(g_emit_count == 1 && !strcmp(g_last_record.event_id, record.event_id));
+  }
+  edr_policy_enforcement_test_set_execute_hook(NULL);
   deferred_fake_reset();
 }
 
@@ -2477,11 +2597,13 @@ static void test_block_uses_terminal_journal_when_ordinary_pending_table_full(vo
 }
 
 static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
-  enum { workers = 65 };
+  enum { workers = 64 };
   pthread_t threads[workers];
   ConcurrentEmit work[workers];
+  EdrBehaviorRecord overflow;
   atomic_int start = 0;
   int emitted = 0;
+  int durable_before;
   assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
   assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
@@ -2505,15 +2627,24 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
     assert(pthread_create(&threads[i], NULL, emit_same_p0_record, &work[i]) == 0);
   }
   atomic_store_explicit(&start, 1, memory_order_release);
-  for (int spins = 0; spins < 5000 && atomic_load(&g_combined_inflight) < 64; spins++) {
+  for (int spins = 0; spins < 5000 && atomic_load(&g_combined_inflight) < workers; spins++) {
     struct timespec pause = {0, 1000000L};
     (void)nanosleep(&pause, NULL);
   }
-  assert(atomic_load(&g_combined_inflight) == 64);
-  /* Give the final contender a scheduling window while every claim remains
-   * pending; releasing first would legitimately let it reuse a committed
-   * slot and would not exercise the full-table contract. */
-  { struct timespec pause = {0, 100000000L}; (void)nanosleep(&pause, NULL); }
+  assert(atomic_load(&g_combined_inflight) == workers);
+  /* Establish every pending handoff before the overflow contender. Its
+   * source-only result closes the family ACK gate, so launching all 65 at
+   * once can correctly defer a slower claimant at the pre-handoff check.
+   * Keep the first 64 blocked until the overflow result is fully recorded. */
+  init_record(&overflow);
+  overflow.pid = 99200u + workers;
+  overflow.event_time_ns = 500u + workers;
+  snprintf(overflow.endpoint_id, sizeof(overflow.endpoint_id), "ep-pending-full");
+  snprintf(overflow.process_name, sizeof(overflow.process_name), "dedup-test.exe");
+  durable_before = atomic_load(&g_durable_count);
+  assert(edr_p0_rule_try_emit(&overflow) == 0);
+  assert(atomic_load(&g_durable_count) == durable_before + 1);
+  assert(!edr_p0_rule_source_only_capability_healthy_for_event(overflow.type, NULL, 0u));
   EdrP0DedupMetrics pending_metrics;
   edr_p0_rule_get_dedup_metrics(&pending_metrics);
   assert(pending_metrics.pending_backpressure == 1u);
@@ -2526,8 +2657,8 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
   atomic_store(&g_parallel_mode, 0);
   EdrP0DedupMetrics metrics;
   edr_p0_rule_get_dedup_metrics(&metrics);
-  assert(emitted == 64);
-  assert(g_emit_count == 64);
+  assert(emitted == workers);
+  assert(g_emit_count == workers);
   assert(metrics.pending_backpressure == 1u);
 }
 #endif
@@ -2573,6 +2704,8 @@ int main(void) {
   test_restart_latch_requires_durable_loss_audit();
   test_ir_not_ready_durably_preserves_every_p0_event_group();
   test_source_only_fault_is_scoped_to_owning_event_family();
+  test_file_read_durable_wait_preserves_burst_and_both_gates();
+  test_file_read_gate_closing_during_delivery_keeps_one_owner();
   test_deferred_retry_ruleset_change_and_action_owner();
   test_deferred_storage_faults_are_retained_and_backed_off();
   test_script_matches_obey_process_family_gate();

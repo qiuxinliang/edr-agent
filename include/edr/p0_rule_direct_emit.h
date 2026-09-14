@@ -106,6 +106,10 @@ void edr_p0_rule_test_reset_dedup(void);
  * production queue/header implementation. */
 void edr_p0_rule_test_force_source_only_startup(void);
 void edr_p0_rule_test_set_monotonic_ms(uint64_t value);
+/* Fault injection at the collector boundary; no live collector is linked into
+ * the deterministic P0 state-machine tests. */
+void edr_p0_rule_test_set_file_read_collector_healthy(int healthy);
+void edr_p0_rule_test_close_file_read_gate_after(unsigned checks);
 /* Uses the production source-only context builder; test-only so fixture
  * generators cannot drift into a hand-written terminal/source schema. */
 int edr_p0_rule_test_build_source_only_direct_record(const EdrBehaviorRecord *record,

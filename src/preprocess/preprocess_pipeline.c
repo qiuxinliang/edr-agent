@@ -35,7 +35,6 @@
 #include "edr/process_evidence_worker.h"
 #include "edr/process_generation.h"
 #include "edr/windows_file_identity.h"
-#include "edr/file_read_deferred.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -78,7 +77,6 @@ typedef struct {
 } EdrP0TokenIdentityCacheEntry;
 static EdrP0TokenIdentityCacheEntry s_p0_token_identity_cache[EDR_P0_TOKEN_IDENTITY_CACHE];
 static uint32_t s_p0_token_identity_next;
-static EdrFileReadDeferred s_file_read_deferred;
 #endif
 
 /** 与 [agent] 对齐，写入每条 BehaviorRecord（线格式 / nanopb 与 endpoint_id 一致） */
@@ -1281,18 +1279,6 @@ static int p0_file_read_evaluation_ready(void) {
          edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_FILE_READ, NULL, 0u);
 }
 
-static void p0_file_read_deferred_observe(const EdrBehaviorRecord *br, const char *outcome) {
-  uint64_t total = s_file_read_deferred.admitted + s_file_read_deferred.rejected +
-                   s_file_read_deferred.released + s_file_read_deferred.expired;
-  edr_p0_rule_observe_validation_stage(br, "file_read_deferred", outcome);
-  if (total <= 8u || (total & 127u) == 0u) {
-    fprintf(stderr, "[FileRead] deferred=%u admitted=%llu released=%llu expired=%llu rejected=%llu outcome=%s event=%s pid=%u\n",
-            s_file_read_deferred.count, (unsigned long long)s_file_read_deferred.admitted,
-            (unsigned long long)s_file_read_deferred.released,
-            (unsigned long long)s_file_read_deferred.expired,
-            (unsigned long long)s_file_read_deferred.rejected, outcome, br->event_id, br->pid);
-  }
-}
 #endif
 
 static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
@@ -1357,27 +1343,23 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
 #ifdef _WIN32
   if (br.type == EDR_EVENT_FILE_READ && !p0_file_read_evaluation_ready()) {
-    /* Reserve this bounded wait for signed-IR path interest. Ordinary reads
-     * retain the existing local-evidence path and cannot evict P0 candidates. */
+    /* Own metadata/actor validation above is still mandatory. Matching is
+     * side-effect-free: the P0 owner retains exact matches in its existing
+     * durable queue while either collector or ACK authority is unavailable.
+     * Never substitute a short RAM wait for restart-safe ownership. */
     if (!edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)) {
       edr_local_evidence_cache_record_behavior(&br);
       return;
     }
-    if (edr_file_read_deferred_push(&s_file_read_deferred, &br, edr_monotonic_ns())) {
-      p0_file_read_deferred_observe(&br, "held");
-    } else {
-      p0_file_read_deferred_observe(&br, "capacity_unavailable");
-      p0_mark_file_read_collector_evidence(&br, EDR_P0_FILE_READ_REASON_DEFERRED_CAPACITY);
-      (void)p0_process_collector_evidence_gate(&br);
-    }
+    (void)edr_p0_rule_try_emit(&br);
+    edr_local_evidence_cache_record_behavior(&br);
     return;
   }
 #endif
   process_ready_record(br, slot);
 }
 
-/* Deferred reads arrive here with their original validated actor/path tuple.
- * Do not re-open a PID or replace it with a later occupant after the wait. */
+/* Records reach this path only with their original validated actor/path tuple. */
 static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   /* AGT-010: low-priority records can be shed only after all fields on which
    * P0 matching depends have been enriched and the active IR has proved a
@@ -1433,27 +1415,6 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
   emit_behavior_record(&br);
 }
 
-static void process_pending_file_reads(int stopping) {
-#ifdef _WIN32
-  EdrBehaviorRecord ready;
-  int result;
-  while ((result = edr_file_read_deferred_pop(&s_file_read_deferred, edr_monotonic_ns(),
-                                              p0_file_read_evaluation_ready(), stopping, &ready)) != 0) {
-    if (result == 1) {
-      p0_file_read_deferred_observe(&ready, "released");
-      process_ready_record(ready, NULL);
-    } else {
-      p0_file_read_deferred_observe(&ready, stopping ? "shutdown" : "timeout");
-      p0_mark_file_read_collector_evidence(&ready, stopping ? EDR_P0_FILE_READ_REASON_DEFERRED_SHUTDOWN
-                                                         : EDR_P0_FILE_READ_REASON_DEFERRED_TIMEOUT);
-      (void)p0_process_collector_evidence_gate(&ready);
-    }
-  }
-#else
-  (void)stopping;
-#endif
-}
-
 static void process_pending_process_creates(void) {
 #ifdef _WIN32
   EdrBehaviorRecord ready;
@@ -1490,7 +1451,6 @@ static void poll_p0_source_only_durable_retry(void) {
   /* A retry may have just committed the restart-loss audit (or the final
    * retained source assertion). Re-evaluate the latch only after that commit. */
   (void)edr_p0_rule_source_only_recover_after_queue_open();
-  process_pending_file_reads(0);
   (void)edr_p0_rule_poll_deferred_match();
 }
 
@@ -1622,7 +1582,6 @@ static void *preprocess_main(void *arg) {
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
       }
-      process_pending_file_reads(1);
       poll_p0_source_only_durable_retry();
       edr_storage_queue_poll_drain();
       edr_local_evidence_cache_poll_maintenance();
@@ -1689,7 +1648,6 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
 #ifdef _WIN32
-  memset(&s_file_read_deferred, 0, sizeof(s_file_read_deferred));
   s_stop_preprocess = 0;
   s_thread = CreateThread(NULL, 0, preprocess_main, NULL, 0, NULL);
   if (!s_thread) {
