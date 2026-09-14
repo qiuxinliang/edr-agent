@@ -1,6 +1,11 @@
 #Requires -Version 5.1
 # USB/HSM keys stay in the current user's Windows certificate provider.
 # No key export, PIN storage, store auto-selection, or unsigned fallback.
+# Hosted build steps can inherit PowerShell 7's PSModulePath when invoking
+# Windows PowerShell 5.1. Load this host's certificate provider explicitly;
+# never resolve a same-named module from a workspace or another PS edition.
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop
+
 function Invoke-EdRSignTool {
     param([string]$SignTool, [string[]]$Arguments, [int]$TimeoutSeconds = 180)
     if (-not $SignTool) { $SignTool = (Get-Command signtool.exe -ErrorAction Stop).Source }
