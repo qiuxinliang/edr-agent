@@ -38,6 +38,7 @@ RUNTIME_EXPECTED = {
     "python_installer_config_contract",
     "detection_decision_combo", "detection_regression_scenarios",
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",
+    "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
     "webshell_semantic_rules", "pmfe_scan_detail_format", "command_signature_cross_language",
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_rule_ir_record_golden",
 }
@@ -199,15 +200,18 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIn("Windows release gate test is not registered", result.stderr)
 
     def test_missing_runtime_target_fails_at_configuration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source, build, _ = self.fixture(directory, missing_target="test_request_signing")
-            result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
-            self.assertIn("Agent runtime gate executable target is missing", result.stderr)
+        for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, missing_target=target)
+                result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
+                self.assertIn("Agent runtime gate executable target is missing", result.stderr)
+                self.assertIn(target, result.stderr)
 
     def test_security_queue_and_detection_failures_block_both_gate_labels(self):
         # Inject failures in each newly required group, not just check labels in text.
         for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
-                     "behavior_record_alert_proto_contract", "command_signature_cross_language"):
+                     "behavior_record_alert_proto_contract", "command_signature_cross_language",
+                     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine"):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
