@@ -724,8 +724,24 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
                qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
     int acl_rc = run_icacls(args, install_dir, log_path);
-    if (_wcsicmp(sensitive_dirs[i], L"queue") == 0 && acl_rc != 0) {
-      append_log_utf8(log_path, L"queue_acl_repair_failed");
+    if (acl_rc != 0) {
+      _snwprintf(args, sizeof(args) / sizeof(args[0]),
+                 L"runtime_directory_acl_repair_failed path=%ls rc=%d", path, acl_rc);
+      append_log_utf8(log_path, args);
+      return 52;
+    }
+    /* icacls drops directory-only (OI)(CI) grants on existing files. With
+     * /inheritance:r /T that can leave an empty file DACL despite exit=0.
+     * Add direct grants without /grant:r so directories retain inheritance
+     * for future children. Never grant ordinary users access to runtime data. */
+    _snwprintf(args, sizeof(args) / sizeof(args[0]),
+               L"%ls /grant \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /T /C /Q", qpath);
+    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
+    acl_rc = run_icacls(args, install_dir, log_path);
+    if (acl_rc != 0) {
+      _snwprintf(args, sizeof(args) / sizeof(args[0]),
+                 L"runtime_file_acl_repair_failed path=%ls rc=%d", path, acl_rc);
+      append_log_utf8(log_path, args);
       return 52;
     }
   }

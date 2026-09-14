@@ -180,6 +180,10 @@ if(WIN32)
     windows_release_collector_pe_closure
     windows_inplace_collector_transaction
     PROPERTIES TIMEOUT 60)
+  add_test(NAME windows_installer_acl_behavior
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")
+  set_tests_properties(windows_installer_acl_behavior PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c

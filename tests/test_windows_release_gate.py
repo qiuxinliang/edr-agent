@@ -30,6 +30,7 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
+    "windows_installer_acl_behavior",
 }
 RUNTIME_EXPECTED = {
     "command_inbox_persistence", "request_signing", "http_retry_contract", "command_result_json_contract",
