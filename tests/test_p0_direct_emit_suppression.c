@@ -1571,7 +1571,10 @@ static void test_file_read_durable_wait_preserves_burst_and_both_gates(void) {
   g_ir_ready = g_ir_evaluation_available = 1;
   g_combined_emit_allowed = g_durable_emit_allowed = 1;
   g_source_latch = g_source_ack = 0;
-  g_emit_count = g_durable_count = 0;
+  /* MSVC's experimental C11 atomics cannot supply an assignment value to
+   * another atomic assignment. Keep both stores explicit and seq_cst. */
+  atomic_store(&g_durable_count, 0);
+  atomic_store(&g_emit_count, 0);
   for (unsigned i = 0; i < 12u; ++i) {
     init_file_read_record(&record, "dedup-test.exe");
     record.process_start_key = UINT64_C(11540474045143213);
@@ -1773,7 +1776,8 @@ static void test_file_read_gate_closing_during_delivery_keeps_one_owner(void) {
     edr_policy_v2_configure(&config);
     edr_policy_enforcement_test_set_execute_hook(test_enforcement_execute_hook);
     g_ir_ready = g_ir_evaluation_available = g_combined_emit_allowed = 1;
-    g_emit_count = g_durable_count = 0;
+    atomic_store(&g_durable_count, 0);
+    atomic_store(&g_emit_count, 0);
     int actions_before = atomic_load(&g_enforcement_side_effects);
     int intents_before = atomic_load(&g_terminal_precreate_calls);
     init_file_read_record(&record, "dedup-test.exe");

@@ -68,6 +68,11 @@ jobs:
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
         run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture x64
+      - name: Preflight native P0 test compiler before dependencies
+        shell: pwsh
+        run: |
+          python tests/test_windows_release_gate.py WindowsReleaseGateTests.test_p0_direct_emit_windows_compiler_surface -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native P0 compiler preflight failed before dependency installation' }
       # P0 bundle generation is architecture-independent.  Use the x64 Python
       # wheel on every Windows runner, including ARM64, so cryptography never
       # silently falls back to a Rust/source build.

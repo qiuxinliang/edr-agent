@@ -280,6 +280,11 @@ jobs:
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
         run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+      - name: Preflight native P0 test compiler before dependencies
+        shell: pwsh
+        run: |
+          python tests/test_windows_release_gate.py WindowsReleaseGateTests.test_p0_direct_emit_windows_compiler_surface -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native P0 compiler preflight failed before dependency installation' }
       - name: Install build tools
         shell: pwsh
         run: choco install ninja innosetup -y --no-progress
@@ -405,10 +410,11 @@ jobs:
         shell: pwsh
         run: Write-Warning 'Shared dependency cache was not published; this build may continue, but a later tag may rebuild dependencies. See the publication step.'
 
-      # Persist completed dependencies before configure, product builds or tests
-      # can fail. Only ABI-keyed packages/downloads are saved, never installed state.
+      # The shared Release already persists dependencies across tags. Save the
+      # ref-local Actions copy only if that publication failed, before product
+      # gates run; avoid uploading the same closure twice on the success path.
       - name: Save completed vcpkg dependencies
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
+        if: steps.shared-vcpkg-publish.outcome != 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
         uses: actions/cache/save@v5
         with:
           path: |

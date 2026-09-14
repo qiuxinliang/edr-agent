@@ -337,6 +337,14 @@ class WindowsReleaseGateTests(unittest.TestCase):
             verify_sqlite_package_location(isolated_build / "CMakeCache.txt",
                                            prefix / "include", prefix / "lib" / library.name)
 
+    def test_p0_direct_emit_windows_compiler_surface(self):
+        """Compile the actual P0 test before installing external dependencies.
+
+        On Windows this exercises cl.exe's C11 atomics, not a host compiler's
+        approximation. Keep the later SQLite-enabled and runtime gates too.
+        """
+        self.compile_p0_windows_branches(with_sqlite=False)
+
     def test_p0_gate_windows_branches_compile_with_sqlite(self):
         """Compile real P0 gate tests with the production SQLite branches enabled.
 
@@ -344,14 +352,16 @@ class WindowsReleaseGateTests(unittest.TestCase):
         that MSVC accepts it. Native Windows uses its CRT/SDK; other hosts remove
         those conveniences while retaining the actual SQLite headers.
         """
+        self.compile_p0_windows_branches(with_sqlite=True)
+
+    def compile_p0_windows_branches(self, *, with_sqlite):
         cmake_source = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         begin = cmake_source.index("set(CMAKE_C_STANDARD 11)")
         end = cmake_source.index('option(EDR_BUILD_TESTS', begin)
-        targets = (
-            "test_p0_direct_emit_suppression", "test_local_evidence_cache_candidate",
-            "test_p0_deferred_snapshot", "test_behavior_record_alert_emit",
-            "test_process_tree_cache",
-        )
+        targets = ("test_p0_direct_emit_suppression",)
+        if with_sqlite:
+            targets += ("test_local_evidence_cache_candidate", "test_p0_deferred_snapshot",
+                        "test_behavior_record_alert_emit", "test_process_tree_cache")
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             build = source / "build"
@@ -379,8 +389,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 '#endif\n', encoding="utf-8")
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(P0WindowsBranches C)',
-                cmake_source[begin:end], 'find_package(SQLite3 REQUIRED)',
+                'if(WIN32 AND NOT MSVC)',
+                '  message(FATAL_ERROR "Windows compiler surface probe requires initialized MSVC")',
+                'endif()',
+                cmake_source[begin:end],
             ]
+            if with_sqlite:
+                lines.append('find_package(SQLite3 REQUIRED)')
             for target in targets:
                 lines += [
                     f'add_library({target} OBJECT "{(ROOT / "tests" / (target + ".c")).as_posix()}")',
@@ -395,25 +410,37 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     '-include "${CMAKE_SOURCE_DIR}/msvc_surface.h")',
                     'endif()',
                 ]
-            lines += [
-                'target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)',
-                'target_compile_definitions(test_behavior_record_alert_emit PRIVATE EDR_HAVE_NANOPB=1 EDR_HAVE_SQLITE=1 EDR_OS_WINDOWS=1)',
-                'target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)',
-                'if(TARGET SQLite3::SQLite3)',
-                '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite3::SQLite3)',
-                'else()',
-                '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite::SQLite3)',
-                'endif()',
-                'if(MSVC)',
-                '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "/FI${CMAKE_SOURCE_DIR}/require_sqlite.h")',
-                'else()',
-                '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "-include${CMAKE_SOURCE_DIR}/require_sqlite.h")',
-                'endif()',
-            ]
+            lines.append('target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)')
+            if with_sqlite:
+                lines += [
+                    'target_compile_definitions(test_behavior_record_alert_emit PRIVATE EDR_HAVE_NANOPB=1 EDR_HAVE_SQLITE=1 EDR_OS_WINDOWS=1)',
+                    'target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)',
+                    'if(TARGET SQLite3::SQLite3)',
+                    '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite3::SQLite3)',
+                    'else()',
+                    '  target_link_libraries(test_local_evidence_cache_candidate PRIVATE SQLite::SQLite3)',
+                    'endif()',
+                    'if(MSVC)',
+                    '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "/FI${CMAKE_SOURCE_DIR}/require_sqlite.h")',
+                    'else()',
+                    '  target_compile_options(test_local_evidence_cache_candidate PRIVATE "-include${CMAKE_SOURCE_DIR}/require_sqlite.h")',
+                    'endif()',
+                ]
             (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
-            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
-                             "-DCMAKE_BUILD_TYPE=Release")
-            self.run_command("cmake", "--build", str(build), "--parallel", "2", "--", "-k", "0")
+            options = []
+            if os.name == "nt":
+                # Do not infer the target from the possibly emulated Python/
+                # CMake host. Reuse the architecture selected by VsDevCmd.
+                arch = os.environ.get("VSCMD_ARG_TGT_ARCH", "").lower()
+                self.assertIn(arch, ("x64", "arm64"), "Initialize Visual Studio before the compiler probe")
+                options.append("-DEDR_WINDOWS_TARGET_ARCH=" + ("amd64" if arch == "x64" else "arm64"))
+            # Early preflight needs no Chocolatey/Ninja installation; NMake is
+            # supplied by the VS toolchain we have already initialized.
+            generator = "NMake Makefiles" if os.name == "nt" and not with_sqlite else "Ninja"
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", generator,
+                             "-DCMAKE_BUILD_TYPE=Release", *options)
+            build_args = ("--parallel", "2", "--", "-k", "0") if generator == "Ninja" else ()
+            self.run_command("cmake", "--build", str(build), *build_args)
 
     @unittest.skipIf(os.name == "nt", "the release gate executes the native Windows binary")
     def test_p0_windows_admission_behavior(self):
@@ -540,6 +567,12 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.assertEqual(len(matches), 1, marker)
                     return matches[0]
                 initialize = step_with("name: Initialize pinned Visual Studio 2022 environment")
+                if "prebuild" not in workflow:
+                    preflight = step_with("name: Preflight native P0 test compiler before dependencies")
+                    self.assertIn("WindowsReleaseGateTests.test_p0_direct_emit_windows_compiler_surface -v", preflight)
+                    self.assertIn("if ($LASTEXITCODE -ne 0)", preflight)
+                    self.assertLess(steps.index(initialize), steps.index(preflight))
+                    self.assertLess(steps.index(preflight), steps.index(step_with("id: vcpkg-key\n")))
                 identify = step_with("id: vcpkg-key\n")
                 restore = step_with("uses: actions/cache/restore@v5")
                 install = step_with("name: vcpkg install (")
@@ -555,7 +588,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertIn("key: ${{ steps.vcpkg-key.outputs.key }}", restore)
                 self.assertIn("${{ steps.vcpkg-key.outputs.restore-prefix }}", restore)
                 self.assertIn("key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}", save)
-                self.assertIn("if: steps.vcpkg-cache.outputs.cache-hit != 'true'", save)
+                self.assertIn("steps.vcpkg-cache.outputs.cache-hit != 'true'", save)
                 self.assertIn("hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''", save)
                 for cache_step in (restore, save):
                     paths = re.search(r'path: \|\n(.*?)(?=\n\s+key:)', cache_step, re.DOTALL)
@@ -583,6 +616,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.assertLess(steps.index(install), steps.index(publish))
                     self.assertLess(steps.index(publish), steps.index(consumer))
                     self.assertIn("steps.shared-vcpkg-publish.outcome == 'failure'", source)
+                    self.assertIn("if: steps.shared-vcpkg-publish.outcome != 'success' &&", save)
+                    self.assertLess(steps.index(publish), steps.index(save))
                 for marker in re.findall(r'(?m)^\s*\$installed_marker = (.*)$', source):
                     self.assertEqual(marker, 'Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\\vcpkg\\status"')
 

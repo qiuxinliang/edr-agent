@@ -2124,9 +2124,8 @@ static void test_context_manifest_utf8_backslash_and_invalid_rejection(void) {
 
 static void fill_max_backslash_utf8(char *dst, size_t cap) {
   assert(dst != NULL && cap >= 5u);
-  dst[0] = (char)0xe6;
-  dst[1] = (char)0xb5;
-  dst[2] = (char)0x8b; /* U+6D4B, valid three-byte UTF-8. */
+  /* U+6D4B bytes, without an out-of-range conversion to MSVC's signed char. */
+  memcpy(dst, "\xE6\xB5\x8B", 3u);
   memset(dst + 3u, '\\', cap - 4u);
   dst[cap - 1u] = '\0';
 }
