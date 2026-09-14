@@ -70,6 +70,14 @@ jobs:
           REQUESTED_MODE: ${{ inputs.release_mode }}
           CONFIGURED_MODE: ${{ vars.WINDOWS_RELEASE_MODE }}
         run: python3 scripts/windows_release_mode.py --event "$GITHUB_EVENT_NAME" --requested "$REQUESTED_MODE" --configured "$CONFIGURED_MODE" --output "$GITHUB_OUTPUT"
+      - name: Check private signing configuration before building
+        if: steps.signing-mode.outputs.mode == 'usb'
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo '::error::Configure the dedicated USB_SIGNING_TOKEN before a USB release'; exit 1; }
+          test "$(gh api repos/qiuxinliang/edr-agent-signing --jq .private)" = true
+          test "$(gh api repos/qiuxinliang/edr-agent-signing/actions/workflows/sign.yml --jq .state)" = active
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1307,6 +1315,8 @@ jobs:
       contents: read
       actions: read
     uses: ./.github/workflows/windows-usb-sign-files.yml
+    secrets:
+      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
     with:
       phase: native
       version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
@@ -1325,6 +1335,8 @@ jobs:
       contents: read
       actions: read
     uses: ./.github/workflows/windows-usb-sign-files.yml
+    secrets:
+      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
     with:
       phase: installer
       version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
@@ -1343,6 +1355,8 @@ jobs:
       contents: read
       actions: read
     uses: ./.github/workflows/windows-usb-sign-files.yml
+    secrets:
+      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
     with:
       phase: manifest
       version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}

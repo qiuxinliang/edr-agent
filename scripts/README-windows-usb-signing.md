@@ -30,8 +30,8 @@ whole-ZIP signing or local repackaging.
 `package-state-*` artifacts are hosted-only checkpoints (3-day retention).
 `usb-<phase>-request-<arch>` contains a flat allowlist and request identity
 (commit/version/architecture/phase, SHA256, size); no arbitrary extension or
-extra file is accepted. The dedicated workflow sparsely checks out only three
-reviewed signing scripts. First-party signatures are checked for exact
+extra file is accepted. The private signing repository runs its reviewed snapshot
+of the signing helpers, never source code from a public request. First-party signatures are checked for exact
 publisher and timestamp; byte-level checks reject replacement with a different,
 otherwise correctly signed program. Upstream WinDivert/Velociraptor signatures
 are not replaced.
@@ -43,18 +43,31 @@ Existing PFX and unsigned release paths remain supported.
 
 ## Runner lifecycle and security
 
+The fixed runner belongs ONLY to private `qiuxinliang/edr-agent-signing`.
+The public repository dispatches a private request from a GitHub-hosted runner;
+it has no runner registered on the USB host. Private hosted admission validates
+the exact source repository, release workflow, active run attempt, commit,
+tag/version (or manual main release) and both architecture artifact IDs before
+scheduling the hardware host. The private host rechecks source freshness before
+signing and before returning results. Private signing results are downloaded
+back into the original run and pass the unchanged hosted integrity gates.
+
 The runner runs interactively as the certificate owner, never as SYSTEM.
-Use labels `self-hosted,Windows,edr-usb-signing`. Keep UTM running, its user
+Register once WITHOUT `--ephemeral`, using labels
+`self-hosted,Windows,edr-usb-signing`. Install the private repository's
+`scripts/Install-RunnerLogonTask.ps1` once elevated. It starts the fixed runner
+when the signing user logs on, prevents duplicate starts and restarts unexpected
+exits (1-minute delay, up to 999 restarts; inspect the task if exhausted).
+Keep UTM running, its user
 signed in and the USB redirected. Enter PINs directly in Windows; never export
 the key or store PINs in scripts, arguments, variables or GitHub secrets.
 
-This pipeline has THREE sequential USB jobs (both architectures in each).
-An ephemeral runner accepts only one job: register a fresh ephemeral runner for
-each signing phase, or provision an isolated ephemeral runner pool. The prior
-single-job registration does not automatically serve all three phases.
-Do not silently replace it with a permanent public-repository runner.
-Before starting each runner, check the release run ID, source commit and pending
-phase; stop/deregister unused registrations on cancellation. Signing jobs
+This pipeline still has THREE sequential USB jobs (both architectures in each),
+all served by the same private runner. No per-phase registration or Mac daemon
+is required. Do not register this persistent runner with the public repository.
+The hosted bridge has a 30-minute wait deadline and cancels its known private run
+on failure/cancellation. Source freshness checks also prevent stale queued jobs
+from signing/returning results. Signing jobs
 serialize on `edr-usb-token`, have a 20-minute deadline, and SignTool has a
 180-second per-call deadline. No untrusted PR jobs, unsigned fallback, or key
 export is allowed. Restrict runner directories to the signing user and SYSTEM.
@@ -77,6 +90,25 @@ publisher allowlist, strict subject validation and all manifest hashes remain
 required. Until the hardware path passes, USB releases remain blocked rather
 than falling back to unsigned publication.
 
+## One-time cross-repository access
+
+Configure `USB_SIGNING_TOKEN` in BOTH repositories: a dedicated fine-grained PAT
+limited to `edr-agent` and `edr-agent-signing`, Actions read/write and automatic
+Metadata read ONLY. It dispatches/reads private signing runs and reads public
+request artifacts; it does not need Contents write, administration or key access.
+Use `gh secret set USB_SIGNING_TOKEN --repo <repository>` interactively, never
+commit the credential or reuse a personal CLI OAuth token. Rotate before expiry.
+The private signing repository must remain private, restricted to trusted release
+maintainers, with no PR-triggered hardware jobs. Review signing-code updates
+separately; a source release must not automatically replace trusted signing code.
+
+`WINDOWS_USB_THUMBPRINT` and `WINDOWS_USB_SIGNTOOL_PATH` are also configured in the
+private repository. The public repository retains publisher configuration for
+hosted verification. A missing token/private workflow fails before native builds.
+An offline runner is reported as waiting, then terminal failure, never unsigned
+success. Existing release tags retain their old workflows; publish a NEW version
+after merging this bridge, do not retag immutable releases.
+
 ## Verification and recovery
 
 `tests/test_windows_usb_exchange.ps1` checks identity, allowlists, duplicates,
@@ -88,7 +120,7 @@ own temporary files/software test certificate, never the USB certificate.
 Syntax and exchange checks run on both native build hosts.
 
 A failed signing phase produces no publishable success. Retry from the prior
-hosted checkpoint with a fresh response directory and runner registration;
+hosted checkpoint with a fresh response directory; reuse the fixed private runner;
 never overwrite an immutable published release. Import the verified final bundle
 into the platform; CI success alone does not prove platform trust or endpoint
 installation success.
