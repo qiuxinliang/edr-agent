@@ -1203,7 +1203,9 @@ jobs:
 
       - name: Stage native USB signing input
         if: env.WINDOWS_RELEASE_MODE == 'usb'
-        shell: powershell
+        # Stay in the native build's PowerShell 7 environment. Switching to
+        # 5.1 here inherits an incompatible PSModulePath from VS initialization.
+        shell: pwsh
         run: .\scripts\Stage-WindowsUsbSigningInput.ps1 -Architecture $env:EDR_RELEASE_ARCH -Version $env:EDR_AGENT_VERSION -OutputDirectory "$env:RUNNER_TEMP\usb-input-$env:EDR_RELEASE_ARCH"
 
       - name: Upload native USB signing input
