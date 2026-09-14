@@ -91,3 +91,18 @@ Linux PMFE 扫描固定 `/proc/<pid>` 并校验扫描前后进程出生标识；
 - Shell 模板语法和 `git diff --check` 通过。
 
 这些是代码及合成回归数据，不是此前 220 条现场告警或 UTM 新版本部署的实测结果。
+
+## 后续 Windows 链接回归修正
+
+`test_ave_sdk` 进入发布测试集合后，MSVC 暴露出缺失的
+`edr_preprocess_apply_sampling_pct` 符号。此前 `ingest_http.c` 内仅 GCC/Clang
+生效的弱符号空实现掩盖了测试依赖缺口；单源文件交叉编译也不能发现链接错误。
+
+- 删除生产传输中的弱符号兜底，产品必须链接真正的预处理实现。
+- 在两个 AVE 测试共享的既有测试替身中显式实现采样接收/观察接口，并包含生产声明头。
+- SDK 回归调用真实传输画像入口，断言 37% 和 100% 均传到测试边界，不以空实现取得通过。
+- 删除弱符号、尚未添加替身时，本地完整目标复现同一未解析符号；补齐后产品及
+  `test_ave_sdk` / `test_ave_pipeline` 链接成功。两个 AVE 测试及其 ASan/UBSan 运行均为 2/2 通过。
+- 两个完整 CMake 测试目标完成 Windows amd64（MinGW）和 arm64（Zig/Clang）交叉链接，
+  共生成四个 EXE，而不只是编译修改文件。交叉配置未启用 SQLite/OpenSSL/Curl，
+  属于链接依赖检查，不代表生产配置或 Windows/MSVC 原生执行已通过；本地运行测试使用真实 SQLite。

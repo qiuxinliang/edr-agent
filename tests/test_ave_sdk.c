@@ -2,6 +2,8 @@
  * 最小化 AVE SDK 自检：AVE_Init / AVE_GetVersion / AVE_ScanFile（首个可选参数为待扫文件）。
  */
 #include "edr/ave_sdk.h"
+#include "edr/ingest_http.h"
+#include "edr/preprocess.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +63,14 @@ static void test_behavior_drain(void) {
 }
 
 int main(int argc, char **argv) {
+  /* Exercise the real transport caller and the explicit test boundary. This
+   * must link without compiler-specific weak fallback implementations. */
+  edr_ingest_http_apply_telemetry_profile(NULL, NULL, NULL, -1, -1,
+                                          NULL, 37u, NULL, -1);
+  assert(edr_preprocess_sampling_pct() == 37u);
+  edr_ingest_http_apply_telemetry_profile(NULL, NULL, NULL, -1, -1,
+                                          NULL, 100u, NULL, -1);
+  assert(edr_preprocess_sampling_pct() == 100u);
   AVEConfig cfg = {0};
   cfg.max_concurrent_scans = 2;
   cfg.behavior_monitor_enabled = true;

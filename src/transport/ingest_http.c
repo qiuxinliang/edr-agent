@@ -25,10 +25,6 @@
 static int json_get_bool(const char *obj, const char *key, int *out);
 static void control_ack_mark_pending_snapshot_stale(void);
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak)) void edr_preprocess_apply_sampling_pct(uint32_t pct) { (void)pct; }
-#endif
-
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
