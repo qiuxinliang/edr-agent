@@ -3,6 +3,13 @@
 ## Responsibility boundary
 
 Use `edr-agent client release` with `release_mode=usb` and a new version.
+USB is the default for both tags and manual runs. `prepare-release` resolves the
+mode once and all build/sign/lifecycle/publish gates consume that output. Missing
+repository variables cannot disable signing. Tag releases reject `unsigned`;
+only an explicit manual `release_mode=unsigned` permits an unsigned test release.
+Set `WINDOWS_RELEASE_MODE=usb` in the repository for older workflows that still
+depend on this variable. A new source commit requires a new release version.
+
 GitHub compiles, assembles Inno installers, creates ZIPs, verifies hashes and
 publishes. UTM only signs allowlisted EXEs and small detached CMS manifests.
 It never downloads a complete package, source tree, DLL set or rules bundle,
@@ -67,7 +74,8 @@ GitHub CLI for signing jobs; artifacts are transferred using Actions.
 `WINDOWS_USB_INNO_PATH` is no longer consumed. Hosted packaging uses its installed
 Inno Setup 6 compiler and fails clearly if missing. Backend trusted roots,
 publisher allowlist, strict subject validation and all manifest hashes remain
-required. Do not activate USB mode globally before a full release passes.
+required. Until the hardware path passes, USB releases remain blocked rather
+than falling back to unsigned publication.
 
 ## Verification and recovery
 

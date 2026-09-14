@@ -1,7 +1,6 @@
 # 独立 edr-agent 仓库：工作目录 = 本仓库根。默认发布 AMD64/ARM64 Windows Agent：
 # `win_*` tag → vcpkg(curl + sqlite) → 双架构 Release Bundle。
-# 当前无证书时默认发布完整 unsigned bundle；取得证书后将仓库变量
-# `WINDOWS_RELEASE_MODE` 设为 `signed`，无需修改工作流。
+# 默认 USB 签名；未签名仅允许手动明确选择，tag 发布禁止退回 unsigned。
 # YARA 依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
@@ -21,7 +20,7 @@ on:
       release_mode:
         description: Publish a complete signed or unsigned Release Bundle
         required: true
-        default: unsigned
+        default: usb
         type: choice
         options:
           - unsigned
@@ -51,17 +50,30 @@ env:
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
-  WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
 
 jobs:
   prepare-release:
     name: Prepare immutable GitHub Release
     runs-on: ubuntu-latest
+    outputs:
+      signing-mode: ${{ steps.signing-mode.outputs.mode }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Test release signing admission
+        run: python3 tests/test_windows_release_mode.py
+      - name: Resolve mandatory signing policy
+        id: signing-mode
+        env:
+          REQUESTED_MODE: ${{ inputs.release_mode }}
+          CONFIGURED_MODE: ${{ vars.WINDOWS_RELEASE_MODE }}
+        run: python3 scripts/windows_release_mode.py --event "$GITHUB_EVENT_NAME" --requested "$REQUESTED_MODE" --configured "$CONFIGURED_MODE" --output "$GITHUB_OUTPUT"
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          WINDOWS_RELEASE_MODE: ${{ steps.signing-mode.outputs.mode }}
         shell: bash
         run: |
           set -euo pipefail
@@ -118,6 +130,7 @@ jobs:
             cmake_processor: ARM64
             include_windivert: "false"
     env:
+      WINDOWS_RELEASE_MODE: ${{ needs.prepare-release.outputs.signing-mode }}
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       EDR_RELEASE_ARCH: ${{ matrix.arch }}
@@ -1288,8 +1301,8 @@ jobs:
           retention-days: 3
 
   usb-native-sign:
-    needs: windows-build
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_mode == 'usb') || (github.event_name == 'push' && vars.WINDOWS_RELEASE_MODE == 'usb') }}
+    needs: [prepare-release, windows-build]
+    if: ${{ needs.prepare-release.outputs.signing-mode == 'usb' }}
     permissions:
       contents: read
       actions: read
@@ -1345,9 +1358,14 @@ jobs:
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
+      - prepare-release
       - windows-build
       - windows-lifecycle
+      - usb-publish-assets
+    if: ${{ always() && needs.prepare-release.result == 'success' && needs.windows-build.result == 'success' && needs.windows-lifecycle.result == 'success' && (needs.prepare-release.outputs.signing-mode != 'usb' || needs.usb-publish-assets.result == 'success') }}
     runs-on: ubuntu-latest
+    env:
+      WINDOWS_RELEASE_MODE: ${{ needs.prepare-release.outputs.signing-mode }}
     steps:
       - name: Verify combined AMD64/ARM64 asset set
         env:
@@ -1405,8 +1423,8 @@ jobs:
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
-    needs: [windows-build, usb-publish-assets]
-    if: ${{ always() && needs.windows-build.result == 'success' && (needs.usb-publish-assets.result == 'success' || ((github.event_name == 'workflow_dispatch' && inputs.release_mode != 'usb' || github.event_name == 'push' && vars.WINDOWS_RELEASE_MODE != 'usb') && needs.usb-publish-assets.result == 'skipped')) }}
+    needs: [prepare-release, windows-build, usb-publish-assets]
+    if: ${{ always() && needs.prepare-release.result == 'success' && needs.windows-build.result == 'success' && ((needs.prepare-release.outputs.signing-mode == 'usb' && needs.usb-publish-assets.result == 'success') || (needs.prepare-release.outputs.signing-mode != 'usb' && needs.usb-publish-assets.result == 'skipped')) }}
     permissions:
       contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
