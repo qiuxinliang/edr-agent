@@ -2,11 +2,19 @@
 
 ## Responsibility boundary
 
-Use `edr-agent client release` with `release_mode=usb` and a new version.
-USB is the default for both tags and manual runs. `prepare-release` resolves the
-mode once and all build/sign/lifecycle/publish gates consume that output. Missing
-repository variables cannot disable signing. Tag releases reject `unsigned`;
-only an explicit manual `release_mode=unsigned` permits an unsigned test release.
+Daily `win_*` tags and manual runs now default to `build_purpose=candidate`.
+They compile/test both architectures and retain `unsigned-candidate-*` Actions
+artifacts for seven days, with an unsigned notice. They do not create a Release,
+dispatch USB jobs, or promote artifacts to endpoints. Signing configuration is
+not required. A successful candidate run does not imply lifecycle/release approval.
+
+For a formal release, separately start `edr-agent client release` from reviewed
+`main` with `build_purpose=release`, `release_mode=usb` (or `signed` for PFX), and a
+new version. This explicit path rebuilds and runs the full signing/lifecycle
+pipeline; it does not silently promote a candidate or reuse its trust status.
+`prepare-release` resolves purpose/mode once; every publication gate consumes
+that decision. Missing repository configuration cannot disable release signing.
+Unsigned output is candidate-only and cannot be published by this workflow.
 Set `WINDOWS_RELEASE_MODE=usb` in the repository for older workflows that still
 depend on this variable. A new source commit requires a new release version.
 
@@ -44,7 +52,7 @@ Hosted packaging and the private signing snapshot share this contract.
 Both architectures must validate before draft uploads. The publish job remains
 gated on native install, upgrade and rollback tests. Runtime identity is rebuilt
 from signed components and forces `installer_required`, not `binary_hot`.
-Existing PFX and unsigned release paths remain supported.
+The explicit PFX signed-release path remains supported.
 
 ## Runner lifecycle and security
 
@@ -111,8 +119,10 @@ separately; a source release must not automatically replace trusted signing code
 private repository. The public repository retains publisher configuration for
 hosted verification. A missing token/private workflow fails before native builds.
 An offline runner is reported as waiting, then terminal failure, never unsigned
-success. Existing release tags retain their old workflows; publish a NEW version
-after merging this bridge, do not retag immutable releases.
+success. Existing release tags retain their old workflows; use a new ref containing
+the change. Do not retag immutable releases. The candidate default is the temporary
+operational choice while the full signing pipeline is stabilized; restore automatic
+tag publication only after the two-architecture signed lifecycle path is proven.
 
 ## Verification and recovery
 

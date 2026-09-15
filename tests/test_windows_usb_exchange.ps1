@@ -140,6 +140,8 @@ try {
             Write-ExchangeJson (Join-Path $ui 'setup-ui-manifest.json') ([ordered]@{
                 version='1.2.3';target_arch='arm64';setup_target_arch='arm64';agent_binary_sha256='';runtime_identity_sha256='';publisher_thumbprint='';setup_exe_sha256='';ui_exe_sha256='';setup_exe_signed=$false;ui_exe_signed=$false;capabilities=@{signature_status='unsigned'};generated_at_utc=''
             })
+            # Reproduce upload/download: empty directories do not survive artifacts.
+            Remove-Item -LiteralPath (Join-Path $hosted 'dist')
             & $packager -Stage Installer -OutputDirectory $hosted -ExpectedCommit $commit -Thumbprint $thumb -ManifestSignerSubject 'CN=Fixture' -ResponseDirectory $response
             $state=Get-Content (Join-Path $hosted 'state.json') -Raw | ConvertFrom-Json
             if($state.stage -ne 'installer'){throw 'Hosted installer did not advance'}

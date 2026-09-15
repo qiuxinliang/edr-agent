@@ -13,12 +13,13 @@ spec.loader.exec_module(module)
 
 
 class ReleaseSigningModeTests(unittest.TestCase):
-    def gate(self, job, mode, usb_result, build='success', lifecycle='success'):
+    def gate(self, job, mode, usb_result, build='success', lifecycle='success', purpose='release'):
         workflow = (SCRIPT.parent.parent / '.github/workflows/edr-agent-client-release.yml').read_text()
         block = re.split(r'\n  [\w-]+:\n', workflow.split(f'\n  {job}:\n', 1)[1], maxsplit=1)[0]
         expression = re.search(r'^    if: \$\{\{ (.+) \}\}$', block, re.MULTILINE).group(1)
         values = {
             'needs.prepare-release.outputs.signing-mode': mode,
+            'needs.prepare-release.outputs.build-purpose': purpose,
             'needs.prepare-release.result': 'success',
             'needs.windows-build.result': build,
             'needs.windows-lifecycle.result': lifecycle,
@@ -40,11 +41,49 @@ class ReleaseSigningModeTests(unittest.TestCase):
         self.assertFalse(self.gate('publish-release', 'usb', 'success', lifecycle='failure'))
         self.assertFalse(self.gate('windows-lifecycle', 'usb', 'success', build='failure'))
 
-    def test_explicit_other_modes_preserve_native_lifecycle(self):
-        for mode in ('signed', 'unsigned'):
-            self.assertTrue(self.gate('windows-lifecycle', mode, 'skipped'))
-            self.assertTrue(self.gate('publish-release', mode, 'skipped'))
-            self.assertFalse(self.gate('publish-release', mode, 'skipped', lifecycle='failure'))
+    def test_explicit_signed_mode_preserves_native_lifecycle(self):
+        self.assertTrue(self.gate('windows-lifecycle', 'signed', 'skipped'))
+        self.assertTrue(self.gate('publish-release', 'signed', 'skipped'))
+        self.assertFalse(self.gate('publish-release', 'signed', 'skipped', lifecycle='failure'))
+
+    def test_candidate_cannot_sign_promote_or_publish_even_if_other_jobs_succeed(self):
+        for mode in ('signed', 'unsigned', 'usb'):
+            for job in ('usb-native-sign', 'windows-lifecycle', 'publish-release'):
+                with self.subTest(mode=mode, job=job):
+                    self.assertFalse(self.gate(job, mode, 'success', purpose='candidate'))
+        for job in ('windows-lifecycle', 'publish-release'):
+            self.assertFalse(self.gate(job, 'unsigned', 'success', purpose='release'))
+
+    def test_candidate_plan_needs_no_signing_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for event in ('push', 'workflow_dispatch'):
+                output = Path(directory) / event
+                result = subprocess.run([sys.executable, str(SCRIPT), '--event', event,
+                    '--purpose', 'candidate', '--configured', 'usb', '--output', str(output)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), 'mode=unsigned\npurpose=candidate\n')
+
+    def test_release_plan_rejects_unsigned_and_emits_no_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            base = [sys.executable, str(SCRIPT), '--event', 'workflow_dispatch', '--purpose', 'release', '--output', str(output)]
+            result = subprocess.run(base + ['--requested', 'unsigned'], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+            result = subprocess.run(base + ['--requested', 'usb'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(), 'mode=usb\npurpose=release\n')
+
+    def test_workflow_candidate_defaults_and_artifact_only_boundary(self):
+        workflow = (SCRIPT.parent.parent / '.github/workflows/edr-agent-client-release.yml').read_text()
+        purpose_input = workflow.split('      build_purpose:', 1)[1].split('      release_mode:', 1)[0]
+        self.assertIn('default: candidate', purpose_input)
+        self.assertIn("BUILD_PURPOSE: ${{ inputs.build_purpose || 'candidate' }}", workflow)
+        self.assertIn("if: steps.signing-mode.outputs.purpose == 'release'", workflow)
+        upload = workflow.split('      - name: Upload ${{ matrix.arch }} release bundle', 1)[1].split('      - name:', 1)[0]
+        self.assertIn("env.WINDOWS_BUILD_PURPOSE == 'release'", upload)
+        self.assertIn('name: unsigned-candidate-', workflow)
+        self.assertNotIn('Publish unsigned Windows release', workflow)
 
     def test_missing_configuration_requires_usb(self):
         for event in ("push", "workflow_dispatch"):

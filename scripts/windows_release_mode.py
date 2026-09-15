@@ -21,11 +21,21 @@ def main() -> None:
     parser.add_argument("--requested", default="")
     parser.add_argument("--configured", default="")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--purpose", choices=("candidate", "release"))
     args = parser.parse_args()
-    mode = resolve_mode(args.event, args.requested, args.configured)
+    if args.purpose == "candidate":
+        if args.event not in {"push", "workflow_dispatch"}:
+            raise ValueError("Unsupported candidate event")
+        mode = "unsigned"
+    else:
+        mode = resolve_mode(args.event, args.requested, args.configured)
+        if args.purpose == "release" and mode == "unsigned":
+            raise ValueError("Unsigned output is candidate-only; releases require signing")
     with Path(args.output).open("a", encoding="utf-8") as output:
         output.write(f"mode={mode}\n")
-    print(f"Resolved release mode: {mode}; unsigned is never an automatic fallback")
+        if args.purpose:
+            output.write(f"purpose={args.purpose}\n")
+    print(f"Resolved purpose: {args.purpose or 'legacy explicit mode'}; signing: {mode}")
 
 
 if __name__ == "__main__":

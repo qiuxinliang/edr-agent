@@ -100,6 +100,9 @@ $setup=Join-Path $dist ($prefix+'setup.exe')
 $integrityPath=Join-Path $runtime 'native-package-integrity.json'
 $uiManifestPath=Join-Path $ui 'setup-ui-manifest.json'
 if ($Stage -eq 'Installer') {
+    # Actions artifacts contain files, not empty directories. Prepare's empty
+    # dist directory is absent after download on the hosted assembly runner.
+    New-Item -ItemType Directory -Path $dist -Force | Out-Null
     foreach ($name in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe')) {
         Copy-Item -LiteralPath (Join-Path $ResponseDirectory $name) -Destination (Join-Path $runtime $name) -Force
     }
