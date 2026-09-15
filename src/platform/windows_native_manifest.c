@@ -12,6 +12,10 @@
 #define EDR_NATIVE_PATH_MAX 32768u
 #define EDR_NATIVE_NAME_MAX 128u
 
+static int manifest_is_builtin_collector(const char *name) {
+  return name && !strcmp(name, "collector/forensic_collector_builtin.exe");
+}
+
 static int manifest_hex_value(char ch) {
   if (ch >= '0' && ch <= '9') return ch - '0';
   if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
@@ -24,6 +28,9 @@ int edr_windows_native_manifest_name_safe(const char *name) {
   size_t length;
   size_t base_length;
   if (!name || !name[0] || !strcmp(name, ".") || !strcmp(name, "..")) return 0;
+  /* The release manifest has one supported nested runtime entry. Do not
+   * generalize this exception to arbitrary paths, aliases, or executables. */
+  if (manifest_is_builtin_collector(name)) return 1;
   length = strlen(name);
   if (length > EDR_NATIVE_NAME_MAX) return 0;
   if (name[length - 1] == '.' || name[length - 1] == ' ') return 0;
@@ -114,6 +121,7 @@ static int manifest_root_valid(const wchar_t *install_dir) {
                      NULL);
   if (root == INVALID_HANDLE_VALUE) return 0;
   if (!GetFileInformationByHandleEx(root, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+      !(tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
       (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
     CloseHandle(root);
     return 0;
@@ -236,6 +244,16 @@ int edr_windows_native_manifest_validate(const wchar_t *install_dir,
         cJSON_Delete(root);
         goto cleanup;
       }
+      if (manifest_is_builtin_collector(name->valuestring)) {
+        /* Checking only the executable would follow a junction/symlink in
+         * its parent and allow a hash-matching file outside the install. */
+        int written = _snwprintf(entry_path, entry_capacity, L"%ls\\collector", install_dir);
+        if (written < 0 || (size_t)written >= entry_capacity ||
+            !manifest_root_valid(entry_path)) {
+          cJSON_Delete(root);
+          goto cleanup;
+        }
+      }
       {
         int written = _snwprintf(entry_path, entry_capacity, L"%ls\\%ls", install_dir,
                                  name_wide);
@@ -271,6 +289,7 @@ int edr_windows_native_manifest_validate(const wchar_t *install_dir,
          * only the .dll/.exe extension policy is relaxed for it. */
         int legacy_contract = !_stricmp(name->valuestring, "p0_matcher_contract.json");
         if (!required_name && !legacy_contract &&
+            !manifest_is_builtin_collector(name->valuestring) &&
             (!extension || _stricmp(extension, ".dll") != 0)) {
           cJSON_Delete(root);
           goto cleanup;

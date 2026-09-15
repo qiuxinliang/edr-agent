@@ -129,6 +129,84 @@ static int create_test_root(wchar_t root[32768]) {
   return 1;
 }
 
+static int test_builtin_collector(const wchar_t *root, const wchar_t *source,
+                                  const char *hash) {
+  wchar_t directory[32768], collector[32768], outside[32768], outside_file[32768];
+  char manifest[4096];
+  int length, ok = 1;
+  const char *rejected_names[] = {
+      "collector/extra.exe", "collector/extra.dll",
+      "Collector/forensic_collector_builtin.exe",
+      "collector\\\\forensic_collector_builtin.exe",
+      "collector/../forensic_collector_builtin.exe",
+      "collector/forensic_collector_builtin.exe:stream",
+      "collector/forensic_collector_builtin.exe.",
+      "collector/forensic_collector_builtin.exe "};
+  if (!join_path(root, L"collector", directory, 32768) ||
+      !join_path(directory, L"forensic_collector_builtin.exe", collector, 32768) ||
+      !CreateDirectoryW(directory, NULL) || !CopyFileW(source, collector, FALSE))
+    return fail("create builtin collector fixture");
+  length = _snprintf(manifest, sizeof(manifest),
+      "{\"schema\":\"edr.windows.native-package-integrity.v1\",\"files\":["
+      "{\"name\":\"FDSecurityInstallerWorker.exe\",\"sha256\":\"%s\"},"
+      "{\"name\":\"uninstall.exe\",\"sha256\":\"%s\"},"
+      "{\"name\":\"collector/forensic_collector_builtin.exe\",\"sha256\":\"%s\"}]}",
+      hash, hash, hash);
+  ok &= validate_bytes(root, manifest, (size_t)length, 1,
+                       "packaged builtin collector must pass native validation");
+  for (size_t i = 0; i < sizeof(rejected_names) / sizeof(rejected_names[0]); ++i) {
+    char negative[4096];
+    ok &= expect_true(!edr_windows_native_manifest_name_safe(rejected_names[i]),
+                       "unsupported nested name must be rejected independent of file existence");
+    int count = _snprintf(negative, sizeof(negative),
+        "{\"schema\":\"edr.windows.native-package-integrity.v1\",\"files\":["
+        "{\"name\":\"FDSecurityInstallerWorker.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"uninstall.exe\",\"sha256\":\"%s\"},"
+        "{\"name\":\"%s\",\"sha256\":\"%s\"}]}", hash, hash, rejected_names[i], hash);
+    ok &= validate_bytes(root, negative, (size_t)count, 0,
+                         "collector aliases and unsupported nested entries must fail");
+  }
+  {
+    char duplicate[4096];
+    int count = _snprintf(duplicate, sizeof(duplicate), "%.*s,"
+        "{\"name\":\"collector/forensic_collector_builtin.exe\",\"sha256\":\"%s\"}]}",
+        length - 2, manifest, hash);
+    ok &= validate_bytes(root, duplicate, (size_t)count, 0,
+                         "duplicate collector entry must fail");
+  }
+  ok &= expect_true(write_bytes(collector, "tampered", 8), "tamper collector fixture");
+  ok &= validate_bytes(root, manifest, (size_t)length, 0,
+                       "tampered builtin collector must fail");
+  ok &= expect_true(DeleteFileW(collector), "delete collector fixture");
+  ok &= validate_bytes(root, manifest, (size_t)length, 0,
+                       "missing builtin collector must fail");
+  if (!CreateSymbolicLinkW(collector, source, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+    ok &= fail("collector file reparse fixture must be creatable");
+  } else {
+    ok &= validate_bytes(root, manifest, (size_t)length, 0,
+                         "collector file reparse must fail even with matching hash");
+    ok &= expect_true(DeleteFileW(collector), "remove collector file link");
+  }
+  ok &= expect_true(RemoveDirectoryW(directory), "remove collector directory");
+  if (!create_test_root(outside)) return fail("create collector directory link target");
+  if (!join_path(outside, L"forensic_collector_builtin.exe", outside_file, 32768) ||
+      !CopyFileW(source, outside_file, FALSE)) {
+    ok &= fail("populate collector directory link target");
+  } else {
+    if (!CreateSymbolicLinkW(directory, outside, SYMBOLIC_LINK_FLAG_DIRECTORY |
+                                               SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+      ok &= fail("collector directory reparse fixture must be creatable");
+    } else {
+      ok &= validate_bytes(root, manifest, (size_t)length, 0,
+                           "collector parent reparse must fail even with matching hash");
+      ok &= expect_true(RemoveDirectoryW(directory), "remove collector directory link");
+    }
+    ok &= expect_true(DeleteFileW(outside_file), "remove external collector fixture");
+  }
+  ok &= expect_true(RemoveDirectoryW(outside), "remove external collector directory");
+  return ok;
+}
+
 static int remove_tree(const wchar_t *root) {
   wchar_t path[32768];
   const wchar_t *names[] = {
@@ -175,6 +253,7 @@ int wmain(void) {
                     "build valid manifest");
   ok &= validate_bytes(root, valid_manifest, (size_t)valid_length, 1,
                        "valid manifest must pass");
+  ok &= test_builtin_collector(root, source, worker_hash);
 
   {
     char negative[4096];
