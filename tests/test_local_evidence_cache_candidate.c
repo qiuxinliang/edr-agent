@@ -2,6 +2,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
+#include "../src/preprocess/process_cached_generation.h"
 #include "cJSON.h"
 
 #include <assert.h>
@@ -4251,7 +4252,72 @@ static void test_candidate_structured_evidence_and_durable_identity(void) {
 }
 #endif
 
+static void test_retained_file_read_cached_actor(void) {
+  /* 3.2.499 UTM: a benign script read had a path but zero generation, while
+   * its process/create/write facts already carried the exact lifetime. */
+  const uint64_t creation = UINT64_C(134339443092584333);
+  const uint64_t birth = (creation - UINT64_C(116444736000000000)) * 100u;
+  const uint64_t key = UINT64_C(11821949021852890);
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r));
+  char command[700];
+  assert(r != NULL);
+  memset(command, 'x', sizeof(command) - 1u);
+  command[sizeof(command) - 1u] = '\0';
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(5012u, 100u, "powershell.exe", command,
+             "C:\\Windows\\powershell.exe", "parent.exe", birth, key, creation) == 0);
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5012u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  snprintf(r->file_path, sizeof(r->file_path), "%s", "C:\\Temp\\script-fact.ps1");
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 1);
+  assert(r->process_start_key == key && r->process_creation_filetime_100ns == creation);
+  assert(r->file_actor_generation_validated && strcmp(r->cmdline, command) == 0);
+  assert(strcmp(r->file_path, "C:\\Temp\\script-fact.ps1") == 0);
+  assert(strcmp(r->process_generation_source, "file_read_process_tree_cache_generation") == 0);
+  assert(!r->collector_evidence_gate[0] && !r->username[0]);
+
+  /* A cache miss or conflict is best effort, not an assertion that pauses P0. */
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5012u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  assert(p0_bind_file_read_cached_generation(r, key + 1u, 0u) == 0);
+  assert(p0_bind_file_read_cached_generation(r, key, creation + 1u) == 0);
+  r->event_time_ns = (int64_t)(birth - 1u);
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  r->pid = 5013u;
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  assert(!r->process_start_key && !r->collector_evidence_gate[0]);
+
+  /* The existing stricter rule for unidentified network actors is unchanged. */
+  r->pid = 5012u;
+  r->type = EDR_EVENT_NET_CONNECT;
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 1);
+  /* Preserve explicit command truncation and reject a clipped image path. */
+  assert(edr_pt_cache_put_generation_with_provenance(
+      5014u, 100u, "powershell.exe", command, "C:\\Windows\\powershell.exe",
+      "parent.exe", birth, key + 2u, creation, EDR_PTC_SOURCE_TRUNC_CMDLINE) == 0);
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5014u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 1);
+  assert(strstr(r->source_truncated_fields, "source.cmdline") != NULL);
+  assert(edr_pt_cache_put_generation_with_provenance(
+      5015u, 100u, "powershell.exe", command, "C:\\Windows\\powershell.exe",
+      "parent.exe", birth, key + 3u, creation, EDR_PTC_SOURCE_TRUNC_EXE_PATH) == 0);
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5015u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  assert(!r->process_start_key && !r->file_actor_generation_validated);
+  edr_pt_cache_shutdown();
+  free(r);
+}
+
 int main(void) {
+  test_retained_file_read_cached_actor();
   test_checknetisolation_standard_low_risk_is_not_candidate();
   test_checknetisolation_high_risk_port_is_candidate();
   test_checknetisolation_p1_context_is_candidate();

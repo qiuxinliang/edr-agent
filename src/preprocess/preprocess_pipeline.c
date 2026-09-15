@@ -69,6 +69,7 @@ static uint64_t s_sampling_kept;
 #ifdef _WIN32
 #define EDR_P0_TOKEN_IDENTITY_CACHE 128u
 #include "process_token_permissions_win.h"
+#include "process_cached_generation.h"
 typedef struct {
   uint32_t pid;
   uint64_t process_start_key;
@@ -330,78 +331,6 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
  * ARM64 schema may omit it. EventHeader.TimeStamp remains event time and is
  * never a creation surrogate. */
 static const char *p0_process_path_basename(const char *path);
-
-/* Kernel-File delivery can trail a short-lived actor's exit.  Recover only
- * the exact historical generation which contains the source event time; the
- * cache entry itself must carry both independent generation facts.  This is
- * deliberately narrower than a PID cache lookup so a reused PID can never
- * lend its image or command line to an older FileRead. */
-static int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
-                                               uint64_t source_start_key,
-                                               uint64_t source_creation) {
-  ProcessTreeEntry snapshot;
-  uint64_t event_unix_ns;
-  if (!edr_behavior_has_process_actor(br) || br->type == EDR_EVENT_PROCESS_CREATE ||
-      !br->pid || br->event_time_ns <= 0) {
-    return 0;
-  }
-  event_unix_ns = (uint64_t)br->event_time_ns;
-  memset(&snapshot, 0, sizeof(snapshot));
-  if (edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot) != 0 ||
-      !snapshot.process_start_key || !snapshot.creation_filetime_100ns ||
-      !snapshot.start_time_ns || !snapshot.exe_path[0] ||
-      (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) ||
-      (source_start_key != 0u &&
-       source_start_key != snapshot.process_start_key) ||
-      (source_creation != 0u &&
-       source_creation != snapshot.creation_filetime_100ns)) {
-    return 0;
-  }
-  if (!edr_process_generation_contains_event(snapshot.creation_filetime_100ns, event_unix_ns)) {
-    return 0;
-  }
-  if ((br->type == EDR_EVENT_NET_CONNECT || br->type == EDR_EVENT_NET_LISTEN) &&
-      !source_start_key && !source_creation && !snapshot.exit_time_ns) {
-    /* With no actor generation from the network provider, a possibly stale
-     * open-ended PID interval is not independent proof. A closed historical
-     * lifetime or a live same-handle query is required. */
-    return 0;
-  }
-
-  br->process_start_key = snapshot.process_start_key;
-  br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
-  br->ppid = snapshot.ppid;
-  copy_trunc(br->exe_path, sizeof(br->exe_path), snapshot.exe_path);
-  copy_trunc(br->image_path_canonical, sizeof(br->image_path_canonical),
-             snapshot.exe_path);
-  copy_trunc(br->process_name, sizeof(br->process_name),
-             snapshot.process_name[0]
-                 ? snapshot.process_name
-                 : p0_process_path_basename(snapshot.exe_path));
-  if (!br->cmdline[0] && snapshot.cmdline[0]) {
-    copy_trunc(br->cmdline, sizeof(br->cmdline), snapshot.cmdline);
-    copy_trunc(br->command_line_origin, sizeof(br->command_line_origin),
-               "process_tree_cache_generation");
-    if (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE)
-      edr_behavior_mark_source_truncated(br, "source.cmdline");
-  }
-  if (!br->parent_name[0] && snapshot.parent_name[0]) {
-    copy_trunc(br->parent_name, sizeof(br->parent_name), snapshot.parent_name);
-  }
-  copy_trunc(br->image_path_resolution_status,
-             sizeof(br->image_path_resolution_status), "RESOLVED");
-  copy_trunc(br->image_path_resolution_source,
-             sizeof(br->image_path_resolution_source),
-             "process_tree_cache_generation");
-  copy_trunc(br->process_generation_source,
-             sizeof(br->process_generation_source),
-             br->kernel_file_activity ? "file_activity_process_tree_cache_generation"
-             : br->type == EDR_EVENT_FILE_READ ? "file_read_process_tree_cache_generation"
-                                             : "network_process_tree_cache_generation");
-  if (br->type == EDR_EVENT_FILE_READ || br->kernel_file_activity)
-    br->file_actor_generation_validated = 1u;
-  return 1;
-}
 
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   HANDLE process = NULL;
@@ -1572,6 +1501,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * existing fail-closed path; collector assertions were handled above. */
     if (br.file_path[0] &&
         !edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)) {
+      /* Detection interest is not a retention-identity requirement. Reuse
+       * an already captured historical actor when available, without a live
+       * query or a new P0 gate for an unrelated/expired reader. */
+      (void)p0_bind_file_read_cached_generation(
+          &br, br.process_start_key, br.process_creation_filetime_100ns);
       apply_agent_ids_to_record(&br);
       edr_p0_rule_observe_validation_stage(&br, "file_read_interest", "verified_path_miss");
       edr_local_evidence_cache_record_behavior(&br);

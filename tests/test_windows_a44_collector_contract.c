@@ -100,18 +100,20 @@ int main(void) {
   char *a44 = read_source(root, "src/collector/edr_a44_split_path_win.c");
   char *tdh = read_source(root, "src/collector/etw_tdh_win.c");
   char *preprocess = read_source(root, "src/preprocess/preprocess_pipeline.c");
+  char *cached_generation = read_source(root, "src/preprocess/process_cached_generation.h");
   char *direct = read_source(root, "src/preprocess/p0_rule_direct_emit.c");
   char *mapper = read_source(root, "src/preprocess/behavior_from_slot.c");
   char *agent = read_source(root, "src/core/agent.c");
   char *collector_header = read_source(root, "include/edr/collector.h");
   char *event_bus = read_source(root, "src/core/event_bus.c");
   if (!cmake || !collector || !a44 || !tdh || !preprocess || !direct || !mapper || !agent ||
-      !collector_header || !event_bus) {
+      !collector_header || !event_bus || !cached_generation) {
     free(cmake);
     free(collector);
     free(a44);
     free(tdh);
     free(preprocess);
+    free(cached_generation);
     free(direct);
     free(mapper);
     free(agent);
@@ -580,13 +582,13 @@ int main(void) {
                          "FileRead without an extended StartKey must use the timestamp-bound live tuple");
   ok &= require_contains(direct, "file_read_pid_event_time_live_telemetry",
                          "direct P0 must accept the timestamp-bound live FileRead generation");
-  ok &= require_contains(preprocess, "edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot)",
+  ok &= require_contains(cached_generation, "edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot)",
                          "short-lived FileRead actors must use an event-time process generation snapshot");
-  ok &= require_contains(preprocess, "source_start_key != snapshot.process_start_key",
+  ok &= require_contains(cached_generation, "source_start_key != snapshot.process_start_key",
                          "cached FileRead generations must preserve the source StartKey boundary");
-  ok &= require_contains(preprocess, "source_creation != snapshot.creation_filetime_100ns",
+  ok &= require_contains(cached_generation, "source_creation != snapshot.creation_filetime_100ns",
                          "cached FileRead generations must preserve the creation FILETIME boundary");
-  ok &= require_contains(preprocess, "file_read_process_tree_cache_generation",
+  ok &= require_contains(cached_generation, "file_read_process_tree_cache_generation",
                          "preprocess must label an exact historical FileRead generation");
   ok &= require_contains(direct, "file_read_process_tree_cache_generation",
                          "direct P0 must accept only the explicit historical FileRead generation source");
@@ -778,6 +780,7 @@ int main(void) {
   free(a44);
   free(tdh);
   free(preprocess);
+  free(cached_generation);
   free(direct);
   free(mapper);
   free(agent);
