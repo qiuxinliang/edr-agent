@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / '.github/workflows/edr-agent-client-release.yml'
@@ -9,7 +10,7 @@ WORKFLOW = ROOT / '.github/workflows/edr-agent-client-release.yml'
 
 class WindowsReleaseWorkflowTests(unittest.TestCase):
     def setUp(self):
-        self.text = WORKFLOW.read_text()
+        self.text = WORKFLOW.read_text(encoding='utf-8')
         self.jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                    self.text.split('\njobs:\n', 1)[1], re.M | re.S))
 
@@ -48,13 +49,30 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('artifact-manifest.json.p7s', self.jobs['publish-release'])
 
     def test_syntax_validation_has_no_missing_or_retired_targets(self):
-        validator = (ROOT / 'scripts/validate_windows_powershell_syntax.ps1').read_text()
+        validator = (ROOT / 'scripts/validate_windows_powershell_syntax.ps1').read_text(encoding='utf-8')
         targets = re.findall(r'^  "([^"\n]+\.ps1)"', validator, re.M)
         self.assertGreater(len(targets), 20)
         for target in targets:
             self.assertTrue((ROOT / target.replace('\\', '/')).is_file(), target)
             self.assertNotIn('Usb', target)
         self.assertIn('tests\\test_windows_installer_acl.ps1', targets)
+
+
+class WindowsReleaseWorkflowEncodingTests(unittest.TestCase):
+    def test_contracts_under_windows_legacy_default_encoding(self):
+        original_read_text = Path.read_text
+
+        def legacy_read_text(path, encoding=None, errors=None):
+            # Decode actual repository bytes; only simulate Windows's default
+            # when a caller omits its encoding. Never replace/ignore bad bytes.
+            return original_read_text(path, encoding=encoding or 'cp1252', errors=errors)
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(WindowsReleaseWorkflowTests)
+        result = unittest.TestResult()
+        with patch.object(Path, 'read_text', legacy_read_text):
+            suite.run(result)
+        self.assertGreater(result.testsRun, 0)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
 
 
 if __name__ == '__main__':
