@@ -102,3 +102,54 @@ ProcessCreate/create/write 命令行长度为 1308，两条 FileRead 为 1023，
 
 下一轮只有出现新的、定位到具体处理边界的代码缺陷才安排编译。
 若是版本未加载、正常本地保留、字段不适用，应分别处理部署、消费或评价规则，而不是继续扩大 Agent 采集。
+
+## 6. 3.2.502 Windows 测试失败：截断标记常量先被编译器截断
+
+### 原始证据与边界
+
+- 失败版本：`win_3.2.502`，commit `2785d7a35d2082381a48a785e6c35d89516ea384`。
+- [运行 34971566723](https://github.com/qiuxinliang/edr-agent/actions/runs/34971566723) 中，
+  [amd64](https://github.com/qiuxinliang/edr-agent/actions/runs/34971566723/job/104388882225)
+  与 [arm64](https://github.com/qiuxinliang/edr-agent/actions/runs/34971566723/job/104388882208)
+  均在 `test_local_evidence_cache_candidate.c:4537` 的
+  `edr_behavior_source_field_truncated(decoded, "source.command_line_origin")` 断言失败。
+  这是测试执行失败，不是链接失败，也不是此前同名测试中的进程树断言。
+- 两个架构的 MSVC 19.44 编译日志均已在 `behavior_from_slot.c:1350–1351`
+  报 `C4309: truncation of constant value`，在 DNS 位传参处报 `C4245`。
+  这些警告没有终止编译；不能把最后的 CTest 包装异常当作原因。
+
+### 已定位机制与同类边界
+
+`truncation_mask` 虽然是 `uint64_t`，定义标记的普通 C `enum` 却先经过 MSVC 的
+32 位表示。`1ull` 只约束移位表达式，不能保证枚举成员保留该类型。
+[Microsoft 的 C 枚举说明](https://learn.microsoft.com/en-us/cpp/c-language/c-enumeration-declarations)
+也规定了枚举常量的 `int` 约束。
+
+用实际修改前后定义，分别在 Clang 的 `x86_64-pc-windows-msvc` 与
+`aarch64-pc-windows-msvc` 目标生成常量返回值，两个目标结果一致：
+
+| 标记 | 原定义转为 uint64_t | 修正后 |
+| --- | --- | --- |
+| DNS，第 31 位 | `0xffffffff80000000`，符号扩展 | `0x0000000080000000` |
+| 截断列表溢出，第 32 位 | `0` | `0x0000000100000000` |
+| 命令行来源，第 33 位 | `0` | `0x0000000200000000` |
+
+因此过长来源被解析器清空后，`truncation_mask |= 0` 没有保留原因，最终触发断言。
+新增第 33 位暴露了既有第 32 位的同类缺陷；只改单个新标记会留下隐患。
+此前 macOS 与 MinGW 检查允许更宽的枚举值，不能替代 MSVC 语义验证。
+这也解释了为什么本地通过，而 Windows 两架构均失败；无需再增加命令行容量。
+
+### 修正与验证范围
+
+- 同一组 34 个标记改为显式 `UINT64_C(1)` 位掩码常量；不改变结构体、缓存容量或线协议。
+- 对第 31–33 位保留编译期数值不变量，避免再次在生成产物前悄悄丢位。
+- 原第 4537 行断言保留。现有解析测试补 9 个场景：DNS/来源刚好容纳、到达与超过容量，
+  截断列表超长，以及 DNS 与来源同时截断；要求标记互不混淆，后续 `COMPLETE` 不抹掉损失。
+- 定向 CTest：`local_evidence_cache_candidate`、`cmd_actor_and_script_artifact`、
+  `detection_sensor_bridge`，3/3 通过；使用真实解析代码，本地证据测试仍含原非生产 P0 IR stub。
+- 实际定义的双目标编译对照：修改前各 31/34 个数值正确，修改后各 34/34 正确。
+- MinGW x64 语法检查及 Clang C11 严格枚举约束检查通过；`git diff --check` 通过。
+
+以上证明本次常量窄化机制及本地候选修正，不是修改后 MSVC 原生运行的替代证据。
+尚未推送、触发新发布、部署或改动 UTM；原生 amd64/arm64 的现有 54 项发布测试仍待新候选运行。
+没有新增 CI 串行门禁，没有将警告全局设为错误，也没有削弱失败断言。
