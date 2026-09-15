@@ -3787,6 +3787,12 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
   EdrBehaviorRecord reused_parent;
   EdrBehaviorRecord sparse;
   char tree[8192];
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  /* Preserve the captured FILETIME tuples and sub-millisecond birth ordering.
+   * A historical replay must not age out merely because CI runs a day later. */
+  edr_local_evidence_cache_test_set_now_unix_ns(
+      (int64_t)(child_birth + UINT64_C(30000000000)));
+#endif
 #if defined(EDR_HAVE_SQLITE)
   char db[512];
   assert(make_test_sqlite_path(db, sizeof(db)) == 0);
@@ -4000,10 +4006,27 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
       "gspawn-win64-helper.exe",
       "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "11540474045138506") != NULL);
+  /* The same durable data must really expire after 24 hours. Do not disable
+   * maintenance or increase retention just to preserve this replay fixture. */
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(
+      (int64_t)(child_birth + UINT64_C(25) * 3600u * UINT64_C(1000000000)));
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(sqlite_table_count(db, "process_cache") == 0u);
+  assert(edr_local_evidence_cache_process_tree_json(
+             child_pid, child.endpoint_id, tree, sizeof(tree)) == -2);
+#endif
 #endif
 
   edr_pt_cache_shutdown();
   edr_local_evidence_cache_close();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+#endif
 #if defined(EDR_HAVE_SQLITE)
   cleanup_test_sqlite_path(db);
 #endif

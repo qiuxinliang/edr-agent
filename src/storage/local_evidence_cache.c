@@ -538,7 +538,20 @@ static int identity_quality_rank(const char *q) {
   return 0;
 }
 
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+static int64_t s_test_now_unix_ns;
+
+void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns) {
+  evidence_cache_lock();
+  s_test_now_unix_ns = now_ns;
+  evidence_cache_unlock();
+}
+#endif
+
 static int64_t now_unix_ns(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_now_unix_ns > 0) return s_test_now_unix_ns;
+#endif
   time_t t = time(NULL);
   return (int64_t)t * 1000000000LL;
 }

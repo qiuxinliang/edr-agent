@@ -200,6 +200,9 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
 void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out);
 
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+/* Test-only wall clock for historical replay and retention checks. Survives
+ * cache close/open; pass zero to restore the real clock after the scenario. */
+void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns);
 /* Aborts the next candidate-cache transaction commits from SQLite's commit
  * hook. This is test-only evidence that counters and dedupe state move only
  * after the durable boundary succeeds. */
