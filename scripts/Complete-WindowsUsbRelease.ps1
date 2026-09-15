@@ -90,7 +90,7 @@ $version=$state.version; $arch=$state.architecture
 $prefix="edr-agent-win_$version-windows-$arch-"
 $runtime=Join-Path $out 'runtime'; $ui=Join-Path $out 'ui'; $dist=Join-Path $out 'dist'; $source=Join-Path $out 'source'
 $request=Join-Path $out ($phase+'-request')
-$null=Read-SigningRequest $request $phase $ExpectedCommit $version $arch
+$validatedRequest=Read-SigningRequest $request $phase $ExpectedCommit $version $arch
 Assert-SigningResponse $request $ResponseDirectory $Thumbprint
 $manifest=Get-Content -LiteralPath (Join-Path $out 'original-manifest.json') -Raw | ConvertFrom-Json
 $agent=Join-Path $runtime 'FDSensor.exe'
@@ -103,7 +103,9 @@ if ($Stage -eq 'Installer') {
     foreach ($name in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe')) {
         Copy-Item -LiteralPath (Join-Path $ResponseDirectory $name) -Destination (Join-Path $runtime $name) -Force
     }
-    foreach ($name in @('forensic_collector.exe','forensic_collector_builtin.exe')) {
+    # Copy exactly the collectors in the validated request, not a fixed list.
+    # Assert-SigningResponse above still requires every requested signed EXE.
+    foreach ($name in @($validatedRequest.files | Where-Object { $_.name -cin @('forensic_collector.exe','forensic_collector_builtin.exe') } | ForEach-Object name)) {
         Copy-Item -LiteralPath (Join-Path $ResponseDirectory $name) -Destination (Join-Path $collector $name) -Force
     }
     Copy-Item -LiteralPath (Join-Path $ResponseDirectory 'FDSecuritySetupUI.exe') -Destination $uiExe -Force

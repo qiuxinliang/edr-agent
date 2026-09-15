@@ -17,7 +17,7 @@ and needs no Inno compiler or GitHub release-write permission.
 
 | Phase | GitHub sends to USB | USB returns | GitHub then does |
 | --- | --- | --- | --- |
-| native | FDSensor, installer worker, uninstaller, two collectors, Setup UI EXEs | Signed EXEs and request-bound receipt | Verify unchanged program payload and publisher; rebuild Inno |
+| native | FDSensor, installer worker, uninstaller, built-in collector, Setup UI; external collector if present | Signed EXEs and request-bound receipt | Verify unchanged program payload and publisher; rebuild Inno |
 | installer | FDSecuritySetup.exe and small setup-ui-manifest.json | Signed installer; manifest with updated installer hash and CMS | Verify only that hash changed; assemble runtime/UI ZIPs and final release hashes |
 | manifest | Final artifact-manifest.json | Same JSON plus detached CMS | Verify all final hashes; upload to draft and run native lifecycle gates |
 
@@ -35,6 +35,11 @@ of the signing helpers, never source code from a public request. First-party sig
 publisher and timestamp; byte-level checks reject replacement with a different,
 otherwise correctly signed program. Upstream WinDivert/Velociraptor signatures
 are not replaced.
+
+`forensic_collector.exe` is optional; `forensic_collector_builtin.exe` remains
+required. If the optional EXE is shipped, it must appear in the request inventory,
+pass the same hash/signature checks, and be restored from the signed response.
+Hosted packaging and the private signing snapshot share this contract.
 
 Both architectures must validate before draft uploads. The publish job remains
 gated on native install, upgrade and rollback tests. Runtime identity is rebuilt

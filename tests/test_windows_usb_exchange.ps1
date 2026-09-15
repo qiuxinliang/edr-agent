@@ -38,6 +38,53 @@ try {
     Write-ExchangeJson (Join-Path $request 'request.json') $manifest
     Reject { Read-SigningRequest $request manifest $commit '1.2.3' arm64 }
 
+    # Both supported native inventories must work on both architectures.
+    # Optional means absent is allowed, never that an included file is unchecked.
+    $required=@('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','forensic_collector_builtin.exe','FDSecuritySetupUI.exe')
+    $nativeInputs=Join-Path $scratch 'native-inputs'
+    New-Item -ItemType Directory -Path $nativeInputs | Out-Null
+    foreach($name in ($required+@('forensic_collector.exe'))) {
+        [IO.File]::WriteAllText((Join-Path $nativeInputs $name),'inventory-test-only')
+    }
+    foreach($arch in @('amd64','arm64')) {
+        foreach($includeCollector in @($false,$true)) {
+            $names=@($required)
+            if($includeCollector){$names+='forensic_collector.exe'}
+            $nativeRequest=Join-Path $scratch "native-$arch-$includeCollector"
+            New-SigningRequest $nativeRequest native $commit '1.2.3' $arch @($names | ForEach-Object {Join-Path $nativeInputs $_})
+            $r=Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch
+            if(@($r.files).Count -ne $names.Count){throw 'Native inventory lost files'}
+            $script:checks++
+            foreach($missing in $required) {
+                $r.files=@($r.files | Where-Object name -cne $missing)
+                Write-ExchangeJson (Join-Path $nativeRequest 'request.json') $r
+                # Remove the file as well: a clean but incomplete inventory must fail.
+                Remove-Item -LiteralPath (Join-Path $nativeRequest $missing)
+                Reject { Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch }
+                Copy-Item -LiteralPath (Join-Path $nativeInputs $missing) -Destination $nativeRequest
+                $r.files=@($names | ForEach-Object {
+                    $p=Join-Path $nativeRequest $_
+                    [pscustomobject]@{name=$_;sha256=(Get-ExchangeHash $p);size=(Get-Item $p).Length}
+                })
+                Write-ExchangeJson (Join-Path $nativeRequest 'request.json') $r
+            }
+            $extra=Join-Path $nativeRequest 'whole-bundle.zip'
+            [IO.File]::WriteAllText($extra,'not allowed')
+            Reject { Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch }
+            Remove-Item -LiteralPath $extra
+            if($includeCollector) {
+                $optional=Join-Path $nativeRequest 'forensic_collector.exe'
+                [IO.File]::WriteAllText($optional,'tampered')
+                Reject { Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch }
+                Remove-Item -LiteralPath $optional
+                Reject { Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch }
+            } else {
+                Copy-Item -LiteralPath (Join-Path $nativeInputs 'forensic_collector.exe') -Destination $nativeRequest
+                Reject { Read-SigningRequest $nativeRequest native $commit '1.2.3' $arch }
+            }
+        }
+    }
+
     # Isolate Authenticode trust lookup while exercising byte-level replacement
     # protection. Real Windows SignTool/CMS coverage lives in store-signing test.
     function Get-AuthenticodeSignature { param($LiteralPath)
@@ -61,6 +108,48 @@ try {
     $signed[400]=42; [BitConverter]::GetBytes([uint32]32).CopyTo($signed,300)
     [IO.File]::WriteAllBytes($b,$signed)
     Reject { Assert-SignedExecutable $a $b $thumb }
+    # Exercise the real hosted Installer stage with a stub only at the external
+    # Inno compiler boundary. The private signing repo intentionally has no packager.
+    $packager=Join-Path $PSScriptRoot '..\scripts\Complete-WindowsUsbRelease.ps1'
+    if(Test-Path -LiteralPath $packager) {
+        [BitConverter]::GetBytes([uint32]16).CopyTo($signed,300)
+        foreach($includeCollector in @($false,$true)) {
+            $hosted=Join-Path $scratch "hosted-$includeCollector"
+            $runtime=Join-Path $hosted 'runtime'; $ui=Join-Path $hosted 'ui'
+            $buildRoot=Join-Path $hosted 'source\install\windows-inno'
+            $response=Join-Path $hosted 'response'
+            New-Item -ItemType Directory -Force -Path "$runtime\collector",$ui,"$hosted\dist","$buildRoot\Output",$response | Out-Null
+            $names=@($required)
+            if($includeCollector){$names+='forensic_collector.exe'}
+            foreach($name in $names) {
+                [IO.File]::WriteAllBytes((Join-Path $nativeInputs $name),$original)
+                [IO.File]::WriteAllBytes((Join-Path $response $name),$signed)
+            }
+            $request=Join-Path $hosted 'native-request'
+            New-SigningRequest $request native $commit '1.2.3' arm64 @($names | ForEach-Object {Join-Path $nativeInputs $_})
+            Write-ExchangeJson (Join-Path $response 'receipt.json') ([ordered]@{request_sha256=(Get-ExchangeHash (Join-Path $request 'request.json'));publisher=$thumb})
+            Write-ExchangeJson (Join-Path $hosted 'state.json') ([ordered]@{stage='native';source_commit=$commit;version='1.2.3';architecture='arm64'})
+            Write-ExchangeJson (Join-Path $hosted 'original-manifest.json') @{}
+            $entries=@($names | Where-Object {$_ -ne 'FDSecuritySetupUI.exe'} | ForEach-Object {
+                $relative=if($_ -like 'forensic_*'){"collector/$_"}else{$_}
+                [pscustomobject]@{name=$relative;sha256='pending'}
+            })
+            Write-ExchangeJson (Join-Path $runtime 'native-package-integrity.json') ([ordered]@{schema='edr.windows.native-package-integrity.v1';files=$entries})
+            [IO.File]::WriteAllText((Join-Path $runtime 'edr_agent_setup.exe'),'old fixture installer')
+            [IO.File]::WriteAllText((Join-Path $buildRoot 'Build-BundledInstaller.ps1'), '[IO.File]::WriteAllText((Join-Path $PSScriptRoot "Output\FDSecuritySetup-bundled.exe"),"test compiler output"); $global:LASTEXITCODE=0')
+            Write-ExchangeJson (Join-Path $ui 'setup-ui-manifest.json') ([ordered]@{
+                version='1.2.3';target_arch='arm64';setup_target_arch='arm64';agent_binary_sha256='';runtime_identity_sha256='';publisher_thumbprint='';setup_exe_sha256='';ui_exe_sha256='';setup_exe_signed=$false;ui_exe_signed=$false;capabilities=@{signature_status='unsigned'};generated_at_utc=''
+            })
+            & $packager -Stage Installer -OutputDirectory $hosted -ExpectedCommit $commit -Thumbprint $thumb -ManifestSignerSubject 'CN=Fixture' -ResponseDirectory $response
+            $state=Get-Content (Join-Path $hosted 'state.json') -Raw | ConvertFrom-Json
+            if($state.stage -ne 'installer'){throw 'Hosted installer did not advance'}
+            if((Test-Path "$runtime\collector\forensic_collector.exe") -ne $includeCollector){throw 'Optional collector presence changed'}
+            foreach($name in $names | Where-Object {$_ -like 'forensic_*'}) {
+                if((Get-ExchangeHash "$runtime\collector\$name") -cne (Get-ExchangeHash (Join-Path $response $name))){throw 'Collector signed bytes not restored'}
+            }
+            $script:checks++
+        }
+    }
     Remove-Item Function:\Get-AuthenticodeSignature
     # Detached response binding uses an in-memory leaf, never a certificate store/root.
     Add-Type -AssemblyName System.Security

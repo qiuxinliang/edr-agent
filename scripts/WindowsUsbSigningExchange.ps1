@@ -28,12 +28,16 @@ function Read-SigningRequest([string]$Directory, [string]$Phase, [string]$Commit
     $r = Get-Content -LiteralPath (Join-Path $Directory 'request.json') -Raw | ConvertFrom-Json
     if ($r.schema -cne 'edr.windows.file-signing.v1' -or $r.phase -cne $Phase -or $r.source_commit -cne $Commit -or
         $r.version -cne $Version -or $r.architecture -cne $Arch) { throw 'Signing request identity mismatch' }
-    $allowed = switch ($Phase) {
-        native { @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','forensic_collector.exe','forensic_collector_builtin.exe','FDSecuritySetupUI.exe') }
+    $required = @(switch ($Phase) {
+        native { @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','forensic_collector_builtin.exe','FDSecuritySetupUI.exe') }
         installer { @('FDSecuritySetup.exe','setup-ui-manifest.json') }
         manifest { @('artifact-manifest.json') }
         default { throw 'Unknown signing phase' }
-    }
+    })
+    # The external collector is optional. When shipped it is subject to the
+    # same inventory, hash and signature contract as every required EXE.
+    $allowed = @($required)
+    if ($Phase -eq 'native') { $allowed += 'forensic_collector.exe' }
     $seen = @{}
     foreach ($f in $r.files) {
         $path = Get-ExchangeFile $Directory $f.name
@@ -44,7 +48,10 @@ function Read-SigningRequest([string]$Directory, [string]$Phase, [string]$Commit
             $item.Length -ne $f.size -or (Get-ExchangeHash $path) -cne $f.sha256) { throw 'Signing request payload integrity mismatch' }
         if ($f.name.EndsWith('.json') -and $item.Length -gt 1MB) { throw 'Signing metadata exceeds 1 MiB' }
     }
-    if ($seen.Count -ne $allowed.Count -or @(Get-ChildItem -LiteralPath $Directory -Force).Count -ne $allowed.Count+1) {
+    foreach ($name in $required) {
+        if (-not $seen.ContainsKey($name)) { throw "Missing required signing payload: $name" }
+    }
+    if (@(Get-ChildItem -LiteralPath $Directory -Force).Count -ne $seen.Count+1) {
         throw 'Incomplete signing request or extra files; archives and sources are prohibited'
     }
     return $r
