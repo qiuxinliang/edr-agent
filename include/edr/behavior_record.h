@@ -166,6 +166,9 @@ void edr_behavior_record_init(EdrBehaviorRecord *r);
 
 int edr_behavior_source_field_truncated(const EdrBehaviorRecord *r, const char *field);
 void edr_behavior_mark_source_truncated(EdrBehaviorRecord *r, const char *field);
+/* Only after replacing this field from a verified complete fact. Does not
+ * clear other loss markers, list overflow, or NOT_EVALUABLE. */
+void edr_behavior_resolve_source_truncated(EdrBehaviorRecord *r, const char *field);
 
 void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r);
 

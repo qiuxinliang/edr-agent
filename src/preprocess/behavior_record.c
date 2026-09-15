@@ -55,6 +55,33 @@ void edr_behavior_mark_source_truncated(EdrBehaviorRecord *r, const char *field)
     snprintf(r->source_completeness, sizeof(r->source_completeness), "%s", "TRUNCATED");
 }
 
+void edr_behavior_resolve_source_truncated(EdrBehaviorRecord *r, const char *field) {
+  char *cursor;
+  size_t len;
+  int removed = 0;
+  if (!r || !field || !field[0]) return;
+  len = strlen(field);
+  cursor = r->source_truncated_fields;
+  while (*cursor) {
+    char *end = strchr(cursor, ',');
+    size_t item_len = end ? (size_t)(end - cursor) : strlen(cursor);
+    if (item_len == len && memcmp(cursor, field, len) == 0) {
+      removed = 1;
+      if (end) memmove(cursor, end + 1u, strlen(end + 1u) + 1u);
+      else {
+        if (cursor > r->source_truncated_fields) --cursor;
+        *cursor = '\0';
+        break;
+      }
+    } else {
+      if (!end) break;
+      cursor = end + 1u;
+    }
+  }
+  if (removed && !r->source_truncated_fields[0] && strcmp(r->source_completeness, "TRUNCATED") == 0)
+    snprintf(r->source_completeness, sizeof(r->source_completeness), "%s", "COALESCED");
+}
+
 void edr_behavior_record_enrich_system_context(EdrBehaviorRecord *r) {
   if (!r) {
     return;

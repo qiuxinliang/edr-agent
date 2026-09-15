@@ -1068,6 +1068,8 @@ edr_apply_test_warnings(test_process_tree_cache)
 add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
   ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
@@ -1089,6 +1091,9 @@ if(SQLite3_FOUND)
 endif()
 if(UNIX)
   target_link_libraries(test_local_evidence_cache_candidate PRIVATE Threads::Threads)
+endif()
+if(NOT MSVC)
+  target_link_libraries(test_local_evidence_cache_candidate PRIVATE m)
 endif()
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

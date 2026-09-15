@@ -440,17 +440,22 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
         br, EDR_P0_FILE_READ_REASON_GENERATION_MISMATCH);
     return 0;
   }
-  if (!br->cmdline[0]) {
+  if (p0_command_line_is_cached_preview(br)) {
+    /* A live actor may still have a truncated collector command. Consume the
+     * already captured fact first; do not force an extra OS query for it. */
+    (void)p0_bind_file_read_cached_generation(br, live.process_start_key,
+                                               live.creation_filetime_100ns);
+  }
+  if (!br->cmdline[0] || p0_command_line_is_cached_preview(br)) {
+    char command_line[EDR_BR_STR_LONG];
     reason[0] = '\0';
-    if (edr_process_command_line_query_live(process, br->cmdline, sizeof(br->cmdline),
+    if (edr_process_command_line_query_live(process, command_line, sizeof(command_line),
                                             reason, sizeof(reason))) {
-      snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
-               "live_same_generation");
-    } else {
+      (void)p0_adopt_generation_command_fact(br, command_line, 0, "live_same_generation");
+    } else if (!br->cmdline[0]) {
       /* The process may exit between ETW delivery and this bounded query.
        * Keep the raw source, but never borrow a PID-only command line from a
        * new process occupant or present an incomplete string as evaluable. */
-      br->cmdline[0] = '\0';
       snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
                "live_same_generation_unavailable");
     }

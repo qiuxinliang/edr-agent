@@ -1,8 +1,10 @@
 #include "edr/behavior_record.h"
+#include "edr/behavior_from_slot.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "../src/preprocess/process_cached_generation.h"
+#include "../src/collector/process_command_preview.h"
 #include "cJSON.h"
 
 #include <assert.h>
@@ -34,6 +36,8 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 
 bool edr_resource_preprocess_throttle_active(void) { return false; }
 uint64_t edr_monotonic_ns(void) { return 1000000000ull; }
+/* The parser's unrelated enforcement side effect is outside this fixture. */
+void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
 static int make_test_sqlite_path(char *out, size_t cap) {
 #if defined(_WIN32)
@@ -4259,7 +4263,7 @@ static void test_retained_file_read_cached_actor(void) {
   const uint64_t birth = (creation - UINT64_C(116444736000000000)) * 100u;
   const uint64_t key = UINT64_C(11821949021852890);
   EdrBehaviorRecord *r = calloc(1u, sizeof(*r));
-  char command[700];
+  char command[1309];
   assert(r != NULL);
   memset(command, 'x', sizeof(command) - 1u);
   command[sizeof(command) - 1u] = '\0';
@@ -4276,6 +4280,21 @@ static void test_retained_file_read_cached_actor(void) {
   assert(strcmp(r->file_path, "C:\\Temp\\script-fact.ps1") == 0);
   assert(strcmp(r->process_generation_source, "file_read_process_tree_cache_generation") == 0);
   assert(!r->collector_evidence_gate[0] && !r->username[0]);
+
+  /* 3.2.501 UTM: upstream populated a nonempty 1023-byte preview before
+   * retention. Empty-only enrichment (even with a large destination) loses
+   * the 1308-byte historical fact. */
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5012u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  memcpy(r->cmdline, command, 1023u);
+  r->cmdline[1023] = '\0';
+  snprintf(r->command_line_origin, sizeof(r->command_line_origin), "%s",
+           "collector_pid_cache_preview");
+  edr_behavior_mark_source_truncated(r, "source.cmdline");
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 1);
+  assert(strcmp(r->cmdline, command) == 0);
+  assert(!edr_behavior_source_field_truncated(r, "source.cmdline"));
 
   /* A cache miss or conflict is best effort, not an assertion that pauses P0. */
   init_record(r, EDR_EVENT_FILE_READ);
@@ -4316,7 +4335,215 @@ static void test_retained_file_read_cached_actor(void) {
   free(r);
 }
 
+static void command_preview_roundtrip(EdrBehaviorRecord *record, EdrBehaviorRecord *decoded,
+                                      EdrEventSlot *slot, uint64_t key, uint64_t birth) {
+  memset(slot, 0, sizeof(*slot));
+  slot->type = EDR_EVENT_FILE_READ;
+  slot->timestamp_ns = birth + UINT64_C(1000000000);
+  int n = snprintf((char *)slot->data, sizeof(slot->data),
+                   "ETW1\nprov=kfile\npid=5102\nprocess_start_key=%llu\n"
+                   "img=C:\\Windows\\powershell.exe\n"
+                   "file=C:\\Temp\\script-fact.ps1\n", (unsigned long long)key);
+  assert(n > 0 && (size_t)n < sizeof(slot->data));
+  slot->size = (uint32_t)n + 1u;
+  assert(edr_collector_slot_append_command(slot, record) == EDR_SLOT_KV_APPENDED);
+  edr_behavior_from_slot(slot, decoded);
+}
+
+static void test_command_preview_to_durable_fact(void) {
+  struct timespec now;
+  assert(timespec_get(&now, TIME_UTC) == TIME_UTC);
+  const uint64_t birth = ((uint64_t)now.tv_sec - 2u) * UINT64_C(1000000000);
+  const uint64_t creation = UINT64_C(116444736000000000) + birth / 100u;
+  const uint64_t key = UINT64_C(11821949021855555);
+  EdrBehaviorRecord *source = calloc(1u, sizeof(*source));
+  EdrBehaviorRecord *record = calloc(1u, sizeof(*record));
+  EdrBehaviorRecord *decoded = calloc(1u, sizeof(*decoded));
+  EdrProcessCommandPreview preview = {{0}, 0};
+  EdrEventSlot slot;
+  assert(source && record && decoded);
+  edr_pt_cache_init();
+  const size_t lengths[] = {1022u, 1023u, 1024u, 1308u, 3072u};
+  for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+    memset(source->cmdline, 'x', lengths[i]);
+    source->cmdline[lengths[i]] = '\0';
+    assert(edr_pt_cache_put_generation(5102u, 100u, "powershell.exe", source->cmdline,
+        "C:\\Windows\\powershell.exe", "parent.exe", birth, key, creation) == 0);
+    edr_process_command_preview_store(&preview, source);
+    init_record(record, EDR_EVENT_FILE_READ);
+    edr_process_command_preview_fill(&preview, record);
+    command_preview_roundtrip(record, decoded, &slot, key, birth);
+    assert(strcmp(decoded->command_line_origin, record->command_line_origin) == 0);
+    assert(edr_behavior_source_field_truncated(decoded, "source.cmdline") ==
+           (lengths[i] >= sizeof(preview.text)));
+    assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+    assert(strcmp(decoded->cmdline, source->cmdline) == 0);
+    assert(!edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+    assert(!decoded->username[0]);
+  }
+
+  /* Mid-codepoint cutoff must remain valid UTF-8, not a broken JSON string. */
+  memcpy(source->cmdline + 1022u, "\xe4\xb8\xad", 3u);
+  source->cmdline[1308u] = '\0';
+  assert(edr_pt_cache_put_generation(5102u, 100u, "powershell.exe", source->cmdline,
+      "C:\\Windows\\powershell.exe", "parent.exe", birth, key, creation) == 0);
+  edr_process_command_preview_store(&preview, source);
+  assert(strlen(preview.text) == 1022u && preview.truncated);
+  init_record(record, EDR_EVENT_FILE_READ);
+  edr_process_command_preview_fill(&preview, record);
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strcmp(decoded->cmdline, source->cmdline) == 0);
+
+#if defined(EDR_HAVE_SQLITE)
+  /* Reopen the real database: success in the in-memory record is not enough. */
+  {
+    char db[640];
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+    assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+    edr_local_evidence_cache_record_behavior(decoded);
+    edr_local_evidence_cache_close();
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(raw, "SELECT cmdline,source_truncated_fields FROM p0_candidates "
+                                 "WHERE pid=5102", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), source->cmdline) == 0);
+    if (sqlite3_column_bytes(st, 1) != 0)
+      fprintf(stderr, "command roundtrip durable truncations: %s\n", sqlite3_column_text(st, 1));
+    assert(strcmp((const char *)sqlite3_column_text(st, 1), "") == 0);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    cleanup_test_sqlite_path(db);
+  }
+#endif
+
+  /* Never overwrite a different command, a direct nonempty observation, or
+   * a record from a mismatched/reused PID lifetime. */
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  decoded->cmdline[0] = 'z';
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(decoded->cmdline[0] == 'z' && strlen(decoded->cmdline) == 1022u);
+  assert(edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  snprintf(decoded->command_line_origin, sizeof(decoded->command_line_origin), "%s", "live_same_generation");
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strlen(decoded->cmdline) == 1022u);
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  decoded->command_line_origin[0] = '\0';
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strlen(decoded->cmdline) == 1022u);
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  assert(p0_bind_file_read_cached_generation(decoded, key + 1u, creation) == 0);
+  assert(strlen(decoded->cmdline) == 1022u);
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation + 1u) == 0);
+  decoded->pid++;
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 0);
+
+  const char *remaining[] = {"source.parent_path", "source.list_overflow"};
+  for (size_t i = 0; i < sizeof(remaining) / sizeof(remaining[0]); ++i) {
+    command_preview_roundtrip(record, decoded, &slot, key, birth);
+    edr_behavior_mark_source_truncated(decoded, remaining[i]);
+    assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+    assert(strcmp(decoded->cmdline, source->cmdline) == 0);
+    assert(strcmp(decoded->source_truncated_fields, remaining[i]) == 0);
+    assert(strcmp(decoded->source_completeness, "TRUNCATED") == 0);
+  }
+  snprintf(record->source_completeness, sizeof(record->source_completeness), "%s", "NOT_EVALUABLE");
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strcmp(decoded->source_completeness, "NOT_EVALUABLE") == 0);
+
+  /* A shorter historical value cannot downgrade the preview. */
+  source->cmdline[512u] = '\0';
+  assert(edr_pt_cache_put_generation(5102u, 100u, "powershell.exe", source->cmdline,
+      "C:\\Windows\\powershell.exe", "parent.exe", birth, key, creation) == 0);
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strlen(decoded->cmdline) == 1022u);
+  assert(edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+  source->cmdline[512u] = 'x';
+
+  assert(edr_pt_cache_put_generation_with_provenance(5102u, 100u, "powershell.exe", source->cmdline,
+      "C:\\Windows\\powershell.exe", "parent.exe", birth, key, creation,
+      EDR_PTC_SOURCE_TRUNC_CMDLINE) == 0);
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  assert(p0_bind_file_read_cached_generation(decoded, key, creation) == 1);
+  assert(strcmp(decoded->cmdline, source->cmdline) == 0);
+  assert(edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+  /* A later verified live fact can finish a still-truncated history fact.
+   * A failed/empty or conflicting query must not erase the retained prefix. */
+  assert(p0_command_line_is_cached_preview(decoded));
+  assert(p0_adopt_generation_command_fact(decoded, "", 0, "live_same_generation") == 0);
+  assert(strcmp(decoded->cmdline, source->cmdline) == 0);
+  source->cmdline[0] = 'z';
+  assert(p0_adopt_generation_command_fact(decoded, source->cmdline, 0, "live_same_generation") == 0);
+  source->cmdline[0] = 'x';
+  assert(p0_adopt_generation_command_fact(decoded, source->cmdline, 0, "live_same_generation") == 1);
+  assert(!edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+  assert(strcmp(decoded->command_line_origin, "live_same_generation") == 0);
+
+  /* Propagate source truncation even when the cache itself has spare space. */
+  strcpy(source->cmdline, "short-but-incomplete");
+  edr_behavior_mark_source_truncated(source, "source.cmdline");
+  edr_process_command_preview_store(&preview, source);
+  assert(preview.truncated);
+  strcpy(record->cmdline, "existing-direct-fact");
+  edr_process_command_preview_fill(&preview, record);
+  assert(strcmp(record->cmdline, "existing-direct-fact") == 0);
+
+  /* At every slot capacity, either metadata and command both survive or
+   * the preview is absent. Never a nonempty unlabelled truncated value. */
+  init_record(record, EDR_EVENT_FILE_READ);
+  edr_process_command_preview_fill(&preview, record);
+  for (size_t available = 0u; available < 300u; ++available) {
+    memset(&slot, 0, sizeof(slot));
+    size_t used = sizeof(slot.data) - 1u - available;
+    memcpy(slot.data, "ETW1\npadding=", 13u);
+    memset(slot.data + 13u, 'x', used - 14u);
+    slot.data[used - 1u] = '\n';
+    slot.size = (uint32_t)used + 1u;
+    EdrSlotKvResult result = edr_collector_slot_append_command(&slot, record);
+    const char *raw = (const char *)slot.data;
+    assert(slot.size <= sizeof(slot.data));
+    if (strstr(raw, "\ncmd=")) {
+      assert(result == EDR_SLOT_KV_APPENDED);
+      assert(strstr(raw, "\nsource_truncated_fields=source.cmdline\n"));
+      assert(strstr(raw, "\ncommand_line_origin=collector_pid_cache_preview\n"));
+    } else assert(result == EDR_SLOT_KV_NO_SPACE);
+  }
+
+  /* Shared ETW1 writer remains fail-before-write for oversized values and
+   * sanitizes line breaks instead of accepting injected metadata lines. */
+  memset(&slot, 0, sizeof(slot));
+  assert(edr_collector_slot_append_kv(&slot, "cmd", "a\ncmd=other\rb") == EDR_SLOT_KV_APPENDED);
+  assert(strcmp((const char *)slot.data, "cmd=a cmd=other b\n") == 0);
+  uint32_t saved_size = slot.size;
+  memset(source->cmdline, 'x', 2048u);
+  source->cmdline[2048u] = '\0';
+  assert(edr_collector_slot_append_kv(&slot, "cmd", source->cmdline) == EDR_SLOT_KV_VALUE_TOO_LONG);
+  assert(slot.size == saved_size);
+
+  /* Do not guess a clipped origin or erase unrelated loss when repairing. */
+  command_preview_roundtrip(record, decoded, &slot, key, birth);
+  char invalid_origin[80];
+  memset(invalid_origin, 'x', sizeof(invalid_origin) - 1u);
+  invalid_origin[sizeof(invalid_origin) - 1u] = '\0';
+  assert(edr_collector_slot_append_kv(&slot, "command_line_origin", invalid_origin) == EDR_SLOT_KV_APPENDED);
+  edr_behavior_from_slot(&slot, decoded);
+  assert(!decoded->command_line_origin[0]);
+  assert(edr_behavior_source_field_truncated(decoded, "source.command_line_origin"));
+  assert(edr_behavior_source_field_truncated(decoded, "source.cmdline"));
+  edr_pt_cache_shutdown();
+  free(source);
+  free(record);
+  free(decoded);
+}
+
 int main(void) {
+  test_command_preview_to_durable_fact();
   test_retained_file_read_cached_actor();
   test_checknetisolation_standard_low_risk_is_not_candidate();
   test_checknetisolation_high_risk_port_is_candidate();

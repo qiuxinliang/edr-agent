@@ -44,6 +44,7 @@
 #include "ave_etw_feed_win.h"
 #include "security_event_xml.h"
 #include "security_event_time_win.h"
+#include "process_command_preview.h"
 
 #ifdef EDR_COLLECTOR_FILE_IO_TESTING
 #include "collector_file_io_test.h"
@@ -177,7 +178,7 @@ typedef struct {
   uint8_t security_observation;
   char process_name[256];
   char exe_path[512];
-  char cmdline[1024];
+  EdrProcessCommandPreview command_preview;
   char username[256];
   char domain[256];
   char user_sid[256];
@@ -1466,22 +1467,6 @@ typedef struct {
   int snapshot_available;
 } EdrRegistryWatch;
 
-static void edr_etw1_sanitize_value(char *dst, size_t cap, const char *src) {
-  size_t off = 0u;
-  if (!dst || cap == 0u) {
-    return;
-  }
-  dst[0] = '\0';
-  if (!src) {
-    return;
-  }
-  while (*src && off + 1u < cap) {
-    unsigned char c = (unsigned char)*src++;
-    dst[off++] = (c == '\r' || c == '\n' || c == '\0') ? ' ' : (char)c;
-  }
-  dst[off] = '\0';
-}
-
 static void edr_registry_value_data_text(DWORD type, const BYTE *data, DWORD size,
                                          char *out, size_t out_cap) {
   if (!out || out_cap == 0u) {
@@ -1970,9 +1955,6 @@ static void edr_security_emit_registry_4657(const char *xml) {
   }
 }
 
-typedef enum { EDR_SLOT_KV_APPENDED, EDR_SLOT_KV_EMPTY, EDR_SLOT_KV_NO_SPACE, EDR_SLOT_KV_VALUE_TOO_LONG } EdrSlotKvResult;
-static EdrSlotKvResult edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key, const char *value);
-
 static int edr_security_identity_value_present(const char *value) {
   const char *end;
   if (!value) return 0;
@@ -2200,7 +2182,7 @@ static void edr_collector_pid_cache_update(const EdrBehaviorRecord *br) {
                    br->image_path_canonical[0] ? br->image_path_canonical : br->exe_path);
   }
   if (br->cmdline[0]) {
-    edr_copy_trunc(slot->cmdline, sizeof(slot->cmdline), br->cmdline);
+    edr_process_command_preview_store(&slot->command_preview, br);
   }
   edr_collector_pid_cache_copy_identity(slot, br);
   ReleaseSRWLockExclusive(&s_pid_cache_lock);
@@ -2223,9 +2205,7 @@ static void edr_collector_pid_cache_enrich(EdrBehaviorRecord *br) {
     if (!br->exe_path[0] && slot->exe_path[0]) {
       edr_copy_trunc(br->exe_path, sizeof(br->exe_path), slot->exe_path);
     }
-    if (!br->cmdline[0] && slot->cmdline[0]) {
-      edr_copy_trunc(br->cmdline, sizeof(br->cmdline), slot->cmdline);
-    }
+    edr_process_command_preview_fill(&slot->command_preview, br);
     if (!br->identity_quality[0] && slot->identity_quality[0]) {
       edr_copy_trunc(br->username, sizeof(br->username), slot->username);
       edr_copy_trunc(br->domain, sizeof(br->domain), slot->domain);
@@ -2287,37 +2267,12 @@ static void edr_collector_file_read_metadata_capture_subject(
   for (size_t i = 0u; i < EDR_COLLECTOR_PID_CACHE; ++i) {
     const EdrCollectorPidCacheEntry *entry = &s_pid_cache[i];
     if (entry->pid == pid && entry->process_start_key == process_start_key) {
-      edr_collector_file_read_metadata_extract_marker(entry->cmdline, out_marker,
+      edr_collector_file_read_metadata_extract_marker(entry->command_preview.text, out_marker,
                                                       out_marker_cap);
       break;
     }
   }
   ReleaseSRWLockShared(&s_pid_cache_lock);
-}
-
-static EdrSlotKvResult edr_collector_slot_append_kv(EdrEventSlot *slot, const char *key,
-                                                      const char *value) {
-  char safe[2048];
-  size_t used;
-  int n;
-  if (!slot || !key || !key[0] || !value || !value[0]) {
-    return EDR_SLOT_KV_EMPTY;
-  }
-  used = strnlen((const char *)slot->data, sizeof(slot->data));
-  if (used >= sizeof(slot->data) - 4u) {
-    return EDR_SLOT_KV_NO_SPACE;
-  }
-  edr_etw1_sanitize_value(safe, sizeof(safe), value);
-  if (strlen(value) >= sizeof(safe)) return EDR_SLOT_KV_VALUE_TOO_LONG;
-  if (!safe[0]) {
-    return EDR_SLOT_KV_EMPTY;
-  }
-  n = snprintf(NULL, 0, "%s%s=%s\n", (used > 0u && slot->data[used - 1u] != '\n') ? "\n" : "", key, safe);
-  if (n <= 0 || used + (size_t)n >= sizeof(slot->data)) return EDR_SLOT_KV_NO_SPACE;
-  n = snprintf((char *)slot->data + used, sizeof(slot->data) - used, "%s%s=%s\n",
-               (used > 0u && slot->data[used - 1u] != '\n') ? "\n" : "", key, safe);
-  slot->size = (uint32_t)(used + (size_t)n + 1u);
-  return EDR_SLOT_KV_APPENDED;
 }
 
 static void edr_collector_file_key_cache_purge_locked(uint64_t event_ns) {
@@ -3878,7 +3833,7 @@ static void edr_collector_registry_writeback_identity(EdrEventSlot *slot,
   }
   raw = (const char *)slot->data;
   if (!strstr(raw, "\ncmd=")) {
-    edr_collector_slot_append_kv(slot, "cmd", br->cmdline);
+    (void)edr_collector_slot_append_command(slot, br);
   }
 }
 
@@ -3905,7 +3860,7 @@ static void edr_collector_file_read_writeback_actor(EdrEventSlot *slot,
                                      "exact_process_start_key_cache");
   raw = (const char *)slot->data;
   if (!strstr(raw, "\ncmd=") && br->cmdline[0]) {
-    (void)edr_collector_slot_append_kv(slot, "cmd", br->cmdline);
+    (void)edr_collector_slot_append_command(slot, br);
   }
   (void)edr_collector_slot_append_kv(slot, "file_read_actor_quality",
                                      "exact_process_start_key_cache");

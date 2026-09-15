@@ -7,6 +7,29 @@
 #include <stdio.h>
 #include <string.h>
 
+static inline int p0_command_line_is_cached_preview(const EdrBehaviorRecord *br) {
+  return br->cmdline[0] && edr_behavior_source_field_truncated(br, "source.cmdline") &&
+      (strcmp(br->command_line_origin, "collector_pid_cache_preview") == 0 ||
+       strcmp(br->command_line_origin, "process_tree_cache_generation") == 0);
+}
+
+/* Call only after proving the fact belongs to this event's process lifetime.
+ * Shared by retained-history and same-handle live-query paths, so a nonempty
+ * preview cannot block one of them. Direct/conflicting facts are preserved. */
+static inline int p0_adopt_generation_command_fact(EdrBehaviorRecord *br,
+    const char *fact, int fact_truncated, const char *origin) {
+  size_t current_len = strlen(br->cmdline);
+  size_t fact_len = strlen(fact);
+  if (!fact_len || fact_len >= sizeof(br->cmdline)) return 0;
+  if (current_len && (!p0_command_line_is_cached_preview(br) ||
+      fact_len < current_len || memcmp(fact, br->cmdline, current_len) != 0)) return 0;
+  memcpy(br->cmdline, fact, fact_len + 1u);
+  snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s", origin);
+  if (fact_truncated) edr_behavior_mark_source_truncated(br, "source.cmdline");
+  else edr_behavior_resolve_source_truncated(br, "source.cmdline");
+  return 1;
+}
+
 /* Shared by live-query fallback and best-effort retention. This operation
  * performs no OS query and cannot assert a FileRead capability failure.
  * A source tuple, when present, must agree with the historical lifetime. */
@@ -46,13 +69,9 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
       if (*p == '\\' || *p == '/') name = p + 1;
   }
   snprintf(br->process_name, sizeof(br->process_name), "%s", name);
-  if (!br->cmdline[0] && snapshot.cmdline[0]) {
-    snprintf(br->cmdline, sizeof(br->cmdline), "%s", snapshot.cmdline);
-    snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
-             "process_tree_cache_generation");
-    if (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE)
-      edr_behavior_mark_source_truncated(br, "source.cmdline");
-  }
+  (void)p0_adopt_generation_command_fact(br, snapshot.cmdline,
+      (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE) != 0u,
+      "process_tree_cache_generation");
   if (!br->parent_name[0] && snapshot.parent_name[0])
     snprintf(br->parent_name, sizeof(br->parent_name), "%s", snapshot.parent_name);
   snprintf(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "%s", "RESOLVED");

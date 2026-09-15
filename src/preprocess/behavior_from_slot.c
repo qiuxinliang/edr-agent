@@ -1272,6 +1272,7 @@ typedef struct {
   uint64_t process_creation_filetime_100ns;
   uint64_t file_key;
   char process_generation_source[64];
+  char command_line_origin[64];
   char image_raw[EDR_BR_STR_LONG];
   char image_canonical[EDR_BR_STR_LONG];
   char image_namespace[32];
@@ -1347,6 +1348,7 @@ enum {
   EDR_ETW_TRUNC_REG_OLD_VALUE_DATA = 1ull << 30,
   EDR_ETW_TRUNC_DNS_QUERY = 1ull << 31,
   EDR_ETW_TRUNC_SOURCE_TRUNCATED_FIELDS = 1ull << 32,
+  EDR_ETW_TRUNC_COMMAND_LINE_ORIGIN = 1ull << 33,
 };
 
 static int copy_text_exact(char *dst, size_t cap, const char *src) {
@@ -1482,6 +1484,7 @@ static int copy_record_username(EdrBehaviorRecord *r, const char *domain, const 
 }
 
 static void mark_etw1_input_truncations(EdrBehaviorRecord *r, uint64_t mask) {
+  if (mask & EDR_ETW_TRUNC_COMMAND_LINE_ORIGIN) mark_source_truncation(r, "command_line_origin");
   if (mask & EDR_ETW_TRUNC_IMAGE) {
     mark_source_truncation(r, "exe_path");
     mark_source_truncation(r, "process_name");
@@ -1755,6 +1758,9 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->has_process_generation_source = etw1_copy_text(
         f, f->process_generation_source, sizeof(f->process_generation_source), val,
         EDR_ETW_TRUNC_PROCESS_GENERATION_SOURCE);
+  } else if (strcmp(key, "command_line_origin") == 0) {
+    (void)etw1_copy_text(f, f->command_line_origin, sizeof(f->command_line_origin), val,
+                         EDR_ETW_TRUNC_COMMAND_LINE_ORIGIN);
   } else if (strcmp(key, "img") == 0) {
     f->has_img = etw1_copy_text(f, f->img, sizeof(f->img), val, EDR_ETW_TRUNC_IMAGE);
   } else if (strcmp(key, "img_raw") == 0) {
@@ -2199,6 +2205,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     if (ef.has_cmd) {
       (void)copy_record_source_text(r, r->cmdline, sizeof(r->cmdline), ef.cmd, "cmdline");
+      (void)copy_record_source_text(r, r->command_line_origin, sizeof(r->command_line_origin),
+                                    ef.command_line_origin, "command_line_origin");
       if (!r->exe_path[0]) {
         char first[EDR_BR_STR_LONG];
         first_cmd_token(ef.cmd, first, sizeof(first));
@@ -2446,7 +2454,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     }
     /* Later ETW metadata can describe a normal source state, but it cannot
      * erase a field omission detected while parsing this same record. */
-    if (ef.truncation_mask != 0u || r->source_truncated_fields[0] != '\0') {
+    if ((ef.truncation_mask != 0u || r->source_truncated_fields[0] != '\0') &&
+        strcmp(r->source_completeness, "NOT_EVALUABLE") != 0) {
       (void)copy_text_exact(r->source_completeness, sizeof(r->source_completeness),
                             "TRUNCATED");
     }
