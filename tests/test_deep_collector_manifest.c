@@ -507,9 +507,89 @@ static void test_blocking_collector_cancels_process_group(void) {
   remove(script);
   rmdir(dir);
 }
+
+static void test_async_collector_wall_timeout(void) {
+  char dir[512], script[600], marker[600], body[1400], detail[256];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create timeout temp dir");
+  snprintf(script, sizeof(script), "%s/ignores-timeout.sh", dir);
+  snprintf(marker, sizeof(marker), "%s/orphan-write", dir);
+  snprintf(body, sizeof(body), "#!/bin/sh\n(sleep 2; echo orphan > '%s') &\nwait\n", marker);
+  expect_true(write_file_bytes(script, body) == 0, "write timeout collector");
+  expect_true(chmod(script, 0700) == 0, "make timeout collector executable");
+  EdrCollectorRunSpec spec = {0};
+  spec.collector_bin = script; spec.scope = "triage"; spec.output_dir = dir; spec.timeout_s = 1;
+  expect_true(edr_deep_collector_spawn(&spec, detail, sizeof(detail)) == EDR_DC_OK, "spawn timeout collector");
+  int rc = 1, ec = 0;
+  for (unsigned i = 0; i < 30 && rc > 0; ++i) {
+    usleep(100000);
+    rc = edr_deep_collector_poll(&ec, detail, sizeof(detail));
+  }
+  expect_true(rc == EDR_DC_ERR_TIMEOUT, "parent enforces timeout for an uncooperative child");
+  expect_true(!edr_deep_collector_is_running(), "timeout clears active slot");
+  sleep(2);
+  expect_true(!path_exists(marker), "timeout kills descendants before they write more data");
+  remove(marker); remove(script); rmdir(dir);
+}
+
 #endif
 
-int main(void) {
+
+#ifdef _WIN32
+static void test_async_collector_wall_timeout_windows(void) {
+  char dir[512], marker[600], exe[1024], extra[700], detail[256];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create Windows timeout directory");
+  snprintf(marker, sizeof(marker), "%s\\orphan-write", dir);
+  expect_true(GetModuleFileNameA(NULL, exe, sizeof(exe)) > 0, "locate test child executable");
+  snprintf(extra, sizeof(extra), "--marker=\"%s\"", marker);
+  EdrCollectorRunSpec spec = {0};
+  spec.collector_bin = exe; spec.fixed_local_binary = 1;
+  spec.scope = "timeout-test"; spec.output_dir = dir; spec.extra_args = extra; spec.timeout_s = 1;
+  expect_true(edr_deep_collector_spawn(&spec, detail, sizeof(detail)) == EDR_DC_OK,
+              "spawn Windows timeout collector in a job");
+  int rc = 1, ec = 0;
+  for (unsigned i = 0; i < 30 && rc > 0; ++i) {
+    Sleep(100);
+    rc = edr_deep_collector_poll(&ec, detail, sizeof(detail));
+  }
+  expect_true(rc == EDR_DC_ERR_TIMEOUT, "Windows parent enforces wall-time limit");
+  expect_true(!edr_deep_collector_is_running(), "Windows timeout releases active slot");
+  Sleep(2500);
+  expect_true(!path_exists(marker), "Windows timeout terminates tar-like descendants");
+  remove(marker); _rmdir(dir);
+}
+
+static int run_timeout_test_child(int argc, char **argv) {
+  const char *marker = NULL;
+  int collector = 0;
+  for (int i = 1; i < argc; ++i) {
+    if (strncmp(argv[i], "--late-write=", 13) == 0) {
+      Sleep(2500);
+      return write_file_bytes(argv[i] + 13, "unexpected orphan write");
+    }
+    if (strncmp(argv[i], "--marker=", 9) == 0) marker = argv[i] + 9;
+    if (strcmp(argv[i], "--scope=timeout-test") == 0) collector = 1;
+  }
+  if (!collector) return -1;
+  if (!marker) return 5;
+  char exe[1024], cmd[1800];
+  if (!GetModuleFileNameA(NULL, exe, sizeof(exe))) return 5;
+  snprintf(cmd, sizeof(cmd), "\"%s\" --late-write=\"%s\"", exe, marker);
+  STARTUPINFOA si = {0}; si.cb = sizeof(si);
+  PROCESS_INFORMATION pi = {0};
+  if (!CreateProcessA(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return 5;
+  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  Sleep(30000); /* Intentionally ignore --timeout; parent must stop this tree. */
+  return 0;
+}
+#endif
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+  int child_rc = run_timeout_test_child(argc, argv);
+  if (child_rc >= 0) return child_rc;
+#else
+  (void)argc; (void)argv;
+#endif
   test_json_url_unescape();
   test_json_str_rejects_oversized_manifest_value();
   test_download_detail_keeps_curl_exit_when_prior_detail_is_full();
@@ -524,6 +604,9 @@ int main(void) {
   test_maybe_refresh_keeps_current_when_sha_matches();
 #ifndef _WIN32
   test_blocking_collector_cancels_process_group();
+  test_async_collector_wall_timeout();
+#else
+  test_async_collector_wall_timeout_windows();
 #endif
   return g_failures == 0 ? 0 : 1;
 }

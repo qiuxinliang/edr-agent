@@ -1,3 +1,4 @@
+#include "edr/forensic_limits.h"
 #include "edr/response.h"
 #include "edr/response_utils.h"
 #include "edr/command_util.h"
@@ -108,19 +109,37 @@ int response_forensic_copy_one_file(const char *src, const char *dst) {
 #endif
 }
 
-void response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len) {
+static int response_forensic_copy_limited(const char *src, const char *dst, size_t *remaining) {
+  FILE *in = fopen(src, "rb");
+  if (!in) return -1;
+  FILE *out = fopen(dst, "wb");
+  if (!out) { fclose(in); return -1; }
+  char buf[65536]; size_t n; int failed = 0;
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+    if (n > *remaining || fwrite(buf, 1, n, out) != n) { failed = 1; break; }
+    *remaining -= n;
+  }
+  if (ferror(in)) failed = 1;
+  if (fclose(in) != 0) failed = 1;
+  if (fclose(out) != 0) failed = 1;
+  if (failed) (void)remove(dst);
+  return failed ? -1 : 0;
+}
+
+int response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len) {
   const char *e = getenv("EDR_FORENSIC_COPY_PATHS");
   if (!e || e[0] != '1' || !pl || len == 0u) {
-    return;
+    return 0;
   }
   char work[8192];
   if (len >= sizeof(work)) {
-    len = sizeof(work) - 1u;
+    return -1;
   }
   memcpy(work, pl, len);
   work[len] = 0;
   char *p = work;
   int idx = 0;
+  size_t remaining = EDR_FORENSIC_BASELINE_MAX_BYTES - 4096u;
   for (;;) {
     char *line = p;
     char *nl = strchr(p, '\n');
@@ -137,13 +156,15 @@ void response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t 
 #else
       snprintf(dst, sizeof(dst), "%s/copied_%02d", jobdir, idx++);
 #endif
-      (void)response_forensic_copy_one_file(line, dst);
+      if (idx >= (int)EDR_FORENSIC_BASELINE_MAX_FILES ||
+          response_forensic_copy_limited(line, dst, &remaining) != 0) return -1;
     }
     if (!nl) {
       break;
     }
     p = nl + 1;
   }
+  return 0;
 }
 
 void response_sanitize_job_name(const char *src, char *dst, size_t cap) {
@@ -270,8 +291,16 @@ int response_make_tar_bundle(const char *dir, const char *bundle_path) {
     return -1;
   }
 #ifdef _WIN32
-  intptr_t rc = _spawnlp(_P_WAIT, "tar", "tar", "czf", bundle_path, "-C", dir, ".", NULL);
-  return (rc == 0) ? 0 : -1;
+  char quoted_bundle[1200], quoted_dir[1200];
+  if (strchr(bundle_path, '"') || strchr(dir, '"') ||
+      strlen(bundle_path) + 3u > sizeof(quoted_bundle) ||
+      strlen(dir) + 3u > sizeof(quoted_dir)) return -1;
+  snprintf(quoted_bundle, sizeof(quoted_bundle), "\"%s\"", bundle_path);
+  snprintf(quoted_dir, sizeof(quoted_dir), "\"%s\"", dir);
+  intptr_t rc = _spawnlp(_P_WAIT, "tar", "tar", "czf", quoted_bundle, "-C", quoted_dir, ".", NULL);
+  if (rc == 0) return 0;
+  (void)remove(bundle_path);
+  return -1;
 #else
   pid_t pid = fork();
   if (pid < 0) {
@@ -285,7 +314,9 @@ int response_make_tar_bundle(const char *dir, const char *bundle_path) {
   if (waitpid(pid, &st, 0) < 0) {
     return -1;
   }
-  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) return 0;
+  (void)remove(bundle_path);
+  return -1;
 #endif
 }
 

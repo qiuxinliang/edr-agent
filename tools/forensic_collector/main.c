@@ -8,7 +8,7 @@
  *   forensic_collector --scope=<triage|standard|full|all> --output-dir=<dir> \
  *                      --timeout=<sec> [--request=<file>] [--out-file=<bundle>] [--reason=<str>]
  *   - 同时接受 --key=value 与 --key value 两种形式。
- *   - 所有产物写 --output-dir；若给了 --out-file，则把 output-dir 打包为该文件
+ *   - 所有产物写 --output-dir；若给了 --out-file，则仅把本次产物打包为该文件
  *     （agent 随后上传 --out-file）。out-file 不存在会导致 agent 上传失败。
  *   - 退出码 0=成功；非 0=失败（与 agent edr_deep_collector_run_blocking 的 ec 语义一致）。
  * ==========================================================================*/
@@ -23,17 +23,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <stdint.h>
 
 #if defined(_WIN32)
 #include <direct.h>
 #include <windows.h>
+#include <process.h>
 #define EDR_PATH_SEP '\\'
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <sys/statvfs.h>
 #define EDR_PATH_SEP '/'
 #endif
+
+#include "../../include/edr/forensic_limits.h"
 
 #define MAXPATH 1024
 
@@ -44,6 +51,36 @@ static char g_out_file[MAXPATH] = "";
 static char g_reason[256] = "";
 static long g_timeout = 300;
 static unsigned g_partial_failures;
+
+/* A baseline snapshot has a hard input budget; it is not a disk image. */
+#define MAX_COLLECTION_BYTES EDR_FORENSIC_BASELINE_MAX_BYTES
+#define MAX_COLLECTION_FILES EDR_FORENSIC_BASELINE_MAX_FILES
+static size_t g_collected_bytes;
+static unsigned g_file_count;
+static char g_files[MAX_COLLECTION_FILES][64];
+static int g_limit_exceeded;
+
+static int record_file(const char *name) {
+  for (unsigned i = 0; i < g_file_count; ++i) {
+    if (strcmp(g_files[i], name) == 0) return 0;
+  }
+  if (g_file_count == MAX_COLLECTION_FILES || strlen(name) >= sizeof(g_files[0])) {
+    g_limit_exceeded = 1;
+    return -1;
+  }
+  strcpy(g_files[g_file_count++], name);
+  return 0;
+}
+
+static int write_evidence(FILE *out, const void *data, size_t n) {
+  if (n > MAX_COLLECTION_BYTES - g_collected_bytes) {
+    g_limit_exceeded = 1;
+    return -1;
+  }
+  if (fwrite(data, 1, n, out) != n) return -1;
+  g_collected_bytes += n;
+  return 0;
+}
 
 static int has_prefix(const char *s, const char *pfx) {
   return strncmp(s, pfx, strlen(pfx)) == 0;
@@ -150,6 +187,10 @@ static void now_iso(char *out, size_t cap) {
 /* 把命令 stdout 落到 output-dir/<name>。任何不完整的输出都不保留为完整产物，
  * 但收集可降级继续，最终由 manifest/collected.json 记录。 */
 static int run_to_file(const char *cmd, const char *name) {
+  if (g_limit_exceeded || g_file_count >= MAX_COLLECTION_FILES - 2u) {
+    g_limit_exceeded = 1;
+    return -1;
+  }
   char path[MAXPATH];
   int failed = 0;
   if (join_path_exact(path, sizeof(path), g_output_dir, name) != 0) {
@@ -172,7 +213,7 @@ static int run_to_file(const char *cmd, const char *name) {
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0) {
-      if (fwrite(buf, 1, n, out) != n) {
+      if (write_evidence(out, buf, n) != 0) {
         failed = 1;
         break;
       }
@@ -190,7 +231,7 @@ static int run_to_file(const char *cmd, const char *name) {
     g_partial_failures++;
     return -1;
   }
-  return 0;
+  return record_file(name);
 }
 
 static int write_str_file(const char *name, const char *content) {
@@ -201,18 +242,22 @@ static int write_str_file(const char *name, const char *content) {
   len = strlen(content);
   FILE *f = fopen(path, "wb");
   if (!f) return -1;
-  if (fwrite(content, 1, len, f) != len) failed = 1;
+  if (write_evidence(f, content, len) != 0) failed = 1;
   if (fclose(f) != 0) failed = 1;
   if (failed) {
     remove(path);
     return -1;
   }
-  return 0;
+  return record_file(name);
 }
 
 /* Copy targeted evidence without constructing a shell command from request
  * data.  A read/write failure removes the partial destination. */
 static int copy_target_file(const char *source, const char *name) {
+  if (g_limit_exceeded || g_file_count >= MAX_COLLECTION_FILES - 2u) {
+    g_limit_exceeded = 1;
+    return -1;
+  }
   char path[MAXPATH];
   char buf[8192];
   FILE *in;
@@ -228,7 +273,7 @@ static int copy_target_file(const char *source, const char *name) {
     return -1;
   }
   while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-    if (fwrite(buf, 1, n, out) != n) {
+    if (write_evidence(out, buf, n) != 0) {
       failed = 1;
       break;
     }
@@ -240,7 +285,7 @@ static int copy_target_file(const char *source, const char *name) {
     remove(path);
     return -1;
   }
-  return 0;
+  return record_file(name);
 }
 
 /* 从 --request 文件中尽力提取 "path":"..." 目标并拷贝到 output-dir（targeted/full）。 */
@@ -384,27 +429,59 @@ static int collect(void) {
   return 0;
 }
 
-/* 把 output-dir 打包为 out-file（tar.gz）。返回 0 成功。 */
+/* Only files successfully produced by this invocation enter the archive.
+ * Never enumerate output-dir: it may contain old archives, requests or logs. */
 static int make_bundle(void) {
-  char cmd[MAXPATH * 3];
-  int written;
+  /* Refuse to overwrite an old artifact (including aliases of input files). */
+  FILE *reserved = fopen(g_out_file, "wbx");
+  if (!reserved) return -1;
+  if (fclose(reserved) != 0) { (void)remove(g_out_file); return -1; }
+  const char *args[MAX_COLLECTION_FILES + 9u];
 #if defined(_WIN32)
-  /* Windows 10+ 自带 bsdtar（tar.exe）。 */
-  written = snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\" . 2>nul", g_out_file, g_output_dir);
-  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
-  if (system(cmd) == 0 && file_exists(g_out_file)) return 0;
-  /* 回退 PowerShell Compress-Archive（产物为 .zip 语义，但路径按 out-file 给定）。 */
-  written = snprintf(cmd, sizeof(cmd),
-                     "powershell -NoProfile -Command \"Compress-Archive -Path '%s\\*' -DestinationPath '%s' -Force\" >nul 2>&1",
-                     g_output_dir, g_out_file);
-  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
-  (void)system(cmd);
-#else
-  written = snprintf(cmd, sizeof(cmd), "tar czf \"%s\" -C \"%s\" . 2>/dev/null", g_out_file, g_output_dir);
-  if (written <= 0 || (size_t)written >= sizeof(cmd)) return -1;
-  if (system(cmd) != 0) return -1;
+  char quoted_out[MAXPATH + 3], quoted_dir[MAXPATH + 3];
+  if (strchr(g_out_file, '"') || strchr(g_output_dir, '"')) {
+    (void)remove(g_out_file);
+    return -1;
+  }
+  snprintf(quoted_out, sizeof(quoted_out), "\"%s\"", g_out_file);
+  snprintf(quoted_dir, sizeof(quoted_dir), "\"%s\"", g_output_dir);
 #endif
-  return file_exists(g_out_file) ? 0 : -1;
+  unsigned n = 0;
+  args[n++] = "tar";
+  args[n++] = "-czf";
+#if defined(_WIN32)
+  args[n++] = quoted_out;
+#else
+  args[n++] = g_out_file;
+#endif
+  args[n++] = "-C";
+#if defined(_WIN32)
+  args[n++] = quoted_dir;
+#else
+  args[n++] = g_output_dir;
+#endif
+  args[n++] = "--";
+  for (unsigned i = 0; i < g_file_count; ++i) args[n++] = g_files[i];
+  args[n] = NULL;
+#if defined(_WIN32)
+  intptr_t rc = _spawnvp(_P_WAIT, "tar", args);
+  if (rc == 0 && file_exists(g_out_file)) return 0;
+#else
+  pid_t pid = fork();
+  if (pid == 0) {
+    execvp("tar", (char *const *)args);
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited;
+  do { waited = pid > 0 ? waitpid(pid, &status, 0) : -1; }
+  while (waited < 0 && errno == EINTR);
+  if (waited == pid && pid > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+      file_exists(g_out_file)) return 0;
+#endif
+  /* A failed tar must not turn an existing/partial file into false success. */
+  (void)remove(g_out_file);
+  return -1;
 }
 
 int main(int argc, char **argv) {
@@ -452,7 +529,12 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  if (collect() != 0) {
+  if (!edr_forensic_storage_ready(g_output_dir)) {
+    fputs("forensic_collector: insufficient free space (256 MiB required) or volume query failed\n", stderr);
+    return 3;
+  }
+  if (collect() != 0 || g_limit_exceeded) {
+    if (g_limit_exceeded) fputs("forensic_collector: collection exceeds 64 MiB / 64 files budget\n", stderr);
     fputs("forensic_collector: cannot record complete collection status\n", stderr);
     return 3;
   }

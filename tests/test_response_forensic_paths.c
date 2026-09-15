@@ -1,5 +1,12 @@
 #include "edr/response.h"
 #include "edr/response_utils.h"
+#include "edr/forensic_limits.h"
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +19,45 @@ static void require_true(int ok, const char *message) {
   }
 }
 
+static void test_baseline_copy_budget(void) {
+  char dir[512];
+#ifdef _WIN32
+  char tmp[400];
+  require_true(GetTempPathA(sizeof(tmp), tmp) > 0, "get temporary directory");
+  snprintf(dir, sizeof(dir), "%sforensic copy %lu", tmp, (unsigned long)GetCurrentProcessId());
+  require_true(_mkdir(dir) == 0, "create copy workspace");
+  _putenv_s("EDR_FORENSIC_COPY_PATHS", "1");
+#else
+  snprintf(dir, sizeof(dir), "/tmp/forensic copy %lu", (unsigned long)getpid());
+  require_true(mkdir(dir, 0700) == 0, "create copy workspace");
+  setenv("EDR_FORENSIC_COPY_PATHS", "1", 1);
+#endif
+  char src[600], first[600], second[600], payload[1250];
+  snprintf(src, sizeof(src), "%s/source", dir);
+  snprintf(first, sizeof(first), "%s/copied_00", dir);
+  snprintf(second, sizeof(second), "%s/copied_01", dir);
+  FILE *f = fopen(src, "wb"); require_true(f != NULL, "create synthetic evidence");
+  require_true(fseek(f, 33L * 1024L * 1024L - 1L, SEEK_SET) == 0, "size synthetic evidence");
+  fputc(0, f); fclose(f);
+  snprintf(payload, sizeof(payload), "%s\n%s", src, src);
+  require_true(response_forensic_copy_lines(dir, (const uint8_t *)payload, strlen(payload)) != 0,
+               "fallback enforces aggregate budget");
+  f = fopen(second, "rb"); require_true(f == NULL, "fallback removes incomplete oversized copy");
+  remove(first);
+  f = fopen(src, "wb"); require_true(f != NULL, "replace synthetic evidence");
+  fputs("synthetic", f); fclose(f);
+  require_true(response_forensic_copy_lines(dir, (const uint8_t *)src, strlen(src)) == 0,
+               "fallback accepts bounded evidence");
+  remove(first); remove(src);
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_COPY_PATHS", ""); _rmdir(dir);
+#else
+  unsetenv("EDR_FORENSIC_COPY_PATHS"); rmdir(dir);
+#endif
+}
+
 int main(void) {
+  test_baseline_copy_budget();
   const char *active = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true}";
   const char *restored = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":false,\"restored\":true,\"enforcement_verified\":true}";
   const char *active_with_management = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true,\"management_reachable\":true}";

@@ -12,7 +12,7 @@ extern "C" {
 #endif
 
 int response_forensic_copy_one_file(const char *src, const char *dst);
-void response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len);
+int response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len);
 void response_sanitize_job_name(const char *src, char *dst, size_t cap);
 /* Build the exact request/artifact arguments for an external collector.
  * A nonzero return clears every output; callers must not execute a partially

@@ -22,6 +22,18 @@
 #include <unistd.h>
 #endif
 
+/* Enforce wall time in the parent; --timeout is only advisory to a child. */
+static uint64_t g_collector_deadline_ms;
+static uint64_t dc_monotonic_ms(void) {
+#ifdef _WIN32
+  return GetTickCount64();
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
 /* P3:下载 + SHA256 验签的平台无关辅助(放在平台分支之前,两端共用)。 */
 
 /* 计算文件 SHA256(十六进制,小写)。成功返回 0。大文件分块读。 */
@@ -1228,6 +1240,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
            "%s", "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe");
 
   HANDLE job = CreateJobObject(NULL, NULL);
+  if (!job) return EDR_DC_ERR_SPAWN;
   if (job) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
     jeli.BasicLimitInformation.LimitFlags =
@@ -1235,8 +1248,11 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
         JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
     jeli.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart =
         (int64_t)params->timeout_s * 10000000LL;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                            &jeli, sizeof(jeli));
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                 &jeli, sizeof(jeli))) {
+      CloseHandle(job);
+      return EDR_DC_ERR_SPAWN;
+    }
 
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpu = {0};
     cpu.ControlFlags =
@@ -1271,8 +1287,10 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
     return EDR_DC_ERR_SPAWN;
   }
 
-  if (job) {
-    AssignProcessToJobObject(job, pi.hProcess);
+  if (!AssignProcessToJobObject(job, pi.hProcess)) {
+    TerminateProcess(pi.hProcess, 1u);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job);
+    return EDR_DC_ERR_SPAWN;
   }
 
   SetPriorityClass(pi.hProcess, IDLE_PRIORITY_CLASS);
@@ -1282,6 +1300,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
 
   g_collector_process = pi.hProcess;
   g_collector_job = job;
+  g_collector_deadline_ms = dc_monotonic_ms() + (uint64_t)(params->timeout_s ? params->timeout_s : 300u) * 1000u;
   g_running = 1;
   return EDR_DC_OK;
 }
@@ -1289,6 +1308,12 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
 int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
                             size_t detail_cap) {
   if (!g_collector_process || !g_running) return 0;
+  if (g_collector_deadline_ms && dc_monotonic_ms() >= g_collector_deadline_ms) {
+    edr_deep_collector_kill();
+    if (out_exit_code) *out_exit_code = EDR_DC_ERR_TIMEOUT;
+    if (out_detail) snprintf(out_detail, detail_cap, "collector wall-time limit exceeded; process tree terminated");
+    return EDR_DC_ERR_TIMEOUT;
+  }
 
   DWORD ec = 0;
   if (!GetExitCodeProcess(g_collector_process, &ec)) {
@@ -1299,6 +1324,7 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
     CloseHandle(g_collector_process);
     g_collector_process = NULL;
     g_running = 0;
+    if (g_collector_job) { CloseHandle(g_collector_job); g_collector_job = NULL; }
     dc_async_stderr_cleanup();
     return EDR_DC_ERR_CRASH;
   }
@@ -1314,6 +1340,7 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
     CloseHandle(g_collector_process);
     g_collector_process = NULL;
     g_running = 0;
+    if (g_collector_job) { CloseHandle(g_collector_job); g_collector_job = NULL; }
     dc_async_stderr_cleanup();
     return 0;
   }
@@ -1321,6 +1348,7 @@ int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
 }
 
 void edr_deep_collector_kill(void) {
+  if (g_collector_job) TerminateJobObject(g_collector_job, 9u);
   if (g_collector_process) {
     TerminateProcess(g_collector_process, 9);
     (void)WaitForSingleObject(g_collector_process, 5000u);
@@ -1368,7 +1396,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
            spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
 
   HANDLE job = CreateJobObject(NULL, NULL);
-  if (!job && spec->cpu_limit_percent) {
+  if (!job) {
     if (out_detail) {
       snprintf(out_detail, detail_cap, "collector CPU quota job creation failed: %lu",
                (unsigned long)GetLastError());
@@ -1388,7 +1416,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     cpu.CpuRate = cpu_percent * 100u;
     BOOL cpu_ok = SetInformationJobObject(job, JobObjectCpuRateControlInformation,
                                          &cpu, sizeof(cpu));
-    if (spec->cpu_limit_percent && (!limits_ok || !cpu_ok)) {
+    if (!limits_ok || (spec->cpu_limit_percent && !cpu_ok)) {
       DWORD error = GetLastError();
       CloseHandle(job);
       if (out_detail) {
@@ -1441,7 +1469,7 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
     if (job) CloseHandle(job);
     return EDR_DC_ERR_SPAWN;
   }
-  if (job && !AssignProcessToJobObject(job, pi.hProcess) && spec->cpu_limit_percent) {
+  if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
     DWORD error = GetLastError();
     TerminateProcess(pi.hProcess, 1u);
     (void)WaitForSingleObject(pi.hProcess, 5000u);
@@ -1550,7 +1578,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   }
 
   HANDLE job = CreateJobObject(NULL, NULL);
-  if (!job && spec->cpu_limit_percent) {
+  if (!job) {
     if (out_detail) {
       snprintf(out_detail, detail_cap, "collector CPU quota job creation failed: %lu",
                (unsigned long)GetLastError());
@@ -1570,7 +1598,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     cpu.CpuRate = cpu_percent * 100u;
     BOOL cpu_ok = SetInformationJobObject(job, JobObjectCpuRateControlInformation,
                                          &cpu, sizeof(cpu));
-    if (spec->cpu_limit_percent && (!limits_ok || !cpu_ok)) {
+    if (!limits_ok || (spec->cpu_limit_percent && !cpu_ok)) {
       DWORD error = GetLastError();
       CloseHandle(job);
       if (out_detail) {
@@ -1632,7 +1660,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
     return EDR_DC_ERR_SPAWN;
   }
   if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
-  if (job && !AssignProcessToJobObject(job, pi.hProcess) && spec->cpu_limit_percent) {
+  if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
     DWORD error = GetLastError();
     TerminateProcess(pi.hProcess, 1u);
     (void)WaitForSingleObject(pi.hProcess, 5000u);
@@ -1652,6 +1680,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   CloseHandle(pi.hThread);
   g_collector_process = pi.hProcess;
   g_collector_job = job;
+  g_collector_deadline_ms = dc_monotonic_ms() + (uint64_t)to * 1000u;
   if (herr != INVALID_HANDLE_VALUE) {
     snprintf(g_collector_stderr_path, sizeof(g_collector_stderr_path), "%s", errpath);
   }
@@ -1720,6 +1749,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
 
   (void)setpgid(pid, pid);
   g_collector_pid = pid;
+  g_collector_deadline_ms = dc_monotonic_ms() + (uint64_t)(params->timeout_s ? params->timeout_s : 300u) * 1000u;
   g_running = 1;
   snprintf(g_detail, sizeof(g_detail), "collector pid=%d started", (int)pid);
   return EDR_DC_OK;
@@ -1728,6 +1758,12 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
 int edr_deep_collector_poll(int *out_exit_code, char *out_detail,
                             size_t detail_cap) {
   if (!g_collector_pid || !g_running) return 0;
+  if (g_collector_deadline_ms && dc_monotonic_ms() >= g_collector_deadline_ms) {
+    edr_deep_collector_kill();
+    if (out_exit_code) *out_exit_code = EDR_DC_ERR_TIMEOUT;
+    if (out_detail) snprintf(out_detail, detail_cap, "collector wall-time limit exceeded; process tree terminated");
+    return EDR_DC_ERR_TIMEOUT;
+  }
 
   int st = 0;
   pid_t w = waitpid(g_collector_pid, &st, WNOHANG);
@@ -1942,6 +1978,7 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   }
   (void)setpgid(pid, pid);
   g_collector_pid = pid;
+  g_collector_deadline_ms = dc_monotonic_ms() + (uint64_t)to * 1000u;
   g_running = 1;
   snprintf(g_detail, sizeof(g_detail), "collector pid=%d started(async)", (int)pid);
   return EDR_DC_OK;

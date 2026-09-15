@@ -1404,3 +1404,12 @@ include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
 if(WIN32)
   include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
 endif()
+
+add_executable(test_builtin_forensic_bundle ${CMAKE_CURRENT_SOURCE_DIR}/test_builtin_forensic_bundle.c)
+edr_apply_test_warnings(test_builtin_forensic_bundle)
+add_test(NAME builtin_forensic_bundle COMMAND test_builtin_forensic_bundle)
+if(UNIX AND TARGET forensic_collector)
+  add_test(NAME builtin_forensic_bundle_regressions
+    COMMAND ${CMAKE_COMMAND} -E env "BIN=$<TARGET_FILE:forensic_collector>"
+      ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/forensic_collector/test_bundle.py)
+endif()
