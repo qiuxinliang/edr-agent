@@ -1,12 +1,12 @@
-# 独立 edr-agent 仓库：工作目录 = 本仓库根。默认构建 AMD64/ARM64 Windows 候选制品：
-# `win_*` tag → vcpkg(curl + sqlite) → 双架构测试候选包。
-# 日常 tag/手动默认只生成候选制品；正式发布需手动选择 release 并完成签名。
+# 独立 edr-agent 仓库：工作目录 = 本仓库根。默认发布 AMD64/ARM64 Windows Agent：
+# `win_*` tag → vcpkg(curl + sqlite) → 双架构 Release Bundle。
+# 当前无证书时默认发布完整 unsigned bundle；取得证书后将仓库变量
+# `WINDOWS_RELEASE_MODE` 设为 `signed`，无需修改工作流。
 # YARA 依赖长链移至独立 workflow，release 默认不编译 legacy gRPC/protobuf 依赖。
 #
 # 触发：`git push origin <tag>`（`win_M.m.p`）或 Actions Run workflow；首步 `verify_ave_behavior_chain_invariants.sh`。
 
 name: edr-agent client release
-run-name: Windows ${{ inputs.version || github.ref_name }} / ${{ inputs.build_purpose || 'candidate' }}
 
 on:
   push:
@@ -18,22 +18,14 @@ on:
         description: Release version without the win_ prefix (for example 3.2.266)
         required: true
         type: string
-      build_purpose:
-        description: candidate builds and tests only; release explicitly signs and publishes
-        required: true
-        default: candidate
-        type: choice
-        options:
-          - candidate
-          - release
       release_mode:
-        description: Signing method for an explicit release (ignored for candidate builds)
+        description: Publish a complete signed or unsigned Release Bundle
         required: true
-        default: usb
+        default: unsigned
         type: choice
         options:
+          - unsigned
           - signed
-          - usb
       upgrade_class:
         description: Upgrade path classification; binary_hot additionally requires post-build identity proof against the previous immutable Release
         required: true
@@ -47,10 +39,9 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 concurrency:
-  group: edr-agent-release-${{ github.ref }}-${{ inputs.build_purpose || 'candidate' }}
+  group: edr-agent-release-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -58,41 +49,17 @@ env:
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
+  WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
 
 jobs:
   prepare-release:
-    name: Resolve candidate build or signed release
+    name: Prepare immutable GitHub Release
     runs-on: ubuntu-latest
-    outputs:
-      signing-mode: ${{ steps.signing-mode.outputs.mode }}
-      build-purpose: ${{ steps.signing-mode.outputs.purpose }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Test release signing admission
-        run: python3 tests/test_windows_release_mode.py
-      - name: Resolve mandatory signing policy
-        id: signing-mode
-        env:
-          REQUESTED_MODE: ${{ inputs.release_mode }}
-          CONFIGURED_MODE: ${{ vars.WINDOWS_RELEASE_MODE }}
-          BUILD_PURPOSE: ${{ inputs.build_purpose || 'candidate' }}
-        run: python3 scripts/windows_release_mode.py --event "$GITHUB_EVENT_NAME" --purpose "$BUILD_PURPOSE" --requested "$REQUESTED_MODE" --configured "$CONFIGURED_MODE" --output "$GITHUB_OUTPUT"
-      - name: Check private signing configuration before building
-        if: steps.signing-mode.outputs.mode == 'usb'
-        env:
-          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
-        run: |
-          test -n "$GH_TOKEN" || { echo '::error::Configure the dedicated USB_SIGNING_TOKEN before a USB release'; exit 1; }
-          test "$(gh api repos/qiuxinliang/edr-agent-signing --jq .private)" = true
-          test "$(gh api repos/qiuxinliang/edr-agent-signing/actions/workflows/sign.yml --jq .state)" = active
       - name: Create draft release
-        if: steps.signing-mode.outputs.purpose == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
-          WINDOWS_RELEASE_MODE: ${{ steps.signing-mode.outputs.mode }}
         shell: bash
         run: |
           set -euo pipefail
@@ -112,7 +79,7 @@ jobs:
           else
             args+=(--verify-tag)
           fi
-          if [[ "${WINDOWS_RELEASE_MODE}" == "signed" || "${WINDOWS_RELEASE_MODE}" == "usb" ]]; then
+          if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
             args+=(--title "edr-agent ${tag} (Windows AMD64 + ARM64)")
           else
             args+=(--title "edr-agent ${tag} (UNSIGNED Windows AMD64 + ARM64)")
@@ -149,8 +116,6 @@ jobs:
             cmake_processor: ARM64
             include_windivert: "false"
     env:
-      WINDOWS_RELEASE_MODE: ${{ needs.prepare-release.outputs.signing-mode }}
-      WINDOWS_BUILD_PURPOSE: ${{ needs.prepare-release.outputs.build-purpose }}
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       EDR_RELEASE_ARCH: ${{ matrix.arch }}
@@ -186,10 +151,9 @@ jobs:
       - name: Validate release scripts with Windows PowerShell 5.1
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
-
-      - name: Validate file-only USB signing exchange
-        shell: powershell
-        run: .\tests\test_windows_usb_exchange.ps1
+      - name: Verify hosted release workflow contract
+        shell: pwsh
+        run: python tests/test_windows_release_workflow.py
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
         shell: pwsh
         run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
@@ -200,17 +164,13 @@ jobs:
         shell: pwsh
         run: |
           $mode = $env:WINDOWS_RELEASE_MODE.Trim().ToLowerInvariant()
-          if ($mode -notin @('signed', 'unsigned', 'usb')) {
-            throw "WINDOWS_RELEASE_MODE must be signed, unsigned or usb"
+          if ($mode -notin @('signed', 'unsigned')) {
+            throw "WINDOWS_RELEASE_MODE must be signed or unsigned"
           }
-          if ($mode -in @('unsigned', 'usb')) {
+          if ($mode -eq 'unsigned') {
             "WINDOWS_RELEASE_UNSIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
             "WINDOWS_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
-            if ($mode -eq 'usb') {
-              Write-Host 'Native outputs are intermediate only; publication requires the dedicated USB signing job and lifecycle gates.'
-            } else {
-              Write-Host 'Unsigned test candidate only: no USB, no GitHub Release publication and no endpoint promotion.'
-            }
+            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag $env:EDR_AGENT_RELEASE_TAG. The complete SHA-256-pinned update bundle will still be published."
             exit 0
           }
           "WINDOWS_RELEASE_UNSIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -323,10 +283,6 @@ jobs:
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
         run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
-      - name: Validate detached signing contract with temporary software certificate
-        if: env.WINDOWS_RELEASE_MODE == 'usb'
-        shell: powershell
-        run: .\tests\test_windows_store_signing.ps1 -SignTool (Get-Command signtool.exe -ErrorAction Stop).Source
       - name: Preflight native P0 test compiler before dependencies
         shell: pwsh
         run: |
@@ -596,7 +552,7 @@ jobs:
           if (-not $pfx -or -not (Test-Path -LiteralPath $pfx)) {
             throw "validated release signing PFX is unavailable"
           }
-          $targets = Get-ChildItem build -Recurse -File | Where-Object Name -in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','forensic_collector_builtin.exe')
+          $targets = Get-ChildItem build -Recurse -File | Where-Object Name -in @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe')
           foreach ($target in $targets) {
             & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_SIGNING_PFX_PASSWORD $target.FullName
             if ($LASTEXITCODE -ne 0) { throw "signtool failed: $($target.FullName)" }
@@ -1279,25 +1235,7 @@ jobs:
           }
           Get-ChildItem -LiteralPath $dist | Select-Object Name,Length
 
-      - name: Label unsigned test candidate
-        if: env.WINDOWS_BUILD_PURPOSE == 'candidate'
-        shell: pwsh
-        run: |
-          $notice = "UNSIGNED TEST CANDIDATE ONLY. Not a signed release; do not promote to endpoints or disable signature verification. Source: $env:GITHUB_SHA. Native lifecycle publication gates have not run."
-          [IO.File]::WriteAllText((Join-Path $PWD 'dist/UNSIGNED-CANDIDATE.txt'), $notice)
-          "$env:EDR_RELEASE_ARCH candidate: build and tests passed; signing and publication intentionally not requested." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-      - name: Retain ${{ matrix.arch }} unsigned test candidate
-        if: env.WINDOWS_BUILD_PURPOSE == 'candidate'
-        uses: actions/upload-artifact@v4
-        with:
-          name: unsigned-candidate-${{ env.EDR_AGENT_RELEASE_TAG }}-${{ matrix.arch }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Upload ${{ matrix.arch }} release bundle
-        if: env.WINDOWS_BUILD_PURPOSE == 'release' && env.WINDOWS_RELEASE_MODE != 'usb'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
@@ -1308,107 +1246,12 @@ jobs:
             @($assets.FullName) --clobber
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed" }
 
-      - name: Prepare hosted packaging state and EXE-only signing request
-        if: env.WINDOWS_RELEASE_MODE == 'usb'
-        shell: pwsh
-        env:
-          USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
-          USB_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
-        run: |
-          .\scripts\Stage-WindowsReleasePackaging.ps1 -Architecture $env:EDR_RELEASE_ARCH -Version $env:EDR_AGENT_VERSION -OutputDirectory "$env:RUNNER_TEMP\host-input"
-          .\scripts\Complete-WindowsUsbRelease.ps1 -Stage Prepare -InputDirectory "$env:RUNNER_TEMP\host-input" -OutputDirectory "$env:RUNNER_TEMP\package-state" -ExpectedCommit $env:GITHUB_SHA -Thumbprint $env:USB_THUMBPRINT -ManifestSignerSubject $env:USB_SUBJECT
-
-      - name: Retain packaging state on GitHub only
-        if: env.WINDOWS_RELEASE_MODE == 'usb'
-        uses: actions/upload-artifact@v4
-        with:
-          name: package-state-native-${{ matrix.arch }}
-          path: ${{ runner.temp }}/package-state/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 3
-
-      - name: Send only native EXEs and request inventory to USB
-        if: env.WINDOWS_RELEASE_MODE == 'usb'
-        uses: actions/upload-artifact@v4
-        with:
-          name: usb-native-request-${{ matrix.arch }}
-          path: ${{ runner.temp }}/package-state/native-request/
-          if-no-files-found: error
-          retention-days: 3
-
-  usb-native-sign:
-    needs: [prepare-release, windows-build]
-    if: ${{ needs.prepare-release.outputs.build-purpose == 'release' && needs.prepare-release.outputs.signing-mode == 'usb' }}
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/windows-usb-sign-files.yml
-    secrets:
-      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
-    with:
-      phase: native
-      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
-
-  usb-build-installer:
-    needs: usb-native-sign
-    uses: ./.github/workflows/windows-usb-package.yml
-    with:
-      stage: Installer
-      phase: native
-      next_phase: installer
-
-  usb-installer-sign:
-    needs: usb-build-installer
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/windows-usb-sign-files.yml
-    secrets:
-      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
-    with:
-      phase: installer
-      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
-
-  usb-build-bundle:
-    needs: usb-installer-sign
-    uses: ./.github/workflows/windows-usb-package.yml
-    with:
-      stage: Bundle
-      phase: installer
-      next_phase: manifest
-
-  usb-manifest-sign:
-    needs: usb-build-bundle
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/windows-usb-sign-files.yml
-    secrets:
-      USB_SIGNING_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
-    with:
-      phase: manifest
-      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
-
-  usb-publish-assets:
-    needs: usb-manifest-sign
-    uses: ./.github/workflows/windows-usb-package.yml
-    with:
-      stage: Verify
-      phase: manifest
-      next_phase: verified
-
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
-      - prepare-release
       - windows-build
       - windows-lifecycle
-      - usb-publish-assets
-    if: ${{ always() && needs.prepare-release.outputs.build-purpose == 'release' && needs.prepare-release.outputs.signing-mode != 'unsigned' && needs.prepare-release.result == 'success' && needs.windows-build.result == 'success' && needs.windows-lifecycle.result == 'success' && (needs.prepare-release.outputs.signing-mode != 'usb' || needs.usb-publish-assets.result == 'success') }}
     runs-on: ubuntu-latest
-    env:
-      WINDOWS_RELEASE_MODE: ${{ needs.prepare-release.outputs.signing-mode }}
     steps:
       - name: Verify combined AMD64/ARM64 asset set
         env:
@@ -1429,14 +1272,14 @@ jobs:
               name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
               has_asset "${name}" || { echo "::error::missing combined release asset: ${name}"; exit 1; }
             done
-            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" || "${WINDOWS_RELEASE_MODE}" == "usb" ]]; then
+            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
               name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
               has_asset "${name}" || { echo "::error::missing signed manifest: ${name}"; exit 1; }
             fi
           done
 
       - name: Publish signed Windows release
-        if: env.WINDOWS_RELEASE_MODE == 'signed' || env.WINDOWS_RELEASE_MODE == 'usb'
+        if: env.WINDOWS_RELEASE_MODE == 'signed'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1445,10 +1288,28 @@ jobs:
             --draft=false --prerelease=false --latest \
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
 
+      - name: Publish unsigned Windows release
+        if: env.WINDOWS_RELEASE_MODE == 'unsigned'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          body="$(mktemp)"
+          cat >"${body}" <<'EOF'
+          WARNING: This temporary Windows build is unsigned.
+          Windows will show an unknown-publisher warning. Platform publication and Agent update require
+          EDR_AGENT_RELEASE_SIGNATURE_POLICY=optional and remain pinned to the manifest and task SHA-256.
+          The standalone FDSensor.exe and manifest update metadata are published so an optional-signature
+          platform can verify and promote the exact SHA-256-pinned artifact.
+          EOF
+          gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --prerelease=false --latest \
+            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (UNSIGNED Windows AMD64 + ARM64)" \
+            --notes-file "${body}"
+
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
-    needs: [prepare-release, windows-build, usb-publish-assets]
-    if: ${{ always() && needs.prepare-release.outputs.build-purpose == 'release' && needs.prepare-release.outputs.signing-mode != 'unsigned' && needs.prepare-release.result == 'success' && needs.windows-build.result == 'success' && ((needs.prepare-release.outputs.signing-mode == 'usb' && needs.usb-publish-assets.result == 'success') || (needs.prepare-release.outputs.signing-mode != 'usb' && needs.usb-publish-assets.result == 'skipped')) }}
+    needs: windows-build
     permissions:
       contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml

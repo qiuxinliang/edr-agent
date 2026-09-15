@@ -12,13 +12,6 @@ $RepositoryRoot = [IO.Path]::GetFullPath($RepositoryRoot)
 
 $relativePaths = @(
   "scripts\validate_windows_powershell_syntax.ps1",
-  "scripts\WindowsStoreSigning.ps1",
-  "scripts\WindowsUsbSigningExchange.ps1",
-  "scripts\Sign-WindowsReleaseFiles.ps1",
-  "tests\test_windows_usb_exchange.ps1",
-  "scripts\Stage-WindowsReleasePackaging.ps1",
-  "scripts\Complete-WindowsUsbRelease.ps1",
-  "tests\test_windows_store_signing.ps1",
   "scripts\Validate-DependencyLocks.ps1",
   "scripts\Restore-SetupUiLocked.ps1",
   "scripts\edr_agent_install.ps1",
