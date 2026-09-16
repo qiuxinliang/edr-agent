@@ -421,6 +421,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
             build = source / "build"
             (source / "windows.h").write_text(
                 '#include <stdint.h>\n#define MAX_PATH 260\n'
+                '/* Windows SDK rpcndr.h exposes this MIDL type macro. */\n'
+                '#define small char\n'
                 'typedef uint32_t DWORD;\n'
                 'typedef struct { DWORD dwLowDateTime, dwHighDateTime; } FILETIME;\n'
                 'DWORD GetTempPathA(DWORD, char *);\n'

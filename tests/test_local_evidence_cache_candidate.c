@@ -4589,7 +4589,7 @@ static void assert_cached_command(const char *db, const EdrBehaviorRecord *r,
  * a complete 3288-byte command followed by a 2047-byte enrichment preview.
  * Use the production writer and reopened RTQ consumer, not copied SQL. */
 static void test_process_command_quality_survives_update_and_reopen(void) {
-  char db[512], complete[3289], small[80];
+  char db[512], complete[3289], undersized_tree[80];
   struct timespec ts;
   EdrBehaviorRecord *r = (EdrBehaviorRecord *)calloc(1u, sizeof(*r));
   EdrBehaviorRecord *sparse = (EdrBehaviorRecord *)calloc(1u, sizeof(*sparse));
@@ -4656,8 +4656,8 @@ static void test_process_command_quality_survives_update_and_reopen(void) {
   }
   /* The caller's budget is unchanged; insufficient output is not JSON success. */
   assert(edr_local_evidence_cache_process_tree_json(
-      r->pid, r->endpoint_id, small, sizeof(small)) == -3);
-  assert(small[0] == '\0');
+      r->pid, r->endpoint_id, undersized_tree, sizeof(undersized_tree)) == -3);
+  assert(undersized_tree[0] == '\0');
 
   /* Reuse must reset both value and quality; a longer old command is no authority. */
   set_record_generation(r, UINT64_C(12384898975274623));
