@@ -239,7 +239,10 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
                                                   uint32_t *scanned,
                                                   int *truncated);
 
-/** 用进程缓存返回 pid 的父进程和直接子进程，供 RTR 进程树查看。 */
+/** 用进程缓存返回 pid 的父进程和直接子进程，供 RTR 进程树查看。
+ * Returns -2 when absent; -3 with empty output on serialization/budget failure.
+ * A successful result preserves the selected command and its field quality.
+ */
 int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,
                                                char *out, size_t cap);
 

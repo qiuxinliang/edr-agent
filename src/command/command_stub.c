@@ -3829,6 +3829,13 @@ static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t le
   }
   char detail[12000];
   int r = edr_local_evidence_cache_process_tree_json((uint32_t)pid, endpoint_id, detail, sizeof(detail));
+  if (r == -3) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_process_tree: serialization or output budget exhausted");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4,
+              "cached process tree exceeds response budget or cannot be serialized");
+    return;
+  }
   if (r != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_process_tree: no cached process");

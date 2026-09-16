@@ -2324,6 +2324,7 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
   sqlite_exec_create_legacy_cache(db);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   assert(sqlite_table_has_column(db, "process_cache", "process_start_key"));
+  assert(sqlite_table_has_column(db, "process_cache", "cmdline_truncated_fields"));
   assert(sqlite_table_has_column(db, "process_cache", "process_creation_filetime_100ns"));
   assert(sqlite_table_has_column(db, "process_cache", "process_generation_source"));
   assert(sqlite_table_has_column(db, "process_cache", "parent_process_start_key"));
@@ -3668,10 +3669,12 @@ static void test_process_cache_preserves_full_facts_and_source_provenance(void) 
   snprintf(sparse->endpoint_id, sizeof(sparse->endpoint_id),
            "ep-full-process-facts");
   edr_local_evidence_cache_enrich_behavior(sparse);
-  assert(strlen(sparse->cmdline) == sizeof(sparse->cmdline) - 1u);
+  /* A bigger preview is still weaker than the previous complete command.
+   * The independently truncated image path keeps its own provenance. */
+  assert(strlen(sparse->cmdline) == 1024u);
   assert(strlen(sparse->exe_path) == sizeof(sparse->exe_path) - 1u);
   assert(strcmp(sparse->source_completeness, "TRUNCATED") == 0);
-  assert(strstr(sparse->source_truncated_fields, "source.cmdline") != NULL);
+  assert(strstr(sparse->source_truncated_fields, "source.cmdline") == NULL);
   assert(strstr(sparse->source_truncated_fields,
                 "source.image_path_canonical") != NULL);
 
@@ -4542,7 +4545,237 @@ static void test_command_preview_to_durable_fact(void) {
   free(decoded);
 }
 
+#if defined(EDR_HAVE_SQLITE)
+static void assert_cached_command(const char *db, const EdrBehaviorRecord *r,
+                                  const char *expected, const char *quality) {
+  sqlite3 *raw = NULL;
+  sqlite3_stmt *st = NULL;
+  char tree[12000]; /* Actual do_rtr_process_tree response budget. */
+  cJSON *document, *root, *command, *state;
+  assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(raw,
+      "SELECT cmdline,cmdline_truncated_fields FROM process_cache WHERE endpoint_id=? AND pid=?;",
+      -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 1, r->endpoint_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_bind_int64(st, 2, r->pid) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0), expected) == 0);
+  if (strcmp(quality, "unknown") == 0) {
+    assert(sqlite3_column_type(st, 1) == SQLITE_NULL);
+  } else {
+    const char *fields = (const char *)sqlite3_column_text(st, 1);
+    assert(fields != NULL);
+    assert((strcmp(quality, "complete") == 0) == (fields[0] == '\0'));
+  }
+  sqlite3_finalize(st);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  assert(edr_local_evidence_cache_process_tree_json(
+      r->pid, r->endpoint_id, tree, sizeof(tree)) == 0);
+  document = cJSON_Parse(tree);
+  assert(document != NULL);
+  root = cJSON_GetObjectItemCaseSensitive(document, "root");
+  command = cJSON_GetObjectItemCaseSensitive(root, "cmdline");
+  state = cJSON_GetObjectItemCaseSensitive(root, "cmdline_quality");
+  assert(cJSON_IsString(command) && strcmp(command->valuestring, expected) == 0);
+  assert(cJSON_IsString(state) && strcmp(state->valuestring, quality) == 0);
+  if (strcmp(quality, "unknown") == 0) {
+    cJSON *fields = cJSON_GetObjectItemCaseSensitive(root, "cmdline_truncated_fields");
+    assert(cJSON_IsString(fields) && fields->valuestring[0] == '\0');
+  }
+  cJSON_Delete(document);
+}
+
+/* Fixed properties of the native 3.2.503 failure: same birth and StartKey,
+ * a complete 3288-byte command followed by a 2047-byte enrichment preview.
+ * Use the production writer and reopened RTQ consumer, not copied SQL. */
+static void test_process_command_quality_survives_update_and_reopen(void) {
+  char db[512], complete[3289], small[80];
+  struct timespec ts;
+  EdrBehaviorRecord *r = (EdrBehaviorRecord *)calloc(1u, sizeof(*r));
+  EdrBehaviorRecord *sparse = (EdrBehaviorRecord *)calloc(1u, sizeof(*sparse));
+  assert(r && sparse && make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_pt_cache_init();
+  init_record(r, EDR_EVENT_PROCESS_CREATE);
+  r->pid = 10084u; r->priority = 0u;
+  r->event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(r, UINT64_C(12384898975274622));
+  strcpy(r->endpoint_id, "ep-command-quality");
+  strcpy(r->tenant_id, "tenant-command-quality");
+  /* Exercise durable candidate admission, independently of live rule matches. */
+  strcpy(r->detection_context, "{\"severity\":\"P1\"}");
+  strcpy(r->process_name, "probe.exe");
+  strcpy(r->exe_path, "C:\\Windows\\Temp\\probe.exe");
+  fill_text(complete, sizeof(complete), 3288u, 'a');
+  memcpy(complete + 1600u, "\xE4\xB8\xAD\\\"\n", 6u);
+  strcpy(r->cmdline, complete);
+  strcpy(r->event_id, "full-command");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  r->event_time_ns++;
+  r->cmdline[2047] = '\0';
+  strcpy(r->event_id, "truncated-enrichment");
+  strcpy(r->source_completeness, "ENRICHMENT_ONLY");
+  strcpy(r->source_truncated_fields, "source.cmdline");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, complete, "complete");
+  *sparse = *r;
+  sparse->cmdline[0] = '\0'; sparse->source_truncated_fields[0] = '\0';
+  sparse->source_completeness[0] = '\0';
+  edr_local_evidence_cache_enrich_behavior(sparse);
+  assert(strcmp(sparse->cmdline, complete) == 0);
+  assert(!edr_behavior_source_field_truncated(sparse, "source.cmdline"));
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert_cached_command(db, r, complete, "complete");
+  *sparse = *r;
+  sparse->cmdline[0] = '\0';
+  edr_local_evidence_cache_observe_process(sparse);
+  assert_cached_command(db, r, complete, "complete");
+  /* Restart + late weak observation must not put a weaker hot slot above SQL. */
+  r->event_time_ns++;
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, complete, "complete");
+  assert(sqlite_table_count(db, "p0_candidates") == 2u);
+  {
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(raw,
+        "SELECT length(CAST(cmdline AS BLOB)),source_truncated_fields FROM p0_candidates ORDER BY length(cmdline);",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 2047);
+    assert(strcmp((const char *)sqlite3_column_text(st, 1), "source.cmdline") == 0);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 3288);
+    assert(strcmp((const char *)sqlite3_column_text(st, 1), "") == 0);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st); assert(sqlite3_close(raw) == SQLITE_OK);
+  }
+  /* The caller's budget is unchanged; insufficient output is not JSON success. */
+  assert(edr_local_evidence_cache_process_tree_json(
+      r->pid, r->endpoint_id, small, sizeof(small)) == -3);
+  assert(small[0] == '\0');
+
+  /* Reuse must reset both value and quality; a longer old command is no authority. */
+  set_record_generation(r, UINT64_C(12384898975274623));
+  r->event_time_ns++;
+  strcpy(r->event_id, "new-generation-preview");
+  strcpy(r->cmdline, "short-preview");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short-preview", "truncated");
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert_cached_command(db, r, "short-preview", "truncated");
+  /* A compatible longer preview can improve an incomplete observation. */
+  r->event_time_ns++; strcpy(r->event_id, "longer-preview");
+  strcpy(r->cmdline, "short-preview-more");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short-preview-more", "truncated");
+  r->event_time_ns++; strcpy(r->event_id, "shorter-preview");
+  strcpy(r->cmdline, "short");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short-preview-more", "truncated");
+  r->event_time_ns++; strcpy(r->event_id, "conflicting-preview");
+  strcpy(r->cmdline, "unrelated-preview-is-even-longer");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short-preview-more", "truncated");
+  /* Complete, even shorter, is not equivalent to an arbitrary longer preview. */
+  r->event_time_ns++; strcpy(r->event_id, "complete-short-command");
+  strcpy(r->cmdline, "short"); r->source_truncated_fields[0] = '\0';
+  r->source_completeness[0] = '\0';
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short", "complete");
+  r->event_time_ns++; strcpy(r->event_id, "ambiguous-field-overflow");
+  strcpy(r->cmdline, "short-plus-unknown");
+  strcpy(r->source_truncated_fields, "source.list_overflow");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "short", "complete");
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert_cached_command(db, r, "short", "complete");
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  r->event_time_ns++; strcpy(r->event_id, "other-tenant-preview");
+  strcpy(r->tenant_id, "tenant-other");
+  strcpy(r->cmdline, "other-preview");
+  strcpy(r->source_truncated_fields, "source.cmdline");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "other-preview", "truncated");
+  edr_local_evidence_cache_close();
+  edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+  free(sparse); free(r);
+}
+
+static void test_legacy_command_quality_is_unknown_until_observed(void) {
+  char db[512];
+  sqlite3 *raw = NULL;
+  EdrBehaviorRecord *r = (EdrBehaviorRecord *)calloc(1u, sizeof(*r));
+  struct timespec ts;
+  assert(r && make_test_sqlite_path(db, sizeof(db)) == 0);
+  /* A real pre-column schema, with a generation-bound row: migration must
+   * not manufacture complete quality from a NULL legacy marker. */
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw,
+      "CREATE TABLE process_cache(endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,"
+      "ppid INTEGER,name TEXT,path TEXT,cmdline TEXT,parent_name TEXT,parent_path TEXT,"
+      "first_seen_ns INTEGER,last_seen_ns INTEGER,process_start_key TEXT,"
+      "process_creation_filetime_100ns TEXT,PRIMARY KEY(endpoint_id,pid));"
+      "INSERT INTO process_cache(endpoint_id,tenant_id,pid,cmdline,process_start_key,process_creation_filetime_100ns) "
+      "VALUES('ep-legacy-command','tenant-legacy',10084,'legacy-preview','12','133700000000000012');",
+      NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  init_record(r, EDR_EVENT_PROCESS_CREATE);
+  r->pid = 10084u; set_record_generation(r, 12u);
+  strcpy(r->endpoint_id, "ep-legacy-command"); strcpy(r->tenant_id, "tenant-legacy");
+  for (unsigned i = 0u; i < 2u; i++) {
+    assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+    assert_cached_command(db, r, "legacy-preview", "unknown");
+    edr_local_evidence_cache_close();
+  }
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  r->event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  strcpy(r->detection_context, "{\"severity\":\"P1\"}");
+  strcpy(r->event_id, "unknown-cache-roundtrip");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  /* Unknown legacy text remains queryable, but cannot turn into a new source
+   * fact or be falsely declared truncated merely by a cache roundtrip. */
+  assert(r->cmdline[0] == '\0');
+  assert(r->source_truncated_fields[0] == '\0');
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "legacy-preview", "unknown");
+  strcpy(r->cmdline, "complete-replacement");
+  r->source_truncated_fields[0] = '\0';
+  strcpy(r->event_id, "complete-legacy-upgrade");
+  strcpy(r->detection_context, "{\"severity\":\"P1\"}");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+  assert_cached_command(db, r, "complete-replacement", "complete");
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert_cached_command(db, r, "complete-replacement", "complete");
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(db); free(r);
+}
+#endif
+
 int main(void) {
+#if defined(EDR_HAVE_SQLITE)
+  test_process_command_quality_survives_update_and_reopen();
+  test_legacy_command_quality_is_unknown_until_observed();
+#endif
   test_command_preview_to_durable_fact();
   test_retained_file_read_cached_actor();
   test_checknetisolation_standard_low_risk_is_not_candidate();

@@ -529,6 +529,39 @@ static void apply_cached_field_provenance(EdrBehaviorRecord *record,
   }
 }
 
+/* Compare command facts only after the caller admits the same lifetime.
+ * Empty means no update; a known preview cannot replace a complete fact.
+ * Between previews, only a compatible extension adds information. Complete
+ * observations may legitimately change, including becoming shorter. NULL
+ * provenance is legacy/unknown, never proof that the old command was complete. */
+static int command_fact_should_replace(const char *current, const char *current_fields,
+                                       const char *incoming, const char *incoming_fields) {
+  size_t old_len, new_len;
+  if (!incoming || !incoming[0]) return 0;
+  if (!current || !current[0]) return 1;
+  if (incoming_fields && !incoming_fields[0]) return 1;
+  if (current_fields && !current_fields[0]) return 0;
+  old_len = strlen(current);
+  new_len = strlen(incoming);
+  return new_len >= old_len && memcmp(current, incoming, old_len) == 0;
+}
+
+static void command_record_provenance(const EdrBehaviorRecord *r, char out[64]) {
+  static const char *const fields[] = {"source.cmdline"};
+  capture_field_provenance(out, 64u, r, fields, 1u, "source.cmdline", 1);
+}
+
+/* Private marker for NULL legacy provenance. It may be displayed as unknown
+ * by RTQ, but must not be exported as a source truncation or complete fact. */
+static int command_quality_known(const ProcSlot *p) {
+  return p && !source_field_list_has(p->cmdline_truncated_fields,
+                                     "source.cmdline_quality_unknown");
+}
+
+#if defined(EDR_HAVE_SQLITE)
+static void hydrate_process_command(ProcSlot *p);
+#endif
+
 static int identity_quality_rank(const char *q) {
   if (!q) return 0;
   if (strcmp(q, "target_4688") == 0) return 4;
@@ -955,6 +988,8 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
   else if (strcmp(r->identity_quality, "token_sid") == 0) s_status.identity_token_sid++;
   else if (!r->identity_quality[0]) s_status.identity_none++;
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
+  const int command_cache_cold = !p || !generation_bound(&p->generation) ||
+      (incoming_generation_known && !generation_equal(&p->generation, &incoming_generation));
   if (!p && has_identity && !incoming_generation_known) {
     /* Do not create a generation-zero identity slot that a later PID reuse can inherit. */
     s_status.generation_unknown_update_rejects++;
@@ -1032,6 +1067,10 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
     copy_s(p->endpoint_id, sizeof(p->endpoint_id), r->endpoint_id);
   }
   if (r->tenant_id[0]) {
+    if (p->tenant_id[0] && strcmp(p->tenant_id, r->tenant_id) != 0) {
+      p->cmdline[0] = '\0';
+      p->cmdline_truncated_fields[0] = '\0';
+    }
     copy_s(p->tenant_id, sizeof(p->tenant_id), r->tenant_id);
   }
   if (r->process_name[0]) {
@@ -1050,12 +1089,23 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
                              sizeof(path_fields) / sizeof(path_fields[0]),
                              "source.exe_path", exact);
   }
+#if defined(EDR_HAVE_SQLITE)
+  /* Hydrate once per cold lifetime, including an empty first command, not on
+   * every ordinary event/cache miss. Sparse metadata must not mask SQL facts. */
+  if (command_cache_cold && !p->cmdline[0]) hydrate_process_command(p);
+#else
+  (void)command_cache_cold;
+#endif
   if (r->cmdline[0]) {
-    static const char *const cmdline_fields[] = {"source.cmdline"};
-    const int exact = copy_s(p->cmdline, sizeof(p->cmdline), r->cmdline);
-    capture_field_provenance(p->cmdline_truncated_fields,
-                             sizeof(p->cmdline_truncated_fields), r,
-                             cmdline_fields, 1u, "source.cmdline", exact);
+    char fields[64];
+    command_record_provenance(r, fields);
+    if (command_fact_should_replace(p->cmdline, p->cmdline_truncated_fields,
+                                    r->cmdline, fields)) {
+      const int exact = copy_s(p->cmdline, sizeof(p->cmdline), r->cmdline);
+      copy_s(p->cmdline_truncated_fields, sizeof(p->cmdline_truncated_fields), fields);
+      if (!exact) source_field_list_append(p->cmdline_truncated_fields,
+          sizeof(p->cmdline_truncated_fields), "source.cmdline");
+    }
   }
   /* Grandparent display is retained only with the child lifecycle and the
    * exact parent edge selected at that child's birth.  It is never rebuilt
@@ -1171,7 +1221,7 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         apply_cached_field_provenance(r, p->path_truncated_fields);
         if (!exact) apply_cached_field_provenance(r, "source.exe_path");
       }
-      if (!r->cmdline[0] && p->cmdline[0]) {
+      if (!r->cmdline[0] && p->cmdline[0] && command_quality_known(p)) {
         const int exact = copy_s(r->cmdline, sizeof(r->cmdline), p->cmdline);
         apply_cached_field_provenance(r, p->cmdline_truncated_fields);
         if (!exact) apply_cached_field_provenance(r, "source.cmdline");
@@ -1249,7 +1299,7 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
             apply_cached_field_provenance(r, "source.parent_path");
         }
       }
-      if (pp->cmdline[0] && !r->parent_cmdline[0]) {
+      if (pp->cmdline[0] && !r->parent_cmdline[0] && command_quality_known(pp)) {
         copy_s(r->parent_cmdline, sizeof(r->parent_cmdline), pp->cmdline);
         if (pp->cmdline_truncated_fields[0])
           apply_cached_field_provenance(r, "source.parent_cmdline");
@@ -2222,6 +2272,8 @@ static int sqlite_ensure_process_cache_generation_columns(void) {
       {"identity_quality",
        "ALTER TABLE process_cache ADD COLUMN identity_quality TEXT;"},
       {"exe_hash", "ALTER TABLE process_cache ADD COLUMN exe_hash TEXT;"},
+      {"cmdline_truncated_fields",
+       "ALTER TABLE process_cache ADD COLUMN cmdline_truncated_fields TEXT;"},
   };
   for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
     int has_column = sqlite_process_cache_has_column(columns[i].name);
@@ -2268,7 +2320,15 @@ static int sqlite_read_process_cache_row(sqlite3_stmt *st, ProcSlot *out) {
   out->ppid = (uint32_t)sqlite3_column_int64(st, 3);
   copy_s(out->name, sizeof(out->name), (const char *)sqlite3_column_text(st, 4));
   copy_s(out->path, sizeof(out->path), (const char *)sqlite3_column_text(st, 5));
-  copy_s(out->cmdline, sizeof(out->cmdline), (const char *)sqlite3_column_text(st, 6));
+  {
+    const char *fields = (const char *)sqlite3_column_text(st, 23);
+    const int exact = copy_s(out->cmdline, sizeof(out->cmdline),
+                             (const char *)sqlite3_column_text(st, 6));
+    copy_s(out->cmdline_truncated_fields, sizeof(out->cmdline_truncated_fields),
+           fields ? fields : "source.cmdline_quality_unknown");
+    if (!exact) source_field_list_append(out->cmdline_truncated_fields,
+        sizeof(out->cmdline_truncated_fields), "source.cmdline");
+  }
   copy_s(out->parent_name, sizeof(out->parent_name),
          (const char *)sqlite3_column_text(st, 7));
   copy_s(out->parent_path, sizeof(out->parent_path),
@@ -2472,6 +2532,37 @@ static void bind_text(sqlite3_stmt *st, int idx, const char *s) {
   sqlite3_bind_text(st, idx, s ? s : "", -1, SQLITE_TRANSIENT);
 }
 
+static void hydrate_process_command(ProcSlot *p) {
+  sqlite3_stmt *st = NULL;
+  char start[32], birth[32];
+  if (!s_db || !p || !generation_bound(&p->generation)) return;
+  sqlite_u64_decimal(p->generation.process_start_key, start);
+  sqlite_u64_decimal(p->generation.creation_filetime_100ns, birth);
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT cmdline,cmdline_truncated_fields FROM process_cache WHERE "
+      "endpoint_id=? AND tenant_id=? AND pid=? AND process_start_key=? "
+      "AND process_creation_filetime_100ns=?;", -1, &st, NULL) != SQLITE_OK) {
+    set_error("prepare durable command hydration failed");
+    return;
+  }
+  bind_text(st, 1, p->endpoint_id); bind_text(st, 2, p->tenant_id);
+  sqlite3_bind_int64(st, 3, p->pid);
+  bind_text(st, 4, start); bind_text(st, 5, birth);
+  int rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) {
+    const char *fields = (const char *)sqlite3_column_text(st, 1);
+    const int exact = copy_s(p->cmdline, sizeof(p->cmdline),
+                             (const char *)sqlite3_column_text(st, 0));
+    copy_s(p->cmdline_truncated_fields, sizeof(p->cmdline_truncated_fields),
+           fields ? fields : "source.cmdline_quality_unknown");
+    if (!exact) source_field_list_append(p->cmdline_truncated_fields,
+        sizeof(p->cmdline_truncated_fields), "source.cmdline");
+  } else if (rc != SQLITE_DONE) {
+    set_error("read durable command hydration failed");
+  }
+  sqlite3_finalize(st);
+}
+
 /* Persist the same conservative late-parent repair used by the hot cache.
  * Every child row is revalidated against the process-tree interval at that
  * child's immutable creation time; PPID alone is never authority.  Parent
@@ -2606,6 +2697,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   char start_key[32], creation[32], parent_start_key[32], parent_creation[32];
   int parent_known;
   int preserve_stronger_identity = 0;
+  int replace_command = 1;
+  char command_fields[64];
   if (!s_db || !should_update_process_cache(r) ||
       !record_process_generation(r, &generation)) {
     /* Unknown PID-only metadata is never durable authority. It may remain in
@@ -2614,6 +2707,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
     return 0;
   }
   parent_known = record_parent_snapshot(r, &parent_snapshot);
+  command_record_provenance(r, command_fields);
   memset(&parent_generation, 0, sizeof(parent_generation));
   if (parent_known) {
     parent_generation.process_start_key = parent_snapshot.process_start_key;
@@ -2633,8 +2727,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   {
     sqlite3_stmt *identity_st = NULL;
     const char *identity_sql =
-        "SELECT identity_quality FROM process_cache WHERE endpoint_id=? AND pid=? "
-        "AND process_start_key=? AND process_creation_filetime_100ns=? LIMIT 1;";
+        "SELECT identity_quality,cmdline,cmdline_truncated_fields FROM process_cache WHERE endpoint_id=? AND pid=? "
+        "AND process_start_key=? AND process_creation_filetime_100ns=? AND tenant_id=? LIMIT 1;";
     if (sqlite3_prepare_v2(s_db, identity_sql, -1, &identity_st, NULL) !=
         SQLITE_OK) {
       set_error("prepare process_cache identity quality failed");
@@ -2644,12 +2738,21 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
     sqlite3_bind_int64(identity_st, 2, (sqlite3_int64)r->pid);
     bind_text(identity_st, 3, start_key);
     bind_text(identity_st, 4, creation);
-    if (sqlite3_step(identity_st) == SQLITE_ROW) {
+    bind_text(identity_st, 5, r->tenant_id);
+    int read_rc = sqlite3_step(identity_st);
+    if (read_rc == SQLITE_ROW) {
       const char *current_quality =
           (const char *)sqlite3_column_text(identity_st, 0);
       preserve_stronger_identity =
           identity_quality_rank(current_quality) >
           identity_quality_rank(r->identity_quality);
+      replace_command = command_fact_should_replace(
+          (const char *)sqlite3_column_text(identity_st, 1),
+          (const char *)sqlite3_column_text(identity_st, 2), r->cmdline, command_fields);
+    } else if (read_rc != SQLITE_DONE) {
+      set_error("read process_cache field quality failed");
+      sqlite3_finalize(identity_st);
+      return -1;
     }
     sqlite3_finalize(identity_st);
   }
@@ -2658,7 +2761,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "first_seen_ns,last_seen_ns,process_start_key,process_creation_filetime_100ns,"
       "process_generation_source,parent_process_start_key,parent_process_creation_filetime_100ns,"
       "parent_process_generation_source,username,domain,user_sid,logon_id,identity_source,"
-      "identity_quality,exe_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "identity_quality,exe_hash,cmdline_truncated_fields) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(endpoint_id,pid) DO UPDATE SET "
       "tenant_id=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
@@ -2674,7 +2777,11 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "THEN excluded.path WHEN excluded.path<>'' THEN excluded.path ELSE process_cache.path END,"
       "cmdline=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
-      "THEN excluded.cmdline WHEN excluded.cmdline<>'' THEN excluded.cmdline ELSE process_cache.cmdline END,"
+      "THEN excluded.cmdline WHEN ?26 THEN excluded.cmdline ELSE process_cache.cmdline END,"
+      "cmdline_truncated_fields=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
+      "THEN excluded.cmdline_truncated_fields WHEN ?26 THEN excluded.cmdline_truncated_fields "
+      "ELSE process_cache.cmdline_truncated_fields END,"
       "parent_name=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
@@ -2757,6 +2864,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 22, preserve_stronger_identity ? "" : r->identity_source);
   bind_text(st, 23, preserve_stronger_identity ? "" : r->identity_quality);
   bind_text(st, 24, r->exe_hash);
+  bind_text(st, 25, command_fields);
+  sqlite3_bind_int(st, 26, replace_command);
   int rc = sqlite3_step(st);
   if (rc != SQLITE_DONE) {
     set_error("upsert process_cache failed");
@@ -4283,7 +4392,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
       "parent_process_start_key TEXT,parent_process_creation_filetime_100ns TEXT,"
       "parent_process_generation_source TEXT,username TEXT,domain TEXT,user_sid TEXT,"
-      "logon_id TEXT,identity_source TEXT,identity_quality TEXT,exe_hash TEXT,"
+      "logon_id TEXT,identity_source TEXT,identity_quality TEXT,exe_hash TEXT,cmdline_truncated_fields TEXT,"
       "PRIMARY KEY(endpoint_id,pid));"
       "CREATE INDEX IF NOT EXISTS idx_process_cache_parent ON process_cache(endpoint_id,ppid);"
       "CREATE TABLE IF NOT EXISTS event_cache ("
@@ -5864,9 +5973,16 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
   return 0;
 }
 
-static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
+static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
                              const char *source, const ProcSlot *p) {
-  char ep[120], tn[160], nm[320], path[1200], cmd[1200], pn[320], pp[640];
+  char ep[120], tn[160], nm[320], path[1200], pn[320], pp[640], command_fields[192];
+  cJSON *command = cJSON_CreateString(p ? p->cmdline : "");
+  char *cmd = command ? cJSON_PrintUnformatted(command) : NULL;
+  cJSON_Delete(command);
+  if (!cmd) return 0;
+  const char *quality = !p || !p->cmdline[0] ? "missing" :
+      !command_quality_known(p) ?
+      "unknown" : p->cmdline_truncated_fields[0] ? "truncated" : "complete";
   char username[640], domain[640], user_sid[640], logon_id[160];
   char identity_source[96], identity_quality[96], exe_hash[160];
   char generation_start[32], generation_creation[32], generation_source[160];
@@ -5875,7 +5991,7 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(tn, sizeof(tn), p ? p->tenant_id : "");
   json_escape(nm, sizeof(nm), p ? p->name : "");
   json_escape(path, sizeof(path), p ? p->path : "");
-  json_escape(cmd, sizeof(cmd), p ? p->cmdline : "");
+  json_escape(command_fields, sizeof(command_fields), command_quality_known(p) ? p->cmdline_truncated_fields : "");
   json_escape(pn, sizeof(pn), p ? p->parent_name : "");
   json_escape(pp, sizeof(pp), p ? p->parent_path : "");
   json_escape(username, sizeof(username), p ? p->username : "");
@@ -5901,6 +6017,7 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
               p ? p->parent_process_generation_source : "");
   appendf(out, cap, off, "%s{\"source\":\"%s\",\"endpoint_id\":%s,\"tenant_id\":%s,"
                           "\"pid\":%u,\"ppid\":%u,\"name\":%s,\"path\":%s,\"cmdline\":%s,"
+                          "\"cmdline_quality\":\"%s\",\"cmdline_truncated_fields\":%s,"
                           "\"parent_name\":%s,\"parent_path\":%s,\"process_start_key\":\"%s\","
                           "\"process_creation_filetime_100ns\":\"%s\",\"process_generation_source\":%s,"
                           "\"parent_process_start_key\":\"%s\",\"parent_process_creation_filetime_100ns\":\"%s\","
@@ -5908,12 +6025,14 @@ static void append_proc_json(char *out, size_t cap, size_t *off, int *first,
                           "\"user_sid\":%s,\"logon_id\":%s,\"identity_source\":%s,"
                           "\"identity_quality\":%s,\"exe_hash\":%s,\"last_seen_ns\":%lld}",
           *first ? "" : ",", source ? source : "", ep, tn, p ? p->pid : 0u,
-          p ? p->ppid : 0u, nm, path, cmd, pn, pp, generation_start, generation_creation,
+          p ? p->ppid : 0u, nm, path, cmd, quality, command_fields, pn, pp, generation_start, generation_creation,
           generation_source, parent_generation_start, parent_generation_creation,
           parent_generation_source, username, domain, user_sid, logon_id,
           identity_source, identity_quality, exe_hash,
           p ? (long long)p->last_seen_ns : 0LL);
   *first = 0;
+  cJSON_free(cmd);
+  return *off < cap - 1u;
 }
 
 int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,
@@ -5932,7 +6051,7 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
         "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
         "process_start_key,process_creation_filetime_100ns,process_generation_source,"
         "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash "
+        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
         "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
     sqlite3_stmt *root_st = NULL;
     if (sqlite3_prepare_v2(s_db, root_sql, -1, &root_st, NULL) == SQLITE_OK) {
@@ -5954,15 +6073,16 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
   size_t off = 0;
   int first = 1;
   uint32_t children = 0;
+  int serialized = 1;
   appendf(out, cap, &off, "{\"pid\":%u,\"root\":", pid);
   if (root) {
     int only = 1;
-    append_proc_json(out, cap, &off, &only, root_source, root);
+    serialized = append_proc_json(out, cap, &off, &only, root_source, root);
   } else {
     appendf(out, cap, &off, "null");
   }
   appendf(out, cap, &off, ",\"children\":[");
-  for (size_t i = 0; i < EDR_EVIDENCE_PROC_SLOTS && children < 64u; i++) {
+  for (size_t i = 0; serialized && i < EDR_EVIDENCE_PROC_SLOTS && children < 64u; i++) {
     ProcSlot *p = &s_proc[i];
     if (!root || !generation_bound(&root->generation) || p->pid == 0u || p->ppid != pid ||
         !generation_equal(&p->parent_generation, &root->generation)) {
@@ -5971,16 +6091,16 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
     if (endpoint_id && endpoint_id[0] && p->endpoint_id[0] && strcmp(endpoint_id, p->endpoint_id) != 0) {
       continue;
     }
-    append_proc_json(out, cap, &off, &first, "memory", p);
+    serialized = append_proc_json(out, cap, &off, &first, "memory", p);
     children++;
   }
 #if defined(EDR_HAVE_SQLITE)
-  if (s_db && root && generation_bound(&root->generation) && root->endpoint_id[0] && children < 64u) {
+  if (serialized && s_db && root && generation_bound(&root->generation) && root->endpoint_id[0] && children < 64u) {
     const char *sql =
         "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
         "process_start_key,process_creation_filetime_100ns,process_generation_source,"
         "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash "
+        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
         "FROM process_cache WHERE endpoint_id=? AND ppid=? AND parent_process_start_key=? "
         "AND parent_process_creation_filetime_100ns=? ORDER BY last_seen_ns DESC LIMIT 64;";
     sqlite3_stmt *st = NULL;
@@ -5993,13 +6113,13 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
       sqlite3_bind_int64(st, 2, (sqlite3_int64)pid);
       sqlite3_bind_text(st, 3, parent_start, -1, SQLITE_TRANSIENT);
       sqlite3_bind_text(st, 4, parent_creation, -1, SQLITE_TRANSIENT);
-      while (sqlite3_step(st) == SQLITE_ROW && children < 64u) {
+      while (serialized && sqlite3_step(st) == SQLITE_ROW && children < 64u) {
         ProcSlot tmp;
         if (!sqlite_read_process_cache_row(st, &tmp) ||
             !generation_equal(&tmp.parent_generation, &root->generation)) {
           continue;
         }
-        append_proc_json(out, cap, &off, &first, "sqlite", &tmp);
+        serialized = append_proc_json(out, cap, &off, &first, "sqlite", &tmp);
         children++;
       }
       sqlite3_finalize(st);
@@ -6009,6 +6129,12 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
   appendf(out, cap, &off, "],\"child_count\":%u}", children);
   out[cap - 1u] = '\0';
   int found = root || children;
+  if (!serialized || off >= cap - 1u) {
+    out[0] = '\0';
+    set_error("process tree JSON allocation or output budget exhausted");
+    evidence_cache_unlock();
+    return -3;
+  }
   evidence_cache_unlock();
   return found ? 0 : -2;
 }
