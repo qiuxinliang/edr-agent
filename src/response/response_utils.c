@@ -76,6 +76,35 @@ int response_isolation_status_verified(const char *json, int expect_isolated) {
   return ok;
 }
 
+int response_isolation_observation_valid(const char *json) {
+  cJSON *root = json ? cJSON_ParseWithOpts(json, NULL, 1) : NULL;
+  if (!cJSON_IsObject(root)) { cJSON_Delete(root); return 0; }
+  int count = 0;
+  for (const cJSON *p = root->child; p; p = p->next) {
+    if (!p->string || (strcmp(p->string, "schema") && strcmp(p->string, "state") &&
+        strcmp(p->string, "restoration_verified") && strcmp(p->string, "reason"))) {
+      cJSON_Delete(root); return 0;
+    }
+    for (const cJSON *q = p->next; q; q = q->next) {
+      if (q->string && strcmp(p->string, q->string) == 0) { cJSON_Delete(root); return 0; }
+    }
+    count++;
+  }
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+  const cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
+  const cJSON *restored = cJSON_GetObjectItemCaseSensitive(root, "restoration_verified");
+  const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+  int ok = count == 4 && cJSON_IsString(schema) &&
+      strcmp(schema->valuestring, "edr.isolation.observation.v2") == 0 &&
+      cJSON_IsString(state) && cJSON_IsBool(restored) && cJSON_IsString(reason) &&
+      strlen(reason->valuestring) <= 160 &&
+      (strcmp(state->valuestring, "normal") == 0 ||
+       strcmp(state->valuestring, "isolated") == 0 || strcmp(state->valuestring, "unknown") == 0) &&
+      (!cJSON_IsTrue(restored) || strcmp(state->valuestring, "normal") == 0);
+  cJSON_Delete(root);
+  return ok;
+}
+
 int response_forensic_copy_one_file(const char *src, const char *dst) {
 #ifdef _WIN32
   return CopyFileA(src, dst, FALSE) ? 0 : -1;

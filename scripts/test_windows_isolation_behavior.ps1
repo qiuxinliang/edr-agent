@@ -81,6 +81,32 @@ function Reset-TestState {
 }
 try {
   Reset-TestState
+  $observation = Show-Observation | ConvertFrom-Json
+  Assert ($observation.schema -eq 'edr.isolation.observation.v2' -and $observation.state -eq 'normal') 'clean OS without prior isolation is normal'
+  Assert (-not $observation.restoration_verified -and $observation.reason -eq 'recovery_baseline_missing') 'missing baseline is diagnostic, never restore completion'
+  Assert (-not (Test-Path -LiteralPath $StatePath)) 'observation must not fabricate a journal'
+  Assert (-not (Show-Status | ConvertFrom-Json).enforcement_verified) 'legacy operation proof still requires the baseline'
+  Expect-Failure { Remove-Isolation } 'recovery_baseline_missing'
+  $script:profiles[0].DefaultOutboundAction = 'Block'
+  Assert ((Show-Observation | ConvertFrom-Json).state -eq 'unknown') 'partial or external outbound block is not normal'
+  Reset-TestState
+  $script:profiles[0].Enabled = 'False'
+  Assert ((Show-Observation | ConvertFrom-Json).state -eq 'unknown') 'disabled firewall must not be verified by this observer'
+  Reset-TestState
+  $script:profiles[0].Name = 'Private'
+  Assert ((Show-Observation | ConvertFrom-Json).state -eq 'unknown') 'duplicate profile must not hide a missing domain profile'
+  Reset-TestState
+  $script:rules[0].DisplayName = "$Prefix leftover"
+  Assert ((Show-Observation | ConvertFrom-Json).state -eq 'unknown') 'owned residual rule is not normal'
+  Reset-TestState
+  foreach ($p in $script:profiles) { $p.DefaultOutboundAction = 'Block' }
+  Save-State ([pscustomobject]@{schema='edr.isolation.v3';phase='restored';profiles=$script:profiles;disabled_rules=@()})
+  $observation = Show-Observation | ConvertFrom-Json
+  Assert ($observation.state -eq 'normal' -and $observation.restoration_verified) 'legitimate blocked pre-isolation policy retains existing restoration semantics'
+  Reset-TestState
+  Set-Content -LiteralPath $StatePath -Value '{invalid' -Encoding UTF8
+  Expect-Failure { Show-Observation } '.'
+  Reset-TestState
   Enable-Isolation
   $first = Get-Content -LiteralPath $StatePath -Raw
   $isolationState = Read-State
@@ -90,6 +116,7 @@ try {
     Assert ($rule.Count -eq 1 -and $rule[0].Enabled -eq 'True' -and $rule[0].Service -eq 'Dhcp') "missing constrained DHCP preservation rule: $name"
   }
   Assert (Test-Isolation (Read-State)) 'isolation must verify actual rules'
+  Assert ((Show-Observation | ConvertFrom-Json).state -eq 'isolated') 'current isolated enforcement stays visible'
   Assert (($script:rules | Where-Object Name -eq 'existing-allow').Enabled -eq 'False') 'explicit allow must be disabled'
   Enable-Isolation
   Assert ((Get-Content -LiteralPath $StatePath -Raw) -ceq $first) 'repeat enable must preserve initial baseline byte-for-byte'
@@ -100,6 +127,13 @@ try {
   Remove-Isolation
   $status = Show-Status | ConvertFrom-Json
   Assert ($status.restored -and $status.enforcement_verified -and -not $status.isolated) 'restore must be verified and idempotent'
+  $restoredJournal = Get-Content -LiteralPath $StatePath -Raw
+  $observation = Show-Observation | ConvertFrom-Json
+  Assert ($observation.state -eq 'normal' -and $observation.restoration_verified) 'restoration proof remains separate from current normal'
+  Assert ((Get-Content -LiteralPath $StatePath -Raw) -ceq $restoredJournal) 'read-only observation preserves baseline'
+  ($script:rules | Where-Object Name -eq 'existing-allow').Enabled = 'False'
+  $observation = Show-Observation | ConvertFrom-Json
+  Assert ($observation.state -eq 'normal' -and -not $observation.restoration_verified -and $observation.reason -eq 'restoration_unverified') 'baseline drift remains diagnostic rather than inventing current isolation'
   Reset-TestState
   Enable-Isolation
   $script:reachable = $false

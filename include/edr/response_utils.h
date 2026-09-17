@@ -27,6 +27,8 @@ int response_forensic_build_collector_paths(const char *outdir, char separator,
 int response_forensic_external_failure_must_not_fallback(int collector_rc);
 /* Only a structured, non-contradictory OS-effect receipt is success. */
 int response_isolation_status_verified(const char *json, int expect_isolated);
+/* Valid observation includes unknown; it is never a restore completion proof. */
+int response_isolation_observation_valid(const char *json);
 typedef struct EdrResponseFileSecurity {
   char dacl[8192];
   uint32_t attributes;

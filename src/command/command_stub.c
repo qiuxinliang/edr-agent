@@ -1293,7 +1293,7 @@ static int isolate_run(int enable, const char *cmd_id) {
 /* Status is a second signal from the enforcement backend, not a restatement
  * of the agent stamp. Built-in scripts are required to report an active rule
  * set; custom hooks may provide EDR_ISOLATE_STATUS_HOOK for the same check. */
-static int isolate_run_status(char *evidence, size_t evidence_cap) {
+static int isolate_run_status(char *evidence, size_t evidence_cap, int observation) {
   if (!evidence || evidence_cap < 2u) return -1;
   evidence[0] = '\0';
   const char *hook = getenv("EDR_ISOLATE_STATUS_HOOK");
@@ -1307,8 +1307,9 @@ static int isolate_run_status(char *evidence, size_t evidence_cap) {
     formatted = snprintf(cmd, sizeof(cmd), "%s > \"%s\" 2>&1", hook, outpath);
   } else {
 #ifdef _WIN32
-    formatted = snprintf(cmd, sizeof(cmd), "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\" -Action Status > \"%s\" 2>&1", script, outpath);
+    formatted = snprintf(cmd, sizeof(cmd), "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\" -Action %s > \"%s\" 2>&1", script, observation ? "Observe" : "Status", outpath);
 #else
+    (void)observation;
     formatted = snprintf(cmd, sizeof(cmd), "/bin/bash \"%s\" status > \"%s\" 2>&1", script, outpath);
 #endif
   }
@@ -1365,7 +1366,7 @@ static int do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   isolate_autofill_allowlist();
   int rc = isolate_run(1, cmd_id);
   char evidence[2048];
-  if (rc != 0 || isolate_run_status(evidence, sizeof(evidence)) != 0 ||
+  if (rc != 0 || isolate_run_status(evidence, sizeof(evidence), 0) != 0 ||
       !isolate_status_reports_active(evidence)) {
     /* Keep the intent on uncertainty; the OS script retains its recovery
      * baseline. A failed command may have partially changed enforcement. */
@@ -1397,7 +1398,7 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   int rc = isolate_run(0, cmd_id);
 #ifdef _WIN32
   char evidence[2048];
-  if (rc == 0 && (isolate_run_status(evidence, sizeof(evidence)) != 0 ||
+  if (rc == 0 && (isolate_run_status(evidence, sizeof(evidence), 0) != 0 ||
                  !response_isolation_status_verified(evidence, 0))) rc = -1;
 #endif
   if (rc != 0) {
@@ -1425,13 +1426,14 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
 
 static void do_isolate_status(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   char evidence[2048];
-  if (isolate_stamp_only_mode() || isolate_run_status(evidence, sizeof(evidence)) != 0) {
+  if (isolate_stamp_only_mode() || isolate_run_status(evidence, sizeof(evidence), 1) != 0) {
     s_exec_fail++;
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation state unknown; OS evidence unavailable");
     return;
   }
 #ifdef _WIN32
-  if (!response_isolation_status_verified(evidence, 1) &&
+  if (!response_isolation_observation_valid(evidence) &&
+      !response_isolation_status_verified(evidence, 1) &&
       !response_isolation_status_verified(evidence, 0)) {
     s_exec_fail++;
     soar_emit(cmd_id, sm, EdrCmdExecFailed, 5, "isolation/restoration state not verified");

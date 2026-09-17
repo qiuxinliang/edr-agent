@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 param(
-  [ValidateSet("Enable", "Remove", "Status")]
+  [ValidateSet("Enable", "Remove", "Status", "Observe")]
   [string]$Action = "Enable"
 )
 
@@ -269,6 +269,29 @@ function Show-Status {
   [ordered]@{ schema='edr.isolation.status.v1'; isolated=[bool]$isolated; restored=[bool]$restored; enforcement_verified=[bool]($isolated -or $restored); management_reachable=$managementReachable } | ConvertTo-Json -Compress
 }
 
+function Show-Observation {
+  # Current enforcement and completion of a historical restore are different
+  # facts. A fresh installation need not have a recovery journal to be normal.
+  # Mutating Enable/Remove still use Show-Status and its strict v1 proof.
+  $state = Read-State
+  $restored = $null -ne $state -and $state.phase -eq 'restored' -and (Test-Restored $state)
+  $observed = 'unknown'
+  $reason = 'os_state_unverified'
+  $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+  $normal = $profiles.Count -eq 3 -and (@($profiles.Name | Sort-Object -Unique) -join ',') -eq 'Domain,Private,Public'
+  foreach ($p in $profiles) {
+    if ([string]$p.Enabled -ne 'True' -or [string]$p.DefaultOutboundAction -ne 'Allow') { $normal = $false }
+  }
+  if ($restored -or ($normal -and @(Get-OwnedRules).Count -eq 0)) {
+    $observed = 'normal'
+    $reason = if ($restored) { '' } elseif ($null -eq $state) { 'recovery_baseline_missing' } else { 'restoration_unverified' }
+  } elseif (Test-Isolation $state) {
+    $observed = 'isolated'
+    $reason = ''
+  }
+  [ordered]@{ schema='edr.isolation.observation.v2'; state=$observed; restoration_verified=[bool]($observed -eq 'normal' -and $restored); reason=$reason } | ConvertTo-Json -Compress
+}
+
 $mutex = New-Object Threading.Mutex($false, 'Global\FDSecurity.Isolation')
 $locked = $false
 try {
@@ -278,8 +301,9 @@ try {
     'Enable' { Enable-Isolation }
     'Remove' { Remove-Isolation }
     'Status' { }
+    'Observe' { }
   }
-  Show-Status
+  if ($Action -eq 'Observe') { Show-Observation } else { Show-Status }
 } finally {
   if ($locked) { $mutex.ReleaseMutex() }
   $mutex.Dispose()

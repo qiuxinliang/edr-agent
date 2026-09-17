@@ -58,6 +58,24 @@ static void test_baseline_copy_budget(void) {
 
 int main(void) {
   test_baseline_copy_budget();
+  const char *normal_observation = "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":false,\"reason\":\"recovery_baseline_missing\"}";
+  const char *unknown_observation = "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"unknown\",\"restoration_verified\":false,\"reason\":\"os_state_unverified\"}";
+  require_true(response_isolation_observation_valid(normal_observation), "normal observation does not require historical restoration");
+  require_true(response_isolation_observation_valid(unknown_observation), "unknown is a valid observation, not verified enforcement");
+  require_true(response_isolation_observation_valid("{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"isolated\",\"restoration_verified\":false,\"reason\":\"\"}"), "accept isolated observation");
+  require_true(response_isolation_observation_valid("{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":true,\"reason\":\"\"}"), "accept restored observation");
+  require_true(!response_isolation_status_verified(normal_observation, 0), "normal observation must never satisfy a restore completion check");
+  const char *bad_observations[] = {
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"isolated\",\"restoration_verified\":true,\"reason\":\"\"}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"unknown\",\"restoration_verified\":true,\"reason\":\"\"}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"state\":\"normal\",\"restoration_verified\":false,\"reason\":\"\"}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":\"false\",\"reason\":\"\"}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":false,\"reason\":null}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":false,\"reason\":\"\",\"extra\":1}",
+    "{\"schema\":\"edr.isolation.observation.v2\",\"state\":\"normal\",\"restoration_verified\":false,\"reason\":\"\"} noise"
+  };
+  for (size_t i = 0; i < sizeof(bad_observations)/sizeof(bad_observations[0]); ++i)
+    require_true(!response_isolation_observation_valid(bad_observations[i]), "reject inconsistent or malformed observations");
   const char *active = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true}";
   const char *restored = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":false,\"restored\":true,\"enforcement_verified\":true}";
   const char *active_with_management = "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true,\"management_reachable\":true}";
