@@ -234,6 +234,27 @@ static void test_sequence(unsigned version, size_t width) {
   make_event(&read, 15u, version, width, object, key, NULL);
   make_event(&close, 14u, version, width, object, key, NULL);
 
+  /* Fill the production 4096-slot object cache using real typed metadata.
+   * Evict a different object's Close after the target's earlier Create;
+   * the complete target Read must still cross the publication boundary. */
+  reset("unrelated_object_eviction_preserves_read");
+  Fixture pressure;
+  make_event(&pressure, 14u, version, width, object + 1u, key + 1u, NULL);
+  feed(&pressure, 400u);
+  feed(&create, 200u);
+  for (unsigned i = 2u; i < 4096u; ++i) {
+    make_event(&pressure, 12u, version, width, object + i, 0u, new_name);
+    feed(&pressure, 500u + i);
+  }
+  make_event(&pressure, 12u, version, width, object + 5000u, 0u, new_name);
+  feed(&pressure, 9000u);
+  expect_read(&read, 10000u, old_path, key, object,
+              "file_read_binding_quality=etw_fileobject_create");
+  begin_case("unidentified_boundary_still_rejects_read");
+  make_event(&pressure, 14u, version, width, 0u, 0u, NULL);
+  feed(&pressure, 11000u);
+  expect_rejected(&read, 11500u, EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+
   reset("no_namecreate_read");
   feed(&create, 100u);
   assert(!bus.published); /* Open metadata is not a Read. */

@@ -286,6 +286,8 @@ static SRWLOCK s_file_key_cache_lock = SRWLOCK_INIT;
 /* Uses the same lock and joined-session reset as the FileKey cache. */
 static EdrFileObjectBinding s_file_object_cache[EDR_COLLECTOR_FILE_OBJECT_CACHE];
 static EdrFileObjectHistory s_file_object_history;
+/* Protected by s_file_key_cache_lock; logarithmically sampled local diagnostics. */
+static uint64_t s_file_io_binding_failures;
 static EdrFileReadMetadataGate s_file_read_metadata_gate;
 static EdrFileReadMetadataCoalesceEntry
     s_file_read_metadata_coalesce[EDR_FILE_READ_METADATA_COALESCE_SLOTS];
@@ -2297,6 +2299,7 @@ static void edr_collector_file_key_cache_reset(void) {
   AcquireSRWLockExclusive(&s_file_key_cache_lock);
   memset(s_file_object_cache, 0, sizeof(s_file_object_cache));
   memset(&s_file_object_history, 0, sizeof(s_file_object_history));
+  s_file_io_binding_failures = 0u;
   memset(s_file_key_cache, 0, sizeof(s_file_key_cache));
   s_file_key_cache_next = 0u;
   s_file_key_session_epoch++;
@@ -3237,8 +3240,9 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
     if (!file_object) {
       /* An unidentifiable boundary makes older object lifetimes unsafe.
        * Retain the watermark so delayed metadata cannot resurrect them. */
-      if (event_ns > s_file_object_history.discarded_through)
-        s_file_object_history.discarded_through = event_ns;
+      edr_file_object_binding_unknown_boundary(
+          s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE,
+          &s_file_object_history, event_ns);
     } else if (is_create) {
       edr_file_object_binding_open(s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE,
                                   &s_file_object_history, file_object, event_ns,
@@ -3400,6 +3404,9 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   int resolved = 0;
   int have_problem = 0;
   int key_expired = 0;
+  EdrFileObjectResolution object_resolution = {0};
+  EdrFileObjectHistory object_history = {0};
+  uint64_t diagnostic_ordinal = 0u;
   char problem_path[EDR_BR_STR_LONG];
   const char *problem_reason = NULL;
   if (out_file_key) *out_file_key = 0u;
@@ -3503,9 +3510,9 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     resolved = 1;
   }
   if (read_pid && file_object) {
-    const char *object_path = edr_file_object_binding_resolve(
+    const char *object_path = edr_file_object_binding_resolve_detail(
         s_file_object_cache, EDR_COLLECTOR_FILE_OBJECT_CACHE, &s_file_object_history,
-        file_object, event_ns);
+        file_object, event_ns, &object_resolution);
     int conflict = 0;
     const char *selected = edr_file_mutation_binding_select(
         resolved ? path_out : NULL, object_path, have_problem, key_expired, &conflict);
@@ -3531,6 +3538,9 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
                                : "file_object_history_expired";
     }
   }
+  if (!resolved) {
+    object_history = s_file_object_history;
+  }
   ReleaseSRWLockExclusive(&s_file_key_cache_lock);
   if (!resolved && read_pid &&
       edr_kernel_file_mutation_path_descriptor(descriptor)) {
@@ -3544,6 +3554,33 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     }
   }
   if (!resolved) {
+    /* Count final failures only; successful mutation-path fallback must not
+     * consume the first/power-of-two diagnostic samples. */
+    AcquireSRWLockExclusive(&s_file_key_cache_lock);
+    diagnostic_ordinal = ++s_file_io_binding_failures;
+    ReleaseSRWLockExclusive(&s_file_key_cache_lock);
+    /* Keep diagnostic subreasons local: the durable source-only contract is
+     * unchanged. Snapshot under the cache lock above, print outside it. The
+     * last eviction is context, NOT proof it caused this event's rejection. */
+    if (diagnostic_ordinal <= 3u ||
+        (diagnostic_ordinal & (diagnostic_ordinal - 1u)) == 0u) {
+      fprintf(stderr,
+          "[collector] file_binding_unresolved count=%llu event_id=%u pid=%lu "
+          "event_ns=%llu session_epoch=%llu file_key=0x%llx file_object=0x%llx "
+          "key_name_ns=%llu key_rejected=%d object_status=%s opened_at=%llu closed_at=%llu "
+          "admission_watermark=%llu evictions=%llu last_evicted_object=0x%llx last_evicted_at=%llu\n",
+          (unsigned long long)diagnostic_ordinal, (unsigned)descriptor->Id,
+          (unsigned long)read_pid, (unsigned long long)event_ns,
+          (unsigned long long)session_epoch, (unsigned long long)file_key,
+          (unsigned long long)file_object, (unsigned long long)best_name_event_ns,
+          have_problem, edr_file_object_resolution_name(object_resolution.status),
+          (unsigned long long)object_resolution.opened_at,
+          (unsigned long long)object_resolution.closed_at,
+          (unsigned long long)object_history.discarded_through,
+          (unsigned long long)object_history.evictions,
+          (unsigned long long)object_history.last_evicted_object,
+          (unsigned long long)object_history.last_evicted_at);
+    }
     if (have_problem) {
       snprintf(path_out, path_cap, "%s", problem_path);
       if (out_gate_reason) *out_gate_reason = problem_reason;
