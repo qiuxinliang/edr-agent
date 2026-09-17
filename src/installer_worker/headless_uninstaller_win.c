@@ -862,112 +862,8 @@ static int edr_native_run_process(const wchar_t *executable, const wchar_t *argu
   return (int)exit_code;
 }
 
-static int edr_native_disable_service_recovery(SC_HANDLE service) {
-  SERVICE_FAILURE_ACTIONSW no_actions;
-  BOOL failure_flag = FALSE;
-  ZeroMemory(&no_actions, sizeof(no_actions));
-  if (!ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &no_actions)) return 0;
-  return ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-                               &failure_flag) != FALSE;
-}
+#include "native_service_remove.h"
 
-static int edr_native_restore_service_and_start(const wchar_t *service_name) {
-  SC_HANDLE manager;
-  SC_HANDLE service;
-  SERVICE_FAILURE_ACTIONSW recovery;
-  SC_ACTION action;
-  SERVICE_FAILURE_ACTIONS_FLAG flag;
-  int ok = 0;
-
-  manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-  if (manager == NULL) return 0;
-  service = OpenServiceW(manager, service_name,
-                         SERVICE_CHANGE_CONFIG | SERVICE_START);
-  if (service == NULL) {
-    CloseServiceHandle(manager);
-    return 0;
-  }
-  ZeroMemory(&action, sizeof(action));
-  action.Type = SC_ACTION_RESTART;
-  action.Delay = 60000;
-  ZeroMemory(&recovery, sizeof(recovery));
-  recovery.dwResetPeriod = 86400;
-  recovery.cActions = 1;
-  recovery.lpsaActions = &action;
-  flag.fFailureActionsOnNonCrashFailures = TRUE;
-  if (ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &recovery) &&
-      ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag) &&
-      StartServiceW(service, 0, NULL)) {
-    ok = 1;
-  }
-  CloseServiceHandle(service);
-  CloseServiceHandle(manager);
-  return ok;
-}
-
-static int edr_native_stop_delete_service(const wchar_t *service_name,
-                                          DWORD *service_pid_out) {
-  SC_HANDLE manager;
-  SC_HANDLE service;
-  SERVICE_STATUS_PROCESS status;
-  DWORD bytes = 0;
-  DWORD started = GetTickCount();
-  int deleted = 0;
-
-  if (service_pid_out) *service_pid_out = 0;
-  if (!service_name || !service_name[0]) return 1;
-  manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-  if (manager == NULL) return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST;
-  service = OpenServiceW(manager, service_name,
-                         SERVICE_QUERY_STATUS | SERVICE_STOP |
-                             SERVICE_CHANGE_CONFIG | DELETE);
-  if (service == NULL) {
-    DWORD error = GetLastError();
-    CloseServiceHandle(manager);
-    return error == ERROR_SERVICE_DOES_NOT_EXIST;
-  }
-  if (!edr_native_disable_service_recovery(service)) goto cleanup;
-  if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-                            (LPBYTE)&status, sizeof(status), &bytes)) goto cleanup;
-  if (service_pid_out) *service_pid_out = status.dwProcessId;
-  if (status.dwCurrentState != SERVICE_STOPPED) {
-    SERVICE_STATUS ignored;
-    ControlService(service, SERVICE_CONTROL_STOP, &ignored);
-    do {
-      Sleep(100);
-      if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-                                (LPBYTE)&status, sizeof(status), &bytes)) goto cleanup;
-      if (GetTickCount() - started > 30000) goto cleanup;
-    } while (status.dwCurrentState != SERVICE_STOPPED);
-  }
-  if (!DeleteService(service)) goto cleanup;
-  deleted = 1;
-cleanup:
-  CloseServiceHandle(service);
-  CloseServiceHandle(manager);
-  if (!deleted) {
-    edr_native_restore_service_and_start(service_name);
-    return 0;
-  }
-  started = GetTickCount();
-  for (;;) {
-    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (manager == NULL) return -1;
-    service = OpenServiceW(manager, service_name, SERVICE_QUERY_STATUS);
-    if (service == NULL) {
-      DWORD error = GetLastError();
-      CloseServiceHandle(manager);
-      if (error == ERROR_SERVICE_DOES_NOT_EXIST) return 1;
-      if (error != ERROR_SERVICE_MARKED_FOR_DELETE || GetTickCount() - started > 30000) return -1;
-      Sleep(100);
-      continue;
-    }
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
-    if (GetTickCount() - started > 30000) return -1;
-    Sleep(100);
-  }
-}
 
 static int edr_native_delete_task_names(const wchar_t *const *task_names,
                                         size_t task_count) {
@@ -1346,12 +1242,15 @@ static int edr_native_cleanup_stale_finalizers(const wchar_t *state_dir) {
   return 1;
 }
 
-static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid) {
+static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid,
+                                  int require_same_image) {
   wchar_t sensor[MAX_PATH_LONG];
   wchar_t canonical_sensor[MAX_PATH_LONG];
   HANDLE snapshot;
   PROCESSENTRY32W entry;
   DWORD started = GetTickCount();
+
+  if (require_same_image && !target_pid) return ERROR_INVALID_PARAMETER;
 
   if (!join_path(sensor, sizeof(sensor) / sizeof(sensor[0]), install_dir, L"FDSensor.exe") ||
       !edr_finalizer_canonical_path(sensor, canonical_sensor,
@@ -1406,7 +1305,7 @@ static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid) 
     CloseHandle(identity);
     if (_wcsicmp(canonical_process, canonical_sensor) != 0) {
       CloseHandle(process);
-      return ERROR_SUCCESS;
+      return require_same_image ? ERROR_INVALID_DATA : ERROR_SUCCESS;
     }
     /* Request termination only after the grace period and exact image-path
      * validation. Keeping the synchronize handle open pins process identity,
@@ -1417,11 +1316,18 @@ static int edr_native_stop_sensor(const wchar_t *install_dir, DWORD target_pid) 
       CloseHandle(process);
       return (int)error;
     }
-    if (!TerminateProcess(terminator, ERROR_CANCELLED) ||
-        WaitForSingleObject(terminator, 5000) != WAIT_OBJECT_0) {
+    if (!TerminateProcess(terminator, ERROR_CANCELLED)) {
+      DWORD error = edr_finalizer_last_error();
       CloseHandle(terminator);
       CloseHandle(process);
-      return ERROR_TIMEOUT;
+      return (int)error;
+    }
+    wait_result = WaitForSingleObject(terminator, 5000);
+    if (wait_result != WAIT_OBJECT_0) {
+      DWORD error = wait_result == WAIT_TIMEOUT ? ERROR_TIMEOUT : edr_finalizer_last_error();
+      CloseHandle(terminator);
+      CloseHandle(process);
+      return (int)error;
     }
     CloseHandle(terminator);
     CloseHandle(process);
@@ -1753,7 +1659,8 @@ static int edr_native_validate_certificate_identity(const wchar_t *install_dir,
 
 static void edr_native_write_failure_receipt(const wchar_t *self_path,
                                              const char *failure_stage, int error,
-                                             const wchar_t *failure_path) {
+                                             const wchar_t *failure_path,
+                                             const EdrNativeServiceRemoval *service) {
   wchar_t receipt[MAX_PATH_LONG];
   wchar_t temporary[MAX_PATH_LONG];
   wchar_t directory[MAX_PATH_LONG];
@@ -1763,7 +1670,7 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path,
   HANDLE file = INVALID_HANDLE_VALUE;
   char *content = NULL;
   char *path_utf8 = NULL;
-  SIZE_T content_capacity = 128;
+  SIZE_T content_capacity = 512;
   int path_utf8_count = 0;
   int written;
   DWORD bytes_written = 0;
@@ -1817,6 +1724,17 @@ static void edr_native_write_failure_receipt(const wchar_t *self_path,
                             failure_stage, error, path_utf8)
                 : _snprintf(content, content_capacity,
                             "stage=%s\nerror=%d\n", failure_stage, error);
+  if (service && written > 0 && (SIZE_T)written < content_capacity) {
+    int extra = _snprintf(content + written, content_capacity - (SIZE_T)written,
+        "service_pid=%lu\nservice_state=%lu\nservice_checkpoint=%lu\nservice_wait_hint=%lu\n"
+        "service_deletion_committed=%d\nrecovery_attempted=%d\nrecovery_error=%lu\n",
+        (unsigned long)service->pid, (unsigned long)service->status.dwCurrentState,
+        (unsigned long)service->status.dwCheckPoint, (unsigned long)service->status.dwWaitHint,
+        service->deletion_committed, service->recovery_attempted,
+        (unsigned long)service->recovery_error);
+    if (extra < 0 || (SIZE_T)extra >= content_capacity - (SIZE_T)written) written = -1;
+    else written += extra;
+  }
   if (written > 0 && (SIZE_T)written < content_capacity &&
       WriteFile(file, content, (DWORD)written, &bytes_written, NULL) &&
       bytes_written == (DWORD)written) {
@@ -2196,15 +2114,13 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   wchar_t certificate_store[64];
   DWORD self_length;
   int result = ERROR_GEN_FAILURE;
-  int service_touched = 0;
-  int service_deleted = 0;
+  EdrNativeServiceRemoval service_removal = {0};
   int remote_requested = 0;
   int local_handoff = 0;
   int certificate_configured = 0;
   int handoff_acknowledged = 0;
   int self_delete_attempted = 0;
   DWORD self_delete_error = ERROR_SUCCESS;
-  DWORD service_pid = 0;
   const char *failure_stage = "preflight";
   const char *attestation_failure_stage = "attestation";
   DWORD parent_pid = 0;
@@ -2305,24 +2221,14 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     result = ERROR_ACCESS_DENIED;
     goto recovery;
   }
-  {
-    int service_result;
-    failure_stage = "delete-service";
-    service_touched = 1;
-    service_result = edr_native_stop_delete_service(service_name, &service_pid);
-    if (service_result < 0) {
-      service_deleted = 1;
-      result = ERROR_TIMEOUT;
-      goto cleanup;
-    }
-    if (service_result == 0) {
-      result = ERROR_SERVICE_NOT_ACTIVE;
-      goto recovery;
-    }
+  result = (int)edr_native_stop_delete_service(service_name, install_dir,
+                                               &service_removal, edr_native_stop_sensor);
+  if (result != ERROR_SUCCESS) {
+    failure_stage = service_removal.stage;
+    goto recovery;
   }
-  service_deleted = 1;
   failure_stage = "stop-sensor";
-  result = edr_native_stop_sensor(install_dir, service_pid);
+  result = edr_native_stop_sensor(install_dir, service_removal.pid, 0);
   if (result != ERROR_SUCCESS) goto cleanup;
   failure_stage = "etw-cleanup";
   result = edr_native_run_etw_cleanup(install_dir);
@@ -2368,7 +2274,7 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
     } else {
       self_delete_error = deferred_result;
       edr_native_write_failure_receipt(self_path, "self-delete-schedule",
-                                       (int)self_delete_error, NULL);
+                                       (int)self_delete_error, NULL, NULL);
     }
   }
   if (local_handoff) {
@@ -2386,8 +2292,9 @@ static int edr_native_finalizer(int argc, wchar_t **argv) {
   }
   goto cleanup;
 recovery:
-  if (service_touched && !service_deleted) {
-    edr_native_restore_service_and_start(service_name);
+  if (service_removal.recovery_changed && !service_removal.deletion_committed) {
+    service_removal.recovery_attempted = 1;
+    service_removal.recovery_error = edr_native_restore_service_and_start(service_name, &service_removal);
   }
 cleanup:
   if (!handoff_acknowledged && handoff_pipe != INVALID_HANDLE_VALUE) {
@@ -2403,7 +2310,8 @@ cleanup:
                                      (DWORD)(sizeof(self_path) / sizeof(self_path[0])));
     if (self_length && self_length < sizeof(self_path) / sizeof(self_path[0])) {
       if (result != ERROR_SUCCESS) {
-        edr_native_write_failure_receipt(self_path, failure_stage, result, failure_path);
+        edr_native_write_failure_receipt(self_path, failure_stage, result, failure_path,
+                                         &service_removal);
       }
       if (!self_delete_attempted) (void)edr_finalizer_schedule_self_delete(self_path);
     }
@@ -2411,6 +2319,7 @@ cleanup:
   if (handoff_pipe != INVALID_HANDLE_VALUE) CloseHandle(handoff_pipe);
   if (parent_handle) CloseHandle(parent_handle);
   if (failure_path) HeapFree(GetProcessHeap(), 0, failure_path);
+  free(service_removal.previous_actions);
   SecureZeroMemory(commit_frame, sizeof(commit_frame));
   SecureZeroMemory(token, sizeof(token));
   return result;

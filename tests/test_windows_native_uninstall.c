@@ -11,6 +11,8 @@
 #include "edr/windows_spawn.h"
 #include "edr/windows_spawn_lock.h"
 
+int edr_test_native_service_removal(void);
+
 static int edr_finalizer_secure_directory(const wchar_t *path) {
   SECURITY_ATTRIBUTES security;
   PSECURITY_DESCRIPTOR descriptor = NULL;
@@ -74,6 +76,26 @@ static int edr_test_parent_delivery_window(void) {
   if (running) CloseHandle(running);
   if (!ok) fprintf(stderr, "parent delivery window contract failed\n");
   return ok;
+}
+
+static int edr_test_strict_sensor_identity(const wchar_t *root) {
+  wchar_t sensor[MAX_PATH_LONG];
+  HANDLE file;
+  int result;
+  if (!join_path(sensor, sizeof(sensor) / sizeof(sensor[0]), root, L"FDSensor.exe")) return 0;
+  file = CreateFileW(sensor, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+  if (file == INVALID_HANDLE_VALUE) return 0;
+  CloseHandle(file);
+  /* The fixture image is not this process. Even a live PID must never be
+   * terminated, or reported as a successful strict stop, on path mismatch. */
+  result = edr_native_stop_sensor(root, GetCurrentProcessId(), 1);
+  if (!DeleteFileW(sensor)) return 0;
+  if (result != ERROR_INVALID_DATA) {
+    fprintf(stderr, "strict sensor identity returned %d\n", result);
+    return 0;
+  }
+  return 1;
 }
 
 static int edr_test_attestation_retry_policy(void) {
@@ -244,6 +266,7 @@ static int edr_test_failure_receipt_replaces_open_previous(const wchar_t *root) 
   DWORD bytes_read = 0;
   DWORD thread_exit = ERROR_GEN_FAILURE;
   char content[512];
+  EdrNativeServiceRemoval service = {0};
   int ok = 0;
 
   ZeroMemory(&delayed_close, sizeof(delayed_close));
@@ -256,7 +279,7 @@ static int edr_test_failure_receipt_replaces_open_previous(const wchar_t *root) 
                  root, L"current-failure.dll")) {
     goto cleanup;
   }
-  edr_native_write_failure_receipt(self_path, "previous", ERROR_GEN_FAILURE, NULL);
+  edr_native_write_failure_receipt(self_path, "previous", ERROR_GEN_FAILURE, NULL, NULL);
   receipt = CreateFileW(receipt_path, GENERIC_READ,
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -267,8 +290,14 @@ static int edr_test_failure_receipt_replaces_open_previous(const wchar_t *root) 
                               &delayed_close, 0, NULL);
   if (!close_thread) goto cleanup;
   receipt = INVALID_HANDLE_VALUE;
+  service.pid = 708;
+  service.status.dwCurrentState = SERVICE_STOP_PENDING;
+  service.status.dwCheckPoint = 1;
+  service.status.dwWaitHint = 30000;
+  service.recovery_attempted = 1;
+  service.recovery_error = ERROR_SERVICE_ALREADY_RUNNING;
   edr_native_write_failure_receipt(self_path, "remove-install-root",
-                                   ERROR_ACCESS_DENIED, failure_path);
+                                   ERROR_ACCESS_DENIED, failure_path, &service);
   if (WaitForSingleObject(close_thread, 5000) != WAIT_OBJECT_0 ||
       !GetExitCodeThread(close_thread, &thread_exit) ||
       thread_exit != ERROR_SUCCESS) {
@@ -284,6 +313,10 @@ static int edr_test_failure_receipt_replaces_open_previous(const wchar_t *root) 
       !bytes_read ||
       !strstr(content, "stage=remove-install-root") ||
       !strstr(content, "error=5") ||
+      !strstr(content, "service_pid=708\n") ||
+      !strstr(content, "service_state=3\n") ||
+      !strstr(content, "recovery_attempted=1\n") ||
+      !strstr(content, "recovery_error=1056\n") ||
       !strstr(content, "current-failure.dll")) {
     goto cleanup;
   }
@@ -980,6 +1013,9 @@ static int edr_finalizer_foundation_self_test(void) {
   }
   failure_stage = "parent-delivery-window";
   if (!edr_test_parent_delivery_window()) goto cleanup;
+  failure_stage = "service-removal-state-machine";
+  if (!edr_test_native_service_removal()) goto cleanup;
+  if (edr_native_stop_sensor(L"unused", 0, 1) != ERROR_INVALID_PARAMETER) goto cleanup;
   failure_stage = "attestation-retry-policy";
   if (!edr_test_attestation_retry_policy()) goto cleanup;
   failure_stage = "local-handoff-marker";
@@ -1036,6 +1072,8 @@ static int edr_finalizer_foundation_self_test(void) {
       !edr_finalizer_copy_verified(source, target)) {
     goto cleanup;
   }
+  failure_stage = "strict-sensor-identity";
+  if (!edr_test_strict_sensor_identity(root)) goto cleanup;
   failure_stage = "transient-locked-delete";
   if (!edr_test_transient_locked_delete(root)) goto cleanup;
   failure_stage = "transient-mapped-image-delete";

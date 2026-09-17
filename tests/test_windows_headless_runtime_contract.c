@@ -446,9 +446,9 @@ int main(void) {
                          "historical finalizer cleanup must enforce a fixed stale age threshold");
   ok &= require_contains(headless_uninstaller, "edr_native_process_running_at_path(path)",
                          "historical finalizer cleanup must skip any image still running");
-  ok &= require_contains(headless_uninstaller, "DWORD *service_pid_out",
+  ok &= require_contains(headless_uninstaller, "EdrNativeServiceRemoval service_removal",
                          "native finalizer must retain the SCM-owned service process identity");
-  ok &= require_contains(headless_uninstaller, "edr_native_stop_sensor(install_dir, service_pid)",
+  ok &= require_contains(headless_uninstaller, "edr_native_stop_sensor(install_dir, service_removal.pid, 0)",
                          "sensor teardown must target the service PID instead of arbitrary same-name processes");
   ok &= require_contains(headless_uninstaller, "_wcsicmp(canonical_process, canonical_sensor) != 0",
                          "sensor teardown must reject a reused PID before requesting termination");

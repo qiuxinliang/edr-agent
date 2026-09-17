@@ -536,6 +536,7 @@ if(WIN32)
   # handoff, inheritance, safe-delete, and self-unlink behavior checks.
   add_executable(test_windows_native_uninstall
     ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_native_uninstall.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_native_service_remove.c
     ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn_lock.c
     ${CMAKE_SOURCE_DIR}/src/platform/windows_handoff.c
     ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn.c
