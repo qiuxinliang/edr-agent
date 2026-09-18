@@ -1299,6 +1299,11 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   assert(after_quota.write_budget_critical_context_dropped == 0u);
   assert(after_quota.context_facts_written == baseline.context_facts_written + 4u);
   assert(after_quota.context_refs_written == baseline.context_refs_written + 80u);
+  assert(after_quota.context_ref_writes_by_event_type[EDR_EVENT_PROCESS_CREATE] == 80u);
+  char ref_sources_json[256];
+  assert(edr_local_evidence_cache_context_ref_write_sources_json(
+             ref_sources_json, sizeof(ref_sources_json)) > 0);
+  assert(strstr(ref_sources_json, "\"1\":80") != NULL);
   assert(after_quota.artifacts_written == baseline.artifacts_written + 80u);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts + 4u);
   assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 80u);

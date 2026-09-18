@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Fixed-width counters keep health payloads deterministic while covering all
+ * wire event values currently assigned by types.h and future values. */
+#define EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS 256u
+
 typedef struct {
   int db_open;
   uint64_t records_written;
@@ -24,6 +28,10 @@ typedef struct {
    * count of candidate-visible materialized artifacts changed. */
   uint64_t context_facts_written;
   uint64_t context_refs_written;
+  /* Number of committed candidate-context reference write operations grouped
+   * by the source behavior event type. This is attribution telemetry only; it
+   * does not change admission, retention, or upload behavior. */
+  uint64_t context_ref_writes_by_event_type[EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS];
   uint64_t command_results_written;
   /* Candidate accounting has non-overlapping denominators:
    * requests = reused + admission_attempts;
@@ -216,6 +224,9 @@ void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms);
 
 /** 追加 engine_health JSON 片段，形如 `"evidence_cache":{...}`。 */
 void edr_local_evidence_cache_status_json(char *out, size_t cap);
+
+/** Read-only compact JSON map of context-reference writes keyed by event type. */
+int edr_local_evidence_cache_context_ref_write_sources_json(char *out, size_t cap);
 
 /**
  * RTQ/RTR 轻量查询：payload_json 支持 event_type/type、pid、endpoint_id、

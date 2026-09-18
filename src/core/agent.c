@@ -2302,6 +2302,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char p0_ir_version[256], p0_ir_artifact_sha[80], p0_ir_degrade_reason[192];
   char p0_artifact_reason[192];
   char p0_artifact_reason_raw[96];
+  char context_ref_sources_json[8192];
   const char *p0_bundle_sha256 = "";
   const char *hot_thread_role = "unknown";
   EdrIngestHttpRuntime http_rt;
@@ -2442,6 +2443,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_p0_rule_get_dedup_metrics(&p0_metrics);
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
   edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
+  if (edr_local_evidence_cache_context_ref_write_sources_json(
+          context_ref_sources_json, sizeof(context_ref_sources_json)) < 0) {
+    snprintf(context_ref_sources_json, sizeof(context_ref_sources_json), "{}");
+  }
   if (strcmp(health_profile, "diagnostic") != 0) {
     char body_basic[49152];
     int n_basic = snprintf(
@@ -2555,7 +2560,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 		"\"ordinary_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
 		"\"context_dropped\":%llu},"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
-        "\"max_db_mb\":%u},"
+        "\"max_db_mb\":%u,\"maintenance\":{\"runs\":%llu,"
+        "\"retention_evicted\":%llu,\"capacity_evicted\":%llu},"
+        "\"context_window_evictions\":%llu,\"context_ref_write_sources\":%s},"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
         "\"requests_total\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,"
         "\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,"
@@ -2743,6 +2750,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.p0_candidate_rows,
         (unsigned long long)evidence_status.db_bytes,
         (unsigned long long)evidence_status.wal_bytes, evidence_status.max_db_mb,
+        (unsigned long long)evidence_status.maintenance_runs,
+        (unsigned long long)evidence_status.db_retention_evicted,
+        (unsigned long long)evidence_status.db_capacity_evicted,
+        (unsigned long long)evidence_status.context_window_evictions,
+        context_ref_sources_json,
         process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
         (unsigned long long)process_evidence_metrics.requests_total,
         (unsigned long long)process_evidence_metrics.ready_hits,

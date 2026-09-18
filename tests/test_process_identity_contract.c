@@ -322,6 +322,10 @@ int main(void) {
                          "basic health must expose P0 acceptance counters");
   ok &= require_contains(agent, "\\\"evidence_cache\\\":{\\\"db_open\\\":%s,\\\"utilization_bps\\\":%u",
                          "basic health must expose evidence-cache utilization");
+  ok &= require_contains(agent, "\\\"maintenance\\\":{\\\"runs\\\":%llu",
+                         "basic health must expose evidence-cache maintenance counters");
+  ok &= require_contains(agent, "\\\"context_ref_write_sources\\\":%s",
+                         "basic health must expose context-reference source attribution");
   ok &= require_before(
       agent,
       "\\\"process_evidence_worker\\\":{\\\"slots_used\\\":%u,\\\"capacity\\\":%u",

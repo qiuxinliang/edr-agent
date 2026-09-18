@@ -420,6 +420,31 @@ static uint32_t evidence_context_window_s(void);
 static int ring_related_to_record(const RingSlot *s, const EdrBehaviorRecord *r);
 static int same_ci(const char *a, const char *b);
 
+static int context_ref_write_sources_json_from_status(
+    const EdrEvidenceCacheStatus *st, char *out, size_t cap) {
+  size_t off = 0u;
+  int first = 1;
+  if (!st || !out || cap == 0u) {
+    return -1;
+  }
+  appendf(out, cap, &off, "{");
+  for (uint32_t type = 0u; type < EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS; ++type) {
+    uint64_t writes = st->context_ref_writes_by_event_type[type];
+    if (writes == 0u) {
+      continue;
+    }
+    appendf(out, cap, &off, "%s\"%u\":%llu", first ? "" : ",", type,
+            (unsigned long long)writes);
+    first = 0;
+  }
+  appendf(out, cap, &off, "}");
+  if (off >= cap - 1u) {
+    out[0] = '\0';
+    return -1;
+  }
+  return (int)off;
+}
+
 static void set_error(const char *msg) {
   snprintf(s_status.last_error, sizeof(s_status.last_error), "%s", msg ? msg : "");
 }
@@ -3752,6 +3777,10 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
   }
   s_status.context_facts_written += prepared.fact_insert;
   s_status.context_refs_written += prepared.ref_count;
+  if ((unsigned)r->type < EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS) {
+    s_status.context_ref_writes_by_event_type[(unsigned)r->type] +=
+        prepared.ref_count;
+  }
   if (written) *written = materialized_changes;
   sqlite_free_prepared_context_artifacts(&prepared);
   return 0;
@@ -6148,9 +6177,14 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   char path[640];
   char err[220];
   char eng[80];
+  char context_ref_sources[8192];
   json_escape(path, sizeof(path), st.path);
   json_escape(err, sizeof(err), st.last_error);
   json_escape(eng, sizeof(eng), st.last_engine);
+  if (context_ref_write_sources_json_from_status(
+          &st, context_ref_sources, sizeof(context_ref_sources)) != 0) {
+    snprintf(context_ref_sources, sizeof(context_ref_sources), "{}");
+  }
   int written = snprintf(out, cap,
            "\"evidence_cache\":{\"db_open\":%s,\"path\":%s,\"max_db_mb\":%u,"
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
@@ -6173,7 +6207,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
            "\"p0_candidates\":{\"written\":%llu,\"rows\":%llu},"
            "\"artifacts\":{\"written\":%llu,\"context_facts_written\":%llu,"
-           "\"context_refs_written\":%llu},"
+           "\"context_refs_written\":%llu,\"context_ref_write_sources\":%s},"
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
@@ -6255,7 +6289,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.p0_candidate_rows,
            (unsigned long long)st.artifacts_written,
            (unsigned long long)st.context_facts_written,
-           (unsigned long long)st.context_refs_written,
+           (unsigned long long)st.context_refs_written, context_ref_sources,
            (unsigned long long)st.command_results_written, st.metrics_minutes,
            (unsigned long long)st.file_coalesced,
            (unsigned long long)st.registry_coalesced,
@@ -6271,4 +6305,13 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
     (void)snprintf(out, cap, "\"evidence_cache\":{\"db_open\":%s,\"status\":\"truncated\"}",
                    st.db_open ? "true" : "false");
   }
+}
+
+int edr_local_evidence_cache_context_ref_write_sources_json(char *out, size_t cap) {
+  EdrEvidenceCacheStatus st;
+  if (!out || cap == 0u) {
+    return -1;
+  }
+  edr_local_evidence_cache_get_status(&st);
+  return context_ref_write_sources_json_from_status(&st, out, cap);
 }
