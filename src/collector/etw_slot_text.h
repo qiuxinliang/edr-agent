@@ -23,7 +23,9 @@ static inline void edr_etw1_sanitize_value(char *dst, size_t cap, const char *sr
 
 static inline EdrSlotKvResult edr_collector_slot_append_kv(
     EdrEventSlot *slot, const char *key, const char *value) {
-  char safe[2048];
+  /* The event envelope is the capacity authority. An unrelated 2 KiB
+   * scratch limit rejected commands that fit both the envelope and record. */
+  char safe[EDR_MAX_EVENT_PAYLOAD];
   size_t used;
   int n;
   if (!slot || !key || !key[0] || !value || !value[0]) return EDR_SLOT_KV_EMPTY;

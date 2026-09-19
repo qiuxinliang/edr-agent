@@ -1504,6 +1504,69 @@ static void test_critical_context_still_honors_database_capacity(void) {
   cleanup_test_sqlite_path(db);
 }
 
+/* Freed pages are reclaimable space, not live evidence to evict. Exercise
+ * reopen maintenance using a real SQLite file, without touching a live cache. */
+static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
+  char db[512];
+  struct timespec ts;
+  EdrBehaviorRecord candidate;
+  EdrEvidenceCacheStatus status;
+  sqlite3 *raw = NULL;
+  char *error = NULL;
+
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74325u;
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  candidate.process_start_key = UINT64_C(0x74325);
+  candidate.process_creation_filetime_100ns = UINT64_C(133700000000074325);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-reclaim");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "reclaim-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.3.25");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw,
+      "CREATE TABLE reclaim_fixture(payload BLOB);"
+      "INSERT INTO reclaim_fixture VALUES(zeroblob(2097152));"
+      "DROP TABLE reclaim_fixture;", NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_capacity_evicted == 0u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
+  edr_local_evidence_cache_close();
+
+  /* A genuinely over-budget live set must still be evicted, but only one
+   * batch is needed here. Allocated pages remain large until reclamation. */
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw,
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1100) "
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns,cmdline) "
+      "SELECT 'bulk-' || x,(SELECT MAX(event_time_ns) FROM p0_candidates),"
+      "printf('%02500d',x) FROM n;", NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  assert(sqlite_table_count(db, "p0_candidates") == 1101u);
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_capacity_evicted >= 1000u);
+  assert(sqlite_table_count(db, "p0_candidates") == 101u);
+  assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_critical_context_still_honors_retention(void) {
   char db[512];
   struct timespec ts;
@@ -4528,10 +4591,17 @@ static void test_command_preview_to_durable_fact(void) {
   memset(&slot, 0, sizeof(slot));
   assert(edr_collector_slot_append_kv(&slot, "cmd", "a\ncmd=other\rb") == EDR_SLOT_KV_APPENDED);
   assert(strcmp((const char *)slot.data, "cmd=a cmd=other b\n") == 0);
-  uint32_t saved_size = slot.size;
   memset(source->cmdline, 'x', 2048u);
   source->cmdline[2048u] = '\0';
-  assert(edr_collector_slot_append_kv(&slot, "cmd", source->cmdline) == EDR_SLOT_KV_VALUE_TOO_LONG);
+  assert(edr_collector_slot_append_kv(&slot, "cmd", source->cmdline) == EDR_SLOT_KV_APPENDED);
+  uint32_t saved_size = slot.size;
+  /* Remaining envelope capacity, not a second 2048-byte ceiling, is binding. */
+  assert(edr_collector_slot_append_kv(&slot, "cmd", source->cmdline) == EDR_SLOT_KV_NO_SPACE);
+  assert(slot.size == saved_size);
+  char oversized[EDR_MAX_EVENT_PAYLOAD + 1u];
+  memset(oversized, 'x', sizeof(oversized) - 1u);
+  oversized[sizeof(oversized) - 1u] = '\0';
+  assert(edr_collector_slot_append_kv(&slot, "cmd", oversized) == EDR_SLOT_KV_VALUE_TOO_LONG);
   assert(slot.size == saved_size);
 
   /* Do not guess a clipped origin or erase unrelated loss when repairing. */
@@ -4805,6 +4875,7 @@ int main(void) {
   test_critical_context_high_fanout_is_atomically_bounded();
   test_critical_context_distinct_events_exceed_legacy_fixed_limit();
   test_critical_context_still_honors_database_capacity();
+  test_capacity_reclaims_free_pages_before_evicting_candidates();
   test_critical_context_still_honors_retention();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
   test_candidate_fallback_preserves_path_and_generation_boundaries();

@@ -1,4 +1,6 @@
 #include "edr/behavior_from_slot.h"
+#include "../src/collector/etw_slot_text.h"
+#include "../src/collector/security_event_xml.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -146,6 +148,36 @@ int main(void) {
             "4688 provenance mismatch: security=%u source=%s fields=%s integrity=%s elevation=%u\n",
             (unsigned)r.is_security_4688, r.source_completeness,
             r.source_truncated_fields, r.integrity_level, r.token_elevation);
+    return 1;
+  }
+
+  memset(&slot, 0, sizeof(slot));
+  slot.type = EDR_EVENT_PROCESS_CREATE;
+  slot.timestamp_ns = 3u;
+  snprintf((char *)slot.data, sizeof(slot.data),
+           "ETW1\nprov=sec\neid=4688\nepid=89\nimg=C:\\Windows\\System32\\cmd.exe\n");
+  slot.size = (uint32_t)strlen((const char *)slot.data);
+  char command[EDR_BR_STR_LONG];
+  char extracted[EDR_BR_STR_LONG];
+  char xml[EDR_BR_STR_LONG + 128u];
+  size_t source_length = 0u;
+  snprintf(command, sizeof(command), "cmd.exe /c ");
+  for (size_t i = strlen(command); i < 3307u; ++i) {
+    command[i] = (char)('a' + (i % 26u));
+  }
+  command[3307] = '\0';
+  snprintf(xml, sizeof(xml), "<Data Name='CommandLine'>%s</Data>", command);
+  if (edr_security_xml_get_data_utf8(xml, "CommandLine", extracted,
+                                     sizeof(extracted), &source_length) !=
+          EDR_SECURITY_XML_TEXT_COMPLETE || source_length != 3307u ||
+      edr_collector_slot_append_kv(&slot, "cmd", extracted) != EDR_SLOT_KV_APPENDED) {
+    fprintf(stderr, "long command rejected before behavior decoding\n");
+    return 1;
+  }
+  edr_behavior_from_slot(&slot, &r);
+  if (strcmp(r.cmdline, command) != 0 ||
+      r.source_truncated_fields[0] != '\0') {
+    fprintf(stderr, "long command changed at ETW1 boundary\n");
     return 1;
   }
   return 0;

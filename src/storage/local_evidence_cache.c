@@ -4226,6 +4226,27 @@ static void sqlite_flush_metrics(void) {
   }
 }
 
+/* DELETE changes live pages, not the allocated file length. Use live pages
+ * only to decide whether more evidence must be evicted; admission still uses
+ * the physical database + WAL budget after reclamation. On inspection failure
+ * do not delete evidence speculatively. */
+static int sqlite_live_size_over_limit(void) {
+  sqlite3_stmt *st = NULL;
+  int over = -1;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT (page_count-freelist_count)*page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;",
+      -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
+    sqlite3_int64 bytes = sqlite3_column_int64(st, 0);
+    if (bytes >= 0) {
+      over = (uint64_t)bytes > (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+    }
+  }
+  sqlite3_finalize(st);
+  if (over < 0) set_error("evidence cache live-page size query failed");
+  return over;
+}
+
 static void sqlite_maintenance(void) {
   if (!s_db) {
     return;
@@ -4271,7 +4292,10 @@ static void sqlite_maintenance(void) {
     if (changes > 0) s_status.db_retention_evicted += (uint64_t)changes;
   }
   if (db_size_over_limit()) {
-    for (int pass = 0; pass < 4 && db_size_over_limit(); pass++) {
+    /* A WAL or already-free pages can account for the excess. Reclaim before
+     * deleting candidates, and stop deleting once the live set fits. */
+    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    for (int pass = 0; pass < 4 && sqlite_live_size_over_limit() > 0; pass++) {
       if (exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);") == 0) {
         int changes = sqlite3_changes(s_db);
         if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
@@ -4296,6 +4320,8 @@ static void sqlite_maintenance(void) {
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     if (db_size_over_limit()) {
       (void)exec_sql("VACUUM;");
+      /* In WAL mode VACUUM writes replacement pages into the WAL. */
+      (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     }
   } else {
     (void)exec_sql("PRAGMA wal_checkpoint(PASSIVE);");

@@ -231,12 +231,16 @@ int main(void) {
     ok &= require_contains(pipeline, "edr_process_generation_query_live",
                            "target generation must be validated against a live target handle");
     ok &= require_contains(pipeline,
-                           "edr_process_command_line_query_live(process, br->cmdline",
+                           "edr_process_command_line_query_live(process, command_line",
                            "Kernel ProcessStart must read command line from its validated handle");
     ok &= require_before(pipeline,
-                         "edr_process_command_line_query_live(process, br->cmdline",
+                         "edr_process_command_line_query_live(process, command_line",
                          "CloseHandle(process);\n  br->process_start_key = live.process_start_key;",
                          "same-generation command line must be read before closing the validated handle");
+    ok &= require_before(pipeline,
+                         "p0_adopt_generation_command_fact(br, command_line, 0, \"live_same_generation\")",
+                         "CloseHandle(process);\n  br->process_start_key = live.process_start_key;",
+                         "queried command must be adopted with its same-generation provenance");
     ok &= require_contains(pipeline, "live_same_generation_unavailable",
                            "failed live command-line queries must remain explicit and source-only");
     ok &= require_before(pipeline, "(void)enrich_process_token_identity(&br);",
@@ -371,8 +375,12 @@ int main(void) {
                        "kernel source needs an initial revision without a 4688 merge");
   ok &= require_contains(
       pipeline,
-      "strcmp(requested.hash_reason, \"identity_revalidation_pending\") == 0",
-      "preprocess must wait only when the requested file object has work in flight");
+      "if (!ready && (strcmp(evidence.hash_reason, \"queued\") == 0 ||\n"
+      "                 strcmp(evidence.hash_reason, \"identity_revalidation_pending\") == 0))",
+      "preprocess must defer only when the requested file object has work in flight");
+  ok &= require_contains(
+      pipeline, "edr_process_evidence_pending_add(br, slot, &evidence, now)",
+      "deferral must preserve the record, slot and requested evidence together");
   ok &= require_contains(
       pipeline,
       "if (!edr_behavior_has_process_actor(br))",

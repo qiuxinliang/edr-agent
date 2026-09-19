@@ -2013,7 +2013,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
     s_health.security_4688_received++;
   }
   char img[1024];
-  char cmd[2048];
+  char cmd[EDR_BR_STR_LONG];
   char epid[64];
   char ppid[64];
   char user[256];
