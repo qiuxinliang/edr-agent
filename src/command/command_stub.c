@@ -640,6 +640,49 @@ static int parse_json_bool_field(const uint8_t *p, size_t len, const char *key, 
   return edr_parse_json_bool(p, len, key, out) ? 0 : -1;
 }
 
+static int parse_json_u64_field(const uint8_t *p, size_t len, const char *key,
+                                uint64_t *out) {
+  char text[64];
+  cJSON *root = NULL;
+  const cJSON *value = NULL;
+  char *end = NULL;
+  unsigned long long parsed;
+  if (!p || !key || !out) {
+    return -1;
+  }
+  if (edr_parse_json_string(p, len, key, text, sizeof(text))) {
+    if (text[0] < '0' || text[0] > '9') {
+      return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != ERANGE && end != text && *end == '\0' && parsed != 0u) {
+      *out = (uint64_t)parsed;
+      return 0;
+    }
+    return -1;
+  }
+  root = cJSON_ParseWithLength((const char *)p, len);
+  value = root ? cJSON_GetObjectItemCaseSensitive(root, key) : NULL;
+  /* JSON numbers are parsed as doubles by cJSON.  Values above 2^53 cannot
+   * carry an exact process-generation identity; require the wire contract's
+   * decimal string form for those values instead of silently rounding a PID
+   * lifetime into a different one. */
+  if (!cJSON_IsNumber(value) || value->valuedouble <= 0.0 ||
+      value->valuedouble > 9007199254740991.0) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  parsed = (unsigned long long)value->valuedouble;
+  if ((double)parsed != value->valuedouble) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  *out = (uint64_t)parsed;
+  cJSON_Delete(root);
+  return 0;
+}
+
 static int parse_pid_json(const uint8_t *p, size_t len, long *out_pid) {
   int pid = -1;
   if (!out_pid || !edr_parse_json_int(p, len, "pid", &pid) || pid <= 0) {
@@ -3829,8 +3872,31 @@ static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t le
   if (parse_json_string_field(pl, len, "endpoint_id", endpoint_id, sizeof(endpoint_id)) != 0) {
     endpoint_id[0] = '\0';
   }
+  uint64_t process_start_key = 0u;
+  uint64_t process_creation_filetime_100ns = 0u;
+  int has_process_start_key =
+      parse_json_u64_field(pl, len, "process_start_key", &process_start_key) == 0;
+  int has_process_creation_filetime =
+      parse_json_u64_field(pl, len, "process_creation_filetime_100ns",
+                           &process_creation_filetime_100ns) == 0;
+  if (has_process_start_key != has_process_creation_filetime) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_process_tree: process generation tuple is incomplete");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2,
+              "process_start_key and process_creation_filetime_100ns are both required");
+    return;
+  }
+  if (!has_process_start_key) {
+    s_exec_fail++;
+    audit_both(cmd_id, "rtr_process_tree: generation-bound lookup required");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2,
+              "generation-bound process tree lookup requires process_start_key and process_creation_filetime_100ns");
+    return;
+  }
   char detail[12000];
-  int r = edr_local_evidence_cache_process_tree_json((uint32_t)pid, endpoint_id, detail, sizeof(detail));
+  int r = edr_local_evidence_cache_process_tree_generation_json(
+      (uint32_t)pid, endpoint_id, process_start_key,
+      process_creation_filetime_100ns, detail, sizeof(detail));
   if (r == -3) {
     s_exec_fail++;
     audit_both(cmd_id, "rtr_process_tree: serialization or output budget exhausted");

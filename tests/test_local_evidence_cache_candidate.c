@@ -2486,6 +2486,17 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
     assert(strstr(tree, "B-path.exe") != NULL);
     assert(strstr(tree, "A-path.exe") == NULL);
     assert(strstr(tree, b_start_text) != NULL && strstr(tree, b_creation_text) != NULL);
+    /* A PID-only lookup is useful for current operator inspection, but a
+     * historical replay must bind both generation facts.  The old A lifetime
+     * must never resolve to the current B row after PID reuse. */
+    assert(edr_local_evidence_cache_process_tree_generation_json(
+               pid, "ep-persistent-generation", b_start, b_creation,
+               tree, sizeof(tree)) == 0);
+    assert(strstr(tree, "B-path.exe") != NULL);
+    assert(strstr(tree, "A-path.exe") == NULL);
+    assert(edr_local_evidence_cache_process_tree_generation_json(
+               pid, "ep-persistent-generation", a_start, a_creation,
+               tree, sizeof(tree)) == -2);
   }
   {
     char output[16384];
@@ -2534,6 +2545,14 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
     }
     assert(saw_a && saw_b);
     cJSON_Delete(document);
+
+    assert(edr_local_evidence_cache_query_json(
+               "{\"pid\":96700,\"process_start_key\":\"18446744073709551500\","
+               "\"process_creation_filetime_100ns\":\"18446744073709551501\","
+               "\"limit\":10,\"time_window_s\":600}", output,
+               sizeof(output)) == 0);
+    assert(strstr(output, "A-candidate.bin") != NULL);
+    assert(strstr(output, "B-candidate.bin") == NULL);
   }
   edr_local_evidence_cache_close();
   cleanup_test_sqlite_path(db);

@@ -231,7 +231,8 @@ int edr_local_evidence_cache_context_ref_write_sources_json(char *out, size_t ca
 /**
  * RTQ/RTR 轻量查询：payload_json 支持 event_type/type、pid、endpoint_id、
  * process_name_contains、cmdline_contains、file_path/file_path_contains、
- * file_sha256、file_ext、remote_ip、registry_key_contains、limit、time_window_s。
+ * file_sha256、file_ext、remote_ip、registry_key_contains、pid、
+ * process_start_key、process_creation_filetime_100ns、limit、time_window_s。
  * 优先返回内存 ring，SQLite 可用时补历史。file_sha256 只查缓存，不触发文件系统扫描。
  */
 int edr_local_evidence_cache_query_json(const char *payload_json, char *out, size_t cap);
@@ -256,5 +257,13 @@ int edr_local_evidence_cache_query_file_hash_json(const char *file_sha256,
  */
 int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,
                                                char *out, size_t cap);
+
+/** Generation-bound process tree lookup.  PID is only a routing hint; both
+ * generation values must match the cached process row and its parent edge.
+ * Returns -2 when the exact process generation is absent and -3 when the
+ * response cannot be serialized within the supplied budget. */
+int edr_local_evidence_cache_process_tree_generation_json(
+    uint32_t pid, const char *endpoint_id, uint64_t process_start_key,
+    uint64_t process_creation_filetime_100ns, char *out, size_t cap);
 
 #endif

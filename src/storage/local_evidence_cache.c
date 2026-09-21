@@ -11,6 +11,7 @@
 #include "cJSON.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -5451,6 +5452,10 @@ typedef struct {
   int has_type;
   uint32_t type;
   uint32_t pid;
+  int has_process_start_key;
+  uint64_t process_start_key;
+  int has_process_creation_filetime_100ns;
+  uint64_t process_creation_filetime_100ns;
   uint32_t limit;
   uint32_t time_window_s;
   char endpoint_id[48];
@@ -5578,6 +5583,52 @@ static int json_get_u32(const char *json, const char *key, uint32_t *out) {
   return 0;
 }
 
+static int json_get_u64(const char *json, const char *key, uint64_t *out) {
+  char text[64];
+  char pattern[80];
+  const char *p;
+  char *end = NULL;
+  unsigned long long value;
+  if (!json || !key || !out) {
+    return -1;
+  }
+  if (json_get_string(json, key, text, sizeof(text)) == 0) {
+    if (text[0] < '0' || text[0] > '9') {
+      return -1;
+    }
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno != ERANGE && end != text && *end == '\0') {
+      *out = (uint64_t)value;
+      return 0;
+    }
+    return -1;
+  }
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  p = strstr(json, pattern);
+  if (!p) {
+    return -1;
+  }
+  p = strchr(p + strlen(pattern), ':');
+  if (!p) {
+    return -1;
+  }
+  do {
+    p++;
+  } while (*p && isspace((unsigned char)*p));
+  if (*p < '0' || *p > '9') {
+    return -1;
+  }
+  errno = 0;
+  value = strtoull(p, &end, 10);
+  if (errno == ERANGE || end == p ||
+      (*end != ',' && *end != '}' && !isspace((unsigned char)*end))) {
+    return -1;
+  }
+  *out = (uint64_t)value;
+  return 0;
+}
+
 static uint32_t event_type_from_name(const char *s, int *ok) {
   if (ok) {
     *ok = 1;
@@ -5654,6 +5705,14 @@ static void parse_rtq_filter(const char *json, RtqFilter *f) {
   (void)json_get_string(json, "registry_key_contains", f->registry_key_contains,
                         sizeof(f->registry_key_contains));
   (void)json_get_u32(json, "pid", &f->pid);
+  if (json_get_u64(json, "process_start_key", &f->process_start_key) == 0) {
+    f->has_process_start_key = f->process_start_key != 0u;
+  }
+  if (json_get_u64(json, "process_creation_filetime_100ns",
+                   &f->process_creation_filetime_100ns) == 0) {
+    f->has_process_creation_filetime_100ns =
+        f->process_creation_filetime_100ns != 0u;
+  }
   (void)json_get_u32(json, "limit", &f->limit);
   (void)json_get_u32(json, "time_window_s", &f->time_window_s);
   if (f->limit == 0u || f->limit > 500u) {
@@ -5680,7 +5739,8 @@ static int rtq_match_common(const RtqFilter *f, uint32_t type, uint32_t pid,
                             int64_t event_time_ns, const char *endpoint_id,
                             const char *process_name, const char *cmdline,
                             const char *file_path, const char *remote_ip,
-                            const char *registry_key) {
+                            const char *registry_key, uint64_t process_start_key,
+                            uint64_t process_creation_filetime_100ns) {
   int64_t cutoff = now_unix_ns() - (int64_t)f->time_window_s * 1000000000LL;
   if (event_time_ns > 0 && event_time_ns < cutoff) {
     return 0;
@@ -5689,6 +5749,13 @@ static int rtq_match_common(const RtqFilter *f, uint32_t type, uint32_t pid,
     return 0;
   }
   if (f->pid != 0u && f->pid != pid) {
+    return 0;
+  }
+  if (f->has_process_start_key && f->process_start_key != process_start_key) {
+    return 0;
+  }
+  if (f->has_process_creation_filetime_100ns &&
+      f->process_creation_filetime_100ns != process_creation_filetime_100ns) {
     return 0;
   }
   if (f->endpoint_id[0] && endpoint_id && endpoint_id[0] &&
@@ -5934,7 +6001,9 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
       }
       scanned++;
       if (!rtq_match_common(&f, r->type, r->pid, r->event_time_ns, r->endpoint_id,
-                            r->process_name, "", r->file_path, r->net_dst, "")) {
+                            r->process_name, "", r->file_path, r->net_dst, "",
+                            r->generation.process_start_key,
+                            r->generation.creation_filetime_100ns)) {
         continue;
       }
       char start_key[32];
@@ -6010,7 +6079,12 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
         const char *generation_source = (const char *)sqlite3_column_text(st, 17);
         const char *source_completeness = (const char *)sqlite3_column_text(st, 18);
         const char *source_truncated_fields = (const char *)sqlite3_column_text(st, 19);
-        if (!rtq_match_common(&f, ty, pid, ts, ep, pn, cl, fp, rip, rk)) {
+        uint64_t start_key_value = 0u;
+        uint64_t creation_value = 0u;
+        (void)sqlite_decimal_u64(start_key, &start_key_value);
+        (void)sqlite_decimal_u64(creation, &creation_value);
+        if (!rtq_match_common(&f, ty, pid, ts, ep, pn, cl, fp, rip, rk,
+                              start_key_value, creation_value)) {
           continue;
         }
         append_event_json(out, cap, &off, &first, "p0_candidates", ts, ty, pid, ppid, ep, pn,
@@ -6090,28 +6164,53 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
   return *off < cap - 1u;
 }
 
-int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,
-                                               char *out, size_t cap) {
+int edr_local_evidence_cache_process_tree_generation_json(
+    uint32_t pid, const char *endpoint_id, uint64_t process_start_key,
+    uint64_t process_creation_filetime_100ns, char *out, size_t cap) {
   if (!out || cap == 0u || pid == 0u) {
     return -1;
   }
+  if ((process_start_key == 0u) != (process_creation_filetime_100ns == 0u)) {
+    return -1;
+  }
+  const int generation_lookup = process_start_key != 0u;
   evidence_cache_lock();
   ProcSlot *memory_root = find_proc(pid, endpoint_id);
   const ProcSlot *root = memory_root;
   const char *root_source = "memory";
+  if (generation_lookup &&
+      (!root || !generation_bound(&root->generation) ||
+       root->generation.process_start_key != process_start_key ||
+       root->generation.creation_filetime_100ns != process_creation_filetime_100ns)) {
+    root = NULL;
+  }
 #if defined(EDR_HAVE_SQLITE)
   ProcSlot durable_root;
   if (s_db && (!root || !generation_bound(&root->generation)) && endpoint_id && endpoint_id[0]) {
-    const char *root_sql =
-        "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
-        "process_start_key,process_creation_filetime_100ns,process_generation_source,"
-        "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
-        "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
+    const char *root_sql = generation_lookup
+        ? "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
+          "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+          "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
+          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
+          "FROM process_cache WHERE endpoint_id=? AND pid=? AND process_start_key=? "
+          "AND process_creation_filetime_100ns=? LIMIT 1;"
+        : "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
+          "process_start_key,process_creation_filetime_100ns,process_generation_source,"
+          "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
+          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
+          "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
     sqlite3_stmt *root_st = NULL;
     if (sqlite3_prepare_v2(s_db, root_sql, -1, &root_st, NULL) == SQLITE_OK) {
       sqlite3_bind_text(root_st, 1, endpoint_id, -1, SQLITE_TRANSIENT);
       sqlite3_bind_int64(root_st, 2, (sqlite3_int64)pid);
+      if (generation_lookup) {
+        char start_text[32];
+        char creation_text[32];
+        sqlite_u64_decimal(process_start_key, start_text);
+        sqlite_u64_decimal(process_creation_filetime_100ns, creation_text);
+        sqlite3_bind_text(root_st, 3, start_text, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(root_st, 4, creation_text, -1, SQLITE_TRANSIENT);
+      }
       if (sqlite3_step(root_st) == SQLITE_ROW && sqlite_read_process_cache_row(root_st, &durable_root)) {
         root = &durable_root;
         root_source = "sqlite";
@@ -6192,6 +6291,12 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
   }
   evidence_cache_unlock();
   return found ? 0 : -2;
+}
+
+int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoint_id,
+                                               char *out, size_t cap) {
+  return edr_local_evidence_cache_process_tree_generation_json(
+      pid, endpoint_id, 0u, 0u, out, cap);
 }
 
 void edr_local_evidence_cache_status_json(char *out, size_t cap) {
