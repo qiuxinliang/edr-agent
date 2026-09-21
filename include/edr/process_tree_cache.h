@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define EDR_PTC_STR_SHORT 64u
-#define EDR_PTC_STR_LONG  4096u
+#define EDR_PTC_STR_LONG  8192u
 #define EDR_PTC_STR_PATH  4096u
 #define EDR_PTC_EXIT_GRACE_NS (30ULL * 1000000000ULL)
 
@@ -73,7 +73,7 @@ int edr_pt_cache_put_generation(uint32_t pid, uint32_t ppid,
 
 /* Exact-generation insertion with source provenance.  The mask describes
  * truncation which happened before this cache received the strings; it is
- * retained even when the supplied value fits the cache's 4096-byte field.
+ * retained even when the supplied value fits the cache's 8192-byte field.
  * The legacy API above is equivalent to passing a zero mask. */
 int edr_pt_cache_put_generation_with_provenance(
     uint32_t pid, uint32_t ppid,

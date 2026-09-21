@@ -1263,7 +1263,7 @@ typedef struct {
   char creator_sid[256];
   char creator_logon_id[64];
   char parent_img[EDR_BR_STR_LONG];
-  char parent_cmdline[EDR_BR_STR_LONG];
+  char parent_cmdline[EDR_BR_STR_CMDLINE];
   char cwd[EDR_BR_STR_LONG];
   char integrity[64];
   char token_elevation[64];

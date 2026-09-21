@@ -447,7 +447,7 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
                                                live.creation_filetime_100ns);
   }
   if (!br->cmdline[0] || p0_command_line_is_cached_preview(br)) {
-    char command_line[EDR_BR_STR_LONG];
+    char command_line[EDR_BR_STR_CMDLINE];
     reason[0] = '\0';
     if (edr_process_command_line_query_live(process, command_line, sizeof(command_line),
                                             reason, sizeof(reason))) {
@@ -522,7 +522,7 @@ static int p0_resolve_live_parent_generation(const EdrBehaviorRecord *child,
   ULARGE_INTEGER observed;
   EdrLiveProcessGeneration live;
   char path[EDR_BR_STR_LONG];
-  char cmdline[EDR_BR_STR_LONG];
+  char cmdline[EDR_BR_STR_CMDLINE];
   char reason[64];
   uint64_t parent_creation_ns;
   uint64_t child_event_ns;

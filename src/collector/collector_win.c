@@ -3808,7 +3808,7 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
       (void)edr_collector_slot_append_kv(slot, "process_generation_source",
                                          "kernel_process_live_verified");
       if (!process_start.cmdline[0]) {
-        char command_line[EDR_BR_STR_LONG];
+        char command_line[EDR_BR_STR_CMDLINE];
         if (edr_process_command_line_query_live(process, command_line,
                                                 sizeof(command_line), reason,
                                                 sizeof(reason))) {

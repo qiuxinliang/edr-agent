@@ -1,4 +1,5 @@
 #include "edr/process_generation.h"
+#include "edr/behavior_record.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -45,15 +46,30 @@ int main(int argc, char **argv) {
     fprintf(stderr, "bounded output did not fail closed: %s\n", reason);
     return 1;
   }
-  char executable[MAX_PATH], child_command[MAX_PATH + 32];
+  char executable[MAX_PATH];
+  char child_command[EDR_BR_STR_CMDLINE + MAX_PATH];
   if (!GetModuleFileNameA(NULL, executable, sizeof(executable))) return 1;
-  snprintf(child_command, sizeof(child_command), "\"%s\" --child", executable);
+  const char *long_marker = "EDR_LONG_COMMAND_TEST";
+  const size_t target_command_length = 5204u;
+  int prefix_length = snprintf(child_command, sizeof(child_command),
+                               "\"%s\" --child %s ", executable, long_marker);
+  if (prefix_length <= 0 || (size_t)prefix_length >= target_command_length ||
+      (size_t)prefix_length >= sizeof(child_command)) return 1;
+  memset(child_command + prefix_length, 'x', target_command_length - (size_t)prefix_length);
+  child_command[target_command_length] = '\0';
   STARTUPINFOA startup = {0};
   PROCESS_INFORMATION child = {0};
   startup.cb = sizeof(startup);
   if (!CreateProcessA(executable, child_command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &startup, &child)) return 1;
+  char long_command[EDR_BR_STR_CMDLINE];
+  reason[0] = '\0';
+  int long_query_ok = edr_process_command_line_query_live(
+      child.hProcess, long_command, sizeof(long_command), reason, sizeof(reason)) &&
+      strlen(long_command) > 4096u && strstr(long_command, long_marker) != NULL &&
+      strcmp(reason, "ok") == 0;
   FILETIME created = {0}, exited, kernel, user;
   int ok = GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user) != 0;
+  ok = ok && long_query_ok;
   uint64_t identity = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
   ok = ok && !edr_process_terminate_checked(child.dwProcessId, 0u, 5000, reason, sizeof(reason)) &&
       WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;

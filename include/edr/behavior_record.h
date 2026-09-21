@@ -11,6 +11,7 @@
 
 #define EDR_BR_STR_SHORT 256u
 #define EDR_BR_STR_LONG 4096u
+#define EDR_BR_STR_CMDLINE 8192u
 #define EDR_BR_STR_MID 512u
 #define EDR_BR_ID_LEN 48u
 #define EDR_BR_MAX_MITRE 8u
@@ -27,7 +28,11 @@ typedef struct {
   uint32_t pid;
   uint32_t ppid;
   char process_name[EDR_BR_STR_SHORT];
-  char cmdline[EDR_BR_STR_LONG];
+  /* Command lines are the only long fact whose authoritative Windows query
+   * routinely exceeds the generic 4 KiB field.  Keep this capacity separate
+   * from paths and other long fields so their memory/transport contracts do
+   * not grow as a side effect. */
+  char cmdline[EDR_BR_STR_CMDLINE];
   char exe_hash[65];
   char exe_path[EDR_BR_STR_LONG];
   /* Original Windows path and its resolution state are retained separately.
@@ -138,7 +143,7 @@ typedef struct {
   char integrity_level[32];
   uint32_t token_elevation;
   char process_path_hash[65];
-  char parent_cmdline[EDR_BR_STR_LONG];
+  char parent_cmdline[EDR_BR_STR_CMDLINE];
   uint32_t grandparent_pid;
   char grandparent_name[EDR_BR_STR_SHORT];
   char grandparent_path[EDR_BR_STR_MID];

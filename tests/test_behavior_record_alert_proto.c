@@ -198,19 +198,22 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
   edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
   char expected[EDR_BR_STR_LONG];
 
-  /* Every aligned 4 KiB record string survives exactly at the boundary. */
+  /* Paths remain complete at their 4 KiB transport boundary.  The
+   * authoritative command fact is larger than the bounded wire projection;
+   * that projection must be explicitly marked rather than presented as
+   * missing. */
   init_transport_record(&record);
   fill_boundary_ascii(record.cmdline, sizeof(record.cmdline), 'c');
   fill_boundary_ascii(record.exe_path, sizeof(record.exe_path), 'e');
   fill_boundary_ascii(record.file_path, sizeof(record.file_path), 'f');
   snprintf(record.file_op, sizeof(record.file_op), "write");
   if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
-      strlen(decoded.cmdline) != sizeof(record.cmdline) - 1u ||
+      strlen(decoded.cmdline) != sizeof(decoded.cmdline) - 1u ||
       strlen(decoded.exe_path) != sizeof(record.exe_path) - 1u ||
       !decoded.which_detail ||
       strlen(decoded.detail.file.target_path) != sizeof(record.file_path) - 1u ||
-      strcmp(decoded.transport_completeness, "COMPLETE") != 0 ||
-      decoded.truncated_fields[0] != '\0') {
+      strcmp(decoded.transport_completeness, "TRUNCATED") != 0 ||
+      strcmp(decoded.truncated_fields, "cmdline") != 0) {
     return 0;
   }
 
@@ -220,12 +223,13 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
   fill_boundary_ascii(record.current_directory, sizeof(record.current_directory), 'd');
   if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
       decoded.which_detail != edr_v1_BehaviorEvent_process_tag ||
-      strlen(decoded.detail.process.parent_cmdline) != sizeof(record.parent_cmdline) - 1u ||
+      strlen(decoded.detail.process.parent_cmdline) != sizeof(decoded.detail.process.parent_cmdline) - 1u ||
       strlen(decoded.detail.process.current_directory) != sizeof(record.current_directory) - 1u ||
       !decoded.has_process_context ||
-      strlen(decoded.process_context.parent_cmdline) != sizeof(record.parent_cmdline) - 1u ||
+      strlen(decoded.process_context.parent_cmdline) != sizeof(decoded.process_context.parent_cmdline) - 1u ||
       strlen(decoded.process_context.current_directory) != sizeof(record.current_directory) - 1u ||
-      strcmp(decoded.transport_completeness, "COMPLETE") != 0) {
+      strcmp(decoded.transport_completeness, "TRUNCATED") != 0 ||
+      strcmp(decoded.truncated_fields, "parent_cmdline") != 0) {
     return 0;
   }
 
@@ -253,13 +257,15 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
   memset(record.cmdline, 'x', sizeof(record.cmdline) - 2u);
   record.cmdline[sizeof(record.cmdline) - 2u] = (char)0xc3;
   record.cmdline[sizeof(record.cmdline) - 1u] = (char)0xa9;
-  memset(expected, 'x', sizeof(expected) - 2u);
-  expected[sizeof(expected) - 2u] = '\0';
+  /* The wire field remains 4 KiB.  The source-side 8 KiB command is clipped
+   * to the largest complete UTF-8 prefix that fits in that wire field. */
+  memset(expected, 'x', sizeof(decoded.cmdline) - 1u);
+  expected[sizeof(decoded.cmdline) - 1u] = '\0';
   if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
       strcmp(decoded.transport_completeness, "TRUNCATED") != 0 ||
       strcmp(decoded.truncated_fields, "cmdline") != 0 ||
       strcmp(decoded.cmdline, expected) != 0 ||
-      strlen(decoded.cmdline) != sizeof(record.cmdline) - 2u) {
+      strlen(decoded.cmdline) != sizeof(decoded.cmdline) - 1u) {
     return 0;
   }
   return 1;

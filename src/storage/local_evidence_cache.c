@@ -72,10 +72,10 @@ typedef struct {
   char tenant_id[64];
   char name[256];
   char path[EDR_BR_STR_LONG];
-  char cmdline[EDR_BR_STR_LONG];
+  char cmdline[EDR_BR_STR_CMDLINE];
   char parent_name[256];
   char parent_path[512];
-  char parent_cmdline[EDR_BR_STR_LONG];
+  char parent_cmdline[EDR_BR_STR_CMDLINE];
   /* Only provenance for fields retained by this cache is stored.  Keeping
    * each origin list separate lets a later complete update replace one fact
    * without erasing or inheriting another field's omission. */
