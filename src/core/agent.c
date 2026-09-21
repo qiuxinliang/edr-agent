@@ -263,6 +263,7 @@ static const char *edr_agent_config_public_key_pem(const EdrConfig *cfg) {
   }
   return "";
 }
+#endif
 
 static int b64url_val(char c) {
   if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -299,6 +300,7 @@ static int b64url_decode(const char *in, unsigned char *out, size_t out_cap, siz
   return 0;
 }
 
+#ifdef EDR_HAVE_OPENSSL_HTTP
 static void b64url_encode(const unsigned char *in, size_t in_len, char *out, size_t out_cap) {
   static const char *tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   size_t o = 0;
