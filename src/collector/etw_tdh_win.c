@@ -468,6 +468,10 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   out_event->event_id = rec->EventHeader.EventDescriptor.Id;
   out_event->opcode = rec->EventHeader.EventDescriptor.Opcode;
   out_event->pid = rec->EventHeader.ProcessId;
+  /* Kernel-Network's header names the logger, not necessarily the socket
+   * owner. A missing payload PID must remain unknown, never header fallback. */
+  if (memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_NETWORK, sizeof(GUID)) == 0)
+    out_event->pid = 0u;
   snprintf(out_event->provider, sizeof(out_event->provider), "%s", prov_tag ? prov_tag : "unknown");
 
   static const PCWSTR proc_try[] = {

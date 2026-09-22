@@ -33,6 +33,7 @@
 #include "edr/p0_source_only_contract.h"
 #include "edr/pmfe.h"
 #include "edr/process_generation.h"
+#include "edr/windows_file_identity.h"
 #include "edr/process_tree_cache.h"
 #include "edr/sensor_interest.h"
 #include "edr/sha256.h"
@@ -52,6 +53,16 @@
 
 #include <string.h>
 #include <stdio.h>
+#ifdef EDR_COLLECTOR_NETWORK_TESTING
+#include "collector_network_test.h"
+/* Only external process I/O is replaced; binding, filtering and encoding
+ * below are the production implementation. */
+#define OpenProcess edr_network_test_open_process
+#define CloseHandle edr_network_test_close_handle
+#define GetProcessTimes edr_network_test_process_times
+#define edr_process_generation_query_live edr_network_test_query_generation
+#define edr_windows_process_image_path_utf8 edr_network_test_image_path
+#endif
 #include <stdlib.h>
 #include <wchar.h>
 
@@ -327,7 +338,8 @@ typedef struct {
 
 static EdrEtwSemanticCacheEntry s_etw_semantic_cache[EDR_ETW_SEMANTIC_CACHE_SIZE];
 
-static int edr_collector_should_admit_slot(EdrEventSlot *slot);
+static int edr_collector_should_admit_slot(EdrEventSlot *slot,
+                                          EdrSensorInterestEvent *network_interest);
 static int edr_collector_file_event_type(EdrEventType t);
 static int edr_collector_registry_event_type(EdrEventType t);
 static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
@@ -1437,7 +1449,7 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
   }
   edr_collector_debug_tdh_payload(slot, debug_tag);
   slot->priority = edr_priority_from_utf8_payload(slot->data, slot->size);
-  if (!edr_collector_should_admit_slot(slot)) {
+  if (!edr_collector_should_admit_slot(slot, NULL)) {
     s_health.collector_dropped++;
     return 0;
   }
@@ -4065,8 +4077,90 @@ static int edr_collector_known_low_value_file_record(const EdrBehaviorRecord *br
   return 0;
 }
 
-static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
+/* Kernel-Network names the socket owner in its payload. The header's
+ * ProcessStartKey belongs to the logging process, not necessarily that owner.
+ * Resolve the payload PID using one process handle and the source event time,
+ * before any predicate which requires a process name. Never query a name by
+ * PID separately, or turn a delayed event into the current PID generation. */
+static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
+  HANDLE process = NULL;
+  EdrLiveProcessGeneration live;
+  FILETIME created, exited, kernel, user;
+  uint64_t created_at, exited_at;
+  char reason[64] = "network_actor_pid_unavailable";
+  char path[EDR_BR_STR_LONG];
+  const char *base;
+  int ok = 0;
+  if (!br) return 0;
+  memset(&live, 0, sizeof(live));
+  if (!br->pid) goto done;
+  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
+  if (!process) {
+    snprintf(reason, sizeof(reason), "network_actor_open_failed");
+    goto done;
+  }
+  if (!edr_process_generation_query_live(process, &live, reason, sizeof(reason))) goto done;
+  if (live.pid != br->pid || !live.process_start_key ||
+      (br->process_start_key && br->process_start_key != live.process_start_key) ||
+      !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    snprintf(reason, sizeof(reason), "network_actor_generation_mismatch");
+    goto done;
+  }
+  created_at = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  exited_at = ((uint64_t)exited.dwHighDateTime << 32u) | exited.dwLowDateTime;
+  if (created_at != live.creation_filetime_100ns ||
+      (br->process_creation_filetime_100ns &&
+       br->process_creation_filetime_100ns != created_at) ||
+      br->event_time_ns <= 0 ||
+      !edr_process_generation_contains_event(created_at, (uint64_t)br->event_time_ns) ||
+      (exited_at && edr_process_generation_contains_event(exited_at,
+                                                         (uint64_t)br->event_time_ns))) {
+    snprintf(reason, sizeof(reason), "network_actor_event_time_mismatch");
+    goto done;
+  }
+  if (!edr_windows_process_image_path_utf8(process, path, sizeof(path)) || !path[0]) {
+    snprintf(reason, sizeof(reason), "network_actor_image_unavailable");
+    goto done;
+  }
+  base = path;
+  for (const char *c = path; *c; ++c) if (*c == '\\' || *c == '/') base = c + 1;
+  if (!base[0] || strlen(base) >= sizeof(br->process_name)) {
+    snprintf(reason, sizeof(reason), "network_actor_name_unavailable");
+    goto done;
+  }
+  br->process_start_key = live.process_start_key;
+  br->process_creation_filetime_100ns = live.creation_filetime_100ns;
+  edr_copy_trunc(br->exe_path, sizeof(br->exe_path), path);
+  edr_copy_trunc(br->process_name, sizeof(br->process_name), base);
+  snprintf(reason, sizeof(reason), "network_pid_event_time_live_telemetry");
+  ok = 1;
+done:
+  if (process) CloseHandle(process);
+  edr_copy_trunc(br->process_generation_source, sizeof(br->process_generation_source), reason);
+  return ok;
+}
+
+static int edr_collector_network_writeback_actor(EdrEventSlot *slot,
+                                                  const EdrBehaviorRecord *br,
+                                                  int bound) {
+  char key[32], birth[32];
+  if (edr_collector_slot_append_kv(slot, "process_generation_source",
+                                   br->process_generation_source) != EDR_SLOT_KV_APPENDED) return 0;
+  if (!bound) return 1; /* Keep port facts without inventing an actor identity. */
+  snprintf(key, sizeof(key), "%llu", (unsigned long long)br->process_start_key);
+  snprintf(birth, sizeof(birth), "%llu", (unsigned long long)br->process_creation_filetime_100ns);
+  return edr_collector_slot_append_kv(slot, "process_start_key", key) == EDR_SLOT_KV_APPENDED &&
+      edr_collector_slot_append_kv(slot, "process_creation_filetime_100ns", birth) == EDR_SLOT_KV_APPENDED &&
+      edr_collector_slot_append_kv(slot, "img", br->exe_path) == EDR_SLOT_KV_APPENDED &&
+      edr_collector_slot_append_kv(slot, "img_canonical", br->exe_path) == EDR_SLOT_KV_APPENDED &&
+      edr_collector_slot_append_kv(slot, "img_resolution_status", "RESOLVED") == EDR_SLOT_KV_APPENDED &&
+      edr_collector_slot_append_kv(slot, "img_resolution_source", "live_same_generation") == EDR_SLOT_KV_APPENDED;
+}
+
+static int edr_collector_should_admit_slot(EdrEventSlot *slot,
+                                          EdrSensorInterestEvent *network_interest) {
   EdrBehaviorRecord br;
+  int network_actor_bound = 0;
   if (!slot) {
     return 0;
   }
@@ -4074,6 +4168,14 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
     return 1;
   }
   edr_behavior_from_slot(slot, &br);
+  if (network_interest) {
+    /* An absent Kernel-Network payload PID cannot be replaced by the logger. */
+    if (!network_interest->pid || br.pid != network_interest->pid) {
+      s_health.metadata_dropped++;
+      return 0;
+    }
+    network_actor_bound = edr_collector_network_bind_actor(&br);
+  }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
     /* A preceding Security 4688 observation may already hold target identity
      * for this PID generation. Merge it before admission/matching; PID alone
@@ -4091,6 +4193,27 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot) {
   if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
       br.exe_path[0] && !br.network_aux_path[0]) {
     edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
+  }
+  if (network_interest) {
+    network_interest->process_start_key = br.process_start_key;
+    edr_copy_trunc(network_interest->process_name, sizeof(network_interest->process_name), br.process_name);
+    if (!network_interest->path[0] && br.cmdline[0])
+      edr_copy_trunc(network_interest->path, sizeof(network_interest->path), br.cmdline);
+    if (!edr_sensor_interest_should_admit(network_interest)) {
+      if (!network_actor_bound) {
+        uint64_t count = ++s_health.process_start_key_missing_events;
+        if (count <= 3u || (count & (count - 1u)) == 0u)
+          fprintf(stderr, "[collector] network interest unresolved pid=%u at=%lld port=%u count=%llu reason=%s\n",
+                  br.pid, (long long)br.event_time_ns, br.net_dport,
+                  (unsigned long long)count, br.process_generation_source);
+      }
+      return 0;
+    }
+    if (!edr_collector_network_writeback_actor(slot, &br, network_actor_bound) ||
+        (br.cmdline[0] && edr_collector_slot_append_command(slot, &br) != EDR_SLOT_KV_APPENDED)) {
+      s_health.metadata_dropped++;
+      return 0; /* A partial identity is never published or used downstream. */
+    }
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE && edr_collector_valid_process_create_record(&br)) {
     edr_collector_pid_cache_update(&br);
@@ -4266,6 +4389,9 @@ static void edr_collector_file_context_failure(EdrEventType type, const char *re
 
 static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
                                               const char *tag, uint64_t timestamp_ns) {
+  EdrSensorInterestEvent interest_event;
+  const int is_network = ty == EDR_EVENT_NET_CONNECT || ty == EDR_EVENT_NET_LISTEN;
+  int have_network_interest = 0;
   char file_read_path[EDR_BR_STR_LONG];
   const char *file_read_gate_reason = NULL;
   uint64_t file_read_key = 0u;
@@ -4277,6 +4403,12 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                          (edr_kernel_file_create_descriptor(&event_record->EventHeader.EventDescriptor) ||
                           edr_kernel_file_create_new_descriptor(&event_record->EventHeader.EventDescriptor)));
   if (!s_bus || !event_record || !tag) {
+    return;
+  }
+  if (is_network && !timestamp_ns) {
+    /* The callback clock cannot authorize a PID generation for an event
+     * whose provider timestamp is missing. */
+    s_health.metadata_dropped++;
     return;
   }
   file_read_path[0] = '\0';
@@ -4324,9 +4456,9 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     edr_pmfe_on_process_lifecycle_hint();
   }
   {
-    EdrSensorInterestEvent interest_event;
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
-      if (ty != EDR_EVENT_PROCESS_CREATE && ty != EDR_EVENT_PROCESS_TERMINATE) {
+      have_network_interest = is_network;
+      if (!is_network && ty != EDR_EVENT_PROCESS_CREATE && ty != EDR_EVENT_PROCESS_TERMINATE) {
         (void)edr_collector_event_process_start_key(event_record,
                                                     &interest_event.process_start_key);
       }
@@ -4370,13 +4502,13 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
       }
       {
         int new_self_generation = 0;
-        if (edr_agent_self_suppress_interest(&interest_event, &new_self_generation)) {
+        if (!is_network && edr_agent_self_suppress_interest(&interest_event, &new_self_generation)) {
           edr_agent_self_count_drop_source(edr_unix_ns(), EDR_AGENT_SELF_DROP_INTEREST,
                                            new_self_generation);
           return;
         }
       }
-      if (!edr_sensor_interest_should_admit(&interest_event)) {
+      if (!is_network && !edr_sensor_interest_should_admit(&interest_event)) {
         s_health.collector_dropped++;
         return;
       }
@@ -4464,7 +4596,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     }
   }
 
-  if (!edr_collector_should_admit_slot(&slot)) {
+  if (!edr_collector_should_admit_slot(&slot, have_network_interest ? &interest_event : NULL)) {
     s_health.collector_dropped++;
     return;
   }
@@ -4531,6 +4663,25 @@ int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
 void edr_collector_file_io_test_health(EdrCollectorHealth *health) {
   *health = s_health;
   edr_collector_file_read_metadata_gate_copy_health(health);
+}
+#endif
+
+#ifdef EDR_COLLECTOR_NETWORK_TESTING
+void edr_collector_network_test_reset(EdrEventBus *bus) {
+  s_bus = bus;
+  s_agent_pid = GetCurrentProcessId();
+  memset(&s_health, 0, sizeof(s_health));
+  memset(s_pid_cache, 0, sizeof(s_pid_cache));
+  s_pid_cache_next = 0u;
+}
+
+void edr_collector_network_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
+  edr_collector_decode_mapped_event(record, EDR_EVENT_NET_CONNECT, "knet", event_ns);
+}
+
+void edr_collector_network_test_health(EdrCollectorHealth *out) { *out = s_health; }
+int edr_collector_network_test_bind_actor(EdrBehaviorRecord *record) {
+  return edr_collector_network_bind_actor(record);
 }
 #endif
 

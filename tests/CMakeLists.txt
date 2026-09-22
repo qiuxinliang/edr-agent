@@ -386,6 +386,7 @@ if(WIN32)
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
     ${CMAKE_SOURCE_DIR}/src/core/time_util.c
     ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
   target_include_directories(test_collector_file_read_windows PRIVATE
@@ -405,13 +406,44 @@ if(WIN32)
 
   add_executable(test_etw_network_decode_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c
-    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/collector_network_stubs.c
+    ${CMAKE_SOURCE_DIR}/src/collector/collector_win.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/adaptive_collection.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/sensor_interest.c
+    ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
+    ${CMAKE_SOURCE_DIR}/src/core/time_util.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
   target_include_directories(test_etw_network_decode_windows PRIVATE
-    ${CMAKE_SOURCE_DIR}/include)
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_etw_network_decode_windows PRIVATE
-    EDR_TDH_TESTING=1)
+    EDR_TDH_TESTING=1 EDR_COLLECTOR_NETWORK_TESTING=1)
+  if(MSVC)
+    target_compile_options(test_etw_network_decode_windows PRIVATE /Gy /Gw)
+    target_link_options(test_etw_network_decode_windows PRIVATE /OPT:REF /INCREMENTAL:NO)
+  else()
+    target_compile_options(test_etw_network_decode_windows PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(test_etw_network_decode_windows PRIVATE -Wl,--gc-sections)
+  endif()
+  target_link_libraries(test_etw_network_decode_windows PRIVATE tdh advapi32 wevtapi)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
   edr_apply_test_warnings(test_etw_network_decode_windows)
   add_test(NAME etw_network_decode_native COMMAND test_etw_network_decode_windows)
+  set_tests_properties(etw_network_decode_native PROPERTIES
+    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json")
 
   add_executable(test_security_event_time_windows test_security_event_time_windows.c)
   target_link_libraries(test_security_event_time_windows PRIVATE wevtapi)
