@@ -793,6 +793,7 @@ target_include_directories(edr_agent PRIVATE
 )
 target_compile_definitions(edr_agent PRIVATE
   EDR_HAVE_NANOPB=1
+  PB_FIELD_32BIT=1
   "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\""
   "EDR_AGENT_UPDATE_SCRIPT_PATH=\"edr_agent_inplace_update.ps1\""
 )

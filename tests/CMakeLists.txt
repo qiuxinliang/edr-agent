@@ -700,7 +700,7 @@ target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/third_party/cjson
   ${CMAKE_SOURCE_DIR}/src/proto
 )
-target_compile_definitions(edr_ave_test_common INTERFACE EDR_HAVE_NANOPB=1)
+target_compile_definitions(edr_ave_test_common INTERFACE EDR_HAVE_NANOPB=1 PB_FIELD_32BIT=1)
 target_link_libraries(edr_ave_test_common INTERFACE Threads::Threads)
 if(SQLite3_FOUND)
   if(TARGET SQLite3::SQLite3)

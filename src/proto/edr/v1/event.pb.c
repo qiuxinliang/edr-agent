@@ -6,6 +6,13 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
+
+/* The following messages exceed 64kB in size: edr_v1_BehaviorEvent */
+
+/* The PB_FIELD_32BIT compilation option must be defined to support messages that exceed 64 kB in size. */
+#ifndef PB_FIELD_32BIT
+#error Enable PB_FIELD_32BIT to support messages exceeding 64kB in size: edr_v1_BehaviorEvent
+#endif
 PB_BIND(edr_v1_AveBehaviorEventFeed, edr_v1_AveBehaviorEventFeed, 4)
 
 
