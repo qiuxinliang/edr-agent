@@ -2233,6 +2233,8 @@ static int sqlite_ensure_p0_candidate_columns(void) {
        "ALTER TABLE p0_candidates ADD COLUMN source_truncated_fields TEXT;"},
       {"normalized_command",
        "ALTER TABLE p0_candidates ADD COLUMN normalized_command TEXT;"},
+      {"normalized_command_truncated",
+       "ALTER TABLE p0_candidates ADD COLUMN normalized_command_truncated INTEGER NOT NULL DEFAULT 0;"},
       {"script_path", "ALTER TABLE p0_candidates ADD COLUMN script_path TEXT;"},
       {"exe_hash", "ALTER TABLE p0_candidates ADD COLUMN exe_hash TEXT;"},
       {"username", "ALTER TABLE p0_candidates ADD COLUMN username TEXT;"},
@@ -3089,10 +3091,11 @@ static int manifest_add_candidate_evidence(cJSON *root,
   cJSON *signature_copy = NULL;
   char normalized[EDR_BR_STR_LONG];
   char script_path[EDR_BR_STR_LONG];
+  int normalized_truncated;
   int ok;
   if (!root || !r) return 0;
-  edr_p0_normalize_command_for_evidence(r->cmdline, normalized,
-                                        sizeof(normalized));
+  normalized_truncated = edr_p0_normalize_command_for_evidence(
+      r->cmdline, normalized, sizeof(normalized));
   (void)edr_p0_extract_script_path(r->cmdline, script_path,
                                    sizeof(script_path));
   command = cJSON_CreateObject();
@@ -3101,6 +3104,8 @@ static int manifest_add_candidate_evidence(cJSON *root,
   if (!command || !identity || !artifact) goto fail;
   ok = manifest_add_text(command, "raw", r->cmdline) &&
        manifest_add_text(command, "normalized", normalized) &&
+       cJSON_AddBoolToObject(command, "normalized_truncated",
+                             normalized_truncated) != NULL &&
        manifest_add_text(command, "script_path", script_path) &&
        manifest_add_text(identity, "username", r->username) &&
        manifest_add_text(identity, "domain", r->domain) &&
@@ -4034,14 +4039,15 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   const char *generation_source;
   char normalized_command[EDR_BR_STR_LONG];
   char script_path[EDR_BR_STR_LONG];
+  int normalized_command_truncated;
   if (!s_db || !r) {
     set_error("evidence cache database unavailable");
     return -1;
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
-  edr_p0_normalize_command_for_evidence(r->cmdline, normalized_command,
-                                        sizeof(normalized_command));
+  normalized_command_truncated = edr_p0_normalize_command_for_evidence(
+      r->cmdline, normalized_command, sizeof(normalized_command));
   (void)edr_p0_extract_script_path(r->cmdline, script_path,
                                    sizeof(script_path));
   char computed_candidate_id[160];
@@ -4061,9 +4067,9 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,reg_key_path,"
       "reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns,"
       "process_start_key,process_creation_filetime_100ns,process_generation_source,"
-      "source_completeness,source_truncated_fields,normalized_command,script_path,exe_hash,"
+      "source_completeness,source_truncated_fields,normalized_command,normalized_command_truncated,script_path,exe_hash,"
       "username,user_sid,identity_source,identity_quality) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(candidate_id) DO UPDATE SET "
       "tenant_id=CASE WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE p0_candidates.tenant_id END,"
       "event_time_ns=CASE WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
@@ -4106,6 +4112,7 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "WHEN 'NOT_EVALUABLE' THEN 2 WHEN 'COALESCE_BACKPRESSURE' THEN 1 ELSE 0 END) "
       "THEN excluded.source_truncated_fields ELSE p0_candidates.source_truncated_fields END,"
       "normalized_command=CASE WHEN excluded.normalized_command<>'' THEN excluded.normalized_command ELSE p0_candidates.normalized_command END,"
+      "normalized_command_truncated=CASE WHEN excluded.normalized_command<>'' THEN excluded.normalized_command_truncated ELSE p0_candidates.normalized_command_truncated END,"
       "script_path=CASE WHEN excluded.script_path<>'' THEN excluded.script_path ELSE p0_candidates.script_path END,"
       "exe_hash=CASE WHEN excluded.exe_hash<>'' THEN excluded.exe_hash ELSE p0_candidates.exe_hash END,"
       "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE p0_candidates.username END,"
@@ -4150,12 +4157,13 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   bind_text(st, 25, r->source_completeness);
   bind_text(st, 26, r->source_truncated_fields);
   bind_text(st, 27, normalized_command);
-  bind_text(st, 28, script_path);
-  bind_text(st, 29, r->exe_hash);
-  bind_text(st, 30, r->username);
-  bind_text(st, 31, r->user_sid);
-  bind_text(st, 32, r->identity_source);
-  bind_text(st, 33, r->identity_quality);
+  sqlite3_bind_int(st, 28, normalized_command_truncated);
+  bind_text(st, 29, script_path);
+  bind_text(st, 30, r->exe_hash);
+  bind_text(st, 31, r->username);
+  bind_text(st, 32, r->user_sid);
+  bind_text(st, 33, r->identity_source);
+  bind_text(st, 34, r->identity_quality);
   if (sqlite3_step(st) != SQLITE_DONE) {
     set_error("insert p0_candidates failed");
     sqlite3_finalize(st);
@@ -4466,6 +4474,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "context_post_until_ns INTEGER,created_ns INTEGER,process_start_key TEXT,"
       "process_creation_filetime_100ns TEXT,process_generation_source TEXT,"
       "source_completeness TEXT,source_truncated_fields TEXT,normalized_command TEXT,"
+      "normalized_command_truncated INTEGER NOT NULL DEFAULT 0,"
       "script_path TEXT,exe_hash TEXT,username TEXT,user_sid TEXT,identity_source TEXT,"
       "identity_quality TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_p0_candidates_ep_time ON p0_candidates(endpoint_id,event_time_ns);"

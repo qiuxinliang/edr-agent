@@ -29,7 +29,9 @@
 #include "edr/command_util.h"
 #include "edr/command_cancel.h"
 #include "edr/command_state.h"
+#include "edr/behavior_record.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/process_generation.h"
 #include "edr/response.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
@@ -703,15 +705,9 @@ static void query_process_file_metadata_cached(
     (*cache_count)++;
 }
 
-typedef LONG (WINAPI *RtqNtQueryInformationProcessFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-typedef struct rtq_unicode_string {
-    USHORT length;
-    USHORT maximum_length;
-    PWSTR buffer;
-} rtq_unicode_string;
-
-/* ProcessCommandLineInformation (60) is available on supported Windows 10/11
- * releases and avoids WMIC/CIM process spawning, locale parsing and hangs. */
+/* Use the same bounded, validated native query as process-generation-bound
+ * command consumers.  RTQ owns the PID-to-handle lookup here, while the
+ * shared helper owns reply validation and the UTF-8 capacity check. */
 static int query_process_cmdline_native(DWORD pid, char *cmd, size_t cap, DWORD *error_code) {
     if (cmd && cap > 0) cmd[0] = '\0';
     if (error_code) *error_code = ERROR_SUCCESS;
@@ -722,53 +718,31 @@ static int query_process_cmdline_native(DWORD pid, char *cmd, size_t cap, DWORD 
         if (error_code) *error_code = GetLastError();
         return -1;
     }
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    RtqNtQueryInformationProcessFn query = ntdll
-        ? (RtqNtQueryInformationProcessFn)(void *)GetProcAddress(ntdll, "NtQueryInformationProcess")
-        : NULL;
-    if (!query) {
-        if (error_code) *error_code = ERROR_PROC_NOT_FOUND;
-        CloseHandle(process);
-        return -1;
-    }
-
-    ULONG needed = 0;
-    (void)query(process, 60u, NULL, 0u, &needed);
-    if (needed < sizeof(rtq_unicode_string) || needed > 1024u * 1024u) {
-        if (error_code) *error_code = ERROR_NOT_SUPPORTED;
-        CloseHandle(process);
-        return -1;
-    }
-    unsigned char *raw = (unsigned char *)calloc(1u, (size_t)needed + sizeof(wchar_t));
-    if (!raw) {
-        if (error_code) *error_code = ERROR_OUTOFMEMORY;
-        CloseHandle(process);
-        return -1;
-    }
-    LONG status = query(process, 60u, raw, needed, &needed);
+    char reason[64] = {0};
+    int ok = edr_process_command_line_query_live(process, cmd, cap,
+                                                 reason, sizeof(reason));
     CloseHandle(process);
-    if (status < 0) {
-        if (error_code) *error_code = status == (LONG)0xC0000022L ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE;
-        free(raw);
-        return -1;
-    }
+    if (ok) return 1;
 
-    rtq_unicode_string *value = (rtq_unicode_string *)raw;
-    if (!value->buffer || value->length == 0u) {
-        free(raw);
-        return 0;
+    if (error_code) {
+        if (strcmp(reason, "command_line_too_long") == 0) {
+            *error_code = ERROR_INSUFFICIENT_BUFFER;
+        } else if (strcmp(reason, "command_line_buffer_unavailable") == 0) {
+            *error_code = ERROR_OUTOFMEMORY;
+        } else if (strcmp(reason, "command_line_encoding_invalid") == 0 ||
+                   strcmp(reason, "command_line_encoding_failed") == 0) {
+            *error_code = ERROR_NO_UNICODE_TRANSLATION;
+        } else if (strcmp(reason, "command_line_reply_invalid") == 0) {
+            *error_code = ERROR_INVALID_DATA;
+        } else if (strcmp(reason, "command_line_api_unavailable") == 0) {
+            *error_code = ERROR_PROC_NOT_FOUND;
+        } else if (strcmp(reason, "command_line_query_failed") == 0) {
+            *error_code = ERROR_GEN_FAILURE;
+        } else {
+            *error_code = ERROR_GEN_FAILURE;
+        }
     }
-    size_t chars = (size_t)value->length / sizeof(wchar_t);
-    int written = WideCharToMultiByte(CP_UTF8, 0, value->buffer, (int)chars,
-                                      cmd, (int)(cap - 1u), NULL, NULL);
-    if (written <= 0) {
-        if (error_code) *error_code = GetLastError();
-        free(raw);
-        return -1;
-    }
-    cmd[written] = '\0';
-    free(raw);
-    return 1;
+    return -1;
 }
 
 static void ipv4_to_text(DWORD addr, char *out, size_t cap);
@@ -850,10 +824,16 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
     PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
     int count = 0;
-    int cmdline_required = f->process_cmdline[0] || f->script_content[0] || f->script_engine[0];
+    int cmdline_queried = 0;
     int cmdline_sampled = 0;
     int cmdline_access_denied = 0;
+    int cmdline_too_long = 0;
     int cmdline_failed = 0;
+    int parent_cmdline_queried = 0;
+    int parent_cmdline_sampled = 0;
+    int parent_cmdline_access_denied = 0;
+    int parent_cmdline_too_long = 0;
+    int parent_cmdline_failed = 0;
     rtq_process_file_metadata file_metadata_cache[RTQ_PROCESS_FILE_METADATA_CACHE_MAX];
     int file_metadata_cache_count = 0;
     memset(file_metadata_cache, 0, sizeof(file_metadata_cache));
@@ -870,13 +850,14 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
 
             char path[520] = {0};
             char user[260] = {0};
-            char cmdline[2048] = {0};
+            char cmdline[EDR_BR_STR_CMDLINE] = {0};
             char integrity[64] = {0};
             char exe_sha256[65] = {0};
             char signature[32] = {0};
             char parent_path[520] = {0};
-            char parent_cmdline[2048] = {0};
+            char parent_cmdline[EDR_BR_STR_CMDLINE] = {0};
             char parent_name[260] = {0};
+            int process_cmdline_queried = 0;
             if (ok && f->process_path[0]) {
                 query_process_path(pe.th32ProcessID, path, sizeof(path));
                 if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
@@ -887,10 +868,13 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
             }
             if (ok && (f->process_cmdline[0] || f->script_content[0] || f->script_engine[0])) {
                 DWORD cmdline_error = ERROR_SUCCESS;
+                process_cmdline_queried = 1;
+                cmdline_queried++;
                 int cmdline_rc = query_process_cmdline_native(pe.th32ProcessID, cmdline,
                                                               sizeof(cmdline), &cmdline_error);
                 if (cmdline_rc >= 0) cmdline_sampled++;
                 else if (cmdline_error == ERROR_ACCESS_DENIED) cmdline_access_denied++;
+                else if (cmdline_error == ERROR_INSUFFICIENT_BUFFER) cmdline_too_long++;
                 else cmdline_failed++;
                 if (f->process_cmdline[0] && !str_contains_icase(cmdline, f->process_cmdline)) ok = 0;
                 if (f->script_engine[0] && !str_contains_icase(name, f->script_engine) &&
@@ -900,9 +884,16 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
             if (ok && *total < RTQ_MAX_RESULTS) {
                 if (!path[0]) query_process_path(pe.th32ProcessID, path, sizeof(path));
                 if (!user[0]) query_process_user(pe.th32ProcessID, user, sizeof(user));
-                if (!cmdline[0]) {
-                    (void)query_process_cmdline_native(pe.th32ProcessID, cmdline,
-                                                       sizeof(cmdline), NULL);
+                if (!process_cmdline_queried) {
+                    DWORD cmdline_error = ERROR_SUCCESS;
+                    process_cmdline_queried = 1;
+                    cmdline_queried++;
+                    int cmdline_rc = query_process_cmdline_native(pe.th32ProcessID, cmdline,
+                                                                  sizeof(cmdline), &cmdline_error);
+                    if (cmdline_rc >= 0) cmdline_sampled++;
+                    else if (cmdline_error == ERROR_ACCESS_DENIED) cmdline_access_denied++;
+                    else if (cmdline_error == ERROR_INSUFFICIENT_BUFFER) cmdline_too_long++;
+                    else cmdline_failed++;
                 }
                 query_process_integrity_level(pe.th32ProcessID, integrity, sizeof(integrity));
                 if (path[0]) {
@@ -912,8 +903,15 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
                 }
                 if (pe.th32ParentProcessID > 0) {
                     query_process_path(pe.th32ParentProcessID, parent_path, sizeof(parent_path));
-                    (void)query_process_cmdline_native(pe.th32ParentProcessID, parent_cmdline,
-                                                       sizeof(parent_cmdline), NULL);
+                    DWORD parent_cmdline_error = ERROR_SUCCESS;
+                    parent_cmdline_queried++;
+                    int parent_cmdline_rc = query_process_cmdline_native(
+                        pe.th32ParentProcessID, parent_cmdline, sizeof(parent_cmdline),
+                        &parent_cmdline_error);
+                    if (parent_cmdline_rc >= 0) parent_cmdline_sampled++;
+                    else if (parent_cmdline_error == ERROR_ACCESS_DENIED) parent_cmdline_access_denied++;
+                    else if (parent_cmdline_error == ERROR_INSUFFICIENT_BUFFER) parent_cmdline_too_long++;
+                    else parent_cmdline_failed++;
                     if (parent_path[0]) {
                         const char *base = strrchr(parent_path, '\\');
                         snprintf(parent_name, sizeof(parent_name), "%s", base ? base + 1 : parent_path);
@@ -953,18 +951,48 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
         } while (Process32NextW(h, &pe));
     }
     CloseHandle(h);
-    if (cmdline_required && cmdline_sampled == 0 && (cmdline_access_denied + cmdline_failed) > 0) {
+    if (cmdline_queried && cmdline_too_long > 0) {
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "native process_cmdline exceeded the bounded UTF-8 capacity of %u bytes; omitted and not used as complete match text; too_long=%d",
+                 (unsigned)(EDR_BR_STR_CMDLINE - 1u), cmdline_too_long);
+        rtq_error_append(errs, "process_cmdline", "too_long", message, 0);
+    }
+    if (cmdline_queried && cmdline_sampled == 0 &&
+        (cmdline_access_denied + cmdline_failed) > 0) {
         char message[256];
         snprintf(message, sizeof(message),
                  "native command-line sampling unavailable for all candidates; access_denied=%d failed=%d",
                  cmdline_access_denied, cmdline_failed);
         rtq_error_append(errs, "process_cmdline", "collector_unavailable", message, 0);
-    } else if (cmdline_required && (cmdline_access_denied + cmdline_failed) > 0) {
+    } else if (cmdline_queried && (cmdline_access_denied + cmdline_failed) > 0) {
         char message[256];
         snprintf(message, sizeof(message),
                  "native command-line sampling was partial; sampled=%d access_denied=%d failed=%d",
                  cmdline_sampled, cmdline_access_denied, cmdline_failed);
         rtq_error_append(errs, "process_cmdline", "partial_access", message, 0);
+    }
+    if (parent_cmdline_queried && parent_cmdline_too_long > 0) {
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "native parent_cmdline exceeded the bounded UTF-8 capacity of %u bytes; omitted from the row; too_long=%d",
+                 (unsigned)(EDR_BR_STR_CMDLINE - 1u), parent_cmdline_too_long);
+        rtq_error_append(errs, "parent_cmdline", "too_long", message, 0);
+    }
+    if (parent_cmdline_queried && parent_cmdline_sampled == 0 &&
+        (parent_cmdline_access_denied + parent_cmdline_failed) > 0) {
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "native parent_cmdline sampling unavailable for all rows; access_denied=%d failed=%d",
+                 parent_cmdline_access_denied, parent_cmdline_failed);
+        rtq_error_append(errs, "parent_cmdline", "collector_unavailable", message, 0);
+    } else if (parent_cmdline_queried &&
+               (parent_cmdline_access_denied + parent_cmdline_failed) > 0) {
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "native parent_cmdline sampling was partial; sampled=%d access_denied=%d failed=%d",
+                 parent_cmdline_sampled, parent_cmdline_access_denied, parent_cmdline_failed);
+        rtq_error_append(errs, "parent_cmdline", "partial_access", message, 0);
     }
     return count;
 }

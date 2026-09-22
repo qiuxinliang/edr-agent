@@ -12,8 +12,10 @@
 /* Canonical command evidence shared by maintenance-baseline matching and the
  * durable candidate manifest.  The normalizer is intentionally syntactic: it
  * never expands variables or resolves paths under an event actor's identity. */
-void edr_p0_normalize_command_for_evidence(const char *input, char *out,
-                                           size_t out_cap);
+/* Returns non-zero when the normalized derived value could not contain the
+ * complete normalized input. The raw command remains authoritative. */
+int edr_p0_normalize_command_for_evidence(const char *input, char *out,
+                                          size_t out_cap);
 
 /* Extracts the first explicit script argument from a Windows command line.
  * Returns 1 only for a bounded token ending in a supported script extension. */

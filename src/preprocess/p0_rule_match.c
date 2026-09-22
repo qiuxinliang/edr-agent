@@ -64,29 +64,39 @@ static int cistr_find(const char *hay, const char *needle) {
   return strstr(hbuf, nbuf) != NULL;
 }
 
-void edr_p0_normalize_command_for_evidence(const char *input, char *out,
-                                           size_t out_cap) {
+int edr_p0_normalize_command_for_evidence(const char *input, char *out,
+                                          size_t out_cap) {
   size_t used = 0u;
   int pending_space = 0;
-  if (!out || out_cap == 0u) return;
+  int truncated = 0;
+  if (!out || out_cap == 0u) return input && input[0] ? 1 : 0;
   out[0] = '\0';
-  if (!input) return;
-  for (const char *p = input; *p && used + 1u < out_cap; ++p) {
+  if (!input) return 0;
+  for (const char *p = input; *p; ++p) {
     char c = *p;
     if (c == '"' || c == '\'') continue;
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
       pending_space = used > 0u ? 1 : 0;
       continue;
     }
-    if (pending_space && used + 1u < out_cap) {
+    if (pending_space) {
+      if (used + 2u >= out_cap) {
+        truncated = 1;
+        break;
+      }
       out[used++] = ' ';
       pending_space = 0;
+    }
+    if (used + 1u >= out_cap) {
+      truncated = 1;
+      break;
     }
     if (c == '\\') c = '/';
     else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
     out[used++] = c;
   }
   out[used] = '\0';
+  return truncated;
 }
 
 static int p0_command_token_next(const char **cursor, char *out,

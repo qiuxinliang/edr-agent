@@ -3812,9 +3812,31 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
         if (edr_process_command_line_query_live(process, command_line,
                                                 sizeof(command_line), reason,
                                                 sizeof(reason))) {
-          (void)edr_collector_slot_append_kv(slot, "cmd", command_line);
-          (void)edr_collector_slot_append_kv(slot, "command_line_origin",
-                                             "live_same_generation");
+          EdrSlotKvResult command_result = edr_collector_slot_append_kv(
+              slot, "cmd", command_line);
+          EdrSlotKvResult origin_result = EDR_SLOT_KV_EMPTY;
+          if (command_result == EDR_SLOT_KV_APPENDED) {
+            origin_result = edr_collector_slot_append_kv(
+                slot, "command_line_origin", "live_same_generation");
+          }
+          if (command_result != EDR_SLOT_KV_APPENDED ||
+              origin_result != EDR_SLOT_KV_APPENDED) {
+            /* The live query is authoritative only when both the value and
+             * its provenance fit. Preserve an explicit loss marker when the
+             * envelope rejects either append; never publish an unlabelled
+             * missing enrichment. */
+            s_health.metadata_dropped++;
+            if (edr_collector_slot_append_kv(
+                    slot, "source_completeness", "TRUNCATED") !=
+                EDR_SLOT_KV_APPENDED) {
+              s_health.metadata_dropped++;
+            }
+            if (edr_collector_slot_append_kv(
+                    slot, "source_truncated_fields", "source.cmdline") !=
+                EDR_SLOT_KV_APPENDED) {
+              s_health.metadata_dropped++;
+            }
+          }
         }
       }
       CloseHandle(process);

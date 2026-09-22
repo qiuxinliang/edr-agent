@@ -180,11 +180,13 @@ static void test_high_signal_process_is_candidate(void) {
 static void test_command_evidence_normalization_and_script_path(void) {
   char normalized[1024];
   char script_path[1024];
+  char long_command[EDR_BR_STR_CMDLINE];
+  char long_normalized[EDR_BR_STR_LONG];
   const char *command =
       "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\"  "
       "-NoProfile -File \"C:\\Ops\\Maintenance Script.ps1\"";
-  edr_p0_normalize_command_for_evidence(command, normalized,
-                                        sizeof(normalized));
+  assert(edr_p0_normalize_command_for_evidence(command, normalized,
+                                               sizeof(normalized)) == 0);
   assert(strcmp(normalized,
                 "c:/windows/system32/windowspowershell/v1.0/powershell.exe "
                 "-noprofile -file c:/ops/maintenance script.ps1") == 0);
@@ -193,6 +195,19 @@ static void test_command_evidence_normalization_and_script_path(void) {
   assert(strcmp(script_path, "C:\\Ops\\Maintenance Script.ps1") == 0);
   assert(edr_p0_extract_script_path("powershell.exe -Command Get-Process",
                                     script_path, sizeof(script_path)) == 0);
+
+  memset(long_command, 'A', sizeof(long_command) - 1u);
+  long_command[sizeof(long_command) - 1u] = '\0';
+  assert(edr_p0_normalize_command_for_evidence(
+             long_command, long_normalized, sizeof(long_normalized)) == 1);
+  assert(strlen(long_normalized) == sizeof(long_normalized) - 1u);
+  /* Whitespace removed by normalization does not count as lost command data. */
+  memset(long_command, 'A', sizeof(long_normalized) - 1u);
+  memset(long_command + sizeof(long_normalized) - 1u, ' ',
+         sizeof(long_command) - sizeof(long_normalized));
+  long_command[sizeof(long_command) - 1u] = '\0';
+  assert(edr_p0_normalize_command_for_evidence(
+             long_command, long_normalized, sizeof(long_normalized)) == 0);
 }
 
 static void test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise(void) {
@@ -4279,6 +4294,8 @@ static void test_candidate_structured_evidence_and_durable_identity(void) {
                   : NULL;
   assert(cJSON_IsObject(command) && cJSON_IsObject(identity) &&
          cJSON_IsObject(artifact) && cJSON_IsObject(signature));
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(
+      command, "normalized_truncated")));
   assert(strcmp(cJSON_GetObjectItemCaseSensitive(command, "script_path")->valuestring,
                 "C:\\Ops\\Maintenance Script.ps1") == 0);
   assert(strstr(cJSON_GetObjectItemCaseSensitive(command, "normalized")->valuestring,
@@ -4295,7 +4312,8 @@ static void test_candidate_structured_evidence_and_durable_identity(void) {
   assert(sqlite3_prepare_v2(
              db,
              "SELECT normalized_command,script_path,exe_hash,username,user_sid,"
-             "identity_source,identity_quality FROM p0_candidates WHERE candidate_id=?;",
+             "identity_source,identity_quality,normalized_command_truncated "
+             "FROM p0_candidates WHERE candidate_id=?;",
              -1, &stmt, NULL) == SQLITE_OK);
   assert(sqlite3_bind_text(stmt, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
   assert(sqlite3_step(stmt) == SQLITE_ROW);
@@ -4308,6 +4326,7 @@ static void test_candidate_structured_evidence_and_durable_identity(void) {
   assert(strcmp((const char *)sqlite3_column_text(stmt, 4), "S-1-5-21-1000") == 0);
   assert(strcmp((const char *)sqlite3_column_text(stmt, 5), "target_4688") == 0);
   assert(strcmp((const char *)sqlite3_column_text(stmt, 6), "target_4688") == 0);
+  assert(sqlite3_column_int(stmt, 7) == 0);
   sqlite3_finalize(stmt);
   assert(sqlite3_close(db) == SQLITE_OK);
 

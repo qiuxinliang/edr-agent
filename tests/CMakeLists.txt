@@ -317,6 +317,18 @@ set_tests_properties(windows_unicode_path_source_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
 if(WIN32)
+  add_executable(test_rtq_long_command_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_rtq_long_command_windows.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
+  target_include_directories(test_rtq_long_command_windows PRIVATE
+    ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(test_rtq_long_command_windows PRIVATE advapi32)
+  edr_apply_test_warnings(test_rtq_long_command_windows)
+  add_test(NAME rtq_long_command_windows
+    COMMAND test_rtq_long_command_windows)
+endif()
+
+if(WIN32)
   add_executable(test_windows_unicode_path_native
     ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_unicode_path_native.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c)
@@ -351,6 +363,7 @@ if(WIN32)
   edr_apply_test_warnings(test_process_generation_windows)
   add_test(NAME process_generation_same_handle_command_line
     COMMAND test_process_generation_windows)
+
   add_executable(test_kernel_file_io_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_file_io_windows.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_file_object_binding.c

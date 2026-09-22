@@ -182,6 +182,12 @@ int main(void) {
                          "4688 creator variables must be declared in collector source");
   ok &= require_contains(collector, "EdrSlotKvResult rp = edr_collector_slot_append_kv",
                          "4688 must use checked atomic ETW1 field appends");
+  ok &= require_contains(collector, "EdrSlotKvResult command_result = edr_collector_slot_append_kv",
+                         "live process enrichment must check command append capacity");
+  ok &= require_contains(collector, "origin_result != EDR_SLOT_KV_APPENDED",
+                         "live process enrichment must not publish provenance without its command");
+  ok &= require_contains(collector, "source_truncated_fields",
+                         "live command append failure must expose an explicit loss marker");
   ok &= require_contains(collector, "security_4688_required_overflow_dropped++",
                          "4688 must drop incomplete required payloads rather than truncate");
   ok &= require_contains(collector, "EDR_SLOT_KV_VALUE_TOO_LONG",
