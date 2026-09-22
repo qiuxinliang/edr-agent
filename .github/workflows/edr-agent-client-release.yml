@@ -413,11 +413,11 @@ jobs:
         shell: pwsh
         run: Write-Warning 'Shared dependency cache was not published; this build may continue, but a later tag may rebuild dependencies. See the publication step.'
 
-      # The shared Release already persists dependencies across tags. Save the
-      # ref-local Actions copy only if that publication failed, before product
-      # gates run; avoid uploading the same closure twice on the success path.
+      # Persist the completed local closure even if the immutable shared Release
+      # already existed. Downloading a snapshot is not proof of an ABI cache hit;
+      # rebuilt packages must remain available to reruns of this ref.
       - name: Save completed vcpkg dependencies
-        if: steps.shared-vcpkg-publish.outcome != 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
         uses: actions/cache/save@v5
         with:
           path: |

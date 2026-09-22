@@ -673,7 +673,12 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.assertLess(steps.index(install), steps.index(publish))
                     self.assertLess(steps.index(publish), steps.index(consumer))
                     self.assertIn("steps.shared-vcpkg-publish.outcome == 'failure'", source)
-                    self.assertIn("if: steps.shared-vcpkg-publish.outcome != 'success' &&", save)
+                    # A shared archive can exist without matching current ABIs.
+                    # Persist the completed local closure even after a successful
+                    # (including already-published) shared publication step.
+                    condition = re.search(r'(?m)^\s*if: (.*)$', save)
+                    self.assertIsNotNone(condition)
+                    self.assertEqual(condition[1], "steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''")
                     self.assertLess(steps.index(publish), steps.index(save))
                 for marker in re.findall(r'(?m)^\s*\$installed_marker = (.*)$', source):
                     self.assertEqual(marker, 'Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\\vcpkg\\status"')

@@ -83,6 +83,77 @@ function Get-VcpkgFailureDisposition {
   return [pscustomobject]@{ Retry = $false; Reason = 'unclassified failure' }
 }
 
+function Get-VcpkgAttemptSummary {
+  param([string[]] $Lines, [int] $Attempt, [int] $ExitCode, [double] $ElapsedSeconds)
+
+  $restored = 0
+  $restoreCountObserved = $false
+  $sourcePackages = [ordered]@{}
+  foreach ($line in $Lines) {
+    # Only vcpkg's binary restore result proves an ABI cache hit. A downloaded
+    # source archive, or a restored Actions archive, does not prove reuse.
+    if ($line -match '^Restored (\d+) package\(s\) from ') {
+      $restored += [int]$Matches[1]
+      $restoreCountObserved = $true
+    }
+    elseif ($line -match '^Building ([A-Za-z0-9_.+-]+)(?:\[[A-Za-z0-9_,.+-]*\])?:([A-Za-z0-9_-]+)(?:@|\.\.\.|\s|$)') {
+      $package = $Matches[1] + ':' + $Matches[2]
+      if (-not $sourcePackages.Contains($package)) {
+        $sourcePackages[$package] = [pscustomobject]@{ Package = $package; Elapsed = ''; Completed = $false }
+      }
+    }
+    elseif ($line -match '^Elapsed time to handle ([A-Za-z0-9_.+-]+):([A-Za-z0-9_-]+):\s*([0-9.,]+\s*[A-Za-z]+)\s*$') {
+      $package = $Matches[1] + ':' + $Matches[2]
+      if ($sourcePackages.Contains($package)) {
+        $sourcePackages[$package].Elapsed = $Matches[3]
+        $sourcePackages[$package].Completed = $true
+      }
+    }
+  }
+  $completed = @($sourcePackages.Values | Where-Object { $_.Completed }).Count
+  return [pscustomobject]@{
+    Attempt = $Attempt
+    ExitCode = $ExitCode
+    ElapsedSeconds = $ElapsedSeconds
+    BinaryRestored = if ($restoreCountObserved) { [string]$restored } else { 'unknown' }
+    SourceStarted = $sourcePackages.Count
+    SourceCompleted = $completed
+    SourcePackages = @($sourcePackages.Values)
+  }
+}
+
+function Write-VcpkgInstallSummary {
+  param([object[]] $Attempts, [double] $ElapsedSeconds, [bool] $Succeeded)
+
+  $result = if ($Succeeded) { 'success' } else { 'failure' }
+  Write-Host ("[vcpkg] total install elapsed_seconds={0:F1} attempts={1} result={2}" -f $ElapsedSeconds, $Attempts.Count, $result)
+  $summary = New-Object 'System.Collections.Generic.List[string]'
+  $summary.Add('### vcpkg install')
+  $summary.Add('')
+  $summary.Add(('Result: {0}; attempts: {1}; total elapsed: {2:F1} seconds (including retry waits).' -f $result, $Attempts.Count, $ElapsedSeconds))
+  $summary.Add('')
+  $summary.Add('| Attempt | Exit code | Seconds | Binary packages restored | Source builds started | Source builds completed |')
+  $summary.Add('| --- | --- | --- | --- | --- | --- |')
+  foreach ($item in $Attempts) {
+    Write-Host ("[vcpkg] attempt summary attempt={0} exit_code={1} elapsed_seconds={2:F1} binary_restored={3} source_started={4} source_completed={5}" -f $item.Attempt, $item.ExitCode, $item.ElapsedSeconds, $item.BinaryRestored, $item.SourceStarted, $item.SourceCompleted)
+    $summary.Add(('| {0} | {1} | {2:F1} | {3} | {4} | {5} |' -f $item.Attempt, $item.ExitCode, $item.ElapsedSeconds, $item.BinaryRestored, $item.SourceStarted, $item.SourceCompleted))
+  }
+  $summary.Add('')
+  $summary.Add('Binary restores are reported by vcpkg after ABI selection; source-download cache hits are not binary restores. Counts are per attempt and are not added across retries. Unknown means vcpkg emitted no restore count. Source completion requires a matching package elapsed-time line.')
+  $summary.Add('')
+  foreach ($item in $Attempts) {
+    foreach ($package in $item.SourcePackages) {
+      $state = if ($package.Completed) { 'completed' } else { 'started; no completion reported' }
+      $elapsed = if ($package.Elapsed) { $package.Elapsed } else { 'unknown' }
+      Write-Host ("[vcpkg] source package attempt={0} package={1} state={2} elapsed={3}" -f $item.Attempt, $package.Package, $state, $elapsed)
+      $summary.Add(('- Attempt {0}: {1}; {2}; elapsed: {3}.' -f $item.Attempt, $package.Package, $state, $elapsed))
+    }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+    Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine) -Encoding UTF8
+  }
+}
+
 $installArgs = @("install") + @($FeatureArgs)
 $previousConcurrency = [Environment]::GetEnvironmentVariable("VCPKG_MAX_CONCURRENCY", "Process")
 $restoreConcurrency = $false
@@ -96,10 +167,13 @@ if ([string]::IsNullOrWhiteSpace($previousConcurrency)) {
 }
 
 $installTimer = [Diagnostics.Stopwatch]::StartNew()
+$attemptSummaries = New-Object 'System.Collections.Generic.List[object]'
+$installSucceeded = $false
 try {
   for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
     Write-Host "[vcpkg] install attempt $attempt/$MaxAttempts (max parallel build jobs: $env:VCPKG_MAX_CONCURRENCY)"
     $output = New-Object 'System.Collections.Generic.List[string]'
+    $attemptTimer = [Diagnostics.Stopwatch]::StartNew()
     $previousErrorActionPreference = $ErrorActionPreference
     $hasNativeErrorPreference = $PSVersionTable.PSVersion.Major -ge 7
     if ($hasNativeErrorPreference) {
@@ -123,8 +197,11 @@ try {
       if ($hasNativeErrorPreference) {
         $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
       }
+      $attemptTimer.Stop()
     }
+    $attemptSummaries.Add((Get-VcpkgAttemptSummary -Lines $output.ToArray() -Attempt $attempt -ExitCode $exitCode -ElapsedSeconds $attemptTimer.Elapsed.TotalSeconds))
     if ($exitCode -eq 0) {
+      $installSucceeded = $true
       Write-Host "[vcpkg] install succeeded on attempt $attempt"
       return
     }
@@ -156,11 +233,19 @@ try {
 }
 finally {
   $installTimer.Stop()
-  Write-Host ("[vcpkg] total install elapsed_seconds={0:F1}" -f $installTimer.Elapsed.TotalSeconds)
   if ($restoreConcurrency) {
     Remove-Item Env:VCPKG_MAX_CONCURRENCY -ErrorAction SilentlyContinue
   }
   elseif ($null -ne $previousConcurrency) {
     $env:VCPKG_MAX_CONCURRENCY = $previousConcurrency
+  }
+  try {
+    Write-VcpkgInstallSummary -Attempts $attemptSummaries.ToArray() -ElapsedSeconds $installTimer.Elapsed.TotalSeconds -Succeeded $installSucceeded
+  }
+  catch {
+    # Preserve an existing install failure, but never claim successful diagnostics
+    # when their required GitHub destination could not be written.
+    Write-Warning "[vcpkg] install summary could not be written: $($_.Exception.Message)"
+    if ($installSucceeded) { throw }
   }
 }

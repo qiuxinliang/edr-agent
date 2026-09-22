@@ -99,11 +99,12 @@ cmake --build build
 - **CMake Presets**（`CMakePresets.json`）：在仓库内 `edr-agent` 目录执行 `cmake --list-presets`；典型用法  
   - 本机已装 vcpkg：在 `edr-agent` 下 **`vcpkg install`** 默认安装产品主线依赖（HTTPS REST/SQLite 等）。`cmake --preset w-vcpkg-ninja-dev` 用于日常快编；`w-vcpkg-ninja-ort-yara` 与 `w-vcpkg-ninja-grpc-ort` 是历史兼容别名，实际均为不含 ONNX Runtime、无 gRPC 的产品构建。
   - **Linux 快编**：`cmake --preset l-ninja-dev`（依赖最少）；可用 `CC="ccache gcc" CXX="ccache g++"` 配合 ccache。
-  - **跨平台快编预设**：`any-ninja-fast-dev`（默认开 `EDR_ENABLE_COMPILER_CACHE=ON`），`any-ninja-fast-release-lto`（额外开 `EDR_ENABLE_IPO=ON`，工具链不支持时自动降级并告警）。
+  - **跨平台 Ninja 预设**：`any-ninja-fast-dev` 与 `any-ninja-fast-release-lto`；其中遗留的 `EDR_ENABLE_COMPILER_CACHE`、`EDR_ENABLE_IPO` 变量当前不被 CMake 消费，预设名称不代表已启用缓存或 LTO。
 - **vcpkg 二进制缓存**（本机/团队）：例如 PowerShell 中  
   `$env:VCPKG_BINARY_SOURCES="clear;files,$HOME\.vcpkg-bincache,readwrite"` 后再 `vcpkg install`，curl/OpenSSL/SQLite 等命中缓存时冷启动明显变短；或参考 **`scripts/vcpkg_binary_cache_env.example.ps1`**。CI 中已用 `VCPKG_BINARY_SOURCES` + 缓存目录，与本地思路一致。
-- **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须已进 **vcvars / x64 本机工具** 环境）。GitHub Actions 上 `edr-agent-ci` / `edr-agent-client-release` 已启用 Ninja 与 sccache（Windows）或 ccache（Linux 快编 job）。
-- **统一加速开关**（可显式覆盖）：`EDR_ENABLE_COMPILER_CACHE`（默认 `ON`，自动探测 `sccache` 优先于 `ccache`）、`EDR_ENABLE_UNITY_BUILD`（默认 `OFF`）、`EDR_ENABLE_IPO`（默认 `OFF`）。
+- **Ninja / 并行 / sccache（Windows 本机）**：与 Preset 或 `cmake -G Ninja` 一致；可安装 [sccache](https://github.com/mozilla/sccache) 后运行 **`scripts/sccache_env_windows.ps1`** 设 `SCCACHE_DIR`（默认 `%LOCALAPPDATA%\sccache-edr-agent`），再于 CMake 中加 `-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache`（须先初始化目标架构的 Visual Studio 环境）。当前 Windows release 使用 Ninja 并行编译与 vcpkg 依赖缓存，没有配置 sccache；CMake 也没有实现 `EDR_ENABLE_COMPILER_CACHE`、`EDR_ENABLE_UNITY_BUILD`、`EDR_ENABLE_IPO` 这三个自定义开关。
+- **ARM64 发布缓存**：共享依赖 Release 只创建、不覆盖；缓存身份包含架构、锁文件、编译工具、PowerShell 与 runner 镜像版本。镜像升级后创建新缓存，避免旧缓存反复导致 OpenSSL 等依赖重编；相同镜像下不同产品 tag 仍可复用。缓存仅传输 ABI 二进制包与原始下载，始终运行 `vcpkg install` 校验 ABI，不恢复 `vcpkg_installed`。
+- **预热与验收**：发布前可对同一代码 ref 运行 `Build Pre-built vcpkg Packages`。首次换键需要预热或源码构建一次；后续查看 job summary 的 `Binary packages restored`、`Source builds started` 和分包耗时。下载到共享缓存不代表 ABI 命中。ARM64 保留原生编译、原生测试和安装生命周期门禁，静态 PCRE2 来源验证也保持独立构建。
 
 **终端监测小工具 `edr_monitor`**：与主程序独立，用于联调阶段快速核对「管控地址是否可达、REST 根是否健康、离线库文件是否存在、本机是否已有 Agent 进程」。详见源码头注释；Windows 安装包/zip 在构建出 `edr_monitor.exe` 时会一并带上（可选）。
 

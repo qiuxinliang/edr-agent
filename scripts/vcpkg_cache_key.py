@@ -36,6 +36,10 @@ def windows_toolchain():
         raise ValueError("Initialized Visual Studio compiler cl.exe was not found")
     cmake = subprocess.run(["cmake", "--version"], check=True, capture_output=True,
                            text=True, timeout=15).stdout.splitlines()[0]
+    powershell = subprocess.run(["pwsh", "--version"], check=True, capture_output=True,
+                                text=True, timeout=15).stdout.strip()
+    if not powershell:
+        raise ValueError("PowerShell version is required for the dependency cache identity")
     # vcpkg may use Hostarm64 even when the product environment uses Hostx64.
     tools_root = Path(os.environ["VCToolsInstallDir"])
     compilers = {path.relative_to(tools_root).as_posix(): digest_file(path)
@@ -46,11 +50,15 @@ def windows_toolchain():
         "vc_tools": os.environ["VCToolsVersion"].strip(),
         "windows_sdk": os.environ["WindowsSDKVersion"].strip(),
         "selected_compiler": digest_file(compiler), "compilers": compilers,
-        "cmake": cmake, "runner_arch": os.environ.get("RUNNER_ARCH", ""),
+        "cmake": cmake, "powershell": powershell,
+        "runner_arch": os.environ.get("RUNNER_ARCH", ""),
         "image": os.environ.get("ImageOS", ""),
-        # A runner image republish alone is not a new ABI. Actual compiler
-        # contents, SDK version, host and CMake remain part of the identity;
-        # vcpkg independently verifies its complete per-package ABI inputs.
+        # The shared Release is immutable. A hosted image update can change
+        # vcpkg ABI inputs beyond cl.exe/CMake (including PowerShell), so it
+        # needs a fresh snapshot even when those compiler hashes are unchanged.
+        # Ref/tag/run IDs stay excluded: repeated builds on the same image
+        # must reuse the snapshot. vcpkg still validates every package ABI.
+        "image_version": os.environ.get("ImageVersion", ""),
     }
 
 
@@ -59,13 +67,17 @@ def main():
     parser.add_argument("--triplet", required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    key, prefix = cache_identity(root, args.triplet, windows_toolchain())
+    toolchain = windows_toolchain()
+    key, prefix = cache_identity(root, args.triplet, toolchain)
     output = os.environ.get("GITHUB_OUTPUT")
     if not output:
         raise ValueError("GITHUB_OUTPUT is required for the cache-key step")
     with open(output, "a", encoding="utf-8") as stream:
         stream.write(f"key={key}\nrestore-prefix={prefix}\n")
     print(f"[vcpkg] dependency cache key: {key}; package ABI checks remain enabled")
+    print(f"[vcpkg] cache tools: image={toolchain.get('image', '')} "
+          f"image_version={toolchain.get('image_version', '')} "
+          f"cmake={toolchain.get('cmake', '')} powershell={toolchain.get('powershell', '')}")
 
 
 if __name__ == "__main__":

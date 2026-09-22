@@ -145,19 +145,41 @@ class VcpkgCacheKeyTests(unittest.TestCase):
                 "VCToolsVersion": "14.44.35207",
                 "WindowsSDKVersion": "10.0.26100.0",
                 "VCToolsInstallDir": str(tools_root),
+                "ImageOS": "win11-arm64",
+                "ImageVersion": "20260906.161.1",
             }
             cmake_result = subprocess.CompletedProcess(
                 ["cmake", "--version"], 0, stdout="cmake version 4.1.0\n", stderr=""
             )
 
+            powershell_result = subprocess.CompletedProcess(
+                ["pwsh", "--version"], 0, stdout="PowerShell 7.6.4\n", stderr=""
+            )
+            def tool_version(command, **kwargs):
+                return powershell_result if command[0] == "pwsh" else cmake_result
+
             with mock.patch.dict(os.environ, environment, clear=True), \
                     mock.patch.object(MODULE.shutil, "which", return_value=str(selected_compiler)), \
-                    mock.patch.object(MODULE.subprocess, "run", return_value=cmake_result) as run:
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=tool_version) as run:
                 initial_toolchain = MODULE.windows_toolchain()
                 initial_key, _ = MODULE.cache_identity(root, "x64-windows", initial_toolchain)
 
-                with mock.patch.dict(os.environ, {'ImageVersion': 'new-image', 'GITHUB_REF': 'refs/tags/win_3.2.999'}):
+                with mock.patch.dict(os.environ, {'GITHUB_REF': 'refs/tags/win_3.2.999', 'GITHUB_RUN_ID': '123'}):
                     self.assertEqual(initial_toolchain, MODULE.windows_toolchain())
+
+                # Regression: the ARM64 image changed every package ABI while
+                # cl.exe/CMake/SDK and the old shared Release key stayed equal.
+                with mock.patch.dict(os.environ, {'ImageVersion': '20260914.169.1'}):
+                    image_toolchain = MODULE.windows_toolchain()
+                powershell_result.stdout = "PowerShell 7.6.6\n"
+                powershell_toolchain = MODULE.windows_toolchain()
+                powershell_result.stdout = "PowerShell 7.6.4\n"
+                for triplet in ("x64-windows", "arm64-windows"):
+                    original = MODULE.cache_identity(root, triplet, initial_toolchain)
+                    for changed in (image_toolchain, powershell_toolchain):
+                        with self.subTest(triplet=triplet, changed=changed):
+                            self.assertNotEqual(original[0], MODULE.cache_identity(root, triplet, changed)[0])
+                            self.assertEqual(original[1], MODULE.cache_identity(root, triplet, changed)[1])
 
                 selected_compiler.write_bytes(b"selected-v2")
                 selected_toolchain = MODULE.windows_toolchain()
@@ -173,9 +195,13 @@ class VcpkgCacheKeyTests(unittest.TestCase):
             self.assertNotEqual(initial_key, selected_key)
             self.assertNotEqual(initial_toolchain["compilers"], host_toolchain["compilers"])
             self.assertNotEqual(initial_key, host_key)
-            self.assertEqual(4, run.call_count)
-            run.assert_called_with(
+            self.assertEqual(12, run.call_count)
+            run.assert_any_call(
                 ["cmake", "--version"], check=True, capture_output=True,
+                text=True, timeout=15,
+            )
+            run.assert_any_call(
+                ["pwsh", "--version"], check=True, capture_output=True,
                 text=True, timeout=15,
             )
 
