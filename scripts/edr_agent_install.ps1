@@ -57,6 +57,7 @@ param(
   [string]$Pkcs11Module = $(if ($env:EDR_PKCS11_MODULE) { $env:EDR_PKCS11_MODULE } else { "" }),
   [string]$TpmKeyUri = $(if ($env:EDR_TPM_KEY_URI) { $env:EDR_TPM_KEY_URI } else { "" }),
   [switch]$TrustCa = $($env:EDR_TRUST_CA -eq "1"),
+  [string]$WindowsInstallProfile = $(if ($env:EDR_WINDOWS_INSTALL_PROFILE) { $env:EDR_WINDOWS_INSTALL_PROFILE } else { "client" }),
   [switch]$InstallAutorun,
   [switch]$HardenAcl,
   [switch]$ConfigureSensorPolicy = $($env:EDR_CONFIGURE_SENSOR_POLICY -ne "0"),
@@ -95,6 +96,20 @@ function Get-EnrollOs {
   if ($env:OS -match "Windows_NT" -or $env:OS -like "*Windows*") { return "windows" }
   if ($IsMacOS) { return "darwin" }
   return "linux"
+}
+
+function Normalize-WindowsInstallProfile([string]$Profile) {
+  $value = if ($Profile) { $Profile.Trim().ToLowerInvariant() } else { "client" }
+  switch ($value) {
+    "" { return "client" }
+    "pc" { return "client" }
+    "windows_client" { return "client" }
+    "server_desktop" { return "server_desktop" }
+    "windows_server_desktop" { return "server_desktop" }
+    "server_core" { return "server_core" }
+    "windows_server_core" { return "server_core" }
+    default { return $value }
+  }
 }
 
 $Output = [System.IO.Path]::GetFullPath($Output)
@@ -994,6 +1009,7 @@ function Get-WindowsInstallCompatibilitySnapshot {
   $securityProtocol = "unknown"
   try { $securityProtocol = [string][System.Net.ServicePointManager]::SecurityProtocol } catch {}
   return [ordered]@{
+    target_profile = (Normalize-WindowsInstallProfile $WindowsInstallProfile)
     os = [ordered]@{
       product_name = if ($os) { [string]$os.ProductName } else { "unknown" }
       edition = if ($os) { [string]$os.EditionID } else { "unknown" }
@@ -1026,6 +1042,38 @@ function Get-WindowsInstallCompatibilitySnapshot {
   }
 }
 
+function Assert-WindowsInstallTargetProfile {
+  param([object]$Snapshot)
+  $profile = Normalize-WindowsInstallProfile $WindowsInstallProfile
+  if ($profile -eq "client") { return }
+  if ($profile -ne "server_desktop" -and $profile -ne "server_core") {
+    throw ("Unsupported Windows install profile: {0}" -f $profile)
+  }
+  $failures = New-Object System.Collections.Generic.List[string]
+  $os = $Snapshot.os
+  if ([string]$os.product_name -notmatch "Windows Server") {
+    $failures.Add(("Windows Server profile requires Windows Server; product_name={0}" -f $os.product_name)) | Out-Null
+  }
+  if ([string]$os.architecture -notmatch "^(?i:AMD64|X64)$") {
+    $failures.Add(("Windows Server profile requires native amd64; architecture={0}" -f $os.architecture)) | Out-Null
+  }
+  $build = 0
+  [void][int]::TryParse([string]$os.build, [ref]$build)
+  if ($build -lt 17763) {
+    $failures.Add(("Windows Server profile requires Server 2019/build 17763 or newer; build={0}" -f $os.build)) | Out-Null
+  }
+  $installationType = [string]$os.installation_type
+  if ($profile -eq "server_core" -and $installationType -notmatch "Server Core") {
+    $failures.Add(("server_core profile requires InstallationType=Server Core; installation_type={0}" -f $installationType)) | Out-Null
+  }
+  if ($profile -eq "server_desktop" -and $installationType -match "Server Core") {
+    $failures.Add("server_desktop profile cannot run on Server Core") | Out-Null
+  }
+  if ($failures.Count -gt 0) {
+    throw ($failures -join " | ")
+  }
+}
+
 function Write-WindowsInstallCompatibilityDiagnostic {
   param([object]$Snapshot, [string]$Failure = "")
   $report = [ordered]@{
@@ -1046,6 +1094,11 @@ function Assert-WindowsInstallCompatibility {
   if ((Get-EnrollOs) -ne "windows") { return $null }
   $snapshot = Get-WindowsInstallCompatibilitySnapshot
   $failures = New-Object System.Collections.Generic.List[string]
+  try {
+    Assert-WindowsInstallTargetProfile -Snapshot $snapshot
+  } catch {
+    $failures.Add($_.Exception.Message) | Out-Null
+  }
   $ps = $snapshot.powershell
   if ([string]$ps.edition -ne "Desktop" -or [version][string]$ps.version -lt [version]"5.1") {
     $failures.Add(("Windows enrollment requires Windows PowerShell 5.1 Desktop; executable={0}, version={1}, edition={2}" -f $ps.executable, $ps.version, $ps.edition)) | Out-Null

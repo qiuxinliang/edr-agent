@@ -65,6 +65,34 @@ try {
   Assert-InstallTest ([int]$snapshot.dotnet_framework_release -ge 0) "runtime snapshot records .NET Framework Release"
   [void](Assert-WindowsInstallCompatibility -RequestedProvider "pem")
 
+  # Server profiles are opt-in and must reject client/unsupported hosts before
+  # key creation. The legacy client profile remains the default behavior.
+  $savedInstallProfile = $WindowsInstallProfile
+  try {
+    $WindowsInstallProfile = "server_core"
+    $serverSnapshot = [ordered]@{
+      os = [ordered]@{
+        product_name = "Microsoft Windows Server 2022 Standard"
+        # RuntimeInformation reports x64 on native Windows amd64 hosts.
+        architecture = "x64"
+        build = "20348"
+        installation_type = "Server Core"
+      }
+    }
+    [void](Assert-WindowsInstallTargetProfile -Snapshot $serverSnapshot)
+    $serverSnapshot.os.installation_type = "Server"
+    try { Assert-WindowsInstallTargetProfile -Snapshot $serverSnapshot; throw "expected server_core InstallationType rejection" } catch {
+      Assert-InstallTest ($_.Exception.Message -match "InstallationType=Server Core") "server_core rejects Desktop installation type"
+    }
+    $serverSnapshot.os.installation_type = "Server Core"
+    $serverSnapshot.os.build = "14393"
+    try { Assert-WindowsInstallTargetProfile -Snapshot $serverSnapshot; throw "expected Server 2016 build rejection" } catch {
+      Assert-InstallTest ($_.Exception.Message -match "build 17763") "server profile rejects pre-2019 builds"
+    }
+  } finally {
+    $WindowsInstallProfile = $savedInstallProfile
+  }
+
   # Scoped input substitution tests capability decisions, not API availability
   # on this runner. The real CSR branches run separately below.
   & {
