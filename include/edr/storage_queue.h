@@ -261,6 +261,9 @@ void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count);
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count);
 /* Aborts the next deferred-match FULL commits, including atomic handoff. */
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
+/* Freeze the deferred retry/peek wall clock in Unix seconds; a negative value
+ * restores real time. The override is test-only and survives database reopen. */
+void edr_storage_queue_test_set_p0_deferred_time(int64_t unix_seconds);
 /* Simulates a checked journal ACK statement failure while the normal-row
  * delete is still in the enclosing terminal FULL transaction. */
 void edr_storage_queue_test_fail_next_terminal_ack_steps(unsigned count);

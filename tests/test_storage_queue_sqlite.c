@@ -2383,6 +2383,7 @@ static void test_p0_deferred_match_durable_lifecycle(void) {
   char selected_key[65];
   uint8_t *selected_payload = NULL;
   size_t selected_len = 0u;
+  const int64_t retry_now = (int64_t)time(NULL);
   uint8_t wire[20];
   EdrStorageQueueCapacityMetrics metrics;
   sqlite3 *legacy = NULL;
@@ -2463,32 +2464,62 @@ static void test_p0_deferred_match_durable_lifecycle(void) {
   assert(edr_storage_queue_open(path) == EDR_OK);
   assert(edr_storage_queue_p0_deferred_contains(key_a) == 1);
 
+  /* FULL commits and a separate SQLite read may cross a wall-clock second.
+   * Freeze only retry/peek time so these assertions test the durable deadline,
+   * not whether this runner completes the intervening I/O within one second. */
+  edr_storage_queue_test_set_p0_deferred_time(retry_now);
   assert(edr_storage_queue_p0_deferred_retry(key_a, "family_still_unhealthy") == EDR_OK);
   {
     sqlite3_int64 retry_count = 0;
     sqlite3_int64 next_retry_at = 0;
-    sqlite3_int64 now = (sqlite3_int64)time(NULL);
     p0_deferred_retry_values(path, key_a, &retry_count, &next_retry_at);
-    assert(retry_count == 1 && next_retry_at >= now && next_retry_at <= now + 1);
+    assert(retry_count == 1 && next_retry_at == retry_now + 1);
   }
   assert(edr_storage_queue_p0_deferred_peek(
              4u, selected_key, &selected_payload, &selected_len) == 0);
+  assert(selected_key[0] == '\0' && selected_payload == NULL && selected_len == 0u);
+  edr_storage_queue_test_fail_next_p0_deferred_commits(1u);
+  assert(edr_storage_queue_p0_deferred_retry(key_a, "failed_retry_commit") == EDR_ERR_SQLITE_WRITE);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  {
+    sqlite3_int64 retry_count = 0;
+    sqlite3_int64 next_retry_at = 0;
+    p0_deferred_retry_values(path, key_a, &retry_count, &next_retry_at);
+    assert(retry_count == 1 && next_retry_at == retry_now + 1);
+    assert(p0_deferred_state_matches(path, key_a, "pending",
+                                     (int)(sizeof(snapshot_a) - 1u),
+                                     "family_still_unhealthy"));
+  }
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 0);
+  edr_storage_queue_test_set_p0_deferred_time(retry_now + 1);
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 1);
+  assert(strcmp(selected_key, key_a) == 0);
+  assert(selected_len == sizeof(snapshot_a) - 1u);
+  assert(memcmp(selected_payload, snapshot_a, selected_len) == 0);
+  free(selected_payload);
+  selected_payload = NULL;
   p0_deferred_exec_sql(path,
       "UPDATE p0_deferred_match SET retry_count=9,next_retry_at=0 WHERE state='pending';");
   assert(edr_storage_queue_p0_deferred_retry(key_a, "backoff_cap") == EDR_OK);
   {
     sqlite3_int64 retry_count = 0;
     sqlite3_int64 next_retry_at = 0;
-    sqlite3_int64 now = (sqlite3_int64)time(NULL);
     p0_deferred_retry_values(path, key_a, &retry_count, &next_retry_at);
-    assert(retry_count == 10 && next_retry_at >= now + 59 && next_retry_at <= now + 60);
+    assert(retry_count == 10 && next_retry_at == retry_now + 61);
   }
-  p0_deferred_exec_sql(path,
-      "UPDATE p0_deferred_match SET next_retry_at=0 WHERE state='pending';");
+  edr_storage_queue_test_set_p0_deferred_time(retry_now + 60);
+  assert(edr_storage_queue_p0_deferred_peek(
+             4u, selected_key, &selected_payload, &selected_len) == 0);
+  edr_storage_queue_test_set_p0_deferred_time(retry_now + 61);
   assert(edr_storage_queue_p0_deferred_peek(
              4u, selected_key, &selected_payload, &selected_len) == 1);
+  assert(strcmp(selected_key, key_a) == 0);
   free(selected_payload);
   selected_payload = NULL;
+  edr_storage_queue_test_set_p0_deferred_time(-1);
 
   edr_storage_queue_test_fail_next_p0_deferred_commits(1u);
   assert(edr_storage_queue_p0_deferred_complete(

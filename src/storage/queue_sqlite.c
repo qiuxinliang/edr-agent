@@ -65,6 +65,7 @@ static unsigned s_test_p0_latch_commit_failures;
 static int s_test_p0_latch_commit_active;
 static unsigned s_test_p0_deferred_commit_failures;
 static int s_test_p0_deferred_commit_active;
+static int64_t s_test_p0_deferred_time = -1;
 
 /* SQLite invokes this synchronously during COMMIT. Returning nonzero makes
  * SQLite abort the actual commit and roll the transaction back, exercising
@@ -1990,6 +1991,12 @@ void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) {
   queue_state_unlock();
 }
 
+void edr_storage_queue_test_set_p0_deferred_time(int64_t unix_seconds) {
+  queue_state_lock();
+  s_test_p0_deferred_time = unix_seconds;
+  queue_state_unlock();
+}
+
 void edr_storage_queue_test_fail_next_terminal_ack_steps(unsigned count) {
   queue_state_lock();
   s_test_terminal_ack_step_failures = count;
@@ -2765,6 +2772,13 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
   return result;
 }
 
+static sqlite3_int64 p0_deferred_now_locked(void) {
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  if (s_test_p0_deferred_time >= 0) return (sqlite3_int64)s_test_p0_deferred_time;
+#endif
+  return (sqlite3_int64)time(NULL);
+}
+
 static int p0_deferred_mark_failed_by_id_locked(sqlite3_int64 row_id,
                                                 const char *reason) {
   sqlite3_stmt *st = NULL;
@@ -2968,7 +2982,7 @@ int edr_storage_queue_p0_deferred_peek(uint32_t healthy_family_mask,
       queue_state_unlock();
       return -1;
     }
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(st, 1, p0_deferred_now_locked());
     sqlite3_bind_int64(st, 2, (sqlite3_int64)(uint64_t)healthy_family_mask);
     rc = sqlite3_step(st);
     if (rc == SQLITE_DONE) {
@@ -3277,9 +3291,9 @@ EdrError edr_storage_queue_p0_deferred_retry(const char *key_hex,
     return EDR_ERR_SQLITE_WRITE;
   }
   sqlite3_bind_int64(st, 1, next_count);
-  sqlite3_bind_int64(st, 2, (sqlite3_int64)time(NULL) + delay);
+  sqlite3_bind_int64(st, 2, p0_deferred_now_locked() + delay);
   sqlite3_bind_text(st, 3, reason, -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(st, 4, (sqlite3_int64)time(NULL));
+  sqlite3_bind_int64(st, 4, p0_deferred_now_locked());
   sqlite3_bind_text(st, 5, key, -1, SQLITE_TRANSIENT);
   rc = sqlite3_step(st);
   {
@@ -4486,6 +4500,7 @@ EdrError edr_storage_queue_p0_source_only_recovery_probe(void) {
 void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) { (void)count; }
+void edr_storage_queue_test_set_p0_deferred_time(int64_t unix_seconds) { (void)unix_seconds; }
 void edr_storage_queue_test_fail_next_terminal_select_allocations(
     unsigned key_count, unsigned batch_id_count, unsigned wire_count) {
   (void)key_count;
