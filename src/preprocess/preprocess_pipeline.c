@@ -1251,7 +1251,22 @@ static int p0_resource_throttle_proven_miss(const EdrBehaviorRecord *br) {
   if (!edr_p0_rule_ir_is_ready()) {
     return 0;
   }
+  /* A bounded command preview can miss a predicate in the retained tail.
+   * This is an unknown result, never a proven miss for pressure shedding. */
+  if (edr_behavior_source_field_truncated(br, "source.cmdline") ||
+      edr_behavior_source_field_truncated(br, "source.cmdline_quality_unknown")) return 0;
   return edr_p0_rule_ir_br_matches_any(br) ? 0 : 1;
+}
+
+static int p0_process_create_matches_complete_fact(const EdrBehaviorRecord *br,
+                                                    const EdrCommandFacts *facts) {
+  EdrP0RuleIrEvaluation evaluation;
+  int matched = 0;
+  if (edr_p0_rule_ir_evaluate_record(br, facts, &evaluation)) {
+    matched = evaluation.match_count > 0u;
+    edr_p0_rule_ir_evaluation_free(&evaluation);
+  }
+  return matched;
 }
 
 /* Collector evidence gates are an authority boundary, not ordinary telemetry:
@@ -1297,7 +1312,8 @@ static int p0_file_read_evaluation_ready(void) {
 
 #endif
 
-static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
+static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
+                                 const EdrCommandFacts *facts);
 static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot);
 
 static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
@@ -1326,6 +1342,8 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
 
 /* Continue from the original captured actor, not a fresh PID/path lookup. */
 static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
+  EdrCommandFacts command_facts = {0};
+  int command_facts_resolved = 0;
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_behavior_enrich_file_activity(&br);
   edr_windows_event_policy_apply(&br);
@@ -1338,7 +1356,7 @@ static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *sl
   }
 #endif
   if (p0_process_collector_evidence_gate(&br)) {
-    return;
+    goto facts_cleanup;
   }
   {
     const char *not_evaluable_reason = p0_process_create_not_evaluable_reason(&br);
@@ -1353,15 +1371,23 @@ static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *sl
      * but do not yet satisfy a rule, still take the durable source-only gate.
      * Block/action authority remains independently fail-closed on an exact
      * generation and action-authoritative file identity. */
-    if (not_evaluable_reason && p0_process_create_candidate(&br) &&
-        !edr_p0_rule_ir_br_matches_any(&br)) {
-      p0_mark_not_evaluable(&br, not_evaluable_reason);
-      edr_local_evidence_cache_record_behavior(&br);
-      /* Required Windows P0 evidence is absent: retain a source-only,
-       * high-priority record through the one bounded retry handoff rather
-       * than matching a partial record or silently dropping a SQLite fault. */
-      (void)edr_p0_rule_emit_pre_evaluation_gate(&br, not_evaluable_reason);
-      return;
+    if (not_evaluable_reason && p0_process_create_candidate(&br)) {
+      int source_only = edr_p0_rule_process_create_hard_reject(&br);
+      if (!source_only) {
+        edr_local_evidence_cache_resolve_commands(
+            &br, &command_facts.subject, &command_facts.parent);
+        command_facts_resolved = 1;
+        source_only = !p0_process_create_matches_complete_fact(&br, &command_facts);
+      }
+      if (source_only) {
+        p0_mark_not_evaluable(&br, not_evaluable_reason);
+        edr_local_evidence_cache_record_behavior(&br);
+        /* Required Windows P0 evidence is absent: retain a source-only,
+         * high-priority record through the one bounded retry handoff rather
+         * than matching a partial record or silently dropping a SQLite fault. */
+        (void)edr_p0_rule_emit_pre_evaluation_gate(&br, not_evaluable_reason);
+        goto facts_cleanup;
+      }
     }
   }
 #ifdef _WIN32
@@ -1372,18 +1398,21 @@ static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *sl
      * Never substitute a short RAM wait for restart-safe ownership. */
     if (!edr_p0_rule_ir_file_read_path_may_match(br.file_path, NULL)) {
       edr_local_evidence_cache_record_behavior(&br);
-      return;
+      goto facts_cleanup;
     }
     (void)edr_p0_rule_try_emit(&br);
     edr_local_evidence_cache_record_behavior(&br);
-    return;
+    goto facts_cleanup;
   }
 #endif
-  process_ready_record(br, slot);
+  process_ready_record(br, slot, command_facts_resolved ? &command_facts : NULL);
+facts_cleanup:
+  free(command_facts.subject); free(command_facts.parent);
 }
 
 /* Records reach this path only with their original validated actor/path tuple. */
-static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
+static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
+                                 const EdrCommandFacts *facts) {
   /* AGT-010: low-priority records can be shed only after all fields on which
    * P0 matching depends have been enriched and the active IR has proved a
    * miss.  Inotify intentionally uses priority=1; doing this before parent
@@ -1396,7 +1425,8 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
   /* P0 owns its hard-invalid, registry-attribution, and
    * policy guards. Evaluate before generic admission so a local-only source
    * can still be represented by one combined source+alert frame. */
-  int p0_emitted = edr_p0_rule_try_emit(&br);
+  int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts(&br, facts)
+                         : edr_p0_rule_try_emit(&br);
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   {

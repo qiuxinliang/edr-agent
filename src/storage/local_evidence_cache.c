@@ -4541,7 +4541,8 @@ void edr_local_evidence_cache_resolve_commands(const EdrBehaviorRecord *r,
   *subject = NULL; *parent = NULL;
   if (!r || !memchr(r->cmdline, 0, sizeof(r->cmdline)) ||
       !memchr(r->parent_cmdline, 0, sizeof(r->parent_cmdline))) return;
-  if ((!r->cmdline[0] || edr_behavior_source_field_truncated(r, "source.cmdline")) &&
+  if ((!r->cmdline[0] || edr_behavior_source_field_truncated(r, "source.cmdline") ||
+       edr_behavior_source_field_truncated(r, "source.cmdline_quality_unknown")) &&
       strcmp(r->command_line_origin, "live_command_fact_store_failed") != 0)
     *subject = edr_local_evidence_cache_read_command_fact(r);
   if ((!r->parent_cmdline[0] || edr_behavior_source_field_truncated(r, "source.parent_cmdline")) &&

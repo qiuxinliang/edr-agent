@@ -128,7 +128,11 @@ uint64_t edr_p0_rule_ir_sensor_admission_generation(void);
  * binding.  Match indexes are bounded and allocation-free; copy an immutable
  * descriptor out with edr_p0_rule_ir_evaluation_get_match() before emitting.
  * Returns 1 for a usable snapshot (including zero matches), 0 otherwise. */
+/* Complete command facts must already be resolved from the exact generation
+ * and hash-checked store (or decoded from its durable snapshot). A truncated
+ * preview is never a command predicate input. */
 int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
+                                   const EdrCommandFacts *facts,
                                    EdrP0RuleIrEvaluation *out_evaluation);
 int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
                                         uint32_t index,

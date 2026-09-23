@@ -54,7 +54,7 @@ static void *evaluate_rules(void *unused) {
     EdrP0RuleIrEvaluation evaluation;
     int found = 0;
     memset(&evaluation, 0, sizeof(evaluation));
-    if (!edr_p0_rule_ir_evaluate_record(&record, &evaluation) ||
+    if (!edr_p0_rule_ir_evaluate_record(&record, NULL, &evaluation) ||
         !evaluation.binding.rules_bundle_version[0] ||
         !evaluation.binding.artifact_sha256[0] || evaluation.binding.snapshot_epoch == 0u) {
       fprintf(stderr, "single-snapshot evaluation unavailable at iteration %d\n", i);

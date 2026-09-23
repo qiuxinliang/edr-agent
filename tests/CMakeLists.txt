@@ -1192,7 +1192,7 @@ if(SQLite3_FOUND)
     ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
-    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c
+    ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
@@ -1207,8 +1207,19 @@ if(SQLite3_FOUND)
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
   target_link_libraries(test_command_fact_transport PRIVATE edr_ave_test_common)
+  if(EDR_PCRE2_AVAILABLE)
+    target_sources(test_command_fact_transport PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
+      ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c)
+    target_compile_definitions(test_command_fact_transport PRIVATE EDR_P0_TEST_REAL_IR=1)
+    target_link_libraries(test_command_fact_transport PRIVATE ${EDR_PCRE2_TARGET})
+  endif()
   edr_apply_test_warnings(test_command_fact_transport)
   add_test(NAME command_fact_transport COMMAND test_command_fact_transport)
+  if(EDR_PCRE2_AVAILABLE)
+    set_tests_properties(command_fact_transport PROPERTIES
+      ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+  endif()
 endif()
 
 add_executable(test_deep_collector_manifest ${CMAKE_CURRENT_SOURCE_DIR}/test_deep_collector_manifest.c

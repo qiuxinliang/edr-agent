@@ -5,6 +5,7 @@
 #include "edr/storage_queue.h"
 #include "edr/sha256.h"
 #include "edr/p0_deferred_snapshot.h"
+#include "edr/p0_rule_ir.h"
 #include "edr/v1/event.pb.h"
 #include "pb_decode.h"
 #include "cJSON.h"
@@ -64,6 +65,22 @@ static void identity(EdrBehaviorRecord *r, uint32_t pid) {
   r->process_creation_filetime_100ns = UINT64_C(134346261457945144) + pid;
 }
 
+#ifdef EDR_P0_TEST_REAL_IR
+static int has_rule(const EdrBehaviorRecord *record, const EdrCommandFacts *facts,
+                    const char *rule_id) {
+  EdrP0RuleIrEvaluation evaluation;
+  int found = 0;
+  assert(edr_p0_rule_ir_evaluate_record(record, facts, &evaluation));
+  for (uint32_t i = 0; i < evaluation.match_count; ++i) {
+    EdrP0RuleIrMatch match;
+    assert(edr_p0_rule_ir_evaluation_get_match(&evaluation, i, &match));
+    if (strcmp(match.rule_id, rule_id) == 0) found = 1;
+  }
+  edr_p0_rule_ir_evaluation_free(&evaluation);
+  return found;
+}
+#endif
+
 int main(int argc, char **argv) {
   char db[512], queue[512];
   EdrBehaviorRecord *parent = calloc(1, sizeof(*parent)), *child = calloc(1, sizeof(*child));
@@ -77,7 +94,7 @@ int main(int argc, char **argv) {
   strcpy(child->process_name, "inert-child.exe");
   strcpy(child->exe_path, "C:/test/inert-child.exe");
   strcpy(child->event_id, "command-fact-roundtrip");
-  strcpy(child->file_path, "C:/test/Login Data"); strcpy(child->file_op, "read");
+  strcpy(child->file_path, "C:\\test\\Login Data"); strcpy(child->file_op, "read");
   child->event_time_ns = INT64_C(1790152545794514400);
   child->type = EDR_EVENT_FILE_READ; child->ppid = parent->pid;
   child->parent_process_start_key = parent->process_start_key;
@@ -94,6 +111,15 @@ int main(int argc, char **argv) {
     memset(command, 'x', n); memcpy(command, "inert.exe --BEGIN ", 18); memcpy(command + n - 4, " END", 4); command[n] = 0;
     /* Multibyte content immediately crosses the old preview boundary. */
     if (n > 8194u) memcpy(command + 8190, "\xe4\xb8\xad", 3);
+    if (n == 8191u || n == 8192u || n == 12717u) {
+      memcpy(command + n - 5u, " -enc", 5u);
+    }
+    if (n == 12717u) {
+      /* Keep syntax-significant bytes in the exact BAT1 fixture as well as
+       * the long-tail predicate. The backend can consume this same output. */
+      command[3000] = '\n'; command[5000] = '\t';
+      memcpy(command + 6000, "   ", 3u);
+    }
     assert(edr_local_evidence_cache_save_command_fact(parent, command) == 0);
     assert(edr_local_evidence_cache_save_command_fact(child, command) == 0);
     assert(edr_local_evidence_cache_save_command_fact(parent, command) == 0);
@@ -144,6 +170,57 @@ int main(int argc, char **argv) {
     }
     EdrCommandFacts captured = {0};
     edr_local_evidence_cache_resolve_commands(child, &captured.subject, &captured.parent);
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(captured.subject && captured.parent);
+    assert(has_rule(child, &captured, "R-CRED-003"));
+    strcpy(child->file_path, "C:\\Chrome\\Network\\Cookies");
+    strcpy(child->process_name, "powershell.exe");
+    assert(has_rule(child, &captured, "R-CRED-011"));
+    strcpy(child->file_path, "C:\\test\\Login Data");
+    strcpy(child->process_name, "inert-child.exe");
+    if (n == 8191u || n == 8192u || n == 12717u) {
+      EdrBehaviorRecord *candidate = malloc(sizeof(*candidate));
+      assert(candidate);
+      *candidate = *child;
+      candidate->type = EDR_EVENT_PROCESS_CREATE;
+      strcpy(candidate->process_name, "powershell.exe");
+      memcpy(candidate->cmdline, command, n < EDR_BR_STR_CMDLINE ? n + 1u : EDR_BR_STR_CMDLINE - 1u);
+      candidate->cmdline[n < EDR_BR_STR_CMDLINE ? n : EDR_BR_STR_CMDLINE - 1u] = 0;
+      if (n == 8191u) {
+        edr_behavior_resolve_source_truncated(candidate, "source.cmdline");
+        assert(has_rule(candidate, NULL, "R-EXEC-001"));
+      } else {
+        assert(!has_rule(candidate, NULL, "R-EXEC-001"));
+        /* The raw interest shortcut sees only this preview. Preprocess must
+         * retain it under pressure until the exact fact can be evaluated. */
+        assert(!edr_p0_rule_ir_br_matches_any(candidate));
+      }
+      assert(has_rule(candidate, &captured, "R-EXEC-001"));
+      if (n >= 8192u) {
+        candidate->process_start_key++;
+        char *wrong_generation = edr_local_evidence_cache_read_command_fact(candidate);
+        assert(!wrong_generation);
+        EdrCommandFacts missing = {wrong_generation, NULL};
+        assert(!has_rule(candidate, &missing, "R-EXEC-001"));
+      }
+      free(candidate);
+    }
+    if (n == 12717u) {
+      EdrBehaviorRecord *unknown = malloc(sizeof(*unknown));
+      assert(unknown);
+      *unknown = *child;
+      edr_behavior_resolve_source_truncated(unknown, "source.cmdline");
+      edr_behavior_mark_source_truncated(unknown, "source.cmdline_quality_unknown");
+      EdrCommandFacts checked = {0};
+      edr_local_evidence_cache_resolve_commands(unknown, &checked.subject, &checked.parent);
+      assert(checked.subject && !strcmp(checked.subject, command));
+      unknown->type = EDR_EVENT_PROCESS_CREATE;
+      strcpy(unknown->process_name, "powershell.exe");
+      assert(!has_rule(unknown, NULL, "R-EXEC-001"));
+      assert(has_rule(unknown, &checked, "R-EXEC-001"));
+      free(checked.subject); free(checked.parent); free(unknown);
+    }
+#endif
     EdrP0RuleIrBinding binding = {0};
     strcpy(binding.rules_bundle_version, "synthetic-r1"); memset(binding.artifact_sha256, 'a', 64u);
     char *snapshot = NULL, deferred_key[65]; size_t snapshot_size = 0;
@@ -181,6 +258,16 @@ int main(int argc, char **argv) {
     assert(edr_p0_deferred_snapshot_decode_facts((const char *)retained, retained_size,
         restored, &restored_binding, restored_rule, sizeof(restored_rule), &recovered));
     free(retained);
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(has_rule(restored, &recovered, "R-CRED-003"));
+    if (n == 12717u) {
+      restored->type = EDR_EVENT_PROCESS_CREATE;
+      strcpy(restored->process_name, "powershell.exe");
+      assert(has_rule(restored, &recovered, "R-EXEC-001"));
+      restored->type = EDR_EVENT_FILE_READ;
+      strcpy(restored->process_name, "inert-child.exe");
+    }
+#endif
     size_t replay_size = 0;
     uint8_t *replay = edr_behavior_record_alloc_durable_wire_facts(restored, &alert, &recovered, &replay_size);
     assert(replay && replay_size == expected_size && !memcmp(replay, expected_wire, replay_size));

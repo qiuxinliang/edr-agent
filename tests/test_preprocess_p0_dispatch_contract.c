@@ -33,21 +33,37 @@ int main(void) {
   const char *throttle_proven_miss;
   const char *throttle_gate;
   const char *p0_enrichment;
+  const char *hard_quality;
+  const char *fact_resolve;
+  const char *fact_match;
+  const char *source_only_gate;
+  const char *fact_handoff;
 
   if (!root || !root[0]) root = ".";
   snprintf(path, sizeof(path), "%s/src/preprocess/preprocess_pipeline.c", root);
   source = read_file(path);
   if (!source) return 1;
-  p0_call = strstr(source, "int p0_emitted = edr_p0_rule_try_emit(&br);");
+  p0_call = strstr(source, "int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts(&br, facts)");
   decision = strstr(source, "edr_detection_decision_evaluate(&br, &dd);");
   local_only = strstr(source, "edr_preprocess_admit_telemetry(&br, &dd)");
   p0_guard = strstr(source, "if (p0_emitted > 0) {\n    return;\n  }\n  emit_behavior_record(&br);");
   throttle_proven_miss = strstr(source, "static int p0_resource_throttle_proven_miss");
   throttle_gate = strstr(source, "p0_resource_throttle_proven_miss(&br)");
   p0_enrichment = strstr(source, "edr_pid_history_pmfe_fill_record(&br);");
+  hard_quality = strstr(source, "int source_only = edr_p0_rule_process_create_hard_reject(&br);");
+  fact_resolve = hard_quality ? strstr(hard_quality, "edr_local_evidence_cache_resolve_commands(") : NULL;
+  fact_match = fact_resolve ? strstr(fact_resolve,
+      "p0_process_create_matches_complete_fact(&br, &command_facts)") : NULL;
+  source_only_gate = fact_match ? strstr(fact_match,
+      "edr_p0_rule_emit_pre_evaluation_gate(&br, not_evaluable_reason)") : NULL;
+  fact_handoff = source_only_gate ? strstr(source_only_gate,
+      "process_ready_record(br, slot, command_facts_resolved ? &command_facts : NULL)") : NULL;
   standalone = p0_call ? strstr(p0_call, "emit_behavior_record(&br);") : NULL;
   if (!p0_call || !decision || !local_only || !p0_guard || !standalone ||
       !throttle_proven_miss || !throttle_gate || !p0_enrichment ||
+      !hard_quality || !fact_resolve || !fact_match || !source_only_gate || !fact_handoff ||
+      hard_quality >= fact_resolve || fact_resolve >= fact_match ||
+      fact_match >= source_only_gate || source_only_gate >= fact_handoff ||
       throttle_gate <= p0_enrichment || throttle_gate >= p0_call ||
       p0_call >= decision || p0_call >= local_only || p0_guard >= standalone) {
     fprintf(stderr, "P0 dispatch must precede local-only admission, and pressure may shed only verified IR misses\n");

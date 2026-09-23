@@ -191,6 +191,9 @@ typedef struct {
 void edr_behavior_record_init(EdrBehaviorRecord *r);
 
 int edr_behavior_source_field_truncated(const EdrBehaviorRecord *r, const char *field);
+/* A source-quality status that cannot be projected onto individual IR
+ * predicates remains source-only even when complete command facts exist. */
+int edr_behavior_p0_source_quality_hard_reject(const EdrBehaviorRecord *r);
 void edr_behavior_mark_source_truncated(EdrBehaviorRecord *r, const char *field);
 /* Only after replacing this field from a verified complete fact. Does not
  * clear other loss markers, list overflow, or NOT_EVALUABLE. */

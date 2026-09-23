@@ -50,6 +50,16 @@ int edr_behavior_source_field_truncated(const EdrBehaviorRecord *r, const char *
   return 0;
 }
 
+int edr_behavior_p0_source_quality_hard_reject(const EdrBehaviorRecord *r) {
+  if (!r) return 1;
+  return (strcmp(r->source_completeness, "TRUNCATED") == 0 &&
+          !r->source_truncated_fields[0]) ||
+         (strcmp(r->source_completeness, "NOT_EVALUABLE") == 0 &&
+          r->source_truncated_fields[0]) ||
+         edr_behavior_source_field_truncated(r, "source.list_overflow") ||
+         edr_behavior_source_field_truncated(r, "source.source_completeness");
+}
+
 void edr_behavior_mark_source_truncated(EdrBehaviorRecord *r, const char *field) {
   size_t used, len;
   if (!r || !field || !field[0]) return;

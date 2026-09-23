@@ -1042,26 +1042,45 @@ static int p0_ends_with_ci(const char *s, const char *suffix) {
   return 1;
 }
 
-static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
+int edr_p0_rule_process_create_hard_reject(const EdrBehaviorRecord *br) {
   const char *name;
-  int complete_rule_match = 0;
-  if (!br) {
-    return 1;
-  }
-  /* Missing source fields are never benign matcher inputs.  The Windows
-   * preprocess lane turns a process create into a registered source-only
-   * disposition; this guard keeps direct callers from alerting or acting on
-   * a record that has already withheld rule-relevant evidence. */
-  if (strcmp(br->source_completeness, "TRUNCATED") == 0 ||
-      br->source_truncated_fields[0] != '\0') {
+  if (!br) return 1;
+  if (br->type != EDR_EVENT_PROCESS_CREATE) return 0;
+  /* These record-level guards cannot be repaired by a complete command
+   * predicate. Keep the Windows source-only owner and direct emitter aligned. */
+  if (edr_behavior_p0_source_quality_hard_reject(br) ||
+      edr_behavior_source_field_truncated(br, "source.process_name") ||
+      br->is_security_4688 ||
+      strcmp(br->image_path_resolution_status, "NOT_EVALUABLE") == 0 ||
+      br->pid == 0u ||
+      (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0])) return 1;
+  name = br->process_name[0] ? br->process_name : br->exe_path;
+  return p0_ends_with_ci(name, ".dll") || p0_ends_with_ci(name, ".sys");
+}
+
+static int p0_valid_process_create_record(const EdrBehaviorRecord *br,
+                                          const EdrCommandFacts *retained_facts) {
+  if (!br) return 1;
+  /* A bare TRUNCATED status or overflowed field list has no safe dependency
+   * projection. Named preview omissions are checked against each predicate
+   * by the authenticated IR before any alert or action. */
+  if (br->type == EDR_EVENT_PROCESS_CREATE) {
+    if (edr_p0_rule_process_create_hard_reject(br)) return 0;
+  } else if (edr_behavior_p0_source_quality_hard_reject(br)) {
     return 0;
   }
   if (br->type == EDR_EVENT_FILE_READ) {
     /* A registered collector assertion is immutable source-only evidence,
      * never a candidate to retain and later upgrade into an alert. */
-    if (br->collector_evidence_gate[0] || br->collector_evidence_reason[0] ||
+    if (edr_behavior_source_field_truncated(br, "source.file_path") ||
+        edr_behavior_source_field_truncated(br, "source.process_name") ||
+        edr_behavior_source_field_truncated(br, "source.exe_path") ||
+        edr_behavior_source_field_truncated(br, "source.image_path_canonical") ||
+        edr_behavior_source_field_truncated(br, "source.image_path_resolution_status") ||
+        edr_behavior_source_field_truncated(br, "source.process_generation_source") ||
+        br->collector_evidence_gate[0] || br->collector_evidence_reason[0] ||
         strcmp(br->source_completeness, "NOT_EVALUABLE") == 0) return 0;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
     /* Kernel-File Read is P0-eligible only after both the FileKey path and
      * actor generation have survived exact StartKey/creation binding from a
      * live handle or event-time historical generation. A missing extended
@@ -1084,48 +1103,32 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
   if (br->type != EDR_EVENT_PROCESS_CREATE) {
     return 1;
   }
-  /* Security 4688 augments a kernel process generation; it must not create a
-   * second P0 alert as an independent lifecycle event. */
-  if (br->is_security_4688) {
-    return 0;
-  }
-  /* A raw NT device path cannot establish that an image is outside a system
-   * directory, so it is not eligible for path-sensitive P0 evaluation. */
-  if (strcmp(br->image_path_resolution_status, "NOT_EVALUABLE") == 0) {
-    return 0;
-  }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
   /* The authenticated IR is the authority for predicate completeness.  A
    * short-lived process may exit before optional user/parent/cmd enrichment
    * completes; if the active rule already matched without those fields, keep
    * the detection and declare the missing evidence instead of suppressing it.
    * This never authorizes enforcement, whose generation/file-identity gates
    * are checked separately below the matcher. */
-  complete_rule_match = edr_p0_rule_ir_is_ready() &&
-                        edr_p0_rule_ir_br_matches_any(br);
-  /* P0 path rules require a coalesced Windows process generation.  The
-   * preprocess pipeline emits a durable source-only disposition when these
-   * fields are unavailable; this guard also protects direct callers. */
-  if (!complete_rule_match &&
-      ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
-       !br->process_name[0] || !br->exe_path[0] || !br->cmdline[0] || br->ppid == 0u ||
-       !br->parent_path[0] || !br->parent_creation_time[0] ||
-       (!br->username[0] && !br->user_sid[0]))) {
-    return 0;
+  if ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
+      !br->process_name[0] || !br->exe_path[0] || !br->cmdline[0] || br->ppid == 0u ||
+      !br->parent_path[0] || !br->parent_creation_time[0] ||
+      (!br->username[0] && !br->user_sid[0])) {
+    EdrP0RuleIrEvaluation evaluation;
+    int complete_rule_match = 0;
+    if (edr_p0_rule_ir_is_ready() &&
+        edr_p0_rule_ir_evaluate_record(br, retained_facts, &evaluation)) {
+      complete_rule_match = evaluation.match_count > 0u;
+      edr_p0_rule_ir_evaluation_free(&evaluation);
+    }
+    /* The pipeline's durable source-only gate is the owner for records with
+     * missing optional evidence but no complete-rule match. Direct callers
+     * remain fail-closed at this same boundary. */
+    if (!complete_rule_match) return 0;
   }
 #else
-  (void)complete_rule_match;
+  (void)retained_facts;
 #endif
-  if (br->pid == 0u) {
-    return 0;
-  }
-  if (!br->process_name[0] && !br->exe_path[0] && !br->cmdline[0]) {
-    return 0;
-  }
-  name = br->process_name[0] ? br->process_name : br->exe_path;
-  if (p0_ends_with_ci(name, ".dll") || p0_ends_with_ci(name, ".sys")) {
-    return 0;
-  }
   return 1;
 }
 
@@ -3889,14 +3892,13 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
  * converts this exact snapshot into a wire, or records an explicit terminal
  * disposition. No process or SQLite access is performed under s_p0_state_lock. */
 static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
-    const EdrP0RuleIrBinding *binding, const char *rule_id, int gate_closed) {
+    const EdrP0RuleIrBinding *binding, const char *rule_id, int gate_closed,
+    const EdrCommandFacts *facts) {
   char *json = NULL;
   size_t length = 0u;
   char key[65];
   int owned = -1;
-  EdrCommandFacts facts = {0};
-  edr_local_evidence_cache_resolve_commands(br, &facts.subject, &facts.parent);
-  if (edr_p0_deferred_snapshot_encode_facts(br,binding,rule_id,&facts,&json,&length) &&
+  if (edr_p0_deferred_snapshot_encode_facts(br,binding,rule_id,facts,&json,&length) &&
       edr_sha256_hex((const uint8_t *)json,length,key)==0) {
     owned = gate_closed
         ? (edr_storage_queue_p0_deferred_retain(key,p0_source_only_family_for_event(br->type),
@@ -3912,7 +3914,6 @@ static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
     }
   }
   free(json);
-  free(facts.subject); free(facts.parent);
   if (owned < 0) {
     p0_state_lock();
     p0_source_only_mark_unhealthy_for_event_locked("p0_deferred_admission_failed",1,br->type);
@@ -3999,7 +4000,7 @@ int edr_p0_rule_poll_deferred_match(void) {
         delivery_gate),"retry_delivery_gate");
     goto replay_done;
   }
-  if (!p0_valid_process_create_record(record)) {
+  if (!p0_valid_process_create_record(record, &facts)) {
     p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,
         "retained_evidence_invalid"),"fail_evidence");
     goto replay_done;
@@ -4014,7 +4015,7 @@ int edr_p0_rule_poll_deferred_match(void) {
     goto replay_done;
   }
   memset(&evaluation,0,sizeof(evaluation));
-  if (!edr_p0_rule_ir_evaluate_record(record,&evaluation)) {
+  if (!edr_p0_rule_ir_evaluate_record(record,&facts,&evaluation)) {
     p0_deferred_storage_result(edr_storage_queue_p0_deferred_retry(key,"p0_ir_evaluation_unavailable"),"retry_evaluation");
     goto replay_done;
   }
@@ -4129,9 +4130,10 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record) {
 
 #undef p0_json_escape_or_empty
 
-int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
+int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
+                                             const EdrCommandFacts *provided_facts) {
   int emitted_count = 0;
-  if (!br) {
+  if (!br || !provided_facts) {
     return 0;
   }
   const char *p0_env = getenv("EDR_P0_DIRECT_EMIT");
@@ -4156,7 +4158,9 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     return 0;
   }
 
-  if (!p0_valid_process_create_record(br)) {
+  /* This entry only borrows the caller's one generation-bound fact snapshot.
+   * An empty fact is an unavailable predicate, never a reason to re-read. */
+  if (!p0_valid_process_create_record(br, provided_facts)) {
     edr_p0_rule_observe_validation_stage(br, "precondition", "invalid_process_create");
     static uint64_t s_invalid_process_create;
     s_invalid_process_create++;
@@ -4227,7 +4231,7 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     int gate_closed = 0;
     const char *delivery_gate;
     memset(&evaluation, 0, sizeof(evaluation));
-    if (edr_p0_rule_ir_evaluate_record(br, &evaluation)) {
+    if (edr_p0_rule_ir_evaluate_record(br, provided_facts, &evaluation)) {
       edr_p0_rule_observe_validation_stage(
           br, "matcher",
           p0_validation_target_matched(br, &evaluation) ? "target_match" : "target_no_match");
@@ -4270,7 +4274,8 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
           continue;
         }
         gate_closed = gate_closed || p0_delivery_gate_reason(br->type) != NULL;
-        if (p0_defer_or_already_owned(br,&evaluation.binding,rid,gate_closed)) continue;
+        if (p0_defer_or_already_owned(br,&evaluation.binding,rid,gate_closed,
+                                      provided_facts)) continue;
         const char *known_fp_reason = "";
         if (!p0_should_suppress_known_false_positive(
                 rid, br, detail, &known_fp_reason)) {
@@ -4281,13 +4286,10 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         }
         /* A terminal intent and its result must use the same command bodies;
          * late enrichment cannot enlarge a post-action recovery reservation. */
-        EdrCommandFacts command_facts = {0};
-        edr_local_evidence_cache_resolve_commands(br, &command_facts.subject, &command_facts.parent);
         int rule_emitted = emit_for_rule(br, rid, match.severity,
                           match.title[0] ? match.title : rid,
                           match.mitre_csv, &evaluation.binding,
-                          known_fp_reason, NULL, NULL, &delivery_gated, &command_facts);
-        free(command_facts.subject); free(command_facts.parent);
+                          known_fp_reason, NULL, NULL, &delivery_gated, provided_facts);
         if (rule_emitted) {
           emitted_count++;
           edr_adaptive_collection_raise(match.severity, rid, br->pid, br->ppid,
@@ -4296,7 +4298,8 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
         } else if (delivery_gated) {
           /* A late gate closure must not lose a record which did not own a
            * durable snapshot when matching started. */
-          (void)p0_defer_or_already_owned(br,&evaluation.binding,rid,1);
+          (void)p0_defer_or_already_owned(br,&evaluation.binding,rid,1,
+                                          provided_facts);
         }
       }
       edr_p0_rule_ir_evaluation_free(&evaluation);
@@ -4319,4 +4322,20 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
     }
   }
   return emitted_count;
+}
+
+int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
+  EdrCommandFacts facts = {0};
+  int emitted;
+  int hard_reject = br && (br->type == EDR_EVENT_PROCESS_CREATE
+      ? edr_p0_rule_process_create_hard_reject(br)
+      : edr_behavior_p0_source_quality_hard_reject(br));
+  if (br && getenv_int01_disabled_on_zero("EDR_P0_DIRECT_EMIT") &&
+      !hard_reject &&
+      (!p0_is_ruleset_evaluation_event(br->type) || edr_p0_rule_ir_is_ready())) {
+    edr_local_evidence_cache_resolve_commands(br, &facts.subject, &facts.parent);
+  }
+  emitted = edr_p0_rule_try_emit_with_command_facts(br, &facts);
+  free(facts.subject); free(facts.parent);
+  return emitted;
 }

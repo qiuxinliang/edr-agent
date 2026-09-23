@@ -876,6 +876,25 @@ static int verify_source_truncation_pre_evaluation_durable(void) {
       strstr(decoded.ave_result_json, "\"gate_id\":\"P0_PROCESS_EVIDENCE_GATE\"") == NULL) {
     return 0;
   }
+  /* A generation-bound command tail may match an IR predicate, but a
+   * NOT_EVALUABLE source carrying that truncation marker stays source-only. */
+  snprintf(input.source_completeness, sizeof(input.source_completeness), "%s", "NOT_EVALUABLE");
+  snprintf(input.source_truncated_fields, sizeof(input.source_truncated_fields), "%s",
+           "source.cmdline");
+  snprintf(input.process_name, sizeof(input.process_name), "%s", "powershell.exe");
+  snprintf(input.cmdline, sizeof(input.cmdline), "%s", "powershell.exe safe-preview");
+  if (!edr_behavior_p0_source_quality_hard_reject(&input) ||
+      !edr_p0_source_only_build_pre_evaluation_record(
+          &input, "source_fields_truncated", &built)) return 0;
+  wire_len = edr_behavior_record_encode_durable_wire(&built, wire, sizeof(wire));
+  memset(&decoded, 0, sizeof(decoded));
+  stream = pb_istream_from_buffer(wire + 16u, wire_len - 16u);
+  if (wire_len <= 16u || !pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded) ||
+      decoded.has_behavior_alert ||
+      strcmp(decoded.source_completeness, "NOT_EVALUABLE") != 0 ||
+      strcmp(decoded.truncated_fields, "source.cmdline") != 0 ||
+      strstr(decoded.ave_result_json, "\"gate_id\":\"P0_PROCESS_EVIDENCE_GATE\"") == NULL)
+    return 0;
   return 1;
 }
 

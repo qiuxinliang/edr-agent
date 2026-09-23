@@ -12,6 +12,13 @@
 /* Returns the number of P0 combined frames synchronously accepted by the
  * persistent high-priority offline queue. */
 int edr_p0_rule_try_emit(const EdrBehaviorRecord *br);
+/* ProcessCreate record-level hard rejection shared with the Windows
+ * pre-evaluation source-only gate. Optional predicate gaps are not included. */
+int edr_p0_rule_process_create_hard_reject(const EdrBehaviorRecord *br);
+/* The preprocess caller owns these already-resolved generation-bound strings
+ * until return. Admission, matching, ownership and wire emission only borrow. */
+int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
+                                             const EdrCommandFacts *facts);
 /* Emits one bounded, marker-only validation stage line. Production traffic
  * without an explicit P0CASE marker is a no-op. */
 void edr_p0_rule_observe_validation_stage(const EdrBehaviorRecord *br,

@@ -42,8 +42,10 @@ void edr_p0_rule_ir_sensor_admission_unlock(void) {}
 uint64_t edr_p0_rule_ir_sensor_admission_generation(void) { return 0u; }
 
 int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
+                                   const EdrCommandFacts *facts,
                                    EdrP0RuleIrEvaluation *out_evaluation) {
   (void)br;
+  (void)facts;
   if (out_evaluation) {
     memset(out_evaluation, 0, sizeof(*out_evaluation));
   }

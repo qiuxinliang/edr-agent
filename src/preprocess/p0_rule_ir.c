@@ -4,6 +4,7 @@
 #include "edr/behavior_record.h"
 #include "edr/encrypt_p0_rules.h"
 #include "edr/sha256.h"
+#include "edr/process_generation.h"
 #include "cJSON.h"
 
 /* pcre2.h 要求：在包含前设定宽度；本文件使用 8 位 API（与 PCRE2_UCHAR8 / char* 一致） */
@@ -1352,8 +1353,8 @@ static int one_rule_match_process(
   return 1;
 }
 
-static int one_rule_match_file(const struct p0_ir_one *r, const EdrBehaviorRecord *br) {
-  const char *cmd = br->cmdline[0] ? br->cmdline : "";
+static int one_rule_match_file(const struct p0_ir_one *r, const EdrBehaviorRecord *br,
+                               const char *cmd) {
   const char *par = br->parent_name[0] ? br->parent_name : "";
   char pnlow[1024];
   char prlow[1024];
@@ -1771,14 +1772,120 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
   return 1;
 }
 
-static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRecord *br) {
+static int p0_ir_known_source_marker(const char *field, size_t length) {
+  static const char *const known[] = {
+      "source.cmdline", "source.cmdline_quality_unknown", "source.command_line_origin",
+      "source.creator_domain",
+      "source.creator_logon_id", "source.creator_sid", "source.creator_username",
+      "source.current_directory",
+      "source.dns_query", "source.domain", "source.exe_hash", "source.exe_path",
+      "source.file_old_path", "source.file_path", "source.grandparent_path",
+      "source.image_path_canonical", "source.image_path_namespace",
+      "source.image_path_raw", "source.image_path_resolution_source",
+      "source.image_path_resolution_status", "source.integrity_level",
+      "source.logon_id", "source.net_dst", "source.net_proto", "source.net_src",
+      "source.parent_cmdline", "source.parent_command_fact", "source.parent_name",
+      "source.old_file_path", "source.parent_path", "source.pmfe_snapshot",
+      "source.process_creation_time", "source.process_generation_source",
+      "source.process_name",
+      "source.reg_attribution", "source.reg_detail_status", "source.reg_key_path",
+      "source.reg_old_value_data", "source.reg_op", "source.reg_source",
+      "source.reg_value_data", "source.reg_value_name", "source.script_snippet",
+      "source.source_completeness", "source.token_elevation", "source.user_sid",
+      "source.username"};
+  for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); ++i)
+    if (strlen(known[i]) == length && memcmp(known[i], field, length) == 0) return 1;
+  return 0;
+}
+
+static int p0_ir_source_markers_valid(const EdrBehaviorRecord *br) {
+  const char *cursor, *end;
+  if (!memchr(br->source_truncated_fields, 0, sizeof(br->source_truncated_fields))) return 0;
+  cursor = br->source_truncated_fields;
+  if (!cursor[0]) return strcmp(br->source_completeness, "TRUNCATED") != 0;
+  while (*cursor) {
+    end = strchr(cursor, ',');
+    if (!end) end = cursor + strlen(cursor);
+    if (!p0_ir_known_source_marker(cursor, (size_t)(end - cursor))) return 0;
+    if (!*end) break;
+    cursor = end + 1u;
+    if (!*cursor) return 0;
+  }
+  return 1;
+}
+
+static const char *p0_ir_rule_command(const struct p0_ir_one *r,
+    const EdrBehaviorRecord *br, const EdrCommandFacts *facts) {
+  const char *preview = br->cmdline[0] ? br->cmdline : br->script_snippet;
+  const char *complete;
+  size_t n, complete_n;
+  if (!r->n_cmd_all && !r->n_cmd_any) return preview;
+  if (!memchr(br->cmdline, 0, sizeof(br->cmdline)) ||
+      !memchr(br->script_snippet, 0, sizeof(br->script_snippet))) return NULL;
+  if (edr_behavior_source_field_truncated(br, "source.script_snippet") &&
+      !br->cmdline[0]) return NULL;
+  if (!edr_behavior_source_field_truncated(br, "source.cmdline") &&
+      !edr_behavior_source_field_truncated(br, "source.cmdline_quality_unknown"))
+    return preview;
+  complete = facts ? facts->subject : NULL;
+  if (!complete || !br->pid || !br->process_start_key ||
+      !br->process_creation_filetime_100ns || !br->tenant_id[0] ||
+      !br->endpoint_id[0]) return NULL;
+  n = strlen(br->cmdline);
+  complete_n = strnlen(complete, EDR_PROCESS_COMMAND_FACT_CAP);
+  if (complete_n == EDR_PROCESS_COMMAND_FACT_CAP || complete_n < n ||
+      (edr_behavior_source_field_truncated(br, "source.cmdline") && complete_n == n) ||
+      strncmp(complete, br->cmdline, n) != 0) return NULL;
+  return complete;
+}
+
+static int p0_ir_rule_fields_complete(const struct p0_ir_one *r,
+    const EdrBehaviorRecord *br) {
+  int file_read = br->type == EDR_EVENT_FILE_READ;
+  int file_rule = strcmp(r->event_type, "file_read") == 0 ||
+                  strcmp(r->event_type, "file_write") == 0;
+  if (!p0_ir_source_markers_valid(br)) return 0;
+  if (edr_behavior_source_field_truncated(br, "source.source_completeness")) return 0;
+  if (file_read &&
+      (edr_behavior_source_field_truncated(br, "source.image_path_resolution_status") ||
+       edr_behavior_source_field_truncated(br, "source.process_generation_source"))) return 0;
+  if (((file_read || (file_rule && r->n_fpath)) &&
+       edr_behavior_source_field_truncated(br, "source.file_path"))) return 0;
+  if ((file_read || r->n_name_in || r->n_pn_rx) &&
+      edr_behavior_source_field_truncated(br, "source.process_name")) return 0;
+  if (file_read &&
+      (edr_behavior_source_field_truncated(br, "source.exe_path") ||
+       edr_behavior_source_field_truncated(br, "source.image_path_canonical"))) return 0;
+  if (r->n_ppath_rx &&
+      (edr_behavior_source_field_truncated(br, "source.exe_path") ||
+       edr_behavior_source_field_truncated(br, "source.image_path_canonical"))) return 0;
+  if ((r->n_parent_in || r->n_pr_rx) &&
+      edr_behavior_source_field_truncated(br, "source.parent_name")) return 0;
+  if (strcmp(r->event_type, "network_connect") == 0 && r->n_fpath &&
+      edr_behavior_source_field_truncated(br, "source.file_path")) return 0;
+  if (strcmp(r->event_type, "registry_set") == 0 &&
+      ((r->n_regpath || r->n_reg_dword) &&
+       edr_behavior_source_field_truncated(br, "source.reg_key_path"))) return 0;
+  if (strcmp(r->event_type, "registry_set") == 0 && (r->n_reg_name || r->n_reg_dword) &&
+      edr_behavior_source_field_truncated(br, "source.reg_value_name")) return 0;
+  if (strcmp(r->event_type, "registry_set") == 0 && (r->n_reg_data || r->n_reg_dword) &&
+      edr_behavior_source_field_truncated(br, "source.reg_value_data")) return 0;
+  return 1;
+}
+
+static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRecord *br,
+                                  const EdrCommandFacts *facts, int authoritative) {
+  const char *cmd;
   if (!r || !br) {
     return 0;
   }
+  if (authoritative && !p0_ir_rule_fields_complete(r, br)) return 0;
+  cmd = authoritative ? p0_ir_rule_command(r, br, facts) :
+      (br->cmdline[0] ? br->cmdline : br->script_snippet);
+  if ((r->n_cmd_all || r->n_cmd_any) && !cmd) return 0;
   if (strcmp(r->event_type, "process_create") == 0 || strcmp(r->event_type, "script_powershell") == 0 ||
       strcmp(r->event_type, "powershell_script") == 0 || strcmp(r->event_type, "script_wmi") == 0 ||
       strcmp(r->event_type, "wmi_script") == 0) {
-    const char *cmd = br->cmdline[0] ? br->cmdline : br->script_snippet;
     const char *pn = br->process_name[0] ? br->process_name : NULL;
     if (!pn && br->type == EDR_EVENT_SCRIPT_POWERSHELL) {
       pn = "powershell.exe";
@@ -1791,7 +1898,7 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
     );
   }
   if (strcmp(r->event_type, "file_read") == 0 || strcmp(r->event_type, "file_write") == 0) {
-    return one_rule_match_file(r, br);
+    return one_rule_match_file(r, br, cmd);
   }
   if (strcmp(r->event_type, "network_connect") == 0) {
     return one_rule_match_net(r, br);
@@ -2373,6 +2480,7 @@ int edr_p0_rule_ir_get_binding(EdrP0RuleIrBinding *out_binding) {
 }
 
 int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
+                                   const EdrCommandFacts *facts,
                                    EdrP0RuleIrEvaluation *out_evaluation) {
   p0_ir_candidate *snapshot;
   uint32_t match_count = 0u;
@@ -2404,7 +2512,7 @@ int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
       continue;
     }
     hit = p0_br_wants_event_type(br->type, rule->event_type) &&
-          p0_ir_match_rule_to_br(rule, br);
+          p0_ir_match_rule_to_br(rule, br, facts, 1);
     p0_ir_stats_record_snapshot(snapshot, i, hit);
     if (!hit) {
       continue;
@@ -2683,7 +2791,7 @@ int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
     return 0;
   }
   result = p0_br_wants_event_type(br->type, snapshot->rule[index].event_type) &&
-           p0_ir_match_rule_to_br(&snapshot->rule[index], br);
+           p0_ir_match_rule_to_br(&snapshot->rule[index], br, NULL, 0);
   p0_ir_snapshot_release(snapshot);
   return result ? 1 : 0;
 }
@@ -2700,7 +2808,7 @@ int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
   }
   for (int i = 0; i < snapshot->n; i++) {
     if (snapshot->rule[i].in_use && p0_br_wants_event_type(br->type, snapshot->rule[i].event_type) &&
-        p0_ir_match_rule_to_br(&snapshot->rule[i], br)) {
+        p0_ir_match_rule_to_br(&snapshot->rule[i], br, NULL, 0)) {
       p0_ir_snapshot_release(snapshot);
       return 1;
     }

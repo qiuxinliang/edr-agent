@@ -4,6 +4,7 @@
 #include "edr/behavior_alert_emit.h"
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/p0_deferred_snapshot.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/policy_enforcement.h"
 #include "edr/policy_v2.h"
@@ -42,6 +43,9 @@ int edr_p0_test_should_suppress_known_false_positive(const char *rule_id,
                                                      const EdrBehaviorRecord *br,
                                                      const char *detail,
                                                      const char **out_reason);
+void edr_test_set_stub_command_fact(const char *subject);
+void edr_test_set_stub_command_fact_fail_after(int successful_calls);
+int edr_test_stub_command_fact_resolve_count(void);
 
 static atomic_int g_adaptive_raises = 0;
 void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t pid,
@@ -473,6 +477,7 @@ int edr_p0_rule_ir_get_binding(EdrP0RuleIrBinding *out_binding) {
   return 1;
 }
 int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
+                                   const EdrCommandFacts *facts,
                                    EdrP0RuleIrEvaluation *out_evaluation) {
   atomic_fetch_add(&g_ir_evaluation_calls, 1);
   if (!br || !out_evaluation) {
@@ -485,7 +490,10 @@ int edr_p0_rule_ir_evaluate_record(const EdrBehaviorRecord *br,
   if (!edr_p0_rule_ir_get_binding(&out_evaluation->binding)) {
     return 0;
   }
-  if (!edr_p0_rule_ir_br_matches_any(br)) {
+  if (!edr_p0_rule_ir_br_matches_any(br) &&
+      !(g_command_only_match && facts && facts->subject &&
+        strcmp(br->process_name, "powershell.exe") == 0 &&
+        strstr(facts->subject, " -enc ") != NULL)) {
     return 1;
   }
   out_evaluation->match_indices[0] = 0u;
@@ -740,16 +748,210 @@ static void test_windows_process_admission_uses_rule_predicates(void) {
   atomic_store(&g_ir_evaluation_calls, 0);
   init_record(&r);
   snprintf(r.process_name, sizeof(r.process_name), "%s", "ordinary-miss.exe");
-  /* Incomplete and no proven predicate: reject before snapshot evaluation. */
+  /* Incomplete and no proven predicate: authoritative snapshot proves miss. */
   assert(edr_p0_rule_try_emit(&r) == 0);
-  assert(atomic_load(&g_ir_evaluation_calls) == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
   assert(g_emit_count == 0 && g_durable_count == 0);
   /* A proven rule match remains alertable without optional enrichment.
    * This also catches a disagreement between the two fake IR query APIs. */
   snprintf(r.process_name, sizeof(r.process_name), "%s", "dedup-test.exe");
   assert(edr_p0_rule_try_emit(&r) == 1);
-  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 3);
   assert(g_emit_count == 1 && g_durable_count == 0);
+}
+
+static void test_windows_full_command_match_survives_optional_gap(void) {
+  EdrBehaviorRecord r;
+  int before;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = g_ir_evaluation_available = g_combined_emit_allowed = 1;
+  g_command_only_match = 1;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  atomic_store(&g_emit_count, 0);
+  init_complete_process_record(&r, "powershell.exe");
+  strcpy(r.event_id, "full-command-optional-gap");
+  strcpy(r.cmdline, "powershell.exe safe-preview");
+  r.parent_path[0] = '\0';
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_test_set_stub_command_fact("powershell.exe safe-preview -enc payload");
+  assert(!edr_p0_rule_ir_br_matches_any(&r));
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(atomic_load(&g_emit_count) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 2);
+  assert(!strcmp(g_last_record.event_id, r.event_id));
+  before = atomic_load(&g_ir_evaluation_calls);
+  strcpy(r.event_id, "full-command-wrong-generation");
+  r.process_start_key = 0;
+  /* The fake resolver cannot prove generation; the production IR refuses
+   * command predicates without exact generation fields. */
+  edr_test_set_stub_command_fact(NULL);
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == before + 1);
+  r.process_start_key = 0x4242u;
+  r.pid = 0;
+  strcpy(r.event_id, "full-command-missing-pid");
+  edr_test_set_stub_command_fact("powershell.exe safe-preview -enc payload");
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+  edr_test_set_stub_command_fact(NULL);
+  g_command_only_match = 0;
+}
+
+static void test_windows_command_fact_is_one_admission_snapshot(void) {
+  EdrBehaviorRecord r, restored;
+  EdrP0RuleIrBinding binding;
+  EdrCommandFacts recovered = {0};
+  char rule[128];
+  const char *full = "powershell.exe safe-preview -enc payload";
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  deferred_fake_reset();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  edr_p0_rule_test_set_monotonic_ms(5000u);
+  g_ir_ready = g_ir_evaluation_available = g_combined_emit_allowed = 1;
+  g_command_only_match = 1;
+  g_source_latch = g_source_ack = 0;
+  atomic_store(&g_emit_count, 0);
+  init_complete_process_record(&r, "powershell.exe");
+  strcpy(r.event_id, "full-command-resolve-once");
+  strcpy(r.cmdline, "powershell.exe safe-preview");
+  r.parent_path[0] = '\0';
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_test_set_stub_command_fact(full);
+  edr_test_set_stub_command_fact_fail_after(1);
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(edr_test_stub_command_fact_resolve_count() == 1);
+  assert(atomic_load(&g_emit_count) == 1);
+
+  /* Ownership and retained replay must encode the same fact which matched,
+   * even when a later cache read would fail. */
+  edr_p0_rule_test_reset_dedup();
+  deferred_fake_reset();
+  deferred_contains_fails = 1;
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  strcpy(r.event_id, "full-command-retain-once");
+  edr_test_set_stub_command_fact_fail_after(1);
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(edr_test_stub_command_fact_resolve_count() == 1);
+  assert(deferred_count == 1u);
+  assert(edr_p0_deferred_snapshot_decode_facts(
+      (const char *)deferred_rows[0].payload, deferred_rows[0].length,
+      &restored, &binding, rule, sizeof(rule), &recovered));
+  assert(recovered.subject && !strcmp(recovered.subject, full));
+  free(recovered.subject); free(recovered.parent);
+  deferred_contains_fails = 0;
+  edr_test_set_stub_command_fact(NULL);
+  edr_test_set_stub_command_fact_fail_after(0);
+  g_source_ack = 1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  edr_p0_rule_test_set_monotonic_ms(6000u);
+  assert(edr_p0_rule_poll_deferred_match() == 1);
+  assert(deferred_completions == 1u);
+  assert(atomic_load(&g_emit_count) == 2);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  deferred_fake_reset();
+  edr_test_set_stub_command_fact_fail_after(-1);
+  edr_test_set_stub_command_fact(NULL);
+  g_command_only_match = 0;
+}
+
+static void test_windows_pipeline_handoff_borrows_matched_fact(void) {
+  EdrBehaviorRecord r;
+  EdrCommandFacts facts = {(char *)"powershell.exe safe-preview -enc payload", NULL};
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = g_ir_evaluation_available = g_combined_emit_allowed = 1;
+  g_command_only_match = 1;
+  atomic_store(&g_emit_count, 0);
+  init_complete_process_record(&r, "powershell.exe");
+  strcpy(r.event_id, "pipeline-fact-handoff");
+  strcpy(r.cmdline, "powershell.exe safe-preview");
+  r.parent_path[0] = '\0';
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_test_set_stub_command_fact(NULL);
+  edr_test_set_stub_command_fact_fail_after(0);
+  assert(edr_p0_rule_try_emit_with_command_facts(&r, &facts) == 1);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+  EdrCommandFacts missing = {0};
+  strcpy(r.event_id, "pipeline-fact-first-read-missing");
+  edr_test_set_stub_command_fact(facts.subject);
+  assert(edr_p0_rule_try_emit_with_command_facts(&r, &missing) == 0);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+  strcpy(r.event_id, "pipeline-fact-hard-reject");
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_behavior_p0_source_quality_hard_reject(&r));
+  assert(edr_p0_rule_try_emit_with_command_facts(&r, &facts) == 0);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  assert(atomic_load(&g_emit_count) == 1);
+  edr_test_set_stub_command_fact_fail_after(-1);
+  edr_test_set_stub_command_fact(NULL);
+  g_command_only_match = 0;
+}
+
+static void test_windows_pipeline_and_emitter_share_process_hard_gate(void) {
+  EdrBehaviorRecord r, valid;
+  init_complete_process_record(&r, "powershell.exe");
+  strcpy(r.cmdline, "powershell.exe safe-preview");
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  valid = r;
+  assert(!edr_p0_rule_process_create_hard_reject(&valid));
+  r.parent_path[0] = '\0';
+  assert(!edr_p0_rule_process_create_hard_reject(&r));
+  /* The complete tail can match, but an unresolved image path remains a
+   * record-level hard rejection and must enter pipeline source-only. */
+  strcpy(r.image_path_resolution_status, "NOT_EVALUABLE");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  strcpy(r.image_path_resolution_status, "UNRESOLVED");
+  assert(!edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  r.is_security_4688 = 1;
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  r.pid = 0;
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  edr_behavior_mark_source_truncated(&r, "source.process_name");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  r.source_truncated_fields[0] = '\0';
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  edr_behavior_mark_source_truncated(&r, "source.list_overflow");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  edr_behavior_mark_source_truncated(&r, "source.source_completeness");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  r.process_name[0] = r.exe_path[0] = r.cmdline[0] = '\0';
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  strcpy(r.process_name, "payload.DLL");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  r = valid;
+  r.process_name[0] = '\0';
+  strcpy(r.exe_path, "payload.SyS");
+  assert(edr_p0_rule_process_create_hard_reject(&r));
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  g_ir_ready = 1;
+  r = valid;
+  strcpy(r.image_path_resolution_status, "NOT_EVALUABLE");
+  edr_test_set_stub_command_fact("powershell.exe safe-preview -enc payload");
+  edr_test_set_stub_command_fact_fail_after(1);
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  edr_test_set_stub_command_fact_fail_after(-1);
+  edr_test_set_stub_command_fact(NULL);
 }
 
 static void test_windows_file_read_admission_requires_bound_evidence(void) {
@@ -784,7 +986,10 @@ static void test_windows_file_read_admission_requires_bound_evidence(void) {
       case 9: strcpy(r.source_completeness, "TRUNCATED"); break;
       case 10: strcpy(r.source_truncated_fields, "source.file_path"); break;
     }
-    assert(edr_p0_rule_try_emit(&r) == 0);
+    if (edr_p0_rule_try_emit(&r) != 0) {
+      fprintf(stderr, "unexpected Windows FileRead admission at case %u\n", i);
+      assert(0);
+    }
     assert(atomic_load(&g_ir_evaluation_calls) == 0);
     assert(g_emit_count == 0 && g_durable_count == 0);
   }
@@ -797,6 +1002,12 @@ static void test_windows_file_read_admission_requires_bound_evidence(void) {
     assert(atomic_load(&g_ir_evaluation_calls) == (int)i + 1);
     assert(atomic_load(&g_emit_count) == (int)i + 1);
   }
+  init_file_read_record(&r, "dedup-test.exe");
+  snprintf(r.event_id, sizeof(r.event_id), "%s", "valid-parent-preview-file-read");
+  edr_behavior_mark_source_truncated(&r, "source.parent_cmdline");
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) ==
+         (int)(sizeof(generation_sources) / sizeof(generation_sources[0])) + 1);
 }
 #endif
 
@@ -1357,6 +1568,51 @@ static void test_source_truncation_never_emits_after_coalescer_status(void) {
            "source.process_name,source.exe_hash");
   assert(edr_p0_rule_try_emit(&r) == 0);
   assert(g_emit_count == 0);
+}
+
+static void test_file_read_parent_command_preview_reaches_matcher(void) {
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = 1;
+  g_ir_evaluation_available = 1;
+  g_combined_emit_allowed = 1;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  atomic_store(&g_emit_count, 0);
+  init_file_read_record(&r, "dedup-test.exe");
+  snprintf(r.event_id, sizeof(r.event_id), "%s", "parent-preview-file-read");
+  edr_behavior_mark_source_truncated(&r, "source.parent_cmdline");
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  assert(atomic_load(&g_emit_count) == 1);
+  assert(edr_behavior_source_field_truncated(&g_last_record, "source.parent_cmdline"));
+  snprintf(r.event_id, sizeof(r.event_id), "%s", "parent-preview-cookies-read");
+  snprintf(r.file_path, sizeof(r.file_path), "%s", "C:\\Chrome\\Network\\Cookies");
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 2);
+  assert(atomic_load(&g_emit_count) == 2);
+  assert(!strcmp(g_last_record.event_id, "parent-preview-cookies-read"));
+  assert(edr_behavior_source_field_truncated(&g_last_record, "source.parent_cmdline"));
+}
+
+static void test_not_evaluable_with_preview_stays_source_only(void) {
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_ir_ready = 1;
+  g_ir_evaluation_available = 1;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  atomic_store(&g_emit_count, 0);
+  init_record(&r);
+  r.type = EDR_EVENT_NET_CONNECT;
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "dedup-test.exe");
+  snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "NOT_EVALUABLE");
+  snprintf(r.source_truncated_fields, sizeof(r.source_truncated_fields), "%s",
+           "source.parent_cmdline");
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 0);
+  assert(atomic_load(&g_emit_count) == 0);
 }
 
 static void test_p0_bundle_sha256_is_required_and_attached(void) {
@@ -2809,6 +3065,15 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
 #endif
 
 int main(void) {
+#ifdef EDR_P0_WINDOWS_ADMISSION_TEST
+  test_windows_process_admission_uses_rule_predicates();
+  test_windows_full_command_match_survives_optional_gap();
+  test_windows_command_fact_is_one_admission_snapshot();
+  test_windows_pipeline_handoff_borrows_matched_fact();
+  test_windows_pipeline_and_emitter_share_process_hard_gate();
+  test_windows_file_read_admission_requires_bound_evidence();
+  return 0;
+#endif
   test_internal_markers_do_not_skip_p0();
   test_self_noise_requires_exact_live_owner();
   test_internal_marker_without_process_name_survives_deferred_replay();
@@ -2846,6 +3111,8 @@ int main(void) {
   test_p0_governor_suppression_is_not_queue_backpressure();
   test_p0_miss_does_not_emit_combined_frame();
   test_source_truncation_never_emits_after_coalescer_status();
+  test_file_read_parent_command_preview_reaches_matcher();
+  test_not_evaluable_with_preview_stays_source_only();
   test_p0_bundle_sha256_is_required_and_attached();
   test_ir_evaluation_failure_durably_preserves_source_without_alert();
   test_source_only_retry_lane_is_exact_and_overflow_latched();
