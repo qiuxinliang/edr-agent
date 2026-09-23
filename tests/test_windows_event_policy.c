@@ -108,7 +108,7 @@ static void test_registry_noise_is_not_emitted(void) {
   assert(r.priority == 2u);
 }
 
-static void test_agent_forensic_bundle_is_not_emitted(void) {
+static void test_agent_forensic_marker_preserves_file_classification(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
   init_record(&r, EDR_EVENT_FILE_WRITE);
@@ -118,10 +118,26 @@ static void test_agent_forensic_bundle_is_not_emitted(void) {
   edr_windows_event_policy_apply(&r);
   edr_windows_event_policy_evaluate(&r, &p);
   assert(p.applies);
-  assert(p.noisy);
+  assert(!p.noisy);
   assert(!p.should_emit);
   assert(!p.should_persist);
-  assert(strstr(p.reason, "agent_internal_forensic") != NULL);
+  assert(strstr(p.reason, "agent_internal_forensic") == NULL);
+  assert(strcmp(p.reason, "ordinary_windows_metadata_only") == 0);
+  assert(strstr(p.tags, "agent_internal_marker") != NULL);
+
+  /* The same path label must not hide an executable/script artifact. */
+  snprintf(r.file_path, sizeof(r.file_path),
+           "C:\\Users\\alice\\AppData\\Local\\Temp\\edr_forensic\\cmd_forensic_1\\payload.ps1");
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.suspicious && p.should_emit && p.should_persist);
+  assert(strstr(p.tags, "agent_internal_marker") != NULL);
+
+  /* A marker elsewhere in the event must not drop a known webshell path. */
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\inetpub\\wwwroot\\upload\\shell.aspx");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "cmd_forensic_1 source=agent_internal");
+  snprintf(r.detection_context, sizeof(r.detection_context), "%s", "{\"edr_internal\":true}");
+  edr_windows_event_policy_evaluate(&r, &p);
+  assert(p.suspicious && p.should_emit && p.should_persist);
 }
 
 static void test_cleanmgr_temp_xml_is_not_emitted(void) {
@@ -515,7 +531,7 @@ int main(void) {
   test_localservice_tfs_dav_cache_is_not_emitted();
   test_autorun_registry_is_high_signal();
   test_registry_noise_is_not_emitted();
-  test_agent_forensic_bundle_is_not_emitted();
+  test_agent_forensic_marker_preserves_file_classification();
   test_cleanmgr_temp_xml_is_not_emitted();
   test_system_driver_enumeration_is_not_emitted();
   test_powershell_policy_probe_is_not_emitted();

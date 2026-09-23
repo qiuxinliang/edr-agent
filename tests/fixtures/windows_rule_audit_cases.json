@@ -352,6 +352,478 @@
         "process_name": "rundll32.exe",
         "cmdline": "rundll32.exe C:\\Windows\\System32\\shell32.dll,Control_RunDLL"
       }
+    },
+    {
+      "case_id": "firewall_outbound_allow",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=Outbound dir=out action=allow"
+      }
+    },
+    {
+      "case_id": "firewall_quoted_allow",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=\"Support Channel\" dir=\"in\" action=\"allow\""
+      }
+    },
+    {
+      "case_id": "firewall_allow_in_quoted_name",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=\"action=allow dir=in\" dir=in action=block"
+      }
+    },
+    {
+      "case_id": "user_add_quoted_arguments",
+      "rule_id": "R-ACCT-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net1.exe",
+        "cmdline": "net1.exe user \"audit user\" \"Synthetic Password\" /add /expires:never"
+      }
+    },
+    {
+      "case_id": "user_password_containing_add",
+      "rule_id": "R-ACCT-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser \"password /add value\""
+      }
+    },
+    {
+      "case_id": "user_add_suffix",
+      "rule_id": "R-ACCT-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser /addition"
+      }
+    },
+    {
+      "case_id": "aws_bare_s3_sync",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "aws s3 sync C:\\Data s3://example-bucket/"
+      }
+    },
+    {
+      "case_id": "aws_profile_before_service",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "aws.exe --profile \"audit profile\" s3 cp report.txt s3://example-bucket/report.txt"
+      }
+    },
+    {
+      "case_id": "aws_flag_before_service",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "aws.exe --no-sign-request s3 cp report.txt s3://example-bucket/report.txt"
+      }
+    },
+    {
+      "case_id": "aws_quoted_executable",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "\"C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe\" s3 sync C:\\Data s3://example-bucket/"
+      }
+    },
+    {
+      "case_id": "icacls_quoted_target_grant_replace",
+      "rule_id": "R-MITRE-WIN-T1044",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "icacls.exe",
+        "cmdline": "\"C:\\Windows\\System32\\icacls.exe\" \"C:\\Shared Data\" /grant:r user:R"
+      }
+    },
+    {
+      "case_id": "icacls_integrity_change",
+      "rule_id": "R-MITRE-WIN-T1044",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "icacls.exe",
+        "cmdline": "icacls.exe C:\\Data /setintegritylevel L"
+      }
+    },
+    {
+      "case_id": "icacls_grant_suffix",
+      "rule_id": "R-MITRE-WIN-T1044",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "icacls.exe",
+        "cmdline": "icacls.exe C:\\Data /grantfake user:R"
+      }
+    },
+    {
+      "case_id": "rundll32_programdata_quoted",
+      "rule_id": "R-MITRE-WIN-T1073",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "rundll32.exe",
+        "cmdline": "rundll32.exe \"C:\\ProgramData\\Demo App\\plugin.dll\",Entry"
+      }
+    },
+    {
+      "case_id": "rundll32_dll_txt_suffix",
+      "rule_id": "R-MITRE-WIN-T1073",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "rundll32.exe",
+        "cmdline": "rundll32.exe C:\\Users\\alice\\plugin.dll.txt,Entry"
+      }
+    },
+    {
+      "case_id": "powershell_registry_hklm_colon",
+      "rule_id": "R-FILELESS-007",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe Get-ItemPropertyValue HKLM:\\Software\\Demo; IEX $value"
+      }
+    },
+    {
+      "case_id": "powershell_registry_without_execution_hint",
+      "rule_id": "R-FILELESS-007",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe Get-ItemProperty HKCU:\\Software\\Demo"
+      }
+    },
+    {
+      "case_id": "uac_hex_zero",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0x00000000"
+      }
+    },
+    {
+      "case_id": "uac_whitespace_zero",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": " \t0 \r\n"
+      }
+    },
+    {
+      "case_id": "uac_decimal_ten",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "10"
+      }
+    },
+    {
+      "case_id": "uac_hex_sixteen",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0x00000010"
+      }
+    },
+    {
+      "case_id": "uac_inconsistent_display",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0 (0x00000001)"
+      }
+    },
+    {
+      "case_id": "uac_trailing_junk",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0 ignored"
+      }
+    },
+    {
+      "case_id": "uac_negative",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "-0"
+      }
+    },
+    {
+      "case_id": "uac_overflow",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "4294967296"
+      }
+    },
+    {
+      "case_id": "uac_unknown_data",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": ""
+      }
+    },
+    {
+      "case_id": "uac_similar_key",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\SystemBackup",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "mpssvc_disabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc",
+        "registry_value_name": "Start",
+        "registry_value_data": "4 (0x00000004)"
+      }
+    },
+    {
+      "case_id": "mpssvc_running_start",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc",
+        "registry_value_name": "Start",
+        "registry_value_data": "2"
+      }
+    },
+    {
+      "case_id": "mpssvc_wrong_name",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc",
+        "registry_value_name": "EnableFirewall",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "defender_wrong_service_value",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "registry_value_name": "Start",
+        "registry_value_data": "4"
+      }
+    },
+    {
+      "case_id": "defender_realtime_disabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+        "registry_value_name": "DisableRealtimeMonitoring",
+        "registry_value_data": "0x00000001"
+      }
+    },
+    {
+      "case_id": "defender_realtime_restored",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+        "registry_value_name": "DisableRealtimeMonitoring",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "defender_similar_value_name",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "registry_value_name": "DisableAntiSpywareBackup",
+        "registry_value_data": "1"
+      }
+    },
+    {
+      "case_id": "firewall_group_policy_disabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\DomainProfile",
+        "registry_value_name": "EnableFirewall",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "firewall_wrong_value_name",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+        "registry_value_name": "DisableAntiSpyware",
+        "registry_value_data": "1"
+      }
+    },
+    {
+      "case_id": "uac_distinct_key_trailing_space",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System ",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "uac_distinct_value_trailing_space",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA ",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "user_password_containing_nested_user_add",
+      "rule_id": "R-ACCT-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user bob \"fake user jane /add text\""
+      }
+    },
+    {
+      "case_id": "user_add_quoted_switch",
+      "rule_id": "R-ACCT-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser \"Synthetic Password\" \"/add\""
+      }
+    },
+    {
+      "case_id": "firewall_quoted_complete_parameters",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=Test \"dir=in\" \"action=allow\""
+      }
     }
   ]
 }

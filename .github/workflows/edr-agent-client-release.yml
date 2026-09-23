@@ -586,6 +586,15 @@ jobs:
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
 
+      - name: Save native Windows rule validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-rule-validation-${{ matrix.arch }}
+          path: build/windows-rule-audit-result.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: "[Timing] Build summary"
         if: always()
         shell: pwsh

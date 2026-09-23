@@ -26,7 +26,7 @@ typedef struct {
 
 typedef struct {
   uint8_t enabled;
-  uint8_t agent_internal_forensic;
+  uint8_t agent_internal_forensic; /* Diagnostic marker tagging, never authority to drop. */
   uint8_t low_value_file_process;
   uint8_t low_value_file_suffix;
   uint8_t temp_xml;

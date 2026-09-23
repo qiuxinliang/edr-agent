@@ -305,7 +305,8 @@ static void set_filetime(LPFILETIME out, uint64_t value) {
 }
 BOOL WINAPI edr_network_test_process_times(HANDLE process, LPFILETIME created,
                                           LPFILETIME exited, LPFILETIME kernel, LPFILETIME user) {
-  if (use_real_process_io) return GetProcessTimes(process, created, exited, kernel, user);
+  if (use_real_process_io || process == GetCurrentProcess())
+    return GetProcessTimes(process, created, exited, kernel, user);
   assert(process == (HANDLE)&live_actor);
   assert(state_queries == 1u); /* State must precede potentially undefined ExitTime. */
   ++time_queries;
@@ -316,7 +317,8 @@ BOOL WINAPI edr_network_test_process_times(HANDLE process, LPFILETIME created,
 }
 int edr_network_test_query_generation(void *process, EdrLiveProcessGeneration *out,
                                        char *reason, size_t cap) {
-  if (use_real_process_io) return edr_process_generation_query_live(process, out, reason, cap);
+  if (use_real_process_io || process == GetCurrentProcess())
+    return edr_process_generation_query_live(process, out, reason, cap);
   assert(process == &live_actor);
   *out = live_actor;
   snprintf(reason, cap, "ok");
@@ -556,6 +558,53 @@ static void test_real_same_handle_actor_binding(void) {
   fprintf(stderr, "[collector-network] real Windows same-handle binding passed\n");
 }
 
+static void test_self_noise_uses_immutable_actor_identity(void) {
+  EdrLiveProcessGeneration self = {9100u, UINT64_C(0x91000001), UINT64_C(132000000000000000)};
+  EdrBehaviorRecord br;
+  EdrSensorInterestEvent interest;
+  static const char *const names[] = {"powershell.exe", "FDSensor.exe", "edr_agent.exe"};
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
+  edr_collector_network_test_self_identity(&self);
+  memset(&br, 0, sizeof(br));
+  memset(&interest, 0, sizeof(interest));
+  br.pid = interest.pid = 9200u;
+  br.ppid = interest.parent_pid = self.pid;
+  br.process_start_key = interest.process_start_key = 0x92000001u;
+  snprintf(br.cmdline, sizeof(br.cmdline), "%s", "powershell.exe cmd_forensic_1 edr_remote_1");
+  snprintf(br.file_path, sizeof(br.file_path), "%s", "C:\\edr_forensic\\payload.ps1");
+  snprintf(br.exe_path, sizeof(br.exe_path), "%s", "C:\\FDSecurity\\FDSensor.exe");
+  snprintf(br.reg_key_path, sizeof(br.reg_key_path), "%s", "HKCU\\edr_remote_");
+  snprintf(interest.path, sizeof(interest.path), "%s", br.file_path);
+  snprintf(interest.registry_path, sizeof(interest.registry_path), "%s", br.reg_key_path);
+  for (size_t i = 0u; i < sizeof(names) / sizeof(names[0]); ++i) {
+    snprintf(br.process_name, sizeof(br.process_name), "%s", names[i]);
+    snprintf(interest.process_name, sizeof(interest.process_name), "%s", names[i]);
+    assert(!edr_collector_network_test_self_record(&br));
+    assert(!edr_collector_network_test_self_interest(&interest));
+  }
+  /* Text or a parent match cannot leave behind a descendant cache exemption. */
+  br.ppid = interest.parent_pid = 0u;
+  br.cmdline[0] = br.file_path[0] = interest.path[0] = '\0';
+  assert(!edr_collector_network_test_self_record(&br));
+  assert(!edr_collector_network_test_self_interest(&interest));
+  br.pid = interest.pid = self.pid;
+  assert(!edr_collector_network_test_self_record(&br));
+  assert(!edr_collector_network_test_self_interest(&interest));
+  br.process_start_key = interest.process_start_key = 0u;
+  assert(!edr_collector_network_test_self_record(&br));
+  assert(!edr_collector_network_test_self_interest(&interest));
+  br.process_start_key = interest.process_start_key = self.process_start_key;
+  assert(edr_collector_network_test_self_record(&br));
+  assert(edr_collector_network_test_self_interest(&interest));
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "1") == 0);
+  assert(!edr_collector_network_test_self_record(&br));
+  assert(!edr_collector_network_test_self_interest(&interest));
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
+  edr_collector_network_test_self_identity(NULL);
+  assert(!edr_collector_network_test_self_record(&br));
+  assert(!edr_collector_network_test_self_interest(&interest));
+}
+
 int main(int argc, char **argv) {
   /* Standalone native replay uses literal argv, not a shell which can
    * reinterpret paths or environment assignments. CTest supplies these by env. */
@@ -571,6 +620,7 @@ int main(int argc, char **argv) {
   test_other_provider_host_order_and_text_ports();
   test_collector_network_admission();
   test_file_control_policy_preconditions();
+  test_self_noise_uses_immutable_actor_identity();
   test_real_same_handle_actor_binding();
   puts("Windows ETW network decoding tests passed");
   return 0;

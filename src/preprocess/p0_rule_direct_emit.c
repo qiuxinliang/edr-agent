@@ -665,44 +665,6 @@ static int p0_has_maintenance_hard_blocker(const EdrBehaviorRecord *br, const ch
   return 0;
 }
 
-static int p0_is_agent_internal_command(const EdrBehaviorRecord *br) {
-  const char *cmd = br ? br->cmdline : NULL;
-  if (!br) {
-    return 0;
-  }
-  if ((cmd && cmd[0] && (p0_contains_ci(cmd, "\\edr_forensic\\") ||
-                         p0_contains_ci(cmd, "/edr_forensic/") ||
-                         p0_contains_ci(cmd, "cmd_forensic_") ||
-                         p0_contains_ci(cmd, "auto-forensic-"))) ||
-      p0_contains_ci(br->file_path, "\\edr_forensic\\") ||
-      p0_contains_ci(br->file_path, "/edr_forensic/") ||
-      p0_contains_ci(br->file_path, "cmd_forensic_") ||
-      p0_contains_ci(br->file_path, "auto-forensic-") ||
-      p0_contains_ci(br->script_snippet, "forensic_bundle") ||
-      p0_contains_ci(br->detection_context, "\"edr_internal\":true") ||
-      p0_contains_ci(br->detection_context, "\"source\":\"agent_internal\"")) {
-    return 1;
-  }
-  if (!cmd || !cmd[0]) {
-    return 0;
-  }
-  if (p0_contains_ci(cmd, "/api/v1/agent/sensor-interest.json") ||
-      p0_contains_ci(cmd, "/agent/sensor-interest.json") ||
-      p0_contains_ci(cmd, "edr_sensor_interest_") ||
-      p0_contains_ci(cmd, "/api/v1/agent/rules.toml") ||
-      p0_contains_ci(cmd, "/agent/rules.toml") ||
-      p0_contains_ci(cmd, "/api/v1/agent/p0-bundle.enc") ||
-      p0_contains_ci(cmd, "/agent/p0-bundle.enc") ||
-      p0_contains_ci(cmd, "/api/v1/agent/version/latest") ||
-      p0_contains_ci(cmd, "/agent/version/latest") ||
-      p0_contains_ci(cmd, "/api/v1/agent/download/latest") ||
-      p0_contains_ci(cmd, "/agent/download/latest") ||
-      p0_contains_ci(cmd, "edr_remote_")) {
-    return 1;
-  }
-  return 0;
-}
-
 static int p0_parent_is_windows_service_host(const EdrBehaviorRecord *br) {
   const char *parent = br ? br->parent_name : NULL;
   const char *path = br ? br->parent_path : NULL;
@@ -3361,21 +3323,14 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     s_debug_enabled = (getenv("EDR_P0_DEBUG") != NULL) ? 1 : 0;
   }
 
-  /* 拒绝空 process_name 且 cmdline 含 forensic 痕迹的事件（Agent 内部取证命令，非真实攻击进程） */
+  /* A command-only rule can match before optional process-name enrichment.
+   * Recover a display name without treating job/path text as trust evidence. */
   char resolved_pn[64];
   resolved_pn[0] = '\0';
   const char *pn = br->process_name;
   if (!pn || !pn[0]) {
     const char *cl = br->cmdline;
     if (cl && cl[0]) {
-      if (strstr(cl, "edr_forensic") != NULL) {
-        if (s_debug_enabled)
-          fprintf(stderr, "[P0 DEBUG] emit blocked: cmdline contains forensic path (pid=%u)\n", br->pid);
-        p0_observe_rule_disposition(br, rule_id, "rejected",
-                                    "agent_forensic_command", known_fp_reason, 0u);
-        if (terminal_reason) *terminal_reason = "agent_forensic_command";
-        return 0;
-      }
       while (*cl == ' ' || *cl == '"') cl++;
       const char *end = cl;
       while (*end && *end != ' ' && *end != '"') end++;
@@ -4227,12 +4182,9 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
   } else if ((!pn || !pn[0]) && br->type == EDR_EVENT_SCRIPT_WMI) {
     pn = "wmiprvse.exe";
   }
-  if (p0_is_agent_internal_command(br)) {
-    if (p0_debug_all_enabled()) {
-      p0_debug_event("internal-skip", br, pn, detail);
-    }
-    return 0;
-  }
+  /* Command text, paths and context tags are observations, not proof that an
+   * Agent-owned job produced this event. Even an authorized RTR child must
+   * pass the active rule predicates and ordinary durable deduplication. */
 
   /* Debug default prints matches only. Use EDR_P0_DEBUG_ALL=1 to dump every candidate. */
   static uint64_t s_debug_empty_count;

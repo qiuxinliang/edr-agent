@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
-  "ir_schema_version": 2,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-d566ab75",
+  "ir_schema_version": 3,
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-d685f452",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "52cad1228f991c191260faccd0bf05e4eac1df77937aecbffa04bd3df887e664",
+  "sensor_interest_manifest_sha256": "2de55a76b41415d8afd6aa30328cea7b5cffc60c95bf683515c28acde6e2187e",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -344,15 +344,12 @@
       ],
       "description": "EnableLUA 被设置为 0",
       "condition": {
-        "registry_path_regex_any": [
-          "(?i)\\\\windows\\\\currentversion\\\\policies\\\\system"
-        ],
-        "registry_value_data_in": [
-          "0",
-          "0x00000000"
-        ],
-        "registry_value_name_in": [
-          "enablelua"
+        "registry_dword_any": [
+          {
+            "path_regex": "(?i)\\\\windows\\\\currentversion\\\\policies\\\\system$",
+            "value_name": "enablelua",
+            "value": 0
+          }
         ]
       }
     },
@@ -405,18 +402,29 @@
       "mitre_ttps": [
         "T1562.001"
       ],
-      "description": "MpsSvc/EnableFirewall/DisableAntiSpyware 等关键键被关闭",
+      "description": "MpsSvc Start=4、FirewallPolicy/WindowsFirewall EnableFirewall=0，或 Defender DisableAntiSpyware/DisableRealtimeMonitoring=1；路径、名称与数值须同一分支匹配。",
       "condition": {
-        "registry_path_regex_any": [
-          "(?i)mpssvc",
-          "(?i)firewallpolicy",
-          "(?i)windows defender"
-        ],
-        "registry_value_name_in": [
-          "start",
-          "enablefirewall",
-          "disableantispyware",
-          "disablerealtimemonitoring"
+        "registry_dword_any": [
+          {
+            "path_regex": "(?i)\\\\system\\\\(?:currentcontrolset|controlset[0-9]{3})\\\\services\\\\mpssvc$",
+            "value_name": "start",
+            "value": 4
+          },
+          {
+            "path_regex": "(?i)\\\\(?:firewallpolicy|windowsfirewall)\\\\(?:domainprofile|publicprofile|standardprofile|privateprofile)$",
+            "value_name": "enablefirewall",
+            "value": 0
+          },
+          {
+            "path_regex": "(?i)\\\\windows defender$",
+            "value_name": "disableantispyware",
+            "value": 1
+          },
+          {
+            "path_regex": "(?i)\\\\windows defender\\\\real-time protection$",
+            "value_name": "disablerealtimemonitoring",
+            "value": 1
+          }
         ]
       }
     },
@@ -785,12 +793,9 @@
       "description": "netsh advfirewall 添加 allow/inbound 规则，疑似放行后门通道",
       "condition": {
         "command_regex_all": [
-          "(?i)advfirewall",
-          "(?i)add\\s+rule"
-        ],
-        "command_regex_any": [
-          "(?i)\\baction\\s*=\\s*allow\\b",
-          "(?i)\\bdir\\s*=\\s*in\\b"
+          "(?i)\\badvfirewall\\s+firewall\\s+add\\s+rule\\b",
+          "(?i)^\\s*(?:(?:[^\\s\"]|\"[^\"]*\")+\\s+)*(?:\"action\\s*=\\s*allow\"|action\\s*=\\s*(?:\"allow\"|allow))(?:\\s|$)",
+          "(?i)^\\s*(?:(?:[^\\s\"]|\"[^\"]*\")+\\s+)*(?:\"dir\\s*=\\s*in\"|dir\\s*=\\s*(?:\"in\"|in))(?:\\s|$)"
         ],
         "process_name_in": [
           "netsh.exe"
@@ -1368,7 +1373,7 @@
         "command_regex_any": [
           "(?i)\\brclone\\.exe\\s+(copy|sync|move)\\s+",
           "(?i)\\brclone\\s+(copy|sync|move)\\s+",
-          "(?i)\\baws\\.exe\\s+\\S+\\s+s3\\s+(cp|sync)\\s+",
+          "(?i)\\baws(?:\\.exe)?\"?\\s+(?:--[a-z0-9-]+(?:=[^\\s\"]+|\\s+(?:\"[^\"]+\"|[^\\s\"-][^\\s\"]*))?\\s+)*s3\\s+(cp|sync)\\s+",
           "(?i)\\bazcopy\\.exe\\s+copy\\s+",
           "(?i)\\baz\\s+storage\\s+blob\\s+upload\\b",
           "(?i)\\bgsutil\\s+-m\\s+cp\\s+",
@@ -1733,7 +1738,7 @@
           "(?i)\\buser\\b"
         ],
         "command_regex_any": [
-          "(?i)\\suser\\s+[^\\s\"]+\\s+/add\\b"
+          "(?i)^\\s*(?:(?:[^\\s\"]|\"[^\"]*\")+\\s+)*user\\s+(?:\"[^\"\\r\\n]+\"|[^\\s\"/]+)(?:\\s+(?:\"[^\"\\r\\n]*\"|[^\\s\"]+))*\\s+(?:\"/add\"|/add)(?:\\s|$)"
         ],
         "process_name_in": [
           "net.exe",
@@ -2037,7 +2042,7 @@
       "description": "针对 ATT&CK 父技术「T1044」（File System Permissions Weakness）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "command_regex_any": [
-          "(?i)\\bicacls\\b.{0,120}\\(/grant|/setintegritylevel\\)",
+          "(?i)\\bicacls(?:\\.exe)?\"?\\s+.{0,120}\\s/(grant(?::r)?|setintegritylevel)(?:\\s|$)",
           "(?i)\\battrib\\s+-r\\s+-s\\s+-h\\b"
         ]
       }
@@ -2132,8 +2137,8 @@
       "description": "针对 ATT&CK 父技术「T1073」（DLL Side-Loading）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "command_regex_any": [
-          "(?i)\\\\\\\\Users\\\\\\\\[^\\\\]+\\\\\\\\.{0,80}\\.dll",
-          "(?i)\\\\\\\\ProgramData\\\\\\\\.{0,80}\\.dll"
+          "(?i)\\\\Users\\\\[^\\\\]+\\\\.{0,80}\\.dll(?:[,\"\\s]|$)",
+          "(?i)\\\\ProgramData\\\\.{0,80}\\.dll(?:[,\"\\s]|$)"
         ],
         "process_name_in": [
           "rundll32.exe"
@@ -3066,7 +3071,7 @@
       "condition": {
         "command_regex_all": [
           "(?i)(get-itemproperty|get-itempropertyvalue)",
-          "(?i)(hklm\\\\|hkcu\\\\)"
+          "(?i)\\b(?:hklm|hkcu):?\\\\"
         ],
         "command_regex_any": [
           "(?i)invoke-expression",

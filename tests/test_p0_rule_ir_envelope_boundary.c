@@ -20,7 +20,7 @@ static int write_all(int fd, const uint8_t *data, size_t len) {
 
 static int make_valid_plaintext(size_t len, uint8_t **out) {
   static const char document[] =
-      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":2,"
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":3,"
       "\"rules_bundle_version\":\"boundary-v1\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":"
       "\"0000000000000000000000000000000000000000000000000000000000000000\","

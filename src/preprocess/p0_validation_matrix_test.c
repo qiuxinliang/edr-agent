@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 typedef struct {
   const char *case_id;
@@ -292,6 +295,28 @@ static int check_sensor_interest_staged_replace(const char *production_path) {
     failures++;
     goto done;
   }
+#if defined(_WIN32)
+  /* Windows commits through MoveFileExA, not the POSIX parent-fsync hook.
+   * A real handle without FILE_SHARE_DELETE must deny that replacement. */
+  {
+    int result;
+    HANDLE held = CreateFileA(dst_path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (held == INVALID_HANDLE_VALUE) {
+      fprintf(stderr, "sensor-interest replacement sharing-denial setup failed: %lu\n",
+              (unsigned long)GetLastError());
+      failures++;
+      goto done;
+    }
+    result = edr_sensor_interest_replace_manifest_from_file(production_copy);
+    CloseHandle(held);
+    if (result == 0) {
+      fprintf(stderr, "sensor-interest staged replacement ignored Windows sharing denial\n");
+      failures++;
+      goto done;
+    }
+  }
+#else
   /* Force the second durability barrier: the stage has been renamed, so the
    * installer must roll back the old bytes and must not publish its candidate. */
   edr_sensor_interest_test_fail_parent_sync_after(2u);
@@ -300,13 +325,14 @@ static int check_sensor_interest_staged_replace(const char *production_path) {
     failures++;
     goto done;
   }
+#endif
   memset(&after, 0, sizeof(after));
   edr_sensor_interest_get_status(&after);
   free(installed);
   installed = read_text_file(dst_path, &installed_len);
   if (!installed || installed_len != raw_len || memcmp(installed, raw, raw_len) != 0 ||
       after.snapshot_epoch != before.snapshot_epoch || !after.p0_binding_valid) {
-    fprintf(stderr, "sensor-interest post-rename rollback did not retain the old durable state\n");
+    fprintf(stderr, "sensor-interest failed replacement did not retain the old durable state\n");
     failures++;
     goto done;
   }
@@ -333,6 +359,16 @@ static int check_sensor_interest_staged_replace(const char *production_path) {
       after.snapshot_epoch != before.snapshot_epoch) {
     fprintf(stderr, "sensor-interest failed staged update altered live bytes or snapshot\n");
     failures++;
+  }
+  if (edr_sensor_interest_replace_manifest_from_file(production_copy) != 0) {
+    fprintf(stderr, "sensor-interest valid replacement did not recover after failure\n");
+    failures++;
+  } else {
+    edr_sensor_interest_get_status(&after);
+    if (!after.p0_binding_valid || after.snapshot_epoch <= before.snapshot_epoch) {
+      fprintf(stderr, "sensor-interest replacement recovery did not publish verified state\n");
+      failures++;
+    }
   }
 done:
   free(installed);

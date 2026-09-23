@@ -954,6 +954,17 @@ if(EDR_PCRE2_AVAILABLE)
     target_link_libraries(test_p0_candidate_replay PRIVATE ${EDR_PCRE2_LIBRARY})
   endif()
   edr_apply_test_warnings(test_p0_candidate_replay)
+  set(_edr_windows_rule_audit_native_args)
+  if(WIN32)
+    list(APPEND _edr_windows_rule_audit_native_args --native-windows)
+  endif()
+  add_test(NAME windows_rule_semantic_audit
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/verify_windows_rule_audit.py
+      --replay $<TARGET_FILE:test_p0_candidate_replay>
+      --output ${CMAKE_BINARY_DIR}/windows-rule-audit-result.json
+      ${_edr_windows_rule_audit_native_args}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(windows_rule_semantic_audit PROPERTIES TIMEOUT 180)
 
   add_executable(test_p0_rule_ir_record_golden
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c

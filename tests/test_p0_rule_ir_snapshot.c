@@ -153,6 +153,72 @@ static int rejected_install_keeps_state(const char *staged, const char *dst, con
          strcmp(before_sha, after_sha) == 0;
 }
 
+/* Invalid typed constraints must reject the whole candidate and preserve the
+ * active snapshot and destination bytes. Schema 2 stays readable during upgrade,
+ * but cannot disguise schema 3 operators as an old bundle. */
+static int registry_candidate_contract(const char *dst, const char *active, const char *source) {
+  static const char branch[] = "{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":4}";
+  const char *bad_conditions[] = {
+    "{\"registry_dword_any\":null}", "{\"registry_dword_any\":[]}",
+    "{\"registry_dword_any\":[null]}", "{\"registry_dword_any\":[{}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\"}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":null}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":false}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":-1}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":4294967296}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":1.5}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":\"4\"}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":4,\"other\":1}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\",\"value\":4,\"value\":0}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"[\",\"value_name\":\"Start\",\"value\":4}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\" \",\"value_name\":\"Start\",\"value\":4}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\" Start\",\"value\":4}]}",
+    "{\"registry_dword_any\":[{\"path_regex\":\"a\",\"value_name\":\"Start\\u0000X\",\"value\":4}]}"
+  };
+  size_t negative_count = sizeof(bad_conditions) / sizeof(bad_conditions[0]);
+  for (size_t i = 0; i < negative_count + 6u; ++i) {
+    char path[] = "/tmp/edr-p0-registry-XXXXXX";
+    char json[4096], condition[2048], long_value[513];
+    unsigned schema = EDR_P0_RULE_IR_SCHEMA_VERSION;
+    int expect_valid = 0;
+    if (i < negative_count) snprintf(condition, sizeof(condition), "%s", bad_conditions[i]);
+    else if (i == negative_count) {
+      snprintf(condition, sizeof(condition), "{\"registry_dword_any\":[%s]}", branch);
+      schema = 2u;
+    } else if (i == negative_count + 1u) {
+      snprintf(condition, sizeof(condition), "{\"registry_path_regex_any\":[\"a\"],\"registry_value_data_in\":[\"0\"]}");
+      schema = 2u;
+      expect_valid = 1;
+    } else if (i == negative_count + 2u) {
+      snprintf(condition, sizeof(condition), "{\"registry_dword_any\":[%s]}", branch);
+      expect_valid = 1;
+    } else if (i == negative_count + 3u) {
+      snprintf(condition, sizeof(condition), "{\"registry_dword_any\":[%s,%s,%s,%s,%s,%s,%s,%s,%s]}",
+               branch,branch,branch,branch,branch,branch,branch,branch,branch);
+    } else {
+      size_t length = i == negative_count + 4u ? 512u : 128u;
+      memset(long_value, 'a', length); long_value[length] = 0;
+      snprintf(condition, sizeof(condition), "{\"registry_dword_any\":[{\"path_regex\":\"%s\",\"value_name\":\"%s\",\"value\":4}]}",
+               length == 512u ? long_value : "a", length == 128u ? long_value : "Start");
+    }
+    snprintf(json, sizeof(json),
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":%u,"
+      "\"rules_bundle_version\":\"registry-contract\",\"rule_count\":1,"
+      "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+      "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
+      "\"rules\":[{\"id\":\"registry\",\"event_type\":\"registry_set\",\"condition\":%s}]}", schema, condition);
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    int wrote = write_all(fd, json);
+    close(fd);
+    int okay = wrote && (expect_valid ? edr_p0_rule_ir_validate_candidate_path(path) :
+                        rejected_install_keeps_state(path, dst, active)) && files_equal(source, dst);
+    unlink(path);
+    if (!okay) { fprintf(stderr, "registry candidate case %zu failed\n", i); return 0; }
+  }
+  return 1;
+}
+
 int main(void) {
   char before_sha[65], installed_sha[65], after_sha[65], staged[] = "/tmp/edr-p0-stage-XXXXXX";
   char source_path[PATH_MAX];
@@ -166,8 +232,8 @@ int main(void) {
     "{\"rules\":[{\"id\":\"sem\",\"event_type\":\"process_create\",\"condition\":{}}]}",
     "{\"rules\":[{\"id\":\"pcre\",\"event_type\":\"process_create\",\"condition\":{\"command_regex_any\":[\"[\"]}}]}",
     "{\"rules\":[{\"id\":\"net-unsupported\",\"event_type\":\"network_connect\",\"condition\":{\"remote_port_in\":[1080],\"command_regex_any\":[\"(?i)x\"]}}]}",
-    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":3,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
-    "{\"kind\":\"wrong_ir_kind\",\"ir_schema_version\":2,\"rules_bundle_version\":\"wrong-kind\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"kind\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}" };
+    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":4,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
+    "{\"kind\":\"wrong_ir_kind\",\"ir_schema_version\":3,\"rules_bundle_version\":\"wrong-kind\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"kind\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}" };
   if (!source || !source[0] || snprintf(source_path, sizeof(source_path), "%s", source) >= (int)sizeof(source_path)) {
     fprintf(stderr, "snapshot test missing EDR_P0_IR_PATH\n"); return 1;
   }
@@ -236,10 +302,12 @@ int main(void) {
     if (!rejected_install_keeps_state(bad, dst, installed_sha) || !files_equal(source, dst)) goto fail;
     unlink(bad);
   }
+  failed_stage = "registry DWORD and legacy schema candidate contract";
+  if (!registry_candidate_contract(dst, installed_sha, source)) goto fail;
   snprintf(bad, sizeof(bad), "%s", bad_template);
   bad_fd = mkstemp(bad); if (bad_fd < 0 || !write_all(
       bad_fd,
-      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":2,"
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":3,"
       "\"rules_bundle_version\":\"snapshot-test-v1\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","

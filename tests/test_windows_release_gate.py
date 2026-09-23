@@ -47,7 +47,7 @@ RUNTIME_EXPECTED = {
     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
     "webshell_semantic_rules", "pmfe_scan_detail_format", "command_signature_cross_language",
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_rule_ir_record_golden",
-    "p0_validation_matrix",
+    "p0_validation_matrix", "windows_rule_semantic_audit",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
 }
 EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED
@@ -253,7 +253,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIn("Windows release gate test is not registered", result.stderr)
 
     def test_missing_runtime_target_fails_at_configuration(self):
-        for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer"):
+        for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer",
+                       "test_p0_candidate_replay"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_target=target)
                 result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
@@ -264,7 +265,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
         # Inject failures in each newly required group, not just check labels in text.
         for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
                      "behavior_record_alert_proto_contract", "command_signature_cross_language",
-                     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine"):
+                     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
+                     "windows_rule_semantic_audit"):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")

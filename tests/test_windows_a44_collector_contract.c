@@ -253,14 +253,10 @@ int main(void) {
       collector, "static VOID WINAPI edr_event_record_callback(",
       "static DWORD WINAPI edr_etw_consumer_thread(",
       "edr_collector_kernel_file_track_metadata(event_record, event_ns)",
-      "if (!edr_collector_keep_agent_self_events()",
-      "provider-wide name metadata must precede Agent self-event filtering");
-  ok &= require_order_in_function(
-      collector, "static VOID WINAPI edr_event_record_callback(",
-      "static DWORD WINAPI edr_etw_consumer_thread(",
-      "edr_collector_kernel_file_track_metadata(event_record, event_ns)",
-      "edr_agent_self_fuse_should_drop_event",
-      "self-fuse must not drop shared FileKey NameDelete or NameCreate");
+      "if (event_ns == 0u)",
+      "provider-wide name metadata must precede ordinary actor admission");
+  ok &= require_absent(collector, "edr_agent_self_fuse_should_drop_event",
+                       "callback logger identity must not suppress payload actors or shared FileKey metadata");
   ok &= require_contains(collector, "edr_tdh_kernel_file_extract_file_key",
                          "Read must resolve its typed FileKey");
   ok &= require_contains(collector, "name_end_event_ns",
@@ -418,8 +414,8 @@ int main(void) {
   ok &= require_contains(tdh, "&out_event->process_start_key",
                          "interest filtering must carry the Kernel-Process target generation");
   ok &= require_contains(collector,
-                         "edr_agent_self_pid_seen(ev->pid, ev->process_start_key, now)",
-                         "interest self-noise filtering must reject PID-only ancestry matches");
+                         "ev->pid, ev->process_start_key)",
+                         "interest self-noise filtering must compare exact actor generation");
   ok &= require_contains(collector, "This is a metadata-only NameCreate, not an attributed Read",
                          "metadata-only schema misses must not globally fuse FileRead");
   ok &= require_contains(collector, "edr_collector_file_key_cache_invalidate(file_key)",

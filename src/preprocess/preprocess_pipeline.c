@@ -1350,7 +1350,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot)
     edr_local_evidence_cache_record_behavior(&br);
     return;
   }
-  /* P0 owns its hard-invalid, registry-attribution, internal-command, and
+  /* P0 owns its hard-invalid, registry-attribution, and
    * policy guards. Evaluate before generic admission so a local-only source
    * can still be represented by one combined source+alert frame. */
   int p0_emitted = edr_p0_rule_try_emit(&br);

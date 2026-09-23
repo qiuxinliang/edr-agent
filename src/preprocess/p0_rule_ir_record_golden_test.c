@@ -45,11 +45,12 @@ int main(void) {
   int i_net = find_rule_index("R-NET-001");
   int i_lmove015 = find_rule_index("R-LMOVE-015");
   int i_def = find_rule_index("R-DEFENSE-001");
+  int i_def4 = find_rule_index("R-DEFENSE-004");
   int i_t1138 = find_rule_index("R-MITRE-WIN-T1138");
   int i_lolbin10 = find_rule_index("R-LOLBIN-010");
   int i_exec3 = find_rule_index("R-EXEC-003");
   int i_anom = find_rule_index("R-ANOM-001");
-  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_net < 0 || i_lmove015 < 0 || i_def < 0 ||
+  if (i_cred3 < 0 || i_web < 0 || i_lmove < 0 || i_net < 0 || i_lmove015 < 0 || i_def < 0 || i_def4 < 0 ||
       i_t1138 < 0 || i_lolbin10 < 0 || i_exec3 < 0 || i_anom < 0) {
     fprintf(stderr, "[p0_ir_record] missing expected rule in bundle (indices)\n");
     return 1;
@@ -225,6 +226,40 @@ int main(void) {
   snprintf(br.reg_value_data, sizeof(br.reg_value_data), "1");
   if (!check_br("DEFENSE-001 miss", &br, i_def, 0)) {
     return 1;
+  }
+  {
+    const struct { const char *data; int want; } cases[] = {
+      {"0",1},{"000",1},{"0x00000000",1},{"0 (0x00000000)",1},
+      {" \t0 (0X00000000)\r\n",1},{"1 (0x00000001)",0},{"4294967296",0},
+      {"0x100000000",0},{"0 (0x00000001)",0},{"1 (0x00000000)",0},
+      {"0 (0x100000000)",0},{"0 garbage",0},{"0x",0},{"-0",0},{"+0",0},
+      {"",0},{"0x0 (0x0)",0},{"0(0x0)",0},{"1.0",0},{"0 (0x0) tail",0}
+    };
+    for (size_t i=0; i<sizeof(cases)/sizeof(cases[0]); ++i) {
+      snprintf(br.reg_value_data,sizeof(br.reg_value_data),"%s",cases[i].data);
+      if (!check_br(cases[i].data,&br,i_def,cases[i].want)) return 1;
+    }
+  }
+  {
+    const struct { const char *path; const char *name; const char *data; int want; } cases[] = {
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc","Start","4 (0x00000004)",1},
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc","Start","2",0},
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc ","Start","4",0},
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\MpsSvc","EnableFirewall","0",0},
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile","EnableFirewall","0x00000000",1},
+      {"HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile","Start","4",0},
+      {"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender","DisableAntiSpyware","1 (0x00000001)",1},
+      {"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender","DisableAntiSpyware","0",0},
+      {"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender","Start","4",0},
+      {"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection","DisableRealtimeMonitoring","1",1},
+      {"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection","DisableRealtimeMonitoring","0",0}
+    };
+    for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);++i) {
+      snprintf(br.reg_key_path,sizeof(br.reg_key_path),"%s",cases[i].path);
+      snprintf(br.reg_value_name,sizeof(br.reg_value_name),"%s",cases[i].name);
+      snprintf(br.reg_value_data,sizeof(br.reg_value_data),"%s",cases[i].data);
+      if (!check_br(cases[i].path,&br,i_def4,cases[i].want)) return 1;
+    }
   }
   edr_behavior_record_init(&br);
   br.type = EDR_EVENT_REG_DELETE_KEY;

@@ -9,6 +9,7 @@
 #include "edr/policy_v2.h"
 #include "edr/config.h"
 #include "edr/storage_queue.h"
+#include "../src/collector/collector_self_identity.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -69,6 +70,7 @@ static int g_terminal_update_allowed = 1;
 static int g_terminal_source_enqueue_allowed = 1;
 static int g_ir_ready = 1;
 static int g_ir_evaluation_available = 1;
+static int g_command_only_match = 0;
 static atomic_int g_ir_evaluation_calls = 0;
 static atomic_int g_block_combined = 0;
 static atomic_int g_combined_inflight = 0;
@@ -527,7 +529,11 @@ int edr_p0_rule_ir_rule_id_at(int index, const char **out_id) {
   }
   return 1;
 }
-int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) { return g_ir_ready && br && index==0 && strcmp(br->process_name,"dedup-test.exe")==0; }
+int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index) {
+  return g_ir_ready && br && index == 0 &&
+         (strcmp(br->process_name, "dedup-test.exe") == 0 ||
+          (g_command_only_match && strncmp(br->cmdline, "dedup-test.exe ", 15u) == 0));
+}
 int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
   /* Admission and snapshot evaluation query the same fake authenticated rule.
    * Snapshot unavailability is a separate fault, not a predicate miss. */
@@ -583,6 +589,125 @@ static void init_file_read_record(EdrBehaviorRecord *r, const char *name) {
   snprintf(r->file_path, sizeof(r->file_path), "%s", "C:\\Test\\fixture.dat");
   snprintf(r->process_generation_source, sizeof(r->process_generation_source),
            "%s", "etw_start_key_live_telemetry");
+}
+
+static void test_internal_markers_do_not_skip_p0(void) {
+  static const char *const commands[] = {
+      "ordinary-command", "\\edr_forensic\\", "/edr_forensic/", "cmd_forensic_",
+      "auto-forensic-", "/api/v1/agent/sensor-interest.json", "/agent/sensor-interest.json",
+      "edr_sensor_interest_", "/api/v1/agent/rules.toml", "/agent/rules.toml",
+      "/api/v1/agent/p0-bundle.enc", "/agent/p0-bundle.enc",
+      "/api/v1/agent/version/latest", "/agent/version/latest",
+      "/api/v1/agent/download/latest", "/agent/download/latest", "edr_remote_"};
+  static const char *const paths[] = {
+      "C:\\edr_forensic\\payload.ps1", "/edr_forensic/payload.ps1",
+      "C:\\Temp\\cmd_forensic_payload.ps1", "C:\\Temp\\auto-forensic-payload.ps1"};
+  const size_t command_count = sizeof(commands) / sizeof(commands[0]);
+  const size_t path_count = sizeof(paths) / sizeof(paths[0]);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  for (size_t i = 0u; i < command_count + path_count + 3u; ++i) {
+    EdrBehaviorRecord r;
+    EdrP0DedupMetrics metrics;
+    edr_p0_rule_test_reset_dedup();
+    edr_p0_rule_test_set_monotonic_ms(1000u);
+    g_emit_count = 0;
+    atomic_store(&g_ir_evaluation_calls, 0);
+    init_complete_process_record(&r, "dedup-test.exe");
+    if (i < command_count)
+      snprintf(r.cmdline, sizeof(r.cmdline), "dedup-test.exe --payload %s", commands[i]);
+    else if (i < command_count + path_count)
+      snprintf(r.file_path, sizeof(r.file_path), "%s", paths[i - command_count]);
+    else if (i == command_count + path_count)
+      snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "forensic_bundle");
+    else
+      snprintf(r.detection_context, sizeof(r.detection_context), "%s",
+               i == command_count + path_count + 1u ?
+                   "{\"edr_internal\":true}" : "{\"source\":\"agent_internal\"}");
+    assert(edr_p0_rule_try_emit(&r) == 1);
+    assert(atomic_load(&g_ir_evaluation_calls) == 1);
+    assert(g_emit_count == 1);
+    /* These labels also cannot bypass the normal exact-source replay owner. */
+    assert(edr_p0_rule_try_emit(&r) == 0);
+    assert(atomic_load(&g_ir_evaluation_calls) == 2);
+    assert(g_emit_count == 1);
+    edr_p0_rule_get_dedup_metrics(&metrics);
+    assert(metrics.exact_suppressed == 1u);
+  }
+}
+
+static void test_self_noise_requires_exact_live_owner(void) {
+  const EdrLiveProcessGeneration self = {42u, UINT64_C(0x424200), UINT64_C(132000000000000000)};
+  EdrLiveProcessGeneration unknown = self;
+  EdrBehaviorRecord r;
+  init_complete_process_record(&r, "FDSensor.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "FDSensor.exe edr_remote_cmd_forensic_");
+  snprintf(r.parent_name, sizeof(r.parent_name), "%s", "FDSensor.exe");
+  r.ppid = self.pid;
+  r.process_start_key = 0x7777u;
+  /* An actual child or spoofed image name is not the collector process. */
+  assert(!edr_collector_self_identity_matches(&self, r.pid, r.process_start_key));
+  edr_p0_rule_test_reset_dedup();
+  atomic_store(&g_ir_evaluation_calls, 0);
+  (void)edr_p0_rule_try_emit(&r);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  r.pid = self.pid;
+  assert(!edr_collector_self_identity_matches(&self, r.pid, r.process_start_key));
+  assert(!edr_collector_self_identity_matches(&self, r.pid, 0u));
+  r.process_start_key = self.process_start_key;
+  assert(edr_collector_self_identity_matches(&self, r.pid, r.process_start_key));
+  assert(!edr_collector_self_identity_matches(&self, 0u, r.process_start_key));
+  unknown.process_start_key = 0u;
+  assert(!edr_collector_self_identity_matches(&unknown, r.pid, r.process_start_key));
+  unknown = self;
+  unknown.creation_filetime_100ns = 0u;
+  assert(!edr_collector_self_identity_matches(&unknown, r.pid, r.process_start_key));
+  assert(!edr_collector_self_identity_matches(NULL, r.pid, r.process_start_key));
+}
+
+static void test_internal_marker_without_process_name_survives_deferred_replay(void) {
+  EdrBehaviorRecord record, gate_source;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_test_set_monotonic_ms(3000u);
+  g_command_only_match = 1;
+  g_emit_count = 0;
+  init_complete_process_record(&record, "dedup-test.exe");
+  record.process_name[0] = '\0';
+  snprintf(record.cmdline, sizeof(record.cmdline), "%s",
+           "dedup-test.exe --payload C:\\edr_forensic\\payload.ps1");
+  assert(edr_p0_rule_try_emit(&record) == 1 && g_emit_count == 1);
+  assert(edr_p0_rule_try_emit(&record) == 0 && g_emit_count == 1);
+
+  deferred_fake_reset();
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  edr_p0_rule_test_set_monotonic_ms(4000u);
+  g_source_latch = g_source_ack = 0;
+  g_durable_emit_allowed = g_combined_emit_allowed = 1;
+  g_combined_emit_outcome = EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED;
+  g_ir_evaluation_available = 0;
+  init_file_read_record(&gate_source, "reader.exe");
+  snprintf(gate_source.event_id, sizeof(gate_source.event_id), "%s", "marker-gate-source");
+  assert(edr_p0_rule_try_emit(&gate_source) == 0);
+  g_ir_evaluation_available = 1;
+  record.type = EDR_EVENT_FILE_WRITE;
+  snprintf(record.event_id, sizeof(record.event_id), "%s", "marker-command-only-deferred");
+  assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 1u && g_emit_count == 1);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
+  g_source_ack = 1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  edr_p0_rule_test_set_monotonic_ms(5000u);
+  assert(edr_p0_rule_poll_deferred_match() == 1);
+  assert(deferred_completions == 1u && g_emit_count == 2);
+  assert(!strcmp(g_last_record.event_id, "marker-command-only-deferred"));
+  assert(strstr(g_last_record.cmdline, "edr_forensic") != NULL);
+  assert(edr_p0_rule_poll_deferred_match() == 0 && g_emit_count == 2);
+  deferred_fake_reset();
+  edr_p0_rule_test_reset_dedup();
+  g_command_only_match = 0;
+  g_source_ack = 0;
 }
 
 #if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
@@ -2668,6 +2793,9 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
 #endif
 
 int main(void) {
+  test_internal_markers_do_not_skip_p0();
+  test_self_noise_requires_exact_live_owner();
+  test_internal_marker_without_process_name_survives_deferred_replay();
   test_edge_update_signed_chain_is_suppressed();
   test_edge_update_without_signature_is_not_suppressed();
   test_edge_update_malicious_command_is_not_suppressed();

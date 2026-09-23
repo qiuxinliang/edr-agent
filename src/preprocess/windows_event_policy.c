@@ -311,7 +311,7 @@ static void mark_noisy(EdrWindowsEventPolicy *p, const char *reason, const char 
   add_tag(p, tag);
 }
 
-static int agent_internal_forensic_activity(const EdrBehaviorRecord *r) {
+static int agent_internal_forensic_marker(const EdrBehaviorRecord *r) {
   if (!r) {
     return 0;
   }
@@ -451,9 +451,11 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     mark_noisy(p, "empty_file_metadata", "metadata_only");
     return;
   }
-  if (g_event_filter_cfg.agent_internal_forensic && agent_internal_forensic_activity(r)) {
-    mark_noisy(p, "agent_internal_forensic", "agent_internal");
-    return;
+  if (g_event_filter_cfg.agent_internal_forensic && agent_internal_forensic_marker(r)) {
+    /* Paths and command/context labels can be supplied by any process. Keep
+     * the configured diagnostic hint without granting a telemetry or P0
+     * exemption; the ordinary file classification still runs below. */
+    add_tag(p, "agent_internal_marker");
   }
   if (has_ci_path(path, "__PSScriptPolicyTest_")) {
     mark_noisy(p, "powershell_script_policy_probe", "noise_powershell_policy");

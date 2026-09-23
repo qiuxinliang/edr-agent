@@ -69,11 +69,18 @@ extern const size_t edr_p0_rule_ir_embed_len;
 #endif
 #endif
 
+#define P0_IR_REG_DWORD_MAX 8
 #define P0_IR_NAME_IN_MAX 24
 #define P0_IR_PAT 40
 #define P0_IR_ID_MAX 64
 #define P0_IR_STR 512
 #define P0_IR_SENSOR_INTEREST_HASH_MODE "raw-json-v1-p0-artifact-sha256-zeroed"
+
+struct p0_ir_registry_dword {
+  pcre2_code *path;
+  char name[128];
+  uint32_t value;
+};
 
 struct p0_ir_one {
   char id[P0_IR_ID_MAX];
@@ -106,6 +113,8 @@ struct p0_ir_one {
   int n_reg_name;
   char reg_data_in[P0_IR_NAME_IN_MAX][256];
   int n_reg_data;
+  struct p0_ir_registry_dword reg_dword[P0_IR_REG_DWORD_MAX];
+  int n_reg_dword;
   int in_use;
 };
 
@@ -413,10 +422,36 @@ static void add_rx_array(
   }
 }
 
+static void add_reg_dword(cJSON *condition, struct p0_ir_one *rule, int *parse_ok) {
+  cJSON *branches = cJSON_GetObjectItemCaseSensitive(condition, "registry_dword_any");
+  cJSON *branch;
+  if (!branches) return;
+  cJSON_ArrayForEach(branch, branches) {
+    char error[200];
+    cJSON *path = cJSON_GetObjectItemCaseSensitive(branch, "path_regex");
+    cJSON *name = cJSON_GetObjectItemCaseSensitive(branch, "value_name");
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(branch, "value");
+    struct p0_ir_registry_dword *predicate = &rule->reg_dword[rule->n_reg_dword];
+    predicate->path = compile_pat(path->valuestring, error, sizeof(error));
+    if (!predicate->path) {
+      fprintf(stderr, "[p0_rule_ir] invalid registry_dword_any path in %s: %s\n", rule->id, error);
+      *parse_ok = 0;
+      return;
+    }
+    ascii_lower_truncate(predicate->name, sizeof(predicate->name), name->valuestring);
+    predicate->value = (uint32_t)value->valuedouble;
+    ++rule->n_reg_dword;
+  }
+}
+
 static void p0_ir_free_pcre_in_rule(struct p0_ir_one *r) {
   int i;
   if (!r) {
     return;
+  }
+  for (i = 0; i < r->n_reg_dword; ++i) {
+    pcre2_code_free(r->reg_dword[i].path);
+    r->reg_dword[i].path = NULL;
   }
   for (i = 0; i < P0_IR_PAT; i++) {
     if (r->re_cmd_any[i]) {
@@ -1444,6 +1479,72 @@ static int reg_data_substring_any(
   return 0;
 }
 
+static int reg_ascii_space(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+static int reg_dword_atom(const char **cursor, unsigned base, uint32_t *out) {
+  const char *p = *cursor;
+  uint32_t value = 0u;
+  int digits = 0;
+  for (;;) {
+    unsigned digit;
+    if (*p >= '0' && *p <= '9') digit = (unsigned)(*p - '0');
+    else if (base == 16u && *p >= 'a' && *p <= 'f') digit = (unsigned)(*p - 'a') + 10u;
+    else if (base == 16u && *p >= 'A' && *p <= 'F') digit = (unsigned)(*p - 'A') + 10u;
+    else break;
+    if (value > (UINT32_MAX - digit) / base) return 0;
+    value = value * base + digit;
+    ++digits;
+    ++p;
+  }
+  if (!digits) return 0;
+  *cursor = p;
+  *out = value;
+  return 1;
+}
+
+/* collector_win renders DWORD as "decimal (0xHEX)". Require both values to
+ * agree; numeric prefixes and conflicting display strings are not evidence. */
+static int reg_parse_dword(const char *data, uint32_t *out) {
+  const char *p = data;
+  uint32_t value;
+  int hex;
+  if (!p) return 0;
+  while (reg_ascii_space(*p)) ++p;
+  hex = p[0] == '0' && (p[1] == 'x' || p[1] == 'X');
+  if (hex) p += 2;
+  if (!reg_dword_atom(&p, hex ? 16u : 10u, &value)) return 0;
+  if (!hex && reg_ascii_space(*p)) {
+    while (reg_ascii_space(*p)) ++p;
+    if (*p == '(') {
+      uint32_t second;
+      ++p;
+      if (p[0] != '0' || (p[1] != 'x' && p[1] != 'X')) return 0;
+      p += 2;
+      if (!reg_dword_atom(&p, 16u, &second) || second != value || *p++ != ')') return 0;
+    }
+  }
+  while (reg_ascii_space(*p)) ++p;
+  if (*p) return 0;
+  *out = value;
+  return 1;
+}
+
+static int reg_dword_any(const struct p0_ir_one *rule, const EdrBehaviorRecord *record) {
+  uint32_t value;
+  char name[sizeof(record->reg_value_name)];
+  int i;
+  if (!reg_parse_dword(record->reg_value_data, &value)) return 0;
+  ascii_lower_truncate(name, sizeof(name), record->reg_value_name);
+  for (i = 0; i < rule->n_reg_dword; ++i) {
+    const struct p0_ir_registry_dword *predicate = &rule->reg_dword[i];
+    if (value == predicate->value && strcmp(name, predicate->name) == 0 &&
+        pcre2_ok_one(predicate->path, record->reg_key_path)) return 1;
+  }
+  return 0;
+}
+
 static int one_rule_match_registry(const struct p0_ir_one *r, const EdrBehaviorRecord *br) {
   const char *path = br->reg_key_path[0] ? br->reg_key_path : "";
   if (r->n_regpath > 0) {
@@ -1456,6 +1557,7 @@ static int one_rule_match_registry(const struct p0_ir_one *r, const EdrBehaviorR
       return 0;
     }
   }
+  if (r->n_reg_dword > 0 && !reg_dword_any(r, br)) return 0;
   if (r->n_reg_data > 0) {
     if (!reg_data_substring_any(br->reg_value_data, r->reg_data_in, r->n_reg_data)) {
       return 0;
@@ -1517,7 +1619,7 @@ static int p0_rule_has_constraints(const char *et, const struct p0_ir_one *r) {
     return r->n_name_in > 0 || r->n_pn_rx > 0 || r->n_rport > 0 || r->n_fpath > 0;
   }
   if (strcmp(et, "registry_set") == 0) {
-    return r->n_regpath > 0 || r->n_reg_name > 0 || r->n_reg_data > 0;
+    return r->n_regpath > 0 || r->n_reg_name > 0 || r->n_reg_data > 0 || r->n_reg_dword > 0;
   }
   return 0;
 }
@@ -1553,6 +1655,47 @@ static int p0_condition_port_array_valid(const cJSON *value) {
   return 1;
 }
 
+static int p0_condition_dword_array_valid(const cJSON *branches) {
+  cJSON *branch;
+  int count = cJSON_GetArraySize(branches);
+  if (!cJSON_IsArray(branches) || count < 1 || count > P0_IR_REG_DWORD_MAX) return 0;
+  cJSON_ArrayForEach(branch, branches) {
+    cJSON *field;
+    unsigned seen = 0u;
+    if (!cJSON_IsObject(branch)) return 0;
+    cJSON_ArrayForEach(field, branch) {
+      unsigned bit;
+      if (!field->string) return 0;
+      if (strcmp(field->string, "path_regex") == 0) {
+        bit = 1u;
+        if (!cJSON_IsString(field) || !field->valuestring || !field->valuestring[0] ||
+            strlen(field->valuestring) > 511u) return 0;
+        {
+          const char *p = field->valuestring;
+          while (reg_ascii_space(*p)) ++p;
+          if (!*p) return 0;
+        }
+      } else if (strcmp(field->string, "value_name") == 0) {
+        size_t len;
+        bit = 2u;
+        if (!cJSON_IsString(field) || !field->valuestring) return 0;
+        len = strlen(field->valuestring);
+        if (len < 1u || len > 127u || reg_ascii_space(field->valuestring[0]) ||
+            reg_ascii_space(field->valuestring[len - 1u])) return 0;
+      } else if (strcmp(field->string, "value") == 0) {
+        double value = field->valuedouble;
+        bit = 4u;
+        if (!cJSON_IsNumber(field) || !(value >= 0.0 && value <= 4294967295.0) ||
+            value != (double)(uint32_t)value) return 0;
+      } else return 0;
+      if (seen & bit) return 0;
+      seen |= bit;
+    }
+    if (seen != 7u) return 0;
+  }
+  return 1;
+}
+
 /* Conditions are a security contract, not an extensible bag of hints. A
  * field unknown to the event type must reject the entire candidate rather
  * than silently weakening a rule when an Agent parser has not implemented it.
@@ -1568,6 +1711,9 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
     int string_array = 0;
     if (!key) {
       return 0;
+    }
+    for (cJSON *prior = condition->child; prior != item; prior = prior->next) {
+      if (prior->string && strcmp(prior->string, key) == 0) return 0;
     }
     if (strcmp(event_type, "process_create") == 0 ||
         strcmp(event_type, "script_powershell") == 0 ||
@@ -1598,7 +1744,8 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
     } else if (strcmp(event_type, "registry_set") == 0) {
       allowed = strcmp(key, "registry_path_regex_any") == 0 ||
                 strcmp(key, "registry_value_name_in") == 0 ||
-                strcmp(key, "registry_value_data_in") == 0;
+                strcmp(key, "registry_value_data_in") == 0 ||
+                strcmp(key, "registry_dword_any") == 0;
     }
     if (!allowed) {
       return 0;
@@ -1608,6 +1755,8 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
       if (depth < 1 || !cJSON_IsNumber(item) || item->valuedouble != (double)depth) {
         return 0;
       }
+    } else if (strcmp(key, "registry_dword_any") == 0) {
+      if (!p0_condition_dword_array_valid(item)) return 0;
     } else if (strcmp(key, "remote_port_in") == 0) {
       if (!p0_condition_port_array_valid(item)) {
         return 0;
@@ -1674,6 +1823,15 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
   fprintf(stderr, "[p0_rule_ir:%s/%s] loading %s (%zu bytes, %s)\n",
           EDR_P0_MATCHER_SOURCE_SCHEMA, EDR_P0_MATCHER_RULE_SCHEMA, source_label, data_len,
           (data_len >= 4 && memcmp(data, "EDR1", 4) == 0) ? "EDR1" : (data_len >= 1 && data[0] == '{') ? "JSON" : "unknown");
+  /* cJSON exposes NUL-terminated strings; accepting an embedded NUL would
+   * silently shorten a path or value-name constraint. */
+  for (size_t i = 0; i < data_len; ++i) {
+    if (!data[i]) return 0;
+    if (data[i] == '\\' && i + 1u < data_len) {
+      if (i + 5u < data_len && memcmp(data + i, "\\u0000", 6u) == 0) return 0;
+      ++i;
+    }
+  }
   cJSON *root = cJSON_ParseWithLength(data, data_len);
   if (!root) {
     fprintf(stderr, "[p0_rule_ir] JSON parse failed: %s\n", source_label);
@@ -1685,6 +1843,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     fprintf(stderr, "[p0_rule_ir] top-level 'rules' missing or not array: %s\n", source_label);
     return 0;
   }
+  int legacy_schema = 0;
   {
     cJSON *kind = cJSON_GetObjectItemCaseSensitive(root, "kind");
     cJSON *schema_version = cJSON_GetObjectItemCaseSensitive(root, "ir_schema_version");
@@ -1695,7 +1854,8 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!cJSON_IsString(kind) || !kind->valuestring ||
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
-        schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION ||
+        (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
+         schema_version->valuedouble != 2.0) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
         (uint32_t)declared_count->valueint != (uint32_t)cJSON_GetArraySize(rules) ||
@@ -1706,6 +1866,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       fprintf(stderr, "[p0_rule_ir] missing or inconsistent artifact binding: %s\n", source_label);
       return 0;
     }
+    legacy_schema = schema_version->valuedouble == 2.0;
     snprintf(s_rules_bundle_version, sizeof(s_rules_bundle_version), "%s", version->valuestring);
     s_declared_rule_count = (uint32_t)declared_count->valueint;
     snprintf(s_sensor_interest_manifest_sha256, sizeof(s_sensor_interest_manifest_sha256), "%s",
@@ -1787,7 +1948,8 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       }
     }
     cJSON *jcond = cJSON_GetObjectItemCaseSensitive(rnode, "condition");
-    if (!p0_condition_keys_supported(etbuf, jcond)) {
+    if (!p0_condition_keys_supported(etbuf, jcond) ||
+        (legacy_schema && cJSON_GetObjectItemCaseSensitive(jcond, "registry_dword_any"))) {
       semantic_ok = 0;
       break;
     }
@@ -1855,6 +2017,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
           jcond, "file_path_regex_any", t.re_fpath, &t.n_fpath, P0_IR_PAT, jid->valuestring, &parse_ok
       );
     } else if (strcmp(etbuf, "registry_set") == 0) {
+      add_reg_dword(jcond, &t, &parse_ok);
       add_rx_array(
           jcond, "registry_path_regex_any", t.re_regpath, &t.n_regpath, P0_IR_PAT, jid->valuestring, &parse_ok
       );
