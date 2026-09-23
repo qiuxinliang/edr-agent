@@ -3,7 +3,9 @@ edr.v1.BehaviorEvent.event_id max_size:48
 edr.v1.BehaviorEvent.endpoint_id max_size:48
 edr.v1.BehaviorEvent.tenant_id max_size:64
 edr.v1.BehaviorEvent.process_name max_size:256
-edr.v1.BehaviorEvent.cmdline max_size:8192
+# Wire fact only: Windows' maximum UTF-16 command represented as UTF-8.
+# Hot records remain bounded previews; complete facts are read at encoding.
+edr.v1.BehaviorEvent.cmdline max_size:98302
 edr.v1.BehaviorEvent.exe_hash max_size:65
 edr.v1.BehaviorEvent.exe_path max_size:4096
 edr.v1.BehaviorEvent.username max_size:256
@@ -45,7 +47,7 @@ edr.v1.ProcessDetail.grandparent_path max_size:512
 edr.v1.ProcessContext.parent_name max_size:256
 edr.v1.ProcessContext.parent_path max_size:512
 edr.v1.ProcessContext.integrity_level max_size:64
-edr.v1.ProcessContext.parent_cmdline max_size:8192
+edr.v1.ProcessContext.parent_cmdline max_size:98302
 edr.v1.ProcessContext.current_directory max_size:4096
 edr.v1.ProcessContext.process_creation_time max_size:64
 edr.v1.ProcessContext.grandparent_name max_size:256

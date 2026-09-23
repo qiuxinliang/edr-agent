@@ -173,14 +173,14 @@ int main(void) {
   edr_alert_governor_reset_for_test();
   s_snapshot_calls=0u;
   s_enqueue_result=EDR_ERR_SQLITE_WRITE;
-  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner") !=
+  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner",NULL) !=
           EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED ||
       s_deferred_calls!=1u || s_snapshot_calls!=0u) {
     fprintf(stderr,"failed deferred atomic handoff or immutable source contract violated\n");
     return 10;
   }
   s_enqueue_result=EDR_OK;
-  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner") !=
+  if (edr_behavior_record_alert_emit_deferred(&record,&alert,"retained-owner",NULL) !=
           EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED || s_deferred_calls!=2u || s_snapshot_calls!=0u) {
     fprintf(stderr,"deferred handoff did not recover through its durable owner\n");
     return 11;

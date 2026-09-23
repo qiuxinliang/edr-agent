@@ -106,6 +106,18 @@ static void copy_trunc(char *dst, size_t cap, const char *src) {
   dst[i] = '\0';
 }
 
+#ifdef _WIN32
+static void copy_command_preview(char *out, size_t cap, const char *full) {
+  size_t n = strlen(full);
+  if (n >= cap) {
+    n = cap - 1u;
+    while (n && ((unsigned char)full[n] & 0xc0u) == 0x80u) --n;
+  }
+  memcpy(out, full, n);
+  out[n] = 0;
+}
+#endif
+
 static void sync_agent_ids_from_cfg(const EdrConfig *cfg) {
   if (!cfg) {
     return;
@@ -333,6 +345,7 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
 static const char *p0_process_path_basename(const char *path);
 
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
+  apply_agent_ids_to_record(br);
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
   ULARGE_INTEGER observed;
@@ -446,12 +459,24 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
     (void)p0_bind_file_read_cached_generation(br, live.process_start_key,
                                                live.creation_filetime_100ns);
   }
-  if (!br->cmdline[0] || p0_command_line_is_cached_preview(br)) {
-    char command_line[EDR_BR_STR_CMDLINE];
+  if (!br->cmdline[0] || edr_behavior_source_field_truncated(br, "source.cmdline")) {
     reason[0] = '\0';
-    if (edr_process_command_line_query_live(process, command_line, sizeof(command_line),
-                                            reason, sizeof(reason))) {
-      (void)p0_adopt_generation_command_fact(br, command_line, 0, "live_same_generation");
+    char *command_line = edr_process_command_line_query_alloc(process, reason, sizeof(reason));
+    if (command_line) {
+      if (strlen(command_line) < sizeof(br->cmdline)) {
+        (void)p0_adopt_generation_command_fact(br, command_line, 0, "live_same_generation");
+      } else if (!br->cmdline[0] || strncmp(command_line, br->cmdline, strlen(br->cmdline)) == 0) {
+        br->process_start_key = live.process_start_key;
+        br->process_creation_filetime_100ns = live.creation_filetime_100ns;
+        int stored = edr_local_evidence_cache_save_command_fact(br, command_line) == 0;
+        copy_command_preview(br->cmdline, sizeof(br->cmdline), command_line);
+        /* Preview is never evaluable as the entire command. The uploader
+         * resolves the generation-bound fact, not this bounded field. */
+        edr_behavior_mark_source_truncated(br, "source.cmdline");
+        snprintf(br->command_line_origin, sizeof(br->command_line_origin), "%s",
+                 stored ? "live_same_generation_fact_preview" : "live_command_fact_store_failed");
+      }
+      free(command_line);
     } else if (!br->cmdline[0]) {
       /* The process may exit between ETW delivery and this bounded query.
        * Keep the raw source, but never borrow a PID-only command line from a
@@ -515,14 +540,14 @@ static const char *p0_process_path_basename(const char *path) {
  * PID alone: telemetry StartKey, telemetry/CreateProcess FILETIME and the
  * queried image path all belong to that handle.  A replacement which reused
  * the PID after the child was created is rejected by the creation-time order. */
-static int p0_resolve_live_parent_generation(const EdrBehaviorRecord *child,
+static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
                                              ProcessTreeEntry *out_parent) {
   HANDLE process = NULL;
   FILETIME created, exited, kernel, user;
   ULARGE_INTEGER observed;
   EdrLiveProcessGeneration live;
   char path[EDR_BR_STR_LONG];
-  char cmdline[EDR_BR_STR_CMDLINE];
+  char *cmdline = NULL;
   char reason[64];
   uint64_t parent_creation_ns;
   uint64_t child_event_ns;
@@ -557,10 +582,8 @@ static int p0_resolve_live_parent_generation(const EdrBehaviorRecord *child,
     CloseHandle(process);
     return 0;
   }
-  cmdline[0] = '\0';
   reason[0] = '\0';
-  (void)edr_process_command_line_query_live(process, cmdline, sizeof(cmdline),
-                                            reason, sizeof(reason));
+  cmdline = edr_process_command_line_query_alloc(process, reason, sizeof(reason));
   CloseHandle(process);
   memset(out_parent, 0, sizeof(*out_parent));
   out_parent->pid = child->ppid;
@@ -570,11 +593,29 @@ static int p0_resolve_live_parent_generation(const EdrBehaviorRecord *child,
   out_parent->last_seen_ns = child_event_ns;
   snprintf(out_parent->process_name, sizeof(out_parent->process_name), "%s",
            p0_process_path_basename(path));
-  snprintf(out_parent->cmdline, sizeof(out_parent->cmdline), "%s", cmdline);
+  copy_command_preview(out_parent->cmdline, sizeof(out_parent->cmdline), cmdline ? cmdline : "");
+  if (cmdline && strlen(cmdline) >= sizeof(out_parent->cmdline)) {
+    EdrBehaviorRecord *identity = (EdrBehaviorRecord *)calloc(1u, sizeof(*identity));
+    int stored = 0;
+    out_parent->source_truncation_mask |= EDR_PTC_SOURCE_TRUNC_CMDLINE;
+    if (identity) {
+      copy_trunc(identity->endpoint_id, sizeof(identity->endpoint_id), child->endpoint_id);
+      copy_trunc(identity->tenant_id, sizeof(identity->tenant_id), child->tenant_id);
+      identity->pid = child->ppid;
+      identity->process_start_key = live.process_start_key;
+      identity->process_creation_filetime_100ns = live.creation_filetime_100ns;
+      stored = edr_local_evidence_cache_save_command_fact(identity, cmdline) == 0;
+      free(identity);
+    }
+    /* A failed conflict write must not resolve this observation to an older
+     * full tail merely because both command previews match. */
+    if (!stored) edr_behavior_mark_source_truncated(child, "source.parent_command_fact");
+  }
   snprintf(out_parent->exe_path, sizeof(out_parent->exe_path), "%s", path);
   (void)edr_pt_cache_put_generation(
       child->ppid, 0u, p0_process_path_basename(path), cmdline, path, NULL,
       parent_creation_ns, live.process_start_key, live.creation_filetime_100ns);
+  free(cmdline);
   /* The current record is already bound by the validated live handle. Cache
    * pressure or an older same-generation timestamp must not erase that fact;
    * insertion is best-effort only for later descendants. */
@@ -958,6 +999,8 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
     if (parent_snapshot == 0 &&
         parent.process_start_key != 0u &&
         parent.creation_filetime_100ns != 0u && parent.start_time_ns != 0u) {
+      br->parent_process_start_key = parent.process_start_key;
+      br->parent_process_creation_filetime_100ns = parent.creation_filetime_100ns;
       /* The historical cache, not raw 4688 fields or a current PID lookup,
        * owns the parent generation.  Overwrite any earlier unbound display
        * values so an A->B PID reuse cannot borrow B's path or FILETIME. */
@@ -1054,23 +1097,21 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
   if (!br) {
     return;
   }
-  uint8_t buf[16384];
+  uint8_t *buf = (uint8_t *)malloc(EDR_EVENT_BATCH_CAP);
+  if (!buf) {
+    fprintf(stderr, "[preprocess] event encoding allocation failed event=%s\n", br->event_id);
+    return;
+  }
   size_t n = 0;
   const char *enc = getenv("EDR_BEHAVIOR_ENCODING");
   if (!enc || enc[0] == '\0' || strcmp(enc, "protobuf") == 0) {
 #ifdef EDR_HAVE_NANOPB
-    n = edr_behavior_record_encode_protobuf(br, buf, sizeof(buf));
+    n = edr_behavior_record_encode_frame(br, NULL, buf, EDR_EVENT_BATCH_CAP);
 #endif
-    if (n == 0) {
-      n = edr_behavior_wire_encode(br, buf, sizeof(buf));
-    }
   } else if (enc && strcmp(enc, "protobuf_c") == 0) {
-    n = edr_behavior_record_encode_protobuf_c(br, buf, sizeof(buf));
-    if (n == 0) {
-      n = edr_behavior_wire_encode(br, buf, sizeof(buf));
-    }
+    n = edr_behavior_record_encode_frame(br, NULL, buf, EDR_EVENT_BATCH_CAP);
   } else {
-    n = edr_behavior_wire_encode(br, buf, sizeof(buf));
+    n = edr_behavior_wire_encode(br, buf, EDR_EVENT_BATCH_CAP);
   }
   if (n > 0) {
     if (edr_event_batch_push(buf, n) != 0) {
@@ -1078,6 +1119,8 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
               br->event_id);
     }
   }
+  if (!n) fprintf(stderr, "[preprocess] event encoding failed event=%s; no lossy fallback\n", br->event_id);
+  free(buf);
 }
 
 /* behavior_summary flush 的 emit 回调：直接复用统一编码 + 入批次路径。 */

@@ -129,6 +129,7 @@ static void pt_store_fact(char *inline_value, size_t inline_cap,
     return;
   }
   copied = source_len < full_cap ? source_len : full_cap - 1u;
+  while (copied < source_len && copied && ((unsigned char)source[copied] & 0xc0u) == 0x80u) --copied;
   replacement = (char *)malloc(copied + 1u);
   if (replacement) {
     memcpy(replacement, source, copied);
@@ -148,6 +149,7 @@ static void pt_store_fact(char *inline_value, size_t inline_cap,
   free(*extended_value);
   *extended_value = NULL;
   copied = inline_cap - 1u;
+  while (copied && ((unsigned char)source[copied] & 0xc0u) == 0x80u) --copied;
   memcpy(inline_value, source, copied);
   inline_value[copied] = '\0';
   *truncation_mask |= field_mask;

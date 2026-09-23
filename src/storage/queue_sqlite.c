@@ -1,6 +1,7 @@
 #include "edr/storage_queue.h"
 
 #include "edr/ingest_http.h"
+#include "edr/event_batch.h"
 #include "edr/sha256.h"
 #include "edr/time_util.h"
 #include "edr/transport_sink.h"
@@ -216,26 +217,28 @@ static uint64_t queue_add_bytes(uint64_t total, uint64_t value) {
 #define EDR_P0_DEFERRED_LOGICAL_OVERHEAD 512ULL
 #define EDR_P0_DEFERRED_REASON_RESERVE_BYTES 255ULL
 #define EDR_TERMINAL_LOGICAL_OVERHEAD 1024ULL
-#define EDR_TERMINAL_FRAME_MAX_BYTES (65536ULL + 16ULL)
+#define EDR_TERMINAL_FRAME_MAX_BYTES ((uint64_t)EDR_EVENT_BATCH_CAP)
+#define EDR_TERMINAL_BASE_FRAME_BYTES (65536ULL + 16ULL)
 #define EDR_TERMINAL_TEXT_MAX_BYTES 255u
 #define EDR_TERMINAL_OWNER_DIGEST_HEX_LEN 64u
 /* Intent and final records are serialized by p0_rule_direct_emit into one
  * BAT1 frame each. Keep the terminal recovery reservation tied to that
  * bounded wire contract rather than to SQLite's non-reclaiming file size. */
-#define EDR_TERMINAL_INTENT_RESERVE_BYTES (EDR_TERMINAL_FRAME_MAX_BYTES + 255ULL)
-/* p0_rule_direct_emit serializes each final BAT1 into a 65536+16 byte buffer;
+#define EDR_TERMINAL_INTENT_RESERVE_BYTES (EDR_TERMINAL_BASE_FRAME_BYTES + 255ULL)
+/* The lane minimum still supports the existing short-command frame bound;
  * batch IDs are bounded by terminal_text_valid (255 bytes). Reserving both
  * final frames before execution prevents an ordinary backlog from consuming
- * their only durable recovery space. */
+ * their only durable recovery space. Long commands increase only their own
+ * owner's reservation, not every ordinary event's reserved lane. */
 #define EDR_TERMINAL_FINAL_RESERVE_BYTES \
-  (2ULL * (EDR_TERMINAL_FRAME_MAX_BYTES + 255ULL))
+  (2ULL * (EDR_TERMINAL_BASE_FRAME_BYTES + 255ULL))
 #define EDR_TERMINAL_CRITICAL_RESERVE_MIN \
   (EDR_TERMINAL_LOGICAL_OVERHEAD + EDR_TERMINAL_INTENT_RESERVE_BYTES + \
    EDR_TERMINAL_FINAL_RESERVE_BYTES + 4096ULL)
 #define EDR_P0_SOURCE_ONLY_RETRY_RESERVE_SLOTS 8ULL
 #define EDR_P0_SOURCE_ONLY_RESERVE_MIN \
   (EDR_P0_SOURCE_ONLY_RETRY_RESERVE_SLOTS * \
-   (EDR_QUEUE_EVENT_LOGICAL_OVERHEAD + EDR_TERMINAL_FRAME_MAX_BYTES + 255ULL))
+   (EDR_QUEUE_EVENT_LOGICAL_OVERHEAD + EDR_TERMINAL_BASE_FRAME_BYTES + 255ULL))
 /* Legacy builds used these SQLite-header bits. They are read once during the
  * queue_meta upgrade only; no current path writes or trusts either header. */
 #define EDR_QUEUE_P0_SOURCE_ONLY_LEGACY_LATCH_BIT UINT32_C(0x40000000)
@@ -477,6 +480,17 @@ static uint64_t p0_deferred_live_cost(size_t payload_len) {
   return queue_add_bytes(total, EDR_P0_DEFERRED_REASON_RESERVE_BYTES);
 }
 
+static uint64_t terminal_final_reserve_for_intent(size_t intent_wire_len) {
+  /* Final source and alert keep the intent's immutable command facts. The
+   * extra base-frame bound covers all non-command terminal/alert fields; cap
+   * at the same maximum the encoder and terminal_wire_valid actually accept.
+   * Existing small-intent rows keep almost the old cost, and reservation is
+   * committed before any side effect. */
+  uint64_t frame = queue_add_bytes((uint64_t)intent_wire_len, EDR_TERMINAL_BASE_FRAME_BYTES);
+  if (frame > EDR_TERMINAL_FRAME_MAX_BYTES) frame = EDR_TERMINAL_FRAME_MAX_BYTES;
+  return 2ULL * (frame + EDR_TERMINAL_TEXT_MAX_BYTES);
+}
+
 static uint64_t queue_terminal_precreate_live_cost(const char *idempotency_key,
                                                     const char *source_event_key,
                                                     const char *rule_id,
@@ -490,7 +504,7 @@ static uint64_t queue_terminal_precreate_live_cost(const char *idempotency_key,
   total = queue_add_bytes(total, (uint64_t)strlen(process_generation_key));
   total = queue_add_bytes(total, (uint64_t)strlen(intent_batch_id));
   total = queue_add_bytes(total, (uint64_t)intent_wire_len);
-  return queue_add_bytes(total, EDR_TERMINAL_FINAL_RESERVE_BYTES);
+  return queue_add_bytes(total, terminal_final_reserve_for_intent(intent_wire_len));
 }
 
 static uint64_t queue_terminal_final_live_cost(const char *source_batch_id,
@@ -3656,7 +3670,7 @@ EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate
           sqlite3_bind_text(st, 5, process_generation_key, -1, SQLITE_TRANSIENT);
           sqlite3_bind_text(st, 6, intent_batch_id, -1, SQLITE_TRANSIENT);
           sqlite3_bind_blob(st, 7, intent_wire, (int)intent_wire_len, SQLITE_TRANSIENT);
-          sqlite3_bind_int64(st, 8, (sqlite3_int64)EDR_TERMINAL_FINAL_RESERVE_BYTES);
+          sqlite3_bind_int64(st, 8, (sqlite3_int64)terminal_final_reserve_for_intent(intent_wire_len));
           sqlite3_bind_int64(st, 9, now);
           sqlite3_bind_int64(st, 10, now);
           if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(s_db) == 1) {

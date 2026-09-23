@@ -11,4 +11,10 @@ int edr_p0_deferred_snapshot_encode(const EdrBehaviorRecord *record,
 int edr_p0_deferred_snapshot_decode(const char *json, size_t length,
     EdrBehaviorRecord *record, EdrP0RuleIrBinding *binding,
     char *rule_id, size_t rule_cap);
+int edr_p0_deferred_snapshot_encode_facts(const EdrBehaviorRecord *record,
+    const EdrP0RuleIrBinding *binding, const char *rule_id,
+    const EdrCommandFacts *facts, char **out, size_t *length);
+int edr_p0_deferred_snapshot_decode_facts(const char *json, size_t length,
+    EdrBehaviorRecord *record, EdrP0RuleIrBinding *binding,
+    char *rule_id, size_t rule_cap, EdrCommandFacts *facts);
 #endif

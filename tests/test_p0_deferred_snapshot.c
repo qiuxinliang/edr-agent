@@ -53,20 +53,35 @@ int main(void) {
    * fields must fail explicitly, never restore a partial valid-looking record. */
   assert(!edr_p0_deferred_snapshot_decode(json,length-1u,&restored,&decoded,rule,sizeof(rule)));
   cJSON *root=cJSON_Parse(json); assert(root);
-  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),3);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),4);
   char *bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad);
-  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),3);
   cJSON *record=cJSON_GetObjectItemCaseSensitive(root,"record");
   assert(cJSON_ReplaceItemInObjectCaseSensitive(record,"pid",cJSON_CreateString("4294967296")));
   bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad); cJSON_Delete(root);
+  /* Existing schema-2 rows preserve syscall outcomes after upgrade. */
+  root=cJSON_Parse(json); assert(root);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
+  cJSON_DeleteItemFromObjectCaseSensitive(root,"command_facts");
+  record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_start_key");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_creation_filetime_100ns");
+  bad=cJSON_PrintUnformatted(root); assert(bad);
+  assert(edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
+  assert(restored.syscall_result==INT64_MIN && restored.syscall_result_known==original.syscall_result_known);
+  assert(!restored.parent_process_start_key && !restored.parent_process_creation_filetime_100ns);
+  free(bad); cJSON_Delete(root);
   /* Existing schema-1 durable rows survive upgrade with outcome unknown. */
   root=cJSON_Parse(json); assert(root);
   cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),1);
+  cJSON_DeleteItemFromObjectCaseSensitive(root,"command_facts");
   record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_start_key");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_creation_filetime_100ns");
   const char *syscall_fields[] = {"syscall_name", "syscall_sensor", "syscall_result",
     "syscall_target_pid", "syscall_result_known", "syscall_success", "syscall_success_known"};
   for (size_t i=0;i<sizeof(syscall_fields)/sizeof(syscall_fields[0]);++i)

@@ -20,6 +20,13 @@
  * carried alongside independently detected transport clipping. */
 #define EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN 384u
 
+/* Owned separately from copied hot records. A deferred queue snapshot owns
+ * these complete strings until its wire handoff; callers free both members. */
+typedef struct EdrCommandFacts {
+  char *subject;
+  char *parent;
+} EdrCommandFacts;
+
 typedef struct {
   char event_id[EDR_BR_ID_LEN];
   char endpoint_id[EDR_BR_ID_LEN];
@@ -168,6 +175,10 @@ typedef struct {
   /* Raw Windows FILETIME from the target process payload or a validated live
    * ProcessTelemetryIdInformation query. */
   uint64_t process_creation_filetime_100ns;
+  /* Bound parent identity, not the current occupant of ppid. Carries the
+   * command-fact reference through asynchronous record copies. */
+  uint64_t parent_process_start_key;
+  uint64_t parent_process_creation_filetime_100ns;
   char process_generation_source[64];
   char parent_creation_time[64];
   char command_line_origin[64];

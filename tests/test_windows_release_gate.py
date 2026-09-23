@@ -40,7 +40,7 @@ RUNTIME_EXPECTED = {
     "process_evidence_pending", "telemetry_admission", "pid_history_pmfe_generation",
     "behavior_record_alert_proto_contract",
     "behavior_record_alert_emit_contract", "p0_direct_emit_suppression", "p0_deferred_snapshot",
-    "process_tree_cache", "local_evidence_cache_candidate",
+    "process_tree_cache", "local_evidence_cache_candidate", "command_fact_transport",
     "python_installer_config_contract",
     "detection_decision_combo", "detection_regression_scenarios",
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",

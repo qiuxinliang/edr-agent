@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Single-threaded wire fixtures live outside the 1 MiB Windows stack.
+ * Production serialization uses heap-owned messages; nested test decoders
+ * must not add several maximum-size protocol objects to that same stack. */
+
 static void init_transport_record(EdrBehaviorRecord *record) {
   memset(record, 0, sizeof(*record));
   record->type = EDR_EVENT_PROCESS_CREATE;
@@ -21,7 +25,7 @@ static void init_transport_record(EdrBehaviorRecord *record) {
 static int verify_pmfe_evidence_projection(void) {
   EdrBehaviorRecord record;
   uint8_t wire[32768];
-  edr_v1_BehaviorEvent decoded;
+  static edr_v1_BehaviorEvent decoded;
   init_transport_record(&record);
   record.type = EDR_EVENT_PMFE_SCAN_RESULT;
   snprintf(record.cmdline, sizeof(record.cmdline), "%s", "private_exec=1 mz_hits=1 elf_hits=1");
@@ -104,7 +108,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
 
   for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     EdrBehaviorRecord record;
-    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
 
     init_transport_record(&record);
     fill_common_process_context(&record, cases[i].name);
@@ -166,7 +170,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
    * encoding path with a non-process oneof rather than assuming compatibility. */
   {
     EdrBehaviorRecord record;
-    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
     init_transport_record(&record);
     snprintf(record.parent_name, sizeof(record.parent_name), "parent-protobuf-c.exe");
     snprintf(record.parent_path, sizeof(record.parent_path), "C:/parent/protobuf-c.exe");
@@ -189,7 +193,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
   /* Missing input stays missing even when a non-process detail is present. */
   {
     EdrBehaviorRecord record;
-    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
     init_transport_record(&record);
     snprintf(record.file_op, sizeof(record.file_op), "create");
     snprintf(record.file_path, sizeof(record.file_path), "E:/removable/marker.txt");
@@ -205,7 +209,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
    * than copied past its record boundary or silently treated as complete. */
   {
     EdrBehaviorRecord record;
-    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
     init_transport_record(&record);
     memset(record.parent_name, 'n', sizeof(record.parent_name));
     memset(record.parent_path, 'p', sizeof(record.parent_path));
@@ -224,8 +228,8 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
 
 static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
   EdrBehaviorRecord record;
-  edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
-  char expected[EDR_BR_STR_CMDLINE];
+  static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+  char expected[EDR_BR_STR_CMDLINE + 1u];
 
   /* Paths and command lines remain complete at their declared transport
    * boundaries when the source value fits the static field. */
@@ -235,7 +239,7 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
   fill_boundary_ascii(record.file_path, sizeof(record.file_path), 'f');
   snprintf(record.file_op, sizeof(record.file_op), "write");
   if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
-      strlen(decoded.cmdline) != sizeof(decoded.cmdline) - 1u ||
+      strlen(decoded.cmdline) != sizeof(record.cmdline) - 1u ||
       strlen(decoded.exe_path) != sizeof(record.exe_path) - 1u ||
       !decoded.which_detail ||
       strlen(decoded.detail.file.target_path) != sizeof(record.file_path) - 1u ||
@@ -253,7 +257,7 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
       strlen(decoded.detail.process.parent_cmdline) != sizeof(decoded.detail.process.parent_cmdline) - 1u ||
       strlen(decoded.detail.process.current_directory) != sizeof(record.current_directory) - 1u ||
       !decoded.has_process_context ||
-      strlen(decoded.process_context.parent_cmdline) != sizeof(decoded.process_context.parent_cmdline) - 1u ||
+      strlen(decoded.process_context.parent_cmdline) != sizeof(record.parent_cmdline) - 1u ||
       strlen(decoded.process_context.current_directory) != sizeof(record.current_directory) - 1u ||
       strcmp(decoded.transport_completeness, "COMPLETE") != 0 ||
       decoded.truncated_fields[0] != '\0') {
@@ -278,17 +282,16 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
     return 0;
   }
 
-  /* A capacity+1 non-terminated UTF-8 input is tagged as truncated, and the
-   * final two-byte character is discarded as a unit rather than split. */
+  /* A non-terminated preview is still marked truncated. The larger wire
+   * fact field can retain the entire available UTF-8 prefix, without an OOB read. */
   init_transport_record(&record);
   memset(record.cmdline, 'x', sizeof(record.cmdline) - 2u);
   record.cmdline[sizeof(record.cmdline) - 2u] = (char)0xc3;
   record.cmdline[sizeof(record.cmdline) - 1u] = (char)0xa9;
-  /* The wire field reserves 8 KiB including its NUL terminator. The source
-   * side is filled to its same capacity, so the final two-byte character is
-   * clipped to the largest complete UTF-8 prefix. */
   memset(expected, 'x', sizeof(record.cmdline) - 2u);
-  expected[sizeof(record.cmdline) - 2u] = '\0';
+  expected[sizeof(record.cmdline) - 2u] = (char)0xc3;
+  expected[sizeof(record.cmdline) - 1u] = (char)0xa9;
+  expected[sizeof(record.cmdline)] = '\0';
   if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
       strcmp(decoded.transport_completeness, "TRUNCATED") != 0 ||
       strcmp(decoded.truncated_fields, "cmdline") != 0 ||
@@ -301,7 +304,7 @@ static int verify_transport_boundaries(uint8_t *wire, size_t wire_cap) {
 
 static int verify_source_truncation_projection(uint8_t *wire, size_t wire_cap) {
   EdrBehaviorRecord record;
-  edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+  static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
   size_t used = 0u;
 
   /* The encoder accepts a production-created source list verbatim, but still
@@ -405,11 +408,11 @@ static int emit_common_process_context_fixtures(void) {
       {"dns", EDR_EVENT_NET_DNS_QUERY, edr_v1_BehaviorEvent_dns_tag},
       {"script", EDR_EVENT_SCRIPT_POWERSHELL, edr_v1_BehaviorEvent_script_tag},
   };
-  uint8_t wire[edr_v1_BehaviorEvent_size];
+  static uint8_t wire[edr_v1_BehaviorEvent_size];
 
   for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
     EdrBehaviorRecord record;
-    edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+    static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
     pb_istream_t stream;
     size_t wire_len;
 
@@ -464,9 +467,9 @@ static int emit_common_process_context_fixtures(void) {
 int main(int argc, char **argv) {
   EdrBehaviorRecord record;
   AVEBehaviorAlert alert;
-  uint8_t wire[edr_v1_BehaviorEvent_size];
-  uint8_t combined_wire[edr_v1_BehaviorEvent_size];
-  edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
+  static uint8_t wire[edr_v1_BehaviorEvent_size];
+  static uint8_t combined_wire[edr_v1_BehaviorEvent_size];
+  static edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
   size_t combined_wire_len = 0u;
   const int emit_combined_frame =
       argc == 2 && strcmp(argv[1], "--emit-combined-frame-base64") == 0;

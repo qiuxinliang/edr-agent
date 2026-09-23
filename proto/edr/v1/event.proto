@@ -95,9 +95,9 @@ message BehaviorEvent {
   uint32 pid = 6;
   uint32 ppid = 7;
   string process_name = 8;
-  // The nanopb static contract reserves 8192 bytes, including the NUL
-  // terminator; consumers must use the typed truncation marker for longer
-  // values.
+  // Complete command fact. The nanopb wire bound covers Windows UTF-16
+  // command strings after UTF-8 conversion; hot-record previews stay bounded
+  // independently and retain typed omissions when the fact is unavailable.
   string cmdline = 9;
   string exe_hash = 10;
   string exe_path = 11;
@@ -184,7 +184,7 @@ message ProcessDetail {
   string integrity_level = 3;
   // 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
   // 端侧已采集，补齐上报供服务端进程链/研判使用。
-  // Same 8192-byte static contract as BehaviorEvent.cmdline.
+  // Legacy bounded preview. ProcessContext is authoritative for long parent facts.
   string parent_cmdline = 4;
   string current_directory = 5;
   string process_creation_time = 6;
@@ -234,7 +234,8 @@ message ProcessContext {
   optional string parent_name = 1;
   optional string parent_path = 2;
   optional string integrity_level = 3;
-  // Same 8192-byte static contract as BehaviorEvent.cmdline.
+  // Complete parent command; nanopb wire bound follows the Windows UTF-16
+  // command maximum. Hot record previews are not the transport authority.
   optional string parent_cmdline = 4;
   optional string current_directory = 5;
   optional string process_creation_time = 6;

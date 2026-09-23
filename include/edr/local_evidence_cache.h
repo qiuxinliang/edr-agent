@@ -177,6 +177,16 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours);
 void edr_local_evidence_cache_close(void);
 
+/* Long commands live once in the existing bounded artifacts store, keyed by
+ * tenant/endpoint/PID/StartKey/birth. Never infer ownership from PID alone.
+ * Save returns zero only for committed, hash-verified, non-conflicting facts.
+ * Read returns owned memory (free), or NULL when unavailable/invalid. */
+int edr_local_evidence_cache_save_command_fact(const EdrBehaviorRecord *identity,
+                                               const char *command);
+char *edr_local_evidence_cache_read_command_fact(const EdrBehaviorRecord *identity);
+void edr_local_evidence_cache_resolve_commands(const EdrBehaviorRecord *record,
+                                               char **subject, char **parent);
+
 /** 用已缓存的进程元数据补全 pid/ppid/name/path/cmdline/parent。 */
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r);
 

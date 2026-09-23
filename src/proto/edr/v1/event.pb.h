@@ -88,7 +88,7 @@ typedef struct _edr_v1_ProcessDetail {
     char integrity_level[64];
     /* 取证增强字段（与 EdrBehaviorRecord / 平台 alerts_analysis_snapshot 必需字段对齐）：
  端侧已采集，补齐上报供服务端进程链/研判使用。
- Same 8192-byte static contract as BehaviorEvent.cmdline. */
+ Legacy bounded preview. ProcessContext is authoritative for long parent facts. */
     char parent_cmdline[8192];
     char current_directory[4096];
     char process_creation_time[64];
@@ -141,9 +141,10 @@ typedef struct _edr_v1_ProcessContext {
     char parent_path[512];
     bool has_integrity_level;
     char integrity_level[64];
-    /* Same 8192-byte static contract as BehaviorEvent.cmdline. */
+    /* Complete parent command; nanopb wire bound follows the Windows UTF-16
+ command maximum. Hot record previews are not the transport authority. */
     bool has_parent_cmdline;
-    char parent_cmdline[8192];
+    char parent_cmdline[98302];
     bool has_current_directory;
     char current_directory[4096];
     bool has_process_creation_time;
@@ -168,10 +169,10 @@ typedef struct _edr_v1_BehaviorEvent {
     uint32_t pid;
     uint32_t ppid;
     char process_name[256];
-    /* The nanopb static contract reserves 8192 bytes, including the NUL
- terminator; consumers must use the typed truncation marker for longer
- values. */
-    char cmdline[8192];
+    /* Complete command fact. The nanopb wire bound covers Windows UTF-16
+ command strings after UTF-8 conversion; hot-record previews stay bounded
+ independently and retain typed omissions when the fact is unavailable. */
+    char cmdline[98302];
     char exe_hash[65];
     char exe_path[4096];
     char username[256];
@@ -617,11 +618,11 @@ extern const pb_msgdesc_t edr_v1_ProcessContext_msg;
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         4864
 #define edr_v1_BehaviorAlert_size                11192
-#define edr_v1_BehaviorEvent_size                72744
+#define edr_v1_BehaviorEvent_size                252967
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   4144
 #define edr_v1_NetworkDetail_size                4257
-#define edr_v1_ProcessContext_size               13978
+#define edr_v1_ProcessContext_size               104089
 #define edr_v1_ProcessDetail_size                13978
 #define edr_v1_RegistryDetail_size               9767
 #define edr_v1_ScriptDetail_size                 4098

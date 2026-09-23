@@ -109,3 +109,6 @@ UNSIGNED(syscall_target_pid)
 UNSIGNED(syscall_result_known)
 UNSIGNED(syscall_success)
 UNSIGNED(syscall_success_known)
+/* Schema 3 preserves exact parent references across deferred queue recovery. */
+UNSIGNED(parent_process_start_key)
+UNSIGNED(parent_process_creation_filetime_100ns)

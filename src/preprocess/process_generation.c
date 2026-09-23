@@ -162,9 +162,9 @@ int edr_process_generation_query_live(void *native_process_handle,
   return 1;
 }
 
-int edr_process_command_line_query_live(void *native_process_handle,
-                                        char *out, size_t out_cap,
-                                        char *reason, size_t reason_cap) {
+static int query_command_line(void *native_process_handle,
+                               char *out, size_t out_cap, char **allocated,
+                               char *reason, size_t reason_cap) {
   EdrNtQueryInformationProcessFn query;
   EdrUnicodeString *value;
   unsigned char *raw;
@@ -179,7 +179,7 @@ int edr_process_command_line_query_live(void *native_process_handle,
   int written;
 
   if (out && out_cap > 0u) out[0] = '\0';
-  if (!native_process_handle || !out || out_cap < 2u) {
+  if (!native_process_handle || (!allocated && (!out || out_cap < 2u))) {
     set_reason(reason, reason_cap, "invalid_command_line_output");
     return 0;
   }
@@ -227,23 +227,45 @@ int edr_process_command_line_query_live(void *native_process_handle,
   }
   utf8_needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value->Buffer,
                                     (int)chars, NULL, 0, NULL, NULL);
-  if (utf8_needed <= 0 || (size_t)utf8_needed >= out_cap) {
+  if (utf8_needed <= 0 || (size_t)utf8_needed >= EDR_PROCESS_COMMAND_FACT_CAP ||
+      (!allocated && (size_t)utf8_needed >= out_cap)) {
     free(raw);
     set_reason(reason, reason_cap,
                utf8_needed > 0 ? "command_line_too_long" : "command_line_encoding_invalid");
     return 0;
+  }
+  if (allocated) {
+    out = (char *)malloc((size_t)utf8_needed + 1u);
+    if (!out) {
+      free(raw);
+      set_reason(reason, reason_cap, "command_line_buffer_unavailable");
+      return 0;
+    }
   }
   written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value->Buffer,
                                 (int)chars, out, utf8_needed, NULL, NULL);
   free(raw);
   if (written != utf8_needed) {
     out[0] = '\0';
+    if (allocated) free(out);
     set_reason(reason, reason_cap, "command_line_encoding_failed");
     return 0;
   }
   out[written] = '\0';
+  if (allocated) *allocated = out;
   set_reason(reason, reason_cap, "ok");
   return 1;
+}
+
+int edr_process_command_line_query_live(void *handle, char *out, size_t cap,
+                                        char *reason, size_t reason_cap) {
+  return query_command_line(handle, out, cap, NULL, reason, reason_cap);
+}
+
+char *edr_process_command_line_query_alloc(void *handle, char *reason, size_t cap) {
+  char *result = NULL;
+  (void)query_command_line(handle, NULL, 0u, &result, reason, cap);
+  return result;
 }
 
 int edr_process_generation_validate_live(void *native_process_handle,
@@ -273,6 +295,12 @@ int edr_process_generation_validate_live(void *native_process_handle,
 }
 
 #else
+
+char *edr_process_command_line_query_alloc(void *handle, char *reason, size_t cap) {
+  (void)handle;
+  set_reason(reason, cap, "unsupported_platform");
+  return NULL;
+}
 
 int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,
                                   uint32_t timeout_ms, char *reason, size_t reason_cap) {

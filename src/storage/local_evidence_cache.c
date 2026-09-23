@@ -3,6 +3,7 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
+#include "edr/process_generation.h"
 #include "edr/resource.h"
 #include "edr/sha256.h"
 #include "edr/time_util.h"
@@ -777,6 +778,14 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
 static int record_parent_generation(const EdrBehaviorRecord *r,
                                     EvidenceProcessGeneration *out) {
   ProcessTreeEntry snapshot;
+  if (r && out && r->ppid && r->parent_process_start_key &&
+      r->parent_process_creation_filetime_100ns &&
+      r->process_creation_filetime_100ns >= r->parent_process_creation_filetime_100ns) {
+    memset(out, 0, sizeof(*out));
+    out->process_start_key = r->parent_process_start_key;
+    out->creation_filetime_100ns = r->parent_process_creation_filetime_100ns;
+    return 1;
+  }
   if (!out || !record_parent_snapshot(r, &snapshot)) return 0;
   memset(out, 0, sizeof(*out));
   out->process_start_key = snapshot.process_start_key;
@@ -1223,6 +1232,11 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
     return;
   }
   evidence_cache_lock();
+  EvidenceProcessGeneration parent_ref;
+  if (record_parent_generation(r, &parent_ref)) {
+    r->parent_process_start_key = parent_ref.process_start_key;
+    r->parent_process_creation_filetime_100ns = parent_ref.creation_filetime_100ns;
+  }
   s_status.identity_enrich_attempts++;
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
   if (p) {
@@ -4391,6 +4405,170 @@ void edr_local_evidence_cache_record_command_result(
 #endif
 }
 
+/* A command fact is immutable for one exact process generation. The existing
+ * artifact retention/capacity owner also governs these rows; they are embedded
+ * in the event before queue admission, not a new file-upload work queue. */
+#if defined(EDR_HAVE_SQLITE)
+static int command_fact_key(const EdrBehaviorRecord *r, char key[80]) {
+  EdrSha256Ctx ctx;
+  uint8_t digest[32];
+  if (!r || !r->tenant_id[0] || !r->endpoint_id[0] || !r->pid ||
+      !r->process_start_key || !r->process_creation_filetime_100ns ||
+      !memchr(r->tenant_id, 0, sizeof(r->tenant_id)) ||
+      !memchr(r->endpoint_id, 0, sizeof(r->endpoint_id))) return 0;
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, r->tenant_id);
+  candidate_digest_text(&ctx, r->endpoint_id);
+  candidate_digest_u64(&ctx, r->pid);
+  candidate_digest_u64(&ctx, r->process_start_key);
+  candidate_digest_u64(&ctx, r->process_creation_filetime_100ns);
+  edr_sha256_final(&ctx, digest);
+  memcpy(key, "command:", 8u);
+  for (size_t i = 0; i < 32u; ++i) snprintf(key + 8u + 2u*i, 3u, "%02x", digest[i]);
+  return 1;
+}
+
+static char *read_command_fact_locked(const EdrBehaviorRecord *r) {
+  char key[80], hash[65];
+  char *result = NULL;
+  sqlite3_stmt *st = NULL;
+  if (!s_db || !command_fact_key(r, key)) return NULL;
+  if (sqlite3_prepare_v2(s_db,
+        "SELECT manifest_json,sha256 FROM artifacts WHERE artifact_id=? AND tenant_id=? "
+        "AND endpoint_id=? AND artifact_type='process_command_line' AND upload_status='embedded'", -1, &st, NULL) != SQLITE_OK)
+    return NULL;
+  bind_text(st, 1, key); bind_text(st, 2, r->tenant_id); bind_text(st, 3, r->endpoint_id);
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *json = (const char *)sqlite3_column_text(st, 0);
+    const char *expected = (const char *)sqlite3_column_text(st, 1);
+    int bytes = sqlite3_column_bytes(st, 0);
+    cJSON *root = json && bytes > 0 && (size_t)bytes < EDR_PROCESS_COMMAND_FACT_CAP * 6u + 200u
+        ? cJSON_Parse(json) : NULL;
+    const cJSON *command = cJSON_GetObjectItemCaseSensitive(root, "command_line");
+    const cJSON *reference = cJSON_GetObjectItemCaseSensitive(root, "reference");
+    if (cJSON_IsString(command) && command->valuestring[0]) {
+      size_t n = strlen(command->valuestring);
+      if (n < EDR_PROCESS_COMMAND_FACT_CAP && manifest_utf8_valid(command->valuestring) &&
+          edr_sha256_hex((const uint8_t *)command->valuestring, n, hash) == 0 &&
+          expected && strcmp(expected, hash) == 0 && cJSON_IsString(reference) &&
+          strcmp(reference->valuestring, key) == 0) {
+        result = (char *)malloc(n + 1u);
+        if (result) memcpy(result, command->valuestring, n + 1u);
+      } else set_error("command fact hash/encoding/size invalid");
+    }
+    cJSON_Delete(root);
+  }
+  sqlite3_finalize(st);
+  return result;
+}
+#endif
+
+int edr_local_evidence_cache_save_command_fact(const EdrBehaviorRecord *r, const char *command) {
+  int rc = -1;
+  evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char key[80], hash[65];
+  sqlite3_stmt *st = NULL;
+  cJSON *root = NULL;
+  char *json = NULL;
+  size_t n = command ? strlen(command) : 0u;
+  set_error("complete command fact unavailable: invalid identity, encoding, or storage");
+  if (s_db && command_fact_key(r, key) && n && n < EDR_PROCESS_COMMAND_FACT_CAP &&
+      manifest_utf8_valid(command) && edr_sha256_hex((const uint8_t *)command, n, hash) == 0) {
+    char *prior = read_command_fact_locked(r);
+    if (prior) {
+      rc = strcmp(prior, command) == 0 ? 0 : -1;
+      if (rc) {
+        /* Equal previews can conceal different tails. Retain the original
+         * evidence but invalidate this ambiguous generation reference, also
+         * after restart. It must never silently resolve to the earlier tail. */
+        if (sqlite3_prepare_v2(s_db,
+            "UPDATE artifacts SET upload_status='conflict' WHERE artifact_id=?",
+            -1, &st, NULL) == SQLITE_OK) {
+          bind_text(st, 1, key);
+          if (sqlite3_step(st) != SQLITE_DONE)
+            set_error("command fact conflict could not be persisted");
+          else set_error("same-generation command fact conflict; reference invalidated");
+        }
+      }
+      free(prior);
+    } else if (sqlite_size_budget_allow()) {
+      root = cJSON_CreateObject();
+      if (manifest_add_text(root, "command_line", command) &&
+          manifest_add_text(root, "reference", key) &&
+          (json = cJSON_PrintUnformatted(root)) != NULL &&
+          sqlite3_prepare_v2(s_db,
+            "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,"
+            "sha256,manifest_json,created_ns,upload_status) "
+            "VALUES(?,?,?,'','process_command_line',?,?,?,'embedded') "
+            "ON CONFLICT(artifact_id) DO NOTHING", -1, &st, NULL) == SQLITE_OK) {
+        bind_text(st, 1, key); bind_text(st, 2, r->endpoint_id); bind_text(st, 3, r->tenant_id);
+        bind_text(st, 4, hash); bind_text(st, 5, json);
+        sqlite3_bind_int64(st, 6, (sqlite3_int64)now_unix_ns());
+        if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(s_db) == 1) {
+          s_status.artifacts_written++;
+          rc = 0;
+        } else set_error("command fact commit failed or existing fact invalid");
+      }
+    }
+  }
+  sqlite3_finalize(st);
+  cJSON_free(json);
+  cJSON_Delete(root);
+#else
+  (void)r; (void)command;
+#endif
+  if (!rc) set_error("");
+  evidence_cache_unlock();
+  return rc;
+}
+
+char *edr_local_evidence_cache_read_command_fact(const EdrBehaviorRecord *r) {
+  char *result = NULL;
+  evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  result = read_command_fact_locked(r);
+#else
+  (void)r;
+#endif
+  evidence_cache_unlock();
+  return result;
+}
+
+void edr_local_evidence_cache_resolve_commands(const EdrBehaviorRecord *r,
+                                               char **subject, char **parent) {
+  if (!subject || !parent) return;
+  *subject = NULL; *parent = NULL;
+  if (!r || !memchr(r->cmdline, 0, sizeof(r->cmdline)) ||
+      !memchr(r->parent_cmdline, 0, sizeof(r->parent_cmdline))) return;
+  if ((!r->cmdline[0] || edr_behavior_source_field_truncated(r, "source.cmdline")) &&
+      strcmp(r->command_line_origin, "live_command_fact_store_failed") != 0)
+    *subject = edr_local_evidence_cache_read_command_fact(r);
+  if ((!r->parent_cmdline[0] || edr_behavior_source_field_truncated(r, "source.parent_cmdline")) &&
+      !edr_behavior_source_field_truncated(r, "source.parent_command_fact") &&
+      r->ppid && r->parent_process_start_key && r->parent_process_creation_filetime_100ns &&
+      r->parent_process_creation_filetime_100ns <= r->process_creation_filetime_100ns) {
+    EdrBehaviorRecord *identity = (EdrBehaviorRecord *)calloc(1u, sizeof(*identity));
+    if (identity) {
+      copy_s(identity->tenant_id, sizeof(identity->tenant_id), r->tenant_id);
+      copy_s(identity->endpoint_id, sizeof(identity->endpoint_id), r->endpoint_id);
+      identity->pid = r->ppid;
+      identity->process_start_key = r->parent_process_start_key;
+      identity->process_creation_filetime_100ns = r->parent_process_creation_filetime_100ns;
+      *parent = edr_local_evidence_cache_read_command_fact(identity);
+      free(identity);
+    }
+  }
+  /* An explicit source value may conflict; a reference is not permission to
+   * overwrite it with another observation, even within the same lifetime. */
+  if (*subject && r->cmdline[0] && strncmp(*subject, r->cmdline, strlen(r->cmdline)) != 0) {
+    free(*subject); *subject = NULL;
+  }
+  if (*parent && r->parent_cmdline[0] && strncmp(*parent, r->parent_cmdline, strlen(r->parent_cmdline)) != 0) {
+    free(*parent); *parent = NULL;
+  }
+}
+
 static void evidence_cache_close_locked(void) {
 #if defined(EDR_HAVE_SQLITE)
   if (s_db) {
@@ -6114,11 +6292,36 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
 static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
                              const char *source, const ProcSlot *p) {
   char ep[120], tn[160], nm[320], path[1200], pn[320], pp[640], command_fields[192];
-  cJSON *command = cJSON_CreateString(p ? p->cmdline : "");
+  char *complete = NULL;
+  char reference[80] = "", sha[65] = "";
+#if defined(EDR_HAVE_SQLITE)
+  if (p && (!p->cmdline[0] || p->cmdline_truncated_fields[0])) {
+    EdrBehaviorRecord *identity = (EdrBehaviorRecord *)calloc(1u, sizeof(*identity));
+    if (identity) {
+      copy_s(identity->tenant_id, sizeof(identity->tenant_id), p->tenant_id);
+      copy_s(identity->endpoint_id, sizeof(identity->endpoint_id), p->endpoint_id);
+      identity->pid = p->pid;
+      identity->process_start_key = p->generation.process_start_key;
+      identity->process_creation_filetime_100ns = p->generation.creation_filetime_100ns;
+      complete = read_command_fact_locked(identity);
+      if (complete && (!p->cmdline[0] || strncmp(complete, p->cmdline, strlen(p->cmdline)) == 0)) {
+        (void)command_fact_key(identity, reference);
+        (void)edr_sha256_hex((const uint8_t *)complete, strlen(complete), sha);
+      } else { free(complete); complete = NULL; }
+      free(identity);
+    }
+  }
+#endif
+  /* RTQ has its own caller-supplied envelope. It may show the preview with
+   * an exact fact reference, but must not pretend it is the complete string. */
+  size_t full_bytes = complete ? strlen(complete) : 0u;
+  int full_fits = complete && cap > *off && full_bytes * 6u + 8192u < cap - *off;
+  cJSON *command = cJSON_CreateString(full_fits ? complete : p ? p->cmdline : "");
   char *cmd = command ? cJSON_PrintUnformatted(command) : NULL;
   cJSON_Delete(command);
+  free(complete);
   if (!cmd) return 0;
-  const char *quality = !p || !p->cmdline[0] ? "missing" :
+  const char *quality = full_fits ? "complete" : full_bytes ? "preview_full_fact_retained" : !p || !p->cmdline[0] ? "missing" :
       !command_quality_known(p) ?
       "unknown" : p->cmdline_truncated_fields[0] ? "truncated" : "complete";
   char username[640], domain[640], user_sid[640], logon_id[160];
@@ -6129,7 +6332,7 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(tn, sizeof(tn), p ? p->tenant_id : "");
   json_escape(nm, sizeof(nm), p ? p->name : "");
   json_escape(path, sizeof(path), p ? p->path : "");
-  json_escape(command_fields, sizeof(command_fields), command_quality_known(p) ? p->cmdline_truncated_fields : "");
+  json_escape(command_fields, sizeof(command_fields), full_fits ? "" : command_quality_known(p) ? p->cmdline_truncated_fields : "");
   json_escape(pn, sizeof(pn), p ? p->parent_name : "");
   json_escape(pp, sizeof(pp), p ? p->parent_path : "");
   json_escape(username, sizeof(username), p ? p->username : "");
@@ -6156,6 +6359,7 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
   appendf(out, cap, off, "%s{\"source\":\"%s\",\"endpoint_id\":%s,\"tenant_id\":%s,"
                           "\"pid\":%u,\"ppid\":%u,\"name\":%s,\"path\":%s,\"cmdline\":%s,"
                           "\"cmdline_quality\":\"%s\",\"cmdline_truncated_fields\":%s,"
+                          "\"cmdline_fact_ref\":\"%s\",\"cmdline_fact_sha256\":\"%s\",\"cmdline_fact_bytes\":%zu,"
                           "\"parent_name\":%s,\"parent_path\":%s,\"process_start_key\":\"%s\","
                           "\"process_creation_filetime_100ns\":\"%s\",\"process_generation_source\":%s,"
                           "\"parent_process_start_key\":\"%s\",\"parent_process_creation_filetime_100ns\":\"%s\","
@@ -6163,7 +6367,7 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
                           "\"user_sid\":%s,\"logon_id\":%s,\"identity_source\":%s,"
                           "\"identity_quality\":%s,\"exe_hash\":%s,\"last_seen_ns\":%lld}",
           *first ? "" : ",", source ? source : "", ep, tn, p ? p->pid : 0u,
-          p ? p->ppid : 0u, nm, path, cmd, quality, command_fields, pn, pp, generation_start, generation_creation,
+          p ? p->ppid : 0u, nm, path, cmd, quality, command_fields, reference, sha, full_bytes, pn, pp, generation_start, generation_creation,
           generation_source, parent_generation_start, parent_generation_creation,
           parent_generation_source, username, domain, user_sid, logon_id,
           identity_source, identity_quality, exe_hash,

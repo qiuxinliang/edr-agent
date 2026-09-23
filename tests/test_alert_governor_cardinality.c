@@ -29,6 +29,11 @@ int edr_event_batch_push(const uint8_t *wire, size_t wire_len) {
 /* This cardinality test has no persistent queue fixture. Combined P0 delivery
  * must therefore fail closed rather than receiving a fake durable success. */
 int edr_storage_queue_is_open(void) { return 0; }
+EdrError edr_storage_queue_p0_deferred_complete(const char *key, const char *batch,
+    const uint8_t *wire, size_t length, const char *reason) {
+  (void)key; (void)batch; (void)wire; (void)length; (void)reason;
+  return EDR_ERR_SQLITE_WRITE;
+}
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *payload,
                                    size_t payload_len, int compressed, int severity) {
   (void)batch_id; (void)payload; (void)payload_len; (void)compressed; (void)severity;

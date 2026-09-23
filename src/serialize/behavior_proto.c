@@ -2,6 +2,7 @@
 
 #include "edr/ave_sdk.h"
 #include "edr/pmfe.h"
+#include "edr/process_generation.h"
 #include "edr/types.h"
 
 #include "edr/v1/event.pb.h"
@@ -667,30 +668,74 @@ static size_t encode_behavior_event(const edr_v1_BehaviorEvent *msg, uint8_t *ou
   return stream.bytes_written;
 }
 
+static void resolve_wire_omission(edr_v1_BehaviorEvent *msg, const char *field) {
+  char *cursor = msg->truncated_fields;
+  size_t length = strlen(field);
+  while (*cursor) {
+    char *end = strchr(cursor, ',');
+    size_t n = end ? (size_t)(end - cursor) : strlen(cursor);
+    if (n == length && memcmp(cursor, field, n) == 0) {
+      if (end) memmove(cursor, end + 1, strlen(end + 1) + 1);
+      else { if (cursor > msg->truncated_fields) --cursor; *cursor = 0; break; }
+    } else { if (!end) break; cursor = end + 1; }
+  }
+  if (!msg->truncated_fields[0] && strcmp(msg->source_completeness, "TRUNCATED") == 0)
+    copy_str(msg->source_completeness, sizeof(msg->source_completeness), "COALESCED");
+}
+
+size_t edr_behavior_record_encode_protobuf_facts(const EdrBehaviorRecord *r,
+    const AVEBehaviorAlert *alert, const char *command, const char *parent_command,
+    uint8_t *out, size_t out_cap) {
+  edr_v1_BehaviorEvent *msg;
+  size_t result;
+  if (!r || !out || out_cap < 16u ||
+      (command && (!command[0] || strlen(command) >= EDR_PROCESS_COMMAND_FACT_CAP)) ||
+      (parent_command && (!parent_command[0] || strlen(parent_command) >= EDR_PROCESS_COMMAND_FACT_CAP)))
+    return 0;
+  /* Complete facts do not enlarge every hot record or Windows thread stack. */
+  msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
+  if (!msg) return 0;
+  fill_behavior_record_event_fields(msg, r);
+  if (alert) fill_behavior_alert_fields(msg, alert);
+  if (command) {
+    copy_str(msg->cmdline, sizeof(msg->cmdline), command);
+    resolve_wire_omission(msg, "source.cmdline");
+  }
+  if (parent_command) {
+    msg->has_process_context = true;
+    msg->process_context.has_parent_cmdline = true;
+    copy_str(msg->process_context.parent_cmdline, sizeof(msg->process_context.parent_cmdline), parent_command);
+    resolve_wire_omission(msg, "source.parent_cmdline");
+    /* The authoritative common context carries the fact once. Do not send
+     * a duplicate long value through the deprecated ProcessDetail projection. */
+    if (msg->which_detail == edr_v1_BehaviorEvent_process_tag) {
+      if (strlen(parent_command) < sizeof(msg->detail.process.parent_cmdline))
+        copy_str(msg->detail.process.parent_cmdline, sizeof(msg->detail.process.parent_cmdline), parent_command);
+      else msg->detail.process.parent_cmdline[0] = 0;
+    }
+  }
+  result = encode_behavior_event(msg, out, out_cap);
+  free(msg);
+  return result;
+}
+
 size_t edr_behavior_record_encode_protobuf(const EdrBehaviorRecord *r, uint8_t *out,
                                            size_t out_cap) {
-  if (!r || !out || out_cap < 16u) {
-    return 0;
-  }
-
-  edr_v1_BehaviorEvent msg;
-  memset(&msg, 0, sizeof(msg));
-  fill_behavior_record_event_fields(&msg, r);
-
-  return encode_behavior_event(&msg, out, out_cap);
+  return edr_behavior_record_encode_protobuf_facts(r, NULL, NULL, NULL, out, out_cap);
 }
 
 size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char *endpoint_id,
                                           const char *tenant_id, uint8_t *out, size_t out_cap) {
-  if (!a || !out || out_cap < edr_v1_BehaviorEvent_size) {
+  if (!a || !out || out_cap < 16u) {
     return 0;
   }
-  edr_v1_BehaviorEvent msg;
-  memset(&msg, 0, sizeof(msg));
-
-  fill_behavior_alert_event_fields(&msg, a, endpoint_id, tenant_id);
-  fill_behavior_alert_fields(&msg, a);
-  return encode_behavior_event(&msg, out, out_cap);
+  edr_v1_BehaviorEvent *msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
+  if (!msg) return 0;
+  fill_behavior_alert_event_fields(msg, a, endpoint_id, tenant_id);
+  fill_behavior_alert_fields(msg, a);
+  size_t result = encode_behavior_event(msg, out, out_cap);
+  free(msg);
+  return result;
 }
 
 size_t edr_behavior_record_alert_encode_protobuf(const EdrBehaviorRecord *r,
@@ -700,9 +745,5 @@ size_t edr_behavior_record_alert_encode_protobuf(const EdrBehaviorRecord *r,
     return 0;
   }
 
-  edr_v1_BehaviorEvent msg;
-  memset(&msg, 0, sizeof(msg));
-  fill_behavior_record_event_fields(&msg, r);
-  fill_behavior_alert_fields(&msg, a);
-  return encode_behavior_event(&msg, out, out_cap);
+  return edr_behavior_record_encode_protobuf_facts(r, a, NULL, NULL, out, out_cap);
 }

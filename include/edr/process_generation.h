@@ -47,6 +47,13 @@ int edr_process_command_line_query_live(void *native_process_handle,
                                         char *out, size_t out_cap,
                                         char *reason, size_t reason_cap);
 
+/* Windows UNICODE_STRING has at most 32767 UTF-16 code units; UTF-8
+ * needs at most three bytes per unit plus NUL. This is a fact bound, not a
+ * hot-record or model-input budget. Caller frees the exact-sized result. */
+#define EDR_PROCESS_COMMAND_FACT_CAP (32767u * 3u + 1u)
+char *edr_process_command_line_query_alloc(void *native_process_handle,
+                                          char *reason, size_t reason_cap);
+
 /* Bind termination to the observed creation FILETIME and confirm exit using
  * the same OS process handle. No PID-only fallback is permitted. */
 int edr_process_terminate_checked(uint32_t pid, uint64_t expected_creation_filetime,

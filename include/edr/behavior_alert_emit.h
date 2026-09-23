@@ -11,8 +11,15 @@
 #include <stdint.h>
 
 void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a);
-/* Pure encoders for the one-frame BAT1 queue wire.  They do not allocate,
- * enqueue, or perform transport I/O; the caller owns `wire`. */
+/* Resolve generation-bound command facts before encoding. No network I/O. */
+size_t edr_behavior_record_encode_frame(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, uint8_t *frame, size_t capacity);
+/* Owned BAT1 bytes within the existing event-batch cap. Caller frees. */
+uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, size_t *length);
+uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length);
+/* One-frame encoders read evidence storage; caller owns `wire`. */
 size_t edr_behavior_record_alert_encode_durable_wire(const EdrBehaviorRecord *record,
                                                       const AVEBehaviorAlert *alert,
                                                       uint8_t *wire, size_t wire_cap);
@@ -46,7 +53,7 @@ EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_p
  * governor rules remain identical; a committed key cannot emit twice. */
 EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
-    const char *deferred_key);
+    const char *deferred_key, const EdrCommandFacts *facts);
 
 /* Compatibility boolean wrapper for callers that only need durable success. */
 int edr_behavior_record_alert_emit_to_batch_with_prepare(

@@ -68,6 +68,39 @@ cannot claim the action a second time.
 
 ## Parent-generation repair
 
+### Complete command facts and rollback boundary
+
+The 8 KiB behavior/process-tree command field is a UTF-8 preview, not the
+complete-fact limit. Longer same-handle observations use the existing evidence
+artifact store, keyed by tenant, endpoint, PID, StartKey and creation FILETIME,
+with a full-content hash. Conflicting same-generation observations invalidate
+the reference rather than selecting an earlier tail. Failed retention remains
+explicitly incomplete. The artifact store retains its existing capacity and
+retention owner.
+
+Schema 3 snapshots bind the parent generation and embed resolved subject and
+parent command bodies, so replay does not depend on the evidence cache or a
+live process. The new reader accepts schema 1 and 2 without inventing missing
+fields. Encoding still fails explicitly above the existing 512 KiB limit.
+Final BAT1 messages remain within the existing 256 KiB event-batch limit.
+Terminal action space is reserved from immutable intent facts before execution,
+without increasing the global queue budget or short-event lane minimum.
+
+Older Agents do not understand schema 3 or the larger terminal frames. **Do
+not downgrade with pending new-format owners.** Quiesce/drain them under the
+new Agent first, or retain the database for explicit recovery with the new
+version. An old reader quarantines unsupported snapshots as `failed`; merely
+upgrading again does not automatically retry those failed rows. Do not delete
+the queue to force rollback. These source changes are not a proof of binary-hot
+rollback compatibility. Deploy the matching server command-capacity/projection
+changes before publishing the Agent.
+
+`test_command_fact_transport` checks exact parent identity, cache/queue reopen,
+cache-independent deferred handoff, conflicts and wire content at 8191, 8192,
+12717 and 98301 UTF-8 bytes. The Windows same-handle test queries an actual
+12717-byte inert child. Neither replaces post-deployment sensor-to-model
+acceptance, especially for a process that exits before live enrichment.
+
 A separate read-only snapshot showed child PID 6316 bound to parent PID 3404
 with generation `11540474045138450`, while the corresponding actual parent
 generation was `11540474045138506`. The difference is not a missing display

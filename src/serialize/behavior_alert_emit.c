@@ -3,6 +3,7 @@
 #include "edr/alert_governor.h"
 #include "edr/behavior_proto.h"
 #include "edr/event_batch.h"
+#include "edr/local_evidence_cache.h"
 #include "edr/preprocess.h"
 #include "edr/policy_v2.h"
 #include "edr/process_tree_cache.h"
@@ -103,7 +104,7 @@ static size_t behavior_frame_encode_durable_wire(const uint8_t *frame, size_t fr
   wire[13] = (uint8_t)((frame_len >> 8) & 0xffu);
   wire[14] = (uint8_t)((frame_len >> 16) & 0xffu);
   wire[15] = (uint8_t)((frame_len >> 24) & 0xffu);
-  memcpy(wire + 16u, frame, frame_len);
+  memmove(wire + 16u, frame, frame_len);
   return wire_len;
 }
 
@@ -119,13 +120,27 @@ int edr_behavior_durable_wire_batch_id(const char *kind, const uint8_t *wire, si
   return out[0] != '\0';
 }
 
+size_t edr_behavior_record_encode_frame(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, uint8_t *frame, size_t capacity) {
+#ifdef EDR_HAVE_NANOPB
+  char *subject = NULL, *parent = NULL;
+  edr_local_evidence_cache_resolve_commands(record, &subject, &parent);
+  size_t n = edr_behavior_record_encode_protobuf_facts(record, alert, subject, parent, frame, capacity);
+  free(subject); free(parent);
+  return n;
+#else
+  (void)record; (void)alert; (void)frame; (void)capacity;
+  return 0;
+#endif
+}
+
 size_t edr_behavior_record_alert_encode_durable_wire(const EdrBehaviorRecord *record,
                                                       const AVEBehaviorAlert *alert,
                                                       uint8_t *wire, size_t wire_cap) {
 #ifdef EDR_HAVE_NANOPB
-  uint8_t frame[65536];
-  size_t n = edr_behavior_record_alert_encode_protobuf(record, alert, frame, sizeof(frame));
-  return behavior_frame_encode_durable_wire(frame, n, wire, wire_cap);
+  if (!wire || wire_cap <= 16u) return 0;
+  size_t n = edr_behavior_record_encode_frame(record, alert, wire + 16u, wire_cap - 16u);
+  return behavior_frame_encode_durable_wire(wire + 16u, n, wire, wire_cap);
 #else
   (void)record;
   (void)alert;
@@ -138,9 +153,9 @@ size_t edr_behavior_record_alert_encode_durable_wire(const EdrBehaviorRecord *re
 size_t edr_behavior_record_encode_durable_wire(const EdrBehaviorRecord *record,
                                                uint8_t *wire, size_t wire_cap) {
 #ifdef EDR_HAVE_NANOPB
-  uint8_t frame[65536];
-  size_t n = edr_behavior_record_encode_protobuf(record, frame, sizeof(frame));
-  return behavior_frame_encode_durable_wire(frame, n, wire, wire_cap);
+  if (!wire || wire_cap <= 16u) return 0;
+  size_t n = edr_behavior_record_encode_frame(record, NULL, wire + 16u, wire_cap - 16u);
+  return behavior_frame_encode_durable_wire(wire + 16u, n, wire, wire_cap);
 #else
   (void)record;
   (void)wire;
@@ -157,16 +172,49 @@ static int enqueue_durable_p0_wire(const char *batch_id, const uint8_t *wire, si
   return edr_storage_queue_enqueue(batch_id, wire, wire_len, 0, severity) == EDR_OK;
 }
 
+uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  const size_t cap = EDR_EVENT_BATCH_CAP;
+  uint8_t *wire;
+  if (!length) return NULL;
+  *length = 0;
+  wire = (uint8_t *)malloc(cap);
+  if (!wire) return NULL;
+#ifdef EDR_HAVE_NANOPB
+  if (facts) {
+    /* Snapshot-owned bodies are authoritative for this replay. Do not query
+     * a later cache observation or depend on evidence-cache retention. */
+    size_t n = edr_behavior_record_encode_protobuf_facts(record, alert,
+        facts->subject, facts->parent, wire + 16u, cap - 16u);
+    *length = behavior_frame_encode_durable_wire(wire + 16u, n, wire, cap);
+  } else
+#else
+  (void)facts;
+#endif
+  { *length = alert ? edr_behavior_record_alert_encode_durable_wire(record, alert, wire, cap)
+                    : edr_behavior_record_encode_durable_wire(record, wire, cap); }
+  if (!*length) { free(wire); return NULL; }
+  return wire;
+}
+
+uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, size_t *length) {
+  return edr_behavior_record_alloc_durable_wire_facts(record, alert, NULL, length);
+}
+
 static int emit_record_alert_raw(const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert) {
-  uint8_t wire[65536 + 16u];
   char batch_id[128];
-  size_t wire_len = edr_behavior_record_alert_encode_durable_wire(record, alert, wire, sizeof(wire));
+  size_t wire_len = 0;
+  uint8_t *wire = edr_behavior_record_alloc_durable_wire(record, alert, &wire_len);
   if (wire_len == 0u ||
       !edr_behavior_durable_wire_batch_id("p0", wire, wire_len, batch_id, sizeof(batch_id))) {
+    free(wire);
     return 0;
   }
-  return enqueue_durable_p0_wire(batch_id, wire, wire_len,
-                                 EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);
+  int ok = enqueue_durable_p0_wire(batch_id, wire, wire_len,
+                                  EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);
+  free(wire);
+  return ok;
 }
 
 typedef struct CombinedEmitContext {
@@ -175,6 +223,7 @@ typedef struct CombinedEmitContext {
   EdrBehaviorRecordAlertPrepareFn prepare;
   void *prepare_context;
   const char *deferred_key;
+  const EdrCommandFacts *facts;
 } CombinedEmitContext;
 
 static int emit_record_alert_callback(void *context) {
@@ -182,13 +231,14 @@ static int emit_record_alert_callback(void *context) {
   if (!combined) return 0;
   if (combined->prepare && !combined->prepare(combined->prepare_context)) return 0;
   if (combined->deferred_key) {
-    uint8_t wire[65536u + 16u];
     char batch_id[128];
-    size_t n = edr_behavior_record_alert_encode_durable_wire(
-        combined->record, combined->alert, wire, sizeof(wire));
-    return n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id)) &&
+    size_t n = 0;
+    uint8_t *wire = edr_behavior_record_alloc_durable_wire_facts(combined->record, combined->alert, combined->facts, &n);
+    int ok = n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id)) &&
         edr_storage_queue_p0_deferred_complete(combined->deferred_key,
             batch_id, wire, n, "queue_accepted") == EDR_OK;
+    free(wire);
+    return ok;
   }
   return emit_record_alert_raw(combined->record, combined->alert);
 }
@@ -287,7 +337,7 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
 static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
     EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context,
-    const char *deferred_key) {
+    const char *deferred_key, const EdrCommandFacts *facts) {
   if (!record || !alert) {
     return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
   }
@@ -308,6 +358,7 @@ static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
   combined.prepare = prepare;
   combined.prepare_context = prepare_context;
   combined.deferred_key = deferred_key;
+  combined.facts = facts;
   governor_outcome = edr_alert_governor_admit_and_emit(
       alert, 0, emit_record_alert_callback, &combined, &decision);
   if (decision.emit_summary) {
@@ -327,6 +378,7 @@ static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
   (void)prepare;
   (void)prepare_context;
   (void)deferred_key;
+  (void)facts;
   return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
 #endif
 }
@@ -334,14 +386,14 @@ static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
 EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
     EdrBehaviorRecordAlertPrepareFn prepare, void *prepare_context) {
-  return emit_combined_outcome(record, alert, prepare, prepare_context, NULL);
+  return emit_combined_outcome(record, alert, prepare, prepare_context, NULL, NULL);
 }
 
 EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
     const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert,
-    const char *deferred_key) {
+    const char *deferred_key, const EdrCommandFacts *facts) {
   if (!deferred_key || !deferred_key[0]) return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
-  return emit_combined_outcome(record, alert, NULL, NULL, deferred_key);
+  return emit_combined_outcome(record, alert, NULL, NULL, deferred_key, facts);
 }
 
 int edr_behavior_record_alert_emit_to_batch_with_prepare(
@@ -359,19 +411,22 @@ int edr_behavior_record_alert_emit_to_batch(const EdrBehaviorRecord *record,
 
 int edr_behavior_record_emit_durable(const EdrBehaviorRecord *record) {
 #ifdef EDR_HAVE_NANOPB
-  uint8_t wire[65536 + 16u];
   char batch_id[128];
   if (!record || !edr_p0_source_only_validate_record(record)) {
     return 0;
   }
-  size_t wire_len = edr_behavior_record_encode_durable_wire(record, wire, sizeof(wire));
+  size_t wire_len = 0;
+  uint8_t *wire = edr_behavior_record_alloc_durable_wire(record, NULL, &wire_len);
   if (wire_len == 0u ||
       !edr_behavior_durable_wire_batch_id("p0-source", wire, wire_len,
                                           batch_id, sizeof(batch_id))) {
+    free(wire);
     return 0;
   }
-  return enqueue_durable_p0_wire(batch_id, wire, wire_len,
-                                 EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY);
+  int ok = enqueue_durable_p0_wire(batch_id, wire, wire_len,
+                                  EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY);
+  free(wire);
+  return ok;
 #else
   (void)record;
   return 0;

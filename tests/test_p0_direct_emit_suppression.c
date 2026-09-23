@@ -137,7 +137,9 @@ static const char *g_bundle_sha256 = "0123456789abcdef0123456789abcdef0123456789
 static AVEBehaviorAlert g_last_alert;
 static EdrBehaviorRecord g_last_record;
 EdrBehaviorRecordAlertEmitOutcome edr_behavior_record_alert_emit_deferred(
-    const EdrBehaviorRecord *record,const AVEBehaviorAlert *alert,const char *key) {
+    const EdrBehaviorRecord *record,const AVEBehaviorAlert *alert,const char *key,
+    const EdrCommandFacts *facts) {
+  (void)facts;
   if (!g_combined_emit_allowed || deferred_complete_fails)
     return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
   if (g_combined_emit_outcome != EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED) return g_combined_emit_outcome;
@@ -209,6 +211,20 @@ static size_t make_terminal_wire(uint8_t kind, uint8_t *wire, size_t wire_cap) {
   wire[12] = 4u; wire[13] = 0u; wire[14] = 0u; wire[15] = 0u;
   wire[16] = kind; wire[17] = 0u; wire[18] = 0xa5u; wire[19] = 0x5au;
   return 20u;
+}
+
+uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, size_t *length) {
+  uint8_t *wire = malloc(20u);
+  assert(wire);
+  *length = alert ? edr_behavior_record_alert_encode_durable_wire(record, alert, wire, 20u)
+                  : edr_behavior_record_encode_durable_wire(record, wire, 20u);
+  return wire;
+}
+uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  (void)facts;
+  return edr_behavior_record_alloc_durable_wire(record, alert, length);
 }
 
 size_t edr_behavior_record_encode_durable_wire(const EdrBehaviorRecord *record,

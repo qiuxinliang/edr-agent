@@ -703,6 +703,7 @@ else()
 endif()
 # 与 `edr_agent` 一致：`ave_behavior_pipeline` → `edr_behavior_alert_emit_to_batch` 的依赖链
 set(_edr_test_behavior_emit_sources
+  ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
@@ -771,6 +772,7 @@ edr_apply_test_warnings(test_behavior_record_alert_proto)
 add_test(NAME behavior_record_alert_proto_contract COMMAND test_behavior_record_alert_proto)
 
 add_executable(test_behavior_record_alert_emit
+  ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
   ${CMAKE_CURRENT_SOURCE_DIR}/test_behavior_record_alert_emit.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
@@ -794,6 +796,7 @@ if(EDR_PCRE2_AVAILABLE)
   # authority; registering a guaranteed-red test would falsely imply that the
   # stub can exercise a production P0 contract.
   add_executable(test_p0_source_only_durable_contract
+    ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_source_only_durable_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
@@ -1078,6 +1081,7 @@ edr_apply_test_warnings(test_pe_verify)
 add_test(NAME pe_verify COMMAND test_pe_verify WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
@@ -1178,6 +1182,34 @@ if(NOT MSVC)
 endif()
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+if(SQLite3_FOUND)
+  add_executable(test_command_fact_transport
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_command_fact_transport.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
+    ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+    ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
+    ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+    ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/src/core/time_util.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
+  target_link_libraries(test_command_fact_transport PRIVATE edr_ave_test_common)
+  edr_apply_test_warnings(test_command_fact_transport)
+  add_test(NAME command_fact_transport COMMAND test_command_fact_transport)
+endif()
 
 add_executable(test_deep_collector_manifest ${CMAKE_CURRENT_SOURCE_DIR}/test_deep_collector_manifest.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
@@ -1449,6 +1481,7 @@ add_test(NAME self_protect_heartbeat COMMAND test_self_protect_heartbeat WORKING
 
 # Release blocker: ordinary behavior-alert output must stay within the endpoint/rule SLO.
 add_executable(test_alert_governor_cardinality
+  ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
   ${CMAKE_CURRENT_SOURCE_DIR}/test_alert_governor_cardinality.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
   ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
