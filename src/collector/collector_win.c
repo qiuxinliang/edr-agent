@@ -60,6 +60,7 @@
 #define OpenProcess edr_network_test_open_process
 #define CloseHandle edr_network_test_close_handle
 #define GetProcessTimes edr_network_test_process_times
+#define WaitForSingleObject edr_network_test_wait_process
 #define edr_process_generation_query_live edr_network_test_query_generation
 #define edr_windows_process_image_path_utf8 edr_network_test_image_path
 #endif
@@ -4087,6 +4088,7 @@ static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
   EdrLiveProcessGeneration live;
   FILETIME created, exited, kernel, user;
   uint64_t created_at, exited_at;
+  DWORD process_state;
   char reason[64] = "network_actor_pid_unavailable";
   char path[EDR_BR_STR_LONG];
   const char *base;
@@ -4094,20 +4096,38 @@ static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
   if (!br) return 0;
   memset(&live, 0, sizeof(live));
   if (!br->pid) goto done;
-  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, br->pid);
+  process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, br->pid);
   if (!process) {
     snprintf(reason, sizeof(reason), "network_actor_open_failed");
     goto done;
   }
   if (!edr_process_generation_query_live(process, &live, reason, sizeof(reason))) goto done;
   if (live.pid != br->pid || !live.process_start_key ||
-      (br->process_start_key && br->process_start_key != live.process_start_key) ||
-      !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+      (br->process_start_key && br->process_start_key != live.process_start_key)) {
     snprintf(reason, sizeof(reason), "network_actor_generation_mismatch");
     goto done;
   }
+  /* ExitTime is undefined for a running process. Observe the same handle
+   * before querying times, so a signaled process has a defined exit bound.
+   * Do not use GetExitCodeProcess: a terminated process can return 259 too.
+   * Zero timeout never blocks the ETW consumer. If it exits after WAIT_TIMEOUT,
+   * identity still belongs to this handle; do not consume the undefined bound. */
+  process_state = WaitForSingleObject(process, 0u);
+  if (process_state != WAIT_OBJECT_0 && process_state != WAIT_TIMEOUT) {
+    snprintf(reason, sizeof(reason), "network_actor_state_unavailable");
+    goto done;
+  }
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    snprintf(reason, sizeof(reason), "network_actor_times_unavailable");
+    goto done;
+  }
   created_at = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
-  exited_at = ((uint64_t)exited.dwHighDateTime << 32u) | exited.dwLowDateTime;
+  exited_at = process_state == WAIT_OBJECT_0
+      ? ((uint64_t)exited.dwHighDateTime << 32u) | exited.dwLowDateTime : 0u;
+  if (process_state == WAIT_OBJECT_0 && (!exited_at || exited_at < created_at)) {
+    snprintf(reason, sizeof(reason), "network_actor_times_unavailable");
+    goto done;
+  }
   if (created_at != live.creation_filetime_100ns ||
       (br->process_creation_filetime_100ns &&
        br->process_creation_filetime_100ns != created_at) ||

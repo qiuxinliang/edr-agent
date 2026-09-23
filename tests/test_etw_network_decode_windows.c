@@ -268,7 +268,9 @@ static EdrLiveProcessGeneration live_actor;
 static const char *actor_path;
 static uint64_t os_birth, os_exit;
 static unsigned opens, closes, image_queries;
-static int deny_open, deny_image;
+static int deny_open, deny_image, deny_times;
+static DWORD actor_state;
+static unsigned state_queries, time_queries;
 static int use_real_process_io;
 static const uint32_t actor_pid = 9840u;
 static const uint64_t event_ns = 1700000000000000000ULL;
@@ -281,7 +283,7 @@ bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
 }
 HANDLE WINAPI edr_network_test_open_process(DWORD access, BOOL inherit, DWORD pid) {
   if (use_real_process_io) return OpenProcess(access, inherit, pid);
-  assert(access == PROCESS_QUERY_LIMITED_INFORMATION && !inherit && pid == actor_pid);
+  assert(access == (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) && !inherit && pid == actor_pid);
   ++opens;
   return deny_open ? NULL : (HANDLE)&live_actor;
 }
@@ -291,6 +293,12 @@ BOOL WINAPI edr_network_test_close_handle(HANDLE process) {
   ++closes;
   return TRUE;
 }
+DWORD WINAPI edr_network_test_wait_process(HANDLE process, DWORD milliseconds) {
+  if (use_real_process_io) return WaitForSingleObject(process, milliseconds);
+  assert(process == (HANDLE)&live_actor && milliseconds == 0u);
+  ++state_queries;
+  return actor_state;
+}
 static void set_filetime(LPFILETIME out, uint64_t value) {
   out->dwHighDateTime = (DWORD)(value >> 32u);
   out->dwLowDateTime = (DWORD)value;
@@ -299,6 +307,9 @@ BOOL WINAPI edr_network_test_process_times(HANDLE process, LPFILETIME created,
                                           LPFILETIME exited, LPFILETIME kernel, LPFILETIME user) {
   if (use_real_process_io) return GetProcessTimes(process, created, exited, kernel, user);
   assert(process == (HANDLE)&live_actor);
+  assert(state_queries == 1u); /* State must precede potentially undefined ExitTime. */
+  ++time_queries;
+  if (deny_times) return FALSE;
   set_filetime(created, os_birth); set_filetime(exited, os_exit);
   set_filetime(kernel, 0u); set_filetime(user, 0u);
   return TRUE;
@@ -326,8 +337,9 @@ static EVENT_RECORD network_case(const char *name, uint16_t port) {
   fprintf(stderr, "[collector-network] %s\n", name);
   memset(&bus, 0, sizeof(bus));
   edr_collector_network_test_reset(&bus);
-  opens = closes = image_queries = 0u;
-  deny_open = deny_image = 0;
+  opens = closes = image_queries = state_queries = time_queries = 0u;
+  deny_open = deny_image = deny_times = 0;
+  actor_state = WAIT_TIMEOUT;
   live_actor.pid = actor_pid;
   live_actor.process_start_key = 0x12345678u;
   live_actor.creation_filetime_100ns = 116444736000000000ULL + event_ns / 100u - 10000000u;
@@ -393,6 +405,27 @@ static void test_collector_network_admission(void) {
   assert(decoded.net_dport == 54760u && !strcmp(decoded.net_dst, "127.0.0.1"));
   assert(opens == 1u && image_queries == 1u);
 
+  record = network_case("running actor with undefined nonzero exit time", 54760u);
+  /* GetProcessTimes does not define ExitTime until the process has exited. */
+  os_exit = 116444736000000000ULL + event_ns / 100u - 1u;
+  feed_network(&record, event_ns, 1u);
+  assert(state_queries == 1u && time_queries == 1u && image_queries == 1u);
+
+  record = network_case("process state query fails closed", 54760u);
+  actor_state = WAIT_FAILED;
+  feed_network(&record, event_ns, 0u);
+  assert(state_queries == 1u && time_queries == 0u && image_queries == 0u);
+  record = network_case("interesting port survives unavailable process state", 445u);
+  actor_state = WAIT_FAILED;
+  feed_network(&record, event_ns, 1u);
+  edr_behavior_from_slot(&bus.last, &decoded);
+  assert(!decoded.process_start_key && !decoded.exe_path[0]);
+  assert(!strcmp(decoded.process_generation_source, "network_actor_state_unavailable"));
+  record = network_case("process time query fails closed", 54760u);
+  deny_times = 1;
+  feed_network(&record, event_ns, 0u);
+  assert(image_queries == 0u);
+
   record = network_case("uninteresting process remains filtered", 54760u);
   actor_path = "C:\\Windows\\System32\\notepad.exe";
   feed_network(&record, event_ns, 0u);
@@ -415,10 +448,23 @@ static void test_collector_network_admission(void) {
    * a missing source time must not become authority to bind a current PID. */
   feed_network(&record, 0u, 0u);
   record = network_case("exited after source event still uses same handle", 54760u);
+  actor_state = WAIT_OBJECT_0;
   os_exit = 116444736000000000ULL + event_ns / 100u + 1u;
   feed_network(&record, event_ns, 1u);
   record = network_case("event after process exit", 54760u);
+  actor_state = WAIT_OBJECT_0;
   os_exit = 116444736000000000ULL + event_ns / 100u - 1u;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("event at process exit", 54760u);
+  actor_state = WAIT_OBJECT_0;
+  os_exit = 116444736000000000ULL + event_ns / 100u;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("exited process without valid exit time", 54760u);
+  actor_state = WAIT_OBJECT_0;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("exit time predates birth", 54760u);
+  actor_state = WAIT_OBJECT_0;
+  os_exit = os_birth - 1u;
   feed_network(&record, event_ns, 0u);
   record = network_case("process unavailable is not ordinary", 54760u);
   deny_open = 1;
@@ -485,11 +531,20 @@ static void test_real_same_handle_actor_binding(void) {
   br->type = EDR_EVENT_NET_CONNECT;
   br->pid = GetCurrentProcessId();
   FILETIME observed;
-  GetSystemTimeAsFileTime(&observed);
+  /* Match the collector's clock; do not compare a coarse wall-clock sample
+   * against an exact process creation timestamp. No lifetime slack is added. */
+  GetSystemTimePreciseAsFileTime(&observed);
   uint64_t now_filetime = ((uint64_t)observed.dwHighDateTime << 32u) | observed.dwLowDateTime;
   br->event_time_ns = (int64_t)((now_filetime - 116444736000000000ULL) * 100u);
   use_real_process_io = 1;
-  assert(edr_collector_network_test_bind_actor(br));
+  int bound = edr_collector_network_test_bind_actor(br);
+  if (!bound) {
+    fprintf(stderr, "[collector-network] real binding failed: reason=%s pid=%lu event_ns=%llu creation_filetime=%llu\n",
+            br->process_generation_source, (unsigned long)br->pid,
+            (unsigned long long)br->event_time_ns,
+            (unsigned long long)(((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime));
+  }
+  assert(bound);
   assert(br->process_start_key && br->process_creation_filetime_100ns ==
       (((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime));
   assert(!strcmp(br->exe_path, executable));
