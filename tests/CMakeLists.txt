@@ -1206,7 +1206,6 @@ if(SQLite3_FOUND)
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
-  target_link_libraries(test_command_fact_transport PRIVATE edr_ave_test_common)
   if(EDR_PCRE2_AVAILABLE)
     target_sources(test_command_fact_transport PRIVATE
       ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
@@ -1214,6 +1213,9 @@ if(SQLite3_FOUND)
     target_compile_definitions(test_command_fact_transport PRIVATE EDR_P0_TEST_REAL_IR=1)
     target_link_libraries(test_command_fact_transport PRIVATE ${EDR_PCRE2_TARGET})
   endif()
+  # Append SQLite's shared include prefix after the verified static matcher;
+  # its dynamic pcre2.h hardcodes static mode off despite PCRE2_STATIC.
+  target_link_libraries(test_command_fact_transport PRIVATE edr_ave_test_common)
   edr_apply_test_warnings(test_command_fact_transport)
   add_test(NAME command_fact_transport COMMAND test_command_fact_transport)
   if(EDR_PCRE2_AVAILABLE)

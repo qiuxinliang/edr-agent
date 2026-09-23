@@ -265,10 +265,16 @@ class PCRE2CMakeGateTests(unittest.TestCase):
         common_start = tests_source.index("add_library(edr_ave_test_common INTERFACE)")
         common_end = tests_source.index("target_link_libraries(test_ave_fp", common_start)
         common = tests_source[common_start:common_end]
-        targets = (
-            "test_p0_source_only_durable_contract", "test_p0_rule_ir_record_golden",
-            "test_p0_candidate_replay", "test_p0_validation_matrix",
-        )
+        # Discover matcher consumers from their sources so a new target cannot
+        # silently miss this check. Include platform/optional targets: only
+        # their header/archive dependency order is compiled by this fixture.
+        targets = tuple(dict.fromkeys(
+            match[1] for match in re.finditer(
+                r'(?:add_executable|target_sources)\(\s*(\w+)\s+([^)]*)\)', tests_source)
+            if "${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}" in match[2]
+            or re.search(r'/p0_rule_ir\.c(?:\s|$)', match[2])
+        ))
+        self.assertIn("test_command_fact_transport", targets)
         with tempfile.TemporaryDirectory(prefix="edr-pcre2-header-") as directory:
             source = Path(directory)
             for prefix in ("static", "dynamic"):
@@ -297,11 +303,20 @@ class PCRE2CMakeGateTests(unittest.TestCase):
                 'set(SQLite3_FOUND TRUE)', 'add_library(SQLite3::SQLite3 INTERFACE IMPORTED)',
                 'set_target_properties(SQLite3::SQLite3 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/dynamic/include")',
                 'add_library(Threads::Threads INTERFACE IMPORTED)', common,
+                'add_library(OpenSSL::Crypto INTERFACE IMPORTED)',
+                'set_target_properties(OpenSSL::Crypto PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/dynamic/include")',
+                # Native Windows dependencies have no role in the header probe.
+                'add_library(tdh INTERFACE)', 'add_library(advapi32 INTERFACE)',
+                'add_library(wevtapi INTERFACE)',
             ]
             for target in targets:
-                link = re.search(rf'target_link_libraries\({target} PRIVATE[^)]*\)', tests_source)
-                self.assertIsNotNone(link, target)
-                lines += [f'add_executable({target} probe.c)', link[0],
+                # Preserve every link declaration in source order. Select the
+                # verified-target branch, not the legacy raw-library fallback.
+                links = [match[0] for match in re.finditer(
+                    rf'target_link_libraries\(\s*{re.escape(target)}\s+PRIVATE\b[^)]*\)',
+                    tests_source) if "${EDR_PCRE2_LIBRARY}" not in match[0]]
+                self.assertTrue(links, target)
+                lines += [f'add_executable({target} probe.c)', *links,
                           f'add_test(NAME {target} COMMAND {target})']
             lines += [
                 'add_executable(header_collision_control EXCLUDE_FROM_ALL probe.c)',
