@@ -53,7 +53,7 @@ int main(void) {
   hard_quality = strstr(source, "int source_only = edr_p0_rule_process_create_hard_reject(&br);");
   fact_resolve = hard_quality ? strstr(hard_quality, "edr_local_evidence_cache_resolve_commands(") : NULL;
   fact_match = fact_resolve ? strstr(fact_resolve,
-      "p0_process_create_matches_complete_fact(&br, &command_facts)") : NULL;
+      "edr_p0_rule_ir_evaluate_record(&br, &command_facts, &evaluation)") : NULL;
   source_only_gate = fact_match ? strstr(fact_match,
       "edr_p0_rule_emit_pre_evaluation_gate(&br, not_evaluable_reason)") : NULL;
   fact_handoff = source_only_gate ? strstr(source_only_gate,

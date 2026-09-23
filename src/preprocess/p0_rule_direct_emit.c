@@ -1058,8 +1058,7 @@ int edr_p0_rule_process_create_hard_reject(const EdrBehaviorRecord *br) {
   return p0_ends_with_ci(name, ".dll") || p0_ends_with_ci(name, ".sys");
 }
 
-static int p0_valid_process_create_record(const EdrBehaviorRecord *br,
-                                          const EdrCommandFacts *retained_facts) {
+static int p0_valid_process_create_record(const EdrBehaviorRecord *br) {
   if (!br) return 1;
   /* A bare TRUNCATED status or overflowed field list has no safe dependency
    * projection. Named preview omissions are checked against each predicate
@@ -1100,35 +1099,9 @@ static int p0_valid_process_create_record(const EdrBehaviorRecord *br,
 #endif
     return 1;
   }
-  if (br->type != EDR_EVENT_PROCESS_CREATE) {
-    return 1;
-  }
-#if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
-  /* The authenticated IR is the authority for predicate completeness.  A
-   * short-lived process may exit before optional user/parent/cmd enrichment
-   * completes; if the active rule already matched without those fields, keep
-   * the detection and declare the missing evidence instead of suppressing it.
-   * This never authorizes enforcement, whose generation/file-identity gates
-   * are checked separately below the matcher. */
-  if ((br->image_path_raw[0] && strcmp(br->image_path_resolution_status, "RESOLVED") != 0) ||
-      !br->process_name[0] || !br->exe_path[0] || !br->cmdline[0] || br->ppid == 0u ||
-      !br->parent_path[0] || !br->parent_creation_time[0] ||
-      (!br->username[0] && !br->user_sid[0])) {
-    EdrP0RuleIrEvaluation evaluation;
-    int complete_rule_match = 0;
-    if (edr_p0_rule_ir_is_ready() &&
-        edr_p0_rule_ir_evaluate_record(br, retained_facts, &evaluation)) {
-      complete_rule_match = evaluation.match_count > 0u;
-      edr_p0_rule_ir_evaluation_free(&evaluation);
-    }
-    /* The pipeline's durable source-only gate is the owner for records with
-     * missing optional evidence but no complete-rule match. Direct callers
-     * remain fail-closed at this same boundary. */
-    if (!complete_rule_match) return 0;
-  }
-#else
-  (void)retained_facts;
-#endif
+  /* Optional evidence is checked by the single authoritative IR evaluation
+   * below. An unavailable evaluator is a capability/retry condition, never
+   * proof that this record (or its retained snapshot) is invalid. */
   return 1;
 }
 
@@ -4000,7 +3973,7 @@ int edr_p0_rule_poll_deferred_match(void) {
         delivery_gate),"retry_delivery_gate");
     goto replay_done;
   }
-  if (!p0_valid_process_create_record(record, &facts)) {
+  if (!p0_valid_process_create_record(record)) {
     p0_deferred_storage_result(edr_storage_queue_p0_deferred_fail(key,
         "retained_evidence_invalid"),"fail_evidence");
     goto replay_done;
@@ -4079,8 +4052,8 @@ static int p0_is_ruleset_evaluation_event(EdrEventType type) {
   }
 }
 
-static int emit_ruleset_evaluation_gate(const EdrBehaviorRecord *br,
-                                        const char *reason) {
+int edr_p0_rule_emit_ruleset_evaluation_gate(const EdrBehaviorRecord *br,
+                                            const char *reason) {
   EdrBehaviorRecord evidence;
   if (!br || !reason || !reason[0]) return 0;
   if (!p0_build_source_only_ruleset_evaluation_record(br, reason, &evidence)) return 0;
@@ -4154,13 +4127,13 @@ int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
    * authority was unavailable. */
   if (p0_is_ruleset_evaluation_event(br->type) && !edr_p0_rule_ir_is_ready()) {
     edr_p0_rule_observe_validation_stage(br, "ruleset", "p0_ir_not_ready");
-    (void)emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
+    (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
     return 0;
   }
 
   /* This entry only borrows the caller's one generation-bound fact snapshot.
    * An empty fact is an unavailable predicate, never a reason to re-read. */
-  if (!p0_valid_process_create_record(br, provided_facts)) {
+  if (!p0_valid_process_create_record(br)) {
     edr_p0_rule_observe_validation_stage(br, "precondition", "invalid_process_create");
     static uint64_t s_invalid_process_create;
     s_invalid_process_create++;
@@ -4313,11 +4286,11 @@ int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
      * it intentionally has no rule/bundle/action claim. */
     if (p0_is_ruleset_evaluation_event(br->type) && edr_p0_rule_ir_is_ready()) {
       edr_p0_rule_observe_validation_stage(br, "matcher", "p0_ir_evaluation_unavailable");
-      (void)emit_ruleset_evaluation_gate(br, "p0_ir_evaluation_unavailable");
+      (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_evaluation_unavailable");
       return 0;
     }
     if (p0_is_ruleset_evaluation_event(br->type)) {
-      (void)emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
+      (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
       return 0;
     }
   }

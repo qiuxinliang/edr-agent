@@ -756,8 +756,40 @@ static void test_windows_process_admission_uses_rule_predicates(void) {
    * This also catches a disagreement between the two fake IR query APIs. */
   snprintf(r.process_name, sizeof(r.process_name), "%s", "dedup-test.exe");
   assert(edr_p0_rule_try_emit(&r) == 1);
-  assert(atomic_load(&g_ir_evaluation_calls) == 3);
+  assert(atomic_load(&g_ir_evaluation_calls) == 2);
   assert(g_emit_count == 1 && g_durable_count == 0);
+}
+
+static void test_windows_optional_gap_evaluation_failure_preserves_source(void) {
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  edr_p0_rule_source_only_set_runtime_identity("tenant_default", "ep-local");
+  g_ir_ready = g_combined_emit_allowed = g_durable_emit_allowed = 1;
+  g_source_latch = g_source_ack = 0;
+  atomic_store(&g_emit_count, 0);
+  atomic_store(&g_durable_count, 0);
+  atomic_store(&g_ir_evaluation_calls, 0);
+  int actions_before = atomic_load(&g_enforcement_side_effects);
+  init_complete_process_record(&r, "dedup-test.exe");
+  strcpy(r.event_id, "optional-gap-evaluation-unavailable");
+  r.parent_path[0] = '\0';
+  assert(!edr_p0_rule_process_create_hard_reject(&r));
+  g_ir_evaluation_available = 0;
+  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(g_emit_count == 0 && g_durable_count == 1);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  assert(atomic_load(&g_enforcement_side_effects) == actions_before);
+  assert(strstr(g_last_record.detection_context,
+                "\"reason\":\"p0_ir_evaluation_unavailable\"") != NULL);
+  assert(!edr_p0_rule_source_only_capability_healthy_for_event(r.type, NULL, 0u));
+  g_ir_evaluation_available = 1;
+  g_source_ack = 1;
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(g_emit_count == 1 && !strcmp(g_last_record.event_id, r.event_id));
+  assert(atomic_load(&g_ir_evaluation_calls) == 2);
 }
 
 static void test_windows_full_command_match_survives_optional_gap(void) {
@@ -779,7 +811,7 @@ static void test_windows_full_command_match_survives_optional_gap(void) {
   assert(!edr_p0_rule_ir_br_matches_any(&r));
   assert(edr_p0_rule_try_emit(&r) == 1);
   assert(atomic_load(&g_emit_count) == 1);
-  assert(atomic_load(&g_ir_evaluation_calls) == 2);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
   assert(!strcmp(g_last_record.event_id, r.event_id));
   before = atomic_load(&g_ir_evaluation_calls);
   strcpy(r.event_id, "full-command-wrong-generation");
@@ -838,21 +870,34 @@ static void test_windows_command_fact_is_one_admission_snapshot(void) {
   assert(edr_p0_rule_try_emit(&r) == 0);
   assert(edr_test_stub_command_fact_resolve_count() == 1);
   assert(deferred_count == 1u);
-  assert(edr_p0_deferred_snapshot_decode_facts(
-      (const char *)deferred_rows[0].payload, deferred_rows[0].length,
-      &restored, &binding, rule, sizeof(rule), &recovered));
-  assert(recovered.subject && !strcmp(recovered.subject, full));
-  free(recovered.subject); free(recovered.parent);
   deferred_contains_fails = 0;
   edr_test_set_stub_command_fact(NULL);
   edr_test_set_stub_command_fact_fail_after(0);
   g_source_ack = 1;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   edr_p0_rule_test_set_monotonic_ms(6000u);
+  /* The same optional gap requires an authoritative IR evaluation on replay.
+   * Temporary evaluator loss cannot terminally invalidate retained evidence. */
+  g_ir_evaluation_available = 0;
+  atomic_store(&g_ir_evaluation_calls, 0);
+  assert(edr_p0_rule_poll_deferred_match() == 0);
+  assert(deferred_retries == 1u && deferred_rows[0].state == 0);
+  assert(deferred_completions == 0u && atomic_load(&g_emit_count) == 1);
+  assert(edr_test_stub_command_fact_resolve_count() == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 1);
+  assert(edr_p0_deferred_snapshot_decode_facts(
+      (const char *)deferred_rows[0].payload, deferred_rows[0].length,
+      &restored, &binding, rule, sizeof(rule), &recovered));
+  assert(recovered.subject && !strcmp(recovered.subject, full));
+  assert(!strcmp(restored.event_id, r.event_id) && !restored.parent_path[0]);
+  free(recovered.subject); free(recovered.parent);
+  g_ir_evaluation_available = 1;
+  edr_p0_rule_test_set_monotonic_ms(6100u);
   assert(edr_p0_rule_poll_deferred_match() == 1);
   assert(deferred_completions == 1u);
   assert(atomic_load(&g_emit_count) == 2);
   assert(edr_test_stub_command_fact_resolve_count() == 0);
+  assert(atomic_load(&g_ir_evaluation_calls) == 2);
   deferred_fake_reset();
   edr_test_set_stub_command_fact_fail_after(-1);
   edr_test_set_stub_command_fact(NULL);
@@ -3065,15 +3110,6 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
 #endif
 
 int main(void) {
-#ifdef EDR_P0_WINDOWS_ADMISSION_TEST
-  test_windows_process_admission_uses_rule_predicates();
-  test_windows_full_command_match_survives_optional_gap();
-  test_windows_command_fact_is_one_admission_snapshot();
-  test_windows_pipeline_handoff_borrows_matched_fact();
-  test_windows_pipeline_and_emitter_share_process_hard_gate();
-  test_windows_file_read_admission_requires_bound_evidence();
-  return 0;
-#endif
   test_internal_markers_do_not_skip_p0();
   test_self_noise_requires_exact_live_owner();
   test_internal_marker_without_process_name_survives_deferred_replay();
@@ -3098,6 +3134,11 @@ int main(void) {
   test_searchprotocolhost_no_cmdline_user_path_not_suppressed();
 #if defined(_WIN32) || defined(EDR_P0_WINDOWS_ADMISSION_TEST)
   test_windows_process_admission_uses_rule_predicates();
+  test_windows_optional_gap_evaluation_failure_preserves_source();
+  test_windows_full_command_match_survives_optional_gap();
+  test_windows_command_fact_is_one_admission_snapshot();
+  test_windows_pipeline_handoff_borrows_matched_fact();
+  test_windows_pipeline_and_emitter_share_process_hard_gate();
   test_windows_file_read_admission_requires_bound_evidence();
 #endif
   test_real_p0_dedup_metric_matrix();

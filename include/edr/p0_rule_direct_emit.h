@@ -39,6 +39,11 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record);
 int edr_p0_rule_emit_pre_evaluation_gate(const EdrBehaviorRecord *record,
                                          const char *reason);
 
+/* Retain a ruleset evaluation failure through the existing bounded source-only
+ * owner. Does not evaluate again or claim rule/action authority. */
+int edr_p0_rule_emit_ruleset_evaluation_gate(const EdrBehaviorRecord *record,
+                                             const char *reason);
+
 /* Attempts one retained source-only durable record without creating a worker
  * or a second persistent queue.  A positive result copies the exactly
  * committed record to `committed_out`, so the collector can resume only after

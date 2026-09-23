@@ -549,8 +549,12 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
                              "-DCMAKE_BUILD_TYPE=Release")
             self.run_command("cmake", "--build", str(build), "--parallel", "2")
-            self.run_command("ctest", "--test-dir", str(build), "--output-on-failure",
-                             "--no-tests=error", "-R", "^p0_direct_emit_suppression$")
+            completed = self.run_command(
+                "ctest", "--test-dir", str(build), "--verbose", "--output-on-failure",
+                "--no-tests=error", "-R", "^p0_direct_emit_suppression$")
+            # The host probe must reach the same suite completion as native
+            # Windows, not return after only the admission-specific cases.
+            self.assertIn("test_p0_direct_emit_suppression: ok", completed.stdout)
 
     def test_file_read_consumer_lifecycle_gate_behavior(self):
         """Execute the production readiness predicate for every lifecycle combination.

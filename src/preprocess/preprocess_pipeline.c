@@ -1258,17 +1258,6 @@ static int p0_resource_throttle_proven_miss(const EdrBehaviorRecord *br) {
   return edr_p0_rule_ir_br_matches_any(br) ? 0 : 1;
 }
 
-static int p0_process_create_matches_complete_fact(const EdrBehaviorRecord *br,
-                                                    const EdrCommandFacts *facts) {
-  EdrP0RuleIrEvaluation evaluation;
-  int matched = 0;
-  if (edr_p0_rule_ir_evaluate_record(br, facts, &evaluation)) {
-    matched = evaluation.match_count > 0u;
-    edr_p0_rule_ir_evaluation_free(&evaluation);
-  }
-  return matched;
-}
-
 /* Collector evidence gates are an authority boundary, not ordinary telemetry:
  * once marked, they bypass rule matching, generic admission and enforcement.
  * The return value is intentionally ignored here because the common durable
@@ -1374,10 +1363,21 @@ static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *sl
     if (not_evaluable_reason && p0_process_create_candidate(&br)) {
       int source_only = edr_p0_rule_process_create_hard_reject(&br);
       if (!source_only) {
+        EdrP0RuleIrEvaluation evaluation;
         edr_local_evidence_cache_resolve_commands(
             &br, &command_facts.subject, &command_facts.parent);
         command_facts_resolved = 1;
-        source_only = !p0_process_create_matches_complete_fact(&br, &command_facts);
+        if (!edr_p0_rule_ir_evaluate_record(&br, &command_facts, &evaluation)) {
+          /* Failure is not a predicate miss or evidence invalidity. Preserve
+           * the source and report the first failure without evaluating again. */
+          edr_local_evidence_cache_record_behavior(&br);
+          (void)edr_p0_rule_emit_ruleset_evaluation_gate(
+              &br, edr_p0_rule_ir_is_ready() ? "p0_ir_evaluation_unavailable"
+                                           : "p0_ir_not_ready");
+          goto facts_cleanup;
+        }
+        source_only = evaluation.match_count == 0u;
+        edr_p0_rule_ir_evaluation_free(&evaluation);
       }
       if (source_only) {
         p0_mark_not_evaluable(&br, not_evaluable_reason);
