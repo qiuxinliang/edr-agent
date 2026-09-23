@@ -7,6 +7,8 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/windows_event_policy.h"
 #include "edr/windows_file_identity.h"
+#include "edr/network_admission_trace_win.h"
+#include "cJSON.h"
 
 #include <tdh.h>
 
@@ -272,11 +274,13 @@ static int deny_open, deny_image, deny_times;
 static DWORD actor_state;
 static unsigned state_queries, time_queries;
 static int use_real_process_io;
+static int reject_bus, fail_trace_write;
 static const uint32_t actor_pid = 9840u;
 static const uint64_t event_ns = 1700000000000000000ULL;
 
 bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
   assert(target == &bus && slot->type == EDR_EVENT_NET_CONNECT);
+  if (reject_bus) return false;
   bus.last = *slot;
   ++bus.published;
   return true;
@@ -285,7 +289,13 @@ HANDLE WINAPI edr_network_test_open_process(DWORD access, BOOL inherit, DWORD pi
   if (use_real_process_io) return OpenProcess(access, inherit, pid);
   assert(access == (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) && !inherit && pid == actor_pid);
   ++opens;
-  return deny_open ? NULL : (HANDLE)&live_actor;
+  if (deny_open) { SetLastError(ERROR_ACCESS_DENIED); return NULL; }
+  return (HANDLE)&live_actor;
+}
+BOOL WINAPI edr_network_test_write_file(HANDLE file, LPCVOID data, DWORD size,
+                                        LPDWORD written, LPOVERLAPPED overlapped) {
+  if (fail_trace_write) { *written = 0; SetLastError(ERROR_DISK_FULL); return FALSE; }
+  return WriteFile(file, data, size, written, overlapped);
 }
 BOOL WINAPI edr_network_test_close_handle(HANDLE process) {
   if (use_real_process_io) return CloseHandle(process);
@@ -341,6 +351,7 @@ static EVENT_RECORD network_case(const char *name, uint16_t port) {
   edr_collector_network_test_reset(&bus);
   opens = closes = image_queries = state_queries = time_queries = 0u;
   deny_open = deny_image = deny_times = 0;
+  reject_bus = 0;
   actor_state = WAIT_TIMEOUT;
   live_actor.pid = actor_pid;
   live_actor.process_start_key = 0x12345678u;
@@ -489,6 +500,217 @@ static void test_collector_network_admission(void) {
   feed_network(&record, event_ns, 1u);
 }
 
+static void trace_temp_path(char path[1024], WCHAR wide[1024]) {
+  WCHAR directory[1024];
+  DWORD n = GetTempPathW(1024u, directory);
+  assert(n && n < 1024u);
+  assert(GetTempFileNameW(directory, L"nta", 0, wide));
+  assert(DeleteFileW(wide)); /* our own empty reservation, never user data */
+  assert(WideCharToMultiByte(CP_UTF8, 0, wide, -1, path, 1024, NULL, NULL));
+}
+
+static cJSON *trace_line(FILE *file, const char *kind) {
+  char line[8192];
+  assert(fgets(line, sizeof(line), file));
+  cJSON *j = cJSON_Parse(line);
+  assert(j && cJSON_IsString(cJSON_GetObjectItemCaseSensitive(j, "kind")));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(j, "kind")->valuestring, kind));
+  return j;
+}
+
+static int trace_number(cJSON *j, const char *key) {
+  cJSON *v = cJSON_GetObjectItemCaseSensitive(j, key);
+  assert(cJSON_IsNumber(v));
+  return v->valueint;
+}
+
+static void trace_string(cJSON *j, const char *key, const char *expected) {
+  cJSON *v = cJSON_GetObjectItemCaseSensitive(j, key);
+  assert(cJSON_IsString(v) && !strcmp(v->valuestring, expected));
+}
+
+typedef struct { EVENT_RECORD record; EdrEventSlot slot; } TraceThreadInput;
+static void trace_begin_fixture(EdrNetworkAdmissionTrace *t, const EVENT_RECORD *record,
+                                 const EdrEventSlot *slot) {
+  EdrBehaviorRecord br;
+  edr_behavior_from_slot(slot, &br);
+  edr_network_trace_prepare(t, record, slot, NULL);
+  edr_network_trace_begin(t, &br);
+}
+static DWORD WINAPI trace_producer(void *arg) {
+  TraceThreadInput *input = (TraceThreadInput *)arg;
+  for (unsigned i = 0; i < 40u; ++i) {
+    EdrNetworkAdmissionTrace t;
+    trace_begin_fixture(&t, &input->record, &input->slot);
+    if (t.sequence) {
+      (void)edr_network_trace_admission(&t, 0, "concurrent_fixture");
+      edr_network_trace_finish(&t);
+    }
+  }
+  return 0;
+}
+
+static void test_network_admission_trace(void) {
+  char path[1024]; WCHAR wide[1024];
+  EVENT_RECORD record = network_case("diagnostic disabled baseline", 54760u);
+  feed_network(&record, event_ns, 1u);
+  EdrEventSlot baseline = bus.last;
+  trace_temp_path(path, wide);
+  assert(edr_network_trace_start(path, 54760u, EDR_NETWORK_TRACE_MAX_MS) == 1);
+  record = network_case("diagnostic must not change published bytes", 54760u);
+  feed_network(&record, event_ns, 1u);
+  assert(!memcmp(&baseline, &bus.last, sizeof(baseline)));
+  record = network_case("trace actor failure before interest drop", 54760u);
+  deny_open = 1;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("trace stale generation before interest drop", 54760u);
+  live_actor.creation_filetime_100ns = os_birth = 116444736000000000ULL + event_ns / 100u + 1u;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("trace admitted but bus rejects", 54760u);
+  reject_bus = 1;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("trace missing payload PID is not logger PID", 54760u);
+  find_property(L"PID")->status = ERROR_NOT_FOUND;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("trace does not broaden interest", 54760u);
+  actor_path = "C:\\Windows\\System32\\odd\"name.exe";
+  feed_network(&record, event_ns, 0u);
+  record = network_case("nonselected port excluded from diagnostic", 445u);
+  feed_network(&record, event_ns, 1u);
+  edr_network_trace_flush();
+  /* File is readable while collector is running; no shutdown/stderr required. */
+  FILE *file = _wfopen(wide, L"rb"); assert(file);
+  cJSON *j = trace_line(file, "session");
+  assert(trace_number(j, "destination_port") == 54760); cJSON_Delete(j);
+  j = trace_line(file, "event");
+  trace_string(j, "event_ns", "1700000000000000000");
+  trace_string(j, "input_start_key", "0");
+  trace_string(j, "process_start_key", "305419896");
+  trace_string(j, "actor_reason", "network_pid_event_time_live_telemetry");
+  assert(trace_number(j, "payload_pid") == (int)actor_pid && trace_number(j, "header_pid") == 4);
+  assert(trace_number(j, "src_port") == 54770 && trace_number(j, "dst_port") == 54760);
+  assert(trace_number(j, "actor_bound") == 1 && trace_number(j, "interest_admitted") == 1);
+  assert(trace_number(j, "identity_writeback") == 1 && trace_number(j, "collector_admitted") == 1);
+  assert(trace_number(j, "bus_published") == 1); cJSON_Delete(j);
+  j = trace_line(file, "event");
+  trace_string(j, "actor_reason", "network_actor_open_failed");
+  trace_string(j, "reason", "sensor_interest_rejected");
+  assert(trace_number(j, "actor_win32_error") == ERROR_ACCESS_DENIED);
+  assert(trace_number(j, "actor_bound") == 0 && trace_number(j, "interest_admitted") == 0);
+  assert(trace_number(j, "identity_writeback") == -1 && trace_number(j, "bus_published") == -1);
+  cJSON_Delete(j);
+  j = trace_line(file, "event");
+  trace_string(j, "actor_reason", "network_actor_event_time_mismatch"); cJSON_Delete(j);
+  j = trace_line(file, "event");
+  assert(trace_number(j, "collector_admitted") == 1 && trace_number(j, "bus_published") == 0);
+  cJSON_Delete(j);
+  j = trace_line(file, "event");
+  trace_string(j, "reason", "payload_pid_unavailable_or_mismatch");
+  assert(trace_number(j, "payload_pid") == 0 && trace_number(j, "actor_bound") == -1);
+  cJSON_Delete(j);
+  j = trace_line(file, "event");
+  trace_string(j, "process_name", "odd\"name.exe");
+  assert(trace_number(j, "collector_admitted") == 0); cJSON_Delete(j);
+  assert(fgetc(file) == EOF); fclose(file);
+  edr_network_trace_stop();
+  /* An existing investigation must never be overwritten, even on restart. */
+  assert(edr_network_trace_start(path, 54760u, 120000u) == -1);
+  file = _wfopen(wide, L"rb"); assert(file);
+  j = trace_line(file, "session"); cJSON_Delete(j);
+  for (unsigned i = 0; i < 6; ++i) { j = trace_line(file, "event"); cJSON_Delete(j); }
+  j = trace_line(file, "summary");
+  assert(trace_number(j, "selected") == 6 && trace_number(j, "written") == 6);
+  assert(trace_number(j, "diagnostic_contention_dropped") == 0 && trace_number(j, "write_error") == 0);
+  cJSON_Delete(j); assert(fgetc(file) == EOF); fclose(file); assert(DeleteFileW(wide));
+
+  /* The real memory/writer contract remains bounded without executing 130
+   * process queries or generating ETW/real network traffic. */
+  trace_temp_path(path, wide);
+  assert(edr_network_trace_start(path, 54760u, 120000u) == 1);
+  for (unsigned i = 0; i < EDR_NETWORK_TRACE_LIMIT + 2u; ++i) {
+    EdrNetworkAdmissionTrace t;
+    trace_begin_fixture(&t, &record, &baseline);
+    assert(t.sequence);
+    (void)edr_network_trace_admission(&t, 0, "fixture_decision");
+    edr_network_trace_finish(&t);
+  }
+  edr_network_trace_stop();
+  file = _wfopen(wide, L"rb"); assert(file);
+  j = trace_line(file, "session"); cJSON_Delete(j);
+  for (unsigned i = 0; i < EDR_NETWORK_TRACE_LIMIT; ++i) { j = trace_line(file, "event"); cJSON_Delete(j); }
+  j = trace_line(file, "summary");
+  assert(trace_number(j, "written") == EDR_NETWORK_TRACE_LIMIT);
+  assert(trace_number(j, "diagnostic_limit_dropped") == 2); cJSON_Delete(j);
+  assert(fgetc(file) == EOF && ftell(file) < 526000L); fclose(file); assert(DeleteFileW(wide));
+
+  trace_temp_path(path, wide);
+  assert(edr_network_trace_start(path, 54760u, 120000u) == 1);
+  TraceThreadInput input = {record, baseline};
+  HANDLE producers[4];
+  for (unsigned i = 0; i < 4u; ++i) {
+    producers[i] = CreateThread(NULL, 0, trace_producer, &input, 0, NULL);
+    assert(producers[i]);
+  }
+  DWORD wait_result;
+  uint64_t until = GetTickCount64() + 5000u;
+  do {
+    edr_network_trace_flush();
+    wait_result = WaitForMultipleObjects(4u, producers, TRUE, 1u);
+    assert(wait_result == WAIT_TIMEOUT || wait_result == WAIT_OBJECT_0);
+    assert(GetTickCount64() < until);
+  } while (wait_result == WAIT_TIMEOUT);
+  for (unsigned i = 0; i < 4u; ++i) assert(CloseHandle(producers[i]));
+  edr_network_trace_stop();
+  file = _wfopen(wide, L"rb"); assert(file);
+  j = trace_line(file, "session"); cJSON_Delete(j);
+  unsigned lines = 0u;
+  int seen[161] = {0};
+  for (;;) {
+    char line[8192]; assert(fgets(line, sizeof(line), file));
+    j = cJSON_Parse(line); assert(j);
+    if (!strcmp(cJSON_GetObjectItemCaseSensitive(j, "kind")->valuestring, "summary")) break;
+    trace_string(j, "reason", "concurrent_fixture");
+    int seq = atoi(cJSON_GetObjectItemCaseSensitive(j, "sequence")->valuestring);
+    assert(seq > 0 && seq <= 160 && !seen[seq]); seen[seq] = 1;
+    ++lines; cJSON_Delete(j);
+  }
+  assert(lines <= EDR_NETWORK_TRACE_LIMIT && trace_number(j, "selected") == 160);
+  assert(trace_number(j, "written") == (int)lines && trace_number(j, "inflight") == 0);
+  assert(trace_number(j, "written") + trace_number(j, "diagnostic_limit_dropped") +
+         trace_number(j, "diagnostic_contention_dropped") == 160);
+  cJSON_Delete(j); assert(fgetc(file) == EOF); fclose(file); assert(DeleteFileW(wide));
+
+  trace_temp_path(path, wide);
+  assert(edr_network_trace_start(path, 54760u, 1u) == 1);
+  Sleep(5u);
+  EdrNetworkAdmissionTrace t;
+  trace_begin_fixture(&t, &record, &baseline); assert(!t.sequence);
+  edr_network_trace_flush();
+  file = _wfopen(wide, L"rb"); assert(file);
+  j = trace_line(file, "session"); cJSON_Delete(j);
+  j = trace_line(file, "summary"); trace_string(j, "reason", "deadline");
+  assert(trace_number(j, "selected") == 0); cJSON_Delete(j);
+  fclose(file); assert(DeleteFileW(wide));
+
+  trace_temp_path(path, wide);
+  assert(edr_network_trace_start(path, 54760u, 120000u) == 1);
+  record = network_case("diagnostic disk failure never changes collection", 54760u);
+  feed_network(&record, event_ns, 1u);
+  fail_trace_write = 1;
+  edr_network_trace_flush();
+  record = network_case("collection survives disabled diagnostic writer", 54760u);
+  feed_network(&record, event_ns, 1u);
+  fail_trace_write = 0;
+  edr_network_trace_stop();
+  /* No fabricated success footer after a write failure. */
+  file = _wfopen(wide, L"rb"); assert(file);
+  j = trace_line(file, "session"); cJSON_Delete(j);
+  assert(fgetc(file) == EOF); fclose(file); assert(DeleteFileW(wide));
+  assert(edr_network_trace_start("relative.jsonl", 54760u, 120000u) == -1);
+  assert(edr_network_trace_start(NULL, 54760u, 120000u) == 0);
+  puts("Network admission trace: actual decision branches, readback, bounds and failures passed");
+}
+
 static void test_file_control_policy_preconditions(void) {
   static const char *paths[] = {
       "C:\\Windows\\Temp\\EDR-FILE-CONTROL\\A.txt",
@@ -619,6 +841,7 @@ int main(int argc, char **argv) {
   test_kernel_network_ipv6_text_unchanged();
   test_other_provider_host_order_and_text_ports();
   test_collector_network_admission();
+  test_network_admission_trace();
   test_file_control_policy_preconditions();
   test_self_noise_uses_immutable_actor_identity();
   test_real_same_handle_actor_binding();

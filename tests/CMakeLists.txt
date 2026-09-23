@@ -381,6 +381,7 @@ if(WIN32)
     ${CMAKE_CURRENT_SOURCE_DIR}/test_collector_file_read_windows.c
     ${CMAKE_CURRENT_SOURCE_DIR}/collector_file_read_stubs.c
     ${CMAKE_SOURCE_DIR}/src/collector/collector_win.c
+    ${CMAKE_SOURCE_DIR}/src/collector/network_admission_trace_win.c
     ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
@@ -388,9 +389,10 @@ if(WIN32)
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
     ${CMAKE_SOURCE_DIR}/src/core/time_util.c
-    ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
   target_include_directories(test_collector_file_read_windows PRIVATE
-    ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_collector_file_read_windows PRIVATE
     EDR_COLLECTOR_FILE_IO_TESTING=1)
   if(MSVC)
@@ -408,6 +410,7 @@ if(WIN32)
     ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c
     ${CMAKE_CURRENT_SOURCE_DIR}/collector_network_stubs.c
     ${CMAKE_SOURCE_DIR}/src/collector/collector_win.c
+    ${CMAKE_SOURCE_DIR}/src/collector/network_admission_trace_win.c
     ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c

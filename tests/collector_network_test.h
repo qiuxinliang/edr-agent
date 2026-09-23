@@ -25,4 +25,6 @@ BOOL WINAPI edr_network_test_process_times(HANDLE process, LPFILETIME created,
 int edr_network_test_query_generation(void *process, EdrLiveProcessGeneration *out,
                                        char *reason, size_t cap);
 int edr_network_test_image_path(void *process, char *out, size_t cap);
+BOOL WINAPI edr_network_test_write_file(HANDLE file, LPCVOID data, DWORD size,
+                                        LPDWORD written, LPOVERLAPPED overlapped);
 #endif

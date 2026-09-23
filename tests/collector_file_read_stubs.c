@@ -41,6 +41,7 @@ void edr_ave_etw_feed_from_event(EVENT_RECORD *record, EdrEventType type,
 int edr_policy_v2_ransomware_enabled(const char *control) { abort(); }
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { abort(); }
 int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *record) { abort(); }
+int edr_p0_rule_ir_is_ready(void) { abort(); }
 int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) { abort(); }
 int edr_p0_rule_ir_is_interesting_process_name(const char *name) { abort(); }
 int edr_adaptive_collection_should_admit_record(const EdrBehaviorRecord *record) { abort(); }

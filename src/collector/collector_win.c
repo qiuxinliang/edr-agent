@@ -23,6 +23,7 @@
 #include "edr/config.h"
 #include "edr/etw_guids_win.h"
 #include "edr/etw_observability_win.h"
+#include "edr/network_admission_trace_win.h"
 #include "edr/etw_tdh_win.h"
 #include "edr/edr_a44_split_path_win.h"
 #include "edr/event_bus.h"
@@ -326,7 +327,8 @@ typedef struct {
 static EdrEtwSemanticCacheEntry s_etw_semantic_cache[EDR_ETW_SEMANTIC_CACHE_SIZE];
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot,
-                                          EdrSensorInterestEvent *network_interest);
+                                          EdrSensorInterestEvent *network_interest,
+                                          EdrNetworkAdmissionTrace *trace);
 static int edr_collector_file_event_type(EdrEventType t);
 static int edr_collector_registry_event_type(EdrEventType t);
 static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
@@ -1143,7 +1145,7 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
   }
   edr_collector_debug_tdh_payload(slot, debug_tag);
   slot->priority = edr_priority_from_utf8_payload(slot->data, slot->size);
-  if (!edr_collector_should_admit_slot(slot, NULL)) {
+  if (!edr_collector_should_admit_slot(slot, NULL, NULL)) {
     s_health.collector_dropped++;
     return 0;
   }
@@ -3769,7 +3771,7 @@ static int edr_collector_known_low_value_file_record(const EdrBehaviorRecord *br
  * Resolve the payload PID using one process handle and the source event time,
  * before any predicate which requires a process name. Never query a name by
  * PID separately, or turn a delayed event into the current PID generation. */
-static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
+static int edr_collector_network_bind_actor(EdrBehaviorRecord *br, DWORD *native_error) {
   HANDLE process = NULL;
   EdrLiveProcessGeneration live;
   FILETIME created, exited, kernel, user;
@@ -3779,11 +3781,13 @@ static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
   char path[EDR_BR_STR_LONG];
   const char *base;
   int ok = 0;
+  if (native_error) *native_error = ERROR_SUCCESS;
   if (!br) return 0;
   memset(&live, 0, sizeof(live));
   if (!br->pid) goto done;
   process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, br->pid);
   if (!process) {
+    if (native_error) *native_error = GetLastError();
     snprintf(reason, sizeof(reason), "network_actor_open_failed");
     goto done;
   }
@@ -3800,10 +3804,12 @@ static int edr_collector_network_bind_actor(EdrBehaviorRecord *br) {
    * identity still belongs to this handle; do not consume the undefined bound. */
   process_state = WaitForSingleObject(process, 0u);
   if (process_state != WAIT_OBJECT_0 && process_state != WAIT_TIMEOUT) {
+    if (native_error && process_state == WAIT_FAILED) *native_error = GetLastError();
     snprintf(reason, sizeof(reason), "network_actor_state_unavailable");
     goto done;
   }
   if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    if (native_error) *native_error = GetLastError();
     snprintf(reason, sizeof(reason), "network_actor_times_unavailable");
     goto done;
   }
@@ -3864,23 +3870,27 @@ static int edr_collector_network_writeback_actor(EdrEventSlot *slot,
 }
 
 static int edr_collector_should_admit_slot(EdrEventSlot *slot,
-                                          EdrSensorInterestEvent *network_interest) {
+                                          EdrSensorInterestEvent *network_interest,
+                                          EdrNetworkAdmissionTrace *trace) {
   EdrBehaviorRecord br;
   int network_actor_bound = 0;
   if (!slot) {
     return 0;
   }
   if (edr_env_bool_default("EDR_COLLECTOR_ADMIT_ALL", 0)) {
-    return 1;
+    return edr_network_trace_admission(trace, 1, "admit_all_override");
   }
   edr_behavior_from_slot(slot, &br);
+  edr_network_trace_begin(trace, &br);
   if (network_interest) {
     /* An absent Kernel-Network payload PID cannot be replaced by the logger. */
     if (!network_interest->pid || br.pid != network_interest->pid) {
       s_health.metadata_dropped++;
-      return 0;
+      return edr_network_trace_admission(trace, 0, "payload_pid_unavailable_or_mismatch");
     }
-    network_actor_bound = edr_collector_network_bind_actor(&br);
+    DWORD actor_error = ERROR_SUCCESS;
+    network_actor_bound = edr_collector_network_bind_actor(&br, &actor_error);
+    edr_network_trace_actor(trace, &br, network_actor_bound, actor_error);
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
     /* A preceding Security 4688 observation may already hold target identity
@@ -3901,11 +3911,14 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
     edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
   }
   if (network_interest) {
+    edr_network_trace_identity(trace, &br);
     network_interest->process_start_key = br.process_start_key;
     edr_copy_trunc(network_interest->process_name, sizeof(network_interest->process_name), br.process_name);
     if (!network_interest->path[0] && br.cmdline[0])
       edr_copy_trunc(network_interest->path, sizeof(network_interest->path), br.cmdline);
-    if (!edr_sensor_interest_should_admit(network_interest)) {
+    int interest_admitted = edr_sensor_interest_should_admit(network_interest);
+    if (trace) trace->interest = interest_admitted;
+    if (!interest_admitted) {
       if (!network_actor_bound) {
         uint64_t count = ++s_health.process_start_key_missing_events;
         if (count <= 3u || (count & (count - 1u)) == 0u)
@@ -3913,20 +3926,23 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
                   br.pid, (long long)br.event_time_ns, br.net_dport,
                   (unsigned long long)count, br.process_generation_source);
       }
-      return 0;
+      return edr_network_trace_admission(trace, 0, "sensor_interest_rejected");
     }
     if (!edr_collector_network_writeback_actor(slot, &br, network_actor_bound) ||
         (br.cmdline[0] && edr_collector_slot_append_command(slot, &br) != EDR_SLOT_KV_APPENDED)) {
       s_health.metadata_dropped++;
-      return 0; /* A partial identity is never published or used downstream. */
+      if (trace) trace->writeback = 0;
+      /* A partial identity is never published or used downstream. */
+      return edr_network_trace_admission(trace, 0, "identity_writeback_incomplete");
     }
+    if (trace) trace->writeback = 1;
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE && edr_collector_valid_process_create_record(&br)) {
     edr_collector_pid_cache_update(&br);
   }
   if (edr_agent_self_suppress_record(&br)) {
     edr_agent_self_count_drop_source(EDR_AGENT_SELF_DROP_RECORD);
-    return 0;
+    return edr_network_trace_admission(trace, 0, "agent_self_identity");
   }
   if (slot->type == EDR_EVENT_FILE_READ) {
     /* Windows noise policy is intentionally downstream of the verified IR
@@ -4015,16 +4031,16 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
   }
   if (br.priority == 0u) {
     slot->priority = 0u;
-    return 1;
+    return edr_network_trace_admission(trace, 1, "priority_zero");
   }
   if (edr_p0_rule_ir_br_matches_any(&br)) {
     slot->priority = 0u;
     slot->p0_critical = 1u;
-    return 1;
+    return edr_network_trace_admission(trace, 1, "p0_rule_match");
   }
   if (edr_adaptive_collection_should_admit_record(&br)) {
     slot->priority = br.priority ? br.priority : 1u;
-    return 1;
+    return edr_network_trace_admission(trace, 1, "adaptive_collection");
   }
   if (slot->type == EDR_EVENT_PROCESS_CREATE) {
     if (!edr_collector_valid_process_create_record(&br)) {
@@ -4060,13 +4076,14 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
          edr_is_p0_network_port(br.net_dport) ||
          edr_collector_process_is_suspicious(&br) ||
          edr_network_dest_is_lateral_or_remote_admin(&br))) {
-      return 1;
+      return edr_network_trace_admission(trace, 1, "network_interest");
     }
     int keep = edr_env_bool_default("EDR_COLLECTOR_KEEP_ALL_NET", 0);
     if (!keep) {
       s_health.ordinary_network_dropped++;
     }
-    return keep;
+    return edr_network_trace_admission(trace, keep,
+        keep ? "keep_all_net_override" : "ordinary_network_filtered");
   }
   if (slot->type == EDR_EVENT_SCRIPT_POWERSHELL || slot->type == EDR_EVENT_SCRIPT_WMI ||
       slot->type == EDR_EVENT_NET_DNS_QUERY || slot->type == EDR_EVENT_NET_TLS_HANDSHAKE ||
@@ -4296,7 +4313,12 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     }
   }
 
-  if (!edr_collector_should_admit_slot(&slot, have_network_interest ? &interest_event : NULL)) {
+  EdrNetworkAdmissionTrace network_trace;
+  if (is_network) edr_network_trace_prepare(&network_trace, event_record, &slot,
+                                          have_network_interest ? &interest_event : NULL);
+  if (!edr_collector_should_admit_slot(&slot, have_network_interest ? &interest_event : NULL,
+                                       is_network ? &network_trace : NULL)) {
+    if (is_network) edr_network_trace_finish(&network_trace);
     s_health.collector_dropped++;
     return;
   }
@@ -4309,7 +4331,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                                 ave_dom[0] ? ave_dom : NULL);
   }
 
-  if (!edr_event_bus_try_push(s_bus, &slot)) {
+  int published = edr_event_bus_try_push(s_bus, &slot);
+  if (!published) {
     s_health.queue_dropped++;
     if (ty == EDR_EVENT_FILE_READ && slot.p0_critical) {
       /* The bus reserve protected this slot from ordinary flood.  If the P0
@@ -4323,6 +4346,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   } else if (ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
              ty == EDR_EVENT_REG_DELETE_KEY) {
     s_health.registry_events_admitted++;
+  }
+  if (is_network) {
+    network_trace.published = published;
+    edr_network_trace_finish(&network_trace);
   }
 }
 
@@ -4379,7 +4406,7 @@ void edr_collector_network_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
 
 void edr_collector_network_test_health(EdrCollectorHealth *out) { *out = s_health; }
 int edr_collector_network_test_bind_actor(EdrBehaviorRecord *record) {
-  return edr_collector_network_bind_actor(record);
+  return edr_collector_network_bind_actor(record, NULL);
 }
 void edr_collector_network_test_self_identity(const EdrLiveProcessGeneration *identity) {
   memset(&s_agent_self_identity, 0, sizeof(s_agent_self_identity));
@@ -4851,6 +4878,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
     (void)edr_collector_stop();
     return EDR_ERR_INTERNAL;
   }
+  edr_network_trace_start_from_env();
   s_consumer_thread =
       CreateThread(NULL, 0, edr_etw_consumer_thread, NULL, 0, &s_consumer_thread_id);
   if (!s_consumer_thread) {
@@ -4936,6 +4964,7 @@ int edr_collector_stop(void) {
   if (!edr_a44_split_path_stop()) {
     return 0;
   }
+  edr_network_trace_stop();
 
   if (s_consumer_thread) {
     CloseHandle(s_consumer_thread);
@@ -4974,6 +5003,7 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   if (!out_health) {
     return -1;
   }
+  edr_network_trace_flush();
   *out_health = s_health;
   edr_collector_file_read_metadata_gate_copy_health(out_health);
   /* Historical self-fuse fields stay zero for health-wire compatibility;
