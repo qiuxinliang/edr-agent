@@ -154,7 +154,9 @@ int main(void) {
 
   char *callback = slice_between(collector, "static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {",
                                  "static DWORD WINAPI edr_etw_consumer_thread(");
-  char *admission = slice_between(collector, "static int edr_collector_should_admit_slot(EdrEventSlot *slot) {",
+  char *admission = slice_between(collector,
+                                  "static int edr_collector_should_admit_slot(EdrEventSlot *slot,\n"
+                                  "                                          EdrSensorInterestEvent *network_interest) {",
                                   "static void edr_collector_decode_mapped_event(");
   char *decode = slice_between(collector,
                                "static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record,",

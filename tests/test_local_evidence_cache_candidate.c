@@ -4444,6 +4444,62 @@ static void test_retained_file_read_cached_actor(void) {
   free(r);
 }
 
+static void test_delayed_file_actor_with_exact_start_key(void) {
+  /* 3.2.519's short-reader sample had its source StartKey but reached the
+   * server about 34 seconds after the read. Reproduce the candidate cache
+   * mechanism, not the unobserved historical in-memory state: an entry is
+   * retained, yet PID/time lookup expires 30 seconds after exit. */
+  struct timespec ts;
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  const uint64_t now = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+  const uint64_t birth = now / 100u * 100u - EDR_PTC_EXIT_GRACE_NS - UINT64_C(10000000000);
+  const uint64_t creation = birth / 100u + UINT64_C(116444736000000000);
+  const uint64_t key = UINT64_C(15481123719090486);
+  const uint64_t read_time = birth + UINT64_C(6000000000);
+  const uint64_t exit_time = read_time + UINT64_C(2000000000);
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r));
+  ProcessTreeEntry snapshot;
+  assert(r != NULL);
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(1104u, 6464u, "reader.exe", "reader --marker",
+             "C:\\test\\reader.exe", "parent.exe", birth, key, creation) == 0);
+  assert(edr_pt_cache_mark_exit_generation(1104u, key, exit_time) == 0);
+  assert(edr_pt_cache_snapshot(1104u, &snapshot) == 0);
+  assert(snapshot.creation_filetime_100ns == creation);
+  assert(edr_pt_cache_snapshot_at(1104u, read_time, &snapshot) == -2);
+  assert(edr_pt_cache_snapshot_generation_at(1104u, 0u, read_time, &snapshot) == -1);
+  assert(snapshot.pid == 0u);
+  assert(edr_pt_cache_snapshot_generation_at(1104u, key, 0u, &snapshot) == -1);
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 1104u;
+  r->event_time_ns = (int64_t)read_time;
+  assert(p0_bind_file_read_cached_generation(r, key, 0u) == 1);
+  assert(r->process_creation_filetime_100ns == creation);
+  assert(r->file_actor_generation_validated);
+  assert(strcmp(r->cmdline, "reader --marker") == 0);
+
+  /* A current occupant cannot replace the actor of the delayed read. */
+  assert(edr_pt_cache_put_generation(1104u, 7000u, "replacement.exe", "replacement",
+             "C:\\test\\replacement.exe", "other.exe", birth + UINT64_C(9000000000),
+             key + 1u, creation + UINT64_C(90000000)) == 0);
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 1);
+  assert(r->ppid == 6464u && r->process_start_key == key);
+  assert(p0_bind_file_read_cached_generation(r, key + 1u, 0u) == 0);
+  assert(p0_bind_file_read_cached_generation(r, key, creation + 1u) == 0);
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  r->event_time_ns = (int64_t)(birth - 1u);
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 0);
+  r->event_time_ns = (int64_t)(exit_time + 1u);
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 0);
+  r->event_time_ns = 0;
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 0);
+  r->event_time_ns = (int64_t)read_time;
+  assert(edr_pt_cache_remove(1104u) == 0);
+  assert(p0_bind_file_read_cached_generation(r, key, creation) == 0);
+  edr_pt_cache_shutdown();
+  free(r);
+}
+
 static void command_preview_roundtrip(EdrBehaviorRecord *record, EdrBehaviorRecord *decoded,
                                       EdrEventSlot *slot, uint64_t key, uint64_t birth) {
   memset(slot, 0, sizeof(*slot));
@@ -4885,6 +4941,7 @@ static void test_legacy_command_quality_is_unknown_until_observed(void) {
 #endif
 
 int main(void) {
+  test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
   test_process_command_quality_survives_update_and_reopen();
   test_legacy_command_quality_is_unknown_until_observed();

@@ -38,12 +38,16 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
                                                       uint64_t source_creation) {
   ProcessTreeEntry snapshot;
   uint64_t event_unix_ns;
+  int snapshot_result;
   const char *name;
   if (!edr_behavior_has_process_actor(br) || br->type == EDR_EVENT_PROCESS_CREATE ||
       !br->pid || br->event_time_ns <= 0) return 0;
   event_unix_ns = (uint64_t)br->event_time_ns;
   memset(&snapshot, 0, sizeof(snapshot));
-  if (edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot) != 0 ||
+  snapshot_result = source_start_key
+      ? edr_pt_cache_snapshot_generation_at(br->pid, source_start_key, event_unix_ns, &snapshot)
+      : edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot);
+  if (snapshot_result != 0 ||
       !snapshot.process_start_key || !snapshot.creation_filetime_100ns ||
       !snapshot.start_time_ns || !snapshot.exe_path[0] ||
       (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) ||

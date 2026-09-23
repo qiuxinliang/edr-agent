@@ -96,6 +96,13 @@ int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out);
  */
 int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out);
 
+/* Select an already retained actor by its captured StartKey AND event-time
+ * lifetime. Unlike PID/time-only inference, exact-key evidence does not expire
+ * with wall-clock delay after exit. Does not extend retention or resurrect an
+ * evicted entry. Both key and event time must be nonzero; no PID-only fallback. */
+int edr_pt_cache_snapshot_generation_at(uint32_t pid, uint64_t process_start_key,
+                                        uint64_t event_time_ns, ProcessTreeEntry *out);
+
 /** 标记进程退出，保留短暂迟到告警宽限。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns);
 

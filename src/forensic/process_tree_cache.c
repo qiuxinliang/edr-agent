@@ -296,6 +296,7 @@ static int pt_entry_matches_event_time(const PTStoredEntry *entry,
  * event.  Old and new generations intentionally coexist: a delayed child
  * that predates PID reuse must see A, not the later B entry. */
 static const PTStoredEntry *pt_get_at_locked(uint32_t pid, uint64_t event_time_ns,
+                                             uint64_t process_start_key,
                                              int *out_had_pid) {
   const PTStoredEntry *best = NULL;
   uint64_t now_ns = pt_wall_ns();
@@ -304,7 +305,12 @@ static const PTStoredEntry *pt_get_at_locked(uint32_t pid, uint64_t event_time_n
     const PTStoredEntry *entry = &g_pt_table[i].entry;
     if (!g_pt_table[i].occupied || entry->pid != pid) continue;
     had_pid = 1;
-    if (!pt_entry_matches_event_time(entry, event_time_ns, now_ns)) continue;
+    if (process_start_key && entry->process_start_key != process_start_key) continue;
+    /* A delayed exact-key observation is not a fresh PID-only inference.
+     * Still validate birth/exit, but never discard its retained identity just
+     * because queue processing took longer than the inference grace period. */
+    if (!pt_entry_matches_event_time(entry, event_time_ns,
+                                      process_start_key ? 0u : now_ns)) continue;
     if (!best || entry->start_time_ns > best->start_time_ns ||
         (entry->start_time_ns == best->start_time_ns &&
          entry->last_seen_ns > best->last_seen_ns)) {
@@ -461,11 +467,12 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
 }
 
 static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
+                              uint64_t process_start_key,
                               bool validate_time, ProcessTreeEntry *out) {
   const PTStoredEntry *entry;
   int had_pid = 0;
   if (validate_time) {
-    entry = pt_get_at_locked(pid, event_time_ns, &had_pid);
+    entry = pt_get_at_locked(pid, event_time_ns, process_start_key, &had_pid);
   } else {
     entry = pt_get_latest_locked(pid);
     had_pid = entry != NULL;
@@ -499,7 +506,7 @@ static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
 int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out) {
   if (!out) return -1;
   pt_lock();
-  int rc = pt_snapshot_locked(pid, 0u, false, out);
+  int rc = pt_snapshot_locked(pid, 0u, 0u, false, out);
   pt_unlock();
   return rc;
 }
@@ -507,7 +514,20 @@ int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out) {
 int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out) {
   if (!out) return -1;
   pt_lock();
-  int rc = pt_snapshot_locked(pid, event_time_ns, true, out);
+  int rc = pt_snapshot_locked(pid, event_time_ns, 0u, true, out);
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_snapshot_generation_at(uint32_t pid, uint64_t process_start_key,
+                                        uint64_t event_time_ns, ProcessTreeEntry *out) {
+  if (!out) return -1;
+  if (!pid || !process_start_key || !event_time_ns) {
+    memset(out, 0, sizeof(*out));
+    return -1;
+  }
+  pt_lock();
+  int rc = pt_snapshot_locked(pid, event_time_ns, process_start_key, true, out);
   pt_unlock();
   return rc;
 }
@@ -589,7 +609,7 @@ static uint32_t pt_chain_depth_at_locked(uint32_t pid, uint64_t event_time_ns) {
   uint32_t depth = 0u;
   uint32_t cur = pid;
   for (int hop = 0; hop < 32; ++hop) {
-    const PTStoredEntry *entry = pt_get_at_locked(cur, event_time_ns, NULL);
+    const PTStoredEntry *entry = pt_get_at_locked(cur, event_time_ns, 0u, NULL);
     if (!entry || entry->ppid == 0u || entry->ppid == cur) {
       depth++;
       break;
@@ -618,14 +638,14 @@ static void pt_fill_record_locked(uint32_t pid, uint64_t event_time_ns,
   const PTStoredEntry *self;
   const PTStoredEntry *parent;
   const PTStoredEntry *grandparent;
-  self = use_event_time ? pt_get_at_locked(pid, event_time_ns, NULL)
+  self = use_event_time ? pt_get_at_locked(pid, event_time_ns, 0u, NULL)
                         : pt_get_latest_locked(pid);
   if (!self) return;
   if (self->ppid == 0u || self->ppid == pid) {
     if (out_chain_depth) *out_chain_depth = 1u;
     return;
   }
-  parent = use_event_time ? pt_get_at_locked(self->ppid, event_time_ns, NULL)
+  parent = use_event_time ? pt_get_at_locked(self->ppid, event_time_ns, 0u, NULL)
                           : pt_get_latest_locked(self->ppid);
   if (parent && parent_cmdline && pt_entry_cmdline(parent)[0] && pc_cap > 0u) {
     const char *value = pt_entry_cmdline(parent);
@@ -642,7 +662,7 @@ static void pt_fill_record_locked(uint32_t pid, uint64_t event_time_ns,
     if (out_chain_depth) *out_chain_depth = parent ? 2u : 1u;
     return;
   }
-  grandparent = use_event_time ? pt_get_at_locked(parent->ppid, event_time_ns, NULL)
+  grandparent = use_event_time ? pt_get_at_locked(parent->ppid, event_time_ns, 0u, NULL)
                                : pt_get_latest_locked(parent->ppid);
   if (grandparent) {
     if (out_grandparent_pid) *out_grandparent_pid = grandparent->pid;
