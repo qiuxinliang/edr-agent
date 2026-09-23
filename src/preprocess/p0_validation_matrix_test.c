@@ -448,9 +448,11 @@ int main(void) {
   failures += check_sensor_interest_raw_contract(getenv("EDR_SENSOR_INTEREST_PATH"));
   failures += check_sensor_interest_staged_replace(getenv("EDR_SENSOR_INTEREST_PATH"));
   failures += check_sensor_interest_ir_pair(getenv("EDR_SENSOR_INTEREST_PATH"));
-  if (sizeof(k_cases) / sizeof(k_cases[0]) != 519u) {
-    fprintf(stderr, "P0 matcher replay case count=%zu, want=519\n",
-            sizeof(k_cases) / sizeof(k_cases[0]));
+  int rule_count = edr_p0_rule_ir_rule_count();
+  const size_t case_count = sizeof(k_cases) / sizeof(k_cases[0]);
+  if (rule_count <= 0 || case_count != (size_t)rule_count * 3u) {
+    fprintf(stderr, "P0 matcher replay case count=%zu, want=%d active rules * 3\n",
+            case_count, rule_count);
     failures++;
   }
   for (i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); ++i) {
@@ -567,9 +569,30 @@ int main(void) {
       }
     }
   }
-  if (positives != 173 || missing != 173 || business_benign != 132 ||
-      rule_tuning_required != 25 || security_control != 10 || not_evaluable != 6 ||
-      sensor_dispatch_positives != 45) {
+  /* Coverage follows the active authority, not a stale historical 173-rule
+   * count. Every rule must retain its positive, missing-field and operational
+   * case; one duplicated rule cannot compensate for an uncovered new rule. */
+  for (int rule_index = 0; rule_index < rule_count; ++rule_index) {
+    const char *rule_id = NULL;
+    int positive_cases = 0, missing_cases = 0, other_cases = 0;
+    if (!edr_p0_rule_ir_rule_id_at(rule_index, &rule_id) || !rule_id) {
+      failures++;
+      continue;
+    }
+    for (size_t j = 0; j < case_count; ++j) {
+      if (strcmp(k_cases[j].rule_id, rule_id) != 0) continue;
+      if (strcmp(k_cases[j].case_kind, "POSITIVE_E2E") == 0) positive_cases++;
+      else if (strcmp(k_cases[j].case_kind, "MISSING_FIELD_REPLAY") == 0) missing_cases++;
+      else other_cases++;
+    }
+    if (positive_cases != 1 || missing_cases != 1 || other_cases != 1) {
+      fprintf(stderr, "%s: coverage must contain exactly one positive, missing-field and operational case\n", rule_id);
+      failures++;
+    }
+  }
+  if (positives != rule_count || missing != rule_count ||
+      (size_t)(positives + missing + business_benign + rule_tuning_required +
+               security_control + not_evaluable) != case_count) {
     fprintf(stderr, "coverage mismatch: positive=%d missing=%d business_benign=%d tuning=%d security=%d not_evaluable=%d sensor_dispatch=%d\n",
             positives, missing, business_benign, rule_tuning_required, security_control,
             not_evaluable, sensor_dispatch_positives);

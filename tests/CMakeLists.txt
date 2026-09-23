@@ -637,6 +637,7 @@ add_executable(test_ave_fp ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_fp.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_ave_fp PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/ave)
 set(_edr_test_ave_sdk_sources
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_sdk.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_suppression.c
   ${CMAKE_SOURCE_DIR}/src/ave/ave_rules_meta.c
@@ -867,6 +868,7 @@ add_executable(test_ave_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_ave_suppres
 target_link_libraries(test_ave_suppression PRIVATE edr_ave_test_common)
 
 add_executable(test_detection_decision ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_decision.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
@@ -875,6 +877,7 @@ edr_apply_test_warnings(test_detection_decision)
 add_test(NAME detection_decision_combo COMMAND test_detection_decision WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_detection_regression ${CMAKE_CURRENT_SOURCE_DIR}/test_detection_regression.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
@@ -909,6 +912,24 @@ if(NOT MSVC)
   target_link_libraries(test_detection_sensor_bridge PRIVATE m)
 endif()
 add_test(NAME detection_sensor_bridge COMMAND test_detection_sensor_bridge WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(test_linux_syscall_evidence
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_linux_syscall_evidence.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_linux_syscall_evidence PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_compile_options(test_linux_syscall_evidence PRIVATE -ffunction-sections -fdata-sections)
+  target_link_options(test_linux_syscall_evidence PRIVATE -Wl,--gc-sections)
+  target_link_libraries(test_linux_syscall_evidence PRIVATE Threads::Threads m)
+  edr_apply_test_warnings(test_linux_syscall_evidence)
+  add_test(NAME linux_syscall_evidence COMMAND test_linux_syscall_evidence)
+endif()
 
 foreach(target test_detection_decision test_detection_regression test_detection_sensor_bridge)
   target_sources(${target} PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -1222,6 +1243,25 @@ add_executable(test_pmfe_pe_arch
 target_include_directories(test_pmfe_pe_arch PRIVATE ${CMAKE_SOURCE_DIR}/src/pmfe)
 edr_apply_test_warnings(test_pmfe_pe_arch)
 add_test(NAME pmfe_pe_architectures COMMAND test_pmfe_pe_arch WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_pmfe_evidence
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_evidence.c
+  ${CMAKE_SOURCE_DIR}/src/pmfe/pmfe_evidence.c)
+target_include_directories(test_pmfe_evidence PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/pmfe)
+edr_apply_test_warnings(test_pmfe_evidence)
+add_test(NAME pmfe_same_region_evidence COMMAND test_pmfe_evidence)
+
+add_executable(test_pmfe_injection_generation
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_injection_generation.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/correlation_engine.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_pmfe_injection_generation PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_pmfe_injection_generation PRIVATE Threads::Threads)
+edr_apply_test_warnings(test_pmfe_injection_generation)
+add_test(NAME pmfe_injection_generation COMMAND test_pmfe_injection_generation)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(test_pmfe_linux_maps ${CMAKE_CURRENT_SOURCE_DIR}/test_pmfe_linux_maps.c ${CMAKE_SOURCE_DIR}/src/pmfe/pmfe_linux_scan_util.c)

@@ -1,6 +1,7 @@
 #include "edr/behavior_proto.h"
 
 #include "edr/ave_sdk.h"
+#include "edr/pmfe.h"
 #include "edr/types.h"
 
 #include "edr/v1/event.pb.h"
@@ -278,8 +279,11 @@ static void fill_pmfe_cross_engine_fields(edr_v1_BehaviorEvent *m, const EdrBeha
   float ave = pmfe_detail_f(r->cmdline, "ave_max_score");
   float dns_best = pmfe_detail_f(r->cmdline, "dns_best");
   int stomp = pmfe_detail_i(r->cmdline, "stomp_suspicious");
-  int mz = pmfe_detail_i(r->cmdline, "mz_hits");
-  int elf = pmfe_detail_i(r->cmdline, "elf_hits");
+  unsigned images = pmfe_detail_i(r->script_snippet, "private_exec_image_hits") > 0 ? 1u : 0u;
+  unsigned threads = pmfe_detail_i(r->script_snippet, "private_exec_thread_starts") > 0 ? 1u : 0u;
+  int injection = pmfe_detail_i(r->script_snippet, "injection_observed") > 0;
+  unsigned memfd = pmfe_detail_i(r->script_snippet, "memfd_exec") > 0 ? 1u : 0u;
+  unsigned deleted = pmfe_detail_i(r->script_snippet, "deleted_exec") > 0 ? 1u : 0u;
   int dns_hits = pmfe_detail_i(r->cmdline, "dns_ascii_hits") + pmfe_detail_i(r->cmdline, "dns_utf16_hits") +
                  pmfe_detail_i(r->cmdline, "dns_wire_hits");
   if (r->pmfe_snapshot[0]) {
@@ -292,19 +296,14 @@ static void fill_pmfe_cross_engine_fields(edr_v1_BehaviorEvent *m, const EdrBeha
       dns_best = p ? strtof(p + 11, NULL) : dns_best;
     }
     stomp = stomp || pmfe_has_positive_json_number(r->pmfe_snapshot, "stomp");
-    mz = mz || pmfe_has_positive_json_number(r->pmfe_snapshot, "mz");
-    elf = elf || pmfe_has_positive_json_number(r->pmfe_snapshot, "elf");
+    images = images || pmfe_has_positive_json_number(r->pmfe_snapshot, "image_hits");
     dns_hits = dns_hits || pmfe_has_positive_json_number(r->pmfe_snapshot, "dns");
   }
-  float conf = 0.f;
-  if (stomp) conf = 0.92f;
-  if (dns_hits) conf = conf > 0.63f ? conf : 0.63f;
-  if (dns_best > conf) conf = dns_best;
-  if (ave > conf) conf = ave;
-  if (conf > 1.f) conf = 1.f;
+  float conf = edr_pmfe_evidence_score((unsigned)stomp, (unsigned)dns_hits,
+      dns_best, ave, images, threads, injection, memfd, deleted);
   m->has_ave_behavior_feed = true;
   m->ave_behavior_feed.pmfe_confidence = conf;
-  m->ave_behavior_feed.pmfe_pe_found = (mz || elf || stomp) ? true : false;
+  m->ave_behavior_feed.pmfe_pe_found = images > 0u;
   m->ave_behavior_feed.pmfe_dns_tunnel = (dns_hits || dns_best >= 0.30f) ? true : false;
 }
 

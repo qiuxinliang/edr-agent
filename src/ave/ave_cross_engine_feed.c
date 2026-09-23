@@ -9,25 +9,25 @@
 #include <string.h>
 #include <ctype.h>
 
-static int mz_hits_from_detail_text(const char *s) {
+static int image_hits_from_detail_text(const char *s) {
   if (!s || !s[0]) {
     return 0;
   }
-  const char *p = strstr(s, "mz_hits=");
+  const char *p = strstr(s, "private_exec_image_hits=");
   if (!p) {
     return 0;
   }
-  return (int)strtol(p + 8, NULL, 10);
+  return (int)strtol(p + strlen("private_exec_image_hits="), NULL, 10);
 }
 
 static uint8_t pmfe_pe_found_from_record(const EdrBehaviorRecord *br) {
   if (edr_ave_cross_engine_pmfe_snapshot_pe_hint(br->pmfe_snapshot)) {
     return 1u;
   }
-  if (mz_hits_from_detail_text(br->cmdline) >= 1) {
+  if (image_hits_from_detail_text(br->cmdline) >= 1) {
     return 1u;
   }
-  if (mz_hits_from_detail_text(br->script_snippet) >= 1) {
+  if (image_hits_from_detail_text(br->script_snippet) >= 1) {
     return 1u;
   }
   return 0u;
@@ -320,6 +320,10 @@ static int ave_record_input_quality(const EdrBehaviorRecord *br, AVEEventType av
 }
 
 void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
+  if (br && (br->type == EDR_EVENT_PROCESS_INJECT || br->type == EDR_EVENT_THREAD_CREATE_REMOTE) &&
+      !edr_behavior_is_injection_evidence(br)) {
+    return;
+  }
   const char *eo = getenv("EDR_AVE_CROSS_ENGINE_FEED");
   if (eo && eo[0] == '0') {
     return;

@@ -20,7 +20,7 @@ float edr_ave_cross_engine_parse_first_score(const char *t1, const char *t2, con
 /** 解析 `pmfe_snapshot` JSON 中的 `"ave":` 浮点（无则 0）。 */
 float edr_ave_cross_engine_pmfe_snapshot_ave(const char *json);
 
-/** 解析 `pmfe_snapshot` 中 `"mz":` / `"stomp":` / `"elf":` 是否暗示 PE/可疑内存（供 feat[54]）。 */
+/** 仅使用结构头验证且位于同一私有执行区域的 image_hits；旧版魔数计数不能证明此关系。 */
 int edr_ave_cross_engine_pmfe_snapshot_pe_hint(const char *json);
 
 /**

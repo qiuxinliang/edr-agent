@@ -170,7 +170,59 @@ static void test_rejects_oversized_event_fields_atomically_and_recovers(void) {
   assert(strstr(g_last_event.cmdline, "hostname") != NULL);
 }
 
+static void test_pmfe_image_hint_requires_same_region_validation(void) {
+  EdrBehaviorRecord r;
+  make_enriched_record(&r, EDR_EVENT_PMFE_SCAN_RESULT, 5200u);
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "private_exec=1 mz_hits=1");
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "score=0.35;thread_start_matches=1");
+  snprintf(r.pmfe_snapshot, sizeof(r.pmfe_snapshot), "%s", "{\"mz\":1,\"elf\":1,\"stomp\":1}");
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1);
+  assert(g_last_event.pmfe_pe_found == 0u);
+  snprintf(r.script_snippet, sizeof(r.script_snippet), "%s", "score=0.90;private_exec_image_hits=1");
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1);
+  assert(g_last_event.pmfe_pe_found == 1u);
+  assert(g_last_event.pmfe_confidence == 0.90f);
+}
+
+static void test_linux_syscall_outcomes_do_not_create_injection_verdicts(void) {
+  EdrBehaviorRecord r;
+  make_enriched_record(&r, EDR_EVENT_PROCESS_INJECT, 5210u);
+  /* Existing Windows input retains the same feed semantics. */
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1 && g_last_event.event_type == AVE_EVT_PROCESS_INJECT);
+  strcpy(r.syscall_sensor, "auditd");
+  expect_atomic_reject(&r); /* old producer: name/outcome absent */
+  strcpy(r.syscall_name, "process_vm_writev");
+  expect_atomic_reject(&r);
+  r.syscall_result_known = 1;
+  r.syscall_result = 4096;
+  expect_atomic_reject(&r); /* return value alone is not trusted success */
+  r.syscall_success_known = 1;
+  expect_atomic_reject(&r); /* explicit failure */
+  r.syscall_success = 1;
+  r.syscall_result = -1;
+  expect_atomic_reject(&r);
+  r.syscall_result = 0;
+  expect_atomic_reject(&r);
+  r.syscall_result = 4096;
+  reset_capture();
+  edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1 && g_last_event.event_type == AVE_EVT_PROCESS_INJECT);
+  const char *not_injection[] = {"memfd_create", "process_vm_readv", "ptrace"};
+  for (size_t i=0; i<sizeof(not_injection)/sizeof(not_injection[0]); ++i) {
+    strcpy(r.syscall_name, not_injection[i]);
+    expect_atomic_reject(&r);
+  }
+}
+
 int main(void) {
+  test_linux_syscall_outcomes_do_not_create_injection_verdicts();
+  test_pmfe_image_hint_requires_same_region_validation();
   test_rejects_pid_only_process_create();
   test_accepts_enriched_process_create();
   test_rejects_file_without_process_identity();

@@ -1,36 +1,64 @@
 tracepoint:syscalls:sys_enter_execve
 {
-  printf("edr syscall=execve pid=%d comm=%s exe=%s\n", pid, comm, str(args->filename));
+  printf("edr syscall=execve pid=%d comm_hex=\"%rh\" exe_hex=\"%rh\"\n", pid, buf(comm), buf(str(args->filename)));
 }
 
 tracepoint:syscalls:sys_enter_connect
 {
-  printf("edr syscall=connect pid=%d comm=%s\n", pid, comm);
+  printf("edr syscall=connect pid=%d comm_hex=\"%rh\"\n", pid, buf(comm));
 }
 
 tracepoint:syscalls:sys_enter_ptrace
 {
-  printf("edr syscall=ptrace pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+  printf("edr syscall=ptrace pid=%d target_pid=%d comm_hex=\"%rh\"\n", pid, args->pid, buf(comm));
 }
 
 tracepoint:syscalls:sys_enter_process_vm_writev
 {
-  printf("edr syscall=process_vm_writev pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+  @writev_pending[tid] = 1;
+  @writev_target[tid] = args->pid;
+}
+
+tracepoint:syscalls:sys_exit_process_vm_writev
+/@writev_pending[tid]/
+{
+  printf("edr syscall=process_vm_writev pid=%d target_pid=%d exit=%ld comm_hex=\"%rh\"\n", pid, @writev_target[tid], args->ret, buf(comm));
+  delete(@writev_target[tid]);
+  delete(@writev_pending[tid]);
 }
 
 tracepoint:syscalls:sys_enter_process_vm_readv
 {
-  printf("edr syscall=process_vm_readv pid=%d comm=%s target_pid=%d\n", pid, comm, args->pid);
+  printf("edr syscall=process_vm_readv pid=%d target_pid=%d comm_hex=\"%rh\"\n", pid, args->pid, buf(comm));
 }
 
 tracepoint:syscalls:sys_enter_memfd_create
 {
-  printf("edr syscall=memfd_create pid=%d comm=%s name=%s\n", pid, comm, str(args->uname));
+  @memfd_pending[tid] = 1;
+  @memfd_name[tid] = str(args->uname);
+}
+
+tracepoint:syscalls:sys_exit_memfd_create
+/@memfd_pending[tid]/
+{
+  printf("edr syscall=memfd_create pid=%d exit=%ld comm_hex=\"%rh\" name_hex=\"%rh\"\n", pid, args->ret, buf(comm), buf(@memfd_name[tid]));
+  delete(@memfd_pending[tid]);
+  delete(@memfd_name[tid]);
+}
+
+// Exit cleanup prevents an interrupted thread from leaving a stale pair for
+// a reused TID. Each syscall exit also deletes its own bounded map entries.
+tracepoint:sched:sched_process_exit
+{
+  delete(@writev_target[tid]);
+  delete(@writev_pending[tid]);
+  delete(@memfd_pending[tid]);
+  delete(@memfd_name[tid]);
 }
 
 tracepoint:syscalls:sys_enter_init_module,
 tracepoint:syscalls:sys_enter_finit_module,
 tracepoint:syscalls:sys_enter_delete_module
 {
-  printf("edr syscall=module_load pid=%d comm=%s\n", pid, comm);
+  printf("edr syscall=module_load pid=%d comm_hex=\"%rh\"\n", pid, buf(comm));
 }

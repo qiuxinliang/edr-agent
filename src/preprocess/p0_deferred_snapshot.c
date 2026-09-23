@@ -28,6 +28,12 @@ static const Field fields[] = {
 #undef TEXT
 #undef FIELD
 
+enum { SNAPSHOT_V2_FIELDS = 7 };
+static size_t snapshot_field_count(int schema) {
+  size_t count = sizeof(fields)/sizeof(fields[0]);
+  return schema == 1 ? count - SNAPSHOT_V2_FIELDS : count;
+}
+
 static uint64_t load_unsigned(const void *p, size_t n) {
   uint64_t a; uint32_t b; uint8_t c;
   if (n == sizeof(a)) { memcpy(&a,p,n); return a; }
@@ -53,17 +59,23 @@ int edr_p0_deferred_snapshot_encode(const EdrBehaviorRecord *r,
     const EdrP0RuleIrBinding *b, const char *rule_id, char **out, size_t *length) {
   cJSON *root = NULL, *record = NULL;
   char *json = NULL;
+  int schema;
   if (!out || !length) return 0;
   *out = NULL; *length = 0u;
   if (!r || !b || !rule_id || !rule_id[0] || strlen(rule_id) >= 64u ||
       !r->event_id[0] || !r->endpoint_id[0] || !r->tenant_id[0]) return 0;
+  /* Ordinary P0 records still use the original format, including across an
+   * installer rollback. Only actual new syscall facts need schema 2. */
+  schema = r->syscall_name[0] || r->syscall_sensor[0] || r->syscall_result ||
+           r->syscall_target_pid || r->syscall_result_known || r->syscall_success ||
+           r->syscall_success_known ? 2 : 1;
   root = cJSON_CreateObject();
-  if (!root || !cJSON_AddNumberToObject(root,"schema",1) ||
+  if (!root || !cJSON_AddNumberToObject(root,"schema",schema) ||
       !cJSON_AddStringToObject(root,"rule_id",rule_id) ||
       !add_text(root,"bundle_version",b->rules_bundle_version,sizeof(b->rules_bundle_version)) ||
       !add_text(root,"bundle_sha256",b->artifact_sha256,sizeof(b->artifact_sha256)) ||
       !(record = cJSON_AddObjectToObject(root,"record"))) goto done;
-  for (size_t i=0; i<sizeof(fields)/sizeof(fields[0]); ++i) {
+  for (size_t i=0; i<snapshot_field_count(schema); ++i) {
     const Field *f = &fields[i];
     const void *p = (const char *)r + f->offset;
     char number[32];
@@ -102,6 +114,7 @@ int edr_p0_deferred_snapshot_decode(const char *json, size_t length,
   cJSON *root = NULL;
   const cJSON *record, *schema;
   int ok = 0;
+  size_t field_count;
   if (!json || !length || length > EDR_STORAGE_QUEUE_P0_DEFERRED_MAX_PAYLOAD_BYTES ||
       !r || !b || !rule_id || !rule_cap) return 0;
   memset(r,0,sizeof(*r)); memset(b,0,sizeof(*b)); rule_id[0]=0;
@@ -109,12 +122,13 @@ int edr_p0_deferred_snapshot_decode(const char *json, size_t length,
   if (!root || end != json+length || !cJSON_IsObject(root) || cJSON_GetArraySize(root)!=5) goto done;
   schema=cJSON_GetObjectItemCaseSensitive(root,"schema");
   record=cJSON_GetObjectItemCaseSensitive(root,"record");
-  if (!cJSON_IsNumber(schema) || schema->valuedouble!=1.0 || !cJSON_IsObject(record) ||
-      cJSON_GetArraySize(record)!=(int)(sizeof(fields)/sizeof(fields[0])) ||
+  if (!cJSON_IsNumber(schema) || (schema->valuedouble!=1.0 && schema->valuedouble!=2.0)) goto done;
+  field_count = snapshot_field_count(schema->valueint);
+  if (!cJSON_IsObject(record) || cJSON_GetArraySize(record)!=(int)field_count ||
       !copy_text(root,"rule_id",rule_id,rule_cap) ||
       !copy_text(root,"bundle_version",b->rules_bundle_version,sizeof(b->rules_bundle_version)) ||
       !copy_text(root,"bundle_sha256",b->artifact_sha256,sizeof(b->artifact_sha256))) goto done;
-  for (size_t i=0; i<sizeof(fields)/sizeof(fields[0]); ++i) {
+  for (size_t i=0; i<field_count; ++i) {
     const Field *f=&fields[i];
     void *p=(char *)r+f->offset;
     const cJSON *v=cJSON_GetObjectItemCaseSensitive(record,f->name);

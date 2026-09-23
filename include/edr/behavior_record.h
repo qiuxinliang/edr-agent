@@ -67,6 +67,16 @@ typedef struct {
   uint8_t is_security_4688;
   uint32_t priority;
 
+  /* Linux collector facts, kept separate from command/script text. Missing
+   * outcome is unknown; a zero result is meaningful (for example fd 0). */
+  char syscall_name[64];
+  char syscall_sensor[16];
+  int64_t syscall_result;
+  uint32_t syscall_target_pid;
+  uint8_t syscall_result_known;
+  uint8_t syscall_success;
+  uint8_t syscall_success_known;
+
   char parent_name[EDR_BR_STR_SHORT];
   char parent_path[EDR_BR_STR_MID];
   char parent_resolution_status[32];
@@ -184,6 +194,10 @@ int edr_process_create_is_lifecycle_authoritative(const EdrBehaviorRecord *r);
 /** Event families whose PID denotes the process actor. This selects context
  * work only; callers must independently validate the process generation. */
 int edr_behavior_has_process_actor(const EdrBehaviorRecord *r);
+
+/* Operation evidence, not a malware verdict. Linux syscall entry/failed calls,
+ * read-only access and memfd creation cannot become successful injection. */
+int edr_behavior_is_injection_evidence(const EdrBehaviorRecord *r);
 
 /** Preserve the nanosecond representation used by process-generation edges.
  * Output is empty when the input or destination cannot represent it. */

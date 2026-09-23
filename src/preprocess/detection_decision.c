@@ -563,7 +563,7 @@ static int has_persistence_change_indicator(const EdrBehaviorRecord *r) {
 }
 
 static int is_injection_event(const EdrBehaviorRecord *r) {
-  return r->type == EDR_EVENT_PROCESS_INJECT || r->type == EDR_EVENT_THREAD_CREATE_REMOTE;
+  return edr_behavior_is_injection_evidence(r);
 }
 
 static double detail_number(const char *text, const char *key, double fallback) {
@@ -1459,6 +1459,10 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   char pmfe_entropy[32];
   char pmfe_regions[32];
   char pmfe_private_exec[32];
+  char pmfe_private_exec_image_hits[32];
+  char pmfe_private_exec_thread_starts[32];
+  char pmfe_module_integrity_scope[32];
+  char pmfe_injection_status[32];
   char pmfe_memfd_exec[32];
   char pmfe_deleted_exec[32];
   char pmfe_thread_start_matches[32];
@@ -1564,6 +1568,10 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   pmfe_entropy[0] = '\0';
   pmfe_regions[0] = '\0';
   pmfe_private_exec[0] = '\0';
+  pmfe_private_exec_image_hits[0] = '\0';
+  pmfe_private_exec_thread_starts[0] = '\0';
+  pmfe_module_integrity_scope[0] = '\0';
+  pmfe_injection_status[0] = '\0';
   pmfe_memfd_exec[0] = '\0';
   pmfe_deleted_exec[0] = '\0';
   pmfe_thread_start_matches[0] = '\0';
@@ -1647,6 +1655,14 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   detail_value(r->cmdline, "ent_max", pmfe_entropy, sizeof(pmfe_entropy));
   detail_value(r->cmdline, "regions", pmfe_regions, sizeof(pmfe_regions));
   detail_value(r->script_snippet, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
+  detail_value(r->script_snippet, "private_exec_image_hits", pmfe_private_exec_image_hits,
+               sizeof(pmfe_private_exec_image_hits));
+  detail_value(r->script_snippet, "private_exec_thread_starts", pmfe_private_exec_thread_starts,
+               sizeof(pmfe_private_exec_thread_starts));
+  detail_value(r->script_snippet, "module_integrity_scope", pmfe_module_integrity_scope,
+               sizeof(pmfe_module_integrity_scope));
+  detail_value(r->script_snippet, "injection_status", pmfe_injection_status,
+               sizeof(pmfe_injection_status));
   if (!pmfe_private_exec[0]) detail_value(r->cmdline, "private_exec", pmfe_private_exec, sizeof(pmfe_private_exec));
   detail_value(r->script_snippet, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
   if (!pmfe_memfd_exec[0]) detail_value(r->cmdline, "memfd_exec", pmfe_memfd_exec, sizeof(pmfe_memfd_exec));
@@ -1665,6 +1681,11 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   json_cat(context, context_capacity,
            "{\"engine\":");
   json_str(context, context_capacity, engine_name(r), 48u);
+  if (r->type == EDR_EVENT_PROCESS_INJECT || r->type == EDR_EVENT_THREAD_CREATE_REMOTE) {
+    json_cat(context, context_capacity, ",\"event_type\":");
+    json_str(context, context_capacity,
+             r->type == EDR_EVENT_PROCESS_INJECT ? "process_inject" : "remote_thread_create", 32u);
+  }
   json_cat(context, context_capacity,
            ",\"rule_id\":\"agent_decision_v1\",\"confidence\":%.3f,\"suppressed\":%s,\"reason\":",
            d->confidence, d->suppress ? "true" : "false");
@@ -1969,6 +1990,13 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
              pmfe_read_failures[0] ? strtol(pmfe_read_failures, NULL, 10) : 0L,
              pmfe_injection_observed[0] && strcmp(pmfe_injection_observed, "0") != 0 ? "true" : "false");
     json_str(context, context_capacity, pmfe_module_consistency, 64u);
+    json_cat(context, context_capacity,
+             ",\"private_exec_image_hits\":%ld,\"private_exec_thread_starts\":%ld,\"module_integrity_scope\":",
+             pmfe_private_exec_image_hits[0] ? strtol(pmfe_private_exec_image_hits, NULL, 10) : 0L,
+             pmfe_private_exec_thread_starts[0] ? strtol(pmfe_private_exec_thread_starts, NULL, 10) : 0L);
+    json_str(context, context_capacity, pmfe_module_integrity_scope, 32u);
+    json_cat(context, context_capacity, ",\"injection_status\":");
+    json_str(context, context_capacity, pmfe_injection_status, 32u);
     json_cat(context, context_capacity, "},\"samples\":{\"dns_sample\":");
     json_str(context, context_capacity, pmfe_dns_sample, 96u);
     json_cat(context, context_capacity, ",\"dns_owner\":");
@@ -1978,6 +2006,22 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
     json_cat(context, context_capacity, "},");
   } else {
     json_cat(context, context_capacity, "\"schema\":\"generic_engine_evidence_v1\",");
+  }
+  if (r->syscall_name[0] && r->syscall_sensor[0]) {
+    json_cat(context, context_capacity, "\"linux_syscall\":{\"name\":");
+    json_str(context, context_capacity, r->syscall_name, sizeof(r->syscall_name) - 1u);
+    json_cat(context, context_capacity, ",\"sensor\":");
+    json_str(context, context_capacity, r->syscall_sensor, sizeof(r->syscall_sensor) - 1u);
+    if (r->syscall_success_known) {
+      json_cat(context, context_capacity, ",\"success\":%s", r->syscall_success ? "true" : "false");
+    }
+    if (r->syscall_result_known) {
+      json_cat(context, context_capacity, ",\"result\":\"%lld\"", (long long)r->syscall_result);
+    }
+    if (r->syscall_target_pid) {
+      json_cat(context, context_capacity, ",\"target_pid\":%u", r->syscall_target_pid);
+    }
+    json_cat(context, context_capacity, "},");
   }
   json_cat(context, context_capacity, "\"pmfe_snapshot\":");
   json_record_str(context, context_capacity, r->pmfe_snapshot, 360u, complete_record_text);

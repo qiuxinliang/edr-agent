@@ -1,4 +1,4 @@
-/* Version-1 durable snapshot fields. Integers are decimal strings to retain
+/* Durable snapshot fields. Integers are decimal strings to retain
  * nanosecond timestamps and process generation keys beyond JSON's 53 bits.
  * This is a local persistence codec, not network/source authority. */
 TEXT(event_id)
@@ -100,3 +100,12 @@ TEXT(encoded_command_type)
 TEXT(powershell_script_block)
 TEXT(wmi_filter)
 TEXT(scheduled_task_path)
+/* Schema 2 appends exactly these seven collector facts. Never insert a new
+ * member before this boundary: schema 1 pending records retain their layout. */
+TEXT(syscall_name)
+TEXT(syscall_sensor)
+SIGNED(syscall_result)
+UNSIGNED(syscall_target_pid)
+UNSIGNED(syscall_result_known)
+UNSIGNED(syscall_success)
+UNSIGNED(syscall_success_known)

@@ -24,6 +24,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <pthread.h>
 #endif
 
 /* ------------------------------------------------------------------ 常量 */
@@ -148,15 +150,25 @@ static volatile long s_inject_write_seq; /* 单调递增，取模定位槽 */
 
 #define CORR_INJECT_HISTORY_SLOTS 128u
 typedef struct {
-  volatile uint32_t ready;
-  uint64_t sequence;
+  uint8_t ready;
   uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t creation_filetime_100ns;
   int64_t event_time_ns;
   char process_name[256];
   char technique[32];
 } CorrInjectHistory;
 static CorrInjectHistory s_inject_history[CORR_INJECT_HISTORY_SLOTS];
 static volatile long s_inject_history_seq;
+#ifdef _WIN32
+static SRWLOCK s_inject_history_lock = SRWLOCK_INIT;
+#define INJECT_HISTORY_LOCK() AcquireSRWLockExclusive(&s_inject_history_lock)
+#define INJECT_HISTORY_UNLOCK() ReleaseSRWLockExclusive(&s_inject_history_lock)
+#else
+static pthread_mutex_t s_inject_history_lock = PTHREAD_MUTEX_INITIALIZER;
+#define INJECT_HISTORY_LOCK() pthread_mutex_lock(&s_inject_history_lock)
+#define INJECT_HISTORY_UNLOCK() pthread_mutex_unlock(&s_inject_history_lock)
+#endif
 
 /* ------------------------------------------------------------ 运行态/指标 */
 
@@ -1462,6 +1474,10 @@ static int corr_dns_is_tunnel_like(const char *qname) {
 
 /* 步谓词是否满足（event_type 之外的附加约束）。 */
 static int corr_step_predicate_ok(const CorrStep *step, const EdrBehaviorRecord *br) {
+  if ((br->type == EDR_EVENT_PROCESS_INJECT || br->type == EDR_EVENT_THREAD_CREATE_REMOTE) &&
+      !edr_behavior_is_injection_evidence(br)) {
+    return 0;
+  }
   if (step->flags & CORR_STEP_REQUIRE_EXTERNAL) {
     if (!corr_ip_is_external(br->net_dst)) {
       return 0;
@@ -1652,56 +1668,85 @@ static void corr_note_ave_signal(CorrSignalKind kind, uint32_t pid, const char *
 
 void edr_correlation_note_injection(uint32_t pid, const char *process_name, int64_t event_time_ns,
                                     const char *technique) {
-  corr_note_ave_signal(CORR_SIG_INJECT, pid, process_name, event_time_ns, technique);
-  if (pid != 0u) {
-    long sequence = corr_fetch_inc_long(&s_inject_history_seq);
-    CorrInjectHistory *slot = &s_inject_history[(uint32_t)sequence % CORR_INJECT_HISTORY_SLOTS];
-    slot->ready = 0u;
-    slot->sequence = (uint64_t)(unsigned long)sequence;
-    slot->pid = pid;
-    slot->event_time_ns = event_time_ns;
-    snprintf(slot->process_name, sizeof(slot->process_name), "%s",
-             process_name ? process_name : "");
-    snprintf(slot->technique, sizeof(slot->technique), "%s",
-             technique ? technique : "");
-#if defined(_WIN32)
-    MemoryBarrier();
-#elif defined(__GNUC__) || defined(__clang__)
-    __sync_synchronize();
-#endif
-    slot->ready = 1u;
+  EdrLiveProcessGeneration generation;
+  memset(&generation, 0, sizeof(generation));
+#ifdef _WIN32
+  /* AVE's ABI currently has no StartKey. Bind its timestamp to the same live
+   * OS object here; a delayed verdict from before this birth cannot bind to a
+   * reused PID. Failure deliberately leaves the observation unbound. */
+  HANDLE process = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+  if (process) {
+    EdrLiveProcessGeneration observed;
+    FILETIME created, exited, kernel, user;
+    ULARGE_INTEGER creation;
+    char reason[64];
+    memset(&observed, 0, sizeof(observed));
+    if (edr_process_generation_query_live(process, &observed, reason, sizeof(reason)) &&
+        observed.pid == pid && GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+      creation.LowPart = created.dwLowDateTime;
+      creation.HighPart = created.dwHighDateTime;
+      if (creation.QuadPart == observed.creation_filetime_100ns && event_time_ns > 0 &&
+          edr_process_generation_contains_event(creation.QuadPart, (uint64_t)event_time_ns)) {
+        generation = observed;
+      }
+    }
+    CloseHandle(process);
   }
+#endif
+  edr_correlation_note_injection_for_generation(pid, &generation, process_name,
+                                                event_time_ns, technique);
 }
 
-int edr_correlation_latest_injection(uint32_t pid,
+void edr_correlation_note_injection_for_generation(
+    uint32_t pid, const EdrLiveProcessGeneration *generation,
+    const char *process_name, int64_t event_time_ns, const char *technique) {
+  corr_note_ave_signal(CORR_SIG_INJECT, pid, process_name, event_time_ns, technique);
+  if (!generation || pid == 0u || generation->pid != pid ||
+      generation->process_start_key == 0u || event_time_ns <= 0 ||
+      !edr_process_generation_contains_event(generation->creation_filetime_100ns,
+                                             (uint64_t)event_time_ns)) return;
+  INJECT_HISTORY_LOCK();
+  long sequence = corr_fetch_inc_long(&s_inject_history_seq);
+  CorrInjectHistory *slot = &s_inject_history[(uint32_t)sequence % CORR_INJECT_HISTORY_SLOTS];
+  slot->pid = pid;
+  slot->process_start_key = generation->process_start_key;
+  slot->creation_filetime_100ns = generation->creation_filetime_100ns;
+  slot->event_time_ns = event_time_ns;
+  snprintf(slot->process_name, sizeof(slot->process_name), "%s", process_name ? process_name : "");
+  snprintf(slot->technique, sizeof(slot->technique), "%s", technique ? technique : "");
+  slot->ready = 1u;
+  INJECT_HISTORY_UNLOCK();
+}
+
+int edr_correlation_latest_injection(const EdrLiveProcessGeneration *generation,
+                                     int64_t scan_time_ns, int64_t max_age_ns,
                                      EdrCorrelationInjectionObservation *out) {
-  if (!out || pid == 0u) return 0;
+  if (!out) return 0;
   memset(out, 0, sizeof(*out));
-  uint64_t best_sequence = 0u;
+  if (!generation || generation->pid == 0u || generation->process_start_key == 0u ||
+      scan_time_ns <= 0 || max_age_ns < 0 ||
+      !edr_process_generation_contains_event(generation->creation_filetime_100ns,
+                                             (uint64_t)scan_time_ns)) return 0;
   int found = 0;
+  INJECT_HISTORY_LOCK();
   for (uint32_t i = 0; i < CORR_INJECT_HISTORY_SLOTS; i++) {
-    CorrInjectHistory *slot = &s_inject_history[i];
-    if (slot->ready == 0u || slot->pid != pid) continue;
-    uint64_t sequence = slot->sequence;
-    EdrCorrelationInjectionObservation candidate;
-    memset(&candidate, 0, sizeof(candidate));
-    candidate.pid = slot->pid;
-    candidate.event_time_ns = slot->event_time_ns;
-    snprintf(candidate.process_name, sizeof(candidate.process_name), "%s", slot->process_name);
-    snprintf(candidate.technique, sizeof(candidate.technique), "%s", slot->technique);
-    snprintf(candidate.source, sizeof(candidate.source), "%s", "ave_behavior");
-#if defined(_WIN32)
-    MemoryBarrier();
-#elif defined(__GNUC__) || defined(__clang__)
-    __sync_synchronize();
-#endif
-    if (slot->ready == 0u || slot->sequence != sequence || slot->pid != pid) continue;
-    if (!found || sequence >= best_sequence) {
-      *out = candidate;
-      best_sequence = sequence;
-      found = 1;
-    }
+    const CorrInjectHistory *slot = &s_inject_history[i];
+    if (!slot->ready || slot->pid != generation->pid ||
+        slot->process_start_key != generation->process_start_key ||
+        slot->creation_filetime_100ns != generation->creation_filetime_100ns ||
+        slot->event_time_ns > scan_time_ns ||
+        scan_time_ns - slot->event_time_ns > max_age_ns ||
+        (found && slot->event_time_ns <= out->event_time_ns)) continue;
+    out->pid = slot->pid;
+    out->process_start_key = slot->process_start_key;
+    out->creation_filetime_100ns = slot->creation_filetime_100ns;
+    out->event_time_ns = slot->event_time_ns;
+    snprintf(out->process_name, sizeof(out->process_name), "%s", slot->process_name);
+    snprintf(out->technique, sizeof(out->technique), "%s", slot->technique);
+    snprintf(out->source, sizeof(out->source), "%s", "ave_behavior");
+    found = 1;
   }
+  INJECT_HISTORY_UNLOCK();
   return found;
 }
 

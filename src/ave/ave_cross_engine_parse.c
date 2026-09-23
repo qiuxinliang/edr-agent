@@ -82,8 +82,5 @@ int edr_ave_cross_engine_pmfe_snapshot_pe_hint(const char *json) {
   if (!json || !json[0]) {
     return 0;
   }
-  int mz = json_int_field(json, "\"mz\":");
-  int stomp = json_int_field(json, "\"stomp\":");
-  int elf = json_int_field(json, "\"elf\":");
-  return (mz >= 1 || stomp >= 1 || elf >= 1) ? 1 : 0;
+  return json_int_field(json, "\"image_hits\":") > 0 ? 1 : 0;
 }

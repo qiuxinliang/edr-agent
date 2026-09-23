@@ -19,6 +19,7 @@
 
 #include "edr/behavior_record.h"
 #include "edr/sensor_interest.h"
+#include "edr/process_generation.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -69,18 +70,29 @@ void edr_correlation_evaluate(const EdrBehaviorRecord *br);
 void edr_correlation_note_injection(uint32_t pid, const char *process_name,
                                     int64_t event_time_ns, const char *technique);
 
+/* Captured-generation variant. Unknown generation still feeds the existing
+ * sequence path, but is never published as PMFE correlation evidence. */
+void edr_correlation_note_injection_for_generation(
+    uint32_t pid, const EdrLiveProcessGeneration *generation,
+    const char *process_name, int64_t event_time_ns, const char *technique);
+
 typedef struct EdrCorrelationInjectionObservation {
   uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t creation_filetime_100ns;
   int64_t event_time_ns;
   char process_name[256];
   char technique[32];
   char source[32];
 } EdrCorrelationInjectionObservation;
 
-/** Return the latest AVE-confirmed injection observation for pid. This is a
+/** Return the latest AVE-confirmed injection observation for the exact process
+ * generation at or before scan_time_ns and within max_age_ns. Unknown identity
+ * and future observations do not match. This is a
  * process-level correlation signal; it does not imply that pid wrote a
  * particular VAD unless source/target telemetry is available. */
-int edr_correlation_latest_injection(uint32_t pid,
+int edr_correlation_latest_injection(const EdrLiveProcessGeneration *generation,
+                                     int64_t scan_time_ns, int64_t max_age_ns,
                                      EdrCorrelationInjectionObservation *out);
 
 /**

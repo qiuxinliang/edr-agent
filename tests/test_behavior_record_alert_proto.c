@@ -18,6 +18,35 @@ static void init_transport_record(EdrBehaviorRecord *record) {
   snprintf(record->tenant_id, sizeof(record->tenant_id), "tenant-transport");
 }
 
+static int verify_pmfe_evidence_projection(void) {
+  EdrBehaviorRecord record;
+  uint8_t wire[32768];
+  edr_v1_BehaviorEvent decoded;
+  init_transport_record(&record);
+  record.type = EDR_EVENT_PMFE_SCAN_RESULT;
+  snprintf(record.cmdline, sizeof(record.cmdline), "%s", "private_exec=1 mz_hits=1 elf_hits=1");
+  const char *cases[] = {
+    "private_exec=1;thread_start_matches=1;mz_hits=1",
+    "private_exec_image_hits=1",
+    "private_exec_thread_starts=1",
+    "injection_observed=1",
+    "private_exec_image_hits=-1"
+  };
+  const float scores[] = {0.0f, 0.90f, 0.92f, 0.94f, 0.0f};
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    snprintf(record.script_snippet, sizeof(record.script_snippet), "%s", cases[i]);
+    size_t len = edr_behavior_record_encode_protobuf(&record, wire, sizeof(wire));
+    if (!len) return 0;
+    memset(&decoded, 0, sizeof(decoded));
+    pb_istream_t stream = pb_istream_from_buffer(wire, len);
+    if (!pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded) ||
+        !decoded.has_ave_behavior_feed ||
+        decoded.ave_behavior_feed.pmfe_confidence != scores[i] ||
+        decoded.ave_behavior_feed.pmfe_pe_found != (i == 1u)) return 0;
+  }
+  return 1;
+}
+
 static void fill_boundary_ascii(char *dst, size_t cap, char value) {
   if (!dst || cap == 0u) return;
   memset(dst, value, cap - 1u);
@@ -584,6 +613,10 @@ int main(int argc, char **argv) {
       decoded.behavior_alert.user_subject_json[0] != '\0') {
     fprintf(stderr, "pure alert user subject withholding was not explicit\n");
     return 7;
+  }
+  if (!verify_pmfe_evidence_projection()) {
+    fprintf(stderr, "PMFE same-region evidence projection failed\n");
+    return 12;
   }
   if (!verify_transport_boundaries(wire, sizeof(wire))) {
     fprintf(stderr, "transport boundary or UTF-8 truncation contract failed\n");

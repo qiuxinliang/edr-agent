@@ -69,6 +69,8 @@ typedef struct EdrPmfeRegionResult {
   float entropy;
   uint8_t read_ok;
   uint8_t mz_found;
+  uint8_t image_header_valid;
+  uint8_t private_executable;
   uint8_t yara_hit_count;
   uint8_t thread_start_count;
   char protection_name[48];
@@ -109,6 +111,8 @@ typedef struct EdrPmfeScanResult {
   uint32_t thread_start_matches;
   uint32_t thread_query_failures;
   uint32_t private_exec;
+  uint32_t private_exec_image_hits;
+  uint32_t private_exec_thread_starts;
   uint32_t memfd_exec;
   uint32_t deleted_exec;
   uint32_t stomp_suspicious;
@@ -123,7 +127,9 @@ typedef struct EdrPmfeScanResult {
   char dns_sample[200];
   char dns_owner[200];
   char module_consistency[24];
+  char module_integrity_scope[32];
   uint8_t injection_observed;
+  char injection_status[32];
   int64_t injection_event_time_ns;
   int64_t injection_age_ms;
   char injection_technique[32];
@@ -134,6 +140,27 @@ typedef struct EdrPmfeScanResult {
   char warning[256];
   EdrPmfeRegionResult regions[EDR_PMFE_MAX_REGIONS];
 } EdrPmfeScanResult;
+
+/* Shared by the scan producer and protobuf AVE projection. Aggregate region
+ * totals and signature-only MZ/ELF counts deliberately do not enter scoring. */
+static inline float edr_pmfe_evidence_score(unsigned stomp, unsigned dns_hits,
+    float dns_best, float ave_max, unsigned private_exec_image_hits,
+    unsigned private_exec_thread_starts, int injection_observed,
+    unsigned memfd_exec, unsigned deleted_exec) {
+  float score = stomp ? 0.92f : 0.f;
+  if (dns_hits) {
+    float dns_score = 0.55f + 0.08f * (float)dns_hits;
+    if (dns_score > score) score = dns_score;
+  }
+  if (dns_best > score) score = dns_best;
+  if (ave_max > score) score = ave_max;
+  if (private_exec_image_hits && score < 0.90f) score = 0.90f;
+  if (private_exec_thread_starts && score < 0.92f) score = 0.92f;
+  if (injection_observed && score < 0.94f) score = 0.94f;
+  if (memfd_exec && score < 0.92f) score = 0.92f;
+  if (deleted_exec && score < 0.88f) score = 0.88f;
+  return score > 1.f ? 1.f : score;
+}
 
 typedef void (*EdrPmfeServerScanResultCallback)(const char *command_id, uint32_t pid,
                                                 int scan_status, const char *detail,

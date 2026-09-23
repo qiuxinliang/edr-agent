@@ -38,7 +38,7 @@ int main(void) {
   const uint64_t b_start_key = UINT64_C(0x200002);
   const uint64_t b_creation = UINT64_C(133700000000000002);
   const char *a_detail =
-      "pid=4242 stomp_suspicious=1 dns_ascii_hits=0 dns_utf16_hits=0 "
+      "pid=4242 private_exec_image_hits=2 stomp_suspicious=1 dns_ascii_hits=0 dns_utf16_hits=0 "
       "dns_wire_hits=0 mz_hits=0 elf_hits=0 private_exec=1 memfd_exec=0 "
       "deleted_exec=0 vm_read_failures=0 ave_max_score=0.100 dns_best=0";
   const char *b_detail =
@@ -58,6 +58,7 @@ int main(void) {
   EdrBehaviorRecord a = record_for(reused_pid, a_start_key, a_creation);
   edr_pid_history_pmfe_fill_record(&a);
   assert(strstr(a.pmfe_snapshot, "\"stomp\":1") != NULL);
+  assert(strstr(a.pmfe_snapshot, "\"image_hits\":2") != NULL);
 
   EdrBehaviorRecord b = record_for(reused_pid, b_start_key, b_creation);
   snprintf(b.pmfe_snapshot, sizeof(b.pmfe_snapshot), "%s", "stale");

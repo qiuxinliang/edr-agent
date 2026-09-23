@@ -17,7 +17,7 @@ int main(void) {
     fprintf(stderr, "parse score2 got %f\n", (double)y);
     return 2;
   }
-  const char *j = "{\"stomp\":0,\"dns\":1,\"mz\":2,\"elf\":0,\"ave\":0.4412}";
+  const char *j = "{\"stomp\":0,\"dns\":1,\"mz\":2,\"elf\":0,\"image_hits\":1,\"ave\":0.4412}";
   if (!near_f(edr_ave_cross_engine_pmfe_snapshot_ave(j), 0.4412f)) {
     fprintf(stderr, "json ave fail\n");
     return 3;
@@ -30,6 +30,11 @@ int main(void) {
   if (edr_ave_cross_engine_pmfe_snapshot_pe_hint(j2) != 0) {
     fprintf(stderr, "json pe hint expected 0\n");
     return 5;
+  }
+  if (edr_ave_cross_engine_pmfe_snapshot_pe_hint(
+          "{\"private_exec\":1,\"mz\":1,\"elf\":1,\"stomp\":1}") != 0) {
+    fprintf(stderr, "legacy aggregates must not imply same-region image evidence\n");
+    return 6;
   }
   puts("ok");
   return 0;

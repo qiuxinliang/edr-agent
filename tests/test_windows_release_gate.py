@@ -47,6 +47,8 @@ RUNTIME_EXPECTED = {
     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
     "webshell_semantic_rules", "pmfe_scan_detail_format", "command_signature_cross_language",
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_rule_ir_record_golden",
+    "p0_validation_matrix",
+    "pmfe_same_region_evidence", "pmfe_injection_generation",
 }
 EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED
 PREVIOUSLY_UNBUILT = {

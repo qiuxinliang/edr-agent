@@ -117,6 +117,7 @@ EOF
 # correlation_engine 依赖 cJSON(规则下发) 与 sha256(版本指纹)，一并链接。
 "$CC" -I "$ROOT/include" -I "$ROOT/third_party/cjson" -Wall -Wextra -Wno-unused-parameter \
   "$TMP/harness.c" "$ROOT/src/preprocess/correlation_engine.c" \
+  "$ROOT/src/preprocess/behavior_record.c" \
   "$ROOT/third_party/cjson/cJSON.c" "$ROOT/src/command/sha256.c" -o "$TMP/harness"
 "$TMP/harness"
 echo "== (A) 逻辑验证通过 =="

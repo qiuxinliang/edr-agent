@@ -184,6 +184,7 @@ void edr_pid_history_pmfe_ingest_scan_detail(
   int mz = detail_i(detail, "mz_hits=");
   int elf = detail_i(detail, "elf_hits=");
   unsigned private_exec = detail_u(detail, "private_exec=");
+  unsigned image_hits = detail_u(detail, "private_exec_image_hits=");
   unsigned memfd_exec = detail_u(detail, "memfd_exec=");
   unsigned deleted_exec = detail_u(detail, "deleted_exec=");
   unsigned read_failures = detail_u(detail, "vm_read_failures=");
@@ -233,10 +234,10 @@ void edr_pid_history_pmfe_ingest_scan_detail(
     (void)snprintf(
         s_slots[idx].json, sizeof(s_slots[idx].json),
         "{\"stomp\":%u,\"dns\":%u,\"mz\":%d,\"elf\":%d,\"private_exec\":%u,\"memfd_exec\":%u,"
-        "\"deleted_exec\":%u,\"read_failures\":%u,"
+        "\"deleted_exec\":%u,\"read_failures\":%u,\"image_hits\":%u,"
         "\"ave\":%.4f,\"dns_best\":%.4f,\"sample\":\"%.120s\","
         "\"owner\":\"%.120s\"}",
-        stomp, dns, mz, elf, private_exec, memfd_exec, deleted_exec, read_failures,
+        stomp, dns, mz, elf, private_exec, memfd_exec, deleted_exec, read_failures, image_hits,
         (double)ave, (double)dns_best, esample, eowner);
   }
   unlock();

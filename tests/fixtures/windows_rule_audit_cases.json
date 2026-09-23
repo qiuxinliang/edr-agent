@@ -1,0 +1,357 @@
+{
+  "schema": "edr.windows-rule-audit.v1",
+  "scope": "inert matcher inputs; context_required hits are signals, not confirmed attacks; no commands execute",
+  "cases": [
+    {
+      "case_id": "authorized_smb",
+      "rule_id": "R-LMOVE-001",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "network_connect",
+        "process_name": "explorer.exe",
+        "dest_port": 445,
+        "dest_ip": "10.1.2.3"
+      }
+    },
+    {
+      "case_id": "authorized_rdp",
+      "rule_id": "R-LMOVE-002",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "network_connect",
+        "process_name": "mstsc.exe",
+        "dest_port": 3389,
+        "dest_ip": "10.1.2.3"
+      }
+    },
+    {
+      "case_id": "authorized_winrm",
+      "rule_id": "R-LMOVE-003",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "network_connect",
+        "process_name": "powershell.exe",
+        "dest_port": 5985,
+        "dest_ip": "10.1.2.3"
+      }
+    },
+    {
+      "case_id": "browser_own_credentials",
+      "rule_id": "R-CRED-003",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "file_read",
+        "process_name": "msedge.exe",
+        "file_path": "C:\\Users\\alice\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Login Data"
+      }
+    },
+    {
+      "case_id": "normal_npm_config_read",
+      "rule_id": "R-DEV-CREDENTIAL-READ-001",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "file_read",
+        "process_name": "node.exe",
+        "file_path": "C:\\Users\\alice\\.npmrc"
+      }
+    },
+    {
+      "case_id": "normal_mcp_config_write",
+      "rule_id": "R-AI-CONFIG-WRITE-001",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "file_write",
+        "process_name": "node.exe",
+        "file_path": "C:\\Users\\alice\\.cursor\\mcp.json"
+      }
+    },
+    {
+      "case_id": "normal_cloud_token",
+      "rule_id": "R-IDENTITY-CLI-TOKEN-001",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "az.exe",
+        "cmdline": "az account get-access-token"
+      }
+    },
+    {
+      "case_id": "normal_hidden_inventory",
+      "rule_id": "R-EXEC-002",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -WindowStyle Hidden -File Inventory.ps1"
+      }
+    },
+    {
+      "case_id": "uac_enabled_dword",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "1 (0x00000001)"
+      }
+    },
+    {
+      "case_id": "defender_restored",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "registry_value_name": "DisableAntiSpyware",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "normal_marshal_sizeof",
+      "rule_id": "R-INJECT-004",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command '[Runtime.InteropServices.Marshal]::SizeOf([int])'"
+      }
+    },
+    {
+      "case_id": "local_excel_com",
+      "rule_id": "R-LMOVE-014",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command 'New-Object -ComObject Excel.Application'"
+      }
+    },
+    {
+      "case_id": "approved_msi_install",
+      "rule_id": "R-LOLBIN-006",
+      "expect_match": true,
+      "scope": "context_required",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "msiexec.exe",
+        "cmdline": "msiexec.exe /i C:\\Windows\\Temp\\approved.msi"
+      }
+    },
+    {
+      "case_id": "add_blocking_firewall_rule",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=BlockInbound dir=in action=block"
+      }
+    },
+    {
+      "case_id": "user_add_with_password_argument",
+      "rule_id": "R-ACCT-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser SyntheticPassword /add"
+      }
+    },
+    {
+      "case_id": "aws_standard_s3_copy",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "aws.exe s3 cp report.txt s3://example-bucket/report.txt"
+      }
+    },
+    {
+      "case_id": "icacls_standard_grant",
+      "rule_id": "R-MITRE-WIN-T1044",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "icacls.exe",
+        "cmdline": "icacls C:\\Data /grant user:R"
+      }
+    },
+    {
+      "case_id": "rundll32_standard_path",
+      "rule_id": "R-MITRE-WIN-T1073",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "rundll32.exe",
+        "cmdline": "rundll32.exe C:\\Users\\alice\\plugin.dll,Entry"
+      }
+    },
+    {
+      "case_id": "powershell_registry_provider_colon",
+      "rule_id": "R-FILELESS-007",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe Get-ItemProperty HKCU:\\Software\\Demo; Write-Output $env:TEMP"
+      }
+    },
+    {
+      "case_id": "uac_disabled_dword",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "0 (0x00000000)"
+      }
+    },
+    {
+      "case_id": "uac_decimal_enabled",
+      "rule_id": "R-DEFENSE-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "registry_value_name": "EnableLUA",
+        "registry_value_data": "1"
+      }
+    },
+    {
+      "case_id": "defender_disabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "registry_value_name": "DisableAntiSpyware",
+        "registry_value_data": "1"
+      }
+    },
+    {
+      "case_id": "firewall_enabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+        "registry_value_name": "EnableFirewall",
+        "registry_value_data": "1"
+      }
+    },
+    {
+      "case_id": "firewall_disabled",
+      "rule_id": "R-DEFENSE-004",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "registry_set",
+        "registry_path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+        "registry_value_name": "EnableFirewall",
+        "registry_value_data": "0"
+      }
+    },
+    {
+      "case_id": "inbound_allow",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=AllowInbound dir=in action=allow"
+      }
+    },
+    {
+      "case_id": "outbound_block",
+      "rule_id": "R-DEFENSE-005",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "netsh.exe",
+        "cmdline": "netsh.exe advfirewall firewall add rule name=BlockOutbound dir=out action=block"
+      }
+    },
+    {
+      "case_id": "user_add_without_password",
+      "rule_id": "R-ACCT-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser /add"
+      }
+    },
+    {
+      "case_id": "user_query",
+      "rule_id": "R-ACCT-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "net.exe",
+        "cmdline": "net.exe user audituser"
+      }
+    },
+    {
+      "case_id": "aws_s3_list",
+      "rule_id": "R-EXFIL-003",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "aws.exe",
+        "cmdline": "aws.exe s3 ls s3://example-bucket/"
+      }
+    },
+    {
+      "case_id": "icacls_query",
+      "rule_id": "R-MITRE-WIN-T1044",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "icacls.exe",
+        "cmdline": "icacls C:\\Data"
+      }
+    },
+    {
+      "case_id": "rundll32_system_library",
+      "rule_id": "R-MITRE-WIN-T1073",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "rundll32.exe",
+        "cmdline": "rundll32.exe C:\\Windows\\System32\\shell32.dll,Control_RunDLL"
+      }
+    }
+  ]
+}

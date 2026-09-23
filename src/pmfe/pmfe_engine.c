@@ -29,6 +29,7 @@ extern void edr_pmfe_host_policy_shutdown(void);
 #include "edr/edr_log.h"
 #include "edr/error.h"
 #include "edr/process_generation.h"
+#include "pmfe_evidence.h"
 #include "edr/sha256.h"
 #include "edr/response.h"
 #include "pmfe_pe_arch.h"
@@ -753,23 +754,8 @@ static void pmfe_map_thread_starts(uint32_t pid, EdrPmfeScanResult *result) {
       result->thread_query_failures++;
       continue;
     }
-    uint64_t address = (uint64_t)(uintptr_t)start;
-    for (uint8_t i = 0; i < result->region_count; i++) {
-      EdrPmfeRegionResult *region = &result->regions[i];
-      if (address < region->base || address >= region->base + region->size_bytes) continue;
-      if (region->thread_start_count < EDR_PMFE_MAX_THREAD_STARTS) {
-        EdrPmfeThreadStart *thread_start = &region->thread_starts[region->thread_start_count++];
-        thread_start->tid = entry.th32ThreadID;
-        thread_start->start_address = address;
-      }
-      result->thread_start_matches++;
-      if (!strstr(region->reason, "thread_start")) {
-        strncat(region->reason, ",thread_start",
-                sizeof(region->reason) - strlen(region->reason) - 1u);
-      }
-      if (region->score < 0.92f) region->score = 0.92f;
-      break;
-    }
+    (void)edr_pmfe_region_note_thread(result, entry.th32ThreadID,
+                                      (uint64_t)(uintptr_t)start);
   } while (Thread32Next(snapshot, &entry));
   CloseHandle(snapshot);
 }
@@ -1339,6 +1325,8 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
       region->size_bytes = (uint64_t)pool[i].size;
       region->protection = (uint32_t)pool[i].protect;
       region->memory_type = (uint32_t)pool[i].type;
+      region->private_executable = (uint8_t)edr_pmfe_windows_private_executable(
+          region->memory_type, region->protection);
       region->score = pool[i].score >= 100.f ? 1.f : pool[i].score / 100.f;
       pmfe_win_protection_name(pool[i].protect, region->protection_name,
                                sizeof(region->protection_name));
@@ -1386,10 +1374,11 @@ static void pmfe_win_vad_deep_scan(HANDLE proc, uint32_t pid, unsigned peek_cap_
       region->bytes_sampled = (uint64_t)br;
       region->entropy = ent;
       region->mz_found = (buf[0] == 'M' && buf[1] == 'Z') ? 1u : 0u;
+      edr_pmfe_region_note_sample(result, region, buf, (size_t)br);
       pmfe_sha256_bytes(buf, (size_t)br, region->sha256);
       if (region->mz_found) {
         strncat(region->reason, ",mz_header", sizeof(region->reason) - strlen(region->reason) - 1u);
-        pmfe_peek_pe_metadata(buf, (size_t)br, region);
+        if (region->image_header_valid) pmfe_peek_pe_metadata(buf, (size_t)br, region);
       }
       if (ent >= 7.2f) {
         strncat(region->reason, ",high_entropy", sizeof(region->reason) - strlen(region->reason) - 1u);
@@ -1540,6 +1529,8 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
   (void)pmfe_coarse_vad_windows_handle(h, &regions, &cand);
   char vad_extra[896];
   if (result) {
+    snprintf(result->module_integrity_scope, sizeof(result->module_integrity_scope),
+             "%s", do_mod ? "module_header_prefix" : "not_requested");
     result->regions_total = regions;
     result->private_exec = cand;
   }
@@ -1557,16 +1548,17 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
 
   if (bm.enum_failed) {
     snprintf(detail, detail_cap,
-             "pid=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%.64s%s%.240s", pid,
+             "pid=%u private_exec_image_hits=%u prio=%u band=%u baseline=enum_failed regions=%u private_exec=%u vad_hint=%.64s%s%.240s", pid,
+             result ? result->private_exec_image_hits : 0u,
              (unsigned)task->priority, (unsigned)task->band, regions, cand, vh, vad_extra[0] ? " | " : "",
              vad_extra[0] ? vad_extra : "");
   } else {
     const char *stomp_path = bm.first_stomp_path[0] ? bm.first_stomp_path : "-";
     snprintf(detail, detail_cap,
-             "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
+             "pid=%u private_exec_image_hits=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
              "first_stomp=%.200s thread_start=unknown executable_private_page=%u private_page_origin=unknown "
              "cross_process_write=unknown module_path_consistency=%s module_signature=unknown vad_hint=%.64s%s%.240s",
-             pid, (unsigned)task->priority, (unsigned)task->band, bm.module_count, bm.stomp_suspicious, bm.disk_hash_ok,
+             pid, result ? result->private_exec_image_hits : 0u, (unsigned)task->priority, (unsigned)task->band, bm.module_count, bm.stomp_suspicious, bm.disk_hash_ok,
              regions, cand, stomp_path, cand ? 1u : 0u, bm.stomp_suspicious ? "mismatch" : "ok", vh,
              vad_extra[0] ? " | " : "", vad_extra[0] ? vad_extra : "");
     if (result) result->stomp_suspicious = bm.stomp_suspicious;
@@ -1578,6 +1570,7 @@ typedef struct {
   uint64_t lo;
   uint64_t hi;
   float score;
+  uint8_t private_executable;
 } PmfeLinuxMapCand;
 
 typedef struct {
@@ -2012,6 +2005,12 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
       pool[np].lo = lo;
       pool[np].hi = hi;
       pool[np].score = sc;
+      /* Linux private file mappings are normal executable images. Only
+       * anonymous/deleted/memfd executable mappings correspond to this signal. */
+      pool[np].private_executable = (uint8_t)(strlen(perms) >= 4u &&
+          perms[2] == 'x' && perms[3] == 'p' &&
+          (!mpathline[0] || edr_pmfe_linux_path_is_memfd(mpathline) ||
+           edr_pmfe_linux_path_is_deleted(mpathline)));
       np++;
     }
     if (do_integrity && strlen(perms) >= 4u && perms[2] == 'x' && perms[3] == 'p' && strchr(mpathline, '/') != NULL &&
@@ -2074,6 +2073,21 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
     if (nr <= 0) {
       continue;
     }
+    if (result) {
+      EdrPmfeRegionResult sample;
+      memset(&sample, 0, sizeof(sample));
+      sample.base = base;
+      sample.size_bytes = rsz;
+      sample.read_ok = 1u;
+      sample.bytes_sampled = (uint64_t)nr;
+      sample.private_executable = pool[i].private_executable;
+      snprintf(sample.kind, sizeof(sample.kind), "%s",
+               sample.private_executable ? "private_exec" : "mapped");
+      edr_pmfe_region_note_sample(result, &sample, buf, (size_t)nr);
+      if (result->region_count < EDR_PMFE_MAX_REGIONS) {
+        result->regions[result->region_count++] = sample;
+      }
+    }
     if ((size_t)nr >= 4u && buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F') {
       elf++;
     }
@@ -2116,10 +2130,10 @@ static int pmfe_scan_linux(const EdrPmfeTask *task, char *detail, size_t detail_
   }
 
   snprintf(detail, detail_cap,
-           "pid=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
+           "pid=%u private_exec_image_hits=%u prio=%u band=%u baseline_mods=%u stomp_suspicious=%u disk_hash_ok=%u regions=%u private_exec=%u "
            "memfd_exec=%u deleted_exec=%u file_exec_maps=%u first_stomp=%.200s thread_start=unknown executable_private_page=%u "
            "private_page_origin=%s cross_process_write=unknown module_path_consistency=%s module_signature=unknown | %s",
-           pid_u, (unsigned)task->priority, (unsigned)task->band, baseline_mods_u, stomp, disk_ok, regions,
+           pid_u, result ? result->private_exec_image_hits : 0u, (unsigned)task->priority, (unsigned)task->band, baseline_mods_u, stomp, disk_ok, regions,
            private_exec, memfd_exec, deleted_exec, file_exec_maps, stomp_disp, private_exec ? 1u : 0u,
            private_exec > file_exec_maps ? "anonymous_or_memfd" : "file_backed",
            stomp ? "mismatch" : "ok", extra);
@@ -2152,6 +2166,8 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
     result->regions_total = pmfe_detail_u(detail, "regions=");
     result->regions_read = pmfe_detail_u(detail, "maps_peek=");
     result->read_failures = pmfe_detail_u(detail, "vm_read_failures=");
+    snprintf(result->module_integrity_scope, sizeof(result->module_integrity_scope),
+             "%s", task->module_integrity ? "file_header_prefix" : "not_requested");
     result->private_exec = pmfe_detail_u(detail, "private_exec=");
     result->memfd_exec = pmfe_detail_u(detail, "memfd_exec=");
     result->deleted_exec = pmfe_detail_u(detail, "deleted_exec=");
@@ -2242,12 +2258,12 @@ static uint64_t pmfe_wall_time_ns(void) {
 }
 
 static uint8_t pmfe_emit_priority(unsigned stomp, unsigned dns_hits, float ave_max,
-                                  unsigned private_exec, unsigned mz_hits, unsigned memfd_exec,
+                                  unsigned private_exec_image_hits, unsigned memfd_exec,
                                   unsigned deleted_exec,
-                                  unsigned thread_start_matches, int injection_observed) {
+                                  unsigned private_exec_thread_starts, int injection_observed) {
   if (stomp > 0u || dns_hits > 0u || ave_max >= 0.65f ||
-      (private_exec > 0u && mz_hits > 0u) ||
-      (thread_start_matches > 0u && private_exec > 0u) || memfd_exec > 0u || deleted_exec > 0u ||
+      private_exec_image_hits > 0u ||
+      private_exec_thread_starts > 0u || memfd_exec > 0u || deleted_exec > 0u ||
       injection_observed) {
     return 0u;
   }
@@ -2291,6 +2307,8 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   unsigned deleted_exec = scan_result ? scan_result->deleted_exec : pmfe_detail_u(detail, "deleted_exec=");
   unsigned mz_hits = scan_result ? scan_result->mz_hits : (unsigned)(mz > 0 ? mz : (elf > 0 ? elf : 0));
   unsigned thread_start_matches = scan_result ? scan_result->thread_start_matches : 0u;
+  unsigned private_exec_image_hits = scan_result ? scan_result->private_exec_image_hits : 0u;
+  unsigned private_exec_thread_starts = scan_result ? scan_result->private_exec_thread_starts : 0u;
   unsigned read_failures = scan_result ? scan_result->read_failures : pmfe_detail_u(detail, "vm_read_failures=");
   int injection_observed = scan_result && scan_result->injection_observed != 0u;
   char dns_sample[256];
@@ -2306,8 +2324,8 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   if (ave_max >= 0.5f) {
     want = 1;
   }
-  if ((private_exec > 0u && mz_hits > 0u) ||
-      (thread_start_matches > 0u && private_exec > 0u) || injection_observed) {
+  if (private_exec_image_hits > 0u ||
+      private_exec_thread_starts > 0u || injection_observed) {
     want = 1;
   }
   if (memfd_exec > 0u || deleted_exec > 0u) {
@@ -2343,37 +2361,9 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
     }
   }
 
-  float score = 0.f;
-  if (stomp > 0u) {
-    score = 0.92f;
-  }
-  if (dns_hits > 0u) {
-    float s = 0.55f + 0.08f * (float)dns_hits;
-    if (s > score) {
-      score = s;
-    }
-    if (dns_best > score) {
-      score = dns_best;
-    }
-  }
-  if (ave_max > score) {
-    score = ave_max;
-  }
-  if (private_exec > 0u && mz_hits > 0u && score < 0.90f) {
-    score = 0.90f;
-  }
-  if (thread_start_matches > 0u && private_exec > 0u && score < 0.92f) {
-    score = 0.92f;
-  }
-  if (injection_observed && score < 0.94f) {
-    score = 0.94f;
-  }
-  if (memfd_exec > 0u && score < 0.92f) {
-    score = 0.92f;
-  }
-  if (deleted_exec > 0u && score < 0.88f) {
-    score = 0.88f;
-  }
+  float score = edr_pmfe_evidence_score(stomp, dns_hits, dns_best, ave_max,
+      private_exec_image_hits, private_exec_thread_starts, injection_observed,
+      memfd_exec, deleted_exec);
   int clean_followup = shellcode_followup && scan_result && strcmp(scan_result->verdict, "clean") == 0;
   if (clean_followup) {
     score = 0.05f;
@@ -2389,8 +2379,8 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = pmfe_wall_time_ns();
   slot.type = EDR_EVENT_PMFE_SCAN_RESULT;
-  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max, private_exec, mz_hits, memfd_exec, deleted_exec,
-                                     thread_start_matches, injection_observed);
+  slot.priority = pmfe_emit_priority(stomp, dns_hits, ave_max, private_exec_image_hits, memfd_exec, deleted_exec,
+                                     private_exec_thread_starts, injection_observed);
   slot.consumed = false;
   slot.attack_surface_hint = 0u;
 
@@ -2416,11 +2406,16 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
                    "%s"
                    "pmfe_status=%s\npmfe_verdict=%s\nprivate_exec=%u\nmemfd_exec=%u\ndeleted_exec=%u\nmz_hits=%u\n"
                    "stomp_suspicious=%u\nthread_start_matches=%u\nread_failures=%u\n"
+                   "private_exec_image_hits=%u\nprivate_exec_thread_starts=%u\n"
+                   "module_integrity_scope=%s\ninjection_status=%s\n"
                    "injection_observed=%u\nimg=%s\ncmd=%s\nqname=%s\nscore=%.4f\nmitre=%s\n"
                    "detector=pmfe\n",
                    task->pid, cid, (unsigned)shellcode_followup, source_alert_id,
                    generation_lines, status, verdict,
                    private_exec, memfd_exec, deleted_exec, mz_hits, stomp, thread_start_matches, read_failures,
+                   private_exec_image_hits, private_exec_thread_starts,
+                   scan_result ? scan_result->module_integrity_scope : "unknown",
+                   scan_result ? scan_result->injection_status : "unknown",
                    (unsigned)injection_observed, img, cmdline_buf,
                    dns_sample[0] ? dns_sample : "-", score,
                    suspicious ? "T1055" : "-");
@@ -2499,6 +2494,8 @@ static void pmfe_worker_body(void) {
     scan_result.pid = task.pid;
     scan_result.started_unix_ms = pmfe_result_unix_ms();
     scan_result.injection_age_ms = -1;
+    snprintf(scan_result.injection_status, sizeof(scan_result.injection_status),
+             "%s", "unsupported_platform");
     snprintf(scan_result.cross_process_write_status,
              sizeof(scan_result.cross_process_write_status), "%s", "not_observed");
     uint64_t started_clock_ms = pmfe_result_clock_ms();
@@ -2556,31 +2553,30 @@ static void pmfe_worker_body(void) {
 #ifdef _WIN32
     {
       EdrCorrelationInjectionObservation observation;
-      if (edr_correlation_latest_injection(task.pid, &observation)) {
-        int64_t age_ms = -1;
-        if (observation.event_time_ns > 0) {
-          int64_t event_ms = observation.event_time_ns / 1000000ll;
-          age_ms = (int64_t)scan_result.started_unix_ms - event_ms;
+      int64_t correlation_window_ms = 15ll * 60ll * 1000ll;
+      const char *window_env = getenv("EDR_PMFE_INJECTION_CORRELATION_MS");
+      if (window_env && window_env[0]) {
+        long long configured = strtoll(window_env, NULL, 10);
+        if (configured >= 1000ll && configured <= 24ll * 60ll * 60ll * 1000ll) {
+          correlation_window_ms = configured;
         }
-        int64_t correlation_window_ms = 15ll * 60ll * 1000ll;
-        const char *window_env = getenv("EDR_PMFE_INJECTION_CORRELATION_MS");
-        if (window_env && window_env[0]) {
-          long long configured = strtoll(window_env, NULL, 10);
-          if (configured >= 1000ll && configured <= 24ll * 60ll * 60ll * 1000ll) {
-            correlation_window_ms = configured;
-          }
-        }
-        if (age_ms >= -60000ll && age_ms <= correlation_window_ms) {
-          scan_result.injection_observed = 1u;
-          scan_result.injection_event_time_ns = observation.event_time_ns;
-          scan_result.injection_age_ms = age_ms;
-          snprintf(scan_result.injection_technique,
-                   sizeof(scan_result.injection_technique), "%s",
-                   observation.technique);
-          snprintf(scan_result.injection_source,
-                   sizeof(scan_result.injection_source), "%s",
-                   observation.source);
-        }
+      }
+      snprintf(scan_result.injection_status, sizeof(scan_result.injection_status), "%s",
+               scan_generation.process_start_key && scan_generation.creation_filetime_100ns
+                   ? "not_observed" : "generation_unavailable");
+      if (scan_result.started_unix_ms <= (uint64_t)INT64_MAX / 1000000u &&
+          edr_correlation_latest_injection(&scan_generation,
+              (int64_t)scan_result.started_unix_ms * 1000000ll,
+              correlation_window_ms * 1000000ll, &observation)) {
+        scan_result.injection_observed = 1u;
+        snprintf(scan_result.injection_status, sizeof(scan_result.injection_status), "%s", "observed");
+        scan_result.injection_event_time_ns = observation.event_time_ns;
+        scan_result.injection_age_ms = (int64_t)scan_result.started_unix_ms -
+                                        observation.event_time_ns / 1000000ll;
+        snprintf(scan_result.injection_technique, sizeof(scan_result.injection_technique),
+                 "%s", observation.technique);
+        snprintf(scan_result.injection_source, sizeof(scan_result.injection_source),
+                 "%s", observation.source);
       }
     }
 #endif

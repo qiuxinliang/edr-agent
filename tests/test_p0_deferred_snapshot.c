@@ -30,6 +30,7 @@ int main(void) {
   original.process_creation_filetime_100ns=UINT64_C(134337835418663457);
   original.event_time_ns=INT64_C(1789309942708556400);
   original.file_key=UINT64_MAX-1u;
+  original.syscall_result=INT64_MIN;
   strcpy(original.parent_name,"父进程.exe");
   strcpy(original.cmdline,"powershell.exe -File \"C:\\用户\\context.ps1\"\nsecond line");
   strcpy(binding.rules_bundle_version,"r283");
@@ -52,14 +53,34 @@ int main(void) {
    * fields must fail explicitly, never restore a partial valid-looking record. */
   assert(!edr_p0_deferred_snapshot_decode(json,length-1u,&restored,&decoded,rule,sizeof(rule)));
   cJSON *root=cJSON_Parse(json); assert(root);
-  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),3);
   char *bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad);
-  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),1);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
   cJSON *record=cJSON_GetObjectItemCaseSensitive(root,"record");
   assert(cJSON_ReplaceItemInObjectCaseSensitive(record,"pid",cJSON_CreateString("4294967296")));
   bad=cJSON_PrintUnformatted(root); assert(bad);
+  assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
+  free(bad); cJSON_Delete(root);
+  /* Existing schema-1 durable rows survive upgrade with outcome unknown. */
+  root=cJSON_Parse(json); assert(root);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),1);
+  record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  const char *syscall_fields[] = {"syscall_name", "syscall_sensor", "syscall_result",
+    "syscall_target_pid", "syscall_result_known", "syscall_success", "syscall_success_known"};
+  for (size_t i=0;i<sizeof(syscall_fields)/sizeof(syscall_fields[0]);++i)
+    cJSON_DeleteItemFromObjectCaseSensitive(record,syscall_fields[i]);
+  bad=cJSON_PrintUnformatted(root); assert(bad);
+  assert(edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
+  assert(restored.process_start_key==UINT64_MAX && restored.syscall_name[0]==0);
+  assert(!restored.syscall_result_known && !restored.syscall_success_known);
+  char *legacy=NULL; size_t legacy_length=0;
+  assert(edr_p0_deferred_snapshot_encode(&restored,&decoded,rule,&legacy,&legacy_length));
+  assert(legacy_length==strlen(bad) && strcmp(legacy,bad)==0);
+  free(legacy);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
+  free(bad); bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad); cJSON_Delete(root); free(json);
   /* Worst-case JSON escaping of every bounded source string must fit the

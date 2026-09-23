@@ -1300,7 +1300,78 @@ static void test_parent_directory_is_not_a_ransom_note(void) {
   cJSON_Delete(root);
 }
 
+static void test_linux_syscall_evidence_keeps_unknown_distinct(void) {
+  const struct {
+    const char *fields;
+    int known;
+    int succeeded;
+    const char *result;
+  } cases[] = {
+    {"syscall_success=true\nsyscall_result=4294967297\n", 1, 1, "4294967297"},
+    {"syscall_success=false\nsyscall_result=-13\n", 1, 0, "-13"},
+    {"syscall_success=true\nsyscall_result=0\n", 1, 1, "0"},
+    {"", 0, 0, NULL},
+    {"syscall_success=maybe\nsyscall_result=12trailing\n", 0, 0, NULL},
+    {"syscall_success=true\nsyscall_result=-1\n", 1, 0, "-1"},
+    {"syscall_result=9223372036854775808\n", 0, 0, NULL},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    EdrEventSlot slot;
+    EdrBehaviorRecord record;
+    EdrDetectionDecision decision;
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "ETW1\nprov=auditd\nsensor=auditd\npid=501\ntarget_pid=777\n"
+             "syscall_name=process_vm_writev\nprocess_start_key=3001\n%s", cases[i].fields);
+    fill_slot(&slot, EDR_EVENT_PROCESS_INJECT, payload);
+    edr_behavior_from_slot(&slot, &record);
+    assert(record.pid == 501 && record.syscall_target_pid == 777);
+    assert(record.process_start_key == 3001);
+    assert(record.syscall_success_known == cases[i].known);
+    assert(!cases[i].known || record.syscall_success == cases[i].succeeded);
+    assert(record.syscall_result_known == (cases[i].result != NULL));
+    edr_detection_decision_evaluate(&record, &decision);
+    int is_injection = cases[i].known && cases[i].succeeded &&
+                       cases[i].result && record.syscall_result > 0;
+    assert((strstr(decision.reason, "process_injection_signal") != NULL) == is_injection);
+    cJSON *context = cJSON_Parse(record.detection_context);
+    assert(context);
+    cJSON *evidence = cJSON_GetObjectItemCaseSensitive(context, "engine_evidence");
+    cJSON *syscall = cJSON_GetObjectItemCaseSensitive(evidence, "linux_syscall");
+    assert(cJSON_IsObject(syscall));
+    assert(strcmp(cJSON_GetObjectItemCaseSensitive(syscall, "name")->valuestring, "process_vm_writev") == 0);
+    cJSON *success = cJSON_GetObjectItemCaseSensitive(syscall, "success");
+    assert(cases[i].known ? cJSON_IsBool(success) : success == NULL);
+    if (cases[i].known) assert(cJSON_IsTrue(success) == cases[i].succeeded);
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(syscall, "result");
+    assert(cases[i].result ? cJSON_IsString(result) : result == NULL);
+    if (cases[i].result) assert(strcmp(result->valuestring, cases[i].result) == 0);
+    cJSON_Delete(context);
+  }
+  /* A script/command may discuss a syscall but cannot create collector facts. */
+  EdrEventSlot slot;
+  EdrBehaviorRecord record;
+  fill_slot(&slot, EDR_EVENT_PROCESS_CREATE,
+            "ETW1\nprov=proc\nsensor=auditd\nsyscall_name=process_vm_writev\n"
+            "syscall_success=true\nsyscall_result=4096\n"
+            "cmd=echo syscall_success=true syscall_result=4096\n");
+  edr_behavior_from_slot(&slot, &record);
+  assert(!record.syscall_name[0] && !record.syscall_result_known && !record.syscall_success_known);
+  fill_slot(&slot, EDR_EVENT_PROCESS_INJECT,
+            "ETW1\nprov=ebpf\nsensor=auditd\nsyscall_name=process_vm_writev\n"
+            "syscall_success=true\nsyscall_result=4096\n");
+  edr_behavior_from_slot(&slot, &record);
+  assert(!record.syscall_name[0]);
+  assert(!edr_behavior_is_injection_evidence(&record));
+  fill_slot(&slot, EDR_EVENT_PROCESS_INJECT,
+            "ETW1\nprov=auditd\npid=501\nsyscall=process_vm_writev\n");
+  edr_behavior_from_slot(&slot, &record);
+  assert(strcmp(record.syscall_sensor, "auditd") == 0);
+  assert(!edr_behavior_is_injection_evidence(&record));
+}
+
 int main(void) {
+  test_linux_syscall_evidence_keeps_unknown_distinct();
   test_ransom_admission_snapshot_is_internal_only();
   test_mutation_identity_and_bounded_context();
   test_parent_directory_is_not_a_ransom_note();

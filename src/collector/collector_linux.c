@@ -10,6 +10,7 @@
 #endif
 
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -130,16 +131,33 @@ static void trim_spaces(char *s) {
   }
 }
 
+/* Only complete top-level fields are authoritative. In particular pid= must
+ * never match ppid=/target_pid= or text inside a quoted comm/exe value. */
+static const char *audit_field(const char *line, const char *key) {
+  const size_t key_len = strlen(key);
+  const char *p = line;
+  while (p && *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (strncmp(p, key, key_len) == 0) return p + key_len;
+    int quoted = 0;
+    while (*p) {
+      if (*p == '"') quoted = !quoted;
+      else if (!quoted && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) break;
+      p++;
+    }
+  }
+  return NULL;
+}
+
 static void copy_between_quotes(const char *line, const char *key, char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
   }
   out[0] = '\0';
-  const char *p = strstr(line, key);
+  const char *p = audit_field(line, key);
   if (!p) {
     return;
   }
-  p += strlen(key);
   if (*p == '"') {
     p++;
     size_t i = 0;
@@ -148,36 +166,34 @@ static void copy_between_quotes(const char *line, const char *key, char *out, si
       i++;
     }
     out[i] = '\0';
+    if (p[i] != '"') out[0] = '\0';
   } else {
     size_t i = 0;
-    while (p[i] && p[i] != ' ' && p[i] != '\n' && i + 1u < cap) {
+    while (p[i] && p[i] != ' ' && p[i] != '\t' && p[i] != '\r' && p[i] != '\n' && i + 1u < cap) {
       out[i] = p[i];
       i++;
     }
     out[i] = '\0';
+    if (p[i] && p[i] != ' ' && p[i] != '\t' && p[i] != '\r' && p[i] != '\n') out[0] = '\0';
   }
 }
 
 static long audit_long_field(const char *line, const char *key, long defv) {
-  const char *p = strstr(line, key);
-  if (!p) {
-    return defv;
-  }
-  p += strlen(key);
+  char value[32];
+  copy_between_quotes(line, key, value, sizeof(value));
   char *end = NULL;
-  long v = strtol(p, &end, 10);
-  return end != p ? v : defv;
+  errno = 0;
+  long v = strtol(value, &end, 10);
+  return value[0] && end && *end == '\0' && errno != ERANGE ? v : defv;
 }
 
 static unsigned long audit_hex_field(const char *line, const char *key, unsigned long defv) {
-  const char *p = strstr(line, key);
-  if (!p) {
-    return defv;
-  }
-  p += strlen(key);
+  char text[32];
+  copy_between_quotes(line, key, text, sizeof(text));
   char *end = NULL;
-  unsigned long value = strtoul(p, &end, 16);
-  return end != p ? value : defv;
+  errno = 0;
+  unsigned long value = strtoul(text, &end, 16);
+  return text[0] && text[0] != '-' && end && *end == '\0' && errno != ERANGE ? value : defv;
 }
 
 static int env_truthy(const char *key) {
@@ -206,8 +222,10 @@ static int audit_append_field(char *buf, size_t cap, const char *out_key, const 
     return 0;
   }
   buf[used++] = '=';
-  memcpy(buf + used, value, value_len);
-  used += value_len;
+  for (size_t i = 0; i < value_len; ++i) {
+    char c = value[i];
+    buf[used++] = c == '\r' || c == '\n' ? '_' : c;
+  }
   buf[used++] = '\n';
   buf[used] = '\0';
   return 1;
@@ -221,6 +239,56 @@ static int audit_copy_optional(const char *line, const char *key, const char *ou
     return 1;
   }
   return audit_append_field(buf, cap, out_key, val);
+}
+
+static int audit_append_outcome(const char *line, char *buf, size_t cap) {
+  char success[16], result[32], canonical[32];
+  copy_between_quotes(line, "success=", success, sizeof(success));
+  copy_between_quotes(line, "exit=", result, sizeof(result));
+  if (!result[0]) copy_between_quotes(line, "ret=", result, sizeof(result));
+  int known = 0;
+  int succeeded = 0;
+  if (strcmp(success, "yes") == 0 || strcmp(success, "true") == 0 || strcmp(success, "1") == 0) {
+    known = 1;
+    succeeded = 1;
+  } else if (strcmp(success, "no") == 0 || strcmp(success, "false") == 0 || strcmp(success, "0") == 0) {
+    known = 1;
+  }
+  char *end = NULL;
+  errno = 0;
+  intmax_t value = strtoimax(result, &end, 10);
+  if (result[0] && end && *end == '\0' && errno != ERANGE && value >= INT64_MIN && value <= INT64_MAX) {
+    snprintf(canonical, sizeof(canonical), "%" PRId64, (int64_t)value);
+    if (!audit_append_field(buf, cap, "syscall_result", canonical)) return 0;
+    if (!known || value < 0) {
+      known = 1;
+      succeeded = value >= 0;
+    }
+  }
+  return !known || audit_append_field(buf, cap, "syscall_success", succeeded ? "true" : "false");
+}
+
+static int ebpf_copy_text(const char *line, const char *hex_key, const char *legacy_key,
+                          const char *out_key, char *buf, size_t cap) {
+  char hex[PATH_MAX], value[PATH_MAX];
+  copy_between_quotes(line, hex_key, hex, sizeof(hex));
+  if (!hex[0]) return audit_copy_optional(line, legacy_key, out_key, buf, cap);
+  const char *p = hex;
+  size_t used = 0;
+  while (*p) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    char byte[3] = {p[0], p[1], '\0'};
+    if (!p[1] || (p[2] && p[2] != ' ') || used + 1u >= sizeof(value)) return 0;
+    char *end = NULL;
+    unsigned long decoded = strtoul(byte, &end, 16);
+    if (end != byte + 2 || decoded > 255u) return 0;
+    if (decoded == 0u) break;
+    value[used++] = (char)decoded;
+    p += 2;
+  }
+  value[used] = '\0';
+  return audit_append_field(buf, cap, out_key, value);
 }
 
 static int audit_append_unsigned(char *buf, size_t cap, const char *out_key, unsigned long value) {
@@ -262,7 +330,7 @@ static const LinuxAuditSyscallMap *audit_lookup_syscall(const char *line) {
   }
   char *end = NULL;
   long nr = strtol(name, &end, 10);
-  if (end == name) {
+  if (end == name || *end != '\0') {
     return NULL;
   }
   int aarch64 = strstr(line, "arch=c00000b7") != NULL;
@@ -386,8 +454,8 @@ static void push_audit_event(const char *line) {
   slot.priority = 0;
   slot.consumed = false;
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=auditd\nsensor=auditd\nsyscall=%s\npid=%ld\nppid=%ld\nimg=%s\nprocess=%s\nauid=%s\nuid=%s\ngid=%s\nsession=%s\n",
-                   m->name, pid, ppid, exe[0] ? exe : "-", comm[0] ? comm : "-", auid[0] ? auid : "-",
+                   "ETW1\nprov=auditd\nsensor=auditd\nsyscall=%s\nsyscall_name=%s\npid=%ld\nppid=%ld\nimg=%s\nprocess=%s\nauid=%s\nuid=%s\ngid=%s\nsession=%s\n",
+                   m->name, m->name, pid, ppid, exe[0] ? exe : "-", comm[0] ? comm : "-", auid[0] ? auid : "-",
                    uid[0] ? uid : "-", gid[0] ? gid : "-", ses[0] ? ses : "-");
   if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
@@ -398,6 +466,7 @@ static void push_audit_event(const char *line) {
       !audit_copy_optional(line, "family=", "family", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "success=", "success", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "exit=", "exit", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
+      !audit_append_outcome(line, (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       (target_pid > 0 &&
        !audit_append_unsigned((char *)slot.data, EDR_MAX_EVENT_PAYLOAD, "target_pid", target_pid)) ||
       (env_truthy("EDR_LINUX_INCLUDE_RAW_AUDIT") &&
@@ -421,42 +490,44 @@ static void push_ebpf_trace_event(const char *line) {
   if (!s_bus || !line || !line[0]) {
     return;
   }
+  char syscall[64];
+  copy_between_quotes(line, "syscall=", syscall, sizeof(syscall));
   EdrEventType type = EDR_EVENT_PROCESS_CREATE;
   const char *op = "execve";
-  if (strstr(line, "connect")) {
+  if (strcmp(syscall, "connect") == 0) {
     type = EDR_EVENT_NET_CONNECT;
     op = "connect";
-  } else if (strstr(line, "openat")) {
+  } else if (strcmp(syscall, "openat") == 0) {
     type = EDR_EVENT_FILE_READ;
     op = "openat";
-  } else if (strstr(line, "rename")) {
+  } else if (strcmp(syscall, "rename") == 0 || strcmp(syscall, "renameat") == 0 || strcmp(syscall, "renameat2") == 0) {
     type = EDR_EVENT_FILE_RENAME;
     op = "rename";
-  } else if (strstr(line, "unlink")) {
+  } else if (strcmp(syscall, "unlink") == 0 || strcmp(syscall, "unlinkat") == 0) {
     type = EDR_EVENT_FILE_DELETE;
     op = "unlink";
-  } else if (strstr(line, "chmod") || strstr(line, "chown")) {
+  } else if (strcmp(syscall, "chmod") == 0 || strcmp(syscall, "chown") == 0) {
     type = EDR_EVENT_FILE_PERMISSION_CHANGE;
-    op = strstr(line, "chown") ? "chown" : "chmod";
-  } else if (strstr(line, "setuid")) {
+    op = strcmp(syscall, "chown") == 0 ? "chown" : "chmod";
+  } else if (strcmp(syscall, "setuid") == 0) {
     type = EDR_EVENT_AUTH_PRIVILEGE_ESC;
     op = "setuid";
-  } else if (strstr(line, "ptrace")) {
+  } else if (strcmp(syscall, "ptrace") == 0) {
     type = EDR_EVENT_PROCESS_INJECT;
     op = "ptrace";
-  } else if (strstr(line, "process_vm_writev")) {
+  } else if (strcmp(syscall, "process_vm_writev") == 0) {
     type = EDR_EVENT_PROCESS_INJECT;
     op = "process_vm_writev";
-  } else if (strstr(line, "process_vm_readv")) {
+  } else if (strcmp(syscall, "process_vm_readv") == 0) {
     type = EDR_EVENT_PROCESS_INJECT;
     op = "process_vm_readv";
-  } else if (strstr(line, "memfd_create")) {
+  } else if (strcmp(syscall, "memfd_create") == 0) {
     type = EDR_EVENT_PROCESS_INJECT;
     op = "memfd_create";
-  } else if (strstr(line, "module")) {
+  } else if (strcmp(syscall, "module_load") == 0) {
     type = EDR_EVENT_DRIVER_LOAD;
     op = "module_load";
-  } else if (!strstr(line, "execve")) {
+  } else if (strcmp(syscall, "execve") != 0) {
     return;
   }
   EdrEventSlot slot;
@@ -466,18 +537,19 @@ static void push_ebpf_trace_event(const char *line) {
   slot.priority = 0;
   long pid = audit_long_field(line, "pid=", 0);
   int n = snprintf((char *)slot.data, EDR_MAX_EVENT_PAYLOAD,
-                   "ETW1\nprov=ebpf\nsensor=ebpf\nsyscall=%s\npid=%ld\n", op, pid);
+                   "ETW1\nprov=ebpf\nsensor=ebpf\nsyscall=%s\nsyscall_name=%s\npid=%ld\n", op, op, pid);
   if (n <= 0 || (size_t)n >= EDR_MAX_EVENT_PAYLOAD) {
     return;
   }
-  if (!audit_copy_optional(line, "comm=", "process", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
-      !audit_copy_optional(line, "exe=", "img", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
+  if (!audit_append_outcome(line, (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
+      !ebpf_copy_text(line, "comm_hex=", "comm=", "process", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
+      !ebpf_copy_text(line, "exe_hex=", "exe=", "img", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "file=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "path=", "file", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "dst=", "dst", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "dport=", "dport", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       !audit_copy_optional(line, "target_pid=", "target_pid", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
-      !audit_copy_optional(line, "name=", "memfd_name", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
+      !ebpf_copy_text(line, "name_hex=", "name=", "memfd_name", (char *)slot.data, EDR_MAX_EVENT_PAYLOAD) ||
       (env_truthy("EDR_LINUX_INCLUDE_RAW_EBPF") &&
        !audit_append_raw_prefix((char *)slot.data, EDR_MAX_EVENT_PAYLOAD, line, 1100u))) {
     s_health.collector_dropped++;

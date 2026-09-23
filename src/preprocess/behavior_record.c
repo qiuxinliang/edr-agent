@@ -19,6 +19,19 @@ void edr_behavior_record_init(EdrBehaviorRecord *r) {
   snprintf(r->endpoint_id, sizeof(r->endpoint_id), "ep-local");
 }
 
+int edr_behavior_is_injection_evidence(const EdrBehaviorRecord *r) {
+  if (!r || (r->type != EDR_EVENT_PROCESS_INJECT && r->type != EDR_EVENT_THREAD_CREATE_REMOTE))
+    return 0;
+  if (strcmp(r->syscall_sensor, "auditd") != 0 && strcmp(r->syscall_sensor, "ebpf") != 0)
+    return 1;
+  if (!r->syscall_success_known || !r->syscall_success || !r->syscall_result_known)
+    return 0;
+  if (strcmp(r->syscall_name, "process_vm_writev") == 0) return r->syscall_result > 0;
+  /* The ptrace request is not captured: successful ATTACH/GETREGS is not
+   * evidence of a memory write. Retain the event without upgrading it. */
+  return 0;
+}
+
 int edr_behavior_source_field_truncated(const EdrBehaviorRecord *r, const char *field) {
   const char *cursor;
   size_t len;

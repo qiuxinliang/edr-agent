@@ -5,6 +5,7 @@
 #include "edr/p0_source_only_contract.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1197,6 +1198,13 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
 
 typedef struct {
   char prov[48];
+  char syscall_name[64];
+  char syscall_sensor[16];
+  int64_t syscall_result;
+  uint32_t syscall_target_pid;
+  uint8_t syscall_result_known;
+  uint8_t syscall_success;
+  uint8_t syscall_success_known;
   unsigned long eid;
   char img[EDR_BR_STR_LONG];
   char cmd[EDR_BR_STR_LONG];
@@ -1698,6 +1706,32 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   }
   if (strcmp(key, "prov") == 0) {
     snprintf(f->prov, sizeof(f->prov), "%s", val);
+  } else if (strcmp(key, "syscall_name") == 0) {
+    (void)copy_text_exact(f->syscall_name, sizeof(f->syscall_name), val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "syscall_success") == 0) {
+    f->syscall_success_known = strcmp(val, "true") == 0 || strcmp(val, "false") == 0;
+    f->syscall_success = strcmp(val, "true") == 0;
+    if (f->syscall_success_known) append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "syscall_result") == 0) {
+    char *end = NULL;
+    errno = 0;
+    long long result = strtoll(val, &end, 10);
+    f->syscall_result_known = val[0] && end && *end == '\0' && errno != ERANGE;
+    if (f->syscall_result_known) {
+      f->syscall_result = (int64_t)result;
+      append_sensor_kv(f, key, val);
+    }
+  } else if (strcmp(key, "sensor") == 0) {
+    (void)copy_text_exact(f->syscall_sensor, sizeof(f->syscall_sensor), val);
+    append_sensor_kv(f, key, val);
+  } else if (strcmp(key, "target_pid") == 0) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long target = strtoull(val, &end, 10);
+    if (val[0] && val[0] != '-' && end && *end == '\0' && errno != ERANGE && target <= UINT32_MAX)
+      f->syscall_target_pid = (uint32_t)target;
+    append_sensor_kv(f, key, val);
   } else if (strcmp(key, "eid") == 0) {
     f->eid = parse_ulong_auto(val);
   } else if (strcmp(key, "pid") == 0) {
@@ -1814,12 +1848,15 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
              strcmp(key, "followup_only") == 0 ||
              strcmp(key, "source_alert_id") == 0 || strcmp(key, "pmfe_status") == 0 ||
              strcmp(key, "pmfe_verdict") == 0 || strcmp(key, "private_exec") == 0 ||
+             strcmp(key, "private_exec_image_hits") == 0 ||
+             strcmp(key, "private_exec_thread_starts") == 0 ||
+             strcmp(key, "module_integrity_scope") == 0 ||
+             strcmp(key, "injection_status") == 0 ||
              strcmp(key, "mz_hits") == 0 || strcmp(key, "stomp_suspicious") == 0 ||
              strcmp(key, "thread_start_matches") == 0 || strcmp(key, "read_failures") == 0 ||
              strcmp(key, "injection_observed") == 0 || strcmp(key, "syscall") == 0 ||
              strcmp(key, "memfd_exec") == 0 || strcmp(key, "deleted_exec") == 0 ||
-             strcmp(key, "target_pid") == 0 || strcmp(key, "memfd_name") == 0 ||
-             strcmp(key, "sensor") == 0) {
+             strcmp(key, "memfd_name") == 0) {
     append_sensor_kv(f, key, val);
   } else if (strcmp(key, "path") == 0 && !f->file[0]) {
     (void)etw1_copy_text(f, f->file, sizeof(f->file), val, EDR_ETW_TRUNC_FILE_PATH);
@@ -2144,6 +2181,24 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
 
   Etw1Fields ef;
   if (slot->size > 0 && etw1_parse(slot->data, slot->size, &ef) == 0) {
+    /* These facts originate in the Linux collector envelope, never in script
+     * or command text. Older enter-only producers keep an unknown outcome. */
+    if (strcmp(ef.prov, "auditd") == 0 || strcmp(ef.prov, "ebpf") == 0)
+      (void)copy_text_exact(r->syscall_sensor, sizeof(r->syscall_sensor), ef.prov);
+    if ((strcmp(ef.prov, "auditd") == 0 || strcmp(ef.prov, "ebpf") == 0) &&
+        strcmp(ef.prov, ef.syscall_sensor) == 0 && ef.syscall_name[0]) {
+      (void)copy_text_exact(r->syscall_name, sizeof(r->syscall_name), ef.syscall_name);
+      (void)copy_text_exact(r->syscall_sensor, sizeof(r->syscall_sensor), ef.syscall_sensor);
+      r->syscall_target_pid = ef.syscall_target_pid;
+      r->syscall_result = ef.syscall_result;
+      r->syscall_result_known = ef.syscall_result_known;
+      r->syscall_success = ef.syscall_success;
+      r->syscall_success_known = ef.syscall_success_known;
+      if (r->syscall_result_known && r->syscall_result < 0) {
+        r->syscall_success_known = 1u;
+        r->syscall_success = 0u;
+      }
+    }
     r->kernel_file_write = slot->type == EDR_EVENT_FILE_WRITE &&
                            strcmp(ef.prov, "kfile") == 0;
     r->kernel_file_activity = is_file_activity_event(slot->type) &&

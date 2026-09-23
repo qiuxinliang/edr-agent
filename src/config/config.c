@@ -18,7 +18,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r283-245523c2"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r283-d566ab75"
 
 /*
  * Some older Windows bootstrap packages wrote paths such as

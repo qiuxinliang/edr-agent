@@ -5578,6 +5578,8 @@ static cJSON *pmfe_region_json(const char *command_id, EdrPmfeRegionResult *r,
   cJSON_AddStringToObject(item, "reason", r->reason);
   cJSON_AddStringToObject(item, "sha256", r->sha256);
   cJSON_AddBoolToObject(item, "read_ok", r->read_ok ? 1 : 0);
+  cJSON_AddBoolToObject(item, "image_header_valid", r->image_header_valid ? 1 : 0);
+  cJSON_AddBoolToObject(item, "private_executable", r->private_executable ? 1 : 0);
   if (r->pe_arch[0]) {
     cJSON *pe = cJSON_AddObjectToObject(item, "pe");
     cJSON_AddStringToObject(pe, "arch", r->pe_arch);
@@ -5716,6 +5718,9 @@ static char *pmfe_completion_result_json(PmfeCompletion *completion) {
   cJSON_AddNumberToObject(signals, "entropy_max", r->entropy_max);
   cJSON_AddNumberToObject(signals, "regions_scanned", r->regions_total);
   cJSON_AddNumberToObject(signals, "private_exec", r->private_exec);
+  cJSON_AddNumberToObject(signals, "private_exec_image_hits", r->private_exec_image_hits);
+  cJSON_AddNumberToObject(signals, "private_exec_thread_starts", r->private_exec_thread_starts);
+  cJSON_AddStringToObject(signals, "module_integrity_scope", r->module_integrity_scope);
   cJSON_AddNumberToObject(signals, "memfd_exec", r->memfd_exec);
   cJSON_AddNumberToObject(signals, "deleted_exec", r->deleted_exec);
   cJSON_AddStringToObject(signals, "module_consistency", r->module_consistency);
@@ -5731,6 +5736,7 @@ static char *pmfe_completion_result_json(PmfeCompletion *completion) {
       "No source-to-target memory write telemetry was available for this scan");
   cJSON *injection = cJSON_AddObjectToObject(correlation, "injection_signal");
   cJSON_AddBoolToObject(injection, "observed", r->injection_observed ? 1 : 0);
+  cJSON_AddStringToObject(injection, "status", r->injection_status);
   if (r->injection_observed) {
     char event_time_ns[32];
     snprintf(event_time_ns, sizeof(event_time_ns), "%lld",
