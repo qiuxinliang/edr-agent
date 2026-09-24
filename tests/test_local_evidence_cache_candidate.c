@@ -35,7 +35,8 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #endif
 
 bool edr_resource_preprocess_throttle_active(void) { return false; }
-uint64_t edr_monotonic_ns(void) { return 1000000000ull; }
+static uint64_t s_test_monotonic_ns = 1000000000ull;
+uint64_t edr_monotonic_ns(void) { return s_test_monotonic_ns; }
 /* The parser's unrelated enforcement side effect is outside this fixture. */
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
@@ -1579,6 +1580,179 @@ static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
   assert(sqlite_table_count(db, "p0_candidates") == 101u);
   assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
   edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+}
+
+/* Reproduce a cache dominated by refs whose candidates have already gone.
+ * The shared fact and the surviving candidate remain readable after pressure
+ * cleanup; a later no-pressure reopen preserves independent refs. */
+static void test_capacity_prefers_unowned_refs_and_preserves_consumers(void) {
+  char db[512];
+  char command[32769];
+  struct timespec ts;
+  EdrBehaviorRecord identity;
+  EdrEvidenceCacheStatus status;
+  sqlite3 *raw = NULL;
+  sqlite3_stmt *st = NULL;
+  char *error = NULL;
+  char *readback;
+  uint64_t remaining_refs;
+  const char *fixture =
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns) "
+      "VALUES('live-pressure',CAST(strftime('%s','now') AS INTEGER)*1000000000);"
+      "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,created_ns) "
+      "VALUES('shared','ep-pressure','tenant-pressure','{\"candidate_id\":null,\"value\":1}',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000),"
+      "('unowned','ep-pressure','tenant-pressure','{\"candidate_id\":null,\"value\":2}',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000);"
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status) "
+      "VALUES('live-ref','live-pressure','shared','\"live-pressure\"',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000,'local_manifest');"
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1200) "
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status) "
+      "SELECT 'orphan-'||x,'missing-'||x,CASE WHEN x<=1000 THEN 'unowned' ELSE 'shared' END,"
+      "'\"'||printf('%01000d',x)||'\"',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000+x,'local_manifest' FROM n;";
+
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw, fixture, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 1201u);
+
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_capacity_evicted >= 1000u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  assert(sqlite_table_count(db, "candidate_context_refs") > 1u);
+  assert(sqlite_table_count(db, "candidate_context_refs") < 1201u);
+  assert(sqlite_table_count(db, "context_facts") == 1u);
+  assert(sqlite_table_count(db, EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) ==
+         sqlite_table_count(db, "candidate_context_refs"));
+  assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(raw,
+      "SELECT manifest_json FROM materialized_artifacts WHERE artifact_id='live-ref';",
+      -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0),
+                "{\"candidate_id\":\"live-pressure\",\"value\":1}") == 0);
+  sqlite3_finalize(st);
+  assert(sqlite3_prepare_v2(raw,
+      "SELECT manifest_template_json FROM context_facts WHERE fact_id='shared';",
+      -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(st, 0),
+                "{\"candidate_id\":null,\"value\":1}") == 0);
+  sqlite3_finalize(st);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  raw = NULL;
+  assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
+
+  init_record(&identity, EDR_EVENT_PROCESS_CREATE);
+  identity.pid = 74401u;
+  identity.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&identity, UINT64_C(0x74401));
+  snprintf(identity.endpoint_id, sizeof(identity.endpoint_id), "ep-pressure");
+  snprintf(identity.tenant_id, sizeof(identity.tenant_id), "tenant-pressure");
+  fill_text(command, sizeof(command), 32768u, 'A');
+  assert(edr_local_evidence_cache_save_command_fact(&identity, command) == 0);
+  readback = edr_local_evidence_cache_read_command_fact(&identity);
+  assert(readback && strlen(readback) == 32768u && memcmp(readback, command, 32769u) == 0);
+  free(readback);
+  edr_local_evidence_cache_close();
+
+  /* Normal capacity retains standalone refs and the full command artifact. */
+  remaining_refs = sqlite_table_count(db, "candidate_context_refs");
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(sqlite_table_count(db, "candidate_context_refs") == remaining_refs);
+  readback = edr_local_evidence_cache_read_command_fact(&identity);
+  assert(readback && strlen(readback) == 32768u && memcmp(readback, command, 32769u) == 0);
+  free(readback);
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+}
+
+static void test_runtime_reclaim_reprepares_shared_context_fact(void) {
+  char db[512], first_id[160], second_id[160];
+  struct timespec ts;
+  EdrBehaviorRecord first, second, context;
+  EdrEvidenceCacheStatus before, after;
+  sqlite3 *raw = NULL;
+  sqlite3_stmt *st = NULL;
+  char *error = NULL;
+  const char *pressure_sql =
+      "UPDATE candidate_context_refs SET created_ns="
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000;"
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<998) "
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status) "
+      "SELECT 'stale-'||x,'gone-'||x,(SELECT fact_id FROM context_facts "
+      "WHERE manifest_template_json LIKE '%runtime-context%' LIMIT 1),"
+      "'\"'||printf('%01500d',x)||'\"',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000+x,'local_manifest' FROM n;";
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  init_record(&first, EDR_EVENT_NET_CONNECT);
+  first.priority = 3u;
+  first.pid = 74402u;
+  first.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&first, UINT64_C(0x74402));
+  snprintf(first.endpoint_id, sizeof(first.endpoint_id), "ep-runtime-reclaim");
+  snprintf(first.event_id, sizeof(first.event_id), "runtime-first");
+  snprintf(first.process_name, sizeof(first.process_name), "powershell.exe");
+  snprintf(first.net_dst, sizeof(first.net_dst), "10.74.4.2");
+  first.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&first);
+  sqlite_candidate_id_for_source_event(db, first.event_id, first_id, sizeof(first_id));
+  context = first;
+  context.priority = 1u;
+  context.type = EDR_EVENT_PROCESS_CREATE;
+  context.event_time_ns += 3000000LL;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
+  snprintf(context.event_id, sizeof(context.event_id), "runtime-context");
+  snprintf(context.process_name, sizeof(context.process_name), "helper.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "helper.exe --context");
+  assert(edr_local_evidence_cache_is_candidate(&context) == 0);
+  edr_local_evidence_cache_record_behavior(&context);
+  assert(sqlite_table_count(db, "context_facts") == 1u);
+  assert(sqlite_post_artifact_count(db, first_id, context.event_id) == 1u);
+
+  second = first;
+  second.event_time_ns += 2000000LL;
+  snprintf(second.event_id, sizeof(second.event_id), "runtime-second");
+  snprintf(second.net_dst, sizeof(second.net_dst), "10.74.4.3");
+  edr_local_evidence_cache_record_behavior(&second);
+  sqlite_candidate_id_for_source_event(db, second.event_id, second_id, sizeof(second_id));
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw, pressure_sql, NULL, NULL, &error) == SQLITE_OK);
+  sqlite3_free(error);
+  error = NULL;
+  assert(sqlite3_prepare_v2(raw, "DELETE FROM p0_candidates WHERE candidate_id=?;",
+                            -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 1, first_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 1000u);
+
+  edr_local_evidence_cache_get_status(&before);
+  assert(sqlite_post_artifact_count(db, second_id, context.event_id) == 0u);
+  s_test_monotonic_ns = 12000000000ull;
+  edr_local_evidence_cache_record_behavior(&context);
+  s_test_monotonic_ns = 1000000000ull;
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.maintenance_runs > before.maintenance_runs);
+  assert(after.context_facts_written == before.context_facts_written + 1u);
+  assert(sqlite_table_count(db, "context_facts") == 1u);
+  assert(sqlite_post_artifact_count(db, second_id, context.event_id) == 1u);
+  edr_local_evidence_cache_close();
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   cleanup_test_sqlite_path(db);
 }
 
@@ -4971,6 +5145,8 @@ int main(void) {
   test_critical_context_distinct_events_exceed_legacy_fixed_limit();
   test_critical_context_still_honors_database_capacity();
   test_capacity_reclaims_free_pages_before_evicting_candidates();
+  test_capacity_prefers_unowned_refs_and_preserves_consumers();
+  test_runtime_reclaim_reprepares_shared_context_fact();
   test_critical_context_still_honors_retention();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
   test_candidate_fallback_preserves_path_and_generation_boundaries();

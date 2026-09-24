@@ -3774,6 +3774,7 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
   PreparedContextArtifacts prepared;
   uint32_t budget_units;
   uint32_t materialized_changes;
+  uint64_t maintenance_runs;
   if (written) *written = 0u;
   if (sqlite_prepare_context_artifacts(r, candidate_ids, candidate_count,
                                        &prepared) != 0) {
@@ -3785,8 +3786,25 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
     sqlite_free_prepared_context_artifacts(&prepared);
     return 0;
   }
-  if (!sqlite_size_budget_allow() ||
-      !sqlite_write_budget_allow(budget_units, ts, write_class)) {
+  maintenance_runs = s_status.maintenance_runs;
+  if (!sqlite_size_budget_allow()) {
+    sqlite_free_prepared_context_artifacts(&prepared);
+    return -1;
+  }
+  if (s_status.maintenance_runs != maintenance_runs) {
+    /* Capacity maintenance may remove the last old ref and its fact after
+     * preparation. Recheck before writing a ref to that fact. */
+    sqlite_free_prepared_context_artifacts(&prepared);
+    if (sqlite_prepare_context_artifacts(r, candidate_ids, candidate_count,
+                                         &prepared) != 0) return -1;
+    budget_units = (prepared.fact_insert || prepared.ref_count) ? 1u : 0u;
+    materialized_changes = prepared.ref_count;
+    if (budget_units == 0u) {
+      sqlite_free_prepared_context_artifacts(&prepared);
+      return 0;
+    }
+  }
+  if (!sqlite_write_budget_allow(budget_units, ts, write_class)) {
     sqlite_free_prepared_context_artifacts(&prepared);
     return -1;
   }
@@ -4319,6 +4337,29 @@ static void sqlite_maintenance(void) {
      * deleting candidates, and stop deleting once the live set fits. */
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     for (int pass = 0; pass < 4 && sqlite_live_size_over_limit() > 0; pass++) {
+      /* Reclaim bounded old refs with no surviving candidate first. Their
+       * facts are shared, so remove only facts with no remaining refs. A
+       * productive orphan batch must not evict live candidates or command
+       * artifacts in the same pass. */
+      if (exec_sql("DELETE FROM candidate_context_refs WHERE rowid IN ("
+                   "SELECT r.rowid FROM candidate_context_refs r "
+                   "WHERE NOT EXISTS (SELECT 1 FROM p0_candidates c "
+                   "WHERE c.candidate_id=r.candidate_id) "
+                   "ORDER BY r.created_ns ASC,r.rowid ASC LIMIT 1000);") != 0) {
+        break;
+      }
+      int orphan_changes = sqlite3_changes(s_db);
+      if (orphan_changes > 0) {
+        s_status.db_capacity_evicted += (uint64_t)orphan_changes;
+        if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
+                     "SELECT 1 FROM candidate_context_refs "
+                     "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") != 0) {
+          break;
+        }
+        int fact_changes = sqlite3_changes(s_db);
+        if (fact_changes > 0) s_status.db_capacity_evicted += (uint64_t)fact_changes;
+        continue;
+      }
       if (exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);") == 0) {
         int changes = sqlite3_changes(s_db);
         if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
