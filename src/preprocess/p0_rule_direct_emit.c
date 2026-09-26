@@ -4103,9 +4103,11 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record) {
 
 #undef p0_json_escape_or_empty
 
-int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
-                                             const EdrCommandFacts *provided_facts) {
+int edr_p0_rule_try_emit_with_command_facts_status(
+    const EdrBehaviorRecord *br, const EdrCommandFacts *provided_facts,
+    int *proven_miss) {
   int emitted_count = 0;
+  if (proven_miss) *proven_miss = 0;
   if (!br || !provided_facts) {
     return 0;
   }
@@ -4275,6 +4277,11 @@ int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
                                           provided_facts);
         }
       }
+      if (!descriptor_failure && !gate_closed && evaluation.match_count == 0u &&
+          !(br->type == EDR_EVENT_PROCESS_CREATE
+                ? edr_p0_rule_process_create_hard_reject(br)
+                : edr_behavior_p0_source_quality_hard_reject(br)) &&
+          proven_miss) *proven_miss = 1;
       edr_p0_rule_ir_evaluation_free(&evaluation);
       if (!descriptor_failure) {
         return emitted_count;
@@ -4297,9 +4304,16 @@ int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
   return emitted_count;
 }
 
-int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
+int edr_p0_rule_try_emit_with_command_facts(const EdrBehaviorRecord *br,
+                                             const EdrCommandFacts *facts) {
+  return edr_p0_rule_try_emit_with_command_facts_status(br, facts, NULL);
+}
+
+int edr_p0_rule_try_emit_status(const EdrBehaviorRecord *br,
+                                int *proven_miss) {
   EdrCommandFacts facts = {0};
   int emitted;
+  if (proven_miss) *proven_miss = 0;
   int hard_reject = br && (br->type == EDR_EVENT_PROCESS_CREATE
       ? edr_p0_rule_process_create_hard_reject(br)
       : edr_behavior_p0_source_quality_hard_reject(br));
@@ -4308,7 +4322,12 @@ int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
       (!p0_is_ruleset_evaluation_event(br->type) || edr_p0_rule_ir_is_ready())) {
     edr_local_evidence_cache_resolve_commands(br, &facts.subject, &facts.parent);
   }
-  emitted = edr_p0_rule_try_emit_with_command_facts(br, &facts);
+  emitted = edr_p0_rule_try_emit_with_command_facts_status(br, &facts,
+                                                           proven_miss);
   free(facts.subject); free(facts.parent);
   return emitted;
+}
+
+int edr_p0_rule_try_emit(const EdrBehaviorRecord *br) {
+  return edr_p0_rule_try_emit_status(br, NULL);
 }

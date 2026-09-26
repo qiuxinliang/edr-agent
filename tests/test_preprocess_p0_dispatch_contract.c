@@ -46,11 +46,11 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/src/preprocess/preprocess_pipeline.c", root);
   source = read_file(path);
   if (!source) return 1;
-  p0_call = strstr(source, "int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts(&br, facts)");
+  p0_call = strstr(source, "int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts_status(");
   decision = strstr(source, "edr_detection_decision_evaluate(&br, &dd);");
   local_only = strstr(source, "edr_preprocess_admit_telemetry(&br, &dd)");
   p0_guard = strstr(source, "if (p0_emitted > 0) {\n    return;\n  }");
-  upload_gate = p0_guard ? strstr(p0_guard, "edr_preprocess_upload_admit(&br, &dd, edr_p0_rule_ir_is_ready(),") : NULL;
+  upload_gate = p0_guard ? strstr(p0_guard, "edr_preprocess_upload_admit(&br, &dd, p0_proven_miss,") : NULL;
   local_ave = decision ? strstr(decision, "edr_ave_cross_engine_feed_from_record(&br);") : NULL;
   local_forensics = local_ave ? strstr(local_ave, "edr_command_dispatch_recommended_forensics(&br);") : NULL;
   throttle_proven_miss = strstr(source, "static int p0_resource_throttle_proven_miss");

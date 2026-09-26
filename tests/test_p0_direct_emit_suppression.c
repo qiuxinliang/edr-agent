@@ -633,6 +633,7 @@ static void test_internal_markers_do_not_skip_p0(void) {
   for (size_t i = 0u; i < command_count + path_count + 3u; ++i) {
     EdrBehaviorRecord r;
     EdrP0DedupMetrics metrics;
+    int proven_miss = 1;
     edr_p0_rule_test_reset_dedup();
     edr_p0_rule_test_set_monotonic_ms(1000u);
     g_emit_count = 0;
@@ -648,11 +649,14 @@ static void test_internal_markers_do_not_skip_p0(void) {
       snprintf(r.detection_context, sizeof(r.detection_context), "%s",
                i == command_count + path_count + 1u ?
                    "{\"edr_internal\":true}" : "{\"source\":\"agent_internal\"}");
-    assert(edr_p0_rule_try_emit(&r) == 1);
+    assert(edr_p0_rule_try_emit_status(&r, &proven_miss) == 1);
+    assert(proven_miss == 0);
     assert(atomic_load(&g_ir_evaluation_calls) == 1);
     assert(g_emit_count == 1);
     /* These labels also cannot bypass the normal exact-source replay owner. */
-    assert(edr_p0_rule_try_emit(&r) == 0);
+    proven_miss = 1;
+    assert(edr_p0_rule_try_emit_status(&r, &proven_miss) == 0);
+    assert(proven_miss == 0);
     assert(atomic_load(&g_ir_evaluation_calls) == 2);
     assert(g_emit_count == 1);
     edr_p0_rule_get_dedup_metrics(&metrics);
@@ -1571,6 +1575,7 @@ static void test_p0_governor_suppression_is_not_queue_backpressure(void) {
 
 static void test_p0_miss_does_not_emit_combined_frame(void) {
   EdrBehaviorRecord r;
+  int proven_miss = 0;
 
   assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
   assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
@@ -1582,7 +1587,8 @@ static void test_p0_miss_does_not_emit_combined_frame(void) {
   r.pid = 99007u;
   r.event_time_ns = 107u;
   atomic_store(&g_ir_evaluation_calls, 0);
-  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(edr_p0_rule_try_emit_status(&r, &proven_miss) == 0);
+  assert(proven_miss == 1);
   assert(g_emit_count == 0);
   assert(atomic_load(&g_ir_evaluation_calls) == 1); /* actual miss, not admission rejection */
 }
@@ -1695,6 +1701,7 @@ static void test_p0_bundle_sha256_is_required_and_attached(void) {
 
 static void test_ir_evaluation_failure_durably_preserves_source_without_alert(void) {
   EdrBehaviorRecord r;
+  int proven_miss = 1;
   assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
   assert(test_setenv("EDR_P0_DEDUP_SEC", "3", 1) == 0);
   edr_p0_rule_test_reset_dedup();
@@ -1709,7 +1716,8 @@ static void test_ir_evaluation_failure_durably_preserves_source_without_alert(vo
   r.event_time_ns = 111u;
   snprintf(r.cmdline, sizeof(r.cmdline), "powershell.exe -enc SQBFAFgA");
   /* A durable source-only gate is not an alert/combined frame. */
-  assert(edr_p0_rule_try_emit(&r) == 0);
+  assert(edr_p0_rule_try_emit_status(&r, &proven_miss) == 0);
+  assert(proven_miss == 0);
   assert(g_emit_count == 0);
   assert(g_durable_count == 1);
   assert(strstr(g_last_record.detection_context,

@@ -1425,8 +1425,10 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   /* P0 owns its hard-invalid, registry-attribution, and
    * policy guards. Evaluate before generic admission so a local-only source
    * can still be represented by one combined source+alert frame. */
-  int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts(&br, facts)
-                         : edr_p0_rule_try_emit(&br);
+  int p0_proven_miss = 0;
+  int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts_status(
+                               &br, facts, &p0_proven_miss)
+                         : edr_p0_rule_try_emit_status(&br, &p0_proven_miss);
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   EdrDetectionDecision dd;
@@ -1445,7 +1447,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   if (p0_emitted > 0) {
     return;
   }
-  if (!edr_preprocess_upload_admit(&br, &dd, edr_p0_rule_ir_is_ready(),
+  if (!edr_preprocess_upload_admit(&br, &dd, p0_proven_miss,
                                    local_forensics_dispatched)) return;
   emit_behavior_record(&br);
 }
