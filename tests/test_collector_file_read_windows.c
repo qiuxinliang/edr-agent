@@ -400,11 +400,58 @@ int main(void) {
                   "so capability_healthy=0 is expected independently of Read publication\n");
   /* Do not inherit bypass/admission or debug settings from a developer shell. */
   assert(_putenv_s("EDR_COLLECTOR_ADMIT_ALL", "0") == 0);
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
   assert(_putenv_s("EDR_TDH_DEBUG", "0") == 0);
   for (unsigned version = 0u; version <= 1u; ++version) {
     test_sequence(version, 4u);
     test_sequence(version, 8u);
   }
+  /* A long-lived Agent handle can have no retained Create or NameCreate.
+   * Suppress only the proven live Agent generation before it opens a P0 gate. */
+  reset("self_unbound_read_does_not_open_gate");
+  EdrLiveProcessGeneration self = {
+      reader_pid, UINT64_C(0x7211), UINT64_C(116444736000000001)};
+  edr_collector_file_io_test_self_identity(&self);
+  Fixture self_read;
+  make_event(&self_read, 15u, 1u, 8u, UINT64_C(0x721100), UINT64_C(0x721101), NULL);
+  feed(&self_read, 150u);
+  EdrCollectorHealth health;
+  EdrEventSlot pending;
+  edr_collector_file_io_test_health(&health);
+  assert(bus.published == 0u && !edr_collector_file_io_test_pending(&pending));
+  assert(health.agent_self_direct_pid_suppressed == 1u);
+  assert(health.file_read_name_cache_misses == 0u &&
+         health.file_read_metadata_gate_staged == 0u);
+
+  reset("explicit_self_diagnostics_retains_source_only");
+  edr_collector_file_io_test_self_identity(&self);
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "1") == 0);
+  expect_rejected(&self_read, 150u,
+                  EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+  assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
+
+  reset("precreation_pid_reuse_remains_source_only");
+  self.creation_filetime_100ns = UINT64_C(116444736000000002);
+  edr_collector_file_io_test_self_identity(&self);
+  expect_rejected(&self_read, 150u, EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+  edr_collector_file_io_test_health(&health);
+  assert(health.agent_self_direct_pid_suppressed == 0u);
+
+  reset("canary_marked_agent_read_remains_source_only");
+  self.creation_filetime_100ns = UINT64_C(116444736000000001);
+  edr_collector_file_io_test_self_identity(&self);
+  edr_collector_register_policy_canary_process(reader_pid,
+                                               "EDR_POLICY_CANARY_collector_fixture");
+  FILETIME now;
+  GetSystemTimePreciseAsFileTime(&now);
+  uint64_t now_filetime = ((uint64_t)now.dwHighDateTime << 32u) | now.dwLowDateTime;
+  assert(now_filetime > UINT64_C(116444736000000000));
+  expect_rejected(&self_read,
+                  (now_filetime - UINT64_C(116444736000000000)) * 100u,
+                  EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED);
+  edr_collector_file_io_test_health(&health);
+  assert(health.agent_self_direct_pid_suppressed == 0u);
+
   puts("collector_file_read_windows: real metadata/resolver/slot/gate cases passed (v0/v1, 32/64-bit)");
   return 0;
 }

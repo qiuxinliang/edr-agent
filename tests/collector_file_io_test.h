@@ -9,12 +9,14 @@
 #include <evntcons.h>
 #include "edr/event_bus.h"
 #include "edr/collector.h"
+#include "edr/process_generation.h"
 
 void edr_collector_file_io_test_reset(EdrEventBus *bus);
 uint64_t edr_collector_file_io_test_new_epoch(void);
 void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns);
 int edr_collector_file_io_test_pending(EdrEventSlot *slot);
 void edr_collector_file_io_test_health(EdrCollectorHealth *health);
+void edr_collector_file_io_test_self_identity(const EdrLiveProcessGeneration *identity);
 /* Test-owned injection at the real binding append boundary. */
 void edr_collector_file_io_test_before_binding(EdrEventSlot *slot);
 

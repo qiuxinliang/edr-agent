@@ -908,6 +908,7 @@ unavailable:
 }
 
 typedef enum {
+  EDR_AGENT_SELF_DROP_DIRECT_PID = 1,
   EDR_AGENT_SELF_DROP_RECORD = 3,
   EDR_AGENT_SELF_DROP_INTEREST = 4,
 } EdrAgentSelfDropSource;
@@ -920,6 +921,8 @@ static void edr_agent_self_count_drop_source(EdrAgentSelfDropSource source) {
     s_health.agent_self_record_suppressed++;
   else if (source == EDR_AGENT_SELF_DROP_INTEREST)
     s_health.agent_self_interest_suppressed++;
+  else if (source == EDR_AGENT_SELF_DROP_DIRECT_PID)
+    s_health.agent_self_direct_pid_suppressed++;
 }
 
 static int edr_policy_canary_marker(const char *s) {
@@ -3434,6 +3437,29 @@ static int edr_collector_event_process_start_key(const EVENT_RECORD *record,
   return 0;
 }
 
+/* Filter only a typed Read from this live Agent generation. Keep provider
+ * metadata: a handle opened here can later be read by another process.
+ * Unknown time, another StartKey, canary-marked PIDs and diagnostic self collection
+ * retain the normal path and its source-only failure contract. */
+static int edr_agent_self_suppress_file_read_source(const EVENT_RECORD *record,
+                                                    uint64_t event_ns) {
+  uint64_t start_key = 0u;
+  uint32_t pid;
+  if (!record || !event_ns || edr_collector_keep_agent_self_events() ||
+      memcmp(&record->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_FILE,
+             sizeof(GUID)) != 0 ||
+      !edr_kernel_file_read_descriptor(&record->EventHeader.EventDescriptor)) {
+    return 0;
+  }
+  pid = record->EventHeader.ProcessId;
+  if (edr_policy_canary_pid_seen(pid, event_ns)) return 0;
+  (void)edr_collector_event_process_start_key(record, &start_key);
+  if (!edr_collector_self_identity_matches_file_read(
+          &s_agent_self_identity, pid, event_ns, start_key)) return 0;
+  edr_agent_self_count_drop_source(EDR_AGENT_SELF_DROP_DIRECT_PID);
+  return 1;
+}
+
 /* EventHeader.TimeStamp is retained strictly as source event time.  For a
  * Kernel-Process Start, target generation comes from the TDH event payload
  * and is validated against a handle for that target PID.  The extended
@@ -4126,6 +4152,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   if (!s_bus || !event_record || !tag) {
     return;
   }
+  /* The callback handles this before A4.4 enqueue. Keep the same boundary
+   * for synchronous fallback and test feeds that enter this decoder directly. */
+  if (ty == EDR_EVENT_FILE_READ &&
+      edr_agent_self_suppress_file_read_source(event_record, timestamp_ns)) return;
   if (is_network && !timestamp_ns) {
     /* The callback clock cannot authorize a PID generation for an event
      * whose provider timestamp is missing. */
@@ -4389,6 +4419,11 @@ void edr_collector_file_io_test_health(EdrCollectorHealth *health) {
   *health = s_health;
   edr_collector_file_read_metadata_gate_copy_health(health);
 }
+
+void edr_collector_file_io_test_self_identity(const EdrLiveProcessGeneration *identity) {
+  memset(&s_agent_self_identity, 0, sizeof(s_agent_self_identity));
+  if (identity) s_agent_self_identity = *identity;
+}
 #endif
 
 #ifdef EDR_COLLECTOR_NETWORK_TESTING
@@ -4501,6 +4536,9 @@ static VOID WINAPI edr_event_record_callback(PEVENT_RECORD event_record) {
      * not a failed collection attempt. */
     return;
   }
+
+  if (ty == EDR_EVENT_FILE_READ &&
+      edr_agent_self_suppress_file_read_source(event_record, event_ns)) return;
 
   /* The shared decode path resolves exact new-session bindings before it
    * enforces a pending gate, allowing only recovery evidence through here. */
