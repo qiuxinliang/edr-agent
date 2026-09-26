@@ -2513,6 +2513,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"resume_count\":%lu,\"control_frames\":%lu,"
         "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
         "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
+        "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
+        "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu},"
         "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
         "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
@@ -2674,6 +2676,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         tv2_rt.send_attempts, tv2_rt.send_ok, tv2_rt.send_fail, tv2_rt.ack_ok, tv2_rt.ack_fail,
         tv2_rt.resume_count, tv2_rt.control_frames,
         tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
+        http_rt.report_events_post_ok_count,
+        (unsigned long long)http_rt.report_events_post_ok_body_bytes,
+        (unsigned long long)http_rt.report_events_post_attempt_body_bytes,
+        (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
         edr_event_bus_p0_reserved_slots(agent->event_bus),
@@ -3175,6 +3181,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"active_channel\":\"%s\",\"last_operation\":\"%s\","
       "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
       "%s"
+      "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
+      "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu},"
       "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
       "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
       "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
@@ -3426,6 +3434,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       tv2_rt.channel_backfill, tv2_rt.channel_upload, tv2_rt.channel_command_result,
       tv2_active_channel, tv2_last_operation, tv2_envelope_format, tv2_last_error,
       poll_probe_json,
+      http_rt.report_events_post_ok_count,
+      (unsigned long long)http_rt.report_events_post_ok_body_bytes,
+      (unsigned long long)http_rt.report_events_post_attempt_body_bytes,
+      (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
       edr_event_bus_p0_reserved_slots(agent->event_bus),

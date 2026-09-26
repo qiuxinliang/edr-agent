@@ -33,5 +33,60 @@ int main(void) {
   assert(stored == 4u && considered == 2u);
   assert(!edr_preprocess_admit_telemetry(NULL, &d));
   assert(stored == 4u);
+
+  /* Ordinary suppressed rename can skip only its standalone upload. A schema
+   * change, missing P0 rule authority, or any signal keeps the upload. */
+  memset(&r, 0, sizeof(r));
+  memset(&d, 0, sizeof(d));
+  r.type = EDR_EVENT_FILE_RENAME;
+  r.priority = 2u;
+  strcpy(r.event_id, "rename-baseline-1");
+  strcpy(r.file_path, "C:\\Program Files\\Example\\file.txt");
+  strcpy(r.detection_context,
+         "{\"signals\":{\"ransom_behavior\":false,\"ransom_canary\":false,"
+         "\"ransom_recovery_tamper\":false,\"ransom_note\":false,"
+         "\"ransom_note_burst\":false,\"security_product_kill\":false,"
+         "\"extension_changed\":false,\"high_content_entropy\":false},"
+         "\"ransom_control\":{\"phase\":\"baseline\",\"kind\":\"\"},"
+         "\"recommended_forensics\":[\"process_tree\",\"targeted_files\"]}");
+  d.suppress = 1u;
+  d.allowlisted_path = 1u;
+  strcpy(d.noise_reasons, "allowlisted_path");
+  strcpy(d.selection_action, "emit_context");
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_rename_upload_skipped_count() == 1u);
+  strcpy(d.signal_reasons, "ransom_behavior_counter");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  d.signal_reasons[0] = '\0';
+  r.priority = 0u;
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.priority = 2u;
+  r.type = EDR_EVENT_FILE_DELETE;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.type = EDR_EVENT_FILE_RENAME;
+  strcpy(r.detection_context, "{\"ransom_control\":{\"phase\":\"candidate\"}}");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_rename_upload_skipped_count() == 2u);
+
+  /* Run the real decision builder: its generic forensic suggestions do not
+   * make an otherwise suppressed baseline rename an independent alert. */
+  memset(&r, 0, sizeof(r));
+  memset(&d, 0, sizeof(d));
+  r.type = EDR_EVENT_FILE_RENAME;
+  r.priority = 0u; /* Ransom burst admission can reserve this lane before evaluation. */
+  r.pid = 11004u;
+  strcpy(r.event_id, "rename-generated-context");
+  strcpy(r.process_name, "setup.exe");
+  strcpy(r.exe_path, "C:\\Program Files\\Example\\setup.exe");
+  strcpy(r.file_path, "C:\\Users\\alice\\Documents\\report.docx");
+  strcpy(r.file_old_path, "C:\\Users\\alice\\Documents\\report-old.docx");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress && d.allowlisted_path);
+  assert(r.priority == 0u);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_rename_upload_skipped_count() == 3u);
   return 0;
 }

@@ -261,8 +261,14 @@ add_test(NAME process_evidence_pending COMMAND test_process_evidence_pending)
 
 add_executable(test_telemetry_admission
   ${CMAKE_CURRENT_SOURCE_DIR}/test_telemetry_admission.c
-  ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c)
-target_include_directories(test_telemetry_admission PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_telemetry_admission PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_telemetry_admission)
 add_test(NAME telemetry_admission COMMAND test_telemetry_admission)
 

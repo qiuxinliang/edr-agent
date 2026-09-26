@@ -124,6 +124,11 @@ typedef struct {
   unsigned long http2_cert_error_count;
   unsigned long report_events_v2_ok_count;
   unsigned long report_events_v2_fail_count;
+  /* Process-lifetime HTTP request-body bytes. Attempts include requests
+   * rejected before network I/O; successful bytes exclude TLS/header cost. */
+  unsigned long report_events_post_ok_count;
+  uint64_t report_events_post_ok_body_bytes;
+  uint64_t report_events_post_attempt_body_bytes;
   unsigned long zstd_compress_ok_count;
   unsigned long zstd_compress_fail_count;
   unsigned long http2_multiplex_ok_count;

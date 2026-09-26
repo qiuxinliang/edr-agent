@@ -13,6 +13,12 @@ struct EdrDetectionDecision;
  * and deduplication. Returns nonzero only for telemetry admission. */
 int edr_preprocess_admit_telemetry(const EdrBehaviorRecord *record,
                                   const struct EdrDetectionDecision *decision);
+/* Called after local detectors and evidence capture. A false result skips only
+ * the ordinary standalone upload; P0 combined/source-only delivery is separate. */
+int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
+                               const struct EdrDetectionDecision *decision,
+                               int p0_rules_ready, int local_forensics_dispatched);
+uint64_t edr_preprocess_baseline_rename_upload_skipped_count(void);
 
 /** cfg 为 NULL 时使用 edr_config_apply_defaults 等价默认值 */
 EdrError edr_preprocess_start(struct EdrEventBus *bus, const EdrConfig *cfg);

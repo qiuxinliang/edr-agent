@@ -115,6 +115,9 @@ static int s_long_poll_fallback_cfg = 1;
 static int s_report_events_v2_enabled_cfg = 1;
 static unsigned long s_report_events_v2_ok;
 static unsigned long s_report_events_v2_fail;
+static unsigned long s_report_events_post_ok;
+static uint64_t s_report_events_post_ok_body_bytes;
+static uint64_t s_report_events_post_attempt_body_bytes;
 
 static int ascii_eq_ci(const char *a, const char *b);
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -1624,6 +1627,9 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->http2_cert_error_count = s_http2_cert_error_count;
   out->report_events_v2_ok_count = s_report_events_v2_ok;
   out->report_events_v2_fail_count = s_report_events_v2_fail;
+  out->report_events_post_ok_count = s_report_events_post_ok;
+  out->report_events_post_ok_body_bytes = s_report_events_post_ok_body_bytes;
+  out->report_events_post_attempt_body_bytes = s_report_events_post_attempt_body_bytes;
   out->zstd_compress_ok_count = s_zstd_compress_ok;
   out->zstd_compress_fail_count = s_zstd_compress_fail;
   out->http2_multiplex_ok_count = s_http2_multiplex_ok;
@@ -5462,12 +5468,17 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
     int v2rc;
     if (build_report_events_v2_envelope(batch_id, header12, header_len, payload, payload_len,
                                         &env, &env_len) == 0) {
+      runtime_state_lock();
+      s_report_events_post_attempt_body_bytes += (uint64_t)env_len;
+      runtime_state_unlock();
       v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
                                (const char *)env, env_len, NULL, 0u);
       free(env);
       if (v2rc == 0) {
         runtime_state_lock();
         s_report_events_v2_ok++;
+        s_report_events_post_ok++;
+        s_report_events_post_ok_body_bytes += (uint64_t)env_len;
         runtime_state_unlock();
         note_http_request_success();
         return 0;
@@ -5520,12 +5531,20 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
            "{\"endpoint_id\":\"%s\",\"batch_id\":\"%s\",\"agent_version\":\"%s\",\"payload\":\"%s\"}",
            s_endpoint, batch_id, s_agent_ver, b64);
   free(b64);
+  size_t body_len = strlen(body);
+  runtime_state_lock();
+  s_report_events_post_attempt_body_bytes += (uint64_t)body_len;
+  runtime_state_unlock();
   int rc = post_to_suffix("ingest/report-events", body);
   free(body);
   if (rc != 0) {
     log_native_post_failure("report-events", rc);
     return -1;
   }
+  runtime_state_lock();
+  s_report_events_post_ok++;
+  s_report_events_post_ok_body_bytes += (uint64_t)body_len;
+  runtime_state_unlock();
   return 0;
 }
 

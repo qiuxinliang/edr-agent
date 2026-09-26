@@ -1429,16 +1429,13 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
                          : edr_p0_rule_try_emit(&br);
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
-  {
-    EdrDetectionDecision dd;
-    edr_detection_decision_evaluate(&br, &dd);
-    if (!edr_preprocess_admit_telemetry(&br, &dd)) return;
-  }
+  EdrDetectionDecision dd;
+  edr_detection_decision_evaluate(&br, &dd);
+  if (!edr_preprocess_admit_telemetry(&br, &dd)) return;
   edr_pmfe_on_preprocess_slot(slot, &br);
-  /* P2 T9：Shellcode / Webshell / PMFE → AVE 行为槽（E 组 46–47、53–54） */
-  /* should_emit already applied this policy to the unchanged record. */
+  /* P2 T9: keep local AVE and forensic consumers before the upload filter. */
   edr_ave_cross_engine_feed_from_record(&br);
-  (void)edr_command_dispatch_recommended_forensics(&br);
+  int local_forensics_dispatched = edr_command_dispatch_recommended_forensics(&br);
   if (!edr_local_evidence_cache_is_candidate(&br)) {
     return;
   }
@@ -1448,6 +1445,8 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   if (p0_emitted > 0) {
     return;
   }
+  if (!edr_preprocess_upload_admit(&br, &dd, edr_p0_rule_ir_is_ready(),
+                                   local_forensics_dispatched)) return;
   emit_behavior_record(&br);
 }
 
