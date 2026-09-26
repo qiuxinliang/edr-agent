@@ -286,6 +286,30 @@ static void test_behavior_summary_below_threshold_no_emit(void) {
   assert(g_summary_count == 0);
 }
 
+static void test_behavior_summary_local_only_flush(void) {
+  const int64_t base_ns = 1779345200000000000LL;
+  EdrEvidenceCacheStatus before, after;
+  g_summary_count = 0;
+  for (int i = 0; i < 6; i++) {
+    EdrBehaviorRecord r;
+    init_record(&r, EDR_EVENT_NET_CONNECT);
+    r.pid = 9999u;
+    r.event_time_ns = base_ns + (int64_t)i * 1000000LL;
+    snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-local-summary");
+    snprintf(r.process_name, sizeof(r.process_name), "telemetry.exe");
+    snprintf(r.net_dst, sizeof(r.net_dst), "93.184.216.34");
+    r.net_dport = 80u;
+    edr_local_evidence_cache_record_behavior(&r);
+  }
+  edr_local_evidence_cache_get_status(&before);
+  assert(before.aggregate_slots_used > 0u);
+  edr_local_evidence_cache_flush_summaries(base_ns + 60000000000LL, NULL);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.aggregate_slots_used < before.aggregate_slots_used);
+  assert(after.summaries_emitted == before.summaries_emitted);
+  assert(g_summary_count == 0);
+}
+
 static void test_identity_status_counter_basics(void) {
   assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
   struct timespec ts;
@@ -5132,6 +5156,7 @@ int main(void) {
   test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise();
   test_behavior_summary_flush_coalesced_events();
   test_behavior_summary_below_threshold_no_emit();
+  test_behavior_summary_local_only_flush();
   test_identity_status_counter_basics();
 #if defined(EDR_HAVE_SQLITE)
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();

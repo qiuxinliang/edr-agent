@@ -1909,9 +1909,6 @@ static unsigned summary_flush_min_count(void) {
 
 void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
                                               void (*emit)(const EdrBehaviorRecord *)) {
-  if (!emit) {
-    return;
-  }
   int64_t cur_minute = (now_ns / 1000000000LL) / 60LL;
   unsigned threshold = summary_flush_min_count();
   for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
@@ -1930,6 +1927,13 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
     }
     if (s->count < (uint64_t)threshold) {
       /* 计数不足以成一条摘要：直接释放槽位，明细此前已被 coalesce 丢弃。 */
+      memset(s, 0, sizeof(*s));
+      evidence_cache_unlock();
+      continue;
+    }
+    /* Production retains local coalescing counters but has no consumer for
+     * these summaries. Drain closed slots without creating network frames. */
+    if (!emit) {
       memset(s, 0, sizeof(*s));
       evidence_cache_unlock();
       continue;

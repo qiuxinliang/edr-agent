@@ -209,8 +209,8 @@ void edr_local_evidence_cache_poll_maintenance(void);
 
 /**
  * Flush 已关闭窗口（早于当前分钟）且计数达到阈值（EDR_SUMMARY_MIN_COUNT，默认 5）的
- * 普通事件聚合槽，为每个槽构造一条 EDR_EVENT_BEHAVIOR_SUMMARY 记录并通过 emit 回调上报，
- * 用一条摘要替代被 coalesce 丢弃的重复明细。emit 由调用方提供（编码 + 入批次）。
+ * 普通事件聚合槽。emit 为 NULL 时只清空过期槽位，保留本地聚合计数而不上报；
+ * 非 NULL 时为测试或显式消费者构造 EDR_EVENT_BEHAVIOR_SUMMARY 记录。
  */
 void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
                                               void (*emit)(const EdrBehaviorRecord *));

@@ -1123,11 +1123,6 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
   free(buf);
 }
 
-/* behavior_summary flush 的 emit 回调：直接复用统一编码 + 入批次路径。 */
-static void emit_summary_record(const EdrBehaviorRecord *br) {
-  emit_behavior_record(br);
-}
-
 /* 节流的行为簇摘要 flush：最多每 ~30s 扫描一次已关闭窗口的聚合槽。 */
 static void poll_summary_flush(void) {
   static uint64_t s_last_flush_mono_ns;
@@ -1137,7 +1132,7 @@ static void poll_summary_flush(void) {
   }
   s_last_flush_mono_ns = mono;
   int64_t now_ns = (int64_t)time(NULL) * 1000000000LL;
-  edr_local_evidence_cache_flush_summaries(now_ns, emit_summary_record);
+  edr_local_evidence_cache_flush_summaries(now_ns, NULL);
 }
 
 static int p0_process_create_candidate(const EdrBehaviorRecord *br) {
