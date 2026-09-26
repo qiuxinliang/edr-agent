@@ -58,6 +58,7 @@ static void fill_boundary_ascii(char *dst, size_t cap, char value) {
 }
 
 static void fill_common_process_context(EdrBehaviorRecord *record, const char *label) {
+  record->process_chain_depth = 7u;
   snprintf(record->parent_name, sizeof(record->parent_name), "parent-%s.exe", label);
   snprintf(record->parent_path, sizeof(record->parent_path), "C:/parent/%s.exe", label);
   snprintf(record->integrity_level, sizeof(record->integrity_level), "high");
@@ -91,6 +92,27 @@ static int encode_decode_record(const EdrBehaviorRecord *record, uint8_t *wire,
                                 size_t wire_cap, edr_v1_BehaviorEvent *decoded) {
   return encode_decode_record_with(edr_behavior_record_encode_protobuf, record, wire, wire_cap,
                                    decoded);
+}
+
+static int verify_process_chain_depth(uint8_t *wire, size_t wire_cap) {
+  const uint32_t depths[] = {0u, 7u, UINT32_MAX};
+  const EdrBehaviorRecordEncoder encoders[] = {
+      edr_behavior_record_encode_protobuf, edr_behavior_record_encode_protobuf_c};
+  static edr_v1_BehaviorEvent decoded;
+  EdrBehaviorRecord record;
+  for (size_t i = 0; i < sizeof(depths) / sizeof(depths[0]); ++i) {
+    init_transport_record(&record);
+    record.process_chain_depth = depths[i];
+    for (size_t j = 0; j < sizeof(encoders) / sizeof(encoders[0]); ++j) {
+      if (!encode_decode_record_with(encoders[j], &record, wire, wire_cap, &decoded) ||
+          decoded.process_chain_depth != depths[i]) {
+        fprintf(stderr, "process chain depth lost: encoder=%zu expected=%u decoded=%u\n",
+                j, (unsigned)depths[i], (unsigned)decoded.process_chain_depth);
+        return 0;
+      }
+    }
+  }
+  return 1;
 }
 
 static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wire_cap) {
@@ -136,6 +158,7 @@ static int verify_parent_identity_across_detail_oneofs(uint8_t *wire, size_t wir
     }
     if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
         decoded.which_detail != cases[i].expected_detail ||
+        decoded.process_chain_depth != record.process_chain_depth ||
         strcmp(decoded.parent_name, record.parent_name) != 0 ||
         strcmp(decoded.parent_path, record.parent_path) != 0 ||
         !decoded.has_process_context ||
@@ -450,6 +473,7 @@ static int emit_common_process_context_fixtures(void) {
     stream = pb_istream_from_buffer(wire, wire_len);
     if (wire_len == 0u ||
         !pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded) ||
+        decoded.process_chain_depth != record.process_chain_depth ||
         decoded.which_detail != cases[i].detail_tag || !decoded.has_process_context ||
         strcmp(decoded.process_context.parent_cmdline, record.parent_cmdline) != 0 ||
         !decoded.process_context.has_token_elevation ||
@@ -554,6 +578,7 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(decoded.event_id, record.event_id) != 0 || decoded.pid != record.pid ||
+      decoded.process_chain_depth != record.process_chain_depth ||
       strcmp(decoded.exe_path, record.exe_path) != 0 ||
       strcmp(decoded.username, record.username) != 0 || strcmp(decoded.domain, record.domain) != 0 ||
       strcmp(decoded.user_sid, record.user_sid) != 0 ||
@@ -611,11 +636,15 @@ int main(int argc, char **argv) {
   stream = pb_istream_from_buffer(wire, pure_wire_len);
   if (!pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded) ||
       !decoded.has_behavior_alert ||
+      decoded.process_chain_depth != 0u ||
       strcmp(decoded.behavior_alert.user_subject_status, "withheld") != 0 ||
       strcmp(decoded.behavior_alert.user_subject_withheld_reason, "not_provided_by_agent") != 0 ||
       decoded.behavior_alert.user_subject_json[0] != '\0') {
     fprintf(stderr, "pure alert user subject withholding was not explicit\n");
     return 7;
+  }
+  if (!verify_process_chain_depth(wire, sizeof(wire))) {
+    return 13;
   }
   if (!verify_pmfe_evidence_projection()) {
     fprintf(stderr, "PMFE same-region evidence projection failed\n");

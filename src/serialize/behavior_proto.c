@@ -519,6 +519,7 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
   msg->event_time_ns = r->event_time_ns;
   msg->pid = r->pid;
   msg->ppid = r->ppid;
+  msg->process_chain_depth = r->process_chain_depth;
   copy_str(msg->process_name, sizeof(msg->process_name), r->process_name);
   copy_record_transport_field(msg->cmdline, sizeof(msg->cmdline), r->cmdline,
                               sizeof(r->cmdline), &transport, "cmdline");
