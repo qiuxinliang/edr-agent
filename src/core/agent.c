@@ -2515,7 +2515,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
         "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
         "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu,"
-        "\"baseline_file_upload_skipped\":%llu},"
+        "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
         "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
         "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
@@ -2682,6 +2682,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)http_rt.report_events_post_attempt_body_bytes,
         (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
         (unsigned long long)edr_preprocess_baseline_file_upload_skipped_count(),
+        (unsigned long long)edr_preprocess_baseline_process_upload_skipped_count(),
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
         edr_event_bus_p0_reserved_slots(agent->event_bus),
@@ -3185,7 +3186,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "%s"
       "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
       "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu,"
-      "\"baseline_file_upload_skipped\":%llu},"
+      "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
       "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
       "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
       "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
@@ -3442,6 +3443,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)http_rt.report_events_post_attempt_body_bytes,
       (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
       (unsigned long long)edr_preprocess_baseline_file_upload_skipped_count(),
+      (unsigned long long)edr_preprocess_baseline_process_upload_skipped_count(),
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
       edr_event_bus_p0_reserved_slots(agent->event_bus),

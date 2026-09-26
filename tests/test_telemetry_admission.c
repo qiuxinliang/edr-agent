@@ -78,7 +78,7 @@ int main(void) {
   assert(edr_preprocess_baseline_rename_upload_skipped_count() == 2u);
 
   /* A server-style structured baseline file frame can skip only after an
-   * authoritative P0 miss. A process baseline remains for source validation. */
+   * authoritative P0 miss. */
   memset(&r, 0, sizeof(r));
   memset(&d, 0, sizeof(d));
   r.type = EDR_EVENT_FILE_CREATE;
@@ -107,6 +107,41 @@ int main(void) {
   assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
   r.source_truncated_fields[0] = '\0';
   r.type = EDR_EVENT_PROCESS_CREATE;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+
+  /* The server drops these ordinary process baselines. Suppress only a
+   * generation-bound source after a P0 miss; retain incomplete source,
+   * active signals and dispatched forensics on the existing upload path. */
+  memset(&r, 0, sizeof(r));
+  memset(&d, 0, sizeof(d));
+  r.type = EDR_EVENT_PROCESS_CREATE;
+  r.pid = 123u;
+  r.ppid = 4u;
+  r.process_start_key = 12345u;
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  strcpy(r.event_id, "structured-baseline-process");
+  strcpy(r.process_name, "ordinary.exe");
+  strcpy(r.exe_path, "C:\\Vendor\\ordinary.exe");
+  strcpy(r.source_completeness, "COALESCED");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strcmp(d.reason, "baseline") == 0);
+  assert(d.event_quality_score <= 20u);
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_process_upload_skipped_count() == 1u);
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+  r.process_start_key = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 12345u;
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.source_completeness, "CORRELATION_MISSING");
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_process_upload_skipped_count() == 2u);
+  strcpy(d.signal_reasons, "suspicious_parent");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  d.signal_reasons[0] = '\0';
+  r.is_security_4688 = 1u;
   assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
 
   /* Run the real decision builder: its generic forensic suggestions do not

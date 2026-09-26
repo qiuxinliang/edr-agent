@@ -8,6 +8,7 @@
 
 static _Atomic uint64_t s_baseline_rename_upload_skipped;
 static _Atomic uint64_t s_baseline_file_upload_skipped;
+static _Atomic uint64_t s_baseline_process_upload_skipped;
 
 static int baseline_context_has_no_server_signal(const char *json) {
   static const char *const positive_signals[] = {
@@ -65,15 +66,22 @@ int edr_preprocess_admit_telemetry(const EdrBehaviorRecord *record,
 int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
                                const EdrDetectionDecision *decision,
                                int p0_proven_miss, int local_forensics_dispatched) {
+  const int is_process = record && record->type == EDR_EVENT_PROCESS_CREATE;
   if (!record || !decision || !p0_proven_miss || local_forensics_dispatched > 0 ||
-      (record->type != EDR_EVENT_FILE_CREATE &&
+      (!is_process && record->type != EDR_EVENT_FILE_CREATE &&
        record->type != EDR_EVENT_FILE_WRITE &&
        record->type != EDR_EVENT_FILE_DELETE &&
        record->type != EDR_EVENT_FILE_RENAME) ||
-      !record->event_id[0] || !record->file_path[0] ||
+      !record->event_id[0] || (!is_process && !record->file_path[0]) ||
+      (is_process && (record->is_security_4688 || !record->process_start_key ||
+                      !record->process_creation_filetime_100ns)) ||
       record->collector_evidence_gate[0] || record->source_truncated_fields[0] ||
-      (record->source_completeness[0] &&
-       strcmp(record->source_completeness, "COMPLETE") != 0) ||
+      (is_process
+           ? (strcmp(record->source_completeness, "COALESCED") != 0 &&
+              strcmp(record->source_completeness, "CORRELATION_MISSING") != 0 &&
+              strcmp(record->source_completeness, "COMPLETE") != 0)
+           : (record->source_completeness[0] &&
+              strcmp(record->source_completeness, "COMPLETE") != 0)) ||
       record->pmfe_snapshot[0] || record->cert_revoked_ancestor ||
       decision->signal_reasons[0] || decision->has_remote ||
       decision->suspicious_parent || decision->context_correlated ||
@@ -92,9 +100,13 @@ int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
       strstr(decision->noise_reasons, "allowlisted_path") != NULL;
   const int structured_baseline = strcmp(decision->reason, "baseline") == 0 &&
       decision->event_quality_score <= 20u;
-  if (!allowlisted_baseline && !structured_baseline) return 1;
+  if (is_process ? !structured_baseline : (!allowlisted_baseline && !structured_baseline))
+    return 1;
 
-  if (record->type == EDR_EVENT_FILE_RENAME) {
+  if (is_process) {
+    atomic_fetch_add_explicit(&s_baseline_process_upload_skipped, 1u,
+                              memory_order_relaxed);
+  } else if (record->type == EDR_EVENT_FILE_RENAME) {
     atomic_fetch_add_explicit(&s_baseline_rename_upload_skipped, 1u,
                               memory_order_relaxed);
   } else {
@@ -111,5 +123,10 @@ uint64_t edr_preprocess_baseline_rename_upload_skipped_count(void) {
 
 uint64_t edr_preprocess_baseline_file_upload_skipped_count(void) {
   return atomic_load_explicit(&s_baseline_file_upload_skipped,
+                              memory_order_relaxed);
+}
+
+uint64_t edr_preprocess_baseline_process_upload_skipped_count(void) {
+  return atomic_load_explicit(&s_baseline_process_upload_skipped,
                               memory_order_relaxed);
 }

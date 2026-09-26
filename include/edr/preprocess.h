@@ -20,6 +20,7 @@ int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
                                int p0_proven_miss, int local_forensics_dispatched);
 uint64_t edr_preprocess_baseline_rename_upload_skipped_count(void);
 uint64_t edr_preprocess_baseline_file_upload_skipped_count(void);
+uint64_t edr_preprocess_baseline_process_upload_skipped_count(void);
 
 /** cfg 为 NULL 时使用 edr_config_apply_defaults 等价默认值 */
 EdrError edr_preprocess_start(struct EdrEventBus *bus, const EdrConfig *cfg);
