@@ -6,6 +6,7 @@
 #include "edr/windows_spawn_lock.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -544,9 +545,20 @@ static int popen_one_line(const char *cmd, char *buf, size_t cap) {
     }
     return -1;
   }
+  /* Drain the rest so a multi-line status cannot get SIGPIPE before exit. */
+  char remaining[256];
+  while (fgets(remaining, sizeof(remaining), pf)) {
+  }
+  int read_failed = ferror(pf);
   (void)fclose(pf);
-  if (child > 0) {
-    (void)waitpid(child, NULL, 0);
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid(child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (read_failed || waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    buf[0] = 0;
+    return -1;
   }
   trim_crlf(buf);
   return 0;
@@ -578,12 +590,12 @@ static int popen_count_lines(const char *cmd) {
 static void collect_linux_fw(EdrSecurityPolicySnap *o) {
   int nlines = -1;
   char ufw[256];
-  if (popen_one_line("sh -c 'command -v ufw >/dev/null && ufw status 2>/dev/null | head -n1'", ufw,
-                     sizeof(ufw)) == 0 &&
-      strstr(ufw, "active")) {
+  if (popen_one_line("LC_ALL=C ufw status 2>/dev/null", ufw, sizeof(ufw)) == 0 &&
+      (strcmp(ufw, "Status: active") == 0 || strcmp(ufw, "Status: inactive") == 0)) {
     o->top_fw_enabled_known = o->sp_fw_enabled_known = 1;
-    o->top_fw_enabled = o->sp_fw_enabled = 1;
-    snprintf(o->top_fw_profile, sizeof(o->top_fw_profile), "%s", "ufw:active");
+    o->top_fw_enabled = o->sp_fw_enabled = strcmp(ufw, "Status: active") == 0;
+    snprintf(o->top_fw_profile, sizeof(o->top_fw_profile), "%s",
+             o->sp_fw_enabled ? "ufw:active" : "ufw:inactive");
     snprintf(o->sp_default_inbound, sizeof(o->sp_default_inbound), "%s", "UNKNOWN");
     snprintf(o->sp_default_outbound, sizeof(o->sp_default_outbound), "%s", "UNKNOWN");
   }
@@ -621,15 +633,14 @@ static void collect_linux_fw(EdrSecurityPolicySnap *o) {
     o->top_rule_count = nlines;
   }
   if (strcmp(pol_in, "UNKNOWN") != 0 || strcmp(pol_out, "UNKNOWN") != 0 || nlines > 0) {
-    if (!o->sp_fw_enabled_known) {
+    int iptables_enabled = strcmp(pol_in, "BLOCK") == 0 || strcmp(pol_out, "BLOCK") == 0 || nlines > 8;
+    if (!o->sp_fw_enabled_known || (!o->sp_fw_enabled && iptables_enabled)) {
       /* 有 iptables 表即认为主机具备包过滤栈；是否“等同 Windows 防火墙开启”不强行等同 */
       o->sp_fw_enabled_known = 1;
-      o->sp_fw_enabled = (strcmp(pol_in, "BLOCK") == 0 || strcmp(pol_out, "BLOCK") == 0 || nlines > 8);
+      o->sp_fw_enabled = iptables_enabled;
       o->top_fw_enabled_known = 1;
       o->top_fw_enabled = o->sp_fw_enabled;
-      if (!o->top_fw_profile[0]) {
-        snprintf(o->top_fw_profile, sizeof(o->top_fw_profile), "%s", "iptables");
-      }
+      snprintf(o->top_fw_profile, sizeof(o->top_fw_profile), "%s", "iptables");
     }
     snprintf(o->sp_default_inbound, sizeof(o->sp_default_inbound), "%s", pol_in);
     snprintf(o->sp_default_outbound, sizeof(o->sp_default_outbound), "%s", pol_out);

@@ -526,6 +526,16 @@ endif()
 edr_apply_test_warnings(test_attack_surface_inventory_policy)
 add_test(NAME attack_surface_inventory_policy COMMAND test_attack_surface_inventory_policy)
 
+if(UNIX)
+  add_executable(test_security_policy_linux
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_security_policy_linux.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_security_policy_linux PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  edr_apply_test_warnings(test_security_policy_linux)
+  add_test(NAME security_policy_linux COMMAND test_security_policy_linux)
+endif()
+
 add_executable(test_control_stream_lease_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_control_stream_lease_contract.c)
 edr_apply_test_warnings(test_control_stream_lease_contract)
 add_test(NAME control_stream_lease_contract COMMAND test_control_stream_lease_contract
