@@ -454,6 +454,13 @@ if(WIN32)
   set_tests_properties(etw_network_decode_native PROPERTIES
     ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json")
 
+  add_executable(test_wfas_provider_windows test_wfas_provider_windows.c)
+  target_include_directories(test_wfas_provider_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_link_libraries(test_wfas_provider_windows PRIVATE wevtapi)
+  edr_apply_test_warnings(test_wfas_provider_windows)
+  add_test(NAME wfas_provider_native COMMAND test_wfas_provider_windows)
+  set_tests_properties(wfas_provider_native PROPERTIES TIMEOUT 30)
+
   add_executable(test_security_event_time_windows test_security_event_time_windows.c)
   target_link_libraries(test_security_event_time_windows PRIVATE wevtapi)
   edr_apply_test_warnings(test_security_event_time_windows)
