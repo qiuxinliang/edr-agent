@@ -3871,6 +3871,7 @@ static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
   size_t length = 0u;
   char key[65];
   int owned = -1;
+  int source_unowned = 0;
   if (edr_p0_deferred_snapshot_encode_facts(br,binding,rule_id,facts,&json,&length) &&
       edr_sha256_hex((const uint8_t *)json,length,key)==0) {
     owned = gate_closed
@@ -3885,9 +3886,24 @@ static int p0_defer_or_already_owned(const EdrBehaviorRecord *br,
           == EDR_OK ? 1 : -1;
       gate_closed = 1;
     }
+    if (owned < 0) {
+      /* A failed write/lookup is not proof that no deferred owner exists.
+       * Do not publish a terminal source disposition alongside an existing
+       * snapshot that can still be evaluated after recovery. */
+      source_unowned = edr_storage_queue_p0_deferred_contains(key) == 0;
+    }
   }
   free(json);
   if (owned < 0) {
+    /* The matched source is still in hand even if deferred admission failed.
+     * Preserve its identity and rule-bound disposition using the existing
+     * source-only queue/retry owner before declaring an unidentifiable loss.
+     * This does not grant authority to execute or clear the central ACK gate. */
+    if (source_unowned && p0_emit_source_only_not_evaluable(
+            br, rule_id, "p0_deferred_admission_failed", binding)) {
+      p0_observe_rule_disposition(br,rule_id,"source_only","p0_deferred_admission_failed","",0u);
+      return 1;
+    }
     p0_state_lock();
     p0_source_only_mark_unhealthy_for_event_locked("p0_deferred_admission_failed",1,br->type);
     p0_state_unlock();

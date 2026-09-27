@@ -2140,12 +2140,54 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   retain_deferred_fixture(&record,"deferred-admission-boundary");
   deferred_write_fails=1;
   strcpy(record.event_id,"deferred-capacity-rejected");
+  int durable_before = atomic_load(&g_durable_count);
+  int actions_before = atomic_load(&g_enforcement_side_effects);
   assert(edr_p0_rule_try_emit(&record)==0);
   EdrP0EmitMetrics loss_metrics;
   edr_p0_rule_get_emit_metrics(&loss_metrics);
-  assert(loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
-  assert(!strcmp(loss_metrics.source_only_terminal_reason,"p0_deferred_admission_failed"));
+  /* A full deferred lane does not lose a still-available source. Retain its
+   * exact disposition through the existing durable source-only lane. */
+  assert(atomic_load(&g_durable_count) == durable_before + 1);
+  assert(!strcmp(g_last_record.event_id, record.event_id));
+  assert(g_last_record.pid == record.pid);
+  assert(g_last_record.process_start_key == record.process_start_key);
+  assert(g_last_record.event_time_ns == record.event_time_ns);
+  assert(strstr(g_last_record.detection_context,"\"reason\":\"p0_deferred_admission_failed\""));
+  assert(!loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
+  assert(!strcmp(loss_metrics.source_only_terminal_reason,"source_only_delivery_pending_ack"));
   assert(deferred_count==1u && deferred_rows[0].state==0); /* no overwrite */
+  assert(g_emit_count == 0 && atomic_load(&g_enforcement_side_effects) == actions_before);
+  /* A replay must reuse the immutable source, while another rejected source
+   * must retain its own identity rather than another generic loss audit. */
+  assert(edr_p0_rule_try_emit(&record)==0);
+  assert(atomic_load(&g_durable_count) == durable_before + 1);
+  strcpy(record.event_id,"deferred-capacity-rejected-second");
+  assert(edr_p0_rule_try_emit(&record)==0);
+  assert(atomic_load(&g_durable_count) == durable_before + 2);
+  assert(!strcmp(g_last_record.event_id, record.event_id));
+
+  /* If both durable paths are unavailable, retain exact sources in the
+   * bounded retry owner; exhausting that owner must still latch real loss. */
+  g_durable_emit_allowed=0;
+  for (unsigned i=0;i<9u;i++) {
+    snprintf(record.event_id,sizeof(record.event_id),"deferred-both-unavailable-%u",i);
+    assert(edr_p0_rule_try_emit(&record)==0);
+  }
+  edr_p0_rule_get_emit_metrics(&loss_metrics);
+  assert(loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
+  assert(loss_metrics.source_only_retry_pending == 8u);
+  assert(deferred_count==1u && deferred_rows[0].state==0);
+  assert(atomic_load(&g_enforcement_side_effects) == actions_before);
+
+  retain_deferred_fixture(&record,"deferred-owner-unknown");
+  deferred_write_fails=1;
+  deferred_contains_fails=1;
+  durable_before=atomic_load(&g_durable_count);
+  assert(edr_p0_rule_try_emit(&record)==0);
+  assert(atomic_load(&g_durable_count)==durable_before);
+  edr_p0_rule_get_emit_metrics(&loss_metrics);
+  assert(loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
+  assert(deferred_count==1u && deferred_rows[0].state==0);
 
   edr_policy_v2_configure(&block_policy);
   atomic_store(&g_enforcement_side_effects,0);

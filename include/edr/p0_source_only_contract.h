@@ -92,6 +92,7 @@ typedef struct EdrP0SourceOnlyReason {
 #define EDR_P0_SOURCE_ONLY_DIRECT_REASONS(X) \
   X("p0_dedup_pending_backpressure") \
   X("p0_alert_queue_backpressure") \
+  X("p0_deferred_admission_failed") \
   X("terminal_authority_unavailable") \
   X("terminal_context_merge_failed") \
   X("terminal_intent_encoding_failed") \
