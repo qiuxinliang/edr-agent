@@ -62,6 +62,11 @@ before publication, including after a build checkpoint is reused.
 
 ## Build preparation and timing
 
+The prepare job runs checkpoint behavior, workflow wiring, and the portable
+`agent_update_packaging_contract` source test before starting native builds.
+The same packaging contract remains in the Windows CTest gate. This catches
+workflow/helper contract drift early without replacing native validation.
+
 The pinned x64 Python 3.12.10 tool directory is cached on ARM64 hosts; version,
 architecture and binary-only P0 cryptography dependency requirements are unchanged.
 The existing **Build Pre-built vcpkg Packages** workflow seeds this cache on the

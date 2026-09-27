@@ -508,12 +508,22 @@ int main(void) {
            "release binds the outer Setup UI signature state to the same verified release mode");
   contains(workflow, "package root must contain exactly one package-capabilities.json",
            "release gate verifies the architecture capability manifest is packaged exactly once");
-  contains(workflow, "gh release upload", "architecture bundles are retained in the draft release before publication");
+  contains(workflow, "python scripts/windows_release_checkpoint.py upload --arch $env:EDR_RELEASE_ARCH",
+           "architecture bundles use the verified checkpoint uploader before publication");
+  contains_before(workflow, "windows_release_checkpoint.py seal --arch",
+                  "windows_release_checkpoint.py upload --arch",
+                  "architecture bundles are sealed before draft upload");
+  contains_before(workflow, "windows_release_checkpoint.py verify-owner",
+                  "Verify combined AMD64/ARM64 asset set",
+                  "publication rechecks draft ownership before validating the combined asset set");
   contains(workflow, "Verify combined AMD64/ARM64 asset set",
            "combined release is published only after both architecture bundles exist");
   contains(workflow, "Copy-Item -LiteralPath $agentBinary -Destination $agentAsset -Force",
            "signed and unsigned releases both publish the raw update artifact");
-  contains(workflow, "optional-signature", "unsigned release documents the integrity-pinned platform path");
+  snprintf(path, sizeof(path), "%s/scripts/windows_release_checkpoint.py", root);
+  char *release_checkpoint = read_file(path);
+  contains(release_checkpoint, "optional-signature", "unsigned release documents the integrity-pinned platform path");
+  free(release_checkpoint);
   contains(workflow, "SignedCms", "release produces detached signed manifest");
   contains(workflow, "signer_thumbprint", "manifest binds expected signer thumbprint");
   contains(workflow, "CMS signer subject does not match", "release verifies CMS signer identity binding");

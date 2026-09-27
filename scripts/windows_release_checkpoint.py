@@ -21,7 +21,9 @@ import time
 CHECKPOINT = "release-checkpoint.json"
 MARKER = re.compile(r"<!-- edr-release-source:(.*?) -->")
 UNSIGNED = ("WARNING: This Windows build is unsigned. Windows may show an unknown-publisher "
-            "warning. Platform/Agent signature requirements are not changed by this release.\n")
+            "warning. Use only where the platform explicitly permits optional-signature "
+            "installation/update with verified SHA-256 artifact hashes. "
+            "Platform/Agent signature requirements are not changed by this release.\n")
 
 
 def source(env=os.environ):

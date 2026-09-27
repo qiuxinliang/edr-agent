@@ -98,6 +98,20 @@ class ReleaseCheckpointTests(unittest.TestCase):
         self.assertEqual(self.api.info["body"], original["body"])
         self.assertEqual(self.api.uploads, [])
 
+    def test_unsigned_notes_explain_integrity_requirements_only_for_unsigned_mode(self):
+        for mode in ("unsigned", "signed"):
+            with self.subTest(mode=mode):
+                api = FakeGitHub()
+                cp.prepare(api, dict(SOURCE, mode=mode))
+                body = api.info["body"]
+                if mode == "unsigned":
+                    self.assertIn("optional-signature", body)
+                    self.assertIn("verified SHA-256", body)
+                    self.assertIn("signature requirements are not changed", body)
+                else:
+                    self.assertNotIn("WARNING", body)
+                self.assertTrue(api.info["draft"])
+
     def test_conflicting_identity_and_legacy_drafts_rejected(self):
         for field, value in (("commit", "b" * 40), ("mode", "signed"), ("run_id", "5678"),
                              ("upgrade_class", "binary_hot")):
@@ -238,6 +252,21 @@ class ReleaseCheckpointTests(unittest.TestCase):
         self.assertEqual(len(self.api.uploads), 5)
         cp.upload(self.api, self.directory, SOURCE, "arm64")
         self.assertEqual(len(self.api.uploads), 5)  # Verified, not uploaded again.
+
+    def test_both_architecture_bundles_remain_in_draft_until_publication(self):
+        original_body = self.api.info["body"]
+        for arch in ("amd64", "arm64"):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as output:
+                self.directory = Path(output)
+                self.bundle(arch=arch)
+                cp.upload(self.api, self.directory, SOURCE, arch)
+                self.assertTrue(self.api.info["draft"])
+                self.assertEqual(self.api.info["body"], original_body)
+                for name in cp.asset_names(SOURCE, arch):
+                    self.assertEqual(self.api.blobs[name], (self.directory / name).read_bytes())
+        self.assertEqual(set(self.api.blobs),
+                         cp.asset_names(SOURCE, "amd64") | cp.asset_names(SOURCE, "arm64"))
+        self.assertEqual(len(self.api.uploads), 10)
 
     def test_existing_same_size_different_hash_is_never_overwritten(self):
         self.bundle()

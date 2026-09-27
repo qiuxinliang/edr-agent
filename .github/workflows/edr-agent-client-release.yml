@@ -62,7 +62,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Verify release ownership and checkpoint contracts
-        run: python3 tests/test_windows_release_checkpoint.py
+        run: |
+          python3 tests/test_windows_release_checkpoint.py
+          python3 tests/test_windows_release_workflow.py
+          cc -std=c11 -Wall -Wextra -Werror tests/test_agent_update_assets.c -o "$RUNNER_TEMP/test_agent_update_assets"
+          EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"
       - name: Bind draft release to source and run
         id: prepare
         env:

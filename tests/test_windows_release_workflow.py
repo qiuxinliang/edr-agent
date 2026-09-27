@@ -56,6 +56,15 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn('gh release upload', build)
         self.assertNotIn('--notes-file', self.jobs['publish-release'])
 
+    def test_source_packaging_contract_runs_before_native_build(self):
+        prepare = self.jobs['prepare-release']
+        self.assertIn('python3 tests/test_windows_release_workflow.py', prepare)
+        self.assertIn('cc -std=c11 -Wall -Wextra -Werror tests/test_agent_update_assets.c', prepare)
+        self.assertIn('EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"', prepare)
+        self.assertLess(prepare.index('tests/test_agent_update_assets.c'),
+                        prepare.index('windows_release_checkpoint.py prepare'))
+        self.assertIn("--label-regex '^windows-release-gate$'", self.jobs['windows-build'])
+
     def test_arm_python_cache_has_default_branch_producer(self):
         producer = (ROOT / '.github/workflows/edr-agent-prebuild-packages.yml').read_text(encoding='utf-8')
         for text in (self.text, producer):
