@@ -36,6 +36,12 @@ existing artifact manifest also carries this provenance. Unbound legacy drafts
 are not silently adopted: use a new version. Existing tags/runs still use their
 old workflow snapshot; this change cannot protect uploads from an older workflow.
 
+Draft discovery resolves the release ID using GraphQL, then reads release metadata
+and paginated assets through REST by ID. REST's published-release tag endpoint can
+return 404 for an existing draft; that is not proof that creation failed. After
+creation the workflow checks visibility at most three times, without creating a
+second draft; permission/transport errors remain explicit failures.
+
 If a run fails, use **Re-run failed jobs** on that original run, not a new manual
 release. After all native build/test, packaging and integrity steps succeed,
 the complete `dist` directory is retained as `release-checkpoint-amd64/arm64`

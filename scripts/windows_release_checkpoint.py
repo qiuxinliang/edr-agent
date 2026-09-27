@@ -60,10 +60,32 @@ class GitHub:
         return result.stdout
 
     def release(self, tag):
-        value = self.call("api", f"repos/{self.repository}/releases/tags/{tag}", missing=True)
-        if value is None:
+        # REST /releases/tags/{tag} can return 404 for an existing draft, even
+        # with write access. GraphQL release(tagName:) resolves both states.
+        owner, name = self.repository.split("/", 1)
+        value = self.call("api", "graphql", "-f", "query=" + """
+            query($owner: String!, $name: String!, $tag: String!) {
+              repository(owner: $owner, name: $name) {
+                release(tagName: $tag) {
+                  id: databaseId tag_name: tagName
+                }
+              }
+            }
+            """, "-f", f"owner={owner}", "-f", f"name={name}", "-f", f"tag={tag}")
+        response = json.loads(value)
+        repository = (response.get("data") or {}).get("repository")
+        if response.get("errors") or repository is None:
+            raise RuntimeError("Release lookup failed; check GitHub repository access, not draft existence")
+        info = repository["release"]
+        if info is None:
             return None
-        info = json.loads(value)
+        if info.get("tag_name") != tag or not isinstance(info.get("id"), int):
+            raise RuntimeError("Release lookup returned an invalid tag/ID binding")
+        # Fetch the REST representation by stable ID (including target_commitish,
+        # which is not a GraphQL Release field), then paginate its assets.
+        info = json.loads(self.call("api", f"repos/{self.repository}/releases/{info['id']}"))
+        if info.get("tag_name") != tag:
+            raise RuntimeError("Release tag changed during lookup; refusing mutation")
         # The embedded asset list can be paginated independently of the release.
         pages = self.call("api", f"repos/{self.repository}/releases/{info['id']}/assets?per_page=100",
                           "--paginate", "--slurp")
@@ -114,7 +136,15 @@ def prepare(api, expected):
         body += "<!-- edr-release-source:" + json.dumps(expected, sort_keys=True) + " -->"
         api.call("release", "create", tag, "--repo", api.repository, "--draft",
                  "--target", expected["commit"], "--title", f"edr-agent {tag}", "--notes", body)
-        info = api.release(tag)
+        for attempt in range(3):
+            info = api.release(tag)
+            if info is not None:
+                break
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        if info is None:
+            raise RuntimeError("Draft creation succeeded but the release is not visible after 3 checks; "
+                               "check repository permissions and rerun the original prepare job")
     require_owner(info, expected, published=not info["draft"])
     verify_tag_target(api, info, expected)
     return not info["draft"]

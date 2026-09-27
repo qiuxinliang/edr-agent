@@ -141,7 +141,64 @@ class ReleaseCheckpointTests(unittest.TestCase):
                 api.release(SOURCE["tag"])
         error.stderr = "HTTP 404: Not Found"
         with patch.object(cp.subprocess, "run", return_value=error):
+            with self.assertRaisesRegex(RuntimeError, "404"):
+                api.release(SOURCE["tag"])
+
+    def test_release_lookup_resolves_draft_without_published_tag_endpoint(self):
+        api = cp.GitHub(SOURCE["repository"])
+        for draft in (True, False):
+            info = dict(id=397548605, tag_name=SOURCE["tag"], draft=draft,
+                        body=self.api.info["body"], target_commitish=SOURCE["commit"])
+            calls = []
+
+            def transport(*args, **kwargs):
+                calls.append(args)
+                if args[:2] == ("api", "graphql"):
+                    return json.dumps({"data": {"repository": {"release": {
+                        "id": info["id"], "tag_name": info["tag_name"]}}}})
+                if args[1].endswith("/releases/397548605"):
+                    return json.dumps(info)
+                if args[1].endswith("/releases/397548605/assets?per_page=100"):
+                    return json.dumps([[{"name": "first"}], [{"name": "second"}]])
+                # This is the actual failed transport behavior, not a fake
+                # release() implementation that assumes drafts are discoverable.
+                if "/releases/tags/" in args[1]:
+                    return None
+                raise AssertionError(args)
+
+            with self.subTest(draft=draft), patch.object(api, "call", side_effect=transport):
+                result = api.release(SOURCE["tag"])
+                self.assertEqual(result["draft"], draft)
+                self.assertEqual(result["id"], 397548605)
+                self.assertEqual([a["name"] for a in result["assets"]], ["first", "second"])
+                self.assertFalse(any("/releases/tags/" in str(call) for call in calls))
+
+    def test_graphql_missing_release_differs_from_permission_or_partial_error(self):
+        api = cp.GitHub(SOURCE["repository"])
+        with patch.object(api, "call", return_value=json.dumps({"data": {"repository": {"release": None}}})):
             self.assertIsNone(api.release(SOURCE["tag"]))
+        for response in ({"data": {"repository": None}},
+                         {"data": {"repository": {"release": None}}, "errors": [{"message": "denied"}]}):
+            with self.subTest(response=response), patch.object(api, "call", return_value=json.dumps(response)):
+                with self.assertRaisesRegex(RuntimeError, "repository access"):
+                    api.release(SOURCE["tag"])
+
+    def test_prepare_readback_retries_but_creates_only_once(self):
+        info = self.api.release(SOURCE["tag"])
+        with patch.object(self.api, "release", side_effect=[None, None, info]) as read:
+            with patch.object(self.api, "call", wraps=self.api.call) as create, patch.object(cp.time, "sleep"):
+                self.assertFalse(cp.prepare(self.api, SOURCE))
+                self.assertEqual(create.call_count, 1)
+                self.assertEqual(read.call_count, 3)
+
+    def test_prepare_invisible_draft_has_bounded_actionable_failure(self):
+        with patch.object(self.api, "release", return_value=None) as read:
+            with patch.object(self.api, "call", wraps=self.api.call) as create, patch.object(cp.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "not visible after 3 checks"):
+                    cp.prepare(self.api, SOURCE)
+                self.assertEqual(create.call_count, 1)
+                self.assertEqual(read.call_count, 4)  # Initial lookup plus three readbacks.
+                self.assertEqual(sleep.call_count, 2)
 
     def test_corruption_rejected_before_any_upload(self):
         self.bundle()
