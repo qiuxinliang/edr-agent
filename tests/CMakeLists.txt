@@ -362,7 +362,8 @@ if(WIN32)
 
   add_executable(test_process_generation_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_process_generation_windows.c
-    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c)
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c)
   target_include_directories(test_process_generation_windows PRIVATE
     ${CMAKE_SOURCE_DIR}/include)
   target_link_libraries(test_process_generation_windows PRIVATE advapi32)

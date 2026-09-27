@@ -2366,6 +2366,25 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
                                     sizeof(r->process_generation_source),
                                     ef.process_generation_source, "process_generation_source");
     }
+    /* Only the collector's private slot binding can attest an early token
+     * query. A textual identity_source/quality or 4688 tuple cannot grant it.
+     * This startup fact remains valid after the target exits; later I/O uses
+     * its own identity rules and must not inherit this authority. */
+    if (r->type == EDR_EVENT_PROCESS_CREATE && !r->is_security_4688 &&
+        strcmp(ef.prov, "kproc") == 0) {
+      if (slot->process_token_snapshot_truncated) {
+        edr_behavior_mark_source_truncated(r, "source.user_sid");
+        edr_behavior_mark_source_truncated(r, "source.logon_id");
+      } else if (target_present && r->pid == slot->process_token_snapshot_pid &&
+          r->process_start_key != 0u &&
+          r->process_start_key == slot->process_token_snapshot_start_key &&
+          r->process_creation_filetime_100ns != 0u &&
+          r->process_creation_filetime_100ns ==
+              slot->process_token_snapshot_creation_filetime_100ns) {
+        snprintf(r->identity_source, sizeof(r->identity_source), "%s", "kernel_process_token");
+        snprintf(r->identity_quality, sizeof(r->identity_quality), "%s", "token_sid");
+      }
+    }
     if (ef.file[0]) {
       (void)copy_record_source_text(r, r->file_path, sizeof(r->file_path), ef.file, "file_path");
       snprintf(r->file_op, sizeof(r->file_op), "%s",

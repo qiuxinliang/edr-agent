@@ -68,6 +68,7 @@
 #endif
 #include <stdlib.h>
 #include <wchar.h>
+#include "process_start_token_win.h"
 
 /* Older SDKs (including the MinGW SDK used by CI) predate these documented
  * evntcons.h names.  The values and structure are from the public ETW API,
@@ -3565,6 +3566,9 @@ static void edr_collector_append_event_process_generation(EdrEventSlot *slot,
             }
           }
         }
+      }
+      if (edr_process_start_token_capture(process, &live, &process_start, slot) < 0) {
+        s_health.metadata_dropped++;
       }
       CloseHandle(process);
       return;

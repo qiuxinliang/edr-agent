@@ -10,6 +10,87 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../src/preprocess/process_token_permissions_win.h"
+#include "../src/collector/process_start_token_win.h"
+
+static int startup_token_contract(HANDLE child, DWORD pid, uint64_t creation) {
+  EdrLiveProcessGeneration live;
+  EdrBehaviorRecord source;
+  EdrEventSlot captured, attempt;
+  HANDLE own_token = NULL;
+  char reason[96], expected_logon[32];
+  LPSTR expected_sid = NULL;
+  DWORD bytes = 0u;
+  TOKEN_USER *owner = NULL;
+  TOKEN_STATISTICS stats;
+  int ok = 0;
+  memset(&source, 0, sizeof(source));
+  memset(&captured, 0, sizeof(captured));
+  if (!edr_process_generation_query_live(child, &live, reason, sizeof(reason)) ||
+      !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &own_token)) goto done;
+  (void)GetTokenInformation(own_token, TokenUser, NULL, 0u, &bytes);
+  if (!bytes || bytes > 65536u) goto done;
+  owner = (TOKEN_USER *)malloc(bytes);
+  if (!owner || !GetTokenInformation(own_token, TokenUser, owner, bytes, &bytes) ||
+      !ConvertSidToStringSidA(owner->User.Sid, &expected_sid) ||
+      !GetTokenInformation(own_token, TokenStatistics, &stats, sizeof(stats), &bytes)) goto done;
+  snprintf(expected_logon, sizeof(expected_logon), "logon_id=0x%llx\n",
+      (unsigned long long)(((uint64_t)(uint32_t)stats.AuthenticationId.HighPart << 32u) |
+                           stats.AuthenticationId.LowPart));
+  source.type = EDR_EVENT_PROCESS_CREATE;
+  source.pid = pid;
+  source.process_creation_filetime_100ns = creation;
+  if (!edr_windows_process_image_path_utf8(child, source.image_path_canonical,
+                                          sizeof(source.image_path_canonical))) goto done;
+  captured.type = EDR_EVENT_PROCESS_CREATE;
+  memcpy(captured.data, "ETW1\n", 6u);
+  captured.size = 6u;
+  if (edr_process_start_token_capture(child, &live, &source, &captured) != 1 ||
+      captured.process_token_snapshot_pid != pid ||
+      captured.process_token_snapshot_start_key != live.process_start_key ||
+      captured.process_token_snapshot_creation_filetime_100ns != creation ||
+      !strstr((char *)captured.data, expected_sid) ||
+      !strstr((char *)captured.data, expected_logon)) goto done;
+  /* Wrong actor, generation, path and unavailable handles cannot bind a
+   * snapshot, even when the caller passes a valid live process handle. */
+  attempt = captured; source.pid++;
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0 ||
+      attempt.process_token_snapshot_start_key) goto done;
+  source.pid--; source.process_creation_filetime_100ns++;
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0) goto done;
+  source.process_creation_filetime_100ns--; source.process_start_key = live.process_start_key + 1u;
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0) goto done;
+  source.process_start_key = live.process_start_key;
+  source.image_path_canonical[0] = 'X';
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0) goto done;
+  if (!edr_windows_process_image_path_utf8(child, source.image_path_canonical,
+                                          sizeof(source.image_path_canonical))) goto done;
+  if (edr_process_start_token_capture(NULL, &live, &source, &attempt) != 0) goto done;
+  /* Leave room for the SID alone. Partial publication must roll back and
+   * retain a per-event truncation indicator without increasing the envelope. */
+  size_t used = sizeof(attempt.data) - (strlen(expected_sid) + strlen("user_sid=\n") + 5u);
+  memset(&attempt, 0, sizeof(attempt));
+  memset(attempt.data, 'x', used);
+  attempt.data[used - 1u] = '\n'; attempt.data[used] = '\0';
+  attempt.size = (uint32_t)used + 1u;
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != -1 ||
+      !attempt.process_token_snapshot_truncated || attempt.process_token_snapshot_start_key ||
+      attempt.size != used + 1u || strlen((char *)attempt.data) != used ||
+      strstr((char *)attempt.data, "user_sid=")) goto done;
+  /* The process exists under an exact OS handle here. End only this test
+   * child, then show why the already-captured tuple must survive queue delay. */
+  if (!edr_process_terminate_checked(pid, creation, 5000, reason, sizeof(reason))) goto done;
+  memset(&attempt, 0, sizeof(attempt));
+  if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0 ||
+      !strstr((char *)captured.data, expected_sid) ||
+      !strstr((char *)captured.data, expected_logon)) goto done;
+  ok = 1;
+done:
+  if (expected_sid) LocalFree(expected_sid);
+  free(owner);
+  if (own_token) CloseHandle(own_token);
+  if (!ok) fprintf(stderr, "startup token snapshot contract failed\n");
+  return ok;
+}
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--child") == 0) { Sleep(15000); return 0; }
@@ -81,8 +162,8 @@ int main(int argc, char **argv) {
   ok = ok && !edr_process_terminate_checked(child.dwProcessId, identity + 1u, 5000, reason, sizeof(reason)) &&
       strcmp(reason, "process_generation_mismatch") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;
   ok = ok && !edr_process_terminate_checked(GetCurrentProcessId(), identity, 5000, reason, sizeof(reason));
-  ok = ok && edr_process_terminate_checked(child.dwProcessId, identity, 5000, reason, sizeof(reason)) &&
-      strcmp(reason, "process_exit_verified") == 0 && WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0;
+  ok = ok && startup_token_contract(child.hProcess, child.dwProcessId, identity) &&
+      WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0;
   ok = ok && edr_process_terminate_checked(child.dwProcessId, identity, 5000, reason, sizeof(reason)) &&
       strcmp(reason, "process_already_gone") == 0;
   if (!ok) {

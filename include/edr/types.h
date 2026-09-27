@@ -80,6 +80,12 @@ typedef struct {
   uint64_t ransom_sample_process_start_key;
   float ransom_content_entropy;
   uint32_t ransom_content_sample_bytes;
+  /* Collector-owned binding for a token tuple captured from the validated
+   * ProcessStart handle. Never accepted from an ETW1 payload or copied to
+   * another process generation. The SID/LUID remain in the bounded payload. */
+  uint64_t process_token_snapshot_start_key;
+  uint64_t process_token_snapshot_creation_filetime_100ns;
+  uint32_t process_token_snapshot_pid;
   EdrEventType type;
   uint8_t priority;
   /* Explicit admission class for the in-process event bus.  This is not a
@@ -89,6 +95,7 @@ typedef struct {
   uint8_t ransom_content_sampled;
   /** §19.10：来自 Microsoft-Windows-TCPIP / WFAS 的 ETW，供攻击面增量刷新去抖联动 */
   uint8_t attack_surface_hint;
+  uint8_t process_token_snapshot_truncated;
   bool consumed;
 } EdrEventSlot;
 

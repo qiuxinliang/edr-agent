@@ -8,6 +8,60 @@
 /* Link seam required by behavior_from_slot's ransomware policy path. */
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
+static int test_process_token_snapshot(EdrBehaviorRecord *r) {
+  EdrEventSlot slot;
+  memset(&slot, 0, sizeof(slot));
+  slot.type = EDR_EVENT_PROCESS_CREATE;
+  snprintf((char *)slot.data, sizeof(slot.data),
+      "ETW1\nprov=kproc\npid=42\nimg=C:\\Fixture\\child.exe\n"
+      "process_start_key=1234\nprocess_creation_filetime_100ns=134349586805261828\n"
+      "user_sid=S-1-5-18\nlogon_id=0x3e7\nidentity_quality=token_sid\n");
+  slot.size = (uint32_t)strlen((char *)slot.data) + 1u;
+  /* Payload text alone cannot claim a live token snapshot. */
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0) return 1;
+  slot.process_token_snapshot_pid = 42u;
+  slot.process_token_snapshot_start_key = 1234u;
+  slot.process_token_snapshot_creation_filetime_100ns = 134349586805261828ULL;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") ||
+      strcmp(r->identity_source, "kernel_process_token") ||
+      strcmp(r->user_sid, "S-1-5-18") || strcmp(r->logon_id, "0x3e7")) {
+    fprintf(stderr, "collector token snapshot lost at delayed normalization\n");
+    return 1;
+  }
+  slot.process_token_snapshot_pid++;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0) return 1;
+  slot.process_token_snapshot_pid--;
+  slot.process_token_snapshot_start_key++;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0) return 1;
+  slot.process_token_snapshot_start_key--;
+  slot.process_token_snapshot_creation_filetime_100ns++;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0) return 1;
+  slot.process_token_snapshot_creation_filetime_100ns--;
+  slot.process_token_snapshot_truncated = 1u;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0 ||
+      !edr_behavior_source_field_truncated(r, "source.user_sid") ||
+      !edr_behavior_source_field_truncated(r, "source.logon_id")) return 1;
+  slot.process_token_snapshot_truncated = 0u;
+  slot.type = EDR_EVENT_FILE_READ;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "token_sid") == 0) return 1;
+  slot.type = EDR_EVENT_PROCESS_CREATE;
+  snprintf((char *)slot.data, sizeof(slot.data),
+      "ETW1\nprov=sec\neid=4688\nepid=42\nprocess_start_key=1234\n"
+      "process_creation_filetime_100ns=134349586805261828\n"
+      "user_sid=S-1-5-18\nlogon_id=0x3e7\n");
+  slot.size = (uint32_t)strlen((char *)slot.data) + 1u;
+  edr_behavior_from_slot(&slot, r);
+  if (strcmp(r->identity_quality, "target_4688") != 0) return 1;
+  return 0;
+}
+
 static int test_etw1_high_truncation_bits(EdrBehaviorRecord *r) {
   const struct {
     const char *key;
@@ -79,6 +133,7 @@ int main(void) {
   EdrEventSlot slot; EdrBehaviorRecord r;
   char precise[64], tiny[20];
   if (test_etw1_high_truncation_bits(&r) != 0) return 1;
+  if (test_process_token_snapshot(&r) != 0) return 1;
   edr_behavior_format_time_ns(INT64_C(1789371253913980400), precise, sizeof(precise));
   if (strcmp(precise, "2026-09-14T07:34:13.913980400Z") != 0) return 1;
   edr_behavior_format_time_ns(INT64_C(1789371253913980400), tiny, sizeof(tiny));
