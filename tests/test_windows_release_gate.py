@@ -5,6 +5,8 @@ The host admission probe only adapts OS locks/clock; it is not Windows emulation
 The actual tests still run natively in the normal Windows CTest gate.
 """
 import json
+from concurrent.futures import ThreadPoolExecutor
+import io
 import os
 from pathlib import Path
 import re
@@ -12,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -639,9 +642,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.assertLess(steps.index(initialize), steps.index(preflight))
                     self.assertLess(steps.index(preflight), steps.index(step_with("id: vcpkg-key\n")))
                 identify = step_with("id: vcpkg-key\n")
-                restore = step_with("uses: actions/cache/restore@v5")
+                restore = step_with("id: vcpkg-cache\n")
                 install = step_with("name: vcpkg install (")
-                save = step_with("uses: actions/cache/save@v5")
+                save = step_with("name: Save completed vcpkg dependencies")
                 consumer = step_with("name: Publish shared vcpkg dependency cache" if "prebuild" in workflow
                                      else "name: Configure (")
                 for before, after in zip((initialize, identify, restore, install, save),
@@ -686,7 +689,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     # (including already-published) shared publication step.
                     condition = re.search(r'(?m)^\s*if: (.*)$', save)
                     self.assertIsNotNone(condition)
-                    self.assertEqual(condition[1], "steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''")
+                    self.assertEqual(condition[1], "(steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != '') && steps.resume.outputs.restored != 'true'")
                     self.assertLess(steps.index(publish), steps.index(save))
                 for marker in re.findall(r'(?m)^\s*\$installed_marker = (.*)$', source):
                     self.assertEqual(marker, 'Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\\vcpkg\\status"')
@@ -706,5 +709,38 @@ class WindowsReleaseGateTests(unittest.TestCase):
         self.assertIn("--target agent_runtime_gate_tests", source)
 
 
+def run_parallel_cases(cases, workers, stream):
+    """Independent temp-dir fixtures; bounded concurrency, no test selection loss.
+
+    Each case owns its TestResult and log, so failures cannot be swallowed or
+    interleaved. Native product CTest remains a separate, mandatory release step.
+    """
+    if workers not in (1, 2):
+        raise ValueError("Gate fixture parallelism must be 1 or 2")
+    cases = list(cases)
+    if not cases:
+        raise ValueError("Empty gate fixture selection")
+
+    def run_case(case):
+        output = io.StringIO()
+        started = time.monotonic()
+        result = unittest.TextTestRunner(stream=output, verbosity=2).run(case)
+        return case.id(), result, output.getvalue(), time.monotonic() - started
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(run_case, cases))
+    for name, result, output, elapsed in results:
+        stream.write(output)
+        stream.write(f"[gate-timing] {name}: {elapsed:.2f}s\n")
+    total = sum(result.testsRun for _, result, _, _ in results)
+    stream.write(f"Gate fixtures: {total}/{len(cases)} executed; workers={workers}\n")
+    return total == len(cases) and all(result.wasSuccessful() for _, result, _, _ in results)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--parallel":
+        names = unittest.defaultTestLoader.getTestCaseNames(WindowsReleaseGateTests)
+        sys.exit(0 if run_parallel_cases((WindowsReleaseGateTests(name) for name in names),
+                                        int(sys.argv[2]), sys.stderr) else 1)
+    else:
+        unittest.main()

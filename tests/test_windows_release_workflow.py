@@ -36,7 +36,33 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         # No always() or job-level condition can bypass implicit successful needs.
         self.assertNotRegex(publish, r'(?m)^    if:')
         self.assertIn('windows-install-upgrade-rollback.yml', self.jobs['windows-lifecycle'])
-        self.assertIn('already published and is immutable', self.jobs['prepare-release'])
+        self.assertIn('windows_release_checkpoint.py prepare', self.jobs['prepare-release'])
+        self.assertIn("needs.prepare-release.outputs.published != 'true'", self.jobs['windows-build'])
+
+    def test_version_lock_and_checkpoint_gate(self):
+        lock = self.text.split('\nconcurrency:\n', 1)[1].split('\nenv:', 1)[0]
+        self.assertIn("format('win_{0}', inputs.version) || github.ref_name", lock)
+        self.assertIn('cancel-in-progress: false', lock)
+        build = self.jobs['windows-build']
+        self.assertLess(build.index('name: Test\n'), build.index('name: Seal verified package checkpoint'))
+        self.assertLess(build.index('name: Prepare release assets'), build.index('name: Seal verified package checkpoint'))
+        self.assertLess(build.index('name: Retain verified package'), build.index('name: Upload ${{ matrix.arch }}'))
+        for name in ('Build (Ninja)', 'Test', 'Package (setup exe + runtime zip)',
+                     'Prepare release assets', 'Seal verified package checkpoint'):
+            step = build.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("if: steps.resume.outputs.restored != 'true'", step)
+        self.assertIn('windows_release_checkpoint.py restore --arch', build)
+        self.assertIn('windows_release_checkpoint.py upload --arch', build)
+        self.assertNotIn('gh release upload', build)
+        self.assertNotIn('--notes-file', self.jobs['publish-release'])
+
+    def test_arm_python_cache_has_default_branch_producer(self):
+        producer = (ROOT / '.github/workflows/edr-agent-prebuild-packages.yml').read_text(encoding='utf-8')
+        for text in (self.text, producer):
+            self.assertIn('python-tool-${{ runner.os }}-${{ runner.arch }}-3.12.10-x64-v1', text)
+            self.assertIn('${{ runner.tool_cache }}/Python/3.12.10/x64.complete', text)
+            self.assertIn("python-version: '3.12.10'", text)
+        self.assertIn('branches:\n      - main', producer)
 
     def test_component_and_signed_manifest_checks_are_preserved(self):
         build = self.jobs['windows-build']

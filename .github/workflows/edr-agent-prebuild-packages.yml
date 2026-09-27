@@ -54,6 +54,32 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Seed on main/default branch so subsequent release tags can restore it.
+      # Tag-local caches alone are not visible to a different release tag.
+      - name: Restore pinned ARM64-host Python tool cache
+        if: matrix.msvc_arch == 'arm64'
+        id: python-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.tool_cache }}/Python/3.12.10/x64
+            ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
+          key: python-tool-${{ runner.os }}-${{ runner.arch }}-3.12.10-x64-v1
+      - name: Set up pinned Python for release tools
+        if: matrix.msvc_arch == 'arm64'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Save pinned ARM64-host Python tool cache
+        if: matrix.msvc_arch == 'arm64' && steps.python-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ runner.tool_cache }}/Python/3.12.10/x64
+            ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
+          key: ${{ steps.python-cache.outputs.cache-primary-key }}
+
       - name: Initialize pinned Visual Studio 2022 environment
         shell: pwsh
         run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
