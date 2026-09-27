@@ -1415,6 +1415,8 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u && p0_resource_throttle_proven_miss(&br)) {
     edr_local_evidence_cache_record_behavior(&br);
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "resource_throttle_proven_miss");
     return;
   }
   /* P0 owns its hard-invalid, registry-attribution, and
@@ -1428,22 +1430,40 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   edr_net_fanout_on_event(&br);
   EdrDetectionDecision dd;
   edr_detection_decision_evaluate(&br, &dd);
-  if (!edr_preprocess_admit_telemetry(&br, &dd)) return;
+  if (!edr_preprocess_admit_telemetry(&br, &dd)) {
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition",
+          dd.drop ? "decision_drop" : strcmp(dd.selection_action, "local_only") == 0
+              ? "local_only" : "emit_filter_rejected");
+    return;
+  }
   edr_pmfe_on_preprocess_slot(slot, &br);
   /* P2 T9: keep local AVE and forensic consumers before the upload filter. */
   edr_ave_cross_engine_feed_from_record(&br);
   int local_forensics_dispatched = edr_command_dispatch_recommended_forensics(&br);
   if (!edr_local_evidence_cache_is_candidate(&br)) {
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "not_retention_candidate");
     return;
   }
   if (!edr_preprocess_sampling_allow(&br)) {
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "sampling_rejected");
     return;
   }
   if (p0_emitted > 0) {
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "p0_already_emitted");
     return;
   }
   if (!edr_preprocess_upload_admit(&br, &dd, p0_proven_miss,
-                                   local_forensics_dispatched)) return;
+                                   local_forensics_dispatched)) {
+    if (br.type == EDR_EVENT_PROCESS_CREATE)
+      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "baseline_upload_suppressed");
+    return;
+  }
+  if (br.type == EDR_EVENT_PROCESS_CREATE)
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "ordinary_emit_requested");
   emit_behavior_record(&br);
 }
 

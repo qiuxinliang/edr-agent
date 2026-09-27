@@ -28,6 +28,7 @@ WINDOWS_EXPECTED = {
     "command_process_identity_and_receipts",
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
+    "cmd_actor_and_script_artifact",
     "kernel_file_io_identity", "collector_file_read_windows", "etw_network_decode_native",
     "security_event_time_native", "security_event_time_failures", "wfas_provider_native",
     "rtq_long_command_windows",
