@@ -39,6 +39,11 @@ static uint32_t edr_event_bus_p0_reserve_for_capacity(uint32_t cap) {
   return reserve > cap ? cap : reserve;
 }
 
+static uint32_t rejection_type(const EdrEventSlot *slot) {
+  uint32_t type = (uint32_t)slot->type;
+  return type < EDR_EVENT_BUS_REJECTION_TYPES ? type : 0u;
+}
+
 #ifdef _WIN32
 
 typedef struct {
@@ -58,6 +63,7 @@ struct EdrEventBus {
   uint64_t p0_reserve_rejected;
   uint64_t pushed;
   uint64_t high_water_hits;
+  EdrEventBusRejections rejected;
   CRITICAL_SECTION mu;
   CONDITION_VARIABLE nonempty;
   int mu_inited;
@@ -104,6 +110,7 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
       bus->normal_count >= bus->cap - bus->p0_reserved) {
     bus->dropped++;
     bus->ordinary_reserve_rejected++;
+    bus->rejected.ordinary[rejection_type(slot)]++;
     LeaveCriticalSection(&bus->mu);
     return false;
   }
@@ -111,8 +118,10 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
     bus->dropped++;
     if (slot->p0_critical) {
       bus->p0_reserve_rejected++;
+      bus->rejected.p0[rejection_type(slot)]++;
     } else {
       bus->ordinary_reserve_rejected++;
+      bus->rejected.ordinary[rejection_type(slot)]++;
     }
     LeaveCriticalSection(&bus->mu);
     return false;
@@ -214,6 +223,15 @@ uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus) {
   return n;
 }
 
+void edr_event_bus_rejection_snapshot(EdrEventBus *bus, EdrEventBusRejections *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  if (!bus || !bus->mu_inited) return;
+  EnterCriticalSection(&bus->mu);
+  *out = bus->rejected;
+  LeaveCriticalSection(&bus->mu);
+}
+
 uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {
   return bus ? (uint64_t)sizeof(*bus) + (uint64_t)bus->cap * (uint64_t)sizeof(EdrEventBusCell) : 0u;
 }
@@ -277,6 +295,8 @@ struct EdrEventBus {
   _Atomic uint64_t p0_reserve_rejected;
   _Atomic uint64_t pushed;
   _Atomic uint64_t high_water_hits;
+  _Atomic uint64_t rejected_ordinary[EDR_EVENT_BUS_REJECTION_TYPES];
+  _Atomic uint64_t rejected_p0[EDR_EVENT_BUS_REJECTION_TYPES];
 };
 
 static inline uint64_t bus_lap(uint64_t pos, uint32_t cap) { return pos / (uint64_t)cap; }
@@ -309,6 +329,10 @@ EdrEventBus *edr_event_bus_create(uint32_t slot_count) {
   atomic_init(&bus->p0_reserve_rejected, 0u);
   atomic_init(&bus->pushed, 0u);
   atomic_init(&bus->high_water_hits, 0u);
+  for (uint32_t i = 0u; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i) {
+    atomic_init(&bus->rejected_ordinary[i], 0u);
+    atomic_init(&bus->rejected_p0[i], 0u);
+  }
   return bus;
 }
 
@@ -334,6 +358,8 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
         (void)atomic_fetch_add_explicit(&bus->dropped, 1u, memory_order_relaxed);
         (void)atomic_fetch_add_explicit(&bus->ordinary_reserve_rejected, 1u,
                                         memory_order_relaxed);
+        (void)atomic_fetch_add_explicit(&bus->rejected_ordinary[rejection_type(slot)],
+                                        1u, memory_order_relaxed);
         return false;
       }
       if (atomic_compare_exchange_weak_explicit(&bus->normal_count, &normal_count,
@@ -378,9 +404,13 @@ bool edr_event_bus_try_push(EdrEventBus *bus, const EdrEventSlot *slot) {
         if (slot->p0_critical) {
           (void)atomic_fetch_add_explicit(&bus->p0_reserve_rejected, 1u,
                                           memory_order_relaxed);
+          (void)atomic_fetch_add_explicit(&bus->rejected_p0[rejection_type(slot)],
+                                          1u, memory_order_relaxed);
         } else {
           (void)atomic_fetch_add_explicit(&bus->ordinary_reserve_rejected, 1u,
                                           memory_order_relaxed);
+          (void)atomic_fetch_add_explicit(&bus->rejected_ordinary[rejection_type(slot)],
+                                          1u, memory_order_relaxed);
         }
         return false;
       }
@@ -460,6 +490,17 @@ uint64_t edr_event_bus_ordinary_reserve_rejected_total(EdrEventBus *bus) {
 
 uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus) {
   return bus ? atomic_load_explicit(&bus->p0_reserve_rejected, memory_order_relaxed) : 0u;
+}
+
+void edr_event_bus_rejection_snapshot(EdrEventBus *bus, EdrEventBusRejections *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  if (!bus) return;
+  /* Each counter is atomic; a live multi-producer snapshot may span pushes. */
+  for (uint32_t i = 0u; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i) {
+    out->ordinary[i] = atomic_load_explicit(&bus->rejected_ordinary[i], memory_order_relaxed);
+    out->p0[i] = atomic_load_explicit(&bus->rejected_p0[i], memory_order_relaxed);
+  }
 }
 
 uint64_t edr_event_bus_static_bytes(const EdrEventBus *bus) {

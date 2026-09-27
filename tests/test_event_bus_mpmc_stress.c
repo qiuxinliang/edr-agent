@@ -94,6 +94,47 @@ static void make_dummy_slot(EdrEventSlot *o) {
   memcpy(o->data, "ABCD", 4u);
 }
 
+static int test_rejected_types(void) {
+  EdrEventBus *bus = edr_event_bus_create(4u);
+  EdrEventSlot s;
+  EdrEventBusRejections snapshot;
+  if (!bus) return 1;
+  make_dummy_slot(&s);
+  /* Physical full while ordinary admission is still below its own limit. */
+  s.p0_critical = 1u;
+  for (int i = 0; i < 3; ++i) if (!edr_event_bus_try_push(bus, &s)) return 1;
+  s.p0_critical = 0u;
+  if (!edr_event_bus_try_push(bus, &s)) return 1;
+  edr_event_bus_rejection_snapshot(bus, &snapshot);
+  for (uint32_t i = 0; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i) {
+    if (snapshot.ordinary[i] || snapshot.p0[i]) return 1;
+    s.type = (EdrEventType)i;
+    s.p0_critical = 0u;
+    if (edr_event_bus_try_push(bus, &s)) return 1;
+    s.p0_critical = 1u;
+    if (edr_event_bus_try_push(bus, &s)) return 1;
+  }
+  s.type = (EdrEventType)-1;
+  if (edr_event_bus_try_push(bus, &s)) return 1;
+  s.type = (EdrEventType)9999;
+  s.p0_critical = 0u;
+  if (edr_event_bus_try_push(bus, &s)) return 1;
+  edr_event_bus_rejection_snapshot(bus, &snapshot);
+  uint64_t total = 0u;
+  for (uint32_t i = 0; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i) {
+    if (snapshot.ordinary[i] != (i ? 1u : 2u) ||
+        snapshot.p0[i] != (i ? 1u : 2u)) return 1;
+    total += snapshot.ordinary[i] + snapshot.p0[i];
+  }
+  if (total != edr_event_bus_dropped_total(bus)) return 1;
+  edr_event_bus_destroy(bus);
+  edr_event_bus_rejection_snapshot(NULL, &snapshot);
+  edr_event_bus_rejection_snapshot(NULL, NULL);
+  for (uint32_t i = 0; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i)
+    if (snapshot.ordinary[i] || snapshot.p0[i]) return 1;
+  return 0;
+}
+
 /* Ordinary flood must never consume the P0 reservation.  This is deliberately
  * a cap=1 seam: it proves the invariant without relying on queue timing. */
 static int test_p0_reserve(void) {
@@ -139,6 +180,10 @@ static int test_p0_reserve(void) {
     edr_event_bus_destroy(bus);
     return 1;
   }
+  EdrEventBusRejections rejected;
+  edr_event_bus_rejection_snapshot(bus, &rejected);
+  if (rejected.ordinary[EDR_EVENT_FILE_WRITE] != 1u ||
+      rejected.p0[EDR_EVENT_FILE_WRITE] != 1u) return 1;
   for (uint32_t i = 0u; i < 16u; ++i) {
     if (!edr_event_bus_try_pop(bus, &out)) {
       fprintf(stderr, "p0 reserve: pop %u failed\n", i);
@@ -290,6 +335,10 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
   {
     const uint64_t ptot = edr_event_bus_pushed_total(bus);
     const uint64_t dtot = edr_event_bus_dropped_total(bus);
+    EdrEventBusRejections rejected;
+    edr_event_bus_rejection_snapshot(bus, &rejected);
+    if (rejected.ordinary[EDR_EVENT_FILE_WRITE] != dtot ||
+        rejected.p0[EDR_EVENT_FILE_WRITE] != 0u) return 1;
     if (pops != ptot) {
       fprintf(
           stderr,
@@ -314,6 +363,10 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
 }
 
 int main(int argc, char **argv) {
+  if (test_rejected_types() != 0) {
+    fprintf(stderr, "rejected event type accounting failed\n");
+    return 1;
+  }
   if (test_seq() != 0) {
     return 1;
   }

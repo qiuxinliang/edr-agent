@@ -2263,6 +2263,31 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   }
   *last_health_ns = now;
 
+  EdrEventBusRejections bus_rejected;
+  char bus_rejected_json[EDR_EVENT_BUS_REJECTION_TYPES * 80u + 3u];
+  size_t bus_rejected_used = 0u;
+  uint64_t bus_ordinary_rejected = 0u, bus_p0_rejected = 0u;
+  edr_event_bus_rejection_snapshot(agent->event_bus, &bus_rejected);
+  int bus_json_ok = edr_agent_append_json_fragment(bus_rejected_json,
+      sizeof(bus_rejected_json), &bus_rejected_used, "{");
+  int bus_separator = 0;
+  for (uint32_t i = 0u; i < EDR_EVENT_BUS_REJECTION_TYPES; ++i) {
+    bus_ordinary_rejected += bus_rejected.ordinary[i];
+    bus_p0_rejected += bus_rejected.p0[i];
+    if (!bus_rejected.ordinary[i] && !bus_rejected.p0[i]) continue;
+    if (bus_json_ok) bus_json_ok = edr_agent_append_json_fragment(bus_rejected_json,
+        sizeof(bus_rejected_json), &bus_rejected_used,
+        "%s\"%u\":{\"ordinary\":%llu,\"p0\":%llu}", bus_separator ? "," : "", i,
+        (unsigned long long)bus_rejected.ordinary[i], (unsigned long long)bus_rejected.p0[i]);
+    bus_separator = 1;
+  }
+  if (bus_json_ok) bus_json_ok = edr_agent_append_json_fragment(bus_rejected_json,
+      sizeof(bus_rejected_json), &bus_rejected_used, "}");
+  if (!bus_json_ok) {
+    fprintf(stderr, "[health] event bus rejection counters exceed JSON buffer\n");
+    return;
+  }
+
   unsigned long pmfe_sub = 0, pmfe_done = 0, pmfe_drop = 0;
   unsigned long pmfe_q = 0;
   EdrPmfeRuntimeStats pmfe_runtime;
@@ -2518,7 +2543,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
         "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
         "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
-        "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
+        "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu,\"rejected_by_type\":%s},"
         "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
         "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
         "\"command_delivery\":{\"executor\":{\"started\":%s,\"accepting\":%s,"
@@ -2686,12 +2711,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
         edr_event_bus_p0_reserved_slots(agent->event_bus),
-        (unsigned long long)edr_event_bus_ordinary_reserve_rejected_total(agent->event_bus),
-        (unsigned long long)edr_event_bus_p0_reserve_rejected_total(agent->event_bus),
+        (unsigned long long)bus_ordinary_rejected,
+        (unsigned long long)bus_p0_rejected,
         (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
-        (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
+        (unsigned long long)(bus_ordinary_rejected + bus_p0_rejected),
         (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
-        (unsigned long long)edr_event_bus_static_bytes(agent->event_bus),
+        (unsigned long long)edr_event_bus_static_bytes(agent->event_bus), bus_rejected_json,
         (unsigned long long)s_agent_loop_count,
         (unsigned long long)s_agent_loop_interval_last_ms,
         (unsigned long long)s_agent_loop_interval_max_ms,
@@ -3189,7 +3214,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
       "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
       "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
-      "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu},"
+      "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu,\"rejected_by_type\":%s},"
       "\"main_loop\":{\"count\":%llu,\"interval_last_ms\":%llu,"
       "\"interval_max_ms\":%llu,\"elapsed_last_us\":%llu,\"elapsed_max_us\":%llu},"
       "\"command_delivery\":{\"poll_count\":%llu,\"last_poll_unix_ms\":%lld,"
@@ -3447,12 +3472,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
       edr_event_bus_p0_reserved_slots(agent->event_bus),
-      (unsigned long long)edr_event_bus_ordinary_reserve_rejected_total(agent->event_bus),
-      (unsigned long long)edr_event_bus_p0_reserve_rejected_total(agent->event_bus),
+      (unsigned long long)bus_ordinary_rejected,
+      (unsigned long long)bus_p0_rejected,
       (unsigned long long)edr_event_bus_pushed_total(agent->event_bus),
-      (unsigned long long)edr_event_bus_dropped_total(agent->event_bus),
+      (unsigned long long)(bus_ordinary_rejected + bus_p0_rejected),
       (unsigned long long)edr_event_bus_high_water_hits(agent->event_bus),
-      (unsigned long long)edr_event_bus_static_bytes(agent->event_bus),
+      (unsigned long long)edr_event_bus_static_bytes(agent->event_bus), bus_rejected_json,
       (unsigned long long)s_agent_loop_count,
       (unsigned long long)s_agent_loop_interval_last_ms,
       (unsigned long long)s_agent_loop_interval_max_ms,

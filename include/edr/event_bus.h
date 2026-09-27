@@ -13,6 +13,15 @@
 
 typedef struct EdrEventBus EdrEventBus;
 
+/* Numeric EdrEventType keys; bucket 0 includes out-of-range types. Counters
+ * measure rejected push attempts, not distinct events or durable loss. */
+#define EDR_EVENT_BUS_REJECTION_TYPES (EDR_EVENT_CAPABILITY_AUDIT + 1u)
+typedef struct {
+  uint64_t ordinary[EDR_EVENT_BUS_REJECTION_TYPES];
+  uint64_t p0[EDR_EVENT_BUS_REJECTION_TYPES];
+} EdrEventBusRejections;
+void edr_event_bus_rejection_snapshot(EdrEventBus *bus, EdrEventBusRejections *out);
+
 EdrEventBus *edr_event_bus_create(uint32_t slot_count);
 void edr_event_bus_destroy(EdrEventBus *bus);
 
