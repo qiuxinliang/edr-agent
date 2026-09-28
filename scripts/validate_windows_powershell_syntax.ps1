@@ -30,6 +30,8 @@ $relativePaths = @(
   "scripts\stage_vcpkg_runtime_dlls_build_release.ps1",
   "scripts\stage_msvc_runtime_dlls_build_release.ps1",
   "scripts\write_windows_package_capabilities.ps1",
+  "scripts\Verify-WindowsUsbSignatures.ps1",
+  "tests\test_windows_usb_signatures.ps1",
   "scripts\test_windows_package_capabilities_contract.ps1",
   "scripts\windows_setup_exe_lifecycle_smoke.ps1",
   "scripts\windows_release_lifecycle_smoke.ps1",

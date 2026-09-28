@@ -26,6 +26,7 @@ on:
         options:
           - unsigned
           - signed
+          - usb
       upgrade_class:
         description: Upgrade path classification; binary_hot additionally requires post-build identity proof against the previous immutable Release
         required: true
@@ -65,6 +66,7 @@ jobs:
         run: |
           python3 tests/test_windows_release_checkpoint.py
           python3 tests/test_windows_release_workflow.py
+          python3 tests/test_windows_usb_bundle.py
           cc -std=c11 -Wall -Wextra -Werror tests/test_agent_update_assets.c -o "$RUNNER_TEMP/test_agent_update_assets"
           EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"
       - name: Bind draft release to source and run
@@ -73,6 +75,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: python3 scripts/windows_release_checkpoint.py prepare
+      - name: Fail early for missing USB configuration
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        env:
+          USB_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
+          USB_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
+        shell: bash
+        run: |
+          test -n "$USB_TOKEN" && test -n "$USB_SUBJECT" && [[ "$USB_THUMBPRINT" =~ ^[A-F0-9]{40}$ ]] || { echo 'USB signing credential or pinned publisher is not configured'; exit 1; }
 
   windows-build:
     name: Build Windows ${{ matrix.arch }} (FDSensor.exe + runtime DLLs, fast no-gRPC)
@@ -150,7 +161,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          python scripts/windows_release_checkpoint.py restore --arch $env:EDR_RELEASE_ARCH
+          $command = if ($env:WINDOWS_RELEASE_MODE -eq 'usb') { 'restore-input' } else { 'restore' }
+          python scripts/windows_release_checkpoint.py $command --arch $env:EDR_RELEASE_ARCH
           if ($LASTEXITCODE -ne 0) { throw 'Release checkpoint verification failed; refusing unsafe reuse' }
       - uses: actions/setup-dotnet@v5
         if: steps.resume.outputs.restored != 'true'
@@ -171,6 +183,10 @@ jobs:
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
         run: python tests/test_windows_release_workflow.py
+      - name: Verify USB response integrity regressions
+        if: steps.resume.outputs.restored != 'true'
+        shell: powershell
+        run: .\tests\test_windows_usb_signatures.ps1
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
@@ -184,13 +200,13 @@ jobs:
         shell: pwsh
         run: |
           $mode = $env:WINDOWS_RELEASE_MODE.Trim().ToLowerInvariant()
-          if ($mode -notin @('signed', 'unsigned')) {
-            throw "WINDOWS_RELEASE_MODE must be signed or unsigned"
+          if ($mode -notin @('signed', 'unsigned', 'usb')) {
+            throw "WINDOWS_RELEASE_MODE must be signed, unsigned or usb"
           }
-          if ($mode -eq 'unsigned') {
+          if ($mode -in @('unsigned','usb')) {
             "WINDOWS_RELEASE_UNSIGNED=true" | Out-File -FilePath $env:GITHUB_ENV -Append
             "WINDOWS_RELEASE_SIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag $env:EDR_AGENT_RELEASE_TAG. The complete SHA-256-pinned update bundle will still be published."
+            Write-Host "::warning title=Unsigned Windows release::Authenticode and CMS signing are disabled for tag $env:EDR_AGENT_RELEASE_TAG. USB mode retains these inputs only; signed finalization is mandatory before publication."
             exit 0
           }
           "WINDOWS_RELEASE_UNSIGNED=false" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -1299,18 +1315,23 @@ jobs:
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
         run: |
-          python scripts/windows_release_checkpoint.py seal --arch $env:EDR_RELEASE_ARCH
+          if ($env:WINDOWS_RELEASE_MODE -eq 'usb') {
+            python scripts/windows_release_checkpoint.py seal-input --arch $env:EDR_RELEASE_ARCH
+          } else {
+            python scripts/windows_release_checkpoint.py seal --arch $env:EDR_RELEASE_ARCH
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Cannot checkpoint invalid release assets' }
       - name: Retain verified package for upload retry
         if: steps.resume.outputs.restored != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: release-checkpoint-${{ matrix.arch }}
+          name: release-${{ env.WINDOWS_RELEASE_MODE == 'usb' && 'input' || 'checkpoint' }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
       - name: Upload ${{ matrix.arch }} release bundle
+        if: env.WINDOWS_RELEASE_MODE != 'usb'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
@@ -1318,11 +1339,91 @@ jobs:
           python scripts/windows_release_checkpoint.py upload --arch $env:EDR_RELEASE_ARCH
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; rerun failed jobs to reuse the verified checkpoint' }
 
+  usb-finalize:
+    name: Finalize USB release (one private handoff)
+    needs: windows-build
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+      - uses: actions/setup-python@v6
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        with:
+          python-version: '3.12.10'
+      - uses: actions/download-artifact@v4
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        with:
+          pattern: release-input-*
+          path: inputs
+      - name: Restore same-run signed final checkpoint
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        id: final-resume
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          python scripts/windows_release_checkpoint.py restore-usb-final --directory finalized
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot safely resume signed release' }
+      - name: Dispatch one private finalization job and wait with a deadline
+        if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
+        id: signer
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+        shell: pwsh
+        run: |
+          $version=$env:EDR_AGENT_RELEASE_TAG.Substring(4)
+          python scripts/private_signing_bridge.py dispatch --run $env:GITHUB_RUN_ID --attempt $env:GITHUB_RUN_ATTEMPT --commit $env:GITHUB_SHA --version $version
+          if ($LASTEXITCODE -ne 0) { throw 'USB finalization failed; rerun failed jobs, not the native build' }
+      - uses: actions/download-artifact@v4
+        if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
+        with:
+          repository: qiuxinliang/edr-agent-signing
+          run-id: ${{ steps.signer.outputs.signing_run_id }}
+          github-token: ${{ secrets.USB_SIGNING_TOKEN }}
+          name: usb-finalized
+          path: finalized
+      - name: Independently verify signed payloads before uploading
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
+          USB_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
+        shell: pwsh
+        run: |
+          foreach ($arch in @('amd64','arm64')) {
+            python scripts/windows_usb_bundle.py verify --input "inputs/release-input-$arch" --signed "finalized/$arch" --output "verify/$arch" --arch $arch --thumbprint $env:USB_THUMBPRINT --subject $env:USB_SUBJECT
+            if ($LASTEXITCODE -ne 0) { throw 'Final USB bundle contract failed' }
+            .\scripts\Verify-WindowsUsbSignatures.ps1 -Original "$PWD\verify\$arch\original" -Signed "$PWD\verify\$arch\signed" -Thumbprint $env:USB_THUMBPRINT
+            python scripts/windows_release_checkpoint.py seal --directory "finalized/$arch" --arch $arch
+            if ($LASTEXITCODE -ne 0) { throw 'Final USB checkpoint failed' }
+          }
+      - name: Retain final signed bundle before network upload
+        if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-verified-final
+          path: finalized/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Upload verified USB bundles
+        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          foreach ($arch in @('amd64','arm64')) {
+            python scripts/windows_release_checkpoint.py upload --directory "finalized/$arch" --arch $arch
+            if ($LASTEXITCODE -ne 0) { throw 'Upload failed; preserve the signed final checkpoint' }
+          }
+
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
       - windows-build
       - windows-lifecycle
+      - usb-finalize
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -1349,14 +1450,14 @@ jobs:
               name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
               has_asset "${name}" || { echo "::error::missing combined release asset: ${name}"; exit 1; }
             done
-            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" ]]; then
+            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" || "${WINDOWS_RELEASE_MODE}" == "usb" ]]; then
               name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
               has_asset "${name}" || { echo "::error::missing signed manifest: ${name}"; exit 1; }
             fi
           done
 
       - name: Publish signed Windows release
-        if: env.WINDOWS_RELEASE_MODE == 'signed'
+        if: env.WINDOWS_RELEASE_MODE == 'signed' || env.WINDOWS_RELEASE_MODE == 'usb'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1377,7 +1478,7 @@ jobs:
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
-    needs: windows-build
+    needs: usb-finalize
     permissions:
       contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml

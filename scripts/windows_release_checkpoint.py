@@ -35,8 +35,10 @@ def source(env=os.environ):
         raise ValueError("Invalid release version; expected win_M.m.p")
     if not re.fullmatch(r"[0-9a-f]{40}", result["commit"]) or not result["run_id"].isdigit():
         raise ValueError("Invalid release source identity")
-    if result["mode"] not in ("signed", "unsigned"):
+    if result["mode"] not in ("signed", "unsigned", "usb"):
         raise ValueError("Unsupported release mode")
+    if result["mode"] == "usb" and result["upgrade_class"] == "binary_hot":
+        raise ValueError("USB signing changes runtime identities; use auto or installer_required")
     return result
 
 
@@ -173,19 +175,21 @@ def verify_owner(api, expected):
     return info
 
 
-def asset_names(expected, arch):
+def asset_names(expected, arch, *, candidate=False):
     if arch not in ("amd64", "arm64"):
         raise ValueError("Invalid release architecture")
     prefix = f"edr-agent-{expected['tag']}-windows-{arch}-"
     names = {prefix + s for s in ("exe.zip", "setup.exe", "setup-ui.zip", "FDSensor.exe", "artifact-manifest.json")}
-    if expected["mode"] == "signed":
+    if expected["mode"] in ("signed", "usb") and not candidate:
         names.add(prefix + "artifact-manifest.json.p7s")
     return names
 
 
-def inspect_bundle(directory, expected, arch):
+def inspect_bundle(directory, expected, arch, *, candidate=False):
     directory = Path(directory)
-    names = asset_names(expected, arch)
+    if candidate and expected["mode"] != "usb":
+        raise ValueError("Only USB releases accept a pre-signing candidate")
+    names = asset_names(expected, arch, candidate=candidate)
     actual = {p.name for p in directory.iterdir() if p.name != CHECKPOINT}
     if actual != names or any(not (directory / name).is_file() or (directory / name).is_symlink() for name in names):
         raise ValueError("Checkpoint must contain the exact complete architecture asset set")
@@ -193,7 +197,8 @@ def inspect_bundle(directory, expected, arch):
     manifest = json.loads((directory / manifest_name).read_text(encoding="utf-8-sig"))
     if manifest.get("build_provenance") != expected or manifest.get("version") != expected["tag"][4:].removesuffix("-unsigned"):
         raise ValueError("Manifest source/version mismatch")
-    if manifest.get("signature", {}).get("status") != expected["mode"]:
+    status = "unsigned" if candidate else ("signed" if expected["mode"] == "usb" else expected["mode"])
+    if manifest.get("signature", {}).get("status") != status:
         raise ValueError("Manifest signing mode mismatch")
     files = {name: {"sha256": digest(directory / name), "size": (directory / name).stat().st_size} for name in names}
     entries = manifest.get("artifacts", [])
@@ -206,20 +211,20 @@ def inspect_bundle(directory, expected, arch):
     return {"source": expected, "arch": arch, "files": files}
 
 
-def seal(directory, expected, arch):
-    record = inspect_bundle(directory, expected, arch)
+def seal(directory, expected, arch, *, candidate=False):
+    record = inspect_bundle(directory, expected, arch, candidate=candidate)
     (Path(directory) / CHECKPOINT).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
 
 
-def verify_checkpoint(directory, expected, arch):
+def verify_checkpoint(directory, expected, arch, *, candidate=False):
     record = json.loads((Path(directory) / CHECKPOINT).read_text(encoding="utf-8"))
-    if record != inspect_bundle(directory, expected, arch):
+    if record != inspect_bundle(directory, expected, arch, candidate=candidate):
         raise ValueError("Checkpoint identity or file digest mismatch; refuse reuse")
     return record
 
 
-def restore(api, directory, expected, arch):
-    name = f"release-checkpoint-{arch}"
+def restore(api, directory, expected, arch, *, candidate=False):
+    name = f"release-{'input' if candidate else 'checkpoint'}-{arch}"
     pages = api.call("api", f"repos/{api.repository}/actions/runs/{expected['run_id']}/artifacts?per_page=100",
                      "--paginate", "--slurp")
     candidates = [a for page in json.loads(pages) for a in page["artifacts"] if a["name"] == name]
@@ -229,7 +234,7 @@ def restore(api, directory, expected, arch):
         raise ValueError("Checkpoint expired or ambiguous; use a new release version")
     api.call("run", "download", expected["run_id"], "--repo", api.repository,
              "--name", name, "--dir", str(directory))
-    verify_checkpoint(directory, expected, arch)
+    verify_checkpoint(directory, expected, arch, candidate=candidate)
     return True
 
 
@@ -243,6 +248,23 @@ def remote_matches(api, tag, asset, local):
     with tempfile.TemporaryDirectory() as temporary:
         api.download(tag, asset["name"], temporary)
         return digest(Path(temporary) / asset["name"]) == digest(local)
+
+
+def restore_usb_final(api, directory, expected):
+    if expected['mode'] != 'usb':
+        raise ValueError('USB final checkpoint requires USB mode')
+    pages = api.call('api', f"repos/{api.repository}/actions/runs/{expected['run_id']}/artifacts?per_page=100",
+                     '--paginate', '--slurp')
+    matches = [a for page in json.loads(pages) for a in page['artifacts'] if a['name'] == 'usb-verified-final']
+    if not matches:
+        return False
+    if len(matches) != 1 or matches[0]['expired']:
+        raise ValueError('Signed final checkpoint expired or ambiguous; use a new version, never re-sign published assets')
+    api.call('run', 'download', expected['run_id'], '--repo', api.repository,
+             '--name', 'usb-verified-final', '--dir', str(directory))
+    for arch in ('amd64', 'arm64'):
+        verify_checkpoint(Path(directory) / arch, expected, arch)
+    return True
 
 
 def upload(api, directory, expected, arch):
@@ -278,7 +300,7 @@ def upload(api, directory, expected, arch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload"))
+    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     args = parser.parse_args()
@@ -293,13 +315,14 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
             stream.write(f"published={str(published).lower()}\n")
         print("Already published from this source; no duplicate build" if published else "Draft source identity verified")
-    elif args.command == "restore":
-        restored = restore(api, args.directory, expected, args.arch)
+    elif args.command in ("restore", "restore-input", "restore-usb-final"):
+        restored = (restore_usb_final(api, args.directory, expected) if args.command == 'restore-usb-final'
+                    else restore(api, args.directory, expected, args.arch, candidate=args.command == "restore-input"))
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
             stream.write(f"restored={str(restored).lower()}\n")
         print("Verified complete checkpoint; resume upload" if restored else "No checkpoint; full build and gates required")
-    elif args.command == "seal":
-        seal(args.directory, expected, args.arch)
+    elif args.command in ("seal", "seal-input"):
+        seal(args.directory, expected, args.arch, candidate=args.command == "seal-input")
     else:
         upload(api, args.directory, expected, args.arch)
 

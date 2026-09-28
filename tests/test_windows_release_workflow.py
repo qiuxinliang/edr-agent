@@ -14,25 +14,25 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                    self.text.split('\njobs:\n', 1)[1], re.M | re.S))
 
-    def test_only_original_hosted_job_graph_remains(self):
-        self.assertEqual(set(self.jobs), {'prepare-release', 'windows-build', 'windows-lifecycle', 'publish-release'})
-        for removed in ('usb-native', 'USB_SIGNING_TOKEN', 'edr-agent-signing', 'self-hosted', 'build_purpose', 'unsigned-candidate-'):
+    def test_single_usb_handoff_keeps_public_jobs_hosted(self):
+        self.assertEqual(set(self.jobs), {'prepare-release', 'windows-build', 'usb-finalize', 'windows-lifecycle', 'publish-release'})
+        for removed in ('usb-native', 'usb-installer', 'usb-manifest', 'self-hosted', 'build_purpose', 'unsigned-candidate-'):
             self.assertNotIn(removed, self.text)
         self.assertFalse(list((ROOT / '.github/workflows').glob('windows-usb-*.yml')))
 
-    def test_original_modes_and_default_are_restored(self):
+    def test_usb_is_opt_in_and_unsigned_default_is_unchanged(self):
         modes = self.text.split('      release_mode:', 1)[1].split('      upgrade_class:', 1)[0]
-        self.assertEqual(re.findall(r'^          - (\w+)$', modes, re.M), ['unsigned', 'signed'])
+        self.assertEqual(re.findall(r'^          - (\w+)$', modes, re.M), ['unsigned', 'signed', 'usb'])
         self.assertIn('default: unsigned', modes)
         self.assertIn("vars.WINDOWS_RELEASE_MODE || 'unsigned'", self.text)
         self.assertIn('(UNSIGNED Windows AMD64 + ARM64)', self.jobs['publish-release'])
 
     def test_publication_still_requires_build_and_lifecycle_success(self):
         self.assertIn('needs: prepare-release', self.jobs['windows-build'])
-        self.assertIn('needs: windows-build', self.jobs['windows-lifecycle'])
+        self.assertIn('needs: usb-finalize', self.jobs['windows-lifecycle'])
         publish = self.jobs['publish-release']
         needs = publish.split('    needs:\n', 1)[1].split('    runs-on:', 1)[0]
-        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['windows-build', 'windows-lifecycle'])
+        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['windows-build', 'windows-lifecycle', 'usb-finalize'])
         # No always() or job-level condition can bypass implicit successful needs.
         self.assertNotRegex(publish, r'(?m)^    if:')
         self.assertIn('windows-install-upgrade-rollback.yml', self.jobs['windows-lifecycle'])
@@ -51,7 +51,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                      'Prepare release assets', 'Seal verified package checkpoint'):
             step = build.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
             self.assertIn("if: steps.resume.outputs.restored != 'true'", step)
-        self.assertIn('windows_release_checkpoint.py restore --arch', build)
+        self.assertIn("'restore-input' } else { 'restore' }", build)
+        self.assertIn('windows_release_checkpoint.py $command --arch', build)
+        self.assertIn("if: env.WINDOWS_RELEASE_MODE != 'usb'", build)
         self.assertIn('windows_release_checkpoint.py upload --arch', build)
         self.assertNotIn('gh release upload', build)
         self.assertNotIn('--notes-file', self.jobs['publish-release'])
@@ -83,13 +85,23 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
             self.assertIn(check, build)
         self.assertIn('artifact-manifest.json.p7s', self.jobs['publish-release'])
 
+    def test_usb_finalization_retains_both_retry_boundaries_and_signature_gate(self):
+        build, finish = self.jobs['windows-build'], self.jobs['usb-finalize']
+        self.assertIn('seal-input --arch', build)
+        self.assertEqual(finish.count('private_signing_bridge.py dispatch'), 1)
+        self.assertNotIn('--phase', finish)
+        self.assertIn('restore-usb-final --directory finalized', finish)
+        self.assertIn("steps.final-resume.outputs.restored != 'true'", finish)
+        self.assertLess(finish.index('Verify-WindowsUsbSignatures.ps1'), finish.index('name: usb-verified-final'))
+        self.assertLess(finish.index('name: usb-verified-final'), finish.index('windows_release_checkpoint.py upload'))
+        self.assertIn("needs: usb-finalize", self.jobs['windows-lifecycle'])
+
     def test_syntax_validation_has_no_missing_or_retired_targets(self):
         validator = (ROOT / 'scripts/validate_windows_powershell_syntax.ps1').read_text(encoding='utf-8')
         targets = re.findall(r'^  "([^"\n]+\.ps1)"', validator, re.M)
         self.assertGreater(len(targets), 20)
         for target in targets:
             self.assertTrue((ROOT / target.replace('\\', '/')).is_file(), target)
-            self.assertNotIn('Usb', target)
         self.assertIn('tests\\test_windows_installer_acl.ps1', targets)
 
 

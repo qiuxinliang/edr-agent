@@ -22,6 +22,8 @@ param(
     [string] $AppVersion = "0.0.0",
     [string] $Configuration = "Release",
     [string] $OutputZip = "",
+    # Only for a hash-verified CI publish tree; never runs MSBuild on the signer.
+    [string] $PrebuiltPublishDir = "",
     [string] $PreconfigJson = "",
     [string] $BootstrapTrustPublicKeyPem = "",
     [ValidateSet("", "self-contained", "compact", "framework-dependent")]
@@ -336,9 +338,9 @@ $publishDirCandidates = @(
     (Join-Path $scriptDir "bin\$Configuration\$targetFramework\$runtime\publish"),
     (Join-Path $scriptDir "bin\$platformDir\$Configuration\$targetFramework\$runtime\publish")
 )
-foreach ($candidate in $publishDirCandidates) {
+if (-not $PrebuiltPublishDir) { foreach ($candidate in $publishDirCandidates) {
     Remove-Item -LiteralPath $candidate -Recurse -Force -ErrorAction SilentlyContinue
-}
+} }
 
 $resolvedRuntimeMode = if ($RuntimeMode) { $RuntimeMode } elseif ($env:EDR_SETUP_UI_RUNTIME_MODE) { [string]$env:EDR_SETUP_UI_RUNTIME_MODE } else { "compact" }
 if ($resolvedRuntimeMode -notin @("self-contained", "compact", "framework-dependent")) {
@@ -353,6 +355,7 @@ if ($readyToRun -notin @("true", "false")) {
 }
 Write-Host "Setup UI runtime mode: $resolvedRuntimeMode (self-contained=$selfContained, readyToRun=$readyToRun)"
 
+if (-not $PrebuiltPublishDir) {
 $lockedRestoreScript = Join-Path $repositoryRoot "scripts\Restore-SetupUiLocked.ps1"
 if (-not (Test-Path -LiteralPath $lockedRestoreScript -PathType Leaf)) {
     throw "Missing Setup UI locked-restore gate: $lockedRestoreScript"
@@ -398,6 +401,17 @@ foreach ($candidate in $publishDirCandidates) {
 
 if (-not $publishDir) {
     throw "Publish directory not found. Checked: $($publishDirCandidates -join '; ')"
+}
+} else {
+    $publishDir = (Resolve-Path -LiteralPath $PrebuiltPublishDir -ErrorAction Stop).Path
+    $prebuiltManifest = Get-Content -LiteralPath (Join-Path $publishDir 'setup-ui-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($prebuiltManifest.version -cne $AppVersion -or $prebuiltManifest.runtime_identifier -cne $runtime -or
+        $prebuiltManifest.target_arch -cne $targetArch -or $prebuiltManifest.runtime_mode -cne $resolvedRuntimeMode) {
+        throw 'Prebuilt Setup UI version/architecture/runtime mode mismatch'
+    }
+    $uiHash = Get-FileSha256Hex (Join-Path $publishDir 'FDSecuritySetupUI.exe')
+    if ($uiHash -cne $prebuiltManifest.ui_exe_sha256) { throw 'Prebuilt Setup UI hash mismatch' }
+    Write-Host 'Using verified prebuilt Setup UI; no NuGet restore or dotnet publish'
 }
 
 $requiredPublishFiles = @(
@@ -456,7 +470,9 @@ if ($BootstrapTrustPublicKeyPem) {
 }
 
 $versionFile = Join-Path (Resolve-Path (Join-Path $scriptDir "..\..")).Path "VERSION"
-if (Test-Path -LiteralPath $versionFile) {
+if ($PrebuiltPublishDir) {
+    if (([IO.File]::ReadAllText((Join-Path $publishDir 'VERSION'))).Trim() -cne $AppVersion) { throw 'Prebuilt Setup UI VERSION mismatch' }
+} elseif (Test-Path -LiteralPath $versionFile) {
     Copy-Item -LiteralPath $versionFile -Destination (Join-Path $publishDir "VERSION") -Force
 } else {
     [System.IO.File]::WriteAllText((Join-Path $publishDir "VERSION"), $AppVersion)
