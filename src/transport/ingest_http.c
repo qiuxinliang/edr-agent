@@ -1,3 +1,5 @@
+#include "edr/health_upload.h"
+#include "edr/time_util.h"
 #include "edr/ingest_http.h"
 #include "http_budget.h"
 
@@ -5548,12 +5550,24 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   return 0;
 }
 
+static EdrHealthUpload s_health_upload;
+static int send_engine_health(const char *body, char *reply, size_t cap, void *ctx) {
+  (void)ctx;
+  cJSON *root = cJSON_Parse(body);
+  if (!root) return -1;
+  int delta = cJSON_GetObjectItemCaseSensitive(root, "engine_health_update") != NULL;
+  cJSON_Delete(root);
+  return edr_ingest_http_post_json_suffix(delta ? "ingest/engine-health/delta" :
+      "ingest/engine-health", body, reply, cap);
+}
+
 int edr_ingest_http_post_engine_health_json(const char *body_json) {
   if (!edr_ingest_http_configured() || !body_json || !body_json[0]) {
     return -1;
   }
 
-  int rc = post_to_suffix("ingest/engine-health", body_json);
+  int rc = edr_health_upload(&s_health_upload, body_json, edr_monotonic_ns(),
+                             send_engine_health, NULL);
   if (rc != 0) {
     log_native_post_failure("engine_health", rc);
     return -1;

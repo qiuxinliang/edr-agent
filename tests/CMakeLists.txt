@@ -741,6 +741,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
+  ${CMAKE_SOURCE_DIR}/src/transport/health_upload.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
   ${CMAKE_SOURCE_DIR}/src/transport/request_signing.c
@@ -1574,6 +1575,15 @@ set_tests_properties(event_batch_max_age PROPERTIES TIMEOUT 30)
 
 add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smoke.sh $<TARGET_FILE:edr_agent>)
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
+
+
+add_executable(test_health_upload test_health_upload.c
+  ${CMAKE_SOURCE_DIR}/src/transport/health_upload.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_health_upload PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_health_upload)
+add_test(NAME health_upload COMMAND test_health_upload)
 
 include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
 if(WIN32)

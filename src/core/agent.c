@@ -2297,6 +2297,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&avst, 0, sizeof(avst));
   int ave_ok = 0;
 
+  char source_only_reason[512];
   char rules_ver[96], runtime_policy_raw[96], runtime_policy_ver[96];
   char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
@@ -2469,6 +2470,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_local_evidence_cache_get_status(&evidence_status);
   edr_p0_rule_get_dedup_metrics(&p0_metrics);
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
+  json_escape_small(p0_emit_metrics.source_only_terminal_reason, source_only_reason, sizeof(source_only_reason));
   edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
   if (edr_local_evidence_cache_context_ref_write_sources_json(
           context_ref_sources_json, sizeof(context_ref_sources_json)) < 0) {
@@ -2540,7 +2542,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"envelope_format\":\"%s\",\"last_error\":\"%s\"}}}},"
         "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
         "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu,"
-        "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
+        "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu,\"baseline_registry_upload_skipped\":%llu},"
         "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
         "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
         "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu,\"rejected_by_type\":%s},"
@@ -2578,7 +2580,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"dedup\":{\"suppressed_total\":%llu,\"exact_suppressed\":%llu,"
         "\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu},"
         "\"source_only\":{\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u,\"loss_detected\":%s,"
-        "\"retry_pending\":%llu,\"retry_committed\":%llu},"
+        "\"retry_pending\":%llu,\"retry_committed\":%llu,\"reason\":\"%s\"},"
         "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
         "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
@@ -2708,6 +2710,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
         (unsigned long long)edr_preprocess_baseline_file_upload_skipped_count(),
         (unsigned long long)edr_preprocess_baseline_process_upload_skipped_count(),
+        (unsigned long long)edr_preprocess_baseline_registry_upload_skipped_count(),
         edr_event_bus_capacity(agent->event_bus),
         edr_event_bus_used_approx(agent->event_bus),
         edr_event_bus_p0_reserved_slots(agent->event_bus),
@@ -2764,7 +2767,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         p0_emit_metrics.source_only_unhealthy_families,
         p0_emit_metrics.source_only_loss_detected ? "true" : "false",
         (unsigned long long)p0_emit_metrics.source_only_retry_pending,
-        (unsigned long long)p0_emit_metrics.source_only_retry_committed,
+        (unsigned long long)p0_emit_metrics.source_only_retry_committed, source_only_reason,
         evidence_status.db_open ? "true" : "false", evidence_status.db_utilization_bps,
         (unsigned long long)evidence_status.candidate_requests,
         (unsigned long long)evidence_status.candidate_reused,
@@ -2968,13 +2971,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)p0_emit_metrics.source_only_backpressure_failed);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
                  p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"p0_source_only_durability\":{\"retry_pending\":%llu,\"retry_attempts\":%llu,\"retry_committed\":%llu,\"retry_capacity_exhausted\":%llu,\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u}",
+                 ",\"p0_source_only_durability\":{\"retry_pending\":%llu,\"retry_attempts\":%llu,\"retry_committed\":%llu,\"retry_capacity_exhausted\":%llu,\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u,\"reason\":\"%s\"}",
                  (unsigned long long)p0_emit_metrics.source_only_retry_pending,
                  (unsigned long long)p0_emit_metrics.source_only_retry_attempts,
                  (unsigned long long)p0_emit_metrics.source_only_retry_committed,
                  (unsigned long long)p0_emit_metrics.source_only_retry_capacity_exhausted,
                  p0_emit_metrics.source_only_terminal_unhealthy ? "true" : "false",
-                 p0_emit_metrics.source_only_unhealthy_families);
+                 p0_emit_metrics.source_only_unhealthy_families, source_only_reason);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(p0_health_json, sizeof(p0_health_json), &p0_health_used,
                  ",\"p0_rule_bundle\":{\"plaintext_sha256\":\"%s\"}",
                  p0_bundle_sha256 ? p0_bundle_sha256 : "");
@@ -3211,7 +3214,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "%s"
       "\"event_delivery\":{\"post_ok_count\":%lu,\"post_ok_body_bytes\":%llu,"
       "\"post_attempt_body_bytes\":%llu,\"baseline_rename_upload_skipped\":%llu,"
-      "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu},"
+      "\"baseline_file_upload_skipped\":%llu,\"baseline_process_upload_skipped\":%llu,\"baseline_registry_upload_skipped\":%llu},"
       "\"event_bus\":{\"capacity\":%u,\"used\":%u,\"p0_reserved\":%u,"
       "\"ordinary_reserve_rejected\":%llu,\"p0_reserve_rejected\":%llu,\"pushed\":%llu,"
       "\"dropped\":%llu,\"high_water_hits\":%llu,\"static_bytes\":%llu,\"rejected_by_type\":%s},"
@@ -3469,6 +3472,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)edr_preprocess_baseline_rename_upload_skipped_count(),
       (unsigned long long)edr_preprocess_baseline_file_upload_skipped_count(),
       (unsigned long long)edr_preprocess_baseline_process_upload_skipped_count(),
+        (unsigned long long)edr_preprocess_baseline_registry_upload_skipped_count(),
       edr_event_bus_capacity(agent->event_bus),
       edr_event_bus_used_approx(agent->event_bus),
       edr_event_bus_p0_reserved_slots(agent->event_bus),

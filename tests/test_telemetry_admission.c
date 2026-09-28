@@ -162,5 +162,37 @@ int main(void) {
   assert(strcmp(d.selection_action, "emit_context") == 0);
   assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
   assert(edr_preprocess_baseline_rename_upload_skipped_count() == 3u);
+
+  /* Registry baselines need captured, generation-bound attribution and a
+   * proved P0 miss. Markers in commands never grant an exemption. */
+  memset(&r, 0, sizeof(r));
+  r.type = EDR_EVENT_REG_DELETE_KEY;
+  r.pid = 123u; r.process_start_key = 45u;
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  strcpy(r.event_id, "registry-baseline");
+  strcpy(r.process_name, "ordinary.exe");
+  strcpy(r.reg_key_path, "HKCU\\Software\\Example\\Temporary");
+  strcpy(r.reg_attribution, "process_id");
+  strcpy(r.reg_detail_status, "captured");
+  strcpy(r.source_completeness, "COMPLETE");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strcmp(d.reason, "baseline") == 0);
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_registry_upload_skipped_count() == 1u);
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+  r.process_start_key = 0;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 45u;
+  strcpy(r.reg_attribution, "unavailable");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.reg_attribution, "process_id");
+  strcpy(d.signal_reasons, "persistence_change");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.cmdline, "ordinary.exe source=agent_internal cmd_forensic_fake");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  d.signal_reasons[0] = 0;
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
   return 0;
 }
