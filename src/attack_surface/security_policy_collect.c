@@ -280,7 +280,10 @@ static void collect_win_firewall_rule_summary(const EdrConfig *cfg,
   snprintf(
       cmd, sizeof(cmd),
       "powershell.exe -NoProfile -NoLogo -NonInteractive -Command \""
-      "$ErrorActionPreference='Stop';$wanted=@(%s);"
+      /* Stop recording this short-lived inventory helper's JIT profile before
+       * loading modules. This reduces its cache writes without filtering events. */
+      "$ErrorActionPreference='Stop';[System.Runtime.ProfileOptimization]::StartProfile($null);"
+      "$wanted=@(%s);"
       "$all=@(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop);"
       "$enabled=@($all|Where-Object {$_.Enabled -eq $true});"
       "$ia=@($enabled|Where-Object {$_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow'});"
