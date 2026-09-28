@@ -15,7 +15,8 @@
  * header and exports these literals, so a backend provenance record cannot
  * name a parser schema, capacity, or source grammar that this binary does
  * not actually compile. */
-#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v2"
+/* v3 narrows file_write to content writes and creates. */
+#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v3"
 #define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@3"
 #define EDR_P0_RULE_IR_BUNDLE_KIND "edr_p0_rule_bundle_ir_v1"
 #define EDR_P0_RULE_IR_SCHEMA_VERSION 3u

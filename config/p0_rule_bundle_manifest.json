@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-d685f452",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-32595aa6",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 180,
   "rules": [
@@ -623,7 +623,7 @@
     },
     {
       "id": "R-EXFIL-001",
-      "title": "敏感目录压缩打包（数据暂存）",
+      "title": "敏感目录压缩打包命令",
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
@@ -1614,7 +1614,7 @@
     },
     {
       "id": "R-EXFIL-006",
-      "title": "用户数据归档打包落地",
+      "title": "用户目录归档文件创建或写入",
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,

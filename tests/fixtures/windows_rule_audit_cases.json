@@ -824,6 +824,106 @@
         "process_name": "netsh.exe",
         "cmdline": "netsh.exe advfirewall firewall add rule name=Test \"dir=in\" \"action=allow\""
       }
+    },
+    {
+      "case_id": "archive_file_write",
+      "rule_id": "R-EXFIL-006",
+      "expect_match": true,
+      "event": {
+        "event_type": "file_write",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\ProgramData\\app\\diagnostics.zip"
+      }
+    },
+    {
+      "case_id": "archive_file_create",
+      "rule_id": "R-EXFIL-006",
+      "expect_match": true,
+      "event": {
+        "event_type": "file_create",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\ProgramData\\app\\diagnostics.zip"
+      }
+    },
+    {
+      "case_id": "archive_file_delete",
+      "rule_id": "R-EXFIL-006",
+      "expect_match": false,
+      "event": {
+        "event_type": "file_delete",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\ProgramData\\app\\diagnostics.zip"
+      }
+    },
+    {
+      "case_id": "archive_file_rename",
+      "rule_id": "R-EXFIL-006",
+      "expect_match": false,
+      "event": {
+        "event_type": "file_rename",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\ProgramData\\app\\diagnostics.zip"
+      }
+    },
+    {
+      "case_id": "archive_file_permission_change",
+      "rule_id": "R-EXFIL-006",
+      "expect_match": false,
+      "event": {
+        "event_type": "file_permission_change",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\ProgramData\\app\\diagnostics.zip"
+      }
+    },
+    {
+      "case_id": "archive_command_enumerate_downloads",
+      "rule_id": "R-EXFIL-001",
+      "expect_match": false,
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command Get-ChildItem C:\\Users\\user\\Downloads\\MinGit"
+      }
+    },
+    {
+      "case_id": "archive_command_list_archive",
+      "rule_id": "R-EXFIL-001",
+      "expect_match": false,
+      "event": {
+        "event_type": "process_create",
+        "process_name": "7z.exe",
+        "cmdline": "7z.exe l C:\\Users\\user\\Downloads\\a.zip"
+      }
+    },
+    {
+      "case_id": "archive_command_extract_archive",
+      "rule_id": "R-EXFIL-001",
+      "expect_match": false,
+      "event": {
+        "event_type": "process_create",
+        "process_name": "7z.exe",
+        "cmdline": "7z.exe e C:\\Users\\user\\Downloads\\a.zip"
+      }
+    },
+    {
+      "case_id": "archive_command_pack_archive",
+      "rule_id": "R-EXFIL-001",
+      "expect_match": true,
+      "event": {
+        "event_type": "process_create",
+        "process_name": "7z.exe",
+        "cmdline": "\"C:\\Program Files\\7-Zip\\7z.exe\" a C:\\Users\\user\\Downloads\\a.zip C:\\Users\\user\\Documents"
+      }
+    },
+    {
+      "case_id": "archive_command_compress_archive",
+      "rule_id": "R-EXFIL-001",
+      "expect_match": true,
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command Compress-Archive -Path C:\\Users\\user\\Documents -DestinationPath C:\\Temp\\a.zip"
+      }
     }
   ]
 }

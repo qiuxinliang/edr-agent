@@ -1584,10 +1584,9 @@ static int p0_br_wants_event_type(EdrEventType t, const char *et) {
     return t == EDR_EVENT_FILE_READ ? 1 : 0;
   }
   if (strcmp(et, "file_write") == 0) {
-    return (t == EDR_EVENT_FILE_WRITE || t == EDR_EVENT_FILE_CREATE || t == EDR_EVENT_FILE_DELETE ||
-            t == EDR_EVENT_FILE_RENAME || t == EDR_EVENT_FILE_PERMISSION_CHANGE)
-               ? 1
-               : 0;
+    /* A deletion, rename or ACL change does not establish content creation.
+     * Keep this contract aligned with the server's write/create semantics. */
+    return (t == EDR_EVENT_FILE_WRITE || t == EDR_EVENT_FILE_CREATE) ? 1 : 0;
   }
   if (strcmp(et, "network_connect") == 0) {
     /* 与平台 `network_connect` 同构：含出站连接与 **监听绑定**（TCPIP 等 → `NET_LISTEN`） */

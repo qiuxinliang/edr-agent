@@ -212,7 +212,7 @@ class PCRE2StaticProducerContractTests(unittest.TestCase):
             "dedicated_empty_buildtrees_packages_installed_downloads",
             contract["producer"]["work_root_isolation"],
         )
-        self.assertEqual("edr.dynamic-rules.source.v2", contract["agent_matcher"]["source_schema"])
+        self.assertEqual("edr.dynamic-rules.source.v3", contract["agent_matcher"]["source_schema"])
         self.assertEqual("edr_p0_rule_bundle_ir_v1@3", contract["agent_matcher"]["rule_schema"])
         self.assertEqual(256, contract["agent_matcher"]["max_rules"])
         self.assertEqual("edr_p0_rule_bundle_ir_v1", contract["agent_matcher"]["bundle_kind"])
