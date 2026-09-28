@@ -23,6 +23,10 @@ int main(int argc, char **argv) {
   if (strcmp(argv[2], "process_create") == 0) record.type = EDR_EVENT_PROCESS_CREATE;
   else if (strcmp(argv[2], "file_read") == 0) record.type = EDR_EVENT_FILE_READ;
   else if (strcmp(argv[2], "file_write") == 0) record.type = EDR_EVENT_FILE_WRITE;
+  else if (strcmp(argv[2], "file_create") == 0) record.type = EDR_EVENT_FILE_CREATE;
+  else if (strcmp(argv[2], "file_delete") == 0) record.type = EDR_EVENT_FILE_DELETE;
+  else if (strcmp(argv[2], "file_rename") == 0) record.type = EDR_EVENT_FILE_RENAME;
+  else if (strcmp(argv[2], "file_permission_change") == 0) record.type = EDR_EVENT_FILE_PERMISSION_CHANGE;
   else if (argc == 12 && strcmp(argv[2], "registry_set") == 0) record.type = EDR_EVENT_REG_SET_VALUE;
   else if (argc == 12 && strcmp(argv[2], "network_connect") == 0) record.type = EDR_EVENT_NET_CONNECT;
   else { fprintf(stderr, "unsupported replay event\n"); return 2; }

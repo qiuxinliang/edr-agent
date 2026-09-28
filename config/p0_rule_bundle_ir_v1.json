@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 3,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-d685f452",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-32595aa6",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "2de55a76b41415d8afd6aa30328cea7b5cffc60c95bf683515c28acde6e2187e",
+  "sensor_interest_manifest_sha256": "5e90e40ba4740e7f39f48a8b182ef99bae610b48debc2faf684120bfd59de76b",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -1307,7 +1307,7 @@
     },
     {
       "id": "R-EXFIL-001",
-      "title": "敏感目录压缩打包（数据暂存）",
+      "title": "敏感目录压缩打包命令",
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
@@ -1315,12 +1315,11 @@
         "T1074",
         "T1560.001"
       ],
-      "description": "rar/7z/winrar 对 Users/Documents/Desktop 等路径打包，或 PowerShell Compress-Archive",
+      "description": "观察到归档工具的打包命令或 PowerShell Compress-Archive；目录引用、枚举或解压命令不证明打包，执行完成与恶意用途需另证。",
       "condition": {
         "command_regex_any": [
-          "(?i)\\\\(Users|Documents and Settings)\\\\[^\\\\\\s\"]+\\\\(Documents|Desktop|Downloads)",
-          "(?i)Compress-Archive",
-          "(?i)\\s[ae]\\s+[^\\n]{0,240}\\\\Users\\\\"
+          "(?i)(?:^|[\\s;&|])Compress-Archive(?:\\s|$)",
+          "(?i)^(?:\"[^\"\\r\\n]*[\\\\/]|[^\"\\r\\n]*[\\\\/])?(?:7z|7za|rar|winrar)(?:\\.exe)?\"?\\s+[amu]\\s+[^\\r\\n]{0,1000}\\\\(?:Users|Documents and Settings)\\\\"
         ],
         "process_name_in": [
           "rar.exe",
@@ -3269,7 +3268,7 @@
     },
     {
       "id": "R-EXFIL-006",
-      "title": "用户数据归档打包落地",
+      "title": "用户目录归档文件创建或写入",
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
@@ -3277,7 +3276,7 @@
         "T1074.001",
         "T1560.001"
       ],
-      "description": "检测常见压缩工具或PowerShell在用户目录、下载目录、临时目录或ProgramData中生成归档文件，覆盖勒索/外传前的数据打包阶段。",
+      "description": "观察到常见压缩工具或 PowerShell 在用户目录、临时目录或 ProgramData 创建或写入归档文件；不包含删除、重命名或权限修改，不据此断言归档完整成功或外传。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Users\\\\[^\\\\]+\\\\(Desktop|Downloads|Documents|AppData\\\\Local\\\\Temp)\\\\.*\\.(zip|7z|rar|tar|gz|tgz)$",
