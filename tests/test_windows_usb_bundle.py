@@ -137,6 +137,10 @@ class AdmissionTests(unittest.TestCase):
                              ('head_repository',dict(full_name='attacker/fork'))]:
             with self.subTest(field=field), self.assertRaises(ValueError):
                 bridge.validate_source('1234', '2', 'a'*40, '3.2.999', dict(info, **{field:value}))
+        for branch in bridge.RELEASE_BRANCHES:
+            bridge.validate_source('1234', '2', 'a'*40, '3.2.999', dict(info, event='workflow_dispatch', head_branch=branch))
+        with self.assertRaises(ValueError):
+            bridge.validate_source('1234', '2', 'a'*40, '3.2.999', dict(info, event='workflow_dispatch', head_branch='untrusted-feature'))
 
     def test_exact_two_immutable_artifacts(self):
         items = [dict(name='release-input-'+a, id=i, expired=False,

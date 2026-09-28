@@ -18,7 +18,7 @@
 - 私有仓库使用已有 `WINDOWS_USB_SIGNTOOL_PATH`；`WINDOWS_USB_INNO_PATH` 默认 `C:\EDRSigning\InnoSetup6\ISCC.exe`。使用微软 SDK SignTool 和已有 Inno Setup 6，不下载来源不明的工具。
 - 私有签名机只执行私有脚本以及被私有 `packaging-trust.json` 逐文件批准的公共打包代码。普通 Agent 源码变化不需修改白名单；打包脚本变化需要同步审核该文件的哈希。不要自动接受新哈希。
 - Runner 必须以证书所属 Windows 用户交互登录运行，不能用 guest/SYSTEM 服务替代。首次依赖下载需要网络；Python 固定 3.12.10，之后复用工具缓存。
-- 先运行私有 `Signing host health`，再从公共 main 手动选择 `release_mode=usb` 做候选版本验收。完整验收通过后才考虑把仓库默认 `WINDOWS_RELEASE_MODE` 改为 `usb`。
+- 先运行私有 `Signing host health`，再从公共 main 或现有发布分支 `codex/release-workflow-convergence` 手动选择 `release_mode=usb`、`candidate=true` 做验收。候选通过全部门禁后发布为 prerelease，不改变 latest。其他手动分支不进入硬件签名。完整验收通过后才考虑把仓库默认 `WINDOWS_RELEASE_MODE` 改为 `usb`。
 
 ## 日常使用与失败恢复
 

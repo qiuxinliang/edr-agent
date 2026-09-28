@@ -21,7 +21,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertFalse(list((ROOT / '.github/workflows').glob('windows-usb-*.yml')))
 
     def test_usb_is_opt_in_and_unsigned_default_is_unchanged(self):
-        modes = self.text.split('      release_mode:', 1)[1].split('      upgrade_class:', 1)[0]
+        modes = self.text.split('      release_mode:', 1)[1].split('      candidate:', 1)[0]
         self.assertEqual(re.findall(r'^          - (\w+)$', modes, re.M), ['unsigned', 'signed', 'usb'])
         self.assertIn('default: unsigned', modes)
         self.assertIn("vars.WINDOWS_RELEASE_MODE || 'unsigned'", self.text)
@@ -95,6 +95,14 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(finish.index('Verify-WindowsUsbSignatures.ps1'), finish.index('name: usb-verified-final'))
         self.assertLess(finish.index('name: usb-verified-final'), finish.index('windows_release_checkpoint.py upload'))
         self.assertIn("needs: usb-finalize", self.jobs['windows-lifecycle'])
+
+    def test_candidate_never_promotes_latest(self):
+        publish = self.jobs['publish-release']
+        for name in ('Publish signed Windows release', 'Publish unsigned Windows release'):
+            step = publish.split('- name: ' + name, 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("env.EDR_RELEASE_CANDIDATE != 'true'", step)
+        candidate = publish.split('- name: Publish candidate without promoting latest', 1)[1]
+        self.assertIn('--prerelease=true --latest=false', candidate)
 
     def test_syntax_validation_has_no_missing_or_retired_targets(self):
         validator = (ROOT / 'scripts/validate_windows_powershell_syntax.ps1').read_text(encoding='utf-8')

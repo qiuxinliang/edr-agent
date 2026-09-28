@@ -13,6 +13,7 @@ SOURCE = "qiuxinliang/edr-agent"
 SIGNER = "qiuxinliang/edr-agent-signing"
 WORKFLOW = "sign.yml"
 RELEASE_WORKFLOW = ".github/workflows/edr-agent-client-release.yml"
+RELEASE_BRANCHES = {"main", "codex/release-workflow-convergence"}
 
 
 def api(path, data=None):
@@ -53,8 +54,8 @@ def validate_source(run, attempt, commit, version, info):
         raise ValueError("Source must be the active matching EDR release run, not a fork, stale attempt or other workflow")
     event, branch = info.get("event"), info.get("head_branch")
     if not ((event == "push" and branch == "win_" + version)
-            or (event == "workflow_dispatch" and branch == "main")):
-        raise ValueError("USB signing accepts release tags or a manual release from main only")
+            or (event == "workflow_dispatch" and branch in RELEASE_BRANCHES)):
+        raise ValueError("USB signing accepts release tags or a manual release from an explicitly trusted release branch only")
 
 
 def select_artifacts(items, run, commit):
