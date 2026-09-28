@@ -2,6 +2,8 @@
 #include "edr/detection_decision.h"
 #include "edr/dedup.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/windows_event_policy.h"
+#include "cJSON.h"
 #include <assert.h>
 #include <string.h>
 static unsigned stored, considered;
@@ -15,6 +17,112 @@ int edr_preprocess_should_emit(const EdrBehaviorRecord *r) {
   considered++;
   return allow;
 }
+
+static void test_uncombined_tool_file_upload(void) {
+  EdrBehaviorRecord r = {0};
+  EdrDetectionDecision d = {0};
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.priority = 0u;
+  r.pid = 74001u;
+  r.process_start_key = 74001u;
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  r.kernel_file_activity = 1u;
+  r.file_actor_generation_validated = 1u;
+  strcpy(r.event_id, "tool-cache-write");
+  strcpy(r.source_completeness, "COMPLETE");
+  strcpy(r.process_name, "powershell.exe");
+  strcpy(r.exe_path, "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  strcpy(r.cmdline, "powershell.exe -NoProfile -NonInteractive");
+  strcpy(r.file_path, "C:\\Users\\alice\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive");
+  edr_windows_event_policy_configure(NULL);
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.suppress);
+  assert(strcmp(d.reason, "lolbin,lolbin_without_combo_condition") == 0);
+  assert(strcmp(d.signal_reasons, "lolbin") == 0);
+  uint64_t before = edr_preprocess_baseline_file_upload_skipped_count();
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_baseline_file_upload_skipped_count() == before + 1u);
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+
+  /* Identity, attribution, diagnostics and sensitive targets still upload. */
+  r.process_start_key = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 74001u;
+  r.process_creation_filetime_100ns = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  r.file_actor_generation_validated = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.file_actor_generation_validated = 1u;
+  strcpy(r.collector_evidence_gate, "file_path_unresolved");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.collector_evidence_gate[0] = 0;
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.source_completeness, "COMPLETE");
+  strcpy(r.source_truncated_fields, "source.cmdline");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.source_truncated_fields[0] = 0;
+  strcpy(r.file_path, "C:\\inetpub\\wwwroot\\shell.aspx");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Users\\alice\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\startup.ps1");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Users\\alice\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive");
+  r.type = EDR_EVENT_PROCESS_CREATE;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.type = EDR_EVENT_FILE_READ;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.type = EDR_EVENT_FILE_WRITE;
+
+  /* The same tool gains upload value as soon as another signal or retained
+   * process context appears. Missing/changed JSON must not grant suppression. */
+  char baseline[sizeof(r.detection_context)];
+  strcpy(baseline, r.detection_context);
+  static const char *const positive[] = {
+      "remote", "ransom_note", "tls_anomaly", "ransom_canary", "script_sensor",
+      "process_context", "ransom_behavior", "extension_changed", "ransom_note_burst",
+      "suspicious_parent", "webshell_semantic", "persistence_change",
+      "high_content_entropy", "cert_revoked_ancestor", "security_product_kill",
+      "ransom_recovery_tamper", "silverfox_attack_chain"};
+  for (size_t i = 0; i < sizeof(positive) / sizeof(positive[0]); ++i) {
+    cJSON *context = cJSON_Parse(baseline);
+    assert(context);
+    cJSON *signals = cJSON_GetObjectItemCaseSensitive(context, "signals");
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(signals, positive[i], cJSON_CreateBool(1)));
+    assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+    assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+    cJSON_Delete(context);
+  }
+  cJSON *context = cJSON_Parse(baseline);
+  assert(context);
+  cJSON *signals = cJSON_GetObjectItemCaseSensitive(context, "signals");
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(signals, "ransom_chain_score", cJSON_CreateNumber(35)));
+  assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(signals, "ransom_chain_score", cJSON_CreateNumber(20)));
+  cJSON_DeleteItemFromObjectCaseSensitive(signals, "remote");
+  assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  cJSON_Delete(context);
+  static const char *const retained[] = {
+      "tracking_saturated", "state_transition", "periodic_summary"};
+  for (size_t i = 0; i < sizeof(retained) / sizeof(retained[0]); ++i) {
+    context = cJSON_Parse(baseline);
+    assert(context);
+    cJSON *control = cJSON_GetObjectItemCaseSensitive(context, "ransom_control");
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(control, retained[i], cJSON_CreateBool(1)));
+    assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+    assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+    cJSON_Delete(context);
+  }
+  strcpy(r.detection_context, "{broken");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.detection_context, baseline);
+  strcpy(d.signal_reasons, "lolbin,script_or_encoded_payload");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+}
+
 int main(void) {
   EdrBehaviorRecord r = {0};
   EdrDetectionDecision d = {0};
@@ -194,5 +302,6 @@ int main(void) {
   d.signal_reasons[0] = 0;
   strcpy(r.source_completeness, "NOT_EVALUABLE");
   assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  test_uncombined_tool_file_upload();
   return 0;
 }

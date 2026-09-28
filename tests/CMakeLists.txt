@@ -262,6 +262,7 @@ add_test(NAME process_evidence_pending COMMAND test_process_evidence_pending)
 add_executable(test_telemetry_admission
   ${CMAKE_CURRENT_SOURCE_DIR}/test_telemetry_admission.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
