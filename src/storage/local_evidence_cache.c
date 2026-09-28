@@ -4339,12 +4339,13 @@ static void sqlite_maintenance(void) {
   if (db_size_over_limit()) {
     /* Physical pressure includes WAL pages. A live set just below the cap
      * otherwise survives every cleanup and rejects the next WAL transaction.
-     * Keep bounded working room: at most the default ~4 MiB checkpoint batch,
-     * and at most 1/16 of a small cache. This is reclaimed only on pressure;
+     * Keep room for two default ~4 MiB checkpoint batches: the transaction
+     * crossing a checkpoint can leave a larger WAL on disk. Bound the reserve
+     * to 1/16 of a small cache. This is reclaimed only on pressure;
      * the configured physical admission cap and retention remain unchanged. */
     uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
     uint64_t headroom = limit / 16u;
-    if (headroom > 4u * 1024u * 1024u) headroom = 4u * 1024u * 1024u;
+    if (headroom > 8u * 1024u * 1024u) headroom = 8u * 1024u * 1024u;
     uint64_t target = limit - headroom;
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     for (int pass = 0; pass < 4 && sqlite_live_size_over_limit(target) > 0; pass++) {
