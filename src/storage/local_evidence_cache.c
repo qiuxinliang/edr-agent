@@ -2479,10 +2479,11 @@ static int sqlite_size_budget_allow(void) {
     return 1;
   }
   /* Automatic checkpoint can leave a large, reusable WAL allocation behind.
-   * When the database already has working room, try SQLite's non-waiting
-   * reset before rejecting a candidate or invoking evidence eviction. An
-   * active reader can prevent reset; the unchanged physical cap still wins. */
-  if (s_status.db_bytes <= sqlite_capacity_live_target()) {
+   * The cleanup target is not an admission cap: normal database growth past
+   * that target must still allow WAL reset while the database fits the hard
+   * cap. An active reader can prevent reset; physical admission still wins. */
+  uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+  if (s_status.db_bytes < limit) {
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     if (!db_size_over_limit()) {
       return 1;
