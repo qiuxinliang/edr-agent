@@ -4275,7 +4275,7 @@ static void sqlite_flush_metrics(void) {
  * only to decide whether more evidence must be evicted; admission still uses
  * the physical database + WAL budget after reclamation. On inspection failure
  * do not delete evidence speculatively. */
-static int sqlite_live_size_over_limit(void) {
+static int sqlite_live_size_over_limit(uint64_t limit) {
   sqlite3_stmt *st = NULL;
   int over = -1;
   if (sqlite3_prepare_v2(s_db,
@@ -4284,7 +4284,7 @@ static int sqlite_live_size_over_limit(void) {
       -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
     sqlite3_int64 bytes = sqlite3_column_int64(st, 0);
     if (bytes >= 0) {
-      over = (uint64_t)bytes > (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+      over = (uint64_t)bytes > limit;
     }
   }
   sqlite3_finalize(st);
@@ -4337,10 +4337,17 @@ static void sqlite_maintenance(void) {
     if (changes > 0) s_status.db_retention_evicted += (uint64_t)changes;
   }
   if (db_size_over_limit()) {
-    /* A WAL or already-free pages can account for the excess. Reclaim before
-     * deleting candidates, and stop deleting once the live set fits. */
+    /* Physical pressure includes WAL pages. A live set just below the cap
+     * otherwise survives every cleanup and rejects the next WAL transaction.
+     * Keep bounded working room: at most the default ~4 MiB checkpoint batch,
+     * and at most 1/16 of a small cache. This is reclaimed only on pressure;
+     * the configured physical admission cap and retention remain unchanged. */
+    uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+    uint64_t headroom = limit / 16u;
+    if (headroom > 4u * 1024u * 1024u) headroom = 4u * 1024u * 1024u;
+    uint64_t target = limit - headroom;
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
-    for (int pass = 0; pass < 4 && sqlite_live_size_over_limit() > 0; pass++) {
+    for (int pass = 0; pass < 4 && sqlite_live_size_over_limit(target) > 0; pass++) {
       /* Reclaim bounded old refs with no surviving candidate first. Their
        * facts are shared, so remove only facts with no remaining refs. A
        * productive orphan batch must not evict live candidates or command
@@ -4386,7 +4393,8 @@ static void sqlite_maintenance(void) {
       }
     }
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
-    if (db_size_over_limit()) {
+    refresh_db_size_status();
+    if (s_status.db_bytes + s_status.wal_bytes > target) {
       (void)exec_sql("VACUUM;");
       /* In WAL mode VACUUM writes replacement pages into the WAL. */
       (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
