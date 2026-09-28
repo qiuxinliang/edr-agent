@@ -78,7 +78,10 @@ int edr_health_upload(EdrHealthUpload *s, const char *body, uint64_t now_ns,
   edr_health_upload_reset(s);
   s->full_bytes += strlen(body); s->attempt_bytes += strlen(body);
   rc=send(body,reply,sizeof(reply),ctx);
-  if (rc==0) s->full_count++;
+  response=cJSON_Parse(reply);
+  const cJSON *data=cJSON_GetObjectItemCaseSensitive(response,"data");
+  if (rc==0 && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(data,"accepted"))) s->full_count++;
+  else rc=-1;
   goto done;
  }
  cJSON *stats=cJSON_AddObjectToObject(health,"health_upload");
@@ -113,11 +116,16 @@ int edr_health_upload(EdrHealthUpload *s, const char *body, uint64_t now_ns,
   response=cJSON_Parse(reply); is_delta=0;
  }
  if (rc != 0) goto done;
- if (is_delta) s->delta_count++; else { s->full_count++; s->full_at_ns=now_ns; }
  const cJSON *data=cJSON_GetObjectItemCaseSensitive(response,"data");
  const cJSON *version=cJSON_GetObjectItemCaseSensitive(data,"health_delta_version");
  const cJSON *revision=cJSON_GetObjectItemCaseSensitive(data,"health_revision");
  const cJSON *accepted=cJSON_GetObjectItemCaseSensitive(data,"accepted");
+ if (!cJSON_IsTrue(accepted) || (is_delta &&
+     (!cJSON_IsNumber(version) || version->valuedouble!=1 || !cJSON_IsString(revision) ||
+      !revision->valuestring[0] || strlen(revision->valuestring)>=sizeof(s->revision)))) {
+  rc=-1; goto done;
+ }
+ if (is_delta) s->delta_count++; else { s->full_count++; s->full_at_ns=now_ns; }
  if (cJSON_IsTrue(accepted) && cJSON_IsNumber(version) && version->valuedouble==1 &&
      cJSON_IsString(revision) && revision->valuestring[0] && strlen(revision->valuestring)<sizeof(s->revision)) {
   cJSON_Delete(s->base); s->base=full; full=NULL;

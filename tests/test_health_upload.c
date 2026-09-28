@@ -6,10 +6,11 @@
 typedef struct {
  cJSON *latest;
  unsigned seq, calls, deltas;
- int fail, mismatch, legacy;
+ int fail, mismatch, legacy, invalid_ack;
 } Server;
 static int send_body(const char *body, char *reply, size_t cap, void *ctx) {
  Server *s=ctx; s->calls++;
+ if (s->invalid_ack) { snprintf(reply,cap,"{\"data\":{\"accepted\":false}}"); return 0; }
  cJSON *root=cJSON_Parse(body); assert(root);
  const cJSON *health=cJSON_GetObjectItemCaseSensitive(root,"engine_health");
  const cJSON *update=cJSON_GetObjectItemCaseSensitive(root,"engine_health_update");
@@ -84,6 +85,10 @@ int main(void) {
  assert(edr_health_upload(&state,other,1310000000001ULL,send_body,&server)==0);
  assert(server.deltas==deltas); /* endpoint identity changed */
  assert(state.attempt_bytes>0 && state.full_bytes>0);
+ server.invalid_ack=1;uint64_t acknowledged=state.full_count+state.delta_count;
+ assert(edr_health_upload(&state,a,1315000000001ULL,send_body,&server)!=0);
+ assert(state.base==NULL && state.full_count+state.delta_count==acknowledged);
+ server.invalid_ack=0;
  const char *wide="{\"endpoint_id\":\"ep\",\"engine_health\":{\"wide\":18446744073709551615}}";
  assert(edr_health_upload(&state,wide,1320000000001ULL,raw_send,(void *)wide)==0);
  assert(state.base==NULL);
