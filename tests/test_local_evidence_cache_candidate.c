@@ -1866,7 +1866,7 @@ static void test_capacity_allows_wal_transaction_after_reclaim(void) {
 /* A committed large transaction can leave an allocated WAL larger than the
  * working reserve even after automatic checkpoint. Admission must reclaim that
  * tail without another full maintenance, and must not bypass a pinned reader. */
-static void test_capacity_reclaims_wal_tail_without_evicting_evidence(void) {
+static void test_capacity_reclaims_wal_tail_without_evicting_evidence(unsigned fill_mib) {
   char db[512];
   sqlite3 *raw = NULL, *reader = NULL;
   sqlite3_stmt *insert = NULL, *pages = NULL, *pinned = NULL;
@@ -1886,8 +1886,8 @@ static void test_capacity_reclaims_wal_tail_without_evicting_evidence(void) {
     assert(sqlite3_step(pages) == SQLITE_ROW);
     int page_count = sqlite3_column_int(pages, 0);
     assert(sqlite3_reset(pages) == SQLITE_OK);
-    if (page_count * 4096LL >= 119LL * 1024 * 1024) {
-      assert(page_count * 4096LL < 120LL * 1024 * 1024);
+    if (page_count * 4096LL >= (uint64_t)fill_mib * 1024 * 1024) {
+      assert(page_count * 4096LL < (uint64_t)(fill_mib + 1u) * 1024 * 1024);
       break;
     }
     assert(++count < 5000);
@@ -5443,7 +5443,8 @@ int main(void) {
   test_capacity_prefers_unowned_refs_and_preserves_consumers();
   test_capacity_reserves_wal_room_below_live_limit();
   test_capacity_allows_wal_transaction_after_reclaim();
-  test_capacity_reclaims_wal_tail_without_evicting_evidence();
+  test_capacity_reclaims_wal_tail_without_evicting_evidence(119u);
+  test_capacity_reclaims_wal_tail_without_evicting_evidence(121u);
   test_runtime_reclaim_reprepares_shared_context_fact();
   test_critical_context_still_honors_retention();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
