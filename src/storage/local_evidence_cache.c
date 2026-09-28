@@ -2467,9 +2467,26 @@ static int db_size_over_limit(void) {
   return limit > 0u && total > limit;
 }
 
+static uint64_t sqlite_capacity_live_target(void) {
+  uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+  uint64_t headroom = limit / 16u;
+  if (headroom > 8u * 1024u * 1024u) headroom = 8u * 1024u * 1024u;
+  return limit - headroom;
+}
+
 static int sqlite_size_budget_allow(void) {
   if (!db_size_over_limit()) {
     return 1;
+  }
+  /* Automatic checkpoint can leave a large, reusable WAL allocation behind.
+   * When the database already has working room, try SQLite's non-waiting
+   * reset before rejecting a candidate or invoking evidence eviction. An
+   * active reader can prevent reset; the unchanged physical cap still wins. */
+  if (s_status.db_bytes <= sqlite_capacity_live_target()) {
+    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    if (!db_size_over_limit()) {
+      return 1;
+    }
   }
   uint64_t now = edr_monotonic_ns();
   if (now - s_last_maintenance_ns >= 10000000000ULL) {
@@ -4343,10 +4360,7 @@ static void sqlite_maintenance(void) {
      * crossing a checkpoint can leave a larger WAL on disk. Bound the reserve
      * to 1/16 of a small cache. This is reclaimed only on pressure;
      * the configured physical admission cap and retention remain unchanged. */
-    uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
-    uint64_t headroom = limit / 16u;
-    if (headroom > 8u * 1024u * 1024u) headroom = 8u * 1024u * 1024u;
-    uint64_t target = limit - headroom;
+    uint64_t target = sqlite_capacity_live_target();
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     for (int pass = 0; pass < 4 && sqlite_live_size_over_limit(target) > 0; pass++) {
       /* Reclaim bounded old refs with no surviving candidate first. Their

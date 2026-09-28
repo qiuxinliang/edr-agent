@@ -1863,6 +1863,113 @@ static void test_capacity_allows_wal_transaction_after_reclaim(void) {
   cleanup_test_sqlite_path(db);
 }
 
+/* A committed large transaction can leave an allocated WAL larger than the
+ * working reserve even after automatic checkpoint. Admission must reclaim that
+ * tail without another full maintenance, and must not bypass a pinned reader. */
+static void test_capacity_reclaims_wal_tail_without_evicting_evidence(void) {
+  char db[512];
+  sqlite3 *raw = NULL, *reader = NULL;
+  sqlite3_stmt *insert = NULL, *pages = NULL, *pinned = NULL;
+  EdrEvidenceCacheStatus before, after, blocked;
+  EdrBehaviorRecord candidate;
+  struct timespec ts;
+  int count = 0;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(edr_local_evidence_cache_open(db, 128u, 24u) == 0);
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(raw,
+      "INSERT INTO artifacts(artifact_id,manifest_json,created_ns) VALUES(?,zeroblob(32768),"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000);", -1, &insert, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(raw, "PRAGMA page_count", -1, &pages, NULL) == SQLITE_OK);
+  for (;;) {
+    assert(sqlite3_step(pages) == SQLITE_ROW);
+    int page_count = sqlite3_column_int(pages, 0);
+    assert(sqlite3_reset(pages) == SQLITE_OK);
+    if (page_count * 4096LL >= 119LL * 1024 * 1024) {
+      assert(page_count * 4096LL < 120LL * 1024 * 1024);
+      break;
+    }
+    assert(++count < 5000);
+    assert(sqlite3_bind_int(insert, 1, count) == SQLITE_OK);
+    assert(sqlite3_step(insert) == SQLITE_DONE);
+    assert(sqlite3_reset(insert) == SQLITE_OK);
+  }
+  sqlite3_finalize(pages);
+  sqlite3_finalize(insert);
+  assert(sqlite3_exec(raw, "COMMIT;PRAGMA wal_checkpoint(TRUNCATE);",
+                      NULL, NULL, NULL) == SQLITE_OK);
+  s_test_monotonic_ns = 61000000000ull;
+  edr_local_evidence_cache_poll_maintenance();
+  assert(sqlite3_exec(raw,
+      "UPDATE artifacts SET manifest_json=replace(printf('%032768d',1),'0','x') "
+      "WHERE rowid IN (SELECT rowid FROM artifacts LIMIT 400);",
+      NULL, NULL, NULL) == SQLITE_OK);
+  edr_local_evidence_cache_get_status(&before);
+  assert(before.wal_bytes > 12ULL * 1024 * 1024);
+  assert(before.db_bytes + before.wal_bytes > 128ULL * 1024 * 1024);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74405u;
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&candidate, UINT64_C(0x74405));
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-wal-tail");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "wal-tail-candidate");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.4.5");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.candidate_admitted == before.candidate_admitted + 1u);
+  assert(after.db_budget_dropped == before.db_budget_dropped);
+  assert(after.maintenance_runs == before.maintenance_runs);
+  assert(after.db_capacity_evicted == before.db_capacity_evicted);
+  assert(sqlite_table_count(db, "artifacts") == (uint64_t)count + 1u);
+
+  assert(sqlite3_open_v2(db, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(reader, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(reader,
+                          "SELECT substr(manifest_json,1,1) FROM artifacts WHERE artifact_id='1';", -1,
+                          &pinned, NULL) == SQLITE_OK);
+  assert(sqlite3_step(pinned) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(pinned, 0), "x") == 0);
+  assert(sqlite3_exec(raw,
+      "UPDATE artifacts SET manifest_json=replace(printf('%032768d',2),'0','y') "
+      "WHERE rowid IN (SELECT rowid FROM artifacts LIMIT 400);",
+      NULL, NULL, NULL) == SQLITE_OK);
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "wal-tail-pinned-reader");
+  candidate.event_time_ns += 1000000LL;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&blocked);
+  assert(blocked.candidate_admitted == after.candidate_admitted);
+  assert(blocked.db_budget_dropped == after.db_budget_dropped + 1u);
+  assert(blocked.maintenance_runs == after.maintenance_runs);
+  sqlite3_finalize(pinned);
+  assert(sqlite3_exec(reader, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(reader) == SQLITE_OK);
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.candidate_admitted == blocked.candidate_admitted + 1u);
+  assert(after.maintenance_runs == before.maintenance_runs);
+  assert(after.db_capacity_evicted == before.db_capacity_evicted);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 128u, 24u) == 0);
+  assert(sqlite_table_count(db, "p0_candidates") == 2u);
+  assert(sqlite_table_count(db, "artifacts") == (uint64_t)count + 2u);
+  assert(sqlite3_open_v2(db, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(reader,
+                          "SELECT substr(manifest_json,1,1) FROM artifacts WHERE artifact_id='1';", -1,
+                          &pinned, NULL) == SQLITE_OK);
+  assert(sqlite3_step(pinned) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(pinned, 0), "y") == 0);
+  sqlite3_finalize(pinned);
+  assert(sqlite3_close(reader) == SQLITE_OK);
+  edr_local_evidence_cache_close();
+  s_test_monotonic_ns = 1000000000ull;
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_runtime_reclaim_reprepares_shared_context_fact(void) {
   char db[512], first_id[160], second_id[160];
   struct timespec ts;
@@ -5336,6 +5443,7 @@ int main(void) {
   test_capacity_prefers_unowned_refs_and_preserves_consumers();
   test_capacity_reserves_wal_room_below_live_limit();
   test_capacity_allows_wal_transaction_after_reclaim();
+  test_capacity_reclaims_wal_tail_without_evicting_evidence();
   test_runtime_reclaim_reprepares_shared_context_fact();
   test_critical_context_still_honors_retention();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
