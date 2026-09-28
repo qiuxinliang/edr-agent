@@ -26,6 +26,11 @@ on:
         options:
           - unsigned
           - signed
+      candidate:
+        description: Publish as prerelease without changing latest after all gates pass
+        required: true
+        default: false
+        type: boolean
       upgrade_class:
         description: Upgrade path classification; binary_hot additionally requires post-build identity proof against the previous immutable Release
         required: true
@@ -51,6 +56,7 @@ env:
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
+  EDR_RELEASE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || false }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
 
 jobs:
@@ -1356,7 +1362,7 @@ jobs:
           done
 
       - name: Publish signed Windows release
-        if: env.WINDOWS_RELEASE_MODE == 'signed'
+        if: env.EDR_RELEASE_CANDIDATE != 'true' && env.WINDOWS_RELEASE_MODE == 'signed'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1366,7 +1372,7 @@ jobs:
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
 
       - name: Publish unsigned Windows release
-        if: env.WINDOWS_RELEASE_MODE == 'unsigned'
+        if: env.EDR_RELEASE_CANDIDATE != 'true' && env.WINDOWS_RELEASE_MODE == 'unsigned'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1374,6 +1380,16 @@ jobs:
           gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --draft=false --prerelease=false --latest \
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (UNSIGNED Windows AMD64 + ARM64)"
+
+      - name: Publish candidate without promoting latest
+        if: env.EDR_RELEASE_CANDIDATE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --draft=false --prerelease=true --latest=false \
+            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (${WINDOWS_RELEASE_MODE} candidate AMD64 + ARM64)"
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater

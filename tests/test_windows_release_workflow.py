@@ -14,6 +14,14 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                    self.text.split('\njobs:\n', 1)[1], re.M | re.S))
 
+    def test_candidate_never_promotes_latest(self):
+        publish = self.jobs['publish-release']
+        for name in ('Publish signed Windows release', 'Publish unsigned Windows release'):
+            step = publish.split('- name: ' + name, 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("env.EDR_RELEASE_CANDIDATE != 'true'", step)
+        candidate = publish.split('- name: Publish candidate without promoting latest', 1)[1]
+        self.assertIn('--prerelease=true --latest=false', candidate)
+
     def test_only_original_hosted_job_graph_remains(self):
         self.assertEqual(set(self.jobs), {'prepare-release', 'windows-build', 'windows-lifecycle', 'publish-release'})
         for removed in ('usb-native', 'USB_SIGNING_TOKEN', 'edr-agent-signing', 'self-hosted', 'build_purpose', 'unsigned-candidate-'):
