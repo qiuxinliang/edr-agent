@@ -1,7 +1,7 @@
 /* 由 edr-agent/scripts/gen_p0_golden_vectors_inc.py 自 p0_golden_vectors.json 生成，勿手改。 */
 #ifndef P0_GOLDEN_VECTORS_DATA_INC
 #define P0_GOLDEN_VECTORS_DATA_INC
-#define P0_GOLDEN_N 44
+#define P0_GOLDEN_N 51
 static const char p0_gv_r0[] = "R-EXEC-001";
 static const char p0_gv_p0[] = "powershell.exe";
 static const char p0_gv_c0[] = "powershell -EncodedCommand abc";
@@ -134,13 +134,34 @@ static const char p0_gv_c42[] = "cmd.exe /c whoami & hostname --edr-p0-case diag
 static const char p0_gv_r43[] = "R-MITRE-WIN-T1012";
 static const char p0_gv_p43[] = "cmd.exe";
 static const char p0_gv_c43[] = "cmd.exe /c reg query HKLM\\SAM --edr-p0-case diagnostic";
+static const char p0_gv_r44[] = "R-DISC-001";
+static const char p0_gv_p44[] = "cmd.exe";
+static const char p0_gv_c44[] = "cmd.exe /c \"\"C:\\Windows\\System32\\whoami.exe\" & \"C:\\Windows\\System32\\hostname.exe\"\"";
+static const char p0_gv_r45[] = "R-DISC-001";
+static const char p0_gv_p45[] = "powershell.exe";
+static const char p0_gv_c45[] = "powershell.exe -Command \"whoami\nhostname\"";
+static const char p0_gv_r46[] = "R-DISC-001";
+static const char p0_gv_p46[] = "powershell.exe";
+static const char p0_gv_c46[] = "powershell.exe -Command \"& whoami; & hostname\"";
+static const char p0_gv_r47[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p47[] = "cmd.exe";
+static const char p0_gv_c47[] = "cmd.exe /c \"\"C:\\Windows\\System32\\reg.exe\" query HKLM\\SAM\"";
+static const char p0_gv_r48[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p48[] = "powershell.exe";
+static const char p0_gv_c48[] = "powershell.exe -Command \"& 'C:\\Windows\\System32\\reg.exe' query HKLM\\SAM\"";
+static const char p0_gv_r49[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p49[] = "powershell.exe";
+static const char p0_gv_c49[] = "powershell.exe -Command \"Write-Output 'notice; reg query HKLM\\SAM'\"";
+static const char p0_gv_r50[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p50[] = "powershell.exe";
+static const char p0_gv_c50[] = "powershell.exe -Command \"$s='notice; Get-ItemProperty -Path HKLM:\\SAM'; Write-Output $s\"";
 static const char *p0_golden_rule_id[] = {
-p0_gv_r0, p0_gv_r1, p0_gv_r2, p0_gv_r3, p0_gv_r4, p0_gv_r5, p0_gv_r6, p0_gv_r7, p0_gv_r8, p0_gv_r9, p0_gv_r10, p0_gv_r11, p0_gv_r12, p0_gv_r13, p0_gv_r14, p0_gv_r15, p0_gv_r16, p0_gv_r17, p0_gv_r18, p0_gv_r19, p0_gv_r20, p0_gv_r21, p0_gv_r22, p0_gv_r23, p0_gv_r24, p0_gv_r25, p0_gv_r26, p0_gv_r27, p0_gv_r28, p0_gv_r29, p0_gv_r30, p0_gv_r31, p0_gv_r32, p0_gv_r33, p0_gv_r34, p0_gv_r35, p0_gv_r36, p0_gv_r37, p0_gv_r38, p0_gv_r39, p0_gv_r40, p0_gv_r41, p0_gv_r42, p0_gv_r43, };
+p0_gv_r0, p0_gv_r1, p0_gv_r2, p0_gv_r3, p0_gv_r4, p0_gv_r5, p0_gv_r6, p0_gv_r7, p0_gv_r8, p0_gv_r9, p0_gv_r10, p0_gv_r11, p0_gv_r12, p0_gv_r13, p0_gv_r14, p0_gv_r15, p0_gv_r16, p0_gv_r17, p0_gv_r18, p0_gv_r19, p0_gv_r20, p0_gv_r21, p0_gv_r22, p0_gv_r23, p0_gv_r24, p0_gv_r25, p0_gv_r26, p0_gv_r27, p0_gv_r28, p0_gv_r29, p0_gv_r30, p0_gv_r31, p0_gv_r32, p0_gv_r33, p0_gv_r34, p0_gv_r35, p0_gv_r36, p0_gv_r37, p0_gv_r38, p0_gv_r39, p0_gv_r40, p0_gv_r41, p0_gv_r42, p0_gv_r43, p0_gv_r44, p0_gv_r45, p0_gv_r46, p0_gv_r47, p0_gv_r48, p0_gv_r49, p0_gv_r50, };
 static const char *p0_golden_process_name[] = {
-p0_gv_p0, p0_gv_p1, p0_gv_p2, p0_gv_p3, p0_gv_p4, p0_gv_p5, p0_gv_p6, p0_gv_p7, p0_gv_p8, p0_gv_p9, p0_gv_p10, p0_gv_p11, p0_gv_p12, p0_gv_p13, p0_gv_p14, p0_gv_p15, p0_gv_p16, p0_gv_p17, p0_gv_p18, p0_gv_p19, p0_gv_p20, p0_gv_p21, p0_gv_p22, p0_gv_p23, p0_gv_p24, p0_gv_p25, p0_gv_p26, p0_gv_p27, p0_gv_p28, p0_gv_p29, p0_gv_p30, p0_gv_p31, p0_gv_p32, p0_gv_p33, p0_gv_p34, p0_gv_p35, p0_gv_p36, p0_gv_p37, p0_gv_p38, p0_gv_p39, p0_gv_p40, p0_gv_p41, p0_gv_p42, p0_gv_p43, };
+p0_gv_p0, p0_gv_p1, p0_gv_p2, p0_gv_p3, p0_gv_p4, p0_gv_p5, p0_gv_p6, p0_gv_p7, p0_gv_p8, p0_gv_p9, p0_gv_p10, p0_gv_p11, p0_gv_p12, p0_gv_p13, p0_gv_p14, p0_gv_p15, p0_gv_p16, p0_gv_p17, p0_gv_p18, p0_gv_p19, p0_gv_p20, p0_gv_p21, p0_gv_p22, p0_gv_p23, p0_gv_p24, p0_gv_p25, p0_gv_p26, p0_gv_p27, p0_gv_p28, p0_gv_p29, p0_gv_p30, p0_gv_p31, p0_gv_p32, p0_gv_p33, p0_gv_p34, p0_gv_p35, p0_gv_p36, p0_gv_p37, p0_gv_p38, p0_gv_p39, p0_gv_p40, p0_gv_p41, p0_gv_p42, p0_gv_p43, p0_gv_p44, p0_gv_p45, p0_gv_p46, p0_gv_p47, p0_gv_p48, p0_gv_p49, p0_gv_p50, };
 static const char *p0_golden_cmdline[] = {
-p0_gv_c0, p0_gv_c1, p0_gv_c2, p0_gv_c3, p0_gv_c4, p0_gv_c5, p0_gv_c6, p0_gv_c7, p0_gv_c8, p0_gv_c9, p0_gv_c10, p0_gv_c11, p0_gv_c12, p0_gv_c13, p0_gv_c14, p0_gv_c15, p0_gv_c16, p0_gv_c17, p0_gv_c18, p0_gv_c19, p0_gv_c20, p0_gv_c21, p0_gv_c22, p0_gv_c23, p0_gv_c24, p0_gv_c25, p0_gv_c26, p0_gv_c27, p0_gv_c28, p0_gv_c29, p0_gv_c30, p0_gv_c31, p0_gv_c32, p0_gv_c33, p0_gv_c34, p0_gv_c35, p0_gv_c36, p0_gv_c37, p0_gv_c38, p0_gv_c39, p0_gv_c40, p0_gv_c41, p0_gv_c42, p0_gv_c43, };
+p0_gv_c0, p0_gv_c1, p0_gv_c2, p0_gv_c3, p0_gv_c4, p0_gv_c5, p0_gv_c6, p0_gv_c7, p0_gv_c8, p0_gv_c9, p0_gv_c10, p0_gv_c11, p0_gv_c12, p0_gv_c13, p0_gv_c14, p0_gv_c15, p0_gv_c16, p0_gv_c17, p0_gv_c18, p0_gv_c19, p0_gv_c20, p0_gv_c21, p0_gv_c22, p0_gv_c23, p0_gv_c24, p0_gv_c25, p0_gv_c26, p0_gv_c27, p0_gv_c28, p0_gv_c29, p0_gv_c30, p0_gv_c31, p0_gv_c32, p0_gv_c33, p0_gv_c34, p0_gv_c35, p0_gv_c36, p0_gv_c37, p0_gv_c38, p0_gv_c39, p0_gv_c40, p0_gv_c41, p0_gv_c42, p0_gv_c43, p0_gv_c44, p0_gv_c45, p0_gv_c46, p0_gv_c47, p0_gv_c48, p0_gv_c49, p0_gv_c50, };
 static const int p0_golden_expect[] = {
-1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, };
+1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, };
 #endif
 

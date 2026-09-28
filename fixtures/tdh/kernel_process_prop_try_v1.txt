@@ -1,13 +1,33 @@
-# A2.3：与 etw_tdh_win.c 中 kernel-process Provider 的 proc_try[] 属性名顺序一致（L"..." 名，一行一个，含 # 注释可）
-# 改序会影响「先试高频名」的 TDH 命中统计；调序请同步更新本文件并提 MR 说明。
-CommandLine
-Commandline
+# Kernel-process proc_try order; freeze the collector contract present since 7b9a33bf.
+# Image aliases precede command aliases; preserve parent command, CWD and PID fallback fields.
+# Intentional collector changes must update this fixture after review.
 ImageFileName
 ImageName
 Filename
+ProcessName
+NewProcessName
+ApplicationName
+CommandLine
+Commandline
+ProcessCommandLine
+Command
+ParentProcessName
+ParentImageName
+ParentImage
+ParentProcessPath
+CreatorProcessName
+ParentCommandLine
+ParentProcessCommandLine
+CreatorCommandLine
+CurrentDirectory
+WorkingDirectory
 ParentProcessId
 ParentProcessID
-ParentImage
-ParentFileName
+ParentID
+ParentId
+CreatorProcessId
 ProcessId
 ProcessID
+PID
+NewProcessId
+NewProcessID

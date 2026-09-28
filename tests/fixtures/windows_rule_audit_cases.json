@@ -924,6 +924,666 @@
         "process_name": "powershell.exe",
         "cmdline": "powershell.exe -Command Compress-Archive -Path C:\\Users\\user\\Documents -DestinationPath C:\\Temp\\a.zip"
       }
+    },
+    {
+      "case_id": "p0_precision_disc_and",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c whoami && hostname"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_reversed",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c ipconfig /all & whoami /all"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_uppercase",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "CMD.EXE /C WHOAMI.EXE & HOSTNAME.EXE"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_quoted_command",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c \"whoami.exe && hostname.exe\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_quoted_images",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c \"\"C:\\Windows\\System32\\whoami.exe\" & \"C:\\Windows\\System32\\hostname.exe\"\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_newline",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"whoami\nhostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_call_operator",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"& whoami; & hostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_semicolon",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"whoami; ipconfig /all\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_inventory",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c systeminfo"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_repeat",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c whoami & whoami /all"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_two_names_in_echo",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c echo \"whoami hostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_literal",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"Write-Output 'notice; whoami; hostname'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_literal_assignment",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"$message='notice; whoami; hostname'; Write-Output $message\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_output_filename",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c echo hi > hostname-whoami.txt"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_first_suffix",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c whoami-helper.exe & hostname"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_second_suffix",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c whoami & hostname-helper.exe"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_direct",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "parent_name": "",
+        "cmdline": "reg.exe query HKLM\\SAM /s"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_direct_quoted",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "parent_name": "",
+        "cmdline": "\"C:\\Windows\\System32\\reg.exe\" query HKLM\\SECURITY"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_shell",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c reg.exe query \"HKLM\\SECURITY\\Policy\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_shell_quoted_image",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c \"\"C:\\Windows\\System32\\reg.exe\" query HKLM\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_path",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"Get-ItemProperty -Path HKLM:\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_literalpath",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -c Get-ChildItem -LiteralPath 'HKLM:\\SECURITY\\Policy'"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_call_operator",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"& 'C:\\Windows\\System32\\reg.exe' query HKLM\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_remote",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c reg query \\\\server\\HKLM\\SAM"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_inventory",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c reg query HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_suffix",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "reg.exe",
+        "parent_name": "",
+        "cmdline": "reg.exe query HKLM\\SAMBackup"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_value_search",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c reg query HKLM\\Software /f SAM"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_literal",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"Write-Output 'notice; reg query HKLM\\SAM'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_assignment",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -Command \"$s='notice; Get-ItemProperty -Path HKLM:\\SAM'; Write-Output $s\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_inventory",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "parent_name": "",
+        "cmdline": "powershell.exe -c Get-ChildItem -Path HKLM:\\Software"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_echo",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "",
+        "cmdline": "cmd.exe /c echo reg query HKLM\\SAM"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_collector_name_no_bypass",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "forensic_collector_builtin.exe",
+        "cmdline": "cmd.exe /c whoami & hostname"
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_collector_name_no_bypass",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "parent_name": "forensic_collector_builtin.exe",
+        "cmdline": "cmd.exe /c reg query HKLM\\SAM"
+      }
+    },
+    {
+      "case_id": "p0_precision_cookie_read_msedge.exe",
+      "rule_id": "R-LMOVE-012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "file_read",
+        "process_name": "msedge.exe",
+        "file_path": "C:\\Users\\x\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies"
+      }
+    },
+    {
+      "case_id": "p0_precision_cookie_read_powershell.exe",
+      "rule_id": "R-LMOVE-012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "file_read",
+        "process_name": "powershell.exe",
+        "file_path": "C:\\Users\\x\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_literal_trailing_space",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"Write-Output 'notice; whoami; hostname '\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_assignment_trailing_space",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"$s='notice; whoami; hostname '; Write-Output $s\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_comment",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"# whoami; hostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_escaped_separator",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"whoami `; hostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_quoted_names_not_called",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"'whoami'; 'hostname'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_quoted_call",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"& 'C:\\Windows\\System32\\whoami.exe'; & 'C:\\Windows\\System32\\hostname.exe'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_after_assignment",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"$label='notice; whoami; hostname'; whoami; hostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_after_comment",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"# inventory label\nwhoami\nhostname\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_ps_literal_fake_flag",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"Write-Output '-Command whoami; hostname '\""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_cmd_quoted_text",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd.exe /c echo \"notice & whoami & hostname \""
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_cmd_escaped_separator",
+      "rule_id": "R-DISC-001",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd.exe /c echo notice ^& whoami ^& hostname"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_cmd_single_quote_is_not_quote",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd.exe /c echo 'notice & whoami & hostname"
+      }
+    },
+    {
+      "case_id": "p0_precision_disc_cmd_flags_quoted_paths",
+      "rule_id": "R-DISC-001",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "\"C:\\Windows\\System32\\cmd.exe\" /d /s /c \"\"C:\\Windows\\System32\\whoami.exe\" & \"C:\\Windows\\System32\\hostname.exe\"\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_after_assignment",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"$s='notice; reg query HKLM\\SAM'; reg query HKLM\\SECURITY\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_comment",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"# reg query HKLM\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_literal_fake_flag",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"Write-Output '-Command reg query HKLM\\SAM'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_after_comment",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"# registry inventory\nreg query HKLM\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_doubled_quote_literal",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"Write-Output 'notice''; reg query HKLM\\SAM'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_literal_cmdlet",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"'Get-ItemProperty'; 'HKLM:\\SAM'\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_ps_cmdlet_call",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": true,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"& 'Get-ItemProperty' -Path HKLM:\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_cmd_literal",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "cmd.exe",
+        "cmdline": "cmd.exe /c echo \"notice & reg query HKLM\\SAM\""
+      }
+    },
+    {
+      "case_id": "p0_precision_reg_script_args_not_code",
+      "rule_id": "R-MITRE-WIN-T1012",
+      "expect_match": false,
+      "scope": "rule_semantics",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -File report.ps1 -Command \"reg query HKLM\\SAM\""
+      }
     }
   ]
 }
