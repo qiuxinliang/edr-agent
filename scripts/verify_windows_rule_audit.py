@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import struct
 import sys
 
 
@@ -42,17 +43,23 @@ def windows_native_architecture():
 
 def verify_native_replay(root, replay):
     architecture = windows_native_architecture()
-    # CTest may be launched by PowerShell 7. Its module path must not make
-    # Windows PowerShell 5.1 import modules for an incompatible runtime.
-    powershell_env = {key: value for key, value in os.environ.items()
-                      if key.upper() != "PSMODULEPATH"}
-    check = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-         "-File", str(root / "scripts/Assert-WindowsPeArchitecture.ps1"),
-         "-Path", str(replay.resolve()), "-Architecture", architecture],
-        text=True, capture_output=True, timeout=30, shell=False, env=powershell_env)
-    if check.returncode != 0:
-        raise RuntimeError(f"native replay PE verification failed: {check.stderr[-1000:] or check.stdout[-1000:]}")
+    # Read the six PE signature/machine bytes in-process. Starting another
+    # PowerShell runtime made this bounded header check depend on cold startup.
+    with replay.open("rb") as stream:
+        header = stream.read(64)
+        if len(header) != 64 or header[:2] != b"MZ":
+            raise RuntimeError("native replay has an invalid DOS header")
+        offset = struct.unpack_from("<I", header, 0x3c)[0]
+        size = stream.seek(0, os.SEEK_END)
+        if offset < 64 or offset > size - 6:
+            raise RuntimeError("native replay has an invalid PE offset")
+        stream.seek(offset)
+        signature, machine = struct.unpack("<4sH", stream.read(6))
+        if signature != b"PE\0\0":
+            raise RuntimeError("native replay has an invalid PE signature")
+        expected = {"amd64": 0x8664, "arm64": 0xAA64}[architecture]
+        if machine != expected:
+            raise RuntimeError(f"native replay PE architecture mismatch: expected={architecture} actual=0x{machine:04x}")
     return architecture
 
 

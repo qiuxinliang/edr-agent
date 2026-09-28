@@ -95,8 +95,8 @@ def verify_sqlite_package_location(cache_file: Path, include_dir: Path, library:
 
 
 class WindowsReleaseGateTests(unittest.TestCase):
-    def run_command(self, *args, success=True, env=None):
-        result = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
+    def run_command(self, *args, success=True, env=None, timeout=90):
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -117,6 +117,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
             declarations.append(match.group(0).replace(
                 "${CMAKE_CURRENT_SOURCE_DIR}", (ROOT / "tests").as_posix()).replace(
                 "${CMAKE_SOURCE_DIR}", ROOT.as_posix()))
+
+        # Carry the production deadlines into the fixture as well as commands.
+        properties = re.search(
+            r"  set_tests_properties\(\s*windows_release_collector_pe_closure\s*"
+            r"windows_inplace_collector_transaction\s*PROPERTIES TIMEOUT \d+\)", definitions)
+        self.assertIsNotNone(properties)
+        declarations.append(properties.group(0))
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
@@ -145,7 +152,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.run_command(*command[:host_index], *probe, env=inherited)
             if os.name == "nt":
                 self.run_command("ctest", "--test-dir", str(build),
-                                 "--output-on-failure", "--timeout", "30", env=inherited)
+                                 "--output-on-failure", env=inherited, timeout=150)
             self.assertEqual(inherited["PSModulePath"], str(foreign_modules))
 
     def test_sqlite_header_relocation_includes_vcpkg_companion(self):
