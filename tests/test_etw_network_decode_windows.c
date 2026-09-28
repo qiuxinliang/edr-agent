@@ -682,7 +682,14 @@ static void test_network_admission_trace(void) {
 
   trace_temp_path(path, wide);
   assert(edr_network_trace_start(path, 54760u, 1u) == 1);
-  Sleep(5u);
+  /* GetTickCount64 can advance only once per 10-16 ms timer tick. Sleep(5)
+   * does not prove that the clock used by the trace deadline has advanced. */
+  uint64_t started_tick = GetTickCount64();
+  for (unsigned attempt = 0u;
+       attempt < 100u && GetTickCount64() - started_tick < 2u; ++attempt) {
+    Sleep(1u);
+  }
+  assert(GetTickCount64() - started_tick >= 2u);
   EdrNetworkAdmissionTrace t;
   trace_begin_fixture(&t, &record, &baseline); assert(!t.sequence);
   edr_network_trace_flush();
