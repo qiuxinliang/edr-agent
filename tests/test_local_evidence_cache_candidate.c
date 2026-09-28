@@ -1700,6 +1700,86 @@ static void test_capacity_prefers_unowned_refs_and_preserves_consumers(void) {
   cleanup_test_sqlite_path(db);
 }
 
+/* A full live set just below the cap still needs room for the next WAL
+ * transaction. Reclaim unowned references under physical pressure instead of
+ * repeatedly checkpointing/VACUUMing the same near-full set. */
+static void test_capacity_reserves_wal_room_below_live_limit(void) {
+  char db[512], sql[1024];
+  sqlite3 *raw = NULL;
+  sqlite3_stmt *st = NULL;
+  EdrEvidenceCacheStatus before, after;
+  EdrBehaviorRecord candidate;
+  struct timespec ts;
+  int pages = 0, rows = 0;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_exec(raw,
+      "PRAGMA wal_autocheckpoint=0;"
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns) VALUES('keep',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000);"
+      "INSERT INTO context_facts(fact_id,manifest_template_json,created_ns) "
+      "VALUES('shared','{\"candidate_id\":null,\"proof\":1}',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000);"
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns) "
+      "VALUES('keep-ref','keep','shared','\"keep\"',"
+      "CAST(strftime('%s','now') AS INTEGER)*1000000000);",
+      NULL, NULL, NULL) == SQLITE_OK);
+  while (pages < 248) {
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns) "
+        "VALUES('orphan-%d','gone-%d','shared',printf('%%02500d',%d),"
+        "CAST(strftime('%%s','now') AS INTEGER)*1000000000);",rows,rows,rows);
+    assert(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK);
+    ++rows;
+    assert(rows < 1000);
+    assert(sqlite3_prepare_v2(raw, "PRAGMA page_count", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    pages = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+  }
+  assert(pages < 256);
+  assert(sqlite3_exec(raw,
+      "PRAGMA wal_checkpoint(TRUNCATE);"
+      "UPDATE candidate_context_refs SET upload_status='local_manifest' "
+      "WHERE candidate_id<>'keep';", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  edr_local_evidence_cache_get_status(&before);
+  assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
+  s_test_monotonic_ns = 61000000000ull;
+  edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.db_capacity_evicted > before.db_capacity_evicted);
+  assert(after.db_bytes + after.wal_bytes < 960u * 1024u);
+  assert(sqlite_table_count(db, "p0_candidates") == 1u);
+  assert(sqlite_table_count(db, "candidate_context_refs") == 1u);
+  assert(sqlite_table_count(db, "context_facts") == 1u);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74403u;
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&candidate, UINT64_C(0x74403));
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-wal-room");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "wal-room-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.4.3");
+  candidate.net_dport = 445u;
+  before = after;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.candidate_admitted == before.candidate_admitted + 1u);
+  assert(after.db_budget_dropped == before.db_budget_dropped);
+  assert(after.maintenance_runs == before.maintenance_runs);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  assert(sqlite_table_count(db, "p0_candidates") == 2u);
+  assert(sqlite_table_count(db, "context_facts") == 1u);
+  edr_local_evidence_cache_close();
+  s_test_monotonic_ns = 1000000000ull;
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_runtime_reclaim_reprepares_shared_context_fact(void) {
   char db[512], first_id[160], second_id[160];
   struct timespec ts;
@@ -5171,6 +5251,7 @@ int main(void) {
   test_critical_context_still_honors_database_capacity();
   test_capacity_reclaims_free_pages_before_evicting_candidates();
   test_capacity_prefers_unowned_refs_and_preserves_consumers();
+  test_capacity_reserves_wal_room_below_live_limit();
   test_runtime_reclaim_reprepares_shared_context_fact();
   test_critical_context_still_honors_retention();
   test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
