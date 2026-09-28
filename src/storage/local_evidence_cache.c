@@ -217,6 +217,7 @@ static uint32_t s_context_ring_pos;
 static uint32_t s_context_window_next;
 static EdrEvidenceCacheStatus s_status;
 static uint64_t s_last_maintenance_ns;
+static uint64_t s_last_capacity_failure_ns;
 static int64_t s_write_budget_minute;
 static uint32_t s_write_budget_count;
 static uint32_t s_write_budget_ordinary_context_count;
@@ -2476,6 +2477,7 @@ static uint64_t sqlite_capacity_live_target(void) {
 
 static int sqlite_size_budget_allow(void) {
   if (!db_size_over_limit()) {
+    s_last_capacity_failure_ns = 0u;
     return 1;
   }
   /* Automatic checkpoint can leave a large, reusable WAL allocation behind.
@@ -2484,18 +2486,33 @@ static int sqlite_size_budget_allow(void) {
    * cap. An active reader can prevent reset; physical admission still wins. */
   uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
   if (s_status.db_bytes < limit) {
-    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
+                                      NULL, NULL);
+    if (rc != SQLITE_OK) {
+      char error[128];
+      snprintf(error, sizeof(error), "evidence cache WAL reset blocked or failed: sqlite rc=%d", rc);
+      set_error(error);
+      s_status.db_budget_dropped++;
+      return 0;
+    }
     if (!db_size_over_limit()) {
+      s_last_capacity_failure_ns = 0u;
       return 1;
     }
   }
   uint64_t now = edr_monotonic_ns();
-  if (now - s_last_maintenance_ns >= 10000000000ULL) {
+  /* Damp repeated failures, not successful reclamation. A fast writer can
+   * refill the recovered space within ten seconds; rejecting it merely because
+   * the previous cleanup succeeded recently turns throughput gains into loss. */
+  if (s_last_capacity_failure_ns == 0u ||
+      now - s_last_capacity_failure_ns >= 10000000000ULL) {
     s_last_maintenance_ns = now;
     sqlite_maintenance();
-  }
-  if (!db_size_over_limit()) {
-    return 1;
+    if (!db_size_over_limit()) {
+      s_last_capacity_failure_ns = 0u;
+      return 1;
+    }
+    s_last_capacity_failure_ns = edr_monotonic_ns();
   }
   s_status.db_budget_dropped++;
   set_error("evidence cache size budget exceeded");
@@ -3639,39 +3656,30 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
                                             char candidate_ids[][160],
                                             uint32_t candidate_count,
                                             PreparedContextArtifacts *prepared) {
+  sqlite3_stmt *st = NULL;
   if (!s_db || !r || !candidate_ids || candidate_count == 0u || !prepared) {
     return -1;
   }
   memset(prepared, 0, sizeof(*prepared));
-  if (sqlite_prepare_context_fact(r, prepared) != 0) {
-    sqlite_free_prepared_context_artifacts(prepared);
-    return -1;
-  }
+  if (sqlite_prepare_context_fact(r, prepared) != 0) goto fail;
   prepared->refs = (PreparedContextRef *)calloc(
       candidate_count, sizeof(PreparedContextRef));
   if (!prepared->refs) {
     set_error("allocate post-context replay plan failed");
-    sqlite_free_prepared_context_artifacts(prepared);
-    return -1;
+    goto fail;
+  }
+  if (sqlite3_prepare_v2(s_db,
+          "SELECT candidate_id,fact_id FROM candidate_context_refs WHERE artifact_id=?;",
+          -1, &st, NULL) != SQLITE_OK) {
+    set_error("prepare context reference replay lookup failed");
+    goto fail;
   }
   for (uint32_t i = 0u; i < candidate_count; ++i) {
     PreparedContextRef *ref = &prepared->refs[prepared->ref_count];
-    sqlite3_stmt *st = NULL;
     int step;
     if (!candidate_ids[i][0] ||
         artifact_id_for(r, candidate_ids[i], "post_context", ref->artifact_id,
-                        sizeof(ref->artifact_id)) != 0) {
-      sqlite_free_prepared_context_artifacts(prepared);
-      return -1;
-    }
-    if (sqlite3_prepare_v2(
-            s_db,
-            "SELECT candidate_id,fact_id FROM candidate_context_refs WHERE artifact_id=?;",
-            -1, &st, NULL) != SQLITE_OK) {
-      set_error("prepare context reference replay lookup failed");
-      sqlite_free_prepared_context_artifacts(prepared);
-      return -1;
-    }
+                        sizeof(ref->artifact_id)) != 0) goto fail;
     bind_text(st, 1, ref->artifact_id);
     step = sqlite3_step(st);
     if (step == SQLITE_ROW) {
@@ -3681,31 +3689,34 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
                               strcmp(existing_candidate, candidate_ids[i]) == 0;
       int exact = candidate_matches && existing_fact &&
                   strcmp(existing_fact, prepared->fact_id) == 0;
-      sqlite3_finalize(st);
+      (void)sqlite3_reset(st);
+      (void)sqlite3_clear_bindings(st);
       if (exact) continue;
       if (!candidate_matches) {
         set_error("context reference candidate conflict");
-        sqlite_free_prepared_context_artifacts(prepared);
-        return -1;
+        goto fail;
       }
+    } else if (step == SQLITE_DONE) {
+      (void)sqlite3_reset(st);
+      (void)sqlite3_clear_bindings(st);
     } else {
-      sqlite3_finalize(st);
-    }
-    if (step != SQLITE_ROW && step != SQLITE_DONE) {
       set_error("read context reference replay state failed");
-      sqlite_free_prepared_context_artifacts(prepared);
-      return -1;
+      goto fail;
     }
     ref->candidate_id_json = context_candidate_id_json(candidate_ids[i]);
     if (!ref->candidate_id_json) {
       set_error("encode context reference candidate id failed");
-      sqlite_free_prepared_context_artifacts(prepared);
-      return -1;
+      goto fail;
     }
     ref->candidate_index = i;
     prepared->ref_count++;
   }
+  sqlite3_finalize(st);
   return 0;
+fail:
+  sqlite3_finalize(st);
+  sqlite_free_prepared_context_artifacts(prepared);
+  return -1;
 }
 
 /* Preserve all-or-none post-context attribution when one event belongs to
@@ -3748,38 +3759,46 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
     }
     sqlite3_finalize(st);
   }
+  static const char ref_sql[] =
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
+      "candidate_id_json,created_ns,upload_status,minio_key) "
+      "VALUES(?,?,?,?,?,'local_manifest','') "
+      "ON CONFLICT(artifact_id) DO UPDATE SET fact_id=excluded.fact_id,"
+      "candidate_id_json=excluded.candidate_id_json,"
+      "created_ns=excluded.created_ns,upload_status=excluded.upload_status,"
+      "minio_key=excluded.minio_key;";
+  sqlite3_stmt *ref_st = NULL;
+  if (prepared->ref_count &&
+      sqlite3_prepare_v2(s_db, ref_sql, -1, &ref_st, NULL) != SQLITE_OK) {
+    set_error("prepare context reference insert failed");
+    sqlite3_finalize(ref_st);
+    sqlite_rollback_silent();
+    return -1;
+  }
   for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
-    static const char ref_sql[] =
-        "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
-        "candidate_id_json,created_ns,upload_status,minio_key) "
-        "VALUES(?,?,?,?,?,'local_manifest','') "
-        "ON CONFLICT(artifact_id) DO UPDATE SET fact_id=excluded.fact_id,"
-        "candidate_id_json=excluded.candidate_id_json,"
-        "created_ns=excluded.created_ns,upload_status=excluded.upload_status,"
-        "minio_key=excluded.minio_key;";
     const PreparedContextRef *ref = &prepared->refs[i];
     uint32_t candidate_index = ref->candidate_index;
-    sqlite3_stmt *st = NULL;
-    if (!candidate_ids[candidate_index][0] ||
-        sqlite3_prepare_v2(s_db, ref_sql, -1, &st, NULL) != SQLITE_OK) {
-      set_error("prepare context reference insert failed");
-      sqlite3_finalize(st);
+    if (!candidate_ids[candidate_index][0]) {
+      set_error("context reference candidate missing");
+      sqlite3_finalize(ref_st);
       sqlite_rollback_silent();
       return -1;
     }
-    bind_text(st, 1, ref->artifact_id);
-    bind_text(st, 2, candidate_ids[candidate_index]);
-    bind_text(st, 3, prepared->fact_id);
-    bind_text(st, 4, ref->candidate_id_json);
-    sqlite3_bind_int64(st, 5, written_ns);
-    if (sqlite3_step(st) != SQLITE_DONE) {
+    bind_text(ref_st, 1, ref->artifact_id);
+    bind_text(ref_st, 2, candidate_ids[candidate_index]);
+    bind_text(ref_st, 3, prepared->fact_id);
+    bind_text(ref_st, 4, ref->candidate_id_json);
+    sqlite3_bind_int64(ref_st, 5, written_ns);
+    if (sqlite3_step(ref_st) != SQLITE_DONE) {
       set_error("insert context reference failed");
-      sqlite3_finalize(st);
+      sqlite3_finalize(ref_st);
       sqlite_rollback_silent();
       return -1;
     }
-    sqlite3_finalize(st);
+    (void)sqlite3_reset(ref_st);
+    (void)sqlite3_clear_bindings(ref_st);
   }
+  sqlite3_finalize(ref_st);
   if (sqlite_commit_candidate_transaction() != 0) {
     sqlite_rollback_silent();
     return -1;
@@ -4365,14 +4384,15 @@ static void sqlite_maintenance(void) {
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     for (int pass = 0; pass < 4 && sqlite_live_size_over_limit(target) > 0; pass++) {
       /* Reclaim bounded old refs with no surviving candidate first. Their
-       * facts are shared, so remove only facts with no remaining refs. A
-       * productive orphan batch must not evict live candidates or command
-       * artifacts in the same pass. */
+       * facts are shared, so remove only facts with no remaining refs.
+       * Each orphan batch is bounded to 4096 refs so it can recover the WAL
+       * reserve without repacking partially used pages. A productive orphan
+       * batch must not evict live candidates or command artifacts in the same pass. */
       if (exec_sql("DELETE FROM candidate_context_refs WHERE rowid IN ("
                    "SELECT r.rowid FROM candidate_context_refs r "
                    "WHERE NOT EXISTS (SELECT 1 FROM p0_candidates c "
                    "WHERE c.candidate_id=r.candidate_id) "
-                   "ORDER BY r.created_ns ASC,r.rowid ASC LIMIT 1000);") != 0) {
+                   "ORDER BY r.created_ns ASC,r.rowid ASC LIMIT 4096);") != 0) {
         break;
       }
       int orphan_changes = sqlite3_changes(s_db);
@@ -4411,8 +4431,10 @@ static void sqlite_maintenance(void) {
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     refresh_db_size_status();
     if (s_status.db_bytes + s_status.wal_bytes > target) {
-      (void)exec_sql("VACUUM;");
-      /* In WAL mode VACUUM writes replacement pages into the WAL. */
+      /* Reclaim at most 4096 free pages per maintenance call.
+       * The database is migrated to incremental mode before collectors start;
+       * runtime pressure must not rewrite the entire evidence database. */
+      (void)exec_sql("PRAGMA incremental_vacuum(4096);");
       (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     }
   } else {
@@ -4650,6 +4672,43 @@ static void evidence_cache_close_locked(void) {
   s_status.db_open = 0;
 }
 
+#if defined(EDR_HAVE_SQLITE)
+static int sqlite_auto_vacuum_mode(void) {
+  sqlite3_stmt *st = NULL;
+  int mode = -1;
+  if (sqlite3_prepare_v2(s_db, "PRAGMA auto_vacuum;", -1, &st, NULL) == SQLITE_OK &&
+      sqlite3_step(st) == SQLITE_ROW) mode = sqlite3_column_int(st, 0);
+  sqlite3_finalize(st);
+  return mode;
+}
+
+/* Existing caches need one SQLite-atomic rebuild to add the pointer map.
+ * Do this before exposing the cache to collectors. A failed migration leaves
+ * opening failed and can be retried; never accept a silent no-op pragma. */
+static int sqlite_ensure_incremental_vacuum(void) {
+  int mode = sqlite_auto_vacuum_mode();
+  if (mode == 2) return 0;
+  if (mode < 0 || exec_sql("PRAGMA auto_vacuum=INCREMENTAL;") != 0) {
+    set_error("evidence cache incremental vacuum setup failed");
+    return -1;
+  }
+  if (sqlite_auto_vacuum_mode() != 2 && exec_sql("VACUUM;") != 0) {
+    set_error("evidence cache incremental vacuum migration failed");
+    return -1;
+  }
+  if (sqlite_auto_vacuum_mode() != 2) {
+    set_error("evidence cache incremental vacuum unavailable");
+    return -1;
+  }
+  if (sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
+                              NULL, NULL) != SQLITE_OK) {
+    set_error("evidence cache migration checkpoint blocked");
+    return -1;
+  }
+  return 0;
+}
+#endif
+
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours) {
   evidence_cache_lock();
@@ -4666,6 +4725,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_context_ring_pos = 0;
   s_context_window_next = 0;
   s_last_maintenance_ns = 0u;
+  s_last_capacity_failure_ns = 0u;
   s_write_budget_minute = 0;
   s_write_budget_count = 0u;
   s_write_budget_ordinary_context_count = 0u;
@@ -4696,6 +4756,11 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   (void)exec_sql("PRAGMA synchronous=NORMAL;");
   (void)exec_sql("PRAGMA cache_size=-1024;");
   (void)exec_sql("PRAGMA mmap_size=0;");
+  if (sqlite_ensure_incremental_vacuum() != 0) {
+    evidence_cache_close_locked();
+    evidence_cache_unlock();
+    return -1;
+  }
   const char *schema =
       "CREATE TABLE IF NOT EXISTS process_cache ("
       "endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,ppid INTEGER,"
