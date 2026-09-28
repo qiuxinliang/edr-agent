@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-32595aa6",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-eedcbf3a",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 180,
   "rules": [
@@ -881,7 +881,7 @@
     },
     {
       "id": "R-MITRE-WIN-T1012",
-      "title": "Query Registry",
+      "title": "SAM/SECURITY 敏感注册表查询",
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
@@ -1567,13 +1567,12 @@
     },
     {
       "id": "R-LMOVE-012",
-      "title": "Pass-the-Cookie/浏览器会话劫持横向移动",
+      "title": "浏览器凭据或会话文件访问",
       "severity": 3,
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
         "T1539",
-        "T1550.004",
         "T1555.003"
       ]
     },

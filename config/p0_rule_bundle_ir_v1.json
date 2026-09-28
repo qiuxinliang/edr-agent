@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 3,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-32595aa6",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-eedcbf3a",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "5e90e40ba4740e7f39f48a8b182ef99bae610b48debc2faf684120bfd59de76b",
+  "sensor_interest_manifest_sha256": "224c629f86f82809052461471ed4777b4428353750d150fa7aa641c20f636b51",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -985,14 +985,14 @@
         "T1057",
         "T1082"
       ],
-      "description": "whoami/systeminfo/tasklist/hostname/ipconfig 高频发现命令",
+      "description": "同一 cmd/PowerShell 命令行通过命令分隔符串联至少两种不同的 whoami/systeminfo/tasklist/hostname/ipconfig 发现命令；单项资产盘点、重复同一命令或参数中的命令名不足以触发。跨进程命令关联不在本规则范围内。",
       "condition": {
         "command_regex_any": [
-          "(?i)\\bwhoami\\b",
-          "(?i)\\bsysteminfo\\b",
-          "(?i)\\btasklist\\b",
-          "(?i)\\bhostname\\b",
-          "(?i)\\bipconfig\\b"
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?whoami(?:\\.exe)?(?:\\s[^;\\r\\n&|]{0,512})?[;&|]+\\s*(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?(?:systeminfo|tasklist|hostname|ipconfig)(?:\\.exe)?(?:\\s|[;&|\"\\r\\n]|$)",
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?systeminfo(?:\\.exe)?(?:\\s[^;\\r\\n&|]{0,512})?[;&|]+\\s*(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?(?:whoami|tasklist|hostname|ipconfig)(?:\\.exe)?(?:\\s|[;&|\"\\r\\n]|$)",
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?tasklist(?:\\.exe)?(?:\\s[^;\\r\\n&|]{0,512})?[;&|]+\\s*(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?(?:whoami|systeminfo|hostname|ipconfig)(?:\\.exe)?(?:\\s|[;&|\"\\r\\n]|$)",
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?hostname(?:\\.exe)?(?:\\s[^;\\r\\n&|]{0,512})?[;&|]+\\s*(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?(?:whoami|systeminfo|tasklist|ipconfig)(?:\\.exe)?(?:\\s|[;&|\"\\r\\n]|$)",
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?ipconfig(?:\\.exe)?(?:\\s[^;\\r\\n&|]{0,512})?[;&|]+\\s*(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?(?:whoami|systeminfo|tasklist|hostname)(?:\\.exe)?(?:\\s|[;&|\"\\r\\n]|$)"
         ],
         "process_name_in": [
           "cmd.exe",
@@ -1861,24 +1861,24 @@
     },
     {
       "id": "R-MITRE-WIN-T1012",
-      "title": "Query Registry",
+      "title": "SAM/SECURITY 敏感注册表查询",
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
       "mitre_ttps": [
         "T1012"
       ],
-      "description": "针对 ATT&CK 父技术「T1012」（Query Registry）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
+      "description": "观察到 reg query 或 PowerShell 注册表读取命令查询 HKLM 的 SAM/SECURITY 区域；单次启动项或软件清单查询不作为本 P0 规则的独立告警。查询尝试不证明读取成功或凭据被窃取。",
       "condition": {
         "command_regex_any": [
-          "(?i)\\breg\\s+query\\b",
-          "(?i)Get-ItemProperty\\s+-Path\\s+.{0,200}Registry::",
-          "(?i)Get-ChildItem\\s+.{0,120}HKLM:\\\\\\\\Software\\\\\\\\Microsoft\\\\\\\\Windows\\\\\\\\CurrentVersion"
+          "(?i)(?:^[\"']?|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:[a-z]:\\\\[^\\s\"';&|]*\\\\)?reg(?:\\.exe)?[\"']?\\s+query\\s+[\"']?(?:\\\\\\\\[^\\\\\\s\"']+\\\\)?(?:HKLM|HKEY_LOCAL_MACHINE)\\\\(?:SAM|SECURITY)(?:\\\\|[\"'\\s;|&]|$)",
+          "(?i)(?:^|[;&|\\r\\n]\\s*|(?:/c|/k|-c|-command)\\s+[\"']?)(?:Get-ItemProperty|Get-ChildItem)\\s+(?:-(?:Literal)?Path\\s+)?[\"']?(?:(?:Registry::)?HKEY_LOCAL_MACHINE\\\\|HKLM:\\\\)(?:SAM|SECURITY)(?:\\\\|[\"'\\s;|&]|$)"
         ],
         "process_name_in": [
           "cmd.exe",
           "powershell.exe",
-          "pwsh.exe"
+          "pwsh.exe",
+          "reg.exe"
         ]
       }
     },
@@ -3174,16 +3174,15 @@
     },
     {
       "id": "R-LMOVE-012",
-      "title": "Pass-the-Cookie/浏览器会话劫持横向移动",
+      "title": "浏览器凭据或会话文件访问",
       "severity": 3,
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
         "T1539",
-        "T1550.004",
         "T1555.003"
       ],
-      "description": "检测浏览器Cookie/Session数据被复制或读取后用于横向认证绕过(如从Chrome/Edge/Firefox读取Login Data/Cookies，配合sharpchromium/rubeus等工具进行基于Web/Cloud的横向移动)。",
+      "description": "观察到浏览器凭据、Cookie 文件或相关工具路径被读取；浏览器自身也会产生此行为。当前证据仅证明文件访问，不证明会话窃取成功、认证绕过或横向移动，需结合进程身份及后续使用证据研判。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",

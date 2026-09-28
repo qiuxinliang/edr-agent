@@ -1,7 +1,7 @@
 /* 由 edr-agent/scripts/gen_p0_golden_vectors_inc.py 自 p0_golden_vectors.json 生成，勿手改。 */
 #ifndef P0_GOLDEN_VECTORS_DATA_INC
 #define P0_GOLDEN_VECTORS_DATA_INC
-#define P0_GOLDEN_N 11
+#define P0_GOLDEN_N 44
 static const char p0_gv_r0[] = "R-EXEC-001";
 static const char p0_gv_p0[] = "powershell.exe";
 static const char p0_gv_c0[] = "powershell -EncodedCommand abc";
@@ -35,13 +35,112 @@ static const char p0_gv_c9[] = "C:\\ProgramData\\Golden\\Setup64.exe /silent";
 static const char p0_gv_r10[] = "R-SILVERFOX-004";
 static const char p0_gv_p10[] = "sc.exe";
 static const char p0_gv_c10[] = "sc.exe create wsftprm type= kernel binPath= C:\\Windows\\Temp\\wsftprm.sys";
+static const char p0_gv_r11[] = "R-DISC-001";
+static const char p0_gv_p11[] = "cmd.exe";
+static const char p0_gv_c11[] = "cmd.exe /c systeminfo";
+static const char p0_gv_r12[] = "R-DISC-001";
+static const char p0_gv_p12[] = "cmd.exe";
+static const char p0_gv_c12[] = "cmd.exe /c tasklist /v /fo csv";
+static const char p0_gv_r13[] = "R-DISC-001";
+static const char p0_gv_p13[] = "cmd.exe";
+static const char p0_gv_c13[] = "cmd.exe /c hostname";
+static const char p0_gv_r14[] = "R-DISC-001";
+static const char p0_gv_p14[] = "cmd.exe";
+static const char p0_gv_c14[] = "cmd.exe /c whoami & hostname";
+static const char p0_gv_r15[] = "R-DISC-001";
+static const char p0_gv_p15[] = "cmd.exe";
+static const char p0_gv_c15[] = "cmd.exe /c ipconfig /all && tasklist /v";
+static const char p0_gv_r16[] = "R-DISC-001";
+static const char p0_gv_p16[] = "cmd.exe";
+static const char p0_gv_c16[] = "cmd.exe /c systeminfo | hostname";
+static const char p0_gv_r17[] = "R-DISC-001";
+static const char p0_gv_p17[] = "cmd.exe";
+static const char p0_gv_c17[] = "cmd.exe /c whoami & whoami /all";
+static const char p0_gv_r18[] = "R-DISC-001";
+static const char p0_gv_p18[] = "cmd.exe";
+static const char p0_gv_c18[] = "cmd.exe /c echo whoami hostname";
+static const char p0_gv_r19[] = "R-DISC-001";
+static const char p0_gv_p19[] = "cmd.exe";
+static const char p0_gv_c19[] = "cmd.exe /c echo \"whoami;hostname\"";
+static const char p0_gv_r20[] = "R-DISC-001";
+static const char p0_gv_p20[] = "cmd.exe";
+static const char p0_gv_c20[] = "cmd.exe /c whoami & echo hostname";
+static const char p0_gv_r21[] = "R-DISC-001";
+static const char p0_gv_p21[] = "cmd.exe";
+static const char p0_gv_c21[] = "cmd.exe /c whoami & hostname-helper.exe";
+static const char p0_gv_r22[] = "R-DISC-001";
+static const char p0_gv_p22[] = "cmd.exe";
+static const char p0_gv_c22[] = "cmd.exe /c C:\\Windows\\System32\\whoami.exe && C:\\Windows\\System32\\hostname.exe";
+static const char p0_gv_r23[] = "R-DISC-001";
+static const char p0_gv_p23[] = "powershell.exe";
+static const char p0_gv_c23[] = "powershell.exe -Command \"whoami; Get-Date\"";
+static const char p0_gv_r24[] = "R-DISC-001";
+static const char p0_gv_p24[] = "powershell.exe";
+static const char p0_gv_c24[] = "powershell.exe -Command \"whoami; hostname\"";
+static const char p0_gv_r25[] = "R-DISC-001";
+static const char p0_gv_p25[] = "pwsh.exe";
+static const char p0_gv_c25[] = "pwsh.exe -c \"tasklist; ipconfig /all\"";
+static const char p0_gv_r26[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p26[] = "cmd.exe";
+static const char p0_gv_c26[] = "cmd.exe /c reg query \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\"";
+static const char p0_gv_r27[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p27[] = "cmd.exe";
+static const char p0_gv_c27[] = "cmd.exe /c reg query \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\"";
+static const char p0_gv_r28[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p28[] = "cmd.exe";
+static const char p0_gv_c28[] = "cmd.exe /c reg query HKLM\\SAM /s";
+static const char p0_gv_r29[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p29[] = "cmd.exe";
+static const char p0_gv_c29[] = "cmd.exe /c reg.exe query \"HKEY_LOCAL_MACHINE\\SECURITY\\Policy\"";
+static const char p0_gv_r30[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p30[] = "cmd.exe";
+static const char p0_gv_c30[] = "cmd.exe /c reg query HKLM\\SAMBackup";
+static const char p0_gv_r31[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p31[] = "cmd.exe";
+static const char p0_gv_c31[] = "cmd.exe /c reg query HKLM\\Software /f SAM";
+static const char p0_gv_r32[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p32[] = "cmd.exe";
+static const char p0_gv_c32[] = "cmd.exe /c echo reg query HKLM\\SAM";
+static const char p0_gv_r33[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p33[] = "cmd.exe";
+static const char p0_gv_c33[] = "cmd.exe /c reg query \\\\host\\HKLM\\SECURITY";
+static const char p0_gv_r34[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p34[] = "reg.exe";
+static const char p0_gv_c34[] = "reg.exe query HKLM\\SAM";
+static const char p0_gv_r35[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p35[] = "reg.exe";
+static const char p0_gv_c35[] = "\"C:\\Windows\\System32\\reg.exe\" query HKLM\\SAM";
+static const char p0_gv_r36[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p36[] = "powershell.exe";
+static const char p0_gv_c36[] = "powershell.exe -Command \"Get-ItemProperty -Path Registry::HKEY_LOCAL_MACHINE\\SAM\"";
+static const char p0_gv_r37[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p37[] = "powershell.exe";
+static const char p0_gv_c37[] = "powershell.exe -c Get-ChildItem -LiteralPath 'HKLM:\\SECURITY\\Policy'";
+static const char p0_gv_r38[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p38[] = "powershell.exe";
+static const char p0_gv_c38[] = "powershell.exe -c Get-ItemProperty -Path HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion";
+static const char p0_gv_r39[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p39[] = "powershell.exe";
+static const char p0_gv_c39[] = "powershell.exe -c Get-ItemProperty -Path HKLM:\\SAMBackup";
+static const char p0_gv_r40[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p40[] = "powershell.exe";
+static const char p0_gv_c40[] = "powershell.exe -c Write-Output \"Get-ItemProperty -Path HKLM:\\SAM\"";
+static const char p0_gv_r41[] = "R-DISC-001";
+static const char p0_gv_p41[] = "cmd.exe";
+static const char p0_gv_c41[] = "cmd.exe /c whoami-helper.exe & hostname";
+static const char p0_gv_r42[] = "R-DISC-001";
+static const char p0_gv_p42[] = "cmd.exe";
+static const char p0_gv_c42[] = "cmd.exe /c whoami & hostname --edr-p0-case diagnostic";
+static const char p0_gv_r43[] = "R-MITRE-WIN-T1012";
+static const char p0_gv_p43[] = "cmd.exe";
+static const char p0_gv_c43[] = "cmd.exe /c reg query HKLM\\SAM --edr-p0-case diagnostic";
 static const char *p0_golden_rule_id[] = {
-p0_gv_r0, p0_gv_r1, p0_gv_r2, p0_gv_r3, p0_gv_r4, p0_gv_r5, p0_gv_r6, p0_gv_r7, p0_gv_r8, p0_gv_r9, p0_gv_r10, };
+p0_gv_r0, p0_gv_r1, p0_gv_r2, p0_gv_r3, p0_gv_r4, p0_gv_r5, p0_gv_r6, p0_gv_r7, p0_gv_r8, p0_gv_r9, p0_gv_r10, p0_gv_r11, p0_gv_r12, p0_gv_r13, p0_gv_r14, p0_gv_r15, p0_gv_r16, p0_gv_r17, p0_gv_r18, p0_gv_r19, p0_gv_r20, p0_gv_r21, p0_gv_r22, p0_gv_r23, p0_gv_r24, p0_gv_r25, p0_gv_r26, p0_gv_r27, p0_gv_r28, p0_gv_r29, p0_gv_r30, p0_gv_r31, p0_gv_r32, p0_gv_r33, p0_gv_r34, p0_gv_r35, p0_gv_r36, p0_gv_r37, p0_gv_r38, p0_gv_r39, p0_gv_r40, p0_gv_r41, p0_gv_r42, p0_gv_r43, };
 static const char *p0_golden_process_name[] = {
-p0_gv_p0, p0_gv_p1, p0_gv_p2, p0_gv_p3, p0_gv_p4, p0_gv_p5, p0_gv_p6, p0_gv_p7, p0_gv_p8, p0_gv_p9, p0_gv_p10, };
+p0_gv_p0, p0_gv_p1, p0_gv_p2, p0_gv_p3, p0_gv_p4, p0_gv_p5, p0_gv_p6, p0_gv_p7, p0_gv_p8, p0_gv_p9, p0_gv_p10, p0_gv_p11, p0_gv_p12, p0_gv_p13, p0_gv_p14, p0_gv_p15, p0_gv_p16, p0_gv_p17, p0_gv_p18, p0_gv_p19, p0_gv_p20, p0_gv_p21, p0_gv_p22, p0_gv_p23, p0_gv_p24, p0_gv_p25, p0_gv_p26, p0_gv_p27, p0_gv_p28, p0_gv_p29, p0_gv_p30, p0_gv_p31, p0_gv_p32, p0_gv_p33, p0_gv_p34, p0_gv_p35, p0_gv_p36, p0_gv_p37, p0_gv_p38, p0_gv_p39, p0_gv_p40, p0_gv_p41, p0_gv_p42, p0_gv_p43, };
 static const char *p0_golden_cmdline[] = {
-p0_gv_c0, p0_gv_c1, p0_gv_c2, p0_gv_c3, p0_gv_c4, p0_gv_c5, p0_gv_c6, p0_gv_c7, p0_gv_c8, p0_gv_c9, p0_gv_c10, };
+p0_gv_c0, p0_gv_c1, p0_gv_c2, p0_gv_c3, p0_gv_c4, p0_gv_c5, p0_gv_c6, p0_gv_c7, p0_gv_c8, p0_gv_c9, p0_gv_c10, p0_gv_c11, p0_gv_c12, p0_gv_c13, p0_gv_c14, p0_gv_c15, p0_gv_c16, p0_gv_c17, p0_gv_c18, p0_gv_c19, p0_gv_c20, p0_gv_c21, p0_gv_c22, p0_gv_c23, p0_gv_c24, p0_gv_c25, p0_gv_c26, p0_gv_c27, p0_gv_c28, p0_gv_c29, p0_gv_c30, p0_gv_c31, p0_gv_c32, p0_gv_c33, p0_gv_c34, p0_gv_c35, p0_gv_c36, p0_gv_c37, p0_gv_c38, p0_gv_c39, p0_gv_c40, p0_gv_c41, p0_gv_c42, p0_gv_c43, };
 static const int p0_golden_expect[] = {
-1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, };
+1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, };
 #endif
 
