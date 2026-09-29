@@ -86,7 +86,9 @@ int edr_local_evidence_cache_maintenance_main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--migration-timeout-ms") && !timeout_seen && i + 1 < argc) {
       char *end = NULL; const char *value = argv[++i];
       unsigned long parsed = strtoul(value, &end, 10);
-      if (!value[0] || !end || *end || parsed == 0 || parsed > 600000) return 2;
+      if (!value[0] || !end || *end || parsed == 0 || parsed > 600000) {
+        fprintf(stderr, "migration timeout must be an integer from 1 to 600000 milliseconds\n"); return 2;
+      }
       timeout = (uint32_t)parsed; timeout_seen = 1;
     } else {
       fprintf(stderr, "cache maintenance accepts only config, rollback executable and timeout options\n"); return 2;
@@ -109,7 +111,10 @@ int edr_local_evidence_cache_maintenance_main(int argc, char **argv) {
     edr_config_free_heap(&cfg); return 2;
   }
   InterlockedExchange(&cancelled, 0);
-  if (!SetConsoleCtrlHandler(migration_control, TRUE)) { edr_config_free_heap(&cfg); return 2; }
+  if (!SetConsoleCtrlHandler(migration_control, TRUE)) {
+    fprintf(stderr, "cache maintenance cancellation handler failed: %lu\n", (unsigned long)GetLastError());
+    edr_config_free_heap(&cfg); return 2;
+  }
   EdrEvidenceMigrationResult result;
   int rc = edr_local_evidence_cache_migrate(path, cfg.offline.evidence_cache_max_size_mb, timeout,
                                             migration_cancelled, NULL, &result);

@@ -151,7 +151,11 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   if (sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE;COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
     snprintf(result->error, sizeof(result->error), "cache is busy; stop its Agent/readers before migration"); goto done;
   }
-  if (sqlite3_exec(db, "PRAGMA synchronous=FULL;PRAGMA wal_autocheckpoint=0;PRAGMA cache_size=-1024;PRAGMA cache_spill=OFF;PRAGMA mmap_size=0;",
+  /* A near-full cache can have only 1 MiB of migration headroom. Keep clean
+   * read pages below 128 KiB so the commit reserve reflects dirty work rather
+   * than filling the runtime's 1 MiB read cache within each small batch.
+   * Spill stays disabled; unusually large dirty batches still fail closed. */
+  if (sqlite3_exec(db, "PRAGMA synchronous=FULL;PRAGMA wal_autocheckpoint=0;PRAGMA cache_size=-128;PRAGMA cache_spill=OFF;PRAGMA mmap_size=0;",
                    NULL, NULL, NULL) != SQLITE_OK) goto sqlite_error;
   if (scalar(db, "PRAGMA auto_vacuum", &mode) != 0 || mode != 2) {
     snprintf(result->error, sizeof(result->error), "upgrade the cache to incremental vacuum before context migration"); goto done;
@@ -173,6 +177,11 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   if (edr_context_store_open(&store, db) != 0 || edr_context_store_begin_upgrade(&store) != 0) goto store_error;
   for (;;) {
     if (interrupted(&deadline)) goto cancelled_out;
+    /* All statements from the previous batch are finalized. Drop only clean
+     * cached pages before the next transaction: retaining read pages from
+     * earlier batches can consume the conservative reserve at a nearly full
+     * cache, even though those pages need neither WAL nor main-file writes. */
+    if (sqlite3_db_release_memory(db) != SQLITE_OK) goto sqlite_error;
     if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
     if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
     if (bytes > cap) { snprintf(result->error, sizeof(result->error), "migration reached physical budget; committed batches remain resumable"); goto done; }
@@ -182,6 +191,7 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
     if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
     if (bytes > cap) { snprintf(result->error, sizeof(result->error), "migration reclaim reached physical budget"); goto done; }
     if (sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) != SQLITE_OK) goto sqlite_error;
+    if (sqlite3_db_release_memory(db) != SQLITE_OK) goto sqlite_error;
     if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
     if (!disk_room(path, 2u * 1024u * 1024u)) { snprintf(result->error, sizeof(result->error), "migration disk reserve exhausted; resume after freeing space"); goto done; }
     unsigned batch = bytes < cap ? (unsigned)((cap - bytes) / (256u * 1024u)) : 0;

@@ -5895,6 +5895,38 @@ static void test_compact_migration_budget_and_storage_types(void) {
 
 static int migration_cancel(void *context) { (void)context; return 1; }
 
+static void test_compact_near_full_migration_releases_clean_pages(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  migration_fixture(path);
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db,
+    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4096) "
+    "INSERT INTO context_facts SELECT printf('pressure-%064x',(i*137)%4096),'ep','tenant',"
+    "'{\"candidate_id\":null,\"type\":11}',9000000000000000200,9000000000000000200 FROM n;"
+    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4096),"
+    "c(v,i) AS (SELECT printf('candidate-%04d-',i%32)||replace(hex(zeroblob(100)),'0','a'),i FROM n) "
+    "INSERT INTO candidate_context_refs SELECT c.v||':post_context:'||printf('%064x',(i*137)%4096),"
+    "c.v,printf('pressure-%064x',(i*137)%4096),json_quote(c.v),9000000000000000200,'local','' FROM c;"
+    "DROP TABLE migration_expected;CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;"
+    "CREATE TABLE migration_pressure_fixture(payload BLOB);");
+  sqlite3_int64 bytes = compact_scalar(db, "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size");
+  uint32_t budget = (uint32_t)((bytes + 1048575) / 1048576) + 3;
+  sqlite3_int64 padding = (sqlite3_int64)budget * 1048576 - 1572864 - bytes;
+  char sql[128]; snprintf(sql, sizeof(sql), "INSERT INTO migration_pressure_fixture VALUES(zeroblob(%lld))", (long long)padding);
+  compact_exec(db, sql); compact_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+  bytes = compact_scalar(db, "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size");
+  assert((sqlite3_int64)budget * 1048576 - bytes >= 1048576);
+  assert((sqlite3_int64)budget * 1048576 - bytes < 1572864);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  EdrEvidenceMigrationResult result;
+  int rc = edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result);
+  if (rc) fprintf(stderr, "near-full migration: %s (%llu moved)\n", result.error, (unsigned long long)result.moved_refs);
+  assert(rc == 0 && result.complete && result.format == 2);
+  assert(result.moved_refs == 4099 && result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+}
+
 static void test_compact_format_resume_and_projection(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -6036,6 +6068,7 @@ int main(int argc, char **argv) {
   test_compact_process_crash_recovery();
   test_compact_full_busy_and_unknown_format();
   test_compact_migration_budget_and_storage_types();
+  test_compact_near_full_migration_releases_clean_pages();
   test_compact_format_resume_and_projection();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();
