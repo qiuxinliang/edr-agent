@@ -5927,6 +5927,36 @@ static void test_compact_near_full_migration_releases_clean_pages(void) {
   assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
 }
 
+static void test_compact_near_full_existing_page_rewrites(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  migration_fixture(path);
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  /* Model a large in-place page rewrite independently of private evidence and
+   * platform-specific B-tree layouts. The trigger changes only test padding;
+   * every evidence row must keep its original projection. These dirty pages
+   * need WAL space, but the enforced main-file cap limits file growth. */
+  compact_exec(db,
+    "CREATE TABLE migration_rewrite_fixture(payload BLOB);"
+    "INSERT INTO migration_rewrite_fixture VALUES(zeroblob(720000));"
+    "CREATE TRIGGER migration_rewrite_existing AFTER DELETE ON candidate_context_refs BEGIN "
+    "UPDATE migration_rewrite_fixture SET payload=CAST(replace(hex(zeroblob(360000)),'0','x') AS BLOB); END;"
+    "CREATE TABLE migration_pressure_fixture(payload BLOB);");
+  sqlite3_int64 bytes = compact_scalar(db, "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size");
+  uint32_t budget = (uint32_t)((bytes + 1048575) / 1048576) + 4;
+  sqlite3_int64 padding = (sqlite3_int64)budget * 1048576 - 1310720 - bytes;
+  char sql[128]; snprintf(sql, sizeof(sql), "INSERT INTO migration_pressure_fixture VALUES(zeroblob(%lld))", (long long)padding);
+  compact_exec(db, sql); compact_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  EdrEvidenceMigrationResult result;
+  int rc = edr_local_evidence_cache_migrate(path, budget, 10000, NULL, NULL, &result);
+  if (rc) fprintf(stderr, "existing-page migration: %s\n", result.error);
+  assert(rc == 0 && result.complete && result.format == 2 && result.moved_refs == 3);
+  assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(compact_scalar(db, "SELECT length(payload) FROM migration_rewrite_fixture") == 720000);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+}
+
 static void test_compact_format_resume_and_projection(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -6069,6 +6099,7 @@ int main(int argc, char **argv) {
   test_compact_full_busy_and_unknown_format();
   test_compact_migration_budget_and_storage_types();
   test_compact_near_full_migration_releases_clean_pages();
+  test_compact_near_full_existing_page_rewrites();
   test_compact_format_resume_and_projection();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();

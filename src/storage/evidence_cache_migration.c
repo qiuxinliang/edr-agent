@@ -24,7 +24,8 @@ typedef struct {
 typedef struct {
   sqlite3 *db;
   const char *path, *wal;
-  uint64_t cap;
+  uint64_t cap, main_cap, page_size;
+  const char *phase;
   int rejected;
 } MigrationBudget;
 
@@ -62,17 +63,26 @@ static uint64_t file_bytes(const char *path) {
   return rc == 0 ? (uint64_t)st.st_size : errno == ENOENT ? 0 : UINT64_MAX;
 }
 
-/* cache_spill is disabled for this exclusive maintenance connection. Before
- * commit, reserve both a WAL frame and main-file space for every cached page
- * (including clean pages), plus headers. This intentionally overestimates
- * growth so a wide historical row fails before publishing an oversized batch. */
+/* With spilling disabled, every page written by this transaction is still in
+ * the pager cache. Reserve its WAL frame and possible main-file growth. The
+ * latter is also bounded by the verified max_page_count, so rewrites of pages
+ * already in a nearly full file need not all be counted as new main pages.
+ * Count clean pages too, and retain a reserve beyond explicit WAL headers. */
 static int budget_before_commit(void *arg) {
   MigrationBudget *b = (MigrationBudget *)arg;
   int used = 0, high = 0;
   uint64_t main_bytes = file_bytes(b->path), wal_bytes = file_bytes(b->wal);
   if (sqlite3_db_status(b->db, SQLITE_DBSTATUS_CACHE_USED, &used, &high, 0) != SQLITE_OK ||
-      used < 0 || main_bytes > b->cap || wal_bytes > b->cap ||
-      main_bytes + wal_bytes + 2u * (uint64_t)used + 131072u > b->cap) {
+      used < 0 || !b->page_size || main_bytes > b->main_cap || wal_bytes > b->cap) {
+    b->rejected = 1; return 1;
+  }
+  uint64_t cached = (uint64_t)used;
+  /* A prior schema transaction may still have pages in WAL. Include their
+   * possible main-file growth until the next checkpoint has truncated WAL. */
+  uint64_t main_bound = main_bytes + wal_bytes + cached;
+  if (main_bound > b->main_cap) main_bound = b->main_cap;
+  uint64_t frame_headers = ((cached + b->page_size - 1) / b->page_size) * 24u + 32u;
+  if (main_bound + wal_bytes + cached + frame_headers + 131072u > b->cap) {
     b->rejected = 1; return 1;
   }
   return 0;
@@ -172,7 +182,14 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   snprintf(limit_sql, sizeof(limit_sql), "PRAGMA max_page_count=%llu;",
            (unsigned long long)((cap - 1024u * 1024u) / (uint64_t)page_size));
   if (sqlite3_exec(db, limit_sql, NULL, NULL, NULL) != SQLITE_OK) goto sqlite_error;
+  sqlite3_int64 max_pages = 0;
+  if (scalar(db, "PRAGMA max_page_count", &max_pages) != 0 || max_pages <= 0 ||
+      (uint64_t)max_pages > (cap - 1024u * 1024u) / (uint64_t)page_size) {
+    snprintf(result->error, sizeof(result->error), "migration main-file page limit was not enforced"); goto done;
+  }
   budget.db = db; budget.path = path; budget.wal = wal; budget.cap = cap;
+  budget.main_cap = (uint64_t)max_pages * (uint64_t)page_size;
+  budget.page_size = (uint64_t)page_size; budget.phase = "schema";
   sqlite3_commit_hook(db, budget_before_commit, &budget);
   if (edr_context_store_open(&store, db) != 0 || edr_context_store_begin_upgrade(&store) != 0) goto store_error;
   for (;;) {
@@ -186,6 +203,7 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
     if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
     if (bytes > cap) { snprintf(result->error, sizeof(result->error), "migration reached physical budget; committed batches remain resumable"); goto done; }
     if (sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) != SQLITE_OK) goto sqlite_error;
+    budget.phase = "reclaim";
     if (sqlite3_exec(db, "PRAGMA incremental_vacuum(256)", NULL, NULL, NULL) != SQLITE_OK) goto sqlite_error;
     if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
     if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
@@ -201,6 +219,7 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
      * must have rolled back completely before retrying. */
     unsigned batch = 64;
     unsigned moved = 0; int complete = 0;
+    budget.phase = "reference batch";
     for (;;) {
       budget.rejected = 0;
       if (edr_context_store_migrate_batch(&store, batch, &moved, &complete) == 0) break;
@@ -241,7 +260,7 @@ done:
     /* max_page_count is a connection-local migration limit. */
     sqlite3_close(db);
   }
-  if (budget.rejected) snprintf(result->error, sizeof(result->error), "migration transaction exceeds physical reserve; committed batches remain resumable");
+  if (budget.rejected) snprintf(result->error, sizeof(result->error), "migration %s exceeds physical reserve; committed batches remain resumable", budget.phase);
   sqlite3_free(wal);
   result->elapsed_ms = migration_clock_ms() - start;
   return rc;
