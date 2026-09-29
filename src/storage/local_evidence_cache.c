@@ -29,6 +29,7 @@
 
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
+#include "evidence_context_store.h"
 #include <sys/stat.h>
 #endif
 
@@ -400,6 +401,7 @@ static void evidence_cache_unlock(void) {
 
 #if defined(EDR_HAVE_SQLITE)
 static sqlite3 *s_db;
+static EdrContextStore s_context_store;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_commit_failures;
 static int s_test_commit_active;
@@ -3669,9 +3671,8 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
     set_error("allocate post-context replay plan failed");
     goto fail;
   }
-  if (sqlite3_prepare_v2(s_db,
-          "SELECT candidate_id,fact_id FROM candidate_context_refs WHERE artifact_id=?;",
-          -1, &st, NULL) != SQLITE_OK) {
+  st = edr_context_store_prepare_lookup(&s_context_store);
+  if (!st) {
     set_error("prepare context reference replay lookup failed");
     goto fail;
   }
@@ -3681,7 +3682,7 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
     if (!candidate_ids[i][0] ||
         artifact_id_for(r, candidate_ids[i], "post_context", ref->artifact_id,
                         sizeof(ref->artifact_id)) != 0) goto fail;
-    bind_text(st, 1, ref->artifact_id);
+    if (edr_context_store_bind_lookup(&s_context_store, st, ref->artifact_id) != 0) goto fail;
     step = sqlite3_step(st);
     if (step == SQLITE_ROW) {
       const char *existing_candidate = (const char *)sqlite3_column_text(st, 0);
@@ -3690,6 +3691,10 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
                               strcmp(existing_candidate, candidate_ids[i]) == 0;
       int exact = candidate_matches && existing_fact &&
                   strcmp(existing_fact, prepared->fact_id) == 0;
+      if (sqlite3_step(st) != SQLITE_DONE) {
+        set_error("ambiguous context reference replay identity");
+        goto fail;
+      }
       (void)sqlite3_reset(st);
       (void)sqlite3_clear_bindings(st);
       if (exact) continue;
@@ -3760,46 +3765,24 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
     }
     sqlite3_finalize(st);
   }
-  static const char ref_sql[] =
-      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
-      "candidate_id_json,created_ns,upload_status,minio_key) "
-      "VALUES(?,?,?,?,?,'local_manifest','') "
-      "ON CONFLICT(artifact_id) DO UPDATE SET fact_id=excluded.fact_id,"
-      "candidate_id_json=excluded.candidate_id_json,"
-      "created_ns=excluded.created_ns,upload_status=excluded.upload_status,"
-      "minio_key=excluded.minio_key;";
-  sqlite3_stmt *ref_st = NULL;
-  if (prepared->ref_count &&
-      sqlite3_prepare_v2(s_db, ref_sql, -1, &ref_st, NULL) != SQLITE_OK) {
-    set_error("prepare context reference insert failed");
-    sqlite3_finalize(ref_st);
+  EdrContextWriter writer;
+  if (edr_context_writer_open(&s_context_store, &writer) != 0) {
+    set_error(s_context_store.error);
     sqlite_rollback_silent();
     return -1;
   }
   for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
     const PreparedContextRef *ref = &prepared->refs[i];
-    uint32_t candidate_index = ref->candidate_index;
-    if (!candidate_ids[candidate_index][0]) {
-      set_error("context reference candidate missing");
-      sqlite3_finalize(ref_st);
+    if (edr_context_writer_put(&writer, ref->artifact_id,
+          candidate_ids[ref->candidate_index], prepared->fact_id,
+          ref->candidate_id_json, written_ns, 0, "local_manifest", "") != 0) {
+      set_error(s_context_store.error);
+      edr_context_writer_close(&writer);
       sqlite_rollback_silent();
       return -1;
     }
-    bind_text(ref_st, 1, ref->artifact_id);
-    bind_text(ref_st, 2, candidate_ids[candidate_index]);
-    bind_text(ref_st, 3, prepared->fact_id);
-    bind_text(ref_st, 4, ref->candidate_id_json);
-    sqlite3_bind_int64(ref_st, 5, written_ns);
-    if (sqlite3_step(ref_st) != SQLITE_DONE) {
-      set_error("insert context reference failed");
-      sqlite3_finalize(ref_st);
-      sqlite_rollback_silent();
-      return -1;
-    }
-    (void)sqlite3_reset(ref_st);
-    (void)sqlite3_clear_bindings(ref_st);
   }
-  sqlite3_finalize(ref_st);
+  edr_context_writer_close(&writer);
   if (sqlite_commit_candidate_transaction() != 0) {
     sqlite_rollback_silent();
     return -1;
@@ -3914,7 +3897,7 @@ static int sqlite_migrate_legacy_context_artifacts(void) {
   static const char select_sql[] =
       "SELECT a.artifact_id,a.endpoint_id,a.tenant_id,a.candidate_id,a.manifest_json,"
       "a.created_ns,a.upload_status,a.minio_key FROM artifacts a "
-      "LEFT JOIN candidate_context_refs r ON r.artifact_id=a.artifact_id "
+      "LEFT JOIN context_reference_projection r ON r.artifact_id=a.artifact_id "
       "WHERE a.artifact_type='post_context' AND "
       "(r.artifact_id IS NULL OR a.created_ns>r.created_ns) "
       "ORDER BY a.created_ns,a.artifact_id;";
@@ -3932,26 +3915,19 @@ static int sqlite_migrate_legacy_context_artifacts(void) {
   static const char fact_lookup_sql[] =
       "SELECT endpoint_id,tenant_id,manifest_template_json "
       "FROM context_facts WHERE fact_id=?;";
-  static const char ref_sql[] =
-      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,"
-      "candidate_id_json,created_ns,upload_status,minio_key) VALUES(?,?,?,?,?,?,?) "
-      "ON CONFLICT(artifact_id) DO UPDATE SET "
-      "candidate_id=excluded.candidate_id,fact_id=excluded.fact_id,"
-      "candidate_id_json=excluded.candidate_id_json,"
-      "created_ns=MAX(candidate_context_refs.created_ns,excluded.created_ns),"
-      "upload_status=excluded.upload_status,minio_key=excluded.minio_key;";
   sqlite3_stmt *select_st = NULL;
   sqlite3_stmt *normalize_st = NULL;
   sqlite3_stmt *fact_st = NULL;
   sqlite3_stmt *fact_lookup_st = NULL;
-  sqlite3_stmt *ref_st = NULL;
+  EdrContextWriter writer;
+  memset(&writer, 0, sizeof(writer));
   int result = -1;
   if (!s_db || exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
   if (sqlite3_prepare_v2(s_db, select_sql, -1, &select_st, NULL) != SQLITE_OK ||
       sqlite3_prepare_v2(s_db, normalize_sql, -1, &normalize_st, NULL) != SQLITE_OK ||
       sqlite3_prepare_v2(s_db, fact_sql, -1, &fact_st, NULL) != SQLITE_OK ||
       sqlite3_prepare_v2(s_db, fact_lookup_sql, -1, &fact_lookup_st, NULL) != SQLITE_OK ||
-      sqlite3_prepare_v2(s_db, ref_sql, -1, &ref_st, NULL) != SQLITE_OK) {
+      edr_context_writer_open(&s_context_store, &writer) != 0) {
     set_error("prepare legacy context normalization failed");
     goto done;
   }
@@ -4051,17 +4027,10 @@ static int sqlite_migrate_legacy_context_artifacts(void) {
         goto row_done;
       }
     }
-    sqlite3_reset(ref_st);
-    sqlite3_clear_bindings(ref_st);
-    bind_text(ref_st, 1, artifact_id);
-    bind_text(ref_st, 2, candidate_id);
-    bind_text(ref_st, 3, fact_id);
-    bind_text(ref_st, 4, candidate_json);
-    sqlite3_bind_int64(ref_st, 5, created_ns);
-    bind_text(ref_st, 6, upload_status ? upload_status : "local_manifest");
-    bind_text(ref_st, 7, minio_key ? minio_key : "");
-    if (sqlite3_step(ref_st) != SQLITE_DONE) {
-      set_error("migrate legacy context reference failed");
+    if (edr_context_writer_put(&writer, artifact_id, candidate_id, fact_id,
+          candidate_json, created_ns, 0, upload_status ? upload_status : "local_manifest",
+          minio_key ? minio_key : "") != 0) {
+      set_error(s_context_store.error);
       goto row_done;
     }
     cJSON_free(candidate_json);
@@ -4077,7 +4046,7 @@ row_done:
   result = 0;
 
 done:
-  sqlite3_finalize(ref_st);
+  edr_context_writer_close(&writer);
   sqlite3_finalize(fact_lookup_st);
   sqlite3_finalize(fact_st);
   sqlite3_finalize(normalize_st);
@@ -4330,6 +4299,41 @@ static int sqlite_live_size_over_limit(uint64_t limit) {
   return over;
 }
 
+static int sqlite_collect_context_facts(void) {
+  unsigned removed = 0;
+  if (edr_context_store_collect_facts(&s_context_store, &removed) != 0) {
+    set_error(s_context_store.error);
+    return -1;
+  }
+  return (int)removed;
+}
+
+static int sqlite_evict_context_refs(int orphans, unsigned limit) {
+  if (s_context_store.format) {
+    unsigned removed = 0;
+    if (edr_context_store_evict(&s_context_store, orphans, limit, &removed) != 0) {
+      set_error(s_context_store.error);
+      return -1;
+    }
+    return (int)removed;
+  }
+  const char *query = orphans
+      ? "DELETE FROM candidate_context_refs WHERE rowid IN (SELECT r.rowid FROM candidate_context_refs r "
+        "WHERE NOT EXISTS (SELECT 1 FROM p0_candidates c WHERE c.candidate_id=r.candidate_id) "
+        "ORDER BY r.created_ns,r.rowid LIMIT ?);"
+      : "DELETE FROM candidate_context_refs WHERE rowid IN (SELECT rowid FROM candidate_context_refs "
+        "ORDER BY created_ns LIMIT ?);";
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(s_db, query, -1, &st, NULL) != SQLITE_OK) {
+    set_error("prepare context reclaim failed"); return -1;
+  }
+  sqlite3_bind_int(st, 1, (int)limit);
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) { set_error("context reclaim failed"); return -1; }
+  return sqlite3_changes(s_db);
+}
+
 static void sqlite_maintenance(void) {
   if (!s_db) {
     return;
@@ -4368,12 +4372,12 @@ static void sqlite_maintenance(void) {
       s_status.db_retention_evicted += (uint64_t)changes;
     }
   }
-  if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
-               "SELECT 1 FROM candidate_context_refs "
-               "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") == 0) {
-    int changes = sqlite3_changes(s_db);
-    if (changes > 0) s_status.db_retention_evicted += (uint64_t)changes;
-  }
+  unsigned expired_compact = 0;
+  if (edr_context_store_expire(&s_context_store, cutoff, &expired_compact) != 0)
+    set_error(s_context_store.error);
+  else s_status.db_retention_evicted += expired_compact;
+  int collected_facts = sqlite_collect_context_facts();
+  if (collected_facts > 0) s_status.db_retention_evicted += (uint64_t)collected_facts;
   if (db_size_over_limit()) {
     /* Physical pressure includes WAL pages. A live set just below the cap
      * otherwise survives every cleanup and rejects the next WAL transaction.
@@ -4389,22 +4393,12 @@ static void sqlite_maintenance(void) {
        * Each orphan batch is bounded to 4096 refs so it can recover the WAL
        * reserve without repacking partially used pages. A productive orphan
        * batch must not evict live candidates or command artifacts in the same pass. */
-      if (exec_sql("DELETE FROM candidate_context_refs WHERE rowid IN ("
-                   "SELECT r.rowid FROM candidate_context_refs r "
-                   "WHERE NOT EXISTS (SELECT 1 FROM p0_candidates c "
-                   "WHERE c.candidate_id=r.candidate_id) "
-                   "ORDER BY r.created_ns ASC,r.rowid ASC LIMIT 4096);") != 0) {
-        break;
-      }
-      int orphan_changes = sqlite3_changes(s_db);
+      int orphan_changes = sqlite_evict_context_refs(1, 4096u);
+      if (orphan_changes < 0) break;
       if (orphan_changes > 0) {
         s_status.db_capacity_evicted += (uint64_t)orphan_changes;
-        if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
-                     "SELECT 1 FROM candidate_context_refs "
-                     "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") != 0) {
-          break;
-        }
-        int fact_changes = sqlite3_changes(s_db);
+        int fact_changes = sqlite_collect_context_facts();
+        if (fact_changes < 0) break;
         if (fact_changes > 0) s_status.db_capacity_evicted += (uint64_t)fact_changes;
         continue;
       }
@@ -4416,18 +4410,10 @@ static void sqlite_maintenance(void) {
         int changes = sqlite3_changes(s_db);
         if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
       }
-      if (exec_sql("DELETE FROM candidate_context_refs WHERE rowid IN ("
-                   "SELECT rowid FROM candidate_context_refs "
-                   "ORDER BY created_ns ASC LIMIT 1000);") == 0) {
-        int changes = sqlite3_changes(s_db);
-        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
-      }
-      if (exec_sql("DELETE FROM context_facts WHERE NOT EXISTS ("
-                   "SELECT 1 FROM candidate_context_refs "
-                   "WHERE candidate_context_refs.fact_id=context_facts.fact_id);") == 0) {
-        int changes = sqlite3_changes(s_db);
-        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
-      }
+      int ref_changes = sqlite_evict_context_refs(0, 1000u);
+      if (ref_changes > 0) s_status.db_capacity_evicted += (uint64_t)ref_changes;
+      int fact_changes = sqlite_collect_context_facts();
+      if (fact_changes > 0) s_status.db_capacity_evicted += (uint64_t)fact_changes;
     }
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     refresh_db_size_status();
@@ -4748,6 +4734,13 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     return -1;
   }
   s_status.db_open = 1;
+  if (edr_context_store_check_format(&s_context_store, s_db) != 0) {
+    set_error(s_context_store.error);
+    evidence_cache_close_locked();
+    evidence_cache_unlock();
+    return -1;
+  }
+  s_status.storage_format = (uint32_t)s_context_store.format;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   s_test_commit_failures = 0u;
   s_test_commit_active = 0;
@@ -4798,31 +4791,6 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "artifact_type TEXT,path TEXT,sha256 TEXT,manifest_json TEXT,created_ns INTEGER,"
       "upload_status TEXT,minio_key TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_artifacts_ep_time ON artifacts(endpoint_id,created_ns);"
-      "CREATE TABLE IF NOT EXISTS context_facts ("
-      "fact_id TEXT PRIMARY KEY,endpoint_id TEXT,tenant_id TEXT,"
-      "manifest_template_json TEXT NOT NULL,created_ns INTEGER,updated_ns INTEGER);"
-      "CREATE INDEX IF NOT EXISTS idx_context_facts_ep_time "
-      "ON context_facts(endpoint_id,updated_ns);"
-      "CREATE TABLE IF NOT EXISTS candidate_context_refs ("
-      "artifact_id TEXT PRIMARY KEY,candidate_id TEXT NOT NULL,fact_id TEXT NOT NULL,"
-      "candidate_id_json TEXT NOT NULL,created_ns INTEGER,upload_status TEXT,minio_key TEXT,"
-      "UNIQUE(candidate_id,fact_id));"
-      "CREATE INDEX IF NOT EXISTS idx_candidate_context_refs_candidate "
-      "ON candidate_context_refs(candidate_id,created_ns);"
-      "CREATE INDEX IF NOT EXISTS idx_candidate_context_refs_fact "
-      "ON candidate_context_refs(fact_id);"
-      "CREATE VIEW IF NOT EXISTS materialized_artifacts AS "
-      "SELECT artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,"
-      "manifest_json,created_ns,upload_status,minio_key FROM artifacts a "
-      "WHERE a.artifact_type<>'post_context' OR NOT EXISTS ("
-      "SELECT 1 FROM candidate_context_refs r WHERE r.artifact_id=a.artifact_id) "
-      "UNION ALL "
-      "SELECT r.artifact_id,f.endpoint_id,f.tenant_id,r.candidate_id,'post_context','','',"
-      "replace(f.manifest_template_json,'\"candidate_id\":null',"
-      "'\"candidate_id\":'||r.candidate_id_json),"
-      "CASE WHEN f.updated_ns>r.created_ns THEN f.updated_ns ELSE r.created_ns END,"
-      "r.upload_status,r.minio_key FROM candidate_context_refs r "
-      "JOIN context_facts f ON f.fact_id=r.fact_id;"
       "CREATE TABLE IF NOT EXISTS command_results ("
       "command_id TEXT PRIMARY KEY,command_type TEXT,status TEXT,execution_status INTEGER,"
       "exit_code INTEGER,detail TEXT,artifacts TEXT,updated_ns INTEGER);"
@@ -4845,6 +4813,12 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "task_id TEXT PRIMARY KEY,status TEXT,evidence_refs TEXT,upload_refs TEXT,error TEXT,"
       "retryable INTEGER,updated_ns INTEGER);";
   if (exec_sql(schema) != 0) {
+    evidence_cache_close_locked();
+    evidence_cache_unlock();
+    return -1;
+  }
+  if (edr_context_store_open(&s_context_store, s_db) != 0) {
+    set_error(s_context_store.error);
     evidence_cache_close_locked();
     evidence_cache_unlock();
     return -1;
@@ -6728,7 +6702,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
     snprintf(context_ref_sources, sizeof(context_ref_sources), "{}");
   }
   int written = snprintf(out, cap,
-           "\"evidence_cache\":{\"db_open\":%s,\"path\":%s,\"max_db_mb\":%u,"
+           "\"evidence_cache\":{\"db_open\":%s,\"storage_format\":%u,\"path\":%s,\"max_db_mb\":%u,"
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
@@ -6753,7 +6727,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
-           st.db_open ? "true" : "false", path, st.max_db_mb, st.retention_hours,
+           st.db_open ? "true" : "false", st.storage_format, path, st.max_db_mb, st.retention_hours,
            (unsigned long long)st.db_bytes, (unsigned long long)st.wal_bytes,
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,

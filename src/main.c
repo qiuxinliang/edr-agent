@@ -427,6 +427,11 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
 #endif
 
 static void print_usage(const char *argv0) {
+  fprintf(stderr, "       %s --evidence-cache-format-capabilities\n", argv0);
+#ifdef _WIN32
+  fprintf(stderr, "       %s --evidence-cache-migrate --config <absolute path> "
+                  "--evidence-cache-rollback-exe <absolute path> [--migration-timeout-ms <1..600000>]\n", argv0);
+#endif
   fprintf(stderr,
           "Usage: %s [--config <path>] [--config-test] [--service] [--service-name <name>] "
           "[--etw-uninstall-cleanup]\n",
@@ -737,6 +742,18 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 #endif
 
 int main(int argc, char **argv) {
+  if (argc == 2 && !strcmp(argv[1], "--evidence-cache-format-capabilities")) {
+#if defined(EDR_HAVE_SQLITE)
+    puts("{\"protocol\":1,\"read_min\":0,\"read_max\":2,\"write_min\":0,\"write_max\":2}");
+    return 0;
+#else
+    fprintf(stderr, "SQLite evidence cache is unavailable\n"); return 2;
+#endif
+  }
+#ifdef _WIN32
+  if (argc >= 2 && !strcmp(argv[1], "--evidence-cache-migrate"))
+    return edr_local_evidence_cache_maintenance_main(argc, argv);
+#endif
   const char *config = NULL;
   int run_as_service = 0;
   int config_test = 0;

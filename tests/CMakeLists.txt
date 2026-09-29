@@ -1184,6 +1184,8 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+  ${CMAKE_SOURCE_DIR}/src/storage/evidence_context_store.c
+  ${CMAKE_SOURCE_DIR}/src/storage/evidence_cache_migration.c
   ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
@@ -1216,6 +1218,8 @@ if(SQLite3_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/test_command_fact_transport.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
     ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+    ${CMAKE_SOURCE_DIR}/src/storage/evidence_context_store.c
+    ${CMAKE_SOURCE_DIR}/src/storage/evidence_cache_migration.c
     ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
     ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c

@@ -541,6 +541,9 @@ set(EDR_AGENT_SOURCES
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c
   src/storage/local_evidence_cache.c
+  src/storage/evidence_context_store.c
+  src/storage/evidence_cache_migration.c
+  src/storage/evidence_cache_maintenance_win.c
   src/command/command_stub.c
   src/command/command_process.c
   src/command/command_signature.c

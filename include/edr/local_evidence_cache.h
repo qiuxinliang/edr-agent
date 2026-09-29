@@ -18,6 +18,7 @@
 
 typedef struct {
   int db_open;
+  uint32_t storage_format; /* 0 legacy, 1 migrating, 2 compact */
   uint64_t records_written;
   uint64_t records_dropped;
   uint64_t records_skipped;
@@ -172,6 +173,29 @@ typedef struct {
  * historical artifacts projection while materializing normalized post-context
  * facts with their candidate attribution. */
 #define EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW "materialized_artifacts"
+
+typedef struct {
+  uint64_t moved_refs;
+  uint64_t batches;
+  uint64_t peak_physical_bytes;
+  uint64_t elapsed_ms;
+  uint32_t format;
+  uint32_t complete;
+  char error[192];
+} EdrEvidenceMigrationResult;
+
+/* Finite, exclusive maintenance operation for the installed updater/operator.
+ * The Agent must be stopped and the selected rollback binary must support
+ * formats 1 and 2. No collection, retention cleanup, or whole-file replacement
+ * runs here. On cancellation/failure, committed batches remain readable and
+ * the next invocation resumes from remaining legacy references. */
+int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
+                                    uint32_t timeout_ms,
+                                    int (*cancelled)(void *), void *cancel_context,
+                                    EdrEvidenceMigrationResult *result);
+#ifdef _WIN32
+int edr_local_evidence_cache_maintenance_main(int argc, char **argv);
+#endif
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours);

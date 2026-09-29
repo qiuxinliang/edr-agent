@@ -24,6 +24,8 @@ static void test_setenv(const char *name, const char *value) {
 static void test_unsetenv(const char *name) { assert(_putenv_s(name, "") == 0); }
 #else
 #include <pthread.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 static void test_setenv(const char *name, const char *value) {
   assert(setenv(name, value, 1) == 0);
@@ -33,6 +35,7 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
+#include "../src/storage/evidence_context_store.h"
 #endif
 
 bool edr_resource_preprocess_throttle_active(void) { return false; }
@@ -5727,9 +5730,314 @@ static void test_legacy_command_quality_is_unknown_until_observed(void) {
 }
 #endif
 
-int main(void) {
+
+#if defined(EDR_HAVE_SQLITE)
+static void compact_exec(sqlite3 *db, const char *sql) {
+  char *error = NULL;
+  int rc = sqlite3_exec(db, sql, NULL, NULL, &error);
+  if (rc != SQLITE_OK) fprintf(stderr, "compact fixture SQL failed: %s\n", error ? error : "unknown");
+  sqlite3_free(error);
+  assert(rc == SQLITE_OK);
+}
+
+static int64_t compact_scalar(sqlite3 *db, const char *sql) {
+  sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  int64_t value = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st); return value;
+}
+
+static void compact_assert_projection(sqlite3 *db) {
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM migration_expected EXCEPT SELECT * FROM materialized_artifacts)") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM materialized_artifacts EXCEPT SELECT * FROM migration_expected)") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM migration_expected") == compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts"));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+}
+
+static void migration_fixture(const char *path) {
+  sqlite_exec_create_legacy_context_artifacts(path, 0);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts");
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static int migration_crash_commit(void *unused) {
+  (void)unused;
+#if defined(_WIN32)
+  ExitProcess(86);
+#else
+  _exit(86);
+#endif
+  return 1;
+}
+
+static void migration_crash_child(const char *path, int phase) {
+  sqlite3 *db = NULL; EdrContextStore store;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA cache_size=1;");
+  assert(edr_context_store_open(&store, db) == 0);
+  if (phase == 0) sqlite3_commit_hook(db, migration_crash_commit, NULL);
+  assert(edr_context_store_begin_upgrade(&store) == 0);
+  if (phase == 1 || phase == 3) sqlite3_commit_hook(db, migration_crash_commit, NULL);
+  unsigned moved; int complete;
+  assert(edr_context_store_migrate_batch(&store, phase == 3 ? 64 : 1, &moved, &complete) == 0);
+  migration_crash_commit(NULL); /* phase 2: committed WAL, no checkpoint/close */
+}
+
+static void run_migration_crash_child(const char *path, int phase) {
+#if defined(_WIN32)
+  char executable[MAX_PATH], command[2048];
+  DWORD n = GetModuleFileNameA(NULL, executable, sizeof(executable));
+  assert(n && n < sizeof(executable));
+  assert(snprintf(command, sizeof(command), "\"%s\" --crash-cache-migration \"%s\" %d", executable, path, phase) < (int)sizeof(command));
+  STARTUPINFOA si; PROCESS_INFORMATION pi;
+  memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi)); si.cb = sizeof(si);
+  assert(CreateProcessA(executable, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi));
+  DWORD wait = WaitForSingleObject(pi.hProcess, 10000), code = 0;
+  if (wait != WAIT_OBJECT_0) { TerminateProcess(pi.hProcess, 87); WaitForSingleObject(pi.hProcess, 2000); }
+  assert(GetExitCodeProcess(pi.hProcess, &code)); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  assert(wait == WAIT_OBJECT_0 && code == 86);
+#else
+  pid_t child = fork(); assert(child >= 0);
+  if (child == 0) migration_crash_child(path, phase);
+  int status = 0; pid_t done = 0;
+  for (unsigned i = 0; i < 1000 && done == 0; ++i) {
+    done = waitpid(child, &status, WNOHANG); if (!done) usleep(10000);
+  }
+  if (done == 0) { kill(child, SIGKILL); waitpid(child, &status, 0); }
+  assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == 86);
+#endif
+}
+
+static void test_compact_process_crash_recovery(void) {
+  for (int phase = 0; phase < 4; ++phase) {
+    char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    migration_fixture(path);
+    run_migration_crash_child(path, phase);
+    sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+    compact_assert_projection(db);
+    assert(compact_scalar(db, "PRAGMA user_version") == (phase == 0 ? 0 : 1));
+    if (phase) assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == (phase == 2 ? 1 : 0));
+    assert(sqlite3_close(db) == SQLITE_OK);
+    EdrEvidenceMigrationResult result;
+    assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == 0);
+    assert(result.complete && result.format == 2);
+    assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+    assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  }
+}
+
+static void test_compact_full_busy_and_unknown_format(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  migration_fixture(path);
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "BEGIN IMMEDIATE");
+  EdrEvidenceMigrationResult result;
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == -1);
+  assert(strstr(result.error, "busy"));
+  compact_exec(db, "ROLLBACK"); compact_assert_projection(db);
+  EdrContextStore store; assert(edr_context_store_open(&store, db) == 0);
+  assert(edr_context_store_begin_upgrade(&store) == 0);
+  compact_exec(db, "WITH c(v) AS (SELECT replace(hex(zeroblob(10000)),'0','a')) "
+                   "INSERT INTO candidate_context_refs SELECT c.v||':post_context:'||replace(hex(zeroblob(32)),'0','a'),"
+                   "c.v,f.fact_id,json_quote(c.v),9000000000000000200,'local','' FROM c,context_facts f LIMIT 1;"
+                   "DROP TABLE migration_expected;CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;"
+                   "CREATE TABLE space_fixture(payload BLOB);"
+                   "INSERT INTO space_fixture SELECT zeroblob((freelist_count+1)*4096) FROM pragma_freelist_count;");
+  char limit[96]; snprintf(limit, sizeof(limit), "PRAGMA max_page_count=%lld", (long long)compact_scalar(db, "PRAGMA page_count"));
+  compact_exec(db, limit);
+  unsigned moved = 0; int complete = 0;
+  assert(edr_context_store_migrate_batch(&store, 64, &moved, &complete) == -1);
+  if (!strstr(store.error, "full")) fprintf(stderr, "migration failure: %s\n", store.error);
+  assert(strstr(store.error, "full"));
+  assert(moved == 0 && !complete); compact_assert_projection(db);
+  compact_exec(db, "PRAGMA max_page_count=100000;PRAGMA user_version=99");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == -1);
+  assert(strstr(result.error, "unsupported"));
+  assert(edr_local_evidence_cache_open(path, 16, 24) == -1);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(compact_scalar(db, "PRAGMA user_version") == 99);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+}
+
+static void test_compact_migration_budget_and_storage_types(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  migration_fixture(path);
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "UPDATE candidate_context_refs SET created_ns='invalid' WHERE rowid=1;"
+                   "DROP TABLE migration_expected;CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  EdrEvidenceMigrationResult result;
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == -1);
+  assert(strstr(result.error, "storage type"));
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  compact_exec(db, "UPDATE candidate_context_refs SET created_ns=9000000000000000200 WHERE rowid=1;"
+                   "WITH c(v) AS (SELECT replace(hex(zeroblob(262144)),'0','a')) "
+                   "INSERT INTO candidate_context_refs SELECT c.v||':post_context:'||replace(hex(zeroblob(32)),'0','a'),"
+                   "c.v,f.fact_id,json_quote(c.v),9000000000000000200,'local','' FROM c,context_facts f LIMIT 1;"
+                   "DROP TABLE migration_expected;CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+  uint32_t budget = (uint32_t)((compact_scalar(db, "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size") + 1048575) / 1048576) + 2;
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_migrate(path, budget, 10000, NULL, NULL, &result) == -1);
+  assert(strstr(result.error, "reserve") || strstr(result.error, "full"));
+  assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_migrate(path, budget + 16, 10000, NULL, NULL, &result) == 0);
+  assert(result.complete && result.format == 2);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+}
+
+static int migration_cancel(void *context) { (void)context; return 1; }
+
+static void test_compact_format_resume_and_projection(void) {
+  char path[512];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  sqlite_exec_create_legacy_context_artifacts(path, 0);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db,
+      "INSERT INTO candidate_context_refs SELECT 'historical-opaque-artifact','legacy-a',fact_id,"
+      "'\"legacy-a\" ',NULL,NULL,NULL FROM candidate_context_refs WHERE candidate_id='legacy-b';"
+      "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+  EdrContextStore store;
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 0);
+  assert(edr_context_store_begin_upgrade(&store) == 0 && store.format == 1);
+  compact_exec(db, "CREATE TRIGGER fail_compact_batch BEFORE INSERT ON compact_context_refs "
+                   "WHEN (SELECT COUNT(*) FROM compact_context_refs)>0 BEGIN SELECT RAISE(ABORT,'injected batch failure'); END;");
+  unsigned moved = 0; int complete = 0;
+  assert(edr_context_store_migrate_batch(&store, 64, &moved, &complete) == -1);
+  assert(moved == 0 && !complete);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 4);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 0);
+  compact_assert_projection(db);
+  compact_exec(db, "DROP TRIGGER fail_compact_batch;");
+  assert(edr_context_store_migrate_batch(&store, 1, &moved, &complete) == 0);
+  assert(moved == 1 && !complete);
+  compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  /* Normal runtime opens and preserves a partly migrated cache. */
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_assert_projection(db);
+  assert(compact_scalar(db, "PRAGMA user_version") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 1);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  EdrEvidenceMigrationResult result;
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, migration_cancel, NULL, &result) == -1);
+  assert(result.moved_refs == 0 && !result.complete);
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == 0);
+  assert(result.complete && result.format == 2 && result.moved_refs == 3);
+  assert(result.peak_physical_bytes <= UINT64_C(16) * 1024 * 1024);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_assert_projection(db);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs WHERE created_ns IS NULL AND upload_status IS NULL AND minio_key IS NULL") == 1);
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 2);
+  unsigned removed = 0;
+  assert(edr_context_store_collect_facts(&store, &removed) == 0 && removed == 0);
+  compact_assert_projection(db);
+  assert(edr_context_store_evict(&store, 1, 2, &removed) == 0 && removed == 2);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts WHERE artifact_type='post_context'") >= 2);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+}
+
+static void test_compact_runtime_replay_enrichment_and_failure(void) {
+  char path[512];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  EdrBehaviorRecord candidate, context;
+  struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "0");
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3; candidate.pid = 74001; candidate.event_time_ns = base;
+  set_record_generation(&candidate, 74001);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "compact-ep");
+  snprintf(candidate.tenant_id, sizeof(candidate.tenant_id), "compact-tenant");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "compact-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.1"); candidate.net_dport = 445;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  char id[160]; sqlite_candidate_id_for_source_event(path, candidate.event_id, id, sizeof(id));
+  context = candidate; context.priority = 1; context.type = EDR_EVENT_PROCESS_CREATE;
+  context.net_dst[0] = 0; context.net_dport = 0; context.event_time_ns = base + 1000;
+  snprintf(context.process_name, sizeof(context.process_name), "helper.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "helper.exe --context");
+  snprintf(context.event_id, sizeof(context.event_id), "compact-context");
+  edr_local_evidence_cache_record_behavior(&context);
+  assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
+  edr_local_evidence_cache_close();
+  EdrEvidenceMigrationResult migration;
+  assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &migration) == 0);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  /* Historical windows are deliberately not rearmed by a replay after restart.
+   * A fresh candidate in the same generation opens a real new window, consumes
+   * the retained fact, and then exercises exact replay/enrichment in format 2. */
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "compact-new-candidate");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.2");
+  candidate.event_time_ns = base + 500;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_candidate_id_for_source_event(path, candidate.event_id, id, sizeof(id));
+  EdrEvidenceCacheStatus before, replay, failed;
+  edr_local_evidence_cache_record_behavior(&context);
+  assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
+  edr_local_evidence_cache_get_status(&before);
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&replay);
+  assert(before.context_refs_written == replay.context_refs_written);
+  assert(before.context_facts_written == replay.context_facts_written);
+  snprintf(context.source_completeness, sizeof(context.source_completeness), "COMPLETE");
+  edr_local_evidence_cache_record_behavior(&context);
+  sqlite_assert_post_artifact_completeness(path, id, context.event_id, "COMPLETE");
+  assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
+  uint64_t facts = sqlite_table_count(path, "context_facts");
+  uint64_t refs = sqlite_table_count(path, "compact_context_refs");
+  snprintf(context.event_id, sizeof(context.event_id), "compact-commit-failure");
+  edr_local_evidence_cache_test_fail_next_commits(1);
+  edr_local_evidence_cache_record_behavior(&context);
+  edr_local_evidence_cache_get_status(&failed);
+  assert(failed.last_error[0]);
+  assert(sqlite_table_count(path, "context_facts") == facts);
+  assert(sqlite_table_count(path, "compact_context_refs") == refs);
+  edr_local_evidence_cache_record_behavior(&context);
+  assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
+  edr_local_evidence_cache_close();
+  test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
+  cleanup_test_sqlite_path(path);
+}
+#endif
+
+int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if (argc == 4 && strcmp(argv[1], "--crash-cache-migration") == 0) {
+    migration_crash_child(argv[2], atoi(argv[3])); return 1;
+  }
+#else
+  (void)argc; (void)argv;
+#endif
   test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
+  test_compact_process_crash_recovery();
+  test_compact_full_busy_and_unknown_format();
+  test_compact_migration_budget_and_storage_types();
+  test_compact_format_resume_and_projection();
+  test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();
   test_legacy_command_quality_is_unknown_until_observed();
 #endif

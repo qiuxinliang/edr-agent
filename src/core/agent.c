@@ -2581,7 +2581,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu},"
         "\"source_only\":{\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u,\"loss_detected\":%s,"
         "\"retry_pending\":%llu,\"retry_committed\":%llu,\"reason\":\"%s\"},"
-        "\"evidence_cache\":{\"db_open\":%s,\"utilization_bps\":%u,"
+        "\"evidence_cache\":{\"db_open\":%s,\"storage_format\":%u,\"utilization_bps\":%u,"
         "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
         "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
         "\"context_facts_written\":%llu,\"context_refs_written\":%llu,"
@@ -2768,7 +2768,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         p0_emit_metrics.source_only_loss_detected ? "true" : "false",
         (unsigned long long)p0_emit_metrics.source_only_retry_pending,
         (unsigned long long)p0_emit_metrics.source_only_retry_committed, source_only_reason,
-        evidence_status.db_open ? "true" : "false", evidence_status.db_utilization_bps,
+        evidence_status.db_open ? "true" : "false", evidence_status.storage_format, evidence_status.db_utilization_bps,
         (unsigned long long)evidence_status.candidate_requests,
         (unsigned long long)evidence_status.candidate_reused,
         (unsigned long long)evidence_status.candidate_admitted,
