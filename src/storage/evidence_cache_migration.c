@@ -194,11 +194,21 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
     if (sqlite3_db_release_memory(db) != SQLITE_OK) goto sqlite_error;
     if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
     if (!disk_room(path, 2u * 1024u * 1024u)) { snprintf(result->error, sizeof(result->error), "migration disk reserve exhausted; resume after freeing space"); goto done; }
-    unsigned batch = bytes < cap ? (unsigned)((cap - bytes) / (256u * 1024u)) : 0;
-    if (!batch) { snprintf(result->error, sizeof(result->error), "insufficient migration batch headroom"); goto done; }
-    if (batch > 64) batch = 64;
+    /* The commit hook measures the actual working set before any dirty pages
+     * spill. Start at the bounded maximum and split a rejected transaction,
+     * instead of paying FULL commit/checkpoint latency for a guessed five-row
+     * batch on Windows. At most seven attempts (64..1); each failed attempt
+     * must have rolled back completely before retrying. */
+    unsigned batch = 64;
     unsigned moved = 0; int complete = 0;
-    if (edr_context_store_migrate_batch(&store, batch, &moved, &complete) != 0) goto store_error;
+    for (;;) {
+      budget.rejected = 0;
+      if (edr_context_store_migrate_batch(&store, batch, &moved, &complete) == 0) break;
+      if (!budget.rejected || batch == 1 || !sqlite3_get_autocommit(db)) goto store_error;
+      if (interrupted(&deadline)) goto cancelled_out;
+      batch /= 2;
+      if (sqlite3_db_release_memory(db) != SQLITE_OK) goto sqlite_error;
+    }
     result->moved_refs += moved; ++result->batches;
     if (complete) {
       if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
@@ -209,6 +219,7 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   }
   goto done;
 store_error:
+  if (interrupted(&deadline)) goto cancelled_out;
   snprintf(result->error, sizeof(result->error), "%s", store.error);
   goto done;
 sqlite_error:
