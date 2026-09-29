@@ -4949,6 +4949,35 @@ static int evidence_contains_ci(const char *haystack, const char *needle) {
   return 0;
 }
 
+static int evidence_text_has_high_signal(const EdrBehaviorRecord *r);
+static int evidence_has_priority_or_high_confidence_context(const EdrBehaviorRecord *r);
+
+/* This runtime-generated cache adds no command or target evidence. Limit the
+ * exclusion to the observed ordinary writer, exact system-profile object and
+ * non-destructive operations; never turn the surrounding directory into an
+ * evidence allowlist. P0 evaluation and upload policy are independent. */
+static int evidence_is_powershell_startup_cache_noise(const EdrBehaviorRecord *r) {
+  static const char object[] =
+      "\\windows\\system32\\config\\systemprofile\\appdata\\local\\microsoft"
+      "\\windows\\powershell\\startupprofiledata-noninteractive";
+  if (!r || (r->type != EDR_EVENT_FILE_WRITE && r->type != EDR_EVENT_FILE_CREATE) ||
+      r->priority == 0u || evidence_has_priority_or_high_confidence_context(r) ||
+      evidence_text_has_high_signal(r) ||
+      strlen(r->process_name) != strlen("powershell.exe") ||
+      !evidence_contains_ci(r->process_name, "powershell.exe")) {
+    return 0;
+  }
+  const char *path = r->file_path;
+  if (!isalpha((unsigned char)path[0]) || path[1] != ':' ||
+      strlen(path + 2) != sizeof(object) - 1u) return 0;
+  for (size_t i = 0; i < sizeof(object) - 1u; ++i) {
+    char c = (char)tolower((unsigned char)path[i + 2]);
+    if (c == '/') c = '\\';
+    if (c != object[i]) return 0;
+  }
+  return 1;
+}
+
 static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   if (!r || !is_file_event_type((uint32_t)r->type)) {
     return 0;
@@ -4956,6 +4985,9 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   const char *path = r->file_path[0] ? r->file_path : r->exe_path;
   if (!path || !path[0]) {
     return 0;
+  }
+  if (evidence_is_powershell_startup_cache_noise(r)) {
+    return 1;
   }
   if (evidence_contains_ci(path, ":WofCompressedData")) {
     return 1;

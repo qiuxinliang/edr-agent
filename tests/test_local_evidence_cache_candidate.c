@@ -1493,6 +1493,76 @@ static void test_incremental_cache_migration_recovers_from_blockers(void) {
   }
 }
 
+/* Real UTM failure: ordinary PowerShell startup-cache writes were attached
+ * to every active candidate despite adding no execution or target evidence. */
+static void test_startup_cache_context_filter_preserves_risk_and_boundaries(void) {
+  char db[512], candidate_id[160];
+  struct timespec ts;
+  EdrBehaviorRecord candidate, context;
+  EdrEvidenceCacheStatus before, after;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&candidate, 74121u);
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-startup-context");
+  snprintf(candidate.tenant_id, sizeof(candidate.tenant_id), "tenant-startup-context");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "startup-context-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.1.21");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_candidate_id_for_source_event(db, candidate.event_id, candidate_id, sizeof(candidate_id));
+  edr_local_evidence_cache_get_status(&before);
+  context = candidate;
+  context.type = EDR_EVENT_FILE_WRITE;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
+  snprintf(context.file_path, sizeof(context.file_path),
+      "C:\\WINDOWS\\system32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive");
+  for (unsigned i = 0; i < 32; ++i) {
+    context.event_time_ns++;
+    snprintf(context.event_id, sizeof(context.event_id), "startup-noise-%u", i);
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.context_facts_written == before.context_facts_written);
+  assert(after.context_refs_written == before.context_refs_written);
+  assert(after.records_skipped == before.records_skipped + 32u);
+  assert(sqlite_post_artifact_count(db, candidate_id, "startup-noise-0") == 0u);
+
+  /* Neither a matching basename nor an ordinary name establishes a blanket
+   * exclusion. Risk, another actor, another object and destructive operations
+   * must remain retrievable through the production materialized view. */
+  for (unsigned i = 0; i < 8; ++i) {
+    EdrBehaviorRecord keep = context;
+    keep.event_time_ns += 100u + i;
+    snprintf(keep.event_id, sizeof(keep.event_id), "startup-keep-%u", i);
+    switch (i) {
+      case 0: keep.priority = 0u; break;
+      case 1: snprintf(keep.detection_context, sizeof(keep.detection_context), "{\"severity\":\"P0\"}"); break;
+      case 2: snprintf(keep.cmdline, sizeof(keep.cmdline), "powershell.exe -EncodedCommand test"); break;
+      case 3: snprintf(keep.process_name, sizeof(keep.process_name), "other.exe"); break;
+      case 4: strcat(keep.file_path, ":payload"); break;
+      case 5: strcat(keep.file_path, ".ps1"); break;
+      case 6: keep.type = EDR_EVENT_FILE_DELETE; break;
+      case 7: snprintf(keep.file_path, sizeof(keep.file_path), "C:\\Other\\StartupProfileData-NonInteractive"); break;
+    }
+    edr_local_evidence_cache_record_behavior(&keep);
+    assert(sqlite_post_artifact_count(db, candidate_id, keep.event_id) == 1u);
+  }
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  for (unsigned i = 0; i < 8; ++i) {
+    char source[64];
+    snprintf(source, sizeof(source), "startup-keep-%u", i);
+    assert(sqlite_post_artifact_count(db, candidate_id, source) == 1u);
+  }
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_critical_context_distinct_events_exceed_legacy_fixed_limit(void) {
   char db[512];
   struct timespec ts;
@@ -5637,6 +5707,7 @@ int main(void) {
   test_post_context_exact_replay_charges_only_durable_changes();
   test_critical_context_high_fanout_is_atomically_bounded();
   test_incremental_cache_migration_recovers_from_blockers();
+  test_startup_cache_context_filter_preserves_risk_and_boundaries();
   test_critical_context_distinct_events_exceed_legacy_fixed_limit();
   test_critical_context_still_honors_database_capacity();
   test_incremental_reclaim_is_bounded_and_preserves_evidence();
