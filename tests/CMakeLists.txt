@@ -1179,6 +1179,8 @@ edr_apply_test_warnings(test_process_tree_cache)
 add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c

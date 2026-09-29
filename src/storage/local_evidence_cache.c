@@ -8,6 +8,7 @@
 #include "edr/sha256.h"
 #include "edr/time_util.h"
 #include "edr/windows_event_policy.h"
+#include "../preprocess/baseline_context.h"
 
 #include "cJSON.h"
 
@@ -4950,6 +4951,7 @@ static int evidence_contains_ci(const char *haystack, const char *needle) {
 }
 
 static int evidence_text_has_high_signal(const EdrBehaviorRecord *r);
+static int evidence_string_has_high_signal(const char *text);
 static int evidence_has_priority_or_high_confidence_context(const EdrBehaviorRecord *r);
 
 /* This runtime-generated cache adds no command or target evidence. Limit the
@@ -4962,7 +4964,10 @@ static int evidence_is_powershell_startup_cache_noise(const EdrBehaviorRecord *r
       "\\windows\\powershell\\startupprofiledata-noninteractive";
   if (!r || (r->type != EDR_EVENT_FILE_WRITE && r->type != EDR_EVENT_FILE_CREATE) ||
       r->priority == 0u || evidence_has_priority_or_high_confidence_context(r) ||
-      evidence_text_has_high_signal(r) ||
+      r->pmfe_snapshot[0] || r->cert_revoked_ancestor ||
+      r->collector_evidence_gate[0] || r->source_truncated_fields[0] ||
+      evidence_string_has_high_signal(r->cmdline) ||
+      evidence_string_has_high_signal(r->script_snippet) ||
       strlen(r->process_name) != strlen("powershell.exe") ||
       !evidence_contains_ci(r->process_name, "powershell.exe")) {
     return 0;
@@ -4974,6 +4979,28 @@ static int evidence_is_powershell_startup_cache_noise(const EdrBehaviorRecord *r
     char c = (char)tolower((unsigned char)path[i + 2]);
     if (c == '/') c = '\\';
     if (c != object[i]) return 0;
+  }
+  if (r->detection_context[0]) {
+    /* Decision metadata contains negative keys such as pmfe_scan:false.
+     * Consume their values through the baseline contract, not text tokens.
+     * Unknown contexts and any requested investigation keep the fact. */
+    cJSON *root = cJSON_Parse(r->detection_context);
+    const cJSON *quality = cJSON_GetObjectItemCaseSensitive(root, "event_quality");
+    const cJSON *score = cJSON_GetObjectItemCaseSensitive(quality, "score");
+    const cJSON *action = cJSON_GetObjectItemCaseSensitive(quality, "selection_action");
+    const cJSON *trigger = cJSON_GetObjectItemCaseSensitive(root, "detection_trigger");
+    int baseline = baseline_context_has_no_server_signal(root, 1) &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "suppressed")) &&
+        cJSON_IsNumber(score) && score->valuedouble == 32.0 &&
+        cJSON_IsString(action) &&
+        (strcmp(action->valuestring, "emit_context") == 0 ||
+         strcmp(action->valuestring, "local_only") == 0) &&
+        cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(trigger, "pmfe_scan")) &&
+        cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(trigger, "single_process_minidump")) &&
+        cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(trigger, "targeted_files")) &&
+        cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(trigger, "ioc_lookup"));
+    cJSON_Delete(root);
+    if (!baseline) return 0;
   }
   return 1;
 }
@@ -5049,7 +5076,7 @@ static int evidence_is_low_value_file_noise(const EdrBehaviorRecord *r) {
   return 0;
 }
 
-static int evidence_text_has_high_signal(const EdrBehaviorRecord *r) {
+static int evidence_string_has_high_signal(const char *text) {
   static const char *const tokens[] = {
       "encodedcommand", "-enc", "frombase64string", "invoke-expression", "iex ",
       "downloadstring", "downloadfile", "sekurlsa", "mimikatz", "ntdsutil",
@@ -5059,17 +5086,21 @@ static int evidence_text_has_high_signal(const EdrBehaviorRecord *r) {
       "add-mppreference", "set-mppreference", "disableantispyware",
       "ransom_counter=1", "webshell_candidate", "shellcode", "pmfe",
   };
-  if (!r) {
+  if (!text || !text[0]) {
     return 0;
   }
   for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
-    if (evidence_contains_ci(r->cmdline, tokens[i]) ||
-        evidence_contains_ci(r->script_snippet, tokens[i]) ||
-        evidence_contains_ci(r->detection_context, tokens[i])) {
+    if (evidence_contains_ci(text, tokens[i])) {
       return 1;
     }
   }
   return 0;
+}
+
+static int evidence_text_has_high_signal(const EdrBehaviorRecord *r) {
+  return r && (evidence_string_has_high_signal(r->cmdline) ||
+               evidence_string_has_high_signal(r->script_snippet) ||
+               evidence_string_has_high_signal(r->detection_context));
 }
 
 static int evidence_is_high_risk_port(uint32_t port) {

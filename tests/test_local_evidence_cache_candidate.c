@@ -1,5 +1,6 @@
 #include "edr/behavior_record.h"
 #include "edr/behavior_from_slot.h"
+#include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
@@ -1532,10 +1533,30 @@ static void test_startup_cache_context_filter_preserves_risk_and_boundaries(void
   assert(after.records_skipped == before.records_skipped + 32u);
   assert(sqlite_post_artifact_count(db, candidate_id, "startup-noise-0") == 0u);
 
+  /* The production decision adds negative metadata such as pmfe_scan=false.
+   * Its field names are not observed PMFE evidence. Exercise that real owner,
+   * not only an empty detection_context as in the first candidate test. */
+  snprintf(context.exe_path, sizeof(context.exe_path),
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline),
+      "powershell.exe -NoProfile -NonInteractive -Command Write-Output EDR_CACHE_CONTROL");
+  for (unsigned i = 0; i < 32; ++i) {
+    EdrDetectionDecision decision;
+    context.event_time_ns++;
+    snprintf(context.event_id, sizeof(context.event_id), "startup-decided-noise-%u", i);
+    edr_detection_decision_evaluate(&context, &decision);
+    assert(decision.suppress && decision.event_quality_score == 32u);
+    edr_local_evidence_cache_record_behavior(&context);
+  }
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.context_facts_written == before.context_facts_written);
+  assert(after.context_refs_written == before.context_refs_written);
+  assert(after.records_skipped == before.records_skipped + 64u);
+
   /* Neither a matching basename nor an ordinary name establishes a blanket
    * exclusion. Risk, another actor, another object and destructive operations
    * must remain retrievable through the production materialized view. */
-  for (unsigned i = 0; i < 8; ++i) {
+  for (unsigned i = 0; i < 21; ++i) {
     EdrBehaviorRecord keep = context;
     keep.event_time_ns += 100u + i;
     snprintf(keep.event_id, sizeof(keep.event_id), "startup-keep-%u", i);
@@ -1548,13 +1569,42 @@ static void test_startup_cache_context_filter_preserves_risk_and_boundaries(void
       case 5: strcat(keep.file_path, ".ps1"); break;
       case 6: keep.type = EDR_EVENT_FILE_DELETE; break;
       case 7: snprintf(keep.file_path, sizeof(keep.file_path), "C:\\Other\\StartupProfileData-NonInteractive"); break;
+      case 8: snprintf(keep.pmfe_snapshot, sizeof(keep.pmfe_snapshot), "observed memory evidence"); break;
+      case 9: snprintf(keep.script_snippet, sizeof(keep.script_snippet), "ransom_counter=1"); break;
+      case 10: keep.cert_revoked_ancestor = 1; break;
+      case 11: snprintf(keep.detection_context, sizeof(keep.detection_context), "{\"signals\":"); break;
+      case 12: snprintf(keep.detection_context, sizeof(keep.detection_context), "{}"); break;
+      case 13: case 14: case 15: case 16: case 17: case 18: {
+        cJSON *root = cJSON_Parse(keep.detection_context);
+        assert(root);
+        if (i == 13) cJSON_ReplaceItemInObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "signals"), "ransom_behavior", cJSON_CreateTrue());
+        if (i == 14) cJSON_ReplaceItemInObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "detection_trigger"), "pmfe_scan", cJSON_CreateTrue());
+        if (i == 15) cJSON_ReplaceItemInObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "ransom_control"), "tracking_saturated", cJSON_CreateTrue());
+        if (i == 16) cJSON_DeleteItemFromObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "signals"), "ransom_behavior");
+        if (i == 17) cJSON_ReplaceItemInObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "event_quality"), "score", cJSON_CreateNumber(80));
+        if (i == 18) cJSON_ReplaceItemInObjectCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(root, "ransom_control"), "phase", cJSON_CreateString("candidate"));
+        char *json = cJSON_PrintUnformatted(root);
+        assert(json && strlen(json) < sizeof(keep.detection_context));
+        snprintf(keep.detection_context, sizeof(keep.detection_context), "%s", json);
+        cJSON_free(json);
+        cJSON_Delete(root);
+        break;
+      }
+      case 19: snprintf(keep.source_truncated_fields, sizeof(keep.source_truncated_fields), "script_snippet"); break;
+      case 20: snprintf(keep.collector_evidence_gate, sizeof(keep.collector_evidence_gate), "pending"); break;
     }
     edr_local_evidence_cache_record_behavior(&keep);
     assert(sqlite_post_artifact_count(db, candidate_id, keep.event_id) == 1u);
   }
   edr_local_evidence_cache_close();
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  for (unsigned i = 0; i < 8; ++i) {
+  for (unsigned i = 0; i < 21; ++i) {
     char source[64];
     snprintf(source, sizeof(source), "startup-keep-%u", i);
     assert(sqlite_post_artifact_count(db, candidate_id, source) == 1u);
