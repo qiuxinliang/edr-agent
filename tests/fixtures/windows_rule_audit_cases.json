@@ -1584,6 +1584,127 @@
         "process_name": "powershell.exe",
         "cmdline": "powershell.exe -File report.ps1 -Command \"reg query HKLM\\SAM\""
       }
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -NoProfile -Command \"Add-MpPreference -ExclusionPath C:\\Owned -WhatIf\""
+      },
+      "expect_match": true,
+      "case_id": "defender_attempt",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "pwsh.exe -Command \"Set-MpPreference -DisableRealtimeMonitoring $true\""
+      },
+      "expect_match": true,
+      "case_id": "defender_set",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"Write-Output ok; Add-MpPreference -ExclusionPath C:\\Owned\""
+      },
+      "expect_match": true,
+      "case_id": "defender_after_statement",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "pwsh.exe -Command & 'Add-MpPreference' -ExclusionPath C:\\Owned"
+      },
+      "expect_match": true,
+      "case_id": "defender_call_operator",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"Write-Output 'Add-MpPreference -ExclusionPath C:\\Owned'\""
+      },
+      "expect_match": false,
+      "case_id": "defender_literal",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"$s='Add-MpPreference -ExclusionPath C:\\Owned'; Write-Output $s\""
+      },
+      "expect_match": false,
+      "case_id": "defender_assignment",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"Write-Output ok # Add-MpPreference -ExclusionPath C:\\Owned\""
+      },
+      "expect_match": false,
+      "case_id": "defender_comment",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "python.exe run.py \"Add-MpPreference -ExclusionPath C:\\Owned\""
+      },
+      "expect_match": false,
+      "case_id": "defender_argument",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"$p.Arguments='-Command Add-MpPreference -ExclusionPath C:\\Owned';$p.Start()\""
+      },
+      "expect_match": false,
+      "case_id": "defender_wrapper",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"function f { Add-MpPreference -ExclusionPath C:\\Owned }\""
+      },
+      "expect_match": false,
+      "case_id": "defender_function_not_invoked",
+      "scope": "command_invocation"
+    },
+    {
+      "rule_id": "R-MITRE-WIN-T1089",
+      "event": {
+        "event_type": "process_create",
+        "process_name": "powershell.exe",
+        "cmdline": "powershell.exe -Command \"$Add-MpPreference = 'ExclusionPath'\""
+      },
+      "expect_match": false,
+      "case_id": "defender_variable_name",
+      "scope": "command_invocation"
     }
   ]
 }

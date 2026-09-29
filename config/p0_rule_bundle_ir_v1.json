@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 3,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-39d48141",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-e2008650",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 180,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "4bda2ea66ccb471c5a68c5d668ec0884399b1770122eb587a64116cb3ab56368",
+  "sensor_interest_manifest_sha256": "2512aae4d7572c74d4c123af76dd202d1b3a465e7f0ab50c2d5c7c36322e63f3",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -2221,8 +2221,8 @@
       "description": "针对 ATT&CK 父技术「T1089」（Disabling Security Tools）的可疑行为检测；条件已相对收紧以降低误报，上线后仍建议按租户观察并微调。规则携带 server_routing：命中后须走服务端 AI，并作为 L1-L3 分析数据源。",
       "condition": {
         "command_regex_any": [
-          "(?i)Set-MpPreference.{0,80}DisableRealtimeMonitoring",
-          "(?i)Add-MpPreference.{0,80}ExclusionPath"
+          "(?i)^\\s*(?:(?:[a-z]:[\\\\/][^\\s\\x22\\x27;&|]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?|\\x22(?:[^\\x22\\r\\n]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?\\x22)(?:[ \\t]+-(?:nologo|noprofile|nop|noninteractive|noexit|sta|mta|(?:executionpolicy|ep|windowstyle|w)[ \\t]+[a-z]+))*[ \\t]+-(?:c|command)[ \\t]+\\x22?(?:(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[;&|\\r\\n]+|(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*#[^\\r\\n]*(?:\\r?\\n|$))[ \\t]*)*(?:&[ \\t]*\\{[ \\t]*)?(?:Add-MpPreference|&[ \\t]*[\\x22\\x27]?Add-MpPreference[\\x22\\x27]?)[ \\t]+(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[ \\t])?-ExclusionPath(?:[ \\t:]|$)",
+          "(?i)^\\s*(?:(?:[a-z]:[\\\\/][^\\s\\x22\\x27;&|]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?|\\x22(?:[^\\x22\\r\\n]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?\\x22)(?:[ \\t]+-(?:nologo|noprofile|nop|noninteractive|noexit|sta|mta|(?:executionpolicy|ep|windowstyle|w)[ \\t]+[a-z]+))*[ \\t]+-(?:c|command)[ \\t]+\\x22?(?:(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[;&|\\r\\n]+|(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*#[^\\r\\n]*(?:\\r?\\n|$))[ \\t]*)*(?:&[ \\t]*\\{[ \\t]*)?(?:Set-MpPreference|&[ \\t]*[\\x22\\x27]?Set-MpPreference[\\x22\\x27]?)[ \\t]+(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[ \\t])?-DisableRealtimeMonitoring(?:[ \\t:]|$)"
         ]
       }
     },

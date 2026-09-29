@@ -393,6 +393,23 @@ static void mark_suspicious(EdrWindowsEventPolicy *p, const char *reason, const 
   p->suspicious = 1u;
 }
 
+static int registry_hive_file_path(const char *path) {
+  static const char *const hives[] = {
+      "\\config\\sam", "\\config\\system", "\\config\\security", "\\config\\software"};
+  if (!path) return 0;
+  for (size_t i=0; i<sizeof(hives)/sizeof(hives[0]); i++) {
+    size_t n=strlen(hives[i]);
+    for (const char *at=path; *at; at++) {
+      size_t j=0;
+      while (j<n && at[j] && fold_char(at[j])==hives[i][j]) j++;
+      /* SYSTEMprofile and SAMple are directories, not hive files. Retain
+       * hive logs, backups and alternate streams as sensitive evidence. */
+      if (j==n && (!at[n] || at[n]=='.' || at[n]==':')) return 1;
+    }
+  }
+  return 0;
+}
+
 static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) {
   const char *path = r->file_path[0] ? r->file_path : r->exe_path;
   static const char *const web_roots[] = {
@@ -436,8 +453,7 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       "\\windowsapps\\",
   };
   static const char *const cred_files[] = {
-      "\\ntds.dit", "\\config\\sam", "\\config\\system", "\\config\\security",
-      "\\config\\software", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
+      "\\ntds.dit", "lsass.dmp", "\\lsass", "\\sam.save", "\\system.save",
   };
   if (r->file_path[0] && !file_path_usable_for_policy(r->file_path)) {
     mark_noisy(p, "invalid_file_path_metadata", "metadata_only");
@@ -509,7 +525,7 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     return;
   }
 
-  if (any_contains(path, cred_files, sizeof(cred_files) / sizeof(cred_files[0]))) {
+  if (registry_hive_file_path(path) || any_contains(path, cred_files, sizeof(cred_files) / sizeof(cred_files[0]))) {
     mark_suspicious(p, "credential_store_or_dump_path", "credential_access");
   }
   if (any_contains(path, web_roots, sizeof(web_roots) / sizeof(web_roots[0]))) {

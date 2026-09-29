@@ -45,6 +45,15 @@ static void test_uncombined_tool_file_upload(void) {
   assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
   assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
 
+  /* Frozen UTM failure: SYSTEMprofile matched the SYSTEM hive prefix and
+   * bypassed the already supported uncombined-tool admission decision. */
+  strcpy(r.file_path, "C:\\WINDOWS\\system32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Windows\\System32\\config\\SYSTEM");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Users\\alice\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive");
+
   /* Identity, attribution, diagnostics and sensitive targets still upload. */
   r.process_start_key = 0u;
   assert(edr_preprocess_upload_admit(&r, &d, 1, 0));

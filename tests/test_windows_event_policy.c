@@ -523,8 +523,29 @@ static void test_policy_status_marks_overlong_drop_context(void) {
   assert(strcmp(st.last_drop_cmdline, "<overlong>") == 0);
 }
 
+static void test_registry_hive_path_boundary(void) {
+  static const char *const paths[] = {
+      "C:\\WINDOWS\\system32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\PowerShell\\StartupProfileData-NonInteractive",
+      "C:\\Windows\\System32\\config\\SYSTEM",
+      "C:/Windows/System32/config/SYSTEM.LOG1",
+      "\\Device\\HarddiskVolume3\\Windows\\System32\\config\\SAM",
+      "C:\\Windows\\System32\\config\\SECURITY.sav",
+      "C:\\Windows\\System32\\config\\SOFTWARE:stream",
+      "C:\\Windows\\System32\\config\\SAMple\\data.txt",
+  };
+  for (size_t i=0; i<sizeof(paths)/sizeof(paths[0]); i++) {
+    EdrBehaviorRecord r; EdrWindowsEventPolicy p;
+    init_record(&r, EDR_EVENT_FILE_WRITE);
+    snprintf(r.file_path,sizeof(r.file_path),"%s",paths[i]);
+    edr_windows_event_policy_evaluate(&r,&p);
+    if (i==0 || i==6) { assert(!p.high_value); assert(!p.suspicious); }
+    else { assert(p.high_value); assert(p.suspicious); assert(p.should_persist); }
+  }
+}
+
 int main(void) {
   edr_windows_event_policy_configure(NULL);
+  test_registry_hive_path_boundary();
   test_webshell_path_is_high_signal();
   test_browser_cache_stays_ring_only();
   test_initial_access_artifact_is_suspicious();
