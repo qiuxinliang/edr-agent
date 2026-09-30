@@ -287,7 +287,14 @@ int response_mkdir_p(const char *path) {
     return -1;
   }
   memcpy(tmp, path, n + 1u);
-  for (char *p = tmp + 1; *p; p++) {
+  char *first = tmp + 1;
+#ifdef _WIN32
+  /* C: is drive-relative; attempting to create it can target the drive root
+   * when the caller's working directory is on another drive. */
+  if (n >= 3u && isalpha((unsigned char)tmp[0]) && tmp[1] == ':' &&
+      (tmp[2] == '/' || tmp[2] == '\\')) first = tmp + 3;
+#endif
+  for (char *p = first; *p; p++) {
     if (*p == '/' || *p == '\\') {
       char bak = *p;
       *p = '\0';

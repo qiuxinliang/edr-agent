@@ -192,13 +192,17 @@ static void test_enqueue_failures(void) {
   setup("enqueue"); char path[1200]; pending_path(path, sizeof(path), "cmd_queue");
   fail_fdopen = 1;
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") != 0 && !exists(path));
+  assert(fail_fdopen == 0);
   assert(temporary_files() == 0u);
   fail_flush = 1;
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") != 0 && !exists(path));
+  assert(fail_flush == 0);
   fail_close = 1;
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") != 0 && !exists(path));
+  assert(fail_close == 0 && close_after_flush == 0);
   fail_publish = 1;
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") != 0 && !exists(path));
+  assert(fail_publish == 0);
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") == 0 && exists(path));
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "manifest") == 0);
   assert(edr_command_upload_outbox_write_legacy("cmd_queue", bundle, sha, "conflict") != 0);
@@ -341,6 +345,15 @@ int main(void) {
 #ifdef _WIN32
   char temp[MAX_PATH]; assert(GetTempPathA(sizeof(temp), temp));
   assert(GetTempFileNameA(temp, "euo", 0, root)); assert(DeleteFileA(root)); make_dir(root);
+  char original_cwd[MAX_PATH];
+  DWORD cwd_size = GetCurrentDirectoryA(sizeof(original_cwd), original_cwd);
+  assert(cwd_size > 0 && cwd_size < sizeof(original_cwd));
+  /* Reproduce a drive-relative C: resolving to its root regardless of whether
+   * this CI worker normally checks out on C: or another drive. */
+  if (root[1] == ':' && (root[2] == '\\' || root[2] == '/')) {
+    char drive_root[] = {root[0], ':', '\\', 0};
+    assert(SetCurrentDirectoryA(drive_root));
+  }
 #else
   snprintf(root, sizeof(root), "%s/edr-upload-outbox.XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
   assert(mkdtemp(root));
@@ -351,5 +364,8 @@ int main(void) {
   test_rename_retry(); test_receipt_failure(); test_terminal_commit_before_receipt_failure();
   test_readable_terminal_is_not_a_durable_commit(); test_failure_receipt_survives_artifact_recovery();
   test_bad_records_do_not_spend_upload_budget(); test_hash_and_missing_terminal();
+#ifdef _WIN32
+  assert(SetCurrentDirectoryA(original_cwd));
+#endif
   puts("forensic upload outbox contract passed"); return 0;
 }
