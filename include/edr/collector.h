@@ -79,6 +79,18 @@ typedef enum {
     EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT
 } EdrFileWriteUnresolvedReason;
 
+/* Disjoint refinements of NO_LIFETIME only. Same PID without a verified
+ * StartKey/lifetime is explicitly unproven, never self-filter authority. */
+typedef enum {
+    EDR_FILE_WRITE_NO_LIFETIME_SELF_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_SELF_NO_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_SELF_PID_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_SELF_PID_NO_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_OTHER_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_OTHER_NO_OBJECT,
+    EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT
+} EdrFileWriteNoLifetimeReason;
+
 typedef struct {
     int etw_or_inotify_enabled;
     int powershell_visible;
@@ -120,6 +132,16 @@ typedef struct {
     int disposition_accounting_available;
     uint64_t collector_drop_reasons[EDR_COLLECTOR_DROP_REASON_COUNT];
     uint64_t file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT];
+    uint64_t file_write_no_lifetime_reasons[EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT];
+    /* Bounded object-history snapshot, exposed only during a diagnostic lease.
+     * Open entries include quarantined paths, reported separately below. */
+    int file_object_history_available;
+    uint64_t file_object_history_capacity;
+    uint64_t file_object_history_open_paths;
+    uint64_t file_object_history_open_unusable;
+    uint64_t file_object_history_closed_lifetimes;
+    uint64_t file_object_history_close_boundaries;
+    uint64_t file_object_history_evictions;
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;
     uint64_t agent_self_direct_pid_suppressed;

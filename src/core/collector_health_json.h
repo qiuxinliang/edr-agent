@@ -8,7 +8,7 @@
 /* Private fragment shared by basic/detailed health and its wire-contract test.
  * Both totals come from the collector snapshot, never from a cross-stage delta. */
 static inline int edr_collector_health_json(const EdrCollectorHealth *health,
-                                           char *out, size_t capacity) {
+                                           int diagnostic, char *out, size_t capacity) {
   static const char *const drop_names[EDR_COLLECTOR_DROP_REASON_COUNT] = {
       "slot_admission_rejected", "sensor_interest_rejected", "security_render_failed",
       "security_event_unsupported", "security_required_overflow"};
@@ -16,6 +16,10 @@ static inline int edr_collector_health_json(const EdrCollectorHealth *health,
       "invalid_event", "missing_file_key_or_schema", "actor_unavailable",
       "file_key_ambiguous", "binding_conflict", "history_discarded", "lifetime_ended",
       "path_unavailable", "object_conflict", "unknown_boundary", "no_retained_lifetime"};
+  static const char *const no_lifetime_names[EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT] = {
+      "verified_self_object_available", "verified_self_object_unavailable",
+      "same_pid_unverified_object_available", "same_pid_unverified_object_unavailable",
+      "other_pid_object_available", "other_pid_object_unavailable"};
   size_t used = 0u;
   int n;
   if (!health || !out || !capacity) return -1;
@@ -45,7 +49,26 @@ static inline int edr_collector_health_json(const EdrCollectorHealth *health,
   for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i)
     EDR_COLLECTOR_JSON_APPEND("%s\"%s\":%llu", i ? "," : "", unresolved_names[i],
         (unsigned long long)health->file_write_unresolved_reasons[i]);
-  EDR_COLLECTOR_JSON_APPEND("}}},");
+  EDR_COLLECTOR_JSON_APPEND("}}");
+  if (diagnostic) {
+    EDR_COLLECTOR_JSON_APPEND(
+        ",\"no_lifetime_diagnostics\":{\"available\":%s,\"unit\":\"file_write_callbacks\",\"reasons\":{",
+        health->disposition_accounting_available ? "true" : "false");
+    for (size_t i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i)
+      EDR_COLLECTOR_JSON_APPEND("%s\"%s\":%llu", i ? "," : "", no_lifetime_names[i],
+          (unsigned long long)health->file_write_no_lifetime_reasons[i]);
+    EDR_COLLECTOR_JSON_APPEND(
+        "}},\"object_history\":{\"available\":%s,\"capacity\":%llu,\"open_paths\":%llu,"
+        "\"open_unusable\":%llu,\"closed_lifetimes\":%llu,\"close_boundaries\":%llu,\"evictions\":%llu}",
+        health->file_object_history_available ? "true" : "false",
+        (unsigned long long)health->file_object_history_capacity,
+        (unsigned long long)health->file_object_history_open_paths,
+        (unsigned long long)health->file_object_history_open_unusable,
+        (unsigned long long)health->file_object_history_closed_lifetimes,
+        (unsigned long long)health->file_object_history_close_boundaries,
+        (unsigned long long)health->file_object_history_evictions);
+  }
+  EDR_COLLECTOR_JSON_APPEND("},");
 #undef EDR_COLLECTOR_JSON_APPEND
   return 0;
 }

@@ -55,6 +55,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #ifdef EDR_COLLECTOR_NETWORK_TESTING
 #include "collector_network_test.h"
 /* Only external process I/O is replaced; binding, filtering and encoding
@@ -116,6 +117,7 @@ static void edr_collector_note_drop(EdrCollectorDropReason reason) {
 }
 
 static void edr_collector_disposition_snapshot(EdrCollectorHealth *out) {
+  uint64_t no_lifetime = 0u;
   out->disposition_accounting_available = 1;
   out->collector_dropped = 0u;
   out->file_write_path_unresolved = 0u;
@@ -124,9 +126,15 @@ static void edr_collector_disposition_snapshot(EdrCollectorHealth *out) {
         (volatile LONG64 *)&s_health.collector_drop_reasons[i], 0, 0);
     out->collector_dropped += out->collector_drop_reasons[i];
   }
+  for (size_t i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i) {
+    out->file_write_no_lifetime_reasons[i] = (uint64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)&s_health.file_write_no_lifetime_reasons[i], 0, 0);
+    no_lifetime += out->file_write_no_lifetime_reasons[i];
+  }
   for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i) {
-    out->file_write_unresolved_reasons[i] = (uint64_t)InterlockedCompareExchange64(
-        (volatile LONG64 *)&s_health.file_write_unresolved_reasons[i], 0, 0);
+    out->file_write_unresolved_reasons[i] = i == EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME
+        ? no_lifetime : (uint64_t)InterlockedCompareExchange64(
+            (volatile LONG64 *)&s_health.file_write_unresolved_reasons[i], 0, 0);
     out->file_write_path_unresolved += out->file_write_unresolved_reasons[i];
   }
 }
@@ -337,6 +345,27 @@ static SRWLOCK s_policy_canary_lock = SRWLOCK_INIT;
 #ifdef EDR_COLLECTOR_FILE_IO_TESTING
 static uint64_t s_policy_canary_test_now_ns;
 #endif
+
+static void edr_collector_file_object_history_snapshot(EdrCollectorHealth *out) {
+  out->file_object_history_available = 1;
+  out->file_object_history_capacity = EDR_COLLECTOR_FILE_OBJECT_CACHE;
+  out->file_object_history_open_paths = 0u;
+  out->file_object_history_open_unusable = 0u;
+  out->file_object_history_closed_lifetimes = 0u;
+  out->file_object_history_close_boundaries = 0u;
+  AcquireSRWLockShared(&s_file_key_cache_lock);
+  out->file_object_history_evictions = s_file_object_history.evictions;
+  for (size_t i = 0u; i < EDR_COLLECTOR_FILE_OBJECT_CACHE; ++i) {
+    const EdrFileObjectBinding *entry = &s_file_object_cache[i];
+    if (!entry->object) continue;
+    if (!entry->opened_at) out->file_object_history_close_boundaries++;
+    else if (entry->closed_at) out->file_object_history_closed_lifetimes++;
+    else if (entry->status == EDR_FILE_OBJECT_RESOLVED && entry->path[0])
+      out->file_object_history_open_paths++;
+    else out->file_object_history_open_unusable++;
+  }
+  ReleaseSRWLockShared(&s_file_key_cache_lock);
+}
 #define EDR_ETW_SEMANTIC_CACHE_SIZE 256u
 
 typedef struct {
@@ -464,6 +493,23 @@ static int edr_tdh_field_contains(const TRACE_EVENT_INFO *info, ULONG info_size,
     }
   }
   return 0;
+}
+
+static void edr_collector_note_write_no_lifetime(const EVENT_RECORD *record,
+                                                uint64_t event_ns,
+                                                uint64_t file_object) {
+  uint64_t start_key = 0u;
+  EdrFileWriteNoLifetimeReason reason = EDR_FILE_WRITE_NO_LIFETIME_OTHER_OBJECT;
+  if (s_agent_self_identity.pid && record->EventHeader.ProcessId == s_agent_self_identity.pid) {
+    (void)edr_collector_event_process_start_key(record, &start_key);
+    reason = edr_collector_self_identity_matches(&s_agent_self_identity,
+                                                 record->EventHeader.ProcessId, start_key) &&
+             edr_process_generation_contains_event(s_agent_self_identity.creation_filetime_100ns,
+                                                    event_ns)
+        ? EDR_FILE_WRITE_NO_LIFETIME_SELF_OBJECT : EDR_FILE_WRITE_NO_LIFETIME_SELF_PID_OBJECT;
+  }
+  if (!file_object) reason = (EdrFileWriteNoLifetimeReason)(reason + 1);
+  InterlockedIncrement64((volatile LONG64 *)&s_health.file_write_no_lifetime_reasons[reason]);
 }
 
 static int edr_tdh_info_contains(const TRACE_EVENT_INFO *info, ULONG info_size,
@@ -4259,7 +4305,10 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     if (ty == EDR_EVENT_FILE_WRITE) {
       /* A kernel pointer is not a path. Missing/ambiguous name lifetimes
        * cannot create a ransomware mutation or borrow the NameCreate actor. */
-      InterlockedIncrement64((volatile LONG64 *)&s_health.file_write_unresolved_reasons[file_write_failure]);
+      if (file_write_failure == EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME)
+        edr_collector_note_write_no_lifetime(event_record, timestamp_ns, file_write_object);
+      else
+        InterlockedIncrement64((volatile LONG64 *)&s_health.file_write_unresolved_reasons[file_write_failure]);
       uint64_t count = (uint64_t)InterlockedIncrement64(
           (volatile LONG64 *)&s_health.file_write_path_unresolved);
       if (count <= 3u || (count & (count - 1u)) == 0u) {
@@ -4516,6 +4565,7 @@ int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
 void edr_collector_file_io_test_health(EdrCollectorHealth *health) {
   *health = s_health;
   edr_collector_disposition_snapshot(health);
+  edr_collector_file_object_history_snapshot(health);
   edr_collector_file_read_metadata_gate_copy_health(health);
 }
 
@@ -5144,6 +5194,11 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   edr_network_trace_flush();
   *out_health = s_health;
   edr_collector_disposition_snapshot(out_health);
+  if (s_collector_cfg && s_collector_cfg->health_monitor.enabled &&
+      strcmp(s_collector_cfg->health_monitor.profile, "diagnostic") == 0 &&
+      (!s_collector_cfg->health_monitor.expires_at_unix_ms ||
+       (uint64_t)time(NULL) * 1000ULL < s_collector_cfg->health_monitor.expires_at_unix_ms))
+    edr_collector_file_object_history_snapshot(out_health);
   edr_collector_file_read_metadata_gate_copy_health(out_health);
   /* Historical self-fuse fields stay zero for health-wire compatibility;
    * event-derived descendant suppression and its fuse no longer exist. */

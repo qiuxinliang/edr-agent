@@ -26,7 +26,7 @@ static uint64_t reasons(const cJSON *accounting, int available, const char *unit
   return total;
 }
 
-static void test_snapshot(int available) {
+static void test_snapshot(int available, int diagnostic) {
   static const char *const drops[] = {
       "slot_admission_rejected", "sensor_interest_rejected", "security_render_failed",
       "security_event_unsupported", "security_required_overflow"};
@@ -34,6 +34,10 @@ static void test_snapshot(int available) {
       "invalid_event", "missing_file_key_or_schema", "actor_unavailable",
       "file_key_ambiguous", "binding_conflict", "history_discarded", "lifetime_ended",
       "path_unavailable", "object_conflict", "unknown_boundary", "no_retained_lifetime"};
+  static const char *const no_lifetime[] = {
+      "verified_self_object_available", "verified_self_object_unavailable",
+      "same_pid_unverified_object_available", "same_pid_unverified_object_unavailable",
+      "other_pid_object_available", "other_pid_object_unavailable"};
   EdrCollectorHealth health = {0};
   health.disposition_accounting_available = available;
   health.queue_dropped = 7u;
@@ -47,11 +51,20 @@ static void test_snapshot(int available) {
     health.file_write_unresolved_reasons[i] = available ? i + 11u : 0u;
     health.file_write_path_unresolved += health.file_write_unresolved_reasons[i];
   }
+  for (size_t i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i)
+    health.file_write_no_lifetime_reasons[i] = available ? i + 1u : 0u;
+  health.file_object_history_available = available;
+  health.file_object_history_capacity = 4096u;
+  health.file_object_history_open_paths = 3u;
+  health.file_object_history_open_unusable = 2u;
+  health.file_object_history_closed_lifetimes = 5u;
+  health.file_object_history_close_boundaries = 7u;
+  health.file_object_history_evictions = 13u;
   /* Platforms without these reasons preserve their existing totals and
    * explicitly refuse the complete-reason-accounting interpretation. */
   if (!available) health.collector_dropped = 31u;
-  char fragment[2048], document[2100];
-  assert(edr_collector_health_json(&health, fragment, sizeof(fragment)) == 0);
+  char fragment[4096], document[4150];
+  assert(edr_collector_health_json(&health, diagnostic, fragment, sizeof(fragment)) == 0);
   assert(snprintf(document, sizeof(document), "{%s\"end\":true}", fragment) > 0);
   cJSON *parsed = cJSON_Parse(document);
   assert(parsed && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(parsed, "end")));
@@ -67,20 +80,36 @@ static void test_snapshot(int available) {
   total = reasons(cJSON_GetObjectItemCaseSensitive(writes, "unresolved_accounting"),
       available, "file_write_callbacks", failures, sizeof(failures) / sizeof(failures[0]));
   assert(total == health.file_write_path_unresolved);
+  const cJSON *detail = cJSON_GetObjectItemCaseSensitive(writes, "no_lifetime_diagnostics");
+  const cJSON *history = cJSON_GetObjectItemCaseSensitive(writes, "object_history");
+  if (diagnostic) {
+    total = reasons(detail, available, "file_write_callbacks", no_lifetime,
+                    sizeof(no_lifetime) / sizeof(no_lifetime[0]));
+    assert(total == health.file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME]);
+    assert(cJSON_IsObject(history));
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(history, "available")) == available);
+    assert(number(history, "capacity") == 4096u && number(history, "open_paths") == 3u);
+    assert(number(history, "open_unusable") == 2u && number(history, "closed_lifetimes") == 5u);
+    assert(number(history, "close_boundaries") == 7u && number(history, "evictions") == 13u);
+  } else assert(!detail && !history);
   cJSON_Delete(parsed);
   char small[16];
-  assert(edr_collector_health_json(&health, small, sizeof(small)) == -1 && !small[0]);
+  assert(edr_collector_health_json(&health, diagnostic, small, sizeof(small)) == -1 && !small[0]);
   /* Counter width cannot overflow the shared production fragment buffer. */
   for (size_t i = 0u; i < EDR_COLLECTOR_DROP_REASON_COUNT; ++i)
     health.collector_drop_reasons[i] = UINT64_MAX;
   for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i)
     health.file_write_unresolved_reasons[i] = UINT64_MAX;
-  assert(edr_collector_health_json(&health, fragment, sizeof(fragment)) == 0);
+  for (size_t i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i)
+    health.file_write_no_lifetime_reasons[i] = UINT64_MAX;
+  assert(edr_collector_health_json(&health, diagnostic, fragment, sizeof(fragment)) == 0);
 }
 
 int main(void) {
-  test_snapshot(1);
-  test_snapshot(0);
+  test_snapshot(1, 0);
+  test_snapshot(0, 0);
+  test_snapshot(1, 1);
+  test_snapshot(0, 1);
   puts("collector health disposition JSON contract passed");
   return 0;
 }

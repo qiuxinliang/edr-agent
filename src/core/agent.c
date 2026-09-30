@@ -2364,11 +2364,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
-  char collector_health_json[2048];
-  if (edr_collector_health_json(&ch, collector_health_json, sizeof(collector_health_json)) != 0) {
-    fprintf(stderr, "[health] collector disposition counters exceed JSON buffer\n");
-    return;
-  }
+  char collector_health_json[4096];
   edr_parent_enrichment_get_metrics(&parent_metrics);
   edr_pt_cache_get_metrics(&process_cache_metrics);
   edr_process_coalescer_get_metrics(&process_coalescer_metrics);
@@ -2398,6 +2394,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   json_escape_small(agent->cfg.health_monitor.request_id, health_request_id, sizeof(health_request_id));
   if (!monitor_lease_active) {
     snprintf(health_profile, sizeof(health_profile), "%s", "basic");
+  }
+  if (edr_collector_health_json(&ch, strcmp(health_profile, "diagnostic") == 0,
+                              collector_health_json, sizeof(collector_health_json)) != 0) {
+    fprintf(stderr, "[health] collector disposition counters exceed JSON buffer\n");
+    return;
   }
   json_escape_small(agent->cfg.preprocessing.rules_version, rules_ver, sizeof(rules_ver));
   runtime_policy_raw[0] = '\0';

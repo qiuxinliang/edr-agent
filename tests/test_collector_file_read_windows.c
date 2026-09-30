@@ -643,6 +643,98 @@ static void test_concurrent_canary_registration(void) {
   edr_collector_file_io_test_canary_clock(0u);
 }
 
+static void test_no_lifetime_diagnostics(unsigned version, size_t width) {
+  Fixture write, create, close;
+  const uint64_t object = 0x721101u, key = 0x721102u;
+  case_version = version; case_width = width;
+  reset("write_no_lifetime_identity_object_matrix");
+  for (unsigned actor = 0u; actor < 3u; ++actor) {
+    for (unsigned missing_object = 0u; missing_object < 2u; ++missing_object) {
+      EdrLiveProcessGeneration self = {
+          actor == 2u ? 99999u : reader_pid, UINT64_C(0x7211), UINT64_C(116444736000000001)};
+      edr_collector_file_io_test_self_identity(&self);
+      make_event(&write, 16u, version, width, missing_object ? 0u : object, key, NULL);
+      EVENT_HEADER_EXTENDED_DATA_ITEM extended;
+      memset(&extended, 0, sizeof(extended));
+      extended.ExtType = 13u; extended.DataSize = sizeof(self.process_start_key);
+      extended.DataPtr = (ULONGLONG)(ULONG_PTR)&self.process_start_key;
+      if (actor == 0u) { write.record.ExtendedData = &extended; write.record.ExtendedDataCount = 1u; }
+      feed(&write, 150u);
+      EdrCollectorHealth h;
+      edr_collector_file_io_test_health(&h);
+      unsigned added = actor * 2u + missing_object;
+      assert(h.file_write_path_unresolved == added + 1u);
+      assert(h.file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME] == added + 1u);
+      for (unsigned i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i)
+        assert(h.file_write_no_lifetime_reasons[i] == (i <= added ? 1u : 0u));
+      assert(!bus.published && !h.collector_dropped);
+    }
+  }
+  for (unsigned mode = 0u; mode < 2u; ++mode) {
+    reset(mode ? "write_prebirth_not_verified_self" : "write_conflicting_key_not_verified_self");
+    EdrLiveProcessGeneration self = {reader_pid, 0x7211u,
+        mode ? UINT64_C(116444736000000002) : UINT64_C(116444736000000001)};
+    edr_collector_file_io_test_self_identity(&self);
+    make_event(&write, 16u, version, width, object, key, NULL);
+    uint64_t event_key = mode ? self.process_start_key : 0x9999u;
+    EVENT_HEADER_EXTENDED_DATA_ITEM extended;
+    memset(&extended, 0, sizeof(extended));
+    extended.ExtType = 13u; extended.DataSize = sizeof(event_key);
+    extended.DataPtr = (ULONGLONG)(ULONG_PTR)&event_key;
+    write.record.ExtendedData = &extended; write.record.ExtendedDataCount = 1u;
+    feed(&write, 150u);
+    EdrCollectorHealth h; edr_collector_file_io_test_health(&h);
+    assert(h.file_write_no_lifetime_reasons[EDR_FILE_WRITE_NO_LIFETIME_SELF_PID_OBJECT] == 1u);
+    assert(!h.file_write_no_lifetime_reasons[EDR_FILE_WRITE_NO_LIFETIME_SELF_OBJECT]);
+  }
+  reset("object_history_occupancy_partition");
+  make_event(&create, 12u, version, width, object, 0u, old_name); feed(&create, 100u);
+  make_event(&create, 12u, version, width, object + 1u, 0u, old_name); feed(&create, 110u);
+  make_event(&close, 14u, version, width, object + 1u, key, NULL); feed(&close, 200u);
+  make_event(&create, 12u, version, width, object + 2u, 0u, old_name); feed(&create, 120u);
+  make_event(&create, 12u, version, width, object + 2u, 0u, new_name); feed(&create, 120u);
+  EdrCollectorHealth h; edr_collector_file_io_test_health(&h);
+  assert(h.file_object_history_available && h.file_object_history_capacity == 4096u);
+  assert(h.file_object_history_open_paths == 1u && h.file_object_history_open_unusable == 1u);
+  assert(h.file_object_history_closed_lifetimes == 1u && h.file_object_history_close_boundaries == 1u);
+  assert(!h.file_object_history_evictions);
+}
+
+static DWORD WINAPI concurrent_no_lifetime_failures(void *context) {
+  for (unsigned i = 0u; i < 1000u; ++i) feed((Fixture *)context, 150u);
+  return 0u;
+}
+
+static void test_concurrent_no_lifetime_snapshot(void) {
+  Fixture write;
+  HANDLE workers[4];
+  reset("write_no_lifetime_snapshot_during_concurrent_decode");
+  make_event(&write, 16u, 1u, 8u, 0u, 0x721102u, NULL);
+  for (size_t i = 0u; i < 4u; ++i) {
+    workers[i] = CreateThread(NULL, 0u, concurrent_no_lifetime_failures, &write, 0u, NULL);
+    assert(workers[i]);
+  }
+  uint64_t deadline = GetTickCount64() + 30000u;
+  DWORD wait;
+  do {
+    EdrCollectorHealth h;
+    edr_collector_file_io_test_health(&h);
+    uint64_t total = 0u;
+    for (size_t i = 0u; i < EDR_FILE_WRITE_NO_LIFETIME_REASON_COUNT; ++i)
+      total += h.file_write_no_lifetime_reasons[i];
+    assert(total == h.file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME]);
+    assert(total == h.file_write_path_unresolved);
+    wait = WaitForMultipleObjects(4u, workers, TRUE, 0u);
+    assert(wait == WAIT_OBJECT_0 || wait == WAIT_TIMEOUT);
+    assert(GetTickCount64() <= deadline);
+    if (wait == WAIT_TIMEOUT) Sleep(1u);
+  } while (wait == WAIT_TIMEOUT);
+  for (size_t i = 0u; i < 4u; ++i) assert(CloseHandle(workers[i]));
+  EdrCollectorHealth h; edr_collector_file_io_test_health(&h);
+  assert(h.file_write_path_unresolved == 4000u);
+  assert(h.file_write_no_lifetime_reasons[EDR_FILE_WRITE_NO_LIFETIME_OTHER_NO_OBJECT] == 4000u);
+}
+
 int main(void) {
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "[fixture] native collector diagnostic build; no ETW consumer is started, "
@@ -658,9 +750,12 @@ int main(void) {
     test_write_accounting(version, 8u);
     test_canary_processing_time(version, 4u);
     test_canary_processing_time(version, 8u);
+    test_no_lifetime_diagnostics(version, 4u);
+    test_no_lifetime_diagnostics(version, 8u);
   }
   test_concurrent_write_accounting();
   test_concurrent_canary_registration();
+  test_concurrent_no_lifetime_snapshot();
   /* A long-lived Agent handle can have no retained Create or NameCreate.
    * Suppress only the proven live Agent generation before it opens a P0 gate. */
   reset("self_unbound_read_does_not_open_gate");
