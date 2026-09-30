@@ -114,6 +114,13 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
   return 0;
 }
 
+int edr_command_state_finish_once(const char *command_id, const char *command_type,
+    const EdrSoarCommandMeta *meta, const char *response_status, int execution_status,
+    int exit_code, const char *detail, const char *artifacts, int report_pending) {
+  return edr_command_state_finish(command_id, command_type, meta, response_status,
+                                  execution_status, exit_code, detail, artifacts, report_pending);
+}
+
 void edr_command_state_delete_inbox(const char *command_id) { (void)command_id; }
 
 const char *edr_command_normalize_forensic_result(const char *command_type,

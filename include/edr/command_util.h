@@ -31,6 +31,12 @@ int edr_command_emit_always_typed_status(const char *cmd_id, const char *command
                                           const EdrSoarCommandMeta *sm,
                                           EdrCommandExecutionStatus st, int exit_code,
                                           const char *detail, const char *response_status);
+/* Same normalization/cancellation owner, with atomic duplicate terminal handling.
+ * Return values match edr_command_state_finish_once. */
+int edr_command_emit_always_typed_status_once(const char *cmd_id, const char *command_type,
+    const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st, int exit_code,
+    const char *detail, const char *response_status);
+
 void edr_command_emit_always(const char *cmd_id, const EdrSoarCommandMeta *sm,
                              EdrCommandExecutionStatus st, int exit_code, const char *detail);
 

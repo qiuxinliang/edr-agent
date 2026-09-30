@@ -7,11 +7,13 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <windows.h>
 #define TEST_PID _getpid()
 static void test_setenv(const char *name, const char *value) { _putenv_s(name, value); }
 #else
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
 #define TEST_PID getpid()
 static void test_setenv(const char *name, const char *value) { setenv(name, value, 1); }
 #endif
@@ -59,6 +61,71 @@ static int only_velo(const char *command_type, void *user) {
   return command_type && strcmp(command_type, "velo_query") == 0;
 }
 
+typedef struct OnceProbe { int rc; } OnceProbe;
+#ifdef _WIN32
+static DWORD WINAPI once_probe(void *opaque) {
+#else
+static void *once_probe(void *opaque) {
+#endif
+  OnceProbe *probe = (OnceProbe *)opaque;
+  probe->rc = edr_command_state_finish_once("cmd-once-concurrent", "collect_forensic", NULL,
+      "ok", 1, 0, "same durable artifact hash and key", "", 1);
+#ifdef _WIN32
+  return 0;
+#else
+  return NULL;
+#endif
+}
+
+static void verify_once_terminals(void) {
+  const char *detail = "artifact sha and object key";
+  require_true(edr_command_state_finish_once("cmd-once", "collect_forensic", NULL,
+      "ok", 1, 0, detail, "", 1) == 0, "first terminal once commit");
+  require_true(edr_command_state_finish_once("cmd-once", "collect_forensic", NULL,
+      "ok", 1, 0, detail, "", 1) == 1, "identical terminal is recognized");
+  EdrCommandStateRecord *pending = calloc(16u, sizeof(*pending));
+  require_true(pending != NULL, "allocate terminal fixture");
+  int n = edr_command_state_collect_pending(pending, 16u), found = -1;
+  for (int i = 0; i < n; ++i) if (!strcmp(pending[i].command_id, "cmd-once")) found = i;
+  require_true(found >= 0, "new once terminal is pending");
+  EdrCommandStateRecord once = pending[found];
+  require_true(edr_command_state_mark_report_retry(&once, "bounded retry", ((int64_t)time(NULL) + 600LL) * 1000LL) == 0,
+      "persist terminal delivery backoff");
+  require_true(edr_command_state_finish_once("cmd-once", "collect_forensic", NULL,
+      "ok", 1, 0, detail, "", 1) == 1, "duplicate does not reset retry state");
+  n = edr_command_state_collect_pending(pending, 16u);
+  for (int i = 0; i < n; ++i)
+    require_true(strcmp(pending[i].command_id, "cmd-once") != 0, "duplicate preserves future backoff");
+  require_true(edr_command_state_mark_reported(&once) == 0, "persist terminal ACK");
+  require_true(edr_command_state_finish_once("cmd-once", "collect_forensic", NULL,
+      "ok", 1, 0, detail, "", 1) == 1, "duplicate keeps ACKed terminal");
+  require_true(edr_command_state_finish_once("cmd-once", "collect_forensic", NULL,
+      "ok", 1, 0, "different hash or key", "", 1) == -2, "conflicting terminal is rejected");
+  require_true(edr_command_state_finish_once("cmd-once", "yara_scan", NULL,
+      "ok", 1, 0, detail, "", 1) == -2, "command type cannot change after final");
+  n = edr_command_state_collect_pending(pending, 16u);
+  for (int i = 0; i < n; ++i)
+    require_true(strcmp(pending[i].command_id, "cmd-once") != 0, "ACK remains authoritative after duplicate/conflict");
+  free(pending);
+  OnceProbe probes[2] = {{-9}, {-9}};
+#ifdef _WIN32
+  HANDLE threads[2];
+  for (int i = 0; i < 2; ++i) {
+    threads[i] = CreateThread(NULL, 0, once_probe, &probes[i], 0, NULL);
+    require_true(threads[i] != NULL, "start competing terminal writer");
+  }
+  require_true(WaitForMultipleObjects(2, threads, TRUE, 10000) == WAIT_OBJECT_0, "join terminal writers");
+  CloseHandle(threads[0]); CloseHandle(threads[1]);
+#else
+  pthread_t threads[2];
+  for (int i = 0; i < 2; ++i) require_true(pthread_create(&threads[i], NULL, once_probe, &probes[i]) == 0,
+      "start competing terminal writer");
+  for (int i = 0; i < 2; ++i) require_true(pthread_join(threads[i], NULL) == 0, "join terminal writer");
+#endif
+  require_true((probes[0].rc == 0 && probes[1].rc == 1) ||
+               (probes[0].rc == 1 && probes[1].rc == 0), "one atomic terminal commit under contention");
+}
+
 int main(void) {
   char state_dir[512];
   char state_path[sizeof(state_dir) + sizeof("/command_state.jsonl")];
@@ -79,6 +146,7 @@ int main(void) {
   test_setenv("EDR_COMMAND_STATE_DB", state_path);
   test_setenv("EDR_COMMAND_INBOX_DIR", inbox_dir);
   test_setenv("EDR_COMMAND_ACK_DIR", ack_dir);
+  verify_once_terminals();
 
   EdrSoarCommandMeta meta;
   memset(&meta, 0, sizeof(meta));

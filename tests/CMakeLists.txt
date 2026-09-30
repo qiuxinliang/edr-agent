@@ -66,6 +66,22 @@ if(WIN32)
   target_link_libraries(test_command_inbox PRIVATE advapi32)
 endif()
 
+# Embed the production I/O boundary for bounded CRT failure injection.
+add_executable(test_command_upload_outbox
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_command_upload_outbox.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_command_upload_outbox PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_command_upload_outbox PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(test_command_upload_outbox)
+add_test(NAME command_upload_outbox_recovery COMMAND test_command_upload_outbox
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_response_forensic_paths
   ${CMAKE_CURRENT_SOURCE_DIR}/test_response_forensic_paths.c
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c

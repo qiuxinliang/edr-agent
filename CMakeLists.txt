@@ -545,6 +545,7 @@ set(EDR_AGENT_SOURCES
   src/storage/evidence_cache_migration.c
   src/storage/evidence_cache_maintenance_win.c
   src/command/command_stub.c
+  src/command/command_upload_outbox.c
   src/command/command_process.c
   src/command/command_signature.c
   src/command/command_signature_helpers.c

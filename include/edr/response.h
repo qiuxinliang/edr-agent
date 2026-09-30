@@ -58,7 +58,8 @@ int edr_response_forensic_async_cancel(const char *target_cmd_id);
 void edr_response_forensic_async_abort_shutdown(void);
 /* 是否有采集在运行(busy 查询)。 */
 int edr_response_forensic_async_active(void);
-void edr_response_forensic_complete_queued_upload(
+/* Return zero only after the terminal result is durably handed to command state. */
+int edr_response_forensic_complete_queued_upload(
     const char *command_id, const char *command_type, const EdrSoarCommandMeta *soar_meta,
     const char *artifact_path, const char *sha256, const char *object_key,
     const char *source, int partial, int upload_ok, const char *upload_error);

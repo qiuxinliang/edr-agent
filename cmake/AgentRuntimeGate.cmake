@@ -16,6 +16,7 @@ function(edr_agent_runtime_gate test_name executable_target)
 endfunction()
 
 edr_agent_runtime_gate(command_inbox_persistence test_command_inbox)
+edr_agent_runtime_gate(command_upload_outbox_recovery test_command_upload_outbox)
 edr_agent_runtime_gate(request_signing test_request_signing)
 edr_agent_runtime_gate(http_retry_contract test_http_retry)
 edr_agent_runtime_gate(command_result_json_contract test_command_result_json)

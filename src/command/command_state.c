@@ -2147,10 +2147,61 @@ int edr_command_state_replay_begin(const char *command_id, const char *command_t
                                                out_retry_count, out_duplicate);
 }
 
-int edr_command_state_finish(const char *command_id, const char *command_type,
+/* Caller holds the state lock. Compare the complete semantic terminal record;
+ * delivery ACK/retry fields belong to the existing result owner and are never
+ * reset by a duplicate forensic upload completion. */
+static int matching_terminal_locked(const char *command_id, const char *command_type,
+    const EdrSoarCommandMeta *meta, const char *response_status, int execution_status,
+    int exit_code, const char *detail, const char *artifacts) {
+  char path[1024], idem[128];
+  state_default_path(path, sizeof(path));
+  state_idempotency_key(meta, idem, sizeof(idem));
+  FILE *f = state_open_read_secure(path, NULL);
+  if (!f) {
+    struct stat st;
+    return stat(path, &st) != 0 && errno == ENOENT ? 0 : -1;
+  }
+  char *line = (char *)malloc(EDR_COMMAND_STATE_LINE_CAP);
+  EdrCommandStateRecord *prior = (EdrCommandStateRecord *)malloc(sizeof(*prior));
+  int result = 0;
+  if (!line || !prior) result = -1;
+  while (result >= 0 && line && prior && fgets(line, EDR_COMMAND_STATE_LINE_CAP, f)) {
+    if (!strchr(line, '\n') && !feof(f)) { result = -1; break; }
+    if (!line_matches_key(line, "command_id", command_id)) continue;
+    fill_record_from_line(line, prior);
+    if (strcmp(prior->command_id, command_id) || !prior->final_record) continue;
+    if (strcmp(prior->command_type, command_type ? command_type : "") ||
+        strcmp(prior->idempotency_key, idem) ||
+        strcmp(prior->response_status, response_status ? response_status : "failed") ||
+        prior->execution_status != execution_status || prior->exit_code != exit_code ||
+        strcmp(prior->detail, detail ? detail : "") || strcmp(prior->artifacts, artifacts ? artifacts : "") ||
+        strcmp(prior->soar_correlation_id, meta ? meta->soar_correlation_id : "") ||
+        strcmp(prior->playbook_run_id, meta ? meta->playbook_run_id : "") ||
+        strcmp(prior->playbook_step_id, meta ? meta->playbook_step_id : "")) {
+      result = -2;
+      break;
+    }
+    result = 1;
+  }
+  if (ferror(f)) result = -1;
+  if (fclose(f) != 0) result = -1;
+  free(line); free(prior);
+  if (result == 1) {
+    /* A prior append can leave a complete readable line even when its flush
+     * failed. Reconfirm durability before treating it as an existing commit. */
+    FILE *durable = state_open_append_secure(path);
+    if (!durable) return -1;
+    int flushed = state_flush_file(durable);
+    if (fclose(durable) != 0) flushed = -1;
+    if (flushed != 0) result = -1;
+  }
+  return result;
+}
+
+static int command_state_finish(const char *command_id, const char *command_type,
                              const EdrSoarCommandMeta *meta, const char *response_status,
                              int execution_status, int exit_code, const char *detail,
-                             const char *artifacts, int report_pending) {
+                             const char *artifacts, int report_pending, int once) {
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
@@ -2186,7 +2237,15 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
            0u, 0LL,
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
-  if (append_state_line_locked(line) != 0) {
+  if (once) {
+    FILE *lock = state_lock_acquire();
+    if (!lock) return -1;
+    int prior = matching_terminal_locked(command_id, command_type, meta, response_status,
+                                         execution_status, exit_code, detail, artifacts);
+    int written = prior == 0 ? append_state_line(line) : prior;
+    state_lock_release(lock);
+    if (written != 0) return written;
+  } else if (append_state_line_locked(line) != 0) {
     return -1;
   }
   edr_local_evidence_cache_record_command_result(
@@ -2194,6 +2253,21 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
       execution_status, exit_code, detail, artifacts);
   edr_command_state_compact_if_needed();
   return 0;
+}
+
+int edr_command_state_finish(const char *command_id, const char *command_type,
+    const EdrSoarCommandMeta *meta, const char *response_status, int execution_status,
+    int exit_code, const char *detail, const char *artifacts, int report_pending) {
+  return command_state_finish(command_id, command_type, meta, response_status,
+                              execution_status, exit_code, detail, artifacts, report_pending, 0);
+}
+
+int edr_command_state_finish_once(const char *command_id, const char *command_type,
+    const EdrSoarCommandMeta *meta, const char *response_status, int execution_status,
+    int exit_code, const char *detail, const char *artifacts, int report_pending) {
+  if (!command_id || !command_id[0]) return -1;
+  return command_state_finish(command_id, command_type, meta, response_status,
+                              execution_status, exit_code, detail, artifacts, report_pending, 1);
 }
 
 int edr_command_state_request_cancel(const char *command_id,

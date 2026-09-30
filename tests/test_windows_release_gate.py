@@ -38,7 +38,7 @@ WINDOWS_EXPECTED = {
     "windows_installer_acl_behavior",
 }
 RUNTIME_EXPECTED = {
-    "command_inbox_persistence", "request_signing", "http_retry_contract", "command_result_json_contract",
+    "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
     "transport_durable_owner", "transport_v2_status_capacity", "ave_sdk_smoke",
     "process_evidence_pending", "telemetry_admission", "health_upload", "pid_history_pmfe_generation",

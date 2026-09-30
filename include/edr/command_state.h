@@ -110,6 +110,12 @@ int edr_command_state_finish(const char *command_id, const char *command_type,
                              int execution_status, int exit_code, const char *detail,
                              const char *artifacts, int report_pending);
 
+/* For queued forensic handoff: 0=new terminal commit, 1=identical durable final,
+ * -1=I/O failure, -2=conflicting final. Duplicates preserve ACK/retry state. */
+int edr_command_state_finish_once(const char *command_id, const char *command_type,
+    const EdrSoarCommandMeta *meta, const char *response_status, int execution_status,
+    int exit_code, const char *detail, const char *artifacts, int report_pending);
+
 int edr_command_state_store_inbox(const char *command_id, const char *command_type,
                                   const uint8_t *payload, size_t payload_len,
                                   const EdrSoarCommandMeta *meta);

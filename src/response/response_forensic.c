@@ -999,7 +999,7 @@ static void fx_report_terminal(const char *cmd_id, const EdrSoarCommandMeta *sm,
   }
 }
 
-void edr_response_forensic_complete_queued_upload(
+int edr_response_forensic_complete_queued_upload(
     const char *command_id, const char *command_type, const EdrSoarCommandMeta *soar_meta,
     const char *artifact_path, const char *sha256, const char *object_key,
     const char *source, int partial, int upload_ok, const char *upload_error) {
@@ -1014,10 +1014,13 @@ void edr_response_forensic_complete_queued_upload(
       forensic_result_json(result, sizeof(result), partial ? "partial_success" : "success",
                            actual_source, artifact_path, sha256, object_key, 0, "ok", "");
     }
-    edr_cmd_inc_handled();
-    edr_cmd_inc_exec_ok();
-    edr_command_emit_always_typed(command_id, type, soar_meta, EdrCmdExecOk, 0, result);
-    return;
+    int persisted = edr_command_emit_always_typed_status_once(
+        command_id, type, soar_meta, EdrCmdExecOk, 0, result, NULL);
+    if (persisted == 0) {
+      edr_cmd_inc_handled();
+      edr_cmd_inc_exec_ok();
+    }
+    return persisted < 0 ? persisted : 0;
   }
   const char *error = upload_error && upload_error[0]
                           ? upload_error
@@ -1029,8 +1032,10 @@ void edr_response_forensic_complete_queued_upload(
     forensic_result_json(result, sizeof(result), "failed", actual_source, artifact_path,
                          sha256, "", 0, "failed", error);
   }
-  edr_cmd_inc_exec_fail();
-  edr_command_emit_always_typed(command_id, type, soar_meta, EdrCmdExecFailed, 9, result);
+  int persisted = edr_command_emit_always_typed_status_once(
+      command_id, type, soar_meta, EdrCmdExecFailed, 9, result, NULL);
+  if (persisted == 0) edr_cmd_inc_exec_fail();
+  return persisted < 0 ? persisted : 0;
 }
 
 void edr_response_forensic_async_poll(void) {

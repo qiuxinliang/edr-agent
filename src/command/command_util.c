@@ -209,10 +209,10 @@ static const char *command_response_status_label(EdrCommandExecutionStatus st) {
   }
 }
 
-int edr_command_emit_always_typed_status(const char *cmd_id, const char *command_type,
+static int command_emit_always_typed_status(const char *cmd_id, const char *command_type,
                                           const EdrSoarCommandMeta *sm,
                                           EdrCommandExecutionStatus st, int exit_code,
-                                          const char *detail, const char *response_status) {
+                                          const char *detail, const char *response_status, int once) {
   char cancel_detail[1536];
   /* kill_process owns its pre-action cancellation check and structured OS
    * receipt. A late cancellation cannot undo a verified process exit or erase
@@ -226,18 +226,37 @@ int edr_command_emit_always_typed_status(const char *cmd_id, const char *command
   detail = edr_command_normalize_forensic_result(command_type, st, exit_code, detail,
                                                  forensic_detail, sizeof(forensic_detail));
   edr_command_audit_both(cmd_id, detail);
-  int state_rc = edr_command_state_finish(cmd_id, command_type ? command_type : "", sm,
+  int (*finish)(const char *, const char *, const EdrSoarCommandMeta *, const char *,
+                int, int, const char *, const char *, int) =
+      once ? edr_command_state_finish_once : edr_command_state_finish;
+  int state_rc = finish(cmd_id, command_type ? command_type : "", sm,
                                response_status && response_status[0]
                                    ? response_status
                                    : command_response_status_label(st),
                                (int)st, exit_code,
                                detail ? detail : "", "", edr_ingest_http_configured());
-  if (state_rc == 0) {
+  if (state_rc >= 0) {
     edr_command_state_delete_inbox(cmd_id);
   } else {
-    edr_command_audit_both(cmd_id, "terminal command state persist failed; durable inbox retained");
+    edr_command_audit_both(cmd_id, state_rc == -2
+        ? "conflicting durable terminal command state; existing result and inbox preserved"
+        : "terminal command state persist failed; durable inbox retained");
   }
   return state_rc;
+}
+
+int edr_command_emit_always_typed_status(const char *cmd_id, const char *command_type,
+    const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st, int exit_code,
+    const char *detail, const char *response_status) {
+  return command_emit_always_typed_status(cmd_id, command_type, sm, st, exit_code,
+                                         detail, response_status, 0);
+}
+
+int edr_command_emit_always_typed_status_once(const char *cmd_id, const char *command_type,
+    const EdrSoarCommandMeta *sm, EdrCommandExecutionStatus st, int exit_code,
+    const char *detail, const char *response_status) {
+  return command_emit_always_typed_status(cmd_id, command_type, sm, st, exit_code,
+                                         detail, response_status, 1);
 }
 
 void edr_command_emit_always_typed(const char *cmd_id, const char *command_type,

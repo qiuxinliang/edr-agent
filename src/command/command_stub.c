@@ -13,6 +13,7 @@
 #include "edr/agent_update_command.h"
 #include "edr/agent_lifecycle_command.h"
 #include "edr/command.h"
+#include "command_upload_outbox.h"
 #include "edr/command_cancel.h"
 #include "edr/command_contract.h"
 #include "edr/command_executor.h"
@@ -3387,183 +3388,15 @@ static void forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t le
   }
 }
 
-static void upload_outbox_dir(char *out, size_t cap) {
-  const char *e = getenv("EDR_UPLOAD_OUTBOX_DIR");
-  if (!e || !e[0]) {
-    e = getenv("EDR_COMMAND_OUTBOX_DIR");
-  }
-  if (e && e[0]) {
-    snprintf(out, cap, "%s", e);
-    return;
-  }
-#ifdef _WIN32
-  snprintf(out, cap, "%s", "C:\\Program Files\\FDSecurity\\upload_outbox");
-#else
-  snprintf(out, cap, "%s", "/tmp/edr_upload_outbox");
-#endif
-}
-
-static void write_upload_outbox(const char *cmd_id, const char *bundle, const char *sha,
-                                const char *manifest) {
-  char dir[700];
-  upload_outbox_dir(dir, sizeof(dir));
-  if (mkdir_p_quiet(dir) != 0) {
-    return;
-  }
-  char safe[180];
-  snprintf(safe, sizeof(safe), "%s", (cmd_id && cmd_id[0]) ? cmd_id : "cmd");
-  sanitize_component(safe);
-  char path[900];
-#ifdef _WIN32
-  snprintf(path, sizeof(path), "%s\\upload_%s_%lld.pending", dir, safe, (long long)time(NULL));
-#else
-  snprintf(path, sizeof(path), "%s/upload_%s_%lld.pending", dir, safe, (long long)time(NULL));
-#endif
-  FILE *f = fopen(path, "w");
-  if (!f) {
-    return;
-  }
-  fprintf(f, "command_id=%s\nbundle_path=%s\nsha256=%s\nmanifest_path=%s\ncreated_unix_ms=%lld\n",
-          cmd_id ? cmd_id : "", bundle ? bundle : "", sha ? sha : "", manifest ? manifest : "",
-          (long long)command_now_ms());
-  fclose(f);
-}
-
-static void upload_meta_value(char *value) {
-  if (!value) return;
-  for (; *value; value++) {
-    if (*value == '\r' || *value == '\n') *value = ' ';
-  }
-}
-
-int edr_command_queue_forensic_upload(const char *command_id, const char *command_type,
-                                      const EdrSoarCommandMeta *soar_meta,
-                                      const char *artifact_path, const char *sha256,
-                                      const char *source, int partial) {
-  if (!command_id || !command_id[0] || !artifact_path || !artifact_path[0] ||
-      !file_exists_c(artifact_path)) {
-    return -1;
-  }
-  char dir[700];
-  upload_outbox_dir(dir, sizeof(dir));
-  if (mkdir_p_quiet(dir) != 0) return -1;
-  char safe[180];
-  snprintf(safe, sizeof(safe), "%s", command_id);
-  sanitize_component(safe);
-  int64_t now_ms = command_now_ms();
-  char path[900], tmp[920];
-#ifdef _WIN32
-  snprintf(path, sizeof(path), "%s\\upload_%s_%lld.pending", dir, safe, (long long)now_ms);
-#else
-  snprintf(path, sizeof(path), "%s/upload_%s_%lld.pending", dir, safe, (long long)now_ms);
-#endif
-  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-  FILE *f = fopen(tmp, "w");
-  if (!f) return -1;
-  char type[80], src[80], idem[520], soar[140], run[108], step[108];
-  snprintf(type, sizeof(type), "%s", command_type ? command_type : "collect_forensic");
-  snprintf(src, sizeof(src), "%s", source ? source : "builtin");
-  snprintf(idem, sizeof(idem), "%s", soar_meta ? soar_meta->idempotency_key : "");
-  snprintf(soar, sizeof(soar), "%s", soar_meta ? soar_meta->soar_correlation_id : "");
-  snprintf(run, sizeof(run), "%s", soar_meta ? soar_meta->playbook_run_id : "");
-  snprintf(step, sizeof(step), "%s", soar_meta ? soar_meta->playbook_step_id : "");
-  upload_meta_value(type); upload_meta_value(src); upload_meta_value(idem);
-  upload_meta_value(soar); upload_meta_value(run); upload_meta_value(step);
-  fprintf(f,
-          "kind=forensic_terminal\ncommand_id=%s\ncommand_type=%s\nbundle_path=%s\n"
-          "sha256=%s\nsource=%s\npartial=%d\nidempotency_key=%s\n"
-          "soar_correlation_id=%s\nplaybook_run_id=%s\nplaybook_step_id=%s\n"
-          "created_unix_ms=%lld\n",
-          command_id, type, artifact_path, sha256 ? sha256 : "", src, partial ? 1 : 0,
-          idem, soar, run, step, (long long)now_ms);
-  if (fclose(f) != 0 || rename(tmp, path) != 0) {
-    (void)remove(tmp);
-    return -1;
-  }
-  edr_command_executor_wake();
-  return 0;
-}
-
-static int read_kv_file_value(const char *path, const char *key, char *out, size_t cap) {
-  FILE *f = fopen(path, "r");
-  if (!f) return -1;
-  char line[1400];
-  size_t kn = strlen(key);
-  int ok = -1;
-  while (fgets(line, sizeof(line), f)) {
-    if (strncmp(line, key, kn) == 0 && line[kn] == '=') {
-      char *value = line + kn + 1u;
-      value[strcspn(value, "\r\n")] = '\0';
-      if (strlen(value) < cap) { memcpy(out, value, strlen(value) + 1u); ok = 0; }
-      break;
-    }
-  }
-  if (ferror(f)) ok = -1;
-  if (fclose(f) != 0) ok = -1;
-  return ok;
-}
-
-static int flush_upload_outbox_one(const char *pending_path) {
-  char cmd_id[128], bundle[1024], sha[65], kind[48];
-  kind[0] = '\0';
-  (void)read_kv_file_value(pending_path, "kind", kind, sizeof(kind));
-  if (read_kv_file_value(pending_path, "command_id", cmd_id, sizeof(cmd_id)) != 0 ||
-      read_kv_file_value(pending_path, "bundle_path", bundle, sizeof(bundle)) != 0 ||
-      read_kv_file_value(pending_path, "sha256", sha, sizeof(sha)) != 0) {
-    return 0;
-  }
-  if (!file_exists_c(bundle)) {
-    if (strcmp(kind, "forensic_terminal") == 0) {
-      char command_type[80], source[80], partial_raw[16];
-      EdrSoarCommandMeta sm;
-      memset(&sm, 0, sizeof(sm));
-      command_type[0] = source[0] = partial_raw[0] = '\0';
-      (void)read_kv_file_value(pending_path, "command_type", command_type, sizeof(command_type));
-      (void)read_kv_file_value(pending_path, "source", source, sizeof(source));
-      (void)read_kv_file_value(pending_path, "partial", partial_raw, sizeof(partial_raw));
-      (void)read_kv_file_value(pending_path, "idempotency_key", sm.idempotency_key, sizeof(sm.idempotency_key));
-      (void)read_kv_file_value(pending_path, "soar_correlation_id", sm.soar_correlation_id, sizeof(sm.soar_correlation_id));
-      (void)read_kv_file_value(pending_path, "playbook_run_id", sm.playbook_run_id, sizeof(sm.playbook_run_id));
-      (void)read_kv_file_value(pending_path, "playbook_step_id", sm.playbook_step_id, sizeof(sm.playbook_step_id));
-      edr_response_forensic_complete_queued_upload(cmd_id, command_type, &sm, bundle, sha, "",
-                                                   source, atoi(partial_raw), 0,
-                                                   "artifact missing before upload retry");
-      char failed[1100];
-      snprintf(failed, sizeof(failed), "%s.failed", pending_path);
-      (void)rename(pending_path, failed);
-      return 1;
-    }
-    return 0;
-  }
-  char minio_key[1024];
-  minio_key[0] = '\0';
-  if (edr_transport_v2_upload_file(cmd_id[0] ? cmd_id : "upload_outbox", bundle, sha, minio_key, sizeof(minio_key)) == 0) {
-    if (strcmp(kind, "forensic_terminal") == 0) {
-      char command_type[80], source[80], partial_raw[16];
-      EdrSoarCommandMeta sm;
-      memset(&sm, 0, sizeof(sm));
-      command_type[0] = source[0] = partial_raw[0] = '\0';
-      (void)read_kv_file_value(pending_path, "command_type", command_type, sizeof(command_type));
-      (void)read_kv_file_value(pending_path, "source", source, sizeof(source));
-      (void)read_kv_file_value(pending_path, "partial", partial_raw, sizeof(partial_raw));
-      (void)read_kv_file_value(pending_path, "idempotency_key", sm.idempotency_key, sizeof(sm.idempotency_key));
-      (void)read_kv_file_value(pending_path, "soar_correlation_id", sm.soar_correlation_id, sizeof(sm.soar_correlation_id));
-      (void)read_kv_file_value(pending_path, "playbook_run_id", sm.playbook_run_id, sizeof(sm.playbook_run_id));
-      (void)read_kv_file_value(pending_path, "playbook_step_id", sm.playbook_step_id, sizeof(sm.playbook_step_id));
-      edr_response_forensic_complete_queued_upload(cmd_id, command_type, &sm, bundle, sha, minio_key,
-                                                   source, atoi(partial_raw), 1, "");
-    }
-    char done[1100];
-    snprintf(done, sizeof(done), "%s.done", pending_path);
-    (void)rename(pending_path, done);
-    return 1;
-  }
-  return -1;
-}
-
 static void flush_upload_outbox(void) {
+  static char scan_dir[700];
+  static uint32_t next_scan_index;
   char dir[700];
-  upload_outbox_dir(dir, sizeof(dir));
+  edr_command_upload_outbox_dir(dir, sizeof(dir));
+  if (strcmp(scan_dir, dir) != 0) {
+    snprintf(scan_dir, sizeof(scan_dir), "%s", dir);
+    next_scan_index = 0u;
+  }
   int64_t now_ms = command_now_ms();
   if (delivery_health_upload_backoff_active(now_ms)) {
     return;
@@ -3571,6 +3404,8 @@ static void flush_upload_outbox(void) {
   uint32_t max_per_poll = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_PER_POLL", 1u, 1u, 64u);
   uint32_t attempted_this_poll = 0u;
   uint32_t seen_this_poll = 0u;
+  uint32_t scan_start = next_scan_index, examined_this_poll = 0u;
+  int traversal_complete = 1;
 #ifdef _WIN32
   char pattern[900];
   snprintf(pattern, sizeof(pattern), "%s\\*.pending", dir);
@@ -3584,16 +3419,24 @@ static void flush_upload_outbox(void) {
       char path[1000];
       snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
       seen_this_poll++;
-      if (attempted_this_poll >= max_per_poll) {
-        continue;
+      /* Continue from the previous pass even when a damaged file cannot be
+       * retired. Use the existing poll budget for artifact hashing as well as
+       * network attempts. Directory changes
+       * can defer a record to the next wrap, but cannot pin every poll to it. */
+      if (seen_this_poll - 1u < scan_start || examined_this_poll >= max_per_poll ||
+          attempted_this_poll >= max_per_poll) continue;
+      examined_this_poll++;
+      next_scan_index = seen_this_poll;
+      int attempted = 0;
+      int rc = edr_command_upload_outbox_flush_one(path, &attempted);
+      if (attempted) {
+        attempted_this_poll++;
+        delivery_health_upload_attempted();
+        delivery_health_upload_result(rc == -1 ? -1 : 1, now_ms);
       }
-      attempted_this_poll++;
-      delivery_health_upload_attempted();
-      int rc = flush_upload_outbox_one(path);
-      delivery_health_upload_result(rc, now_ms);
-      if (rc < 0) {
-        break;
-      }
+      /* Local corruption or rename failures must not strand another artifact.
+       * Network failures retain the existing capped global backoff. */
+      if (rc == -1) { traversal_complete = 0; break; }
     }
   } while (FindNextFileA(h, &fd));
   FindClose(h);
@@ -3610,20 +3453,30 @@ static void flush_upload_outbox(void) {
       char path[1000];
       snprintf(path, sizeof(path), "%s/%s", dir, name);
       seen_this_poll++;
-      if (attempted_this_poll >= max_per_poll) {
-        continue;
+      /* Continue from the previous pass even when a damaged file cannot be
+       * retired. Use the existing poll budget for artifact hashing as well as
+       * network attempts. Directory changes
+       * can defer a record to the next wrap, but cannot pin every poll to it. */
+      if (seen_this_poll - 1u < scan_start || examined_this_poll >= max_per_poll ||
+          attempted_this_poll >= max_per_poll) continue;
+      examined_this_poll++;
+      next_scan_index = seen_this_poll;
+      int attempted = 0;
+      int rc = edr_command_upload_outbox_flush_one(path, &attempted);
+      if (attempted) {
+        attempted_this_poll++;
+        delivery_health_upload_attempted();
+        delivery_health_upload_result(rc == -1 ? -1 : 1, now_ms);
       }
-      attempted_this_poll++;
-      delivery_health_upload_attempted();
-      int rc = flush_upload_outbox_one(path);
-      delivery_health_upload_result(rc, now_ms);
-      if (rc < 0) {
-        break;
-      }
+      /* Local corruption or rename failures must not strand another artifact.
+       * Network failures retain the existing capped global backoff. */
+      if (rc == -1) { traversal_complete = 0; break; }
     }
   }
   closedir(d);
 #endif
+  if (traversal_complete && (next_scan_index >= seen_this_poll || scan_start >= seen_this_poll))
+    next_scan_index = 0u;
   delivery_health_upload_pending(seen_this_poll);
 }
 
@@ -3779,8 +3632,9 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   upload_key[0] = '\0';
   int upload_rc = edr_transport_v2_upload_file(cmd_id ? cmd_id : "forensic", bundle, bundle_sha,
                                                         upload_key, sizeof(upload_key));
+  int outbox_rc = 0;
   if (upload_rc != 0) {
-    write_upload_outbox(cmd_id, bundle, bundle_sha, manifest);
+    outbox_rc = edr_command_upload_outbox_write_legacy(cmd_id, bundle, bundle_sha, manifest);
   }
   char manifest_json[900];
 #ifdef _WIN32
@@ -3805,7 +3659,9 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
   s_handled++;
   audit_both(cmd_id, upload_rc == 0
                          ? "forensic: manifest + bundle.tgz + artifact upload ok"
-                         : "forensic: manifest + bundle.tgz ok; artifact upload failed, queued outbox");
+                         : outbox_rc == 0
+                               ? "forensic: manifest + bundle.tgz ok; artifact upload failed, queued outbox"
+                               : "forensic: artifact upload and retry queue persistence failed; local bundle retained");
   {
     char manifestj[1200], bundlej[1200], keyj[1200], artifacts[4200], detail[4800];
     json_escape_to(manifestj, sizeof(manifestj), manifest);
@@ -3819,7 +3675,7 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
              "{\"manifest_path\":%s,\"bundle_path\":%s,\"sha256\":\"%s\",\"upload_status\":\"%s\","
              "\"minio_key\":%s,\"outbox\":\"%s\"}",
              manifestj, bundlej, bundle_sha, upload_rc == 0 ? "ok" : "failed", keyj,
-             upload_rc == 0 ? "none" : "queued");
+             upload_rc == 0 ? "none" : outbox_rc == 0 ? "queued" : "failed");
     if (upload_rc == 0) {
       s_exec_ok++;
       soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", artifacts);
