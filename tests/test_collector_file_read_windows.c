@@ -735,6 +735,43 @@ static void test_concurrent_no_lifetime_snapshot(void) {
   assert(h.file_write_no_lifetime_reasons[EDR_FILE_WRITE_NO_LIFETIME_OTHER_NO_OBJECT] == 4000u);
 }
 
+static void test_open_binding_under_close_pressure(unsigned version, size_t width) {
+  Fixture create, close, write, read;
+  const uint64_t object = 0x721101u, key = 0x721102u;
+  case_version = version; case_width = width;
+  reset("open_binding_survives_close_pressure_for_read_and_write");
+  make_event(&create, 12u, version, width, object, 0u, old_name); feed(&create, 100u);
+  for (unsigned i = 0u; i < 8192u; ++i) {
+    make_event(&close, 14u, version, width, 0x900000u + i, 0u, NULL);
+    feed(&close, 1000u + i);
+  }
+  make_event(&write, 16u, version, width, object, key, NULL);
+  feed(&write, 10000u);
+  if (bus.published != 1u) diagnose();
+  assert(bus.published == 1u);
+  EdrBehaviorRecord br; edr_behavior_from_slot(&bus.last, &br);
+  assert(br.type == EDR_EVENT_FILE_WRITE && br.pid == reader_pid);
+  assert(br.event_time_ns == 10000 && strcmp(br.file_path, old_path) == 0);
+  make_event(&read, 15u, version, width, object, key, NULL);
+  expect_read(&read, 10000u, old_path, key, object, "etw_fileobject_create");
+  EdrCollectorHealth h; edr_collector_file_io_test_health(&h);
+  assert(h.file_object_history_evictions > 0u && h.file_object_history_open_paths == 1u);
+  assert(!h.file_write_path_unresolved && !h.collector_dropped && !h.queue_dropped);
+  /* The retained path must still be invalidated by a delayed same-object
+   * Close below the admission floor; it cannot escape its actual lifetime. */
+  make_event(&close, 14u, version, width, object, key, NULL); feed(&close, 200u);
+  feed(&write, 10000u);
+  EdrEventSlot pending;
+  edr_collector_file_io_test_health(&h);
+  assert(bus.published == 2u && !edr_collector_file_io_test_pending(&pending));
+  assert(h.file_write_path_resolved == 1u && h.file_write_path_unresolved == 1u);
+  assert(!h.collector_dropped && !h.queue_dropped && !h.file_write_payload_incomplete);
+  for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i) {
+    assert(h.file_write_unresolved_reasons[i] ==
+           (i == EDR_FILE_WRITE_UNRESOLVED_HISTORY_DISCARDED ? 1u : 0u));
+  }
+}
+
 int main(void) {
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "[fixture] native collector diagnostic build; no ETW consumer is started, "
@@ -752,6 +789,8 @@ int main(void) {
     test_canary_processing_time(version, 8u);
     test_no_lifetime_diagnostics(version, 4u);
     test_no_lifetime_diagnostics(version, 8u);
+    test_open_binding_under_close_pressure(version, 4u);
+    test_open_binding_under_close_pressure(version, 8u);
   }
   test_concurrent_write_accounting();
   test_concurrent_canary_registration();

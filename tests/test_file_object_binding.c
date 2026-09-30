@@ -124,6 +124,84 @@ static void permute_arrivals(unsigned *order, size_t depth) {
   }
 }
 
+static void test_open_path_survives_close_pressure(size_t capacity) {
+  EdrFileObjectBinding *entries = calloc(capacity, sizeof(*entries));
+  EdrFileObjectHistory history = {0};
+  assert(entries);
+  edr_file_object_binding_open(entries, capacity, &history, 11, 100, "anchor");
+  for (size_t i = 0; i < capacity * 2; ++i)
+    edr_file_object_binding_close(entries, capacity, &history, 1000 + i, 1000 + i);
+  const char *path = edr_file_object_binding_resolve(entries, capacity, &history, 11, 20000);
+  assert(path && strcmp(path, "anchor") == 0 && history.evictions > 0);
+  /* Keeping the open path cannot override a delayed Close below the floor. */
+  edr_file_object_binding_close(entries, capacity, &history, 11, 150);
+  assert(!edr_file_object_binding_resolve(entries, capacity, &history, 11, 20000));
+  edr_file_object_binding_open(entries, capacity, &history, 11, 100, "anchor");
+  assert(!edr_file_object_binding_resolve(entries, capacity, &history, 11, 20000));
+  free(entries);
+}
+
+static void test_oldest_retired_fact_and_open_fallback(void) {
+  EdrFileObjectBinding entries[4] = {{0}};
+  EdrFileObjectHistory history = {0};
+  edr_file_object_binding_open(entries, 4, &history, 11, 100, "anchor");
+  edr_file_object_binding_close(entries, 4, &history, 22, 900);
+  edr_file_object_binding_close(entries, 4, &history, 33, 200);
+  edr_file_object_binding_close(entries, 4, &history, 44, 800);
+  edr_file_object_binding_open(entries, 4, &history, 55, 1000, "new");
+  assert(history.last_evicted_object == 33 && history.discarded_through == 200);
+  assert(edr_file_object_binding_resolve(entries, 4, &history, 11, 1050));
+  edr_file_object_binding_open(entries, 4, &history, 33, 150, "late_before_evicted_close");
+  assert(!edr_file_object_binding_resolve(entries, 4, &history, 33, 1050));
+  edr_file_object_binding_open(entries, 4, &history, 33, 1200, "fresh_generation");
+  edr_file_object_binding_close(entries, 4, &history, 33, 200);
+  assert(edr_file_object_binding_resolve(entries, 4, &history, 33, 1250));
+
+  memset(entries, 0, sizeof(entries)); memset(&history, 0, sizeof(history));
+  for (uint64_t i = 1; i <= 4; ++i)
+    edr_file_object_binding_open(entries, 4, &history, i, i * 100, i == 2 ? NULL : "open");
+  edr_file_object_binding_open(entries, 4, &history, 5, 500, "new");
+  assert(history.last_evicted_object == 2);
+  assert(edr_file_object_binding_resolve(entries, 4, &history, 1, 550));
+  memset(entries, 0, sizeof(entries)); memset(&history, 0, sizeof(history));
+  for (uint64_t i = 1; i <= 4; ++i)
+    edr_file_object_binding_open(entries, 4, &history, i, i * 100, "open");
+  edr_file_object_binding_open(entries, 4, &history, 5, 500, "new");
+  assert(history.evictions == 1 && history.last_evicted_object == 1);
+  assert(!edr_file_object_binding_resolve(entries, 4, &history, 1, 550));
+  assert(edr_file_object_binding_resolve(entries, 4, &history, 5, 550));
+}
+
+/* More pressure/reuse histories than the exhaustive six-event permutation.
+ * A small cache may return fewer facts than full history, never a new path. */
+static void test_generated_histories_match_retained_facts(void) {
+  uint32_t random = 0x7211u;
+  for (unsigned trial = 0; trial < 200; ++trial) {
+    EdrFileObjectBinding bounded[8] = {{0}}, retained[64] = {{0}};
+    EdrFileObjectHistory small = {0}, full = {0};
+    size_t capacity = (size_t)1u << (trial % 4u);
+    for (unsigned step = 0; step < 30; ++step) {
+      random = random * 1664525u + 1013904223u;
+      uint64_t object = 11u + ((random >> 8u) % 4u);
+      uint64_t at = 100u + ((random >> 12u) % 30u) * 100u;
+      if ((random >> 24u) % 3u == 0u) {
+        edr_file_object_binding_close(bounded, capacity, &small, object, at);
+        edr_file_object_binding_close(retained, 64, &full, object, at);
+      } else {
+        const char *path = (random & 1u) ? "path_A" : "path_B";
+        edr_file_object_binding_open(bounded, capacity, &small, object, at, path);
+        edr_file_object_binding_open(retained, 64, &full, object, at, path);
+      }
+      for (uint64_t target = 11; target <= 14; ++target)
+        for (uint64_t query = 100; query <= 3200; query += 400) {
+          const char *actual = edr_file_object_binding_resolve(bounded, capacity, &small, target, query);
+          const char *expected = edr_file_object_binding_resolve(retained, 64, &full, target, query);
+          if (actual) assert(expected && strcmp(actual, expected) == 0);
+        }
+    }
+  }
+}
+
 void edr_test_file_object_binding_contract(void) {
   test_new_generation_does_not_evict_its_own_boundary();
   test_unrelated_eviction(4, 150);
@@ -131,6 +209,10 @@ void edr_test_file_object_binding_contract(void) {
   test_unrelated_eviction(4096, 150);
   test_unrelated_eviction(4096, 400);
   test_scoped_history_and_diagnostics();
+  test_open_path_survives_close_pressure(4);
+  test_open_path_survives_close_pressure(4096);
+  test_oldest_retired_fact_and_open_fallback();
+  test_generated_histories_match_retained_facts();
   unsigned order[6];
   permute_arrivals(order, 0);
   EdrFileObjectBinding entries[32] = {{0}};

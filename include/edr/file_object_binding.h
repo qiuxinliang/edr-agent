@@ -98,11 +98,21 @@ static inline void edr_file_object_binding_unknown_boundary(EdrFileObjectBinding
  * The object namespace is distinct from FileKey; never cast one into the other. */
 static inline EdrFileObjectBinding *edr_file_object_binding_slot(
     EdrFileObjectBinding *entries, size_t count, EdrFileObjectHistory *history) {
+  EdrFileObjectBinding *retired = NULL;
+  uint64_t retired_at = UINT64_MAX;
   for (size_t i = 0; i < count; ++i) {
-    if (!entries[i].object) return &entries[i];
+    EdrFileObjectBinding *entry = &entries[i];
+    if (!entry->object) return entry;
+    /* Closed boundaries must still advance the admission watermark when
+     * removed. Prefer the oldest such fact over an intact open path; a
+     * delayed Create/Close still quarantines older same-object residents. */
+    if (entry->closed_at || entry->status != EDR_FILE_OBJECT_RESOLVED || !entry->path[0]) {
+      uint64_t at = entry->closed_at > entry->opened_at ? entry->closed_at : entry->opened_at;
+      if (!retired || at < retired_at) { retired = entry; retired_at = at; }
+    }
   }
   if (!count) return NULL;
-  EdrFileObjectBinding *slot = &entries[history->next++ % count];
+  EdrFileObjectBinding *slot = retired ? retired : &entries[history->next++ % count];
   uint64_t discarded = slot->closed_at > slot->opened_at ? slot->closed_at : slot->opened_at;
   /* Admission watermark prevents a discarded Close/reuse from being undone
    * by a delayed Create. Existing paths are revoked only for this object:
