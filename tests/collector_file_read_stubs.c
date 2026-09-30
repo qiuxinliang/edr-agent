@@ -17,6 +17,9 @@
 #include <assert.h>
 #include <stdlib.h>
 
+int edr_collector_test_sensor_admit = 1;
+int edr_collector_test_rule_match = 1;
+
 /* Every intact fixture path is interesting. This isolates binding behavior
  * from the machine's installed rules without skipping collector admission. */
 int edr_p0_rule_ir_file_read_path_may_match(const char *path, uint64_t *epoch) {
@@ -26,22 +29,25 @@ int edr_p0_rule_ir_file_read_path_may_match(const char *path, uint64_t *epoch) {
 }
 
 int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
-  assert(event && event->type == EDR_EVENT_FILE_READ && event->path[0]);
-  return 1;
+  assert(event && (event->type == EDR_EVENT_FILE_READ || event->type == EDR_EVENT_FILE_WRITE) && event->path[0]);
+  return edr_collector_test_sensor_admit;
 }
 
 void edr_ave_etw_feed_from_event(EVENT_RECORD *record, EdrEventType type,
                                 uint64_t at, const char *ip, const char *domain) {
-  assert(record && type == EDR_EVENT_FILE_READ && at);
+  assert(record && (type == EDR_EVENT_FILE_READ || type == EDR_EVENT_FILE_WRITE) && at);
   assert(!ip && !domain);
 }
 
 /* An unexpected side effect or entry into another event family is a test
  * failure, not a successful mock operation. abort also works with NDEBUG. */
-int edr_policy_v2_ransomware_enabled(const char *control) { abort(); }
+int edr_policy_v2_ransomware_enabled(const char *control) { assert(control); return 0; }
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { abort(); }
-int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *record) { abort(); }
-int edr_p0_rule_ir_is_ready(void) { abort(); }
+int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *record) {
+  assert(record && record->type == EDR_EVENT_FILE_WRITE);
+  return edr_collector_test_rule_match;
+}
+int edr_p0_rule_ir_is_ready(void) { return 1; }
 int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) { abort(); }
 int edr_p0_rule_ir_is_interesting_process_name(const char *name) { abort(); }
 int edr_adaptive_collection_should_admit_record(const EdrBehaviorRecord *record) { abort(); }

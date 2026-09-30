@@ -1600,6 +1600,13 @@ add_test(NAME edr_agent_smoke COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/agent_smo
 set_tests_properties(edr_agent_smoke PROPERTIES TIMEOUT 30)
 
 
+add_executable(test_collector_health_json test_collector_health_json.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_collector_health_json PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_collector_health_json)
+add_test(NAME collector_health_disposition_json COMMAND test_collector_health_json)
+
 add_executable(test_health_upload test_health_upload.c
   ${CMAKE_SOURCE_DIR}/src/transport/health_upload.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)

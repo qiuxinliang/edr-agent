@@ -49,6 +49,36 @@ typedef struct {
     uint64_t total_filtered;
 } EdrCollectorFilterStats;
 
+/* Mutually exclusive outer collector rejection exits. These count rejected
+ * callback/slot attempts, not unique user operations. Existing policy/self
+ * counters describe other or overlapping stages and must not be added here. */
+typedef enum {
+    EDR_COLLECTOR_DROP_SLOT_ADMISSION,
+    EDR_COLLECTOR_DROP_SENSOR_INTEREST,
+    EDR_COLLECTOR_DROP_SECURITY_RENDER,
+    EDR_COLLECTOR_DROP_SECURITY_UNSUPPORTED,
+    EDR_COLLECTOR_DROP_SECURITY_OVERFLOW,
+    EDR_COLLECTOR_DROP_REASON_COUNT
+} EdrCollectorDropReason;
+
+/* Final FileWrite resolver failures only; one reason per failed callback.
+ * These reuse existing binding decisions, without inferring missing data from
+ * a recent eviction or treating unresolved callbacks as independent writes. */
+typedef enum {
+    EDR_FILE_WRITE_UNRESOLVED_INVALID_EVENT,
+    EDR_FILE_WRITE_UNRESOLVED_MISSING_KEY,
+    EDR_FILE_WRITE_UNRESOLVED_ACTOR,
+    EDR_FILE_WRITE_UNRESOLVED_KEY_AMBIGUOUS,
+    EDR_FILE_WRITE_UNRESOLVED_BINDING_CONFLICT,
+    EDR_FILE_WRITE_UNRESOLVED_HISTORY_DISCARDED,
+    EDR_FILE_WRITE_UNRESOLVED_LIFETIME_ENDED,
+    EDR_FILE_WRITE_UNRESOLVED_PATH_UNAVAILABLE,
+    EDR_FILE_WRITE_UNRESOLVED_OBJECT_CONFLICT,
+    EDR_FILE_WRITE_UNRESOLVED_UNKNOWN_BOUNDARY,
+    EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME,
+    EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT
+} EdrFileWriteUnresolvedReason;
+
 typedef struct {
     int etw_or_inotify_enabled;
     int powershell_visible;
@@ -85,6 +115,11 @@ typedef struct {
     uint64_t etw_callbacks_registry;
     uint64_t etw_prefilter_dropped;
     uint64_t collector_dropped;
+    /* Windows snapshots derive each reported total from these atomically
+     * read buckets. This is not an atomic snapshot across pipeline stages. */
+    int disposition_accounting_available;
+    uint64_t collector_drop_reasons[EDR_COLLECTOR_DROP_REASON_COUNT];
+    uint64_t file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT];
     uint64_t queue_dropped;
     uint64_t agent_self_suppressed;
     uint64_t agent_self_direct_pid_suppressed;

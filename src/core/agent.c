@@ -24,6 +24,7 @@
 
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
+#include "collector_health_json.h"
 #include "edr/command.h"
 #include "edr/command_executor.h"
 #include "edr/response_capability_manifest.h"
@@ -2363,6 +2364,11 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_transport_v2_get_runtime(&tv2_rt);
   edr_resource_get_sample(&rs);
   (void)edr_collector_get_health(&ch);
+  char collector_health_json[2048];
+  if (edr_collector_health_json(&ch, collector_health_json, sizeof(collector_health_json)) != 0) {
+    fprintf(stderr, "[health] collector disposition counters exceed JSON buffer\n");
+    return;
+  }
   edr_parent_enrichment_get_metrics(&parent_metrics);
   edr_pt_cache_get_metrics(&process_cache_metrics);
   edr_process_coalescer_get_metrics(&process_coalescer_metrics);
@@ -2610,8 +2616,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
         "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
         "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
-        "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
-        "\"file_write_collection\":{\"path_resolved\":%llu,\"path_unresolved\":%llu,\"payload_incomplete\":%llu},"
+        "%s"
         "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
         "\"critical_binding_capacity_exhausted\":%llu,\"file_key_ambiguities\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
         "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"recovery_episodes\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
@@ -2829,11 +2834,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)ch.etw_callbacks_network,
         (unsigned long long)ch.etw_callbacks_registry,
         (unsigned long long)ch.etw_prefilter_dropped,
-        (unsigned long long)ch.collector_dropped,
-        (unsigned long long)ch.queue_dropped,
-        (unsigned long long)ch.file_write_path_resolved,
-        (unsigned long long)ch.file_write_path_unresolved,
-        (unsigned long long)ch.file_write_payload_incomplete,
+        collector_health_json,
         (unsigned long long)ch.file_read_name_bindings,
         (unsigned long long)ch.file_read_name_cache_misses,
         (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,
@@ -3286,8 +3287,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"unattributed\":%llu},"
       "\"etw_callbacks\":{\"total\":%llu,\"process\":%llu,\"file\":%llu,"
       "\"network\":%llu,\"registry\":%llu,\"prefilter_dropped\":%llu},"
-      "\"collector_dropped\":%llu,\"queue_dropped\":%llu,"
-      "\"file_write_collection\":{\"path_resolved\":%llu,\"path_unresolved\":%llu,\"payload_incomplete\":%llu},"
+      "%s"
       "\"file_read_collection\":{\"name_bindings\":%llu,\"name_cache_misses\":%llu,"
       "\"critical_binding_capacity_exhausted\":%llu,\"file_key_ambiguities\":%llu,\"generation_unavailable\":%llu,\"actor_generation_unavailable\":%llu,"
       "\"metadata_gate\":{\"healthy\":%s,\"reason\":\"%s\",\"staged\":%llu,\"coalesced\":%llu,\"enqueue_attempts\":%llu,\"queue_rejected\":%llu,\"durable_successes\":%llu,\"durable_failures\":%llu,\"retry_attempts\":%llu,\"paused_events\":%llu,\"epoch_restart_attempts\":%llu,\"epoch_restart_successes\":%llu,\"epoch_restart_failures\":%llu,\"recovery_episodes\":%llu,\"post_reset_recovery\":{\"bindings\":%llu,\"failures\":%llu,\"reason\":\"%s\"}},"
@@ -3584,11 +3584,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ch.etw_callbacks_network,
       (unsigned long long)ch.etw_callbacks_registry,
       (unsigned long long)ch.etw_prefilter_dropped,
-      (unsigned long long)ch.collector_dropped,
-      (unsigned long long)ch.queue_dropped,
-      (unsigned long long)ch.file_write_path_resolved,
-      (unsigned long long)ch.file_write_path_unresolved,
-      (unsigned long long)ch.file_write_payload_incomplete,
+      collector_health_json,
       (unsigned long long)ch.file_read_name_bindings,
       (unsigned long long)ch.file_read_name_cache_misses,
       (unsigned long long)ch.file_read_critical_binding_capacity_exhausted,

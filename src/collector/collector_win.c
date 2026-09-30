@@ -110,6 +110,27 @@ static volatile LONG s_consumer_open_ok;
 static volatile LONG s_consumer_running;
 static volatile LONG s_network_first_callback_observed;
 static EdrCollectorHealth s_health;
+
+static void edr_collector_note_drop(EdrCollectorDropReason reason) {
+  InterlockedIncrement64((volatile LONG64 *)&s_health.collector_drop_reasons[reason]);
+}
+
+static void edr_collector_disposition_snapshot(EdrCollectorHealth *out) {
+  out->disposition_accounting_available = 1;
+  out->collector_dropped = 0u;
+  out->file_write_path_unresolved = 0u;
+  for (size_t i = 0u; i < EDR_COLLECTOR_DROP_REASON_COUNT; ++i) {
+    out->collector_drop_reasons[i] = (uint64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)&s_health.collector_drop_reasons[i], 0, 0);
+    out->collector_dropped += out->collector_drop_reasons[i];
+  }
+  for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i) {
+    out->file_write_unresolved_reasons[i] = (uint64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)&s_health.file_write_unresolved_reasons[i], 0, 0);
+    out->file_write_path_unresolved += out->file_write_unresolved_reasons[i];
+  }
+}
+
 static const EdrConfig *s_collector_cfg;
 
 #define EDR_COLLECTOR_PID_CACHE 512u
@@ -1150,7 +1171,7 @@ static int edr_push_slot_after_policy(EdrEventSlot *slot, const char *debug_tag)
   edr_collector_debug_tdh_payload(slot, debug_tag);
   slot->priority = edr_priority_from_utf8_payload(slot->data, slot->size);
   if (!edr_collector_should_admit_slot(slot, NULL, NULL)) {
-    s_health.collector_dropped++;
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SLOT_ADMISSION);
     return 0;
   }
   if (!edr_event_bus_try_push(s_bus, slot)) {
@@ -1409,7 +1430,7 @@ static void edr_registry_watch_emit(const char *path, const char *value_name,
   snprintf(interest.path, sizeof(interest.path), "%s", path);
   snprintf(interest.registry_path, sizeof(interest.registry_path), "%s", path);
   if (!edr_sensor_interest_should_admit(&interest)) {
-    s_health.collector_dropped++;
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SENSOR_INTEREST);
     return;
   }
 
@@ -1707,7 +1728,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   }
   char *xml = NULL;
   if (!edr_evt_render_xml_utf8(event, &xml)) {
-    s_health.collector_dropped++;
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SECURITY_RENDER);
     return ERROR_SUCCESS;
   }
   {
@@ -1719,7 +1740,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
     }
     if (event_id != 4688u) {
       free(xml);
-      s_health.collector_dropped++;
+      edr_collector_note_drop(EDR_COLLECTOR_DROP_SECURITY_UNSUPPORTED);
       return ERROR_SUCCESS;
     }
     s_health.security_4688_received++;
@@ -1800,7 +1821,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
       source_status != EDR_SLOT_KV_APPENDED ||
       (cmd_source_truncated && source_fields != EDR_SLOT_KV_APPENDED) ||
       (ri != EDR_SLOT_KV_APPENDED && rc != EDR_SLOT_KV_APPENDED)) {
-    s_health.security_4688_required_overflow_dropped++; s_health.collector_dropped++; return ERROR_SUCCESS;
+    s_health.security_4688_required_overflow_dropped++; edr_collector_note_drop(EDR_COLLECTOR_DROP_SECURITY_OVERFLOW); return ERROR_SUCCESS;
   }
   int degraded = cmd_source_truncated;
   for (size_t oi = 0; oi < sizeof(identity)/sizeof(identity[0]); oi++) if (identity[oi] == EDR_SLOT_KV_NO_SPACE || identity[oi] == EDR_SLOT_KV_VALUE_TOO_LONG) { degraded = 1; s_health.security_4688_identity_capacity_omitted_fields++; }
@@ -3093,12 +3114,38 @@ static int edr_collector_kernel_file_track_metadata(const EVENT_RECORD *record,
   return 0;
 }
 
+static EdrFileWriteUnresolvedReason edr_collector_file_write_failure_reason(
+    uint32_t actor_pid, const char *problem, EdrFileObjectResolutionStatus status) {
+  if (problem) {
+    if (strcmp(problem, EDR_P0_FILE_READ_REASON_FILE_KEY_AMBIGUOUS) == 0)
+      return EDR_FILE_WRITE_UNRESOLVED_KEY_AMBIGUOUS;
+    if (strcmp(problem, "file_write_binding_conflict") == 0)
+      return EDR_FILE_WRITE_UNRESOLVED_BINDING_CONFLICT;
+    if (strcmp(problem, "file_object_history_expired") == 0)
+      return EDR_FILE_WRITE_UNRESOLVED_HISTORY_DISCARDED;
+    if (strcmp(problem, EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED) == 0)
+      return EDR_FILE_WRITE_UNRESOLVED_PATH_UNAVAILABLE;
+  }
+  if (!actor_pid) return EDR_FILE_WRITE_UNRESOLVED_ACTOR;
+  switch (status) {
+    case EDR_FILE_OBJECT_CLOSED: return EDR_FILE_WRITE_UNRESOLVED_LIFETIME_ENDED;
+    case EDR_FILE_OBJECT_PATH_UNAVAILABLE: return EDR_FILE_WRITE_UNRESOLVED_PATH_UNAVAILABLE;
+    case EDR_FILE_OBJECT_CONFLICT: return EDR_FILE_WRITE_UNRESOLVED_OBJECT_CONFLICT;
+    case EDR_FILE_OBJECT_HISTORY_DISCARDED: return EDR_FILE_WRITE_UNRESOLVED_HISTORY_DISCARDED;
+    case EDR_FILE_OBJECT_UNKNOWN_BOUNDARY: return EDR_FILE_WRITE_UNRESOLVED_UNKNOWN_BOUNDARY;
+    /* A resolved object can still exceed the caller's destination capacity. */
+    case EDR_FILE_OBJECT_RESOLVED: return EDR_FILE_WRITE_UNRESOLVED_PATH_UNAVAILABLE;
+    default: return EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME;
+  }
+}
+
 static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
                                                   uint64_t event_ns, uint64_t *out_file_key,
                                                   char *path_out, size_t path_cap,
                                                   const char **out_gate_reason,
                                                   uint64_t *out_file_object,
-                                                  const char **out_binding_quality) {
+                                                  const char **out_binding_quality,
+                                                  EdrFileWriteUnresolvedReason *out_failure_reason) {
   const EVENT_DESCRIPTOR *descriptor;
   uint64_t file_key = 0u;
   uint64_t file_object = 0u;
@@ -3114,6 +3161,7 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   uint64_t diagnostic_ordinal = 0u;
   char problem_path[EDR_BR_STR_LONG];
   const char *problem_reason = NULL;
+  if (out_failure_reason) *out_failure_reason = EDR_FILE_WRITE_UNRESOLVED_INVALID_EVENT;
   if (out_file_key) *out_file_key = 0u;
   if (out_file_object) *out_file_object = 0u;
   if (out_binding_quality) *out_binding_quality = "etw_filekey_namecreate";
@@ -3145,6 +3193,7 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
   if ((!is_read && !edr_kernel_file_write_descriptor(descriptor) &&
        !edr_kernel_file_mutation_path_descriptor(descriptor)) ||
       !edr_tdh_kernel_file_extract_file_key((PEVENT_RECORD)record, &file_key) || !file_key) {
+    if (out_failure_reason) *out_failure_reason = EDR_FILE_WRITE_UNRESOLVED_MISSING_KEY;
     if (out_gate_reason) *out_gate_reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
     return 0;
   }
@@ -3296,6 +3345,9 @@ static int edr_collector_kernel_file_io_resolve(const EVENT_RECORD *record,
     } else if (out_gate_reason) {
       *out_gate_reason = EDR_P0_FILE_READ_REASON_CANONICAL_PATH_UNRESOLVED;
     }
+    if (out_failure_reason)
+      *out_failure_reason = edr_collector_file_write_failure_reason(
+          read_pid, have_problem ? problem_reason : NULL, object_resolution.status);
     if (is_read) s_health.file_read_name_cache_misses++;
     return 0;
   }
@@ -4148,6 +4200,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   uint64_t file_read_key = 0u;
   uint64_t file_write_object = 0u;
   const char *file_io_binding_quality = NULL;
+  EdrFileWriteUnresolvedReason file_write_failure = EDR_FILE_WRITE_UNRESOLVED_INVALID_EVENT;
   const int is_file_io = ty == EDR_EVENT_FILE_READ || ty == EDR_EVENT_FILE_WRITE ||
                         ty == EDR_EVENT_FILE_RENAME || ty == EDR_EVENT_FILE_DELETE ||
                         (ty == EDR_EVENT_FILE_CREATE && event_record &&
@@ -4171,11 +4224,14 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
       !edr_collector_kernel_file_io_resolve(event_record, timestamp_ns, &file_read_key,
                                               file_read_path, sizeof(file_read_path),
                                               &file_read_gate_reason, &file_write_object,
-                                              &file_io_binding_quality)) {
+                                              &file_io_binding_quality,
+                                              ty == EDR_EVENT_FILE_WRITE ? &file_write_failure : NULL)) {
     if (ty == EDR_EVENT_FILE_WRITE) {
       /* A kernel pointer is not a path. Missing/ambiguous name lifetimes
        * cannot create a ransomware mutation or borrow the NameCreate actor. */
-      uint64_t count = ++s_health.file_write_path_unresolved;
+      InterlockedIncrement64((volatile LONG64 *)&s_health.file_write_unresolved_reasons[file_write_failure]);
+      uint64_t count = (uint64_t)InterlockedIncrement64(
+          (volatile LONG64 *)&s_health.file_write_path_unresolved);
       if (count <= 3u || (count & (count - 1u)) == 0u) {
         fprintf(stderr, "[collector] FileWrite path unavailable pid=%lu file_key=0x%llx file_object=0x%llx count=%llu reason=%s\n",
                 (unsigned long)event_record->EventHeader.ProcessId,
@@ -4260,7 +4316,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         return;
       }
       if (!is_network && !edr_sensor_interest_should_admit(&interest_event)) {
-        s_health.collector_dropped++;
+        edr_collector_note_drop(EDR_COLLECTOR_DROP_SENSOR_INTEREST);
         return;
       }
     }
@@ -4353,7 +4409,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   if (!edr_collector_should_admit_slot(&slot, have_network_interest ? &interest_event : NULL,
                                        is_network ? &network_trace : NULL)) {
     if (is_network) edr_network_trace_finish(&network_trace);
-    s_health.collector_dropped++;
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SLOT_ADMISSION);
     return;
   }
 
@@ -4411,6 +4467,8 @@ void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
   (void)edr_collector_kernel_file_track_metadata(record, event_ns);
   if (edr_kernel_file_read_descriptor(&record->EventHeader.EventDescriptor))
     edr_collector_decode_mapped_event(record, EDR_EVENT_FILE_READ, "kfile", event_ns);
+  else if (edr_kernel_file_write_descriptor(&record->EventHeader.EventDescriptor))
+    edr_collector_decode_mapped_event(record, EDR_EVENT_FILE_WRITE, "kfile", event_ns);
 }
 
 int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
@@ -4421,6 +4479,7 @@ int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
 
 void edr_collector_file_io_test_health(EdrCollectorHealth *health) {
   *health = s_health;
+  edr_collector_disposition_snapshot(health);
   edr_collector_file_read_metadata_gate_copy_health(health);
 }
 
@@ -4443,7 +4502,10 @@ void edr_collector_network_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
   edr_collector_decode_mapped_event(record, EDR_EVENT_NET_CONNECT, "knet", event_ns);
 }
 
-void edr_collector_network_test_health(EdrCollectorHealth *out) { *out = s_health; }
+void edr_collector_network_test_health(EdrCollectorHealth *out) {
+  *out = s_health;
+  edr_collector_disposition_snapshot(out);
+}
 int edr_collector_network_test_bind_actor(EdrBehaviorRecord *record) {
   return edr_collector_network_bind_actor(record, NULL);
 }
@@ -5047,6 +5109,7 @@ int edr_collector_get_health(EdrCollectorHealth *out_health) {
   }
   edr_network_trace_flush();
   *out_health = s_health;
+  edr_collector_disposition_snapshot(out_health);
   edr_collector_file_read_metadata_gate_copy_health(out_health);
   /* Historical self-fuse fields stay zero for health-wire compatibility;
    * event-derived descendant suppression and its fuse no longer exist. */

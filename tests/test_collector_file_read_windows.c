@@ -10,6 +10,14 @@
 #include <string.h>
 #include <wchar.h>
 
+#ifdef NDEBUG
+#error Collector fixtures require active assertions
+#endif
+
+extern int edr_collector_test_sensor_admit;
+extern int edr_collector_test_rule_match;
+static int reject_bus;
+
 /* Capture the actual publication boundary; no resolver or slot logic lives
  * in this sink. Metadata and rejected Reads must never reach it. */
 struct EdrEventBus {
@@ -29,8 +37,9 @@ static const char old_path[] = "C:\\Fixture\\existing.txt";
 static const char new_path[] = "C:\\Fixture\\reused.txt";
 
 bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
-  assert(target == &bus && slot && slot->type == EDR_EVENT_FILE_READ);
+  assert(target == &bus && slot && (slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE));
   assert(slot->size && slot->size <= sizeof(slot->data));
+  if (reject_bus) return false;
   bus.last = *slot;
   ++bus.published;
   return true;
@@ -38,7 +47,7 @@ bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
 
 void edr_collector_file_io_test_before_binding(EdrEventSlot *slot) {
   if (binding_space == SIZE_MAX) return;
-  assert(slot->type == EDR_EVENT_FILE_READ);
+  assert(slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE);
   size_t used = strlen((const char *)slot->data);
   size_t target = sizeof(slot->data) - 1u - binding_space;
   assert(target > used + 10u && target < sizeof(slot->data));
@@ -72,17 +81,17 @@ static void make_event(Fixture *f, unsigned id, unsigned version, size_t width,
   f->record.EventHeader.ProviderId = EDR_ETW_GUID_KERNEL_FILE;
   f->record.EventHeader.Flags = width == 8u ? EVENT_HEADER_FLAG_64_BIT_HEADER
                                            : EVENT_HEADER_FLAG_32_BIT_HEADER;
-  f->record.EventHeader.ProcessId = id == 15u ? reader_pid : opener_pid;
+  f->record.EventHeader.ProcessId = (id == 15u || id == 16u) ? reader_pid : opener_pid;
   f->record.EventHeader.EventDescriptor.Id = (USHORT)id;
   f->record.EventHeader.EventDescriptor.Task = (USHORT)id;
   f->record.EventHeader.EventDescriptor.Version = (BYTE)(id <= 11u ? 0u : version);
   f->record.EventHeader.EventDescriptor.Level = 4u;
   f->record.EventHeader.EventDescriptor.Keyword = id <= 11u ? 0x10u
-      : id == 12u ? 0xa0u : id == 15u ? 0x120u : 0x20u;
+      : id == 12u ? 0xa0u : id == 15u ? 0x120u : id == 16u ? 0x220u : 0x20u;
   if (id <= 11u) {
     number(f, &used, key, width);
   } else {
-    if (id == 15u) number(f, &used, 0u, 8u); /* ByteOffset */
+    if (id == 15u || id == 16u) number(f, &used, 0u, 8u); /* ByteOffset */
     number(f, &used, 1u, width); /* Irp */
     if (version == 0u) number(f, &used, 7u, width); /* ThreadId */
     number(f, &used, object, width);
@@ -92,7 +101,7 @@ static void make_event(Fixture *f, unsigned id, unsigned version, size_t width,
       number(f, &used, 0u, 4u); /* CreateOptions */
       number(f, &used, 0u, 4u); /* CreateAttributes */
       number(f, &used, 3u, 4u); /* ShareAccess */
-    } else if (id == 15u) {
+    } else if (id == 15u || id == 16u) {
       number(f, &used, 512u, 4u); /* IOSize */
       number(f, &used, 0u, 4u); /* IOFlags */
       if (version == 1u) number(f, &used, 0u, 4u); /* ExtraFlags */
@@ -117,6 +126,9 @@ static void begin_case(const char *name) {
 static void reset(const char *name) {
   memset(&bus, 0, sizeof(bus));
   binding_space = SIZE_MAX;
+  reject_bus = 0;
+  edr_collector_test_sensor_admit = 1;
+  edr_collector_test_rule_match = 1;
   edr_collector_file_io_test_reset(&bus);
   begin_case(name);
 }
@@ -394,6 +406,142 @@ static void test_sequence(unsigned version, size_t width) {
   }
 }
 
+
+static void expect_write_failure(Fixture *write, uint64_t at,
+                                  EdrFileWriteUnresolvedReason reason) {
+  feed(write, at);
+  EdrCollectorHealth health;
+  EdrEventSlot pending;
+  edr_collector_file_io_test_health(&health);
+  assert(health.disposition_accounting_available);
+  assert(!bus.published && !edr_collector_file_io_test_pending(&pending));
+  assert(health.file_write_path_unresolved == 1u && !health.file_write_path_resolved);
+  assert(!health.collector_dropped && !health.queue_dropped && !health.file_write_payload_incomplete);
+  for (size_t i = 0u; i < EDR_FILE_WRITE_UNRESOLVED_REASON_COUNT; ++i) {
+    if (health.file_write_unresolved_reasons[i] != (i == (size_t)reason ? 1u : 0u)) diagnose();
+    assert(health.file_write_unresolved_reasons[i] == (i == (size_t)reason ? 1u : 0u));
+  }
+}
+
+static void test_write_accounting(unsigned version, size_t width) {
+  Fixture write, create, close, name;
+  const uint64_t object = 0x721101u, key = 0x721102u;
+  case_version = version;
+  case_width = width;
+  make_event(&write, 16u, version, width, object, key, NULL);
+  make_event(&create, 12u, version, width, object, 0u, old_name);
+  make_event(&close, 14u, version, width, object, key, NULL);
+  reset("write_invalid_timestamp");
+  expect_write_failure(&write, 0u, EDR_FILE_WRITE_UNRESOLVED_INVALID_EVENT);
+  reset("write_missing_key");
+  make_event(&write, 16u, version, width, object, 0u, NULL);
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_MISSING_KEY);
+  make_event(&write, 16u, version, width, object, key, NULL);
+  reset("write_no_retained_lifetime");
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_NO_LIFETIME);
+  reset("write_actor_unavailable");
+  feed(&create, 100u);
+  write.record.EventHeader.ProcessId = 0u;
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_ACTOR);
+  write.record.EventHeader.ProcessId = reader_pid;
+  reset("write_closed_lifetime");
+  feed(&create, 100u);
+  feed(&close, 200u);
+  expect_write_failure(&write, 250u, EDR_FILE_WRITE_UNRESOLVED_LIFETIME_ENDED);
+  reset("write_key_boundary_ambiguous");
+  make_event(&name, 10u, version, width, 0u, key, old_name);
+  feed(&name, 100u);
+  make_event(&name, 11u, version, width, 0u, key, NULL);
+  feed(&name, 200u);
+  expect_write_failure(&write, 200u, EDR_FILE_WRITE_UNRESOLVED_KEY_AMBIGUOUS);
+  reset("write_key_ambiguity_precedes_missing_actor");
+  make_event(&name, 10u, version, width, 0u, key, old_name);
+  feed(&name, 100u);
+  make_event(&name, 11u, version, width, 0u, key, NULL);
+  feed(&name, 200u);
+  write.record.EventHeader.ProcessId = 0u;
+  expect_write_failure(&write, 200u, EDR_FILE_WRITE_UNRESOLVED_KEY_AMBIGUOUS);
+  write.record.EventHeader.ProcessId = reader_pid;
+  reset("write_key_object_conflict");
+  make_event(&name, 10u, version, width, 0u, key, new_name);
+  feed(&name, 100u);
+  feed(&create, 110u);
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_BINDING_CONFLICT);
+  reset("write_object_conflict");
+  feed(&create, 100u);
+  make_event(&create, 12u, version, width, object, 0u, new_name);
+  feed(&create, 100u);
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_OBJECT_CONFLICT);
+  reset("write_path_unavailable");
+  WCHAR long_name[EDR_FILE_OBJECT_PATH_CAP + 1u];
+  for (size_t i = 0u; i < EDR_FILE_OBJECT_PATH_CAP; ++i) long_name[i] = L'x';
+  long_name[EDR_FILE_OBJECT_PATH_CAP] = L'\0';
+  make_event(&create, 12u, version, width, object, 0u, long_name);
+  feed(&create, 100u);
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_PATH_UNAVAILABLE);
+  reset("write_unknown_boundary");
+  make_event(&create, 12u, version, width, object, 0u, old_name);
+  feed(&create, 100u);
+  make_event(&close, 14u, version, width, 0u, 0u, NULL);
+  feed(&close, 120u);
+  expect_write_failure(&write, 150u, EDR_FILE_WRITE_UNRESOLVED_UNKNOWN_BOUNDARY);
+
+  reset("write_history_discarded");
+  /* Fill the production 4096-entry history and evict the oldest lifetime. */
+  for (size_t i = 0u; i <= 4096u; ++i) {
+    make_event(&create, 12u, version, width, object + i, 0u, old_name);
+    feed(&create, 100u + i);
+  }
+  expect_write_failure(&write, 100u, EDR_FILE_WRITE_UNRESOLVED_HISTORY_DISCARDED);
+
+  for (unsigned mode = 0; mode < 5u; ++mode) {
+    reset("write_resolved_disposition");
+    make_event(&create, 12u, version, width, object, 0u, old_name);
+    feed(&create, 100u);
+    edr_collector_test_sensor_admit = mode != 1u;
+    edr_collector_test_rule_match = mode != 2u;
+    reject_bus = mode == 3u;
+    if (mode == 4u) binding_space = 0u;
+    feed(&write, 150u);
+    EdrCollectorHealth health;
+    edr_collector_file_io_test_health(&health);
+    assert(health.file_write_path_unresolved == 0u);
+    assert(health.collector_dropped == (mode == 1u || mode == 2u ? 1u : 0u));
+    assert(health.collector_drop_reasons[EDR_COLLECTOR_DROP_SENSOR_INTEREST] == (mode == 1u ? 1u : 0u));
+    assert(health.collector_drop_reasons[EDR_COLLECTOR_DROP_SLOT_ADMISSION] == (mode == 2u ? 1u : 0u));
+    assert(health.queue_dropped == (mode == 3u ? 1u : 0u));
+    assert(health.file_write_payload_incomplete == (mode == 4u ? 1u : 0u));
+    assert(health.file_write_path_resolved == (mode == 1u || mode == 4u ? 0u : 1u));
+    assert(bus.published == (mode == 0u ? 1u : 0u));
+  }
+}
+
+/* Multiple decoder workers can reject concurrently. Invalid timestamps take
+ * the real resolver rejection exit without touching any ETW session or cache. */
+static DWORD WINAPI concurrent_write_failures(void *context) {
+  Fixture *write = (Fixture *)context;
+  for (unsigned i = 0u; i < 1000u; ++i) feed(write, 0u);
+  return 0u;
+}
+
+static void test_concurrent_write_accounting(void) {
+  Fixture write;
+  HANDLE workers[4];
+  reset("write_concurrent_reason_accounting");
+  make_event(&write, 16u, 1u, 8u, 0x721101u, 0x721102u, NULL);
+  for (size_t i = 0u; i < 4u; ++i) {
+    workers[i] = CreateThread(NULL, 0u, concurrent_write_failures, &write, 0u, NULL);
+    assert(workers[i]);
+  }
+  assert(WaitForMultipleObjects(4u, workers, TRUE, 30000u) == WAIT_OBJECT_0);
+  for (size_t i = 0u; i < 4u; ++i) assert(CloseHandle(workers[i]));
+  EdrCollectorHealth health;
+  edr_collector_file_io_test_health(&health);
+  assert(health.file_write_path_unresolved == 4000u);
+  assert(health.file_write_unresolved_reasons[EDR_FILE_WRITE_UNRESOLVED_INVALID_EVENT] == 4000u);
+  assert(!health.collector_dropped && !health.queue_dropped && !bus.published);
+}
+
 int main(void) {
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "[fixture] native collector diagnostic build; no ETW consumer is started, "
@@ -405,7 +553,10 @@ int main(void) {
   for (unsigned version = 0u; version <= 1u; ++version) {
     test_sequence(version, 4u);
     test_sequence(version, 8u);
+    test_write_accounting(version, 4u);
+    test_write_accounting(version, 8u);
   }
+  test_concurrent_write_accounting();
   /* A long-lived Agent handle can have no retained Create or NameCreate.
    * Suppress only the proven live Agent generation before it opens a P0 gate. */
   reset("self_unbound_read_does_not_open_gate");
