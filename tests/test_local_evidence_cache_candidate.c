@@ -5808,6 +5808,10 @@ static void run_migration_crash_child(const char *path, int phase) {
     done = waitpid(child, &status, WNOHANG); if (!done) usleep(10000);
   }
   if (done == 0) { kill(child, SIGKILL); waitpid(child, &status, 0); }
+  if (done != child || !WIFEXITED(status) || WEXITSTATUS(status) != 86)
+    fprintf(stderr, "migration crash child phase=%d wait=%ld status=%d exit=%d signal=%d\n",
+            phase, (long)done, status, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+            WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == 86);
 #endif
 }
@@ -6016,6 +6020,82 @@ static void test_compact_format_resume_and_projection(void) {
   cleanup_test_sqlite_path(path);
 }
 
+static void test_context_fact_collection_preserves_references(void) {
+  for (int format = 0; format <= 2; ++format) {
+    char path[512];
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+    edr_local_evidence_cache_close();
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    EdrContextStore store;
+    assert(edr_context_store_open(&store, db) == 0);
+    compact_exec(db,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<512) "
+        "INSERT INTO context_facts(fact_id,manifest_template_json,created_ns,updated_ns) "
+        "SELECT printf('%064x',(x*73)%512),'{\"candidate_id\":null,\"padding\":\"'||"
+        "printf('%03000d',x)||'\"}',1,1 FROM n;"
+        "INSERT INTO candidate_context_refs "
+        "SELECT 'candidate-'||(rowid%4)||':post_context:'||fact_id,'candidate-'||(rowid%4),"
+        "fact_id,'\"candidate-'||(rowid%4)||'\"',1,NULL,NULL FROM context_facts;"
+        "INSERT INTO candidate_context_refs SELECT artifact_id||'-shared','shared',fact_id,"
+        "'\"shared\"',NULL,NULL,NULL FROM candidate_context_refs LIMIT 1;");
+    if (format) {
+      assert(edr_context_store_begin_upgrade(&store) == 0);
+      unsigned moved = 0; int complete = 0;
+      do {
+        assert(edr_context_store_migrate_batch(&store, 64, &moved, &complete) == 0);
+      } while (format == 2 && !complete);
+      assert(store.format == format);
+    }
+    compact_exec(db, "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+    unsigned removed = 0;
+    if (format == 2) {
+      /* Compare pager reads on the same wide, fully referenced facts. This
+       * guards maintenance I/O without a timing or query-text assertion. */
+      int before = 0, after = 0, unused = 0;
+      compact_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);PRAGMA cache_size=-64;PRAGMA mmap_size=0;");
+      assert(sqlite3_db_release_memory(db) == SQLITE_OK);
+      assert(sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &before, &unused, 1) == SQLITE_OK);
+      compact_exec(db,
+          "DELETE FROM context_facts WHERE NOT EXISTS(SELECT 1 FROM candidate_context_refs r "
+          "WHERE r.fact_id=context_facts.fact_id) AND NOT EXISTS(SELECT 1 FROM context_fact_keys k "
+          "WHERE k.fact_id=context_facts.fact_id);");
+      assert(sqlite3_changes(db) == 0);
+      assert(sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &before, &unused, 1) == SQLITE_OK);
+      assert(sqlite3_db_release_memory(db) == SQLITE_OK);
+      assert(edr_context_store_collect_facts(&store, &removed) == 0 && removed == 0);
+      assert(sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, &after, &unused, 0) == SQLITE_OK);
+      assert(before > 0 && after * 2 < before);
+    }
+    compact_exec(db,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<20) "
+        "INSERT INTO context_facts(fact_id,manifest_template_json) SELECT 'unreferenced-'||x,'{}' FROM n;"
+        "INSERT INTO context_facts(fact_id,manifest_template_json) VALUES(NULL,'{}');");
+    if (format) {
+      compact_exec(db,
+          "INSERT INTO context_fact_keys(fact_id) SELECT fact_id FROM context_facts WHERE fact_id LIKE 'unreferenced-%';"
+          "INSERT INTO context_candidates(candidate_id,candidate_id_json) VALUES('unused','\"unused\"');");
+    }
+    compact_exec(db,
+        "CREATE TRIGGER fail_fact_collection BEFORE DELETE ON context_facts "
+        "WHEN OLD.fact_id='unreferenced-1' BEGIN SELECT RAISE(ABORT,'injected fact collection failure'); END;");
+    assert(edr_context_store_collect_facts(&store, &removed) == -1 && removed == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 533);
+    compact_assert_projection(db);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(&store, db) == 0 && store.format == format);
+    compact_exec(db, "DROP TRIGGER fail_fact_collection;");
+    assert(edr_context_store_collect_facts(&store, &removed) == 0 && removed == 21);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 512);
+    compact_assert_projection(db);
+    assert(edr_context_store_collect_facts(&store, &removed) == 0 && removed == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    cleanup_test_sqlite_path(path);
+  }
+}
+
 static void test_compact_runtime_replay_enrichment_and_failure(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -6101,6 +6181,7 @@ int main(int argc, char **argv) {
   test_compact_near_full_migration_releases_clean_pages();
   test_compact_near_full_existing_page_rewrites();
   test_compact_format_resume_and_projection();
+  test_context_fact_collection_preserves_references();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();
   test_legacy_command_quality_is_unknown_until_observed();

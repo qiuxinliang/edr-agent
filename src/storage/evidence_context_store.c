@@ -354,10 +354,16 @@ int edr_context_store_collect_facts(EdrContextStore *s, unsigned *removed) {
   *removed = 0;
   if (s->format && sql(s, "DELETE FROM context_fact_keys WHERE NOT EXISTS (SELECT 1 FROM compact_context_refs r "
                          "WHERE r.fact_key=context_fact_keys.id);") != 0) return -1;
+  /* Select identities through the existing covering index before touching
+   * fact rows. A direct DELETE scan reads pages containing the wide manifest
+   * bodies even when every fact is still referenced. Rowids are used only
+   * inside this statement; no persistent identity or deletion predicate changes. */
   const char *query = s->format ?
-    "DELETE FROM context_facts WHERE NOT EXISTS (SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id) "
-    "AND NOT EXISTS(SELECT 1 FROM context_fact_keys k WHERE k.fact_id=context_facts.fact_id);"
-    : "DELETE FROM context_facts WHERE NOT EXISTS (SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id);";
+    "DELETE FROM context_facts WHERE rowid IN (SELECT f.rowid FROM context_facts f "
+    "WHERE NOT EXISTS (SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=f.fact_id) "
+    "AND NOT EXISTS(SELECT 1 FROM context_fact_keys k WHERE k.fact_id=f.fact_id));"
+    : "DELETE FROM context_facts WHERE rowid IN (SELECT f.rowid FROM context_facts f "
+      "WHERE NOT EXISTS (SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=f.fact_id));";
   if (sql(s, query) != 0) return -1;
   *removed = (unsigned)sqlite3_changes(s->db);
   if (s->format && sql(s, "DELETE FROM context_candidates WHERE NOT EXISTS (SELECT 1 FROM compact_context_refs r "
