@@ -17,6 +17,8 @@ void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns);
 int edr_collector_file_io_test_pending(EdrEventSlot *slot);
 void edr_collector_file_io_test_health(EdrCollectorHealth *health);
 void edr_collector_file_io_test_self_identity(const EdrLiveProcessGeneration *identity);
+/* Isolated processing-clock control; zero restores the production clock. */
+void edr_collector_file_io_test_canary_clock(uint64_t processing_ns);
 /* Test-owned injection at the real binding append boundary. */
 void edr_collector_file_io_test_before_binding(EdrEventSlot *slot);
 

@@ -542,6 +542,107 @@ static void test_concurrent_write_accounting(void) {
   assert(!health.collector_dropped && !health.queue_dropped && !bus.published);
 }
 
+static void test_canary_processing_time(unsigned version, size_t width) {
+  const char *const cases[] = {
+      "canary_write_path_late_event", "canary_write_registered_late_event",
+      "canary_read_registered_late_event", "canary_read_future_event",
+      "canary_write_no_start_key", "canary_write_diagnostic_self",
+      "canary_write_expired", "canary_read_expired",
+      "canary_write_expired_conflicting_start_key", "canary_concurrent_newer_registration"};
+  const uint64_t processing = UINT64_C(1000000000);
+  EdrLiveProcessGeneration self = {
+      reader_pid, UINT64_C(0x7211), UINT64_C(116444736000000001)};
+  case_version = version;
+  case_width = width;
+  assert(_putenv_s("EDR_POLICY_CANARY_TTL_S", "120") == 0);
+  for (unsigned mode = 0u; mode < sizeof(cases) / sizeof(cases[0]); ++mode) {
+    Fixture create, io;
+    const int is_read = mode == 2u || mode == 3u || mode == 7u;
+    const int expired = mode >= 6u && mode <= 8u;
+    uint64_t start_key = mode == 8u ? UINT64_C(0x9999) : self.process_start_key;
+    EVENT_HEADER_EXTENDED_DATA_ITEM extended;
+    reset(cases[mode]);
+    edr_collector_file_io_test_self_identity(&self);
+    edr_collector_file_io_test_canary_clock(processing);
+    if (mode != 0u && mode != 4u && mode != 5u)
+      edr_collector_register_policy_canary_process(reader_pid, "EDR_POLICY_CANARY_registered");
+    make_event(&create, 12u, version, width, 0x721101u, 0u,
+               mode == 0u || mode == 4u || mode == 5u
+                   ? L"C:\\Fixture\\EDR_POLICY_CANARY_late.txt" : old_name);
+    make_event(&io, is_read ? 15u : 16u, version, width, 0x721101u, 0x721102u, NULL);
+    memset(&extended, 0, sizeof(extended));
+    extended.ExtType = 13u; /* documented ProcessStartKey extended item */
+    extended.DataSize = sizeof(start_key);
+    extended.DataPtr = (ULONGLONG)(ULONG_PTR)&start_key;
+    if (mode != 4u) {
+      io.record.ExtendedData = &extended;
+      io.record.ExtendedDataCount = 1u;
+    }
+    if (expired) edr_collector_file_io_test_canary_clock(processing + UINT64_C(120000000001));
+    /* Models a caller whose clock capture preceded another worker's refresh. */
+    if (mode == 9u) edr_collector_file_io_test_canary_clock(processing - 1u);
+    if (mode == 5u) assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "1") == 0);
+    feed(&create, 100u);
+    uint64_t event_ns = mode == 3u ? UINT64_C(500000000000) : 150u;
+    feed(&io, event_ns);
+    EdrCollectorHealth health;
+    EdrEventSlot pending;
+    edr_collector_file_io_test_health(&health);
+    const unsigned expected = mode == 6u || mode == 7u ? 0u : 1u;
+    if (bus.published != expected) diagnose();
+    assert(bus.published == expected && !edr_collector_file_io_test_pending(&pending));
+    assert(health.agent_self_record_suppressed == 0u);
+    assert(health.agent_self_interest_suppressed == (mode == 6u ? 1u : 0u));
+    assert(health.agent_self_direct_pid_suppressed == (mode == 7u ? 1u : 0u));
+    assert(health.collector_dropped == 0u && health.file_write_path_unresolved == 0u);
+    if (expected) {
+      EdrBehaviorRecord br;
+      edr_behavior_from_slot(&bus.last, &br);
+      assert(br.pid == reader_pid && br.event_time_ns == (int64_t)event_ns);
+      assert(br.process_start_key == (mode == 4u ? 0u : start_key));
+    }
+    assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
+  }
+  edr_collector_file_io_test_canary_clock(0u);
+}
+
+static DWORD WINAPI register_canary_concurrently(void *context) {
+  uint32_t pid = (uint32_t)(ULONG_PTR)context;
+  for (unsigned i = 0u; i < 1000u; ++i)
+    edr_collector_register_policy_canary_process(pid, "EDR_POLICY_CANARY_parallel");
+  return 0u;
+}
+
+static void test_concurrent_canary_registration(void) {
+  HANDLE workers[4];
+  Fixture create, write;
+  reset("canary_parallel_registration");
+  edr_collector_file_io_test_canary_clock(UINT64_C(1000000000));
+  for (size_t i = 0u; i < 4u; ++i) {
+    workers[i] = CreateThread(NULL, 0u, register_canary_concurrently,
+                             (void *)(ULONG_PTR)(reader_pid + i), 0u, NULL);
+    assert(workers[i]);
+  }
+  assert(WaitForMultipleObjects(4u, workers, TRUE, 30000u) == WAIT_OBJECT_0);
+  for (size_t i = 0u; i < 4u; ++i) {
+    assert(CloseHandle(workers[i]));
+    EdrLiveProcessGeneration self = {
+        reader_pid + (uint32_t)i, UINT64_C(0x7211), UINT64_C(116444736000000001)};
+    edr_collector_file_io_test_self_identity(&self);
+    make_event(&create, 12u, 1u, 8u, 0x721101u + i, 0u, old_name);
+    make_event(&write, 16u, 1u, 8u, 0x721101u + i, 0x721102u, NULL);
+    write.record.EventHeader.ProcessId = self.pid;
+    EVENT_HEADER_EXTENDED_DATA_ITEM extended;
+    memset(&extended, 0, sizeof(extended));
+    extended.ExtType = 13u; extended.DataSize = sizeof(self.process_start_key);
+    extended.DataPtr = (ULONGLONG)(ULONG_PTR)&self.process_start_key;
+    write.record.ExtendedData = &extended; write.record.ExtendedDataCount = 1u;
+    feed(&create, 100u); feed(&write, 150u);
+    assert(bus.published == i + 1u);
+  }
+  edr_collector_file_io_test_canary_clock(0u);
+}
+
 int main(void) {
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "[fixture] native collector diagnostic build; no ETW consumer is started, "
@@ -555,8 +656,11 @@ int main(void) {
     test_sequence(version, 8u);
     test_write_accounting(version, 4u);
     test_write_accounting(version, 8u);
+    test_canary_processing_time(version, 4u);
+    test_canary_processing_time(version, 8u);
   }
   test_concurrent_write_accounting();
+  test_concurrent_canary_registration();
   /* A long-lived Agent handle can have no retained Create or NameCreate.
    * Suppress only the proven live Agent generation before it opens a P0 gate. */
   reset("self_unbound_read_does_not_open_gate");

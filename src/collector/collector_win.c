@@ -333,6 +333,10 @@ static uint32_t s_device_map_count;
 static uint32_t s_policy_canary_pid_cache[EDR_POLICY_CANARY_PID_CACHE];
 static uint64_t s_policy_canary_seen_ns[EDR_POLICY_CANARY_PID_CACHE];
 static uint32_t s_policy_canary_pid_next;
+static SRWLOCK s_policy_canary_lock = SRWLOCK_INIT;
+#ifdef EDR_COLLECTOR_FILE_IO_TESTING
+static uint64_t s_policy_canary_test_now_ns;
+#endif
 #define EDR_ETW_SEMANTIC_CACHE_SIZE 256u
 
 typedef struct {
@@ -956,37 +960,63 @@ static uint64_t edr_policy_canary_ttl_ns(void) {
          1000000000ULL;
 }
 
+/* Canary retention is a processing-time lease. Source event time remains
+ * authoritative for actor lifetimes, but must never expire this lease. */
+static uint64_t edr_policy_canary_now_ns(void) {
+#ifdef EDR_COLLECTOR_FILE_IO_TESTING
+  if (s_policy_canary_test_now_ns) return s_policy_canary_test_now_ns;
+#endif
+  return edr_monotonic_ns();
+}
+
+static void edr_policy_canary_reset(void) {
+  AcquireSRWLockExclusive(&s_policy_canary_lock);
+  memset(s_policy_canary_pid_cache, 0, sizeof(s_policy_canary_pid_cache));
+  memset(s_policy_canary_seen_ns, 0, sizeof(s_policy_canary_seen_ns));
+  s_policy_canary_pid_next = 0u;
+  ReleaseSRWLockExclusive(&s_policy_canary_lock);
+}
+
 static void edr_policy_canary_mark_pid(uint32_t pid, uint64_t now_ns) {
-  if (pid == 0u) {
+  if (pid == 0u || now_ns == 0u) {
     return;
   }
+  AcquireSRWLockExclusive(&s_policy_canary_lock);
   for (uint32_t i = 0; i < EDR_POLICY_CANARY_PID_CACHE; i++) {
     if (s_policy_canary_pid_cache[i] == pid) {
-      s_policy_canary_seen_ns[i] = now_ns;
+      if (now_ns > s_policy_canary_seen_ns[i]) s_policy_canary_seen_ns[i] = now_ns;
+      ReleaseSRWLockExclusive(&s_policy_canary_lock);
       return;
     }
   }
   uint32_t idx = s_policy_canary_pid_next++ % EDR_POLICY_CANARY_PID_CACHE;
   s_policy_canary_pid_cache[idx] = pid;
   s_policy_canary_seen_ns[idx] = now_ns;
+  ReleaseSRWLockExclusive(&s_policy_canary_lock);
 }
 
 static int edr_policy_canary_pid_seen(uint32_t pid, uint64_t now_ns) {
   const uint64_t ttl_ns = edr_policy_canary_ttl_ns();
-  if (pid == 0u) {
+  if (pid == 0u || now_ns == 0u) {
     return 0;
   }
+  AcquireSRWLockExclusive(&s_policy_canary_lock);
   for (uint32_t i = 0; i < EDR_POLICY_CANARY_PID_CACHE; i++) {
     if (s_policy_canary_pid_cache[i] != pid) {
       continue;
     }
-    if (now_ns >= s_policy_canary_seen_ns[i] && now_ns - s_policy_canary_seen_ns[i] <= ttl_ns) {
+    /* Another worker can refresh the entry after this caller captures now.
+     * That newer registration is active; do not clear it as a time reversal. */
+    if (now_ns <= s_policy_canary_seen_ns[i] || now_ns - s_policy_canary_seen_ns[i] <= ttl_ns) {
+      ReleaseSRWLockExclusive(&s_policy_canary_lock);
       return 1;
     }
     s_policy_canary_pid_cache[i] = 0u;
     s_policy_canary_seen_ns[i] = 0u;
+    ReleaseSRWLockExclusive(&s_policy_canary_lock);
     return 0;
   }
+  ReleaseSRWLockExclusive(&s_policy_canary_lock);
   return 0;
 }
 
@@ -994,13 +1024,13 @@ void edr_collector_register_policy_canary_process(uint32_t pid, const char *comm
   if (pid == 0u || !edr_policy_canary_marker(command)) {
     return;
   }
-  edr_policy_canary_mark_pid(pid, edr_unix_ns());
+  edr_policy_canary_mark_pid(pid, edr_policy_canary_now_ns());
 }
 
 static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
   uint64_t now;
   if (!ev || edr_collector_keep_agent_self_events()) return 0;
-  now = edr_unix_ns();
+  now = edr_policy_canary_now_ns();
   if (edr_policy_canary_marker(ev->path) || edr_policy_canary_marker(ev->registry_path) ||
       edr_policy_canary_pid_seen(ev->pid, now) ||
       edr_policy_canary_pid_seen(ev->parent_pid, now)) {
@@ -1014,7 +1044,7 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
 static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
   uint64_t now;
   if (!br || edr_collector_keep_agent_self_events()) return 0;
-  now = br->event_time_ns > 0 ? (uint64_t)br->event_time_ns : edr_unix_ns();
+  now = edr_policy_canary_now_ns();
   if (edr_policy_canary_marker(br->cmdline) || edr_policy_canary_pid_seen(br->pid, now) ||
       edr_policy_canary_pid_seen(br->ppid, now)) {
     edr_policy_canary_mark_pid(br->pid, now);
@@ -3505,7 +3535,7 @@ static int edr_agent_self_suppress_file_read_source(const EVENT_RECORD *record,
     return 0;
   }
   pid = record->EventHeader.ProcessId;
-  if (edr_policy_canary_pid_seen(pid, event_ns)) return 0;
+  if (edr_policy_canary_pid_seen(pid, edr_policy_canary_now_ns())) return 0;
   (void)edr_collector_event_process_start_key(record, &start_key);
   if (!edr_collector_self_identity_matches_file_read(
           &s_agent_self_identity, pid, event_ns, start_key)) return 0;
@@ -4456,6 +4486,12 @@ void edr_collector_file_io_test_reset(EdrEventBus *bus) {
   memset(s_file_read_metadata_coalesce, 0, sizeof(s_file_read_metadata_coalesce));
   s_file_read_metadata_coalesce_next = 0u;
   edr_collector_file_key_cache_reset();
+  edr_policy_canary_reset();
+  s_policy_canary_test_now_ns = 0u;
+}
+
+void edr_collector_file_io_test_canary_clock(uint64_t processing_ns) {
+  s_policy_canary_test_now_ns = processing_ns;
 }
 
 uint64_t edr_collector_file_io_test_new_epoch(void) {
@@ -4888,9 +4924,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   edr_collector_file_read_metadata_gate_session_starting();
   memset(s_device_map, 0, sizeof(s_device_map));
   edr_collector_init_device_map();
-  memset(s_policy_canary_pid_cache, 0, sizeof(s_policy_canary_pid_cache));
-  memset(s_policy_canary_seen_ns, 0, sizeof(s_policy_canary_seen_ns));
-  s_policy_canary_pid_next = 0u;
+  edr_policy_canary_reset();
   edr_sensor_interest_lazy_init();
 
   ULONG name_bytes =
