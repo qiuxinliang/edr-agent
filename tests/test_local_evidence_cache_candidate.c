@@ -6240,6 +6240,10 @@ static void test_compact_near_full_migration_releases_clean_pages(void) {
   sqlite3 *db = NULL;
   EdrEvidenceMigrationResult result;
   int rc = edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result);
+  fprintf(stderr, "near-full migration result: rc=%d elapsed_ms=%llu moved=%llu batches=%llu peak_bytes=%llu budget_bytes=%llu\n",
+          rc, (unsigned long long)result.elapsed_ms, (unsigned long long)result.moved_refs,
+          (unsigned long long)result.batches, (unsigned long long)result.peak_physical_bytes,
+          (unsigned long long)budget * 1048576u);
   if (rc) fprintf(stderr, "near-full migration: %s (%llu moved)\n", result.error, (unsigned long long)result.moved_refs);
   assert(rc == 0 && result.complete && result.format == 2);
   assert(result.moved_refs == 4099 && result.peak_physical_bytes <= (uint64_t)budget * 1048576);

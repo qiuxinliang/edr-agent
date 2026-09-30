@@ -308,8 +308,12 @@ int edr_context_store_migrate_batch(EdrContextStore *s, unsigned limit,
   }
   if (sql(s, "BEGIN IMMEDIATE;") != 0) return -1;
   if (edr_context_writer_open(s, &writer) != 0) goto rollback;
+  /* Follow the existing artifact primary-key index. Rowid order can scatter
+   * each small batch across the wide artifact/candidate indexes, exhausting
+   * the migration reserve and repeating work after rollback. Identity order
+   * keeps related references together without a sort buffer or a new index. */
   if (prepare(s, &read, "SELECT artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key "
-                        "FROM candidate_context_refs ORDER BY rowid LIMIT 1;") != 0) goto done;
+                        "FROM candidate_context_refs ORDER BY artifact_id LIMIT 1;") != 0) goto done;
   for (unsigned i = 0; i < limit; ++i) {
     int rc = sqlite3_step(read);
     if (rc == SQLITE_DONE) { *complete = 1; break; }
