@@ -384,10 +384,12 @@ namespace FDSecurity {
   `$agentArgs = "--config " + (Quote-FDNativeArg `$cfg)
   Write-FDTaskLog ("args=`$agentArgs")
   `$p = Start-Process -FilePath `$exe -ArgumentList `$agentArgs -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop
+  # Retain the original process handle before it exits. Reopening by PID after
+  # exit can lose ExitCode; casting that null value to int incorrectly reports 0.
+  `$null = `$p.Handle
   Write-FDTaskLog ("started_pid=" + `$p.Id + " inherited_kill_on_close_job=1")
   Start-Sleep -Seconds 4
-  `$alive = Get-Process -Id `$p.Id -ErrorAction SilentlyContinue
-  if (-not `$alive) {
+  if (`$p.HasExited) {
     try { `$p.Refresh(); Write-FDTaskLog ("process_exited_early exit_code=" + `$p.ExitCode) } catch { Write-FDTaskLog "process_exited_early" }
     try { if (Test-Path -LiteralPath `$stderrPath) { Get-Content -LiteralPath `$stderrPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stderr " + `$_) } } } catch {}
     try { if (Test-Path -LiteralPath `$stdoutPath) { Get-Content -LiteralPath `$stdoutPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stdout " + `$_) } } } catch {}
@@ -397,6 +399,7 @@ namespace FDSecurity {
   try {
     `$p.WaitForExit()
     `$p.Refresh()
+    if (`$null -eq `$p.ExitCode) { throw 'Agent exit code is unavailable' }
     `$exitCode = [int]`$p.ExitCode
     Write-FDTaskLog ("process_exit exit_code=" + `$exitCode)
     try { if (Test-Path -LiteralPath `$stderrPath) { Get-Content -LiteralPath `$stderrPath -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { Write-FDTaskLog ("stderr " + `$_) } } } catch {}

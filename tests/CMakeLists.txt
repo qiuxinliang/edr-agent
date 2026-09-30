@@ -8,6 +8,11 @@ add_test(NAME python_installer_config_contract
 set_tests_properties(python_installer_config_contract PROPERTIES TIMEOUT 120)
 
 if(OpenSSL_FOUND)
+  add_executable(test_openssl_tls_handshake ${CMAKE_CURRENT_SOURCE_DIR}/test_openssl_tls_handshake.c)
+  edr_apply_test_warnings(test_openssl_tls_handshake)
+  target_link_libraries(test_openssl_tls_handshake PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  add_test(NAME openssl_tls_handshake COMMAND test_openssl_tls_handshake)
+  set_tests_properties(openssl_tls_handshake PROPERTIES TIMEOUT 30)
   add_executable(test_command_signature_cross_language
     ${CMAKE_CURRENT_SOURCE_DIR}/test_command_signature_cross_language.c
     ${CMAKE_SOURCE_DIR}/src/command/command_signature.c
@@ -603,6 +608,12 @@ if(WIN32)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   # Four bounded TLS clients/servers plus real RSA CSR/certreq and rollback.
   set_tests_properties(windows_install_compatibility_behavior PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+  add_executable(test_windows_task_exit_fixture ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_exit_fixture.c)
+  add_test(NAME windows_task_exit_behavior
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_exit.ps1
+      -RepositoryRoot ${CMAKE_SOURCE_DIR} -Fixture $<TARGET_FILE:test_windows_task_exit_fixture>)
+  set_tests_properties(windows_task_exit_behavior PROPERTIES TIMEOUT 60)
 endif()
 
 if(WIN32)

@@ -25,6 +25,17 @@ be revisited separately if hardware signing is needed later.
 
 ## Daily release and failure recovery
 
+The ARM64 dependency triplet overrides OpenSSL 3.6.3's `/Gs0` with the compiler
+default `/Gs4096`, following OpenSSL commit
+`e9344b082ffa78cb1d68f6446c1b6417c4244a00`. This avoids ARM64 prologue corruption;
+`/GS`, large-frame stack probes, certificate validation and dependency versions
+remain enabled/unchanged. Remove the override when the pinned port contains that
+fix. The configuration and triplet participate in cache identity and vcpkg ABI
+validation. Release gates now exercise the linked TLS 1.2/1.3 libraries with
+trusted mutual authentication, untrusted certificates, wrong hostnames and missing
+client certificates. Task launcher tests also require the real native exit code
+before and after the startup observation period.
+
 Choose one entry point: push `win_M.m.p`, **or** manually run the release workflow
 with that version. Both now share a version-level concurrency group, without
 cancelling a running release. A completed release with the same commit/mode is

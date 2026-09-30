@@ -19,6 +19,8 @@ on:
       - scripts/vcpkg_cache_key.py
       - scripts/Initialize-VSEnvironment.ps1
       - scripts/bootstrap_pinned_vcpkg.ps1
+      - vcpkg-configuration.json
+      - triplets/arm64-windows.cmake
       - .github/workflows/edr-agent-prebuild-packages.yml
 
 permissions:

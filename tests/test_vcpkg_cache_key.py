@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,8 @@ SPEC.loader.exec_module(MODULE)
 
 KEY_INPUTS = (
     "vcpkg.json",
+    "vcpkg-configuration.json",
+    "triplets/arm64-windows.cmake",
     "dependencies.lock.json",
     "scripts/Initialize-VSEnvironment.ps1",
     "scripts/bootstrap_pinned_vcpkg.ps1",
@@ -26,6 +29,24 @@ KEY_INPUTS = (
 
 
 class VcpkgCacheKeyTests(unittest.TestCase):
+    def test_arm64_probe_override_only_applies_to_openssl(self):
+        root = SCRIPT.resolve().parents[1]
+        config = json.loads((root / "vcpkg-configuration.json").read_text())
+        self.assertIn("triplets", config["overlay-triplets"])
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "triplet.cmake"
+            script.write_text(
+                f'include("{(root / "triplets/arm64-windows.cmake").as_posix()}")\n'
+                'message("arch=${VCPKG_TARGET_ARCHITECTURE};crt=${VCPKG_CRT_LINKAGE};'
+                'link=${VCPKG_LIBRARY_LINKAGE};c=${VCPKG_C_FLAGS};cxx=${VCPKG_CXX_FLAGS}")\n'
+            )
+            for port in ("openssl", "curl", "sqlite3"):
+                result = subprocess.run(["cmake", f"-DPORT={port}", "-P", str(script)],
+                                        check=True, capture_output=True, text=True, timeout=15)
+                flags = "/Gs4096" if port == "openssl" else ""
+                self.assertEqual(result.stderr.strip(),
+                                 f"arch=arm64;crt=dynamic;link=dynamic;c={flags};cxx={flags}")
+
     def make_root(self, directory: str) -> Path:
         root = Path(directory)
         for index, relative in enumerate(KEY_INPUTS):

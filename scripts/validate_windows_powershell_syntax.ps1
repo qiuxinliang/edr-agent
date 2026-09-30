@@ -40,6 +40,7 @@ $relativePaths = @(
   "tests\test_windows_installer_acl.ps1",
   "tests\test_vcpkg_install_retry.ps1",
   "tests\test_vs_host_architecture.ps1",
+  "tests\test_windows_task_exit.ps1",
   "install\windows-inno\Build-BundledInstaller.ps1",
   "install\windows-inno\edr_install_wizard_enroll.ps1",
   "install\windows-inno\edr_windows_autorun.ps1",
