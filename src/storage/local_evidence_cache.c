@@ -145,6 +145,7 @@ typedef struct {
   uint64_t registry_drops;
   uint64_t network_drops;
   uint64_t other_drops;
+  uint64_t committed[4];
 } MetricSlot;
 
 typedef struct {
@@ -214,6 +215,7 @@ static RingSlot s_ring[EDR_EVIDENCE_RING_SLOTS];
 static RingSlot s_context_ring[EDR_EVIDENCE_CONTEXT_RING_SLOTS];
 static ContextWindowSlot s_context_windows[EDR_EVIDENCE_CONTEXT_WINDOWS];
 static MetricSlot s_metrics[EDR_EVIDENCE_METRIC_SLOTS];
+static uint64_t s_metric_retry_after_ns;
 static CandidateDedupeSlot s_candidate_dedupe[EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS];
 static OrdinaryAggregateSlot s_ordinary_agg[EDR_EVIDENCE_AGG_SLOTS];
 static uint32_t s_ring_pos;
@@ -1452,10 +1454,24 @@ static int is_network_event_type(uint32_t type) {
          type == (uint32_t)EDR_EVENT_NET_TLS_HANDSHAKE;
 }
 
+static int metric_slot_pending(const MetricSlot *m) {
+  return m->minute_unix != 0 &&
+         (m->file_drops != m->committed[0] || m->registry_drops != m->committed[1] ||
+          m->network_drops != m->committed[2] || m->other_drops != m->committed[3]);
+}
+
+#if defined(EDR_HAVE_SQLITE)
+static int sqlite_flush_metrics(int final_attempt);
+#endif
+
 static MetricSlot *metric_slot_for(const EdrBehaviorRecord *r, int64_t event_time_ns) {
   int64_t minute = (event_time_ns / 1000000000LL) / 60LL;
+  int64_t cutoff = (now_unix_ns() / 1000000000LL -
+                    (int64_t)s_status.retention_hours * 3600LL) / 60LL;
+  if (minute < cutoff) return NULL;
   const char *endpoint_id = (r && r->endpoint_id[0]) ? r->endpoint_id : "";
   MetricSlot *empty = NULL;
+  MetricSlot *clean = NULL;
   MetricSlot *oldest = &s_metrics[0];
   for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; i++) {
     MetricSlot *m = &s_metrics[i];
@@ -1470,8 +1486,23 @@ static MetricSlot *metric_slot_for(const EdrBehaviorRecord *r, int64_t event_tim
     if (m->minute_unix < oldest->minute_unix) {
       oldest = m;
     }
+    if (m->minute_unix != 0 && !metric_slot_pending(m) &&
+        (!clean || m->minute_unix < clean->minute_unix)) {
+      clean = m;
+    }
   }
-  MetricSlot *m = empty ? empty : oldest;
+  /* Reuse committed slots before flushing. Otherwise a series of distinct
+   * late minutes can make the newest dirty slot the next oldest victim and
+   * force a database transaction for every event. */
+  MetricSlot *m = empty ? empty : (clean ? clean : oldest);
+#if defined(EDR_HAVE_SQLITE)
+  if (!empty && metric_slot_pending(m) && sqlite_flush_metrics(0) != 0) {
+    /* Existing slots can keep accumulating. Do not erase their pending counts
+     * merely to accept another key while storage is unavailable. */
+    s_status.metric_unrecorded++;
+    return NULL;
+  }
+#endif
   if (!empty && m->minute_unix != 0) {
     s_status.metric_slot_evictions++;
   }
@@ -1485,16 +1516,16 @@ static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns
   MetricSlot *m = metric_slot_for(r, event_time_ns);
   uint32_t type = r ? (uint32_t)r->type : 0u;
   if (is_file_event_type(type)) {
-    m->file_drops++;
+    if (m) m->file_drops++;
     s_status.metric_file_drops++;
   } else if (is_registry_event_type(type)) {
-    m->registry_drops++;
+    if (m) m->registry_drops++;
     s_status.metric_registry_drops++;
   } else if (is_network_event_type(type)) {
-    m->network_drops++;
+    if (m) m->network_drops++;
     s_status.metric_network_drops++;
   } else {
-    m->other_drops++;
+    if (m) m->other_drops++;
     s_status.metric_other_drops++;
   }
 }
@@ -4311,43 +4342,96 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   return 0;
 }
 
-static void sqlite_flush_metrics(void) {
-  if (!s_db) {
-    return;
+/* The cache mutex serializes producers with this bounded batch. Watermarks
+ * describe only successfully committed counts from this process, so reopening
+ * in the same minute adds new observations without replacing earlier totals. */
+static int sqlite_flush_metrics(int final_attempt) {
+  int pending = 0, began = 0, rc;
+  sqlite3_stmt *st = NULL;
+  uint64_t now = edr_monotonic_ns();
+  int64_t cutoff = (now_unix_ns() / 1000000000LL -
+                    (int64_t)s_status.retention_hours * 3600LL) / 60LL;
+  for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
+    MetricSlot *m = &s_metrics[i];
+    if (m->minute_unix != 0 && m->minute_unix < cutoff) {
+      /* Retirement follows the same minute boundary as DELETE in maintenance.
+       * It must also apply during slot replacement and final close. */
+      memset(m, 0, sizeof(*m));
+    }
+    if (metric_slot_pending(m)) pending = 1;
+  }
+  if (!pending) return 0;
+  if (!final_attempt && now < s_metric_retry_after_ns) return -1;
+  if (!s_db) { set_error("metrics flush has no database"); goto failed; }
+  if (!sqlite3_get_autocommit(s_db)) {
+    set_error("metrics flush refused inside an existing transaction");
+    goto failed;
   }
   const char *sql =
       "INSERT INTO metrics(minute_unix,endpoint_id,metric_name,value) VALUES(?,?,?,?) "
-      "ON CONFLICT(minute_unix,endpoint_id,metric_name) DO UPDATE SET value=excluded.value;";
-  for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; i++) {
+      "ON CONFLICT(minute_unix,endpoint_id,metric_name) DO UPDATE "
+      "SET value=metrics.value+excluded.value "
+      "WHERE metrics.value>=0 AND metrics.value<=9223372036854775807-excluded.value;";
+  rc = sqlite3_exec(s_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
+  if (rc != SQLITE_OK) { set_error("metrics transaction begin failed"); goto failed; }
+  began = 1;
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+    set_error("metrics statement prepare failed"); goto failed;
+  }
+  static const char *names[] = {"file_drops", "registry_drops", "network_drops", "other_drops"};
+  for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
     MetricSlot *m = &s_metrics[i];
-    if (m->minute_unix == 0) {
-      continue;
-    }
-    const struct {
-      const char *name;
-      uint64_t value;
-    } metrics[] = {
-        {"file_drops", m->file_drops},
-        {"registry_drops", m->registry_drops},
-        {"network_drops", m->network_drops},
-        {"other_drops", m->other_drops},
-    };
-    for (size_t j = 0; j < sizeof(metrics) / sizeof(metrics[0]); j++) {
-      if (metrics[j].value == 0u) {
-        continue;
+    uint64_t values[] = {m->file_drops, m->registry_drops, m->network_drops, m->other_drops};
+    for (size_t j = 0; m->minute_unix != 0 && j < 4u; ++j) {
+      uint64_t delta = values[j] - m->committed[j];
+      if (!delta) continue;
+      if (delta > (uint64_t)INT64_MAX ||
+          sqlite3_bind_int64(st, 1, m->minute_unix) != SQLITE_OK ||
+          sqlite3_bind_text(st, 2, m->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+          sqlite3_bind_text(st, 3, names[j], -1, SQLITE_STATIC) != SQLITE_OK ||
+          sqlite3_bind_int64(st, 4, (sqlite3_int64)delta) != SQLITE_OK) {
+        set_error("metrics delta overflow or bind failed"); goto failed;
       }
-      sqlite3_stmt *st = NULL;
-      if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
-        return;
+      if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) {
+        set_error("metrics write failed or cumulative value overflowed"); goto failed;
       }
-      sqlite3_bind_int64(st, 1, (sqlite3_int64)m->minute_unix);
-      bind_text(st, 2, m->endpoint_id);
-      bind_text(st, 3, metrics[j].name);
-      sqlite3_bind_int64(st, 4, (sqlite3_int64)metrics[j].value);
-      (void)sqlite3_step(st);
-      sqlite3_finalize(st);
+      if (sqlite3_reset(st) != SQLITE_OK || sqlite3_clear_bindings(st) != SQLITE_OK) {
+        set_error("metrics statement reset failed"); goto failed;
+      }
     }
   }
+  sqlite3_finalize(st);
+  st = NULL;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  s_test_commit_active = 1;
+#endif
+  rc = sqlite3_exec(s_db, "COMMIT;", NULL, NULL, NULL);
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  s_test_commit_active = 0;
+#endif
+  if (rc != SQLITE_OK) {
+    set_error("metrics transaction commit failed"); goto failed;
+  }
+  for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
+    MetricSlot *m = &s_metrics[i];
+    m->committed[0] = m->file_drops;
+    m->committed[1] = m->registry_drops;
+    m->committed[2] = m->network_drops;
+    m->committed[3] = m->other_drops;
+  }
+  s_metric_retry_after_ns = 0u;
+  return 0;
+failed:
+  if (st) sqlite3_finalize(st);
+  if (began && sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL) != SQLITE_OK &&
+      !sqlite3_get_autocommit(s_db))
+    set_error("metrics rollback failed; database transaction remains active");
+  s_status.metric_write_failures++;
+  /* A full metrics ring must not turn a storage error into per-event SQL I/O.
+   * Retry on the existing maintenance cadence; close gets one final attempt. */
+  s_metric_retry_after_ns = now > UINT64_MAX - 60000000000ULL
+                               ? UINT64_MAX : now + 60000000000ULL;
+  return -1;
 }
 
 /* DELETE changes live pages, not the allocated file length. Use live pages
@@ -4411,7 +4495,7 @@ static void sqlite_maintenance(void) {
     return;
   }
   s_status.maintenance_runs++;
-  sqlite_flush_metrics();
+  (void)sqlite_flush_metrics(0);
   int64_t cutoff = now_unix_ns() - (int64_t)s_status.retention_hours * 3600LL * 1000000000LL;
   int64_t cutoff_minute = (cutoff / 1000000000LL) / 60LL;
   sqlite3_stmt *st = NULL;
@@ -4723,6 +4807,20 @@ void edr_local_evidence_cache_resolve_commands(const EdrBehaviorRecord *r,
 static void evidence_cache_close_locked(void) {
 #if defined(EDR_HAVE_SQLITE)
   if (s_db) {
+    if (sqlite_flush_metrics(1) != 0) {
+      uint64_t lost = 0u;
+      for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
+        MetricSlot *m = &s_metrics[i];
+        uint64_t values[] = {m->file_drops, m->registry_drops, m->network_drops, m->other_drops};
+        for (size_t j = 0; j < 4u; ++j)
+          evidence_cache_add_saturating(&lost, values[j] - m->committed[j]);
+      }
+      evidence_cache_add_saturating(&s_status.metric_unrecorded, lost);
+      /* A closed volatile metrics ring cannot retry after reopen. Keep this
+       * terminal loss visible even when startup resets the health counters. */
+      fprintf(stderr, "[evidence-cache] closing with %llu uncommitted diagnostic counts: %s\n",
+              (unsigned long long)lost, s_status.last_error);
+    }
     (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
     sqlite3_close(s_db);
     s_db = NULL;
@@ -4778,6 +4876,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   memset(s_context_ring, 0, sizeof(s_context_ring));
   memset(s_context_windows, 0, sizeof(s_context_windows));
   memset(s_metrics, 0, sizeof(s_metrics));
+  s_metric_retry_after_ns = 0u;
   memset(s_candidate_dedupe, 0, sizeof(s_candidate_dedupe));
   memset(s_ordinary_agg, 0, sizeof(s_ordinary_agg));
   s_ring_pos = 0;
@@ -6821,7 +6920,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"hot_ring_events\":%u,\"context_windows\":%u,\"metrics\":%u,"
            "\"candidate_dedup\":%u,\"aggregate_slots\":%u},"
            "\"utilization_bps\":{\"db\":%u,\"process_slots\":%u,\"ring\":%u,\"hot_ring\":%u,\"metrics\":%u,\"aggregate\":%u,\"context_windows\":%u,\"candidate_dedup\":%u},"
-           "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"context_window_nominal_ended_replacements\":%llu,\"context_window_protected_replacements\":%llu,\"metrics\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
+           "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"context_window_nominal_ended_replacements\":%llu,\"context_window_protected_replacements\":%llu,\"metrics\":%llu,\"metric_write_failures\":%llu,\"metric_unrecorded\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
            "\"oldest\":{\"process_last_seen_ns\":%lld,\"ring_event_time_ns\":%lld,\"hot_ring_event_time_ns\":%lld,\"candidate_dedup_ns\":%lld,\"p0_candidate_event_time_ns\":%lld},"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
@@ -6897,6 +6996,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.context_window_nominal_ended_replacements,
            (unsigned long long)st.context_window_protected_replacements,
            (unsigned long long)st.metric_slot_evictions,
+           (unsigned long long)st.metric_write_failures,
+           (unsigned long long)st.metric_unrecorded,
            (unsigned long long)st.candidate_dedup_evictions,
            (unsigned long long)st.aggregate_slot_evictions,
            (unsigned long long)st.db_retention_evicted,

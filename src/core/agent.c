@@ -2593,7 +2593,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
 		"\"context_dropped\":%llu},"
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
         "\"max_db_mb\":%u,\"maintenance\":{\"runs\":%llu,"
-        "\"retention_evicted\":%llu,\"capacity_evicted\":%llu},"
+        "\"retention_evicted\":%llu,\"capacity_evicted\":%llu,\"metric_write_failures\":%llu,\"metric_unrecorded\":%llu},"
         "\"context_window_evictions\":%llu,"
         "\"context_window_nominal_ended_replacements\":%llu,"
         "\"context_window_protected_replacements\":%llu,\"context_ref_write_sources\":%s},"
@@ -2794,6 +2794,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.maintenance_runs,
         (unsigned long long)evidence_status.db_retention_evicted,
         (unsigned long long)evidence_status.db_capacity_evicted,
+        (unsigned long long)evidence_status.metric_write_failures,
+        (unsigned long long)evidence_status.metric_unrecorded,
         (unsigned long long)evidence_status.context_window_evictions,
         (unsigned long long)evidence_status.context_window_nominal_ended_replacements,
         (unsigned long long)evidence_status.context_window_protected_replacements,

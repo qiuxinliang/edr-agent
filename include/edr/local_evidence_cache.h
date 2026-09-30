@@ -108,6 +108,8 @@ typedef struct {
   uint64_t context_window_nominal_ended_replacements;
   uint64_t context_window_protected_replacements;
   uint64_t metric_slot_evictions;
+  uint64_t metric_write_failures;
+  uint64_t metric_unrecorded;
   uint64_t candidate_dedup_evictions;
   uint64_t aggregate_slot_evictions;
   uint64_t db_retention_evicted;

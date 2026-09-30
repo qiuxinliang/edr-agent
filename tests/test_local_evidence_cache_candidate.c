@@ -24,9 +24,12 @@ static void test_setenv(const char *name, const char *value) {
 static void test_unsetenv(const char *name) { assert(_putenv_s(name, "") == 0); }
 #else
 #include <pthread.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
+extern char **environ;
+static const char *s_test_executable;
 static void test_setenv(const char *name, const char *value) {
   assert(setenv(name, value, 1) == 0);
 }
@@ -6102,8 +6105,14 @@ static void run_migration_crash_child(const char *path, int phase) {
   assert(GetExitCodeProcess(pi.hProcess, &code)); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
   assert(wait == WAIT_OBJECT_0 && code == 86);
 #else
-  pid_t child = fork(); assert(child >= 0);
-  if (child == 0) migration_crash_child(path, phase);
+  /* Run the same CLI as Windows in a fresh process. Executing SQLite directly
+   * after fork inherits system-library state from all preceding test cases. */
+  char phase_arg[16];
+  snprintf(phase_arg, sizeof(phase_arg), "%d", phase);
+  char *child_args[] = {(char *)s_test_executable, "--crash-cache-migration",
+                        (char *)path, phase_arg, NULL};
+  pid_t child = 0;
+  assert(posix_spawnp(&child, s_test_executable, NULL, NULL, child_args, environ) == 0);
   int status = 0; pid_t done = 0;
   for (unsigned i = 0; i < 1000 && done == 0; ++i) {
     done = waitpid(child, &status, WNOHANG); if (!done) usleep(10000);
@@ -6466,7 +6475,221 @@ static void test_compact_runtime_replay_enrichment_and_failure(void) {
 }
 #endif
 
+#if defined(EDR_HAVE_SQLITE)
+static void metric_test_record(int64_t minute, const char *endpoint) {
+  EdrBehaviorRecord r;
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  r.event_time_ns = minute * 60000000000LL + 1000000000LL;
+  r.pid = 79001u;
+  set_record_generation(&r, 79001u);
+  snprintf(r.endpoint_id, sizeof(r.endpoint_id), "%s", endpoint);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\Metrics\\ordinary.txt");
+  assert(edr_local_evidence_cache_is_candidate(&r) == 0);
+  edr_local_evidence_cache_record_behavior(&r);
+}
+
+static void metric_test_poll(void) {
+  s_test_monotonic_ns += 61000000000ULL;
+  edr_local_evidence_cache_poll_maintenance();
+}
+
+static int64_t metric_test_value(const char *path, int64_t minute,
+                                const char *endpoint) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  int64_t result = 0;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT value FROM metrics WHERE minute_unix=? "
+      "AND endpoint_id=? AND metric_name='file_drops'", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_int64(st, 1, minute) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 2, endpoint, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  int rc = sqlite3_step(st);
+  assert(rc == SQLITE_ROW || rc == SQLITE_DONE);
+  if (rc == SQLITE_ROW) result = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  return result;
+}
+
+/* Exercise the production drop counter and maintenance owner. A trigger makes
+ * unnecessary INSERT attempts fail, so stable-count verification does not
+ * depend on timing, SQL text, or SQLite's physical no-op-write optimization. */
+static void test_metrics_commit_watermark_restart_and_failure(void) {
+  char path[512];
+  sqlite3 *raw = NULL;
+  EdrEvidenceCacheStatus before, after;
+  int64_t minute = (int64_t)time(NULL) / 60;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(minute * 60000000000LL + 30000000000LL);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  for (unsigned i = 0; i < 11u; ++i) metric_test_record(minute, "metric-a");
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-a") == 11);
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "BEGIN SELECT RAISE(ABORT,'injected metrics failure'); END;");
+  edr_local_evidence_cache_get_status(&before);
+  metric_test_poll();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.metric_write_failures == before.metric_write_failures);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+
+  /* A normal close must commit the last increment even before the next poll.
+   * Reopen in the same minute must add to 12, not replace it with 1. */
+  metric_test_record(minute, "metric-a");
+  edr_local_evidence_cache_close();
+  assert(metric_test_value(path, minute, "metric-a") == 12);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  metric_test_record(minute, "metric-a");
+  metric_test_record(minute, "metric-b");
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "WHEN NEW.endpoint_id='metric-b' "
+                    "BEGIN SELECT RAISE(ABORT,'injected second metric failure'); END;");
+  metric_test_poll();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.metric_write_failures == 1u);
+  assert(metric_test_value(path, minute, "metric-a") == 12);
+  assert(metric_test_value(path, minute, "metric-b") == 0);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-a") == 13);
+  assert(metric_test_value(path, minute, "metric-b") == 1);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-a") == 13);
+  assert(metric_test_value(path, minute, "metric-b") == 1);
+
+  /* Expired in-memory slots must not resurrect rows deleted by retention. */
+  edr_local_evidence_cache_test_set_now_unix_ns((minute + 25 * 60) * 60000000000LL);
+  metric_test_poll();
+  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics") == 0);
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "BEGIN SELECT RAISE(ABORT,'expired metrics resurrected'); END;");
+  edr_local_evidence_cache_get_status(&before);
+  metric_test_record(minute, "metric-a");
+  metric_test_poll();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.metric_write_failures == before.metric_write_failures);
+  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics") == 0);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = 1000000000ULL;
+  cleanup_test_sqlite_path(path);
+}
+
+static void test_metrics_slot_reuse_and_failed_handoff(void) {
+  char path[512];
+  sqlite3 *raw = NULL;
+  EdrEvidenceCacheStatus status;
+  int64_t minute = (int64_t)time(NULL) / 60;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(minute * 60000000000LL + 30000000000LL);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  for (unsigned i = 0; i < 180u; ++i) metric_test_record(minute - 180 + i, "metric-slots");
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "BEGIN SELECT RAISE(ABORT,'metric slot handoff failed'); END;");
+  metric_test_record(minute, "metric-slots");
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.metric_write_failures == 1u);
+  assert(status.metric_unrecorded == 1u);
+  assert(status.metric_file_drops == 181u);
+  assert(status.metric_slot_evictions == 0u);
+  for (unsigned i = 0; i < 8u; ++i) metric_test_record(minute, "metric-slots");
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.metric_write_failures == 1u);
+  assert(status.metric_unrecorded == 9u);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  s_test_monotonic_ns += 61000000000ULL;
+  /* Successful reuse must first hand off the old dirty slot. */
+  metric_test_record(minute, "metric-slots");
+  assert(metric_test_value(path, minute - 180, "metric-slots") == 1);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-slots") == 1);
+  /* A late record for a previously persisted/replaced minute adds once. */
+  metric_test_record(minute - 180, "metric-slots");
+  metric_test_poll();
+  assert(metric_test_value(path, minute - 180, "metric-slots") == 2);
+  metric_test_poll();
+  assert(metric_test_value(path, minute - 180, "metric-slots") == 2);
+  /* Consecutive late keys can use clean slots without per-event SQL. */
+  metric_test_record(minute - 190, "metric-slots");
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "BEGIN SELECT RAISE(ABORT,'late metric caused hot-path SQL'); END;");
+  metric_test_record(minute - 191, "metric-slots");
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.metric_write_failures == 1u);
+  assert(status.metric_unrecorded == 9u);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  metric_test_poll();
+  assert(metric_test_value(path, minute - 190, "metric-slots") == 1);
+  assert(metric_test_value(path, minute - 191, "metric-slots") == 1);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = 1000000000ULL;
+  cleanup_test_sqlite_path(path);
+}
+
+static void test_metrics_commit_failure_close_and_retention_boundary(void) {
+  char path[512];
+  sqlite3 *raw = NULL;
+  EdrEvidenceCacheStatus status;
+  int64_t minute = (int64_t)time(NULL) / 60;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(minute * 60000000000LL + 30000000000LL);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  metric_test_record(minute, "metric-commit");
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  metric_test_poll();
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.metric_write_failures == 1u);
+  assert(metric_test_value(path, minute, "metric-commit") == 0);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-commit") == 1);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-commit") == 1);
+
+  /* Exactly the cutoff minute is retained; only strictly older minutes retire.
+   * Close must obey that same boundary for pending, unflushed increments. */
+  metric_test_record(minute - 24 * 60, "metric-boundary");
+  metric_test_record(minute - 24 * 60 - 1, "metric-expired");
+  edr_local_evidence_cache_close();
+  assert(metric_test_value(path, minute - 24 * 60, "metric-boundary") == 1);
+  assert(metric_test_value(path, minute - 24 * 60 - 1, "metric-expired") == 0);
+
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  metric_test_record(minute, "metric-final-failure");
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
+                    "BEGIN SELECT RAISE(ABORT,'final metrics commit failed'); END;");
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_open == 0);
+  assert(status.metric_write_failures == 1u);
+  assert(status.metric_unrecorded == 1u);
+  assert(status.last_error[0] != '\0');
+  assert(metric_test_value(path, minute, "metric-final-failure") == 0);
+  compact_exec(raw, "DROP TRIGGER metrics_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = 1000000000ULL;
+  cleanup_test_sqlite_path(path);
+}
+
+#endif
+
 int main(int argc, char **argv) {
+#if !defined(_WIN32)
+  s_test_executable = argv[0];
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc == 4 && strcmp(argv[1], "--crash-cache-migration") == 0) {
     migration_crash_child(argv[2], atoi(argv[3])); return 1;
@@ -6476,6 +6699,9 @@ int main(int argc, char **argv) {
 #endif
   test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
+  test_metrics_commit_watermark_restart_and_failure();
+  test_metrics_slot_reuse_and_failed_handoff();
+  test_metrics_commit_failure_close_and_retention_boundary();
   test_compact_process_crash_recovery();
   test_compact_full_busy_and_unknown_format();
   test_compact_migration_budget_and_storage_types();
