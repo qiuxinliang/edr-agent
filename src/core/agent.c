@@ -2594,7 +2594,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
         "\"max_db_mb\":%u,\"maintenance\":{\"runs\":%llu,"
         "\"retention_evicted\":%llu,\"capacity_evicted\":%llu},"
-        "\"context_window_evictions\":%llu,\"context_ref_write_sources\":%s},"
+        "\"context_window_evictions\":%llu,"
+        "\"context_window_nominal_ended_replacements\":%llu,"
+        "\"context_window_protected_replacements\":%llu,\"context_ref_write_sources\":%s},"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
         "\"requests_total\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,"
         "\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,"
@@ -2793,6 +2795,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.db_retention_evicted,
         (unsigned long long)evidence_status.db_capacity_evicted,
         (unsigned long long)evidence_status.context_window_evictions,
+        (unsigned long long)evidence_status.context_window_nominal_ended_replacements,
+        (unsigned long long)evidence_status.context_window_protected_replacements,
         context_ref_sources_json,
         process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
         (unsigned long long)process_evidence_metrics.requests_total,

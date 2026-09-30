@@ -131,6 +131,7 @@ typedef struct {
   uint32_t pid;
   int64_t from_ns;
   int64_t until_ns;
+  uint64_t created_mono_ns;
   EvidenceProcessGeneration generation;
   char endpoint_id[48];
   char tenant_id[64];
@@ -195,6 +196,7 @@ typedef struct {
   uint32_t kind;
   char endpoint_id[48];
   char prefix[160];
+  char semantic_digest[65];
   uint64_t count;
   /* behavior_summary 上报所需的聚合上下文。 */
   int64_t first_seen_ns;
@@ -1824,32 +1826,100 @@ static int ordinary_aggregate_prefix(const EdrBehaviorRecord *r, uint32_t kind,
   return 1;
 }
 
+/* This is bounded sampling of repeated ordinary behavior, not source-event
+ * deduplication. Different source IDs can describe the same action/object, but
+ * PID reuse, distinct operations and changes to captured object facts must
+ * retain separate representatives. The human-readable summary prefix is not
+ * an identity: it may be shortened, and a directory contains many objects. */
+static int ordinary_aggregate_digest(const EdrBehaviorRecord *r, uint32_t kind,
+                                     int64_t minute, char out[65]) {
+  EvidenceProcessGeneration generation;
+  EdrSha256Ctx ctx;
+  uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[] = "0123456789abcdef";
+  if (!r || r->event_time_ns <= 0 ||
+      !record_process_generation(r, &generation) ||
+      r->source_truncated_fields[0] ||
+      strcmp(r->source_completeness, "TRUNCATED") == 0 ||
+      strcmp(r->source_completeness, "NOT_EVALUABLE") == 0) {
+    return 0;
+  }
+  if ((kind == 1u && (!r->file_path[0] ||
+                      (r->type == EDR_EVENT_FILE_RENAME && !r->file_old_path[0]))) ||
+      (kind == 2u && !r->reg_key_path[0]) ||
+      (kind == 3u && r->type == EDR_EVENT_NET_DNS_QUERY && !r->dns_query[0]) ||
+      (kind == 3u && r->type != EDR_EVENT_NET_DNS_QUERY &&
+       (!r->net_proto[0] ||
+        ((!r->net_dst[0] || !r->net_dport) &&
+         (r->type != EDR_EVENT_NET_LISTEN || !r->net_src[0] || !r->net_sport))))) {
+    return 0;
+  }
+  edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, "edr-ordinary-behavior-v1");
+  candidate_digest_text(&ctx, r->tenant_id);
+  candidate_digest_text(&ctx, r->endpoint_id);
+  candidate_digest_u64(&ctx, r->pid);
+  candidate_digest_u64(&ctx, generation.process_start_key);
+  candidate_digest_u64(&ctx, generation.creation_filetime_100ns);
+  candidate_digest_u64(&ctx, (uint64_t)minute);
+  candidate_digest_u64(&ctx, (uint64_t)r->type);
+  candidate_digest_text(&ctx, r->source_completeness);
+  if (kind == 1u) {
+    candidate_digest_text(&ctx, r->file_op);
+    candidate_digest_text(&ctx, r->file_path);
+    candidate_digest_text(&ctx, r->file_old_path);
+    candidate_digest_u64(&ctx, r->file_key);
+    candidate_digest_u64(&ctx, r->file_target_has_motw);
+  } else if (kind == 2u) {
+    candidate_digest_text(&ctx, r->reg_op);
+    candidate_digest_text(&ctx, r->reg_key_path);
+    candidate_digest_text(&ctx, r->reg_value_name);
+    candidate_digest_text(&ctx, r->reg_value_data);
+    candidate_digest_text(&ctx, r->reg_old_value_data);
+    candidate_digest_text(&ctx, r->reg_attribution);
+    candidate_digest_text(&ctx, r->reg_detail_status);
+  } else {
+    candidate_digest_text(&ctx, r->net_src);
+    candidate_digest_text(&ctx, r->net_dst);
+    candidate_digest_u64(&ctx, r->net_sport);
+    candidate_digest_u64(&ctx, r->net_dport);
+    candidate_digest_text(&ctx, r->net_proto);
+    candidate_digest_text(&ctx, r->dns_query);
+    candidate_digest_text(&ctx, r->network_aux_path);
+  }
+  edr_sha256_final(&ctx, digest);
+  for (size_t i = 0u; i < sizeof(digest); ++i) {
+    out[i * 2u] = hex[digest[i] >> 4u];
+    out[i * 2u + 1u] = hex[digest[i] & 0x0fu];
+  }
+  out[64] = '\0';
+  return 1;
+}
+
 static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_t ts) {
   uint32_t kind = 0u;
   if (!ordinary_aggregate_kind(r, &kind)) {
     return 0;
   }
-  char prefix[160];
-  if (!ordinary_aggregate_prefix(r, kind, prefix, sizeof(prefix))) {
+  char semantic_digest[65];
+  int64_t minute = (ts / 1000000000LL) / 60LL;
+  if (!ordinary_aggregate_digest(r, kind, minute, semantic_digest)) {
     return 0;
   }
-  int64_t minute = (ts / 1000000000LL) / 60LL;
   size_t replace_i = 0u;
+  size_t empty_i = EDR_EVIDENCE_AGG_SLOTS;
   int64_t oldest = INT64_MAX;
   for (size_t i = 0; i < EDR_EVIDENCE_AGG_SLOTS; i++) {
     OrdinaryAggregateSlot *s = &s_ordinary_agg[i];
     if (!s->used) {
-      replace_i = i;
-      oldest = INT64_MIN;
-      break;
+      if (empty_i == EDR_EVIDENCE_AGG_SLOTS) empty_i = i;
+      continue;
     }
     if (s->minute_unix < oldest) {
       oldest = s->minute_unix;
       replace_i = i;
     }
-    if (s->minute_unix == minute && s->pid == r->pid && s->kind == kind &&
-        strncmp(s->endpoint_id, r->endpoint_id, sizeof(s->endpoint_id)) == 0 &&
-        strncmp(s->prefix, prefix, sizeof(s->prefix)) == 0) {
+    if (strcmp(s->semantic_digest, semantic_digest) == 0) {
       s->count++;
       if (ts > s->last_seen_ns) {
         s->last_seen_ns = ts;
@@ -1872,6 +1942,7 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
       return 1;
     }
   }
+  if (empty_i != EDR_EVIDENCE_AGG_SLOTS) replace_i = empty_i;
   OrdinaryAggregateSlot *slot = &s_ordinary_agg[replace_i];
   if (slot->used) {
     s_status.aggregate_slot_evictions++;
@@ -1888,7 +1959,8 @@ static int ordinary_aggregate_should_coalesce(const EdrBehaviorRecord *r, int64_
   copy_s(slot->endpoint_id, sizeof(slot->endpoint_id), r ? r->endpoint_id : "");
   copy_s(slot->tenant_id, sizeof(slot->tenant_id), r ? r->tenant_id : "");
   copy_s(slot->process_name, sizeof(slot->process_name), r ? r->process_name : "");
-  copy_s(slot->prefix, sizeof(slot->prefix), prefix);
+  (void)ordinary_aggregate_prefix(r, kind, slot->prefix, sizeof(slot->prefix));
+  copy_s(slot->semantic_digest, sizeof(slot->semantic_digest), semantic_digest);
   if (r && r->detection_context[0]) {
     extract_json_string_field(r->detection_context, "\"reason\":\"", slot->suppression_reason,
                               sizeof(slot->suppression_reason));
@@ -5269,6 +5341,19 @@ static int same_context_scope(const ContextWindowSlot *w,
   return strcmp(w->tenant_id, r->tenant_id) == 0;
 }
 
+/* A nominally ended window is preferred only when capacity requires replacing
+ * an entry. Event time owns matching; monotonic age prevents a future source
+ * timestamp from immediately aging out a newly admitted candidate. Keeping
+ * entries until replacement still allows late events to match them. This is
+ * not a claim that all late events have arrived or that replacement is lossless. */
+static int context_window_nominally_ended(const ContextWindowSlot *w,
+                                         int64_t event_time_ns, uint64_t mono_ns) {
+  return w->pid != 0u && w->until_ns < event_time_ns &&
+         w->until_ns >= w->from_ns && mono_ns >= w->created_mono_ns &&
+         mono_ns - w->created_mono_ns >=
+             (uint64_t)w->until_ns - (uint64_t)w->from_ns;
+}
+
 static void mark_one_context_window(uint32_t pid,
                                     const EvidenceProcessGeneration *generation,
                                     const char *endpoint_id,
@@ -5278,7 +5363,17 @@ static void mark_one_context_window(uint32_t pid,
   if (pid == 0u || !generation_bound(generation) || !candidate_id || !candidate_id[0]) {
     return;
   }
+  uint64_t mono_ns = edr_monotonic_ns();
+  size_t empty_i = EDR_EVIDENCE_CONTEXT_WINDOWS;
+  size_t ended_i = EDR_EVIDENCE_CONTEXT_WINDOWS;
   for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; i++) {
+    const ContextWindowSlot *existing = &s_context_windows[i];
+    if (existing->pid == 0u && empty_i == EDR_EVIDENCE_CONTEXT_WINDOWS) empty_i = i;
+    if (context_window_nominally_ended(existing, from_ns, mono_ns) &&
+        (ended_i == EDR_EVIDENCE_CONTEXT_WINDOWS ||
+         existing->until_ns < s_context_windows[ended_i].until_ns)) {
+      ended_i = i;
+    }
     if (s_context_windows[i].pid == pid &&
         generation_equal(&s_context_windows[i].generation, generation) &&
         (!s_context_windows[i].endpoint_id[0] || !endpoint_id || !endpoint_id[0] ||
@@ -5295,14 +5390,24 @@ static void mark_one_context_window(uint32_t pid,
       return;
     }
   }
-  ContextWindowSlot *w = &s_context_windows[s_context_window_next++ % EDR_EVIDENCE_CONTEXT_WINDOWS];
+  size_t replace_i = empty_i != EDR_EVIDENCE_CONTEXT_WINDOWS ? empty_i
+      : ended_i != EDR_EVIDENCE_CONTEXT_WINDOWS ? ended_i
+      : s_context_window_next % EDR_EVIDENCE_CONTEXT_WINDOWS;
+  s_context_window_next = (uint32_t)((replace_i + 1u) % EDR_EVIDENCE_CONTEXT_WINDOWS);
+  ContextWindowSlot *w = &s_context_windows[replace_i];
   if (w->pid != 0u) {
     s_status.context_window_evictions++;
+    if (context_window_nominally_ended(w, from_ns, mono_ns)) {
+      s_status.context_window_nominal_ended_replacements++;
+    } else {
+      s_status.context_window_protected_replacements++;
+    }
   }
   memset(w, 0, sizeof(*w));
   w->pid = pid;
   w->from_ns = from_ns;
   w->until_ns = until_ns;
+  w->created_mono_ns = mono_ns;
   w->generation = *generation;
   copy_s(w->endpoint_id, sizeof(w->endpoint_id), endpoint_id);
   copy_s(w->tenant_id, sizeof(w->tenant_id), tenant_id);
@@ -5330,9 +5435,9 @@ static void mark_context_window(const EdrBehaviorRecord *r, int64_t until_ns,
 
 /* One post-context record can belong to several distinct committed candidates.
  * The fixed 256-slot table is intentionally multi-keyed by candidate+process
- * generation; when it evicts a live entry the existing health eviction counter
- * makes that bounded completeness loss visible instead of silently replacing a
- * prior candidate for the same PID. */
+ * generation. Replacement counters distinguish nominally ended entries from
+ * entries still protected by event time or monotonic age. Neither category
+ * proves the number of missing events; late-event completeness is bounded. */
 static uint32_t context_window_matches(const EdrBehaviorRecord *r, int64_t now_ns,
                                        char candidate_ids[][160], uint32_t cap) {
   EvidenceProcessGeneration generation;
@@ -6716,7 +6821,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"hot_ring_events\":%u,\"context_windows\":%u,\"metrics\":%u,"
            "\"candidate_dedup\":%u,\"aggregate_slots\":%u},"
            "\"utilization_bps\":{\"db\":%u,\"process_slots\":%u,\"ring\":%u,\"hot_ring\":%u,\"metrics\":%u,\"aggregate\":%u,\"context_windows\":%u,\"candidate_dedup\":%u},"
-           "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"metrics\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
+           "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"context_window_nominal_ended_replacements\":%llu,\"context_window_protected_replacements\":%llu,\"metrics\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
            "\"oldest\":{\"process_last_seen_ns\":%lld,\"ring_event_time_ns\":%lld,\"hot_ring_event_time_ns\":%lld,\"candidate_dedup_ns\":%lld,\"p0_candidate_event_time_ns\":%lld},"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
@@ -6789,6 +6894,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.ring_evictions,
            (unsigned long long)st.hot_ring_evictions,
            (unsigned long long)st.context_window_evictions,
+           (unsigned long long)st.context_window_nominal_ended_replacements,
+           (unsigned long long)st.context_window_protected_replacements,
            (unsigned long long)st.metric_slot_evictions,
            (unsigned long long)st.candidate_dedup_evictions,
            (unsigned long long)st.aggregate_slot_evictions,

@@ -101,6 +101,12 @@ typedef struct {
   uint64_t ring_evictions;
   uint64_t hot_ring_evictions;
   uint64_t context_window_evictions;
+  /* The total above remains compatible. These disjoint replacement classes
+   * describe capacity decisions, not proven lost-event counts. A nominally
+   * ended window can still have late events; protected includes young windows
+   * whose event-time end has passed but monotonic residence has not. */
+  uint64_t context_window_nominal_ended_replacements;
+  uint64_t context_window_protected_replacements;
   uint64_t metric_slot_evictions;
   uint64_t candidate_dedup_evictions;
   uint64_t aggregate_slot_evictions;

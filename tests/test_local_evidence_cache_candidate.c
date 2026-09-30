@@ -249,11 +249,13 @@ static void test_behavior_summary_flush_coalesced_events(void) {
     EdrBehaviorRecord r;
     init_record(&r, EDR_EVENT_NET_CONNECT);
     r.pid = 7777u;
+    set_record_generation(&r, 7777u);
     r.event_time_ns = base_ns + (int64_t)i * 1000000LL; /* 同一分钟内 */
     snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-sum-1");
     snprintf(r.process_name, sizeof(r.process_name), "telemetry.exe");
     snprintf(r.net_dst, sizeof(r.net_dst), "93.184.216.34");
     r.net_dport = 80u; /* 非高危端口 -> 普通事件 -> 进入聚合 */
+    snprintf(r.net_proto, sizeof(r.net_proto), "tcp");
     edr_local_evidence_cache_record_behavior(&r);
   }
   /* 窗口未关闭：当前分钟内 flush 不应产出。 */
@@ -279,11 +281,13 @@ static void test_behavior_summary_below_threshold_no_emit(void) {
     EdrBehaviorRecord r;
     init_record(&r, EDR_EVENT_NET_CONNECT);
     r.pid = 8888u;
+    set_record_generation(&r, 8888u);
     r.event_time_ns = base_ns + (int64_t)i * 1000000LL;
     snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-sum-2");
     snprintf(r.process_name, sizeof(r.process_name), "telemetry.exe");
     snprintf(r.net_dst, sizeof(r.net_dst), "93.184.216.34");
     r.net_dport = 80u;
+    snprintf(r.net_proto, sizeof(r.net_proto), "tcp");
     edr_local_evidence_cache_record_behavior(&r);
   }
   edr_local_evidence_cache_flush_summaries(base_ns + 60000000000LL, summary_capture);
@@ -298,11 +302,13 @@ static void test_behavior_summary_local_only_flush(void) {
     EdrBehaviorRecord r;
     init_record(&r, EDR_EVENT_NET_CONNECT);
     r.pid = 9999u;
+    set_record_generation(&r, 9999u);
     r.event_time_ns = base_ns + (int64_t)i * 1000000LL;
     snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-local-summary");
     snprintf(r.process_name, sizeof(r.process_name), "telemetry.exe");
     snprintf(r.net_dst, sizeof(r.net_dst), "93.184.216.34");
     r.net_dport = 80u;
+    snprintf(r.net_proto, sizeof(r.net_proto), "tcp");
     edr_local_evidence_cache_record_behavior(&r);
   }
   edr_local_evidence_cache_get_status(&before);
@@ -3557,6 +3563,301 @@ static void test_snapshot_generation_persists_candidate_manifests_and_rtq(void) 
  * post-context windows, a semantic fallback artifact id does not collide at
  * same timestamp/type, and a late-old ring arrival cannot hide a recent
  * pre-context record. */
+static void init_ordinary_aggregate_record(EdrBehaviorRecord *r, EdrEventType type,
+                                          int64_t time_ns) {
+  init_record(r, type);
+  r->pid = 96601u;
+  set_record_generation(r, 96601u);
+  r->event_time_ns = time_ns;
+  snprintf(r->endpoint_id, sizeof(r->endpoint_id), "ep-ordinary-semantic");
+  snprintf(r->tenant_id, sizeof(r->tenant_id), "tenant-ordinary");
+  snprintf(r->process_name, sizeof(r->process_name), "ordinary.exe");
+}
+
+/* Exercise public admission and its observable retained/coalesced result. */
+static void record_ordinary_expected(const EdrBehaviorRecord *r, int coalesced) {
+  EdrEvidenceCacheStatus before, after;
+  assert(edr_local_evidence_cache_is_candidate(r) == 0);
+  edr_local_evidence_cache_get_status(&before);
+  edr_local_evidence_cache_record_behavior(r);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.ordinary_coalesced == before.ordinary_coalesced + (coalesced ? 1u : 0u));
+  assert(after.hot_ring_ingested == before.hot_ring_ingested + (coalesced ? 0u : 1u));
+  assert(after.candidate_admitted == before.candidate_admitted);
+  assert(after.artifacts_written == before.artifacts_written);
+}
+
+static int64_t ordinary_test_minute(void) {
+  return ((int64_t)time(NULL) / 60LL) * 60000000000LL + 5000000000LL;
+}
+
+static void test_ordinary_aggregation_preserves_pre_context_actions(void) {
+  char db[640], bundle[32768];
+  EdrBehaviorRecord r, candidate;
+  const int64_t base = ordinary_test_minute();
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_pt_cache_init();
+  init_ordinary_aggregate_record(&r, EDR_EVENT_FILE_READ, base);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\UserData\\ordinary\\a.bin");
+  snprintf(r.event_id, sizeof(r.event_id), "ordinary-read-first");
+  record_ordinary_expected(&r, 0);
+  r.event_time_ns++;
+  snprintf(r.event_id, sizeof(r.event_id), "ordinary-read-other-source");
+  record_ordinary_expected(&r, 1);
+  r.type = EDR_EVENT_FILE_WRITE;
+  record_ordinary_expected(&r, 0);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\UserData\\ordinary\\b.bin");
+  record_ordinary_expected(&r, 0);
+  r.type = EDR_EVENT_FILE_DELETE;
+  record_ordinary_expected(&r, 0);
+  r.type = EDR_EVENT_FILE_RENAME;
+  snprintf(r.file_old_path, sizeof(r.file_old_path), "C:\\UserData\\ordinary\\old-one.bin");
+  record_ordinary_expected(&r, 0);
+  snprintf(r.file_old_path, sizeof(r.file_old_path), "C:\\UserData\\ordinary\\old-two.bin");
+  record_ordinary_expected(&r, 0);
+  record_ordinary_expected(&r, 1);
+
+  candidate = r;
+  candidate.type = EDR_EVENT_NET_CONNECT;
+  candidate.event_time_ns = base + 1000000000LL;
+  candidate.net_dport = 445u;
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "ordinary-context-consumer");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.10");
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_bundle_manifest_for_source_event(db, candidate.event_id, bundle, sizeof(bundle));
+  cJSON *root = cJSON_Parse(bundle);
+  assert(root != NULL);
+  cJSON *context = cJSON_GetObjectItemCaseSensitive(root, "context");
+  assert(cJSON_IsArray(context) && cJSON_GetArraySize(context) == 6);
+  unsigned reads = 0u, writes = 0u, deletes = 0u, renames = 0u;
+  for (int i = 0; i < cJSON_GetArraySize(context); ++i) {
+    cJSON *item = cJSON_GetArrayItem(context, i);
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+    cJSON *path = cJSON_GetObjectItemCaseSensitive(item, "file_path");
+    assert(cJSON_IsNumber(type) && cJSON_IsString(path));
+    assert(strcmp(path->valuestring, "C:\\UserData\\ordinary\\a.bin") == 0 ||
+           strcmp(path->valuestring, "C:\\UserData\\ordinary\\b.bin") == 0);
+    reads += type->valueint == EDR_EVENT_FILE_READ;
+    writes += type->valueint == EDR_EVENT_FILE_WRITE;
+    deletes += type->valueint == EDR_EVENT_FILE_DELETE;
+    renames += type->valueint == EDR_EVENT_FILE_RENAME;
+  }
+  assert(reads == 1u && writes == 2u && deletes == 1u && renames == 2u);
+  /* The existing projection has no old-path field; this test claims that the
+   * two rename observations survive, not that the projection gained fields. */
+  cJSON_Delete(root);
+  edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+}
+
+static void test_ordinary_aggregation_scope_objects_and_incomplete_keys(void) {
+  EdrBehaviorRecord initial, r;
+  const int64_t base = ordinary_test_minute();
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  edr_pt_cache_init();
+  init_ordinary_aggregate_record(&initial, EDR_EVENT_NET_CONNECT, base);
+  snprintf(initial.net_src, sizeof(initial.net_src), "192.0.2.1");
+  snprintf(initial.net_dst, sizeof(initial.net_dst), "192.0.2.2");
+  snprintf(initial.net_proto, sizeof(initial.net_proto), "tcp");
+  initial.net_sport = 50000u; initial.net_dport = 80u;
+  record_ordinary_expected(&initial, 0);
+  r = initial; snprintf(r.event_id, sizeof(r.event_id), "distinct-observation");
+  record_ordinary_expected(&r, 1);
+  r = initial; set_record_generation(&r, 96602u);
+  record_ordinary_expected(&r, 0);
+  r = initial; snprintf(r.tenant_id, sizeof(r.tenant_id), "tenant-other");
+  record_ordinary_expected(&r, 0);
+  r = initial; snprintf(r.endpoint_id, sizeof(r.endpoint_id), "ep-other");
+  record_ordinary_expected(&r, 0);
+  r = initial; r.type = EDR_EVENT_NET_LISTEN;
+  record_ordinary_expected(&r, 0);
+  r = initial; snprintf(r.net_proto, sizeof(r.net_proto), "udp");
+  record_ordinary_expected(&r, 0);
+  r = initial; r.net_sport++;
+  record_ordinary_expected(&r, 0);
+  r = initial; r.event_time_ns += 60000000000LL;
+  record_ordinary_expected(&r, 0);
+  r = initial; r.process_start_key = 0u; r.process_creation_filetime_100ns = 0u;
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 0);
+  r = initial; r.process_creation_filetime_100ns = 0u;
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 0);
+  r = initial; snprintf(r.source_truncated_fields, sizeof(r.source_truncated_fields), "source.net_dst");
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 0);
+  r = initial; snprintf(r.source_completeness, sizeof(r.source_completeness), "NOT_EVALUABLE");
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 0);
+  r = initial; r.net_proto[0] = '\0';
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 0);
+
+  init_ordinary_aggregate_record(&r, EDR_EVENT_REG_SET_VALUE, base);
+  snprintf(r.reg_key_path, sizeof(r.reg_key_path), "HKCU\\Software\\OrdinaryFixture");
+  snprintf(r.reg_value_name, sizeof(r.reg_value_name), "ValueA");
+  snprintf(r.reg_value_data, sizeof(r.reg_value_data), "first");
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 1);
+  snprintf(r.reg_value_name, sizeof(r.reg_value_name), "ValueB");
+  record_ordinary_expected(&r, 0);
+  snprintf(r.reg_value_data, sizeof(r.reg_value_data), "second");
+  record_ordinary_expected(&r, 0);
+  r.type = EDR_EVENT_REG_DELETE_KEY;
+  record_ordinary_expected(&r, 0);
+
+  init_ordinary_aggregate_record(&r, EDR_EVENT_FILE_WRITE, base);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\UserData\\");
+  size_t prefix = strlen(r.file_path);
+  memset(r.file_path + prefix, 'a', 200u);
+  snprintf(r.file_path + prefix + 200u, sizeof(r.file_path) - prefix - 200u, "\\one.bin");
+  record_ordinary_expected(&r, 0);
+  snprintf(r.file_path + prefix + 200u, sizeof(r.file_path) - prefix - 200u, "\\two.bin");
+  record_ordinary_expected(&r, 0); record_ordinary_expected(&r, 1);
+  edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+}
+
+static void test_ordinary_aggregation_closed_slot_holes_and_capacity(void) {
+  EdrBehaviorRecord r;
+  EdrEvidenceCacheStatus st;
+  const int64_t base = ordinary_test_minute();
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  edr_pt_cache_init();
+  init_ordinary_aggregate_record(&r, EDR_EVENT_NET_CONNECT, base - 60000000000LL);
+  snprintf(r.net_proto, sizeof(r.net_proto), "tcp");
+  snprintf(r.net_dst, sizeof(r.net_dst), "192.0.2.1"); r.net_dport = 80u;
+  record_ordinary_expected(&r, 0);
+  r.event_time_ns = base;
+  record_ordinary_expected(&r, 0);
+  edr_local_evidence_cache_flush_summaries(base, NULL);
+  record_ordinary_expected(&r, 1);
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.aggregate_slots_used == 1u);
+  for (unsigned i = 1u; i < 513u; ++i) {
+    snprintf(r.net_dst, sizeof(r.net_dst), "198.51.%u.%u", i / 250u, i % 250u + 1u);
+    record_ordinary_expected(&r, 0);
+  }
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.aggregate_slots_used == 512u && st.aggregate_slots_capacity == 512u);
+  assert(st.hot_ring_events == 256u && st.hot_ring_capacity == 256u);
+  assert(st.aggregate_slot_evictions == 1u);
+  assert(st.summaries_emitted == 0u && st.candidate_admitted == 0u);
+  edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+}
+
+static void init_window_replacement_candidate(EdrBehaviorRecord *r, unsigned index,
+                                               int64_t event_time_ns) {
+  init_record(r, EDR_EVENT_NET_CONNECT);
+  r->pid = 97000u + index;
+  set_record_generation(r, 97000u + index);
+  r->event_time_ns = event_time_ns;
+  r->net_dport = 445u;
+  snprintf(r->endpoint_id, sizeof(r->endpoint_id), "ep-window-replacement");
+  snprintf(r->tenant_id, sizeof(r->tenant_id), "tenant-window");
+  snprintf(r->process_name, sizeof(r->process_name), "window-owner.exe");
+  snprintf(r->net_dst, sizeof(r->net_dst), "192.0.2.40");
+  snprintf(r->event_id, sizeof(r->event_id), "window-candidate-%u", index);
+}
+
+static void probe_window_replacement(const char *db, unsigned index,
+                                     int64_t event_time_ns, const char *source_id,
+                                     uint64_t expected) {
+  EdrBehaviorRecord r;
+  char candidate_id[200];
+  init_window_replacement_candidate(&r, index, event_time_ns);
+  sqlite_candidate_id_for_source_event(db, r.event_id, candidate_id, sizeof(candidate_id));
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.net_dport = 0u; r.net_dst[0] = '\0';
+  snprintf(r.event_id, sizeof(r.event_id), "%s", source_id);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\UserData\\window-context.bin");
+  assert(edr_local_evidence_cache_is_candidate(&r) == 0);
+  edr_local_evidence_cache_record_behavior(&r);
+  assert(sqlite_post_artifact_count(db, candidate_id, source_id) == expected);
+}
+
+static void assert_window_replacement_status(uint64_t ended, uint64_t protected) {
+  EdrEvidenceCacheStatus st;
+  char fragment[32768], document[32770];
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.context_window_evictions == ended + protected);
+  assert(st.context_window_nominal_ended_replacements == ended);
+  assert(st.context_window_protected_replacements == protected);
+  edr_local_evidence_cache_status_json(fragment, sizeof(fragment));
+  assert(snprintf(document, sizeof(document), "{%s}", fragment) > 0);
+  cJSON *root = cJSON_Parse(document);
+  assert(root != NULL);
+  cJSON *cache = cJSON_GetObjectItemCaseSensitive(root, "evidence_cache");
+  cJSON *evictions = cJSON_GetObjectItemCaseSensitive(cache, "evictions");
+  cJSON *total_json = cJSON_GetObjectItemCaseSensitive(evictions, "context_windows");
+  cJSON *ended_json = cJSON_GetObjectItemCaseSensitive(evictions, "context_window_nominal_ended_replacements");
+  cJSON *protected_json = cJSON_GetObjectItemCaseSensitive(evictions, "context_window_protected_replacements");
+  assert(cJSON_IsNumber(total_json) && total_json->valuedouble == (double)(ended + protected));
+  assert(cJSON_IsNumber(ended_json) && ended_json->valuedouble == (double)ended);
+  assert(cJSON_IsNumber(protected_json) && protected_json->valuedouble == (double)protected);
+  cJSON_Delete(root);
+}
+
+static void test_context_window_prefers_nominal_end_and_retains_late_events(void) {
+  char db[640];
+  EdrBehaviorRecord r;
+  EdrEvidenceCacheStatus st;
+  const int64_t base = ordinary_test_minute() - 180000000000LL;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  edr_pt_cache_init();
+  s_test_monotonic_ns = 1000000000ULL;
+  /* Slot 0 is still active at the new candidate's event time. Slot 1 has an
+   * earlier nominal end despite arriving after slot 0. Distinct owners keep
+   * this a window-allocation test, not a quadratic context-fanout workload. */
+  for (unsigned i = 0u; i < 256u; ++i) {
+    init_window_replacement_candidate(&r, i, base + (i == 1u ? 0LL : 60000000000LL));
+    edr_local_evidence_cache_record_behavior(&r);
+  }
+  edr_local_evidence_cache_get_status(&st);
+  assert(st.candidate_admitted == 256u && st.context_windows_capacity == 256u);
+  assert_window_replacement_status(0u, 0u);
+  s_test_monotonic_ns += 61000000000ULL;
+  init_window_replacement_candidate(&r, 256u, base + 61000000000LL);
+  edr_local_evidence_cache_record_behavior(&r);
+  assert_window_replacement_status(1u, 0u);
+  probe_window_replacement(db, 0u, base + 62000000000LL, "active-slot-zero", 1u);
+  probe_window_replacement(db, 1u, base + 30000000000LL, "replaced-ended-slot", 0u);
+  /* No proactive expiry sweep: far-later arrival can still use a retained
+   * event-time window. A new classification does not claim late completeness. */
+  s_test_monotonic_ns += 600000000000ULL;
+  probe_window_replacement(db, 2u, base + 70000000000LL, "late-retained-slot", 1u);
+  init_window_replacement_candidate(&r, 1u, base);
+  edr_local_evidence_cache_record_behavior(&r);
+  assert_window_replacement_status(1u, 0u);
+  probe_window_replacement(db, 1u, base + 30000000001LL, "replay-must-not-rearm", 0u);
+  edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+  cleanup_test_sqlite_path(db);
+  s_test_monotonic_ns = 1000000000ULL;
+}
+
+static void test_context_window_protection_requires_both_clocks(void) {
+  const int64_t base = ordinary_test_minute() - 180000000000LL;
+  for (unsigned scenario = 0u; scenario < 3u; ++scenario) {
+    char db[640];
+    EdrBehaviorRecord r;
+    assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+    assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+    edr_pt_cache_init();
+    s_test_monotonic_ns = 1000000000ULL;
+    for (unsigned i = 0u; i < 256u; ++i) {
+      init_window_replacement_candidate(&r, i, base);
+      edr_local_evidence_cache_record_behavior(&r);
+    }
+    /* Event-time jump alone, monotonic age alone, and a non-advancing clock
+     * must all remain classified as protected capacity replacements. */
+    s_test_monotonic_ns = scenario == 1u ? 62000000000ULL : scenario == 2u ? 0u : 1000000001ULL;
+    init_window_replacement_candidate(&r, 256u,
+                                      base + (scenario == 1u ? 30000000000LL : 120000000000LL));
+    edr_local_evidence_cache_record_behavior(&r);
+    assert_window_replacement_status(0u, 1u);
+    probe_window_replacement(db, 0u, base + 1000000000LL, "protected-victim", 0u);
+    probe_window_replacement(db, 1u, base + 1000000000LL, "protected-survivor", 1u);
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+    cleanup_test_sqlite_path(db);
+  }
+  s_test_monotonic_ns = 1000000000ULL;
+}
+
 static void test_context_generation_multicandidate_and_artifact_identity(void) {
   const char *db = "local_evidence_cache_generation_context.sqlite";
   const uint32_t pid = 96101u;
@@ -6201,6 +6502,11 @@ int main(int argc, char **argv) {
   test_behavior_summary_local_only_flush();
   test_identity_status_counter_basics();
 #if defined(EDR_HAVE_SQLITE)
+  test_ordinary_aggregation_preserves_pre_context_actions();
+  test_ordinary_aggregation_scope_objects_and_incomplete_keys();
+  test_ordinary_aggregation_closed_slot_holes_and_capacity();
+  test_context_window_prefers_nominal_end_and_retains_late_events();
+  test_context_window_protection_requires_both_clocks();
   test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
   test_legacy_post_context_normalizes_without_losing_variants();
   test_legacy_context_corrupt_fact_blocks_reference();
