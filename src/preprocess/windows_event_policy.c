@@ -410,6 +410,13 @@ static int registry_hive_file_path(const char *path) {
   return 0;
 }
 
+static int record_has_priority_signal(const EdrBehaviorRecord *r) {
+  return r->priority == 0u || has_ci_path(r->detection_context, "\"confidence\":0.7") ||
+         has_ci_path(r->detection_context, "\"confidence\":0.8") ||
+         has_ci_path(r->detection_context, "\"confidence\":0.9") ||
+         has_ci_path(r->detection_context, "\"confidence\":1");
+}
+
 static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) {
   const char *path = r->file_path[0] ? r->file_path : r->exe_path;
   static const char *const web_roots[] = {
@@ -558,7 +565,15 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
     return;
   }
   if (any_contains(path, user_temp_dirs, sizeof(user_temp_dirs) / sizeof(user_temp_dirs[0]))) {
-    if (any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0]))) {
+    /* Reading an existing staging artifact does not establish a file drop.
+     * Preserve an independent priority signal before ordinary noise filters. */
+    if (r->type == EDR_EVENT_FILE_READ) {
+      if (record_has_priority_signal(r) &&
+          (any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0])) ||
+           any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0])))) {
+        mark_high(p, "prioritized_staging_file_read", "prioritized_file_read");
+      }
+    } else if (any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0]))) {
       mark_suspicious(p, "script_drop_in_user_temp_path", "script_temp_staging");
     } else if (any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0]))) {
       mark_suspicious(p, "executable_drop_in_user_temp_path", "executable_temp_staging");
@@ -568,7 +583,7 @@ static void classify_file(const EdrBehaviorRecord *r, EdrWindowsEventPolicy *p) 
       has_ci_path(r->script_snippet, "ransom_note_burst=1")) {
     mark_suspicious(p, "ransomware_note_or_file_burst", "ransomware_behavior");
   }
-  if (has_ci_path(path, "\\users\\public\\") &&
+  if (r->type != EDR_EVENT_FILE_READ && has_ci_path(path, "\\users\\public\\") &&
       (any_ends(path, executable_exts, sizeof(executable_exts) / sizeof(executable_exts[0])) ||
        any_ends(path, script_exts, sizeof(script_exts) / sizeof(script_exts[0])))) {
     mark_suspicious(p, "public_directory_execution_artifact", "public_staging");
@@ -700,10 +715,7 @@ void edr_windows_event_policy_evaluate(const EdrBehaviorRecord *r,
     return;
   }
 
-  if (!out->noisy && (r->priority == 0u || has_ci_path(r->detection_context, "\"confidence\":0.7") ||
-      has_ci_path(r->detection_context, "\"confidence\":0.8") ||
-      has_ci_path(r->detection_context, "\"confidence\":0.9") ||
-      has_ci_path(r->detection_context, "\"confidence\":1"))) {
+  if (!out->noisy && record_has_priority_signal(r)) {
     out->should_emit = 1u;
     out->should_persist = 1u;
   }

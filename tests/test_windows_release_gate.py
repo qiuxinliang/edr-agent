@@ -41,7 +41,7 @@ RUNTIME_EXPECTED = {
     "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
     "transport_durable_owner", "transport_v2_status_capacity", "ave_sdk_smoke",
-    "process_evidence_pending", "telemetry_admission", "health_upload", "pid_history_pmfe_generation",
+    "process_evidence_pending", "telemetry_admission", "windows_event_policy", "health_upload", "pid_history_pmfe_generation",
     "behavior_record_alert_proto_contract",
     "behavior_record_alert_emit_contract", "p0_direct_emit_suppression", "p0_deferred_snapshot",
     "process_tree_cache", "local_evidence_cache_candidate", "command_fact_transport",

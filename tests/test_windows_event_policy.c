@@ -57,6 +57,114 @@ static void test_initial_access_artifact_is_suspicious(void) {
   assert(strstr(r.script_snippet, "script_temp_staging") != NULL);
 }
 
+static void test_staging_file_read_is_not_a_drop(void) {
+  static const char *const paths[] = {
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\payload.exe",
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\payload.ps1",
+      "C:\\Users\\Public\\payload.exe",
+      "C:\\Users\\Public\\payload.ps1",
+  };
+  static const char *const processes[] = {"MicrosoftEdgeUpdate.exe", "reader.exe"};
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    for (size_t j = 0u; j < sizeof(processes) / sizeof(processes[0]); ++j) {
+      EdrBehaviorRecord r;
+      EdrWindowsEventPolicy p;
+      init_record(&r, EDR_EVENT_FILE_READ);
+      snprintf(r.process_name, sizeof(r.process_name), "%s", processes[j]);
+      snprintf(r.file_path, sizeof(r.file_path), "%s", paths[i]);
+      edr_windows_event_policy_apply(&r);
+      edr_windows_event_policy_evaluate(&r, &p);
+      assert(!p.suspicious && !p.high_value);
+      assert(!p.should_emit && !p.should_persist);
+      assert(r.priority != 0u);
+      assert(strstr(r.script_snippet, "staging") == NULL);
+    }
+  }
+}
+
+static void test_staging_mutations_remain_high_signal(void) {
+  static const EdrEventType types[] = {
+      EDR_EVENT_FILE_CREATE, EDR_EVENT_FILE_WRITE, EDR_EVENT_FILE_RENAME,
+      EDR_EVENT_FILE_DELETE, EDR_EVENT_FILE_PERMISSION_CHANGE,
+  };
+  static const char *const paths[] = {
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\payload.exe",
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\payload.ps1",
+      "C:\\Users\\Public\\payload.exe",
+      "C:\\Users\\Public\\payload.ps1",
+  };
+  for (size_t i = 0u; i < sizeof(types) / sizeof(types[0]); ++i) {
+    for (size_t j = 0u; j < sizeof(paths) / sizeof(paths[0]); ++j) {
+      EdrBehaviorRecord r;
+      EdrWindowsEventPolicy p;
+      init_record(&r, types[i]);
+      snprintf(r.process_name, sizeof(r.process_name), "MicrosoftEdgeUpdate.exe");
+      snprintf(r.file_path, sizeof(r.file_path), "%s", paths[j]);
+      edr_windows_event_policy_apply(&r);
+      edr_windows_event_policy_evaluate(&r, &p);
+      assert(p.suspicious && p.high_value);
+      assert(p.should_emit && p.should_persist);
+      assert(r.priority == 0u);
+    }
+  }
+}
+
+static void test_sensitive_file_reads_remain_high_signal(void) {
+  static const char *const paths[] = {
+      "C:\\Windows\\System32\\config\\SAM",
+      "C:\\Windows\\System32\\config\\SYSTEM",
+      "C:\\Windows\\NTDS\\ntds.dit",
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\lsass.dmp",
+      "C:\\Users\\Public\\sam.save",
+  };
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    EdrBehaviorRecord r;
+    EdrWindowsEventPolicy p;
+    init_record(&r, EDR_EVENT_FILE_READ);
+    snprintf(r.process_name, sizeof(r.process_name), "MicrosoftEdgeUpdate.exe");
+    snprintf(r.file_path, sizeof(r.file_path), "%s", paths[i]);
+    edr_windows_event_policy_apply(&r);
+    edr_windows_event_policy_evaluate(&r, &p);
+    assert(p.suspicious && p.high_value);
+    assert(p.should_emit && p.should_persist);
+    assert(r.priority == 0u);
+    assert(strstr(p.tags, "credential_access") != NULL);
+  }
+}
+
+static void test_explicit_priority_file_read_is_preserved(void) {
+  static const char *const paths[] = {
+      "C:\\Users\\alice\\AppData\\Local\\Temp\\payload.exe",
+      "C:\\Users\\Public\\payload.ps1",
+  };
+  static const char *const processes[] = {"MicrosoftEdgeUpdate.exe", "reader.exe"};
+  static const char *const confidence[] = {
+      "", "{\"confidence\":0.7}", "{\"confidence\":0.8}",
+      "{\"confidence\":0.9}", "{\"confidence\":1}",
+  };
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    for (size_t j = 0u; j < sizeof(processes) / sizeof(processes[0]); ++j) {
+      for (size_t k = 0u; k < sizeof(confidence) / sizeof(confidence[0]); ++k) {
+        EdrBehaviorRecord r;
+        EdrWindowsEventPolicy p;
+        init_record(&r, EDR_EVENT_FILE_READ);
+        snprintf(r.process_name, sizeof(r.process_name), "%s", processes[j]);
+        snprintf(r.file_path, sizeof(r.file_path), "%s", paths[i]);
+        snprintf(r.detection_context, sizeof(r.detection_context), "%s", confidence[k]);
+        if (k == 0u) r.priority = 0u;
+        edr_windows_event_policy_apply(&r);
+        edr_windows_event_policy_evaluate(&r, &p);
+        assert(p.should_emit && p.should_persist);
+        assert(p.high_value && !p.suspicious && !p.noisy);
+        assert(strstr(p.tags, "prioritized_file_read") != NULL);
+        assert(strstr(r.script_snippet, "drop_in") == NULL);
+        assert(strstr(r.script_snippet, "public_staging") == NULL);
+        if (k == 0u) assert(r.priority == 0u);
+      }
+    }
+  }
+}
+
 static void test_localservice_tfs_dav_cache_is_not_emitted(void) {
   EdrBehaviorRecord r;
   EdrWindowsEventPolicy p;
@@ -549,6 +657,10 @@ int main(void) {
   test_webshell_path_is_high_signal();
   test_browser_cache_stays_ring_only();
   test_initial_access_artifact_is_suspicious();
+  test_staging_file_read_is_not_a_drop();
+  test_staging_mutations_remain_high_signal();
+  test_sensitive_file_reads_remain_high_signal();
+  test_explicit_priority_file_read_is_preserved();
   test_localservice_tfs_dav_cache_is_not_emitted();
   test_autorun_registry_is_high_signal();
   test_registry_noise_is_not_emitted();
