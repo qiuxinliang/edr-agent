@@ -203,12 +203,6 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
     if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
     if (bytes > cap) { snprintf(result->error, sizeof(result->error), "migration reached physical budget; committed batches remain resumable"); goto done; }
     if (sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) != SQLITE_OK) goto sqlite_error;
-    budget.phase = "reclaim";
-    if (sqlite3_exec(db, "PRAGMA incremental_vacuum(256)", NULL, NULL, NULL) != SQLITE_OK) goto sqlite_error;
-    if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
-    if (bytes > result->peak_physical_bytes) result->peak_physical_bytes = bytes;
-    if (bytes > cap) { snprintf(result->error, sizeof(result->error), "migration reclaim reached physical budget"); goto done; }
-    if (sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) != SQLITE_OK) goto sqlite_error;
     if (sqlite3_db_release_memory(db) != SQLITE_OK) goto sqlite_error;
     if (physical_bound(db, wal, &bytes) != 0) goto sqlite_error;
     if (!disk_room(path, 2u * 1024u * 1024u)) { snprintf(result->error, sizeof(result->error), "migration disk reserve exhausted; resume after freeing space"); goto done; }

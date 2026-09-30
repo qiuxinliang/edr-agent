@@ -809,7 +809,7 @@ int main(void) {
            "release workflow probes freshly built native uninstall components");
   contains(client_release, "invoke_windows_native_capability_probe.ps1",
            "release workflow waits for GUI subsystem capability probes through the shared runner");
-  contains(client_release, "runner: windows-11-arm",
+  contains(client_release, "runner: windows-11-vs2026-arm",
            "release workflow builds and tests ARM64 on a native Windows runner");
   contains(client_release, "invoke_windows_native_capability_probe.ps1",
            "release workflow executes native lifecycle capability probes on both architectures");
@@ -840,7 +840,7 @@ int main(void) {
            "release workflow rejects packages missing native component integrity metadata");
   require_true(!strstr(client_release, "uninstall\\.ps1"),
                "release package gate must not require the removed PowerShell uninstaller");
-  contains(client_release, "Initialize-VS2022Environment.ps1",
+  contains(client_release, "Initialize-VSEnvironment.ps1",
            "release workflow pins the Visual Studio compiler generation on both architectures");
   contains(client_release, "bootstrap_pinned_vcpkg.ps1",
            "release workflow bootstraps the manifest-pinned vcpkg commit");

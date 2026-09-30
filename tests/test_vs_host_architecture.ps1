@@ -5,10 +5,10 @@ param()
 $ErrorActionPreference = "Stop"
 
 function Assert-VsHostTest([bool] $Condition, [string] $Message) {
-  if (-not $Condition) { throw "VS2022 host architecture test failed: $Message" }
+  if (-not $Condition) { throw "Visual Studio host architecture test failed: $Message" }
 }
 
-$productionScript = Join-Path $PSScriptRoot "..\scripts\Initialize-VS2022Environment.ps1"
+$productionScript = Join-Path $PSScriptRoot "..\scripts\Initialize-VSEnvironment.ps1"
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $tokens = $null
 $parseErrors = $null
@@ -80,10 +80,11 @@ try {
   }
   function Get-WindowsHostArchitecture { return $script:testCase.Host }
   function Get-VsWherePath { return $script:fixtureVsWhere }
-  function Find-VS2022Installation {
+  function Find-VSInstallation {
     param([string] $VsWherePath, [string] $VersionRange, [string[]] $RequiredComponents)
     Assert-VsHostTest ($VsWherePath -eq $script:fixtureVsWhere) "vswhere boundary path changed"
-    Assert-VsHostTest ($VersionRange -eq "[17.0,18.0)") "dependency lock range changed"
+    $expectedRange = if ($script:testCase.Host -eq "arm64") { "[18.0,19.0)" } else { "[17.0,18.0)" }
+    Assert-VsHostTest ($VersionRange -eq $expectedRange) "dependency lock must follow native host"
     $script:capturedComponents = @($RequiredComponents)
     return [pscustomobject]@{ Path = $script:fixtureVsRoot; Version = $script:testCase.Version }
   }
@@ -113,18 +114,18 @@ try {
     @{ Name = "arm64-arm64"; Host = "arm64"; Target = "arm64";
       Component = "Microsoft.VisualStudio.Component.VC.Tools.ARM64";
       Compiler = (Join-Path $script:fixtureVsRoot "VC\Tools\MSVC\14.44.35207\bin\HostARM64\ARM64\cl.exe");
-      Version = "17.14.12" },
+      Version = "18.10.12" },
     @{ Name = "arm64-x64"; Host = "arm64"; Target = "x64";
       Component = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64";
       Compiler = (Join-Path $script:fixtureVsRoot "VC\Tools\MSVC\14.44.35207\bin\HostARM64\x64\cl.exe");
-      Version = "17.14.12" }
+      Version = "18.10.12" }
   )
   foreach ($script:testCase in $cases) {
     $githubEnvironment = Join-Path $testRoot ("github-{0}.env" -f $script:testCase.Name)
     $script:capturedComponents = @()
     $script:capturedHost = ""
     $script:capturedTarget = ""
-    Initialize-VS2022Environment -TargetArchitecture $script:testCase.Target `
+    Initialize-VSEnvironment -TargetArchitecture $script:testCase.Target `
       -GithubEnvPath $githubEnvironment -RepositoryRoot $repositoryRoot
     Assert-VsHostTest ($script:capturedHost -eq $script:testCase.Host) "$($script:testCase.Name) host"
     Assert-VsHostTest ($script:capturedTarget -eq $script:testCase.Target) "$($script:testCase.Name) target"
@@ -138,12 +139,12 @@ try {
   $script:testCase = @{
     Name = "mismatched-host"; Host = "arm64"; Target = "arm64";
     Compiler = (Join-Path $script:fixtureVsRoot "VC\Tools\MSVC\14.44.35207\bin\Hostx64\ARM64\cl.exe");
-    Version = "17.14.12"
+    Version = "18.10.12"
   }
   $mismatchEnvironment = Join-Path $testRoot "github-mismatch.env"
   $mismatchFailed = $false
   try {
-    Initialize-VS2022Environment -TargetArchitecture arm64 `
+    Initialize-VSEnvironment -TargetArchitecture arm64 `
       -GithubEnvPath $mismatchEnvironment -RepositoryRoot $repositoryRoot
   } catch {
     $mismatchFailed = $_.Exception.Message -match "compiler architecture mismatch"
@@ -158,7 +159,7 @@ try {
   }
   $wrongTargetFailed = $false
   try {
-    Initialize-VS2022Environment -TargetArchitecture arm64 `
+    Initialize-VSEnvironment -TargetArchitecture arm64 `
       -GithubEnvPath "" -RepositoryRoot $repositoryRoot
   } catch {
     $wrongTargetFailed = $_.Exception.Message -match "compiler architecture mismatch"
@@ -172,14 +173,29 @@ try {
   }
   $oldVersionFailed = $false
   try {
-    Initialize-VS2022Environment -TargetArchitecture arm64 `
+    Initialize-VSEnvironment -TargetArchitecture arm64 `
       -GithubEnvPath "" -RepositoryRoot $repositoryRoot
   } catch {
-    $oldVersionFailed = $_.Exception.Message -match "17.4 or later"
+    $oldVersionFailed = $_.Exception.Message -match "Visual Studio generation mismatch"
   }
-  Assert-VsHostTest $oldVersionFailed "native ARM64 host must reject Visual Studio older than 17.4"
+  Assert-VsHostTest $oldVersionFailed "native ARM64 host must reject a compiler outside its locked generation"
 
-  Write-Host "VS2022 host architecture selection tests passed; actual_host=$actualHostArchitecture native_host=$actualNativeArchitecture."
+  foreach ($invalid in @(
+    @{ Host = "x64"; Target = "x64"; Version = "18.10.1" },
+    @{ Host = "arm64"; Target = "arm64"; Version = "19.0.1" }
+  )) {
+    $script:testCase = $invalid
+    $invalidEnvironment = Join-Path $testRoot ("wrong-generation-" + $invalid.Host + ".env")
+    $rejected = $false
+    try {
+      Initialize-VSEnvironment -TargetArchitecture $invalid.Target `
+        -GithubEnvPath $invalidEnvironment -RepositoryRoot $repositoryRoot
+    } catch { $rejected = $_.Exception.Message -match "Visual Studio generation mismatch" }
+    Assert-VsHostTest $rejected "wrong-generation compiler must be rejected for $($invalid.Host)"
+    Assert-VsHostTest (-not (Test-Path -LiteralPath $invalidEnvironment)) "wrong generation cannot export an environment"
+  }
+
+  Write-Host "Visual Studio host architecture selection tests passed; actual_host=$actualHostArchitecture native_host=$actualNativeArchitecture."
 } finally {
   $env:RUNNER_TEMP = $savedRunnerTemp
   $env:VCPKG_ROOT = $savedVcpkgRoot

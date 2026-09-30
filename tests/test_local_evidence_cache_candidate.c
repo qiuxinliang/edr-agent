@@ -6209,8 +6209,7 @@ static void test_compact_migration_budget_and_storage_types(void) {
 
 static int migration_cancel(void *context) { (void)context; return 1; }
 
-static void test_compact_near_full_migration_releases_clean_pages(void) {
-  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+static uint32_t near_full_migration_fixture(const char *path) {
   migration_fixture(path);
   sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
   compact_exec(db,
@@ -6232,11 +6231,45 @@ static void test_compact_near_full_migration_releases_clean_pages(void) {
   assert((sqlite3_int64)budget * 1048576 - bytes >= 1048576);
   assert((sqlite3_int64)budget * 1048576 - bytes < 1572864);
   assert(sqlite3_close(db) == SQLITE_OK);
+  return budget;
+}
+
+static void test_compact_near_full_migration_releases_clean_pages(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  uint32_t budget = near_full_migration_fixture(path);
+  sqlite3 *db = NULL;
   EdrEvidenceMigrationResult result;
   int rc = edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result);
   if (rc) fprintf(stderr, "near-full migration: %s (%llu moved)\n", result.error, (unsigned long long)result.moved_refs);
   assert(rc == 0 && result.complete && result.format == 2);
   assert(result.moved_refs == 4099 && result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+}
+
+static int migration_cancel_after_progress(void *context) {
+  unsigned *remaining = (unsigned *)context;
+  if (*remaining) --*remaining;
+  return *remaining == 0;
+}
+
+static void test_compact_near_full_cancel_resume(void) {
+  char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  uint32_t budget = near_full_migration_fixture(path);
+  unsigned callbacks = 200;
+  EdrEvidenceMigrationResult result;
+  assert(edr_local_evidence_cache_migrate(path, budget, 60000,
+      migration_cancel_after_progress, &callbacks, &result) == -1);
+  assert(!result.complete && result.format == 1 && strstr(result.error, "cancelled"));
+  assert(result.moved_refs > 0 && result.moved_refs < 4099);
+  assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+  uint64_t committed = result.moved_refs;
+  sqlite3 *db = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result) == 0);
+  assert(result.complete && result.format == 2 && result.moved_refs + committed == 4099);
+  assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
   assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
   assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
 }
@@ -6706,6 +6739,7 @@ int main(int argc, char **argv) {
   test_compact_full_busy_and_unknown_format();
   test_compact_migration_budget_and_storage_types();
   test_compact_near_full_migration_releases_clean_pages();
+  test_compact_near_full_cancel_resume();
   test_compact_near_full_existing_page_rewrites();
   test_compact_format_resume_and_projection();
   test_context_fact_collection_preserves_references();

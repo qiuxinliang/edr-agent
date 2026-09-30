@@ -55,8 +55,11 @@ function Test-TargetPeArchitecture {
 
 $candidateRoots = New-Object System.Collections.Generic.List[string]
 if ($env:VCToolsRedistDir) {
-  $candidateRoots.Add((Join-Path $env:VCToolsRedistDir "$redistArch\Microsoft.VC143.CRT"))
-  $candidateRoots.Add((Join-Path $env:VCToolsRedistDir "$redistArch\Microsoft.VC142.CRT"))
+  $selectedRedist = Join-Path $env:VCToolsRedistDir $redistArch
+  if (Test-Path -LiteralPath $selectedRedist -PathType Container) {
+    Get-ChildItem -LiteralPath $selectedRedist -Directory -Filter "Microsoft.VC*.CRT" |
+      Sort-Object Name -Descending | ForEach-Object { $candidateRoots.Add($_.FullName) }
+  }
 }
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"

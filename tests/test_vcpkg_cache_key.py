@@ -18,7 +18,7 @@ SPEC.loader.exec_module(MODULE)
 KEY_INPUTS = (
     "vcpkg.json",
     "dependencies.lock.json",
-    "scripts/Initialize-VS2022Environment.ps1",
+    "scripts/Initialize-VSEnvironment.ps1",
     "scripts/bootstrap_pinned_vcpkg.ps1",
     "scripts/vcpkg_cache_key.py",
     "scripts/vcpkg_release_cache.py",

@@ -101,7 +101,7 @@ def production_cmake_configure_blocks(source: str) -> list[str]:
 
 class PCRE2CMakeGateTests(unittest.TestCase):
     def test_visual_studio_environment_preserves_caller_vcpkg_root(self):
-        source = (AGENT_ROOT / "scripts" / "Initialize-VS2022Environment.ps1").read_text(encoding="utf-8")
+        source = (AGENT_ROOT / "scripts" / "Initialize-VSEnvironment.ps1").read_text(encoding="utf-8")
         self.assertIn(
             '$callerVcpkgRoot = [Environment]::GetEnvironmentVariable("VCPKG_ROOT", "Process")',
             source,

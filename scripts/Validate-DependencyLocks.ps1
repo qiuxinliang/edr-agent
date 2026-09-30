@@ -22,9 +22,12 @@ $dependencyLock = Read-JsonFile "dependencies.lock.json"
 if ([string]$dependencyLock.schema -ne "edr.native-dependencies.lock.v1") {
   throw "Unsupported dependency lock schema: $($dependencyLock.schema)"
 }
-if ([string]$dependencyLock.visual_studio.generation -ne "2022" -or
-    [string]$dependencyLock.visual_studio.version_range -ne "[17.0,18.0)") {
-  throw "Visual Studio must be locked to generation 2022 and range [17.0,18.0)"
+if (@($dependencyLock.visual_studio.PSObject.Properties).Count -ne 2 -or
+    [string]$dependencyLock.visual_studio.x64.generation -ne "2022" -or
+    [string]$dependencyLock.visual_studio.x64.version_range -ne "[17.0,18.0)" -or
+    [string]$dependencyLock.visual_studio.arm64.generation -ne "2026" -or
+    [string]$dependencyLock.visual_studio.arm64.version_range -ne "[18.0,19.0)") {
+  throw "Visual Studio must be locked per host: x64=2022 [17.0,18.0), arm64=2026 [18.0,19.0)"
 }
 
 $globalJson = Read-JsonFile "global.json"
@@ -107,4 +110,4 @@ if (-not (Test-Path -LiteralPath $releaseRequirements -PathType Leaf) -or
   throw "Release P0 encryption dependency must pin cryptography==44.0.3 in requirements-release.txt"
 }
 
-Write-Host "Dependency locks verified: VS2022, .NET $($globalJson.sdk.version), vcpkg $vcpkgBaseline, NuGet source policy and RID closures, P0 cryptography"
+Write-Host "Dependency locks verified: VS2022/x64 and VS2026/arm64, .NET $($globalJson.sdk.version), vcpkg $vcpkgBaseline, NuGet source policy and RID closures, P0 cryptography"

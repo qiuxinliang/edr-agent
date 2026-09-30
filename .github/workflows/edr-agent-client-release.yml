@@ -114,7 +114,7 @@ jobs:
             cmake_processor: AMD64
             include_windivert: "true"
           - arch: arm64
-            runner: windows-11-arm
+            runner: windows-11-vs2026-arm
             msvc_arch: arm64
             triplet: arm64-windows
             runtime_identifier: win-arm64
@@ -325,10 +325,10 @@ jobs:
           "EDR_UPGRADE_CLASS=$upgradeClass" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Windows release upgrade class: $upgradeClass"
 
-      - name: Initialize pinned Visual Studio 2022 environment
+      - name: Initialize pinned Visual Studio environment
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
-        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
       - name: Preflight native P0 test compiler before dependencies
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
@@ -380,7 +380,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_vcpkg_*cache*.py' -v
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache regression failed' }
           & .\tests\test_vcpkg_install_retry.ps1
-          & .\tests\test_vs2022_host_architecture.ps1
+          & .\tests\test_vs_host_architecture.ps1
           python .\scripts\vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
       - name: Cache vcpkg source and binary downloads
         if: steps.resume.outputs.restored != 'true'

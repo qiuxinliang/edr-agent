@@ -653,7 +653,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     matches = [step for step in steps if marker in step]
                     self.assertEqual(len(matches), 1, marker)
                     return matches[0]
-                initialize = step_with("name: Initialize pinned Visual Studio 2022 environment")
+                initialize = step_with("name: Initialize pinned Visual Studio environment")
                 if "prebuild" not in workflow:
                     preflight = step_with("name: Preflight native P0 test compiler before dependencies")
                     self.assertIn("WindowsReleaseGateTests.test_p0_direct_emit_windows_compiler_surface -v", preflight)
@@ -697,7 +697,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.assertIn("permissions:\n  contents: read", source)
                     self.assertNotIn("vcpkg_release_cache.py publish", source)
                 self.assertIn("test_vcpkg_install_retry.ps1", identify)
-                self.assertIn("test_vs2022_host_architecture.ps1", identify)
+                self.assertIn("test_vs_host_architecture.ps1", identify)
                 if workflow == "edr-agent-client-release.yml":
                     publish = step_with("name: Publish shared vcpkg dependency cache")
                     self.assertLess(steps.index(install), steps.index(publish))

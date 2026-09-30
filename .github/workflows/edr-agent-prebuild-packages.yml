@@ -17,7 +17,7 @@ on:
       - scripts/vcpkg_release_cache.py
       - scripts/Invoke-VcpkgInstallWithRetry.ps1
       - scripts/vcpkg_cache_key.py
-      - scripts/Initialize-VS2022Environment.ps1
+      - scripts/Initialize-VSEnvironment.ps1
       - scripts/bootstrap_pinned_vcpkg.ps1
       - .github/workflows/edr-agent-prebuild-packages.yml
 
@@ -46,7 +46,7 @@ jobs:
             runner: windows-2022
             msvc_arch: x64
           - triplet: arm64-windows
-            runner: windows-11-arm
+            runner: windows-11-vs2026-arm
             msvc_arch: arm64
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
@@ -80,9 +80,9 @@ jobs:
             ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
           key: ${{ steps.python-cache.outputs.cache-primary-key }}
 
-      - name: Initialize pinned Visual Studio 2022 environment
+      - name: Initialize pinned Visual Studio environment
         shell: pwsh
-        run: .\scripts\Initialize-VS2022Environment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
 
       - name: Prepare cache directories
         shell: pwsh
@@ -97,7 +97,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_vcpkg_*cache*.py' -v
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache regression failed' }
           & .\tests\test_vcpkg_install_retry.ps1
-          & .\tests\test_vs2022_host_architecture.ps1
+          & .\tests\test_vs_host_architecture.ps1
           python .\scripts\vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
       - name: Cache vcpkg source and binary downloads
         id: vcpkg-cache

@@ -17,7 +17,7 @@ def cache_identity(root, triplet, toolchain):
         raise ValueError(f"Unsupported dependency triplet: {triplet}")
     # Share snapshots between PR, prebuild and release jobs with identical inputs.
     inputs = {name: digest_file(root / name) for name in (
-        "vcpkg.json", "dependencies.lock.json", "scripts/Initialize-VS2022Environment.ps1",
+        "vcpkg.json", "dependencies.lock.json", "scripts/Initialize-VSEnvironment.ps1",
         "scripts/bootstrap_pinned_vcpkg.ps1", "scripts/vcpkg_cache_key.py",
         "scripts/vcpkg_release_cache.py",
     )}

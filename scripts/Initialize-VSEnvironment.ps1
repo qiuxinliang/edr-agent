@@ -43,7 +43,7 @@ public static class EdrVsHostArchitectureNativeMethods {
       [EdrVsHostArchitectureNativeMethods]::GetCurrentProcess(),
       [ref]$processMachine, [ref]$nativeMachine)
   } catch [System.EntryPointNotFoundException] {
-    throw "IsWow64Process2 is unavailable; Visual Studio 2022 host detection requires Windows 10 or Windows Server version 1709 or later"
+    throw "IsWow64Process2 is unavailable; Visual Studio host detection requires Windows 10 or Windows Server version 1709 or later"
   }
   if (-not $succeeded) {
     $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
@@ -64,7 +64,7 @@ function Get-VsWherePath {
   return Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 }
 
-function Find-VS2022Installation {
+function Find-VSInstallation {
   param(
     [string] $VsWherePath,
     [string] $VersionRange,
@@ -72,7 +72,7 @@ function Find-VS2022Installation {
   )
   $installationPath = (& $VsWherePath -products * -version $VersionRange -requires $RequiredComponents -property installationPath -latest | Select-Object -First 1)
   if ([string]::IsNullOrWhiteSpace([string]$installationPath)) {
-    throw "Visual Studio 2022 with the required C++ target toolchain is required: $($RequiredComponents -join ',')"
+    throw "Visual Studio in locked range $VersionRange with the required C++ target toolchain is required: $($RequiredComponents -join ',')"
   }
   $installationVersion = (& $VsWherePath -path $installationPath -property installationVersion | Select-Object -First 1)
   return [pscustomobject]@{
@@ -106,7 +106,7 @@ function Assert-VSCompilerPath {
     [string] $TargetArchitecture
   )
   if ([string]::IsNullOrWhiteSpace($Compiler)) {
-    throw "cl.exe was not found after Visual Studio 2022 initialization"
+    throw "cl.exe was not found after Visual Studio initialization"
   }
   $compilerFull = [IO.Path]::GetFullPath($Compiler).Replace('/', '\')
   $installationFull = [IO.Path]::GetFullPath($InstallationPath).TrimEnd('\', '/')
@@ -120,7 +120,7 @@ function Assert-VSCompilerPath {
   return $compilerFull
 }
 
-function Initialize-VS2022Environment {
+function Initialize-VSEnvironment {
   param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("x64", "arm64")]
@@ -133,8 +133,10 @@ function Initialize-VS2022Environment {
   $callerVcpkgRoot = [Environment]::GetEnvironmentVariable("VCPKG_ROOT", "Process")
   Invoke-DependencyLockValidation -RepositoryRoot $repositoryRoot
   $dependencyLock = [IO.File]::ReadAllText((Join-Path $repositoryRoot "dependencies.lock.json")) | ConvertFrom-Json
-  $visualStudioVersionRange = [string]$dependencyLock.visual_studio.version_range
   $hostArchitecture = Get-WindowsHostArchitecture
+  $hostContract = $dependencyLock.visual_studio.PSObject.Properties[$hostArchitecture].Value
+  if ($null -eq $hostContract) { throw "Visual Studio lock missing for host=$hostArchitecture" }
+  $visualStudioVersionRange = [string]$hostContract.version_range
 
   $vswhere = Get-VsWherePath
   if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
@@ -145,30 +147,27 @@ function Initialize-VS2022Environment {
   } else {
     @("Microsoft.VisualStudio.Component.VC.Tools.x86.x64")
   }
-  $installation = Find-VS2022Installation -VsWherePath $vswhere `
+  $installation = Find-VSInstallation -VsWherePath $vswhere `
     -VersionRange $visualStudioVersionRange -RequiredComponents $requiredComponents
-  if ($installation.Version -notmatch '^17\.') {
-    throw "Visual Studio generation mismatch: expected 17.x, actual=$($installation.Version)"
-  }
-  if ($hostArchitecture -eq "arm64") {
-    $versionMatch = [regex]::Match($installation.Version, '^17\.(\d+)')
-    if (-not $versionMatch.Success -or [int]$versionMatch.Groups[1].Value -lt 4) {
-      throw "Visual Studio 2022 17.4 or later is required for a native ARM64 host; actual=$($installation.Version)"
-    }
+  $range = [regex]::Match($visualStudioVersionRange, '^\[(\d+\.\d+),(\d+\.\d+)\)$')
+  if (-not $range.Success -or
+      [version]$installation.Version -lt [version]$range.Groups[1].Value -or
+      [version]$installation.Version -ge [version]$range.Groups[2].Value) {
+    throw "Visual Studio generation mismatch: host=$hostArchitecture expected=$visualStudioVersionRange actual=$($installation.Version)"
   }
   $devCmd = Join-Path $installation.Path "Common7\Tools\VsDevCmd.bat"
   if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) {
     throw "VsDevCmd.bat was not found: $devCmd"
   }
 
-  $environmentDump = Join-Path $env:RUNNER_TEMP ("vs2022-{0}-{1}-{2}.env" -f `
+  $environmentDump = Join-Path $env:RUNNER_TEMP ("vs-{0}-{1}-{2}.env" -f `
     $hostArchitecture, $TargetArchitecture, [Guid]::NewGuid().ToString("N"))
   try {
     $exitCode = Invoke-VsDevCmdEnvironment -DevCmd $devCmd `
       -TargetArchitecture $TargetArchitecture -HostArchitecture $hostArchitecture `
       -EnvironmentDump $environmentDump
     if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $environmentDump -PathType Leaf)) {
-      throw "Visual Studio 2022 environment initialization failed for host=$hostArchitecture target=$TargetArchitecture"
+      throw "Visual Studio environment initialization failed for host=$hostArchitecture target=$TargetArchitecture"
     }
 
     $environmentEntries = New-Object 'System.Collections.Generic.List[object]'
@@ -203,9 +202,9 @@ function Initialize-VS2022Environment {
     Remove-Item -LiteralPath $environmentDump -Force -ErrorAction SilentlyContinue
   }
 
-  Write-Host "Visual Studio 2022 ready: version=$($installation.Version) host=$hostArchitecture target=$TargetArchitecture compiler=$compiler"
+  Write-Host "Visual Studio $($hostContract.generation) ready: version=$($installation.Version) host=$hostArchitecture target=$TargetArchitecture compiler=$compiler"
 }
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-Initialize-VS2022Environment -TargetArchitecture $Architecture `
+Initialize-VSEnvironment -TargetArchitecture $Architecture `
   -GithubEnvPath $GithubEnvPath -RepositoryRoot $repositoryRoot

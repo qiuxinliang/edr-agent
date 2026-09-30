@@ -338,6 +338,13 @@ int edr_context_store_migrate_batch(EdrContextStore *s, unsigned limit,
   sqlite3_finalize(read); read = NULL;
   edr_context_writer_close(&writer);
   if (*complete && sql(s, "PRAGMA user_version=2;") != 0) goto rollback;
+  /* Reuse the migration transaction for bounded reclamation. Separate FULL
+   * vacuum commits and a second WAL checkpoint dominated small Windows
+   * batches. Scaling reclamation with the validated row limit lets the
+   * caller's reserve guard split and roll back the entire unit together. */
+  char reclaim[64];
+  snprintf(reclaim, sizeof(reclaim), "PRAGMA incremental_vacuum(%u);", limit);
+  if (sql(s, reclaim) != 0) goto rollback;
   if (sql(s, "COMMIT;") != 0) goto rollback;
   if (*complete) s->format = 2;
   return 0;
