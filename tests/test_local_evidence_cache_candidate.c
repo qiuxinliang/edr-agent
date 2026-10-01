@@ -6443,6 +6443,99 @@ static void test_context_fact_collection_preserves_references(void) {
   }
 }
 
+/* Exercise the maintenance owner, including mixed-format references, with
+ * real expired payloads and nanosecond/NULL retention boundaries. */
+static void test_payload_retention_boundaries_and_projection(void) {
+  const int64_t now = (int64_t)time(NULL) * 1000000000LL;
+  const int64_t cutoff = now - 24LL * 3600 * 1000000000LL;
+  for (int format = 0; format <= 2; ++format) {
+    char path[512], sql[4096];
+    sqlite3 *db = NULL;
+    EdrContextStore store;
+    EdrEvidenceCacheStatus before, after;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(now);
+    assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+    edr_local_evidence_cache_close();
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(&store, db) == 0);
+    int length = snprintf(sql, sizeof(sql),
+        "BEGIN;"
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4192) "
+        "INSERT INTO p0_candidates(candidate_id,endpoint_id,pid,event_time_ns,cmdline) "
+        "SELECT 'candidate-'||x,'ep-'||(x%%4),x%%3,CASE WHEN x<=4096 THEN %lld-1 "
+        "WHEN x%%3=0 THEN %lld WHEN x%%3=1 THEN %lld+1 END,printf('%%01024d',x) FROM n;"
+        "INSERT INTO artifacts(artifact_id,endpoint_id,candidate_id,artifact_type,"
+        "manifest_json,created_ns,upload_status,minio_key) "
+        "SELECT 'artifact-'||id,endpoint_id,candidate_id,'command',cmdline,event_time_ns,"
+        "'pending','key-'||id FROM p0_candidates;"
+        "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,created_ns,updated_ns) "
+        "VALUES('shared','ep-1','tenant','{\"candidate_id\":null,\"fact\":\"shared\"}',1,1),"
+        "('unowned','ep-1','tenant','{\"candidate_id\":null,\"fact\":\"unowned\"}',1,1);"
+        "INSERT INTO candidate_context_refs VALUES"
+        "('expired-ref','candidate-1','shared','\"candidate-1\"',%lld-1,'pending','old'),"
+        "('keep-ref','candidate-4098','shared','\"candidate-4098\"',%lld,'uploaded','keep'),"
+        "('unowned-ref','candidate-2','unowned','\"candidate-2\"',%lld-1,NULL,NULL),"
+        "('keep-orphan-ref','candidate-2','shared','\"candidate-2\"',%lld+1,NULL,NULL),"
+        "('null-ref','candidate-4097','shared','\"candidate-4097\"',NULL,NULL,NULL);COMMIT;",
+        (long long)cutoff, (long long)cutoff, (long long)cutoff,
+        (long long)cutoff, (long long)cutoff, (long long)cutoff, (long long)cutoff);
+    assert(length > 0 && (size_t)length < sizeof(sql));
+    compact_exec(db, sql);
+    if (format) {
+      unsigned moved = 0; int complete = 0;
+      assert(edr_context_store_begin_upgrade(&store) == 0);
+      do {
+        assert(edr_context_store_migrate_batch(&store, 1, &moved, &complete) == 0);
+      } while (format == 2 && !complete);
+      assert(store.format == format);
+    }
+    /* Store the whole consumer projection before maintenance. The retained
+     * orphan reference intentionally outlives its expired candidate. */
+    compact_exec(db,
+        "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts "
+        "WHERE artifact_id IN ('keep-ref','keep-orphan-ref','null-ref') "
+        "OR artifact_id IN (SELECT 'artifact-'||id FROM p0_candidates WHERE id>4096);"
+        "CREATE TABLE expected_candidates AS SELECT * FROM p0_candidates WHERE id>4096;"
+        "CREATE TABLE expected_facts AS SELECT * FROM context_facts WHERE fact_id='shared';");
+    assert(sqlite3_close(db) == SQLITE_OK);
+    /* Open executes the same production maintenance owner as periodic poll. */
+    assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+    edr_local_evidence_cache_get_status(&before);
+    assert(before.db_retention_evicted == 8195u); /* 2*4096 payloads + 2 refs + 1 fact */
+    assert(before.db_capacity_evicted == 0u && before.last_error[0] == '\0');
+    for (int pass = 0; pass < 3; ++pass) {
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      compact_assert_projection(db);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts") == 99);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 96);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE created_ns IS NULL") == 32);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE event_time_ns IS NULL") == 32);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM expected_candidates EXCEPT SELECT * FROM p0_candidates)") == 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM p0_candidates EXCEPT SELECT * FROM expected_candidates)") == 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 1);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM expected_facts EXCEPT SELECT * FROM context_facts)") == 0);
+      assert(sqlite3_close(db) == SQLITE_OK);
+      if (pass == 0) {
+        s_test_monotonic_ns += 61000000000ULL;
+        edr_local_evidence_cache_poll_maintenance();
+        edr_local_evidence_cache_get_status(&after);
+        assert(after.maintenance_runs == before.maintenance_runs + 1u);
+        assert(after.db_retention_evicted == before.db_retention_evicted);
+      } else if (pass == 1) {
+        edr_local_evidence_cache_close();
+        assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+        edr_local_evidence_cache_get_status(&after);
+        assert(after.db_retention_evicted == 0u && after.last_error[0] == '\0');
+      }
+    }
+    edr_local_evidence_cache_close();
+    cleanup_test_sqlite_path(path);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = 1000000000ULL;
+}
+
 static void test_compact_runtime_replay_enrichment_and_failure(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -6747,6 +6840,7 @@ int main(int argc, char **argv) {
   test_compact_near_full_existing_page_rewrites();
   test_compact_format_resume_and_projection();
   test_context_fact_collection_preserves_references();
+  test_payload_retention_boundaries_and_projection();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();
   test_legacy_command_quality_is_unknown_until_observed();

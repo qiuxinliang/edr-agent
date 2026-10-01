@@ -4506,7 +4506,14 @@ static void sqlite_maintenance(void) {
                         "last_seen_ns", "created_ns", "created_ns", "updated_ns"};
   for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
     char sql[160];
-    snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
+    if (strcmp(tables[i], "p0_candidates") == 0 || strcmp(tables[i], "artifacts") == 0) {
+      /* Existing time indexes cover rowid selection without reading wide
+       * command/manifest payloads for rows that will survive retention. */
+      snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE rowid IN "
+               "(SELECT rowid FROM %s WHERE %s < ?);", tables[i], tables[i], cols[i]);
+    } else {
+      snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
+    }
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
       sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
       int rc = sqlite3_step(st);
