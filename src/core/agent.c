@@ -2254,7 +2254,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   char static_ver[48], behavior_ver[48], ioc_ver[48];
   char health_profile[48], health_request_id[160];
   char det_policy_source[64], det_policy_version[96], det_policy_rollback[96], det_policy_audit[160];
-  char http_err[192], command_result_error[192], evidence_json[4096], sensor_interest_ver[160], sensor_interest_rules[160];
+  char http_err[192], command_result_error[192], evidence_json[16384], sensor_interest_ver[160], sensor_interest_rules[160];
   char sensor_interest_artifact_sha[80], sensor_interest_coverage_sha[80];
   char sensor_interest_manifest_sha[80], sensor_interest_manifest_hash_mode[80];
   char corr_health_json[600], p0_health_json[8192];
@@ -2426,6 +2426,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&p0_emit_metrics, 0, sizeof(p0_emit_metrics));
   memset(&queue_capacity_metrics, 0, sizeof(queue_capacity_metrics));
   edr_local_evidence_cache_get_status(&evidence_status);
+  char evidence_accounting_json[2048];
+  if (edr_local_evidence_cache_accounting_json(&evidence_status, evidence_accounting_json,
+                                              sizeof(evidence_accounting_json)) != 0)
+    snprintf(evidence_accounting_json, sizeof(evidence_accounting_json), "{\"status\":\"unavailable\"}");
   edr_p0_rule_get_dedup_metrics(&p0_metrics);
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
   json_escape_small(p0_emit_metrics.source_only_terminal_reason, source_only_reason, sizeof(source_only_reason));
@@ -2554,7 +2558,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"retention_evicted\":%llu,\"capacity_evicted\":%llu,\"metric_write_failures\":%llu,\"metric_unrecorded\":%llu},"
         "\"context_window_evictions\":%llu,"
         "\"context_window_nominal_ended_replacements\":%llu,"
-        "\"context_window_protected_replacements\":%llu,\"context_ref_write_sources\":%s},"
+        "\"context_window_protected_replacements\":%llu,\"context_ref_write_sources\":%s,\"accounting\":%s},"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
         "\"requests_total\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,"
         "\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,"
@@ -2758,7 +2762,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)evidence_status.context_window_evictions,
         (unsigned long long)evidence_status.context_window_nominal_ended_replacements,
         (unsigned long long)evidence_status.context_window_protected_replacements,
-        context_ref_sources_json,
+        context_ref_sources_json, evidence_accounting_json,
         process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
         (unsigned long long)process_evidence_metrics.requests_total,
         (unsigned long long)process_evidence_metrics.ready_hits,

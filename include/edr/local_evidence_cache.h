@@ -16,6 +16,21 @@
  * wire event values currently assigned by types.h and future values. */
 #define EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS 256u
 
+/* Disjoint decisions for ordinary inputs that did not request durable storage. */
+typedef enum {
+  EDR_EVIDENCE_POLICY_FILTERED, EDR_EVIDENCE_PRESSURE_SKIPPED,
+  EDR_EVIDENCE_COALESCED, EDR_EVIDENCE_HOT_RING_ONLY,
+  EDR_EVIDENCE_ORDINARY_REASON_COUNT
+} EdrEvidenceOrdinaryReason;
+
+/* One reason per failed candidate or context persistence operation. */
+typedef enum {
+  EDR_EVIDENCE_FAILURE_NO_DATABASE, EDR_EVIDENCE_FAILURE_CAPACITY,
+  EDR_EVIDENCE_FAILURE_WRITE_BUDGET, EDR_EVIDENCE_FAILURE_RESOURCE,
+  EDR_EVIDENCE_FAILURE_INVALID, EDR_EVIDENCE_FAILURE_STORAGE,
+  EDR_EVIDENCE_FAILURE_UNCLASSIFIED, EDR_EVIDENCE_FAILURE_REASON_COUNT
+} EdrEvidenceFailureReason;
+
 typedef struct {
   int db_open;
   uint32_t storage_format; /* 0 legacy, 1 migrating, 2 compact */
@@ -34,10 +49,10 @@ typedef struct {
    * does not change admission, retention, or upload behavior. */
   uint64_t context_ref_writes_by_event_type[EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS];
   uint64_t command_results_written;
-  /* Candidate accounting has non-overlapping denominators:
-   * requests = reused + admission_attempts;
-   * admission_attempts = admitted + rejected.
-   * `admitted` advances only after the containing SQLite transaction commits. */
+  /* Candidate operations: requests = records_written + candidate_rejected.
+   * records_written counts successful insert/update transactions, not unique
+   * evidence. Reuse and first-admission counters overlap failure outcomes;
+   * database replay/enrichment can bypass first-admission accounting. */
   uint64_t candidate_requests;
   /* Current-process, short-window local evidence reuse only. It is neither
    * alert suppression nor a persistent/cross-restart cache-hit metric. */
@@ -88,6 +103,9 @@ typedef struct {
   uint64_t metric_registry_drops;
   uint64_t metric_network_drops;
   uint64_t metric_other_drops;
+  uint64_t ordinary_reasons[EDR_EVIDENCE_ORDINARY_REASON_COUNT];
+  uint64_t candidate_failure_reasons[EDR_EVIDENCE_FAILURE_REASON_COUNT];
+  uint64_t context_failure_reasons[EDR_EVIDENCE_FAILURE_REASON_COUNT];
   uint64_t maintenance_runs;
   uint64_t identity_observations_total;
   uint64_t identity_none;
@@ -250,6 +268,9 @@ void edr_local_evidence_cache_flush_summaries(int64_t now_ns,
                                               void (*emit)(const EdrBehaviorRecord *));
 
 void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out);
+/* Shared by basic and diagnostic health; returns -1 on insufficient output. */
+int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *status,
+                                            char *out, size_t cap);
 
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 /* Test-only wall clock for historical replay and retention checks. Survives
@@ -259,6 +280,7 @@ void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns);
  * hook. This is test-only evidence that counters and dedupe state move only
  * after the durable boundary succeeds. */
 void edr_local_evidence_cache_test_fail_next_commits(unsigned count);
+void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count);
 /* Test-only mutex timing controls. They never exist in production builds. */
 void edr_local_evidence_cache_test_reset_mutex_timing(void);
 void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,

@@ -41,7 +41,8 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #include "../src/storage/evidence_context_store.h"
 #endif
 
-bool edr_resource_preprocess_throttle_active(void) { return false; }
+static bool s_test_pressure;
+bool edr_resource_preprocess_throttle_active(void) { return s_test_pressure; }
 static uint64_t s_test_monotonic_ns = 1000000000ull;
 uint64_t edr_monotonic_ns(void) { return s_test_monotonic_ns; }
 /* The parser's unrelated enforcement side effect is outside this fixture. */
@@ -817,6 +818,7 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   assert(failed.candidate_admitted == 0u);
   assert(failed.candidate_rejected == 1u);
   assert(failed.candidate_transaction_failures == 1u);
+  assert(failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] == 1u);
   assert(failed.records_written == 0u && failed.p0_candidates_written == 0u);
   assert(failed.artifacts_written == 0u);
   assert(sqlite_table_count(db, "p0_candidates") == 0u);
@@ -1140,6 +1142,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   assert(status.write_budget_ordinary_context_used == 4u);
   assert(status.write_budget_ordinary_context_limit == 4u);
   assert(status.write_budget_context_dropped >= 2u);
+  assert(status.context_failure_reasons[EDR_EVIDENCE_FAILURE_WRITE_BUDGET] == status.write_budget_context_dropped);
   assert(status.write_budget_ordinary_context_dropped >= 2u);
   assert(status.write_budget_critical_context_dropped == 0u);
   assert(status.write_budget_candidate_dropped == 0u);
@@ -1147,7 +1150,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   assert(status.candidate_rejected == 0u);
   assert(status.artifacts_written == 39u);
 
-  char health_json[4096];
+  char health_json[8192];
   edr_local_evidence_cache_status_json(health_json, sizeof(health_json));
   assert(strstr(health_json, "\"scope\":\"context_only\"") != NULL);
   assert(strstr(health_json, "\"candidate\":{\"mode\":\"exempt\",\"dropped\":0}") != NULL);
@@ -1398,6 +1401,8 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   edr_local_evidence_cache_record_behavior(&context);
   edr_local_evidence_cache_get_status(&after_failure);
   assert(after_failure.records_dropped == before_failure.records_dropped + 1u);
+  assert(after_failure.context_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] ==
+         before_failure.context_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] + 1u);
   assert(after_failure.last_error[0] != '\0');
   assert(after_failure.context_facts_written == before_failure.context_facts_written);
   assert(after_failure.context_refs_written == before_failure.context_refs_written);
@@ -1762,6 +1767,8 @@ static void test_critical_context_still_honors_database_capacity(void) {
 
   assert(after.db_budget_dropped == before.db_budget_dropped + 1u);
   assert(after.records_dropped == before.records_dropped + 1u);
+  assert(after.context_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
+         before.context_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] + 1u);
   assert(after.write_budget_critical_context_used == 0u);
   assert(after.write_budget_critical_context_dropped == 0u);
   assert(strstr(after.last_error, "evidence cache size budget exceeded") != NULL);
@@ -4113,6 +4120,8 @@ static void test_context_manifest_utf8_backslash_and_invalid_rejection(void) {
   edr_local_evidence_cache_record_behavior(&event);
   edr_local_evidence_cache_get_status(&after);
   assert(after.manifest_rejections == before.manifest_rejections + 1u);
+  assert(after.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] ==
+         before.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] + 1u);
   assert(after.records_dropped == before.records_dropped + 1u);
   assert(sqlite_post_artifact_count(db, candidate_id, "manifest-invalid-utf8") == 0u);
   sqlite_assert_all_artifact_manifests_parse(db);
@@ -7062,22 +7071,134 @@ static void metric_test_poll(void) {
   edr_local_evidence_cache_poll_maintenance();
 }
 
-static int64_t metric_test_value(const char *path, int64_t minute,
-                                const char *endpoint) {
+static int64_t metric_test_named_value(const char *path, int64_t minute,
+                                const char *endpoint, const char *name) {
   sqlite3 *db = NULL;
   sqlite3_stmt *st = NULL;
   int64_t result = 0;
   assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
   assert(sqlite3_prepare_v2(db, "SELECT value FROM metrics WHERE minute_unix=? "
-      "AND endpoint_id=? AND metric_name='file_drops'", -1, &st, NULL) == SQLITE_OK);
+      "AND endpoint_id=? AND metric_name=?", -1, &st, NULL) == SQLITE_OK);
   assert(sqlite3_bind_int64(st, 1, minute) == SQLITE_OK);
   assert(sqlite3_bind_text(st, 2, endpoint, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 3, name, -1, SQLITE_TRANSIENT) == SQLITE_OK);
   int rc = sqlite3_step(st);
   assert(rc == SQLITE_ROW || rc == SQLITE_DONE);
   if (rc == SQLITE_ROW) result = sqlite3_column_int64(st, 0);
   sqlite3_finalize(st);
   assert(sqlite3_close(db) == SQLITE_OK);
   return result;
+}
+
+static int64_t metric_test_value(const char *path, int64_t minute, const char *endpoint) {
+  return metric_test_named_value(path, minute, endpoint, "file_drops");
+}
+
+static void test_metric_dispositions_and_resource_failures(void) {
+  char path[512], health[16384], document[16400];
+  sqlite3 *raw = NULL;
+  EdrEvidenceCacheStatus status;
+  EdrBehaviorRecord r;
+  const char *reason_names[] = {"ordinary_policy_filtered", "ordinary_pressure_skipped",
+                                "ordinary_coalesced", "ordinary_hot_ring_only"};
+  int64_t minute = (int64_t)time(NULL) / 60;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(minute * 60000000000LL + 1000000000LL);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  init_record(&r, EDR_EVENT_FILE_WRITE);
+  r.event_time_ns = minute * 60000000000LL + 1000000000LL;
+  set_record_generation(&r, 4242u);
+  snprintf(r.endpoint_id, sizeof(r.endpoint_id), "metric-reasons");
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\Noise\\__PSScriptPolicyTest_fixture.ps1");
+  edr_local_evidence_cache_record_behavior(&r);
+  snprintf(r.file_path, sizeof(r.file_path), "C:\\Data\\ordinary.txt");
+  s_test_pressure = true;
+  edr_local_evidence_cache_record_behavior(&r);
+  s_test_pressure = false;
+  edr_local_evidence_cache_record_behavior(&r);
+  edr_local_evidence_cache_record_behavior(&r);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.metric_file_drops == 4u && status.records_skipped == 4u);
+  assert(status.records_dropped == 0u && status.hot_ring_ingested == 1u);
+  for (size_t i = 0; i < EDR_EVIDENCE_ORDINARY_REASON_COUNT; ++i) assert(status.ordinary_reasons[i] == 1u);
+  assert(sqlite_table_count(path, "p0_candidates") == 0u);
+
+  /* Fail after the legacy aggregate is written: both label sets must roll back. */
+  assert(sqlite3_open(path, &raw) == SQLITE_OK);
+  compact_exec(raw, "CREATE TRIGGER reasons_deny BEFORE INSERT ON metrics "
+                    "WHEN NEW.metric_name LIKE 'ordinary_%' "
+                    "BEGIN SELECT RAISE(ABORT,'reason metric failure'); END;");
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-reasons") == 0);
+  for (size_t i = 0; i < 4; ++i) assert(metric_test_named_value(path, minute, "metric-reasons", reason_names[i]) == 0);
+  compact_exec(raw, "DROP TRIGGER reasons_deny;");
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  metric_test_poll();
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-reasons") == 4);
+  for (size_t i = 0; i < 4; ++i) assert(metric_test_named_value(path, minute, "metric-reasons", reason_names[i]) == 1);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  edr_local_evidence_cache_record_behavior(&r);
+  metric_test_poll();
+  assert(metric_test_value(path, minute, "metric-reasons") == 5);
+  assert(metric_test_named_value(path, minute, "metric-reasons", "ordinary_hot_ring_only") == 2);
+
+  /* Fail a real manifest allocation after the candidate transaction starts. */
+  r.priority = 3u;
+  r.type = EDR_EVENT_NET_CONNECT;
+  r.file_path[0] = '\0';
+  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+  snprintf(r.net_dst, sizeof(r.net_dst), "10.0.0.55");
+  r.net_dport = 445u;
+  assert(edr_local_evidence_cache_is_candidate(&r) == 1);
+  snprintf(r.event_id, sizeof(r.event_id), "resource-candidate");
+  edr_local_evidence_cache_test_fail_next_manifest_allocations(1u);
+  edr_local_evidence_cache_record_behavior(&r);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_rejected == 1u && status.records_dropped == 1u);
+  assert(status.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_RESOURCE] == 1u);
+  assert(status.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] == 0u);
+  assert(sqlite_table_count(path, "p0_candidates") == 0u);
+  edr_local_evidence_cache_record_behavior(&r);
+  assert(sqlite_table_count(path, "p0_candidates") == 1u);
+  metric_test_poll();
+  assert(metric_test_named_value(path, minute, "metric-reasons", "candidate_resource_failed") == 1);
+  assert(metric_test_value(path, minute, "metric-reasons") == 5);
+
+  edr_local_evidence_cache_status_json(health, sizeof(health));
+  snprintf(document, sizeof(document), "{%s}", health);
+  cJSON *root = cJSON_Parse(document);
+  assert(root != NULL);
+  cJSON *cache = cJSON_GetObjectItemCaseSensitive(root, "evidence_cache");
+  cJSON *accounting = cJSON_GetObjectItemCaseSensitive(cache, "accounting");
+  assert(cJSON_IsObject(accounting));
+  cJSON *failures = cJSON_GetObjectItemCaseSensitive(accounting, "candidate_failures");
+  assert(cJSON_GetObjectItemCaseSensitive(failures, "candidate_resource_failed")->valuedouble == 1.0);
+  assert(cJSON_GetObjectItemCaseSensitive(cache, "physical_bytes") != NULL);
+  cJSON_Delete(root);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_record_behavior(&r);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_NO_DATABASE] == 1u);
+  assert(status.candidate_requests == status.records_written + status.candidate_rejected);
+  uint64_t candidate_failures = 0, context_failures = 0;
+  for (size_t i = 0; i < EDR_EVIDENCE_FAILURE_REASON_COUNT; ++i) {
+    candidate_failures += status.candidate_failure_reasons[i];
+    context_failures += status.context_failure_reasons[i];
+  }
+  assert(status.candidate_rejected == candidate_failures);
+  assert(status.records_dropped == candidate_failures + context_failures);
+  assert(edr_local_evidence_cache_accounting_json(&status, health, 4u) == -1);
+  assert(edr_local_evidence_cache_accounting_json(&status, health, sizeof(health)) == 0);
+  root = cJSON_Parse(health);
+  assert(root != NULL);
+  failures = cJSON_GetObjectItemCaseSensitive(root, "candidate_failures");
+  assert(cJSON_GetObjectItemCaseSensitive(failures, "candidate_no_database")->valuedouble == 1.0);
+  cJSON_Delete(root);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = 1000000000ULL;
+  cleanup_test_sqlite_path(path);
 }
 
 /* Exercise the production drop counter and maintenance owner. A trigger makes
@@ -7274,6 +7395,7 @@ int main(int argc, char **argv) {
 #endif
   test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
+  test_metric_dispositions_and_resource_failures();
   test_metrics_commit_watermark_restart_and_failure();
   test_metrics_slot_reuse_and_failed_handoff();
   test_metrics_commit_failure_close_and_retention_boundary();

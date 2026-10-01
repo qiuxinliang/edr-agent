@@ -138,6 +138,24 @@ typedef struct {
   char candidate_id[160];
 } ContextWindowSlot;
 
+#define METRIC_ORDINARY_BASE 4u
+#define METRIC_CANDIDATE_BASE (METRIC_ORDINARY_BASE + EDR_EVIDENCE_ORDINARY_REASON_COUNT)
+#define METRIC_CONTEXT_BASE (METRIC_CANDIDATE_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
+#define METRIC_COUNT (METRIC_CONTEXT_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
+static const char *const metric_names[METRIC_COUNT] = {
+  "file_drops", "registry_drops", "network_drops", "other_drops",
+  "ordinary_policy_filtered", "ordinary_pressure_skipped", "ordinary_coalesced", "ordinary_hot_ring_only",
+  "candidate_no_database", "candidate_capacity_refused", "candidate_write_budget_refused",
+  "candidate_resource_failed", "candidate_invalid", "candidate_storage_failed", "candidate_unclassified_failure",
+  "context_no_database", "context_capacity_refused", "context_write_budget_refused",
+  "context_resource_failed", "context_invalid", "context_storage_failed", "context_unclassified_failure"
+};
+/* Protected by the cache owner mutex; reset for each persistence operation. */
+static EdrEvidenceFailureReason s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+static unsigned s_test_manifest_allocation_failures;
+#endif
+
 typedef struct {
   int64_t minute_unix;
   char endpoint_id[48];
@@ -145,7 +163,8 @@ typedef struct {
   uint64_t registry_drops;
   uint64_t network_drops;
   uint64_t other_drops;
-  uint64_t committed[4];
+  uint64_t reasons[METRIC_COUNT - METRIC_ORDINARY_BASE];
+  uint64_t committed[METRIC_COUNT];
 } MetricSlot;
 
 typedef struct {
@@ -456,6 +475,10 @@ static int context_ref_write_sources_json_from_status(
 }
 
 static void set_error(const char *msg) {
+#if defined(EDR_HAVE_SQLITE)
+  if (s_db && sqlite3_errcode(s_db) == SQLITE_NOMEM)
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+#endif
   snprintf(s_status.last_error, sizeof(s_status.last_error), "%s", msg ? msg : "");
 }
 
@@ -1454,10 +1477,21 @@ static int is_network_event_type(uint32_t type) {
          type == (uint32_t)EDR_EVENT_NET_TLS_HANDSHAKE;
 }
 
+static uint64_t metric_slot_value(const MetricSlot *m, size_t index) {
+  switch (index) {
+  case 0: return m->file_drops;
+  case 1: return m->registry_drops;
+  case 2: return m->network_drops;
+  case 3: return m->other_drops;
+  default: return m->reasons[index - METRIC_ORDINARY_BASE];
+  }
+}
+
 static int metric_slot_pending(const MetricSlot *m) {
-  return m->minute_unix != 0 &&
-         (m->file_drops != m->committed[0] || m->registry_drops != m->committed[1] ||
-          m->network_drops != m->committed[2] || m->other_drops != m->committed[3]);
+  if (m->minute_unix == 0) return 0;
+  for (size_t i = 0; i < METRIC_COUNT; ++i)
+    if (metric_slot_value(m, i) != m->committed[i]) return 1;
+  return 0;
 }
 
 #if defined(EDR_HAVE_SQLITE)
@@ -1512,8 +1546,11 @@ static MetricSlot *metric_slot_for(const EdrBehaviorRecord *r, int64_t event_tim
   return m;
 }
 
-static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns) {
+static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns,
+                               EdrEvidenceOrdinaryReason reason) {
   MetricSlot *m = metric_slot_for(r, event_time_ns);
+  if (m) m->reasons[reason]++;
+  s_status.ordinary_reasons[reason]++;
   uint32_t type = r ? (uint32_t)r->type : 0u;
   if (is_file_event_type(type)) {
     if (m) m->file_drops++;
@@ -1528,6 +1565,15 @@ static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns
     if (m) m->other_drops++;
     s_status.metric_other_drops++;
   }
+}
+
+static void record_persistence_failure(const EdrBehaviorRecord *r, int64_t ts,
+                                        int candidate, EdrEvidenceFailureReason reason) {
+  MetricSlot *m = metric_slot_for(r, ts);
+  size_t index = (candidate ? METRIC_CANDIDATE_BASE : METRIC_CONTEXT_BASE) + (size_t)reason;
+  if (m) m->reasons[index - METRIC_ORDINARY_BASE]++;
+  if (candidate) s_status.candidate_failure_reasons[reason]++;
+  else s_status.context_failure_reasons[reason]++;
 }
 
 static uint32_t metric_slots_used(void) {
@@ -3191,14 +3237,31 @@ static int manifest_utf8_valid(const char *text) {
   return manifest_utf8_bytes_valid(value, strlen(value));
 }
 
+static cJSON *manifest_create_object(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_manifest_allocation_failures) {
+    s_test_manifest_allocation_failures--;
+    return NULL;
+  }
+#endif
+  return cJSON_CreateObject();
+}
+
 static void manifest_rejected(const char *reason) {
   s_status.manifest_rejections++;
   set_error(reason ? reason : "context manifest rejected");
 }
 
 static int manifest_add_text(cJSON *object, const char *name, const char *value) {
-  return object && name && manifest_utf8_valid(value) &&
-         cJSON_AddStringToObject(object, name, value ? value : "") != NULL;
+  if (!object || !name || !manifest_utf8_valid(value)) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+    return 0;
+  }
+  if (!cJSON_AddStringToObject(object, name, value ? value : "")) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    return 0;
+  }
+  return 1;
 }
 
 /* cJSON's number representation is a double.  Preserve source event times
@@ -3212,7 +3275,12 @@ static int manifest_add_i64(cJSON *object, const char *name, int64_t value) {
   written = snprintf(decimal, sizeof(decimal), "%lld", (long long)value);
   if (written < 0 || (size_t)written >= sizeof(decimal)) return 0;
   number = cJSON_CreateRaw(decimal);
-  return number && cJSON_AddItemToObject(object, name, number);
+  if (!number || !cJSON_AddItemToObject(object, name, number)) {
+    cJSON_Delete(number);
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    return 0;
+  }
+  return 1;
 }
 
 static int manifest_add_u64(cJSON *object, const char *name, uint64_t value) {
@@ -3223,7 +3291,12 @@ static int manifest_add_u64(cJSON *object, const char *name, uint64_t value) {
   written = snprintf(decimal, sizeof(decimal), "%llu", (unsigned long long)value);
   if (written < 0 || (size_t)written >= sizeof(decimal)) return 0;
   number = cJSON_CreateRaw(decimal);
-  return number && cJSON_AddItemToObject(object, name, number);
+  if (!number || !cJSON_AddItemToObject(object, name, number)) {
+    cJSON_Delete(number);
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    return 0;
+  }
+  return 1;
 }
 
 /* Process generation is an exact identifier, not a JavaScript number.  Emit
@@ -3244,6 +3317,7 @@ static int manifest_finish(cJSON *root, char **out) {
   *out = NULL;
   printed = cJSON_PrintUnformatted(root);
   if (!printed || strlen(printed) > EDR_EVIDENCE_MANIFEST_MAX_BYTES) {
+    s_persistence_failure = printed ? EDR_EVIDENCE_FAILURE_INVALID : EDR_EVIDENCE_FAILURE_RESOURCE;
     if (printed) cJSON_free(printed);
     manifest_rejected("context manifest allocation or bounded-size failure");
     return -1;
@@ -3274,7 +3348,10 @@ static int manifest_add_candidate_evidence(cJSON *root,
   command = cJSON_CreateObject();
   identity = cJSON_CreateObject();
   artifact = cJSON_CreateObject();
-  if (!command || !identity || !artifact) goto fail;
+  if (!command || !identity || !artifact) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    goto fail;
+  }
   ok = manifest_add_text(command, "raw", r->cmdline) &&
        manifest_add_text(command, "normalized", normalized) &&
        cJSON_AddBoolToObject(command, "normalized_truncated",
@@ -3343,16 +3420,19 @@ static int manifest_array_add_unique_source(cJSON *array, const char *value,
                                             uint32_t *count) {
   cJSON *item;
   if (!array || !count || !value || !value[0]) return 1;
-  if (!manifest_utf8_valid(value)) return 0;
+  if (!manifest_utf8_valid(value)) { s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID; return 0; }
   cJSON_ArrayForEach(item, array) {
     if (cJSON_IsString(item) && item->valuestring &&
         strcmp(item->valuestring, value) == 0) {
       return 1;
     }
   }
-  if (*count >= EDR_EVIDENCE_SOURCE_EVENT_ALIASES_MAX) return 0;
+  if (*count >= EDR_EVIDENCE_SOURCE_EVENT_ALIASES_MAX) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID; return 0;
+  }
   item = cJSON_CreateString(value);
   if (!item || !cJSON_AddItemToArray(array, item)) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
     cJSON_Delete(item);
     return 0;
   }
@@ -3372,6 +3452,7 @@ static int manifest_add_source_event_aliases(cJSON *root, const char *candidate_
   int ok = 1;
   aliases = cJSON_CreateArray();
   if (!root || !aliases || !candidate_id || !candidate_id[0]) {
+    if (!aliases) s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
     cJSON_Delete(aliases);
     return 0;
   }
@@ -3412,6 +3493,8 @@ static int manifest_add_source_event_aliases(cJSON *root, const char *candidate_
     }
     sqlite3_finalize(st);
   } else if (s_db) {
+    s_persistence_failure = sqlite3_errcode(s_db) == SQLITE_NOMEM ?
+        EDR_EVIDENCE_FAILURE_RESOURCE : EDR_EVIDENCE_FAILURE_STORAGE;
     cJSON_Delete(aliases);
     return 0;
   }
@@ -3442,7 +3525,13 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
-  root = cJSON_CreateObject();
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
+  root = manifest_create_object();
+  if (!root) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    manifest_rejected("context manifest allocation failed");
+    return -1;
+  }
   context = root ? cJSON_AddArrayToObject(root, "context") : NULL;
   ok = root && context &&
 #if defined(EDR_HAVE_SQLITE)
@@ -3542,7 +3631,13 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
-  root = cJSON_CreateObject();
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
+  root = manifest_create_object();
+  if (!root) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+    manifest_rejected("context manifest allocation failed");
+    return -1;
+  }
   ok = root &&
        manifest_add_text(root, "schema", "p0_post_context_event.v1") &&
        cJSON_AddNullToObject(root, "candidate_id") &&
@@ -3636,11 +3731,13 @@ static char *context_candidate_id_json(const char *candidate_id) {
   cJSON *value;
   char *json;
   if (!candidate_id || !candidate_id[0] || !manifest_utf8_valid(candidate_id)) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
     return NULL;
   }
   value = cJSON_CreateString(candidate_id);
-  if (!value) return NULL;
+  if (!value) { s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE; return NULL; }
   json = cJSON_PrintUnformatted(value);
+  if (!json) s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
   cJSON_Delete(value);
   return json;
 }
@@ -3676,6 +3773,7 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
   if (!s_db || !candidate_id || !candidate_id[0]) {
     return -1;
   }
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
   const char *sql =
       "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,"
       "sha256,manifest_json,created_ns,upload_status,minio_key) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -3748,6 +3846,7 @@ static int sqlite_prepare_context_fact(const EdrBehaviorRecord *r,
                           prepared->fact_id) != 0) {
     return -1;
   }
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare context fact replay lookup failed");
     return -1;
@@ -3757,6 +3856,7 @@ static int sqlite_prepare_context_fact(const EdrBehaviorRecord *r,
   if (step == SQLITE_ROW) {
     const char *existing = (const char *)sqlite3_column_text(st, 0);
     if (!existing || strcmp(existing, prepared->manifest_template) != 0) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
       set_error("context fact hash collision");
       sqlite3_finalize(st);
       return -1;
@@ -3785,6 +3885,7 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
   prepared->refs = (PreparedContextRef *)calloc(
       candidate_count, sizeof(PreparedContextRef));
   if (!prepared->refs) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
     set_error("allocate post-context replay plan failed");
     goto fail;
   }
@@ -3816,6 +3917,7 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
       (void)sqlite3_clear_bindings(st);
       if (exact) continue;
       if (!candidate_matches) {
+        s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
         set_error("context reference candidate conflict");
         goto fail;
       }
@@ -3913,6 +4015,7 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
                                                     int64_t ts,
                                                     EvidenceWriteClass write_class,
                                                     uint32_t *written) {
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
   PreparedContextArtifacts prepared;
   uint32_t budget_units;
   uint32_t materialized_changes;
@@ -3930,6 +4033,7 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
   }
   maintenance_runs = s_status.maintenance_runs;
   if (!sqlite_size_budget_allow()) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_CAPACITY;
     sqlite_free_prepared_context_artifacts(&prepared);
     return -1;
   }
@@ -3947,9 +4051,11 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
     }
   }
   if (!sqlite_write_budget_allow(budget_units, ts, write_class)) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_WRITE_BUDGET;
     sqlite_free_prepared_context_artifacts(&prepared);
     return -1;
   }
+  s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
   if (sqlite_record_context_artifacts(r, candidate_ids, &prepared) != 0) {
     sqlite_write_budget_release(budget_units, ts, write_class);
     sqlite_free_prepared_context_artifacts(&prepared);
@@ -4392,17 +4498,15 @@ static int sqlite_flush_metrics(int final_attempt) {
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("metrics statement prepare failed"); goto failed;
   }
-  static const char *names[] = {"file_drops", "registry_drops", "network_drops", "other_drops"};
   for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
     MetricSlot *m = &s_metrics[i];
-    uint64_t values[] = {m->file_drops, m->registry_drops, m->network_drops, m->other_drops};
-    for (size_t j = 0; m->minute_unix != 0 && j < 4u; ++j) {
-      uint64_t delta = values[j] - m->committed[j];
+    for (size_t j = 0; m->minute_unix != 0 && j < METRIC_COUNT; ++j) {
+      uint64_t delta = metric_slot_value(m, j) - m->committed[j];
       if (!delta) continue;
       if (delta > (uint64_t)INT64_MAX ||
           sqlite3_bind_int64(st, 1, m->minute_unix) != SQLITE_OK ||
           sqlite3_bind_text(st, 2, m->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
-          sqlite3_bind_text(st, 3, names[j], -1, SQLITE_STATIC) != SQLITE_OK ||
+          sqlite3_bind_text(st, 3, metric_names[j], -1, SQLITE_STATIC) != SQLITE_OK ||
           sqlite3_bind_int64(st, 4, (sqlite3_int64)delta) != SQLITE_OK) {
         set_error("metrics delta overflow or bind failed"); goto failed;
       }
@@ -4428,10 +4532,7 @@ static int sqlite_flush_metrics(int final_attempt) {
   }
   for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
     MetricSlot *m = &s_metrics[i];
-    m->committed[0] = m->file_drops;
-    m->committed[1] = m->registry_drops;
-    m->committed[2] = m->network_drops;
-    m->committed[3] = m->other_drops;
+    for (size_t j = 0; j < METRIC_COUNT; ++j) m->committed[j] = metric_slot_value(m, j);
   }
   s_metric_retry_after_ns = 0u;
   return 0;
@@ -4888,9 +4989,11 @@ static void evidence_cache_close_locked(void) {
       uint64_t lost = 0u;
       for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
         MetricSlot *m = &s_metrics[i];
-        uint64_t values[] = {m->file_drops, m->registry_drops, m->network_drops, m->other_drops};
-        for (size_t j = 0; j < 4u; ++j)
-          evidence_cache_add_saturating(&lost, values[j] - m->committed[j]);
+        for (size_t j = 0; j < METRIC_COUNT; ++j) {
+          /* Ordinary type and reason label the same observation. Count once. */
+          if (j >= METRIC_ORDINARY_BASE && j < METRIC_CANDIDATE_BASE) continue;
+          evidence_cache_add_saturating(&lost, metric_slot_value(m, j) - m->committed[j]);
+        }
       }
       evidence_cache_add_saturating(&s_status.metric_unrecorded, lost);
       /* A closed volatile metrics ring cannot retry after reopen. Keep this
@@ -4991,6 +5094,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_status.storage_format = (uint32_t)s_context_store.format;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   s_test_commit_failures = 0u;
+  s_test_manifest_allocation_failures = 0u;
   s_test_commit_active = 0;
   (void)sqlite3_commit_hook(s_db, evidence_cache_test_commit_hook, NULL);
 #endif
@@ -5096,6 +5200,12 @@ void edr_local_evidence_cache_close(void) {
 }
 
 #if defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count) {
+  evidence_cache_lock();
+  s_test_manifest_allocation_failures = count;
+  evidence_cache_unlock();
+}
+
 void edr_local_evidence_cache_test_fail_next_commits(unsigned count) {
   evidence_cache_lock();
   s_test_commit_failures = count;
@@ -5760,25 +5870,25 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     post_until_ns = context_window_until(ts);
   }
   if (!store_candidate && !store_context && low_value_file_noise) {
-    record_metric_drop(r, ts);
+    record_metric_drop(r, ts, EDR_EVIDENCE_POLICY_FILTERED);
     s_status.records_skipped++;
     goto done;
   }
   if (!store_candidate && !store_context && evidence_cache_pressure_active()) {
-    record_metric_drop(r, ts);
+    record_metric_drop(r, ts, EDR_EVIDENCE_PRESSURE_SKIPPED);
     s_status.pressure_dropped++;
     s_status.records_skipped++;
     goto done;
   }
   if (!store_candidate && !store_context && ordinary_aggregate_should_coalesce(r, ts)) {
-    record_metric_drop(r, ts);
+    record_metric_drop(r, ts, EDR_EVIDENCE_COALESCED);
     s_status.records_skipped++;
     goto done;
   }
   if (!store_candidate && !store_context) {
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
-    record_metric_drop(r, ts);
+    record_metric_drop(r, ts, EDR_EVIDENCE_HOT_RING_ONLY);
     s_status.records_skipped++;
     goto done;
   }
@@ -5791,6 +5901,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (store_candidate) {
     int candidate_existing = candidate_reused;
     if (!s_db) {
+      record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_NO_DATABASE);
       s_status.candidate_rejected++;
       s_status.records_dropped++;
       context_ring_capture(r);
@@ -5798,8 +5909,10 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       goto done;
     }
     if (!candidate_existing && r->event_id[0]) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
       int exists = sqlite_candidate_exists(candidate_id);
       if (exists < 0) {
+        record_persistence_failure(r, ts, 1, s_persistence_failure);
         s_status.candidate_rejected++;
         s_status.candidate_transaction_failures++;
         s_status.records_dropped++;
@@ -5815,6 +5928,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
        * Durable size/retention and transaction outcomes remain authoritative
        * resource and failure bounds. */
       if (!sqlite_size_budget_allow()) {
+        record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_CAPACITY);
         s_status.candidate_rejected++;
         s_status.records_dropped++;
         context_ring_capture(r);
@@ -5822,7 +5936,9 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
         goto done;
       }
     }
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
     if (sqlite_record_candidate(r, candidate_id, pre_count, post_until_ns) != 0) {
+      record_persistence_failure(r, ts, 1, s_persistence_failure);
       s_status.candidate_rejected++;
       s_status.candidate_transaction_failures++;
       s_status.records_dropped++;
@@ -5849,6 +5965,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       if (sqlite_record_budgeted_context_artifacts(
               r, context_candidate_ids, context_candidate_count, ts,
               context_write_class, &context_artifacts_written) != 0) {
+        record_persistence_failure(r, ts, 0, s_persistence_failure);
         s_status.records_dropped++;
       } else {
         s_status.artifacts_written += context_artifacts_written;
@@ -5862,11 +5979,14 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     if (sqlite_record_budgeted_context_artifacts(
             r, context_candidate_ids, context_candidate_count, ts,
             context_write_class, &context_artifacts_written) != 0) {
+      record_persistence_failure(r, ts, 0, s_persistence_failure);
       s_status.records_dropped++;
       goto done;
     }
     s_status.artifacts_written += context_artifacts_written;
   } else if (store_context) {
+    record_persistence_failure(r, ts, 0, EDR_EVIDENCE_FAILURE_NO_DATABASE);
+    s_status.records_dropped++;
     /* SQLite being unavailable never pretends that a context artifact was
      * admitted; retain only the bounded in-memory view. */
     context_ring_capture(r);
@@ -5882,11 +6002,14 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   (void)post_until_ns;
   if (store_candidate) {
     s_status.candidate_admission_attempts++;
+    record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_NO_DATABASE);
     s_status.candidate_rejected++;
     s_status.records_dropped++;
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
   } else if (store_context) {
+    record_persistence_failure(r, ts, 0, EDR_EVIDENCE_FAILURE_NO_DATABASE);
+    s_status.records_dropped++;
     context_ring_capture(r);
     s_status.hot_ring_ingested++;
     ring_record(r);
@@ -6974,6 +7097,33 @@ int edr_local_evidence_cache_process_tree_json(uint32_t pid, const char *endpoin
       pid, endpoint_id, 0u, 0u, out, cap);
 }
 
+static void metric_reason_json(char *out, size_t cap, const char *const *names,
+                                const uint64_t *counts, size_t count) {
+  size_t off = 0u;
+  appendf(out, cap, &off, "{");
+  for (size_t i = 0u; i < count; ++i)
+    appendf(out, cap, &off, "%s\"%s\":%llu", i ? "," : "", names[i],
+            (unsigned long long)counts[i]);
+  appendf(out, cap, &off, "}");
+}
+
+int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, char *out, size_t cap) {
+  if (!st || !out || !cap) return -1;
+  char ordinary_reasons[512], candidate_failures[1024], context_failures[1024];
+  metric_reason_json(ordinary_reasons, sizeof(ordinary_reasons), metric_names + METRIC_ORDINARY_BASE,
+                    st->ordinary_reasons, EDR_EVIDENCE_ORDINARY_REASON_COUNT);
+  metric_reason_json(candidate_failures, sizeof(candidate_failures), metric_names + METRIC_CANDIDATE_BASE,
+                    st->candidate_failure_reasons, EDR_EVIDENCE_FAILURE_REASON_COUNT);
+  metric_reason_json(context_failures, sizeof(context_failures), metric_names + METRIC_CONTEXT_BASE,
+                    st->context_failure_reasons, EDR_EVIDENCE_FAILURE_REASON_COUNT);
+  int written = snprintf(out, cap,
+      "{\"scope\":\"current_process\",\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
+      "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s}",
+      ordinary_reasons, candidate_failures, context_failures);
+  if (written < 0 || (size_t)written >= cap) { out[0] = '\0'; return -1; }
+  return 0;
+}
+
 void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   if (!out || cap == 0u) {
     return;
@@ -6984,6 +7134,9 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   char err[220];
   char eng[80];
   char context_ref_sources[8192];
+  char accounting[2048];
+  if (edr_local_evidence_cache_accounting_json(&st, accounting, sizeof(accounting)) != 0)
+    snprintf(accounting, sizeof(accounting), "{\"status\":\"unavailable\"}");
   json_escape(path, sizeof(path), st.path);
   json_escape(err, sizeof(err), st.last_error);
   json_escape(eng, sizeof(eng), st.last_engine);
@@ -7016,7 +7169,9 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"context_refs_written\":%llu,\"context_ref_write_sources\":%s},"
            "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
-           "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu}}",
+           "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu},"
+           "\"accounting\":%s,"
+           "\"shm_bytes\":%llu,\"physical_bytes\":%llu}",
            st.db_open ? "true" : "false", st.storage_format, path, st.max_db_mb, st.retention_hours,
            (unsigned long long)st.db_bytes, (unsigned long long)st.wal_bytes,
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
@@ -7107,7 +7262,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.metric_file_drops,
            (unsigned long long)st.metric_registry_drops,
            (unsigned long long)st.metric_network_drops,
-           (unsigned long long)st.metric_other_drops);
+           (unsigned long long)st.metric_other_drops, accounting,
+           (unsigned long long)st.shm_bytes, (unsigned long long)st.physical_bytes);
   if (written < 0 || (size_t)written >= cap) {
     /* This function supplies a JSON member, not a complete document.  Keep
      * that member syntactically valid for older callers with a small buffer
