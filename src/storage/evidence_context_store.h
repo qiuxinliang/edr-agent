@@ -40,7 +40,9 @@ void edr_context_writer_close(EdrContextWriter *writer);
 int edr_context_store_collect_facts(EdrContextStore *store, unsigned *removed);
 int edr_context_store_expire(EdrContextStore *store, sqlite3_int64 cutoff,
                              unsigned *removed);
+/* Atomically remove a bounded reference batch and only its now-unreferenced
+ * facts/dictionary entries. Counts describe committed rows, excluding keys. */
 int edr_context_store_evict(EdrContextStore *store, int orphans_only,
-                            unsigned limit, unsigned *removed);
+                            unsigned limit, unsigned *removed, unsigned *facts_removed);
 
 #endif

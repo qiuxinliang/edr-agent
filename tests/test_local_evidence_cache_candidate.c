@@ -6091,12 +6091,12 @@ static void migration_crash_child(const char *path, int phase) {
   migration_crash_commit(NULL); /* phase 2: committed WAL, no checkpoint/close */
 }
 
-static void run_migration_crash_child(const char *path, int phase) {
+static void run_cache_crash_child(const char *path, const char *mode, int phase) {
 #if defined(_WIN32)
   char executable[MAX_PATH], command[2048];
   DWORD n = GetModuleFileNameA(NULL, executable, sizeof(executable));
   assert(n && n < sizeof(executable));
-  assert(snprintf(command, sizeof(command), "\"%s\" --crash-cache-migration \"%s\" %d", executable, path, phase) < (int)sizeof(command));
+  assert(snprintf(command, sizeof(command), "\"%s\" %s \"%s\" %d", executable, mode, path, phase) < (int)sizeof(command));
   STARTUPINFOA si; PROCESS_INFORMATION pi;
   memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi)); si.cb = sizeof(si);
   assert(CreateProcessA(executable, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi));
@@ -6109,7 +6109,7 @@ static void run_migration_crash_child(const char *path, int phase) {
    * after fork inherits system-library state from all preceding test cases. */
   char phase_arg[16];
   snprintf(phase_arg, sizeof(phase_arg), "%d", phase);
-  char *child_args[] = {(char *)s_test_executable, "--crash-cache-migration",
+  char *child_args[] = {(char *)s_test_executable, (char *)mode,
                         (char *)path, phase_arg, NULL};
   pid_t child = 0;
   assert(posix_spawnp(&child, s_test_executable, NULL, NULL, child_args, environ) == 0);
@@ -6130,7 +6130,7 @@ static void test_compact_process_crash_recovery(void) {
   for (int phase = 0; phase < 4; ++phase) {
     char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
     migration_fixture(path);
-    run_migration_crash_child(path, phase);
+    run_cache_crash_child(path, "--crash-cache-migration", phase);
     sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
     compact_assert_projection(db);
     assert(compact_scalar(db, "PRAGMA user_version") == (phase == 0 ? 0 : 1));
@@ -6360,10 +6360,241 @@ static void test_compact_format_resume_and_projection(void) {
   unsigned removed = 0;
   assert(edr_context_store_collect_facts(&store, &removed) == 0 && removed == 0);
   compact_assert_projection(db);
-  assert(edr_context_store_evict(&store, 1, 2, &removed) == 0 && removed == 2);
+  unsigned facts_removed = 0;
+  assert(edr_context_store_evict(&store, 1, 2, &removed, &facts_removed) == 0 && removed == 2);
   assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts WHERE artifact_type='post_context'") >= 2);
   assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
   assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+}
+
+static void reclaim_fixture(const char *path, int format) {
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL; EdrContextStore store;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(edr_context_store_open(&store, db) == 0);
+  compact_exec(db,
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns) VALUES('live',9000000000000000000);"
+      "INSERT INTO context_facts(fact_id,manifest_template_json,updated_ns) VALUES"
+      "('shared','{\"candidate_id\":null,\"fact\":\"shared\"}',9000000000000000000),"
+      "('last','{\"candidate_id\":null,\"fact\":\"last\"}',9000000000000000000),"
+      "('keep','{\"candidate_id\":null,\"fact\":\"keep\"}',9000000000000000000);"
+      "INSERT INTO candidate_context_refs VALUES"
+      "('a','gone-a','shared','\"gone-a\"',NULL,NULL,NULL),"
+      "('b','gone-b','shared','\"gone-b\"',9000000000000000001,'uploaded','object-b'),"
+      "('c','gone-c','last','\"gone-c\"',9000000000000000002,'pending',NULL),"
+      "('d','live','keep','\"live\"',9000000000000000003,NULL,NULL);");
+  if (format) {
+    unsigned moved; int complete;
+    assert(edr_context_store_begin_upgrade(&store) == 0);
+    do {
+      assert(edr_context_store_migrate_batch(&store, format == 1 ? 1 : 64, &moved, &complete) == 0);
+    } while (format == 2 && !complete);
+    assert(store.format == format);
+  }
+  /* Unrelated old garbage remains the full collector's responsibility. */
+  compact_exec(db,
+      "INSERT INTO context_facts(fact_id,manifest_template_json) VALUES('unrelated','{}');"
+      "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+  assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static int reclaim_abort_commit(void *unused) { (void)unused; return 1; }
+
+static void reclaim_crash_child(const char *path, int phase) {
+  sqlite3 *db = NULL; EdrContextStore store; unsigned refs, facts;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA cache_size=1;");
+  assert(edr_context_store_open(&store, db) == 0);
+  if (!phase) sqlite3_commit_hook(db, migration_crash_commit, NULL);
+  assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == 0);
+  assert(refs == 3 && facts == 2);
+  migration_crash_commit(NULL);
+}
+
+static void test_context_batch_reclaim_recovery_and_scope(void) {
+  for (int format = 0; format <= 2; ++format) {
+    char path[512]; sqlite3 *db = NULL; EdrContextStore store;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    reclaim_fixture(path, format);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(&store, db) == 0);
+    unsigned refs = 99, facts = 99;
+    /* Fail after unlinking and at COMMIT: all references and facts survive. */
+    const char *targets[] = {"candidate_context_refs", "context_facts",
+                            "compact_context_refs", "context_fact_keys", "context_candidates"};
+    for (unsigned i = 0; i < (format ? 5u : 2u); ++i) {
+      if (format == 2 && i == 0) continue; /* no legacy rows in this fixture */
+      char sql[384];
+      snprintf(sql, sizeof(sql), "CREATE TRIGGER reclaim_deny BEFORE DELETE ON %s "
+          "BEGIN SELECT RAISE(ABORT,'injected reclaim failure'); END;", targets[i]);
+      compact_exec(db, sql);
+      assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == -1);
+      assert(refs == 0 && facts == 0 && sqlite3_get_autocommit(db));
+      compact_assert_projection(db);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 4);
+      compact_exec(db, "DROP TRIGGER reclaim_deny;");
+    }
+    sqlite3_commit_hook(db, reclaim_abort_commit, NULL);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == -1);
+    assert(refs == 0 && facts == 0 && sqlite3_get_autocommit(db));
+    sqlite3_commit_hook(db, NULL, NULL);
+    compact_assert_projection(db);
+    /* SQLite FULL during GC must roll back the earlier reference DELETEs. */
+    compact_exec(db,
+        "CREATE TABLE reclaim_growth(payload BLOB);"
+        "CREATE TRIGGER reclaim_full BEFORE DELETE ON context_facts BEGIN "
+        "INSERT INTO reclaim_growth VALUES(zeroblob(1048576)); END;");
+    char page_limit[96];
+    snprintf(page_limit, sizeof(page_limit), "PRAGMA max_page_count=%lld;",
+             (long long)compact_scalar(db, "PRAGMA page_count"));
+    compact_exec(db, page_limit);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == -1);
+    assert(refs == 0 && facts == 0 && sqlite3_get_autocommit(db));
+    assert(strstr(store.error, "sqlite=13"));
+    compact_assert_projection(db);
+    compact_exec(db, "DROP TRIGGER reclaim_full;DROP TABLE reclaim_growth;PRAGMA max_page_count=1073741823;");
+    sqlite3 *busy = NULL;
+    assert(sqlite3_open(path, &busy) == SQLITE_OK);
+    compact_exec(busy, "BEGIN IMMEDIATE;");
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == -1);
+    assert(refs == 0 && facts == 0 && strstr(store.error, "sqlite=5"));
+    compact_exec(busy, "ROLLBACK;");
+    assert(sqlite3_close(busy) == SQLITE_OK);
+    compact_assert_projection(db);
+    if (format) {
+      compact_exec(db, "PRAGMA foreign_keys=OFF;DELETE FROM context_fact_keys WHERE id=1;PRAGMA foreign_keys=ON;");
+      assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == -1);
+      assert(refs == 0 && facts == 0 && strstr(store.error, "identity unavailable"));
+      compact_exec(db, "INSERT INTO context_fact_keys(id,fact_id) VALUES(1,'shared');");
+      compact_assert_projection(db);
+    }
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(&store, db) == 0);
+    assert(edr_context_store_evict(&store, 1, 1, &refs, &facts) == 0 && refs == 1 && facts == 0);
+    compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id='a';");
+    compact_assert_projection(db); /* format 1: legacy ref protects a compact fact */
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 4);
+    assert(edr_context_store_evict(&store, 1, 1, &refs, &facts) == 0 && refs == 1 && facts == 1);
+    compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id='b';");
+    compact_assert_projection(db);
+    if (format) {
+      /* Reuse the freed integer identities for different facts/candidates.
+       * A prior batch must never retain or later consume those identities. */
+      compact_exec(db,
+          "INSERT INTO context_facts(fact_id,manifest_template_json) VALUES('new-generation','{\"candidate_id\":null}');"
+          "INSERT INTO context_fact_keys(id,fact_id) VALUES(1,'new-generation');"
+          "INSERT INTO context_candidates(id,candidate_id,candidate_id_json) VALUES(1,'new-live','\"new-live\"');"
+          "INSERT INTO p0_candidates(candidate_id,event_time_ns) VALUES('new-live',9000000000000000000);"
+          "INSERT INTO compact_context_refs(candidate_key,fact_key,artifact_override,created_ns) VALUES(1,1,'new-ref',9000000000000000004);"
+          "INSERT INTO migration_expected SELECT * FROM materialized_artifacts WHERE artifact_id='new-ref';");
+    }
+    assert(edr_context_store_evict(&store, 1, 1, &refs, &facts) == 0 && refs == 1 && facts == 1);
+    compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id='c';");
+    compact_assert_projection(db);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == 0 && refs == 0 && facts == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts WHERE fact_id='unrelated'") == 1);
+    assert(edr_context_store_collect_facts(&store, &facts) == 0 && facts == 1);
+    assert(edr_context_store_evict(&store, 0, 1, &refs, &facts) == 0 && refs == 1 && facts == 1);
+    compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id='d';");
+    compact_assert_projection(db);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
+    assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+
+    for (int phase = 0; phase < 2; ++phase) {
+      assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+      reclaim_fixture(path, format);
+      run_cache_crash_child(path, "--crash-cache-reclaim", phase);
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      if (phase) compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id IN ('a','b','c');");
+      compact_assert_projection(db);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == (phase ? 2 : 4));
+      assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+    }
+  }
+}
+
+static void test_context_batch_reclaim_limit(void) {
+  for (int format = 0; format <= 2; ++format) {
+    char path[512]; sqlite3 *db = NULL; EdrContextStore store;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    reclaim_fixture(path, format);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(&store, db) == 0);
+    /* One shared fact spans more than two complete batches, including legacy
+     * references on a versioned database. It must survive until the last ref. */
+    compact_exec(db,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<8193) "
+        "INSERT INTO candidate_context_refs SELECT 'bulk-'||x,'bulk-'||x,'shared','\"bulk-'||x||'\"',"
+        "9000000000000000005,NULL,NULL FROM n;");
+    unsigned refs, facts;
+    assert(edr_context_store_evict(&store, 1, 4097, &refs, &facts) == -1 && refs == 0 && facts == 0);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == 0 && refs == 4096 && facts == 1);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == 0 && refs == 4096 && facts == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts WHERE fact_id='shared'") == 1);
+    assert(edr_context_store_evict(&store, 1, 4096, &refs, &facts) == 0 && refs == 4 && facts == 1);
+    compact_exec(db, "DELETE FROM migration_expected WHERE artifact_id IN ('a','b','c');");
+    compact_assert_projection(db);
+    assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  }
+}
+
+static void test_maintenance_failure_retains_cause_and_retry_interval(void) {
+  char path[512]; sqlite3 *db = NULL;
+  EdrEvidenceCacheStatus before, after;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db,
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns) VALUES('expired',1);"
+      "INSERT INTO artifacts(artifact_id,created_ns) VALUES('expired',1);"
+      "CREATE TRIGGER retention_deny BEFORE DELETE ON artifacts "
+      "BEGIN SELECT RAISE(ABORT,'injected retention failure'); END;");
+  edr_local_evidence_cache_get_status(&before);
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.maintenance_runs == before.maintenance_runs + 1);
+  assert(after.db_retention_evicted == before.db_retention_evicted + 1);
+  assert(strstr(after.last_error, "artifacts") && strstr(after.last_error, "sqlite=19/1811"));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired'") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_id='expired'") == 1);
+  before = after;
+  compact_exec(db, "DROP TRIGGER retention_deny;");
+  for (unsigned i = 0; i < 100; ++i) edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.maintenance_runs == before.maintenance_runs);
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.db_retention_evicted == before.db_retention_evicted + 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_id='expired'") == 0);
+  /* Prepare failures and BUSY are distinguishable from no expired rows. */
+  compact_exec(db, "ALTER TABLE registry_evidence RENAME TO blocked_registry_evidence;");
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(strstr(after.last_error, "registry_evidence") && strstr(after.last_error, "sqlite=1/1"));
+  compact_exec(db, "ALTER TABLE blocked_registry_evidence RENAME TO registry_evidence;BEGIN IMMEDIATE;");
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(strstr(after.last_error, "p0_candidates") && strstr(after.last_error, "sqlite=5/5"));
+  compact_exec(db, "ROLLBACK;");
+  before = after;
+  for (unsigned i = 0; i < 100; ++i) edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.maintenance_runs == before.maintenance_runs);
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  assert(sqlite3_close(db) == SQLITE_OK);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  s_test_monotonic_ns = UINT64_C(1000000000);
   cleanup_test_sqlite_path(path);
 }
 
@@ -6824,6 +7055,9 @@ int main(int argc, char **argv) {
   if (argc == 4 && strcmp(argv[1], "--crash-cache-migration") == 0) {
     migration_crash_child(argv[2], atoi(argv[3])); return 1;
   }
+  if (argc == 4 && strcmp(argv[1], "--crash-cache-reclaim") == 0) {
+    reclaim_crash_child(argv[2], atoi(argv[3])); return 1;
+  }
 #else
   (void)argc; (void)argv;
 #endif
@@ -6840,6 +7074,9 @@ int main(int argc, char **argv) {
   test_compact_near_full_existing_page_rewrites();
   test_compact_format_resume_and_projection();
   test_context_fact_collection_preserves_references();
+  test_context_batch_reclaim_recovery_and_scope();
+  test_context_batch_reclaim_limit();
+  test_maintenance_failure_retains_cause_and_retry_interval();
   test_payload_retention_boundaries_and_projection();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();

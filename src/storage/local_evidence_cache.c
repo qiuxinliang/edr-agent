@@ -2304,7 +2304,7 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
 }
 
 #if defined(EDR_HAVE_SQLITE)
-static void sqlite_maintenance(void);
+static int sqlite_maintenance(void);
 
 static int exec_sql(const char *sql) {
   char *err = NULL;
@@ -2613,12 +2613,18 @@ static int sqlite_size_budget_allow(void) {
   if (s_last_capacity_failure_ns == 0u ||
       now - s_last_capacity_failure_ns >= 10000000000ULL) {
     s_last_maintenance_ns = now;
-    sqlite_maintenance();
+    int maintenance_result = sqlite_maintenance();
     if (!db_size_over_limit()) {
       s_last_capacity_failure_ns = 0u;
       return 1;
     }
     s_last_capacity_failure_ns = edr_monotonic_ns();
+    if (maintenance_result != 0) {
+      /* Keep the actionable maintenance cause instead of replacing it with
+       * a generic full-cache message. Physical admission remains binding. */
+      s_status.db_budget_dropped++;
+      return 0;
+    }
   }
   s_status.db_budget_dropped++;
   set_error("evidence cache size budget exceeded");
@@ -4457,48 +4463,61 @@ static int sqlite_live_size_over_limit(uint64_t limit) {
 
 static int sqlite_collect_context_facts(void) {
   unsigned removed = 0;
-  if (edr_context_store_collect_facts(&s_context_store, &removed) != 0) {
+  int rc = edr_context_store_collect_facts(&s_context_store, &removed);
+  /* A later dictionary cleanup can fail after the fact DELETE committed. */
+  s_status.db_retention_evicted += removed;
+  if (rc != 0) {
+    set_error(s_context_store.error);
+    return -1;
+  }
+  return 0;
+}
+
+static int sqlite_evict_context_refs(int orphans, unsigned limit, unsigned *facts_removed) {
+  unsigned removed = 0;
+  if (edr_context_store_evict(&s_context_store, orphans, limit, &removed, facts_removed) != 0) {
     set_error(s_context_store.error);
     return -1;
   }
   return (int)removed;
 }
 
-static int sqlite_evict_context_refs(int orphans, unsigned limit) {
-  if (s_context_store.format) {
-    unsigned removed = 0;
-    if (edr_context_store_evict(&s_context_store, orphans, limit, &removed) != 0) {
-      set_error(s_context_store.error);
-      return -1;
-    }
-    return (int)removed;
-  }
-  const char *query = orphans
-      ? "DELETE FROM candidate_context_refs WHERE rowid IN (SELECT r.rowid FROM candidate_context_refs r "
-        "WHERE NOT EXISTS (SELECT 1 FROM p0_candidates c WHERE c.candidate_id=r.candidate_id) "
-        "ORDER BY r.created_ns,r.rowid LIMIT ?);"
-      : "DELETE FROM candidate_context_refs WHERE rowid IN (SELECT rowid FROM candidate_context_refs "
-        "ORDER BY created_ns LIMIT ?);";
-  sqlite3_stmt *st = NULL;
-  if (sqlite3_prepare_v2(s_db, query, -1, &st, NULL) != SQLITE_OK) {
-    set_error("prepare context reclaim failed"); return -1;
-  }
-  sqlite3_bind_int(st, 1, (int)limit);
-  int rc = sqlite3_step(st);
-  sqlite3_finalize(st);
-  if (rc != SQLITE_DONE) { set_error("context reclaim failed"); return -1; }
-  return sqlite3_changes(s_db);
+static int sqlite_maintenance_error(const char *stage, int rc) {
+  char error[sizeof(s_status.last_error)];
+  snprintf(error, sizeof(error), "maintenance %s: sqlite=%d/%d %s", stage,
+           rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
+  set_error(error);
+  return -1;
 }
 
-static void sqlite_maintenance(void) {
+static int sqlite_maintenance_delete(const char *query, const char *stage,
+                                    const sqlite3_int64 *cutoff, uint64_t *counter) {
+  sqlite3_stmt *st = NULL;
+  int rc = sqlite3_prepare_v2(s_db, query, -1, &st, NULL);
+  if (rc == SQLITE_OK && cutoff) rc = sqlite3_bind_int64(st, 1, *cutoff);
+  if (rc == SQLITE_OK) rc = sqlite3_step(st);
+  if (rc != SQLITE_DONE) sqlite_maintenance_error(stage, rc);
+  else *counter += (uint64_t)sqlite3_changes(s_db);
+  sqlite3_finalize(st);
+  return rc == SQLITE_DONE ? 0 : -1;
+}
+
+static int sqlite_maintenance_checkpoint(int mode) {
+  int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, mode, NULL, NULL);
+  return rc == SQLITE_OK ? 0 : sqlite_maintenance_error("checkpoint", rc);
+}
+
+static int sqlite_maintenance(void) {
   if (!s_db) {
-    return;
+    set_error("maintenance database unavailable");
+    return -1;
   }
   s_status.maintenance_runs++;
-  (void)sqlite_flush_metrics(0);
-  int64_t cutoff = now_unix_ns() - (int64_t)s_status.retention_hours * 3600LL * 1000000000LL;
-  int64_t cutoff_minute = (cutoff / 1000000000LL) / 60LL;
-  sqlite3_stmt *st = NULL;
+  /* Diagnostic flush failures do not prevent evidence reclamation. Preserve
+   * their failed result while letting a later storage error identify itself. */
+  int result = sqlite_flush_metrics(0);
+  sqlite3_int64 cutoff = now_unix_ns() - (int64_t)s_status.retention_hours * 3600LL * 1000000000LL;
+  sqlite3_int64 cutoff_minute = (cutoff / 1000000000LL) / 60LL;
   const char *tables[] = {"p0_candidates", "process_cache", "file_evidence", "network_ioc",
                           "registry_evidence", "artifacts", "candidate_context_refs",
                           "command_results"};
@@ -4514,33 +4533,17 @@ static void sqlite_maintenance(void) {
     } else {
       snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
     }
-    if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
-      sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
-      int rc = sqlite3_step(st);
-      int changes = rc == SQLITE_DONE ? sqlite3_changes(s_db) : 0;
-      sqlite3_finalize(st);
-      st = NULL;
-      if (changes > 0) {
-        s_status.db_retention_evicted += (uint64_t)changes;
-      }
-    }
+    if (sqlite_maintenance_delete(sql, tables[i], &cutoff, &s_status.db_retention_evicted) != 0) goto failed;
   }
-  if (sqlite3_prepare_v2(s_db, "DELETE FROM metrics WHERE minute_unix < ?;", -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff_minute);
-    int rc = sqlite3_step(st);
-    int changes = rc == SQLITE_DONE ? sqlite3_changes(s_db) : 0;
-    sqlite3_finalize(st);
-    st = NULL;
-    if (changes > 0) {
-      s_status.db_retention_evicted += (uint64_t)changes;
-    }
-  }
+  if (sqlite_maintenance_delete("DELETE FROM metrics WHERE minute_unix < ?;", "metrics",
+                               &cutoff_minute, &s_status.db_retention_evicted) != 0) goto failed;
   unsigned expired_compact = 0;
-  if (edr_context_store_expire(&s_context_store, cutoff, &expired_compact) != 0)
+  if (edr_context_store_expire(&s_context_store, cutoff, &expired_compact) != 0) {
     set_error(s_context_store.error);
-  else s_status.db_retention_evicted += expired_compact;
-  int collected_facts = sqlite_collect_context_facts();
-  if (collected_facts > 0) s_status.db_retention_evicted += (uint64_t)collected_facts;
+    goto failed;
+  }
+  s_status.db_retention_evicted += expired_compact;
+  if (sqlite_collect_context_facts() != 0) goto failed;
   if (db_size_over_limit()) {
     /* Physical pressure includes WAL pages. A live set just below the cap
      * otherwise survives every cleanup and rejects the next WAL transaction.
@@ -4549,51 +4552,61 @@ static void sqlite_maintenance(void) {
      * to 1/16 of a small cache. This is reclaimed only on pressure;
      * the configured physical admission cap and retention remain unchanged. */
     uint64_t target = sqlite_capacity_live_target();
-    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
-    for (int pass = 0; pass < 4 && sqlite_live_size_over_limit(target) > 0; pass++) {
+    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
+    for (int pass = 0; pass < 4; pass++) {
+      int over = sqlite_live_size_over_limit(target);
+      if (over < 0) goto failed;
+      if (!over) break;
       /* Reclaim bounded old refs with no surviving candidate first. Their
        * facts are shared, so remove only facts with no remaining refs.
        * Each orphan batch is bounded to 4096 refs so it can recover the WAL
        * reserve without repacking partially used pages. A productive orphan
        * batch must not evict live candidates or command artifacts in the same pass. */
-      int orphan_changes = sqlite_evict_context_refs(1, 4096u);
-      if (orphan_changes < 0) break;
+      unsigned fact_changes = 0;
+      int orphan_changes = sqlite_evict_context_refs(1, 4096u, &fact_changes);
+      if (orphan_changes < 0) goto failed;
       if (orphan_changes > 0) {
-        s_status.db_capacity_evicted += (uint64_t)orphan_changes;
-        int fact_changes = sqlite_collect_context_facts();
-        if (fact_changes < 0) break;
-        if (fact_changes > 0) s_status.db_capacity_evicted += (uint64_t)fact_changes;
+        s_status.db_capacity_evicted += (uint64_t)orphan_changes + fact_changes;
         continue;
       }
-      if (exec_sql("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);") == 0) {
-        int changes = sqlite3_changes(s_db);
-        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
-      }
-      if (exec_sql("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);") == 0) {
-        int changes = sqlite3_changes(s_db);
-        if (changes > 0) s_status.db_capacity_evicted += (uint64_t)changes;
-      }
-      int ref_changes = sqlite_evict_context_refs(0, 1000u);
-      if (ref_changes > 0) s_status.db_capacity_evicted += (uint64_t)ref_changes;
-      int fact_changes = sqlite_collect_context_facts();
-      if (fact_changes > 0) s_status.db_capacity_evicted += (uint64_t)fact_changes;
+      if (sqlite_maintenance_delete("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);",
+                                   "capacity p0_candidates", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
+      if (sqlite_maintenance_delete("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);",
+                                   "capacity artifacts", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
+      int ref_changes = sqlite_evict_context_refs(0, 1000u, &fact_changes);
+      if (ref_changes < 0) goto failed;
+      s_status.db_capacity_evicted += (uint64_t)ref_changes + fact_changes;
     }
-    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
     refresh_db_size_status();
     if (s_status.db_bytes + s_status.wal_bytes > target) {
       /* Reclaim at most 4096 free pages per maintenance call.
        * The database is migrated to incremental mode before collectors start;
        * runtime pressure must not rewrite the entire evidence database. */
-      (void)exec_sql("PRAGMA incremental_vacuum(4096);");
-      (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+      if (exec_sql("PRAGMA incremental_vacuum(4096);") != 0) {
+        sqlite_maintenance_error("incremental vacuum", sqlite3_errcode(s_db));
+        goto failed;
+      }
+      if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
     }
   } else {
-    (void)exec_sql("PRAGMA wal_checkpoint(PASSIVE);");
+    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_PASSIVE) != 0) goto failed;
   }
-  (void)exec_sql("PRAGMA shrink_memory;");
+  if (exec_sql("PRAGMA shrink_memory;") != 0) {
+    sqlite_maintenance_error("release pager memory", sqlite3_errcode(s_db));
+    goto failed;
+  }
+  goto finish;
+failed:
+  result = -1;
+finish:
+  /* Each completed statement/batch stays committed. Failed attempts retain
+   * the normal minute poll or existing capacity-failure backoff, never a
+   * per-event retry loop. Release pager memory on both outcomes. */
   (void)sqlite3_db_release_memory(s_db);
   (void)sqlite3_release_memory(0);
   refresh_db_size_status();
+  return result;
 }
 #endif
 

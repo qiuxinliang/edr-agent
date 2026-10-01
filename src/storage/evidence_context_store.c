@@ -6,7 +6,8 @@
 #include <string.h>
 
 static int fail(EdrContextStore *s, const char *operation) {
-  snprintf(s->error, sizeof(s->error), "%s: %s", operation, sqlite3_errmsg(s->db));
+  snprintf(s->error, sizeof(s->error), "%s: sqlite=%d %s", operation,
+           sqlite3_extended_errcode(s->db), sqlite3_errmsg(s->db));
   return -1;
 }
 
@@ -392,32 +393,71 @@ int edr_context_store_expire(EdrContextStore *s, sqlite3_int64 cutoff, unsigned 
   *removed = (unsigned)sqlite3_changes(s->db); return 0;
 }
 
-int edr_context_store_evict(EdrContextStore *s, int orphans, unsigned limit, unsigned *removed) {
-  *removed = 0;
-  if (!s->format || !limit || limit > 4096) return -1;
-  if (sql(s, "BEGIN IMMEDIATE;CREATE TEMP TABLE IF NOT EXISTS context_reclaim(kind INTEGER,id INTEGER);"
+int edr_context_store_evict(EdrContextStore *s, int orphans, unsigned limit,
+                            unsigned *removed, unsigned *facts_removed) {
+  *removed = 0; *facts_removed = 0;
+  if (!limit || limit > 4096) return -1;
+  if (sql(s, "BEGIN IMMEDIATE;CREATE TEMP TABLE IF NOT EXISTS context_reclaim("
+             "kind INTEGER,id INTEGER,fact_id TEXT,candidate_key INTEGER);"
              "DELETE FROM context_reclaim;") != 0) goto rollback;
   const char *orphan_query =
-    "INSERT INTO context_reclaim SELECT kind,id FROM ("
+    "INSERT INTO context_reclaim(kind,id) SELECT kind,id FROM ("
     "SELECT 0 kind,r.rowid id,r.created_ns stamp FROM candidate_context_refs r "
     "WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=r.candidate_id) UNION ALL "
     "SELECT 1,r.id,r.created_ns FROM compact_context_refs r WHERE candidate_key IN ("
     "SELECT c.id FROM context_candidates c WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=c.candidate_id))) "
     "ORDER BY stamp,kind,id LIMIT ?;";
   const char *oldest_query =
-    "INSERT INTO context_reclaim SELECT kind,id FROM ("
+    "INSERT INTO context_reclaim(kind,id) SELECT kind,id FROM ("
     "SELECT 0 kind,rowid id,created_ns stamp FROM candidate_context_refs UNION ALL "
     "SELECT 1,id,created_ns FROM compact_context_refs) ORDER BY stamp,kind,id LIMIT ?;";
   sqlite3_stmt *st = NULL;
-  if (prepare(s, &st, orphans ? orphan_query : oldest_query) != 0) goto rollback;
+  const char *query = orphans ? orphan_query : oldest_query;
+  if (!s->format) {
+    query = orphans
+        ? "INSERT INTO context_reclaim(kind,id) SELECT 0,r.rowid FROM candidate_context_refs r "
+          "WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=r.candidate_id) "
+          "ORDER BY r.created_ns,r.rowid LIMIT ?;"
+        : "INSERT INTO context_reclaim(kind,id) SELECT 0,rowid FROM candidate_context_refs "
+          "ORDER BY created_ns,rowid LIMIT ?;";
+  }
+  if (prepare(s, &st, query) != 0) goto rollback;
   sqlite3_bind_int(st, 1, (int)limit); int rc = sqlite3_step(st); sqlite3_finalize(st);
   if (rc != SQLITE_DONE) { fail(s, "select context reclaim failed"); goto rollback; }
+  /* Resolve identities only for the selected batch, before unlinking it.
+   * These identities never outlive this transaction or survive key reuse. */
+  if (sql(s, "UPDATE context_reclaim SET fact_id=(SELECT r.fact_id FROM candidate_context_refs r "
+             "WHERE r.rowid=context_reclaim.id) WHERE kind=0;") != 0) goto rollback;
+  if (s->format && sql(s,
+      "UPDATE context_reclaim SET (fact_id,candidate_key)=(SELECT f.fact_id,r.candidate_key "
+      "FROM compact_context_refs r JOIN context_fact_keys f ON f.id=r.fact_key "
+      "WHERE r.id=context_reclaim.id) WHERE kind=1;") != 0) goto rollback;
+  if (prepare(s, &st, "SELECT COUNT(*) FROM context_reclaim WHERE fact_id IS NULL;") != 0) goto rollback;
+  rc = sqlite3_step(st);
+  int missing_identity = rc != SQLITE_ROW || sqlite3_column_int(st, 0) != 0;
+  sqlite3_finalize(st);
+  if (missing_identity) { fail(s, "context reclaim identity unavailable"); goto rollback; }
   if (sql(s, "DELETE FROM candidate_context_refs WHERE rowid IN (SELECT id FROM context_reclaim WHERE kind=0)") != 0) goto rollback;
   unsigned count = (unsigned)sqlite3_changes(s->db);
-  if (sql(s, "DELETE FROM compact_context_refs WHERE id IN (SELECT id FROM context_reclaim WHERE kind=1)") != 0) goto rollback;
-  count += (unsigned)sqlite3_changes(s->db);
+  if (s->format) {
+    if (sql(s, "DELETE FROM compact_context_refs WHERE id IN (SELECT id FROM context_reclaim WHERE kind=1)") != 0) goto rollback;
+    count += (unsigned)sqlite3_changes(s->db);
+    if (sql(s, "DELETE FROM context_fact_keys WHERE fact_id IN (SELECT fact_id FROM context_reclaim) "
+               "AND NOT EXISTS(SELECT 1 FROM compact_context_refs r WHERE r.fact_key=context_fact_keys.id);") != 0) goto rollback;
+  }
+  query = s->format
+      ? "DELETE FROM context_facts WHERE fact_id IN (SELECT fact_id FROM context_reclaim) "
+        "AND NOT EXISTS(SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id) "
+        "AND NOT EXISTS(SELECT 1 FROM context_fact_keys k WHERE k.fact_id=context_facts.fact_id);"
+      : "DELETE FROM context_facts WHERE fact_id IN (SELECT fact_id FROM context_reclaim) "
+        "AND NOT EXISTS(SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id);";
+  if (sql(s, query) != 0) goto rollback;
+  unsigned fact_count = (unsigned)sqlite3_changes(s->db);
+  if (s->format && sql(s,
+      "DELETE FROM context_candidates WHERE id IN (SELECT candidate_key FROM context_reclaim) "
+      "AND NOT EXISTS(SELECT 1 FROM compact_context_refs r WHERE r.candidate_key=context_candidates.id);") != 0) goto rollback;
   if (sql(s, "DELETE FROM context_reclaim;COMMIT;") != 0) goto rollback;
-  *removed = count; return 0;
+  *removed = count; *facts_removed = fact_count; return 0;
 rollback:
   sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL); return -1;
 }
