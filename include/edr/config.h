@@ -474,6 +474,13 @@ typedef struct EdrConfig {
     char ports[256];                /* 逗号分隔扫描敏感端口;空=内置默认 */
   } net_fanout;
 
+  /** Durable identity of the verified remote policy materialized in this file. */
+  struct {
+    char version[128];
+    char hash[65];
+    uint64_t sequence;
+  } applied_remote_policy;
+
 } EdrConfig;
 
 /** 设计文档默认值（无文件或未指定键时使用） */
@@ -504,7 +511,16 @@ EdrError edr_config_load_preprocessing_rules(const char *path, EdrConfig *cfg);
 EdrError edr_config_reload_if_modified(const char *path, EdrConfig *cfg, time_t *mtime_cache,
                                      int *out_reloaded);
 
+/** Persist effective remote-owned fields, retaining every other parsed source
+ * value. source must be a valid primary or LKG. Atomic replacement, restrictive
+ * temporary file, checked writes and flush. Runtime secrets are never copied. */
+int edr_config_save_effective_policy(const char *source, const char *path, const EdrConfig *cfg);
+int edr_config_atomic_copy(const char *source, const char *path);
+
 /** 配置文件内容 FNV-1a 指纹（十六进制，至少 17 字节缓冲）；不可读时 out_hex[0]='\0' */
+/** Environment may require signing, but never disable a local signing requirement. */
+int edr_config_signature_required(const EdrConfig *cfg);
+
 void edr_config_fingerprint(const char *path, char *out_hex, size_t cap);
 
 #endif

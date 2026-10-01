@@ -312,6 +312,102 @@ static void test_remote_preprocessing_rules_replace_only_rule_section(void) {
   edr_config_free_heap(&cfg);
 }
 
+
+static void test_effective_policy_survives_restart_and_recovery(void) {
+  const char *primary = "edr_test_policy_primary.toml";
+  const char *lkg = "edr_test_policy_lkg.toml";
+  EdrConfig live = {0}, loaded = {0};
+  char before[80], after[80];
+  FILE *f = fopen(primary, "wb");
+  assert(f);
+  fputs("[server]\nclient_key_provider = 'cert_store'\nclient_cert_store = 'LocalMachine/My'\n"
+        "client_cert_thumbprint = 'test-thumbprint'\n"
+        "[config_signing]\nsignature_required = true\nsigning_key_id = 'test-key'\n"
+        "public_key_pem = 'test-public-key'\n"
+        "[platform]\nrest_bearer_token = 'on-disk-test-token'\n"
+        "[platform.request_signing]\nenabled = true\nkey_id = 'request-key'\nsecret = 'on-disk-test-secret'\n"
+        "[offline]\nretention_hours = 37\nevidence_cache_retention_hours = 19\n"
+        "[event_filter]\nenabled = true\nlow_value_file_process = false\n"
+        "[command.rtr_shell]\nallowlist = ['old-command']\nmax_timeout_sec = 40\n"
+        "[upload]\nbatch_max_events = 123\n"
+        "[future_extension]\nvalue = { items = [1, 2], child = { active = true } }\n"
+        "[[preprocessing.rules]]\nevent_type = 'PROCESS_CREATE'\naction = 'emit_always'\n", f);
+  assert(fclose(f) == 0);
+  assert(edr_config_load(primary, &live) == EDR_OK);
+  live.upload.batch_max_events = 456;
+  live.event_filter.low_value_file_process = true;
+  snprintf(live.command.rtr_shell_allowlist, sizeof(live.command.rtr_shell_allowlist), "new-command");
+  live.command.rtr_shell_max_timeout_sec = 55;
+  /* An in-memory/env credential must never be introduced into the snapshot. */
+  snprintf(live.platform.rest_bearer_token, sizeof(live.platform.rest_bearer_token), "runtime-only-token");
+  snprintf(live.platform.request_signing.secret, sizeof(live.platform.request_signing.secret), "runtime-only-secret");
+  snprintf(live.applied_remote_policy.version, sizeof(live.applied_remote_policy.version), "policy-42");
+  snprintf(live.applied_remote_policy.hash, sizeof(live.applied_remote_policy.hash), "test-hash");
+  live.applied_remote_policy.sequence = 42;
+  assert(edr_config_save_effective_policy(primary, primary, &live) == 0);
+  assert(edr_config_atomic_copy(primary, lkg) == 0);
+  assert(edr_config_load(primary, &loaded) == EDR_OK);
+  assert(loaded.upload.batch_max_events == 456);
+  assert(loaded.event_filter.low_value_file_process);
+  assert(loaded.offline.retention_hours == 37);
+  assert(loaded.offline.evidence_cache_retention_hours == 19);
+  assert(loaded.config_signing.signature_required);
+#ifdef _WIN32
+  _putenv_s("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED", "0");
+#else
+  setenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED", "0", 1);
+#endif
+  assert(edr_config_signature_required(&loaded));
+  loaded.config_signing.signature_required = false;
+#ifdef _WIN32
+  _putenv_s("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED", "1");
+#else
+  setenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED", "1", 1);
+#endif
+  assert(edr_config_signature_required(&loaded));
+  loaded.config_signing.signature_required = true;
+#ifdef _WIN32
+  _putenv_s("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED", "");
+#else
+  unsetenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED");
+#endif
+  assert(!strcmp(loaded.config_signing.public_key_pem, "test-public-key"));
+  assert(!strcmp(loaded.server.client_cert_store, "LocalMachine/My"));
+  assert(!strcmp(loaded.server.client_cert_thumbprint, "test-thumbprint"));
+  assert(loaded.platform.request_signing.enabled);
+  assert(!strcmp(loaded.platform.request_signing.secret, "on-disk-test-secret"));
+  assert(!strcmp(loaded.platform.rest_bearer_token, "on-disk-test-token"));
+  assert(!strcmp(loaded.command.rtr_shell_allowlist, "new-command"));
+  assert(loaded.command.rtr_shell_max_timeout_sec == 55);
+  assert(loaded.preprocessing.rules_count == live.preprocessing.rules_count);
+  assert(loaded.applied_remote_policy.sequence == 42);
+  assert(!strcmp(loaded.applied_remote_policy.version, "policy-42"));
+  /* Repeated saves and unknown nested values must remain parseable. */
+  assert(edr_config_save_effective_policy(primary, primary, &loaded) == 0);
+  edr_config_fingerprint(primary, before, sizeof(before));
+  assert(edr_config_save_effective_policy("missing-policy-source", primary, &loaded) != 0);
+  edr_config_fingerprint(primary, after, sizeof(after));
+  assert(!strcmp(before, after));
+  f = fopen(primary, "wb"); assert(f); fputs("[broken", f); fclose(f);
+  assert(edr_config_load(primary, &loaded) != EDR_OK);
+  assert(edr_config_load(lkg, &loaded) == EDR_OK);
+  assert(loaded.upload.batch_max_events == 456);
+  assert(loaded.config_signing.signature_required);
+  assert(loaded.platform.request_signing.enabled);
+  assert(loaded.offline.retention_hours == 37);
+  assert(loaded.applied_remote_policy.sequence == 42);
+  /* Long, escaped strings must not be truncated by the old 2048-byte buffer. */
+  memset(loaded.command.signing_public_key_pem, 'a', sizeof(loaded.command.signing_public_key_pem) - 1);
+  loaded.command.signing_public_key_pem[3] = '\n';
+  loaded.command.signing_public_key_pem[4] = '"';
+  assert(edr_config_save_effective_policy(lkg, primary, &loaded) == 0);
+  assert(edr_config_load(primary, &live) == EDR_OK);
+  assert(!strcmp(live.command.signing_public_key_pem, loaded.command.signing_public_key_pem));
+  edr_config_free_heap(&live);
+  edr_config_free_heap(&loaded);
+  remove(primary); remove(lkg);
+}
+
 int main(void) {
   const char *fn = "edr_test_cfg_fp.toml";
   FILE *f = fopen(fn, "wb");
@@ -326,6 +422,7 @@ int main(void) {
   if (!fp[0]) {
     return 1;
   }
+  test_effective_policy_survives_restart_and_recovery();
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
   test_command_forensic_yara_rules_dir();

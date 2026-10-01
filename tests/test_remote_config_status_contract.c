@@ -68,13 +68,16 @@ int main(void) {
       contains(agent, "atoll(headers->sequence)") ||
       !contains(agent, "signed payload identity mismatch") ||
       !contains(agent, "config_headers.policy_version") ||
+      !contains(agent, "remote_config_persistence_failed") ||
+      !ordered_before(agent, "edr_config_save_effective_policy(source, agent->config_path, &agent->cfg)",
+                      "edr_ingest_http_set_policy_version(config_headers.policy_version)") ||
       !contains(agent, "edr_ingest_http_set_policy_version(config_headers.policy_version)") ||
       contains(agent, "\"rules_applied\"") ||
       contains(agent, "\"rules_failed\"") ||
       !contains(agent, "15ULL * 60ULL * 1000000000ULL") ||
       !contains(ingest, "X-Rules-Version\", out->policy_version") ||
       !contains(ingest, "static char s_policy_version[128]") ||
-      !contains(transport, "edr_ingest_http_set_policy_version(NULL)") ||
+      !contains(transport, "edr_ingest_http_set_policy_version(cfg->applied_remote_policy.version)") ||
       contains(transport, "edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version)") ||
       !contains(ingest, "desired_version && desired_version[0] ? desired_version : \"\"") ||
       !ordered_before(agent, "edr_agent_verify_config_headers(&agent->cfg",

@@ -133,10 +133,9 @@ int edr_transport_init_from_config(const struct EdrConfig *cfg) {
     edr_ingest_http_configure_request_signing(&reqsig);
   }
   /* Runtime policy and preprocessing rules have independent identities.  The
-   * signed runtime-policy pull sets this value after verification; until then
-   * report the explicit local fallback instead of mislabeling a rules bundle
-   * as the applied endpoint policy. */
-  edr_ingest_http_set_policy_version(NULL);
+   * verified policy identity survives restart with the effective configuration.
+   * Files without a persisted policy identity retain the local fallback. */
+  edr_ingest_http_set_policy_version(cfg->applied_remote_policy.version);
   edr_ingest_http_configure_transport_options(
       cfg->platform.http2_enabled ? 1 : 0,
       cfg->platform.http2_require ? 1 : 0,

@@ -218,14 +218,6 @@ static int edr_agent_download_text_file(const char *url, const char *tmp, size_t
   return -1;
 }
 
-static int edr_agent_config_signature_required(const EdrConfig *cfg) {
-  const char *v = getenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED");
-  if (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')) {
-    return 1;
-  }
-  return cfg && cfg->config_signing.signature_required;
-}
-
 static int edr_agent_rules_signature_required(void) {
   const char *v = getenv("EDR_RULES_SIGNATURE_REQUIRED");
   if (v && (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N')) {
@@ -551,7 +543,7 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
 #endif
   if (reason && reason_cap) reason[0] = '\0';
   if (!headers || !headers->signature[0] || !headers->signed_payload_b64[0] || !headers->sequence[0] || !headers->config_hash[0]) {
-    if (edr_agent_config_signature_required(cfg)) {
+    if (edr_config_signature_required(cfg)) {
       snprintf(reason, reason_cap, "missing signed config headers");
       return -1;
     }
@@ -579,6 +571,9 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
     return -1;
   }
   seen = edr_agent_read_config_sequence_state(queue_db_path);
+  if (cfg && cfg->applied_remote_policy.sequence > (uint64_t)(seen > 0 ? seen : 0)) {
+    seen = (long long)cfg->applied_remote_policy.sequence;
+  }
   if (seq > 0 && seen > 0 && seq < seen) {
     snprintf(reason, reason_cap, "config rollback detected sequence=%lld seen=%lld", seq, seen);
     return -1;
@@ -626,7 +621,7 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
     }
   }
 #else
-  if (edr_agent_config_signature_required(cfg)) {
+  if (edr_config_signature_required(cfg)) {
     snprintf(reason, reason_cap, "OpenSSL signature verification unavailable");
     return -1;
   }
@@ -804,40 +799,7 @@ static void edr_agent_neighbor_file_path(const char *config_path, const char *su
 }
 
 static int edr_agent_copy_file(const char *src, const char *dst) {
-  FILE *in;
-  FILE *out;
-  unsigned char buf[8192];
-  if (!src || !src[0] || !dst || !dst[0]) {
-    return -1;
-  }
-  in = fopen(src, "rb");
-  if (!in) {
-    return -1;
-  }
-  out = fopen(dst, "wb");
-  if (!out) {
-    fclose(in);
-    return -1;
-  }
-  for (;;) {
-    size_t n = fread(buf, 1u, sizeof(buf), in);
-    if (n > 0u && fwrite(buf, 1u, n, out) != n) {
-      fclose(in);
-      fclose(out);
-      return -1;
-    }
-    if (n < sizeof(buf)) {
-      if (ferror(in)) {
-        fclose(in);
-        fclose(out);
-        return -1;
-      }
-      break;
-    }
-  }
-  fclose(in);
-  fclose(out);
-  return 0;
+  return edr_config_atomic_copy(src, dst);
 }
 
 static void edr_agent_toml_escape(const char *in, char *out, size_t cap) {
@@ -1220,17 +1182,6 @@ static int edr_agent_save_last_good_config(EdrAgent *agent, const char *source_p
   }
   edr_agent_state_file_path(source_path, "last_good_agent.toml", lkg, sizeof(lkg));
   return edr_agent_copy_file(source_path, lkg);
-}
-
-static int edr_agent_save_last_good_snapshot(EdrAgent *agent) {
-  char lkg[1100];
-  const char *base;
-  if (!agent) {
-    return -1;
-  }
-  base = agent->config_path && agent->config_path[0] ? agent->config_path : "agent.toml";
-  edr_agent_state_file_path(base, "last_good_agent.toml", lkg, sizeof(lkg));
-  return edr_agent_write_config_snapshot(lkg, &agent->cfg);
 }
 
 static EdrError edr_agent_try_last_good_config(EdrAgent *agent, const char *load_path, const char *reason) {
@@ -4440,9 +4391,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   EdrError ce = edr_config_load(tmp, &remote);
   char fp[80];
   int changed = 0;
-  int was_recovering = agent->config_recovery_active;
-  char repaired_local_config[1100];
-  repaired_local_config[0] = '\0';
+
   edr_config_fingerprint(tmp, fp, sizeof(fp));
   if (ce != EDR_OK) {
     char parse_reason[96];
@@ -4488,24 +4437,34 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_reconfigure(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
+  {
+    long long sequence = 0;
+    struct stat persisted;
+    const char *source = agent->config_recovery_active && agent->config_recovery_source[0]
+                             ? agent->config_recovery_source : agent->config_path;
+    (void)edr_agent_parse_config_sequence(config_headers.sequence, &sequence);
+    snprintf(agent->cfg.applied_remote_policy.version,
+             sizeof(agent->cfg.applied_remote_policy.version), "%s", config_headers.policy_version);
+    snprintf(agent->cfg.applied_remote_policy.hash,
+             sizeof(agent->cfg.applied_remote_policy.hash), "%s", config_headers.config_hash);
+    if (sequence > 0) agent->cfg.applied_remote_policy.sequence = (uint64_t)sequence;
+    if (!agent->config_path ||
+        edr_config_save_effective_policy(source, agent->config_path, &agent->cfg) != 0 ||
+        edr_agent_save_last_good_config(agent, agent->config_path) != 0) {
+      edr_agent_report_remote_config_failure(agent, &config_headers,
+                                             "remote_config_persistence_failed", now);
+      /* Keep the old applied identity so the next delivery retries persistence.
+       * The live policy may be active; it must not be acknowledged as durable. */
+      return;
+    }
+    if (stat(agent->config_path, &persisted) == 0) agent->config_mtime = persisted.st_mtime;
+    edr_agent_clear_config_recovery(agent);
+  }
   edr_ingest_http_set_policy_version(config_headers.policy_version);
   if ((changed & EDR_REMOTE_POLICY_HEALTH_MONITOR_CHANGED) != 0 &&
       agent->cfg.health_monitor.enabled && last_health_ns) {
     *last_health_ns = 0u;
     edr_agent_poll_engine_health(agent, last_health_ns, 1);
-  }
-  if (was_recovering && agent->config_path && agent->config_path[0] &&
-      edr_agent_write_config_snapshot(agent->config_path, &agent->cfg) == 0) {
-    snprintf(repaired_local_config, sizeof(repaired_local_config), "%s", agent->config_path);
-  }
-  edr_agent_clear_config_recovery(agent);
-  if (edr_agent_save_last_good_snapshot(agent) == 0) {
-    agent->config_recovery_auto_repaired = 1;
-    snprintf(agent->config_recovery_mode, sizeof(agent->config_recovery_mode), "%s", "remote_repaired");
-    if (repaired_local_config[0]) {
-      snprintf(agent->config_recovery_recovered_path, sizeof(agent->config_recovery_recovered_path),
-               "%s", repaired_local_config);
-    }
   }
   if (config_headers.sequence[0] || config_headers.config_hash[0]) {
     long long seq = 0;

@@ -15,6 +15,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
@@ -2950,6 +2959,17 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
       take_string(toml_string_in(t, "ports"), cfg->net_fanout.ports, sizeof(cfg->net_fanout.ports));
     }
   }
+  {
+    toml_table_t *t = toml_table_in(root, "applied_remote_policy");
+    if (t) {
+      toml_datum_t seq = toml_int_in(t, "sequence");
+      take_string(toml_string_in(t, "version"), cfg->applied_remote_policy.version,
+                  sizeof(cfg->applied_remote_policy.version));
+      take_string(toml_string_in(t, "hash"), cfg->applied_remote_policy.hash,
+                  sizeof(cfg->applied_remote_policy.hash));
+      if (seq.ok && seq.u.i > 0) cfg->applied_remote_policy.sequence = (uint64_t)seq.u.i;
+    }
+  }
   toml_free(root);
   edr_config_clamp(cfg);
   apply_detection_policy_env(cfg);
@@ -3012,4 +3032,394 @@ void edr_config_fingerprint(const char *path, char *out_hex, size_t cap) {
   }
   fclose(fp);
   snprintf(out_hex, cap, "%016llx", (unsigned long long)h);
+}
+
+/* Only fields owned by edr_agent_apply_remote_policy are materialized from
+ * memory. All other values (including secrets and trust settings) are retained
+ * from the parsed local source, never copied from environment-derived state. */
+typedef enum { POLICY_BOOL, POLICY_STRING, POLICY_INT, POLICY_U32, POLICY_U64,
+               POLICY_MODE, POLICY_PORTS } PolicyValueKind;
+typedef struct { const char *section, *key; size_t offset; PolicyValueKind kind; } PolicyField;
+#define POLICY_FIELD(section, key, member, kind) {section, key, offsetof(EdrConfig, member), POLICY_##kind}
+static const PolicyField policy_fields[] = {
+  POLICY_FIELD("applied_remote_policy", "version", applied_remote_policy.version, STRING),
+  POLICY_FIELD("applied_remote_policy", "hash", applied_remote_policy.hash, STRING),
+  POLICY_FIELD("applied_remote_policy", "sequence", applied_remote_policy.sequence, U64),
+  POLICY_FIELD("preprocessing", "rules_version", preprocessing.rules_version, STRING),
+  POLICY_FIELD("collection", "etw_enabled", collection.etw_enabled, BOOL),
+  POLICY_FIELD("collection", "etw_dns_client_provider", collection.etw_dns_client_provider, BOOL),
+  POLICY_FIELD("collection", "etw_powershell_provider", collection.etw_powershell_provider, BOOL),
+  POLICY_FIELD("collection", "etw_amsi_provider", collection.etw_amsi_provider, BOOL),
+  POLICY_FIELD("collection", "etw_schannel_provider", collection.etw_schannel_provider, BOOL),
+  POLICY_FIELD("collection", "etw_security_audit_provider", collection.etw_security_audit_provider, BOOL),
+  POLICY_FIELD("collection", "etw_wmi_provider", collection.etw_wmi_provider, BOOL),
+  POLICY_FIELD("collection", "etw_tcpip_provider", collection.etw_tcpip_provider, BOOL),
+  POLICY_FIELD("collection", "etw_firewall_provider", collection.etw_firewall_provider, BOOL),
+  POLICY_FIELD("collection", "max_event_queue_size", collection.max_event_queue_size, U32),
+  POLICY_FIELD("collection", "adaptive_enabled", collection.adaptive_enabled, BOOL),
+  POLICY_FIELD("collection", "adaptive_boost_seconds", collection.adaptive_boost_seconds, U32),
+  POLICY_FIELD("collection", "adaptive_min_severity", collection.adaptive_min_severity, U32),
+  POLICY_FIELD("event_filter", "enabled", event_filter.enabled, BOOL),
+  POLICY_FIELD("event_filter", "version", event_filter.version, STRING),
+  POLICY_FIELD("event_filter", "agent_internal_forensic", event_filter.agent_internal_forensic, BOOL),
+  POLICY_FIELD("event_filter", "low_value_file_process", event_filter.low_value_file_process, BOOL),
+  POLICY_FIELD("event_filter", "low_value_file_suffix", event_filter.low_value_file_suffix, BOOL),
+  POLICY_FIELD("event_filter", "temp_xml", event_filter.temp_xml, BOOL),
+  POLICY_FIELD("event_filter", "low_value_process_names", event_filter.low_value_process_names, STRING),
+  POLICY_FIELD("event_filter", "low_value_suffixes", event_filter.low_value_suffixes, STRING),
+  POLICY_FIELD("event_filter", "temp_xml_patterns", event_filter.temp_xml_patterns, STRING),
+  POLICY_FIELD("event_filter", "agent_internal_patterns", event_filter.agent_internal_patterns, STRING),
+  POLICY_FIELD("detection", "auto_profile", detection.auto_profile, BOOL),
+  POLICY_FIELD("detection", "shellcode_mode", detection.shellcode_mode, INT),
+  POLICY_FIELD("detection", "webshell_mode", detection.webshell_mode, INT),
+  POLICY_FIELD("detection", "pmfe_mode", detection.pmfe_mode, INT),
+  POLICY_FIELD("correlation", "enabled", correlation.enabled, BOOL),
+  POLICY_FIELD("correlation", "inject_feedback_enabled", correlation.inject_feedback_enabled, BOOL),
+  POLICY_FIELD("policy_v2", "credential_mode", policy_v2.credential_mode, MODE),
+  POLICY_FIELD("policy_v2", "lateral_mode", policy_v2.lateral_mode, MODE),
+  POLICY_FIELD("policy_v2", "privilege_mode", policy_v2.privilege_mode, MODE),
+  POLICY_FIELD("policy_v2", "evasion_mode", policy_v2.evasion_mode, MODE),
+  POLICY_FIELD("policy_v2", "persistence_mode", policy_v2.persistence_mode, MODE),
+  POLICY_FIELD("policy_v2", "script_mode", policy_v2.script_mode, MODE),
+  POLICY_FIELD("policy_v2", "webshell_mode", policy_v2.webshell_mode, MODE),
+  POLICY_FIELD("policy_v2", "exfil_mode", policy_v2.exfil_mode, MODE),
+  POLICY_FIELD("policy_v2", "impact_mode", policy_v2.impact_mode, MODE),
+  POLICY_FIELD("policy_v2", "ransomware_behavior", policy_v2.ransomware_behavior, BOOL),
+  POLICY_FIELD("policy_v2", "ransomware_mass_write", policy_v2.ransomware_mass_write, BOOL),
+  POLICY_FIELD("policy_v2", "ransomware_vss", policy_v2.ransomware_vss, BOOL),
+  POLICY_FIELD("policy_v2", "ransomware_spread", policy_v2.ransomware_spread, BOOL),
+  POLICY_FIELD("policy_v2", "ransomware_honey", policy_v2.ransomware_honey, BOOL),
+  POLICY_FIELD("policy_v2", "ransomware_forensic", policy_v2.ransomware_forensic, BOOL),
+  POLICY_FIELD("webshell_detector", "roots", webshell_detector.roots, STRING),
+  POLICY_FIELD("upload", "batch_max_events", upload.batch_max_events, U32),
+  POLICY_FIELD("upload", "batch_max_size_mb", upload.batch_max_size_mb, U32),
+  POLICY_FIELD("upload", "batch_timeout_s", upload.batch_timeout_s, INT),
+  POLICY_FIELD("upload", "max_upload_mbps", upload.max_upload_mbps, U32),
+  POLICY_FIELD("resource_limit", "cpu_limit_percent", resource_limit.cpu_limit_percent, U32),
+  POLICY_FIELD("resource_limit", "memory_limit_mb", resource_limit.memory_limit_mb, U32),
+  POLICY_FIELD("resource_limit", "emergency_cpu_limit", resource_limit.emergency_cpu_limit, U32),
+  POLICY_FIELD("resource_limit", "pmfe_scans_per_min", resource_limit.pmfe_scans_per_min, U32),
+  POLICY_FIELD("resource_limit", "webshell_scan_mb_per_min", resource_limit.webshell_scan_mb_per_min, U32),
+  POLICY_FIELD("resource_limit", "shellcode_packets_per_sec", resource_limit.shellcode_packets_per_sec, U32),
+  POLICY_FIELD("resource_limit", "low_priority_keep_percent_under_pressure", resource_limit.low_priority_keep_percent_under_pressure, U32),
+  POLICY_FIELD("health_monitor", "enabled", health_monitor.enabled, BOOL),
+  POLICY_FIELD("health_monitor", "profile", health_monitor.profile, STRING),
+  POLICY_FIELD("health_monitor", "interval_s", health_monitor.interval_s, U32),
+  POLICY_FIELD("health_monitor", "expires_at_unix_ms", health_monitor.expires_at_unix_ms, U64),
+  POLICY_FIELD("health_monitor", "request_id", health_monitor.request_id, STRING),
+  POLICY_FIELD("command", "allow_dangerous", command.allow_dangerous, BOOL),
+  POLICY_FIELD("command", "allow_rtq_readonly", command.allow_rtq_readonly, BOOL),
+  POLICY_FIELD("command", "allow_lifecycle_maintenance", command.allow_lifecycle_maintenance, BOOL),
+  POLICY_FIELD("command", "rtr_shell_allowlist", command.rtr_shell_allowlist, STRING),
+  POLICY_FIELD("command", "rtr_shell_max_timeout_sec", command.rtr_shell_max_timeout_sec, U32),
+  POLICY_FIELD("command", "signing_public_key_path", command.signing_public_key_path, STRING),
+  POLICY_FIELD("command", "signing_public_key_pem", command.signing_public_key_pem, STRING),
+  POLICY_FIELD("command", "forensic_yara_rules_dir", command.forensic_yara_rules_dir, STRING),
+  POLICY_FIELD("forensic_auto", "enabled", forensic_auto.enabled, BOOL),
+  POLICY_FIELD("forensic_auto", "cooldown_s", forensic_auto.cooldown_s, U32),
+  POLICY_FIELD("forensic_auto", "per_pid_cooldown_s", forensic_auto.per_pid_cooldown_s, U32),
+  POLICY_FIELD("forensic_auto", "max_per_hour", forensic_auto.max_per_hour, U32),
+  POLICY_FIELD("forensic_auto", "trigger_on_p0", forensic_auto.trigger_on_p0, BOOL),
+  POLICY_FIELD("forensic_auto", "collect_process_tree", forensic_auto.collect_process_tree, BOOL),
+  POLICY_FIELD("platform", "http2_enabled", platform.http2_enabled, BOOL),
+  POLICY_FIELD("platform", "http2_require", platform.http2_require, BOOL),
+  POLICY_FIELD("platform", "control_http2_enabled", platform.control_http2_enabled, BOOL),
+  POLICY_FIELD("platform", "control_http2_require", platform.control_http2_require, BOOL),
+  POLICY_FIELD("platform", "control_http1_fallback", platform.control_http1_fallback, BOOL),
+  POLICY_FIELD("platform", "control_stream_enabled", platform.control_stream_enabled, BOOL),
+  POLICY_FIELD("platform", "long_poll_fallback", platform.long_poll_fallback, BOOL),
+  POLICY_FIELD("platform", "report_events_v2_enabled", platform.report_events_v2_enabled, BOOL),
+  POLICY_FIELD("platform", "data_plane_encoding", platform.data_plane_encoding, STRING),
+  POLICY_FIELD("platform", "data_plane_compression", platform.data_plane_compression, STRING),
+  POLICY_FIELD("platform", "control_dict_version", platform.control_dict_version, STRING),
+  POLICY_FIELD("platform", "control_schema_version", platform.control_schema_version, STRING),
+  POLICY_FIELD("platform", "control_profile_id", platform.control_profile_id, STRING),
+  POLICY_FIELD("platform", "qos_dscp", platform.qos_dscp, STRING),
+  POLICY_FIELD("platform", "telemetry_threshold", platform.telemetry_threshold, STRING),
+  POLICY_FIELD("platform", "telemetry_sampling_pct", platform.telemetry_sampling_pct, U32),
+  POLICY_FIELD("platform", "backpressure_enabled", platform.backpressure_enabled, BOOL),
+  POLICY_FIELD("platform", "proxy_mode", platform.proxy_mode, STRING),
+  POLICY_FIELD("platform", "proxy_url", platform.proxy_url, STRING),
+  POLICY_FIELD("platform", "relay_url", platform.relay_url, STRING),
+  POLICY_FIELD("ave", "scan_threads", ave.scan_threads, INT),
+  POLICY_FIELD("ave", "max_file_size_mb", ave.max_file_size_mb, INT),
+  POLICY_FIELD("ave", "sensitivity", ave.sensitivity, STRING),
+  POLICY_FIELD("ave", "behavior_monitor_enabled", ave.behavior_monitor_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "enabled", attack_surface.enabled, BOOL),
+  POLICY_FIELD("attack_surface", "listeners_enabled", attack_surface.listeners_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "public_service_enabled", attack_surface.public_service_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "local_admins_enabled", attack_surface.local_admins_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "services_enabled", attack_surface.services_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "shares_enabled", attack_surface.shares_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "browser_enabled", attack_surface.browser_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "software_enabled", attack_surface.software_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "defender_enabled", attack_surface.defender_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "egress_enabled", attack_surface.egress_enabled, BOOL),
+  POLICY_FIELD("attack_surface", "port_interval_s", attack_surface.port_interval_s, U32),
+  POLICY_FIELD("attack_surface", "conn_interval_s", attack_surface.conn_interval_s, U32),
+  POLICY_FIELD("attack_surface", "service_interval_s", attack_surface.service_interval_s, U32),
+  POLICY_FIELD("attack_surface", "policy_interval_s", attack_surface.policy_interval_s, U32),
+  POLICY_FIELD("attack_surface", "full_snapshot_interval_s", attack_surface.full_snapshot_interval_s, U32),
+  POLICY_FIELD("attack_surface", "outbound_top_n", attack_surface.outbound_top_n, U32),
+  POLICY_FIELD("attack_surface", "egress_top_n", attack_surface.egress_top_n, U32),
+  POLICY_FIELD("attack_surface", "outbound_exclude_loopback", attack_surface.outbound_exclude_loopback, BOOL),
+  POLICY_FIELD("attack_surface", "geoip_db_path", attack_surface.geoip_db_path, STRING),
+  POLICY_FIELD("attack_surface", "firewall_rule_detail_max", attack_surface.firewall_rule_detail_max, U32),
+  POLICY_FIELD("attack_surface", "high_risk_immediate_ports", attack_surface.high_risk_immediate_ports, PORTS),
+  POLICY_FIELD("attack_surface", "etw_refresh_triggers_snapshot", attack_surface.etw_refresh_triggers_snapshot, BOOL),
+  POLICY_FIELD("attack_surface", "etw_refresh_debounce_s", attack_surface.etw_refresh_debounce_s, U32),
+  POLICY_FIELD("attack_surface", "win_listen_cache_ttl_ms", attack_surface.win_listen_cache_ttl_ms, U32),
+  POLICY_FIELD("self_protect", "event_bus_pressure_warn_pct", self_protect.event_bus_pressure_warn_pct, U32),
+  POLICY_FIELD("command.rtr_shell", "allowlist", command.rtr_shell_allowlist, STRING),
+  POLICY_FIELD("command.rtr_shell", "max_timeout_sec", command.rtr_shell_max_timeout_sec, U32),
+};
+#undef POLICY_FIELD
+
+static void policy_string(FILE *out, const char *value) {
+  const unsigned char *p = (const unsigned char *)value;
+  fputc('"', out);
+  for (; *p; ++p) {
+    switch (*p) {
+      case '"': fputs("\\\"", out); break;
+      case '\\': fputs("\\\\", out); break;
+      case '\n': fputs("\\n", out); break;
+      case '\r': fputs("\\r", out); break;
+      case '\t': fputs("\\t", out); break;
+      default:
+        if (*p < 32u || *p == 127u) fprintf(out, "\\u%04x", (unsigned)*p);
+        else fputc(*p, out);
+    }
+  }
+  fputc('"', out);
+}
+
+static void policy_key(FILE *out, const char *key) {
+  const unsigned char *p = (const unsigned char *)key;
+  for (; *p; ++p) if (!isalnum(*p) && *p != '_' && *p != '-') break;
+  if (!*p && key[0]) fputs(key, out);
+  else policy_string(out, key);
+}
+
+static const PolicyField *policy_field(const char *section, const char *key) {
+  size_t i;
+  for (i = 0; i < sizeof(policy_fields) / sizeof(policy_fields[0]); ++i)
+    if (!strcmp(section, policy_fields[i].section) && !strcmp(key, policy_fields[i].key))
+      return &policy_fields[i];
+  return NULL;
+}
+
+static void policy_value(FILE *out, const PolicyField *field, const EdrConfig *cfg) {
+  const void *value = (const char *)cfg + field->offset;
+  static const char *modes[] = {"off", "observe", "alert", "block"};
+  size_t i;
+  switch (field->kind) {
+    case POLICY_BOOL: fputs(*(const bool *)value ? "true" : "false", out); break;
+    case POLICY_STRING: policy_string(out, (const char *)value); break;
+    case POLICY_INT: fprintf(out, "%d", *(const int *)value); break;
+    case POLICY_U32: fprintf(out, "%u", *(const uint32_t *)value); break;
+    case POLICY_U64: fprintf(out, "%llu", (unsigned long long)*(const uint64_t *)value); break;
+    case POLICY_MODE: {
+      int mode = *(const int *)value;
+      policy_string(out, modes[mode >= 0 && mode <= 3 ? mode : 2]);
+      break;
+    }
+    case POLICY_PORTS:
+      fputc('[', out);
+      for (i = 0; i < cfg->attack_surface.high_risk_immediate_ports_count; ++i) {
+        if (i) fputs(", ", out);
+        fprintf(out, "%u", cfg->attack_surface.high_risk_immediate_ports[i]);
+      }
+      fputc(']', out);
+      break;
+  }
+}
+
+static int policy_table(FILE *, toml_table_t *, const char *, const EdrConfig *, unsigned, int);
+static int policy_array(FILE *out, toml_array_t *arr, unsigned depth) {
+  int i;
+  if (depth > 64u) return -1;
+  fputc('[', out);
+  for (i = 0; i < toml_array_nelem(arr); ++i) {
+    toml_raw_t raw = toml_raw_at(arr, i);
+    if (i) fputs(", ", out);
+    if (raw) fputs(raw, out);
+    else if (toml_array_at(arr, i)) {
+      if (policy_array(out, toml_array_at(arr, i), depth + 1u)) return -1;
+    } else if (toml_table_at(arr, i)) {
+      if (policy_table(out, toml_table_at(arr, i), "", NULL, depth + 1u, 1)) return -1;
+    } else return -1;
+  }
+  fputc(']', out);
+  return 0;
+}
+
+/* TOML inline tables preserve unknown nested keys and arrays of tables. */
+static int policy_table(FILE *out, toml_table_t *table, const char *section,
+                        const EdrConfig *cfg, unsigned depth, int inlined) {
+  int i, written = 0;
+  size_t n;
+  const char *key;
+  if (depth > 64u) return -1;
+  if (inlined) fputc('{', out);
+  for (i = 0; table && (key = toml_key_in(table, i)) != NULL; ++i) {
+    const PolicyField *field = cfg ? policy_field(section, key) : NULL;
+    toml_raw_t raw = toml_raw_in(table, key);
+    if (inlined && written++) fputs(", ", out);
+    policy_key(out, key); fputs(" = ", out);
+    if (field) policy_value(out, field, cfg);
+    else if (raw) fputs(raw, out);
+    else if (toml_array_in(table, key)) {
+      if (policy_array(out, toml_array_in(table, key), depth + 1u)) return -1;
+    } else if (toml_table_in(table, key)) {
+      char child[512];
+      if (snprintf(child, sizeof(child), "%s.%s", section, key) >= (int)sizeof(child)) return -1;
+      if (policy_table(out, toml_table_in(table, key), child, cfg, depth + 1u, 1)) return -1;
+    } else return -1;
+    if (!inlined) fputc('\n', out);
+  }
+  for (n = 0; cfg && n < sizeof(policy_fields) / sizeof(policy_fields[0]); ++n) {
+    const PolicyField *field = &policy_fields[n];
+    if (strcmp(section, field->section) || (table && toml_key_exists(table, field->key))) continue;
+    /* Do not turn the legacy env-only correlation configuration into an
+     * explicit disabled policy unless a remote/local policy configured it. */
+    if (!strcmp(section, "correlation") && !cfg->correlation.configured) continue;
+    if (inlined && written++) fputs(", ", out);
+    policy_key(out, field->key); fputs(" = ", out); policy_value(out, field, cfg);
+    if (!inlined) fputc('\n', out);
+  }
+  if (inlined) fputc('}', out);
+  return ferror(out) ? -1 : 0;
+}
+
+static FILE *config_atomic_open(const char *path, char *tmp, size_t cap) {
+  static unsigned serial;
+  unsigned attempt;
+  int fd;
+  for (attempt = 0; attempt < 16u; ++attempt) {
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = (int)getpid();
+#endif
+    if (snprintf(tmp, cap, "%s.tmp.%d.%u", path, pid, ++serial) >= (int)cap) return NULL;
+#ifdef _WIN32
+    fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+    if (fd >= 0) {
+#ifdef _WIN32
+      FILE *out = _fdopen(fd, "wb");
+      if (!out) { _close(fd); remove(tmp); }
+#else
+      FILE *out = fdopen(fd, "wb");
+      if (!out) { close(fd); remove(tmp); }
+#endif
+      return out;
+    }
+    if (errno != EEXIST) return NULL;
+  }
+  return NULL;
+}
+
+static int config_atomic_finish(FILE *out, const char *tmp, const char *path, int failed) {
+  if (ferror(out) || fflush(out)) failed = 1;
+#ifdef _WIN32
+  if (_commit(_fileno(out))) failed = 1;
+#else
+  if (fsync(fileno(out))) failed = 1;
+#endif
+  if (fclose(out)) failed = 1;
+  if (!failed) {
+#ifdef _WIN32
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) failed = 1;
+#else
+    if (rename(tmp, path)) failed = 1;
+    if (!failed) {
+      char parent[2304];
+      char *slash;
+      int dir;
+      snprintf(parent, sizeof(parent), "%s", path);
+      slash = strrchr(parent, '/');
+      if (slash) { if (slash == parent) slash[1] = 0; else *slash = 0; }
+      else snprintf(parent, sizeof(parent), ".");
+      dir = open(parent, O_RDONLY);
+      if (dir < 0) failed = 1;
+      else { if (fsync(dir)) failed = 1; close(dir); }
+    }
+#endif
+  }
+  if (failed) remove(tmp);
+  return failed ? -1 : 0;
+}
+
+int edr_config_atomic_copy(const char *source, const char *path) {
+  char tmp[2304];
+  unsigned char buf[8192];
+  size_t n;
+  int failed;
+  FILE *in, *out;
+  if (!source || !path || !(in = fopen(source, "rb"))) return -1;
+  out = config_atomic_open(path, tmp, sizeof(tmp));
+  if (!out) { fclose(in); return -1; }
+  while ((n = fread(buf, 1, sizeof(buf), in)) != 0u)
+    if (fwrite(buf, 1, n, out) != n) break;
+  failed = ferror(in) || ferror(out);
+  if (fclose(in)) failed = 1;
+  return config_atomic_finish(out, tmp, path, failed);
+}
+
+int edr_config_save_effective_policy(const char *source, const char *path, const EdrConfig *cfg) {
+  char error[256], tmp[2304];
+  toml_table_t *root;
+  FILE *out;
+  const char *key;
+  int i, failed = 0;
+  size_t n, prev;
+  if (!source || !path || !cfg) return -1;
+  root = edr_config_parse_file_compat(source, error, sizeof(error));
+  if (!root) return -1;
+  out = config_atomic_open(path, tmp, sizeof(tmp));
+  if (!out) { toml_free(root); return -1; }
+  fputs("# Local configuration with the last applied remote policy.\n", out);
+  /* Write root scalars before any section headers. */
+  for (i = 0; (key = toml_key_in(root, i)) != NULL; ++i) {
+    if (toml_table_in(root, key)) continue;
+    policy_key(out, key); fputs(" = ", out);
+    if (toml_raw_in(root, key)) fputs(toml_raw_in(root, key), out);
+    else if (policy_array(out, toml_array_in(root, key), 0)) failed = 1;
+    fputc('\n', out);
+  }
+  for (i = 0; (key = toml_key_in(root, i)) != NULL; ++i) {
+    toml_table_t *table = toml_table_in(root, key);
+    if (!table) continue;
+    fputs("\n[", out); policy_key(out, key); fputs("]\n", out);
+    if (policy_table(out, table, key, cfg, 0, 0)) failed = 1;
+  }
+  for (n = 0; n < sizeof(policy_fields) / sizeof(policy_fields[0]); ++n) {
+    const char *section = policy_fields[n].section;
+    if (strchr(section, '.') || toml_table_in(root, section)) continue;
+    for (prev = 0; prev < n; ++prev) if (!strcmp(section, policy_fields[prev].section)) break;
+    if (prev != n || (!strcmp(section, "correlation") && !cfg->correlation.configured)) continue;
+    fprintf(out, "\n[%s]\n", section);
+    if (policy_table(out, NULL, section, cfg, 0, 0)) failed = 1;
+  }
+  toml_free(root);
+  /* Parse our complete output before replacing the authority file. This avoids
+   * both truncation and partial writes becoming the new recovery source. */
+  if (fflush(out)) failed = 1;
+  if (!failed) {
+    root = edr_config_parse_file_compat(tmp, error, sizeof(error));
+    if (!root) failed = 1;
+    else toml_free(root);
+  }
+  return config_atomic_finish(out, tmp, path, failed);
+}
+
+int edr_config_signature_required(const EdrConfig *cfg) {
+  const char *v = getenv("EDR_AGENT_CONFIG_SIGNATURE_REQUIRED");
+  if (v && (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')) {
+    return 1;
+  }
+  return cfg && cfg->config_signing.signature_required;
 }
