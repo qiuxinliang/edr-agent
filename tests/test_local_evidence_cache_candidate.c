@@ -1131,6 +1131,7 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   }
 
   edr_local_evidence_cache_get_status(&status);
+  assert(status.physical_bytes == status.db_bytes + status.wal_bytes + status.shm_bytes);
   assert(status.write_budget_base_limit == 8u);
   assert(status.write_budget_limit == 4u);
   assert(status.write_budget_used == 4u);

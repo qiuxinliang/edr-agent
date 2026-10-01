@@ -51,6 +51,7 @@ static void test_sleep_ms(unsigned milliseconds) {
 
 static int s_send_ok;
 static int s_configured = 1;
+static int s_circuit_open;
 static int s_reject_value = -1;
 static const char *s_receipt_body;
 static int s_telemetry_deferred;
@@ -70,6 +71,7 @@ static void reset_send_state(int send_ok) {
   pthread_mutex_lock(&s_send_lock);
   s_send_ok = send_ok;
   s_configured = 1;
+  s_circuit_open = 0;
   s_reject_value = -1;
   s_receipt_body = NULL;
   s_telemetry_deferred = s_defer_during_send = 0;
@@ -120,6 +122,7 @@ static unsigned total_send_calls(void) {
 static void reset_send_state(int send_ok) {
   s_send_ok = send_ok;
   s_configured = 1;
+  s_circuit_open = 0;
   s_reject_value = -1;
   s_receipt_body = NULL;
   s_telemetry_deferred = s_defer_during_send = 0;
@@ -133,7 +136,7 @@ static unsigned total_send_calls(void) { return s_send_calls; }
 #endif
 
 int edr_ingest_http_configured(void) { return s_configured; }
-int edr_ingest_http_circuit_open(void) { return 0; }
+int edr_ingest_http_circuit_open(void) { return s_circuit_open; }
 int edr_ingest_http_telemetry_deferred(void) { return s_telemetry_deferred; }
 int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12,
                                    size_t header_len, const uint8_t *payload,
@@ -1428,7 +1431,7 @@ static void test_terminal_owner_digest_migration_and_unresolved_legacy_latch(voi
 /* event_queue batch ids are sent and later rebound as C strings. A durable
  * SQLite TEXT NUL or overlong value is therefore terminal metadata corruption,
  * not a retryable transport outcome. It must leave the row auditable without
- * permanently consuming pending admission capacity or starving a later row. */
+ * starving a later row. Its retained payload still consumes admission capacity. */
 static void test_event_queue_batch_metadata_corruption_quarantines_without_starvation(void) {
   enum { large_wire_len = 200000 };
   char path[256];
@@ -1505,13 +1508,13 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   assert(after.delivery_acked == before.delivery_acked + 1u);
   assert(after.delivery_requeued == before.delivery_requeued);
   assert(after.delivery_failed == before.delivery_failed + 2u);
-  assert(after.used_bytes == 0u);
-  assert(before.used_bytes > after.used_bytes + 400000u);
+  assert(after.used_bytes >= 400000u && before.used_bytes > after.used_bytes);
+  assert(after.retained_nonpending_bytes == after.used_bytes);
 
   edr_storage_queue_close();
   assert(edr_storage_queue_open(path) == EDR_OK);
   edr_storage_queue_get_capacity_metrics(&after_reopen);
-  assert(after_reopen.used_bytes == 0u);
+  assert(after_reopen.used_bytes == after.used_bytes);
   assert(after_reopen.event_queue_metadata_corruption_failures ==
          after.event_queue_metadata_corruption_failures);
   assert(edr_storage_queue_dead_letter_count() == 2u);
@@ -1537,10 +1540,13 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
   assert(after_transient.delivery_requeued == after_reopen.delivery_requeued + 1u);
   assert(after_transient.delivery_failed == after_reopen.delivery_failed);
 
-  /* Dead-letter audit payloads are excluded from logical admission, so a
-   * later ordinary batch can admit despite their retained physical bytes. */
-  assert(edr_storage_queue_enqueue("ordinary-after-quarantine", large_wire, large_wire_len, 0,
+  /* A later ordinary batch can use remaining budget, but quarantine must
+   * not reset retained usage and allow an unlimited sequence of new writes. */
+  assert(edr_storage_queue_enqueue("ordinary-after-quarantine", valid_wire, sizeof(valid_wire), 0,
                                    EDR_STORAGE_QUEUE_SEVERITY_ORDINARY) == EDR_OK);
+  assert(edr_storage_queue_enqueue("ordinary-over-retained-budget", large_wire, large_wire_len, 0,
+                                   EDR_STORAGE_QUEUE_SEVERITY_ORDINARY) == EDR_ERR_QUEUE_FULL);
+  assert(status_count(path, "dead_letter") == 2);
   edr_storage_queue_close();
   free(large_wire);
   (void)remove(path);
@@ -2474,6 +2480,57 @@ static void test_event_selection_oom_preserves_durable_payload(void) {
   }
 }
 
+static void test_retention_runs_while_transport_circuit_is_open(void) {
+  char path[256]; uint8_t wire[20]; EdrStorageQueueCapacityMetrics metrics;
+  snprintf(path, sizeof(path), "edr-offline-retention-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(wire, 0x81u);
+  assert(test_setenv("EDR_QUEUE_RETENTION_HOURS", "1") == 0);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enqueue("old-ordinary", wire, sizeof(wire), 0, 0) == EDR_OK);
+  assert(edr_storage_queue_enqueue("old-terminal", wire, sizeof(wire), 0, 1) == EDR_OK);
+  assert(edr_storage_queue_enqueue("old-source", wire, sizeof(wire), 0, 2) == EDR_OK);
+  edr_storage_queue_close();
+  sqlite_exec_path(path, "UPDATE event_queue SET created_at=1;");
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  reset_send_state(1); s_circuit_open = 1;
+  edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(batch_row_id(path, "old-ordinary") < 0);
+  assert(status_count(path, "dead_letter") == 1);
+  assert(queue_batch_pending(path, "old-source"));
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.retained_nonpending_bytes > 0u);
+  assert(metrics.used_bytes > metrics.retained_nonpending_bytes);
+  edr_storage_queue_close(); remove(path); s_circuit_open = 0;
+  assert(test_unsetenv("EDR_QUEUE_RETENTION_HOURS") == 0);
+}
+
+static void test_pinned_wal_is_visible_beyond_logical_budget(void) {
+  char path[256]; sqlite3 *reader = NULL;
+  uint8_t *wire = malloc(65536u); EdrStorageQueueCapacityMetrics metrics;
+  assert(wire); make_large_wire(wire, 65536u, 0x82u);
+  snprintf(path, sizeof(path), "edr-pinned-wal-%ld.db", (long)TEST_PID);
+  remove(path); assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(sqlite3_open(path, &reader) == SQLITE_OK);
+  assert(sqlite3_exec(reader, "BEGIN; SELECT COUNT(*) FROM event_queue;", NULL, NULL, NULL) == SQLITE_OK);
+  reset_send_state(1);
+  for (int i = 0; i < 18; ++i) {
+    char id[48]; snprintf(id, sizeof(id), "wal-retained-history-%d", i);
+    assert(edr_storage_queue_enqueue(id, wire, 65536u, 0, 0) == EDR_OK);
+    edr_storage_queue_poll_drain();
+    assert(edr_storage_queue_pending_count() == 0u);
+    /* A second reader keeps the WAL generation alive across owner reopen. */
+    edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  }
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.used_bytes == 0u && metrics.wal_bytes > metrics.max_bytes);
+  assert(metrics.physical_bytes == metrics.db_bytes + metrics.wal_bytes + metrics.shm_bytes);
+  assert(sqlite3_exec(reader, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+  sqlite3_close(reader); edr_storage_queue_close();
+  remove(path); free(wire); assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+}
+
 static void test_unconfigured_transport_preserves_retry_budget(void) {
   for (int severity = 0; severity <= 2; ++severity) {
     char path[256];
@@ -2527,6 +2584,7 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
   edr_storage_queue_close();
   assert(edr_storage_queue_open(path) == EDR_OK);
   s_configured = 1;
+  s_circuit_open = 0;
   s_reject_value = -1;
   s_receipt_body = NULL;
   s_defer_during_send = 1;
@@ -3051,6 +3109,8 @@ int main(void) {
   test_retry_backoff_and_fairness_survive_reopen();
   test_queue_requires_bound_receipt_after_lost_response();
   test_event_selection_oom_preserves_durable_payload();
+  test_retention_runs_while_transport_circuit_is_open();
+  test_pinned_wal_is_visible_beyond_logical_budget();
   test_unconfigured_transport_preserves_retry_budget();
   test_budget_deferral_preserves_ordinary_retry_allowance();
   test_budget_deferral_preserves_terminal_frames();

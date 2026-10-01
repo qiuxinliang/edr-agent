@@ -179,9 +179,10 @@ typedef struct {
   uint64_t wal_bytes;
   uint64_t shm_bytes;
   uint64_t physical_bytes;
-  /* Logical live allocation is the admission authority; physical SQLite
+  /* Logical retained allocation (all statuses) is the admission authority; physical SQLite
    * files are high-water diagnostics and do not strand an empty queue. */
   uint64_t used_bytes;
+  uint64_t retained_nonpending_bytes;
   uint64_t max_bytes;
   uint64_t ordinary_limit_bytes;
   /* `critical_reserve_bytes` is the total excluded from ordinary admission.

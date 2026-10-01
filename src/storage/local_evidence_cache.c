@@ -2543,11 +2543,16 @@ static void refresh_db_size_status(void) {
   s_status.db_bytes = path_size_bytes(s_status.path);
   if (!s_status.path[0]) {
     s_status.wal_bytes = 0u;
+    s_status.shm_bytes = 0u;
+    s_status.physical_bytes = s_status.db_bytes;
     return;
   }
   char wal_path[640];
   snprintf(wal_path, sizeof(wal_path), "%s-wal", s_status.path);
   s_status.wal_bytes = path_size_bytes(wal_path);
+  snprintf(wal_path, sizeof(wal_path), "%s-shm", s_status.path);
+  s_status.shm_bytes = path_size_bytes(wal_path);
+  s_status.physical_bytes = s_status.db_bytes + s_status.wal_bytes + s_status.shm_bytes;
 }
 
 static void refresh_candidate_inventory_status(EdrEvidenceCacheStatus *st) {
@@ -6056,6 +6061,8 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   refresh_db_size_status();
   st.db_bytes = s_status.db_bytes;
   st.wal_bytes = s_status.wal_bytes;
+  st.shm_bytes = s_status.shm_bytes;
+  st.physical_bytes = s_status.physical_bytes;
   st.db_utilization_bps = utilization_bps(st.db_bytes + st.wal_bytes,
                                           (uint64_t)st.max_db_mb * 1024ULL * 1024ULL);
   refresh_candidate_inventory_status(&st);

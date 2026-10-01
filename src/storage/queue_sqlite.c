@@ -328,10 +328,10 @@ static int queue_sql_sum_locked(const char *sql, uint64_t *out) {
   return 1;
 }
 
-static int queue_logical_live_bytes_locked(uint64_t *out) {
+static int queue_logical_retained_bytes_locked(uint64_t *out) {
   static const char event_sql[] =
       "SELECT COALESCE(SUM(length(batch_id)+length(payload)+512),0) "
-      "FROM event_queue WHERE status='pending';";
+      "FROM event_queue;";
   static const char terminal_sql[] =
       "SELECT COALESCE(SUM("
       "length(idempotency_key)+length(source_event_key)+length(rule_id)+"
@@ -468,7 +468,10 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   }
   out->physical_bytes = queue_add_bytes(queue_add_bytes(out->db_bytes, out->wal_bytes),
                                         out->shm_bytes);
-  if (!queue_logical_live_bytes_locked(&out->used_bytes) ||
+  if (!queue_logical_retained_bytes_locked(&out->used_bytes) ||
+      !queue_sql_sum_locked("SELECT COALESCE(SUM(length(batch_id)+length(payload)+512),0) "
+                            "FROM event_queue WHERE status!='pending';",
+                            &out->retained_nonpending_bytes) ||
       !queue_pending_inventory_locked(&out->pending_rows, &out->oldest_pending_created_unix_s) ||
       !p0_deferred_inventory_locked(&out->p0_deferred_pending_rows,
                                     &out->p0_deferred_failed_rows)) {
@@ -1017,7 +1020,8 @@ static void cleanup_expired_rows(void) {
   }
   time_t cutoff = time(NULL) - (time_t)hours * 3600;
   sqlite3_stmt *st = NULL;
-  const char *sql = "DELETE FROM event_queue WHERE created_at < ? AND severity=0;";
+  const char *sql = "DELETE FROM event_queue WHERE id IN (SELECT id FROM event_queue "
+                    "WHERE created_at < ? AND severity=0 ORDER BY id LIMIT 256);";
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
     if (sqlite3_step(st) == SQLITE_DONE) {
@@ -1029,7 +1033,8 @@ static void cleanup_expired_rows(void) {
   st = NULL;
   if (sqlite3_prepare_v2(s_db,
                          "UPDATE event_queue SET status='dead_letter', terminal_reason='retention_expired', "
-                         "terminal_at=? WHERE created_at < ? AND severity=1 AND status='pending';",
+                         "terminal_at=? WHERE id IN (SELECT id FROM event_queue WHERE created_at < ? "
+                         "AND severity=1 AND status='pending' ORDER BY id LIMIT 256);",
                          -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
     sqlite3_bind_int64(st, 2, (sqlite3_int64)cutoff);
@@ -2322,6 +2327,7 @@ static void storage_queue_close_unlocked(void) {
   s_terminal_failed = 0;
   s_terminal_outcome_unknown = 0;
   s_last_drain_ns = 0u;
+  s_last_cleanup_ns = 0u;
 }
 
 static void queue_lock_release(void) {
@@ -4420,6 +4426,7 @@ void edr_storage_queue_poll_drain(void) {
       return;
     }
     s_last_drain_ns = now;
+    cleanup_expired_rows();
     queue_state_unlock();
     return;
   }

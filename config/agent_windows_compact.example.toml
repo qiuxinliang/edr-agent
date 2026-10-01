@@ -75,7 +75,9 @@ max_upload_mbps      = 4
 
 [offline]
 queue_db_path        = "C:\\Program Files\\FDSecurity\\queue\\edr_queue.db"
+# Logical retained queue budget (including dead-letter/corrupt records); not a DB/WAL/SHM file limit.
 max_queue_size_mb    = 512
+# Ordinary records expire; severity 1 moves to dead-letter; severity 2 remains until ACK.
 retention_hours      = 72
 evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db"
 evidence_cache_max_size_mb = 512

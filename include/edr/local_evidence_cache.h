@@ -165,6 +165,8 @@ typedef struct {
   uint32_t retention_hours;
   uint64_t db_bytes;
   uint64_t wal_bytes;
+  uint64_t shm_bytes;
+  uint64_t physical_bytes;
   uint64_t p0_candidate_rows;
   int64_t oldest_process_last_seen_ns;
   int64_t oldest_ring_event_time_ns;

@@ -19,7 +19,7 @@ Order: R04, R02, R03, R08, R05, R06, R01, R07.
 | R03 | Durable exponential backoff (1–300 seconds); every eighth event selection uses oldest eligible ID. Terminal journals defer failed rows using persisted error/time/counters. | SQLite contract: legacy schema upgrade and reopen, poison severity-2 retained, lower priority progresses within eight selections, independent journals progress. |
 | R08 | Versioned whole-batch receipt binds endpoint, batch ID and SHA-256. Backend rejects volatile-only async operation; any alert persistence failure retries. | Agent receipt + SQLite response-loss tests; Go partial-failure/idempotency tests; isolated MySQL worker and actual server restart preserve acknowledged payload. |
 | R05 | Event batch-ID/payload allocation failures and SQLite NOMEM defer selection without retry consumption or corruption disposition; terminal selection failures no longer increment send retries. | SQLite fault injection passed for both allocations at severities 0/1/2, exact payload replay after recovery, all three terminal allocations, and existing real corruption isolation cases. |
-| R06 | Define and observe logical capacity, physical usage and retention separately. | Pending |
+| R06 | Charge every retained event state to logical admission; report nonpending bytes and DB/WAL/SHM physical usage; run TTL cleanup even while transport is deferred. | Agent build, storage_queue_sqlite_contract and local_evidence_cache_candidate passed, including pinned-WAL visibility and circuit-open retention. |
 | R01 | Installation history must not substitute for current runtime health. | Pending |
 | R07 | Preserve compatible aggregate counters and add reason-specific accounting. | Pending |
 
@@ -88,3 +88,30 @@ its SQL-driver harness because the migration contains mysql-client `DELIMITER`
 commands. Claim-fencing unit tests passed; that separate migration harness remains
 a validation gap. Installed host mysqld crashed at initialization; no host database
 was modified.
+
+## R06 capacity and retention contract
+
+`max_queue_size_mb` now bounds estimated retained logical record allocation,
+including dead-letter/corrupt payloads, journal reservations and deferred records.
+Changing a record status no longer creates free admission budget. On upgrade,
+already retained records can exceed the configured budget; they are preserved,
+new admissions receive a counted capacity refusal, and existing deliveries continue.
+`retained_nonpending_bytes` explains this usage. Physical DB/WAL/SHM totals are
+reported separately; SQLite free pages and a reader-pinned WAL can exceed the
+logical limit even with zero pending records. No physical file hard limit is
+claimed or silently imposed by deleting unacknowledged evidence. A strict physical
+quota requires an explicit storage/deployment policy and remains outside this change.
+
+| Data/state | Retention disposition |
+| --- | --- |
+| Ordinary event rows | Removed after configured age, including ordinary dead letters |
+| Severity 1 pending | Moves to retained dead letter at TTL or retry exhaustion |
+| Severity 2 pending/corrupt | No TTL/retry deletion; valid pending payload waits for ACK |
+| Completed terminal/deferred rows | Removed by the existing bounded maintenance owner after retention |
+| Unresolved/failed terminal/deferred rows | Retained and charged; no automatic evidence deletion |
+| Evidence cache | Its own TTL/capacity policy; DB+WAL target, now with SHM/total diagnostics |
+
+TTL is an eligibility rule, not a promise that every event is retained for exactly
+that duration or that offline backlog will later be fully delivered. Capacity
+refusal and ordinary retention eviction have separate counters. This change does
+not invent an automatic archive/purge destination for unresolved audit evidence.
