@@ -15,7 +15,7 @@ Order: R04, R02, R03, R08, R05, R06, R01, R07.
 | Item | Change and acceptance | Verification |
 | --- | --- | --- |
 | R04 | Atomic primary + LKG persistence; preserve parsed local fields and never serialize runtime credentials. Persist policy identity and use its sequence as an additional rollback floor. | Local Agent build; config restart/LKG/long-string/secret/signature-override regression; installer config and remote status contracts passed. |
-| R02 | Unconfigured transport must not consume retry budget. | Pending |
+| R02 | Unconfigured polling only performs normal retention maintenance; event and terminal retry counters require an attempted send. | SQLite contract passed: severities 0/1/2 remain pending with zero attempts/retries across reopen, then acknowledge after configuration; terminal frames and budget deferral also covered. |
 | R03 | One rejected record must not indefinitely block eligible records. | Pending |
 | R08 | Local acknowledgement must match durable backend acceptance. | Pending |
 | R05 | Resource exhaustion must preserve valid pending records. | Pending |
@@ -40,3 +40,9 @@ Tests execute the real parser, serializer and atomic copy on macOS. Native
 Windows ACL/replace behavior and abrupt-power-loss durability are not proven by
 these tests. The local build uses the existing P0 rule test stub and does not
 represent production Windows detector validation.
+
+R02 retry_count means a failed transport submission while not locally deferred;
+it is not a count of HTTP requests (the transport can reject locally or retry
+internally). Unconfigured and budget/circuit-deferred states do not consume that
+budget. Existing counters are retained for compatibility; historical inflated
+values are not silently reset because genuine failures cannot be distinguished.

@@ -49,6 +49,7 @@ static void test_sleep_ms(unsigned milliseconds) {
 }
 
 static int s_send_ok;
+static int s_configured = 1;
 static int s_telemetry_deferred;
 static int s_defer_during_send;
 static unsigned s_send_calls;
@@ -65,6 +66,7 @@ static pthread_cond_t s_send_cond = PTHREAD_COND_INITIALIZER;
 static void reset_send_state(int send_ok) {
   pthread_mutex_lock(&s_send_lock);
   s_send_ok = send_ok;
+  s_configured = 1;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -112,6 +114,7 @@ static unsigned total_send_calls(void) {
 #else
 static void reset_send_state(int send_ok) {
   s_send_ok = send_ok;
+  s_configured = 1;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -122,7 +125,7 @@ static unsigned send_calls_for(uint8_t value) { return s_send_value_calls[value]
 static unsigned total_send_calls(void) { return s_send_calls; }
 #endif
 
-int edr_ingest_http_configured(void) { return 1; }
+int edr_ingest_http_configured(void) { return s_configured; }
 int edr_ingest_http_circuit_open(void) { return 0; }
 int edr_ingest_http_telemetry_deferred(void) { return s_telemetry_deferred; }
 int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12,
@@ -2308,6 +2311,35 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
 }
 #endif
 
+static void test_unconfigured_transport_preserves_retry_budget(void) {
+  for (int severity = 0; severity <= 2; ++severity) {
+    char path[256];
+    uint8_t wire[20];
+    snprintf(path, sizeof(path), "edr-unconfigured-%d-%ld.db", severity, (long)TEST_PID);
+    remove(path);
+    make_wire(wire, (uint8_t)(0xb0 + severity));
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_enqueue("not-sent", wire, sizeof(wire), 0, severity) == EDR_OK);
+    reset_send_state(0);
+    s_configured = 0;
+    for (int poll = 0; poll < 3; ++poll) {
+      edr_storage_queue_poll_drain();
+      assert(total_send_calls() == 0u);
+      assert(batch_retry_count(path, "not-sent") == 0);
+      assert(status_count(path, "pending") == 1);
+      edr_storage_queue_close();
+      assert(edr_storage_queue_open(path) == EDR_OK);
+    }
+    reset_send_state(1);
+    edr_storage_queue_poll_drain();
+    assert(total_send_calls() == 1u);
+    assert(status_count(path, "pending") == 0);
+    assert(status_count(path, "dead_letter") == 0);
+    edr_storage_queue_close();
+    remove(path);
+  }
+}
+
 static void test_budget_deferral_preserves_terminal_frames(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
@@ -2324,6 +2356,14 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
              "budget-terminal", "budget-source", source, sizeof(source),
              "budget-combined", combined, sizeof(combined)) == EDR_OK);
   reset_send_state(0);
+  s_configured = 0;
+  edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(terminal_journal_frame_retry_count(path, "budget-terminal", 1) == 0);
+  assert(terminal_journal_frame_retry_count(path, "budget-terminal", 0) == 0);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  s_configured = 1;
   s_defer_during_send = 1;
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xcau) == 1u && send_calls_for(0xcbu) == 0u);
@@ -2842,6 +2882,7 @@ int main(void) {
   edr_storage_queue_close();
   (void)remove(path);
   test_terminal_journal_durable_commits_and_exact_replay();
+  test_unconfigured_transport_preserves_retry_budget();
   test_budget_deferral_preserves_ordinary_retry_allowance();
   test_budget_deferral_preserves_terminal_frames();
   test_terminal_journal_recovery_and_independent_acks();

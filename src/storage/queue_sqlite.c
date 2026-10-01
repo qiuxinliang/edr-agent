@@ -1166,6 +1166,7 @@ static int drain_one_row(void) {
   }
   queue_state_unlock();
   int send = -1;
+  int attempted = 0;
   if (edr_ingest_http_configured()) {
     if (edr_ingest_http_circuit_open() || edr_ingest_http_telemetry_deferred()) {
       queue_state_lock();
@@ -1187,6 +1188,7 @@ static int drain_one_row(void) {
       fprintf(stderr, "[queue_delivery] state=sent row_id=%lld batch_id=%s\n",
               (long long)id, batch_id_copy);
     }
+    attempted = 1;
     send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12,
                                           (size_t)blob_len - 12u);
   }
@@ -1215,7 +1217,7 @@ static int drain_one_row(void) {
   if (s_db == selected_db && s_db_generation == selected_generation) {
     /* Local budget refusal did not send the bytes. It must not consume the
      * retry allowance and eventually discard a durable ordinary batch. */
-    if (!edr_ingest_http_telemetry_deferred())
+    if (attempted && !edr_ingest_http_telemetry_deferred())
       bump_selected_retry(selected_db, id, batch_id_copy, blob_copy, blob_len);
     s_delivery_requeued++;
     requeued = 1;
@@ -4251,8 +4253,10 @@ static int drain_one_terminal_journal_frame(void) {
   queue_state_unlock();
 
   int send = -1;
+  int attempted = 0;
   if (edr_ingest_http_configured() && !edr_ingest_http_circuit_open() &&
       !edr_ingest_http_telemetry_deferred()) {
+    attempted = 1;
     send = edr_transport_v2_report_events(batch_id, wire, 12u, wire + 12u,
                                           (size_t)wire_len - 12u);
   }
@@ -4272,7 +4276,7 @@ static int drain_one_terminal_journal_frame(void) {
     return acknowledged ? 0 : 2;
   }
   queue_state_lock();
-  if (s_db == selected_db && s_db_generation == selected_generation &&
+  if (attempted && s_db == selected_db && s_db_generation == selected_generation &&
       !edr_ingest_http_telemetry_deferred()) {
     if (frame_kind == 0) {
       /* The only pre-action evidence must remain replayable. Unlike final
@@ -4301,6 +4305,16 @@ void edr_storage_queue_poll_drain(void) {
   }
   drain_generation = s_db_generation;
   if (s_drain_generation == drain_generation) {
+    queue_state_unlock();
+    return;
+  }
+  if (!edr_ingest_http_configured()) {
+    /* Configuration absence is not a delivery attempt. Normal retention
+     * maintenance still runs, but retry disposition must wait for transport. */
+    if (now - s_last_drain_ns >= interval_ns) {
+      s_last_drain_ns = now;
+      cleanup_expired_rows();
+    }
     queue_state_unlock();
     return;
   }
