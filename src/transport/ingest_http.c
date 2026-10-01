@@ -1,3 +1,4 @@
+#include "edr/report_events_ack.h"
 #include "edr/health_upload.h"
 #include "edr/time_util.h"
 #include "edr/ingest_http.h"
@@ -5464,6 +5465,8 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       payload_len == 0u) {
     return -1;
   }
+  char receipt[8192];
+  receipt[0] = '\0';
   if (report_events_v2_should_use()) {
     uint8_t *env = NULL;
     size_t env_len = 0u;
@@ -5474,8 +5477,13 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       s_report_events_post_attempt_body_bytes += (uint64_t)env_len;
       runtime_state_unlock();
       v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
-                               (const char *)env, env_len, NULL, 0u);
+                               (const char *)env, env_len, receipt, sizeof(receipt));
       free(env);
+      if (v2rc == 0 && !edr_report_events_acknowledged(receipt, s_endpoint, batch_id,
+                                                     header12, header_len, payload, payload_len)) {
+        runtime_failure("report-events receipt missing, incomplete or mismatched");
+        v2rc = -1;
+      }
       if (v2rc == 0) {
         runtime_state_lock();
         s_report_events_v2_ok++;
@@ -5537,8 +5545,16 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   runtime_state_lock();
   s_report_events_post_attempt_body_bytes += (uint64_t)body_len;
   runtime_state_unlock();
-  int rc = post_to_suffix("ingest/report-events", body);
+  int rc = request_to_suffix("POST", "ingest/report-events", "application/json",
+                             body, body_len, receipt, sizeof(receipt));
   free(body);
+  if (rc == 0 && !edr_report_events_acknowledged(receipt, s_endpoint, batch_id,
+                                               header12, header_len, payload, payload_len)) {
+    runtime_failure("report-events receipt missing, incomplete or mismatched");
+    rc = -1;
+  }
+  if (rc == 0) note_http_request_success();
+  else note_http_request_failure();
   if (rc != 0) {
     log_native_post_failure("report-events", rc);
     return -1;

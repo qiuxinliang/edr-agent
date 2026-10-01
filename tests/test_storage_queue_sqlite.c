@@ -1,5 +1,6 @@
 #include "edr/error.h"
 #include "edr/sha256.h"
+#include "edr/report_events_ack.h"
 #include "edr/storage_queue.h"
 
 #ifdef NDEBUG
@@ -51,6 +52,7 @@ static void test_sleep_ms(unsigned milliseconds) {
 static int s_send_ok;
 static int s_configured = 1;
 static int s_reject_value = -1;
+static const char *s_receipt_body;
 static int s_telemetry_deferred;
 static int s_defer_during_send;
 static unsigned s_send_calls;
@@ -69,6 +71,7 @@ static void reset_send_state(int send_ok) {
   s_send_ok = send_ok;
   s_configured = 1;
   s_reject_value = -1;
+  s_receipt_body = NULL;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -118,6 +121,7 @@ static void reset_send_state(int send_ok) {
   s_send_ok = send_ok;
   s_configured = 1;
   s_reject_value = -1;
+  s_receipt_body = NULL;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -157,13 +161,15 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
     pthread_cond_broadcast(&s_send_cond);
     while (s_block_send) pthread_cond_wait(&s_send_cond, &s_send_lock);
   }
-  int result = (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value)) ? 0 : -1;
+  int result = (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value) &&
+      (!s_receipt_body || edr_report_events_acknowledged(s_receipt_body, "test-endpoint", batch_id, header12, header_len, payload, payload_len))) ? 0 : -1;
   pthread_mutex_unlock(&s_send_lock);
   return result;
 #else
   s_send_calls++;
   if (payload_len >= 5u) s_send_value_calls[payload[4]]++;
-  return (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value)) ? 0 : -1;
+  return (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value) &&
+      (!s_receipt_body || edr_report_events_acknowledged(s_receipt_body, "test-endpoint", batch_id, header12, header_len, payload, payload_len))) ? 0 : -1;
 #endif
 }
 
@@ -2369,6 +2375,7 @@ static void test_retry_backoff_and_fairness_survive_reopen(void) {
   assert(edr_storage_queue_open(path) == EDR_OK);
   edr_storage_queue_test_set_delivery_time(now + 3);
   s_reject_value = -1;
+  s_receipt_body = NULL;
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xf1u) == 3u);
   assert(status_count(path, "pending") == 0);
@@ -2408,6 +2415,36 @@ static void test_terminal_rejection_allows_other_journals(void) {
   edr_storage_queue_close();
   edr_storage_queue_test_set_delivery_time(-1);
   remove(path);
+}
+
+static void test_queue_requires_bound_receipt_after_lost_response(void) {
+  char path[256], hash[65], receipt[1024];
+  uint8_t wire[20];
+  int64_t now = (int64_t)time(NULL);
+  snprintf(path, sizeof(path), "edr-receipt-queue-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(wire, 0xb9u);
+  assert(edr_sha256_hex(wire, sizeof(wire), hash) == 0);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enqueue("receipt-batch", wire, sizeof(wire), 0, 2) == EDR_OK);
+  reset_send_state(0); /* server response never arrived */
+  edr_storage_queue_test_set_delivery_time(now);
+  edr_storage_queue_poll_drain();
+  assert(status_count(path, "pending") == 1);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  reset_send_state(1); s_receipt_body = "{}"; /* HTTP success without a receipt */
+  edr_storage_queue_test_set_delivery_time(now + 301);
+  edr_storage_queue_poll_drain();
+  assert(status_count(path, "pending") == 1);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  snprintf(receipt, sizeof(receipt),
+           "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"ack\":{\"version\":1,\"state\":\"durable\","
+           "\"endpoint_id\":\"test-endpoint\",\"batch_id\":\"receipt-batch\",\"payload_sha256\":\"%s\"}}}", hash);
+  s_receipt_body = receipt;
+  edr_storage_queue_test_set_delivery_time(now + 602);
+  edr_storage_queue_poll_drain();
+  assert(status_count(path, "pending") == 0);
+  edr_storage_queue_close(); edr_storage_queue_test_set_delivery_time(-1);
+  s_receipt_body = NULL; remove(path);
 }
 
 static void test_unconfigured_transport_preserves_retry_budget(void) {
@@ -2464,6 +2501,7 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
   assert(edr_storage_queue_open(path) == EDR_OK);
   s_configured = 1;
   s_reject_value = -1;
+  s_receipt_body = NULL;
   s_defer_during_send = 1;
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xcau) == 1u && send_calls_for(0xcbu) == 0u);
@@ -2984,6 +3022,7 @@ int main(void) {
   test_terminal_journal_durable_commits_and_exact_replay();
   test_terminal_rejection_allows_other_journals();
   test_retry_backoff_and_fairness_survive_reopen();
+  test_queue_requires_bound_receipt_after_lost_response();
   test_unconfigured_transport_preserves_retry_budget();
   test_budget_deferral_preserves_ordinary_retry_allowance();
   test_budget_deferral_preserves_terminal_frames();

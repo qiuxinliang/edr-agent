@@ -533,6 +533,7 @@ set(EDR_AGENT_SOURCES
   third_party/nanopb/pb_decode.c
   src/transport/event_batch.c
   src/transport/command_result_json.c
+  src/transport/report_events_ack.c
   src/transport/health_upload.c
   src/transport/ingest_http.c
   src/transport/request_signing.c

@@ -769,6 +769,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/transport/event_batch.c
+  ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
   ${CMAKE_SOURCE_DIR}/src/transport/health_upload.c
   ${CMAKE_SOURCE_DIR}/src/transport/ingest_http.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c
@@ -896,7 +897,10 @@ if(SQLite3_FOUND)
     ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
     ${CMAKE_SOURCE_DIR}/src/command/sha256.c
     ${CMAKE_SOURCE_DIR}/src/core/time_util.c)
-  target_include_directories(test_storage_queue_sqlite PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_sources(test_storage_queue_sqlite PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_storage_queue_sqlite PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_storage_queue_sqlite PRIVATE EDR_HAVE_SQLITE=1 EDR_STORAGE_QUEUE_TESTING=1)
   if(TARGET SQLite3::SQLite3)
     target_link_libraries(test_storage_queue_sqlite PRIVATE SQLite3::SQLite3 Threads::Threads)
@@ -1639,3 +1643,13 @@ if(UNIX AND TARGET forensic_collector)
     COMMAND ${CMAKE_COMMAND} -E env "BIN=$<TARGET_FILE:forensic_collector>"
       ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/forensic_collector/test_bundle.py)
 endif()
+
+add_executable(test_report_events_ack test_report_events_ack.c
+  ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_report_events_ack PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_report_events_ack)
+add_test(NAME report_events_ack_contract COMMAND test_report_events_ack
+  ${CMAKE_SOURCE_DIR}/tests/testdata/report_events_ack_v1.json)

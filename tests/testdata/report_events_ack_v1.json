@@ -1,0 +1,13 @@
+{
+  "code": "OK",
+  "data": {
+    "accepted": true,
+    "ack": {
+      "version": 1,
+      "state": "durable",
+      "endpoint_id": "test-endpoint",
+      "batch_id": "test-batch",
+      "payload_sha256": "d5320cff5e58ccd2feb8df2109a207733ff47e6b52f19aec6fbc02f7aa803d04"
+    }
+  }
+}
