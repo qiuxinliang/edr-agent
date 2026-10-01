@@ -50,6 +50,7 @@ static void test_sleep_ms(unsigned milliseconds) {
 
 static int s_send_ok;
 static int s_configured = 1;
+static int s_reject_value = -1;
 static int s_telemetry_deferred;
 static int s_defer_during_send;
 static unsigned s_send_calls;
@@ -67,6 +68,7 @@ static void reset_send_state(int send_ok) {
   pthread_mutex_lock(&s_send_lock);
   s_send_ok = send_ok;
   s_configured = 1;
+  s_reject_value = -1;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -115,6 +117,7 @@ static unsigned total_send_calls(void) {
 static void reset_send_state(int send_ok) {
   s_send_ok = send_ok;
   s_configured = 1;
+  s_reject_value = -1;
   s_telemetry_deferred = s_defer_during_send = 0;
   s_send_calls = 0u;
   memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
@@ -154,13 +157,13 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
     pthread_cond_broadcast(&s_send_cond);
     while (s_block_send) pthread_cond_wait(&s_send_cond, &s_send_lock);
   }
-  int result = s_send_ok ? 0 : -1;
+  int result = (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value)) ? 0 : -1;
   pthread_mutex_unlock(&s_send_lock);
   return result;
 #else
   s_send_calls++;
   if (payload_len >= 5u) s_send_value_calls[payload[4]]++;
-  return s_send_ok ? 0 : -1;
+  return (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value)) ? 0 : -1;
 #endif
 }
 
@@ -791,7 +794,9 @@ static void test_terminal_selected_frame_retry_then_ack(void) {
   edr_storage_queue_close();
   assert(edr_storage_queue_open(path) == EDR_OK);
   reset_send_state(1);
+  edr_storage_queue_test_set_delivery_time((int64_t)time(NULL) + 301);
   edr_storage_queue_poll_drain();
+  edr_storage_queue_test_set_delivery_time(-1);
   assert(send_calls_for(0x75u) == 1u && send_calls_for(0x76u) == 1u);
   assert(terminal_journal_state_is(path, "selected-frame", "completed"));
   edr_storage_queue_close();
@@ -1546,6 +1551,7 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   uint8_t intent[20], source[20], combined[20];
   EdrEnforcementTerminalJournalMetrics metrics;
   snprintf(path, sizeof(path), "edr-terminal-journal-final-retry-%ld.db", (long)TEST_PID);
+  edr_storage_queue_test_set_delivery_time(-1);
   (void)remove(path);
   make_wire(intent, 0xa1u);
   make_wire(source, 0xa2u);
@@ -1568,6 +1574,7 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   assert(edr_storage_queue_open(path) == EDR_OK);
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xa2u) == 1u);
+  edr_storage_queue_test_set_delivery_time((int64_t)time(NULL) + 2);
   assert(terminal_journal_frame_retry_count(path, "final-retry", 1) == 1);
   assert(terminal_journal_state_is(path, "final-retry", "ready"));
 
@@ -1605,6 +1612,7 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   edr_storage_queue_poll_drain();
   assert(total_send_calls() == 0u);
   edr_storage_queue_close();
+  edr_storage_queue_test_set_delivery_time(-1);
   (void)remove(path);
 }
 
@@ -2039,7 +2047,7 @@ static void test_p0_source_only_retry_retention_corruption_and_identity(void) {
    * stays an integer and the source is still selected; no implicit terminal
    * policy may convert this capability assertion into a dead letter. */
   sqlite_exec_path(path,
-                   "UPDATE event_queue SET retry_count=9223372036854775807 "
+                   "UPDATE event_queue SET next_retry_at=0,retry_count=9223372036854775807 "
                    "WHERE batch_id='source-only-retained-batch';");
   assert(edr_storage_queue_open(path) == EDR_OK);
   reset_send_state(0);
@@ -2052,7 +2060,7 @@ static void test_p0_source_only_retry_retention_corruption_and_identity(void) {
   /* Retention only deletes ordinary rows / terminals; an aged severity-2 row
    * remains replayable until an acknowledged transport deletes it. */
   sqlite_exec_path(path,
-                   "UPDATE event_queue SET created_at=1 WHERE batch_id='source-only-retained-batch';");
+                   "UPDATE event_queue SET next_retry_at=0,created_at=1 WHERE batch_id='source-only-retained-batch';");
   assert(edr_storage_queue_open(path) == EDR_OK);
   edr_storage_queue_test_run_cleanup();
   assert(status_count(path, "pending") == 1);
@@ -2311,6 +2319,97 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
 }
 #endif
 
+static void test_retry_backoff_and_fairness_survive_reopen(void) {
+  char path[256];
+  uint8_t low[20], poison[20], high[20];
+  const int64_t now = (int64_t)time(NULL);
+  snprintf(path, sizeof(path), "edr-queue-fairness-%ld.db", (long)TEST_PID);
+  remove(path);
+  /* Upgrade a real pre-deadline database, preserving its records and identity. */
+  sqlite_exec_path(path, "CREATE TABLE event_queue (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "batch_id TEXT NOT NULL UNIQUE,payload BLOB NOT NULL,created_at INTEGER NOT NULL,"
+                        "compressed INTEGER NOT NULL DEFAULT 0,severity INTEGER NOT NULL DEFAULT 0,"
+                        "retry_count INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',"
+                        "terminal_reason TEXT NOT NULL DEFAULT '',terminal_at INTEGER NOT NULL DEFAULT 0);");
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  make_wire(low, 0xf0u); make_wire(poison, 0xf1u); make_wire(high, 0xf2u);
+  assert(edr_storage_queue_enqueue("old-low", low, sizeof(low), 0, 0) == EDR_OK);
+  assert(edr_storage_queue_enqueue("poison", poison, sizeof(poison), 0, 2) == EDR_OK);
+  for (int i = 0; i < 16; ++i) {
+    char id[32]; snprintf(id, sizeof(id), "new-high-%d", i);
+    assert(edr_storage_queue_enqueue(id, high, sizeof(high), 0, 2) == EDR_OK);
+  }
+  reset_send_state(1);
+  s_reject_value = 0xf1;
+  edr_storage_queue_test_set_delivery_time(now);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xf1u) == 1u);
+  assert(batch_retry_count(path, "poison") == 1);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xf1u) == 1u); /* reopen does not defeat backoff */
+  assert(send_calls_for(0xf0u) == 1u); /* progress within eight eligible selections */
+  for (int i = 0; i < 3; ++i) {
+    edr_storage_queue_close();
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    edr_storage_queue_poll_drain();
+  }
+  assert(send_calls_for(0xf2u) == 16u);
+  assert(status_count(path, "pending") == 1);
+  assert(edr_storage_queue_pending_count() == 1u); /* delayed is not empty */
+  assert(status_count(path, "dead_letter") == 0);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_test_set_delivery_time(now + 1);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xf1u) == 2u);
+  assert(batch_retry_count(path, "poison") == 2); /* protected despite MAX_RETRIES=1 */
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_test_set_delivery_time(now + 3);
+  s_reject_value = -1;
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xf1u) == 3u);
+  assert(status_count(path, "pending") == 0);
+  edr_storage_queue_close();
+  edr_storage_queue_test_set_delivery_time(-1);
+  remove(path);
+}
+
+static void test_terminal_rejection_allows_other_journals(void) {
+  char path[256];
+  uint8_t intent[20], bad[20], good[20];
+  snprintf(path, sizeof(path), "edr-terminal-fairness-%ld.db", (long)TEST_PID);
+  remove(path);
+  make_wire(intent, 0xd0u); make_wire(bad, 0xd1u); make_wire(good, 0xd2u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  for (int i = 0; i < 2; ++i) {
+    const char *key = i ? "good-journal" : "bad-journal";
+    const char *src = i ? "good-source" : "bad-source";
+    const char *combined = i ? "good-combined" : "bad-combined";
+    assert(edr_storage_queue_enforcement_terminal_precreate(
+               key, key, "R-TERMINAL", key, key, intent, sizeof(intent)) ==
+           EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+    assert(edr_storage_queue_enforcement_terminal_update(
+               key, src, i ? good : bad, sizeof(good), combined, good, sizeof(good)) == EDR_OK);
+  }
+  reset_send_state(1);
+  s_reject_value = 0xd1;
+  edr_storage_queue_test_set_delivery_time((int64_t)time(NULL));
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xd1u) == 1u);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xd1u) == 1u);
+  assert(terminal_journal_state_is(path, "bad-journal", "ready"));
+  assert(terminal_journal_state_is(path, "good-journal", "completed"));
+  edr_storage_queue_close();
+  edr_storage_queue_test_set_delivery_time(-1);
+  remove(path);
+}
+
 static void test_unconfigured_transport_preserves_retry_budget(void) {
   for (int severity = 0; severity <= 2; ++severity) {
     char path[256];
@@ -2364,6 +2463,7 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
   edr_storage_queue_close();
   assert(edr_storage_queue_open(path) == EDR_OK);
   s_configured = 1;
+  s_reject_value = -1;
   s_defer_during_send = 1;
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xcau) == 1u && send_calls_for(0xcbu) == 0u);
@@ -2882,6 +2982,8 @@ int main(void) {
   edr_storage_queue_close();
   (void)remove(path);
   test_terminal_journal_durable_commits_and_exact_replay();
+  test_terminal_rejection_allows_other_journals();
+  test_retry_backoff_and_fairness_survive_reopen();
   test_unconfigured_transport_preserves_retry_budget();
   test_budget_deferral_preserves_ordinary_retry_allowance();
   test_budget_deferral_preserves_terminal_frames();

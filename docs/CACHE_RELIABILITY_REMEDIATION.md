@@ -16,7 +16,7 @@ Order: R04, R02, R03, R08, R05, R06, R01, R07.
 | --- | --- | --- |
 | R04 | Atomic primary + LKG persistence; preserve parsed local fields and never serialize runtime credentials. Persist policy identity and use its sequence as an additional rollback floor. | Local Agent build; config restart/LKG/long-string/secret/signature-override regression; installer config and remote status contracts passed. |
 | R02 | Unconfigured polling only performs normal retention maintenance; event and terminal retry counters require an attempted send. | SQLite contract passed: severities 0/1/2 remain pending with zero attempts/retries across reopen, then acknowledge after configuration; terminal frames and budget deferral also covered. |
-| R03 | One rejected record must not indefinitely block eligible records. | Pending |
+| R03 | Durable exponential backoff (1–300 seconds); every eighth event selection uses oldest eligible ID. Terminal journals defer failed rows using persisted error/time/counters. | SQLite contract: legacy schema upgrade and reopen, poison severity-2 retained, lower priority progresses within eight selections, independent journals progress. |
 | R08 | Local acknowledgement must match durable backend acceptance. | Pending |
 | R05 | Resource exhaustion must preserve valid pending records. | Pending |
 | R06 | Define and observe logical capacity, physical usage and retention separately. | Pending |
@@ -46,3 +46,13 @@ it is not a count of HTTP requests (the transport can reject locally or retry
 internally). Unconfigured and budget/circuit-deferred states do not consume that
 budget. Existing counters are retained for compatibility; historical inflated
 values are not silently reset because genuine failures cannot be distinguished.
+
+R03 scheduling: priority applies among due rows. A failed event becomes due after
+1, 2, 4, ... seconds, capped at 300 seconds. Reopen preserves the deadline;
+clock rollback beyond the cap permits a fresh attempt. A fair selection after
+seven priority selections serves the oldest eligible ID. With transport available,
+one poison source cannot monopolize subsequent polls. End-to-end latency still
+depends on HTTP timeout, circuit backoff and the number of older eligible rows.
+A non-acknowledgement is retained/retried under the existing severity policy;
+no permanent HTTP rejection is interpreted as permission to delete protected
+source evidence. Backend contract rejection handling is covered under R08.

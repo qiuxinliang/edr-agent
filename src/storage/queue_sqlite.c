@@ -67,6 +67,7 @@ static int s_test_p0_latch_commit_active;
 static unsigned s_test_p0_deferred_commit_failures;
 static int s_test_p0_deferred_commit_active;
 static int64_t s_test_p0_deferred_time = -1;
+static int64_t s_test_delivery_time = -1;
 
 /* SQLite invokes this synchronously during COMMIT. Returning nonzero makes
  * SQLite abort the actual commit and roll the transaction back, exercising
@@ -157,6 +158,23 @@ void edr_storage_queue_configure(uint32_t max_db_mb, uint32_t retention_hours) {
   s_cfg_retention_hours = retention_hours;
   queue_state_unlock();
 }
+
+/* Wall-clock deadline is durable across restart. Clamp apparent future
+ * deadlines to one backoff cap when the clock moves backwards. */
+static sqlite3_int64 delivery_time(void) {
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  if (s_test_delivery_time >= 0) return s_test_delivery_time;
+#endif
+  return (sqlite3_int64)time(NULL);
+}
+#ifdef EDR_STORAGE_QUEUE_TESTING
+void edr_storage_queue_test_set_delivery_time(int64_t seconds) {
+  queue_state_lock();
+  s_test_delivery_time = seconds;
+  queue_state_unlock();
+}
+#endif
+static unsigned s_delivery_priority_streak;
 
 static int max_retry_limit(void) {
   static int cached = -999;
@@ -898,8 +916,10 @@ static void bump_selected_retry(sqlite3 *db, sqlite3_int64 id, const char *batch
    * SQLite promote an overflowing signed INTEGER to REAL, which would make a
    * future exact replay / audit query ambiguous. */
   const char *sql = "UPDATE event_queue SET retry_count=CASE "
-                    "WHEN retry_count<9223372036854775807 THEN retry_count+1 ELSE retry_count END "
-                    "WHERE id=? AND batch_id=? AND payload=? AND status='pending';";
+                    "WHEN retry_count<9223372036854775807 THEN retry_count+1 ELSE retry_count END, "
+                    "next_retry_at=?4 + CASE WHEN retry_count>=8 THEN 300 "
+                    "WHEN retry_count<0 THEN 1 ELSE (1 << retry_count) END "
+                    "WHERE id=?1 AND batch_id=?2 AND payload=?3 AND status='pending';";
   if (!db || !batch_id || !payload || payload_len <= 0 ||
       sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
     return;
@@ -907,6 +927,7 @@ static void bump_selected_retry(sqlite3 *db, sqlite3_int64 id, const char *batch
   sqlite3_bind_int64(st, 1, id);
   sqlite3_bind_text(st, 2, batch_id, -1, SQLITE_TRANSIENT);
   sqlite3_bind_blob(st, 3, payload, payload_len, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 4, delivery_time());
   (void)sqlite3_step(st);
   sqlite3_finalize(st);
 }
@@ -1045,21 +1066,27 @@ static int drain_one_row(void) {
   sqlite3 *selected_db = s_db;
   uint64_t selected_generation = s_db_generation;
   sqlite3_stmt *st = NULL;
-  const char *sql = "SELECT id, batch_id, payload, retry_count, severity FROM event_queue WHERE status='pending' "
-                    "ORDER BY severity DESC, id ASC LIMIT 1;";
+  char sql[512];
+  /* Seven priority selections followed by an oldest-eligible selection prevent
+   * an ongoing high-priority arrival stream from starving an older batch. */
+  int fair_turn = s_delivery_priority_streak >= 7u;
+  snprintf(sql, sizeof(sql),
+           "SELECT id,batch_id,payload,retry_count,severity FROM event_queue "
+           "WHERE status='pending' AND (next_retry_at<=?1 OR next_retry_at>?1+300) "
+           "ORDER BY %s LIMIT 1;", fair_turn ? "id ASC" : "severity DESC,id ASC");
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     queue_state_unlock();
-    return 1;
+    return 2;
   }
+  sqlite3_bind_int64(st, 1, delivery_time());
   int step = sqlite3_step(st);
   if (step != SQLITE_ROW) {
     sqlite3_finalize(st);
-    if (step == SQLITE_DONE) {
-      s_pending = 0;
-    }
+    /* No due row does not mean the durable pending queue is empty. */
     queue_state_unlock();
-    return 1;
+    return step == SQLITE_DONE ? 1 : 2;
   }
+  s_delivery_priority_streak = fair_turn ? 0u : s_delivery_priority_streak + 1u;
 
   sqlite3_int64 id = sqlite3_column_int64(st, 0);
   const unsigned char *batch_id = sqlite3_column_text(st, 1);
@@ -2418,6 +2445,28 @@ EdrError edr_storage_queue_open(const char *path) {
   (void)exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN severity INTEGER NOT NULL DEFAULT 0;");
   (void)exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN terminal_reason TEXT NOT NULL DEFAULT '';");
   (void)exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN terminal_at INTEGER NOT NULL DEFAULT 0;");
+  {
+    sqlite3_stmt *column = NULL;
+    int present = 0, rc;
+    rc = sqlite3_prepare_v2(s_db, "PRAGMA table_info(event_queue);", -1, &column, NULL);
+    if (rc == SQLITE_OK) {
+      while ((rc = sqlite3_step(column)) == SQLITE_ROW) {
+        const unsigned char *name = sqlite3_column_text(column, 1);
+        if (name && !strcmp((const char *)name, "next_retry_at")) present = 1;
+      }
+    }
+    sqlite3_finalize(column);
+    if (rc != SQLITE_DONE ||
+        (!present && exec_simple(s_db, "ALTER TABLE event_queue ADD COLUMN "
+                                     "next_retry_at INTEGER NOT NULL DEFAULT 0;") != SQLITE_OK) ||
+        exec_simple(s_db, "CREATE INDEX IF NOT EXISTS idx_event_queue_due "
+                         "ON event_queue(status,next_retry_at);") != SQLITE_OK) {
+      fprintf(stderr, "[queue] retry deadline migration failed\n");
+      sqlite3_close(s_db); s_db = NULL;
+      queue_lock_release(); queue_state_unlock();
+      return EDR_ERR_SQLITE_WRITE;
+    }
+  }
   /* Databases created before the dedicated P0 source-only lane stored only
    * 0/1. Preserve those exact values explicitly; any other historical value
    * is an unknown priority contract and must fail open rather than be silently
@@ -3927,7 +3976,7 @@ static void terminal_journal_bump_intent_retry_locked(sqlite3 *db, sqlite3_int64
       "AND intent_acked=0 AND intent_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(st, 1, delivery_time());
     sqlite3_bind_int64(st, 2, id);
     sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 4, wire, wire_len, SQLITE_TRANSIENT);
@@ -3972,7 +4021,7 @@ static void terminal_journal_bump_frame_retry_locked(sqlite3 *db, sqlite3_int64 
                           "AND combined_acked=0 AND combined_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(st, 1, delivery_time());
     sqlite3_bind_int64(st, 2, id);
     sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 4, wire, wire_len, SQLITE_TRANSIENT);
@@ -4086,20 +4135,26 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
  * this drain pass). Allocation/SQLite read failures preserve durable state;
  * only impossible durable metadata or an invalid persisted wire becomes
  * terminally failed. */
+#define TERMINAL_RETRY_DUE \
+  " AND (last_error NOT IN ('intent_transport_failed','source_transport_failed','combined_transport_failed') " \
+  "OR updated_at>?1 OR updated_at<=?1-CASE " \
+  "WHEN MAX(intent_retry_count,source_retry_count,combined_retry_count)>8 THEN 300 " \
+  "ELSE (1 << MAX(0,MAX(intent_retry_count,source_retry_count,combined_retry_count)-1)) END) "
+
 static int drain_one_terminal_journal_frame(void) {
   static const char *const select_sql[3] = {
       "SELECT id,idempotency_key,intent_batch_id,intent_wire "
       "FROM enforcement_terminal_journal j "
       "WHERE state IN ('pending_intent','outcome_unknown') AND intent_acked=0 "
-      "AND intent_wire IS NOT NULL AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "AND intent_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.intent_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;",
       "SELECT id,idempotency_key,source_batch_id,source_wire "
       "FROM enforcement_terminal_journal j WHERE state='ready' AND source_acked=0 "
-      "AND source_wire IS NOT NULL AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "AND source_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.source_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;",
       "SELECT id,idempotency_key,combined_batch_id,combined_wire "
       "FROM enforcement_terminal_journal j WHERE state='ready' AND combined_acked=0 "
-      "AND combined_wire IS NOT NULL AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "AND combined_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.combined_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;"};
   sqlite3_stmt *st = NULL;
   sqlite3 *selected_db;
@@ -4129,6 +4184,7 @@ static int drain_one_terminal_journal_frame(void) {
       queue_state_unlock();
       return 2;
     }
+    sqlite3_bind_int64(st, 1, delivery_time());
     int step_rc = sqlite3_step(st);
     if (step_rc == SQLITE_ROW) {
       const unsigned char *stored_key = sqlite3_column_text(st, 1);
