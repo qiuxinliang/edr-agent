@@ -1814,6 +1814,23 @@ static void test_incremental_reclaim_is_bounded_and_preserves_evidence(void) {
   for (unsigned pass = 0; pass < 2u; ++pass) {
     s_test_monotonic_ns += 61000000000ull;
     edr_local_evidence_cache_poll_maintenance();
+    int64_t remaining = sqlite_scalar_integer(db, "PRAGMA freelist_count;");
+    int64_t cycle_free = remaining;
+    uint64_t runs;
+    edr_local_evidence_cache_get_status(&status);
+    runs = status.maintenance_runs;
+    for (unsigned slice = 0; slice < 16u; ++slice) {
+      edr_local_evidence_cache_poll_maintenance();
+      int64_t next = sqlite_scalar_integer(db, "PRAGMA freelist_count;");
+      assert(remaining - next >= 0 && remaining - next <= 256);
+      remaining = next;
+    }
+    edr_local_evidence_cache_get_status(&status);
+    assert(status.maintenance_runs == runs);
+    assert(cycle_free - remaining <= 4096);
+    for (unsigned extra = 0; extra < 20u; ++extra)
+      edr_local_evidence_cache_poll_maintenance();
+    assert(sqlite_scalar_integer(db, "PRAGMA freelist_count;") == remaining);
   }
   edr_local_evidence_cache_get_status(&status);
   assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
@@ -2081,6 +2098,13 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
   edr_local_evidence_cache_poll_maintenance();
   edr_local_evidence_cache_get_status(&after);
   assert(after.db_capacity_evicted > before.db_capacity_evicted);
+  /* Routine reclamation now yields before shrinking; complete its bounded
+   * slices at the same clock time, without rerunning retention or GC. */
+  uint64_t runs = after.maintenance_runs;
+  for (unsigned slice = 0; slice < 16u; ++slice)
+    edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.maintenance_runs == runs);
   assert(after.db_bytes + after.wal_bytes < 960u * 1024u);
   assert(sqlite_table_count(db, "p0_candidates") == 1u);
   assert(sqlite_table_count(db, "candidate_context_refs") == 1u);
@@ -6598,6 +6622,189 @@ static void test_maintenance_failure_retains_cause_and_retry_interval(void) {
   cleanup_test_sqlite_path(path);
 }
 
+static void sliced_reclaim_padding(sqlite3 *db) {
+  compact_exec(db,
+      "CREATE TABLE slice_padding(payload BLOB);"
+      "INSERT INTO slice_padding VALUES(zeroblob(4194304));"
+      "DROP TABLE slice_padding;PRAGMA wal_checkpoint(TRUNCATE);");
+  assert(compact_scalar(db, "PRAGMA freelist_count") > 1024);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI sliced_cache_consumer(void *unused) {
+#else
+static void *sliced_cache_consumer(void *unused) {
+#endif
+  (void)unused;
+  char query[4096];
+  EdrEvidenceCacheStatus status;
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_open);
+  assert(edr_local_evidence_cache_query_json("{\"limit\":1}", query, sizeof(query)) == 0);
+  edr_local_evidence_cache_record_command_result(
+      "between-slices", "test", "complete", 0, 0, "consumer entered owner", "[]");
+  return 0;
+}
+
+static void run_sliced_cache_consumer(void) {
+#if defined(_WIN32)
+  HANDLE thread = CreateThread(NULL, 0, sliced_cache_consumer, NULL, 0, NULL);
+  assert(thread != NULL);
+  assert(WaitForSingleObject(thread, 5000) == WAIT_OBJECT_0);
+  CloseHandle(thread);
+#else
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, sliced_cache_consumer, NULL) == 0);
+  assert(pthread_join(thread, NULL) == 0);
+#endif
+}
+
+/* Real owner calls on both sides of each yield: full projections survive in
+ * formats 0/1/2, another thread can read/write, and new expiry work waits for
+ * the next cycle instead of being repeated by each page slice. */
+static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
+  for (int format = 0; format <= 2; ++format) {
+    char path[512]; sqlite3 *db = NULL;
+    EdrEvidenceCacheStatus before, after;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    reclaim_fixture(path, format);
+    assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sliced_reclaim_padding(db);
+    sqlite3_int64 initial = compact_scalar(db, "PRAGMA freelist_count");
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    edr_local_evidence_cache_get_status(&before);
+    compact_exec(db, "INSERT INTO file_evidence(endpoint_id,path,last_seen_ns) VALUES('slice','next-cycle',1);");
+    for (unsigned slice = 0; slice < 16; ++slice) {
+      sqlite3_int64 old = compact_scalar(db, "PRAGMA freelist_count");
+      edr_local_evidence_cache_poll_maintenance();
+      sqlite3_int64 next = compact_scalar(db, "PRAGMA freelist_count");
+      assert(old - next >= 0 && old - next <= 256);
+      run_sliced_cache_consumer();
+      compact_assert_projection(db);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM file_evidence WHERE path='next-cycle'") == 1);
+    }
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == before.maintenance_runs);
+    assert(after.db_capacity_evicted == before.db_capacity_evicted);
+    assert(after.db_bytes + after.wal_bytes < 1048576);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM command_results WHERE command_id='between-slices' AND detail='consumer entered owner'") == 1);
+
+    /* A writer makes the next slice BUSY. Abandon this cycle with its cause;
+     * 100 immediate polls may not retry even when the blocker disappears. */
+    sliced_reclaim_padding(db);
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM file_evidence WHERE path='next-cycle'") == 0);
+    s_test_monotonic_ns += UINT64_C(120000000000);
+    compact_exec(db, "BEGIN IMMEDIATE;");
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&before);
+    assert(strstr(before.last_error, "incremental vacuum") && strstr(before.last_error, "sqlite=5/5"));
+    compact_exec(db, "ROLLBACK;");
+    initial = compact_scalar(db, "PRAGMA freelist_count");
+    for (unsigned i = 0; i < 100; ++i) edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == before.maintenance_runs);
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_poll_maintenance();
+    assert(initial - compact_scalar(db, "PRAGMA freelist_count") == 256);
+
+    /* A pinned reader allows the vacuum commit but prevents WAL truncation.
+     * Preserve that progress and report checkpoint failure without hot retry. */
+    compact_exec(db, "BEGIN;SELECT COUNT(*) FROM p0_candidates;");
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&before);
+    assert(strstr(before.last_error, "checkpoint") && strstr(before.last_error, "sqlite=5/5"));
+    compact_exec(db, "ROLLBACK;");
+    compact_assert_projection(db);
+    initial = compact_scalar(db, "PRAGMA freelist_count");
+    for (unsigned i = 0; i < 100; ++i) edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == before.maintenance_runs);
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_poll_maintenance();
+
+    /* The remaining DB is still over its hard cap. A required candidate write
+     * must synchronously reclaim space, cancel the old continuation, and commit. */
+    EdrBehaviorRecord candidate;
+    struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+    init_record(&candidate, EDR_EVENT_NET_CONNECT);
+    candidate.priority = 3; candidate.pid = 74501;
+    candidate.event_time_ns = (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
+    set_record_generation(&candidate, 74501);
+    snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "ep-slice");
+    snprintf(candidate.event_id, sizeof(candidate.event_id), "slice-required-candidate");
+    snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.11");
+    candidate.net_dport = 445;
+    edr_local_evidence_cache_get_status(&before);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == before.maintenance_runs + 1);
+    assert(after.candidate_admitted == before.candidate_admitted + 1);
+    assert(after.candidate_rejected == before.candidate_rejected);
+    assert(after.db_budget_dropped == before.db_budget_dropped);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM migration_expected EXCEPT SELECT * FROM materialized_artifacts)") == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM materialized_artifacts EXCEPT SELECT * FROM migration_expected)") == 1);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts a JOIN p0_candidates c ON a.candidate_id=c.candidate_id WHERE c.endpoint_id='ep-slice' AND a.artifact_type='p0_context_bundle'") == 1);
+    /* Refill free pages without another scheduled cycle: a stale continuation
+     * would shrink this fixture despite synchronous admission having finished. */
+    sliced_reclaim_padding(db);
+    initial = compact_scalar(db, "PRAGMA freelist_count");
+    edr_local_evidence_cache_poll_maintenance();
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.db_bytes + after.wal_bytes <= 1048576);
+    assert(sqlite_table_count(path, "p0_candidates") == 2);
+    edr_local_evidence_cache_close();
+    s_test_monotonic_ns = UINT64_C(1000000000);
+    cleanup_test_sqlite_path(path);
+  }
+}
+
+static void sliced_reclaim_crash_child(const char *path, int phase) {
+  sqlite3 *db = NULL;
+  assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  sliced_reclaim_padding(db);
+  s_test_monotonic_ns += UINT64_C(60000000000);
+  edr_local_evidence_cache_poll_maintenance();
+  if (phase) edr_local_evidence_cache_poll_maintenance();
+  migration_crash_commit(NULL); /* Real process exit before/after a slice. */
+}
+
+static void test_sliced_reclaim_process_restart(void) {
+  for (int format = 0; format <= 2; ++format) {
+    for (int phase = 0; phase <= 1; ++phase) {
+      char path[512]; sqlite3 *db = NULL;
+      assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+      reclaim_fixture(path, format);
+      run_cache_crash_child(path, "--crash-cache-slice", phase);
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      compact_assert_projection(db);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+      assert(sqlite3_close(db) == SQLITE_OK);
+      assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+      EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+      assert(status.db_bytes + status.wal_bytes <= 1048576);
+      edr_local_evidence_cache_close();
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      compact_assert_projection(db);
+      assert(sqlite3_close(db) == SQLITE_OK);
+      cleanup_test_sqlite_path(path);
+    }
+  }
+}
+
 static void test_context_fact_collection_preserves_references(void) {
   for (int format = 0; format <= 2; ++format) {
     char path[512];
@@ -7058,6 +7265,9 @@ int main(int argc, char **argv) {
   if (argc == 4 && strcmp(argv[1], "--crash-cache-reclaim") == 0) {
     reclaim_crash_child(argv[2], atoi(argv[3])); return 1;
   }
+  if (argc == 4 && strcmp(argv[1], "--crash-cache-slice") == 0) {
+    sliced_reclaim_crash_child(argv[2], atoi(argv[3])); return 1;
+  }
 #else
   (void)argc; (void)argv;
 #endif
@@ -7077,6 +7287,8 @@ int main(int argc, char **argv) {
   test_context_batch_reclaim_recovery_and_scope();
   test_context_batch_reclaim_limit();
   test_maintenance_failure_retains_cause_and_retry_interval();
+  test_sliced_reclaim_yields_preserves_projection_and_backoff();
+  test_sliced_reclaim_process_restart();
   test_payload_retention_boundaries_and_projection();
   test_compact_runtime_replay_enrichment_and_failure();
   test_process_command_quality_survives_update_and_reopen();

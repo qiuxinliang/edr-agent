@@ -2304,7 +2304,10 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
 }
 
 #if defined(EDR_HAVE_SQLITE)
-static int sqlite_maintenance(void);
+/* Only physical reclamation is resumable. No row identities or SQLite
+ * statements survive a poll, and admission/startup can take over at any time. */
+static unsigned s_maintenance_reclaim_pages;
+static int sqlite_maintenance(int defer_reclaim);
 
 static int exec_sql(const char *sql) {
   char *err = NULL;
@@ -2613,7 +2616,7 @@ static int sqlite_size_budget_allow(void) {
   if (s_last_capacity_failure_ns == 0u ||
       now - s_last_capacity_failure_ns >= 10000000000ULL) {
     s_last_maintenance_ns = now;
-    int maintenance_result = sqlite_maintenance();
+    int maintenance_result = sqlite_maintenance(0);
     if (!db_size_over_limit()) {
       s_last_capacity_failure_ns = 0u;
       return 1;
@@ -4507,7 +4510,55 @@ static int sqlite_maintenance_checkpoint(int mode) {
   return rc == SQLITE_OK ? 0 : sqlite_maintenance_error("checkpoint", rc);
 }
 
-static int sqlite_maintenance(void) {
+static int sqlite_maintenance_reclaim(unsigned pages) {
+  char sql[64];
+  snprintf(sql, sizeof(sql), "PRAGMA incremental_vacuum(%u);", pages);
+  if (exec_sql(sql) != 0)
+    return sqlite_maintenance_error("incremental vacuum", sqlite3_errcode(s_db));
+  return sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE);
+}
+
+/* Called under the owner lock, once per preprocess turn. The caller releases
+ * the lock and returns to event processing before any subsequent slice. */
+static void sqlite_maintenance_reclaim_poll(void) {
+  sqlite3_stmt *st = NULL;
+  unsigned pages = s_maintenance_reclaim_pages < 256u
+                       ? s_maintenance_reclaim_pages : 256u;
+  int rc = sqlite3_prepare_v2(s_db, "PRAGMA freelist_count;", -1, &st, NULL);
+  if (rc == SQLITE_OK) rc = sqlite3_step(st);
+  if (rc != SQLITE_ROW) {
+    sqlite_maintenance_error("freelist query", rc);
+    sqlite3_finalize(st);
+    goto failed;
+  }
+  sqlite3_int64 free_pages = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  if (free_pages < 0) {
+    set_error("maintenance freelist query returned negative pages");
+    goto failed;
+  }
+  if ((sqlite3_uint64)free_pages < pages) pages = (unsigned)free_pages;
+  if (pages == 0u) {
+    s_maintenance_reclaim_pages = 0u;
+  } else {
+    if (sqlite_maintenance_reclaim(pages) != 0) goto failed;
+    s_maintenance_reclaim_pages -= pages;
+    if (free_pages == pages) s_maintenance_reclaim_pages = 0u;
+  }
+  goto finish;
+failed:
+  /* Restart from a fresh maintenance cycle after the existing minute backoff.
+   * A delayed slice must not turn failure into a per-event retry loop. */
+  s_maintenance_reclaim_pages = 0u;
+  s_last_maintenance_ns = edr_monotonic_ns();
+finish:
+  (void)sqlite3_db_release_memory(s_db);
+  (void)sqlite3_release_memory(0);
+  refresh_db_size_status();
+}
+
+static int sqlite_maintenance(int defer_reclaim) {
+  s_maintenance_reclaim_pages = 0u;
   if (!s_db) {
     set_error("maintenance database unavailable");
     return -1;
@@ -4580,14 +4631,11 @@ static int sqlite_maintenance(void) {
     if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
     refresh_db_size_status();
     if (s_status.db_bytes + s_status.wal_bytes > target) {
-      /* Reclaim at most 4096 free pages per maintenance call.
-       * The database is migrated to incremental mode before collectors start;
-       * runtime pressure must not rewrite the entire evidence database. */
-      if (exec_sql("PRAGMA incremental_vacuum(4096);") != 0) {
-        sqlite_maintenance_error("incremental vacuum", sqlite3_errcode(s_db));
-        goto failed;
-      }
-      if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
+      /* Preserve the 4096-page cycle budget. Routine maintenance yields before
+       * reclaiming 256 pages per later poll; startup and required admission
+       * retain synchronous recovery and the same physical capacity check. */
+      if (defer_reclaim) s_maintenance_reclaim_pages = 4096u;
+      else if (sqlite_maintenance_reclaim(4096u) != 0) goto failed;
     }
   } else {
     if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_PASSIVE) != 0) goto failed;
@@ -4598,6 +4646,7 @@ static int sqlite_maintenance(void) {
   }
   goto finish;
 failed:
+  s_maintenance_reclaim_pages = 0u;
   result = -1;
 finish:
   /* Each completed statement/batch stays committed. Failed attempts retain
@@ -4826,6 +4875,9 @@ void edr_local_evidence_cache_resolve_commands(const EdrBehaviorRecord *r,
 
 static void evidence_cache_close_locked(void) {
 #if defined(EDR_HAVE_SQLITE)
+  /* Completed slices are SQLite commits; remaining free pages are discovered
+   * by normal startup maintenance, with no durable scheduler state to replay. */
+  s_maintenance_reclaim_pages = 0u;
   if (s_db) {
     if (sqlite_flush_metrics(1) != 0) {
       uint64_t lost = 0u;
@@ -5021,7 +5073,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     evidence_cache_unlock();
     return -1;
   }
-  sqlite_maintenance();
+  sqlite_maintenance(0);
   evidence_cache_unlock();
   return 0;
 #else
@@ -5842,13 +5894,20 @@ done:
 void edr_local_evidence_cache_poll_maintenance(void) {
   uint64_t now = edr_monotonic_ns();
   evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  if (s_db && s_maintenance_reclaim_pages != 0u) {
+    sqlite_maintenance_reclaim_poll();
+    evidence_cache_unlock();
+    return;
+  }
+#endif
   if (now - s_last_maintenance_ns < 60000000000ULL) {
     evidence_cache_unlock();
     return;
   }
   s_last_maintenance_ns = now;
 #if defined(EDR_HAVE_SQLITE)
-  sqlite_maintenance();
+  sqlite_maintenance(1);
 #endif
   evidence_cache_unlock();
 }
