@@ -68,6 +68,7 @@ static unsigned s_test_p0_deferred_commit_failures;
 static int s_test_p0_deferred_commit_active;
 static int64_t s_test_p0_deferred_time = -1;
 static int64_t s_test_delivery_time = -1;
+static unsigned s_test_event_alloc_failures[2];
 
 /* SQLite invokes this synchronously during COMMIT. Returning nonzero makes
  * SQLite abort the actual commit and roll the transaction back, exercising
@@ -112,6 +113,7 @@ static uint64_t s_delivery_sent;
 static uint64_t s_delivery_acked;
 static uint64_t s_delivery_requeued;
 static uint64_t s_delivery_failed;
+static uint64_t s_delivery_resource_deferred;
 static uint64_t s_event_queue_metadata_corruption_failures;
 static uint64_t s_retention_evicted_rows;
 static uint64_t s_last_cleanup_ns;
@@ -450,6 +452,7 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   out->delivery_acked = s_delivery_acked;
   out->delivery_requeued = s_delivery_requeued;
   out->delivery_failed = s_delivery_failed;
+  out->delivery_resource_deferred = s_delivery_resource_deferred;
   out->event_queue_metadata_corruption_failures =
       s_event_queue_metadata_corruption_failures;
   out->retention_evicted_rows = s_retention_evicted_rows;
@@ -1057,6 +1060,25 @@ static void cleanup_expired_rows(void) {
 /**
  * 返回：0 已处理一行（成功删除、丢弃坏行、或失败已 bump_retry），1 无待处理行，2 上传失败应停止本轮连续 drain
  */
+#ifdef EDR_STORAGE_QUEUE_TESTING
+void edr_storage_queue_test_fail_event_alloc(unsigned kind, unsigned failures) {
+  queue_state_lock();
+  if (kind < 2u) s_test_event_alloc_failures[kind] = failures;
+  queue_state_unlock();
+}
+#endif
+static void *event_select_alloc(size_t size, unsigned kind) {
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  if (kind < 2u && s_test_event_alloc_failures[kind]) {
+    --s_test_event_alloc_failures[kind];
+    return NULL;
+  }
+#else
+  (void)kind;
+#endif
+  return malloc(size);
+}
+
 static int drain_one_row(void) {
   queue_state_lock();
   if (!s_db) {
@@ -1097,7 +1119,15 @@ static int drain_one_row(void) {
   int severity = sqlite3_column_int(st, 4);
   uint8_t *blob_copy = NULL;
   char *batch_id_copy = NULL;
+  int allocation_failed = 0;
   s_delivery_selected++;
+  if (sqlite3_errcode(s_db) == SQLITE_NOMEM) {
+    sqlite3_finalize(st);
+    s_delivery_resource_deferred++;
+    s_delivery_requeued++;
+    queue_state_unlock();
+    return 2;
+  }
   int metadata_invalid = !queue_sql_text_valid(batch_id, batch_id_len);
   if (metadata_invalid) {
     int quarantined;
@@ -1117,7 +1147,8 @@ static int drain_one_row(void) {
     return quarantined == 0 ? 0 : 2;
   }
   if (batch_id && batch_id_len > 0) {
-    batch_id_copy = (char *)malloc((size_t)batch_id_len + 1u);
+    batch_id_copy = (char *)event_select_alloc((size_t)batch_id_len + 1u, 0u);
+    if (!batch_id_copy) allocation_failed = 1;
     if (batch_id_copy) {
       memcpy(batch_id_copy, batch_id, (size_t)batch_id_len);
       batch_id_copy[batch_id_len] = '\0';
@@ -1126,12 +1157,23 @@ static int drain_one_row(void) {
   /* sqlite column pointers become invalid at finalize/reset. Copy while the
    * statement owns the row, then release SQLite before any transport I/O. */
   if (blob && blob_len > 0) {
-    blob_copy = (uint8_t *)malloc((size_t)blob_len);
+    blob_copy = (uint8_t *)event_select_alloc((size_t)blob_len, 1u);
+    if (!blob_copy) allocation_failed = 1;
     if (blob_copy) {
       memcpy(blob_copy, blob, (size_t)blob_len);
     }
   }
   sqlite3_finalize(st);
+  if (allocation_failed) {
+    /* A valid committed record is still owned by SQLite. Local OOM must not
+     * consume retry budget or quarantine/delete it as corrupt. */
+    free(batch_id_copy);
+    free(blob_copy);
+    s_delivery_resource_deferred++;
+    s_delivery_requeued++;
+    queue_state_unlock();
+    return 2;
+  }
 
   {
     int lim = max_retry_limit();
@@ -4041,17 +4083,14 @@ static void terminal_journal_note_selection_transient_locked(sqlite3 *db,
   sqlite3_stmt *st = NULL;
   const char *sql = frame_kind == 0
                         ? "UPDATE enforcement_terminal_journal SET "
-                          "intent_retry_count=intent_retry_count+1,"
                           "last_error='intent_selection_transient',updated_at=? "
                           "WHERE id=? AND state IN ('pending_intent','outcome_unknown') "
                           "AND intent_acked=0;"
                         : frame_kind == 1
                             ? "UPDATE enforcement_terminal_journal SET "
-                              "source_retry_count=source_retry_count+1,"
                               "last_error='source_selection_transient',updated_at=? "
                               "WHERE id=? AND state='ready' AND source_acked=0;"
                             : "UPDATE enforcement_terminal_journal SET "
-                              "combined_retry_count=combined_retry_count+1,"
                               "last_error='combined_selection_transient',updated_at=? "
                               "WHERE id=? AND state='ready' AND combined_acked=0;";
   if (!db || id <= 0 || frame_kind < 0 || frame_kind > 2) return;

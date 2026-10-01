@@ -214,6 +214,7 @@ typedef struct {
   uint64_t delivery_acked;
   uint64_t delivery_requeued;
   uint64_t delivery_failed;
+  uint64_t delivery_resource_deferred;
   /* Durable event_queue batch metadata that cannot safely cross SQLite TEXT
    * to the C-string transport boundary is terminally isolated by row id.
    * This is a process-lifetime counter; the row's status/reason is durable. */
@@ -265,6 +266,8 @@ void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
  * restores real time. The override is test-only and survives database reopen. */
 void edr_storage_queue_test_set_p0_deferred_time(int64_t unix_seconds);
 void edr_storage_queue_test_set_delivery_time(int64_t unix_seconds);
+/* kind: 0=batch ID copy, 1=payload copy. */
+void edr_storage_queue_test_fail_event_alloc(unsigned kind, unsigned failures);
 /* Simulates a checked journal ACK statement failure while the normal-row
  * delete is still in the enclosing terminal FULL transaction. */
 void edr_storage_queue_test_fail_next_terminal_ack_steps(unsigned count);

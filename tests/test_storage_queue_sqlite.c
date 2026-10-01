@@ -810,7 +810,7 @@ static void test_terminal_selected_frame_retry_then_ack(void) {
 }
 
 /* Each selected-frame copy allocation is transient. It must not turn a valid
- * durable final frame into `failed`: the state stays ready, the retry is
+ * durable final frame into `failed`: the state stays ready, the resource failure is
  * visible, and a later allocation-successful poll sends the same frame. */
 static void test_terminal_selected_frame_allocation_failures_preserve_retry(void) {
   for (unsigned kind = 0u; kind < 3u; ++kind) {
@@ -850,7 +850,7 @@ static void test_terminal_selected_frame_allocation_failures_preserve_retry(void
     edr_storage_queue_poll_drain();
     assert(send_calls_for(source_value) == 0u && send_calls_for(combined_value) == 0u);
     assert(terminal_journal_state_is(path, key, "ready"));
-    assert(terminal_journal_frame_retry_count(path, key, 1) == 1);
+    assert(terminal_journal_frame_retry_count(path, key, 1) == 0);
     edr_storage_queue_enforcement_terminal_get_metrics(&after);
     assert(after.replay_selection_transient_failures ==
            before.replay_selection_transient_failures + 1u);
@@ -2447,6 +2447,33 @@ static void test_queue_requires_bound_receipt_after_lost_response(void) {
   s_receipt_body = NULL; remove(path);
 }
 
+static void test_event_selection_oom_preserves_durable_payload(void) {
+  for (unsigned kind = 0; kind < 2; ++kind) for (int severity = 0; severity <= 2; ++severity) {
+    char path[256]; uint8_t wire[20];
+    EdrStorageQueueCapacityMetrics before, after;
+    snprintf(path, sizeof(path), "edr-event-oom-%u-%d-%ld.db", kind, severity, (long)TEST_PID);
+    remove(path); make_wire(wire, (uint8_t)(0xa0 + severity));
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_enqueue("oom-batch", wire, sizeof(wire), 0, severity) == EDR_OK);
+    reset_send_state(1);
+    edr_storage_queue_get_capacity_metrics(&before);
+    edr_storage_queue_test_fail_event_alloc(kind, 1u);
+    edr_storage_queue_poll_drain();
+    assert(total_send_calls() == 0u);
+    assert(status_count(path, "pending") == 1);
+    assert(status_count(path, "dead_letter") == 0 && status_count(path, "corrupt") == 0);
+    assert(batch_retry_count(path, "oom-batch") == 0);
+    edr_storage_queue_get_capacity_metrics(&after);
+    assert(after.delivery_resource_deferred == before.delivery_resource_deferred + 1u);
+    assert(after.delivery_failed == before.delivery_failed);
+    edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+    edr_storage_queue_poll_drain();
+    assert(total_send_calls() == 1u && status_count(path, "pending") == 0);
+    assert(s_last_payload_len == sizeof(wire) && !memcmp(s_last_payload, wire, sizeof(wire)));
+    edr_storage_queue_close(); remove(path);
+  }
+}
+
 static void test_unconfigured_transport_preserves_retry_budget(void) {
   for (int severity = 0; severity <= 2; ++severity) {
     char path[256];
@@ -3023,6 +3050,7 @@ int main(void) {
   test_terminal_rejection_allows_other_journals();
   test_retry_backoff_and_fairness_survive_reopen();
   test_queue_requires_bound_receipt_after_lost_response();
+  test_event_selection_oom_preserves_durable_payload();
   test_unconfigured_transport_preserves_retry_budget();
   test_budget_deferral_preserves_ordinary_retry_allowance();
   test_budget_deferral_preserves_terminal_frames();

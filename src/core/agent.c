@@ -2968,7 +2968,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)terminal_journal_metrics.precreate_commit_failures);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
                  p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"p0_offline_queue_capacity\":{\"used_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
+                 ",\"p0_offline_queue_capacity\":{\"used_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu,\"resource_deferred\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
                  (unsigned long long)queue_capacity_metrics.used_bytes,
                  (unsigned long long)queue_capacity_metrics.max_bytes,
                  queue_capacity_metrics.utilization_bps,
@@ -2997,6 +2997,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)queue_capacity_metrics.delivery_acked,
                  (unsigned long long)queue_capacity_metrics.delivery_requeued,
                  (unsigned long long)queue_capacity_metrics.delivery_failed,
+                 (unsigned long long)queue_capacity_metrics.delivery_resource_deferred,
                  (unsigned long long)queue_capacity_metrics.db_bytes,
                  (unsigned long long)queue_capacity_metrics.wal_bytes,
                  (unsigned long long)queue_capacity_metrics.shm_bytes,
