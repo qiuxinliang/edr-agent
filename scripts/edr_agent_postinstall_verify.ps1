@@ -13,10 +13,13 @@ param(
   [string]$ConfigPath = "",
   [string]$ReportPath = $(if ($env:EDR_VERIFY_REPORT_PATH) { $env:EDR_VERIFY_REPORT_PATH } else { "" }),
   [string]$LogPath = $(if ($env:EDR_VERIFY_LOG_PATH) { $env:EDR_VERIFY_LOG_PATH } else { "" }),
-  [int]$PolicyTimeoutSec = 8
+  [int]$PolicyTimeoutSec = 8,
+  [ValidateSet("auto", "service", "scheduled_task", "manual")][string]$RuntimeMode = "auto",
+  [string]$InstallationRunId = ""
 )
 
 $ErrorActionPreference = "Stop"
+$checkId = [Guid]::NewGuid().ToString("N")
 
 if (-not $ConfigPath) {
   $ConfigPath = Join-Path $InstallDir "agent.toml"
@@ -191,12 +194,17 @@ function Write-Report {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
   }
   $json = $Report | ConvertTo-Json -Depth 8
+  $temporary = $path + "." + $checkId + ".tmp"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
   try {
-    $json | Set-Content -LiteralPath $path -Encoding UTF8
-  } catch {
-    Write-VerifyLog ("report Set-Content failed: " + $_.Exception.Message)
-    $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
-    [System.IO.File]::WriteAllText($path, $json, $utf8NoBom)
+    [System.IO.File]::WriteAllText($temporary, $json, $utf8NoBom)
+    if ([System.IO.File]::Exists($path)) {
+      [System.IO.File]::Replace($temporary, $path, $null)
+    } else {
+      [System.IO.File]::Move($temporary, $path)
+    }
+  } finally {
+    if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) }
   }
   Write-VerifyLog ("report=" + $path)
   Write-Host "postinstall_verify_report=$path"
@@ -212,6 +220,10 @@ trap {
     }
     $script:checks.Add((New-Check -Name "script_exception" -Status "failed" -Message $msg)) | Out-Null
     $fallbackReport = [ordered]@{
+      schema = "edr.installation-verification.v2"
+      scope = "installation_runtime_snapshot"
+      check_id = $checkId
+      installation_run_id = $InstallationRunId
       created_at = (Get-Date).ToUniversalTime().ToString("o")
       status = "failed"
       install_dir = $(try { [System.IO.Path]::GetFullPath($InstallDir) } catch { $InstallDir })
@@ -293,69 +305,72 @@ if ($runtimePolicyUrl) {
 }
 $checks.Add((New-Check -Name "runtime_policy_pull" -Status $policyStatus -Message $policyMessage)) | Out-Null
 
+# Observe the installed image, not another process with the same filename.
 $procCount = 0
-foreach ($procName in @("FDSensor", "edr_agent")) {
-  $procCount += @((Get-Process -Name $procName -ErrorAction SilentlyContinue)).Count
-}
-$taskState = ""
+$processState = "missing"
+$binaryState = "missing"
+$expectedImages = @((Join-Path $InstallDir "FDSensor.exe"), (Join-Path $InstallDir "edr_agent.exe"))
+try {
+  foreach ($path in $expectedImages) {
+    if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) { $binaryState = "present" }
+  }
+} catch { $binaryState = "unknown"; Write-VerifyLog ("binary query failed: " + $_.Exception.Message) }
+try {
+  $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='FDSensor.exe' OR Name='edr_agent.exe'" -ErrorAction Stop)
+  foreach ($process in $processes) {
+    if (-not $process.ExecutablePath) { $processState = "unknown"; continue }
+    if ($expectedImages -contains $process.ExecutablePath) { $procCount++ }
+  }
+  if ($procCount -gt 0) { $processState = "running" }
+} catch { $processState = "unknown"; Write-VerifyLog ("process query failed: " + $_.Exception.Message) }
+$taskState = "missing"
 $taskLastResult = ""
-$serviceState = ""
+$serviceState = "missing"
 try {
-  foreach ($taskName in @("FDSecurityAgent", "EdrAgent")) {
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task) {
-      $taskState = [string]$task.State
-      try {
-        $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($info) { $taskLastResult = [string]$info.LastTaskResult }
-      } catch {}
-      try {
-        foreach ($action in @($task.Actions)) {
-          Write-VerifyLog ("scheduled_task_action task={0} execute={1} args={2} wd={3}" -f $taskName, $action.Execute, $action.Arguments, $action.WorkingDirectory)
-        }
-        Write-VerifyLog ("scheduled_task_state task={0} state={1} last_result={2}" -f $taskName, $taskState, $taskLastResult)
-      } catch {}
-      break
-    }
-  }
-} catch {}
+  $services = @(Get-Service -ErrorAction Stop | Where-Object { $_.Name -in @("FDSecurityAgent", "EdrAgent") })
+  if ($services.Count -gt 0) { $serviceState = ([string]$services[0].Status).ToLowerInvariant() }
+} catch { $serviceState = "unknown"; Write-VerifyLog ("service query failed: " + $_.Exception.Message) }
 try {
-  foreach ($svcName in @("FDSecurityAgent", "EdrAgent")) {
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if ($svc) { $serviceState = [string]$svc.Status; break }
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -in @("FDSecurityAgent", "EdrAgent") })
+  if ($tasks.Count -gt 0) {
+    $taskState = ([string]$tasks[0].State).ToLowerInvariant()
+    $taskLastResult = [string](Get-ScheduledTaskInfo -InputObject $tasks[0] -ErrorAction Stop).LastTaskResult
   }
-} catch {}
-$runtimeOk = ($procCount -gt 0 -or $taskState -or $serviceState)
-$runtimeMsg = "process_count=$procCount"
-if ($taskState) { $runtimeMsg += " scheduled_task=$taskState" }
-if ($taskLastResult) { $runtimeMsg += " task_last_result=$taskLastResult" }
-if ($serviceState) { $runtimeMsg += " service=$serviceState" }
-$taskResultWarn = $false
-if ($taskLastResult) {
-  try { $taskResultWarn = ([int64]$taskLastResult -ne 0) } catch { $taskResultWarn = $true }
+} catch { $taskState = "unknown"; Write-VerifyLog ("task query failed: " + $_.Exception.Message) }
+$effectiveMode = $RuntimeMode
+if ($effectiveMode -eq "auto") {
+  $effectiveMode = if ($serviceState -notin @("missing", "unknown")) { "service" } elseif ($taskState -notin @("missing", "unknown")) { "scheduled_task" } else { "manual" }
 }
-$runtimeStatus = if (-not $runtimeOk) { "warning" } elseif ($taskResultWarn) { "warning" } else { "ok" }
+$runtimeStatus = "ok"
+if ($binaryState -eq "missing" -or $processState -eq "missing" -or
+    ($effectiveMode -eq "service" -and $serviceState -in @("missing", "stopped")) -or
+    ($effectiveMode -eq "scheduled_task" -and $taskState -in @("missing", "disabled", "ready"))) {
+  $runtimeStatus = "failed"
+} elseif ($binaryState -eq "unknown" -or $processState -eq "unknown" -or
+    ($effectiveMode -eq "service" -and $serviceState -eq "unknown") -or
+    ($effectiveMode -eq "scheduled_task" -and $taskState -eq "unknown") -or
+    ($RuntimeMode -eq "auto" -and ($serviceState -eq "unknown" -or $taskState -eq "unknown"))) {
+  $runtimeStatus = "unknown"
+} elseif (($effectiveMode -eq "service" -and $serviceState -ne "running") -or
+          ($effectiveMode -eq "scheduled_task" -and $taskState -ne "running")) {
+  $runtimeStatus = "warning"
+}
+$runtimeMsg = "binary=$binaryState process=$processState process_count=$procCount service=$serviceState task=$taskState task_last_result=$taskLastResult mode=$effectiveMode"
 $checks.Add((New-Check -Name "runtime_presence" -Status $runtimeStatus -Message $runtimeMsg)) | Out-Null
 
-$reportDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($ReportPath))
-$healthReport = Join-Path $reportDir "install_health_report.json"
-if (-not (Test-Path -LiteralPath $healthReport)) {
-  $healthReport = Join-Path $InstallDir "install_health_report.json"
-}
-$healthOk = $false
-if (Test-Path -LiteralPath $healthReport) {
-  try {
-    $raw = Get-Content -LiteralPath $healthReport -Raw -Encoding UTF8
-    $healthOk = ($raw -match '"status"\s*:\s*"ok"')
-  } catch {}
-}
-$healthStatus = if ($healthOk) { "ok" } else { "pending" }
-$healthMessage = if ($healthOk) { $healthReport } else { "waiting for agent heartbeat or bootstrap report" }
-$checks.Add((New-Check -Name "bootstrap_health" -Status $healthStatus -Message $healthMessage)) | Out-Null
-
+# Bootstrap installation history is a diagnostic reference, never a live check.
+$healthReport = Join-Path $InstallDir "install_health_report.json"
 $failed = @($checks | Where-Object { $_.status -eq "failed" }).Count
-$overallStatus = if ($failed -eq 0) { "ok" } else { "failed" }
+$unknown = @($checks | Where-Object { $_.status -eq "unknown" }).Count
+$warnings = @($checks | Where-Object { $_.status -eq "warning" }).Count
+$overallStatus = if ($failed -gt 0) { "failed" } elseif ($unknown -gt 0) { "unknown" } elseif ($warnings -gt 0) { "warning" } else { "ok" }
 $report = [ordered]@{
+  schema = "edr.installation-verification.v2"
+  scope = "installation_runtime_snapshot"
+  check_id = $checkId
+  installation_run_id = $InstallationRunId
+  historical_installation_report_path = $healthReport
+  capability_health = "unknown"
   created_at = (Get-Date).ToUniversalTime().ToString("o")
   status = $overallStatus
   install_dir = [System.IO.Path]::GetFullPath($InstallDir)
@@ -368,11 +383,13 @@ $report = [ordered]@{
   p0_rule_version = [string]$p0Summary["version"]
   p0_rule_count = [string]$p0Summary["count"]
   agent_version = $agentVersion
+  binary_state = $binaryState
+  process_state = $processState
   agent_process_running = ($procCount -gt 0)
   scheduled_task_state = $taskState
   scheduled_task_last_result = $taskLastResult
   service_state = $serviceState
-  runtime_mode = $(if ($serviceState) { "windows_service" } elseif ($taskState) { "scheduled_task" } else { "manual" })
+  runtime_mode = $effectiveMode
   proxy_mode = $proxyMode
   proxy = (Format-ProxySummary -Mode $proxyMode -Url $proxyUrl)
   checks = $checks
@@ -383,6 +400,10 @@ if ($failed -gt 0) {
   Write-VerifyLog ("failed_checks=" + $failed)
   Write-Host "post-install verification failed; report=$ReportPath"
   exit 1
+}
+if ($overallStatus -ne "ok") {
+  Write-VerifyLog ("verification_status=" + $overallStatus)
+  exit 2
 }
 Write-VerifyLog "ok"
 exit 0

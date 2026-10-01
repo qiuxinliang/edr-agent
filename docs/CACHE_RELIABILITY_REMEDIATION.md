@@ -20,7 +20,7 @@ Order: R04, R02, R03, R08, R05, R06, R01, R07.
 | R08 | Versioned whole-batch receipt binds endpoint, batch ID and SHA-256. Backend rejects volatile-only async operation; any alert persistence failure retries. | Agent receipt + SQLite response-loss tests; Go partial-failure/idempotency tests; isolated MySQL worker and actual server restart preserve acknowledged payload. |
 | R05 | Event batch-ID/payload allocation failures and SQLite NOMEM defer selection without retry consumption or corruption disposition; terminal selection failures no longer increment send retries. | SQLite fault injection passed for both allocations at severities 0/1/2, exact payload replay after recovery, all three terminal allocations, and existing real corruption isolation cases. |
 | R06 | Charge every retained event state to logical admission; report nonpending bytes and DB/WAL/SHM physical usage; run TTL cleanup even while transport is deferred. | Agent build, storage_queue_sqlite_contract and local_evidence_cache_candidate passed, including pinned-WAL visibility and circuit-open retention. |
-| R01 | Installation history must not substitute for current runtime health. | Pending |
+| R01 | Always regenerate a timestamped presence snapshot; distinguish missing/stopped/unknown and the installed image path. Installer UI consumes current stage outcomes; bootstrap history is separate. | Portable classification, packaging/headless contracts and MinGW Windows worker compile/link passed. Native Windows/PowerShell behavior test registered in the Windows release gate, not executed on this Mac. |
 | R07 | Preserve compatible aggregate counters and add reason-specific accounting. | Pending |
 
 ## R04 authority and limits
@@ -115,3 +115,30 @@ TTL is an eligibility rule, not a promise that every event is retained for exact
 that duration or that offline backlog will later be fully delivered. Capacity
 refusal and ordinary retention eviction have separate counters. This change does
 not invent an automatic archive/purge destination for unresolved audit evidence.
+
+## R01 current checks and installation history
+
+`install_health_report.json` remains bootstrap installation history. The native
+worker always generates a new `install_runtime_health.json` (Inno path), with
+check ID, installation-run ID, UTC time, worker version, individual probe states
+and Win32 errors. It checks the configured installation's actual process image
+path and requires a running service when service mode is selected. Missing
+files/services, stopped services and access/query errors are distinct. Writes
+are checked and replaced atomically; nonhealthy checks return nonzero.
+
+The PowerShell verifier records its own check/run IDs and Agent version, requires
+actual running states and image identity, and never consults historical success
+to determine health. Unknown and warning states cannot return a successful
+verification exit code. Inno clears only previous current-check reports and bases
+its finished heading on the two current stage exit codes. A report is a snapshot
+at installation, not continuing monitoring or proof of detector/TLS/backend
+health; capability health is explicitly unknown.
+
+The portable decision tests cover individual probe absence and query failure,
+service stopped/pending and service-optional modes. The complete native worker
+compiled and linked for Windows with MinGW `-Wall -Wextra -Werror`. The registered
+Windows test executes the native worker against an isolated absent runtime, then
+executes the actual PowerShell verifier with OS-query fixtures for running,
+stopped, missing, unknown, unrelated same-name processes and removed files. It
+never modifies host services/tasks. PowerShell, Inno compilation and real Windows
+API execution are unavailable on this Mac and remain required release validation.

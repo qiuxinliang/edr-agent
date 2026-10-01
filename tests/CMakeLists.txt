@@ -205,6 +205,10 @@ if(WIN32)
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")
   set_tests_properties(windows_installer_acl_behavior PROPERTIES TIMEOUT 120)
+  add_test(NAME windows_installer_health_behavior
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_health.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>' -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  set_tests_properties(windows_installer_health_behavior PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
@@ -1630,6 +1634,20 @@ target_include_directories(test_health_upload PRIVATE
 edr_apply_test_warnings(test_health_upload)
 add_test(NAME health_upload COMMAND test_health_upload)
 
+add_executable(test_runtime_health test_runtime_health.c)
+edr_apply_test_warnings(test_runtime_health)
+add_test(NAME installer_runtime_health_classification COMMAND test_runtime_health)
+
+add_executable(test_report_events_ack test_report_events_ack.c
+  ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_report_events_ack PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_report_events_ack)
+add_test(NAME report_events_ack_contract COMMAND test_report_events_ack
+  ${CMAKE_SOURCE_DIR}/tests/testdata/report_events_ack_v1.json)
+
 include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
 if(WIN32)
   include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
@@ -1643,13 +1661,3 @@ if(UNIX AND TARGET forensic_collector)
     COMMAND ${CMAKE_COMMAND} -E env "BIN=$<TARGET_FILE:forensic_collector>"
       ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/forensic_collector/test_bundle.py)
 endif()
-
-add_executable(test_report_events_ack test_report_events_ack.c
-  ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
-  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
-  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
-target_include_directories(test_report_events_ack PRIVATE
-  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-edr_apply_test_warnings(test_report_events_ack)
-add_test(NAME report_events_ack_contract COMMAND test_report_events_ack
-  ${CMAKE_SOURCE_DIR}/tests/testdata/report_events_ack_v1.json)

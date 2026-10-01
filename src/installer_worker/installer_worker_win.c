@@ -12,6 +12,10 @@
 #include "edr/windows_handoff.h"
 #include "edr/windows_spawn.h"
 #include "edr/windows_spawn_lock.h"
+#include "runtime_health.h"
+#ifndef EDR_AGENT_VERSION_STRING
+#define EDR_AGENT_VERSION_STRING "unknown"
+#endif
 
 static const wchar_t *DEFAULT_INSTALL_DIR = L"C:\\Program Files\\FDSecurity";
 static const wchar_t *DEFAULT_SERVICE_NAME = L"FDSecurityAgent";
@@ -516,25 +520,6 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
   return (ok && process_ok) ? 0 : 5;
 }
 
-static int service_running_by_name(const wchar_t *service_name) {
-  int running = 0;
-  SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-  if (!scm) return 0;
-  SC_HANDLE svc = OpenServiceW(scm, service_name, SERVICE_QUERY_STATUS);
-  if (!svc) {
-    CloseServiceHandle(scm);
-    return 0;
-  }
-  SERVICE_STATUS_PROCESS ssp;
-  DWORD bytes = 0;
-  if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytes) &&
-      ssp.dwCurrentState == SERVICE_RUNNING) {
-    running = 1;
-  }
-  CloseServiceHandle(svc);
-  CloseServiceHandle(scm);
-  return running;
-}
 
 static void delete_service_by_name(const wchar_t *service_name, const wchar_t *log_path) {
   SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
@@ -1226,49 +1211,126 @@ static int stage_uninstall_runtime(const wchar_t *install_dir, const wchar_t *lo
   return 0;
 }
 
-static int stage_write_health_summary(const wchar_t *install_dir, const wchar_t *config_path,
-                                      const wchar_t *report_path, const wchar_t *log_path) {
-  append_log_utf8(log_path, L"stage=write-health-summary begin");
-  if (!report_path || !report_path[0]) {
-    append_log_utf8(log_path, L"health_report_missing_path");
-    return 50;
+static void json_escape_wide_utf8(const wchar_t *value, char *out, size_t cap);
+
+static EdrHealthState health_file_state(const wchar_t *path, DWORD *error) {
+  DWORD attrs = GetFileAttributesW(path);
+  *error = attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+  if (attrs != INVALID_FILE_ATTRIBUTES)
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) ? EDR_HEALTH_MISSING : EDR_HEALTH_PRESENT;
+  return (*error == ERROR_FILE_NOT_FOUND || *error == ERROR_PATH_NOT_FOUND) ?
+      EDR_HEALTH_MISSING : EDR_HEALTH_UNKNOWN;
+}
+
+static EdrHealthState health_service_state(const wchar_t *name, DWORD *error) {
+  EdrHealthState state = EDR_HEALTH_UNKNOWN;
+  SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+  *error = scm ? ERROR_SUCCESS : GetLastError();
+  if (!scm) return state;
+  SC_HANDLE svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+  if (!svc) {
+    *error = GetLastError();
+    state = *error == ERROR_SERVICE_DOES_NOT_EXIST ? EDR_HEALTH_MISSING : EDR_HEALTH_UNKNOWN;
+  } else {
+    SERVICE_STATUS_PROCESS status;
+    DWORD bytes = 0;
+    if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&status, sizeof(status), &bytes)) {
+      state = status.dwCurrentState == SERVICE_RUNNING ? EDR_HEALTH_RUNNING :
+              status.dwCurrentState == SERVICE_STOPPED ? EDR_HEALTH_STOPPED :
+              status.dwCurrentState == SERVICE_PAUSED ? EDR_HEALTH_PAUSED : EDR_HEALTH_PENDING;
+    } else *error = GetLastError();
+    CloseServiceHandle(svc);
   }
-  HANDLE existing = CreateFileW(report_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, NULL);
-  if (existing != INVALID_HANDLE_VALUE) {
-    LARGE_INTEGER sz;
-    if (GetFileSizeEx(existing, &sz) && sz.QuadPart > 0) {
-      CloseHandle(existing);
-      append_log_utf8(log_path, L"health_report_exists_keep_existing");
-      return 0;
+  CloseServiceHandle(scm);
+  return state;
+}
+
+static EdrHealthState health_process_state(const wchar_t *exe, DWORD *error) {
+  wchar_t expected[MAX_PATH * 4];
+  DWORD length = GetFullPathNameW(exe, (DWORD)(sizeof(expected) / sizeof(expected[0])), expected, NULL);
+  *error = ERROR_SUCCESS;
+  if (!length || length >= sizeof(expected) / sizeof(expected[0])) {
+    *error = length ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+    return EDR_HEALTH_UNKNOWN;
+  }
+  const wchar_t *name = wcsrchr(expected, L'\\');
+  name = name ? name + 1 : expected;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) { *error = GetLastError(); return EDR_HEALTH_UNKNOWN; }
+  EdrHealthState state = EDR_HEALTH_MISSING;
+  PROCESSENTRY32W pe;
+  ZeroMemory(&pe, sizeof(pe)); pe.dwSize = sizeof(pe);
+  BOOL more = Process32FirstW(snap, &pe);
+  while (more) {
+    if (_wcsicmp(pe.szExeFile, name) == 0) {
+      HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+      wchar_t image[MAX_PATH * 4]; DWORD cap = (DWORD)(sizeof(image) / sizeof(image[0]));
+      if (!process || !QueryFullProcessImageNameW(process, 0, image, &cap)) {
+        *error = GetLastError(); state = EDR_HEALTH_UNKNOWN;
+      } else if (_wcsicmp(image, expected) == 0) {
+        CloseHandle(process); CloseHandle(snap); *error = ERROR_SUCCESS;
+        return EDR_HEALTH_RUNNING;
+      }
+      if (process) CloseHandle(process);
     }
-    CloseHandle(existing);
+    more = Process32NextW(snap, &pe);
   }
-  HANDLE h = CreateFileW(report_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (h == INVALID_HANDLE_VALUE) {
-    append_log_utf8(log_path, L"health_report_create_failed");
-    return 51;
-  }
-  (void)install_dir;
-  int cfg = file_exists(config_path);
-  int proc = process_running_by_name(L"FDSensor.exe");
-  int svc = service_running_by_name(DEFAULT_SERVICE_NAME);
-  char json[1024];
-  snprintf(json, sizeof(json),
-           "{\r\n"
-           "  \"created_by\": \"FDSecurityInstallerWorker\",\r\n"
-           "  \"status\": \"%s\",\r\n"
-           "  \"agent_toml\": %s,\r\n"
-           "  \"agent_process_running\": %s,\r\n"
-           "  \"service_running\": %s\r\n"
-           "}\r\n",
-           (cfg && (proc || svc)) ? "ok" : "warning", cfg ? "true" : "false", proc ? "true" : "false",
-           svc ? "true" : "false");
+  DWORD end_error = GetLastError();
+  if (end_error != ERROR_NO_MORE_FILES) { *error = end_error; state = EDR_HEALTH_UNKNOWN; }
+  CloseHandle(snap);
+  return state;
+}
+
+static int stage_write_health_summary(const wchar_t *install_dir, const wchar_t *config_path,
+                                      const wchar_t *report_path, const wchar_t *log_path,
+                                      const wchar_t *service_name, int service_required,
+                                      const wchar_t *run_id) {
+  append_log_utf8(log_path, L"stage=write-health-summary begin");
+  if (!report_path || !report_path[0]) return 50;
+  wchar_t exe[MAX_PATH * 2], temporary[MAX_PATH * 2];
+  join_path(exe, sizeof(exe) / sizeof(exe[0]), install_dir, L"FDSensor.exe");
+  DWORD cfg_error, exe_error, proc_error, svc_error;
+  EdrHealthState cfg = health_file_state(config_path, &cfg_error);
+  EdrHealthState binary = health_file_state(exe, &exe_error);
+  EdrHealthState proc = health_process_state(exe, &proc_error);
+  EdrHealthState svc = health_service_state(service_name, &svc_error);
+  const char *status = edr_health_presence_status(cfg, binary, proc, svc, service_required);
+  SYSTEMTIME now; FILETIME ft; GetSystemTime(&now); GetSystemTimeAsFileTime(&ft);
+  char run[512], json[2048];
+  json_escape_wide_utf8(run_id, run, sizeof(run));
+  int n = snprintf(json, sizeof(json),
+      "{\r\n  \"schema\": \"edr.runtime-presence.v1\",\r\n"
+      "  \"scope\": \"installation_runtime_snapshot\",\r\n"
+      "  \"check_id\": \"%08lx%08lx-%lu\",\r\n  \"installation_run_id\": \"%s\",\r\n"
+      "  \"created_at\": \"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ\",\r\n"
+      "  \"worker_version\": \"%s\",\r\n  \"status\": \"%s\",\r\n"
+      "  \"config_state\": \"%s\", \"config_error\": %lu,\r\n"
+      "  \"binary_state\": \"%s\", \"binary_error\": %lu,\r\n"
+      "  \"process_state\": \"%s\", \"process_error\": %lu,\r\n"
+      "  \"service_state\": \"%s\", \"service_error\": %lu,\r\n"
+      "  \"service_required\": %s,\r\n  \"capability_health\": \"unknown\"\r\n}\r\n",
+      (unsigned long)ft.dwHighDateTime, (unsigned long)ft.dwLowDateTime,
+      (unsigned long)GetCurrentProcessId(), run, now.wYear, now.wMonth, now.wDay,
+      now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, EDR_AGENT_VERSION_STRING, status,
+      edr_health_state_name(cfg), (unsigned long)cfg_error, edr_health_state_name(binary), (unsigned long)exe_error,
+      edr_health_state_name(proc), (unsigned long)proc_error, edr_health_state_name(svc), (unsigned long)svc_error,
+      service_required ? "true" : "false");
+  if (n < 0 || (size_t)n >= sizeof(json)) return 51;
+  int path_n = _snwprintf(temporary, sizeof(temporary) / sizeof(temporary[0]), L"%ls.%lu.tmp",
+                          report_path, (unsigned long)GetCurrentProcessId());
+  if (path_n < 0 || (size_t)path_n >= sizeof(temporary) / sizeof(temporary[0])) return 51;
+  HANDLE h = CreateFileW(temporary, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 51;
   DWORD written = 0;
-  WriteFile(h, json, (DWORD)strlen(json), &written, NULL);
+  BOOL ok = WriteFile(h, json, (DWORD)n, &written, NULL) && written == (DWORD)n && FlushFileBuffers(h);
   CloseHandle(h);
-  append_log_utf8(log_path, L"stage=write-health-summary ok");
-  return 0;
+  if (!ok || !MoveFileExW(temporary, report_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DeleteFileW(temporary); append_log_utf8(log_path, L"health_report_write_failed"); return 51;
+  }
+  append_log_utf8(log_path, strcmp(status, "ok") == 0 ? L"stage=write-health-summary ok" :
+                                                       L"stage=write-health-summary not_healthy");
+  return strcmp(status, "ok") == 0 ? 0 : strcmp(status, "unknown") == 0 ? 53 : 52;
 }
 
 static void json_escape_wide_utf8(const wchar_t *value, char *out, size_t cap) {
@@ -1501,11 +1563,11 @@ int main(void) {
   const wchar_t *ack_write_handle_text = arg_value(argc, argv, L"--ack-write-handle");
   const wchar_t *parent_pid_text = arg_value(argc, argv, L"--parent-pid");
   const wchar_t *endpoint_id = arg_value(argc, argv, L"--endpoint-id");
+  if (!install_dir || !install_dir[0]) install_dir = DEFAULT_INSTALL_DIR;
   wchar_t default_log[MAX_PATH * 2], default_cfg[MAX_PATH * 2], default_exe[MAX_PATH * 2];
   join_path(default_log, sizeof(default_log) / sizeof(default_log[0]), install_dir, L"diagnostics\\installer-worker.log");
   join_path(default_cfg, sizeof(default_cfg) / sizeof(default_cfg[0]), install_dir, L"agent.toml");
   join_path(default_exe, sizeof(default_exe) / sizeof(default_exe[0]), install_dir, L"FDSensor.exe");
-  if (!install_dir || !install_dir[0]) install_dir = DEFAULT_INSTALL_DIR;
   if (!log_path || !log_path[0]) log_path = default_log;
   const wchar_t *config_path = arg_value(argc, argv, L"--config");
   const wchar_t *exe_path = arg_value(argc, argv, L"--exe");
@@ -1594,7 +1656,9 @@ int main(void) {
   } else if (_wcsicmp(stage, L"uninstall-runtime") == 0) {
     rc = stage_uninstall_runtime(install_dir, log_path);
   } else if (_wcsicmp(stage, L"write-health-summary") == 0) {
-    rc = stage_write_health_summary(install_dir, config_path, report_path, log_path);
+    rc = stage_write_health_summary(install_dir, config_path, report_path, log_path, svc,
+        _wcsicmp(arg_value(argc, argv, L"--runtime-mode"), L"service") == 0,
+        arg_value(argc, argv, L"--run-id"));
   } else {
     usage();
     rc = 64;

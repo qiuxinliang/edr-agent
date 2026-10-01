@@ -204,6 +204,9 @@ var
   EdrInstallFailed: Boolean;
   EdrFailureReason: string;
   EdrDiagnosticsDir: string;
+  EdrInstallationRunId: string;
+  EdrPolicyVerifyOk: Boolean;
+  EdrPresenceVerifyOk: Boolean;
   EdrDiagnosticsBundle: string;
   EdrStageLog: string;
   EdrCurrentStage: string;
@@ -696,10 +699,19 @@ end;
 
 procedure EdrInitDiagnostics;
 begin
+  EdrInstallationRunId := GetDateTimeString('yyyymmddhhnnsszzz', '', '');
+  EdrPolicyVerifyOk := False;
+  EdrPresenceVerifyOk := False;
   EdrDiagnosticsDir := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics');
   if not DirExists(EdrDiagnosticsDir) then
     ForceDirectories(EdrDiagnosticsDir);
   EdrDiagnosticsBundle := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\install-diagnostics.zip');
+  if FileExists(EdrDiagnosticsFile('install_runtime_verify.json')) and
+      (not DeleteFile(EdrDiagnosticsFile('install_runtime_verify.json'))) then
+    RaiseException('Cannot clear previous runtime verification report');
+  if FileExists(EdrDiagnosticsFile('install_runtime_health.json')) and
+      (not DeleteFile(EdrDiagnosticsFile('install_runtime_health.json'))) then
+    RaiseException('Cannot clear previous runtime presence report');
   EdrStageLog := EdrDiagnosticsDir + '\install-stage.log';
   SaveStringToFile(EdrStageLog, 'FDSecurity setup diagnostics' + #13#10, False);
   EdrAppendStageLog('diagnostics_dir=' + EdrDiagnosticsDir);
@@ -836,6 +848,8 @@ begin
   Ok := Exec(FileName, Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
   if Ok and (Code = 0) then
   begin
+    if Title = 'Pull runtime policy' then EdrPolicyVerifyOk := True;
+    if Title = 'Write health summary' then EdrPresenceVerifyOk := True;
     EdrAppendStageLog('OK [' + Title + '] exit=0');
     EdrSetProgress(StageNo, StageTotal, Title, EdrProductStageDetail(Title, 'ok'));
     EdrProgressPage.SetProgress(StageNo, StageTotal);
@@ -974,11 +988,20 @@ begin
   Result := EdrWorkerBaseParams('harden-acl');
 end;
 
+function EdrExpectedRuntimeMode: string;
+begin
+  if WizardIsTaskSelected('windowsservice') then Result := 'service'
+  else if WizardIsTaskSelected('windowsautorun') then Result := 'scheduled_task'
+  else Result := 'manual';
+end;
+
 function EdrWorkerHealthSummaryParams: string;
 begin
   Result := EdrWorkerBaseParams('write-health-summary')
     + ' --config ' + EdrCmdQuote(ExpandConstant('{app}\agent.toml'))
-    + ' --report ' + EdrCmdQuote(EdrDiagnosticsFile('install_health_report.json'));
+    + ' --report ' + EdrCmdQuote(EdrDiagnosticsFile('install_runtime_health.json'))
+    + ' --runtime-mode ' + EdrCmdQuote(EdrExpectedRuntimeMode)
+    + ' --run-id ' + EdrCmdQuote(EdrInstallationRunId);
 end;
 
 function EdrStopRuntimePsParameters: string;
@@ -1048,7 +1071,8 @@ begin
     + 'try{if((Test-Path -LiteralPath $script) -and $icacls){& $icacls.Source $script /grant:r ''*S-1-5-18:F'' /grant:r ''*S-1-5-32-544:F'' /grant:r ''*S-1-5-32-545:RX'' /C /Q | Out-Null}}catch{};'
     + 'try{if(Test-Path -LiteralPath $script){Unblock-File -LiteralPath $script -ErrorAction SilentlyContinue}}catch{};'
     + 'try{'
-    + '& $script -InstallDir ' + EdrPsSq(ExpandConstant('{app}')) + ' -ConfigPath ' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ' -PolicyTimeoutSec 15 *>> $out;'
+    + '& $script -InstallDir ' + EdrPsSq(ExpandConstant('{app}')) + ' -ConfigPath ' + EdrPsSq(ExpandConstant('{app}\agent.toml')) + ' -PolicyTimeoutSec 15 -RuntimeMode ' + EdrPsSq(EdrExpectedRuntimeMode)
+    + ' -InstallationRunId ' + EdrPsSq(EdrInstallationRunId) + ' *>> $out;'
     + '$ok=$?;'
     + '$code=1;if($ok){$code=0};'
     + 'if($LASTEXITCODE -ne $null){$code=$LASTEXITCODE};'
@@ -1064,8 +1088,10 @@ end;
 function EdrHealthSummaryPsParameters: string;
 begin
   Result := '-NoProfile -ExecutionPolicy Bypass -Command "'
-    + 'if(Test-Path -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + '){exit 0};'
-    + 'exit 0'
+    + '$ErrorActionPreference=''Stop'';'
+    + '$r=Get-Content -LiteralPath ' + EdrPsSq(EdrDiagnosticsFile('install_runtime_verify.json')) + ' -Raw | ConvertFrom-Json;'
+    + 'if($r.installation_run_id -eq ' + EdrPsSq(EdrInstallationRunId) + ' -and $r.status -eq ''ok''){exit 0};'
+    + 'exit 2'
     + '"';
 end;
 
@@ -1369,40 +1395,19 @@ begin
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
-var
-  HealthReport, PreflightReport, RuntimeReport, S, Msg: string;
-  RawHealthReport: AnsiString;
 begin
   if CurPageID = ReviewPage.ID then
     ReviewPage.MsgLabel.Caption := EdrDeploymentPlanText;
-
-  if CurPageID <> wpFinished then
-    Exit;
-
-  HealthReport := EdrDiagnosticsFile('install_health_report.json');
-  PreflightReport := EdrDiagnosticsFile('install_preflight_report.json');
-  RuntimeReport := EdrDiagnosticsFile('install_runtime_verify.json');
-  if LoadStringFromFile(HealthReport, RawHealthReport) then
-  begin
-    S := RawHealthReport;
-    if (Pos('"status":"ok"', S) > 0) or (Pos('"status": "ok"', S) > 0) then
-      WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed and bootstrap checks passed'
-    else
-      WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed; review bootstrap health report';
-    Msg := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
-      + 'Health report: ' + HealthReport + #13#10
-      + 'Preflight report: ' + PreflightReport + #13#10
-      + 'Runtime report: ' + RuntimeReport + #13#10
-      + 'Diagnostics bundle: ' + EdrDiagnosticsBundle;
-    WizardForm.FinishedLabel.Caption := Msg;
-  end
-  else if AgentTomlExistsForRun then
-  begin
-    WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed';
-    WizardForm.FinishedLabel.Caption := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
-      + 'No bootstrap health report was generated. Check enrollment settings if the agent cannot connect.' + #13#10
-      + 'Diagnostics directory: ' + EdrDiagnosticsDir;
-  end;
+  if CurPageID <> wpFinished then Exit;
+  if EdrPolicyVerifyOk and EdrPresenceVerifyOk then
+    WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed; runtime checks passed at installation'
+  else
+    WizardForm.FinishedHeadingLabel.Caption := 'FDSecurity installed; runtime verification needs attention';
+  WizardForm.FinishedLabel.Caption := 'agent.toml: ' + ExpandConstant('{app}\agent.toml') + #13#10
+    + 'Current verification: ' + EdrDiagnosticsFile('install_runtime_verify.json') + #13#10
+    + 'Current presence: ' + EdrDiagnosticsFile('install_runtime_health.json') + #13#10
+    + 'Installation history: ' + EdrDiagnosticsFile('install_health_report.json') + #13#10
+    + 'Diagnostics bundle: ' + EdrDiagnosticsBundle;
 end;
 
 function InstallerWorkerPresentForUninstall: Boolean;

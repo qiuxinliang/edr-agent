@@ -61,3 +61,6 @@ if(EDR_PCRE2_AVAILABLE)
   edr_agent_runtime_gate(windows_rule_semantic_audit test_p0_candidate_replay)
 endif()
 edr_agent_runtime_gate(health_upload test_health_upload)
+
+edr_agent_runtime_gate(installer_runtime_health_classification test_runtime_health)
+edr_agent_runtime_gate(report_events_ack_contract test_report_events_ack)
