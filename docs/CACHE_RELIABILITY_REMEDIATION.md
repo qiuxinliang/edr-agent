@@ -1,5 +1,10 @@
 # Cache reliability remediation
 
+Latest result: the local backend was upgraded before the single Windows UTM
+endpoint, which now runs `3.2.589`. See [Windows upgrade acceptance](#2026-10-02-windows-upgrade-acceptance)
+for the completed checks, the retained installer policy-probe warning, and the
+remaining verification limits. Earlier pending statements below record prior phases.
+
 Baseline: `8e1e591229c2d83fbbfbf604c95e18e544a77af3` (tested release baseline:
 `f708d6bd7a2ee1eb7be26cb593a4b79957a9746b`). The intervening change only
 limits evidence-cache page reclamation per preprocess turn.
@@ -267,3 +272,109 @@ this is not a native Windows run. The added injected failures prove that health
 and receipt failures block the applicable release labels. Native candidate
 rebuild, installation and normal event delivery remain pending coordination
 with the concurrent rollout task and restoration of the guest control channel.
+
+## 2026-10-02 Windows upgrade acceptance
+
+### Artifact and execution boundary
+
+The tested artifact is `win_3.2.589`, built from Agent
+`03d78b39b2c4f180b6acf41390e45946a2996b53` by
+[run 37014901459](https://github.com/qiuxinliang/edr-agent/actions/runs/37014901459).
+All seven jobs passed. AMD64 and ARM64 each passed 71/71 native CTests and the
+actual Setup upgrade/rollback/uninstall and native runtime lifecycle gates,
+using the published `win_3.2.583` baseline.
+
+Only the ARM64 UTM endpoint was upgraded in this phase. The Setup SHA-256 is
+`809e44b086d492b9f43beb3eabd5ba749880234bb8a4005465e0dd781ba1d3c6`;
+the installed FDSensor SHA-256 is
+`136f0eb3fac875eb047dfc1df74782ea695870d034a626216d93c53d852cf81f`.
+The verified 583 rollback installer, runtime, configuration, task definition and
+stopped cache copies remain in an ACL-restricted guest directory. Host diagnostic
+artifacts and configuration copies are private and ignored by Git.
+
+Exclusive guest ownership was handed over before execution. The original 583
+process, PID 1652 / creation FILETIME `134354182747581310`, received the normal
+console shutdown signal and exited with code 0 in 2.203 seconds. No forced
+termination was used. Both SQLite databases were copied after exit and their
+source/copy hashes matched; WAL and SHM were absent after the normal close.
+Setup ran once, from 14:55:47 UTC, and returned 0. No rollback was used.
+
+The launch RPC timed out before returning its receipt. Read-only job state
+confirmed that the original job had advanced, so the command was not replayed.
+The new scheduled-task process, PID 9688 / creation FILETIME
+`134354265902246381`, started at 14:56:30.224 UTC. At 15:08:49.566 UTC the same
+process remained Running, with the expected binary and 739.342 seconds of
+uptime. The CA, final primary/LKG hashes and independent sequence remained
+unchanged throughout that observation.
+
+### Observed results
+
+| Area | Result and scope |
+| --- | --- |
+| R01 current health | Both reports were generated at 14:56:33 UTC, with distinct check IDs, the same installation run ID `20261002225551341`, and version 589. Native presence was `ok`: config/binary present, process running, service missing but not required for scheduled-task mode. Capability health remained `unknown`. The policy probe correctly retained `warning`; see below. |
+| R04 configuration | The verified remote policy identity was persisted in the complete primary; primary and LKG had identical bytes, SHA-256 `3b1db8ad836ec31c011e6363711aee6e580dfdd402ba56e7cad11b9878e9013f`. Typed local fields and non-policy table presence were preserved, with no existing owned field removed. Both snapshots passed the candidate's native `--config-test`. The separate anti-rollback state remained 524; TOML version/hash/sequence matched v524 and the endpoint's applied policy report. |
+| Cache preservation | All 20 selected pre-upgrade candidate rows and their complete reference/fact sets had identical typed-value hashes after upgrade. This proves preservation of those selected rows and sets, not all cache contents. |
+| SQLite structure | `quick_check=ok` for both stopped database copies and both live upgraded databases. Checks ran on a separate working copy of the frozen evidence; all original frozen hashes remained unchanged. Structure checks do not establish business completeness or remote durability. |
+| R07 accounting | Basic health exposed `p0_acceptance.evidence_cache.accounting` with current-process scope and explicit units. All seven candidate-failure and seven context-failure counters were present and zero. Ordinary coalescing, hot-ring-only storage, policy filtering and pressure skipping had separate nonzero counts; they are not counts of lost important evidence. |
+| R08 normal delivery | Two post-upgrade snapshots found 20 ordinary 589 batches with matching endpoint/batch/SHA-256 in durable jobs and accepted batch records. Jobs were `done`. Three selected batches also had 1, 2 and 1 persisted endpoint-event rows, matching their accepted counts. This does not prove exactly-once effects or every downstream consumer. |
+| Observation | Backend health reported version 589 and PID 9688, online state and connected control stream. Between the two snapshots, successful report-events submissions grew from 403 to 564 while failure count stayed 2. Final health reported no pending offline rows. Instantaneous client SQLite snapshots had one pending row with retry count 0; these are different observation times, not a contradiction or a conservation equation. |
+
+At 15:10 UTC the existing API PID 21204 on `192.168.3.101:8080`, worker PID
+21598 on `127.0.0.1:8081`, and frontend PID 21763 on port 5173 remained live.
+API and worker readiness returned 200 with CA and hostname verification, and the
+frontend returned 200. The backend receipt binary was deployed before this client;
+concurrent backend edits were not rebuilt or deployed during this acceptance.
+Cross-machine timestamps can differ; process identity, version and independently
+captured receipts bind these observations, rather than ordering guest and database
+timestamps as if they shared an exact clock.
+
+### Retained warning and corrected diagnostic failures
+
+The installer's PowerShell runtime-policy probe returned HTTP 401. In the tested
+script it sends endpoint/tenant headers without bearer authentication, while the
+backend route requires authentication. This request also existed in 583. Version
+589 correctly aggregates its warning into overall `warning` and exit 2; the
+noncritical installer stage retains the warning while Setup completes. The native
+Agent has a separate authenticated transport, and its applied/verified v524 report
+and persisted configuration were observed separately. Neither the PowerShell
+warning nor native presence was relabeled as full capability success. A later
+probe fix should reuse native authentication or an authenticated application
+receipt without placing credentials in installer command lines or stage logs.
+
+Three diagnostic failures are preserved with their successful corrections:
+
+- The first cache query assumed the new `event_queue.next_retry_at` column on
+  583. The corrected read-only probe inspected `PRAGMA table_info`, explicitly
+  reported the missing column, and omitted unavailable metrics instead of using
+  zero. The upgraded schema then included the column.
+- The first acceptance script compared a UTC file timestamp with a local
+  `DateTime.Parse` result and incorrectly marked fresh reports stale. A separate
+  receipt normalized both to UTC and verified both current reports. Explicit
+  UTF-8 reading also avoided PowerShell's legacy-codepage decoding of Chinese
+  warning text. The original failed receipt remains intact.
+- The first integrity probe was interrupted by its eight-second SQLite progress
+  deadline (`SQLITE_INTERRUPT`, code 9). A bounded rerun allowed 30 seconds per
+  statement. All four checks completed; the longest took 8.179 seconds. This was
+  a diagnostic timeout, not evidence of corruption.
+
+### Remaining limits and evidence
+
+This phase did not inject disk exhaustion, power loss, memory failure, permanent
+backend rejection, signature-enforcement overrides, offline restart, or damaged
+primary/LKG recovery into the UTM endpoint. Earlier isolated regression evidence
+for those covered code paths remains separate from this live upgrade. Exact raw
+signed v524 response bytes were unavailable, so the full policy-content comparison
+was not claimed; the backend `verified` flag is the Agent's report, not an
+independent cryptographic verification by this audit. The basic profile does not
+expose the diagnostic delivery counters, which remain unavailable rather than zero.
+
+The evidence manifest is the ignored parent-workspace artifact
+`artifacts/cache-upgrade-20261002/install-589/acceptance-summary.json`, with the
+raw install result, UTC report correction, configuration checks, fixed-selector
+cache comparison, structural checks, backend snapshots and consumer-row receipt.
+Historical rollout state was archived before the status journal was updated.
+
+Concurrent Agent commit `7b282749` changes telemetry admission and is not part of
+the tested 589 artifact. This documentation update does not validate or deploy
+that change. Its parent-repository gitlink integration remains with its owning
+task; no unrelated source changes or diagnostic secrets are included here.
