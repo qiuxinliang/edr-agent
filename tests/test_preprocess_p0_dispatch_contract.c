@@ -30,6 +30,7 @@ int main(void) {
   const char *local_only;
   const char *standalone;
   const char *p0_guard;
+  const char *p0_return;
   const char *upload_gate;
   const char *local_ave;
   const char *local_forensics;
@@ -47,9 +48,10 @@ int main(void) {
   source = read_file(path);
   if (!source) return 1;
   p0_call = strstr(source, "int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts_status(");
-  decision = strstr(source, "edr_detection_decision_evaluate(&br, &dd);");
+  decision = strstr(source, "edr_detection_decision_evaluate_after_p0(&br, &dd, p0_proven_miss);");
   local_only = strstr(source, "edr_preprocess_admit_telemetry(&br, &dd)");
-  p0_guard = strstr(source, "if (p0_emitted > 0) {\n    return;\n  }");
+  p0_guard = strstr(source, "if (p0_emitted > 0) {");
+  p0_return = p0_guard ? strstr(p0_guard, "\n    return;") : NULL;
   upload_gate = p0_guard ? strstr(p0_guard, "edr_preprocess_upload_admit(&br, &dd, p0_proven_miss,") : NULL;
   local_ave = decision ? strstr(decision, "edr_ave_cross_engine_feed_from_record(&br);") : NULL;
   local_forensics = local_ave ? strstr(local_ave, "edr_command_dispatch_recommended_forensics(&br);") : NULL;
@@ -65,7 +67,7 @@ int main(void) {
   fact_handoff = source_only_gate ? strstr(source_only_gate,
       "process_ready_record(br, slot, command_facts_resolved ? &command_facts : NULL)") : NULL;
   standalone = p0_call ? strstr(p0_call, "emit_behavior_record(&br);") : NULL;
-  if (!p0_call || !decision || !local_only || !p0_guard || !upload_gate ||
+  if (!p0_call || !decision || !local_only || !p0_guard || !p0_return || !upload_gate ||
       !local_ave || !local_forensics || !standalone ||
       !throttle_proven_miss || !throttle_gate || !p0_enrichment ||
       !hard_quality || !fact_resolve || !fact_match || !source_only_gate || !fact_handoff ||
@@ -74,7 +76,7 @@ int main(void) {
       throttle_gate <= p0_enrichment || throttle_gate >= p0_call ||
       p0_call >= decision || p0_call >= local_only ||
       local_ave >= local_forensics || local_forensics >= upload_gate ||
-      p0_guard >= upload_gate ||
+      p0_guard >= p0_return || p0_return >= upload_gate ||
       upload_gate >= standalone) {
     fprintf(stderr, "P0 dispatch must precede local-only admission, and pressure may shed only verified IR misses\n");
     free(source);

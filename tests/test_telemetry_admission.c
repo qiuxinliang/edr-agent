@@ -9,13 +9,172 @@
 static unsigned stored, considered;
 static int allow;
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
-  assert(r && strcmp(r->event_id, "context-for-live-candidate") == 0);
+  assert(r && r->event_id[0]);
   stored++;
 }
 int edr_preprocess_should_emit(const EdrBehaviorRecord *r) {
   assert(r && stored > considered);
   considered++;
   return allow;
+}
+
+static void test_proven_baseline_read_stays_local(void) {
+  EdrBehaviorRecord r = {0};
+  EdrDetectionDecision d = {0};
+  r.type = EDR_EVENT_FILE_READ;
+  r.priority = 0u; /* The collector reserves the P0 lane before matching. */
+  r.pid = 74002u;
+  r.process_start_key = 74002u;
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  r.file_actor_generation_validated = 1u;
+  strcpy(r.event_id, "read-baseline-context");
+  strcpy(r.source_completeness, "COMPLETE");
+  strcpy(r.process_name, "ordinary.exe");
+  strcpy(r.exe_path, "C:\\Vendor\\ordinary.exe");
+  strcpy(r.file_path, "C:\\Users\\alice\\Documents\\ordinary.dat");
+  edr_windows_event_policy_configure(NULL);
+  edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+  assert(strcmp(d.reason, "baseline") == 0);
+  assert(strcmp(d.selection_action, "local_only") == 0);
+  assert(d.p0_miss_local_only);
+  unsigned before_stored = stored;
+  allow = 1;
+  assert(edr_preprocess_admit_telemetry(&r, &d));
+  uint64_t before_skipped = edr_preprocess_baseline_file_upload_skipped_count();
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(stored == before_stored + 1u);
+  assert(edr_preprocess_baseline_file_upload_skipped_count() == before_skipped + 1u);
+
+  /* An unavailable rule authority or any retained alert/forensic signal
+   * cannot be mistaken for an ordinary read, even at an ordinary path. */
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+  strcpy(d.signal_reasons, "process_context");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  d.signal_reasons[0] = 0;
+  strcpy(r.pmfe_snapshot, "{\"image_hits\":1}");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.pmfe_snapshot[0] = 0;
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.source_completeness, "COMPLETE");
+  r.process_start_key = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 74002u;
+  r.file_actor_generation_validated = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.file_actor_generation_validated = 1u;
+  strcpy(r.collector_evidence_gate, "file_path_unresolved");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.collector_evidence_gate[0] = 0;
+  strcpy(r.source_truncated_fields, "source.cmdline");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.source_truncated_fields[0] = 0;
+
+  strcpy(r.file_path, "C:\\Windows\\System32\\config\\SAM");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\inetpub\\wwwroot\\shell.aspx");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Users\\alice\\Documents\\ordinary.dat");
+  char context[sizeof(r.detection_context)];
+  strcpy(context, r.detection_context);
+  cJSON *root = cJSON_Parse(context);
+  assert(root);
+  cJSON *signals = cJSON_GetObjectItemCaseSensitive(root, "signals");
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(signals, "process_context", cJSON_CreateBool(1)));
+  assert(cJSON_PrintPreallocated(root, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  cJSON_DeleteItemFromObjectCaseSensitive(signals, "process_context");
+  assert(cJSON_PrintPreallocated(root, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  cJSON_Delete(root);
+  strcpy(r.detection_context, "{broken");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.detection_context, context);
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+}
+
+static void test_priority_does_not_create_detection_authority(void) {
+  EdrBehaviorRecord r = {0};
+  EdrDetectionDecision d = {0};
+  r.type = EDR_EVENT_FILE_WRITE;
+  r.priority = 0u;
+  r.pid = 74003u;
+  r.process_start_key = 74003u;
+  r.process_creation_filetime_100ns = 134348800000000000ull;
+  r.file_actor_generation_validated = 1u;
+  strcpy(r.event_id, "priority-reservation-is-not-detection");
+  strcpy(r.source_completeness, "COMPLETE");
+  strcpy(r.process_name, "ordinary.exe");
+  strcpy(r.exe_path, "C:\\Vendor\\ordinary.exe");
+  strcpy(r.file_path, "C:\\Users\\alice\\Documents\\ordinary.dat");
+  strcpy(r.cmdline, "ordinary.exe --cache C:\\Users\\alice\\AppData\\Local\\Example");
+  edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+  assert(strcmp(d.reason, "suspicious_parent_or_user_path") == 0);
+  assert(d.event_quality_score == 32u && d.p0_miss_local_only);
+  assert(strcmp(d.selection_action, "local_only") == 0);
+  assert(r.priority == 0u); /* Reliability/queue priority is unchanged. */
+  unsigned before = stored;
+  allow = 1;
+  assert(edr_preprocess_admit_telemetry(&r, &d));
+  assert(stored == before + 1u); /* Local analysis precedes final admission. */
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
+  cJSON *context = cJSON_Parse(r.detection_context);
+  const cJSON *quality = cJSON_GetObjectItemCaseSensitive(context, "event_quality");
+  assert(strcmp(cJSON_GetObjectItemCaseSensitive(quality, "selection_action")->valuestring,
+                "local_only") == 0);
+  char baseline[sizeof(r.detection_context)];
+  strcpy(baseline, r.detection_context);
+  cJSON *signals = cJSON_GetObjectItemCaseSensitive(context, "signals");
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(signals, "script_sensor", cJSON_CreateBool(1)));
+  assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  cJSON_DeleteItemFromObjectCaseSensitive(signals, "script_sensor");
+  assert(cJSON_PrintPreallocated(context, r.detection_context, sizeof(r.detection_context), 0));
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  cJSON_Delete(context);
+  strcpy(r.detection_context, baseline);
+  strcpy(r.file_path, "C:\\Windows\\System32\\config\\SAM");
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.file_path, "C:\\Users\\alice\\Documents\\ordinary.dat");
+  r.process_start_key = 0u;
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 74003u;
+  assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
+
+  /* A rule hit is never a proved miss. Unknown matcher/gate outcomes and
+   * incomplete actor facts preserve the existing conservative path. */
+  edr_detection_decision_evaluate_after_p0(&r, &d, 0);
+  assert(!d.p0_miss_local_only);
+  assert(strcmp(d.selection_action, "emit_alert") == 0);
+  assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
+  strcpy(r.source_completeness, "NOT_EVALUABLE");
+  edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+  assert(!d.p0_miss_local_only);
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  strcpy(r.source_completeness, "COMPLETE");
+  r.process_start_key = 0u;
+  edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+  assert(!d.p0_miss_local_only);
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  r.process_start_key = 74003u;
+
+  /* Real Office/browser parent context and combined remote/script evidence
+   * do not become a user-path-only baseline. */
+  static const char *const parents[] = {"WINWORD.EXE", "chrome.exe"};
+  for (size_t i = 0; i < sizeof(parents) / sizeof(parents[0]); i++) {
+    strcpy(r.parent_name, parents[i]);
+    edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+    assert(!d.p0_miss_local_only);
+    assert(strcmp(d.selection_action, "emit_alert") == 0);
+    assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
+  }
+  r.parent_name[0] = 0;
+  strcpy(r.cmdline, "ordinary.exe --cache C:\\Users\\alice\\AppData\\Local\\Example --url https://example.test/");
+  edr_detection_decision_evaluate_after_p0(&r, &d, 1);
+  assert(d.has_remote && !d.p0_miss_local_only);
+  assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
 }
 
 static void test_uncombined_tool_file_upload(void) {
@@ -312,5 +471,7 @@ int main(void) {
   strcpy(r.source_completeness, "NOT_EVALUABLE");
   assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
   test_uncombined_tool_file_upload();
+  test_proven_baseline_read_stays_local();
+  test_priority_does_not_create_detection_authority();
   return 0;
 }

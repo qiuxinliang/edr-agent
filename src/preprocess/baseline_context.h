@@ -7,7 +7,8 @@
 /* Shared decision-owner contract for consumers of ordinary baseline facts.
  * Missing, changed or positive signals must retain the evidence. */
 static int baseline_context_has_no_server_signal(const cJSON *root,
-                                               int uncombined_tool_file) {
+                                               int uncombined_tool_file,
+                                               int user_path_only) {
   static const char *const positive_signals[] = {
       "remote", "ransom_note", "tls_anomaly", "ransom_canary",
       "script_sensor", "process_context", "ransom_behavior",
@@ -16,7 +17,7 @@ static int baseline_context_has_no_server_signal(const cJSON *root,
       "high_content_entropy", "cert_revoked_ancestor",
       "security_product_kill", "ransom_recovery_tamper",
       "silverfox_attack_chain"};
-  if (!cJSON_IsObject(root)) return 0;
+  if (!cJSON_IsObject(root) || (uncombined_tool_file && user_path_only)) return 0;
   const cJSON *signals = cJSON_GetObjectItemCaseSensitive(root, "signals");
   const cJSON *control = cJSON_GetObjectItemCaseSensitive(root, "ransom_control");
   const cJSON *quality = cJSON_GetObjectItemCaseSensitive(root, "event_quality");
@@ -36,14 +37,15 @@ static int baseline_context_has_no_server_signal(const cJSON *root,
       !cJSON_IsNumber(chain) ||
       chain->valuedouble != (uncombined_tool_file ? 20.0 : 0.0) ||
       !cJSON_IsArray(reasons) ||
-      cJSON_GetArraySize(reasons) != (uncombined_tool_file ? 1 : 0) ||
+      cJSON_GetArraySize(reasons) != ((uncombined_tool_file || user_path_only) ? 1 : 0) ||
       !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(control, "canary")) ||
       !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(control, "extension_changed"))) {
     return 0;
   }
-  if (uncombined_tool_file) {
+  if (uncombined_tool_file || user_path_only) {
     const cJSON *reason = cJSON_GetArrayItem(reasons, 0);
-    if (!cJSON_IsString(reason) || strcmp(reason->valuestring, "lolbin") != 0 ||
+    const char *expected = user_path_only ? "suspicious_parent_or_user_path" : "lolbin";
+    if (!cJSON_IsString(reason) || strcmp(reason->valuestring, expected) != 0 ||
         !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(control, "tracking_saturated")) ||
         !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(control, "state_transition")) ||
         !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(control, "periodic_summary"))) {
@@ -51,6 +53,10 @@ static int baseline_context_has_no_server_signal(const cJSON *root,
     }
   }
   for (size_t i = 0u; i < sizeof(positive_signals) / sizeof(positive_signals[0]); i++) {
+    if (user_path_only && strcmp(positive_signals[i], "suspicious_parent") == 0) {
+      if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(signals, positive_signals[i]))) return 0;
+      continue;
+    }
     if (!cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(signals,
                                                        positive_signals[i]))) return 0;
   }

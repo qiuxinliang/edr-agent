@@ -5321,7 +5321,7 @@ static int evidence_is_powershell_startup_cache_noise(const EdrBehaviorRecord *r
     const cJSON *score = cJSON_GetObjectItemCaseSensitive(quality, "score");
     const cJSON *action = cJSON_GetObjectItemCaseSensitive(quality, "selection_action");
     const cJSON *trigger = cJSON_GetObjectItemCaseSensitive(root, "detection_trigger");
-    int baseline = baseline_context_has_no_server_signal(root, 1) &&
+    int baseline = baseline_context_has_no_server_signal(root, 1, 0) &&
         cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "suppressed")) &&
         cJSON_IsNumber(score) && score->valuedouble == 32.0 &&
         cJSON_IsString(action) &&

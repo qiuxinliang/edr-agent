@@ -39,7 +39,8 @@ int edr_preprocess_admit_telemetry(const EdrBehaviorRecord *record,
   /* Cache owns retention, aggregation and candidate attribution. Neither a
    * local-only decision nor duplicate transport is authority to skip it. */
   edr_local_evidence_cache_record_behavior(record);
-  if (decision->drop || strcmp(decision->selection_action, "local_only") == 0)
+  if (decision->drop || (strcmp(decision->selection_action, "local_only") == 0 &&
+                         !decision->p0_miss_local_only))
     return 0;
   return edr_preprocess_should_emit(record);
 }
@@ -48,17 +49,27 @@ int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
                                const EdrDetectionDecision *decision,
                                int p0_proven_miss, int local_forensics_dispatched) {
   const int is_process = record && record->type == EDR_EVENT_PROCESS_CREATE;
+  const int is_file_read = record && record->type == EDR_EVENT_FILE_READ;
   const int is_registry = record && (record->type == EDR_EVENT_REG_CREATE_KEY ||
       record->type == EDR_EVENT_REG_SET_VALUE || record->type == EDR_EVENT_REG_DELETE_KEY);
   const int uncombined_tool_file = is_uncombined_tool_file(record, decision);
+  const int user_path_only = decision && decision->p0_miss_local_only &&
+      strcmp(decision->reason, "suspicious_parent_or_user_path") == 0;
   if (!record || !decision || !p0_proven_miss || local_forensics_dispatched > 0 ||
-      (!is_process && !is_registry && record->type != EDR_EVENT_FILE_CREATE &&
+      (decision->p0_miss_local_only && (!record->pid || !record->process_start_key ||
+          !record->process_creation_filetime_100ns ||
+          strcmp(record->source_completeness, "COMPLETE") != 0)) ||
+      (!is_process && !is_registry && !is_file_read && record->type != EDR_EVENT_FILE_CREATE &&
        record->type != EDR_EVENT_FILE_WRITE &&
        record->type != EDR_EVENT_FILE_DELETE &&
        record->type != EDR_EVENT_FILE_RENAME) ||
       !record->event_id[0] || (!is_process && !is_registry && !record->file_path[0]) ||
       (is_process && (record->is_security_4688 || !record->process_start_key ||
                       !record->process_creation_filetime_100ns)) ||
+      (is_file_read && (!record->pid || !record->process_start_key ||
+          !record->process_creation_filetime_100ns ||
+          !record->file_actor_generation_validated ||
+          strcmp(record->source_completeness, "COMPLETE") != 0)) ||
       (is_registry && (!record->pid || !record->reg_key_path[0] ||
           !record->process_start_key || !record->process_creation_filetime_100ns ||
           strcmp(record->source_completeness, "COMPLETE") != 0 ||
@@ -72,26 +83,37 @@ int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
            : (record->source_completeness[0] &&
               strcmp(record->source_completeness, "COMPLETE") != 0)) ||
       record->pmfe_snapshot[0] || record->cert_revoked_ancestor ||
-      (decision->signal_reasons[0] && !uncombined_tool_file) || decision->has_remote ||
-      decision->suspicious_parent || decision->context_correlated ||
+      (decision->signal_reasons[0] && !uncombined_tool_file && !user_path_only) || decision->has_remote ||
+      (decision->suspicious_parent && !user_path_only) || decision->context_correlated ||
       decision->persistence_change || decision->trigger_pmfe_scan ||
       decision->trigger_single_process_minidump) {
     return 1;
+  }
+
+  if (is_file_read || (decision->p0_miss_local_only && !is_process)) {
+    /* Full collection for the signed P0 bundle is not authority for a second
+     * standalone baseline upload. Preserve sensitive targets and collector
+     * diagnostics; the local cache and detectors have already seen this fact. */
+    EdrWindowsEventPolicy policy;
+    edr_windows_event_policy_evaluate(record, &policy);
+    if (!policy.applies || policy.high_value || policy.suspicious) return 1;
+    if (!is_registry && !record->file_actor_generation_validated) return 1;
   }
 
   /* The ordinary frame has no further server consumer when the local IR
    * proved a miss and the generated context has no ransomware signal. Keep
    * every unknown or changed context shape on the upload path. */
   cJSON *context = cJSON_Parse(record->detection_context);
-  const int baseline = baseline_context_has_no_server_signal(context, uncombined_tool_file);
+  const int baseline = baseline_context_has_no_server_signal(context, uncombined_tool_file,
+                                                            user_path_only);
   cJSON_Delete(context);
   if (!baseline) return 1;
   const int allowlisted_baseline = decision->suppress &&
       decision->allowlisted_path &&
       strcmp(decision->selection_action, "emit_context") == 0 &&
       strstr(decision->noise_reasons, "allowlisted_path") != NULL;
-  const int structured_baseline = strcmp(decision->reason, "baseline") == 0 &&
-      decision->event_quality_score <= 20u;
+  const int structured_baseline = (strcmp(decision->reason, "baseline") == 0 &&
+      decision->event_quality_score <= 20u) || user_path_only;
   if ((is_process || is_registry) ? !structured_baseline :
       (!allowlisted_baseline && !structured_baseline && !uncombined_tool_file))
     return 1;

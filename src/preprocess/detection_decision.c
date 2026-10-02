@@ -310,12 +310,16 @@ static int is_lolbin(const char *name) {
          has_ci(b, "cscript.exe") || has_ci(b, "bitsadmin.exe") || has_ci(b, "certutil.exe");
 }
 
-static int suspicious_parent(const EdrBehaviorRecord *r) {
+static int suspicious_parent_name(const EdrBehaviorRecord *r) {
   const char *p = r->parent_name[0] ? r->parent_name : r->parent_path;
-  const char *c = r->cmdline;
   return has_ci(p, "winword") || has_ci(p, "excel") || has_ci(p, "powerpnt") || has_ci(p, "outlook") ||
-         has_ci(p, "acrord") || has_ci(p, "chrome") || has_ci(p, "msedge") || has_ci(p, "iexplore") ||
-         has_ci(c, "\\appdata\\") || has_ci(c, "/tmp/") || has_ci(c, "/var/tmp/");
+         has_ci(p, "acrord") || has_ci(p, "chrome") || has_ci(p, "msedge") || has_ci(p, "iexplore");
+}
+
+static int suspicious_parent(const EdrBehaviorRecord *r) {
+  const char *c = r->cmdline;
+  return suspicious_parent_name(r) || has_ci(c, "\\appdata\\") ||
+         has_ci(c, "/tmp/") || has_ci(c, "/var/tmp/");
 }
 
 static int is_management_tool(const EdrBehaviorRecord *r) {
@@ -1045,7 +1049,8 @@ static uint8_t reason_token_noise_weight(const char *tok) {
   return 0u;
 }
 
-static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecision *out) {
+static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecision *out,
+                                  int p0_proven_miss) {
   out->signal_reasons[0] = '\0';
   out->noise_reasons[0] = '\0';
   uint32_t supp = 0u;
@@ -1099,10 +1104,26 @@ static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecisi
   } else {
     action = "drop";
   }
-  /* P0(priority==0) 强制至少告警；已 suppress 时不高于 emit_context。 */
-  if (!out->drop && r && r->priority == 0u) {
+  /* A reserved transport lane is not a rule hit. Once the authenticated
+   * matcher proves a miss on complete generation-bound facts, an ordinary
+   * baseline or user-writable-path hint retains its original local-only
+   * score. Office/browser ancestry, combined signals and unknown source
+   * quality still keep their conservative admission. */
+  int priority_only = p0_proven_miss && r && r->pid && r->process_start_key &&
+      r->process_creation_filetime_100ns &&
+      strcmp(r->source_completeness, "COMPLETE") == 0 &&
+      !r->collector_evidence_gate[0] && !r->source_truncated_fields[0] &&
+      !r->pmfe_snapshot[0] && !r->cert_revoked_ancestor &&
+      !out->has_remote && !out->context_correlated && !out->persistence_change &&
+      (strcmp(out->reason, "baseline") == 0 ||
+       (strcmp(out->reason, "suspicious_parent_or_user_path") == 0 &&
+        !suspicious_parent_name(r))) &&
+      out->event_quality_score <= 32u;
+  if (!out->drop && r && r->priority == 0u && !priority_only) {
     action = "emit_alert";
   }
+  out->p0_miss_local_only = priority_only && r->priority == 0u &&
+      strcmp(action, "local_only") == 0;
   if (out->suppress && strcmp(action, "emit_alert") == 0) {
     action = "emit_context";
   }
@@ -2315,7 +2336,8 @@ failed:
   free(full);
 }
 
-void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision *out) {
+void edr_detection_decision_evaluate_after_p0(EdrBehaviorRecord *r,
+    EdrDetectionDecision *out, int p0_proven_miss) {
   if (!out) {
     return;
   }
@@ -2612,7 +2634,7 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
     out->drop = 1u;
   }
 
-  compute_event_quality(r, out);
+  compute_event_quality(r, out, p0_proven_miss);
 
   {
     EdrDetectionTrigger trigger;
@@ -2628,4 +2650,8 @@ void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision 
   }
   process_context_update(r, now_ns, remote, script_sensor, tls_anomaly, ransom_burst, ransom, ransom_note,
                          security_kill, webshell_semantic, cred, inject, persistence);
+}
+
+void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision *out) {
+  edr_detection_decision_evaluate_after_p0(r, out, 0);
 }

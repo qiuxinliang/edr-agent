@@ -17,6 +17,9 @@ typedef struct EdrDetectionDecision {
   uint8_t persistence_change;
   uint8_t trigger_pmfe_scan;
   uint8_t trigger_single_process_minidump;
+  /* A proved P0 miss downgraded only a transport-priority promotion. Local
+   * consumers must still run before the standalone-upload gate. */
+  uint8_t p0_miss_local_only;
   char detection_profile[32];
   char suppression_reason[96];
   char suppression_policy_version[64];
@@ -34,5 +37,8 @@ typedef struct EdrDetectionDecision {
 } EdrDetectionDecision;
 
 void edr_detection_decision_evaluate(EdrBehaviorRecord *r, EdrDetectionDecision *out);
+/* Only the active authenticated matcher may supply p0_proven_miss. */
+void edr_detection_decision_evaluate_after_p0(EdrBehaviorRecord *r,
+    EdrDetectionDecision *out, int p0_proven_miss);
 
 #endif

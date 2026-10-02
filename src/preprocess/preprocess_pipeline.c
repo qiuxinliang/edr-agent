@@ -1429,7 +1429,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   EdrDetectionDecision dd;
-  edr_detection_decision_evaluate(&br, &dd);
+  edr_detection_decision_evaluate_after_p0(&br, &dd, p0_proven_miss);
   if (!edr_preprocess_admit_telemetry(&br, &dd)) {
     if (br.type == EDR_EVENT_PROCESS_CREATE)
       edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition",
