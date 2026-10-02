@@ -317,6 +317,141 @@ class ReleaseCheckpointTests(unittest.TestCase):
                 cp.restore(self.api, self.directory, SOURCE, "arm64")
 
 
+class PublishedBaselineTests(unittest.TestCase):
+    @staticmethod
+    def release(tag, *, draft=False, prerelease=True):
+        assets = []
+        for arch in ("amd64", "arm64"):
+            for suffix in ("exe.zip", "setup.exe", "artifact-manifest.json"):
+                asset_id = len(assets) + 1
+                assets.append(dict(name=f"edr-agent-{tag}-windows-{arch}-{suffix}",
+                                   id=asset_id, url=f"https://api.github.com/repos/owner/agent/releases/assets/{asset_id}",
+                                   size=100, digest="sha256:" + "b" * 64))
+        return dict(tag_name=tag, draft=draft, prerelease=prerelease, assets=assets,
+                    body="historical release provenance", target_commitish="c" * 40)
+
+    def test_published_candidate_wins_over_failed_complete_and_incomplete_drafts(self):
+        published = self.release("win_3.2.583")
+        failed = self.release("win_3.2.587", draft=True, prerelease=False)
+        incomplete = self.release("win_3.2.586", draft=True, prerelease=False)
+        incomplete["assets"].pop()
+        target = self.release("win_3.2.588", draft=True, prerelease=False)
+        target["assets"] = []
+        releases = [failed, target, incomplete, published]
+        original = copy.deepcopy(releases)
+        self.assertEqual(cp.select_baseline(releases, target["tag_name"]),
+                         dict(tag="win_3.2.583", state="published", setup_rollback_supported=True))
+        self.assertEqual(cp.select_baseline(releases, target["tag_name"], published["tag_name"])["tag"],
+                         published["tag_name"])
+        self.assertEqual(releases, original)
+
+    def test_published_release_selection_is_numeric_and_strictly_older(self):
+        releases = [self.release(tag, prerelease=False) for tag in
+                    ("win_3.2.98", "win_3.2.100", "win_3.2.101", "win_3.3.1")]
+        self.assertEqual(cp.select_baseline(releases, "win_3.2.101")["tag"], "win_3.2.100")
+        for tag in ("win_3.2.101", "win_3.3.1"):
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, "strictly older"):
+                cp.select_baseline(releases, "win_3.2.101", tag)
+
+    def test_explicit_draft_and_missing_or_duplicate_releases_are_rejected(self):
+        draft = self.release("win_3.2.587", draft=True)
+        with self.assertRaisesRegex(ValueError, "draft"):
+            cp.select_baseline([draft], "win_3.2.588", draft["tag_name"])
+        for releases in ([], [draft, copy.deepcopy(draft)]):
+            with self.subTest(releases=len(releases)), self.assertRaisesRegex(ValueError, "exactly one release"):
+                cp.select_baseline(releases, "win_3.2.588", draft["tag_name"])
+        published = self.release("win_3.2.583")
+        with self.assertRaisesRegex(ValueError, "exactly one release"):
+            cp.select_baseline([published, copy.deepcopy(published)], "win_3.2.588")
+
+    def test_both_architectures_require_each_immutable_asset_once(self):
+        for arch in ("amd64", "arm64"):
+            for suffix in ("exe.zip", "setup.exe", "artifact-manifest.json"):
+                for defect in ("missing", "duplicate"):
+                    with self.subTest(arch=arch, suffix=suffix, defect=defect):
+                        incomplete = self.release("win_3.2.586")
+                        name = f"edr-agent-win_3.2.586-windows-{arch}-{suffix}"
+                        asset = next(a for a in incomplete["assets"] if a["name"] == name)
+                        if defect == "missing":
+                            incomplete["assets"].remove(asset)
+                        else:
+                            incomplete["assets"].append(copy.deepcopy(asset))
+                        with self.assertRaisesRegex(ValueError, "exactly one"):
+                            cp.select_baseline([incomplete], "win_3.2.588", incomplete["tag_name"])
+                        self.assertEqual(cp.select_baseline([incomplete, self.release("win_3.2.583")],
+                                                            "win_3.2.588")["tag"], "win_3.2.583")
+
+    def test_asset_metadata_failures_are_not_no_history(self):
+        for field, value in (("id", None), ("id", True), ("url", ""), ("url", "http://invalid"),
+                             ("size", 0), ("size", True), ("digest", "sha256:bad"), ("digest", 7)):
+            with self.subTest(field=field, value=value):
+                invalid = self.release("win_3.2.583")
+                invalid["assets"][0][field] = value
+                with self.assertRaisesRegex(ValueError, "immutable metadata"):
+                    cp.select_baseline([invalid], "win_3.2.588")
+                with self.assertRaisesRegex(ValueError, "immutable metadata"):
+                    cp.select_baseline([invalid], "win_3.2.588", invalid["tag_name"])
+
+    def test_historical_optional_github_digest_keeps_downstream_verification(self):
+        release = self.release("win_3.2.583")
+        for asset in release["assets"]:
+            asset.pop("digest")
+        self.assertEqual(cp.select_baseline([release], "win_3.2.588")["tag"], release["tag_name"])
+
+    def test_known_broken_setup_boundaries_and_rollback_compatibility(self):
+        for patch_version, eligible, rollback in ((303, True, False), (304, False, False),
+                                                   (341, False, False), (342, True, True)):
+            release = self.release(f"win_3.2.{patch_version}")
+            with self.subTest(version=patch_version):
+                if eligible:
+                    self.assertEqual(cp.select_baseline([release], "win_3.2.588")["setup_rollback_supported"], rollback)
+                else:
+                    with self.assertRaisesRegex(ValueError, "known-broken Setup range"):
+                        cp.select_baseline([release], "win_3.2.588", release["tag_name"])
+        releases = [self.release("win_3.2.341"), self.release("win_3.2.303")]
+        self.assertEqual(cp.select_baseline(releases, "win_3.2.588")["tag"], "win_3.2.303")
+
+    def test_no_published_history_is_distinct_from_bad_release_metadata(self):
+        self.assertIsNone(cp.select_baseline([], "win_3.2.588"))
+        self.assertIsNone(cp.select_baseline([self.release("win_3.2.587", draft=True)], "win_3.2.588"))
+        for invalid in (None, {}, [None]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "release list"):
+                cp.select_baseline(invalid, "win_3.2.588")
+        for tag in ("main", "win_3.2.588-unsigned", ""):
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, "release tag"):
+                cp.select_baseline([], tag)
+
+    def test_paginated_github_lookup_is_readonly_and_errors_propagate(self):
+        api = cp.GitHub("owner/agent")
+        pages = [[self.release("win_3.2.587", draft=True)], [self.release("win_3.2.583")]]
+        with patch.object(api, "call", return_value=json.dumps(pages)) as call:
+            self.assertEqual(cp.select_baseline(api.releases(), "win_3.2.588")["tag"], "win_3.2.583")
+        call.assert_called_once_with("api", "repos/owner/agent/releases?per_page=100", "--paginate", "--slurp")
+        for response in ("not JSON", json.dumps({}), json.dumps([{}])):
+            with self.subTest(response=response), patch.object(api, "call", return_value=response), self.assertRaises(ValueError):
+                api.releases()
+        with patch.object(api, "call", side_effect=RuntimeError("GitHub forbidden")), self.assertRaisesRegex(RuntimeError, "forbidden"):
+            api.releases()
+
+    def test_cli_requires_a_baseline_but_not_target_source_or_published_state(self):
+        api = cp.GitHub("owner/agent")
+        target = self.release("win_3.2.588", draft=True)
+        target["assets"] = []
+        args = ["checkpoint", "select-baseline", "--target-tag", target["tag_name"]]
+        with patch.dict(cp.os.environ, {"GITHUB_REPOSITORY": "owner/agent"}, clear=True), \
+                patch("sys.argv", args), patch.object(cp, "source", side_effect=AssertionError("target source must not be read")), \
+                patch.object(cp, "GitHub", return_value=api), \
+                patch.object(api, "releases", return_value=[target, self.release("win_3.2.583")]), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            cp.main()
+            self.assertEqual(json.loads(output.getvalue())["tag"], "win_3.2.583")
+        with patch.dict(cp.os.environ, {"GITHUB_REPOSITORY": "owner/agent"}, clear=True), \
+                patch("sys.argv", args), patch.object(cp, "GitHub", return_value=api), \
+                patch.object(api, "releases", return_value=[target]), \
+                self.assertRaisesRegex(ValueError, "install/upgrade/rollback has no eligible published baseline"):
+            cp.main()
+
+
 class ParallelGateTests(unittest.TestCase):
     def test_all_cases_execute_and_failure_propagates(self):
         seen = []

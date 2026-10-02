@@ -24,6 +24,90 @@ UNSIGNED = ("WARNING: This Windows build is unsigned. Windows may show an unknow
             "warning. Use only where the platform explicitly permits optional-signature "
             "installation/update with verified SHA-256 artifact hashes. "
             "Platform/Agent signature requirements are not changed by this release.\n")
+BROKEN_SETUP_BASELINE_MIN = (3, 2, 304)
+BROKEN_SETUP_BASELINE_MAX = (3, 2, 341)
+
+
+def windows_release_version(tag):
+    match = re.fullmatch(r"win_(\d+)\.(\d+)\.(\d+)", tag) if isinstance(tag, str) else None
+    if match is None:
+        raise ValueError("Invalid Windows release tag; expected win_M.m.p")
+    return tuple(int(part) for part in match.groups())
+
+
+def baseline_rejection(info, target_version):
+    """A baseline has already passed publication gates, including both arches.
+
+    Published prereleases are verified candidates in this repository. Drafts
+    have not passed those gates, even when all their assets have been uploaded.
+    Historical provenance belongs to that release, not the current target.
+    """
+    if info.get("draft") is not False:
+        return "release is a draft or has no published state"
+    try:
+        version = windows_release_version(info.get("tag_name"))
+    except ValueError:
+        return "release tag is not a supported Windows version"
+    if version >= target_version:
+        return "release must be strictly older than the target"
+    if BROKEN_SETUP_BASELINE_MIN <= version <= BROKEN_SETUP_BASELINE_MAX:
+        return "release is in the known-broken Setup range win_3.2.304..win_3.2.341"
+    assets = info.get("assets")
+    if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
+        return "release has no valid asset metadata"
+    for arch in ("amd64", "arm64"):
+        prefix = f"edr-agent-{info['tag_name']}-windows-{arch}-"
+        for suffix in ("exe.zip", "setup.exe", "artifact-manifest.json"):
+            name = prefix + suffix
+            matches = [asset for asset in assets if asset.get("name") == name]
+            if len(matches) != 1:
+                return f"release must contain exactly one {name}"
+            asset = matches[0]
+            asset_digest = asset.get("digest")
+            if (type(asset.get("id")) is not int or asset["id"] <= 0 or
+                    not isinstance(asset.get("url"), str) or not asset["url"].startswith("https://") or
+                    type(asset.get("size")) is not int or asset["size"] <= 0 or
+                    (asset_digest not in (None, "") and
+                     (not isinstance(asset_digest, str) or
+                      not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", asset_digest)))):
+                return f"release asset {name} has incomplete immutable metadata"
+    return None
+
+
+def select_baseline(releases, target_tag, baseline_tag=""):
+    """Return the newest eligible published baseline, or None when none exists.
+
+    An explicit invalid baseline is an error. The target may still be a draft;
+    its ownership and immutable downloads retain their separate existing gates.
+    """
+    target_version = windows_release_version(target_tag)
+    if not isinstance(releases, list) or any(not isinstance(info, dict) for info in releases):
+        raise ValueError("Invalid GitHub release list; baseline selection cannot proceed")
+    if baseline_tag:
+        windows_release_version(baseline_tag)
+        matches = [info for info in releases if info.get("tag_name") == baseline_tag]
+        if len(matches) != 1:
+            raise ValueError(f"Baseline {baseline_tag} must resolve to exactly one release")
+        rejection = baseline_rejection(matches[0], target_version)
+        if rejection:
+            raise ValueError(f"Baseline {baseline_tag} is not eligible: {rejection}")
+        selected = matches[0]
+    else:
+        candidates = [info for info in releases if baseline_rejection(info, target_version) is None]
+        if not candidates:
+            for info in releases:
+                try:
+                    version = windows_release_version(info.get("tag_name"))
+                except ValueError:
+                    continue
+                if info.get("draft") is False and version < target_version:
+                    raise ValueError("No eligible published baseline: " + baseline_rejection(info, target_version))
+            return None
+        selected = max(candidates, key=lambda info: windows_release_version(info["tag_name"]))
+        if sum(info.get("tag_name") == selected["tag_name"] for info in releases) != 1:
+            raise ValueError(f"Baseline {selected['tag_name']} must resolve to exactly one release")
+    return dict(tag=selected["tag_name"], state="published",
+                setup_rollback_supported=windows_release_version(selected["tag_name"]) > BROKEN_SETUP_BASELINE_MAX)
 
 
 def source(env=os.environ):
@@ -95,6 +179,13 @@ class GitHub:
                           "--paginate", "--slurp")
         info["assets"] = [item for page in json.loads(pages) for item in page]
         return info
+
+    def releases(self):
+        pages = json.loads(self.call("api", f"repos/{self.repository}/releases?per_page=100",
+                                     "--paginate", "--slurp"))
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            raise ValueError("Invalid paginated GitHub release response")
+        return [info for page in pages for info in page]
 
     def tag_commit(self, tag):
         value = self.call("api", f"repos/{self.repository}/git/ref/tags/{tag}", missing=True)
@@ -300,10 +391,22 @@ def upload(api, directory, expected, arch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final"))
+    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
+    parser.add_argument("--target-tag")
+    parser.add_argument("--baseline-tag", default="")
     args = parser.parse_args()
+    if args.command == "select-baseline":
+        if not args.target_tag:
+            parser.error("select-baseline requires --target-tag")
+        windows_release_version(args.target_tag)
+        api = GitHub(os.environ["GITHUB_REPOSITORY"])
+        selected = select_baseline(api.releases(), args.target_tag, args.baseline_tag)
+        if selected is None:
+            raise ValueError("Required install/upgrade/rollback has no eligible published baseline")
+        print(json.dumps(selected, sort_keys=True))
+        return
     expected = source()
     api = GitHub(expected["repository"])
     if args.command == "source":

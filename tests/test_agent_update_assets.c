@@ -608,20 +608,22 @@ int main(void) {
   require_true(lifecycle != NULL, "read Windows release lifecycle workflow");
   contains(lifecycle, "workflow_call:", "release lifecycle is callable with an explicit target");
   contains(lifecycle, "target_tag:", "release lifecycle target tag is an explicit input");
-  contains(lifecycle, "$hasNativeAsset",
-           "blank baseline resolves to the latest lower release with a matching native package");
+  contains(lifecycle, "windows_release_checkpoint.py @selectionArgs",
+           "baseline discovery uses the shared published release selector");
   contains(lifecycle, "baseline_state=$baselineState",
-           "lifecycle diagnostics identify whether the selected baseline candidate was draft or published");
-  contains(lifecycle, "$brokenSetupBaselineMin = [Version]'3.2.304'",
+           "lifecycle diagnostics retain the selected published baseline state");
+  snprintf(path, sizeof(path), "%s/scripts/windows_release_checkpoint.py", root);
+  release_checkpoint = read_file(path);
+  require_true(release_checkpoint != NULL, "read shared Windows release owner");
+  contains(release_checkpoint, "BROKEN_SETUP_BASELINE_MIN = (3, 2, 304)",
            "lifecycle excludes the first release affected by the pre-initialized app-path Setup regression");
-  contains(lifecycle, "$brokenSetupBaselineMax = [Version]'3.2.341'",
+  contains(release_checkpoint, "BROKEN_SETUP_BASELINE_MAX = (3, 2, 341)",
            "lifecycle excludes every release through the final known-broken Setup package");
+  free(release_checkpoint);
   contains(lifecycle, "BASELINE_SETUP_ROLLBACK_SUPPORTED",
            "lifecycle records whether full Setup rollback is valid for the selected baseline");
-  contains(lifecycle, "if ($release.prerelease -or $release.tag_name",
-           "baseline discovery admits older draft candidates for native verification in the current run");
-  require_true(!strstr(lifecycle, "if ($release.draft -or $release.prerelease"),
-               "baseline discovery does not fall back to an ancient published release merely because newer candidates are drafts");
+  contains(lifecycle, "@('--baseline-tag', $requestedBaseline)",
+           "explicit baselines are validated by the same published release owner");
   contains(lifecycle, "$targetRuntime = \"edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip\"",
            "release lifecycle selects baseline runtime assets by architecture-specific immutable exact name");
   contains(lifecycle, "contents: write",

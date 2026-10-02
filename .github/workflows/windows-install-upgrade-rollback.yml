@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       baseline_tag:
-        description: Previous release candidate; empty selects and verifies the newest older candidate with complete native assets
+        description: Published baseline; empty selects the newest older published release with complete assets for both architectures
         required: false
         default: ''
         type: string
@@ -29,7 +29,7 @@ on:
         required: true
         type: string
       baseline_tag:
-        description: Previous release candidate; empty selects and verifies the newest older candidate with complete native assets
+        description: Published baseline; empty selects the newest older published release with complete assets for both architectures
         required: false
         default: ''
         type: string
@@ -95,55 +95,34 @@ jobs:
           }
           "NATIVE_REPEAT_COUNT=$repeatCount" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Restore pinned ARM64-host Python tool cache
+        if: matrix.arch == 'arm64'
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ${{ runner.tool_cache }}/Python/3.12.10/x64
+            ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
+          key: python-tool-${{ runner.os }}-${{ runner.arch }}-3.12.10-x64-v1
+      - name: Set up pinned Python for baseline selection
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+
       - name: Resolve release tags
         shell: pwsh
         run: |
           $target = '${{ inputs.target_tag }}'.Trim()
-          $baseline = '${{ inputs.baseline_tag }}'.Trim()
-          $baselineState = 'explicit'
-          $brokenSetupBaselineMin = [Version]'3.2.304'
-          $brokenSetupBaselineMax = [Version]'3.2.341'
-          if ($target -notmatch '^win_\d+\.\d+\.\d+$') {
-            throw "invalid target release tag: $target"
-          }
-          if (-not $baseline) {
-            $targetVersion = [Version]$target.Substring(4)
-            $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
-            if ($LASTEXITCODE -ne 0) { throw 'cannot list draft and published releases for baseline selection' }
-            $candidates = @()
-            foreach ($release in @($releaseJson | ConvertFrom-Json)) {
-              # Target releases are still drafts while this gate runs. An older
-              # draft with complete immutable assets is a valid candidate only
-              # after this job installs and verifies it on the native runner.
-              if ($release.prerelease -or $release.tag_name -notmatch '^win_\d+\.\d+\.\d+$') { continue }
-              $version = [Version]$release.tag_name.Substring(4)
-              $expectedAsset = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-exe.zip"
-              $expectedSetup = "edr-agent-$($release.tag_name)-windows-${{ matrix.arch }}-setup.exe"
-              $hasNativeAsset = @($release.assets | Where-Object { $_.name -eq $expectedAsset }).Count -eq 1
-              $hasSetupAsset = @($release.assets | Where-Object { $_.name -eq $expectedSetup }).Count -eq 1
-              if ($version -ge $brokenSetupBaselineMin -and $version -le $brokenSetupBaselineMax) {
-                Write-Host "Skipping known-broken Setup baseline $($release.tag_name): InitializeSetup expands {app} before initialization"
-                continue
-              }
-              if ($version -lt $targetVersion -and $hasNativeAsset -and $hasSetupAsset) {
-                $candidates += [pscustomobject]@{
-                  Tag = $release.tag_name
-                  Version = $version
-                  State = $(if ($release.draft) { 'draft' } else { 'published' })
-                }
-              }
-            }
-            $selectedBaseline = $candidates | Sort-Object Version -Descending | Select-Object -First 1
-            $baseline = $selectedBaseline.Tag
-            $baselineState = $selectedBaseline.State
-          }
-          if ($baseline -notmatch '^win_\d+\.\d+\.\d+$') { throw "no valid older release exists for target $target" }
-          if ($target -eq $baseline) { throw 'target and baseline releases must differ' }
-          $baselineVersion = [Version]$baseline.Substring(4)
-          if ($baselineVersion -ge $brokenSetupBaselineMin -and $baselineVersion -le $brokenSetupBaselineMax) {
-            throw "baseline $baseline is in the known-broken Setup range win_3.2.304..win_3.2.341"
-          }
-          $baselineSetupRollbackSupported = $baselineVersion -gt $brokenSetupBaselineMax
+          $requestedBaseline = '${{ inputs.baseline_tag }}'.Trim()
+          $selectionArgs = @('select-baseline', '--target-tag', $target)
+          if ($requestedBaseline) { $selectionArgs += @('--baseline-tag', $requestedBaseline) }
+          $selectionJson = & python .\scripts\windows_release_checkpoint.py @selectionArgs
+          if ($LASTEXITCODE -ne 0) { throw 'published Windows baseline selection failed' }
+          $selectedBaseline = $selectionJson | ConvertFrom-Json -ErrorAction Stop
+          if ($null -eq $selectedBaseline) { throw "no eligible published baseline exists for target $target" }
+          $baseline = $selectedBaseline.tag
+          $baselineState = $selectedBaseline.state
+          $baselineSetupRollbackSupported = [bool]$selectedBaseline.setup_rollback_supported
           Write-Host "Lifecycle target=$target baseline=$baseline baseline_state=$baselineState setup_rollback_supported=$baselineSetupRollbackSupported"
           "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append

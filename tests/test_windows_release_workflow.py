@@ -29,7 +29,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
 
     def test_publication_still_requires_build_and_lifecycle_success(self):
         self.assertIn('needs: prepare-release', self.jobs['windows-build'])
-        self.assertIn('needs: usb-finalize', self.jobs['windows-lifecycle'])
+        self.assertIn('needs: [prepare-release, usb-finalize]', self.jobs['windows-lifecycle'])
         publish = self.jobs['publish-release']
         needs = publish.split('    needs:\n', 1)[1].split('    runs-on:', 1)[0]
         self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['windows-build', 'windows-lifecycle', 'usb-finalize'])
@@ -67,6 +67,37 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                         prepare.index('windows_release_checkpoint.py prepare'))
         self.assertIn("--label-regex '^windows-release-gate$'", self.jobs['windows-build'])
 
+    def test_baseline_is_selected_once_and_shared_with_classification_and_lifecycle(self):
+        prepare, build, lifecycle = (self.jobs[name] for name in
+                                     ('prepare-release', 'windows-build', 'windows-lifecycle'))
+        selection = prepare.split('- name: Select published baseline for this run\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('GH_TOKEN: ${{ github.token }}', selection)
+        self.assertIn('set -euo pipefail', selection)
+        self.assertIn('windows_release_checkpoint.py select-baseline --target-tag', selection)
+        self.assertIn('baseline_tag: ${{ steps.baseline.outputs.baseline_tag }}', prepare)
+        self.assertIn('EDR_PREVIOUS_RELEASE_TAG: ${{ needs.prepare-release.outputs.baseline_tag }}', build)
+        classifier = build.split('- name: Classify supported upgrade path\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('--previous-ref $previousTag --current-ref HEAD', classifier)
+        self.assertIn("if (-not $previousTag) { throw", classifier)
+        self.assertNotIn('git tag --list', classifier)
+        self.assertNotIn('select-baseline', classifier)
+        self.assertIn('needs: [prepare-release, usb-finalize]', lifecycle)
+        self.assertIn('baseline_tag: ${{ needs.prepare-release.outputs.baseline_tag }}', lifecycle)
+        standalone = (ROOT / '.github/workflows/windows-install-upgrade-rollback.yml').read_text(encoding='utf-8')
+        self.assertIn('python-tool-${{ runner.os }}-${{ runner.arch }}-3.12.10-x64-v1', standalone)
+        setup = standalone.split('- name: Set up pinned Python for baseline selection\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('uses: actions/setup-python@v6', setup)
+        self.assertIn("python-version: '3.12.10'", setup)
+        self.assertIn('architecture: x64', setup)
+        self.assertLess(standalone.index('- name: Set up pinned Python for baseline selection'),
+                        standalone.index('- name: Resolve release tags'))
+        resolution = standalone.split('- name: Resolve release tags\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('windows_release_checkpoint.py @selectionArgs', resolution)
+        self.assertIn("@('--baseline-tag', $requestedBaseline)", resolution)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw", resolution)
+        self.assertIn('ConvertFrom-Json -ErrorAction Stop', resolution)
+        self.assertNotIn('foreach ($release', resolution)
+
     def test_arm_python_cache_has_default_branch_producer(self):
         producer = (ROOT / '.github/workflows/edr-agent-prebuild-packages.yml').read_text(encoding='utf-8')
         for text in (self.text, producer):
@@ -94,7 +125,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("steps.final-resume.outputs.restored != 'true'", finish)
         self.assertLess(finish.index('Verify-WindowsUsbSignatures.ps1'), finish.index('name: usb-verified-final'))
         self.assertLess(finish.index('name: usb-verified-final'), finish.index('windows_release_checkpoint.py upload'))
-        self.assertIn("needs: usb-finalize", self.jobs['windows-lifecycle'])
+        self.assertIn("needs: [prepare-release, usb-finalize]", self.jobs['windows-lifecycle'])
 
     def test_candidate_never_promotes_latest(self):
         publish = self.jobs['publish-release']
