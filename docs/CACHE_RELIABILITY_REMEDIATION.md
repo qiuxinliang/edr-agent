@@ -4,8 +4,8 @@ Baseline: `8e1e591229c2d83fbbfbf604c95e18e544a77af3` (tested release baseline:
 `f708d6bd7a2ee1eb7be26cb593a4b79957a9746b`). The intervening change only
 limits evidence-cache page reclamation per preprocess turn.
 
-Scope: local code changes and isolated regression tests. No cloud deployment,
-production data changes, or changes to endpoint protection are authorized.
+Initial scope: local code changes and isolated regression tests. No cloud deployment,
+production data changes, or changes to endpoint protection were performed during remediation.
 Windows-native installation, power loss and live backend acceptance require
 separate environment verification. User-supplied Windows observations remain
 historical evidence, not results of these local tests.
@@ -220,3 +220,50 @@ backends without the receipt cause clients to retain and retry batches. No cloud
 host, production database or endpoint protection setting was changed. Windows
 PowerShell/Inno/native execution, production detector behavior, deployed-server
 acceptance and sudden power loss remain explicitly unverified.
+
+
+## 2026-10-02 rollout in progress
+
+The user authorized deployment in backend-before-client order. The local API and
+independent worker were upgraded through their existing launchd and Screen owners.
+Both use the binary built from root `c957a670`, SHA-256
+`165fc05a195c04a35f13be3fd13a9d558b373c899c6eebe687df2df4c2381f06`.
+Old binary, launch configuration and local address configuration are retained in
+the ignored, restricted `artifacts/cache-upgrade-20261002/rollback/` directory.
+
+Preflight found that the host network had changed while the running API retained
+the previous bind address. Local address configuration and the worker public URL
+were updated to the active interface; the existing frontend owner reloaded its
+matching API/WS addresses. The existing certificate covers the active address;
+CA and hostname verification and API/worker `/ready` returned HTTP 200. API PID
+95744 and worker PID 96074 were bound to the installed executable; frontend PID
+96230 returned HTTP 200. The binary embeds `vcs.modified=true` because the root
+has an unrelated untracked signing directory; tracked backend source was clean.
+
+A controlled authenticated empty-BAT1 probe returned HTTP 202 twice with version-1
+`durable` receipts, the exact submitted payload hash, the same job ID, and a
+duplicate flag on replay. A separate read-only MySQL query found one durable row
+with the exact original bytes; the worker rejected the empty batch as `dead` and
+retained those bytes. No endpoint event rows were created. This proves deployed
+receipt binding, duplicate-job identity and rejected-payload retention for this
+probe; normal event delivery still requires the Windows upgrade verification.
+The Windows upgrade remains pending. UTM guest execution and file reads returned RPC timeouts,
+including after the user reported normal restart. A concurrent task also owns
+network/release work for this guest; coordination was requested. No client setup
+has been launched by this task.
+
+Existing candidate run 36957844115 targets Agent `8c066365` / `3.2.584`; its AMD64
+job failed at release-gate dependency verification. This task cancelled its own
+duplicate pending run 36958055306. The native failure and local self-test show
+missing expectations for the added health/receipt tests; the fixture also needs
+to register the shared installer executable once. The corrective self-test work
+retains all production gate labels and adds explicit failure-blocking assertions.
+The local 19-test gate self-check completed with 18 passes and one failure in
+the host-only Windows-SDK declaration fixture. The fixture lacked `WINAPI` and
+`CreateThread`, which the already existing sliced-cache regression uses. Adding
+those declarations made the failed SQLite-enabled Windows-branch compile probe
+pass in a separate rerun. All 19 self-check cases therefore have passing results;
+this is not a native Windows run. The added injected failures prove that health
+and receipt failures block the applicable release labels. Native candidate
+rebuild, installation and normal event delivery remain pending coordination
+with the concurrent rollout task and restoration of the guest control channel.

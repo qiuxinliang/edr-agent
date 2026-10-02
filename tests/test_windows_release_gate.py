@@ -36,10 +36,11 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
-    "windows_installer_acl_behavior",
+    "windows_installer_acl_behavior", "windows_installer_health_behavior",
     "openssl_tls_handshake", "windows_task_exit_behavior",
 }
 RUNTIME_EXPECTED = {
+    "installer_runtime_health_classification", "report_events_ack_contract",
     "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
     "transport_durable_owner", "transport_v2_status_capacity", "ave_sdk_smoke",
@@ -216,9 +217,11 @@ class WindowsReleaseGateTests(unittest.TestCase):
         (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
         lines = ["cmake_minimum_required(VERSION 3.19)", "project(GateFixture C)", "enable_testing()",
                  "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)"]
+        registered_targets = set()
         for name, target in pairs:
-            if target != '""' and target != missing_target:
+            if target != '""' and target != missing_target and target not in registered_targets:
                 lines.append(f"add_executable({target} main.c)")
+                registered_targets.add(target)
             if name != missing_test:
                 command = target if target != '""' else '"${CMAKE_COMMAND}" -E true'
                 if name == failing_test:
@@ -279,7 +282,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
         for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
                      "behavior_record_alert_proto_contract", "command_signature_cross_language",
                      "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
-                     "windows_rule_semantic_audit"):
+                     "windows_rule_semantic_audit", "installer_runtime_health_classification",
+                     "report_events_ack_contract"):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
@@ -288,6 +292,16 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     result = self.run_command("ctest", "--test-dir", str(build), "-L", label,
                                               "--no-tests=error", "--output-on-failure", success=False)
                     self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+
+    def test_installer_health_failure_blocks_windows_release(self):
+        name = "windows_installer_health_behavior"
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, failing_test=name)
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
+            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                      "--no-tests=error", "--output-on-failure", success=False)
+            self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
     def test_empty_selection_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -438,11 +452,12 @@ class WindowsReleaseGateTests(unittest.TestCase):
             source = Path(directory)
             build = source / "build"
             (source / "windows.h").write_text(
-                '#include <stdint.h>\n#define MAX_PATH 260\n'
+                '#include <stdint.h>\n#include <stddef.h>\n#define MAX_PATH 260\n'
                 '/* Windows SDK rpcndr.h exposes this MIDL type macro. */\n'
                 '#define small char\n'
-                'typedef uint32_t DWORD;\n'
+                'typedef uint32_t DWORD;\n#define WINAPI\n'
                 'typedef void *HANDLE;\ntypedef int BOOL;\n'
+                'HANDLE CreateThread(void *, size_t, DWORD (WINAPI *)(void *), void *, DWORD, DWORD *);\n'
                 '#define FALSE 0\n#define CREATE_NO_WINDOW 0x08000000\n#define WAIT_OBJECT_0 0\n'
                 'typedef struct { DWORD cb; } STARTUPINFOA;\n'
                 'typedef struct { HANDLE hProcess, hThread; } PROCESS_INFORMATION;\n'
