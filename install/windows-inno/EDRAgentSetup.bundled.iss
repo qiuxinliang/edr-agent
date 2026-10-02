@@ -699,7 +699,7 @@ end;
 
 procedure EdrInitDiagnostics;
 begin
-  EdrInstallationRunId := GetDateTimeString('yyyymmddhhnnsszzz', '', '');
+  EdrInstallationRunId := GetDateTimeString('yyyymmddhhnnsszzz', #0, #0);
   EdrPolicyVerifyOk := False;
   EdrPresenceVerifyOk := False;
   EdrDiagnosticsDir := ExpandConstant('{commonappdata}\FDSecurity\setup-ui\agent-diagnostics');
