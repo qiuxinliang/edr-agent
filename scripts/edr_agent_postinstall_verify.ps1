@@ -51,9 +51,14 @@ function Read-TomlString {
   param([string]$Path, [string]$Key)
   if (-not (Test-Path -LiteralPath $Path)) { return "" }
   $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"([^"]*)"'
-  foreach ($line in [System.IO.File]::ReadLines(([System.IO.Path]::GetFullPath($Path)))) {
-    $m = [regex]::Match($line, $pattern)
-    if ($m.Success) { return $m.Groups[1].Value }
+  $reader = [System.IO.File]::OpenText(([System.IO.Path]::GetFullPath($Path)))
+  try {
+    while ($null -ne ($line = $reader.ReadLine())) {
+      $m = [regex]::Match($line, $pattern)
+      if ($m.Success) { return $m.Groups[1].Value }
+    }
+  } finally {
+    $reader.Dispose()
   }
   return ""
 }
@@ -199,7 +204,9 @@ function Write-Report {
   try {
     [System.IO.File]::WriteAllText($temporary, $json, $utf8NoBom)
     if ([System.IO.File]::Exists($path)) {
-      [System.IO.File]::Replace($temporary, $path, $null)
+      # Windows PowerShell converts $null to an empty string for this .NET
+      # string parameter. NullString supplies the actual no-backup null value.
+      [System.IO.File]::Replace($temporary, $path, [NullString]::Value)
     } else {
       [System.IO.File]::Move($temporary, $path)
     }

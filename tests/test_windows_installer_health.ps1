@@ -7,7 +7,66 @@ $report = Join-Path $root 'runtime.json'
 $config = Join-Path $root 'agent.toml'
 $binary = Join-Path $root 'FDSensor.exe'
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+function Assert-FileReleased([string]$Path) {
+  $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+  try { Assert-True ($stream.Length -ge 0) 'Config must allow immediate exclusive access' }
+  finally { $stream.Dispose() }
+}
 try {
+  # Extract only the real reader functions, never installation/service entrypoints.
+  # FileShare.None checks early returns immediately without relying on GC.
+  $readerConfig = Join-Path $root 'reader.toml'
+  foreach ($reader in @(
+      @('scripts/edr_agent_postinstall_verify.ps1', 'Read-TomlString'),
+      @('scripts/edr_agent_install.ps1', 'Read-AgentTomlScalar'),
+      @('scripts/windows_service_install.ps1', 'Read-AgentTomlScalar'))) {
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot $reader[0]), [ref]$tokens, [ref]$parseErrors)
+    Assert-True (@($parseErrors).Count -eq 0) ('Reader source must parse: ' + $reader[0])
+    $readerName = $reader[1]
+    $node = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq $readerName })
+    Assert-True ($node.Count -eq 1) ('Missing unique production reader: ' + $readerName)
+    . ([scriptblock]::Create($node[0].Extent.Text))
+    [IO.File]::WriteAllText($readerConfig, "first = `"first-value`"`nliteral.key = `"middle-value`"`nempty = `"`"`nlast = `"last-value`"")
+    foreach ($sample in @(@('first','first-value'), @('literal.key','middle-value'), @('empty',''), @('last','last-value'), @('absent',''))) {
+      $value = & $readerName -Path $readerConfig -Key $sample[0]
+      Assert-True ([string]$value -ceq $sample[1]) ('Unexpected TOML scalar from ' + $reader[0] + ': ' + $sample[0])
+      Assert-FileReleased $readerConfig
+    }
+    $value = & $readerName -Path (Join-Path $root 'missing-reader.toml') -Key first
+    Assert-True ([string]$value -eq '') 'Missing TOML must return an empty scalar'
+  }
+
+  # Exercise the production atomic writer directly, including its failure path.
+  $verifier = Join-Path $RepoRoot 'scripts/edr_agent_postinstall_verify.ps1'
+  $tokens = $null; $parseErrors = $null
+  $ast = [Management.Automation.Language.Parser]::ParseFile($verifier, [ref]$tokens, [ref]$parseErrors)
+  Assert-True (@($parseErrors).Count -eq 0) 'Verifier source must parse'
+  foreach ($name in @('Write-VerifyLog', 'Write-Report')) {
+    $node = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq $name })
+    Assert-True ($node.Count -eq 1) ('Missing unique production writer: ' + $name)
+    . ([scriptblock]::Create($node[0].Extent.Text))
+  }
+  $ReportPath = Join-Path $root 'atomic-runtime.json'
+  $LogPath = Join-Path $root 'atomic-runtime.log'
+  foreach ($round in 1..3) {
+    $checkId = [Guid]::NewGuid().ToString('N')
+    Write-Report -Report ([ordered]@{status='ok'; check_id=$checkId; round=$round})
+    $written = [IO.File]::ReadAllText($ReportPath) | ConvertFrom-Json
+    Assert-True ($written.check_id -eq $checkId -and $written.round -eq $round) 'Atomic creation/replacement must publish the complete current report'
+    Assert-True (@(Get-ChildItem -LiteralPath $root -Filter 'atomic-runtime.json.*.tmp').Count -eq 0) 'Successful report publication must remove its temporary file'
+  }
+  $previousBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($ReportPath))
+  $lockedReport = [IO.File]::Open($ReportPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  $writeFailure = $null
+  try {
+    try { Write-Report -Report ([ordered]@{status='failed'; check_id='must-not-publish'}) }
+    catch { $writeFailure = $_.Exception }
+  } finally { $lockedReport.Dispose() }
+  Assert-True ($null -ne $writeFailure -and $writeFailure.GetBaseException() -is [IO.IOException]) 'Locked destination must fail explicitly with an I/O cause'
+  Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($ReportPath)) -eq $previousBytes) 'Failed replacement must preserve the previous complete report'
+  Assert-True (@(Get-ChildItem -LiteralPath $root -Filter 'atomic-runtime.json.*.tmp').Count -eq 0) 'Failed replacement must remove its temporary file'
+
   [IO.File]::WriteAllText($config, "endpoint_id = `"test`"`ntenant_id = `"test`"`nrest_base_url = `"https://example.invalid`"")
   [IO.File]::WriteAllText((Join-Path $root 'VERSION'), 'test-version')
   [IO.File]::WriteAllText($report, '{"status":"ok","check_id":"old"}')
@@ -46,7 +105,6 @@ try {
     [pscustomobject]@{TaskName='FDSecurityAgent'; State=$script:fixtureTask}
   }
   function Get-ScheduledTaskInfo { [CmdletBinding()]param($InputObject) [pscustomobject]@{LastTaskResult=0} }
-  $verifier = Join-Path $RepoRoot 'scripts/edr_agent_postinstall_verify.ps1'
   foreach ($case in @(
       @('running','Running','service','ok'), @('running','Stopped','service','failed'),
       @('running','missing','service','failed'), @('running','unknown','service','unknown'),
@@ -60,11 +118,13 @@ try {
     Assert-True ($r.status -eq $case[3]) ('Unexpected verification result for ' + ($case -join ','))
     Assert-True (($code -eq 0) -eq ($case[3] -eq 'ok')) 'Only current successful verification may return zero'
     Assert-True ($r.check_id -ne $oldId -and $r.installation_run_id -eq 'ps-test') 'Verifier must replace historical results'
+    Assert-FileReleased $config
     $oldId=$r.check_id
   }
   Remove-Item -LiteralPath $binary
   & $verifier -InstallDir $root -ConfigPath $config -ReportPath $report -RuntimeMode manual
   $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
   Assert-True ($r.binary_state -eq 'missing' -and $r.status -eq 'failed') 'Removed binary must fail current health'
-  Write-Host 'PASS: fresh native reports and verifier running/stopped/absent/unknown/path identity behavior'
+  Assert-FileReleased $config
+  Write-Host 'PASS: released TOML readers, atomic reports and fresh native/verifier health states'
 } finally { Remove-Item -LiteralPath $root -Recurse -Force }

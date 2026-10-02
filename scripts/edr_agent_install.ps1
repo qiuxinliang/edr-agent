@@ -286,11 +286,16 @@ function Read-AgentTomlScalar {
     return ""
   }
   $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"([^"]*)"'
-  foreach ($line in [System.IO.File]::ReadLines(([System.IO.Path]::GetFullPath($Path)))) {
-    $m = [regex]::Match($line, $pattern)
-    if ($m.Success) {
-      return $m.Groups[1].Value
+  $reader = [System.IO.File]::OpenText(([System.IO.Path]::GetFullPath($Path)))
+  try {
+    while ($null -ne ($line = $reader.ReadLine())) {
+      $m = [regex]::Match($line, $pattern)
+      if ($m.Success) {
+        return $m.Groups[1].Value
+      }
     }
+  } finally {
+    $reader.Dispose()
   }
   return ""
 }

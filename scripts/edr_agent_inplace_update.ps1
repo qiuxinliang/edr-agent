@@ -146,7 +146,7 @@ function Get-InstallerLogEvidence {
   $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($tail)
   $handle = [System.IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
-  if (Test-Path -LiteralPath $snapshotPath) { [System.IO.File]::Replace($tmp, $snapshotPath, $null, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
+  if (Test-Path -LiteralPath $snapshotPath) { [System.IO.File]::Replace($tmp, $snapshotPath, [NullString]::Value, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
   $snapshot = Get-Item -LiteralPath $snapshotPath -Force
 	if (($snapshot.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshot.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
   [pscustomobject]@{ Status='ready'; Path=$snapshotPath; Size=[UInt64]$snapshot.Length; OriginalSize=[UInt64]$item.Length; Sha256=(Get-Sha256 -Path $snapshotPath); Summary=$tail }
@@ -175,7 +175,7 @@ function New-InstallerDiagnosticEvidence {
   $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($diagnostic)
   $handle = [System.IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
-  if ($existing) { [System.IO.File]::Replace($tmp, $snapshotPath, $null, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
+  if ($existing) { [System.IO.File]::Replace($tmp, $snapshotPath, [NullString]::Value, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
   $snapshot = Get-Item -LiteralPath $snapshotPath -Force
 	if (($snapshot.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshot.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
   return [pscustomobject]@{ Path=$snapshotPath; Size=[UInt64]$snapshot.Length; Sha256=(Get-Sha256 -Path $snapshotPath) }
