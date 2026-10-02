@@ -86,23 +86,25 @@ try {
   # Execute the real verifier with only OS query boundaries replaced. No service,
   # scheduled task, remote host or running Agent on this machine is modified.
   [IO.File]::WriteAllText($binary, 'fixture')
-  $script:fixtureProcess = 'running'
-  $script:fixtureService = 'Running'
-  $script:fixtureTask = 'Ready'
+  # Let query boundaries find the fixture in their parent scope. The verifier
+  # runs as a child .ps1, whose script scope does not own these test variables.
+  $fixtureProcess = 'running'
+  $fixtureService = 'Running'
+  $fixtureTask = 'Ready'
   function Get-CimInstance {
     [CmdletBinding()]param($ClassName, $Filter)
-    if ($script:fixtureProcess -eq 'unknown') { throw 'fixture query denied' }
-    if ($script:fixtureProcess -eq 'running') { [pscustomobject]@{ ExecutablePath = $binary } }
-    if ($script:fixtureProcess -eq 'unrelated') { [pscustomobject]@{ ExecutablePath = 'C:\unrelated\FDSensor.exe' } }
+    if ($fixtureProcess -eq 'unknown') { throw 'fixture query denied' }
+    if ($fixtureProcess -eq 'running') { [pscustomobject]@{ ExecutablePath = $binary } }
+    if ($fixtureProcess -eq 'unrelated') { [pscustomobject]@{ ExecutablePath = 'C:\unrelated\FDSensor.exe' } }
   }
   function Get-Service {
     [CmdletBinding()]param()
-    if ($script:fixtureService -eq 'unknown') { throw 'fixture query denied' }
-    if ($script:fixtureService -ne 'missing') { [pscustomobject]@{Name='FDSecurityAgent'; Status=$script:fixtureService} }
+    if ($fixtureService -eq 'unknown') { throw 'fixture query denied' }
+    if ($fixtureService -ne 'missing') { [pscustomobject]@{Name='FDSecurityAgent'; Status=$fixtureService} }
   }
   function Get-ScheduledTask {
     [CmdletBinding()]param()
-    [pscustomobject]@{TaskName='FDSecurityAgent'; State=$script:fixtureTask}
+    [pscustomobject]@{TaskName='FDSecurityAgent'; State=$fixtureTask}
   }
   function Get-ScheduledTaskInfo { [CmdletBinding()]param($InputObject) [pscustomobject]@{LastTaskResult=0} }
   foreach ($case in @(
@@ -111,10 +113,14 @@ try {
       @('missing','Running','service','failed'), @('unrelated','Running','service','failed'),
       @('unknown','Running','service','unknown'), @('running','missing','scheduled_task','failed'),
       @('running','missing','manual','ok'))) {
-    $script:fixtureProcess=$case[0]; $script:fixtureService=$case[1]
-    & $verifier -InstallDir $root -ConfigPath $config -ReportPath $report -RuntimeMode $case[2] -InstallationRunId ps-test
+    $fixtureProcess=$case[0]; $fixtureService=$case[1]
+    & $verifier -InstallDir $root -ConfigPath $config -ReportPath $report -LogPath (Join-Path $root 'verify.log') -RuntimeMode $case[2] -InstallationRunId ps-test
     $code = $LASTEXITCODE
     $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+    $expectedProcess = if ($case[0] -eq 'unrelated') { 'missing' } else { $case[0] }
+    Assert-True ($r.process_state -eq $expectedProcess) ('Verifier must observe the process fixture for ' + ($case -join ','))
+    Assert-True ($r.service_state -eq $case[1].ToLowerInvariant()) ('Verifier must observe the service fixture for ' + ($case -join ','))
+    Assert-True ($r.scheduled_task_state -eq $fixtureTask.ToLowerInvariant()) ('Verifier must observe the task fixture for ' + ($case -join ','))
     Assert-True ($r.status -eq $case[3]) ('Unexpected verification result for ' + ($case -join ','))
     Assert-True (($code -eq 0) -eq ($case[3] -eq 'ok')) 'Only current successful verification may return zero'
     Assert-True ($r.check_id -ne $oldId -and $r.installation_run_id -eq 'ps-test') 'Verifier must replace historical results'
@@ -122,9 +128,19 @@ try {
     $oldId=$r.check_id
   }
   Remove-Item -LiteralPath $binary
-  & $verifier -InstallDir $root -ConfigPath $config -ReportPath $report -RuntimeMode manual
+  & $verifier -InstallDir $root -ConfigPath $config -ReportPath $report -LogPath (Join-Path $root 'verify.log') -RuntimeMode manual
   $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
   Assert-True ($r.binary_state -eq 'missing' -and $r.status -eq 'failed') 'Removed binary must fail current health'
   Assert-FileReleased $config
   Write-Host 'PASS: released TOML readers, atomic reports and fresh native/verifier health states'
+} catch {
+  $testFailure = $_
+  # Preserve the synthetic fixture report in CTest output before strict cleanup.
+  # This includes the first failed check without retaining temporary test files.
+  try {
+    if (Test-Path -LiteralPath $report -PathType Leaf) {
+      Write-Host ('installer_health_failure_report=' + [IO.File]::ReadAllText($report))
+    }
+  } catch { Write-Warning ('Could not read the synthetic failure report: ' + $_.Exception.Message) }
+  throw $testFailure
 } finally { Remove-Item -LiteralPath $root -Recurse -Force }
