@@ -586,7 +586,7 @@ static void test_async_collector_wall_timeout_windows(void) {
   expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create Windows timeout directory");
   snprintf(marker, sizeof(marker), "%s\\orphan-write", dir);
   expect_true(GetModuleFileNameA(NULL, exe, sizeof(exe)) > 0, "locate test child executable");
-  snprintf(extra, sizeof(extra), "--marker=\"%s\"", marker);
+  snprintf(extra, sizeof(extra), "--out-file=\"%s\"", marker);
   EdrCollectorRunSpec spec = {0};
   spec.collector_bin = exe; spec.fixed_local_binary = 1;
   spec.scope = "timeout-test"; spec.output_dir = dir; spec.extra_args = extra; spec.timeout_s = 1;
@@ -612,7 +612,7 @@ static int run_timeout_test_child(int argc, char **argv) {
       Sleep(2500);
       return write_file_bytes(argv[i] + 13, "unexpected orphan write");
     }
-    if (strncmp(argv[i], "--marker=", 9) == 0) marker = argv[i] + 9;
+    if (strncmp(argv[i], "--out-file=", 11) == 0) marker = argv[i] + 11;
     if (strcmp(argv[i], "--scope=timeout-test") == 0) collector = 1;
   }
   if (!collector) return -1;
@@ -629,6 +629,60 @@ static int run_timeout_test_child(int argc, char **argv) {
 }
 #endif
 
+static void test_collector_arguments_cannot_create_independent_egress(void) {
+  const char *denied[] = {
+    "--upload-url=https://synthetic.invalid/raw", "--frontend=synthetic.invalid",
+    "--config=https://synthetic.invalid/client.yaml", "--request=//synthetic-host/share/job.req",
+    "--unknown-network-option=1", "--out-file=one --out-file=two",
+    "--request=\"unterminated"
+  };
+  EdrCollectorRunSpec spec = {0};
+  spec.collector_bin = "synthetic-absent-local-collector";
+  spec.fixed_local_binary = 1;
+  spec.scope = "triage";
+  spec.output_dir = ".";
+  char detail[256];
+  unsigned before = g_download_calls;
+  for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); ++i) {
+    spec.extra_args = denied[i];
+    expect_true(edr_deep_collector_run_blocking(&spec, detail, sizeof(detail)) == EDR_DC_ERR_DISABLED,
+                "blocking collector rejects unsupported egress before resolving its binary");
+    expect_true(strstr(detail, "collector_arguments_purpose_denied") != NULL,
+                "collector reports a bounded local purpose reason");
+    expect_true(edr_deep_collector_spawn(&spec, detail, sizeof(detail)) == EDR_DC_ERR_DISABLED,
+                "async collector uses the same local argument contract");
+  }
+  expect_true(g_download_calls == before, "denied collector arguments cannot cause a download");
+  EdrDeepCollectorParams params = {0};
+  params.scope = "triage";
+  params.output_dir = ".";
+  params.upload_url = "https://synthetic.invalid/raw";
+  expect_true(edr_deep_collector_launch(&params) == EDR_DC_ERR_DISABLED,
+              "legacy launch rejects an independent upload URL");
+}
+
+#ifndef _WIN32
+static void test_local_collector_preserves_quoted_paths(void) {
+  char dir[512], script[600], rows[640], extra[1500], detail[256];
+  expect_true(make_temp_dir(dir,sizeof(dir))==0,"local quoted-path fixture directory");
+  snprintf(script,sizeof(script),"%s/local-collector",dir);
+  snprintf(rows,sizeof(rows),"%s/local rows.txt",dir);
+  const char *body="#!/bin/sh\nfor value do\n case $value in --out-file=*) out=${value#*=};; esac\ndone\nprintf '%s\\n' \"$@\" > \"$out\"\n";
+  expect_true(write_file_bytes(script,body)==0 && chmod(script,0700)==0,"local collector fixture");
+  snprintf(extra,sizeof(extra),"--mode=query --request=\"%s/local request.req\" --out-file=\"%s\" --limit=12",dir,rows);
+  EdrCollectorRunSpec spec={0}; spec.collector_bin=script; spec.fixed_local_binary=1;
+  spec.scope="triage"; spec.output_dir=dir; spec.extra_args=extra; spec.timeout_s=3;
+  expect_true(edr_deep_collector_run_blocking(&spec,detail,sizeof(detail))==EDR_DC_OK,
+              "local-only queries still execute with quoted local paths");
+  FILE *file=fopen(rows,"rb"); char captured[2200]={0};
+  expect_true(file!=NULL,"collector writes local output");
+  if(file) { (void)fread(captured,1,sizeof(captured)-1,file); fclose(file); }
+  expect_true(strstr(captured,"/local request.req\n") && strstr(captured,"/local rows.txt\n"),
+              "both quoted paths arrive as complete child arguments");
+  remove(rows); remove(script); rmdir(dir);
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
   int child_rc = run_timeout_test_child(argc, argv);
@@ -636,6 +690,7 @@ int main(int argc, char **argv) {
 #else
   (void)argc; (void)argv;
 #endif
+  test_collector_arguments_cannot_create_independent_egress();
   test_json_url_unescape();
   test_json_str_rejects_oversized_manifest_value();
   test_download_detail_keeps_curl_exit_when_prior_detail_is_full();
@@ -650,6 +705,7 @@ int main(int argc, char **argv) {
   test_maybe_refresh_replaces_on_sha_change();
   test_maybe_refresh_keeps_current_when_sha_matches();
 #ifndef _WIN32
+  test_local_collector_preserves_quoted_paths();
   test_blocking_collector_cancels_process_group();
   test_async_collector_wall_timeout();
 #else

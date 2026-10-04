@@ -1094,6 +1094,48 @@ static void log_p0_runtime_state(void) {
           (ir_source && ir_source[0]) ? ir_source : "unknown");
 }
 
+static uint8_t *pmfe_result_wire(const uint8_t *frame,size_t length,char batch_id[128]) {
+  if (!frame || !length || length>EDR_EGRESS_FRAME_MAX) return NULL;
+  uint8_t *wire=malloc(length+16u);
+  if (!wire) return NULL;
+  uint32_t words[4]={EDR_TRANSPORT_BATCH_MAGIC_RAW,1u,(uint32_t)length+4u,(uint32_t)length};
+  for (size_t i=0;i<4u;++i) for (size_t j=0;j<4u;++j) wire[4u*i+j]=(uint8_t)(words[i]>>(8u*j));
+  memcpy(wire+16u,frame,length);
+  if (!edr_behavior_durable_wire_batch_id("pmfe-result-v1",wire,length+16u,batch_id,128u)) {
+    free(wire); return NULL;
+  }
+  return wire;
+}
+static int pmfe_enqueue_result_frame(const uint8_t *frame,size_t length) {
+  char batch_id[128]; uint8_t *wire=pmfe_result_wire(frame,length,batch_id);
+  int ok=wire &&
+      edr_storage_queue_enqueue(batch_id,wire,length+16u,0,1)==EDR_OK;
+  free(wire); return ok;
+}
+
+static void poll_pmfe_followup_recovery(void) {
+  EdrPmfeFollowupTask task;
+  /* One bounded scan lease and one result handoff per preprocess turn. No
+   * evidence-owner mutex is held while entering the PMFE or queue owners. */
+  if (edr_local_evidence_cache_pmfe_take_task(&task) &&
+      edr_pmfe_submit_associated_scan(&task)<0)
+    edr_local_evidence_cache_pmfe_note_submit_failure(&task);
+  uint8_t *frame=NULL; size_t length=0;
+  int recovery=edr_local_evidence_cache_pmfe_replay_result(&frame,&length);
+  if (recovery==1) {
+    char reason[96];
+    if (edr_egress_frame_validate(frame,length,reason,sizeof(reason)) &&
+        !pmfe_enqueue_result_frame(frame,length))
+      fprintf(stderr,"[pmfe] durable result handoff failed; exact local wire retained\n");
+  } else if (recovery==2) {
+    char batch_id[128]; uint8_t *wire=pmfe_result_wire(frame,length,batch_id);
+    if (wire && edr_storage_queue_batch_presence(batch_id,wire,length+16u)==0)
+      (void)edr_local_evidence_cache_pmfe_queue_removed(frame,length);
+    free(wire);
+  }
+  free(frame);
+}
+
 static void emit_behavior_record(const EdrBehaviorRecord *br) {
   if (!br) {
     return;
@@ -1115,6 +1157,16 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
     n = edr_behavior_wire_encode(br, buf, EDR_EVENT_BATCH_CAP);
   }
   if (n > 0) {
+    if (edr_local_evidence_cache_pmfe_result_pending(br)) {
+      int bound=edr_local_evidence_cache_pmfe_bind_result(br,buf,n)==0;
+      /* Even a binding fault retains the complete frame with the immutable
+       * queue owner; the send guard holds it and cannot infer an ACK. */
+      if (!pmfe_enqueue_result_frame(buf,n))
+        fprintf(stderr,"[pmfe] result queue handoff failed; durable association recovery pending\n");
+      else if (!bound)
+        fprintf(stderr,"[pmfe] result association commit failed; complete queued wire held locally\n");
+      free(buf); return;
+    }
     char reason[96];
     if (!edr_egress_frame_validate(buf, n, reason, sizeof(reason))) {
       /* Detectors, generation-bound cache, AVE and local forensic consumers
@@ -1318,6 +1370,7 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
 #endif
   apply_agent_ids_to_record(&br);
+  (void)edr_local_evidence_cache_pmfe_apply_scope(&br);
   if (p0_process_collector_evidence_gate(&br)) {
     /* A collector capability assertion is intentionally source-only.  It may
      * not flow through matching, alert admission, correlation, or action. */
@@ -1437,7 +1490,8 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   edr_net_fanout_on_event(&br);
   EdrDetectionDecision dd;
   edr_detection_decision_evaluate_after_p0(&br, &dd, p0_proven_miss);
-  if (!edr_preprocess_admit_telemetry(&br, &dd)) {
+  int pmfe_associated=edr_local_evidence_cache_pmfe_result_pending(&br);
+  if (!edr_preprocess_admit_telemetry(&br, &dd) && !pmfe_associated) {
     if (br.type == EDR_EVENT_PROCESS_CREATE)
       edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition",
           dd.drop ? "decision_drop" : strcmp(dd.selection_action, "local_only") == 0
@@ -1448,12 +1502,12 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   /* P2 T9: keep local AVE and forensic consumers before the upload filter. */
   edr_ave_cross_engine_feed_from_record(&br);
   int local_forensics_dispatched = edr_command_dispatch_recommended_forensics(&br);
-  if (!edr_local_evidence_cache_is_candidate(&br)) {
+  if (!edr_local_evidence_cache_is_candidate(&br) && !pmfe_associated) {
     if (br.type == EDR_EVENT_PROCESS_CREATE)
       edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "not_retention_candidate");
     return;
   }
-  if (!edr_preprocess_sampling_allow(&br)) {
+  if (!edr_preprocess_sampling_allow(&br) && !pmfe_associated) {
     if (br.type == EDR_EVENT_PROCESS_CREATE)
       edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "sampling_rejected");
     return;
@@ -1652,6 +1706,7 @@ static void *preprocess_main(void *arg) {
   for (;;) {
     edr_health_beat(EDR_HEALTH_PREPROCESS);
     poll_pending_process_evidence();
+    poll_pmfe_followup_recovery();
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
       process_one_slot(&slot);

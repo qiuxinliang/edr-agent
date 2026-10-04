@@ -1231,6 +1231,8 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_local_evidence_cache_candidate PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
@@ -1249,6 +1251,8 @@ endif()
 if(NOT MSVC)
   target_link_libraries(test_local_evidence_cache_candidate PRIVATE m)
 endif()
+target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_NANOPB=1)
+target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_policy)
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -1667,10 +1671,30 @@ edr_apply_test_warnings(test_egress_request_policy)
 add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 target_link_libraries(test_deep_collector_manifest PRIVATE edr_egress_policy)
 
+if(SQLite3_FOUND)
+  add_executable(test_queue_recovery test_queue_recovery.c
+    ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/src/core/time_util.c
+    ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
+  target_compile_definitions(test_queue_recovery PRIVATE EDR_HAVE_SQLITE=1 EDR_STORAGE_QUEUE_TESTING=1)
+  target_link_libraries(test_queue_recovery PRIVATE edr_egress_policy Threads::Threads)
+  if(TARGET SQLite3::SQLite3)
+    target_link_libraries(test_queue_recovery PRIVATE SQLite3::SQLite3)
+  else()
+    target_link_libraries(test_queue_recovery PRIVATE SQLite::SQLite3)
+  endif()
+  edr_apply_test_warnings(test_queue_recovery)
+  add_test(NAME queue_recovery_real_codec COMMAND test_queue_recovery)
+  set_tests_properties(queue_recovery_real_codec PROPERTIES TIMEOUT 60)
+endif()
+
+
 # Compile the actual queue/codec/HTTPS owners, with the agent's exact build
 # features. The test entry point only uses synthetic loopback data; collectors
 # and the service main loop are never started.
-if(NOT WIN32 AND SQLite3_FOUND AND OpenSSL_FOUND)
+if(SQLite3_FOUND AND OpenSSL_FOUND)
   get_target_property(_egress_agent_sources edr_agent SOURCES)
   set(_egress_tls_sources)
   foreach(_source IN LISTS _egress_agent_sources)
@@ -1689,11 +1713,22 @@ if(NOT WIN32 AND SQLite3_FOUND AND OpenSSL_FOUND)
     $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
   target_link_libraries(test_egress_tls_client PRIVATE
     $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  target_compile_definitions(test_egress_tls_client PRIVATE EDR_TEST_EXTENDED_EGRESS=1)
   edr_apply_test_warnings(test_egress_tls_client)
   add_test(NAME egress_loopback_mtls COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
     --client $<TARGET_FILE:test_egress_tls_client>)
   set_tests_properties(egress_loopback_mtls PROPERTIES TIMEOUT 150)
+  add_executable(test_pmfe_lifecycle test_pmfe_lifecycle.c ${_egress_tls_sources})
+  target_include_directories(test_pmfe_lifecycle PRIVATE
+    $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_pmfe_lifecycle PRIVATE
+    $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS> EDR_PMFE_LIFECYCLE_TESTING=1)
+  target_link_libraries(test_pmfe_lifecycle PRIVATE
+    $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_pmfe_lifecycle)
+  add_test(NAME pmfe_lifecycle_policy_switch COMMAND test_pmfe_lifecycle)
+  set_tests_properties(pmfe_lifecycle_policy_switch PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(test_runtime_health test_runtime_health.c)
@@ -1723,3 +1758,30 @@ if(UNIX AND TARGET forensic_collector)
     COMMAND ${CMAKE_COMMAND} -E env "BIN=$<TARGET_FILE:forensic_collector>"
       ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/forensic_collector/test_bundle.py)
 endif()
+
+# The same focused contract list owns the build dependencies and CTest label.
+# Native Windows runner refuses missing real SQLite/IR/TLS contracts.
+add_custom_target(telemetry_minimization_tests)
+function(edr_minimization_test test_name target_name)
+  if(TEST "${test_name}" AND TARGET "${target_name}")
+    set_property(TEST "${test_name}" APPEND PROPERTY LABELS telemetry-minimization)
+    add_dependencies(telemetry_minimization_tests "${target_name}")
+  endif()
+endfunction()
+edr_minimization_test(egress_batch_policy test_egress_batch_policy)
+edr_minimization_test(egress_request_policy test_egress_request_policy)
+edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
+edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_candidate)
+edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)
+edr_minimization_test(detection_decision_combo test_detection_decision)
+edr_minimization_test(detection_regression_scenarios test_detection_regression)
+edr_minimization_test(detection_sensor_bridge test_detection_sensor_bridge)
+edr_minimization_test(telemetry_admission test_telemetry_admission)
+edr_minimization_test(deep_collector_manifest test_deep_collector_manifest)
+edr_minimization_test(p0_source_only_durable_contract test_p0_source_only_durable_contract)
+edr_minimization_test(egress_loopback_mtls test_egress_tls_client)
+edr_minimization_test(pmfe_lifecycle_policy_switch test_pmfe_lifecycle)
+edr_minimization_test(report_events_ack_contract test_report_events_ack)
+edr_minimization_test(health_upload test_health_upload)
+edr_minimization_test(behavior_record_alert_proto_contract test_behavior_record_alert_proto)
+edr_minimization_test(behavior_record_alert_emit_contract test_behavior_record_alert_emit)

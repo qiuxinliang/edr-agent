@@ -2,6 +2,9 @@
 
 #include "edr/pmfe.h"
 #include "edr/detection_decision.h"
+#include "edr/local_evidence_cache.h"
+#include "edr/behavior_proto.h"
+#include "edr/egress_batch_policy.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -181,7 +184,32 @@ void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorReco
   char reason[64];
   snprintf(reason, sizeof(reason), "shellcode:%.46s", alert_id[0] ? alert_id : "unlinked");
 
-  if (edr_pmfe_submit_etw_scan_ex(reason, target, band, hint_va) == 0) {
+  int submitted;
+  if (alert_id[0] && br->process_start_key && br->process_creation_filetime_100ns) {
+    EdrPmfeFollowupTask task; memset(&task,0,sizeof(task));
+    uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX);
+    size_t length=frame ? edr_behavior_record_encode_protobuf(br,frame,EDR_EGRESS_FRAME_MAX) : 0u;
+    int prepared=length ? edr_local_evidence_cache_pmfe_prepare(br,alert_id,frame,length,(uint32_t)band,hint_va,&task) : -1;
+    if (prepared<0) {
+      /* Storage failure cannot disable local detection. This RAM task still
+       * verifies the exact original generation, but its results receive no
+       * durable association authority. */
+      snprintf(task.association_id,sizeof(task.association_id),"unbound:%s",alert_id);
+      snprintf(task.source_alert_id,sizeof(task.source_alert_id),"%s",alert_id);
+      snprintf(task.endpoint_id,sizeof(task.endpoint_id),"%s",br->endpoint_id);
+      snprintf(task.tenant_id,sizeof(task.tenant_id),"%s",br->tenant_id);
+      task.pid=br->pid; task.process_start_key=br->process_start_key;
+      task.process_creation_filetime_100ns=br->process_creation_filetime_100ns;
+      task.source_event_time_ns=br->event_time_ns; task.band=(uint32_t)band; task.vad_hint_va=hint_va;
+      submitted=edr_pmfe_submit_associated_scan(&task);
+    } else {
+      /* The durable owner leases jobs, including after restart, before they
+       * enter the existing worker queue. */
+      submitted=prepared;
+    }
+    free(frame);
+  } else submitted=edr_pmfe_submit_etw_scan_ex(reason,target,band,hint_va);
+  if (submitted == 0) {
     fprintf(stderr, "[pmfe][etw] auto_queued shellcode alert_id=%s trigger=%s score=%.4f target_pid=%u band=%u hint=0x%llx\n",
             alert_id[0] ? alert_id : "unlinked", trigger[0] ? trigger : "unknown", score,
             (unsigned)target, (unsigned)band, (unsigned long long)hint_va);

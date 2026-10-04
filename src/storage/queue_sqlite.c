@@ -7,6 +7,7 @@
 #include "edr/transport_sink.h"
 #include "edr/transport_v2.h"
 #include "edr/egress_batch_policy.h"
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -48,6 +50,9 @@ static uint64_t s_terminal_precreate_transaction_failures;
 static uint64_t s_terminal_precreate_commit_failures;
 static uint64_t s_terminal_precreate_metadata_corruption_failures;
 static uint64_t s_terminal_outcome_unknown;
+static uint64_t s_terminal_policy_held_frames;
+static uint64_t s_terminal_local_retained;
+static sqlite3_int64 s_terminal_recheck_cursor;
 static uint64_t s_terminal_replay_selection_transient_failures;
 static uint64_t s_terminal_replay_metadata_corruption_failures;
 enum {
@@ -144,6 +149,10 @@ static int queue_p0_latch_end_durable_locked(int commit);
 static int queue_meta_ack_source_batch_locked(sqlite3 *db, const char *batch_id);
 static int queue_meta_quarantine_source_only_locked(sqlite3_int64 id, const char *reason);
 static void queue_meta_mark_clean_before_close_locked(void);
+static int recovery_projection_ack_locked(sqlite3_int64 origin_id, const char *batch_id,
+                                          const uint8_t *wire, size_t wire_len);
+static int recovery_projection_origin_valid_locked(sqlite3_int64 origin_id,
+    const char *batch_id,const uint8_t *wire,size_t wire_len);
 #if defined(_WIN32)
 static SRWLOCK s_queue_state_lock = SRWLOCK_INIT;
 static void queue_state_lock(void) { AcquireSRWLockExclusive(&s_queue_state_lock); }
@@ -153,6 +162,30 @@ static pthread_mutex_t s_queue_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static void queue_state_lock(void) { pthread_mutex_lock(&s_queue_state_lock); }
 static void queue_state_unlock(void) { pthread_mutex_unlock(&s_queue_state_lock); }
 #endif
+/* Independent lifetime lock: the final guard is also called while the queue
+ * mutex is held. Its owner reads committed state through a separate read-only
+ * connection, and must never recursively acquire the queue mutex. */
+#if defined(_WIN32)
+static SRWLOCK s_intent_owner_lock = SRWLOCK_INIT;
+static void intent_owner_lock(void) { AcquireSRWLockExclusive(&s_intent_owner_lock); }
+static void intent_owner_unlock(void) { ReleaseSRWLockExclusive(&s_intent_owner_lock); }
+#else
+static pthread_mutex_t s_intent_owner_lock = PTHREAD_MUTEX_INITIALIZER;
+static void intent_owner_lock(void) { pthread_mutex_lock(&s_intent_owner_lock); }
+static void intent_owner_unlock(void) { pthread_mutex_unlock(&s_intent_owner_lock); }
+#endif
+static char s_intent_owner_path[512];
+static uint8_t s_intent_owner_nonce[16];
+static void terminal_intent_owner_unregister_locked(void) {
+  edr_egress_set_p0_pair_validator(NULL,NULL);
+  intent_owner_lock();
+  s_intent_owner_path[0]='\0';
+  memset(s_intent_owner_nonce,0,sizeof(s_intent_owner_nonce));
+  intent_owner_unlock();
+}
+static int terminal_intent_association_validate(const EdrEgressP0PairAssociation *tuple,
+    const uint8_t *frame,size_t frame_len,void *user);
+
 #if defined(_WIN32)
 static HANDLE s_lock_handle = INVALID_HANDLE_VALUE;
 #else
@@ -352,7 +385,8 @@ static int queue_sql_sum_locked(const char *sql, uint64_t *out) {
 
 static int queue_logical_retained_bytes_locked(uint64_t *out) {
   static const char event_sql[] =
-      "SELECT COALESCE(SUM(length(batch_id)+length(payload)+512),0) "
+      "SELECT COALESCE(SUM(length(batch_id)+length(payload)+512+"
+      "CASE WHEN recovery_version>0 THEN 512 ELSE 0 END),0) "
       "FROM event_queue;";
   static const char terminal_sql[] =
       "SELECT COALESCE(SUM("
@@ -372,12 +406,16 @@ static int queue_logical_retained_bytes_locked(uint64_t *out) {
   uint64_t events;
   uint64_t terminals;
   uint64_t deferred;
+  uint64_t lineage;
   if (!out || !queue_sql_sum_locked(event_sql, &events) ||
       !queue_sql_sum_locked(terminal_sql, &terminals) ||
-      !queue_sql_sum_locked(deferred_sql, &deferred)) {
+      !queue_sql_sum_locked(deferred_sql, &deferred) ||
+      !queue_sql_sum_locked("SELECT CASE WHEN length(legacy_lineage)>0 THEN 2048 ELSE 0 END+"
+                            "CASE WHEN length(last_recovery_snapshot)>0 THEN 2048 ELSE 0 END "
+                            "FROM queue_meta WHERE id=1;", &lineage)) {
     return 0;
   }
-  *out = queue_add_bytes(queue_add_bytes(events, terminals), deferred);
+  *out = queue_add_bytes(queue_add_bytes(queue_add_bytes(events, terminals), deferred), lineage);
   return *out != UINT64_MAX;
 }
 
@@ -492,13 +530,22 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   out->physical_bytes = queue_add_bytes(queue_add_bytes(out->db_bytes, out->wal_bytes),
                                         out->shm_bytes);
   if (!queue_logical_retained_bytes_locked(&out->used_bytes) ||
-      !queue_sql_sum_locked("SELECT COALESCE(SUM(length(batch_id)+length(payload)+512),0) "
+      !queue_sql_sum_locked("SELECT COALESCE(SUM(length(batch_id)+length(payload)+512+"
+                            "CASE WHEN recovery_version>0 THEN 512 ELSE 0 END),0) "
                             "FROM event_queue WHERE status!='pending';",
                             &out->retained_nonpending_bytes) ||
       !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE status='local_evidence';",
                             &out->local_evidence_rows) ||
       !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE status='policy_held';",
                             &out->policy_held_rows) ||
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM queue_meta WHERE length(legacy_lineage)>0;",
+                            &out->legacy_owner_unacknowledged) ||
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='retained_unresolved';",
+                            &out->retained_unresolved_rows) ||
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_pending';",
+                            &out->projection_pending_rows) ||
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_acked';",
+                            &out->projection_acked_rows) ||
       !queue_pending_inventory_locked(&out->pending_rows, &out->oldest_pending_created_unix_s) ||
       !p0_deferred_inventory_locked(&out->p0_deferred_pending_rows,
                                     &out->p0_deferred_failed_rows)) {
@@ -758,6 +805,7 @@ static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_
   sqlite3_stmt *st = NULL;
   int is_terminal;
   int durable_transaction = 0;
+  sqlite3_int64 origin_id = 0;
   int source_only = severity == EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY;
   const char *sql = "DELETE FROM event_queue "
                     "WHERE id=? AND batch_id=? AND payload=? AND status='pending';";
@@ -770,7 +818,17 @@ static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_
     sqlite3_finalize(st);
     return -1;
   }
-  if (is_terminal || source_only) {
+  {
+    sqlite3_stmt *link = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT origin_row_id FROM event_queue WHERE id=?;", -1,
+                          &link, NULL) != SQLITE_OK) { sqlite3_finalize(st); return -1; }
+    sqlite3_bind_int64(link,1,id);
+    int link_rc=sqlite3_step(link);
+    if (link_rc==SQLITE_ROW) origin_id=sqlite3_column_int64(link,0);
+    sqlite3_finalize(link);
+    if (link_rc!=SQLITE_ROW || origin_id<0) { sqlite3_finalize(st); return -1; }
+  }
+  if (is_terminal || source_only || origin_id>0) {
     /* A severity-2 source record clears its matching capability latch only
      * with this central 2xx ACK DELETE. This is the same FULL crash boundary
      * used for terminal journal acknowledgements. */
@@ -797,12 +855,17 @@ static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_
      * are one FULL transaction, so no crash can strand a ready dual-acked row
      * after its ordinary queue copy disappeared. */
     if (durable_transaction) {
+      if (origin_id>0 && recovery_projection_ack_locked(origin_id,batch_id,payload,
+                                                       (size_t)payload_len) != 0) {
+        (void)terminal_journal_end_durable_locked(0);
+        return -1;
+      }
       if (source_only) {
         if (queue_meta_ack_source_batch_locked(db, batch_id) != 0) {
           (void)queue_p0_latch_end_durable_locked(0);
           return -1;
         }
-      } else if (terminal_journal_ack_batch_id_locked(db, batch_id) != 0) {
+      } else if (is_terminal && terminal_journal_ack_batch_id_locked(db, batch_id) != 0) {
         (void)terminal_journal_end_durable_locked(0);
         return -1;
       }
@@ -976,7 +1039,7 @@ static void cleanup_terminal_journal_rows(void) {
            * Transport failures never enter this state, but corrupt frames
            * must not disappear merely because retention elapsed. */
           "DELETE FROM enforcement_terminal_journal "
-          "WHERE state='completed' AND updated_at < ?;",
+          "WHERE state='completed' AND intent_acked=1 AND source_acked=1 AND combined_acked=1 AND updated_at < ?;",
           -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, cutoff);
     if (sqlite3_step(st) == SQLITE_DONE) {
@@ -1039,7 +1102,7 @@ static void cleanup_expired_rows(void) {
   if (sqlite3_prepare_v2(s_db,
                          "UPDATE event_queue SET status='dead_letter', terminal_reason='retention_expired', "
                          "terminal_at=? WHERE id IN (SELECT id FROM event_queue WHERE created_at < ? "
-                         "AND severity=1 AND status='pending' ORDER BY id LIMIT 256);",
+                         "AND severity=1 AND origin_row_id=0 AND status='pending' ORDER BY id LIMIT 256);",
                          -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
     sqlite3_bind_int64(st, 2, (sqlite3_int64)cutoff);
@@ -1103,7 +1166,7 @@ static int drain_one_row(void) {
    * an ongoing high-priority arrival stream from starving an older batch. */
   int fair_turn = s_delivery_priority_streak >= 7u;
   snprintf(sql, sizeof(sql),
-           "SELECT id,batch_id,payload,retry_count,severity FROM event_queue "
+           "SELECT id,batch_id,payload,retry_count,severity,origin_row_id FROM event_queue "
            "WHERE status='pending' AND (next_retry_at<=?1 OR next_retry_at>?1+300) "
            "ORDER BY %s LIMIT 1;", fair_turn ? "id ASC" : "severity DESC,id ASC");
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -1127,6 +1190,7 @@ static int drain_one_row(void) {
   int blob_len = sqlite3_column_bytes(st, 2);
   int retry_count = sqlite3_column_int(st, 3);
   int severity = sqlite3_column_int(st, 4);
+  sqlite3_int64 origin_id=sqlite3_column_int64(st,5);
   uint8_t *blob_copy = NULL;
   char *batch_id_copy = NULL;
   int allocation_failed = 0;
@@ -1190,7 +1254,7 @@ static int drain_one_row(void) {
     /* Severity 2 is the sole durable fail-closed disposition after a
      * collector/ruleset source cannot be evaluated. It never expires through
      * the ordinary retry policy: only a central ACK may remove it. */
-    if (severity != EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY && lim > 0 && retry_count >= lim) {
+    if (origin_id==0 && severity != EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY && lim > 0 && retry_count >= lim) {
       int disposed;
       disposed = dead_letter_row_by_id(id, "max_retries") == 0;
       if (disposed) s_delivery_failed++;
@@ -1214,6 +1278,18 @@ static int drain_one_row(void) {
     free(blob_copy);
     queue_state_unlock();
     return disposed ? 0 : 2;
+  }
+
+  int linked=origin_id>0?recovery_projection_origin_valid_locked(origin_id,batch_id_copy,
+                                                                blob_copy,(size_t)blob_len):1;
+  if (linked<0) {
+    s_delivery_resource_deferred++; s_delivery_requeued++;
+    free(batch_id_copy); free(blob_copy); queue_state_unlock(); return 2;
+  }
+  if (origin_id<0 || !linked) {
+    int retained=dead_letter_row_by_id(id,"projection_lineage_integrity_failed")==0;
+    if (retained) s_delivery_failed++;
+    free(batch_id_copy); free(blob_copy); queue_state_unlock(); return retained?0:2;
   }
 
   const uint8_t *b = blob_copy;
@@ -1304,6 +1380,12 @@ static int drain_one_row(void) {
       if (acknowledged) s_delivery_acked++;
     }
     queue_state_unlock();
+    if (acknowledged) {
+      char finalize_reason[96];
+      if (!edr_egress_batch_note_queue_removed(blob_copy,12,blob_copy+12,(size_t)blob_len-12,
+                                              finalize_reason,sizeof(finalize_reason)))
+        fprintf(stderr,"[queue] acknowledged payload removed; durable consumer finalize deferred\n");
+    }
     if (severity == EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) {
       fprintf(stderr, "[queue_delivery] state=%s row_id=%lld batch_id=%s\n",
               acknowledged ? "acked" : "ack_state_race", (long long)id,
@@ -1928,20 +2010,26 @@ static void terminal_journal_refresh_locked(void) {
     s_terminal_pending = 0u;
     s_terminal_failed = 0u;
     s_terminal_outcome_unknown = 0u;
+    s_terminal_policy_held_frames = 0u;
+    s_terminal_local_retained = 0u;
     return;
   }
   if (sqlite3_prepare_v2(
           s_db,
           "SELECT "
-          "SUM(CASE WHEN state IN ('pending_intent','outcome_unknown','ready') THEN 1 ELSE 0 END),"
+          "SUM(CASE WHEN state IN ('pending_intent','outcome_unknown','ready') OR (state IN ('completed','local_retained') AND intent_acked=0) THEN 1 ELSE 0 END),"
           "SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),"
-          "SUM(CASE WHEN state='outcome_unknown' THEN 1 ELSE 0 END) "
+          "SUM(CASE WHEN state='outcome_unknown' THEN 1 ELSE 0 END),"
+          "SUM(intent_policy_held+source_policy_held+combined_policy_held),"
+          "SUM(state='local_retained' AND intent_acked=1 AND combined_acked=1 AND source_acked=0) "
           "FROM enforcement_terminal_journal;",
           -1, &st, NULL) == SQLITE_OK) {
     if (sqlite3_step(st) == SQLITE_ROW) {
       s_terminal_pending = (uint64_t)sqlite3_column_int64(st, 0);
       s_terminal_failed = (uint64_t)sqlite3_column_int64(st, 1);
       s_terminal_outcome_unknown = (uint64_t)sqlite3_column_int64(st, 2);
+      s_terminal_policy_held_frames = (uint64_t)sqlite3_column_int64(st, 3);
+      s_terminal_local_retained = (uint64_t)sqlite3_column_int64(st,4);
     }
     sqlite3_finalize(st);
   }
@@ -2228,14 +2316,22 @@ static int terminal_journal_batch_exists_locked(sqlite3 *db, const char *batch_i
   return result;
 }
 
+static int terminal_journal_finish_ready_locked(sqlite3 *db) {
+  if (exec_simple(db,"UPDATE enforcement_terminal_journal SET state='completed',completed_at=updated_at,"
+      "reserved_bytes=0 WHERE state='ready' AND intent_acked=1 AND source_acked=1 AND combined_acked=1;")!=SQLITE_OK)
+    return -1;
+  /* ready is written only after a known final outcome. This local delivery
+   * disposition frees a pending slot, never acknowledges its source bytes,
+   * never discards evidence, and never resolves an outcome_unknown action. */
+  return exec_simple(db,"UPDATE enforcement_terminal_journal SET state='local_retained' "
+      "WHERE state='ready' AND intent_acked=1 AND source_policy_held=1 AND source_acked=0 AND combined_acked=1;")
+      ==SQLITE_OK ? 0 : -1;
+}
 static int terminal_journal_reconcile_completed_locked(void) {
   int rc;
   if (terminal_journal_begin_durable_locked() != 0) return -1;
-  rc = exec_simple(s_db,
-                   "UPDATE enforcement_terminal_journal SET state='completed',completed_at=updated_at,"
-                   "reserved_bytes=0 "
-                   "WHERE state='ready' AND source_acked=1 AND combined_acked=1;");
-  if (rc != SQLITE_OK) {
+  rc = terminal_journal_finish_ready_locked(s_db);
+  if (rc != 0) {
     (void)terminal_journal_end_durable_locked(0);
     return -1;
   }
@@ -2250,7 +2346,7 @@ static int terminal_journal_ack_batch_id_locked(sqlite3 *db, const char *batch_i
   int rc;
   const char *intent_sql =
       "UPDATE enforcement_terminal_journal SET intent_acked=1,last_error='',updated_at=? "
-      "WHERE state IN ('pending_intent','outcome_unknown','ready') "
+      "WHERE state IN ('pending_intent','outcome_unknown','ready','completed','local_retained') "
       "AND intent_acked=0 AND intent_batch_id=?;";
   const char *source_sql =
       "UPDATE enforcement_terminal_journal SET source_acked=1,last_error='',updated_at=? "
@@ -2292,12 +2388,7 @@ static int terminal_journal_ack_batch_id_locked(sqlite3 *db, const char *batch_i
 #ifdef EDR_STORAGE_QUEUE_TESTING
   if (terminal_journal_test_fail_ack_step()) return -1;
 #endif
-  rc = exec_simple(
-      db,
-      "UPDATE enforcement_terminal_journal SET state='completed',completed_at=updated_at,"
-      "reserved_bytes=0 "
-      "WHERE state='ready' AND source_acked=1 AND combined_acked=1;");
-  return rc == SQLITE_OK ? 0 : -1;
+  return terminal_journal_finish_ready_locked(db);
 }
 
 /* 锁等待上限(ms):重装/重启时旧实例可能在数秒内才释放锁;有界重试避免新实例瞬时秒退。
@@ -2385,6 +2476,8 @@ static EdrError queue_lock_acquire(const char *path) {
 }
 
 static void storage_queue_close_unlocked(void) {
+  terminal_intent_owner_unregister_locked();
+  s_terminal_recheck_cursor=0;
   if (s_db) {
     /* A clean close is the only way a later open may distinguish an ordinary
      * restart from a crash between pre-intent latch and source insertion. If
@@ -2428,6 +2521,72 @@ static int queue_busy_timeout_ms(void) {
   if (v < 100) v = 100;
   if (v > 60000) v = 60000;
   return (int)v;
+}
+
+/* Owned metadata only; callers supply fixed table/column names. No payload or
+ * identity is rewritten. Each ALTER is restart-safe through table_info. */
+static int queue_ensure_metadata_column_locked(const char *table, const char *name,
+                                                const char *definition) {
+  char sql[512]; sqlite3_stmt *st = NULL; int found = 0, rc;
+  if (snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table) <= 0 ||
+      sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+  while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+    const unsigned char *column = sqlite3_column_text(st, 1);
+    if (column && !strcmp((const char *)column, name)) found = 1;
+  }
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) return -1;
+  if (found) return 0;
+  int n = snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;", table, name, definition);
+  return n > 0 && (size_t)n < sizeof(sql) && exec_simple(s_db, sql) == SQLITE_OK ? 0 : -1;
+}
+
+static int terminal_frame_metadata_ensure_locked(void) {
+  static const char *prefixes[] = {"intent", "source", "combined"};
+  for (size_t i = 0; i < 3u; ++i) {
+    char name[64], definition[128];
+    snprintf(name, sizeof(name), "%s_policy_held", prefixes[i]);
+    snprintf(definition, sizeof(definition), "INTEGER NOT NULL DEFAULT 0 CHECK(%s IN (0,1))", name);
+    if (queue_ensure_metadata_column_locked("enforcement_terminal_journal", name,
+        definition) != 0) return -1;
+    snprintf(name, sizeof(name), "%s_policy_reason", prefixes[i]);
+    if (queue_ensure_metadata_column_locked("enforcement_terminal_journal", name,
+        "TEXT NOT NULL DEFAULT ''") != 0) return -1;
+    snprintf(name, sizeof(name), "%s_next_retry_at", prefixes[i]);
+    int existed=terminal_journal_has_column_locked(name);
+    if (existed<0) return -1;
+    if (queue_ensure_metadata_column_locked("enforcement_terminal_journal", name,
+        "INTEGER NOT NULL DEFAULT 0") != 0) return -1;
+    if (!existed) {
+      char sql[512];
+      snprintf(sql,sizeof(sql),"UPDATE enforcement_terminal_journal SET %s=updated_at+"
+        "CASE WHEN %s_retry_count>=9 THEN 300 ELSE 1<<MAX(0,%s_retry_count-1) END "
+        "WHERE %s_retry_count>0 AND %s_acked=0;",name,prefixes[i],prefixes[i],prefixes[i],prefixes[i]);
+      if (exec_simple(s_db,sql)!=SQLITE_OK) return -1;
+    }
+  }
+  return 0;
+}
+
+static int queue_recovery_metadata_ensure_locked(void) {
+  static const struct { const char *name; const char *type; } columns[] = {
+    {"recovery_version", "INTEGER NOT NULL DEFAULT 0"},
+    {"original_sha256", "TEXT NOT NULL DEFAULT ''"},
+    {"projection_batch_id", "TEXT NOT NULL DEFAULT ''"},
+    {"projection_sha256", "TEXT NOT NULL DEFAULT ''"},
+    {"projector_version", "TEXT NOT NULL DEFAULT ''"},
+    {"recovery_state", "TEXT NOT NULL DEFAULT ''"},
+    {"origin_row_id", "INTEGER NOT NULL DEFAULT 0"}
+  };
+  for (size_t i=0; i<sizeof(columns)/sizeof(columns[0]); ++i)
+    if (queue_ensure_metadata_column_locked("event_queue",columns[i].name,
+                                           columns[i].type) != 0) return -1;
+  if (queue_ensure_metadata_column_locked("queue_meta","legacy_lineage",
+                                         "TEXT NOT NULL DEFAULT ''") != 0) return -1;
+  if (queue_ensure_metadata_column_locked("queue_meta","last_recovery_owner",
+                                         "TEXT NOT NULL DEFAULT ''") != 0) return -1;
+  return queue_ensure_metadata_column_locked("queue_meta","last_recovery_snapshot",
+                                             "TEXT NOT NULL DEFAULT ''");
 }
 
 EdrError edr_storage_queue_open(const char *path) {
@@ -2670,7 +2829,8 @@ EdrError edr_storage_queue_open(const char *path) {
    * initialized or migrated before any producer can enqueue evidence; a
    * malformed old header/metadata becomes a recovery-required audit rather
    * than a silently healthy capability. */
-  if (queue_meta_ensure_open_locked() != 0) {
+  if (terminal_frame_metadata_ensure_locked() != 0 ||
+      queue_recovery_metadata_ensure_locked() != 0 || queue_meta_ensure_open_locked() != 0) {
     sqlite3_close(s_db);
     s_db = NULL;
     queue_lock_release();
@@ -2706,6 +2866,17 @@ EdrError edr_storage_queue_open(const char *path) {
   }
   s_db_generation++;
   if (s_db_generation == 0u) s_db_generation++;
+  {
+    QueueMetaRow owner;
+    if (queue_meta_read_locked(&owner)!=0) {
+      storage_queue_close_unlocked(); queue_state_unlock(); return EDR_ERR_SQLITE_WRITE;
+    }
+    intent_owner_lock();
+    snprintf(s_intent_owner_path,sizeof(s_intent_owner_path),"%s",s_path);
+    memcpy(s_intent_owner_nonce,owner.nonce,sizeof(s_intent_owner_nonce));
+    intent_owner_unlock();
+    edr_egress_set_p0_pair_validator(terminal_intent_association_validate,NULL);
+  }
   terminal_journal_refresh_locked();
   {
     unsigned deleted = 0u;
@@ -3745,6 +3916,57 @@ static int terminal_journal_owner_digest_conflict_locked(
   return step == SQLITE_DONE ? 1 : -1;
 }
 
+/* Only the persisted original intent for a known, proven final alert may be
+ * sent as necessary association context. A label, source-only disposition or
+ * an action intent without the matching combined alert cannot authorize it. */
+static int terminal_intent_association_validate(const EdrEgressP0PairAssociation *tuple,
+    const uint8_t *frame,size_t frame_len,void *user) {
+  sqlite3 *db=NULL; sqlite3_stmt *st=NULL; int valid=0;
+  (void)user;
+  if (!tuple || !tuple->terminal_key || !tuple->source_event_id || !tuple->rule_id ||
+      !frame || !frame_len || frame_len>EDR_EGRESS_FRAME_MAX) return 0;
+  intent_owner_lock();
+  if (!s_intent_owner_path[0] || sqlite3_open_v2(s_intent_owner_path,&db,
+        SQLITE_OPEN_READONLY|SQLITE_OPEN_NOMUTEX,NULL)!=SQLITE_OK) goto done;
+  sqlite3_busy_timeout(db,100);
+  if (sqlite3_prepare_v2(db,
+      "SELECT j.source_event_key,j.rule_id,j.process_generation_key,j.intent_wire,j.combined_wire,"
+      "j.owner_key_sha256,m.queue_nonce FROM enforcement_terminal_journal j CROSS JOIN queue_meta m "
+      "WHERE j.idempotency_key=? AND j.state IN ('ready','local_retained','completed') AND m.id=1;",
+      -1,&st,NULL)!=SQLITE_OK) goto done;
+  sqlite3_bind_text(st,1,tuple->terminal_key,-1,SQLITE_TRANSIENT);
+  if (sqlite3_step(st)!=SQLITE_ROW) goto done;
+  char generation[32],key_sha[65],stored_frame_sha[65],incoming_frame_sha[65];
+  snprintf(generation,sizeof(generation),"startkey-%016llx",(unsigned long long)tuple->process_start_key);
+  edr_sha256_hex((const uint8_t*)tuple->terminal_key,strlen(tuple->terminal_key),key_sha);
+  const uint8_t *intent=sqlite3_column_blob(st,3),*combined=sqlite3_column_blob(st,4);
+  int intent_len=sqlite3_column_bytes(st,3),combined_len=sqlite3_column_bytes(st,4);
+  const void *nonce=sqlite3_column_blob(st,6);
+  if (!terminal_sql_text_equal(sqlite3_column_text(st,0),sqlite3_column_bytes(st,0),tuple->source_event_id) ||
+      !terminal_sql_text_equal(sqlite3_column_text(st,1),sqlite3_column_bytes(st,1),tuple->rule_id) ||
+      !terminal_sql_text_equal(sqlite3_column_text(st,2),sqlite3_column_bytes(st,2),generation) ||
+      !terminal_sql_text_equal(sqlite3_column_text(st,5),sqlite3_column_bytes(st,5),key_sha) ||
+      !nonce || sqlite3_column_bytes(st,6)!=16 || memcmp(nonce,s_intent_owner_nonce,16) ||
+      !intent || intent_len<16 || !combined || combined_len<16 ||
+      rd_u32_le(intent)!=EDR_TRANSPORT_BATCH_MAGIC_RAW || rd_u32_le(intent+4)!=1u ||
+      rd_u32_le(intent+8)!=(uint32_t)intent_len-12u || rd_u32_le(intent+12)!=(uint32_t)intent_len-16u ||
+      rd_u32_le(combined)!=EDR_TRANSPORT_BATCH_MAGIC_RAW || rd_u32_le(combined+4)!=1u ||
+      rd_u32_le(combined+8)!=(uint32_t)combined_len-12u || rd_u32_le(combined+12)!=(uint32_t)combined_len-16u)
+    goto done;
+  const uint8_t *original=NULL;
+  if ((size_t)intent_len==frame_len+16u && !memcmp(intent+16,frame,frame_len)) original=intent;
+  else if ((size_t)combined_len==frame_len+16u && !memcmp(combined+16,frame,frame_len)) original=combined;
+  if (!original) goto done;
+  edr_sha256_hex(original+16,frame_len,stored_frame_sha);
+  edr_sha256_hex(frame,frame_len,incoming_frame_sha);
+  valid=!strcmp(stored_frame_sha,incoming_frame_sha) &&
+    edr_egress_p0_intent_matches(tuple,intent,(size_t)intent_len) &&
+    edr_egress_p0_combined_matches(tuple,combined,(size_t)combined_len);
+done:
+  sqlite3_finalize(st); if (db) sqlite3_close(db);
+  intent_owner_unlock(); return valid;
+}
+
 EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate(
     const char *idempotency_key, const char *source_event_key, const char *rule_id,
     const char *process_generation_key, const char *intent_batch_id, const uint8_t *intent_wire,
@@ -4059,6 +4281,8 @@ void edr_storage_queue_enforcement_terminal_get_metrics(
   out->owner_metadata_unresolved =
       terminal_journal_owner_corruption_unresolved_locked() == 0 ? 0u : 1u;
   out->outcome_unknown = s_terminal_outcome_unknown;
+  out->policy_held_frames = s_terminal_policy_held_frames;
+  out->local_retained = s_terminal_local_retained;
   out->replay_selection_transient_failures =
       s_terminal_replay_selection_transient_failures;
   out->replay_metadata_corruption_failures =
@@ -4079,6 +4303,22 @@ uint64_t edr_storage_queue_pending_count(void) {
   pending = s_pending;
   queue_state_unlock();
   return pending;
+}
+
+int edr_storage_queue_batch_presence(const char *batch_id,const uint8_t *wire,size_t wire_len) {
+  if (!queue_text_valid(batch_id) || !wire || !wire_len || wire_len>INT_MAX) return -1;
+  sqlite3_stmt *st=NULL; int result=-1;
+  queue_state_lock();
+  if (s_db && sqlite3_prepare_v2(s_db,"SELECT payload FROM event_queue WHERE batch_id=?;",
+      -1,&st,NULL)==SQLITE_OK) {
+    sqlite3_bind_text(st,1,batch_id,-1,SQLITE_TRANSIENT); int rc=sqlite3_step(st);
+    if (rc==SQLITE_DONE) result=0;
+    else if (rc==SQLITE_ROW) {
+      const void *p=sqlite3_column_blob(st,0); int n=sqlite3_column_bytes(st,0);
+      result=p && n==(int)wire_len && !memcmp(p,wire,wire_len) ? 1 : -1;
+    }
+  }
+  sqlite3_finalize(st); queue_state_unlock(); return result;
 }
 
 uint64_t edr_storage_queue_dead_letter_count(void) {
@@ -4123,7 +4363,7 @@ static void terminal_journal_fail_intent_locked(sqlite3 *db, sqlite3_int64 id, c
   const char *sql =
       "UPDATE enforcement_terminal_journal SET state='failed',reserved_bytes=0,"
       "last_error=?,updated_at=? "
-      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown');";
+      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown','ready');";
   if (!db || !key) return;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
     char bounded_reason[96];
@@ -4145,8 +4385,10 @@ static void terminal_journal_bump_intent_retry_locked(sqlite3 *db, sqlite3_int64
   sqlite3_stmt *st = NULL;
   const char *sql =
       "UPDATE enforcement_terminal_journal SET intent_retry_count=intent_retry_count+1,"
-      "last_error='intent_transport_failed',updated_at=? "
-      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown') "
+      "last_error='intent_transport_failed',updated_at=?1,"
+      "intent_next_retry_at=?1+CASE WHEN intent_retry_count>=8 THEN 300 "
+      "ELSE (1 << MAX(0,intent_retry_count)) END "
+      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown','ready','completed','local_retained') "
       "AND intent_acked=0 AND intent_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -4159,15 +4401,31 @@ static void terminal_journal_bump_intent_retry_locked(sqlite3 *db, sqlite3_int64
   }
 }
 
+/* A journal delivery can confirm the exact ordinary held copy too. Deletion
+ * is in the same FULL transaction as the real journal ACK; legacy source
+ * owners and recovery lineage rows keep their separate owner contracts. */
+static int terminal_journal_remove_ordinary_copy_locked(sqlite3 *db,sqlite3_int64 id,
+    const char *key,const char *prefix,const uint8_t *wire,int wire_len) {
+  sqlite3_stmt *st=NULL; char sql[512];
+  int n=snprintf(sql,sizeof(sql),"DELETE FROM event_queue WHERE batch_id=(SELECT %s_batch_id "
+    "FROM enforcement_terminal_journal WHERE id=? AND idempotency_key=?) AND payload=? "
+    "AND severity<>2 AND origin_row_id=0 AND recovery_version=0;",prefix);
+  if (n<0 || (size_t)n>=sizeof(sql) || sqlite3_prepare_v2(db,sql,-1,&st,NULL)!=SQLITE_OK) return -1;
+  sqlite3_bind_int64(st,1,id); sqlite3_bind_text(st,2,key,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_blob(st,3,wire,wire_len,SQLITE_TRANSIENT);
+  int rc=sqlite3_step(st); sqlite3_finalize(st); return rc==SQLITE_DONE?0:-1;
+}
+
 static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, const char *key,
                                               const uint8_t *wire, int wire_len) {
   sqlite3_stmt *st = NULL;
   int acknowledged = 0;
   const char *sql =
       "UPDATE enforcement_terminal_journal SET intent_acked=1,last_error='',updated_at=? "
-      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown') "
+      "WHERE id=? AND idempotency_key=? AND state IN ('pending_intent','outcome_unknown','ready','completed','local_retained') "
       "AND intent_acked=0 AND intent_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return 0;
+  if (terminal_journal_begin_durable_locked()!=0) return 0;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
     sqlite3_bind_int64(st, 1, delivery_time());
     sqlite3_bind_int64(st, 2, id);
@@ -4176,6 +4434,11 @@ static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, con
     if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1) acknowledged = 1;
     sqlite3_finalize(st);
   }
+  if (acknowledged && terminal_journal_remove_ordinary_copy_locked(db,id,key,"intent",wire,wire_len)!=0)
+    acknowledged=0;
+  if (acknowledged && terminal_journal_finish_ready_locked(db)!=0) acknowledged=0;
+  if (!acknowledged) (void)terminal_journal_end_durable_locked(0);
+  else acknowledged=terminal_journal_end_durable_locked(1)==0;
   if (acknowledged) terminal_journal_refresh_locked();
   return acknowledged;
 }
@@ -4187,11 +4450,13 @@ static void terminal_journal_bump_frame_retry_locked(sqlite3 *db, sqlite3_int64 
   const char *sql = source_frame
                         ? "UPDATE enforcement_terminal_journal SET "
                           "source_retry_count=source_retry_count+1,last_error='source_transport_failed',"
-                          "updated_at=? WHERE id=? AND idempotency_key=? AND state='ready' "
+                          "updated_at=?1,source_next_retry_at=?1+CASE WHEN source_retry_count>=8 THEN 300 "
+                          "ELSE (1 << MAX(0,source_retry_count)) END WHERE id=? AND idempotency_key=? AND state='ready' "
                           "AND source_acked=0 AND source_wire=?;"
                         : "UPDATE enforcement_terminal_journal SET "
                           "combined_retry_count=combined_retry_count+1,last_error='combined_transport_failed',"
-                          "updated_at=? WHERE id=? AND idempotency_key=? AND state='ready' "
+                          "updated_at=?1,combined_next_retry_at=?1+CASE WHEN combined_retry_count>=8 THEN 300 "
+                          "ELSE (1 << MAX(0,combined_retry_count)) END WHERE id=? AND idempotency_key=? AND state='ready' "
                           "AND combined_acked=0 AND combined_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -4216,7 +4481,7 @@ static void terminal_journal_note_selection_transient_locked(sqlite3 *db,
   const char *sql = frame_kind == 0
                         ? "UPDATE enforcement_terminal_journal SET "
                           "last_error='intent_selection_transient',updated_at=? "
-                          "WHERE id=? AND state IN ('pending_intent','outcome_unknown') "
+                          "WHERE id=? AND state IN ('pending_intent','outcome_unknown','ready','completed','local_retained') "
                           "AND intent_acked=0;"
                         : frame_kind == 1
                             ? "UPDATE enforcement_terminal_journal SET "
@@ -4246,7 +4511,7 @@ static int terminal_journal_quarantine_metadata_locked(sqlite3 *db,
   const char *sql = frame_kind == 0
                         ? "UPDATE enforcement_terminal_journal SET state='failed',reserved_bytes=0,"
                           "last_error='intent_durable_metadata_invalid',updated_at=? "
-                          "WHERE id=? AND state IN ('pending_intent','outcome_unknown') "
+                          "WHERE id=? AND state IN ('pending_intent','outcome_unknown','ready') "
                           "AND intent_acked=0;"
                         : frame_kind == 1
                             ? "UPDATE enforcement_terminal_journal SET state='failed',reserved_bytes=0,"
@@ -4274,23 +4539,23 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
   sqlite3_stmt *st = NULL;
   const char *sql = source_frame
                         ? "UPDATE enforcement_terminal_journal SET source_acked=1,last_error='',updated_at=?,"
-                          "state=CASE WHEN combined_acked=1 THEN 'completed' ELSE 'ready' END,"
-                          "completed_at=CASE WHEN combined_acked=1 THEN ? ELSE completed_at END,"
-                          "reserved_bytes=CASE WHEN combined_acked=1 THEN 0 ELSE reserved_bytes END "
+                          "state=CASE WHEN combined_acked=1 AND intent_acked=1 THEN 'completed' ELSE 'ready' END,"
+                          "completed_at=CASE WHEN combined_acked=1 AND intent_acked=1 THEN ? ELSE completed_at END,"
+                          "reserved_bytes=CASE WHEN combined_acked=1 AND intent_acked=1 THEN 0 ELSE reserved_bytes END "
                           "WHERE id=? AND idempotency_key=? AND state='ready' AND source_acked=0 "
                           "AND source_wire=?;"
                         : "UPDATE enforcement_terminal_journal SET combined_acked=1,last_error='',updated_at=?,"
-                          "state=CASE WHEN source_acked=1 THEN 'completed' ELSE 'ready' END,"
-                          "completed_at=CASE WHEN source_acked=1 THEN ? ELSE completed_at END,"
-                          "reserved_bytes=CASE WHEN source_acked=1 THEN 0 ELSE reserved_bytes END "
+                          "state=CASE WHEN source_acked=1 AND intent_acked=1 THEN 'completed' ELSE 'ready' END,"
+                          "completed_at=CASE WHEN source_acked=1 AND intent_acked=1 THEN ? ELSE completed_at END,"
+                          "reserved_bytes=CASE WHEN source_acked=1 AND intent_acked=1 THEN 0 ELSE reserved_bytes END "
                           "WHERE id=? AND idempotency_key=? AND state='ready' AND combined_acked=0 "
                           "AND combined_wire=?;";
   int acknowledged = 0;
   if (!db || !key || !wire || wire_len <= 0) return 0;
+  if (terminal_journal_begin_durable_locked()!=0) return 0;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-    /* A successful frame clears the shared failure deadline so another
-     * unacknowledged frame can progress in this pass. Keep retry counters
-     * for diagnostics and use the same clock as replay selection. */
+    /* A verified receipt changes only this frame's ACK under FULL durability.
+     * Independent retry counters/deadlines remain diagnostic evidence. */
     sqlite3_int64 now = delivery_time();
     sqlite3_bind_int64(st, 1, now);
     sqlite3_bind_int64(st, 2, now);
@@ -4300,8 +4565,92 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
     if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1) acknowledged = 1;
     sqlite3_finalize(st);
   }
+  if (acknowledged && terminal_journal_remove_ordinary_copy_locked(db,id,key,
+      source_frame?"source":"combined",wire,wire_len)!=0) acknowledged=0;
+  if (acknowledged && terminal_journal_finish_ready_locked(db)!=0) acknowledged=0;
+  if (!acknowledged) (void)terminal_journal_end_durable_locked(0);
+  else acknowledged=terminal_journal_end_durable_locked(1)==0;
   if (acknowledged) terminal_journal_refresh_locked();
   return acknowledged;
+}
+
+static int terminal_journal_hold_frame_locked(sqlite3_int64 id, const char *key,
+    int frame_kind, const char *batch_id, const uint8_t *wire, int wire_len, const char *reason) {
+  static const char *prefixes[] = {"intent", "source", "combined"};
+  char sql[768]; sqlite3_stmt *st = NULL; int held = 0;
+  if (frame_kind < 0 || frame_kind > 2 || !key || !batch_id || !wire || wire_len <= 0) return 0;
+  const char *prefix = prefixes[frame_kind];
+  int n = snprintf(sql, sizeof(sql), "UPDATE enforcement_terminal_journal SET "
+      "%s_policy_held=1,%s_policy_reason=?,updated_at=? "
+      "WHERE id=? AND idempotency_key=? AND %s_batch_id=? AND %s_wire=? "
+      "AND %s_acked=0 AND %s_policy_held=0;", prefix, prefix, prefix, prefix, prefix, prefix);
+  if (n <= 0 || (size_t)n >= sizeof(sql) || terminal_journal_begin_durable_locked() != 0) return 0;
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, reason, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, delivery_time()); sqlite3_bind_int64(st, 3, id);
+    sqlite3_bind_text(st, 4, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, batch_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st, 6, wire, wire_len, SQLITE_TRANSIENT);
+    held = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(s_db) == 1;
+  }
+  sqlite3_finalize(st);
+  if (held && terminal_journal_finish_ready_locked(s_db)!=0) held=0;
+  if (!held) (void)terminal_journal_end_durable_locked(0);
+  else held = terminal_journal_end_durable_locked(1) == 0;
+  if (held) terminal_journal_refresh_locked();
+  return held;
+}
+
+static int terminal_journal_recheck_intents_locked(void) {
+  for (unsigned examined=0;examined<32;examined++) {
+    sqlite3_stmt *st=NULL; uint8_t *wire=NULL; sqlite3_int64 id=0; int len=0,rc;
+    if (sqlite3_prepare_v2(s_db,"SELECT id,intent_wire FROM enforcement_terminal_journal "
+        "WHERE state IN ('ready','completed','local_retained') AND intent_acked=0 AND intent_policy_held=1 AND id>? "
+        "ORDER BY id LIMIT 1;",-1,&st,NULL)!=SQLITE_OK) return -1;
+    sqlite3_bind_int64(st,1,s_terminal_recheck_cursor); rc=sqlite3_step(st);
+    if (rc==SQLITE_ROW) {
+      id=sqlite3_column_int64(st,0); len=sqlite3_column_bytes(st,1);
+      if (len>0 && (size_t)len<=EDR_EGRESS_BATCH_MAX && sqlite3_column_blob(st,1)) {
+        wire=malloc((size_t)len);
+        if (wire) memcpy(wire,sqlite3_column_blob(st,1),(size_t)len);
+      }
+    }
+    sqlite3_finalize(st); st=NULL;
+    if (rc==SQLITE_DONE) { s_terminal_recheck_cursor=0; terminal_journal_refresh_locked(); return 0; }
+    if (rc!=SQLITE_ROW || !wire) { free(wire); return -1; }
+    s_terminal_recheck_cursor=id; char reason[96];
+    if (len<16 || !edr_egress_batch_validate(wire,12,wire+12,(size_t)len-12,reason,sizeof(reason))) {
+      free(wire); continue;
+    }
+    if (terminal_journal_begin_durable_locked()!=0) { free(wire); return -1; }
+    if (sqlite3_prepare_v2(s_db,"UPDATE enforcement_terminal_journal SET intent_policy_held=0,"
+        "intent_policy_reason='',intent_next_retry_at=0 WHERE id=? AND state IN ('ready','completed','local_retained') "
+        "AND intent_acked=0 AND intent_policy_held=1 AND intent_wire=?;",-1,&st,NULL)!=SQLITE_OK) {
+      (void)terminal_journal_end_durable_locked(0); free(wire); return -1;
+    }
+    sqlite3_bind_int64(st,1,id); sqlite3_bind_blob(st,2,wire,len,SQLITE_TRANSIENT);
+    int updated=sqlite3_step(st)==SQLITE_DONE && sqlite3_changes(s_db)==1;
+    sqlite3_finalize(st); free(wire);
+    if (terminal_journal_end_durable_locked(updated)!=0 || !updated) return -1;
+  }
+  terminal_journal_refresh_locked(); return 0;
+}
+
+static int terminal_journal_hold_corrupt_legacy_intent_locked(sqlite3_int64 id,const char *reason) {
+  sqlite3_stmt *st=NULL; int held=0;
+  if (terminal_journal_begin_durable_locked()!=0) return -1;
+  if (sqlite3_prepare_v2(s_db,"UPDATE enforcement_terminal_journal SET intent_policy_held=1,"
+      "intent_policy_reason=?,last_error=?,updated_at=? WHERE id=? AND intent_acked=0 "
+      "AND state IN ('completed','local_retained');",-1,&st,NULL)!=SQLITE_OK) {
+    (void)terminal_journal_end_durable_locked(0); return -1;
+  }
+  sqlite3_bind_text(st,1,reason,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,2,reason,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st,3,delivery_time()); sqlite3_bind_int64(st,4,id);
+  int rc=sqlite3_step(st); held=rc==SQLITE_DONE && sqlite3_changes(s_db)==1;
+  sqlite3_finalize(st);
+  if (rc!=SQLITE_DONE || terminal_journal_end_durable_locked(held)!=0) return -1;
+  if (held) terminal_journal_refresh_locked();
+  return held;
 }
 
 /* Returns 0 after consuming one state transition, 1 when no replayable frame
@@ -4309,26 +4658,24 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
  * this drain pass). Allocation/SQLite read failures preserve durable state;
  * only impossible durable metadata or an invalid persisted wire becomes
  * terminally failed. */
-#define TERMINAL_RETRY_DUE \
-  " AND (last_error NOT IN ('intent_transport_failed','source_transport_failed','combined_transport_failed') " \
-  "OR updated_at>?1 OR updated_at<=?1-CASE " \
-  "WHEN MAX(intent_retry_count,source_retry_count,combined_retry_count)>8 THEN 300 " \
-  "ELSE (1 << MAX(0,MAX(intent_retry_count,source_retry_count,combined_retry_count)-1)) END) "
+#define TERMINAL_RETRY_DUE(prefix) \
+  " AND " prefix "_policy_held=0 AND (" prefix "_next_retry_at<=?1 " \
+  "OR " prefix "_next_retry_at>?1+300) "
 
 static int drain_one_terminal_journal_frame(void) {
   static const char *const select_sql[3] = {
       "SELECT id,idempotency_key,intent_batch_id,intent_wire "
       "FROM enforcement_terminal_journal j "
-      "WHERE state IN ('pending_intent','outcome_unknown') AND intent_acked=0 "
-      "AND intent_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "WHERE state IN ('pending_intent','outcome_unknown','ready','completed','local_retained') AND intent_acked=0 "
+      "AND intent_wire IS NOT NULL " TERMINAL_RETRY_DUE("intent") " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.intent_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;",
       "SELECT id,idempotency_key,source_batch_id,source_wire "
       "FROM enforcement_terminal_journal j WHERE state='ready' AND source_acked=0 "
-      "AND source_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "AND source_wire IS NOT NULL " TERMINAL_RETRY_DUE("source") " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.source_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;",
       "SELECT id,idempotency_key,combined_batch_id,combined_wire "
       "FROM enforcement_terminal_journal j WHERE state='ready' AND combined_acked=0 "
-      "AND combined_wire IS NOT NULL " TERMINAL_RETRY_DUE " AND NOT EXISTS (SELECT 1 FROM event_queue q "
+      "AND combined_wire IS NOT NULL " TERMINAL_RETRY_DUE("combined") " AND NOT EXISTS (SELECT 1 FROM event_queue q "
       "WHERE q.batch_id=j.combined_batch_id AND q.status='pending') ORDER BY id ASC LIMIT 1;"};
   sqlite3_stmt *st = NULL;
   sqlite3 *selected_db;
@@ -4423,6 +4770,12 @@ static int drain_one_terminal_journal_frame(void) {
     return 1;
   }
   if (durable_metadata_invalid) {
+    int legacy_held=frame_kind==0?terminal_journal_hold_corrupt_legacy_intent_locked(id,
+                                             "intent_durable_metadata_invalid"):0;
+    if (legacy_held!=0) {
+      if (legacy_held>0) s_terminal_replay_metadata_corruption_failures++;
+      free(key); free(batch_id); free(wire); queue_state_unlock(); return legacy_held>0?0:2;
+    }
     int quarantined = terminal_journal_quarantine_metadata_locked(s_db, id, frame_kind);
     if (quarantined) {
       s_terminal_replay_metadata_corruption_failures++;
@@ -4453,6 +4806,11 @@ static int drain_one_terminal_journal_frame(void) {
     return 2;
   }
   if (durable_wire_invalid) {
+    int legacy_held=frame_kind==0?terminal_journal_hold_corrupt_legacy_intent_locked(id,
+                                             "intent_invalid_durable_wire"):0;
+    if (legacy_held!=0) {
+      free(key); free(batch_id); free(wire); queue_state_unlock(); return legacy_held>0?0:2;
+    }
     if (frame_kind == 0) {
       terminal_journal_fail_intent_locked(s_db, id, key ? key : "", "invalid_durable_wire");
     } else {
@@ -4475,6 +4833,16 @@ static int drain_one_terminal_journal_frame(void) {
     free(wire);
     queue_state_unlock();
     return 2;
+  }
+  {
+    char reason[96];
+    if (!edr_egress_batch_validate(wire, 12u, wire + 12u, (size_t)wire_len - 12u,
+                                  reason, sizeof(reason))) {
+      int held = terminal_journal_hold_frame_locked(id, key, frame_kind, batch_id, wire,
+                                                    wire_len, reason);
+      free(key); free(batch_id); free(wire); queue_state_unlock();
+      return held ? 0 : 2;
+    }
   }
   /* The ordinary queue's max-retry policy is intentionally inapplicable to
    * terminal source/result and combined frames. Once the action exists, its
@@ -4521,6 +4889,558 @@ static int drain_one_terminal_journal_frame(void) {
   free(batch_id);
   free(wire);
   return 2;
+}
+
+/* Recovery is a bounded offline consumer of the existing immutable queue.
+ * It does not initialize an agent or transport. Original rows and archived
+ * remote ownership remain evidence; only newly identified projections send. */
+#define EDR_QUEUE_RECOVERY_MAX_BYTES (128u * 1024u * 1024u)
+typedef struct {
+  sqlite3_int64 id;
+  int terminal_kind; /* -2 linked projection, -1 original, otherwise journal */
+  sqlite3_int64 origin_id;
+  int previous_recovery_version;
+  char batch_id[256];
+  uint8_t *wire;
+  size_t wire_len;
+  char original_sha[65];
+  uint8_t *projection;
+  size_t projection_len;
+  uint32_t frames;
+  char reason[96];
+  int understood;
+} QueueRecoveryBatch;
+
+static int recovery_column_present(const char *table, const char *name) {
+  char sql[96]; sqlite3_stmt *st=NULL; int present=0, rc;
+  snprintf(sql,sizeof(sql),"PRAGMA table_info(%s);",table);
+  if (sqlite3_prepare_v2(s_db,sql,-1,&st,NULL)!=SQLITE_OK) return -1;
+  while ((rc=sqlite3_step(st))==SQLITE_ROW) {
+    const unsigned char *value=sqlite3_column_text(st,1);
+    if (value && !strcmp((const char *)value,name)) present=1;
+  }
+  sqlite3_finalize(st); return rc==SQLITE_DONE ? present : -1;
+}
+
+static void recovery_hash_text(EdrSha256Ctx *sha,const char *text) {
+  uint8_t length[8]; uint64_t n=text ? strlen(text) : 0;
+  for (unsigned i=0;i<8;i++) length[i]=(uint8_t)(n>>(i*8));
+  edr_sha256_update(sha,length,8);
+  if (n) edr_sha256_update(sha,(const uint8_t *)text,(size_t)n);
+}
+static void recovery_hash_number(EdrSha256Ctx *sha,uint64_t number) {
+  uint8_t bytes[8];
+  for (unsigned i=0;i<8;i++) bytes[i]=(uint8_t)(number>>(i*8));
+  edr_sha256_update(sha,bytes,8);
+}
+static void recovery_hex(const uint8_t *bytes,size_t n,char *out) {
+  static const char hex[]="0123456789abcdef";
+  for (size_t i=0;i<n;i++) { out[i*2]=hex[bytes[i]>>4]; out[i*2+1]=hex[bytes[i]&15]; }
+  out[n*2]='\0';
+}
+static int recovery_owner_equal(const QueueMetaRow *row,
+                                const EdrStorageQueueP0SourceOnlyLatch *expected) {
+  return row->owner_version==expected->owner_version && row->counter==expected->latch_counter &&
+    row->epoch==expected->latch_epoch && !memcmp(row->nonce,expected->queue_nonce,16) &&
+    queue_meta_is_latched(row)==!!expected->latched &&
+    !strcmp(row->recovery_event_id,expected->recovery_event_id) &&
+    !strcmp(row->recovery_batch_id,expected->recovery_batch_id) &&
+    (!strcmp(row->latch_state,EDR_QUEUE_META_STATE_RECOVERY_REQUIRED))==!!expected->recovery_required;
+}
+static int recovery_add_row(sqlite3_stmt *st,int kind,QueueRecoveryBatch *batch,
+                            uint64_t *total,EdrSha256Ctx *sha) {
+  memset(batch,0,sizeof(*batch)); batch->terminal_kind=kind;
+  batch->id=sqlite3_column_int64(st,0);
+  const unsigned char *id=sqlite3_column_text(st,1);
+  int id_len=sqlite3_column_bytes(st,1), n=sqlite3_column_bytes(st,2);
+  const uint8_t *wire=sqlite3_column_blob(st,2);
+  if (batch->id<=0 || !queue_sql_text_valid(id,id_len) || id_len>=256 || !wire || n<=0 ||
+      (uint64_t)n>EDR_QUEUE_RECOVERY_MAX_BYTES || *total>EDR_QUEUE_RECOVERY_MAX_BYTES-(uint64_t)n)
+    return -1;
+  memcpy(batch->batch_id,id,(size_t)id_len); batch->batch_id[id_len]='\0';
+  batch->wire=malloc((size_t)n);
+  if (!batch->wire) return -1;
+  memcpy(batch->wire,wire,(size_t)n); batch->wire_len=(size_t)n;
+  edr_sha256_hex(wire,(size_t)n,batch->original_sha); *total+=(uint64_t)n;
+  if (kind<0) {
+    batch->previous_recovery_version=sqlite3_column_int(st,8);
+    if (batch->previous_recovery_version!=0 && batch->previous_recovery_version!=1) return -1;
+    if (batch->previous_recovery_version==1) {
+      const unsigned char *stored_sha=sqlite3_column_text(st,9);
+      if (!stored_sha || sqlite3_column_bytes(st,9)!=64 ||
+          memcmp(stored_sha,batch->original_sha,64)) return -1;
+    }
+    if (kind==-2) {
+      batch->origin_id=sqlite3_column_int64(st,11);
+      if (batch->origin_id<=0 || recovery_projection_origin_valid_locked(batch->origin_id,
+          batch->batch_id,batch->wire,batch->wire_len)!=1) return -1;
+    }
+  }
+  recovery_hash_number(sha,(uint64_t)batch->id);
+  recovery_hash_number(sha,(uint64_t)(kind+1));
+  recovery_hash_text(sha,batch->batch_id); recovery_hash_text(sha,batch->original_sha);
+  /* Include status/retry/compression/severity and policy reason in the
+   * inventory so a stale operator authorization cannot silently match. */
+  for (int col=3;col<sqlite3_column_count(st);col++) {
+    const unsigned char *v=sqlite3_column_text(st,col);
+    if (v && strlen((const char *)v)!=(size_t)sqlite3_column_bytes(st,col)) return -1;
+    recovery_hash_text(sha,(const char *)v);
+  }
+  return 0;
+}
+static int recovery_read_lineage(char **out) {
+  *out=NULL; int column=recovery_column_present("queue_meta","legacy_lineage");
+  if (column<0) return -1;
+  if (!column) { *out=calloc(1,1); return *out ? 0 : -1; }
+  sqlite3_stmt *st=NULL;
+  if (sqlite3_prepare_v2(s_db,"SELECT legacy_lineage FROM queue_meta WHERE id=1;",-1,&st,NULL)
+      !=SQLITE_OK) return -1;
+  int rc=sqlite3_step(st); const unsigned char *v=rc==SQLITE_ROW ? sqlite3_column_text(st,0) : NULL;
+  int len=v ? sqlite3_column_bytes(st,0) : -1;
+  if (!v || len<0 || len>=2048 || strlen((const char *)v)!=(size_t)len) {
+    sqlite3_finalize(st); return -1;
+  }
+  *out=malloc((size_t)len+1);
+  if (*out) memcpy(*out,v,(size_t)len+1);
+  sqlite3_finalize(st); return *out ? 0 : -1;
+}
+
+static int recovery_bound_sha(const QueueMetaRow *row,char out[65]) {
+  out[0]='\0'; if (!row->recovery_batch_id[0]) return 0;
+  sqlite3_stmt *st=NULL;
+  if (sqlite3_prepare_v2(s_db,"SELECT payload FROM event_queue WHERE batch_id=?;",-1,&st,NULL)
+      !=SQLITE_OK) return -1;
+  sqlite3_bind_text(st,1,row->recovery_batch_id,-1,SQLITE_TRANSIENT);
+  int rc=sqlite3_step(st);
+  if (rc==SQLITE_ROW) {
+    const uint8_t *wire=sqlite3_column_blob(st,0); int n=sqlite3_column_bytes(st,0);
+    if (!wire || n<=0 || (uint64_t)n>EDR_QUEUE_RECOVERY_MAX_BYTES) {
+      sqlite3_finalize(st); return -1;
+    }
+    edr_sha256_hex(wire,(size_t)n,out);
+    if (sqlite3_step(st)!=SQLITE_DONE) { sqlite3_finalize(st); return -1; }
+  } else if (rc!=SQLITE_DONE) { sqlite3_finalize(st); return -1; }
+  sqlite3_finalize(st); return 0;
+}
+static char *recovery_lineage_create(const QueueMetaRow *old,const char *bound_sha,
+                                     const EdrStorageQueueRecoveryRequest *request,
+                                     const char *snapshot) {
+  cJSON *obj=cJSON_CreateObject(); if (!obj) return NULL;
+  char nonce[33],number[32]; recovery_hex(old->nonce,16,nonce);
+  cJSON_AddNumberToObject(obj,"version",1);
+  cJSON_AddNumberToObject(obj,"owner",old->owner_version);
+  cJSON_AddBoolToObject(obj,"unacknowledged",old->owner_version==2 && queue_meta_is_latched(old));
+  cJSON_AddStringToObject(obj,"nonce",nonce);
+  snprintf(number,sizeof(number),"%llu",(unsigned long long)old->counter);
+  cJSON_AddStringToObject(obj,"counter",number);
+  snprintf(number,sizeof(number),"%llu",(unsigned long long)old->epoch);
+  cJSON_AddStringToObject(obj,"epoch",number);
+  cJSON_AddStringToObject(obj,"state",old->latch_state);
+  cJSON_AddStringToObject(obj,"event_id",old->recovery_event_id);
+  cJSON_AddStringToObject(obj,"batch_id",old->recovery_batch_id);
+  cJSON_AddStringToObject(obj,"bound_wire_sha256",bound_sha);
+  cJSON_AddStringToObject(obj,"bound_wire_status",bound_sha[0]?"retained":"unavailable");
+  cJSON_AddStringToObject(obj,"inventory_sha256",snapshot);
+  cJSON_AddStringToObject(obj,"operator_tenant",request->tenant_id);
+  cJSON_AddStringToObject(obj,"operator_endpoint",request->endpoint_id);
+  cJSON_AddNumberToObject(obj,"max_batches",request->max_batches);
+  snprintf(number,sizeof(number),"%llu",(unsigned long long)request->after_row_id);
+  cJSON_AddStringToObject(obj,"after_row_id",number);
+  char *json=cJSON_GetArraySize(obj)==16?cJSON_PrintUnformatted(obj):NULL;
+  cJSON_Delete(obj);
+  if (json && strlen(json)>=2048) { free(json); json=NULL; }
+  return json;
+}
+static int recovery_authorization_equal(const char *json,const EdrStorageQueueRecoveryRequest *request) {
+  const EdrStorageQueueP0SourceOnlyLatch *expected=&request->expected_owner;
+  cJSON *obj=cJSON_Parse(json); if (!obj) return 0;
+  cJSON *nonce=cJSON_GetObjectItemCaseSensitive(obj,"nonce");
+  cJSON *counter=cJSON_GetObjectItemCaseSensitive(obj,"counter");
+  cJSON *epoch=cJSON_GetObjectItemCaseSensitive(obj,"epoch");
+  cJSON *owner=cJSON_GetObjectItemCaseSensitive(obj,"owner");
+  cJSON *tenant=cJSON_GetObjectItemCaseSensitive(obj,"operator_tenant");
+  cJSON *endpoint=cJSON_GetObjectItemCaseSensitive(obj,"operator_endpoint");
+  cJSON *limit=cJSON_GetObjectItemCaseSensitive(obj,"max_batches");
+  cJSON *cursor=cJSON_GetObjectItemCaseSensitive(obj,"after_row_id");
+  char hex[33],c[32],e[32]; recovery_hex(expected->queue_nonce,16,hex);
+  snprintf(c,sizeof(c),"%llu",(unsigned long long)expected->latch_counter);
+  snprintf(e,sizeof(e),"%llu",(unsigned long long)expected->latch_epoch);
+  char cursor_text[32]; snprintf(cursor_text,sizeof(cursor_text),"%llu",(unsigned long long)request->after_row_id);
+  int same=cJSON_IsNumber(owner) && owner->valuedouble==(double)expected->owner_version &&
+    cJSON_IsString(nonce) && !strcmp(nonce->valuestring,hex) &&
+    cJSON_IsString(counter) && !strcmp(counter->valuestring,c) &&
+    cJSON_IsString(epoch) && !strcmp(epoch->valuestring,e) &&
+    cJSON_IsString(tenant) && !strcmp(tenant->valuestring,request->tenant_id) &&
+    cJSON_IsString(endpoint) && !strcmp(endpoint->valuestring,request->endpoint_id) &&
+    cJSON_IsNumber(limit) && limit->valuedouble==(double)request->max_batches &&
+    cJSON_IsString(cursor) && !strcmp(cursor->valuestring,cursor_text);
+  cJSON_Delete(obj); return same;
+}
+static int recovery_store_lineage(const char *lineage) {
+  sqlite3_stmt *st=NULL;
+  if (sqlite3_prepare_v2(s_db,"UPDATE queue_meta SET legacy_lineage=? WHERE id=1 AND legacy_lineage='';",
+      -1,&st,NULL)!=SQLITE_OK) return -1;
+  sqlite3_bind_text(st,1,lineage,-1,SQLITE_TRANSIENT);
+  int rc=sqlite3_step(st), changed=sqlite3_changes(s_db); sqlite3_finalize(st);
+  return rc==SQLITE_DONE && changed==1 ? 0 : -1;
+}
+
+static int recovery_projection_origin_valid_locked(sqlite3_int64 origin_id,const char *batch_id,
+                                                    const uint8_t *wire,size_t wire_len) {
+  char received_sha[65],actual_sha[65]; sqlite3_stmt *st=NULL;
+  edr_sha256_hex(wire,wire_len,received_sha);
+  if (sqlite3_prepare_v2(s_db,"SELECT payload,original_sha256 FROM event_queue WHERE id=? "
+      "AND recovery_version=1 AND recovery_state='projection_pending' AND projection_batch_id=? "
+      "AND projection_sha256=? AND status='local_evidence';",-1,&st,NULL)!=SQLITE_OK) return -1;
+  sqlite3_bind_int64(st,1,origin_id); sqlite3_bind_text(st,2,batch_id,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,3,received_sha,-1,SQLITE_TRANSIENT);
+  int rc=sqlite3_step(st); const uint8_t *original=rc==SQLITE_ROW ? sqlite3_column_blob(st,0) : NULL;
+  int n=rc==SQLITE_ROW ? sqlite3_column_bytes(st,0) : 0;
+  const unsigned char *expected=rc==SQLITE_ROW ? sqlite3_column_text(st,1) : NULL;
+  int valid=original && n>0 && expected && sqlite3_column_bytes(st,1)==64 &&
+    edr_sha256_hex(original,(size_t)n,actual_sha)==0 && !strcmp(actual_sha,(const char *)expected);
+  sqlite3_finalize(st); return rc==SQLITE_ROW || rc==SQLITE_DONE ? valid : -1;
+}
+static int recovery_projection_ack_locked(sqlite3_int64 origin_id,const char *batch_id,
+                                           const uint8_t *wire,size_t wire_len) {
+  if (recovery_projection_origin_valid_locked(origin_id,batch_id,wire,wire_len)!=1) return -1;
+  char received_sha[65]; sqlite3_stmt *st=NULL; int rc;
+  edr_sha256_hex(wire,wire_len,received_sha);
+  if (sqlite3_prepare_v2(s_db,"UPDATE event_queue SET recovery_state='projection_acked' "
+      "WHERE id=? AND recovery_state='projection_pending' AND projection_batch_id=? "
+      "AND projection_sha256=?;",-1,&st,NULL)!=SQLITE_OK) return -1;
+  sqlite3_bind_int64(st,1,origin_id); sqlite3_bind_text(st,2,batch_id,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,3,received_sha,-1,SQLITE_TRANSIENT);
+  rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st);
+  return rc==SQLITE_DONE && changed==1 ? 0 : -1;
+}
+
+#ifdef EDR_STORAGE_QUEUE_TESTING
+static int s_test_recovery_stop_phase;
+void edr_storage_queue_test_stop_recovery_phase(int phase) { s_test_recovery_stop_phase=phase; }
+static void recovery_test_stop(int phase) {
+#ifndef _WIN32
+  if (s_test_recovery_stop_phase==phase) { kill(getpid(),SIGSTOP); }
+#else
+  if (s_test_recovery_stop_phase==phase) {
+    /* Native Windows fixture kills the real child process at this durable
+     * boundary. No SQLite close/rollback handler can run first. */
+    TerminateProcess(GetCurrentProcess(),95);
+  }
+#endif
+}
+#else
+static void recovery_test_stop(int phase) { (void)phase; }
+#endif
+
+EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueRecoveryRequest *request,
+                                     EdrStorageQueueRecoveryReport *report) {
+  QueueRecoveryBatch batches[EDR_STORAGE_QUEUE_RECOVERY_MAX_BATCHES];
+  QueueMetaRow old; char *lineage=NULL,*new_lineage=NULL,*authorization=NULL; char bound_sha[65];
+  sqlite3_stmt *st=NULL; unsigned count=0; uint64_t total=0; int transaction=0;
+  int handle_owned=0,lock_owned=0;
+  EdrError result=EDR_ERR_SQLITE_WRITE; EdrSha256Ctx inventory;
+  memset(batches,0,sizeof(batches));
+  if (!report) return EDR_ERR_INVALID_ARG;
+  memset(report,0,sizeof(*report)); report->version=1;
+  snprintf(report->reason,sizeof(report->reason),"invalid_recovery_arguments");
+  if (!path || !path[0] || strlen(path)>=sizeof(s_path) || !request || request->version!=1 ||
+      !request->max_batches || request->max_batches>32 || !request->tenant_id ||
+      request->after_row_id>(uint64_t)INT64_MAX ||
+      !request->tenant_id[0] || strlen(request->tenant_id)>127 || !request->endpoint_id ||
+      !request->endpoint_id[0] || strlen(request->endpoint_id)>127 ||
+#ifdef _WIN32
+      !((strlen(path)>=3 && path[1]==':' && (path[2]=='\\'||path[2]=='/')) ||
+        (path[0]=='\\' && path[1]=='\\')) ||
+#else
+      path[0]!='/' ||
+#endif
+      (request->apply && (request->target_owner_version!=3 ||
+                         strlen(request->expected_inventory_sha256)!=64))) return EDR_ERR_INVALID_ARG;
+  queue_state_lock();
+  if (s_db) { result=EDR_ERR_QUEUE_LOCKED; snprintf(report->reason,96,"agent_queue_must_be_closed"); goto done; }
+  load_queue_db_limit(); memcpy(s_path,path,strlen(path)+1);
+  result=queue_lock_acquire(path); if (result!=EDR_OK) { snprintf(report->reason,96,"exclusive_queue_lock_unavailable"); goto done; }
+  lock_owned=1;
+  result=EDR_ERR_SQLITE_OPEN;
+  handle_owned=1;
+  if (sqlite3_open_v2(path,&s_db,request->apply?SQLITE_OPEN_READWRITE:SQLITE_OPEN_READONLY,NULL)
+      !=SQLITE_OK) { snprintf(report->reason,96,"existing_queue_open_failed"); goto done; }
+  sqlite3_busy_timeout(s_db,2000);
+  /* Snapshot authorization and every subsequent mutation share one SQLite
+   * writer transaction. The cooperative file lock alone cannot stop an
+   * unrelated SQLite client changing metadata between check and commit. */
+  if (request->apply) {
+    if (terminal_journal_begin_durable_locked()!=0) goto write_failed;
+    transaction=1;
+  } else {
+    if (exec_simple(s_db,"BEGIN;")!=SQLITE_OK) goto read_failed;
+    transaction=2; /* Consistent read snapshot on a READONLY handle. */
+  }
+  if (queue_meta_read_locked(&old)!=0 || recovery_read_lineage(&lineage)!=0 ||
+      recovery_bound_sha(&old,bound_sha)!=0) { snprintf(report->reason,96,"ownership_inventory_read_failed"); goto done; }
+  intent_owner_lock();
+  snprintf(s_intent_owner_path,sizeof(s_intent_owner_path),"%s",s_path);
+  memcpy(s_intent_owner_nonce,old.nonce,sizeof(s_intent_owner_nonce));
+  intent_owner_unlock();
+  edr_egress_set_p0_pair_validator(terminal_intent_association_validate,NULL);
+  queue_meta_export_latch(&old,&report->current_owner);
+  report->legacy_owner_unacknowledged=lineage[0]?1:0;
+  int previous_column=recovery_column_present("queue_meta","last_recovery_snapshot");
+  int previous_snapshot=0;
+  if (previous_column<0) goto read_failed;
+  if (previous_column==1) {
+    if (sqlite3_prepare_v2(s_db,"SELECT last_recovery_snapshot,last_recovery_owner FROM queue_meta WHERE id=1;",
+        -1,&st,NULL)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW) goto read_failed;
+    const unsigned char *previous=sqlite3_column_text(st,0);
+    const unsigned char *previous_owner=sqlite3_column_text(st,1);
+    previous_snapshot=previous && sqlite3_column_bytes(st,0)>0;
+    if (request->apply && previous && sqlite3_column_bytes(st,0)==64 &&
+        !memcmp(previous,request->expected_inventory_sha256,64) && previous_owner &&
+        recovery_authorization_equal((const char *)previous_owner,request)) {
+      sqlite3_finalize(st); st=NULL;
+      memcpy(report->inventory_sha256,request->expected_inventory_sha256,65);
+      report->applied=1; snprintf(report->reason,96,"matching_inventory_already_committed_no_remote_ack");
+      result=EDR_OK; goto done;
+    }
+    sqlite3_finalize(st); st=NULL;
+  }
+  edr_sha256_init(&inventory); recovery_hash_text(&inventory,"queue-recovery-v1");
+  recovery_hash_text(&inventory,request->tenant_id); recovery_hash_text(&inventory,request->endpoint_id);
+  recovery_hash_number(&inventory,request->max_batches);
+  recovery_hash_number(&inventory,request->after_row_id);
+  recovery_hash_text(&inventory,EDR_EGRESS_PROJECTOR_VERSION);
+  edr_sha256_update(&inventory,old.nonce,16);
+  recovery_hash_number(&inventory,old.owner_version); recovery_hash_number(&inventory,old.counter);
+  recovery_hash_number(&inventory,old.epoch); recovery_hash_text(&inventory,old.latch_state);
+  recovery_hash_text(&inventory,old.recovery_event_id); recovery_hash_text(&inventory,old.recovery_batch_id);
+  recovery_hash_text(&inventory,bound_sha); recovery_hash_text(&inventory,lineage);
+  int recovery_columns=recovery_column_present("event_queue","recovery_version");
+  const char *query=recovery_columns==1 ?
+    "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,"
+    "recovery_version,original_sha256,recovery_state FROM event_queue "
+    "WHERE (recovery_version=0 OR recovery_state='retained_unresolved') AND origin_row_id=0 "
+    "AND (id>?3 OR batch_id=?1) AND "
+    "(status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
+    "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;" :
+    "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,0,'','' FROM event_queue "
+    "WHERE (id>?3 OR batch_id=?1) AND (status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
+    "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;";
+  result=EDR_ERR_SQLITE_WRITE;
+  if (recovery_columns<0 || sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
+  sqlite3_bind_text(st,1,old.recovery_batch_id,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_int(st,2,(int)request->max_batches);
+  sqlite3_bind_int64(st,3,(sqlite3_int64)request->after_row_id); int rc;
+  report->last_event_row_id=request->after_row_id;
+  while ((rc=sqlite3_step(st))==SQLITE_ROW) {
+    if (recovery_add_row(st,-1,&batches[count],&total,&inventory)!=0) goto read_failed;
+    if ((uint64_t)batches[count].id>report->last_event_row_id)
+      report->last_event_row_id=(uint64_t)batches[count].id;
+    count++;
+  }
+  sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto read_failed;
+  if (recovery_columns==1 && count<request->max_batches) {
+    const char *resume_query="SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
+      "q.retry_count,q.terminal_reason,q.recovery_version,o.projection_sha256,q.recovery_state,q.origin_row_id "
+      "FROM event_queue q JOIN event_queue o ON o.id=q.origin_row_id "
+      "WHERE q.origin_row_id>0 AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
+      "ORDER BY q.id LIMIT ?2;";
+    if (sqlite3_prepare_v2(s_db,resume_query,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
+    sqlite3_bind_int64(st,1,(sqlite3_int64)request->after_row_id);
+    sqlite3_bind_int(st,2,(int)(request->max_batches-count));
+    while ((rc=sqlite3_step(st))==SQLITE_ROW) {
+      if (recovery_add_row(st,-2,&batches[count],&total,&inventory)!=0) goto read_failed;
+      if ((uint64_t)batches[count].id>report->last_event_row_id)
+        report->last_event_row_id=(uint64_t)batches[count].id;
+      count++;
+    }
+    sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto read_failed;
+  }
+  static const char *prefixes[]={"intent","source","combined"};
+  int terminal_columns=recovery_column_present("enforcement_terminal_journal","intent_policy_held");
+  if (terminal_columns<0) goto read_failed;
+  for (int kind=0;terminal_columns==1 && kind<3 && count<request->max_batches;kind++) {
+    char sql[640]; const char *p=prefixes[kind];
+    snprintf(sql,sizeof(sql),"SELECT id,%s_batch_id,%s_wire,state,%s_retry_count,%s_policy_reason "
+      "FROM enforcement_terminal_journal WHERE %s_policy_held=1 AND %s_acked=0 "
+      "AND state IN ('ready','local_retained','pending_intent','outcome_unknown') ORDER BY id LIMIT ?;",p,p,p,p,p,p);
+    if (sqlite3_prepare_v2(s_db,sql,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
+    sqlite3_bind_int(st,1,(int)(request->max_batches-count));
+    while ((rc=sqlite3_step(st))==SQLITE_ROW) {
+      if (recovery_add_row(st,kind,&batches[count],&total,&inventory)!=0) goto read_failed;
+      count++;
+    }
+    sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto read_failed;
+  }
+  report->selected_batches=count; report->selected_bytes=total;
+  for (unsigned i=0;i<count;i++) {
+    QueueRecoveryBatch *b=&batches[i];
+    if (b->terminal_kind>=0 || b->terminal_kind==-2) {
+      /* Scope-check the whole decoded frame before deciding whether this
+       * original immutable journal frame can resume under its existing ID. */
+      int scoped=b->wire_len>12 && edr_egress_batch_project_alerts(b->wire,12,b->wire+12,
+        b->wire_len-12,request->tenant_id,request->endpoint_id,&b->projection,
+        &b->projection_len,&b->frames,b->reason,sizeof(b->reason));
+      b->understood=scoped && edr_egress_batch_validate(b->wire,12,b->wire+12,
+        b->wire_len-12,b->reason,sizeof(b->reason));
+    } else if (b->wire_len>12) {
+      b->understood=edr_egress_batch_project_alerts(b->wire,12,b->wire+12,b->wire_len-12,
+        request->tenant_id,request->endpoint_id,&b->projection,&b->projection_len,&b->frames,
+        b->reason,sizeof(b->reason));
+    } else snprintf(b->reason,sizeof(b->reason),"unknown_batch_format");
+    if (!strcmp(b->reason,"historical_scope_mismatch")) {
+      snprintf(report->reason,96,"historical_scope_mismatch_no_transition"); result=EDR_ERR_INVALID_ARG; goto done;
+    }
+    if (!strcmp(b->reason,"egress_validation_allocation_failed")) {
+      snprintf(report->reason,96,"projection_resources_unavailable"); result=EDR_ERR_MEM_LIMIT; goto done;
+    }
+    if (b->terminal_kind==-1 && !b->understood) report->retained_unresolved++;
+    if (b->terminal_kind==-1 && b->understood && b->frames) report->projected_batches++;
+    recovery_hash_number(&inventory,(uint64_t)b->understood);
+    recovery_hash_number(&inventory,b->frames); recovery_hash_text(&inventory,b->reason);
+    if (b->projection) {
+      char projection_hash[65]; edr_sha256_hex(b->projection,b->projection_len,projection_hash);
+      recovery_hash_text(&inventory,projection_hash);
+    } else recovery_hash_text(&inventory,"");
+  }
+  uint8_t digest[32]; edr_sha256_final(&inventory,digest);
+  recovery_hex(digest,32,report->inventory_sha256);
+  if (!request->apply) { snprintf(report->reason,96,"read_only_inventory_checked"); result=EDR_OK; goto done; }
+  if (!recovery_owner_equal(&old,&request->expected_owner) ||
+      strcmp(report->inventory_sha256,request->expected_inventory_sha256)) {
+    snprintf(report->reason,96,"stale_owner_or_inventory_no_transition"); result=EDR_ERR_INVALID_ARG; goto done;
+  }
+  authorization=recovery_lineage_create(&old,bound_sha,request,report->inventory_sha256);
+  if (!authorization) { snprintf(report->reason,96,"recovery_authorization_unavailable"); goto done; }
+  if (old.owner_version==2 && queue_meta_is_latched(&old)) {
+    if (lineage[0]) { snprintf(report->reason,96,"different_legacy_owner_already_retained"); goto done; }
+    new_lineage=recovery_lineage_create(&old,bound_sha,request,report->inventory_sha256);
+    if (!new_lineage) { snprintf(report->reason,96,"legacy_lineage_capacity_invalid"); goto done; }
+  }
+  if (old.owner_version==2 && old.counter==(uint64_t)INT64_MAX) {
+    snprintf(report->reason,96,"owner_counter_exhausted"); goto done;
+  }
+  if (queue_recovery_metadata_ensure_locked()!=0 || terminal_frame_metadata_ensure_locked()!=0) goto write_failed;
+  uint64_t incoming=(new_lineage?2048:0)+(previous_snapshot?0:2048);
+  for (unsigned i=0;i<count;i++) if (batches[i].terminal_kind==-1) {
+    if (!batches[i].previous_recovery_version) incoming=queue_add_bytes(incoming,512);
+    if (batches[i].understood && batches[i].frames)
+      incoming=queue_add_bytes(incoming,queue_event_live_cost("min-v1-0000000000000000000000000000000000000000000000000000000000000000",
+        batches[i].projection_len)+512);
+  }
+  uint64_t used;
+  if (!queue_logical_retained_bytes_locked(&used) || incoming>s_max_db_bytes ||
+      used>s_max_db_bytes-incoming) { result=EDR_ERR_QUEUE_FULL; snprintf(report->reason,96,"recovery_capacity_backpressure"); goto done; }
+  recovery_test_stop(1); /* Fully prepared transaction, no irreversible mutation. */
+  if (new_lineage && recovery_store_lineage(new_lineage)!=0) goto write_failed;
+  for (unsigned i=0;i<count;i++) {
+    QueueRecoveryBatch *b=&batches[i];
+    if (b->terminal_kind==-2) {
+      if (!b->understood) continue;
+      if (sqlite3_prepare_v2(s_db,"UPDATE event_queue SET status='pending',next_retry_at=0,"
+          "terminal_reason='',terminal_at=0 WHERE id=? AND batch_id=? AND payload=? "
+          "AND origin_row_id=? AND status IN ('policy_held','dead_letter');",-1,&st,NULL)!=SQLITE_OK)
+        goto write_failed;
+      sqlite3_bind_int64(st,1,b->id); sqlite3_bind_text(st,2,b->batch_id,-1,SQLITE_TRANSIENT);
+      sqlite3_bind_blob(st,3,b->wire,(int)b->wire_len,SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st,4,b->origin_id);
+      rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st); st=NULL;
+      if (rc!=SQLITE_DONE || changed!=1) goto write_failed;
+      report->resumed_projections++; continue;
+    }
+    if (b->terminal_kind>=0) {
+      if (!b->understood) continue;
+      char sql[512]; const char *p=prefixes[b->terminal_kind];
+      snprintf(sql,sizeof(sql),"UPDATE enforcement_terminal_journal SET %s_policy_held=0,"
+        "%s_policy_reason='',%s_next_retry_at=0,state=CASE WHEN state='local_retained' THEN 'ready' ELSE state END "
+        "WHERE id=? AND %s_batch_id=? AND %s_wire=? "
+        "AND %s_acked=0 AND %s_policy_held=1;",p,p,p,p,p,p,p);
+      if (sqlite3_prepare_v2(s_db,sql,-1,&st,NULL)!=SQLITE_OK) goto write_failed;
+      sqlite3_bind_int64(st,1,b->id); sqlite3_bind_text(st,2,b->batch_id,-1,SQLITE_TRANSIENT);
+      sqlite3_bind_blob(st,3,b->wire,(int)b->wire_len,SQLITE_TRANSIENT);
+      rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st); st=NULL;
+      if (rc!=SQLITE_DONE || changed!=1) goto write_failed;
+      report->resumed_terminal_frames++; continue;
+    }
+    char projection_id[80]="",projection_sha[65]="";
+    const char *state=b->understood?(b->frames?"projection_pending":"local_only"):"retained_unresolved";
+    if (b->understood && b->frames) {
+      edr_sha256_hex(b->projection,b->projection_len,projection_sha);
+      EdrSha256Ctx identity; uint8_t id_digest[32]; char id_hex[65]; edr_sha256_init(&identity);
+      recovery_hash_text(&identity,"historical-alert-projection-v1"); recovery_hash_number(&identity,(uint64_t)b->id);
+      edr_sha256_update(&identity,old.nonce,16); recovery_hash_text(&identity,b->original_sha);
+      recovery_hash_text(&identity,projection_sha); recovery_hash_text(&identity,request->tenant_id);
+      recovery_hash_text(&identity,request->endpoint_id); edr_sha256_final(&identity,id_digest);
+      recovery_hex(id_digest,32,id_hex); snprintf(projection_id,sizeof(projection_id),"min-v1-%s",id_hex);
+      if (!strcmp(projection_id,b->batch_id)) goto write_failed;
+      if (sqlite3_prepare_v2(s_db,"INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,"
+          "status,recovery_version,origin_row_id) VALUES(?,?,?,0,1,'pending',1,?);",-1,&st,NULL)!=SQLITE_OK)
+        goto write_failed;
+      sqlite3_bind_text(st,1,projection_id,-1,SQLITE_TRANSIENT);
+      sqlite3_bind_blob(st,2,b->projection,(int)b->projection_len,SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st,3,(sqlite3_int64)time(NULL)); sqlite3_bind_int64(st,4,b->id);
+      rc=sqlite3_step(st); sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto write_failed;
+    }
+    if (sqlite3_prepare_v2(s_db,"UPDATE event_queue SET status='local_evidence',recovery_version=1,"
+        "original_sha256=?,projection_batch_id=?,projection_sha256=?,recovery_state=?,terminal_reason=?,"
+        "terminal_at=?,projector_version='" EDR_EGRESS_PROJECTOR_VERSION "' "
+        "WHERE id=? AND batch_id=? AND payload=? "
+        "AND recovery_version=? AND (recovery_version=0 OR "
+        "(original_sha256=? AND recovery_state='retained_unresolved'));",-1,&st,NULL)!=SQLITE_OK)
+      goto write_failed;
+    sqlite3_bind_text(st,1,b->original_sha,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(st,2,projection_id,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(st,3,projection_sha,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(st,4,state,-1,SQLITE_STATIC); sqlite3_bind_text(st,5,b->reason,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st,6,(sqlite3_int64)time(NULL)); sqlite3_bind_int64(st,7,b->id);
+    sqlite3_bind_text(st,8,b->batch_id,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_blob(st,9,b->wire,(int)b->wire_len,SQLITE_TRANSIENT);
+    sqlite3_bind_int(st,10,b->previous_recovery_version);
+    sqlite3_bind_text(st,11,b->original_sha,-1,SQLITE_TRANSIENT);
+    rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st); st=NULL;
+    if (rc!=SQLITE_DONE || changed!=1) goto write_failed;
+  }
+  if (old.owner_version==2) {
+    old.owner_version=3; old.counter++; old.epoch=old.counter; old.loss_detected=1;
+    old.recovery_event_id[0]=old.recovery_batch_id[0]='\0';
+    snprintf(old.latch_state,sizeof(old.latch_state),"recovery_required");
+    snprintf(old.last_error,sizeof(old.last_error),"explicit_legacy_owner_retained_v1");
+    if (queue_meta_write_locked(&old)!=0) goto write_failed;
+  }
+  if (sqlite3_prepare_v2(s_db,"UPDATE queue_meta SET last_recovery_snapshot=?,last_recovery_owner=? WHERE id=1;",
+      -1,&st,NULL)!=SQLITE_OK) goto write_failed;
+  sqlite3_bind_text(st,1,report->inventory_sha256,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,2,authorization,-1,SQLITE_TRANSIENT);
+  rc=sqlite3_step(st); int meta_changed=sqlite3_changes(s_db); sqlite3_finalize(st); st=NULL;
+  if (rc!=SQLITE_DONE || meta_changed!=1) goto write_failed;
+  recovery_test_stop(2); /* Original lineage + new owner/projections, before FULL commit. */
+  if (terminal_journal_end_durable_locked(1)!=0) goto write_failed;
+  transaction=0; recovery_test_stop(3);
+  intent_owner_lock();
+  snprintf(s_intent_owner_path,sizeof(s_intent_owner_path),"%s",s_path);
+  memcpy(s_intent_owner_nonce,old.nonce,sizeof(s_intent_owner_nonce));
+  intent_owner_unlock();
+  edr_egress_set_p0_pair_validator(terminal_intent_association_validate,NULL);
+  queue_meta_export_latch(&old,&report->current_owner);
+  report->legacy_owner_unacknowledged=(lineage[0]||new_lineage)?1:0;
+  report->applied=1; snprintf(report->reason,96,"local_transition_committed_no_remote_ack"); result=EDR_OK;
+  goto done;
+read_failed:
+  snprintf(report->reason,96,"immutable_inventory_read_failed"); goto done;
+write_failed:
+  snprintf(report->reason,96,"durable_recovery_transaction_failed"); result=EDR_ERR_SQLITE_WRITE;
+done:
+  if (st) sqlite3_finalize(st);
+  if (transaction==1) (void)terminal_journal_end_durable_locked(0);
+  else if (transaction==2) (void)exec_simple(s_db,"ROLLBACK;");
+  for (unsigned i=0;i<32;i++) { free(batches[i].wire); free(batches[i].projection); }
+  free(lineage); free(new_lineage); free(authorization);
+  /* Maintenance close never claims a clean agent session or changes a latch. */
+  if (handle_owned) terminal_intent_owner_unregister_locked();
+  if (handle_owned && s_db && sqlite3_close(s_db)==SQLITE_OK) s_db=NULL;
+  if (lock_owned) queue_lock_release();
+  if (handle_owned || lock_owned) s_path[0]='\0';
+  queue_state_unlock(); return result;
 }
 
 void edr_storage_queue_poll_drain(void) {
@@ -4574,6 +5494,10 @@ void edr_storage_queue_poll_drain(void) {
   /* Claim this open generation before releasing the state mutex. Cleanup and
    * selection use the same handle, but transport below remains unlocked. */
   s_drain_generation = drain_generation;
+  if (terminal_journal_recheck_intents_locked()!=0) {
+    s_terminal_replay_selection_transient_failures++;
+    s_drain_generation=0; queue_state_unlock(); return;
+  }
   cleanup_expired_rows();
   queue_state_unlock();
 
@@ -4603,6 +5527,18 @@ void edr_storage_queue_poll_drain(void) {
 }
 
 #else /* !EDR_HAVE_SQLITE */
+
+int edr_storage_queue_batch_presence(const char *id,const uint8_t *wire,size_t len) {
+  (void)id; (void)wire; (void)len; return -1;
+}
+
+EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueRecoveryRequest *request,
+                                     EdrStorageQueueRecoveryReport *report) {
+  (void)path; (void)request;
+  if (report) { memset(report,0,sizeof(*report)); snprintf(report->reason,sizeof(report->reason),
+                                                         "sqlite_unavailable"); }
+  return EDR_ERR_NOT_IMPL;
+}
 
 void edr_storage_queue_configure(uint32_t max_db_mb, uint32_t retention_hours) {
   (void)max_db_mb;

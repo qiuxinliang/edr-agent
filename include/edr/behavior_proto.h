@@ -16,6 +16,11 @@ typedef struct AVEBehaviorAlert AVEBehaviorAlert;
 size_t edr_behavior_record_encode_protobuf_facts(const EdrBehaviorRecord *r,
     const AVEBehaviorAlert *alert, const char *command, const char *parent_command,
     uint8_t *out, size_t out_cap);
+/* Complete LOCAL evidence/journal encoding. It preserves source and terminal
+ * bytes and has no egress authority. Outbound producers use the API above. */
+size_t edr_behavior_record_encode_protobuf_full_facts(const EdrBehaviorRecord *r,
+    const AVEBehaviorAlert *alert,const char *command,const char *parent_command,
+    uint8_t *out,size_t out_cap);
 
 /**
  * 将 r 编码为 protobuf 字节；成功返回写入长度，失败或空间不足返回 0。

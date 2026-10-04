@@ -12,6 +12,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
+#ifdef EDR_TEST_EXTENDED_EGRESS
+#include "edr/egress_batch_policy.h"
+#include "edr/detection_decision.h"
+#include "edr/local_evidence_cache.h"
+#include "edr/behavior_from_slot.h"
+#include "edr/behavior_alert_emit.h"
+#include "edr/event_bus.h"
+#include "pmfe_association_fixture.h"
+#include "p0_terminal_association_fixture.h"
+#endif
 #ifdef _WIN32
 #include <windows.h>
 static void pause_retry(void) { Sleep(1200u); }
@@ -93,6 +104,142 @@ static size_t make_wire(EdrBehaviorRecord *r, const AVEBehaviorAlert *alert, uin
   wr(wire, EDR_TRANSPORT_BATCH_MAGIC_RAW); wr(wire + 4u, 1u); wr(wire + 8u, (uint32_t)n + 4u);
   wr(wire + 12u, (uint32_t)n); return n + 16u;
 }
+#ifdef EDR_TEST_EXTENDED_EGRESS
+static int artifact_state_count(const char *path,const char *state) {
+  sqlite3 *db=NULL; sqlite3_stmt *statement=NULL; int count=-1;
+  if(sqlite3_open_v2(path,&db,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK &&
+     sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='pmfe_followup_local_v1' AND upload_status=?",-1,&statement,NULL)==SQLITE_OK) {
+    sqlite3_bind_text(statement,1,state,-1,SQLITE_TRANSIENT);
+    if(sqlite3_step(statement)==SQLITE_ROW) count=sqlite3_column_int(statement,0);
+  }
+  sqlite3_finalize(statement); if(db) sqlite3_close(db); return count;
+}
+static int pmfe_receipt_scenario(const char *queue_path) {
+  char cache_path[1200],batch_id[128];
+  if(snprintf(cache_path,sizeof(cache_path),"%s.evidence",queue_path)>=(int)sizeof(cache_path)) return 2;
+  EdrBehaviorRecord *original=calloc(1,sizeof(*original)),*result=calloc(1,sizeof(*result));
+  uint8_t *wire=malloc(256u*1024u); if(!original || !result || !wire) return 2;
+  edr_test_pmfe_original(original,1,(int64_t)time(NULL)*1000000000LL);
+  strcpy(original->endpoint_id,"synthetic-endpoint"); strcpy(original->tenant_id,"synthetic-tenant");
+  size_t original_len=make_wire(original,NULL,wire,256u*1024u);
+  edr_storage_queue_configure(4,72);
+  CHECK(edr_storage_queue_open(queue_path)==EDR_OK);
+  CHECK(edr_local_evidence_cache_open(cache_path,8,24)==0);
+  EdrPmfeFollowupTask task;
+  CHECK(edr_local_evidence_cache_pmfe_prepare(original,"sc-local-1",wire+16,original_len-16,
+        EDR_PMFE_BAND_P0,0,&task)==0);
+  CHECK(edr_storage_queue_enqueue("tls-pmfe-original",wire,original_len,0,1)==EDR_OK);
+  edr_storage_queue_poll_drain(); CHECK(row_count(queue_path,"tls-pmfe-original",NULL)==0);
+  /* Actual worker, with a deliberately impossible synthetic process generation.
+   * It must report failure/inconclusive before reading any reused process. */
+#ifdef _WIN32
+  _putenv_s("EDR_PMFE_ENABLED","1");
+#else
+  setenv("EDR_PMFE_ENABLED","1",1);
+#endif
+  EdrEventBus *bus=edr_event_bus_create(16); CHECK(bus!=NULL);
+  edr_pmfe_set_event_bus(bus); CHECK(edr_pmfe_init()==EDR_OK);
+  CHECK(edr_local_evidence_cache_pmfe_take_task(&task)==1);
+  CHECK(edr_pmfe_submit_associated_scan(&task)==0);
+  EdrEventSlot slot; int popped=0;
+  for(unsigned attempt=0;attempt<5u && !popped;++attempt) {
+    if(!(popped=edr_event_bus_try_pop(bus,&slot))) (void)edr_event_bus_wait(bus,1000u);
+  }
+  if(!popped) popped=edr_event_bus_try_pop(bus,&slot);
+  edr_pmfe_shutdown(); edr_pmfe_set_event_bus(NULL); CHECK(popped);
+  if(popped) edr_behavior_from_slot(&slot,result);
+  strcpy(result->event_id,"synthetic-pmfe-worker-result");
+  CHECK(result->type==EDR_EVENT_PMFE_SCAN_RESULT);
+  CHECK(edr_local_evidence_cache_pmfe_apply_scope(result)==1);
+  EdrDetectionDecision decision;
+  edr_detection_decision_evaluate(result,&decision);
+  size_t result_len=make_wire(result,NULL,wire,256u*1024u);
+  CHECK(result_len>16 && edr_local_evidence_cache_pmfe_bind_result(result,wire+16,result_len-16)==0);
+  char why[128]; CHECK(edr_egress_batch_validate(wire,12,wire+12,result_len-12,why,sizeof(why)));
+  CHECK(edr_behavior_durable_wire_batch_id("pmfe-result-v1",wire,result_len,batch_id,sizeof(batch_id)));
+  CHECK(edr_storage_queue_enqueue(batch_id,wire,result_len,0,1)==EDR_OK);
+  pause_retry(); edr_storage_queue_poll_drain();
+  CHECK(row_count(queue_path,batch_id,"pending")==1);
+  CHECK(artifact_state_count(cache_path,"result_bound")==1);
+  pause_retry(); edr_storage_queue_poll_drain();
+  CHECK(row_count(queue_path,batch_id,NULL)==0);
+  CHECK(artifact_state_count(cache_path,"completed")==1);
+  CHECK(artifact_state_count(cache_path,"result_acked")==0);
+  edr_storage_queue_close(); edr_local_evidence_cache_close(); edr_event_bus_destroy(bus);
+  free(original); free(result); free(wire);
+  printf("{\"mode\":\"positive-pmfe\",\"synthetic_original_alerts\":1,\"actual_worker_results\":%d,\"enqueued\":2,\"distinct_queue_acks\":2,\"failed_checks\":%u}\n",popped,failed);
+  return failed?1:0;
+}
+static int journal_receipt_scenario(const char *queue_path) {
+  EdrBehaviorRecord *record=calloc(1,sizeof(*record));
+  uint8_t *ordinary=malloc(256u*1024u),*alert=malloc(256u*1024u);
+  if(!record || !ordinary || !alert) return 2;
+  synthetic_record(record); DetectorCapture capture={0};
+  size_t ordinary_len=make_wire(record,NULL,ordinary,256u*1024u);
+  CHECK(detect_synthetic_input(record,&capture)); record->type=EDR_EVENT_BEHAVIOR_ONNX_ALERT;
+  size_t alert_len=make_wire(record,&capture.alert,alert,256u*1024u);
+  edr_storage_queue_configure(4,72); CHECK(edr_storage_queue_open(queue_path)==EDR_OK);
+  CHECK(edr_storage_queue_enforcement_terminal_precreate("synthetic-action","synthetic-source", "synthetic-rule","synthetic-generation","tls-journal-intent",ordinary,ordinary_len)==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  CHECK(edr_storage_queue_enforcement_terminal_update("synthetic-action","tls-journal-source",ordinary,ordinary_len,"tls-journal-combined",alert,alert_len)==EDR_OK);
+  edr_storage_queue_poll_drain(); EdrEnforcementTerminalJournalMetrics status;
+  edr_storage_queue_enforcement_terminal_get_metrics(&status);
+  CHECK(status.policy_held_frames==2 && status.pending==1);
+  sqlite3 *db=NULL; sqlite3_stmt *row=NULL;
+  CHECK(sqlite3_open_v2(queue_path,&db,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK);
+  CHECK(sqlite3_prepare_v2(db,"SELECT source_acked,combined_acked,state,source_wire,combined_wire FROM enforcement_terminal_journal WHERE idempotency_key='synthetic-action'",-1,&row,NULL)==SQLITE_OK);
+  if(row && sqlite3_step(row)==SQLITE_ROW) {
+    CHECK(sqlite3_column_int(row,0)==0 && sqlite3_column_int(row,1)==1);
+    CHECK(!strcmp((const char*)sqlite3_column_text(row,2),"ready"));
+    CHECK(sqlite3_column_bytes(row,3)==(int)ordinary_len && !memcmp(sqlite3_column_blob(row,3),ordinary,ordinary_len));
+    CHECK(sqlite3_column_bytes(row,4)==(int)alert_len && !memcmp(sqlite3_column_blob(row,4),alert,alert_len));
+  } else CHECK(0);
+  sqlite3_finalize(row); if(db) sqlite3_close(db); edr_storage_queue_close();
+  free(record); free(ordinary); free(alert);
+  printf("{\"mode\":\"positive-journal\",\"detector_inputs\":%u,\"detected\":%u,\"source_acked\":0,\"combined_acked\":1,\"failed_checks\":%u}\n",capture.accepted_inputs,atomic_load(&capture.detected),failed);
+  return failed?1:0;
+}
+static int p0_journal_receipt_scenario(const char *queue_path) {
+  EdrTestP0TerminalFixture fixture;
+  if (!edr_test_p0_terminal_fixture_init(&fixture,1,"synthetic-tenant","synthetic-endpoint")) return 2;
+  edr_storage_queue_configure(4,72); CHECK(edr_storage_queue_open(queue_path)==EDR_OK);
+  CHECK(edr_storage_queue_enforcement_terminal_precreate(fixture.terminal_key,fixture.source_event_id,
+      fixture.rule_id,fixture.generation_key,"tls-p0-intent",fixture.wire[0],fixture.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  /* The source tuple or pre-action intent alone is never an alert owner. */
+  char reason[128];
+  CHECK(!edr_egress_batch_validate(fixture.wire[0],12,fixture.wire[0]+12,fixture.length[0]-12,reason,sizeof(reason)));
+  edr_storage_queue_poll_drain();
+  CHECK(edr_storage_queue_enforcement_terminal_update(fixture.terminal_key,"tls-p0-source",
+      fixture.wire[1],fixture.length[1],"tls-p0-combined",fixture.wire[2],fixture.length[2])==EDR_OK);
+  CHECK(edr_egress_batch_validate(fixture.wire[0],12,fixture.wire[0]+12,fixture.length[0]-12,reason,sizeof(reason)));
+  pause_retry(); edr_storage_queue_poll_drain();
+  EdrEnforcementTerminalJournalMetrics status;
+  edr_storage_queue_enforcement_terminal_get_metrics(&status);
+  CHECK(status.pending==1); /* The receiver deliberately loses the intent ACK. */
+  for(unsigned attempt=0;attempt<4u && status.pending;++attempt) {
+    pause_retry(); edr_storage_queue_poll_drain();
+    edr_storage_queue_enforcement_terminal_get_metrics(&status);
+  }
+  CHECK(status.pending==0 && status.local_retained==1);
+  int observed_ack[3]={0,0,0};
+  sqlite3 *db=NULL; sqlite3_stmt *row=NULL;
+  CHECK(sqlite3_open_v2(queue_path,&db,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK);
+  CHECK(sqlite3_prepare_v2(db,"SELECT intent_acked,source_acked,combined_acked,state,intent_wire,source_wire,combined_wire FROM enforcement_terminal_journal WHERE idempotency_key=?",-1,&row,NULL)==SQLITE_OK);
+  if(row) sqlite3_bind_text(row,1,fixture.terminal_key,-1,SQLITE_TRANSIENT);
+  if(row && sqlite3_step(row)==SQLITE_ROW) {
+    for(unsigned i=0;i<3;i++) observed_ack[i]=sqlite3_column_int(row,(int)i);
+    CHECK(sqlite3_column_int(row,0)==1 && sqlite3_column_int(row,1)==0 && sqlite3_column_int(row,2)==1);
+    CHECK(!strcmp((const char*)sqlite3_column_text(row,3),"local_retained"));
+    for(unsigned i=0;i<3;i++)
+      CHECK(sqlite3_column_bytes(row,4+(int)i)==(int)fixture.length[i] &&
+        !memcmp(sqlite3_column_blob(row,4+(int)i),fixture.wire[i],fixture.length[i]));
+  } else CHECK(0);
+  sqlite3_finalize(row); if(db) sqlite3_close(db); edr_storage_queue_close();
+  edr_test_p0_terminal_fixture_free(&fixture);
+  printf("{\"mode\":\"positive-p0-journal\",\"detection_basis\":\"production_schema_fixture\",\"detector_executed\":false,\"enqueued_terminal_frames\":3,\"intent_acked\":%d,\"source_acked\":%d,\"combined_acked\":%d,\"distinct_queue_acks\":%d,\"failed_checks\":%u}\n",observed_ack[0],observed_ack[1],observed_ack[2],observed_ack[0]+observed_ack[2],failed);
+  return failed?1:0;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc != 7) {
     fprintf(stderr, "usage: test_egress_tls_client BASE_URL CA CLIENT_CERT CLIENT_KEY QUEUE_PATH MODE\n"); return 2;
@@ -102,6 +249,29 @@ int main(int argc, char **argv) {
   edr_ingest_http_set_policy_version("synthetic-p1");
   int v2 = !strcmp(argv[6], "positive-v2");
   edr_ingest_http_configure_transport_options(0, 0, 0, 0, v2, "protobuf", v2 ? "zstd" : "none");
+#ifdef EDR_TEST_EXTENDED_EGRESS
+  if (!strcmp(argv[6], "positive-pmfe")) return pmfe_receipt_scenario(argv[5]);
+  if (!strcmp(argv[6], "positive-journal")) return journal_receipt_scenario(argv[5]);
+  if (!strcmp(argv[6], "positive-p0-journal")) return p0_journal_receipt_scenario(argv[5]);
+#endif
+  if (!strcmp(argv[6], "resume-after-crash")) {
+    /* Reopen the actual crashed delivery owner without recollecting or
+     * rebuilding the immutable queued alert. Its held ordinary row remains. */
+    edr_storage_queue_configure(4u, 72u);
+    CHECK(edr_storage_queue_open(argv[5]) == EDR_OK);
+    CHECK(row_count(argv[5], "tls-ordinary", "policy_held") == 1);
+    CHECK(row_count(argv[5], "tls-alert", NULL) == 0);
+    CHECK(row_count(argv[5], "tls-ack-lost", "pending") == 1);
+    for (unsigned attempt = 0; attempt < 3u && row_count(argv[5], "tls-ack-lost", NULL); ++attempt) {
+      pause_retry();
+      edr_storage_queue_poll_drain();
+    }
+    CHECK(row_count(argv[5], "tls-ack-lost", NULL) == 0);
+    CHECK(row_count(argv[5], "tls-ordinary", "policy_held") == 1);
+    edr_storage_queue_close();
+    printf("{\"mode\":\"resume-after-crash\",\"collected\":0,\"detected\":0,\"enqueued\":0,\"failed_checks\":%u}\n", failed);
+    return failed ? 1 : 0;
+  }
   if (strcmp(argv[6], "positive") && strcmp(argv[6], "positive-ip") && !v2) {
     int rc = edr_ingest_http_post_heartbeat();
     printf("{\"mode\":\"%s\",\"tls_rejected\":%s}\n", argv[6], rc != 0 ? "true" : "false");
@@ -133,6 +303,17 @@ int main(int argc, char **argv) {
   CHECK(queue_result == EDR_OK); if (queue_result == EDR_OK) enqueued++;
   pause_retry(); edr_storage_queue_poll_drain();
   CHECK(row_count(argv[5], "tls-ack-lost", "pending") == 1);
+  if (getenv("EDR_TEST_CRASH_AFTER_LOST_ACK")) {
+    /* A test-only executable checkpoint. The harness SIGKILLs this exact
+     * child; a bounded deadline fails if the harness does not terminate it. */
+    if (failed) return 1;
+    printf("{\"crash_checkpoint\":\"lost_ack_pending\",\"detector_inputs\":%u,\"detected\":%u,\"enqueued\":%u}\n",
+           capture.accepted_inputs, atomic_load(&capture.detected), enqueued);
+    fflush(stdout);
+    for (unsigned wait = 0; wait < 10u; ++wait) pause_retry();
+    fprintf(stderr, "synthetic crash harness did not terminate its child\n");
+    return 2;
+  }
   edr_storage_queue_close();
   pause_retry(); CHECK(edr_storage_queue_open(argv[5]) == EDR_OK);
   CHECK(row_count(argv[5], "tls-ordinary", "policy_held") == 1);

@@ -64,6 +64,28 @@ int edr_egress_batch_validate(const uint8_t *header, size_t header_len,
                                      accepted ? "eligible" : "synthetic_policy_rejected");
   return accepted;
 }
+/* This suite cannot assert recovery semantic admission. The separate
+ * queue_recovery_v1_contract links the real projector and protobuf parser. */
+int edr_egress_batch_project_alerts(const uint8_t *header,size_t header_len,
+    const uint8_t *payload,size_t payload_len,const char *tenant,const char *endpoint,
+    uint8_t **out,size_t *out_len,uint32_t *frames,char *reason,size_t cap) {
+  (void)tenant; (void)endpoint;
+  *out=NULL; *out_len=0; *frames=0;
+  (void)header; (void)header_len; (void)payload; (void)payload_len;
+  snprintf(reason,cap,"test_projection_semantics_unavailable"); return 0;
+}
+int edr_egress_batch_note_queue_removed(const uint8_t *header,size_t header_len,
+    const uint8_t *payload,size_t len,char *reason,size_t cap) {
+  (void)header; (void)header_len; (void)payload; (void)len;
+  if (reason && cap) snprintf(reason,cap,"no_test_finalizer"); return 1;
+}
+void edr_egress_set_p0_pair_validator(EdrEgressP0PairValidator fn,void *user) {
+  (void)fn; (void)user; /* Actual association semantics covered by the real codec suite. */
+}
+int edr_egress_p0_combined_matches(const EdrEgressP0PairAssociation *tuple,
+    const uint8_t *wire,size_t len) { (void)tuple; (void)wire; (void)len; return 0; }
+int edr_egress_p0_intent_matches(const EdrEgressP0PairAssociation *tuple,
+    const uint8_t *wire,size_t len) { (void)tuple; (void)wire; (void)len; return 0; }
 static int s_send_ok;
 static int s_configured = 1;
 static int s_circuit_open;
@@ -649,7 +671,8 @@ static void terminal_journal_age_for_retention(const char *path, const char *key
   assert(sqlite3_open(path, &db) == SQLITE_OK);
   assert(sqlite3_prepare_v2(
              db,
-             "UPDATE enforcement_terminal_journal SET created_at=1,updated_at=1 "
+             "UPDATE enforcement_terminal_journal SET created_at=1,updated_at=1,"
+             "intent_next_retry_at=1,source_next_retry_at=1,combined_next_retry_at=1 "
              "WHERE idempotency_key=?;",
              -1, &st, NULL) == SQLITE_OK);
   sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
@@ -2653,7 +2676,8 @@ static void test_budget_deferral_preserves_terminal_frames(void) {
   s_receipt_body = NULL;
   s_defer_during_send = 1;
   edr_storage_queue_poll_drain();
-  assert(send_calls_for(0xcau) == 1u && send_calls_for(0xcbu) == 0u);
+  assert(send_calls_for(0xc9u) == 1u && send_calls_for(0xcau) == 0u && send_calls_for(0xcbu) == 0u);
+  assert(terminal_journal_intent_acked(path, "budget-terminal") == 0);
   assert(terminal_journal_frame_retry_count(path, "budget-terminal", 1) == 0);
   assert(terminal_journal_frame_retry_count(path, "budget-terminal", 0) == 0);
   assert(terminal_journal_state_is(path, "budget-terminal", "ready"));
@@ -3302,6 +3326,32 @@ static void test_missing_source_meta_preserves_owner_recovery(void) {
   edr_storage_queue_close(); remove(path);
 }
 
+static void test_terminal_policy_hold_does_not_block_combined_alert(void) {
+  char path[256]; uint8_t intent[20], source[20], combined[20]; int source_ack, combined_ack;
+  snprintf(path, sizeof(path), "edr-terminal-policy-independent-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(intent, 0xa1u); make_wire(source, 0xa2u); make_wire(combined, 0xa3u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enforcement_terminal_precreate("policy-independent", "synthetic-source",
+      "SYNTHETIC-RULE", "synthetic-generation", "policy-intent", intent, sizeof(intent)) ==
+      EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  assert(edr_storage_queue_enforcement_terminal_update("policy-independent", "policy-source",
+      source, sizeof(source), "policy-combined", combined, sizeof(combined)) == EDR_OK);
+  s_policy_reject_value = 0xa2; reset_send_state(1);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xa2u) == 0u && send_calls_for(0xa3u) == 1u);
+  assert(terminal_journal_final_acks(path, "policy-independent", &source_ack, &combined_ack));
+  assert(source_ack == 0 && combined_ack == 1);
+  assert(terminal_journal_state_is(path, "policy-independent", "local_retained"));
+  assert(terminal_journal_frame_retry_count(path, "policy-independent", 1) == 0);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(edr_storage_queue_enforcement_terminal_precreate("policy-independent", "synthetic-source",
+      "SYNTHETIC-RULE", "synthetic-generation", "policy-intent", intent, sizeof(intent)) ==
+      EDR_ENFORCEMENT_TERMINAL_PRECREATE_EXISTING);
+  edr_storage_queue_close(); remove(path); s_policy_reject_value = -1;
+}
+
 int main(void) {
   char path[256];
   char old_path[256];
@@ -3312,6 +3362,7 @@ int main(void) {
   assert(test_setenv("EDR_QUEUE_DRAIN_INTERVAL_MS", "200") == 0);
   assert(test_setenv("EDR_QUEUE_MAX_RETRIES", "1") == 0);
   test_missing_source_meta_preserves_owner_recovery();
+  test_terminal_policy_hold_does_not_block_combined_alert();
   assert(edr_storage_queue_open(path) == EDR_OK);
   make_wire(wire_a, 1u);
   make_wire(wire_b, 9u);

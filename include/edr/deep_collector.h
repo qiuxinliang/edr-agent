@@ -74,7 +74,7 @@ typedef struct {
   const char *collector_bin; /* 可空:空则用 EDR_FORENSIC_COLLECTOR_BIN 或平台默认 */
   const char *scope;         /* "memory_dump" 等 */
   const char *output_dir;    /* 本地产物目录 */
-  const char *extra_args;    /* 透传 collector,如 "--pid=1234 --full"（已做基本清洗） */
+  const char *extra_args;    /* Local-only whitelist: mode=query, request, out-file, limit, pid, full. */
   uint32_t timeout_s;        /* 0 表示默认 300s */
   uint32_t cpu_limit_percent; /* Windows Job CPU 硬上限；0=默认 10，交互式查询可单独提高 */
   int needs_velociraptor;    /* 1=velo 层(运行前确保 velociraptor 就绪到其槽位);0=builtin/其它,不拉 velo */

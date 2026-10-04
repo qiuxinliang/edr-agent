@@ -7,7 +7,18 @@ pcre2_prefix="${EDR_TEST_PCRE2_PREFIX:-/opt/homebrew/opt/pcre2}"
 crypto_prefix="${EDR_TEST_OPENSSL_PREFIX:-/opt/homebrew/opt/openssl@3}"
 compiler="${CC:-clang}"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/edr-real-ir-test.XXXXXX")"
-trap 'rm -rf "$test_root"' EXIT
+finish_test() {
+  test_status=$?
+  if [[ "$test_status" -ne 0 ]]; then
+    echo "TEST ONLY real IR contract failed (exit $test_status)." >&2
+    for test_log in "$test_root"/*.log; do
+      [[ -f "$test_log" ]] || continue
+      rg "Assertion failed:|^FAIL:|fixture.*failed|fixture authority unavailable" "$test_log" | sed 's/ context=.*$//' >&2 || true
+    done
+  fi
+  rm -rf "$test_root"
+}
+trap finish_test EXIT
 if [[ ! -f "$pcre2_prefix/include/pcre2.h" || ! -f "$crypto_prefix/include/openssl/evp.h" ]]; then
   echo 'Required TEST ONLY PCRE2/OpenSSL headers unavailable; set EDR_TEST_PCRE2_PREFIX and EDR_TEST_OPENSSL_PREFIX.' >&2
   exit 2
@@ -20,7 +31,7 @@ sources=(
  src/preprocess/encrypt_p0_rules.c src/preprocess/preprocess_env.c
  src/detection/policy_enforcement.c src/detection/policy_v2.c
  src/serialize/alert_governor.c src/serialize/behavior_alert_emit.c src/serialize/behavior_proto.c
- src/command/sha256.c src/proto/edr/v1/event.pb.c src/transport/egress_batch_policy.c
+ src/preprocess/p0_terminal_identity.c src/command/sha256.c src/proto/edr/v1/event.pb.c src/transport/egress_batch_policy.c
  third_party/cjson/cJSON.c third_party/nanopb/pb_common.c
  third_party/nanopb/pb_encode.c third_party/nanopb/pb_decode.c
 )

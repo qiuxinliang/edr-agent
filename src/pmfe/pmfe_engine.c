@@ -51,10 +51,6 @@ static const EdrConfig *s_pmfe_cfg;
 static EdrPmfeServerScanResultCallback s_server_scan_result_callback;
 static unsigned pmfe_detail_u(const char *d, const char *key);
 
-void edr_pmfe_bind_config(const EdrConfig *cfg) {
-  s_pmfe_cfg = cfg;
-}
-
 const EdrConfig *edr_pmfe_current_config(void) {
   return s_pmfe_cfg;
 }
@@ -87,11 +83,14 @@ typedef struct {
   uint8_t dns_path;
   uint8_t peek_cap;
   uint8_t server_requested;
+  uint32_t cooldown_ms;
   /** Windows：`VirtualQueryEx` 精扫窗口中心（用户态 VA）；0 表示未指定（全空间候选逻辑不变）。 */
   uint64_t vad_hint_va;
+  EdrPmfeFollowupTask followup;
 } EdrPmfeTask;
 
 static EdrPmfeTask s_task_buf[PMFE_TASK_CAP];
+static EdrPmfeTask s_active_tasks[PMFE_NUM_WORKERS];
 static unsigned s_task_head;
 static unsigned s_task_tail;
 static unsigned s_task_count;
@@ -134,7 +133,10 @@ static HANDLE s_listen_thread;
 static volatile LONG s_listen_stop; /* 1 = exit listen poller */
 static volatile LONG s_shutdown;
 static volatile LONG s_inited;
+static INIT_ONCE s_sync_once = INIT_ONCE_STATIC_INIT;
+static SRWLOCK s_lifecycle_mu = SRWLOCK_INIT;
 #else
+static pthread_mutex_t s_lifecycle_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t s_q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t s_etw_cd_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_q_nonempty = PTHREAD_COND_INITIALIZER;
@@ -148,6 +150,82 @@ static volatile int s_linux_listen_stop;
 static volatile uint64_t s_defer_listen_refresh_at_ms_linux;
 #endif
 #endif
+
+/* Admission, queue state, and publication of ready are owned by s_q_mu.
+ * Synchronizers outlive hot policy restarts, including delayed submitters. */
+static int s_admission_enabled;
+static uint64_t s_run_epoch; /* queue-lock owned; rejects waiters from a prior run */
+#ifdef EDR_PMFE_LIFECYCLE_TESTING
+static void (*s_lifecycle_test_hook)(int phase);
+void edr_pmfe_set_lifecycle_test_hook(void (*hook)(int phase)) {
+  s_lifecycle_test_hook = hook;
+}
+static void pmfe_lifecycle_checkpoint(int phase) {
+  if (s_lifecycle_test_hook) s_lifecycle_test_hook(phase);
+}
+#else
+#define pmfe_lifecycle_checkpoint(phase) ((void)0)
+#endif
+
+#ifdef _WIN32
+static BOOL CALLBACK pmfe_sync_init(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+  (void)once; (void)parameter; (void)context;
+  InitializeCriticalSection(&s_q_mu);
+  InitializeCriticalSection(&s_etw_cd_mu);
+  InitializeConditionVariable(&s_q_nonempty);
+  InitializeConditionVariable(&s_q_nonfull);
+  return TRUE;
+}
+static void pmfe_sync_ensure(void) {
+  (void)InitOnceExecuteOnce(&s_sync_once, pmfe_sync_init, NULL, NULL);
+}
+static void pmfe_lifecycle_lock(void) {
+  pmfe_sync_ensure();
+  AcquireSRWLockExclusive(&s_lifecycle_mu);
+}
+static void pmfe_lifecycle_unlock(void) { ReleaseSRWLockExclusive(&s_lifecycle_mu); }
+static void pmfe_queue_lock(void) { EnterCriticalSection(&s_q_mu); }
+static void pmfe_queue_unlock(void) { LeaveCriticalSection(&s_q_mu); }
+#else
+static void pmfe_sync_ensure(void) {}
+static void pmfe_lifecycle_lock(void) { pthread_mutex_lock(&s_lifecycle_mu); }
+static void pmfe_lifecycle_unlock(void) { pthread_mutex_unlock(&s_lifecycle_mu); }
+static void pmfe_queue_lock(void) { pthread_mutex_lock(&s_q_mu); }
+static void pmfe_queue_unlock(void) { pthread_mutex_unlock(&s_q_mu); }
+#endif
+
+static int pmfe_policy_enabled(const EdrConfig *cfg) {
+  const char *en = getenv("EDR_PMFE_ENABLED");
+  if (en) return en[0] == '1';
+  return cfg && cfg->detection.pmfe_mode != 0 && cfg->resource_limit.pmfe_scans_per_min != 0u;
+}
+
+void edr_pmfe_bind_config(const EdrConfig *cfg) {
+  pmfe_sync_ensure();
+  pmfe_queue_lock();
+  s_pmfe_cfg = cfg;
+  s_admission_enabled = pmfe_policy_enabled(cfg);
+  pmfe_queue_unlock();
+}
+
+static void pmfe_stop_admission(void) {
+  pmfe_queue_lock();
+#ifdef _WIN32
+  InterlockedExchange(&s_inited, 0);
+#else
+  __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
+#endif
+  s_admission_enabled = 0;
+  s_shutdown = 1;
+#ifdef _WIN32
+  WakeAllConditionVariable(&s_q_nonempty);
+  WakeAllConditionVariable(&s_q_nonfull);
+#else
+  pthread_cond_broadcast(&s_q_nonempty);
+  pthread_cond_broadcast(&s_q_nonfull);
+#endif
+  pmfe_queue_unlock();
+}
 
 static EdrEventBus *s_pmfe_bus;
 
@@ -177,9 +255,17 @@ static int pmfe_task_pending_equiv_locked(const EdrPmfeTask *src) {
   }
   for (unsigned i = 0, idx = s_task_head; i < s_task_count; i++, idx = (idx + 1u) % PMFE_TASK_CAP) {
     const EdrPmfeTask *t = &s_task_buf[idx];
+    if (src->followup.association_id[0] || t->followup.association_id[0]) {
+      if (src->followup.association_id[0] && !strcmp(src->followup.association_id,t->followup.association_id)) return 1;
+      continue;
+    }
     if (t->pid == src->pid && t->band == src->band && t->vad_hint_va == src->vad_hint_va && !t->force_deep) {
       return 1;
     }
+  }
+  if (src->followup.association_id[0]) {
+    for (unsigned i=0;i<PMFE_NUM_WORKERS;++i)
+      if (!strcmp(src->followup.association_id,s_active_tasks[i].followup.association_id)) return 1;
   }
   return 0;
 }
@@ -1519,6 +1605,14 @@ static int pmfe_scan_windows(const EdrPmfeTask *task, char *detail, size_t detai
       }
     }
   }
+  if (task->followup.association_id[0] && (!scan_generation ||
+      scan_generation->process_start_key!=task->followup.process_start_key ||
+      scan_generation->creation_filetime_100ns!=task->followup.process_creation_filetime_100ns)) {
+    snprintf(detail,detail_cap,"pid=%u scan_target_generation=unverified_or_mismatched",pid);
+    if (scan_generation) memset(scan_generation,0,sizeof(*scan_generation));
+    CloseHandle(h);
+    return -1;
+  }
   if (result) {
     DWORD image_len = (DWORD)sizeof(result->image_path);
     (void)QueryFullProcessImageNameA(h, 0, result->image_path, &image_len);
@@ -2157,6 +2251,10 @@ static int pmfe_run_scan(const EdrPmfeTask *task, char *detail, size_t detail_ca
 #ifdef _WIN32
   return pmfe_scan_windows(task, detail, detail_cap, result, scan_generation);
 #elif defined(__linux__)
+  if (task->followup.association_id[0]) {
+    snprintf(detail,detail_cap,"pid=%u scan_target_generation=unsupported_platform",task->pid);
+    return -1;
+  }
   int rc = pmfe_scan_linux(task, detail, detail_cap, result);
   if (result) {
     snprintf(result->yara_status, sizeof(result->yara_status), "%s", "unsupported");
@@ -2385,21 +2483,36 @@ static void pmfe_try_emit_scan_result(const EdrPmfeTask *task, const char *detai
   slot.attack_surface_hint = 0u;
 
   const char *cid = task->cmd_id[0] ? task->cmd_id : "-";
-  const char *source_alert_id = shellcode_followup ? task->cmd_id + 14u : "";
+  const char *source_alert_id = task->followup.association_id[0] ? task->followup.source_alert_id :
+                              (shellcode_followup ? task->cmd_id + 14u : "");
   const char *status = scan_result && scan_result->status[0] ? scan_result->status : "unknown";
   const char *verdict = scan_result && scan_result->verdict[0] ? scan_result->verdict : "inconclusive";
   int suspicious = strcmp(verdict, "suspicious") == 0;
-  char generation_lines[224];
+  char generation_lines[512];
   generation_lines[0] = '\0';
+  EdrLiveProcessGeneration expected;
+  const char *generation_source="etw_start_key_live_telemetry";
+  if (task->followup.association_id[0] && (!scan_generation || !scan_generation->process_start_key)) {
+    memset(&expected,0,sizeof(expected)); expected.pid=task->pid;
+    expected.process_start_key=task->followup.process_start_key;
+    expected.creation_filetime_100ns=task->followup.process_creation_filetime_100ns;
+    scan_generation=&expected;
+    generation_source="pmfe_followup_expected_generation";
+  }
   if (scan_generation && scan_generation->pid == task->pid &&
       scan_generation->process_start_key != 0u &&
       scan_generation->creation_filetime_100ns != 0u) {
     (void)snprintf(generation_lines, sizeof(generation_lines),
                    "process_start_key=%llu\n"
                    "process_creation_filetime_100ns=%llu\n"
-                   "process_generation_source=etw_start_key_live_telemetry\n",
+                   "process_generation_source=%s\n",
                    (unsigned long long)scan_generation->process_start_key,
-                   (unsigned long long)scan_generation->creation_filetime_100ns);
+                   (unsigned long long)scan_generation->creation_filetime_100ns,generation_source);
+  }
+  if (task->followup.association_id[0]) {
+    size_t off=strlen(generation_lines);
+    (void)snprintf(generation_lines+off,sizeof(generation_lines)-off,
+                  "pmfe_association_id=%s\n",task->followup.association_id);
   }
   int n = snprintf((char *)slot.data, sizeof(slot.data),
                    "ETW1\nprov=pmfe\npid=%u\ncmd_id=%.63s\nfollowup_only=%u\nsource_alert_id=%.63s\n"
@@ -2451,7 +2564,7 @@ static uint64_t pmfe_result_unix_ms(void) {
 #endif
 }
 
-static void pmfe_worker_body(void) {
+static void pmfe_worker_body(unsigned worker_index) {
   for (;;) {
     EdrPmfeTask task;
     memset(&task, 0, sizeof(task));
@@ -2465,6 +2578,7 @@ static void pmfe_worker_body(void) {
       break;
     }
     task = s_task_buf[s_task_head];
+    s_active_tasks[worker_index]=task;
     s_task_head = (s_task_head + 1u) % PMFE_TASK_CAP;
     s_task_count--;
     WakeConditionVariable(&s_q_nonfull);
@@ -2479,6 +2593,7 @@ static void pmfe_worker_body(void) {
       break;
     }
     task = s_task_buf[s_task_head];
+    s_active_tasks[worker_index]=task;
     s_task_head = (s_task_head + 1u) % PMFE_TASK_CAP;
     s_task_count--;
     pthread_cond_signal(&s_q_nonfull);
@@ -2621,8 +2736,14 @@ static void pmfe_worker_body(void) {
     }
 
 #ifdef _WIN32
+    EnterCriticalSection(&s_q_mu);
+    memset(&s_active_tasks[worker_index],0,sizeof(s_active_tasks[worker_index]));
+    LeaveCriticalSection(&s_q_mu);
     InterlockedIncrement(&s_stat_completed);
 #else
+    pthread_mutex_lock(&s_q_mu);
+    memset(&s_active_tasks[worker_index],0,sizeof(s_active_tasks[worker_index]));
+    pthread_mutex_unlock(&s_q_mu);
     (void)__atomic_add_fetch(&s_stat_completed, 1ul, __ATOMIC_RELAXED);
 #endif
   }
@@ -2630,14 +2751,12 @@ static void pmfe_worker_body(void) {
 
 #ifdef _WIN32
 static DWORD WINAPI pmfe_worker_main(void *arg) {
-  (void)arg;
-  pmfe_worker_body();
+  pmfe_worker_body((unsigned)(uintptr_t)arg);
   return 0;
 }
 #else
 static void *pmfe_worker_main(void *arg) {
-  (void)arg;
-  pmfe_worker_body();
+  pmfe_worker_body((unsigned)(uintptr_t)arg);
   return NULL;
 }
 #endif
@@ -2725,13 +2844,13 @@ static void *pmfe_linux_listen_poll_main(void *arg) {
   __atomic_store_n(&s_defer_listen_refresh_at_ms_linux, 0, __ATOMIC_RELEASE);
   for (;;) {
     for (int i = 0; i < 60; i++) {
-      if (s_linux_listen_stop) {
+      if (__atomic_load_n(&s_linux_listen_stop, __ATOMIC_ACQUIRE)) {
         return NULL;
       }
       pmfe_linux_try_deferred_listen_refresh();
       sleep(1);
     }
-    if (s_linux_listen_stop) {
+    if (__atomic_load_n(&s_linux_listen_stop, __ATOMIC_ACQUIRE)) {
       break;
     }
     edr_pmfe_listen_table_refresh();
@@ -2755,170 +2874,150 @@ void edr_pmfe_on_process_lifecycle_hint(void) {
 void edr_pmfe_on_process_lifecycle_hint(void) {}
 #endif
 
-EdrError edr_pmfe_init(void) {
-  const char *en = getenv("EDR_PMFE_ENABLED");
-  if (en && en[0] == '0') {
-    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED=0)\n");
+static EdrError pmfe_init_locked(void) {
+  pmfe_queue_lock();
+  if (edr_pmfe_is_running()) {
+    pmfe_queue_unlock();
     return EDR_OK;
   }
-  if (en && en[0] != '1') {
-    EDR_LOGV("%s", "[pmfe] disabled (EDR_PMFE_ENABLED must be 0 or 1)\n");
+  if (!pmfe_policy_enabled(s_pmfe_cfg)) {
+    s_admission_enabled = 0;
+    pmfe_queue_unlock();
+    EDR_LOGV("%s", "[pmfe] disabled by endpoint policy or environment\n");
     return EDR_OK;
   }
-  if (!en && (!s_pmfe_cfg || s_pmfe_cfg->detection.pmfe_mode == 0 ||
-              s_pmfe_cfg->resource_limit.pmfe_scans_per_min == 0u)) {
-    EDR_LOGV("%s", "[pmfe] disabled by endpoint policy or zero scan budget\n");
-    return EDR_OK;
-  }
+  s_admission_enabled = 1;
+  s_shutdown = 0;
+  ++s_run_epoch;
+  s_task_head = s_task_tail = s_task_count = 0;
+  memset(s_active_tasks, 0, sizeof(s_active_tasks));
+  pmfe_queue_unlock();
 #ifdef _WIN32
-  if (InterlockedCompareExchange(&s_inited, 1, 0) != 0) {
-    return EDR_OK;
-  }
+  EnterCriticalSection(&s_etw_cd_mu);
+  InterlockedExchange(&s_stat_deduped, 0);
+  InterlockedExchange(&s_stat_cooldown_skipped, 0);
+#else
+  pthread_mutex_lock(&s_etw_cd_mu);
+  __atomic_store_n(&s_stat_deduped, 0ul, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_stat_cooldown_skipped, 0ul, __ATOMIC_RELAXED);
+#endif
+  memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
+  memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
+#ifdef _WIN32
+  LeaveCriticalSection(&s_etw_cd_mu);
   edr_pmfe_host_policy_init();
   edr_pmfe_listen_table_refresh();
   InterlockedExchange(&s_listen_stop, 0);
   s_listen_thread = CreateThread(NULL, 0, pmfe_listen_poll_main, NULL, 0, NULL);
   if (!s_listen_thread) {
+    pmfe_stop_admission();
     edr_pmfe_host_policy_shutdown();
-    InterlockedExchange(&s_inited, 0);
     return EDR_ERR_INTERNAL;
   }
-  InitializeCriticalSection(&s_q_mu);
-  InitializeCriticalSection(&s_etw_cd_mu);
-  InitializeConditionVariable(&s_q_nonempty);
-  InitializeConditionVariable(&s_q_nonfull);
-  s_shutdown = 0;
-  s_task_head = s_task_tail = s_task_count = 0;
-  InterlockedExchange(&s_stat_deduped, 0);
-  InterlockedExchange(&s_stat_cooldown_skipped, 0);
-  memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
-  memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
-  for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
-    s_workers[i] = CreateThread(NULL, 0, pmfe_worker_main, NULL, 0, NULL);
-    if (!s_workers[i]) {
-      s_shutdown = 1;
-      InterlockedExchange(&s_listen_stop, 1);
-      if (s_listen_thread) {
-        WaitForSingleObject(s_listen_thread, 120000);
-        CloseHandle(s_listen_thread);
-        s_listen_thread = NULL;
-      }
-      edr_pmfe_host_policy_shutdown();
-      WakeAllConditionVariable(&s_q_nonempty);
-      for (int j = 0; j < i; j++) {
-        WaitForSingleObject(s_workers[j], INFINITE);
-        CloseHandle(s_workers[j]);
-        s_workers[j] = NULL;
-      }
-      DeleteCriticalSection(&s_etw_cd_mu);
-      DeleteCriticalSection(&s_q_mu);
-      InterlockedExchange(&s_inited, 0);
-      return EDR_ERR_INTERNAL;
-    }
-  }
 #else
-  {
-    int expected = 0;
-    if (!__atomic_compare_exchange_n(&s_inited, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-      return EDR_OK;
-    }
-  }
+  pthread_mutex_unlock(&s_etw_cd_mu);
 #if defined(__linux__)
   edr_pmfe_host_policy_init();
   edr_pmfe_listen_table_refresh();
-  s_linux_listen_stop = 0;
+  __atomic_store_n(&s_linux_listen_stop, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&s_defer_listen_refresh_at_ms_linux, 0, __ATOMIC_RELEASE);
   if (pthread_create(&s_linux_listen_thread, NULL, pmfe_linux_listen_poll_main, NULL) != 0) {
+    pmfe_stop_admission();
     edr_pmfe_host_policy_shutdown();
-    __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
     return EDR_ERR_INTERNAL;
   }
 #endif
-  s_shutdown = 0;
-  s_task_head = s_task_tail = s_task_count = 0;
-  __atomic_store_n(&s_stat_deduped, 0ul, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_stat_cooldown_skipped, 0ul, __ATOMIC_RELAXED);
-  memset(s_etw_cd_pid, 0, sizeof(s_etw_cd_pid));
-  memset(s_etw_cd_ms, 0, sizeof(s_etw_cd_ms));
+#endif
+  pmfe_lifecycle_checkpoint(EDR_PMFE_TEST_INIT_WORKERS);
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
-    int pr = pthread_create(&s_workers[i], NULL, pmfe_worker_main, NULL);
-    if (pr != 0) {
-      s_shutdown = 1;
-      pthread_cond_broadcast(&s_q_nonempty);
+#ifdef _WIN32
+    s_workers[i] = CreateThread(NULL, 0, pmfe_worker_main, (void *)(uintptr_t)i, 0, NULL);
+    int created = s_workers[i] != NULL;
+#else
+    int created = pthread_create(&s_workers[i], NULL, pmfe_worker_main, (void *)(uintptr_t)i) == 0;
+#endif
+    if (!created) {
+      pmfe_stop_admission();
       for (int j = 0; j < i; j++) {
+#ifdef _WIN32
+        WaitForSingleObject(s_workers[j], INFINITE);
+        CloseHandle(s_workers[j]);
+        s_workers[j] = NULL;
+#else
         pthread_join(s_workers[j], NULL);
+#endif
       }
-#if defined(__linux__)
-      s_linux_listen_stop = 1;
+#ifdef _WIN32
+      InterlockedExchange(&s_listen_stop, 1);
+      WaitForSingleObject(s_listen_thread, INFINITE);
+      CloseHandle(s_listen_thread);
+      s_listen_thread = NULL;
+      edr_pmfe_host_policy_shutdown();
+#elif defined(__linux__)
+      __atomic_store_n(&s_linux_listen_stop, 1, __ATOMIC_RELEASE);
       pthread_join(s_linux_listen_thread, NULL);
       edr_pmfe_host_policy_shutdown();
 #endif
-      __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
-      (void)pr;
       return EDR_ERR_INTERNAL;
     }
   }
-#endif
   edr_pid_history_pmfe_init();
+  pmfe_queue_lock();
+#ifdef _WIN32
+  InterlockedExchange(&s_inited, 1);
+#else
+  __atomic_store_n(&s_inited, 1, __ATOMIC_RELEASE);
+#endif
+  pmfe_queue_unlock();
   EDR_LOGV("[pmfe] init workers=%d queue=%d (listen_table: 60s + deferred; Windows/Linux)\n", PMFE_NUM_WORKERS,
            PMFE_TASK_CAP);
   return EDR_OK;
 }
 
+EdrError edr_pmfe_init(void) {
+  pmfe_lifecycle_lock();
+  EdrError result = pmfe_init_locked();
+  pmfe_lifecycle_unlock();
+  return result;
+}
+
 void edr_pmfe_shutdown(void) {
-#ifdef _WIN32
-  if (!pmfe_atomic_load_long(&s_inited)) {
+  pmfe_lifecycle_lock();
+  if (!edr_pmfe_is_running()) {
+    pmfe_lifecycle_unlock();
     return;
   }
-  EnterCriticalSection(&s_q_mu);
-  s_shutdown = 1;
-  WakeAllConditionVariable(&s_q_nonempty);
-  WakeAllConditionVariable(&s_q_nonfull);
-  LeaveCriticalSection(&s_q_mu);
+  /* Revoke admission before host-policy locks or worker state are dismantled.
+   * A delayed submitter must observe this again under the same queue lock. */
+  pmfe_stop_admission();
   for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
-    if (s_workers[i]) {
-      WaitForSingleObject(s_workers[i], INFINITE);
-      CloseHandle(s_workers[i]);
-      s_workers[i] = NULL;
-    }
-  }
-  InterlockedExchange(&s_listen_stop, 1);
-  if (s_listen_thread) {
-    WaitForSingleObject(s_listen_thread, 120000);
-    CloseHandle(s_listen_thread);
-    s_listen_thread = NULL;
-  }
-  edr_pmfe_host_policy_shutdown();
-  DeleteCriticalSection(&s_etw_cd_mu);
-  DeleteCriticalSection(&s_q_mu);
-  InterlockedExchange(&s_inited, 0);
+#ifdef _WIN32
+    WaitForSingleObject(s_workers[i], INFINITE);
+    CloseHandle(s_workers[i]);
+    s_workers[i] = NULL;
 #else
-  if (!__atomic_load_n(&s_inited, __ATOMIC_ACQUIRE)) {
-    return;
-  }
-  pthread_mutex_lock(&s_q_mu);
-  s_shutdown = 1;
-  pthread_cond_broadcast(&s_q_nonempty);
-  pthread_cond_broadcast(&s_q_nonfull);
-  pthread_mutex_unlock(&s_q_mu);
-  for (int i = 0; i < PMFE_NUM_WORKERS; i++) {
     pthread_join(s_workers[i], NULL);
+#endif
   }
-#if defined(__linux__)
-  s_linux_listen_stop = 1;
-  pthread_join(s_linux_listen_thread, NULL);
-  edr_pmfe_host_policy_shutdown();
-#endif
-  __atomic_store_n(&s_inited, 0, __ATOMIC_RELEASE);
-#endif
 #ifdef _WIN32
+  InterlockedExchange(&s_listen_stop, 1);
+  WaitForSingleObject(s_listen_thread, INFINITE);
+  CloseHandle(s_listen_thread);
+  s_listen_thread = NULL;
+  edr_pmfe_host_policy_shutdown();
   EDR_LOGV("[pmfe] shutdown submitted=%ld completed=%ld dropped=%ld\n", (long)s_stat_submitted,
           (long)s_stat_completed, (long)s_stat_dropped);
 #else
+#if defined(__linux__)
+  __atomic_store_n(&s_linux_listen_stop, 1, __ATOMIC_RELEASE);
+  pthread_join(s_linux_listen_thread, NULL);
+  edr_pmfe_host_policy_shutdown();
+#endif
   EDR_LOGV("[pmfe] shutdown submitted=%lu completed=%lu dropped=%lu\n", (unsigned long)s_stat_submitted,
            (unsigned long)s_stat_completed, (unsigned long)s_stat_dropped);
 #endif
   edr_pid_history_pmfe_shutdown();
+  pmfe_lifecycle_unlock();
 }
 
 int edr_pmfe_is_running(void) {
@@ -3036,20 +3135,49 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
   if (!src || src->pid == 0u) {
     return -1;
   }
-#ifdef _WIN32
-  if (!pmfe_atomic_load_long(&s_inited)) {
+  if (!edr_pmfe_is_running()) {
     return -1;
   }
-  EnterCriticalSection(&s_q_mu);
+  pmfe_lifecycle_checkpoint(EDR_PMFE_TEST_SUBMIT_LOCK);
+  pmfe_queue_lock();
+  if (!edr_pmfe_is_running() || !s_admission_enabled || s_shutdown) {
+    pmfe_queue_unlock();
+    return -1;
+  }
+  /* Host policy owns a listening-table lock that is recreated on restart.
+   * Shutdown must first obtain this queue lock to revoke readiness, so no
+   * priority computation can overlap host-policy teardown. */
+  EdrPmfeTask task = *src;
+  task.priority = (uint8_t)edr_pmfe_compute_priority(task.pid);
+  if (task.priority == EDR_PMFE_PRIO_IGNORE) {
+    pmfe_queue_unlock();
+    return -1;
+  }
+  if (!pmfe_etw_cooldown_pass(task.pid, task.cooldown_ms)) {
+    pmfe_queue_unlock();
+    pmfe_stat_inc_cooldown_skipped();
+    return 1;
+  }
+  pmfe_task_fill_scope(&task);
+  if (task.server_requested && task.command_context.requested_region_base != 0ull) {
+    task.vad_hint_va = task.command_context.requested_region_base;
+    task.full_vad = 0u;
+    task.peek_cap = 1u;
+  }
+  src = &task;
+  uint64_t run_epoch = s_run_epoch;
   if (pmfe_task_pending_equiv_locked(src)) {
-    LeaveCriticalSection(&s_q_mu);
+    pmfe_queue_unlock();
     pmfe_stat_inc_deduped();
     return 1;
   }
-  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
+#ifdef _WIN32
+  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown && s_run_epoch == run_epoch &&
+         s_admission_enabled && !src->followup.association_id[0]) {
     SleepConditionVariableCS(&s_q_nonfull, &s_q_mu, 2000);
   }
-  if (s_shutdown || s_task_count >= PMFE_TASK_CAP) {
+  if (s_shutdown || !s_admission_enabled || !edr_pmfe_is_running() ||
+      s_run_epoch != run_epoch || s_task_count >= PMFE_TASK_CAP) {
     LeaveCriticalSection(&s_q_mu);
     InterlockedIncrement(&s_stat_dropped);
     return -1;
@@ -3061,22 +3189,15 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
   WakeAllConditionVariable(&s_q_nonempty);
   LeaveCriticalSection(&s_q_mu);
 #else
-  if (!__atomic_load_n(&s_inited, __ATOMIC_ACQUIRE)) {
-    return -1;
-  }
-  pthread_mutex_lock(&s_q_mu);
-  if (pmfe_task_pending_equiv_locked(src)) {
-    pthread_mutex_unlock(&s_q_mu);
-    pmfe_stat_inc_deduped();
-    return 1;
-  }
-  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown) {
+  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown && s_run_epoch == run_epoch &&
+         s_admission_enabled && !src->followup.association_id[0]) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 2;
     (void)pthread_cond_timedwait(&s_q_nonfull, &s_q_mu, &ts);
   }
-  if (s_shutdown || s_task_count >= PMFE_TASK_CAP) {
+  if (s_shutdown || !s_admission_enabled || !edr_pmfe_is_running() ||
+      s_run_epoch != run_epoch || s_task_count >= PMFE_TASK_CAP) {
     pthread_mutex_unlock(&s_q_mu);
     (void)__atomic_add_fetch(&s_stat_dropped, 1ul, __ATOMIC_RELAXED);
     return -1;
@@ -3105,10 +3226,6 @@ int edr_pmfe_submit_server_scan_ex(const char *command_id, uint32_t pid,
     return -1;
   }
 #endif
-  EdrPmfeScanPriority pr = edr_pmfe_compute_priority(pid);
-  if (pr == EDR_PMFE_PRIO_IGNORE) {
-    return -1;
-  }
   EdrPmfeTask t;
   memset(&t, 0, sizeof(t));
   t.pid = pid;
@@ -3118,16 +3235,9 @@ int edr_pmfe_submit_server_scan_ex(const char *command_id, uint32_t pid,
   if (context) {
     t.command_context = *context;
   }
-  t.priority = (uint8_t)pr;
   t.band = (uint8_t)EDR_PMFE_BAND_P0;
   t.force_deep = 1u;
   t.server_requested = 1u;
-  pmfe_task_fill_scope(&t);
-  if (context && context->requested_region_base != 0ull) {
-    t.vad_hint_va = context->requested_region_base;
-    t.full_vad = 0u;
-    t.peek_cap = 1u;
-  }
   return pmfe_enqueue_task(&t);
 }
 
@@ -3156,14 +3266,6 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
       cd_ms = (uint32_t)v;
     }
   }
-  if (!pmfe_etw_cooldown_pass(pid, cd_ms)) {
-    pmfe_stat_inc_cooldown_skipped();
-    return 1;
-  }
-  EdrPmfeScanPriority pr = edr_pmfe_compute_priority(pid);
-  if (pr == EDR_PMFE_PRIO_IGNORE) {
-    return -1;
-  }
   EdrPmfeTask t;
   memset(&t, 0, sizeof(t));
   t.pid = pid;
@@ -3171,15 +3273,33 @@ int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTrigger
     const char *r = reason && reason[0] ? reason : "evt";
     snprintf(t.cmd_id, sizeof(t.cmd_id), "etw:%.48s", r);
   }
-  t.priority = (uint8_t)pr;
+  t.cooldown_ms = cd_ms;
   t.band = (uint8_t)band;
   if ((unsigned)band > (unsigned)EDR_PMFE_BAND_P2) {
     t.band = (uint8_t)EDR_PMFE_BAND_P0;
   }
   t.force_deep = 0u;
   t.vad_hint_va = vad_hint_va;
-  pmfe_task_fill_scope(&t);
   return pmfe_enqueue_task(&t);
+}
+
+int edr_pmfe_submit_associated_scan(const EdrPmfeFollowupTask *followup) {
+  if (!followup || !followup->association_id[0] || !followup->source_alert_id[0] ||
+      !followup->pid || !followup->process_start_key || !followup->process_creation_filetime_100ns ||
+      followup->source_event_time_ns<=0 || followup->band>(uint32_t)EDR_PMFE_BAND_P2) return -1;
+#ifdef _WIN32
+  if (!pmfe_atomic_load_long(&s_inited)) return -1;
+#else
+  if (!__atomic_load_n(&s_inited,__ATOMIC_ACQUIRE)) return -1;
+#endif
+  EdrPmfeTask task; memset(&task,0,sizeof(task));
+  task.pid=followup->pid; task.followup=*followup;
+  /* Retain the complete source alert identifier; legacy reason truncation
+   * cannot establish association identity. */
+  snprintf(task.cmd_id,sizeof(task.cmd_id),"etw:shellcode:%s",followup->source_alert_id);
+  task.band=(uint8_t)followup->band;
+  task.vad_hint_va=followup->vad_hint_va;
+  return pmfe_enqueue_task(&task);
 }
 
 int edr_pmfe_submit_etw_scan(const char *reason, uint32_t pid) {

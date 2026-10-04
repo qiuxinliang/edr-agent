@@ -1845,7 +1845,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
     f->has_cmd = etw1_copy_text(f, f->cmd, sizeof(f->cmd), val, EDR_ETW_TRUNC_CMDLINE);
   } else if (strcmp(key, "cmd_id") == 0 || strcmp(key, "alert_id") == 0 ||
              strcmp(key, "pmfe_recommended") == 0 || strcmp(key, "pmfe_trigger") == 0 ||
-             strcmp(key, "followup_only") == 0 ||
+             strcmp(key, "followup_only") == 0 || strcmp(key,"pmfe_association_id")==0 ||
              strcmp(key, "source_alert_id") == 0 || strcmp(key, "pmfe_status") == 0 ||
              strcmp(key, "pmfe_verdict") == 0 || strcmp(key, "private_exec") == 0 ||
              strcmp(key, "private_exec_image_hits") == 0 ||

@@ -2421,12 +2421,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrP0DedupMetrics p0_metrics;
   EdrP0EmitMetrics p0_emit_metrics;
   EdrStorageQueueCapacityMetrics queue_capacity_metrics;
+  EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
   memset(&evidence_status, 0, sizeof(evidence_status));
   memset(&p0_metrics, 0, sizeof(p0_metrics));
   memset(&p0_emit_metrics, 0, sizeof(p0_emit_metrics));
   memset(&queue_capacity_metrics, 0, sizeof(queue_capacity_metrics));
   edr_local_evidence_cache_get_status(&evidence_status);
-  char evidence_accounting_json[2048];
+  char evidence_accounting_json[4096];
   if (edr_local_evidence_cache_accounting_json(&evidence_status, evidence_accounting_json,
                                               sizeof(evidence_accounting_json)) != 0)
     snprintf(evidence_accounting_json, sizeof(evidence_accounting_json), "{\"status\":\"unavailable\"}");
@@ -2434,6 +2435,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
   json_escape_small(p0_emit_metrics.source_only_terminal_reason, source_only_reason, sizeof(source_only_reason));
   edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
+  edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
   if (edr_local_evidence_cache_context_ref_write_sources_json(
           context_ref_sources_json, sizeof(context_ref_sources_json)) < 0) {
     snprintf(context_ref_sources_json, sizeof(context_ref_sources_json), "{}");
@@ -2447,7 +2449,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"reported_at_unix_ms\":%llu,"
         "\"capability_manifest\":%s,"
         "\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
-        "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s},"
+        "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
+        "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
+        "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu},"
         "\"config_recovery\":%s,"
         "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
@@ -2602,6 +2606,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)queue_capacity_metrics.policy_held_rows,
         (unsigned long long)queue_capacity_metrics.local_evidence_rows,
         queue_capacity_metrics.capacity_limit_defaulted ? "true" : "false",
+        (unsigned long long)terminal_journal_metrics.policy_held_frames,
+        (unsigned long long)terminal_journal_metrics.local_retained,
+        (unsigned long long)queue_capacity_metrics.legacy_owner_unacknowledged,
+        (unsigned long long)queue_capacity_metrics.retained_unresolved_rows,
+        (unsigned long long)queue_capacity_metrics.projection_pending_rows,
+        (unsigned long long)queue_capacity_metrics.projection_acked_rows,
         config_recovery_json,
         health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
@@ -2889,8 +2899,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   pmfe_q = edr_pmfe_queue_depth();
   edr_windows_event_policy_get_status(&event_filter_status);
   edr_local_evidence_cache_status_json(evidence_json, sizeof(evidence_json));
-  EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
-  edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
   size_t p0_health_used = 0u;
   int p0_health_ok;
   p0_health_json[0] = '\0';
@@ -3020,11 +3028,19 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
       p0_health_json, sizeof(p0_health_json), &p0_health_used,
       ",\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
-      "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s}",
+      "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
+        "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
+        "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu}",
       http_rt.egress_denied_count,
       (unsigned long long)queue_capacity_metrics.policy_held_rows,
       (unsigned long long)queue_capacity_metrics.local_evidence_rows,
-      queue_capacity_metrics.capacity_limit_defaulted ? "true" : "false");
+      queue_capacity_metrics.capacity_limit_defaulted ? "true" : "false",
+        (unsigned long long)terminal_journal_metrics.policy_held_frames,
+        (unsigned long long)terminal_journal_metrics.local_retained,
+        (unsigned long long)queue_capacity_metrics.legacy_owner_unacknowledged,
+        (unsigned long long)queue_capacity_metrics.retained_unresolved_rows,
+        (unsigned long long)queue_capacity_metrics.projection_pending_rows,
+        (unsigned long long)queue_capacity_metrics.projection_acked_rows);
   if (!p0_health_ok) {
     /* Omit optional P0 metrics rather than append a syntactically incomplete
      * fragment to the enclosing engine-health JSON document. */

@@ -20,6 +20,17 @@ static int check(const char *method, const char *path, const char *body) {
 }
 int main(void) {
   const char *heartbeat = "{\"endpoint_id\":\"synthetic-endpoint\",\"agent_version\":\"test-v1\",\"policy_version\":\"synthetic-p1\"}";
+  {
+    char why[128];
+    assert(edr_egress_request_validate_for_scope("POST","ingest/heartbeat","application/json",
+      heartbeat,strlen(heartbeat),"synthetic-tenant","synthetic-endpoint",why,sizeof(why))==0);
+    assert(edr_egress_request_validate_for_scope("POST","ingest/heartbeat","application/json",
+      heartbeat,strlen(heartbeat),"synthetic-tenant","foreign-endpoint",why,sizeof(why))!=0);
+    assert(!strcmp(why,"egress_scope_mismatch"));
+    const char *config="{\"tenant_id\":\"foreign-tenant\",\"endpoint_id\":\"synthetic-endpoint\",\"agent_version\":\"v1\",\"policy_version\":\"p1\"}";
+    assert(edr_egress_request_validate_for_scope("POST","ingest/config-status","application/json",
+      config,strlen(config),"synthetic-tenant","synthetic-endpoint",why,sizeof(why))!=0);
+  }
   assert(check("POST", "https://localhost/api/v1/ingest/heartbeat", heartbeat) == 0);
   assert(check("POST", "ingest/heartbeat", "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"cmdline\":\"synthetic-secret\"}") != 0);
   assert(check("POST", "ingest/heartbeat", "{\"endpoint_id\":\"ep\",\"endpoint_id\":\"other\",\"agent_version\":\"v1\",\"policy_version\":\"p1\"}") != 0);

@@ -2,6 +2,8 @@
 #include "edr/behavior_from_slot.h"
 #include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/behavior_proto.h"
+#include "edr/egress_batch_policy.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "../src/preprocess/process_cached_generation.h"
@@ -7403,6 +7405,247 @@ static void test_metrics_commit_failure_close_and_retention_boundary(void) {
 
 #endif
 
+#if defined(EDR_HAVE_SQLITE)
+#include "pmfe_association_fixture.h"
+static void pmfe_fixture_original(EdrBehaviorRecord *r,unsigned number) {
+  edr_test_pmfe_original(r,number,1700000000000000000LL);
+}
+static void pmfe_fixture_result(EdrBehaviorRecord *r,unsigned number,const char *status,const char *verdict) {
+  edr_test_pmfe_result(r,number,1700000001000000000LL,status,verdict);
+}
+static int pmfe_artifact_count(const char *path,const char *state) {
+  sqlite3 *db=NULL; sqlite3_stmt *st=NULL; int count=-1;
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='pmfe_followup_local_v1' AND upload_status=?",-1,&st,NULL)==SQLITE_OK);
+  sqlite3_bind_text(st,1,state,-1,SQLITE_TRANSIENT);
+  if (sqlite3_step(st)==SQLITE_ROW) count=sqlite3_column_int(st,0);
+  sqlite3_finalize(st); sqlite3_close(db); return count;
+}
+static void test_pmfe_durable_followup_binding_and_receipt_lifecycle(void) {
+  char path[512],alert[64],reason[96]; assert(make_test_sqlite_path(path,sizeof(path))==0);
+  EdrBehaviorRecord *original=calloc(1,sizeof(*original)),*result=calloc(1,sizeof(*result));
+  uint8_t *source=malloc(EDR_EGRESS_FRAME_MAX),*frame=malloc(EDR_EGRESS_FRAME_MAX),*changed=malloc(EDR_EGRESS_FRAME_MAX);
+  assert(original&&result&&source&&frame&&changed);
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+  assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  pmfe_fixture_original(original,1u); pmfe_fixture_result(result,1u,"completed_clean","clean");
+  size_t n=edr_behavior_record_encode_protobuf(result,frame,EDR_EGRESS_FRAME_MAX); assert(n);
+  /* This regression fails on the baseline: clean follow-up IDs cannot prove
+   * association, even when the independent original detector frame is valid. */
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  size_t source_n=edr_behavior_record_encode_protobuf(original,source,EDR_EGRESS_FRAME_MAX); assert(source_n);
+  assert(edr_egress_frame_validate(source,source_n,reason,sizeof(reason)));
+  snprintf(alert,sizeof(alert),"sc-local-1"); EdrPmfeFollowupTask task;
+  original->pid++;
+  assert(edr_local_evidence_cache_pmfe_prepare(original,alert,source,source_n,0u,0u,&task)<0);
+  original->pid--;
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_pmfe_prepare(original,alert,source,source_n,0u,0u,&task)<0);
+  assert(pmfe_artifact_count(path,"scheduled")==0);
+  assert(edr_local_evidence_cache_pmfe_prepare(original,alert,source,source_n,0u,123u,&task)==0);
+  assert(edr_local_evidence_cache_pmfe_take_task(&task)==1);
+  assert(task.process_start_key==original->process_start_key && task.vad_hint_va==123u);
+  edr_local_evidence_cache_pmfe_note_submit_failure(&task);
+  assert(!edr_local_evidence_cache_pmfe_take_task(&task));
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason))); /* scheduled is not result evidence */
+  result->process_start_key++;
+  assert(!edr_local_evidence_cache_pmfe_result_pending(result));
+  result->process_start_key--;
+  strcpy(result->tenant_id,"foreign-tenant"); assert(!edr_local_evidence_cache_pmfe_result_pending(result));
+  strcpy(result->tenant_id,original->tenant_id);
+  assert(edr_local_evidence_cache_pmfe_result_pending(result));
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_pmfe_bind_result(result,frame,n)<0);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  assert(edr_local_evidence_cache_pmfe_bind_result(result,frame,n)==0);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  EdrEvidenceCacheStatus health; edr_local_evidence_cache_get_status(&health);
+  assert(health.pmfe_active==1u && health.pmfe_result_bound==1u && health.pmfe_running==0u);
+  result->event_time_ns++;
+  size_t changed_n=edr_behavior_record_encode_protobuf(result,changed,EDR_EGRESS_FRAME_MAX); assert(changed_n);
+  assert(!edr_egress_frame_validate(changed,changed_n,reason,sizeof(reason)));
+  assert(edr_local_evidence_cache_pmfe_bind_result(result,changed,changed_n)<0);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason))); /* conflicting duplicate cannot revoke original result */
+  result->event_time_ns--;
+  assert(edr_local_evidence_cache_pmfe_ack_frame(source,source_n)==0); /* original ACK never finishes result */
+  assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)<0); /* local saving is not ACK */
+  edr_local_evidence_cache_close(); assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  uint8_t *replay=NULL; size_t replay_n=0;
+  assert(edr_local_evidence_cache_pmfe_replay_result(&replay,&replay_n)==1 && replay_n==n && !memcmp(replay,frame,n)); free(replay);
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_pmfe_ack_frame(frame,n)<0);
+  assert(pmfe_artifact_count(path,"result_bound")==1);
+  assert(edr_local_evidence_cache_pmfe_ack_frame(frame,n)==1);
+  /* Unit-level receipt transition only. Real HTTP receipt testing owns the
+   * distinct mTLS fixture; no fabricated production receipt occurs here. */
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL+25LL*3600LL*1000000000LL);
+  assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  assert(pmfe_artifact_count(path,"result_acked")==1); /* pinned across ACK/delete crash window */
+  edr_local_evidence_cache_get_status(&health);
+  assert(health.pmfe_active==1u && health.pmfe_result_acked==1u);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  assert(edr_local_evidence_cache_pmfe_ack_frame(frame,n)==1);
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)<0);
+  assert(pmfe_artifact_count(path,"result_acked")==1 && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)==1);
+  assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)==1); /* finalization replay is idempotent */
+  edr_local_evidence_cache_close(); assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  assert(pmfe_artifact_count(path,"completed")==0); /* queue completion restores normal bounded retention */
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+  free(original); free(result); free(source); free(frame); free(changed);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+static void test_pmfe_recovery_retry_capacity_and_inconclusive(void) {
+  char path[512],alert[64],reason[96]; assert(make_test_sqlite_path(path,sizeof(path))==0);
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX); assert(r&&frame);
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+  assert(edr_local_evidence_cache_open(path,32u,24u)==0); EdrPmfeFollowupTask task;
+  for (unsigned i=0;i<64u;++i) {
+    pmfe_fixture_original(r,i); size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX); assert(n);
+    snprintf(alert,sizeof(alert),"sc-local-%u",i);
+    assert(edr_local_evidence_cache_pmfe_prepare(r,alert,frame,n,1u,0u,&task)==0);
+  }
+  pmfe_fixture_original(r,64u); size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX); assert(n);
+  assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-64",frame,n,0u,0u,&task)<0);
+  assert(pmfe_artifact_count(path,"scheduled")==64);
+  EdrEvidenceCacheStatus health; char accounting[2048];
+  edr_local_evidence_cache_get_status(&health);
+  assert(health.pmfe_active==64u && health.pmfe_scheduled==64u && health.pmfe_cause_code==3u && health.pmfe_failures>0u);
+  assert(!edr_local_evidence_cache_accounting_json(&health,accounting,sizeof(accounting)));
+  cJSON *account=cJSON_Parse(accounting); assert(account);
+  cJSON *pmfe=cJSON_GetObjectItemCaseSensitive(account,"pmfe_followup");
+  assert(cJSON_GetObjectItemCaseSensitive(pmfe,"active")->valueint==64);
+  assert(cJSON_GetObjectItemCaseSensitive(pmfe,"cause_code")->valueint==3);
+  assert(!strstr(accounting,"sc-local") && !strstr(accounting,"synthetic-pmfe")); cJSON_Delete(account);
+  /* Failed/unavailable scans close the original task without asserting that
+   * a reused PID was scanned. Typed generation remains the scheduled target. */
+  pmfe_fixture_result(r,0u,"failed","inconclusive"); n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  assert(edr_local_evidence_cache_pmfe_bind_result(r,frame,n)==0);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  for (unsigned attempt=0;attempt<3u;++attempt) {
+    assert(edr_local_evidence_cache_pmfe_take_task(&task)==1);
+    edr_local_evidence_cache_pmfe_note_submit_failure(&task);
+    edr_local_evidence_cache_get_status(&health);
+    assert(health.pmfe_cause_code==7u && health.pmfe_running==1u && health.pmfe_active==64u);
+    /* Restart only reclaims RAM ownership, preserving the bounded attempt
+     * counter. The same oldest outstanding task is selected again. */
+    edr_local_evidence_cache_close(); assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL+3601LL*1000000000LL);
+  assert(!edr_local_evidence_cache_pmfe_take_task(&task));
+  assert(pmfe_artifact_count(path,"expired")==63);
+  edr_local_evidence_cache_get_status(&health);
+  assert(health.pmfe_active==1u && health.pmfe_expired==63u && health.pmfe_cause_code==5u);
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason))); /* bound exact result replay survives scan expiry */
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path); free(r); free(frame);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+static void test_pmfe_scope_restoration_and_corruption(void) {
+  char path[512],reason[96]; assert(make_test_sqlite_path(path,sizeof(path))==0);
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); uint8_t *original=malloc(EDR_EGRESS_FRAME_MAX);
+  uint8_t *result=malloc(EDR_EGRESS_FRAME_MAX); assert(r&&original&&result);
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+  assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  pmfe_fixture_original(r,5u); size_t original_n=edr_behavior_record_encode_protobuf(r,original,EDR_EGRESS_FRAME_MAX);
+  EdrPmfeFollowupTask task; assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-5",original,original_n,0,0,&task)==0);
+  pmfe_fixture_result(r,5u,"failed","inconclusive");
+  snprintf(r->script_snippet,sizeof(r->script_snippet),"pmfe_association_id=%s\n",task.association_id);
+  strcpy(r->endpoint_id,"changed-endpoint"); strcpy(r->tenant_id,"changed-tenant");
+  r->process_start_key++;
+  assert(!edr_local_evidence_cache_pmfe_apply_scope(r));
+  assert(!strcmp(r->tenant_id,"changed-tenant")); /* reused PID or wrong generation never rebinds */
+  r->process_start_key--;
+  assert(edr_local_evidence_cache_pmfe_apply_scope(r)==1);
+  assert(!strcmp(r->tenant_id,task.tenant_id) && !strcmp(r->endpoint_id,task.endpoint_id));
+  size_t result_n=edr_behavior_record_encode_protobuf(r,result,EDR_EGRESS_FRAME_MAX); assert(result_n);
+  assert(!edr_egress_frame_validate(result,result_n,reason,sizeof(reason))); /* lookup hint grants no admission */
+  assert(edr_local_evidence_cache_pmfe_bind_result(r,result,result_n)==0);
+  assert(edr_egress_frame_validate(result,result_n,reason,sizeof(reason)));
+  sqlite3 *db=NULL; assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,"CREATE TEMP TABLE pmfe_saved AS SELECT * FROM artifacts WHERE artifact_type='pmfe_followup_local_v1';");
+  compact_exec(db,"UPDATE artifacts SET sha256='corrupt-original-hash' WHERE artifact_type='pmfe_followup_local_v1';");
+  assert(!edr_egress_frame_validate(result,result_n,reason,sizeof(reason)));
+  pmfe_fixture_original(r,5u);
+  assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-5",original,original_n,0,0,&task)<0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts a JOIN pmfe_saved b ON a.artifact_id=b.artifact_id WHERE a.manifest_json=b.manifest_json AND a.sha256='corrupt-original-hash'")==1);
+  compact_exec(db,"UPDATE artifacts SET sha256=(SELECT sha256 FROM pmfe_saved) WHERE artifact_type='pmfe_followup_local_v1';");
+  assert(edr_egress_frame_validate(result,result_n,reason,sizeof(reason)));
+  /* Hash-valid original plus damaged result bytes cannot authorize or replay.
+   * The fixed cause is observable and the original bytes stay untouched. */
+  compact_exec(db,"UPDATE artifacts SET manifest_json=json_set(manifest_json,'$.result_wire_hex','00') WHERE artifact_type='pmfe_followup_local_v1';");
+  assert(!edr_egress_frame_validate(result,result_n,reason,sizeof(reason)));
+  uint8_t *replay=NULL; size_t replay_n=0;
+  assert(!edr_local_evidence_cache_pmfe_replay_result(&replay,&replay_n) && !replay);
+  EdrEvidenceCacheStatus health; edr_local_evidence_cache_get_status(&health);
+  assert(health.pmfe_cause_code==2u && health.pmfe_failures>0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts a JOIN pmfe_saved b ON a.artifact_id=b.artifact_id WHERE json_extract(a.manifest_json,'$.original_wire_hex')=json_extract(b.manifest_json,'$.original_wire_hex')")==1);
+  assert(sqlite3_close(db)==SQLITE_OK); edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0); free(r); free(original); free(result);
+}
+static void pmfe_crash_child(const char *path,int phase) {
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+  assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX); assert(r&&frame);
+  pmfe_fixture_original(r,8u); size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  EdrPmfeFollowupTask task; assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-8",frame,n,0,0,&task)==0);
+  if (phase>=1) assert(edr_local_evidence_cache_pmfe_take_task(&task)==1);
+  if (phase>=2) {
+    pmfe_fixture_result(r,8u,"failed","inconclusive"); n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+    assert(edr_local_evidence_cache_pmfe_bind_result(r,frame,n)==0);
+    if (phase>=3) assert(edr_local_evidence_cache_pmfe_ack_frame(frame,n)==1);
+  }
+  migration_crash_commit(NULL); /* Abrupt process exit: no close/checkpoint cleanup. */
+}
+static void test_pmfe_abrupt_restart_durable_states(void) {
+  for (int phase=0;phase<=3;++phase) {
+    char path[512]; assert(make_test_sqlite_path(path,sizeof(path))==0);
+    run_cache_crash_child(path,"--crash-cache-pmfe",phase);
+    edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+    assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+    if (phase<2) {
+      EdrPmfeFollowupTask task; assert(edr_local_evidence_cache_pmfe_take_task(&task)==1);
+      assert(!strcmp(task.source_alert_id,"sc-local-8"));
+    } else {
+      uint8_t *wire=NULL; size_t n=0;
+      assert(edr_local_evidence_cache_pmfe_replay_result(&wire,&n)==(phase==3 ? 2 : 1));
+      assert(edr_egress_frame_validate(wire,n,NULL,0)); free(wire);
+    }
+    edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+static void test_pmfe_weak_scan_verdict_requires_durable_original(void) {
+  char path[512]; assert(make_test_sqlite_path(path,sizeof(path))==0);
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX); assert(r&&frame);
+  edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
+  assert(edr_local_evidence_cache_open(path,8u,24u)==0);
+  pmfe_fixture_original(r,9u); size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  EdrPmfeFollowupTask task; assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-9",frame,n,0,0,&task)==0);
+  pmfe_fixture_result(r,9u,"completed_suspicious","suspicious");
+  cJSON *ctx=cJSON_Parse(r->detection_context); assert(ctx);
+  cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  cJSON *signals=cJSON_GetObjectItemCaseSensitive(engine,"signals");
+  assert(cJSON_AddNumberToObject(signals,"mz_hits",1));
+  assert(cJSON_PrintPreallocated(ctx,r->detection_context,sizeof(r->detection_context),0)); cJSON_Delete(ctx);
+  n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX); assert(n);
+  /* The real worker can label signature-only regions suspicious. That label
+   * does not establish a new alert; exact original association establishes
+   * the purpose of this necessary scan context. */
+  assert(!edr_egress_frame_validate(frame,n,NULL,0));
+  assert(edr_local_evidence_cache_pmfe_bind_result(r,frame,n)==0);
+  assert(edr_egress_frame_validate(frame,n,NULL,0));
+  assert(edr_local_evidence_cache_pmfe_ack_frame(frame,n)==1);
+  assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)==1);
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path); free(r); free(frame);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+#endif
+
 int main(int argc, char **argv) {
 #if !defined(_WIN32)
   s_test_executable = argv[0];
@@ -7417,10 +7660,20 @@ int main(int argc, char **argv) {
   if (argc == 4 && strcmp(argv[1], "--crash-cache-slice") == 0) {
     sliced_reclaim_crash_child(argv[2], atoi(argv[3])); return 1;
   }
+  if (argc == 4 && strcmp(argv[1], "--crash-cache-pmfe") == 0) {
+    pmfe_crash_child(argv[2],atoi(argv[3])); return 1;
+  }
 #else
   (void)argc; (void)argv;
 #endif
   test_pmfe_names_and_negative_values_are_not_signals();
+#if defined(EDR_HAVE_SQLITE)
+  test_pmfe_durable_followup_binding_and_receipt_lifecycle();
+  test_pmfe_recovery_retry_capacity_and_inconclusive();
+  test_pmfe_scope_restoration_and_corruption();
+  test_pmfe_abrupt_restart_durable_states();
+  test_pmfe_weak_scan_verdict_requires_durable_original();
+#endif
   test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
   test_metric_dispositions_and_resource_failures();

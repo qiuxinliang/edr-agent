@@ -3,6 +3,7 @@
 #include "edr/time_util.h"
 #include "edr/ingest_http.h"
 #include "edr/egress_request_policy.h"
+#include "edr/egress_batch_policy.h"
 #include "http_budget.h"
 
 #include "edr/command.h"
@@ -3526,7 +3527,8 @@ static int native_post_json(const char *url, const char *body, size_t body_len) 
 static int egress_request_allowed(const char *method, const char *url,
                                    const char *content_type, const void *body, size_t len) {
   char reason[128];
-  int rc = edr_egress_request_validate(method, url, content_type, body, len, reason, sizeof(reason));
+  int rc = edr_egress_request_validate_for_scope(method, url, content_type, body, len,
+                                                  s_tenant, s_endpoint, reason, sizeof(reason));
   if (rc != 0) {
     /* Policy refusal is local. It must not trigger route failover, a circuit
      * penalty, or a receipt. Reasons contain schema codes, never payloads. */
@@ -5517,6 +5519,12 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       payload_len == 0u) {
     return -1;
   }
+  char scope_reason[128];
+  if (!edr_egress_batch_validate_scope(header12, header_len, payload, payload_len,
+                                       s_tenant, s_endpoint, scope_reason, sizeof(scope_reason))) {
+    runtime_failure(scope_reason);
+    return EDR_EGRESS_REQUEST_DENIED;
+  }
   char receipt[8192];
   receipt[0] = '\0';
   if (report_events_v2_should_use()) {
@@ -5537,6 +5545,13 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
         v2rc = -1;
       }
       if (v2rc == 0) {
+        char owner_reason[128];
+        if (edr_egress_batch_note_receipt(header12, header_len, payload, payload_len,
+                                         owner_reason, sizeof(owner_reason)) != 1) {
+          runtime_failure(owner_reason);
+          note_http_request_failure();
+          return -1; /* Keep immutable queue bytes until the cache ACK is durable. */
+        }
         runtime_state_lock();
         s_report_events_v2_ok++;
         s_report_events_post_ok++;
@@ -5604,6 +5619,14 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
                                                header12, header_len, payload, payload_len)) {
     runtime_failure("report-events receipt missing, incomplete or mismatched");
     rc = -1;
+  }
+  if (rc == 0) {
+    char owner_reason[128];
+    if (edr_egress_batch_note_receipt(header12, header_len, payload, payload_len,
+                                     owner_reason, sizeof(owner_reason)) != 1) {
+      runtime_failure(owner_reason);
+      rc = -1;
+    }
   }
   if (rc == 0) note_http_request_success();
   else note_http_request_failure();

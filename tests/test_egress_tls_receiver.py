@@ -19,6 +19,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 
 
 def openssl_certificates(root: Path):
@@ -124,9 +125,105 @@ def is_proven_alert(frame):
             int(basis["timestamp_ns"]) == frame[5][0] == alert[6][0] and \
             basis["event_count"] == 1 and basis["last_event_type"] == 9 and \
             basis["behavior_flags"] == 4294967295 and 0 < threshold <= score <= 1 and \
-            context["engine"] == "ave" and context["rule_id"] == "behavior_anomaly" and \
-            context["process"]["cmdline"] == "synthetic.exe --required-alert-context"
+            context["engine"] == "ave" and context["rule_id"] == "behavior_anomaly"
     except (KeyError, IndexError, ValueError, TypeError, struct.error):
+        return False
+
+
+def is_bound_pmfe(frame, db):
+    """Independent synthetic receiver oracle: durable original ownership must
+    precede a nonpositive follow-up; tags alone cannot establish association."""
+    try:
+        if frame[2][0] != b"synthetic-endpoint" or frame[3][0] != b"synthetic-tenant" or 40 in frame:
+            return False
+        context = json.loads(frame[30][0])
+        engine = context["engine_evidence"]
+        generation = (str(frame[51][0]), str(frame[52][0]))
+        if frame[6][0] != 4242 or generation != (str(0xfedcba9876543210), str(133444000000000000)):
+            return False
+        if frame[4][0] == 63:
+            valid = engine["schema"] == "shellcode_result_v1" and engine["alert_id"] == "sc-local-1" and \
+                engine["owner"]["pid"] == frame[6][0] and engine["detection"]["score"] == 0.9 and \
+                engine["detection"]["rule"] == "synthetic-payload-signature" and \
+                engine["payload"]["sha256"] == "a" * 64
+            if valid:
+                db.execute("INSERT INTO followup_owner VALUES(?,?,?,?,?) ON CONFLICT(alert_id) DO NOTHING",
+                           (engine["alert_id"], frame[6][0], *generation, frame[5][0]))
+            return valid
+        if frame[4][0] != 66 or engine["schema"] != "pmfe_result_v1" or \
+            engine["detector"] != "pmfe" or engine["followup_only"] is not True or \
+            engine["verdict"] != "inconclusive" or engine["status"] != "failed":
+            return False
+        owner = db.execute("SELECT pid,start_key,birth,time_ns FROM followup_owner WHERE alert_id=?",
+                           (engine["source_alert_id"],)).fetchone()
+        return owner is not None and owner[:3] == (frame[6][0], *generation) and \
+            owner[3] <= frame[5][0] <= owner[3] + 3600 * 10**9 and \
+            not frame.get(9) and b"pmfe_association_id=" not in frame[30][0]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def is_paired_p0(frame, db, digest):
+    """Synthetic business consumer: a receipt for combined alone cannot create
+    the action alert. A matching independently received intent is required."""
+    try:
+        context = json.loads(frame[30][0])
+        terminal = context["enforcement_terminal"]
+        process = terminal["process"]
+        tenant, endpoint, event = (frame[tag][0].decode() for tag in (3, 2, 1))
+        pid, start, birth = (frame[tag][0] for tag in (6, 51, 52))
+        path, file_id = process["canonical_image_path"], process["file_identity"]
+        if (tenant, endpoint) != ("synthetic-tenant", "synthetic-endpoint") or \
+            terminal["source_event_key"] != event or terminal["source_event_id"] != event or \
+            terminal["process_pid"] != pid or process["generation_key"] != f"startkey-{start:016x}" or \
+            process["creation_filetime_100ns"] != birth or process["file_identity_available"] is not True or \
+            terminal["planned_action"] != "terminate_process" or \
+            context["evidence"]["file_identity"] != file_id or \
+            context["evidence"]["artifact"]["source"] != "process_image_section" or \
+            context["evidence"]["artifact"]["quality"] != "action_authoritative":
+            return False
+        commitment = hashlib.sha256()
+        for value in ("edr-p0-enforcement-terminal-v1", tenant, endpoint, terminal["rule_id"],
+                      event, str(pid), f"{start:016x}", f"{birth:016x}", path, file_id):
+            encoded = value.encode()
+            commitment.update(struct.pack("<I", len(encoded)) + encoded + b"\0")
+        key = "p0-enforcement-" + commitment.hexdigest()
+        if terminal["terminal_key"] != key:
+            return False
+        phase = terminal["phase"]
+        if phase == "intent":
+            if 40 in frame or terminal["requested"] is not True or any(name in terminal for name in ("attempted", "succeeded", "action", "error_code")):
+                return False
+        elif phase == "result" and 40 in frame:
+            alert = protobuf(frame[40][0])
+            subject = json.loads(alert[11][0])
+            source = subject["context"]
+            if subject["subject_type"] != "edr_dynamic_rule" or alert[7][0] != pid or \
+                alert[9][0].decode() != path or source["process_path"] != path or \
+                source["canonical_image_path"] != path or source["file_identity"] != file_id or \
+                source["source_event_id"] != event or source["pid"] != pid or \
+                source["process_start_key"] != str(start) or \
+                source["process_creation_filetime_100ns"] != str(birth) or \
+                subject["enforcement"]["requested"] is not True or \
+                any(subject[name] != terminal[name] for name in ("rule_id", "rules_bundle_version", "rules_bundle_sha256")) or \
+                any(subject["enforcement"][name] != terminal[name]
+                    for name in ("attempted", "succeeded", "action", "error_code")):
+                return False
+            phase = "combined"
+        else:
+            return False  # A source-only result is not another alert receipt.
+        lineage = json.dumps({name: terminal[name] for name in
+                              ("rule_id", "rules_bundle_version", "rules_bundle_sha256")}, sort_keys=True)
+        previous = db.execute("SELECT lineage,intent_sha,combined_sha FROM p0_association WHERE terminal_key=?", (key,)).fetchone()
+        slot = 1 if phase == "intent" else 2
+        if previous and (previous[0] != lineage or (previous[slot] and previous[slot] != digest)):
+            return False
+        db.execute("INSERT INTO p0_association(terminal_key,lineage) VALUES(?,?) ON CONFLICT(terminal_key) DO NOTHING", (key, lineage))
+        column = "intent_sha" if phase == "intent" else "combined_sha"
+        db.execute(f"UPDATE p0_association SET {column}=? WHERE terminal_key=?", (digest, key))
+        db.execute("UPDATE p0_association SET alert_created=1 WHERE terminal_key=? AND intent_sha IS NOT NULL AND combined_sha IS NOT NULL", (key,))
+        return True
+    except (KeyError, IndexError, TypeError, ValueError, struct.error):
         return False
 
 
@@ -144,6 +241,8 @@ class Receiver(http.server.ThreadingHTTPServer):
             db.execute("PRAGMA synchronous=FULL")
             db.execute("CREATE TABLE receipt(batch_id TEXT PRIMARY KEY,sha TEXT NOT NULL,observations INTEGER NOT NULL)")
             db.execute("CREATE TABLE health(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL,payload TEXT NOT NULL)")
+            db.execute("CREATE TABLE followup_owner(alert_id TEXT PRIMARY KEY,pid INTEGER,start_key TEXT,birth TEXT,time_ns INTEGER)")
+            db.execute("CREATE TABLE p0_association(terminal_key TEXT PRIMARY KEY,lineage TEXT NOT NULL,intent_sha TEXT,combined_sha TEXT,alert_created INTEGER NOT NULL DEFAULT 0)")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certificate_root / f"{certificate}.pem", certificate_root / f"{certificate}.key")
         context.load_verify_locations(certificate_root / "ca.pem")
@@ -197,12 +296,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/v1/ingest/report-events":
                 raw = envelope_raw if envelope_raw is not None else base64.b64decode(body["payload"], validate=True)
                 frames = decode_frames(raw)
-                if not frames or not all(is_proven_alert(frame) for frame in frames):
-                    raise ValueError("non-alert raw event reached synthetic receiver")
+                if not frames:
+                    raise ValueError("empty raw event batch reached synthetic receiver")
                 digest = hashlib.sha256(raw).hexdigest()
                 batch = body["batch_id"]
                 with sqlite3.connect(self.server.database) as db:
                     db.execute("PRAGMA synchronous=FULL")
+                    if not all(is_proven_alert(frame) or is_bound_pmfe(frame, db) or is_paired_p0(frame, db, digest) for frame in frames):
+                        raise ValueError("unproven alert or follow-up reached synthetic receiver")
                     previous = db.execute("SELECT sha,observations FROM receipt WHERE batch_id=?", (batch,)).fetchone()
                     if previous and previous[0] != digest:
                         raise ValueError("batch ID reused with changed payload")
@@ -210,7 +311,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     db.execute("INSERT INTO receipt VALUES(?,?,?) ON CONFLICT(batch_id) DO UPDATE SET observations=excluded.observations",
                                (batch, digest, count))
                     db.commit()
-                if batch == "tls-ack-lost" and count == 1:
+                if (batch in ("tls-ack-lost", "tls-p0-intent") or frames[0][4][0] == 66) and count == 1:
                     self.reply({"code": "OK", "data": {"accepted": True}})
                     return
                 ack = {"version": 1, "state": "durable", "endpoint_id": body["endpoint_id"],
@@ -252,6 +353,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply({"code": "SYNTHETIC_BUSINESS_REJECTED"}, 400)
 
 
+def crash_restart_scenario(client, root):
+    """Kill only the child created here, after an independently durable receipt
+    whose ACK is missing. Verify the pending original bytes before reopening."""
+    server = Receiver(root, "server", root / "receiver-crash.db")
+    database = root / "agent-crash.db"
+    environment = os.environ.copy()
+    for name in ("EDR_ZSTD_DICT_PATH", "EDR_CONTROL_DICT_PATH"):
+        environment.pop(name, None)
+    environment["EDR_TEST_CRASH_AFTER_LOST_ACK"] = "1"
+    arguments = [client, f"https://localhost:{server.server_port}/api/v1", str(root / "ca.pem"),
+                 str(root / "client.pem"), str(root / "client.key"), str(database)]
+    checkpoint = root / "crash-checkpoint.json"
+    child = None
+    try:
+        with checkpoint.open("w", encoding="utf-8") as output:
+            child = subprocess.Popen(arguments + ["positive"], stdout=output,
+                                     stderr=subprocess.DEVNULL, env=environment, cwd=root)
+            deadline = time.monotonic() + 10
+            metrics = None
+            while time.monotonic() < deadline and child.poll() is None:
+                for line in checkpoint.read_text(encoding="utf-8").splitlines():
+                    if line.startswith('{"crash_checkpoint"'):
+                        metrics = json.loads(line)
+                if metrics:
+                    break
+                time.sleep(0.05)
+            if not metrics:
+                raise RuntimeError("synthetic crash checkpoint not established")
+            assert metrics["detector_inputs"] == metrics["detected"] == 1 and metrics["enqueued"] == 3
+            with sqlite3.connect(database) as db:
+                before = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
+                assert before and before[1] == "pending"
+                original_hash = hashlib.sha256(before[0]).hexdigest()
+            child.kill()
+            killed = child.wait(timeout=5)
+        with sqlite3.connect(database) as db:
+            after = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
+            assert after == before
+        environment.pop("EDR_TEST_CRASH_AFTER_LOST_ACK", None)
+        result = subprocess.run(arguments + ["resume-after-crash"], capture_output=True,
+                                text=True, timeout=15, env=environment, cwd=root)
+        assert result.returncode == 0, "crashed owner did not recover its genuine receipt"
+        with sqlite3.connect(server.database) as db:
+            receipt = db.execute("SELECT sha,observations FROM receipt WHERE batch_id='tls-ack-lost'").fetchone()
+            assert receipt == (original_hash, 2)
+            durable = db.execute("SELECT COUNT(*) FROM receipt").fetchone()[0]
+        return {"mode": "positive-crash-restart", "client_exit": result.returncode,
+                "client_metrics": [metrics] + [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")],
+                "killed_child_exit": killed, "original_pending_hash_preserved": True,
+                "received_requests": len(server.observations),
+                "received_body_bytes": sum(item["bytes"] for item in server.observations),
+                "receiver_business_failures": len(server.errors), "durable_batches": durable,
+                "duplicate_observations": 1, "distinct_queue_acks": 2}
+    finally:
+        if child and child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        server.finish()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True)
@@ -264,7 +425,10 @@ def main():
         # policy must preserve alert delivery using the existing identity codec.
         (root / "synthetic.dict").write_bytes(b"synthetic-dictionary-content-" * 40)
         reports = []
-        for mode in ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host"):
+        modes = ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host")
+        if not args.baseline:
+            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal")
+        for mode in modes:
             server = Receiver(root, "wrong-host" if mode == "wrong-host" else "server", root / f"receiver-{mode}.db")
             try:
                 environment = os.environ.copy()
@@ -291,9 +455,15 @@ def main():
                 with sqlite3.connect(server.database) as db:
                     reports[-1]["durable_batches"] = db.execute("SELECT COUNT(*) FROM receipt").fetchone()[0]
                     reports[-1]["duplicate_observations"] = db.execute("SELECT COALESCE(SUM(observations-1),0) FROM receipt").fetchone()[0]
+                    if mode == "positive-p0-journal":
+                        reports[-1]["business_alerts"] = db.execute("SELECT COALESCE(SUM(alert_created),0) FROM p0_association").fetchone()[0]
+                        if reports[-1]["business_alerts"] != 1:
+                            reports[-1]["receiver_business_failures"] += 1
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
+        if not args.baseline:
+            reports.append(crash_restart_scenario(args.client, root))
         failed = any(report["client_exit"] or report["receiver_business_failures"] for report in reports)
         failed |= any(report["received_requests"] for report in reports if not report["mode"].startswith("positive"))
         print(json.dumps({"synthetic_only": True, "production_connections": 0,

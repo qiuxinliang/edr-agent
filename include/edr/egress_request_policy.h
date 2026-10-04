@@ -11,6 +11,11 @@
 int edr_egress_request_validate(const char *method, const char *suffix_or_url,
                                 const char *content_type, const void *body,
                                 size_t body_len, char *reason, size_t reason_cap);
+/* Real transports use configured authority in addition to the purpose mask.
+ * Report envelopes and every decoded frame must match both identities. */
+int edr_egress_request_validate_for_scope(const char *method, const char *suffix_or_url,
+    const char *content_type, const void *body, size_t body_len,
+    const char *tenant_id, const char *endpoint_id, char *reason, size_t reason_cap);
 
 /* Projects existing health state only; raw events are never health inputs.
  * Caller releases the returned JSON with free(). Existing health revision/ACK

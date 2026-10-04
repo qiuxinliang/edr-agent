@@ -21,6 +21,7 @@
 #include "edr/self_protect.h"
 #include "edr/watchdog.h"
 #include "edr/storage_queue.h"
+#include "edr/queue_maintenance.h"
 #include "edr/transport_sink.h"
 #include "edr/pmfe.h"
 #include "edr/net_fanout_detector.h"
@@ -742,6 +743,8 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 #endif
 
 int main(int argc, char **argv) {
+  if (argc>=2 && !strcmp(argv[1],"--queue-recover-v1"))
+    return edr_storage_queue_maintenance_main(argc,argv);
   if (argc == 2 && !strcmp(argv[1], "--evidence-cache-format-capabilities")) {
 #if defined(EDR_HAVE_SQLITE)
     puts("{\"protocol\":1,\"read_min\":0,\"read_max\":2,\"write_min\":0,\"write_max\":2}");

@@ -70,8 +70,15 @@ static void AVE_CALL on_behavior(const AVEBehaviorAlert *alert, void *user_data)
   snprintf(record->endpoint_id, sizeof(record->endpoint_id), "synthetic-ave-endpoint");
   snprintf(record->tenant_id, sizeof(record->tenant_id), "synthetic-ave-tenant");
   size_t n = edr_behavior_record_alert_encode_protobuf(record, alert, frame, EDR_EGRESS_FRAME_MAX);
-  char reason[96];
-  assert(n && edr_egress_frame_validate(frame, n, reason, sizeof(reason)));
+  char reason[96] = "producer_projection_failed";
+  int admitted=n && edr_egress_frame_validate(frame,n,reason,sizeof(reason));
+  if (!admitted) {
+    const cJSON *ctx=cJSON_GetObjectItemCaseSensitive(subject,"detection_context");
+    const cJSON *rule=cJSON_GetObjectItemCaseSensitive(ctx,"rule_id");
+    fprintf(stderr,"synthetic AVE admission failed pid=%u bytes=%zu rule=%s reason=%s\n",
+      alert->pid,n,cJSON_IsString(rule)?rule->valuestring:"unavailable",reason);
+  }
+  assert(admitted);
   free(frame);
   free(record);
   cJSON_Delete(subject);

@@ -8,6 +8,7 @@
 #define EDR_LOCAL_EVIDENCE_CACHE_H
 
 #include "edr/behavior_record.h"
+#include "edr/pmfe.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -49,6 +50,18 @@ typedef struct {
    * does not change admission, retention, or upload behavior. */
   uint64_t context_ref_writes_by_event_type[EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS];
   uint64_t command_results_written;
+  /* Durable PMFE ownership counts contain no event identifiers or evidence.
+   * The ACK count remains active until its original queue row is removed. */
+  uint32_t pmfe_scheduled;
+  uint32_t pmfe_running;
+  uint32_t pmfe_result_bound;
+  uint32_t pmfe_result_acked;
+  uint32_t pmfe_active;
+  uint32_t pmfe_expired;
+  uint64_t pmfe_failures; /* Current-process operation failures. */
+  uint32_t pmfe_cause_code; /* 0 none, 1 storage, 2 integrity, 3 capacity,
+                            * 4 binding mismatch, 5 retry/expiry, 6 conflict,
+                            * 7 worker admission unavailable. */
   /* Candidate operations: requests = records_written + candidate_rejected.
    * records_written counts successful insert/update transactions, not unique
    * evidence. Reuse and first-admission counters overlap failure outcomes;
@@ -228,6 +241,31 @@ int edr_local_evidence_cache_maintenance_main(int argc, char **argv);
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours);
 void edr_local_evidence_cache_close(void);
+
+/* Existing bounded artifacts partition owns immutable original/result wire,
+ * exact endpoint/tenant/process-generation and the scan lifecycle. All saves
+ * commit FULL before granting authority; no operation implies server ACK. */
+int edr_local_evidence_cache_pmfe_prepare(const EdrBehaviorRecord *original,
+    const char *source_alert_id, const uint8_t *original_frame, size_t frame_len,
+    uint32_t band, uint64_t vad_hint_va, EdrPmfeFollowupTask *out);
+int edr_local_evidence_cache_pmfe_result_pending(const EdrBehaviorRecord *result);
+/* Restore only the original durable job scope after applying current agent
+ * IDs; policy/tenant changes cannot rename an in-flight scan result. */
+int edr_local_evidence_cache_pmfe_apply_scope(EdrBehaviorRecord *result);
+int edr_local_evidence_cache_pmfe_bind_result(const EdrBehaviorRecord *result,
+    const uint8_t *frame, size_t frame_len);
+/* One lease/retry per invocation; at most three attempts and one hour from
+ * original scheduling. Restart resets RAM ownership, never durable identity. */
+int edr_local_evidence_cache_pmfe_take_task(EdrPmfeFollowupTask *out);
+/* Record an actual worker admission failure for a currently leased job. Its
+ * existing lease/backoff/attempt cap remains authoritative. */
+void edr_local_evidence_cache_pmfe_note_submit_failure(const EdrPmfeFollowupTask *task);
+/* 1=result needs queue handoff; 2=ACKed tombstone needs queue-absence check. */
+int edr_local_evidence_cache_pmfe_replay_result(uint8_t **frame, size_t *length);
+int edr_local_evidence_cache_pmfe_ack_frame(const uint8_t *frame, size_t length);
+/* Only after the queue's own FULL removal commit; ACK tombstones stay pinned
+ * across the two-database crash window until this transition succeeds. */
+int edr_local_evidence_cache_pmfe_queue_removed(const uint8_t *frame,size_t length);
 
 /* Long commands live once in the existing bounded artifacts store, keyed by
  * tenant/endpoint/PID/StartKey/birth. Never infer ownership from PID alone.

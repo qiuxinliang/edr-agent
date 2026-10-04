@@ -4,12 +4,28 @@
 #include "edr/ave_sdk.h"
 #include "edr/types.h"
 #include "edr/transport_sink.h"
+#include "edr/v1/event.pb.h"
 #include "cJSON.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "lz4.h"
+#include <pb_decode.h>
+#include <pb_encode.h>
+
+static edr_v1_BehaviorEvent *decode_frame(const uint8_t *frame,size_t len) {
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); assert(event);
+  pb_istream_t stream=pb_istream_from_buffer(frame,len);
+  assert(pb_decode(&stream,edr_v1_BehaviorEvent_fields,event)); return event;
+}
+/* Immutable historical wire tests deliberately bypass the new producer
+ * projector. Otherwise removing an injected extra before serialization would
+ * not exercise the final send-time whitelist. */
+static size_t immutable_encode(edr_v1_BehaviorEvent *event,uint8_t *frame) {
+  pb_ostream_t stream=pb_ostream_from_buffer(frame,EDR_EGRESS_FRAME_MAX);
+  assert(pb_encode(&stream,edr_v1_BehaviorEvent_fields,event)); return stream.bytes_written;
+}
 
 static void wr(uint8_t *p, uint32_t n) {
   for (unsigned i=0; i<4; i++) p[i]=(uint8_t)(n>>(8*i));
@@ -78,6 +94,12 @@ static void matrix(void) {
   snprintf(a.user_subject_json,sizeof(a.user_subject_json),"%s",extra_text);
   free(extra_text); cJSON_Delete(extra);
   invalid=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  assert(invalid && edr_egress_frame_validate(frame,invalid,reason,sizeof(reason)));
+  edr_v1_BehaviorEvent *decoded=decode_frame(frame,invalid);
+  assert(!strstr(decoded->behavior_alert.user_subject_json,"arbitrary_raw_event"));
+  /* Sending the old opaque bytes is still forbidden. */
+  strcpy(decoded->behavior_alert.user_subject_json,a.user_subject_json);
+  invalid=immutable_encode(decoded,frame); free(decoded);
   assert(!edr_egress_frame_validate(frame,invalid,reason,sizeof(reason)));
   make_alert(&a,r);
   strcpy(a.related_iocs_json,"{\"raw_event\":\"synthetic-unrelated-context\"}");
@@ -191,4 +213,327 @@ static void matrix(void) {
   assert(n && !edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
   free(r); free(frame); free(body); free(saved); free(compressed);
 }
-int main(void) { matrix(); puts("egress batch policy: synthetic matrix passed"); return 0; }
+static void overwrite_json(char *dest,size_t cap,cJSON *root) {
+  char *text=cJSON_PrintUnformatted(root); assert(text && strlen(text)<cap);
+  strcpy(dest,text); free(text);
+}
+static void purpose_masks(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); AVEBehaviorAlert a;
+  uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX); char reason[128]; assert(r && frame);
+  make_record(r); make_alert(&a,r);
+  strcpy(r->detection_context,"{\"engine\":\"agent\",\"reason\":\"synthetic-local-only-diagnostic\"}");
+  cJSON *subject=cJSON_Parse(a.user_subject_json); assert(subject);
+  cJSON *ctx=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  cJSON_AddStringToObject(ctx,"cmdline","synthetic-duplicate-command");
+  cJSON_AddStringToObject(ctx,"hostname","synthetic-unnecessary-host");
+  cJSON_AddStringToObject(ctx,"file_identity","synthetic-volume:file");
+  cJSON_AddStringToObject(ctx,"process_start_key","18446744073709551615");
+  r->process_start_key=UINT64_MAX;
+  cJSON_AddStringToObject(ctx,"powershell_script_block","synthetic-rule-trigger");
+  cJSON *enforcement=cJSON_AddObjectToObject(subject,"enforcement");
+  cJSON_AddTrueToObject(enforcement,"requested"); cJSON_AddFalseToObject(enforcement,"succeeded");
+  cJSON_AddStringToObject(enforcement,"action","terminate_process");
+  cJSON_AddNumberToObject(enforcement,"error_code",5);
+  cJSON_AddStringToObject(enforcement,"message","synthetic-local-only-error-detail");
+  overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject); cJSON_Delete(subject);
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  edr_v1_BehaviorEvent *ev=decode_frame(frame,n);
+  assert(!ev->ave_result_json[0] && !ev->has_ave_behavior_feed);
+  assert(!strcmp(ev->cmdline,r->cmdline));
+  assert(ev->has_process_context && !strcmp(ev->process_context.parent_cmdline,r->parent_cmdline));
+  assert(ev->process_start_key==UINT64_MAX);
+  assert(strstr(ev->behavior_alert.user_subject_json,"synthetic-volume:file"));
+  assert(strstr(ev->behavior_alert.user_subject_json,"synthetic-rule-trigger"));
+  assert(strstr(ev->behavior_alert.user_subject_json,"18446744073709551615"));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-duplicate-command"));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-unnecessary-host"));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-local-only-error-detail"));
+  assert(strstr(r->detection_context,"synthetic-local-only-diagnostic"));
+  subject=cJSON_Parse(ev->behavior_alert.user_subject_json); assert(subject);
+  ctx=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  cJSON_ReplaceItemInObjectCaseSensitive(ctx,"file_identity",cJSON_CreateObject());
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  assert(!strcmp(reason,"alert_field_purpose_invalid")); free(ev);
+
+  make_record(r); make_alert(&a,r);
+  strcpy(r->domain,"synthetic-extra-logon-domain"); strcpy(r->creator_username,"synthetic-extra-creator");
+  strcpy(a.user_subject_json,
+    "{\"subject_type\":\"detection_context\",\"evaluation_basis\":{"
+    "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\","
+    "\"predicate_matched\":true,\"threshold_met\":true,\"pid\":42,"
+    "\"timestamp_ns\":\"1700000000000000000\",\"threshold\":0.65,\"event_count\":1,"
+    "\"behavior_flags\":1,\"last_event_type\":9},\"detection_context\":{"
+    "\"engine\":\"ave\",\"rule_id\":\"behavior_anomaly\",\"confidence\":0.7,"
+    "\"process\":{\"pid\":42,\"parent_pid\":21,\"cmdline\":\"synthetic-duplicate-command\"},"
+    "\"engine_signals\":{\"script_content_score\":0.7,\"raw_event\":{\"secret\":\"synthetic-local-only\"}},"
+    "\"network\":{\"remote_ip\":\"127.0.0.1\",\"dst_port\":443},"
+    "\"recommended_forensics\":[\"process_tree\",\"pmfe_scan\"]}}" );
+  n=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  ev=decode_frame(frame,n); assert(!ev->domain[0] && !ev->creator_username[0]);
+  assert(!strcmp(ev->cmdline,r->cmdline));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"raw_event"));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-duplicate-command"));
+  assert(strstr(ev->behavior_alert.user_subject_json,"script_content_score"));
+  subject=cJSON_Parse(ev->behavior_alert.user_subject_json); assert(subject);
+  ctx=cJSON_GetObjectItemCaseSensitive(subject,"detection_context");
+  cJSON *signals=cJSON_GetObjectItemCaseSensitive(ctx,"engine_signals");
+  cJSON_AddStringToObject(signals,"raw_event","synthetic-local-only");
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  /* A known leaf also cannot carry an arbitrary object or array. */
+  subject=cJSON_Parse(ev->behavior_alert.user_subject_json); assert(subject);
+  ctx=cJSON_GetObjectItemCaseSensitive(subject,"detection_context");
+  signals=cJSON_GetObjectItemCaseSensitive(ctx,"engine_signals");
+  cJSON_DeleteItemFromObjectCaseSensitive(signals,"raw_event");
+  cJSON_ReplaceItemInObjectCaseSensitive(signals,"script_content_score",cJSON_CreateObject());
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason))); free(ev);
+
+  make_record(r); make_alert(&a,r);
+  strcpy(a.user_subject_json,"{\"subject_type\":\"edr_correlation\",\"rule_id\":\"synthetic-correlation\","
+    "\"rules_bundle_version\":\"synthetic-v1\",\"evaluation_basis\":{\"schema\":\"agent_detection_basis_v1\","
+    "\"owner\":\"correlation_engine\",\"predicate_matched\":true,\"pid\":42,"
+    "\"timestamp_ns\":\"1700000000000000000\",\"kind\":\"threshold\",\"threshold\":2,"
+    "\"matched_count\":3,\"window_ms\":1000,\"ordered\":false},\"window_ms\":1000,"
+    "\"count\":3,\"distinct\":0,\"evidence_chain\":[{\"type\":21,\"pid\":42,"
+    "\"event_time_ns\":\"1700000000000000000\",\"detail\":\"synthetic-matched-key\"}]}" );
+  n=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  ev=decode_frame(frame,n); assert(strstr(ev->behavior_alert.user_subject_json,"synthetic-matched-key"));
+  subject=cJSON_Parse(ev->behavior_alert.user_subject_json); assert(subject);
+  ctx=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(subject,"evidence_chain"),0);
+  cJSON_ReplaceItemInObjectCaseSensitive(ctx,"detail",cJSON_CreateObject());
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason))); free(ev);
+
+  make_record(r); make_alert(&a,r);
+  strcpy(a.user_subject_json,"{\"subject_type\":\"net_fanout\",\"evaluation_basis\":{"
+    "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"net_fanout_detector\","
+    "\"predicate_matched\":true,\"pid\":42,\"timestamp_ns\":\"1700000000000000000\","
+    "\"threshold\":2,\"distinct_ips\":3,\"window_s\":60,\"dport\":443,"
+    "\"source_event_id\":\"synthetic-source\"}}" );
+  strcpy(a.related_iocs_json,"{\"detector\":\"net_fanout\",\"dport\":443,\"distinct_ips\":3,\"window_s\":60}");
+  n=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  ev=decode_frame(frame,n); subject=cJSON_Parse(ev->behavior_alert.related_iocs_json); assert(subject);
+  cJSON_AddObjectToObject(subject,"raw_connections");
+  overwrite_json(ev->behavior_alert.related_iocs_json,sizeof(ev->behavior_alert.related_iocs_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason))); free(ev);
+
+  make_record(r); r->type=EDR_EVENT_PROTOCOL_SHELLCODE;
+  strcpy(r->detection_context,"{\"rule_id\":\"agent_decision_v1\",\"process\":{\"pid\":42},"
+    "\"engine_evidence\":{\"schema\":\"shellcode_result_v1\",\"alert_id\":\"synthetic-shellcode\","
+    "\"owner\":{\"pid\":42},\"detection\":{\"detector\":\"shellcode\",\"rule\":\"synthetic-rule\",\"score\":0.9},"
+    "\"payload\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+    "\"preview_hex\":\"synthetic-local-only-payload\"},\"pcap\":{\"stem\":\"synthetic-local-only-pcap\"},"
+    "\"detail\":\"synthetic-local-only-raw-event\"}}" );
+  n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  ev=decode_frame(frame,n); assert(strstr(ev->ave_result_json,"synthetic-shellcode"));
+  assert(!strstr(ev->ave_result_json,"synthetic-local-only"));
+  subject=cJSON_Parse(ev->ave_result_json); assert(subject);
+  ctx=cJSON_GetObjectItemCaseSensitive(subject,"engine_evidence");
+  cJSON_AddObjectToObject(ctx,"pcap"); overwrite_json(ev->ave_result_json,sizeof(ev->ave_result_json),subject);
+  cJSON_Delete(subject); n=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason))); free(ev);
+
+  make_record(r); r->type=EDR_EVENT_WEBSHELL_DETECTED;
+  strcpy(r->detection_context,"{\"rule_id\":\"agent_decision_v1\",\"process\":{\"pid\":42},"
+    "\"engine_evidence\":{\"schema\":\"webshell_result_v1\","
+    "\"file\":{\"path\":\"synthetic-webshell.php\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},"
+    "\"detection\":{\"detector\":\"webshell\",\"rule\":\"synthetic-rule\",\"score\":0.9,\"ast_score\":0.8,\"token_score\":0.7},"
+    "\"sample\":{\"local_path\":\"synthetic-local-only-sample\"}}}" );
+  n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  ev=decode_frame(frame,n); assert(strstr(ev->ave_result_json,"synthetic-webshell.php"));
+  assert(!strstr(ev->ave_result_json,"synthetic-local-only-sample")); free(ev);
+  free(r); free(frame);
+}
+
+static void historical_projection(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); AVEBehaviorAlert a;
+  uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX),*body=malloc(EDR_EGRESS_BATCH_MAX),*selected=NULL;
+  char reason[128]; uint8_t header[12]; uint32_t count=0; size_t selected_len=0; assert(r && frame && body);
+  make_record(r); make_alert(&a,r);
+  size_t ordinary=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  wr(body,(uint32_t)ordinary); memcpy(body+4,frame,ordinary);
+  size_t alert=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  wr(body+ordinary+4,(uint32_t)alert); memcpy(body+ordinary+8,frame,alert);
+  size_t n=ordinary+alert+8; uint8_t *saved=malloc(n); assert(saved); memcpy(saved,body,n);
+  wr(header,EDR_TRANSPORT_BATCH_MAGIC_RAW); wr(header+4,2); wr(header+8,(uint32_t)n);
+  assert(edr_egress_batch_project_alerts(header,12,body,n,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)));
+  assert(count==1 && selected_len==alert+16 && !memcmp(selected+16,frame,alert));
+  assert(!memcmp(body,saved,n));
+  assert(edr_egress_batch_validate(selected,12,selected+12,selected_len-12,reason,sizeof(reason)));
+  assert(edr_egress_batch_validate_scope(selected,12,selected+12,selected_len-12,
+    r->tenant_id,r->endpoint_id,reason,sizeof(reason)));
+  assert(!edr_egress_batch_validate_scope(selected,12,selected+12,selected_len-12,
+    "foreign-tenant",r->endpoint_id,reason,sizeof(reason)));
+  assert(!edr_egress_batch_validate_scope(selected,12,selected+12,selected_len-12,
+    r->tenant_id,"foreign-endpoint",reason,sizeof(reason)));
+  free(selected); selected=NULL;
+  uint8_t *compressed=malloc(LZ4_compressBound((int)n)); assert(compressed);
+  int c=LZ4_compress_default((const char*)body,(char*)compressed,(int)n,LZ4_compressBound((int)n)); assert(c>0);
+  wr(header,EDR_TRANSPORT_BATCH_MAGIC_LZ4);
+  assert(edr_egress_batch_project_alerts(header,12,compressed,(size_t)c,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)));
+  assert(count==1 && !memcmp(selected+16,frame,alert)); free(selected); selected=NULL;
+  assert(!edr_egress_batch_project_alerts(header,12,compressed,(size_t)c,"foreign-tenant",r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)) && !selected && !selected_len && !count);
+  assert(!strcmp(reason,"historical_scope_mismatch"));
+  wr(header,0xdeadbeef);
+  assert(!edr_egress_batch_project_alerts(header,12,body,n,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)) && !selected);
+  wr(header,EDR_TRANSPORT_BATCH_MAGIC_RAW); wr(header+4,1); wr(header+8,(uint32_t)ordinary+4);
+  assert(edr_egress_batch_project_alerts(header,12,body,ordinary+4,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)));
+  assert(count==0 && selected_len==12); free(selected); selected=NULL;
+  edr_v1_BehaviorEvent *ev=decode_frame(body+4,ordinary);
+  strcpy(ev->ave_result_json,"{\"schema\":\"unknown-future-v99\"}");
+  ordinary=immutable_encode(ev,frame); free(ev); wr(body,(uint32_t)ordinary); memcpy(body+4,frame,ordinary);
+  wr(header+8,(uint32_t)ordinary+4);
+  assert(!edr_egress_batch_project_alerts(header,12,body,ordinary+4,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)) && !selected);
+  /* Compatibility is explicit and creates NEW bytes/identity. Keep the old
+   * full payload unchanged while projecting a proven old detector context. */
+  make_record(r); make_alert(&a,r); r->process_start_key=123;
+  alert=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  ev=decode_frame(frame,alert);
+  ev->has_ave_behavior_feed=true;
+  strcpy(ev->ave_behavior_feed.target_domain,"synthetic-local-only-redundant-feed");
+  strcpy(ev->ave_result_json,"{\"schema\":\"agent_decision_v1\",\"reason\":\"synthetic-local-only-generic-score\"}");
+  cJSON *subject=cJSON_Parse(ev->behavior_alert.user_subject_json); assert(subject);
+  cJSON *ctx=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  cJSON_AddStringToObject(ctx,"cmdline","synthetic-local-only-duplicate-command");
+  cJSON *raw=cJSON_AddObjectToObject(ctx,"unknown_environment");
+  cJSON_AddStringToObject(raw,"secret","synthetic-local-only-environment");
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),subject);
+  cJSON_Delete(subject); alert=immutable_encode(ev,frame); free(ev);
+  assert(!edr_egress_frame_validate(frame,alert,reason,sizeof(reason)));
+  wr(body,(uint32_t)alert); memcpy(body+4,frame,alert); wr(header+4,1); wr(header+8,(uint32_t)alert+4);
+  uint8_t *original=malloc(alert+4); assert(original); memcpy(original,body,alert+4);
+  assert(edr_egress_batch_project_alerts(header,12,body,alert+4,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)));
+  assert(count==1 && selected_len<alert+16 && !memcmp(original,body,alert+4));
+  assert(edr_egress_batch_validate(selected,12,selected+12,selected_len-12,reason,sizeof(reason)));
+  ev=decode_frame(selected+16,selected_len-16);
+  assert(ev->process_start_key==123 && !strcmp(ev->cmdline,r->cmdline));
+  assert(ev->has_process_context && !strcmp(ev->process_context.parent_cmdline,r->parent_cmdline));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-local-only"));
+  assert(!ev->ave_result_json[0] && !ev->has_ave_behavior_feed);
+  free(ev); free(selected); selected=NULL; free(original);
+  /* A display label/score never gets upgraded to a proven historical alert. */
+  make_alert(&a,r); strcpy(a.user_subject_json,"{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"label-only\"}");
+  alert=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
+  wr(body,(uint32_t)alert); memcpy(body+4,frame,alert); wr(header+8,(uint32_t)alert+4);
+  assert(!edr_egress_batch_project_alerts(header,12,body,alert+4,r->tenant_id,r->endpoint_id,
+    &selected,&selected_len,&count,reason,sizeof(reason)) && !selected);
+  free(compressed); free(saved); free(body); free(frame); free(r);
+}
+typedef struct {
+  uint8_t *frame; size_t len; unsigned validations,receipts,removals;
+  int state,fail_receipt;
+} TestAssociationOwner;
+static int tuple_matches(const char *source,const char *endpoint,const char *tenant,
+    const char *event,uint32_t pid,uint64_t start,uint64_t birth,int64_t time,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  TestAssociationOwner *owner=user;
+  return !strcmp(source,"synthetic-original-alert") && !strcmp(endpoint,"synthetic-endpoint") &&
+    !strcmp(tenant,"synthetic-tenant") && !strcmp(event,"synthetic-source") && pid==42 && start==123 &&
+    birth==456 && time==1700000000000000000LL && !strcmp(status,"completed_clean") &&
+    !strcmp(verdict,"clean") && owner->frame && len==owner->len && !memcmp(frame,owner->frame,len);
+}
+static int association_validate(const char *source,const char *endpoint,const char *tenant,
+    const char *event,uint32_t pid,uint64_t start,uint64_t birth,int64_t time,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  TestAssociationOwner *owner=user; owner->validations++;
+  return owner->state<2 && tuple_matches(source,endpoint,tenant,event,pid,start,birth,time,status,verdict,frame,len,user);
+}
+static int association_receipt(const char *source,const char *endpoint,const char *tenant,
+    const char *event,uint32_t pid,uint64_t start,uint64_t birth,int64_t time,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  TestAssociationOwner *owner=user; owner->receipts++;
+  if (owner->fail_receipt || !tuple_matches(source,endpoint,tenant,event,pid,start,birth,time,status,verdict,frame,len,user)) return -1;
+  owner->state=1; return 1;
+}
+static int association_removed(const char *source,const char *endpoint,const char *tenant,
+    const char *event,uint32_t pid,uint64_t start,uint64_t birth,int64_t time,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  TestAssociationOwner *owner=user; owner->removals++;
+  if (!owner->state || !tuple_matches(source,endpoint,tenant,event,pid,start,birth,time,status,verdict,frame,len,user)) return -1;
+  owner->state=2; return 1;
+}
+static void association_boundary(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX);
+  uint8_t *body=malloc(EDR_EGRESS_FRAME_MAX+4),header[12]; char reason[128]; assert(r && frame && body);
+  make_record(r); r->type=EDR_EVENT_PMFE_SCAN_RESULT; r->process_start_key=123;
+  r->process_creation_filetime_100ns=456;
+  strcpy(r->detection_context,"{\"rule_id\":\"agent_decision_v1\",\"process\":{\"pid\":42},"
+    "\"engine_evidence\":{\"schema\":\"pmfe_result_v1\",\"detector\":\"pmfe\","
+    "\"source_alert_id\":\"synthetic-original-alert\",\"followup_only\":true,"
+    "\"status\":\"completed_clean\",\"verdict\":\"clean\",\"signals\":{\"regions_scanned\":3},"
+    "\"evidence\":{\"pmfe_snapshot\":\"synthetic-local-only-snapshot\"}}}" );
+  TestAssociationOwner owner={0};
+  edr_egress_set_pmfe_association_validator(NULL,NULL);
+  size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && !edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  edr_egress_set_pmfe_association_validator(association_validate,&owner);
+  n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX);
+  assert(n && !owner.validations); /* Pure minimization never authorizes. */
+  owner.frame=malloc(n); assert(owner.frame); memcpy(owner.frame,frame,n); owner.len=n;
+  assert(edr_egress_frame_validate(frame,n,reason,sizeof(reason)) && owner.validations==1);
+  edr_v1_BehaviorEvent *ev=decode_frame(frame,n);
+  assert(!strstr(ev->ave_result_json,"synthetic-local-only-snapshot"));
+  assert(ev->process_start_key==123 && ev->process_creation_filetime_100ns==456 && !ev->cmdline[0]);
+  strcpy(ev->event_id,"different-source"); size_t changed=immutable_encode(ev,frame);
+  assert(!edr_egress_frame_validate(frame,changed,reason,sizeof(reason))); free(ev);
+  memcpy(frame,owner.frame,n); wr(body,(uint32_t)n); memcpy(body+4,frame,n);
+  wr(header,EDR_TRANSPORT_BATCH_MAGIC_RAW); wr(header+4,1); wr(header+8,(uint32_t)n+4);
+  edr_egress_set_pmfe_receipt_handler(NULL,NULL);
+  assert(!edr_egress_batch_note_receipt(header,12,body,n+4,reason,sizeof(reason)) && owner.state==0);
+  edr_egress_set_pmfe_queue_removed_handler(association_removed,&owner);
+  assert(!edr_egress_batch_note_queue_removed(header,12,body,n+4,reason,sizeof(reason)) && owner.state==0);
+  edr_egress_set_pmfe_receipt_handler(association_receipt,&owner); owner.fail_receipt=1;
+  assert(!edr_egress_batch_note_receipt(header,12,body,n+4,reason,sizeof(reason)) && owner.state==0);
+  owner.fail_receipt=0;
+  /* API ownership test only; the separate TLS test validates a real receipt. */
+  assert(edr_egress_batch_note_receipt(header,12,body,n+4,reason,sizeof(reason)) && owner.state==1);
+  assert(edr_egress_batch_note_queue_removed(header,12,body,n+4,reason,sizeof(reason)) && owner.state==2);
+  assert(edr_egress_batch_note_queue_removed(header,12,body,n+4,reason,sizeof(reason)) && owner.state==2);
+  assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
+  edr_egress_set_pmfe_association_validator(NULL,NULL);
+  edr_egress_set_pmfe_receipt_handler(NULL,NULL); edr_egress_set_pmfe_queue_removed_handler(NULL,NULL);
+  free(owner.frame); free(body); free(frame); free(r);
+}
+static void paired_batch_classification(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)); AVEBehaviorAlert alert;
+  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX+16u),*compressed=malloc(EDR_EGRESS_FRAME_MAX+16u);
+  assert(r && wire && compressed); make_record(r); make_alert(&alert,r);
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&alert,wire+16,EDR_EGRESS_FRAME_MAX);
+  assert(n); wr(wire,EDR_TRANSPORT_BATCH_MAGIC_RAW); wr(wire+4,1); wr(wire+8,(uint32_t)n+4u); wr(wire+12,(uint32_t)n);
+  assert(edr_egress_batch_has_p0_combined(wire,n+16u)==0);
+  int zipped=LZ4_compress_default((const char*)wire+12,(char*)compressed+12,(int)n+4,EDR_EGRESS_FRAME_MAX);
+  assert(zipped>0); memcpy(compressed,wire,12); wr(compressed,EDR_TRANSPORT_BATCH_MAGIC_LZ4);
+  assert(edr_egress_batch_has_p0_combined(compressed,(size_t)zipped+12u)==0);
+  wr(wire,0x51515151u); assert(edr_egress_batch_has_p0_combined(wire,n+16u)==-1);
+  wr(wire,EDR_TRANSPORT_BATCH_MAGIC_RAW);
+  assert(edr_egress_batch_has_p0_combined(wire,n+15u)==-1);
+  edr_v1_BehaviorEvent *ev=decode_frame(wire+16,n);
+  strcpy(ev->ave_result_json,"{\"enforcement_terminal\":{\"phase\":\"result\"}}");
+  n=immutable_encode(ev,wire+16); wr(wire+8,(uint32_t)n+4u); wr(wire+12,(uint32_t)n);
+  /* Detection of a pairing dependency confers no egress permission. */
+  assert(edr_egress_batch_has_p0_combined(wire,n+16u)==1);
+  assert(!edr_egress_frame_validate(wire+16,n,NULL,0));
+  free(ev); free(compressed); free(wire); free(r);
+}
+int main(void) { matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+  puts("egress batch policy: synthetic matrix passed"); return 0; }

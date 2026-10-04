@@ -19,6 +19,7 @@
 #include "edr/behavior_record.h"
 #include "edr/resource.h"
 #include "edr/sha256.h"
+#include "edr/p0_terminal_identity.h"
 #include "edr/storage_queue.h"
 #include "edr/types.h"
 #include "edr/enrich_parent_info.h"
@@ -384,33 +385,12 @@ static int p0_context_reported_file_identity(const char *context, char *out,
                                              size_t out_cap);
 static int p0_context_file_identity(const char *context, char *out, size_t out_cap);
 
-static void p0_terminal_commit_text(EdrSha256Ctx *ctx, const char *text) {
-  uint32_t length = 0u;
-  uint8_t length_le[sizeof(length)];
-  const uint8_t separator = 0u;
-  if (text) length = (uint32_t)strlen(text);
-  /* The terminal key crosses the Agent/backend boundary.  Commit lengths in
-   * explicit little-endian order rather than the host representation. */
-  length_le[0] = (uint8_t)(length & 0xffu);
-  length_le[1] = (uint8_t)((length >> 8u) & 0xffu);
-  length_le[2] = (uint8_t)((length >> 16u) & 0xffu);
-  length_le[3] = (uint8_t)((length >> 24u) & 0xffu);
-  edr_sha256_update(ctx, length_le, sizeof(length_le));
-  if (length) edr_sha256_update(ctx, (const uint8_t *)text, length);
-  edr_sha256_update(ctx, &separator, sizeof(separator));
-}
-
 static int p0_terminal_identity(const EdrBehaviorRecord *br, const char *rule_id,
                                 char *idempotency_key, size_t idempotency_key_cap,
                                 char *source_event_key, size_t source_event_key_cap,
                                 char *process_generation_key, size_t process_generation_key_cap) {
   char file_identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
-  char pid_text[16];
   char start_key_text[32];
-  char creation_text[32];
-  char digest_hex[65];
-  uint8_t digest[EDR_SHA256_DIGEST_LEN];
-  EdrSha256Ctx ctx;
   const char *canonical_path;
   if (!br || !rule_id || !rule_id[0] || !idempotency_key || !source_event_key ||
       !process_generation_key || idempotency_key_cap < 80u || source_event_key_cap < EDR_BR_ID_LEN ||
@@ -423,32 +403,11 @@ static int p0_terminal_identity(const EdrBehaviorRecord *br, const char *rule_id
       !p0_context_file_identity(br->detection_context, file_identity, sizeof(file_identity))) {
     return 0;
   }
-  snprintf(pid_text, sizeof(pid_text), "%u", br->pid);
   snprintf(start_key_text, sizeof(start_key_text), "%016llx",
            (unsigned long long)br->process_start_key);
-  snprintf(creation_text, sizeof(creation_text), "%016llx",
-           (unsigned long long)br->process_creation_filetime_100ns);
-  /* This key is a collision-resistant commitment over every pre-action
-   * process authority field.  FNV is retained only for non-security dedup
-   * buckets; it is never an enforcement/journal identity. */
-  edr_sha256_init(&ctx);
-  p0_terminal_commit_text(&ctx, "edr-p0-enforcement-terminal-v1");
-  p0_terminal_commit_text(&ctx, br->tenant_id);
-  p0_terminal_commit_text(&ctx, br->endpoint_id);
-  p0_terminal_commit_text(&ctx, rule_id);
-  p0_terminal_commit_text(&ctx, br->event_id);
-  p0_terminal_commit_text(&ctx, pid_text);
-  p0_terminal_commit_text(&ctx, start_key_text);
-  p0_terminal_commit_text(&ctx, creation_text);
-  p0_terminal_commit_text(&ctx, canonical_path);
-  p0_terminal_commit_text(&ctx, file_identity);
-  edr_sha256_final(&ctx, digest);
-  for (size_t i = 0u; i < sizeof(digest); ++i) {
-    static const char hex[] = "0123456789abcdef";
-    digest_hex[i * 2u] = hex[digest[i] >> 4u];
-    digest_hex[i * 2u + 1u] = hex[digest[i] & 0x0fu];
-  }
-  digest_hex[64] = '\0';
+  if (!edr_p0_terminal_identity_key(br->tenant_id,br->endpoint_id,rule_id,br->event_id,
+        br->pid,br->process_start_key,br->process_creation_filetime_100ns,
+        canonical_path,file_identity,idempotency_key,idempotency_key_cap)) return 0;
   snprintf(source_event_key, source_event_key_cap, "%s", br->event_id);
   /* `start_key_text` is exactly 16 hexadecimal bytes, so form this terminal
    * authority field without a bounded formatter that could silently shorten
@@ -456,7 +415,6 @@ static int p0_terminal_identity(const EdrBehaviorRecord *br, const char *rule_id
   memcpy(process_generation_key, "startkey-", sizeof("startkey-") - 1u);
   memcpy(process_generation_key + sizeof("startkey-") - 1u, start_key_text,
          sizeof(start_key_text));
-  snprintf(idempotency_key, idempotency_key_cap, "p0-enforcement-%s", digest_hex);
   return 1;
 }
 

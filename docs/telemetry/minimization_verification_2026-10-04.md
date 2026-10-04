@@ -1,6 +1,11 @@
 # Agent upload minimization: development evidence
 
-## Fixed baseline
+The current continuation results are in the final validation ledger below:
+34 individually passed selected contracts, nine isolated mTLS scenarios and
+19 Windows objects plus three linked contract programs. Earlier sections record
+the original three commits; their timestamps and limitations remain historical.
+
+## Fixed baseline and continuation
 
 - Repository: `https://github.com/qiuxinliang/edr-agent.git` (nested Git repository).
 - Branch: `codex/release-workflow-convergence`.
@@ -285,29 +290,135 @@ renamed a passing historical sender. The final rebuilt current binary then
 passed all five mTLS scenarios again, with the counts above unchanged. The
 four focused transport-owner/P0/batch/request tests also passed after the repair.
 
-### Unfinished requirements and release blockers
+## Blocker resolution continuation
 
-These commits do **not** establish strict upload minimization as complete:
+The continuation began with a clean nested worktree at
+`8fed2f9ae7dc018804e56d4ca747078727d41156`. The three staged changes above are
+`26a7ca91`, `64b923bf` and `8fed2f9a`. During the continuation, another authorized
+session committed `efe99ffdf649816488074d73d7d68a80d67267e0` (release cleanup and
+terminal ACK error/clock recovery). Its ACK fixes and regression assertions are
+preserved. A later concurrent documentation-only commit,
+`9368e9593df192e2bd199613ea7870a460796c21`, was also preserved and is the parent
+checkout for this task commit; it changes no production source. This task does
+not include either commit's workflow/release/runtime-assessment files or the
+outer workspace's separately committed frontend work/signing directory. The
+final observed outer HEAD is `0a1736eb150c80192f3c5d128eb1d659d592e5bd`; its
+pre-existing signing directory remains outside this nested task commit.
 
-1. Historical remote-v2 capability ownership cannot be safely cleared by a
-   local-v3 commit or health receipt. Old mixed-batch alerts need a reviewed
-   projection protocol with new ID, original hash lineage and separate ACK.
-   No automatic production migration or operator disposition API is included.
-2. The independent enforcement journal still retries denied source frames with
-   shared backoff and source-before-combined selection. Its HTTP guard prevents
-   raw egress, but it lacks per-frame held/recovery state and can delay a valid
-   combined alert. No action audit, payload or ACK is invented to hide this.
-3. Clean/inconclusive PMFE follow-ups need durable original-alert, endpoint and
-   process-generation association. A string ID alone is denied; this can
-   withhold useful true-alert context until that association owner exists.
-4. Supported alert fields and bounded nested explanation JSON are not yet
-   proven minimal for every rule and server consumer. Native Windows collectors,
-   Schannel/headless finalizer, libcurl HTTP2, production publisher signatures,
-   genuine crash/power loss, and all historical onsite fixtures remain unexecuted.
-   Scripts/installers or arbitrary child program network behavior are outside
-   this C transport boundary and need their own audit before a whole-endpoint
-   strict claim.
+The owner authorized minimum control messages under a separate closed protocol
+whitelist and selected Windows cross compilation plus a repeatable native entry.
+No service, publisher, cloud deployment, merge or real queue migration is part
+of this continuation.
 
-The compatibility proposal names the required server negotiation, new projection
-identity and restart-safe local handoff. These are decision/blocking items for a
-later authorized implementation; none is an expanded egress exception here.
+| Previous blocker and root cause | Current owner and implementation | Verification and remaining boundary |
+| --- | --- | --- |
+| Nested explanation JSON and child arguments could carry unrelated facts or create another sending path | `egress_batch_policy.c` owns recursive typed `alert-fields-v1`; fresh outbound encoding and immutable final admission share it. Full-facts local encoding remains separate. `deep_collector.c` validates a closed local argument contract before binary resolution/download/spawn on both platforms and legacy entry points. | Unknown/nested/wrong-type/duplicate fields denied; actual 21-alert SDK ABI preserved; quoted local query paths executed. Archived `8fed2f9a` collector regression genuinely fails with exit 1, not a missing-API compile failure. Arbitrary substituted programs/VQL are not an OS network sandbox. |
+| PMFE clean/inconclusive or weak suspicious could not be safely linked to a true alert | `local_evidence_cache.c` reuses existing artifacts, stores original wire/SHA and exact scoped generation, and binds final result wire/SHA before queue handoff. `pmfe_engine.c` checks the same opened process handle's generation before memory reads. `preprocess_pipeline.c` consumes leased jobs/replays bound results with deterministic batch identity. | Original/result tuple, corruption, storage failure, policy switch, retries, expiry, capacity and crash/ACK/delete boundaries tested. A real worker failure remains inconclusive for the expected generation. Crash before final result binding uses bounded rescan; it does not guarantee preservation of an uncaptured memory snapshot. |
+| Denied journal source frames shared retry/backoff and could block a true combined alert or exhaust the pending-action cap | `queue_sqlite.c` has separate per-frame held reason/retry deadline and FULL ACK transactions. Source frames remain immutable and unacknowledged. `local_retained` releases a completed action's pending slot only after actual necessary intent and combined receipts; retained bytes still consume capacity. | Real-codec SQLite regression, 1024 retained-action capacity case and mTLS journal receipts. Ordinary manufactured intent cannot receive permission or falsely release an action slot. |
+| P0 combined HTTP acceptance alone did not create the server alert | Existing backend `ingest_p0_batch_mysql_test.go:1218-1246` shows combined Accepted=1/alerts=0 until the matched intent arrives. Strict schema/terminal SHA plus the queue's exact committed intent/combined pair authorize both necessary alert frames. An orphaned combined is also denied. Held pre-action intent is rechecked automatically after FULL combined commit. | Strict real-IR builder contract and independent synthetic receiver business reconciliation, lost intent ACK and replay. Source result is still denied. Backend MySQL integration is source evidence, not a newly executed production-server test. |
+| Historical remote-v2 latch and mixed payloads had no restart-safe explicit recovery path | `main.c` invokes `queue_maintenance.c` before service startup. Default read-only check binds configured scope, exact owner tuple, cursor/limit, original hashes and projected proof. Explicit apply uses FULL transaction, new deterministic projected batch ID, retained parent hash/body and bounded unacknowledged old-owner lineage; current local-v3 recovery still requires healthy IR/probe/loss audit. | Clean/upgrade synthetic DBs, raw/LZ4/mixed/old/unknown input, stale authorization, wrong/lost ACK, immutable lineage, three actual SIGKILL commit boundaries, capacity and proof changes. Unknown or incomplete context remains unresolved with a bounded observable reason; a summary never ACKs the original. No real queue migrated. |
+| Windows execution environment unavailable | `run_telemetry_windows_cross.py` compiles actual changed Windows owners and links policy contracts. `run_telemetry_windows_native.ps1` requires a configured real-dependency native build and executes a shared CMake test target/label, including loopback mTLS and crash cases. | Cross compilation is distinct from full production agent dependency/link acceptance and native runtime. The owner's selected cross/native-entry scope does not certify native sensors, Schannel or headless finalizer operation. |
+
+The original artifact/health owners remain bounded. PMFE associations are limited
+to 64 active entries (including ACKed results awaiting queue deletion), three
+attempts and a one-hour task deadline, with a five-minute running lease. A new
+fixed numeric health summary reports scheduled/running/bound/ACKed-awaiting-queue,
+capacity/failures and closed cause codes. No association ID, original command,
+username, path, raw context or receipt secret appears in that summary.
+
+Historical recovery is an operator tool, not an automatic migration. At most 32
+batches/frames and 128 MiB are inspected per pass; cursor advancement avoids
+unsupported first rows starving later inventory. Retained unresolved rows can
+be explicitly rechecked after decoder/proof upgrades. A linked projection
+retains its existing body/ID/hash across capped service-lifetime backoff rather
+than being deleted at TTL/retry exhaustion. Policy-held projections require
+fresh scoped snapshot authorization to resume. Logical retention remains bounded
+by the existing configured queue limit; SQLite WAL is not a physical disk quota.
+
+### Continuation validation ledger
+
+Final checkout validation: full incremental native build **PASS**. The broadened
+34-case run initially had **33 PASS / 1 FAIL**, with the P0 TLS fixture failure
+recorded. After respecting the existing 1000 ms drain cadence, correcting its
+protocol oracle and completing the historical terminal-state recovery, the five
+affected contracts were rebuilt and rerun: **5/5 PASS**, zero failures, 38.84 s.
+They are `storage_queue_sqlite_contract`, `queue_recovery_real_codec`,
+`local_evidence_cache_candidate`, `egress_loopback_mtls` and
+`pmfe_lifecycle_policy_switch`. The remaining 29 contracts were unchanged after
+their PASS. This gives 34 individually passed selected contracts, not a claim
+that one final full-repository run occurred or that every registered test ran.
+
+| Final validation | Status | Evidence |
+| --- | --- | --- |
+| Native selected contracts | PASS | 34 selected contract names below; final five affected cases all pass |
+| Actual PCRE2/source/terminal builder | PASS | Plaintext current 180-rule bundle and TEST ONLY AES-GCM EDR1; tampered tag rejects -3; immutable intent/source/combined and paired owner restrictions verified |
+| Windows cross compilation | PASS | 19 AMD64 objects, including main/agent health, real SQLite queue/cache/recovery, PMFE, preprocessing, HTTP and test entries; three AMD64 policy/collector test executables linked; output architecture checked |
+| Native Windows entry | CREATED, NOT EXECUTED | CMake real-dependency target/label plus PowerShell runner refuses missing actual IR/SQLite/TLS contracts; no Windows host available |
+| Original Windows 30 records / 29,103 bytes | NOT EXECUTED | Original queue not provided; synthetic tests are not a reconstruction |
+| Backend MySQL business consumer | NOT EXECUTED | Existing combined-first regression/implementation read; independent synthetic receiver checks matching intent/combined business reconciliation |
+| Full Windows production dependency/link gate, Schannel/finalizer, HTTP2 runtime, publisher provenance, hardware power loss | NOT EXECUTED | Cross objects, host OpenSSL, system-library fixtures and SIGKILL do not establish these runtime guarantees |
+| Syntax and Git whitespace checks | PASS | Python parse; shell syntax; final `git diff --check` |
+
+The final TLS report separates actual requests, independently durable receipts
+and distinct queue-owned ACKs. Body counts exclude TLS and HTTP headers.
+
+| Scenario | Requests / body bytes | Durable receiver batches / duplicate observations | Business/ACK result |
+| --- | --- | --- | --- |
+| Actual AVE callback + DNS TLS | 8 / 11,329 | 3 / 2 | One detector input/callback, two synthetic collected records, three enqueued batches, two distinct genuine queue ACKs; ordinary 191-byte record stays held |
+| Actual AVE callback + IP SAN | 8 / 11,329 | 3 / 2 | Same actual provenance/command/ACK assertions |
+| Protobuf + optional dictionary | 8 / 9,174 | 3 / 2 | Existing identity envelope remains inspectable; alert body is unchanged |
+| Wrong CA | 0 / 0 | 0 / 0 | TLS refused before HTTP |
+| Wrong SAN | 0 / 0 | 0 / 0 | TLS refused before HTTP |
+| Associated PMFE actual worker | 3 / 3,230 | 2 / 1 | One original synthetic proven alert and one real worker failure/inconclusive result, two enqueues/two distinct ACKs; first result ACK lost, exact replay completes cache only after queue deletion |
+| Ordinary manufactured journal intent/source plus real AVE alert | 1 / 2,017 | 1 / 0 | Combined genuinely ACKed; ordinary intent/source remain unacknowledged and the action slot remains pending |
+| Matched P0 pair (production-schema fixture) | 3 / 5,928 | 2 / 1 | Exactly one synthetic business alert, intent ACK=1, source ACK=0, combined ACK=1; lost intent receipt replay causes no duplicate business alert |
+| Abrupt child kill after lost ACK | 4 / 6,118 | 2 / 1 | Original pending payload/hash unchanged across kill/reopen; no recollection, redetection or re-encoding on resume; genuine replay ACK removes exact queue row |
+
+All nine final scenarios have client exit 0, zero failed assertions and zero
+receiver business failures. The current actual AVE batch is 1,430 bytes, compared
+with the previous three-commit 1,564-byte fixture; DNS/IP aggregate falls from
+12,229 to 11,329 bytes while the canonical required command/provenance is
+preserved. The rejected ordinary batch remains 191 bytes locally and transmits
+zero bytes. This is synthetic measured data, not a recalculation of the supplied
+historical endpoint's 29,103 bytes.
+
+Reproduce in a disposable host build using the explicit nonproduction settings
+above. The exact broadened selection adds `queue_recovery_real_codec`,
+`pmfe_lifecycle_policy_switch` and `egress_loopback_mtls` to the original 31-case
+expression; real-IR and Windows probes are separate evidence levels:
+
+```sh
+cmake --build /tmp/edr-min-egress -j 4
+ctest --test-dir /tmp/edr-min-egress --output-on-failure \
+  -R '^(transport_v2_status_capacity|transport_durable_owner|telemetry_admission|storage_queue_sqlite_contract|queue_recovery_real_codec|detection_decision_combo|detection_regression_scenarios|detection_sensor_bridge|p0_direct_emit_suppression|p0_deferred_snapshot|preprocess_p0_dispatch_contract|local_evidence_cache_candidate|deep_collector_manifest|pmfe_injection_generation|pmfe_lifecycle_policy_switch|ave_sdk_smoke|net_fanout|health_upload|egress_batch_policy|egress_request_policy|report_events_ack_contract|command_signature_cross_language|command_inbox_persistence|command_upload_outbox_recovery|agent_update_event_outbox|request_signing|control_stream_lease_contract|mtls_upload_transport_contract|behavior_record_alert_proto_contract|behavior_record_alert_emit_contract|alert_cardinality_release_gate|endpoint_policy_v2_modes|collector_health_disposition_json|egress_loopback_mtls)$'
+bash tests/run_p0_source_only_real_ir.sh
+python3 -B tests/run_telemetry_windows_cross.py \
+  --build-dir /tmp/edr-min-egress-windows-owners \
+  --sqlite-include /absolute/portable-sqlite-headers \
+  --openssl-include /absolute/openssl-headers \
+  --pcre2-include /absolute/pcre2-headers
+```
+
+The cross probe copies only the portable SQLite declaration header into its
+isolated build root; it never includes a host SDK ahead of Windows stdlib or
+links host-platform libraries into a PE executable. There is no new production
+service/thread/table or permissive runtime flag. The offline maintenance CLI,
+existing bounded artifact subtype, durable ownership columns/lineage, closed
+field contracts and lifecycle synchronization each have an actual consumer and
+failure-path coverage. Ordinary logical retention still has a finite capacity
+and recoverable, observable state; no queue is cleared to obtain a test pass.
+
+- Completed deterministic before experiments: collector archive `8fed2f9a` FAIL
+  exit 1; historical transport archive `7c43dc2d` FAIL exit 1 (14 requests,
+  86,915 bytes, 13 receiver business failures); weak suspicious PMFE exact-bound
+  fixture FAIL before guard repair, PASS after (9.92 seconds); PMFE worker ready/disabled-policy timing tests FAIL exit 1 before lock repair and PASS after; same required P0 pair contract with old queue implementation FAIL exit 134, current implementation PASS exit 0.
+- Iteration failures were fixed without weakening behavior: legacy artifact NULL
+  cleanup, exact AVE 255-byte target-domain ABI, independent journal retry fixture
+  timing, and synthetic TLS journal SQL-column/protocol-field mistakes. The final P0 fixture also now respects the unchanged 1000 ms drain cadence and bounded retry instead of asserting completion after a suppressed poll. A sandbox socket-bind
+  refusal was infrastructure failure; isolated loopback verification used approved
+  sandbox escalation with normal certificate checks.
+- Native Windows runtime, full Windows production dependency/link gates,
+  libcurl HTTP2 runtime, hardware power loss, production publisher signature,
+  original historical 30-record database and production server/queue operation
+  remain unexecuted. POSIX process-kill tests do not prove hardware power-loss
+  survival; system-library real-IR fixtures do not certify production provenance.

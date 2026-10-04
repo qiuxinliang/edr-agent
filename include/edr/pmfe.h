@@ -205,6 +205,13 @@ void edr_pmfe_shutdown(void);
 /** 返回 PMFE worker/queue 是否已经启动。 */
 int edr_pmfe_is_running(void);
 
+#ifdef EDR_PMFE_LIFECYCLE_TESTING
+/* Timing checkpoints for real-worker concurrency tests; absent from runtime
+ * builds. Hooks are installed only while all test threads are stopped. */
+enum { EDR_PMFE_TEST_INIT_WORKERS = 1, EDR_PMFE_TEST_SUBMIT_LOCK = 2 };
+void edr_pmfe_set_lifecycle_test_hook(void (*hook)(int phase));
+#endif
+
 /**
  * 将服务端触发的扫描请求入队（`PMFE_TRIGGER_SERVER_CMD`，设计 P0，不参与同 PID 冷却）。
  * @param command_id 用于审计日志（可为空）
@@ -227,6 +234,22 @@ int edr_pmfe_submit_etw_scan(const char *reason, uint32_t pid);
  * 同 `edr_pmfe_submit_etw_scan`，可指定 **触发档位**（影响 `pmfe_task_fill_scope` 中 peek/DNS/full_vad）与 **Windows VAD 精扫 hint**（用户态 VA；仅 Windows 深扫使用，0 表示未指定）。
  */
 int edr_pmfe_submit_etw_scan_ex(const char *reason, uint32_t pid, EdrPmfeTriggerBand band, uint64_t vad_hint_va);
+
+/* Durable shellcode follow-up ownership. PID alone never selects a target;
+ * both generation identifiers are verified on the same scan handle. */
+typedef struct EdrPmfeFollowupTask {
+  char association_id[80];
+  char source_alert_id[64];
+  char endpoint_id[48];
+  char tenant_id[64];
+  uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
+  int64_t source_event_time_ns;
+  uint32_t band;
+  uint64_t vad_hint_va;
+} EdrPmfeFollowupTask;
+int edr_pmfe_submit_associated_scan(const EdrPmfeFollowupTask *task);
 
 /** 预处理线程：在 `edr_behavior_from_slot` 之后调用（Windows：`EDR_PMFE_ETW_AUTO=1` 时按事件入队）。 */
 void edr_pmfe_on_preprocess_slot(const EdrEventSlot *slot, const EdrBehaviorRecord *br);

@@ -79,6 +79,15 @@ static const HealthField health_fields[] = {
   N("p0_acceptance.evidence_cache.physical_bytes"), N("p0_acceptance.evidence_cache.max_db_mb"),
   N("p0_acceptance.evidence_cache.candidate_requests"),
   N("p0_acceptance.evidence_cache.candidate_admitted"), N("p0_acceptance.evidence_cache.candidate_rejected"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.scheduled"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.running"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.result_bound"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.result_acked_await_queue"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.active"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.expired"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.capacity"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.failures"),
+  N("p0_acceptance.evidence_cache.accounting.pmfe_followup.cause_code"),
   N("p0_acceptance.evidence_cache.maintenance.metric_write_failures"),
   N("p0_acceptance.evidence_cache.maintenance.metric_unrecorded"),
   B("p0_acceptance.offline_queue.accounting_available"), N("p0_acceptance.offline_queue.utilization_bps"),
@@ -128,6 +137,8 @@ static const HealthField health_fields[] = {
   T("egress.policy_version"), N("egress.denied_requests"),
   B("egress.capacity_limit_defaulted"),
   N("egress.policy_held_rows"), N("egress.local_evidence_rows"), R("egress.last_reason"),
+  N("egress.terminal_policy_held_frames"), N("egress.terminal_local_retained"), N("egress.legacy_owner_unacknowledged"),
+  N("egress.retained_unresolved_rows"), N("egress.projection_pending_rows"), N("egress.projection_acked_rows"),
   B("sensor_health.etw_or_inotify_enabled"), B("sensor_health.powershell_visible"),
   B("sensor_health.amsi_visible"), B("sensor_health.security_audit_visible"),
   B("sensor_health.security_subscription_ready"),
@@ -238,6 +249,7 @@ static int health_reason(const char *value) {
     "file_read_metadata_post_reset_degraded", "file_read_metadata_post_reset_exact_binding_pending",
     "file_read_critical_binding_capacity_recovery_pending", "file_read_metadata_durable_pending",
     "alert_provenance_unavailable", "source_only_requires_local_owner_v3",
+    "p0_pair_durable_alert_owner_unavailable",
     "unknown_or_invalid_event_schema", "event_purpose_unknown", "event_decode_failed",
     "detection_context_invalid", "frame_size_invalid", "unknown_outbound_purpose"
   };
@@ -465,12 +477,16 @@ static uint8_t *decode_base64(const char *s, size_t *len) {
   }
   *len = used; return out;
 }
-static int validate_raw_batch(const uint8_t *raw, size_t len, char *reason, size_t cap) {
+static int validate_raw_batch(const uint8_t *raw, size_t len,const char *tenant,
+    const char *endpoint,char *reason, size_t cap) {
   if (!raw || len <= 12u) return deny(reason, cap, "batch_envelope_invalid");
-  return edr_egress_batch_validate(raw, 12u, raw + 12u, len - 12u, reason, cap)
+  int valid=(tenant || endpoint)?edr_egress_batch_validate_scope(raw,12u,raw+12u,len-12u,
+      tenant,endpoint,reason,cap):edr_egress_batch_validate(raw,12u,raw+12u,len-12u,reason,cap);
+  return valid
       ? 0 : EDR_EGRESS_REQUEST_DENIED;
 }
-static int validate_json_batch(const cJSON *root, char *reason, size_t cap) {
+static int validate_json_batch(const cJSON *root,const char *tenant,const char *endpoint,
+    char *reason, size_t cap) {
   const cJSON *v;
   cJSON_ArrayForEach(v, root)
     if (strcmp(v->string, "endpoint_id") && strcmp(v->string, "batch_id") &&
@@ -481,11 +497,13 @@ static int validate_json_batch(const cJSON *root, char *reason, size_t cap) {
     v = cJSON_GetObjectItemCaseSensitive(root, keys[i]);
     if (!token(v, 160u) || !v->valuestring[0]) return deny(reason, cap, "batch_envelope_identity_invalid");
   }
+  if (endpoint && strcmp(cJSON_GetObjectItemCaseSensitive(root,"endpoint_id")->valuestring,endpoint))
+    return deny(reason,cap,"batch_envelope_scope_mismatch");
   v = cJSON_GetObjectItemCaseSensitive(root, "payload");
   if (!cJSON_IsString(v) || !v->valuestring) return deny(reason, cap, "batch_envelope_invalid");
   size_t len = 0;
   uint8_t *raw = decode_base64(v->valuestring, &len);
-  int rc = validate_raw_batch(raw, len, reason, cap);
+  int rc = validate_raw_batch(raw, len,tenant,endpoint, reason, cap);
   free(raw); return rc;
 }
 static int varint(const uint8_t *data, size_t len, size_t *off, uint64_t *value) {
@@ -498,7 +516,8 @@ static int varint(const uint8_t *data, size_t len, size_t *off, uint64_t *value)
   }
   return 0;
 }
-static int validate_proto_batch(const void *body, size_t len, char *reason, size_t cap) {
+static int validate_proto_batch(const void *body, size_t len,const char *tenant,const char *endpoint,
+    char *reason, size_t cap) {
   const uint8_t *data = body, *fields[10] = {0};
   size_t sizes[10] = {0}, off = 0;
   unsigned seen = 0;
@@ -522,8 +541,10 @@ static int validate_proto_batch(const void *body, size_t len, char *reason, size
           c == '_' || c == '-' || c == '.')) return deny(reason, cap, "batch_envelope_identity_invalid");
     }
   }
+  if (endpoint && (sizes[2]!=strlen(endpoint) || memcmp(fields[2],endpoint,sizes[2])))
+    return deny(reason,cap,"batch_envelope_scope_mismatch");
   if (sizes[8] == 8u && !memcmp(fields[8], "identity", 8u))
-    return validate_raw_batch(fields[9], sizes[9], reason, cap);
+    return validate_raw_batch(fields[9], sizes[9],tenant,endpoint, reason, cap);
   if (sizes[8] != 4u || memcmp(fields[8], "zstd", 4u)) return deny(reason, cap, "batch_envelope_codec_unknown");
 #ifdef EDR_HAVE_ZSTD
   unsigned long long raw_len = ZSTD_getFrameContentSize(fields[9], sizes[9]);
@@ -533,7 +554,7 @@ static int validate_proto_batch(const void *body, size_t len, char *reason, size
   if (!raw) return deny(reason, cap, "batch_envelope_allocation_failed");
   size_t got = ZSTD_decompress(raw, (size_t)raw_len, fields[9], sizes[9]);
   int rc = ZSTD_isError(got) || got != raw_len ? deny(reason, cap, "batch_envelope_compression_invalid") :
-      validate_raw_batch(raw, got, reason, cap);
+      validate_raw_batch(raw, got,tenant,endpoint, reason, cap);
   free(raw); return rc;
 #else
   return deny(reason, cap, "batch_envelope_compression_unavailable");
@@ -696,9 +717,10 @@ static int control_post_valid(const char *path, const cJSON *root) {
   return control_object_valid(root, "", fields, count, 0u);
 }
 
-int edr_egress_request_validate(const char *method, const char *suffix_or_url,
+int edr_egress_request_validate_for_scope(const char *method, const char *suffix_or_url,
                                 const char *content_type, const void *body,
-                                size_t len, char *reason, size_t cap) {
+                                size_t len,const char *tenant,const char *endpoint,
+                                char *reason, size_t cap) {
   if (reason && cap) reason[0] = 0;
   if (!method || !suffix_or_url || !suffix_or_url[0]) return deny(reason, cap, "egress_purpose_unknown");
   const char *path = suffix_or_url;
@@ -720,13 +742,21 @@ int edr_egress_request_validate(const char *method, const char *suffix_or_url,
   if (!body || !len || len > (batch ? EDR_EGRESS_BATCH_WIRE_MAX_BYTES :
       heartbeat ? 1024u : control ? 8192u : EDR_EGRESS_HEALTH_MAX_BYTES)) return deny(reason, cap, "egress_body_limit");
   if (batch && content_type && strcmp(content_type, "application/x-protobuf") == 0)
-    return validate_proto_batch(body, len, reason, cap);
+    return validate_proto_batch(body, len,tenant,endpoint, reason, cap);
   if (!content_type || strcmp(content_type, "application/json")) return deny(reason, cap, "egress_content_type_denied");
   cJSON *root = parse_body(body, len);
   if (!root) return deny(reason, cap, "egress_json_invalid");
+  const cJSON *request_endpoint=cJSON_GetObjectItemCaseSensitive(root,"endpoint_id");
+  const cJSON *request_tenant=cJSON_GetObjectItemCaseSensitive(root,"tenant_id");
+  if ((endpoint && (!endpoint[0] || !cJSON_IsString(request_endpoint) ||
+      strcmp(request_endpoint->valuestring,endpoint))) ||
+      (tenant && request_tenant && (!tenant[0] || !cJSON_IsString(request_tenant) ||
+      strcmp(request_tenant->valuestring,tenant)))) {
+    cJSON_Delete(root); return deny(reason,cap,"egress_scope_mismatch");
+  }
   int rc = 0;
   if (control) { if (!control_post_valid(path, root)) rc = deny(reason, cap, "egress_control_field_or_type_denied"); }
-  else if (batch) rc = validate_json_batch(root, reason, cap);
+  else if (batch) rc = validate_json_batch(root,tenant,endpoint, reason, cap);
   else if (heartbeat) {
     const cJSON *v;
     if (!identities(root)) rc = deny(reason, cap, "heartbeat_identity_invalid");
@@ -736,4 +766,9 @@ int edr_egress_request_validate(const char *method, const char *suffix_or_url,
     }
   } else if (!health_json_valid(root, delta)) rc = deny(reason, cap, "health_field_or_type_denied");
   cJSON_Delete(root); return rc;
+}
+int edr_egress_request_validate(const char *method,const char *suffix_or_url,
+    const char *content_type,const void *body,size_t len,char *reason,size_t cap) {
+  return edr_egress_request_validate_for_scope(method,suffix_or_url,content_type,body,len,
+    NULL,NULL,reason,cap);
 }

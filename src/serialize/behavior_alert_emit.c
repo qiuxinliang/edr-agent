@@ -120,12 +120,14 @@ int edr_behavior_durable_wire_batch_id(const char *kind, const uint8_t *wire, si
   return out[0] != '\0';
 }
 
-size_t edr_behavior_record_encode_frame(const EdrBehaviorRecord *record,
-    const AVEBehaviorAlert *alert, uint8_t *frame, size_t capacity) {
+static size_t record_frame_encode(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,uint8_t *frame,size_t capacity,int outbound) {
 #ifdef EDR_HAVE_NANOPB
   char *subject = NULL, *parent = NULL;
   edr_local_evidence_cache_resolve_commands(record, &subject, &parent);
-  size_t n = edr_behavior_record_encode_protobuf_facts(record, alert, subject, parent, frame, capacity);
+  size_t n = outbound?
+    edr_behavior_record_encode_protobuf_facts(record,alert,subject,parent,frame,capacity):
+    edr_behavior_record_encode_protobuf_full_facts(record,alert,subject,parent,frame,capacity);
   free(subject); free(parent);
   return n;
 #else
@@ -133,13 +135,17 @@ size_t edr_behavior_record_encode_frame(const EdrBehaviorRecord *record,
   return 0;
 #endif
 }
+size_t edr_behavior_record_encode_frame(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,uint8_t *frame,size_t capacity) {
+  return record_frame_encode(record,alert,frame,capacity,1);
+}
 
 size_t edr_behavior_record_alert_encode_durable_wire(const EdrBehaviorRecord *record,
                                                       const AVEBehaviorAlert *alert,
                                                       uint8_t *wire, size_t wire_cap) {
 #ifdef EDR_HAVE_NANOPB
   if (!wire || wire_cap <= 16u) return 0;
-  size_t n = edr_behavior_record_encode_frame(record, alert, wire + 16u, wire_cap - 16u);
+  size_t n = record_frame_encode(record,alert,wire+16u,wire_cap-16u,0);
   return behavior_frame_encode_durable_wire(wire + 16u, n, wire, wire_cap);
 #else
   (void)record;
@@ -154,7 +160,7 @@ size_t edr_behavior_record_encode_durable_wire(const EdrBehaviorRecord *record,
                                                uint8_t *wire, size_t wire_cap) {
 #ifdef EDR_HAVE_NANOPB
   if (!wire || wire_cap <= 16u) return 0;
-  size_t n = edr_behavior_record_encode_frame(record, NULL, wire + 16u, wire_cap - 16u);
+  size_t n = record_frame_encode(record,NULL,wire+16u,wire_cap-16u,0);
   return behavior_frame_encode_durable_wire(wire + 16u, n, wire, wire_cap);
 #else
   (void)record;
@@ -172,8 +178,8 @@ static int enqueue_durable_p0_wire(const char *batch_id, const uint8_t *wire, si
   return edr_storage_queue_enqueue(batch_id, wire, wire_len, 0, severity) == EDR_OK;
 }
 
-uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
-    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+static uint8_t *alloc_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,const EdrCommandFacts *facts,size_t *length,int outbound) {
   const size_t cap = EDR_EVENT_BATCH_CAP;
   uint8_t *wire;
   if (!length) return NULL;
@@ -184,17 +190,34 @@ uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *r
   if (facts) {
     /* Snapshot-owned bodies are authoritative for this replay. Do not query
      * a later cache observation or depend on evidence-cache retention. */
-    size_t n = edr_behavior_record_encode_protobuf_facts(record, alert,
-        facts->subject, facts->parent, wire + 16u, cap - 16u);
+    size_t n = outbound?
+      edr_behavior_record_encode_protobuf_facts(record,alert,facts->subject,facts->parent,wire+16u,cap-16u):
+      edr_behavior_record_encode_protobuf_full_facts(record,alert,facts->subject,facts->parent,wire+16u,cap-16u);
     *length = behavior_frame_encode_durable_wire(wire + 16u, n, wire, cap);
   } else
 #else
   (void)facts;
 #endif
-  { *length = alert ? edr_behavior_record_alert_encode_durable_wire(record, alert, wire, cap)
-                    : edr_behavior_record_encode_durable_wire(record, wire, cap); }
+  {
+#ifdef EDR_HAVE_NANOPB
+    if (outbound) {
+      size_t n=record_frame_encode(record,alert,wire+16u,cap-16u,1);
+      *length=behavior_frame_encode_durable_wire(wire+16u,n,wire,cap);
+    } else
+#endif
+    { *length = alert ? edr_behavior_record_alert_encode_durable_wire(record, alert, wire, cap)
+                      : edr_behavior_record_encode_durable_wire(record, wire, cap); }
+  }
   if (!*length) { free(wire); return NULL; }
   return wire;
+}
+uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,const EdrCommandFacts *facts,size_t *length) {
+  return alloc_wire_facts(record,alert,facts,length,0);
+}
+uint8_t *edr_behavior_record_alloc_outbound_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,const EdrCommandFacts *facts,size_t *length) {
+  return alloc_wire_facts(record,alert,facts,length,1);
 }
 
 uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
@@ -205,7 +228,7 @@ uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
 static int emit_record_alert_raw(const EdrBehaviorRecord *record, const AVEBehaviorAlert *alert) {
   char batch_id[128];
   size_t wire_len = 0;
-  uint8_t *wire = edr_behavior_record_alloc_durable_wire(record, alert, &wire_len);
+  uint8_t *wire = edr_behavior_record_alloc_outbound_wire_facts(record,alert,NULL,&wire_len);
   if (wire_len == 0u ||
       !edr_behavior_durable_wire_batch_id("p0", wire, wire_len, batch_id, sizeof(batch_id))) {
     free(wire);
@@ -233,7 +256,7 @@ static int emit_record_alert_callback(void *context) {
   if (combined->deferred_key) {
     char batch_id[128];
     size_t n = 0;
-    uint8_t *wire = edr_behavior_record_alloc_durable_wire_facts(combined->record, combined->alert, combined->facts, &n);
+    uint8_t *wire = edr_behavior_record_alloc_outbound_wire_facts(combined->record,combined->alert,combined->facts,&n);
     int ok = n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id)) &&
         edr_storage_queue_p0_deferred_complete(combined->deferred_key,
             batch_id, wire, n, "queue_accepted") == EDR_OK;

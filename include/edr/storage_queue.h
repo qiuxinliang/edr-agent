@@ -18,6 +18,9 @@ void edr_storage_queue_configure(uint32_t max_db_mb, uint32_t retention_hours);
 
 /** 是否已成功打开 SQLite 队列（用于 on_fail 策略仅在库可用时入队） */
 int edr_storage_queue_is_open(void);
+/* Exact immutable identity lookup for durable consumer handoff recovery:
+ * 1 present, 0 absent on the current open database, -1 unavailable/conflict. */
+int edr_storage_queue_batch_presence(const char *batch_id,const uint8_t *wire,size_t wire_len);
 
 /* A P0 source-only admission fault means the endpoint could not preserve the
  * only fail-closed disposition for a collector/ruleset capability.  The
@@ -70,6 +73,41 @@ EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *payload, size_t payload_len,
     int compressed, int recovery_audit);
+
+/* Explicit, offline operator recovery. Check opens existing SQLite READONLY;
+ * apply requires a matching immutable inventory and owner tuple, owns the
+ * existing exclusive queue lock, and never sends or asserts a server ACK. */
+#define EDR_STORAGE_QUEUE_RECOVERY_VERSION 1u
+#define EDR_STORAGE_QUEUE_RECOVERY_MAX_BATCHES 32u
+typedef struct {
+  unsigned version;
+  unsigned target_owner_version;
+  unsigned max_batches;
+  uint64_t after_row_id;
+  int apply;
+  const char *tenant_id;
+  const char *endpoint_id;
+  EdrStorageQueueP0SourceOnlyLatch expected_owner;
+  char expected_inventory_sha256[65];
+} EdrStorageQueueRecoveryRequest;
+typedef struct {
+  unsigned version;
+  int applied;
+  EdrStorageQueueP0SourceOnlyLatch current_owner;
+  char inventory_sha256[65];
+  uint64_t selected_batches;
+  uint64_t selected_bytes;
+  uint64_t projected_batches;
+  uint64_t retained_unresolved;
+  uint64_t legacy_owner_unacknowledged;
+  uint64_t resumed_terminal_frames;
+  uint64_t resumed_projections;
+  uint64_t last_event_row_id;
+  char reason[96];
+} EdrStorageQueueRecoveryReport;
+EdrError edr_storage_queue_recover_v1(const char *absolute_path,
+    const EdrStorageQueueRecoveryRequest *request,
+    EdrStorageQueueRecoveryReport *report);
 
 /* A matched P0 rule that cannot proceed while its owning event family is
  * unhealthy is retained in the queue database before the live record is
@@ -172,6 +210,11 @@ typedef struct {
    * unknown owner as absent; zero is healthy and one is fail-closed. */
   uint64_t owner_metadata_unresolved;
   uint64_t outcome_unknown;
+  /* Per-frame local holds never imply a remote receipt or action completion. */
+  uint64_t policy_held_frames;
+  /* Known final outcome and real combined receipt, source retained locally
+   * without ACK. Excluded from pending action slots; full bytes remain capped. */
+  uint64_t local_retained;
   /* A selected durable frame could not be copied or read for replay because
    * local resources/SQLite were transiently unavailable. The row remains in
    * its pending/ready state and its frame retry counter records the retry. */
@@ -199,6 +242,10 @@ typedef struct {
   /* Durable local diagnostics and policy holds retain their original wires. */
   uint64_t local_evidence_rows;
   uint64_t policy_held_rows;
+  uint64_t legacy_owner_unacknowledged;
+  uint64_t retained_unresolved_rows;
+  uint64_t projection_pending_rows;
+  uint64_t projection_acked_rows;
   uint64_t max_bytes;
   /* The effective finite limit used the default configuration or ignored an
    * invalid/zero environment override; the diagnostic log names the cause. */

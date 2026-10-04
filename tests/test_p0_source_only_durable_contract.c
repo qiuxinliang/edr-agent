@@ -2,6 +2,7 @@
 #include "edr/behavior_alert_emit.h"
 #include "edr/behavior_record.h"
 #include "edr/config.h"
+#include "edr/egress_batch_policy.h"
 #include "edr/p0_rule_direct_emit.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_source_only_contract.h"
@@ -12,6 +13,7 @@
 
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
+#include <pb_encode.h>
 
 #include <assert.h>
 #include <stdint.h>
@@ -456,6 +458,24 @@ static int terminal_record_hits_published_rule(const EdrBehaviorRecord *record) 
   return 0;
 }
 
+/* Test-local journal capture owns the original bytes, as above. This proves
+ * the shared callback contract using a real matched rule/combined codec; the
+ * separate queue tests exercise the actual SQLite journal owner. */
+static unsigned s_intent_authorizations;
+static int terminal_journal_authorize(const EdrEgressP0PairAssociation *intent,
+    const uint8_t *frame,size_t len,void *user) {
+  (void)user; s_intent_authorizations++;
+  int exact=(s_terminal_wire_lens[TERMINAL_INTENT_FRAME]==len+16u &&
+      !memcmp(s_terminal_wires[TERMINAL_INTENT_FRAME]+16u,frame,len)) ||
+    (s_terminal_wire_lens[TERMINAL_COMBINED_FRAME]==len+16u &&
+      !memcmp(s_terminal_wires[TERMINAL_COMBINED_FRAME]+16u,frame,len));
+  return s_terminal_precreated && s_terminal_updated &&
+    exact && edr_egress_p0_intent_matches(intent,s_terminal_wires[TERMINAL_INTENT_FRAME],
+      s_terminal_wire_lens[TERMINAL_INTENT_FRAME]) &&
+    edr_egress_p0_combined_matches(intent,s_terminal_wires[TERMINAL_COMBINED_FRAME],
+      s_terminal_wire_lens[TERMINAL_COMBINED_FRAME]);
+}
+
 static int verify_terminal_fixture(void) {
   EdrBehaviorRecord input;
   EdrPolicyEnforcementResult result;
@@ -512,6 +532,20 @@ static int verify_terminal_fixture(void) {
   }
   edr_policy_enforcement_test_set_execute_hook(NULL);
   s_terminal_capture_active = 0;
+
+  {
+    char reason[128];
+    edr_egress_set_p0_pair_validator(NULL,NULL);
+    if (edr_egress_frame_validate(s_terminal_wires[TERMINAL_INTENT_FRAME]+16u,
+        s_terminal_wire_lens[TERMINAL_INTENT_FRAME]-16u,reason,sizeof(reason))) {
+      fprintf(stderr,"FAIL: terminal intent admitted without durable alert owner\n"); return 0;
+    }
+    if (edr_egress_frame_validate(s_terminal_wires[TERMINAL_COMBINED_FRAME]+16u,
+        s_terminal_wire_lens[TERMINAL_COMBINED_FRAME]-16u,reason,sizeof(reason))) {
+      fprintf(stderr,"FAIL: orphan combined admitted without durable intent owner\n"); return 0;
+    }
+    edr_egress_set_p0_pair_validator(terminal_journal_authorize,NULL);
+  }
 
   for (i = 0u; i < TERMINAL_FIXTURE_FRAMES; ++i) {
     edr_v1_BehaviorEvent decoded = edr_v1_BehaviorEvent_init_zero;
@@ -594,7 +628,65 @@ static int verify_terminal_fixture(void) {
                       "\\\\Device\\\\HarddiskVolume3") != NULL) {
       return 0;
     }
+    {
+      char reason[128];
+      if (edr_egress_batch_has_p0_combined(s_terminal_wires[i],s_terminal_wire_lens[i])!=
+          (i==TERMINAL_COMBINED_FRAME)) {
+        fprintf(stderr,"FAIL: paired terminal classification frame=%zu\n",i); return 0;
+      }
+      int admitted=edr_egress_frame_validate(s_terminal_wires[i]+16u,
+        s_terminal_wire_lens[i]-16u,reason,sizeof(reason));
+      if (admitted!=(i==TERMINAL_COMBINED_FRAME || i==TERMINAL_INTENT_FRAME)) {
+        fprintf(stderr,"FAIL: terminal egress contract frame=%zu reason=%s\n",i,reason);
+        return 0;
+      }
+      if (i==TERMINAL_COMBINED_FRAME) {
+        uint8_t changed[65536]; pb_ostream_t out;
+        /* Numeric JSON birth times must retain exact uint64 identity even
+         * above double precision. Labels and terminal hashes cannot hide a
+         * mismatched generation or an opaque source-evidence subtree. */
+        decoded.process_creation_filetime_100ns++;
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason))) {
+          fprintf(stderr,"FAIL: terminal generation mismatch admitted\n"); return 0;
+        }
+        decoded.process_creation_filetime_100ns--;
+        size_t n=strlen(decoded.ave_result_json);
+        if (!n || decoded.ave_result_json[n-1]!='}' || n+32>=sizeof(decoded.ave_result_json)) return 0;
+        snprintf(decoded.ave_result_json+n-1,sizeof(decoded.ave_result_json)-n+1,
+          ",\"raw_source\":\"synthetic-secret\"}");
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason))) {
+          fprintf(stderr,"FAIL: terminal opaque source context admitted\n"); return 0;
+        }
+      }
+      if (i==TERMINAL_INTENT_FRAME) {
+        uint8_t changed[65536]; pb_ostream_t out;
+        /* A genuine terminal tuple on different source bytes still needs its
+         * exact immutable journal owner; arbitrary context never acquires
+         * permission merely by using the same intent label. */
+        snprintf(decoded.cmdline,sizeof(decoded.cmdline),"synthetic-arbitrary-command");
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason))) {
+          fprintf(stderr,"FAIL: intent with unowned source bytes admitted\n"); return 0;
+        }
+        size_t n=strlen(decoded.ave_result_json); unsigned calls=s_intent_authorizations;
+        if (!n || decoded.ave_result_json[n-1]!='}' || n+32>=sizeof(decoded.ave_result_json)) return 0;
+        snprintf(decoded.ave_result_json+n-1,sizeof(decoded.ave_result_json)-n+1,
+          ",\"raw_source\":\"synthetic-secret\"}");
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason)) ||
+            s_intent_authorizations!=calls) {
+          fprintf(stderr,"FAIL: intent opaque context reached owner or was admitted\n"); return 0;
+        }
+      }
+    }
   }
+  edr_egress_set_p0_pair_validator(NULL,NULL);
   return s_terminal_json_lens[0] > 0u && s_terminal_json_lens[1] > 0u &&
          s_terminal_wire_lens[TERMINAL_COMBINED_FRAME] > 20u;
 }

@@ -6,6 +6,7 @@
 #include "edr/process_generation.h"
 #include "edr/resource.h"
 #include "edr/sha256.h"
+#include "edr/egress_batch_policy.h"
 #include "edr/time_util.h"
 #include "edr/windows_event_policy.h"
 #include "../preprocess/baseline_context.h"
@@ -29,6 +30,8 @@
 
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
+#include "edr/v1/event.pb.h"
+#include <pb_decode.h>
 #include "evidence_context_store.h"
 #include <sys/stat.h>
 #endif
@@ -4681,12 +4684,15 @@ static int sqlite_maintenance(int defer_reclaim) {
   const char *cols[] = {"event_time_ns", "last_seen_ns", "last_seen_ns", "last_seen_ns",
                         "last_seen_ns", "created_ns", "created_ns", "updated_ns"};
   for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
-    char sql[160];
+    char sql[256];
     if (strcmp(tables[i], "p0_candidates") == 0 || strcmp(tables[i], "artifacts") == 0) {
       /* Existing time indexes cover rowid selection without reading wide
        * command/manifest payloads for rows that will survive retention. */
-      snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE rowid IN "
-               "(SELECT rowid FROM %s WHERE %s < ?);", tables[i], tables[i], cols[i]);
+      if (!strcmp(tables[i], "artifacts"))
+        snprintf(sql,sizeof(sql),"DELETE FROM artifacts WHERE created_ns<? AND "
+                 "(COALESCE(artifact_type,'')!='pmfe_followup_local_v1' OR upload_status IN ('completed','expired','conflict'));" );
+      else snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE rowid IN "
+                    "(SELECT rowid FROM %s WHERE %s < ?);", tables[i], tables[i], cols[i]);
     } else {
       snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
     }
@@ -4728,7 +4734,7 @@ static int sqlite_maintenance(int defer_reclaim) {
       }
       if (sqlite_maintenance_delete("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);",
                                    "capacity p0_candidates", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
-      if (sqlite_maintenance_delete("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts ORDER BY created_ns ASC LIMIT 1000);",
+      if (sqlite_maintenance_delete("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts WHERE COALESCE(artifact_type,'')!='pmfe_followup_local_v1' OR upload_status IN ('completed','expired','conflict') ORDER BY created_ns ASC LIMIT 1000);",
                                    "capacity artifacts", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
       int ref_changes = sqlite_evict_context_refs(0, 1000u, &fact_changes);
       if (ref_changes < 0) goto failed;
@@ -4931,6 +4937,527 @@ int edr_local_evidence_cache_save_command_fact(const EdrBehaviorRecord *r, const
   evidence_cache_unlock();
   return rc;
 }
+
+/* PMFE follow-ups use the existing artifacts owner. The original frame is
+ * immutable, generation-bound and hash-verified; a result is authorized only
+ * after its exact final wire is committed, independently of delivery ACK. */
+#define PMFE_ASSOC_TYPE "pmfe_followup_local_v1"
+#define PMFE_ASSOC_CAP 64u
+#define PMFE_ASSOC_TTL_NS (3600LL * 1000000000LL)
+#define PMFE_ASSOC_LEASE_NS (300LL * 1000000000LL)
+
+#if defined(EDR_HAVE_SQLITE)
+static void pmfe_error(unsigned cause,const char *detail) {
+  if (s_status.pmfe_failures!=UINT64_MAX) ++s_status.pmfe_failures;
+  s_status.pmfe_cause_code=cause;
+  set_error(detail);
+}
+static void pmfe_refresh_inventory(EdrEvidenceCacheStatus *status) {
+  sqlite3_stmt *st=NULL;
+  if (!s_db || sqlite3_prepare_v2(s_db,
+      "SELECT upload_status,COUNT(*) FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' GROUP BY upload_status",
+      -1,&st,NULL)!=SQLITE_OK) return;
+  while (sqlite3_step(st)==SQLITE_ROW) {
+    const char *state=(const char *)sqlite3_column_text(st,0);
+    unsigned n=(unsigned)sqlite3_column_int(st,1);
+    if (!state) continue;
+    if (!strcmp(state,"scheduled")) status->pmfe_scheduled=n;
+    else if (!strcmp(state,"running")) status->pmfe_running=n;
+    else if (!strcmp(state,"result_bound")) status->pmfe_result_bound=n;
+    else if (!strcmp(state,"result_acked")) status->pmfe_result_acked=n;
+    else if (!strcmp(state,"expired")) status->pmfe_expired=n;
+    if (strcmp(state,"completed") && strcmp(state,"expired") && strcmp(state,"conflict")) status->pmfe_active+=n;
+  }
+  sqlite3_finalize(st);
+}
+static const char *pmfe_text(const cJSON *root, const char *name) {
+  const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, name);
+  return cJSON_IsString(v) && v->valuestring ? v->valuestring : "";
+}
+static uint64_t pmfe_u64(const cJSON *root, const char *name) {
+  const char *s = pmfe_text(root, name); char *end = NULL;
+  if (!s[0]) return 0u;
+  for (const char *p = s; *p; ++p) if (*p < '0' || *p > '9') return 0u;
+  errno = 0; unsigned long long value = strtoull(s, &end, 10);
+  return errno || !end || *end ? 0u : (uint64_t)value;
+}
+static int pmfe_put_u64(cJSON *root, const char *name, uint64_t value) {
+  char s[32]; snprintf(s, sizeof(s), "%llu", (unsigned long long)value);
+  cJSON_DeleteItemFromObjectCaseSensitive(root, name);
+  return manifest_add_text(root, name, s);
+}
+static char *pmfe_hex(const uint8_t *frame, size_t len) {
+  if (!frame || !len || len > EDR_EGRESS_FRAME_MAX) return NULL;
+  char *s = malloc(2u * len + 1u);
+  if (s) for (size_t i = 0; i < len; ++i) snprintf(s + 2u*i, 3u, "%02x", frame[i]);
+  return s;
+}
+static uint8_t *pmfe_unhex(const char *s, size_t *len) {
+  size_t n = strlen(s); *len = 0u;
+  if (!n || n % 2u || n / 2u > EDR_EGRESS_FRAME_MAX) return NULL;
+  uint8_t *out = malloc(n / 2u); if (!out) return NULL;
+  for (size_t i = 0; i < n; i += 2u) {
+    unsigned byte = 0u;
+    for (size_t j = 0; j < 2u; ++j) {
+      char c = s[i+j]; unsigned v;
+      if (c >= '0' && c <= '9') v = (unsigned)(c-'0');
+      else if (c >= 'a' && c <= 'f') v = (unsigned)(c-'a')+10u;
+      else { free(out); return NULL; }
+      byte = byte * 16u + v;
+    }
+    out[i/2u] = (uint8_t)byte;
+  }
+  *len = n / 2u; return out;
+}
+static int pmfe_key(const char *alert, const char *endpoint, const char *tenant, char key[80]) {
+  if (!alert || !alert[0] || strlen(alert) >= 64u || !endpoint || !endpoint[0] ||
+      strlen(endpoint) >= 48u || !tenant || !tenant[0] || strlen(tenant) >= 64u) return 0;
+  EdrSha256Ctx ctx; uint8_t digest[32]; edr_sha256_init(&ctx);
+  candidate_digest_text(&ctx, tenant); candidate_digest_text(&ctx, endpoint);
+  candidate_digest_text(&ctx, alert); edr_sha256_final(&ctx, digest);
+  memcpy(key, "pmfe:", 5u);
+  for (size_t i = 0; i < 32u; ++i) snprintf(key+5u+2u*i, 3u, "%02x", digest[i]);
+  return 1;
+}
+static int pmfe_original_scope_verified(const cJSON *root,const uint8_t *wire,size_t len) {
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); if (!event) return 0;
+  const cJSON *pid=cJSON_GetObjectItemCaseSensitive(root,"pid");
+  pb_istream_t stream=pb_istream_from_buffer(wire,len);
+  int valid=pb_decode(&stream,edr_v1_BehaviorEvent_fields,event) &&
+      event->type==EDR_EVENT_PROTOCOL_SHELLCODE && cJSON_IsNumber(pid) && pid->valuedouble==event->pid &&
+      event->process_start_key==pmfe_u64(root,"process_start_key") &&
+      event->process_creation_filetime_100ns==pmfe_u64(root,"process_creation_filetime_100ns") &&
+      event->event_time_ns>0 && (uint64_t)event->event_time_ns==pmfe_u64(root,"source_event_time_ns") &&
+      !strcmp(event->endpoint_id,pmfe_text(root,"endpoint_id")) &&
+      !strcmp(event->tenant_id,pmfe_text(root,"tenant_id")) &&
+      !strcmp(event->event_id,pmfe_text(root,"original_event_id"));
+  cJSON *ctx=valid ? cJSON_ParseWithOpts(event->ave_result_json,NULL,1) : NULL;
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  valid=valid && !strcmp(pmfe_text(engine,"alert_id"),pmfe_text(root,"source_alert_id"));
+  cJSON_Delete(ctx); free(event); return valid;
+}
+static int pmfe_result_scope_verified(const cJSON *root,const uint8_t *wire,size_t len) {
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); if (!event) return 0;
+  const cJSON *pid=cJSON_GetObjectItemCaseSensitive(root,"pid");
+  pb_istream_t stream=pb_istream_from_buffer(wire,len);
+  int valid=pb_decode(&stream,edr_v1_BehaviorEvent_fields,event) &&
+      event->type==EDR_EVENT_PMFE_SCAN_RESULT && cJSON_IsNumber(pid) && pid->valuedouble==event->pid &&
+      event->process_start_key==pmfe_u64(root,"process_start_key") &&
+      event->process_creation_filetime_100ns==pmfe_u64(root,"process_creation_filetime_100ns") &&
+      event->event_time_ns>0 && (uint64_t)event->event_time_ns==pmfe_u64(root,"result_event_time_ns") &&
+      !strcmp(event->endpoint_id,pmfe_text(root,"endpoint_id")) &&
+      !strcmp(event->tenant_id,pmfe_text(root,"tenant_id")) &&
+      !strcmp(event->event_id,pmfe_text(root,"result_event_id"));
+  cJSON *ctx=valid ? cJSON_ParseWithOpts(event->ave_result_json,NULL,1) : NULL;
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  valid=valid && !strcmp(pmfe_text(engine,"schema"),"pmfe_result_v1") &&
+      !strcmp(pmfe_text(engine,"detector"),"pmfe") &&
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(engine,"followup_only")) &&
+      !strcmp(pmfe_text(engine,"source_alert_id"),pmfe_text(root,"source_alert_id")) &&
+      !strcmp(pmfe_text(engine,"status"),pmfe_text(root,"result_status")) &&
+      !strcmp(pmfe_text(engine,"verdict"),pmfe_text(root,"result_verdict"));
+  cJSON_Delete(ctx); free(event); return valid;
+}
+static cJSON *pmfe_read_locked(const char *key, char state[32]) {
+  sqlite3_stmt *st = NULL; cJSON *root = NULL; state[0] = 0;
+  if (s_db && sqlite3_prepare_v2(s_db,
+      "SELECT manifest_json,sha256,upload_status FROM artifacts WHERE artifact_id=? AND artifact_type='" PMFE_ASSOC_TYPE "'",
+      -1, &st, NULL) == SQLITE_OK) {
+    bind_text(st, 1, key);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+      const char *json = (const char *)sqlite3_column_text(st, 0);
+      int n = sqlite3_column_bytes(st, 0);
+      root = json && n > 0 && (unsigned)n <= EDR_EVIDENCE_MANIFEST_MAX_BYTES
+          ? cJSON_ParseWithOpts(json, NULL, 1) : NULL;
+      const char *column_hash = (const char *)sqlite3_column_text(st, 1);
+      size_t bytes = 0; char hash[65];
+      uint8_t *wire = pmfe_unhex(pmfe_text(root, "original_wire_hex"), &bytes);
+      if (!cJSON_IsObject(root) || strcmp(pmfe_text(root,"schema"),PMFE_ASSOC_TYPE) ||
+          !wire || edr_sha256_hex(wire, bytes, hash) || !column_hash ||
+          strcmp(hash,column_hash) || strcmp(hash,pmfe_text(root,"original_sha256")) ||
+          !pmfe_original_scope_verified(root,wire,bytes)) {
+        cJSON_Delete(root); root = NULL; pmfe_error(2u,"pmfe association original hash invalid");
+      } else {
+        copy_s(state,32u,(const char *)sqlite3_column_text(st,2));
+        if (!strcmp(state,"result_bound") || !strcmp(state,"result_acked") || !strcmp(state,"completed")) {
+          size_t result_len=0; uint8_t *result=pmfe_unhex(pmfe_text(root,"result_wire_hex"),&result_len);
+          if (!result || edr_sha256_hex(result,result_len,hash) ||
+              strcmp(hash,pmfe_text(root,"result_sha256")) || !pmfe_result_scope_verified(root,result,result_len)) {
+            cJSON_Delete(root); root=NULL; pmfe_error(2u,"pmfe association result hash or binding invalid");
+          }
+          free(result);
+        }
+      }
+      free(wire);
+    }
+  }
+  sqlite3_finalize(st); return root;
+}
+static int pmfe_write_locked(const char *key, cJSON *root, const char *state) {
+  char *json = cJSON_PrintUnformatted(root); sqlite3_stmt *st = NULL; int rc = -1;
+  if (!json || strlen(json) > EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+      exec_sql("PRAGMA synchronous=FULL;") || exec_sql("BEGIN IMMEDIATE;")) goto done;
+  if (sqlite3_prepare_v2(s_db,
+      "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,sha256,manifest_json,created_ns,upload_status)"
+      " VALUES(?,?,?,?,'" PMFE_ASSOC_TYPE "',?,?,?,?) ON CONFLICT(artifact_id) DO UPDATE SET manifest_json=excluded.manifest_json,upload_status=excluded.upload_status",
+      -1,&st,NULL) == SQLITE_OK) {
+    bind_text(st,1,key); bind_text(st,2,pmfe_text(root,"endpoint_id"));
+    bind_text(st,3,pmfe_text(root,"tenant_id")); bind_text(st,4,pmfe_text(root,"original_event_id"));
+    bind_text(st,5,pmfe_text(root,"original_sha256")); bind_text(st,6,json);
+    sqlite3_bind_int64(st,7,(sqlite3_int64)pmfe_u64(root,"created_ns")); bind_text(st,8,state);
+    if (sqlite3_step(st)==SQLITE_DONE && sqlite_commit_candidate_transaction()==0) rc=0;
+    else sqlite_rollback_silent();
+  } else sqlite_rollback_silent();
+done:
+  sqlite3_finalize(st); cJSON_free(json);
+  (void)exec_sql("PRAGMA synchronous=NORMAL;");
+  if (rc) pmfe_error(1u,"pmfe association FULL commit failed");
+  return rc;
+}
+static int pmfe_task_from_root(const cJSON *root, EdrPmfeFollowupTask *t) {
+  memset(t,0,sizeof(*t));
+  const cJSON *pid=cJSON_GetObjectItemCaseSensitive(root,"pid");
+  const cJSON *band=cJSON_GetObjectItemCaseSensitive(root,"band");
+  if (!cJSON_IsNumber(pid) || pid->valuedouble<1 || pid->valuedouble>UINT32_MAX ||
+      (double)(uint32_t)pid->valuedouble!=pid->valuedouble || !cJSON_IsNumber(band) ||
+      band->valuedouble<0 || band->valuedouble>2 ||
+      band->valuedouble!=(double)(uint32_t)band->valuedouble) return 0;
+  t->pid=(uint32_t)pid->valuedouble; t->band=(uint32_t)band->valuedouble;
+  t->process_start_key=pmfe_u64(root,"process_start_key");
+  t->process_creation_filetime_100ns=pmfe_u64(root,"process_creation_filetime_100ns");
+  t->source_event_time_ns=(int64_t)pmfe_u64(root,"source_event_time_ns");
+  t->vad_hint_va=pmfe_u64(root,"vad_hint_va");
+  copy_s(t->source_alert_id,sizeof(t->source_alert_id),pmfe_text(root,"source_alert_id"));
+  copy_s(t->endpoint_id,sizeof(t->endpoint_id),pmfe_text(root,"endpoint_id"));
+  copy_s(t->tenant_id,sizeof(t->tenant_id),pmfe_text(root,"tenant_id"));
+  return t->process_start_key && t->process_creation_filetime_100ns &&
+      t->source_event_time_ns>0 && pmfe_key(t->source_alert_id,t->endpoint_id,t->tenant_id,t->association_id);
+}
+static cJSON *pmfe_result_root_locked(const EdrBehaviorRecord *r, char key[80], char state[32]) {
+  if (!r || r->type!=EDR_EVENT_PMFE_SCAN_RESULT || !r->process_start_key ||
+      !r->process_creation_filetime_100ns || r->event_time_ns<=0) return NULL;
+  cJSON *ctx=cJSON_ParseWithOpts(r->detection_context,NULL,1);
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  const char *status=pmfe_text(engine,"status"), *verdict=pmfe_text(engine,"verdict");
+  int valid=!strcmp(pmfe_text(engine,"schema"),"pmfe_result_v1") &&
+      !strcmp(pmfe_text(engine,"detector"),"pmfe") &&
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(engine,"followup_only")) &&
+      ((!strcmp(status,"completed_clean") && !strcmp(verdict,"clean")) ||
+       ((!strcmp(status,"failed") || !strcmp(status,"partial")) && !strcmp(verdict,"inconclusive")) ||
+       ((!strcmp(status,"completed_suspicious") || !strcmp(status,"partial")) && !strcmp(verdict,"suspicious")));
+  cJSON *root=valid && pmfe_key(pmfe_text(engine,"source_alert_id"),r->endpoint_id,r->tenant_id,key)
+      ? pmfe_read_locked(key,state) : NULL;
+  cJSON_Delete(ctx); EdrPmfeFollowupTask task;
+  if (root && (!pmfe_task_from_root(root,&task) || task.pid!=r->pid ||
+      task.process_start_key!=r->process_start_key || task.process_creation_filetime_100ns!=r->process_creation_filetime_100ns ||
+      r->event_time_ns<task.source_event_time_ns ||
+      (uint64_t)r->event_time_ns>pmfe_u64(root,"expires_ns"))) {
+    cJSON_Delete(root); root=NULL; pmfe_error(4u,"pmfe followup scope/generation/time mismatch");
+  }
+  return root;
+}
+static int pmfe_association_validate(const char *alert, const char *endpoint, const char *tenant,
+    const char *event_id, uint32_t pid, uint64_t start, uint64_t birth, int64_t time_ns,
+    const char *status, const char *verdict, const uint8_t *frame, size_t len, void *user) {
+  (void)user; char key[80],state[32],hash[65]; int valid=0; cJSON *root=NULL;
+  uint8_t *original=NULL; size_t original_len=0;
+  if (!pmfe_key(alert,endpoint,tenant,key) || edr_sha256_hex(frame,len,hash)) return 0;
+  evidence_cache_lock(); root=pmfe_read_locked(key,state); EdrPmfeFollowupTask task;
+  if (root && pmfe_task_from_root(root,&task) && pid==task.pid && start==task.process_start_key &&
+      birth==task.process_creation_filetime_100ns && time_ns>0 &&
+      (uint64_t)time_ns==pmfe_u64(root,"result_event_time_ns") &&
+      !strcmp(event_id,pmfe_text(root,"result_event_id")) &&
+      !strcmp(status,pmfe_text(root,"result_status")) && !strcmp(verdict,pmfe_text(root,"result_verdict")) &&
+      !strcmp(hash,pmfe_text(root,"result_sha256")) &&
+      (!strcmp(state,"result_bound") || !strcmp(state,"result_acked") || !strcmp(state,"completed"))) {
+    original=pmfe_unhex(pmfe_text(root,"original_wire_hex"),&original_len);
+    valid=original!=NULL;
+  }
+  cJSON_Delete(root); evidence_cache_unlock();
+  /* Never recurse into egress while holding the evidence owner mutex. The
+   * original is a positive shellcode detector frame, not another follow-up. */
+  if (valid) valid=edr_egress_frame_validate(original,original_len,NULL,0u);
+  free(original); return valid;
+}
+static int pmfe_frame_matches(const EdrBehaviorRecord *r,const char *alert,const uint8_t *frame,size_t len,int original) {
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); if (!event) return 0;
+  pb_istream_t stream=pb_istream_from_buffer(frame,len);
+  int valid=pb_decode(&stream,edr_v1_BehaviorEvent_fields,event) &&
+      event->type==(int32_t)r->type && event->pid==r->pid &&
+      event->process_start_key==r->process_start_key &&
+      event->process_creation_filetime_100ns==r->process_creation_filetime_100ns &&
+      event->event_time_ns==r->event_time_ns && !strcmp(event->event_id,r->event_id) &&
+      !strcmp(event->endpoint_id,r->endpoint_id) && !strcmp(event->tenant_id,r->tenant_id);
+  cJSON *ctx=valid ? cJSON_ParseWithOpts(event->ave_result_json,NULL,1) : NULL;
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  valid=valid && alert && !strcmp(pmfe_text(engine,original ? "alert_id" : "source_alert_id"),alert);
+  if (!original && valid) {
+    cJSON *record_context=cJSON_ParseWithOpts(r->detection_context,NULL,1);
+    const cJSON *record_engine=cJSON_GetObjectItemCaseSensitive(record_context,"engine_evidence");
+    valid=!strcmp(pmfe_text(engine,"schema"),"pmfe_result_v1") &&
+        !strcmp(pmfe_text(engine,"detector"),"pmfe") &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(engine,"followup_only")) &&
+        !strcmp(pmfe_text(engine,"status"),pmfe_text(record_engine,"status")) &&
+        !strcmp(pmfe_text(engine,"verdict"),pmfe_text(record_engine,"verdict"));
+    cJSON_Delete(record_context);
+  }
+  cJSON_Delete(ctx); free(event); return valid;
+}
+#endif
+
+int edr_local_evidence_cache_pmfe_prepare(const EdrBehaviorRecord *r,
+    const char *alert, const uint8_t *frame, size_t len, uint32_t band, uint64_t hint,
+    EdrPmfeFollowupTask *out) {
+  if (!r || !out || r->type!=EDR_EVENT_PROTOCOL_SHELLCODE || !r->event_id[0] ||
+      !r->pid || !r->process_start_key || !r->process_creation_filetime_100ns ||
+      r->event_time_ns<=0 || band>2u || !frame || !len || len>EDR_EGRESS_FRAME_MAX ||
+      !edr_egress_frame_validate(frame,len,NULL,0u)) return -1;
+  int rc=-1; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char key[80],state[32],hash[65]; cJSON *root=NULL; char *hex=NULL;
+  cJSON *ctx=cJSON_ParseWithOpts(r->detection_context,NULL,1);
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  if (!s_db || !pmfe_frame_matches(r,alert,frame,len,1) || strcmp(pmfe_text(engine,"alert_id"),alert ? alert : "") ||
+      !pmfe_key(alert,r->endpoint_id,r->tenant_id,key) || edr_sha256_hex(frame,len,hash)) goto prepare_done;
+  root=pmfe_read_locked(key,state);
+  if (root) {
+    EdrPmfeFollowupTask existing;
+    if (pmfe_task_from_root(root,&existing) && existing.pid==r->pid &&
+        existing.process_start_key==r->process_start_key && existing.process_creation_filetime_100ns==r->process_creation_filetime_100ns &&
+        !strcmp(hash,pmfe_text(root,"original_sha256")) &&
+        (!strcmp(state,"scheduled") || !strcmp(state,"running") || !strcmp(state,"result_bound") ||
+         !strcmp(state,"result_acked") || !strcmp(state,"completed"))) {
+      *out=existing; rc=(!strcmp(state,"scheduled") || !strcmp(state,"running")) ? 0 : 1;
+    }
+    else { (void)pmfe_write_locked(key,root,"conflict"); pmfe_error(6u,"pmfe original association conflict"); }
+    goto prepare_done;
+  }
+  sqlite3_stmt *st=NULL; unsigned count=PMFE_ASSOC_CAP;
+  /* A corrupt or wrong-type row is still existing evidence. Never replace its
+   * immutable bytes by treating a failed verification as a cache miss. */
+  if (sqlite3_prepare_v2(s_db,"SELECT 1 FROM artifacts WHERE artifact_id=?",-1,&st,NULL)!=SQLITE_OK) {
+    pmfe_error(1u,"pmfe association existence query failed"); goto prepare_done;
+  }
+  bind_text(st,1,key); int exists=sqlite3_step(st);
+  sqlite3_finalize(st); st=NULL;
+  if (exists!=SQLITE_DONE) {
+    pmfe_error(exists==SQLITE_ROW ? 2u : 1u,
+        exists==SQLITE_ROW ? "pmfe existing association is corrupt or has wrong owner" : "pmfe association existence read failed");
+    goto prepare_done;
+  }
+  if (sqlite3_prepare_v2(s_db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' AND COALESCE(upload_status,'') NOT IN ('completed','expired','conflict')",-1,&st,NULL)==SQLITE_OK && sqlite3_step(st)==SQLITE_ROW)
+    count=(unsigned)sqlite3_column_int(st,0);
+  sqlite3_finalize(st);
+  if (count>=PMFE_ASSOC_CAP || !sqlite_size_budget_allow()) { pmfe_error(3u,"pmfe association capacity exhausted"); goto prepare_done; }
+  root=cJSON_CreateObject(); hex=pmfe_hex(frame,len); uint64_t now=(uint64_t)now_unix_ns();
+  if (!root || !hex || !manifest_add_text(root,"schema",PMFE_ASSOC_TYPE) ||
+      !manifest_add_text(root,"source_alert_id",alert) || !manifest_add_text(root,"original_event_id",r->event_id) ||
+      !manifest_add_text(root,"endpoint_id",r->endpoint_id) || !manifest_add_text(root,"tenant_id",r->tenant_id) ||
+      !manifest_add_text(root,"original_sha256",hash) || !manifest_add_text(root,"original_wire_hex",hex) ||
+      !cJSON_AddNumberToObject(root,"pid",r->pid) || !cJSON_AddNumberToObject(root,"band",band) ||
+      !pmfe_put_u64(root,"process_start_key",r->process_start_key) ||
+      !pmfe_put_u64(root,"process_creation_filetime_100ns",r->process_creation_filetime_100ns) ||
+      !pmfe_put_u64(root,"source_event_time_ns",(uint64_t)r->event_time_ns) ||
+      !pmfe_put_u64(root,"vad_hint_va",hint) || !pmfe_put_u64(root,"created_ns",now) ||
+      !pmfe_put_u64(root,"expires_ns",now+PMFE_ASSOC_TTL_NS) || !pmfe_put_u64(root,"attempts",0u) ||
+      !pmfe_put_u64(root,"retry_after_ns",0u)) goto prepare_done;
+  if (pmfe_write_locked(key,root,"scheduled")==0 && pmfe_task_from_root(root,out)) rc=0;
+prepare_done:
+  cJSON_Delete(root); cJSON_Delete(ctx); free(hex);
+#else
+  (void)alert; (void)hint;
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_apply_scope(EdrBehaviorRecord *r) {
+  if (!r || r->type!=EDR_EVENT_PMFE_SCAN_RESULT) return 0;
+  int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  /* association_id is only a lookup hint from the worker's typed task. It
+   * supplies no egress authority; final-wire binding remains mandatory. */
+  const char *p=strstr(r->script_snippet,"pmfe_association_id=");
+  char key[80],state[32]; size_t n=0;
+  if (p) {
+    p+=strlen("pmfe_association_id=");
+    while (p[n] && p[n]!=' ' && p[n]!='\n' && n+1u<sizeof(key)) { key[n]=p[n]; ++n; }
+    key[n]=0;
+    cJSON *root=pmfe_read_locked(key,state); EdrPmfeFollowupTask task;
+    if (root && pmfe_task_from_root(root,&task) && !strcmp(task.association_id,key) &&
+        task.pid==r->pid && task.process_start_key==r->process_start_key &&
+        task.process_creation_filetime_100ns==r->process_creation_filetime_100ns) {
+      copy_s(r->endpoint_id,sizeof(r->endpoint_id),task.endpoint_id);
+      copy_s(r->tenant_id,sizeof(r->tenant_id),task.tenant_id); rc=1;
+    }
+    cJSON_Delete(root);
+  }
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_result_pending(const EdrBehaviorRecord *r) {
+  int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char key[80],state[32]; cJSON *root=pmfe_result_root_locked(r,key,state);
+  rc=root && (!strcmp(state,"scheduled") || !strcmp(state,"running") || !strcmp(state,"result_bound"));
+  cJSON_Delete(root);
+#else
+  (void)r;
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_bind_result(const EdrBehaviorRecord *r, const uint8_t *frame, size_t len) {
+  if (!frame || !len || len>EDR_EGRESS_FRAME_MAX) return -1;
+  int rc=-1; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char key[80],state[32],hash[65]; cJSON *root=pmfe_result_root_locked(r,key,state); char *hex=NULL;
+  if (root && pmfe_frame_matches(r,pmfe_text(root,"source_alert_id"),frame,len,0) && !edr_sha256_hex(frame,len,hash)) {
+    if (!strcmp(state,"result_bound") || !strcmp(state,"result_acked") || !strcmp(state,"completed")) {
+      rc=!strcmp(hash,pmfe_text(root,"result_sha256")) ? 0 : -1;
+      if (rc) pmfe_error(6u,"pmfe conflicting result rejected; original immutable result retained");
+    } else if ((!strcmp(state,"scheduled") || !strcmp(state,"running")) &&
+               (uint64_t)now_unix_ns()<=pmfe_u64(root,"expires_ns") && sqlite_size_budget_allow()) {
+      cJSON *ctx=cJSON_Parse(r->detection_context);
+      const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence"); hex=pmfe_hex(frame,len);
+      if (hex && manifest_add_text(root,"result_event_id",r->event_id) &&
+          manifest_add_text(root,"result_sha256",hash) && manifest_add_text(root,"result_wire_hex",hex) &&
+          manifest_add_text(root,"result_status",pmfe_text(engine,"status")) &&
+          manifest_add_text(root,"result_verdict",pmfe_text(engine,"verdict")) &&
+          pmfe_put_u64(root,"result_event_time_ns",(uint64_t)r->event_time_ns) &&
+          pmfe_put_u64(root,"retry_after_ns",0u)) rc=pmfe_write_locked(key,root,"result_bound");
+      cJSON_Delete(ctx);
+    }
+  }
+  free(hex); cJSON_Delete(root);
+#else
+  (void)r;
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_take_task(EdrPmfeFollowupTask *out) {
+  if (!out) return 0; int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  sqlite3_stmt *st=NULL; char key[80]="";
+  if (s_db && sqlite3_prepare_v2(s_db,"SELECT artifact_id FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' AND upload_status IN ('scheduled','running') ORDER BY created_ns LIMIT 64",-1,&st,NULL)==SQLITE_OK) {
+    while (sqlite3_step(st)==SQLITE_ROW) {
+      char state[32]; copy_s(key,sizeof(key),(const char *)sqlite3_column_text(st,0));
+      cJSON *root=pmfe_read_locked(key,state); uint64_t now=(uint64_t)now_unix_ns();
+      if (root && (now>pmfe_u64(root,"expires_ns") ||
+          (pmfe_u64(root,"attempts")>=3u && (!strcmp(state,"scheduled") || now>=pmfe_u64(root,"retry_after_ns"))))) {
+        if (pmfe_write_locked(key,root,"expired")==0) pmfe_error(5u,"pmfe followup scan expired or retry budget exhausted");
+      } else if (root && pmfe_u64(root,"attempts")<3u && (!strcmp(state,"scheduled") || now>=pmfe_u64(root,"retry_after_ns")) && pmfe_task_from_root(root,out) &&
+          pmfe_put_u64(root,"attempts",pmfe_u64(root,"attempts")+1u) &&
+          pmfe_put_u64(root,"retry_after_ns",now+PMFE_ASSOC_LEASE_NS) && pmfe_write_locked(key,root,"running")==0) rc=1;
+      cJSON_Delete(root); if (rc) break;
+    }
+  }
+  sqlite3_finalize(st);
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_replay_result(uint8_t **frame,size_t *length) {
+  if (!frame || !length) return 0; *frame=NULL; *length=0; int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  sqlite3_stmt *st=NULL;
+  if (s_db && sqlite3_prepare_v2(s_db,"SELECT artifact_id FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' AND upload_status IN ('result_bound','result_acked') ORDER BY created_ns LIMIT 64",-1,&st,NULL)==SQLITE_OK) {
+    while (sqlite3_step(st)==SQLITE_ROW) {
+      char key[80],state[32],hash[65]; copy_s(key,sizeof(key),(const char *)sqlite3_column_text(st,0));
+      cJSON *root=pmfe_read_locked(key,state); uint64_t now=(uint64_t)now_unix_ns();
+      if (root && now>=pmfe_u64(root,"retry_after_ns")) {
+        *frame=pmfe_unhex(pmfe_text(root,"result_wire_hex"),length);
+        if (*frame && !edr_sha256_hex(*frame,*length,hash) && !strcmp(hash,pmfe_text(root,"result_sha256")) &&
+            pmfe_put_u64(root,"retry_after_ns",now+30000000000ULL) && pmfe_write_locked(key,root,state)==0) rc=!strcmp(state,"result_acked") ? 2 : 1;
+        if (!rc) { free(*frame); *frame=NULL; *length=0; }
+      }
+      cJSON_Delete(root); if (rc) break;
+    }
+  }
+  sqlite3_finalize(st);
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+void edr_local_evidence_cache_pmfe_note_submit_failure(const EdrPmfeFollowupTask *task) {
+  if (!task) return;
+  evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char state[32]; cJSON *root=pmfe_read_locked(task->association_id,state);
+  EdrPmfeFollowupTask retained;
+  if (root && !strcmp(state,"running") && pmfe_task_from_root(root,&retained) &&
+      retained.pid==task->pid && retained.process_start_key==task->process_start_key &&
+      retained.process_creation_filetime_100ns==task->process_creation_filetime_100ns)
+    pmfe_error(7u,"pmfe worker admission unavailable; bounded scan lease retained");
+  cJSON_Delete(root);
+#endif
+  evidence_cache_unlock();
+}
+
+int edr_local_evidence_cache_pmfe_ack_frame(const uint8_t *frame,size_t len) {
+  if (!frame || !len || len>EDR_EGRESS_FRAME_MAX) return -1;
+  int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char hash[65]; sqlite3_stmt *st=NULL;
+  if (edr_sha256_hex(frame,len,hash)) rc=-1;
+  else if (s_db && sqlite3_prepare_v2(s_db,"SELECT artifact_id FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' AND upload_status IN ('result_bound','result_acked','completed')",-1,&st,NULL)==SQLITE_OK) {
+    while (sqlite3_step(st)==SQLITE_ROW) {
+      char key[80],state[32]; copy_s(key,sizeof(key),(const char *)sqlite3_column_text(st,0));
+      cJSON *root=pmfe_read_locked(key,state);
+      if (root && !strcmp(hash,pmfe_text(root,"result_sha256"))) {
+        rc=(!strcmp(state,"result_acked") || !strcmp(state,"completed")) ? 1 :
+            (pmfe_write_locked(key,root,"result_acked")==0 ? 1 : -1);
+        cJSON_Delete(root); break;
+      }
+      cJSON_Delete(root);
+    }
+  } else if (s_db) rc=-1;
+  sqlite3_finalize(st);
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+int edr_local_evidence_cache_pmfe_queue_removed(const uint8_t *frame,size_t len) {
+  int rc=0; evidence_cache_lock();
+#if defined(EDR_HAVE_SQLITE)
+  char hash[65]; sqlite3_stmt *st=NULL;
+  if (!frame || !len || len>EDR_EGRESS_FRAME_MAX || edr_sha256_hex(frame,len,hash)) rc=-1;
+  else if (s_db && sqlite3_prepare_v2(s_db,"SELECT artifact_id FROM artifacts WHERE artifact_type='" PMFE_ASSOC_TYPE "' AND upload_status IN ('result_bound','result_acked','completed')",-1,&st,NULL)==SQLITE_OK) {
+    while (sqlite3_step(st)==SQLITE_ROW) {
+      char key[80],state[32]; copy_s(key,sizeof(key),(const char *)sqlite3_column_text(st,0));
+      cJSON *root=pmfe_read_locked(key,state);
+      if (root && !strcmp(hash,pmfe_text(root,"result_sha256"))) {
+        rc=!strcmp(state,"completed") ? 1 : !strcmp(state,"result_acked")
+            ? (pmfe_write_locked(key,root,"completed")==0 ? 1 : -1) : -1;
+        cJSON_Delete(root); break;
+      }
+      cJSON_Delete(root);
+    }
+  } else if (s_db) rc=-1;
+  sqlite3_finalize(st);
+#else
+  (void)frame; (void)len;
+#endif
+  evidence_cache_unlock(); return rc;
+}
+
+#if defined(EDR_HAVE_SQLITE)
+static int pmfe_receipt_handler(const char *alert,const char *endpoint,const char *tenant,
+    const char *event_id,uint32_t pid,uint64_t start,uint64_t birth,int64_t event_ns,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  (void)alert; (void)endpoint; (void)tenant; (void)event_id; (void)pid; (void)start;
+  (void)birth; (void)event_ns; (void)status; (void)verdict; (void)user;
+  return edr_local_evidence_cache_pmfe_ack_frame(frame,len);
+}
+static int pmfe_queue_removed_handler(const char *alert,const char *endpoint,const char *tenant,
+    const char *event_id,uint32_t pid,uint64_t start,uint64_t birth,int64_t event_ns,
+    const char *status,const char *verdict,const uint8_t *frame,size_t len,void *user) {
+  (void)alert; (void)endpoint; (void)tenant; (void)event_id; (void)pid; (void)start;
+  (void)birth; (void)event_ns; (void)status; (void)verdict; (void)user;
+  return edr_local_evidence_cache_pmfe_queue_removed(frame,len);
+}
+#endif
 
 char *edr_local_evidence_cache_read_command_fact(const EdrBehaviorRecord *r) {
   char *result = NULL;
@@ -5183,7 +5710,11 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     return -1;
   }
   sqlite_maintenance(0);
+  (void)exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';");
   evidence_cache_unlock();
+  edr_egress_set_pmfe_association_validator(pmfe_association_validate,NULL);
+  edr_egress_set_pmfe_receipt_handler(pmfe_receipt_handler,NULL);
+  edr_egress_set_pmfe_queue_removed_handler(pmfe_queue_removed_handler,NULL);
   return 0;
 #else
   (void)path;
@@ -5194,6 +5725,9 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
 }
 
 void edr_local_evidence_cache_close(void) {
+  edr_egress_set_pmfe_association_validator(NULL,NULL);
+  edr_egress_set_pmfe_receipt_handler(NULL,NULL);
+  edr_egress_set_pmfe_queue_removed_handler(NULL,NULL);
   evidence_cache_lock();
   evidence_cache_close_locked();
   evidence_cache_unlock();
@@ -6238,6 +6772,7 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   st.db_utilization_bps = utilization_bps(st.db_bytes + st.wal_bytes,
                                           (uint64_t)st.max_db_mb * 1024ULL * 1024ULL);
   refresh_candidate_inventory_status(&st);
+  pmfe_refresh_inventory(&st);
 #endif
   *out = st;
   evidence_cache_unlock();
@@ -7167,8 +7702,12 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
                     st->context_failure_reasons, EDR_EVIDENCE_FAILURE_REASON_COUNT);
   int written = snprintf(out, cap,
       "{\"scope\":\"current_process\",\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
-      "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s}",
-      ordinary_reasons, candidate_failures, context_failures);
+      "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s,"
+      "\"pmfe_followup\":{\"scheduled\":%u,\"running\":%u,\"result_bound\":%u,\"result_acked_await_queue\":%u,"
+      "\"active\":%u,\"expired\":%u,\"capacity\":64,\"failures\":%llu,\"cause_code\":%u}}",
+      ordinary_reasons, candidate_failures, context_failures,
+      st->pmfe_scheduled,st->pmfe_running,st->pmfe_result_bound,st->pmfe_result_acked,
+      st->pmfe_active,st->pmfe_expired,(unsigned long long)st->pmfe_failures,st->pmfe_cause_code);
   if (written < 0 || (size_t)written >= cap) { out[0] = '\0'; return -1; }
   return 0;
 }

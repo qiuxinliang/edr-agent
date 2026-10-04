@@ -35,6 +35,83 @@ static uint64_t dc_monotonic_ms(void) {
 #endif
 }
 
+/* Child collectors share the local-only forensic contract.  Validate before
+ * resolving/downloading binaries, and use the same bounded tokens on POSIX. */
+typedef struct DcLocalArgs {
+  char text[2048];
+  char *tokens[16];
+  size_t count;
+} DcLocalArgs;
+
+static int dc_local_path(const char *path) {
+  if (!path || !path[0] || strlen(path) >= 1024u || strstr(path, "://") ||
+      !strncmp(path, "//", 2u) || !strncmp(path, "\\\\", 2u)) return 0;
+  for (const unsigned char *p = (const unsigned char *)path; *p; ++p)
+    if (*p < 0x20u || *p == 0x7fu || *p == '"') return 0;
+#ifdef _WIN32
+  /* A trailing backslash would escape the enclosing command-line quote. */
+  if (path[strlen(path) - 1u] == '\\') return 0;
+#endif
+  return 1;
+}
+
+static int dc_positive_number(const char *s, unsigned long maximum) {
+  unsigned long n = 0;
+  if (!s || !*s) return 0;
+  for (; *s; ++s) {
+    if (*s < '0' || *s > '9' || n > (maximum - (unsigned)(*s - '0')) / 10u) return 0;
+    n = n * 10u + (unsigned)(*s - '0');
+  }
+  return n > 0 && n <= maximum;
+}
+
+static int dc_local_arguments(const char *scope, const char *output_dir,
+                              const char *extra, DcLocalArgs *args,
+                              char *detail, size_t detail_cap) {
+  unsigned seen = 0;
+  memset(args, 0, sizeof(*args));
+  if (!scope || !scope[0] || strlen(scope) >= 80u ||
+      !dc_local_path(output_dir ? output_dir : ".")) goto denied;
+  for (const unsigned char *p = (const unsigned char *)scope; *p; ++p)
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) goto denied;
+  if (!extra || !*extra) return 1;
+  if (strlen(extra) >= sizeof(args->text)) goto denied;
+  char *out = args->text;
+  const char *in = extra;
+  while (*in) {
+    while (*in == ' ' || *in == '\t') ++in;
+    if (!*in) break;
+    if (args->count >= sizeof(args->tokens) / sizeof(args->tokens[0])) goto denied;
+    args->tokens[args->count++] = out;
+    int quoted = 0;
+    while (*in && (quoted || (*in != ' ' && *in != '\t'))) {
+      if (*in == '"') {
+        if (in > extra && in[-1] == '\\') goto denied;
+        quoted = !quoted; ++in; continue;
+      }
+      if ((unsigned char)*in < 0x20u || (unsigned char)*in == 0x7fu) goto denied;
+      *out++ = *in++;
+    }
+    if (quoted) goto denied;
+    *out++ = '\0';
+    const char *token = args->tokens[args->count - 1u];
+    unsigned bit = 0;
+    if (!strcmp(token, "--mode=query")) bit = 1u;
+    else if (!strncmp(token, "--request=", 10u) && dc_local_path(token + 10u)) bit = 2u;
+    else if (!strncmp(token, "--out-file=", 11u) && dc_local_path(token + 11u)) bit = 4u;
+    else if (!strncmp(token, "--limit=", 8u) && dc_positive_number(token + 8u, 5000u)) bit = 8u;
+    else if (!strncmp(token, "--pid=", 6u) && dc_positive_number(token + 6u, 0xfffffffful)) bit = 16u;
+    else if (!strcmp(token, "--full")) bit = 32u;
+    if (!bit || (seen & bit)) goto denied;
+    seen |= bit;
+  }
+  return 1;
+denied:
+  if (detail && detail_cap) snprintf(detail, detail_cap, "collector_arguments_purpose_denied");
+  return 0;
+}
+
 /* P3:下载 + SHA256 验签的平台无关辅助(放在平台分支之前,两端共用)。 */
 
 /* 计算文件 SHA256(十六进制,小写)。成功返回 0。大文件分块读。 */
@@ -1223,6 +1300,11 @@ static void dc_async_stderr_cleanup(void) {
 
 int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   if (!params) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if ((params->upload_url && params->upload_url[0]) ||
+      !dc_local_arguments(params->scope ? params->scope : "standard",
+                          params->output_dir ? params->output_dir : ".",
+                          NULL, &local_args, NULL, 0u)) return EDR_DC_ERR_DISABLED;
 
   if (g_collector_process) {
     DWORD ec = 0;
@@ -1374,9 +1456,10 @@ int edr_deep_collector_is_running(void) {
 int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_detail,
                                     size_t detail_cap) {
   if (out_detail && detail_cap) out_detail[0] = '\0';
-  if (!spec || !spec->scope || !spec->scope[0]) {
-    return EDR_DC_ERR_DISABLED;
-  }
+  if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if (!dc_local_arguments(spec->scope, spec->output_dir, spec->extra_args,
+                          &local_args, out_detail, detail_cap)) return EDR_DC_ERR_DISABLED;
   char binpath[1024];
   int vr = dc_resolve_verify(spec->collector_bin,
                              "C:\\Program Files\\FDSecurity\\collector\\forensic_collector.exe",
@@ -1395,9 +1478,13 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
 
   /* NOTE: 通信硬约束 — 不拼 --upload-url;collector 只写本地 output-dir。 */
   char cmdline[2048];
-  snprintf(cmdline, sizeof(cmdline),
+  int cmdline_len = snprintf(cmdline, sizeof(cmdline),
            "\"%s\" --scope=\"%s\" --output-dir=\"%s\" --timeout=%u %s", bin, spec->scope,
            spec->output_dir ? spec->output_dir : ".", to, spec->extra_args ? spec->extra_args : "");
+  if (cmdline_len < 0 || (size_t)cmdline_len >= sizeof(cmdline)) {
+    if (out_detail && detail_cap) snprintf(out_detail, detail_cap, "collector command line exceeds limit");
+    return EDR_DC_ERR_SPAWN;
+  }
 
   HANDLE job = CreateJobObject(NULL, NULL);
   if (!job) {
@@ -1540,6 +1627,9 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
 int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap) {
   if (out_detail && detail_cap) out_detail[0] = '\0';
   if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if (!dc_local_arguments(spec->scope, spec->output_dir, spec->extra_args,
+                          &local_args, out_detail, detail_cap)) return EDR_DC_ERR_DISABLED;
 
   /* 单槽:已有采集在跑则忙。 */
   if (g_collector_process) {
@@ -1714,6 +1804,11 @@ static const char *find_collector_bin(void) {
 
 int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   if (!params) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if ((params->upload_url && params->upload_url[0]) ||
+      !dc_local_arguments(params->scope ? params->scope : "standard",
+                          params->output_dir ? params->output_dir : ".",
+                          NULL, &local_args, NULL, 0u)) return EDR_DC_ERR_DISABLED;
 
   if (g_collector_pid && g_running) {
     int st = 0;
@@ -1733,7 +1828,7 @@ int edr_deep_collector_launch(const EdrDeepCollectorParams *params) {
   }
 
   if (pid == 0) {
-    char scope_str[32];
+    char scope_str[80];
     snprintf(scope_str, sizeof(scope_str), "%s", params->scope ? params->scope : "standard");
 
     char timeout_str[32];
@@ -1823,9 +1918,10 @@ int edr_deep_collector_is_running(void) {
 int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_detail,
                                     size_t detail_cap) {
   if (out_detail && detail_cap) out_detail[0] = '\0';
-  if (!spec || !spec->scope || !spec->scope[0]) {
-    return EDR_DC_ERR_DISABLED;
-  }
+  if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if (!dc_local_arguments(spec->scope, spec->output_dir, spec->extra_args,
+                          &local_args, out_detail, detail_cap)) return EDR_DC_ERR_DISABLED;
   char binpath[1024];
   int vr = dc_resolve_verify(spec->collector_bin, find_collector_bin(),
                              spec->fixed_local_binary, binpath, sizeof(binpath),
@@ -1852,31 +1948,24 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
   }
   if (pid == 0) {
     dc_child_prepare_limits();
-    /* child:组装 argv(不含 --upload-url),透传 extra_args(空格分词) */
+    /* Only validated local tokens reach execv; quoted paths remain intact. */
     int efd = open(errpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (efd >= 0) {
       dup2(efd, 1);
       dup2(efd, 2);
       if (efd > 2) close(efd);
     }
-    char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
+    char scope_buf[80], out_buf[1100], to_buf[40];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
     snprintf(to_buf, sizeof(to_buf), "--timeout=%u", to);
-    extra[0] = '\0';
-    if (spec->extra_args) snprintf(extra, sizeof(extra), "%s", spec->extra_args);
     char *argv[32];
     int ai = 0;
     argv[ai++] = (char *)bin;
     argv[ai++] = scope_buf;
     argv[ai++] = out_buf;
     argv[ai++] = to_buf;
-    char *save = NULL;
-    char *tok = strtok_r(extra, " ", &save);
-    while (tok && ai < 31) {
-      argv[ai++] = tok;
-      tok = strtok_r(NULL, " ", &save);
-    }
+    for (size_t i = 0; i < local_args.count; ++i) argv[ai++] = local_args.tokens[i];
     argv[ai] = NULL;
     execv(bin, argv);
     _exit(127);
@@ -1927,6 +2016,9 @@ int edr_deep_collector_run_blocking(const EdrCollectorRunSpec *spec, char *out_d
 int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, size_t detail_cap) {
   if (out_detail && detail_cap) out_detail[0] = '\0';
   if (!spec || !spec->scope || !spec->scope[0]) return EDR_DC_ERR_DISABLED;
+  DcLocalArgs local_args;
+  if (!dc_local_arguments(spec->scope, spec->output_dir, spec->extra_args,
+                          &local_args, out_detail, detail_cap)) return EDR_DC_ERR_DISABLED;
 
   /* 单槽:已有采集在跑则忙。 */
   if (g_collector_pid && g_running) {
@@ -1961,21 +2053,17 @@ int edr_deep_collector_spawn(const EdrCollectorRunSpec *spec, char *out_detail, 
   }
   if (pid == 0) {
     dc_child_prepare_limits();
-    char scope_buf[80], out_buf[1024], to_buf[40], extra[2048];
+    char scope_buf[80], out_buf[1100], to_buf[40];
     snprintf(scope_buf, sizeof(scope_buf), "--scope=%s", spec->scope);
     snprintf(out_buf, sizeof(out_buf), "--output-dir=%s", spec->output_dir ? spec->output_dir : ".");
     snprintf(to_buf, sizeof(to_buf), "--timeout=%u", to);
-    extra[0] = '\0';
-    if (spec->extra_args) snprintf(extra, sizeof(extra), "%s", spec->extra_args);
     char *argv[32];
     int ai = 0;
     argv[ai++] = (char *)binpath;
     argv[ai++] = scope_buf;
     argv[ai++] = out_buf;
     argv[ai++] = to_buf;
-    char *save = NULL;
-    char *tok = strtok_r(extra, " ", &save);
-    while (tok && ai < 31) { argv[ai++] = tok; tok = strtok_r(NULL, " ", &save); }
+    for (size_t i = 0; i < local_args.count; ++i) argv[ai++] = local_args.tokens[i];
     argv[ai] = NULL;
     execv(binpath, argv);
     _exit(127);

@@ -541,6 +541,7 @@ set(EDR_AGENT_SOURCES
   src/transport/transport_v2.c
   src/transport/transport_stub.c
   src/storage/queue_sqlite.c
+  src/storage/queue_maintenance.c
   src/storage/local_evidence_cache.c
   src/storage/evidence_context_store.c
   src/storage/evidence_cache_migration.c
@@ -915,10 +916,13 @@ endif()
 # One policy owner is linked by the agent and by isolated transport tests.
 # Keep parsers shared with the existing wire contract; no new dependency.
 add_library(edr_egress_policy STATIC
+  src/preprocess/p0_terminal_identity.c
+  src/command/sha256.c
   src/transport/egress_batch_policy.c
   src/transport/egress_request_policy.c
   src/proto/edr/v1/event.pb.c
   third_party/nanopb/pb_common.c
+  third_party/nanopb/pb_encode.c
   third_party/nanopb/pb_decode.c
   third_party/cjson/cJSON.c
   third_party/lz4/lz4.c)
