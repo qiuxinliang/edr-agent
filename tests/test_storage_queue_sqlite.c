@@ -2,6 +2,7 @@
 #include "edr/sha256.h"
 #include "edr/report_events_ack.h"
 #include "edr/storage_queue.h"
+#include "edr/egress_batch_policy.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -14,6 +15,9 @@
 #include <time.h>
 
 #include <sqlite3.h>
+
+/* Test-only inventory fault; no production API or runtime switch. */
+void edr_storage_queue_test_fail_source_owner_inventory_reads(unsigned count);
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -49,6 +53,17 @@ static void test_sleep_ms(unsigned milliseconds) {
 #endif
 }
 
+static int s_policy_reject_value = -1;
+/* Queue state tests isolate the semantic codec; the real-codec acceptance
+ * matrix is test_egress_batch_policy. Rejection here drives durable states. */
+int edr_egress_batch_validate(const uint8_t *header, size_t header_len,
+    const uint8_t *payload, size_t payload_len, char *reason, size_t reason_cap) {
+  (void)header; (void)header_len;
+  int accepted = !(payload && payload_len >= 5u && payload[4] == s_policy_reject_value);
+  if (reason && reason_cap) snprintf(reason, reason_cap, "%s",
+                                     accepted ? "eligible" : "synthetic_policy_rejected");
+  return accepted;
+}
 static int s_send_ok;
 static int s_configured = 1;
 static int s_circuit_open;
@@ -2264,24 +2279,42 @@ static void test_queue_and_terminal_metric_denominators(void) {
   assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
 }
 
-static void test_unbounded_queue_reports_no_utilization_percentage(void) {
+static int batch_retained_exact(const char *path, const char *batch_id,
+                                const char *status, const uint8_t *wire, size_t len);
+
+static void test_zero_or_invalid_limit_remains_finite(void) {
   char path[256];
   uint8_t wire[20];
   EdrStorageQueueCapacityMetrics metrics;
-  snprintf(path, sizeof(path), "edr-storage-queue-unbounded-%ld.db", (long)TEST_PID);
+  const char *invalid[] = {"0", "not-a-number", "1suffix", "999999", "-1"};
+  snprintf(path, sizeof(path), "edr-storage-queue-default-cap-%ld.db", (long)TEST_PID);
   (void)remove(path);
   assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  edr_storage_queue_configure(0u, 0u);
   make_wire(wire, 0xf4u);
   assert(edr_storage_queue_open(path) == EDR_OK);
-  assert(edr_storage_queue_enqueue("unbounded", wire, sizeof(wire), 0,
+  assert(edr_storage_queue_enqueue("finite-default", wire, sizeof(wire), 0,
                                    EDR_STORAGE_QUEUE_SEVERITY_ORDINARY) == EDR_OK);
   edr_storage_queue_get_capacity_metrics(&metrics);
   assert(metrics.accounting_available == 1u);
-  assert(metrics.max_bytes == 0u);
-  /* max_bytes=0 means capacity is disabled, not a 0% full bounded queue. */
-  assert(metrics.utilization_bps == 0u);
+  assert(metrics.max_bytes == 512u * 1024u * 1024u);
+  assert(metrics.capacity_limit_defaulted == 1u);
   assert(metrics.pending_rows == 1u && metrics.oldest_pending_created_unix_s > 0u);
   edr_storage_queue_close();
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    assert(test_setenv("EDR_QUEUE_MAX_DB_MB", invalid[i]) == 0);
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    edr_storage_queue_get_capacity_metrics(&metrics);
+    assert(metrics.max_bytes == 512u * 1024u * 1024u && metrics.capacity_limit_defaulted == 1u);
+    assert(batch_retained_exact(path, "finite-default", "pending", wire, sizeof(wire)));
+    edr_storage_queue_close();
+  }
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.max_bytes == 1024u * 1024u && metrics.capacity_limit_defaulted == 0u);
+  edr_storage_queue_close();
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
   (void)remove(path);
 }
 
@@ -2495,8 +2528,8 @@ static void test_retention_runs_while_transport_circuit_is_open(void) {
   reset_send_state(1); s_circuit_open = 1;
   edr_storage_queue_poll_drain();
   assert(total_send_calls() == 0u);
-  assert(batch_row_id(path, "old-ordinary") < 0);
-  assert(status_count(path, "dead_letter") == 1);
+  assert(batch_row_id(path, "old-ordinary") > 0);
+  assert(status_count(path, "dead_letter") == 2);
   assert(queue_batch_pending(path, "old-source"));
   edr_storage_queue_get_capacity_metrics(&metrics);
   assert(metrics.retained_nonpending_bytes > 0u);
@@ -2999,6 +3032,245 @@ static void test_p0_deferred_retained_payload_cap(void) {
   (void)remove(path);
 }
 
+static int batch_retained_exact(const char *path, const char *batch_id,
+                                const char *status, const uint8_t *wire, size_t len) {
+  sqlite3 *db = NULL; sqlite3_stmt *st = NULL; int ok = 0;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT status,payload FROM event_queue WHERE batch_id=?;",
+                           -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, batch_id, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *actual = (const char *)sqlite3_column_text(st, 0);
+    const void *body = sqlite3_column_blob(st, 1);
+    ok = actual && !strcmp(actual, status) && body &&
+         sqlite3_column_bytes(st, 1) == (int)len && !memcmp(body, wire, len);
+  }
+  sqlite3_finalize(st); sqlite3_close(db); return ok;
+}
+
+static void test_local_v3_source_evidence_is_not_remote_ack(void) {
+  char path[256]; uint8_t wire[20], different[20];
+  EdrStorageQueueP0SourceOnlyLatch latch, current, wrong;
+  EdrStorageQueueCapacityMetrics metrics, before;
+  snprintf(path, sizeof(path), "edr-local-v3-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(wire, 0x91u); make_wire(different, 0x92u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&before);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+  assert(latch.owner_version == 3u && latch.latched);
+  wrong = latch; wrong.owner_version = 2u;
+  assert(edr_storage_queue_p0_source_only_commit_local(&wrong, "local-event", "local-batch",
+                                                      wire, sizeof(wire), 0, 0) != EDR_OK);
+  edr_storage_queue_test_fail_next_p0_latch_commits(1u);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch, "local-event", "local-batch",
+                                                      wire, sizeof(wire), 0, 0) == EDR_ERR_SQLITE_WRITE);
+  assert(batch_row_id(path, "local-batch") < 0);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch, "local-event", "local-batch",
+                                                      wire, sizeof(wire), 0, 0) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_get(&current) == EDR_OK);
+  assert(!current.latched && current.owner_version == 3u);
+  assert(edr_storage_queue_pending_count() == 0u);
+  assert(batch_retained_exact(path, "local-batch", "local_evidence", wire, sizeof(wire)));
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.local_evidence_rows == 1u && metrics.delivery_acked == before.delivery_acked);
+  assert(metrics.used_bytes == metrics.retained_nonpending_bytes && metrics.used_bytes > sizeof(wire));
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 0);
+  assert(batch_retained_exact(path, "local-batch", "local_evidence", wire, sizeof(wire)));
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch, "local-event", "local-batch",
+                                                      different, sizeof(different), 0, 0) != EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch, "local-event", "local-batch",
+                                                      wire, sizeof(wire), 0, 0) == EDR_OK);
+  /* Simulate the persistent crash gap after local prepare and before commit. */
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&current) == EDR_OK);
+  assert(current.owner_version == 3u && current.recovery_required);
+  /* Another ordinary diagnostic may be retained, never stand in for a loss audit. */
+  assert(edr_storage_queue_p0_source_only_commit_local(&current, "other-source", "other-source-batch",
+                                                      wire, sizeof(wire), 0, 0) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  assert(edr_storage_queue_p0_source_only_commit_local(&current, "loss-audit", "loss-audit-batch",
+                                                      different, sizeof(different), 0, 1) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 0);
+  assert(status_count(path, "local_evidence") == 3);
+  edr_storage_queue_close(); remove(path);
+}
+
+static void test_policy_hold_preserves_legacy_identity_and_latch(void) {
+  char path[256]; uint8_t wire[20]; EdrStorageQueueP0SourceOnlyLatch legacy, local;
+  EdrStorageQueueCapacityMetrics metrics, before;
+  snprintf(path, sizeof(path), "edr-policy-hold-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(wire, 0x93u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&before);
+  assert(edr_storage_queue_p0_source_only_latch_prepare(&legacy) == EDR_OK);
+  assert(legacy.owner_version == 2u);
+  assert(edr_storage_queue_p0_source_only_enqueue_bound(&legacy, "legacy-event", "legacy-batch",
+                                                       wire, sizeof(wire), 0, 0) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&local) == EDR_ERR_INVALID_ARG);
+  assert(local.owner_version == 2u && local.latched);
+  assert(edr_storage_queue_p0_source_only_commit_local(&legacy, "legacy-event", "legacy-batch",
+                                                      wire, sizeof(wire), 0, 0) != EDR_OK);
+  s_policy_reject_value = 0x93; reset_send_state(1);
+  edr_storage_queue_test_fail_next_p0_latch_commits(1u);
+  edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(batch_retained_exact(path, "legacy-batch", "pending", wire, sizeof(wire)));
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(batch_retained_exact(path, "legacy-batch", "policy_held", wire, sizeof(wire)));
+  assert(batch_retry_count(path, "legacy-batch") == 0);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.policy_held_rows == 1u && metrics.delivery_acked == before.delivery_acked);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(batch_retained_exact(path, "legacy-batch", "policy_held", wire, sizeof(wire)));
+  assert(edr_storage_queue_p0_source_only_latch_get(&legacy) == EDR_OK);
+  assert(legacy.latched && legacy.owner_version == 2u);
+  assert(edr_storage_queue_p0_source_only_recovery_probe() == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  edr_storage_queue_close(); remove(path); s_policy_reject_value = -1;
+}
+
+static void test_unknown_historical_wire_is_retained(void) {
+  char path[256]; uint8_t old_wire[20];
+  snprintf(path, sizeof(path), "edr-unknown-history-%ld.db", (long)TEST_PID);
+  remove(path); make_wire(old_wire, 0x94u); old_wire[3] = '9';
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enqueue("old-encoding", old_wire, sizeof(old_wire), 0, 0) == EDR_OK);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(batch_retained_exact(path, "old-encoding", "dead_letter", old_wire, sizeof(old_wire)));
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u && batch_retry_count(path, "old-encoding") == 0);
+  edr_storage_queue_close(); remove(path);
+}
+
+static void test_local_v3_retention_has_bounded_backpressure(void) {
+  char path[256], batch[48]; EdrStorageQueueP0SourceOnlyLatch latch;
+  EdrStorageQueueCapacityMetrics metrics; uint8_t *wire = malloc(131072u);
+  unsigned retained = 0u; int full = 0;
+  assert(wire); make_large_wire(wire, 131072u, 0x95u);
+  snprintf(path, sizeof(path), "edr-local-v3-capacity-%ld.db", (long)TEST_PID);
+  remove(path); edr_storage_queue_configure(1u, 1u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  for (unsigned i = 0u; i < 12u; ++i) {
+    EdrError result;
+    snprintf(batch, sizeof(batch), "local-capacity-%u", i);
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+    result = edr_storage_queue_p0_source_only_commit_local(&latch, "local-capacity-event", batch,
+                                                          wire, 131072u, 0, 0);
+    if (result == EDR_ERR_QUEUE_FULL) { full = 1; break; }
+    assert(result == EDR_OK); retained++;
+  }
+  assert(full && retained > 0u && edr_storage_queue_p0_source_only_latch_is_set() == 1);
+  edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.local_evidence_rows == retained && metrics.used_bytes <= metrics.max_bytes);
+  edr_storage_queue_test_run_cleanup();
+  assert(status_count(path, "local_evidence") == (int)retained);
+  reset_send_state(1); edr_storage_queue_poll_drain(); assert(total_send_calls() == 0u);
+  edr_storage_queue_close(); free(wire); remove(path); edr_storage_queue_configure(0u, 0u);
+}
+
+static void test_lowered_limit_preserves_overcapacity_evidence(void) {
+  char path[256], batch[48]; EdrStorageQueueP0SourceOnlyLatch latch;
+  EdrStorageQueueCapacityMetrics before, after; uint8_t *wire = malloc(131072u);
+  assert(wire); make_large_wire(wire, 131072u, 0x96u);
+  snprintf(path, sizeof(path), "edr-local-v3-lowered-cap-%ld.db", (long)TEST_PID);
+  remove(path); edr_storage_queue_configure(2u, 1u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  for (unsigned i = 0; i < 10u; ++i) {
+    snprintf(batch, sizeof(batch), "overcapacity-%u", i);
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+    assert(edr_storage_queue_p0_source_only_commit_local(&latch, "retained-overcapacity", batch,
+                                                        wire, 131072u, 0, 0) == EDR_OK);
+  }
+  edr_storage_queue_get_capacity_metrics(&before);
+  assert(before.local_evidence_rows == 10u && before.used_bytes > 1024u * 1024u);
+  edr_storage_queue_close(); edr_storage_queue_configure(1u, 1u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&after);
+  assert(after.used_bytes == before.used_bytes && after.used_bytes > after.max_bytes);
+  assert(after.utilization_bps > 10000u && after.local_evidence_rows == 10u);
+  assert(after.capacity_limit_defaulted == 0u);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch, "new-overcapacity", "new-overcapacity",
+                                                      wire, 131072u, 0, 0) == EDR_ERR_QUEUE_FULL);
+  edr_storage_queue_test_run_cleanup();
+  for (unsigned i = 0; i < 10u; ++i) {
+    snprintf(batch, sizeof(batch), "overcapacity-%u", i);
+    assert(batch_retained_exact(path, batch, "local_evidence", wire, 131072u));
+  }
+  assert(batch_row_id(path, "new-overcapacity") < 0);
+  edr_storage_queue_get_capacity_metrics(&after);
+  assert(after.used_bytes == before.used_bytes && after.p0_source_only_rejected > before.p0_source_only_rejected);
+  reset_send_state(1); edr_storage_queue_poll_drain(); assert(total_send_calls() == 0u);
+  edr_storage_queue_close(); free(wire); remove(path); edr_storage_queue_configure(0u, 0u);
+}
+
+static void test_missing_source_meta_preserves_owner_recovery(void) {
+  const char *statuses[] = {"pending", "policy_held", "corrupt"};
+  char path[256], sql[256]; uint8_t wire[20];
+  EdrStorageQueueP0SourceOnlyLatch original, recovered, local;
+  EdrStorageQueueCapacityMetrics before, after;
+  make_wire(wire, 0x97u);
+  for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); ++i) {
+    snprintf(path, sizeof(path), "edr-source-missing-meta-%zu-%ld.db", i, (long)TEST_PID);
+    remove(path); assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_source_only_latch_prepare(&original) == EDR_OK);
+    assert(edr_storage_queue_p0_source_only_enqueue_bound(&original, "missing-meta-event",
+                                                         "missing-meta-batch", wire, sizeof(wire), 0, 0) == EDR_OK);
+    edr_storage_queue_get_capacity_metrics(&before);
+    edr_storage_queue_close();
+    /* Missing singleton is metadata loss, not proof that its remote owner
+     * ACKed. A retained nonpending source is equally significant. */
+    snprintf(sql, sizeof(sql), "UPDATE event_queue SET status='%s'; DELETE FROM queue_meta;", statuses[i]);
+    sqlite_exec_path(path, sql);
+    edr_storage_queue_test_fail_source_owner_inventory_reads(1u);
+    assert(edr_storage_queue_open(path) == EDR_ERR_SQLITE_WRITE);
+    assert(!edr_storage_queue_is_open());
+    assert(batch_retained_exact(path, "missing-meta-batch", statuses[i], wire, sizeof(wire)));
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_source_only_latch_get(&recovered) == EDR_OK);
+    assert(recovered.latched && recovered.recovery_required && recovered.owner_version == 2u);
+    assert(memcmp(recovered.queue_nonce, original.queue_nonce, sizeof(original.queue_nonce)) != 0);
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&local) == EDR_ERR_INVALID_ARG);
+    assert(local.latched && local.owner_version == 2u);
+    assert(edr_storage_queue_p0_source_only_recovery_probe() == EDR_OK);
+    assert(edr_storage_queue_p0_source_only_latch_is_set() == 1);
+    assert(batch_retained_exact(path, "missing-meta-batch", statuses[i], wire, sizeof(wire)));
+    edr_storage_queue_get_capacity_metrics(&after);
+    assert(after.delivery_acked == before.delivery_acked && after.delivery_sent == before.delivery_sent);
+    edr_storage_queue_close(); remove(path);
+  }
+
+  snprintf(path, sizeof(path), "edr-local-source-missing-meta-%ld.db", (long)TEST_PID);
+  remove(path); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&original) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local(&original, "local-missing-meta-event",
+                                                      "local-missing-meta-batch", wire, sizeof(wire), 0, 0) == EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&before);
+  edr_storage_queue_close(); sqlite_exec_path(path, "DELETE FROM queue_meta;");
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_get(&recovered) == EDR_OK);
+  assert(recovered.latched && recovered.recovery_required && recovered.owner_version == 3u);
+  assert(edr_storage_queue_p0_source_only_commit_local(&recovered, "local-missing-meta-audit",
+                                                      "local-missing-meta-audit", wire, sizeof(wire), 0, 1) == EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set() == 0);
+  assert(batch_retained_exact(path, "local-missing-meta-batch", "local_evidence", wire, sizeof(wire)));
+  edr_storage_queue_get_capacity_metrics(&after);
+  assert(after.local_evidence_rows == 2u && after.delivery_acked == before.delivery_acked);
+  assert(after.delivery_sent == before.delivery_sent);
+  edr_storage_queue_close(); remove(path);
+}
+
 int main(void) {
   char path[256];
   char old_path[256];
@@ -3008,6 +3280,7 @@ int main(void) {
   (void)remove(path);
   assert(test_setenv("EDR_QUEUE_DRAIN_INTERVAL_MS", "200") == 0);
   assert(test_setenv("EDR_QUEUE_MAX_RETRIES", "1") == 0);
+  test_missing_source_meta_preserves_owner_recovery();
   assert(edr_storage_queue_open(path) == EDR_OK);
   make_wire(wire_a, 1u);
   make_wire(wire_b, 9u);
@@ -3130,7 +3403,12 @@ int main(void) {
   test_logical_capacity_recovers_and_reserves_terminal();
   test_source_only_capacity_is_distinct_and_bounded();
   test_queue_and_terminal_metric_denominators();
-  test_unbounded_queue_reports_no_utilization_percentage();
+  test_zero_or_invalid_limit_remains_finite();
+  test_local_v3_source_evidence_is_not_remote_ack();
+  test_policy_hold_preserves_legacy_identity_and_latch();
+  test_unknown_historical_wire_is_retained();
+  test_local_v3_retention_has_bounded_backpressure();
+  test_lowered_limit_preserves_overcapacity_evidence();
   test_p0_source_only_latch_persists_until_central_ack();
   test_p0_source_only_multiple_durable_rows_do_not_create_false_loss();
   test_p0_source_only_retry_retention_corruption_and_identity();

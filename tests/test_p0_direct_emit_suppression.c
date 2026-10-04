@@ -10,6 +10,9 @@
 #include "edr/policy_v2.h"
 #include "edr/config.h"
 #include "edr/storage_queue.h"
+#include "edr/behavior_proto.h"
+#include "edr/egress_batch_policy.h"
+#include "cJSON.h"
 #include "../src/collector/collector_self_identity.h"
 
 #ifdef NDEBUG
@@ -25,6 +28,9 @@
 #include <stdatomic.h>
 #include <time.h>
 #include "p0_deferred_queue_fake.h"
+
+static const char *g_test_rule_identity = "R-TEST-DEDUP";
+static const char *g_test_bundle_identity = "test-p0-ir-v1";
 
 #if defined(_WIN32)
 static int test_setenv(const char *name, const char *value, int overwrite) {
@@ -342,13 +348,11 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire, si
   return g_terminal_source_enqueue_allowed ? EDR_OK : EDR_ERR_SQLITE_WRITE;
 }
 
-/* The focused direct-emit unit links no SQLite implementation. Its production
- * persistence contract is covered by test_storage_queue_sqlite; the stub
- * keeps the same ownership rule: local enqueue never clears a latch, and the
- * test must explicitly simulate the central ACK before recovery can pass. */
+/* SQLite durability and v2/v3 ownership are covered by the production queue
+ * tests. This stub models v3 local retention without a remote ACK. */
 int edr_storage_queue_is_open(void) { return 1; }
 int edr_storage_queue_p0_source_only_latch_is_set(void) { return g_source_latch; }
-EdrError edr_storage_queue_p0_source_only_latch_prepare(
+EdrError edr_storage_queue_p0_source_only_latch_prepare_local(
     EdrStorageQueueP0SourceOnlyLatch *out) {
   static const uint8_t nonce[16] = {
       0x10u, 0x32u, 0x54u, 0x76u, 0x98u, 0xbau, 0xdcu, 0xfeu,
@@ -366,6 +370,7 @@ EdrError edr_storage_queue_p0_source_only_latch_prepare(
   }
   memset(out, 0, sizeof(*out));
   memcpy(out->queue_nonce, nonce, sizeof(out->queue_nonce));
+  out->owner_version = EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3;
   out->latch_counter = g_source_latch_counter;
   out->latch_epoch = g_source_latch_epoch;
   out->latched = 1;
@@ -387,12 +392,13 @@ EdrError edr_storage_queue_p0_source_only_latch_get(
   memset(out, 0, sizeof(*out));
   out->latched = g_source_latch;
   memcpy(out->queue_nonce, nonce, sizeof(out->queue_nonce));
+  out->owner_version = EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3;
   out->latch_counter = g_source_latch_counter;
   out->latch_epoch = g_source_latch_epoch;
   out->recovery_required = g_source_latch_recovery_required;
   return EDR_OK;
 }
-EdrError edr_storage_queue_p0_source_only_enqueue_bound(
+EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *wire, size_t wire_len,
     int compressed, int recovery_audit) {
@@ -410,6 +416,11 @@ EdrError edr_storage_queue_p0_source_only_enqueue_bound(
   if (recovery_audit) g_source_latch_recovery_required = 0;
   snprintf(g_source_latch_batch, sizeof(g_source_latch_batch), "%s", batch_id);
   atomic_fetch_add_explicit(&g_durable_count, 1, memory_order_relaxed);
+  if (recovery_audit || !expected->recovery_required) {
+    g_source_latch = 0;
+    g_source_latch_recovery_required = 0;
+    g_source_latch_batch[0] = '\0';
+  }
   return EDR_OK;
 }
 EdrError edr_storage_queue_p0_source_only_recovery_probe(void) { return EDR_OK; }
@@ -463,7 +474,7 @@ int edr_p0_rule_ir_get_binding(EdrP0RuleIrBinding *out_binding) {
   if (!out_binding || !g_ir_ready) return 0;
   memset(out_binding, 0, sizeof(*out_binding));
   snprintf(out_binding->rules_bundle_version, sizeof(out_binding->rules_bundle_version),
-           "%s", "test-p0-ir-v1");
+           "%s", g_test_bundle_identity);
   snprintf(out_binding->artifact_sha256, sizeof(out_binding->artifact_sha256),
            "%s", g_bundle_sha256);
   snprintf(out_binding->sensor_interest_manifest_sha256,
@@ -509,7 +520,7 @@ int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
     return 0;
   }
   memset(out_match, 0, sizeof(*out_match));
-  snprintf(out_match->rule_id, sizeof(out_match->rule_id), "%s", "R-TEST-DEDUP");
+  snprintf(out_match->rule_id, sizeof(out_match->rule_id), "%s", g_test_rule_identity);
   snprintf(out_match->title, sizeof(out_match->title), "%s", "test");
   snprintf(out_match->mitre_csv, sizeof(out_match->mitre_csv), "%s", "T1059");
   out_match->severity = 3;
@@ -529,12 +540,12 @@ int edr_p0_rule_ir_matches(const char *rule_id, const char *process_name, const 
   return 0;
 }
 int edr_p0_rule_ir_get_meta(const char *rule_id, const char **out_title, const char **out_mitre_csv) {
-  if (strcmp(rule_id, "R-TEST-DEDUP") != 0) return -1;
+  if (strcmp(rule_id, g_test_rule_identity) != 0) return -1;
   if (out_title) *out_title = "test";
   if (out_mitre_csv) *out_mitre_csv = "T1059";
   return 1;
 }
-int edr_p0_rule_ir_get_severity(const char *rule_id) { return strcmp(rule_id,"R-TEST-DEDUP")==0 ? 3 : 0; }
+int edr_p0_rule_ir_get_severity(const char *rule_id) { return strcmp(rule_id,g_test_rule_identity)==0 ? 3 : 0; }
 int edr_p0_rule_ir_process_create_count(void) { return 0; }
 int edr_p0_rule_ir_process_create_id_at(int index, const char **out_id) {
   (void)index;
@@ -549,7 +560,7 @@ int edr_p0_rule_ir_rule_id_at(int index, const char **out_id) {
     return 0;
   }
   if (out_id) {
-    *out_id = "R-TEST-DEDUP";
+    *out_id = g_test_rule_identity;
   }
   return 1;
 }
@@ -737,7 +748,7 @@ static void test_internal_marker_without_process_name_survives_deferred_replay(v
   snprintf(record.event_id, sizeof(record.event_id), "%s", "marker-command-only-deferred");
   assert(edr_p0_rule_try_emit(&record) == 0 && deferred_count == 1u && g_emit_count == 1);
   assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   edr_p0_rule_test_set_monotonic_ms(5000u);
   assert(edr_p0_rule_poll_deferred_match() == 1);
@@ -802,7 +813,7 @@ static void test_windows_optional_gap_evaluation_failure_preserves_source(void) 
                 "\"reason\":\"p0_ir_evaluation_unavailable\"") != NULL);
   assert(!edr_p0_rule_source_only_capability_healthy_for_event(r.type, NULL, 0u));
   g_ir_evaluation_available = 1;
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   assert(edr_p0_rule_try_emit(&r) == 1);
   assert(g_emit_count == 1 && !strcmp(g_last_record.event_id, r.event_id));
@@ -890,7 +901,7 @@ static void test_windows_command_fact_is_one_admission_snapshot(void) {
   deferred_contains_fails = 0;
   edr_test_set_stub_command_fact(NULL);
   edr_test_set_stub_command_fact_fail_after(0);
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   edr_p0_rule_test_set_monotonic_ms(6000u);
   /* The same optional gap requires an authoritative IR evaluation on replay.
@@ -1534,13 +1545,13 @@ static void test_p0_push_failure_does_not_commit_emit_counters(void) {
   {
     char source_reason[96];
     assert(edr_p0_rule_source_only_capability_healthy(source_reason, sizeof(source_reason)) == 0);
-    assert(strcmp(source_reason, "source_only_delivery_pending_ack") == 0);
+    assert(strcmp(source_reason, "source_only_local_recovery_probe_pending") == 0);
   }
 
   /* The local source-only queue insert is not acknowledgement. A matching
    * central ACK must clear queue_meta before the same semantic source may
    * re-enter the alert/action path. */
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   g_combined_emit_allowed = 1;
   assert(edr_p0_rule_try_emit(&r) == 1);
@@ -1779,9 +1790,9 @@ static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   edr_p0_rule_test_set_monotonic_ms(1300u);
   assert(edr_p0_rule_poll_source_only_durable_retry(&committed) == 1);
   assert(strcmp(committed.event_id, "source-retry-exact") == 0);
-  /* A local retry reached SQLite but cannot clear queue_meta.  Only the
-   * simulated central ACK is allowed to make lifecycle recovery healthy. */
-  g_source_ack = 1;
+  /* A v3 local retry retained evidence durably. Recovery needs no remote
+   * ACK; it still requires a healthy IR and no pending/lost assertion. */
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   assert(edr_p0_rule_source_only_capability_healthy(reason, sizeof(reason)) == 1);
   edr_p0_rule_get_emit_metrics(&metrics);
@@ -1847,7 +1858,7 @@ static void test_restart_latch_requires_durable_loss_audit(void) {
   assert(strstr(committed.detection_context, "\"loss_detected\":true") != NULL);
   assert(strstr(committed.detection_context, "\"rules_bundle_") == NULL);
   assert(strstr(committed.detection_context, "\"rule_id\"") == NULL);
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   assert(g_source_latch == 0);
   assert(edr_p0_rule_source_only_capability_healthy(reason, sizeof(reason)) == 1);
@@ -1971,7 +1982,7 @@ static void test_source_only_fault_is_scoped_to_owning_event_family(void) {
   assert(edr_p0_rule_try_emit(&file_match)==0 && deferred_count==1u);
   assert(edr_p0_rule_poll_deferred_match()==0); /* cannot bypass the gate */
 
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   assert(edr_p0_rule_source_only_capability_healthy_for_event(
              EDR_EVENT_FILE_READ, reason, sizeof(reason)) == 1);
@@ -2070,7 +2081,7 @@ static void test_file_read_durable_wait_preserves_burst_and_both_gates(void) {
   assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
   assert(deferred_count == 12u);
 
-  /* Closing ACK authority is independent: collector recovery alone is not
+  /* Closing local durability authority is independent: collector recovery alone is not
    * central receipt and cannot publish any retained read. */
   init_file_read_record(&record, "reader.exe");
   strcpy(record.event_id, "file-ack-fault");
@@ -2081,7 +2092,7 @@ static void test_file_read_durable_wait_preserves_burst_and_both_gates(void) {
   edr_p0_rule_test_set_monotonic_ms(20000u);
   assert(edr_p0_rule_poll_deferred_match() == 0 && deferred_completions == 0u);
   assert(atomic_load(&g_enforcement_side_effects) == action_count);
-  g_source_ack = 1;
+  g_source_ack = 0;
   assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   for (unsigned i = 0; i < 12u; ++i) {
     edr_p0_rule_test_set_monotonic_ms(21000u + i * 200u);
@@ -2108,7 +2119,7 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   assert(test_setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
   assert(test_setenv("EDR_P0_DEDUP_SEC","0",1)==0);
   retain_deferred_fixture(&record,"deferred-commit-retry");
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   deferred_complete_fails=1;
   int source_only_before = atomic_load(&g_durable_count);
@@ -2118,7 +2129,7 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   assert(edr_p0_rule_source_only_capability_healthy_for_event(EDR_EVENT_PROCESS_CREATE,NULL,0u));
   assert(atomic_load(&g_adaptive_raises)==0);
   deferred_complete_fails=0;
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   edr_p0_rule_test_set_monotonic_ms(3500u);
   assert(edr_p0_rule_poll_deferred_match()==1);
@@ -2130,7 +2141,7 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   assert(g_last_record.event_time_ns==record.event_time_ns);
 
   retain_deferred_fixture(&record,"deferred-rule-change");
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   g_bundle_sha256="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   assert(edr_p0_rule_poll_deferred_match()==0);
@@ -2154,7 +2165,7 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   assert(g_last_record.event_time_ns == record.event_time_ns);
   assert(strstr(g_last_record.detection_context,"\"reason\":\"p0_deferred_admission_failed\""));
   assert(!loss_metrics.source_only_loss_detected && loss_metrics.source_only_terminal_unhealthy);
-  assert(!strcmp(loss_metrics.source_only_terminal_reason,"source_only_delivery_pending_ack"));
+  assert(!strcmp(loss_metrics.source_only_terminal_reason,"source_only_local_recovery_probe_pending"));
   assert(deferred_count==1u && deferred_rows[0].state==0); /* no overwrite */
   assert(g_emit_count == 0 && atomic_load(&g_enforcement_side_effects) == actions_before);
   /* A replay must reuse the immutable source, while another rejected source
@@ -2195,7 +2206,7 @@ static void test_deferred_retry_ruleset_change_and_action_owner(void) {
   retain_deferred_fixture(&record,"deferred-action-owner");
   assert(edr_p0_rule_poll_deferred_match()==0);
   assert(atomic_load(&g_enforcement_side_effects)==0);
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   edr_p0_rule_test_set_monotonic_ms(3500u);
   deferred_complete_fails=1; /* journal commits but snapshot completion fails */
@@ -2218,7 +2229,7 @@ static void test_deferred_storage_faults_are_retained_and_backed_off(void) {
   EdrP0EmitMetrics metrics;
   const char *original_sha = g_bundle_sha256;
   retain_deferred_fixture(&record,"deferred-lookup-fault");
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   strcpy(record.event_id,"healthy-lookup-fault");
   deferred_contains_fails=1;
@@ -2227,7 +2238,7 @@ static void test_deferred_storage_faults_are_retained_and_backed_off(void) {
   deferred_contains_fails=0;
 
   retain_deferred_fixture(&record,"deferred-fail-write-fault");
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   g_bundle_sha256="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
   deferred_fail_fails=1;
@@ -2249,7 +2260,7 @@ static void test_deferred_storage_faults_are_retained_and_backed_off(void) {
   g_bundle_sha256=original_sha;
 
   retain_deferred_fixture(&record,"deferred-retry-write-fault");
-  g_source_ack=1;
+  g_source_ack=0;
   assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
   g_ir_evaluation_available=0;
   deferred_retry_fails=1;
@@ -2329,7 +2340,7 @@ static void test_script_matches_obey_process_family_gate(void) {
     snprintf(record.event_id,sizeof(record.event_id),"script-family-gate-%zu",i);
     assert(edr_p0_rule_try_emit(&record)==0 && deferred_count==1u && g_emit_count==0);
     assert(edr_p0_rule_poll_deferred_match()==0 && atomic_load(&g_adaptive_raises)==0);
-    g_source_ack=1;
+    g_source_ack=0;
     assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
     edr_p0_rule_test_set_monotonic_ms(5100u);
     assert(edr_p0_rule_poll_deferred_match()==1 && deferred_completions==1u);
@@ -2426,6 +2437,57 @@ static void test_p0_user_subject_overflow_degrades_without_losing_alert(void) {
   assert(after.alerts_with_optional_omission == before.alerts_with_optional_omission + 1u);
   assert(after.values_truncated == before.values_truncated + expected_full_caps + expected_abi_omissions);
   assert(after.minimal_failures == before.minimal_failures);
+}
+
+static void test_optional_failure_preserves_lossless_rule_source_binding(void) {
+  char rule[64], bundle[128];
+  memset(rule, 'r', sizeof(rule) - 1u); rule[sizeof(rule) - 1u] = '\0';
+  memset(bundle, 'v', sizeof(bundle) - 1u); bundle[sizeof(bundle) - 1u] = '\0';
+  g_test_rule_identity = rule;
+  g_test_bundle_identity = bundle;
+  EdrBehaviorRecord r;
+  init_record(&r);
+  r.pid = 99005u;
+  r.event_time_ns = INT64_C(1700000000000000000);
+  snprintf(r.process_name, sizeof(r.process_name), "dedup-test.exe");
+  snprintf(r.event_id, sizeof(r.event_id), "long-identity-binding-test");
+  memset(r.tenant_id, 't', sizeof(r.tenant_id) - 1u);
+  r.tenant_id[sizeof(r.tenant_id) - 1u] = '\0';
+  /* Both preview passes overflow on control-byte escaping; core source and
+   * matched-rule identities are still complete, bounded and representable. */
+  memset(r.exe_path, '\1', 400u); r.exe_path[400] = '\0';
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+  edr_p0_rule_test_reset_dedup();
+  g_emit_count = 0;
+  assert(edr_p0_rule_try_emit(&r) == 1);
+  assert(g_emit_count == 1);
+  cJSON *subject = cJSON_ParseWithOpts(g_last_alert.user_subject_json, NULL, 1);
+  assert(subject);
+  const cJSON *ctx = cJSON_GetObjectItemCaseSensitive(subject, "context");
+  const cJSON *rule_value = cJSON_GetObjectItemCaseSensitive(subject, "rule_id");
+  const cJSON *bundle_value = cJSON_GetObjectItemCaseSensitive(subject, "rules_bundle_version");
+  const cJSON *tenant = cJSON_GetObjectItemCaseSensitive(ctx, "tenant_id");
+  const cJSON *source = cJSON_GetObjectItemCaseSensitive(ctx, "source_event_id");
+  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ctx, "context_degraded")));
+  assert(cJSON_IsString(rule_value) && strcmp(rule_value->valuestring, rule) == 0);
+  assert(cJSON_IsString(bundle_value) && strcmp(bundle_value->valuestring, bundle) == 0);
+  assert(cJSON_IsString(tenant) && strcmp(tenant->valuestring, r.tenant_id) == 0);
+  assert(cJSON_IsString(source) && strcmp(source->valuestring, r.event_id) == 0);
+  cJSON_Delete(subject);
+  uint8_t *frame = malloc(EDR_EGRESS_FRAME_MAX);
+  assert(frame);
+  size_t n = edr_behavior_record_alert_encode_protobuf(&g_last_record, &g_last_alert,
+                                                      frame, EDR_EGRESS_FRAME_MAX);
+  char reason[96];
+  int admitted=n && edr_egress_frame_validate(frame, n, reason, sizeof(reason));
+  if (!admitted) fprintf(stderr,"synthetic fallback egress cause: %s\n",n?reason:"encode_failed");
+  assert(admitted);
+  free(frame);
+  assert(strcmp(g_last_record.tenant_id, r.tenant_id) == 0);
+  assert(memcmp(g_last_record.exe_path, r.exe_path, 401u) == 0);
+  g_test_rule_identity = "R-TEST-DEDUP";
+  g_test_bundle_identity = "test-p0-ir-v1";
 }
 
 #if !defined(_WIN32)
@@ -2667,7 +2729,7 @@ static void test_enforcement_requires_durable_intent_and_one_owner(void) {
     EdrBehaviorRecord committed;
     edr_p0_rule_test_set_monotonic_ms(3300u);
     while (edr_p0_rule_poll_source_only_durable_retry(&committed)) { }
-    g_source_ack = 1;
+    g_source_ack = 0;
     assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
   }
   for (int i = 0; i < workers; i++) {
@@ -3142,7 +3204,7 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
   }
   assert(atomic_load(&g_combined_inflight) == workers);
   /* Establish every pending handoff before the overflow contender. Its
-   * source-only result closes the family ACK gate, so launching all 65 at
+   * source-only result closes the family durability gate, so launching all 65 at
    * once can correctly defer a slower claimant at the pre-handoff check.
    * Keep the first 64 blocked until the overflow result is fully recorded. */
   init_record(&overflow);
@@ -3230,6 +3292,7 @@ int main(void) {
   test_script_matches_obey_process_family_gate();
   test_p0_escape_overflow_degrades_without_silent_core_loss();
   test_p0_user_subject_overflow_degrades_without_losing_alert();
+  test_optional_failure_preserves_lossless_rule_source_binding();
 #if !defined(_WIN32)
   test_p0_pending_claim_allows_one_same_key();
   test_rate_rollback_does_not_reopen_new_window();

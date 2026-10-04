@@ -2446,6 +2446,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
         "\"capability_manifest\":%s,"
+        "\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
+        "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s},"
         "\"config_recovery\":%s,"
         "\"monitor\":{\"enabled\":true,\"profile\":\"%s\","
         "\"interval_s\":%u,\"expires_at_unix_ms\":%llu,\"request_id\":\"%s\"},"
@@ -2595,7 +2597,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "}}",
         agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
         runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
-        (unsigned long long)wall_ms, capability_manifest_json, config_recovery_json,
+        (unsigned long long)wall_ms, capability_manifest_json,
+        http_rt.egress_denied_count,
+        (unsigned long long)queue_capacity_metrics.policy_held_rows,
+        (unsigned long long)queue_capacity_metrics.local_evidence_rows,
+        queue_capacity_metrics.capacity_limit_defaulted ? "true" : "false",
+        config_recovery_json,
         health_profile[0] ? health_profile : "basic",
         agent->cfg.health_monitor.interval_s,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
@@ -3010,6 +3017,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)queue_capacity_metrics.shm_bytes,
                  (unsigned long long)queue_capacity_metrics.physical_bytes,
                  queue_capacity_metrics.accounting_available);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+      p0_health_json, sizeof(p0_health_json), &p0_health_used,
+      ",\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
+      "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s}",
+      http_rt.egress_denied_count,
+      (unsigned long long)queue_capacity_metrics.policy_held_rows,
+      (unsigned long long)queue_capacity_metrics.local_evidence_rows,
+      queue_capacity_metrics.capacity_limit_defaulted ? "true" : "false");
   if (!p0_health_ok) {
     /* Omit optional P0 metrics rather than append a syntactically incomplete
      * fragment to the enclosing engine-health JSON document. */

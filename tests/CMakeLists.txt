@@ -1667,6 +1667,34 @@ edr_apply_test_warnings(test_egress_request_policy)
 add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 target_link_libraries(test_deep_collector_manifest PRIVATE edr_egress_policy)
 
+# Compile the actual queue/codec/HTTPS owners, with the agent's exact build
+# features. The test entry point only uses synthetic loopback data; collectors
+# and the service main loop are never started.
+if(NOT WIN32 AND SQLite3_FOUND AND OpenSSL_FOUND)
+  get_target_property(_egress_agent_sources edr_agent SOURCES)
+  set(_egress_tls_sources)
+  foreach(_source IN LISTS _egress_agent_sources)
+    if(NOT _source MATCHES "(^|/)main\\.c$|\\.rc$")
+      if(IS_ABSOLUTE "${_source}")
+        list(APPEND _egress_tls_sources "${_source}")
+      else()
+        list(APPEND _egress_tls_sources "${CMAKE_SOURCE_DIR}/${_source}")
+      endif()
+    endif()
+  endforeach()
+  add_executable(test_egress_tls_client test_egress_tls_client.c ${_egress_tls_sources})
+  target_include_directories(test_egress_tls_client PRIVATE
+    $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_egress_tls_client PRIVATE
+    $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
+  target_link_libraries(test_egress_tls_client PRIVATE
+    $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_egress_tls_client)
+  add_test(NAME egress_loopback_mtls COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
+    --client $<TARGET_FILE:test_egress_tls_client>)
+  set_tests_properties(egress_loopback_mtls PROPERTIES TIMEOUT 150)
+endif()
 
 add_executable(test_runtime_health test_runtime_health.c)
 edr_apply_test_warnings(test_runtime_health)

@@ -13,7 +13,7 @@
 EdrError edr_storage_queue_open(const char *path);
 void edr_storage_queue_close(void);
 
-/** 打开前设置容量和 TTL；0 表示沿用环境变量/默认。 */
+/** 打开前设置容量和 TTL；容量 0 使用有限的 512 MiB 默认，TTL 0 沿用默认。 */
 void edr_storage_queue_configure(uint32_t max_db_mb, uint32_t retention_hours);
 
 /** 是否已成功打开 SQLite 队列（用于 on_fail 策略仅在库可用时入队） */
@@ -25,6 +25,8 @@ int edr_storage_queue_is_open(void);
  * queue, outbox, sidecar, or worker.  Its CSPRNG queue nonce and signed
  * counter identify a capability-loss audit across database recreation and
  * restarts; the normal event_queue owns the actual source record. */
+#define EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_REMOTE_V2 2u
+#define EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3 3u
 #define EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_NONCE_BYTES 16u
 #define EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_EVENT_ID_MAX 96u
 #define EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX 128u
@@ -37,6 +39,7 @@ typedef struct {
   char recovery_batch_id[EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX];
   int latched;
   int recovery_required;
+  unsigned owner_version;
 } EdrStorageQueueP0SourceOnlyLatch;
 
 /* Persists a latch before a severity-2 record is attempted.  If another
@@ -57,6 +60,16 @@ EdrError edr_storage_queue_p0_source_only_enqueue_bound(
 /* Proves one FULL queue transaction without modifying a latch.  A historic
  * latch is never cleared by this probe; recovery waits for its central ACK. */
 EdrError edr_storage_queue_p0_source_only_recovery_probe(void);
+
+/* Version 3 owns NEW diagnostic evidence locally. Legacy version-2 latches
+ * cannot be converted or cleared by these calls. Local FULL commit proves
+ * durable endpoint retention only; it is never a server ACK. */
+EdrError edr_storage_queue_p0_source_only_latch_prepare_local(
+    EdrStorageQueueP0SourceOnlyLatch *out);
+EdrError edr_storage_queue_p0_source_only_commit_local(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *payload, size_t payload_len,
+    int compressed, int recovery_audit);
 
 /* A matched P0 rule that cannot proceed while its owning event family is
  * unhealthy is retained in the queue database before the live record is
@@ -183,7 +196,13 @@ typedef struct {
    * files are high-water diagnostics and do not strand an empty queue. */
   uint64_t used_bytes;
   uint64_t retained_nonpending_bytes;
+  /* Durable local diagnostics and policy holds retain their original wires. */
+  uint64_t local_evidence_rows;
+  uint64_t policy_held_rows;
   uint64_t max_bytes;
+  /* The effective finite limit used the default configuration or ignored an
+   * invalid/zero environment override; the diagnostic log names the cause. */
+  uint32_t capacity_limit_defaulted;
   uint64_t ordinary_limit_bytes;
   /* `critical_reserve_bytes` is the total excluded from ordinary admission.
    * The two component fields make terminal versus P0 source-only ownership
@@ -220,8 +239,9 @@ typedef struct {
    * to the C-string transport boundary is terminally isolated by row id.
    * This is a process-lifetime counter; the row's status/reason is durable. */
   uint64_t event_queue_metadata_corruption_failures;
-  /* Retention removes completed/ordinary records only; capacity never evicts
-   * a pending record to make room for a later producer. */
+  /* Retention removes only completed payload-free dedup tombstones and
+   * already-confirmed terminal records. Ordinary evidence is retained with a
+   * terminal reason; capacity never evicts pending/local/held evidence. */
   uint64_t retention_evicted_rows;
   uint64_t pending_rows;
   /* Matched P0 snapshots awaiting replay or retained after an explicit unsafe
@@ -232,8 +252,8 @@ typedef struct {
   uint64_t p0_deferred_failed_rows;
   uint64_t oldest_pending_created_unix_s;
   uint64_t oldest_pending_age_s;
-  /* 10,000 = 100%. When max_bytes is zero the queue is deliberately
-   * unbounded, so utilization_bps is 0 rather than a percentage. */
+  /* 10,000 = 100%. Open queues always have a finite nonzero limit; a zero
+   * max_bytes before opening does not represent unbounded admission. */
   uint32_t utilization_bps;
   uint32_t accounting_available;
 } EdrStorageQueueCapacityMetrics;

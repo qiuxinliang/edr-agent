@@ -191,7 +191,7 @@ static int capture_terminal_wire(size_t index, const char *batch_id,
 /* Test-local queue capture preserves the actual production BAT1 bytes; it
  * deliberately does not synthesize a fake wire or JSON context. */
 int edr_storage_queue_is_open(void) { return 1; }
-EdrError edr_storage_queue_p0_source_only_latch_prepare(
+EdrError edr_storage_queue_p0_source_only_latch_prepare_local(
     EdrStorageQueueP0SourceOnlyLatch *out) {
   if (!out) return EDR_ERR_INVALID_ARG;
   if (!s_source_latch.latched) {
@@ -201,6 +201,7 @@ EdrError edr_storage_queue_p0_source_only_latch_prepare(
     s_source_latch.latch_counter = k_delivery_latch_counter;
     s_source_latch.latch_epoch = k_delivery_latch_epoch;
     s_source_latch.latched = 1;
+    s_source_latch.owner_version = EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3;
   } else {
     s_source_latch.recovery_required = 1;
   }
@@ -237,7 +238,7 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire,
   return EDR_OK;
 }
 
-EdrError edr_storage_queue_p0_source_only_enqueue_bound(
+EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *wire, size_t wire_len,
     int compressed, int recovery_audit) {
@@ -250,8 +251,10 @@ EdrError edr_storage_queue_p0_source_only_enqueue_bound(
              sizeof(expected->queue_nonce)) != 0) {
     return EDR_ERR_INVALID_ARG;
   }
-  return edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed,
+  EdrError result = edr_storage_queue_enqueue(batch_id, wire, wire_len, compressed,
                                    EDR_STORAGE_QUEUE_SEVERITY_P0_SOURCE_ONLY);
+  if (result == EDR_OK) { s_source_latch.latched = 0; s_source_latch.latch_epoch = 0; }
+  return result;
 }
 
 EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate(
