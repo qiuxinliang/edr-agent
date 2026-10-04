@@ -663,7 +663,7 @@ jobs:
           name: windows-rule-validation-${{ matrix.arch }}
           path: build/windows-rule-audit-result.json
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 7
 
       - name: "[Timing] Build summary"
         if: (always()) && steps.resume.outputs.restored != 'true'
@@ -1337,7 +1337,7 @@ jobs:
           name: release-${{ env.WINDOWS_RELEASE_MODE == 'usb' && 'input' || 'checkpoint' }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
           compression-level: 0
       - name: Upload ${{ matrix.arch }} release bundle
         if: env.WINDOWS_RELEASE_MODE != 'usb'
@@ -1414,7 +1414,7 @@ jobs:
           name: usb-verified-final
           path: finalized/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
           compression-level: 0
       - name: Upload verified USB bundles
         if: env.WINDOWS_RELEASE_MODE == 'usb'
@@ -1434,6 +1434,9 @@ jobs:
       - windows-lifecycle
       - usb-finalize
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v6
       - name: Recheck release ownership before publication
@@ -1494,6 +1497,11 @@ jobs:
           gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --draft=false --prerelease=true --latest=false \
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (${WINDOWS_RELEASE_MODE} candidate AMD64 + ARM64)"
+
+      - name: Retire published-run CI checkpoints
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/windows_release_checkpoint.py cleanup-published
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater

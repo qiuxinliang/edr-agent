@@ -58,6 +58,22 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn('gh release upload', build)
         self.assertNotIn('--notes-file', self.jobs['publish-release'])
 
+    def test_checkpoint_cleanup_follows_publication_with_scoped_permissions(self):
+        publish = self.jobs['publish-release']
+        cleanup = publish.index('windows_release_checkpoint.py cleanup-published')
+        for step in ('Publish signed Windows release', 'Publish unsigned Windows release',
+                     'Publish candidate without promoting latest'):
+            self.assertLess(publish.index(step), cleanup)
+        self.assertIn('      actions: write', publish)
+        self.assertIn('  actions: read', self.text.split('\njobs:\n', 1)[0])
+        checkpoint = self.jobs['windows-build'].split('- name: Retain verified package', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('retention-days: 1', checkpoint)
+        final = self.jobs['usb-finalize'].split('- name: Retain final signed bundle', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('retention-days: 1', final)
+        lifecycle = (ROOT / '.github/workflows/windows-install-upgrade-rollback.yml').read_text(encoding='utf-8')
+        evidence = lifecycle.split('- name: Upload Windows lifecycle evidence', 1)[1]
+        self.assertIn('retention-days: 7', evidence)
+
     def test_source_packaging_contract_runs_before_native_build(self):
         prepare = self.jobs['prepare-release']
         self.assertIn('python3 tests/test_windows_release_workflow.py', prepare)

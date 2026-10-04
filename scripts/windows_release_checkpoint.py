@@ -389,9 +389,42 @@ def upload(api, directory, expected, arch):
             time.sleep(2 ** (attempt + 1))
 
 
+def cleanup_published_checkpoints(api, expected):
+    """Published release assets own recovery; retire only this run's CI copies."""
+    info = api.release(expected["tag"])
+    require_owner(info, expected)
+    if info.get("draft") is not False:
+        raise ValueError("Checkpoint cleanup requires this run's published release")
+    verify_tag_target(api, info, expected)
+    pages = json.loads(api.call(
+        "api", f"repos/{api.repository}/actions/runs/{expected['run_id']}/artifacts?per_page=100",
+        "--paginate", "--slurp"))
+    names = {"release-checkpoint-amd64", "release-checkpoint-arm64",
+             "release-input-amd64", "release-input-arm64", "usb-verified-final"}
+    selected = [artifact for page in pages for artifact in page["artifacts"]
+                if artifact.get("name") in names and not artifact.get("expired", False)]
+    # Validate the entire set before deleting; neither unrelated evidence nor
+    # another run's recovery boundary may be removed.
+    for artifact in selected:
+        if (type(artifact.get("id")) is not int or artifact["id"] <= 0 or
+                str((artifact.get("workflow_run") or {}).get("id")) != expected["run_id"]):
+            raise ValueError("Checkpoint artifact has invalid run/ID ownership")
+    for artifact in selected:
+        for attempt in range(3):
+            try:
+                api.call("api", "--method", "DELETE",
+                         f"repos/{api.repository}/actions/artifacts/{artifact['id']}", missing=True)
+                break
+            except (RuntimeError, subprocess.TimeoutExpired):
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** (attempt + 1))
+    return len(selected)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline"))
+    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
@@ -413,6 +446,8 @@ def main():
         print(json.dumps(expected, sort_keys=True))
     elif args.command == "verify-owner":
         verify_owner(api, expected)
+    elif args.command == "cleanup-published":
+        print(f"Removed {cleanup_published_checkpoints(api, expected)} published-run CI checkpoints")
     elif args.command == "prepare":
         published = prepare(api, expected)
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
