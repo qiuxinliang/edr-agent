@@ -129,6 +129,8 @@ typedef struct {
   unsigned long report_events_post_ok_count;
   uint64_t report_events_post_ok_body_bytes;
   uint64_t report_events_post_attempt_body_bytes;
+  unsigned long egress_denied_count;
+  char egress_last_reason[128];
   unsigned long zstd_compress_ok_count;
   unsigned long zstd_compress_fail_count;
   unsigned long http2_multiplex_ok_count;

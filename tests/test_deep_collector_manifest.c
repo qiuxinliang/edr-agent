@@ -18,6 +18,7 @@ static const char *g_rest_base;
 static char g_runtime_last_error[160];
 static char g_last_manifest_url[512];
 static char g_last_artifact_url[512];
+static unsigned g_download_calls;
 
 static void expect_true(int cond, const char *msg) {
   if (!cond) {
@@ -75,6 +76,7 @@ static int make_temp_dir(char *out, size_t cap) {
 }
 
 int edr_ingest_http_get_url_to_file(const char *url, const char *file_path, size_t max_bytes) {
+  g_download_calls++;
   (void)max_bytes;
   g_runtime_last_error[0] = '\0';
   if (g_fail_download_substr && strstr(url, g_fail_download_substr)) {
@@ -180,8 +182,14 @@ static void test_artifact_failure_keeps_existing_dest(void) {
 
   g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact bad\",\"sha256\":\"\"}";
   g_artifact_body = "new-bad";
+  g_fail_download_substr = "/download";
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_DOWNLOAD_NO_CURL", "1");
+#else
+  setenv("EDR_FORENSIC_DOWNLOAD_NO_CURL", "1", 1);
+#endif
   char detail[256];
-  int rc = dc_autofetch_via_manifest("https://platform.invalid/manifest", dest, NULL, detail, sizeof(detail));
+  int rc = dc_autofetch_via_manifest("https://platform.invalid/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", dest, NULL, detail, sizeof(detail));
   expect_true(rc == EDR_DC_ERR_DOWNLOAD, "invalid artifact url should fail download");
   expect_true(strstr(detail, "artifact download failed") != NULL, "detail should name artifact stage");
   char got[64];
@@ -195,6 +203,12 @@ static void test_artifact_failure_keeps_existing_dest(void) {
     return;
   }
   expect_true(!path_exists(part), "failed artifact download should not leave .part");
+  g_fail_download_substr = NULL;
+#ifdef _WIN32
+  _putenv_s("EDR_FORENSIC_DOWNLOAD_NO_CURL", "");
+#else
+  unsetenv("EDR_FORENSIC_DOWNLOAD_NO_CURL");
+#endif
   remove(dest);
   rmdir(dir);
 }
@@ -208,10 +222,10 @@ static void test_success_installs_part_atomically(void) {
     rmdir(dir);
     return;
   }
-  g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/artifact\",\"sha256\":\"\"}";
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://platform.invalid/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64\",\"sha256\":\"\"}";
   g_artifact_body = "new-good";
   char detail[256];
-  int rc = dc_autofetch_via_manifest("https://platform.invalid/manifest", dest, NULL, detail, sizeof(detail));
+  int rc = dc_autofetch_via_manifest("https://platform.invalid/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", dest, NULL, detail, sizeof(detail));
   expect_true(rc == EDR_DC_OK, "artifact download should install successfully");
   char got[64];
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "installed dest should be readable");
@@ -225,6 +239,38 @@ static void test_success_installs_part_atomically(void) {
   }
   expect_true(!path_exists(part), "successful install should not leave .part");
   remove(dest);
+  rmdir(dir);
+}
+
+static void test_unproven_external_download_is_denied_before_io(void) {
+  char dir[512], dest[640];
+  expect_true(make_temp_dir(dir, sizeof(dir)) == 0, "create denial temp dir");
+  expect_true(join_test_path(dest, sizeof(dest), dir, "/denied-output") == 0, "denial output path");
+  unsigned calls = g_download_calls;
+  expect_true(dc_download("https://external.invalid/private-artifact", dest) != 0,
+              "unproven external artifact route must be denied");
+  expect_true(g_download_calls == calls && !path_exists(dest), "denial must precede native client and file I/O");
+  expect_true(strstr(dc_last_download_detail(), "egress") != NULL, "denial has an observable policy cause");
+#ifndef _WIN32
+  /* Force the subprocess branch and put a harmless marker-writing curl at
+   * its PATH. A denied route must return before any subprocess can execute. */
+  char fake[640], marker[640];
+  expect_true(join_test_path(fake, sizeof(fake), dir, "/curl") == 0, "fake curl path");
+  expect_true(join_test_path(marker, sizeof(marker), dir, "/executed") == 0, "execution marker path");
+  expect_true(write_file_bytes(fake, "#!/bin/sh\n/usr/bin/touch \"$EDR_EGRESS_EXEC_MARKER\"\n") == 0,
+              "write harmless subprocess marker");
+  expect_true(chmod(fake, 0700) == 0, "make marker executable");
+  const char *existing_path = getenv("PATH");
+  char *saved_path = existing_path ? strdup(existing_path) : NULL;
+  setenv("PATH", dir, 1); setenv("EDR_EGRESS_EXEC_MARKER", marker, 1);
+  setenv("EDR_FORENSIC_DOWNLOAD_NO_INPROC", "1", 1);
+  expect_true(dc_download("https://external.invalid/private-artifact", dest) != 0,
+              "subprocess download cannot bypass purpose denial");
+  expect_true(!path_exists(marker) && !path_exists(dest), "denied route must not execute curl");
+  if (saved_path) { setenv("PATH", saved_path, 1); free(saved_path); } else unsetenv("PATH");
+  unsetenv("EDR_EGRESS_EXEC_MARKER"); unsetenv("EDR_FORENSIC_DOWNLOAD_NO_INPROC");
+  remove(fake);
+#endif
   rmdir(dir);
 }
 
@@ -249,7 +295,7 @@ static void test_artifact_download_fallback_uses_manifest_origin(void) {
 
   char detail[256];
   int rc = dc_autofetch_via_manifest(
-      "https://reachable.local/api/v1/agent/forensic-collector/manifest?kind=forensic_collector&os=windows&arch=amd64",
+      "https://reachable.local/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64",
       dest, NULL, detail, sizeof(detail));
   expect_true(rc == EDR_DC_OK, "artifact fallback should install successfully");
   char got[64];
@@ -284,7 +330,7 @@ static void test_ensure_adapter_derives_manifest_from_rest_base(void) {
     return;
   }
   g_rest_base = "https://reachable.local/api/v1/";
-  g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/artifact\",\"sha256\":\"\"}";
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64\",\"sha256\":\"\"}";
   g_artifact_body = "downloaded-adapter";
   g_last_manifest_url[0] = '\0';
   g_last_artifact_url[0] = '\0';
@@ -306,7 +352,7 @@ static void test_ensure_adapter_derives_manifest_from_rest_base(void) {
   expect_true(strstr(g_last_manifest_url, "kind=adapter") != NULL, "derived adapter manifest should use adapter kind");
   expect_true(strstr(g_last_manifest_url, dc_current_os_token()) != NULL, "derived manifest should include OS");
   expect_true(strstr(g_last_manifest_url, dc_current_arch_token()) != NULL, "derived manifest should include arch");
-  expect_true(strcmp(g_last_artifact_url, "https://reachable.local/artifact") == 0,
+  expect_true(strcmp(g_last_artifact_url, "https://reachable.local/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64") == 0,
               "derived manifest should download advertised artifact URL");
   char got[64];
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "derived install dest should be readable");
@@ -336,7 +382,7 @@ static void test_fixed_local_collector_is_never_replaced_by_adapter(void) {
     return;
   }
   g_rest_base = "https://reachable.local/api/v1/";
-  g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/artifact\",\"sha256\":\"\"}";
+  g_manifest_body = "{\"enabled\":true,\"url\":\"https://reachable.local/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64\",\"sha256\":\"\"}";
   g_artifact_body = "downloaded-adapter";
   g_last_manifest_url[0] = '\0';
   g_last_artifact_url[0] = '\0';
@@ -403,8 +449,8 @@ static void test_maybe_refresh_replaces_on_sha_change(void) {
   /* manifest 广告一个新 sha(= new-adapter-body 的 sha),artifact 下载返回新体。 */
   char newsha[65];
   expect_true(edr_sha256_hex((const unsigned char *)"new-adapter-body", 16, newsha) == 0, "hash new body");
-  static char mbody[256];
-  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/artifact\",\"sha256\":\"%s\"}", newsha);
+  static char mbody[512];
+  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64\",\"sha256\":\"%s\"}", newsha);
   g_manifest_body = mbody;
   g_artifact_body = "new-adapter-body";
 #ifdef _WIN32
@@ -415,7 +461,7 @@ static void test_maybe_refresh_replaces_on_sha_change(void) {
 
   time_t last = 0;
   char detail[256];
-  int rc = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  int rc = dc_maybe_refresh(dest, "https://plat.invalid/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", NULL, &last, detail, sizeof(detail));
   expect_true(rc == EDR_DC_OK, "refresh with changed sha should succeed");
   char got[64];
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "dest readable after refresh");
@@ -423,7 +469,7 @@ static void test_maybe_refresh_replaces_on_sha_change(void) {
 
   /* 第二次:同一 last_check 且间隔未到 → 不再拉取(限流),文件不变。 */
   g_artifact_body = "SHOULD-NOT-BE-USED";
-  int rc2 = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  int rc2 = dc_maybe_refresh(dest, "https://plat.invalid/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", NULL, &last, detail, sizeof(detail));
   expect_true(rc2 == EDR_DC_OK, "second refresh within interval is a no-op");
   expect_true(read_file_text(dest, got, sizeof(got)) == 0, "dest still readable");
   expect_true(strcmp(got, "new-adapter-body") == 0, "rate-limited: file unchanged on second call");
@@ -449,8 +495,8 @@ static void test_maybe_refresh_keeps_current_when_sha_matches(void) {
   expect_true(write_file_bytes(dest, "current-body") == 0, "write current adapter");
   char cursha[65];
   expect_true(edr_sha256_hex((const unsigned char *)"current-body", 12, cursha) == 0, "hash current");
-  static char mbody[256];
-  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/artifact\",\"sha256\":\"%s\"}", cursha);
+  static char mbody[512];
+  snprintf(mbody, sizeof(mbody), "{\"enabled\":true,\"url\":\"https://plat.invalid/api/v1/agent/forensic-collector/download?kind=adapter&os=windows&arch=amd64\",\"sha256\":\"%s\"}", cursha);
   g_manifest_body = mbody;
   g_artifact_body = "SHOULD-NOT-DOWNLOAD";
 #ifdef _WIN32
@@ -460,7 +506,7 @@ static void test_maybe_refresh_keeps_current_when_sha_matches(void) {
 #endif
   time_t last = 0;
   char detail[256];
-  int rc = dc_maybe_refresh(dest, "https://plat.invalid/manifest", NULL, &last, detail, sizeof(detail));
+  int rc = dc_maybe_refresh(dest, "https://plat.invalid/api/v1/agent/forensic-collector/manifest?kind=adapter&os=windows&arch=amd64", NULL, &last, detail, sizeof(detail));
   expect_true(rc == EDR_DC_OK, "matching sha → no-op OK");
   char got[64];
   read_file_text(dest, got, sizeof(got));
@@ -596,6 +642,7 @@ int main(int argc, char **argv) {
   test_native_http_client_error_detection();
   test_artifact_failure_keeps_existing_dest();
   test_success_installs_part_atomically();
+  test_unproven_external_download_is_denied_before_io();
   test_artifact_download_fallback_uses_manifest_origin();
   test_ensure_adapter_derives_manifest_from_rest_base();
   test_fixed_local_collector_is_never_replaced_by_adapter();

@@ -26,6 +26,7 @@
 #include "cJSON.h"
 #include "edr/config.h"
 #include "edr/time_util.h"
+#include "edr/egress_request_policy.h"
 
 #ifndef EDR_HAVE_LIBCURL
 int edr_agent_check_update(const EdrConfig *cfg) {
@@ -132,6 +133,11 @@ static size_t update_write_cb(void *ptr, size_t sz, size_t nmemb, void *userdata
 }
 
 static char *update_http_get(const char *url, size_t *out_len) {
+  char reason[128];
+  if (edr_egress_request_validate("GET", url, NULL, NULL, 0u, reason, sizeof(reason)) != 0) {
+    fprintf(stderr, "[update] egress denied: %s\n", reason);
+    return NULL;
+  }
   if (update_curl_init() != 0) return NULL;
   CURL *curl = curl_easy_init();
   if (!curl) return NULL;
@@ -139,7 +145,7 @@ static char *update_http_get(const char *url, size_t *out_len) {
   update_buf b = {NULL, 0, 0};
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, update_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
@@ -156,6 +162,11 @@ static char *update_http_get(const char *url, size_t *out_len) {
 }
 
 static int update_download_file(const char *url, const char *out_path) {
+  char reason[128];
+  if (edr_egress_request_validate("GET", url, NULL, NULL, 0u, reason, sizeof(reason)) != 0) {
+    fprintf(stderr, "[update] egress denied: %s\n", reason);
+    return EDR_EGRESS_REQUEST_DENIED;
+  }
   if (update_curl_init() != 0) return -1;
   CURL *curl = curl_easy_init();
   if (!curl) return -1;
@@ -168,7 +179,7 @@ static int update_download_file(const char *url, const char *out_path) {
 
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
 

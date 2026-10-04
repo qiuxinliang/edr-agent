@@ -956,12 +956,13 @@ done:
 
 /* 构造证据链 JSON 到 user_subject_json（≤4KiB）。 */
 static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s,
-                                    char *out, size_t cap) {
+                                    uint32_t pid, char *out, size_t cap) {
   char rule_id[96];
   char bundle[192];
   char title[384];
   uint32_t count;
   uint32_t distinct;
+  uint32_t matched_count = 0u;
   int n;
   if (!out || cap == 0 || !rule || !s) {
     return;
@@ -971,17 +972,32 @@ static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s
   corr_json_escape(rule->title, title, sizeof(title), 0);
   distinct = s->n_distinct;
   count = distinct > 0 ? distinct : s->count;
+  if (rule->kind == CORR_KIND_THRESHOLD) matched_count = rule->th_distinct ? s->n_distinct : s->count;
+  else if (rule->ordered) matched_count = s->step;
+  else {
+    for (uint32_t bits = s->count; bits; bits >>= 1u) matched_count += bits & 1u;
+  }
+  if (rule->kind == CORR_KIND_SEQUENCE) count = matched_count;
   n = snprintf(out, cap,
                "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
                "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
+               "\"evaluation_basis\":{\"schema\":\"agent_detection_basis_v1\","
+               "\"owner\":\"correlation_engine\",\"predicate_matched\":true,"
+               "\"pid\":%u,\"timestamp_ns\":\"%lld\",\"kind\":\"%s\","
+               "\"threshold\":%u,\"matched_count\":%u,\"window_ms\":%lld,\"ordered\":%s},"
                "\"window_ms\":%lld,\"count\":%u,\"distinct\":%u,\"evidence_chain\":[",
-               rule_id, bundle, title, (long long)rule->window_ms, count, distinct);
+               rule_id, bundle, title, pid, (long long)s->last_seen_ns,
+               rule->kind == CORR_KIND_THRESHOLD ? "threshold" : "sequence",
+               rule->kind == CORR_KIND_THRESHOLD ? rule->th_threshold : (uint32_t)rule->n_steps,
+               matched_count, (long long)rule->window_ms, rule->ordered ? "true" : "false",
+               (long long)rule->window_ms, count, distinct);
   for (uint8_t i = 0; i < s->ev_count && n > 0 && (size_t)n < cap; i++) {
     char detail[256];
     corr_json_escape(s->ev[i].key_field, detail, sizeof(detail), 80);
     n += snprintf(out + n, cap - (size_t)n,
-                  "%s{\"type\":%u,\"pid\":%u,\"detail\":\"%s\"}",
-                  i ? "," : "", s->ev[i].type, s->ev[i].pid, detail);
+                  "%s{\"type\":%u,\"pid\":%u,\"event_time_ns\":\"%lld\",\"detail\":\"%s\"}",
+                  i ? "," : "", s->ev[i].type, s->ev[i].pid,
+                  (long long)s->ev[i].event_time_ns, detail);
   }
   if (n > 0 && (size_t)n < cap) {
     snprintf(out + n, cap - (size_t)n, "]}");
@@ -1029,7 +1045,7 @@ static void corr_emit(const CorrRule *rule, CorrStateSlot *s, uint32_t pid,
   a.skip_ai_analysis = false;
   a.timestamp_ns = s->last_seen_ns;
   snprintf(a.triggered_tactics, sizeof(a.triggered_tactics), "%s", rule->mitre_csv);
-  corr_build_subject_json(rule, s, a.user_subject_json, sizeof(a.user_subject_json));
+  corr_build_subject_json(rule, s, pid, a.user_subject_json, sizeof(a.user_subject_json));
   edr_behavior_alert_emit_to_batch(&a);
   corr_inc64(&s_stat_fired);
 }

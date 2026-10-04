@@ -181,7 +181,8 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
                                        float ransom_counter_score, uint8_t script_block_present,
                                        uint8_t amsi_content_present, uint8_t ja3_anomaly, uint8_t sni_anomaly,
                                        uint8_t cert_anomaly, uint8_t suspicious_extension_burst,
-                                       uint8_t shadow_copy_delete) {
+                                       uint8_t shadow_copy_delete, uint32_t event_count,
+                                       uint32_t behavior_flags) {
   if (!al) {
     return;
   }
@@ -201,8 +202,8 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
     forensics = "[\"timeline_window\",\"targeted_files\",\"process_tree\"]";
   }
 
-  char proc_name[256], proc_path[512], cmdline_esc[1024], target_path_esc[512], file_sha_esc[80], remote_ip_esc[64], remote_domain_esc[300];
-  char policy_ver[64], policy_esc[96];
+  char proc_name[512], proc_path[1024], cmdline_esc[2048], target_path_esc[1024], file_sha_esc[80], remote_ip_esc[92], remote_domain_esc[512];
+  char policy_ver[64], policy_esc[128];
   json_escape_copy(al->process_name, proc_name, sizeof(proc_name));
   json_escape_copy(al->process_path, proc_path, sizeof(proc_path));
   json_escape_copy(cmdline, cmdline_esc, sizeof(cmdline_esc));
@@ -213,13 +214,13 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
   edr_ingest_http_copy_policy_version(policy_ver, sizeof(policy_ver));
   json_escape_copy(policy_ver, policy_esc, sizeof(policy_esc));
 
-  char network[512] = "";
+  char network[720] = "";
   if (remote_ip_esc[0] || remote_domain_esc[0] || remote_port != 0u) {
     snprintf(network, sizeof(network),
              ",\"network\":{\"remote_ip\":\"%s\",\"remote_url\":\"%s\",\"dst_port\":%u}",
              remote_ip_esc, remote_domain_esc, (unsigned)remote_port);
   }
-  char file[720] = "";
+  char file[1232] = "";
   if (target_path_esc[0] || file_sha_esc[0]) {
     snprintf(file, sizeof(file),
              ",\"file\":{\"path\":\"%s\",\"sha256\":\"%s\",\"signed\":false,"
@@ -231,10 +232,29 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
     snprintf(policy, sizeof(policy), ",\"policy_version\":\"%s\"", policy_esc);
   }
 
-  snprintf(al->user_subject_json, sizeof(al->user_subject_json),
-           "{\"subject_type\":\"detection_context\",\"detection_context\":{\"engine\":\"%s\","
-           "\"rule_id\":\"%s\",\"confidence\":%.3f,\"process\":{\"pid\":%u,\"name\":\"%s\","
-           "\"path\":\"%s\",\"parent_pid\":%u,\"cmdline\":\"%s\"}%s%s%s,"
+  /* These process display fields already have lossless ABI owners on the
+   * alert. If their duplicate JSON projections overflow, retain unique file,
+   * network and detector facts and disclose the omitted duplicates. */
+  char process[2200];
+  for (unsigned compact = 0; compact < 2u; ++compact) {
+    int process_written;
+    if (compact) {
+      process_written = snprintf(process, sizeof(process), "{\"pid\":%u,\"parent_pid\":%u}",
+                                 (unsigned)al->pid, (unsigned)parent_pid);
+    } else {
+      process_written = snprintf(process, sizeof(process),
+                                 "{\"pid\":%u,\"name\":\"%s\",\"path\":\"%s\",\"parent_pid\":%u,\"cmdline\":\"%s\"}",
+                                 (unsigned)al->pid, proc_name, proc_path, (unsigned)parent_pid, cmdline_esc);
+    }
+    if (process_written < 0 || (size_t)process_written >= sizeof(process)) continue;
+    int written = snprintf(al->user_subject_json, sizeof(al->user_subject_json),
+           "{\"subject_type\":\"detection_context\",\"evaluation_basis\":{"
+           "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\","
+           "\"predicate_matched\":true,\"threshold_met\":true,\"pid\":%u,"
+           "\"timestamp_ns\":\"%lld\",\"threshold\":%.6f,\"event_count\":%u,"
+           "\"behavior_flags\":%u,\"last_event_type\":%u},"
+           "\"detection_context\":{\"engine\":\"%s\","
+           "\"rule_id\":\"%s\",\"confidence\":%.3f,\"process\":%s%s%s%s%s,"
            "\"engine_signals\":{\"shellcode_score\":%.3f,\"webshell_score\":%.3f,"
            "\"pmfe_confidence\":%.3f,\"pmfe_dns_tunnel\":%.3f,\"pmfe_pe_found\":%s,"
            "\"script_content_score\":%.3f,\"tls_anomaly_score\":%.3f,\"ransom_counter_score\":%.3f,"
@@ -243,8 +263,11 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
            "\"shadow_copy_delete\":%s,\"ioc_ip_hit\":%s,\"ioc_domain_hit\":%s,\"ioc_sha256_hit\":%s},"
            "\"suppression\":{\"applied\":false,\"policy_version\":\"%s\"},"
            "\"recommended_forensics\":%s}}",
-           engine, rule_id, (double)al->anomaly_score, (unsigned)al->pid, proc_name, proc_path,
-           (unsigned)parent_pid, cmdline_esc, file, network, policy, (double)shellcode_score, (double)webshell_score,
+           (unsigned)al->pid, (long long)al->timestamp_ns, (double)EDR_AVE_BEH_SCORE_HIGH,
+           (unsigned)event_count, (unsigned)behavior_flags, (unsigned)event_type,
+           engine, rule_id, (double)al->anomaly_score, process, file, network, policy,
+           compact ? ",\"context_degraded\":true,\"projection_omissions\":[\"process.name\",\"process.path\",\"process.cmdline\"],\"omission_source\":\"behavior_alert_fields\"" : "",
+           (double)shellcode_score, (double)webshell_score,
            (double)pmfe_confidence, (double)pmfe_dns_tunnel, pmfe_pe_found ? "true" : "false",
            (double)script_content_score, (double)tls_anomaly_score, (double)ransom_counter_score,
            script_block_present ? "true" : "false", amsi_content_present ? "true" : "false",
@@ -252,6 +275,10 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
            suspicious_extension_burst ? "true" : "false", shadow_copy_delete ? "true" : "false",
            ioc_ip_hit ? "true" : "false", ioc_domain_hit ? "true" : "false", ioc_sha256_hit ? "true" : "false",
            policy_esc, forensics);
+    if (written >= 0 && (size_t)written < sizeof(al->user_subject_json)) return;
+  }
+  al->user_subject_json[0] = '\0';
+  fprintf(stderr, "[ave] alert context serialization failed pid=%u reason=context_capacity\n", al->pid);
 }
 
 static int bp_str_eq_ci(const char *a, const char *b) {
@@ -959,6 +986,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
 
   float an_copy = sl->anomaly;
   uint32_t fl_copy = sl->flags;
+  uint32_t event_count_copy = sl->event_count;
   uint32_t pid_copy = e->pid;
   uint32_t ppid_copy = e->ppid;
   AVEEventType evt_copy = e->event_type;
@@ -1028,24 +1056,15 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     } else if (ev_tgt_path[0] && evt_copy == AVE_EVT_PROCESS_CREATE) {
       memcpy(al.process_path, ev_tgt_path, sizeof(al.process_path));
     }
-    /* 可选：与平台 alerts.user_subject_json 对齐的 JSON 真源（调试用/专线注入；生产建议由策略填 AVEBehaviorAlert） */
+    /* Only the actual local evaluation owns outbound alert identity. */
     {
-      const char *ujs = getenv("EDR_BEHAVIOR_USER_SUBJECT_JSON");
-      if (ujs && ujs[0] == '{') {
-        size_t n = strlen(ujs);
-        if (n < sizeof(al.user_subject_json)) {
-          memcpy(al.user_subject_json, ujs, n + 1u);
-        }
-      }
-    }
-    if (!al.user_subject_json[0]) {
       ave_fill_detection_context(&al, evt_copy, ppid_copy, ev_cmdline, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
                                  ev_tgt_port, ev_shellcode_score, ev_webshell_score, ev_pmfe_confidence,
                                  ev_pmfe_dns_tunnel, ev_pmfe_pe_found, ev_ioc_ip_hit, ev_ioc_domain_hit,
                                  ev_ioc_sha256_hit, ev_script_content_score, ev_tls_anomaly_score,
                                  ev_ransom_counter_score, ev_script_block_present, ev_amsi_content_present,
                                  ev_ja3_anomaly, ev_sni_anomaly, ev_cert_anomaly, ev_suspicious_extension_burst,
-                                 ev_shadow_copy_delete);
+                                 ev_shadow_copy_delete, event_count_copy, fl_copy);
     }
     if (!al.related_iocs_json[0]) {
       ave_fill_related_iocs_json(&al, ev_tgt_ip, ev_tgt_domain, ev_file_sha, ev_ioc_ip_hit, ev_ioc_domain_hit,

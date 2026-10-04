@@ -81,3 +81,68 @@ rules. It is a portable regression environment, not a production acceptance
 substitute. Native Windows/authenticated-rule and end-to-end results must be
 reported separately. No detector configuration or collection is weakened on an
 endpoint by running this disposable build.
+
+## Stage 2: final request purpose and field boundaries
+
+The authoritative owners are `egress_batch_policy.c` and
+`egress_request_policy.c`. Preprocessing uses the same frame contract before
+batch assembly, and HTTP validates the final immutable envelope before native
+or libcurl I/O. Independent multipart, stream, updater, collector bootstrap and
+uninstall attestation paths are covered. The approved minimum control messages
+have separate exact route, query and field contracts. Command/query results,
+inventory, attachments, update logs and unknown purposes are denied.
+
+See [the complete egress inventory](egress_policy_v1.md) for each caller, purpose,
+field group, size, scheduling/dedup owner and receipt semantics. Alerts require
+actual detector-owned triggering facts and source identity. AVE/correlation/
+fanout produce their basis only at the detector's actual emit point; this is
+distinct from priority, score or labels. A real accumulated AVE detection is not
+lost when the latest PMFE hint is zero. Standalone positive PMFE/shellcode/webshell
+verdicts can qualify without an embedded BehaviorAlert. The actual PMFE context
+builder is tested; a clean follow-up ID alone is insufficient.
+
+Known protobuf descriptors reject unknown tags, duplicate singular/oneof fields,
+embedded NUL strings, invalid encoding and unsupported types. JSON parsers reject
+duplicate members, incomplete input and decoded NUL suffixes. Detector subjects,
+basis and source bindings have explicit current-member lists; arbitrary extra
+subject members and opaque unrelated IOC objects are rejected. General context
+subtrees and per-rule necessity still require narrower contracts; this is not a
+claim that every retained field is minimal for every rule.
+
+Health projection uses one exact path/type whitelist for full and delta uploads.
+Known bounded cause codes remain distinguishable; free text and raw process/user/
+path/command details stay local. Allocation failure refuses the projection rather
+than acknowledging a partial summary. Removal-only deltas remain compatible.
+Health revision ACKs never acknowledge diagnostic evidence or event batches.
+
+Detector context overflow originally either truncated source identity or emitted
+invalid JSON. P0 now preserves the complete required rule/bundle/source tuple in
+its bounded fallback; AVE omits only duplicate process display projections and
+retains the original alert ABI fields plus unique file/network/detection facts.
+The governor's aggregate counter is health data, rather than a pid-zero pseudo
+alert that could contaminate a real-alert batch. TLS now verifies the peer's DNS
+or IP identity in addition to its CA chain. Fresh envelopes use identity encoding
+when an optional outbound zstd dictionary cannot be inspected by the validator.
+
+New regression suites include actual encoding/decoding, ordinary and valid
+loopback events, false/empty/prose PMFE, priority-only events, source-only,
+mixed/raw/LZ4 batches, unknown versions/tags, false predicates, contradictory
+verdicts, and unsupported channels. The actual AVE SDK produced 21 alerts,
+including a forced capacity fallback, all accepted by the production codec and
+policy. A maximum rule/bundle/tenant identity fixture preserves its exact source
+binding through both preview failures.
+
+The first broadened build exposed a missing policy link on the collector test;
+it is repaired. A broadened run exposed the AVE fixture that did not actually
+overflow and outdated arbitrary-download expectations. Deterministic quoted
+input now exercises the real capacity path. Collector replacement, hashes,
+refresh and fallback still pass through approved bootstrap routes, while
+unapproved native/subprocess downloads are explicitly rejected. These were
+development failures, not passes attributed to the original code.
+
+Stage 2 was also exported from its own Git index into a disposable directory,
+without the Stage 3 owner/schema/queue changes or TLS fixture. Its full native
+build (685 Ninja steps) and 16 focused CTest cases passed. This verifies that
+the second commit is independently buildable and reviewable. Windows binaries
+were not built. The separate headless policy target preserves its static CRT
+while using the same authoritative policy sources.

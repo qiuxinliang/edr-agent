@@ -277,7 +277,6 @@ cmake --build build
 | `EDR_QUEUE_MAX_RETRIES` | 单条补传最大重试次数，默认 `100`；`0` 表示不限制。 |
 | `EDR_QUEUE_MAX_DB_MB` | 队列库文件大小上限（MB，粗粒度 `stat`），超出则拒绝新入队；未设置则不限制。（当前非 Windows 生效） |
 | `EDR_BEHAVIOR_ENCODING` | 见「Protobuf（nanopb）」：`protobuf` / `protobuf_c` / 默认 BER1。 |
-| `EDR_BEHAVIOR_USER_SUBJECT_JSON` | 若设为以 `{` 开头的 JSON 串且长度 < 1KiB，行为告警触发时写入 **`AVEBehaviorAlert.user_subject_json`**，经 ingest 入平台 `alerts.user_subject_json`（**调试用/专线**；与 `edr-backend` 000057 对账）。 |
 | `EDR_P0_DIRECT_EMIT` | `=0` 时禁用 P0 直出；**默认启用**（未设置或设置为1），见 **`docs/EDR_P0_DIRECT_EMIT_E2E.md`**。 |
 | `EDR_P0_DEDUP_SEC` | P0 直出对同一 `(rule_id,endpoint_id,pid)` 的**秒级去重**；默认 `2`；`0` 关。 |
 | `EDR_P0_MAX_EMITS_PER_MIN` | P0 直出**全进程**滑动 60s 内条数上限；`0` 或未设=不限制。 |

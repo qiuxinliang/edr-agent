@@ -2,6 +2,7 @@
 #include "edr/health_upload.h"
 #include "edr/time_util.h"
 #include "edr/ingest_http.h"
+#include "edr/egress_request_policy.h"
 #include "http_budget.h"
 
 #include "edr/command.h"
@@ -121,6 +122,8 @@ static unsigned long s_report_events_v2_fail;
 static unsigned long s_report_events_post_ok;
 static uint64_t s_report_events_post_ok_body_bytes;
 static uint64_t s_report_events_post_attempt_body_bytes;
+static unsigned long s_egress_denied_count;
+static char s_egress_last_reason[128];
 
 static int ascii_eq_ci(const char *a, const char *b);
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -1633,6 +1636,8 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->report_events_post_ok_count = s_report_events_post_ok;
   out->report_events_post_ok_body_bytes = s_report_events_post_ok_body_bytes;
   out->report_events_post_attempt_body_bytes = s_report_events_post_attempt_body_bytes;
+  out->egress_denied_count = s_egress_denied_count;
+  snprintf(out->egress_last_reason, sizeof(out->egress_last_reason), "%s", s_egress_last_reason);
   out->zstd_compress_ok_count = s_zstd_compress_ok;
   out->zstd_compress_fail_count = s_zstd_compress_fail;
   out->http2_multiplex_ok_count = s_http2_multiplex_ok;
@@ -2047,6 +2052,13 @@ static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
     int level = (int)env_ul_clamped("EDR_ZSTD_LEVEL", 3ul, 1ul, 19ul);
     ZSTD_CCtx *cctx;
     zstd_load_dict_once();
+    if (s_zstd_dict && s_zstd_dict_len > 0u) {
+      /* Compression is optional. Preserve proven alert delivery using the
+       * existing identity codec until the immutable envelope validator owns
+       * the configured dictionary. Never weaken inspection or reject an
+       * otherwise valid alert merely because this optimization is enabled. */
+      return 0;
+    }
     bound = ZSTD_compressBound(raw_len);
     dst = (uint8_t *)malloc(bound);
     if (!dst) {
@@ -2063,12 +2075,7 @@ static int maybe_zstd_compress_payload(const uint8_t *raw, size_t raw_len,
       runtime_state_unlock();
       return 0;
     }
-    if (s_zstd_dict && s_zstd_dict_len > 0u) {
-      n = ZSTD_compress_usingDict(cctx, dst, bound, raw, raw_len,
-                                  s_zstd_dict, s_zstd_dict_len, level);
-    } else {
-      n = ZSTD_compressCCtx(cctx, dst, bound, raw, raw_len, level);
-    }
+    n = ZSTD_compressCCtx(cctx, dst, bound, raw, raw_len, level);
     ZSTD_freeCCtx(cctx);
     if (ZSTD_isError(n)) {
       free(dst);
@@ -3343,6 +3350,17 @@ static SSL_CTX *new_https_ctx(void) {
   SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
   return ctx;
 }
+
+static int https_set_peer_identity(SSL *ssl, const char *host) {
+  unsigned char address[16];
+  int literal = inet_pton(AF_INET, host, address) == 1 || inet_pton(AF_INET6, host, address) == 1;
+  int ok = literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) : SSL_set1_host(ssl, host);
+  if (ok != 1) {
+    runtime_failure("https certificate peer identity configuration failed");
+    return 0;
+  }
+  return 1;
+}
 #endif
 
 static int http_socket_recv_adapter(void *ctx, char *buf, int cap) {
@@ -3446,6 +3464,10 @@ static int http_conn_open_new(EdrHttpConn *conn, const char *host, int port, int
     SSL_set_fd(conn->ssl, conn->fd);
 #endif
     (void)SSL_set_tlsext_host_name(conn->ssl, host);
+    if (!https_set_peer_identity(conn->ssl, host)) {
+      http_conn_close(conn);
+      return -1;
+    }
     if (SSL_connect(conn->ssl) != 1) {
       long verify = SSL_get_verify_result(conn->ssl);
       if (verify != X509_V_OK) {
@@ -3499,6 +3521,24 @@ static const char *base_name_ptr(const char *path);
 
 static int native_post_json(const char *url, const char *body, size_t body_len) {
   return native_request("POST", url, "application/json", body, body_len, NULL, 0u);
+}
+
+static int egress_request_allowed(const char *method, const char *url,
+                                   const char *content_type, const void *body, size_t len) {
+  char reason[128];
+  int rc = edr_egress_request_validate(method, url, content_type, body, len, reason, sizeof(reason));
+  if (rc != 0) {
+    /* Policy refusal is local. It must not trigger route failover, a circuit
+     * penalty, or a receipt. Reasons contain schema codes, never payloads. */
+    char message[160];
+    snprintf(message, sizeof(message), "egress_denied:%s", reason);
+    runtime_string_set(s_last_error, sizeof(s_last_error), message);
+    runtime_state_lock();
+    s_egress_denied_count++;
+    snprintf(s_egress_last_reason, sizeof(s_egress_last_reason), "%s", reason);
+    runtime_state_unlock();
+  }
+  return rc;
 }
 
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -4348,6 +4388,7 @@ static int curl_h2_stream_loop(const char *url) {
   CURLcode cc;
   int h2;
   char errbuf[CURL_ERROR_SIZE];
+  if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
   if (!curl_h2_allowed_for_url(url) || !curl_global_ready()) {
     return -2;
   }
@@ -4415,6 +4456,7 @@ static int curl_h1_stream_loop(const char *url) {
   CURLcode cc;
   char errbuf[CURL_ERROR_SIZE];
   long http_version = 0L;
+  if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
   if (!url || strncmp(url, "https://", 8u) != 0 || !curl_global_ready()) {
     return -2;
   }
@@ -4520,6 +4562,8 @@ static int native_request_ex(const char *method, const char *url, const char *co
   int port = 0;
   int https = 0;
   int rc = -1;
+  if (egress_request_allowed(method, url, content_type, body, body_len) != 0)
+    return EDR_EGRESS_REQUEST_DENIED;
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4674,6 +4718,7 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
     return -1;
   }
   rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
+  if (rc == EDR_EGRESS_REQUEST_DENIED) return rc;
   if (rc == 0) {
     route_note_success();
     return 0;
@@ -4868,6 +4913,7 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   int https = 0;
   int rc = -1;
   char req[8192];
+  if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
   if (!out || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -5175,6 +5221,7 @@ static int stream_connect_once(EdrWsConn *out) {
   if (!build_control_stream_url(url, sizeof(url))) {
     return -1;
   }
+  if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     return -1;
   }
@@ -5206,6 +5253,11 @@ static int stream_connect_once(EdrWsConn *out) {
     SSL_set_fd(out->ssl, out->fd);
 #endif
     (void)SSL_set_tlsext_host_name(out->ssl, host);
+    if (!https_set_peer_identity(out->ssl, host)) {
+      ws_close_conn(out);
+      net_done();
+      return -1;
+    }
     if (SSL_connect(out->ssl) != 1) {
       runtime_failure_openssl("control stream tls connect failed");
       ws_close_conn(out);
@@ -5582,8 +5634,15 @@ int edr_ingest_http_post_engine_health_json(const char *body_json) {
     return -1;
   }
 
-  int rc = edr_health_upload(&s_health_upload, body_json, edr_monotonic_ns(),
+  char reason[128];
+  char *minimal = edr_egress_health_project(body_json, reason, sizeof(reason));
+  if (!minimal) {
+    runtime_string_set(s_last_error, sizeof(s_last_error), reason);
+    return EDR_EGRESS_REQUEST_DENIED;
+  }
+  int rc = edr_health_upload(&s_health_upload, minimal, edr_monotonic_ns(),
                              send_engine_health, NULL);
+  free(minimal);
   if (rc != 0) {
     log_native_post_failure("engine_health", rc);
     return -1;
@@ -5667,7 +5726,9 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
   nonce = json_escape_alloc(config_nonce ? config_nonce : "");
   sig = json_escape_alloc(config_signature ? config_signature : "");
   key_id = json_escape_alloc(signing_key_id ? signing_key_id : "");
-  reject = json_escape_alloc(reject_reason ? reject_reason : "");
+  /* Full verification detail remains local. The control receipt needs only
+   * whether validation failed, never downloaded content or a transport URL. */
+  reject = json_escape_alloc(reject_reason && reject_reason[0] ? "config_validation_failed" : "");
   desired_ver = json_escape_alloc(desired_version && desired_version[0] ? desired_version : "");
   desired_h = json_escape_alloc(desired_hash && desired_hash[0] ? desired_hash : (config_hash ? config_hash : ""));
   status = json_escape_alloc(apply_status && apply_status[0] ? apply_status : "reported");
@@ -5728,6 +5789,7 @@ static void command_result_note_delivery_failure(const char *response) {
   }
   runtime_state_lock();
   s_last_command_result_retryable =
+      strncmp(transport_error, "egress_denied:", 14u) != 0 &&
       !(status >= 400 && status < 500 && status != 408 && status != 429);
   if (status > 0 || code[0] || message[0]) {
     snprintf(s_last_command_result_error, sizeof(s_last_command_result_error),
@@ -5892,7 +5954,8 @@ static int edr_ingest_http_post_control_ack_with_status(const char *command_id, 
   cmd = json_escape_alloc(command_id);
   tr = json_escape_alloc((transport && transport[0]) ? transport : "https_control");
   st = json_escape_alloc((status && status[0]) ? status : "received");
-  why = json_escape_alloc(reason ? reason : "");
+  why = json_escape_alloc(reason && reason[0] ?
+      (!strcmp(reason, "command_id_conflict") ? "command_id_conflict" : "control_validation_failed") : "");
   if (!cmd || !tr || !st || !why) {
     free(cmd);
     free(tr);
@@ -6298,6 +6361,11 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   }
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0]) {
     return -1;
+  }
+  if (egress_request_allowed("POST", "ingest/upload-file", "multipart/form-data", NULL, 0u) != 0) {
+    runtime_string_set(s_upload_status, sizeof(s_upload_status), "egress_denied");
+    note_upload_failure();
+    return EDR_EGRESS_REQUEST_DENIED;
   }
   runtime_string_set(s_upload_status, sizeof(s_upload_status), "opening");
   file = fopen(file_path, "rb");

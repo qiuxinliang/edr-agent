@@ -3485,8 +3485,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   {
     unsigned full_values_capped = 0u;
     unsigned full_escape_overflows = 0u;
-    char esc_rule_id[80];
-    char esc_bundle[160];
+    char esc_rule_id[384];
+    char esc_bundle[768];
     char esc_bundle_sha256[80];
     char esc_title[640];
     char esc_proc[384];
@@ -3504,8 +3504,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_parent_cmdline[2048];
     char esc_gp[256];
     char username_esc[512];
-    char esc_ep[96];
-    char esc_tenant[96];
+    char esc_ep[288];
+    char esc_tenant[384];
     char esc_host[256];
     char esc_domain[256];
     char esc_cwd[512];
@@ -3524,7 +3524,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     char esc_enforcement_action[96];
     char esc_enforcement_message[320];
     char esc_user_sid[320], esc_logon_id[96], esc_creator_user[320], esc_creator_domain[320];
-    char esc_creator_sid[320], esc_creator_logon[96], esc_identity_source[64], esc_identity_quality[64], esc_event_id[96];
+    char esc_creator_sid[320], esc_creator_logon[96], esc_identity_source[64], esc_identity_quality[64], esc_event_id[288];
     char parent_name_buf[sizeof(br->parent_name)];
     char parent_path_buf[sizeof(br->parent_path)];
     const char *canonical_image_path = br->image_path_canonical[0]
@@ -3538,8 +3538,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
      * A live PID lookup here (especially during deferred replay) can describe
      * a different parent lifetime. Preserve missing fields instead. */
 
-    p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 48);
-    p0_json_escape_or_empty(binding->rules_bundle_version, esc_bundle, sizeof(esc_bundle), 128);
+    p0_json_escape_or_empty(rule_id, esc_rule_id, sizeof(esc_rule_id), 63);
+    p0_json_escape_or_empty(binding->rules_bundle_version, esc_bundle, sizeof(esc_bundle), 127);
     p0_json_escape_or_empty(binding->artifact_sha256, esc_bundle_sha256, sizeof(esc_bundle_sha256), 64);
     p0_json_escape_or_empty(title ? title : "", esc_title, sizeof(esc_title), 240);
     p0_json_escape_or_empty(pn && pn[0] ? pn : "", esc_proc, sizeof(esc_proc), 160);
@@ -3577,8 +3577,8 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
                             sizeof(esc_parent_cmdline), 480);
     p0_json_escape_or_empty(br->grandparent_name[0] ? br->grandparent_name : "", esc_gp, sizeof(esc_gp), 128);
     p0_json_escape_or_empty(br->username[0] ? br->username : "", username_esc, sizeof(username_esc), 160);
-    p0_json_escape_or_empty(br->endpoint_id[0] ? br->endpoint_id : "", esc_ep, sizeof(esc_ep), 80);
-    p0_json_escape_or_empty(br->tenant_id[0] ? br->tenant_id : "", esc_tenant, sizeof(esc_tenant), 64);
+    p0_json_escape_or_empty(br->endpoint_id[0] ? br->endpoint_id : "", esc_ep, sizeof(esc_ep), sizeof(br->endpoint_id) - 1u);
+    p0_json_escape_or_empty(br->tenant_id[0] ? br->tenant_id : "", esc_tenant, sizeof(esc_tenant), sizeof(br->tenant_id) - 1u);
     p0_json_escape_or_empty(br->hostname[0] ? br->hostname : "", esc_host, sizeof(esc_host), 128);
     p0_json_escape_or_empty(br->domain[0] ? br->domain : "", esc_domain, sizeof(esc_domain), 128);
     p0_json_escape_or_empty(br->user_sid, esc_user_sid, sizeof(esc_user_sid), 256);
@@ -3589,7 +3589,7 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     p0_json_escape_or_empty(br->creator_logon_id, esc_creator_logon, sizeof(esc_creator_logon), 64);
     p0_json_escape_or_empty(br->identity_source, esc_identity_source, sizeof(esc_identity_source), 32);
     p0_json_escape_or_empty(br->identity_quality, esc_identity_quality, sizeof(esc_identity_quality), 32);
-    p0_json_escape_or_empty(br->event_id, esc_event_id, sizeof(esc_event_id), 48);
+    p0_json_escape_or_empty(br->event_id, esc_event_id, sizeof(esc_event_id), sizeof(br->event_id) - 1u);
     p0_json_escape_or_empty(br->current_directory[0] ? br->current_directory : "", esc_cwd, sizeof(esc_cwd), 240);
     p0_json_escape_or_empty(br->integrity_level[0] ? br->integrity_level : "Unknown", esc_il, sizeof(esc_il), 48);
     p0_json_escape_or_empty(br->process_creation_time[0] ? br->process_creation_time : "", esc_pct, sizeof(esc_pct),
@@ -3729,20 +3729,23 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     emitted_metrics.escape_overflow_values += full_escape_overflows;
     if (full_escape_overflows != 0u || n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
       /* Rebuild from scratch.  Do not emit snprintf's partial JSON. */
-      char crule[128], cbundle[192], cbundle_sha256[80], cproc[384], cpath[768],
-           ccanonical[768], cep[128], ctenant[128], cevent[192];
+      char crule[384], cbundle[768], cbundle_sha256[80], cproc[384], cpath[768],
+           ccanonical[768], cep[288], ctenant[384], cevent[288];
       char cuser[384], csid[384], csource[128], cquality[128], caction[192], cmessage[384], identity[1152];
-      int compact_ok =
-          p0_json_escape_compact(rule_id, crule, sizeof(crule), 24) &&
-          p0_json_escape_compact(binding->rules_bundle_version, cbundle, sizeof(cbundle), 48) &&
+      /* Core identifiers are lossless and independent of optional previews.
+       * These buffers fit the full ABI values even at six-byte JSON escaping. */
+      int core_ok =
+          p0_json_escape_compact(rule_id, crule, sizeof(crule), 63) &&
+          p0_json_escape_compact(binding->rules_bundle_version, cbundle, sizeof(cbundle), 127) &&
           p0_json_escape_compact(binding->artifact_sha256, cbundle_sha256, sizeof(cbundle_sha256), 64) &&
+          p0_json_escape_compact(br->endpoint_id, cep, sizeof(cep), sizeof(br->endpoint_id) - 1u) &&
+          p0_json_escape_compact(br->tenant_id, ctenant, sizeof(ctenant), sizeof(br->tenant_id) - 1u) &&
+          p0_json_escape_compact(br->event_id, cevent, sizeof(cevent), sizeof(br->event_id) - 1u);
+      int compact_ok = core_ok &&
           p0_json_escape_compact(pn ? pn : "", cproc, sizeof(cproc), 96) &&
           p0_json_escape_compact(alert_process_path, cpath, sizeof(cpath), 180) &&
           p0_json_escape_compact(canonical_image_path, ccanonical,
                                  sizeof(ccanonical), 180) &&
-          p0_json_escape_compact(br->endpoint_id, cep, sizeof(cep), 48) &&
-          p0_json_escape_compact(br->tenant_id, ctenant, sizeof(ctenant), 48) &&
-          p0_json_escape_compact(br->event_id, cevent, sizeof(cevent), 48) &&
           p0_json_escape_compact(br->username, cuser, sizeof(cuser), 96) &&
           p0_json_escape_compact(br->user_sid, csid, sizeof(csid), 96) &&
           p0_json_escape_compact(br->identity_source, csource, sizeof(csource), 24) &&
@@ -3769,9 +3772,25 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
           enforcement.succeeded ? "true" : "false", caction, enforcement.error_code, cmessage);
       }
       if (!compact_ok || n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
-        snprintf(a.user_subject_json, sizeof(a.user_subject_json),
-                 "{\"subject_type\":\"edr_dynamic_rule\",\"context\":{\"context_degraded\":true},\"enforcement\":{\"requested\":false,\"attempted\":false,\"succeeded\":false}}");
-        emitted_metrics.minimal_failures++;
+        /* The complete record stays in the combined durable frame. A preview
+         * failure cannot erase the exact matched rule and source association. */
+        n = core_ok ? snprintf(a.user_subject_json, sizeof(a.user_subject_json),
+            "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\","
+            "\"rules_bundle_version\":\"%s\",\"rules_bundle_sha256\":\"%s\","
+            "\"context\":{\"context_degraded\":true,\"context_error\":\"optional_context_capacity\","
+            "\"pid\":%u,\"ppid\":%u,\"event_type\":%d,\"process_start_key\":%s,"
+            "\"process_creation_filetime_100ns\":%s,\"endpoint_id\":\"%s\","
+            "\"tenant_id\":\"%s\",\"source_event_id\":\"%s\"},"
+            "\"enforcement\":{\"requested\":%s,\"attempted\":%s,\"succeeded\":%s,\"error_code\":%u}}",
+            crule, cbundle, cbundle_sha256, br->pid, br->ppid, (int)br->type,
+            process_start_key_json, process_creation_filetime_json, cep, ctenant, cevent,
+            enforcement.requested ? "true" : "false", enforcement.attempted ? "true" : "false",
+            enforcement.succeeded ? "true" : "false", enforcement.error_code) : -1;
+        if (n < 0 || (size_t)n >= sizeof(a.user_subject_json)) {
+          a.user_subject_json[0] = '\0';
+          emitted_metrics.minimal_failures++;
+          fprintf(stderr, "[p0] alert source binding serialization failed pid=%u\n", br->pid);
+        }
       }
       emitted_metrics.emitted_without_full_context++;
     } else {

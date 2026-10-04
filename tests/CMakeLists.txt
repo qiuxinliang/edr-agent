@@ -787,6 +787,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_CURRENT_SOURCE_DIR}/stub_preprocess_agent_ids.c
 )
 add_library(edr_ave_test_common INTERFACE)
+target_link_libraries(edr_ave_test_common INTERFACE edr_egress_policy)
 target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src/ave
@@ -1155,8 +1156,11 @@ add_executable(test_p0_direct_emit_suppression ${CMAKE_CURRENT_SOURCE_DIR}/test_
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_p0_direct_emit_suppression PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
-target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads)
+target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1 EDR_HAVE_NANOPB=1)
+target_sources(test_p0_direct_emit_suppression PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
+target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads edr_egress_policy)
 edr_apply_test_warnings(test_p0_direct_emit_suppression)
 add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(p0_direct_emit_suppression PROPERTIES TIMEOUT 120)
@@ -1553,8 +1557,9 @@ set_tests_properties(shellcode_runtime_truth_contract PROPERTIES
 add_executable(test_net_fanout
   ${CMAKE_CURRENT_SOURCE_DIR}/test_net_fanout.c
   ${CMAKE_SOURCE_DIR}/src/detection/net_fanout_core.c
-  ${CMAKE_SOURCE_DIR}/src/detection/net_fanout_detector.c)
-target_include_directories(test_net_fanout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/detection)
+  ${CMAKE_SOURCE_DIR}/src/detection/net_fanout_detector.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_net_fanout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/detection ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_net_fanout)
 add_test(NAME net_fanout COMMAND test_net_fanout WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -1641,6 +1646,27 @@ target_include_directories(test_health_upload PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_health_upload)
 add_test(NAME health_upload COMMAND test_health_upload)
+
+add_executable(test_egress_batch_policy test_egress_batch_policy.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
+target_link_libraries(test_egress_batch_policy PRIVATE edr_egress_policy)
+target_compile_definitions(test_egress_batch_policy PRIVATE EDR_HAVE_NANOPB=1)
+if(WIN32)
+  target_link_libraries(test_egress_batch_policy PRIVATE ws2_32)
+endif()
+edr_apply_test_warnings(test_egress_batch_policy)
+add_test(NAME egress_batch_policy COMMAND test_egress_batch_policy)
+add_executable(test_egress_request_policy test_egress_request_policy.c)
+target_link_libraries(test_egress_request_policy PRIVATE edr_egress_policy)
+edr_apply_test_warnings(test_egress_request_policy)
+add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
+target_link_libraries(test_deep_collector_manifest PRIVATE edr_egress_policy)
+
 
 add_executable(test_runtime_health test_runtime_health.c)
 edr_apply_test_warnings(test_runtime_health)

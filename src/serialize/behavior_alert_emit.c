@@ -245,18 +245,13 @@ static int emit_record_alert_callback(void *context) {
 
 static void emit_volume_summary(uint64_t suppressed_count, uint64_t timestamp_ns,
                                 const char *ep, const char *te) {
-  AVEBehaviorAlert summary;
-  memset(&summary, 0, sizeof(summary));
-  summary.timestamp_ns = timestamp_ns;
-  summary.anomaly_score = 0.1f;
-  summary.skip_ai_analysis = true;
-  snprintf(summary.process_name, sizeof(summary.process_name), "edr-agent");
-  snprintf(summary.triggered_tactics, sizeof(summary.triggered_tactics), "alert_volume_control");
-  snprintf(summary.user_subject_json, sizeof(summary.user_subject_json),
-           "{\"rule_id\":\"alert_cardinality_summary\",\"suppressed_count\":%llu,"
-           "\"period_seconds\":60,\"source\":\"agent_alert_governor\"}",
-           (unsigned long long)suppressed_count);
-  emit_raw(&summary, ep, te);
+  /* The governor owns aggregate health counters, already exposed by the
+   * capability manifest. A pid=0 pseudo-alert would contaminate a batch of
+   * genuine alerts and has no detection provenance. Keep its local diagnostic
+   * and send only the whitelisted health counters through their normal owner. */
+  (void)timestamp_ns; (void)ep; (void)te;
+  fprintf(stderr, "[alert-governor] suppressed_count=%llu period_seconds=60\n",
+          (unsigned long long)suppressed_count);
 }
 #else
 size_t edr_behavior_record_alert_encode_durable_wire(const EdrBehaviorRecord *record,

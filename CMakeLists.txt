@@ -912,6 +912,47 @@ if(EDR_BUILD_AVE_SHARED_LIB)
   add_subdirectory(src/ave)
 endif()
 
+# One policy owner is linked by the agent and by isolated transport tests.
+# Keep parsers shared with the existing wire contract; no new dependency.
+add_library(edr_egress_policy STATIC
+  src/transport/egress_batch_policy.c
+  src/transport/egress_request_policy.c
+  src/proto/edr/v1/event.pb.c
+  third_party/nanopb/pb_common.c
+  third_party/nanopb/pb_decode.c
+  third_party/cjson/cJSON.c
+  third_party/lz4/lz4.c)
+target_include_directories(edr_egress_policy PUBLIC include third_party/cjson
+  third_party/nanopb src/proto third_party/lz4)
+target_compile_definitions(edr_egress_policy PUBLIC PB_FIELD_32BIT=1 EDR_HAVE_LZ4=1)
+if(UNIX)
+  target_link_libraries(edr_egress_policy PUBLIC m)
+endif()
+edr_apply_common_warnings(edr_egress_policy)
+if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
+  target_compile_definitions(edr_egress_policy PRIVATE EDR_HAVE_ZSTD=1)
+  if(EDR_ZSTD_TARGET)
+    target_link_libraries(edr_egress_policy PUBLIC ${EDR_ZSTD_TARGET})
+  else()
+    target_include_directories(edr_egress_policy PRIVATE ${EDR_ZSTD_INCLUDE_DIR})
+    target_link_libraries(edr_egress_policy PUBLIC ${EDR_ZSTD_LIBRARY})
+  endif()
+endif()
+target_link_libraries(edr_agent PRIVATE edr_egress_policy)
+if(TARGET fd_headless_uninstaller)
+  # The detached finalizer requires a static CRT and cannot share the agent's
+  # dynamic-CRT objects. Compile the same authoritative policy for that ABI.
+  get_target_property(_headless_policy_sources edr_egress_policy SOURCES)
+  add_library(edr_egress_policy_headless STATIC ${_headless_policy_sources})
+  target_include_directories(edr_egress_policy_headless PUBLIC
+    $<TARGET_PROPERTY:edr_egress_policy,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(edr_egress_policy_headless PUBLIC PB_FIELD_32BIT=1 EDR_HAVE_LZ4=1)
+  set_property(TARGET edr_egress_policy_headless PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  edr_apply_common_warnings(edr_egress_policy_headless)
+  target_link_libraries(fd_headless_uninstaller PRIVATE edr_egress_policy_headless)
+endif()
+
 if(EDR_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

@@ -1,6 +1,7 @@
 #include "edr/deep_collector.h"
 
 #include "edr/ingest_http.h"
+#include "edr/egress_request_policy.h"
 #include "edr/sha256.h"
 
 #include <stdio.h>
@@ -239,6 +240,12 @@ static int dc_tls_ca_ok(const char *p) {
 
 static int dc_download(const char *url, const char *dest) {
   g_dc_download_detail[0] = '\0';
+  char admission_reason[128];
+  if (edr_egress_request_validate("GET", url, NULL, NULL, 0u,
+      admission_reason, sizeof(admission_reason)) != 0) {
+    dc_set_download_detail("egress purpose denied: %s", admission_reason, 0);
+    return EDR_EGRESS_REQUEST_DENIED;
+  }
   if (!dc_url_ok(url) || !dc_path_ok(dest)) {
     dc_set_download_detail("invalid url or destination", NULL, 0);
     return -1;
@@ -272,22 +279,21 @@ static int dc_download(const char *url, const char *dest) {
   }
   const char *ca = getenv("EDR_FORENSIC_CA_CERT");
   const char *insec = getenv("EDR_FORENSIC_COLLECTOR_INSECURE_TLS");
-  int use_insecure = insec && insec[0] == '1';
-  int use_ca = !use_insecure && dc_tls_ca_ok(ca);
+  if (insec && insec[0] == '1') {
+    dc_set_download_detail("TLS verification required by egress policy", NULL, 0);
+    return -1;
+  }
+  int use_ca = dc_tls_ca_ok(ca);
 #ifdef _WIN32
   char cmd[4096];
   char tlsopt[1200];
   tlsopt[0] = '\0';
-  if (use_insecure) {
-    snprintf(tlsopt, sizeof(tlsopt), " -k");
-  } else if (use_ca) {
+  if (use_ca) {
     snprintf(tlsopt, sizeof(tlsopt), " --cacert \"%s\"", ca);
   }
   /* 直起 curl.exe(lpApplicationName=NULL → 按 PATH 解析首 token);不走 cmd.exe,故无 shell 解释。
-   * url/dest/ca 已过字符护栏,引号包裹安全。
-   * --ssl-no-revoke:Windows 自带 curl 用 Schannel 后端,对私有 CA(mkcert/企业自签,无 CRL/OCSP)会因
-   * "revocation status unknown" 拒绝(curl: (60));跳过吊销检查(仍校验证书链),这是私有 CA 的标准做法。 */
-  snprintf(cmd, sizeof(cmd), "curl.exe -fsSL --ssl-no-revoke%s \"%s\" -o \"%s\"", tlsopt, url, dest);
+   * url/dest/ca 已过字符护栏,引号包裹安全。保留正常证书链、身份及吊销校验。 */
+  snprintf(cmd, sizeof(cmd), "curl.exe -fsS%s \"%s\" -o \"%s\"", tlsopt, url, dest);
   STARTUPINFOA si = { sizeof(si) };
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_HIDE;
@@ -332,10 +338,8 @@ static int dc_download(const char *url, const char *dest) {
     const char *argv[12];
     int n = 0;
     argv[n++] = "curl";
-    argv[n++] = "-fsSL";
-    if (use_insecure) {
-      argv[n++] = "-k";
-    } else if (use_ca) {
+    argv[n++] = "-fsS";
+    if (use_ca) {
       argv[n++] = "--cacert";
       argv[n++] = ca;
     }

@@ -12,6 +12,7 @@
 #include "edr/command.h"
 #include "edr/dedup.h"
 #include "edr/detection_decision.h"
+#include "edr/egress_batch_policy.h"
 #include "edr/emit_rules.h"
 #include "edr/event_batch.h"
 #include "edr/event_bus.h"
@@ -1114,7 +1115,13 @@ static void emit_behavior_record(const EdrBehaviorRecord *br) {
     n = edr_behavior_wire_encode(br, buf, EDR_EVENT_BATCH_CAP);
   }
   if (n > 0) {
-    if (edr_event_batch_push(buf, n) != 0) {
+    char reason[96];
+    if (!edr_egress_frame_validate(buf, n, reason, sizeof(reason))) {
+      /* Detectors, generation-bound cache, AVE and local forensic consumers
+       * ran above. Only actual source+alert frames enter the sending batch;
+       * plain heuristic candidates stay with their existing local owner. */
+      edr_p0_rule_observe_validation_stage(br, "telemetry_disposition", reason);
+    } else if (edr_event_batch_push(buf, n) != 0) {
       fprintf(stderr, "[preprocess] batch admission failed event=%s; local evidence retained where eligible\n",
               br->event_id);
     }

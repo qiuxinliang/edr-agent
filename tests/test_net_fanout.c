@@ -6,6 +6,7 @@
 #include "edr/behavior_record.h"
 #include "edr/resource.h"
 #include "edr/time_util.h"
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,8 @@ static int test_detector_rejects_unrepresentable_alert_identity(void) {
   memset(&record, 0, sizeof(record));
   record.type = EDR_EVENT_NET_CONNECT;
   record.pid = 4242u;
+  record.event_time_ns = INT64_C(1700000000000000000);
+  snprintf(record.event_id, sizeof(record.event_id), "fanout-source-test");
   record.net_dport = 445u;
   snprintf(record.net_dst, sizeof(record.net_dst), "%s", "198.51.100.10");
   snprintf(record.process_name, sizeof(record.process_name), "%s", "scanner.exe");
@@ -94,6 +97,24 @@ static int test_detector_rejects_unrepresentable_alert_identity(void) {
   if (s_emitted_alerts != 1u || strcmp(s_last_alert.process_path, "/usr/bin/scanner") != 0) {
     edr_net_fanout_shutdown();
     return fail("losslessly representable process path must emit unchanged");
+  }
+  cJSON *subject = cJSON_ParseWithOpts(s_last_alert.user_subject_json, NULL, 1);
+  const cJSON *basis = cJSON_GetObjectItemCaseSensitive(subject, "evaluation_basis");
+  const cJSON *owner = cJSON_GetObjectItemCaseSensitive(basis, "owner");
+  const cJSON *source = cJSON_GetObjectItemCaseSensitive(basis, "source_event_id");
+  const cJSON *timestamp = cJSON_GetObjectItemCaseSensitive(basis, "timestamp_ns");
+  const cJSON *threshold = cJSON_GetObjectItemCaseSensitive(basis, "threshold");
+  const cJSON *count = cJSON_GetObjectItemCaseSensitive(basis, "distinct_ips");
+  int valid_basis = cJSON_IsString(owner) && strcmp(owner->valuestring, "net_fanout_detector") == 0 &&
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(basis, "predicate_matched")) &&
+      cJSON_IsString(source) && strcmp(source->valuestring, record.event_id) == 0 &&
+      cJSON_IsString(timestamp) && strcmp(timestamp->valuestring, "1700000000000000000") == 0 &&
+      cJSON_IsNumber(threshold) && threshold->valuedouble == 1.0 &&
+      cJSON_IsNumber(count) && count->valuedouble == 1.0;
+  cJSON_Delete(subject);
+  if (!valid_basis) {
+    edr_net_fanout_shutdown();
+    return fail("actual threshold match must carry exact source and evaluation basis");
   }
 
   edr_net_fanout_shutdown();

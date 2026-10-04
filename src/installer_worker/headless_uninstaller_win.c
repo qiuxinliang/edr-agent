@@ -14,6 +14,7 @@
 #include <sddl.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include "edr/egress_request_policy.h"
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
@@ -1478,6 +1479,21 @@ static int edr_native_attest(const wchar_t *url, const wchar_t *task_id,
     SecureZeroMemory(body, sizeof(body));
     if (failure_stage_out) *failure_stage_out = "attestation-body";
     return ERROR_INSUFFICIENT_BUFFER;
+  }
+
+  {
+    char path_utf8[2048];
+    char policy_reason[128];
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1,
+        path_utf8, sizeof(path_utf8), NULL, NULL) ||
+        edr_egress_request_validate("POST", path_utf8, "application/json", body,
+          (size_t)body_length, policy_reason, sizeof(policy_reason)) != 0) {
+      SecureZeroMemory(authorization, sizeof(authorization));
+      SecureZeroMemory(request_headers, sizeof(request_headers));
+      SecureZeroMemory(body, sizeof(body));
+      if (failure_stage_out) *failure_stage_out = "attestation-egress-policy";
+      return ERROR_ACCESS_DENIED;
+    }
   }
 
   session = WinHttpOpen(L"FDSecurity-Agent-Uninstaller/1",

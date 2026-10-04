@@ -1,6 +1,7 @@
 /* 端侧网络扇出/扫描检测器 —— agent 集成(文件内单例)。见 net_fanout_detector.h */
 
 #include "net_fanout_internal.h"
+#include "cJSON.h"
 
 #include "edr/behavior_alert_emit.h"
 #include "edr/behavior_record.h"
@@ -147,6 +148,25 @@ void edr_net_fanout_on_event(const EdrBehaviorRecord *br) {
   snprintf(a.related_iocs_json, sizeof(a.related_iocs_json),
            "{\"detector\":\"net_fanout\",\"dport\":%u,\"distinct_ips\":%d,\"window_s\":%u}",
            (unsigned)br->net_dport, distinct, s_inst->cfg.window_s);
+  cJSON *subject = cJSON_CreateObject();
+  cJSON *basis = subject ? cJSON_AddObjectToObject(subject, "evaluation_basis") : NULL;
+  char timestamp[32];
+  snprintf(timestamp, sizeof(timestamp), "%lld", (long long)a.timestamp_ns);
+  int basis_ready = basis && cJSON_AddStringToObject(subject, "subject_type", "net_fanout") &&
+      cJSON_AddStringToObject(basis, "schema", "agent_detection_basis_v1") &&
+      cJSON_AddStringToObject(basis, "owner", "net_fanout_detector") &&
+      cJSON_AddBoolToObject(basis, "predicate_matched", 1) &&
+      cJSON_AddNumberToObject(basis, "pid", a.pid) &&
+      cJSON_AddStringToObject(basis, "timestamp_ns", timestamp) &&
+      cJSON_AddNumberToObject(basis, "threshold", s_inst->cfg.distinct_ip_threshold) &&
+      cJSON_AddNumberToObject(basis, "distinct_ips", distinct) &&
+      cJSON_AddNumberToObject(basis, "window_s", s_inst->cfg.window_s) &&
+      cJSON_AddNumberToObject(basis, "dport", br->net_dport) &&
+      cJSON_AddStringToObject(basis, "source_event_id", br->event_id) &&
+      cJSON_PrintPreallocated(subject, a.user_subject_json, sizeof(a.user_subject_json), 0);
+  cJSON_Delete(subject);
+  if (!basis_ready)
+    fprintf(stderr, "[net_fanout] alert basis unavailable pid=%u reason=serialization_failure\n", br->pid);
   edr_behavior_alert_emit_to_batch(&a);
   fprintf(stderr, "[net_fanout] scan/fanout: pid=%u proc=%s dport=%u distinct_ips=%d\n", br->pid, br->process_name,
           (unsigned)br->net_dport, distinct);

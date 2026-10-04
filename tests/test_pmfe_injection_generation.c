@@ -1,14 +1,84 @@
 #include "edr/correlation_engine.h"
 #include "edr/ave_sdk.h"
+#include "cJSON.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 uint64_t edr_monotonic_ns(void) { return UINT64_C(20000000000); }
 static unsigned emitted;
+static int threshold_fixture;
 void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *alert) {
-  assert(strstr(alert->user_subject_json, "R-CORR-INJECT-C2-001") != NULL);
+  assert(strstr(alert->user_subject_json, threshold_fixture ?
+                "R-CORR-THRESHOLD-ONE" : "R-CORR-INJECT-C2-001") != NULL);
+  cJSON *subject = cJSON_ParseWithOpts(alert->user_subject_json, NULL, 1);
+  const cJSON *basis = cJSON_GetObjectItemCaseSensitive(subject, "evaluation_basis");
+  const cJSON *owner = cJSON_GetObjectItemCaseSensitive(basis, "owner");
+  const cJSON *kind = cJSON_GetObjectItemCaseSensitive(basis, "kind");
+  const cJSON *threshold = cJSON_GetObjectItemCaseSensitive(basis, "threshold");
+  const cJSON *matched = cJSON_GetObjectItemCaseSensitive(basis, "matched_count");
+  const cJSON *pid = cJSON_GetObjectItemCaseSensitive(basis, "pid");
+  const cJSON *timestamp = cJSON_GetObjectItemCaseSensitive(basis, "timestamp_ns");
+  const cJSON *chain = cJSON_GetObjectItemCaseSensitive(subject, "evidence_chain");
+  char expected_time[32];
+  snprintf(expected_time, sizeof(expected_time), "%lld", (long long)alert->timestamp_ns);
+  assert(cJSON_IsString(owner) && strcmp(owner->valuestring, "correlation_engine") == 0);
+  assert(cJSON_IsString(kind) && strcmp(kind->valuestring,
+                                      threshold_fixture ? "threshold" : "sequence") == 0);
+  assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(basis, "predicate_matched")));
+  assert(cJSON_IsNumber(threshold) && threshold->valuedouble == (threshold_fixture ? 1.0 : 2.0));
+  assert(cJSON_IsNumber(matched) && matched->valuedouble == (threshold_fixture ? 1.0 : 2.0));
+  assert(cJSON_IsNumber(pid) && pid->valuedouble == alert->pid);
+  assert(cJSON_IsString(timestamp) && strcmp(timestamp->valuestring, expected_time) == 0);
+  assert(cJSON_IsArray(chain) && cJSON_GetArraySize(chain) == (threshold_fixture ? 1 : 2));
+  assert(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(chain, 0), "event_time_ns")));
+  cJSON_Delete(subject);
   emitted++;
+}
+
+static void verify_single_event_threshold_match(void) {
+  char path[512];
+#ifdef _WIN32
+  char temporary[MAX_PATH];
+  assert(GetTempPathA(sizeof(temporary), temporary));
+  assert(GetTempFileNameA(temporary, "cor", 0, path));
+  assert(_putenv_s("EDR_CORRELATION_RULES_PATH", path) == 0);
+#else
+  snprintf(path, sizeof(path), "/tmp/edr-correlation-basis-XXXXXX");
+  int fd = mkstemp(path);
+  assert(fd >= 0);
+  close(fd);
+  assert(setenv("EDR_CORRELATION_RULES_PATH", path, 1) == 0);
+#endif
+  FILE *file = fopen(path, "wb");
+  assert(file);
+  const char rules[] = "{\"version\":\"test-threshold-one\",\"rules\":[{"
+      "\"id\":\"R-CORR-THRESHOLD-ONE\",\"kind\":\"threshold\",\"key\":\"pid\","
+      "\"window_ms\":10000,\"th_event_type\":20,\"th_distinct\":false,\"th_threshold\":1}]}";
+  assert(fwrite(rules, 1, sizeof(rules) - 1u, file) == sizeof(rules) - 1u);
+  assert(fclose(file) == 0);
+  threshold_fixture = 1;
+  edr_correlation_reload();
+  EdrSensorInterestEvent interest = {0};
+  interest.type = EDR_EVENT_NET_CONNECT;
+  interest.pid = 6100u;
+  interest.remote_port = 443u;
+  unsigned before = emitted;
+  edr_correlation_observe_interest(&interest);
+  assert(emitted == before + 1u);
+  threshold_fixture = 0;
+#ifdef _WIN32
+  assert(_putenv_s("EDR_CORRELATION_RULES_PATH", "") == 0);
+#else
+  assert(unsetenv("EDR_CORRELATION_RULES_PATH") == 0);
+#endif
+  assert(remove(path) == 0);
 }
 
 static void verify_syscall_outcomes_do_not_seed_injection_sequences(void) {
@@ -73,5 +143,6 @@ int main(void) {
   assert(!edr_correlation_latest_injection(&unknown, 14 * second, 2 * second, &observation));
   assert(!edr_correlation_latest_injection(NULL, 14 * second, 2 * second, &observation));
   verify_syscall_outcomes_do_not_seed_injection_sequences();
+  verify_single_event_threshold_match();
   return 0;
 }
