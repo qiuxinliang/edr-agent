@@ -1,7 +1,7 @@
 # Cache reliability remediation
 
-Latest result: the local backend was upgraded before the single Windows UTM
-endpoint, which now runs `3.2.589`. See [Windows upgrade acceptance](#2026-10-02-windows-upgrade-acceptance)
+Latest result: the single Windows ARM64 UTM endpoint now runs `3.2.591`.
+See [591 deployment and runtime evaluation](#2026-10-04-agent-591-deployment-and-runtime-evaluation)
 for the completed checks, the retained installer policy-probe warning, and the
 remaining verification limits. Earlier pending statements below record prior phases.
 
@@ -378,3 +378,184 @@ Concurrent Agent commit `7b282749` changes telemetry admission and is not part o
 the tested 589 artifact. This documentation update does not validate or deploy
 that change. Its parent-repository gitlink integration remains with its owning
 task; no unrelated source changes or diagnostic secrets are included here.
+
+
+## 2026-10-04 Agent 591 deployment and runtime evaluation
+
+The user authorized deployment of the latest published Agent and continued
+assessment against the alert-related-only upload requirement and 10,000-terminal
+target. `win_3.2.591` was deployed to the existing Windows ARM64 UTM endpoint;
+this phase performed one real endpoint's 30-minute observation and two bounded
+90-second outbound outages. It did not rerun or pass 10,000-terminal mixed-load
+acceptance. Existing [server capacity results](../../edr-backend/docs/database-capacity-20261002.md)
+remain applicable, including the failed mixed-load cases.
+
+### Published artifact and running identity
+
+The [591 release](https://github.com/qiuxinliang/edr-agent/releases/tag/win_3.2.591)
+was built from `bfb20a9afdb9889ea4c12aef1c648efc47724d87` by
+[run 37208653818](https://github.com/qiuxinliang/edr-agent/actions/runs/37208653818).
+Its manifest declares `unsigned`; the existing lab installation mode was retained,
+and no signature-enforcement or TLS setting was overridden. The release contains
+`7b282749` baseline admission changes and the queue ACK/CI recovery patch; later
+strict egress commits `26a7ca91`, `64b923bf`, and `8fed2f9a`, and concurrent working
+changes, are not part of this executable.
+
+- Setup SHA-256: `2137bf5c1a52cc1eb18190bb736255b8a4493528e576562b8726aef43a44d6e5`.
+- Published runtime ZIP SHA-256: `3c26f68b2076d911883f6b8224d2c9067c8aa74ef4d19786de8042f4837ec8c9`.
+- Installed FDSensor SHA-256: `097e9a99ff9d2e2beab22789e272d0057104d7978f3f9d68ce05000ac9ab6bed`.
+- Agent PID `3652`, creation FILETIME `134356002055865571`, started
+  `2026-10-04T15:10:05.5865571Z`; the same generation remained Running in the
+  SYSTEM `FDSecurityAgent` scheduled task at the final guest check, 15:40:13 UTC.
+
+The original 589 PID `9688` exited normally with code 0 in 2.328 seconds, without
+forced termination. Setup started at 15:09:22 UTC and returned 0. Stopped queue
+and evidence databases were copied with identical source/copy hashes; WAL/SHM
+were absent after normal close. The verified 589 installer, runtime, task and
+configuration remain in the ACL-restricted guest rollback directory.
+
+All 181 existing typed configuration fields were unchanged; primary and LKG
+bytes matched each other. Both passed native `--config-test`. The CA hash and
+independent sequence 524 were unchanged. Native status reported v524 `applied`,
+matching desired/reported hashes and `verified=1`; this is the Agent's report,
+not a new independent signature audit. All 20 selected candidate/reference/fact
+sets were unchanged. Stopped working copies and live databases each returned
+`quick_check=ok`; frozen original hashes remained unchanged. These checks prove
+selected evidence preservation and structure, not completeness of every cache row.
+
+Both fresh installer reports were bound to run ID `20261004230926402`. Runtime
+presence was `ok`; capability health was `unknown`. The aggregate report retained
+`warning` for `runtime_policy_pull`, as in 589. Missing service is expected in
+scheduled-task mode. Full capability success was not claimed; ARM64's published
+manifest also declares the unavailable WinDivert shellcode-network driver.
+
+API PID `74137` and Worker PID `83159` remained the same during this phase, and
+CA/hostname-verified readiness returned 200 for both before and after testing.
+The API disk executable identified root revision `926c1d76` with modified-tree
+metadata. The existing Worker was not restarted; this check does not re-identify
+its in-memory binary by reading the newly replaced file. No backend deployment
+or MySQL/ClickHouse setting change was performed in this phase.
+
+### Thirty-minute observation and upload admission
+
+The UTC window was 15:10:29.946–15:40:30.029 (1,800.083 seconds), with 31 successful
+read-only samples and no sampling error. All samples reported version 591 and
+online state; the largest observed `last_seen` age was 79 seconds. The window
+includes installation acceptance probes and the two outages; it is not a quiet
+idle baseline or a population-representative endpoint sample.
+
+| Observed data | Records | Logical JSON bytes |
+| --- | ---: | ---: |
+| Unresolved FileRead, `NOT_EVALUABLE` source-only metadata | 427 | 764,087 |
+| Security 4688 enrichment | 53 | 176,221 |
+| Process decisions: persistence / script / uncombined LOLBin | 14 / 20 / 16 | 121,854 / 246,554 / 180,548 |
+| AVE process evidence | 17 | 191,416 |
+| Other Agent event | 1 | 831 |
+| All version-591 Agent events | 548 | 1,681,511 |
+| Separate health-history records | 17 | 77,539 |
+
+There were 18 new stored atomic alerts with 607,667 logical process-context bytes.
+These are stored alert rows, not 18 independently verified attacks. Selected
+health reports showed minute-average CPU mean 4.58%, maximum minute average
+21.36%, and reported RSS 52–124 MiB, including warmup and diagnostic workloads.
+
+Current-process telemetry counters advanced by 619 successful event posts,
+685,587 successful request-body bytes and 778,106 attempted
+request-body bytes. Health counters advanced by 4 full and 22 delta reports,
+389,772 attempted bytes against 477,148 equivalent-full bytes. These are
+application body counters sampled at health-report times, not packet capture,
+TLS/HTTP overhead, heartbeat totals or an exact byte total for the host-clock
+window. Health remains `basic`, interval 60 seconds; request and history-archive
+counts have different contracts. Local upload-skipped counters increased by
+143 process and 6 file baselines.
+
+**The strict upload requirement failed.** Unresolved FileRead accounts for
+427/548 (77.9%) of new Agent event rows. Sample
+`epev_f60c4d9cbd_1791127234415504000` has source completeness and disposition
+`NOT_EVALUABLE`, null canonical path, no matched rule, and a `p0` source-only
+context. In the immutable 591 source, collector evidence gates use the durable
+source-only emit/retry path; the ordinary baseline admission change does not
+turn those diagnostics into local-only records. The collector assertion is
+explicitly prohibited from matching, correlation and action. Thus the `p0`
+source label is not proof of a rule hit. Unknown contexts are also deliberately
+kept on the ordinary upload path. Later strict egress code must be released and
+validated before its contract can be attributed to this running endpoint.
+
+### Outage, reconnect and queue recovery
+
+Each outage added one named Windows Firewall rule scoped to FDSensor, the existing
+API address and TCP port 8080. Profiles remained enabled; a separate bounded guard
+removed the rule if the test job failed. Agent, policy, trust and caches were not
+reset. Rule removal, process generation and guard exit were checked independently.
+
+| Test | First outage | Second outage |
+| --- | --- | --- |
+| Block interval UTC | 15:27:19–15:28:50 | 15:36:09–15:37:40 |
+| Peak sampled pending batches | 36 | 11 |
+| Distinct sampled batch identities | 45 | 11 |
+| Two consecutive empty queue samples after unblock | 115.324 s | 31.836 s |
+| Exact receipt and durable-job SHA-256 matches | 45/45 | 11/11 |
+| Final durable jobs | All done | All done, 14 accepted records |
+| Test guard exit | 1; test marked failed | 0; test passed |
+
+The first test's data recovered, but its guard used an unconditional removal of
+an already absent rule. PowerShell returned 1, so the original terminal result
+remains failed. The guard was corrected to explicitly handle the absent-rule
+case while failing real lookup/removal errors; the same 90-second recovery test
+was repeated and passed. A syntax error in the retry script was rejected before
+launch. No failed receipt was rewritten. Both test rules and both guards were
+absent at final acceptance.
+
+Control-report recovery was slower than event/heartbeat recovery. Fresh reports
+showed `h2_unavailable` after each outage with long-poll available. The first fresh
+`connected` report after the first removal was 15:33:04 UTC; after the second it
+was 2026-10-04 15:42:05.657000 UTC, sampled at 2026-10-04 15:42:29.196628 UTC. These are roughly
+four-minute report delays, not precise socket reconnect latencies. At the latter
+sample, PID 3652, version 591, long-poll ready and zero reported pending queue
+were confirmed. This real-client behavior must remain separate from the earlier
+synthetic 2,500-connection reconnect timing.
+
+The 93 pre-existing `dead_letter/max_retries` batches all retained retry count 100
+and originated at 2026-10-02 23:15:13–2026-10-03 00:41:53 UTC. None of their exact
+batch IDs were found in this endpoint's retained accepted receipts or durable
+jobs. Some retained receipts date back to September 16; this alone does not prove
+that every historical receipt was retained. The absence of these batch IDs
+cannot distinguish non-delivery from historical cleanup without further evidence.
+Their historical failure cause and delivery remain unconfirmed. They were preserved, not cleared or automatically requeued;
+success of today's pending-batch test does not resolve those historical batches.
+
+### Storage and 10,000-terminal assessment
+
+At the collector's 15:41 UTC sample, `storage-mysql-v4` measured
+8,569,917,789 B (7.98 GiB), including
+7,831,846,912 B allocated business space and
+738,070,877 B infrastructure. `storage-clickhouse-v2` measured
+603,948,302 B (575.97 MiB), of which
+499,334,078 B (82.7%) was system logs.
+A separate tablespace snapshot measured endpoint_events 1,958,739,968 B, alerts
+1,283,457,024 B and purification history 587,202,560 B. These allocation snapshots
+are not event JSON lengths or a reclaimable-garbage estimate.
+
+The low-load shared MySQL window averaged 99.7 Questions/s, with
+0.506% buffer-pool read misses, zero new log waits and zero new
+buffer-pool-free waits; row-lock waits increased by 1,233 with 6,152 ms cumulative
+wait time. Background services and the measurement queries contribute to these
+counters. The 2 GiB buffer pool and synchronous redo/binlog durability settings
+remained active. This is not a throughput limit or isolated database benchmark.
+
+MySQL remains a candidate for authoritative business state, but 10,000-terminal
+capacity is **not accepted**. First release and verify the strict egress boundary
+while preserving local diagnostics, evidence and replay guarantees; investigate
+the historical unreceived dead letters and the real control reconnect delay.
+Then repeat mixed sustained/reconnect/recovery acceptance with the measured
+request bodies and fixed release/configuration on dedicated resources. The prior
+100/1,000 EPS mixed failures are not overturned by this single endpoint run.
+
+Raw receipts, hashed metadata, private configuration copies and failed diagnostic
+attempts are retained in the ignored, restricted
+`artifacts/agent-591-evaluation-20261004/` directory. The guest rollback and frozen
+copies are under `C:\ProgramData\EDR-AGENT-UPGRADE-20261004-591-attempt2`.
+Initial upgrade digest and stale-generation diagnostic checks failed before their
+respective protected actions; they were corrected with current identities, and
+the original results remain available. This documentation-only change contains
+no secrets, deployment scripts, binaries or concurrent source changes.
