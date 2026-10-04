@@ -623,6 +623,26 @@ static int terminal_journal_frame_retry_count(const char *path, const char *key,
   return count;
 }
 
+static int terminal_journal_delivery_state_is(const char *path, const char *key,
+                                             const char *error, int64_t updated_at) {
+  sqlite3 *db = NULL;
+  sqlite3_stmt *st = NULL;
+  int matches = 0;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db,
+      "SELECT last_error,updated_at FROM enforcement_terminal_journal WHERE idempotency_key=?;",
+      -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(st) == SQLITE_ROW) {
+    const char *actual = (const char *)sqlite3_column_text(st, 0);
+    matches = actual && strcmp(actual, error) == 0 &&
+              sqlite3_column_int64(st, 1) == updated_at;
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return matches;
+}
+
 static void terminal_journal_age_for_retention(const char *path, const char *key) {
   sqlite3 *db = NULL;
   sqlite3_stmt *st = NULL;
@@ -1576,9 +1596,10 @@ static void test_event_queue_batch_metadata_corruption_quarantines_without_starv
 static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
+  const int64_t now = (int64_t)time(NULL);
   EdrEnforcementTerminalJournalMetrics metrics;
   snprintf(path, sizeof(path), "edr-terminal-journal-final-retry-%ld.db", (long)TEST_PID);
-  edr_storage_queue_test_set_delivery_time(-1);
+  edr_storage_queue_test_set_delivery_time(now);
   (void)remove(path);
   make_wire(intent, 0xa1u);
   make_wire(source, 0xa2u);
@@ -1601,9 +1622,16 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   assert(edr_storage_queue_open(path) == EDR_OK);
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0xa2u) == 1u);
-  edr_storage_queue_test_set_delivery_time((int64_t)time(NULL) + 2);
   assert(terminal_journal_frame_retry_count(path, "final-retry", 1) == 1);
   assert(terminal_journal_state_is(path, "final-retry", "ready"));
+
+  /* Reopening alone must not defeat the failed frame's durable backoff. */
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_poll_drain();
+  assert(send_calls_for(0xa2u) == 1u);
+  assert(terminal_journal_frame_retry_count(path, "final-retry", 1) == 1);
+  edr_storage_queue_test_set_delivery_time(now + 2);
 
   edr_storage_queue_close();
   assert(edr_storage_queue_open(path) == EDR_OK);
@@ -1630,6 +1658,9 @@ static void test_terminal_final_frames_survive_retry_limit_and_retention(void) {
   assert(send_calls_for(0xa3u) == 1u);
   assert(terminal_journal_state_is(path, "final-retry", "completed"));
   assert(terminal_journal_final_acks(path, "final-retry", NULL, NULL));
+  /* ACK progress clears the obsolete shared transport error. Both frames
+   * use the same delivery clock, irrespective of native runner speed. */
+  assert(terminal_journal_delivery_state_is(path, "final-retry", "", now + 2));
 
   /* A completed terminal never replays on restart; the action was owned by
    * the precreated journal record and no re-execution path is involved. */

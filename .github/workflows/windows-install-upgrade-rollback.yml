@@ -444,3 +444,4 @@ jobs:
             setup-exe-evidence
             runtime-evidence
           if-no-files-found: warn
+          retention-days: 7

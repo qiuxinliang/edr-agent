@@ -2249,17 +2249,17 @@ static int terminal_journal_ack_batch_id_locked(sqlite3 *db, const char *batch_i
   sqlite3_int64 now;
   int rc;
   const char *intent_sql =
-      "UPDATE enforcement_terminal_journal SET intent_acked=1,updated_at=? "
+      "UPDATE enforcement_terminal_journal SET intent_acked=1,last_error='',updated_at=? "
       "WHERE state IN ('pending_intent','outcome_unknown','ready') "
       "AND intent_acked=0 AND intent_batch_id=?;";
   const char *source_sql =
-      "UPDATE enforcement_terminal_journal SET source_acked=1,updated_at=? "
+      "UPDATE enforcement_terminal_journal SET source_acked=1,last_error='',updated_at=? "
       "WHERE state='ready' AND source_acked=0 AND source_batch_id=?;";
   const char *combined_sql =
-      "UPDATE enforcement_terminal_journal SET combined_acked=1,updated_at=? "
+      "UPDATE enforcement_terminal_journal SET combined_acked=1,last_error='',updated_at=? "
       "WHERE state='ready' AND combined_acked=0 AND combined_batch_id=?;";
   if (!db || !batch_id || !batch_id[0]) return -1;
-  now = (sqlite3_int64)time(NULL);
+  now = delivery_time();
 #ifdef EDR_STORAGE_QUEUE_TESTING
   if (terminal_journal_test_fail_ack_step()) return -1;
 #endif
@@ -4169,7 +4169,7 @@ static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, con
       "AND intent_acked=0 AND intent_wire=?;";
   if (!db || !key || !wire || wire_len <= 0) return 0;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(st, 1, delivery_time());
     sqlite3_bind_int64(st, 2, id);
     sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
     sqlite3_bind_blob(st, 4, wire, wire_len, SQLITE_TRANSIENT);
@@ -4273,13 +4273,13 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
                                              int source_frame, const uint8_t *wire, int wire_len) {
   sqlite3_stmt *st = NULL;
   const char *sql = source_frame
-                        ? "UPDATE enforcement_terminal_journal SET source_acked=1,updated_at=?,"
+                        ? "UPDATE enforcement_terminal_journal SET source_acked=1,last_error='',updated_at=?,"
                           "state=CASE WHEN combined_acked=1 THEN 'completed' ELSE 'ready' END,"
                           "completed_at=CASE WHEN combined_acked=1 THEN ? ELSE completed_at END,"
                           "reserved_bytes=CASE WHEN combined_acked=1 THEN 0 ELSE reserved_bytes END "
                           "WHERE id=? AND idempotency_key=? AND state='ready' AND source_acked=0 "
                           "AND source_wire=?;"
-                        : "UPDATE enforcement_terminal_journal SET combined_acked=1,updated_at=?,"
+                        : "UPDATE enforcement_terminal_journal SET combined_acked=1,last_error='',updated_at=?,"
                           "state=CASE WHEN source_acked=1 THEN 'completed' ELSE 'ready' END,"
                           "completed_at=CASE WHEN source_acked=1 THEN ? ELSE completed_at END,"
                           "reserved_bytes=CASE WHEN source_acked=1 THEN 0 ELSE reserved_bytes END "
@@ -4288,7 +4288,10 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
   int acknowledged = 0;
   if (!db || !key || !wire || wire_len <= 0) return 0;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_int64 now = (sqlite3_int64)time(NULL);
+    /* A successful frame clears the shared failure deadline so another
+     * unacknowledged frame can progress in this pass. Keep retry counters
+     * for diagnostics and use the same clock as replay selection. */
+    sqlite3_int64 now = delivery_time();
     sqlite3_bind_int64(st, 1, now);
     sqlite3_bind_int64(st, 2, now);
     sqlite3_bind_int64(st, 3, id);

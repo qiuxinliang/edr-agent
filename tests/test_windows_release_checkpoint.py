@@ -33,6 +33,7 @@ class FakeGitHub:
         self.artifacts = []
         self.checkpoint = None
         self.upload_error = None
+        self.deletions = []
 
     def tag_commit(self, tag):
         return self.commit
@@ -40,10 +41,15 @@ class FakeGitHub:
     def release(self, tag):
         return copy.deepcopy(self.info)
 
-    def call(self, *args):
+    def call(self, *args, missing=False):
         if args[:2] == ("release", "create"):
             self.info = dict(draft=True, body=args[args.index("--notes") + 1], assets=[])
             self.commit = args[args.index("--target") + 1]
+        elif args[:3] == ("api", "--method", "DELETE"):
+            artifact_id = int(args[3].rsplit("/", 1)[1])
+            self.deletions.append(artifact_id)
+            self.artifacts = [a for a in self.artifacts if a["id"] != artifact_id]
+            return ""
         elif args[0] == "api":
             return json.dumps([{"artifacts": self.artifacts}])
         elif args[:2] == ("run", "download"):
@@ -97,6 +103,71 @@ class ReleaseCheckpointTests(unittest.TestCase):
         self.assertTrue(cp.prepare(self.api, dict(SOURCE, run_id="5678")))
         self.assertEqual(self.api.info["body"], original["body"])
         self.assertEqual(self.api.uploads, [])
+
+    def test_cleanup_only_retires_published_run_recovery_copies(self):
+        self.api.info["draft"] = False
+        names = ("release-checkpoint-amd64", "release-checkpoint-arm64",
+                 "release-input-amd64", "release-input-arm64", "usb-verified-final",
+                 "windows-rule-validation-amd64", "windows-lifecycle-evidence-arm64")
+        self.api.artifacts = [dict(id=i, name=name, expired=False,
+                                  workflow_run=dict(id=1234))
+                              for i, name in enumerate(names, 1)]
+        self.api.artifacts.append(dict(id=8, name="release-checkpoint-amd64", expired=True,
+                                       workflow_run=dict(id=1234)))
+        original = copy.deepcopy(self.api.info)
+        self.assertEqual(cp.cleanup_published_checkpoints(self.api, SOURCE), 5)
+        self.assertEqual(self.api.deletions, [1, 2, 3, 4, 5])
+        self.assertEqual([a["id"] for a in self.api.artifacts], [6, 7, 8])
+        self.assertEqual(self.api.info, original)
+        self.assertEqual(cp.cleanup_published_checkpoints(self.api, SOURCE), 0)
+
+    def test_cleanup_refuses_drafts_and_foreign_release_identity(self):
+        with self.assertRaisesRegex(ValueError, "published release"):
+            cp.cleanup_published_checkpoints(self.api, SOURCE)
+        self.api.info["draft"] = False
+        for field, value in (("commit", "b" * 40), ("run_id", "5678"), ("mode", "signed")):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                cp.cleanup_published_checkpoints(self.api, dict(SOURCE, **{field: value}))
+        self.api.commit = "b" * 40
+        with self.assertRaisesRegex(ValueError, "no longer matches"):
+            cp.cleanup_published_checkpoints(self.api, SOURCE)
+        self.assertEqual(self.api.deletions, [])
+
+    def test_cleanup_validates_all_artifact_owners_before_mutating(self):
+        self.api.info["draft"] = False
+        valid = dict(id=1, name="release-checkpoint-amd64", workflow_run=dict(id=1234))
+        for invalid in (dict(valid, id=True), dict(valid, id=-1),
+                        dict(valid, id=2, workflow_run=dict(id=5678)),
+                        dict(valid, id=2, workflow_run=None)):
+            with self.subTest(artifact=invalid):
+                self.api.artifacts = [valid, invalid]
+                with self.assertRaisesRegex(ValueError, "ownership"):
+                    cp.cleanup_published_checkpoints(self.api, SOURCE)
+                self.assertEqual(self.api.deletions, [])
+
+    def test_cleanup_retries_are_bounded_and_failure_is_reported(self):
+        self.api.info["draft"] = False
+        page = json.dumps([dict(artifacts=[dict(id=1, name="release-checkpoint-amd64",
+                                               workflow_run=dict(id=1234))])])
+        with patch.object(self.api, "call", side_effect=[page, RuntimeError("offline"), ""]) as call, \
+                patch.object(cp.time, "sleep") as sleep:
+            self.assertEqual(cp.cleanup_published_checkpoints(self.api, SOURCE), 1)
+            self.assertEqual(call.call_count, 3)
+            sleep.assert_called_once_with(2)
+        with patch.object(self.api, "call", side_effect=[page] + [RuntimeError("forbidden")] * 3) as call, \
+                patch.object(cp.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "forbidden"):
+                cp.cleanup_published_checkpoints(self.api, SOURCE)
+            self.assertEqual(call.call_count, 4)
+
+    def test_cleanup_missing_delete_is_idempotent_but_forbidden_is_not(self):
+        api = cp.GitHub(SOURCE["repository"])
+        result = subprocess.CompletedProcess(["gh"], 1, "", "HTTP 404: Not Found")
+        with patch.object(cp.subprocess, "run", return_value=result):
+            self.assertIsNone(api.call("api", "--method", "DELETE", "artifact/1", missing=True))
+            result.stderr = "HTTP 403: forbidden"
+            with self.assertRaisesRegex(RuntimeError, "403"):
+                api.call("api", "--method", "DELETE", "artifact/1", missing=True)
 
     def test_unsigned_notes_explain_integrity_requirements_only_for_unsigned_mode(self):
         for mode in ("unsigned", "signed"):

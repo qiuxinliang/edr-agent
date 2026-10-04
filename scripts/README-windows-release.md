@@ -56,7 +56,7 @@ second draft; permission/transport errors remain explicit failures.
 If a run fails, use **Re-run failed jobs** on that original run, not a new manual
 release. After all native build/test, packaging and integrity steps succeed,
 the complete `dist` directory is retained as `release-checkpoint-amd64/arm64`
-for 14 days. A rerun verifies the exact source, run, architecture and every file
+for one day. A rerun verifies the exact source, run, architecture and every file
 SHA-256 before skipping rebuild/sign/package and resuming upload. There is no
 cross-run or cross-commit product cache. A missing checkpoint takes the complete
 build path; an expired, malformed or corrupt checkpoint fails explicitly. If
@@ -70,6 +70,13 @@ three times with backoff. It tolerates a lost reply after a successful upload.
 The local checkpoint receipt is an Actions artifact only, not a release asset.
 Install/upgrade/rollback/uninstall and embedded-updater validation remain required
 before publication, including after a build checkpoint is reused.
+
+After publication, the publish job removes only that run's large CI checkpoints;
+the immutable Release assets remain the installation and rollback source. Draft
+or failed runs keep their recovery checkpoints until the one-day expiry. Rule
+validation and native lifecycle evidence are retained for seven days. Cleanup
+checks the exact release source/run and artifact ownership, and is idempotent;
+it cannot remove another run's checkpoints or diagnostic evidence.
 
 ## Build preparation and timing
 
