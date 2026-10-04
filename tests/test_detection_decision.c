@@ -438,7 +438,7 @@ static void test_event_quality_fp_feedback_downgrades(void) {
   test_unsetenv("EDR_DETECTION_FP_FEEDBACK");
 }
 
-static void test_event_quality_p0_forces_alert(void) {
+static void test_event_quality_detected_shellcode_alert(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
   init(&r);
@@ -450,7 +450,7 @@ static void test_event_quality_p0_forces_alert(void) {
   assert(strcmp(d.selection_action, "emit_alert") == 0);
 }
 
-static void test_event_quality_suppressed_p0_caps_at_context(void) {
+static void test_event_quality_suppressed_p0_retains_score(void) {
   EdrBehaviorRecord r;
   EdrDetectionDecision d;
   init(&r);
@@ -465,7 +465,8 @@ static void test_event_quality_suppressed_p0_caps_at_context(void) {
   edr_detection_decision_evaluate(&r, &d);
   assert(d.suppress);
   assert(!d.drop);
-  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(d.event_quality_score == 10u);
+  assert(strcmp(d.selection_action, "drop") == 0);
   test_unsetenv("EDR_DETECTION_FP_FEEDBACK");
 }
 
@@ -766,7 +767,84 @@ static void test_detection_context_allocation_failure_is_explicit(void) {
   cJSON_Delete(root);
 }
 
+static void test_priority_is_not_detection_evidence(void) {
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.priority = 0u;
+  snprintf(r.process_name, sizeof(r.process_name), "conhost.exe");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.event_quality_score == 20u);
+  assert(strcmp(d.selection_action, "local_only") == 0);
+  init(&r);
+  r.priority = 0u;
+  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "powershell.exe -EncodedCommand TEST");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(d.event_quality_score == 52u);
+  assert(strcmp(d.selection_action, "emit_context") == 0);
+}
+
+static void test_connection_scope_and_loopback_alert(void) {
+  static const struct { const char *host; const char *scope; int remote; } cases[] = {
+      {"127.0.0.1", "loopback", 0}, {"127.23.4.5", "loopback", 0},
+      {"::1", "loopback", 0}, {"[::1]", "loopback", 0},
+      {"::ffff:127.0.0.1", "loopback", 0}, {"localhost", "loopback", 0},
+      {"10.2.3.4", "local_network", 1}, {"172.16.3.4", "local_network", 1},
+      {"192.168.2.3", "local_network", 1}, {"fe80::1", "local_network", 1},
+      {"fc00::12", "local_network", 1}, {"203.0.113.7", "external", 1},
+      {"2001:db8::1", "external", 1}, {"", "unknown", 0},
+      {"127.0.0.999", "unknown", 0}, {"localhost.invalid", "unknown", 0},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    EdrBehaviorRecord r;
+    EdrDetectionDecision d;
+    init(&r);
+    r.type = EDR_EVENT_NET_CONNECT;
+    snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+    snprintf(r.net_dst, sizeof(r.net_dst), "%s", cases[i].host);
+    r.net_dport = 443u;
+    edr_detection_decision_evaluate(&r, &d);
+    assert(d.has_remote == cases[i].remote);
+    cJSON *root = parse_context(&r);
+    const cJSON *scope = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(root, "signals"), "connection_scope");
+    assert(cJSON_IsString(scope));
+    assert(strcmp(scope->valuestring, cases[i].scope) == 0);
+    cJSON_Delete(root);
+    if (!cases[i].remote) {
+      assert(d.event_quality_score < 50u);
+      assert(strcmp(d.selection_action, "emit_alert") != 0);
+    }
+  }
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  r.type = EDR_EVENT_PROTOCOL_SHELLCODE;
+  snprintf(r.net_dst, sizeof(r.net_dst), "127.0.0.1");
+  snprintf(r.script_snippet, sizeof(r.script_snippet),
+           "detector=yara rule=TestLoopbackAttack score=1.0 proto=smb2");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.has_remote);
+  assert(strcmp(d.selection_action, "emit_alert") == 0);
+  assert(strstr(r.detection_context, "TestLoopbackAttack") != NULL);
+  init(&r);
+  r.type = EDR_EVENT_SCRIPT_POWERSHELL;
+  snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+  snprintf(r.parent_name, sizeof(r.parent_name), "winword.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "powershell.exe -EncodedCommand TEST");
+  snprintf(r.script_snippet, sizeof(r.script_snippet),
+           "sensor=scriptblock content=IEX DownloadString AmsiUtils amsiInitFailed");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(!d.has_remote);
+  assert(d.event_quality_score >= 85u);
+  assert(strcmp(d.selection_action, "emit_alert") == 0);
+  assert(strstr(d.reason, "remote_fetch_intent") != NULL);
+}
+
 int main(void) {
+  test_priority_is_not_detection_evidence();
+  test_connection_scope_and_loopback_alert();
   test_regsvr32_remote_combo_high();
   test_regsvr32_without_combo_suppressed();
   test_management_tool_in_enterprise_path_downgrades();
@@ -783,8 +861,8 @@ int main(void) {
   test_false_positive_feedback_policy_suppresses_known_tool();
   test_event_quality_high_signal_emits_alert();
   test_event_quality_fp_feedback_downgrades();
-  test_event_quality_p0_forces_alert();
-  test_event_quality_suppressed_p0_caps_at_context();
+  test_event_quality_detected_shellcode_alert();
+  test_event_quality_suppressed_p0_retains_score();
   test_conditional_suppression_downgrades_matching_variant();
   test_conditional_suppression_skips_high_signal();
   test_ransom_recovery_requires_dangerous_args();

@@ -1,3 +1,10 @@
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 #include "edr/detection_decision.h"
 #include "edr/detection_profile.h"
 #include "edr/policy_v2.h"
@@ -249,22 +256,126 @@ static int ransom_chain_p0_threshold(void) {
   return p0 <= candidate ? candidate + 1 : p0;
 }
 
-static int has_remote_indicator(const EdrBehaviorRecord *r) {
-  if (r && (r->net_dst[0] || r->net_dport != 0u)) {
-    return 1;
+/* Scope describes a parsed address, never the presence of a port. Private and
+ * link-local peers are off-host candidates too: lateral attacks must retain
+ * their remote signal. This does not drop or suppress any loopback event. */
+static int parse_ip_address(int family, const char *host, void *address) {
+#ifdef _WIN32
+  return InetPtonA(family, host, address) == 1;
+#else
+  return inet_pton(family, host, address) == 1;
+#endif
+}
+
+static const char *ipv4_scope(const unsigned char *ip) {
+  if (ip[0] == 127u) return "loopback";
+  if (ip[0] == 0u || ip[0] >= 224u) return "unknown";
+  if (ip[0] == 10u || (ip[0] == 172u && ip[1] >= 16u && ip[1] <= 31u) ||
+      (ip[0] == 192u && ip[1] == 168u) || (ip[0] == 169u && ip[1] == 254u) ||
+      (ip[0] == 100u && ip[1] >= 64u && ip[1] <= 127u)) return "local_network";
+  return "external";
+}
+
+static const char *address_scope(const char *destination, const char *origin) {
+  unsigned char ip[16], source[16];
+  char host[EDR_BR_STR_SHORT];
+  if (!destination || !destination[0]) return "unknown";
+  size_t n = strlen(destination);
+  if (n >= sizeof(host)) return "unknown";
+  memcpy(host, destination, n + 1u);
+  if (host[0] == '[' && n > 2u && host[n - 1u] == ']') {
+    memmove(host, host + 1, n - 2u);
+    host[n - 2u] = '\0';
   }
-  const char *fields[] = {r->cmdline, r->dns_query, r->net_dst, r->script_snippet, r->file_path};
+  if (strlen(host) == 9u && has_ci(host, "localhost")) return "loopback";
+  if (parse_ip_address(AF_INET, host, ip)) {
+    const char *scope = ipv4_scope(ip);
+    if (strcmp(scope, "loopback") != 0 &&
+        origin && parse_ip_address(AF_INET, origin, source) && memcmp(ip, source, 4u) == 0)
+      return "local_host";
+    return scope;
+  }
+  if (!parse_ip_address(AF_INET6, host, ip)) return "unknown";
+  static const unsigned char zero[16] = {0};
+  static const unsigned char loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+  if (memcmp(ip, loopback, sizeof(ip)) == 0) return "loopback";
+  if (memcmp(ip, zero, sizeof(ip)) == 0 || ip[0] == 0xffu) return "unknown";
+  if (memcmp(ip, zero, 10u) == 0 && ip[10] == 0xffu && ip[11] == 0xffu)
+    return ipv4_scope(ip + 12u);
+  if (origin && parse_ip_address(AF_INET6, origin, source) && memcmp(ip, source, sizeof(ip)) == 0)
+    return "local_host";
+  if ((ip[0] & 0xfeu) == 0xfcu || (ip[0] == 0xfeu && (ip[1] & 0xc0u) == 0x80u))
+    return "local_network";
+  return "external";
+}
+
+static const char *connection_scope(const EdrBehaviorRecord *r) {
+  return r ? address_scope(r->net_dst, r->net_src) : "unknown";
+}
+
+static int remote_url_in_text(const char *text) {
+  if (!text) return 0;
+  size_t remaining = strlen(text);
+  for (const char *p = text; *p; ++p, --remaining) {
+    const char *start = NULL;
+    if ((tolower((unsigned char)p[0]) == 'h' && remaining >= 7u &&
+         tolower((unsigned char)p[1]) == 't' && tolower((unsigned char)p[2]) == 't' &&
+         tolower((unsigned char)p[3]) == 'p')) {
+      const char *scheme = p + 4;
+      if (tolower((unsigned char)*scheme) == 's') ++scheme;
+      if (strncmp(scheme, "://", 3u) == 0) start = scheme + 3;
+    } else if (remaining >= 6u && tolower((unsigned char)p[0]) == 'f' &&
+               tolower((unsigned char)p[1]) == 't' && tolower((unsigned char)p[2]) == 'p' &&
+               strncmp(p + 3, "://", 3u) == 0) {
+      start = p + 6;
+    } else if (p[0] == '\\' && p[1] == '\\') {
+      start = p + 2;
+    }
+    if (!start) continue;
+    char target[EDR_BR_STR_SHORT];
+    size_t n = 0u;
+    int bracketed = start[0] == '[';
+    const char *host = start + (bracketed ? 1 : 0);
+    while (host[n] && n + 1u < sizeof(target) &&
+           (bracketed ? host[n] != ']' :
+            (isalnum((unsigned char)host[n]) || host[n] == '.' || host[n] == '-'))) ++n;
+    if (!n || n + 1u >= sizeof(target) || (bracketed && host[n] != ']')) continue;
+    memcpy(target, host, n);
+    target[n] = '\0';
+    const char *scope = address_scope(target, NULL);
+    if (strcmp(scope, "local_network") == 0 || strcmp(scope, "external") == 0) return 1;
+    /* A qualified URL host is explicit remote intent, not a resolved IP.
+     * Bare utility names, words such as downloadstring, and localhost suffix
+     * lookalikes do not stand in for an observed destination. */
+    if (!bracketed && strcmp(scope, "unknown") == 0 &&
+        isalpha((unsigned char)target[0]) && strchr(target, '.') &&
+        !has_ci(target, "localhost")) return 1;
+  }
+  return 0;
+}
+
+static int has_remote_indicator(const EdrBehaviorRecord *r) {
+  if (!r) return 0;
+  const char *scope = connection_scope(r);
+  if (strcmp(scope, "local_network") == 0 || strcmp(scope, "external") == 0) return 1;
+  const char *fields[] = {r->cmdline, r->script_snippet, r->file_path};
   for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
     const char *s = fields[i];
     if (!s || !s[0]) {
       continue;
     }
-    if (has_ci(s, "http://") || has_ci(s, "https://") || has_ci(s, "ftp://") || has_ci(s, "\\\\") ||
-        has_ci(s, "downloadstring") || has_ci(s, "invoke-webrequest") || has_ci(s, "urlcache")) {
+    if (remote_url_in_text(s)) {
       return 1;
     }
   }
   return 0;
+}
+
+static int has_remote_fetch_intent(const EdrBehaviorRecord *r) {
+  return r && (has_ci(r->cmdline, "downloadstring") ||
+      has_ci(r->cmdline, "invoke-webrequest") || has_ci(r->cmdline, "urlcache") ||
+      has_ci(r->script_snippet, "downloadstring") ||
+      has_ci(r->script_snippet, "invoke-webrequest") || has_ci(r->script_snippet, "urlcache"));
 }
 
 static int has_lolbin_script_indicator(const EdrBehaviorRecord *r) {
@@ -1119,9 +1230,9 @@ static void compute_event_quality(const EdrBehaviorRecord *r, EdrDetectionDecisi
        (strcmp(out->reason, "suspicious_parent_or_user_path") == 0 &&
         !suspicious_parent_name(r))) &&
       out->event_quality_score <= 32u;
-  if (!out->drop && r && r->priority == 0u && !priority_only) {
-    action = "emit_alert";
-  }
+  /* Transport priority reserves scheduling capacity; it never proves a
+   * detector fired. Actual P0 rule alerts use the authenticated direct emitter.
+   * This heuristic action remains score based for local detection consumers. */
   out->p0_miss_local_only = priority_only && r->priority == 0u &&
       strcmp(action, "local_only") == 0;
   if (out->suppress && strcmp(action, "emit_alert") == 0) {
@@ -1781,7 +1892,7 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   json_cat(context, context_capacity, ",\"detail_status\":");
   json_record_str(context, context_capacity, r->reg_detail_status, 48u, complete_record_text);
   json_cat(context, context_capacity,
-           "},\"signals\":{\"remote\":%s,\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
+           "},\"signals\":{\"remote\":%s,\"connection_scope\":\"%s\",\"suspicious_parent\":%s,\"allowlisted_path\":%s,"
            "\"cert_revoked_ancestor\":%s,\"script_sensor\":%s,\"tls_anomaly\":%s,"
            "\"ransom_behavior\":%s,\"ransom_canary\":%s,\"ransom_counter_allowlisted\":%s,"
            "\"ransom_signer_allowlisted\":%s,\"extension_changed\":%s,\"high_content_entropy\":%s,"
@@ -1790,7 +1901,7 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
            "\"webshell_semantic\":%s,\"persistence_change\":%s,"
            "\"silverfox_attack_chain\":%s,\"rmm_policy_match\":%s,\"false_positive_feedback\":%s,"
            "\"process_context\":%s},",
-           d->has_remote ? "true" : "false", d->suspicious_parent ? "true" : "false",
+           d->has_remote ? "true" : "false", connection_scope(r), d->suspicious_parent ? "true" : "false",
            d->allowlisted_path ? "true" : "false", r->cert_revoked_ancestor ? "true" : "false",
            script_sensor ? "true" : "false", tls_anomaly ? "true" : "false",
            ransom_burst ? "true" : "false", ransom_canary ? "true" : "false",
@@ -2348,6 +2459,7 @@ void edr_detection_decision_evaluate_after_p0(EdrBehaviorRecord *r,
   }
 
   int remote = has_remote_indicator(r);
+  int remote_fetch_intent = has_remote_fetch_intent(r);
   int script = has_lolbin_script_indicator(r);
   int lolbin = is_lolbin(r->process_name[0] ? r->process_name : r->exe_path);
   int parent = suspicious_parent(r);
@@ -2425,6 +2537,11 @@ void edr_detection_decision_evaluate_after_p0(EdrBehaviorRecord *r,
   if (remote) {
     score += 0.22f;
     add_reason(out->reason, sizeof(out->reason), "remote_indicator");
+  } else if (remote_fetch_intent) {
+    /* Preserve the existing malicious script detection contribution without
+     * inventing an observed off-host endpoint from a fetch API name. */
+    score += 0.22f;
+    add_reason(out->reason, sizeof(out->reason), "remote_fetch_intent");
   }
   if (script) {
     score += 0.18f;

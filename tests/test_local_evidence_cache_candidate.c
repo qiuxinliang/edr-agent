@@ -186,6 +186,33 @@ static void test_high_signal_process_is_candidate(void) {
   assert(edr_local_evidence_cache_is_candidate(&r) == 1);
 }
 
+static void test_pmfe_names_and_negative_values_are_not_signals(void) {
+  static const char *const negative[] = {
+      "{\"schema\":\"agent_decision_v1\",\"detection_trigger\":{\"pmfe_scan\":false}}",
+      "{\"schema\":\"agent_decision_v1\",\"engine_evidence\":{\"pmfe_snapshot\":\"\"}}",
+      "{\"schema\":\"agent_decision_v1\",\"notes\":\"documentation mentions pmfe\"}",
+      "{\"schema\":\"agent_decision_v1\",\"detection_trigger\":{\"pmfe_scan\":\"true\"}}",
+      "{\"schema\":\"agent_decision_v1\",\"engine_evidence\":{\"schema\":\"pmfe_result_v1\",\"verdict\":\"clean\",\"signals\":{\"stomp_suspicious\":0}}}",
+      "{\"schema\":\"agent_decision_v1\",\"engine_evidence\":{\"schema\":\"pmfe_result_v1\",\"verdict\":\"suspicious\",\"signals\":{\"stomp_suspicious\":0},\"evidence\":{\"pmfe_snapshot\":\"\"}}}",
+      "{\"schema\":\"agent_decision_v1\",\"engine_evidence\":{\"schema\":\"pmfe_result_v1\",\"verdict\":\"suspicious\",\"signals\":{\"stomp_suspicious\":\"1\"}}}",
+  };
+  EdrBehaviorRecord r;
+  for (size_t i = 0; i < sizeof(negative) / sizeof(negative[0]); ++i) {
+    init_record(&r, EDR_EVENT_NET_CONNECT);
+    snprintf(r.process_name, sizeof(r.process_name), "powershell.exe");
+    snprintf(r.net_dst, sizeof(r.net_dst), "127.0.0.1");
+    r.net_dport = 443u;
+    snprintf(r.detection_context, sizeof(r.detection_context), "%s", negative[i]);
+    assert(edr_local_evidence_cache_is_candidate(&r) == 0);
+  }
+  init_record(&r, EDR_EVENT_PROCESS_CREATE);
+  snprintf(r.cmdline, sizeof(r.cmdline), "example.exe pmfe-user-notes.txt");
+  assert(edr_local_evidence_cache_is_candidate(&r) == 0);
+  snprintf(r.detection_context, sizeof(r.detection_context),
+           "{\"schema\":\"agent_decision_v1\",\"engine_evidence\":{\"schema\":\"pmfe_result_v1\",\"status\":\"completed\",\"verdict\":\"suspicious\",\"signals\":{\"stomp_suspicious\":1}}}");
+  assert(edr_local_evidence_cache_is_candidate(&r) == 1);
+}
+
 static void test_command_evidence_normalization_and_script_path(void) {
   char normalized[1024];
   char script_path[1024];
@@ -7393,6 +7420,7 @@ int main(int argc, char **argv) {
 #else
   (void)argc; (void)argv;
 #endif
+  test_pmfe_names_and_negative_values_are_not_signals();
   test_delayed_file_actor_with_exact_start_key();
 #if defined(EDR_HAVE_SQLITE)
   test_metric_dispositions_and_resource_failures();

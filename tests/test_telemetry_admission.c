@@ -147,7 +147,8 @@ static void test_priority_does_not_create_detection_authority(void) {
    * incomplete actor facts preserve the existing conservative path. */
   edr_detection_decision_evaluate_after_p0(&r, &d, 0);
   assert(!d.p0_miss_local_only);
-  assert(strcmp(d.selection_action, "emit_alert") == 0);
+  assert(d.event_quality_score == 32u);
+  assert(strcmp(d.selection_action, "local_only") == 0);
   assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
   strcpy(r.source_completeness, "NOT_EVALUABLE");
   edr_detection_decision_evaluate_after_p0(&r, &d, 1);
@@ -167,7 +168,8 @@ static void test_priority_does_not_create_detection_authority(void) {
     strcpy(r.parent_name, parents[i]);
     edr_detection_decision_evaluate_after_p0(&r, &d, 1);
     assert(!d.p0_miss_local_only);
-    assert(strcmp(d.selection_action, "emit_alert") == 0);
+    assert(d.event_quality_score == 32u);
+    assert(strcmp(d.selection_action, "local_only") == 0);
     assert(edr_preprocess_upload_admit(&r, &d, 1, 0));
   }
   r.parent_name[0] = 0;
@@ -198,6 +200,8 @@ static void test_uncombined_tool_file_upload(void) {
   assert(d.suppress);
   assert(strcmp(d.reason, "lolbin,lolbin_without_combo_condition") == 0);
   assert(strcmp(d.signal_reasons, "lolbin") == 0);
+  assert(d.event_quality_score == 32u);
+  assert(strcmp(d.selection_action, "local_only") == 0);
   uint64_t before = edr_preprocess_baseline_file_upload_skipped_count();
   assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
   assert(edr_preprocess_baseline_file_upload_skipped_count() == before + 1u);
@@ -323,7 +327,8 @@ int main(void) {
   strcpy(r.file_old_path, "C:\\Program Files\\Example\\old-file.txt");
   edr_detection_decision_evaluate(&r, &d);
   assert(d.suppress && d.allowlisted_path);
-  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(d.event_quality_score < 20u);
+  assert(strcmp(d.selection_action, "drop") == 0);
   assert(edr_preprocess_upload_admit(&r, &d, 0, 0));
   assert(edr_preprocess_upload_admit(&r, &d, 1, 1));
   assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
@@ -435,7 +440,8 @@ int main(void) {
   edr_detection_decision_evaluate(&r, &d);
   assert(d.suppress && d.allowlisted_path);
   assert(r.priority == 0u);
-  assert(strcmp(d.selection_action, "emit_context") == 0);
+  assert(d.event_quality_score < 20u);
+  assert(strcmp(d.selection_action, "drop") == 0);
   assert(!edr_preprocess_upload_admit(&r, &d, 1, 0));
   assert(edr_preprocess_baseline_rename_upload_skipped_count() == 3u);
 

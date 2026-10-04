@@ -17,8 +17,8 @@ typedef struct EdrDetectionDecision {
   uint8_t persistence_change;
   uint8_t trigger_pmfe_scan;
   uint8_t trigger_single_process_minidump;
-  /* A proved P0 miss downgraded only a transport-priority promotion. Local
-   * consumers must still run before the standalone-upload gate. */
+  /* A proved P0 miss on a complete ordinary baseline. Local consumers must
+   * still run before the standalone-upload gate; scheduling is independent. */
   uint8_t p0_miss_local_only;
   char detection_profile[32];
   char suppression_reason[96];

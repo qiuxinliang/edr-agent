@@ -5416,7 +5416,7 @@ static int evidence_string_has_high_signal(const char *text) {
       "sc create", "binpath=", "psexec", "admin$", "wmic process call create",
       "regsvr32", "mshta", "certutil -urlcache", "bitsadmin /transfer",
       "add-mppreference", "set-mppreference", "disableantispyware",
-      "ransom_counter=1", "webshell_candidate", "shellcode", "pmfe",
+      "ransom_counter=1", "webshell_candidate", "shellcode",
   };
   if (!text || !text[0]) {
     return 0;
@@ -5429,10 +5429,53 @@ static int evidence_string_has_high_signal(const char *text) {
   return 0;
 }
 
+static int evidence_json_string_is(const cJSON *object, const char *name,
+                                   const char *expected) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, name);
+  return cJSON_IsString(value) && strcmp(value->valuestring, expected) == 0;
+}
+
+static int evidence_context_has_positive_signal(const char *context) {
+  cJSON *root = cJSON_ParseWithOpts(context, NULL, 1);
+  int positive = 0;
+  if (!evidence_json_string_is(root, "schema", "agent_decision_v1")) goto done;
+  const cJSON *engine = cJSON_GetObjectItemCaseSensitive(root, "engine_evidence");
+  const cJSON *signals = cJSON_GetObjectItemCaseSensitive(engine, "signals");
+  if (evidence_json_string_is(engine, "schema", "pmfe_result_v1") &&
+      evidence_json_string_is(engine, "verdict", "suspicious")) {
+    /* A recommendation, field name, snapshot text or empty scan is not a
+     * positive finding. Retention uses typed observed findings; outbound alert
+     * identity is checked separately against its authoritative producer. */
+    static const char *const counts[] = {
+        "stomp_suspicious", "private_exec_image_hits", "private_exec_thread_starts",
+        "memfd_exec", "deleted_exec", "thread_start_matches"};
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+      const cJSON *value = cJSON_GetObjectItemCaseSensitive(signals, counts[i]);
+      if (cJSON_IsNumber(value) && value->valuedouble > 0.0 &&
+          value->valuedouble <= UINT32_MAX &&
+          value->valuedouble == (double)(uint32_t)value->valuedouble) positive = 1;
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(signals, "injection_observed")))
+      positive = 1;
+  } else if (evidence_json_string_is(engine, "schema", "shellcode_result_v1") ||
+             evidence_json_string_is(engine, "schema", "webshell_result_v1")) {
+    const cJSON *detection = cJSON_GetObjectItemCaseSensitive(engine, "detection");
+    const cJSON *detector = cJSON_GetObjectItemCaseSensitive(detection, "detector");
+    const cJSON *rule = cJSON_GetObjectItemCaseSensitive(detection, "rule");
+    const cJSON *score = cJSON_GetObjectItemCaseSensitive(detection, "score");
+    positive = cJSON_IsString(detector) && detector->valuestring[0] &&
+        cJSON_IsString(rule) && rule->valuestring[0] &&
+        cJSON_IsNumber(score) && score->valuedouble >= 0.7 && score->valuedouble <= 1.0;
+  }
+done:
+  cJSON_Delete(root);
+  return positive;
+}
+
 static int evidence_text_has_high_signal(const EdrBehaviorRecord *r) {
   return r && (evidence_string_has_high_signal(r->cmdline) ||
                evidence_string_has_high_signal(r->script_snippet) ||
-               evidence_string_has_high_signal(r->detection_context));
+               evidence_context_has_positive_signal(r->detection_context));
 }
 
 static int evidence_is_high_risk_port(uint32_t port) {
@@ -5459,13 +5502,19 @@ static int evidence_has_priority_or_high_confidence_context(const EdrBehaviorRec
   if (!r) {
     return 0;
   }
-  return evidence_contains_ci(r->detection_context, "\"severity\":\"P0\"") ||
-         evidence_contains_ci(r->detection_context, "\"severity\":\"P1\"") ||
-         evidence_contains_ci(r->detection_context, "\"priority\":\"P0\"") ||
-         evidence_contains_ci(r->detection_context, "\"priority\":\"P1\"") ||
-         evidence_contains_ci(r->detection_context, "\"confidence\":0.8") ||
-         evidence_contains_ci(r->detection_context, "\"confidence\":0.9") ||
-         evidence_contains_ci(r->detection_context, "\"confidence\":1");
+  /* This is only a local-cache reservation. Severity and confidence do not
+   * establish an alert or authorize transmission. Read exact typed fields so
+   * quoted/unrelated JSON text cannot change the retention class. */
+  cJSON *root = cJSON_ParseWithOpts(r->detection_context, NULL, 1);
+  const cJSON *confidence = cJSON_GetObjectItemCaseSensitive(root, "confidence");
+  int retain = evidence_json_string_is(root, "severity", "P0") ||
+      evidence_json_string_is(root, "severity", "P1") ||
+      evidence_json_string_is(root, "priority", "P0") ||
+      evidence_json_string_is(root, "priority", "P1") ||
+      (cJSON_IsNumber(confidence) && confidence->valuedouble >= 0.8 &&
+       confidence->valuedouble <= 1.0);
+  cJSON_Delete(root);
+  return retain;
 }
 
 /* Generic reads can dominate a live context window without adding process

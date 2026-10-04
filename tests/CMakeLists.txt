@@ -1247,6 +1247,14 @@ if(NOT MSVC)
 endif()
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+if(WIN32)
+  # Structured connection scope uses Windows' validated numeric IP parser.
+  foreach(target test_detection_decision test_detection_regression
+                 test_detection_sensor_bridge test_telemetry_admission
+                 test_local_evidence_cache_candidate)
+    target_link_libraries(${target} PRIVATE ws2_32)
+  endforeach()
+endif()
 
 if(SQLite3_FOUND)
   add_executable(test_command_fact_transport

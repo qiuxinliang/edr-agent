@@ -25,7 +25,8 @@ static int is_uncombined_tool_file(const EdrBehaviorRecord *r,
       strcmp(d->reason, "lolbin,lolbin_without_combo_condition") != 0 ||
       strcmp(d->signal_reasons, "lolbin") != 0 ||
       strcmp(d->noise_reasons, "lolbin_without_combo_condition") != 0 ||
-      strcmp(d->selection_action, "emit_context") != 0) return 0;
+      (strcmp(d->selection_action, "local_only") != 0 &&
+       strcmp(d->selection_action, "emit_context") != 0)) return 0;
   /* Tool identity alone adds no standalone file evidence to the server.
    * Reuse the path policy owner so startup, credential and other sensitive
    * targets remain eligible even if the local rule bundle proved a miss. */
@@ -110,7 +111,10 @@ int edr_preprocess_upload_admit(const EdrBehaviorRecord *record,
   if (!baseline) return 1;
   const int allowlisted_baseline = decision->suppress &&
       decision->allowlisted_path &&
-      strcmp(decision->selection_action, "emit_context") == 0 &&
+      decision->event_quality_score <= 20u &&
+      (strcmp(decision->selection_action, "drop") == 0 ||
+       strcmp(decision->selection_action, "local_only") == 0 ||
+       strcmp(decision->selection_action, "emit_context") == 0) &&
       strstr(decision->noise_reasons, "allowlisted_path") != NULL;
   const int structured_baseline = (strcmp(decision->reason, "baseline") == 0 &&
       decision->event_quality_score <= 20u) || user_path_only;
