@@ -655,10 +655,10 @@ jobs:
         run: |
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
-          $telemetryArgs = @('-BuildDir', 'build', '-Configuration', 'Release')
+          $telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }
           $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
           if (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe')) {
-            $telemetryArgs += @('-OpenSslBin', $opensslTools)
+            $telemetryArgs.OpenSslBin = $opensslTools
           }
           & .\tests\run_telemetry_windows_native.ps1 @telemetryArgs
           if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }

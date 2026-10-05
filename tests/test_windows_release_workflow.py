@@ -90,9 +90,13 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         call = '& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs'
         self.assertIn(call, step)
         self.assertLess(step.index("--label-regex '^windows-release-gate$'"), step.index(call))
-        self.assertIn("@('-BuildDir', 'build', '-Configuration', 'Release')", step)
+        # PowerShell arrays splat positional values, including strings that
+        # look like parameter names. A script's named parameters require a
+        # hashtable; the old array bound Configuration='build' on native CI.
+        self.assertIn("$telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }", step)
+        self.assertNotRegex(step, r'\$telemetryArgs\s*(?:=|\+=)\s*@\(')
         self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\\openssl'", step)
-        self.assertIn("@('-OpenSslBin', $opensslTools)", step)
+        self.assertIn('$telemetryArgs.OpenSslBin = $opensslTools', step)
         self.assertRegex(step.split(call, 1)[1],
                          r'if\s*\(\$LASTEXITCODE -ne 0\)\s*\{\s*throw\b')
         self.assertLess(build.index(call), build.index('name: Package (setup exe + runtime zip)'))
@@ -127,6 +131,12 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                                                      '# runner exit was ignored', 1),
             'packaging after failure': build.replace('- name: Package (setup exe + runtime zip)\n',
                                                     '- name: Package (setup exe + runtime zip)\n        if: always()\n', 1),
+            'positional script arguments': build.replace(
+                "$telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }",
+                "$telemetryArgs = @('-BuildDir', 'build', '-Configuration', 'Release')", 1),
+            'positional OpenSSL option': build.replace(
+                '$telemetryArgs.OpenSslBin = $opensslTools',
+                "$telemetryArgs += @('-OpenSslBin', $opensslTools)", 1),
         }
         for name, candidate in cases.items():
             with self.subTest(name=name), self.assertRaises(AssertionError):
