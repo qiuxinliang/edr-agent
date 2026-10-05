@@ -279,7 +279,7 @@ static const uint32_t actor_pid = 9840u;
 static const uint64_t event_ns = 1700000000000000000ULL;
 
 bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
-  assert(target == &bus && slot->type == EDR_EVENT_NET_CONNECT);
+  assert(target == &bus && (slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN));
   if (reject_bus) return false;
   bus.last = *slot;
   ++bus.published;
@@ -396,9 +396,11 @@ static void listener_properties(EVENT_RECORD *record, unsigned version) {
   if (version == 1u) add_property(L"ProcessStartKey", &live_actor.process_start_key, 8u);
 }
 static void test_tcpip_listener_manifest(void) {
+  extern unsigned edr_network_test_empty_payloads;
   EdrSensorInterestEvent interest; BYTE payload[1024]; EdrBehaviorRecord decoded;
-  EVENT_RECORD record = network_case("typed listener activation", 54760u);
+  EVENT_RECORD record;
   for (unsigned version = 0; version <= 1; ++version) {
+    record = network_case("typed listener activation", 54760u);
     listener_properties(&record, version);
     assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_LISTEN);
     assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
@@ -406,7 +408,7 @@ static void test_tcpip_listener_manifest(void) {
     assert(interest.process_start_key == (version ? live_actor.process_start_key : 0u));
     size_t n = edr_tdh_build_slot_payload(&record, "tcpip", payload, sizeof(payload)); assert(n);
     expect_contains((const char *)payload, "src=127.0.0.1\nspt=54760\nproto=tcp\n");
-    feed_network(&record, event_ns, version + 1u);
+    feed_network(&record, event_ns, 1u);
     assert(bus.last.type == EDR_EVENT_NET_LISTEN);
     edr_behavior_from_slot(&bus.last, &decoded);
     assert(decoded.pid == actor_pid && decoded.net_sport == 54760u && !decoded.net_dport);
@@ -416,6 +418,8 @@ static void test_tcpip_listener_manifest(void) {
   record.EventHeader.EventDescriptor.Id = 1002u;
   assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_CONNECT);
   for (unsigned fault = 0; fault < 7; ++fault) {
+    record = network_case("invalid listener cannot publish", 54760u);
+    unsigned empty_before = edr_network_test_empty_payloads;
     listener_properties(&record, 1u);
     if (fault == 0) find_property(L"ProcessId")->status = ERROR_NOT_FOUND;
     if (fault == 1) find_property(L"Status")->data[0] = 1u;
@@ -426,8 +430,18 @@ static void test_tcpip_listener_manifest(void) {
     if (fault == 6) memset(find_property(L"SocketAddress")->data + 2, 0, 2u);
     assert(!edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
     assert(!edr_tdh_build_slot_payload(&record, "tcpip", payload, sizeof(payload)));
-    feed_network(&record, event_ns, 2u);
+    feed_network(&record, event_ns, 0u);
+    assert(edr_network_test_empty_payloads == empty_before + 1u && opens == 0u);
   }
+  record = network_case("ordinary listener remains local-policy filtered", 54760u);
+  actor_path = "C:\\Windows\\System32\\notepad.exe";
+  listener_properties(&record, 1u); feed_network(&record, event_ns, 0u);
+  record = network_case("unavailable listener actor cannot borrow a remote port", 3389u);
+  deny_open = 1;
+  listener_properties(&record, 1u);
+  find_property(L"SocketAddress")->data[2] = 0x0d; find_property(L"SocketAddress")->data[3] = 0x3d;
+  feed_network(&record, event_ns, 0u);
+  record = network_case("IPv6 listener retains only local endpoint", 8080u);
   listener_properties(&record, 1u);
   BYTE sa6[28] = {23,0,0x1f,0x90}; sa6[23] = 1;
   find_property(L"AddressFamily")->data[0] = 23u;
@@ -436,6 +450,9 @@ static void test_tcpip_listener_manifest(void) {
   assert(edr_tdh_build_slot_payload(&record,"tcpip",payload,sizeof(payload)));
   expect_contains((const char *)payload,"src=0:0:0:0:0:0:0:1\nspt=8080\n");
   assert(!edr_tdh_build_slot_payload(&record,"tcpip",payload,32u));
+  feed_network(&record, event_ns, 1u);
+  edr_behavior_from_slot(&bus.last, &decoded);
+  assert(decoded.net_sport == 8080u && !decoded.net_dport && !decoded.net_dst[0]);
 }
 
 static void test_collector_network_admission(void) {

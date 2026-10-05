@@ -1363,3 +1363,32 @@ the host before correction (`library edr_validation_trace not found`) and passes
 after importing the actual trace target's sources and usage requirements
 (9.98 s), including its deliberately poisoned-header negative control. The
 production gate is unchanged. Neither failed candidate is deployed or retargeted.
+
+### Full collector listener admission regression
+
+Candidate 604 (`37296796013`, source `0afb14fc`) compiled on AMD64 and ARM64;
+both native gates passed 71/72 tests and rejected `etw_network_decode_native`.
+The first deviation was downstream of successful typed decoding and actor
+binding: the shared network admission branch required a nonzero remote port
+even for NET_LISTEN. A listener has none. It now retains listener context only
+after sensor interest and same-generation actor verification, with a nonzero
+local port and an already suspicious actor. It does not create a remote peer,
+reinterpret local ports as remote evidence, or establish alert identity.
+
+The full native test now resets each listener fixture's actor counters, makes
+its event-bus/AVE observation stubs explicitly accept valid listener output,
+and counts empty-payload observations for malformed inputs. It checks v0/v1,
+IPv4/IPv6, ordinary-actor filtering, unavailable actor with local port 3389,
+seven malformed inputs and exact local-only decoded endpoints. The first
+isolated after-run caught a pre-existing connect-only bus stub assertion; this
+failed run is retained and is not counted as passing.
+
+An ARM64 executable built from the complete native test's actual production
+source list and PCRE2 10.47 ran on the existing Windows lab: identical final
+fixtures with the old collector exited 1 at listener publication; with the
+corrected collector the entire test exited 0. It includes real same-handle
+Windows generation binding and diagnostic failure/boundary tests. Private
+evidence: `network-replay-result-v2.json`, `network-replay-build.json`, and
+`replay-v2-*.stderr/stdout` in the 604 evaluation directory. This isolated replay
+uses a separately cross-built PCRE2 archive and is not the hosted release
+dependency proof. Native production build gates remain mandatory before deploy.

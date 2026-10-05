@@ -4233,6 +4233,13 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
     return 1;
   }
   if (slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) {
+    /* A listener has a local endpoint, never a remote destination. Preserve
+     * context for a verified suspicious actor after sensor-interest admission
+     * without inventing a peer or treating a local port as remote evidence. */
+    if (slot->type == EDR_EVENT_NET_LISTEN && br.net_sport != 0u &&
+        network_actor_bound && edr_collector_process_is_suspicious(&br)) {
+      return edr_network_trace_admission(trace, 1, "listener_actor_interest");
+    }
     if (br.net_dport != 0u &&
         (edr_p0_rule_ir_is_interesting_remote_port(br.net_dport) ||
          edr_is_p0_network_port(br.net_dport) ||
