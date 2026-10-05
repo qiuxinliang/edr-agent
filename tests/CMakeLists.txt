@@ -322,6 +322,12 @@ add_test(NAME attack_surface_command_ingest_contract COMMAND test_attack_surface
 set_tests_properties(attack_surface_command_ingest_contract PROPERTIES
   ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
 
+add_executable(test_process_sid_account
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_process_sid_account.c)
+target_include_directories(test_process_sid_account PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_process_sid_account)
+add_test(NAME saved_process_sid_account_name COMMAND test_process_sid_account)
+
 add_executable(test_process_identity_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_process_identity_contract.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)

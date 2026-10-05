@@ -71,6 +71,7 @@ static uint64_t s_sampling_kept;
 #ifdef _WIN32
 #define EDR_P0_TOKEN_IDENTITY_CACHE 128u
 #include "process_token_permissions_win.h"
+#include "process_sid_account_win.h"
 #include "process_cached_generation.h"
 typedef struct {
   uint32_t pid;
@@ -684,6 +685,18 @@ static int enrich_process_token_identity(EdrBehaviorRecord *br) {
           EDR_WINDOWS_UTF8_PATH_COMPARE_INVALID_UTF8) {
     path_invalid_utf8 = 1;
     goto done;
+  }
+  if (preserve_identity) {
+    DWORD account_error = ERROR_SUCCESS;
+    if (edr_process_snapshot_account_name(br, &account_error) < 0) {
+      /* Retain SID/LUID and provenance on name-service failure. */
+      static uint64_t account_name_failures;
+      uint64_t count = ++account_name_failures;
+      if (count <= 4u || (count & (count - 1u)) == 0u) {
+        fprintf(stderr, "[preprocess] startup account name unavailable event=%s error=%lu count=%llu\n",
+                br->event_id, (unsigned long)account_error, (unsigned long long)count);
+      }
+    }
   }
   if (preserve_identity && br->integrity_level[0] && br->token_elevation != 0u) {
     return 0;

@@ -11,6 +11,7 @@
 #include <string.h>
 #include "../src/preprocess/process_token_permissions_win.h"
 #include "../src/collector/process_start_token_win.h"
+#include "../src/preprocess/process_sid_account_win.h"
 
 static int startup_token_contract(HANDLE child, DWORD pid, uint64_t creation) {
   EdrLiveProcessGeneration live;
@@ -83,6 +84,22 @@ static int startup_token_contract(HANDLE child, DWORD pid, uint64_t creation) {
   if (edr_process_start_token_capture(child, &live, &source, &attempt) != 0 ||
       !strstr((char *)captured.data, expected_sid) ||
       !strstr((char *)captured.data, expected_logon)) goto done;
+  /* Account names are derived from the captured actor SID after exit,
+   * independently of the child's PID or a replacement process. */
+  {
+    EdrBehaviorRecord identity = {0}, before;
+    DWORD account_error;
+    snprintf(identity.user_sid, sizeof(identity.user_sid), "%s", expected_sid);
+    snprintf(identity.logon_id, sizeof(identity.logon_id), "%s", "0x1234");
+    snprintf(identity.identity_source, sizeof(identity.identity_source), "%s", "kernel_process_token");
+    snprintf(identity.identity_quality, sizeof(identity.identity_quality), "%s", "token_sid");
+    identity.pid = pid;
+    before = identity;
+    if (edr_process_snapshot_account_name(&identity, &account_error) != 1 ||
+        !identity.username[0] || strcmp(identity.user_sid, before.user_sid) ||
+        strcmp(identity.logon_id, before.logon_id) ||
+        strcmp(identity.identity_quality, before.identity_quality)) goto done;
+  }
   ok = 1;
 done:
   if (expected_sid) LocalFree(expected_sid);
