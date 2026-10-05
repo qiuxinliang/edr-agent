@@ -553,6 +553,16 @@ class WindowsReleaseGateTests(unittest.TestCase):
         cmake_source = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         settings = cmake_source[cmake_source.index("set(CMAKE_C_STANDARD 11)"):
                                 cmake_source.index("option(EDR_BUILD_TESTS")]
+        # Preserve the actual shared policy's public protobuf include/defines,
+        # sources, and platform compiler options for this real codec consumer.
+        policy_start = cmake_source.index("add_library(edr_egress_policy STATIC\n")
+        policy_end = (cmake_source.index("edr_apply_common_warnings(edr_egress_policy)", policy_start)
+                      + len("edr_apply_common_warnings(edr_egress_policy)"))
+        policy = re.sub(
+            r'(?<![\w/])(?:src|third_party|include)(?:/[\w.-]+)*',
+            lambda match: f'"{(ROOT / match[0]).resolve().as_posix()}"',
+            cmake_source[policy_start:policy_end],
+        )
         tests_source = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         target = tests_source[tests_source.index("add_executable(test_p0_direct_emit_suppression "):
                               tests_source.index("add_executable(test_p0_deferred_snapshot ")]
@@ -576,7 +586,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(P0WindowsAdmission C)',
                 settings, 'find_package(Threads REQUIRED)', 'enable_testing()',
-                f'set(EDR_TEST_ROOT "{ROOT.as_posix()}")', target,
+                f'set(EDR_TEST_ROOT "{ROOT.as_posix()}")', policy, target,
                 f'set_source_files_properties("{(ROOT / "src/preprocess/p0_rule_direct_emit.c").as_posix()}" '
                 'PROPERTIES COMPILE_DEFINITIONS _WIN32 '
                 'COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/windows.h")',
