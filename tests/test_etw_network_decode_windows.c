@@ -382,6 +382,62 @@ static void feed_network(EVENT_RECORD *record, uint64_t at, unsigned expected) {
   assert(closes == opens - (deny_open ? opens : 0u));
 }
 
+static void listener_properties(EVENT_RECORD *record, unsigned version) {
+  reset_properties(record);
+  record->EventHeader.ProviderId = EDR_ETW_GUID_MICROSOFT_TCPIP;
+  record->EventHeader.EventDescriptor.Id = 1123u;
+  record->EventHeader.EventDescriptor.Version = (UCHAR)version;
+  record->EventHeader.EventDescriptor.Task = 1123u;
+  record->EventHeader.EventDescriptor.Opcode = 0u;
+  BYTE sa[16] = {2,0,0xd5,0xe8,127,0,0,1};
+  add_u32(L"Status", 0u); add_u32(L"ProcessId", actor_pid);
+  add_u32(L"AddressFamily", 2u); add_u32(L"AddressLength", sizeof(sa));
+  add_property(L"SocketAddress", sa, sizeof(sa));
+  if (version == 1u) add_property(L"ProcessStartKey", &live_actor.process_start_key, 8u);
+}
+static void test_tcpip_listener_manifest(void) {
+  EdrSensorInterestEvent interest; BYTE payload[1024]; EdrBehaviorRecord decoded;
+  EVENT_RECORD record = network_case("typed listener activation", 54760u);
+  for (unsigned version = 0; version <= 1; ++version) {
+    listener_properties(&record, version);
+    assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_LISTEN);
+    assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
+    assert(interest.pid == actor_pid && interest.remote_port == 0u);
+    assert(interest.process_start_key == (version ? live_actor.process_start_key : 0u));
+    size_t n = edr_tdh_build_slot_payload(&record, "tcpip", payload, sizeof(payload)); assert(n);
+    expect_contains((const char *)payload, "src=127.0.0.1\nspt=54760\nproto=tcp\n");
+    feed_network(&record, event_ns, version + 1u);
+    assert(bus.last.type == EDR_EVENT_NET_LISTEN);
+    edr_behavior_from_slot(&bus.last, &decoded);
+    assert(decoded.pid == actor_pid && decoded.net_sport == 54760u && !decoded.net_dport);
+    assert(!strcmp(decoded.net_src, "127.0.0.1") && !decoded.net_dst[0]);
+  }
+  /* A connection request must never satisfy a listen predicate. */
+  record.EventHeader.EventDescriptor.Id = 1002u;
+  assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_CONNECT);
+  for (unsigned fault = 0; fault < 7; ++fault) {
+    listener_properties(&record, 1u);
+    if (fault == 0) find_property(L"ProcessId")->status = ERROR_NOT_FOUND;
+    if (fault == 1) find_property(L"Status")->data[0] = 1u;
+    if (fault == 2) find_property(L"SocketAddress")->size = 15u;
+    if (fault == 3) find_property(L"AddressFamily")->data[0] = 23u;
+    if (fault == 4) record.EventHeader.EventDescriptor.Version = 2u;
+    if (fault == 5) find_property(L"ProcessStartKey")->status = ERROR_NOT_FOUND;
+    if (fault == 6) memset(find_property(L"SocketAddress")->data + 2, 0, 2u);
+    assert(!edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
+    assert(!edr_tdh_build_slot_payload(&record, "tcpip", payload, sizeof(payload)));
+    feed_network(&record, event_ns, 2u);
+  }
+  listener_properties(&record, 1u);
+  BYTE sa6[28] = {23,0,0x1f,0x90}; sa6[23] = 1;
+  find_property(L"AddressFamily")->data[0] = 23u;
+  find_property(L"AddressLength")->data[0] = 28u;
+  TestProperty *sock = find_property(L"SocketAddress");memcpy(sock->data,sa6,sizeof(sa6));sock->size=sizeof(sa6);
+  assert(edr_tdh_build_slot_payload(&record,"tcpip",payload,sizeof(payload)));
+  expect_contains((const char *)payload,"src=0:0:0:0:0:0:0:1\nspt=8080\n");
+  assert(!edr_tdh_build_slot_payload(&record,"tcpip",payload,32u));
+}
+
 static void test_collector_network_admission(void) {
   EdrSensorInterestStatus status;
   EdrConfig *config = calloc(1u, sizeof(*config));
@@ -848,6 +904,7 @@ int main(int argc, char **argv) {
   test_kernel_network_ipv6_text_unchanged();
   test_other_provider_host_order_and_text_ports();
   test_collector_network_admission();
+  test_tcpip_listener_manifest();
   test_network_admission_trace();
   test_file_control_policy_preconditions();
   test_self_noise_uses_immutable_actor_identity();

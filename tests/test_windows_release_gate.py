@@ -37,7 +37,7 @@ WINDOWS_EXPECTED = {
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
-    "openssl_tls_handshake", "windows_task_exit_behavior",
+    "openssl_tls_handshake", "windows_task_exit_behavior", "validation_trace_contract",
 }
 RUNTIME_EXPECTED = {
     "installer_runtime_health_classification", "report_events_ack_contract",
@@ -563,6 +563,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
             lambda match: f'"{(ROOT / match[0]).resolve().as_posix()}"',
             cmake_source[policy_start:policy_end],
         )
+        trace_start = cmake_source.index("add_library(edr_validation_trace STATIC")
+        trace_end = cmake_source.index("target_link_libraries(edr_agent PRIVATE edr_egress_policy", trace_start)
+        trace = re.sub(
+            r'(?<![\w/])(?:src|include)(?:/[\w.-]+)*',
+            lambda match: f'"{(ROOT / match[0]).resolve().as_posix()}"',
+            cmake_source[trace_start:trace_end],
+        )
         tests_source = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         target = tests_source[tests_source.index("add_executable(test_p0_direct_emit_suppression "):
                               tests_source.index("add_executable(test_p0_deferred_snapshot ")]
@@ -586,7 +593,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(P0WindowsAdmission C)',
                 settings, 'find_package(Threads REQUIRED)', 'enable_testing()',
-                f'set(EDR_TEST_ROOT "{ROOT.as_posix()}")', policy, target,
+                f'set(EDR_TEST_ROOT "{ROOT.as_posix()}")', policy, trace, target,
                 f'set_source_files_properties("{(ROOT / "src/preprocess/p0_rule_direct_emit.c").as_posix()}" '
                 'PROPERTIES COMPILE_DEFINITIONS _WIN32 '
                 'COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/windows.h")',

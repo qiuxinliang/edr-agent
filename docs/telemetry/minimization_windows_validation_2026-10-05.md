@@ -1314,3 +1314,42 @@ backend asynchronous rule/alert completion is a separate join. Witness table
 creation is additive local observation, not permission to migrate real retained
 source-only or legacy mixed batches. Existing payloads/identities and gates
 remain subject to the prior compatibility boundary.
+
+### Candidate gate correction and native listen boundary
+
+Candidate 602, run `37292990915`, was blocked before publication/deployment.
+The new `validation_trace_contract` was registered in the CMake release gate,
+but the dependency fixture's independent expected set was not updated. The
+fixture now expects it and the isolated P0 compiler probe links the actual
+new trace library. No failed gate is bypassed. On the host, the full 19-case
+fixture run also encountered two 90-second CTest timeouts under parallel dummy
+binary execution; those are reported separately from the fixed expected-set
+failure and are being rerun sequentially. Native CI remains the release gate.
+
+A read-only query of the lab Windows TCPIP provider established another concrete
+cause of listen UNKNOWN: event 1002 is a connection request; 1123 v0/v1 is a
+successful listener activation, with binary `SocketAddress`, payload ProcessId,
+and a v1 ProcessStartKey. The old map called 1002 NET_LISTEN and 1123 NET_CONNECT;
+the generic UTF-16 property formatter also did not decode the sockaddr. The
+collector now maps 1123 to NET_LISTEN and reads typed status/actor/family/length,
+network-byte-order port and IPv4/IPv6 address. It never invents a remote peer for
+a listening socket. Unsupported versions, missing identity, failed status,
+family/length conflicts, zero port and truncated output do not become valid
+listen evidence. Existing provider collection and detector policy are retained.
+
+The native TDH replay uses the existing test suite's external-I/O fixture with
+the actual pre-change and post-change `etw_tdh_win.c` (ARM64 binaries): old exit
+41, new exit 0 on the same v1 IPv4 input; new code also rejects failed status.
+Receipt: `fixtures-native.json` under private 602 evaluation artifacts. The full
+native network test now covers mapping, v0/v1 typed fields, IPv6 loopback,
+malformed variants, same-handle generation admission and real mapping before
+publication. Its future CI execution is not claimed by the focused TDH replay.
+The independent observer includes TCPIP 1123 and validates its typed successful
+payload; its original Kernel-Network capture still covers connect events.
+
+The additive receipt observer was also executed against the unchanged 601:
+exit 0, complete read, schema available=false (no table). This explicitly
+means no historical ACK evidence, and does not fabricate confirmation from the
+current queue contents. The live Agent remained PID 4464, exact birth
+134356565652927026, version 3.2.601, with the unchanged baseline binary/config
+hashes throughout these isolated fixture checks.

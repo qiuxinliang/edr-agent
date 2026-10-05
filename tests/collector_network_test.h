@@ -12,6 +12,7 @@
 #include "edr/sensor_interest.h"
 void edr_collector_network_test_reset(EdrEventBus *bus);
 void edr_collector_network_test_feed(EVENT_RECORD *record, uint64_t event_ns);
+int edr_collector_network_test_type(EVENT_RECORD *record);
 void edr_collector_network_test_health(EdrCollectorHealth *out);
 int edr_collector_network_test_bind_actor(EdrBehaviorRecord *record);
 void edr_collector_network_test_self_identity(const EdrLiveProcessGeneration *identity);

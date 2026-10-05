@@ -455,6 +455,44 @@ static uint32_t edr_parse_u32_ascii(const char *s) {
   return v;
 }
 
+/* TCPIP 1123 v0/v1 is ListenerActivated. SocketAddress is a binary
+ * SOCKADDR, not UTF-16 text. Its payload ProcessId owns the socket; the ETW
+ * logger/header is not a substitute. Confirmed against native provider metadata. */
+static int edr_tcpip_listener_descriptor(PEVENT_RECORD rec) {
+  return rec && memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0 &&
+      rec->EventHeader.EventDescriptor.Id == 1123u;
+}
+static int edr_prop_exact(PEVENT_RECORD rec, PCWSTR name, void *out, ULONG size) {
+  PROPERTY_DATA_DESCRIPTOR p = {0}; ULONG actual = 0;
+  p.PropertyName = (ULONGLONG)(ULONG_PTR)name; p.ArrayIndex = ULONG_MAX;
+  ULONG rc = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &p, &actual);
+  if (rc == ERROR_SUCCESS && actual != size) rc = ERROR_INVALID_DATA;
+  if (rc == ERROR_SUCCESS) rc = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &p, size, out);
+  edr_tdh_note_property_status(rc); return rc == ERROR_SUCCESS;
+}
+static int edr_tcpip_listener_fields(PEVENT_RECORD rec, uint32_t *pid, uint64_t *key,
+                                      char address[64], unsigned *port) {
+  uint32_t status = 0, family = 0, size = 0; BYTE raw[28] = {0};
+  *pid = 0; *key = 0; *port = 0; address[0] = '\0';
+  if (rec->EventHeader.EventDescriptor.Version > 1u || rec->EventHeader.EventDescriptor.Opcode != 0u ||
+      !edr_prop_exact(rec, L"Status", &status, 4u) || status != 0u ||
+      !edr_prop_exact(rec, L"ProcessId", pid, 4u) || !*pid ||
+      !edr_prop_exact(rec, L"AddressFamily", &family, 4u) ||
+      !edr_prop_exact(rec, L"AddressLength", &size, 4u) ||
+      !((family == 2u && size == 16u) || (family == 23u && size == 28u)) ||
+      !edr_prop_exact(rec, L"SocketAddress", raw, size) ||
+      ((unsigned)raw[0] | (unsigned)raw[1] << 8u) != family) return 0;
+  if (rec->EventHeader.EventDescriptor.Version == 1u &&
+      (!edr_prop_exact(rec, L"ProcessStartKey", key, 8u) || !*key)) return 0;
+  *port = (unsigned)raw[2] * 256u + raw[3];
+  if (!*port) return 0;
+  if (family == 2u) snprintf(address, 64u, "%u.%u.%u.%u", raw[4], raw[5], raw[6], raw[7]);
+  else snprintf(address, 64u, "%x:%x:%x:%x:%x:%x:%x:%x",
+      raw[8]*256u+raw[9], raw[10]*256u+raw[11], raw[12]*256u+raw[13], raw[14]*256u+raw[15],
+      raw[16]*256u+raw[17], raw[18]*256u+raw[19], raw[20]*256u+raw[21], raw[22]*256u+raw[23]);
+  return 1;
+}
+
 int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
                                         const char *prov_tag,
                                         EdrSensorInterestEvent *out_event) {
@@ -464,6 +502,17 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
     return 0;
   }
   memset(out_event, 0, sizeof(*out_event));
+  if (edr_tcpip_listener_descriptor(rec)) {
+    char address[64]; unsigned port;
+    if (type != EDR_EVENT_NET_LISTEN || !edr_tcpip_listener_fields(rec, &out_event->pid,
+        &out_event->process_start_key, address, &port)) return 0;
+    out_event->type = type; out_event->event_id = 1123u;
+    snprintf(out_event->provider, sizeof(out_event->provider), "tcpip");
+    /* No remote endpoint exists for a listen. Do not manufacture one merely
+     * to satisfy a remote-port signal or an outbound connection rule. */
+    return 1;
+  }
+
   out_event->type = type;
   out_event->event_id = rec->EventHeader.EventDescriptor.Id;
   out_event->opcode = rec->EventHeader.EventDescriptor.Opcode;
@@ -575,6 +624,14 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     return 0;
   }
 
+  if (edr_tcpip_listener_descriptor(rec)) {
+    char address[64]; unsigned port; uint32_t pid; uint64_t key;
+    if (!edr_tcpip_listener_fields(rec, &pid, &key, address, &port)) return 0;
+    int n = snprintf((char *)out, out_cap,
+        "ETW1\nprov=tcpip\npid=%lu\nepid=%lu\neid=1123\nop=0\nsrc=%s\nspt=%u\nproto=tcp\nprocess_start_key=%llu\n",
+        (unsigned long)pid, (unsigned long)pid, address, port, (unsigned long long)key);
+    return n > 0 && (size_t)n < out_cap ? (size_t)n : 0u;
+  }
   char line[8192];
   size_t off = 0;
 

@@ -831,8 +831,9 @@ static int edr_map_type_and_tag(PEVENT_RECORD rec, EdrEventType *out_type,
   }
   if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
     *out_tag = "tcpip";
-    /* 设计 §19.10：1001 新连接 / 1002 端口绑定等；其余按连接类处理 */
-    if (ev_id == 1002u) {
+    /* Native manifest: 1002 requests a connection; 1123 activates a listener.
+     * The TDH owner validates version, status, sockaddr and payload PID. */
+    if (ev_id == 1123u) {
       *out_type = EDR_EVENT_NET_LISTEN;
     } else {
       *out_type = EDR_EVENT_NET_CONNECT;
@@ -4485,7 +4486,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     const GUID *g = &event_record->EventHeader.ProviderId;
     if (memcmp(g, &EDR_ETW_GUID_MICROSOFT_TCPIP, sizeof(GUID)) == 0) {
       USHORT eid = event_record->EventHeader.EventDescriptor.Id;
-      slot.priority = (eid == 1002u) ? 1u : 2u;
+      slot.priority = (eid == 1123u) ? 1u : 2u;
       slot.attack_surface_hint = 1u;
     } else if (memcmp(g, &EDR_ETW_GUID_WINFIREWALL_WFAS, sizeof(GUID)) == 0) {
       slot.priority = 0u;
@@ -4598,7 +4599,13 @@ void edr_collector_network_test_reset(EdrEventBus *bus) {
 }
 
 void edr_collector_network_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
-  edr_collector_decode_mapped_event(record, EDR_EVENT_NET_CONNECT, "knet", event_ns);
+  EdrEventType type; const char *tag = NULL;
+  if (edr_map_type_and_tag(record, &type, &tag))
+    edr_collector_decode_mapped_event(record, type, tag, event_ns);
+}
+int edr_collector_network_test_type(EVENT_RECORD *record) {
+  EdrEventType type; const char *tag = NULL;
+  return edr_map_type_and_tag(record, &type, &tag) ? (int)type : 0;
 }
 
 void edr_collector_network_test_health(EdrCollectorHealth *out) {
