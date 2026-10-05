@@ -664,7 +664,12 @@ static int control_leaf_valid(const cJSON *v, char kind) {
     return 1;
   }
   if (kind == 'r') return !s[0] || !strcmp(s, "control_validation_failed") || !strcmp(s, "config_validation_failed") || !strcmp(s, "command_id_conflict");
-  if (kind == 'p') return !strcmp(s, "https_control") || !strcmp(s, "https_control_stream") || !strcmp(s, "https_long_poll");
+  /* ACKs echo the existing server CommandEnvelope transport, including durable
+   * retries. Keep a closed set; a protocol name never permits result fields. */
+  if (kind == 'p') return !strcmp(s, "https_control") || !strcmp(s, "https_control_stream") ||
+      !strcmp(s, "https_long_poll") || !strcmp(s, "https_h2_server_stream") ||
+      !strcmp(s, "https_http1_stream") || !strcmp(s, "https_h2_long_poll") ||
+      !strcmp(s, "https_http1_long_poll") || !strcmp(s, "https_transport_v2");
   if (kind == 's') return !strcmp(s, "received") || !strcmp(s, "rejected") || !strcmp(s, "reported") ||
       !strcmp(s, "applied") || !strcmp(s, "failed") || !strcmp(s, "unchanged") || !strcmp(s, "restart_required");
   if (kind == 'd') {

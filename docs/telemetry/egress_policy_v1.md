@@ -4,6 +4,13 @@ This policy is a development change, not a production rollout or existing-queue 
 
 Default data purposes are proven alerts, heartbeat, and explicitly projected health. The human owner additionally authorized minimum authentication/bootstrap/startup/signed-policy/command-receipt/protocol-ACK controls, separately from the three data purposes. This authorization does not permit command/query results, host inventory, attachments, or free-text diagnostics. There is no environment switch that widens egress purposes.
 
+Control ACKs preserve the existing CommandEnvelope transport value. The closed
+set is `https_control`, `https_control_stream`, `https_long_poll`,
+`https_h2_server_stream`, `https_http1_stream`, `https_h2_long_poll`,
+`https_http1_long_poll`, and `https_transport_v2`. The latter five are existing
+server producer values, including durable retries; they grant no additional
+fields or data purposes. Unknown values and command-result fields remain denied.
+
 ## Actual outbound execution graph
 
 ```mermaid

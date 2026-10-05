@@ -1591,3 +1591,164 @@ Private evidence hashes (paths relative to `/private/tmp`):
 | `edr-agent-605-evaluation/attempt2/replay/receipt-restart-persistence.json` | `854956820162f054e66a720e6380fca41a769bfbf6f09b0b225db6e7a693a636` |
 | `edr-agent-606-evaluation/trace-counterfactual.json` | `246713de32667a6cb1e3f52b4cd66336fa13a8c495f0224f2c5a9c2c41477ace` |
 | `edr-agent-606-evaluation/network-replay-result.json` | `257c8f09e8ba4c0bba708e35ae04ef1217a5e65967fe369d530b72a713ca1444` |
+
+
+### Candidate 606: native release and deployed acceptance
+
+Source `4a9507389bae6cd4d4811cca31ed2b661ae7da7a` was published as
+[win_3.2.606](https://github.com/qiuxinliang/edr-agent/releases/tag/win_3.2.606).
+[Run 37312878137](https://github.com/qiuxinliang/edr-agent/actions/runs/37312878137)
+completed all seven jobs, including both real installer/updater lifecycle jobs.
+AMD64 passed 72/72 native tests (146.78 s) and 19/19 minimization gates
+(218.38 s); ARM64 passed 72/72 (249.70 s) and 19/19 (220.86 s).
+This is an unsigned candidate prerelease; `latest` remained win_3.2.591.
+The first ARM64 log download reached its deadline; a second bounded download
+retrieved the full successful log. Its CTest summary omits the optional
+“0 tests failed” phrase; both 100-percent summaries and their test counts were
+validated without rerunning or changing tests.
+
+The four deployment inputs (binary, manifest, runtime ZIP and unattended setup)
+were fully downloaded and checked against GitHub digests and the manifest.
+The original download reached its 600-second limit before any Agent lifecycle
+operation. A bounded HTTP 206/Content-Range resume retained the original partial
+file and verified the complete resulting bytes. GUI ZIP bytes were not downloaded
+or used; its release metadata and the successful bundle CI are separate evidence.
+
+| ARM64 deployment artifact | SHA-256 |
+| --- | --- |
+| FDSensor.exe | `e792e7cdcebf52dfdb1c007778a68174a50e8dbe8f1e9b352b44cd0ddd863d2e` |
+| Official setup.exe | `e108be2a06cd8788047a08185638878af4dc4f99513c2100d2617f3b6f100fe1` |
+| Runtime ZIP | `e6ffaa48ca23d135abc3574697b944b0244c975b2bbf4e06998033ba3c39ad65` |
+
+The verified 605 process stopped normally (875 ms, exit 0, no force). The official
+606 installer exited 0 and started PID 4708, birth `134356819428736092`.
+Primary/LKG configuration, CA and policy sequence 524 were preserved. The UTM
+20-second launch wait returned before installation ended; the actual installer
+receipt, rather than the transport timeout, established success. No installer
+or synthetic case was blindly replayed.
+
+The first 606 acceptance controller exhausted its 180-second readiness budget
+with resource pressure/throttle present in reported samples. Rules/cache were
+ready, source-only flags and event-bus drops were zero. It executed no cases,
+removed its Machine opt-in and retained the closed trace (three diagnostic drops).
+CPU snapshots exceeded the unchanged 10-percent budget; a later readback recovered
+to pressure=0/throttle=0. Neither collection nor the budget was changed to pass.
+
+A separately owned normal restart preserved that failed window, confirmed the
+prior scheduled task Ready for three samples, and started PID 5028 with birth
+`134356825692407918`. The stop exited 0 in 1,578 ms without force. The original
+readiness predicates then passed before one execution of the three cases.
+All case owners exited 0; all eight children and 22 truth actions succeeded;
+independent raw ETW parsing reported zero errors. Raw matching still leaves the
+three listener actions unresolved; zero parse errors alone is not full coverage.
+
+#### 606 action, context, delivery and persistence results
+
+| Observable contract | 605 second window | 606 window | Result boundary |
+| --- | --- | --- | --- |
+| Explicit local action observations | 11/22 | 19/22 | Observation is not proof that every detector evaluated every action. |
+| Process creates | 8/8 observed | 8/8 observed | Two real positive rule emissions; ordinary outcomes remain locally explained. |
+| Process exits | 0/8, UNKNOWN | 8/8 observed | Exact target birth joins; eight AVE notifications and interest rejections. No claim of eight alerts. |
+| Ordinary loopback connects | 3/3 observed | 3/3 observed | Two interest rejections, one admitted event with explicit throttle/proven-miss disposition. |
+| Listens | 3 UNKNOWN | 3 UNKNOWN | The unchanged Agent session does not enable TCPIP; live listen acceptance remains unexecuted. |
+| Positive alerts | 2 | 2 | Exact source/generation links, R-EXEC-001, signed bundle r283-e2008650. |
+| Parent command truth | Presence only | Exact equality, 2/2 | Independent GetCommandLineW truth, verified by live OS readback in native smoke. |
+| Actual HTTP bodies | 3,501 bytes | 3,500 bytes | Two decoded immutable payloads of 3,710 bytes each; not whole-machine traffic totals. |
+| Exact request/server/local ACK joins | 2/2 | 2/2 | Server ingest done/accepted=1/attempts=1, accepted batch owner, local COMMITTED witness. |
+| Ordinary exact-generation backend records | 0 | 0 | Applies to these ordinary native/loopback synthetic children only. |
+
+Five ordinary process creates have explicit resource-throttle/proven-miss outcomes;
+one has P0 proven miss and local-only retention. Three short-process creates also
+record generation/correlation unavailable. These diagnostic outcomes remain
+visible; no claim is made that every ordinary event received complete rule
+analysis or durable context retention. Necessary positive context, source/alert
+command lines, decoded commands, image paths, parent PID/image/command and the
+rule predicate all match independent truth. The trace is closed at 456,362 bytes
+with 18 diagnostic contention drops, so absence is never used as proof of filtering.
+
+Parent-command oracle tooling is root-workspace commit
+`15c6a5b1a4fba8c2defcf70db8d757c06dbf8937`. ARM64 cross-build passed; the native
+smoke fails against the old producer (missing parent command) and passes all three
+checks with the new producer, including child/parent failure propagation. An
+initial test that reconstructed Start-Process argument quoting did not establish
+exact command equality. Its failure is retained; the final oracle reads the actual
+OS command of the same PID/birth and does not reconstruct it. No Agent command
+text was changed to satisfy the comparison.
+
+Upgrade preservation inspected all 3,315 original queue rows / 3,584,521 bytes.
+3,314 retained rows have identical identity and payload; the single absent row
+has its original 6,374-byte payload and exact hash in a real committed local ACK,
+a server accepted batch and completed ingest (accepted=1, attempts=1). Thus the
+strict all-rows-present comparison correctly exited 2, and a separate exact
+receipt join explains normal delivery without excusing changed data or inventing
+ACKs. Changed retained identities/payloads=0. Fixed-20 cache comparison passed:
+20 candidates, 5,120 scoped reference occurrences and 5,120 scoped fact-body
+occurrences remained equal to the stopped backup. Shared facts may repeat.
+
+All 182 pre-upgrade ACK witnesses and all 240 pre-restart witnesses are unchanged
+among 260 post-window witnesses, including their original confirmation times.
+No real queue migration, clearing, rewriting or local ACK synthesis occurred.
+Final readback at 14:10 UTC confirms PID 5028/birth above, binary/version/config/CA
+unchanged, task Running, sequence 524 and both Machine trace opt-ins absent.
+The actual ETW session has seven providers and no TCPIP provider. Post-case
+health confirms rules/cache ready, source-only flags=0 and event-bus drops=0;
+resource pressure can recur under the unchanged budget, so sustained pressure-free
+operation is not asserted.
+
+Private evidence follows; raw commands, event bodies, credentials and files are
+not committed. Collection uses bounded read-only backend queries and the existing
+normal TLS path. Coarse SQL time windows normalize Windows seven-digit fractions
+for host Python 3.9; exact decimal FILETIME identities and payload bytes do not.
+
+| Evidence relative to `/private/tmp` | SHA-256 |
+| --- | --- |
+| `edr-agent-606-evaluation/workflow-completed.json` | `5e0ee3fc2ba8ae41c4954ffdd77cdbc5d7ef47486703359316ad005ed1033505` |
+| `edr-agent-606-evaluation/deployment-assets-verified.json` | `926011e3d95b13fb34bbd9d7739c07c79b67ac535a54c898f793d272105d3ace` |
+| `edr-agent-606-evaluation/install-terminal-private.json` | `c7781ff9cb2b59b78553eaeb474c4d7abf3f81f784d38353e8325e803b337281` |
+| `edr-agent-606-evaluation/auto-acceptance-result.json` | `1d77d55786908edd04e386ac9593a67427ad36e888734d3420b23932453a8ade` |
+| `edr-agent-606-evaluation/queue-final-verdict.json` | `b23b5fcc5788dd95b4e49bf6695b5284fc45b015916624af613d72decbe3f010` |
+| `edr-agent-606-evaluation/cache-compare-actual-stdout.json` | `c14a5e67975948c626bfe51d49143d3966313f6d4c9d568ed6daf862b7511a36` |
+| `edr-agent-606-evaluation/parent-smoke-result.json` | `f7aeb1fb28582960e2891ea21c03900e2f186412e6f94ad396e4190ef206c851` |
+| `edr-agent-606-evaluation/replay/runtime-result.json` | `7447a65e53806eacb90cf3c6516201a15d5532b20c0c84b318bd5f46d90ac43a` |
+| `edr-agent-606-evaluation/replay/field-evidence/exact-delivery-verdict.json` | `d7400c7f42b7cc097a9d092771e70b80ac9cf17b0ef973f4b6c589948afd9366` |
+| `edr-agent-606-evaluation/replay/field-evidence/context-quality.json` | `edaa47096ccce7da5e5645a6ddad6d41c537a226a78041495276db257f1efed3` |
+| `edr-agent-606-evaluation/replay/field-evidence/server-batch-receipts.json` | `a089c88ab7385044e04f57bcd934a38fe78a5e9c0f4fe0878d5f9ca93e8e5e6f` |
+| `edr-agent-606-evaluation/replay/field-evidence/agent-validation.jsonl` | `48a3ecee5f1642a3f9013b88bab7af5f158f59afa6a92564526c768323614f6e` |
+| `edr-agent-606-evaluation/replay/receipt-upgrade-restart-persistence.json` | `f2a0d1c031c90f98f012f34cf5a26fc6591fdc955d177834a07e3aafc4ed09ec` |
+| `edr-agent-606-evaluation/replay/final-runtime.json` | `648a222b3e3b2f4adacf1b069a5e734be08f440f7acca1672ebf6f68f24e7a63` |
+| `edr-agent-606-evaluation/replay/final-provider.json` | `f0fd9b948428183e76a42753fdc8fec6674e817a25d537f97c652aecde80f682` |
+
+
+### Control protocol compatibility defect found during 606 acceptance
+
+Event-batch local ACKs above pass. A separate control-delivery ACK check found
+201 durable pending records with `transport=https_h2_server_stream`, nonnegative
+sequence and bounded command ID. The current server owner
+`platform/internal/handler/ingest_http_extensions.go` produces
+`https_h2_server_stream`, `https_http1_stream`, `https_h2_long_poll` and
+`https_http1_long_poll`; `ingest.go` also produces `https_transport_v2`.
+`poll_dispatch_one` preserves that transport in receipt and durable retry state.
+The egress control whitelist only allowed three Agent fallback names, so these
+valid current protocol ACKs were refused before sending. This is a confirmed
+producer/consumer enum mismatch, not an event-batch ACK failure.
+
+The fix adds exactly those five existing producer enum values in
+`control_leaf_valid`. It adds no route, field, arbitrary text, command result,
+query result or attachment exception and changes no signature/TLS checks. Existing
+retry state remains owned by the normal ACK sender; production data is not migrated.
+Regression covers all eight exact names, each name with a forbidden result field,
+and seven invalid/near-match enum values. The same new test aborts on the old
+production owner (host -6; native ARM64 -1073740791) and passes on the fixed owner
+(host/native 0). The native wrapper's initial postcheck wrongly expected the
+function name in assertion output; the preserved assertion instead identifies the
+exact acceptance expression and test line 34. The child failure/pass evidence was
+validated without replay. Full release gates and deployed control-ACK recovery
+are pending for this fix; strict overall minimization is not declared complete.
+
+- `edr-agent-606-evaluation/replay/control-ack-owner-enums.json` SHA-256 `37699175a81b5930c045e22d4ec35e3f0910a02c5d5a1a6a3b4046a9b68181d4`.
+
+- `edr-agent-607-evaluation/policy-before.json` SHA-256 `cedac72c9d68080329dca77d77d7e87a451023063d172ed514d6df458577d32e`.
+
+- `edr-agent-607-evaluation/policy-after.json` SHA-256 `dd359d7caeb88c1b490ce9555e340570b6b60ddfc298e5e7c564b193d55b5074`.
+
+- `edr-agent-607-evaluation/native-policy-verdict.json` SHA-256 `48e7a5e11bcae43597458ac852407ebe10ee2d725e4ee978435925bb9eb6ed8c`.

@@ -18,7 +18,36 @@ static int check(const char *method, const char *path, const char *body) {
   return edr_egress_request_validate(method, path, body ? "application/json" : NULL,
       body, body ? strlen(body) : 0u, reason, sizeof(reason));
 }
+static void test_control_ack_transports(void) {
+  /* Existing server CommandEnvelope transports, including queued ACK replay. */
+  const char *allowed[] = {"https_control", "https_control_stream", "https_long_poll",
+    "https_h2_server_stream", "https_http1_stream", "https_h2_long_poll",
+    "https_http1_long_poll", "https_transport_v2"};
+  const char *denied[] = {"", "https_h2_server_stream_extra", "https_h2_server_stream pmfe",
+    "HTTPS_H2_SERVER_STREAM", "http1_stream", "legacy_websocket", "unknown"};
+  char body[512];
+  for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
+    int n = snprintf(body, sizeof(body),
+        "{\"endpoint_id\":\"ep\",\"command_id\":\"id\",\"status\":\"received\","
+        "\"reason\":\"\",\"transport\":\"%s\",\"last_seq\":1}", allowed[i]);
+    assert(n > 0 && (size_t)n < sizeof(body));
+    assert(check("POST", "ingest/control/ack", body) == 0);
+    cJSON *ack = cJSON_Parse(body); assert(ack);
+    assert(cJSON_AddStringToObject(ack, "result", "synthetic-secret"));
+    char *extra = cJSON_PrintUnformatted(ack); assert(extra);
+    assert(check("POST", "ingest/control/ack", extra) != 0);
+    free(extra); cJSON_Delete(ack);
+  }
+  for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); ++i) {
+    int n = snprintf(body, sizeof(body),
+        "{\"endpoint_id\":\"ep\",\"command_id\":\"id\",\"status\":\"received\","
+        "\"transport\":\"%s\",\"last_seq\":1}", denied[i]);
+    assert(n > 0 && (size_t)n < sizeof(body));
+    assert(check("POST", "ingest/control/ack", body) != 0);
+  }
+}
 int main(void) {
+  test_control_ack_transports();
   {
     char why[96];
     const char *health = "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"monitor\":{\"profile\":\"basic\"},\"p0_offline_queue_capacity\":{\"delivery\":{\"acked\":3,\"sent\":4}}}}";
