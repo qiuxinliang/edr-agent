@@ -319,6 +319,16 @@ void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns);
  * after the durable boundary succeeds. */
 void edr_local_evidence_cache_test_fail_next_commits(unsigned count);
 void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count);
+typedef struct {
+  uint64_t queries;
+  uint64_t vm_steps;
+  uint64_t fullscan_steps;
+} EdrEvidenceCacheQueryCost;
+/* Real PMFE selector statements only: result_query=0 leases, 1 result replay.
+ * Test builds observe SQLite instruction counts before statement finalization. */
+void edr_local_evidence_cache_test_pmfe_query_cost(int result_query,
+                                                  EdrEvidenceCacheQueryCost *out,
+                                                  int reset);
 /* Test-only mutex timing controls. They never exist in production builds. */
 void edr_local_evidence_cache_test_reset_mutex_timing(void);
 void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,

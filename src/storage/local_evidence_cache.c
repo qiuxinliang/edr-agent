@@ -157,6 +157,7 @@ static const char *const metric_names[METRIC_COUNT] = {
 static EdrEvidenceFailureReason s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_manifest_allocation_failures;
+static EdrEvidenceCacheQueryCost s_test_pmfe_query_cost[2];
 #endif
 
 typedef struct {
@@ -5336,6 +5337,16 @@ int edr_local_evidence_cache_pmfe_bind_result(const EdrBehaviorRecord *r, const 
   evidence_cache_unlock(); return rc;
 }
 
+#if defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+static void pmfe_capture_query_cost_locked(sqlite3_stmt *statement, unsigned index) {
+  if (!statement) return;
+  EdrEvidenceCacheQueryCost *cost = &s_test_pmfe_query_cost[index];
+  cost->queries++;
+  cost->vm_steps += (uint64_t)sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 0);
+  cost->fullscan_steps += (uint64_t)sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0);
+}
+#endif
+
 int edr_local_evidence_cache_pmfe_take_task(EdrPmfeFollowupTask *out) {
   if (!out) return 0; int rc=0; evidence_cache_lock();
 #if defined(EDR_HAVE_SQLITE)
@@ -5353,6 +5364,9 @@ int edr_local_evidence_cache_pmfe_take_task(EdrPmfeFollowupTask *out) {
       cJSON_Delete(root); if (rc) break;
     }
   }
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  pmfe_capture_query_cost_locked(st, 0u);
+#endif
   sqlite3_finalize(st);
 #endif
   evidence_cache_unlock(); return rc;
@@ -5375,6 +5389,9 @@ int edr_local_evidence_cache_pmfe_replay_result(uint8_t **frame,size_t *length) 
       cJSON_Delete(root); if (rc) break;
     }
   }
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  pmfe_capture_query_cost_locked(st, 1u);
+#endif
   sqlite3_finalize(st);
 #endif
   evidence_cache_unlock(); return rc;
@@ -5670,6 +5687,9 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "artifact_type TEXT,path TEXT,sha256 TEXT,manifest_json TEXT,created_ns INTEGER,"
       "upload_status TEXT,minio_key TEXT);"
       "CREATE INDEX IF NOT EXISTS idx_artifacts_ep_time ON artifacts(endpoint_id,created_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_artifacts_pmfe_state_created "
+      "ON artifacts(upload_status,created_ns,artifact_id) "
+      "WHERE artifact_type='" PMFE_ASSOC_TYPE "';"
       "CREATE TABLE IF NOT EXISTS command_results ("
       "command_id TEXT PRIMARY KEY,command_type TEXT,status TEXT,execution_status INTEGER,"
       "exit_code INTEGER,detail TEXT,artifacts TEXT,updated_ns INTEGER);"
@@ -5734,6 +5754,16 @@ void edr_local_evidence_cache_close(void) {
 }
 
 #if defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+void edr_local_evidence_cache_test_pmfe_query_cost(int result_query,
+                                                  EdrEvidenceCacheQueryCost *out,
+                                                  int reset) {
+  evidence_cache_lock();
+  unsigned index = result_query ? 1u : 0u;
+  if (out) *out = s_test_pmfe_query_cost[index];
+  if (reset) memset(&s_test_pmfe_query_cost[index], 0, sizeof(s_test_pmfe_query_cost[index]));
+  evidence_cache_unlock();
+}
+
 void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count) {
   evidence_cache_lock();
   s_test_manifest_allocation_failures = count;

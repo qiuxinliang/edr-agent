@@ -7421,6 +7421,132 @@ static int pmfe_artifact_count(const char *path,const char *state) {
   if (sqlite3_step(st)==SQLITE_ROW) count=sqlite3_column_int(st,0);
   sqlite3_finalize(st); sqlite3_close(db); return count;
 }
+static void pmfe_assert_empty_recovery_query_cost(void) {
+  edr_local_evidence_cache_test_pmfe_query_cost(0, NULL, 1);
+  edr_local_evidence_cache_test_pmfe_query_cost(1, NULL, 1);
+  for (unsigned i = 0; i < 16u; ++i) {
+    EdrPmfeFollowupTask task;
+    uint8_t *frame = NULL;
+    size_t length = 0;
+    assert(!edr_local_evidence_cache_pmfe_take_task(&task));
+    assert(!edr_local_evidence_cache_pmfe_replay_result(&frame, &length));
+    assert(!frame && length == 0u);
+  }
+  EdrEvidenceCacheQueryCost costs[2];
+  for (int query = 0; query < 2; ++query) {
+    edr_local_evidence_cache_test_pmfe_query_cost(query, &costs[query], 0);
+    printf("pmfe_empty_recovery_query=%d calls=%llu fullscan_steps=%llu vm_steps=%llu\n",
+           query, (unsigned long long)costs[query].queries,
+           (unsigned long long)costs[query].fullscan_steps,
+           (unsigned long long)costs[query].vm_steps);
+    fflush(stdout);
+  }
+  for (int query = 0; query < 2; ++query) {
+    assert(costs[query].queries == 16u);
+    assert(costs[query].fullscan_steps == 0u);
+    assert(costs[query].vm_steps <= 256u * costs[query].queries);
+  }
+}
+
+static void test_pmfe_recovery_query_cost_and_index_upgrade(void) {
+  char path[512];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  const int64_t now = 1700000000000000000LL;
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  assert(edr_local_evidence_cache_open(path, 32u, 24u) == 0);
+  sqlite3 *db = NULL;
+  sqlite3_stmt *insert = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "BEGIN;");
+  assert(sqlite3_prepare_v2(db, "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,"
+                           "artifact_type,manifest_json,sha256,created_ns,upload_status) "
+                           "VALUES(?,'synthetic-endpoint','synthetic-tenant','command_fact_full',"
+                           "'{\"synthetic\":true}','synthetic-retained-hash',?,'local_only')",
+                           -1, &insert, NULL) == SQLITE_OK);
+  for (unsigned i = 0; i < 10000u; ++i) {
+    char identity[64];
+    snprintf(identity, sizeof(identity), "synthetic-query-cost-%u", i);
+    sqlite3_bind_text(insert, 1, identity, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert, 2, now + (int64_t)i);
+    assert(sqlite3_step(insert) == SQLITE_DONE);
+    sqlite3_reset(insert);
+    sqlite3_clear_bindings(insert);
+  }
+  sqlite3_finalize(insert);
+  /* Completed synthetic rows only exercise index selection, not association
+   * authorization: they deliberately contain no claimed PMFE detection facts. */
+  compact_exec(db, "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<1023) "
+                   "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,artifact_type,manifest_json,"
+                   "sha256,created_ns,upload_status) SELECT 'synthetic-completed-'||i,"
+                   "'synthetic-endpoint','synthetic-tenant','pmfe_followup_local_v1',"
+                   "'{\"synthetic\":true}','synthetic-completed-hash',1700000000000000000+i,'completed' FROM n;"
+                   "COMMIT; CREATE TEMP TABLE expected_query_cost_ordinary AS SELECT * FROM artifacts "
+                   "WHERE artifact_type='command_fact_full';"
+                   "CREATE TEMP TABLE expected_query_cost_completed AS SELECT * FROM artifacts "
+                   "WHERE upload_status='completed';");
+  /* This invokes both real owner selectors. Zero tasks must not inspect the
+   * 10,000 unrelated or 1,024 completed artifacts per turn; no elapsed-time oracle. */
+  pmfe_assert_empty_recovery_query_cost();
+
+  EdrBehaviorRecord *record = calloc(1, sizeof(*record));
+  uint8_t *frame = malloc(EDR_EGRESS_FRAME_MAX);
+  assert(record && frame);
+  pmfe_fixture_original(record, 41u);
+  size_t length = edr_behavior_record_encode_protobuf(record, frame, EDR_EGRESS_FRAME_MAX);
+  EdrPmfeFollowupTask task;
+  assert(length && edr_local_evidence_cache_pmfe_prepare(record, "sc-local-41", frame, length, 0u, 0u, &task) == 0);
+  assert(edr_local_evidence_cache_pmfe_take_task(&task) == 1);
+  assert(!edr_local_evidence_cache_pmfe_take_task(&task)); /* Existing scan lease is authoritative. */
+  pmfe_fixture_result(record, 41u, "failed", "inconclusive");
+  length = edr_behavior_record_encode_protobuf(record, frame, EDR_EGRESS_FRAME_MAX);
+  assert(length && edr_local_evidence_cache_pmfe_bind_result(record, frame, length) == 0);
+  uint8_t *replay = NULL;
+  size_t replay_length = 0;
+  assert(edr_local_evidence_cache_pmfe_replay_result(&replay, &replay_length) == 1);
+  assert(replay_length == length && !memcmp(replay, frame, length));
+  free(replay);
+  compact_exec(db, "CREATE TEMP TABLE expected_query_cost_pmfe AS SELECT artifact_id,sha256,"
+                   "json_extract(manifest_json,'$.original_wire_hex') AS original_wire,"
+                   "json_extract(manifest_json,'$.result_wire_hex') AS result_wire "
+                   "FROM artifacts WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='result_bound';");
+  edr_local_evidence_cache_close();
+  compact_exec(db, "DROP INDEX IF EXISTS idx_artifacts_pmfe_state_created; BEGIN IMMEDIATE;");
+  /* Normal owner initialization DDL must fail with an actionable cause while
+   * another writer holds the database; it must preserve every retained row. */
+  assert(edr_local_evidence_cache_open(path, 32u, 24u) < 0);
+  EdrEvidenceCacheStatus status;
+  edr_local_evidence_cache_get_status(&status);
+  assert(!status.db_open && status.last_error[0]);
+  compact_exec(db, "ROLLBACK;");
+  for (unsigned pass = 0; pass < 2u; ++pass) {
+    assert(edr_local_evidence_cache_open(path, 32u, 24u) == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' "
+                             "AND name='idx_artifacts_pmfe_state_created'") == 1);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM expected_query_cost_ordinary "
+                             "EXCEPT SELECT * FROM artifacts WHERE artifact_type='command_fact_full')") == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='command_fact_full'") == 10000);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM expected_query_cost_completed "
+                             "EXCEPT SELECT * FROM artifacts WHERE upload_status='completed')") == 0);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE upload_status='completed'") == 1024);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts a JOIN expected_query_cost_pmfe e "
+                             "ON a.artifact_id=e.artifact_id WHERE a.sha256=e.sha256 "
+                             "AND json_extract(a.manifest_json,'$.original_wire_hex')=e.original_wire "
+                             "AND json_extract(a.manifest_json,'$.result_wire_hex')=e.result_wire") == 1);
+    edr_local_evidence_cache_test_set_now_unix_ns(now + (int64_t)(pass + 1u) * 31000000000LL);
+    replay = NULL;
+    assert(edr_local_evidence_cache_pmfe_replay_result(&replay, &replay_length) == 1);
+    assert(replay_length == length && !memcmp(replay, frame, length));
+    free(replay);
+    assert(pmfe_artifact_count(path, "result_bound") == 1); /* No fabricated receipt. */
+    edr_local_evidence_cache_close();
+  }
+  assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  free(record);
+  free(frame);
+}
+
 static void test_pmfe_durable_followup_binding_and_receipt_lifecycle(void) {
   char path[512],alert[64],reason[96]; assert(make_test_sqlite_path(path,sizeof(path))==0);
   EdrBehaviorRecord *original=calloc(1,sizeof(*original)),*result=calloc(1,sizeof(*result));
@@ -7651,6 +7777,9 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--pmfe-query-cost") == 0) {
+    test_pmfe_recovery_query_cost_and_index_upgrade(); return 0;
+  }
   if (argc == 4 && strcmp(argv[1], "--crash-cache-migration") == 0) {
     migration_crash_child(argv[2], atoi(argv[3])); return 1;
   }
@@ -7668,6 +7797,7 @@ int main(int argc, char **argv) {
 #endif
   test_pmfe_names_and_negative_values_are_not_signals();
 #if defined(EDR_HAVE_SQLITE)
+  test_pmfe_recovery_query_cost_and_index_upgrade();
   test_pmfe_durable_followup_binding_and_receipt_lifecycle();
   test_pmfe_recovery_retry_capacity_and_inconclusive();
   test_pmfe_scope_restoration_and_corruption();
