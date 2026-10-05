@@ -5,13 +5,23 @@ deployment. The earlier host/cross-build evidence is in
 [the development ledger](minimization_verification_2026-10-04.md). Neither that
 ledger nor a successful build certifies installed sensor behavior.
 
-Current verified checkpoint: 600 has passed both native architecture groups and
-the installer/updater lifecycle gates, been published as a prerelease, and been
-installed on the ARM64 lab endpoint. The stopped queue and fixed evidence subset
-are preserved. The original baseline cache comparison remains failed, and
-installed-600 field acceptance is FAILED with resource pressure and increasing
-eventbus drops. Guarded field cases remain NOT EXECUTED; strict field minimization
-acceptance is incomplete.
+Current verified checkpoint: 601 passes the host regressions, both native
+architecture groups, both CI installer/updater lifecycle groups and published
+ARM64 asset verification. The second protected lab attempt installs the exact
+601 binary successfully. A bound post-install sample reports CPU 60-second
+average 2.41%, current CPU 6.90%, budget 10%, pressure/throttle zero and eventbus
+used/dropped zero. All 507 original stopped queue identities/payloads and the
+fixed evidence subset are preserved in separate bounded read-only comparisons.
+Both bounded synthetic field captures and their private consumer analysis
+complete. The later 60-second CPU average is 2.21%, with no eventbus drops.
+Per-action local/detection/wire/server/ACK evidence still has UNKNOWN gaps.
+Strict field minimization is not declared complete.
+
+The first 601 stop attempt remains FAILED with verified 600 recovery. The
+installed-600 resource/field result and original baseline cache comparison
+remain FAILED. The queue comparison launcher's unknown child exit and the first
+two cache invocation parse failures remain separate failed executions; later
+semantic preservation evidence does not convert those failures into passes.
 
 ## Scope and starting runtime
 
@@ -489,11 +499,437 @@ Busy event processing repeats both queries without the idle wait. A deterministi
 synthetic database with 10,000 unrelated artifacts and zero tasks invokes the
 real owner selector 16 times: the task selector executes 159,984 full-scan steps
 and 480,224 VM steps. Its new zero-full-scan assertion fails on the unchanged
-600 mechanism. This proves a local query-cost defect, separately from installed
-sensor causality. The correction is being implemented as one matching partial
-index in the existing schema owner; no recovery frequency, collection, detector,
-lease, retry budget, wire bytes or ACK contract is relaxed. It is not yet a
-deployed repair or a passed field result.
+600 mechanism. This earlier failure is retained separately from the stronger
+completed-row regression below. It proves a local query-cost defect, separately
+from installed sensor causality.
+
+Commit `3e5ddeb80a8d1d178002a2d6ea74b436d0eccfd9` adds one matching partial
+index through three production schema-owner string literals in
+`src/storage/local_evidence_cache.c`: `idx_artifacts_pmfe_state_created` indexes
+`(upload_status,created_ns,artifact_id)` only for
+`artifact_type='pmfe_followup_local_v1'`. There is no new table, worker or runtime
+option. Actual `SQLITE_STMTSTATUS_FULLSCAN_STEP` and `SQLITE_STMTSTATUS_VM_STEP`
+counters are compiled only under `EDR_LOCAL_EVIDENCE_CACHE_TESTING`; they measure
+the two real owner statements rather than a substitute query or elapsed-time
+oracle. No recovery frequency, collection, detector, lease, retry budget, wire
+bytes or ACK contract is relaxed.
+
+The final deterministic synthetic owner fixture contains 10,000 ordinary
+artifacts, 1,024 completed PMFE-shaped rows and zero active tasks. Completed rows
+carry no claimed detection facts. Each real selector is called 16 times:
+
+| Real owner query | Unindexed full-scan / VM steps | Indexed full-scan / VM steps |
+| --- | ---: | ---: |
+| `edr_local_evidence_cache_pmfe_take_task` | 176,368 / 578,528 | 0 / 512 |
+| `edr_local_evidence_cache_pmfe_replay_result` | 176,368 / 578,528 | 0 / 512 |
+
+The unindexed new assertion terminates with SIGABRT (subprocess exit -6); the
+indexed regression exits 0 and passes. The same fixture verifies exact ordinary
+and completed rows, original/result wire hashes and bytes, existing scan lease
+exclusion, two reopen/replay cycles, and observable initialization failure while
+another writer holds the database. Index creation resumes after that writer
+releases its lock; retained rows and unacknowledged result state remain intact.
+The full `local_evidence_cache_candidate` test passes 1/1 in 7.59 seconds and
+`pmfe_lifecycle_policy_switch` passes 1/1 in 1.23 seconds. Independent review,
+narrow checks and `git diff --check` pass. This is host synthetic evidence with
+the explicit debug rule-IR stub; the fixture opens no production or guest
+database. It does not establish native Windows behavior or installed CPU/drop
+recovery. At that host-verification checkpoint, installed 600 remains unchanged
+and its field result remains FAILED; the later native and 601 lab results follow.
+
+## 601 host verification and native workflow checkpoint
+
+601 [run 37263506416](https://github.com/qiuxinliang/edr-agent/actions/runs/37263506416)
+is dispatched from exact source
+`3e5ddeb80a8d1d178002a2d6ea74b436d0eccfd9` using `workflow_dispatch`.
+The source/run binding is verified and all seven workflow jobs complete with
+SUCCESS. Both product builds and their actual native Test steps pass. The old
+release gate runs before the separate native minimization runner on each
+architecture:
+
+| Native architecture | Existing release gate | Minimization gate | Actual loopback mTLS test |
+| --- | --- | --- | --- |
+| AMD64 | 71/71 PASS, 154.57 s | 18/18 PASS, 228.86 s | PASS, 105.60 s |
+| ARM64 | 71/71 PASS, 240.92 s | 18/18 PASS, 215.34 s | PASS, 106.01 s |
+
+The new receiver-resource test also passes on both architectures. Successful
+CTest stdout does not retain the receiver's per-scene request/body/ACK JSON or
+the query-cost numbers; those native values remain unavailable and are not
+replaced with host measurements.
+
+The actual CI lifecycle steps execute successfully rather than being skipped.
+AMD64 Setup install/upgrade/rollback/uninstall runs from 04:48:04 to 04:49:27 UTC,
+then native runtime update lifecycle from 04:49:27 to 04:50:29 UTC. ARM64 runs
+those steps from 04:48:25 to 04:51:27 and from 04:51:27 to 04:52:47 UTC,
+respectively. Publication completes as prerelease `win_3.2.601`, release
+403365668, at 04:53:06 UTC with ten assets and the exact source/tag commit above.
+`latest` remains `win_3.2.591` (release 403052409). ARM64 asset-content
+verification subsequently passes as recorded below. CI lifecycle success does
+not itself establish a lab upgrade or installed resource recovery. The first
+lab normal-stop attempt subsequently fails before Setup; the second attempt's
+actual stop, installation and bounded post-install results are recorded below.
+
+After the index change, the actual host loopback HTTPS/mTLS receiver passes all
+nine synthetic scenes with normal TLS verification and zero production
+connections. Their measured request/body, durable-batch, duplicate and ACK counts
+match the separate 600 host table above: DNS and IP SAN each 8/11,329, dictionary
+8/9,174, associated PMFE 3/3,230, terminal journal 1/2,017, paired P0 journal
+3/5,928 and crash/restart 4/6,118 requests/bytes; wrong CA and SAN each receive
+0/0. The associated PMFE scene executes one actual worker result and records two
+distinct queue ACKs. The crash scene preserves the original pending hash, then
+records two distinct queue ACKs after restart; resumed collection/detection are
+zero. Receiver business failures are zero throughout, and reported client
+failed-check counters are zero.
+The paired P0 scene remains a production-schema fixture with
+`detector_executed=false`; host measurements are not native Windows facts.
+
+The first sandbox attempt exits 1 on `PermissionError` while binding the local
+listener, before any scene executes. That execution limitation is retained in
+its own receipt; it is not a production-transport test failure. The separately
+completed unrestricted host run supplies the nine-scene result above.
+
+All six mechanically retargeted 601 private owner scripts pass actual Windows
+`Parser.ParseFile` AST parsing at 04:27:50.0154461 UTC, with zero parse errors and
+matching frozen SHA/lengths. That particular operation only parses syntax:
+no prepare, stop, cache, install or field owner executes, no protected 601 job
+is created and no queue is modified during it. The runtime at that historical
+parser checkpoint is still 600; subsequent owner executions follow below.
+
+The original frozen stopped-queue gate remains unchanged at SHA
+`16b8cad374f525356dc2aaa27bbecd0a3b1e26f3136595d9a71b7ef0584a534e`.
+Its decision rejects even a valid retained local-v3 severity-2 fixture; that
+historical refusal is reproduced, with `historical_gate_passed=false`. A new
+private gate, `stopped-owner-compat-601-local-v3-v2`, changes only that
+compatibility classification for the unchanged queue-owner implementation from
+600 (`2754870ecb840b09022882eaf1fc854b34c9b681`) to 601. It permits severity-2
+rows only when the source-owner column exists, fully validated owner is 3, the
+owner is clear with epoch/loss zero, the session is clean, no diagnostics or
+recovery bindings remain, and every such row is exactly
+`status=local_evidence` and `terminal_reason=source_only_local_v3`. It reports
+retained local-v3 and unresolved legacy counts separately, with no inferred
+server ACK or established alert identity. Owner-2 local tags, pending/dead
+source rows, unknown state and any unmet existing owner guard remain refused.
+
+At 04:44:21.8131136 UTC, actual Windows compilation and execution of the gate's
+C# decision function passes all 20 isolated synthetic contracts, including the
+old-gate refusal control and the rejection cases above. Both scripts parse
+with zero errors and match their frozen hashes. This test opens no database
+and executes no stop/install owner. The normal-stop requirement, read-only
+immutable access, file/row/byte/time bounds, quick-check and before/after SHA
+guards are preserved in source. The actual stopped-database gate remains
+pending at that synthetic-test checkpoint and subsequently passes in the second
+lab attempt below. The new gate does not migrate, send or acknowledge retained
+data, and the original failure receipt remains separate.
+
+The strengthened private field wrapper checks its child owner exit code as
+well as the existing completion, ETW-loss, health, throttle, eventbus and queue
+guards. Actual Windows AST parsing and an extracted exact-source condition
+test pass at 04:49:59.2787392 UTC: otherwise valid observations accept exit 0
+and reject exit 1. This is a pure guard test, with no field owner executed;
+`observations_collected_not_acceptance` and the unassigned quality result are
+preserved.
+
+Revision 3 keeps the earlier files and manifests unchanged. Its new
+prepare/install/launch copies pin the new gate SHA and a separate
+`stopped-queue-gate-601-v2.json` receipt. Install additionally verifies the
+exact gate version, source/target commits, eligibility, read-only/immutable
+flags, zero legacy/unknown counts and explicit false ACK/alert-identity flags.
+The existing candidate, normal-stop, backup, rollback and hash guards remain.
+All four new files pass actual Windows `Parser.ParseFile` AST/hash validation
+at 04:51:43.0413500 UTC, with zero errors; mechanical review accounts for every
+changed byte. The root agent has adopted the revision for the planned upgrade.
+Template upload and that parsing operation do not execute these owners or
+inspect an actual live/stopped database; they precede the later lab attempts.
+
+## 601 asset adoption and failed lab stop
+
+All five ARM64 published assets pass independent size and GitHub digest checks,
+the release manifest and bundle inspection, ZIP/raw-binary agreement, and ARM64
+PE architecture validation. The exact source/tag/run identity and prerelease
+with `latest=false` are rechecked after download. The 7,285,601-byte official
+Setup has SHA `6312d3108e541179965cc5250badcc429330daa08f6db38efc50e022d075d7bd`;
+the 2,848,256-byte Agent binary has SHA
+`ca71ab98f8a9b6da404a305311da34748a1d4ed91c51f1857ba8b78ec049312c`.
+The initial download fails its 300-second deadline for the 75,035,330-byte UI
+asset and is retained as FAILED. One separately recorded bounded fallback
+completes verification; it does not overwrite the failed receipt or partial
+downloads. The release owner classifies 600 to 601 as `installer_required`;
+only official Setup is prepared, with queue and evidence retention enabled.
+
+The first protected 601 lab owner starts at 05:33:55 UTC and fails before Setup
+at 05:34:58 UTC. Its original 600 PID/creation-time binding is verified. The
+unchanged normal-stop helper actually exits 9: the stop signal succeeds, the
+process wait succeeds, but the Agent exits 1 after 61,531 ms without forced
+termination. The current stderr contains both preprocessing shutdown timeout
+and dependency-retention markers. In the exact installed source this is the
+60-second preprocessing join followed by `main` returning 1; later drain,
+transport shutdown and normal queue-close success are not reached. This
+identifies the failed shutdown stage, not the particular operation that stalls
+inside the worker. No all-collected-event retention claim follows from a
+process exit or durable-file copy.
+
+Before restarting 600, all nine stopped queue/cache DB, WAL/SHM and current
+startup-log files are copied to a separate protected failure-evidence directory.
+Source and destination byte lengths, SHA digests and write times are verified
+individually and the complete source set is rechecked while the Agent remains
+absent. The preserved files total 572,304,705 bytes. No SQLite checkpoint,
+recovery apply, database replacement, queue clearing or inferred ACK occurs.
+The failed owner and stop receipts remain unchanged. Only after preservation
+and unchanged binary/configuration/CA/sequence/SYSTEM-task verification does
+the existing task start once. At 05:55:58 UTC, 600 is verified Running as one
+new generation; a scoped server sample confirms online heartbeat and verified
+v524 policy. This is recovery from failed stopping, not successful upgrade.
+
+After recovery, CPU still exceeds the 10 percent budget and the event bus
+has backlog; this remains a failed field-readiness condition. A full sample at
+06:05:44 UTC confirms P0/artifact readiness and the open evidence cache, with
+zero retry/family/terminal-unhealthy flags, but the process-local sticky
+`source_only.loss_detected` is 1. This RAM history is distinct from the durable
+queue latch checked by the stopped gate. The existing local-v3 durable audit can
+clear the persistent latch without clearing history in the current process;
+only an actual clean stop and unchanged persistent state can establish the
+next-generation recovery result. No historical loss is cleared manually. Any second
+upgrade attempt must have its own identity and receipts, require an actual
+exit-0 normal stop, and leave the original failure intact. The 601 stopped gate,
+Setup, retention comparisons and field cases remain NOT EXECUTED at this stage.
+
+
+Read-only shutdown review also identifies conditional liveness gaps unchanged
+from 600 to 601. The preprocessing loop checks stopping only after an empty bus;
+a producer that keeps replenishing it can prevent that check. PMFE, WinDivert
+and Webshell bus producers are stopped later in `main`, and a full PMFE
+unassociated-submit queue can wait for admission shutdown that follows the
+preprocessing join. These conditions are not established for the failed lab
+attempt. A deterministic real-owner harness plan is recorded, but no new
+shutdown regression or lifecycle fix executes in this investigation. An
+eventually successful second stop would establish only that actual attempt,
+not close these conditional risks.
+
+Second-attempt templates use a new protected job and the recovered 600
+generation. They leave the failed original owner untouched and reuse its 20
+selector IDs only; no fresh live baseline is claimed. A separate CMD wrapper
+captures the actual unchanged helper process exit immediately, copies its raw
+receipt and refuses replay. Launch/install require strict PID/birth, actual
+helper exit, Agent exit, signal, wait, no force, fresh file times and exact
+receipt hashes before any stopped backup or Setup. Windows AST parsing and
+execution of 24 exact extracted-function contracts plus five synthetic CMD
+exit/missing/stale/replay cases pass at 06:23:47 UTC. Only a synthetic helper
+is invoked; no Agent stop, production helper, real database or installer runs.
+
+At 06:25:50 UTC, the independent protected second job is prepared with eleven
+verified copies and the original configuration, trust, sequence and SYSTEM-task
+contract. Both mechanically retargeted retention probes also pass actual native
+AST and C# compilation, returning before any SQLite or process comparison.
+The completed preparation is not a successful second stop or install. After
+all guest preparation ceases, read-only snapshots show old-generation bus
+backlog 5,280 at 06:27:47, then 4,328 at 06:32:47, with dropped count still zero.
+At this preparation checkpoint the low-interference normal stop remains
+pending; neither sampling nor detectors nor collection are reduced. The later
+second stop and installation result follows below.
+
+The private completed-case consumer is separately strengthened to require
+integer-zero owner/probe/observer/cache exits and an explicitly true trace-stop
+flag, in addition to the existing exact actor/runtime/scope checks. The original
+consumer accepts a same-status owner-exit-1 synthetic receipt; that failure is
+retained. The new consumer passes 11 deterministic host contracts including
+failed, missing and mistyped exit/trace fields. This is a private guard test;
+no completed field case, decoder, guest workload or backend collection executes.
+
+## 601 second lab installation and bounded retention
+
+After preparation has ceased and the original bus has drained, the unchanged
+normal-stop helper targets recovered 600 PID 7224 / creation filetime
+`134356533455526833`. Its separately captured actual process exit is 0. The raw
+stop receipt reports signal sent, wait status 0, Agent exit 0, 2,437 ms elapsed
+and no forced termination. The independent protected attempt-2 owner verifies
+both fresh receipt hashes, the absent Agent and Ready SYSTEM task before
+backup or Setup. This successful stop does not supersede the first failed
+stop or close the unchanged conditional shutdown risks above.
+
+The actual stopped read-only v2 gate passes at 06:48:44 UTC. It verifies queue
+owner 3, clear latch, epoch/loss zero, a clean session, no diagnostic/recovery
+binding and quick-check success. The immutable inventory contains 507 rows:
+412 retained local-v3 source rows, 93 pre-existing severity-1 dead-letter rows
+and two severity-1 policy-held rows; there are zero unresolved legacy-source or
+unknown-severity rows. The local-v3 count establishes compatible retention,
+with explicitly false inferred server ACK and alert identity. Semantic event
+decoding is not performed by this gate. The stopped queue SHA is
+`5ad561ca4a66a876dcccc6d441abb2549eb8235a5b55f492e2a3984033c9a8ab`.
+
+The installation owner starts at 06:48:27.6302525 UTC, starts official Setup at
+06:48:46.6930910 UTC and completes at 06:49:43.0907237 UTC. Setup actually exits
+0; the owner is completed with no installer pending. The resulting one Running
+SYSTEM-task generation is 601 PID 4464 / creation filetime
+`134356565652927026`, binary SHA
+`ca71ab98f8a9b6da404a305311da34748a1d4ed91c51f1857ba8b78ec049312c`.
+Primary/LKG configuration and the CA remain unchanged; independent policy
+sequence remains 524. Current installer verification/health reports are
+freshly bound to this Setup execution. No separate index-bootstrap operation
+is executed.
+
+The bound health sample reported at 06:54:21 UTC has current CPU 6.90%,
+10-second average 3.18% and 60-second average 2.41%, with the unchanged 10%
+budget, pressure/throttle zero, eventbus used/dropped zero and current
+source-only loss flag zero. The recovered 600 sample at 06:42:48 UTC already
+has eventbus used zero while its current CPU is 20.25%, 60-second average
+24.98% and pressure/throttle remain active. Thus the new-generation resource
+observation is favorable, but bus clearance cannot be attributed to the index
+change. Restarted cumulative counters are not subtracted across generations;
+the earlier process-local sticky loss history and 600 failures remain intact.
+This sample does not prove complete collection, detection or ACK behavior.
+
+At 07:07:15.4365873 UTC, the bounded queue comparison reads the immutable
+stopped backup and a consistent read-only live transaction while verifying the
+601 identity. All 507/507 original record IDs, batch IDs, payload SHA values and
+lengths are present and equal, covering 948,210 original payload bytes. Missing,
+identity-changed and payload-changed counts are all zero; both sides read
+1,896,420 payload bytes in 89 ms. The probe retains the 4,096-row / 128-MiB,
+8-second statement / 90-second total bounds. Its full report establishes exact
+preservation of that original inventory; `server_ack=not_inferred` and per-row
+status reporting is not an admission/ACK assertion.
+
+That comparison's launcher separately fails with outer exit 1 after its
+`Start-Process` child exit is returned as NULL. The comparison stdout and
+exclusive full report are complete, with child stderr zero, but actual child
+exit remains UNKNOWN. The exclusive queue comparison is not rerun.
+Semantic preservation PASS and launcher-exit failure are
+recorded separately.
+
+The cache invocation receipts `actual01` and `actual02` retain real
+`ParserError` / `UnexpectedToken` failures, outer exit 1 and empty stdout,
+before SQL executes. The separate `actual03` invocation captures the actual
+native child exit 0 through `$LASTEXITCODE`, with child stderr zero. Its
+07:13:02.3007061 UTC report compares the fixed 20 selector IDs against the
+later stopped cache backup and a read-only live cache. All common columns are
+equal for 20 candidates, 5,120 scoped reference occurrences and 5,120 scoped
+fact occurrences; all 5,120 fact bodies are byte-identical. There are zero
+missing, changed-common-column or changed-body occurrences. Schema columns
+and cache user version 2 are equal on both sides. The bounded comparison reads
+24,980,880 canonical/value bytes in 1,616 ms, with no database modification or
+server ACK inference. Counts are scoped occurrences; shared facts can repeat.
+
+The old baseline is used only to select those IDs. All 20 candidate hashes are
+equal from that baseline to the stopped backup, while all 20 reference/fact
+set hashes differ before this upgrade. Stopped-backup-to-601-live hashes are
+equal for every selected set. This proves the stated subset survived this
+upgrade; it does not erase the original failed baseline comparison, establish
+whole-cache preservation or infer confirmation of any retained source payload.
+
+The first installed-601 native-short capture runs from 07:18:07.7509603 to
+07:18:54.4892207 UTC. Probe, observer, cache and trace start/stop exits are 0,
+and trace stop is explicitly true. The trace reports 90 records read, 12 matched,
+zero parse errors and zero reported ETW events/buffers lost. Circular-file
+completeness and API-truth/per-action joins remain separate checks. This is
+completed capture evidence, not final collection/detection/alert/context/ACK
+acceptance. At that capture checkpoint analysis is pending; the completed cases and
+consumer results are recorded in the following section.
+
+## Installed 601 field observations and remaining acceptance boundaries
+
+Two new bounded synthetic cases actually execute, each with three children,
+concurrency one, 45 seconds of observation and no policy change or business
+command. Each uses a separately fresh full server preflight, the pinned wrapper
+and exact installed PID/birth/binary/configuration/CA. Pressure, throttle,
+source-only loss/retry/degraded masks and eventbus drops are zero before both
+cases. Native-short holds each child for 100 ms; network-loopback holds it for
+3,000 ms and uses loopback only. Their outer 20-second transport waits expire
+without restarting the owners. Subsequent exact completed receipts capture
+real native exit 0, not a timeout interpreted as success.
+
+| Measurement | Native-short | Network-loopback |
+| --- | --- | --- |
+| Wrapper UTC window | 07:18:06.2492491–07:18:55.1279719 | 07:22:52.6653503–07:23:40.7586028 |
+| Requested / completed children | 3 / 3 | 3 / 3 |
+| Owner, probe, observer, cache exit | all integer 0 | all integer 0 |
+| Trace stopped / reported ETW loss | true / 0 | true / 0 |
+| Distinct truth generations / ETW lifetime matches | 3 / 3 | 3 / 3 |
+| Scoped raw ETW rows | 12 | 33 |
+| Truth action count, including exit/network actions | 6 | 12 |
+| Original strict per-action raw observation | 6 OBSERVED | 6 OBSERVED, 6 UNKNOWN |
+| Strict local / sampled wire / exact child server actions | each 6 UNKNOWN | each 12 UNKNOWN |
+| Captured queue batches / decoded frames | 723 / 870 | 747 / 894 |
+| Fetched actor-PID-or-marker server subset | 30 rows | 0 rows |
+| Server rows with exact child PID/birth/scope | 0 | 0 |
+
+The capture and execution checks pass. They do not establish field collection,
+rule evaluation, expected filtering, complete local retention or ACK for each
+action. Historic held records are included in the sampled queue counts; these
+are not newly enqueued/sent/received counts. The server subset uses the existing
+source-time window expanded by 120 seconds and actor PID or case marker. It is
+not the full endpoint receive window. The native subset's 30 records are outside
+the three exact child generations; their independent durable ingest timestamps
+are 07:19:54–07:19:58, after that trace ends. A parent/collector command carrying
+the marker can fall into this subset. Its normalized rows do not preserve
+sufficient structured rule/trigger evidence to verify alert identity, necessity
+or exact original protobuf association. Alert/source status remains UNKNOWN;
+a `p0` envelope, severity, score or record count is not accepted as proof.
+
+The verification owner `outer scripts/telemetry_quality/analyze_actions.py`
+initially compares native decimal UInt32 IPv4 addresses and UInt16 PORT values
+with formatted truth tuples. This creates three false UNKNOWN connect results.
+The repair in outer commit `72d7a922` follows the
+[Microsoft TDH IPv4/PORT contract](https://learn.microsoft.com/en-us/windows/win32/etw/using-tdhgetproperty-to-consume-event-data),
+accepts only bounded canonical unsigned facts for supported provider/event
+schemas, and preserves formatted addresses and generic host-order port aliases.
+The new same-shape three-tuple regression fails before the fix; the complete
+focused analyzer suite passes 41/41 afterward, including wrong provider/schema,
+PID/birth/time/tuple and malformed-value negatives. Independent saved-data
+reanalysis, with no guest operation or decoder rerun, changes network raw results
+to 9 OBSERVED / 3 UNKNOWN. All three connects match; the three listens still lack
+explicit provider evidence. Every local/wire/server action remains UNKNOWN.
+Original traces and reports are immutable; the new derived report records the
+new parser source. This repair changes verification tooling only, not the
+published Agent or any runtime collection behavior.
+
+Exact follow-up read-only metadata verifies all 30 native-subset batches against
+the same tenant/endpoint and saved batch set. Every queue job reports 601,
+`done`, a matching accepted batch SHA and server completion. All 30 stored
+`payload_b64` lengths are zero. This agrees with the current backend's normal
+`ReportEventQueueSQL.MarkDone` cleanup after completion; it does not establish
+that the running backend has the current source build. The original decoded
+batch cannot be recovered from this table for retrospective rule/context/body
+verification. No body or options JSON is exported, no real record is modified,
+and no local ACK is inferred. Structured alert identity and necessary-context
+acceptance for these unrelated records therefore remain UNKNOWN.
+
+The first V2 completed-case consumer fails before its backend query because the
+native producer serializes its five counts as canonical decimal strings, whereas
+the prepared fixture checked integer literals. Its failed capture is retained.
+A separate private V3 consumer accepts only integers or canonical unsigned decimal
+strings for these five counters; boolean/float/negative/noncanonical/overflow
+values are rejected. Owner/child exit checks remain strict integer zero and all
+identity/trace/byte/provenance guards remain unchanged. The original 11 offline
+tests and three added tests pass (14/14), including 105 invalid-count subcases;
+the identical real-owner string-count fixture fails before the repair. Both
+completed cases then collect successfully into a fresh private directory with
+the pinned current decoder and immutable original-frame byte/count checks. No
+workload is rerun and the failed V2 evidence is not overwritten.
+
+A combined historical receive window triggers MySQL error 3024 under the existing
+8-second statement / 12-second client bounds; that failed receipt is retained.
+Two first attempts using Windows seven-digit fractional timestamps fail host
+argument parsing before sampling. Converting timestamps to supported UTC
+microseconds and querying each actual approximately 49-second case separately
+passes without increasing either deadline. Each exact receive window has zero
+ingest jobs, processed events or business alerts. These zeros do not prove
+intentional filtering or no missed detection; source-time marker queries and
+server receive-time counts measure different boundaries.
+
+The later full samples at 07:46:52 UTC still report 601 online with verified
+applied policy, 60-second CPU average 2.21%, current CPU 2.98%, pressure/throttle
+zero, eventbus used/dropped zero and source-only loss/retry zero. Eventbus pushed
+is 35,034 versus 19,021 before the first case, with no within-generation drop
+increase. These counters cover the whole interval and background activity;
+collector callbacks and bus pushes are not distinct case-event counts. The
+runtime reports 68 successful event POSTs / 163,114 actual request-body bytes
+cumulatively, versus 35 / 72,845 before the first case, and health attempt-body
+bytes 291,378 versus 148,531. Neither delta is assigned to the three child
+actors. Detection-evaluation and exact case enqueue/ACK counts remain unavailable
+rather than being reported as zero. A final independent read-only runtime check
+confirms the original 601 PID/birth/binary, Running SYSTEM task and unchanged
+configuration/CA after both cases. The strict field no-miss/necessary-context/ACK
+acceptance remains incomplete; normal collection and detectors were not reduced
+to obtain these results.
 
 ## Private receipt commitments
 
@@ -526,8 +962,77 @@ to native measurements.
 | `passive-server-600-end.json` (intermediate before window end) | `5f6b653b0a1fb6f793802e0489b5e29eb53bb3a1f04b6e275816b59530324367` |
 | `passive-server-600-final.json` (completed 180-second server window) | `564af8a475defa1cf7c96cabd4f793d3256fa88c2e3d0c9e179f55ec77781947` |
 | `passive-delta-summary-600.json` (actual health span and unavailable counters) | `1e1df6bf7f91077c0f5119c8b6e81b53ef14376589e7d790b1a3a61e06ecaaf3` |
+| `pmfe-recovery-query-ckh5ehf9/owner-verification.json` (host indexed-owner regression) | `c6757c42653a8b819a9d8ff6f0ed007fdb1bbe66ac7e47c3a0662a0cc262cdc0` |
+| `edr-601-host-mtls-receiver.log` (sandbox bind limitation; no scenes executed) | `c3d5912af546b91c01c473f56aed517a0719a3a6dbcd01a3afaab44c18aad790` |
+| `edr-601-host-mtls-receiver-unrestricted.log` (actual nine-scene host PASS) | `45d6cda4faae7bfbd8669a0e549579144c365b9e0593d480fce9367662ee7ec2` |
+| `601/template-manifest-v2.json` (six frozen private owners) | `318e84dcda3a6e6d7be7cecd8fd1714d18ccd89c8a87299a52e0fa4463319ba8` |
+| `601/mechanical-adaptation-review.json` | `048de63bcd84d43fb70cd839343822b58968871b24f8b80c925bf7ca53f3f92b` |
+| `601/windows-parser-receipt.json` (AST only; owners NOT EXECUTED) | `7b6a338bac717c4039d5d6dce051efe1d0a986da64a195b171a60f4716b65298` |
+| `601/windows-parser-freeze.json` | `14a71ea1d6de0b6835c8c7d8c7cbf48ae7cc332a450e3cad216c1caec32b0c02` |
+| `601-ci/amd64.log` (71/71, 18/18, actual mTLS) | `3e599837c3732d05f46653cae04fa6894608b8cbc33a8800e5ed2eece789f43e` |
+| `601-ci/arm64.log` (71/71, 18/18, actual mTLS) | `81e1b00bc78d685ce899139303468f8b08cc16f1ac6516ba165b478329dab64a` |
+| `601-ci/lifecycle-amd64.log` (actual Setup/runtime steps) | `3bcb24d222983e7eb99570d384bb838fe4483f3ee2cd1edfacc861c433ad63f2` |
+| `601-ci/lifecycle-arm64.log` (actual Setup/runtime steps) | `5d126c1db6fbd0e9b9eb892b89d55bf8ec2c5c615c33d7ee9ed0e654c59be064` |
+| `601-ci/ci-release-summary.json` (all seven jobs and source/tag/latest binding) | `918c1d2f17ecdef3e6602887f1cdf5e5bfeae47efa13a9e411ac9dd46073cf98` |
+| `compat601/stopped-queue-gate-601-v2.ps1` (new private gate source) | `a1833f65d957179b23af1ec8d2c68a035348dfd268a884ed16ab78550e158141` |
+| `compat601/compat601-synthetic-v2.private.json` (20 native pure-decision contracts) | `7c681816e505ca0a8e6b98fe79209e38cf19d49fa7e48df5b06e7015afc293b6` |
+| `compat601/compat601-review-verification.json` | `585642da037623ecf0fab0ccffe62835631feba5756f55e46a64d7871f1c2816` |
+| `601/owner-exit-parser-guard-receipt.json` (AST/exact condition only) | `d3c29550609eabdec6dbf4e02f2f111b5b360f56a12bd52abebdebf52383240c` |
+| `601/owner-exit-parse-freeze.json` | `8183f1f4cb079b9b30364fb7685459edfcca74d7fe03c8abfdddb742c4db47a5` |
+| `601/revision3/template-manifest-v3.json` | `2c8bb946dbd4b0133db4f132ec249fe59f609817a1647be9cf0bc3334321ac79` |
+| `601/revision3/revision3-validation.json` | `2c87698890761967e3538b4b3a3660f90083a40189b49515e86066b4db65a088` |
+| `601/revision3/windows-ast-hash-validation.private.json` (four AST/hash checks only) | `8ae02e017a46944ec4f02cae573acd41e0c0e82a76c9cc30b8293c4dca79ea23` |
+| `601/arm64-download-attempt1-failed.json` | `316e5498d502714b750321630a8e4f1ab10338719af5d49155e6a1b4aad11cb7` |
+| `601/arm64-assets-fallback-verified.json` | `ae677e11a202fb0025e909cc9c452b75f2205eea010f6d48abb3e15a48a8b8bd` |
+| `601/prepare-execution.json` | `5f7b5fc2f6fc1aa93cd85336b3746f7a00347ac94d91f1458d5da370bcff77d2` |
+| `601/install-result-failed.private.json` | `5a8d9ef35ae095f84739fd0f953ac085497104a232ee89849f4fab2ded0113c2` |
+| `601/failed-stop-inventory01.json` | `0ddeaa46da3a5377a7434bbdee1c2021ceadbb95ced614e8a4312fd9f6578423` |
+| `601/restore600-poll01.json` | `b83dfc3f1310e270aa1407cfa61aca8832ddb9f9554713f937a3bb82b26256c8` |
+| `601/recovery-adoption.json` | `5c520d43971ab75cae95ec65904009ce89d860e60ba9413833b0d42e7d81d8b5` |
+| `601/server-600-restored-full04.json` | `b6c0896d92adf1721f2e605f0af6fa4f23aec35c3a187f83cab4742fead0a2db` |
+| `601/field-consumer/prepared-owner-exit-v2.json` | `e797f089579c6a1ccaa3a689dd070979de1233770256e2f292ad927051ff410d` |
+| `601/decoder-current/decoder-validation.json` | `3849d6e0e32222876e9130b41ee89294e692376b856a24a710acbfb4642dd415` |
+| `601/source-only-loss-semantics.private.json` | `9c627235b1b200e5eacac0699ed4c93c4d0fc7d63877bb41de0a85e3efef81c0` |
+| `601/shutdown-600-owner-harness-plan.private.json` | `317ed47a142dff970cb939477db435155c98eb39336ab0a3b2167c481d859430` |
+| `601/failed-stop-preserved-manifest.private.json` | `22af262d7c393e0eb429e205c9e2e1c663fa238d52919b76c82bf29e47e54e88` |
+| `601/attempt2-native-fixture-launch.json` | `f19ea0e6f7f6e8477642ea689a69b01783d666b159e89f0a33780219ccbdbc23` |
+| `601/attempt2-prepare-execution.json` | `0f3a3d9b4d334d7d7df9244976c14e4693460ff65d044c9b87e3ebe6eeed2e3f` |
+| `601/attempt2-probe-compile-execution.json` | `066d2bcdd37c5616ce5998e8e6459173bac35029fa5ff501ab14aba9e82b47af` |
+| `601/attempt2-install-result.json.private.json` (actual Setup exit 0 / bound 601 generation) | `fd1c5b11ec28fb3bb16bfc58f229703b0b63af2c6d99a792f42af322f2c9f1c1` |
+| `601/attempt2-stopped-cache-manifest.json.private.json` | `b30837000ac944474004eb361bc97856baec82a640e7b59af50a1d307ffc27ea` |
+| `601/attempt2-stopped-queue-gate-601-v2.json.private.json` (actual compatible retention gate) | `96f0bef8afc032ffc0008c840e0864f8d6d91530ef70185d16d909c8f419afc0` |
+| `601/server-601-installed-full01.json` (bound resource sample) | `cb864b853985bcd899eddd6ccda5be8e419128ec3e68f12cb775c239fb785d8d` |
+| `601/actual-queue-retention-readonly.json` (complete 507-row preservation report) | `3c67b7ba3a3e006f3fbd7f16f504bfa7c8d2b89244f1aac6a3d952b9b6e5eda9` |
+| `601/actual-queue-compare-actual-stdout.json` (semantic preservation summary) | `6ccfe04779a87c8c31a6efab3db147213e43f9d91ac19ef00f5598b4ad1adec4` |
+| `601/queue-compare-operation-actual01.json` (outer exit 1 / child exit UNKNOWN) | `1b340f8bbf1dbcc7806fd7626083e26dc8f8e51d968d89931d5b495b1e3d3724` |
+| `601/cache-compare-operation-actual01.json` (pre-SQL parse failure retained) | `e22194bc09e9efde0b28f41801cfc2739d633be9db3ea48b768b895b5a014fcf` |
+| `601/cache-compare-operation-actual02.json` (pre-SQL parse failure retained) | `e22194bc09e9efde0b28f41801cfc2739d633be9db3ea48b768b895b5a014fcf` |
+| `601/cache-compare-operation-actual03.json` (separate completed invocation) | `d65b5a270464a120915655f3afd2af46366c06182b1f40e829fe32a016040769` |
+| `601/actual-cache-compare-actual-stdout.json` (20 / 5,120 / 5,120 subset comparison) | `a47b18cec7112d7caf977ec030939a3cf030cc6001a220bda71e75edddf988d9` |
+| `601/actual-cache-compare-actual-exit.json` (actual native child exit 0) | `d4f98e8ced45b9993b90ca75cbb566a771450cb3a31b523f47fed09154ca11e2` |
+| `601/field-native-short/trace-result.json` (completed capture; acceptance pending) | `28ed6c4121b0adf67e494d93cdbd79656ae7014ef25216981999d0e916ecc347` |
+| `601/field-native-preflight.json` | `efb17b2df6db4865d81ab378979b93d0ef3ea5c5a89f33cc5eb4c2fa3ff5b647` |
+| `601/field-network-preflight.json` | `48c6435ba36d33bcc0aa7da02c47f7310e6ca965e8b7750b5a763e54eb3e881a` |
+| `601/field-native-summary.json` | `f4b02e631cab1758aee54b9eedf102c3a209c4c8b09c9abaf2717465b9a178e3` |
+| `601/field-native-outer-exit.json` | `711c208db1b9fd8692be55c9f40c3274107c11a42fa5ff2c7b0fa7452bdbadc6` |
+| `601/field-network-summary.json` | `060eead4c74ba965a60a26998ad2d7915248d4bf79c395f6bc4bcc6525d62e53` |
+| `601/field-network-outer-exit.json` | `101769042f2be76bf31d4afcf4417bb961d7702dc7edce490d2e6e169a667630` |
+| `601/field-consumer-v3-validation.json` | `cff53a09bd188325d7d49df84b5da5235149ef7945e1e90ba405a04c2b720414` |
+| `601/field-native-analysis-summary.json` | `d48447ca59cb1f4e8928aa766bdc243e63190cba8361d2cb8719407924033929` |
+| `601/field-network-original-analysis-summary.json` | `750b8dda65c3fe07ef8b365e1aa1ee3674275197986439a58d02ff81e31ebf21` |
+| `601/field-network-corrected-analysis-summary.json` | `90dd9b175ff50ce894efa309d1099cf0c029def9ca872b2527405bb747568f4c` |
+| `601/raw-network-codec-validation-summary.json` | `9eaefc88a995b6135510cdae31db3c9e4f222e0a03ae9e6aaa918e236f031aeb` |
+| `601/native-exact-batch-metadata-receipt.json` | `83cf780f60c00c4bbd881fb2e890feb2c765ed12320d5026a030ccf1276ef884` |
+| `601/server-field-combined-failed.json` | `b308c64bafa577fad01289c88a135ae42c6ded5c03ba9b1b11389e87d861b45f` |
+| `601/server-field-native-receive-counts.json` | `e4dddbed1871c307958bcdd77f9a3872829628c5beae16339a5222a98f2673a3` |
+| `601/server-field-network-receive-counts.json` | `1e8e9e0a2bc1d2e255ed1583e07c85280867bd3547d973e76132b9e17a2f2f03` |
+| `601/runtime-final-identity.json` | `3024020e7d45e5a38943bb159e4c996a6015c6174efa1fc64eb2d79746c649d5` |
 
-The completed CI/lifecycle gates, actual lab installation and limited storage
-preservation are passed within the stated scopes. The original cache comparison
-is failed, field execution is not performed, and installed-600 field acceptance
-is FAILED. Strict field minimization has not been declared complete.
+The completed CI/lifecycle gates, verified 601 assets, second lab installation
+and stated bounded preservation comparisons pass within their scopes. The
+first 601 lab stop, installed-600 field result and original cache comparison
+remain FAILED. Queue launcher child exit remains UNKNOWN with outer failure;
+the first two cache parse failures remain failed executions. Both 601 field captures and bounded collection/analysis execute. Exact
+per-action local/detection/wire/server/ACK acceptance remains UNKNOWN where
+evidence is absent; successful observation does not turn these gaps into PASS.
+Strict field minimization has not been declared complete.
