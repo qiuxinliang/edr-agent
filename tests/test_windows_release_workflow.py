@@ -83,6 +83,55 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                         prepare.index('windows_release_checkpoint.py prepare'))
         self.assertIn("--label-regex '^windows-release-gate$'", self.jobs['windows-build'])
 
+    def assert_native_telemetry_release_gate(self, build):
+        step = build.split('- name: Test\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertNotIn('continue-on-error:', step)
+        self.assertIn("if: steps.resume.outputs.restored != 'true'", step)
+        call = '& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs'
+        self.assertIn(call, step)
+        self.assertLess(step.index("--label-regex '^windows-release-gate$'"), step.index(call))
+        self.assertIn("@('-BuildDir', 'build', '-Configuration', 'Release')", step)
+        self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\\openssl'", step)
+        self.assertIn("@('-OpenSslBin', $opensslTools)", step)
+        self.assertRegex(step.split(call, 1)[1],
+                         r'if\s*\(\$LASTEXITCODE -ne 0\)\s*\{\s*throw\b')
+        self.assertLess(build.index(call), build.index('name: Package (setup exe + runtime zip)'))
+        self.assertLess(build.index(call), build.index('name: Seal verified package checkpoint'))
+        for name in ('Package (setup exe + runtime zip)', 'Seal verified package checkpoint'):
+            later = build.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertNotIn('continue-on-error:', later)
+            self.assertNotIn('always()', later)
+            self.assertNotIn('failure()', later)
+
+    def test_native_telemetry_failures_block_packaging_and_publication(self):
+        self.assert_native_telemetry_release_gate(self.jobs['windows-build'])
+        runner = (ROOT / 'tests/run_telemetry_windows_native.ps1').read_text(encoding='utf-8')
+        self.assertIn("$ErrorActionPreference = 'Stop'", runner)
+        self.assertIn('--target telemetry_minimization_tests', runner)
+        command = "-L '^telemetry-minimization$'"
+        self.assertIn(command, runner)
+        self.assertRegex(runner.split(command, 1)[1],
+                         r'if\s*\(\$LASTEXITCODE -ne 0\)\s*\{\s*throw\b')
+        self.assertNotRegex(self.jobs['windows-build'], r'(?m)^    continue-on-error:')
+        self.assertNotRegex(self.jobs['publish-release'], r'(?m)^    if:')
+        self.assertIn('      - windows-build\n', self.jobs['publish-release'])
+
+    def test_native_telemetry_gate_rejects_missing_call_and_failure_bypass(self):
+        build = self.jobs['windows-build']
+        self.assert_native_telemetry_release_gate(build)
+        call = '& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs'
+        cases = {
+            'missing runner': build.replace(call, '# runner omitted', 1),
+            'ignored failure': build.replace('- name: Test\n', '- name: Test\n        continue-on-error: true\n', 1),
+            'unchecked runner failure': build.replace("if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }",
+                                                     '# runner exit was ignored', 1),
+            'packaging after failure': build.replace('- name: Package (setup exe + runtime zip)\n',
+                                                    '- name: Package (setup exe + runtime zip)\n        if: always()\n', 1),
+        }
+        for name, candidate in cases.items():
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                self.assert_native_telemetry_release_gate(candidate)
+
     def test_baseline_is_selected_once_and_shared_with_classification_and_lifecycle(self):
         prepare, build, lifecycle = (self.jobs[name] for name in
                                      ('prepare-release', 'windows-build', 'windows-lifecycle'))
