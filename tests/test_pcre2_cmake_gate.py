@@ -279,6 +279,15 @@ class PCRE2CMakeGateTests(unittest.TestCase):
             lambda match: f'"{(AGENT_ROOT / match[0]).resolve().as_posix()}"',
             root_source[policy_start:policy_end],
         )
+        # Some matcher consumers also link the local validation trace. Keep its
+        # real target and platform requirements in this isolated link graph.
+        trace_start = root_source.index("add_library(edr_validation_trace STATIC")
+        trace_end = root_source.index("target_link_libraries(edr_agent PRIVATE edr_egress_policy", trace_start)
+        trace = re.sub(
+            r'(?<![\w/])(?:src|include)(?:/[\w.-]+)*',
+            lambda match: f'"{(AGENT_ROOT / match[0]).resolve().as_posix()}"',
+            root_source[trace_start:trace_end],
+        )
         # Discover matcher consumers from their sources so a new target cannot
         # silently miss this check. Include platform/optional targets: only
         # their header/archive dependency order is compiled by this fixture.
@@ -306,7 +315,7 @@ class PCRE2CMakeGateTests(unittest.TestCase):
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(HeaderOrder C)', 'enable_testing()',
                 'set(CMAKE_C_STANDARD 11)', 'set(CMAKE_C_STANDARD_REQUIRED ON)',
-                'set(CMAKE_C_EXTENSIONS OFF)', warnings, policy,
+                'set(CMAKE_C_EXTENSIONS OFF)', warnings, policy, trace,
                 'add_library(header_archive STATIC archive.c)',
                 'set_target_properties(header_archive PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/archive")',
                 'set(_edr_pcre2_prefix_real "${CMAKE_SOURCE_DIR}/static")',

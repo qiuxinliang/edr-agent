@@ -1324,7 +1324,8 @@ fixture now expects it and the isolated P0 compiler probe links the actual
 new trace library. No failed gate is bypassed. On the host, the full 19-case
 fixture run also encountered two 90-second CTest timeouts under parallel dummy
 binary execution; those are reported separately from the fixed expected-set
-failure and are being rerun sequentially. Native CI remains the release gate.
+failure. Both timed-out cases passed in the focused sequential rerun (163.14 s).
+Native CI remains the release gate.
 
 A read-only query of the lab Windows TCPIP provider established another concrete
 cause of listen UNKNOWN: event 1002 is a connection request; 1123 v0/v1 is a
@@ -1353,3 +1354,12 @@ means no historical ACK evidence, and does not fabricate confirmation from the
 current queue contents. The live Agent remained PID 4464, exact birth
 134356565652927026, version 3.2.601, with the unchanged baseline binary/config
 hashes throughout these isolated fixture checks.
+
+Candidate 603, run `37295416212`, exposed a second isolated build-fixture
+dependency omission: the PCRE2 header-order probe preserved the network target's
+new trace link but did not define that library in its temporary CMake project.
+AMD64 stopped with LNK1181 before the product build. The same fixture fails on
+the host before correction (`library edr_validation_trace not found`) and passes
+after importing the actual trace target's sources and usage requirements
+(9.98 s), including its deliberately poisoned-header negative control. The
+production gate is unchanged. Neither failed candidate is deployed or retargeted.
