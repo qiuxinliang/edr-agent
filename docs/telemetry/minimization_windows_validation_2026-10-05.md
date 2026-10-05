@@ -1942,3 +1942,39 @@ its native test jobs; the same policy regression executes the current
 `scripts/telemetry_quality/analyze_validation_trace.py` and `analyze_actions.py`;
 retain original inputs/reports and use a new output path. Reassessment does not
 replace a new live run when the binary, policy or input actions change.
+
+## 2026-10-05: native ListenerActivated AF_UNSPEC boundary
+
+The endpoint-scoped signed policy v525 enabled TCPIP on the isolated UTM endpoint
+only. The policy was verified/applied with equal desired/reported hashes and
+`restart_required=0`; the live Agent ETW session gained TCPIP (7 -> 8 providers).
+This corrected the disabled source but did not by itself fix the three listen
+UNKNOWNs. A fresh 607 experiment captured three native TCPIP 1123 v1 records:
+Status=0, nonzero payload ProcessId/ProcessStartKey, AddressLength=16, outer
+AddressFamily=0, and an embedded AF_INET sockaddr with the exact loopback endpoint.
+No raw command line or user identity is included here.
+
+The first failing boundary was `edr_tcpip_listener_fields`: it required the outer
+family to be AF_INET/AF_INET6 before reading the binary sockaddr. The independent
+raw-event analyzer had the same assumption, hiding already-captured evidence.
+The decoder now accepts an explicitly present AF_UNSPEC outer field only when
+its typed binary sockaddr contains a supported, length-consistent family. An
+explicit conflicting family, missing property, invalid status/identity, unknown
+version, malformed size or zero port still fails closed. No remote endpoint is
+invented and no collection or egress rule is relaxed.
+
+Counterfactual native ARM64 replay uses the same updated regression inputs and
+production source list with only the old/new `etw_tdh_win.c` substituted. The old
+607 implementation fails the AF_UNSPEC sensor-interest assertion (Windows native
+fast-fail -1073740791); the fixed implementation exits 0. IPv4 v0/v1 and IPv6
+AF_UNSPEC/explicit-family cases and the expanded rejection cases pass. The runner
+initially expected exit 1 for the intentional old assertion; that wrapper
+expectation failed, and the actual assertion/exit evidence was retained and
+classified without rerunning or modifying the inputs.
+
+Private evidence: `/private/tmp/edr-listen-boundary-607/field-evidence/` and
+`/private/tmp/edr-agent-608-evaluation/`; `native-verdict.json` records the native
+comparison. Before-code SHA256 is
+`ebccc07e4c71fbfc86d6fab72d6cf78961fcb75e014ae36fad99940e3a217cbf`.
+The production fix still requires release gates and the deployed field rerun;
+this section alone does not claim field closure or strict overall minimization.

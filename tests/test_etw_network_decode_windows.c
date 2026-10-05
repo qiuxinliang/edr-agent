@@ -426,8 +426,12 @@ static void test_tcpip_listener_manifest(void) {
   EdrSensorInterestEvent interest; BYTE payload[1024]; EdrBehaviorRecord decoded;
   EVENT_RECORD record;
   for (unsigned version = 0; version <= 1; ++version) {
+   for (unsigned unspecified = 0; unspecified <= 1; ++unspecified) {
     record = network_case("typed listener activation", 54760u);
     listener_properties(&record, version);
+    /* Native Windows 1123 v1 emits AF_UNSPEC in the outer field while the
+     * binary SOCKADDR contains AF_INET. Keep that observed boundary. */
+    if (unspecified) find_property(L"AddressFamily")->data[0] = 0u;
     assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_LISTEN);
     assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
     assert(interest.pid == actor_pid && interest.remote_port == 0u);
@@ -439,11 +443,12 @@ static void test_tcpip_listener_manifest(void) {
     edr_behavior_from_slot(&bus.last, &decoded);
     assert(decoded.pid == actor_pid && decoded.net_sport == 54760u && !decoded.net_dport);
     assert(!strcmp(decoded.net_src, "127.0.0.1") && !decoded.net_dst[0]);
+   }
   }
   /* A connection request must never satisfy a listen predicate. */
   record.EventHeader.EventDescriptor.Id = 1002u;
   assert(edr_collector_network_test_type(&record) == EDR_EVENT_NET_CONNECT);
-  for (unsigned fault = 0; fault < 7; ++fault) {
+  for (unsigned fault = 0; fault < 12; ++fault) {
     record = network_case("invalid listener cannot publish", 54760u);
     unsigned empty_before = edr_network_test_empty_payloads;
     listener_properties(&record, 1u);
@@ -454,6 +459,11 @@ static void test_tcpip_listener_manifest(void) {
     if (fault == 4) record.EventHeader.EventDescriptor.Version = 2u;
     if (fault == 5) find_property(L"ProcessStartKey")->status = ERROR_NOT_FOUND;
     if (fault == 6) memset(find_property(L"SocketAddress")->data + 2, 0, 2u);
+    if (fault == 7) find_property(L"AddressFamily")->status = ERROR_NOT_FOUND;
+    if (fault == 8) find_property(L"AddressFamily")->data[0] = 1u;
+    if (fault == 9) { find_property(L"AddressFamily")->data[0] = 0u; find_property(L"SocketAddress")->data[0] = 1u; }
+    if (fault == 10) { find_property(L"AddressFamily")->data[0] = 0u; find_property(L"SocketAddress")->data[0] = 23u; }
+    if (fault == 11) memset(find_property(L"ProcessStartKey")->data, 0, 8u);
     assert(!edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_LISTEN, "tcpip", &interest));
     assert(!edr_tdh_build_slot_payload(&record, "tcpip", payload, sizeof(payload)));
     feed_network(&record, event_ns, 0u);
@@ -467,10 +477,11 @@ static void test_tcpip_listener_manifest(void) {
   listener_properties(&record, 1u);
   find_property(L"SocketAddress")->data[2] = 0x0d; find_property(L"SocketAddress")->data[3] = 0x3d;
   feed_network(&record, event_ns, 0u);
+  for (unsigned unspecified = 0; unspecified <= 1; ++unspecified) {
   record = network_case("IPv6 listener retains only local endpoint", 8080u);
   listener_properties(&record, 1u);
   BYTE sa6[28] = {23,0,0x1f,0x90}; sa6[23] = 1;
-  find_property(L"AddressFamily")->data[0] = 23u;
+  find_property(L"AddressFamily")->data[0] = unspecified ? 0u : 23u;
   find_property(L"AddressLength")->data[0] = 28u;
   TestProperty *sock = find_property(L"SocketAddress");memcpy(sock->data,sa6,sizeof(sa6));sock->size=sizeof(sa6);
   assert(edr_tdh_build_slot_payload(&record,"tcpip",payload,sizeof(payload)));
@@ -479,6 +490,7 @@ static void test_tcpip_listener_manifest(void) {
   feed_network(&record, event_ns, 1u);
   edr_behavior_from_slot(&bus.last, &decoded);
   assert(decoded.net_sport == 8080u && !decoded.net_dport && !decoded.net_dst[0]);
+  }
 }
 
 static void test_collector_network_admission(void) {

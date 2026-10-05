@@ -479,9 +479,15 @@ static int edr_tcpip_listener_fields(PEVENT_RECORD rec, uint32_t *pid, uint64_t 
       !edr_prop_exact(rec, L"ProcessId", pid, 4u) || !*pid ||
       !edr_prop_exact(rec, L"AddressFamily", &family, 4u) ||
       !edr_prop_exact(rec, L"AddressLength", &size, 4u) ||
-      !((family == 2u && size == 16u) || (family == 23u && size == 28u)) ||
-      !edr_prop_exact(rec, L"SocketAddress", raw, size) ||
-      ((unsigned)raw[0] | (unsigned)raw[1] << 8u) != family) return 0;
+      !(size == 16u || size == 28u) ||
+      !edr_prop_exact(rec, L"SocketAddress", raw, size)) return 0;
+  /* Native ListenerActivated can report outer AF_UNSPEC. The typed binary
+   * SOCKADDR still supplies its family; require an exact family/length pair
+   * and reject any explicit outer-family conflict. Never infer from size. */
+  unsigned socket_family = (unsigned)raw[0] | (unsigned)raw[1] << 8u;
+  if (!((socket_family == 2u && size == 16u) || (socket_family == 23u && size == 28u)) ||
+      (family != 0u && family != socket_family)) return 0;
+  family = socket_family;
   if (rec->EventHeader.EventDescriptor.Version == 1u &&
       (!edr_prop_exact(rec, L"ProcessStartKey", key, 8u) || !*key)) return 0;
   *port = (unsigned)raw[2] * 256u + raw[3];
