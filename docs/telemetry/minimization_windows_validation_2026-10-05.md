@@ -1752,3 +1752,193 @@ are pending for this fix; strict overall minimization is not declared complete.
 - `edr-agent-607-evaluation/policy-after.json` SHA-256 `dd359d7caeb88c1b490ce9555e340570b6b60ddfc298e5e7c564b193d55b5074`.
 
 - `edr-agent-607-evaluation/native-policy-verdict.json` SHA-256 `48e7a5e11bcae43597458ac852407ebe10ee2d725e4ee978435925bb9eb6ed8c`.
+
+
+### Candidate 607: deployed control ACK recovery and frozen-evidence acceptance
+
+Candidate `win_3.2.607`, source `08086431b612508b1dfd39414fef8da60cee390e`,
+was published by [run 37323687235](https://github.com/qiuxinliang/edr-agent/actions/runs/37323687235)
+and installed on the authorized UTM lab. All seven jobs succeeded; the release
+is a prerelease, `latest=false`, and latest remains `win_3.2.591`. This is the
+unsigned lab candidate, not a production rollout. No real queue migration,
+merging, forced process termination, manual ACK, or policy/TLS weakening occurred.
+
+Both architectures passed 72/72 native tests and 19/19 minimization tests:
+AMD64 139.52/210.89 seconds; ARM64 258.42/230.85 seconds. Both native install,
+upgrade, rollback and embedded runtime-update lifecycle jobs passed. The AMD64
+log download hit its 180-second bound after retaining 2,202,965 bytes; that saved
+portion contains both complete test summaries, and independent job metadata
+confirms success at the pinned source. The ARM64 log download completed. The
+log-download timeout is retained as a failed diagnostic operation, not a failed
+native test or a claim that the complete AMD64 log was downloaded.
+
+Official Setup and provenance-manifest bytes were checked against GitHub asset
+digests, sizes and immutable source/run metadata. Runtime ZIP, GUI ZIP and raw
+EXE metadata were checked but their bytes were not downloaded for this deployment.
+The installed executable was independently checked against the published hash:
+
+- Setup SHA-256: `e51663453ab607dbe4aff21a5471f0069d39c99ee3b267566d09b7a637bba091`.
+- Installed EXE SHA-256: `255c1819ce2539ceb53a320c05f09759121dd214a455a861646ef31ca30872eb`.
+- Runtime: PID 7416, decimal birth `134356861241181708`, version `3.2.607`, task Running/SYSTEM.
+- Setup exit 0; normal 606 shutdown exit 0 in 2,390 ms. Primary/LKG config and CA
+  hashes stayed equal to the 606 baseline; independent policy sequence stayed 524.
+
+The initial free-space preflight was below the unchanged 2 GiB threshold, so no
+Agent was stopped then. NTFS compression of exactly two already frozen 606 backup
+files recovered space; both original hashes and logical lengths remained equal.
+No active database or queue was compressed, deleted or migrated. Protected
+preparation subsequently passed its before/after free-space checks. The reviewed
+upgrade-owner fixture passed 24 contract cases and 5 native CMD cases. An earlier
+fixture invocation refused a stale expected source hash before touching the Agent
+or databases. One UTM response also contained unrelated old output; its result
+was rejected and the actual uniquely named guest receipt was read back. The stop
+preflight now checks a freshly echoed nonce plus exact PID/birth. Neither this
+transport defect nor the expected 20-second launch wait caused mutation replay.
+
+The install and field launch transports both returned before the guest operation
+ended. Unique guest owner receipts prove one installation and one field sequence;
+all three case owners exited 0. Initial startup health had resource pressure and
+source-only recovery flags. Both cleared under the original policy before the
+readiness gate admitted any synthetic action. The final 15:15 UTC health sample
+reports rules/artifacts/cache ready, source-only terminal flags 0, event-bus drops
+0, used 0 and resource pressure/throttle 0. This sample does not assert sustained
+absence of resource pressure. Machine trace opt-ins were removed; the same Agent
+process remained running.
+
+#### Exact control ACK recovery
+
+The canonical pre-upgrade snapshot contains 208 distinct `.json` records, all
+using the server-produced `https_h2_server_stream` name. An earlier unconstrained
+snapshot also saw an in-progress temporary file; it is retained but not used as
+the baseline. The fixed IDs were read from both server owners before and after:
+
+| Evidence boundary | Before 607 | After normal 607 retry |
+| --- | --- | --- |
+| Durable local pending records for these exact IDs | 208 | 0 |
+| Server command outbox | 207 expired, 1 delivered | 208 acked |
+| Current delivery-attempt ACK state | 208 unacknowledged | 208 acked |
+| ACK timestamps after this 607 process started | 0 | 208/208 |
+| Changed delivery-attempt identity | — | 0 |
+| Manually issued ACK requests | 0 | 0 |
+
+The existing bounded sender, backoff and server idempotent ACK owner performed
+this recovery. The expired-to-acked transition is supported by the existing
+server `HTTPOutbox.Ack` owner; no server protocol/schema was modified. Acceptance
+is based on those exact server rows and times, not empty local files or counters.
+
+#### Per-action, alert context and event-batch confirmation
+
+One controlled sequence ran 2 encoded PowerShell positives, 3 ordinary short
+processes and 3 loopback connections. All truth executions completed successfully;
+raw parsing errors were 0. The frozen 300-second Agent trace is 421,329 bytes and
+reports 23 diagnostic contention drops. Missing trace edges remain UNKNOWN;
+these diagnostics cannot prove absence of collection or all detector coverage.
+
+The first consumer report had 18/22 observed actions. One additional exit was
+incorrectly UNKNOWN because both consumers used the ETW notification header with
+a fixed 5 ms action margin. Its header was 11.2896 ms later than the OS exit time.
+Independent raw Kernel-Process `CreateTime` and `ExitTime` exactly equal the truth
+process birth and `GetProcessTimes` exit time. Agent exit edges have the same
+explicit PID/birth and record `ave_notified` followed by sensor-interest rejection.
+
+Root-repository commit `0b36cfa4` fixes the validation owner: raw exits use typed
+Kernel-Process `ExitTime` when creation identity is present; Agent exit edges use
+one unique action and explicit process birth. PID-only, inferred StartKey-only,
+conflicting-generation and duplicate-action joins remain rejected. Other action
+time windows are unchanged. Invalid exit-before-birth input fails. Two new
+regressions fail against the old owner and pass with the fix. The full validation
+suite runs 226 tests: 225 passed, 1 skipped because host PowerShell is unavailable.
+The skipped recovery fixture is not reported as executed by that host suite.
+
+The original reports and input bytes were preserved. Reassessment of exactly the
+same eight input files changes just that exit to OBSERVED, without Agent restart,
+action replay, policy change or evidence mutation:
+
+| Stage / obligation | Observed result |
+| --- | --- |
+| Synthetic action truth | 22 actions, successful executions |
+| Agent process creates / exits | 8/8 creates and 8/8 exits observed |
+| Agent loopback connect / listen | 3/3 connects observed; 3 listens UNKNOWN |
+| Positive detection and enqueue | 2 R-EXEC-001 alerts, exact process generations |
+| Actual HTTP requests for those alerts | 2; combined body bytes 3,508; immutable payload bytes 7,476 |
+| Server ingest / accepted-batch owners | 2/2, accepted=1, ingest done, attempts=1 |
+| Exact local event-batch ACK | 2/2 COMMITTED, matching batch ID hash, payload SHA-256 and byte length |
+| Ordinary synthetic native/loopback backend rows | 0 in their exact child-generation scope |
+| Necessary alert context | 2/2 exact source links, child/parent identity, independent parent command, decoded command and rule predicate |
+
+An observed exit means the demonstrated local lifecycle edges ran; it does not
+mean every detector evaluated it or that an exit alert was required. Ordinary
+local processing may exercise resource-throttle/proven-miss paths under the
+unchanged budget. Both alerts retain the full required independently verified
+context and match real requests, server owners and durable local receipts.
+
+The remaining three listens are UNKNOWN: the actual Agent ETW session still has
+seven providers and no TCPIP provider, consistent with the unchanged signed
+policy. Enabled-TCPIP live acceptance was not executed. A passing ListenerActivated
+1123 decoder fixture does not establish runtime listener detection.
+
+#### Existing queue and evidence retention
+
+The stopped compatibility gate passed without mutation or inferred ACK. Of 3,939
+original queue rows (4,236,817 payload bytes), 3,938 retain identical identities
+and payloads. One original 7,355-byte batch was normally delivered: its exact
+original payload hash and size match the real local ACK, accepted server batch
+and completed ingest (accepted=1, attempts=1). The strict all-rows-present probe
+correctly exited 2; its result is retained. A separate exact receipt join accounts
+for the missing row. Changed retained identities/payloads=0, rewritten batches=0.
+
+Fixed-20 evidence comparison passed: all 20 candidates, 5,120 scoped reference
+occurrences and 5,120 scoped fact-body occurrences equal the stopped backup.
+Shared facts can repeat in these counts. All 328 pre-upgrade event ACK witnesses
+remain unchanged among 373 post-window witnesses, including original confirmation
+times. No local save or health-summary ACK was substituted for an original ACK.
+
+This closes the demonstrated control ACK whitelist defect, positive alert context
+and event-batch ACK obligations, and the false exit UNKNOWN in this acceptance
+consumer. Strict overall upload minimization and complete per-action detection
+are not declared complete: enabled listener coverage and any scenarios not run
+in this candidate window remain separate obligations. The 607 release contains
+the Agent fix; the later validation-only root commit changes no published Agent
+runtime code and required no replacement binary.
+
+Private evidence is hashed below; raw commands, request bodies, credentials and
+queue contents are not committed. Backend operations were bounded read-only
+queries; guest evidence directories retain their protected ACLs.
+
+| Evidence relative to `/private/tmp/edr-agent-607-evaluation` | SHA-256 |
+| --- | --- |
+| `workflow-completed.json` | `91fde2b0c397621b279e6d41305fa311a68bad3fec0f61c702cfd2e5d434362f` |
+| `native-gates-summary.json` | `58672915bd97bda81528a535569573f8031d4f016b518ea58caabcf580fec86b` |
+| `deployment-assets-verified.json` | `a441a15dbac454de328ce56887c74f2d52de99fe0e00141b3c108a9f2f81c527` |
+| `native-fixture-r3-actual.json` | `3ede65de579bdd8575b50f3efbda8efeb6737d80b51831b8bd26ebbb90f378cd` |
+| `install-terminal-private.json` | `e7168abde7e1ea2e446df660200e91680d9186dca8c9d4689bb890ce647f7ad8` |
+| `control-server-before.json` | `2523471bb59cf6ccba979b5897967f59dbbf08976ed1e921e1cdb7abb7fa5d70` |
+| `control-server-after.json` | `dea67f81e428bcf475812f73712d4d1a73955785ddc20dca14359e7c9deee5a4` |
+| `control-recovery-verdict.json` | `623eec4c3ac0f3f8ba163d407b5cc425b8e45869b7107ef37db2e805cb7c33a6` |
+| `field-evidence/exact-delivery-verdict.json` | `1966a594ec4c4c5be73fdb7fc190f9110d9035d49610d370627bd7d8ddaa05d6` |
+| `exit-time-reassessment/exact-delivery-verdict.json` | `3ffb994a530f1fd7461533e102b0ab02972cfc860bb5892ac885f008b024f6e1` |
+| `exit-time-reassessment/reassessment-provenance.json` | `aec0536144ce31c1d4ba44aaf1a91cffd2a74d088fb28e71f230756020d8d3bf` |
+| `field-evidence/context-quality.json` | `7b92121e704ed3342659b44f2608ee59ca2c05709c0d01a0881f48cc91a800b5` |
+| `field-evidence/server-batch-receipts.json` | `8f7106e9917291e0535858ca24fa774eed4b46e18f38354b562a0db5d2515ac1` |
+| `queue-final-verdict.json` | `581a51e1c8c11e970c556b44d055aa43287ed14f0af779952fa382f8d0194c51` |
+| `cache-compare-actual-stdout.json` | `b1047c8ebebce7e4c4f39629b2232f558332ba93b426ece73ac9760ccf964d48` |
+| `receipt-upgrade-persistence.json` | `d9f53b296c8ab5bb66ba01cae4ca5f7ce973dfca660083e7ffe7cd7ce192d34c` |
+| `exit-time-regression-before.txt` | `f58d1450cc9d27dcf0c9edf5045c6a341704adf27ae3128b9d96ec28320eeed9` |
+| `exit-time-full-tests.txt` | `3b55b545dbc8b52a6d1bee4d156f5c1539ad0eac4866a548d62f9a863bddbfc4` |
+| `final-runtime.json` | `024f180876028f6dfd51e6e54dbeff4f727daee3ff424791391d549eb563ca0b` |
+| `final-provider.json` | `1e265eddc03582c1dfeb941305b0453dacc662b1807abe769b436efd96a077b8` |
+| `health-after-acceptance.json` | `46b60885d9859c805babf299d558ab4d611606552f7ad73f57cce31d7bb7a9ce` |
+| `publication-final.json` | `fe00568623400f5109738d2dd00063e6f95c8995adc3823ba9d88246a2167170` |
+
+Reproduce the validation-consumer suite from the root repository at `0b36cfa4`:
+
+```sh
+python3 -m unittest discover -s scripts/telemetry_quality -p 'test_*.py'
+```
+
+Agent release tests are reproducible through the pinned workflow run above and
+its native test jobs; the same policy regression executes the current
+`test_egress_request_policy` target. Frozen evidence can be reassessed with
+`scripts/telemetry_quality/analyze_validation_trace.py` and `analyze_actions.py`;
+retain original inputs/reports and use a new output path. Reassessment does not
+replace a new live run when the binary, policy or input actions change.
