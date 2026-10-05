@@ -265,6 +265,16 @@ class PCRE2CMakeGateTests(unittest.TestCase):
         common_start = tests_source.index("add_library(edr_ave_test_common INTERFACE)")
         common_end = tests_source.index("target_link_libraries(test_ave_fp", common_start)
         common = tests_source[common_start:common_end]
+        # The common owner now propagates the shared egress policy. Compile its
+        # real sources/public usage requirements too, rather than treating the
+        # CMake target as a bare platform library name in this isolated fixture.
+        policy_start = root_source.index("add_library(edr_egress_policy STATIC\n")
+        policy_end = root_source.index("edr_apply_common_warnings(edr_egress_policy)", policy_start)
+        policy = re.sub(
+            r'(?<![\w/])(?:src|third_party|include)(?:/[\w.-]+)*',
+            lambda match: f'"{(AGENT_ROOT / match[0]).resolve().as_posix()}"',
+            root_source[policy_start:policy_end],
+        )
         # Discover matcher consumers from their sources so a new target cannot
         # silently miss this check. Include platform/optional targets: only
         # their header/archive dependency order is compiled by this fixture.
@@ -291,6 +301,7 @@ class PCRE2CMakeGateTests(unittest.TestCase):
                 encoding="utf-8")
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(HeaderOrder C)', 'enable_testing()',
+                'set(CMAKE_C_STANDARD 11)', policy,
                 'add_library(header_archive STATIC archive.c)',
                 'set_target_properties(header_archive PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/archive")',
                 'set(_edr_pcre2_prefix_real "${CMAKE_SOURCE_DIR}/static")',
