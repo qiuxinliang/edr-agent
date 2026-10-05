@@ -1036,3 +1036,204 @@ the first two cache parse failures remain failed executions. Both 601 field capt
 per-action local/detection/wire/server/ACK acceptance remains UNKNOWN where
 evidence is absent; successful observation does not turn these gaps into PASS.
 Strict field minimization has not been declared complete.
+
+## Detailed UNKNOWN investigation, 2026-10-05
+
+This continuation is a read-only investigation of the installed 601 and the
+two saved cases. It does not change detection policy, restart the runtime,
+rewrite queues, migrate retained data, or publish a candidate. Only this ledger
+is changed in the repository. Private bounded probes and receipts remain under
+`/private/tmp/edr-agent-601-evaluation/unknown-investigation/`; raw commands,
+user identities, credentials and payloads are not included here.
+
+The nested repository started clean at `45a0f76e` on
+`codex/release-workflow-convergence`; product code is unchanged from `3e5ddeb8`.
+The outer repository was at `fd30c157`; its existing Agent pointer, signing
+directory and concurrent frontend edits are outside this change. At 08:57:52
+UTC, the guest still runs the original installed 601 process generation, with
+binary SHA `ca71ab98f8a9b6da404a305311da34748a1d4ed91c51f1857ba8b78ec049312c`
+and configuration SHA
+`d6e73872e47d71ee88702ed42a5a8a48ccf662bbb9195e7cba154f17ce17f229`.
+Later probes require the same exact `Get-Process` creation FILETIME. The local
+API/second listener map to `edr-backend/bin/edr-api`; its file build information
+says revision `6cdb5a97`, modified=true. This does not establish the exact source
+of both running backend roles. Live database facts below stand independently
+of the current backend source explanations.
+
+### Per-action evidence: first unobserved boundary
+
+| Saved case | Truth actions | Independently observed actions | Local / wire / server per-action result |
+| --- | ---: | ---: | --- |
+| Native short process | 6 | 6 | 6 UNKNOWN at each boundary |
+| Loopback network | 12 | 9 | 12 UNKNOWN at each boundary; 3 listen actions also raw UNKNOWN |
+
+These are action counts, not total ETW or queued record counts. Re-reading all
+870 native-case and 894 network-case decoded queue records without an action
+time filter finds respectively 1 and 8 same-PID records, but zero exact child
+generation matches. Six network records have no generation, and their event
+times predate the child lifetimes. The same-PID process rows belong to older
+generations. Widening the join window cannot convert these into case evidence.
+Both saved local exports contain zero event/candidate/context records.
+
+The first unobserved boundary is between the independent OS observer and the
+Agent's per-event admission/evaluation disposition. Independent ETW observation
+does not prove the Agent decoded or evaluated the same action. Conversely, the
+current observer cannot prove a normal local disposition:
+
+- `local_evidence_cache.c` records ordinary context in its in-memory ring;
+  durable process upsert is part of candidate recording. The SQLite observer
+  does not read that ring or prove each detector's input. Its absence is not a
+  detection failure or proof of successful local retention.
+- `sensor_interest.c` and `collector_win.c` have lifecycle/network admission
+  branches. Process-exit cache/AVE notification precedes some event admission
+  gates. These are possible explanations, not historical per-action receipts.
+- `run_case.ps1` enables Kernel-Network for the independent observer. The
+  Agent's separate TCPIP mapping includes listen handling; the current raw
+  consumer does not establish equivalent listen coverage. Three missing listen
+  observations cannot be classified as Agent loss from this capture.
+- `analyze_actions.py` uses UNKNOWN when no matching record and no authoritative
+  per-action expectation exist. It has raw/local/wire/server stages, not an
+  instrumented detector or ACK stage. Assigning every action a required-upload
+  expectation would contradict minimization; assigning expected-filter without
+  actual disposition evidence would conceal loss.
+
+### Necessary alert context: exact associations exist, but for the exporter
+
+The fixed 30 source IDs from the native-case export join to **30 alerts and 30
+emitted P0 dispositions**, all `R-EXFIL-006`. This resolves the earlier lack of
+an alert-table association for this set. All 30 persisted process contexts are
+valid JSON. Prior exact field checks also bind source/rule/bundle and actor
+generation; the new bounded aggregate receipt independently rechecks counts,
+rule identity and context status.
+
+They are **not the six native-short target actions**. Saved source comparison
+finds one actor generation, zero truth-child generation matches and zero
+truth-parent PID matches. All 30 target the native case's evidence export ZIP;
+all 30 privately decoded script suffixes exactly match the current
+`collect_case.py` export template after root/case substitution. They consist of
+one file-create and 29 file-write events caused by test evidence packaging.
+The case marker and extended source-time query included the exporter. Rule
+association does not make it a successful per-action test, nor does this archive
+activity alone prove actual exfiltration.
+
+The context conclusion remains narrower than full sufficiency:
+
+- `decision_completeness` is 0.6 (3/5), with no generic critical missing fields.
+  Earlier field inspection found command, parent chain and process path
+  available; executable hash/signature were not reported. This generic score
+  does not prove rule-specific investigation sufficiency.
+- All 30 additional server predicates are `not_evaluated`. The current
+  `p0RulePredicateAssessment` only implements the extra check for R-LOLBIN-010;
+  this value alone does not invalidate the separately established R-EXFIL-006
+  endpoint match.
+- Persisted, enriched context sizes are 158,681–161,585 bytes. These are backend
+  JSON sizes, **not outbound HTTP body sizes**. Original protobuf bodies for
+  the 30 done server jobs are no longer stored, and the saved queue capture did
+  not establish their original bodies. Field-by-field outbound minimality
+  remains unverified for this set.
+
+The exporter creates real detector input and therefore contaminates a test
+whose backend query relies on marker/time alone. Future evaluation must join
+the intended actor generation and separately account for the export process.
+Suppressing all PowerShell/archive activity would be an unsafe substitute.
+Whether repeated writes to one archive should aggregate belongs to the rule's
+alert contract, with evidence preservation and dedup regression coverage.
+
+### Local ACK: receipt, queue commit and retained evidence are distinct
+
+The earlier exact server query confirms 30 accepted/done batches with matching
+batch identity and payload SHA. At 09:02:50 UTC, a bounded read-only live SQLite
+transaction finds none of these 30 IDs in `event_queue` or the terminal journal.
+The entire current terminal journal is empty. This is an absence observation,
+**not a local ACK receipt**.
+
+The production path is:
+
+```text
+immutable queued body + batch ID
+  -> request -> server durable/processed receipt
+  -> validate endpoint + batch + exact body SHA + acceptance
+  -> exact selected row/generation deletion transaction
+  -> local delivery counter / severity-1 diagnostic
+```
+
+`report_events_ack.c` validates the receipt; `ingest_http.c` returns transport
+success after validation; `queue_sqlite.c` separately verifies the selected
+database generation/row/body before deletion and increments the in-memory ACK
+counter. Standard queue removal leaves no general per-batch durable ACK
+receipt. `p0_deferred_match=completed` records queue handoff, not server ACK;
+the current 375 completed entries cannot fill this gap. The enforcement journal
+is a separate owner, not a universal receipt ledger.
+
+Two supplemental evidence paths were checked:
+
+1. **Health profile omission is confirmed.** The fixed installed config has
+   basic profile, disabled diagnostic monitoring, 60-second interval and expiry
+   zero. `agent.c` emits queue delivery counters only in the diagnostic branch;
+   its normal basic branch emits smaller `p0_acceptance.offline_queue` metrics.
+   The live server record at 09:09:36 has that smaller object but no
+   `p0_offline_queue_capacity`. The transport whitelist allows the missing
+   counter paths, so it is not the cause of their absence. It does omit
+   `monitor.profile`, explaining why the server cannot directly identify this
+   profile from that field. Missing counters are NULL, not zero; even aggregate
+   counts would not establish ACK of these exact batches.
+2. **The current launch path does redirect logs.** The live parent, scheduled
+   task and bounded startup-log markers identify the PowerShell task launcher
+   and this exact Agent PID. Its installed script redirects stdout/stderr.
+   The competing native-worker-without-redirection explanation is excluded
+   for this process. Both redirected files are zero bytes. The exact ARM64
+   binary is a console-subsystem PE and retains queue diagnostic literals.
+   Why this live process's expected diagnostics are unavailable is unresolved;
+   empty files do not prove an ACK error. No process injection, handle rewrite,
+   verbose-policy change or restart was used to force a result.
+
+Current queue health also requires separate treatment: the snapshot contains
+933 local-evidence rows, 2 policy-held rows (`alert_provenance_unavailable`) and
+93 dead letters (`max_retries`). The source-only owner is v3, clear, loss=0,
+session=open. These describe current retained state; they do not identify which
+version created the dead letters or prove uninterrupted detection during the
+earlier action windows. No retained row was deleted or migrated.
+
+### Checks, rejected explanations and remaining acceptance
+
+| Check | Result and limit |
+| --- | --- |
+| Exact installed generation/binary/config refresh | PASS; unchanged 601 identity |
+| Saved-data generation reassociation without time filter | PASS; no exact child-generation wire matches; this preserves per-action UNKNOWN |
+| Exact 30-source alert/disposition and exporter comparison | PASS; valid associations, wrong workload actor for target-action acceptance |
+| Bounded live queue/journal read | PASS, native exit 0; 48 ms read; absence is not ACK |
+| Basic-profile/config and server field-presence check | PASS; optional counter/profile visibility gap identified |
+| Task/parent/log-owner read | PASS after correcting diagnostic time precision; missing output remains unexplained |
+| Initial long encoded SQLite probe | FAILED to launch; compact bounded probe executed separately |
+| Initial log-owner probe | FAILED its guard: a separate same-process check confirms CIM differs from Get-Process by six 100-ns ticks; replacement retains the exact original Get-Process FILETIME guard |
+| Initial health-query result adapter | FAILED on list/string mismatch after the read; corrected adapter obtained the same bounded query successfully |
+| Initial private saved-data import | FAILED before analysis due to missing module search path; corrected import replay passed |
+| New detector workload, real request-body capture, ACK-loss/crash trial | NOT EXECUTED in this read-only continuation |
+
+The next discriminating test needs one bounded, generation-bound disposition
+trace spanning Agent admission, detector evaluation and local retention, plus
+one known rule-positive action and its necessary context. The receiver must
+capture the immutable body/hash and issue real receipts; the local owner must
+expose receipt validation separately from committed removal. Reusing the
+existing queue/transport test owners is preferable to adding a second sender or
+inventing ACKs. Health-counter availability can support this trace but cannot
+replace it. A capture covering the required listen provider is also needed.
+No historical action can be upgraded from UNKNOWN by a later synthetic replay.
+
+This investigation confirms measurement/consumer gaps and a diagnostic profile
+visibility gap. It does not establish that all 18 actions were evaluated or
+lost, that complete minimal wire context was retained, or that local ACK
+committed for the 30 batches. No speculative runtime patch or release is made.
+
+Private receipt identities for reproducibility:
+
+| Receipt under `unknown-investigation/` | SHA-256 |
+| --- | --- |
+| `inventory-receipt.json` | `4760ae9cea567f9ee8a1ffdc18405953d0e8a059ba3f6035f318d2693025ad71` |
+| `saved-generation-recheck-receipt.json` | `772a1a2f5f92cee6fdbc8fddc4f9f5df9e936d5ca87892c9ab35591af8d0e585` |
+| `exact-alert-summary-receipt.json` | `570ed157d48faff965a36798d915b2c8c7a5a057ec9f07dfb5a3962d59ddc689` |
+| `queue-ack-compact-receipt.json` | `edf0da9e18e556dcf9f98edf463e642955f00c96436ff7a04a6710da7b20c9d5` |
+| `health-profile-v2-receipt.json` | `f6b966d09224c0a4ac9eef393ca75f2d7bd304a4d363d2be33b7dd1b572b3e32` |
+| `health-config-receipt.json` | `b145797ff524582b3ad733b83df7e81345a19c7203bcd214efd66f4149ec6502` |
+| `log-owner-v2-receipt.json` | `f670e81b52400ba6700c7cfc7c9395d530ee781ccff349fc7d115ded76bdfe6f` |
+| `generation-precision-receipt.json` | `8ae5d3e2870c1d47507f8d2008004ceb64dd68c8b0045fa41e48959b52b694ea` |
