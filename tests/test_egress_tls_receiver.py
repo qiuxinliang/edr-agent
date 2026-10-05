@@ -354,6 +354,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply({"code": "SYNTHETIC_BUSINESS_REJECTED"}, 400)
 
 
+def synthetic_child_diagnostics(stderr):
+    """Report fixed assertion names and a hash, never child log contents."""
+    known = {
+        "detect_synthetic_input(r, &capture)": "detector_input",
+        "ordinary_len && alert_len": "fixture_encoding",
+        "edr_storage_queue_open(argv[5]) == EDR_OK": "queue_open",
+        "queue_result == EDR_OK": "queue_enqueue",
+        'row_count(argv[5], "tls-ordinary", "policy_held") == 1': "ordinary_policy_held",
+        'row_count(argv[5], "tls-alert", NULL) == 0': "alert_receipt",
+        "edr_ingest_http_post_heartbeat() == 0": "heartbeat_receipt",
+        'row_count(argv[5], "tls-ack-lost", "pending") == 1': "lost_ack_pending",
+    }
+    names, unknown = set(), 0
+    prefix = "synthetic TLS check failed: "
+    for line in stderr.decode("utf-8", errors="replace").splitlines():
+        if line.startswith(prefix):
+            expression = line[len(prefix):]
+            if expression in known:
+                names.add(known[expression])
+            else:
+                unknown += 1
+    return {"stderr_bytes": len(stderr), "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            "failed_assertions": sorted(names), "unknown_assertions": unknown}
+
+
 def crash_restart_scenario(client, root):
     """Kill only the child created here, after an independently durable receipt
     whose ACK is missing. Verify the pending original bytes before reopening."""
@@ -363,14 +388,20 @@ def crash_restart_scenario(client, root):
     for name in ("EDR_ZSTD_DICT_PATH", "EDR_CONTROL_DICT_PATH"):
         environment.pop(name, None)
     environment["EDR_TEST_CRASH_AFTER_LOST_ACK"] = "1"
-    arguments = [client, f"https://localhost:{server.server_port}/api/v1", str(root / "ca.pem"),
+    # This receiver binds IPv4 only. The crash deadline measures durable owner
+    # recovery; DNS/TLS hostname paths remain exercised by the other scenarios.
+    arguments = [client, f"https://127.0.0.1:{server.server_port}/api/v1", str(root / "ca.pem"),
                  str(root / "client.pem"), str(root / "client.key"), str(database)]
     checkpoint = root / "crash-checkpoint.json"
+    stderr_path = root / "crash-child.stderr"
     child = None
+    stage = "checkpoint"
+    started = time.monotonic()
+    failure = None
     try:
-        with checkpoint.open("w", encoding="utf-8") as output:
+        with checkpoint.open("w", encoding="utf-8") as output, stderr_path.open("wb") as errors:
             child = subprocess.Popen(arguments + ["positive"], stdout=output,
-                                     stderr=subprocess.DEVNULL, env=environment, cwd=root)
+                                     stderr=errors, env=environment, cwd=root)
             deadline = time.monotonic() + 10
             metrics = None
             while time.monotonic() < deadline and child.poll() is None:
@@ -382,20 +413,25 @@ def crash_restart_scenario(client, root):
                 time.sleep(0.05)
             if not metrics:
                 raise RuntimeError("synthetic crash checkpoint not established")
+            stage = "checkpoint_counters"
             assert metrics["detector_inputs"] == metrics["detected"] == 1 and metrics["enqueued"] == 3
+            stage = "pending_original"
             with closing(sqlite3.connect(database)) as db, db:
                 before = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
                 assert before and before[1] == "pending"
                 original_hash = hashlib.sha256(before[0]).hexdigest()
             child.kill()
             killed = child.wait(timeout=5)
+        stage = "killed_original"
         with closing(sqlite3.connect(database)) as db, db:
             after = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
             assert after == before
         environment.pop("EDR_TEST_CRASH_AFTER_LOST_ACK", None)
+        stage = "resume_receipt"
         result = subprocess.run(arguments + ["resume-after-crash"], capture_output=True,
                                 text=True, timeout=15, env=environment, cwd=root)
         assert result.returncode == 0, "crashed owner did not recover its genuine receipt"
+        stage = "durable_receipt"
         with closing(sqlite3.connect(server.database)) as db, db:
             receipt = db.execute("SELECT sha,observations FROM receipt WHERE batch_id='tls-ack-lost'").fetchone()
             assert receipt == (original_hash, 2)
@@ -407,11 +443,28 @@ def crash_restart_scenario(client, root):
                 "received_body_bytes": sum(item["bytes"] for item in server.observations),
                 "receiver_business_failures": len(server.errors), "durable_batches": durable,
                 "duplicate_observations": 1, "distinct_queue_acks": 2}
+    except (AssertionError, RuntimeError, OSError, sqlite3.Error, ValueError, KeyError,
+            subprocess.SubprocessError) as error:
+        failure = {"mode": "positive-crash-restart", "client_exit": 1,
+                   "receiver_business_failures": len(server.errors),
+                   "received_requests": len(server.observations),
+                   "received_body_bytes": sum(item["bytes"] for item in server.observations),
+                   "classes": {path: sum(item["path"] == path for item in server.observations)
+                               for path in sorted({item["path"] for item in server.observations})},
+                   "diagnostic": {"stage": stage, "error_type": type(error).__name__,
+                                  "elapsed_ms": round((time.monotonic() - started) * 1000),
+                                  "child_running_at_failure": bool(child and child.poll() is None),
+                                  "child_exit_at_failure": child.poll() if child else None}}
     finally:
         if child and child.poll() is None:
             child.kill()
             child.wait(timeout=5)
         server.finish()
+    # Failure stays failure, including checkpoint/read errors. The parent still
+    # reports completed scenarios before this one instead of losing their data.
+    failure["diagnostic"].update(synthetic_child_diagnostics(stderr_path.read_bytes()))
+    failure["diagnostic"]["child_exit_after_cleanup"] = child.poll() if child else None
+    return failure
 
 
 def main():
@@ -464,7 +517,14 @@ def main():
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
         if not args.baseline:
-            reports.append(crash_restart_scenario(args.client, root))
+            try:
+                reports.append(crash_restart_scenario(args.client, root))
+            except (AssertionError, RuntimeError, OSError, sqlite3.Error, ValueError, KeyError,
+                    subprocess.SubprocessError) as error:
+                reports.append({"mode": "positive-crash-restart", "client_exit": 1,
+                                "received_requests": None, "receiver_business_failures": 0,
+                                "diagnostic": {"stage": "crash_owner_cleanup",
+                                               "error_type": type(error).__name__}})
         failed = any(report["client_exit"] or report["receiver_business_failures"] for report in reports)
         failed |= any(report["received_requests"] for report in reports if not report["mode"].startswith("positive"))
         print(json.dumps({"synthetic_only": True, "production_connections": 0,
