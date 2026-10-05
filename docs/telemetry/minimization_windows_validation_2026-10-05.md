@@ -1978,3 +1978,193 @@ comparison. Before-code SHA256 is
 `ebccc07e4c71fbfc86d6fab72d6cf78961fcb75e014ae36fad99940e3a217cbf`.
 The production fix still requires release gates and the deployed field rerun;
 this section alone does not claim field closure or strict overall minimization.
+
+
+## 2026-10-06: 608 deployed boundary acceptance and explicit remaining limits
+
+### Release and fixed execution identity
+
+Candidate [win_3.2.608](https://github.com/qiuxinliang/edr-agent/releases/tag/win_3.2.608)
+was published as an unsigned prerelease from
+`e53bef70c6a42f28288f0bf119e3f053dbb654d7`. The
+[release run 37336605446](https://github.com/qiuxinliang/edr-agent/actions/runs/37336605446)
+completed all seven jobs. Each Windows architecture passed 72 native tests plus
+19 minimization tests (182 total); native install, upgrade, embedded updater and
+rollback gates passed on both architectures. The later `906d599e` worktree commit
+belongs to separate account-resolution work and is not part of this binary.
+
+The third protected operation installed that exact candidate in the existing
+isolated ARM64 UTM guest. Previous 607 generation `3364:134356932051509668`
+stopped normally in 2,453 ms, exit 0, without forced termination. Installer exit
+was 0. The verified new generation is `8764:134356945631802181`, version 3.2.608,
+with executable SHA-256
+`c22a8a0112cbb95e06280ca540228725bf67b1682764326a4ec20e8c8c3a6d68`.
+Primary and LKG configuration remain
+`bd7d21712114feb939bb0e6b48d66133776614eba263932c86afba6981e63ca3`;
+CA remains `f1ea357ee8f28d7184f8bc1b9b4c85f5f75587b5466ae9a491d9ed5dd3f75efe`.
+The signed endpoint-only TCPIP policy remains verified/applied at sequence 525;
+the live ETW session has eight providers including TCPIP. Normal TLS validation
+and the existing local test endpoint were used. No production/cloud deployment,
+merge, historical payload migration, queue clearing or ACK fabrication occurred.
+
+### Observed actions, necessary context and actual delivery
+
+The field sequence started only after current rule/artifact/cache health and
+source ownership recovered, resource pressure/throttling were zero, and the
+existing readiness gate passed. Each process is joined by PID plus creation
+FILETIME and the independent action time window, not PID alone.
+
+| Controlled group | Independent actions | Agent observations | Exact child events stored remotely | Valid alert deliveries / local ACK |
+| --- | ---: | ---: | ---: | ---: |
+| Three loopback network children | 12 | 12 | 0 | 0 / 0 |
+| Two encoded PowerShell positives | 4 | 4 | 2 | 2 / 2 |
+| Three short native children | 6 | 6 | 0 | 0 / 0 |
+| Total | 22 | 22 | 2 | 2 / 2 |
+
+The enabled-TCPIP 607 comparison had 9/12 observed network actions and three
+listen UNKNOWNs. The same network action category now has 12/12 observations,
+including all three listeners. Listener edges are explicitly
+`collector_decoded/identity_enriched -> sensor_interest/rejected`: ordinary
+listeners were decoded and rejected by the active interest policy. This proves
+the missing decoder/decision observation, not that each benign listener matched
+an attack rule. Valid attacks on a loopback listener were not live-tested here.
+
+Both positive alerts bind to the actual `R-EXEC-001` predicate and exact source
+process generations. Source/alert commands and images, parent identity/image,
+independently captured parent command, decoded command and rule predicate all
+match their truth inputs. These checks compare real values privately, not only
+field presence, scores, priority or labels. Actual request bodies total 3,517
+bytes; decoded payloads total 7,602 bytes. Each exact batch/payload digest matches
+server batch acceptance, completed ingest with accepted=1, and a COMMITTED local
+ACK. Ordinary controlled child records stored remotely: zero.
+
+The limited trace closed automatically and machine diagnostic options were
+removed. It reports 33 diagnostic trace drops. All 22 selected action joins and
+both exact delivery chains are present, but this is not a global no-loss proof.
+The historical 30 queued-record / 29,103-byte sample proved enqueue only and used
+different inputs; no like-for-like HTTP reduction percentage is inferred from it.
+
+### Complete queue inventory and loss recovery boundaries
+
+The first 608 attempt stopped before installation: the private inventory reader
+limited itself to 4,096 rows, while its immutable backup contained 4,799 rows and
+5,093,744 payload bytes. That arbitrary sample cap was not the Agent's byte-based
+queue-capacity contract. 607 was restored normally; original backups and failed
+receipts were retained. Lossless NTFS compression preserved backup paths, logical
+bytes and SHA-256; only verified synthetic test inputs were deleted afterward.
+
+Root validation commits `1921ecd0` and `07ad671e` introduce complete streaming
+read-only owners in `scripts/telemetry_quality/stopped_queue_inventory.cs` and
+`queue_retention_readonly.cs`. Every row is inspected and included in ordered
+commitments. One row is resident; existing payload, metadata and deadline budgets
+remain enforced. Retention stores bounded exceptions rather than every matching
+row, preserves cumulative backup-read time separately from live lookup time,
+and checks snapshot counts for completeness. Unknown severity, unresolved/legacy
+ownership, payload/metadata limits, deadlines and too many exceptions fail closed.
+All 23 synthetic ARM64 native cases passed, including 4,095/4,096/4,097/9,000 rows,
+independent full digests and changes after row 4,096. See the versioned README and
+`build_queue_inventory_fixtures.py` / `test_queue_inventory.ps1` for reproduction.
+The original 4,799-row frozen input then passed complete inspection in 203 ms.
+
+The second operation encountered a separate real failure: 607 exited 1 after
+61,031 ms and logged preprocessing shutdown timeout. The helper returned 9;
+installation was refused. The same 607 binary was restored through its existing
+task, with failure logs and receipts retained. Its unclean queue session produced
+one explicit, locally durable capability-loss audit. This does not reconstruct
+the original unavailable in-memory assertion.
+
+The diagnostic `loss_detected=true` is sticky history for that process, whereas
+current detection ownership had recovered. Root commit `f90ddf45` adds
+`analyze_recovery.local_source_recovery_proof`: it checks actual local-v3 ownership,
+scope/start time, the decoded audit, nonce/counter commitment and resolved latch.
+The private pre-upgrade consumer accepted this documented historical state only
+with that proof plus current health, no retries and the unchanged stopped-owner
+gate. No counter was cleared, no missing assertion was invented and no local
+retention was treated as server ACK. Clean-recovery test requirements remain intact.
+The full Python suite ran 231 tests: 230 passed, one host PowerShell test skipped.
+Each protected operation's 24 synthetic stop-contract plus five command-owner
+cases passed before that operation was permitted.
+
+### Actual retained data
+
+The successful stopped snapshot contained 5,132 original queue rows and 5,405,286
+payload bytes. Complete comparison found 5,131 unchanged identities/payloads and
+one absent batch. The strict all-present probe correctly returned 2; its failed
+result is retained. The absent original's exact 7,346-byte payload and batch hash
+match real server acceptance/completed ingest and a local ACK. No changed retained
+payload or batch identity was found. All 518 pre-upgrade ACK witnesses remain
+unchanged among 563 post-window witnesses, including original confirmation times.
+
+An inherited selection of 20 older cache candidates had already disappeared from
+this attempt's stopped backup. Its empty-vs-empty equality was explicitly rejected
+as preservation evidence; this run does not attribute their earlier disappearance
+to TTL, loss or this upgrade. A new deterministic selection was made using only
+the immutable stopped backup: most recent 20 candidates in its preceding hour,
+with closed context windows, ordered by event time and binary candidate ID. Only
+after fixing those IDs were live contents queried. All 20 candidate projections
+and 1,397 scoped reference/fact occurrences were unchanged. Shared facts can repeat
+in these counts; this is scoped full-context preservation, not a whole-cache proof.
+
+### Failures, unexecuted scope and residual risk
+
+- Fixed, reproduced: AF_UNSPEC native decoder and raw analyzer discrepancy;
+  finite inventory failing at row 4,097; historical loss incorrectly conflated
+  with unresolved current ownership. Native/field results above support only
+  their stated boundaries.
+- Retained failures: initial stale preparation/source bindings; old-code native
+  assertion with an initially incorrect wrapper exit expectation; first inventory
+  cap refusal; second normal-stop timeout; preliminary overly strict health waits;
+  all-original-rows-present comparison; old empty cache selection. No failed
+  result was overwritten or counted as a pass.
+- Still unresolved: the exact blocked call behind the single 607 preprocessing
+  shutdown timeout. A later normal exit succeeded; it does not identify or repair
+  that cause. No speculative shutdown patch or timeout relaxation was shipped.
+- After the controlled trace closed, later large synthetic database tests and
+  operational activity coincided with event-bus pressure. One health snapshot
+  reported 15,949 cumulative rejects: 14,498 P0-priority candidates and 1,451 other
+  candidates. Their exact event types/rule matches are unavailable from the minimal
+  health projection. These counters do not prove lost valid alerts, but they
+  prevent a claim of no loss under sustained pressure. Timing alone does not prove
+  which test or concurrent activity caused the pressure. The final 17:46:40 UTC observation has bus used=0, resource pressure=false,
+  pending offline delivery=0 and current source ownership healthy; cumulative
+  rejection counters remain unchanged. Recovery is observed, but the loss cause
+  and controlled-alert behavior during pressure remain unverified.
+- Not executed: live valid attack on a loopback listener; a controlled positive
+  alert/no-loss test during that later pressure; real legacy remote-owner migration;
+  production deployment. The policy-analysis default consistency fix `10ec0989`
+  was committed and tested against signed TOML, but this task did not rebuild or
+  restart the local API. The Windows binary contains the Agent fix only.
+
+Strict overall upload minimization / no-loss under every pressure and recovery
+boundary is **not declared complete**. The 22-action, two-alert acceptance and
+specified historical retention checks passed; the pressure and shutdown items
+above remain separate unresolved obligations.
+
+Private evidence is retained below by digest. Raw commands, user context, request
+bodies, credentials, queue bytes and mutable diagnostics are not committed.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| `/private/tmp/edr-agent-608-evaluation/native-verdict.json` | `c08d0112b98dead54a20c12062c2bb46b6a9f59954abd09b96515cf6fa6b4a81` |
+| `/private/tmp/edr-agent-608-evaluation/deployment-assets-verified.json` | `5fd1f297bc3cc852a0d5625d0a61a82a6ea6136c4bae688f3b74a10f5d32c08d` |
+| `/private/tmp/edr-agent-608-evaluation/ci-native-test-counts.json` | `7920dffa8622d6afde29205e67aba0361c22f5218cf1d2265cc7ba59b178347b` |
+| `/private/tmp/edr-agent-608-evaluation/inventory-native-result-r3.json` | `c0f7e1ebb16f0e2c7e79c4c73c42837f3bc4910e395181deb1b39d99eeab4bf8` |
+| `/private/tmp/edr-agent-608-evaluation/space-and-frozen-check.json` | `ad1393f1a7fd2ff5d89c20bd0420e5d0f600945b27e23ec83c5321c0b03a2e54` |
+| `/private/tmp/edr-agent-608-evaluation-attempt2/restore-after-stop-failure.json` | `bf3c05c2dd37617061180f47a329a928fa691bb9d72d61dcc4cdef73bb3228ab` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/source-recovery-proof.json` | `70b2cf5218177c1ee3c4a59b327a50cd721a7599892394848a59aa4652e27867` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/validation-suite.txt` | `44d4acebd549d811c900bb9d59569ee00ade3aca6ff3febf1b192d100b66587b` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/install-terminal-private.json` | `72e62d0d5bc3fdb185d92ea0ecfb06610c1cfbcc78cc6a6ce75db41fe92d7491` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/stopped-queue-gate-608-v1.json` | `5f4cd5788a87c50a4c73d2733e26b5eb542c0eeeccddcc9b54677c728126ab52` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/field-evidence/exact-delivery-verdict.json` | `b7962cc24cb7a9484149070e9912131b802a1524e7fbe43eb42bb58acd41a50b` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/field-evidence/context-quality.json` | `d14e63c7aa4112ff060a53f7bba9a6e20f4073dc9e909405dab41da17f981cfa` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/field-evidence/server-batch-receipts.json` | `9909e634082167feb917dc99c941c4d7ab457bd0ae5bbd51603fed8d55286e34` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/queue-final-verdict.json` | `9ab58495a7cce4c80be45f0e17fd9f6799c2490276f76d01d3855b92ea273a27` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/receipt-upgrade-persistence.json` | `2ba842896b508eb5632d534b8fe77cb93c4afa5d1e638efb31ba8ee952259144` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/cache-compare-actual-stdout.json` | `6ee7ddf408c56a37a313625069f11be9bfced19c32c7cc9532fca2ba4056c5e7` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/cache-current20-verdict.json` | `6088b3b6f2f7ac817afa5c1be0469a42eaac778d7b83f47094b76cadc2887fc5` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/final-runtime.json` | `2ecd12a2e20cbf6d2071b01dc42c84ab9a669199ca1eceeea6009be4b1efc3f6` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/final-provider.json` | `3d73ac02f9382af0b352ba32d63aec620837590c2ddc0b3fb9dd15e25a9877f5` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/publication-final.json` | `1ae19af5cce91a43a0727ce07b2be597a43474696a9e936d0585d6effbc870ef` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/pressure-detail-01.json` | `8739d224d9a970a9a0bf88f0b0b8f899c46435945e9be3024653ab2976b3fa7c` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/pressure-detail-02.json` | `54438f063844c0b746037834bab6ac003f85d6295cf0ad94b4f743796f4cff98` |
+| `/private/tmp/edr-agent-608-evaluation-attempt3/pressure-detail-final.json` | `a0988a1557f7df2eabb32b89d4185f7cc49fa4a79e687166ce92f13a4711e903` |
