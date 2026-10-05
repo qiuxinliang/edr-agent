@@ -1392,3 +1392,202 @@ evidence: `network-replay-result-v2.json`, `network-replay-build.json`, and
 `replay-v2-*.stderr/stdout` in the 604 evaluation directory. This isolated replay
 uses a separately cross-built PCRE2 archive and is not the hosted release
 dependency proof. Native production build gates remain mandatory before deploy.
+
+
+### Candidate 605 publication and deployed acceptance
+
+Candidate `win_3.2.605` is bound to `c5a3d27812c002d8f9bd3d101fcfd3bc61bfeffa`,
+run `37299295683`. All seven jobs completed successfully, including both native
+builds, both actual installer/updater lifecycle jobs and candidate publication.
+AMD64 passed 72/72 native tests (143.63 s) and 19/19 minimization gates
+(215.13 s); ARM64 passed 72/72 (299.09 s) and 19/19 (268.92 s). The
+`etw_network_decode_native`, `validation_trace_contract`, SQLite ACK contract
+and real loopback mTLS receiver gates passed on both architectures. This is
+native CI evidence, separate from the controlled lab acceptance below.
+
+Before upgrading, the actual lab ETW session contained seven providers and
+**did not subscribe to the TCPIP provider**. Both the primary and LKG signed
+configuration had `etw_tcpip_provider=false` while ETW and PowerShell were
+enabled. Consequently ordinary listen actions cannot establish an Agent TCPIP
+collector result under that unchanged policy. The typed listener fix is proved
+by the native collector replay and CI; a live TCPIP-enabled acceptance would
+require a separately authorized policy change. The experiment does not alter
+that policy to make coverage appear complete. The independent observer can
+still capture successful TCPIP 1123 listener events.
+
+The pre-stop backend sample was online at 3.2.601, with rule/artifact/cache
+ready, no source-only unhealthy/loss/retry flags, no resource throttle or
+pressure, event-bus used=0 and pending sends=0. Its cumulative event-bus dropped
+counter was 1114, already present before this candidate experiment; it is not
+attributed to the new build. The guest was still PID 4464 with exact birth
+134356565652927026 and the unchanged baseline configuration, trust anchor and
+rollback installer. No trace opt-in was present at this checkpoint.
+
+
+#### Actual candidate install and retained data
+
+The published candidate remained prerelease and `latest` remained `win_3.2.591`
+at the post-download identity check. Four deployment-consumed files were byte
+verified against both GitHub asset digests and the immutable manifest: the
+manifest, ARM64 runtime ZIP, independent Agent EXE and official Setup EXE. The
+75 MB graphical Setup UI ZIP was not used or fully downloaded on this host;
+its published identity was verified and full bundle/lifecycle validation had
+already passed in CI. This is not described as a complete local bundle download.
+
+ARM64 Agent SHA-256:
+`abd161c69dca01a0b157273103db898a7989b1bc0a3f4130b7fac822da6d810a`.
+Official installer SHA-256:
+`bbcd2e173d528b7fd85c392a86cb6752a9819ec463221a54b5ec8032e5ea0bd6`.
+
+The first preparation was refused with only 1.47 GiB free. Reversible NTFS
+compression of closed experiment files preserved all contents and paths, with
+SHA-256 comparisons before and after; no file or diagnostic was deleted. The
+initial added space was too close to the 2 GiB gate: a second check after
+protected copies refused before launching Setup and the recovery branch
+restarted the unchanged 601. Four additional cold maintenance snapshots were
+then compressed with identical hashes, bringing available space to 3,275,534,336
+bytes. Fourteen cold files were compressed in total; active Agent queue/evidence
+files and the required rollback installer were not compressed or changed by
+these operations. Both space refusals remain failed receipts, not passes.
+
+A separate attempt bound the restored 601 process generation and preserved the
+first job. Native operation fixtures caught an escaped CMD receipt path still
+pointing to the first job; correcting that unused script was followed by all
+24 strict receipt checks and five actual CMD/replay checks passing. The second
+normal stop, frozen backup and read-only historical queue gate passed. Official
+Setup exited 0 and produced stable 605 PID 9552, birth 134356756862003710.
+Primary/LKG configuration hashes remained
+`d6e73872e47d71ee88702ed42a5a8a48ccf662bbb9195e7cba154f17ce17f229`, CA hash remained
+`f1ea357ee8f28d7184f8bc1b9b4c85f5f75587b5466ae9a491d9ed5dd3f75efe`, and signed
+sequence remained 524. No existing queue payload migration was executed.
+
+Read-only comparison against that actual stopped backup found all **2,292
+original queue records / 2,640,275 payload bytes** preserved, with zero missing
+rows, changed batch identities or changed payloads. A first read-only probe
+failed because its URI still named the first job's nonexistent backup; the
+corrected URI completed the same comparison, preserving the failed receipt.
+For exactly 20 historical candidate selectors, all 20 candidates, 5,120 scoped
+reference occurrences and 5,120 scoped fact occurrences matched the stopped
+backup; no fact body changed or disappeared. Shared facts may occur under more
+than one selector, so these occurrence counts are not unique-fact counts.
+Neither comparison infers any server ACK from retained or missing rows.
+
+#### Controlled sampling: incomplete first window retained
+
+The first installed-run experiment successfully executed 6 native process
+actions, 12 loopback process/network actions and 4 encoded PowerShell process
+actions, with no raw parse errors. Backend association used exact child birth
+and source pairs. Ordinary cases had zero matching server events; both positive
+children had an `R-EXEC-001` alert under signed bundle
+`edr-dynamic-rules-v1-r283-e2008650`. Source and alert command lines, decoded
+commands, process paths, parent PID and parent path matched the independent
+truth (Windows path normalization only). Parent command lines were present;
+the independent truth does not contain a parent command-line oracle, so their
+byte equality is not claimed.
+
+This first local trace is **incomplete acceptance evidence**: readiness waiting
+consumed much of the 300-second window, only 5/22 actions had local observed
+edges, 17/22 remained UNKNOWN, and the closed trace recorded 20 diagnostic
+contention drops. It captured no request body for the two positive children;
+zero captured deliveries is not zero delivery. Thirty-six durable local receipt
+rows were observable, but unassociated rows are not counted as those children's
+ACKs. Original input clocks and receipts were retained; the host Python 3.9
+query-window parser required fractional-second normalization for a coarse
+120-second search margin, without changing FILETIME generation identities.
+
+Startup CPU throttling and a transient FILE-family source-only health mask
+(2) were observed, with loss_detected=0 and event-bus dropped=0. Both states
+recovered under the unchanged policy before sampling. They are not suppressed
+or reclassified as healthy by the acceptance tools.
+
+A second bounded sampling run retained the first evidence. Its first normal
+restart stopped 605 successfully but did not establish a stable new generation;
+no sampling was launched from that failed state. Read-only inspection found the
+scheduled task Ready, last result 0, IgnoreNew configured, no Agent and no new
+trace file. A separate start from that verified Ready state restored stable
+605 PID 3008, birth 134356772078459664, with the same binary, policy and CA.
+The exact cause of the earlier no-generation start is not established by these
+receipts alone. Automatic readiness polling then started all three cases within
+the fresh trace window; all case owners exited 0, no raw parse errors occurred,
+and post-case health had rules/cache ready, no source-only unhealthy flag,
+no resource pressure/throttle and event-bus dropped=0.
+
+
+#### Second 605 window: request, alert and ACK join
+
+The closed second trace contains 1,910 event observations, two encoded records
+and two actual HTTP request bodies (443,845 bytes total trace; 30 diagnostic
+contention drops). The eight child generations executed 22 truth actions with
+zero raw parse errors. Eleven actions have explicit local observed edges:
+eight process creates and three loopback connects. Eight process exits and
+three listens remain UNKNOWN in this trace; its drops prohibit absence claims.
+The ordinary native and loopback cases have zero exact-generation backend rows.
+Three ordinary short process creates have explicit generation-unavailable /
+resource-throttle-proven-miss dispositions. Two loopback-case creates have the
+same throttle disposition; the third has a proven miss and local-only retention.
+All three ordinary connects have exact-generation sensor-interest rejection.
+These are observed decisions, not evidence that every detector evaluated every
+ordinary action. Rule/cache health recovered without changing policy.
+
+For the two positive children, the trace records `R-EXEC-001` emitted and queued,
+with local candidate/context retention. Exactly two captured compressed protobuf
+requests decode to two records: each immutable payload is 3,710 bytes, and the
+actual HTTP bodies are 1,749 and 1,752 bytes (3,501 combined). Each exact batch
+and payload hash agrees with server durable ingest (`done`, accepted=1,
+attempts=1), the accepted batch owner, and the local committed ACK witness.
+There are two exact-source backend alerts, with no excluded alert associations.
+Independent truth confirms source/alert command lines, decoded commands, child
+image, parent PID and parent image; the rule predicate is present. Parent command
+line presence is verified, but equality is not claimed without an independent
+parent-command oracle. No raw command or request body is committed here.
+
+The initial host analysis failed because macOS system Python could not discover
+the installed zstd library. Resumption explicitly resolves the existing
+`libzstd.1.5.7.dylib`, keeps the same decoder and 8 MiB output bound, checks saved
+inputs byte-for-byte, and performs read-only backend joins. It executes no new
+actions and does not rewrite request/ACK evidence. The failed receipt remains.
+All 36 witnesses from the preceding runtime are present unchanged among the
+92 post-restart witnesses; no eviction occurred. This proves persistence of those
+witnesses, not an ACK for unmatched historical payloads.
+
+At final 605 runtime readback (2026-10-05 12:44 UTC), PID 3008 and its exact birth
+remain unchanged, the scheduled task is Running, and binary hash/version match
+the installed release. Both Machine trace opt-in variables are absent and the
+trace is closed. The actual session still has seven providers without TCPIP.
+No live TCPIP-enabled listen acceptance is claimed under the unchanged policy.
+
+### Exit diagnostic follow-up after 605 acceptance
+
+The remaining eight exit UNKNOWNs expose a diagnostic identity omission:
+Kernel-Process exit has typed target ProcessID/CreateTime but no target StartKey;
+the interest observation retained only StartKey. The event-header extended key
+belongs to the logger and is not a valid replacement. The interest structure now
+carries the typed eight-byte target birth only with a matching nonzero typed
+four-byte payload PID from Kernel-Process lifecycle events. The local trace uses
+that birth to join an already observed generation even when the exit name is
+truncated or absent. Rule admission, collection volume and the ACK protocol are
+unchanged. Missing/malformed identity remains unjoinable; PID reuse and PID-only
+exit observations never close a different generation in the diagnostic join.
+
+The same new trace regression fails against the 605 trace implementation (abort)
+and passes against the change, including wrong-birth and PID-only negative cases.
+The full native ARM64 collector fixture fails at the exact target-birth assertion
+against the old TDH implementation and passes against the new one; missing PID,
+truncated birth and a different provider cannot create a target birth. The replay
+wrapper expected failure exit 1, but Windows returned -1073740791 for the old
+assertion; the original child receipt and assertion text establish the intended
+counterfactual without rerunning it. The new child exited 0. This is isolated
+fixture evidence; publication and live acceptance of the follow-up remain pending.
+
+Private evidence hashes (paths relative to `/private/tmp`):
+
+| Evidence | SHA-256 |
+| --- | --- |
+| `edr-agent-605-evaluation/attempt2/replay/field-evidence/acceptance-summary.json` | `9bc7cda06f2c7f650a32006b43e8ba49ef4452e5696642aa7219edf45245c6fb` |
+| `edr-agent-605-evaluation/attempt2/replay/field-evidence/server-batch-receipts.json` | `192cd5f66cbd47ced434d53d799cf6b8f3476518db06d109f8a8a8d7d6c459ac` |
+| `edr-agent-605-evaluation/attempt2/replay/field-evidence/context-quality.json` | `ccbc8bde0f77213e20ff16deac605ca61b518e78921a0a951b6836fb55a3f5f1` |
+| `edr-agent-605-evaluation/attempt2/replay/field-evidence/agent-validation.jsonl` | `a60639115eac3354cff84165de4443cbc8c0f0affb95b5834de9338fce2dd73e` |
+| `edr-agent-605-evaluation/attempt2/replay/field-evidence/receipts.json` | `25a00f6370f00c146bf698644f8616e3789ae24d32abf62b227ae9c1b8ddc909` |
+| `edr-agent-605-evaluation/attempt2/replay/receipt-restart-persistence.json` | `854956820162f054e66a720e6380fca41a769bfbf6f09b0b225db6e7a693a636` |
+| `edr-agent-606-evaluation/trace-counterfactual.json` | `246713de32667a6cb1e3f52b4cd66336fa13a8c495f0224f2c5a9c2c41477ace` |
+| `edr-agent-606-evaluation/network-replay-result.json` | `257c8f09e8ba4c0bba708e35ae04ef1217a5e65967fe369d530b72a713ca1444` |

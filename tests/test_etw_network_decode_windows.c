@@ -180,6 +180,32 @@ static void test_kernel_network_raw_ports(void) {
   expect_contains((const char *)payload, "spt=8080\n");
 }
 
+static void test_process_interest_target_birth(void) {
+  EVENT_RECORD record = make_record(&EDR_ETW_GUID_KERNEL_PROCESS, 4u);
+  EdrSensorInterestEvent interest;
+  uint64_t birth = UINT64_C(134356772868606375);
+  uint32_t target_pid = 9540u;
+  record.EventHeader.EventDescriptor.Id = 2u;
+  record.EventHeader.EventDescriptor.Opcode = 2u;
+  reset_properties(&record);
+  add_u32(L"ProcessID", target_pid);
+  add_property(L"CreateTime", &birth, sizeof(birth));
+  assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_PROCESS_TERMINATE, "kproc", &interest));
+  assert(interest.pid == target_pid && interest.process_creation_filetime_100ns == birth);
+  assert(interest.process_start_key == 0u);
+  find_property(L"CreateTime")->size = 4u;
+  assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_PROCESS_TERMINATE, "kproc", &interest));
+  assert(interest.process_creation_filetime_100ns == 0u);
+  find_property(L"CreateTime")->size = sizeof(birth);
+  find_property(L"ProcessID")->status = ERROR_NOT_FOUND;
+  assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_PROCESS_TERMINATE, "kproc", &interest));
+  assert(interest.process_creation_filetime_100ns == 0u); /* No logger-PID fallback. */
+  find_property(L"ProcessID")->status = ERROR_SUCCESS;
+  record.EventHeader.ProviderId = EDR_ETW_GUID_KERNEL_NETWORK;
+  assert(edr_tdh_build_sensor_interest_event(&record, EDR_EVENT_NET_CONNECT, "knet", &interest));
+  assert(interest.process_creation_filetime_100ns == 0u);
+}
+
 static void test_kernel_network_malformed_port_sizes(void) {
   EVENT_RECORD record = make_record(&EDR_ETW_GUID_KERNEL_NETWORK, 11u);
   EdrSensorInterestEvent interest;
@@ -917,6 +943,7 @@ int main(int argc, char **argv) {
     assert(argc == 1);
   }
   test_kernel_network_raw_ports();
+  test_process_interest_target_birth();
   test_kernel_network_malformed_port_sizes();
   test_kernel_network_ipv6_text_unchanged();
   test_other_provider_host_order_and_text_ports();

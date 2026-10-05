@@ -18,6 +18,9 @@ typedef struct {
    * extended actor StartKey for non-lifecycle events.  A PID alone is never
    * sufficient for self-noise ancestry because Windows reuses PIDs. */
   uint64_t process_start_key;
+  /* Kernel-Process payload target birth, for exact local observations when
+   * the terminated target can no longer be queried. Never the logger's key. */
+  uint64_t process_creation_filetime_100ns;
   char process_name[256];
   char parent_process_name[256];
   char path[1024];

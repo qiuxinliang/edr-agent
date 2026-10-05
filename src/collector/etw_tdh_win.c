@@ -571,6 +571,14 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   }
   g = &rec->EventHeader.ProviderId;
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
+    uint32_t target_pid = 0u;
+    uint64_t target_birth = 0u;
+    if ((type == EDR_EVENT_PROCESS_CREATE || type == EDR_EVENT_PROCESS_TERMINATE) &&
+        edr_prop_exact(rec, L"ProcessID", &target_pid, sizeof(target_pid)) &&
+        target_pid && target_pid == out_event->pid &&
+        edr_prop_exact(rec, L"CreateTime", &target_birth, sizeof(target_birth))) {
+      out_event->process_creation_filetime_100ns = target_birth;
+    }
     static const PCWSTR process_key_names[] = {
         L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
     for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {

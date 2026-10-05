@@ -37,6 +37,15 @@ int main(void) {
   strcpy(r.cmdline,"synthetic-secret-command"); strcpy(r.username,"synthetic-secret-user");
   edr_validation_trace_event(&r,"p0_evaluation","proven_miss");
   strcpy(r.process_name,"other.exe"); edr_validation_trace_event(&r,"local_retention","ordinary_hot_ring_only");
+  EdrSensorInterestEvent exited = {0};
+  exited.type = EDR_EVENT_PROCESS_TERMINATE; exited.pid = r.pid;
+  exited.process_creation_filetime_100ns = r.process_creation_filetime_100ns;
+  /* Exit has a typed target birth but no target StartKey or full image name. */
+  edr_validation_trace_interest(&exited, 123456789, "process_exit", "ave_notified");
+  exited.process_creation_filetime_100ns++;
+  edr_validation_trace_interest(&exited, 123456789, "foreign-exit", "");
+  exited.process_creation_filetime_100ns = 0;
+  edr_validation_trace_interest(&exited, 123456789, "foreign-pid-only-exit", "");
   r.process_creation_filetime_100ns++; edr_validation_trace_event(&r,"foreign-generation","");
   r.process_creation_filetime_100ns--; r.process_start_key++; edr_validation_trace_event(&r,"conflicting-key","");
   r.process_start_key--; r.pid++; edr_validation_trace_event(&r,"foreign-pid",""); r.pid--;
@@ -51,6 +60,7 @@ int main(void) {
   edr_validation_trace_stop();
   char *s=read_all(path);
   assert(strstr(s,"proven_miss") && strstr(s,"ordinary_hot_ring_only") && strstr(s,"\"stage\":\"child\""));
+  assert(strstr(s,"\"birth\":\"1000\",\"start_key\":\"0\",\"event_ns\":\"123456789\",\"type\":2,\"event_id\":\"\",\"stage\":\"process_exit\""));
   assert(!strstr(s,"foreign-") && !strstr(s,"conflicting-key") && !strstr(s,"secret"));
   assert(strstr(s,"\"body_hex\":\"7b7d\"") && strstr(s,"\"body_hex\":\"010203ff\""));
   assert(!edr_sha256_hex(wire,sizeof(wire),hash) && strstr(s,hash));

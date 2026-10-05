@@ -159,8 +159,10 @@ void edr_validation_trace_event(const EdrBehaviorRecord *r, const char *stage, c
 void edr_validation_trace_interest(const EdrSensorInterestEvent *e, int64_t ns,
                                   const char *stage, const char *reason) {
   if (!e || !enter()) return;
-  if (scoped_values(e->pid, 0, e->process_start_key, e->process_name, NULL, e->parent_process_name))
-    event_locked(e->pid, 0, e->process_start_key, ns, (unsigned)e->type, "", stage, reason);
+  if (scoped_values(e->pid, e->process_creation_filetime_100ns, e->process_start_key,
+                    e->process_name, NULL, e->parent_process_name))
+    event_locked(e->pid, e->process_creation_filetime_100ns, e->process_start_key,
+                  ns, (unsigned)e->type, "", stage, reason);
   atomic_flag_clear(&s_lock);
 }
 void edr_validation_trace_bind(const EdrBehaviorRecord *r, const char *batch_id,
