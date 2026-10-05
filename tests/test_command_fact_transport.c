@@ -6,9 +6,14 @@
 #include "edr/sha256.h"
 #include "edr/p0_deferred_snapshot.h"
 #include "edr/p0_rule_ir.h"
+#include "edr/egress_batch_policy.h"
+#ifdef EDR_P0_TEST_REAL_IR
+#include "edr/p0_rule_direct_emit.h"
+#endif
 #include "edr/v1/event.pb.h"
 #include "pb_decode.h"
 #include "cJSON.h"
+#include <sqlite3.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,8 +25,10 @@
 #include <unistd.h>
 #endif
 
-/* External I/O only is replaced. Cache, encoder, SQLite queue and replay are
- * production code. No Agent, server, policy or external model is invoked. */
+/* External I/O only is replaced. Cache, matcher, alert producer, encoder,
+ * SQLite queue and replay are production code. No Agent, server or external
+ * model is invoked. The explicit non-production matcher-stub configuration
+ * exercises local retention and denial, and cannot claim a detected alert. */
 bool edr_resource_preprocess_throttle_active(void) { return false; }
 int edr_event_batch_push(const uint8_t *p, size_t n) { (void)p; (void)n; return -1; }
 void edr_preprocess_copy_agent_ids(char *ep, size_t ec, char *tn, size_t tc) {
@@ -65,7 +72,70 @@ static void identity(EdrBehaviorRecord *r, uint32_t pid) {
   r->process_creation_filetime_100ns = UINT64_C(134346261457945144) + pid;
 }
 
+static sqlite3 *read_queue(const char *path) {
+  sqlite3 *db = NULL;
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  return db;
+}
+static int sql_number(const char *path, const char *sql) {
+  sqlite3 *db = read_queue(path); sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  int result = sqlite3_column_int(st, 0);
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st); sqlite3_close(db); return result;
+}
+static void assert_retained_wire(const char *path, const char *sql,
+                                 const uint8_t *wire, size_t size, const char *batch) {
+  sqlite3 *db = read_queue(path); sqlite3_stmt *st = NULL;
+  char before[65], after[65];
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  if (batch) assert(sqlite3_bind_text(st, 1, batch, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  const void *stored = sqlite3_column_blob(st, 0);
+  assert(sqlite3_column_bytes(st, 0) == (int)size && !memcmp(stored, wire, size));
+  assert(edr_sha256_hex(wire, size, before) == 0);
+  assert(edr_sha256_hex(stored, size, after) == 0 && !strcmp(before, after));
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st); sqlite3_close(db);
+}
+
 #ifdef EDR_P0_TEST_REAL_IR
+/* Capture the real producer's immutable queue body, rather than constructing
+ * a provenance string. The decoder only borrows that producer's alert for the
+ * independent full-fact/deferred codec round trip below. */
+static uint8_t *capture_produced_wire(const char *path, size_t *size,
+                                      AVEBehaviorAlert *alert) {
+  sqlite3 *db = read_queue(path); sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(db, "SELECT payload FROM event_queue WHERE status='pending';",
+      -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  *size = (size_t)sqlite3_column_bytes(st, 0);
+  uint8_t *wire = malloc(*size); assert(wire && *size > 16u);
+  memcpy(wire, sqlite3_column_blob(st, 0), *size);
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st); sqlite3_close(db);
+  edr_v1_BehaviorEvent *event = calloc(1, sizeof(*event)); assert(event);
+  pb_istream_t in = pb_istream_from_buffer(wire + 16u, *size - 16u);
+  assert(pb_decode(&in, edr_v1_BehaviorEvent_fields, event) && event->has_behavior_alert);
+  const edr_v1_BehaviorAlert *a = &event->behavior_alert;
+  memset(alert, 0, sizeof(*alert));
+  alert->pid = a->pid; alert->ppid = a->ppid; alert->timestamp_ns = a->timestamp_ns;
+  alert->anomaly_score = a->anomaly_score;
+  alert->skip_ai_analysis = a->skip_ai_analysis; alert->needs_l2_review = a->needs_l2_review;
+  memcpy(alert->tactic_probs, a->tactic_probs, sizeof(alert->tactic_probs));
+  snprintf(alert->process_name, sizeof(alert->process_name), "%s", a->process_name);
+  assert(strlen(a->process_path) < sizeof(alert->process_path));
+  memcpy(alert->process_path, a->process_path, strlen(a->process_path) + 1u);
+  snprintf(alert->triggered_tactics, sizeof(alert->triggered_tactics), "%s", a->triggered_tactics);
+  snprintf(alert->user_subject_json, sizeof(alert->user_subject_json), "%s", a->user_subject_json);
+  snprintf(alert->related_iocs_json, sizeof(alert->related_iocs_json), "%s", a->related_iocs_json);
+  snprintf(alert->cmdline, sizeof(alert->cmdline), "%s", a->cmdline);
+  cJSON *subject = cJSON_Parse(a->user_subject_json); assert(subject);
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(subject, "rule_id")->valuestring, "R-CRED-003"));
+  cJSON_Delete(subject); free(event);
+  return wire;
+}
 static int has_rule(const EdrBehaviorRecord *record, const EdrCommandFacts *facts,
                     const char *rule_id) {
   EdrP0RuleIrEvaluation evaluation;
@@ -82,6 +152,12 @@ static int has_rule(const EdrBehaviorRecord *record, const EdrCommandFacts *fact
 #endif
 
 int main(int argc, char **argv) {
+#ifndef EDR_P0_TEST_REAL_IR
+  if (argc == 2) {
+    fprintf(stderr, "Matcher-stub build cannot export an admitted alert fixture.\n");
+    return 2;
+  }
+#endif
   char db[512], queue[512];
   EdrBehaviorRecord *parent = calloc(1, sizeof(*parent)), *child = calloc(1, sizeof(*child));
   edr_v1_BehaviorEvent *decoded = calloc(1, sizeof(*decoded));
@@ -93,16 +169,22 @@ int main(int argc, char **argv) {
   strcpy(parent->process_name, "inert-parent.exe");
   strcpy(child->process_name, "inert-child.exe");
   strcpy(child->exe_path, "C:/test/inert-child.exe");
+  strcpy(child->image_path_resolution_status, "RESOLVED");
+  strcpy(child->process_generation_source, "file_read_process_tree_cache_generation");
   strcpy(child->event_id, "command-fact-roundtrip");
   strcpy(child->file_path, "C:\\test\\Login Data"); strcpy(child->file_op, "read");
   child->event_time_ns = INT64_C(1790152545794514400);
   child->type = EDR_EVENT_FILE_READ; child->ppid = parent->pid;
   child->parent_process_start_key = parent->process_start_key;
   child->parent_process_creation_filetime_100ns = parent->process_creation_filetime_100ns;
-  AVEBehaviorAlert alert = {0};
-  alert.pid = child->pid; alert.ppid = child->ppid; alert.timestamp_ns = child->event_time_ns;
-  alert.anomaly_score = 0.91f;
-  strcpy(alert.user_subject_json, "{\"rule_id\":\"R-TEST-COMMAND-FACT\",\"severity\":\"P0\"}");
+  AVEBehaviorAlert bare_alert = {0};
+  bare_alert.pid = child->pid; bare_alert.ppid = child->ppid; bare_alert.timestamp_ns = child->event_time_ns;
+  bare_alert.anomaly_score = 0.91f;
+  strcpy(bare_alert.user_subject_json, "{\"rule_id\":\"R-TEST-COMMAND-FACT\",\"severity\":\"P0\"}");
+#ifdef EDR_P0_TEST_REAL_IR
+  edr_p0_rule_test_set_file_read_collector_healthy(1);
+  edr_p0_rule_test_reset_dedup();
+#endif
   const size_t sizes[] = {8191u, 8192u, 12717u, EDR_PROCESS_COMMAND_FACT_CAP - 1u};
   for (size_t k = 0; k < sizeof(sizes)/sizeof(sizes[0]); ++k) {
     size_t n = sizes[k];
@@ -222,13 +304,43 @@ int main(int argc, char **argv) {
     }
 #endif
     EdrP0RuleIrBinding binding = {0};
+    const char *snapshot_rule = "R-TEST-COMMAND-FACT";
+    AVEBehaviorAlert alert = bare_alert;
+    size_t bare_size = 0;
+    uint8_t *bare_wire = edr_behavior_record_alloc_durable_wire(child, &bare_alert, &bare_size);
+    char why[96];
+    assert(bare_wire && bare_size > n*2 && bare_size < 256u*1024u);
+    assert(!edr_egress_batch_validate(bare_wire, 12u, bare_wire+12u,
+        bare_size-12u, why, sizeof(why)));
+    memset(decoded, 0, sizeof(*decoded));
+    pb_istream_t bare_input = pb_istream_from_buffer(bare_wire+16u, bare_size-16u);
+    assert(pb_decode(&bare_input, edr_v1_BehaviorEvent_fields, decoded));
+    assert(decoded->priority == 0 && !strcmp(decoded->cmdline, command) &&
+        !strcmp(decoded->process_context.parent_cmdline, command));
+    assert(edr_storage_queue_open(queue) == EDR_OK);
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(edr_p0_rule_ir_get_binding(&binding));
+    snapshot_rule = "R-CRED-003";
+    int proven_miss = 0;
+    assert(edr_p0_rule_try_emit_with_command_facts_status(child, &captured, &proven_miss) == 1);
+    assert(!proven_miss);
+    expected_wire = capture_produced_wire(queue, &expected_size, &alert);
+    assert(edr_egress_batch_validate(expected_wire, 12u, expected_wire+12u,
+        expected_size-12u, why, sizeof(why)));
+#else
+    /* No matcher authority exists in the explicit stub build. Preserve the
+     * local full-fact regression and require both deliveries to stay held. */
     strcpy(binding.rules_bundle_version, "synthetic-r1"); memset(binding.artifact_sha256, 'a', 64u);
+    expected_wire = edr_behavior_record_alloc_durable_wire(child, &alert, &expected_size);
+    char batch[128];
+    assert(edr_behavior_durable_wire_batch_id("command-fact", expected_wire, expected_size, batch, sizeof(batch)));
+    assert(edr_storage_queue_enqueue(batch, expected_wire, expected_size, 0, 1) == EDR_OK);
+#endif
     char *snapshot = NULL, deferred_key[65]; size_t snapshot_size = 0;
-    assert(edr_p0_deferred_snapshot_encode_facts(child, &binding, "R-TEST-COMMAND-FACT",
+    assert(edr_p0_deferred_snapshot_encode_facts(child, &binding, snapshot_rule,
         &captured, &snapshot, &snapshot_size));
     assert(edr_sha256_hex((const uint8_t *)snapshot, snapshot_size, deferred_key) == 0);
     free(captured.subject); free(captured.parent);
-    expected_wire = edr_behavior_record_alloc_durable_wire(child, &alert, &expected_size);
     assert(expected_wire && expected_size > n*2 && expected_size < 256u*1024u);
     memset(decoded, 0, sizeof(*decoded));
     pb_istream_t input = pb_istream_from_buffer(expected_wire + 16u, expected_size - 16u);
@@ -236,10 +348,6 @@ int main(int argc, char **argv) {
     assert(!strcmp(decoded->cmdline, command) && !strcmp(decoded->process_context.parent_cmdline, command));
     assert(!decoded->truncated_fields[0] && !strcmp(decoded->transport_completeness, "COMPLETE"));
     assert(!strcmp(decoded->detail.file.target_path, child->file_path));
-    assert(edr_storage_queue_open(queue) == EDR_OK);
-    char batch[128];
-    assert(edr_behavior_durable_wire_batch_id("command-fact", expected_wire, expected_size, batch, sizeof(batch)));
-    assert(edr_storage_queue_enqueue(batch, expected_wire, expected_size, 0, 1) == EDR_OK);
     assert(edr_storage_queue_p0_deferred_retain(deferred_key, 1u,
         (const uint8_t *)snapshot, snapshot_size) == EDR_OK);
     free(snapshot);
@@ -248,7 +356,16 @@ int main(int argc, char **argv) {
     assert(edr_storage_queue_open(queue) == EDR_OK);
     unsigned before = delivered;
     edr_storage_queue_poll_drain();
-    assert(delivered == before + 1 && edr_storage_queue_pending_count() == 0);
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(delivered == before + 1);
+#else
+    assert(delivered == before);
+    assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue WHERE status='policy_held' AND retry_count=0;") == (int)(2u*k + 1u));
+    assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue;") == (int)(2u*k + 1u));
+    assert_retained_wire(queue, "SELECT payload FROM event_queue WHERE batch_id=?;",
+        expected_wire, expected_size, batch);
+#endif
+    assert(edr_storage_queue_pending_count() == 0);
     uint8_t *retained = NULL; size_t retained_size = 0;
     char selected_key[65], restored_rule[64];
     assert(edr_storage_queue_p0_deferred_peek(1u, selected_key, &retained, &retained_size) == 1);
@@ -258,6 +375,9 @@ int main(int argc, char **argv) {
     assert(edr_p0_deferred_snapshot_decode_facts((const char *)retained, retained_size,
         restored, &restored_binding, restored_rule, sizeof(restored_rule), &recovered));
     free(retained);
+    assert(!strcmp(restored_rule, snapshot_rule));
+    assert(!strcmp(restored_binding.artifact_sha256, binding.artifact_sha256));
+    assert(!strcmp(restored_binding.rules_bundle_version, binding.rules_bundle_version));
 #ifdef EDR_P0_TEST_REAL_IR
     assert(has_rule(restored, &recovered, "R-CRED-003"));
     if (n == 12717u) {
@@ -269,7 +389,12 @@ int main(int argc, char **argv) {
     }
 #endif
     size_t replay_size = 0;
-    uint8_t *replay = edr_behavior_record_alloc_durable_wire_facts(restored, &alert, &recovered, &replay_size);
+    uint8_t *replay =
+#ifdef EDR_P0_TEST_REAL_IR
+        edr_behavior_record_alloc_outbound_wire_facts(restored, &alert, &recovered, &replay_size);
+#else
+        edr_behavior_record_alloc_durable_wire_facts(restored, &alert, &recovered, &replay_size);
+#endif
     assert(replay && replay_size == expected_size && !memcmp(replay, expected_wire, replay_size));
     /* This is the same atomic handoff used after deferred matching. Give the
      * delivery a distinct id from the earlier deliberately identical test. */
@@ -279,27 +404,58 @@ int main(int argc, char **argv) {
     edr_storage_queue_close();
     assert(edr_storage_queue_open(queue) == EDR_OK);
     edr_storage_queue_poll_drain();
-    assert(delivered == before + 2 && edr_storage_queue_pending_count() == 0);
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(delivered == before + 2);
+#else
+    assert(delivered == before);
+    assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue WHERE status='policy_held' AND retry_count=0;") == (int)(2u*k + 2u));
+    assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue;") == (int)(2u*k + 2u));
+    assert_retained_wire(queue, "SELECT payload FROM event_queue WHERE batch_id=?;",
+        expected_wire, expected_size, batch);
+    assert_retained_wire(queue, "SELECT payload FROM event_queue WHERE batch_id=?;",
+        expected_wire, expected_size, selected_key);
+#endif
+    assert(edr_storage_queue_pending_count() == 0);
     if (n == EDR_PROCESS_COMMAND_FACT_CAP - 1u) {
       EdrStorageQueueCapacityMetrics before_intent, after_intent;
       edr_storage_queue_get_capacity_metrics(&before_intent);
       assert(edr_storage_queue_enforcement_terminal_precreate("long-command-owner", "synthetic-event",
-          "R-TEST", "synthetic-generation", "long-intent", expected_wire, expected_size) ==
+          "R-TEST", "synthetic-generation", "long-intent", bare_wire, bare_size) ==
           EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
       edr_storage_queue_get_capacity_metrics(&after_intent);
-      assert(after_intent.used_bytes >= before_intent.used_bytes + expected_size + 2u*256u*1024u);
+      assert(after_intent.used_bytes >= before_intent.used_bytes + bare_size + 2u*256u*1024u);
       assert(edr_storage_queue_enforcement_terminal_update("long-command-owner", "long-source",
-          expected_wire, expected_size, "long-combined", expected_wire, expected_size) == EDR_OK);
+          bare_wire, bare_size, "long-combined", bare_wire, bare_size) == EDR_OK);
       edr_storage_queue_close(); assert(edr_storage_queue_open(queue) == EDR_OK);
+      unsigned before_bare = delivered;
       edr_storage_queue_poll_drain();
-      assert(delivered == before + 4);
+      assert(delivered == before_bare);
+      assert(sql_number(queue, "SELECT COUNT(*) FROM enforcement_terminal_journal WHERE "
+          "idempotency_key='long-command-owner' AND state='ready' AND "
+          "intent_policy_held=1 AND source_policy_held=1 AND combined_policy_held=1 AND "
+          "intent_acked=0 AND source_acked=0 AND combined_acked=0 AND "
+          "intent_retry_count=0 AND source_retry_count=0 AND combined_retry_count=0 AND "
+          "intent_batch_id='long-intent' AND source_batch_id='long-source' AND combined_batch_id='long-combined';") == 1);
+      EdrEnforcementTerminalJournalMetrics journal;
+      edr_storage_queue_enforcement_terminal_get_metrics(&journal);
+      assert(journal.policy_held_frames == 3 && journal.pending == 1 && journal.local_retained == 0);
+      assert_retained_wire(queue, "SELECT intent_wire FROM enforcement_terminal_journal WHERE idempotency_key='long-command-owner';", bare_wire, bare_size, NULL);
+      assert_retained_wire(queue, "SELECT source_wire FROM enforcement_terminal_journal WHERE idempotency_key='long-command-owner';", bare_wire, bare_size, NULL);
+      assert_retained_wire(queue, "SELECT combined_wire FROM enforcement_terminal_journal WHERE idempotency_key='long-command-owner';", bare_wire, bare_size, NULL);
     }
     edr_storage_queue_close();
     if (argc == 2 && n == 12717u) {
       FILE *f = fopen(argv[1], "wb"); assert(f);
       assert(fwrite(expected_wire, 1, expected_size, f) == expected_size); assert(fclose(f) == 0);
     }
-    printf("command_fact bytes=%zu parent=exact restart=exact queue_replay=exact deferred_cache_closed=exact wire_bytes=%zu\n", n, expected_size);
+    printf("command_fact bytes=%zu parent=exact restart=exact queue_replay=exact deferred_cache_closed=exact wire_bytes=%zu delivery=%s\n", n, expected_size,
+#ifdef EDR_P0_TEST_REAL_IR
+        "real_ir_alert"
+#else
+        "held_without_matcher_authority"
+#endif
+    );
+    free(bare_wire);
     free(expected_wire);
     assert(edr_local_evidence_cache_open(db, 8, 24) == 0);
   }

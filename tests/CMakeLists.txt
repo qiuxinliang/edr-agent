@@ -1291,9 +1291,14 @@ if(SQLite3_FOUND)
     ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
   if(EDR_PCRE2_AVAILABLE)
     target_sources(test_command_fact_transport PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
+      ${CMAKE_SOURCE_DIR}/src/preprocess/adaptive_collection.c
+      ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
+      ${CMAKE_SOURCE_DIR}/src/detection/policy_enforcement.c
       ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
       ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c)
-    target_compile_definitions(test_command_fact_transport PRIVATE EDR_P0_TEST_REAL_IR=1)
+    target_compile_definitions(test_command_fact_transport PRIVATE
+      EDR_P0_TEST_REAL_IR=1 EDR_P0_DIRECT_EMIT_TESTING=1)
     target_link_libraries(test_command_fact_transport PRIVATE ${EDR_PCRE2_TARGET})
   endif()
   # Append SQLite's shared include prefix after the verified static matcher;
