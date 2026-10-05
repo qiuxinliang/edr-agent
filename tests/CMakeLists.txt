@@ -1767,6 +1767,11 @@ endif()
 # The same focused contract list owns the build dependencies and CTest label.
 # Native Windows runner refuses missing real SQLite/IR/TLS contracts.
 add_custom_target(telemetry_minimization_tests)
+# SQLite resource ownership uses Python and needs no native build target.
+add_test(NAME egress_receiver_resources COMMAND ${Python3_EXECUTABLE} -B
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_egress_tls_receiver_resources.py)
+set_tests_properties(egress_receiver_resources PROPERTIES LABELS telemetry-minimization)
+
 function(edr_minimization_test test_name target_name)
   if(TEST "${test_name}" AND TARGET "${target_name}")
     set_property(TEST "${test_name}" APPEND PROPERTY LABELS telemetry-minimization)

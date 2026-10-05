@@ -6,6 +6,7 @@ normal certificate chain and DNS verification remain enabled. SQLite FULL
 commits precede receipts. Only synthetic counters/hashes appear in the report.
 """
 import argparse
+from contextlib import closing
 import base64
 import hashlib
 import http.server
@@ -236,7 +237,7 @@ class Receiver(http.server.ThreadingHTTPServer):
         self.observations = []
         self.errors = []
         self.lock = threading.Lock()
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             db.execute("CREATE TABLE receipt(batch_id TEXT PRIMARY KEY,sha TEXT NOT NULL,observations INTEGER NOT NULL)")
@@ -300,7 +301,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("empty raw event batch reached synthetic receiver")
                 digest = hashlib.sha256(raw).hexdigest()
                 batch = body["batch_id"]
-                with sqlite3.connect(self.server.database) as db:
+                with closing(sqlite3.connect(self.server.database)) as db, db:
                     db.execute("PRAGMA synchronous=FULL")
                     if not all(is_proven_alert(frame) or is_bound_pmfe(frame, db) or is_paired_p0(frame, db, digest) for frame in frames):
                         raise ValueError("unproven alert or follow-up reached synthetic receiver")
@@ -326,7 +327,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path in ("/api/v1/ingest/engine-health", "/api/v1/ingest/engine-health/delta"):
                 if b"synthetic-secret" in wire or b"raw_event" in wire:
                     raise ValueError("private diagnostic evidence reached health receiver")
-                with sqlite3.connect(self.server.database) as db:
+                with closing(sqlite3.connect(self.server.database)) as db, db:
                     db.execute("PRAGMA synchronous=FULL")
                     previous = db.execute("SELECT revision,payload FROM health WHERE id=1").fetchone()
                     update = body.get("engine_health_update")
@@ -382,20 +383,20 @@ def crash_restart_scenario(client, root):
             if not metrics:
                 raise RuntimeError("synthetic crash checkpoint not established")
             assert metrics["detector_inputs"] == metrics["detected"] == 1 and metrics["enqueued"] == 3
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 before = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
                 assert before and before[1] == "pending"
                 original_hash = hashlib.sha256(before[0]).hexdigest()
             child.kill()
             killed = child.wait(timeout=5)
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             after = db.execute("SELECT payload,status FROM event_queue WHERE batch_id='tls-ack-lost'").fetchone()
             assert after == before
         environment.pop("EDR_TEST_CRASH_AFTER_LOST_ACK", None)
         result = subprocess.run(arguments + ["resume-after-crash"], capture_output=True,
                                 text=True, timeout=15, env=environment, cwd=root)
         assert result.returncode == 0, "crashed owner did not recover its genuine receipt"
-        with sqlite3.connect(server.database) as db:
+        with closing(sqlite3.connect(server.database)) as db, db:
             receipt = db.execute("SELECT sha,observations FROM receipt WHERE batch_id='tls-ack-lost'").fetchone()
             assert receipt == (original_hash, 2)
             durable = db.execute("SELECT COUNT(*) FROM receipt").fetchone()[0]
@@ -452,7 +453,7 @@ def main():
                             "classes": {path: sum(item["path"] == path for item in server.observations)
                                         for path in sorted({item["path"] for item in server.observations})}})
             if mode.startswith("positive"):
-                with sqlite3.connect(server.database) as db:
+                with closing(sqlite3.connect(server.database)) as db, db:
                     reports[-1]["durable_batches"] = db.execute("SELECT COUNT(*) FROM receipt").fetchone()[0]
                     reports[-1]["duplicate_observations"] = db.execute("SELECT COALESCE(SUM(observations-1),0) FROM receipt").fetchone()[0]
                     if mode == "positive-p0-journal":
