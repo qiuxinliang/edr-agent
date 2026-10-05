@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #include "edr/agent.h"
 
 #include "edr/adaptive_collection.h"
@@ -1919,6 +1920,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
 #ifdef _WIN32
   s_agent_main_thread_id = (uint32_t)GetCurrentThreadId();
 #endif
+  edr_validation_trace_start_from_env();
   {
     EdrError pe = edr_preprocess_start(agent->event_bus, &agent->cfg);
     if (pe != EDR_OK) {
@@ -1966,6 +1968,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
       while (!agent->shutdown) {
         uint64_t edr_loop_started_ns = edr_agent_loop_probe_begin();
         edr_ms_sleep(200u);
+        edr_validation_trace_flush();
         edr_health_beat(EDR_HEALTH_MAIN_LOOP);
         edr_watchdog_agent_tick(&agent->cfg);
 #ifdef _WIN32
@@ -2573,6 +2576,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"used_bytes\":%llu,\"max_bytes\":%llu,\"pending_rows\":%llu,"
         "\"p0_source_only_rejected\":%llu,\"deferred_pending\":%llu,\"deferred_failed\":%llu,"
         "\"deferred_storage_failures\":%llu,\"deferred_retry_degraded\":%s}},"
+        "\"p0_offline_queue_capacity\":{\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu,\"resource_deferred\":%llu,\"receipt_failures\":%llu}},"
         "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
         "\"security_audit_visible\":%s,\"collector_thread_id\":%u,"
@@ -2800,6 +2804,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)queue_capacity_metrics.p0_deferred_failed_rows,
         (unsigned long long)p0_emit_metrics.deferred_storage_failures,
         p0_emit_metrics.deferred_retry_degraded ? "true" : "false",
+        (unsigned long long)queue_capacity_metrics.delivery_selected,
+        (unsigned long long)queue_capacity_metrics.delivery_sent,
+        (unsigned long long)queue_capacity_metrics.delivery_acked,
+        (unsigned long long)queue_capacity_metrics.delivery_requeued,
+        (unsigned long long)queue_capacity_metrics.delivery_failed,
+        (unsigned long long)queue_capacity_metrics.delivery_resource_deferred,
+        (unsigned long long)queue_capacity_metrics.delivery_receipt_failures,
         ch.etw_or_inotify_enabled ? "true" : "false", ch.powershell_visible ? "true" : "false",
         ch.amsi_visible ? "true" : "false", ch.security_audit_visible ? "true" : "false",
         ch.collector_thread_id,
@@ -2989,7 +3000,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)terminal_journal_metrics.precreate_commit_failures);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
                  p0_health_json, sizeof(p0_health_json), &p0_health_used,
-                 ",\"p0_offline_queue_capacity\":{\"budget_scope\":\"retained_logical\",\"physical_limit_enforced\":false,\"used_bytes\":%llu,\"retained_nonpending_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu,\"resource_deferred\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
+                 ",\"p0_offline_queue_capacity\":{\"budget_scope\":\"retained_logical\",\"physical_limit_enforced\":false,\"used_bytes\":%llu,\"retained_nonpending_bytes\":%llu,\"max_bytes\":%llu,\"utilization_bps\":%u,\"ordinary_limit_bytes\":%llu,\"critical_reserve_bytes\":%llu,\"terminal_reserve_bytes\":%llu,\"p0_source_only_reserve_bytes\":%llu,\"ordinary_rejected\":%llu,\"high_priority_rejected\":%llu,\"p0_source_only_rejected\":%llu,\"event_queue_metadata_corruption_failures\":%llu,\"retention_evicted_rows\":%llu,\"pending_rows\":%llu,\"oldest_pending_created_unix_s\":%llu,\"oldest_pending_age_s\":%llu,\"enqueue\":{\"requests\":%llu,\"reused\":%llu,\"conflicts\":%llu,\"admission_attempts\":%llu,\"admitted\":%llu,\"capacity_rejected\":%llu,\"transaction_failures\":%llu,\"commit_failures\":%llu},\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu,\"resource_deferred\":%llu,\"receipt_failures\":%llu},\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,\"accounting_available\":%u}",
                  (unsigned long long)queue_capacity_metrics.used_bytes,
                  (unsigned long long)queue_capacity_metrics.retained_nonpending_bytes,
                  (unsigned long long)queue_capacity_metrics.max_bytes,
@@ -3020,6 +3031,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)queue_capacity_metrics.delivery_requeued,
                  (unsigned long long)queue_capacity_metrics.delivery_failed,
                  (unsigned long long)queue_capacity_metrics.delivery_resource_deferred,
+                 (unsigned long long)queue_capacity_metrics.delivery_receipt_failures,
                  (unsigned long long)queue_capacity_metrics.db_bytes,
                  (unsigned long long)queue_capacity_metrics.wal_bytes,
                  (unsigned long long)queue_capacity_metrics.shm_bytes,

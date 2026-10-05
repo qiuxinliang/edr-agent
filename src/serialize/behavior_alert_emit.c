@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #include "edr/behavior_alert_emit.h"
 
 #include "edr/alert_governor.h"
@@ -234,8 +235,10 @@ static int emit_record_alert_raw(const EdrBehaviorRecord *record, const AVEBehav
     free(wire);
     return 0;
   }
+  edr_validation_trace_bind(record, batch_id, wire, wire_len);
   int ok = enqueue_durable_p0_wire(batch_id, wire, wire_len,
                                   EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);
+  edr_validation_trace_event(record, "alert_enqueue", ok ? "accepted" : "failed");
   free(wire);
   return ok;
 }
@@ -257,9 +260,13 @@ static int emit_record_alert_callback(void *context) {
     char batch_id[128];
     size_t n = 0;
     uint8_t *wire = edr_behavior_record_alloc_outbound_wire_facts(combined->record,combined->alert,combined->facts,&n);
-    int ok = n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id)) &&
-        edr_storage_queue_p0_deferred_complete(combined->deferred_key,
-            batch_id, wire, n, "queue_accepted") == EDR_OK;
+    int ok = n && edr_behavior_durable_wire_batch_id("p0", wire, n, batch_id, sizeof(batch_id));
+    if (ok) {
+      edr_validation_trace_bind(combined->record, batch_id, wire, n);
+      ok = edr_storage_queue_p0_deferred_complete(combined->deferred_key,
+          batch_id, wire, n, "queue_accepted") == EDR_OK;
+    }
+    edr_validation_trace_event(combined->record, "alert_enqueue", ok ? "accepted" : "failed");
     free(wire);
     return ok;
   }

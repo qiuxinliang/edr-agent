@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 /**
  * Windows ETW 实时采集（§3.1）
  * 需具备足够权限（通常需管理员；Security-Auditing 还需审计策略开启）。
@@ -4064,6 +4065,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
       edr_collector_registry_writeback_identity(slot, &br);
     }
   }
+  edr_validation_trace_event(&br, "collector_decoded", "identity_enriched");
   if ((slot->type == EDR_EVENT_NET_CONNECT || slot->type == EDR_EVENT_NET_LISTEN) &&
       br.exe_path[0] && !br.network_aux_path[0]) {
     edr_copy_trunc(br.network_aux_path, sizeof(br.network_aux_path), br.exe_path);
@@ -4075,6 +4077,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
     if (!network_interest->path[0] && br.cmdline[0])
       edr_copy_trunc(network_interest->path, sizeof(network_interest->path), br.cmdline);
     int interest_admitted = edr_sensor_interest_should_admit(network_interest);
+    edr_validation_trace_event(&br, "sensor_interest", interest_admitted ? "admitted" : "rejected");
     if (trace) trace->interest = interest_admitted;
     if (!interest_admitted) {
       if (!network_actor_bound) {
@@ -4271,6 +4274,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   EdrSensorInterestEvent interest_event;
   const int is_network = ty == EDR_EVENT_NET_CONNECT || ty == EDR_EVENT_NET_LISTEN;
   int have_network_interest = 0;
+  int have_interest = 0;
   char file_read_path[EDR_BR_STR_LONG];
   const char *file_read_gate_reason = NULL;
   uint64_t file_read_key = 0u;
@@ -4348,6 +4352,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   {
     if (edr_tdh_build_sensor_interest_event(event_record, ty, tag, &interest_event)) {
       have_network_interest = is_network;
+      have_interest = 1;
       if (!is_network && ty != EDR_EVENT_PROCESS_CREATE && ty != EDR_EVENT_PROCESS_TERMINATE) {
         (void)edr_collector_event_process_start_key(event_record,
                                                     &interest_event.process_start_key);
@@ -4363,6 +4368,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
                                                    timestamp_ns);
         }
         AVE_NotifyProcessExit(interest_event.pid);
+        edr_validation_trace_interest(&interest_event, (int64_t)timestamp_ns, "process_exit", "ave_notified");
       }
       if ((ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
            ty == EDR_EVENT_REG_DELETE_KEY) && !interest_event.registry_path[0]) {
@@ -4394,9 +4400,14 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         edr_agent_self_count_drop_source(EDR_AGENT_SELF_DROP_INTEREST);
         return;
       }
-      if (!is_network && !edr_sensor_interest_should_admit(&interest_event)) {
-        edr_collector_note_drop(EDR_COLLECTOR_DROP_SENSOR_INTEREST);
-        return;
+      if (!is_network) {
+        int admitted = edr_sensor_interest_should_admit(&interest_event);
+        edr_validation_trace_interest(&interest_event, (int64_t)timestamp_ns,
+                                      "sensor_interest", admitted ? "admitted" : "rejected");
+        if (!admitted) {
+          edr_collector_note_drop(EDR_COLLECTOR_DROP_SENSOR_INTEREST);
+          return;
+        }
       }
     }
   }
@@ -4501,6 +4512,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   }
 
   int published = edr_event_bus_try_push(s_bus, &slot);
+  if (have_interest) edr_validation_trace_interest(&interest_event, (int64_t)timestamp_ns,
+      "event_bus", published ? "published" : "rejected");
   if (!published) {
     s_health.queue_dropped++;
     if (ty == EDR_EVENT_FILE_READ && slot.p0_critical) {

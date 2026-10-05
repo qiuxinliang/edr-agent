@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #include "edr/local_evidence_cache.h"
 
 #include "edr/p0_rule_ir.h"
@@ -1555,6 +1556,7 @@ static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns
   MetricSlot *m = metric_slot_for(r, event_time_ns);
   if (m) m->reasons[reason]++;
   s_status.ordinary_reasons[reason]++;
+  edr_validation_trace_event(r, "local_retention", metric_names[METRIC_ORDINARY_BASE + reason]);
   uint32_t type = r ? (uint32_t)r->type : 0u;
   if (is_file_event_type(type)) {
     if (m) m->file_drops++;
@@ -1576,6 +1578,7 @@ static void record_persistence_failure(const EdrBehaviorRecord *r, int64_t ts,
   MetricSlot *m = metric_slot_for(r, ts);
   size_t index = (candidate ? METRIC_CANDIDATE_BASE : METRIC_CONTEXT_BASE) + (size_t)reason;
   if (m) m->reasons[index - METRIC_ORDINARY_BASE]++;
+  edr_validation_trace_event(r, "local_retention", metric_names[index]);
   if (candidate) s_status.candidate_failure_reasons[reason]++;
   else s_status.context_failure_reasons[reason]++;
 }
@@ -6559,6 +6562,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.hot_ring_ingested++;
       goto done;
     }
+    edr_validation_trace_event(r, "local_retention", "candidate_committed");
     if (!candidate_existing) {
       s_status.candidate_admitted++;
       promote_context_before_window(r, ts);
@@ -6582,6 +6586,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
         s_status.records_dropped++;
       } else {
         s_status.artifacts_written += context_artifacts_written;
+        edr_validation_trace_event(r, "local_retention", "context_committed");
       }
     }
   } else if (s_db && store_context) {
@@ -6597,6 +6602,7 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       goto done;
     }
     s_status.artifacts_written += context_artifacts_written;
+    edr_validation_trace_event(r, "local_retention", "context_committed");
   } else if (store_context) {
     record_persistence_failure(r, ts, 0, EDR_EVIDENCE_FAILURE_NO_DATABASE);
     s_status.records_dropped++;

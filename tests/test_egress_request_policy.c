@@ -19,6 +19,15 @@ static int check(const char *method, const char *path, const char *body) {
       body, body ? strlen(body) : 0u, reason, sizeof(reason));
 }
 int main(void) {
+  {
+    char why[96];
+    const char *health = "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"monitor\":{\"profile\":\"basic\"},\"p0_offline_queue_capacity\":{\"delivery\":{\"acked\":3,\"sent\":4}}}}";
+    char *wire = edr_egress_health_project(health, why, sizeof(why));
+    assert(wire && strstr(wire, "\"profile\":\"basic\"") && strstr(wire, "\"acked\":3"));
+    assert(check("POST", "ingest/engine-health", wire) == 0); free(wire);
+    assert(check("POST", "ingest/engine-health", "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"monitor\":{\"profile\":\"synthetic-secret\"}}}") != 0);
+  }
+
   const char *heartbeat = "{\"endpoint_id\":\"synthetic-endpoint\",\"agent_version\":\"test-v1\",\"policy_version\":\"synthetic-p1\"}";
   {
     char why[128];

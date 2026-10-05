@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #include "edr/preprocess.h"
 
 #include "edr/resource.h"
@@ -1475,8 +1476,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   if (edr_resource_preprocess_throttle_active() && slot && slot->priority != 0u &&
       slot->attack_surface_hint == 0u && p0_resource_throttle_proven_miss(&br)) {
     edr_local_evidence_cache_record_behavior(&br);
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "resource_throttle_proven_miss");
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "resource_throttle_proven_miss");
     return;
   }
   /* P0 owns its hard-invalid, registry-attribution, and
@@ -1486,14 +1486,15 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   int p0_emitted = facts ? edr_p0_rule_try_emit_with_command_facts_status(
                                &br, facts, &p0_proven_miss)
                          : edr_p0_rule_try_emit_status(&br, &p0_proven_miss);
+  edr_validation_trace_event(&br, "p0_evaluation", p0_emitted > 0 ? "emitted" :
+      p0_proven_miss ? "proven_miss" : "not_proven_miss");
   edr_correlation_evaluate(&br); /* 集成点 B：序列/合流关联（总开关默认关时为 no-op） */
   edr_net_fanout_on_event(&br);
   EdrDetectionDecision dd;
   edr_detection_decision_evaluate_after_p0(&br, &dd, p0_proven_miss);
   int pmfe_associated=edr_local_evidence_cache_pmfe_result_pending(&br);
   if (!edr_preprocess_admit_telemetry(&br, &dd) && !pmfe_associated) {
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition",
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition",
           dd.drop ? "decision_drop" : strcmp(dd.selection_action, "local_only") == 0
               ? "local_only" : "emit_filter_rejected");
     return;
@@ -1502,29 +1503,25 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
   /* P2 T9: keep local AVE and forensic consumers before the upload filter. */
   edr_ave_cross_engine_feed_from_record(&br);
   int local_forensics_dispatched = edr_command_dispatch_recommended_forensics(&br);
+  edr_validation_trace_event(&br, "local_consumers", "dispatched");
   if (!edr_local_evidence_cache_is_candidate(&br) && !pmfe_associated) {
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "not_retention_candidate");
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "not_retention_candidate");
     return;
   }
   if (!edr_preprocess_sampling_allow(&br) && !pmfe_associated) {
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "sampling_rejected");
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "sampling_rejected");
     return;
   }
   if (p0_emitted > 0) {
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "p0_already_emitted");
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "p0_already_emitted");
     return;
   }
   if (!edr_preprocess_upload_admit(&br, &dd, p0_proven_miss,
                                    local_forensics_dispatched)) {
-    if (br.type == EDR_EVENT_PROCESS_CREATE)
-      edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "baseline_upload_suppressed");
+    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "baseline_upload_suppressed");
     return;
   }
-  if (br.type == EDR_EVENT_PROCESS_CREATE)
-    edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "ordinary_emit_requested");
+  edr_p0_rule_observe_validation_stage(&br, "telemetry_disposition", "ordinary_emit_requested");
   emit_behavior_record(&br);
 }
 

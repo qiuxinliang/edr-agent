@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 /*
  * P0 直出：与 edr-backend/platform/config/p0_golden_vectors.json + dynamicrules 对拍（CI：
  * validate_p0_golden_vectors.py、go test TestP0RuleGolden_FromManifest）。改 C 端匹配时务必同步
@@ -3226,6 +3227,7 @@ static int p0_validation_target_rule(const EdrBehaviorRecord *br,
 void edr_p0_rule_observe_validation_stage(const EdrBehaviorRecord *br,
                                           const char *stage,
                                           const char *reason) {
+  edr_validation_trace_event(br, stage, reason);
   char marker[96];
   char rule_id[64];
   if (!p0_validation_target_rule(br, rule_id, sizeof(rule_id), marker, sizeof(marker))) {
@@ -3270,6 +3272,9 @@ static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
                                         const char *reason,
                                         const char *known_fp_reason,
                                         uint32_t repetition) {
+  edr_validation_trace_event(br, "p0_rule", rule_id);
+  edr_validation_trace_event(br, "p0_disposition", disposition);
+  edr_validation_trace_event(br, "p0_reason", reason);
   char marker[96];
   p0_disposition_marker(br, marker, sizeof(marker));
   if (repetition > 0u && !marker[0] &&

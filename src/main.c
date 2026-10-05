@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -680,6 +681,7 @@ static int edr_agent_run_main(const char *config) {
     fprintf(stderr, "[shutdown] telemetry worker remains active; retaining queue dependencies for process exit\n");
     return 1;
   }
+  edr_validation_trace_stop();
   edr_local_evidence_cache_close();
   edr_storage_queue_close();
   edr_agent_destroy(agent);

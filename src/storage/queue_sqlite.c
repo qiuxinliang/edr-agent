@@ -121,6 +121,7 @@ static uint64_t s_enqueue_commit_failures;
 static uint64_t s_delivery_selected;
 static uint64_t s_delivery_sent;
 static uint64_t s_delivery_acked;
+static uint64_t s_delivery_receipt_failures;
 static uint64_t s_delivery_requeued;
 static uint64_t s_delivery_failed;
 static uint64_t s_delivery_resource_deferred;
@@ -511,6 +512,7 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   out->delivery_selected = s_delivery_selected;
   out->delivery_sent = s_delivery_sent;
   out->delivery_acked = s_delivery_acked;
+  out->delivery_receipt_failures = s_delivery_receipt_failures;
   out->delivery_requeued = s_delivery_requeued;
   out->delivery_failed = s_delivery_failed;
   out->delivery_resource_deferred = s_delivery_resource_deferred;
@@ -800,6 +802,36 @@ static int terminal_owner_digest_valid(const unsigned char *value, int value_len
   return 1;
 }
 
+/* Local commit witness, never an input to admission or a substitute for a
+ * server receipt. Fixed hashes bound metadata to 1024 rows; no source bodies,
+ * paths or user facts. Call only inside the actual ACK owner's FULL transaction.
+ * Upgrades create an empty table; historical deletes are never backfilled. */
+static int delivery_receipt_record_locked(sqlite3 *db, const char *batch_id,
+                                           const uint8_t *wire, int length) {
+  char batch_sha[65], payload_sha[65]; sqlite3_stmt *st = NULL;
+  int ok = db && batch_id && wire && length > 0 && !sqlite3_get_autocommit(db) &&
+      edr_sha256_hex((const uint8_t *)batch_id, strlen(batch_id), batch_sha) == 0 &&
+      edr_sha256_hex(wire, (size_t)length, payload_sha) == 0;
+  if (ok) ok = sqlite3_prepare_v2(db,
+      "INSERT INTO delivery_receipts_v1(batch_id_sha256,payload_sha256,payload_bytes,acked_at) "
+      "VALUES(?,?,?,?) ON CONFLICT(batch_id_sha256,payload_sha256) DO NOTHING;", -1, &st, NULL) == SQLITE_OK;
+  if (ok) {
+    sqlite3_bind_text(st, 1, batch_sha, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, payload_sha, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, length); sqlite3_bind_int64(st, 4, delivery_time());
+    ok = sqlite3_step(st) == SQLITE_DONE;
+  }
+  sqlite3_finalize(st);
+  if (ok) ok = sqlite3_exec(db,
+      "DELETE FROM delivery_receipts_v1 WHERE id NOT IN "
+      "(SELECT id FROM delivery_receipts_v1 ORDER BY id DESC LIMIT 1024);", NULL, NULL, NULL) == SQLITE_OK;
+  if (!ok) {
+    s_delivery_receipt_failures++;
+    fprintf(stderr, "[queue] local_ack_receipt_commit_failed; original delivery state retained\n");
+  }
+  return ok ? 0 : -1;
+}
+
 static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_id,
                                const uint8_t *payload, int payload_len, int severity) {
   sqlite3_stmt *st = NULL;
@@ -828,7 +860,7 @@ static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_
     sqlite3_finalize(link);
     if (link_rc!=SQLITE_ROW || origin_id<0) { sqlite3_finalize(st); return -1; }
   }
-  if (is_terminal || source_only || origin_id>0) {
+  { /* Every remote ACK and its local witness share one FULL transaction. */
     /* A severity-2 source record clears its matching capability latch only
      * with this central 2xx ACK DELETE. This is the same FULL crash boundary
      * used for terminal journal acknowledgements. */
@@ -850,6 +882,11 @@ static int delete_selected_row(sqlite3 *db, sqlite3_int64 id, const char *batch_
   int changed = sqlite3_changes(db);
   sqlite3_finalize(st);
   if (rc == SQLITE_DONE && changed == 1) {
+    if (delivery_receipt_record_locked(db, batch_id, payload, payload_len) != 0) {
+      if (source_only) (void)queue_p0_latch_end_durable_locked(0);
+      else (void)terminal_journal_end_durable_locked(0);
+      return -1;
+    }
     /* A terminal journal frame and its ordinary-queue copy share the stable
      * batch id.  Delete, acknowledgement flags and the final completed CASE
      * are one FULL transaction, so no crash can strand a ready dual-acked row
@@ -2659,6 +2696,12 @@ EdrError edr_storage_queue_open(const char *path) {
       "last_error TEXT NOT NULL DEFAULT '',"
       "source_latch_owner INTEGER NOT NULL DEFAULT 2 CHECK(source_latch_owner IN (2,3))"
       ");"
+      "CREATE TABLE IF NOT EXISTS delivery_receipts_v1 ("
+      "id INTEGER PRIMARY KEY,"
+      "batch_id_sha256 TEXT NOT NULL CHECK(length(batch_id_sha256)=64),"
+      "payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),"
+      "payload_bytes INTEGER NOT NULL CHECK(payload_bytes>0),"
+      "acked_at INTEGER NOT NULL,UNIQUE(batch_id_sha256,payload_sha256));"
       "CREATE TABLE IF NOT EXISTS p0_deferred_match ("
       "key_sha256 TEXT PRIMARY KEY NOT NULL CHECK(length(key_sha256)=64),"
       "family_mask INTEGER NOT NULL CHECK(family_mask>0 AND family_mask<=15),"
@@ -4416,7 +4459,7 @@ static int terminal_journal_remove_ordinary_copy_locked(sqlite3 *db,sqlite3_int6
   int rc=sqlite3_step(st); sqlite3_finalize(st); return rc==SQLITE_DONE?0:-1;
 }
 
-static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, const char *key,
+static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, const char *key, const char *batch_id,
                                               const uint8_t *wire, int wire_len) {
   sqlite3_stmt *st = NULL;
   int acknowledged = 0;
@@ -4436,6 +4479,7 @@ static int terminal_journal_ack_intent_locked(sqlite3 *db, sqlite3_int64 id, con
   }
   if (acknowledged && terminal_journal_remove_ordinary_copy_locked(db,id,key,"intent",wire,wire_len)!=0)
     acknowledged=0;
+  if (acknowledged && delivery_receipt_record_locked(db,batch_id,wire,wire_len)!=0) acknowledged=0;
   if (acknowledged && terminal_journal_finish_ready_locked(db)!=0) acknowledged=0;
   if (!acknowledged) (void)terminal_journal_end_durable_locked(0);
   else acknowledged=terminal_journal_end_durable_locked(1)==0;
@@ -4534,7 +4578,7 @@ static int terminal_journal_quarantine_metadata_locked(sqlite3 *db,
   return quarantined;
 }
 
-static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, const char *key,
+static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, const char *key, const char *batch_id,
                                              int source_frame, const uint8_t *wire, int wire_len) {
   sqlite3_stmt *st = NULL;
   const char *sql = source_frame
@@ -4567,6 +4611,7 @@ static int terminal_journal_ack_frame_locked(sqlite3 *db, sqlite3_int64 id, cons
   }
   if (acknowledged && terminal_journal_remove_ordinary_copy_locked(db,id,key,
       source_frame?"source":"combined",wire,wire_len)!=0) acknowledged=0;
+  if (acknowledged && delivery_receipt_record_locked(db,batch_id,wire,wire_len)!=0) acknowledged=0;
   if (acknowledged && terminal_journal_finish_ready_locked(db)!=0) acknowledged=0;
   if (!acknowledged) (void)terminal_journal_end_durable_locked(0);
   else acknowledged=terminal_journal_end_durable_locked(1)==0;
@@ -4863,8 +4908,8 @@ static int drain_one_terminal_journal_frame(void) {
     queue_state_lock();
     if (s_db == selected_db && s_db_generation == selected_generation) {
       acknowledged = frame_kind == 0
-                         ? terminal_journal_ack_intent_locked(s_db, id, key, wire, wire_len)
-                         : terminal_journal_ack_frame_locked(s_db, id, key, frame_kind == 1,
+                         ? terminal_journal_ack_intent_locked(s_db, id, key, batch_id, wire, wire_len)
+                         : terminal_journal_ack_frame_locked(s_db, id, key, batch_id, frame_kind == 1,
                                                              wire, wire_len);
     }
     queue_state_unlock();

@@ -12,7 +12,7 @@
 #include <zstd.h>
 #endif
 
-typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON } HealthType;
+typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON, H_PROFILE } HealthType;
 typedef struct { const char *path; HealthType type; } HealthField;
 #define N(p) {"engine_health." p, H_NUMBER}
 #define B(p) {"engine_health." p, H_BOOL}
@@ -27,6 +27,7 @@ static const HealthField health_fields[] = {
   B("config_recovery.active"), B("config_recovery.safe_mode"),
   B("config_recovery.last_good_used"), B("config_recovery.auto_repaired"),
   N("config_recovery.fields_extracted"), S("config_recovery.mode"), R("config_recovery.reason"),
+  {"engine_health.monitor.profile", H_PROFILE},
   B("monitor.enabled"), N("monitor.interval_s"), N("monitor.expires_at_unix_ms"),
   B("communication.http_fallback"), N("communication.http_ok"), N("communication.http_fail"),
   N("communication.offline_queue_pending"), N("communication.last_success_unix_ms"),
@@ -109,6 +110,7 @@ static const HealthField health_fields[] = {
   N("p0_offline_queue_capacity.enqueue.capacity_rejected"),
   N("p0_offline_queue_capacity.enqueue.transaction_failures"),
   N("p0_offline_queue_capacity.enqueue.commit_failures"),
+  N("p0_offline_queue_capacity.delivery.receipt_failures"),
   N("p0_offline_queue_capacity.delivery.selected"), N("p0_offline_queue_capacity.delivery.sent"),
   N("p0_offline_queue_capacity.delivery.acked"), N("p0_offline_queue_capacity.delivery.requeued"),
   N("p0_offline_queue_capacity.delivery.failed"), N("p0_offline_queue_capacity.delivery.resource_deferred"),
@@ -261,6 +263,8 @@ static int valid_value(const cJSON *v, HealthType type) {
     "degraded", "disabled", "unavailable", "idle", "unknown", "unsupported", "not_configured",
     "configured", "ready", "pending", "connected", "connected_pending_hello", "disconnected",
     "connecting_h2", "h2_failed", "h2_unavailable", "h2_unavailable_no_http1_fallback", "ok"};
+  if (type == H_PROFILE) return cJSON_IsString(v) && v->valuestring &&
+      (!strcmp(v->valuestring, "basic") || !strcmp(v->valuestring, "diagnostic"));
   if (type == H_BOOL) return cJSON_IsBool(v);
   if (type == H_NUMBER) return cJSON_IsNumber(v) && isfinite(v->valuedouble) &&
       v->valuedouble >= 0 && v->valuedouble < 9007199254740992.0 && floor(v->valuedouble) == v->valuedouble;

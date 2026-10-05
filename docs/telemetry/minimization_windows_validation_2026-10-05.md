@@ -1237,3 +1237,80 @@ Private receipt identities for reproducibility:
 | `health-config-receipt.json` | `b145797ff524582b3ad733b83df7e81345a19c7203bcd214efd66f4149ec6502` |
 | `log-owner-v2-receipt.json` | `f670e81b52400ba6700c7cfc7c9395d530ee781ccff349fc7d115ded76bdfe6f` |
 | `generation-precision-receipt.json` | `8ae5d3e2870c1d47507f8d2008004ceb64dd68c8b0045fa41e48959b52b694ea` |
+
+## Follow-up implementation: bounded observation and ACK witnesses
+
+Baseline: clean nested `codex/release-workflow-convergence` at `2b0e52fd`;
+product baseline `3e5ddeb8` / candidate 601. Existing outer frontend changes,
+Agent pointer and signing directory are excluded from this implementation.
+
+The preceding investigation established two product observability defects and
+one experiment attribution defect, not proof that all missing ordinary events
+were lost. This change preserves detection/admission decisions:
+
+- `queue_sqlite.c`: every actual accepted delivery now commits a hash-only
+  `delivery_receipts_v1` witness in the same FULL transaction as ordinary row
+  deletion or independent terminal-journal acknowledgement. Batch-ID SHA256,
+  immutable wire SHA256, byte count and local ACK time are the only facts.
+  At most 1024 witnesses remain. Eviction or absence is UNKNOWN, never a NACK
+  or an ACK. Reopen of an old database adds an empty table and never backfills
+  historical deliveries or rewrites existing payloads. Local persistence or
+  commit failure rolls back queue/journal acknowledgement for retry. The table
+  is not read by detection, sending or server acknowledgement validation.
+- `agent.c` / `egress_request_policy.c`: basic health exposes the existing
+  selected/sent/acked/requeued/failed/resource-deferred counters and receipt
+  write failures. Both basic and diagnostic profiles admit the explicit
+  `monitor.profile` enum. No source event is relabelled health.
+- `validation_trace.c`: a disabled-by-default local observer records actual
+  collector interest, preprocessing rule/disposition and evidence-retention
+  boundaries. Only an explicit executable basename and its direct children
+  enter scope; subsequent matching requires a non-conflicting process
+  generation. Unresolved generation stays unresolved. Combined alert encoding
+  binds source event to immutable batch/wire hashes; the HTTP owner can then
+  capture that batch's actual JSON/protobuf request body (not headers).
+  These observations neither emit an alert nor acknowledge a batch.
+
+The temporary observer's current consumer is the controlled Windows action
+experiment. Administrators opt in with `EDR_VALIDATION_TRACE_PATH` (new file in
+an owned protected directory) and `EDR_VALIDATION_TRACE_IMAGE` (exact basename).
+The task launcher refreshes just these two values from machine environment,
+including clearing stale inherited values. The operator removes them after
+launch. One session is limited to 300 seconds, 8 MiB including body hex, 128
+process generations and 128 batch IDs. No overwrite, rotation or upload exists.
+Metadata excludes command lines/user names; captured scoped alert bodies stay
+private. Main-loop flush owns disk I/O; producers never wait for it and record
+observation loss instead. The consumer must account for an incomplete/truncated
+session and dropped observations, and never infer an absent event from them.
+After this investigation the opt-in is removed; default production operation
+allocates no trace buffer and opens no trace file. This is a temporary diagnostic
+facility, not a new telemetry purpose or policy exception.
+
+Validation before candidate publication:
+
+- FAIL-before/PASS-after: exact durable ACK witness test, including write fault
+  preserving original row; health projection preserves profile and ACK count.
+- PASS: reopen/old-schema empty addition, transaction commit rollback, bounded
+  1024-witness eviction, foreign batch/mutated wire rejection, lost/missing
+  remote receipt, independent intent/source/combined journal ACK witnesses.
+- PASS: trace scope rejects PID reuse/conflicting key/unrelated actor; preserves
+  same generation/direct child; captures exact scoped JSON/protobuf bytes;
+  rejects overwrite/invalid scope, enforces TTL/generation/byte bounds, reports
+  drops, redacts invalid diagnostic tokens. POSIX output is mode 0600.
+- PASS: host 45 selected runtime/minimization contracts; separate loopback mTLS
+  real-request/receiver/ACK matrix (22.43 s). The first mTLS attempt could not
+  bind a loopback port in the sandbox; authorized rerun passed with ordinary
+  TLS verification. That environmental failure is not counted as a pass.
+- PASS: MinGW builds the trace contract with warnings as errors; host Agent
+  builds; release checkpoint 40 tests, workflow 15 tests, USB bundle checks and
+  AVE chain invariant check. Native Windows gates and deployment acceptance
+  are pending at this checkpoint.
+- NOT EXECUTED: full old MinGW build directory regeneration fails because its
+  nonproduction dependency configuration lacks required OpenSSL gate targets.
+  It is not a release build and does not replace native AMD64/ARM64 gates.
+
+The trace can prove observed per-event edges, not recover the missing 601
+historical trace. A validated HTTP response proves durable ingest admission;
+backend asynchronous rule/alert completion is a separate join. Witness table
+creation is additive local observation, not permission to migrate real retained
+source-only or legacy mixed batches. Existing payloads/identities and gates
+remain subject to the prior compatibility boundary.

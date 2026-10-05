@@ -767,6 +767,8 @@ static void test_terminal_journal_durable_commits_and_exact_replay(void) {
   (void)remove(path);
 }
 
+static int ack_receipt_count(const char *, const char *, const uint8_t *, size_t);
+
 static void test_terminal_journal_recovery_and_independent_acks(void) {
   char path[256];
   uint8_t intent[20], source[20], combined[20];
@@ -790,6 +792,7 @@ static void test_terminal_journal_recovery_and_independent_acks(void) {
              "crash", "event-crash", "R-TERMINAL", "generation-crash", "intent-crash", intent,
              sizeof(intent)) == EDR_ENFORCEMENT_TERMINAL_PRECREATE_EXISTING);
   assert(terminal_journal_state_is(path, "crash", "outcome_unknown"));
+  assert(ack_receipt_count(path, "intent-crash", intent, sizeof(intent)) == 1);
 
   assert(edr_storage_queue_enforcement_terminal_precreate(
              "final", "event-final", "R-TERMINAL", "generation-final", "intent-final", intent,
@@ -807,6 +810,8 @@ static void test_terminal_journal_recovery_and_independent_acks(void) {
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0x72u) == 1u && send_calls_for(0x73u) == 1u);
   assert(terminal_journal_state_is(path, "final", "completed"));
+  assert(ack_receipt_count(path, "source-final", source, sizeof(source)) == 1);
+  assert(ack_receipt_count(path, "combined-final", combined, sizeof(combined)) == 1);
 
   assert(edr_storage_queue_enforcement_terminal_precreate(
              "both-failed", "event-both", "R-TERMINAL", "generation-both", "intent-both", intent,
@@ -822,6 +827,8 @@ static void test_terminal_journal_recovery_and_independent_acks(void) {
   edr_storage_queue_poll_drain();
   assert(send_calls_for(0x72u) == 1u && send_calls_for(0x73u) == 1u);
   assert(terminal_journal_state_is(path, "both-failed", "completed"));
+  assert(ack_receipt_count(path, "source-both", source, sizeof(source)) == 1);
+  assert(ack_receipt_count(path, "combined-both", combined, sizeof(combined)) == 1);
   edr_storage_queue_close();
   (void)remove(path);
 }
@@ -2523,11 +2530,13 @@ static void test_queue_requires_bound_receipt_after_lost_response(void) {
   edr_storage_queue_test_set_delivery_time(now);
   edr_storage_queue_poll_drain();
   assert(status_count(path, "pending") == 1);
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
   edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
   reset_send_state(1); s_receipt_body = "{}"; /* HTTP success without a receipt */
   edr_storage_queue_test_set_delivery_time(now + 301);
   edr_storage_queue_poll_drain();
   assert(status_count(path, "pending") == 1);
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
   edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
   snprintf(receipt, sizeof(receipt),
            "{\"code\":\"OK\",\"data\":{\"accepted\":true,\"ack\":{\"version\":1,\"state\":\"durable\","
@@ -2536,6 +2545,7 @@ static void test_queue_requires_bound_receipt_after_lost_response(void) {
   edr_storage_queue_test_set_delivery_time(now + 602);
   edr_storage_queue_poll_drain();
   assert(status_count(path, "pending") == 0);
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 1);
   edr_storage_queue_close(); edr_storage_queue_test_set_delivery_time(-1);
   s_receipt_body = NULL; remove(path);
 }
@@ -3352,6 +3362,67 @@ static void test_terminal_policy_hold_does_not_block_combined_alert(void) {
   edr_storage_queue_close(); remove(path); s_policy_reject_value = -1;
 }
 
+static int ack_receipt_count(const char *path, const char *batch, const uint8_t *wire, size_t length) {
+  sqlite3 *db = NULL; sqlite3_stmt *st = NULL; char batch_sha[65], payload_sha[65];
+  assert(edr_sha256_hex((const uint8_t *)batch, strlen(batch), batch_sha) == 0);
+  assert(edr_sha256_hex(wire, length, payload_sha) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM delivery_receipts_v1 WHERE batch_id_sha256=? AND payload_sha256=? AND payload_bytes=?", -1, &st, NULL) == SQLITE_OK);
+  sqlite3_bind_text(st, 1, batch_sha, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, payload_sha, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, (sqlite3_int64)length);
+  assert(sqlite3_step(st) == SQLITE_ROW); int n = sqlite3_column_int(st, 0);
+  sqlite3_finalize(st); sqlite3_close(db); return n;
+}
+
+static void test_exact_ack_receipt_atomic_recovery(void) {
+  char path[256]; uint8_t wire[20];
+  snprintf(path, sizeof(path), "edr-receipt-%ld.db", (long)TEST_PID); remove(path); make_wire(wire, 0x51u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(edr_storage_queue_enqueue("receipt-batch", wire, sizeof(wire), 0, 0) == EDR_OK);
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
+  /* Supported upgrade: old queue rows survive addition of an empty witness
+   * table; no earlier row or local source-only retention becomes an ACK. */
+  edr_storage_queue_close(); sqlite_exec_path(path, "DROP TABLE delivery_receipts_v1;");
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(queue_batch_pending(path, "receipt-batch"));
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
+  /* An actual validated transport success cannot delete its row if the local
+   * witness cannot commit. This is a local fault, not a fabricated remote NACK. */
+  sqlite_exec_path(path, "CREATE TRIGGER receipt_fail BEFORE INSERT ON delivery_receipts_v1 BEGIN SELECT RAISE(ABORT,'synthetic receipt failure'); END;");
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(queue_batch_pending(path, "receipt-batch"));
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
+  sqlite_exec_path(path, "DROP TRIGGER receipt_fail;");
+  /* Failed FULL commit cannot leave a witness ahead of its queue deletion. */
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  edr_storage_queue_test_fail_next_terminal_commits(1u);
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(queue_batch_pending(path, "receipt-batch"));
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
+  /* Fill only synthetic metadata to exercise the exact bounded-retention edge. */
+  sqlite_exec_path(path, "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1024) "
+      "INSERT INTO delivery_receipts_v1(batch_id_sha256,payload_sha256,payload_bytes,acked_at) "
+      "SELECT printf('%064d',x),printf('%064d',x),1,1 FROM n;");
+
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  reset_send_state(1); edr_storage_queue_poll_drain();
+  assert(!queue_batch_pending(path, "receipt-batch"));
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 1);
+  edr_storage_queue_close(); assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 1);
+  assert(ack_receipt_count(path, "foreign-batch", wire, sizeof(wire)) == 0);
+  { sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db, "SELECT count(*) FROM delivery_receipts_v1", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1024);
+    sqlite3_finalize(st); sqlite3_close(db);
+  }
+
+  wire[19] ^= 1u; assert(ack_receipt_count(path, "receipt-batch", wire, sizeof(wire)) == 0);
+  edr_storage_queue_close(); remove(path);
+}
+
 int main(void) {
   char path[256];
   char old_path[256];
@@ -3361,6 +3432,7 @@ int main(void) {
   (void)remove(path);
   assert(test_setenv("EDR_QUEUE_DRAIN_INTERVAL_MS", "200") == 0);
   assert(test_setenv("EDR_QUEUE_MAX_RETRIES", "1") == 0);
+  test_exact_ack_receipt_atomic_recovery();
   test_missing_source_meta_preserves_owner_recovery();
   test_terminal_policy_hold_does_not_block_combined_alert();
   assert(edr_storage_queue_open(path) == EDR_OK);

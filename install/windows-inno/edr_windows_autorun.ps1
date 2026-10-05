@@ -381,6 +381,12 @@ namespace FDSecurity {
       [Environment]::SetEnvironmentVariable(`$envName, `$machineValue, "Process")
     }
   }
+  # Optional local observation only; clear stale inherited values when the
+  # administrator removes the machine-scoped, bounded validation session.
+  foreach (`$traceEnv in @("EDR_VALIDATION_TRACE_PATH", "EDR_VALIDATION_TRACE_IMAGE")) {
+    [Environment]::SetEnvironmentVariable(`$traceEnv,
+      [Environment]::GetEnvironmentVariable(`$traceEnv, "Machine"), "Process")
+  }
   `$agentArgs = "--config " + (Quote-FDNativeArg `$cfg)
   Write-FDTaskLog ("args=`$agentArgs")
   `$p = Start-Process -FilePath `$exe -ArgumentList `$agentArgs -WorkingDirectory `$wd -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath -PassThru -ErrorAction Stop

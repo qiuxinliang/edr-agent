@@ -279,6 +279,7 @@ typedef struct {
   uint64_t delivery_selected;
   uint64_t delivery_sent;
   uint64_t delivery_acked;
+  uint64_t delivery_receipt_failures;
   uint64_t delivery_requeued;
   uint64_t delivery_failed;
   uint64_t delivery_resource_deferred;

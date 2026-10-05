@@ -1,3 +1,4 @@
+#include "edr/validation_trace.h"
 #include "edr/report_events_ack.h"
 #include "edr/health_upload.h"
 #include "edr/time_util.h"
@@ -5536,6 +5537,7 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       runtime_state_lock();
       s_report_events_post_attempt_body_bytes += (uint64_t)env_len;
       runtime_state_unlock();
+      edr_validation_trace_request(batch_id, env, env_len, "application/x-protobuf");
       v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
                                (const char *)env, env_len, receipt, sizeof(receipt));
       free(env);
@@ -5612,6 +5614,7 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   runtime_state_lock();
   s_report_events_post_attempt_body_bytes += (uint64_t)body_len;
   runtime_state_unlock();
+  edr_validation_trace_request(batch_id, body, body_len, "application/json");
   int rc = request_to_suffix("POST", "ingest/report-events", "application/json",
                              body, body_len, receipt, sizeof(receipt));
   free(body);

@@ -435,7 +435,7 @@ if(WIN32)
     target_compile_options(test_collector_file_read_windows PRIVATE -ffunction-sections -fdata-sections)
     target_link_options(test_collector_file_read_windows PRIVATE -Wl,--gc-sections)
   endif()
-  target_link_libraries(test_collector_file_read_windows PRIVATE tdh advapi32 wevtapi)
+  target_link_libraries(test_collector_file_read_windows PRIVATE edr_validation_trace tdh advapi32 wevtapi)
   edr_apply_test_warnings(test_collector_file_read_windows)
   add_test(NAME collector_file_read_windows COMMAND test_collector_file_read_windows)
 
@@ -469,7 +469,7 @@ if(WIN32)
     target_compile_options(test_etw_network_decode_windows PRIVATE -ffunction-sections -fdata-sections)
     target_link_options(test_etw_network_decode_windows PRIVATE -Wl,--gc-sections)
   endif()
-  target_link_libraries(test_etw_network_decode_windows PRIVATE tdh advapi32 wevtapi)
+  target_link_libraries(test_etw_network_decode_windows PRIVATE edr_validation_trace tdh advapi32 wevtapi)
   if(EDR_PCRE2_TARGET)
     target_link_libraries(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_TARGET})
   else()
@@ -787,7 +787,7 @@ set(_edr_test_behavior_emit_sources
   ${CMAKE_CURRENT_SOURCE_DIR}/stub_preprocess_agent_ids.c
 )
 add_library(edr_ave_test_common INTERFACE)
-target_link_libraries(edr_ave_test_common INTERFACE edr_egress_policy)
+target_link_libraries(edr_ave_test_common INTERFACE edr_egress_policy edr_validation_trace)
 target_include_directories(edr_ave_test_common INTERFACE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/src/ave
@@ -1160,7 +1160,7 @@ target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT
 target_sources(test_p0_direct_emit_suppression PRIVATE
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
-target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads edr_egress_policy)
+target_link_libraries(test_p0_direct_emit_suppression PRIVATE Threads::Threads edr_egress_policy edr_validation_trace)
 edr_apply_test_warnings(test_p0_direct_emit_suppression)
 add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(p0_direct_emit_suppression PROPERTIES TIMEOUT 120)
@@ -1252,7 +1252,7 @@ if(NOT MSVC)
   target_link_libraries(test_local_evidence_cache_candidate PRIVATE m)
 endif()
 target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_NANOPB=1)
-target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_policy)
+target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_policy edr_validation_trace)
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -1750,6 +1750,12 @@ edr_apply_test_warnings(test_report_events_ack)
 add_test(NAME report_events_ack_contract COMMAND test_report_events_ack
   ${CMAKE_SOURCE_DIR}/tests/testdata/report_events_ack_v1.json)
 
+add_executable(test_validation_trace test_validation_trace.c)
+target_link_libraries(test_validation_trace PRIVATE edr_validation_trace)
+edr_apply_test_warnings(test_validation_trace)
+add_test(NAME validation_trace_contract COMMAND test_validation_trace)
+set_tests_properties(validation_trace_contract PROPERTIES TIMEOUT 20)
+
 include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
 if(WIN32)
   include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
@@ -1795,3 +1801,5 @@ edr_minimization_test(report_events_ack_contract test_report_events_ack)
 edr_minimization_test(health_upload test_health_upload)
 edr_minimization_test(behavior_record_alert_proto_contract test_behavior_record_alert_proto)
 edr_minimization_test(behavior_record_alert_emit_contract test_behavior_record_alert_emit)
+
+edr_minimization_test(validation_trace_contract test_validation_trace)
