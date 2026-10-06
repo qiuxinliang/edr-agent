@@ -151,6 +151,10 @@ static EdrStorageQueueRecoveryRequest checked(const char *path,EdrStorageQueueRe
   return request;
 }
 static void terminal_hold_and_independent_retry(void) {
+  const int64_t retry_time = 1999999999;
+  /* Pin retry eligibility across FULL commits and reopen; wall-clock seconds
+   * can advance while the intent is supposed to remain in independent backoff. */
+  edr_storage_queue_test_set_delivery_time(retry_time);
   char path[512]; test_path(path,sizeof(path),"real-terminal",0);
   EdrTestP0TerminalFixture f;
   assert(edr_test_p0_terminal_fixture_init(&f,1,"synthetic-tenant","synthetic-endpoint"));
@@ -191,6 +195,8 @@ static void terminal_hold_and_independent_retry(void) {
   receipt_mode=2; sends=0; edr_storage_queue_poll_drain();
   assert(sends==1 && !strcmp(sent_id,"p0-intent")); /* Wrong actual-parser ACK cannot release intent. */
   assert(sql_number(path,"SELECT intent_acked FROM enforcement_terminal_journal;")==0);
+  assert(sql_number(path,"SELECT intent_next_retry_at FROM enforcement_terminal_journal;")==
+         (uint64_t)(retry_time+1));
   /* Intent's independent backoff permits combined-first confirmation. */
   edr_storage_queue_close(); assert(edr_storage_queue_open(path)==EDR_OK);
   receipt_mode=1; sends=0; edr_storage_queue_poll_drain();
@@ -203,7 +209,7 @@ static void terminal_hold_and_independent_retry(void) {
   edr_storage_queue_enforcement_terminal_get_metrics(&metrics);
   assert(metrics.policy_held_frames==1 && metrics.pending==1 && metrics.local_retained==0);
   edr_storage_queue_close(); assert(edr_storage_queue_open(path)==EDR_OK);
-  edr_storage_queue_test_set_delivery_time(2000000000); sends=0; edr_storage_queue_poll_drain();
+  edr_storage_queue_test_set_delivery_time(retry_time+1); sends=0; edr_storage_queue_poll_drain();
   assert(sends==1 && !strcmp(sent_id,"p0-intent"));
   assert(sql_number(path,"SELECT intent_acked FROM enforcement_terminal_journal;")==1);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE batch_id='p0-intent';")==0);
