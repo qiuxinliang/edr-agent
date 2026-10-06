@@ -236,6 +236,7 @@ class Receiver(http.server.ThreadingHTTPServer):
         self.database = database
         self.observations = []
         self.errors = []
+        self.config_receipts = []
         self.lock = threading.Lock()
         with closing(sqlite3.connect(database)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -323,6 +324,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/api/v1/ingest/heartbeat":
                 if set(body) != {"endpoint_id", "agent_version", "policy_version"}:
                     raise ValueError("heartbeat raw field reached receiver")
+                self.reply({"code": "OK"})
+            elif self.path == "/api/v1/ingest/config-status":
+                fields = {"tenant_id", "endpoint_id", "agent_version", "policy_version",
+                          "config_hash", "config_sequence", "config_nonce", "config_signature",
+                          "signing_key_id", "verified", "reject_reason", "desired_version",
+                          "desired_hash", "apply_status", "restart_required", "payload"}
+                contract = self.headers.get("X-EDR-Suppression-Contract")
+                if set(body) != fields or body["tenant_id"] != "synthetic-tenant" or \
+                        body["endpoint_id"] != "synthetic-endpoint" or contract != "2" or \
+                        body["payload"] != {"source": "agent-runtime-policy", "verified": body["verified"]} or \
+                        b"synthetic-secret" in wire:
+                    raise ValueError("invalid config receipt reached receiver")
+                with self.server.lock:
+                    self.server.config_receipts.append({"status": body["apply_status"],
+                                                       "verified": body["verified"],
+                                                       "reason": body["reject_reason"],
+                                                       "contract": contract})
                 self.reply({"code": "OK"})
             elif self.path in ("/api/v1/ingest/engine-health", "/api/v1/ingest/engine-health/delta"):
                 if b"synthetic-secret" in wire or b"raw_event" in wire:
@@ -513,6 +531,13 @@ def main():
                         reports[-1]["business_alerts"] = db.execute("SELECT COALESCE(SUM(alert_created),0) FROM p0_association").fetchone()[0]
                         if reports[-1]["business_alerts"] != 1:
                             reports[-1]["receiver_business_failures"] += 1
+                if mode in ("positive", "positive-ip", "positive-v2"):
+                    reports[-1]["config_receipts"] = server.config_receipts
+                    expected = [{"status": "applied", "verified": True, "reason": "", "contract": "2"},
+                                {"status": "failed", "verified": False,
+                                 "reason": "config_validation_failed", "contract": "2"}]
+                    if server.config_receipts != expected:
+                        reports[-1]["receiver_business_failures"] += 1
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])

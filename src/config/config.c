@@ -3082,7 +3082,7 @@ void edr_config_fingerprint(const char *path, char *out_hex, size_t cap) {
  * memory. All other values (including secrets and trust settings) are retained
  * from the parsed local source, never copied from environment-derived state. */
 typedef enum { POLICY_BOOL, POLICY_STRING, POLICY_INT, POLICY_U32, POLICY_U64,
-               POLICY_MODE, POLICY_PORTS } PolicyValueKind;
+               POLICY_MODE, POLICY_PORTS, POLICY_SUPPRESSION } PolicyValueKind;
 typedef struct { const char *section, *key; size_t offset; PolicyValueKind kind; } PolicyField;
 #define POLICY_FIELD(section, key, member, kind) {section, key, offsetof(EdrConfig, member), POLICY_##kind}
 static const PolicyField policy_fields[] = {
@@ -3090,6 +3090,19 @@ static const PolicyField policy_fields[] = {
   POLICY_FIELD("applied_remote_policy", "hash", applied_remote_policy.hash, STRING),
   POLICY_FIELD("applied_remote_policy", "sequence", applied_remote_policy.sequence, U64),
   POLICY_FIELD("preprocessing", "rules_version", preprocessing.rules_version, STRING),
+  POLICY_FIELD("detection_policy", "source", detection_policy.source, STRING),
+  POLICY_FIELD("detection_policy", "audit_id", detection_policy.audit_id, STRING),
+  POLICY_FIELD("detection_policy", "policy_version", detection_policy.policy_version, STRING),
+  POLICY_FIELD("detection_policy", "rollback_version", detection_policy.rollback_version, STRING),
+  POLICY_FIELD("detection_policy", "fp_policy_version", detection_policy.fp_policy_version, STRING),
+  POLICY_FIELD("detection_policy", "fp_rollback_version", detection_policy.fp_rollback_version, STRING),
+  POLICY_FIELD("detection_policy", "rmm_policy_version", detection_policy.rmm_policy_version, STRING),
+  POLICY_FIELD("detection_policy", "rmm_rollback_version", detection_policy.rmm_rollback_version, STRING),
+  POLICY_FIELD("detection_policy", "allow_paths", detection_policy.allow_paths, STRING),
+  POLICY_FIELD("detection_policy", "script_dirs", detection_policy.script_dirs, STRING),
+  POLICY_FIELD("detection_policy", "management_tools", detection_policy.management_tools, STRING),
+  POLICY_FIELD("detection_policy", "fp_feedback", detection_policy.fp_feedback, STRING),
+  POLICY_FIELD("detection_policy", "suppression", detection_policy.suppression_rules, SUPPRESSION),
   POLICY_FIELD("collection", "etw_enabled", collection.etw_enabled, BOOL),
   POLICY_FIELD("collection", "etw_dns_client_provider", collection.etw_dns_client_provider, BOOL),
   POLICY_FIELD("collection", "etw_powershell_provider", collection.etw_powershell_provider, BOOL),
@@ -3252,7 +3265,75 @@ static const PolicyField *policy_field(const char *section, const char *key) {
   return NULL;
 }
 
-static void policy_value(FILE *out, const PolicyField *field, const EdrConfig *cfg) {
+static int policy_suppression_string(FILE *out, const char *start, size_t len, size_t cap) {
+  char value[256];
+  if (len >= cap || len >= sizeof(value)) return -1;
+  for (size_t i = 0; i < len; ++i)
+    if ((unsigned char)start[i] < 0x20u) return -1;
+  memcpy(value, start, len); value[len] = 0;
+  policy_string(out, value);
+  return 0;
+}
+
+/* Inverse of load_detection_policy_suppression: reject incomplete compact
+ * rules before they can replace the durable authority file. */
+static int policy_suppression(FILE *out, const EdrConfig *cfg) {
+  const char *start = cfg->detection_policy.suppression_rules;
+  const char *end = memchr(start, 0, sizeof(cfg->detection_policy.suppression_rules));
+  const char *names[] = {"target_rule_id", "process_name", "action", "reason", "contains_all", "contains_none"};
+  const size_t caps[] = {96u, 128u, 32u, 96u};
+  int written = 0;
+  if (!end) return -1;
+  fputc('[', out);
+  while (start < end) {
+    const char *row_end = memchr(start, '\x1e', (size_t)(end - start));
+    const char *fields[6], *ends[6];
+    size_t count = 0;
+    const char *p = start;
+    if (!row_end) row_end = end;
+    if (row_end == start) return -1;
+    do {
+      const char *sep = memchr(p, '\x1f', (size_t)(row_end - p));
+      if (count == 6u) return -1;
+      fields[count] = p; ends[count++] = sep ? sep : row_end;
+      if (!sep) break;
+      p = sep + 1;
+    } while (p <= row_end);
+    if (count != 5u && count != 6u) return -1;
+    size_t action_len = (size_t)(ends[2] - fields[2]);
+    if (!((action_len == 9u && !memcmp(fields[2], "downgrade", 9u)) ||
+          (action_len == 4u && !memcmp(fields[2], "drop", 4u)))) return -1;
+    if (written++) fputs(", ", out);
+    fputc('{', out);
+    for (size_t i = 0; i < count; ++i) {
+      if (i) fputs(", ", out);
+      fprintf(out, "%s = ", names[i]);
+      if (i < 4u) {
+        if (policy_suppression_string(out, fields[i], (size_t)(ends[i] - fields[i]), caps[i])) return -1;
+      } else {
+        int tokens = 0;
+        p = fields[i];
+        fputc('[', out);
+        while (p < ends[i]) {
+          const char *sep = memchr(p, '\x1d', (size_t)(ends[i] - p));
+          const char *token_end = sep ? sep : ends[i];
+          if (token_end == p || (sep && sep + 1 == ends[i])) return -1;
+          if (tokens++) fputs(", ", out);
+          if (policy_suppression_string(out, p, (size_t)(token_end - p), 256u)) return -1;
+          p = sep ? sep + 1 : ends[i];
+        }
+        fputc(']', out);
+      }
+    }
+    fputc('}', out);
+    if (row_end != end && row_end + 1 == end) return -1;
+    start = row_end == end ? end : row_end + 1;
+  }
+  fputc(']', out);
+  return ferror(out) ? -1 : 0;
+}
+
+static int policy_value(FILE *out, const PolicyField *field, const EdrConfig *cfg) {
   const void *value = (const char *)cfg + field->offset;
   static const char *modes[] = {"off", "observe", "alert", "block"};
   size_t i;
@@ -3275,7 +3356,9 @@ static void policy_value(FILE *out, const PolicyField *field, const EdrConfig *c
       }
       fputc(']', out);
       break;
+    case POLICY_SUPPRESSION: return policy_suppression(out, cfg);
   }
+  return ferror(out) ? -1 : 0;
 }
 
 static int policy_table(FILE *, toml_table_t *, const char *, const EdrConfig *, unsigned, int);
@@ -3310,7 +3393,9 @@ static int policy_table(FILE *out, toml_table_t *table, const char *section,
     toml_raw_t raw = toml_raw_in(table, key);
     if (inlined && written++) fputs(", ", out);
     policy_key(out, key); fputs(" = ", out);
-    if (field) policy_value(out, field, cfg);
+    if (field) {
+      if (policy_value(out, field, cfg)) return -1;
+    }
     else if (raw) fputs(raw, out);
     else if (toml_array_in(table, key)) {
       if (policy_array(out, toml_array_in(table, key), depth + 1u)) return -1;
@@ -3328,7 +3413,8 @@ static int policy_table(FILE *out, toml_table_t *table, const char *section,
      * explicit disabled policy unless a remote/local policy configured it. */
     if (!strcmp(section, "correlation") && !cfg->correlation.configured) continue;
     if (inlined && written++) fputs(", ", out);
-    policy_key(out, field->key); fputs(" = ", out); policy_value(out, field, cfg);
+    policy_key(out, field->key); fputs(" = ", out);
+    if (policy_value(out, field, cfg)) return -1;
     if (!inlined) fputc('\n', out);
   }
   if (inlined) fputc('}', out);

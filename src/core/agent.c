@@ -4166,6 +4166,11 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
     agent->cfg.event_filter = remote->event_filter;
     edr_agent_apply_event_filter_config(&agent->cfg);
   }
+  if (edr_agent_toml_has_section(tmp, "detection_policy")) {
+    /* edr_config_load installed the authenticated detection channels in the
+     * engine environment; retain the same policy for primary/LKG recovery. */
+    agent->cfg.detection_policy = remote->detection_policy;
+  }
   if (edr_agent_toml_has_section(tmp, "detection")) {
     if (edr_detection_apply_remote_modes(&agent->cfg, remote)) {
       changed |= EDR_REMOTE_POLICY_DETECTION_CHANGED;

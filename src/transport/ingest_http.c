@@ -5771,8 +5771,7 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
            "\"config_nonce\":\"%s\",\"config_signature\":\"%s\",\"signing_key_id\":\"%s\","
            "\"verified\":%s,\"reject_reason\":\"%s\",\"desired_version\":\"%s\","
            "\"desired_hash\":\"%s\",\"apply_status\":\"%s\",\"restart_required\":%s,"
-           "\"payload\":{\"source\":\"agent-runtime-policy\",\"suppression_contract\":\""
-           EDR_DETECTION_SUPPRESSION_CONTRACT "\",\"verified\":%s}}",
+           "\"payload\":{\"source\":\"agent-runtime-policy\",\"verified\":%s}}",
            tenant, endpoint, agent, policy, hash,
            (long long)(config_sequence && config_sequence[0] ? atoll(config_sequence) : 0),
            nonce, sig, key_id, verified ? "true" : "false", reject, desired_ver, desired_h, status,

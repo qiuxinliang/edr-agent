@@ -299,6 +299,22 @@ int main(int argc, char **argv) {
   CHECK(row_count(argv[5], "tls-ordinary", "policy_held") == 1);
   CHECK(row_count(argv[5], "tls-alert", NULL) == 0);
   CHECK(edr_ingest_http_post_heartbeat() == 0);
+  /* Exercise the actual receipt serializer through strict egress and mTLS.
+   * The authenticated request header owns the suppression capability. */
+  CHECK(edr_ingest_http_post_config_status(NULL, NULL, NULL, "synthetic-p2",
+      "synthetic-hash2", "42", "bm9uY2U=", "c2lnbmF0dXJl", "synthetic-key",
+      1, NULL, "synthetic-p2", "synthetic-hash2", "applied", 0) == 0);
+  CHECK(edr_ingest_http_post_config_status(NULL, NULL, NULL, "synthetic-p1",
+      "synthetic-hash1", "43", "bm9uY2U=", "c2lnbmF0dXJl", "synthetic-key",
+      0, "synthetic-secret-validation-detail", "synthetic-p2", "synthetic-hash2", "failed", 0) == 0);
+  CHECK(edr_ingest_http_post_config_status("foreign-tenant", NULL, NULL, "synthetic-p2",
+      "synthetic-hash2", "42", "bm9uY2U=", "c2lnbmF0dXJl", "synthetic-key",
+      1, NULL, "synthetic-p2", "synthetic-hash2", "applied", 0) != 0);
+  CHECK(edr_ingest_http_post_json_suffix("ingest/config-status",
+      "{\"tenant_id\":\"synthetic-tenant\",\"endpoint_id\":\"synthetic-endpoint\","
+      "\"agent_version\":\"test-v1\",\"policy_version\":\"synthetic-p2\","
+      "\"payload\":{\"source\":\"agent-runtime-policy\",\"verified\":true,\"suppression_contract\":\"2\"}}",
+      NULL, 0u) != 0);
   queue_result = edr_storage_queue_enqueue("tls-ack-lost", alert, alert_len, 0, 1);
   CHECK(queue_result == EDR_OK); if (queue_result == EDR_OK) enqueued++;
   pause_retry(); edr_storage_queue_poll_drain();

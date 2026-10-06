@@ -493,6 +493,92 @@ static void test_effective_policy_survives_restart_and_recovery(void) {
   remove(primary); remove(lkg);
 }
 
+static void test_typed_suppression_persistence_and_revocation(void) {
+  const char *primary = "edr_test_suppression_primary.toml";
+  const char *lkg = "edr_test_suppression_lkg.toml";
+  const char *typed = "R-LOLBIN-002\x1f" "\x1f" "downgrade\x1f" "approved\x1f"
+                      "rundll32.exe\x1d" "davclnt.dll,davsetcookie\x1d" "localhost\x1f"
+                      "\x1e" "R-ESCAPED\x1f" "actor.exe\x1f" "drop\x1f" "quote\"\\reason\x1f"
+                      "C:\\fixture\x1d" "\"quoted\"\x1f" "trusted\\path\x1d" "counterexample"
+                      "\x1e" "R-LEGACY\x1f" "legacy.exe\x1f" "downgrade\x1f" "legacy\x1f" "condition";
+  EdrConfig live = {0}, loaded = {0};
+  char before[80], after[80];
+  FILE *f = fopen(primary, "wb");
+  assert(f);
+  fputs("[detection_policy]\nsource='local'\nfp_feedback='stale-flat.exe'\n"
+        "[[detection_policy.suppression]]\ntarget_rule_id='STALE'\nprocess_name='stale.exe'\n"
+        "action='drop'\ncontains_all=['old']\n", f);
+  assert(fclose(f) == 0);
+  assert(edr_config_load(primary, &live) == EDR_OK);
+  snprintf(live.detection_policy.source, sizeof(live.detection_policy.source), "server");
+  snprintf(live.detection_policy.audit_id, sizeof(live.detection_policy.audit_id), "audit-test");
+  snprintf(live.detection_policy.fp_policy_version, sizeof(live.detection_policy.fp_policy_version), "fp-typed");
+  live.detection_policy.fp_feedback[0] = 0;
+  snprintf(live.detection_policy.suppression_rules, sizeof(live.detection_policy.suppression_rules), "%s", typed);
+  assert(edr_config_save_effective_policy(primary, primary, &live) == 0);
+  assert(edr_config_atomic_copy(primary, lkg) == 0);
+  assert(edr_config_load(primary, &loaded) == EDR_OK);
+  assert(!strcmp(loaded.detection_policy.source, "server"));
+  assert(!strcmp(loaded.detection_policy.audit_id, "audit-test"));
+  assert(!strcmp(loaded.detection_policy.fp_policy_version, "fp-typed"));
+  assert(!loaded.detection_policy.fp_feedback[0]);
+  assert(!strcmp(loaded.detection_policy.suppression_rules, typed));
+  assert(!strcmp(getenv("EDR_DETECTION_SUPPRESSION_RULES"), typed));
+  assert(!getenv("EDR_DETECTION_FP_FEEDBACK") || !getenv("EDR_DETECTION_FP_FEEDBACK")[0]);
+  edr_config_free_heap(&loaded);
+  f = fopen(primary, "wb"); assert(f); fputs("[broken", f); fclose(f);
+  assert(edr_config_load(primary, &loaded) != EDR_OK);
+  assert(edr_config_load(lkg, &loaded) == EDR_OK);
+  assert(!strcmp(loaded.detection_policy.suppression_rules, typed));
+  assert(edr_config_save_effective_policy(lkg, primary, &loaded) == 0);
+  edr_config_free_heap(&loaded);
+
+  /* Invalid compact input must not persist a valid prefix or broaden a rule. */
+  const char *bad[] = {"missing-fields", "R\x1f" "\x1f" "unknown\x1f" "reason\x1f" "condition",
+                       "R\x1f" "\x1f" "drop\x1f" "reason\x1f" "ok\x1f" "no\x1f" "extra",
+                       "R\x1f" "\x1f" "drop\x1f" "bad\nreason\x1f" "condition"};
+  edr_config_fingerprint(primary, before, sizeof(before));
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+    snprintf(live.detection_policy.suppression_rules, sizeof(live.detection_policy.suppression_rules),
+             "%s\x1e%s", typed, bad[i]);
+    assert(edr_config_save_effective_policy(primary, primary, &live) != 0);
+    edr_config_fingerprint(primary, after, sizeof(after)); assert(!strcmp(before, after));
+  }
+  snprintf(live.detection_policy.suppression_rules, sizeof(live.detection_policy.suppression_rules),
+           "R\x1f" "\x1f" "drop\x1f" "reason\x1f");
+  size_t offset = strlen(live.detection_policy.suppression_rules);
+  memset(live.detection_policy.suppression_rules + offset, 'x', 256);
+  live.detection_policy.suppression_rules[offset + 256] = 0;
+  assert(edr_config_save_effective_policy(primary, primary, &live) != 0);
+  edr_config_fingerprint(primary, after, sizeof(after)); assert(!strcmp(before, after));
+  memset(live.detection_policy.suppression_rules, 'x', sizeof(live.detection_policy.suppression_rules));
+  assert(edr_config_save_effective_policy(primary, primary, &live) != 0);
+  edr_config_fingerprint(primary, after, sizeof(after)); assert(!strcmp(before, after));
+
+  /* Empty authoritative channels replace stale tables and survive cold load. */
+  live.detection_policy.suppression_rules[0] = 0;
+  assert(edr_config_save_effective_policy(primary, primary, &live) == 0);
+  assert(edr_config_atomic_copy(primary, lkg) == 0);
+  for (int i = 0; i < 2; ++i) {
+#ifdef _WIN32
+    _putenv_s("EDR_DETECTION_FP_FEEDBACK", "stale-flat.exe");
+    _putenv_s("EDR_DETECTION_SUPPRESSION_RULES", typed);
+#else
+    setenv("EDR_DETECTION_FP_FEEDBACK", "stale-flat.exe", 1);
+    setenv("EDR_DETECTION_SUPPRESSION_RULES", typed, 1);
+#endif
+    assert(edr_config_load(i ? lkg : primary, &loaded) == EDR_OK);
+    assert(!strcmp(loaded.detection_policy.source, "server"));
+    assert(!loaded.detection_policy.suppression_rules[0]);
+    assert(!loaded.detection_policy.fp_feedback[0]);
+    assert(!getenv("EDR_DETECTION_SUPPRESSION_RULES") || !getenv("EDR_DETECTION_SUPPRESSION_RULES")[0]);
+    assert(!getenv("EDR_DETECTION_FP_FEEDBACK") || !getenv("EDR_DETECTION_FP_FEEDBACK")[0]);
+    edr_config_free_heap(&loaded);
+  }
+  edr_config_free_heap(&live);
+  remove(primary); remove(lkg);
+}
+
 int main(void) {
   const char *fn = "edr_test_cfg_fp.toml";
   FILE *f = fopen(fn, "wb");
@@ -508,6 +594,7 @@ int main(void) {
     return 1;
   }
   test_effective_policy_survives_restart_and_recovery();
+  test_typed_suppression_persistence_and_revocation();
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
   test_detection_policy_rejects_partial_counterexamples();

@@ -25,6 +25,7 @@ class ReceiverResourcesTest(unittest.TestCase):
         class DatabaseOnly:
             observations = []
             errors = []
+            config_receipts = []
             server_port = 1
 
             def finish(self):
@@ -117,6 +118,7 @@ class ReceiverResourcesTest(unittest.TestCase):
                 server.database = database
                 server.observations = []
                 server.errors = []
+                server.config_receipts = []
                 server.server_port = 1
                 with contextlib.closing(original_connect(database)) as db, db:
                     db.execute("CREATE TABLE receipt(batch_id TEXT PRIMARY KEY,sha TEXT,observations INTEGER)")
