@@ -3,6 +3,8 @@
 #include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/behavior_proto.h"
+#include "edr/v1/event.pb.h"
+#include <pb_decode.h>
 #include "edr/egress_batch_policy.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
@@ -5539,13 +5541,30 @@ static void test_retained_file_read_cached_actor(void) {
   init_record(r, EDR_EVENT_FILE_READ);
   r->pid = 5012u;
   r->event_time_ns = (int64_t)(birth + 1000000000u);
+  r->evidence_revision = 7u;
+  snprintf(r->image_path_raw, sizeof(r->image_path_raw), "%s", "\\Device\\old_actor.exe");
+  snprintf(r->image_path_namespace, sizeof(r->image_path_namespace), "%s", "nt_device");
   snprintf(r->file_path, sizeof(r->file_path), "%s", "C:\\Temp\\script-fact.ps1");
   assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 1);
   assert(r->process_start_key == key && r->process_creation_filetime_100ns == creation);
   assert(r->file_actor_generation_validated && strcmp(r->cmdline, command) == 0);
   assert(strcmp(r->file_path, "C:\\Temp\\script-fact.ps1") == 0);
   assert(strcmp(r->process_generation_source, "file_read_process_tree_cache_generation") == 0);
+  assert(strcmp(r->image_path_raw, "C:\\Windows\\powershell.exe") == 0);
+  assert(strcmp(r->image_path_namespace, "win32") == 0 && r->evidence_revision == 7u);
   assert(!r->collector_evidence_gate[0] && !r->username[0]);
+  /* The actual record encoder must preserve the selected image tuple and the
+   * Read's own revision. It must not borrow the process observation revision. */
+  uint8_t wire[32768];
+  static edr_v1_BehaviorEvent decoded;
+  size_t wire_len = edr_behavior_record_encode_protobuf(r, wire, sizeof(wire));
+  assert(wire_len);
+  memset(&decoded, 0, sizeof(decoded));
+  pb_istream_t stream = pb_istream_from_buffer(wire, wire_len);
+  assert(pb_decode(&stream, edr_v1_BehaviorEvent_fields, &decoded));
+  assert(decoded.evidence_revision == 7u && strcmp(decoded.image_path_namespace, "win32") == 0);
+  assert(strcmp(decoded.image_path_raw, r->image_path_raw) == 0);
+  assert(strcmp(decoded.image_path_canonical, r->image_path_canonical) == 0);
 
   /* 3.2.501 UTM: upstream populated a nonempty 1023-byte preview before
    * retention. Empty-only enrichment (even with a large destination) loses
@@ -5568,12 +5587,25 @@ static void test_retained_file_read_cached_actor(void) {
   r->event_time_ns = (int64_t)(birth + 1000000000u);
   assert(p0_bind_file_read_cached_generation(r, key + 1u, 0u) == 0);
   assert(p0_bind_file_read_cached_generation(r, key, creation + 1u) == 0);
+  assert(!r->image_path_namespace[0] && !r->evidence_revision);
   r->event_time_ns = (int64_t)(birth - 1u);
   assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
   r->event_time_ns = (int64_t)(birth + 1000000000u);
   r->pid = 5013u;
   assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
   assert(!r->process_start_key && !r->collector_evidence_gate[0]);
+
+  /* A selected but unclassified pathname cannot inherit a previous actor's
+   * namespace, and generation enrichment cannot invent a missing revision. */
+  assert(edr_pt_cache_put_generation(5016u, 100u, "reader.exe", "reader",
+             "reader.exe", "parent.exe", birth, key + 4u, creation) == 0);
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 5016u;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  snprintf(r->image_path_namespace, sizeof(r->image_path_namespace), "%s", "win32");
+  assert(p0_bind_file_read_cached_generation(r, key + 4u, creation) == 1);
+  assert(strcmp(r->image_path_raw, "reader.exe") == 0);
+  assert(!r->image_path_namespace[0] && !r->evidence_revision);
 
   /* The existing stricter rule for unidentified network actors is unchanged. */
   r->pid = 5012u;

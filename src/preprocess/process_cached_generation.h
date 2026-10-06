@@ -4,6 +4,7 @@
 #include "edr/behavior_record.h"
 #include "edr/process_generation.h"
 #include "edr/process_tree_cache.h"
+#include "edr/windows_file_identity.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -65,7 +66,10 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
   br->ppid = snapshot.ppid;
   snprintf(br->exe_path, sizeof(br->exe_path), "%s", snapshot.exe_path);
+  snprintf(br->image_path_raw, sizeof(br->image_path_raw), "%s", snapshot.exe_path);
   snprintf(br->image_path_canonical, sizeof(br->image_path_canonical), "%s", snapshot.exe_path);
+  snprintf(br->image_path_namespace, sizeof(br->image_path_namespace), "%s",
+           edr_windows_image_path_namespace(snapshot.exe_path));
   name = snapshot.process_name;
   if (!name[0]) {
     name = snapshot.exe_path;

@@ -48,9 +48,27 @@ static void test_path_snapshot_race_rejection(void) {
                                                       "", a_write_time));
 }
 
+static void test_selected_image_path_namespace(void) {
+  const char *paths[] = {
+    "C:\\Windows\\reader.exe", "c:/Windows/reader.exe", "\\\\server\\share\\reader.exe",
+    "\\\\?\\C:\\Windows\\reader.exe", "\\Device\\HarddiskVolume3\\reader.exe",
+    "\\device\\HarddiskVolume3\\reader.exe", "\\??\\C:\\Windows\\reader.exe",
+    "\\GLOBAL??\\C:\\Windows\\reader.exe", "", "reader.exe", "C:reader.exe",
+    "\\Windows\\reader.exe", "/usr/bin/reader", "C", "\\", "\\\\"
+  };
+  const char *expected[] = {
+    "win32", "win32", "win32", "win32", "nt_device", "nt_device", "nt_dos", "nt_dos",
+    "", "", "", "", "", "", "", ""
+  };
+  assert(strcmp(edr_windows_image_path_namespace(NULL), "") == 0);
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i)
+    assert(strcmp(edr_windows_image_path_namespace(paths[i]), expected[i]) == 0);
+}
+
 int main(void) {
   test_lossless_format_and_xor_collision_pair();
   test_path_snapshot_race_rejection();
+  test_selected_image_path_namespace();
   puts("windows file identity contract: ok");
   return 0;
 }

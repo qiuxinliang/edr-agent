@@ -209,6 +209,10 @@ static void expect_read(Fixture *read, uint64_t at, const char *path,
   assert(record.type == EDR_EVENT_FILE_READ && strcmp(record.file_op, "read") == 0);
   assert(record.pid == reader_pid && record.pid != opener_pid);
   assert(record.event_time_ns == (int64_t)at);
+  assert(record.evidence_revision == 1u);
+  /* A real original read has a revision; an unresolved actor still has no
+   * image namespace, regardless of the target file's absolute pathname. */
+  assert(!record.image_path_namespace[0] && !record.image_path_raw[0]);
   assert(strcmp(record.file_path, path) == 0 && record.file_key == key);
   assert(record.process_start_key == 0u && record.process_creation_filetime_100ns == 0u);
   assert(!record.file_actor_generation_validated);
@@ -379,9 +383,11 @@ static void test_sequence(unsigned version, size_t width) {
            (unsigned long long)object);
   snprintf(key_line, sizeof(key_line), "file_key=0x%llx\n", (unsigned long long)key);
   size_t path_bytes = strlen("file=\n") + strlen(old_path);
-  size_t total = strlen(object_line) + path_bytes + strlen(key_line) +
+  size_t revision_bytes = strlen("evidence_revision=1\n");
+  size_t total = revision_bytes + strlen(object_line) + path_bytes + strlen(key_line) +
       strlen("file_read_binding_quality=etw_fileobject_create\n");
-  const size_t spaces[] = {0u, strlen(object_line) + path_bytes, total - 1u, total};
+  const size_t spaces[] = {0u, revision_bytes + strlen(object_line) + path_bytes,
+                           total - 1u, total};
   for (size_t i = 0u; i < sizeof(spaces) / sizeof(spaces[0]); ++i) {
     static const char *const capacity_cases[] = {
       "capacity_first_field", "capacity_after_object_path", "capacity_last_field", "capacity_exact_fit"
@@ -402,10 +408,62 @@ static void test_sequence(unsigned version, size_t width) {
       assert(edr_collector_file_io_test_pending(&pending));
       edr_behavior_from_slot(&pending, &record);
       assert(strcmp(record.file_path, old_path) == 0 && record.file_key == key);
+      assert(!record.evidence_revision && !record.image_path_namespace[0]);
+      assert(strcmp(record.source_completeness, "NOT_EVALUABLE") == 0);
     }
   }
 }
 
+
+static void test_exact_cached_actor_provenance(unsigned version, size_t width) {
+  const uint64_t object = 0x721100u, file_key = 0x721101u;
+  uint64_t actor_key = UINT64_C(0x721102);
+  Fixture create, read;
+  EVENT_HEADER_EXTENDED_DATA_ITEM extended;
+  EdrBehaviorRecord actor, observed;
+  const char *paths[] = {"C:\\Windows\\reader.exe", "reader.exe"};
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    reset(i ? "cached_unknown_namespace_is_not_win32" : "cached_actor_namespace_and_original_revision");
+    memset(&actor, 0, sizeof(actor));
+    actor.type = EDR_EVENT_PROCESS_CREATE;
+    actor.pid = reader_pid;
+    actor.process_start_key = actor_key;
+    actor.evidence_revision = 9u; /* belongs to ProcessCreate, never this Read */
+    snprintf(actor.process_name, sizeof(actor.process_name), "%s", "reader.exe");
+    snprintf(actor.exe_path, sizeof(actor.exe_path), "%s", paths[i]);
+    edr_collector_file_io_test_observe_process(&actor);
+    /* The same PID's other generation cannot replace the selected actor. */
+    actor.process_start_key = actor_key + 1u;
+    snprintf(actor.exe_path, sizeof(actor.exe_path), "%s", "D:\\replacement.exe");
+    edr_collector_file_io_test_observe_process(&actor);
+    make_event(&create, 12u, version, width, object, 0u, old_name);
+    make_event(&read, 15u, version, width, object, file_key, NULL);
+    memset(&extended, 0, sizeof(extended));
+    extended.ExtType = 0x000Du; /* documented PROCESS_START_KEY */
+    extended.DataSize = (USHORT)sizeof(actor_key);
+    extended.DataPtr = (ULONGLONG)(uintptr_t)&actor_key;
+    read.record.ExtendedData = &extended;
+    read.record.ExtendedDataCount = 1u;
+    feed(&create, 100u);
+    feed(&read, 150u);
+    assert(bus.published == 1u);
+    edr_behavior_from_slot(&bus.last, &observed);
+    assert(observed.process_start_key == actor_key && observed.evidence_revision == 1u);
+    assert(strcmp(observed.exe_path, paths[i]) == 0);
+    assert(strcmp(observed.image_path_raw, paths[i]) == 0);
+    assert(strcmp(observed.image_path_canonical, paths[i]) == 0);
+    assert(strcmp(observed.image_path_namespace, i ? "" : "win32") == 0);
+    assert(strcmp(observed.image_path_resolution_source, "exact_process_start_key_cache") == 0);
+    assert(strcmp(observed.file_path, old_path) == 0);
+    /* A key without a cached lifetime must retain the missing attribution. */
+    actor_key += 2u;
+    feed(&read, 160u);
+    assert(bus.published == 2u);
+    edr_behavior_from_slot(&bus.last, &observed);
+    assert(observed.evidence_revision == 1u);
+    assert(!observed.image_path_namespace[0] && !observed.image_path_raw[0]);
+  }
+}
 
 static void expect_write_failure(Fixture *write, uint64_t at,
                                   EdrFileWriteUnresolvedReason reason) {
@@ -783,6 +841,8 @@ int main(void) {
   for (unsigned version = 0u; version <= 1u; ++version) {
     test_sequence(version, 4u);
     test_sequence(version, 8u);
+    test_exact_cached_actor_provenance(version, 4u);
+    test_exact_cached_actor_provenance(version, 8u);
     test_write_accounting(version, 4u);
     test_write_accounting(version, 8u);
     test_canary_processing_time(version, 4u);

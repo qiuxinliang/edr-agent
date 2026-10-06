@@ -10,10 +10,13 @@
 #include "edr/event_bus.h"
 #include "edr/collector.h"
 #include "edr/process_generation.h"
+#include "edr/behavior_record.h"
 
 void edr_collector_file_io_test_reset(EdrEventBus *bus);
 uint64_t edr_collector_file_io_test_new_epoch(void);
 void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns);
+/* Load the real collector cache through its production exact-generation owner. */
+void edr_collector_file_io_test_observe_process(const EdrBehaviorRecord *record);
 int edr_collector_file_io_test_pending(EdrEventSlot *slot);
 void edr_collector_file_io_test_health(EdrCollectorHealth *health);
 void edr_collector_file_io_test_self_identity(const EdrLiveProcessGeneration *identity);

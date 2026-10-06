@@ -4,6 +4,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Classify the representation actually selected for an actor image. This is
+ * lexical metadata only: it neither resolves a pathname nor proves a process
+ * generation. Relative/unknown paths remain absent instead of becoming Win32
+ * evidence merely because some path text is nonempty. */
+static inline const char *edr_windows_image_path_namespace(const char *path) {
+  if (!path || !path[0]) return "";
+  const char *prefixes[] = {"\\Device\\", "\\??\\", "\\Global??\\"};
+  for (size_t i = 0u; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
+    size_t j = 0u;
+    for (; prefixes[i][j] && path[j]; ++j) {
+      unsigned char a = (unsigned char)prefixes[i][j];
+      unsigned char b = (unsigned char)path[j];
+      if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+      if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+      if (a != b) break;
+    }
+    if (!prefixes[i][j]) return i == 0u ? "nt_device" : "nt_dos";
+  }
+  if (((path[0] >= 'A' && path[0] <= 'Z') ||
+       (path[0] >= 'a' && path[0] <= 'z')) &&
+      path[1] == ':' && (path[2] == '\\' || path[2] == '/')) return "win32";
+  if (path[0] == '\\' && path[1] == '\\' && path[2]) return "win32";
+  return "";
+}
+
 /*
  * The Windows file identity carried across a P0 boundary is deliberately
  * lossless: volume serial plus the complete FILE_ID_128.  It is not the old

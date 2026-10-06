@@ -506,7 +506,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
       return 0;
     }
     copy_trunc(br->exe_path, sizeof(br->exe_path), actor_path);
+    copy_trunc(br->image_path_raw, sizeof(br->image_path_raw), actor_path);
     copy_trunc(br->image_path_canonical, sizeof(br->image_path_canonical), actor_path);
+    copy_trunc(br->image_path_namespace, sizeof(br->image_path_namespace),
+               edr_windows_image_path_namespace(actor_path));
     copy_trunc(br->process_name, sizeof(br->process_name), p0_process_path_basename(actor_path));
     copy_trunc(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "RESOLVED");
     copy_trunc(br->image_path_resolution_source, sizeof(br->image_path_resolution_source), "live_same_generation");

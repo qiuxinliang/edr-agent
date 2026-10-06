@@ -3774,7 +3774,10 @@ static void edr_collector_file_read_writeback_actor(EdrEventSlot *slot,
    * canonical representation, so a later parser cannot prefer a stray raw
    * provider field over the bound actor. */
   (void)edr_collector_slot_append_kv(slot, "img", br->exe_path);
+  (void)edr_collector_slot_append_kv(slot, "img_raw", br->exe_path);
   (void)edr_collector_slot_append_kv(slot, "img_canonical", br->exe_path);
+  (void)edr_collector_slot_append_kv(slot, "img_namespace",
+                                     edr_windows_image_path_namespace(br->exe_path));
   (void)edr_collector_slot_append_kv(slot, "img_resolution_status", "RESOLVED");
   (void)edr_collector_slot_append_kv(slot, "img_resolution_source",
                                      "exact_process_start_key_cache");
@@ -4456,6 +4459,20 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
 #ifdef EDR_COLLECTOR_FILE_IO_TESTING
   edr_collector_file_io_test_before_binding(&slot);
 #endif
+  if (ty == EDR_EVENT_FILE_READ &&
+      edr_collector_slot_append_kv(&slot, "evidence_revision", "1") !=
+          EDR_SLOT_KV_APPENDED) {
+    /* Revision one belongs to this original Kernel-File observation, not to
+     * the actor's ProcessCreate revision or a later backend default. If its
+     * source envelope cannot carry it, retain the existing explicit failure
+     * rather than publishing a fabricated complete observation. */
+    s_health.metadata_dropped++;
+    edr_collector_file_read_metadata_gate_stage(
+        event_record, timestamp_ns, file_read_key,
+        file_read_path[0] ? file_read_path : NULL,
+        EDR_P0_FILE_READ_REASON_PAYLOAD_UNAVAILABLE);
+    return;
+  }
   if (is_file_io &&
       !edr_collector_append_file_io_binding(&slot, file_read_key, file_read_path,
                                              file_write_object, file_io_binding_quality)) {
@@ -4562,6 +4579,10 @@ void edr_collector_file_io_test_reset(EdrEventBus *bus) {
 
 void edr_collector_file_io_test_canary_clock(uint64_t processing_ns) {
   s_policy_canary_test_now_ns = processing_ns;
+}
+
+void edr_collector_file_io_test_observe_process(const EdrBehaviorRecord *record) {
+  edr_collector_pid_cache_update(record);
 }
 
 uint64_t edr_collector_file_io_test_new_epoch(void) {
