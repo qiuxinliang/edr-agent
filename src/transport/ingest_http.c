@@ -16,6 +16,7 @@
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
 #include "edr/http_retry.h"
+#include "edr/detection_decision.h"
 #include "edr/preprocess.h"
 #include "edr/sha256.h"
 #include "edr/transport_v2.h"
@@ -2949,6 +2950,7 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
   n = snprintf(req + used, cap - used,
 		               "X-Tenant-ID: %s\r\n"
 		               "X-Endpoint-ID: %s\r\n"
+		               "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT "\r\n"
 		               "X-User-ID: %s\r\n"
 		               "X-Permission-Set: telemetry:write,endpoint:attack_surface_report\r\n",
 	               s_tenant[0] ? s_tenant : "demo-tenant",
@@ -4034,6 +4036,7 @@ static struct curl_slist *curl_common_headers(const char *content_type) {
   headers = curl_slist_append(headers, h);
   snprintf(h, sizeof(h), "X-Endpoint-ID: %s", s_endpoint[0] ? s_endpoint : "");
   headers = curl_slist_append(headers, h);
+  headers = curl_slist_append(headers, "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT);
   snprintf(h, sizeof(h), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
   headers = curl_slist_append(headers, h);
   headers = curl_slist_append(headers, "X-Permission-Set: telemetry:write,endpoint:attack_surface_report");
@@ -5768,7 +5771,8 @@ int edr_ingest_http_post_config_status(const char *tenant_id,
            "\"config_nonce\":\"%s\",\"config_signature\":\"%s\",\"signing_key_id\":\"%s\","
            "\"verified\":%s,\"reject_reason\":\"%s\",\"desired_version\":\"%s\","
            "\"desired_hash\":\"%s\",\"apply_status\":\"%s\",\"restart_required\":%s,"
-           "\"payload\":{\"source\":\"agent-runtime-policy\",\"verified\":%s}}",
+           "\"payload\":{\"source\":\"agent-runtime-policy\",\"suppression_contract\":\""
+           EDR_DETECTION_SUPPRESSION_CONTRACT "\",\"verified\":%s}}",
            tenant, endpoint, agent, policy, hash,
            (long long)(config_sequence && config_sequence[0] ? atoll(config_sequence) : 0),
            nonce, sig, key_id, verified ? "true" : "false", reject, desired_ver, desired_h, status,

@@ -257,6 +257,7 @@ static void test_detection_policy_conditional_suppression(void) {
           "target_rule_id = \"R-LOLBIN-002\"\n"
           "process_name = \"rundll32.exe\"\n"
           "contains_all = [\"davclnt.dll,DavSetCookie\", \"localhost\"]\n"
+          "contains_none = [\"remote.example\", \"credentials\"]\n"
           "action = \"downgrade\"\n"
           "reason = \"auto_fp_feedback\"\n");
   fclose(f);
@@ -279,6 +280,90 @@ static void test_detection_policy_conditional_suppression(void) {
   assert(strstr(env, "davclnt.dll,DavSetCookie") != NULL);
   assert(strstr(env, "localhost") != NULL);
   assert(strstr(env, "downgrade") != NULL);
+  assert(strcmp(env, "R-LOLBIN-002\037rundll32.exe\037downgrade\037auto_fp_feedback\037"
+                     "davclnt.dll,DavSetCookie\035localhost\037remote.example\035credentials") == 0);
+}
+
+static void test_detection_policy_rejects_partial_counterexamples(void) {
+  const char *fn = "edr_test_cfg_supp_invalid.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fputs("[agent]\nendpoint_id = \"t\"\n[detection_policy]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"valid.exe\"\n"
+        "contains_all = [\"valid.ps1\"]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"oversized.exe\"\n"
+        "contains_all = [\"benign.ps1\"]\ncontains_none = [\"", f);
+  for (int i = 0; i < 300; i++) fputc('x', f);
+  fputs("\"]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"invalid.exe\"\n"
+        "contains_all = [\"benign.ps1\"]\ncontains_none = [\"forbidden\", 7]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"control.exe\"\n"
+        "contains_none = [\"bad\\tvalue\"]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"buffer.exe\"\ncontains_all = [", f);
+  for (int token = 0; token < 40; token++) {
+    if (token) fputc(',', f);
+    fputc('"', f);
+    for (int i = 0; i < 240; i++) fputc('x', f);
+    fputc('"', f);
+  }
+  fputs("]\ncontains_none = [\"forbidden\"]\n"
+        "[[detection_policy.suppression]]\nprocess_name = \"last.exe\"\ncontains_all = [\"last.ps1\"]\n", f);
+  fclose(f);
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  assert(edr_config_load(fn, &cfg) == EDR_OK);
+  remove(fn);
+  assert(strcmp(cfg.detection_policy.suppression_rules,
+                "\037valid.exe\037downgrade\037\037valid.ps1\036"
+                "\037last.exe\037downgrade\037\037last.ps1") == 0);
+  edr_config_free_heap(&cfg);
+}
+
+static void test_detection_policy_empty_server_rules_revoke_previous(void) {
+  const char *fn = "edr_test_cfg_supp_revoke.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fputs("[agent]\nendpoint_id = \"t\"\n[detection_policy]\nsource = \"server\"\n", f);
+  fclose(f);
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  assert(getenv("EDR_DETECTION_SUPPRESSION_RULES") && getenv("EDR_DETECTION_SUPPRESSION_RULES")[0]);
+#ifdef _WIN32
+  _putenv_s("EDR_DETECTION_FP_FEEDBACK", "stale-flat-feedback.exe");
+#else
+  setenv("EDR_DETECTION_FP_FEEDBACK", "stale-flat-feedback.exe", 1);
+#endif
+  assert(edr_config_load(fn, &cfg) == EDR_OK);
+  remove(fn);
+  const char *rules = getenv("EDR_DETECTION_SUPPRESSION_RULES");
+  assert(!rules || !rules[0]);
+  const char *feedback = getenv("EDR_DETECTION_FP_FEEDBACK");
+  assert(!feedback || !feedback[0]);
+  edr_config_free_heap(&cfg);
+}
+
+static void test_detection_policy_local_manual_feedback_remains(void) {
+  const char *fn = "edr_test_cfg_local_feedback.toml";
+  FILE *f = fopen(fn, "wb");
+  assert(f != NULL);
+  fputs("[agent]\nendpoint_id = \"t\"\n", f);
+  fclose(f);
+#ifdef _WIN32
+  _putenv_s("EDR_DETECTION_FP_FEEDBACK", "manual-local.exe");
+#else
+  setenv("EDR_DETECTION_FP_FEEDBACK", "manual-local.exe", 1);
+#endif
+  EdrConfig cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  assert(edr_config_load(fn, &cfg) == EDR_OK);
+  remove(fn);
+  assert(strcmp(getenv("EDR_DETECTION_FP_FEEDBACK"), "manual-local.exe") == 0);
+  edr_config_free_heap(&cfg);
+#ifdef _WIN32
+  _putenv_s("EDR_DETECTION_FP_FEEDBACK", "");
+#else
+  unsetenv("EDR_DETECTION_FP_FEEDBACK");
+#endif
 }
 
 static void test_remote_preprocessing_rules_replace_only_rule_section(void) {
@@ -425,6 +510,9 @@ int main(void) {
   test_effective_policy_survives_restart_and_recovery();
   test_detection_policy_fp_feedback_maps_to_env();
   test_detection_policy_conditional_suppression();
+  test_detection_policy_rejects_partial_counterexamples();
+  test_detection_policy_empty_server_rules_revoke_previous();
+  test_detection_policy_local_manual_feedback_remains();
   test_command_forensic_yara_rules_dir();
   test_lifecycle_maintenance_policy_is_separate_from_dangerous_commands();
   test_remote_detection_modes_parse();

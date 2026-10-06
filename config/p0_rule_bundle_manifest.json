@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-e2008650",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-a435ea01",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 180,
   "rules": [
@@ -219,8 +219,8 @@
     },
     {
       "id": "R-CRED-003",
-      "title": "可疑读取浏览器凭据库",
-      "severity": 2,
+      "title": "浏览器登录凭据库读取",
+      "severity": 1,
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
@@ -1567,8 +1567,8 @@
     },
     {
       "id": "R-LMOVE-012",
-      "title": "浏览器凭据或会话文件访问",
-      "severity": 3,
+      "title": "浏览器 Cookie 文件读取",
+      "severity": 1,
       "event_type": "file_read",
       "enabled": true,
       "mitre_ttps": [
@@ -1831,16 +1831,12 @@
       ]
     },
     {
-      "id": "R-EXEC-006",
-      "title": "脚本解释器内联下载后执行",
-      "severity": 3,
-      "event_type": "process_create",
+      "id": "R-AI-CONFIG-WRITE-001",
+      "title": "脚本解释器改写 AI 工具连接配置",
+      "severity": 2,
+      "event_type": "file_write",
       "enabled": true,
-      "mitre_ttps": [
-        "T1059.006",
-        "T1059.007",
-        "T1105"
-      ]
+      "mitre_ttps": []
     },
     {
       "id": "R-CRED-011",
@@ -1850,16 +1846,6 @@
       "enabled": true,
       "mitre_ttps": [
         "T1539"
-      ]
-    },
-    {
-      "id": "R-RANSOM-004",
-      "title": "PowerShell 删除卷影副本",
-      "severity": 3,
-      "event_type": "process_create",
-      "enabled": true,
-      "mitre_ttps": [
-        "T1490"
       ]
     },
     {
@@ -1883,12 +1869,16 @@
       ]
     },
     {
-      "id": "R-AI-CONFIG-WRITE-001",
-      "title": "脚本解释器改写 AI 工具连接配置",
-      "severity": 2,
-      "event_type": "file_write",
+      "id": "R-EXEC-006",
+      "title": "脚本解释器内联下载后执行",
+      "severity": 3,
+      "event_type": "process_create",
       "enabled": true,
-      "mitre_ttps": []
+      "mitre_ttps": [
+        "T1059.006",
+        "T1059.007",
+        "T1105"
+      ]
     },
     {
       "id": "R-IDENTITY-CLI-TOKEN-001",
@@ -1898,6 +1888,16 @@
       "enabled": true,
       "mitre_ttps": [
         "T1078.004"
+      ]
+    },
+    {
+      "id": "R-RANSOM-004",
+      "title": "PowerShell 删除卷影副本",
+      "severity": 3,
+      "event_type": "process_create",
+      "enabled": true,
+      "mitre_ttps": [
+        "T1490"
       ]
     }
   ]

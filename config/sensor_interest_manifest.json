@@ -128,11 +128,11 @@
     "file_write",
     "registry_set"
   ],
-  "interest_version": "sensor-interest-v1-3cdebd36410a",
+  "interest_version": "sensor-interest-v1-5f2a331244e6",
   "kind": "edr_sensor_interest_manifest",
   "p0_artifact_rule_count": 180,
-  "p0_artifact_sha256": "c1b68e0ccb982aae5944a4408bf2583bb912552e21edbf6a1fe26fea80bb78da",
-  "p0_rule_coverage_sha256": "6c98f5ab1d282f76b6372a4ec08176089bc6ec4c91be911fb68e8907978ff196",
+  "p0_artifact_sha256": "f5b0a58cd79da13bdd9c699d3bf929de9f364e448e9949982939237485eafbb9",
+  "p0_rule_coverage_sha256": "1afa29606eb1eb4a4e2b494a7fb588e21ac0cbda1ae455cd87009766976fbdc4",
   "p0_rule_ids": [
     "R-ACCT-001",
     "R-ACCT-002",
@@ -481,7 +481,7 @@
     27017,
     47001
   ],
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-e2008650",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r283-a435ea01",
   "schema_version": 1,
   "source_dynamic_rules": "dynamic_rules_v1.json"
 }

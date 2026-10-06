@@ -1,5 +1,6 @@
 #include "edr/http_retry.h"
 #include "edr/request_signing.h"
+#include "edr/detection_decision.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -126,6 +127,25 @@ int main(void) {
   spec.user_id = "edr-agent";
   spec.permission_set = "telemetry:write";
   spec.keepalive = 1;
+
+  /* The same builder supplies the native signed runtime-policy GET. The
+   * contract is a compiled capability, independent of environment input. */
+  {
+    char headers[4096];
+    char contract[8];
+    spec.method = "GET";
+    spec.path = "/api/v1/agent/runtime-policy.toml";
+    spec.body = NULL;
+    spec.body_len = 0u;
+    ok &= expect(edr_http_build_request_headers(&spec, 1700000000000LL, headers, sizeof(headers)) > 0 &&
+                 copy_header(headers, "X-EDR-Suppression-Contract", contract, sizeof(contract)) == 0 &&
+                 strcmp(contract, EDR_DETECTION_SUPPRESSION_CONTRACT) == 0,
+                 "signed native runtime-policy GET must advertise the compiled suppression contract");
+    spec.method = "POST";
+    spec.path = "/api/v1/ingest/report-command-result";
+    spec.body = body;
+    spec.body_len = sizeof(body) - 1u;
+  }
 
   RetryFixture lost_response = fixture_with(NULL, "HTTP/1.1 200 OK");
   outcome = edr_http_execute_request_attempts(

@@ -1062,10 +1062,31 @@ if(EDR_PCRE2_AVAILABLE)
   set_tests_properties(p0_rule_ir_record_golden PROPERTIES
     ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
 
+  add_executable(test_p0_rule_ir_exclusions
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_exclusions.c
+    ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+  target_include_directories(test_p0_rule_ir_exclusions PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(test_p0_rule_ir_exclusions PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(test_p0_rule_ir_exclusions PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(test_p0_rule_ir_exclusions PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
+  edr_apply_test_warnings(test_p0_rule_ir_exclusions)
+  add_test(NAME p0_rule_ir_exclusions COMMAND test_p0_rule_ir_exclusions
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
   if(NOT WIN32)
     add_executable(test_p0_rule_ir_snapshot
       ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_snapshot.c
       ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+      ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
       ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
       ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
       ${CMAKE_SOURCE_DIR}/src/command/sha256.c
@@ -1087,6 +1108,7 @@ if(EDR_PCRE2_AVAILABLE)
       add_executable(test_p0_rule_ir_envelope_boundary
         ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_envelope_boundary.c
         ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+        ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
         ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
         ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
         ${CMAKE_SOURCE_DIR}/src/command/sha256.c

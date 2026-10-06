@@ -92,20 +92,30 @@ struct p0_ir_one {
   int chain_gt; /* 0 = unset */
   int n_name_in;
   char name_in[P0_IR_NAME_IN_MAX][128];
+  int n_name_not_in;
+  char name_not_in[P0_IR_NAME_IN_MAX][128];
   int n_parent_in;
   char parent_in[P0_IR_NAME_IN_MAX][128];
+  int n_parent_not_in;
+  char parent_not_in[P0_IR_NAME_IN_MAX][128];
   pcre2_code *re_cmd_any[P0_IR_PAT];
   int n_cmd_any;
   pcre2_code *re_cmd_all[P0_IR_PAT];
   int n_cmd_all;
   pcre2_code *re_pn_rx[P0_IR_PAT];
   int n_pn_rx;
+  pcre2_code *re_pn_not_rx[P0_IR_PAT];
+  int n_pn_not_rx;
   pcre2_code *re_ppath_rx[P0_IR_PAT];
   int n_ppath_rx;
   pcre2_code *re_pr_rx[P0_IR_PAT];
   int n_pr_rx;
+  pcre2_code *re_pr_not_rx[P0_IR_PAT];
+  int n_pr_not_rx;
   pcre2_code *re_fpath[P0_IR_PAT];
   int n_fpath;
+  pcre2_code *re_fpath_not[P0_IR_PAT];
+  int n_fpath_not;
   int rport[64];
   int n_rport;
   pcre2_code *re_regpath[P0_IR_PAT];
@@ -467,6 +477,10 @@ static void p0_ir_free_pcre_in_rule(struct p0_ir_one *r) {
       pcre2_code_free((pcre2_code *)r->re_pn_rx[i]);
       r->re_pn_rx[i] = NULL;
     }
+    if (r->re_pn_not_rx[i]) {
+      pcre2_code_free(r->re_pn_not_rx[i]);
+      r->re_pn_not_rx[i] = NULL;
+    }
     if (r->re_ppath_rx[i]) {
       pcre2_code_free((pcre2_code *)r->re_ppath_rx[i]);
       r->re_ppath_rx[i] = NULL;
@@ -475,9 +489,17 @@ static void p0_ir_free_pcre_in_rule(struct p0_ir_one *r) {
       pcre2_code_free((pcre2_code *)r->re_pr_rx[i]);
       r->re_pr_rx[i] = NULL;
     }
+    if (r->re_pr_not_rx[i]) {
+      pcre2_code_free(r->re_pr_not_rx[i]);
+      r->re_pr_not_rx[i] = NULL;
+    }
     if (r->re_fpath[i]) {
       pcre2_code_free((pcre2_code *)r->re_fpath[i]);
       r->re_fpath[i] = NULL;
+    }
+    if (r->re_fpath_not[i]) {
+      pcre2_code_free(r->re_fpath_not[i]);
+      r->re_fpath_not[i] = NULL;
     }
     if (r->re_regpath[i]) {
       pcre2_code_free((pcre2_code *)r->re_regpath[i]);
@@ -1299,9 +1321,41 @@ static int try_load_default_paths(void) {
 #endif
 }
 
+static int p0_exclusion_field_available(const EdrBehaviorRecord *br,
+                                        const char *field, const char *value) {
+  return value && value[0] &&
+         (!br || (strcmp(br->source_completeness, "NOT_EVALUABLE") != 0 &&
+                  !edr_behavior_p0_source_quality_hard_reject(br) &&
+                  !edr_behavior_source_field_truncated(br, field)));
+}
+
+/* Exclusions consume their own observed field only. An absent or shortened
+ * value is unknown evidence, so it cannot turn a positive match into a miss. */
+static int p0_rule_excludes_fields(const struct p0_ir_one *r,
+                                  const EdrBehaviorRecord *br,
+                                  const char *process_name, const char *parent_name,
+                                  const char *path, const char *path_source_field) {
+  char lower[1024];
+  if (p0_exclusion_field_available(br, "source.process_name", process_name)) {
+    ascii_lower_truncate(lower, sizeof(lower), process_name);
+    if (name_in_list(lower, (const char (*)[128])r->name_not_in, r->n_name_not_in) ||
+        any_pcre((pcre2_code *const *)r->re_pn_not_rx, r->n_pn_not_rx, process_name))
+      return 1;
+  }
+  if (p0_exclusion_field_available(br, "source.parent_name", parent_name)) {
+    ascii_lower_truncate(lower, sizeof(lower), parent_name);
+    if (name_in_list(lower, (const char (*)[128])r->parent_not_in, r->n_parent_not_in) ||
+        any_pcre((pcre2_code *const *)r->re_pr_not_rx, r->n_pr_not_rx, parent_name))
+      return 1;
+  }
+  return p0_exclusion_field_available(br, path_source_field, path) &&
+         any_pcre((pcre2_code *const *)r->re_fpath_not, r->n_fpath_not, path);
+}
+
 static int one_rule_match_process(
     const struct p0_ir_one *r, const char *process_name, const char *process_path,
-    const char *cmdline, const char *parent_name, int pchain) {
+    const char *cmdline, const char *parent_name, int pchain,
+    const EdrBehaviorRecord *br) {
   const char *cmd = cmdline ? cmdline : "";
   const char *par = parent_name ? parent_name : "";
   char pnlow[1024];
@@ -1350,7 +1404,8 @@ static int one_rule_match_process(
       return 0;
     }
   }
-  return 1;
+  return !p0_rule_excludes_fields(r, br, br ? br->process_name : process_name,
+                                  parent_name, NULL, NULL);
 }
 
 static int one_rule_match_file(const struct p0_ir_one *r, const EdrBehaviorRecord *br,
@@ -1380,6 +1435,11 @@ static int one_rule_match_file(const struct p0_ir_one *r, const EdrBehaviorRecor
       return 0;
     }
   }
+  if (r->n_ppath_rx > 0 &&
+      (!br->exe_path[0] ||
+       !any_pcre((pcre2_code *const *)r->re_ppath_rx, r->n_ppath_rx, br->exe_path))) {
+    return 0;
+  }
   if (r->n_cmd_all > 0) {
     if (!all_pcre((pcre2_code *const *)r->re_cmd_all, r->n_cmd_all, cmd)) {
       return 0;
@@ -1397,7 +1457,8 @@ static int one_rule_match_file(const struct p0_ir_one *r, const EdrBehaviorRecor
       return 0;
     }
   }
-  return 1;
+  return !p0_rule_excludes_fields(r, br, br->process_name, par, br->file_path,
+                                  "source.file_path");
 }
 
 static int one_rule_match_net(const struct p0_ir_one *r, const EdrBehaviorRecord *br) {
@@ -1435,7 +1496,8 @@ static int one_rule_match_net(const struct p0_ir_one *r, const EdrBehaviorRecord
       return 0;
     }
   }
-  return 1;
+  return !p0_rule_excludes_fields(r, br, process_name, NULL, br->network_aux_path,
+                                  "source.network_aux_path");
 }
 
 static void lower_inplace_buf(char *buf, size_t cap) {
@@ -1613,7 +1675,7 @@ static int p0_rule_has_constraints(const char *et, const struct p0_ir_one *r) {
   }
   if (strcmp(et, "file_read") == 0 || strcmp(et, "file_write") == 0) {
     return r->n_fpath > 0 || r->n_pn_rx > 0 || r->n_cmd_any > 0 || r->n_cmd_all > 0 || r->n_name_in > 0 ||
-           r->n_parent_in > 0 || r->n_pr_rx > 0;
+           r->n_parent_in > 0 || r->n_pr_rx > 0 || r->n_ppath_rx > 0;
   }
   if (strcmp(et, "network_connect") == 0) {
     return r->n_name_in > 0 || r->n_pn_rx > 0 || r->n_rport > 0 || r->n_fpath > 0;
@@ -1700,7 +1762,8 @@ static int p0_condition_dword_array_valid(const cJSON *branches) {
  * field unknown to the event type must reject the entire candidate rather
  * than silently weakening a rule when an Agent parser has not implemented it.
  */
-static int p0_condition_keys_supported(const char *event_type, const cJSON *condition) {
+static int p0_condition_keys_supported(const char *event_type, const cJSON *condition,
+                                       unsigned schema_version) {
   cJSON *item;
   if (!event_type || !cJSON_IsObject(condition)) {
     return 0;
@@ -1712,6 +1775,11 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
     if (!key) {
       return 0;
     }
+    int name_exclusion = strcmp(key, "process_name_not_in") == 0 ||
+                         strcmp(key, "parent_name_not_in") == 0;
+    int regex_exclusion = strcmp(key, "process_name_not_regex_any") == 0 ||
+                          strcmp(key, "parent_name_not_regex_any") == 0 ||
+                          strcmp(key, "file_path_not_regex_any") == 0;
     for (cJSON *prior = condition->child; prior != item; prior = prior->next) {
       if (prior->string && strcmp(prior->string, key) == 0) return 0;
     }
@@ -1727,7 +1795,10 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "command_regex_all") == 0 ||
                 strcmp(key, "process_name_regex_any") == 0 ||
                 strcmp(key, "process_path_regex_any") == 0 ||
-                strcmp(key, "parent_name_regex_any") == 0;
+                strcmp(key, "parent_name_regex_any") == 0 ||
+                (schema_version >= 4u && (name_exclusion ||
+                  strcmp(key, "process_name_not_regex_any") == 0 ||
+                  strcmp(key, "parent_name_not_regex_any") == 0));
     } else if (strcmp(event_type, "file_read") == 0 || strcmp(event_type, "file_write") == 0) {
       allowed = strcmp(key, "process_name_in") == 0 ||
                 strcmp(key, "parent_name_in") == 0 ||
@@ -1735,12 +1806,18 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "command_regex_all") == 0 ||
                 strcmp(key, "process_name_regex_any") == 0 ||
                 strcmp(key, "parent_name_regex_any") == 0 ||
-                strcmp(key, "file_path_regex_any") == 0;
+                strcmp(key, "file_path_regex_any") == 0 ||
+                (schema_version >= 4u && (name_exclusion || regex_exclusion ||
+                  strcmp(key, "process_path_regex_any") == 0));
     } else if (strcmp(event_type, "network_connect") == 0) {
       allowed = strcmp(key, "remote_port_in") == 0 ||
                 strcmp(key, "file_path_regex_any") == 0 ||
                 strcmp(key, "process_name_in") == 0 ||
-                strcmp(key, "process_name_regex_any") == 0;
+                strcmp(key, "process_name_regex_any") == 0 ||
+                (schema_version >= 4u && (
+                  strcmp(key, "process_name_not_in") == 0 ||
+                  strcmp(key, "process_name_not_regex_any") == 0 ||
+                  strcmp(key, "file_path_not_regex_any") == 0));
     } else if (strcmp(event_type, "registry_set") == 0) {
       allowed = strcmp(key, "registry_path_regex_any") == 0 ||
                 strcmp(key, "registry_value_name_in") == 0 ||
@@ -1767,6 +1844,15 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
     if (string_array && !p0_condition_string_array_valid(item)) {
       return 0;
     }
+    if (name_exclusion) {
+      if (cJSON_GetArraySize(item) > P0_IR_NAME_IN_MAX) return 0;
+      for (cJSON *value = item->child; value; value = value->next) {
+        if (strlen(value->valuestring) >= sizeof(((struct p0_ir_one *)0)->name_not_in[0]))
+          return 0;
+      }
+    } else if (regex_exclusion && cJSON_GetArraySize(item) > P0_IR_PAT) {
+      return 0;
+    }
   }
   return 1;
 }
@@ -1783,6 +1869,7 @@ static int p0_ir_known_source_marker(const char *field, size_t length) {
       "source.image_path_raw", "source.image_path_resolution_source",
       "source.image_path_resolution_status", "source.integrity_level",
       "source.logon_id", "source.net_dst", "source.net_proto", "source.net_src",
+      "source.network_aux_path",
       "source.parent_cmdline", "source.parent_command_fact", "source.parent_name",
       "source.old_file_path", "source.parent_path", "source.pmfe_snapshot",
       "source.process_creation_time", "source.process_generation_source",
@@ -1861,7 +1948,7 @@ static int p0_ir_rule_fields_complete(const struct p0_ir_one *r,
   if ((r->n_parent_in || r->n_pr_rx) &&
       edr_behavior_source_field_truncated(br, "source.parent_name")) return 0;
   if (strcmp(r->event_type, "network_connect") == 0 && r->n_fpath &&
-      edr_behavior_source_field_truncated(br, "source.file_path")) return 0;
+      edr_behavior_source_field_truncated(br, "source.network_aux_path")) return 0;
   if (strcmp(r->event_type, "registry_set") == 0 &&
       ((r->n_regpath || r->n_reg_dword) &&
        edr_behavior_source_field_truncated(br, "source.reg_key_path"))) return 0;
@@ -1893,7 +1980,7 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
     }
     return one_rule_match_process(
         r, pn, br->exe_path[0] ? br->exe_path : NULL, cmd,
-        br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth
+        br->parent_name[0] ? br->parent_name : NULL, (int)br->process_chain_depth, br
     );
   }
   if (strcmp(r->event_type, "file_read") == 0 || strcmp(r->event_type, "file_write") == 0) {
@@ -1949,7 +2036,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     fprintf(stderr, "[p0_rule_ir] top-level 'rules' missing or not array: %s\n", source_label);
     return 0;
   }
-  int legacy_schema = 0;
+  unsigned parsed_schema_version = 0u;
   {
     cJSON *kind = cJSON_GetObjectItemCaseSensitive(root, "kind");
     cJSON *schema_version = cJSON_GetObjectItemCaseSensitive(root, "ir_schema_version");
@@ -1961,6 +2048,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
         (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
+         schema_version->valuedouble != 3.0 &&
          schema_version->valuedouble != 2.0) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
@@ -1972,7 +2060,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       fprintf(stderr, "[p0_rule_ir] missing or inconsistent artifact binding: %s\n", source_label);
       return 0;
     }
-    legacy_schema = schema_version->valuedouble == 2.0;
+    parsed_schema_version = (unsigned)schema_version->valuedouble;
     snprintf(s_rules_bundle_version, sizeof(s_rules_bundle_version), "%s", version->valuestring);
     s_declared_rule_count = (uint32_t)declared_count->valueint;
     snprintf(s_sensor_interest_manifest_sha256, sizeof(s_sensor_interest_manifest_sha256), "%s",
@@ -2054,8 +2142,8 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       }
     }
     cJSON *jcond = cJSON_GetObjectItemCaseSensitive(rnode, "condition");
-    if (!p0_condition_keys_supported(etbuf, jcond) ||
-        (legacy_schema && cJSON_GetObjectItemCaseSensitive(jcond, "registry_dword_any"))) {
+    if (!p0_condition_keys_supported(etbuf, jcond, parsed_schema_version) ||
+        (parsed_schema_version == 2u && cJSON_GetObjectItemCaseSensitive(jcond, "registry_dword_any"))) {
       semantic_ok = 0;
       break;
     }
@@ -2105,6 +2193,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
           jcond, "process_name_regex_any", t.re_pn_rx, &t.n_pn_rx, P0_IR_PAT, jid->valuestring, &parse_ok
       );
       add_rx_array(
+          jcond, "process_path_regex_any", t.re_ppath_rx, &t.n_ppath_rx, P0_IR_PAT, jid->valuestring, &parse_ok
+      );
+      add_rx_array(
           jcond, "parent_name_regex_any", t.re_pr_rx, &t.n_pr_rx, P0_IR_PAT, jid->valuestring, &parse_ok
       );
       add_rx_array(
@@ -2134,6 +2225,16 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
           jcond, "registry_value_data_in", t.reg_data_in, &t.n_reg_data, P0_IR_NAME_IN_MAX
       );
     }
+    add_str_array(jcond, "process_name_not_in", t.name_not_in, &t.n_name_not_in,
+                  P0_IR_NAME_IN_MAX, 1);
+    add_str_array(jcond, "parent_name_not_in", t.parent_not_in, &t.n_parent_not_in,
+                  P0_IR_NAME_IN_MAX, 1);
+    add_rx_array(jcond, "process_name_not_regex_any", t.re_pn_not_rx, &t.n_pn_not_rx,
+                 P0_IR_PAT, jid->valuestring, &parse_ok);
+    add_rx_array(jcond, "parent_name_not_regex_any", t.re_pr_not_rx, &t.n_pr_not_rx,
+                 P0_IR_PAT, jid->valuestring, &parse_ok);
+    add_rx_array(jcond, "file_path_not_regex_any", t.re_fpath_not, &t.n_fpath_not,
+                 P0_IR_PAT, jid->valuestring, &parse_ok);
     if (!parse_ok) {
       p0_ir_free_pcre_in_rule(&t);
       cJSON_Delete(root);
@@ -2627,7 +2728,7 @@ int edr_p0_rule_ir_matches(const char *rule_id, const char *process_name, const 
       break;
     }
     result = one_rule_match_process(
-        &snapshot->rule[i], process_name, NULL, cmdline, parent_name, process_chain_depth) ? 1 : 0;
+        &snapshot->rule[i], process_name, NULL, cmdline, parent_name, process_chain_depth, NULL) ? 1 : 0;
     break;
   }
   p0_ir_snapshot_release(snapshot);

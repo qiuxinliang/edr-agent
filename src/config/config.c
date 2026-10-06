@@ -27,7 +27,7 @@
 
 /** `high_risk_immediate_ports` TOML 数组最多解析条数（防 OOM） */
 #define EDR_ATTACK_SURFACE_PORTS_MAX 256
-#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r283-e2008650"
+#define EDR_PREPROCESS_RULES_VERSION_DEFAULT "edr-dynamic-rules-v1-r283-a435ea01"
 
 /*
  * Some older Windows bootstrap packages wrote paths such as
@@ -1073,18 +1073,58 @@ EdrError edr_config_load_preprocessing_rules(const char *path, EdrConfig *cfg) {
 }
 
 /* 把 [[detection_policy.suppression]] 数组表序列化为控制符分隔的紧凑串，供检测引擎消费。
- * 规则间 0x1e，字段间 0x1f：target,process,action,reason,contains_all；contains_all token 间 0x1d。 */
-static void sup_append(char *out, size_t cap, size_t *len, const char *s) {
+ * 规则间 0x1e，字段间 0x1f：target,process,action,reason,contains_all[,contains_none]；token 间 0x1d。 */
+static int sup_append(char *out, size_t cap, size_t *len, const char *s) {
   if (!s) {
-    return;
+    return 0;
   }
-  for (; *s && *len + 1u < cap; s++) {
-    /* 丢弃控制符，避免破坏分隔结构。 */
-    if ((unsigned char)*s >= 0x20u) {
-      out[(*len)++] = *s;
-    }
+  size_t n = strlen(s);
+  if (n >= cap - *len) return 0;
+  for (const char *p = s; *p; p++) {
+    if ((unsigned char)*p < 0x20u) return 0;
   }
+  memcpy(out + *len, s, n);
+  *len += n;
   out[*len] = '\0';
+  return 1;
+}
+
+static int sup_separator(char *out, size_t cap, size_t *len, char separator) {
+  if (*len + 1u >= cap) return 0;
+  out[(*len)++] = separator;
+  out[*len] = '\0';
+  return 1;
+}
+
+static int sup_string(toml_table_t *t, const char *key, char *out, size_t cap) {
+  toml_datum_t d = toml_string_in(t, key);
+  if (!d.ok) return toml_key_exists(t, key) ? 0 : 1;
+  int ok = d.u.s && strlen(d.u.s) < cap;
+  if (ok) memcpy(out, d.u.s, strlen(d.u.s) + 1u);
+  free(d.u.s);
+  return ok;
+}
+
+static int sup_tokens(toml_table_t *t, const char *key, char *out,
+                      size_t cap, size_t *len) {
+  toml_array_t *arr = toml_array_in(t, key);
+  if (!arr) return toml_key_exists(t, key) ? 0 : 1;
+  int n = toml_array_nelem(arr), written = 0;
+  if (n < 0) return 0;
+  for (int i = 0; i < n; i++) {
+    toml_datum_t d = toml_string_at(arr, i);
+    if (!d.ok || !d.u.s) return 0;
+    /* The matcher stores complete tokens in a 256-byte buffer. */
+    int ok = strlen(d.u.s) < 256u;
+    if (ok && d.u.s[0]) {
+      ok = (!written || sup_separator(out, cap, len, '\x1d')) &&
+           sup_append(out, cap, len, d.u.s);
+      written = 1;
+    }
+    free(d.u.s);
+    if (!ok) return 0;
+  }
+  return 1;
 }
 
 static void load_detection_policy_suppression(toml_table_t *t, EdrConfig *cfg) {
@@ -1110,43 +1150,36 @@ static void load_detection_policy_suppression(toml_table_t *t, EdrConfig *cfg) {
     char process[128] = "";
     char action[32] = "";
     char reason[96] = "";
-    take_string(toml_string_in(rt, "target_rule_id"), target, sizeof(target));
-    take_string(toml_string_in(rt, "process_name"), process, sizeof(process));
-    take_string(toml_string_in(rt, "action"), action, sizeof(action));
-    take_string(toml_string_in(rt, "reason"), reason, sizeof(reason));
+    size_t start = len;
+    if (!sup_string(rt, "target_rule_id", target, sizeof(target)) ||
+        !sup_string(rt, "process_name", process, sizeof(process)) ||
+        !sup_string(rt, "action", action, sizeof(action)) ||
+        !sup_string(rt, "reason", reason, sizeof(reason))) goto rejected;
     if (!action[0]) {
       snprintf(action, sizeof(action), "%s", "downgrade");
     }
-    if (written && len + 1u < cap) {
-      out[len++] = '\x1e';
-    }
-    sup_append(out, cap, &len, target);
-    if (len + 1u < cap) out[len++] = '\x1f';
-    sup_append(out, cap, &len, process);
-    if (len + 1u < cap) out[len++] = '\x1f';
-    sup_append(out, cap, &len, action);
-    if (len + 1u < cap) out[len++] = '\x1f';
-    sup_append(out, cap, &len, reason);
-    if (len + 1u < cap) out[len++] = '\x1f';
-    toml_array_t *ca = toml_array_in(rt, "contains_all");
-    if (ca) {
-      int cn = toml_array_nelem(ca);
-      int first = 1;
-      for (int j = 0; j < cn; j++) {
-        toml_datum_t d = toml_string_at(ca, j);
-        if (!d.ok || !d.u.s) {
-          continue;
-        }
-        if (!first && len + 1u < cap) {
-          out[len++] = '\x1d';
-        }
-        sup_append(out, cap, &len, d.u.s);
-        first = 0;
-        free(d.u.s);
-      }
-    }
+    if (strcmp(action, "downgrade") && strcmp(action, "drop")) goto rejected;
+    if ((written && !sup_separator(out, cap, &len, '\x1e')) ||
+        !sup_append(out, cap, &len, target) ||
+        !sup_separator(out, cap, &len, '\x1f') ||
+        !sup_append(out, cap, &len, process) ||
+        !sup_separator(out, cap, &len, '\x1f') ||
+        !sup_append(out, cap, &len, action) ||
+        !sup_separator(out, cap, &len, '\x1f') ||
+        !sup_append(out, cap, &len, reason) ||
+        !sup_separator(out, cap, &len, '\x1f') ||
+        !sup_tokens(rt, "contains_all", out, cap, &len)) goto rejected;
+    if (toml_key_exists(rt, "contains_none") &&
+        (!sup_separator(out, cap, &len, '\x1f') ||
+         !sup_tokens(rt, "contains_none", out, cap, &len))) goto rejected;
     out[len] = '\0';
     written = 1;
+    continue;
+rejected:
+    /* Never activate a prefix after losing an AND condition or exception. */
+    len = start;
+    out[len] = '\0';
+    fprintf(stderr, "[config] suppression rule %d rejected: invalid or oversized field\n", i);
   }
 }
 
@@ -1266,8 +1299,19 @@ static void apply_detection_policy_env(const EdrConfig *cfg) {
   config_setenv_if_value("EDR_DETECTION_ALLOW_PATHS", cfg->detection_policy.allow_paths);
   config_setenv_if_value("EDR_DETECTION_SCRIPT_DIRS", cfg->detection_policy.script_dirs);
   config_setenv_if_value("EDR_DETECTION_MGMT_TOOLS", cfg->detection_policy.management_tools);
-  config_setenv_if_value("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback);
-  config_setenv_if_value("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules);
+  if (strcmp(cfg->detection_policy.source, "server") == 0) {
+    /* Empty signed feedback revokes both previously installed channels. */
+#ifdef _WIN32
+    (void)_putenv_s("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback);
+    (void)_putenv_s("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules);
+#else
+    (void)setenv("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback, 1);
+    (void)setenv("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules, 1);
+#endif
+  } else {
+    config_setenv_if_value("EDR_DETECTION_FP_FEEDBACK", cfg->detection_policy.fp_feedback);
+    config_setenv_if_value("EDR_DETECTION_SUPPRESSION_RULES", cfg->detection_policy.suppression_rules);
+  }
 }
 
 static void load_ave(toml_table_t *t, EdrConfig *cfg) {

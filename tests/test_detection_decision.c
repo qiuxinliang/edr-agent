@@ -474,7 +474,7 @@ static void test_conditional_suppression_downgrades_matching_variant(void) {
   /* 紧凑串：target \037 process \037 action \037 reason \037 contains_all(\035)。
    * 用八进制转义避免 \x 贪婪吞掉后续十六进制字母。 */
   const char *rules =
-      "R-LOLBIN-002\037rundll32.exe\037downgrade\037auto_fp_R-LOLBIN-002\037"
+      "agent_decision_v1\037rundll32.exe\037downgrade\037auto_fp_R-LOLBIN-002\037"
       "davclnt.dll,DavSetCookie\035localhost";
   test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
 
@@ -506,7 +506,7 @@ static void test_conditional_suppression_downgrades_matching_variant(void) {
 }
 
 static void test_conditional_suppression_skips_high_signal(void) {
-  const char *rules = "R-X\037powershell.exe\037drop\037r\037encodedcommand";
+  const char *rules = "agent_decision_v1\037powershell.exe\037drop\037r\037encodedcommand";
   test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
   /* 凭据转储等高危信号不应被条件化 suppression 误降级。 */
   EdrBehaviorRecord r;
@@ -515,6 +515,106 @@ static void test_conditional_suppression_skips_high_signal(void) {
   snprintf(r.process_name, sizeof(r.process_name), "%s", "powershell.exe");
   snprintf(r.cmdline, sizeof(r.cmdline), "%s",
            "powershell.exe -EncodedCommand SQBFAFgA ; lsass mimikatz sekurlsa::logonpasswords");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+  test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
+}
+
+static void test_conditional_suppression_preserves_scope_and_counterexamples(void) {
+  const char *rules = "agent_decision_v1\037reader.exe\037downgrade\037safe_variant\037allowed.ps1\037forbidden\035remote.example";
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
+  const char *names[] = {"READER.EXE", "reader.exe", "reader.exe", "other.exe", "", "evilreader.exe"};
+  const char *commands[] = {"reader.exe allowed.ps1", "reader.exe allowed.ps1 forbidden",
+                          "reader.exe allowed.ps1 remote.example", "reader.exe allowed.ps1",
+                          "reader.exe allowed.ps1", "reader.exe allowed.ps1"};
+  for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+    EdrBehaviorRecord r;
+    EdrDetectionDecision d;
+    init(&r);
+    snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "COMPLETE");
+    snprintf(r.process_name, sizeof(r.process_name), "%s", names[i]);
+    snprintf(r.cmdline, sizeof(r.cmdline), "%s", commands[i]);
+    edr_detection_decision_evaluate(&r, &d);
+    assert((strstr(d.reason, "conditional_suppression") != NULL) == (i == 0));
+  }
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "reader.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "reader.exe allowed.ps1");
+  snprintf(r.detection_context, sizeof(r.detection_context), "%s", "{\"rule_id\":\"R-CRED-003\"}");
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", "R-CRED-003\037reader.exe\037downgrade\037scoped\037allowed.ps1");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+  /* Explicitly unscoped rules retain their process and token constraints. */
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", "\037reader.exe\037downgrade\037unscoped\037allowed.ps1");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") != NULL);
+  test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
+}
+
+static void test_conditional_suppression_requires_complete_counterexample_text(void) {
+  static const char *truncated[] = {
+    "source.cmdline", "source.cmdline_quality_unknown", "source.file_path",
+    "source.exe_path", "source.script_snippet", "source.process_name",
+    "source.parent_name", "source.parent_path", "source.parent_cmdline",
+    "source.net_dst", "source.dns_query", "source.reg_key_path",
+    "source.username", "source.file_old_path", "source.network_aux_path",
+    "source.reg_value_name", "source.reg_value_data",
+    "source.list_overflow", "source.source_completeness"
+  };
+  const char *rules = "agent_decision_v1\037reader.exe\037downgrade\037safe_variant\037allowed.ps1\037forbidden";
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", rules);
+  for (size_t i = 0; i < sizeof(truncated) / sizeof(truncated[0]); i++) {
+    EdrBehaviorRecord r;
+    EdrDetectionDecision d;
+    init(&r);
+    snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "COMPLETE");
+    snprintf(r.process_name, sizeof(r.process_name), "%s", "reader.exe");
+    snprintf(r.cmdline, sizeof(r.cmdline), "%s", "reader.exe allowed.ps1");
+    edr_behavior_mark_source_truncated(&r, truncated[i]);
+    edr_detection_decision_evaluate(&r, &d);
+    assert(strstr(d.reason, "conditional_suppression") == NULL);
+  }
+  EdrBehaviorRecord r;
+  EdrDetectionDecision d;
+  init(&r);
+  snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "COMPLETE");
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "reader.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "reader.exe allowed.ps1");
+  snprintf(r.parent_path, sizeof(r.parent_path), "%s", "C:\\forbidden\\parent.exe");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+  init(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "reader.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "reader.exe allowed.ps1");
+  /* Missing or unrecognized provenance cannot prove a token is absent. */
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+  snprintf(r.source_completeness, sizeof(r.source_completeness), "%s", "UNKNOWN");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+
+  /* The original command contains the counterexample beyond the local cap. */
+  size_t cap = sizeof(r.cmdline);
+  char *original = (char *)malloc(cap + 32u);
+  assert(original != NULL);
+  memset(original, 'x', cap + 31u);
+  memcpy(original, "reader.exe allowed.ps1 ", sizeof("reader.exe allowed.ps1 ") - 1u);
+  memcpy(original + cap + 1u, " forbidden", sizeof(" forbidden"));
+  snprintf(r.cmdline, cap, "%s", original);
+  free(original);
+  assert(strstr(r.cmdline, "forbidden") == NULL);
+  edr_behavior_mark_source_truncated(&r, "source.cmdline");
+  edr_detection_decision_evaluate(&r, &d);
+  assert(strstr(d.reason, "conditional_suppression") == NULL);
+
+  /* A clipped name cannot authorize even a rule without counterexamples. */
+  init(&r);
+  snprintf(r.process_name, sizeof(r.process_name), "%s", "reader.exe");
+  snprintf(r.cmdline, sizeof(r.cmdline), "%s", "reader.exe allowed.ps1");
+  edr_behavior_mark_source_truncated(&r, "source.process_name");
+  test_setenv("EDR_DETECTION_SUPPRESSION_RULES", "agent_decision_v1\037reader.exe\037downgrade\037name\037allowed.ps1");
   edr_detection_decision_evaluate(&r, &d);
   assert(strstr(d.reason, "conditional_suppression") == NULL);
   test_unsetenv("EDR_DETECTION_SUPPRESSION_RULES");
@@ -865,6 +965,8 @@ int main(void) {
   test_event_quality_suppressed_p0_retains_score();
   test_conditional_suppression_downgrades_matching_variant();
   test_conditional_suppression_skips_high_signal();
+  test_conditional_suppression_preserves_scope_and_counterexamples();
+  test_conditional_suppression_requires_complete_counterexample_text();
   test_ransom_recovery_requires_dangerous_args();
   test_ransom_single_counter_does_not_emit_burst();
   test_ransom_recovery_plus_file_burst_still_alerts();

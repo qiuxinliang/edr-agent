@@ -15,11 +15,12 @@
  * header and exports these literals, so a backend provenance record cannot
  * name a parser schema, capacity, or source grammar that this binary does
  * not actually compile. */
-/* v3 narrows file_write to content writes and creates. */
-#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v3"
-#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@3"
+/* v4 adds field-specific exclusions and executable paths on file rules.
+ * Missing or truncated exclusion evidence cannot exempt an event. */
+#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v4"
+#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@4"
 #define EDR_P0_RULE_IR_BUNDLE_KIND "edr_p0_rule_bundle_ir_v1"
-#define EDR_P0_RULE_IR_SCHEMA_VERSION 3u
+#define EDR_P0_RULE_IR_SCHEMA_VERSION 4u
 #define EDR_P0_RULE_IR_MAX_RULES 256u
 
 typedef struct {

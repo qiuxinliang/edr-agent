@@ -1,4 +1,5 @@
 #include "edr/http_retry.h"
+#include "edr/detection_decision.h"
 
 #include <ctype.h>
 #include <stddef.h>
@@ -115,6 +116,7 @@ int edr_http_build_request_headers(const EdrHttpRequestAttemptSpec *spec,
   n = snprintf(out + used, out_cap - used,
                "X-Tenant-ID: %s\r\n"
                "X-Endpoint-ID: %s\r\n"
+               "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT "\r\n"
                "X-User-ID: %s\r\n"
                "X-Permission-Set: %s\r\n",
                spec->tenant_id && spec->tenant_id[0] ? spec->tenant_id : "demo-tenant",

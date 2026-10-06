@@ -1,6 +1,9 @@
 #ifndef EDR_DETECTION_DECISION_H
 #define EDR_DETECTION_DECISION_H
 
+/* Exact target/process matching, counterexamples and empty-policy revocation. */
+#define EDR_DETECTION_SUPPRESSION_CONTRACT "2"
+
 #include "edr/behavior_record.h"
 
 #include <stdint.h>

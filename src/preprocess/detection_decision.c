@@ -17,6 +17,7 @@
 #include <string.h>
 
 #define EDR_RANSOM_CONTROL_VERSION "ransom-control-v3"
+#define EDR_DETECTION_DECISION_RULE_ID "agent_decision_v1"
 
 static int has_ci(const char *hay, const char *needle) {
   if (!needle || !needle[0]) {
@@ -778,8 +779,8 @@ static int false_positive_feedback_match(const EdrBehaviorRecord *r) {
 }
 
 /* 二期条件化 suppression：解析 EDR_DETECTION_SUPPRESSION_RULES（控制符分隔的紧凑串，由
- * config.c 从 [[detection_policy.suppression]] 生成），用 AND 语义匹配：process_name 命中且
- * contains_all 全部出现才命中。命中时输出 reason 与 action（0=downgrade,1=drop）。
+ * config.c 从 [[detection_policy.suppression]] 生成），先匹配本引擎规则范围和真实进程名，
+ * contains_all 全部出现且 contains_none 全部未出现才命中。输出 reason 和 action。
  * 相比 fp_feedback 平铺匹配，它保留同进程其它形态（如外链 / 非 localhost）的告警能力。 */
 static int record_text_has_ci(const EdrBehaviorRecord *r, const char *needle) {
   if (!r || !needle || !needle[0]) {
@@ -789,6 +790,68 @@ static int record_text_has_ci(const EdrBehaviorRecord *r, const char *needle) {
          has_ci(r->file_path, needle) || has_ci(r->script_snippet, needle) ||
          has_ci(r->net_dst, needle) || has_ci(r->dns_query, needle) ||
          has_ci(r->process_name, needle) || has_ci(r->reg_key_path, needle);
+}
+
+static int suppression_process_name_matches(const char *expected, const char *actual) {
+  if (!expected[0]) return 1;
+  while (*expected && *actual &&
+         tolower((unsigned char)*expected) == tolower((unsigned char)*actual)) {
+    expected++;
+    actual++;
+  }
+  return *expected == '\0' && *actual == '\0';
+}
+
+static int suppression_counterexample_text_complete(const EdrBehaviorRecord *r) {
+  /* An absent counterexample authorizes an exemption only when all searched
+   * source text is available. A clipped tail may contain that counterexample. */
+  static const char *fields[] = {
+    "source.cmdline", "source.cmdline_quality_unknown", "source.exe_path",
+    "source.file_path", "source.script_snippet", "source.net_dst",
+    "source.dns_query", "source.process_name", "source.reg_key_path",
+    "source.parent_name", "source.parent_path", "source.parent_cmdline",
+    "source.username", "source.file_old_path", "source.old_file_path",
+    "source.network_aux_path", "source.reg_value_name", "source.reg_value_data"
+  };
+  if (edr_behavior_p0_source_quality_hard_reject(r) ||
+      (strcmp(r->source_completeness, "COMPLETE") != 0 &&
+       strcmp(r->source_completeness, "COALESCED") != 0 &&
+       strcmp(r->source_completeness, "TRUNCATED") != 0)) return 0;
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    if (edr_behavior_source_field_truncated(r, fields[i])) return 0;
+  }
+  return 1;
+}
+
+static int suppression_counterexample_present(const EdrBehaviorRecord *r, const char *token) {
+  /* Extra source fields can only veto an exemption; they do not expand the
+   * existing positive-token surface that authorizes suppression. */
+  return record_text_has_ci(r, token) || has_ci(r->parent_name, token) ||
+         has_ci(r->parent_path, token) || has_ci(r->parent_cmdline, token) ||
+         has_ci(r->username, token) || has_ci(r->file_old_path, token) ||
+         has_ci(r->network_aux_path, token) || has_ci(r->reg_value_name, token) ||
+         has_ci(r->reg_value_data, token);
+}
+
+static int suppression_tokens_match(const EdrBehaviorRecord *r, const char *start,
+                                    const char *end, int must_be_present,
+                                    int *any_contains) {
+  while (start < end) {
+    char token[256];
+    size_t len = 0u;
+    while (start < end && *start != '\x1d') {
+      if ((unsigned char)*start < 0x20u || len + 1u >= sizeof(token)) return 0;
+      token[len++] = *start++;
+    }
+    token[len] = '\0';
+    if (start < end) start++;
+    if (len) {
+      *any_contains = 1;
+      if (must_be_present ? !record_text_has_ci(r, token)
+                          : suppression_counterexample_present(r, token)) return 0;
+    }
+  }
+  return 1;
 }
 
 static int conditional_suppression_match(const EdrBehaviorRecord *r, char *reason_out,
@@ -813,54 +876,41 @@ static int conditional_suppression_match(const EdrBehaviorRecord *r, char *reaso
     while (*rule_end && *rule_end != '\x1e') {
       rule_end++;
     }
-    /* 字段：target \x1f process \x1f action \x1f reason \x1f contains_all(\x1d 分隔) */
+    /* Optional sixth field contains_none preserves counterexamples. */
     char target[96] = "", process[128] = "", action[32] = "", reason[96] = "";
     char *fields[4] = {target, process, action, reason};
     size_t caps[4] = {sizeof(target), sizeof(process), sizeof(action), sizeof(reason)};
     const char *q = p;
-    int fi = 0;
-    for (; fi < 4 && q < rule_end; fi++) {
-      size_t k = 0u;
-      while (q < rule_end && *q != '\x1f' && k + 1u < caps[fi]) {
-        fields[fi][k++] = *q++;
-      }
-      fields[fi][k] = '\0';
-      while (q < rule_end && *q != '\x1f') {
-        q++;
-      }
-      if (q < rule_end && *q == '\x1f') {
-        q++;
-      }
-    }
-    /* q..rule_end 是 contains_all token（0x1d 分隔）。 */
     int ok = 1;
-    if (process[0] && !record_text_has_ci(r, process)) {
-      ok = 0;
-    }
-    int any_contains = 0;
-    const char *c = q;
-    while (ok && c < rule_end) {
-      char tok[256];
+    for (int fi = 0; fi < 4; fi++) {
       size_t k = 0u;
-      while (c < rule_end && *c != '\x1d' && k + 1u < sizeof(tok)) {
-        tok[k++] = *c++;
-      }
-      tok[k] = '\0';
-      while (c < rule_end && *c != '\x1d') {
-        c++;
-      }
-      if (c < rule_end && *c == '\x1d') {
-        c++;
-      }
-      if (tok[0]) {
-        any_contains = 1;
-        if (!record_text_has_ci(r, tok)) {
+      while (q < rule_end && *q != '\x1f') {
+        if (k + 1u >= caps[fi] || (unsigned char)*q < 0x20u) {
           ok = 0;
           break;
         }
+        fields[fi][k++] = *q++;
       }
+      fields[fi][k] = '\0';
+      if (!ok || q == rule_end) { ok = 0; break; }
+      q++;
     }
-    (void)target;
+    /* The generic decision owns this ID. P0 rule IDs and event-reported
+     * context cannot grant a generic suppression exemption. */
+    if (target[0] && strcmp(target, EDR_DETECTION_DECISION_RULE_ID) != 0) ok = 0;
+    if (process[0] && (edr_behavior_p0_source_quality_hard_reject(r) ||
+                      edr_behavior_source_field_truncated(r, "source.process_name"))) ok = 0;
+    if (!suppression_process_name_matches(process, r->process_name)) ok = 0;
+    if (action[0] && strcmp(action, "downgrade") && strcmp(action, "drop")) ok = 0;
+    int any_contains = 0;
+    const char *all_end = q;
+    while (all_end < rule_end && *all_end != '\x1f') all_end++;
+    if (ok) ok = suppression_tokens_match(r, q, all_end, 1, &any_contains);
+    if (ok && all_end < rule_end) {
+      int any_none = 0;
+      ok = suppression_tokens_match(r, all_end + 1, rule_end, 0, &any_none);
+      if (any_none && !suppression_counterexample_text_complete(r)) ok = 0;
+    }
     /* 至少要有一个收窄条件（进程或 contains），避免空规则全匹配。 */
     if (ok && (process[0] || any_contains)) {
       if (reason_out && reason_cap) {
@@ -1819,7 +1869,7 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
              r->type == EDR_EVENT_PROCESS_INJECT ? "process_inject" : "remote_thread_create", 32u);
   }
   json_cat(context, context_capacity,
-           ",\"rule_id\":\"agent_decision_v1\",\"confidence\":%.3f,\"suppressed\":%s,\"reason\":",
+           ",\"rule_id\":\"" EDR_DETECTION_DECISION_RULE_ID "\",\"confidence\":%.3f,\"suppressed\":%s,\"reason\":",
            d->confidence, d->suppress ? "true" : "false");
   json_str(context, context_capacity, d->reason, 220u);
   json_cat(context, context_capacity,
