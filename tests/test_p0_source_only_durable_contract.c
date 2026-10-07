@@ -642,6 +642,15 @@ static int verify_terminal_fixture(void) {
       }
       if (i==TERMINAL_COMBINED_FRAME) {
         uint8_t changed[65536]; pb_ostream_t out;
+        /* Projection must not rewrite the durable terminal commitment. The
+         * same original bytes remain the journal and late-ACK identity. */
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!edr_egress_event_project(&decoded,reason,sizeof(reason)) ||
+            !pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            out.bytes_written!=s_terminal_wire_lens[i]-16u ||
+            memcmp(changed,s_terminal_wires[i]+16u,out.bytes_written)!=0) {
+          fprintf(stderr,"FAIL: terminal projection rewrote journal commitment\n"); return 0;
+        }
         /* Numeric JSON birth times must retain exact uint64 identity even
          * above double precision. Labels and terminal hashes cannot hide a
          * mismatched generation or an opaque source-evidence subtree. */

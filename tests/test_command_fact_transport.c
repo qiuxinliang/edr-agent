@@ -7,6 +7,7 @@
 #include "edr/p0_deferred_snapshot.h"
 #include "edr/p0_rule_ir.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
 #ifdef EDR_P0_TEST_REAL_IR
 #include "edr/p0_rule_direct_emit.h"
 #endif
@@ -132,7 +133,7 @@ static uint8_t *capture_produced_wire(const char *path, size_t *size,
   snprintf(alert->related_iocs_json, sizeof(alert->related_iocs_json), "%s", a->related_iocs_json);
   snprintf(alert->cmdline, sizeof(alert->cmdline), "%s", a->cmdline);
   cJSON *subject = cJSON_Parse(a->user_subject_json); assert(subject);
-  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(subject, "rule_id")->valuestring, "R-CRED-003"));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(subject, "rule_id")->valuestring, "R-EXEC-001"));
   cJSON_Delete(subject); free(event);
   return wire;
 }
@@ -148,6 +149,27 @@ static int has_rule(const EdrBehaviorRecord *record, const EdrCommandFacts *fact
   }
   edr_p0_rule_ir_evaluation_free(&evaluation);
   return found;
+}
+static void authorize_replayed_match(EdrBehaviorRecord *record, const EdrCommandFacts *facts,
+                                     const EdrP0RuleIrBinding *binding, const char *rule_id) {
+  EdrP0RuleIrEvaluation evaluation;
+  unsigned found = 0;
+  assert(edr_p0_rule_ir_evaluate_record(record, facts, &evaluation));
+  assert(!strcmp(evaluation.binding.artifact_sha256, binding->artifact_sha256));
+  assert(!strcmp(evaluation.binding.rules_bundle_version, binding->rules_bundle_version));
+  for (uint32_t i = 0; i < evaluation.match_count; ++i) {
+    EdrP0RuleIrMatch match;
+    assert(edr_p0_rule_ir_evaluation_get_match(&evaluation, i, &match));
+    if (strcmp(match.rule_id, rule_id)) continue;
+    assert(match.effect == EDR_P0_EFFECT_SECURITY_ALERT);
+    record->evidence_projection_version = EDR_EVIDENCE_PROJECTION_VERSION;
+    record->required_evidence_fields = match.required_evidence_fields;
+    record->tactic_probability_state = 1u;
+    snprintf(record->operation_evidence, sizeof(record->operation_evidence), "%s", match.operation_evidence);
+    ++found;
+  }
+  assert(found == 1);
+  edr_p0_rule_ir_evaluation_free(&evaluation);
 }
 #endif
 
@@ -188,14 +210,16 @@ int main(int argc, char **argv) {
   const size_t sizes[] = {8191u, 8192u, 12717u, EDR_PROCESS_COMMAND_FACT_CAP - 1u};
   for (size_t k = 0; k < sizeof(sizes)/sizeof(sizes[0]); ++k) {
     size_t n = sizes[k];
+    child->type = EDR_EVENT_FILE_READ;
+    strcpy(child->process_name, "inert-child.exe");
+    strcpy(child->file_path, "C:\\test\\Login Data");
+    strcpy(child->file_op, "read");
     parent->process_start_key++; child->process_start_key++;
     child->parent_process_start_key = parent->process_start_key;
     memset(command, 'x', n); memcpy(command, "inert.exe --BEGIN ", 18); memcpy(command + n - 4, " END", 4); command[n] = 0;
     /* Multibyte content immediately crosses the old preview boundary. */
     if (n > 8194u) memcpy(command + 8190, "\xe4\xb8\xad", 3);
-    if (n == 8191u || n == 8192u || n == 12717u) {
-      memcpy(command + n - 5u, " -enc", 5u);
-    }
+    memcpy(command + n - 5u, " -enc", 5u);
     if (n == 12717u) {
       /* Keep syntax-significant bytes in the exact BAT1 fixture as well as
        * the long-tail predicate. The backend can consume this same output. */
@@ -320,8 +344,20 @@ int main(int argc, char **argv) {
     assert(edr_storage_queue_open(queue) == EDR_OK);
 #ifdef EDR_P0_TEST_REAL_IR
     assert(edr_p0_rule_ir_get_binding(&binding));
-    snapshot_rule = "R-CRED-003";
     int proven_miss = 0;
+    /* A browser-data read still matches its real local observation rule,
+     * but has no independent alert or queue authority. Long facts do not
+     * turn that observation into a security alert. */
+    assert(edr_p0_rule_try_emit_with_command_facts_status(child, &captured, &proven_miss) == 0);
+    assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue;") == 0);
+    /* The transport positive has an actual full-command predicate: the
+     * encoded-command token at the tail must survive local/deferred replay.
+     * Its unrelated parent command remains local, outside the projection. */
+    snapshot_rule = "R-EXEC-001";
+    child->type = EDR_EVENT_PROCESS_CREATE;
+    strcpy(child->process_name, "powershell.exe");
+    child->file_path[0] = child->file_op[0] = 0;
+    assert(has_rule(child, &captured, snapshot_rule));
     assert(edr_p0_rule_try_emit_with_command_facts_status(child, &captured, &proven_miss) == 1);
     assert(!proven_miss);
     expected_wire = capture_produced_wire(queue, &expected_size, &alert);
@@ -341,13 +377,22 @@ int main(int argc, char **argv) {
         &captured, &snapshot, &snapshot_size));
     assert(edr_sha256_hex((const uint8_t *)snapshot, snapshot_size, deferred_key) == 0);
     free(captured.subject); free(captured.parent);
-    assert(expected_wire && expected_size > n*2 && expected_size < 256u*1024u);
+    assert(expected_wire && expected_size < 256u*1024u);
     memset(decoded, 0, sizeof(*decoded));
     pb_istream_t input = pb_istream_from_buffer(expected_wire + 16u, expected_size - 16u);
     assert(pb_decode(&input, edr_v1_BehaviorEvent_fields, decoded));
-    assert(!strcmp(decoded->cmdline, command) && !strcmp(decoded->process_context.parent_cmdline, command));
+    assert(!strcmp(decoded->cmdline, command));
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(expected_size > n && expected_size < n*2);
+    assert(decoded->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION);
+    assert(!decoded->process_context.parent_cmdline[0] && !decoded->behavior_alert.cmdline[0]);
+#else
+    assert(expected_size > n*2 && !strcmp(decoded->process_context.parent_cmdline, command));
+#endif
     assert(!decoded->truncated_fields[0] && !strcmp(decoded->transport_completeness, "COMPLETE"));
+#ifndef EDR_P0_TEST_REAL_IR
     assert(!strcmp(decoded->detail.file.target_path, child->file_path));
+#endif
     assert(edr_storage_queue_p0_deferred_retain(deferred_key, 1u,
         (const uint8_t *)snapshot, snapshot_size) == EDR_OK);
     free(snapshot);
@@ -378,15 +423,19 @@ int main(int argc, char **argv) {
     assert(!strcmp(restored_rule, snapshot_rule));
     assert(!strcmp(restored_binding.artifact_sha256, binding.artifact_sha256));
     assert(!strcmp(restored_binding.rules_bundle_version, binding.rules_bundle_version));
+    assert(recovered.subject && !strcmp(recovered.subject, command));
+    assert(recovered.parent && !strcmp(recovered.parent, command));
 #ifdef EDR_P0_TEST_REAL_IR
-    assert(has_rule(restored, &recovered, "R-CRED-003"));
-    if (n == 12717u) {
-      restored->type = EDR_EVENT_PROCESS_CREATE;
-      strcpy(restored->process_name, "powershell.exe");
-      assert(has_rule(restored, &recovered, "R-EXEC-001"));
-      restored->type = EDR_EVENT_FILE_READ;
-      strcpy(restored->process_name, "inert-child.exe");
-    }
+    assert(has_rule(restored, &recovered, "R-EXEC-001"));
+    /* Deferred facts are not a reusable alert grant. Without re-evaluating
+     * the retained binding, the borrowed subject cannot authorize a frame. */
+    size_t unauthorized_size = 0;
+    uint8_t *unauthorized = edr_behavior_record_alloc_outbound_wire_facts(
+        restored, &alert, &recovered, &unauthorized_size);
+    assert(!unauthorized && !unauthorized_size);
+    /* Reproduce the producer's descriptor copy from an actual match under
+     * the same immutable bundle; never authorize from the alert's JSON. */
+    authorize_replayed_match(restored, &recovered, &restored_binding, restored_rule);
 #endif
     size_t replay_size = 0;
     uint8_t *replay =
@@ -396,6 +445,10 @@ int main(int argc, char **argv) {
         edr_behavior_record_alloc_durable_wire_facts(restored, &alert, &recovered, &replay_size);
 #endif
     assert(replay && replay_size == expected_size && !memcmp(replay, expected_wire, replay_size));
+#ifdef EDR_P0_TEST_REAL_IR
+    assert(edr_egress_batch_validate(replay, 12u, replay+12u,
+        replay_size-12u, why, sizeof(why)));
+#endif
     /* This is the same atomic handoff used after deferred matching. Give the
      * delivery a distinct id from the earlier deliberately identical test. */
     assert(edr_storage_queue_p0_deferred_complete(selected_key, selected_key,

@@ -831,7 +831,9 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *res
       !ev->has_ave_behavior_feed && projected_evidence_valid(ev,dynamic,resource_unavailable));
     if (valid && dynamic) {
       const cJSON *context=cJSON_GetObjectItemCaseSensitive(subject,"context");
-      valid=dynamic_context_purpose(subject,ev->required_evidence_fields,0) &&
+      /* Terminal pairs retain the exact journal commitment. Their closed
+       * context is validated above; ordinary v2 projection is not their owner. */
+      valid=(terminal || dynamic_context_purpose(subject,ev->required_evidence_fields,0)) &&
         generation_matches(context,"process_start_key",ev->process_start_key) &&
         generation_matches(context,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns);
     }

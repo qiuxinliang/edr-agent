@@ -457,6 +457,16 @@ if(WIN32)
   edr_apply_test_warnings(test_collector_file_read_windows)
   add_test(NAME collector_file_read_windows COMMAND test_collector_file_read_windows)
 
+  if(NOT OpenSSL_FOUND)
+    message(FATAL_ERROR "Native ETW admission tests require OpenSSL for authenticated P0 rule fixtures")
+  endif()
+  # Exercise production EDR1 admission. Keep the durable purpose archive in
+  # this fixture's build directory, never beside checked-in release inputs.
+  set(_etw_network_rule_fixture "${CMAKE_CURRENT_BINARY_DIR}/etw-network-rules")
+  configure_file(${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc
+    ${_etw_network_rule_fixture}/p0_rule_bundle_ir_v1.json.enc COPYONLY)
+  configure_file(${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json
+    ${_etw_network_rule_fixture}/sensor_interest_manifest.json COPYONLY)
   add_executable(test_etw_network_decode_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c
     ${CMAKE_CURRENT_SOURCE_DIR}/collector_network_stubs.c
@@ -479,7 +489,7 @@ if(WIN32)
   target_include_directories(test_etw_network_decode_windows PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_etw_network_decode_windows PRIVATE
-    EDR_TDH_TESTING=1 EDR_COLLECTOR_NETWORK_TESTING=1)
+    EDR_TDH_TESTING=1 EDR_COLLECTOR_NETWORK_TESTING=1 EDR_HAVE_OPENSSL_FL=1)
   if(MSVC)
     target_compile_options(test_etw_network_decode_windows PRIVATE /Gy /Gw)
     target_link_options(test_etw_network_decode_windows PRIVATE /OPT:REF /INCREMENTAL:NO)
@@ -494,10 +504,13 @@ if(WIN32)
     target_include_directories(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
     target_link_libraries(test_etw_network_decode_windows PRIVATE ${EDR_PCRE2_LIBRARY})
   endif()
+  # Keep the verified static PCRE2 headers before OpenSSL's shared vcpkg
+  # include directory, whose pcre2.h would otherwise declare DLL imports.
+  target_link_libraries(test_etw_network_decode_windows PRIVATE OpenSSL::Crypto)
   edr_apply_test_warnings(test_etw_network_decode_windows)
   add_test(NAME etw_network_decode_native COMMAND test_etw_network_decode_windows)
   set_tests_properties(etw_network_decode_native PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${_etw_network_rule_fixture}/p0_rule_bundle_ir_v1.json.enc;EDR_SENSOR_INTEREST_PATH=${_etw_network_rule_fixture}/sensor_interest_manifest.json")
 
   add_executable(test_wfas_provider_windows test_wfas_provider_windows.c)
   target_include_directories(test_wfas_provider_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
