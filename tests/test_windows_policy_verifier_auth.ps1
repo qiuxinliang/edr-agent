@@ -5,10 +5,16 @@ $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('edr-policy-auth-' + [Guid]
 [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
 $config = Join-Path $fixtureRoot 'agent.toml'
 $oldBearer = [Environment]::GetEnvironmentVariable('EDR_PLATFORM_BEARER', 'Process')
-$rootStore = $null; $rootMaterial = $null; $serverMaterial = $null; $badMaterial = $null
+$rootMaterial = $null; $serverMaterial = $null; $badMaterial = $null; $otherRootMaterial = $null
+$privateTlsConfigured = $false
+$oldCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
 $oldProtocol = [Net.ServicePointManager]::SecurityProtocol
 $oldProxy = [Net.WebRequest]::DefaultWebProxy
 function Assert-Policy([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+function Write-PolicyPhase([string]$Phase, $Listener = $null) {
+  $detail = if ($null -eq $Listener) { '' } else { ' accepted=' + $Listener.AcceptedConnections + ' tls=' + $Listener.HandshakeCompleted + ' http=' + $Listener.ReceivedRequest }
+  Write-Host ('policy_auth_phase=' + $Phase + $detail)
+}
 function Write-PolicyConfig([string]$Bearer) {
   [IO.File]::WriteAllText($config, "[unrelated]`nrest_bearer_token = `"must-not-select`"`n[platform]`nrest_bearer_token = `"$Bearer`"`n")
 }
@@ -100,27 +106,44 @@ try {
     return
   }
 
-  # CI-only loopback TLS fixture: import only this unique test CA into CurrentUser
-  # Root and remove it in finally. No Agent credential/server is reused, and
-  # hostname/chain validation remains the normal Invoke-WebRequest behavior.
+  # Reuse the installer's strict CLR CA validator in this isolated test process.
+  # CurrentUser Root imports can display interactive security UI on Windows;
+  # this fixture must not write an OS trust store or wait for that UI. The real
+  # verifier/request path remains unchanged, including hostname and EKU checks.
+  Assert-Policy ($PSVersionTable.PSEdition -eq 'Desktop') 'Native TLS contract requires Windows PowerShell Desktop; use HostContractOnly on other hosts'
+  Write-PolicyPhase 'native_fixture_load'
+  Assert-Policy ($null -eq $oldCallback) 'TLS fixture requires an isolated validation callback context'
+  $installerAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/edr_agent_install.ps1'), [ref]$tokens, [ref]$parseErrors)
+  Assert-Policy (@($parseErrors).Count -eq 0) 'Production installer TLS validator must parse'
+  $validator = @($installerAst.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Ensure-BootstrapTlsValidatorType' })
+  Assert-Policy ($validator.Count -eq 1) 'Production strict TLS validator must be present'
+  . ([scriptblock]::Create($validator[0].Extent.Text))
+  Ensure-BootstrapTlsValidatorType
   if (-not ('InstallTlsFixture' -as [type])) { Add-Type -Path (Join-Path $RepoRoot 'tests/windows_install_tls_fixture.cs') }
+  Write-PolicyPhase 'native_certificate_create'
   $rootMaterial = [InstallCertificateFixtureFactory]::CreateRoot('FDS Policy Auth ' + [Guid]::NewGuid().ToString('N'))
   $serverMaterial = [InstallCertificateFixtureFactory]::CreateIssued($rootMaterial, 'policy-loopback', $false, '1.3.6.1.5.5.7.3.1', '', '127.0.0.1', -1, 2)
   $badMaterial = [InstallCertificateFixtureFactory]::CreateIssued($rootMaterial, 'wrong-host', $false, '1.3.6.1.5.5.7.3.1', 'wrong.invalid', '', -1, 2)
-  $rootStore = New-Object Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser')
-  $rootStore.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-  $rootStore.Add($rootMaterial.Certificate)
+  $otherRootMaterial = [InstallCertificateFixtureFactory]::CreateRoot('FDS Unrelated Policy CA ' + [Guid]::NewGuid().ToString('N'))
+  [FdsBootstrapTlsValidator]::Configure([Security.Cryptography.X509Certificates.X509Certificate2[]]@($rootMaterial.Certificate), [string[]]@($rootMaterial.Certificate.Thumbprint), [string[]]@())
+  $privateTlsConfigured = $true
+  [Net.ServicePointManager]::ServerCertificateValidationCallback = [FdsBootstrapTlsValidator]::Callback
+  Write-PolicyPhase 'native_private_ca_ready'
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   [Net.WebRequest]::DefaultWebProxy = New-Object Net.WebProxy
   # The previous implementation's actual unauthenticated request is rejected.
+  Write-PolicyPhase 'unauthenticated_begin'
   $listener = New-Object InstallTlsFixture($serverMaterial.Certificate, 'fixture.valid.token', 200)
   try {
     $code = 0
     try { Invoke-WebRequest -Uri ('https://127.0.0.1:' + $listener.Port + '/agent/runtime-policy.toml') -Headers @{'X-Endpoint-ID'='fixture-endpoint'} -UseBasicParsing -TimeoutSec 3 | Out-Null }
     catch { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } }
     Assert-Policy ($code -eq 401 -and $listener.ReceivedRequest -and -not $listener.Authenticated) 'Previous no-bearer request must reproduce actual HTTP 401'
-  } finally { $listener.Dispose() }
+  } finally { $listener.Dispose(); Write-PolicyPhase 'unauthenticated_end' $listener }
+  $caseIndex = 0
   foreach ($case in @(@('fixture.valid.token',200,'ok'), @('fixture.wrong.token',200,'warning'), @('fixture.valid.token',401,'warning'), @('fixture.valid.token',403,'warning'), @('fixture.valid.token',302,'warning'))) {
+    $caseIndex++
+    Write-PolicyPhase ('authenticated_case_' + $caseIndex + '_begin')
     Write-PolicyConfig $case[0]
     $listener = New-Object InstallTlsFixture($serverMaterial.Certificate, 'fixture.valid.token', [int]$case[1])
     try {
@@ -129,28 +152,45 @@ try {
       Assert-Policy ($r.status -eq $case[2] -and $listener.ReceivedRequest) 'Actual TLS authentication/status outcome must match (401 includes server expiry rejection)'
       Assert-Policy (($r | ConvertTo-Json -Compress) -notmatch 'fixture\.(valid|wrong|expired)\.token|Authorization') 'Actual HTTP results must contain no bearer'
       if ($case[1] -eq 200 -and $case[0] -ceq 'fixture.valid.token') { Assert-Policy ($listener.Authenticated -and $r.version -eq 'fixture-policy') 'Correct owner must reach and authenticate at the receiver' }
-    } finally { $listener.Dispose() }
+    } finally { $listener.Dispose(); Write-PolicyPhase ('authenticated_case_' + $caseIndex + '_end') $listener }
   }
   Write-PolicyConfig ''
   Assert-Policy ((Check-Policy).message -eq 'policy_bearer_missing') 'Missing owner cannot report policy success'
   Write-PolicyConfig 'fixture.valid.token'
+  Write-PolicyPhase 'wrong_hostname_begin'
   $listener = New-Object InstallTlsFixture($badMaterial.Certificate, 'fixture.valid.token', 200)
   try {
     $base = 'https://127.0.0.1:' + $listener.Port
     $r = Check-Policy -Url ($base + '/agent/runtime-policy.toml') -Base $base
     Assert-Policy ($r.status -eq 'warning' -and -not $listener.ReceivedRequest) 'Hostname mismatch must fail TLS before sending HTTP credentials'
-  } finally { $listener.Dispose() }
-  Write-Host 'PASS: real TLS policy authentication, old 401, rejection/expiry-status/missing bearer, redirect and hostname validation'
+  } finally { $listener.Dispose(); Write-PolicyPhase 'wrong_hostname_end' $listener }
+  Assert-Policy ([FdsBootstrapTlsValidator]::LastFailure -eq 'certificate_name_mismatch') 'Hostname rejection must come from TLS validation'
+  # Keep the original valid hostname/server certificate and change only the
+  # trusted CA. This independently proves that no trust-all callback is used.
+  [FdsBootstrapTlsValidator]::Configure([Security.Cryptography.X509Certificates.X509Certificate2[]]@($otherRootMaterial.Certificate), [string[]]@($otherRootMaterial.Certificate.Thumbprint), [string[]]@())
+  Write-PolicyPhase 'wrong_ca_begin'
+  $listener = New-Object InstallTlsFixture($serverMaterial.Certificate, 'fixture.valid.token', 200)
+  try {
+    $base = 'https://127.0.0.1:' + $listener.Port
+    $r = Check-Policy -Url ($base + '/agent/runtime-policy.toml') -Base $base
+    Assert-Policy ($r.status -eq 'warning' -and -not $listener.ReceivedRequest) 'Wrong CA must fail TLS before sending HTTP credentials'
+  } finally { $listener.Dispose(); Write-PolicyPhase 'wrong_ca_end' $listener }
+  Assert-Policy ([FdsBootstrapTlsValidator]::LastFailure -match '^bootstrap_(chain_build_failed|trust_anchor_or_pin_mismatch)') 'Wrong CA rejection must come from chain/anchor validation'
+  Write-Host 'PASS: real TLS policy authentication, old 401, rejection/expiry-status/missing bearer, redirect, hostname and CA validation'
 } finally {
   [Environment]::SetEnvironmentVariable('EDR_PLATFORM_BEARER', $oldBearer, 'Process')
   [Net.ServicePointManager]::SecurityProtocol = $oldProtocol
   [Net.WebRequest]::DefaultWebProxy = $oldProxy
-  try { if ($rootStore) { if ($rootMaterial) { $rootStore.Remove($rootMaterial.Certificate) }; $rootStore.Close() } }
+  [Net.ServicePointManager]::ServerCertificateValidationCallback = $oldCallback
+  try { if ($privateTlsConfigured) { [FdsBootstrapTlsValidator]::Configure([Security.Cryptography.X509Certificates.X509Certificate2[]]@(), [string[]]@(), [string[]]@()) } }
   finally {
-    try { if ($badMaterial) { $badMaterial.Dispose() } }
+    try { if ($otherRootMaterial) { $otherRootMaterial.Dispose() } }
     finally {
-      try { if ($serverMaterial) { $serverMaterial.Dispose() } }
-      finally { try { if ($rootMaterial) { $rootMaterial.Dispose() } } finally { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force } }
+      try { if ($badMaterial) { $badMaterial.Dispose() } }
+      finally {
+        try { if ($serverMaterial) { $serverMaterial.Dispose() } }
+        finally { try { if ($rootMaterial) { $rootMaterial.Dispose() } } finally { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force } }
+      }
     }
   }
 }

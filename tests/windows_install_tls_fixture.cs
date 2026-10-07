@@ -235,6 +235,8 @@ public sealed class InstallTlsFixture : IDisposable
     private TcpClient client;
     public readonly int Port;
     public string Error;
+    public volatile int AcceptedConnections;
+    public volatile bool HandshakeCompleted;
     public volatile bool ReceivedRequest;
     public volatile bool Authenticated;
     private readonly string expectedBearer;
@@ -259,11 +261,13 @@ public sealed class InstallTlsFixture : IDisposable
             using (client = listener.AcceptTcpClient())
             using (SslStream ssl = new SslStream(client.GetStream(), false))
             {
+                AcceptedConnections = 1;
                 client.ReceiveTimeout = 5000;
                 client.SendTimeout = 5000;
                 ssl.ReadTimeout = 5000;
                 ssl.WriteTimeout = 5000;
                 ssl.AuthenticateAsServer(certificate, false, SslProtocols.Tls12, false);
+                HandshakeCompleted = true;
                 // Transport-only GET fixture: bounded headers, no request body.
                 int end = 0;
                 StringBuilder request = new StringBuilder();
