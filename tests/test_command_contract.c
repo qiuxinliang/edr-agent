@@ -225,6 +225,11 @@ int main(void) {
                "reject trailing JSON data");
   require_true(!validate("not_registered", "{}", reason, sizeof(reason)),
                "reject unknown command type");
+  const char *renew="{\"schema\":\"edr.result_delivery_renewal.v1\",\"tenant_id\":\"tenant\",\"endpoint_id\":\"ep\",\"target_command_id\":\"original\",\"target_command_type\":\"rtq_execute\",\"target_kind\":\"result\",\"target_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"expires_unix_ms\":2000000000000,\"initiated_by\":\"operator\"}";
+  require_true(validate("result_delivery_renewal",renew,reason,sizeof(reason)),"strict scoped renewal contract");
+  test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","1");test_setenv("EDR_COMMAND_ALLOW_UNSIGNED_DANGEROUS","1");
+  require_true(edr_command_contract_signature_required("renew","result_delivery_renewal"),"renewal never accepts unsigned compatibility input");
+  require_true(!validate("result_delivery_renewal","{}",reason,sizeof(reason)),"renewal scope required");
   printf("ok\n");
   return 0;
 }

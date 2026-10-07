@@ -11,6 +11,9 @@
 
 /* Returns the number of P0 combined frames synchronously accepted by the
  * persistent high-priority offline queue. */
+/* Register before queue replay; authority is indexed by immutable bundle SHA. */
+void edr_p0_rule_register_projection_authority(void);
+
 int edr_p0_rule_try_emit(const EdrBehaviorRecord *br);
 /* proven_miss is true only after the active IR evaluated this event with its
  * generation-bound command facts, found no match, and has no delivery gate. */

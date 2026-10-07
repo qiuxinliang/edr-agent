@@ -2,6 +2,7 @@
  * 最小化 AVE SDK 自检：AVE_Init / AVE_GetVersion / AVE_ScanFile（首个可选参数为待扫文件）。
  */
 #include "edr/ave_sdk.h"
+#include "edr/ave_cross_engine_feed.h"
 #include "edr/ingest_http.h"
 #include "edr/preprocess.h"
 #include "edr/behavior_proto.h"
@@ -146,6 +147,50 @@ static void test_behavior_drain(void) {
 #endif
 }
 
+/* The native collector reserves priority 0 for these four IR observations.
+ * Ordinary browser HTTPS retains scheduling priority 1 (or 2 after local
+ * noise policy). Neither scheduling level is a positive detection fact. */
+static atomic_uint normal_callbacks, normal_frames;
+static void AVE_CALL on_normal_behavior(const AVEBehaviorAlert *alert, void *unused) {
+  (void)unused;
+  EdrBehaviorRecord *record=calloc(1,sizeof(*record));
+  uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX);assert(record && frame);
+  record->type=EDR_EVENT_BEHAVIOR_ONNX_ALERT;record->pid=alert->pid;
+  record->event_time_ns=alert->timestamp_ns;
+  strcpy(record->event_id,"normal-window");strcpy(record->tenant_id,"fixture");strcpy(record->endpoint_id,"fixture");
+  size_t size=edr_behavior_record_alert_encode_protobuf(record,alert,frame,EDR_EGRESS_FRAME_MAX);
+  char reason[128];
+  if(size && edr_egress_frame_validate(frame,size,reason,sizeof(reason))) atomic_fetch_add(&normal_frames,1u);
+  atomic_fetch_add(&normal_callbacks,1u);free(record);free(frame);
+}
+static void normal_feed_drain(void) {
+  AVEStatus status;
+  for(unsigned i=0;i<5000;i++){assert(AVE_GetStatus(&status)==AVE_OK);if(status.behavior_worker_dequeued==status.behavior_queue_enqueued)return;pause_ms();}
+  assert(!"normal feed drain timed out");
+}
+static void test_normal_observation_windows(void) {
+  AVECallbacks callbacks={0};callbacks.on_behavior_alert=on_normal_behavior;
+  assert(AVE_RegisterCallbacks(&callbacks)==AVE_OK);assert(AVE_StartBehaviorMonitor()==AVE_OK);
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);
+  strcpy(r->exe_path,"C:\\Windows\\explorer.exe");strcpy(r->process_name,"explorer.exe");strcpy(r->cmdline,"explorer.exe");
+  strcpy(r->source_completeness,"COMPLETE");strcpy(r->net_src,"192.0.2.2");strcpy(r->net_dst,"192.0.2.10");
+  r->pid=6100;r->process_start_key=6100;r->process_creation_filetime_100ns=133600000000000000ULL;
+  const unsigned ports[]={445,3389,5985,5986};
+  for(unsigned i=0;i<4;i++){r->type=EDR_EVENT_NET_CONNECT;r->pid=6100+i;r->net_dport=ports[i];r->priority=0;
+    for(unsigned j=0;j<256;j++){r->event_time_ns=1700000000000000000LL+j*1000000000LL;edr_ave_cross_engine_feed_from_record(r);if((j%64u)==63u)normal_feed_drain();}}
+  r->type=EDR_EVENT_FILE_READ;r->pid=6104;strcpy(r->process_name,"chrome.exe");strcpy(r->exe_path,"C:\\Browser\\chrome.exe");strcpy(r->cmdline,"chrome.exe");strcpy(r->file_path,"C:\\Lab\\Login Data");
+  edr_ave_cross_engine_feed_from_record(r); /* Unsupported by AVE: remains local P0 observation. */
+  r->pid=6105;strcpy(r->process_name,"backup.exe");strcpy(r->cmdline,"backup.exe --daily");strcpy(r->file_path,"C:\\Lab\\logins.json");edr_ave_cross_engine_feed_from_record(r);
+  r->type=EDR_EVENT_NET_CONNECT;r->pid=6104;r->net_dport=443;strcpy(r->process_name,"chrome.exe");strcpy(r->cmdline,"chrome.exe");r->file_path[0]=0;
+  for(unsigned priority=1;priority<=2;priority++){r->priority=priority;r->pid=6104+priority;
+    for(unsigned j=0;j<2048;j++){r->event_time_ns=1700000000000000000LL+j*1000000000LL;edr_ave_cross_engine_feed_from_record(r);if((j%64u)==63u)normal_feed_drain();}}
+  assert(AVE_DrainBehaviorMonitor(5000)==AVE_OK);
+  AVEStatus status;assert(AVE_GetStatus(&status)==AVE_OK);
+  printf("normal AVE windows: fed=%llu callbacks=%u accepted_frames=%u\n",(unsigned long long)status.behavior_queue_enqueued,atomic_load(&normal_callbacks),atomic_load(&normal_frames));
+  assert(status.behavior_queue_enqueued==5120u);
+  assert(atomic_load(&normal_callbacks)==0u && atomic_load(&normal_frames)==0u);free(r);
+}
+
 int main(int argc, char **argv) {
   /* Exercise the real transport caller and the explicit test boundary. This
    * must link without compiler-specific weak fallback implementations. */
@@ -177,6 +222,7 @@ int main(int argc, char **argv) {
   test_behavior_drain();
   AVE_Shutdown();
   assert(AVE_Init(&cfg) == AVE_OK);
+  test_normal_observation_windows();
   AVE_Shutdown();
   return 0;
 }

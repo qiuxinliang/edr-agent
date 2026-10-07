@@ -20,13 +20,13 @@ static int write_all(int fd, const uint8_t *data, size_t len) {
 
 static int make_valid_plaintext(size_t len, uint8_t **out) {
   static const char document[] =
-      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":3,"
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":5,"
       "\"rules_bundle_version\":\"boundary-v1\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":"
       "\"0000000000000000000000000000000000000000000000000000000000000000\","
       "\"sensor_interest_manifest_hash_mode\":"
       "\"raw-json-v1-p0-artifact-sha256-zeroed\","
-      "\"rules\":[{\"id\":\"boundary\",\"event_type\":\"process_create\","
+      "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"boundary\",\"event_type\":\"process_create\","
       "\"condition\":{\"process_name_in\":[\"boundary.exe\"]}}]}";
   size_t document_len = sizeof(document) - 1u;
   uint8_t *plain;
@@ -41,7 +41,7 @@ static int make_valid_plaintext(size_t len, uint8_t **out) {
 
 static int make_missing_binding_plaintext(size_t len, uint8_t **out) {
   static const char document[] =
-      "{\"rules\":[{\"id\":\"boundary\",\"event_type\":\"process_create\","
+      "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"boundary\",\"event_type\":\"process_create\","
       "\"condition\":{\"process_name_in\":[\"boundary.exe\"]}}]}";
   size_t document_len = sizeof(document) - 1u;
   uint8_t *plain;

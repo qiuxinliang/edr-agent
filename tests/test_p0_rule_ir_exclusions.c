@@ -38,7 +38,7 @@ static int write_bundle(unsigned schema, const char *event, const char *conditio
       "\"rules_bundle_version\":\"exclusion-contract\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
-      "\"rules\":[{\"id\":\"test\",\"event_type\":\"%s\",\"condition\":%s}]}",
+      "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"test\",\"event_type\":\"%s\",\"condition\":%s}]}",
       schema, event, condition);
   int closed = fclose(file);
   return wrote > 0 && closed == 0;
@@ -73,6 +73,8 @@ static void record_init(EdrBehaviorRecord *record, EdrEventType type) {
   snprintf(record->process_name, sizeof(record->process_name), "reader.exe");
   snprintf(record->parent_name, sizeof(record->parent_name), "launcher.exe");
   snprintf(record->cmdline, sizeof(record->cmdline), "reader.exe trigger");
+  if (type==EDR_EVENT_SCRIPT_POWERSHELL || type==EDR_EVENT_SCRIPT_WMI)
+    snprintf(record->script_snippet,sizeof(record->script_snippet),"reader.exe trigger");
   snprintf(record->exe_path, sizeof(record->exe_path), "C:\\Trusted\\reader.exe");
   snprintf(record->file_path, sizeof(record->file_path), "C:\\protected\\Login Data");
   snprintf(record->network_aux_path, sizeof(record->network_aux_path), "C:\\protected\\Login Data");
@@ -301,7 +303,7 @@ static int candidate_contract(void) {
   };
   for (unsigned schema = 2u; schema <= 3u; ++schema) {
     if (!write_bundle(schema, "file_write", "{\"file_path_regex_any\":[\"Login Data$\"]}") ||
-        !edr_p0_rule_ir_validate_candidate_path(s_path)) return 0;
+        edr_p0_rule_ir_validate_candidate_path(s_path)) return 0;
     for (size_t i = 0u; i < sizeof(new_keys) / sizeof(new_keys[0]); ++i) {
       char condition[1024];
       snprintf(condition, sizeof(condition),

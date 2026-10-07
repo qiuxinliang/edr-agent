@@ -290,22 +290,6 @@ static int command_copy_bounded_cstr_exact(char *out, size_t out_cap,
   return 1;
 }
 
-static int command_bounded_cstr_sha256(const char *source, size_t source_cap,
-                                       char out65[65], size_t *length_out) {
-  size_t length = 0u;
-  if (!out65 || !command_bounded_cstr_len(source, source_cap, &length) ||
-      edr_sha256_hex((const uint8_t *)source, length, out65) != 0) {
-    if (out65) {
-      out65[0] = '\0';
-    }
-    return 0;
-  }
-  if (length_out) {
-    *length_out = length;
-  }
-  return 1;
-}
-
 /* The parts passed here are locally constructed C strings. */
 static int command_join_cstrs(char *out, size_t out_cap,
                               const char *const *parts, size_t part_count) {
@@ -3690,6 +3674,12 @@ static void do_forensic(const char *cmd_id, const uint8_t *pl, size_t len, const
 }
 
 static void do_rtq_query(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
+  if (!edr_command_rtq_readonly_enabled()) {
+    s_rejected++;
+    audit_both(cmd_id,"reject rtq_query: readonly RTQ disabled");
+    soar_emit(cmd_id,sm,EdrCmdExecRejected,1,"readonly RTQ disabled");
+    return;
+  }
   char payload[4096];
   if (pl && len > 0u) {
     if (len >= sizeof(payload)) {
@@ -5122,7 +5112,7 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
         break;
       }
       if (recovery_rc < 0) {
-        audit_both(inbox[i].command_id, "agent update journal recovery read failed; inbox retained");
+        audit_both(inbox[i].command_id, edr_egress_is_policy_hold(recovery_rc) ? "agent update delivery policy-held; inbox and evidence retained" : "agent update recovery unavailable; inbox retained");
         edr_command_cancel_end(inbox[i].command_id);
         saw_error = 1;
         continue;
@@ -5328,7 +5318,13 @@ static void record_command_result_delivery_failure(const EdrCommandStateRecord *
   if (!error[0]) {
     snprintf(error, sizeof(error), "%s", "command result delivery failed");
   }
-  if (rc == EDR_INGEST_COMMAND_RESULT_REJECTED || !retryable) {
+  if (rc == EDR_EGRESS_AUTHORIZATION_EXPIRED) {
+    if(edr_command_state_mark_report_held(record,"result_authorization_expired") != 0)
+      audit_both(record->command_id,"result policy hold persistence failed; pending bytes retained");
+    else audit_both(record->command_id,"result authorization expired; durable policy hold, no ACK");
+    return;
+  }
+  if (rc != EDR_EGRESS_LOCAL_STATE_FAILURE && (rc == EDR_INGEST_COMMAND_RESULT_REJECTED || !retryable)) {
     if (edr_command_state_mark_report_rejected(record, error) != 0) {
       audit_both(record->command_id,
                  "command result rejection received but terminal state persistence failed; pending result retained");
@@ -5994,6 +5990,13 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
     return 0;
   }
 
+  int existing_final=edr_command_state_has_final(id,sm);
+  if(existing_final) {
+    audit_both(id,existing_final>0 ? "duplicate command suppressed before admission; original durable result retained" : "command duplicate check unavailable; receipt deferred");
+    if(existing_final>0)s_result_outbox_next_flush_ms=0;
+    return existing_final>0 ? 0 : -1;
+  }
+
   if (normalized_meta.issued_at_unix_ms <= 0) {
     normalized_meta.issued_at_unix_ms = command_now_ms();
   }
@@ -6049,8 +6052,6 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   if (inbox_store_rc != 0) {
     s_exec_fail++;
     audit_both(id, "command inbox persist failed; command not acked");
-    soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
-                 "command inbox persist failed before received ack", "failed", NULL);
     return -1;
   }
 
@@ -6059,54 +6060,10 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   int dup_rc = edr_command_state_begin(id, t, sm, &retry_count, &dup);
   (void)retry_count;
   if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_FINAL) {
-    edr_command_state_delete_inbox(id);
-    if (internal_trusted) {
-      /* Retain the original durable action receipt (including target and OS
-       * verification), not a new synthetic success with a hash-only summary. */
-      audit_both(id, "duplicate internal command suppressed; original terminal receipt retained");
-      return 0;
-    }
-    char detail[2600];
-    if (streq(t, "shell_open")) {
-      snprintf(detail, sizeof(detail),
-               "duplicate shell_open suppressed; live shell session was not reopened (previous_status=%s previous_exit=%d)",
-               dup.response_status[0] ? dup.response_status : "unknown", dup.exit_code);
-      audit_both(id, "duplicate shell_open suppressed by local idempotency state");
-      soar_emit_ex(id, sm, EdrCmdExecFailed, 17, detail, "failed", NULL);
-      return 0;
-    }
-    char previous_status[sizeof(dup.response_status)];
-    const char *status = "unknown";
-    char previous_detail_sha256[65];
-    size_t previous_detail_bytes = 0u;
-    if ((dup.response_status[0] &&
-         !command_copy_bounded_cstr_exact(previous_status, sizeof(previous_status),
-                                          dup.response_status, sizeof(dup.response_status))) ||
-        !command_bounded_cstr_sha256(dup.detail, sizeof(dup.detail), previous_detail_sha256,
-                                     &previous_detail_bytes)) {
-      s_exec_fail++;
-      audit_both(id, "duplicate command state contains unrepresentable provenance");
-      soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
-                   "duplicate command state provenance is invalid", "failed", NULL);
-      return 0;
-    }
-    if (dup.response_status[0]) {
-      status = previous_status;
-    }
-    int detail_written = snprintf(
-        detail, sizeof(detail),
-        "duplicate command suppressed previous_status=%s previous_exit=%d previous_detail_sha256=%s previous_detail_bytes=%zu",
-        status, dup.exit_code, previous_detail_sha256, previous_detail_bytes);
-    if (detail_written < 0 || (size_t)detail_written >= sizeof(detail)) {
-      s_exec_fail++;
-      audit_both(id, "duplicate command state summary is unrepresentable");
-      soar_emit_ex(id, sm, EdrCmdExecFailed, 18,
-                   "duplicate command state summary is unrepresentable", "failed", NULL);
-      return 0;
-    }
-    audit_both(id, "duplicate command suppressed by local idempotency state");
-    soar_emit_ex(id, sm, (EdrCommandExecutionStatus)(dup.execution_status ? dup.execution_status : EdrCmdExecOk),
-                 dup.exit_code, detail, dup.response_status[0] ? status : "ok", NULL);
+    /* Duplicate delivery neither changes result identity nor grants authority.
+     * Existing retry/backoff/ACK/hold state remains authoritative. */
+    audit_both(id, "duplicate command suppressed; original durable result retained");
+    s_result_outbox_next_flush_ms = 0;
     return 0;
   }
   if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
@@ -6387,6 +6344,18 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
     case EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS:
       do_update_server_address(id, payload, payload_len, sm);
       return;
+    case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL: {
+      int rc=edr_command_state_renew_delivery(id,payload,payload_len,sm);
+      if(rc==0) {
+        s_result_outbox_next_flush_ms=0;
+        audit_both(id,"signed result delivery renewal durably applied; original execution retained");
+        soar_emit_ex(id,sm,EdrCmdExecOk,0,"delivery_authorization_renewed","ok",NULL);
+      } else {
+        audit_both(id,rc==EDR_EGRESS_LOCAL_STATE_FAILURE ? "delivery renewal local persistence failed" : "delivery renewal rejected: scope, hash, deadline or replay mismatch");
+        soar_emit_ex(id,sm,EdrCmdExecRejected,rc,"delivery_authorization_renewal_rejected","denied",NULL);
+      }
+      return;
+    }
     case EDR_COMMAND_KIND_AGENT_UPDATE: {
       char detail[1024];
       if (!forensic_operator_gate(sm, payload, payload_len)) {

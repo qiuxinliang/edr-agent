@@ -204,6 +204,8 @@ static const EdrCommandAlias k_commands[] = {
             EDR_COMMAND_PAYLOAD_UPDATE_SERVER),
     COMMAND("set_server_address", EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS, "update_server_address", 0,
             EDR_COMMAND_PAYLOAD_UPDATE_SERVER),
+    COMMAND("result_delivery_renewal", EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL, "result_delivery_renewal",
+            EDR_COMMAND_FLAG_OPERATOR_ONLY, EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("agent_update", EDR_COMMAND_KIND_AGENT_UPDATE, "agent_update",
             EDR_COMMAND_FLAG_DANGEROUS | EDR_COMMAND_FLAG_OPERATOR_ONLY,
             EDR_COMMAND_PAYLOAD_AGENT_UPDATE),
@@ -261,6 +263,7 @@ EdrCommandExecutionLane edr_command_registry_execution_lane(const char *command_
     case EDR_COMMAND_KIND_QUARANTINE_FILE:
     case EDR_COMMAND_KIND_RESTORE_FILE:
     case EDR_COMMAND_KIND_AGENT_UPDATE:
+    case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL:
     case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
     case EDR_COMMAND_KIND_AGENT_OFFBOARD:
     case EDR_COMMAND_KIND_AGENT_UNINSTALL:
@@ -306,6 +309,7 @@ EdrCommandCancelMode edr_command_registry_cancel_mode(const char *command_type) 
     case EDR_COMMAND_KIND_LIST_AUTORUNS:
     case EDR_COMMAND_KIND_EVENTLOG_VIEW:
     case EDR_COMMAND_KIND_AGENT_UPDATE:
+    case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL:
     case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
     case EDR_COMMAND_KIND_AGENT_OFFBOARD:
     case EDR_COMMAND_KIND_AGENT_UNINSTALL:
@@ -326,6 +330,7 @@ EdrCommandReplayPolicy edr_command_registry_replay_policy(const char *command_ty
     case EDR_COMMAND_KIND_SHELL_CLOSE:
     case EDR_COMMAND_KIND_RTR_SHELL:
     case EDR_COMMAND_KIND_AGENT_UPDATE:
+    case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL:
     case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
     case EDR_COMMAND_KIND_AGENT_OFFBOARD:
     case EDR_COMMAND_KIND_AGENT_UNINSTALL:

@@ -5,6 +5,7 @@
 #define EDR_BEHAVIOR_RECORD_H
 
 #include "types.h"
+#include "evidence_projection.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -54,6 +55,12 @@ typedef struct {
    * This is source provenance, distinct from encoder-side clipping. */
   char source_truncated_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
   uint32_t evidence_revision;
+  /* Producer-only authority copied from the detector's immutable decision.
+   * Full local snapshots retain it; only the outbound encoder applies it. */
+  uint32_t evidence_projection_version;
+  uint64_t required_evidence_fields;
+  uint8_t tactic_probability_state; /* 0 unknown, 1 owner did not compute, 2 computed. */
+  char operation_evidence[512];
   char username[EDR_BR_STR_SHORT];
   /* effective process identity; username/domain retain their legacy meaning. */
   char user_sid[EDR_BR_STR_SHORT];

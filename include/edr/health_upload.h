@@ -9,6 +9,7 @@ typedef struct {
  cJSON *base;
  char revision[65];
  uint64_t full_at_ns;
+ unsigned delta_version; /* ACK-negotiated; zero/legacy uses block delta v1. */
  uint64_t full_count, delta_count, resync_count, attempt_bytes, full_bytes;
 } EdrHealthUpload;
 typedef int (*EdrHealthSend)(const char *, char *, size_t, void *);

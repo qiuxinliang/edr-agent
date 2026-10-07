@@ -51,6 +51,37 @@ int main(int argc, char **argv) {
     text = cJSON_PrintUnformatted(root); assert(text && !accepted(text)); free(text);
     cJSON_Delete(root);
   }
+  {
+    cJSON *root=cJSON_Parse(fixture), *data=cJSON_GetObjectItemCaseSensitive(root,"data");
+    cJSON *hold=cJSON_DetachItemFromObjectCaseSensitive(data,"ack");
+    cJSON_AddItemToObject(data,"hold",hold);
+    cJSON_ReplaceItemInObjectCaseSensitive(root,"code",cJSON_CreateString("EVIDENCE_PROJECTION_POLICY_HELD"));
+    cJSON_ReplaceItemInObjectCaseSensitive(data,"accepted",cJSON_CreateFalse());
+    cJSON_ReplaceItemInObjectCaseSensitive(hold,"state",cJSON_CreateString("policy_held"));
+    cJSON_AddStringToObject(hold,"tenant_id","test-tenant");
+    char *text=cJSON_PrintUnformatted(root); assert(text && !accepted(text));
+    assert(edr_report_events_policy_held(text,"test-tenant","test-endpoint","test-batch",
+      (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payload",7));
+    assert(!edr_report_events_policy_held(text,"other","test-endpoint","test-batch",
+      (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payload",7));
+    assert(!edr_report_events_policy_held(text,"test-tenant","test-endpoint","different",
+      (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payload",7));
+    assert(!edr_report_events_policy_held(text,"test-tenant","test-endpoint","test-batch",
+      (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payloae",7));
+    free(text);
+    const char *fields[]={"tenant_id","endpoint_id","batch_id","payload_sha256","version","state"};
+    for (size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++) {
+      cJSON *old=cJSON_DetachItemFromObjectCaseSensitive(hold,fields[i]); assert(old);
+      text=cJSON_PrintUnformatted(root); assert(text);
+      assert(!edr_report_events_policy_held(text,"test-tenant","test-endpoint","test-batch",
+        (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payload",7));
+      free(text); cJSON_AddItemToObject(hold,fields[i],old);
+    }
+    cJSON_AddObjectToObject(data,"ack"); text=cJSON_PrintUnformatted(root); assert(text);
+    assert(!edr_report_events_policy_held(text,"test-tenant","test-endpoint","test-batch",
+      (const uint8_t *)"0123456789ab",12,(const uint8_t *)"payload",7));
+    free(text);cJSON_Delete(root);
+  }
   puts("report-events receipt contract ok");
   return 0;
 }

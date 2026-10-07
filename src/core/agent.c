@@ -1816,6 +1816,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"command_signing\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"}},"
       "\"commands\":{"
       "%s"
+      "\"result_delivery_renewal\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":true,\"runtime_status\":\"%s\"},"
       "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -1876,6 +1877,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       artifact_upload_capability,
       signing_build ? "true" : "false", signing_policy ? "true" : "false", signing_runtime,
       response_command_capability,
+      signing_build ? "true" : "false", !signing_build ? "unavailable" : signing_key_configured ? "healthy" : "degraded",
       rtq_policy ? "true" : "false",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
@@ -2444,7 +2446,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
         "\"capability_manifest\":%s,"
-        "\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"denied_requests\":%lu,"
+        "\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"result_delivery_renewal_supported\":true,\"denied_requests\":%lu,"
         "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
         "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
         "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu},"
@@ -2518,13 +2520,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"lane_workers\":{\"critical\":%u,\"interactive\":%u,\"bulk\":%u,\"scan\":%u},"
         "\"queue_rejected\":%llu}},"
         "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
-        "\"behavior_infer_per_min\":%u,\"pmfe_scans_per_min\":%u,"
+        "\"pmfe_scans_per_min\":%u,"
         "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
         "\"cpu_avg_10s_x100\":%u,\"cpu_avg_60s_x100\":%u,"
         "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
         "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
         "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
-        "\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+        "\"rss_mb\":%llu,"
         "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
         "\"thread_count\":%u,\"handle_count\":%u,"
         "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
@@ -2712,14 +2714,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         ceh.lane_worker_count[EDR_COMMAND_LANE_SCAN],
         (unsigned long long)ceh.queue_rejected_count,
         agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
-        0u,
         agent->cfg.resource_limit.pmfe_scans_per_min,
         rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
         rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
         rs.process_id, rs.logical_processor_count,
         (unsigned long long)rs.process_cpu_delta_100ns,
         (unsigned long long)rs.wall_delta_100ns,
-        (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+        (unsigned long long)rs.rss_mb,
         (unsigned long long)rs.working_set_mb,
         (unsigned long long)rs.private_bytes_mb,
         (unsigned long long)rs.pagefile_mb,
@@ -3032,7 +3033,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  queue_capacity_metrics.accounting_available);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
       p0_health_json, sizeof(p0_health_json), &p0_health_used,
-      ",\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"denied_requests\":%lu,"
+      ",\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"result_delivery_renewal_supported\":true,\"denied_requests\":%lu,"
       "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
         "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
         "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu}",
@@ -3242,7 +3243,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"queue_rejected\":%llu,\"critical_executed\":%llu,"
       "\"interactive_executed\":%llu,\"bulk_executed\":%llu,\"scan_executed\":%llu}},"
       "\"resource\":{\"cpu_budget_percent\":%u,\"memory_budget_mb\":%u,"
-      "\"ave_infer_per_min\":%u,\"behavior_infer_per_min\":%u,"
+      "\"ave_infer_per_min\":%u,"
       "\"pmfe_scans_per_min\":%u,\"webshell_scan_mb_per_min\":%u,"
       "\"shellcode_packets_per_sec\":%u,\"low_priority_keep_percent_under_pressure\":%u,"
       "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
@@ -3250,7 +3251,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
       "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
       "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
-      "\"rss_mb\":%llu,\"current_rss_mb\":%llu,"
+      "\"rss_mb\":%llu,"
       "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
       "\"thread_count\":%u,\"handle_count\":%u,"
       "\"hot_thread_id\":%u,\"hot_thread_cpu_percent\":%u,"
@@ -3520,7 +3521,6 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)ceh.lane_executed[EDR_COMMAND_LANE_SCAN],
       agent->cfg.resource_limit.cpu_limit_percent, agent->cfg.resource_limit.memory_limit_mb,
       0u,
-      0u,
       agent->cfg.resource_limit.pmfe_scans_per_min,
       agent->cfg.resource_limit.webshell_scan_mb_per_min,
       agent->cfg.resource_limit.shellcode_packets_per_sec,
@@ -3530,7 +3530,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       rs.process_id, rs.logical_processor_count,
       (unsigned long long)rs.process_cpu_delta_100ns,
       (unsigned long long)rs.wall_delta_100ns,
-      (unsigned long long)rs.rss_mb, (unsigned long long)rs.rss_mb,
+      (unsigned long long)rs.rss_mb,
       (unsigned long long)rs.working_set_mb,
       (unsigned long long)rs.private_bytes_mb,
       (unsigned long long)rs.pagefile_mb,

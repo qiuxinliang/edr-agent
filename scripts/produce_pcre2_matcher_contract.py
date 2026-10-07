@@ -30,6 +30,8 @@ PORTFILE_RELATIVE = Path("ports") / "pcre2" / "portfile.cmake"
 MATCHER_SOURCE_PATHS = (
     Path("src") / "preprocess" / "p0_rule_ir.c",
     Path("include") / "edr" / "p0_rule_ir.h",
+    Path("src") / "preprocess" / "p0_operation.inc",
+    Path("include") / "edr" / "evidence_projection.h",
 )
 TRIPLETS_DIR = AGENT_ROOT / "triplets"
 TARGET_TRIPLETS = {

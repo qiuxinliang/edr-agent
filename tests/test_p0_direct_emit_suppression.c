@@ -524,6 +524,8 @@ int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
   snprintf(out_match->title, sizeof(out_match->title), "%s", "test");
   snprintf(out_match->mitre_csv, sizeof(out_match->mitre_csv), "%s", "T1059");
   out_match->severity = 3;
+  out_match->effect=EDR_P0_EFFECT_SECURITY_ALERT;
+  out_match->required_evidence_fields=EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND;
   return 1;
 }
 void edr_p0_rule_ir_evaluation_free(EdrP0RuleIrEvaluation *evaluation) {
@@ -3308,4 +3310,11 @@ int main(void) {
 #endif
   puts("test_p0_direct_emit_suppression: ok");
   return 0;
+}
+
+/* This fixture owns exactly the same single immutable purpose returned by
+ * its fake evaluator above; it cannot authorize arbitrary masks or rules. */
+int edr_p0_rule_ir_projection_matches(const char *r,const char *s,uint64_t m,const char *o) {
+  return r && s && o && g_ir_ready && !strcmp(r,g_test_rule_identity) &&
+    !strcmp(s,g_bundle_sha256) && m==(EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND) && !o[0];
 }

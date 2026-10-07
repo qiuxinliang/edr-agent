@@ -24,6 +24,8 @@
 #include <unistd.h>
 #endif
 
+#include "egress_hold.h"
+
 #define UPLOAD_RECORD_CAP 8192u
 
 typedef struct {
@@ -331,6 +333,18 @@ int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted)
       : !strcmp(r.failure_reason, "artifact_hash_changed")
           ? "artifact hash changed before upload retry" : "";
   if (!r.object_key[0] && !r.failure_reason[0]) {
+    char hold_path[1400];
+    if (snprintf(hold_path,sizeof(hold_path),"%s.policy-held",path)>=(int)sizeof(hold_path)) return -2;
+    uint64_t permitted_size=0;
+    int admission=edr_egress_upload_preflight(r.command_id,r.command_id,r.bundle,r.sha,&permitted_size);
+    if (edr_egress_is_policy_hold(admission)) {
+      int held=edr_hold_write(hold_path,r.command_id,admission);
+      edr_command_audit_both(r.command_id, held==EDR_EGRESS_LOCAL_STATE_FAILURE
+          ? "forensic policy hold persistence failed; original pending and artifact retained"
+          : "forensic upload policy held; original pending and artifact retained");
+      return held;
+    }
+    if (admission || edr_hold_clear(hold_path)) return -2;
     char actual[65];
     int hash_rc = file_hash(r.bundle, actual);
     if (hash_rc != 0) {
@@ -353,8 +367,14 @@ int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted)
     }
     if (!error[0]) {
       *upload_attempted = 1;
-      if (edr_transport_v2_upload_file(r.command_id, r.bundle, r.sha, r.object_key, sizeof(r.object_key)) != 0 ||
-          !r.object_key[0]) return -1;
+      int upload_rc=edr_transport_v2_upload_file(r.command_id, r.bundle, r.sha, r.object_key, sizeof(r.object_key));
+      if (edr_egress_is_policy_hold(upload_rc)) {
+        *upload_attempted=0;
+        int held=edr_hold_write(hold_path,r.command_id,upload_rc);
+        if(held==EDR_EGRESS_LOCAL_STATE_FAILURE) edr_command_audit_both(r.command_id,"forensic policy hold persistence failed; pending retained");
+        return held;
+      }
+      if (upload_rc != 0 || !r.object_key[0]) return -1;
       if (add_receipt(path, &r, "object_key", r.object_key) != 0) {
         edr_command_audit_both(r.command_id, "forensic upload receipt persist failed; pending record retained");
         return -2;

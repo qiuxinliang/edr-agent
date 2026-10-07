@@ -22,6 +22,10 @@
 #define EDR_PATH_SEP '/'
 #endif
 
+#include "egress_hold.h"
+
+static char *read_event(const char *path);
+
 typedef struct PendingEvent {
   uint64_t seq;
   char path[1024];
@@ -150,6 +154,12 @@ int edr_agent_update_event_persist(const char *outbox_dir,
       !cJSON_AddStringToObject(detail, "version", context->target_version)) goto done;
   if (context->campaign_id[0] && !cJSON_GetObjectItemCaseSensitive(detail, "campaign_id") &&
       !cJSON_AddStringToObject(detail, "campaign_id", context->campaign_id)) goto done;
+  const char *pinned_names[]={"operation","artifact_id","sha256","version"};
+  const char *pinned_values[]={context->operation,context->artifact_id,context->artifact_sha256,context->target_version};
+  for(size_t i=0;i<4u;i++) {
+    const cJSON *value=cJSON_GetObjectItemCaseSensitive(detail,pinned_names[i]);
+    if(!cJSON_IsString(value)||strcmp(value->valuestring,pinned_values[i]))goto done;
+  }
   char event_id[320];
   snprintf(event_id, sizeof(event_id), "%s-%020llu", safe_command,
            (unsigned long long)event_seq);
@@ -168,7 +178,37 @@ int edr_agent_update_event_persist(const char *outbox_dir,
   if (!body || make_dirs(outbox_dir) != 0) goto done;
   snprintf(path, sizeof(path), "%s%c%s-%020llu.pending.json", outbox_dir,
            EDR_PATH_SEP, safe_command, (unsigned long long)event_seq);
-  rc = write_atomic(path, body);
+  /* Preserve original detailed evidence separately; only a newly created wire
+   * event is minimized. Replays must never change bytes under an old event id. */
+  char evidence_path[1100];
+  snprintf(evidence_path,sizeof(evidence_path),"%s.local",path);
+  errno=0;
+  char *existing=read_event(path);
+  if(!existing && errno!=ENOENT)goto done;
+  if (existing) {
+    char *evidence=read_event(evidence_path);
+    cJSON *prior=cJSON_Parse(evidence?evidence:existing);
+    rc=prior && cJSON_Compare(prior,root,1)?0:-1;
+    cJSON_Delete(prior);free(evidence);free(existing);goto done;
+  }
+  if (write_atomic(evidence_path,body)!=0) goto done;
+  cJSON *minimal_detail=cJSON_CreateObject();
+  if (!minimal_detail || !cJSON_AddStringToObject(minimal_detail,"operation",context->operation) ||
+      !cJSON_AddStringToObject(minimal_detail,"artifact_id",context->artifact_id) ||
+      !cJSON_AddStringToObject(minimal_detail,"sha256",context->artifact_sha256) ||
+      !cJSON_AddStringToObject(minimal_detail,"version",context->target_version)) { cJSON_Delete(minimal_detail);goto done; }
+  if(!strcmp(status,"failed")) {
+    const cJSON *source=cJSON_GetObjectItemCaseSensitive(root,"detail");
+    const char *names[]={"stage","error"};
+    for(size_t i=0;i<2u;i++) {
+      const cJSON *v=cJSON_GetObjectItemCaseSensitive(source,names[i]);
+      if(!cJSON_AddStringToObject(minimal_detail,names[i],edr_egress_upgrade_failure_value(names[i],cJSON_IsString(v)?v->valuestring:NULL))){cJSON_Delete(minimal_detail);goto done;}
+    }
+  }
+  if(!cJSON_ReplaceItemInObjectCaseSensitive(root,"detail",minimal_detail)){cJSON_Delete(minimal_detail);goto done;}
+  cJSON_DeleteItemFromObjectCaseSensitive(root,"reported_at");
+  free(body);body=cJSON_PrintUnformatted(root);
+  if(body) rc = write_atomic(path, body);
 done:
   free(body);
   cJSON_Delete(detail);
@@ -296,8 +336,20 @@ int edr_agent_update_event_flush(const char *outbox_dir,
   PendingEvent *events = NULL;
   size_t count = 0u;
   int flushed = 0;
-  if (!outbox_dir || !post_fn || collect_pending(outbox_dir, &events, &count) != 0) return -1;
+  if (!outbox_dir || !post_fn) return -1;
+  char hold_path[1200],held_command[160];
+  if(snprintf(hold_path,sizeof(hold_path),"%s%cdelivery.policy-held",outbox_dir,EDR_PATH_SEP)>=(int)sizeof(hold_path)) return EDR_EGRESS_LOCAL_STATE_FAILURE;
   uint64_t checkpoint = read_ack_checkpoint(outbox_dir);
+  if(last_acked_seq)*last_acked_seq=checkpoint;
+  int held=edr_hold_read(hold_path,held_command,sizeof(held_command));
+  if(held==EDR_EGRESS_LOCAL_STATE_FAILURE)return held;
+  if(held==EDR_EGRESS_PAYLOAD_POLICY_HELD)return held;
+  if(edr_egress_is_policy_hold(held)) {
+    int admission=edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,held_command,NULL);
+    if(edr_egress_is_policy_hold(admission))return edr_hold_write(hold_path,held_command,admission);
+    if(admission || edr_hold_clear(hold_path))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  }
+  if (collect_pending(outbox_dir, &events, &count) != 0) return -1;
   if (last_acked_seq) *last_acked_seq = checkpoint;
   for (size_t i = 0; i < count; ++i) {
     if (events[i].seq <= checkpoint) {
@@ -308,9 +360,17 @@ int edr_agent_update_event_flush(const char *outbox_dir,
     char response[4096];
     char *body = read_event(events[i].path);
     response[0] = '\0';
-    if (!body || post_fn(body, response, sizeof(response), user) != 0 ||
-        !response_accepted(response)) {
-      free(body); free(events); return flushed;
+    if (!body) {free(events);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+    int post_rc=post_fn(body,response,sizeof(response),user);
+    if(edr_egress_is_policy_hold(post_rc)) {
+      cJSON *event=cJSON_Parse(body);
+      const cJSON *id=cJSON_GetObjectItemCaseSensitive(event,"command_id");
+      int result=cJSON_IsString(id)?edr_hold_write(hold_path,id->valuestring,post_rc):EDR_EGRESS_LOCAL_STATE_FAILURE;
+      if(result==EDR_EGRESS_LOCAL_STATE_FAILURE) fprintf(stderr,"[agent_update] policy hold persistence failed; original events and ACK checkpoint retained\n");
+      cJSON_Delete(event);free(body);free(events);return result;
+    }
+    if(post_rc!=0 || !response_accepted(response)) {
+      free(body);free(events);return post_rc<0?post_rc:EDR_EGRESS_OUTCOME_UNKNOWN;
     }
     free(body);
     if (write_ack_checkpoint(outbox_dir, events[i].seq) != 0) { free(events); return -1; }
@@ -325,6 +385,13 @@ int edr_agent_update_event_flush(const char *outbox_dir,
 
 static int ingest_post(const char *body_json, char *response, size_t response_cap, void *user) {
   (void)user;
+  int rc;
+  char *minimal=edr_egress_upgrade_event_project(body_json,&rc);
+  if(!minimal)return rc;
+  cJSON *original=cJSON_Parse(body_json),*projected=cJSON_Parse(minimal);
+  int same=original && projected && cJSON_Compare(original,projected,1);
+  cJSON_Delete(original);cJSON_Delete(projected);free(minimal);
+  if(!same)return EDR_EGRESS_PAYLOAD_POLICY_HELD; /* old wire bytes need explicit versioned recovery */
   return edr_ingest_http_post_json_suffix("ingest/agent-upgrade-event", body_json,
                                           response, response_cap);
 }
@@ -332,4 +399,21 @@ static int ingest_post(const char *body_json, char *response, size_t response_ca
 int edr_agent_update_event_flush_ingest(const char *outbox_dir,
                                         uint64_t *last_acked_seq) {
   return edr_agent_update_event_flush(outbox_dir, ingest_post, NULL, last_acked_seq);
+}
+
+int edr_agent_update_delivery_preflight(const char *outbox_dir,const char *command_id) {
+  int rc=edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,command_id,NULL);
+  char path[1200];
+  if(!outbox_dir || snprintf(path,sizeof(path),"%s%cdelivery.policy-held",outbox_dir,EDR_PATH_SEP)>=(int)sizeof(path))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  char held_command[160];
+  int prior=edr_hold_read(path,held_command,sizeof(held_command));
+  if(prior==EDR_EGRESS_LOCAL_STATE_FAILURE || prior==EDR_EGRESS_PAYLOAD_POLICY_HELD)return prior;
+  if(edr_egress_is_policy_hold(rc)) {
+    if(make_dirs(outbox_dir))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+    int held=edr_hold_write(path,command_id,rc);
+    if(held==EDR_EGRESS_LOCAL_STATE_FAILURE)fprintf(stderr,"[agent_update] policy hold persistence failed; recovery retained\n");
+    return held;
+  }
+  if(rc)return rc;
+  return edr_hold_clear(path);
 }

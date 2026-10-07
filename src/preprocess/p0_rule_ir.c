@@ -11,6 +11,7 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,7 @@ extern const size_t edr_p0_rule_ir_embed_len;
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <linux/limits.h>
@@ -89,6 +91,9 @@ struct p0_ir_one {
   char mitre_csv[P0_IR_STR];
   char event_type[48];
   int severity;
+  EdrP0RuleEffect effect;
+  uint64_t required_evidence_fields;
+  int operation;
   int chain_gt; /* 0 = unset */
   int n_name_in;
   char name_in[P0_IR_NAME_IN_MAX][128];
@@ -135,6 +140,8 @@ typedef struct p0_ir_candidate {
   int ready;
   char source_label[1024];
   size_t plain_size;
+  uint8_t *source_envelope;
+  size_t source_envelope_size;
   char plain_sha256[65];
   char rules_bundle_version[128];
   uint32_t declared_rule_count;
@@ -154,6 +161,9 @@ typedef struct p0_ir_candidate {
 static p0_ir_candidate *s_active_candidate;
 static p0_ir_candidate *s_load_target;
 static uint64_t s_next_snapshot_epoch;
+static char s_purpose_archive_base[1024];
+/* Publication-lock-owned classification for archive replay I/O failures. */
+static int s_purpose_read_temporary;
 #define s_rule (s_load_target->rule)
 #define s_n (s_load_target->n)
 #define s_ready (s_load_target->ready)
@@ -546,9 +556,11 @@ static void add_reg_data_substrings_munge(
 static int read_full_file(const char *path, char **out, size_t *out_len) {
   FILE *f = fopen(path, "rb");
   if (!f) {
+    s_purpose_read_temporary = errno != ENOENT;
     return 0;
   }
   if (fseek(f, 0, SEEK_END) != 0) {
+    s_purpose_read_temporary=1;
     fclose(f);
     return 0;
   }
@@ -557,17 +569,27 @@ static int read_full_file(const char *path, char **out, size_t *out_len) {
    * exactly EDR_P0_ENCRYPT_OVERHEAD bytes, so the published plaintext limit
    * is deliberately lower than the 4 MiB envelope limit. */
   if (sz < 0 || (size_t)sz > EDR_P0_ENCRYPT_ENVELOPE_MAX_BYTES) {
+    if(sz<0)s_purpose_read_temporary=1;
     fclose(f);
     return 0;
   }
   rewind(f);
   char *b = (char *)malloc((size_t)sz + 1u);
   if (!b) {
+    s_purpose_read_temporary=1;
     fclose(f);
     return 0;
   }
   size_t n = fread(b, 1, (size_t)sz, f);
+  int read_ok = n == (size_t)sz && !ferror(f);
   fclose(f);
+  if (!read_ok) { s_purpose_read_temporary=1;free(b); return 0; }
+  if (s_load_target) {
+    s_load_target->source_envelope = malloc(n ? n : 1u);
+    if (!s_load_target->source_envelope) { s_purpose_read_temporary=1;free(b); return 0; }
+    memcpy(s_load_target->source_envelope,b,n);
+    s_load_target->source_envelope_size=n;
+  }
 
   if (edr_p0_encrypt_is_edr1((const uint8_t *)b, n)) {
     uint8_t *plain = NULL;
@@ -702,6 +724,7 @@ static void p0_ir_candidate_destroy(p0_ir_candidate *candidate) {
   for (i = 0; i < candidate->n; ++i) {
     p0_ir_free_pcre_in_rule(&candidate->rule[i]);
   }
+  free(candidate->source_envelope);
   memset(candidate, 0, sizeof(*candidate));
 }
 
@@ -799,6 +822,7 @@ static int p0_ir_candidate_load_path_locked(p0_ir_candidate *candidate, const ch
   p0_ir_candidate_destroy(candidate);
   previous = s_load_target;
   s_load_target = candidate;
+  s_purpose_read_temporary=0;
   loaded = try_load_ir_path(path);
   s_load_target = previous;
   if (!loaded) p0_ir_candidate_destroy(candidate);
@@ -1216,6 +1240,84 @@ static int p0_ir_replace_file(const char *staged_path, const char *destination_p
 }
 #endif
 
+/* Immutable rule authority is retained beside the existing artifact owner,
+ * before any generation can emit frames. The original authenticated envelope
+ * is used again after restart; filenames alone never grant field authority.
+ * At most 64 envelopes (256 MiB worst case) are retained. No queued owner's
+ * archive is evicted; exhausted storage rejects publication, retaining current. */
+#define P0_IR_PURPOSE_ARCHIVE_MAX 64u
+static int p0_ir_purpose_path(char *out,size_t cap,const char *base,const char *sha) {
+#if defined(EDR_P0_RULE_IR_TESTING) || defined(EDR_P0_DIRECT_EMIT_TESTING)
+  const char *test_base=getenv("EDR_P0_PURPOSE_ARCHIVE_BASE");if(test_base && test_base[0])base=test_base;
+#endif
+  if (!base || !base[0] || !sha || strlen(sha)!=64u) return 0;
+  for (unsigned i=0;i<64u;i++) if (!((sha[i]>='0' && sha[i]<='9') || (sha[i]>='a' && sha[i]<='f'))) return 0;
+  int n=snprintf(out,cap,"%s.purpose-%s.edr1",base,sha);
+  return n>0 && (size_t)n<cap;
+}
+static int p0_ir_purpose_capacity(const char *base) {
+  unsigned count=0;
+#if defined(EDR_P0_RULE_IR_TESTING) || defined(EDR_P0_DIRECT_EMIT_TESTING)
+  const char *test_base=getenv("EDR_P0_PURPOSE_ARCHIVE_BASE");if(test_base && test_base[0])base=test_base;
+#endif
+#ifdef _WIN32
+  char pattern[1200];WIN32_FIND_DATAA data;
+  if (snprintf(pattern,sizeof(pattern),"%s.purpose-*",base)>=(int)sizeof(pattern)) return 0;
+  HANDLE search=FindFirstFileA(pattern,&data);
+  if(search==INVALID_HANDLE_VALUE) return GetLastError()==ERROR_FILE_NOT_FOUND;
+  do {if(++count>=P0_IR_PURPOSE_ARCHIVE_MAX) break;} while(FindNextFileA(search,&data));
+  FindClose(search);
+#else
+  char parent[1200],prefix[1200];
+  if(!p0_ir_parent_dir(base,parent,sizeof(parent)))return 0;
+  const char *name=strrchr(base,'/');name=name?name+1:base;
+  if(snprintf(prefix,sizeof(prefix),"%s.purpose-",name)>=(int)sizeof(prefix))return 0;
+  DIR *dir=opendir(parent);if(!dir)return 0;struct dirent *entry;
+  while((entry=readdir(dir))!=NULL)if(!strncmp(entry->d_name,prefix,strlen(prefix)) && ++count>=P0_IR_PURPOSE_ARCHIVE_MAX)break;
+  closedir(dir);
+#endif
+  return count<P0_IR_PURPOSE_ARCHIVE_MAX;
+}
+static int p0_ir_archive_candidate_locked(const p0_ir_candidate *candidate,const char *base) {
+  char path[1200],temporary[1240];int ok=0;
+  if(!candidate || !candidate->ready || !candidate->source_envelope ||
+     !p0_ir_purpose_path(path,sizeof(path),base,candidate->plain_sha256))return 0;
+#if !defined(EDR_P0_RULE_IR_TESTING) && !defined(EDR_P0_DIRECT_EMIT_TESTING)
+  if(!edr_p0_encrypt_is_edr1(candidate->source_envelope,candidate->source_envelope_size)){
+    fprintf(stderr,"[p0_rule_ir] purpose authority requires authenticated EDR1 envelope\n");return 0;
+  }
+#endif
+  if(file_readable(path)) {
+    p0_ir_candidate *archived=calloc(1,sizeof(*archived));if(!archived)return 0;
+    ok=p0_ir_candidate_load_path_locked(archived,path) && !strcmp(archived->plain_sha256,candidate->plain_sha256);
+    p0_ir_candidate_destroy(archived);free(archived);return ok;
+  }
+  if(!p0_ir_purpose_capacity(base)){fprintf(stderr,"[p0_rule_ir] purpose archive capacity exhausted; retain current bundle\n");return 0;}
+#ifdef _WIN32
+  if(snprintf(temporary,sizeof(temporary),"%s.tmp-%lu",path,(unsigned long)GetCurrentProcessId())>=(int)sizeof(temporary))return 0;
+  HANDLE f=CreateFileA(temporary,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);
+  if(f==INVALID_HANDLE_VALUE)return 0;DWORD wrote=0;
+  ok=WriteFile(f,candidate->source_envelope,(DWORD)candidate->source_envelope_size,&wrote,NULL) && wrote==candidate->source_envelope_size && FlushFileBuffers(f);
+  if(!CloseHandle(f))ok=0;
+  if(ok)ok=MoveFileExA(temporary,path,MOVEFILE_WRITE_THROUGH)!=0;
+  if(!ok)DeleteFileA(temporary);
+#else
+  char parent[1200];if(!p0_ir_parent_dir(path,parent,sizeof(parent)))return 0;
+  if(snprintf(temporary,sizeof(temporary),"%s.tmp-%lu",path,(unsigned long)getpid())>=(int)sizeof(temporary))return 0;
+  int f=open(temporary,O_WRONLY|O_CREAT|O_EXCL,0600);if(f<0)return 0;
+  size_t total=0;while(total<candidate->source_envelope_size){ssize_t n=write(f,candidate->source_envelope+total,candidate->source_envelope_size-total);if(n<=0)break;total+=(size_t)n;}
+  ok=total==candidate->source_envelope_size && fsync(f)==0;if(close(f)!=0)ok=0;
+  if(ok)ok=link(temporary,path)==0;
+  (void)unlink(temporary);
+  if(ok)ok=p0_ir_sync_parent_dir(parent);
+#endif
+  if(!ok)fprintf(stderr,"[p0_rule_ir] purpose archive durability failed; retain current bundle\n");
+  return ok;
+}
+static void p0_ir_purpose_base_locked(const char *base) {
+  snprintf(s_purpose_archive_base,sizeof(s_purpose_archive_base),"%s",base);
+}
+
 int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *destination_path) {
   p0_ir_candidate *next;
   p0_ir_candidate *previous;
@@ -1235,7 +1337,7 @@ int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *de
     return 0;
   }
   loaded = p0_ir_candidate_load_path_locked(next, staged_path);
-  if (loaded && next->ready && p0_ir_sync_staged_file(staged_path)) {
+  if (loaded && next->ready && p0_ir_archive_candidate_locked(next,destination_path) && p0_ir_sync_staged_file(staged_path)) {
     replace_result = p0_ir_replace_file(staged_path, destination_path);
   }
   if (replace_result != 1) {
@@ -1253,6 +1355,7 @@ int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *de
   p0_ir_sensor_pair_write_lock();
   ir_write_lock();
   snprintf(next->source_label, sizeof(next->source_label), "%s", destination_path);
+  p0_ir_purpose_base_locked(destination_path);
   if (!s_inited) {
     s_inited = 1;
     p0_ir_stats_init();
@@ -1824,6 +1927,11 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "registry_value_data_in") == 0 ||
                 strcmp(key, "registry_dword_any") == 0;
     }
+    if (schema_version >= 5u && strcmp(key,"operation")==0 &&
+        ((strcmp(event_type,"file_read")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"credential_db_decrypt")) ||
+         (strcmp(event_type,"network_connect")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"remote_hash_auth")))) continue;
+    if (schema_version >= 5u && strcmp(event_type,"network_connect")==0 &&
+        (!strcmp(key,"command_regex_any") || !strcmp(key,"command_regex_all"))) allowed=1;
     if (!allowed) {
       return 0;
     }
@@ -1902,10 +2010,15 @@ static int p0_ir_source_markers_valid(const EdrBehaviorRecord *br) {
 
 static const char *p0_ir_rule_command(const struct p0_ir_one *r,
     const EdrBehaviorRecord *br, const EdrCommandFacts *facts) {
-  const char *preview = br->cmdline[0] ? br->cmdline : br->script_snippet;
+  const char *preview = br->cmdline;
+  if (strstr(r->event_type,"script")) {
+    if (!memchr(br->script_snippet,0,sizeof(br->script_snippet)) ||
+        edr_behavior_source_field_truncated(br,"source.script_snippet")) return NULL;
+    return br->script_snippet;
+  }
   const char *complete;
   size_t n, complete_n;
-  if (!r->n_cmd_all && !r->n_cmd_any) return preview;
+  if (!r->n_cmd_all && !r->n_cmd_any && !r->operation) return preview;
   if (!memchr(br->cmdline, 0, sizeof(br->cmdline)) ||
       !memchr(br->script_snippet, 0, sizeof(br->script_snippet))) return NULL;
   if (edr_behavior_source_field_truncated(br, "source.script_snippet") &&
@@ -1959,6 +2072,8 @@ static int p0_ir_rule_fields_complete(const struct p0_ir_one *r,
   return 1;
 }
 
+#include "p0_operation.inc"
+
 static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRecord *br,
                                   const EdrCommandFacts *facts, int authoritative) {
   const char *cmd;
@@ -1967,8 +2082,9 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
   }
   if (authoritative && !p0_ir_rule_fields_complete(r, br)) return 0;
   cmd = authoritative ? p0_ir_rule_command(r, br, facts) :
-      (br->cmdline[0] ? br->cmdline : br->script_snippet);
-  if ((r->n_cmd_all || r->n_cmd_any) && !cmd) return 0;
+      (strstr(r->event_type,"script") ? br->script_snippet : br->cmdline);
+  if ((r->n_cmd_all || r->n_cmd_any || r->operation) && !cmd) return 0;
+  if (r->operation && !p0_operation_match(r->operation, br, cmd)) return 0;
   if (strcmp(r->event_type, "process_create") == 0 || strcmp(r->event_type, "script_powershell") == 0 ||
       strcmp(r->event_type, "powershell_script") == 0 || strcmp(r->event_type, "script_wmi") == 0 ||
       strcmp(r->event_type, "wmi_script") == 0) {
@@ -1987,6 +2103,8 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
     return one_rule_match_file(r, br, cmd);
   }
   if (strcmp(r->event_type, "network_connect") == 0) {
+    if (r->n_cmd_any && !any_pcre((pcre2_code *const *)r->re_cmd_any,r->n_cmd_any,cmd)) return 0;
+    for (int i=0;i<r->n_cmd_all;++i) if (!pcre2_ok_one(r->re_cmd_all[i],cmd)) return 0;
     return one_rule_match_net(r, br);
   }
   if (strcmp(r->event_type, "registry_set") == 0) {
@@ -2047,9 +2165,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!cJSON_IsString(kind) || !kind->valuestring ||
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
-        (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
-         schema_version->valuedouble != 3.0 &&
-         schema_version->valuedouble != 2.0) ||
+        (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
         (uint32_t)declared_count->valueint != (uint32_t)cJSON_GetArraySize(rules) ||
@@ -2111,6 +2227,12 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     memset(&t, 0, sizeof(t));
     snprintf(t.id, sizeof(t.id), "%s", jid->valuestring);
     ascii_lower_truncate(t.event_type, sizeof(t.event_type), etbuf);
+    cJSON *effect = cJSON_GetObjectItemCaseSensitive(rnode,"effect");
+    if (!cJSON_IsString(effect) || !effect->valuestring ||
+        (strcmp(effect->valuestring,"local_observation") && strcmp(effect->valuestring,"security_alert"))) {
+      semantic_ok=0; break;
+    }
+    t.effect = !strcmp(effect->valuestring,"security_alert") ? EDR_P0_EFFECT_SECURITY_ALERT : EDR_P0_EFFECT_LOCAL_OBSERVATION;
     t.severity = 3;
     cJSON *jsev = cJSON_GetObjectItemCaseSensitive(rnode, "severity");
     if (cJSON_IsNumber(jsev)) {
@@ -2146,6 +2268,16 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         (parsed_schema_version == 2u && cJSON_GetObjectItemCaseSensitive(jcond, "registry_dword_any"))) {
       semantic_ok = 0;
       break;
+    }
+    cJSON *op=cJSON_GetObjectItemCaseSensitive(jcond,"operation");
+    if (cJSON_IsString(op)) t.operation=!strcmp(op->valuestring,"credential_db_decrypt") ? 1 : 2;
+    if (t.operation) {
+      const char *keys[]={"action","enforcement_action","impact","response"};
+      for (size_t k=0;k<sizeof(keys)/sizeof(keys[0]);++k) {
+        cJSON *v=cJSON_GetObjectItemCaseSensitive(rnode,keys[k]);
+        if (v && (!cJSON_IsString(v) || strcmp(v->valuestring,"alert"))) semantic_ok=0;
+      }
+      if (!semantic_ok) break;
     }
     if (strcmp(etbuf, "process_create") == 0 || strcmp(etbuf, "script_powershell") == 0 ||
         strcmp(etbuf, "powershell_script") == 0 || strcmp(etbuf, "script_wmi") == 0 ||
@@ -2202,6 +2334,8 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
           jcond, "file_path_regex_any", t.re_fpath, &t.n_fpath, P0_IR_PAT, jid->valuestring, &parse_ok
       );
     } else if (strcmp(etbuf, "network_connect") == 0) {
+      add_rx_array(jcond,"command_regex_any",t.re_cmd_any,&t.n_cmd_any,P0_IR_PAT,jid->valuestring,&parse_ok);
+      add_rx_array(jcond,"command_regex_all",t.re_cmd_all,&t.n_cmd_all,P0_IR_PAT,jid->valuestring,&parse_ok);
       add_str_array(
           jcond, "process_name_in", t.name_in, &t.n_name_in, P0_IR_NAME_IN_MAX, 1
       );
@@ -2256,7 +2390,31 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!semantic_ok) {
       break;
     }
-    t.in_use = 1;
+    t.required_evidence_fields = EDR_EVIDENCE_USER;
+    if (t.n_cmd_any || t.n_cmd_all) t.required_evidence_fields |= EDR_EVIDENCE_COMMAND;
+    if (t.n_parent_in || t.n_parent_not_in || t.n_pr_rx || t.n_pr_not_rx)
+      t.required_evidence_fields |= EDR_EVIDENCE_PARENT_NAME;
+    if (t.chain_gt) t.required_evidence_fields |= EDR_EVIDENCE_CHAIN_DEPTH;
+    if (!strcmp(etbuf,"file_read") || !strcmp(etbuf,"file_write")) t.required_evidence_fields |= EDR_EVIDENCE_FILE;
+    if (!strcmp(etbuf,"network_connect")) {
+      t.required_evidence_fields |= EDR_EVIDENCE_NETWORK;
+      if (t.n_fpath || t.n_fpath_not) t.required_evidence_fields |= EDR_EVIDENCE_NETWORK_AUX;
+    }
+    if (!strcmp(etbuf,"registry_set")) {
+      t.required_evidence_fields |= EDR_EVIDENCE_REGISTRY;
+      if (t.n_reg_data || t.n_reg_dword) t.required_evidence_fields |= EDR_EVIDENCE_REGISTRY_DATA;
+    }
+    if (strstr(etbuf,"script")) {
+      t.required_evidence_fields &= ~EDR_EVIDENCE_COMMAND;
+      t.required_evidence_fields |= EDR_EVIDENCE_SCRIPT;
+    }
+    if (t.operation) {
+      if (t.n_cmd_any || t.n_cmd_all) { p0_ir_free_pcre_in_rule(&t); semantic_ok=0; break; }
+      t.required_evidence_fields |= EDR_EVIDENCE_OPERATION;
+    }
+    cJSON *enabled=cJSON_GetObjectItemCaseSensitive(rnode,"enabled");
+    if (enabled && !cJSON_IsBool(enabled)) { p0_ir_free_pcre_in_rule(&t); semantic_ok=0; break; }
+    t.in_use = !enabled || cJSON_IsTrue(enabled);
     s_rule[s_n++] = t;
   }
   cJSON_Delete(root);
@@ -2349,11 +2507,17 @@ void edr_p0_rule_ir_lazy_init(void) {
     loaded = p0_ir_candidate_load_json_locked(
         next, "embedded: p0_rule_bundle_ir_v1.json", embed_data, embed_len
     );
+    if (loaded) {
+      next->source_envelope=malloc(edr_p0_rule_ir_embed_len);
+      if(next->source_envelope){memcpy(next->source_envelope,edr_p0_rule_ir_embed_bytes,edr_p0_rule_ir_embed_len);next->source_envelope_size=edr_p0_rule_ir_embed_len;}else loaded=0;
+      (void)edr_p0_bundle_dst_path(next->source_label,sizeof(next->source_label));
+    }
     if (decrypted) {
       free(decrypted);
     }
   }
 #endif
+  if (loaded && !p0_ir_archive_candidate_locked(next,next->source_label)) loaded=0;
   if (!loaded) {
     fprintf(
         stderr,
@@ -2371,6 +2535,7 @@ void edr_p0_rule_ir_lazy_init(void) {
     p0_ir_clear_ir_artifact_terminal_unhealthy_locked();
     p0_ir_sensor_pair_advance_locked();
     next->epoch = p0_ir_next_epoch_locked();
+    p0_ir_purpose_base_locked(next->source_label);
     previous = s_active_candidate;
     s_active_candidate = next;
     p0_ir_snapshot_retire_locked(previous, &destroy_previous);
@@ -2404,6 +2569,7 @@ void edr_p0_rule_ir_reload(void) {
     return;
   }
   loaded = p0_ir_candidate_load_default_paths_locked(next);
+  if (loaded && !p0_ir_archive_candidate_locked(next,next->source_label)) loaded=0;
   if (!loaded) {
     p0_ir_candidate_destroy(next);
     free(next);
@@ -2421,6 +2587,7 @@ void edr_p0_rule_ir_reload(void) {
   p0_ir_sensor_pair_advance_locked();
   next->epoch = p0_ir_next_epoch_locked();
   s_active_candidate = next;
+  p0_ir_purpose_base_locked(next->source_label);
   p0_ir_snapshot_retire_locked(previous, &destroy_previous);
   ir_write_unlock();
   p0_ir_sensor_pair_write_unlock();
@@ -2661,7 +2828,36 @@ int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
            rule->title[0] ? rule->title : rule->id);
   snprintf(out_match->mitre_csv, sizeof(out_match->mitre_csv), "%s", rule->mitre_csv);
   out_match->severity = rule->severity > 0 ? rule->severity : 3;
+  out_match->effect = rule->effect;
+  out_match->required_evidence_fields = rule->required_evidence_fields;
+  snprintf(out_match->operation_evidence,sizeof(out_match->operation_evidence),"%s",p0_operation_evidence(rule->operation));
   return 1;
+}
+
+static int p0_ir_projection_in(const p0_ir_candidate *snapshot,const char *rule_id,const char *sha,uint64_t fields,const char *operation) {
+  if(snapshot && snapshot->ready && rule_id && sha && operation && !strcmp(sha,snapshot->plain_sha256))
+    for(int i=0;i<snapshot->n;++i){const struct p0_ir_one *r=&snapshot->rule[i];
+      if(r->in_use && r->effect==EDR_P0_EFFECT_SECURITY_ALERT && !strcmp(r->id,rule_id) &&
+         r->required_evidence_fields==fields && !strcmp(operation,p0_operation_evidence(r->operation)))return 1;
+    }
+  return 0;
+}
+int edr_p0_rule_ir_projection_matches(const char *rule_id,const char *bundle_sha,uint64_t fields,const char *operation) {
+  char base[1024],path[1200];int ok;
+  edr_p0_rule_ir_lazy_init();
+  p0_ir_candidate *snapshot=p0_ir_snapshot_acquire();
+  ok=p0_ir_projection_in(snapshot,rule_id,bundle_sha,fields,operation);
+  p0_ir_snapshot_release(snapshot);if(ok)return 1;
+  ir_write_lock();snprintf(base,sizeof(base),"%s",s_purpose_archive_base);ir_write_unlock();
+  if(!p0_ir_purpose_path(path,sizeof(path),base,bundle_sha))return 0;
+  p0_ir_candidate *archived=calloc(1,sizeof(*archived));if(!archived)return -1;
+  p0_ir_publication_lock();
+  ok=p0_ir_candidate_load_path_locked(archived,path);
+#if !defined(EDR_P0_RULE_IR_TESTING) && !defined(EDR_P0_DIRECT_EMIT_TESTING)
+  ok=ok && edr_p0_encrypt_is_edr1(archived->source_envelope,archived->source_envelope_size);
+#endif
+  ok=ok ? p0_ir_projection_in(archived,rule_id,bundle_sha,fields,operation) : (s_purpose_read_temporary ? -1 : 0);
+  p0_ir_publication_unlock();p0_ir_candidate_destroy(archived);free(archived);return ok;
 }
 
 void edr_p0_rule_ir_evaluation_free(EdrP0RuleIrEvaluation *evaluation) {

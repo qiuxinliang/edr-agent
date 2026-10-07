@@ -46,7 +46,47 @@ static int raw_send(const char *body, char *reply, size_t cap, void *ctx) {
  snprintf(reply,cap,"{\"data\":{\"accepted\":true,\"health_delta_version\":1,\"health_revision\":\"raw\"}}");
  return 0;
 }
+typedef struct {unsigned calls;size_t full_bytes,delta_bytes;} LeafServer;
+static int send_leaf(const char *body,char *reply,size_t cap,void *user) {
+ LeafServer *s=user; s->calls++;
+ cJSON *r=cJSON_Parse(body);assert(r);
+ const cJSON *u=cJSON_GetObjectItemCaseSensitive(r,"engine_health_update");
+ const cJSON *h=cJSON_GetObjectItemCaseSensitive(r,"engine_health");
+ if (s->calls==1) {assert(!u);s->full_bytes=strlen(body);}
+ else {
+  assert(u && cJSON_GetObjectItemCaseSensitive(u,"version")->valueint==2);
+  const cJSON *resource=cJSON_GetObjectItemCaseSensitive(h,"resource");
+  assert(resource && cJSON_GetArraySize(resource)==1 && cJSON_GetObjectItemCaseSensitive(resource,"cpu_percent")->valueint==3);
+  const cJSON *removed=cJSON_GetObjectItemCaseSensitive(u,"removed");
+  assert(cJSON_GetArraySize(removed)==1 && !strcmp(cJSON_GetArrayItem(removed,0)->valuestring,"/resource/current_rss_mb"));
+  s->delta_bytes=strlen(body);assert(s->delta_bytes<s->full_bytes);
+ }
+ snprintf(reply,cap,"{\"data\":{\"accepted\":true,\"health_delta_version\":%u,\"health_delta_versions\":[1,2],\"health_revision\":\"leaf%u\"}}",u?2:1,s->calls);
+ cJSON_Delete(r);return 0;
+}
+static int wrong_delta_version(const char *body,char *reply,size_t cap,void *user) {
+ (void)user;cJSON *r=cJSON_Parse(body);assert(r);
+ assert(cJSON_GetObjectItemCaseSensitive(r,"engine_health_update"));cJSON_Delete(r);
+ snprintf(reply,cap,"{\"data\":{\"accepted\":true,\"health_delta_version\":1,\"health_revision\":\"wrong-version\"}}");
+ return 0;
+}
+static void leaf_v2(void) {
+ EdrHealthUpload state={0};LeafServer server={0};
+ const char *base="{\"endpoint_id\":\"ep\",\"agent_version\":\"1\",\"policy_version\":\"p\",\"engine_health\":{\"resource\":{\"rss_mb\":10,\"current_rss_mb\":10,\"cpu_percent\":2},\"static\":\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"}}";
+ cJSON *r=cJSON_Parse(base),*resource=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(r,"engine_health"),"resource");
+ cJSON_DeleteItemFromObjectCaseSensitive(resource,"current_rss_mb");
+ cJSON_ReplaceItemInObjectCaseSensitive(resource,"cpu_percent",cJSON_CreateNumber(3));
+ char *next=cJSON_PrintUnformatted(r);cJSON_Delete(r);
+ assert(edr_health_upload(&state,base,1,send_leaf,&server)==0 && state.delta_version==2);
+ assert(edr_health_upload(&state,next,60000000001ULL,send_leaf,&server)==0 && state.delta_count==1);
+ printf("health v2 full=%zu delta=%zu\n",server.full_bytes,server.delta_bytes);
+ uint64_t accepted=state.full_count+state.delta_count;
+ assert(edr_health_upload(&state,next,120000000001ULL,wrong_delta_version,NULL)!=0);
+ assert(!state.base && state.full_count+state.delta_count==accepted);
+ edr_health_upload_reset(&state);cJSON_free(next);
+}
 int main(void) {
+ leaf_v2();
  EdrHealthUpload state={0}; Server server={0};
  const char *a="{\"endpoint_id\":\"ep\",\"agent_version\":\"1\",\"policy_version\":\"p1\",\"engine_health\":{\"static\":\"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\",\"object\":{\"capability\":true},\"list\":[1,2],\"nullable\":1,\"removed\":{},\"number\":1}}";
  cJSON *r=cJSON_Parse(a), *h=cJSON_GetObjectItemCaseSensitive(r,"engine_health");

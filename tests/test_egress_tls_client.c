@@ -281,6 +281,46 @@ static int command_result_scenario(const char *path) {
   if (found >= 0) {
     EdrCommandStateRecord *record = &pending[found];
     CHECK(record->execution_status == 1 && record->result_authorization.expires_unix_ms > 0);
+    char *original_detail=malloc(strlen(record->detail)+1u);CHECK(original_detail);
+    if(!original_detail){free(pending);return 1;}strcpy(original_detail,record->detail);
+    EdrSoarCommandMeta expired=meta;expired.result_authorization=record->result_authorization;
+    expired.result_authorization.expires_unix_ms=(int64_t)time(NULL)*1000-1;
+    /* Force only the clock boundary in durable state; the original command and
+     * renewal both traverse the real Ed25519 admission and executor owners. */
+    CHECK(edr_command_state_finish(record->command_id,record->command_type,&expired,
+        record->response_status,record->execution_status,record->exit_code,record->detail,record->artifacts,1)==0);
+    record->result_authorization=expired.result_authorization;
+    CHECK(edr_command_state_mark_report_held(record,"result_authorization_expired")==0);
+    const char *renew_payload=getenv("EDR_TEST_RENEWAL_PAYLOAD");
+    const char *renew_signature=getenv("EDR_TEST_RENEWAL_SIGNATURE");
+    const char *renew_issued=getenv("EDR_TEST_RENEWAL_ISSUED");
+    CHECK(renew_payload && renew_signature && renew_issued);
+    if(renew_payload && renew_signature && renew_issued) {
+      EdrSoarCommandMeta renewal={0};
+      snprintf(renewal.idempotency_key,sizeof(renewal.idempotency_key),"%s",renew_signature);
+      renewal.issued_at_unix_ms=strtoll(renew_issued,NULL,10);renewal.deadline_ms=30000;
+      CHECK(edr_command_receive_envelope("cmd_forged_renewal","result_delivery_renewal",
+          (const uint8_t *)renew_payload,strlen(renew_payload),&renewal)==0);
+      CHECK(edr_command_receive_envelope("cmd_synthetic_renewal","result_delivery_renewal",
+          (const uint8_t *)renew_payload,strlen(renew_payload),&renewal)==1);
+      edr_command_executor_wake();int renewed=0;
+      for(unsigned attempt=0;attempt<5u && !renewed;attempt++) {
+        pause_retry();int count=edr_command_state_collect_pending(pending,8u);
+        for(int j=0;j<count;j++)if(!strcmp(pending[j].command_id,"cmd_synthetic_noop")) {
+          record=&pending[j];renewed=1;CHECK(record->result_authorization.expires_unix_ms>(int64_t)time(NULL)*1000);
+          CHECK(!strcmp(record->detail,original_detail) && record->execution_status==1 && record->exit_code==0);
+        }
+      }
+      CHECK(renewed);
+      CHECK(edr_command_receive_envelope("cmd_synthetic_noop","noop",(const uint8_t *)"{}",2,&meta)==0);
+      EdrCommandStateRecord *duplicate=calloc(1,sizeof(*duplicate));CHECK(duplicate);
+      if(duplicate) {
+        CHECK(edr_command_state_begin("cmd_synthetic_noop","noop",&meta,NULL,duplicate)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+        CHECK(!strcmp(duplicate->detail,original_detail));free(duplicate);
+      }
+    }
+    free(original_detail);
+
     CHECK(edr_ingest_http_post_command_result_typed(record->command_id, record->command_type, &meta,
         record->execution_status, record->exit_code, "replacement bytes") != 0);
     /* Receiver deliberately returns an incomplete ACK once. */
@@ -320,7 +360,7 @@ static int command_result_scenario(const char *path) {
   }
   CHECK(edr_command_executor_shutdown_timeout(5000) == 1);
   edr_command_bind_config(NULL); free(pending);
-  printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"failed_checks\":%u}\n", failed);
+  printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
   return failed ? 1 : 0;
 }
 #endif

@@ -10,17 +10,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "edr/behavior_record.h"
+#include "edr/evidence_projection.h"
 
 /* One Agent-owned matcher contract.  The release PCRE2 producer hashes this
  * header and exports these literals, so a backend provenance record cannot
  * name a parser schema, capacity, or source grammar that this binary does
  * not actually compile. */
-/* v4 adds field-specific exclusions and executable paths on file rules.
- * Missing or truncated exclusion evidence cannot exempt an event. */
-#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v4"
-#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@4"
+/* v5 makes local observations and security alerts explicit and binds exact
+ * operation predicates plus rule-owned evidence purposes. */
+#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v5"
+#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@5"
 #define EDR_P0_RULE_IR_BUNDLE_KIND "edr_p0_rule_bundle_ir_v1"
-#define EDR_P0_RULE_IR_SCHEMA_VERSION 4u
+#define EDR_P0_RULE_IR_SCHEMA_VERSION 5u
 #define EDR_P0_RULE_IR_MAX_RULES 256u
 
 typedef struct {
@@ -36,12 +37,25 @@ typedef struct {
  * identity from separately acquired snapshots.  This copied result is built
  * while one immutable IR snapshot is retained; callers own `matches` and
  * release it with edr_p0_rule_ir_evaluation_free(). */
+typedef enum {
+  EDR_P0_EFFECT_LOCAL_OBSERVATION = 0,
+  EDR_P0_EFFECT_SECURITY_ALERT = 1
+} EdrP0RuleEffect;
+
 typedef struct {
   char rule_id[64];
   char title[512];
   char mitre_csv[512];
   int severity;
+  EdrP0RuleEffect effect;
+  uint64_t required_evidence_fields;
+  char operation_evidence[512];
 } EdrP0RuleIrMatch;
+
+/* Exact immutable authority: current snapshot or authenticated archived bundle.
+ * 1=authorized, 0=missing/mismatched authority, -1=temporary local I/O/resource failure. */
+int edr_p0_rule_ir_projection_matches(const char *rule_id, const char *bundle_sha,
+                                      uint64_t fields, const char *operation);
 
 /* This is bounded by the parser's EDR_P0_RULE_IR_MAX_RULES.  The public fixed bound
  * lets an evaluation retain an immutable snapshot without allocating on the

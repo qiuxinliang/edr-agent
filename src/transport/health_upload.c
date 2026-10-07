@@ -4,7 +4,7 @@
 
 void edr_health_upload_reset(EdrHealthUpload *s) {
  if (!s) return;
- cJSON_Delete(s->base); s->base = NULL; s->revision[0] = 0; s->full_at_ns = 0;
+ cJSON_Delete(s->base); s->base = NULL; s->revision[0] = 0; s->full_at_ns = 0; s->delta_version=0;
 }
 
 static int same_identity(const cJSON *a, const cJSON *b) {
@@ -32,6 +32,47 @@ static int exact_block_equal(const cJSON *a, const cJSON *b) {
  cJSON_free(left); cJSON_free(right); return same;
 }
 
+/* v2 objects merge recursively; empty objects, arrays, scalars and null are
+ * replacements. Deletions are explicit JSON pointers relative to health. */
+static int leaf_delta(const cJSON *before,const cJSON *after,cJSON *changes,
+    cJSON *removed,const char *prefix,unsigned depth) {
+ if (depth>10) return 0;
+ const cJSON *item;
+ cJSON_ArrayForEach(item,after) {
+  const cJSON *old=cJSON_GetObjectItemCaseSensitive(before,item->string);
+  if (old && exact_block_equal(old,item)) continue;
+  char path[512]; size_t n=strlen(prefix);
+  if (n+2>=sizeof(path)) return 0;
+  memcpy(path,prefix,n); path[n++]='/';
+  for (const char *p=item->string;*p;p++) {
+   if (n+3>=sizeof(path)) return 0;
+   if (*p=='~'||*p=='/') { path[n++]='~'; path[n++]=*p=='~'?'0':'1'; }
+   else path[n++]=*p;
+  }
+  path[n]=0;
+  cJSON *copy;
+  if (cJSON_IsObject(old)&&cJSON_IsObject(item)&&item->child) {
+   copy=cJSON_CreateObject();
+   if (!copy || !leaf_delta(old,item,copy,removed,path,depth+1)) { cJSON_Delete(copy);return 0; }
+   if (!copy->child) { cJSON_Delete(copy);continue; }
+  } else copy=cJSON_Duplicate(item,1);
+  if (!copy || !cJSON_AddItemToObject(changes,item->string,copy)) { cJSON_Delete(copy);return 0; }
+ }
+ cJSON_ArrayForEach(item,before) {
+  if (cJSON_GetObjectItemCaseSensitive(after,item->string)) continue;
+  char path[512];size_t n=strlen(prefix);
+  if(n+2>=sizeof(path))return 0;
+  memcpy(path,prefix,n);path[n++]='/';
+  for(const char *p=item->string;*p;p++) {
+   if(n+3>=sizeof(path))return 0;
+   if(*p=='~'||*p=='/') {path[n++]='~';path[n++]=*p=='~'?'0':'1';} else path[n++]=*p;
+  }
+  path[n]=0;
+  cJSON *value=cJSON_CreateString(path);
+  if(cJSON_GetArraySize(removed)>=64 || !value || !cJSON_AddItemToArray(removed,value)) {cJSON_Delete(value);return 0;}
+ }
+ return 1;
+}
 static cJSON *make_delta(const EdrHealthUpload *s, const cJSON *full) {
  cJSON *out=cJSON_Duplicate(full,1);
  cJSON *changes=cJSON_CreateObject(), *update=cJSON_CreateObject(), *removed=cJSON_CreateArray();
@@ -39,6 +80,9 @@ static cJSON *make_delta(const EdrHealthUpload *s, const cJSON *full) {
  const cJSON *before=cJSON_GetObjectItemCaseSensitive(s->base,"engine_health");
  const cJSON *after=cJSON_GetObjectItemCaseSensitive(full,"engine_health");
  const cJSON *item;
+ if (s->delta_version==2) {
+  if (!leaf_delta(before,after,changes,removed,"",0)) goto fail;
+ } else {
  cJSON_ArrayForEach(item,after) {
   const cJSON *old=cJSON_GetObjectItemCaseSensitive(before,item->string);
   if (!old || !exact_block_equal(old,item)) {
@@ -52,7 +96,8 @@ static cJSON *make_delta(const EdrHealthUpload *s, const cJSON *full) {
    if (!key || !cJSON_AddItemToArray(removed,key)) { cJSON_Delete(key); goto fail; }
   }
  }
- if (!cJSON_AddNumberToObject(update,"version",1) || !cJSON_AddStringToObject(update,"base",s->revision)) goto fail;
+ }
+ if (!cJSON_AddNumberToObject(update,"version",s->delta_version==2?2:1) || !cJSON_AddStringToObject(update,"base",s->revision)) goto fail;
  if (!cJSON_AddItemToObject(update,"removed",removed)) goto fail;
  removed=NULL;
  if (!cJSON_ReplaceItemInObjectCaseSensitive(out,"engine_health",changes)) goto fail;
@@ -95,10 +140,12 @@ int edr_health_upload(EdrHealthUpload *s, const char *body, uint64_t now_ns,
  if (s->base && s->revision[0] && same_identity(full,s->base) && now_ns >= s->full_at_ns &&
      now_ns-s->full_at_ns < 900ULL*1000000000ULL) {
   delta=make_delta(s,full);
-  if (!delta) goto done;
-  delta_wire=cJSON_PrintUnformatted(delta);
-  if (!delta_wire) goto done;
-  is_delta=strlen(delta_wire)<strlen(full_wire);
+  /* A diff exceeding its explicit bound falls back to a full snapshot. */
+  if (delta) {
+   delta_wire=cJSON_PrintUnformatted(delta);
+   if (!delta_wire) goto done;
+   is_delta=strlen(delta_wire)<strlen(full_wire);
+  }
  }
  s->full_bytes += strlen(full_wire);
  s->attempt_bytes += strlen(is_delta ? delta_wire : full_wire);
@@ -121,15 +168,18 @@ int edr_health_upload(EdrHealthUpload *s, const char *body, uint64_t now_ns,
  const cJSON *revision=cJSON_GetObjectItemCaseSensitive(data,"health_revision");
  const cJSON *accepted=cJSON_GetObjectItemCaseSensitive(data,"accepted");
  if (!cJSON_IsTrue(accepted) || (is_delta &&
-     (!cJSON_IsNumber(version) || version->valuedouble!=1 || !cJSON_IsString(revision) ||
+     (!cJSON_IsNumber(version) || version->valuedouble!=(s->delta_version==2?2:1) || !cJSON_IsString(revision) ||
       !revision->valuestring[0] || strlen(revision->valuestring)>=sizeof(s->revision)))) {
   rc=-1; goto done;
  }
  if (is_delta) s->delta_count++; else { s->full_count++; s->full_at_ns=now_ns; }
- if (cJSON_IsTrue(accepted) && cJSON_IsNumber(version) && version->valuedouble==1 &&
+ if (cJSON_IsTrue(accepted) && cJSON_IsNumber(version) && (version->valuedouble==1 || version->valuedouble==2) &&
      cJSON_IsString(revision) && revision->valuestring[0] && strlen(revision->valuestring)<sizeof(s->revision)) {
   cJSON_Delete(s->base); s->base=full; full=NULL;
   strcpy(s->revision,revision->valuestring);
+  s->delta_version=1;
+  const cJSON *supported=cJSON_GetObjectItemCaseSensitive(data,"health_delta_versions"),*v;
+  cJSON_ArrayForEach(v,supported) if(cJSON_IsNumber(v)&&v->valuedouble==2) s->delta_version=2;
  } else { edr_health_upload_reset(s); }
 done:
  if (rc != 0) edr_health_upload_reset(s);

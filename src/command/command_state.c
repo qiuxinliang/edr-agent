@@ -1,5 +1,6 @@
 #include "edr/command_state.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/sha256.h"
 
 #include "cJSON.h"
 
@@ -112,12 +113,14 @@ static int state_windows_validate_existing(const char *path, int want_dir) {
     return -1;
   }
   DWORD attributes = GetFileAttributesA(path);
-  if (attributes == INVALID_FILE_ATTRIBUTES ||
-      (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u) {
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    DWORD error=GetLastError();
+    errno=(error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND) ? ENOENT : EACCES;
     return -1;
   }
-  if ((((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0u) ? 1 : 0) != want_dir) {
-    return -1;
+  if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u ||
+      ((((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0u) ? 1 : 0) != want_dir)) {
+    errno=EACCES;return -1;
   }
   return 0;
 }
@@ -920,6 +923,8 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   out->retry_count = parse_json_int_field_line(line, "retry_count", 0);
   out->final_record = parse_json_int_field_line(line, "final", 0);
   out->report_pending = parse_json_int_field_line(line, "report_pending", 0);
+  out->report_policy_held = parse_json_int_field_line(line,"report_policy_held",0);
+  parse_json_string_field_line(line,"report_policy_version",out->report_policy_version,sizeof(out->report_policy_version));
   out->report_attempts = (uint32_t)parse_json_int_field_line(line, "report_attempts", 0);
   out->process_id = parse_json_int_field_line(line, "process_id", 0);
   out->updated_unix_ms = parse_json_int64_field_line(line, "updated_unix_ms", 0);
@@ -1036,40 +1041,20 @@ static int control_ack_record_path(const char *command_id, char *out, size_t cap
   return out[0] ? 0 : -1;
 }
 
-static int command_state_has_final(const char *command_id, const EdrSoarCommandMeta *meta) {
-  char path[1024];
-  state_default_path(path, sizeof(path));
-  FILE *lock = state_lock_acquire();
-  if (!lock) {
-    return 0;
+int edr_command_state_has_final(const char *command_id,const EdrSoarCommandMeta *meta) {
+  char path[1024];state_default_path(path,sizeof(path));
+  FILE *lock=state_lock_acquire();if(!lock)return -1;
+  errno=0;FILE *f=state_open_read_secure(path,NULL);
+  if(!f){int rc=errno==ENOENT ? 0 : -1;state_lock_release(lock);return rc;}
+  char idem_key[128];state_idempotency_key(meta,idem_key,sizeof(idem_key));
+  char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);int found=line ? 0 : -1;
+  while(line && fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+    if(!strchr(line,'\n')){found=-1;break;}
+    if(!strstr(line,"\"final\":1"))continue;
+    if((command_id && command_id[0] && line_matches_key(line,"command_id",command_id)) ||
+        (idem_key[0] && line_matches_key(line,"idempotency_key",idem_key)))found=1;
   }
-  FILE *f = state_open_read_secure(path, NULL);
-  if (!f) {
-    state_lock_release(lock);
-    return 0;
-  }
-  char idem_key[128];
-  state_idempotency_key(meta, idem_key, sizeof(idem_key));
-  int found = 0;
-  char line[EDR_COMMAND_STATE_LINE_CAP];
-  while (fgets(line, sizeof(line), f)) {
-    if (!strstr(line, "\"final\":1")) {
-      continue;
-    }
-    int match = 0;
-    if (idem_key[0]) {
-      match = line_matches_key(line, "idempotency_key", idem_key);
-    } else if (command_id && command_id[0]) {
-      match = line_matches_key(line, "command_id", command_id);
-    }
-    if (match) {
-      found = 1;
-      break;
-    }
-  }
-  fclose(f);
-  state_lock_release(lock);
-  return found;
+  if(ferror(f))found=-1;fclose(f);free(line);state_lock_release(lock);return found;
 }
 
 static int command_inbox_delete_path(const char *path) {
@@ -1560,6 +1545,8 @@ void edr_command_state_delete_pending_ack(const char *command_id) {
   state_lock_release(lock);
 }
 
+static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out);
+
 int edr_command_state_store_inbox(const char *command_id, const char *command_type,
                                   const uint8_t *payload, size_t payload_len,
                                   const EdrSoarCommandMeta *meta) {
@@ -1587,6 +1574,19 @@ int edr_command_state_store_inbox(const char *command_id, const char *command_ty
     free(hex);
     return -1;
   }
+  /* A repeated delivery is never a grant renewal or a replacement payload.
+   * Only the explicit signed renewal owner below may update delivery expiry. */
+  EdrCommandInboxRecord previous;
+  errno=0;
+  int prior=command_inbox_read_file(path,&previous), prior_errno=errno;
+  if(prior==0) {
+    int same=!strcmp(previous.command_id,command_id) &&
+      !strcmp(previous.command_type,command_type ? command_type : "") &&
+      previous.payload_len==payload_len && (!payload_len || !memcmp(previous.payload,payload,payload_len));
+    edr_command_state_free_inbox_record(&previous);
+    state_lock_release(lock);free(hex);return same ? 0 : -1;
+  }
+  if(prior_errno!=ENOENT) {state_lock_release(lock);free(hex);return -1;}
   snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
   FILE *f = state_open_new_secure(tmp);
   if (!f) {
@@ -1701,6 +1701,50 @@ static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out)
     return 1;
   }
   return 0;
+}
+
+static int scope_string(const cJSON *root,const char *name,char *out,size_t cap) {
+  const cJSON *v=cJSON_GetObjectItemCaseSensitive(root,name);
+  if(!cJSON_IsString(v) || !v->valuestring || !v->valuestring[0] || strlen(v->valuestring)>=cap)return 0;
+  memcpy(out,v->valuestring,strlen(v->valuestring)+1u);return 1;
+}
+int edr_command_state_task_scope(const char *command_id,EdrEgressTaskScope *out) {
+  if(!command_id || !out)return EDR_EGRESS_REQUEST_DENIED;
+  memset(out,0,sizeof(*out));
+  char path[1200];
+  if(command_inbox_record_path(command_id,path,sizeof(path)))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  FILE *lock=state_lock_acquire();if(!lock)return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  EdrCommandInboxRecord inbox;
+  errno=0;int rc=command_inbox_read_file(path,&inbox), saved_errno=errno;
+  state_lock_release(lock);
+  if(rc)return rc<0 && saved_errno==ENOENT ? EDR_EGRESS_REQUEST_DENIED : EDR_EGRESS_LOCAL_STATE_FAILURE;
+  const EdrCommandResultAuthorization *a=&inbox.meta.result_authorization;
+  /* This protected receipt is created only after signature verification. The
+   * updater retains its inbox until the terminal event is durably ACKed. */
+  int valid=!strcmp(inbox.command_id,command_id) && !strcmp(inbox.command_type,"agent_update") &&
+    !strcmp(a->command_id,command_id) && !strcmp(a->command_type,"agent_update") &&
+    a->tenant_id[0] && a->endpoint_id[0] && a->expires_unix_ms>0;
+  rc=EDR_EGRESS_REQUEST_DENIED;
+  if(valid && a->expires_unix_ms<=state_now_ms())rc=EDR_EGRESS_AUTHORIZATION_EXPIRED;
+  else if(valid) {
+    cJSON *payload=cJSON_ParseWithLength((const char *)inbox.payload,inbox.payload_len);
+    valid=scope_string(payload,"task_id",out->task_id,sizeof(out->task_id)) &&
+      scope_string(payload,"artifact_id",out->artifact_id,sizeof(out->artifact_id)) &&
+      scope_string(payload,"hash",out->artifact_sha256,sizeof(out->artifact_sha256)) &&
+      scope_string(payload,"version",out->target_version,sizeof(out->target_version)) &&
+      scope_string(payload,"operation",out->operation,sizeof(out->operation));
+    if(!scope_string(payload,"upgrade_class",out->upgrade_class,sizeof(out->upgrade_class))) {
+      const cJSON *manifest=cJSON_GetObjectItemCaseSensitive(payload,"runtime_manifest_url");
+      snprintf(out->upgrade_class,sizeof(out->upgrade_class),"%s",cJSON_IsString(manifest)&&manifest->valuestring[0]?"runtime_bundle":"binary_hot");
+    }
+    if(valid) {
+      snprintf(out->command_id,sizeof(out->command_id),"%s",command_id);
+      snprintf(out->tenant_id,sizeof(out->tenant_id),"%s",a->tenant_id);
+      snprintf(out->endpoint_id,sizeof(out->endpoint_id),"%s",a->endpoint_id);rc=0;
+    }
+    cJSON_Delete(payload);
+  }
+  edr_command_state_free_inbox_record(&inbox);return rc;
 }
 
 static int command_inbox_name_is_record(const char *name) {
@@ -1860,7 +1904,7 @@ int edr_command_state_collect_inbox_filtered(EdrCommandInboxRecord *out, size_t 
       }
       continue;
     }
-    if (command_state_has_final(rec.command_id, &rec.meta)) {
+    if (edr_command_state_has_final(rec.command_id, &rec.meta)==1) {
       edr_command_state_free_inbox_record(&rec);
       (void)command_inbox_delete_path(path);
       continue;
@@ -1937,6 +1981,112 @@ static int append_state_line_locked(const char *line) {
   return rc;
 }
 
+/* The renewal and target record share the existing protected command owner.
+ * No content, execution deadline, ACK, owner identity or retry count is changed. */
+static int renewal_equal(const cJSON *o,const char *key,const char *value) {
+  const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);
+  return cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring,value);
+}
+static int renewal_number(cJSON *o,const char *key,double value) {
+  cJSON *n=cJSON_CreateNumber(value);if(!n)return 0;
+  if(cJSON_HasObjectItem(o,key))return cJSON_ReplaceItemInObjectCaseSensitive(o,key,n);
+  return cJSON_AddItemToObject(o,key,n);
+}
+static int renewal_text(cJSON *o,const char *key,const char *value) {
+  cJSON *n=cJSON_CreateString(value);if(!n)return 0;
+  if(cJSON_HasObjectItem(o,key))return cJSON_ReplaceItemInObjectCaseSensitive(o,key,n);
+  return cJSON_AddItemToObject(o,key,n);
+}
+int edr_command_state_renew_delivery(const char *renewal_id,const uint8_t *payload,
+    size_t payload_len,const EdrSoarCommandMeta *meta) {
+  int rc=EDR_EGRESS_REQUEST_DENIED;int64_t now=state_now_ms();
+  if(!renewal_id || !meta || !payload || !payload_len || payload_len>8192u)return rc;
+  const EdrCommandResultAuthorization *authority=&meta->result_authorization;
+  if(strcmp(authority->command_id,renewal_id) || strcmp(authority->command_type,"result_delivery_renewal") ||
+      !authority->tenant_id[0] || !authority->endpoint_id[0] || authority->expires_unix_ms<=now)return rc;
+  cJSON *request=cJSON_ParseWithLength((const char *)payload,payload_len);
+  const cJSON *id=cJSON_GetObjectItemCaseSensitive(request,"target_command_id");
+  const cJSON *type=cJSON_GetObjectItemCaseSensitive(request,"target_command_type");
+  const cJSON *kind=cJSON_GetObjectItemCaseSensitive(request,"target_kind");
+  const cJSON *hash=cJSON_GetObjectItemCaseSensitive(request,"target_sha256");
+  const cJSON *expires=cJSON_GetObjectItemCaseSensitive(request,"expires_unix_ms");
+  if(!renewal_equal(request,"schema","edr.result_delivery_renewal.v1") ||
+      !renewal_equal(request,"initiated_by","operator") ||
+      !renewal_equal(request,"tenant_id",authority->tenant_id) ||
+      !renewal_equal(request,"endpoint_id",authority->endpoint_id) ||
+      !cJSON_IsString(id) || !id->valuestring[0] || strlen(id->valuestring)>=128u || !strcmp(id->valuestring,renewal_id) ||
+      !cJSON_IsString(type) || !type->valuestring[0] || !strcmp(type->valuestring,"result_delivery_renewal") ||
+      !cJSON_IsString(kind) || (strcmp(kind->valuestring,"result") && strcmp(kind->valuestring,"upgrade_payload")) ||
+      !cJSON_IsString(hash) || strlen(hash->valuestring)!=64u || strspn(hash->valuestring,"0123456789abcdef")!=64u ||
+      !cJSON_IsNumber(expires) || expires->valuedouble<=now || expires->valuedouble>now+86400000LL ||
+      expires->valuedouble>(double)authority->expires_unix_ms || (double)(int64_t)expires->valuedouble!=expires->valuedouble)goto done;
+  int upgrade=!strcmp(kind->valuestring,"upgrade_payload");
+  if(upgrade && strcmp(type->valuestring,"agent_update"))goto done;
+  FILE *lock=state_lock_acquire();if(!lock){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done;}
+  cJSON *target=NULL;char path[1200],sha[65];
+  if(upgrade) {
+    if(command_inbox_record_path(id->valuestring,path,sizeof(path)))goto locked_done;
+    EdrCommandInboxRecord inbox;errno=0;int read_rc=command_inbox_read_file(path,&inbox);
+    if(read_rc){rc=errno==ENOENT ? EDR_EGRESS_REQUEST_DENIED : EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    int ok=!strcmp(inbox.command_id,id->valuestring) && !strcmp(inbox.command_type,type->valuestring) &&
+      edr_sha256_hex(inbox.payload,inbox.payload_len,sha)==0 && !strcmp(sha,hash->valuestring);
+    edr_command_state_free_inbox_record(&inbox);if(!ok)goto locked_done;
+    FILE *f=state_open_read_secure(path,NULL);if(!f){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    if(fseek(f,0,SEEK_END)){fclose(f);rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    long len=ftell(f);if(len<=0 || len>33554432 || fseek(f,0,SEEK_SET)){fclose(f);rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    char *raw=malloc((size_t)len+1u);if(!raw){fclose(f);rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    ok=fread(raw,1,(size_t)len,f)==(size_t)len && !ferror(f);fclose(f);raw[len]=0;
+    if(ok)target=cJSON_Parse(raw);free(raw);
+    if(!target){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+  } else {
+    state_default_path(path,sizeof(path));FILE *f=state_open_read_secure(path,NULL);
+    if(!f){rc=errno==ENOENT ? EDR_EGRESS_REQUEST_DENIED : EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);int io_ok=line!=NULL;
+    while(line && fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+      if(!strchr(line,'\n')){io_ok=0;break;}
+      if(line_matches_key(line,"command_id",id->valuestring)) {
+        cJSON *candidate=cJSON_Parse(line);if(!candidate){io_ok=0;break;}
+        cJSON_Delete(target);target=candidate;
+      }
+    }
+    if(ferror(f))io_ok=0;fclose(f);free(line);
+    if(!io_ok){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+    const cJSON *final=cJSON_GetObjectItemCaseSensitive(target,"final");
+    const cJSON *pending=cJSON_GetObjectItemCaseSensitive(target,"report_pending");
+    const cJSON *detail=cJSON_GetObjectItemCaseSensitive(target,"detail");
+    if(!cJSON_IsNumber(final) || final->valueint!=1 || !cJSON_IsNumber(pending) || pending->valueint!=1 ||
+        !cJSON_IsString(detail) || edr_sha256_hex((const uint8_t *)detail->valuestring,strlen(detail->valuestring),sha) ||
+        strcmp(sha,hash->valuestring))goto locked_done;
+  }
+  cJSON *grant=cJSON_GetObjectItemCaseSensitive(target,"result_authorization");
+  const cJSON *old_expiry=cJSON_GetObjectItemCaseSensitive(grant,"expires_unix_ms");
+  if(!renewal_equal(target,"command_id",id->valuestring) || !renewal_equal(target,"command_type",type->valuestring) ||
+      !renewal_equal(grant,"command_id",id->valuestring) || !renewal_equal(grant,"command_type",type->valuestring) ||
+      !renewal_equal(grant,"tenant_id",authority->tenant_id) || !renewal_equal(grant,"endpoint_id",authority->endpoint_id) ||
+      !cJSON_IsNumber(old_expiry) || old_expiry->valuedouble<=0 || expires->valuedouble<=old_expiry->valuedouble)goto locked_done;
+  /* Expiry is monotonic, so replay cannot alter state or extend authorization. */
+  if(!renewal_number(grant,"expires_unix_ms",expires->valuedouble) ||
+      !renewal_text(target,"delivery_renewal_id",renewal_id) ||
+      (!upgrade && (!renewal_number(target,"report_policy_held",0) ||
+                    !renewal_text(target,"report_policy_version","") ||
+                    !renewal_number(target,"report_next_retry_unix_ms",0)))) {rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+  char *updated=cJSON_PrintUnformatted(target);if(!updated){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
+  if(upgrade) {
+    char tmp[1300];snprintf(tmp,sizeof(tmp),"%s.renewal.tmp.%lld",path,(long long)now);
+    FILE *f=state_open_new_secure(tmp);int ok=f!=NULL;
+    if(f){ok=fputs(updated,f)>=0 && fputc('\n',f)!=EOF && state_flush_file(f)==0;if(fclose(f))ok=0;}
+    if(ok)ok=state_replace_file(tmp,path)==0;
+    if(!ok)(void)command_inbox_delete_path(tmp);
+    rc=ok ? 0 : EDR_EGRESS_LOCAL_STATE_FAILURE;
+  } else rc=append_state_line(updated)==0 ? 0 : EDR_EGRESS_LOCAL_STATE_FAILURE;
+  free(updated);
+  if(rc==0)s_collect_cache_pending_zero=0;
+locked_done:
+  cJSON_Delete(target);state_lock_release(lock);
+done:
+  cJSON_Delete(request);return rc;
+}
+
 static int count_prior_attempts(const char *command_id, const EdrSoarCommandMeta *meta) {
   char path[1024];
   state_default_path(path, sizeof(path));
@@ -2000,11 +2150,10 @@ int edr_command_state_begin(const char *command_id, const char *command_type,
     char line[EDR_COMMAND_STATE_LINE_CAP];
     while (fgets(line, sizeof(line), f)) {
       int match = 0;
-      if (idem_key[0]) {
-        match = line_matches_key(line, "idempotency_key", idem_key);
-      } else if (command_id && command_id[0]) {
+      if (command_id && command_id[0])
         match = line_matches_key(line, "command_id", command_id);
-      }
+      if (!match && idem_key[0])
+        match = line_matches_key(line, "idempotency_key", idem_key);
       if (!match) {
         continue;
       }
@@ -2104,11 +2253,10 @@ int edr_command_state_replay_begin_policy(const char *command_id, const char *co
     char line[EDR_COMMAND_STATE_LINE_CAP];
     while (fgets(line, sizeof(line), f)) {
       int match = 0;
-      if (idem_key[0]) {
-        match = line_matches_key(line, "idempotency_key", idem_key);
-      } else if (command_id && command_id[0]) {
+      if (command_id && command_id[0])
         match = line_matches_key(line, "command_id", command_id);
-      }
+      if (!match && idem_key[0])
+        match = line_matches_key(line, "idempotency_key", idem_key);
       if (!match) {
         continue;
       }
@@ -2271,8 +2419,26 @@ static int command_state_finish(const char *command_id, const char *command_type
 #endif
   json_escape_to(det, sizeof(det), detail ? detail : "");
   json_escape_to(art, sizeof(art), artifacts ? artifacts : "");
+  FILE *lock=state_lock_acquire();if(!lock)return -1;
+  EdrCommandResultAuthorization final_authority={0};
+  if(meta)final_authority=meta->result_authorization;
+  if(meta && command_type && !strcmp(command_type,"agent_update")) {
+    /* Recovery can finish while another worker renews delivery. Inherit only
+     * that same protected inbox grant, never the old snapshot's expiry. */
+    char inbox_path[1200];EdrCommandInboxRecord inbox;
+    if(command_inbox_record_path(command_id,inbox_path,sizeof(inbox_path))==0 &&
+        command_inbox_read_file(inbox_path,&inbox)==0) {
+      const EdrCommandResultAuthorization *current=&inbox.meta.result_authorization;
+      if(!strcmp(current->command_id,final_authority.command_id) &&
+          !strcmp(current->command_type,final_authority.command_type) &&
+          !strcmp(current->tenant_id,final_authority.tenant_id) &&
+          !strcmp(current->endpoint_id,final_authority.endpoint_id) &&
+          current->expires_unix_ms>final_authority.expires_unix_ms)final_authority=*current;
+      edr_command_state_free_inbox_record(&inbox);
+    }
+  }
   char auth[1536];
-  if (authorization_json(meta ? &meta->result_authorization : NULL, auth, sizeof(auth)) != 0) return -1;
+  if (authorization_json(&final_authority, auth, sizeof(auth)) != 0) {state_lock_release(lock);return -1;}
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
@@ -2285,17 +2451,11 @@ static int command_state_finish(const char *command_id, const char *command_type
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
            0u, 0LL,
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det, auth);
-  if (once) {
-    FILE *lock = state_lock_acquire();
-    if (!lock) return -1;
-    int prior = matching_terminal_locked(command_id, command_type, meta, response_status,
-                                         execution_status, exit_code, detail, artifacts);
-    int written = prior == 0 ? append_state_line(line) : prior;
-    state_lock_release(lock);
-    if (written != 0) return written;
-  } else if (append_state_line_locked(line) != 0) {
-    return -1;
-  }
+  int prior=once ? matching_terminal_locked(command_id,command_type,meta,response_status,
+      execution_status,exit_code,detail,artifacts) : 0;
+  int written=prior==0 ? append_state_line(line) : prior;
+  state_lock_release(lock);
+  if(written!=0)return written;
   edr_local_evidence_cache_record_command_result(
       command_id, command_type, response_status ? response_status : "failed",
       execution_status, exit_code, detail, artifacts);
@@ -2447,6 +2607,7 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
       continue;
     }
     pending_exists = 1;
+    if(latest[i].report_policy_held && !strcmp(latest[i].report_policy_version,EDR_EGRESS_POLICY_VERSION))continue;
     if (latest[i].report_next_retry_unix_ms <= 0 ||
         latest[i].report_next_retry_unix_ms <= now_ms) {
       out[n++] = latest[i];
@@ -2478,24 +2639,26 @@ int edr_command_state_result_authorized(const char *tenant, const char *endpoint
   }
   EdrCommandStateRecord *latest = calloc(1u, sizeof(*latest));
   char *line = malloc(EDR_COMMAND_STATE_LINE_CAP);
-  if (!latest || !line) { free(latest); free(line); cJSON_Delete(root); return 0; }
+  if (!latest || !line) { free(latest); free(line); cJSON_Delete(root); return EDR_EGRESS_LOCAL_STATE_FAILURE; }
   char path[1024]; state_default_path(path, sizeof(path));
   FILE *lock = state_lock_acquire();
+  errno=0;
   FILE *f = lock ? state_open_read_secure(path, NULL) : NULL;
+  int io_failed=!lock || (!f && errno!=ENOENT);
   int valid = f != NULL;
   while (f && fgets(line, EDR_COMMAND_STATE_LINE_CAP, f)) {
-    if (!strchr(line, '\n')) { valid = 0; break; }
+    if (!strchr(line, '\n')) { valid = 0; io_failed=1; break; }
     if (!line_matches_key(line, "command_id", id->valuestring)) continue;
     EdrCommandStateRecord candidate;
     fill_record_from_line(line, &candidate);
     if (!strcmp(candidate.command_id, id->valuestring)) *latest = candidate;
   }
-  if (f) { if (ferror(f)) valid = 0; fclose(f); }
+  if (f) { if (ferror(f)) {valid=0;io_failed=1;} fclose(f); }
   state_lock_release(lock);
   const EdrCommandResultAuthorization *a = &latest->result_authorization;
   int64_t now = state_now_ms();
   valid = valid && latest->final_record && latest->report_pending &&
-      a->expires_unix_ms > now && a->expires_unix_ms <= now + 86700000LL &&
+      a->expires_unix_ms > 0 && a->expires_unix_ms <= now + 86700000LL &&
       !strcmp(a->tenant_id, tenant) && !strcmp(a->endpoint_id, endpoint) &&
       result_string_equal(root, "endpoint_id", endpoint) &&
       result_string_equal(result, "endpoint_id", endpoint) &&
@@ -2529,13 +2692,14 @@ int edr_command_state_result_authorized(const char *tenant, const char *endpoint
     valid = !strcmp(a->command_id, latest->command_id) &&
         !strcmp(a->command_type, latest->command_type);
   }
+  int decision = io_failed ? EDR_EGRESS_LOCAL_STATE_FAILURE : valid && a->expires_unix_ms <= now ? EDR_EGRESS_AUTHORIZATION_EXPIRED : valid;
   free(latest); free(line); cJSON_Delete(root);
-  return valid;
+  return decision;
 }
 
-int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
+static int mark_report_waiting(const EdrCommandStateRecord *record,
                                         const char *error,
-                                        int64_t next_retry_unix_ms) {
+                                        int64_t next_retry_unix_ms, int held) {
   if (!record || !record->command_id[0]) {
     return -1;
   }
@@ -2564,7 +2728,7 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
   int pid = record->process_id ? record->process_id : (int)getpid();
 #endif
   int64_t now_ms = state_now_ms();
-  uint32_t attempts = record->report_attempts < UINT32_MAX
+  uint32_t attempts = held ? record->report_attempts : record->report_attempts < UINT32_MAX
                           ? record->report_attempts + 1u
                           : UINT32_MAX;
   char auth[1536];
@@ -2573,21 +2737,47 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
            "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":1,"
+           "\"report_policy_held\":%d,\"report_policy_version\":\"%s\","
            "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
            "\"report_next_retry_unix_ms\":%lld,\"report_last_error\":%s,"
            "\"updated_unix_ms\":%lld,\"soar_correlation_id\":%s,"
            "\"playbook_run_id\":%s,\"playbook_step_id\":%s,\"agent_boot_id\":%s,"
            "\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, record->execution_status, record->exit_code,
-           record->retry_count, attempts, (long long)now_ms,
+           record->retry_count, held, held ? EDR_EGRESS_POLICY_VERSION : "", attempts, (long long)now_ms,
            (long long)next_retry_unix_ms, report_error, (long long)now_ms,
            scid, run, step, boot, pid, art, det, auth);
-  if (append_state_line_locked(line) != 0) {
-    return -1;
+  /* An in-flight send may report expiry after a signed renewal or ACK.
+   * Serialize its retry transition with the current durable owner so stale
+   * snapshots cannot undo renewal, reopen an ACK or put it back on hold. */
+  FILE *lock=state_lock_acquire();if(!lock)return -1;
+  char current_path[1024];state_default_path(current_path,sizeof(current_path));
+  FILE *f=state_open_read_secure(current_path,NULL);
+  char *current_line=malloc(EDR_COMMAND_STATE_LINE_CAP);
+  EdrCommandStateRecord *current=calloc(1,sizeof(*current));
+  int ok=f && current_line && current;
+  while(ok && fgets(current_line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+    if(!strchr(current_line,'\n')){ok=0;break;}
+    if(line_matches_key(current_line,"command_id",record->command_id))fill_record_from_line(current_line,current);
   }
+  if(f){if(ferror(f))ok=0;fclose(f);}
+  ok=ok && current->final_record && !strcmp(current->command_type,record->command_type) &&
+      !strcmp(current->detail,record->detail) && current->execution_status==record->execution_status && current->exit_code==record->exit_code;
+  int superseded=ok &&
+      (!current->report_pending || current->result_authorization.expires_unix_ms>record->result_authorization.expires_unix_ms);
+  int wrote=ok && (superseded || append_state_line(line)==0);
+  free(current_line);free(current);state_lock_release(lock);
+  if(!wrote)return -1;
   s_collect_cache_pending_zero = 0;
   edr_command_state_compact_if_needed();
   return 0;
+}
+
+int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,const char *error,int64_t next) {
+  return mark_report_waiting(record,error,next,0);
+}
+int edr_command_state_mark_report_held(const EdrCommandStateRecord *record,const char *error) {
+  return mark_report_waiting(record,error,0,1);
 }
 
 int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {

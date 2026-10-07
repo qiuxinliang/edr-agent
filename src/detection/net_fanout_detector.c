@@ -154,6 +154,7 @@ void edr_net_fanout_on_event(const EdrBehaviorRecord *br) {
   snprintf(timestamp, sizeof(timestamp), "%lld", (long long)a.timestamp_ns);
   int basis_ready = basis && cJSON_AddStringToObject(subject, "subject_type", "net_fanout") &&
       cJSON_AddStringToObject(basis, "schema", "agent_detection_basis_v1") &&
+      cJSON_AddBoolToObject(basis,"tactic_probs_computed",0) &&
       cJSON_AddStringToObject(basis, "owner", "net_fanout_detector") &&
       cJSON_AddBoolToObject(basis, "predicate_matched", 1) &&
       cJSON_AddNumberToObject(basis, "pid", a.pid) &&

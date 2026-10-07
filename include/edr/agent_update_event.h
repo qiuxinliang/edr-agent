@@ -27,9 +27,13 @@ int edr_agent_update_event_persist(const char *outbox_dir,
                                    uint64_t event_seq, const char *status,
                                    int progress, const char *detail_json,
                                    const char *reported_at);
+/* Nonnegative: count ACKed; negative: transport/policy/local/unknown outcome.
+ * last_acked_seq always reflects the durable checkpoint, including partial progress. */
 int edr_agent_update_event_flush(const char *outbox_dir,
                                  EdrAgentUpdateEventPostFn post_fn, void *user,
                                  uint64_t *last_acked_seq);
+/* Runs before journal/log/event reads. Policy hold never advances ACK. */
+int edr_agent_update_delivery_preflight(const char *outbox_dir,const char *command_id);
 int edr_agent_update_event_flush_ingest(const char *outbox_dir,
                                         uint64_t *last_acked_seq);
 

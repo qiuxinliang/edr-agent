@@ -172,3 +172,9 @@ int edr_p0_bundle_dst_path(char *out, size_t cap) {
   if (out) out[0] = '\0';
   return -1;
 }
+
+int edr_p0_rule_ir_projection_matches(const char *rule_id, const char *bundle_sha,
+                                      uint64_t fields, const char *operation) {
+  (void)rule_id; (void)bundle_sha; (void)fields; (void)operation;
+  return 0;
+}

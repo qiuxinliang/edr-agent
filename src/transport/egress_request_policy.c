@@ -5,6 +5,7 @@
 #include "cJSON.h"
 
 #include <math.h>
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,51 @@
 #ifdef EDR_HAVE_ZSTD
 #include <zstd.h>
 #endif
+
+/* Registered once by command ownership before workers start. Tests use the same
+ * boundary to isolate durable authority from network I/O. */
+static _Atomic(EdrEgressTaskScopeLookup) task_scope_lookup;
+static _Atomic(EdrEgressUpgradeLogValidator) upgrade_log_validator;
+void edr_egress_set_task_scope_lookup(EdrEgressTaskScopeLookup lookup) { atomic_store(&task_scope_lookup,lookup); }
+void edr_egress_set_upgrade_log_validator(EdrEgressUpgradeLogValidator validator) { atomic_store(&upgrade_log_validator,validator); }
+int edr_egress_is_policy_hold(int rc) {
+  return rc == EDR_EGRESS_REQUEST_DENIED || rc == EDR_EGRESS_AUTHORIZATION_EXPIRED || rc == EDR_EGRESS_PAYLOAD_POLICY_HELD;
+}
+int edr_egress_task_preflight(EdrEgressPurpose purpose, const char *command_id,
+                              EdrEgressTaskScope *out) {
+  EdrEgressTaskScope scope = {0};
+  if (out) memset(out, 0, sizeof(*out));
+  if (purpose != EDR_EGRESS_UPGRADE_EVENT && purpose != EDR_EGRESS_UPGRADE_LOG)
+    return EDR_EGRESS_REQUEST_DENIED;
+  EdrEgressTaskScopeLookup lookup=atomic_load(&task_scope_lookup);
+  if (!command_id || !command_id[0] || !lookup) return EDR_EGRESS_REQUEST_DENIED;
+  int rc = lookup(command_id, &scope);
+  if (rc) return edr_egress_is_policy_hold(rc) ? rc : EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if (!scope.tenant_id[0] || !scope.endpoint_id[0] || !scope.task_id[0] ||
+      strcmp(scope.command_id, command_id) || !scope.artifact_id[0] ||
+      strlen(scope.artifact_sha256) != 64u || !scope.target_version[0] ||
+      (strcmp(scope.operation, "upgrade") && strcmp(scope.operation, "rollback")) ||
+      (purpose == EDR_EGRESS_UPGRADE_LOG && strcmp(scope.upgrade_class, "installer_required")))
+    return EDR_EGRESS_REQUEST_DENIED;
+  if (out) *out = scope;
+  return 0;
+}
+int edr_egress_upload_preflight(const char *command_id, const char *upload_id,
+    const char *path, const char *sha256, uint64_t *expected_size) {
+  if (expected_size) *expected_size = 0;
+  EdrEgressTaskScope scope;
+  int rc = edr_egress_task_preflight(EDR_EGRESS_UPGRADE_LOG, command_id, &scope);
+  if (rc) return rc;
+  EdrEgressUpgradeLogValidator validator=atomic_load(&upgrade_log_validator);
+  if (!validator || !upload_id || !path || !sha256 || strlen(sha256) != 64u)
+    return EDR_EGRESS_REQUEST_DENIED;
+  uint64_t size = 0;
+  rc = validator(&scope, upload_id, path, sha256, &size);
+  if (rc) return edr_egress_is_policy_hold(rc) ? rc : EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if (!size || size > 1024u * 1024u) return EDR_EGRESS_REQUEST_DENIED;
+  if (expected_size) *expected_size = size;
+  return 0;
+}
 
 typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON, H_PROFILE } HealthType;
 typedef struct { const char *path; HealthType type; } HealthField;
@@ -137,7 +183,7 @@ static const HealthField health_fields[] = {
   N("correlation.active_states"), N("correlation.observed"), N("correlation.evaluated"),
   N("correlation.fired"), N("correlation.suppressed"), N("correlation.evicted"),
   N("correlation.inject_fed"), N("correlation.inject_dropped"), N("correlation.rate_dropped"),
-  T("egress.policy_version"), B("egress.task_results_supported"), N("egress.denied_requests"),
+  T("egress.policy_version"), B("egress.task_results_supported"), B("egress.result_delivery_renewal_supported"), N("egress.denied_requests"),
   B("egress.capacity_limit_defaulted"),
   N("egress.policy_held_rows"), N("egress.local_evidence_rows"), R("egress.last_reason"),
   N("egress.terminal_policy_held_frames"), N("egress.terminal_local_retained"), N("egress.legacy_owner_unacknowledged"),
@@ -288,7 +334,7 @@ static int capability_field(const char *path, HealthType *type) {
   static const char *const commands[] = {"isolate_host", "restore_host", "kill_process", "rtq_execute",
     "rtq_registry", "rtq_eventlog", "yara_scan", "memory_dump", "targeted_forensic", "targeted_forensic_file",
     "targeted_forensic_process", "targeted_forensic_registry", "targeted_forensic_memory", "agent_update_v1",
-    "endpoint_lifecycle_v1", "endpoint_uninstall_attestation_v1", "velociraptor_query"};
+    "endpoint_lifecycle_v1", "endpoint_uninstall_attestation_v1", "velociraptor_query", "result_delivery_renewal"};
   const char *p = NULL;
   const char *prefix = "engine_health.capability_manifest.features.";
   const char *const *names = features;
@@ -416,12 +462,46 @@ static int health_json_valid(const cJSON *root, int delta) {
   const cJSON *version = cJSON_GetObjectItemCaseSensitive(update, "version");
   const cJSON *base = cJSON_GetObjectItemCaseSensitive(update, "base");
   const cJSON *removed = cJSON_GetObjectItemCaseSensitive(update, "removed");
-  if (!cJSON_IsNumber(version) || version->valuedouble != 1.0 || !token(base, 64u) ||
+  if (!cJSON_IsNumber(version) || (version->valuedouble != 1.0 && version->valuedouble != 2.0) || !token(base, 64u) ||
       !base->valuestring[0] || !cJSON_IsArray(removed) || cJSON_GetArraySize(removed) > 64) return 0;
   if (!health->child && !removed->child) return 0;
   cJSON_ArrayForEach(v, update)
     if (strcmp(v->string, "version") && strcmp(v->string, "base") && strcmp(v->string, "removed")) return 0;
   cJSON_ArrayForEach(v, removed) {
+    if (version->valuedouble==2.0) {
+      if (!cJSON_IsString(v) || !v->valuestring || v->valuestring[0]!='/' || strlen(v->valuestring)>240u) return 0;
+      /* Current health keys are closed ASCII identifiers. No escaped or
+       * arbitrary dictionary keys are admitted by the health schema. */
+      char path[256]="engine_health"; size_t used=strlen(path);unsigned depth=0;
+      const cJSON *change=health; const char *cursor=v->valuestring;
+      while (*cursor) {
+        if (*cursor++!='/' || ++depth>10u) return 0;
+        char key[96];size_t n=0;
+        while (*cursor && *cursor!='/') {
+          if (!( (*cursor>='a'&&*cursor<='z') || (*cursor>='A'&&*cursor<='Z') ||
+              (*cursor>='0'&&*cursor<='9') || *cursor=='_') || n+1>=sizeof(key)) return 0;
+          key[n++]=*cursor++;
+        }
+        if (!n || used+n+2>=sizeof(path)) return 0;
+        key[n]=0;path[used++]='.';memcpy(path+used,key,n+1);used+=n;
+        if (change) {
+          if (!cJSON_IsObject(change) || (depth>1u && !change->child)) return 0;
+          change=cJSON_GetObjectItemCaseSensitive(change,key);
+        }
+      }
+      if (change) return 0; /* changed and removed paths must not overlap */
+      int known=0;HealthType ignored;
+      if (field_type(path,&ignored)) known=1;
+      for(size_t i=0;i<sizeof(health_fields)/sizeof(health_fields[0]);i++)
+        if (!strncmp(health_fields[i].path,path,used) && health_fields[i].path[used]=='.') known=1;
+      if (!known) return 0;
+      for(const cJSON *other=v->next;other;other=other->next) {
+        if(!cJSON_IsString(other)||!other->valuestring)return 0;
+        size_t a=strlen(v->valuestring),b=strlen(other->valuestring),n=a<b?a:b;
+        if(!strncmp(v->valuestring,other->valuestring,n) && (a==b || v->valuestring[n]=='/' || other->valuestring[n]=='/')) return 0;
+      }
+      continue;
+    }
     if (!token(v, 64u) || !v->valuestring[0]) return 0;
     char path[100]; snprintf(path, sizeof(path), "engine_health.%s.", v->valuestring);
     int known = 0;
@@ -732,6 +812,92 @@ static int control_post_valid(const char *path, const cJSON *root) {
   return control_object_valid(root, "", fields, count, 0u);
 }
 
+static int upgrade_string(const cJSON *root, const char *key, const char *expected) {
+  const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, key);
+  return cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring, expected);
+}
+const char *edr_egress_upgrade_failure_value(const char *field,const char *candidate) {
+  const char *const stages[]={"agent_reported_failure","staging_directory","artifact_download","runtime_manifest_download","launcher_persist","launcher_start","full_installer_rollback_completed","full_installer_rollback_failed","full_installer_rollback_backup_missing","rollback_completed","rollback_failed","recovery_completed","recovery_failed","failed_before_stop"};
+  const char *const errors[]={"upgrade_failed","INSTALL_BASELINE_CORRUPT","INSTALL_BASELINE_REPAIR_INCOMPLETE","INSTALL_BASELINE_UNSUPPORTED","INSTALL_EXIT_NONZERO","INSTALL_LOG_TOO_LARGE","INSTALL_LOG_UNAVAILABLE","INSTALL_LOG_UNSAFE_PATH","INSTALL_REPAIR_BACKUP_INCOMPLETE"};
+  int stage=field && !strcmp(field,"stage");
+  const char *const *values=stage?stages:errors;
+  size_t count=stage?sizeof(stages)/sizeof(stages[0]):sizeof(errors)/sizeof(errors[0]);
+  for(size_t i=0;candidate && i<count;i++)if(!strcmp(candidate,values[i]))return values[i];
+  return values[0];
+}
+char *edr_egress_upgrade_event_project(const char *body, int *result) {
+  int rc = EDR_EGRESS_REQUEST_DENIED;
+  cJSON *root = cJSON_Parse(body ? body : ""), *out = NULL, *detail = NULL;
+  char *wire = NULL;
+  const cJSON *command = cJSON_GetObjectItemCaseSensitive(root, "command_id");
+  if (!cJSON_IsString(command) || !command->valuestring) goto done;
+  EdrEgressTaskScope scope;
+  rc = edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT, command->valuestring, &scope);
+  if (rc) goto done;
+  rc = EDR_EGRESS_PAYLOAD_POLICY_HELD;
+  const cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "detail");
+  const cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+  const cJSON *seq = cJSON_GetObjectItemCaseSensitive(root, "event_seq");
+  const cJSON *progress = cJSON_GetObjectItemCaseSensitive(root, "progress");
+  const char *const statuses[] = {"downloading", "downloaded", "verified", "installing", "restarting", "health_check", "completed", "failed", "cancelled", "rolling_back", "rollback_health_check", "rolled_back"};
+  if (!upgrade_string(root,"task_id",scope.task_id) || !cJSON_IsObject(source) ||
+      !upgrade_string(source,"artifact_id",scope.artifact_id) ||
+      !upgrade_string(source,"sha256",scope.artifact_sha256) ||
+      !upgrade_string(source,"version",scope.target_version) ||
+      !upgrade_string(source,"operation",scope.operation) ||
+      !cJSON_IsString(status) || !listed(status->valuestring,statuses,sizeof(statuses)/sizeof(statuses[0])) ||
+      !cJSON_IsNumber(seq) || seq->valuedouble < 1 || seq->valuedouble >= 9007199254740992.0 || floor(seq->valuedouble) != seq->valuedouble ||
+      !cJSON_IsNumber(progress) || progress->valuedouble < 0 || progress->valuedouble > 100 || floor(progress->valuedouble) != progress->valuedouble) goto done;
+  char event_id[320],safe_command[sizeof(scope.command_id)];
+  size_t id_len=strlen(scope.command_id);
+  for(size_t i=0;i<id_len;i++){unsigned char c=(unsigned char)scope.command_id[i];safe_command[i]=(isalnum(c)||c=='.'||c=='_'||c=='-')?(char)c:'_';}
+  safe_command[id_len]=0;
+  snprintf(event_id,sizeof(event_id),"%s-%020llu",safe_command,(unsigned long long)seq->valuedouble);
+  if (!upgrade_string(root,"event_id",event_id)) goto done;
+  out=cJSON_CreateObject(); detail=cJSON_CreateObject();
+  if (!out || !detail) { rc=EDR_EGRESS_LOCAL_STATE_FAILURE; goto done; }
+  const char *const keys[]={"task_id","command_id","event_id","status","event_seq","progress"};
+  for (size_t i=0;i<sizeof(keys)/sizeof(keys[0]);i++) {
+    cJSON *copy=cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(root,keys[i]),1);
+    if (!copy || !cJSON_AddItemToObject(out,keys[i],copy)) { cJSON_Delete(copy);rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done; }
+  }
+  if (!cJSON_AddStringToObject(detail,"artifact_id",scope.artifact_id) ||
+      !cJSON_AddStringToObject(detail,"sha256",scope.artifact_sha256) ||
+      !cJSON_AddStringToObject(detail,"version",scope.target_version) ||
+      !cJSON_AddStringToObject(detail,"operation",scope.operation)) {rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done;}
+  if(!strcmp(status->valuestring,"failed")) {
+    const char *names[]={"stage","error"};
+    for(size_t i=0;i<2u;i++) {
+      const cJSON *v=cJSON_GetObjectItemCaseSensitive(source,names[i]);
+      if(!cJSON_AddStringToObject(detail,names[i],edr_egress_upgrade_failure_value(names[i],cJSON_IsString(v)?v->valuestring:NULL))) {rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done;}
+    }
+  }
+  /* The backend consumes the task transition and pinned artifact identity.
+   * Arbitrary updater detail remains in the local event and journal. */
+  if (!cJSON_AddItemToObject(out,"detail",detail)) {rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done;}
+  detail=NULL; wire=cJSON_PrintUnformatted(out); rc=wire?0:EDR_EGRESS_LOCAL_STATE_FAILURE;
+done:
+  cJSON_Delete(root);cJSON_Delete(out);cJSON_Delete(detail);
+  if (result) *result=rc;
+  return wire;
+}
+static int validate_upgrade_event(const void *body,size_t len,const char *tenant,const char *endpoint,char *reason,size_t cap) {
+  cJSON *root=parse_body(body,len);
+  const cJSON *command=cJSON_GetObjectItemCaseSensitive(root,"command_id");
+  EdrEgressTaskScope scope;
+  int rc=cJSON_IsString(command)?edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,command->valuestring,&scope):EDR_EGRESS_REQUEST_DENIED;
+  if (!rc && ((!tenant || strcmp(tenant,scope.tenant_id)) || (!endpoint || strcmp(endpoint,scope.endpoint_id)))) rc=EDR_EGRESS_REQUEST_DENIED;
+  char *raw=root?cJSON_PrintUnformatted(root):NULL,*minimal=NULL;
+  if (!rc && !raw)rc=EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if (!rc) minimal=edr_egress_upgrade_event_project(raw,&rc);
+  cJSON *projected=minimal?cJSON_Parse(minimal):NULL;
+  if (!rc && !projected)rc=EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if (!rc && !cJSON_Compare(root,projected,1))rc=EDR_EGRESS_PAYLOAD_POLICY_HELD;
+  free(raw);free(minimal);cJSON_Delete(root);cJSON_Delete(projected);
+  if (rc && reason && cap) snprintf(reason,cap,"%s",rc==EDR_EGRESS_AUTHORIZATION_EXPIRED?"task_authorization_expired":"upgrade_event_scope_or_fields_denied");
+  return rc;
+}
+
 static int command_result_schema_valid(const cJSON *root) {
   static const char *const keys[] = {"command_id", "command_type", "endpoint_id", "agent_version",
     "status", "exit_code", "detail_utf8", "finished_unix_ms", "soar_correlation_id",
@@ -769,6 +935,11 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   if (scheme) { path = strchr(scheme + 3u, '/'); if (!path) return deny(reason, cap, "egress_purpose_unknown"); }
   if (strncmp(path, "/api/v1/", 8u) == 0) path += 8u;
   else if (*path == '/') ++path;
+  if (!strcmp(method,"POST") && !strcmp(path,"ingest/agent-upgrade-event")) {
+    if (!content_type || strcmp(content_type,"application/json") || !body || !len || len>8192u)
+      return deny(reason,cap,"upgrade_event_body_invalid");
+    return validate_upgrade_event(body,len,tenant,endpoint,reason,cap);
+  }
   /* Explicitly authorized minimum controls: fixed routes/fields only, never
    * inventory, artifacts or diagnostic events. Task results require their durable owner. */
   if (!strcmp(method, "GET")) return !body && !len && control_get_valid(path) ? 0 : deny(reason, cap, "egress_control_field_or_route_denied");
@@ -800,8 +971,13 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   if (command_result) {
     EdrEgressCommandResultValidator owner = atomic_load_explicit(&command_result_validator, memory_order_acquire);
     if (!command_result_schema_valid(root)) rc = deny(reason, cap, "command_result_schema_invalid");
-    else if (!owner || !tenant || !endpoint || !owner(tenant, endpoint, body, len))
-      rc = deny(reason, cap, "command_result_owner_unavailable");
+    else {
+      int owned = owner && tenant && endpoint ? owner(tenant, endpoint, body, len) : 0;
+      if (owned == EDR_EGRESS_AUTHORIZATION_EXPIRED || owned == EDR_EGRESS_LOCAL_STATE_FAILURE) {
+        rc = owned;
+        if(reason && cap)snprintf(reason,cap,"%s",owned == EDR_EGRESS_AUTHORIZATION_EXPIRED ? "command_result_authorization_expired" : "command_result_owner_io_failure");
+      } else if (owned != 1) rc = deny(reason, cap, "command_result_owner_unavailable");
+    }
   }
   else if (control) { if (!control_post_valid(path, root)) rc = deny(reason, cap, "egress_control_field_or_type_denied"); }
   else if (batch) rc = validate_json_batch(root,tenant,endpoint, reason, cap);

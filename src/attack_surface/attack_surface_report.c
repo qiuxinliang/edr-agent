@@ -5,6 +5,7 @@
 #include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
 #include "edr/ingest_http.h"
+#include "edr/egress_request_policy.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -1046,6 +1047,11 @@ static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t
     return 2;
   }
 
+  int admission=edr_egress_task_preflight(EDR_EGRESS_ATTACK_SURFACE,command_id,NULL);
+  if (admission) {
+    snprintf(detail,detail_cap,"%s",edr_egress_is_policy_hold(admission)?"attack_surface_policy_held":"attack_surface_admission_unavailable");
+    return admission;
+  }
   uint64_t started_ms = asurf_monotonic_ms();
   AsListener L[EDR_ASURF_LISTENERS_MAX];
   int truncated = 0;

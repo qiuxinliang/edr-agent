@@ -484,6 +484,7 @@ static int edr_agent_run_main(const char *config) {
     edr_ensure_parent_dirs_win(qpath);
 #endif
     const char *queue_error_path = (qpath && qpath[0]) ? qpath : "edr_queue.db";
+    edr_p0_rule_register_projection_authority();
     EdrError sq = edr_storage_queue_open(qpath);
     if (sq != EDR_OK) {
 #ifdef _WIN32

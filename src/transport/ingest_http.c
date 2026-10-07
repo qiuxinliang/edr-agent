@@ -13,11 +13,13 @@
 
 #include "cJSON.h"
 #include "edr/command_state.h"
+#include "edr/agent_update_command.h"
 #include "edr/command_util.h"
 #include "edr/event_batch.h"
 #include "edr/http_retry.h"
 #include "edr/detection_decision.h"
 #include "edr/preprocess.h"
+#include "edr/p0_rule_ir.h"
 #include "edr/sha256.h"
 #include "edr/transport_v2.h"
 
@@ -1299,6 +1301,8 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
                                 const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url) {
   edr_egress_set_command_result_validator(edr_command_state_result_authorized);
+  edr_egress_set_task_scope_lookup(edr_command_state_task_scope);
+  edr_egress_set_upgrade_log_validator(edr_agent_update_log_authorized);
   const char *relay_effective = getenv("EDR_RELAY_URL");
   const char *proxy_mode_effective = getenv("EDR_PROXY_MODE");
   const char *proxy_url_effective = getenv("EDR_PROXY_URL");
@@ -2952,10 +2956,12 @@ static int append_common_headers(char *req, size_t cap, size_t used) {
 		               "X-Tenant-ID: %s\r\n"
 		               "X-Endpoint-ID: %s\r\n"
 		               "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT "\r\n"
+                       "X-EDR-P0-IR-Schema: %u\r\n"
 		               "X-User-ID: %s\r\n"
 		               "X-Permission-Set: telemetry:write,endpoint:attack_surface_report\r\n",
 	               s_tenant[0] ? s_tenant : "demo-tenant",
 	               s_endpoint[0] ? s_endpoint : "",
+                       (unsigned)EDR_P0_RULE_IR_SCHEMA_VERSION,
 	               s_user[0] ? s_user : "edr-agent");
   if (n <= 0 || (size_t)n >= cap - used) {
     return -1;
@@ -4038,6 +4044,8 @@ static struct curl_slist *curl_common_headers(const char *content_type) {
   snprintf(h, sizeof(h), "X-Endpoint-ID: %s", s_endpoint[0] ? s_endpoint : "");
   headers = curl_slist_append(headers, h);
   headers = curl_slist_append(headers, "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT);
+  snprintf(h, sizeof(h), "X-EDR-P0-IR-Schema: %u", (unsigned)EDR_P0_RULE_IR_SCHEMA_VERSION);
+  headers = curl_slist_append(headers, h);
   snprintf(h, sizeof(h), "X-User-ID: %s", s_user[0] ? s_user : "edr-agent");
   headers = curl_slist_append(headers, h);
   headers = curl_slist_append(headers, "X-Permission-Set: telemetry:write,endpoint:attack_surface_report");
@@ -4569,8 +4577,8 @@ static int native_request_ex(const char *method, const char *url, const char *co
   int port = 0;
   int https = 0;
   int rc = -1;
-  if (egress_request_allowed(method, url, content_type, body, body_len) != 0)
-    return EDR_EGRESS_REQUEST_DENIED;
+  int admission = egress_request_allowed(method, url, content_type, body, body_len);
+  if (admission != 0) return admission;
   if (parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4725,7 +4733,7 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
     return -1;
   }
   rc = native_request_ex(method, url, content_type, body, body_len, out_body, out_cap, timeout_s);
-  if (rc == EDR_EGRESS_REQUEST_DENIED) return rc;
+  if (edr_egress_is_policy_hold(rc) || rc == EDR_EGRESS_LOCAL_STATE_FAILURE) return rc;
   if (rc == 0) {
     route_note_success();
     return 0;
@@ -4766,6 +4774,7 @@ int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
     return -1;
   }
   int rc = request_to_suffix("POST", suffix, "application/json", body_json, strlen(body_json), resp_body, resp_body_cap);
+  if (edr_egress_is_policy_hold(rc) || rc == EDR_EGRESS_LOCAL_STATE_FAILURE) return rc;
   if (rc == 0) {
     note_http_request_success();
     return 0;
@@ -5528,6 +5537,8 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   if (!edr_egress_batch_validate_scope(header12, header_len, payload, payload_len,
                                        s_tenant, s_endpoint, scope_reason, sizeof(scope_reason))) {
     runtime_failure(scope_reason);
+    if (!strcmp(scope_reason,"rule_projection_authority_unavailable") ||
+        !strcmp(scope_reason,"egress_validation_allocation_failed")) return EDR_EGRESS_LOCAL_STATE_FAILURE;
     return EDR_EGRESS_REQUEST_DENIED;
   }
   char receipt[8192];
@@ -5545,6 +5556,11 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
       v2rc = request_to_suffix("POST", "ingest/report-events", "application/x-protobuf",
                                (const char *)env, env_len, receipt, sizeof(receipt));
       free(env);
+      if (edr_report_events_policy_held(receipt,s_tenant,s_endpoint,batch_id,
+                                        header12,header_len,payload,payload_len)) {
+        runtime_failure("server evidence projection policy held; immutable batch retained");
+        return EDR_REPORT_EVENTS_POLICY_HELD;
+      }
       if (v2rc == 0 && !edr_report_events_acknowledged(receipt, s_endpoint, batch_id,
                                                      header12, header_len, payload, payload_len)) {
         runtime_failure("report-events receipt missing, incomplete or mismatched");
@@ -5622,6 +5638,11 @@ int edr_ingest_http_post_report_events(const char *batch_id, const uint8_t *head
   int rc = request_to_suffix("POST", "ingest/report-events", "application/json",
                              body, body_len, receipt, sizeof(receipt));
   free(body);
+  if (edr_report_events_policy_held(receipt,s_tenant,s_endpoint,batch_id,
+                                    header12,header_len,payload,payload_len)) {
+    runtime_failure("server evidence projection policy held; immutable batch retained");
+    return EDR_REPORT_EVENTS_POLICY_HELD;
+  }
   if (rc == 0 && !edr_report_events_acknowledged(receipt, s_endpoint, batch_id,
                                                header12, header_len, payload, payload_len)) {
     runtime_failure("report-events receipt missing, incomplete or mismatched");
@@ -5899,6 +5920,7 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
     note_command_result_failure();
   }
   edr_command_result_json_free(body);
+  if (rc == EDR_EGRESS_AUTHORIZATION_EXPIRED || rc == EDR_EGRESS_LOCAL_STATE_FAILURE) return rc;
   if (rc != 0) {
     if (!application_ack_missing) {
       command_result_note_delivery_failure(response);
@@ -6112,7 +6134,7 @@ static long upload_max_mb(void) {
 
 #ifdef EDR_HAVE_CURL_HTTP2
 static int curl_upload_multipart_file(const char *command_id, const char *upload_id, const char *file_path,
-                                      const char *sha256_hex, char *resp_body,
+                                      const uint8_t *snapshot, size_t snapshot_len, const char *sha256_hex, char *resp_body,
                                       size_t resp_body_cap) {
   char url[1400];
   CURL *curl = NULL;
@@ -6174,7 +6196,7 @@ static int curl_upload_multipart_file(const char *command_id, const char *upload
   curl_mime_name(part, "file");
   curl_mime_filename(part, filename);
   curl_mime_type(part, "application/octet-stream");
-  if (curl_mime_filedata(part, file_path) != CURLE_OK) {
+  if (curl_mime_data(part, (const char *)snapshot, snapshot_len) != CURLE_OK) {
     curl_mime_free(mime);
     curl_easy_cleanup(curl);
     return -2;
@@ -6234,56 +6256,21 @@ static int curl_upload_multipart_file(const char *command_id, const char *upload
 }
 #endif
 
-static int http_conn_write_file(EdrHttpConn *conn, FILE *f, size_t file_len) {
-  char chunk[65536];
-  size_t remaining = file_len;
-  if (!conn || !f) {
-    return -1;
-  }
-  while (remaining > 0u) {
-    size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
-    size_t got = fread(chunk, 1u, want, f);
-    if (got == 0u) {
-      return -1;
-    }
-    if (http_conn_write_all(conn, chunk, got) != 0) {
-      return -1;
-    }
-    remaining -= got;
-  }
-  return 0;
-}
-
-static int multipart_body_sha256(FILE *file, const char *pre, size_t pre_len,
-                                 const char *post, size_t post_len, char out65[65]) {
-  EdrSha256Ctx ctx;
-  uint8_t digest[EDR_SHA256_DIGEST_LEN];
-  uint8_t chunk[65536];
-  static const char hex[] = "0123456789abcdef";
-  if (!file || !pre || !post || !out65 || fseek(file, 0, SEEK_SET) != 0) return -1;
-  edr_sha256_init(&ctx);
-  edr_sha256_update(&ctx, (const uint8_t *)pre, pre_len);
-  for (;;) {
-    size_t n = fread(chunk, 1u, sizeof(chunk), file);
-    if (n > 0u) edr_sha256_update(&ctx, chunk, n);
-    if (n < sizeof(chunk)) {
-      if (ferror(file)) return -1;
-      break;
-    }
-  }
-  edr_sha256_update(&ctx, (const uint8_t *)post, post_len);
-  edr_sha256_final(&ctx, digest);
-  for (size_t i = 0u; i < sizeof(digest); i++) {
-    out65[i * 2u] = hex[(digest[i] >> 4u) & 0x0fu];
-    out65[i * 2u + 1u] = hex[digest[i] & 0x0fu];
-  }
-  out65[64] = '\0';
-  return fseek(file, 0, SEEK_SET) == 0 ? 0 : -1;
+static int multipart_body_sha256(const uint8_t *snapshot,size_t snapshot_len,
+                                 const char *pre,size_t pre_len,const char *post,size_t post_len,char out65[65]) {
+  EdrSha256Ctx ctx;uint8_t digest[EDR_SHA256_DIGEST_LEN];
+  static const char hex[]="0123456789abcdef";
+  if(!snapshot || !pre || !post || !out65)return -1;
+  edr_sha256_init(&ctx);edr_sha256_update(&ctx,(const uint8_t *)pre,pre_len);
+  edr_sha256_update(&ctx,snapshot,snapshot_len);edr_sha256_update(&ctx,(const uint8_t *)post,post_len);
+  edr_sha256_final(&ctx,digest);
+  for(size_t i=0;i<sizeof(digest);i++){out65[i*2u]=hex[digest[i]>>4u];out65[i*2u+1u]=hex[digest[i]&15u];}
+  out65[64]=0;return 0;
 }
 
 static int request_to_suffix_multipart_file(const char *suffix, const char *content_type,
                                             const char *pre, size_t pre_len,
-                                            FILE *file, size_t file_len,
+                                            const uint8_t *snapshot, size_t file_len,
                                             const char *post, size_t post_len,
                                             const char *content_sha256_hex,
                                             char *resp_body, size_t resp_body_cap) {
@@ -6326,9 +6313,6 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     EdrHttpConn local_conn;
     memset(&local_conn, 0, sizeof(local_conn));
     local_conn.fd = EDR_SOCKET_INVALID;
-    if (fseek(file, 0, SEEK_SET) != 0) {
-      break;
-    }
     if (http_conn_open_new(&local_conn, host, port, https, 0) != 0) {
       continue;
     }
@@ -6342,7 +6326,7 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     EdrHttpAttemptOutcome response_outcome = EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     if (http_conn_write_all(&local_conn, req, (size_t)rn) == 0 &&
         http_conn_write_all(&local_conn, pre, pre_len) == 0 &&
-        http_conn_write_file(&local_conn, file, file_len) == 0 &&
+        http_conn_write_all(&local_conn, (const char *)snapshot, file_len) == 0 &&
         http_conn_write_all(&local_conn, post, post_len) == 0) {
       response_outcome = read_http_response_from_recv(
           http_socket_recv_adapter, &local_conn, resp_body, resp_body_cap, &reusable);
@@ -6361,6 +6345,23 @@ static int request_to_suffix_multipart_file(const char *suffix, const char *cont
     runtime_failure(https ? "https upload failed" : "http upload failed");
   }
   return rc;
+}
+
+static int upgrade_upload_acked(const char *response,const EdrEgressTaskScope *scope,char *key,size_t cap) {
+  cJSON *root=cJSON_Parse(response?response:"");
+  const cJSON *data=cJSON_GetObjectItemCaseSensitive(root,"data");
+  if(!cJSON_IsObject(data))data=root;
+  const cJSON *success=cJSON_GetObjectItemCaseSensitive(data,"success");
+  const cJSON *object=cJSON_GetObjectItemCaseSensitive(data,"minio_key");
+  const char *names[]={"tenant_id","endpoint_id","command_id","evidence_status"};
+  const char *values[]={scope->tenant_id,scope->endpoint_id,scope->command_id,"linked"};
+  int valid=cJSON_IsTrue(success) && cJSON_IsString(object) && object->valuestring[0] && key && strlen(object->valuestring)<cap;
+  for(size_t i=0;valid && i<4u;i++) {
+    const cJSON *v=cJSON_GetObjectItemCaseSensitive(data,names[i]);
+    valid=cJSON_IsString(v)&&!strcmp(v->valuestring,values[i]);
+  }
+  if(valid)snprintf(key,cap,"%s",object->valuestring);
+  cJSON_Delete(root);return valid;
 }
 
 int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
@@ -6392,10 +6393,14 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   if (!edr_ingest_http_configured() || !upload_id || !upload_id[0] || !file_path || !file_path[0]) {
     return -1;
   }
-  if (egress_request_allowed("POST", "ingest/upload-file", "multipart/form-data", NULL, 0u) != 0) {
-    runtime_string_set(s_upload_status, sizeof(s_upload_status), "egress_denied");
-    note_upload_failure();
-    return EDR_EGRESS_REQUEST_DENIED;
+  uint64_t expected_size=0;
+  int admission=edr_egress_upload_preflight(command_id,upload_id,file_path,sha256_hex,&expected_size);
+  EdrEgressTaskScope scope;
+  if(!admission)admission=edr_egress_task_preflight(EDR_EGRESS_UPGRADE_LOG,command_id,&scope);
+  if(!admission && (strcmp(scope.tenant_id,s_tenant) || strcmp(scope.endpoint_id,s_endpoint)))admission=EDR_EGRESS_REQUEST_DENIED;
+  if(admission) {
+    runtime_string_set(s_upload_status,sizeof(s_upload_status),"policy_held");
+    return admission;
   }
   runtime_string_set(s_upload_status, sizeof(s_upload_status), "opening");
   file = fopen(file_path, "rb");
@@ -6414,7 +6419,8 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   }
   sz = ftell(file);
   max_mb = upload_max_mb();
-  if (sz < 0 || (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
+  if (sz <= 0 || (uint64_t)sz != expected_size || (uint64_t)sz > 1048576u ||
+      (unsigned long)sz > (unsigned long)max_mb * 1024ul * 1024ul) {
     fclose(file);
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_too_large");
     note_upload_failure();
@@ -6429,26 +6435,40 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
     runtime_failure("http upload file seek failed");
     return -1;
   }
+  /* Read once, then hash and send the identical bounded redacted snapshot.
+   * Neither libcurl nor a native retry reopens a mutable source path. */
+  uint8_t *snapshot=malloc(file_len);
+  if(!snapshot){fclose(file);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  int snapshot_ok=fread(snapshot,1u,file_len,file)==file_len && !ferror(file);
+  if(fclose(file))snapshot_ok=0;
+  if(!snapshot_ok){free(snapshot);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  char actual_sha[65];
+  if(edr_sha256_hex(snapshot,file_len,actual_sha) || !sha256_hex || strcmp(actual_sha,sha256_hex)) {
+    free(snapshot);runtime_failure("authorized upgrade log hash mismatch");return EDR_EGRESS_REQUEST_DENIED;
+  }
+  admission=edr_egress_upload_preflight(command_id,upload_id,file_path,actual_sha,&expected_size);
+  if(admission || expected_size!=file_len) {free(snapshot);return admission?admission:EDR_EGRESS_REQUEST_DENIED;}
 #ifdef EDR_HAVE_CURL_HTTP2
   if (http2_client_enabled() && !s_request_signing.enabled) {
     int store_mtls_curl = curl_ssl_backend_is_schannel() && schannel_store_mtls_configured();
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "uploading_h2");
     resp[0] = '\0';
-    rc = curl_upload_multipart_file(command_id, upload_id, file_path,
+    rc = curl_upload_multipart_file(command_id, upload_id, file_path, snapshot, file_len,
 	                                sha256_hex ? sha256_hex : "", resp, sizeof(resp));
+    if (rc == 0 && !upgrade_upload_acked(resp,&scope,out_minio_key,out_minio_key_cap)) {
+      free(snapshot);runtime_failure("upgrade log application ACK missing or mismatched");
+      return EDR_EGRESS_OUTCOME_UNKNOWN;
+    }
     if (rc == 0) {
       note_http_request_success();
       note_upload_success();
       runtime_string_set(s_upload_status, sizeof(s_upload_status), "ok_h2");
-      if (out_minio_key && out_minio_key_cap > 0u) {
-        (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
-      }
-      fclose(file);
+      free(snapshot);
       return 0;
     }
     if (rc != -2) {
       if (http2_required() || store_mtls_curl) {
-        fclose(file);
+        free(snapshot);
         runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_h2");
         note_upload_failure();
         runtime_failure(store_mtls_curl
@@ -6456,18 +6476,11 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
                             : "HTTP/2 required but h2 upload failed");
         return -1;
       }
-      if (fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_seek");
-        note_upload_failure();
-        runtime_failure("http upload file seek failed");
-        return -1;
-      }
     }
   }
 #endif
   if (http2_required() && !s_request_signing.enabled) {
-    fclose(file);
+    free(snapshot);
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_h2_required");
     note_upload_failure();
     runtime_failure("HTTP/2 required but h2 upload transport unavailable");
@@ -6480,7 +6493,7 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   sha = json_escape_alloc(sha256_hex ? sha256_hex : "");
   fname = json_escape_alloc(filename);
   if (!uid || !cid || !eid || !sha || !fname) {
-    fclose(file);
+    free(snapshot);
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed_build");
     note_upload_failure();
     free(uid);
@@ -6504,8 +6517,8 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   {
     size_t pre_len = strlen(pre);
     size_t post_len = strlen(post);
-    if (multipart_body_sha256(file, pre, pre_len, post, post_len, multipart_sha256) != 0) {
-      fclose(file);
+    if (multipart_body_sha256(snapshot, file_len, pre, pre_len, post, post_len, multipart_sha256) != 0) {
+      free(snapshot);
       free(uid);
       free(cid);
       free(eid);
@@ -6520,16 +6533,16 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
   resp[0] = '\0';
   runtime_string_set(s_upload_status, sizeof(s_upload_status), "uploading_http");
   rc = request_to_suffix_multipart_file("ingest/upload-file", content_type,
-                                        pre, strlen(pre), file, file_len,
+                                        pre, strlen(pre), snapshot, file_len,
                                         post, strlen(post), multipart_sha256,
                                         resp, sizeof(resp));
+  if (rc == 0 && !upgrade_upload_acked(resp,&scope,out_minio_key,out_minio_key_cap)) {
+    runtime_failure("upgrade log application ACK missing or mismatched");rc=EDR_EGRESS_OUTCOME_UNKNOWN;
+  }
   if (rc == 0) {
     note_http_request_success();
     note_upload_success();
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "ok_http");
-    if (out_minio_key && out_minio_key_cap > 0u) {
-      (void)json_get_string(resp, "minio_key", out_minio_key, out_minio_key_cap);
-    }
   } else if (runtime_string_empty(s_last_error)) {
     note_http_request_failure();
     note_upload_failure();
@@ -6539,7 +6552,7 @@ int edr_ingest_http_upload_file_multipart_for_command(const char *command_id,
     note_upload_failure();
     runtime_string_set(s_upload_status, sizeof(s_upload_status), "failed");
   }
-  fclose(file);
+  free(snapshot);
   free(uid);
   free(cid);
   free(eid);

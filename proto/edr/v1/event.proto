@@ -176,6 +176,14 @@ message BehaviorEvent {
   // different event/process generation. ProcessDetail remains the legacy
   // compatibility projection when this message is absent.
   ProcessContext process_context = 68;
+  // Versioned producer projection. It never changes an already hashed frame.
+  uint32 evidence_projection_version = 69;
+  uint64 required_evidence_fields = 70;
+  // Bounded operation proof without credential values or arbitrary commands.
+  string operation_evidence_json = 71;
+  // Absent means legacy/unknown. False means the owner did not compute these
+  // probabilities; an empty repeated field must not be interpreted as zeros.
+  optional bool tactic_probs_computed = 72;
 }
 
 message ProcessDetail {

@@ -10,6 +10,7 @@
 #include "edr/command.h"
 #include "edr/command_executor.h"
 #include "edr/command_state.h"
+#include "edr/agent_update_command.h"
 
 bool edr_resource_preprocess_throttle_active(void) {
   return false;
@@ -52,6 +53,25 @@ int edr_command_state_result_authorized(const char *tenant, const char *endpoint
   (void)body;
   (void)len;
   return 0;
+}
+
+int edr_command_state_task_scope(const char *command_id, EdrEgressTaskScope *out) {
+  (void)command_id;
+  if (out) {
+    EdrEgressTaskScope empty = {0};
+    *out = empty;
+  }
+  return EDR_EGRESS_REQUEST_DENIED;
+}
+
+int edr_agent_update_log_authorized(const EdrEgressTaskScope *scope,
+    const char *upload_id, const char *path, const char *sha256, uint64_t *expected_size) {
+  (void)scope;
+  (void)upload_id;
+  (void)path;
+  (void)sha256;
+  if (expected_size) *expected_size = 0;
+  return EDR_EGRESS_REQUEST_DENIED;
 }
 
 void edr_command_audit_both(const char *cmd_id, const char *msg) {

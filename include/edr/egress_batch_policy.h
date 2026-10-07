@@ -5,7 +5,7 @@
 #include <stdint.h>
 struct _edr_v1_BehaviorEvent;
 
-#define EDR_EGRESS_PROJECTOR_VERSION "alert-fields-v1"
+#define EDR_EGRESS_PROJECTOR_VERSION "alert-fields-v2"
 #define EDR_EGRESS_BATCH_MAX (4u * 1024u * 1024u)
 #define EDR_EGRESS_FRAME_MAX (256u * 1024u)
 #define EDR_EGRESS_FRAME_COUNT_MAX 4096u
@@ -27,6 +27,16 @@ int edr_egress_batch_validate_scope(const uint8_t *header, size_t header_len,
  * This does not authorize sending or confirm a PMFE association. */
 int edr_egress_event_project(struct _edr_v1_BehaviorEvent *event,
     char *reason, size_t reason_cap);
+/* The final dynamic-frame gate and explicit historical projection require a
+ * trusted descriptor indexed by the immutable bundle SHA. The authority owner
+ * retains verified prior generations; active-bundle replacement must not
+ * reinterpret committed bytes. A self-reported field mask is never authority.
+ * Return 1 for a proven contract, 0 for absent/mismatched authority, and -1
+ * for temporary resource/I/O failure. This never establishes receipt or
+ * modifies original queue entries. */
+typedef int (*EdrEgressRuleProjectionValidator)(const char *rule_id,
+    const char *bundle_sha, uint64_t mask, const char *operation, void *user);
+void edr_egress_set_rule_projection_validator(EdrEgressRuleProjectionValidator validator, void *user);
 
 /* Explicit maintenance only: decode the whole historical batch, verify every
  * frame's tenant/endpoint, and select proven alerts/their original required

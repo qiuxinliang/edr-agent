@@ -982,7 +982,7 @@ static void corr_build_subject_json(const CorrRule *rule, const CorrStateSlot *s
                "{\"subject_type\":\"edr_correlation\",\"rule_id\":\"%s\","
                "\"rules_bundle_version\":\"%s\",\"display_title\":\"%s\","
                "\"evaluation_basis\":{\"schema\":\"agent_detection_basis_v1\","
-               "\"owner\":\"correlation_engine\",\"predicate_matched\":true,"
+               "\"owner\":\"correlation_engine\",\"tactic_probs_computed\":false,\"predicate_matched\":true,"
                "\"pid\":%u,\"timestamp_ns\":\"%lld\",\"kind\":\"%s\","
                "\"threshold\":%u,\"matched_count\":%u,\"window_ms\":%lld,\"ordered\":%s},"
                "\"window_ms\":%lld,\"count\":%u,\"distinct\":%u,\"evidence_chain\":[",

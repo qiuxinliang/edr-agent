@@ -104,19 +104,26 @@ def is_proven_alert(frame):
     try:
         alert = protobuf(frame[40][0])
         subject = json.loads(alert[11][0])
-        if frame[9][0] != b"synthetic.exe --required-alert-context" or alert[7][0] != frame[6][0]:
+        if alert[7][0] != frame[6][0]:
             return False
         if subject["subject_type"] == "edr_dynamic_rule":
             # The initial fixed-proof fixture remains independently checkable
             # for the exact-before-source comparison; current fixtures use the
             # actual AVE callback path below.
-            return subject["rule_id"] == "synthetic-rule" and \
+            return frame[9][0] == b"synthetic.exe --required-alert-context" and \
+                subject["rule_id"] == "synthetic-rule" and \
                 subject["context"]["source_event_id"] == "synthetic-source" and \
                 subject["context"]["pid"] == alert[7][0]
         if subject["subject_type"] != "detection_context" or frame[4][0] != 70:
             return False
+        # Version 2's AVE evidence contract retains the predicate facts and
+        # owner, while unrelated process/identity strings remain local.
+        if frame.get(69) != [2] or 9 in frame or 2 in alert:
+            return False
         basis = subject["evaluation_basis"]
         context = subject["detection_context"]
+        if set(context["process"]) != {"pid", "parent_pid"} or basis["tactic_probs_computed"] is not False:
+            return False
         score = struct.unpack("<f", alert[1][0])[0]
         threshold = basis["threshold"]
         return basis["schema"] == "agent_detection_basis_v1" and \
@@ -504,6 +511,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True)
     parser.add_argument("--baseline", action="store_true", help="run historical implementation; regression is expected to fail")
+    parser.add_argument("--command-only", action="store_true", help="focus real signed result/renewal delivery without detector fixtures")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="edr-egress-mtls-") as temporary:
         root = Path(temporary)
@@ -515,6 +523,8 @@ def main():
         modes = ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host")
         if not args.baseline:
             modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command")
+        if args.command_only:
+            modes = ("positive-command",)
         for mode in modes:
             server = Receiver(root, "wrong-host" if mode == "wrong-host" else "server", root / f"receiver-{mode}.db")
             try:
@@ -547,6 +557,27 @@ def main():
                         signature = base64.urlsafe_b64encode((root / "command.sig").read_bytes()).decode().rstrip("=")
                         environment[f"EDR_TEST_{label}_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
                         environment[f"EDR_TEST_{label}_ISSUED"] = issued
+                    issued = str(int(time.time() * 1000))
+                    original = {"task_id":"cmd_synthetic_noop","status":"ok","exit_code":0,
+                                "evidence_refs":[],"upload_refs":[],"artifacts":[],"error":"",
+                                "retryable":False,"raw_detail":"noop"}
+                    exact_detail = json.dumps(original,separators=(",",":"))
+                    renewal = {"schema":"edr.result_delivery_renewal.v1","tenant_id":"synthetic-tenant",
+                               "endpoint_id":"synthetic-endpoint","target_command_id":"cmd_synthetic_noop",
+                               "target_command_type":"noop","target_kind":"result",
+                               "target_sha256":hashlib.sha256(exact_detail.encode()).hexdigest(),
+                               "expires_unix_ms":int(issued)+120000,"initiated_by":"operator"}
+                    payload = json.dumps(renewal,separators=(",",":"))
+                    canonical = "\n".join(("cmd_synthetic_renewal","result_delivery_renewal","cmd_synthetic_renewal",
+                                              issued,"30000",hashlib.sha256(payload.encode()).hexdigest())).encode()
+                    (root / "command.txt").write_bytes(canonical)
+                    subprocess.run([executable,"pkeyutl","-sign","-rawin","-inkey","command.key",
+                                    "-in","command.txt","-out","command.sig"],cwd=root,check=True,
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=15)
+                    signature=base64.urlsafe_b64encode((root/"command.sig").read_bytes()).decode().rstrip("=")
+                    environment["EDR_TEST_RENEWAL_SIGNATURE"]="cmd_synthetic_renewal|sigv2|ed25519|synthetic-key|"+signature
+                    environment["EDR_TEST_RENEWAL_ISSUED"]=issued
+                    environment["EDR_TEST_RENEWAL_PAYLOAD"]=payload
                 host = "127.0.0.1" if mode == "positive-ip" else "localhost"
                 result = subprocess.run([args.client, f"https://{host}:{server.server_port}/api/v1",
                                          str(root / ("other-ca.pem" if mode == "wrong-ca" else "ca.pem")),
@@ -583,7 +614,7 @@ def main():
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
-        if not args.baseline:
+        if not args.baseline and not args.command_only:
             try:
                 reports.append(crash_restart_scenario(args.client, root))
             except (AssertionError, RuntimeError, OSError, sqlite3.Error, ValueError, KeyError,

@@ -244,6 +244,18 @@ static const CommandFieldRule k_update_server_rules[] = {
     RULE("address", FIELD_STRING, 0, 0, 0, 512, 0),
 };
 
+static const CommandFieldRule k_delivery_renewal_rules[] = {
+    RULE("schema", FIELD_STRING, 1, 0, 0, 63, 0),
+    RULE("tenant_id", FIELD_STRING, 1, 0, 0, 127, 0),
+    RULE("endpoint_id", FIELD_STRING, 1, 0, 0, 127, 0),
+    RULE("target_command_id", FIELD_STRING, 1, 0, 0, 127, 0),
+    RULE("target_command_type", FIELD_STRING, 1, 0, 0, 63, 0),
+    RULE("target_kind", FIELD_STRING, 1, 0, 0, 31, 0),
+    RULE("target_sha256", FIELD_STRING, 1, 0, 0, 64, 0),
+    RULE("expires_unix_ms", FIELD_NUMBER, 1, 1, 9007199254740991.0, 0, 0),
+    RULE("initiated_by", FIELD_STRING, 1, 0, 0, 31, 0),
+};
+
 static const CommandFieldRule k_agent_update_rules[] = {
     RULE("schema", FIELD_STRING, 1, 0, 0, 31, 0),
     RULE("task_id", FIELD_STRING, 1, 0, 0, 128, 0),
@@ -419,6 +431,8 @@ static void command_rules(EdrCommandKind kind, const CommandFieldRule **rules,
       *rules = k_rtr_shell_rules; *count = COUNT_OF(k_rtr_shell_rules); break;
     case EDR_COMMAND_KIND_UPDATE_SERVER_ADDRESS:
       *rules = k_update_server_rules; *count = COUNT_OF(k_update_server_rules); break;
+    case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL:
+      *rules = k_delivery_renewal_rules; *count = COUNT_OF(k_delivery_renewal_rules); break;
     case EDR_COMMAND_KIND_AGENT_UPDATE:
       *rules = k_agent_update_rules; *count = COUNT_OF(k_agent_update_rules); break;
     case EDR_COMMAND_KIND_AGENT_RESTART_SERVICE:
@@ -437,6 +451,19 @@ static int has_nonempty_string(const cJSON *root, const char *name) {
 
 static int validate_semantics(EdrCommandKind kind, const cJSON *root,
                               char *reason, size_t reason_cap) {
+  if (kind == EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL) {
+    const char *schema=cJSON_GetObjectItemCaseSensitive(root,"schema")->valuestring;
+    const char *mode=cJSON_GetObjectItemCaseSensitive(root,"target_kind")->valuestring;
+    const char *type=cJSON_GetObjectItemCaseSensitive(root,"target_command_type")->valuestring;
+    const char *sha=cJSON_GetObjectItemCaseSensitive(root,"target_sha256")->valuestring;
+    const char *by=cJSON_GetObjectItemCaseSensitive(root,"initiated_by")->valuestring;
+    if (strcmp(schema,"edr.result_delivery_renewal.v1") || strcmp(by,"operator") ||
+        (strcmp(mode,"result") && strcmp(mode,"upgrade_payload")) ||
+        (!strcmp(mode,"upgrade_payload") && strcmp(type,"agent_update")) ||
+        !edr_command_registry_lookup(type) || !strcmp(type,"result_delivery_renewal") ||
+        strlen(sha)!=64u || strspn(sha,"0123456789abcdef")!=64u)
+      return contract_fail(reason,reason_cap,"invalid scoped result delivery renewal");
+  }
   if (kind == EDR_COMMAND_KIND_KILL_PROCESS) {
     const cJSON *creation = cJSON_GetObjectItemCaseSensitive(root, "process_creation_filetime_100ns");
     const char *value = cJSON_IsString(creation) ? creation->valuestring : "";
@@ -674,7 +701,8 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
 
 int edr_command_contract_signature_required(const char *command_id, const char *command_type) {
   (void)command_id;
-  if (edr_command_registry_is_shell(command_type)) {
+  if (!strcmp(command_type ? command_type : "", "result_delivery_renewal") ||
+      edr_command_registry_is_shell(command_type)) {
     return 1;
   }
   const char *require = getenv("EDR_COMMAND_REQUIRE_SIGNATURE");

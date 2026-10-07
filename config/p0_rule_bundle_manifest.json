@@ -1,8 +1,8 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r283-a435ea01",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-ad5e56a7",
   "source_ids_file": "p0_rule_ids_v1.txt",
-  "rule_count": 180,
+  "rule_count": 182,
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -10,6 +10,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001"
       ]
@@ -20,6 +21,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1564.003"
@@ -31,6 +33,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1204.002"
@@ -42,6 +45,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1204.001"
@@ -53,6 +57,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.010"
       ]
@@ -63,6 +68,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.011"
       ]
@@ -73,6 +79,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105"
       ]
@@ -83,6 +90,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.005"
       ]
@@ -93,6 +101,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1047"
       ]
@@ -103,6 +112,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1547.001"
       ]
@@ -113,6 +123,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1547.004"
       ]
@@ -123,6 +134,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1053.005"
       ]
@@ -133,6 +145,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1546.012"
       ]
@@ -143,6 +156,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1546.010"
       ]
@@ -153,6 +167,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1546.009"
       ]
@@ -163,6 +178,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1112"
       ]
@@ -173,6 +189,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1112"
       ]
@@ -183,6 +200,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1112"
       ]
@@ -193,6 +211,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.001"
       ]
@@ -203,6 +222,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.002"
       ]
@@ -213,6 +233,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.001"
       ]
@@ -223,6 +244,7 @@
       "severity": 1,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1555.003"
       ]
@@ -233,6 +255,7 @@
       "severity": 3,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.003"
       ]
@@ -243,6 +266,7 @@
       "severity": 2,
       "event_type": "network_connect",
       "enabled": true,
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1021.002"
       ]
@@ -253,6 +277,7 @@
       "severity": 2,
       "event_type": "network_connect",
       "enabled": true,
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1021.001"
       ]
@@ -263,6 +288,7 @@
       "severity": 2,
       "event_type": "network_connect",
       "enabled": true,
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1021.006"
       ]
@@ -273,6 +299,7 @@
       "severity": 3,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1505.003"
       ]
@@ -283,6 +310,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1505.003"
@@ -294,6 +322,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1490"
       ]
@@ -304,6 +333,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1486",
         "T1562.001"
@@ -315,6 +345,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059"
       ]
@@ -325,6 +356,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105",
         "T1218.007"
@@ -336,6 +368,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.003"
       ]
@@ -346,6 +379,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1220"
       ]
@@ -356,6 +390,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1543.003"
       ]
@@ -366,6 +401,7 @@
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1547.001"
       ]
@@ -376,6 +412,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.004"
       ]
@@ -386,6 +423,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1021.002",
         "T1569.002"
@@ -397,6 +435,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105",
         "T1197"
@@ -408,6 +447,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1546.003"
       ]
@@ -418,6 +458,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1070.001"
       ]
@@ -428,6 +469,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.001"
       ]
@@ -438,6 +480,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1105"
@@ -449,6 +492,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1555"
       ]
@@ -459,6 +503,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1135"
       ]
@@ -469,6 +514,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1033",
         "T1057",
@@ -481,6 +527,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1620"
@@ -492,6 +539,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.010",
         "T1553.005"
@@ -503,6 +551,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1127.001",
         "T1218.004"
@@ -514,6 +563,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.005",
         "T1059.007"
@@ -525,6 +575,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1202"
@@ -536,6 +587,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218.008"
       ]
@@ -546,6 +598,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1071.004"
       ]
@@ -556,6 +609,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1071.004"
       ]
@@ -566,6 +620,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1046"
       ]
@@ -576,6 +631,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1110.001",
         "T1110.003"
@@ -587,6 +643,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1095"
       ]
@@ -597,6 +654,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.006"
       ]
@@ -607,6 +665,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1558.003"
       ]
@@ -617,6 +676,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1550.002"
       ]
@@ -627,6 +687,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1074",
         "T1560.001"
@@ -638,6 +699,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1041",
         "T1048"
@@ -649,6 +711,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1567.002"
       ]
@@ -659,6 +722,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1115"
       ]
@@ -669,6 +733,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1056.001"
       ]
@@ -679,6 +744,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1574.002"
       ]
@@ -689,6 +755,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1055"
       ]
@@ -699,6 +766,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1548.002"
       ]
@@ -709,6 +777,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1134",
         "T1134.001",
@@ -721,6 +790,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.010"
       ]
@@ -731,6 +801,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1497",
         "T1497.001",
@@ -743,6 +814,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1014",
         "T1547.006"
@@ -754,6 +826,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1485"
       ]
@@ -764,6 +837,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1496"
       ]
@@ -774,6 +848,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1498"
       ]
@@ -784,6 +859,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1195.002"
       ]
@@ -794,6 +870,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1553.002"
       ]
@@ -804,6 +881,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1542.001",
         "T1542.003"
@@ -815,6 +893,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1136.001"
       ]
@@ -825,6 +904,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1098"
       ]
@@ -835,6 +915,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1213"
       ]
@@ -845,6 +926,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.010"
       ]
@@ -855,6 +937,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1548.002"
       ]
@@ -865,6 +948,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1004"
       ]
@@ -875,6 +959,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1006"
       ]
@@ -885,6 +970,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1012"
       ]
@@ -895,6 +981,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1013"
       ]
@@ -905,6 +992,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1015"
       ]
@@ -915,6 +1003,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1023"
       ]
@@ -925,6 +1014,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1028"
       ]
@@ -935,6 +1025,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1031"
       ]
@@ -945,6 +1036,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1034"
       ]
@@ -955,6 +1047,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1037"
       ]
@@ -965,6 +1058,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1042"
       ]
@@ -975,6 +1069,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1044"
       ]
@@ -985,6 +1080,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1050"
       ]
@@ -995,6 +1091,7 @@
       "severity": 1,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1051"
       ]
@@ -1005,6 +1102,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1054"
       ]
@@ -1015,6 +1113,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1060"
       ]
@@ -1025,6 +1124,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1073"
       ]
@@ -1035,6 +1135,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1075"
       ]
@@ -1045,6 +1146,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1084"
       ]
@@ -1055,6 +1157,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1088"
       ]
@@ -1065,6 +1168,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1089"
       ]
@@ -1075,6 +1179,7 @@
       "severity": 1,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1091"
       ]
@@ -1085,6 +1190,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1097"
       ]
@@ -1095,6 +1201,7 @@
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1100"
       ]
@@ -1105,6 +1212,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1101"
       ]
@@ -1115,6 +1223,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1103"
       ]
@@ -1125,6 +1234,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1107"
       ]
@@ -1135,6 +1245,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1117"
       ]
@@ -1145,6 +1256,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1118"
       ]
@@ -1155,6 +1267,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1121"
       ]
@@ -1165,6 +1278,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1122"
       ]
@@ -1175,6 +1289,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1128"
       ]
@@ -1185,6 +1300,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1130"
       ]
@@ -1195,6 +1311,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1131"
       ]
@@ -1205,6 +1322,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1137"
       ]
@@ -1215,6 +1333,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1138"
       ]
@@ -1225,6 +1344,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1170"
       ]
@@ -1235,6 +1355,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1171"
       ]
@@ -1245,6 +1366,7 @@
       "severity": 1,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1173"
       ]
@@ -1255,6 +1377,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1174"
       ]
@@ -1265,6 +1388,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1175"
       ]
@@ -1275,6 +1399,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1177"
       ]
@@ -1285,6 +1410,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1180"
       ]
@@ -1295,6 +1421,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1182"
       ]
@@ -1305,6 +1432,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1183"
       ]
@@ -1315,6 +1443,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1219"
       ]
@@ -1325,6 +1454,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1219"
       ]
@@ -1335,6 +1465,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1204.002",
         "T1219"
@@ -1346,6 +1477,7 @@
       "severity": 2,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1219",
         "T1543.003"
@@ -1357,6 +1489,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1219",
@@ -1369,6 +1502,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1036.005",
         "T1105",
@@ -1381,6 +1515,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1036.005",
         "T1204.002",
@@ -1393,6 +1528,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1218",
         "T1548.002"
@@ -1404,6 +1540,7 @@
       "severity": 4,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1014",
         "T1068",
@@ -1416,6 +1553,7 @@
       "severity": 3,
       "event_type": "registry_set",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1027",
         "T1112",
@@ -1428,6 +1566,7 @@
       "severity": 3,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1068",
         "T1105",
@@ -1440,6 +1579,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1036.003",
         "T1059",
@@ -1452,6 +1592,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1036.003",
         "T1059.001",
@@ -1464,6 +1605,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1027",
         "T1036.003",
@@ -1476,6 +1618,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1055.012",
         "T1620"
@@ -1487,6 +1630,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1055",
         "T1055.001",
@@ -1499,6 +1643,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.001",
         "T1562.006",
@@ -1511,6 +1656,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1574.001",
         "T1574.002"
@@ -1522,6 +1668,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1112",
@@ -1534,6 +1681,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1027.004",
         "T1055",
@@ -1546,6 +1694,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1059.005",
@@ -1559,6 +1708,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.005",
         "T1059.007",
@@ -1571,6 +1721,7 @@
       "severity": 1,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1539",
         "T1555.003"
@@ -1582,6 +1733,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1021.004",
         "T1090",
@@ -1594,6 +1746,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003",
         "T1021.003",
@@ -1606,6 +1759,7 @@
       "severity": 3,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.002",
         "T1003.003"
@@ -1617,6 +1771,7 @@
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1074.001",
         "T1560.001"
@@ -1628,6 +1783,7 @@
       "severity": 3,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1530",
         "T1552.001",
@@ -1640,6 +1796,7 @@
       "severity": 3,
       "event_type": "network_connect",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1090",
         "T1572"
@@ -1651,6 +1808,7 @@
       "severity": 2,
       "event_type": "network_connect",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1018",
         "T1021",
@@ -1663,6 +1821,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1525",
         "T1527",
@@ -1675,6 +1834,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1048",
         "T1530",
@@ -1687,6 +1847,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.001",
         "T1204.004",
@@ -1699,6 +1860,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105",
         "T1204.004",
@@ -1711,6 +1873,7 @@
       "severity": 4,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1014",
         "T1068",
@@ -1723,6 +1886,7 @@
       "severity": 4,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1562.001",
         "T1562.004"
@@ -1734,6 +1898,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105",
         "T1202",
@@ -1746,6 +1911,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1505.003"
@@ -1757,6 +1923,7 @@
       "severity": 4,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059",
         "T1105",
@@ -1769,6 +1936,7 @@
       "severity": 3,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1105",
         "T1505.003"
@@ -1780,6 +1948,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003.001"
       ]
@@ -1790,6 +1959,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1003",
         "T1555",
@@ -1802,6 +1972,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1021.002",
         "T1047",
@@ -1815,6 +1986,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1548.002"
       ]
@@ -1825,6 +1997,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1068",
         "T1134.001"
@@ -1836,6 +2009,7 @@
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": []
     },
     {
@@ -1844,6 +2018,7 @@
       "severity": 2,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1539"
       ]
@@ -1854,6 +2029,7 @@
       "severity": 2,
       "event_type": "file_read",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1552.001"
       ]
@@ -1864,6 +2040,7 @@
       "severity": 2,
       "event_type": "file_write",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1546.018"
       ]
@@ -1874,6 +2051,7 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1059.006",
         "T1059.007",
@@ -1886,6 +2064,7 @@
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1078.004"
       ]
@@ -1896,8 +2075,31 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
+      "effect": "security_alert",
       "mitre_ttps": [
         "T1490"
+      ]
+    },
+    {
+      "id": "R-CRED-017",
+      "title": "凭据数据库显式解密读取",
+      "severity": 3,
+      "event_type": "file_read",
+      "enabled": true,
+      "effect": "security_alert",
+      "mitre_ttps": [
+        "T1555.003"
+      ]
+    },
+    {
+      "id": "R-LMOVE-017",
+      "title": "管理协议显式哈希认证连接",
+      "severity": 3,
+      "event_type": "network_connect",
+      "enabled": true,
+      "effect": "security_alert",
+      "mitre_ttps": [
+        "T1550.002"
       ]
     }
   ]

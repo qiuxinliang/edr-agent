@@ -28,6 +28,8 @@ typedef struct {
   const char *registry_path;
   const char *registry_value_name;
   const char *registry_value_data;
+  const char *dest_ip;
+  const char *effect;
 } P0ValidationCase;
 
 /* The standalone matrix binary links the same SensorInterest predicate as
@@ -503,6 +505,10 @@ int main(void) {
     }
     edr_behavior_record_init(&br);
     br.type = tc->type;
+    br.pid=1234u; br.process_start_key=2345u; br.process_creation_filetime_100ns=3456u;
+    copy_text(br.tenant_id,sizeof(br.tenant_id),"fixture-tenant");
+    copy_text(br.endpoint_id,sizeof(br.endpoint_id),"fixture-endpoint");
+    copy_text(br.net_dst,sizeof(br.net_dst),tc->dest_ip);
     br.process_chain_depth = tc->chain_depth;
     br.net_dport = tc->dest_port;
     copy_text(br.process_name, sizeof(br.process_name), tc->process_name);
@@ -520,9 +526,9 @@ int main(void) {
     }
     if (strcmp(tc->case_kind, "POSITIVE_E2E") == 0) {
       positives++;
-      if (strcmp(tc->case_class, "DETECTION_REQUIRED") != 0 ||
-          strcmp(tc->operational_expectation, "TARGET_RULE_PRESENT") != 0 ||
-          strcmp(tc->validation_status, "UNVERIFIED") != 0 || !tc->expect_hit) {
+      if ((strcmp(tc->case_class, "DETECTION_REQUIRED") != 0 && strcmp(tc->case_class,"LOCAL_OBSERVATION_REQUIRED") != 0) ||
+          (strcmp(tc->operational_expectation, "TARGET_RULE_PRESENT") != 0 && strcmp(tc->operational_expectation,"LOCAL_OBSERVATION_PRESENT_ALERT_ABSENT") != 0) ||
+          (strcmp(tc->validation_status, "UNVERIFIED") != 0 && strcmp(tc->validation_status,"STATIC_REPLAY_ONLY") != 0) || !tc->expect_hit) {
         fprintf(stderr, "%s: invalid positive replay contract\n", tc->case_id);
         failures++;
       }
@@ -555,7 +561,7 @@ int main(void) {
       business_benign++;
       if (strcmp(tc->case_class, "BUSINESS_BENIGN_E2E") != 0 ||
           strcmp(tc->operational_expectation, "TARGET_RULE_ABSENT_AND_QUIET_WINDOW") != 0 ||
-          strcmp(tc->validation_status, "UNVERIFIED") != 0 || tc->expect_hit) {
+          (strcmp(tc->validation_status, "UNVERIFIED") != 0 && strcmp(tc->validation_status,"STATIC_REPLAY_ONLY") != 0) || (tc->expect_hit && strcmp(tc->effect,"local_observation"))) {
         fprintf(stderr, "%s: business-benign replay is not an unverified zero-alert candidate\n", tc->case_id);
         failures++;
       }
@@ -563,7 +569,7 @@ int main(void) {
       rule_tuning_required++;
       if (strcmp(tc->case_class, "RULE_TUNING_REQUIRED") != 0 ||
           strcmp(tc->operational_expectation, "NO_PASS_RULE_TUNING_REQUIRED") != 0 ||
-          strcmp(tc->validation_status, "UNVERIFIED") != 0 || !tc->expect_hit) {
+          (strcmp(tc->validation_status, "UNVERIFIED") != 0 && strcmp(tc->validation_status,"STATIC_REPLAY_ONLY") != 0) || !tc->expect_hit) {
         fprintf(stderr, "%s: rule-tuning replay contract is inconsistent\n", tc->case_id);
         failures++;
       }
@@ -571,7 +577,7 @@ int main(void) {
       security_control++;
       if (strcmp(tc->case_class, "SECURITY_CONTROL") != 0 ||
           strcmp(tc->operational_expectation, "TARGET_RULE_PRESENT_SECURITY_CONTROL") != 0 ||
-          strcmp(tc->validation_status, "UNVERIFIED") != 0 || !tc->expect_hit) {
+          (strcmp(tc->validation_status, "UNVERIFIED") != 0 && strcmp(tc->validation_status,"STATIC_REPLAY_ONLY") != 0) || !tc->expect_hit) {
         fprintf(stderr, "%s: security-control replay contract is inconsistent\n", tc->case_id);
         failures++;
       }

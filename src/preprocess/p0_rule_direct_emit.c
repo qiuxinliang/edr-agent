@@ -9,6 +9,7 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_deferred_snapshot.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/egress_batch_policy.h"
 #include "edr/policy_enforcement.h"
 #include "edr/policy_v2.h"
 #include "edr/p0_source_only_contract.h"
@@ -3298,9 +3299,19 @@ static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
 
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma, const EdrP0RuleIrBinding *binding,
-                        const char *known_fp_reason, const char *deferred_key,
+                        const EdrP0RuleIrMatch *match, const char *known_fp_reason, const char *deferred_key,
                         const char **terminal_reason, int *delivery_gated,
                         const EdrCommandFacts *command_facts) {
+  /* Copy authority from the same retained snapshot before any immutable frame
+   * or terminal intent is produced. Full local evidence stays intact. */
+  EdrBehaviorRecord authorized;
+  if (!match || match->effect != EDR_P0_EFFECT_SECURITY_ALERT) return 0;
+  authorized = *br;
+  authorized.evidence_projection_version = EDR_EVIDENCE_PROJECTION_VERSION;
+  authorized.tactic_probability_state = 1u;
+  authorized.required_evidence_fields = match->required_evidence_fields;
+  snprintf(authorized.operation_evidence,sizeof(authorized.operation_evidence),"%s",match->operation_evidence);
+  br = &authorized;
   EdrPolicyEnforcementResult enforcement;
   EdrP0EmitMetrics emitted_metrics = {0};
   p0_dedup_reservation dedup_reservation = {0};
@@ -3367,6 +3378,14 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
   /* Planning has no side effect.  The owner claim and durable intent below
    * must happen before a block policy is allowed to touch the process. */
   edr_policy_enforcement_plan(br, mitre_comma, rule_id, &enforcement);
+  if (match->required_evidence_fields & EDR_EVIDENCE_OPERATION) {
+    if (enforcement.requested) {
+      enforcement.requested=0;
+      snprintf(enforcement.action,sizeof(enforcement.action),"%s","operation_alert_only");
+      snprintf(enforcement.message,sizeof(enforcement.message),"%s","block action withheld: operation contract permits alert only");
+      p0_observe_rule_disposition(br,rule_id,"action_withheld","operation_alert_only",known_fp_reason,0u);
+    }
+  }
   if (enforcement.requested &&
       !edr_p0_artifact_identity_is_action_authoritative(br->detection_context)) {
     /* The current evidence worker starts from a pathname only after the
@@ -4050,7 +4069,7 @@ int edr_p0_rule_poll_deferred_match(void) {
     if (edr_p0_rule_ir_evaluation_get_match(&evaluation,i,&match) && !strcmp(match.rule_id,rule_id)) {
       found=1;
       emitted=emit_for_rule(record,rule_id,match.severity,match.title,match.mitre_csv,
-          &evaluation.binding,"",key,&terminal,NULL,&facts);
+          &evaluation.binding,&match,"",key,&terminal,NULL,&facts);
       if (emitted) {
         const char *name = record->process_name;
         if (!name[0] && record->type == EDR_EVENT_SCRIPT_POWERSHELL) name = "powershell.exe";
@@ -4149,10 +4168,21 @@ int edr_p0_rule_emit_collector_evidence_gate(const EdrBehaviorRecord *record) {
 
 #undef p0_json_escape_or_empty
 
+static int p0_projection_validator(const char *rule, const char *sha, uint64_t mask,
+                                    const char *operation, void *user) {
+  (void)user;
+  return edr_p0_rule_ir_projection_matches(rule,sha,mask,operation);
+}
+
+void edr_p0_rule_register_projection_authority(void) {
+  edr_egress_set_rule_projection_validator(p0_projection_validator,NULL);
+}
+
 int edr_p0_rule_try_emit_with_command_facts_status(
     const EdrBehaviorRecord *br, const EdrCommandFacts *provided_facts,
     int *proven_miss) {
   int emitted_count = 0;
+  edr_egress_set_rule_projection_validator(p0_projection_validator,NULL);
   if (proven_miss) *proven_miss = 0;
   if (!br || !provided_facts) {
     return 0;
@@ -4291,6 +4321,14 @@ int edr_p0_rule_try_emit_with_command_facts_status(
           break;
         }
         rid = match.rule_id;
+        if (match.effect == EDR_P0_EFFECT_LOCAL_OBSERVATION) {
+          /* Matching an observation grants no action/queue/quota/latch
+           * authority. Preserve the original bounded local evidence once. */
+          /* The pipeline admission owner retains every record once before
+           * local-only/drop decisions. A rule match must not write it twice. */
+          edr_p0_rule_observe_validation_stage(br,"local_observation",rid);
+          continue;
+        }
         if (registry_best_index >= 0 && i != registry_best_index) {
           continue;
         }
@@ -4310,7 +4348,7 @@ int edr_p0_rule_try_emit_with_command_facts_status(
         int rule_emitted = emit_for_rule(br, rid, match.severity,
                           match.title[0] ? match.title : rid,
                           match.mitre_csv, &evaluation.binding,
-                          known_fp_reason, NULL, NULL, &delivery_gated, provided_facts);
+                          &match, known_fp_reason, NULL, NULL, &delivery_gated, provided_facts);
         if (rule_emitted) {
           emitted_count++;
           edr_adaptive_collection_raise(match.severity, rid, br->pid, br->ppid,

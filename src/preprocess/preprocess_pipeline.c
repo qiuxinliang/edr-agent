@@ -1095,6 +1095,7 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
 static void log_p0_runtime_state(void) {
   EdrP0RuleIrBinding binding;
   edr_p0_rule_ir_lazy_init();
+  edr_p0_rule_register_projection_authority();
   const char *ir_source = "";
   const char *ir_sha256 = "";
   size_t ir_plain_size = 0u;
@@ -1319,6 +1320,7 @@ static int p0_resource_throttle_proven_miss(const EdrBehaviorRecord *br) {
     return 0;
   }
   edr_p0_rule_ir_lazy_init();
+  edr_p0_rule_register_projection_authority();
   if (!edr_p0_rule_ir_is_ready()) {
     return 0;
   }

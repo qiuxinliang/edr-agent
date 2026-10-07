@@ -1087,9 +1087,10 @@ int edr_agent_update_finalize_recovery(
 
     char uploaded_key[sizeof(recovery->installer_log_storage_key)];
     memset(uploaded_key, 0, sizeof(uploaded_key));
-    if (upload(recovery->command_id, recovery->installer_log_evidence_id,
+    int upload_rc=upload(recovery->command_id, recovery->installer_log_evidence_id,
                installer_log_path, recovery->installer_log_sha256,
-               uploaded_key, sizeof(uploaded_key), user) != 0) return -1;
+               uploaded_key, sizeof(uploaded_key), user);
+    if(upload_rc) return upload_rc;
     if (uploaded_key[0]) {
       snprintf(recovery->installer_log_storage_key,
                sizeof(recovery->installer_log_storage_key), "%s", uploaded_key);
@@ -1133,7 +1134,8 @@ int edr_agent_update_finalize_recovery(
   }
 
   uint64_t last_acked = 0u;
-  if (flush(event_outbox_dir, &last_acked, user) < 0) return -1;
+  int flush_rc=flush(event_outbox_dir, &last_acked, user);
+  if(flush_rc<0)return flush_rc;
   recovery->terminal_event_acked =
       edr_agent_update_journal_is_terminal(recovery->status) &&
       last_acked >= recovery->last_event_seq;
@@ -1205,6 +1207,63 @@ static int import_journal_events(const cJSON *root, const EdrAgentUpdateRequest 
 }
 #endif
 
+int edr_agent_update_log_journal_authorized(const EdrEgressTaskScope *scope,
+    const char *journal_json,const char *upload_id,const char *basename,
+    const char *sha256,uint64_t *expected_size) {
+  if(expected_size)*expected_size=0;
+  if(!scope || !journal_json || !upload_id || !basename || !sha256) return EDR_EGRESS_REQUEST_DENIED;
+  EdrAgentUpdateRecovery record;
+  memset(&record,0,sizeof(record));
+  if(edr_agent_update_parse_journal(journal_json,&record)<1) return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  size_t n=strlen(basename);
+  if(strcmp(scope->upgrade_class,"installer_required") ||
+      strcmp(record.command_id,scope->command_id) || strcmp(record.task_id,scope->task_id) ||
+      strcmp(record.operation,scope->operation) || strcmp(record.artifact_id,scope->artifact_id) ||
+      strcmp(record.artifact_sha256,scope->artifact_sha256) || strcmp(record.target_version,scope->target_version) ||
+      n<9u || strcmp(basename+n-9u,".redacted") || strchr(basename,'/') || strchr(basename,'\\') ||
+      strstr(basename,"..") || strcmp(record.installer_log_file,basename) ||
+      strcmp(record.installer_log_sha256,sha256) || !is_hex(sha256,64u) ||
+      !record.installer_log_size || record.installer_log_size>1024u*1024u) return EDR_EGRESS_REQUEST_DENIED;
+  for(const unsigned char *p=(const unsigned char*)basename;*p;p++)
+    if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='.'||*p=='-'||*p=='_'))return EDR_EGRESS_REQUEST_DENIED;
+  char seed[400],digest[65],expected[96];
+  int len=snprintf(seed,sizeof(seed),"%s\n%s\ninstaller-log-v1",scope->task_id,scope->command_id);
+  if(len<0 || (size_t)len>=sizeof(seed) || edr_sha256_hex((const uint8_t*)seed,(size_t)len,digest)) return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  snprintf(expected,sizeof(expected),"ev_installer_%s",digest);
+  if(strcmp(upload_id,expected) || strcmp(record.installer_log_evidence_id,expected)) return EDR_EGRESS_REQUEST_DENIED;
+  if(expected_size)*expected_size=record.installer_log_size;
+  return 0;
+}
+int edr_agent_update_log_authorized(const EdrEgressTaskScope *scope,
+    const char *upload_id,const char *path,const char *sha256,uint64_t *expected_size) {
+#ifndef _WIN32
+  (void)scope;(void)upload_id;(void)path;(void)sha256;(void)expected_size;
+  return EDR_EGRESS_REQUEST_DENIED;
+#else
+  if(!scope || !path)return EDR_EGRESS_REQUEST_DENIED;
+  char safe_id[129],program_data[MAX_PATH],journal[MAX_PATH],expected_path[MAX_PATH];
+  safe_command_id(scope->command_id,safe_id,sizeof(safe_id));
+  DWORD n=GetEnvironmentVariableA("ProgramData",program_data,sizeof(program_data));
+  if(!n || n>=sizeof(program_data))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if(snprintf(journal,sizeof(journal),"%s\\FDSecurity\\state\\agent-update-%s.journal.json",program_data,safe_id)>=(int)sizeof(journal))return EDR_EGRESS_REQUEST_DENIED;
+  DWORD attrs=GetFileAttributesA(journal);
+  if(attrs==INVALID_FILE_ATTRIBUTES || (attrs&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  FILE *f=fopen(journal,"rb");if(!f)return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  if(fseek(f,0,SEEK_END)){fclose(f);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  long len=ftell(f);
+  if(len<=0 || len>1024L*1024L || fseek(f,0,SEEK_SET)){fclose(f);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  char *json=malloc((size_t)len+1u);if(!json){fclose(f);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  int ok=fread(json,1,(size_t)len,f)==(size_t)len && !ferror(f);fclose(f);json[len]=0;
+  EdrAgentUpdateRecovery record={0};
+  if(!ok || edr_agent_update_parse_journal(json,&record)<1){free(json);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
+  if(snprintf(expected_path,sizeof(expected_path),"%s\\FDSecurity\\logs\\%s",program_data,record.installer_log_file)>=(int)sizeof(expected_path) || _stricmp(path,expected_path)) {free(json);return EDR_EGRESS_REQUEST_DENIED;}
+  attrs=GetFileAttributesA(path);
+  if(attrs==INVALID_FILE_ATTRIBUTES || (attrs&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))){free(json);return EDR_EGRESS_REQUEST_DENIED;}
+  int rc=edr_agent_update_log_journal_authorized(scope,json,upload_id,record.installer_log_file,sha256,expected_size);
+  free(json);return rc;
+#endif
+}
+
 int edr_agent_update_recover(const char *command_id, const uint8_t *payload,
                              size_t payload_len, EdrAgentUpdateRecovery *out) {
   if (!out || !command_id || !command_id[0] || !payload || !payload_len) return -1;
@@ -1212,6 +1271,10 @@ int edr_agent_update_recover(const char *command_id, const uint8_t *payload,
 #ifndef _WIN32
   return 0;
 #else
+  char preflight_dir[MAX_PATH];
+  if(!event_command_dir(command_id,preflight_dir,sizeof(preflight_dir)))return -1;
+  int admission=edr_agent_update_delivery_preflight(preflight_dir,command_id);
+  if(admission)return admission;
   EdrAgentUpdateRequest req;
   char reason[256];
   if (!edr_agent_update_parse_request(payload, payload_len, &req, reason, sizeof(reason))) return -1;

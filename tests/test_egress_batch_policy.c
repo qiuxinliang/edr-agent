@@ -1,4 +1,5 @@
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
 #include "edr/behavior_proto.h"
 #include "edr/detection_decision.h"
 #include "edr/ave_sdk.h"
@@ -13,6 +14,8 @@
 #include "lz4.h"
 #include <pb_decode.h>
 #include <pb_encode.h>
+
+static int synthetic_projection_owner(const char *,const char *,uint64_t,const char *,void *);
 
 static edr_v1_BehaviorEvent *decode_frame(const uint8_t *frame,size_t len) {
   edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); assert(event);
@@ -32,6 +35,9 @@ static void wr(uint8_t *p, uint32_t n) {
 }
 static void make_record(EdrBehaviorRecord *r) {
   memset(r,0,sizeof(*r));
+  r->tactic_probability_state=1;
+  r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;
+  r->required_evidence_fields=EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_NETWORK;
   r->type=EDR_EVENT_NET_CONNECT; r->pid=42; r->ppid=21;
   r->event_time_ns=1700000000000000000LL; r->priority=0;
   snprintf(r->event_id,sizeof(r->event_id),"synthetic-source");
@@ -244,7 +250,7 @@ static void purpose_masks(void) {
   assert(ev->has_process_context && !strcmp(ev->process_context.parent_cmdline,r->parent_cmdline));
   assert(ev->process_start_key==UINT64_MAX);
   assert(strstr(ev->behavior_alert.user_subject_json,"synthetic-volume:file"));
-  assert(strstr(ev->behavior_alert.user_subject_json,"synthetic-rule-trigger"));
+  assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-rule-trigger"));
   assert(strstr(ev->behavior_alert.user_subject_json,"18446744073709551615"));
   assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-duplicate-command"));
   assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-unnecessary-host"));
@@ -274,7 +280,7 @@ static void purpose_masks(void) {
   n=edr_behavior_record_alert_encode_protobuf(r,&a,frame,EDR_EGRESS_FRAME_MAX);
   assert(n && edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
   ev=decode_frame(frame,n); assert(!ev->domain[0] && !ev->creator_username[0]);
-  assert(!strcmp(ev->cmdline,r->cmdline));
+  assert(!ev->cmdline[0] && !ev->process_context.has_parent_cmdline);
   assert(!strstr(ev->behavior_alert.user_subject_json,"raw_event"));
   assert(!strstr(ev->behavior_alert.user_subject_json,"synthetic-duplicate-command"));
   assert(strstr(ev->behavior_alert.user_subject_json,"script_content_score"));
@@ -358,7 +364,18 @@ static void purpose_masks(void) {
   free(r); free(frame);
 }
 
+static int synthetic_authority_unavailable;
+static int synthetic_projection_owner(const char *rule,const char *bundle,uint64_t mask,const char *operation,void *user) {
+  (void)user;
+  if (synthetic_authority_unavailable) return -1;
+  if (strlen(bundle)!=64 || bundle[63]!='1' || operation[0]) return 0;
+  if (!strcmp(rule,"synthetic-network")) return mask==EDR_EVIDENCE_NETWORK;
+  if (!strcmp(rule,"synthetic-user")) return mask==EDR_EVIDENCE_USER;
+  return !strcmp(rule,"synthetic-rule") &&
+    mask==(EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_NETWORK);
+}
 static void historical_projection(void) {
+  edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL);
   EdrBehaviorRecord *r=calloc(1,sizeof(*r)); AVEBehaviorAlert a;
   uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX),*body=malloc(EDR_EGRESS_BATCH_MAX),*selected=NULL;
   char reason[128]; uint8_t header[12]; uint32_t count=0; size_t selected_len=0; assert(r && frame && body);
@@ -535,5 +552,51 @@ static void paired_batch_classification(void) {
   assert(!edr_egress_frame_validate(wire+16,n,NULL,0));
   free(ev); free(compressed); free(wire); free(r);
 }
-int main(void) { matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+static void evidence_projection_v2(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
+ uint8_t *plain=malloc(EDR_EGRESS_FRAME_MAX),*rich=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&plain&&rich);
+ char why[128];make_record(r);make_alert(&a,r);r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+ cJSON *contract=cJSON_Parse(a.user_subject_json);assert(contract);
+ cJSON_ReplaceItemInObjectCaseSensitive(contract,"rule_id",cJSON_CreateString("synthetic-network"));
+ overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),contract);cJSON_Delete(contract);
+ size_t minimum=edr_behavior_record_alert_encode_protobuf(r,&a,plain,EDR_EGRESS_FRAME_MAX);assert(minimum);
+ strcpy(r->username,"unrelated-user");strcpy(r->user_sid,"unrelated-sid");strcpy(r->domain,"unrelated-domain");
+ strcpy(r->identity_source,"synthetic");strcpy(r->identity_quality,"synthetic");r->session_id=77;
+ strcpy(r->creator_username,"unrelated-creator");strcpy(r->current_directory,"C:\\unrelated");
+ strcpy(r->grandparent_name,"unrelated-grandparent");r->grandparent_pid=700;
+ strcpy(a.process_name,"duplicate-name");strcpy(a.process_path,"duplicate-path");strcpy(a.cmdline,"duplicate-command");a.ppid=21;
+ size_t injected=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);
+ assert(injected==minimum&&!memcmp(plain,rich,minimum));
+ assert(edr_egress_frame_validate(rich,injected,why,sizeof(why)));
+ synthetic_authority_unavailable=1;
+ assert(!edr_egress_frame_validate(rich,injected,why,sizeof(why)) && !strcmp(why,"rule_projection_authority_unavailable"));
+ synthetic_authority_unavailable=0;
+ assert(edr_egress_frame_validate(rich,injected,why,sizeof(why)));
+ edr_v1_BehaviorEvent *ev=decode_frame(rich,injected);
+ assert(ev->has_tactic_probs_computed&&!ev->tactic_probs_computed&&ev->behavior_alert.tactic_probs_count==0);
+ assert(ev->has_process_context&&!ev->process_context.has_parent_cmdline&&ev->which_detail==edr_v1_BehaviorEvent_network_tag);
+ /* Re-encoding immutable bytes bypasses the producer. Widening a mask
+  * together with its field must still fail the trusted purpose descriptor. */
+ ev->required_evidence_fields |= EDR_EVIDENCE_COMMAND;
+ strcpy(ev->cmdline,"injected-after-freeze-command");
+ size_t invalid=immutable_encode(ev,rich);
+ assert(!edr_egress_frame_validate(rich,invalid,why,sizeof(why)));
+ assert(!strcmp(why,"rule_projection_authority_unproven"));
+ ev->required_evidence_fields &= ~EDR_EVIDENCE_COMMAND;ev->cmdline[0]=0;
+ strcpy(ev->domain,"injected-after-freeze");invalid=immutable_encode(ev,rich);
+ assert(!edr_egress_frame_validate(rich,invalid,why,sizeof(why)));free(ev);
+ r->tactic_probability_state=2;size_t calculated=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);
+ ev=decode_frame(rich,calculated);assert(ev->has_tactic_probs_computed&&ev->tactic_probs_computed&&ev->behavior_alert.tactic_probs_count==14);
+ assert(calculated==minimum+58&&edr_egress_frame_validate(rich,calculated,why,sizeof(why)));free(ev);
+ r->required_evidence_fields=EDR_EVIDENCE_USER;r->tactic_probability_state=1;
+ contract=cJSON_Parse(a.user_subject_json);assert(contract);
+ cJSON_ReplaceItemInObjectCaseSensitive(contract,"rule_id",cJSON_CreateString("synthetic-user"));
+ overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),contract);cJSON_Delete(contract);
+ size_t user=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);ev=decode_frame(rich,user);
+ assert(!strcmp(ev->username,r->username)&&!strcmp(ev->identity_source,r->identity_source)&&!strcmp(ev->identity_quality,r->identity_quality));
+ assert(!ev->domain[0]&&!ev->user_sid[0]&&!ev->creator_username[0]);free(ev);
+ printf("evidence v2 minimal=%zu unrelated_injection=%zu computed_zero=%zu\n",minimum,injected,calculated);
+ free(r);free(plain);free(rich);
+}
+int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); evidence_projection_v2(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }

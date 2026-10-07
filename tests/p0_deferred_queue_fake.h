@@ -57,3 +57,7 @@ EdrError edr_storage_queue_p0_deferred_fail(const char *key,const char *reason) 
   for(unsigned i=0;i<deferred_count;++i) if(!strcmp(key,deferred_rows[i].key)) {deferred_rows[i].state=2;return EDR_OK;}
   return EDR_ERR_SQLITE_WRITE;
 }
+
+/* Counts the retention port; SQLite persistence is separately tested. */
+static unsigned deferred_fake_local_observation_count;
+void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *record) {if(record) deferred_fake_local_observation_count++;}

@@ -2,6 +2,7 @@
 #include "edr/command_contract.h"
 #include "edr/command_registry.h"
 #include "edr/ingest_http.h"
+#include "edr/sha256.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -202,6 +203,28 @@ int main(void) {
                    recovery.installer_log_size == 1234 &&
                    strcmp(recovery.installer_evidence_status, "pending_upload") == 0,
                "v2 succeeded journal maps terminal OK and preserves installer evidence descriptor");
+  {
+    EdrEgressTaskScope scope={0};
+    snprintf(scope.task_id,sizeof(scope.task_id),"task-1");snprintf(scope.command_id,sizeof(scope.command_id),"cmd-1");
+    snprintf(scope.operation,sizeof(scope.operation),"upgrade");snprintf(scope.artifact_id,sizeof(scope.artifact_id),"artifact-1");
+    snprintf(scope.artifact_sha256,sizeof(scope.artifact_sha256),"%s",recovery.artifact_sha256);
+    snprintf(scope.target_version,sizeof(scope.target_version),"2.1.0");snprintf(scope.upgrade_class,sizeof(scope.upgrade_class),"installer_required");
+    const char *seed="task-1\ncmd-1\ninstaller-log-v1";char digest[65],id[96];
+    require_true(edr_sha256_hex((const uint8_t*)seed,strlen(seed),digest)==0,"deterministic log id");
+    snprintf(id,sizeof(id),"ev_installer_%s",digest);
+    cJSON *journal=cJSON_Parse(success_journal);require_true(journal!=NULL,"journal fixture parse");
+    cJSON_ReplaceItemInObjectCaseSensitive(journal,"installer_log_evidence_id",cJSON_CreateString(id));
+    cJSON_ReplaceItemInObjectCaseSensitive(journal,"installer_log_file",cJSON_CreateString("agent-update-task-1-cmd-1-installer.log.redacted"));
+    char *serialized=cJSON_PrintUnformatted(journal);uint64_t bytes=0;
+    require_true(edr_agent_update_log_journal_authorized(&scope,serialized,id,"agent-update-task-1-cmd-1-installer.log.redacted",recovery.installer_log_sha256,&bytes)==0 && bytes==1234,"bound redacted log permitted");
+    require_true(edr_agent_update_log_journal_authorized(&scope,serialized,id,"other.redacted",recovery.installer_log_sha256,&bytes)==EDR_EGRESS_REQUEST_DENIED,"arbitrary same-hash path denied");
+    require_true(edr_agent_update_log_journal_authorized(&scope,serialized,"other-id","agent-update-task-1-cmd-1-installer.log.redacted",recovery.installer_log_sha256,&bytes)==EDR_EGRESS_REQUEST_DENIED,"unbound artifact id denied");
+    scope.task_id[0]='x';
+    require_true(edr_agent_update_log_journal_authorized(&scope,serialized,id,"agent-update-task-1-cmd-1-installer.log.redacted",recovery.installer_log_sha256,&bytes)==EDR_EGRESS_REQUEST_DENIED,"cross-task log denied");scope.task_id[0]='t';
+    free(serialized);cJSON_ReplaceItemInObjectCaseSensitive(journal,"installer_log_size",cJSON_CreateNumber(1048577));serialized=cJSON_PrintUnformatted(journal);
+    require_true(edr_agent_update_log_journal_authorized(&scope,serialized,id,"agent-update-task-1-cmd-1-installer.log.redacted",recovery.installer_log_sha256,&bytes)==EDR_EGRESS_REQUEST_DENIED,"oversize redacted log denied");
+    free(serialized);cJSON_Delete(journal);
+  }
   const char *runtime_bundle_success_journal =
       "{\"schema_version\":2,\"task_id\":\"task-1\",\"command_id\":\"cmd-1\","
       "\"operation\":\"upgrade\",\"artifact_id\":\"artifact-1\","

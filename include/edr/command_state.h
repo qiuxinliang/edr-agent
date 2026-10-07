@@ -2,6 +2,7 @@
 #define EDR_COMMAND_STATE_H
 
 #include "edr/command.h"
+#include "edr/egress_request_policy.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -22,6 +23,8 @@ typedef struct EdrCommandStateRecord {
   int retry_count;
   int final_record;
   int report_pending;
+  int report_policy_held;
+  char report_policy_version[64];
   uint32_t report_attempts;
   int64_t report_last_failure_unix_ms;
   int64_t report_next_retry_unix_ms;
@@ -93,6 +96,9 @@ enum {
   EDR_COMMAND_STATE_CANCEL_ALREADY_FINAL = 2,
 };
 
+/* Read-only duplicate check before any terminal-producing admission failure.
+ * 1=existing terminal, 0=absent, -1=unreadable protected state. */
+int edr_command_state_has_final(const char *command_id,const EdrSoarCommandMeta *meta);
 int edr_command_state_begin(const char *command_id, const char *command_type,
                             const EdrSoarCommandMeta *meta, int *out_retry_count,
                             EdrCommandStateRecord *out_duplicate);
@@ -146,7 +152,8 @@ void edr_command_state_delete_pending_ack(const char *command_id);
 void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats);
 
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
-/* Final egress guard: exact durable terminal bytes and admitted task scope. */
+/* Final egress guard: 1 exact durable terminal and task scope, 0 denied,
+ * EDR_EGRESS_AUTHORIZATION_EXPIRED or EDR_EGRESS_LOCAL_STATE_FAILURE. */
 int edr_command_state_result_authorized(const char *tenant_id, const char *endpoint_id,
                                         const void *body, size_t len);
 int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
@@ -155,6 +162,12 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
 int edr_command_state_mark_reported(const EdrCommandStateRecord *record);
 /* A permanent HTTP/API rejection is retained locally for audit but no longer
  * retried, preventing a malformed terminal result from amplifying traffic. */
+/* Verified external renewal command only; does not change execution or result
+ * bytes. 0=durable update, DENIED=scope/hash/replay mismatch, -5=local I/O. */
+int edr_command_state_renew_delivery(const char *renewal_id, const uint8_t *payload,
+    size_t payload_len, const EdrSoarCommandMeta *verified_meta);
+int edr_command_state_task_scope(const char *command_id, EdrEgressTaskScope *out);
+int edr_command_state_mark_report_held(const EdrCommandStateRecord *record, const char *error);
 int edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
                                            const char *error);
 void edr_command_state_compact_if_needed(void);

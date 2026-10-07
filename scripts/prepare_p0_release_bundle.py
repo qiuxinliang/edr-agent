@@ -319,6 +319,12 @@ def prepare_backend_bundle(agent_root: pathlib.Path, backend_config: pathlib.Pat
         ):
             _copy_stage_mirror(source, target)
 
+        staged_operation_c = stage_root / "edr-agent/src/preprocess/p0_operation_vectors.inc"
+        operation_cmd = [sys.executable, str(agent_root / "scripts/gen_p0_operation_vectors.py"),
+                         "--source", str(backend_config / "p0_operation_vectors.json"), "--out", str(staged_operation_c)]
+        run(operation_cmd, repo_root)
+        run([*operation_cmd, "--check"], repo_root)
+
         staged_matrix = stage_root / "edr-backend" / "platform" / "testdata" / "p0_validation_matrix_v1.json"
         staged_matrix_c = stage_root / "edr-agent" / "src" / "preprocess" / "p0_validation_matrix_data.inc"
         matrix_cmd = [
@@ -369,6 +375,7 @@ def prepare_backend_bundle(agent_root: pathlib.Path, backend_config: pathlib.Pat
             pathlib.Path("edr-agent/config/sensor_interest_manifest.json"),
             pathlib.Path("edr-backend/platform/testdata/p0_validation_matrix_v1.json"),
             pathlib.Path("edr-agent/src/preprocess/p0_validation_matrix_data.inc"),
+            pathlib.Path("edr-agent/src/preprocess/p0_operation_vectors.inc"),
             pathlib.Path("edr-agent/config/p0_rule_bundle_ir_v1.json.enc"),
             pathlib.Path("edr-backend/platform/config/p0_rule_bundle_ir_v1.json.enc"),
         ):

@@ -6,13 +6,22 @@
 #include <string.h>
 #include <errno.h>
 #include "edr/command_state.h"
+#include "edr/sha256.h"
+static size_t hashed_bytes;
+static const char *test_executable;
+static int policy_result;
+static void measured_hash(EdrSha256Ctx *ctx,const uint8_t *bytes,size_t n) {hashed_bytes+=n;edr_sha256_update(ctx,bytes,n);}
+int edr_egress_is_policy_hold(int rc) {return rc==-3||rc==-4||rc==-7;}
+int edr_egress_upload_preflight(const char *id,const char *upload,const char *path,const char *sha,uint64_t *size) {(void)id;(void)upload;(void)path;(void)sha;if(size)*size=24;return policy_result;}
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include <process.h>
 static void env(const char *key, const char *value) { _putenv_s(key, value); }
 #else
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 static void env(const char *key, const char *value) { setenv(key, value, 1); }
 #endif
 
@@ -58,7 +67,9 @@ static FILE *injected_fdopen(int fd, const char *mode) {
 #endif
 #define fflush injected_fflush
 #define fclose injected_fclose
+#define edr_sha256_update measured_hash
 #include "../src/command/command_upload_outbox.c"
+#undef edr_sha256_update
 #undef fflush
 #undef fclose
 #ifdef _WIN32
@@ -159,6 +170,7 @@ static void setup(const char *name) {
   snprintf(state, sizeof(state), "%s/state.jsonl", dir); env("EDR_COMMAND_STATE_DB", state);
   snprintf(inbox, sizeof(inbox), "%s/inbox", dir); env("EDR_COMMAND_INBOX_DIR", inbox);
   terminal_new = fail_terminal_receipt = 0;
+  policy_result=0;hashed_bytes=0;
   upload_calls = upload_fail = terminal_calls = terminal_fail = audits = 0;
 }
 static void pending_path(char *path, size_t cap, const char *id) {
@@ -341,7 +353,39 @@ static void test_hash_and_missing_terminal(void) {
   assert(edr_command_upload_outbox_flush_one(path, &attempted) == 0 && attempted == 0);
   assert(upload_calls == 0 && terminal_calls == 2 && !last_upload_ok && strstr(last_error, "missing"));
 }
-int main(void) {
+static void test_policy_hold_before_hash(void) {
+  setup("policy-held");char path[1200],before[8192],after[8192],hold[1250];int attempted=99;
+  assert(edr_command_queue_forensic_upload("cmd_hold","collect_forensic",&meta,bundle,sha,"builtin",0)==0);
+  pending_path(path,sizeof(path),"cmd_hold");contents(path,before,sizeof(before));
+  snprintf(hold,sizeof(hold),"%s.policy-held",path);policy_result=EDR_EGRESS_REQUEST_DENIED;hashed_bytes=0;
+  for(int i=0;i<3;i++)assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_REQUEST_DENIED && !attempted);
+  assert(hashed_bytes==0 && upload_calls==0 && terminal_calls==0 && exists(bundle) && exists(hold));
+  /* Drop all volatile counters and reopen durable state, as restart would. */
+  hashed_bytes=0;assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_REQUEST_DENIED);
+  contents(path,after,sizeof(after));assert(!strcmp(before,after) && hashed_bytes==0);
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,test_executable,test_executable,"--held-restart",path,NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(test_executable,test_executable,"--held-restart",path,(char*)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
+  policy_result=EDR_EGRESS_AUTHORIZATION_EXPIRED;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_AUTHORIZATION_EXPIRED && !attempted);
+  assert(remove(hold)==0);fail_flush=1;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_LOCAL_STATE_FAILURE && !attempted);
+  assert(!hashed_bytes && exists(path));
+  policy_result=0;upload_fail=1;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==-1 && attempted && hashed_bytes>0 && !exists(hold));
+  upload_fail=0;assert(edr_command_upload_outbox_flush_one(path,&attempted)==1 && !exists(path));
+}
+int main(int argc,char **argv) {
+  test_executable=argv[0];
+  if(argc==3 && !strcmp(argv[1],"--held-restart")) {
+    policy_result=EDR_EGRESS_REQUEST_DENIED;int attempted=99;
+    assert(edr_command_upload_outbox_flush_one(argv[2],&attempted)==EDR_EGRESS_REQUEST_DENIED);
+    assert(!attempted && !hashed_bytes && !upload_calls && !terminal_calls);return 0;
+  }
 #ifdef _WIN32
   char temp[MAX_PATH]; assert(GetTempPathA(sizeof(temp), temp));
   assert(GetTempFileNameA(temp, "euo", 0, root)); assert(DeleteFileA(root)); make_dir(root);
@@ -360,6 +404,7 @@ int main(void) {
 #endif
   strcpy(meta.idempotency_key, "idempotency|retained"); strcpy(meta.soar_correlation_id, "correlation");
   strcpy(meta.playbook_run_id, "run"); strcpy(meta.playbook_step_id, "step");
+  test_policy_hold_before_hash();
   test_enqueue_failures(); test_legacy_upgrade(); test_reopen_after_terminal_failure();
   test_rename_retry(); test_receipt_failure(); test_terminal_commit_before_receipt_failure();
   test_readable_terminal_is_not_a_durable_commit(); test_failure_receipt_survives_artifact_recovery();

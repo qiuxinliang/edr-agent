@@ -7,6 +7,7 @@
 #include "edr/transport_sink.h"
 #include "edr/transport_v2.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/report_events_ack.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -75,6 +76,7 @@ static int s_test_p0_deferred_commit_active;
 static int64_t s_test_p0_deferred_time = -1;
 static int64_t s_test_delivery_time = -1;
 static unsigned s_test_event_alloc_failures[2];
+static unsigned s_test_egress_allocation_failures;
 static unsigned s_test_source_owner_inventory_read_failures;
 
 /* SQLite invokes this synchronously during COMMIT. Returning nonzero makes
@@ -407,16 +409,17 @@ static int queue_logical_retained_bytes_locked(uint64_t *out) {
   uint64_t events;
   uint64_t terminals;
   uint64_t deferred;
-  uint64_t lineage;
+  uint64_t lineage, projections;
   if (!out || !queue_sql_sum_locked(event_sql, &events) ||
       !queue_sql_sum_locked(terminal_sql, &terminals) ||
       !queue_sql_sum_locked(deferred_sql, &deferred) ||
+      !queue_sql_sum_locked("SELECT COUNT(*)*512 FROM queue_projection_relations;", &projections) ||
       !queue_sql_sum_locked("SELECT CASE WHEN length(legacy_lineage)>0 THEN 2048 ELSE 0 END+"
                             "CASE WHEN length(last_recovery_snapshot)>0 THEN 2048 ELSE 0 END "
                             "FROM queue_meta WHERE id=1;", &lineage)) {
     return 0;
   }
-  *out = queue_add_bytes(queue_add_bytes(queue_add_bytes(events, terminals), deferred), lineage);
+  *out = queue_add_bytes(queue_add_bytes(queue_add_bytes(queue_add_bytes(events, terminals), deferred), lineage), projections);
   return *out != UINT64_MAX;
 }
 
@@ -544,9 +547,9 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
                             &out->legacy_owner_unacknowledged) ||
       !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='retained_unresolved';",
                             &out->retained_unresolved_rows) ||
-      !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_pending';",
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='pending';",
                             &out->projection_pending_rows) ||
-      !queue_sql_sum_locked("SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_acked';",
+      !queue_sql_sum_locked("SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='acked';",
                             &out->projection_acked_rows) ||
       !queue_pending_inventory_locked(&out->pending_rows, &out->oldest_pending_created_unix_s) ||
       !p0_deferred_inventory_locked(&out->p0_deferred_pending_rows,
@@ -1171,6 +1174,11 @@ static void cleanup_expired_rows(void) {
  * 返回：0 已处理一行（成功删除、丢弃坏行、或失败已 bump_retry），1 无待处理行，2 上传失败应停止本轮连续 drain
  */
 #ifdef EDR_STORAGE_QUEUE_TESTING
+/* Inject only the final gate's temporary allocation verdict. The unchanged
+ * queue transition below is shared with real preflight failures. */
+void edr_storage_queue_test_fail_egress_allocation(unsigned failures) {
+  queue_state_lock(); s_test_egress_allocation_failures=failures; queue_state_unlock();
+}
 void edr_storage_queue_test_fail_event_alloc(unsigned kind, unsigned failures) {
   queue_state_lock();
   if (kind < 2u) s_test_event_alloc_failures[kind] = failures;
@@ -1187,6 +1195,31 @@ static void *event_select_alloc(size_t size, unsigned kind) {
   (void)kind;
 #endif
   return malloc(size);
+}
+
+static int hold_selected_row_locked(sqlite3_int64 id,const char *batch_id,
+    const uint8_t *wire,int wire_len,const char *policy_reason) {
+  sqlite3_stmt *hold = NULL;
+  int held = 0;
+  int durable_started = queue_p0_latch_begin_durable_locked() == 0;
+  if (durable_started && sqlite3_prepare_v2(s_db,
+      "UPDATE event_queue SET status='policy_held',terminal_reason=?,terminal_at=? "
+      "WHERE id=? AND batch_id=? AND payload=? AND status='pending';",
+      -1, &hold, NULL) == SQLITE_OK) {
+    sqlite3_bind_text(hold, 1, policy_reason, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(hold, 2, (sqlite3_int64)time(NULL));
+    sqlite3_bind_int64(hold, 3, id);
+    sqlite3_bind_text(hold, 4, batch_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(hold, 5, wire, wire_len, SQLITE_TRANSIENT);
+    held = sqlite3_step(hold) == SQLITE_DONE && sqlite3_changes(s_db) == 1;
+  }
+  sqlite3_finalize(hold);
+  if (durable_started) {
+    if (held) held = queue_p0_latch_end_durable_locked(1) == 0;
+    else (void)queue_p0_latch_end_durable_locked(0);
+  }
+  if (held) { if (s_pending) s_pending--; s_delivery_failed++; }
+  return held;
 }
 
 static int drain_one_row(void) {
@@ -1348,28 +1381,23 @@ static int drain_one_row(void) {
 
   {
     char policy_reason[96];
-    if (!edr_egress_batch_validate(b, 12u, b + 12u, (size_t)blob_len - 12u,
-                                 policy_reason, sizeof(policy_reason))) {
-      sqlite3_stmt *hold = NULL;
-      int held = 0;
-      int durable_started = queue_p0_latch_begin_durable_locked() == 0;
-      if (durable_started && sqlite3_prepare_v2(s_db,
-          "UPDATE event_queue SET status='policy_held',terminal_reason=?,terminal_at=? "
-          "WHERE id=? AND batch_id=? AND payload=? AND status='pending';",
-          -1, &hold, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(hold, 1, policy_reason, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(hold, 2, (sqlite3_int64)time(NULL));
-        sqlite3_bind_int64(hold, 3, id);
-        sqlite3_bind_text(hold, 4, batch_id_copy, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_blob(hold, 5, blob_copy, blob_len, SQLITE_TRANSIENT);
-        held = sqlite3_step(hold) == SQLITE_DONE && sqlite3_changes(s_db) == 1;
+    int policy_valid;
+#ifdef EDR_STORAGE_QUEUE_TESTING
+    if (s_test_egress_allocation_failures) {
+      --s_test_egress_allocation_failures;
+      snprintf(policy_reason,sizeof(policy_reason),"egress_validation_allocation_failed");
+      policy_valid=0;
+    } else
+#endif
+    policy_valid=edr_egress_batch_validate(b, 12u, b + 12u, (size_t)blob_len - 12u,
+                                         policy_reason, sizeof(policy_reason));
+    if (!policy_valid) {
+      if (!strcmp(policy_reason,"rule_projection_authority_unavailable") ||
+          !strcmp(policy_reason,"egress_validation_allocation_failed")) {
+        s_delivery_resource_deferred++; s_delivery_requeued++;
+        free(batch_id_copy); free(blob_copy); queue_state_unlock(); return 2;
       }
-      sqlite3_finalize(hold);
-      if (durable_started) {
-        if (held) held = queue_p0_latch_end_durable_locked(1) == 0;
-        else (void)queue_p0_latch_end_durable_locked(0);
-      }
-      if (held) { if (s_pending) s_pending--; s_delivery_failed++; }
+      int held=hold_selected_row_locked(id,batch_id_copy,blob_copy,blob_len,policy_reason);
       free(batch_id_copy); free(blob_copy); queue_state_unlock();
       return held ? 0 : 2;
     }
@@ -1407,6 +1435,16 @@ static int drain_one_row(void) {
     attempted = 1;
     send = edr_transport_v2_report_events(batch_id_copy, b, 12u, b + 12,
                                           (size_t)blob_len - 12u);
+  }
+  if (send == EDR_REPORT_EVENTS_POLICY_HELD) {
+    int held=0;
+    queue_state_lock();
+    if (s_db==selected_db && s_db_generation==selected_generation)
+      held=hold_selected_row_locked(id,batch_id_copy,blob_copy,blob_len,
+          "server_evidence_projection_unproven");
+    queue_state_unlock();
+    free(batch_id_copy); free(blob_copy);
+    return held ? 0 : 2;
   }
   if (send == 0) {
     int acknowledged = 0;
@@ -2622,8 +2660,35 @@ static int queue_recovery_metadata_ensure_locked(void) {
                                          "TEXT NOT NULL DEFAULT ''") != 0) return -1;
   if (queue_ensure_metadata_column_locked("queue_meta","last_recovery_owner",
                                          "TEXT NOT NULL DEFAULT ''") != 0) return -1;
-  return queue_ensure_metadata_column_locked("queue_meta","last_recovery_snapshot",
-                                             "TEXT NOT NULL DEFAULT ''");
+  if (queue_ensure_metadata_column_locked("queue_meta","last_recovery_snapshot",
+                                          "TEXT NOT NULL DEFAULT ''") != 0) return -1;
+  /* One relation per immutable projection. The legacy pointer remains a
+   * compatibility witness; it must never be overwritten by a newer version.
+   * Backfill only an existing committed relation, never fabricate an ACK. */
+  const char *sql =
+    "CREATE TABLE IF NOT EXISTS queue_projection_relations ("
+    "origin_row_id INTEGER NOT NULL,projector_version TEXT NOT NULL,"
+    "batch_id TEXT NOT NULL UNIQUE,payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),"
+    "receipt_state TEXT NOT NULL CHECK(receipt_state IN ('pending','acked')),"
+    "created_at INTEGER NOT NULL,acked_at INTEGER NOT NULL DEFAULT 0,"
+    "PRIMARY KEY(origin_row_id,projector_version),"
+    "FOREIGN KEY(origin_row_id) REFERENCES event_queue(id) ON DELETE RESTRICT);"
+    "INSERT INTO queue_projection_relations(origin_row_id,projector_version,batch_id,payload_sha256,"
+    "receipt_state,created_at,acked_at) "
+    "SELECT id,projector_version,projection_batch_id,projection_sha256,"
+    "CASE WHEN recovery_state='projection_acked' THEN 'acked' ELSE 'pending' END,terminal_at,0 "
+    "FROM event_queue WHERE recovery_version=1 AND origin_row_id=0 "
+    "AND projection_batch_id<>'' AND projector_version<>'' AND length(projection_sha256)=64 "
+    "ON CONFLICT(origin_row_id,projector_version) DO NOTHING;";
+  if (exec_simple(s_db,sql)!=SQLITE_OK) return -1;
+  sqlite3_stmt *check=NULL;
+  if (sqlite3_prepare_v2(s_db,"SELECT COUNT(*) FROM event_queue o "
+      "LEFT JOIN queue_projection_relations p ON p.origin_row_id=o.id AND p.projector_version=o.projector_version "
+      "WHERE o.projection_batch_id<>'' AND (p.batch_id IS NULL OR p.batch_id<>o.projection_batch_id "
+      "OR p.payload_sha256<>o.projection_sha256);",-1,&check,NULL)!=SQLITE_OK) return -1;
+  int rc=sqlite3_step(check);
+  int valid=rc==SQLITE_ROW && sqlite3_column_int64(check,0)==0;
+  sqlite3_finalize(check); return valid?0:-1;
 }
 
 EdrError edr_storage_queue_open(const char *path) {
@@ -5134,9 +5199,17 @@ static int recovery_projection_origin_valid_locked(sqlite3_int64 origin_id,const
                                                     const uint8_t *wire,size_t wire_len) {
   char received_sha[65],actual_sha[65]; sqlite3_stmt *st=NULL;
   edr_sha256_hex(wire,wire_len,received_sha);
-  if (sqlite3_prepare_v2(s_db,"SELECT payload,original_sha256 FROM event_queue WHERE id=? "
-      "AND recovery_version=1 AND recovery_state='projection_pending' AND projection_batch_id=? "
-      "AND projection_sha256=? AND status='local_evidence';",-1,&st,NULL)!=SQLITE_OK) return -1;
+  /* Read-only maintenance must also understand an unmigrated v1 database. */
+  int relations=recovery_column_present("queue_projection_relations","origin_row_id");
+  if (relations<0) return -1;
+  const char *query=relations ?
+    "SELECT o.payload,o.original_sha256 FROM event_queue o JOIN queue_projection_relations p "
+    "ON p.origin_row_id=o.id WHERE o.id=? AND o.recovery_version=1 AND p.batch_id=? "
+    "AND p.payload_sha256=? AND p.receipt_state='pending' AND o.status='local_evidence';" :
+    "SELECT payload,original_sha256 FROM event_queue WHERE id=? "
+    "AND recovery_version=1 AND recovery_state='projection_pending' AND projection_batch_id=? "
+    "AND projection_sha256=? AND status='local_evidence';";
+  if (sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK) return -1;
   sqlite3_bind_int64(st,1,origin_id); sqlite3_bind_text(st,2,batch_id,-1,SQLITE_TRANSIENT);
   sqlite3_bind_text(st,3,received_sha,-1,SQLITE_TRANSIENT);
   int rc=sqlite3_step(st); const uint8_t *original=rc==SQLITE_ROW ? sqlite3_column_blob(st,0) : NULL;
@@ -5151,13 +5224,21 @@ static int recovery_projection_ack_locked(sqlite3_int64 origin_id,const char *ba
   if (recovery_projection_origin_valid_locked(origin_id,batch_id,wire,wire_len)!=1) return -1;
   char received_sha[65]; sqlite3_stmt *st=NULL; int rc;
   edr_sha256_hex(wire,wire_len,received_sha);
+  if (sqlite3_prepare_v2(s_db,"UPDATE queue_projection_relations SET receipt_state='acked',acked_at=? "
+      "WHERE origin_row_id=? AND receipt_state='pending' AND batch_id=? "
+      "AND payload_sha256=?;",-1,&st,NULL)!=SQLITE_OK) return -1;
+  sqlite3_bind_int64(st,1,delivery_time()); sqlite3_bind_int64(st,2,origin_id);
+  sqlite3_bind_text(st,3,batch_id,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,4,received_sha,-1,SQLITE_TRANSIENT);
+  rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st);
+  if (rc!=SQLITE_DONE || changed!=1) return -1;
+  /* Only the exact legacy child changes its compatibility status. A v2 ACK
+   * neither acknowledges the v1 child nor clears the independent health latch. */
   if (sqlite3_prepare_v2(s_db,"UPDATE event_queue SET recovery_state='projection_acked' "
-      "WHERE id=? AND recovery_state='projection_pending' AND projection_batch_id=? "
-      "AND projection_sha256=?;",-1,&st,NULL)!=SQLITE_OK) return -1;
+      "WHERE id=? AND projection_batch_id=? AND projection_sha256=?;",-1,&st,NULL)!=SQLITE_OK) return -1;
   sqlite3_bind_int64(st,1,origin_id); sqlite3_bind_text(st,2,batch_id,-1,SQLITE_TRANSIENT);
   sqlite3_bind_text(st,3,received_sha,-1,SQLITE_TRANSIENT);
-  rc=sqlite3_step(st); int changed=sqlite3_changes(s_db); sqlite3_finalize(st);
-  return rc==SQLITE_DONE && changed==1 ? 0 : -1;
+  rc=sqlite3_step(st); sqlite3_finalize(st); return rc==SQLITE_DONE?0:-1;
 }
 
 #ifdef EDR_STORAGE_QUEUE_TESTING
@@ -5261,10 +5342,20 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
   recovery_hash_text(&inventory,old.recovery_event_id); recovery_hash_text(&inventory,old.recovery_batch_id);
   recovery_hash_text(&inventory,bound_sha); recovery_hash_text(&inventory,lineage);
   int recovery_columns=recovery_column_present("event_queue","recovery_version");
-  const char *query=recovery_columns==1 ?
+  int projection_relations=recovery_column_present("queue_projection_relations","origin_row_id");
+  if (projection_relations<0) goto read_failed;
+  const char *query=recovery_columns==1 && projection_relations ?
+    "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,"
+    "recovery_version,original_sha256,recovery_state FROM event_queue o "
+    "WHERE origin_row_id=0 AND (recovery_version=0 OR recovery_state='retained_unresolved' OR "
+    "(recovery_version=1 AND projector_version<>?4 AND projection_batch_id<>'' AND NOT EXISTS "
+    "(SELECT 1 FROM queue_projection_relations p WHERE p.origin_row_id=o.id AND p.projector_version=?4))) "
+    "AND (id>?3 OR batch_id=?1) AND (status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
+    "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;" : recovery_columns==1 ?
     "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,"
     "recovery_version,original_sha256,recovery_state FROM event_queue "
-    "WHERE (recovery_version=0 OR recovery_state='retained_unresolved') AND origin_row_id=0 "
+    "WHERE (recovery_version=0 OR recovery_state='retained_unresolved' OR "
+    "(recovery_version=1 AND projector_version<>?4 AND projection_batch_id<>'')) AND origin_row_id=0 "
     "AND (id>?3 OR batch_id=?1) AND "
     "(status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
     "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;" :
@@ -5275,7 +5366,9 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
   if (recovery_columns<0 || sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
   sqlite3_bind_text(st,1,old.recovery_batch_id,-1,SQLITE_TRANSIENT);
   sqlite3_bind_int(st,2,(int)request->max_batches);
-  sqlite3_bind_int64(st,3,(sqlite3_int64)request->after_row_id); int rc;
+  sqlite3_bind_int64(st,3,(sqlite3_int64)request->after_row_id);
+  if (recovery_columns==1) sqlite3_bind_text(st,4,EDR_EGRESS_PROJECTOR_VERSION,-1,SQLITE_STATIC);
+  int rc;
   report->last_event_row_id=request->after_row_id;
   while ((rc=sqlite3_step(st))==SQLITE_ROW) {
     if (recovery_add_row(st,-1,&batches[count],&total,&inventory)!=0) goto read_failed;
@@ -5285,7 +5378,12 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
   }
   sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto read_failed;
   if (recovery_columns==1 && count<request->max_batches) {
-    const char *resume_query="SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
+    const char *resume_query=projection_relations ?
+      "SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
+      "q.retry_count,q.terminal_reason,q.recovery_version,p.payload_sha256,q.recovery_state,q.origin_row_id "
+      "FROM event_queue q JOIN queue_projection_relations p ON p.origin_row_id=q.origin_row_id AND p.batch_id=q.batch_id "
+      "WHERE q.origin_row_id>0 AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
+      "ORDER BY q.id LIMIT ?2;" : "SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
       "q.retry_count,q.terminal_reason,q.recovery_version,o.projection_sha256,q.recovery_state,q.origin_row_id "
       "FROM event_queue q JOIN event_queue o ON o.id=q.origin_row_id "
       "WHERE q.origin_row_id>0 AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
@@ -5371,7 +5469,7 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
     if (!batches[i].previous_recovery_version) incoming=queue_add_bytes(incoming,512);
     if (batches[i].understood && batches[i].frames)
       incoming=queue_add_bytes(incoming,queue_event_live_cost("min-v1-0000000000000000000000000000000000000000000000000000000000000000",
-        batches[i].projection_len)+512);
+        batches[i].projection_len)+1024);
   }
   uint64_t used;
   if (!queue_logical_retained_bytes_locked(&used) || incoming>s_max_db_bytes ||
@@ -5412,11 +5510,13 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
     if (b->understood && b->frames) {
       edr_sha256_hex(b->projection,b->projection_len,projection_sha);
       EdrSha256Ctx identity; uint8_t id_digest[32]; char id_hex[65]; edr_sha256_init(&identity);
-      recovery_hash_text(&identity,"historical-alert-projection-v1"); recovery_hash_number(&identity,(uint64_t)b->id);
+      recovery_hash_text(&identity,"historical-alert-projection");
+      recovery_hash_text(&identity,EDR_EGRESS_PROJECTOR_VERSION);
+      recovery_hash_number(&identity,(uint64_t)b->id);
       edr_sha256_update(&identity,old.nonce,16); recovery_hash_text(&identity,b->original_sha);
       recovery_hash_text(&identity,projection_sha); recovery_hash_text(&identity,request->tenant_id);
       recovery_hash_text(&identity,request->endpoint_id); edr_sha256_final(&identity,id_digest);
-      recovery_hex(id_digest,32,id_hex); snprintf(projection_id,sizeof(projection_id),"min-v1-%s",id_hex);
+      recovery_hex(id_digest,32,id_hex); snprintf(projection_id,sizeof(projection_id),"min-v2-%s",id_hex);
       if (!strcmp(projection_id,b->batch_id)) goto write_failed;
       if (sqlite3_prepare_v2(s_db,"INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,"
           "status,recovery_version,origin_row_id) VALUES(?,?,?,0,1,'pending',1,?);",-1,&st,NULL)!=SQLITE_OK)
@@ -5425,13 +5525,23 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
       sqlite3_bind_blob(st,2,b->projection,(int)b->projection_len,SQLITE_TRANSIENT);
       sqlite3_bind_int64(st,3,(sqlite3_int64)time(NULL)); sqlite3_bind_int64(st,4,b->id);
       rc=sqlite3_step(st); sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto write_failed;
+      if (sqlite3_prepare_v2(s_db,"INSERT INTO queue_projection_relations(origin_row_id,projector_version,"
+          "batch_id,payload_sha256,receipt_state,created_at) VALUES(?,?,?,?,'pending',?);",-1,&st,NULL)!=SQLITE_OK)
+        goto write_failed;
+      sqlite3_bind_int64(st,1,b->id); sqlite3_bind_text(st,2,EDR_EGRESS_PROJECTOR_VERSION,-1,SQLITE_STATIC);
+      sqlite3_bind_text(st,3,projection_id,-1,SQLITE_TRANSIENT);
+      sqlite3_bind_text(st,4,projection_sha,-1,SQLITE_TRANSIENT);
+      sqlite3_bind_int64(st,5,(sqlite3_int64)time(NULL));
+      rc=sqlite3_step(st); sqlite3_finalize(st); st=NULL; if (rc!=SQLITE_DONE) goto write_failed;
     }
     if (sqlite3_prepare_v2(s_db,"UPDATE event_queue SET status='local_evidence',recovery_version=1,"
-        "original_sha256=?,projection_batch_id=?,projection_sha256=?,recovery_state=?,terminal_reason=?,"
-        "terminal_at=?,projector_version='" EDR_EGRESS_PROJECTOR_VERSION "' "
+        "original_sha256=?,projection_batch_id=CASE WHEN projection_batch_id='' THEN ? ELSE projection_batch_id END,"
+        "projection_sha256=CASE WHEN projection_batch_id='' THEN ? ELSE projection_sha256 END,"
+        "recovery_state=CASE WHEN projection_batch_id='' THEN ? ELSE recovery_state END,terminal_reason=?,"
+        "terminal_at=?,projector_version=CASE WHEN projection_batch_id='' THEN '" EDR_EGRESS_PROJECTOR_VERSION "' ELSE projector_version END "
         "WHERE id=? AND batch_id=? AND payload=? "
         "AND recovery_version=? AND (recovery_version=0 OR "
-        "(original_sha256=? AND recovery_state='retained_unresolved'));",-1,&st,NULL)!=SQLITE_OK)
+        "(original_sha256=? AND (recovery_state='retained_unresolved' OR projector_version<>'" EDR_EGRESS_PROJECTOR_VERSION "')));",-1,&st,NULL)!=SQLITE_OK)
       goto write_failed;
     sqlite3_bind_text(st,1,b->original_sha,-1,SQLITE_TRANSIENT);
     sqlite3_bind_text(st,2,projection_id,-1,SQLITE_TRANSIENT);

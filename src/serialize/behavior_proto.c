@@ -8,6 +8,7 @@
 
 #include "edr/v1/event.pb.h"
 #include <pb_encode.h>
+#include "cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -559,6 +560,11 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
                               r->source_completeness, sizeof(r->source_completeness), &transport,
                               "source_completeness");
   msg->evidence_revision = r->evidence_revision;
+  msg->evidence_projection_version = r->evidence_projection_version;
+  msg->required_evidence_fields = r->required_evidence_fields;
+  msg->has_tactic_probs_computed = r->tactic_probability_state != 0;
+  msg->tactic_probs_computed = r->tactic_probability_state == 2;
+  copy_str(msg->operation_evidence_json,sizeof(msg->operation_evidence_json),r->operation_evidence);
   copy_str(msg->parent_resolution_status, sizeof(msg->parent_resolution_status),
            r->parent_resolution_status);
   copy_str(msg->parent_resolution_source, sizeof(msg->parent_resolution_source),
@@ -628,6 +634,12 @@ static void fill_behavior_alert_event_fields(edr_v1_BehaviorEvent *msg,
 
 static void fill_behavior_alert_fields(edr_v1_BehaviorEvent *msg, const AVEBehaviorAlert *a) {
   msg->has_behavior_alert = true;
+  /* Owner explicitly declares calculation state; never infer it from zeros. */
+  cJSON *subject=cJSON_Parse(a->user_subject_json);
+  const cJSON *basis=cJSON_GetObjectItemCaseSensitive(subject,"evaluation_basis");
+  const cJSON *computed=cJSON_GetObjectItemCaseSensitive(basis,"tactic_probs_computed");
+  if (cJSON_IsBool(computed)) {msg->has_tactic_probs_computed=true;msg->tactic_probs_computed=cJSON_IsTrue(computed);}
+  cJSON_Delete(subject);
   msg->behavior_alert.anomaly_score = a->anomaly_score;
   msg->behavior_alert.tactic_probs_count = 14;
   for (int i = 0; i < 14; i++) {
@@ -701,6 +713,16 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   if (!msg) return 0;
   fill_behavior_record_event_fields(msg, r);
   if (alert) fill_behavior_alert_fields(msg, alert);
+  if (!outbound) {
+    /* Local facts and exact terminal journals use their existing full wire
+     * contract. They are not a minimized v2 frame, even when derived from an
+     * authorized match; journal bytes retain their original receipt identity. */
+    msg->evidence_projection_version=0;
+    msg->required_evidence_fields=0;
+    msg->operation_evidence_json[0]=0;
+    msg->has_tactic_probs_computed=false;
+    msg->tactic_probs_computed=false;
+  }
   if (command) {
     copy_str(msg->cmdline, sizeof(msg->cmdline), command);
     resolve_wire_omission(msg, "source.cmdline");

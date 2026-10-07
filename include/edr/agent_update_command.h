@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "edr/egress_request_policy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,6 +105,13 @@ int edr_agent_update_probe_full_installer_baseline(
     const char *installation_directory, char *reason, size_t reason_cap);
 int edr_agent_update_resolve_script_path(char *out, size_t out_cap);
 int edr_agent_update_create_directories(const char *path);
+/* Upgrade-specific file permission, tied to the durable journal, never caller
+ * supplied identifiers alone. Transport independently verifies the file bytes. */
+int edr_agent_update_log_journal_authorized(const EdrEgressTaskScope *scope,
+    const char *journal_json, const char *upload_id, const char *basename,
+    const char *sha256, uint64_t *expected_size);
+int edr_agent_update_log_authorized(const EdrEgressTaskScope *scope,
+    const char *upload_id, const char *path, const char *sha256, uint64_t *expected_size);
 int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
                              size_t payload_len, char *detail, size_t detail_cap);
 int edr_agent_update_recover(const char *command_id, const uint8_t *payload,

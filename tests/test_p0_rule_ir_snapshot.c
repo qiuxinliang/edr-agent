@@ -188,7 +188,7 @@ static int registry_candidate_contract(const char *dst, const char *active, cons
     } else if (i == negative_count + 1u) {
       snprintf(condition, sizeof(condition), "{\"registry_path_regex_any\":[\"a\"],\"registry_value_data_in\":[\"0\"]}");
       schema = 2u;
-      expect_valid = 1;
+      expect_valid = 0; /* IR5 requires explicit effect and disallows downgrade. */
     } else if (i == negative_count + 2u) {
       snprintf(condition, sizeof(condition), "{\"registry_dword_any\":[%s]}", branch);
       expect_valid = 1;
@@ -206,7 +206,7 @@ static int registry_candidate_contract(const char *dst, const char *active, cons
       "\"rules_bundle_version\":\"registry-contract\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
-      "\"rules\":[{\"id\":\"registry\",\"event_type\":\"registry_set\",\"condition\":%s}]}", schema, condition);
+      "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"registry\",\"event_type\":\"registry_set\",\"condition\":%s}]}", schema, condition);
     int fd = mkstemp(path);
     if (fd < 0) return 0;
     int wrote = write_all(fd, json);
@@ -229,11 +229,11 @@ int main(void) {
   int staged_fd = -1, dst_fd = -1, bad_fd = -1;
   const char *failed_stage = "initialization";
   const char *cases[] = { "EDR1wrong-key-material", "EDR1",
-    "{\"rules\":[{\"id\":\"sem\",\"event_type\":\"process_create\",\"condition\":{}}]}",
-    "{\"rules\":[{\"id\":\"pcre\",\"event_type\":\"process_create\",\"condition\":{\"command_regex_any\":[\"[\"]}}]}",
-    "{\"rules\":[{\"id\":\"net-unsupported\",\"event_type\":\"network_connect\",\"condition\":{\"remote_port_in\":[1080],\"command_regex_any\":[\"(?i)x\"]}}]}",
-    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":5,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
-    "{\"kind\":\"wrong_ir_kind\",\"ir_schema_version\":3,\"rules_bundle_version\":\"wrong-kind\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"id\":\"kind\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}" };
+    "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"sem\",\"event_type\":\"process_create\",\"condition\":{}}]}",
+    "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"pcre\",\"event_type\":\"process_create\",\"condition\":{\"command_regex_any\":[\"[\"]}}]}",
+    "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"net-unsupported\",\"event_type\":\"network_connect\",\"condition\":{\"remote_port_in\":[1080],\"command_regex_any\":[\"(?i)x\"]}}]}",
+    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":6,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"effect\":\"security_alert\",\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
+    "{\"kind\":\"wrong_ir_kind\",\"ir_schema_version\":3,\"rules_bundle_version\":\"wrong-kind\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"effect\":\"security_alert\",\"id\":\"kind\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}" };
   if (!source || !source[0] || snprintf(source_path, sizeof(source_path), "%s", source) >= (int)sizeof(source_path)) {
     fprintf(stderr, "snapshot test missing EDR_P0_IR_PATH\n"); return 1;
   }
@@ -264,6 +264,15 @@ int main(void) {
   failed_stage = "install valid staged bundle";
   if (!copy_file(source, staged) || !edr_p0_rule_ir_install_staged_bundle(staged, dst) || !files_equal(source, dst) ||
       !active_sha(installed_sha) || strcmp(before_sha, installed_sha) != 0) goto fail;
+  /* Establish both immutable purpose envelopes before injecting failures
+   * into the artifact replacement journal. Their separate creation barrier
+   * must not shift these intentionally journal-specific fsync positions. */
+  snprintf(staged,sizeof(staged),"%s",staged_template);
+  staged_fd=mkstemp(staged);if(staged_fd<0)goto fail;close(staged_fd);staged_fd=-1;
+  if(!copy_file(source,staged) || !append_space(staged) || !edr_p0_rule_ir_install_staged_bundle(staged,dst))goto fail;
+  snprintf(staged,sizeof(staged),"%s",staged_template);
+  staged_fd=mkstemp(staged);if(staged_fd<0)goto fail;close(staged_fd);staged_fd=-1;
+  if(!copy_file(source,staged) || !edr_p0_rule_ir_install_staged_bundle(staged,dst) || !files_equal(source,dst))goto fail;
   /* A failure after the staged file is renamed must restore the previous
    * durable bytes and leave the active snapshot untouched.  Whitespace makes
    * the staged plaintext SHA distinct while retaining valid JSON. */
@@ -307,11 +316,11 @@ int main(void) {
   snprintf(bad, sizeof(bad), "%s", bad_template);
   bad_fd = mkstemp(bad); if (bad_fd < 0 || !write_all(
       bad_fd,
-      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":3,"
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":5,"
       "\"rules_bundle_version\":\"snapshot-test-v1\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
-      "\"rules\":[{\"id\":\"net-name\",\"title\":\"net name\",\"mitre_ttps\":[\"T1090\"],"
+      "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"net-name\",\"title\":\"net name\",\"mitre_ttps\":[\"T1090\"],"
       "\"event_type\":\"network_connect\",\"condition\":{\"process_name_in\":[\"tool.exe\"],\"remote_port_in\":[1080]}}]}")) goto fail;
   close(bad_fd); bad_fd = -1;
   failed_stage = "validate non-install candidate";

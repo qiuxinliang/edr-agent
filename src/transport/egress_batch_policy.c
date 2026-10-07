@@ -3,6 +3,7 @@
 #include "edr/p0_terminal_identity.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
+#include "edr/evidence_projection.h"
 #include "edr/v1/event.pb.h"
 #include "cJSON.h"
 #include <pb_common.h>
@@ -36,6 +37,13 @@ static _Atomic(EdrEgressPmfeReceiptHandler) pmfe_queue_removed_handler;
 static _Atomic(void*) pmfe_queue_removed_user;
 static _Atomic(EdrEgressP0PairValidator) p0_pair_validator;
 static _Atomic(void*) p0_pair_user;
+static _Atomic(EdrEgressRuleProjectionValidator) rule_projection_validator;
+static _Atomic(void*) rule_projection_user;
+void edr_egress_set_rule_projection_validator(EdrEgressRuleProjectionValidator validator,void *user) {
+  if (!validator) { atomic_store_explicit(&rule_projection_validator,NULL,memory_order_release);return; }
+  atomic_store_explicit(&rule_projection_user,user,memory_order_relaxed);
+  atomic_store_explicit(&rule_projection_validator,validator,memory_order_release);
+}
 void edr_egress_set_pmfe_association_validator(
     EdrEgressPmfeAssociationValidator validator, void *user) {
   if (!validator) { atomic_store_explicit(&pmfe_validator,NULL,memory_order_release); return; }
@@ -217,7 +225,7 @@ static const JsonField p0_journal_subject_fields[]={E("subject_type",32,"edr_dyn
   S("rule_id",128),S("rules_bundle_version",255),S("rules_bundle_sha256",64),S("display_title",384),
   O("context",p0_journal_subject_context_fields),O("enforcement",p0_journal_enforcement_fields),END};
 static const JsonField ave_basis_fields[]={E("schema",64,"agent_detection_basis_v1"),
-  E("owner",48,"ave_behavior_pipeline"),B("predicate_matched"),B("threshold_met"),
+  E("owner",48,"ave_behavior_pipeline"),B("predicate_matched"),B("tactic_probs_computed"),B("threshold_met"),
   U("pid"),D("timestamp_ns"),F("threshold"),U("event_count"),U("behavior_flags"),
   {"last_event_type",JS_UINT,13,NULL,NULL},END};
 static const JsonField actor_json_fields[]={U("pid"),U("parent_pid"),END};
@@ -244,7 +252,7 @@ static const JsonField ave_context_fields[]={E("engine",32,"ave|pmfe|shellcode|w
 static const JsonField ave_fields[]={E("subject_type",32,"detection_context"),
   O("evaluation_basis",ave_basis_fields),O("detection_context",ave_context_fields),END};
 static const JsonField correlation_basis_fields[]={E("schema",64,"agent_detection_basis_v1"),
-  E("owner",48,"correlation_engine"),B("predicate_matched"),U("pid"),D("timestamp_ns"),
+  E("owner",48,"correlation_engine"),B("tactic_probs_computed"),B("predicate_matched"),U("pid"),D("timestamp_ns"),
   E("kind",16,"sequence|threshold"),U("threshold"),U("matched_count"),U("window_ms"),B("ordered"),END};
 static const JsonField chain_fields[]={U("type"),U("pid"),D("event_time_ns"),S("detail",80),END};
 static const JsonField correlation_fields[]={E("subject_type",32,"edr_correlation"),
@@ -252,7 +260,7 @@ static const JsonField correlation_fields[]={E("subject_type",32,"edr_correlatio
   O("evaluation_basis",correlation_basis_fields),U("window_ms"),U("count"),U("distinct"),
   A("evidence_chain",32,chain_fields),END};
 static const JsonField fanout_basis_fields[]={E("schema",64,"agent_detection_basis_v1"),
-  E("owner",48,"net_fanout_detector"),B("predicate_matched"),U("pid"),D("timestamp_ns"),
+  E("owner",48,"net_fanout_detector"),B("tactic_probs_computed"),B("predicate_matched"),U("pid"),D("timestamp_ns"),
   U("threshold"),U("distinct_ips"),U("window_s"),P("dport"),S("source_event_id",255),END};
 static const JsonField fanout_fields[]={E("subject_type",32,"net_fanout"),
   O("evaluation_basis",fanout_basis_fields),END};
@@ -577,6 +585,104 @@ static void project_supplemental_identity(edr_v1_BehaviorEvent *ev) {
   ev->creator_username[0]=ev->creator_domain[0]=ev->creator_sid[0]=ev->creator_logon_id[0]=0;
   ev->identity_source[0]=ev->identity_quality[0]=0;
 }
+/* These are finite purpose profiles, not authorization inferred from a field
+ * name. Dynamic masks originate in the held IR snapshot; the final byte gate
+ * enforces that contract independently of the currently active rule bundle. */
+static int operation_evidence_valid(const edr_v1_BehaviorEvent *ev) {
+  if (!(ev->required_evidence_fields & EDR_EVIDENCE_OPERATION)) return !ev->operation_evidence_json[0];
+  if (ev->required_evidence_fields & (EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_SCRIPT)) return 0;
+  if (!strcmp(ev->operation_evidence_json,"{\"kind\":\"credential_db_decrypt\",\"object_bound\":true,\"unprotect\":true}"))
+    return (ev->required_evidence_fields & EDR_EVIDENCE_FILE)!=0;
+  if (!strcmp(ev->operation_evidence_json,"{\"kind\":\"remote_hash_auth\",\"object_bound\":true,\"hash_argument_present\":true}"))
+    return (ev->required_evidence_fields & EDR_EVIDENCE_NETWORK)!=0;
+  return 0;
+}
+static int dynamic_context_purpose(cJSON *subject,uint64_t mask,int project) {
+  cJSON *ctx=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  static const struct {const char *name;uint64_t purpose;} conditional[]={
+    {"powershell_script_block",EDR_EVIDENCE_SCRIPT},
+    {"command_line_origin",EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_SCRIPT},
+    {"encoded_command_type",EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_SCRIPT},
+    {"registry_source",EDR_EVIDENCE_REGISTRY},
+    {"registry_attribution",EDR_EVIDENCE_REGISTRY},
+    {"registry_detail_status",EDR_EVIDENCE_REGISTRY},
+    {"registry_old_data",0} /* no current IR predicate consumes previous data */
+  };
+  for (size_t i=0;i<sizeof(conditional)/sizeof(conditional[0]);i++)
+    if (!(mask&conditional[i].purpose) && cJSON_GetObjectItemCaseSensitive(ctx,conditional[i].name)) {
+      if (!project) return 0;
+      cJSON_DeleteItemFromObjectCaseSensitive(ctx,conditional[i].name);
+    }
+  return 1;
+}
+static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
+  uint64_t mask=ev->required_evidence_fields;
+  char identity_source[sizeof(ev->identity_source)],identity_quality[sizeof(ev->identity_quality)];
+  memcpy(identity_source,ev->identity_source,sizeof(identity_source));
+  memcpy(identity_quality,ev->identity_quality,sizeof(identity_quality));
+  project_supplemental_identity(ev);
+  if (!(mask & EDR_EVIDENCE_USER)) ev->username[0]=0;
+  else {
+    memcpy(ev->identity_source,identity_source,sizeof(identity_source));
+    memcpy(ev->identity_quality,identity_quality,sizeof(identity_quality));
+  }
+  if (!(mask & EDR_EVIDENCE_COMMAND)) ev->cmdline[0]=0;
+  if (!(mask & EDR_EVIDENCE_CHAIN_DEPTH)) ev->process_chain_depth=0;
+  ev->parent_name[0]=ev->parent_path[0]=0;
+  edr_v1_ProcessContext *c=&ev->process_context;
+  ev->has_process_context=true; /* Authoritative even when intentionally empty. */
+  if (!(mask & EDR_EVIDENCE_PARENT_NAME)) {c->has_parent_name=false;c->parent_name[0]=0;}
+  if (!(mask & EDR_EVIDENCE_PARENT_PATH)) {c->has_parent_path=false;c->parent_path[0]=0;}
+  if (!(mask & EDR_EVIDENCE_PARENT_COMMAND)) {c->has_parent_cmdline=false;c->parent_cmdline[0]=0;}
+  if (!(mask & EDR_EVIDENCE_TOKEN)) {c->has_integrity_level=false;c->integrity_level[0]=0;c->has_token_elevation=false;c->token_elevation=0;}
+  c->has_current_directory=false;c->current_directory[0]=0;
+  c->has_process_creation_time=false;c->process_creation_time[0]=0;
+  c->has_grandparent_pid=false;c->grandparent_pid=0;
+  c->has_grandparent_name=false;c->grandparent_name[0]=0;
+  c->has_grandparent_path=false;c->grandparent_path[0]=0;
+  if (!(mask & (EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_CHAIN_DEPTH))) {
+    ev->ppid=0;ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+  }
+  int keep=(ev->which_detail==edr_v1_BehaviorEvent_file_tag && (mask&EDR_EVIDENCE_FILE)) ||
+    (ev->which_detail==edr_v1_BehaviorEvent_network_tag && (mask&EDR_EVIDENCE_NETWORK)) ||
+    (ev->which_detail==edr_v1_BehaviorEvent_registry_tag && (mask&EDR_EVIDENCE_REGISTRY)) ||
+    (ev->which_detail==edr_v1_BehaviorEvent_script_tag && (mask&EDR_EVIDENCE_SCRIPT)) ||
+    (ev->which_detail==edr_v1_BehaviorEvent_dns_tag && (mask&EDR_EVIDENCE_NETWORK));
+  if (!keep) {ev->which_detail=0;memset(&ev->detail,0,sizeof(ev->detail));}
+  if (ev->which_detail==edr_v1_BehaviorEvent_file_tag) {
+    ev->detail.file.file_size=0;ev->detail.file.target_has_motw=false;
+  }
+  if (ev->which_detail==edr_v1_BehaviorEvent_registry_tag && !(mask&EDR_EVIDENCE_REGISTRY_DATA))
+    ev->detail.registry.value_data[0]=0;
+  if (ev->which_detail==edr_v1_BehaviorEvent_network_tag) {
+    ev->detail.network.src_ip[0]=0;ev->detail.network.src_port=0;
+    if (!(mask&EDR_EVIDENCE_NETWORK_AUX)) ev->detail.network.network_aux_path[0]=0;
+  }
+  if (ev->has_behavior_alert) {
+    ev->behavior_alert.ppid=0;
+    ev->behavior_alert.process_name[0]=ev->behavior_alert.process_path[0]=ev->behavior_alert.cmdline[0]=0;
+    /* The current internal owners use deterministic predicates/window scores;
+     * none compute tactic probabilities. Do not derive this from zero values. */
+    if (ev->has_tactic_probs_computed && !ev->tactic_probs_computed) {
+      ev->behavior_alert.tactic_probs_count=0;
+      memset(ev->behavior_alert.tactic_probs,0,sizeof(ev->behavior_alert.tactic_probs));
+    }
+  }
+}
+static int projected_evidence_valid(const edr_v1_BehaviorEvent *ev,int dynamic,int *resource_unavailable) {
+  if (ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION ||
+      (ev->required_evidence_fields & ~EDR_EVIDENCE_ALL) ||
+      ((ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY_DATA) && !(ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY)) ||
+      ((ev->required_evidence_fields&EDR_EVIDENCE_NETWORK_AUX) && !(ev->required_evidence_fields&EDR_EVIDENCE_NETWORK)) ||
+      (!dynamic && ev->required_evidence_fields) || !operation_evidence_valid(ev) ||
+      (ev->has_behavior_alert && ev->has_tactic_probs_computed &&
+       ((!ev->tactic_probs_computed && ev->behavior_alert.tactic_probs_count) ||
+        (ev->tactic_probs_computed && ev->behavior_alert.tactic_probs_count!=14)))) return 0;
+  edr_v1_BehaviorEvent *projected=malloc(sizeof(*projected));
+  if (!projected) { if (resource_unavailable) *resource_unavailable=1; return 0; }
+  memcpy(projected,ev,sizeof(*ev)); project_evidence_fields(projected);
+  int valid=memcmp(projected,ev,sizeof(*ev))==0;free(projected);return valid;
+}
 static int generation_matches(const cJSON *ctx,const char *key,uint64_t generation) {
   const cJSON *v=cJSON_GetObjectItemCaseSensitive(ctx,key);
   if (!v) return 1;
@@ -713,7 +819,7 @@ static int p0_pair_owned(const edr_v1_BehaviorEvent *ev,cJSON *ctx,const uint8_t
   void *user=atomic_load_explicit(&p0_pair_user,memory_order_relaxed);
   return validator && validator(&tuple,frame,len,user)==1;
 }
-static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx) {
+static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *resource_unavailable) {
   if (ev->has_behavior_alert) {
     cJSON *subject=object(ev->behavior_alert.user_subject_json);
     const JsonField *fields=subject_fields(subject);
@@ -722,10 +828,11 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx) {
     int terminal=cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")!=NULL;
     int valid=terminal?p0_terminal_context_valid(ev,subject,ctx):
       (fields && json_fields(subject,fields,0,0) && !ev->ave_result_json[0] &&
-      !ev->has_ave_behavior_feed && (dynamic || supplemental_identity_empty(ev)));
+      !ev->has_ave_behavior_feed && projected_evidence_valid(ev,dynamic,resource_unavailable));
     if (valid && dynamic) {
       const cJSON *context=cJSON_GetObjectItemCaseSensitive(subject,"context");
-      valid=generation_matches(context,"process_start_key",ev->process_start_key) &&
+      valid=dynamic_context_purpose(subject,ev->required_evidence_fields,0) &&
+        generation_matches(context,"process_start_key",ev->process_start_key) &&
         generation_matches(context,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns);
     }
     if (valid && ev->behavior_alert.related_iocs_json[0]) {
@@ -740,6 +847,9 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx) {
   if (ev->has_ave_behavior_feed) return 0;
   const JsonField *fields=standalone_fields(ev,ctx);
   if (!fields || !json_fields(ctx,fields,0,0) || !supplemental_identity_empty(ev)) return 0;
+  const cJSON *engine=cJSON_GetObjectItemCaseSensitive(ctx,"engine_evidence");
+  if (!(ev->type==EDR_EVENT_PMFE_SCAN_RESULT && !pmfe_independent_positive(engine)) &&
+      !projected_evidence_valid(ev,0,resource_unavailable)) return 0;
   if (ev->which_detail==edr_v1_BehaviorEvent_script_tag ||
       ev->which_detail==edr_v1_BehaviorEvent_dns_tag ||
       (ev->type==EDR_EVENT_PMFE_SCAN_RESULT && (ev->cmdline[0] ||
@@ -777,6 +887,7 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
     fanout=same(subject,"subject_type","net_fanout");
     if (recognized) {
       valid=json_fields(subject,fields,1,0);
+      if (valid && dynamic) valid=dynamic_context_purpose(subject,ev->required_evidence_fields,1);
       if (valid && ev->behavior_alert.related_iocs_json[0]) {
         iocs=document(ev->behavior_alert.related_iocs_json);
         valid=ioc_json_fields(iocs,fanout,1);
@@ -801,7 +912,10 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
   }
   if (recognized && valid) {
     ev->has_ave_behavior_feed=false; memset(&ev->ave_behavior_feed,0,sizeof(ev->ave_behavior_feed));
-    if (!dynamic) project_supplemental_identity(ev);
+    if (dynamic && ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION) valid=0;
+    if (!dynamic) {ev->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;ev->required_evidence_fields=0;ev->operation_evidence_json[0]=0;}
+    if (valid && !operation_evidence_valid(ev)) valid=0;
+    if (valid) project_evidence_fields(ev);
     if (subject_text) {
       strcpy(ev->behavior_alert.user_subject_json,subject_text);
       if (ioc_text) strcpy(ev->behavior_alert.related_iocs_json,ioc_text);
@@ -858,8 +972,24 @@ static int frame_validate(const uint8_t *frame,size_t len,char *reason,size_t ca
   int intent=!ev->has_behavior_alert && paired;
   int valid = !source_only && (alert_valid(ev) || standalone_engine(ev,ctx,frame,len) ||
     (intent && p0_intent_fields_valid(ev,ctx,NULL)));
-  if (valid && !event_fields_valid(ev,ctx)) {
-    cJSON_Delete(ctx); free(ev); return deny(reason,cap,"alert_field_purpose_invalid");
+  if (valid && ev->has_behavior_alert && !paired) {
+    cJSON *subject=object(ev->behavior_alert.user_subject_json);
+    if (same(subject,"subject_type","edr_dynamic_rule")) {
+      EdrEgressRuleProjectionValidator validator=atomic_load_explicit(&rule_projection_validator,memory_order_acquire);
+      void *user=atomic_load_explicit(&rule_projection_user,memory_order_relaxed);
+      int proven=validator?validator(string(subject,"rule_id"),string(subject,"rules_bundle_sha256"),
+          ev->required_evidence_fields,ev->operation_evidence_json,user):0;
+      if (proven!=1) {
+        cJSON_Delete(subject); cJSON_Delete(ctx); free(ev);
+        return deny(reason,cap,proven<0?"rule_projection_authority_unavailable":"rule_projection_authority_unproven");
+      }
+    }
+    cJSON_Delete(subject);
+  }
+  int resource_unavailable=0;
+  if (valid && !event_fields_valid(ev,ctx,&resource_unavailable)) {
+    cJSON_Delete(ctx); free(ev); return deny(reason,cap,
+      resource_unavailable?"egress_validation_allocation_failed":"alert_field_purpose_invalid");
   }
   if (valid && paired && require_pair_owner && !p0_pair_owned(ev,ctx,frame,len)) {
     cJSON_Delete(ctx); free(ev); return deny(reason,cap,"p0_pair_durable_alert_owner_unavailable");
@@ -1052,13 +1182,25 @@ int edr_egress_batch_project_alerts(const uint8_t *header,size_t header_len,
         (engine_schema[0] && strcmp(engine_schema,"generic_engine_evidence_v1") && !engine_fields);
       cJSON_Delete(ctx);
       if (unknown || (strcmp(why,"alert_provenance_unavailable") &&
-          strcmp(why,"source_only_requires_local_owner_v3") && strcmp(why,"alert_field_purpose_invalid"))) {
+          strcmp(why,"source_only_requires_local_owner_v3") && strcmp(why,"rule_projection_authority_unproven") && strcmp(why,"alert_field_purpose_invalid"))) {
         deny(reason,cap,unknown?"historical_detection_schema_unknown":why); ok=0; break;
       }
       if (source_only) candidate=0;
       if (candidate) {
         /* Rewriting an association-bound nonpositive result would invalidate
          * its exact hash. It needs the existing cache owner, not a marker. */
+        cJSON *legacy_subject=event->has_behavior_alert?object(event->behavior_alert.user_subject_json):NULL;
+        if (same(legacy_subject,"subject_type","edr_dynamic_rule")) {
+          EdrEgressRuleProjectionValidator validator=atomic_load_explicit(&rule_projection_validator,memory_order_acquire);
+          void *user=atomic_load_explicit(&rule_projection_user,memory_order_relaxed);
+          int proven=validator?validator(string(legacy_subject,"rule_id"),string(legacy_subject,"rules_bundle_sha256"),
+              event->required_evidence_fields,event->operation_evidence_json,user):0;
+          if (proven!=1) {
+            cJSON_Delete(legacy_subject);deny(reason,cap,proven<0?"rule_projection_authority_unavailable":"historical_rule_projection_unproven");ok=0;break;
+          }
+          event->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;
+        }
+        cJSON_Delete(legacy_subject);
         if (nonpositive || !edr_egress_event_project(event,why,sizeof(why))) {
           deny(reason,cap,nonpositive?"historical_pmfe_association_rebind_required":why); ok=0; break;
         }

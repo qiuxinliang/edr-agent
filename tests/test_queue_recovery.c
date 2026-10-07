@@ -1,5 +1,6 @@
 #include "edr/storage_queue.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
 #include "edr/report_events_ack.h"
 #include "edr/transport_sink.h"
 #include "edr/sha256.h"
@@ -30,6 +31,7 @@
 #endif
 
 void edr_storage_queue_test_stop_recovery_phase(int phase);
+void edr_storage_queue_test_fail_egress_allocation(unsigned failures);
 static unsigned sends;
 static int receipt_mode;
 static char sent_id[128];
@@ -54,6 +56,7 @@ int edr_transport_v2_report_events(const char *id,const uint8_t *header,size_t h
   assert(edr_egress_batch_validate(header,hlen,payload,plen,why,sizeof(why)));
   snprintf(sent_id,sizeof(sent_id),"%s",id); sent_len=hlen+plen;
   memcpy(sent_wire,header,hlen); memcpy(sent_wire+hlen,payload,plen); sends++;
+  if (receipt_mode==3) return EDR_REPORT_EVENTS_POLICY_HELD;
   if (!receipt_mode) return -1; /* No network in this storage contract. */
   char sha[65],body[640]; edr_sha256_hex(sent_wire,sent_len,sha);
   snprintf(body,sizeof(body),"{\"code\":\"OK\",\"data\":{\"accepted\":1,\"invalid_frames\":0,"
@@ -91,11 +94,13 @@ static uint8_t *make_wire(int alert,int mixed,int compressed,const char *endpoin
       ev->behavior_alert.pid=42; ev->behavior_alert.timestamp_ns=ev->event_time_ns;
       ev->behavior_alert.anomaly_score=0.7f;
       snprintf(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),
-        "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"synthetic-rule\","
-        "\"rules_bundle_version\":\"synthetic-v1\",\"rules_bundle_sha256\":\"%064d\","
-        "\"context\":{\"pid\":42,\"event_type\":%d,\"source_event_id\":\"synthetic-source\","
-        "\"endpoint_id\":\"%s\",\"tenant_id\":\"synthetic-tenant\"}}",1,
-        (int)EDR_EVENT_NET_CONNECT,endpoint);
+        "{\"subject_type\":\"detection_context\",\"evaluation_basis\":{"
+        "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\","
+        "\"predicate_matched\":true,\"threshold_met\":true,\"pid\":42,"
+        "\"timestamp_ns\":\"1700000000000000000\",\"threshold\":0.65,\"event_count\":1,"
+        "\"behavior_flags\":1,\"last_event_type\":9},\"detection_context\":{"
+        "\"engine\":\"ave\",\"rule_id\":\"behavior_anomaly\",\"confidence\":0.7,"
+        "\"process\":{\"pid\":42},\"engine_signals\":{\"script_content_score\":0.7}}}");
     }
     pb_ostream_t output=pb_ostream_from_buffer(frame,65536);
     assert(pb_encode(&output,edr_v1_BehaviorEvent_fields,ev));
@@ -364,7 +369,7 @@ static void historic_projection_and_receipt(int compressed) {
   original_equal(path,"legacy-batch",wire,len);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==2);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_pending';")==1);
-  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE projector_version='alert-fields-v1';")==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE projector_version='" EDR_EGRESS_PROJECTOR_VERSION "';")==1);
   assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK && report.applied);
   assert(strstr(report.reason,"already_committed"));
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==2);
@@ -402,10 +407,10 @@ static void historic_projection_and_receipt(int compressed) {
   edr_v1_BehaviorEvent *sent=calloc(1,sizeof(*sent)); assert(sent);
   pb_istream_t in=pb_istream_from_buffer(sent_wire+16,rd(sent_wire+12));
   assert(pb_decode(&in,edr_v1_BehaviorEvent_fields,sent));
-  assert(sent->has_behavior_alert && sent->pid==42 && !strcmp(sent->cmdline,"synthetic-required-fact"));
+  assert(sent->has_behavior_alert && sent->pid==42 && !sent->cmdline[0]);
   assert(!strcmp(sent->exe_path,"synthetic-required-path") &&
-    strstr(sent->behavior_alert.user_subject_json,"synthetic-rule") &&
-    strstr(sent->behavior_alert.user_subject_json,"synthetic-v1"));
+    strstr(sent->behavior_alert.user_subject_json,"ave_behavior_pipeline") &&
+    strstr(sent->behavior_alert.user_subject_json,"script_content_score"));
   free(sent);
   assert(edr_storage_queue_batch_presence(sent_id,sent_wire,sent_len)==0);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==1);
@@ -426,6 +431,141 @@ static void historic_projection_and_receipt(int compressed) {
   assert(!edr_storage_queue_p0_source_only_latch_is_set());
   assert(sql_number(path,"SELECT length(legacy_lineage)>0 FROM queue_meta;")==1);
   edr_storage_queue_close(); remove(path); free(wire); free(audit);
+}
+static int resource_authority_available=1;
+static int resource_projection_owner(const char *rule,const char *sha,uint64_t mask,const char *operation,void *user) {
+  (void)user;
+  if(!resource_authority_available)return -1;
+  return !strcmp(rule,"resource-rule") && !strcmp(sha,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") &&
+    mask==EDR_EVIDENCE_COMMAND && !operation[0];
+}
+static uint8_t *resource_projection_wire(size_t *len) {
+  size_t old_len;uint8_t *old=make_wire(1,0,0,"synthetic-endpoint",&old_len);
+  edr_v1_BehaviorEvent *ev=calloc(1,sizeof(*ev));uint8_t *wire=malloc(65536);assert(ev&&wire);
+  pb_istream_t input=pb_istream_from_buffer(old+16,rd(old+12));
+  assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,ev));
+  ev->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;
+  ev->required_evidence_fields=EDR_EVIDENCE_COMMAND;
+  ev->has_tactic_probs_computed=true;ev->tactic_probs_computed=false;
+  snprintf(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),
+    "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"resource-rule\","
+    "\"rules_bundle_version\":\"resource-bundle\",\"rules_bundle_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+    "\"context\":{\"pid\":42,\"event_type\":%d,\"source_event_id\":\"synthetic-source\","
+    "\"endpoint_id\":\"synthetic-endpoint\",\"tenant_id\":\"synthetic-tenant\"}}",(int)ev->type);
+  char why[96];assert(edr_egress_event_project(ev,why,sizeof(why)));
+  pb_ostream_t output=pb_ostream_from_buffer(wire+16,65520);
+  assert(pb_encode(&output,edr_v1_BehaviorEvent_fields,ev));
+  wr(wire,EDR_TRANSPORT_BATCH_MAGIC_RAW);wr(wire+4,1);wr(wire+8,(uint32_t)output.bytes_written+4);wr(wire+12,(uint32_t)output.bytes_written);
+  *len=output.bytes_written+16;
+  assert(edr_egress_batch_validate(wire,12,wire+12,*len-12,why,sizeof(why)));
+  free(old);free(ev);return wire;
+}
+static void resource_preflight_defers_original_bytes(void) {
+  edr_egress_set_rule_projection_validator(resource_projection_owner,NULL);
+  for(unsigned kind=0;kind<2;kind++) {
+    char path[512];test_path(path,sizeof(path),"resource-preflight",(int)kind);
+    size_t len;uint8_t *wire=resource_projection_wire(&len);
+    initialize(path,wire,len,0);assert(edr_storage_queue_open(path)==EDR_OK);
+    EdrStorageQueueCapacityMetrics before,after;
+    edr_storage_queue_get_capacity_metrics(&before);sends=0;receipt_mode=1;
+    if(kind==0)resource_authority_available=0;
+    for(unsigned i=0;i<3;i++) {
+      if(kind==1)edr_storage_queue_test_fail_egress_allocation(1);
+      edr_storage_queue_poll_drain();assert(sends==0);
+      assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE batch_id='legacy-batch' AND status='pending' AND retry_count=0 AND next_retry_at=0;")==1);
+      assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE status IN ('policy_held','dead_letter');")==0);
+      original_equal(path,"legacy-batch",wire,len);
+      /* Reopen starts a new drain generation without sleeping through the
+       * production minimum 200ms poll throttle or altering durable metadata. */
+      if(i<2){edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);}
+    }
+    edr_storage_queue_get_capacity_metrics(&after);
+    assert(after.delivery_resource_deferred==before.delivery_resource_deferred+3);
+    assert(after.delivery_sent==before.delivery_sent && after.delivery_failed==before.delivery_failed);
+    edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+    if(kind==1)edr_storage_queue_test_fail_egress_allocation(1);
+    edr_storage_queue_poll_drain();assert(sends==0);
+    original_equal(path,"legacy-batch",wire,len);
+    assert(sql_number(path,"SELECT retry_count FROM event_queue WHERE batch_id='legacy-batch';")==0);
+    resource_authority_available=1;
+    edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+    edr_storage_queue_poll_drain();assert(sends==1);
+    assert(!strcmp(sent_id,"legacy-batch") && sent_len==len && !memcmp(sent_wire,wire,len));
+    assert(edr_storage_queue_batch_presence("legacy-batch",wire,len)==0);
+    assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==0);
+    edr_storage_queue_close();remove(path);free(wire);
+  }
+  edr_egress_set_rule_projection_validator(NULL,NULL);
+  puts("queue preflight resource failures: no hold/retry mutation across reopen; exact original bytes ACKed after recovery");
+}
+static void server_policy_hold_retains_lineage(void) {
+  char path[512]; test_path(path,sizeof(path),"server-policy-hold",0);
+  size_t len; uint8_t *wire=make_wire(1,1,0,"synthetic-endpoint",&len);
+  initialize(path,wire,len,1);
+  EdrStorageQueueRecoveryReport report; EdrStorageQueueRecoveryRequest request=checked(path,&report);
+  assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+  assert(edr_storage_queue_open(path)==EDR_OK); sends=0;receipt_mode=3;
+  edr_storage_queue_poll_drain();assert(sends==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE origin_row_id>0 AND status='policy_held' AND terminal_reason='server_evidence_projection_unproven' AND retry_count=0;")==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='acked';")==0);
+  assert(sql_number(path,"SELECT source_latch_loss_detected FROM queue_meta;")==1);
+  original_equal(path,"legacy-batch",wire,len);original_equal(path,sent_id,sent_wire,sent_len);
+  for (unsigned i=0;i<3;i++) edr_storage_queue_poll_drain();assert(sends==1);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  receipt_mode=1;edr_storage_queue_poll_drain();assert(sends==1);
+  original_equal(path,"legacy-batch",wire,len);original_equal(path,sent_id,sent_wire,sent_len);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='pending';")==1);
+  edr_storage_queue_close();remove(path);free(wire);
+}
+/* Storage relation migration fixture. Both children contain already eligible
+ * wire; this tests relation/receipt versions, not old sensor semantics. Actual
+ * legacy frame minimization is exercised above through the production codec. */
+static void multiversion_projection_receipts(int newest_first) {
+  char path[512]; test_path(path,sizeof(path),"projection-versions",newest_first);
+  size_t len; uint8_t *wire=make_wire(1,1,0,"synthetic-endpoint",&len);
+  initialize(path,wire,len,1);
+  EdrStorageQueueRecoveryReport report; EdrStorageQueueRecoveryRequest request=checked(path,&report);
+  assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+  /* Shape of a 612 database: only its original pointer and existing child.
+   * Never change either payload. A startup migration must preserve the pair. */
+  sql_exec(path,"UPDATE event_queue SET batch_id='legacy-v1-child' WHERE origin_row_id>0;"
+    "UPDATE event_queue SET projector_version='alert-fields-v1',projection_batch_id='legacy-v1-child' "
+    "WHERE origin_row_id=0; DROP TABLE queue_projection_relations;");
+  char old_sha[65],after_sha[65]; file_sha(path,old_sha);
+  request=checked(path,&report);
+  assert(report.projected_batches==1);
+  file_sha(path,after_sha); assert(!strcmp(old_sha,after_sha));
+  assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations;")==2);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='pending';")==2);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE projection_batch_id='legacy-v1-child' "
+    "AND projector_version='alert-fields-v1';")==1);
+  original_equal(path,"legacy-batch",wire,len);
+  /* Restart preserves both relations. Wrong ACK acknowledges neither. */
+  assert(edr_storage_queue_open(path)==EDR_OK); sends=0;receipt_mode=2;
+  edr_storage_queue_poll_drain();assert(sends>=1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='acked';")==0);
+  edr_storage_queue_close();
+  sql_exec(path,newest_first ?
+    "UPDATE event_queue SET next_retry_at=CASE WHEN batch_id='legacy-v1-child' THEN CAST(strftime('%s','now') AS INTEGER)+120 ELSE 0 END WHERE origin_row_id>0;" :
+    "UPDATE event_queue SET next_retry_at=CASE WHEN batch_id='legacy-v1-child' THEN 0 ELSE CAST(strftime('%s','now') AS INTEGER)+120 END WHERE origin_row_id>0;");
+  assert(edr_storage_queue_open(path)==EDR_OK); sends=0;receipt_mode=1;
+  edr_storage_queue_poll_drain();assert(sends==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='acked';")==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='pending';")==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_acked';")==!newest_first);
+  edr_storage_queue_close();
+  sql_exec(path,"UPDATE event_queue SET next_retry_at=0 WHERE origin_row_id>0;");
+  assert(edr_storage_queue_open(path)==EDR_OK); sends=0;
+  edr_storage_queue_poll_drain();assert(sends==1);
+  assert(sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations WHERE receipt_state='acked';")==2);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==1);
+  assert(sql_number(path,"SELECT source_latch_loss_detected FROM queue_meta;")==1);
+  original_equal(path,"legacy-batch",wire,len);
+  edr_storage_queue_close();
+  request=checked(path,&report);assert(report.selected_batches==0);
+  assert(edr_storage_queue_open(path)==EDR_OK);sends=0;edr_storage_queue_poll_drain();assert(sends==0);
+  edr_storage_queue_close();remove(path);free(wire);
 }
 static void unresolved_foreign_capacity(void) {
   char path[512]; test_path(path,sizeof(path),"real-unresolved",0);
@@ -532,6 +672,9 @@ int main(int argc,char **argv) {
   historical_paired_alert_requires_original_intent_owner();
   historical_known_outcome_missing_intent_receipt();
   historic_projection_and_receipt(0); historic_projection_and_receipt(1);
+  resource_preflight_defers_original_bytes();
+  server_policy_hold_retains_lineage();
+  multiversion_projection_receipts(0); multiversion_projection_receipts(1);
   unresolved_foreign_capacity();
   process_crash_boundaries();
   puts("queue recovery: real codecs, immutable lineage, independent receipts, FULL rollback/restart passed");

@@ -249,7 +249,7 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
     if (process_written < 0 || (size_t)process_written >= sizeof(process)) continue;
     int written = snprintf(al->user_subject_json, sizeof(al->user_subject_json),
            "{\"subject_type\":\"detection_context\",\"evaluation_basis\":{"
-           "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\","
+           "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\",\"tactic_probs_computed\":false,"
            "\"predicate_matched\":true,\"threshold_met\":true,\"pid\":%u,"
            "\"timestamp_ns\":\"%lld\",\"threshold\":%.6f,\"event_count\":%u,"
            "\"behavior_flags\":%u,\"last_event_type\":%u},"
@@ -969,8 +969,9 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   float last_tactic_probs[14];
   memset(last_tactic_probs, 0, sizeof(last_tactic_probs));
   {
-    float sev = (float)e->severity_hint / 255.0f;
-    float bump = sev * 0.12f + (float)popcount_u32(e->behavior_flags) * 0.04f;
+    /* Collector priority schedules work; repetition does not turn it into
+     * evidence. Only the detector-owned behavior facts affect anomaly. */
+    float bump = (float)popcount_u32(e->behavior_flags) * 0.04f;
     if (e->event_type == AVE_EVT_LSASS_ACCESS || e->event_type == AVE_EVT_MEM_ALLOC_EXEC) {
       bump += 0.08f;
     }

@@ -60,6 +60,7 @@ add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIR
 
 add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_inbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include
@@ -133,6 +134,7 @@ add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_pro
   ${CMAKE_SOURCE_DIR}/src/command/command_process.c
   ${CMAKE_SOURCE_DIR}/src/command/command_util.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_process PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_link_libraries(test_command_process PRIVATE Threads::Threads)
@@ -160,6 +162,7 @@ else()
   target_link_libraries(test_agent_update_contract PRIVATE
     advapi32 shell32 ole32 oleaut32 uuid taskschd)
 endif()
+target_link_libraries(test_agent_update_contract PRIVATE edr_egress_policy)
 edr_apply_test_warnings(test_agent_update_contract)
 add_test(NAME agent_update_command_contract COMMAND test_agent_update_contract)
 
@@ -170,8 +173,17 @@ if(NOT WIN32)
     ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
   target_include_directories(test_agent_update_event PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_link_libraries(test_agent_update_event PRIVATE edr_egress_policy)
   edr_apply_test_warnings(test_agent_update_event)
   add_test(NAME agent_update_event_outbox COMMAND test_agent_update_event)
+endif()
+
+if(NOT WIN32)
+  add_executable(test_attack_surface_policy test_attack_surface_policy.c
+    ${CMAKE_SOURCE_DIR}/src/attack_surface/attack_surface_report.c)
+  target_link_libraries(test_attack_surface_policy PRIVATE edr_egress_policy Threads::Threads)
+  edr_apply_test_warnings(test_attack_surface_policy)
+  add_test(NAME attack_surface_policy_preflight COMMAND test_attack_surface_policy)
 endif()
 
 add_executable(test_agent_update_assets ${CMAKE_CURRENT_SOURCE_DIR}/test_agent_update_assets.c)
@@ -896,6 +908,44 @@ if(EDR_PCRE2_AVAILABLE)
   add_test(NAME p0_source_only_durable_contract COMMAND test_p0_source_only_durable_contract)
   set_tests_properties(p0_source_only_durable_contract PROPERTIES
     ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+  add_executable(test_p0_observation_semantics
+    ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_observation_semantics.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
+    ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
+    ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/encrypt_p0_rules.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/preprocess_env.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_enforcement.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/behavior_alert_emit.c
+    ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+    ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+    ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
+    ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
+    ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
+  target_include_directories(test_p0_observation_semantics PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_compile_definitions(test_p0_observation_semantics PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)
+  # Select the verified static header before SQLite's shared vcpkg include
+  # directory. vcpkg's dynamic pcre2.h hardcodes the static check to 0, so
+  # PCRE2_STATIC alone cannot prevent dllimport declarations from that header.
+  target_link_libraries(test_p0_observation_semantics PRIVATE
+    ${EDR_PCRE2_TARGET} edr_ave_test_common Threads::Threads)
+  edr_apply_test_warnings(test_p0_observation_semantics)
+  add_test(NAME p0_observation_semantics COMMAND test_p0_observation_semantics)
+  set_tests_properties(p0_observation_semantics PROPERTIES
+    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
 else()
   message(STATUS
     "P0 source-only durable fixture: not registered because the non-production "
@@ -1286,7 +1336,7 @@ add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_c
 if(WIN32)
   # Structured connection scope uses Windows' validated numeric IP parser.
   foreach(target test_detection_decision test_detection_regression
-                 test_detection_sensor_bridge test_telemetry_admission
+                 test_detection_sensor_bridge test_telemetry_admission test_p0_observation_semantics
                  test_local_evidence_cache_candidate)
     target_link_libraries(${target} PRIVATE ws2_32)
   endforeach()
@@ -1704,6 +1754,7 @@ edr_apply_test_warnings(test_egress_request_policy)
 add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 add_executable(test_command_result_egress test_command_result_egress.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_link_libraries(test_command_result_egress PRIVATE edr_egress_policy Threads::Threads)
 if(WIN32)
@@ -1842,3 +1893,49 @@ edr_minimization_test(behavior_record_alert_proto_contract test_behavior_record_
 edr_minimization_test(behavior_record_alert_emit_contract test_behavior_record_alert_emit)
 
 edr_minimization_test(validation_trace_contract test_validation_trace)
+
+if(EDR_PCRE2_AVAILABLE)
+  get_target_property(_p0_operation_sources test_p0_rule_ir_record_golden SOURCES)
+  list(REMOVE_ITEM _p0_operation_sources ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c)
+  add_executable(test_p0_operation test_p0_operation.c ${_p0_operation_sources})
+  target_include_directories(test_p0_operation PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_link_libraries(test_p0_operation PRIVATE ${EDR_PCRE2_TARGET} edr_ave_test_common)
+  edr_apply_test_warnings(test_p0_operation)
+  add_test(NAME p0_operation COMMAND test_p0_operation)
+  set_tests_properties(p0_operation PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
+  add_executable(test_p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive.c ${_p0_operation_sources})
+  target_include_directories(test_p0_rule_ir_purpose_archive PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_compile_definitions(test_p0_rule_ir_purpose_archive PRIVATE EDR_P0_ENCRYPT_TESTING=1 EDR_P0_RULE_IR_TESTING=1)
+  target_link_libraries(test_p0_rule_ir_purpose_archive PRIVATE ${EDR_PCRE2_TARGET} edr_ave_test_common)
+  edr_apply_test_warnings(test_p0_rule_ir_purpose_archive)
+  add_test(NAME p0_rule_ir_purpose_archive COMMAND test_p0_rule_ir_purpose_archive)
+  set_tests_properties(p0_rule_ir_purpose_archive PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
+
+endif()
+
+edr_minimization_test(p0_observation_semantics test_p0_observation_semantics)
+edr_minimization_test(p0_operation test_p0_operation)
+edr_minimization_test(p0_rule_ir_record_golden test_p0_rule_ir_record_golden)
+edr_minimization_test(p0_rule_ir_snapshot test_p0_rule_ir_snapshot)
+
+edr_minimization_test(p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive)
+edr_minimization_test(ave_sdk_smoke test_ave_sdk)
+
+# Synthetic plaintext fixtures and retained purpose envelopes stay in the build
+# directory; production targets never accept plaintext historical authority.
+foreach(_p0_fixture p0_source_only_durable_contract p0_observation_semantics
+    p0_rule_ir_record_golden p0_rule_ir_exclusions p0_rule_ir_snapshot
+    p0_rule_ir_envelope_boundary p0_validation_matrix p0_operation p0_candidate_replay)
+  if(TARGET test_${_p0_fixture})
+    target_compile_definitions(test_${_p0_fixture} PRIVATE EDR_P0_RULE_IR_TESTING=1)
+    if(TEST ${_p0_fixture})
+      set_property(TEST ${_p0_fixture} APPEND PROPERTY ENVIRONMENT
+        "EDR_P0_PURPOSE_ARCHIVE_BASE=${CMAKE_CURRENT_BINARY_DIR}/${_p0_fixture}-authority")
+    endif()
+  endif()
+endforeach()
+if(TEST windows_rule_semantic_audit)
+  set_property(TEST windows_rule_semantic_audit APPEND PROPERTY ENVIRONMENT
+    "EDR_P0_PURPOSE_ARCHIVE_BASE=${CMAKE_CURRENT_BINARY_DIR}/windows-rule-audit-authority")
+endif()
+edr_minimization_test(p0_validation_matrix test_p0_validation_matrix)
