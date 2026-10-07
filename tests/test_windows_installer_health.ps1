@@ -67,7 +67,7 @@ try {
   Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($ReportPath)) -eq $previousBytes) 'Failed replacement must preserve the previous complete report'
   Assert-True (@(Get-ChildItem -LiteralPath $root -Filter 'atomic-runtime.json.*.tmp').Count -eq 0) 'Failed replacement must remove its temporary file'
 
-  [IO.File]::WriteAllText($config, "endpoint_id = `"test`"`ntenant_id = `"test`"`nrest_base_url = `"https://example.invalid`"")
+  [IO.File]::WriteAllText($config, "endpoint_id = `"test`"`ntenant_id = `"test`"`n[platform]`nrest_base_url = `"https://example.invalid`"")
   [IO.File]::WriteAllText((Join-Path $root 'VERSION'), 'test-version')
   [IO.File]::WriteAllText($report, '{"status":"ok","check_id":"old"}')
   [IO.File]::WriteAllText((Join-Path $root 'install_health_report.json'), '{"status":"ok"}')
@@ -132,6 +132,7 @@ try {
   $r = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
   Assert-True ($r.binary_state -eq 'missing' -and $r.status -eq 'failed') 'Removed binary must fail current health'
   Assert-FileReleased $config
+  & (Join-Path $RepoRoot 'tests/test_windows_policy_verifier_auth.ps1') -RepoRoot $RepoRoot
   Write-Host 'PASS: released TOML readers, atomic reports and fresh native/verifier health states'
 } catch {
   $testFailure = $_

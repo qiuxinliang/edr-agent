@@ -48,12 +48,15 @@ function Write-VerifyLog {
 }
 
 function Read-TomlString {
-  param([string]$Path, [string]$Key)
+  param([string]$Path, [string]$Key, [string]$Section = "")
   if (-not (Test-Path -LiteralPath $Path)) { return "" }
   $pattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*"([^"]*)"'
   $reader = [System.IO.File]::OpenText(([System.IO.Path]::GetFullPath($Path)))
+  $currentSection = ""
   try {
     while ($null -ne ($line = $reader.ReadLine())) {
+      if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') { $currentSection = $Matches[1].Trim(); continue }
+      if ($Section -and $currentSection -cne $Section) { continue }
       $m = [regex]::Match($line, $pattern)
       if ($m.Success) { return $m.Groups[1].Value }
     }
@@ -61,6 +64,77 @@ function Read-TomlString {
     $reader.Dispose()
   }
   return ""
+}
+
+# This is the same bearer owner/precedence as edr_transport_init_from_config.
+# Restrict the TOML read to [platform]; never select an identically named key
+# from another section or put the credential in command arguments or reports.
+function Read-AgentPolicyBearer {
+  param([string]$Path)
+  $bearer = [Environment]::GetEnvironmentVariable('EDR_PLATFORM_BEARER', 'Process')
+  if (-not $bearer) {
+    $bearer = ''; $section = ''; $found = $false
+    $reader = [IO.File]::OpenText([IO.Path]::GetFullPath($Path))
+    try {
+      while ($null -ne ($line = $reader.ReadLine())) {
+        if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') { $section = $Matches[1].Trim(); continue }
+        if ($section -ceq 'platform' -and $line -match '^\s*rest_bearer_token\s*=') {
+          if ($found) { throw 'policy_bearer_source_invalid' }
+          $found = $true
+          # Bearer token68 contains no TOML escapes; reject malformed or multiline
+          # values instead of guessing a different credential than the Agent.
+          $m = [regex]::Match($line, '^\s*rest_bearer_token\s*=\s*(["''])([A-Za-z0-9._~+/=-]*)\1\s*(?:#.*)?$')
+          if (-not $m.Success) { throw 'policy_bearer_source_invalid' }
+          $bearer = $m.Groups[2].Value
+        }
+      }
+    } finally { $reader.Dispose() }
+  }
+  if (-not $bearer) { throw 'policy_bearer_missing' }
+  if ($bearer.Length -gt 511 -or $bearer -cnotmatch '^[A-Za-z0-9._~+/-]+=*$') { throw 'policy_bearer_source_invalid' }
+  return $bearer
+}
+
+function Invoke-AgentPolicyVerification {
+  param([string]$Path, [string]$Url, [string]$RestBaseUrl, [string]$RelayUrl,
+        [string]$EndpointId, [string]$TenantId, [int]$TimeoutSec, [hashtable]$ProxyOptions)
+  $result = [ordered]@{ status = 'warning'; message = 'policy_request_failed'; version = '' }
+  $headers = @{}; $bearer = $null
+  try {
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Fragment) { throw 'policy_url_invalid' }
+    # A configured remote URL is not authority to disclose the platform token
+    # to an arbitrary host. Redirects are disabled for the same reason.
+    $trustedOrigin = $false
+    foreach ($base in @($RestBaseUrl, $RelayUrl)) {
+      $baseUri = $null
+      if ([Uri]::TryCreate($base, [UriKind]::Absolute, [ref]$baseUri) -and
+          $baseUri.Scheme -ceq 'https' -and -not $baseUri.UserInfo -and
+          $baseUri.DnsSafeHost -ieq $uri.DnsSafeHost -and $baseUri.Port -eq $uri.Port) { $trustedOrigin = $true }
+    }
+    if (-not $trustedOrigin) { throw 'policy_url_origin_mismatch' }
+    $bearer = Read-AgentPolicyBearer -Path $Path
+    $headers['Authorization'] = 'Bearer ' + $bearer
+    if ($EndpointId) { $headers['X-Endpoint-ID'] = $EndpointId }
+    if ($TenantId) { $headers['X-Tenant-ID'] = $TenantId }
+    $resp = Invoke-WebRequest -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSec -MaximumRedirection 0 @ProxyOptions
+    if ([int]$resp.StatusCode -ne 200) { throw 'policy_http_status_unexpected' }
+    $result.status = 'ok'; $result.message = 'authenticated_policy_http_200'
+    # This verifies an authenticated fetch only. Signature/application status
+    # continues to belong to the running Agent's signed policy owner.
+    $result.version = Read-PolicyVersionFromText -Text ([string]$resp.Content)
+    if (-not $result.version) { $result.version = 'runtime-policy' }
+  } catch {
+    $result.status = 'warning'; $result.message = 'policy_request_failed'; $result.version = ''
+    $known = @('policy_bearer_missing', 'policy_bearer_source_invalid', 'policy_url_invalid', 'policy_url_origin_mismatch', 'policy_http_status_unexpected')
+    if ($known -ccontains $_.Exception.Message) { $result.message = $_.Exception.Message }
+    elseif ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $result.message = 'policy_http_' + [int]$_.Exception.Response.StatusCode }
+    # Never include response bodies, request headers, or arbitrary exception text.
+  } finally {
+    $headers.Clear(); $bearer = $null
+  }
+  return $result
 }
 
 function Read-TextFile {
@@ -268,8 +342,8 @@ $checks.Add((New-Check -Name "agent_toml" -Status $configStatus -Message $Config
 
 $endpointId = Read-TomlString -Path $ConfigPath -Key "endpoint_id"
 $tenantId = Read-TomlString -Path $ConfigPath -Key "tenant_id"
-$restBase = Read-TomlString -Path $ConfigPath -Key "rest_base_url"
-$runtimePolicyUrl = Read-TomlString -Path $ConfigPath -Key "runtime_policy_url"
+$restBase = Read-TomlString -Path $ConfigPath -Key "rest_base_url" -Section "platform"
+$runtimePolicyUrl = Read-TomlString -Path $ConfigPath -Key "runtime_policy_url" -Section "remote"
 $proxyMode = Normalize-ProxyModeValue (Read-TomlString -Path $ConfigPath -Key "proxy_mode")
 $proxyUrl = Read-TomlString -Path $ConfigPath -Key "proxy_url"
 $agentVersion = Read-AgentVersion
@@ -294,21 +368,11 @@ $policyStatus = "skipped"
 $policyMessage = "runtime_policy_url missing"
 $policyVersion = ""
 if ($runtimePolicyUrl) {
-  try {
-    Write-VerifyLog ("runtime_policy_pull url=" + $runtimePolicyUrl)
-    $headers = @{}
-    if ($endpointId) { $headers["X-Endpoint-ID"] = $endpointId }
-    if ($tenantId) { $headers["X-Tenant-ID"] = $tenantId }
-    $resp = Invoke-WebRequest -Uri $runtimePolicyUrl -Headers $headers -UseBasicParsing -TimeoutSec $PolicyTimeoutSec @webRequestProxyOptions
-    $policyStatus = "ok"
-    $policyMessage = "HTTP $($resp.StatusCode) $runtimePolicyUrl"
-    $policyVersion = Read-PolicyVersionFromText -Text ([string]$resp.Content)
-    if (-not $policyVersion) { $policyVersion = "runtime-policy" }
-  } catch {
-    $policyStatus = "warning"
-    $policyMessage = "policy pull failed: $($_.Exception.Message)"
-    Write-VerifyLog ($policyMessage)
-  }
+  $policyCheck = Invoke-AgentPolicyVerification -Path $ConfigPath -Url $runtimePolicyUrl -RestBaseUrl $restBase -RelayUrl (Read-TomlString -Path $ConfigPath -Key "relay_url" -Section "platform") -EndpointId $endpointId -TenantId $tenantId -TimeoutSec $PolicyTimeoutSec -ProxyOptions $webRequestProxyOptions
+  $policyStatus = $policyCheck.status
+  $policyMessage = $policyCheck.message
+  $policyVersion = $policyCheck.version
+  Write-VerifyLog ("runtime_policy_pull " + $policyMessage)
 }
 $checks.Add((New-Check -Name "runtime_policy_pull" -Status $policyStatus -Message $policyMessage)) | Out-Null
 

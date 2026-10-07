@@ -235,9 +235,16 @@ public sealed class InstallTlsFixture : IDisposable
     private TcpClient client;
     public readonly int Port;
     public string Error;
-    public InstallTlsFixture(X509Certificate2 certificate)
+    public volatile bool ReceivedRequest;
+    public volatile bool Authenticated;
+    private readonly string expectedBearer;
+    private readonly int forcedStatus;
+    public InstallTlsFixture(X509Certificate2 certificate) : this(certificate, null, 200) { }
+    public InstallTlsFixture(X509Certificate2 certificate, string expectedBearer, int forcedStatus)
     {
         this.certificate = certificate;
+        this.expectedBearer = expectedBearer;
+        this.forcedStatus = forcedStatus;
         listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -259,17 +266,29 @@ public sealed class InstallTlsFixture : IDisposable
                 ssl.AuthenticateAsServer(certificate, false, SslProtocols.Tls12, false);
                 // Transport-only GET fixture: bounded headers, no request body.
                 int end = 0;
+                StringBuilder request = new StringBuilder();
                 for (int count = 0; count < 16384 && end != 4; count++)
                 {
                     int b = ssl.ReadByte();
                     if (b < 0) throw new IOException("request closed before headers");
+                    request.Append((char)b);
                     if ((end == 0 || end == 2) && b == 13) end++;
                     else if ((end == 1 || end == 3) && b == 10) end++;
                     else end = 0;
                 }
                 if (end != 4) throw new IOException("headers too long");
+                ReceivedRequest = true;
+                string headers = request.ToString();
+                foreach (string line in headers.Split(new string[] { "\r\n" }, StringSplitOptions.None))
+                    if (line.StartsWith("Authorization: ", StringComparison.OrdinalIgnoreCase))
+                        Authenticated = expectedBearer != null && String.Equals(
+                            line.Substring(15), "Bearer " + expectedBearer, StringComparison.Ordinal);
+                int status = expectedBearer != null && !Authenticated ? 401 : forcedStatus;
+                string body = expectedBearer == null ? "{\"ok\":true}" : "version = \"fixture-policy\"\n";
                 byte[] response = Encoding.ASCII.GetBytes(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
+                    "HTTP/1.1 " + status + " Fixture\r\nContent-Type: " + (expectedBearer == null ? "application/json" : "text/plain") + "\r\nContent-Length: " + Encoding.ASCII.GetByteCount(body) +
+                    (status == 302 ? "\r\nLocation: https://localhost:1/must-not-follow" : "") +
+                    "\r\nConnection: close\r\n\r\n" + body);
                 ssl.Write(response, 0, response.Length);
                 ssl.Flush();
             }
