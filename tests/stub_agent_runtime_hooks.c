@@ -43,6 +43,17 @@ int edr_command_receive_envelope(const char *command_id, const char *command_typ
 
 void edr_command_executor_wake(void) {}
 
+/* AVE-only tests admit no commands and therefore own no result egress. The
+ * signed-command/loopback tests link the real durable command state instead. */
+int edr_command_state_result_authorized(const char *tenant, const char *endpoint,
+                                        const void *body, size_t len) {
+  (void)tenant;
+  (void)endpoint;
+  (void)body;
+  (void)len;
+  return 0;
+}
+
 void edr_command_audit_both(const char *cmd_id, const char *msg) {
   (void)cmd_id;
   (void)msg;
