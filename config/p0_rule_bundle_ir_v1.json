@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
-  "ir_schema_version": 5,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-ad5e56a7",
+  "ir_schema_version": 6,
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-9ebc399b",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 182,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "344ab18ca3fbc2399e2c0d1743a7fd06830c463da58c3fd955ef894f0c07de04",
+  "sensor_interest_manifest_sha256": "a50f345d688d2f871634d659b0e7c41afb425e31b72897fa5a25f2a83a6b67c4",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -3813,7 +3813,7 @@
     },
     {
       "id": "R-CRED-010",
-      "title": "DPAPI/Vault/浏览器会话凭据收集痕迹",
+      "title": "凭据工具的明确提取尝试",
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
@@ -3823,13 +3823,9 @@
         "T1555",
         "T1555.003"
       ],
-      "description": "检测 LaZagne、SharpDPAPI、Seatbelt 等本地凭据、DPAPI、Windows Vault、浏览器 cookie/session 收集工具。",
+      "description": "完整命令参数符合受支持凭据工具的明确提取操作；仅证明进程命令尝试，不宣称凭据读取或提取成功。帮助、文档、未知参数与不完整命令保留本地。",
       "condition": {
-        "command_regex_any": [
-          "(?i)(lazagne|sharpdpapi|seatbelt).*?(password|cred|vault|dpapi|cookie|browser)",
-          "(?i)(dpapi::|vault::|chrome.*login data|firefox.*logins\\.json)",
-          "(?i)(cookies|login data|key4\\.db).*?(copy|dump|decrypt)"
-        ]
+        "operation": "credential_tool_attempt"
       }
     },
     {

@@ -12,6 +12,7 @@
 int edr_preprocess_should_emit(const EdrBehaviorRecord *record) { assert(record); return 1; }
 static unsigned frames;
 static int operation_frame;
+static unsigned pair_id;
 static int bytes_have(const uint8_t *wire,size_t len,const char *s) {size_t n=strlen(s);for(size_t i=0;i+n<=len;i++)if(!memcmp(wire+i,s,n))return 1;return 0;}
 EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len,int compressed,int severity) {
   char reason[160];
@@ -30,6 +31,7 @@ EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len
     assert(!strstr(e->cmdline,"0123456789abcdef"));
     assert(!strstr(e->behavior_alert.cmdline,"0123456789abcdef"));
     assert(!strstr(e->behavior_alert.user_subject_json,"fixture-user"));
+    assert(!bytes_have(wire,len,"SYNTHETIC-CREDENTIAL-ONLY"));
     assert(!e->cmdline[0] && !e->behavior_alert.cmdline[0]);
   }
   printf("accepted frame bytes=%zu operation=%d\n",len-16,operation_frame);
@@ -58,8 +60,9 @@ int edr_event_batch_push(const uint8_t *wire,size_t len) {(void)wire;(void)len;a
 static unsigned ordinal;
 static void check_case(const char *label,EdrEventType type,const char *name,const char *cmd,unsigned port,const char *path,int want_alert,int want_local) {
   EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);++ordinal;
-  r->type=type;r->pid=7000+ordinal;r->ppid=6000;r->event_time_ns=1720000000000000000LL+ordinal;
-  r->process_start_key=9000+ordinal;r->process_creation_filetime_100ns=133600000000000000ULL+ordinal;
+  unsigned generation=pair_id?pair_id:ordinal;
+  r->type=type;r->pid=7000+generation;r->ppid=6000;r->event_time_ns=1720000000000000000LL+ordinal;
+  r->process_start_key=9000+generation;r->process_creation_filetime_100ns=133600000000000000ULL+generation;
   snprintf(r->event_id,sizeof(r->event_id),"semantics-%u",ordinal);
   strcpy(r->tenant_id,"fixture-tenant");strcpy(r->endpoint_id,"fixture-endpoint");
   snprintf(r->process_name,sizeof(r->process_name),"%s",name);
@@ -83,6 +86,18 @@ static void check_case(const char *label,EdrEventType type,const char *name,cons
   printf("%s emitted=%d observation=%d local_admission_calls=1 repeat=0\n",label,emitted,want_local);
   free(r);
 }
+static void check_credential_pair(const char *label,const char *name,const char *command,
+                                 int process_alert,int file_alert) {
+  unsigned before=frames;
+  pair_id=1000u+ordinal;
+  operation_frame=1;
+  check_case(label,EDR_EVENT_PROCESS_CREATE,name,command,0,NULL,process_alert,0);
+  assert(frames-before==(unsigned)process_alert);
+  before=frames;
+  check_case(label,EDR_EVENT_FILE_READ,name,command,0,"C:\\Lab\\Login Data",file_alert,1);
+  assert(frames-before==(unsigned)file_alert);
+  pair_id=0;
+}
 int main(void) {
   deferred_fake_reset();edr_p0_rule_test_reset_dedup();edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
@@ -97,9 +112,24 @@ int main(void) {
   operation_frame=1;
   check_case("hash auth",EDR_EVENT_NET_CONNECT,"netexec.exe","netexec.exe smb 192.0.2.10 -u fixture-user -H 0123456789abcdef0123456789abcdef",445,NULL,1,1);
   check_case("decrypt",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Login Data\\\" /unprotect\"",0,"C:\\Lab\\Login Data",1,1);
+  check_credential_pair("direct decrypt","mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Login Data\\\" /unprotect\"",1,1);
+  check_credential_pair("echo","cmd.exe","cmd.exe /c echo dpapi::chrome",0,0);
+  check_credential_pair("help","mimikatz.exe","mimikatz.exe \"dpapi::chrome /?\"",0,0);
+  check_credential_pair("global help","mimikatz.exe","mimikatz.exe --help \"dpapi::chrome\"",0,0);
+  check_credential_pair("document","notepad.exe","notepad.exe \"C:\\Docs\\chrome Login Data guide.txt\"",0,0);
+  check_credential_pair("quoted data","python.exe","python.exe -c \"print('dpapi::chrome')\"",0,0);
+  check_credential_pair("vault help","mimikatz.exe","mimikatz.exe \"vault::cred /?\"",0,0);
+  check_credential_pair("unrecognized secret","mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Login Data\\\" /unprotect /password:SYNTHETIC-CREDENTIAL-ONLY\"",0,0);
+  check_credential_pair("masterkey","mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Login Data\\\" /masterkey:0123456789abcdef0123456789abcdef01234567\"",1,0);
+  check_credential_pair("vault credential","mimikatz.exe","mimikatz.exe \"vault::cred\" exit",1,0);
+  check_credential_pair("lazagne","lazagne.exe","lazagne.exe browsers -password SYNTHETIC-CREDENTIAL-ONLY",1,0);
+  check_credential_pair("sharpdpapi","SharpDPAPI.exe","SharpDPAPI.exe credentials /password:SYNTHETIC-CREDENTIAL-ONLY",1,0);
+  check_credential_pair("seatbelt vault","Seatbelt.exe","Seatbelt.exe WindowsVault",1,0);
+  check_credential_pair("seatbelt inventory","Seatbelt.exe","Seatbelt.exe DpapiMasterKeys",0,0);
   EdrConfig cfg;memset(&cfg,0,sizeof(cfg));cfg.policy_v2.credential_mode=EDR_POLICY_MODE_BLOCK;
   edr_policy_v2_configure(&cfg);
   check_case("decrypt block withheld",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Login Data\\\" /unprotect\"",0,"C:\\Lab\\Login Data",1,1);
+  check_credential_pair("attempt block withheld","SharpDPAPI.exe","SharpDPAPI.exe credentials /password:SYNTHETIC-CREDENTIAL-ONLY",1,0);
   assert(s_terminal_precreated==0 && s_terminal_updated==0);
   return 0;
 }

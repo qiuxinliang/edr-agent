@@ -10,7 +10,9 @@ int main(void) {
  edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
   const Case *c=&cases[i];EdrBehaviorRecord br;edr_behavior_record_init(&br);
-  br.type=!strcmp(c->type,"file_read")?EDR_EVENT_FILE_READ:EDR_EVENT_NET_CONNECT;
+  EdrEventType type=!strcmp(c->type,"file_read")?EDR_EVENT_FILE_READ:
+      !strcmp(c->type,"process_create")?EDR_EVENT_PROCESS_CREATE:EDR_EVENT_NET_CONNECT;
+  br.type=type;
   br.pid=123;br.process_start_key=456;br.process_creation_filetime_100ns=789;
   strcpy(br.endpoint_id,"fixture-endpoint");strcpy(br.tenant_id,"fixture-tenant");
   snprintf(br.process_name,sizeof(br.process_name),"%s",c->name);snprintf(br.exe_path,sizeof(br.exe_path),"%s",c->image);
@@ -20,7 +22,7 @@ int main(void) {
    if(variant==1) br.process_start_key=0;
    if(variant==2) {br.process_start_key=456;edr_behavior_mark_source_truncated(&br,"source.cmdline");}
    if(variant==3) {edr_behavior_resolve_source_truncated(&br,"source.cmdline");br.type=EDR_EVENT_NET_LISTEN;}
-   if(variant==4) {br.type=!strcmp(c->type,"file_read")?EDR_EVENT_FILE_READ:EDR_EVENT_NET_CONNECT;snprintf(br.script_snippet,sizeof(br.script_snippet),"%s",br.cmdline);br.cmdline[0]=0;}
+   if(variant==4) {br.type=type;snprintf(br.script_snippet,sizeof(br.script_snippet),"%s",br.cmdline);br.cmdline[0]=0;}
    EdrP0RuleIrEvaluation evaluation;assert(edr_p0_rule_ir_evaluate_record(&br,NULL,&evaluation));int found=0;
    for(uint32_t j=0;j<evaluation.match_count;j++) {EdrP0RuleIrMatch match;assert(edr_p0_rule_ir_evaluation_get_match(&evaluation,j,&match));
     if(!strcmp(c->rule,match.rule_id)) {found=1;assert(match.effect==EDR_P0_EFFECT_SECURITY_ALERT);assert(!(match.required_evidence_fields&EDR_EVIDENCE_COMMAND));assert(match.required_evidence_fields&EDR_EVIDENCE_OPERATION);assert(!strstr(match.operation_evidence,"0123456789abcdef"));}

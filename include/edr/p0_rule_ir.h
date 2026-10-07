@@ -16,12 +16,13 @@
  * header and exports these literals, so a backend provenance record cannot
  * name a parser schema, capacity, or source grammar that this binary does
  * not actually compile. */
-/* v5 makes local observations and security alerts explicit and binds exact
- * operation predicates plus rule-owned evidence purposes. */
-#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v5"
-#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@5"
+/* v6 adds the closed credential-tool attempt grammar. Older binaries must not
+ * receive a predicate they cannot execute; v5 is read only for frozen purpose
+ * authority, never activated for new matches. */
+#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v6"
+#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@6"
 #define EDR_P0_RULE_IR_BUNDLE_KIND "edr_p0_rule_bundle_ir_v1"
-#define EDR_P0_RULE_IR_SCHEMA_VERSION 5u
+#define EDR_P0_RULE_IR_SCHEMA_VERSION 6u
 #define EDR_P0_RULE_IR_MAX_RULES 256u
 
 typedef struct {
@@ -112,6 +113,8 @@ void edr_p0_rule_ir_test_fail_parent_sync_after_count(unsigned int nth_call,
  * slow ruleset reload. */
 void edr_p0_rule_ir_test_pause_preparation(int pause);
 int edr_p0_rule_ir_test_preparation_paused(void);
+/* Shared C/Go corpus for the exact authenticated historical predicate form. */
+int edr_p0_rule_ir_test_retired_purpose(unsigned schema, const char *rule_json);
 #endif
 
 /* 获取 P0 bundle 目标路径（edr_config/ 下的 .json 文件）。返回值 0=成功，-1=无法解析路径。 */

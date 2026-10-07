@@ -94,6 +94,7 @@ struct p0_ir_one {
   EdrP0RuleEffect effect;
   uint64_t required_evidence_fields;
   int operation;
+  int retired_credential_predicate;
   int chain_gt; /* 0 = unset */
   int n_name_in;
   char name_in[P0_IR_NAME_IN_MAX][128];
@@ -138,6 +139,8 @@ typedef struct p0_ir_candidate {
   struct p0_ir_one rule[EDR_P0_RULE_IR_MAX_RULES];
   int n;
   int ready;
+  unsigned schema_version;
+  int purpose_only;
   char source_label[1024];
   size_t plain_size;
   uint8_t *source_envelope;
@@ -813,13 +816,14 @@ static void p0_ir_clear_ir_artifact_terminal_unhealthy_locked(void) {
 /* The following helpers require s_ir_publication_lock.  Parsing still uses
  * s_load_target for the long-standing field macros, but that target is now
  * private to publication work and never protected by the ETW reader locks. */
-static int p0_ir_candidate_load_path_locked(p0_ir_candidate *candidate, const char *path) {
+static int p0_ir_candidate_load_path_locked(p0_ir_candidate *candidate, const char *path, int purpose_only) {
   p0_ir_candidate *previous;
   int loaded;
   if (!candidate || !path || !path[0]) return 0;
   p0_ir_test_pause_preparation();
   s_publication_recovery_failed = 0;
   p0_ir_candidate_destroy(candidate);
+  candidate->purpose_only=purpose_only;
   previous = s_load_target;
   s_load_target = candidate;
   s_purpose_read_temporary=0;
@@ -869,7 +873,7 @@ int edr_p0_rule_ir_validate_candidate_path(const char *path) {
     return 0;
   }
   p0_ir_publication_lock();
-  ok = p0_ir_candidate_load_path_locked(candidate, path);
+  ok = p0_ir_candidate_load_path_locked(candidate, path, 0);
   p0_ir_publication_unlock();
   p0_ir_candidate_destroy(candidate);
   free(candidate);
@@ -1289,7 +1293,7 @@ static int p0_ir_archive_candidate_locked(const p0_ir_candidate *candidate,const
 #endif
   if(file_readable(path)) {
     p0_ir_candidate *archived=calloc(1,sizeof(*archived));if(!archived)return 0;
-    ok=p0_ir_candidate_load_path_locked(archived,path) && !strcmp(archived->plain_sha256,candidate->plain_sha256);
+    ok=p0_ir_candidate_load_path_locked(archived,path,0) && !strcmp(archived->plain_sha256,candidate->plain_sha256);
     p0_ir_candidate_destroy(archived);free(archived);return ok;
   }
   if(!p0_ir_purpose_capacity(base)){fprintf(stderr,"[p0_rule_ir] purpose archive capacity exhausted; retain current bundle\n");return 0;}
@@ -1336,7 +1340,7 @@ int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *de
     p0_ir_publication_unlock();
     return 0;
   }
-  loaded = p0_ir_candidate_load_path_locked(next, staged_path);
+  loaded = p0_ir_candidate_load_path_locked(next, staged_path, 0);
   if (loaded && next->ready && p0_ir_archive_candidate_locked(next,destination_path) && p0_ir_sync_staged_file(staged_path)) {
     replace_result = p0_ir_replace_file(staged_path, destination_path);
   }
@@ -1769,6 +1773,7 @@ static int p0_rule_has_constraints(const char *et, const struct p0_ir_one *r) {
   if (!r || !et) {
     return 0;
   }
+  if (r->operation) return 1;
   if (strcmp(et, "process_create") == 0 || strcmp(et, "script_powershell") == 0 ||
       strcmp(et, "powershell_script") == 0 || strcmp(et, "script_wmi") == 0 ||
       strcmp(et, "wmi_script") == 0) {
@@ -1930,6 +1935,9 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
     if (schema_version >= 5u && strcmp(key,"operation")==0 &&
         ((strcmp(event_type,"file_read")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"credential_db_decrypt")) ||
          (strcmp(event_type,"network_connect")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"remote_hash_auth")))) continue;
+    if (schema_version >= 6u && strcmp(key,"operation")==0 &&
+        strcmp(event_type,"process_create")==0 && cJSON_IsString(item) &&
+        !strcmp(item->valuestring,"credential_tool_attempt")) continue;
     if (schema_version >= 5u && strcmp(event_type,"network_connect")==0 &&
         (!strcmp(key,"command_regex_any") || !strcmp(key,"command_regex_all"))) allowed=1;
     if (!allowed) {
@@ -2116,6 +2124,47 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
 /**
  * 从已解析的 JSON 文本加载；成功且至少一条可求值规则时 s_ready=1。每次入口清空 s_n。
  */
+/* Retire the proven weak predicate from its authenticated historical artifact,
+ * not by looking up today's rule ID or mutating a frozen frame. Other v5
+ * purpose contracts remain usable for ACK loss/restart replay. */
+static int p0_ir_retired_credential_predicate(unsigned schema,
+    const struct p0_ir_one *rule, const cJSON *condition) {
+  static const char *patterns[]={
+    "(?i)(lazagne|sharpdpapi|seatbelt).*?(password|cred|vault|dpapi|cookie|browser)",
+    "(?i)(dpapi::|vault::|chrome.*login data|firefox.*logins\\.json)",
+    "(?i)(cookies|login data|key4\\.db).*?(copy|dump|decrypt)"};
+  if (schema!=5u || strcmp(rule->event_type,"process_create") ||
+      rule->effect!=EDR_P0_EFFECT_SECURITY_ALERT || cJSON_GetArraySize(condition)!=1) return 0;
+  const cJSON *a=cJSON_GetObjectItemCaseSensitive(condition,"command_regex_any");
+  if (!cJSON_IsArray(a) || cJSON_GetArraySize(a)!=3) return 0;
+  unsigned seen=0;
+  for (int i=0;i<3;i++) {
+    const cJSON *v=cJSON_GetArrayItem(a,i);unsigned bit=0;
+    if (!cJSON_IsString(v)) return 0;
+    for (int j=0;j<3;j++) if (!strcmp(v->valuestring,patterns[j])) bit=1u<<j;
+    if (!bit || (seen&bit)) return 0;
+    seen|=bit;
+  }
+  return seen==7u;
+}
+#if defined(EDR_P0_RULE_IR_TESTING)
+int edr_p0_rule_ir_test_retired_purpose(unsigned schema,const char *rule_json) {
+  cJSON *j=cJSON_Parse(rule_json);struct p0_ir_one rule;int result=0;
+  memset(&rule,0,sizeof(rule));
+  if (j) {
+    const cJSON *event=cJSON_GetObjectItemCaseSensitive(j,"event_type");
+    const cJSON *effect=cJSON_GetObjectItemCaseSensitive(j,"effect");
+    if (cJSON_IsString(event) && cJSON_IsString(effect)) {
+      snprintf(rule.event_type,sizeof(rule.event_type),"%s",event->valuestring);
+      rule.effect=!strcmp(effect->valuestring,"security_alert")?EDR_P0_EFFECT_SECURITY_ALERT:EDR_P0_EFFECT_LOCAL_OBSERVATION;
+      result=p0_ir_retired_credential_predicate(schema,&rule,cJSON_GetObjectItemCaseSensitive(j,"condition"));
+    }
+    cJSON_Delete(j);
+  }
+  return result;
+}
+#endif
+
 static int p0_ir_load_from_json_text(const char *source_label, const char *data, size_t data_len) {
   if (!data || data_len > EDR_P0_ENCRYPT_PLAINTEXT_MAX_BYTES) {
     fprintf(stderr, "[p0_rule_ir] plaintext exceeds envelope contract: %s\n",
@@ -2165,7 +2214,8 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!cJSON_IsString(kind) || !kind->valuestring ||
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
-        (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION) ||
+        (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
+         !(s_load_target->purpose_only && schema_version->valuedouble == 5.0)) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
         (uint32_t)declared_count->valueint != (uint32_t)cJSON_GetArraySize(rules) ||
@@ -2177,6 +2227,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       return 0;
     }
     parsed_schema_version = (unsigned)schema_version->valuedouble;
+    s_load_target->schema_version=parsed_schema_version;
     snprintf(s_rules_bundle_version, sizeof(s_rules_bundle_version), "%s", version->valuestring);
     s_declared_rule_count = (uint32_t)declared_count->valueint;
     snprintf(s_sensor_interest_manifest_sha256, sizeof(s_sensor_interest_manifest_sha256), "%s",
@@ -2270,7 +2321,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
       break;
     }
     cJSON *op=cJSON_GetObjectItemCaseSensitive(jcond,"operation");
-    if (cJSON_IsString(op)) t.operation=!strcmp(op->valuestring,"credential_db_decrypt") ? 1 : 2;
+    if (cJSON_IsString(op)) t.operation=!strcmp(op->valuestring,"credential_db_decrypt") ? 1 :
+        !strcmp(op->valuestring,"remote_hash_auth") ? 2 : 3;
+    t.retired_credential_predicate=p0_ir_retired_credential_predicate(parsed_schema_version,&t,jcond);
     if (t.operation) {
       const char *keys[]={"action","enforcement_action","impact","response"};
       for (size_t k=0;k<sizeof(keys)/sizeof(keys[0]);++k) {
@@ -2837,7 +2890,7 @@ int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
 static int p0_ir_projection_in(const p0_ir_candidate *snapshot,const char *rule_id,const char *sha,uint64_t fields,const char *operation) {
   if(snapshot && snapshot->ready && rule_id && sha && operation && !strcmp(sha,snapshot->plain_sha256))
     for(int i=0;i<snapshot->n;++i){const struct p0_ir_one *r=&snapshot->rule[i];
-      if(r->in_use && r->effect==EDR_P0_EFFECT_SECURITY_ALERT && !strcmp(r->id,rule_id) &&
+      if(r->in_use && !r->retired_credential_predicate && r->effect==EDR_P0_EFFECT_SECURITY_ALERT && !strcmp(r->id,rule_id) &&
          r->required_evidence_fields==fields && !strcmp(operation,p0_operation_evidence(r->operation)))return 1;
     }
   return 0;
@@ -2852,7 +2905,7 @@ int edr_p0_rule_ir_projection_matches(const char *rule_id,const char *bundle_sha
   if(!p0_ir_purpose_path(path,sizeof(path),base,bundle_sha))return 0;
   p0_ir_candidate *archived=calloc(1,sizeof(*archived));if(!archived)return -1;
   p0_ir_publication_lock();
-  ok=p0_ir_candidate_load_path_locked(archived,path);
+  ok=p0_ir_candidate_load_path_locked(archived,path,1);
 #if !defined(EDR_P0_RULE_IR_TESTING) && !defined(EDR_P0_DIRECT_EMIT_TESTING)
   ok=ok && edr_p0_encrypt_is_edr1(archived->source_envelope,archived->source_envelope_size);
 #endif

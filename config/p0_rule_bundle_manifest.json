@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-ad5e56a7",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-9ebc399b",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 182,
   "rules": [
@@ -1955,7 +1955,7 @@
     },
     {
       "id": "R-CRED-010",
-      "title": "DPAPI/Vault/浏览器会话凭据收集痕迹",
+      "title": "凭据工具的明确提取尝试",
       "severity": 2,
       "event_type": "process_create",
       "enabled": true,
