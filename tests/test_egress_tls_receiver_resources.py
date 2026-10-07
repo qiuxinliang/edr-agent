@@ -65,22 +65,39 @@ class ReceiverResourcesTest(unittest.TestCase):
         self.assertEqual(len(diagnostic["stderr_sha256"]), 64)
         self.assertNotIn("private arbitrary", json.dumps(report))
 
-    def test_ninth_failure_preserves_first_eight_reports_and_failure_exit(self):
+    def test_final_failure_preserves_all_prior_reports_and_failure_exit(self):
         # Every fake client fails; this checks diagnostic ownership only and
         # never represents mocked HTTP, receipt or crash recovery as success.
         failed_client = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+
+        def fail_client_with_unused_signing_fixture(arguments, **kwargs):
+            if arguments[0] == "unused":
+                return failed_client
+            # main now prepares signed-command inputs before invoking the
+            # deliberately failing client. These bytes are never verified or
+            # sent: this test owns only resource cleanup and failure reports.
+            self.assertIn(arguments[1], ("genpkey", "pkey", "pkeyutl"))
+            output_path = Path(kwargs["cwd"]) / arguments[arguments.index("-out") + 1]
+            output_path.write_bytes(b"unused signing fixture")
+            return subprocess.CompletedProcess(arguments, 0)
+
         output = io.StringIO()
         with patch.object(receiver, "openssl_certificates"), \
              patch.object(receiver, "Receiver", self.database_only_receiver), \
-             patch.object(receiver.subprocess, "run", return_value=failed_client), \
+             patch.object(receiver.subprocess, "run", side_effect=fail_client_with_unused_signing_fixture), \
              patch.object(receiver, "crash_restart_scenario", side_effect=OSError("private detail")), \
              patch("sys.argv", ["receiver", "--client", "unused"]), \
              contextlib.redirect_stdout(output):
             self.assertEqual(receiver.main(), 1)
         report = json.loads(output.getvalue())
         self.assertFalse(report["passed"])
-        self.assertEqual(len(report["scenarios"]), 9)
+        self.assertEqual([item["mode"] for item in report["scenarios"]], [
+            "positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host",
+            "positive-pmfe", "positive-journal", "positive-p0-journal",
+            "positive-command", "positive-crash-restart",
+        ])
         self.assertTrue(all(item["client_exit"] == 1 for item in report["scenarios"]))
+        self.assertTrue(all(item["received_requests"] == 0 for item in report["scenarios"][:-1]))
         self.assertEqual(report["scenarios"][-1]["diagnostic"]["stage"], "crash_owner_cleanup")
         self.assertNotIn("private detail", output.getvalue())
 
