@@ -1,10 +1,10 @@
 #ifndef EDR_EGRESS_BATCH_POLICY_H
 #define EDR_EGRESS_BATCH_POLICY_H
+#include "edr/egress_request_policy.h"
 #include <stddef.h>
 #include <stdint.h>
 struct _edr_v1_BehaviorEvent;
 
-#define EDR_EGRESS_POLICY_VERSION "minimal-egress-v1"
 #define EDR_EGRESS_PROJECTOR_VERSION "alert-fields-v1"
 #define EDR_EGRESS_BATCH_MAX (4u * 1024u * 1024u)
 #define EDR_EGRESS_FRAME_MAX (256u * 1024u)

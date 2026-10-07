@@ -858,6 +858,45 @@ static void state_idempotency_key(const EdrSoarCommandMeta *meta, char *out, siz
   out[n] = '\0';
 }
 
+/* Kept inside the existing inbox/result records: no separate grant store. */
+static int authorization_json(const EdrCommandResultAuthorization *auth, char *out, size_t cap) {
+  EdrCommandResultAuthorization empty = {0};
+  if (!auth) auth = &empty;
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return -1;
+  int ok = cJSON_AddStringToObject(root, "command_id", auth->command_id) &&
+      cJSON_AddStringToObject(root, "command_type", auth->command_type) &&
+      cJSON_AddStringToObject(root, "tenant_id", auth->tenant_id) &&
+      cJSON_AddStringToObject(root, "endpoint_id", auth->endpoint_id) &&
+      cJSON_AddNumberToObject(root, "expires_unix_ms", (double)auth->expires_unix_ms) &&
+      cJSON_PrintPreallocated(root, out, (int)cap, 0);
+  cJSON_Delete(root);
+  return ok ? 0 : -1;
+}
+
+static void authorization_from_line(const char *line, EdrCommandResultAuthorization *auth) {
+  memset(auth, 0, sizeof(*auth));
+  cJSON *root = cJSON_Parse(line);
+  const cJSON *a = cJSON_GetObjectItemCaseSensitive(root, "result_authorization");
+  const char *names[] = {"command_id", "command_type", "tenant_id", "endpoint_id"};
+  char *dest[] = {auth->command_id, auth->command_type, auth->tenant_id, auth->endpoint_id};
+  size_t caps[] = {sizeof(auth->command_id), sizeof(auth->command_type),
+                   sizeof(auth->tenant_id), sizeof(auth->endpoint_id)};
+  int valid = cJSON_IsObject(a);
+  for (size_t i = 0; valid && i < 4u; ++i) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(a, names[i]);
+    valid = cJSON_IsString(v) && v->valuestring && strlen(v->valuestring) < caps[i];
+    if (valid) memcpy(dest[i], v->valuestring, strlen(v->valuestring) + 1u);
+  }
+  const cJSON *expires = cJSON_GetObjectItemCaseSensitive(a, "expires_unix_ms");
+  if (valid && cJSON_IsNumber(expires) && expires->valuedouble > 0 &&
+      expires->valuedouble < 9007199254740992.0 &&
+      expires->valuedouble == (double)(int64_t)expires->valuedouble) {
+    auth->expires_unix_ms = (int64_t)expires->valuedouble;
+  } else memset(auth, 0, sizeof(*auth));
+  cJSON_Delete(root);
+}
+
 static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) {
   if (!out) {
     return;
@@ -875,6 +914,7 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   parse_json_string_field_line(line, "agent_boot_id", out->agent_boot_id, sizeof(out->agent_boot_id));
   parse_json_string_field_line(line, "report_last_error", out->report_last_error,
                                sizeof(out->report_last_error));
+  authorization_from_line(line, &out->result_authorization);
   out->execution_status = parse_json_int_field_line(line, "execution_status", 0);
   out->exit_code = parse_json_int_field_line(line, "exit_code", 0);
   out->retry_count = parse_json_int_field_line(line, "retry_count", 0);
@@ -1565,13 +1605,18 @@ int edr_command_state_store_inbox(const char *command_id, const char *command_ty
   json_escape_to(step, sizeof(step), sm->playbook_step_id);
   json_escape_to(idem, sizeof(idem), sm->idempotency_key);
   json_escape_to(by, sizeof(by), sm->initiated_by);
+  char auth[1536];
+  if (authorization_json(&sm->result_authorization, auth, sizeof(auth)) != 0) {
+    fclose(f); (void)command_inbox_delete_path(tmp);
+    state_lock_release(lock); free(hex); return -1;
+  }
   fprintf(f,
           "{\"record\":\"command_inbox\",\"command_id\":%s,\"command_type\":%s,"
           "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
           "\"idempotency_key\":%s,\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
-          "\"initiated_by\":%s,\"received_unix_ms\":%lld,\"payload_hex\":\"",
+          "\"initiated_by\":%s,\"received_unix_ms\":%lld,\"result_authorization\":%s,\"payload_hex\":\"",
           cid, ctype, scid, run, step, idem, (long long)sm->issued_at_unix_ms,
-          (unsigned)sm->deadline_ms, by, (long long)state_now_ms());
+          (unsigned)sm->deadline_ms, by, (long long)state_now_ms(), auth);
   fputs(hex, f);
   fputs("\"}\n", f);
   int ok = state_flush_file(f) == 0;
@@ -1636,6 +1681,7 @@ static int command_inbox_read_file(const char *path, EdrCommandInboxRecord *out)
                                sizeof(out->meta.idempotency_key));
   parse_json_string_field_line(buf, "initiated_by", out->meta.initiated_by,
                                sizeof(out->meta.initiated_by));
+  authorization_from_line(buf, &out->meta.result_authorization);
   out->meta.issued_at_unix_ms = parse_json_int64_field_line(buf, "issued_at_unix_ms", 0);
   int64_t deadline_ms = parse_json_int64_field_line(buf, "deadline_ms", 0);
   if (deadline_ms > 0 && deadline_ms <= 0xffffffffLL) {
@@ -2225,6 +2271,8 @@ static int command_state_finish(const char *command_id, const char *command_type
 #endif
   json_escape_to(det, sizeof(det), detail ? detail : "");
   json_escape_to(art, sizeof(art), artifacts ? artifacts : "");
+  char auth[1536];
+  if (authorization_json(meta ? &meta->result_authorization : NULL, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
@@ -2233,10 +2281,10 @@ static int command_state_finish(const char *command_id, const char *command_type
            "\"report_next_retry_unix_ms\":0,\"report_last_error\":\"\","
            "\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
-           "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
+           "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
            0u, 0LL,
-           (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
+           (long long)state_now_ms(), scid, run, step, boot, pid, art, det, auth);
   if (once) {
     FILE *lock = state_lock_acquire();
     if (!lock) return -1;
@@ -2414,6 +2462,77 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
   return (int)n;
 }
 
+static int result_string_equal(const cJSON *result, const char *name, const char *expected) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(result, name);
+  return cJSON_IsString(value) && value->valuestring && !strcmp(value->valuestring, expected);
+}
+
+int edr_command_state_result_authorized(const char *tenant, const char *endpoint,
+                                        const void *body, size_t len) {
+  if (!tenant || !tenant[0] || !endpoint || !endpoint[0] || !body || !len) return 0;
+  cJSON *root = cJSON_ParseWithLength((const char *)body, len);
+  const cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+  const cJSON *id = cJSON_GetObjectItemCaseSensitive(result, "command_id");
+  if (!cJSON_IsString(id) || !id->valuestring || !id->valuestring[0]) {
+    cJSON_Delete(root); return 0;
+  }
+  EdrCommandStateRecord *latest = calloc(1u, sizeof(*latest));
+  char *line = malloc(EDR_COMMAND_STATE_LINE_CAP);
+  if (!latest || !line) { free(latest); free(line); cJSON_Delete(root); return 0; }
+  char path[1024]; state_default_path(path, sizeof(path));
+  FILE *lock = state_lock_acquire();
+  FILE *f = lock ? state_open_read_secure(path, NULL) : NULL;
+  int valid = f != NULL;
+  while (f && fgets(line, EDR_COMMAND_STATE_LINE_CAP, f)) {
+    if (!strchr(line, '\n')) { valid = 0; break; }
+    if (!line_matches_key(line, "command_id", id->valuestring)) continue;
+    EdrCommandStateRecord candidate;
+    fill_record_from_line(line, &candidate);
+    if (!strcmp(candidate.command_id, id->valuestring)) *latest = candidate;
+  }
+  if (f) { if (ferror(f)) valid = 0; fclose(f); }
+  state_lock_release(lock);
+  const EdrCommandResultAuthorization *a = &latest->result_authorization;
+  int64_t now = state_now_ms();
+  valid = valid && latest->final_record && latest->report_pending &&
+      a->expires_unix_ms > now && a->expires_unix_ms <= now + 86700000LL &&
+      !strcmp(a->tenant_id, tenant) && !strcmp(a->endpoint_id, endpoint) &&
+      result_string_equal(root, "endpoint_id", endpoint) &&
+      result_string_equal(result, "endpoint_id", endpoint) &&
+      result_string_equal(result, "command_type", latest->command_type) &&
+      result_string_equal(result, "detail_utf8", latest->detail) &&
+      result_string_equal(result, "soar_correlation_id", latest->soar_correlation_id) &&
+      result_string_equal(result, "playbook_run_id", latest->playbook_run_id) &&
+      result_string_equal(result, "playbook_step_id", latest->playbook_step_id);
+  const cJSON *status = cJSON_GetObjectItemCaseSensitive(result, "status");
+  const cJSON *exit_code = cJSON_GetObjectItemCaseSensitive(result, "exit_code");
+  valid = valid && cJSON_IsNumber(status) && status->valuedouble == latest->execution_status &&
+      cJSON_IsNumber(exit_code) && exit_code->valuedouble == latest->exit_code;
+  if (valid && !strcmp(latest->command_type, "shell_stream")) {
+    /* Streams inherit the admitted session, never authority from an ID prefix alone. */
+    cJSON *stream = cJSON_Parse(latest->detail);
+    const cJSON *seq = cJSON_GetObjectItemCaseSensitive(stream, "seq");
+    char expected[128] = "";
+    if (strlen(a->command_id) < 48u && cJSON_IsNumber(seq) && seq->valuedouble >= 1 &&
+        seq->valuedouble < 9007199254740992.0 &&
+        seq->valuedouble == (double)(uint64_t)seq->valuedouble) {
+      snprintf(expected, sizeof(expected), "%.47s.s%06llu", a->command_id,
+               (unsigned long long)seq->valuedouble);
+    }
+    valid = !strcmp(a->command_type, "shell_open") &&
+        result_string_equal(stream, "schema", "edr.shell.stream.v1") &&
+        result_string_equal(stream, "session_id", a->command_id) &&
+        !strcmp(expected, latest->command_id) &&
+        !strcmp(latest->soar_correlation_id, a->command_id);
+    cJSON_Delete(stream);
+  } else if (valid) {
+    valid = !strcmp(a->command_id, latest->command_id) &&
+        !strcmp(a->command_type, latest->command_type);
+  }
+  free(latest); free(line); cJSON_Delete(root);
+  return valid;
+}
+
 int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
                                         const char *error,
                                         int64_t next_retry_unix_ms) {
@@ -2448,6 +2567,8 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
   uint32_t attempts = record->report_attempts < UINT32_MAX
                           ? record->report_attempts + 1u
                           : UINT32_MAX;
+  char auth[1536];
+  if (authorization_json(&record->result_authorization, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
@@ -2456,11 +2577,11 @@ int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
            "\"report_next_retry_unix_ms\":%lld,\"report_last_error\":%s,"
            "\"updated_unix_ms\":%lld,\"soar_correlation_id\":%s,"
            "\"playbook_run_id\":%s,\"playbook_step_id\":%s,\"agent_boot_id\":%s,"
-           "\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
+           "\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, record->execution_status, record->exit_code,
            record->retry_count, attempts, (long long)now_ms,
            (long long)next_retry_unix_ms, report_error, (long long)now_ms,
-           scid, run, step, boot, pid, art, det);
+           scid, run, step, boot, pid, art, det, auth);
   if (append_state_line_locked(line) != 0) {
     return -1;
   }
@@ -2496,6 +2617,8 @@ int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
 #else
   int pid = record->process_id ? record->process_id : (int)getpid();
 #endif
+  char auth[1536];
+  if (authorization_json(&record->result_authorization, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
@@ -2504,12 +2627,12 @@ int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
            "\"report_next_retry_unix_ms\":0,\"report_last_error\":%s,"
            "\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
-           "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s}",
+           "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, record->execution_status, record->exit_code,
            record->retry_count, record->report_attempts,
            (long long)record->report_last_failure_unix_ms,
            record->report_last_error[0] ? report_error : "\"\"",
-           (long long)state_now_ms(), scid, run, step, boot, pid, art, det);
+           (long long)state_now_ms(), scid, run, step, boot, pid, art, det, auth);
   if (append_state_line_locked(line) != 0) {
     return -1;
   }
@@ -2581,7 +2704,7 @@ void edr_command_state_compact_if_needed(void) {
   }
   size_t idx = 0;
   size_t retained_bytes = 0u;
-  char buf[8192];
+  char buf[EDR_COMMAND_STATE_LINE_CAP];
   while (fgets(buf, sizeof(buf), f)) {
     size_t slot = idx % keep_lines;
     if (lines[slot]) {

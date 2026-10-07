@@ -1,3 +1,4 @@
+#include "edr/egress_request_policy.h"
 #include "edr/validation_trace.h"
 #include "edr/agent.h"
 
@@ -1674,18 +1675,10 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   int sqlite_policy = agent && agent->cfg.offline.queue_db_path[0];
   int velo_policy = edr_response_forensic_external_enabled();
   int yara_external_policy = edr_response_yara_external_enabled();
-  int artifact_upload_configured = agent && http_rt && http_rt->configured && http_rt->mtls_configured &&
-      agent->cfg.platform.request_signing.enabled &&
-      agent->cfg.platform.request_signing.key_id[0] &&
-      agent->cfg.platform.request_signing.secret[0];
-  int artifact_upload_failed = http_rt &&
-      (strncmp(http_rt->upload_status, "failed", 6u) == 0 ||
-       strstr(http_rt->http2_last_error, "upload-file") != NULL);
-  const char *artifact_upload_runtime = !(http_rt && http_rt->configured && http_rt->mtls_configured)
-                                            ? "unavailable"
-                                        : !artifact_upload_configured ? "degraded"
-                                        : artifact_upload_failed ? "degraded"
-                                        : http_rt->upload_ok_count > 0u ? "healthy" : "idle";
+  /* Multipart remains a separately authorized purpose. Transport readiness
+   * alone must not advertise an upload path the final egress guard denies. */
+  int artifact_upload_configured = 0;
+  const char *artifact_upload_runtime = "disabled";
   int yara_command_build = yara_build || velo_policy;
   int yara_command_policy = yara_external_policy ? (velo_policy && artifact_upload_configured)
                                                   : (yara_build && yara_rules_ready);
@@ -1827,9 +1820,9 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara_scan\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"artifact_upload_required\":%s},"
-      "\"memory_dump\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
-      "\"targeted_forensic\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
-      "\"targeted_forensic_file\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"memory_dump\":{\"artifact_upload_required\":true,\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
+      "\"targeted_forensic\":{\"artifact_upload_required\":true,\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"targeted_forensic_file\":{\"artifact_upload_required\":true,\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
       "\"targeted_forensic_process\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_registry\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
       "\"targeted_forensic_memory\":{\"code_supported\":false,\"build_supported\":false,\"policy_enabled\":false,\"runtime_status\":\"unsupported\"},"
@@ -2451,7 +2444,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
         "\"capability_manifest\":%s,"
-        "\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
+        "\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"denied_requests\":%lu,"
         "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
         "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
         "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu},"
@@ -3039,7 +3032,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  queue_capacity_metrics.accounting_available);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
       p0_health_json, sizeof(p0_health_json), &p0_health_used,
-      ",\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":%lu,"
+      ",\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"denied_requests\":%lu,"
       "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
         "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
         "\"retained_unresolved_rows\":%llu,\"projection_pending_rows\":%llu,\"projection_acked_rows\":%llu}",

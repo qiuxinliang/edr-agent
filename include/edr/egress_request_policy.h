@@ -7,6 +7,14 @@
 #define EDR_EGRESS_REQUEST_DENIED (-3)
 #define EDR_EGRESS_HEALTH_MAX_BYTES (32768u)
 #define EDR_EGRESS_BATCH_WIRE_MAX_BYTES (8u * 1024u * 1024u)
+#define EDR_EGRESS_COMMAND_RESULT_MAX_BYTES (128u * 1024u)
+#define EDR_EGRESS_POLICY_VERSION "minimal-egress-v2"
+
+/* Registered by command state before transport starts. Missing owner denies
+ * results; registering a callback never authorizes a route or arbitrary body. */
+typedef int (*EdrEgressCommandResultValidator)(const char *tenant_id,
+    const char *endpoint_id, const void *body, size_t len);
+void edr_egress_set_command_result_validator(EdrEgressCommandResultValidator validator);
 
 int edr_egress_request_validate(const char *method, const char *suffix_or_url,
                                 const char *content_type, const void *body,

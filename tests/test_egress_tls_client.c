@@ -14,6 +14,10 @@
 #include <stdatomic.h>
 #include <time.h>
 #ifdef EDR_TEST_EXTENDED_EGRESS
+#include "edr/command_state.h"
+#include "edr/command_result_json.h"
+#include "edr/command_executor.h"
+#include "edr/config.h"
 #include "edr/egress_batch_policy.h"
 #include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
@@ -240,6 +244,87 @@ static int p0_journal_receipt_scenario(const char *queue_path) {
 }
 #endif
 
+#ifdef EDR_TEST_EXTENDED_EGRESS
+static int command_result_scenario(const char *path) {
+#ifdef _WIN32
+  _putenv_s("EDR_COMMAND_STATE_DIR", path);
+#else
+  setenv("EDR_COMMAND_STATE_DIR", path, 1);
+#endif
+  EdrConfig cfg = {0};
+  strcpy(cfg.agent.tenant_id, "synthetic-tenant");
+  strcpy(cfg.agent.endpoint_id, "synthetic-endpoint");
+  edr_command_bind_config(&cfg);
+  EdrSoarCommandMeta meta = {0};
+  const char *signature = getenv("EDR_TEST_COMMAND_SIGNATURE");
+  const char *issued = getenv("EDR_TEST_COMMAND_ISSUED");
+  CHECK(signature && issued);
+  if (!signature || !issued) return 1;
+  snprintf(meta.idempotency_key, sizeof(meta.idempotency_key), "%s", signature);
+  meta.issued_at_unix_ms = (int64_t)strtoll(issued, NULL, 10);
+  meta.deadline_ms = 30000;
+  /* Changed identity invalidates the actual Ed25519 signature. */
+  CHECK(edr_command_receive_envelope("cmd_synthetic_forged", "noop", (const uint8_t *)"{}", 2, &meta) == 0);
+  CHECK(edr_ingest_http_post_command_result_typed("cmd_synthetic_forged", "noop", &meta, 1, 0, "forged") != 0);
+  CHECK(edr_command_receive_envelope("cmd_synthetic_noop", "noop", (const uint8_t *)"[]", 2, &meta) == 0);
+  CHECK(edr_command_receive_envelope("cmd_synthetic_noop", "noop", (const uint8_t *)"{}", 2, &meta) == 1);
+  edr_command_executor_wake();
+  EdrCommandStateRecord *pending = calloc(8u, sizeof(*pending)); CHECK(pending);
+  int found = -1;
+  for (unsigned attempt = 0; pending && attempt < 5u && found < 0; ++attempt) {
+    pause_retry();
+    int count = edr_command_state_collect_pending(pending, 8u);
+    for (int i = 0; i < count; ++i)
+      if (!strcmp(pending[i].command_id, "cmd_synthetic_noop")) found = i;
+  }
+  CHECK(found >= 0);
+  if (found >= 0) {
+    EdrCommandStateRecord *record = &pending[found];
+    CHECK(record->execution_status == 1 && record->result_authorization.expires_unix_ms > 0);
+    CHECK(edr_ingest_http_post_command_result_typed(record->command_id, record->command_type, &meta,
+        record->execution_status, record->exit_code, "replacement bytes") != 0);
+    /* Receiver deliberately returns an incomplete ACK once. */
+    CHECK(edr_ingest_http_post_command_result_typed(record->command_id, record->command_type, &meta,
+        record->execution_status, record->exit_code, record->detail) != 0);
+    CHECK(edr_ingest_http_post_command_result_typed(record->command_id, record->command_type, &meta,
+        record->execution_status, record->exit_code, record->detail) == 0);
+    CHECK(edr_command_state_mark_reported(record) == 0);
+    CHECK(edr_ingest_http_post_command_result_typed(record->command_id, record->command_type, &meta,
+        record->execution_status, record->exit_code, record->detail) != 0);
+  }
+  /* Authenticated rejection results must remain reportable; no execution occurs. */
+  const char *kinds[] = {"EXPIRED", "INVALID"};
+  const char *ids[] = {"cmd_synthetic_expired", "cmd_synthetic_invalid"};
+  const char *types[] = {"noop", "rtq_execute"};
+  for (size_t k = 0; k < 2; ++k) {
+    char key[96]; EdrSoarCommandMeta rejected = {0};
+    snprintf(key, sizeof(key), "EDR_TEST_%s_SIGNATURE", kinds[k]);
+    const char *sig = getenv(key);
+    snprintf(key, sizeof(key), "EDR_TEST_%s_ISSUED", kinds[k]);
+    const char *when = getenv(key);
+    CHECK(sig && when); if (!sig || !when) continue;
+    snprintf(rejected.idempotency_key, sizeof(rejected.idempotency_key), "%s", sig);
+    rejected.issued_at_unix_ms = strtoll(when, NULL, 10); rejected.deadline_ms = 30000;
+    CHECK(edr_command_receive_envelope(ids[k], types[k], (const uint8_t *)"{}", 2, &rejected) == 0);
+    int count = edr_command_state_collect_pending(pending, 8u), match = 0;
+    for (int i = 0; i < count; ++i) if (!strcmp(pending[i].command_id, ids[k])) {
+      EdrCommandStateRecord *r = &pending[i]; match = 1;
+      CHECK(r->execution_status == (k == 0 ? EdrCmdExecFailed : EdrCmdExecRejected));
+      char *body = edr_command_result_http_json("synthetic-endpoint", "test-v1", r->command_id,
+          r->command_type, r->execution_status, r->exit_code, r->detail,
+          (int64_t)time(NULL)*1000, "", "", "");
+      CHECK(body && edr_command_state_result_authorized("synthetic-tenant", "synthetic-endpoint", body, strlen(body)));
+      free(body);
+    }
+    CHECK(match);
+  }
+  CHECK(edr_command_executor_shutdown_timeout(5000) == 1);
+  edr_command_bind_config(NULL); free(pending);
+  printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"failed_checks\":%u}\n", failed);
+  return failed ? 1 : 0;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc != 7) {
     fprintf(stderr, "usage: test_egress_tls_client BASE_URL CA CLIENT_CERT CLIENT_KEY QUEUE_PATH MODE\n"); return 2;
@@ -250,6 +335,7 @@ int main(int argc, char **argv) {
   int v2 = !strcmp(argv[6], "positive-v2");
   edr_ingest_http_configure_transport_options(0, 0, 0, 0, v2, "protobuf", v2 ? "zstd" : "none");
 #ifdef EDR_TEST_EXTENDED_EGRESS
+  if (!strcmp(argv[6], "positive-command")) return command_result_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-pmfe")) return pmfe_receipt_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-journal")) return journal_receipt_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-p0-journal")) return p0_journal_receipt_scenario(argv[5]);

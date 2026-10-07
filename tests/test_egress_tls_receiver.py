@@ -321,6 +321,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if batch == "tls-ack-mismatch":
                     ack["payload_sha256"] = "0" * 64
                 self.reply({"code": "OK", "data": {"accepted": True, "invalid_frames": 0, "ack": ack}})
+            elif self.path == "/api/v1/ingest/report-command-result":
+                result = body["result"]
+                if body["endpoint_id"] != "synthetic-endpoint" or result["command_id"] != "cmd_synthetic_noop" or result["command_type"] != "noop" or result["status"] != 1:
+                    raise ValueError("unowned command result reached receiver")
+                stable = dict(result)
+                stable.pop("finished_unix_ms")
+                digest = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+                with closing(sqlite3.connect(self.server.database)) as db, db:
+                    db.execute("PRAGMA synchronous=FULL")
+                    previous = db.execute("SELECT sha,observations FROM receipt WHERE batch_id='cmd_synthetic_noop'").fetchone()
+                    if previous and previous[0] != digest:
+                        raise ValueError("command retry changed terminal body")
+                    count = previous[1] + 1 if previous else 1
+                    db.execute("INSERT INTO receipt VALUES('cmd_synthetic_noop',?,?) ON CONFLICT(batch_id) DO UPDATE SET observations=excluded.observations", (digest, count))
+                self.reply({"code": "OK", "data": {"accepted": True, "complete": count > 1}})
             elif self.path == "/api/v1/ingest/heartbeat":
                 if set(body) != {"endpoint_id", "agent_version", "policy_version"}:
                     raise ValueError("heartbeat raw field reached receiver")
@@ -499,7 +514,7 @@ def main():
         reports = []
         modes = ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host")
         if not args.baseline:
-            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal")
+            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command")
         for mode in modes:
             server = Receiver(root, "wrong-host" if mode == "wrong-host" else "server", root / f"receiver-{mode}.db")
             try:
@@ -508,6 +523,30 @@ def main():
                 environment.pop("EDR_CONTROL_DICT_PATH", None)
                 if mode == "positive-v2":
                     environment["EDR_ZSTD_DICT_PATH"] = str(root / "synthetic.dict")
+                if mode == "positive-command":
+                    executable = shutil.which("openssl")
+                    for command in (
+                        ["genpkey", "-algorithm", "ED25519", "-out", "command.key"],
+                        ["pkey", "-in", "command.key", "-pubout", "-out", "command.pub"],
+                    ):
+                        subprocess.run([executable, *command], cwd=root, check=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                    environment["EDR_COMMAND_SIGNING_PUBLIC_KEY"] = (root / "command.pub").read_text()
+                    for label, command_id, command_type, age in (
+                        ("COMMAND", "cmd_synthetic_noop", "noop", 0),
+                        ("EXPIRED", "cmd_synthetic_expired", "noop", 60000),
+                        ("INVALID", "cmd_synthetic_invalid", "rtq_execute", 0),
+                    ):
+                        issued = str(int(time.time() * 1000) - age)
+                        canonical = "\n".join((command_id, command_type, command_id, issued,
+                                                 "30000", hashlib.sha256(b"{}").hexdigest())).encode()
+                        (root / "command.txt").write_bytes(canonical)
+                        subprocess.run([executable, "pkeyutl", "-sign", "-rawin", "-inkey", "command.key",
+                                        "-in", "command.txt", "-out", "command.sig"], cwd=root, check=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                        signature = base64.urlsafe_b64encode((root / "command.sig").read_bytes()).decode().rstrip("=")
+                        environment[f"EDR_TEST_{label}_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
+                        environment[f"EDR_TEST_{label}_ISSUED"] = issued
                 host = "127.0.0.1" if mode == "positive-ip" else "localhost"
                 result = subprocess.run([args.client, f"https://{host}:{server.server_port}/api/v1",
                                          str(root / ("other-ca.pem" if mode == "wrong-ca" else "ca.pem")),
@@ -531,6 +570,9 @@ def main():
                         reports[-1]["business_alerts"] = db.execute("SELECT COALESCE(SUM(alert_created),0) FROM p0_association").fetchone()[0]
                         if reports[-1]["business_alerts"] != 1:
                             reports[-1]["receiver_business_failures"] += 1
+                if mode == "positive-command":
+                    if len(server.observations) != 2 or reports[-1]["durable_batches"] != 1 or reports[-1]["duplicate_observations"] != 1:
+                        reports[-1]["receiver_business_failures"] += 1
                 if mode in ("positive", "positive-ip", "positive-v2"):
                     reports[-1]["config_receipts"] = server.config_receipts
                     expected = [{"status": "applied", "verified": True, "reason": "", "contract": "2"},

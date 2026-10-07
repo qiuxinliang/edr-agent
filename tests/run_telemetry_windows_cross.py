@@ -51,6 +51,7 @@ def main():
               'src/storage/local_evidence_cache.c','src/preprocess/preprocess_pipeline.c',
               'src/pmfe/pmfe_engine.c','src/pmfe/pmfe_etw_preprocess.c',
               'src/forensic/deep_collector.c','src/transport/ingest_http.c',
+              'src/command/command_state.c','src/command/command_stub.c','src/shell/shell_session.c',
               'src/preprocess/p0_rule_ir.c','src/preprocess/p0_rule_direct_emit.c',
               'src/preprocess/behavior_from_slot.c','src/serialize/behavior_proto.c',
               'src/serialize/behavior_alert_emit.c',
@@ -79,6 +80,8 @@ def main():
     tests = {
         'test_egress_batch_policy': ('tests/test_egress_batch_policy.c',) + codec,
         'test_egress_request_policy': ('tests/test_egress_request_policy.c',),
+        'test_command_result_egress': ('tests/test_command_result_egress.c',
+            'src/command/command_state.c','src/transport/command_result_json.c'),
         'test_deep_collector_manifest': ('tests/test_deep_collector_manifest.c',
             'src/platform/windows_spawn_lock.c'),
     }

@@ -5,6 +5,7 @@
 #ifndef EDR_SHELL_SESSION_H
 #define EDR_SHELL_SESSION_H
 
+#include "edr/command.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -19,7 +20,7 @@ typedef void (*edr_ss_write_fn)(const char *session_id,
                                 uint64_t seq,
                                 const char *data, size_t len,
                                 int exit_code, bool closed,
-                                void *user);
+                                const EdrCommandResultAuthorization *authorization, void *user);
 
 /**
  * 初始化，注册输出回调。
@@ -41,7 +42,8 @@ void edr_shell_session_shutdown(void);
  * shell: "cmd.exe" / "powershell.exe" / "/bin/bash"
  * 返回 0 成功，-1 失败（超过 max 或无法创建进程）
  */
-int edr_shell_session_open(const char *session_id, const char *shell);
+int edr_shell_session_open(const char *session_id, const char *shell,
+                            const EdrCommandResultAuthorization *authorization);
 
 /**
  * 向 session 的 stdin 写入数据。

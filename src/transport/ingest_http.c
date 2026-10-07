@@ -1298,6 +1298,7 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
                                 const char *client_cert_thumbprint,
                                 const char *proxy_mode,
                                 const char *proxy_url, const char *relay_url) {
+  edr_egress_set_command_result_validator(edr_command_state_result_authorized);
   const char *relay_effective = getenv("EDR_RELAY_URL");
   const char *proxy_mode_effective = getenv("EDR_PROXY_MODE");
   const char *proxy_url_effective = getenv("EDR_PROXY_URL");

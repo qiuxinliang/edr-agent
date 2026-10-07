@@ -12,12 +12,16 @@ static size_t s_max_chunk;
 static volatile int s_poll_running;
 
 static void capture_output(const char *session_id, uint64_t seq, const char *data, size_t len,
-                           int exit_code, bool closed, void *user) {
+                           int exit_code, bool closed, const EdrCommandResultAuthorization *authorization, void *user) {
   (void)session_id;
   (void)seq;
   (void)exit_code;
   (void)closed;
   (void)user;
+  if (!authorization || strcmp(authorization->command_id, session_id) ||
+      strcmp(authorization->tenant_id, "synthetic-tenant")) {
+    fputs("FAIL: session lost its original result authority\n", stderr); exit(1);
+  }
   if (!data || len == 0u) return;
   if (len > s_max_chunk) s_max_chunk = len;
   size_t remaining = sizeof(s_output) - 1u - s_output_len;
@@ -55,7 +59,10 @@ static void exercise_concurrent_lifecycle(void) {
   for (int i = 0; i < 50; i++) {
     char session_id[64];
     snprintf(session_id, sizeof(session_id), "test-shell-race-%d", i);
-    require_true(edr_shell_session_open(session_id, "/bin/sh") == 0,
+    EdrCommandResultAuthorization authority = {0};
+    snprintf(authority.command_id, sizeof(authority.command_id), "%s", session_id);
+    snprintf(authority.tenant_id, sizeof(authority.tenant_id), "synthetic-tenant");
+    require_true(edr_shell_session_open(session_id, "/bin/sh", &authority) == 0,
                  "open shell while poll thread is active");
     require_true(edr_shell_session_input(session_id, input, sizeof(input) - 1u) == 0,
                  "write shell while poll thread is active");
@@ -71,12 +78,15 @@ static void exercise_concurrent_lifecycle(void) {
 
 int main(void) {
   const char *session_id = "test-shell-stream";
+  EdrCommandResultAuthorization authority = {0};
+  snprintf(authority.command_id, sizeof(authority.command_id), "%s", session_id);
+  snprintf(authority.tenant_id, sizeof(authority.tenant_id), "synthetic-tenant");
   const char command[] =
       "printf 'BEGIN-RTR\\n'; i=0; while [ $i -lt 12000 ]; do printf A; "
       "i=$((i+1)); done; printf '\\nEND-RTR\\n'\n";
 
   edr_shell_session_init(1u, 10u, EDR_SS_BUF_KB, capture_output, NULL);
-  require_true(edr_shell_session_open(session_id, "/bin/sh") == 0,
+  require_true(edr_shell_session_open(session_id, "/bin/sh", &authority) == 0,
                "open test shell session");
   require_true(edr_shell_session_input(session_id, command, sizeof(command) - 1u) == 0,
                "write long shell command");

@@ -2227,7 +2227,8 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
 }
 
 static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *data, size_t len,
-                                   int exit_code, bool closed, void *user) {
+                                   int exit_code, bool closed,
+                                   const EdrCommandResultAuthorization *authorization, void *user) {
   (void)user;
   char sid_copy[EDR_SS_ID_LEN];
   if (!command_copy_bounded_cstr_exact(sid_copy, sizeof(sid_copy), sid, EDR_SS_ID_LEN) ||
@@ -2283,6 +2284,7 @@ static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *da
 
   EdrSoarCommandMeta dummy;
   memset(&dummy, 0, sizeof(dummy));
+  if (authorization) dummy.result_authorization = *authorization;
   (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
                                          sizeof(dummy.soar_correlation_id), sid_copy,
                                          sizeof(sid_copy));
@@ -2303,6 +2305,7 @@ persist_failure:
   {
     EdrSoarCommandMeta dummy;
     memset(&dummy, 0, sizeof(dummy));
+    if (authorization) dummy.result_authorization = *authorization;
     (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
                                            sizeof(dummy.soar_correlation_id), sid_copy,
                                            sizeof(sid_copy));
@@ -2345,7 +2348,7 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
     snprintf(shell_type, sizeof(shell_type), "%s", requested_shell);
   }
   ensure_shell_session_initialized();
-  int rc = edr_shell_session_open(cmd_id, shell_type);
+  int rc = edr_shell_session_open(cmd_id, shell_type, &sm->result_authorization);
   if (rc != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "shell_open: failed");
@@ -5966,11 +5969,15 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
                                          int internal_trusted) {
   EdrSoarCommandMeta empty;
   memset(&empty, 0, sizeof(empty));
-  const EdrSoarCommandMeta *sm = soar_meta ? soar_meta : &empty;
+  EdrSoarCommandMeta normalized_meta = soar_meta ? *soar_meta : empty;
+  memset(&normalized_meta.result_authorization, 0, sizeof(normalized_meta.result_authorization));
+  const EdrSoarCommandMeta *sm = &normalized_meta;
   const char *t = command_type ? command_type : "";
   const char *id = command_id ? command_id : "";
   command_set_active_type_owned(t);
 
+  /* Unverified input has no authority over command IDs or replay state.
+   * Keep the rejection audit, without creating a trusted terminal record. */
   char sig_reason[160];
   sig_reason[0] = 0;
   CommandSignaturePolicy signature_policy;
@@ -5978,18 +5985,15 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
                                     sig_reason, sizeof(sig_reason))) {
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature policy rejected");
-    soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature policy rejected");
     return 0;
   }
   if (!edr_command_signature_verify(id, t, payload, payload_len, sm, &signature_policy,
                                 sig_reason, sizeof(sig_reason))) {
     s_rejected++;
     audit_both(id, sig_reason[0] ? sig_reason : "command signature rejected");
-    soar_emit(id, sm, EdrCmdExecRejected, 15, sig_reason[0] ? sig_reason : "command signature rejected");
     return 0;
   }
 
-  EdrSoarCommandMeta normalized_meta = *sm;
   if (normalized_meta.issued_at_unix_ms <= 0) {
     normalized_meta.issued_at_unix_ms = command_now_ms();
   }
@@ -5997,6 +6001,21 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
     normalized_meta.deadline_ms = edr_command_registry_default_timeout_s(t) * 1000u;
   }
   sm = &normalized_meta;
+
+  /* Only the verified remote owner may create result authority. Local automatic
+   * actions and unsigned compatibility commands cannot authorize extra egress. */
+  const EdrConfig *cfg = edr_command_get_config();
+  const EdrCommandDescriptor *result_owner = edr_command_registry_lookup(t);
+  if (!internal_trusted && signature_policy.required && cfg && result_owner &&
+      cfg->agent.tenant_id[0] && cfg->agent.endpoint_id[0]) {
+    EdrCommandResultAuthorization *a = &normalized_meta.result_authorization;
+    if (!command_copy_bounded_cstr_exact(a->command_id, sizeof(a->command_id), id, 128u) ||
+        !command_copy_bounded_cstr_exact(a->command_type, sizeof(a->command_type),
+                                        result_owner->canonical_type, 64u)) return -1;
+    memcpy(a->tenant_id, cfg->agent.tenant_id, sizeof(a->tenant_id));
+    memcpy(a->endpoint_id, cfg->agent.endpoint_id, sizeof(a->endpoint_id));
+    a->expires_unix_ms = normalized_meta.issued_at_unix_ms + 86400000LL;
+  }
 
   char deadline_reason[180];
   deadline_reason[0] = '\0';

@@ -34,6 +34,7 @@ typedef struct EdrCommandStateRecord {
   char playbook_step_id[128];
   char artifacts[1024];
   char detail[EDR_COMMAND_STATE_DETAIL_CAP];
+  EdrCommandResultAuthorization result_authorization;
 } EdrCommandStateRecord;
 
 typedef struct EdrCommandInboxRecord {
@@ -145,6 +146,9 @@ void edr_command_state_delete_pending_ack(const char *command_id);
 void edr_command_state_get_quarantine_stats(EdrCommandStateQuarantineStats *out_stats);
 
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap);
+/* Final egress guard: exact durable terminal bytes and admitted task scope. */
+int edr_command_state_result_authorized(const char *tenant_id, const char *endpoint_id,
+                                        const void *body, size_t len);
 int edr_command_state_mark_report_retry(const EdrCommandStateRecord *record,
                                         const char *error,
                                         int64_t next_retry_unix_ms);

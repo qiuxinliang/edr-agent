@@ -10,6 +10,7 @@
 
 typedef struct {
   char session_id[EDR_SS_ID_LEN];
+  EdrCommandResultAuthorization result_authorization;
   HANDLE process;
   HANDLE stdin_w;
   HANDLE stdout_r;
@@ -90,7 +91,8 @@ void edr_shell_session_shutdown(void) {
   sessions_unlock();
 }
 
-int edr_shell_session_open(const char *session_id, const char *shell) {
+int edr_shell_session_open(const char *session_id, const char *shell,
+                            const EdrCommandResultAuthorization *authorization) {
   sessions_lock();
   if (!g_initialized || !session_id || !shell) {
     sessions_unlock();
@@ -182,6 +184,8 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   s->job = job;
   s->start_ms = GetTickCount64();
   s->next_seq = 1u;
+  memset(&s->result_authorization, 0, sizeof(s->result_authorization));
+  if (authorization) s->result_authorization = *authorization;
   s->active = true;
   sessions_unlock();
   return 0;
@@ -241,7 +245,7 @@ void edr_shell_session_poll(void) {
       if (g_write_fn) {
         DWORD ec = 0;
         GetExitCodeProcess(s->process, &ec);
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, g_write_user);
+        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, &s->result_authorization, g_write_user);
       }
       close_session_handles(s);
       (void)memset(s, 0, sizeof(*s));
@@ -257,7 +261,7 @@ void edr_shell_session_poll(void) {
         DWORD got = 0;
         if (ReadFile(s->stdout_r, buf, avail, &got, NULL) && got > 0) {
           if (g_write_fn) {
-            g_write_fn(s->session_id, s->next_seq++, buf, got, 0, false, g_write_user);
+            g_write_fn(s->session_id, s->next_seq++, buf, got, 0, false, &s->result_authorization, g_write_user);
           }
         }
         free(buf);
@@ -267,7 +271,7 @@ void edr_shell_session_poll(void) {
     DWORD ec = 0;
     if (GetExitCodeProcess(s->process, &ec) && ec != STILL_ACTIVE) {
       if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, g_write_user);
+        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, &s->result_authorization, g_write_user);
       }
       close_session_handles(s);
       (void)memset(s, 0, sizeof(*s));
@@ -278,7 +282,7 @@ void edr_shell_session_poll(void) {
     if (g_timeout_s > 0 && elapsed > (uint64_t)g_timeout_s * 1000ULL) {
       TerminateProcess(s->process, 1);
       if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, g_write_user);
+        g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, &s->result_authorization, g_write_user);
       }
       close_session_handles(s);
       (void)memset(s, 0, sizeof(*s));
@@ -308,6 +312,7 @@ uint32_t edr_shell_session_active_count(void) {
 
 typedef struct {
   char session_id[EDR_SS_ID_LEN];
+  EdrCommandResultAuthorization result_authorization;
   pid_t child_pid;
   int stdin_fd;
   int stdout_fd;
@@ -386,7 +391,8 @@ void edr_shell_session_shutdown(void) {
   sessions_unlock();
 }
 
-int edr_shell_session_open(const char *session_id, const char *shell) {
+int edr_shell_session_open(const char *session_id, const char *shell,
+                            const EdrCommandResultAuthorization *authorization) {
   sessions_lock();
   if (!g_initialized || !session_id || !shell) {
     sessions_unlock();
@@ -435,6 +441,8 @@ int edr_shell_session_open(const char *session_id, const char *shell) {
   s->stdout_fd = stdout_pipe[0];
   s->start_ms = ms_now();
   s->next_seq = 1u;
+  memset(&s->result_authorization, 0, sizeof(s->result_authorization));
+  if (authorization) s->result_authorization = *authorization;
   s->active = true;
   sessions_unlock();
   return 0;
@@ -493,7 +501,7 @@ void edr_shell_session_poll(void) {
     ssize_t n = read(s->stdout_fd, buf, cap);
     if (n > 0) {
       if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, buf, (size_t)n, 0, false, g_write_user);
+        g_write_fn(s->session_id, s->next_seq++, buf, (size_t)n, 0, false, &s->result_authorization, g_write_user);
       }
     }
 
@@ -502,7 +510,7 @@ void edr_shell_session_poll(void) {
     if (wr > 0) {
       int ec = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
       if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, ec, true, g_write_user);
+        g_write_fn(s->session_id, s->next_seq++, NULL, 0, ec, true, &s->result_authorization, g_write_user);
       }
       if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
       if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
@@ -517,7 +525,7 @@ void edr_shell_session_poll(void) {
         kill(s->child_pid, SIGKILL);
         waitpid(s->child_pid, NULL, WNOHANG);
         if (g_write_fn) {
-          g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, g_write_user);
+          g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, &s->result_authorization, g_write_user);
         }
         if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
         if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }

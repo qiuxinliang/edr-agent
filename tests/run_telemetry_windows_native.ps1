@@ -23,7 +23,7 @@ try {
   $listing = & ctest --test-dir $build -C $Configuration -N --show-only=json-v1
   if ($LASTEXITCODE -ne 0) { throw 'CTest inventory failed.' }
   $inventory = ($listing -join "`n") | ConvertFrom-Json
-  $required = @('egress_batch_policy','egress_request_policy','egress_receiver_resources','queue_recovery_real_codec',
+  $required = @('egress_batch_policy','egress_request_policy','command_result_egress','egress_receiver_resources','queue_recovery_real_codec',
     'local_evidence_cache_candidate','storage_queue_sqlite_contract','deep_collector_manifest',
     'p0_source_only_durable_contract','egress_loopback_mtls','report_events_ack_contract',
     'pmfe_lifecycle_policy_switch')

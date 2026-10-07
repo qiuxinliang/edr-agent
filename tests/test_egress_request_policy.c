@@ -84,7 +84,7 @@ int main(void) {
         n + 17u, why, sizeof(why)) != 0);
     free(hidden);
   }
-  const char *input = "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"reported_at_unix_ms\":1700000000000,\"config_recovery\":{\"active\":true,\"source\":\"synthetic-secret-path\",\"reason\":\"synthetic-secret-error\"},\"sensor_health\":{\"event_filter\":{\"last_drop\":{\"cmdline\":\"synthetic-secret-command\"}},\"file_read_collection\":{\"metadata_gate\":{\"healthy\":false,\"durable_failures\":2,\"reason\":\"synthetic-secret-user\"}}},\"p0_acceptance\":{\"source_only\":{\"terminal_unhealthy\":true,\"retry_pending\":3,\"reason\":\"process_generation_or_correlation_unavailable\"}},\"p0_offline_queue_capacity\":{\"local_evidence_rows\":4,\"policy_held_rows\":1},\"egress\":{\"policy_version\":\"minimal-egress-v1\",\"denied_requests\":3},\"capability_manifest\":{\"schema\":\"edr.agent.capabilities.v1\",\"features\":{\"pmfe\":{\"code_supported\":true,\"runtime_status\":\"healthy\",\"detail\":\"synthetic-secret-detail\"}}},\"raw_event\":{\"username\":\"synthetic-secret-user\"}}}";
+  const char *input = "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"reported_at_unix_ms\":1700000000000,\"config_recovery\":{\"active\":true,\"source\":\"synthetic-secret-path\",\"reason\":\"synthetic-secret-error\"},\"sensor_health\":{\"event_filter\":{\"last_drop\":{\"cmdline\":\"synthetic-secret-command\"}},\"file_read_collection\":{\"metadata_gate\":{\"healthy\":false,\"durable_failures\":2,\"reason\":\"synthetic-secret-user\"}}},\"p0_acceptance\":{\"source_only\":{\"terminal_unhealthy\":true,\"retry_pending\":3,\"reason\":\"process_generation_or_correlation_unavailable\"}},\"p0_offline_queue_capacity\":{\"local_evidence_rows\":4,\"policy_held_rows\":1},\"egress\":{\"policy_version\":\"minimal-egress-v2\",\"task_results_supported\":true,\"denied_requests\":3},\"capability_manifest\":{\"schema\":\"edr.agent.capabilities.v1\",\"features\":{\"pmfe\":{\"code_supported\":true,\"runtime_status\":\"healthy\",\"detail\":\"synthetic-secret-detail\"}}},\"raw_event\":{\"username\":\"synthetic-secret-user\"}}}";
   char reason[128];
   assert(check("POST", "ingest/engine-health", input) != 0);
   char *minimal = edr_egress_health_project(input, reason, sizeof(reason));
@@ -94,6 +94,7 @@ int main(void) {
   assert(strstr(minimal, "local_evidence_rows") && strstr(minimal, "policy_held_rows") && strstr(minimal, "capability_manifest"));
   assert(strstr(minimal, "process_generation_or_correlation_unavailable"));
   assert(strstr(minimal, "detail_available_locally"));
+  assert(strstr(minimal, "\"task_results_supported\":true"));
   assert(check("POST", "ingest/engine-health", minimal) == 0);
   /* Every cJSON allocation boundary either succeeds or fails the complete
    * projection. Never silently return a partial known health block on OOM. */

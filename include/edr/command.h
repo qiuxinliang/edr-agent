@@ -40,6 +40,17 @@ void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record);
 /* Checked again at execution, after a queued automatic action may outlive a policy change. */
 int edr_ransom_auto_response_enabled(void);
 
+/* Local-only authority, minted after signed external command admission. Never
+ * decoded from a transport field. Results may retry for 24h after issue;
+ * this does not extend the command's execution deadline. */
+typedef struct EdrCommandResultAuthorization {
+  char command_id[128];
+  char command_type[64];
+  char tenant_id[128];
+  char endpoint_id[128];
+  int64_t expires_unix_ms;
+} EdrCommandResultAuthorization;
+
 /** 与 CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由控制面写入） */
 typedef struct EdrSoarCommandMeta {
   char soar_correlation_id[128];
@@ -50,6 +61,7 @@ typedef struct EdrSoarCommandMeta {
   uint32_t deadline_ms;
   /* 命令发起来源(取证 velo 仅允许 "operator" 人工下发;空/其它=自动化,被 gate 拒绝)。 */
   char initiated_by[32];
+  EdrCommandResultAuthorization result_authorization;
 } EdrSoarCommandMeta;
 
 /** 与 ingest.proto CommandExecutionStatus 枚举值一致 */

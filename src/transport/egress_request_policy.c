@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "edr/egress_request_policy.h"
 #include "edr/egress_batch_policy.h"
 #include "edr/p0_source_only_contract.h"
@@ -136,7 +137,7 @@ static const HealthField health_fields[] = {
   N("correlation.active_states"), N("correlation.observed"), N("correlation.evaluated"),
   N("correlation.fired"), N("correlation.suppressed"), N("correlation.evicted"),
   N("correlation.inject_fed"), N("correlation.inject_dropped"), N("correlation.rate_dropped"),
-  T("egress.policy_version"), N("egress.denied_requests"),
+  T("egress.policy_version"), B("egress.task_results_supported"), N("egress.denied_requests"),
   B("egress.capacity_limit_defaulted"),
   N("egress.policy_held_rows"), N("egress.local_evidence_rows"), R("egress.last_reason"),
   N("egress.terminal_policy_held_frames"), N("egress.terminal_local_retained"), N("egress.legacy_owner_unacknowledged"),
@@ -203,6 +204,11 @@ static const HealthField health_fields[] = {
 #undef T
 #undef S
 #undef R
+
+static _Atomic(EdrEgressCommandResultValidator) command_result_validator;
+void edr_egress_set_command_result_validator(EdrEgressCommandResultValidator validator) {
+  atomic_store_explicit(&command_result_validator, validator, memory_order_release);
+}
 
 static int deny(char *reason, size_t cap, const char *cause) {
   if (reason && cap) snprintf(reason, cap, "%s", cause);
@@ -726,6 +732,32 @@ static int control_post_valid(const char *path, const cJSON *root) {
   return control_object_valid(root, "", fields, count, 0u);
 }
 
+static int command_result_schema_valid(const cJSON *root) {
+  static const char *const keys[] = {"command_id", "command_type", "endpoint_id", "agent_version",
+    "status", "exit_code", "detail_utf8", "finished_unix_ms", "soar_correlation_id",
+    "playbook_run_id", "playbook_step_id"};
+  const cJSON *v;
+  cJSON_ArrayForEach(v, root)
+    if (strcmp(v->string, "endpoint_id") && strcmp(v->string, "result")) return 0;
+  const cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "result");
+  if (!cJSON_IsObject(r) || cJSON_GetArraySize(r) != 11) return 0;
+  cJSON_ArrayForEach(v, r) {
+    if (!listed(v->string, keys, sizeof(keys) / sizeof(keys[0]))) return 0;
+    if (!strcmp(v->string, "status")) {
+      if (!cJSON_IsNumber(v) || v->valuedouble < 1 || v->valuedouble > 4 ||
+          floor(v->valuedouble) != v->valuedouble) return 0;
+    } else if (!strcmp(v->string, "exit_code")) {
+      if (!cJSON_IsNumber(v) || v->valuedouble < -2147483648.0 || v->valuedouble > 2147483647.0 ||
+          floor(v->valuedouble) != v->valuedouble) return 0;
+    } else if (!strcmp(v->string, "finished_unix_ms")) {
+      if (!valid_value(v, H_NUMBER) || v->valuedouble < 1) return 0;
+    } else if (!strcmp(v->string, "detail_utf8")) {
+      if (!cJSON_IsString(v) || !v->valuestring || strlen(v->valuestring) >= 16384u) return 0;
+    } else if (!token(v, 127u)) return 0;
+  }
+  return 1;
+}
+
 int edr_egress_request_validate_for_scope(const char *method, const char *suffix_or_url,
                                 const char *content_type, const void *body,
                                 size_t len,const char *tenant,const char *endpoint,
@@ -738,18 +770,19 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   if (strncmp(path, "/api/v1/", 8u) == 0) path += 8u;
   else if (*path == '/') ++path;
   /* Explicitly authorized minimum controls: fixed routes/fields only, never
-   * command results, query results, inventory, artifacts or diagnostic events. */
+   * inventory, artifacts or diagnostic events. Task results require their durable owner. */
   if (!strcmp(method, "GET")) return !body && !len && control_get_valid(path) ? 0 : deny(reason, cap, "egress_control_field_or_route_denied");
   if (strcmp(method, "POST")) return deny(reason, cap, "egress_method_denied");
+  int command_result = !strcmp(path, "ingest/report-command-result");
   int batch = strcmp(path, "ingest/report-events") == 0;
   int heartbeat = strcmp(path, "ingest/heartbeat") == 0;
   int health = strcmp(path, "ingest/engine-health") == 0;
   int delta = strcmp(path, "ingest/engine-health/delta") == 0;
   int control = !strcmp(path, "ingest/control/hello") || !strcmp(path, "ingest/control/ack") ||
       !strcmp(path, "ingest/config-status") || !strcmp(path, "agent/lifecycle/uninstall-attest");
-  if (!batch && !heartbeat && !health && !delta && !control) return deny(reason, cap, "egress_purpose_not_allowed");
+  if (!batch && !heartbeat && !health && !delta && !control && !command_result) return deny(reason, cap, "egress_purpose_not_allowed");
   if (!body || !len || len > (batch ? EDR_EGRESS_BATCH_WIRE_MAX_BYTES :
-      heartbeat ? 1024u : control ? 8192u : EDR_EGRESS_HEALTH_MAX_BYTES)) return deny(reason, cap, "egress_body_limit");
+      heartbeat ? 1024u : control ? 8192u : command_result ? EDR_EGRESS_COMMAND_RESULT_MAX_BYTES : EDR_EGRESS_HEALTH_MAX_BYTES)) return deny(reason, cap, "egress_body_limit");
   if (batch && content_type && strcmp(content_type, "application/x-protobuf") == 0)
     return validate_proto_batch(body, len,tenant,endpoint, reason, cap);
   if (!content_type || strcmp(content_type, "application/json")) return deny(reason, cap, "egress_content_type_denied");
@@ -764,7 +797,13 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
     cJSON_Delete(root); return deny(reason,cap,"egress_scope_mismatch");
   }
   int rc = 0;
-  if (control) { if (!control_post_valid(path, root)) rc = deny(reason, cap, "egress_control_field_or_type_denied"); }
+  if (command_result) {
+    EdrEgressCommandResultValidator owner = atomic_load_explicit(&command_result_validator, memory_order_acquire);
+    if (!command_result_schema_valid(root)) rc = deny(reason, cap, "command_result_schema_invalid");
+    else if (!owner || !tenant || !endpoint || !owner(tenant, endpoint, body, len))
+      rc = deny(reason, cap, "command_result_owner_unavailable");
+  }
+  else if (control) { if (!control_post_valid(path, root)) rc = deny(reason, cap, "egress_control_field_or_type_denied"); }
   else if (batch) rc = validate_json_batch(root,tenant,endpoint, reason, cap);
   else if (heartbeat) {
     const cJSON *v;
