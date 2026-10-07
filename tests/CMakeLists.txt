@@ -1907,23 +1907,28 @@ edr_minimization_test(behavior_record_alert_emit_contract test_behavior_record_a
 
 edr_minimization_test(validation_trace_contract test_validation_trace)
 
-if(EDR_PCRE2_AVAILABLE)
+if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   get_target_property(_p0_operation_sources test_p0_rule_ir_record_golden SOURCES)
   list(REMOVE_ITEM _p0_operation_sources ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c)
   add_executable(test_p0_operation test_p0_operation.c ${_p0_operation_sources})
   target_include_directories(test_p0_operation PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-  target_link_libraries(test_p0_operation PRIVATE ${EDR_PCRE2_TARGET} edr_ave_test_common)
+  target_compile_definitions(test_p0_operation PRIVATE EDR_HAVE_OPENSSL_FL=1)
+  # Both fixtures consume authenticated EDR1 bytes. Keep the verified static
+  # PCRE2 headers ahead of OpenSSL/SQLite's shared vcpkg include directory.
+  target_link_libraries(test_p0_operation PRIVATE ${EDR_PCRE2_TARGET} OpenSSL::Crypto edr_ave_test_common)
   edr_apply_test_warnings(test_p0_operation)
   add_test(NAME p0_operation COMMAND test_p0_operation)
   set_tests_properties(p0_operation PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
   add_executable(test_p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive.c ${_p0_operation_sources})
   target_include_directories(test_p0_rule_ir_purpose_archive PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-  target_compile_definitions(test_p0_rule_ir_purpose_archive PRIVATE EDR_P0_ENCRYPT_TESTING=1 EDR_P0_RULE_IR_TESTING=1)
-  target_link_libraries(test_p0_rule_ir_purpose_archive PRIVATE ${EDR_PCRE2_TARGET} edr_ave_test_common)
+  target_compile_definitions(test_p0_rule_ir_purpose_archive PRIVATE
+    EDR_P0_ENCRYPT_TESTING=1 EDR_P0_RULE_IR_TESTING=1 EDR_HAVE_OPENSSL_FL=1)
+  target_link_libraries(test_p0_rule_ir_purpose_archive PRIVATE ${EDR_PCRE2_TARGET} OpenSSL::Crypto edr_ave_test_common)
   edr_apply_test_warnings(test_p0_rule_ir_purpose_archive)
   add_test(NAME p0_rule_ir_purpose_archive COMMAND test_p0_rule_ir_purpose_archive)
   set_tests_properties(p0_rule_ir_purpose_archive PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
-
+elseif(EDR_PCRE2_AVAILABLE)
+  message(STATUS "P0 encrypted operation/purpose fixtures require EDR_WITH_P0_RULES_OPENSSL and OpenSSL::Crypto")
 endif()
 
 edr_minimization_test(p0_observation_semantics test_p0_observation_semantics)
