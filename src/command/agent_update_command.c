@@ -34,6 +34,31 @@
 #define EDR_AGENT_UPDATE_SCRIPT_PATH "scripts/edr_agent_inplace_update.ps1"
 #endif
 
+#if defined(_WIN32) || defined(EDR_AGENT_UPDATE_TESTING)
+/* Keep the executable-to-directory boundary shared with the readiness test. */
+static int installer_directory_from_executable(const char *expected,
+                                                char *directory, size_t cap) {
+  if (!expected || !expected[0] || !directory || cap == 0u) return 0;
+  int written = snprintf(directory, cap, "%s", expected);
+  if (written <= 0 || (size_t)written >= cap) return 0;
+  char *separator = strrchr(directory, '\\');
+  char *forward = strrchr(directory, '/');
+  if (!separator || (forward && forward > separator)) separator = forward;
+  if (!separator) return 0;
+  *separator = '\0';
+  return directory[0] != '\0';
+}
+#endif
+
+#ifdef EDR_AGENT_UPDATE_TESTING
+int edr_agent_update_test_install_directory(const char *expected,
+                                             char *directory, size_t cap);
+int edr_agent_update_test_install_directory(const char *expected,
+                                             char *directory, size_t cap) {
+  return installer_directory_from_executable(expected, directory, cap);
+}
+#endif
+
 #ifdef _WIN32
 enum embedded_updater_result {
   EMBEDDED_UPDATER_FAILED = -1,
@@ -153,12 +178,8 @@ static char *read_identity_file(const char *path) {
 }
 
 static int scheduled_task_identity_matches(const char *expected) {
-  if (!expected || !expected[0]) return 0;
   char directory[MAX_PATH] = {0};
-  snprintf(directory, sizeof(directory), "%s", expected);
-  char *separator = strrchr(directory, '\\');
-  if (!separator) return 0;
-  *separator = '\0';
+  if (!installer_directory_from_executable(expected, directory, sizeof(directory))) return 0;
 
   HRESULT initialize = CoInitializeEx(NULL, COINIT_MULTITHREADED);
   int uninitialize = SUCCEEDED(initialize);

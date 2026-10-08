@@ -156,6 +156,7 @@ add_executable(test_agent_update_contract
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_agent_update_contract PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_compile_definitions(test_agent_update_contract PRIVATE EDR_AGENT_UPDATE_TESTING=1)
 if(NOT WIN32)
   target_compile_definitions(test_agent_update_contract PRIVATE EDR_OS_POSIX=1)
 else()
