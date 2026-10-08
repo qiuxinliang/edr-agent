@@ -33,6 +33,8 @@ Invoke-Expression (Get-UpdaterFunctionSource 'Rollback-RuntimeUpdatePlan' 'Get-A
 Invoke-Expression (Get-UpdaterFunctionSource 'Get-InstallerLogEvidence' 'Get-InstallerEvidenceId')
 Invoke-Expression (Get-UpdaterFunctionSource 'New-InstallerDiagnosticEvidence' 'Invoke-FullInstallerUpgrade')
 
+& (Join-Path $RepoRoot 'tests/test_installer_log_redaction.ps1') -RepoRoot $RepoRoot
+
 $requiredRootComponents = @('FDSecurityInstallerWorker.exe', 'uninstall.exe')
 if (-not (Test-SupportedNativeRuntimeComponent -Name 'collector/forensic_collector_builtin.exe' -RequiredRootComponents $requiredRootComponents)) {
   throw 'updater rejected the canonical nested collector identity path'

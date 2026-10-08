@@ -130,20 +130,35 @@ function Get-InstallerLogEvidence {
 	if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'INSTALL_LOG_UNSAFE_PATH' }
   if ($item.Length -gt 1MB) { return [pscustomobject]@{ Status='too_large'; Size=[UInt64]$item.Length; Sha256=(Get-Sha256 -Path $Path); Summary='installer log exceeded 1 MiB' } }
   $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-	$safe = $raw
-	$safe = [regex]::Replace($safe, '(?im)^\s*Authorization\s*:\s*.*$', 'Authorization: [REDACTED]')
-	$safe = [regex]::Replace($safe, '(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]')
-	$safe = [regex]::Replace($safe, '(?i)(token|password|passwd|secret|api[_-]?key|private.?key|certificate|thumbprint)\s*[:=]\s*[^\r\n\s]+', '$1=[REDACTED]')
-	$safe = [regex]::Replace($safe, '(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[PRIVATE_KEY_REDACTED]')
-	$safe = [regex]::Replace($safe, '(?i)https?://[^\s?]+\?[^\s]+', '[URL_REDACTED]')
-  $tail = if ($safe.Length -gt 4096) { $safe.Substring($safe.Length - 4096) } else { $safe }
+  # Redact complete values before selecting the bounded tail. In particular,
+  # whitespace inside quotes or folded header values is still sensitive data.
+  $safe = [regex]::Replace($raw, '(?im)^[ \t]*Authorization[ \t]*:[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*', 'Authorization: [REDACTED]')
+  $safe = [regex]::Replace($safe, '(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[PRIVATE_KEY_REDACTED]')
+  $secretValuePattern = @'
+(?is)["']?\b([a-z0-9_.-]*(?:token|password|passwd|secret|api[_-]?key|private.?key|certificate|thumbprint))["']?[ \t]*[:=][ \t]*(?:"(?:\\.|`.|""|[^"\\`])*(?:"|\z)|'(?:\\.|''|[^'\\])*(?:'|\z)|[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*)
+'@
+  $safe = [regex]::Replace($safe, $secretValuePattern, '$1=[REDACTED]')
+  $safe = [regex]::Replace($safe, '(?i)\bBearer[ \t]+[^\s"''<>]+', 'Bearer [REDACTED]')
+  $safe = [regex]::Replace($safe, '(?i)\b[a-z][a-z0-9+.-]*://[^\s"''<>]+', '[URL_REDACTED]')
+  # Profile paths can contain spaces. A quoted path has an explicit end; an
+  # unquoted path conservatively consumes the rest of that diagnostic line.
+  $profilePathPattern = @'
+(?i)(?:"(?:[a-z]:[\\/](?:Users|Documents and Settings)[\\/]|/(?:Users|home)/)[^"\r\n]*(?:"|$)|'(?:[a-z]:[\\/](?:Users|Documents and Settings)[\\/]|/(?:Users|home)/)[^'\r\n]*(?:'|$)|(?:[a-z]:[\\/](?:Users|Documents and Settings)[\\/]|/(?:Users|home)/)[^\r\n]*)
+'@
+  $safe = [regex]::Replace($safe, $profilePathPattern, '[USER_PATH_REDACTED]')
+  $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+  $bytes = $utf8.GetBytes($safe)
+  $offset = [Math]::Max(0, $bytes.Length - 4096)
+  # Advance past a partial UTF-8 scalar, including supplementary characters.
+  while ($offset -lt $bytes.Length -and ($bytes[$offset] -band 0xC0) -eq 0x80) { $offset++ }
+  $tail = $utf8.GetString($bytes, $offset, $bytes.Length - $offset)
+  $bytes = $utf8.GetBytes($tail)
   $snapshotPath = "$Path.redacted"
 	if (Test-Path -LiteralPath $snapshotPath) {
 		$snapshotExisting = Get-Item -LiteralPath $snapshotPath -Force
 		if (($snapshotExisting.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $snapshotExisting.PSIsContainer) { throw 'INSTALL_LOG_UNSAFE_PATH' }
 	}
   $tmp = Join-Path (Split-Path -Parent $snapshotPath) ('.installer-redacted-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-  $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($tail)
   $handle = [System.IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try { $handle.Write($bytes, 0, $bytes.Length); $handle.Flush($true) } finally { $handle.Dispose() }
   if (Test-Path -LiteralPath $snapshotPath) { [System.IO.File]::Replace($tmp, $snapshotPath, [NullString]::Value, $true) } else { Move-Item -LiteralPath $tmp -Destination $snapshotPath -Force }
