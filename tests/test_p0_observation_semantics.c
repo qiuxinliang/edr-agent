@@ -9,10 +9,15 @@
 #undef edr_event_batch_push
 #include "edr/preprocess.h"
 #include "edr/detection_decision.h"
+#include "edr/behavior_proto.h"
+#include "cJSON.h"
 int edr_preprocess_should_emit(const EdrBehaviorRecord *record) { assert(record); return 1; }
 static unsigned frames;
 static int operation_frame;
 static unsigned pair_id;
+static const char *observation_rule;
+static int incomplete_cookie_command;
+static int inject_cookie_context;
 static int bytes_have(const uint8_t *wire,size_t len,const char *s) {size_t n=strlen(s);for(size_t i=0;i+n<=len;i++)if(!memcmp(wire+i,s,n))return 1;return 0;}
 EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len,int compressed,int severity) {
   char reason[160];
@@ -26,6 +31,15 @@ EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len
   assert(edr_egress_frame_validate(wire+16,len-16,reason,sizeof(reason)));
   if(operation_frame) {
     assert(e->operation_evidence_json[0]);
+    if(observation_rule) {
+      cJSON *subject=cJSON_Parse(e->behavior_alert.user_subject_json);assert(subject);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(subject,"rule_id")->valuestring,"R-CRED-017"));
+      cJSON_Delete(subject);
+      assert(e->which_detail==edr_v1_BehaviorEvent_file_tag && strstr(e->detail.file.target_path,"Cookies"));
+      assert(!bytes_have(wire,len,"198.51.100.") && !bytes_have(wire,len,"unrelated.invalid") &&
+             !bytes_have(wire,len,"UNRELATED-SCRIPT") && !bytes_have(wire,len,"UNRELATED"));
+      assert(!strcmp(e->operation_evidence_json,"{\"kind\":\"credential_db_decrypt\",\"object_bound\":true,\"unprotect\":true}"));
+    }
     assert(!bytes_have(wire,len,"0123456789abcdef"));
     assert(!bytes_have(wire,len,"fixture-user"));
     assert(!strstr(e->cmdline,"0123456789abcdef"));
@@ -70,12 +84,26 @@ static void check_case(const char *label,EdrEventType type,const char *name,cons
   snprintf(r->cmdline,sizeof(r->cmdline),"%s",cmd);
   strcpy(r->image_path_canonical,r->exe_path);strcpy(r->image_path_resolution_status,"RESOLVED");
   strcpy(r->process_generation_source,"file_read_process_tree_cache_generation");
+  if(type==EDR_EVENT_NET_CONNECT) {
   strcpy(r->net_src,"192.0.2.1");strcpy(r->net_dst,"192.0.2.10");r->net_dport=port;strcpy(r->net_proto,"tcp");
+  }
   if(path)snprintf(r->file_path,sizeof(r->file_path),"%s",path);
+  if(incomplete_cookie_command) edr_behavior_mark_source_truncated(r,"source.cmdline");
+  if(inject_cookie_context) {
+    strcpy(r->net_src,"198.51.100.1");strcpy(r->net_dst,"198.51.100.2");r->net_dport=443;
+    strcpy(r->dns_query,"unrelated.invalid");strcpy(r->reg_key_path,"HKCU\\UNRELATED");
+    strcpy(r->reg_op,"query");strcpy(r->script_snippet,"UNRELATED-SCRIPT");
+    uint8_t legacy[8192],marked[8192];
+    size_t n=edr_behavior_record_encode_protobuf_full_facts(r,NULL,NULL,NULL,legacy,sizeof(legacy));assert(n);
+    r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;r->required_evidence_fields=EDR_EVIDENCE_FILE;
+    size_t m=edr_behavior_record_encode_protobuf_full_facts(r,NULL,NULL,NULL,marked,sizeof(marked));
+    assert(m==n && !memcmp(legacy,marked,n));
+    r->evidence_projection_version=0;r->required_evidence_fields=0;
+  }
   EdrCommandFacts facts={r->cmdline,r->parent_cmdline};
   if(want_local) {
     EdrP0RuleIrEvaluation evaluation;assert(edr_p0_rule_ir_evaluate_record(r,&facts,&evaluation));int observed=0;
-    for(uint32_t j=0;j<evaluation.match_count;j++) {EdrP0RuleIrMatch m;assert(edr_p0_rule_ir_evaluation_get_match(&evaluation,j,&m));if(m.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION)observed=1;}
+    for(uint32_t j=0;j<evaluation.match_count;j++) {EdrP0RuleIrMatch m;assert(edr_p0_rule_ir_evaluation_get_match(&evaluation,j,&m));if(m.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION && (!observation_rule || !strcmp(m.rule_id,observation_rule)))observed=1;}
     edr_p0_rule_ir_evaluation_free(&evaluation);assert(observed);
   }
   unsigned before=frames,local_before=deferred_fake_local_observation_count;
@@ -106,6 +134,25 @@ static void check_credential_pair(const char *label,const char *name,const char 
 int main(void) {
   deferred_fake_reset();edr_p0_rule_test_reset_dedup();edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  observation_rule="R-LMOVE-012";
+  check_case("cookie chrome",EDR_EVENT_FILE_READ,"chrome.exe","chrome.exe",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  check_case("cookie backup",EDR_EVENT_FILE_READ,"backup.exe","backup.exe --daily",0,"C:\\Users\\fixture\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies",0,1);
+  check_case("cookie firefox",EDR_EVENT_FILE_READ,"firefox.exe","firefox.exe",0,"C:\\Users\\fixture\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\fixture\\cookies.sqlite",0,1);
+  observation_rule="R-CRED-011";
+  check_case("cookie script backup",EDR_EVENT_FILE_READ,"python.exe","python.exe backup.py",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  check_case("cookie powershell backup",EDR_EVENT_FILE_READ,"powershell.exe","powershell.exe -File backup.ps1",0,"C:\\Users\\fixture\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies",0,1);
+  observation_rule="R-LMOVE-012";
+  check_case("cookie echo",EDR_EVENT_FILE_READ,"cmd.exe","cmd.exe /c echo dpapi::chrome /unprotect",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  check_case("cookie help",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /?\"",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  operation_frame=1;
+  check_case("cookie object-bound decrypt",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies\\\" /unprotect\"",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",1,1);
+  inject_cookie_context=1;
+  check_case("cookie decrypt with unrelated detail injection",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies\\\" /unprotect\"",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",1,1);
+  inject_cookie_context=0;
+  check_case("cookie wrong object",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Lab\\Cookies\\\" /unprotect\"",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  incomplete_cookie_command=1;
+  check_case("cookie truncated command",EDR_EVENT_FILE_READ,"mimikatz.exe","mimikatz.exe \"dpapi::chrome /in:\\\"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies\\\" /unprotect\"",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
+  incomplete_cookie_command=0;operation_frame=0;observation_rule=NULL;
   check_case("smb",EDR_EVENT_NET_CONNECT,"explorer.exe","explorer.exe",445,NULL,0,1);
   check_case("rdp",EDR_EVENT_NET_CONNECT,"mstsc.exe","mstsc.exe /v:managed",3389,NULL,0,1);
   check_case("winrm",EDR_EVENT_NET_CONNECT,"powershell.exe","Enter-PSSession managed",5985,NULL,0,1);

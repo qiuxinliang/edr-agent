@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
   "ir_schema_version": 7,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-85e0d680",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-dc60879e",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 182,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "a43b8c2f37f346c91ddd3013a9805d9c9a8fb248d3beab3e0155b07ac4217afc",
+  "sensor_interest_manifest_sha256": "777ecde8404e880e16bfdc57f4ab90acab9d3f6393eafa71fbea063422c6e022",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -3773,20 +3773,17 @@
       "severity": 1,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539",
         "T1555.003"
       ],
-      "description": "观察 Chrome、Edge 或 Firefox Cookie 文件读取。浏览器自身读取也会命中，保留原始事件并按中优先级观测，不据此确认会话窃取、认证绕过或横向移动，不单独触发自动隔离。Login Data 由 R-CRED-003 观察；工具名称出现在目标文件路径不构成工具执行证据。需结合真实访问者、目标用户归属及独立攻击证据研判。",
+      "description": "本地观察 Chrome、Edge 或 Firefox Cookie 文件读取；浏览器、备份或脚本自身读取不独立构成安全告警。保留原始采集条件与本地证据用于关联；明确解密操作且实际对象一致由 R-CRED-017 检测。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
           "(?i)\\\\Microsoft\\\\Edge\\\\.*\\\\Cookies$",
           "(?i)\\\\Mozilla\\\\Firefox\\\\.*\\\\cookies\\.sqlite$"
-        ],
-        "evidence_purposes": [
-          "actor_attribution"
         ]
       }
     },
@@ -4430,11 +4427,11 @@
       "severity": 2,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539"
       ],
-      "description": "解释器读取 Cookie 数据库；保留进程身份与文件路径供云关联，不单独自动阻断合法自动化。",
+      "description": "本地观察脚本解释器读取 Cookie 数据库；解释器身份与文件路径不能独立证明会话窃取，合法备份不独立上传。保留采集与本地关联；明确解密操作且实际对象一致由 R-CRED-017 检测。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Network\\\\Cookies$",
@@ -4448,9 +4445,6 @@
           "pwsh.exe",
           "wscript.exe",
           "cscript.exe"
-        ],
-        "evidence_purposes": [
-          "actor_attribution"
         ]
       }
     },
@@ -4608,10 +4602,11 @@
       "mitre_ttps": [
         "T1555.003"
       ],
-      "description": "实际读取对象与同一进程完整命令中显式 dpapi::chrome /in 路径一致且带 /unprotect；仅证明解密请求，不证明窃取成功。",
+      "description": "实际读取 Login Data 或 Cookies 对象与同一进程完整命令中显式 dpapi::chrome /in 路径一致且带 /unprotect；仅证明解密请求，不证明窃取成功。",
       "condition": {
         "file_path_regex_any": [
-          "(?i)\\\\login data$"
+          "(?i)\\\\login data$",
+          "(?i)\\\\cookies$"
         ],
         "process_name_in": [
           "mimikatz.exe"

@@ -1,5 +1,6 @@
 #include "edr/behavior_proto.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
 
 #include "edr/ave_sdk.h"
 #include "edr/pmfe.h"
@@ -434,17 +435,24 @@ static void fill_process_context(edr_v1_BehaviorEvent *m, const EdrBehaviorRecor
 }
 
 static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r,
-                              EdrTransportCompleteness *transport) {
+                              EdrTransportCompleteness *transport, int outbound) {
+  /* Choose an authorized purpose before filling a oneof. Otherwise unrelated
+   * context can take its slot and projection later removes the real object.
+   * Full local/journal encoding keeps the historical selection and bytes. */
+  int projected = outbound && r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION;
+  uint64_t fields = r->required_evidence_fields;
   m->which_detail = 0;
   memset(&m->detail, 0, sizeof(m->detail));
 
-  if (r->dns_query[0]) {
+  if (r->dns_query[0] && (!projected || ((fields & EDR_EVIDENCE_NETWORK) &&
+      !r->net_dst[0] && (!(fields & EDR_EVIDENCE_NETWORK_AUX) || !r->network_aux_path[0])))) {
     m->which_detail = edr_v1_BehaviorEvent_dns_tag;
     copy_record_transport_field(m->detail.dns.query_name, sizeof(m->detail.dns.query_name),
                                 r->dns_query, sizeof(r->dns_query), transport, "dns_query");
     return;
   }
-  if (r->reg_key_path[0] || r->reg_value_name[0] || r->reg_value_data[0] || r->reg_op[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_REGISTRY)) &&
+      (r->reg_key_path[0] || r->reg_value_name[0] || r->reg_value_data[0] || r->reg_op[0])) {
     m->which_detail = edr_v1_BehaviorEvent_registry_tag;
     copy_record_transport_field(m->detail.registry.key_path, sizeof(m->detail.registry.key_path),
                                 r->reg_key_path, sizeof(r->reg_key_path), transport, "reg_key_path");
@@ -455,7 +463,8 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     copy_str(m->detail.registry.operation, sizeof(m->detail.registry.operation), r->reg_op);
     return;
   }
-  if (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_NETWORK)) &&
+      (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0])) {
     m->which_detail = edr_v1_BehaviorEvent_network_tag;
     copy_str(m->detail.network.src_ip, sizeof(m->detail.network.src_ip), r->net_src);
     m->detail.network.src_port = r->net_sport;
@@ -467,7 +476,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
                                 sizeof(r->network_aux_path), transport, "network_aux_path");
     return;
   }
-  if (r->file_path[0] || r->file_op[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_FILE)) && (r->file_path[0] || r->file_op[0])) {
     m->which_detail = edr_v1_BehaviorEvent_file_tag;
     copy_str(m->detail.file.operation, sizeof(m->detail.file.operation), r->file_op);
     copy_record_transport_field(m->detail.file.target_path, sizeof(m->detail.file.target_path),
@@ -476,14 +485,14 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     m->detail.file.target_has_motw = (r->file_target_has_motw != 0u);
     return;
   }
-  if (r->script_snippet[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_SCRIPT)) && r->script_snippet[0]) {
     m->which_detail = edr_v1_BehaviorEvent_script_tag;
     copy_record_transport_field(m->detail.script.snippet, sizeof(m->detail.script.snippet),
                                 r->script_snippet, sizeof(r->script_snippet), transport,
                                 "script_snippet");
     return;
   }
-  if (record_has_process_context(r)) {
+  if (!projected && record_has_process_context(r)) {
     m->which_detail = edr_v1_BehaviorEvent_process_tag;
     copy_record_transport_field(m->detail.process.parent_name,
                                 sizeof(m->detail.process.parent_name), r->parent_name,
@@ -512,7 +521,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
 }
 
 static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
-                                              const EdrBehaviorRecord *r) {
+                                              const EdrBehaviorRecord *r, int outbound) {
   EdrTransportCompleteness transport = {0};
   copy_str(msg->event_id, sizeof(msg->event_id), r->event_id);
   copy_str(msg->endpoint_id, sizeof(msg->endpoint_id), r->endpoint_id);
@@ -592,7 +601,7 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
   }
   msg->priority = r->priority;
 
-  fill_oneof_detail(msg, r, &transport);
+  fill_oneof_detail(msg, r, &transport, outbound);
   fill_ave_behavior_feed(msg, r, &transport);
 
   copy_str(msg->transport_completeness, sizeof(msg->transport_completeness),
@@ -711,7 +720,7 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   /* Complete facts do not enlarge every hot record or Windows thread stack. */
   msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
   if (!msg) return 0;
-  fill_behavior_record_event_fields(msg, r);
+  fill_behavior_record_event_fields(msg, r, outbound);
   if (alert) fill_behavior_alert_fields(msg, alert);
   if (!outbound) {
     /* Local facts and exact terminal journals use their existing full wire

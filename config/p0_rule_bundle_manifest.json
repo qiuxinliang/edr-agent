@@ -1,6 +1,6 @@
 {
   "kind": "edr_p0_rule_bundle_manifest",
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-85e0d680",
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-dc60879e",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "rule_count": 182,
   "rules": [
@@ -1721,7 +1721,7 @@
       "severity": 1,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539",
         "T1555.003"
@@ -2018,7 +2018,7 @@
       "severity": 2,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539"
       ]

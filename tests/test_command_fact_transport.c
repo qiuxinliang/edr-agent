@@ -173,6 +173,29 @@ static void authorize_replayed_match(EdrBehaviorRecord *record, const EdrCommand
 }
 #endif
 
+#ifdef EDR_P0_TEST_REAL_IR
+static void verify_cookie_command_generation(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);identity(r,9701);
+  r->type=EDR_EVENT_FILE_READ;r->event_time_ns=INT64_C(1790152545794514400);
+  strcpy(r->event_id,"cookie-generation");strcpy(r->process_name,"mimikatz.exe");
+  strcpy(r->exe_path,"C:\\Tools\\mimikatz.exe");
+  strcpy(r->file_path,"C:\\Lab\\Cookies");strcpy(r->cmdline,"mimikatz.exe");
+  const char *command="mimikatz.exe \"dpapi::chrome /in:C:\\Lab\\Cookies /unprotect\"";
+  assert(edr_local_evidence_cache_save_command_fact(r,command)==0);
+  edr_behavior_mark_source_truncated(r,"source.cmdline");
+  char *complete=edr_local_evidence_cache_read_command_fact(r);assert(complete);
+  EdrCommandFacts facts={complete,NULL};assert(has_rule(r,&facts,"R-CRED-017"));free(complete);
+  /* A reused PID must not borrow the old full operation or object argument. */
+  for(int variant=0;variant<2;variant++) {
+    if(variant==0) r->process_start_key++; else r->process_creation_filetime_100ns++;
+    complete=edr_local_evidence_cache_read_command_fact(r);assert(!complete);
+    facts.subject=complete;assert(!has_rule(r,&facts,"R-CRED-017"));
+    if(variant==0) r->process_start_key--; else r->process_creation_filetime_100ns--;
+  }
+  free(r);puts("Cookie operation: real SQLite command owner accepts same generation; rejects reused PID start key and birth");
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifndef EDR_P0_TEST_REAL_IR
   if (argc == 2) {
@@ -206,6 +229,7 @@ int main(int argc, char **argv) {
 #ifdef EDR_P0_TEST_REAL_IR
   edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_test_reset_dedup();
+  verify_cookie_command_generation();
 #endif
   const size_t sizes[] = {8191u, 8192u, 12717u, EDR_PROCESS_COMMAND_FACT_CAP - 1u};
   for (size_t k = 0; k < sizeof(sizes)/sizeof(sizes[0]); ++k) {

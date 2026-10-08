@@ -78,6 +78,53 @@ static void dump_purpose_contract(const char *base,const unsigned char *plain,si
  free(after);free(encrypted);cJSON_free(json);cJSON_Delete(j);
  puts("IR6 archive: denied active downgrade; exact weak dump purpose held; safe owner and original bytes survive restart");
 }
+static void cookie_purpose_contract(const char *base,const unsigned char *plain,size_t size,
+                                    const EdrP0RuleIrMatch *valid) {
+ const char *ids[]={"R-LMOVE-012","R-CRED-011"};
+ for(unsigned i=0;i<3;i++) for(int renamed=0;renamed<2;renamed++) {
+  EdrP0RuleIrBinding active_before,active_after;assert(edr_p0_rule_ir_get_binding(&active_before));
+  cJSON *j=cJSON_ParseWithLength((const char*)plain,size);assert(j);
+  cJSON *r,*old=NULL; cJSON_ArrayForEach(r,cJSON_GetObjectItemCaseSensitive(j,"rules"))
+   if(!strcmp(cJSON_GetObjectItemCaseSensitive(r,"id")->valuestring,ids[i%2])) old=r;
+  assert(old);const char *id=renamed?"R-RENAMED-COOKIE":ids[i%2];
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(old,"id",cJSON_CreateString(id)));
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(old,"effect",cJSON_CreateString("security_alert")));
+  cJSON *purposes=cJSON_AddArrayToObject(cJSON_GetObjectItemCaseSensitive(old,"condition"),"evidence_purposes");
+  assert(purposes && cJSON_AddItemToArray(purposes,cJSON_CreateString("actor_attribution")));
+  if(i==2) {
+   cJSON_ArrayForEach(r,cJSON_GetObjectItemCaseSensitive(j,"rules"))
+    if(!strcmp(cJSON_GetObjectItemCaseSensitive(r,"id")->valuestring,"R-CRED-011")) {
+     assert(cJSON_ReplaceItemInObjectCaseSensitive(r,"effect",cJSON_CreateString("security_alert")));
+     cJSON *p=cJSON_AddArrayToObject(cJSON_GetObjectItemCaseSensitive(r,"condition"),"evidence_purposes");
+     assert(p && cJSON_AddItemToArray(p,cJSON_CreateString("actor_attribution")));
+    }
+  }
+  char *json=cJSON_PrintUnformatted(j),sha[65],archive[400];unsigned char *encrypted=NULL;size_t encrypted_size=0;assert(json);
+  assert(edr_sha256_hex((const uint8_t*)json,strlen(json),sha)==0);
+  assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)json,strlen(json),&encrypted,&encrypted_size)==0);
+  snprintf(archive,sizeof(archive),"%s.purpose-%s.edr1",base,sha);save(archive,encrypted,encrypted_size);
+  assert(!edr_p0_rule_ir_validate_candidate_path(archive));
+  assert(!edr_p0_rule_ir_install_staged_bundle(archive,base));
+  assert(edr_p0_rule_ir_get_binding(&active_after));
+  assert(!strcmp(active_before.artifact_sha256,active_after.artifact_sha256));
+  for(int restart=0;restart<2;restart++) {
+   assert(edr_p0_rule_ir_projection_matches(valid->rule_id,sha,valid->required_evidence_fields,valid->operation_evidence)==1);
+   assert(edr_p0_rule_ir_projection_matches(id,sha,EDR_EVIDENCE_USER|EDR_EVIDENCE_FILE,"")==0);
+   edr_p0_rule_ir_shutdown();edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  }
+  size_t after_size;unsigned char *after=read_bytes(archive,&after_size);
+  assert(after_size==encrypted_size && !memcmp(after,encrypted,after_size));
+  if(i<2) {
+   assert(cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(old,"condition"),"operation","credential_db_decrypt"));
+   char *strong=cJSON_PrintUnformatted(j);unsigned char *sealed=NULL;size_t sealed_size=0;assert(strong);
+   assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)strong,strlen(strong),&sealed,&sealed_size)==0);
+   char candidate[420];snprintf(candidate,sizeof(candidate),"%s.strong",archive);save(candidate,sealed,sealed_size);
+   assert(edr_p0_rule_ir_validate_candidate_path(candidate));free(sealed);cJSON_free(strong);
+  }
+  free(after);free(encrypted);cJSON_free(json);cJSON_Delete(j);
+ }
+ puts("IR7 Cookie predicate: old active package refused; renamed historical purpose held; safe sibling and original archive survive restart");
+}
 int main(void){
  static const struct {const char *id;unsigned schema;int retired;const char *rule;} corpus[]={
 #include "../src/preprocess/p0_retired_purpose_vectors.inc"
@@ -103,6 +150,7 @@ int main(void){
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));
  legacy_purpose_contract(base,plain,plain_size,&match);
  dump_purpose_contract(base,plain,plain_size,&match);
+ cookie_purpose_contract(base,plain,plain_size,&match);
  assert(!edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields|EDR_EVIDENCE_PARENT_NAME,match.operation_evidence));
  unsigned char *changed=malloc(plain_size+1),*encrypted=NULL;size_t encrypted_size=0;assert(changed);memcpy(changed,plain,plain_size);changed[plain_size]='\n';assert(edr_p0_encrypt_encrypt_edr1_for_test(changed,plain_size+1,&encrypted,&encrypted_size)==0);save(stage,encrypted,encrypted_size);
  assert(edr_p0_rule_ir_install_staged_bundle(stage,base));

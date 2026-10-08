@@ -636,5 +636,34 @@ static void evidence_projection_v2(void) {
  printf("evidence v2 minimal=%zu unrelated_injection=%zu computed_zero=%zu\n",minimum,injected,calculated);
  free(r);free(plain);free(rich);
 }
-int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+/* The synthetic projection owner isolates rule lookup only. Real encoder,
+ * decoder and final gate preserve the NETWORK purpose's actual object. */
+static void network_detail_competition(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*baseline=malloc(EDR_EGRESS_FRAME_MAX),*full=malloc(EDR_EGRESS_FRAME_MAX);
+ assert(r&&wire&&baseline&&full);make_record(r);make_alert(&a,r);r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+ cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+ cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString("synthetic-network"));
+ overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+ r->net_dst[0]=0;strcpy(r->dns_query,"fixture.example.invalid");size_t baseline_size=0;
+ for(int variant=0;variant<4;variant++) {
+  if(variant==1) strcpy(r->net_src,"198.51.100.1");
+  if(variant==2) strcpy(r->network_aux_path,"UNRELATED-AUX");
+  if(variant==3) strcpy(r->net_dst,"192.0.2.10");
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+  assert(edr_egress_frame_validate(wire,n,NULL,0));edr_v1_BehaviorEvent *e=decode_frame(wire,n);
+  if(variant<3) {
+   assert(e->which_detail==edr_v1_BehaviorEvent_dns_tag && !strcmp(e->detail.dns.query_name,r->dns_query));
+   if(!variant) {memcpy(baseline,wire,n);baseline_size=n;} else assert(n==baseline_size&&!memcmp(baseline,wire,n));
+  } else assert(e->which_detail==edr_v1_BehaviorEvent_network_tag && !strcmp(e->detail.network.dst_ip,r->net_dst));
+  free(e);
+  size_t f=edr_behavior_record_encode_protobuf_full_facts(r,&a,NULL,NULL,full,EDR_EGRESS_FRAME_MAX);assert(f);
+  r->evidence_projection_version=0;r->required_evidence_fields=0;
+  size_t legacy=edr_behavior_record_encode_protobuf_full_facts(r,&a,NULL,NULL,wire,EDR_EGRESS_FRAME_MAX);
+  assert(f==legacy&&!memcmp(full,wire,f));
+  r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+ }
+ free(r);free(wire);free(baseline);free(full);
+}
+int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }
