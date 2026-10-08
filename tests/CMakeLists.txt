@@ -65,7 +65,7 @@ add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox
 target_include_directories(test_command_inbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_inbox PRIVATE Threads::Threads)
+target_link_libraries(test_command_inbox PRIVATE Threads::Threads edr_egress_policy)
 edr_apply_test_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -80,7 +80,7 @@ add_executable(test_command_upload_outbox
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_upload_outbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads)
+target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
   target_link_libraries(test_command_upload_outbox PRIVATE advapi32)
 endif()
@@ -137,7 +137,7 @@ add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_pro
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_process PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_process PRIVATE Threads::Threads)
+target_link_libraries(test_command_process PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
   target_link_libraries(test_command_process PRIVATE advapi32)
 endif()
@@ -1707,8 +1707,11 @@ add_test(NAME endpoint_policy_v2_modes COMMAND test_policy_v2 WORKING_DIRECTORY 
 
 add_executable(test_forensic_result_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_result_contract.c
-  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c)
-target_include_directories(test_forensic_result_contract PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c
+  ${CMAKE_SOURCE_DIR}/src/transport/egress_purpose_json.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_forensic_result_contract PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_forensic_result_contract)
 add_test(NAME forensic_result_contract COMMAND test_forensic_result_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -1766,6 +1769,7 @@ target_link_libraries(test_egress_request_policy PRIVATE edr_egress_policy)
 edr_apply_test_warnings(test_egress_request_policy)
 add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 add_executable(test_command_result_egress test_command_result_egress.c
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
@@ -1775,6 +1779,17 @@ if(WIN32)
 endif()
 edr_apply_test_warnings(test_command_result_egress)
 add_test(NAME command_result_egress COMMAND test_command_result_egress)
+add_executable(test_command_result_compaction test_command_result_compaction.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
+target_link_libraries(test_command_result_compaction PRIVATE edr_egress_policy Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_command_result_compaction PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(test_command_result_compaction)
+add_test(NAME command_result_compaction COMMAND test_command_result_compaction)
+
 
 target_link_libraries(test_deep_collector_manifest PRIVATE edr_egress_policy)
 
@@ -1889,6 +1904,7 @@ endfunction()
 edr_minimization_test(egress_batch_policy test_egress_batch_policy)
 edr_minimization_test(egress_request_policy test_egress_request_policy)
 edr_minimization_test(command_result_egress test_command_result_egress)
+edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
 edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_candidate)
 edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)

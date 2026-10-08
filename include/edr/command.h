@@ -49,6 +49,9 @@ typedef struct EdrCommandResultAuthorization {
   char tenant_id[128];
   char endpoint_id[128];
   int64_t expires_unix_ms;
+  /* Verified request-derived content contract. Empty historical grants never
+   * acquire content authority from their stored result or a delivery renewal. */
+  char content_contract[12288];
 } EdrCommandResultAuthorization;
 
 /** 与 CommandEnvelope SOAR 扩展字段对应（定长 UTF-8，截断由控制面写入） */

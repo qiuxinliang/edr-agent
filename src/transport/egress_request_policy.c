@@ -365,35 +365,6 @@ static int field_type(const char *path, HealthType *type) {
   }
   return capability_field(path, type);
 }
-static int duplicate_keys(const cJSON *v) {
-  const cJSON *a, *b;
-  cJSON_ArrayForEach(a, v) {
-    if (cJSON_IsObject(v)) for (b = a->next; b; b = b->next)
-      if (a->string && b->string && strcmp(a->string, b->string) == 0) return 1;
-    if (duplicate_keys(a)) return 1;
-  }
-  return 0;
-}
-static cJSON *parse_body(const void *body, size_t len) {
-  if (!body || !len || len > EDR_EGRESS_BATCH_WIRE_MAX_BYTES) return NULL;
-  const unsigned char *bytes = body;
-  if (memchr(body, 0, len)) return NULL;
-  /* cJSON exposes C strings. A decoded NUL would conceal a key/value suffix
-   * from every whitelist comparison while the original bytes still leave. */
-  for (size_t i = 0; i < len; ++i) {
-    if (bytes[i] != '\\' || i + 1u >= len) continue;
-    if (bytes[i + 1u] == 'u' && i + 5u < len && !memcmp(bytes + i + 2u, "0000", 4u)) return NULL;
-    ++i; /* An escaped backslash is literal, not a following Unicode escape. */
-  }
-  char *copy = malloc(len + 1u);
-  if (!copy) return NULL;
-  memcpy(copy, body, len); copy[len] = 0;
-  const char *end = NULL;
-  cJSON *root = cJSON_ParseWithLengthOpts(copy, len + 1u, &end, 1);
-  if (!cJSON_IsObject(root) || end != copy + len || duplicate_keys(root)) { cJSON_Delete(root); root = NULL; }
-  free(copy);
-  return root;
-}
 static int validate_health_node(const cJSON *v, const char *path, unsigned depth) {
   if (depth > 10u) return 0;
   if (cJSON_IsObject(v)) {
@@ -517,7 +488,7 @@ char *edr_egress_health_project(const char *body, char *reason, size_t cap) {
   int allocation_failed = 0;
   if (reason && cap) reason[0] = 0;
   if (!body || strlen(body) > 131072u) { deny(reason, cap, "health_input_limit"); return NULL; }
-  cJSON *root = parse_body(body, strlen(body));
+  cJSON *root = edr_egress_parse_purpose_object(body, strlen(body));
   cJSON *out = cJSON_CreateObject();
   if (!out) allocation_failed = 1;
   if (!root || !out || !identities(root) || cJSON_GetObjectItemCaseSensitive(root, "engine_health_update")) goto fail;
@@ -882,7 +853,7 @@ done:
   return wire;
 }
 static int validate_upgrade_event(const void *body,size_t len,const char *tenant,const char *endpoint,char *reason,size_t cap) {
-  cJSON *root=parse_body(body,len);
+  cJSON *root=edr_egress_parse_purpose_object(body,len);
   const cJSON *command=cJSON_GetObjectItemCaseSensitive(root,"command_id");
   EdrEgressTaskScope scope;
   int rc=cJSON_IsString(command)?edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,command->valuestring,&scope):EDR_EGRESS_REQUEST_DENIED;
@@ -957,7 +928,7 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   if (batch && content_type && strcmp(content_type, "application/x-protobuf") == 0)
     return validate_proto_batch(body, len,tenant,endpoint, reason, cap);
   if (!content_type || strcmp(content_type, "application/json")) return deny(reason, cap, "egress_content_type_denied");
-  cJSON *root = parse_body(body, len);
+  cJSON *root = edr_egress_parse_purpose_object(body, len);
   if (!root) return deny(reason, cap, "egress_json_invalid");
   const cJSON *request_endpoint=cJSON_GetObjectItemCaseSensitive(root,"endpoint_id");
   const cJSON *request_tenant=cJSON_GetObjectItemCaseSensitive(root,"tenant_id");

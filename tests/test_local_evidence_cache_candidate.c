@@ -5301,6 +5301,44 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
 #endif
 }
 
+
+static void test_rtq_signed_scope_and_legacy_aliases(void) {
+#if defined(EDR_HAVE_SQLITE)
+  char db[640],out[16384];assert(make_test_sqlite_path(db,sizeof(db))==0);
+  assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+  EdrBehaviorRecord r;init_record(&r,EDR_EVENT_NET_CONNECT);
+  struct timespec ts;assert(timespec_get(&ts,TIME_UTC)==TIME_UTC);
+  r.event_time_ns=(int64_t)ts.tv_sec*INT64_C(1000000000)+ts.tv_nsec;
+  r.pid=8171;r.priority=3;set_record_generation(&r,8171);
+  snprintf(r.endpoint_id,sizeof(r.endpoint_id),"scope-endpoint");
+  snprintf(r.event_id,sizeof(r.event_id),"scope-event");
+  snprintf(r.process_name,sizeof(r.process_name),"scope-tool.exe");
+  snprintf(r.exe_path,sizeof(r.exe_path),"C:/Scope/tool.exe");
+  snprintf(r.cmdline,sizeof(r.cmdline),"scope-tool --bounded");
+  snprintf(r.net_dst,sizeof(r.net_dst),"192.0.2.71");r.net_dport=445;
+  edr_local_evidence_cache_record_behavior(&r);
+  const char *queries[]={
+    "{\"event_type\":\"network\",\"process_name\":\"scope-tool\",\"process_path\":\"C:/Scope/\",\"process_cmdline\":\"--bounded\",\"remote_port\":445,\"limit\":1000,\"time_window_s\":604800}",
+    "{\"type\":\"network\",\"process_name_contains\":\"scope-tool\",\"cmdline_contains\":\"--bounded\",\"remote_port\":445}",
+    "{\"event_type\":\"network\",\"type\":\"network\",\"process_name\":\"scope-tool\",\"process_name_contains\":\"scope-tool\"}"};
+  for(size_t i=0;i<sizeof(queries)/sizeof(queries[0]);i++) {
+    assert(edr_local_evidence_cache_query_json(queries[i],out,sizeof(out))==0);
+    cJSON *root=cJSON_Parse(out);assert(root);const cJSON *rows=cJSON_GetObjectItemCaseSensitive(root,"rows");
+    assert(cJSON_IsArray(rows)&&cJSON_GetArraySize(rows)>0);
+    assert(strstr(out,"192.0.2.71")&&strstr(out,"445"));cJSON_Delete(root);
+  }
+  const char *miss[]={"{\"process_path\":\"C:/Other/\"}","{\"remote_port\":3389}","{\"event_type\":\"file\"}"};
+  for(size_t i=0;i<sizeof(miss)/sizeof(miss[0]);i++) {
+    assert(edr_local_evidence_cache_query_json(miss[i],out,sizeof(out))==0);
+    cJSON *root=cJSON_Parse(out);assert(root);assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root,"rows"))==0);cJSON_Delete(root);
+  }
+  const char *invalid[]={"{\"process_name\":\"a\",\"process_name_contains\":\"b\"}","{\"event_type\":\"network\",\"type\":\"file\"}","{\"limit\":1001}","{\"remote_port\":\"445\"}","{\"process_path\":\"x\",\"process_path\":\"y\"}"};
+  for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)assert(edr_local_evidence_cache_query_json(invalid[i],out,sizeof(out))!=0);
+  edr_local_evidence_cache_close();cleanup_test_sqlite_path(db);
+  puts("PASS: production cache applies canonical signed scope, aliases, path/port, retained limits, and rejects conflicts");
+#endif
+}
+
 static void test_file_sha256_query_uses_file_evidence_cache(void) {
 #if defined(EDR_HAVE_SQLITE)
   const char *db = "rtq_file_hash_cache_test.sqlite";
@@ -7937,6 +7975,7 @@ int main(int argc, char **argv) {
   test_process_cache_preserves_full_facts_and_source_provenance();
   test_grandparent_cache_requires_verified_lifecycle_parent_edge();
   test_parent_edge_repairs_late_real_generation_at_child_birth();
+  test_rtq_signed_scope_and_legacy_aliases();
   test_file_sha256_query_uses_file_evidence_cache();
   puts("test_local_evidence_cache_candidate: ok");
   return 0;

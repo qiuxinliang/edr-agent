@@ -558,9 +558,8 @@ def main():
                         environment[f"EDR_TEST_{label}_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
                         environment[f"EDR_TEST_{label}_ISSUED"] = issued
                     issued = str(int(time.time() * 1000))
-                    original = {"task_id":"cmd_synthetic_noop","status":"ok","exit_code":0,
-                                "evidence_refs":[],"upload_refs":[],"artifacts":[],"error":"",
-                                "retryable":False,"raw_detail":"noop"}
+                    original = {"schema":"edr.command.status.v1","status":1,"exit_code":0,
+                                "diagnostic":"command_completed"}
                     exact_detail = json.dumps(original,separators=(",",":"))
                     renewal = {"schema":"edr.result_delivery_renewal.v1","tenant_id":"synthetic-tenant",
                                "endpoint_id":"synthetic-endpoint","target_command_id":"cmd_synthetic_noop",

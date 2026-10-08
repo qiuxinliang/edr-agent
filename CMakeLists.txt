@@ -920,6 +920,7 @@ add_library(edr_egress_policy STATIC
   src/command/sha256.c
   src/transport/egress_batch_policy.c
   src/transport/egress_request_policy.c
+  src/transport/egress_purpose_json.c
   src/proto/edr/v1/event.pb.c
   third_party/nanopb/pb_common.c
   third_party/nanopb/pb_encode.c

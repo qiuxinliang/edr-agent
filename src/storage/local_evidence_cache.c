@@ -1,3 +1,4 @@
+#include "edr/egress_request_policy.h"
 #include "edr/validation_trace.h"
 #include "edr/local_evidence_cache.h"
 
@@ -6851,12 +6852,14 @@ typedef struct {
   uint32_t limit;
   uint32_t time_window_s;
   char endpoint_id[48];
-  char process_name_contains[128];
-  char cmdline_contains[256];
-  char file_path_contains[256];
+  char process_name_contains[513];
+  char process_path_contains[4097];
+  char cmdline_contains[4097];
+  char file_path_contains[4097];
   char file_sha256[65];
   char file_ext[32];
-  char remote_ip[64];
+  char remote_ip[129];
+  uint32_t remote_port;
   char registry_key_contains[256];
 } RtqFilter;
 
@@ -7072,65 +7075,48 @@ static uint32_t event_type_from_name(const char *s, int *ok) {
   return 0u;
 }
 
-static void parse_rtq_filter(const char *json, RtqFilter *f) {
-  memset(f, 0, sizeof(*f));
-  f->limit = 50u;
-  f->time_window_s = 600u;
-  if (!json) {
-    return;
-  }
-  (void)json_get_string(json, "endpoint_id", f->endpoint_id, sizeof(f->endpoint_id));
-  (void)json_get_string(json, "process_name_contains", f->process_name_contains,
-                        sizeof(f->process_name_contains));
-  (void)json_get_string(json, "cmdline_contains", f->cmdline_contains, sizeof(f->cmdline_contains));
-  (void)json_get_string(json, "file_path_contains", f->file_path_contains,
-                        sizeof(f->file_path_contains));
-  if (f->file_path_contains[0] == '\0') {
-    (void)json_get_string(json, "file_path", f->file_path_contains,
-                          sizeof(f->file_path_contains));
-  }
-  if (json_get_string(json, "file_sha256", f->file_sha256, sizeof(f->file_sha256)) != 0) {
-    (void)json_get_string(json, "sha256", f->file_sha256, sizeof(f->file_sha256));
-  }
-  (void)json_get_string(json, "file_ext", f->file_ext, sizeof(f->file_ext));
-  (void)json_get_string(json, "remote_ip", f->remote_ip, sizeof(f->remote_ip));
-  (void)json_get_string(json, "registry_key_contains", f->registry_key_contains,
-                        sizeof(f->registry_key_contains));
-  (void)json_get_u32(json, "pid", &f->pid);
-  if (json_get_u64(json, "process_start_key", &f->process_start_key) == 0) {
-    f->has_process_start_key = f->process_start_key != 0u;
-  }
-  if (json_get_u64(json, "process_creation_filetime_100ns",
-                   &f->process_creation_filetime_100ns) == 0) {
-    f->has_process_creation_filetime_100ns =
-        f->process_creation_filetime_100ns != 0u;
-  }
-  (void)json_get_u32(json, "limit", &f->limit);
-  (void)json_get_u32(json, "time_window_s", &f->time_window_s);
-  if (f->limit == 0u || f->limit > 500u) {
-    f->limit = 50u;
-  }
-  if (f->time_window_s == 0u || f->time_window_s > 86400u) {
-    f->time_window_s = 600u;
-  }
-  char et[64];
-  if (json_get_string(json, "event_type", et, sizeof(et)) != 0) {
-    (void)json_get_string(json, "type", et, sizeof(et));
-  }
-  if (et[0]) {
-    int ok = 0;
-    uint32_t ty = event_type_from_name(et, &ok);
-    if (ok) {
-      f->has_type = 1;
-      f->type = ty;
-    }
-  }
+static int rtq_filter_text(const cJSON *root,const char *canonical,const char *alias,
+                            char *out,size_t cap) {
+  const cJSON *v=cJSON_GetObjectItemCaseSensitive(root,canonical);
+  const cJSON *old=alias?cJSON_GetObjectItemCaseSensitive(root,alias):NULL;
+  if(v && old && (!cJSON_IsString(v)||!cJSON_IsString(old)||strcmp(v->valuestring,old->valuestring)))return 0;
+  if(!v)v=old;if(!v)return 1;
+  if(!cJSON_IsString(v)||!v->valuestring||strlen(v->valuestring)>=cap)return 0;
+  memcpy(out,v->valuestring,strlen(v->valuestring)+1);return 1;
+}
+static int rtq_filter_u32(const cJSON *root,const char *key,uint32_t *out,uint32_t min,uint32_t max) {
+  const cJSON *v=cJSON_GetObjectItemCaseSensitive(root,key);if(!v)return 1;
+  if(!cJSON_IsNumber(v)||v->valuedouble<min||v->valuedouble>max||v->valuedouble!=(double)(uint32_t)v->valuedouble)return 0;
+  *out=(uint32_t)v->valuedouble;return 1;
+}
+static int parse_rtq_filter(const char *json, RtqFilter *f) {
+  memset(f,0,sizeof(*f));f->limit=50u;f->time_window_s=600u;
+  if(!json)return 0;
+  cJSON *root=edr_egress_parse_purpose_object(json,strlen(json));if(!root)return -1;
+  int ok=rtq_filter_text(root,"endpoint_id",NULL,f->endpoint_id,sizeof(f->endpoint_id)) &&
+      rtq_filter_text(root,"process_name","process_name_contains",f->process_name_contains,sizeof(f->process_name_contains)) &&
+      rtq_filter_text(root,"process_path",NULL,f->process_path_contains,sizeof(f->process_path_contains)) &&
+      rtq_filter_text(root,"process_cmdline","cmdline_contains",f->cmdline_contains,sizeof(f->cmdline_contains)) &&
+      rtq_filter_text(root,"file_path","file_path_contains",f->file_path_contains,sizeof(f->file_path_contains)) &&
+      rtq_filter_text(root,"file_sha256","sha256",f->file_sha256,sizeof(f->file_sha256)) &&
+      rtq_filter_text(root,"file_ext",NULL,f->file_ext,sizeof(f->file_ext)) &&
+      rtq_filter_text(root,"remote_ip",NULL,f->remote_ip,sizeof(f->remote_ip)) &&
+      rtq_filter_text(root,"registry_key_contains",NULL,f->registry_key_contains,sizeof(f->registry_key_contains)) &&
+      rtq_filter_u32(root,"remote_port",&f->remote_port,1u,65535u) &&
+      rtq_filter_u32(root,"pid",&f->pid,1u,UINT32_MAX) &&
+      rtq_filter_u32(root,"limit",&f->limit,1u,1000u) &&
+      rtq_filter_u32(root,"time_window_s",&f->time_window_s,1u,604800u);
+  if(json_get_u64(json,"process_start_key",&f->process_start_key)==0)f->has_process_start_key=f->process_start_key!=0u;
+  if(json_get_u64(json,"process_creation_filetime_100ns",&f->process_creation_filetime_100ns)==0)f->has_process_creation_filetime_100ns=f->process_creation_filetime_100ns!=0u;
+  char et[65]={0};ok=ok&&rtq_filter_text(root,"event_type","type",et,sizeof(et));
+  if(ok && et[0]){int known=0;f->type=event_type_from_name(et,&known);f->has_type=known;ok=known;}
+  cJSON_Delete(root);return ok?0:-1;
 }
 
 static int rtq_match_common(const RtqFilter *f, uint32_t type, uint32_t pid,
                             int64_t event_time_ns, const char *endpoint_id,
-                            const char *process_name, const char *cmdline,
-                            const char *file_path, const char *remote_ip,
+                            const char *process_name, const char *cmdline, const char *process_path,
+                            const char *file_path, const char *remote_ip, uint32_t remote_port,
                             const char *registry_key, uint64_t process_start_key,
                             uint64_t process_creation_filetime_100ns) {
   int64_t cutoff = now_unix_ns() - (int64_t)f->time_window_s * 1000000000LL;
@@ -7157,6 +7143,8 @@ static int rtq_match_common(const RtqFilter *f, uint32_t type, uint32_t pid,
   if (!contains_ci(process_name, f->process_name_contains)) {
     return 0;
   }
+  if (!contains_ci(process_path, f->process_path_contains) ||
+      (f->remote_port && f->remote_port != remote_port)) return 0;
   if (!contains_ci(cmdline, f->cmdline_contains)) {
     return 0;
   }
@@ -7376,7 +7364,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
     return -1;
   }
   RtqFilter f;
-  parse_rtq_filter(payload_json, &f);
+  if (parse_rtq_filter(payload_json, &f) != 0) { out[0]=0; return -1; }
   evidence_cache_lock();
   size_t off = 0;
   int first = 1;
@@ -7393,7 +7381,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
       }
       scanned++;
       if (!rtq_match_common(&f, r->type, r->pid, r->event_time_ns, r->endpoint_id,
-                            r->process_name, "", r->file_path, r->net_dst, "",
+                            r->process_name, "", "", r->file_path, r->net_dst, r->net_dport, "",
                             r->generation.process_start_key,
                             r->generation.creation_filetime_100ns)) {
         continue;
@@ -7475,7 +7463,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
         uint64_t creation_value = 0u;
         (void)sqlite_decimal_u64(start_key, &start_key_value);
         (void)sqlite_decimal_u64(creation, &creation_value);
-        if (!rtq_match_common(&f, ty, pid, ts, ep, pn, cl, fp, rip, rk,
+        if (!rtq_match_common(&f, ty, pid, ts, ep, pn, cl, xp, fp, rip, dport, rk,
                               start_key_value, creation_value)) {
           continue;
         }

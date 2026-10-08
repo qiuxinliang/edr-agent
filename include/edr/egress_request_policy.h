@@ -42,7 +42,12 @@ char *edr_egress_upgrade_event_project(const char *body, int *result);
 #define EDR_EGRESS_HEALTH_MAX_BYTES (32768u)
 #define EDR_EGRESS_BATCH_WIRE_MAX_BYTES (8u * 1024u * 1024u)
 #define EDR_EGRESS_COMMAND_RESULT_MAX_BYTES (128u * 1024u)
-#define EDR_EGRESS_POLICY_VERSION "minimal-egress-v3"
+
+/* Shared strict object boundary: complete input, no duplicate keys or decoded
+ * NUL strings. The caller owns the returned cJSON object. */
+struct cJSON;
+struct cJSON *edr_egress_parse_purpose_object(const void *body, size_t len);
+#define EDR_EGRESS_POLICY_VERSION "minimal-egress-v4"
 
 /* Registered by command state before transport starts. Missing owner denies
  * results; registering a callback never authorizes a route or arbitrary body.

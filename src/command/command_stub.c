@@ -5051,10 +5051,9 @@ static int command_signature_policy_for(const char *cmd_id, const char *cmd_type
 }
 
 int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
-  EdrCommandInboxRecord inbox[16];
-  memset(inbox, 0, sizeof(inbox));
-  int n = edr_command_state_collect_inbox_filtered(
-      inbox, sizeof(inbox) / sizeof(inbox[0]), command_lane_filter, &lane);
+  EdrCommandInboxRecord *inbox = calloc(16u, sizeof(*inbox));
+  if (!inbox) { audit_both("", "command inbox replay allocation failed; durable inbox retained"); return -1; }
+  int n = edr_command_state_collect_inbox_filtered(inbox, 16u, command_lane_filter, &lane);
   int work_done = 0;
   int saw_error = 0;
   for (int i = 0; i < n; i++) {
@@ -5269,6 +5268,7 @@ int edr_command_replay_persisted_inbox_once_for_lane(int lane) {
   for (int i = 0; i < n; i++) {
     edr_command_state_free_inbox_record(&inbox[i]);
   }
+  free(inbox);
   if (work_done) {
     return 1;
   }
@@ -5345,11 +5345,10 @@ static void record_command_result_delivery_failure(const EdrCommandStateRecord *
 }
 
 static void flush_command_result_outbox(void) {
-  EdrCommandStateRecord pending[16];
-  int n = edr_command_state_collect_pending(pending, sizeof(pending) / sizeof(pending[0]));
-  if (n <= 0) {
-    return;
-  }
+  EdrCommandStateRecord *pending = calloc(16u, sizeof(*pending));
+  if (!pending) { audit_both("", "command result flush allocation failed; durable results retained"); return; }
+  int n = edr_command_state_collect_pending(pending, 16u);
+  if (n <= 0) { free(pending); return; }
   for (int i = 0; i < n; i++) {
     EdrSoarCommandMeta sm;
     memset(&sm, 0, sizeof(sm));
@@ -5374,6 +5373,7 @@ static void flush_command_result_outbox(void) {
       record_command_result_delivery_failure(&pending[i], rc);
     }
   }
+  free(pending);
 }
 
 void edr_command_on_pmfe_scan_complete(const char *command_id, uint32_t pid, int scan_status,
@@ -6018,6 +6018,12 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
     memcpy(a->tenant_id, cfg->agent.tenant_id, sizeof(a->tenant_id));
     memcpy(a->endpoint_id, cfg->agent.endpoint_id, sizeof(a->endpoint_id));
     a->expires_unix_ms = normalized_meta.issued_at_unix_ms + 86400000LL;
+    if (edr_command_result_bind_contract(a, payload, payload_len,
+                                         normalized_meta.issued_at_unix_ms) != 0) {
+      audit_both(id, "command result purpose exceeds supported content bounds; execution rejected");
+      soar_emit(id, sm, EdrCmdExecRejected, 19, "result purpose contract rejected");
+      return 0;
+    }
   }
 
   char deadline_reason[180];
