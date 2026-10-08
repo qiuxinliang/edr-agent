@@ -64,7 +64,19 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   }
   br->process_start_key = snapshot.process_start_key;
   br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
-  br->ppid = snapshot.ppid;
+  edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,
+                       snapshot.ppid, snapshot.parent_pid_state);
+  if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT &&
+      snapshot.parent_pid_state != EDR_PARENT_PID_CONFLICT) {
+    /* Make the owning tree remember the disagreement for this exact lifetime;
+     * a later sparse event cannot silently re-enable its cached parent edge. */
+    (void)edr_pt_cache_put_generation_with_parent_state(br->pid, snapshot.ppid,
+        NULL, NULL, NULL, NULL, snapshot.last_seen_ns, snapshot.process_start_key,
+        snapshot.creation_filetime_100ns, 0u, EDR_PARENT_PID_CONFLICT);
+  }
+  if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+      br->parent_pid_state == EDR_PARENT_PID_INVALID)
+    edr_behavior_clear_parent_context(br);
   snprintf(br->exe_path, sizeof(br->exe_path), "%s", snapshot.exe_path);
   snprintf(br->image_path_raw, sizeof(br->image_path_raw), "%s", snapshot.exe_path);
   snprintf(br->image_path_canonical, sizeof(br->image_path_canonical), "%s", snapshot.exe_path);
@@ -80,7 +92,8 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   (void)p0_adopt_generation_command_fact(br, snapshot.cmdline,
       (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_CMDLINE) != 0u,
       "process_tree_cache_generation");
-  if (!br->parent_name[0] && snapshot.parent_name[0])
+  if (edr_behavior_parent_pid_usable(br) && snapshot.parent_pid_state == EDR_PARENT_PID_KNOWN &&
+      snapshot.ppid == br->ppid && !br->parent_name[0] && snapshot.parent_name[0])
     snprintf(br->parent_name, sizeof(br->parent_name), "%s", snapshot.parent_name);
   snprintf(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "%s", "RESOLVED");
   snprintf(br->image_path_resolution_source, sizeof(br->image_path_resolution_source), "%s",

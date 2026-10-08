@@ -4,7 +4,8 @@
 
 /* Captured by the detecting owner, not inferred from labels or scores at send
  * time. P0 derives these bits from its retained immutable matcher snapshot. */
-#define EDR_EVIDENCE_PROJECTION_VERSION 2u
+#define EDR_EVIDENCE_PROJECTION_LEGACY_VERSION 2u
+#define EDR_EVIDENCE_PROJECTION_VERSION 3u
 #define EDR_EVIDENCE_COMMAND        (UINT64_C(1) << 0)
 #define EDR_EVIDENCE_PARENT_NAME    (UINT64_C(1) << 1)
 #define EDR_EVIDENCE_PARENT_PATH    (UINT64_C(1) << 2)

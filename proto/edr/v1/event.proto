@@ -184,6 +184,10 @@ message BehaviorEvent {
   // Absent means legacy/unknown. False means the owner did not compute these
   // probabilities; an empty repeated field must not be interpreted as zeros.
   optional bool tactic_probs_computed = 72;
+  // Parent relationship validity, independent of optional parent text:
+  // 0 unknown, 1 known nonzero, 2 explicit zero, 3 invalid, 4 conflicting.
+  // Absent on old frames; a nonzero legacy ppid remains a known observation.
+  optional uint32 parent_pid_state = 73;
 }
 
 message ProcessDetail {

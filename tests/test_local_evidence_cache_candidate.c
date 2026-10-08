@@ -3268,6 +3268,7 @@ static void test_process_cache_generation_migration_and_restart_safe_rtq(void) {
   cleanup_test_sqlite_path(db);
   sqlite_exec_create_legacy_cache(db);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(sqlite_table_has_column(db, "process_cache", "parent_pid_state"));
   assert(sqlite_table_has_column(db, "process_cache", "process_start_key"));
   assert(sqlite_table_has_column(db, "process_cache", "cmdline_truncated_fields"));
   assert(sqlite_table_has_column(db, "process_cache", "process_creation_filetime_100ns"));
@@ -7842,6 +7843,144 @@ static void test_pmfe_weak_scan_verdict_requires_durable_original(void) {
 }
 #endif
 
+
+static void test_parent_pid_states_and_cache_owner(void) {
+  static const struct { const char *text; uint32_t pid; uint8_t state; } cases[] = {
+    {"", 0u, EDR_PARENT_PID_UNKNOWN},
+    {"ppid=0\n", 0u, EDR_PARENT_PID_EXPLICIT_ZERO},
+    {"ppid=4242\n", 4242u, EDR_PARENT_PID_KNOWN},
+    {"ppid=0x1092\n", 4242u, EDR_PARENT_PID_KNOWN},
+    {"ppid=\n", 0u, EDR_PARENT_PID_INVALID},
+    {"ppid=unknown\n", 0u, EDR_PARENT_PID_INVALID},
+    {"ppid=4242bad\n", 0u, EDR_PARENT_PID_INVALID},
+    {"ppid=-1\n", 0u, EDR_PARENT_PID_INVALID},
+    {"ppid=4294967296\n", 0u, EDR_PARENT_PID_INVALID},
+    {"ppid=4242\nppid=4242\n", 4242u, EDR_PARENT_PID_KNOWN},
+    {"ppid=4242\nppid=0\n", 4242u, EDR_PARENT_PID_CONFLICT},
+    {"ppid=0\nppid=4242\n", 0u, EDR_PARENT_PID_CONFLICT},
+    {"ppid=4242\nppid=bad\n", 4242u, EDR_PARENT_PID_CONFLICT}
+  };
+  EdrBehaviorRecord *r = calloc(1u,sizeof(*r));
+  EdrEventSlot slot;
+  assert(r);
+  for (size_t i=0u;i<sizeof(cases)/sizeof(cases[0]);++i) {
+    memset(&slot,0,sizeof(slot)); slot.type=EDR_EVENT_PROCESS_CREATE;
+    slot.timestamp_ns=1791454000000000000LL;
+    snprintf((char *)slot.data,sizeof(slot.data),"ETW1\npid=9001\n%sparent_img=C:\\parent.exe\nparent_cmdline=parent --unrelated\n",cases[i].text);
+    slot.size=(uint32_t)strlen((char *)slot.data);
+    edr_behavior_from_slot(&slot,r);
+    assert(r->ppid==cases[i].pid && r->parent_pid_state==cases[i].state);
+    if (cases[i].state==EDR_PARENT_PID_INVALID || cases[i].state==EDR_PARENT_PID_CONFLICT)
+      assert(!r->parent_name[0] && !r->parent_cmdline[0]);
+  }
+  const uint64_t creation=UINT64_C(134339443092584333);
+  const uint64_t birth=test_filetime_unix_ns(creation), key=900100u;
+  ProcessTreeEntry tree;
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(9001u,0u,"cmd.exe",NULL,"C:\\cmd.exe",NULL,birth,key,creation)==0);
+  init_record(r,EDR_EVENT_FILE_READ); r->pid=9001u; r->ppid=299u;
+  r->event_time_ns=(int64_t)(birth+1000000000u);
+  assert(p0_bind_file_read_cached_generation(r,key,creation)==1);
+  assert(r->ppid==299u && r->parent_pid_state==EDR_PARENT_PID_KNOWN);
+  assert(edr_pt_cache_put_generation(9001u,777u,NULL,NULL,NULL,NULL,birth,key,creation)==0);
+  snprintf(r->parent_name,sizeof(r->parent_name),"borrowed.exe");
+  snprintf(r->parent_cmdline,sizeof(r->parent_cmdline),"unrelated-secret-context");
+  r->parent_process_start_key=123u; r->parent_process_creation_filetime_100ns=creation-1u;
+  assert(p0_bind_file_read_cached_generation(r,key,creation)==1);
+  assert(r->ppid==299u && r->parent_pid_state==EDR_PARENT_PID_CONFLICT);
+  assert(!r->parent_name[0] && !r->parent_cmdline[0] && !r->parent_process_start_key);
+  assert(edr_pt_cache_snapshot_generation_at(9001u,key,birth+1000000000u,&tree)==0);
+  assert(tree.ppid==777u && tree.parent_pid_state==EDR_PARENT_PID_CONFLICT);
+  init_record(r,EDR_EVENT_FILE_READ); r->pid=9001u; r->event_time_ns=(int64_t)(birth+1000000000u);
+  assert(p0_bind_file_read_cached_generation(r,key,creation)==1);
+  assert(r->parent_pid_state==EDR_PARENT_PID_CONFLICT && !r->parent_name[0]);
+  assert(edr_pt_cache_put_generation(9001u,777u,NULL,NULL,NULL,NULL,birth,key,creation)==0);
+  assert(edr_pt_cache_snapshot_generation_at(9001u,key,birth+1000000000u,&tree)==0);
+  assert(tree.parent_pid_state==EDR_PARENT_PID_CONFLICT);
+  init_record(r,EDR_EVENT_FILE_READ); r->pid=9001u; r->ppid=299u;
+  r->event_time_ns=(int64_t)(birth+1000000000u);
+  assert(p0_bind_file_read_cached_generation(r,key+1u,creation)==0);
+  assert(r->ppid==299u && r->parent_pid_state==EDR_PARENT_PID_UNKNOWN);
+  assert(edr_pt_cache_put_generation(9002u,299u,"cmd.exe",NULL,"C:\\cmd.exe","parent.exe",birth,key+2u,creation)==0);
+  assert(edr_pt_cache_put_generation(9002u,0u,NULL,NULL,NULL,NULL,birth,key+2u,creation)==0);
+  assert(edr_pt_cache_snapshot_generation_at(9002u,key+2u,birth+1000000000u,&tree)==0);
+  assert(tree.ppid==299u && tree.parent_pid_state==EDR_PARENT_PID_KNOWN);
+  init_record(r,EDR_EVENT_FILE_READ); r->pid=9002u; r->event_time_ns=(int64_t)(birth+1000000000u);
+  assert(p0_bind_file_read_cached_generation(r,key+2u,creation)==1);
+  assert(r->ppid==299u && r->parent_pid_state==EDR_PARENT_PID_KNOWN);
+  init_record(r,EDR_EVENT_FILE_READ); r->pid=9002u; r->event_time_ns=(int64_t)(birth+1000000000u);
+  r->parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+  assert(p0_bind_file_read_cached_generation(r,key+2u,creation)==1);
+  assert(r->ppid==0u && r->parent_pid_state==EDR_PARENT_PID_CONFLICT && !r->parent_name[0]);
+  assert(edr_pt_cache_snapshot_generation_at(9002u,key+2u,birth+1000000000u,&tree)==0);
+  assert(tree.ppid==299u && tree.parent_pid_state==EDR_PARENT_PID_CONFLICT);
+  edr_pt_cache_shutdown();
+  free(r);
+}
+
+#if defined(EDR_HAVE_SQLITE)
+static void test_parent_pid_state_persistence_and_migration(void) {
+  for (int legacy=0;legacy<2;++legacy) {
+    char db[512],tree[16384];
+    assert(make_test_sqlite_path(db,sizeof(db))==0);
+    cleanup_test_sqlite_path(db);
+    if(legacy) sqlite_exec_create_legacy_cache(db);
+    EdrBehaviorRecord *r=calloc(1u,sizeof(*r)); assert(r);
+    assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+    assert(sqlite_table_has_column(db,"process_cache","parent_pid_state"));
+    init_record(r,EDR_EVENT_PROCESS_CREATE); r->pid=98211u; r->ppid=299u;
+    struct timespec now; assert(timespec_get(&now,TIME_UTC)==TIME_UTC);
+    r->event_time_ns=(int64_t)now.tv_sec*1000000000LL+now.tv_nsec;
+    snprintf(r->detection_context,sizeof(r->detection_context),"{\"severity\":\"P1\"}");
+    r->process_start_key=98211u; r->process_creation_filetime_100ns=test_unix_ns_to_filetime((uint64_t)r->event_time_ns-1000000000u);
+    snprintf(r->endpoint_id,sizeof(r->endpoint_id),"ep-parent-state");
+    snprintf(r->tenant_id,sizeof(r->tenant_id),"tenant-parent-state");
+    snprintf(r->process_name,sizeof(r->process_name),"cmd.exe");
+    snprintf(r->exe_path,sizeof(r->exe_path),"C:\\Windows\\cmd.exe");
+    snprintf(r->parent_name,sizeof(r->parent_name),"first.exe");
+    edr_local_evidence_cache_observe_process(r);
+    edr_local_evidence_cache_record_behavior(r);
+    edr_local_evidence_cache_close();
+    sqlite3 *raw=NULL; assert(sqlite3_open(db,&raw)==SQLITE_OK);
+    assert(sqlite3_exec(raw,"UPDATE process_cache SET parent_pid_state=0 WHERE pid=98211;",NULL,NULL,NULL)==SQLITE_OK);
+    assert(sqlite3_close(raw)==SQLITE_OK);
+    assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+    assert(edr_local_evidence_cache_process_tree_json(r->pid,r->endpoint_id,tree,sizeof(tree))==0);
+    assert(strstr(tree,"\"ppid\":299") && strstr(tree,"\"parent_pid_state\":1"));
+    edr_local_evidence_cache_observe_process(r);
+    r->ppid=777u; r->event_time_ns+=1000u;
+    snprintf(r->parent_name,sizeof(r->parent_name),"conflicting.exe");
+    edr_local_evidence_cache_observe_process(r);
+    edr_local_evidence_cache_record_behavior(r);
+    assert(edr_local_evidence_cache_process_tree_json(r->pid,r->endpoint_id,tree,sizeof(tree))==0);
+    assert(strstr(tree,"\"ppid\":299") && strstr(tree,"\"parent_pid_state\":4"));
+    assert(!strstr(tree,"conflicting.exe"));
+    edr_local_evidence_cache_close();
+    for(int reopen=0;reopen<2;++reopen) {
+      assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+      assert(edr_local_evidence_cache_process_tree_json(r->pid,r->endpoint_id,tree,sizeof(tree))==0);
+      assert(strstr(tree,"\"ppid\":299") && strstr(tree,"\"parent_pid_state\":4"));
+      assert(!strstr(tree,"conflicting.exe"));
+      edr_local_evidence_cache_close();
+    }
+    /* A later exact lifetime can establish its own parent; conflict does not
+     * leak across PID reuse, and explicit zero persists independently. */
+    r->event_time_ns+=2000000000LL; r->process_start_key+=1u;
+    r->process_creation_filetime_100ns+=20000000u;
+    r->ppid=0u; r->parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+    r->parent_name[0]='\0';
+    assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+    edr_local_evidence_cache_observe_process(r);
+    edr_local_evidence_cache_record_behavior(r);
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(db,8u,24u)==0);
+    assert(edr_local_evidence_cache_process_tree_json(r->pid,r->endpoint_id,tree,sizeof(tree))==0);
+    assert(strstr(tree,"\"ppid\":0") && strstr(tree,"\"parent_pid_state\":2"));
+    edr_local_evidence_cache_close(); cleanup_test_sqlite_path(db);free(r);
+  }
+}
+#endif
+
 int main(int argc, char **argv) {
 #if !defined(_WIN32)
   s_test_executable = argv[0];
@@ -7899,6 +8038,10 @@ int main(int argc, char **argv) {
   test_legacy_command_quality_is_unknown_until_observed();
 #endif
   test_command_preview_to_durable_fact();
+  test_parent_pid_states_and_cache_owner();
+#if defined(EDR_HAVE_SQLITE)
+  test_parent_pid_state_persistence_and_migration();
+#endif
   test_retained_file_read_cached_actor();
   test_checknetisolation_standard_low_risk_is_not_candidate();
   test_checknetisolation_high_risk_port_is_candidate();

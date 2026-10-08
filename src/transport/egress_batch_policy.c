@@ -4,6 +4,7 @@
 #include "edr/transport_sink.h"
 #include "edr/types.h"
 #include "edr/evidence_projection.h"
+#include "edr/parent_pid.h"
 #include "edr/v1/event.pb.h"
 #include "cJSON.h"
 #include <pb_common.h>
@@ -446,6 +447,11 @@ static int engine_alert(const edr_v1_BehaviorEvent *ev, const cJSON *subject) {
   const cJSON *ctx = cJSON_GetObjectItemCaseSensitive(subject, "detection_context");
   const cJSON *process = cJSON_GetObjectItemCaseSensitive(ctx, "process");
   const cJSON *signals = cJSON_GetObjectItemCaseSensitive(ctx, "engine_signals");
+  const cJSON *parent = cJSON_GetObjectItemCaseSensitive(process, "parent_pid");
+  if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && parent &&
+      (!cJSON_IsNumber(parent) || parent->valuedouble < 0 || parent->valuedouble > UINT32_MAX ||
+       floor(parent->valuedouble) != parent->valuedouble ||
+       (parent->valuedouble > 0 && ev->ppid && parent->valuedouble != ev->ppid))) return 0;
   const char *engine = string(ctx, "engine"), *rule = string(ctx, "rule_id");
   const cJSON *threshold=cJSON_GetObjectItemCaseSensitive(basis,"threshold");
   const cJSON *flags=cJSON_GetObjectItemCaseSensitive(basis,"behavior_flags");
@@ -635,6 +641,26 @@ static int target_identity_qualified(const edr_v1_BehaviorEvent *ev) {
     if (!strcmp(ev->identity_source,sources[i])) return 1;
   return 0;
 }
+static int projected_version(uint32_t version) {
+  return version == EDR_EVIDENCE_PROJECTION_VERSION ||
+      version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION;
+}
+static int parent_pid_fields_valid(const edr_v1_BehaviorEvent *ev) {
+  if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION)
+    return !ev->has_parent_pid_state;
+  if (!ev->has_parent_pid_state) return 0;
+  if (ev->parent_pid_state != EDR_PARENT_PID_KNOWN &&
+      (ev->required_evidence_fields & (EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH |
+       EDR_EVIDENCE_PARENT_COMMAND | EDR_EVIDENCE_CHAIN_DEPTH))) return 0;
+  switch (ev->parent_pid_state) {
+    case EDR_PARENT_PID_KNOWN: return ev->ppid != 0;
+    case EDR_PARENT_PID_UNKNOWN:
+    case EDR_PARENT_PID_EXPLICIT_ZERO:
+    case EDR_PARENT_PID_INVALID: return ev->ppid == 0;
+    case EDR_PARENT_PID_CONFLICT: return 1;
+    default: return 0;
+  }
+}
 static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   uint64_t mask=ev->required_evidence_fields;
   char identity_source[sizeof(ev->identity_source)],identity_quality[sizeof(ev->identity_quality)];
@@ -662,7 +688,9 @@ static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   c->has_grandparent_name=false;c->grandparent_name[0]=0;
   c->has_grandparent_path=false;c->grandparent_path[0]=0;
   if (!(mask & (EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_CHAIN_DEPTH))) {
-    ev->ppid=0;ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+    if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION)
+      ev->ppid=0;
+    ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
   }
   int keep=(ev->which_detail==edr_v1_BehaviorEvent_file_tag && (mask&EDR_EVIDENCE_FILE)) ||
     (ev->which_detail==edr_v1_BehaviorEvent_network_tag && (mask&EDR_EVIDENCE_NETWORK)) ||
@@ -691,7 +719,7 @@ static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   }
 }
 static int projected_evidence_valid(const edr_v1_BehaviorEvent *ev,int dynamic,int *resource_unavailable) {
-  if (ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION ||
+  if (!projected_version(ev->evidence_projection_version) || !parent_pid_fields_valid(ev) ||
       (ev->required_evidence_fields & ~EDR_EVIDENCE_ALL) ||
       ((ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY_DATA) && !(ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY)) ||
       ((ev->required_evidence_fields&EDR_EVIDENCE_NETWORK_AUX) && !(ev->required_evidence_fields&EDR_EVIDENCE_NETWORK)) ||
@@ -800,7 +828,7 @@ static int p0_terminal_tuple(const edr_v1_BehaviorEvent *ev,cJSON *ctx,const cha
 }
 static int p0_terminal_context_valid(const edr_v1_BehaviorEvent *ev,cJSON *subject,cJSON *ctx) {
   if (!same(subject,"subject_type","edr_dynamic_rule") || !dynamic_alert(ev,subject) ||
-      !json_fields(subject,ev->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION?
+      !json_fields(subject,projected_version(ev->evidence_projection_version)?
         p0_projected_subject_fields:p0_journal_subject_fields,0,0) ||
       !p0_terminal_tuple(ev,ctx,"result",NULL)) return 0;
   const cJSON *terminal=cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal");
@@ -815,7 +843,7 @@ static int p0_terminal_context_valid(const edr_v1_BehaviorEvent *ev,cJSON *subje
     same(terminal,"rules_bundle_sha256",string(subject,"rules_bundle_sha256")) &&
     same(source,"process_path",path) &&
     same(source,"canonical_image_path",path) &&
-    (ev->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION?
+    (projected_version(ev->evidence_projection_version)?
       (!ev->behavior_alert.process_path[0] && !strcmp(ev->exe_path,path)):
       !strcmp(ev->behavior_alert.process_path,path)) &&
     same(source,"file_identity",string(process,"file_identity")) &&
@@ -847,7 +875,7 @@ static int p0_pair_owned(const edr_v1_BehaviorEvent *ev,cJSON *ctx,const uint8_t
 }
 static int terminal_projection_valid(const edr_v1_BehaviorEvent *ev,int *resource_unavailable) {
   if (ev->evidence_projection_version==0) return 1; /* exact historical owner */
-  return ev->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION &&
+  return projected_version(ev->evidence_projection_version) &&
     !ev->has_ave_behavior_feed && ev->image_path_canonical[0] &&
     !strcmp(ev->exe_path,ev->image_path_canonical) && projected_evidence_valid(ev,1,resource_unavailable);
 }
@@ -900,12 +928,16 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
   }
   if (cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")) {
     cJSON *subject=ev->has_behavior_alert?object(ev->behavior_alert.user_subject_json):NULL;
-    int fresh=ev->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION;
+    int fresh=projected_version(ev->evidence_projection_version);
     int valid=ev->evidence_projection_version==0 || fresh;
     if (valid && fresh) {
       /* Only fresh producer bytes are projected. Never rewrite the uint64
        * terminal JSON lexeme or use this function to resend a journal. */
-      valid=operation_evidence_valid(ev);
+      if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && !ev->has_parent_pid_state) {
+        ev->has_parent_pid_state=true;
+        ev->parent_pid_state=ev->ppid?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+      }
+      valid=parent_pid_fields_valid(ev) && operation_evidence_valid(ev);
       if (valid && subject) {
         valid=json_fields(subject,p0_projected_subject_fields,1,0) &&
           dynamic_context_purpose(subject,ev->required_evidence_fields,1);
@@ -962,8 +994,13 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
   }
   if (recognized && valid) {
     ev->has_ave_behavior_feed=false; memset(&ev->ave_behavior_feed,0,sizeof(ev->ave_behavior_feed));
-    if (dynamic && ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION) valid=0;
+    if (dynamic && !projected_version(ev->evidence_projection_version)) valid=0;
     if (!dynamic) {ev->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;ev->required_evidence_fields=0;ev->operation_evidence_json[0]=0;}
+    if (valid && ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && !ev->has_parent_pid_state) {
+      ev->has_parent_pid_state=true;
+      ev->parent_pid_state=ev->ppid?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+    }
+    if (valid && !parent_pid_fields_valid(ev)) valid=0;
     if (valid && !operation_evidence_valid(ev)) valid=0;
     if (valid) project_evidence_fields(ev);
     if (subject_text) {
@@ -1023,7 +1060,7 @@ static int frame_validate(const uint8_t *frame,size_t len,char *reason,size_t ca
   int valid = !source_only && (alert_valid(ev) || standalone_engine(ev,ctx,frame,len) ||
     (intent && p0_intent_fields_valid(ev,ctx,NULL)));
   if (valid && ((ev->has_behavior_alert && !paired) ||
-      (paired && ev->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION))) {
+      (paired && projected_version(ev->evidence_projection_version)))) {
     cJSON *subject=ev->has_behavior_alert?object(ev->behavior_alert.user_subject_json):NULL;
     const cJSON *authority=paired?cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal"):subject;
     if (paired || same(subject,"subject_type","edr_dynamic_rule")) {

@@ -71,6 +71,7 @@ typedef struct {
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  uint8_t parent_pid_state;
   EvidenceProcessGeneration generation;
   EvidenceProcessGeneration parent_generation;
   char process_generation_source[64];
@@ -118,6 +119,7 @@ typedef struct {
   uint32_t type;
   uint32_t pid;
   uint32_t ppid;
+  uint8_t parent_pid_state;
   EvidenceProcessGeneration generation;
   EvidenceProcessGeneration parent_generation;
   char endpoint_id[48];
@@ -787,7 +789,7 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
                                   ProcessTreeEntry *snapshot) {
   uint64_t child_birth_ns = 0u;
   uint64_t selector_ns;
-  if (!r || !snapshot || r->ppid == 0u ||
+  if (!edr_behavior_parent_pid_usable(r) || !snapshot ||
       network_actor_generation_unbound(r)) {
     return 0;
   }
@@ -815,7 +817,7 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
 static int record_parent_generation(const EdrBehaviorRecord *r,
                                     EvidenceProcessGeneration *out) {
   ProcessTreeEntry snapshot;
-  if (r && out && r->ppid && r->parent_process_start_key &&
+  if (edr_behavior_parent_pid_usable(r) && out && r->parent_process_start_key &&
       r->parent_process_creation_filetime_100ns &&
       r->process_creation_filetime_100ns >= r->parent_process_creation_filetime_100ns) {
     memset(out, 0, sizeof(*out));
@@ -866,7 +868,8 @@ static int proc_parent_generation_matches_record(const ProcSlot *p,
    * not need the parent generation to remain in the short-lived process-tree
    * history.  Requiring another snapshot here made a valid edge disappear
    * after the parent exit grace, or change when that PID was reused. */
-  return p && r && proc_generation_matches_record(p, r) &&
+  return p && edr_behavior_parent_pid_usable(r) && p->parent_pid_state == EDR_PARENT_PID_KNOWN &&
+         proc_generation_matches_record(p, r) &&
          generation_bound(&p->parent_generation) &&
          (r->ppid == 0u || p->ppid == r->ppid);
 }
@@ -1009,7 +1012,8 @@ static void repair_child_parent_edges(const EdrBehaviorRecord *parent,
     ProcessTreeEntry selected;
     uint64_t child_birth_ns;
     if (child->pid == 0u || child->pid == parent->pid ||
-        child->ppid != parent->pid || !generation_bound(&child->generation) ||
+        child->ppid != parent->pid || child->parent_pid_state != EDR_PARENT_PID_KNOWN ||
+        !generation_bound(&child->generation) ||
         generation->creation_filetime_100ns >
             child->generation.creation_filetime_100ns ||
         (child->endpoint_id[0] && parent->endpoint_id[0] &&
@@ -1104,21 +1108,16 @@ static void process_cache_update(const EdrBehaviorRecord *r) {
     p->generation = incoming_generation;
   }
   p->pid = r->pid;
-  if (r->ppid != 0u) {
-    if (p->ppid != 0u && p->ppid != r->ppid) {
-      p->parent_name[0] = '\0';
-      p->parent_path[0] = '\0';
-      p->parent_cmdline[0] = '\0';
-      p->parent_path_truncated_fields[0] = '\0';
-      p->parent_cmdline_truncated_fields[0] = '\0';
-      p->grandparent_pid = 0u;
-      p->grandparent_name[0] = '\0';
-      p->grandparent_path[0] = '\0';
-      p->grandparent_path_truncated_fields[0] = '\0';
-      memset(&p->parent_generation, 0, sizeof(p->parent_generation));
-      p->parent_process_generation_source[0] = '\0';
-    }
-    p->ppid = r->ppid;
+  edr_parent_pid_merge(&p->ppid, &p->parent_pid_state, r->ppid, r->parent_pid_state);
+  if (p->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+      p->parent_pid_state == EDR_PARENT_PID_INVALID) {
+    p->parent_name[0] = p->parent_path[0] = p->parent_cmdline[0] = '\0';
+    p->parent_path_truncated_fields[0] = p->parent_cmdline_truncated_fields[0] = '\0';
+    p->grandparent_pid = 0u;
+    p->grandparent_name[0] = p->grandparent_path[0] = p->grandparent_path_truncated_fields[0] = '\0';
+    memset(&p->parent_generation, 0, sizeof(p->parent_generation));
+    p->parent_process_generation_source[0] = '\0';
+    incoming_parent_generation_known = 0;
   }
   p->last_seen_ns = record_time_ns(r);
   if (incoming_parent_generation_known &&
@@ -1287,9 +1286,10 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         if (!r->username[0] && !r->user_sid[0]) s_status.identity_cache_misses++;
       }
     } else {
-      if (r->ppid == 0u && p->ppid != 0u) {
-        r->ppid = p->ppid;
-      }
+      edr_parent_pid_merge(&r->ppid, &r->parent_pid_state, p->ppid, p->parent_pid_state);
+      if (r->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+          r->parent_pid_state == EDR_PARENT_PID_INVALID)
+        edr_behavior_clear_parent_context(r);
       if (!r->process_name[0] && p->name[0]) {
         copy_s(r->process_name, sizeof(r->process_name), p->name);
       }
@@ -1361,7 +1361,7 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
       }
     }
   } else { s_status.process_cache_misses++; s_status.identity_cache_misses++; }
-  if ((!r->parent_name[0] || !r->parent_path[0] || !r->parent_cmdline[0]) && r->ppid != 0u) {
+  if ((!r->parent_name[0] || !r->parent_path[0] || !r->parent_cmdline[0]) && edr_behavior_parent_pid_usable(r)) {
     ProcSlot *pp = find_proc(r->ppid, r->endpoint_id);
     EvidenceProcessGeneration parent_generation;
     if (pp && record_parent_generation(r, &parent_generation) &&
@@ -1402,6 +1402,7 @@ static int ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
   s->type = (uint32_t)r->type;
   s->pid = r->pid;
   s->ppid = r->ppid;
+  s->parent_pid_state = edr_parent_pid_effective_state(r->ppid, r->parent_pid_state);
   (void)record_process_generation(r, &s->generation);
   (void)record_parent_generation(r, &s->parent_generation);
   s->net_dport = r->net_dport;
@@ -2462,6 +2463,7 @@ static int sqlite_ensure_process_cache_generation_columns(void) {
     const char *name;
     const char *alter;
   } columns[] = {
+      {"parent_pid_state", "ALTER TABLE process_cache ADD COLUMN parent_pid_state INTEGER NOT NULL DEFAULT 0;"},
       {"process_start_key", "ALTER TABLE process_cache ADD COLUMN process_start_key TEXT;"},
       {"process_creation_filetime_100ns",
        "ALTER TABLE process_cache ADD COLUMN process_creation_filetime_100ns TEXT;"},
@@ -2528,6 +2530,7 @@ static int sqlite_read_process_cache_row(sqlite3_stmt *st, ProcSlot *out) {
          (const char *)sqlite3_column_text(st, 1));
   out->pid = (uint32_t)sqlite3_column_int64(st, 2);
   out->ppid = (uint32_t)sqlite3_column_int64(st, 3);
+  out->parent_pid_state = edr_parent_pid_effective_state(out->ppid, (uint8_t)sqlite3_column_int(st, 24));
   copy_s(out->name, sizeof(out->name), (const char *)sqlite3_column_text(st, 4));
   copy_s(out->path, sizeof(out->path), (const char *)sqlite3_column_text(st, 5));
   {
@@ -2555,7 +2558,8 @@ static int sqlite_read_process_cache_row(sqlite3_stmt *st, ProcSlot *out) {
          (const char *)sqlite3_column_text(st, 12));
   parent_start_key = (const char *)sqlite3_column_text(st, 13);
   parent_creation = (const char *)sqlite3_column_text(st, 14);
-  if (sqlite_decimal_u64(parent_start_key, &out->parent_generation.process_start_key) &&
+  if (out->parent_pid_state == EDR_PARENT_PID_KNOWN &&
+      sqlite_decimal_u64(parent_start_key, &out->parent_generation.process_start_key) &&
       sqlite_decimal_u64(parent_creation,
                          &out->parent_generation.creation_filetime_100ns) &&
       generation_bound(&out->parent_generation)) {
@@ -2829,13 +2833,13 @@ static int repair_child_parent_edges_sqlite(
   static const char *select_sql =
       "SELECT pid,process_start_key,process_creation_filetime_100ns,"
       "parent_process_start_key,parent_process_creation_filetime_100ns "
-      "FROM process_cache WHERE endpoint_id=? AND ppid=? AND pid<>?;";
+      "FROM process_cache WHERE endpoint_id=? AND ppid=? AND pid<>? AND parent_pid_state IN (0,1);";
   static const char *update_sql =
       "UPDATE process_cache SET parent_process_start_key=?,"
       "parent_process_creation_filetime_100ns=?,"
       "parent_process_generation_source=?,parent_name=?,parent_path=? "
       "WHERE endpoint_id=? AND pid=? AND ppid=? AND process_start_key=? "
-      "AND process_creation_filetime_100ns=?;";
+      "AND process_creation_filetime_100ns=? AND parent_pid_state IN (0,1);";
   sqlite3_stmt *select_st = NULL;
   sqlite3_stmt *update_st = NULL;
   char parent_start_key[32];
@@ -2953,6 +2957,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   int parent_known;
   int preserve_stronger_identity = 0;
   int replace_command = 1;
+  uint32_t durable_ppid = r->ppid;
+  uint8_t durable_parent_state = edr_parent_pid_effective_state(r->ppid, r->parent_pid_state);
   char command_fields[64];
   if (!s_db || !should_update_process_cache(r) ||
       !record_process_generation(r, &generation)) {
@@ -2982,7 +2988,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   {
     sqlite3_stmt *identity_st = NULL;
     const char *identity_sql =
-        "SELECT identity_quality,cmdline,cmdline_truncated_fields FROM process_cache WHERE endpoint_id=? AND pid=? "
+        "SELECT identity_quality,cmdline,cmdline_truncated_fields,ppid,parent_pid_state FROM process_cache WHERE endpoint_id=? AND pid=? "
         "AND process_start_key=? AND process_creation_filetime_100ns=? AND tenant_id=? LIMIT 1;";
     if (sqlite3_prepare_v2(s_db, identity_sql, -1, &identity_st, NULL) !=
         SQLITE_OK) {
@@ -2996,6 +3002,11 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
     bind_text(identity_st, 5, r->tenant_id);
     int read_rc = sqlite3_step(identity_st);
     if (read_rc == SQLITE_ROW) {
+      uint32_t previous_ppid = (uint32_t)sqlite3_column_int64(identity_st, 3);
+      uint8_t previous_state = (uint8_t)sqlite3_column_int(identity_st, 4);
+      edr_parent_pid_merge(&previous_ppid, &previous_state, durable_ppid, durable_parent_state);
+      durable_ppid = previous_ppid;
+      durable_parent_state = previous_state;
       const char *current_quality =
           (const char *)sqlite3_column_text(identity_st, 0);
       preserve_stronger_identity =
@@ -3016,8 +3027,8 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "first_seen_ns,last_seen_ns,process_start_key,process_creation_filetime_100ns,"
       "process_generation_source,parent_process_start_key,parent_process_creation_filetime_100ns,"
       "parent_process_generation_source,username,domain,user_sid,logon_id,identity_source,"
-      "identity_quality,exe_hash,cmdline_truncated_fields) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-      "ON CONFLICT(endpoint_id,pid) DO UPDATE SET "
+      "identity_quality,exe_hash,cmdline_truncated_fields,parent_pid_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?27) "
+      "ON CONFLICT(endpoint_id,pid) DO UPDATE SET parent_pid_state=excluded.parent_pid_state,"
       "tenant_id=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
       "THEN excluded.tenant_id WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE process_cache.tenant_id END,"
@@ -3037,14 +3048,14 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns "
       "THEN excluded.cmdline_truncated_fields WHEN ?26 THEN excluded.cmdline_truncated_fields "
       "ELSE process_cache.cmdline_truncated_fields END,"
-      "parent_name=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "parent_name=CASE WHEN excluded.parent_pid_state IN (3,4) THEN '' WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
       "(excluded.parent_process_start_key<>'' AND (process_cache.ppid IS NOT excluded.ppid OR "
       "process_cache.parent_process_start_key IS NOT excluded.parent_process_start_key OR "
       "process_cache.parent_process_creation_filetime_100ns IS NOT excluded.parent_process_creation_filetime_100ns)) "
       "THEN excluded.parent_name WHEN excluded.parent_name<>'' THEN excluded.parent_name ELSE process_cache.parent_name END,"
-      "parent_path=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "parent_path=CASE WHEN excluded.parent_pid_state IN (3,4) THEN '' WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
       "(excluded.parent_process_start_key<>'' AND (process_cache.ppid IS NOT excluded.ppid OR "
@@ -3061,15 +3072,15 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
       "process_creation_filetime_100ns=excluded.process_creation_filetime_100ns,"
       "process_generation_source=CASE WHEN excluded.process_generation_source<>'' THEN "
       "excluded.process_generation_source ELSE process_cache.process_generation_source END,"
-      "parent_process_start_key=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "parent_process_start_key=CASE WHEN excluded.parent_pid_state IN (3,4) THEN '' WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
       "excluded.parent_process_start_key<>'' THEN excluded.parent_process_start_key ELSE process_cache.parent_process_start_key END,"
-      "parent_process_creation_filetime_100ns=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "parent_process_creation_filetime_100ns=CASE WHEN excluded.parent_pid_state IN (3,4) THEN '' WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
       "excluded.parent_process_start_key<>'' THEN excluded.parent_process_creation_filetime_100ns ELSE process_cache.parent_process_creation_filetime_100ns END,"
-      "parent_process_generation_source=CASE WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
+      "parent_process_generation_source=CASE WHEN excluded.parent_pid_state IN (3,4) THEN '' WHEN process_cache.process_start_key IS NOT excluded.process_start_key OR "
       "process_cache.process_creation_filetime_100ns IS NOT excluded.process_creation_filetime_100ns OR "
       "(excluded.ppid<>0 AND process_cache.ppid IS NOT excluded.ppid) OR "
       "excluded.parent_process_start_key<>'' THEN excluded.parent_process_generation_source ELSE process_cache.parent_process_generation_source END,"
@@ -3095,15 +3106,19 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 1, r->endpoint_id);
   bind_text(st, 2, r->tenant_id);
   sqlite3_bind_int64(st, 3, (sqlite3_int64)r->pid);
-  sqlite3_bind_int64(st, 4, (sqlite3_int64)r->ppid);
+  sqlite3_bind_int64(st, 4, (sqlite3_int64)durable_ppid);
   bind_text(st, 5, r->process_name);
   bind_text(st, 6, r->exe_path);
   bind_text(st, 7, r->cmdline);
+  if (durable_parent_state == EDR_PARENT_PID_CONFLICT || durable_parent_state == EDR_PARENT_PID_INVALID) {
+    parent_known = 0;
+    parent_start_key[0] = parent_creation[0] = '\0';
+  }
   /* Parent display and generation must come from one child-birth snapshot.
    * Never persist a newly recomputed tuple beside stale fields carried by an
    * earlier record revision. */
-  bind_text(st, 8, parent_known ? parent_snapshot.process_name : r->parent_name);
-  bind_text(st, 9, parent_known ? parent_snapshot.exe_path : r->parent_path);
+  bind_text(st, 8, durable_parent_state != EDR_PARENT_PID_CONFLICT && durable_parent_state != EDR_PARENT_PID_INVALID ? (parent_known ? parent_snapshot.process_name : r->parent_name) : "");
+  bind_text(st, 9, durable_parent_state != EDR_PARENT_PID_CONFLICT && durable_parent_state != EDR_PARENT_PID_INVALID ? (parent_known ? parent_snapshot.exe_path : r->parent_path) : "");
   sqlite3_bind_int64(st, 10, (sqlite3_int64)ts);
   sqlite3_bind_int64(st, 11, (sqlite3_int64)ts);
   bind_text(st, 12, start_key);
@@ -3121,6 +3136,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
   bind_text(st, 24, r->exe_hash);
   bind_text(st, 25, command_fields);
   sqlite3_bind_int(st, 26, replace_command);
+  sqlite3_bind_int(st, 27, durable_parent_state);
   int rc = sqlite3_step(st);
   if (rc != SQLITE_DONE) {
     set_error("upsert process_cache failed");
@@ -3585,6 +3601,7 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
          manifest_add_u64(item, "type", s->type) &&
          manifest_add_u64(item, "pid", s->pid) &&
          manifest_add_u64(item, "ppid", s->ppid) &&
+         manifest_add_u64(item, "parent_pid_state", s->parent_pid_state) &&
          manifest_add_u64_text(item, "process_start_key", s->generation.process_start_key) &&
          manifest_add_u64_text(item, "process_creation_filetime_100ns",
                                s->generation.creation_filetime_100ns) &&
@@ -3654,6 +3671,7 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
        manifest_add_u64(root, "type", (uint32_t)r->type) &&
        manifest_add_u64(root, "pid", r->pid) &&
        manifest_add_u64(root, "ppid", r->ppid) &&
+       manifest_add_u64(root, "parent_pid_state", edr_parent_pid_effective_state(r->ppid,r->parent_pid_state)) &&
        manifest_add_u64_text(root, "process_start_key",
                              generation_known ? generation.process_start_key : 0u) &&
        manifest_add_u64_text(root, "process_creation_filetime_100ns",
@@ -5664,6 +5682,7 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "parent_process_start_key TEXT,parent_process_creation_filetime_100ns TEXT,"
       "parent_process_generation_source TEXT,username TEXT,domain TEXT,user_sid TEXT,"
       "logon_id TEXT,identity_source TEXT,identity_quality TEXT,exe_hash TEXT,cmdline_truncated_fields TEXT,"
+      "parent_pid_state INTEGER NOT NULL DEFAULT 0,"
       "PRIMARY KEY(endpoint_id,pid));"
       "CREATE INDEX IF NOT EXISTS idx_process_cache_parent ON process_cache(endpoint_id,ppid);"
       "CREATE TABLE IF NOT EXISTS event_cache ("
@@ -7550,7 +7569,7 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
   json_escape(parent_generation_source, sizeof(parent_generation_source),
               p ? p->parent_process_generation_source : "");
   appendf(out, cap, off, "%s{\"source\":\"%s\",\"endpoint_id\":%s,\"tenant_id\":%s,"
-                          "\"pid\":%u,\"ppid\":%u,\"name\":%s,\"path\":%s,\"cmdline\":%s,"
+                          "\"pid\":%u,\"ppid\":%u,\"parent_pid_state\":%u,\"name\":%s,\"path\":%s,\"cmdline\":%s,"
                           "\"cmdline_quality\":\"%s\",\"cmdline_truncated_fields\":%s,"
                           "\"cmdline_fact_ref\":\"%s\",\"cmdline_fact_sha256\":\"%s\",\"cmdline_fact_bytes\":%zu,"
                           "\"parent_name\":%s,\"parent_path\":%s,\"process_start_key\":\"%s\","
@@ -7560,7 +7579,7 @@ static int append_proc_json(char *out, size_t cap, size_t *off, int *first,
                           "\"user_sid\":%s,\"logon_id\":%s,\"identity_source\":%s,"
                           "\"identity_quality\":%s,\"exe_hash\":%s,\"last_seen_ns\":%lld}",
           *first ? "" : ",", source ? source : "", ep, tn, p ? p->pid : 0u,
-          p ? p->ppid : 0u, nm, path, cmd, quality, command_fields, reference, sha, full_bytes, pn, pp, generation_start, generation_creation,
+          p ? p->ppid : 0u, p ? p->parent_pid_state : 0u, nm, path, cmd, quality, command_fields, reference, sha, full_bytes, pn, pp, generation_start, generation_creation,
           generation_source, parent_generation_start, parent_generation_creation,
           parent_generation_source, username, domain, user_sid, logon_id,
           identity_source, identity_quality, exe_hash,
@@ -7597,13 +7616,13 @@ int edr_local_evidence_cache_process_tree_generation_json(
         ? "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
           "process_start_key,process_creation_filetime_100ns,process_generation_source,"
           "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
+          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields,parent_pid_state "
           "FROM process_cache WHERE endpoint_id=? AND pid=? AND process_start_key=? "
           "AND process_creation_filetime_100ns=? LIMIT 1;"
         : "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
           "process_start_key,process_creation_filetime_100ns,process_generation_source,"
           "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
+          "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields,parent_pid_state "
           "FROM process_cache WHERE endpoint_id=? AND pid=? LIMIT 1;";
     sqlite3_stmt *root_st = NULL;
     if (sqlite3_prepare_v2(s_db, root_sql, -1, &root_st, NULL) == SQLITE_OK) {
@@ -7644,7 +7663,7 @@ int edr_local_evidence_cache_process_tree_generation_json(
   appendf(out, cap, &off, ",\"children\":[");
   for (size_t i = 0; serialized && i < EDR_EVIDENCE_PROC_SLOTS && children < 64u; i++) {
     ProcSlot *p = &s_proc[i];
-    if (!root || !generation_bound(&root->generation) || p->pid == 0u || p->ppid != pid ||
+    if (!root || !generation_bound(&root->generation) || p->pid == 0u || p->ppid != pid || p->parent_pid_state != EDR_PARENT_PID_KNOWN ||
         !generation_equal(&p->parent_generation, &root->generation)) {
       continue;
     }
@@ -7660,8 +7679,8 @@ int edr_local_evidence_cache_process_tree_generation_json(
         "SELECT endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,last_seen_ns,"
         "process_start_key,process_creation_filetime_100ns,process_generation_source,"
         "parent_process_start_key,parent_process_creation_filetime_100ns,parent_process_generation_source,"
-        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields "
-        "FROM process_cache WHERE endpoint_id=? AND ppid=? AND parent_process_start_key=? "
+        "username,domain,user_sid,logon_id,identity_source,identity_quality,exe_hash,cmdline_truncated_fields,parent_pid_state "
+        "FROM process_cache WHERE parent_pid_state IN (0,1) AND endpoint_id=? AND ppid=? AND parent_process_start_key=? "
         "AND parent_process_creation_filetime_100ns=? ORDER BY last_seen_ns DESC LIMIT 64;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {

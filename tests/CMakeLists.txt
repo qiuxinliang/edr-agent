@@ -431,6 +431,18 @@ if(WIN32)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
 
+  add_executable(test_etw_process_payload_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_process_payload_windows.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+  target_include_directories(test_etw_process_payload_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_definitions(test_etw_process_payload_windows PRIVATE EDR_TDH_TESTING=1)
+  target_link_libraries(test_etw_process_payload_windows PRIVATE tdh)
+  edr_apply_test_warnings(test_etw_process_payload_windows)
+  add_test(NAME etw_process_payload_identity_native COMMAND test_etw_process_payload_windows)
+
   # Keep the real collector decoder and discard unrelated service entry points.
   # MSVC needs packaged functions and non-incremental REF even in Debug builds.
   add_executable(test_collector_file_read_windows
@@ -1917,6 +1929,7 @@ edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)
 edr_minimization_test(detection_decision_combo test_detection_decision)
 edr_minimization_test(detection_regression_scenarios test_detection_regression)
 edr_minimization_test(detection_sensor_bridge test_detection_sensor_bridge)
+edr_minimization_test(etw_process_payload_identity_native test_etw_process_payload_windows)
 edr_minimization_test(telemetry_admission test_telemetry_admission)
 edr_minimization_test(deep_collector_manifest test_deep_collector_manifest)
 edr_minimization_test(p0_source_only_durable_contract test_p0_source_only_durable_contract)

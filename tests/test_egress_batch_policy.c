@@ -665,5 +665,48 @@ static void network_detail_competition(void) {
  }
  free(r);free(wire);free(baseline);free(full);
 }
-int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+static void parent_relation_projection(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;assert(r);
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*local=malloc(EDR_EGRESS_FRAME_MAX);assert(wire&&local);
+ char why[128];make_record(r);make_alert(&a,r);r->ppid=4242;a.ppid=4242;
+ r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+ cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+ cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString("synthetic-network"));
+ overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+ size_t full=edr_behavior_record_encode_protobuf_full_facts(r,&a,NULL,NULL,local,EDR_EGRESS_FRAME_MAX);
+ size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(full&&n);
+ edr_v1_BehaviorEvent *ev=decode_frame(wire,n),*facts=decode_frame(local,full);
+ assert(facts->ppid==4242&&facts->behavior_alert.ppid==4242);
+ assert(ev->evidence_projection_version==3&&ev->ppid==4242&&ev->behavior_alert.ppid==0);
+ assert(ev->has_parent_pid_state&&ev->parent_pid_state==EDR_PARENT_PID_KNOWN);
+ assert(!ev->process_context.has_parent_cmdline&&!ev->process_context.has_current_directory);
+ assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));
+ ev->has_parent_pid_state=false;size_t bad=immutable_encode(ev,local);
+ assert(!edr_egress_frame_validate(local,bad,why,sizeof(why)));
+ ev->has_parent_pid_state=true;ev->parent_pid_state=EDR_PARENT_PID_UNKNOWN;bad=immutable_encode(ev,local);
+ assert(!edr_egress_frame_validate(local,bad,why,sizeof(why)));free(ev);free(facts);
+ printf("parent relation local_full=%zu projected_v3=%zu ppid=4242\n",full,n);
+ r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+ n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);ev=decode_frame(wire,n);
+ assert(ev->ppid==0&&ev->has_parent_pid_state&&ev->parent_pid_state==EDR_PARENT_PID_EXPLICIT_ZERO);
+ assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));free(ev);
+ r->ppid=4242;r->parent_pid_state=EDR_PARENT_PID_CONFLICT;
+ n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);ev=decode_frame(wire,n);
+ assert(ev->ppid==4242&&ev->parent_pid_state==EDR_PARENT_PID_CONFLICT);
+ assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));free(ev);
+ r->required_evidence_fields|=EDR_EVIDENCE_PARENT_NAME;
+ assert(!edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
+ r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_UNKNOWN;
+ assert(!edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
+ r->ppid=4242;
+ r->required_evidence_fields=EDR_EVIDENCE_NETWORK;r->parent_pid_state=EDR_PARENT_PID_KNOWN;
+ r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_LEGACY_VERSION;
+ n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);ev=decode_frame(wire,n);
+ assert(ev->evidence_projection_version==2&&ev->ppid==0&&!ev->has_parent_pid_state);
+ memcpy(local,wire,n);assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));
+ assert(!memcmp(local,wire,n)); /* Validation never edits a frozen v2 body. */
+ printf("parent relation legacy_v2=%zu ppid=0 frozen_bytes_unchanged=1\n",n);
+ free(ev);free(r);free(wire);free(local);
+}
+int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); parent_relation_projection(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }

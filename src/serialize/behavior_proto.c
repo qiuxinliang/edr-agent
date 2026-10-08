@@ -439,7 +439,8 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
   /* Choose an authorized purpose before filling a oneof. Otherwise unrelated
    * context can take its slot and projection later removes the real object.
    * Full local/journal encoding keeps the historical selection and bytes. */
-  int projected = outbound && r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION;
+  int projected = outbound && (r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION ||
+      r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION);
   uint64_t fields = r->required_evidence_fields;
   m->which_detail = 0;
   memset(&m->detail, 0, sizeof(m->detail));
@@ -530,6 +531,12 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
   msg->event_time_ns = r->event_time_ns;
   msg->pid = r->pid;
   msg->ppid = r->ppid;
+  if (r->evidence_projection_version != EDR_EVIDENCE_PROJECTION_LEGACY_VERSION) {
+    msg->has_parent_pid_state = true;
+    msg->parent_pid_state = r->parent_pid_state;
+    if (msg->parent_pid_state == EDR_PARENT_PID_UNKNOWN && msg->ppid)
+      msg->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  }
   msg->process_chain_depth = r->process_chain_depth;
   copy_str(msg->process_name, sizeof(msg->process_name), r->process_name);
   copy_record_transport_field(msg->cmdline, sizeof(msg->cmdline), r->cmdline,

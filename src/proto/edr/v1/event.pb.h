@@ -255,6 +255,11 @@ typedef struct _edr_v1_BehaviorEvent {
  probabilities; an empty repeated field must not be interpreted as zeros. */
     bool has_tactic_probs_computed;
     bool tactic_probs_computed;
+    /* Parent relationship validity, independent of optional parent text:
+ 0 unknown, 1 known nonzero, 2 explicit zero, 3 invalid, 4 conflicting.
+ Absent on old frames; a nonzero legacy ppid remains a known observation. */
+    bool has_parent_pid_state;
+    uint32_t parent_pid_state;
 } edr_v1_BehaviorEvent;
 
 
@@ -265,7 +270,7 @@ extern "C" {
 /* Initializer values for message structs */
 #define edr_v1_AveBehaviorEventFeed_init_default {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_default        {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
-#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_default, 0, 0, "", false, 0}
+#define edr_v1_BehaviorEvent_init_default        {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_default}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_default, false, edr_v1_AveBehaviorEventFeed_init_default, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_default, 0, 0, "", false, 0, false, 0}
 #define edr_v1_ProcessDetail_init_default        {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_default           {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_default       {"", "", "", ""}
@@ -275,7 +280,7 @@ extern "C" {
 #define edr_v1_ProcessContext_init_default       {false, "", false, "", false, "", false, "", false, "", false, "", false, 0, false, 0, false, "", false, ""}
 #define edr_v1_AveBehaviorEventFeed_init_zero    {0, "", 0, 0, 0, 0, 0, 0, "", "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "", false, 0}
 #define edr_v1_BehaviorAlert_init_zero           {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, "", 0, 0, 0, 0, "", "", "", "", 0, "", "", ""}
-#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_zero, 0, 0, "", false, 0}
+#define edr_v1_BehaviorEvent_init_zero           {"", "", "", 0, 0, 0, 0, "", "", "", "", "", 0, 0, 0, {edr_v1_ProcessDetail_init_zero}, "", 0, {"", "", "", "", "", "", "", ""}, 0, false, edr_v1_BehaviorAlert_init_zero, false, edr_v1_AveBehaviorEventFeed_init_zero, "", "", "", "", "", "", "", "", "", 0, 0, "", "", "", "", "", "", "", 0, "", "", "", "", "", "", "", false, edr_v1_ProcessContext_init_zero, 0, 0, "", false, 0, false, 0}
 #define edr_v1_ProcessDetail_init_zero           {"", "", "", "", "", "", 0, 0, "", ""}
 #define edr_v1_FileDetail_init_zero              {"", "", 0, 0}
 #define edr_v1_RegistryDetail_init_zero          {"", "", "", ""}
@@ -421,6 +426,7 @@ extern "C" {
 #define edr_v1_BehaviorEvent_required_evidence_fields_tag 70
 #define edr_v1_BehaviorEvent_operation_evidence_json_tag 71
 #define edr_v1_BehaviorEvent_tactic_probs_computed_tag 72
+#define edr_v1_BehaviorEvent_parent_pid_state_tag 73
 
 /* Struct field encoding specification for nanopb */
 #define edr_v1_AveBehaviorEventFeed_FIELDLIST(X, a) \
@@ -531,7 +537,8 @@ X(a, STATIC,   OPTIONAL, MESSAGE,  process_context,  68) \
 X(a, STATIC,   SINGULAR, UINT32,   evidence_projection_version,  69) \
 X(a, STATIC,   SINGULAR, UINT64,   required_evidence_fields,  70) \
 X(a, STATIC,   SINGULAR, STRING,   operation_evidence_json,  71) \
-X(a, STATIC,   OPTIONAL, BOOL,     tactic_probs_computed,  72)
+X(a, STATIC,   OPTIONAL, BOOL,     tactic_probs_computed,  72) \
+X(a, STATIC,   OPTIONAL, UINT32,   parent_pid_state,  73)
 #define edr_v1_BehaviorEvent_CALLBACK NULL
 #define edr_v1_BehaviorEvent_DEFAULT NULL
 #define edr_v1_BehaviorEvent_detail_process_MSGTYPE edr_v1_ProcessDetail
@@ -635,7 +642,7 @@ extern const pb_msgdesc_t edr_v1_ProcessContext_msg;
 #define EDR_V1_EDR_V1_EVENT_PB_H_MAX_SIZE        edr_v1_BehaviorEvent_size
 #define edr_v1_AveBehaviorEventFeed_size         4864
 #define edr_v1_BehaviorAlert_size                11192
-#define edr_v1_BehaviorEvent_size                253504
+#define edr_v1_BehaviorEvent_size                253511
 #define edr_v1_DnsDetail_size                    514
 #define edr_v1_FileDetail_size                   4144
 #define edr_v1_NetworkDetail_size                4257

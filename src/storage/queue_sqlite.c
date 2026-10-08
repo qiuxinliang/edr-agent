@@ -7,6 +7,7 @@
 #include "edr/transport_sink.h"
 #include "edr/transport_v2.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
 #include "edr/report_events_ack.h"
 #include "cJSON.h"
 
@@ -5527,7 +5528,7 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
       edr_sha256_update(&identity,old.nonce,16); recovery_hash_text(&identity,b->original_sha);
       recovery_hash_text(&identity,projection_sha); recovery_hash_text(&identity,request->tenant_id);
       recovery_hash_text(&identity,request->endpoint_id); edr_sha256_final(&identity,id_digest);
-      recovery_hex(id_digest,32,id_hex); snprintf(projection_id,sizeof(projection_id),"min-v2-%s",id_hex);
+      recovery_hex(id_digest,32,id_hex); snprintf(projection_id,sizeof(projection_id),"min-v%u-%s",EDR_EVIDENCE_PROJECTION_VERSION,id_hex);
       if (!strcmp(projection_id,b->batch_id)) goto write_failed;
       if (sqlite3_prepare_v2(s_db,"INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,"
           "status,recovery_version,origin_row_id) VALUES(?,?,?,0,1,'pending',1,?);",-1,&st,NULL)!=SQLITE_OK)

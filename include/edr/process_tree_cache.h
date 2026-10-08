@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "parent_pid.h"
 
 #define EDR_PTC_STR_SHORT 64u
 #define EDR_PTC_STR_LONG  8192u
@@ -28,6 +29,7 @@ enum {
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  uint8_t parent_pid_state;
   /* A parent may be selected only when these are captured from the same
    * lifecycle generation.  For exact generations `start_time_ns` is the
    * canonical Unix birth derived from creation_filetime_100ns; observation
@@ -83,6 +85,16 @@ int edr_pt_cache_put_generation_with_provenance(
     uint64_t process_start_key,
     uint64_t creation_filetime_100ns,
     uint8_t source_truncation_mask);
+
+/* Source-aware insertion for the lifecycle owner. Existing wrappers retain
+ * legacy semantics: zero means unknown, nonzero means known. */
+int edr_pt_cache_put_generation_with_parent_state(
+    uint32_t pid, uint32_t ppid,
+    const char *process_name, const char *cmdline,
+    const char *exe_path, const char *parent_name,
+    uint64_t observation_time_ns, uint64_t process_start_key,
+    uint64_t creation_filetime_100ns, uint8_t source_truncation_mask,
+    uint8_t parent_pid_state);
 
 /** 根据 PID 查找内部条目；仅可在缓存实现内部持锁调用。 */
 const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid);

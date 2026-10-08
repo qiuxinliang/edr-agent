@@ -998,7 +998,7 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   uint64_t child_birth_ns = filetime_100ns_to_unix_ns(br->process_creation_filetime_100ns);
   uint64_t parent_selector_ns = child_birth_ns != 0u ? child_birth_ns
       : (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0);
-  if (br->ppid > 0u) {
+  if (edr_behavior_parent_pid_usable(br)) {
     ProcessTreeEntry parent;
     int parent_from_live = 0;
     int parent_snapshot = edr_pt_cache_snapshot_at(
@@ -1055,12 +1055,21 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
                          ((edr_behavior_source_field_truncated(br, "source.exe_path") ||
                            edr_behavior_source_field_truncated(br, "source.image_path_canonical"))
                               ? EDR_PTC_SOURCE_TRUNC_EXE_PATH : 0u);
-    (void)edr_pt_cache_put_generation_with_provenance(
+    (void)edr_pt_cache_put_generation_with_parent_state(
         br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path, br->parent_name,
         (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), br->process_start_key,
-        br->process_creation_filetime_100ns, provenance);
+        br->process_creation_filetime_100ns, provenance, br->parent_pid_state);
+    ProcessTreeEntry own;
+    if (edr_pt_cache_snapshot_generation_at(br->pid, br->process_start_key,
+        (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), &own) == 0 &&
+        own.creation_filetime_100ns == br->process_creation_filetime_100ns) {
+      edr_parent_pid_merge(&br->ppid, &br->parent_pid_state, own.ppid, own.parent_pid_state);
+      if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+          br->parent_pid_state == EDR_PARENT_PID_INVALID)
+        edr_behavior_clear_parent_context(br);
+    }
   }
-  {
+  if (edr_behavior_parent_pid_usable(br)) {
     uint32_t chain_depth = 0u;
     uint8_t provenance = 0u;
     edr_pt_cache_fill_record_at_with_provenance(

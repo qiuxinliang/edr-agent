@@ -18,6 +18,7 @@ static unsigned pair_id;
 static const char *observation_rule;
 static int incomplete_cookie_command;
 static int inject_cookie_context;
+static int parent_relation_case;
 static int bytes_have(const uint8_t *wire,size_t len,const char *s) {size_t n=strlen(s);for(size_t i=0;i+n<=len;i++)if(!memcmp(wire+i,s,n))return 1;return 0;}
 EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len,int compressed,int severity) {
   char reason[160];
@@ -27,7 +28,15 @@ EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len
   edr_v1_BehaviorEvent *e=calloc(1,sizeof(*e));assert(e);
   pb_istream_t in=pb_istream_from_buffer(wire+16,len-16);
   assert(pb_decode(&in,edr_v1_BehaviorEvent_fields,e));
-  assert(e->has_behavior_alert && e->evidence_projection_version==2);
+  assert(e->has_behavior_alert && e->evidence_projection_version==EDR_EVIDENCE_PROJECTION_VERSION);
+  if (parent_relation_case) {
+    assert(e->ppid==6000 && e->behavior_alert.ppid==0);
+    assert(e->has_parent_pid_state && e->parent_pid_state==EDR_PARENT_PID_KNOWN);
+    assert(!e->process_context.has_parent_cmdline && !e->process_context.has_current_directory);
+    printf("parent relation rule frame ppid=%u state=%u projection=%u mask=%llu\n",
+           e->ppid,e->parent_pid_state,e->evidence_projection_version,
+           (unsigned long long)e->required_evidence_fields);
+  }
   assert(edr_egress_frame_validate(wire+16,len-16,reason,sizeof(reason)));
   if(operation_frame) {
     assert(e->operation_evidence_json[0]);
@@ -100,6 +109,18 @@ static void check_case(const char *label,EdrEventType type,const char *name,cons
     assert(m==n && !memcmp(legacy,marked,n));
     r->evidence_projection_version=0;r->required_evidence_fields=0;
   }
+  if(parent_relation_case) {
+    strcpy(r->parent_name,parent_relation_case==1?"explorer.exe":"winword.exe");
+    strcpy(r->parent_resolution_status,"RESOLVED");
+    r->parent_process_start_key=8000;r->parent_process_creation_filetime_100ns=133500000000000000ULL;
+    if(parent_relation_case==2) {
+      EdrP0RuleIrEvaluation blocked;uint8_t original=r->parent_pid_state;
+      r->parent_pid_state=EDR_PARENT_PID_CONFLICT;
+      assert(edr_p0_rule_ir_evaluate_record(r,&(EdrCommandFacts){r->cmdline,r->parent_cmdline},&blocked));
+      for(uint32_t i=0;i<blocked.match_count;i++){EdrP0RuleIrMatch m;assert(edr_p0_rule_ir_evaluation_get_match(&blocked,i,&m));assert(strcmp(m.rule_id,"R-EXEC-003"));}
+      edr_p0_rule_ir_evaluation_free(&blocked);r->parent_pid_state=original;
+    }
+  }
   EdrCommandFacts facts={r->cmdline,r->parent_cmdline};
   if(want_local) {
     EdrP0RuleIrEvaluation evaluation;assert(edr_p0_rule_ir_evaluate_record(r,&facts,&evaluation));int observed=0;
@@ -134,6 +155,11 @@ static void check_credential_pair(const char *label,const char *name,const char 
 int main(void) {
   deferred_fake_reset();edr_p0_rule_test_reset_dedup();edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  parent_relation_case=1;
+  check_case("parent relation R-EXEC-001",EDR_EVENT_PROCESS_CREATE,"powershell.exe","powershell.exe -enc SQBFAFgA",0,NULL,1,0);
+  parent_relation_case=2;
+  check_case("parent relation R-EXEC-003",EDR_EVENT_PROCESS_CREATE,"cmd.exe","cmd.exe /c ver",0,NULL,1,0);
+  parent_relation_case=0;
   observation_rule="R-LMOVE-012";
   check_case("cookie chrome",EDR_EVENT_FILE_READ,"chrome.exe","chrome.exe",0,"C:\\Users\\fixture\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Network\\Cookies",0,1);
   check_case("cookie backup",EDR_EVENT_FILE_READ,"backup.exe","backup.exe --daily",0,"C:\\Users\\fixture\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies",0,1);

@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "evidence_projection.h"
+#include "parent_pid.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -35,6 +36,7 @@ typedef struct {
   int64_t event_time_ns;
   uint32_t pid;
   uint32_t ppid;
+  uint8_t parent_pid_state;
   char process_name[EDR_BR_STR_SHORT];
   /* Command lines are the only long fact whose authoritative Windows query
    * routinely exceeds the generic 4 KiB field.  Keep this capacity separate
@@ -194,6 +196,23 @@ typedef struct {
   char wmi_filter[512];
   char scheduled_task_path[1024];
 } EdrBehaviorRecord;
+
+/* Relationship conflict/invalidity withholds borrowed parent facts, without
+ * erasing the original PPID or the child's exact process identity. */
+static inline void edr_behavior_clear_parent_context(EdrBehaviorRecord *r) {
+  r->parent_name[0] = r->parent_path[0] = r->parent_cmdline[0] = '\0';
+  r->parent_creation_time[0] = '\0';
+  r->parent_process_start_key = r->parent_process_creation_filetime_100ns = 0u;
+  r->grandparent_pid = r->process_chain_depth = 0u;
+  r->grandparent_name[0] = r->grandparent_path[0] = '\0';
+  r->sibling_names[0] = '\0';
+  r->parent_resolution_status[0] = r->parent_resolution_source[0] = '\0';
+}
+
+static inline int edr_behavior_parent_pid_usable(const EdrBehaviorRecord *r) {
+  return r && r->ppid != 0u &&
+      edr_parent_pid_effective_state(r->ppid, r->parent_pid_state) == EDR_PARENT_PID_KNOWN;
+}
 
 void edr_behavior_record_init(EdrBehaviorRecord *r);
 

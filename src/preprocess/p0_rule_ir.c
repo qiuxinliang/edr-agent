@@ -2058,6 +2058,10 @@ static int p0_ir_rule_fields_complete(const struct p0_ir_one *r,
   int file_rule = strcmp(r->event_type, "file_read") == 0 ||
                   strcmp(r->event_type, "file_write") == 0;
   if (!p0_ir_source_markers_valid(br)) return 0;
+  if ((br->parent_pid_state == EDR_PARENT_PID_INVALID ||
+       br->parent_pid_state == EDR_PARENT_PID_CONFLICT) &&
+      (r->required_evidence_fields & (EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH |
+       EDR_EVIDENCE_PARENT_COMMAND | EDR_EVIDENCE_CHAIN_DEPTH))) return 0;
   if (edr_behavior_source_field_truncated(br, "source.source_completeness")) return 0;
   if (file_read &&
       (edr_behavior_source_field_truncated(br, "source.image_path_resolution_status") ||

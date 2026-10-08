@@ -27,6 +27,7 @@
 typedef struct {
   uint32_t pid;
   uint32_t ppid;
+  uint8_t parent_pid_state;
   uint64_t process_start_key;
   uint64_t creation_filetime_100ns;
   uint64_t start_time_ns;
@@ -329,7 +330,7 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
                          uint64_t birth_time_ns, uint64_t observation_time_ns,
                          uint64_t process_start_key,
                          uint64_t creation_filetime_100ns,
-                         uint8_t source_truncation_mask) {
+                         uint8_t source_truncation_mask, uint8_t parent_pid_state) {
   if (!g_pt_initialized) return -1;
   if ((process_start_key == 0u) != (creation_filetime_100ns == 0u)) return -1;
   size_t idx = pt_hash(pid);
@@ -351,7 +352,7 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
     pt_evict_lru();
     return pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
                          birth_time_ns, observation_time_ns, process_start_key,
-                         creation_filetime_100ns, source_truncation_mask);
+                         creation_filetime_100ns, source_truncation_mask, parent_pid_state);
   }
   bool was_occupied = g_pt_table[target].occupied;
   PTStoredEntry *e = &g_pt_table[target].entry;
@@ -373,6 +374,7 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
     pt_clear_entry(e);
     e->pid = pid;
     e->ppid = ppid;
+    e->parent_pid_state = edr_parent_pid_effective_state(ppid, parent_pid_state);
     e->process_start_key = process_start_key;
     e->creation_filetime_100ns = creation_filetime_100ns;
     e->start_time_ns = birth_time_ns;
@@ -381,12 +383,13 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
   } else if (exact_generation) {
     /* Once exact generation birth/exit is present, later metadata may update
      * observation recency but must neither move birth nor resurrect exit. */
-    if (ppid != 0u) e->ppid = ppid;
+    edr_parent_pid_merge(&e->ppid, &e->parent_pid_state, ppid, parent_pid_state);
     if (observation_time_ns > e->last_seen_ns)
       e->last_seen_ns = observation_time_ns;
   } else {
     e->pid = pid;
     e->ppid = ppid;
+    e->parent_pid_state = edr_parent_pid_effective_state(ppid, parent_pid_state);
     e->start_time_ns = birth_time_ns;
     e->last_seen_ns = observation_time_ns;
     e->exit_time_ns = 0u;
@@ -405,7 +408,8 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
                   &e->source_truncation_mask, EDR_PTC_SOURCE_TRUNC_EXE_PATH,
                   exe_path,
                   (source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) != 0u);
-  if (parent_name && parent_name[0])
+  if (e->parent_pid_state == EDR_PARENT_PID_CONFLICT) e->parent_name[0] = '\0';
+  if (e->parent_pid_state != EDR_PARENT_PID_CONFLICT && e->parent_pid_state != EDR_PARENT_PID_INVALID && parent_name && parent_name[0])
     snprintf(e->parent_name, sizeof(e->parent_name), "%s", parent_name);
   g_pt_table[target].occupied = true;
   if (exact_generation && !was_occupied)
@@ -422,7 +426,7 @@ int edr_pt_cache_put(uint32_t pid, uint32_t ppid,
                      uint64_t start_time_ns) {
   pt_lock();
   int rc = pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
-                         start_time_ns, start_time_ns, 0u, 0u, 0u);
+                         start_time_ns, start_time_ns, 0u, 0u, 0u, EDR_PARENT_PID_UNKNOWN);
   pt_unlock();
   return rc;
 }
@@ -446,6 +450,16 @@ int edr_pt_cache_put_generation_with_provenance(
     uint64_t process_start_key,
     uint64_t creation_filetime_100ns,
     uint8_t source_truncation_mask) {
+  return edr_pt_cache_put_generation_with_parent_state(
+      pid, ppid, process_name, cmdline, exe_path, parent_name, observation_time_ns,
+      process_start_key, creation_filetime_100ns, source_truncation_mask, EDR_PARENT_PID_UNKNOWN);
+}
+
+int edr_pt_cache_put_generation_with_parent_state(
+    uint32_t pid, uint32_t ppid, const char *process_name, const char *cmdline,
+    const char *exe_path, const char *parent_name, uint64_t observation_time_ns,
+    uint64_t process_start_key, uint64_t creation_filetime_100ns,
+    uint8_t source_truncation_mask, uint8_t parent_pid_state) {
   int rc;
   uint64_t birth_time_ns;
   if (!pid || !process_start_key || !creation_filetime_100ns) return -1;
@@ -454,7 +468,7 @@ int edr_pt_cache_put_generation_with_provenance(
   pt_lock();
   rc = pt_put_locked(pid, ppid, process_name, cmdline, exe_path, parent_name,
                      birth_time_ns, observation_time_ns, process_start_key,
-                     creation_filetime_100ns, source_truncation_mask);
+                     creation_filetime_100ns, source_truncation_mask, parent_pid_state);
   pt_unlock();
   return rc;
 }
@@ -491,6 +505,7 @@ static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
   memset(out, 0, sizeof(*out));
   out->pid = entry->pid;
   out->ppid = entry->ppid;
+  out->parent_pid_state = entry->parent_pid_state;
   out->process_start_key = entry->process_start_key;
   out->creation_filetime_100ns = entry->creation_filetime_100ns;
   out->start_time_ns = entry->start_time_ns;
@@ -597,7 +612,7 @@ static uint32_t pt_chain_depth_locked(uint32_t pid) {
   uint32_t cur = pid;
   for (int hop = 0; hop < 32; hop++) {
     const PTStoredEntry *e = pt_get_latest_locked(cur);
-    if (!e || e->ppid == 0 || e->ppid == cur) {
+    if (!e || e->parent_pid_state != EDR_PARENT_PID_KNOWN || e->ppid == 0 || e->ppid == cur) {
       depth++;
       break;
     }
@@ -612,7 +627,7 @@ static uint32_t pt_chain_depth_at_locked(uint32_t pid, uint64_t event_time_ns) {
   uint32_t cur = pid;
   for (int hop = 0; hop < 32; ++hop) {
     const PTStoredEntry *entry = pt_get_at_locked(cur, event_time_ns, 0u, NULL);
-    if (!entry || entry->ppid == 0u || entry->ppid == cur) {
+    if (!entry || entry->parent_pid_state != EDR_PARENT_PID_KNOWN || entry->ppid == 0u || entry->ppid == cur) {
       depth++;
       break;
     }
@@ -643,7 +658,7 @@ static void pt_fill_record_locked(uint32_t pid, uint64_t event_time_ns,
   self = use_event_time ? pt_get_at_locked(pid, event_time_ns, 0u, NULL)
                         : pt_get_latest_locked(pid);
   if (!self) return;
-  if (self->ppid == 0u || self->ppid == pid) {
+  if (self->parent_pid_state != EDR_PARENT_PID_KNOWN || self->ppid == 0u || self->ppid == pid) {
     if (out_chain_depth) *out_chain_depth = 1u;
     return;
   }
@@ -660,7 +675,7 @@ static void pt_fill_record_locked(uint32_t pid, uint64_t event_time_ns,
       *out_source_truncation_mask |= EDR_PTC_RECORD_TRUNC_PARENT_CMDLINE;
     }
   }
-  if (!parent || parent->ppid == 0u || parent->ppid == self->ppid) {
+  if (!parent || parent->parent_pid_state != EDR_PARENT_PID_KNOWN || parent->ppid == 0u || parent->ppid == self->ppid) {
     if (out_chain_depth) *out_chain_depth = parent ? 2u : 1u;
     return;
   }

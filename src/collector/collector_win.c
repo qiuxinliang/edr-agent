@@ -4454,8 +4454,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
     plen = EDR_MAX_EVENT_PAYLOAD;
   }
   slot.size = (uint32_t)plen;
-  edr_collector_append_image_path_metadata(&slot);
   edr_collector_append_event_process_generation(&slot, event_record);
+  edr_collector_append_image_path_metadata(&slot);
 #ifdef EDR_COLLECTOR_FILE_IO_TESTING
   edr_collector_file_io_test_before_binding(&slot);
 #endif

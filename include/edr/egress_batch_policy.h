@@ -5,7 +5,7 @@
 #include <stdint.h>
 struct _edr_v1_BehaviorEvent;
 
-#define EDR_EGRESS_PROJECTOR_VERSION "alert-fields-v2"
+#define EDR_EGRESS_PROJECTOR_VERSION "alert-fields-v3"
 #define EDR_EGRESS_BATCH_MAX (4u * 1024u * 1024u)
 #define EDR_EGRESS_FRAME_MAX (256u * 1024u)
 #define EDR_EGRESS_FRAME_COUNT_MAX 4096u
