@@ -5344,23 +5344,32 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
   int recovery_columns=recovery_column_present("event_queue","recovery_version");
   int projection_relations=recovery_column_present("queue_projection_relations","origin_row_id");
   if (projection_relations<0) goto read_failed;
+  /* This command restores undelivered evidence, not a new delivery purpose.
+   * A receipt for any historical projection suppresses creation of another
+   * child. Keep original bytes, per-version receipts and independent latch
+   * ownership intact; never translate a local migration into a remote ACK. */
   const char *query=recovery_columns==1 && projection_relations ?
     "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,"
     "recovery_version,original_sha256,recovery_state FROM event_queue o "
-    "WHERE origin_row_id=0 AND (recovery_version=0 OR recovery_state='retained_unresolved' OR "
+    "WHERE origin_row_id=0 AND status!='acked' AND recovery_state!='projection_acked' "
+    "AND NOT EXISTS (SELECT 1 FROM queue_projection_relations received "
+    "WHERE received.origin_row_id=o.id AND received.receipt_state='acked') "
+    "AND (recovery_version=0 OR recovery_state='retained_unresolved' OR "
     "(recovery_version=1 AND projector_version<>?4 AND projection_batch_id<>'' AND NOT EXISTS "
     "(SELECT 1 FROM queue_projection_relations p WHERE p.origin_row_id=o.id AND p.projector_version=?4))) "
     "AND (id>?3 OR batch_id=?1) AND (status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
     "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;" : recovery_columns==1 ?
     "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,"
     "recovery_version,original_sha256,recovery_state FROM event_queue "
-    "WHERE (recovery_version=0 OR recovery_state='retained_unresolved' OR "
+    "WHERE status!='acked' AND recovery_state!='projection_acked' AND "
+    "(recovery_version=0 OR recovery_state='retained_unresolved' OR "
     "(recovery_version=1 AND projector_version<>?4 AND projection_batch_id<>'')) AND origin_row_id=0 "
     "AND (id>?3 OR batch_id=?1) AND "
     "(status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
     "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;" :
     "SELECT id,batch_id,payload,status,compressed,severity,retry_count,terminal_reason,0,'','' FROM event_queue "
-    "WHERE (id>?3 OR batch_id=?1) AND (status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
+    "WHERE status!='acked' AND (id>?3 OR batch_id=?1) "
+    "AND (status!='local_evidence' OR terminal_reason!='source_only_local_v3') "
     "ORDER BY CASE WHEN batch_id=?1 THEN 0 ELSE 1 END,id LIMIT ?2;";
   result=EDR_ERR_SQLITE_WRITE;
   if (recovery_columns<0 || sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
@@ -5382,11 +5391,13 @@ EdrError edr_storage_queue_recover_v1(const char *path,const EdrStorageQueueReco
       "SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
       "q.retry_count,q.terminal_reason,q.recovery_version,p.payload_sha256,q.recovery_state,q.origin_row_id "
       "FROM event_queue q JOIN queue_projection_relations p ON p.origin_row_id=q.origin_row_id AND p.batch_id=q.batch_id "
-      "WHERE q.origin_row_id>0 AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
+      "WHERE q.origin_row_id>0 AND p.receipt_state='pending' "
+      "AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
       "ORDER BY q.id LIMIT ?2;" : "SELECT q.id,q.batch_id,q.payload,q.status,q.compressed,q.severity,"
       "q.retry_count,q.terminal_reason,q.recovery_version,o.projection_sha256,q.recovery_state,q.origin_row_id "
       "FROM event_queue q JOIN event_queue o ON o.id=q.origin_row_id "
-      "WHERE q.origin_row_id>0 AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
+      "WHERE q.origin_row_id>0 AND o.recovery_state!='projection_acked' "
+      "AND q.status IN ('policy_held','dead_letter') AND q.id>?1 "
       "ORDER BY q.id LIMIT ?2;";
     if (sqlite3_prepare_v2(s_db,resume_query,-1,&st,NULL)!=SQLITE_OK) goto read_failed;
     sqlite3_bind_int64(st,1,(sqlite3_int64)request->after_row_id);

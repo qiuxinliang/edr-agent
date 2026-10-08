@@ -373,6 +373,10 @@ static void historic_projection_and_receipt(int compressed) {
   assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK && report.applied);
   assert(strstr(report.reason,"already_committed"));
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==2);
+  EdrStorageQueueRecoveryRequest pending_again=checked(path,&report);
+  assert(report.selected_batches==0 && report.projected_batches==0);
+  assert(edr_storage_queue_recover_v1(path,&pending_again,&report)==EDR_OK);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==2);
   /* A genuine linked alert remains replayable for service lifetime across
    * ordinary TTL/retry limits. No local cleanup can become a remote ACK. */
   sql_exec(path,"UPDATE event_queue SET created_at=1,retry_count=1000,next_retry_at=0 WHERE origin_row_id>0;");
@@ -567,6 +571,45 @@ static void multiversion_projection_receipts(int newest_first) {
   assert(edr_storage_queue_open(path)==EDR_OK);sends=0;edr_storage_queue_poll_drain();assert(sends==0);
   edr_storage_queue_close();remove(path);free(wire);
 }
+/* A retained receipt is not a request to deliver the same fact using a newer
+ * projector. Cover a legacy acknowledged row and both shapes of v1 receipts. */
+static void acknowledged_history_is_not_redelivered(int shape) {
+  char path[512]; test_path(path,sizeof(path),"acked-history",shape);
+  size_t len; uint8_t *wire=make_wire(1,1,0,"synthetic-endpoint",&len);
+  initialize(path,wire,len,1);
+  EdrStorageQueueRecoveryReport report; EdrStorageQueueRecoveryRequest request;
+  if (shape==0) {
+    /* Legacy state fixture: retained original marked ACKed, no child receipt. */
+    sql_exec(path,"UPDATE event_queue SET status='acked' WHERE batch_id='legacy-batch';");
+  } else {
+    request=checked(path,&report);
+    assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+    assert(edr_storage_queue_open(path)==EDR_OK); sends=0;receipt_mode=1;
+    edr_storage_queue_poll_drain();assert(sends==1);
+    edr_storage_queue_close();
+    assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==1);
+    assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_acked';")==1);
+    sql_exec(path,"UPDATE event_queue SET projector_version='alert-fields-v1' WHERE origin_row_id=0;"
+      "UPDATE queue_projection_relations SET projector_version='alert-fields-v1';");
+    if (shape==1) sql_exec(path,"DROP TABLE queue_projection_relations;");
+  }
+  char before_sha[65],after_sha[65];file_sha(path,before_sha);
+  request=checked(path,&report);file_sha(path,after_sha);
+  assert(!strcmp(before_sha,after_sha));
+  assert(report.selected_batches==0 && report.projected_batches==0);
+  assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+  assert(report.projected_batches==0 && report.resumed_projections==0);
+  original_equal(path,"legacy-batch",wire,len);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==1);
+  assert(sql_number(path,"SELECT source_latch_loss_detected FROM queue_meta;")==1);
+  assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK);
+  assert(edr_storage_queue_open(path)==EDR_OK);sends=0;receipt_mode=1;
+  edr_storage_queue_poll_drain();assert(sends==0);
+  edr_storage_queue_close();
+  request=checked(path,&report);assert(report.selected_batches==0);
+  original_equal(path,"legacy-batch",wire,len);
+  remove(path);free(wire);
+}
 static void unresolved_foreign_capacity(void) {
   char path[512]; test_path(path,sizeof(path),"real-unresolved",0);
   size_t len; uint8_t *wire=make_wire(0,0,0,"synthetic-endpoint",&len);
@@ -675,6 +718,7 @@ int main(int argc,char **argv) {
   resource_preflight_defers_original_bytes();
   server_policy_hold_retains_lineage();
   multiversion_projection_receipts(0); multiversion_projection_receipts(1);
+  for(int shape=0;shape<3;shape++) acknowledged_history_is_not_redelivered(shape);
   unresolved_foreign_capacity();
   process_crash_boundaries();
   puts("queue recovery: real codecs, immutable lineage, independent receipts, FULL rollback/restart passed");
