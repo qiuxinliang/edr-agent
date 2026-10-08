@@ -359,6 +359,9 @@ static void make_terminal_record(EdrBehaviorRecord *record) {
   record->type = EDR_EVENT_PROCESS_CREATE;
   record->event_time_ns = 1720000000000000000LL;
   record->pid = 4242u;
+  /* This rule proves the known office parent; name alone is not a relation. */
+  record->ppid = 6000u;
+  record->parent_pid_state = EDR_PARENT_PID_KNOWN;
   record->process_start_key = 0x4242u;
   record->process_creation_filetime_100ns = 133444555666777888ULL;
   snprintf(record->event_id, sizeof(record->event_id), "%s", k_terminal_event_id);
@@ -528,6 +531,18 @@ static int verify_terminal_fixture(void) {
   }
   edr_p0_rule_ir_evaluation_free(&evaluation);
   if (!bound) return 0;
+  /* Parent-predicate authority cannot be reconstructed from a name when the
+   * minimal parent relationship is unknown. Keep this fail-closed guard. */
+  EdrBehaviorRecord *unknown_parent = malloc(sizeof(*unknown_parent));
+  if (!unknown_parent) return 0;
+  *unknown_parent = s_terminal_records[0];
+  unknown_parent->ppid = 0u;
+  unknown_parent->parent_pid_state = EDR_PARENT_PID_UNKNOWN;
+  size_t rejected_len = 0u;
+  uint8_t *rejected = edr_behavior_record_alloc_outbound_wire_facts(
+      unknown_parent, NULL, NULL, &rejected_len);
+  free(unknown_parent);
+  if (rejected || rejected_len) { free(rejected); return 0; }
   for (i = 0u; i < TERMINAL_AUTHORITY_FRAMES; ++i) {
     s_terminal_expected_wire_lens[i] = edr_behavior_record_encode_durable_wire(
         &s_terminal_records[i], s_terminal_expected_wires[i], sizeof(s_terminal_expected_wires[i]));

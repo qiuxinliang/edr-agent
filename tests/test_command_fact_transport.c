@@ -101,6 +101,60 @@ static void assert_retained_wire(const char *path, const char *sql,
   sqlite3_finalize(st); sqlite3_close(db);
 }
 
+static void deferred_parent_state_restart(void) {
+  for (uint8_t state = EDR_PARENT_PID_EXPLICIT_ZERO; state <= EDR_PARENT_PID_CONFLICT; ++state) {
+    char path[512], key[65], selected[65], rule[64];
+    char *snapshot = NULL; size_t size = 0;
+    uint8_t *retained = NULL; size_t retained_size = 0;
+    EdrBehaviorRecord *source = calloc(1, sizeof(*source));
+    EdrBehaviorRecord *restored = calloc(1, sizeof(*restored));
+    EdrP0RuleIrBinding binding = {0}, decoded_binding;
+    assert(source && restored);
+    temp_file(path); identity(source, 9001u);
+    strcpy(source->event_id, "deferred-parent-state-event");
+    source->parent_pid_state = state;
+    source->ppid = state == EDR_PARENT_PID_CONFLICT ? 299u : 0u;
+    strcpy(binding.rules_bundle_version, "synthetic-parent-state-r1");
+    memset(binding.artifact_sha256, 'a', 64u);
+    assert(edr_p0_deferred_snapshot_encode(source, &binding, "R-TEST-PARENT-STATE", &snapshot, &size));
+    assert(strstr(snapshot, "\"schema\":4"));
+    assert(edr_sha256_hex((const uint8_t *)snapshot, size, key) == 0);
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_retain(key, 1u, (const uint8_t *)snapshot, size) == EDR_OK);
+    edr_storage_queue_close();
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_peek(1u, selected, &retained, &retained_size) == 1);
+    assert(!strcmp(key, selected) && retained_size == size && !memcmp(retained, snapshot, size));
+    assert(edr_p0_deferred_snapshot_decode((const char *)retained, retained_size,
+        restored, &decoded_binding, rule, sizeof(rule)));
+    assert(restored->parent_pid_state == state && restored->ppid == source->ppid);
+    assert(!strcmp(rule, "R-TEST-PARENT-STATE") &&
+        !strcmp(decoded_binding.artifact_sha256, binding.artifact_sha256));
+    free(retained); retained = NULL;
+    /* Replace only the older reader's unsupported-schema verdict. The fail
+     * transition, restart, digest/owner retention and selection are real C
+     * SQLite code. This does not claim execution of an older Windows binary. */
+    assert(edr_storage_queue_p0_deferred_fail(key, "snapshot_invalid_or_unsupported") == EDR_OK);
+    edr_storage_queue_close();
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_contains(key) == 1);
+    assert_retained_wire(path, "SELECT payload FROM p0_deferred_match WHERE key_sha256=?;",
+        (const uint8_t *)snapshot, size, key);
+    assert(sql_number(path, "SELECT COUNT(*) FROM p0_deferred_match WHERE state='failed' AND "
+        "last_error='snapshot_invalid_or_unsupported' AND key_sha256=payload_sha256 AND "
+        "completed_at=0 AND terminal_reason='';") == 1);
+    assert(edr_storage_queue_p0_deferred_peek(1u, selected, &retained, &retained_size) == 0);
+    assert(!retained && !retained_size && !selected[0]);
+    unsigned before = delivered;
+    edr_storage_queue_poll_drain();
+    assert(delivered == before && edr_storage_queue_pending_count() == 0);
+    assert(sql_number(path, "SELECT COUNT(*) FROM event_queue;") == 0);
+    edr_storage_queue_close(); cleanup(path);
+    printf("deferred parent state=%u restart=exact unsupported=failed_retained no_delivery=1\n", state);
+    free(snapshot); free(source); free(restored);
+  }
+}
+
 #ifdef EDR_P0_TEST_REAL_IR
 /* Capture the real producer's immutable queue body, rather than constructing
  * a provenance string. The decoder only borrows that producer's alert for the
@@ -566,5 +620,6 @@ int main(int argc, char **argv) {
   edr_local_evidence_cache_close();
   cleanup(db); cleanup(queue);
   free(parent); free(child); free(decoded); free(command);
+  deferred_parent_state_restart();
   return 0;
 }
