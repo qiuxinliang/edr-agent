@@ -209,9 +209,13 @@ if(WIN32)
   add_test(NAME windows_inplace_collector_transaction
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_inplace_collector_transaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  add_test(NAME windows_installer_log_redaction
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_installer_log_redaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
   set_tests_properties(
     windows_release_collector_pe_closure
     windows_inplace_collector_transaction
+    windows_installer_log_redaction
     PROPERTIES TIMEOUT 60)
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command

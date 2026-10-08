@@ -36,6 +36,7 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
+    "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
     "openssl_tls_handshake", "windows_task_exit_behavior", "validation_trace_contract",
 }
@@ -109,7 +110,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
         """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
         names = ("windows_release_collector_pe_closure",
-                 "windows_inplace_collector_transaction")
+                 "windows_inplace_collector_transaction",
+                 "windows_installer_log_redaction")
         definitions = (ROOT / "tests" / "CMakeLists.txt").read_text(encoding="utf-8")
         declarations = []
         for name in names:
@@ -124,7 +126,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
         # Carry the production deadlines into the fixture as well as commands.
         properties = re.search(
             r"  set_tests_properties\(\s*windows_release_collector_pe_closure\s*"
-            r"windows_inplace_collector_transaction\s*PROPERTIES TIMEOUT \d+\)", definitions)
+            r"windows_inplace_collector_transaction\s*windows_installer_log_redaction\s*"
+            r"PROPERTIES TIMEOUT \d+\)", definitions)
         self.assertIsNotNone(properties)
         declarations.append(properties.group(0))
 
@@ -293,15 +296,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
                                               "--no-tests=error", "--output-on-failure", success=False)
                     self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
-    def test_installer_health_failure_blocks_windows_release(self):
-        name = "windows_installer_health_behavior"
-        with tempfile.TemporaryDirectory() as directory:
-            source, build, _ = self.fixture(directory, failing_test=name)
-            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
-            self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
-            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
-                                      "--no-tests=error", "--output-on-failure", success=False)
-            self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+    def test_installer_health_and_redaction_failures_block_windows_release(self):
+        for name in ("windows_installer_health_behavior", "windows_installer_log_redaction"):
+            with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, failing_test=name)
+                self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+                self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
+                result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                          "--no-tests=error", "--output-on-failure", success=False)
+                self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
     def test_empty_selection_fails(self):
         with tempfile.TemporaryDirectory() as directory:
