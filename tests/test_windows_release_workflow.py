@@ -1,5 +1,6 @@
 """Guard the restored job graph and retained release integrity boundaries."""
 from pathlib import Path
+import itertools
 import re
 import unittest
 from unittest.mock import patch
@@ -32,9 +33,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('needs: [prepare-release, usb-finalize]', self.jobs['windows-lifecycle'])
         publish = self.jobs['publish-release']
         needs = publish.split('    needs:\n', 1)[1].split('    runs-on:', 1)[0]
-        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['windows-build', 'windows-lifecycle', 'usb-finalize'])
-        # No always() or job-level condition can bypass implicit successful needs.
-        self.assertNotRegex(publish, r'(?m)^    if:')
+        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M),
+                         ['prepare-release', 'windows-build', 'windows-lifecycle', 'usb-finalize'])
+        self.assert_publication_gate(publish)
         self.assertIn('windows-install-upgrade-rollback.yml', self.jobs['windows-lifecycle'])
         self.assertIn('windows_release_checkpoint.py prepare', self.jobs['prepare-release'])
         self.assertIn("needs.prepare-release.outputs.published != 'true'", self.jobs['windows-build'])
@@ -68,8 +69,8 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('  actions: read', self.text.split('\njobs:\n', 1)[0])
         checkpoint = self.jobs['windows-build'].split('- name: Retain verified package', 1)[1].split('\n      - ', 1)[0]
         self.assertIn('retention-days: 1', checkpoint)
-        final = self.jobs['usb-finalize'].split('- name: Retain final signed bundle', 1)[1].split('\n      - ', 1)[0]
-        self.assertIn('retention-days: 1', final)
+        self.assertNotIn('actions/upload-artifact', self.jobs['usb-finalize'])
+        self.assertIn('immutable private Release', self.jobs['usb-finalize'])
         lifecycle = (ROOT / '.github/workflows/windows-install-upgrade-rollback.yml').read_text(encoding='utf-8')
         evidence = lifecycle.split('- name: Upload Windows lifecycle evidence', 1)[1]
         self.assertIn('retention-days: 7', evidence)
@@ -117,7 +118,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertRegex(runner.split(command, 1)[1],
                          r'if\s*\(\$LASTEXITCODE -ne 0\)\s*\{\s*throw\b')
         self.assertNotRegex(self.jobs['windows-build'], r'(?m)^    continue-on-error:')
-        self.assertNotRegex(self.jobs['publish-release'], r'(?m)^    if:')
+        self.assert_publication_gate(self.jobs['publish-release'])
         self.assertIn('      - windows-build\n', self.jobs['publish-release'])
 
     def test_native_telemetry_gate_rejects_missing_call_and_failure_bypass(self):
@@ -198,9 +199,82 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn('--phase', finish)
         self.assertIn('restore-usb-final --directory finalized', finish)
         self.assertIn("steps.final-resume.outputs.restored != 'true'", finish)
-        self.assertLess(finish.index('Verify-WindowsUsbSignatures.ps1'), finish.index('name: usb-verified-final'))
-        self.assertLess(finish.index('name: usb-verified-final'), finish.index('windows_release_checkpoint.py upload'))
+        legacy_restore = finish.split('- name: Restore same-run signed final checkpoint\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("env.RECOVERY_MODE != 'true'", legacy_restore)
+        self.assertIn('private_signing_bridge.py download --signing-run', finish)
+        self.assertLess(finish.index('private_signing_bridge.py download'), finish.index('Verify-WindowsUsbSignatures.ps1'))
+        self.assertLess(finish.index('Verify-WindowsUsbSignatures.ps1'), finish.index('windows_release_checkpoint.py upload'))
+        self.assertNotIn('actions/upload-artifact', finish)
+        self.assertNotIn('name: usb-verified-final', finish)
         self.assertIn("needs: [prepare-release, usb-finalize]", self.jobs['windows-lifecycle'])
+
+    @staticmethod
+    def evaluate_job_condition(job, results, recovery, *, cancelled=False):
+        condition = re.search(r'^    if: \$\{\{ (.+) \}\}$', job, re.M).group(1)
+        condition = condition.replace('always()', 'True').replace('!cancelled()', str(not cancelled))
+        condition = condition.replace('inputs.recover_source_run', repr('1234' if recovery else ''))
+        condition = re.sub(r'needs\.([\w-]+)\.result', lambda match: repr(results[match[1]]), condition)
+        condition = condition.replace('&&', 'and').replace('||', 'or')
+        return eval(condition, {'__builtins__': {}}, {})
+
+    def assert_publication_gate(self, job):
+        statuses = ('success', 'failure', 'cancelled', 'skipped')
+        keys = ('prepare-release', 'windows-build', 'usb-finalize', 'windows-lifecycle')
+        for recovery, cancelled in itertools.product((False, True), repeat=2):
+            for values in itertools.product(statuses, repeat=4):
+                results = dict(zip(keys, values))
+                expected = (not cancelled and results['prepare-release'] == 'success'
+                            and results['usb-finalize'] == 'success'
+                            and results['windows-lifecycle'] == 'success'
+                            and (results['windows-build'] == 'success'
+                                 or (recovery and results['windows-build'] == 'skipped')))
+                self.assertEqual(self.evaluate_job_condition(job, results, recovery, cancelled=cancelled),
+                                 expected, (recovery, cancelled, results))
+
+    def test_recovery_is_admitted_before_existing_draft_access_and_never_rebuilds(self):
+        prepare = self.jobs['prepare-release']
+        self.assertLess(prepare.index('private_signing_bridge.py recover-check'),
+                        prepare.index('name: Bind draft release to source and run'))
+        bind = prepare.split('- name: Bind draft release to source and run', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('windows_release_checkpoint.py verify-owner', bind)
+        self.assertIn('if [[ "$RECOVERY_MODE" == \'true\' ]]', bind)
+        build_condition = re.search(r'^    if: (.+)$', self.jobs['windows-build'], re.M).group(1)
+        for field in ('run', 'attempt', 'commit'):
+            self.assertIn(f"inputs.recover_source_{field} == ''", build_condition)
+        finish = self.jobs['usb-finalize']
+        download = finish.split('- name: Download only admitted original build inputs', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('run-id: ${{ inputs.recover_source_run }}', download)
+        self.assertIn('artifact-ids: ${{ needs.prepare-release.outputs.artifact_ids }}', download)
+        self.assertIn('windows_release_checkpoint.py verify-input', finish)
+        self.assertLess(finish.index('windows_release_checkpoint.py verify-input'),
+                        finish.index('private_signing_bridge.py dispatch'))
+        self.assertIn('--run $env:SOURCE_RUN --attempt $env:SOURCE_ATTEMPT --commit $env:SOURCE_COMMIT', finish)
+        self.assertNotRegex(self.text, r'\$env:GITHUB_(?:SHA|RUN_ID|REPOSITORY)\s*=')
+
+    def test_usb_actions_and_private_release_credentials_have_separate_consumers(self):
+        prepare = self.jobs['prepare-release'].split('- name: Fail early for missing USB configuration', 1)[1]
+        self.assertIn('USB_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}', prepare)
+        self.assertIn('test -n "$USB_RELEASE_TOKEN"', prepare)
+        finish = self.jobs['usb-finalize']
+        dispatch = finish.split('- name: Dispatch one private finalization job', 1)[1].split('\n      - ', 1)[0]
+        download = finish.split('- name: Download immutable private Release result', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}', dispatch)
+        self.assertNotIn('USB_SIGNING_RELEASE_TOKEN', dispatch)
+        self.assertIn('GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}', download)
+        self.assertIn('USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}', download)
+        lifecycle = self.jobs['windows-lifecycle']
+        self.assertIn('USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}', lifecycle)
+        self.assertNotIn('USB_SIGNING_TOKEN:', lifecycle)
+
+    def test_recovery_publication_condition_rejects_missing_lifecycle_or_failed_native_build(self):
+        job = self.jobs['publish-release']
+        self.assert_publication_gate(job)
+        weakened = job.replace("needs.windows-lifecycle.result == 'success'", 'True')
+        with self.assertRaises(AssertionError):
+            self.assert_publication_gate(weakened)
+        weakened = job.replace("needs.windows-build.result == 'skipped'", "needs.windows-build.result != 'success'")
+        with self.assertRaises(AssertionError):
+            self.assert_publication_gate(weakened)
 
     def test_candidate_never_promotes_latest(self):
         publish = self.jobs['publish-release']

@@ -42,6 +42,18 @@ on:
           - binary_hot
           - runtime_bundle
           - installer_required
+      recover_source_run:
+        description: Resume an existing USB candidate from its immutable successful native builds (no compilation)
+        required: false
+        type: string
+      recover_source_attempt:
+        description: Latest failed source run attempt; required with recover_source_run
+        required: false
+        type: string
+      recover_source_commit:
+        description: Full original source commit; required with recover_source_run
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -59,6 +71,14 @@ env:
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_RELEASE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || false }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
+  RECOVERY_MODE: ${{ inputs.recover_source_run != '' || inputs.recover_source_attempt != '' || inputs.recover_source_commit != '' }}
+  SOURCE_RUN: ${{ inputs.recover_source_run }}
+  SOURCE_ATTEMPT: ${{ inputs.recover_source_attempt }}
+  SOURCE_COMMIT: ${{ inputs.recover_source_commit }}
+  SOURCE_REPOSITORY: ${{ inputs.recover_source_run != '' && github.repository || '' }}
+  EXECUTOR_RUN: ${{ github.run_id }}
+  EXECUTOR_ATTEMPT: ${{ github.run_attempt }}
+  EXECUTOR_COMMIT: ${{ github.sha }}
 
 jobs:
   prepare-release:
@@ -67,6 +87,7 @@ jobs:
     outputs:
       published: ${{ steps.prepare.outputs.published }}
       baseline_tag: ${{ steps.baseline.outputs.baseline_tag }}
+      artifact_ids: ${{ steps.recovery.outputs.artifact_ids }}
     steps:
       - uses: actions/checkout@v6
       - name: Verify release ownership and checkpoint contracts
@@ -76,12 +97,29 @@ jobs:
           python3 tests/test_windows_usb_bundle.py
           cc -std=c11 -Wall -Wextra -Werror tests/test_agent_update_assets.c -o "$RUNNER_TEMP/test_agent_update_assets"
           EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"
+      - name: Admit immutable recovery source and active executor
+        if: env.RECOVERY_MODE == 'true'
+        id: recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/private_signing_bridge.py recover-check --run "$SOURCE_RUN" --attempt "$SOURCE_ATTEMPT" --commit "$SOURCE_COMMIT" --version "${EDR_AGENT_RELEASE_TAG#win_}"
       - name: Bind draft release to source and run
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: python3 scripts/windows_release_checkpoint.py prepare
+        run: |
+          set -euo pipefail
+          if [[ "$RECOVERY_MODE" == 'true' ]]; then
+            # Recovery must not create a missing draft or take over its owner.
+            python3 scripts/windows_release_checkpoint.py verify-owner
+            printf 'published=false\n' >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/windows_release_checkpoint.py prepare
+          fi
       - name: Select published baseline for this run
         if: steps.prepare.outputs.published != 'true'
         id: baseline
@@ -97,16 +135,22 @@ jobs:
         if: env.WINDOWS_RELEASE_MODE == 'usb'
         env:
           USB_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
           USB_THUMBPRINT: ${{ vars.WINDOWS_USB_THUMBPRINT }}
           USB_SUBJECT: ${{ vars.WINDOWS_USB_SIGNER_SUBJECT }}
         shell: bash
         run: |
-          test -n "$USB_TOKEN" && test -n "$USB_SUBJECT" && [[ "$USB_THUMBPRINT" =~ ^[A-F0-9]{40}$ ]] || { echo 'USB signing credential or pinned publisher is not configured'; exit 1; }
+          set -euo pipefail
+          test -n "$USB_TOKEN" && test -n "$USB_RELEASE_TOKEN" && test -n "$USB_SUBJECT" && [[ "$USB_THUMBPRINT" =~ ^[A-F0-9]{40}$ ]] || { echo 'USB Actions/Release credentials or pinned publisher are not configured'; exit 1; }
+          # Fail before USB access if the separately scoped credential cannot
+          # read private Release assets. Its write path is verified by evidence upload.
+          [[ "$(GH_TOKEN="$USB_RELEASE_TOKEN" gh api repos/qiuxinliang/edr-agent-signing --jq '.private')" == 'true' ]]
+          GH_TOKEN="$USB_RELEASE_TOKEN" gh api 'repos/qiuxinliang/edr-agent-signing/releases?per_page=1' --silent
 
   windows-build:
     name: Build Windows ${{ matrix.arch }} (FDSensor.exe + runtime DLLs, fast no-gRPC)
     needs: prepare-release
-    if: needs.prepare-release.outputs.published != 'true'
+    if: needs.prepare-release.outputs.published != 'true' && inputs.recover_source_run == '' && inputs.recover_source_attempt == '' && inputs.recover_source_commit == ''
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
@@ -1357,9 +1401,17 @@ jobs:
 
   usb-finalize:
     name: Finalize USB release (one private handoff)
-    needs: windows-build
+    needs: [prepare-release, windows-build]
+    # Only admitted recovery may bypass a deliberately skipped native build.
+    if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' && needs.prepare-release.outputs.published != 'true' && (needs.windows-build.result == 'success' || (inputs.recover_source_run != '' && needs.windows-build.result == 'skipped')) }}
     runs-on: windows-2022
     timeout-minutes: 45
+    env:
+      SIGNING_CONTEXT: 'true'
+      SOURCE_REPOSITORY: ${{ github.repository }}
+      SOURCE_RUN: ${{ inputs.recover_source_run || github.run_id }}
+      SOURCE_ATTEMPT: ${{ inputs.recover_source_attempt || github.run_attempt }}
+      SOURCE_COMMIT: ${{ inputs.recover_source_commit || github.sha }}
     steps:
       - uses: actions/checkout@v6
         if: env.WINDOWS_RELEASE_MODE == 'usb'
@@ -1368,12 +1420,29 @@ jobs:
         with:
           python-version: '3.12.10'
       - uses: actions/download-artifact@v4
-        if: env.WINDOWS_RELEASE_MODE == 'usb'
+        if: env.WINDOWS_RELEASE_MODE == 'usb' && env.RECOVERY_MODE != 'true'
         with:
           pattern: release-input-*
           path: inputs
-      - name: Restore same-run signed final checkpoint
+      - name: Download only admitted original build inputs
+        if: env.RECOVERY_MODE == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.recover_source_run }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ needs.prepare-release.outputs.artifact_ids }}
+          path: inputs
+      - name: Verify immutable inputs against original build provenance
         if: env.WINDOWS_RELEASE_MODE == 'usb'
+        shell: pwsh
+        run: |
+          foreach ($arch in @('amd64','arm64')) {
+            python scripts/windows_release_checkpoint.py verify-input --directory "inputs/release-input-$arch" --arch $arch
+            if ($LASTEXITCODE -ne 0) { throw 'Original native checkpoint invalid; recovery never recompiles or replaces inputs' }
+          }
+      - name: Restore same-run signed final checkpoint
+        if: env.WINDOWS_RELEASE_MODE == 'usb' && env.RECOVERY_MODE != 'true'
         id: final-resume
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1389,16 +1458,18 @@ jobs:
         shell: pwsh
         run: |
           $version=$env:EDR_AGENT_RELEASE_TAG.Substring(4)
-          python scripts/private_signing_bridge.py dispatch --run $env:GITHUB_RUN_ID --attempt $env:GITHUB_RUN_ATTEMPT --commit $env:GITHUB_SHA --version $version
+          python scripts/private_signing_bridge.py dispatch --run $env:SOURCE_RUN --attempt $env:SOURCE_ATTEMPT --commit $env:SOURCE_COMMIT --version $version
           if ($LASTEXITCODE -ne 0) { throw 'USB finalization failed; rerun failed jobs, not the native build' }
-      - uses: actions/download-artifact@v4
+      - name: Download immutable private Release result
         if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
-        with:
-          repository: qiuxinliang/edr-agent-signing
-          run-id: ${{ steps.signer.outputs.signing_run_id }}
-          github-token: ${{ secrets.USB_SIGNING_TOKEN }}
-          name: usb-finalized
-          path: finalized
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+          SIGNING_RUN: ${{ steps.signer.outputs.signing_run_id }}
+        shell: pwsh
+        run: |
+          python scripts/private_signing_bridge.py download --signing-run $env:SIGNING_RUN --directory finalized
+          if ($LASTEXITCODE -ne 0) { throw 'Private Release result download or identity verification failed' }
       - name: Independently verify signed payloads before uploading
         if: env.WINDOWS_RELEASE_MODE == 'usb'
         env:
@@ -1414,15 +1485,8 @@ jobs:
             python scripts/windows_release_checkpoint.py seal --directory "finalized/$arch" --arch $arch
             if ($LASTEXITCODE -ne 0) { throw 'Final USB checkpoint failed' }
           }
-      - name: Retain final signed bundle before network upload
-        if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: usb-verified-final
-          path: finalized/
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+      # The immutable private Release retains the signed response. Do not
+      # duplicate it into quota-blocked Actions storage before publication.
       - name: Upload verified USB bundles
         if: env.WINDOWS_RELEASE_MODE == 'usb'
         env:
@@ -1431,15 +1495,17 @@ jobs:
         run: |
           foreach ($arch in @('amd64','arm64')) {
             python scripts/windows_release_checkpoint.py upload --directory "finalized/$arch" --arch $arch
-            if ($LASTEXITCODE -ne 0) { throw 'Upload failed; preserve the signed final checkpoint' }
+            if ($LASTEXITCODE -ne 0) { throw 'Upload failed; immutable signed response remains in the private Release' }
           }
 
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
+      - prepare-release
       - windows-build
       - windows-lifecycle
       - usb-finalize
+    if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' && needs.usb-finalize.result == 'success' && needs.windows-lifecycle.result == 'success' && (needs.windows-build.result == 'success' || (inputs.recover_source_run != '' && needs.windows-build.result == 'skipped')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1481,9 +1547,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          title="edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
+          if [[ "${WINDOWS_RELEASE_MODE}" == 'usb' ]]; then
+            title="edr-agent ${EDR_AGENT_RELEASE_TAG} (Headless SIGNED; Setup UI UNSIGNED; AMD64 + ARM64)"
+          fi
           gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --draft=false --prerelease=false --latest \
-            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
+            --title "$title"
 
       - name: Publish unsigned Windows release
         if: env.EDR_RELEASE_CANDIDATE != 'true' && env.WINDOWS_RELEASE_MODE == 'unsigned'
@@ -1501,9 +1571,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          title="edr-agent ${EDR_AGENT_RELEASE_TAG} (${WINDOWS_RELEASE_MODE} candidate AMD64 + ARM64)"
+          if [[ "${WINDOWS_RELEASE_MODE}" == 'usb' ]]; then
+            title="edr-agent ${EDR_AGENT_RELEASE_TAG} (USB candidate; Headless SIGNED; Setup UI UNSIGNED; AMD64 + ARM64)"
+          fi
           gh release edit "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
             --draft=false --prerelease=true --latest=false \
-            --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (${WINDOWS_RELEASE_MODE} candidate AMD64 + ARM64)"
+            --title "$title"
 
       - name: Retire published-run CI checkpoints
         env:
@@ -1513,9 +1587,13 @@ jobs:
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
     needs: [prepare-release, usb-finalize]
+    if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' && needs.usb-finalize.result == 'success' }}
     permissions:
       contents: write
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
+    secrets:
+      USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
     with:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
       baseline_tag: ${{ needs.prepare-release.outputs.baseline_tag }}
+      evidence_transport: ${{ (inputs.release_mode == 'usb' || (github.event_name != 'workflow_dispatch' && vars.WINDOWS_RELEASE_MODE == 'usb')) && 'release' || 'actions' }}

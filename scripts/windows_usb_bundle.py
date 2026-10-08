@@ -58,6 +58,22 @@ def inventory(root):
     return {p.relative_to(root).as_posix(): cp.digest(p) for p in root.rglob('*') if p.is_file()}
 
 
+def headless_manifest(runtime, original, thumbprint, generated_at):
+    """Existing protocol-5 consumers need a signed installer, not a GUI shell."""
+    return dict(
+        name='FDSecurity Headless Installer', version=original['version'],
+        target_arch=original['target_arch'], setup_target_arch=original['setup_target_arch'],
+        setup_exe='FDSecuritySetup.exe', setup_exe_sha256=cp.digest(runtime / 'edr_agent_setup.exe'),
+        setup_exe_signed=True, agent_binary_sha256=cp.digest(runtime / 'FDSensor.exe'),
+        runtime_identity_sha256=cp.digest(runtime / 'native-package-integrity.json'),
+        publisher_thumbprint=thumbprint, capabilities=read(runtime / 'package-capabilities.json'),
+        upgrade_protocol=original['upgrade_protocol'],
+        preserves_existing_identity=original['preserves_existing_identity'],
+        preserves_offline_queue=original['preserves_offline_queue'],
+        preserves_evidence_cache=original['preserves_evidence_cache'],
+        generated_at_utc=generated_at)
+
+
 def stage(assets, destination, expected, arch, candidate):
     (cp.verify_checkpoint if candidate else cp.inspect_bundle)(assets, expected, arch, candidate=candidate)
     if destination.exists():
@@ -70,10 +86,12 @@ def stage(assets, destination, expected, arch, candidate):
     runtime, ui = destination / 'runtime', destination / 'ui'
     if (runtime / 'VERSION').read_text().strip() != expected['tag'][4:]:
         raise ValueError('Runtime version mismatch')
-    for left, right in ((runtime / 'FDSensor.exe', assets / (prefix + 'FDSensor.exe')),
-                        (runtime / 'edr_agent_setup.exe', assets / (prefix + 'setup.exe')),
-                        (ui / 'FDSecuritySetup.exe', assets / (prefix + 'setup.exe')),
-                        (ui / 'setup-ui-manifest.json', runtime / 'full-installer-manifest.json')):
+    identities = [(runtime / 'FDSensor.exe', assets / (prefix + 'FDSensor.exe')),
+                  (runtime / 'edr_agent_setup.exe', assets / (prefix + 'setup.exe'))]
+    if candidate:
+        identities.extend(((ui / 'FDSecuritySetup.exe', assets / (prefix + 'setup.exe')),
+                           (ui / 'setup-ui-manifest.json', runtime / 'full-installer-manifest.json')))
+    for left, right in identities:
         if cp.digest(left) != cp.digest(right):
             raise ValueError('Installer/runtime/raw asset identity mismatch')
     integrity = read(runtime / 'native-package-integrity.json')
@@ -85,25 +103,38 @@ def stage(assets, destination, expected, arch, candidate):
     for entry in entries:
         if cp.digest(child(runtime, entry['name'])) != entry['sha256']:
             raise ValueError('Runtime component hash mismatch')
-    manifest = read(ui / 'setup-ui-manifest.json')
-    for key, path in {'ui_exe_sha256': ui / 'FDSecuritySetupUI.exe',
-                      'setup_exe_sha256': ui / 'FDSecuritySetup.exe',
-                      'agent_binary_sha256': runtime / 'FDSensor.exe',
-                      'runtime_identity_sha256': runtime / 'native-package-integrity.json'}.items():
-        if manifest.get(key) != cp.digest(path):
-            raise ValueError('Installer manifest hash mismatch: ' + key)
-    status = 'unsigned' if candidate else 'signed'
-    if (manifest['version'] != expected['tag'][4:] or manifest['target_arch'] != arch
-            or manifest['setup_target_arch'] != arch or manifest['capabilities']['signature_status'] != status
-            or read(runtime / 'package-capabilities.json')['signature_status'] != status):
-        raise ValueError('Installer version/architecture/signature closure mismatch')
+    runtime_status = 'unsigned' if candidate else 'signed'
+    for root, manifest_name, setup_name, status in (
+            (ui, 'setup-ui-manifest.json', 'FDSecuritySetup.exe', 'unsigned'),
+            (runtime, 'full-installer-manifest.json', 'edr_agent_setup.exe', runtime_status)):
+        manifest = read(root / manifest_name)
+        hashes = {'setup_exe_sha256': root / setup_name,
+                  'agent_binary_sha256': runtime / 'FDSensor.exe',
+                  'runtime_identity_sha256': runtime / 'native-package-integrity.json'}
+        if root == ui:
+            hashes['ui_exe_sha256'] = ui / 'FDSecuritySetupUI.exe'
+            if manifest.get('ui_exe_signed') is not False:
+                raise ValueError('Setup UI executable must remain unsigned')
+        for key, path in hashes.items():
+            if manifest.get(key) != cp.digest(path):
+                raise ValueError('Installer manifest hash mismatch: ' + key)
+        if (manifest['version'] != expected['tag'][4:] or manifest['target_arch'] != arch
+                or manifest['setup_target_arch'] != arch or manifest['capabilities']['signature_status'] != status
+                or manifest.get('setup_exe_signed') is not (status == 'signed')):
+            raise ValueError('Installer version/architecture/signature closure mismatch')
+    if read(runtime / 'package-capabilities.json')['signature_status'] != runtime_status:
+        raise ValueError('Runtime signature closure mismatch')
+    if not candidate:
+        release = read(assets / (prefix + 'artifact-manifest.json'))
+        if release['signature'].get('authenticode_scope') != 'headless':
+            raise ValueError('Final USB release must explicitly declare Headless signing scope')
 
 
 def compare(original, signed, thumbprint, subject):
     for root, allowed, additions in (
         ('runtime', NATIVE | {'native-package-integrity.json', 'package-capabilities.json',
                              'edr_agent_setup.exe', 'full-installer-manifest.json'}, {'full-installer-manifest.p7s'}),
-        ('ui', {'FDSecuritySetupUI.exe', 'FDSecuritySetup.exe', 'setup-ui-manifest.json'}, {'setup-ui-manifest.p7s'})):
+        ('ui', {'FDSecuritySetup.exe', 'setup-ui-manifest.json'}, {'setup-ui-manifest.p7s'})):
         before, after = inventory(original / root), inventory(signed / root)
         if set(after) != set(before) | additions:
             raise ValueError('Signed package file set changed: ' + root)
@@ -119,17 +150,18 @@ def compare(original, signed, thumbprint, subject):
         if before != after:
             raise ValueError('Runtime metadata changed outside signing contract')
     before, after = read(original / 'ui/setup-ui-manifest.json'), read(signed / 'ui/setup-ui-manifest.json')
-    for key in ('ui_exe_sha256', 'setup_exe_sha256', 'agent_binary_sha256', 'runtime_identity_sha256', 'generated_at_utc'):
+    for key in ('setup_exe_sha256', 'agent_binary_sha256', 'runtime_identity_sha256', 'generated_at_utc'):
         before[key] = after[key]  # Hashes were independently checked by stage().
-    before.update(publisher_thumbprint=thumbprint, setup_exe_signed=True, ui_exe_signed=True)
-    before['capabilities']['signature_status'] = 'signed'
+    before.update(publisher_thumbprint=thumbprint)
     if before != after:
         raise ValueError('Installer contract changed outside signing fields')
-    if cp.digest(signed / 'runtime/full-installer-manifest.p7s') != cp.digest(signed / 'ui/setup-ui-manifest.p7s'):
-        raise ValueError('Headless/UI manifest signatures differ')
+    full = read(signed / 'runtime/full-installer-manifest.json')
+    if full != headless_manifest(signed / 'runtime', read(original / 'ui/setup-ui-manifest.json'),
+                                 thumbprint, full.get('generated_at_utc')):
+        raise ValueError('Headless installer contract changed outside signing fields')
     before = read(next((original / 'assets').glob('*artifact-manifest.json')))
     after = read(next((signed / 'assets').glob('*artifact-manifest.json')))
-    before['signature'] = dict(format='cms-detached-sha256', status='signed',
+    before['signature'] = dict(format='cms-detached-sha256', status='signed', authenticode_scope='headless',
                                signer_thumbprint=thumbprint, signer_subject=subject)
     for entry in before['artifacts']:
         p = signed / 'assets' / entry['name']

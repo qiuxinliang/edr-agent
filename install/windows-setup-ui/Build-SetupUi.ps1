@@ -35,10 +35,16 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("signed", "unsigned")]
     [string] $ExpectedSignatureStatus,
+    # USB finalization keeps both GUI entry points unsigned while a detached
+    # publisher CMS still authenticates this package's hashes and provenance.
+    [switch] $SkipExecutableSigning,
     [switch] $AllowMissingSetupArchMetadata
 )
 
 $ErrorActionPreference = "Stop"
+if ($SkipExecutableSigning -and (-not $PrebuiltPublishDir -or $ExpectedSignatureStatus -ne 'unsigned')) {
+    throw 'SkipExecutableSigning requires a verified prebuilt UI and unsigned entry-point status'
+}
 if ($AgentBinarySha256 -cnotmatch '\A[0-9A-Fa-f]{64}\z') {
     throw "AgentBinarySha256 must be exactly 64 hexadecimal characters"
 }
@@ -440,8 +446,18 @@ if (-not (Test-Path -LiteralPath $installerBootstrapArchVerifier)) {
 }
 & $archVerifier -Path $uiExe -Architecture $targetArch
 & $installerBootstrapArchVerifier -Path $bundledSetupExe -PayloadArchitecture $targetArch
-$uiSigned = Invoke-SignIfConfigured $uiExe
-$setupSigned = Invoke-SignIfConfigured $bundledSetupExe
+if ($SkipExecutableSigning) {
+    foreach ($entryPoint in @($uiExe, $bundledSetupExe)) {
+        if ((Get-AuthenticodeSignature -LiteralPath $entryPoint).Status -ne 'NotSigned') {
+            throw "Unsigned Setup UI entry point unexpectedly has a signature: $entryPoint"
+        }
+    }
+    $uiSigned = $false
+    $setupSigned = $false
+} else {
+    $uiSigned = Invoke-SignIfConfigured $uiExe
+    $setupSigned = Invoke-SignIfConfigured $bundledSetupExe
+}
 $actualSignatureStatus = if ($uiSigned -and $setupSigned) { "signed" } elseif (-not $uiSigned -and -not $setupSigned) { "unsigned" } else { "mixed" }
 if ($actualSignatureStatus -eq "mixed") {
     throw "Setup UI signature closure is inconsistent: setup_exe_signed=$setupSigned ui_exe_signed=$uiSigned"

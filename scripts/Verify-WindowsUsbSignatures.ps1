@@ -40,17 +40,31 @@ function Assert-ExchangeCms([string]$Content, [string]$Signature, [string]$Thumb
     if ($cms.SignerInfos.Count -ne 1 -or $cms.SignerInfos[0].Certificate.Thumbprint -ne $Thumbprint -or
         $cms.SignerInfos[0].DigestAlgorithm.Value -ne '2.16.840.1.101.3.4.2.1') { throw 'Returned CMS publisher/digest mismatch' }
 }
+function Assert-UnsignedExecutable([string]$Path) {
+    if ((Get-AuthenticodeSignature -LiteralPath $Path).Status -ne 'NotSigned') {
+        throw 'Setup UI executable must remain unsigned'
+    }
+}
+function Assert-UnchangedUnsignedExecutable([string]$Original, [string]$Returned) {
+    Assert-UnsignedExecutable $Returned
+    if ((Get-FileHash -LiteralPath $Original -Algorithm SHA256).Hash -cne
+        (Get-FileHash -LiteralPath $Returned -Algorithm SHA256).Hash) {
+        throw 'Setup UI wrapper changed; only the Headless executable closure may be signed'
+    }
+}
 
 # The caller first verifies/extracts both complete bundles with windows_usb_bundle.py.
-foreach ($root in @('runtime','ui')) {
- $names=if($root -eq 'runtime') { @('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','collector/forensic_collector_builtin.exe') } else { @('FDSecuritySetupUI.exe') }
- if($root -eq 'runtime' -and (Test-Path (Join-Path $Original 'runtime/collector/forensic_collector.exe'))) { $names += 'collector/forensic_collector.exe' }
- foreach($name in $names) { Assert-SignedExecutable (Join-Path $Original "$root/$name") (Join-Path $Signed "$root/$name") $Thumbprint }
-}
-$setup=Get-AuthenticodeSignature -LiteralPath (Join-Path $Signed 'ui/FDSecuritySetup.exe')
-if($setup.Status -ne 'Valid' -or $setup.SignerCertificate.Thumbprint -ne $Thumbprint -or -not $setup.TimeStamperCertificate) { throw 'Final Setup signature/publisher/timestamp invalid' }
+$names=@('FDSensor.exe','FDSecurityInstallerWorker.exe','uninstall.exe','collector/forensic_collector_builtin.exe')
+if(Test-Path (Join-Path $Original 'runtime/collector/forensic_collector.exe')) { $names += 'collector/forensic_collector.exe' }
+foreach($name in $names) { Assert-SignedExecutable (Join-Path $Original "runtime/$name") (Join-Path $Signed "runtime/$name") $Thumbprint }
+Assert-UnchangedUnsignedExecutable (Join-Path $Original 'ui/FDSecuritySetupUI.exe') (Join-Path $Signed 'ui/FDSecuritySetupUI.exe')
+# The Inno payload is built once. Its GUI copy remains unsigned; only the
+# Headless copy acquires Authenticode, with no executable payload differences.
+Assert-UnsignedExecutable (Join-Path $Signed 'ui/FDSecuritySetup.exe')
+Assert-SignedExecutable (Join-Path $Signed 'ui/FDSecuritySetup.exe') (Join-Path $Signed 'runtime/edr_agent_setup.exe') $Thumbprint
+Assert-ExchangeCms (Join-Path $Signed 'runtime/full-installer-manifest.json') (Join-Path $Signed 'runtime/full-installer-manifest.p7s') $Thumbprint
 Assert-ExchangeCms (Join-Path $Signed 'ui/setup-ui-manifest.json') (Join-Path $Signed 'ui/setup-ui-manifest.p7s') $Thumbprint
 $manifest=@(Get-ChildItem -LiteralPath (Join-Path $Signed 'assets') -Filter '*artifact-manifest.json' -File)
 if($manifest.Count -ne 1) { throw 'Expected one final artifact manifest' }
 Assert-ExchangeCms $manifest[0].FullName ($manifest[0].FullName+'.p7s') $Thumbprint
-Write-Host 'USB signatures, timestamps and unchanged native executable payloads verified'
+Write-Host 'Headless signatures, independent manifest CMS, timestamps, unchanged payloads and unsigned GUI entry points verified'

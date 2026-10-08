@@ -22,6 +22,15 @@ on:
         required: false
         default: 1
         type: number
+      evidence_transport:
+        description: Evidence storage (actions or private release)
+        required: false
+        default: actions
+        type: string
+    secrets:
+      USB_SIGNING_RELEASE_TOKEN:
+        description: Contents write restricted to the private signing repository; used only by release evidence transport
+        required: false
   workflow_dispatch:
     inputs:
       target_tag:
@@ -47,6 +56,14 @@ on:
         required: false
         default: 1
         type: number
+      evidence_transport:
+        description: Evidence storage
+        required: false
+        default: actions
+        type: choice
+        options:
+          - actions
+          - release
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -80,6 +97,8 @@ jobs:
           LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
           LIFECYCLE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
           LIFECYCLE_MATRIX_ARCH: ${{ matrix.arch }}
+          LIFECYCLE_EVIDENCE_TRANSPORT: ${{ inputs.evidence_transport }}
+          PRIVATE_EVIDENCE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
         run: |
           $architecture = $env:LIFECYCLE_ARCHITECTURE
           if ($architecture -cnotin @('all', 'amd64', 'arm64')) {
@@ -87,6 +106,12 @@ jobs:
           }
           if ($env:LIFECYCLE_MATRIX_ARCH -eq 'invalid') {
             throw "invalid lifecycle matrix architecture for input: $architecture"
+          }
+          if ($env:LIFECYCLE_EVIDENCE_TRANSPORT -cnotin @('actions', 'release')) {
+            throw 'evidence_transport must be actions or release'
+          }
+          if ($env:LIFECYCLE_EVIDENCE_TRANSPORT -eq 'release' -and -not $env:PRIVATE_EVIDENCE_TOKEN) {
+            throw 'Private Release evidence requires USB_SIGNING_RELEASE_TOKEN with Contents write on the private signing repository'
           }
           [int]$repeatCount = 0
           $repeatText = $env:LIFECYCLE_REPEAT_COUNT
@@ -303,9 +328,15 @@ jobs:
       - name: Publish lifecycle evidence summary
         if: always()
         shell: pwsh
+        env:
+          LIFECYCLE_EVIDENCE_TRANSPORT: ${{ inputs.evidence_transport }}
         run: |
           "## Windows ${{ matrix.arch }} Setup EXE lifecycle evidence" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "Evidence artifact: `windows-lifecycle-evidence-${{ matrix.arch }}` (setup-exe-evidence, runtime-evidence)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($env:LIFECYCLE_EVIDENCE_TRANSPORT -eq 'release') {
+            "Private evidence draft: edr-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-${{ matrix.arch }} (setup-exe-evidence, runtime-evidence)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          } else {
+            "Evidence artifact: `windows-lifecycle-evidence-${{ matrix.arch }}` (setup-exe-evidence, runtime-evidence)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
           if (Test-Path -LiteralPath setup-exe-evidence\summary.json) {
             '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             Get-Content -LiteralPath setup-exe-evidence\summary.json | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
@@ -436,7 +467,7 @@ jobs:
           }
 
       - name: Upload Windows lifecycle evidence
-        if: always()
+        if: always() && inputs.evidence_transport == 'actions'
         uses: actions/upload-artifact@v4
         with:
           name: windows-lifecycle-evidence-${{ matrix.arch }}
@@ -445,3 +476,18 @@ jobs:
             runtime-evidence
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Retain complete lifecycle evidence in private Release
+        if: always() && inputs.evidence_transport == 'release'
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+          LIFECYCLE_TARGET_TAG: ${{ inputs.target_tag }}
+          LIFECYCLE_JOB_STATUS: ${{ job.status }}
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "lifecycle-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-${{ matrix.arch }}"
+          & python .\scripts\upload_windows_lifecycle_evidence.py `
+            --target-tag $env:LIFECYCLE_TARGET_TAG --arch '${{ matrix.arch }}' `
+            --job-status $env:LIFECYCLE_JOB_STATUS --output-dir $destination
+          if ($LASTEXITCODE -ne 0) { throw 'Private lifecycle evidence retention failed; inspect this job log; no evidence was published publicly' }

@@ -11,7 +11,8 @@ foreach($fn in $ast.FindAll({param($n) $n -is [Management.Automation.Language.Fu
 $scratch=Join-Path ([IO.Path]::GetTempPath()) ('edr-usb-identity-test-'+[Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $pin='A'*40
-function Get-AuthenticodeSignature { param($LiteralPath) [pscustomobject]@{Status='Valid';SignerCertificate=[pscustomobject]@{Thumbprint=$pin};TimeStamperCertificate=$true} }
+$script:signatureStatus='Valid'
+function Get-AuthenticodeSignature { param($LiteralPath) [pscustomobject]@{Status=$script:signatureStatus;SignerCertificate=[pscustomobject]@{Thumbprint=$pin};TimeStamperCertificate=$true} }
 function Reject([scriptblock]$Call) { $failed=$false; try { & $Call } catch { $failed=$true }; if(-not $failed) { throw 'Expected identity validation failure' } }
 try {
  [byte[]]$a=New-Object byte[] 512
@@ -30,6 +31,15 @@ try {
  $b[400]=0; [BitConverter]::GetBytes([uint32]500).CopyTo($b,296); [IO.File]::WriteAllBytes($signed,$b)
  Reject { Assert-SignedExecutable $original $signed $pin }
  Reject { Assert-SignedExecutable $original $signed ('B'*40) }
+ # GUI entry points must really be unsigned, and their wrapper byte-identical.
+ Reject { Assert-UnsignedExecutable $original }
+ $script:signatureStatus='NotSigned'
+ Assert-UnsignedExecutable $original
+ Assert-UnchangedUnsignedExecutable $original $original
+ Reject { Assert-UnchangedUnsignedExecutable $original $signed }
+ $script:signatureStatus='UnknownError'
+ Reject { Assert-UnsignedExecutable $original }
+ $script:signatureStatus='Valid'
  # Exercise the actual CMS verifier with a disposable in-memory key.
  Add-Type -AssemblyName System.Security
  $rsa=[Security.Cryptography.RSA]::Create(2048)

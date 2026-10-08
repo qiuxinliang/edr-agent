@@ -778,8 +778,20 @@ int main(void) {
            "workflow uploads lifecycle evidence even when the smoke test fails");
   contains_adjacent_lines(lifecycle, "- name: Publish lifecycle evidence summary", "        if: always()",
            "workflow binds always() directly to the lifecycle evidence summary step");
-  contains_adjacent_lines(lifecycle, "- name: Upload Windows lifecycle evidence", "        if: always()",
-           "workflow binds always() directly to the lifecycle evidence upload step");
+  contains_adjacent_lines(lifecycle, "- name: Upload Windows lifecycle evidence",
+           "        if: always() && inputs.evidence_transport == 'actions'",
+           "Actions evidence upload always runs for its selected transport, even after lifecycle failure");
+  contains_adjacent_lines(lifecycle, "- name: Retain complete lifecycle evidence in private Release",
+           "        if: always() && inputs.evidence_transport == 'release'",
+           "private Release evidence upload always runs for its selected transport, even after lifecycle failure");
+  contains(lifecycle, "$env:LIFECYCLE_EVIDENCE_TRANSPORT -cnotin @('actions', 'release')",
+           "lifecycle rejects unknown transports instead of skipping both evidence paths");
+  contains_before(lifecycle, "$env:LIFECYCLE_EVIDENCE_TRANSPORT -cnotin @('actions', 'release')",
+           "- name: Resolve release tags", "evidence transport is validated before release downloads or lifecycle execution");
+  require_true(!strstr(lifecycle, "continue-on-error:"),
+           "neither a lifecycle job nor an evidence step may hide failure with continue-on-error");
+  contains(lifecycle, "if ($LASTEXITCODE -ne 0) { throw 'Private lifecycle evidence retention failed;",
+           "private Release evidence upload failure fails the lifecycle gate");
   contains(lifecycle, "uninstall-install-root-residual.json",
            "workflow summary prints residual install-root diagnostics when present");
   contains(lifecycle, "native-failure-receipt.txt",

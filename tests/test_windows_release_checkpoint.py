@@ -21,6 +21,65 @@ SOURCE = dict(tag="win_3.2.999", commit="a" * 40, repository="owner/agent", run_
               mode="unsigned", upgrade_class="auto")
 
 
+class SourceContextTests(unittest.TestCase):
+    def setUp(self):
+        self.env = dict(EDR_AGENT_RELEASE_TAG='win_3.2.999', GITHUB_SHA='b' * 40,
+                        GITHUB_REPOSITORY='owner/executor', GITHUB_RUN_ID='5678',
+                        WINDOWS_RELEASE_MODE='usb', EDR_UPGRADE_CLASS_OVERRIDE='auto',
+                        SOURCE_REPOSITORY='owner/agent', SOURCE_RUN='1234',
+                        SOURCE_ATTEMPT='4', SOURCE_COMMIT='a' * 40, RECOVERY_MODE='true')
+
+    def test_explicit_source_preserves_binary_provenance_without_spoofing_executor(self):
+        original = self.env.copy()
+        self.assertEqual(cp.source(self.env), dict(SOURCE, mode='usb'))
+        self.assertEqual(self.env, original)
+        self.env['RECOVERY_MODE'] = 'false'
+        self.env['SIGNING_CONTEXT'] = 'true'
+        self.assertEqual(cp.source(self.env), dict(SOURCE, mode='usb'))
+
+    def test_normal_unsigned_source_remains_the_actual_github_run(self):
+        env = {k: v for k, v in self.env.items() if not k.startswith('SOURCE_')}
+        env.update(WINDOWS_RELEASE_MODE='unsigned', RECOVERY_MODE='false')
+        self.assertEqual(cp.source(env), dict(SOURCE, commit='b' * 40,
+                                             repository='owner/executor', run_id='5678'))
+
+    def test_incomplete_invalid_or_non_usb_source_context_is_rejected(self):
+        cases = [dict(self.env, **{key: value}) for key, value in (
+            ('SOURCE_RUN', ''), ('SOURCE_ATTEMPT', ''), ('SOURCE_COMMIT', ''),
+            ('SOURCE_RUN', '0'), ('SOURCE_ATTEMPT', '-1'), ('SOURCE_COMMIT', 'main'),
+            ('SOURCE_REPOSITORY', ''), ('SOURCE_REPOSITORY', 'owner/../agent'),
+            ('RECOVERY_MODE', 'false'), ('WINDOWS_RELEASE_MODE', 'unsigned'),
+            ('WINDOWS_RELEASE_MODE', 'signed'))]
+        cases.append({k: v for k, v in self.env.items() if not k.startswith('SOURCE_')})
+        for env in cases:
+            with self.subTest(env=env), self.assertRaises(ValueError):
+                cp.source(env)
+
+    def test_verify_input_cli_checks_original_bytes_without_restore_or_upload(self):
+        source = cp.source(self.env)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            names = cp.asset_names(source, 'amd64', candidate=True)
+            manifest_name = next(n for n in names if n.endswith('artifact-manifest.json'))
+            for name in names - {manifest_name}:
+                (root / name).write_bytes(name.encode())
+            entries = [dict(name=n, sha256=cp.digest(root / n), size=(root / n).stat().st_size)
+                       for n in sorted(names - {manifest_name})]
+            (root / manifest_name).write_text(json.dumps(dict(
+                version='3.2.999', build_provenance=source,
+                signature={'status': 'unsigned'}, artifacts=entries)), encoding='utf-8')
+            cp.seal(root, source, 'amd64', candidate=True)
+            args = ['checkpoint', 'verify-input', '--directory', str(root), '--arch', 'amd64']
+            with patch.dict(cp.os.environ, self.env, clear=True), patch('sys.argv', args), \
+                    patch.object(cp.GitHub, 'call', side_effect=AssertionError('No GitHub I/O')), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                cp.main()
+                self.assertIn('no compilation or upload', output.getvalue())
+                (root / next(iter(names - {manifest_name}))).write_bytes(b'changed')
+                with self.assertRaises(ValueError):
+                    cp.main()
+
+
 class FakeGitHub:
     repository = "owner/agent"
 

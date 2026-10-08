@@ -115,6 +115,25 @@ def source(env=os.environ):
         ("tag", "EDR_AGENT_RELEASE_TAG"), ("commit", "GITHUB_SHA"),
         ("repository", "GITHUB_REPOSITORY"), ("run_id", "GITHUB_RUN_ID"),
         ("mode", "WINDOWS_RELEASE_MODE"), ("upgrade_class", "EDR_UPGRADE_CLASS_OVERRIDE"))}
+    # Recovery executes new reviewed packaging code over an older immutable
+    # build. Keep the actual GitHub executor identity untouched; admission
+    # verifies this explicit source context against the GitHub API before use.
+    source_keys = ("SOURCE_RUN", "SOURCE_ATTEMPT", "SOURCE_COMMIT")
+    explicit = [env.get(key, "") for key in source_keys]
+    if any(explicit):
+        if (not all(explicit) or result["mode"] != "usb"
+                or not (env.get("RECOVERY_MODE") == "true" or env.get("SIGNING_CONTEXT") == "true")):
+            raise ValueError("Explicit source requires a complete USB recovery/signing context")
+        if (not re.fullmatch(r"[1-9][0-9]*", explicit[0])
+                or not re.fullmatch(r"[1-9][0-9]*", explicit[1])
+                or not re.fullmatch(r"[a-f0-9]{40}", explicit[2])):
+            raise ValueError("Invalid explicit release source identity")
+        repository = env.get("SOURCE_REPOSITORY", "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+            raise ValueError("Explicit source repository is required")
+        result.update(run_id=explicit[0], commit=explicit[2], repository=repository)
+    elif env.get("RECOVERY_MODE") == "true":
+        raise ValueError("Recovery source identity is missing")
     if not re.fullmatch(r"win_\d+\.\d+\.\d+(?:-unsigned)?", result["tag"]):
         raise ValueError("Invalid release version; expected win_M.m.p")
     if not re.fullmatch(r"[0-9a-f]{40}", result["commit"]) or not result["run_id"].isdigit():
@@ -424,7 +443,7 @@ def cleanup_published_checkpoints(api, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published"))
+    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "verify-input", "restore-usb-final", "select-baseline", "cleanup-published"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
@@ -446,6 +465,11 @@ def main():
         print(json.dumps(expected, sort_keys=True))
     elif args.command == "verify-owner":
         verify_owner(api, expected)
+    elif args.command == "verify-input":
+        if not args.arch:
+            parser.error("verify-input requires --arch")
+        verify_checkpoint(args.directory, expected, args.arch, candidate=True)
+        print("Immutable original build checkpoint verified; no compilation or upload performed")
     elif args.command == "cleanup-published":
         print(f"Removed {cleanup_published_checkpoints(api, expected)} published-run CI checkpoints")
     elif args.command == "prepare":
