@@ -237,6 +237,12 @@ uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *r
   return edr_behavior_record_alloc_durable_wire(record, alert, length);
 }
 
+uint8_t *edr_behavior_record_alloc_outbound_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  (void)facts;
+  return edr_behavior_record_alloc_durable_wire(record, alert, length);
+}
+
 size_t edr_behavior_record_encode_durable_wire(const EdrBehaviorRecord *record,
                                                uint8_t *wire, size_t wire_cap) {
   if (!record) return 0u;

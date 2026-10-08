@@ -1932,6 +1932,12 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "registry_value_data_in") == 0 ||
                 strcmp(key, "registry_dword_any") == 0;
     }
+    if (schema_version >= 7u && !strcmp(key,"evidence_purposes")) {
+      if (!cJSON_IsArray(item) || cJSON_GetArraySize(item)>1) return 0;
+      const cJSON *purpose=cJSON_GetArrayItem(item,0);
+      if (purpose && (!cJSON_IsString(purpose) || strcmp(purpose->valuestring,"actor_attribution"))) return 0;
+      continue;
+    }
     if (schema_version >= 5u && strcmp(key,"operation")==0 &&
         ((strcmp(event_type,"file_read")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"credential_db_decrypt")) ||
          (strcmp(event_type,"network_connect")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"remote_hash_auth")))) continue;
@@ -2129,23 +2135,31 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
  * purpose contracts remain usable for ACK loss/restart replay. */
 static int p0_ir_retired_credential_predicate(unsigned schema,
     const struct p0_ir_one *rule, const cJSON *condition) {
-  static const char *patterns[]={
+  static const char *credential_patterns[]={
     "(?i)(lazagne|sharpdpapi|seatbelt).*?(password|cred|vault|dpapi|cookie|browser)",
     "(?i)(dpapi::|vault::|chrome.*login data|firefox.*logins\\.json)",
     "(?i)(cookies|login data|key4\\.db).*?(copy|dump|decrypt)"};
-  if (schema!=5u || strcmp(rule->event_type,"process_create") ||
+  static const char *dump_patterns[]={
+    "(?i)(nanodump|dumpert|safetykatz|sharpkatz)",
+    "(?i)comsvcs\\.dll.*MiniDump.*lsass",
+    "(?i)rundll32\\.exe.*comsvcs\\.dll.*#?24",
+    "(?i)procdump(64)?\\.exe.*(-ma|-mm).*lsass",
+    "(?i)taskmgr\\.exe.*lsass\\.dmp"};
+  if ((schema!=5u && schema!=6u) || strcmp(rule->event_type,"process_create") ||
       rule->effect!=EDR_P0_EFFECT_SECURITY_ALERT || cJSON_GetArraySize(condition)!=1) return 0;
   const cJSON *a=cJSON_GetObjectItemCaseSensitive(condition,"command_regex_any");
-  if (!cJSON_IsArray(a) || cJSON_GetArraySize(a)!=3) return 0;
+  int count=cJSON_GetArraySize(a);
+  const char **patterns=count==5?dump_patterns:credential_patterns;
+  if (!cJSON_IsArray(a) || (count!=5 && !(schema==5u && count==3))) return 0;
   unsigned seen=0;
-  for (int i=0;i<3;i++) {
+  for (int i=0;i<count;i++) {
     const cJSON *v=cJSON_GetArrayItem(a,i);unsigned bit=0;
     if (!cJSON_IsString(v)) return 0;
-    for (int j=0;j<3;j++) if (!strcmp(v->valuestring,patterns[j])) bit=1u<<j;
+    for (int j=0;j<count;j++) if (!strcmp(v->valuestring,patterns[j])) bit=1u<<j;
     if (!bit || (seen&bit)) return 0;
     seen|=bit;
   }
-  return seen==7u;
+  return seen==((1u<<count)-1u);
 }
 #if defined(EDR_P0_RULE_IR_TESTING)
 int edr_p0_rule_ir_test_retired_purpose(unsigned schema,const char *rule_json) {
@@ -2215,7 +2229,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
         (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
-         !(s_load_target->purpose_only && schema_version->valuedouble == 5.0)) ||
+         !(s_load_target->purpose_only && (schema_version->valuedouble == 5.0 || schema_version->valuedouble == 6.0))) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
         (uint32_t)declared_count->valueint != (uint32_t)cJSON_GetArraySize(rules) ||
@@ -2443,7 +2457,11 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!semantic_ok) {
       break;
     }
-    t.required_evidence_fields = EDR_EVIDENCE_USER;
+    const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(jcond,"evidence_purposes");
+    if (t.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION && purposes && cJSON_GetArraySize(purposes)) { semantic_ok=0; break; }
+    /* IR5/6 frozen ownership keeps its original mask. IR7 attribution is an
+     * explicit consumer purpose; it is never inferred from the alert label. */
+    t.required_evidence_fields=(parsed_schema_version<7u || (purposes && cJSON_GetArraySize(purposes))) ? EDR_EVIDENCE_USER : 0;
     if (t.n_cmd_any || t.n_cmd_all) t.required_evidence_fields |= EDR_EVIDENCE_COMMAND;
     if (t.n_parent_in || t.n_parent_not_in || t.n_pr_rx || t.n_pr_not_rx)
       t.required_evidence_fields |= EDR_EVIDENCE_PARENT_NAME;

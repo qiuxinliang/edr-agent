@@ -65,6 +65,18 @@ static int p0_operation_hex(const char *s, size_t len) {
 static int p0_credential_tool_attempt(const EdrBehaviorRecord *br,
                                       char a[][2048], int argc) {
   if (br->type!=EDR_EVENT_PROCESS_CREATE) return 0;
+  if (p0_operation_word(br->process_name,"nanodump.exe") ||
+      p0_operation_word(br->process_name,"nanodump.x64.exe") ||
+      p0_operation_word(br->process_name,"nanodump.x86.exe")) {
+    if ((argc!=3 && argc!=4) ||
+        (!p0_operation_word(a[1],"-w") && !p0_operation_word(a[1],"--write")) ||
+        (argc==4 && !p0_operation_word(a[3],"-v") && !p0_operation_word(a[3],"--valid"))) return 0;
+    const char *path=a[2];size_t n=strlen(path);
+    if (n<4 || !((path[0]>='A' && path[0]<='Z') || (path[0]>='a' && path[0]<='z')) ||
+        path[1]!=':' || (path[2]!='\\' && path[2]!='/') || path[n-1]=='\\' || path[n-1]=='/') return 0;
+    for(size_t i=3;i<n;i++) if(path[i]=='%' || path[i]=='$' || path[i]=='*' || path[i]=='?' || path[i]==':' || path[i]=='"') return 0;
+    return 1;
+  }
   if (p0_operation_word(br->process_name,"mimikatz.exe")) {
     char sub[8][2048];int n;
     if ((argc!=2 && argc!=3) || (argc==3 && !p0_operation_word(a[2],"exit"))) return 0;

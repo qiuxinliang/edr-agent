@@ -368,11 +368,32 @@ static int synthetic_authority_unavailable;
 static int synthetic_projection_owner(const char *rule,const char *bundle,uint64_t mask,const char *operation,void *user) {
   (void)user;
   if (synthetic_authority_unavailable) return -1;
-  if (strlen(bundle)!=64 || bundle[63]!='1' || operation[0]) return 0;
+  if (strlen(bundle)!=64 || bundle[63]!='1') return 0;
+  if (!strcmp(rule,"synthetic-operation")) return mask==EDR_EVIDENCE_OPERATION &&
+    !strcmp(operation,"{\"kind\":\"credential_tool_attempt\"}");
+  if (operation[0]) return 0;
   if (!strcmp(rule,"synthetic-network")) return mask==EDR_EVIDENCE_NETWORK;
   if (!strcmp(rule,"synthetic-user")) return mask==EDR_EVIDENCE_USER;
   return !strcmp(rule,"synthetic-rule") &&
     mask==(EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_NETWORK);
+}
+static void operation_without_user_purpose(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
+  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&wire);
+  make_record(r);r->type=EDR_EVENT_PROCESS_CREATE;make_alert(&a,r);
+  r->required_evidence_fields=EDR_EVIDENCE_OPERATION;
+  strcpy(r->operation_evidence,"{\"kind\":\"credential_tool_attempt\"}");
+  strcpy(r->username,"synthetic-user");strcpy(r->identity_source,"token_query");strcpy(r->identity_quality,"token_sid");
+  cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+  cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString("synthetic-operation"));
+  overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);
+  assert(n&&edr_egress_frame_validate(wire,n,NULL,0));
+  edr_v1_BehaviorEvent *event=decode_frame(wire,n);
+  assert(!event->username[0]&&!event->cmdline[0]&&!event->identity_source[0]);
+  event->required_evidence_fields|=EDR_EVIDENCE_USER;
+  n=immutable_encode(event,wire);assert(!edr_egress_frame_validate(wire,n,NULL,0));
+  free(event);free(wire);free(r);
 }
 static void historical_projection(void) {
   edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL);
@@ -592,11 +613,28 @@ static void evidence_projection_v2(void) {
  contract=cJSON_Parse(a.user_subject_json);assert(contract);
  cJSON_ReplaceItemInObjectCaseSensitive(contract,"rule_id",cJSON_CreateString("synthetic-user"));
  overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),contract);cJSON_Delete(contract);
+ /* An arbitrary/creator label cannot assert target attribution even when the
+  * detector explicitly declared the user consumer purpose. */
+ const char *rejected[][2]={{"synthetic","synthetic"},{"creator_fallback","creator_fallback"},
+   {"unknown","unknown"},{"token_access_denied","access_denied"},{"target_4688_live_mismatch","unavailable"}};
+ for (size_t i=0;i<sizeof(rejected)/sizeof(rejected[0]);i++) {
+   strcpy(r->identity_source,rejected[i][0]);strcpy(r->identity_quality,rejected[i][1]);
+   size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);ev=decode_frame(rich,n);
+   assert(!ev->username[0]&&!ev->identity_source[0]&&!ev->identity_quality[0]);
+   assert(edr_egress_frame_validate(rich,n,why,sizeof(why)));free(ev);
+ }
+ const char *accepted[]={"kernel_process_token","token_query","token_cache","token_query_4688_validated","token_cache_4688_validated","target_4688"};
+ for (size_t i=0;i<sizeof(accepted)/sizeof(accepted[0]);i++) {
+   strcpy(r->identity_source,accepted[i]);strcpy(r->identity_quality,i==5?"target_4688":"token_sid");
+   size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);ev=decode_frame(rich,n);
+   assert(!strcmp(ev->username,r->username)&&!strcmp(ev->identity_source,r->identity_source));
+   assert(edr_egress_frame_validate(rich,n,why,sizeof(why)));free(ev);
+ }
  size_t user=edr_behavior_record_alert_encode_protobuf(r,&a,rich,EDR_EGRESS_FRAME_MAX);ev=decode_frame(rich,user);
  assert(!strcmp(ev->username,r->username)&&!strcmp(ev->identity_source,r->identity_source)&&!strcmp(ev->identity_quality,r->identity_quality));
  assert(!ev->domain[0]&&!ev->user_sid[0]&&!ev->creator_username[0]);free(ev);
  printf("evidence v2 minimal=%zu unrelated_injection=%zu computed_zero=%zu\n",minimum,injected,calculated);
  free(r);free(plain);free(rich);
 }
-int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); evidence_projection_v2(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }

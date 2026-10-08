@@ -25,6 +25,7 @@ static void legacy_purpose_contract(const char *base,const unsigned char *plain,
  cJSON *j=cJSON_ParseWithLength((const char*)plain,size);assert(j);
  cJSON *rules=cJSON_GetObjectItemCaseSensitive(j,"rules"),*r,*old=NULL;
  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"ir_schema_version"),5);
+ cJSON_ArrayForEach(r,rules) cJSON_DeleteItemFromObjectCaseSensitive(cJSON_GetObjectItemCaseSensitive(r,"condition"),"evidence_purposes");
  cJSON_ArrayForEach(r,rules) if(!strcmp(cJSON_GetObjectItemCaseSensitive(r,"id")->valuestring,"R-CRED-010")) old=r;
  assert(old);
  cJSON *condition=cJSON_CreateObject(),*patterns=cJSON_AddArrayToObject(condition,"command_regex_any");assert(patterns);
@@ -54,6 +55,29 @@ static void legacy_purpose_contract(const char *base,const unsigned char *plain,
  cJSON_Delete(j);
  puts("IR5 frozen authority: preserved other rules; exact weak predicate held even renamed; archive bytes unchanged after replay/restart");
 }
+static void dump_purpose_contract(const char *base,const unsigned char *plain,size_t size,
+                                  const EdrP0RuleIrMatch *valid) {
+ cJSON *j=cJSON_ParseWithLength((const char*)plain,size);assert(j);
+ cJSON *rules=cJSON_GetObjectItemCaseSensitive(j,"rules"),*r,*old=NULL;
+ cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"ir_schema_version"),6);
+ cJSON_ArrayForEach(r,rules) cJSON_DeleteItemFromObjectCaseSensitive(cJSON_GetObjectItemCaseSensitive(r,"condition"),"evidence_purposes");
+ cJSON_ArrayForEach(r,rules) if(!strcmp(cJSON_GetObjectItemCaseSensitive(r,"id")->valuestring,"R-CRED-009")) old=r;
+ assert(old);assert(cJSON_ReplaceItemInObjectCaseSensitive(old,"effect",cJSON_CreateString("security_alert")));
+ char *json=cJSON_PrintUnformatted(j),sha[65],archive[400];unsigned char *encrypted=NULL;size_t encrypted_size=0;assert(json);
+ assert(edr_sha256_hex((const uint8_t*)json,strlen(json),sha)==0);
+ assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)json,strlen(json),&encrypted,&encrypted_size)==0);
+ snprintf(archive,sizeof(archive),"%s.purpose-%s.edr1",base,sha);save(archive,encrypted,encrypted_size);
+ assert(!edr_p0_rule_ir_validate_candidate_path(archive));
+ for(int restart=0;restart<2;restart++) {
+  assert(edr_p0_rule_ir_projection_matches(valid->rule_id,sha,valid->required_evidence_fields,valid->operation_evidence)==1);
+  assert(edr_p0_rule_ir_projection_matches("R-CRED-009",sha,EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND,"")==0);
+  edr_p0_rule_ir_shutdown();edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+ }
+ size_t after_size;unsigned char *after=read_bytes(archive,&after_size);
+ assert(after_size==encrypted_size && !memcmp(after,encrypted,after_size));
+ free(after);free(encrypted);cJSON_free(json);cJSON_Delete(j);
+ puts("IR6 archive: denied active downgrade; exact weak dump purpose held; safe owner and original bytes survive restart");
+}
 int main(void){
  static const struct {const char *id;unsigned schema;int retired;const char *rule;} corpus[]={
 #include "../src/preprocess/p0_retired_purpose_vectors.inc"
@@ -78,6 +102,7 @@ int main(void){
  EdrP0RuleIrEvaluation eval;assert(edr_p0_rule_ir_evaluate_record(&br,NULL,&eval));assert(eval.match_count);EdrP0RuleIrMatch match;assert(edr_p0_rule_ir_evaluation_get_match(&eval,0,&match));char sha[65];strcpy(sha,eval.binding.artifact_sha256);edr_p0_rule_ir_evaluation_free(&eval);
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));
  legacy_purpose_contract(base,plain,plain_size,&match);
+ dump_purpose_contract(base,plain,plain_size,&match);
  assert(!edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields|EDR_EVIDENCE_PARENT_NAME,match.operation_evidence));
  unsigned char *changed=malloc(plain_size+1),*encrypted=NULL;size_t encrypted_size=0;assert(changed);memcpy(changed,plain,plain_size);changed[plain_size]='\n';assert(edr_p0_encrypt_encrypt_edr1_for_test(changed,plain_size+1,&encrypted,&encrypted_size)==0);save(stage,encrypted,encrypted_size);
  assert(edr_p0_rule_ir_install_staged_bundle(stage,base));
