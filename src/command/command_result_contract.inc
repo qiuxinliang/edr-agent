@@ -1,5 +1,6 @@
 /* The durable command owner owns both request-derived purposes and projection.
  * This file is compiled only as part of command_state.c. */
+#include "edr/shell_session.h"
 static const char *result_text(const cJSON *o, const char *key) {
   const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);
   return cJSON_IsString(v) && v->valuestring ? v->valuestring : "";
@@ -295,6 +296,25 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
   }
   return out;
 }
+/* The open receipt is a control fact from the session owner, not stdout.
+ * Keep a fixed banner for supported consumers without copying the requested
+ * shell or accepting a generic successful command as an opened session. */
+static cJSON *result_shell_open(const cJSON *root,const EdrCommandResultAuthorization *a,int exit_code) {
+  if(exit_code || strcmp(a->command_type,"shell_open") || !a->command_id[0] ||
+      strlen(a->command_id)>=EDR_SS_ID_LEN || strcmp(result_text(root,"schema"),"edr.shell.session.v1") ||
+      strcmp(result_text(root,"session_id"),a->command_id) || strcmp(result_text(root,"status"),"ok") ||
+      !result_integer(root,"exit_code",0,0,NULL) ||
+      !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root,"closed")))return NULL;
+  cJSON *out=cJSON_CreateObject();if(!out)return NULL;
+  if(!cJSON_AddStringToObject(out,"schema","edr.shell.session.v1") ||
+      !cJSON_AddStringToObject(out,"session_id",a->command_id) ||
+      !cJSON_AddStringToObject(out,"status","ok") || !cJSON_AddNumberToObject(out,"exit_code",0) ||
+      !cJSON_AddBoolToObject(out,"closed",0) ||
+      !cJSON_AddStringToObject(out,"raw_detail","shell session opened: authorized session")) {
+    cJSON_Delete(out);return NULL;
+  }
+  return out;
+}
 static cJSON *result_shell(const cJSON *root,const cJSON *contract,const EdrCommandResultAuthorization *a,int stream) {
   if(!cJSON_IsObject(root))return NULL;
   const char *data=result_text(root,stream?"data":"output");
@@ -331,6 +351,7 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
     if(strcmp(result_text(raw,"task_id"),a->command_id))goto done;
     inner=edr_egress_parse_purpose_object(wrapper_raw->valuestring,strlen(wrapper_raw->valuestring));body=inner;}
   if(status!=1 && !strcmp(result_text(body,"schema"),"edr.command.status.v1"))projected=result_status(status,exit_code);
+  else if(status==1 && !strcmp(type,"shell_open") && !strcmp(kind,"shell_stream"))projected=result_shell_open(body,a,exit_code);
   else if(!strcmp(type,"shell_stream") && !strcmp(kind,"shell_stream"))projected=result_shell(body,contract,a,1);
   else if(!strcmp(type,"rtr_shell") && !strcmp(kind,"shell_output") && body && cJSON_HasObjectItem(body,"output"))projected=result_shell(body,contract,a,0);
   else if(status==1 && !strcmp(type,"rtq_execute") && !strcmp(kind,"rtq"))projected=result_query(body,contract,a,0);
@@ -340,7 +361,7 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
     if(rc<0 || (rc==0&&status==1))goto done;
     if(rc==0)projected=result_status(status,exit_code);
   }
-  else if(!strcmp(type,a->command_type) && (!strcmp(kind,"status") || !strcmp(kind,"shell_stream") || status!=1))projected=result_status(status,exit_code);
+  else if(!strcmp(type,a->command_type) && (!strcmp(kind,"status") || status!=1))projected=result_status(status,exit_code);
   if(projected && cJSON_PrintPreallocated(projected,out,(int)cap,0) && strlen(out)<=(size_t)max_bytes) {
     cJSON_Delete(projected);cJSON_Delete(inner);cJSON_Delete(raw);cJSON_Delete(contract);return 0;
   }

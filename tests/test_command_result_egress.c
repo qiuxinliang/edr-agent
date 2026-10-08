@@ -115,7 +115,66 @@ static void typed_owner_tests(void) {
   puts("PASS: typed kill/isolation/forensic/YARA/PMFE through durable owner, serialization and final guard; wrong generation and reverse action held without ACK");
 }
 
+static void shell_open_purpose_tests(void) {
+  EdrSoarCommandMeta m=task("opened-session","shell_open");
+  const char *raw="{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"ok\",\"exit_code\":0,\"closed\":false}";
+  const char *injected="{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"ok\",\"exit_code\":0,\"closed\":false,\"shell_type\":\"UNRELATED_SHELL\",\"stdout\":\"UNRELATED_OUTPUT\",\"raw_detail\":\"UNRELATED_TEXT\"}";
+  char projected[16384],wrapped_projection[16384],canonical_projection[16384];
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",1,0,raw,projected,sizeof(projected))==0);
+  CHECK(strstr(projected,"shell session opened:") && strstr(projected,"\"status\":\"ok\""));
+  cJSON *wrapper=cJSON_CreateObject();CHECK(wrapper);
+  CHECK(cJSON_AddStringToObject(wrapper,"task_id","opened-session") &&
+        cJSON_AddStringToObject(wrapper,"status","ok") && cJSON_AddNumberToObject(wrapper,"exit_code",0) &&
+        cJSON_AddStringToObject(wrapper,"raw_detail",injected));
+  char *wrapped=cJSON_PrintUnformatted(wrapper);CHECK(wrapped);cJSON_Delete(wrapper);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",1,0,wrapped,wrapped_projection,sizeof(wrapped_projection))==0);
+  CHECK(!strcmp(projected,wrapped_projection) && !strstr(projected,"UNRELATED"));
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",1,0,projected,canonical_projection,sizeof(canonical_projection))==0);
+  CHECK(!strcmp(projected,canonical_projection));
+  CHECK(edr_command_state_finish("opened-session","shell_open",&m,"ok",1,0,wrapped,"",1)==0);
+  char *body=persisted_body("opened-session","shell_open");
+  CHECK(allowed("tenant","ep",body) && !allowed("wrong","ep",body) && !allowed("tenant","wrong",body));
+  CHECK(strstr(body,"shell session opened:") && !strstr(body,"UNRELATED"));
+  char *tampered=wire("opened-session","shell_open",injected,"");CHECK(!allowed("tenant","ep",tampered));free(tampered);
+  EdrCommandStateRecord *record=calloc(1,sizeof(*record));CHECK(record);
+  CHECK(edr_command_state_begin("opened-session","shell_open",NULL,NULL,record)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(!strcmp(record->detail,projected) && !record->report_policy_held && record->report_pending);
+  CHECK(edr_command_state_mark_reported(record)==0);
+  CHECK(edr_command_state_finish("opened-session","shell_open",&m,"ok",1,0,wrapped,"",1)==0);
+  CHECK(!allowed("tenant","ep",body));free(record);free(body);free(wrapped);
+  const char *invalid[]={
+      "shell session opened: cmd.exe",
+      "{\"schema\":\"edr.command.status.v1\",\"status\":1,\"exit_code\":0,\"diagnostic\":\"command_completed\"}",
+      "{\"task_id\":\"opened-session\",\"status\":\"ok\",\"raw_detail\":\"shell session opened: cmd.exe\"}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"other-session\",\"status\":\"ok\",\"exit_code\":0,\"closed\":false}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"failed\",\"exit_code\":0,\"closed\":false}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":1,\"exit_code\":0,\"closed\":false}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"ok\",\"exit_code\":1,\"closed\":false}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"ok\",\"exit_code\":0,\"closed\":true}",
+      "{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"opened-session\",\"status\":\"ok\",\"exit_code\":0}"};
+  for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",1,0,invalid[i],canonical_projection,sizeof(canonical_projection))!=0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",1,1,raw,canonical_projection,sizeof(canonical_projection))!=0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_input",1,0,raw,canonical_projection,sizeof(canonical_projection))!=0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"shell_open",2,1,raw,canonical_projection,sizeof(canonical_projection))==0 &&
+        strstr(canonical_projection,"command_rejected") && !strstr(canonical_projection,"opened"));
+  EdrCommandResultAuthorization wrong=m.result_authorization;
+  snprintf(wrong.command_type,sizeof(wrong.command_type),"rtr_shell");
+  CHECK(edr_command_result_project_detail(&wrong,"shell_open",1,0,raw,canonical_projection,sizeof(canonical_projection))!=0);
+  wrong=m.result_authorization;
+  cJSON *contract=cJSON_Parse(wrong.content_contract);CHECK(contract);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(contract,"max_bytes"),64);
+  CHECK(cJSON_PrintPreallocated(contract,wrong.content_contract,sizeof(wrong.content_contract),0));cJSON_Delete(contract);
+  CHECK(edr_command_result_project_detail(&wrong,"shell_open",1,0,raw,canonical_projection,sizeof(canonical_projection))!=0);
+  m=task("expired-open","shell_open");m.result_authorization.expires_unix_ms=(int64_t)time(NULL)*1000-1;
+  const char *expired="{\"schema\":\"edr.shell.session.v1\",\"session_id\":\"expired-open\",\"status\":\"ok\",\"exit_code\":0,\"closed\":false}";
+  CHECK(edr_command_state_finish("expired-open","shell_open",&m,"ok",1,0,expired,"",1)==0);
+  body=persisted_body("expired-open","shell_open");CHECK(!allowed("tenant","ep",body));free(body);
+  puts("PASS: typed shell-open control survives real owner, serializer and final gate; legacy/generic success never becomes opened; binding, projection, expiry and ACK remain enforced");
+}
+
 static void purpose_tests(void) {
+  shell_open_purpose_tests();
   EdrSoarCommandMeta q=task("purpose-query","rtq_execute");
   const char *injected="{\"results\":[{\"type\":\"process\",\"pid\":12,\"name\":\"foo\",\"user\":\"UNRELATED_IDENTITY\",\"cmdline\":\"UNRELATED_COMMAND\",\"extra\":{\"secret\":\"UNRELATED_NESTED\"}}],\"total\":1,\"raw_extra\":\"UNRELATED_TOP\"}";
   CHECK(edr_command_state_finish("purpose-query","rtq_execute",&q,"ok",1,0,injected,"",1)==0);

@@ -2319,6 +2319,14 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
                  "denied", NULL);
     return;
   }
+  char session_id[EDR_SS_ID_LEN];
+  if (!command_copy_bounded_cstr_exact(session_id, sizeof(session_id), cmd_id, 128u) ||
+      !session_id[0]) {
+    s_rejected++;
+    audit_both(cmd_id, "shell_open: session id exceeds owner limit");
+    soar_emit_ex(cmd_id, sm, EdrCmdExecRejected, 1, "invalid shell session id", "denied", NULL);
+    return;
+  }
   char shell_type[128];
 #ifdef _WIN32
   snprintf(shell_type, sizeof(shell_type), "%s", "cmd.exe /Q /K chcp 65001 > nul");
@@ -2332,7 +2340,7 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
     snprintf(shell_type, sizeof(shell_type), "%s", requested_shell);
   }
   ensure_shell_session_initialized();
-  int rc = edr_shell_session_open(cmd_id, shell_type, &sm->result_authorization);
+  int rc = edr_shell_session_open(session_id, shell_type, &sm->result_authorization);
   if (rc != 0) {
     s_exec_fail++;
     audit_both(cmd_id, "shell_open: failed");
@@ -2341,8 +2349,11 @@ static void do_shell_open(const char *cmd_id, const uint8_t *pl, size_t len,
   }
   s_handled++;
   s_exec_ok++;
-  char detail[180];
-  snprintf(detail, sizeof(detail), "shell session opened: %s", shell_type);
+  char sessionj[EDR_SS_ID_LEN * 6u + 3u], detail[EDR_SS_ID_LEN * 6u + 192u];
+  json_escape_to(sessionj, sizeof(sessionj), session_id);
+  snprintf(detail, sizeof(detail),
+           "{\"schema\":\"edr.shell.session.v1\",\"session_id\":%s,"
+           "\"status\":\"ok\",\"exit_code\":0,\"closed\":false}", sessionj);
   audit_both(cmd_id, "shell_open: ok");
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
 }
