@@ -30,6 +30,7 @@ WINDOWS_EXPECTED = {
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
     "cmd_actor_and_script_artifact",
     "kernel_file_io_identity", "collector_file_read_windows", "etw_network_decode_native",
+    "etw_process_payload_identity_native",
     "collector_health_disposition_json",
     "security_event_time_native", "security_event_time_failures", "wfas_provider_native",
     "rtq_long_command_windows",
