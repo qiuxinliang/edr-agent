@@ -1,4 +1,5 @@
 #include "edr/process_generation.h"
+#include "edr/parent_pid.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -162,6 +163,70 @@ int edr_process_generation_query_live(void *native_process_handle,
   return 1;
 }
 
+/* Microsoft documents this BasicInformation layout for
+ * ZwQueryInformationProcess, including InheritedFromUniqueProcessId. Like the
+ * existing telemetry query, resolve it at runtime and reject a changed reply. */
+typedef struct {
+  LONG exit_status;
+  PVOID peb_base_address;
+  ULONG_PTR affinity_mask;
+  LONG base_priority;
+  ULONG_PTR unique_process_id;
+  ULONG_PTR inherited_from_unique_process_id;
+} EdrProcessBasicInformation;
+
+int edr_process_parent_pid_query_live(void *native_process_handle,
+                                      const EdrLiveProcessGeneration *expected,
+                                      uint32_t *out_parent_pid,
+                                      uint8_t *out_parent_state,
+                                      char *reason, size_t reason_cap) {
+  EdrLiveProcessGeneration observed;
+  EdrProcessBasicInformation basic;
+  FILETIME created, exited, kernel, user;
+  EdrNtQueryInformationProcessFn query;
+  ULONG returned = 0u;
+  uint64_t creation;
+  if (out_parent_pid) *out_parent_pid = 0u;
+  if (out_parent_state) *out_parent_state = EDR_PARENT_PID_UNKNOWN;
+  if (!native_process_handle || !expected || !out_parent_pid || !out_parent_state ||
+      !expected->pid || !expected->process_start_key || !expected->creation_filetime_100ns) {
+    set_reason(reason, reason_cap, "live_parent_invalid_input");
+    return 0;
+  }
+  if (!edr_process_generation_query_live(native_process_handle, &observed,
+                                        reason, reason_cap) ||
+      !GetProcessTimes((HANDLE)native_process_handle, &created, &exited, &kernel, &user)) {
+    set_reason(reason, reason_cap, "live_parent_generation_unavailable");
+    return 0;
+  }
+  creation = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  if (observed.pid != expected->pid ||
+      observed.process_start_key != expected->process_start_key ||
+      observed.creation_filetime_100ns != expected->creation_filetime_100ns ||
+      creation != expected->creation_filetime_100ns) {
+    set_reason(reason, reason_cap, "live_parent_generation_mismatch");
+    return 0;
+  }
+  query = resolve_native_query();
+  memset(&basic, 0, sizeof(basic));
+  if (!query || query((HANDLE)native_process_handle, 0u, &basic, sizeof(basic),
+                      &returned) < 0) {
+    set_reason(reason, reason_cap, "live_parent_query_unavailable");
+    return 0;
+  }
+  if (returned != sizeof(basic) || basic.unique_process_id != expected->pid ||
+      basic.inherited_from_unique_process_id > UINT32_MAX ||
+      basic.inherited_from_unique_process_id == expected->pid) {
+    set_reason(reason, reason_cap, "live_parent_reply_invalid");
+    return 0;
+  }
+  *out_parent_pid = (uint32_t)basic.inherited_from_unique_process_id;
+  *out_parent_state = *out_parent_pid ? EDR_PARENT_PID_KNOWN : EDR_PARENT_PID_EXPLICIT_ZERO;
+  set_reason(reason, reason_cap, *out_parent_pid ? "live_child_parent_known"
+                                               : "live_child_parent_explicit_zero");
+  return 1;
+}
+
 static int query_command_line(void *native_process_handle,
                                char *out, size_t out_cap, char **allocated,
                                char *reason, size_t reason_cap) {
@@ -295,6 +360,20 @@ int edr_process_generation_validate_live(void *native_process_handle,
 }
 
 #else
+
+int edr_process_parent_pid_query_live(void *native_process_handle,
+                                      const EdrLiveProcessGeneration *expected,
+                                      uint32_t *out_parent_pid,
+                                      uint8_t *out_parent_state,
+                                      char *reason, size_t reason_cap) {
+  (void)native_process_handle;
+  (void)expected;
+  if (out_parent_pid) *out_parent_pid = 0u;
+  if (out_parent_state) *out_parent_state = EDR_PARENT_PID_UNKNOWN;
+  set_reason(reason, reason_cap, "live_parent_query_unavailable");
+  return 0;
+}
+
 
 char *edr_process_command_line_query_alloc(void *handle, char *reason, size_t cap) {
   (void)handle;

@@ -13,6 +13,52 @@
 #include "../src/collector/process_start_token_win.h"
 #include "../src/preprocess/process_sid_account_win.h"
 
+static int same_handle_parent_contract(HANDLE child, DWORD pid, uint64_t creation) {
+  EdrLiveProcessGeneration live, wrong;
+  uint32_t parent_pid = UINT32_MAX;
+  uint8_t parent_state = EDR_PARENT_PID_CONFLICT;
+  char reason[96];
+  if (!edr_process_generation_query_live(child, &live, reason, sizeof(reason)) ||
+      live.pid != pid || live.creation_filetime_100ns != creation ||
+      !edr_process_parent_pid_query_live(child, &live, &parent_pid, &parent_state,
+                                         reason, sizeof(reason)) ||
+      parent_pid != GetCurrentProcessId() || parent_state != EDR_PARENT_PID_KNOWN) {
+    fprintf(stderr, "same-child-handle parent query failed\n");
+    return 0;
+  }
+  /* The source is this still-open child object, not a new lookup of a PID.
+   * An otherwise valid handle must not complete a different actor tuple. */
+  for (unsigned i = 0u; i < 6u; ++i) {
+    wrong = live;
+    if (i == 0u) wrong.pid++;
+    else if (i == 1u) wrong.process_start_key++;
+    else if (i == 2u) wrong.creation_filetime_100ns++;
+    else if (i == 3u) wrong.pid = 0u;
+    else if (i == 4u) wrong.process_start_key = 0u;
+    else wrong.creation_filetime_100ns = 0u;
+    parent_pid = UINT32_MAX; parent_state = EDR_PARENT_PID_CONFLICT;
+    if (edr_process_parent_pid_query_live(child, &wrong, &parent_pid, &parent_state,
+                                          reason, sizeof(reason)) ||
+        parent_pid != 0u || parent_state != EDR_PARENT_PID_UNKNOWN) {
+      fprintf(stderr, "wrong actor tuple acquired a parent relationship\n");
+      return 0;
+    }
+  }
+  parent_pid = UINT32_MAX; parent_state = EDR_PARENT_PID_CONFLICT;
+  if (edr_process_parent_pid_query_live(NULL, &live, &parent_pid, &parent_state,
+                                        reason, sizeof(reason)) ||
+      parent_pid != 0u || parent_state != EDR_PARENT_PID_UNKNOWN) return 0;
+  parent_pid = UINT32_MAX; parent_state = EDR_PARENT_PID_CONFLICT;
+  if (edr_process_parent_pid_query_live(child, NULL, &parent_pid, &parent_state,
+                                        reason, sizeof(reason)) ||
+      parent_pid != 0u || parent_state != EDR_PARENT_PID_UNKNOWN) return 0;
+  if (edr_process_parent_pid_query_live(child, &live, NULL, &parent_state,
+                                        reason, sizeof(reason)) ||
+      edr_process_parent_pid_query_live(child, &live, &parent_pid, NULL,
+                                        reason, sizeof(reason))) return 0;
+  return 1;
+}
+
 static int startup_token_contract(HANDLE child, DWORD pid, uint64_t creation) {
   EdrLiveProcessGeneration live;
   EdrBehaviorRecord source;
@@ -173,6 +219,7 @@ int main(int argc, char **argv) {
   int ok = GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user) != 0;
   ok = ok && long_query_ok;
   uint64_t identity = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  ok = ok && same_handle_parent_contract(child.hProcess, child.dwProcessId, identity);
   ok = ok && !edr_process_terminate_checked(child.dwProcessId, 0u, 5000, reason, sizeof(reason)) &&
       WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT;
   ok = ok && !edr_process_terminate_checked(4u, identity, 5000, reason, sizeof(reason));

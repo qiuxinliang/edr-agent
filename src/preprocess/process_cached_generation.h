@@ -41,6 +41,18 @@ static inline int p0_cached_generation_reject(const EdrBehaviorRecord *br,
   return 0;
 }
 
+static inline int p0_cached_actor_text_matches(const char *source,
+                                              const char *cached) {
+#ifdef _WIN32
+  return edr_windows_utf8_path_compare_ci(source, cached) ==
+      EDR_WINDOWS_UTF8_PATH_COMPARE_MATCH;
+#else
+  /* Non-Windows fixtures/consumers have no Windows ordinal API. Do not claim
+   * its Unicode semantics or normalize a distinct local pathname. */
+  return strcmp(source, cached) == 0;
+#endif
+}
+
 static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
                                                       uint64_t source_start_key,
                                                       uint64_t source_creation) {
@@ -51,6 +63,16 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   if (!edr_behavior_has_process_actor(br) || br->type == EDR_EVENT_PROCESS_CREATE ||
       !br->pid || br->event_time_ns <= 0)
     return p0_cached_generation_reject(br, "cache_actor_ineligible");
+  /* The record may already contain a same-handle live tuple. A fallback must
+   * not discard it merely because its caller retained the original empty
+   * source tuple, nor may contradictory captures be joined. */
+  if ((source_start_key && br->process_start_key &&
+       source_start_key != br->process_start_key) ||
+      (source_creation && br->process_creation_filetime_100ns &&
+       source_creation != br->process_creation_filetime_100ns))
+    return p0_cached_generation_reject(br, "cache_generation_mismatch");
+  if (!source_start_key) source_start_key = br->process_start_key;
+  if (!source_creation) source_creation = br->process_creation_filetime_100ns;
   event_unix_ns = (uint64_t)br->event_time_ns;
   memset(&snapshot, 0, sizeof(snapshot));
   snapshot_result = source_start_key
@@ -74,12 +96,21 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   if (!edr_process_generation_contains_event(snapshot.creation_filetime_100ns,
                                                event_unix_ns))
     return p0_cached_generation_reject(br, "cache_event_time_rejected");
+  /* Exit bounds may be inferred from a later PID birth, and may omit an
+   * intermediate generation. File actor recovery needs its own captured
+   * StartKey, not a PID/time inference even when that interval is closed. */
+  if ((br->type == EDR_EVENT_FILE_READ || br->kernel_file_activity) && !source_start_key)
+    return p0_cached_generation_reject(br, "cache_actor_unproven");
   if ((br->type == EDR_EVENT_NET_CONNECT || br->type == EDR_EVENT_NET_LISTEN) &&
-      !source_start_key && !source_creation && !snapshot.exit_time_ns) {
-    /* Preserve the stricter network contract: an open PID interval alone
-     * does not independently prove an unattributed network actor. */
+      !source_start_key && !source_creation)
     return p0_cached_generation_reject(br, "cache_network_unproven");
-  }
+  const char *source_image = br->image_path_canonical[0]
+      ? br->image_path_canonical : br->exe_path;
+  if ((source_image[0] && !p0_cached_actor_text_matches(source_image, snapshot.exe_path)) ||
+      (br->process_name[0] && strncmp(br->process_name, "pid:", 4u) != 0 &&
+       snapshot.process_name[0] && !p0_cached_actor_text_matches(
+          br->process_name, snapshot.process_name)))
+    return p0_cached_generation_reject(br, "cache_actor_identity_mismatch");
   br->process_start_key = snapshot.process_start_key;
   br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
   edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,

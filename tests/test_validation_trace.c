@@ -76,6 +76,7 @@ static void parent_identity_contract(void) {
   edr_validation_trace_event(&r, "cached_generation", "cache_miss");
   edr_validation_trace_event(&r, "parent_cache", "cache_parent_unknown");
   edr_parent_pid_merge(&r.ppid, &r.parent_pid_state, 299u, EDR_PARENT_PID_KNOWN);
+  edr_validation_trace_event(&r, "parent_query", "live_child_parent_known");
   edr_validation_trace_parent_change(&r, 0u, EDR_PARENT_PID_UNKNOWN, "identity_enriched");
   edr_validation_trace_parent_change(&r, 299u, EDR_PARENT_PID_KNOWN, "enriched");
   edr_validation_trace_event(&r, "p0_rule", "R-EXEC-001");
@@ -117,6 +118,7 @@ static void parent_identity_contract(void) {
   stage_has(s, "actor_binding", "\"reason\":\"reason_unavailable\"");
   stage_has(s, "cached_generation", "\"reason\":\"cache_miss\"");
   stage_has(s, "parent_cache", "\"reason\":\"cache_parent_unknown\"");
+  stage_has(s, "parent_query", "\"reason\":\"live_child_parent_known\"");
   stage_has(s, "identity_enriched", "\"change_reason\":\"unknown_completed\"");
   stage_has(s, "enriched", "\"ppid\":299,\"parent_pid_state\":1");
   stage_has(s, "enriched", "\"change_reason\":\"known_retained\"");
@@ -220,6 +222,7 @@ int main(void) {
   edr_validation_trace_event(&r,"actor_binding","live_process_open_failed");
   edr_validation_trace_event(&r,"cached_generation","cache_miss");
   edr_validation_trace_event(&r,"parent_cache","cache_parent_unknown");
+  edr_validation_trace_event(&r,"parent_query","live_child_parent_known");
   strcpy(r.process_name,"other.exe"); edr_validation_trace_event(&r,"local_retention","ordinary_hot_ring_only");
   EdrSensorInterestEvent exited = {0};
   exited.type = EDR_EVENT_PROCESS_TERMINATE; exited.pid = r.pid;
@@ -246,7 +249,7 @@ int main(void) {
   assert(strstr(s,"proven_miss") && strstr(s,"ordinary_hot_ring_only") && strstr(s,"\"stage\":\"child\""));
   assert(strstr(s,"\"birth\":\"1000\",\"start_key\":\"0\",\"event_ns\":\"123456789\",\"type\":2,\"event_id\":\"\",\"stage\":\"process_exit\""));
   assert(!strstr(s,"foreign-") && !strstr(s,"conflicting-key") && !strstr(s,"secret"));
-  assert(!strstr(s,"actor_binding") && !strstr(s,"cached_generation") && !strstr(s,"parent_cache"));
+  assert(!strstr(s,"actor_binding") && !strstr(s,"cached_generation") && !strstr(s,"parent_cache") && !strstr(s,"parent_query"));
   assert(strstr(s,"\"body_hex\":\"7b7d\"") && strstr(s,"\"body_hex\":\"010203ff\""));
   assert(!edr_sha256_hex(wire,sizeof(wire),hash) && strstr(s,hash));
   assert(strstr(s,"\"kind\":\"closed\"") && strstr(s,"\"dropped\":0")); free(s);

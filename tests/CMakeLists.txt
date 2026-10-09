@@ -1371,6 +1371,7 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c

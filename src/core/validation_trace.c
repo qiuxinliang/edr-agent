@@ -61,13 +61,13 @@ static int parent_stage(const char *stage) {
   return stage && (!strcmp(stage, "normalized") || !strcmp(stage, "identity_enriched") ||
       !strcmp(stage, "enriched") || !strcmp(stage, "wire") ||
       !strcmp(stage, "actor_binding") || !strcmp(stage, "cached_generation") ||
-      !strcmp(stage, "parent_cache"));
+      !strcmp(stage, "parent_cache") || !strcmp(stage, "parent_query"));
 }
 static int selected_stage(const char *stage) {
   if (atomic_load(&s_parent_identity_only)) return parent_stage(stage);
   /* These new owner diagnostics belong only to parent diagnosis. */
   return !stage || (strcmp(stage, "actor_binding") && strcmp(stage, "cached_generation") &&
-      strcmp(stage, "parent_cache"));
+      strcmp(stage, "parent_cache") && strcmp(stage, "parent_query"));
 }
 static const char *parent_reason(const char *reason) {
   /* Owning components supply fixed diagnostic causes, never identity text. */
@@ -88,7 +88,12 @@ static const char *parent_reason(const char *reason) {
     "cache_generation_incomplete", "cache_record_generation_unproven", "cache_image_unavailable",
     "cache_image_truncated", "cache_generation_mismatch", "cache_event_time_rejected",
     "cache_network_unproven", "cache_parent_unknown", "cache_parent_known",
-    "cache_parent_explicit_zero", "cache_parent_invalid", "cache_parent_conflict"
+    "cache_parent_explicit_zero", "cache_parent_invalid", "cache_parent_conflict",
+    "cache_actor_identity_mismatch", "cache_actor_unproven", "source_parent_preserved",
+    "live_parent_invalid_input", "live_parent_generation_unavailable",
+    "live_parent_generation_mismatch", "live_parent_query_unavailable",
+    "live_parent_reply_invalid", "live_child_parent_known", "live_child_parent_explicit_zero",
+    "live_parent_cache_unavailable"
   };
   if (reason) for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i)
     if (!strcmp(reason, allowed[i])) return allowed[i];

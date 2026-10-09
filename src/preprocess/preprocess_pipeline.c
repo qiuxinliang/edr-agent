@@ -347,6 +347,62 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
  * never a creation surrogate. */
 static const char *p0_process_path_basename(const char *path);
 
+/* The child handle and event lifetime have already been validated. Keep the
+ * numeric edge independent of optional parent image/command enrichment: a
+ * missed ProcessStart event must not leave a live, proven actor UNKNOWN. */
+static void p0_enrich_bound_parent_pid(EdrBehaviorRecord *br, HANDLE process,
+                                       const EdrLiveProcessGeneration *live) {
+  ProcessTreeEntry cached;
+  uint64_t event_ns = (uint64_t)br->event_time_ns;
+  const char *cause = "source_parent_preserved";
+  char reason[64];
+  uint32_t parent_pid = 0u;
+  uint8_t parent_state = EDR_PARENT_PID_UNKNOWN;
+  if (edr_pt_cache_snapshot_generation_at(br->pid, live->process_start_key,
+      event_ns, &cached) == 0 &&
+      cached.creation_filetime_100ns == live->creation_filetime_100ns) {
+    edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,
+                         cached.ppid, cached.parent_pid_state);
+    switch (edr_parent_pid_effective_state(cached.ppid, cached.parent_pid_state)) {
+      case EDR_PARENT_PID_KNOWN: cause = "cache_parent_known"; break;
+      case EDR_PARENT_PID_EXPLICIT_ZERO: cause = "cache_parent_explicit_zero"; break;
+      case EDR_PARENT_PID_INVALID: cause = "cache_parent_invalid"; break;
+      case EDR_PARENT_PID_CONFLICT: cause = "cache_parent_conflict"; break;
+      default: break;
+    }
+  }
+  if (edr_parent_pid_effective_state(br->ppid, br->parent_pid_state) ==
+      EDR_PARENT_PID_UNKNOWN) {
+    (void)edr_process_parent_pid_query_live(process, live, &parent_pid,
+                                           &parent_state, reason, sizeof(reason));
+    edr_parent_pid_merge(&br->ppid, &br->parent_pid_state, parent_pid, parent_state);
+    cause = reason;
+  }
+  if (edr_parent_pid_effective_state(br->ppid, br->parent_pid_state) !=
+      EDR_PARENT_PID_UNKNOWN) {
+    /* Retain only this proven child's numeric fact. Existing owner merge
+     * makes disagreements sticky; it never changes birth or resurrects exit.
+     * This path reads no parent process or optional sensitive context. */
+    if (edr_pt_cache_put_generation_with_parent_state(br->pid, br->ppid,
+        br->process_name, NULL, br->exe_path, NULL, event_ns,
+        live->process_start_key, live->creation_filetime_100ns,
+        edr_behavior_source_field_truncated(br, "source.exe_path") ||
+        edr_behavior_source_field_truncated(br, "source.image_path_canonical")
+            ? EDR_PTC_SOURCE_TRUNC_EXE_PATH : 0u, br->parent_pid_state) != 0) {
+      cause = "live_parent_cache_unavailable";
+    } else if (edr_pt_cache_snapshot_generation_at(br->pid, live->process_start_key,
+        event_ns, &cached) == 0 &&
+        cached.creation_filetime_100ns == live->creation_filetime_100ns) {
+      edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,
+                           cached.ppid, cached.parent_pid_state);
+    }
+  }
+  if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+      br->parent_pid_state == EDR_PARENT_PID_INVALID)
+    edr_behavior_clear_parent_context(br);
+  edr_validation_trace_event(br, "parent_query", cause);
+}
+
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   apply_agent_ids_to_record(br);
   HANDLE process = NULL;
@@ -514,9 +570,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
     copy_trunc(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "RESOLVED");
     copy_trunc(br->image_path_resolution_source, sizeof(br->image_path_resolution_source), "live_same_generation");
   }
-  CloseHandle(process);
   br->process_start_key = live.process_start_key;
   br->process_creation_filetime_100ns = live.creation_filetime_100ns;
+  p0_enrich_bound_parent_pid(br, process, &live);
+  CloseHandle(process);
   snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
            br->type == EDR_EVENT_PROCESS_CREATE
                ? (source_start_key != 0u ? "kernel_payload_live_telemetry"
