@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 cmake_policy(SET CMP0091 NEW)
 project(edr_agent
-  VERSION 0.1.0
+  VERSION 3.2.639
   DESCRIPTION "EDR endpoint agent"
   LANGUAGES C CXX
 )

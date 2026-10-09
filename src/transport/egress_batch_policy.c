@@ -323,6 +323,11 @@ static const JsonField p0_signature_fields[]={S("status",64),S("source",96),S("s
   S("thumbprint",192),S("revocation",64),S("quality",64),S("reason",160),END};
 static const JsonField p0_evidence_fields[]={O("artifact",p0_artifact_fields),S("file_identity",128),
   O("hash",p0_hash_fields),O("signature",p0_signature_fields),B("omitted"),S("reason",160),END};
+/* A matched ordinary P0 alert has a current response consumer for its actor's
+ * file metadata, independently of the fields used by the rule predicate.
+ * This closed snapshot explanation is not a file target, generic diagnostic
+ * context, or the action-authoritative terminal journal contract below. */
+static const JsonField p0_snapshot_context_fields[]={O("evidence",p0_evidence_fields),END};
 static const JsonField p0_terminal_process_fields[]={S("generation_key",32),
   {"creation_filetime_100ns",JS_U64,0,NULL,NULL},S("canonical_image_path",4096),
   S("file_identity",128),B("file_identity_available"),END};
@@ -755,6 +760,71 @@ static int generation_matches(const cJSON *ctx,const char *key,uint64_t generati
   char expected[32]; snprintf(expected,sizeof(expected),"%llu",(unsigned long long)generation);
   return generation && cJSON_IsString(v) && !strcmp(v->valuestring,expected);
 }
+static int p0_snapshot_actor_matches(const edr_v1_BehaviorEvent *ev,const cJSON *subject,const cJSON *ctx) {
+  const cJSON *source=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  /* P0 copies this field from the same snapshot envelope into its subject;
+   * neither copy is an identity captured from the running image section. */
+  const cJSON *source_file=cJSON_GetObjectItemCaseSensitive(source,"file_identity");
+  const cJSON *snapshot_file=cJSON_GetObjectItemCaseSensitive(evidence,"file_identity");
+  return ev->pid && ev->process_start_key && ev->process_creation_filetime_100ns &&
+    ev->image_path_canonical[0] && dynamic_alert(ev,subject) &&
+    cJSON_IsString(source_file) && cJSON_IsString(snapshot_file) &&
+    !strcmp(source_file->valuestring,snapshot_file->valuestring) &&
+    cJSON_GetObjectItemCaseSensitive(source,"process_start_key") &&
+    cJSON_GetObjectItemCaseSensitive(source,"process_creation_filetime_100ns") &&
+    generation_matches(source,"process_start_key",ev->process_start_key) &&
+    generation_matches(source,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns) &&
+    same(source,"canonical_image_path",ev->image_path_canonical);
+}
+static int p0_snapshot_evidence_valid(cJSON *ctx) {
+  if (!json_fields(ctx,p0_snapshot_context_fields,0,0)) return 0;
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  if (!cJSON_IsObject(evidence)) return 0;
+  if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(evidence,"omitted")))
+    return string(evidence,"reason")[0] &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"artifact") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"file_identity") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"hash") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"signature");
+  const cJSON *artifact=cJSON_GetObjectItemCaseSensitive(evidence,"artifact");
+  const cJSON *digest=cJSON_GetObjectItemCaseSensitive(evidence,"hash");
+  return same(artifact,"source","post_event_path_snapshot") &&
+    (same(artifact,"quality","non_authoritative") || same(artifact,"quality","NOT_EVALUABLE")) &&
+    (!string(digest,"value")[0] || hash(string(digest,"value"))) &&
+    (!same(digest,"quality","captured") || hash(string(digest,"value")));
+}
+static int p0_snapshot_context_valid(const edr_v1_BehaviorEvent *ev,const cJSON *subject,cJSON *ctx) {
+  if (!ev->ave_result_json[0]) return 1;
+  if (!p0_snapshot_evidence_valid(ctx)) return 0;
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  /* An omission reports only the inability to carry optional evidence. It
+   * contains no hash, signer, identity or authority from another actor. */
+  return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(evidence,"omitted")) ||
+    p0_snapshot_actor_matches(ev,subject,ctx);
+}
+static int project_p0_snapshot_context(edr_v1_BehaviorEvent *ev,const cJSON *subject,cJSON *ctx) {
+  const char *omission=NULL;
+  if (!cJSON_GetObjectItemCaseSensitive(ctx,"evidence")) {
+    ev->ave_result_json[0]=0; /* Generic score/context still stays local. */
+    return 1;
+  }
+  if (!json_fields(ctx,p0_snapshot_context_fields,1,0) || !p0_snapshot_evidence_valid(ctx))
+    omission="process_evidence_projection_invalid";
+  else if (!p0_snapshot_context_valid(ev,subject,ctx))
+    omission="process_evidence_actor_unavailable";
+  char *text=omission?NULL:cJSON_PrintUnformatted(ctx);
+  if (!omission && !text) return 0; /* Resource failure is retryable, never success. */
+  if (!omission && strlen(text)>=sizeof(ev->ave_result_json))
+    omission="process_evidence_projection_capacity";
+  if (omission) {
+    int n=snprintf(ev->ave_result_json,sizeof(ev->ave_result_json),
+      "{\"evidence\":{\"omitted\":true,\"reason\":\"%s\"}}",omission);
+    free(text);
+    return n>0 && (size_t)n<sizeof(ev->ave_result_json);
+  }
+  strcpy(ev->ave_result_json,text);free(text);return 1;
+}
 static int supplemental_identity_empty(const edr_v1_BehaviorEvent *ev) {
   return !ev->session_id && !ev->domain[0] && !ev->user_sid[0] && !ev->logon_id[0] &&
     !ev->creator_username[0] && !ev->creator_domain[0] && !ev->creator_sid[0] &&
@@ -903,7 +973,8 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *res
     int fanout=same(subject,"subject_type","net_fanout");
     int terminal=cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")!=NULL;
     int valid=terminal?(p0_terminal_context_valid(ev,subject,ctx) && terminal_projection_valid(ev,resource_unavailable)):
-      (fields && json_fields(subject,fields,0,0) && !ev->ave_result_json[0] &&
+      (fields && json_fields(subject,fields,0,0) &&
+      (dynamic?p0_snapshot_context_valid(ev,subject,ctx):!ev->ave_result_json[0]) &&
       !ev->has_ave_behavior_feed && projected_evidence_valid(ev,dynamic,resource_unavailable));
     if (valid && dynamic) {
       const cJSON *context=cJSON_GetObjectItemCaseSensitive(subject,"context");
@@ -1022,7 +1093,8 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
     if (subject_text) {
       strcpy(ev->behavior_alert.user_subject_json,subject_text);
       if (ioc_text) strcpy(ev->behavior_alert.related_iocs_json,ioc_text);
-      ev->ave_result_json[0]=0; /* Redundant generic score/context stays local. */
+      if (dynamic) { if (valid) valid=project_p0_snapshot_context(ev,subject,ctx); }
+      else ev->ave_result_json[0]=0; /* Redundant generic score/context stays local. */
     } else if (ctx_text) {
       strcpy(ev->ave_result_json,ctx_text);
       if (ev->which_detail==edr_v1_BehaviorEvent_script_tag ||
