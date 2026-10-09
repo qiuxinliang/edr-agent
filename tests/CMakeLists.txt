@@ -1359,6 +1359,16 @@ endif()
 edr_apply_test_warnings(test_process_tree_cache)
 add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_parent_context_binding ${CMAKE_CURRENT_SOURCE_DIR}/test_parent_context_binding.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c)
+target_include_directories(test_parent_context_binding PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(UNIX)
+  target_link_libraries(test_parent_context_binding PRIVATE Threads::Threads)
+endif()
+edr_apply_test_warnings(test_parent_context_binding)
+add_test(NAME parent_context_binding COMMAND test_parent_context_binding WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c

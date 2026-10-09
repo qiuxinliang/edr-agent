@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "parent_command_redaction.h"
 
 static int captured_decimal(const cJSON *object, const char *key, uint64_t *out) {
   const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, key);
@@ -751,6 +752,14 @@ static void fill_behavior_alert_fields(edr_v1_BehaviorEvent *msg, const AVEBehav
 static size_t encode_behavior_event(edr_v1_BehaviorEvent *msg, uint8_t *out, size_t out_cap,
                                     int outbound, const EdrBehaviorRecord *source) {
   if (outbound && !edr_egress_event_project(msg,NULL,0)) return 0;
+  if (outbound) {
+    /* Complete facts have already replaced bounded previews. Minimize only
+     * newly generated wire copies before immutable bytes/hash are assigned;
+     * local facts and exact journal/retry bytes never pass this branch. */
+    parent_command_redact(msg->process_context.parent_cmdline);
+    if (msg->which_detail == edr_v1_BehaviorEvent_process_tag)
+      parent_command_redact(msg->detail.process.parent_cmdline);
+  }
   if (outbound && edr_validation_trace_enabled()) {
     const char *rule_id = "";
     cJSON *subject = cJSON_Parse(msg->behavior_alert.user_subject_json);
@@ -786,6 +795,24 @@ static void resolve_wire_omission(edr_v1_BehaviorEvent *msg, const char *field) 
     copy_str(msg->source_completeness, sizeof(msg->source_completeness), "COALESCED");
 }
 
+static void resolve_restored_command(edr_v1_BehaviorEvent *msg,
+                                      const char *source_field, const char *wire_field) {
+  resolve_wire_omission(msg, source_field);
+  resolve_wire_omission(msg, wire_field);
+  /* Other transport omissions keep their provenance; source omissions alone
+   * do not imply clipping by this encoder. Overflow markers stay conservative. */
+  int transport_omission = 0;
+  const char *item = msg->truncated_fields;
+  while (*item) {
+    const char *end = strchr(item, ',');
+    size_t n = end ? (size_t)(end - item) : strlen(item);
+    if (n && (n < 7u || memcmp(item, "source.", 7u))) transport_omission = 1;
+    if (!end) break;
+    item = end + 1u;
+  }
+  if (!transport_omission) copy_str(msg->transport_completeness, sizeof(msg->transport_completeness), "COMPLETE");
+}
+
 static size_t encode_record_facts(const EdrBehaviorRecord *r,
     const AVEBehaviorAlert *alert, const char *command, const char *parent_command,
     uint8_t *out, size_t out_cap,int outbound) {
@@ -793,7 +820,9 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   size_t result;
   if (!r || !out || out_cap < 16u ||
       (command && (!command[0] || strlen(command) >= EDR_PROCESS_COMMAND_FACT_CAP)) ||
-      (parent_command && (!parent_command[0] || strlen(parent_command) >= EDR_PROCESS_COMMAND_FACT_CAP)))
+      (parent_command && (!parent_command[0] || strlen(parent_command) >= EDR_PROCESS_COMMAND_FACT_CAP)) ||
+      (command && strlen(command) >= sizeof(((edr_v1_BehaviorEvent *)0)->cmdline)) ||
+      (parent_command && strlen(parent_command) >= sizeof(((edr_v1_BehaviorEvent *)0)->process_context.parent_cmdline)))
     return 0;
   /* Complete facts do not enlarge every hot record or Windows thread stack. */
   msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
@@ -812,13 +841,13 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   }
   if (command) {
     copy_str(msg->cmdline, sizeof(msg->cmdline), command);
-    resolve_wire_omission(msg, "source.cmdline");
+    resolve_restored_command(msg, "source.cmdline", "cmdline");
   }
   if (parent_command) {
     msg->has_process_context = true;
     msg->process_context.has_parent_cmdline = true;
     copy_str(msg->process_context.parent_cmdline, sizeof(msg->process_context.parent_cmdline), parent_command);
-    resolve_wire_omission(msg, "source.parent_cmdline");
+    resolve_restored_command(msg, "source.parent_cmdline", "parent_cmdline");
     /* The authoritative common context carries the fact once. Do not send
      * a duplicate long value through the deprecated ProcessDetail projection. */
     if (msg->which_detail == edr_v1_BehaviorEvent_process_tag) {

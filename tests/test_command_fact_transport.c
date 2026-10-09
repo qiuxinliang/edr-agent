@@ -276,6 +276,9 @@ int main(int argc, char **argv) {
   child->type = EDR_EVENT_FILE_READ; child->ppid = parent->pid;
   child->parent_process_start_key = parent->process_start_key;
   child->parent_process_creation_filetime_100ns = parent->process_creation_filetime_100ns;
+  /* This fixture starts after the native parent lifetime proof. The separate
+   * parent-binding regression exercises that proof and denial itself. */
+  strcpy(child->parent_resolution_source, "live_parent_generation");
   AVEBehaviorAlert bare_alert = {0};
   bare_alert.pid = child->pid; bare_alert.ppid = child->ppid; bare_alert.timestamp_ns = child->event_time_ns;
   bare_alert.anomaly_score = 0.91f;
@@ -318,7 +321,12 @@ int main(int argc, char **argv) {
     assert(fact && strlen(fact) == n && !strcmp(command, fact)); free(fact);
     /* Empty and nonempty preview must both resolve through the production
      * parent reference, even after the process-tree hot cache is gone. */
-    strcpy(child->cmdline, "inert.exe"); strcpy(child->parent_cmdline, "inert.exe");
+    strcpy(child->cmdline, "inert.exe");
+    /* Exercise a real cached full-fact restore after a preview cuts UTF-8
+     * at the legacy boundary, rather than only replacing a short ASCII stub. */
+    size_t preview_size = n < sizeof(child->parent_cmdline) ? n : sizeof(child->parent_cmdline) - 1u;
+    memcpy(child->parent_cmdline, command, preview_size);
+    child->parent_cmdline[preview_size] = 0;
     edr_behavior_mark_source_truncated(child, "source.cmdline");
     edr_behavior_mark_source_truncated(child, "source.parent_cmdline");
     if (n == 12717u) {
@@ -333,6 +341,11 @@ int main(int argc, char **argv) {
       assert(edr_pt_cache_put_generation(parent->pid, 0u, parent->process_name,
           parent->cmdline, "C:/test/inert-parent.exe", NULL, birth,
           parent->process_start_key, parent->process_creation_filetime_100ns) == 0);
+      uint64_t child_birth = (child->process_creation_filetime_100ns - UINT64_C(116444736000000000)) * 100u;
+      /* Prove this exact parent remained alive through the child's creation;
+       * an inferred cache interval is not authority for a parent-text edge. */
+      assert(edr_pt_cache_mark_alive_generation(parent->pid, parent->process_start_key,
+          parent->process_creation_filetime_100ns, child_birth) == 0);
       edr_local_evidence_cache_observe_process(parent);
       edr_local_evidence_cache_observe_process(child);
       assert(edr_local_evidence_cache_process_tree_generation_json(parent->pid, parent->endpoint_id,

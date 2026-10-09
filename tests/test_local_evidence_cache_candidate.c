@@ -4945,6 +4945,127 @@ static void test_process_cache_preserves_full_facts_and_source_provenance(void) 
   free(observed);
 }
 
+static void test_parent_text_requires_proved_lifetime_and_survives_cache_eviction(void) {
+  const uint32_t parent_pid = 97001u, child_pid = 97002u;
+  const uint64_t now = (uint64_t)time(NULL) * UINT64_C(1000000000);
+  const uint64_t a = now - UINT64_C(8000000000);
+  const uint64_t i = now - UINT64_C(6000000000);
+  const uint64_t c = now - UINT64_C(5000000000);
+  const uint64_t b = now - UINT64_C(4000000000);
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+#if defined(EDR_HAVE_SQLITE)
+  char db[512];
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  cleanup_test_sqlite_path(db);
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+#else
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+#endif
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-A.exe", "A_SYNTHETIC_TEXT",
+      "C:/isolated/parent-A.exe", NULL, a, 100u, test_unix_ns_to_filetime(a)) == 0);
+  assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-B.exe", "B_SYNTHETIC_TEXT",
+      "C:/isolated/parent-B.exe", NULL, b, 300u, test_unix_ns_to_filetime(b)) == 0);
+  init_record(r, EDR_EVENT_PROCESS_CREATE);
+  r->pid = child_pid; r->ppid = parent_pid; r->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  r->event_time_ns = (int64_t)c; r->process_start_key = 200u;
+  r->process_creation_filetime_100ns = test_unix_ns_to_filetime(c);
+  strcpy(r->process_name, "synthetic-child.exe"); strcpy(r->exe_path, "C:/isolated/child.exe");
+  strcpy(r->endpoint_id, "ep-synthetic-parent-binding");
+  strcpy(r->tenant_id, "tenant-synthetic-parent-binding");
+  strcpy(r->event_id, "synthetic-parent-binding-durable");
+  r->priority = 3u;
+  strcpy(r->detection_context, "{\"engine\":\"p0\",\"severity\":\"P0\"}");
+  strcpy(r->parent_name, "parent-A.exe"); strcpy(r->parent_path, "C:/isolated/parent-A.exe");
+  strcpy(r->parent_cmdline, "A_SYNTHETIC_TEXT"); strcpy(r->parent_resolution_source, "process_tree_cache");
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(r->ppid == parent_pid && r->parent_pid_state == EDR_PARENT_PID_KNOWN);
+  assert(!r->parent_name[0] && !r->parent_path[0] && !r->parent_cmdline[0]);
+  assert(!r->parent_process_start_key);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_unproven"));
+
+  assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-I.exe", "I_SYNTHETIC_TEXT",
+      "C:/isolated/parent-I.exe", NULL, i, 150u, test_unix_ns_to_filetime(i)) == 0);
+  assert(edr_pt_cache_mark_alive_generation(parent_pid, 150u,
+      test_unix_ns_to_filetime(i), c + 100u) == 0);
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(r->parent_process_start_key == 150u);
+  assert(!strcmp(r->parent_name, "parent-I.exe") && !strcmp(r->parent_path, "C:/isolated/parent-I.exe"));
+  assert(!strcmp(r->parent_cmdline, "I_SYNTHETIC_TEXT"));
+  assert(!strcmp(r->parent_resolution_source, "process_tree_cache_verified"));
+  assert(!strcmp(r->parent_resolution_status, "RESOLVED"));
+  edr_local_evidence_cache_record_behavior(r);
+
+  /* A retained proved tuple can be observed after the short PTC is evicted;
+   * neither its source nor the next sparse exact-child event lose the edge. */
+  edr_pt_cache_shutdown(); edr_pt_cache_init();
+  edr_local_evidence_cache_observe_process(r);
+  edr_behavior_clear_parent_context(r); r->type = EDR_EVENT_FILE_WRITE;
+  r->event_time_ns = (int64_t)(c + 1000u);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(r->parent_process_start_key == 150u && !strcmp(r->parent_cmdline, "I_SYNTHETIC_TEXT"));
+  assert(!strcmp(r->parent_resolution_source, "process_tree_cache_verified"));
+
+  /* A late contradictory StartKey for the exact same parent birth invalidates
+   * the retained text proof. Cache disappearance must not clear this conflict. */
+  assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-I.exe", "I_SYNTHETIC_TEXT",
+      "C:/isolated/parent-I.exe", NULL, i, 150u, test_unix_ns_to_filetime(i)) == 0);
+  assert(edr_pt_cache_mark_alive_generation(parent_pid, 150u,
+      test_unix_ns_to_filetime(i), c + 100u) == 0);
+  assert(edr_pt_cache_put_generation(parent_pid, 4u, "parent-X.exe", "X_SYNTHETIC_TEXT",
+      "C:/isolated/parent-X.exe", NULL, i, 151u, test_unix_ns_to_filetime(i)) == 0);
+  edr_behavior_clear_parent_context(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(r->ppid == parent_pid && r->parent_pid_state == EDR_PARENT_PID_KNOWN);
+  assert(!r->parent_process_start_key && !r->parent_name[0] && !r->parent_path[0] && !r->parent_cmdline[0]);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  edr_pt_cache_shutdown(); edr_pt_cache_init();
+  edr_behavior_clear_parent_context(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(!r->parent_name[0] && !r->parent_cmdline[0]);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+
+  /* Two proved references for the same child disagree. Do not silently take
+   * the cached name and the new record's command, and do not erase PPID. */
+  r->parent_process_start_key = 100u;
+  r->parent_process_creation_filetime_100ns = test_unix_ns_to_filetime(a);
+  strcpy(r->parent_resolution_source, "live_parent_generation");
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(r->ppid == parent_pid && r->parent_pid_state == EDR_PARENT_PID_KNOWN);
+  assert(!r->parent_process_start_key && !r->parent_name[0] && !r->parent_path[0] && !r->parent_cmdline[0]);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(!r->parent_name[0] && !r->parent_cmdline[0]);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_record_behavior(r);
+#if defined(EDR_HAVE_SQLITE)
+  char birth_text[32], tree[8192];
+  snprintf(birth_text, sizeof(birth_text), "%llu",
+           (unsigned long long)test_unix_ns_to_filetime(i));
+  sqlite_assert_process_parent_edge(db, r->endpoint_id, child_pid, "150", birth_text,
+                                    "parent_generation_conflict", "", "");
+  edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
+  edr_pt_cache_init();
+  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(edr_local_evidence_cache_process_tree_generation_json(
+      child_pid, r->endpoint_id, r->process_start_key,
+      r->process_creation_filetime_100ns, tree, sizeof(tree)) == 0);
+  assert(strstr(tree, "parent_generation_conflict") != NULL);
+  assert(strstr(tree, "I_SYNTHETIC_TEXT") == NULL);
+  edr_behavior_clear_parent_context(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(!r->parent_name[0] && !r->parent_path[0] && !r->parent_cmdline[0]);
+  edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(db);
+#else
+  edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
+#endif
+  free(r);
+}
+
 static void test_grandparent_cache_requires_verified_lifecycle_parent_edge(void) {
   const uint32_t grandparent_pid = 96310u;
   const uint32_t parent_pid = 96311u;
@@ -4969,6 +5090,9 @@ static void test_grandparent_cache_requires_verified_lifecycle_parent_edge(void)
              child_pid, parent_pid, "child.exe", "child",
              "C:\\Trusted\\child.exe", "parent-a.exe", child_birth,
              UINT64_C(0x96312), test_unix_ns_to_filetime(child_birth)) == 0);
+  /* The exact parent was checked alive after the immutable child birth. */
+  assert(edr_pt_cache_mark_alive_generation(parent_pid, UINT64_C(0x96311),
+      test_unix_ns_to_filetime(parent_birth), child_birth + 1u) == 0);
 
   init_record(child, EDR_EVENT_PROCESS_CREATE);
   child->pid = child_pid;
@@ -5033,9 +5157,9 @@ static void test_grandparent_cache_requires_verified_lifecycle_parent_edge(void)
 }
 
 /* Exact field values captured from WIN-FAC3AC1PS5O.  The child was first
- * bound to an older still-open generation of PID 3404; the real parent start
- * then arrived late, and a later observation of that same generation used to
- * move its birth beyond the child.  Repair must replace the whole edge, while
+ * saw an older still-open generation of PID 3404; it stays unbound until the
+ * real parent lifetime is verified. A later same-generation observation used
+ * to move its birth beyond the child. Repair binds the whole edge, while
  * a subsequent PID reuse must not move it again. */
 static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
   const uint32_t parent_pid = 3404u;
@@ -5103,11 +5227,11 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
   edr_local_evidence_cache_record_behavior(&child);
   assert(edr_local_evidence_cache_process_tree_json(
              child_pid, child.endpoint_id, tree, sizeof(tree)) == 0);
-  assert(strstr(tree, "11540474045138450") != NULL);
+  assert(strstr(tree, "11540474045138450") == NULL);
 #if defined(EDR_HAVE_SQLITE)
   sqlite_assert_process_parent_edge(
-      db, child.endpoint_id, child_pid, "11540474045138450",
-      "134337831008307727", "child_birth_parent_snapshot",
+      db, child.endpoint_id, child_pid, "",
+      "", "",
       "gspawn-win64-helper.exe",
       "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
   sparse=child;
@@ -5143,6 +5267,8 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
              "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe",
              "qemu-ga.exe", child_birth + 2000000000u, real_parent_key,
              real_parent_creation) == 0);
+  assert(edr_pt_cache_mark_alive_generation(parent_pid, real_parent_key,
+      real_parent_creation, child_birth + 2000000000u) == 0);
   init_record(&real_parent, EDR_EVENT_PROCESS_CREATE);
   real_parent.pid = parent_pid;
   real_parent.ppid = 3228u;
@@ -5165,14 +5291,14 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
     edr_local_evidence_cache_get_status(&status);
     assert(strstr(status.last_error,"durable child parent repair update failed"));
     sqlite_assert_process_parent_edge(db,child.endpoint_id,child_pid,
-        "11540474045138450","134337831008307727","child_birth_parent_snapshot",
+        "","","",
         "gspawn-win64-helper.exe","C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
     assert(sqlite3_open(db,&fault_db)==SQLITE_OK);
     assert(sqlite3_exec(fault_db,"DROP TRIGGER fail_parent_repair;",NULL,NULL,NULL)==SQLITE_OK);
     assert(sqlite3_close(fault_db)==SQLITE_OK);
     edr_local_evidence_cache_observe_process(&real_parent);
     sqlite_assert_process_parent_edge(db,child.endpoint_id,child_pid+1u,
-        "11540474045138506","134337835417985964","late_child_birth_parent_snapshot",
+        "11540474045138506","134337835417985964","verified_late_child_birth_parent_snapshot",
         "gspawn-win64-helper.exe","C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
   }
 #endif
@@ -5189,7 +5315,7 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
   edr_local_evidence_cache_close();
   sqlite_assert_process_parent_edge(
       db, child.endpoint_id, child_pid, "11540474045138506",
-      "134337835417985964", "late_child_birth_parent_snapshot",
+      "134337835417985964", "verified_late_child_birth_parent_snapshot",
       "gspawn-win64-helper.exe",
       "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
@@ -5272,7 +5398,7 @@ static void test_parent_edge_repairs_late_real_generation_at_child_birth(void) {
   edr_local_evidence_cache_close();
   sqlite_assert_process_parent_edge(
       db, child.endpoint_id, child_pid, "11540474045138506",
-      "134337835417985964", "late_child_birth_parent_snapshot",
+      "134337835417985964", "verified_child_birth_parent_snapshot",
       "gspawn-win64-helper.exe",
       "C:\\Program Files\\Qemu-ga\\gspawn-win64-helper.exe");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
@@ -8326,6 +8452,7 @@ int main(int argc, char **argv) {
   test_parent_only_nonprocess_record_does_not_create_process_slot();
   test_process_cache_preserves_full_facts_and_source_provenance();
   test_grandparent_cache_requires_verified_lifecycle_parent_edge();
+  test_parent_text_requires_proved_lifetime_and_survives_cache_eviction();
   test_parent_edge_repairs_late_real_generation_at_child_birth();
   test_rtq_signed_scope_and_legacy_aliases();
   test_file_sha256_query_uses_file_evidence_cache();

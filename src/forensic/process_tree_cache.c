@@ -33,6 +33,9 @@ typedef struct {
   uint64_t start_time_ns;
   uint64_t last_seen_ns;
   uint64_t exit_time_ns;
+  uint64_t verified_alive_until_ns;
+  uint8_t exit_time_observed;
+  uint8_t generation_conflict;
   char process_name[EDR_PTC_STR_SHORT];
   char cmdline_inline[PT_INLINE_CMDLINE_CAP];
   char exe_path_inline[PT_INLINE_PATH_CAP];
@@ -227,6 +230,25 @@ static int pt_creation_birth_unix_ns(uint64_t creation_filetime_100ns,
   return *out != 0u;
 }
 
+static void pt_flag_lifetime_conflicts_locked(size_t index) {
+  PTStoredEntry *entry = &g_pt_table[index].entry;
+  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+    PTStoredEntry *other = &g_pt_table[i].entry;
+    if (i == index || !g_pt_table[i].occupied || other->pid != entry->pid ||
+        !other->process_start_key || !other->creation_filetime_100ns)
+      continue;
+    PTStoredEntry *older = entry->start_time_ns < other->start_time_ns ? entry : other;
+    PTStoredEntry *newer = older == entry ? other : entry;
+    if ((other->process_start_key == entry->process_start_key) !=
+            (other->creation_filetime_100ns == entry->creation_filetime_100ns) ||
+        (older->start_time_ns < newer->start_time_ns &&
+         (older->verified_alive_until_ns > newer->start_time_ns ||
+          (older->exit_time_observed && older->exit_time_ns > newer->start_time_ns)))) {
+      other->generation_conflict = entry->generation_conflict = 1u;
+    }
+  }
+}
+
 /* Exact generations form non-overlapping PID-lifetime intervals.  This is
  * called only for a newly inserted generation: one scan finds its next birth,
  * and one scan closes older overlapping occupants at this birth. */
@@ -248,6 +270,7 @@ static void pt_bound_new_exact_interval_locked(size_t new_index) {
   if (next_birth != 0u &&
       (inserted->exit_time_ns == 0u || inserted->exit_time_ns > next_birth)) {
     inserted->exit_time_ns = next_birth;
+    inserted->exit_time_observed = 0u;
   }
   for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
     PTStoredEntry *older = &g_pt_table[i].entry;
@@ -260,6 +283,7 @@ static void pt_bound_new_exact_interval_locked(size_t new_index) {
     if (older->exit_time_ns == 0u ||
         older->exit_time_ns > inserted->start_time_ns) {
       older->exit_time_ns = inserted->start_time_ns;
+      older->exit_time_observed = 0u;
     }
   }
 }
@@ -412,8 +436,10 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
   if (e->parent_pid_state != EDR_PARENT_PID_CONFLICT && e->parent_pid_state != EDR_PARENT_PID_INVALID && parent_name && parent_name[0])
     snprintf(e->parent_name, sizeof(e->parent_name), "%s", parent_name);
   g_pt_table[target].occupied = true;
-  if (exact_generation && !was_occupied)
-    pt_bound_new_exact_interval_locked(target);
+  if (exact_generation) {
+    pt_flag_lifetime_conflicts_locked(target);
+    if (!was_occupied) pt_bound_new_exact_interval_locked(target);
+  }
   if (e->last_seen_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
     g_pt_oldest_ns = e->last_seen_ns;
   }
@@ -482,6 +508,26 @@ const ProcessTreeEntry *edr_pt_cache_get(uint32_t pid) {
   return edr_pt_cache_snapshot(pid, &snapshot) == 0 ? &snapshot : NULL;
 }
 
+static void pt_copy_snapshot(const PTStoredEntry *entry, ProcessTreeEntry *out) {
+  memset(out, 0, sizeof(*out));
+  out->pid = entry->pid;
+  out->ppid = entry->ppid;
+  out->parent_pid_state = entry->parent_pid_state;
+  out->process_start_key = entry->process_start_key;
+  out->creation_filetime_100ns = entry->creation_filetime_100ns;
+  out->start_time_ns = entry->start_time_ns;
+  out->last_seen_ns = entry->last_seen_ns;
+  out->exit_time_ns = entry->exit_time_ns;
+  out->verified_alive_until_ns = entry->verified_alive_until_ns;
+  out->exit_time_observed = entry->exit_time_observed;
+  out->generation_conflict = entry->generation_conflict;
+  snprintf(out->process_name, sizeof(out->process_name), "%s", entry->process_name);
+  snprintf(out->cmdline, sizeof(out->cmdline), "%s", pt_entry_cmdline(entry));
+  snprintf(out->exe_path, sizeof(out->exe_path), "%s", pt_entry_exe_path(entry));
+  snprintf(out->parent_name, sizeof(out->parent_name), "%s", entry->parent_name);
+  out->source_truncation_mask = entry->source_truncation_mask;
+}
+
 static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
                               uint64_t process_start_key,
                               bool validate_time, ProcessTreeEntry *out) {
@@ -502,20 +548,7 @@ static int pt_snapshot_locked(uint32_t pid, uint64_t event_time_ns,
     g_pt_metrics.snapshot_misses++;
     return -1;
   }
-  memset(out, 0, sizeof(*out));
-  out->pid = entry->pid;
-  out->ppid = entry->ppid;
-  out->parent_pid_state = entry->parent_pid_state;
-  out->process_start_key = entry->process_start_key;
-  out->creation_filetime_100ns = entry->creation_filetime_100ns;
-  out->start_time_ns = entry->start_time_ns;
-  out->last_seen_ns = entry->last_seen_ns;
-  out->exit_time_ns = entry->exit_time_ns;
-  snprintf(out->process_name, sizeof(out->process_name), "%s", entry->process_name);
-  snprintf(out->cmdline, sizeof(out->cmdline), "%s", pt_entry_cmdline(entry));
-  snprintf(out->exe_path, sizeof(out->exe_path), "%s", pt_entry_exe_path(entry));
-  snprintf(out->parent_name, sizeof(out->parent_name), "%s", entry->parent_name);
-  out->source_truncation_mask = entry->source_truncation_mask;
+  pt_copy_snapshot(entry, out);
   g_pt_metrics.snapshot_hits++;
   return 0;
 }
@@ -532,6 +565,74 @@ int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEn
   if (!out) return -1;
   pt_lock();
   int rc = pt_snapshot_locked(pid, event_time_ns, 0u, true, out);
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_snapshot_parent_at(uint32_t pid, uint64_t child_birth_ns,
+                                    ProcessTreeEntry *out) {
+  const PTStoredEntry *selected = NULL;
+  int had_pid = 0;
+  if (!out) return -1;
+  memset(out, 0, sizeof(*out));
+  if (!pid || !child_birth_ns) return -1;
+  pt_lock();
+  for (size_t i = 0u; i < PT_HT_CAPACITY && g_pt_initialized; ++i) {
+    const PTStoredEntry *entry = &g_pt_table[i].entry;
+    if (!g_pt_table[i].occupied || entry->pid != pid) continue;
+    had_pid = 1;
+    if (!entry->process_start_key || !entry->creation_filetime_100ns ||
+        entry->generation_conflict ||
+        !pt_entry_matches_event_time(entry, child_birth_ns, 0u) ||
+        (entry->verified_alive_until_ns < child_birth_ns &&
+         !(entry->exit_time_observed && entry->exit_time_ns >= child_birth_ns)))
+      continue;
+    if (selected) {
+      /* Two claimed lifetimes cannot both own the same parent PID at birth. */
+      selected = NULL;
+      had_pid = 1;
+      break;
+    }
+    selected = entry;
+  }
+  int rc = -1;
+  if (selected) {
+    /* Copy this exact tuple directly; never reselect by PID after unlocking. */
+    pt_copy_snapshot(selected, out);
+    g_pt_metrics.snapshot_hits++;
+    rc = 0;
+  } else if (had_pid) {
+    g_pt_metrics.snapshot_time_rejects++;
+    rc = -2;
+  } else {
+    g_pt_metrics.snapshot_misses++;
+  }
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_mark_alive_generation(uint32_t pid, uint64_t process_start_key,
+                                       uint64_t creation_filetime_100ns,
+                                       uint64_t verified_alive_until_ns) {
+  int rc = -1;
+  if (!pid || !process_start_key || !creation_filetime_100ns ||
+      !verified_alive_until_ns) return -1;
+  pt_lock();
+  for (size_t i = 0u; i < PT_HT_CAPACITY && g_pt_initialized; ++i) {
+    PTStoredEntry *entry = &g_pt_table[i].entry;
+    if (!g_pt_table[i].occupied || entry->pid != pid ||
+        !pt_generation_equal(entry, process_start_key, creation_filetime_100ns))
+      continue;
+    if (!entry->generation_conflict &&
+        verified_alive_until_ns >= entry->start_time_ns &&
+        (!entry->exit_time_ns || verified_alive_until_ns <= entry->exit_time_ns)) {
+      if (entry->verified_alive_until_ns < verified_alive_until_ns)
+        entry->verified_alive_until_ns = verified_alive_until_ns;
+      pt_flag_lifetime_conflicts_locked(i);
+      rc = entry->generation_conflict ? -2 : 0;
+    }
+    break;
+  }
   pt_unlock();
   return rc;
 }
@@ -557,6 +658,8 @@ int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns) {
     if (exit_time_ns == 0u) exit_time_ns = pt_wall_ns();
     if (entry->start_time_ns == 0u || exit_time_ns >= entry->start_time_ns) {
       entry->exit_time_ns = exit_time_ns;
+      /* A PID-only exit is not an exact parent-lifetime witness. */
+      entry->exit_time_observed = 0u;
       entry->last_seen_ns = exit_time_ns;
       g_pt_metrics.exits_marked++;
       rc = 0;
@@ -580,6 +683,8 @@ int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t process_start_key,
     if (exit_time_ns == 0u) exit_time_ns = pt_wall_ns();
     if (entry->start_time_ns == 0u || exit_time_ns >= entry->start_time_ns) {
       entry->exit_time_ns = exit_time_ns;
+      entry->exit_time_observed = 1u;
+      pt_flag_lifetime_conflicts_locked(i);
       entry->last_seen_ns = exit_time_ns;
       g_pt_metrics.exits_marked++;
       rc = 0;

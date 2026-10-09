@@ -2,12 +2,14 @@
 #include "edr/behavior_proto.h"
 #include "edr/behavior_proto_c.h"
 #include "edr/event_batch.h"
+#include "edr/process_generation.h"
 
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Single-threaded wire fixtures live outside the 1 MiB Windows stack.
@@ -402,6 +404,123 @@ static int verify_source_truncation_projection(uint8_t *wire, size_t wire_cap) {
   return 1;
 }
 
+
+/* Decode the actual encoder's wire copy. Local evidence remains unchanged,
+ * while explicit credentials are replaced only in new outbound parent text. */
+static int verify_parent_command_minimization(uint8_t *wire, size_t wire_cap) {
+  static const struct { const char *command; const char *preserved; } cases[] = {
+      {"parent.exe --password=SYNTHETIC_SECRET --safe keep", "--safe keep"},
+      {"parent.exe --token \"SYNTHETIC_SECRET with 空格\" --safe keep", "--safe keep"},
+      {"parent.exe --password 'SYNTHETIC_SECRET with ''quoted'' text' --safe keep", "--safe keep"},
+      {"parent.exe --password=\"SYNTHETIC_SECRET with `\"escaped`\" text\" --safe keep", "--safe keep"},
+      {"parent.exe --password 'SYNTHETIC_SECRET unfinished 空格", "--password '"},
+      {"parent.exe https://name:SYNTHETIC_SECRET@host.invalid/path?normal=keep", "@host.invalid/path?normal=keep"},
+      {"parent.exe 'https://host.invalid/path?k=SYNTHETIC_SAFE&access_token=SYNTHETIC_SECRET' --safe keep", "k=SYNTHETIC_SAFE"},
+      {"parent.exe https://host.invalid/?access%5Ftoken=SYNTHETIC_SECRET&normal=keep", "&normal=keep"},
+      {"parent.exe https://host.invalid/?API-Key=SYNTHETIC_SECRET#fragment", "#fragment"},
+      {"parent.exe --connection \"Server=db;Password='SYNTHETIC_SECRET with 空格';Database=keep\" --safe keep", "Database=keep\" --safe keep"},
+      {"parent.exe --connection \"Server=db;Database=keep;Token=SYNTHETIC_SECRET with 空格\" --safe keep", "\" --safe keep"},
+      {"parent.exe --password:SYNTHETIC_SECRET --safe keep", "--safe keep"},
+  };
+  static edr_v1_BehaviorEvent decoded;
+  EdrBehaviorRecord record, before;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    init_transport_record(&record);
+    strcpy(record.cmdline, "child.exe --ordinary");
+    strcpy(record.parent_name, "parent.exe");
+    strcpy(record.parent_path, "C:/Users/SYNTHETIC_USER/parent.exe");
+    snprintf(record.parent_cmdline, sizeof(record.parent_cmdline), "%s", cases[i].command);
+    if (i == 4u) { strcpy(record.source_completeness, "TRUNCATED"); strcpy(record.source_truncated_fields, "source.parent_cmdline"); }
+    before = record;
+    if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
+        !decoded.has_process_context || !decoded.process_context.has_parent_cmdline ||
+        strstr(decoded.process_context.parent_cmdline, "SYNTHETIC_SECRET") ||
+        !strchr(decoded.process_context.parent_cmdline, '*') ||
+        !strstr(decoded.process_context.parent_cmdline, cases[i].preserved) ||
+        strlen(decoded.process_context.parent_cmdline) != strlen(cases[i].command) ||
+        strcmp(decoded.process_context.parent_path, record.parent_path) ||
+        strcmp(decoded.cmdline, record.cmdline) ||
+        (decoded.which_detail == edr_v1_BehaviorEvent_process_tag &&
+         strstr(decoded.detail.process.parent_cmdline, "SYNTHETIC_SECRET")) ||
+        memcmp(&record, &before, sizeof(record))) {
+      fprintf(stderr, "parent command minimization failed case=%zu\n", i); return 0;
+    }
+    const size_t size = edr_behavior_record_encode_protobuf_full_facts(
+        &record, NULL, NULL, cases[i].command, wire, wire_cap);
+    memset(&decoded, 0, sizeof(decoded));
+    pb_istream_t input = pb_istream_from_buffer(wire, size);
+    if (!size || !pb_decode(&input, edr_v1_BehaviorEvent_fields, &decoded) ||
+        strcmp(decoded.process_context.parent_cmdline, cases[i].command) ||
+        memcmp(&record, &before, sizeof(record))) {
+      fprintf(stderr, "local parent command fact changed case=%zu\n", i); return 0;
+    }
+  }
+  static const char *ordinary[] = {
+      "parent.exe --quoted 'SYNTHETIC_SAFE_LITERAL with 空格' --safe keep",
+      "parent.exe https://host.invalid/?k=SYNTHETIC_SAFE&normal=keep",
+      "parent.exe --connection \"Server=db;Database=keep;Application=EDR\"",
+      "parent.exe --password --help --safe keep",
+  };
+  for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); ++i) {
+    init_transport_record(&record);
+    snprintf(record.parent_cmdline, sizeof(record.parent_cmdline), "%s", ordinary[i]);
+    if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
+        strcmp(decoded.process_context.parent_cmdline, ordinary[i])) {
+      fprintf(stderr, "ordinary parent parameter changed case=%zu\n", i); return 0;
+    }
+  }
+  return 1;
+}
+
+static int verify_complete_fact_truncation_provenance(uint8_t *wire, size_t wire_cap) {
+  static edr_v1_BehaviorEvent decoded;
+  EdrBehaviorRecord record;
+  const size_t sizes[] = {8192u, 8193u};
+  char *full = malloc(EDR_PROCESS_COMMAND_FACT_CAP + 1u);
+  if (!full) return 0;
+  for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+    size_t n = sizes[k];
+    memset(full, 'a', n); full[n] = 0;
+    /* UTF-8 spans the old 8191-byte preview boundary. */
+    memcpy(full + 8189u, "中", 3u);
+    for (int remaining = 0; remaining < 3; ++remaining) {
+      init_transport_record(&record);
+      memcpy(record.parent_cmdline, full, sizeof(record.parent_cmdline) - 1u);
+      record.parent_cmdline[sizeof(record.parent_cmdline) - 1u] = 0;
+      strcpy(record.source_completeness, "TRUNCATED");
+      strcpy(record.source_truncated_fields, remaining == 1 ? "source.parent_cmdline,source.file_path" : "source.parent_cmdline");
+      if (remaining == 2) memset(record.current_directory, 'b', sizeof(record.current_directory));
+      if (!encode_decode_record(&record, wire, wire_cap, &decoded) ||
+          !strstr(decoded.truncated_fields, "parent_cmdline")) { free(full); return 0; }
+      size_t size = edr_behavior_record_encode_protobuf_facts(&record, NULL, NULL, full, wire, wire_cap);
+      memset(&decoded, 0, sizeof(decoded));
+      pb_istream_t in = pb_istream_from_buffer(wire, size);
+      if (!size || !pb_decode(&in, edr_v1_BehaviorEvent_fields, &decoded) ||
+          strcmp(decoded.process_context.parent_cmdline, full) ||
+          strstr(decoded.truncated_fields, "parent_cmdline") ||
+          (remaining == 0 && (decoded.truncated_fields[0] || strcmp(decoded.source_completeness, "COALESCED") ||
+                            strcmp(decoded.transport_completeness, "COMPLETE"))) ||
+          (remaining == 1 && (!strstr(decoded.truncated_fields, "source.file_path") ||
+                            strcmp(decoded.source_completeness, "TRUNCATED") ||
+                            strcmp(decoded.transport_completeness, "COMPLETE"))) ||
+          (remaining == 2 && (!strstr(decoded.truncated_fields, "current_directory") ||
+                            strcmp(decoded.transport_completeness, "TRUNCATED")))) {
+        fprintf(stderr, "restored parent provenance failed size=%zu remaining=%d\n", n, remaining);
+        free(full); return 0;
+      }
+    }
+  }
+  init_transport_record(&record);
+  strcpy(record.source_completeness, "TRUNCATED"); strcpy(record.source_truncated_fields, "source.parent_cmdline");
+  memset(full, 'x', EDR_PROCESS_COMMAND_FACT_CAP); full[EDR_PROCESS_COMMAND_FACT_CAP] = 0;
+  if (edr_behavior_record_encode_protobuf_facts(&record, NULL, NULL, full, wire, wire_cap) != 0u ||
+      edr_behavior_record_encode_protobuf_facts(&record, NULL, full, NULL, wire, wire_cap) != 0u ||
+      strcmp(record.source_completeness, "TRUNCATED") || strcmp(record.source_truncated_fields, "source.parent_cmdline")) {
+    fprintf(stderr, "oversize caller fact falsely restored\n"); free(full); return 0;
+  }
+  free(full); return 1;
+}
+
 static void print_base64(const uint8_t *input, size_t input_len) {
   static const char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -661,6 +780,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "source truncation projection contract failed\n");
     return 10;
   }
+  if (!verify_parent_command_minimization(wire, sizeof(wire))) return 14;
+  if (!verify_complete_fact_truncation_provenance(wire, sizeof(wire))) return 15;
   if (emit_combined_frame) {
     print_base64(combined_wire, combined_wire_len);
     putchar('\n');

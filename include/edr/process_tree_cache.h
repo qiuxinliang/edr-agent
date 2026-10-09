@@ -39,6 +39,11 @@ typedef struct {
   uint64_t start_time_ns;
   uint64_t last_seen_ns;
   uint64_t exit_time_ns;
+  /* Parent-text ownership needs a lifetime witness, not an interval inferred
+   * from the next observed reuse of this PID. These values are local only. */
+  uint64_t verified_alive_until_ns;
+  uint8_t exit_time_observed;
+  uint8_t generation_conflict;
   char process_name[EDR_PTC_STR_SHORT];
   char cmdline[EDR_PTC_STR_LONG];
   char exe_path[EDR_PTC_STR_PATH];
@@ -107,6 +112,18 @@ int edr_pt_cache_snapshot(uint32_t pid, ProcessTreeEntry *out);
  * generation 或已超出退出宽限时返回 -2。
  */
 int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out);
+
+/* Select parent text only when an exact generation was observed alive at or
+ * after the child's birth, or its exact exit proves that it still existed.
+ * Inferred PID intervals and contradictory tuples are never proof. */
+int edr_pt_cache_snapshot_parent_at(uint32_t pid, uint64_t child_birth_ns,
+                                    ProcessTreeEntry *out);
+
+/* Called only after the same native handle proves this exact tuple alive.
+ * Ordinary cache metadata observations must not call this function. */
+int edr_pt_cache_mark_alive_generation(uint32_t pid, uint64_t process_start_key,
+                                       uint64_t creation_filetime_100ns,
+                                       uint64_t verified_alive_until_ns);
 
 /* Select an already retained actor by its captured StartKey AND event-time
  * lifetime. Unlike PID/time-only inference, exact-key evidence does not expire
