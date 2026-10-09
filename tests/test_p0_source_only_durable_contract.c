@@ -303,11 +303,6 @@ void edr_preprocess_copy_agent_ids(char *endpoint_id, size_t endpoint_cap,
   if (tenant_id && tenant_cap) tenant_id[0] = '\0';
 }
 
-int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out) {
-  (void)pid; (void)event_time_ns; (void)out;
-  return -1;
-}
-
 void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t pid,
                                    uint32_t parent_pid, const char *process_name) {
   (void)severity; (void)rule_id; (void)pid; (void)parent_pid; (void)process_name;
@@ -1315,6 +1310,7 @@ int main(int argc, char **argv) {
       argc == 2 && strcmp(argv[1], "--emit-terminal-authority-durable-fixture") == 0;
   if (argc > 1 && !emit_contract && !emit_fixture && !emit_terminal_golden &&
       !emit_terminal_fixture) return 2;
+  edr_pt_cache_init();
   edr_p0_rule_ir_lazy_init();
   {
     const char *loaded_sha256 = NULL;
@@ -1360,5 +1356,6 @@ int main(int argc, char **argv) {
   if (emit_fixture) print_durable_fixture();
   if (emit_terminal_golden) print_terminal_authority_golden();
   if (emit_terminal_fixture) print_terminal_durable_fixture();
+  edr_pt_cache_shutdown();
   return 0;
 }
