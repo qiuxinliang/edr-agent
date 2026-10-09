@@ -421,6 +421,15 @@ static int verify_parent_command_minimization(uint8_t *wire, size_t wire_cap) {
       {"parent.exe --connection \"Server=db;Password='SYNTHETIC_SECRET with 空格';Database=keep\" --safe keep", "Database=keep\" --safe keep"},
       {"parent.exe --connection \"Server=db;Database=keep;Token=SYNTHETIC_SECRET with 空格\" --safe keep", "\" --safe keep"},
       {"parent.exe --password:SYNTHETIC_SECRET --safe keep", "--safe keep"},
+      {"parent.exe \"--password\" \"SYNTHETIC_SECRET\" \"--token\" \"SYNTHETIC_SECRET\" --safe keep", "--safe keep"},
+      {"parent.exe '--token' 'SYNTHETIC_SECRET with 空格' --safe keep", "--safe keep"},
+      {"parent.exe \"--password\"=SYNTHETIC_SECRET --safe keep", "--safe keep"},
+      {"parent.exe '--token':\"SYNTHETIC_SECRET\" --safe keep", "--safe keep"},
+      {"parent.exe -Command 'tool \"--password\" \"SYNTHETIC_SECRET\" --safe keep' --outer keep", "--safe keep' --outer keep"},
+      {"parent.exe -Command \"tool '--token' 'SYNTHETIC_SECRET' --safe keep\" --outer keep", "--safe keep\" --outer keep"},
+      {"parent.exe \"--token\" \"SYNTHETIC_SECRET unfinished 空格", "\"--token\" \""},
+      {"parent.exe \"--password\" \"-SYNTHETIC_SECRET\" --safe keep", "--safe keep"},
+      {"parent.exe \"--token\" \"--SYNTHETIC_SECRET\" --safe keep", "--safe keep"},
   };
   static edr_v1_BehaviorEvent decoded;
   EdrBehaviorRecord record, before;
@@ -460,6 +469,10 @@ static int verify_parent_command_minimization(uint8_t *wire, size_t wire_cap) {
       "parent.exe https://host.invalid/?k=SYNTHETIC_SAFE&normal=keep",
       "parent.exe --connection \"Server=db;Database=keep;Application=EDR\"",
       "parent.exe --password --help --safe keep",
+      "parent.exe \"--password\" --help --safe keep",
+      "parent.exe '--token'",
+      "parent.exe \"--password-format\" \"SYNTHETIC_SAFE_LITERAL\" --safe keep",
+      "parent.exe \"--safe-note\" \"SYNTHETIC_SAFE_LITERAL with 空格\"",
   };
   for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); ++i) {
     init_transport_record(&record);
