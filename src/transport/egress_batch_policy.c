@@ -649,9 +649,21 @@ static int parent_pid_fields_valid(const edr_v1_BehaviorEvent *ev) {
   if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION)
     return !ev->has_parent_pid_state;
   if (!ev->has_parent_pid_state) return 0;
+  /* A purpose authorizes available evidence; it is not a detection predicate.
+   * An unavailable/conflicting edge may carry diagnostics, never borrowed
+   * parent text or ancestry. This v3 check does not alter frozen v2 fields. */
   if (ev->parent_pid_state != EDR_PARENT_PID_KNOWN &&
-      (ev->required_evidence_fields & (EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH |
-       EDR_EVIDENCE_PARENT_COMMAND | EDR_EVIDENCE_CHAIN_DEPTH))) return 0;
+      (ev->parent_name[0] || ev->parent_path[0] || ev->process_chain_depth ||
+       ev->process_context.has_parent_name || ev->process_context.parent_name[0] ||
+       ev->process_context.has_parent_path || ev->process_context.parent_path[0] ||
+       ev->process_context.has_parent_cmdline || ev->process_context.parent_cmdline[0] ||
+       ev->process_context.has_grandparent_pid || ev->process_context.grandparent_pid ||
+       ev->process_context.has_grandparent_name || ev->process_context.grandparent_name[0] ||
+       ev->process_context.has_grandparent_path || ev->process_context.grandparent_path[0] ||
+       (ev->which_detail == edr_v1_BehaviorEvent_process_tag &&
+        (ev->detail.process.parent_name[0] || ev->detail.process.parent_path[0] ||
+         ev->detail.process.parent_cmdline[0] || ev->detail.process.grandparent_pid ||
+         ev->detail.process.grandparent_name[0] || ev->detail.process.grandparent_path[0])))) return 0;
   switch (ev->parent_pid_state) {
     case EDR_PARENT_PID_KNOWN: return ev->ppid != 0;
     case EDR_PARENT_PID_UNKNOWN:
@@ -688,9 +700,13 @@ static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   c->has_grandparent_name=false;c->grandparent_name[0]=0;
   c->has_grandparent_path=false;c->grandparent_path[0]=0;
   if (!(mask & (EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_CHAIN_DEPTH))) {
-    if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION)
+    if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION) {
       ev->ppid=0;
-    ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+      ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+    }
+    /* v3 collection diagnostics are independent of optional parent text.
+     * Preserve only captured values; absence and invalid/conflicting parent
+     * states never acquire a creation identity or a successful resolution. */
   }
   int keep=(ev->which_detail==edr_v1_BehaviorEvent_file_tag && (mask&EDR_EVIDENCE_FILE)) ||
     (ev->which_detail==edr_v1_BehaviorEvent_network_tag && (mask&EDR_EVIDENCE_NETWORK)) ||

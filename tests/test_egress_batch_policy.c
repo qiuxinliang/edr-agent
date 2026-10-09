@@ -373,6 +373,7 @@ static int synthetic_projection_owner(const char *rule,const char *bundle,uint64
     !strcmp(operation,"{\"kind\":\"credential_tool_attempt\"}");
   if (operation[0]) return 0;
   if (!strcmp(rule,"synthetic-network")) return mask==EDR_EVIDENCE_NETWORK;
+  if (!strcmp(rule,"synthetic-parent")) return mask==(EDR_EVIDENCE_NETWORK|EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND);
   if (!strcmp(rule,"synthetic-user")) return mask==EDR_EVIDENCE_USER;
   return !strcmp(rule,"synthetic-rule") &&
     mask==(EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_NETWORK);
@@ -686,7 +687,7 @@ static void parent_relation_projection(void) {
  ev->has_parent_pid_state=true;ev->parent_pid_state=EDR_PARENT_PID_UNKNOWN;bad=immutable_encode(ev,local);
  assert(!edr_egress_frame_validate(local,bad,why,sizeof(why)));free(ev);free(facts);
  printf("parent relation local_full=%zu projected_v3=%zu ppid=4242\n",full,n);
- r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+ r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;edr_behavior_clear_parent_context(r);
  n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);ev=decode_frame(wire,n);
  assert(ev->ppid==0&&ev->has_parent_pid_state&&ev->parent_pid_state==EDR_PARENT_PID_EXPLICIT_ZERO);
  assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));free(ev);
@@ -695,9 +696,11 @@ static void parent_relation_projection(void) {
  assert(ev->ppid==4242&&ev->parent_pid_state==EDR_PARENT_PID_CONFLICT);
  assert(edr_egress_frame_validate(wire,n,why,sizeof(why)));free(ev);
  r->required_evidence_fields|=EDR_EVIDENCE_PARENT_NAME;
+ assert(edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
+ strcpy(r->parent_name,"unbound-parent.exe");
  assert(!edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
- r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_UNKNOWN;
- assert(!edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
+ edr_behavior_clear_parent_context(r);r->ppid=0;r->parent_pid_state=EDR_PARENT_PID_UNKNOWN;
+ assert(edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
  r->ppid=4242;
  r->required_evidence_fields=EDR_EVIDENCE_NETWORK;r->parent_pid_state=EDR_PARENT_PID_KNOWN;
  r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_LEGACY_VERSION;
@@ -707,6 +710,76 @@ static void parent_relation_projection(void) {
  assert(!memcmp(local,wire,n)); /* Validation never edits a frozen v2 body. */
  printf("parent relation legacy_v2=%zu ppid=0 frozen_bytes_unchanged=1\n",n);
  free(ev);free(r);free(wire);free(local);
+}
+
+static void unavailable_parent_purpose(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&wire);
+ for(unsigned state=0;state<=EDR_PARENT_PID_CONFLICT;state++) if(state!=EDR_PARENT_PID_KNOWN) for(int purpose=0;purpose<2;purpose++) {
+  make_record(r);r->parent_pid_state=(uint8_t)state;r->ppid=state==EDR_PARENT_PID_CONFLICT?21:0;
+  edr_behavior_clear_parent_context(r);r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+  if(purpose)r->required_evidence_fields|=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+  strcpy(r->parent_resolution_status,"NOT_EVALUABLE");strcpy(r->parent_resolution_source,"generation_unavailable");
+  make_alert(&a,r);cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+  cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString(purpose?"synthetic-parent":"synthetic-network"));
+  overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+  assert(edr_egress_frame_validate(wire,n,NULL,0));
+  edr_v1_BehaviorEvent *ev=decode_frame(wire,n);
+  strcpy(ev->parent_name,"unbound-parent.exe");n=immutable_encode(ev,wire);
+  assert(!edr_egress_frame_validate(wire,n,NULL,0));free(ev);
+  for(unsigned field=0;field<4;field++) {
+   if(field==0)strcpy(r->parent_name,"unbound-parent.exe");
+   if(field==1)strcpy(r->parent_path,"C:\\unbound-parent.exe");
+   if(field==2)strcpy(r->parent_cmdline,"unbound-parent.exe --untrusted");
+   if(field==3)r->process_chain_depth=2;
+   assert(!edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX));
+   edr_behavior_clear_parent_context(r);
+  }
+ }
+ free(r);free(wire);
+ puts("v3 optional parent purpose: unavailable edges emit without borrowed text; raw and producer violations reject");
+}
+
+static void parent_resolution_diagnostics(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*frozen=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&wire&&frozen);
+ for(unsigned version=2;version<=3;version++) for(unsigned state=0;state<=EDR_PARENT_PID_CONFLICT;state++) {
+  make_record(r);r->evidence_projection_version=version;r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+  r->parent_pid_state=(uint8_t)state;r->ppid=(state==EDR_PARENT_PID_KNOWN||state==EDR_PARENT_PID_CONFLICT)?21:0;
+  if(state!=EDR_PARENT_PID_KNOWN) edr_behavior_clear_parent_context(r);
+  strcpy(r->parent_resolution_status,"NOT_EVALUABLE");
+  strcpy(r->parent_resolution_source,"generation_unavailable");
+  make_alert(&a,r);cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+  cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString("synthetic-network"));
+  overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+  size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+  edr_v1_BehaviorEvent *ev=decode_frame(wire,n);
+  assert(!ev->parent_name[0]&&!ev->parent_path[0]&&!ev->process_context.has_parent_cmdline);
+  assert(!strcmp(ev->parent_resolution_status,version==3?"NOT_EVALUABLE":""));
+  assert(!strcmp(ev->parent_resolution_source,version==3?"generation_unavailable":""));
+  assert(!ev->parent_creation_time[0]); /* Never invent a creation value. */
+  memcpy(frozen,wire,n);assert(edr_egress_frame_validate(wire,n,NULL,0));assert(!memcmp(frozen,wire,n));free(ev);
+  r->parent_resolution_status[0]=r->parent_resolution_source[0]=0;
+  n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+  ev=decode_frame(wire,n);assert(!ev->parent_resolution_status[0]&&!ev->parent_resolution_source[0]);free(ev);
+ }
+ make_record(r);r->required_evidence_fields=EDR_EVIDENCE_NETWORK;
+ strcpy(r->parent_resolution_status,"RESOLVED");strcpy(r->parent_resolution_source,"live_parent_generation");
+ strcpy(r->parent_creation_time,"2026-10-09T08:00:08.063129700Z");
+ make_alert(&a,r);cJSON *subject=cJSON_Parse(a.user_subject_json);assert(subject);
+ cJSON_ReplaceItemInObjectCaseSensitive(subject,"rule_id",cJSON_CreateString("synthetic-network"));
+ overwrite_json(a.user_subject_json,sizeof(a.user_subject_json),subject);cJSON_Delete(subject);
+ size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+ edr_v1_BehaviorEvent *ev=decode_frame(wire,n);assert(!strcmp(ev->parent_creation_time,r->parent_creation_time));
+ assert(!strcmp(ev->parent_resolution_status,"RESOLVED")&&!ev->process_context.has_parent_cmdline);
+ assert(edr_egress_frame_validate(wire,n,NULL,0));free(ev);
+ r->evidence_projection_version=2;n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+ memcpy(frozen,wire,n);r->parent_resolution_status[0]=r->parent_resolution_source[0]=r->parent_creation_time[0]=0;
+ size_t legacy=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);
+ assert(n==legacy&&!memcmp(frozen,wire,n)); /* Frozen v2 commitment remains byte-identical. */
+ free(r);free(wire);free(frozen);
+ puts("parent collection diagnostics: v3 preserves captured values without text purpose; v2 bytes unchanged");
 }
 
 /* Shared v3 contract: top-level is canonical, alias is optional but exact
@@ -740,5 +813,5 @@ static void engine_parent_alias_contract(void) {
  free(ev);free(wire);free(r);
 }
 
-int main(void) { engine_parent_alias_contract(); edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); parent_relation_projection(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+int main(void) { engine_parent_alias_contract(); edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); parent_relation_projection(); unavailable_parent_purpose(); parent_resolution_diagnostics(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }

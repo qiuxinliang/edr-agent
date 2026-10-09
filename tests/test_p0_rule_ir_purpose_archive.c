@@ -125,6 +125,36 @@ static void cookie_purpose_contract(const char *base,const unsigned char *plain,
  }
  puts("IR7 Cookie predicate: old active package refused; renamed historical purpose held; safe sibling and original archive survive restart");
 }
+static void parent_purpose_contract(const char *base,const unsigned char *plain,size_t size) {
+ const uint64_t actor=EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND;
+ const uint64_t parent=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+ for(unsigned schema=7;schema<=8;schema++) {
+  cJSON *j=cJSON_ParseWithLength((const char*)plain,size),*rule=NULL,*item;assert(j);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"ir_schema_version"),schema);
+  cJSON_ArrayForEach(item,cJSON_GetObjectItemCaseSensitive(j,"rules"))
+   if(!strcmp(cJSON_GetObjectItemCaseSensitive(item,"id")->valuestring,"R-EXEC-001"))rule=item;
+  assert(rule);cJSON *condition=cJSON_GetObjectItemCaseSensitive(rule,"condition");
+  cJSON_DeleteItemFromObjectCaseSensitive(condition,"evidence_purposes");
+  cJSON *purposes=cJSON_AddArrayToObject(condition,"evidence_purposes");assert(purposes);
+  assert(cJSON_AddItemToArray(purposes,cJSON_CreateString("actor_attribution")));
+  if(schema==8)assert(cJSON_AddItemToArray(purposes,cJSON_CreateString("parent_context")));
+  char *json=cJSON_PrintUnformatted(j),sha[65],archive[400];unsigned char *encrypted=NULL;size_t encrypted_size=0;assert(json);
+  assert(edr_sha256_hex((const uint8_t*)json,strlen(json),sha)==0);
+  assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)json,strlen(json),&encrypted,&encrypted_size)==0);
+  snprintf(archive,sizeof(archive),"%s.purpose-%s.edr1",base,sha);save(archive,encrypted,encrypted_size);
+  assert(edr_p0_rule_ir_validate_candidate_path(archive));
+  uint64_t expected=actor|(schema==8?parent:0);
+  for(int restart=0;restart<2;restart++) {
+   assert(edr_p0_rule_ir_projection_matches("R-EXEC-001",sha,expected,"")==1);
+   assert(edr_p0_rule_ir_projection_matches("R-EXEC-001",sha,expected^parent,"")==0);
+   edr_p0_rule_ir_shutdown();edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  }
+  size_t after_size;unsigned char *after=read_bytes(archive,&after_size);
+  assert(after_size==encrypted_size&&!memcmp(after,encrypted,after_size));
+  free(after);free(encrypted);cJSON_free(json);cJSON_Delete(j);
+ }
+ puts("IR7 and IR8 parent purpose archives: exact independent masks and frozen bytes survive restart");
+}
 int main(void){
  static const struct {const char *id;unsigned schema;int retired;const char *rule;} corpus[]={
 #include "../src/preprocess/p0_retired_purpose_vectors.inc"
@@ -148,6 +178,7 @@ int main(void){
  EdrBehaviorRecord br;edr_behavior_record_init(&br);br.type=EDR_EVENT_PROCESS_CREATE;strcpy(br.process_name,"procdump.exe");strcpy(br.cmdline,"procdump.exe -ma lsass C:\\Temp\\lsass.dmp");
  EdrP0RuleIrEvaluation eval;assert(edr_p0_rule_ir_evaluate_record(&br,NULL,&eval));assert(eval.match_count);EdrP0RuleIrMatch match;assert(edr_p0_rule_ir_evaluation_get_match(&eval,0,&match));char sha[65];strcpy(sha,eval.binding.artifact_sha256);edr_p0_rule_ir_evaluation_free(&eval);
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));
+ parent_purpose_contract(base,plain,plain_size);
  legacy_purpose_contract(base,plain,plain_size,&match);
  dump_purpose_contract(base,plain,plain_size,&match);
  cookie_purpose_contract(base,plain,plain_size,&match);

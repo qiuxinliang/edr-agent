@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
-  "ir_schema_version": 7,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-dc60879e",
+  "ir_schema_version": 8,
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-1802f979",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 182,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "777ecde8404e880e16bfdc57f4ab90acab9d3f6393eafa71fbea063422c6e022",
+  "sensor_interest_manifest_sha256": "658d2f112b469c9cb9fcf0daa06ba972f9924b67e23eb8ea1a330fcb51f9bae3",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -29,7 +29,8 @@
           "pwsh.exe"
         ],
         "evidence_purposes": [
-          "actor_attribution"
+          "actor_attribution",
+          "parent_context"
         ]
       }
     },
