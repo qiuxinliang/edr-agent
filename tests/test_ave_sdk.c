@@ -7,6 +7,9 @@
 #include "edr/preprocess.h"
 #include "edr/behavior_proto.h"
 #include "edr/egress_batch_policy.h"
+#include "ave_behavior_pipeline.h"
+#include "edr/v1/event.pb.h"
+#include <pb_decode.h>
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -24,6 +27,101 @@ static void pause_ms(void) { struct timespec d = {0, 1000000L}; nanosleep(&d, NU
 
 static atomic_int s_block_callback;
 static atomic_uint s_callbacks;
+static atomic_uint s_parent_callbacks;
+static atomic_uint s_generation_callbacks;
+
+static void AVE_CALL on_generation_behavior(const AVEBehaviorAlert *alert, void *unused) {
+  (void)unused;
+  EdrAveProcessIdentity capture;
+  assert(alert->pid==7000u&&edr_behavior_alert_process_identity(alert,&capture)==1);
+  unsigned index=atomic_fetch_add(&s_generation_callbacks,1u);
+  assert(index<2u&&capture.process_start_key==(index?222u:111u));
+  assert(capture.parent_pid==(index?0u:299u));
+  assert(capture.parent_pid_state==(index?EDR_PARENT_PID_UNKNOWN:EDR_PARENT_PID_KNOWN));
+}
+
+static void test_captured_generation_reuse(void) {
+  AVECallbacks callbacks={0};callbacks.on_behavior_alert=on_generation_behavior;
+  assert(AVE_RegisterCallbacks(&callbacks)==AVE_OK&&AVE_StartBehaviorMonitor()==AVE_OK);
+  AVEBehaviorEvent event={0};EdrAveProcessIdentity capture={0};
+  capture.pid=event.pid=7000u;event.timestamp_ns=1700000000000000000LL;
+  event.event_type=AVE_EVT_FILE_WRITE;event.behavior_flags=UINT32_MAX;
+  capture.parent_pid=299;capture.parent_pid_state=EDR_PARENT_PID_KNOWN;
+  capture.process_start_key=111;capture.process_creation_filetime_100ns=133444736000000000ULL;
+  strcpy(capture.source_event_id,"synthetic-generation-first");
+  assert(edr_ave_feed_event_captured(&event,&capture)==AVE_OK);
+  event.timestamp_ns+=1000;event.behavior_flags=0;
+  capture.parent_pid=0;capture.parent_pid_state=EDR_PARENT_PID_UNKNOWN;
+  capture.process_start_key=222;capture.process_creation_filetime_100ns++;
+  strcpy(capture.source_event_id,"synthetic-generation-reused");
+  assert(edr_ave_feed_event_captured(&event,&capture)==AVE_OK);
+  event.timestamp_ns++;event.behavior_flags=UINT32_MAX;
+  assert(edr_ave_feed_event_captured(&event,&capture)==AVE_OK);
+  assert(AVE_DrainBehaviorMonitor(10000u)==AVE_OK&&atomic_load(&s_generation_callbacks)==2u);
+  puts("captured PID reuse: new exact lifetime reset, parent not inherited, attack detection retained");
+}
+
+static void AVE_CALL on_parent_behavior(const AVEBehaviorAlert *alert, void *unused) {
+  (void)unused;
+  assert(alert->pid >= 6000u && alert->pid <= 6005u);
+  unsigned state = alert->pid - 6000u;
+  if (state == 5u) state = EDR_PARENT_PID_CONFLICT;
+  uint32_t parent = (state == EDR_PARENT_PID_KNOWN || alert->pid == 6004u) ? 299u : 0u;
+  EdrAveProcessIdentity captured;
+  assert(edr_behavior_alert_process_identity(alert, &captured) == 1);
+  assert(captured.parent_pid == parent && captured.parent_pid_state == state);
+  assert(captured.process_start_key == 991122u + alert->pid);
+  assert(captured.process_creation_filetime_100ns == 133444736000000000ULL);
+  assert(strncmp(captured.source_event_id, "synthetic-parent-", 17u) == 0);
+  uint8_t *frame = malloc(EDR_EGRESS_FRAME_MAX);
+  edr_v1_BehaviorEvent *wire = calloc(1u, sizeof(*wire));
+  assert(frame && wire);
+  size_t n = edr_behavior_alert_encode_protobuf(alert, "synthetic-endpoint", "synthetic-tenant",
+                                               frame, EDR_EGRESS_FRAME_MAX);
+  assert(n);
+  pb_istream_t stream = pb_istream_from_buffer(frame, n);
+  assert(pb_decode(&stream, edr_v1_BehaviorEvent_fields, wire));
+  assert(wire->ppid == parent && wire->has_parent_pid_state && wire->parent_pid_state == state);
+  assert(wire->process_start_key == captured.process_start_key);
+  assert(wire->process_creation_filetime_100ns == captured.process_creation_filetime_100ns);
+  assert(strstr(wire->behavior_alert.user_subject_json, "captured_process") == NULL);
+  assert(strstr(wire->behavior_alert.user_subject_json, "synthetic-parent-") == NULL);
+  cJSON *subject = cJSON_Parse(wire->behavior_alert.user_subject_json);
+  const cJSON *ctx = cJSON_GetObjectItemCaseSensitive(subject, "detection_context");
+  const cJSON *process = cJSON_GetObjectItemCaseSensitive(ctx, "process");
+  assert(cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(process, "parent_pid")) == parent);
+  assert(edr_egress_frame_validate(frame, n, NULL, 0));
+  cJSON_Delete(subject); free(wire); free(frame);
+  atomic_fetch_add(&s_parent_callbacks, 1u);
+}
+
+static void test_captured_parent_states_through_real_pipeline(void) {
+  AVECallbacks callbacks = {0};
+  callbacks.on_behavior_alert = on_parent_behavior;
+  assert(AVE_RegisterCallbacks(&callbacks) == AVE_OK);
+  assert(AVE_StartBehaviorMonitor() == AVE_OK);
+  for (unsigned value = 0; value < 6u; ++value) {
+    AVEBehaviorEvent event = {0};
+    EdrAveProcessIdentity capture = {0};
+    capture.pid = event.pid = 6000u + value;
+    capture.parent_pid_state = value == 5u ? EDR_PARENT_PID_CONFLICT : (uint8_t)value;
+    capture.parent_pid = (value == 1u || value == 4u) ? 299u : 0u;
+    capture.process_start_key = 991122u + event.pid;
+    capture.process_creation_filetime_100ns = 133444736000000000ULL;
+    snprintf(capture.source_event_id, sizeof(capture.source_event_id), "synthetic-parent-%u", event.pid);
+    event.ppid = capture.parent_pid;
+    event.event_type = AVE_EVT_LSASS_ACCESS;
+    event.timestamp_ns = 1700000000000000000LL;
+    event.behavior_flags = UINT32_MAX; /* Synthetic detector facts; never execute a command. */
+    snprintf(event.process_name, sizeof(event.process_name), "synthetic.exe");
+    assert(edr_ave_feed_event_captured(&event, &capture) == AVE_OK);
+    memset(&event, 0xff, sizeof(event));
+    memset(&capture, 0xff, sizeof(capture)); /* The queue must own both copies. */
+  }
+  assert(AVE_DrainBehaviorMonitor(10000u) == AVE_OK);
+  assert(atomic_load(&s_parent_callbacks) == 6u);
+  puts("captured AVE parent states: real feed/queue/detector/callback/codec/gate passed");
+}
 static void AVE_CALL on_behavior(const AVEBehaviorAlert *alert, void *user_data) {
   (void)user_data;
   assert(alert->pid >= 5000u && alert->pid <= 5020u);
@@ -220,6 +318,12 @@ int main(int argc, char **argv) {
   }
 
   test_behavior_drain();
+  AVE_Shutdown();
+  assert(AVE_Init(&cfg) == AVE_OK);
+  test_captured_parent_states_through_real_pipeline();
+  AVE_Shutdown();
+  assert(AVE_Init(&cfg) == AVE_OK);
+  test_captured_generation_reuse();
   AVE_Shutdown();
   assert(AVE_Init(&cfg) == AVE_OK);
   test_normal_observation_windows();

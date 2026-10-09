@@ -451,7 +451,7 @@ static int engine_alert(const edr_v1_BehaviorEvent *ev, const cJSON *subject) {
   if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && parent &&
       (!cJSON_IsNumber(parent) || parent->valuedouble < 0 || parent->valuedouble > UINT32_MAX ||
        floor(parent->valuedouble) != parent->valuedouble ||
-       (parent->valuedouble > 0 && ev->ppid && parent->valuedouble != ev->ppid))) return 0;
+        parent->valuedouble != ev->ppid)) return 0;
   const char *engine = string(ctx, "engine"), *rule = string(ctx, "rule_id");
   const cJSON *threshold=cJSON_GetObjectItemCaseSensitive(basis,"threshold");
   const cJSON *flags=cJSON_GetObjectItemCaseSensitive(basis,"behavior_flags");

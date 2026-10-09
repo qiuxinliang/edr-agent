@@ -9,7 +9,7 @@
 
 typedef struct {
   atomic_uintptr_t sequence;
-  AVEBehaviorEvent data;
+  EdrAveQueuedEvent data;
 } AveMpmcCell;
 
 struct AveMpmcQueue {
@@ -50,7 +50,7 @@ void ave_mpmc_destroy(AveMpmcQueue *q) {
   free(q);
 }
 
-int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
+int ave_mpmc_try_push(AveMpmcQueue *q, const EdrAveQueuedEvent *e) {
   if (!q || !e) {
     return -1;
   }
@@ -75,7 +75,7 @@ int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
   }
 }
 
-int ave_mpmc_try_pop(AveMpmcQueue *q, AVEBehaviorEvent *out) {
+int ave_mpmc_try_pop(AveMpmcQueue *q, EdrAveQueuedEvent *out) {
   if (!q || !out) {
     return -1;
   }
@@ -117,7 +117,7 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
 #include <windows.h>
 
 struct AveMpmcQueue {
-  AVEBehaviorEvent *buf;
+  EdrAveQueuedEvent *buf;
   size_t cap;
   size_t head;
   size_t count;
@@ -133,7 +133,7 @@ int ave_mpmc_init(AveMpmcQueue **out_q, size_t capacity) {
   if (!q) {
     return -1;
   }
-  q->buf = (AVEBehaviorEvent *)calloc(capacity, sizeof(AVEBehaviorEvent));
+  q->buf = (EdrAveQueuedEvent *)calloc(capacity, sizeof(EdrAveQueuedEvent));
   if (!q->buf) {
     free(q);
     return -1;
@@ -156,11 +156,12 @@ void ave_mpmc_destroy(AveMpmcQueue *q) {
   free(q);
 }
 
-int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
+int ave_mpmc_try_push(AveMpmcQueue *q, const EdrAveQueuedEvent *e) {
+  if (!q || !e) return -1;
   EnterCriticalSection(&q->mu);
   if (q->count >= q->cap) {
-    q->head = (q->head + 1u) % q->cap;
-    q->count--;
+    LeaveCriticalSection(&q->mu);
+    return -1;
   }
   size_t idx = (q->head + q->count) % q->cap;
   memcpy(&q->buf[idx], e, sizeof(*e));
@@ -169,7 +170,8 @@ int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
   return 0;
 }
 
-int ave_mpmc_try_pop(AveMpmcQueue *q, AVEBehaviorEvent *out) {
+int ave_mpmc_try_pop(AveMpmcQueue *q, EdrAveQueuedEvent *out) {
+  if (!q || !out) return -1;
   EnterCriticalSection(&q->mu);
   if (q->count == 0u) {
     LeaveCriticalSection(&q->mu);
@@ -198,7 +200,7 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
 #include <pthread.h>
 
 struct AveMpmcQueue {
-  AVEBehaviorEvent *buf;
+  EdrAveQueuedEvent *buf;
   size_t cap;
   size_t head;
   size_t count;
@@ -213,7 +215,7 @@ int ave_mpmc_init(AveMpmcQueue **out_q, size_t capacity) {
   if (!q) {
     return -1;
   }
-  q->buf = (AVEBehaviorEvent *)calloc(capacity, sizeof(AVEBehaviorEvent));
+  q->buf = (EdrAveQueuedEvent *)calloc(capacity, sizeof(EdrAveQueuedEvent));
   if (!q->buf) {
     free(q);
     return -1;
@@ -237,11 +239,12 @@ void ave_mpmc_destroy(AveMpmcQueue *q) {
   free(q);
 }
 
-int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
+int ave_mpmc_try_push(AveMpmcQueue *q, const EdrAveQueuedEvent *e) {
+  if (!q || !e) return -1;
   pthread_mutex_lock(&q->mu);
   if (q->count >= q->cap) {
-    q->head = (q->head + 1u) % q->cap;
-    q->count--;
+    pthread_mutex_unlock(&q->mu);
+    return -1;
   }
   size_t idx = (q->head + q->count) % q->cap;
   memcpy(&q->buf[idx], e, sizeof(*e));
@@ -250,7 +253,8 @@ int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e) {
   return 0;
 }
 
-int ave_mpmc_try_pop(AveMpmcQueue *q, AVEBehaviorEvent *out) {
+int ave_mpmc_try_pop(AveMpmcQueue *q, EdrAveQueuedEvent *out) {
+  if (!q || !out) return -1;
   pthread_mutex_lock(&q->mu);
   if (q->count == 0u) {
     pthread_mutex_unlock(&q->mu);
@@ -267,9 +271,10 @@ size_t ave_mpmc_approx_depth(const AveMpmcQueue *q) {
   if (!q) {
     return 0;
   }
-  pthread_mutex_lock(&q->mu);
-  size_t n = q->count;
-  pthread_mutex_unlock(&q->mu);
+  AveMpmcQueue *mq = (AveMpmcQueue *)q;
+  pthread_mutex_lock(&mq->mu);
+  size_t n = mq->count;
+  pthread_mutex_unlock(&mq->mu);
   return n;
 }
 

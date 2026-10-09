@@ -6,6 +6,12 @@
 #define EDR_AVE_BEHAVIOR_PIPELINE_H
 
 #include "edr/ave_sdk.h"
+#include "edr/ave_process_identity.h"
+
+typedef struct {
+  AVEBehaviorEvent event;
+  EdrAveProcessIdentity process;
+} EdrAveQueuedEvent;
 
 struct EdrConfig;
 
@@ -24,7 +30,11 @@ void edr_ave_bp_set_callbacks(const AVECallbacks *callbacks);
 int edr_ave_bp_start_monitor(const struct EdrConfig *cfg);
 void edr_ave_bp_configure_resource_limits(const struct EdrConfig *cfg);
 
-int edr_ave_bp_feed(const AVEBehaviorEvent *event);
+int edr_ave_bp_feed(const AVEBehaviorEvent *event,
+                    const EdrAveProcessIdentity *process);
+/* Same SDK configuration/IOC admission as FeedEventEx, with internal capture. */
+int edr_ave_feed_event_captured(const AVEBehaviorEvent *event,
+                                const EdrAveProcessIdentity *process);
 
 /**
  * B3b：静态规则扫描结论写入行为 PID 槽，供 §5.5 特征维 44–45（与《11》PidHistory.ave_* 对齐）。

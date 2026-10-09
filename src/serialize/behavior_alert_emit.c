@@ -8,6 +8,7 @@
 #include "edr/preprocess.h"
 #include "edr/policy_v2.h"
 #include "edr/process_tree_cache.h"
+#include "edr/process_generation.h"
 #include "edr/p0_source_only_contract.h"
 #include "edr/sha256.h"
 #include "edr/storage_queue.h"
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include "cJSON.h"
 
 #ifndef EDR_HAVE_NANOPB
 #pragma message("WARNING: EDR_HAVE_NANOPB not defined; ALL P0 and AVE behavior alerts will be silently dropped. Build with nanopb support for production use.")
@@ -47,21 +49,64 @@ static int process_name_is_placeholder(const char *name) {
   return *p == '\0';
 }
 
-static void enrich_alert_process_snapshot(AVEBehaviorAlert *alert) {
-  if (!alert || alert->pid == 0u) return;
+static int enrich_alert_process_snapshot(AVEBehaviorAlert *alert) {
+  if (!alert || alert->pid == 0u) return 0;
+  EdrAveProcessIdentity capture;
+  int captured = edr_behavior_alert_process_identity(alert, &capture);
+  if (captured < 0) return 0;
+  /* The legacy SDK has no captured child generation. Never infer its parent
+   * from a PID/time-only snapshot. Valid source PPID remains untouched. */
+  if (!captured ||
+      !capture.process_start_key || !capture.process_creation_filetime_100ns ||
+      alert->timestamp_ns <= 0 ||
+      !edr_process_generation_contains_event(capture.process_creation_filetime_100ns,
+                                              (uint64_t)alert->timestamp_ns)) return 1;
   ProcessTreeEntry snapshot;
   uint64_t event_time_ns = alert->timestamp_ns > 0 ? (uint64_t)alert->timestamp_ns : 0u;
-  if (edr_pt_cache_snapshot_at(alert->pid, event_time_ns, &snapshot) != 0) return;
+  if (edr_pt_cache_snapshot_generation_at(alert->pid, capture.process_start_key, event_time_ns, &snapshot) != 0 ||
+      snapshot.creation_filetime_100ns != capture.process_creation_filetime_100ns ||
+      (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) ||
+      (alert->process_path[0] && snapshot.exe_path[0] && strcmp(alert->process_path, snapshot.exe_path))) return 1;
+  uint32_t merged_pid = capture.parent_pid;
+  uint8_t merged_state = capture.parent_pid_state;
+  edr_parent_pid_merge(&merged_pid, &merged_state, snapshot.ppid, snapshot.parent_pid_state);
+  if (merged_state == EDR_PARENT_PID_CONFLICT &&
+      snapshot.parent_pid_state != EDR_PARENT_PID_CONFLICT) {
+    /* The tree owns this exact lifetime. Remember the disagreement even if
+     * rebuilding this alert fails; later sparse events must not confirm it. */
+    (void)edr_pt_cache_put_generation_with_parent_state(alert->pid, snapshot.ppid,
+        NULL, NULL, NULL, NULL, snapshot.last_seen_ns, snapshot.process_start_key,
+        snapshot.creation_filetime_100ns, 0u, EDR_PARENT_PID_CONFLICT);
+  }
+  if (merged_pid != capture.parent_pid || merged_state != capture.parent_pid_state) {
+    cJSON *subject = cJSON_ParseWithOpts(alert->user_subject_json, NULL, 1);
+    cJSON *captured = cJSON_GetObjectItemCaseSensitive(subject, "captured_process");
+    cJSON *ctx = cJSON_GetObjectItemCaseSensitive(subject, "detection_context");
+    cJSON *process = cJSON_GetObjectItemCaseSensitive(ctx, "process");
+    int updated = cJSON_IsObject(captured) && cJSON_IsObject(process) &&
+      cJSON_ReplaceItemInObjectCaseSensitive(captured, "parent_pid", cJSON_CreateNumber(merged_pid)) &&
+      cJSON_ReplaceItemInObjectCaseSensitive(captured, "parent_pid_state", cJSON_CreateNumber(merged_state)) &&
+      cJSON_ReplaceItemInObjectCaseSensitive(process, "parent_pid", cJSON_CreateNumber(merged_pid));
+    char *text = updated ? cJSON_PrintUnformatted(subject) : NULL;
+    if (!text || strlen(text) >= sizeof(alert->user_subject_json)) {
+      free(text); cJSON_Delete(subject);
+      fprintf(stderr, "[edr] parent identity projection failed; new alert was not queued\n");
+      return 0;
+    }
+    memcpy(alert->user_subject_json, text, strlen(text) + 1u);
+    alert->ppid = merged_pid;
+    free(text); cJSON_Delete(subject);
+  }
   if (process_name_is_placeholder(alert->process_name) && snapshot.process_name[0]) {
     snprintf(alert->process_name, sizeof(alert->process_name), "%s", snapshot.process_name);
   }
   if (!alert->process_path[0] && snapshot.exe_path[0]) {
     snprintf(alert->process_path, sizeof(alert->process_path), "%s", snapshot.exe_path);
   }
-  if (alert->ppid == 0u) alert->ppid = snapshot.ppid;
   if (!alert->cmdline[0] && snapshot.cmdline[0]) {
     snprintf(alert->cmdline, sizeof(alert->cmdline), "%s", snapshot.cmdline);
   }
+  return 1;
 }
 
 static int emit_raw(const AVEBehaviorAlert *a, const char *ep, const char *te) {
@@ -334,7 +379,7 @@ void edr_behavior_alert_emit_to_batch(const AVEBehaviorAlert *a) {
   }
   if (decision.allow_original) {
     AVEBehaviorAlert enriched = *a;
-    enrich_alert_process_snapshot(&enriched);
+    if (!enrich_alert_process_snapshot(&enriched)) return;
     emit_raw(&enriched, ep, te);
     static int s_debug_enabled = -1;
     if (s_debug_enabled < 0) {
@@ -377,7 +422,8 @@ static EdrBehaviorRecordAlertEmitOutcome emit_combined_outcome(
   AVEBehaviorAlert enriched = *alert;
   /* Deferred sources already own their captured generation. A later cache
    * lookup by PID/time alone cannot fill an exact-generation record safely. */
-  if (!deferred_key) enrich_alert_process_snapshot(&enriched);
+  if (!deferred_key && !enrich_alert_process_snapshot(&enriched))
+    return EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED;
   combined.record = record;
   combined.alert = &enriched;
   combined.prepare = prepare;

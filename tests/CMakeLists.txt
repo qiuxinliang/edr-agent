@@ -897,6 +897,33 @@ target_link_libraries(test_behavior_record_alert_emit PRIVATE edr_ave_test_commo
 edr_apply_test_warnings(test_behavior_record_alert_emit)
 add_test(NAME behavior_record_alert_emit_contract COMMAND test_behavior_record_alert_emit)
 
+# Real exact-cache enrichment, codec/gate and private queue. External policy,
+# batch and storage ports are isolated in the fixture; it sends no HTTP.
+set(_edr_ave_parent_sources
+  test_ave_parent_integrity.c stub_command_fact_resolver.c
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_lf_mpmc.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+add_executable(test_ave_parent_integrity ${_edr_ave_parent_sources})
+target_link_libraries(test_ave_parent_integrity PRIVATE edr_ave_test_common)
+edr_apply_test_warnings(test_ave_parent_integrity)
+add_test(NAME ave_parent_integrity COMMAND test_ave_parent_integrity)
+if(NOT WIN32)
+  add_executable(test_ave_parent_integrity_mutex ${_edr_ave_parent_sources})
+  target_compile_definitions(test_ave_parent_integrity_mutex PRIVATE __STDC_NO_ATOMICS__=1)
+  target_link_libraries(test_ave_parent_integrity_mutex PRIVATE edr_ave_test_common)
+  edr_apply_test_warnings(test_ave_parent_integrity_mutex)
+  add_test(NAME ave_parent_integrity_mutex COMMAND test_ave_parent_integrity_mutex)
+endif()
+
 if(EDR_PCRE2_AVAILABLE)
   # This test emits durable wire bytes carrying the authenticated published IR
   # binding.  The explicit Debug stub has no matcher and cannot prove that
@@ -1774,7 +1801,7 @@ add_executable(test_egress_batch_policy test_egress_batch_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
-target_link_libraries(test_egress_batch_policy PRIVATE edr_egress_policy)
+target_link_libraries(test_egress_batch_policy PRIVATE edr_egress_policy edr_validation_trace)
 target_compile_definitions(test_egress_batch_policy PRIVATE EDR_HAVE_NANOPB=1)
 if(WIN32)
   target_link_libraries(test_egress_batch_policy PRIVATE ws2_32)

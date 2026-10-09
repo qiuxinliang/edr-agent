@@ -1406,7 +1406,11 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
   /* Token identity is bound to the same live ProcessStartKey/FILETIME handle,
    * not to a pathname artifact reopened after ProcessCreate. */
+  uint32_t previous_ppid = br.ppid;
+  uint8_t previous_parent_state = br.parent_pid_state;
   enrich_process_integrity_context(&br);
+  edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state,
+                                     "identity_enriched");
   edr_local_evidence_cache_observe_process(&br);
   if (!apply_process_evidence(&br, slot)) return;
   process_enriched_record(br, slot);
@@ -1416,11 +1420,14 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
 static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   EdrCommandFacts command_facts = {0};
   int command_facts_resolved = 0;
+  uint32_t previous_ppid = br.ppid;
+  uint8_t previous_parent_state = br.parent_pid_state;
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_behavior_enrich_file_activity(&br);
   edr_windows_event_policy_apply(&br);
   /* The history owner validates the exact generation for every event family. */
   edr_pid_history_pmfe_fill_record(&br);
+  edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state, "enriched");
 #ifdef _WIN32
   {
     const char *file_read_reason = p0_file_read_unavailable_reason(&br);
@@ -1621,6 +1628,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   process_pending_process_creates();
 #endif
   edr_behavior_from_slot(slot, &br);
+  edr_validation_trace_event(&br, "normalized", "decoded");
   if (br.collector_evidence_gate[0]) {
     process_one_record(br, slot);
     return;
@@ -1644,7 +1652,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
       /* Publish already verified lightweight context before the correlation
        * wait. File/network events need not wait for this process's alert. */
       apply_agent_ids_to_record(&br);
+      uint32_t previous_ppid = br.ppid;
+      uint8_t previous_parent_state = br.parent_pid_state;
       enrich_process_integrity_context(&br);
+      edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state,
+                                         "identity_enriched");
       edr_local_evidence_cache_observe_process(&br);
     }
     int candidate = p0_process_create_candidate(&br);
@@ -1683,8 +1695,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
       /* Detection interest is not a retention-identity requirement. Reuse
        * an already captured historical actor when available, without a live
        * query or a new P0 gate for an unrelated/expired reader. */
+      uint32_t previous_ppid = br.ppid;
+      uint8_t previous_parent_state = br.parent_pid_state;
       (void)p0_bind_file_read_cached_generation(
           &br, br.process_start_key, br.process_creation_filetime_100ns);
+      edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state, "enriched");
       apply_agent_ids_to_record(&br);
       edr_p0_rule_observe_validation_stage(&br, "file_read_interest", "verified_path_miss");
       edr_local_evidence_cache_record_behavior(&br);

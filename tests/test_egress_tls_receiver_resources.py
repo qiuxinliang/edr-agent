@@ -23,7 +23,7 @@ spec.loader.exec_module(receiver)
 class AlertParentProjectionTest(unittest.TestCase):
     """Synthetic oracle inputs only; the real C client owns TLS integration."""
     @staticmethod
-    def frame(version, parent=21, state=1):
+    def frame(version, parent=21, state=1, json_parent=Ellipsis):
         def varint(value):
             data = bytearray()
             while value > 127:
@@ -49,6 +49,10 @@ class AlertParentProjectionTest(unittest.TestCase):
                 "engine": "ave", "rule_id": "behavior_anomaly",
             },
         }
+        if json_parent is None:
+            del subject["detection_context"]["process"]["parent_pid"]
+        elif json_parent is not Ellipsis:
+            subject["detection_context"]["process"]["parent_pid"] = json_parent
         encoded = json.dumps(subject, separators=(",", ":")).encode()
         alert = varint(1 << 3 | 5) + struct.pack("<f", 0.9) + \
             scalar(6, 1700000000000000000) + scalar(7, 42) + \
@@ -72,6 +76,25 @@ class AlertParentProjectionTest(unittest.TestCase):
         for state in (0, 2, 3):
             with self.subTest(state=state):
                 self.assertTrue(receiver.is_proven_alert(self.frame(3, parent=0, state=state)))
+
+    def test_complete_v3_parent_contract_matrix(self):
+        accepted = 0
+        for state in (None, 0, 1, 2, 3, 4):
+            for mode in (0, 1, 2):
+                parent = 4242 if mode == 2 else 0
+                for alias in (None, 0, 4242, 99):
+                    frame = self.frame(3, parent=parent, state=state, json_parent=alias)
+                    if state is None:
+                        del frame[73]
+                    if mode == 0:
+                        del frame[7]
+                    expected = state is not None and (state == 4 or
+                        (parent != 0 if state == 1 else parent == 0)) and (alias is None or alias == parent)
+                    with self.subTest(state=state, mode=mode, alias=alias):
+                        actual = receiver.is_proven_alert(frame)
+                        self.assertEqual(actual, expected)
+                        accepted += actual
+        self.assertEqual(accepted, 20)
 
     def test_parent_state_version_and_alias_conflicts_are_rejected(self):
         cases = [self.frame(4), self.frame(3, parent=0, state=1),

@@ -708,5 +708,37 @@ static void parent_relation_projection(void) {
  printf("parent relation legacy_v2=%zu ppid=0 frozen_bytes_unchanged=1\n",n);
  free(ev);free(r);free(wire);free(local);
 }
-int main(void) { edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); parent_relation_projection(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+
+/* Shared v3 contract: top-level is canonical, alias is optional but exact
+ * when present, including zero. Nonoptional tag7 presence supplies no state. */
+static void engine_parent_alias_contract(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a={0};
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&wire);
+ r->type=EDR_EVENT_BEHAVIOR_ONNX_ALERT;r->pid=42;r->ppid=4242;r->parent_pid_state=EDR_PARENT_PID_KNOWN;
+ r->event_time_ns=1700000000000000000LL;strcpy(r->event_id,"synthetic-engine-parent");
+ strcpy(r->endpoint_id,"synthetic-endpoint");strcpy(r->tenant_id,"synthetic-tenant");
+ a.pid=r->pid;a.ppid=r->ppid;a.timestamp_ns=r->event_time_ns;a.anomaly_score=.9f;
+ strcpy(a.user_subject_json,"{\"subject_type\":\"detection_context\",\"detection_context\":{\"engine\":\"ave\",\"rule_id\":\"behavior_anomaly\",\"process\":{\"pid\":42,\"parent_pid\":4242},\"engine_signals\":{}},\"evaluation_basis\":{\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\",\"predicate_matched\":true,\"threshold_met\":true,\"tactic_probs_computed\":false,\"pid\":42,\"timestamp_ns\":\"1700000000000000000\",\"threshold\":0.65,\"event_count\":1,\"last_event_type\":9,\"behavior_flags\":4294967295}}");
+ size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+ edr_v1_BehaviorEvent *ev=decode_frame(wire,n);
+ unsigned accepted=0;
+ for(int state=-1;state<=EDR_PARENT_PID_CONFLICT;++state) for(int mode=0;mode<3;++mode) for(int alias=0;alias<4;++alias) {
+  const uint32_t values[]={0,0,4242,99};
+  ev->has_parent_pid_state=state>=0;ev->parent_pid_state=state<0?0:(uint32_t)state;ev->ppid=mode==2?4242:0;
+  cJSON *json=cJSON_Parse(a.user_subject_json);assert(json);
+  cJSON *ctx=cJSON_GetObjectItemCaseSensitive(json,"detection_context");cJSON *process=cJSON_GetObjectItemCaseSensitive(ctx,"process");
+  cJSON_DeleteItemFromObjectCaseSensitive(process,"parent_pid");
+  if(alias) cJSON_AddNumberToObject(process,"parent_pid",values[alias]);
+  overwrite_json(ev->behavior_alert.user_subject_json,sizeof(ev->behavior_alert.user_subject_json),json);cJSON_Delete(json);
+  n=immutable_encode(ev,wire);if(mode==1){wire[n++]=0x38;wire[n++]=0;}
+  int expected=state>=0 && (state==EDR_PARENT_PID_CONFLICT ||
+   (state==EDR_PARENT_PID_KNOWN?ev->ppid!=0:ev->ppid==0)) && (!alias || values[alias]==ev->ppid);
+  int actual=edr_egress_frame_validate(wire,n,NULL,0);assert(actual==expected);accepted+=(unsigned)actual;
+ }
+ assert(accepted==20u);
+ puts("v3 engine parent contract: 72 cases, 20 valid, absent/explicit zero distinguished");
+ free(ev);free(wire);free(r);
+}
+
+int main(void) { engine_parent_alias_contract(); edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); parent_relation_projection(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }

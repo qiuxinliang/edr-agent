@@ -945,6 +945,8 @@ if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
 endif()
 add_library(edr_validation_trace STATIC src/core/validation_trace.c src/command/sha256.c)
 target_include_directories(edr_validation_trace PUBLIC include)
+target_compile_definitions(edr_validation_trace PUBLIC
+  "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\"")
 edr_apply_common_warnings(edr_validation_trace)
 if(WIN32)
   target_link_libraries(edr_validation_trace PUBLIC advapi32)

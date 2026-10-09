@@ -1,5 +1,6 @@
 #include "edr/validation_trace.h"
 #include "edr/sha256.h"
+#include "edr/agent_update.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@ static char *s_buffer;
 static size_t s_used, s_written;
 static unsigned s_events, s_generations, s_batches;
 static uint64_t s_deadline;
+static int s_parent_identity_only;
 static char s_image[128], s_batch_sha[TRACE_IDENTITIES][65];
 static struct { uint32_t pid; uint64_t birth, key; } s_actors[TRACE_IDENTITIES];
 
@@ -94,7 +96,8 @@ static int write_bytes(const char *data, size_t n) {
 #endif
 }
 
-int edr_validation_trace_start(const char *path, const char *image, unsigned seconds) {
+static int trace_start(const char *path, const char *image, unsigned seconds,
+                       int parent_identity_only) {
   /* Lifecycle-owned startup; a stopped session is never silently reused. */
   if (s_buffer || !path || !path[0] || !image || !image[0] || !token(image, sizeof(s_image)) ||
       strchr(image, ':') || !seconds || seconds > 300u) return -1;
@@ -123,37 +126,114 @@ int edr_validation_trace_start(const char *path, const char *image, unsigned sec
     return -1;
   }
   s_used = s_written = 0; s_events = s_generations = s_batches = 0;
+  s_parent_identity_only = parent_identity_only;
   atomic_store(&s_dropped, 0); snprintf(s_image, sizeof(s_image), "%s", image);
   s_deadline = now_ms() + (uint64_t)seconds * 1000u;
-  char header[384]; int n = snprintf(header, sizeof(header),
+  char header[640]; int n = snprintf(header, sizeof(header),
       "{\"kind\":\"session\",\"schema\":\"edr.validation_trace.v1\",\"image\":\"%s\","
-      "\"duration_s\":%u,\"capacity_bytes\":%u,\"generation_limit\":%u,\"batch_limit\":%u}\n",
-      image, seconds, TRACE_CAP, TRACE_IDENTITIES, TRACE_IDENTITIES);
+      "\"duration_s\":%u,\"capacity_bytes\":%u,\"generation_limit\":%u,\"batch_limit\":%u,"
+      "\"purpose\":\"%s\",\"agent_version\":\"%s\",\"build_sha\":\"unknown\"}\n",
+      image, seconds, TRACE_CAP, TRACE_IDENTITIES, TRACE_IDENTITIES,
+      parent_identity_only ? "parent_identity" : "egress_validation",
+      token(EDR_AGENT_VERSION_STRING, 128) ? EDR_AGENT_VERSION_STRING : "unknown");
   append(header, (size_t)n); atomic_store(&s_enabled, 1); return 0;
+}
+int edr_validation_trace_start(const char *path, const char *image, unsigned seconds) {
+  return trace_start(path, image, seconds, 0);
+}
+int edr_validation_trace_start_parent(const char *path, const char *image, unsigned seconds) {
+  return trace_start(path, image, seconds, 1);
 }
 void edr_validation_trace_start_from_env(void) {
   const char *path = getenv("EDR_VALIDATION_TRACE_PATH");
   const char *image = getenv("EDR_VALIDATION_TRACE_IMAGE");
-  if (path && path[0] && edr_validation_trace_start(path, image, 300u) != 0)
+  const char *purpose = getenv("EDR_VALIDATION_TRACE_PURPOSE");
+  if (!path || !path[0]) return;
+  if (purpose && purpose[0] && strcmp(purpose, "parent_identity") != 0 &&
+      strcmp(purpose, "egress_validation") != 0) {
+    fprintf(stderr, "[validation_trace] unsupported local diagnostic purpose\n");
+    return;
+  }
+  int parent_identity = purpose && strcmp(purpose, "parent_identity") == 0;
+  if (trace_start(path, image, 300u, parent_identity) != 0)
     fprintf(stderr, "[validation_trace] protected local session could not start\n");
 }
+int edr_validation_trace_enabled(void) {
+  return atomic_load(&s_enabled) && now_ms() < s_deadline;
+}
 static void event_locked(uint32_t pid, uint64_t birth, uint64_t key, int64_t ns,
-                         unsigned type, const char *event_id, const char *stage, const char *reason) {
-  char line[768];
+                         unsigned type, const char *event_id, const char *stage, const char *reason,
+                         uint32_t ppid, uint32_t parent_state, uint32_t projection_version,
+                         uint64_t required_fields, const char *rule_id, const char *change_reason,
+                         const char *wire_event_id) {
+  char line[1536], wire_mapping[384] = "";
+  if (wire_event_id) {
+    snprintf(wire_mapping, sizeof(wire_mapping),
+        ",\"source_event_id\":\"%s\",\"wire_event_id\":\"%s\"",
+        token(event_id, EDR_BR_ID_LEN) ? event_id : "",
+        token(wire_event_id, EDR_BR_ID_LEN) ? wire_event_id : "");
+  }
+  uint32_t effective_state = parent_state == EDR_PARENT_PID_UNKNOWN && ppid
+      ? EDR_PARENT_PID_KNOWN : parent_state;
   int n = snprintf(line, sizeof(line),
       "{\"kind\":\"event\",\"sequence\":%u,\"pid\":%u,\"birth\":\"%llu\",\"start_key\":\"%llu\","
-      "\"event_ns\":\"%lld\",\"type\":%u,\"event_id\":\"%s\",\"stage\":\"%s\",\"reason\":\"%s\"}\n",
+      "\"event_ns\":\"%lld\",\"type\":%u,\"event_id\":\"%s\",\"stage\":\"%s\",\"reason\":\"%s\","
+      "\"ppid\":%u,\"parent_pid_state\":%u,\"parent_pid_effective_state\":%u,"
+      "\"projection_version\":%u,\"required_evidence_fields\":\"%llu\",\"rule_id\":\"%s\","
+      "\"change_reason\":\"%s\"%s}\n",
       ++s_events, pid, (unsigned long long)birth, (unsigned long long)key, (long long)ns, type,
       token(event_id, EDR_BR_ID_LEN) ? event_id : "",
       token(stage, 96) ? stage : "invalid_diagnostic_token",
-      token(reason, 96) ? reason : "invalid_diagnostic_token");
+      s_parent_identity_only ? "parent_identity" :
+          (token(reason, 96) ? reason : "invalid_diagnostic_token"), ppid, parent_state, effective_state,
+      projection_version, (unsigned long long)required_fields,
+      token(rule_id, 96) ? rule_id : "",
+      token(change_reason, 96) ? change_reason : "invalid_diagnostic_token", wire_mapping);
   if (n > 0 && (size_t)n < sizeof(line)) append(line, (size_t)n);
   else atomic_fetch_add(&s_dropped, 1u);
 }
 void edr_validation_trace_event(const EdrBehaviorRecord *r, const char *stage, const char *reason) {
   if (!enter()) return;
   if (scoped(r)) event_locked(r->pid, r->process_creation_filetime_100ns, r->process_start_key,
-                              r->event_time_ns, (unsigned)r->type, r->event_id, stage, reason);
+                              r->event_time_ns, (unsigned)r->type, r->event_id, stage, reason,
+                              r->ppid, r->parent_pid_state, r->evidence_projection_version,
+                              r->required_evidence_fields,
+                              stage && strcmp(stage, "p0_rule") == 0 ? reason : "", "not_compared", NULL);
+  atomic_flag_clear(&s_lock);
+}
+void edr_validation_trace_parent_change(const EdrBehaviorRecord *r,
+                                       uint32_t previous_ppid, uint8_t previous_state,
+                                       const char *stage) {
+  if (!enter()) return;
+  if (scoped(r)) {
+    const char *change;
+    uint8_t before = edr_parent_pid_effective_state(previous_ppid, previous_state);
+    uint8_t after = edr_parent_pid_effective_state(r->ppid, r->parent_pid_state);
+    if (after == EDR_PARENT_PID_CONFLICT) change = "conflict_retained_or_detected";
+    else if (after == EDR_PARENT_PID_INVALID) change = "invalid_retained";
+    else if (before == EDR_PARENT_PID_UNKNOWN && after == EDR_PARENT_PID_KNOWN)
+      change = "unknown_completed";
+    else if (previous_ppid != r->ppid || previous_state != r->parent_pid_state)
+      change = "parent_value_or_state_changed";
+    else if (after == EDR_PARENT_PID_UNKNOWN) change = "unknown_retained";
+    else if (after == EDR_PARENT_PID_EXPLICIT_ZERO) change = "explicit_zero_retained";
+    else change = "known_retained";
+    event_locked(r->pid, r->process_creation_filetime_100ns, r->process_start_key,
+        r->event_time_ns, (unsigned)r->type, r->event_id, stage, "parent_identity",
+        r->ppid, r->parent_pid_state, r->evidence_projection_version,
+        r->required_evidence_fields, "", change, NULL);
+  }
+  atomic_flag_clear(&s_lock);
+}
+void edr_validation_trace_parent_wire(const EdrBehaviorRecord *r,
+                                    uint32_t wire_ppid, uint32_t wire_state,
+                                    uint32_t projection_version, uint64_t required_fields,
+                                    const char *rule_id, const char *wire_event_id) {
+  if (!enter()) return;
+  if (scoped(r)) event_locked(r->pid, r->process_creation_filetime_100ns, r->process_start_key,
+      r->event_time_ns, (unsigned)r->type, r->event_id, "wire", "parent_identity",
+      wire_ppid, wire_state, projection_version, required_fields, rule_id, "final_projection",
+      wire_event_id ? wire_event_id : r->event_id);
   atomic_flag_clear(&s_lock);
 }
 void edr_validation_trace_interest(const EdrSensorInterestEvent *e, int64_t ns,
@@ -162,7 +242,8 @@ void edr_validation_trace_interest(const EdrSensorInterestEvent *e, int64_t ns,
   if (scoped_values(e->pid, e->process_creation_filetime_100ns, e->process_start_key,
                     e->process_name, NULL, e->parent_process_name))
     event_locked(e->pid, e->process_creation_filetime_100ns, e->process_start_key,
-                  ns, (unsigned)e->type, "", stage, reason);
+                  ns, (unsigned)e->type, "", stage, reason, e->parent_pid,
+                  EDR_PARENT_PID_UNKNOWN, 0u, 0u, "", "not_compared", NULL);
   atomic_flag_clear(&s_lock);
 }
 void edr_validation_trace_bind(const EdrBehaviorRecord *r, const char *batch_id,
@@ -190,6 +271,7 @@ void edr_validation_trace_bind(const EdrBehaviorRecord *r, const char *batch_id,
 void edr_validation_trace_request(const char *batch_id, const void *body, size_t length,
                                   const char *content_type) {
   if (!batch_id || !body || !content_type || !enter()) return;
+  if (s_parent_identity_only) { atomic_flag_clear(&s_lock); return; }
   char hash[65];
   if (edr_sha256_hex((const uint8_t *)batch_id, strlen(batch_id), hash) == 0) {
     for (unsigned i = 0; i < s_batches; ++i) if (!strcmp(hash, s_batch_sha[i])) {

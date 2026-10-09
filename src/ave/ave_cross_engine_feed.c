@@ -1,4 +1,5 @@
 #include "edr/ave_cross_engine_feed.h"
+#include "ave_behavior_pipeline.h"
 
 #include "edr/ave_sdk.h"
 #include "edr/policy_v2.h"
@@ -360,7 +361,9 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
   }
 
   ev.pid = br->pid;
-  ev.ppid = br->ppid;
+  uint8_t parent_state = edr_parent_pid_effective_state(br->ppid, br->parent_pid_state);
+  /* Retained conflict candidates are audit values, not parent features. */
+  ev.ppid = parent_state == EDR_PARENT_PID_KNOWN ? br->ppid : 0u;
   ev.event_type = avt;
   ev.cert_revoked_ancestor = br->cert_revoked_ancestor ? 1u : 0u;
   ev.cert_anomaly = br->cert_revoked_ancestor ? 1u : 0u;
@@ -458,5 +461,13 @@ void edr_ave_cross_engine_feed_from_record(const EdrBehaviorRecord *br) {
     break;
   }
 
-  (void)AVE_FeedEventEx(&ev, sizeof(ev));
+  EdrAveProcessIdentity process = {0};
+  process.pid = br->pid;
+  process.parent_pid = br->ppid;
+  process.parent_pid_state = parent_state;
+  process.process_start_key = br->process_start_key;
+  process.process_creation_filetime_100ns = br->process_creation_filetime_100ns;
+  if (!copy_record_text_exact(process.source_event_id, sizeof(process.source_event_id),
+                              br->event_id, sizeof(br->event_id))) return;
+  (void)edr_ave_feed_event_captured(&ev, &process);
 }
