@@ -666,6 +666,11 @@ if(WIN32)
       ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_exit.ps1
       -RepositoryRoot ${CMAKE_SOURCE_DIR} -Fixture $<TARGET_FILE:test_windows_task_exit_fixture>)
   set_tests_properties(windows_task_exit_behavior PROPERTIES TIMEOUT 60)
+  add_test(NAME windows_task_trace_environment
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_trace_environment.ps1
+      -RepositoryRoot ${CMAKE_SOURCE_DIR})
+  set_tests_properties(windows_task_trace_environment PROPERTIES TIMEOUT 30)
 endif()
 
 if(WIN32)
