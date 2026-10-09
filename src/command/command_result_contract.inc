@@ -285,14 +285,25 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
     cJSON_AddItemToObject(out,"errors",errors);
     const cJSON *input=cJSON_GetObjectItemCaseSensitive(root,"errors");
     if(input && (!cJSON_IsArray(input)||cJSON_GetArraySize(input)>32)){cJSON_Delete(out);return NULL;}
+    int warnings=0;
     for(const cJSON *error=input?input->child:NULL;error;error=error->next) {
       const char *source=result_text(error,"source"),*code=result_text(error,"code");
       if(!result_member(source,"process|process_cmdline|parent_cmdline|network|registry|eventlog|file_hash_cache|command_result_transport") ||
          !result_member(code,"snapshot_failed|too_long|collector_unavailable|partial_access|collector_failed|partial_failure|invalid_hive|access_denied|key_not_found|invalid_utf8|query_failed|render_context_failed|enumeration_failed|oom|sampler_timeout|sampler_failed|process_path_unsupported|cache_query_failed|platform_unsupported|result_truncated")) {cJSON_Delete(out);return NULL;}
       cJSON *item=cJSON_CreateObject();if(!item){cJSON_Delete(out);return NULL;}
-      cJSON_AddStringToObject(item,"source",source);cJSON_AddStringToObject(item,"code",code);cJSON_AddItemToArray(errors,item);
+      const cJSON *retryable=cJSON_GetObjectItemCaseSensitive(error,"retryable");
+      if(retryable && !cJSON_IsBool(retryable)){cJSON_Delete(item);cJSON_Delete(out);return NULL;}
+      /* Classify finite codes here so free text or a forged severity cannot
+       * downgrade a real collection failure. This survives durable replay. */
+      int warning=result_member(code,"partial_access|result_truncated");
+      cJSON_AddStringToObject(item,"source",source);cJSON_AddStringToObject(item,"code",code);
+      cJSON_AddStringToObject(item,"severity",warning?"warning":"error");
+      cJSON_AddBoolToObject(item,"retryable",cJSON_IsTrue(retryable));
+      cJSON_AddItemToArray(errors,item);
+      if(warning)warnings++;
     }
-    cJSON_AddItemToObject(out,"error",cJSON_GetArraySize(errors)?cJSON_CreateString("collector_diagnostic"):cJSON_CreateNull());
+    if(cJSON_GetArraySize(errors))cJSON_AddNumberToObject(out,"warning_count",warnings);
+    cJSON_AddItemToObject(out,"error",cJSON_GetArraySize(errors)>warnings?cJSON_CreateString("collector_diagnostic"):cJSON_CreateNull());
   }
   return out;
 }

@@ -173,8 +173,41 @@ static void shell_open_purpose_tests(void) {
   puts("PASS: typed shell-open control survives real owner, serializer and final gate; legacy/generic success never becomes opened; binding, projection, expiry and ACK remain enforced");
 }
 
+static void rtq_diagnostic_purpose_tests(void) {
+  static const struct { const char *request; const char *row; } cases[] = {
+    {"{\"process_name\":\"foo\"}", "{\"type\":\"process\",\"name\":\"foo\",\"pid\":1}"},
+    {"{\"network_remote_port\":443}", "{\"type\":\"network\",\"remote_port\":443}"},
+    {"{\"file_path\":\"/tmp/foo\"}", "{\"type\":\"file\",\"path\":\"/tmp/foo\",\"size\":1}"},
+    {"{\"registry_path\":\"HKLM\\\\Software\\\\Allowed\"}", "{\"type\":\"registry\",\"key\":\"HKLM\\\\Software\\\\Allowed\",\"value\":\"v\"}"},
+    {"{\"eventlog_channel\":\"Security\"}", "{\"type\":\"eventlog\",\"channel\":\"Security\",\"query\":\"*\",\"provider\":\"Synthetic\",\"timestamp\":\"2026-10-09T18:58:14Z\",\"event_id\":4624,\"record_id\":1}"},
+    {"{\"script_content\":\"foo\"}", "{\"type\":\"process\",\"name\":\"powershell\",\"cmdline\":\"foo\",\"pid\":1}"}
+  };
+  char detail[2048], projected[16384], canonical[16384], id[64];
+  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+    snprintf(id,sizeof(id),"rtq-warning-%zu",i);
+    EdrSoarCommandMeta m=task(id,"rtq_execute");
+    CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)cases[i].request,
+        strlen(cases[i].request),(int64_t)time(NULL)*1000)==0);
+    snprintf(detail,sizeof(detail),"{\"results\":[%s],\"truncated\":true,\"error\":null,\"errors\":[{\"source\":\"command_result_transport\",\"code\":\"result_truncated\",\"severity\":\"warning\",\"retryable\":false,\"message\":\"UNRELATED diagnostic text\"}]}",cases[i].row);
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0);
+    CHECK(strstr(projected,"\"severity\":\"warning\"") && strstr(projected,"\"error\":null") &&
+        strstr(projected,"\"warning_count\":1") && !strstr(projected,"UNRELATED"));
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,projected,canonical,sizeof(canonical))==0 && !strcmp(projected,canonical));
+    CHECK(edr_command_state_finish(id,"rtq_execute",&m,"ok",1,0,detail,"",1)==0);
+    char *body=persisted_body(id,"rtq_execute");CHECK(allowed("tenant","ep",body));free(body);
+  }
+  EdrSoarCommandMeta m=task("rtq-hard-diagnostic","rtq_execute");
+  const char *failure="{\"results\":[],\"truncated\":false,\"errors\":[{\"source\":\"process\",\"code\":\"snapshot_failed\",\"severity\":\"warning\",\"retryable\":true}]}";
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,failure,projected,sizeof(projected))==0);
+  CHECK(strstr(projected,"\"severity\":\"error\"") && strstr(projected,"collector_diagnostic") && strstr(projected,"\"retryable\":true"));
+  const char *invalid="{\"results\":[],\"errors\":[{\"source\":\"process\",\"code\":\"snapshot_failed\",\"retryable\":\"false\"}]}";
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,invalid,projected,sizeof(projected))!=0);
+  puts("PASS: RTQ bounded diagnostics preserve warnings across projection, durable owner and final gate for all six query categories; real errors cannot be downgraded");
+}
+
 static void purpose_tests(void) {
   shell_open_purpose_tests();
+  rtq_diagnostic_purpose_tests();
   EdrSoarCommandMeta q=task("purpose-query","rtq_execute");
   const char *injected="{\"results\":[{\"type\":\"process\",\"pid\":12,\"name\":\"foo\",\"user\":\"UNRELATED_IDENTITY\",\"cmdline\":\"UNRELATED_COMMAND\",\"extra\":{\"secret\":\"UNRELATED_NESTED\"}}],\"total\":1,\"raw_extra\":\"UNRELATED_TOP\"}";
   CHECK(edr_command_state_finish("purpose-query","rtq_execute",&q,"ok",1,0,injected,"",1)==0);
