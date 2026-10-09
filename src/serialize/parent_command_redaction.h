@@ -115,12 +115,22 @@ static void parent_command_redact(char *s) {
     while (parent_command_key_char((unsigned char)s[end])) ++end;
     if (end == key || !parent_command_sensitive_key(s, key, end)) continue;
     size_t value = end;
+    /* A separate argv option token may itself be quoted. Consume its closing
+     * quote before looking for a value; keep an enclosing script quote. */
+    if (option && (previous == '\'' || previous == '"') &&
+        !parent_command_escaped(s, i - 1u) && s[end] == previous &&
+        !parent_command_escaped(s, end)) {
+      ++value;
+      if (container_quote == previous) container_quote = 0;
+      i = end;
+    }
+    size_t separator = value;
     while (parent_command_space((unsigned char)s[value])) ++value;
     int assignment = s[value] == '=' || (option && s[value] == ':');
     if (assignment) {
       ++value;
       while (parent_command_space((unsigned char)s[value])) ++value;
-    } else if (!option || value == end) continue;
+    } else if (!option || value == separator) continue;
     /* A following switch is a missing value, not a credential to redact. */
     if (!assignment && s[value] == '-') continue;
     int connection = !option && (previous == ';' || container_quote != 0);

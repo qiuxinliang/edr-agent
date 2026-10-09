@@ -856,6 +856,30 @@ static void parent_relation_projection(void) {
  free(ev);free(r);free(wire);free(local);
 }
 
+static void quoted_parent_command_egress(void) {
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;assert(r);
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*local=malloc(EDR_EGRESS_FRAME_MAX);
+ uint8_t *frozen=malloc(EDR_EGRESS_FRAME_MAX);assert(wire&&local&&frozen);
+ make_record(r);make_alert(&a,r);
+ strcpy(r->parent_cmdline,"parent.exe \"--password\" \"SYNTHETIC_PASSWORD_MARKER\" \"--token\" \"SYNTHETIC_TOKEN_MARKER\" --safe keep");
+ char original[sizeof(r->parent_cmdline)];strcpy(original,r->parent_cmdline);
+ size_t full=edr_behavior_record_encode_protobuf_full_facts(r,&a,NULL,NULL,local,EDR_EGRESS_FRAME_MAX);
+ size_t n=edr_behavior_record_alert_encode_protobuf(r,&a,wire,EDR_EGRESS_FRAME_MAX);assert(full&&n);
+ edr_v1_BehaviorEvent *ev=decode_frame(wire,n),*facts=decode_frame(local,full);
+ assert(ev->ppid==21&&ev->parent_pid_state==EDR_PARENT_PID_KNOWN);
+ assert(ev->has_process_context&&ev->process_context.has_parent_cmdline);
+ assert(!strstr(ev->process_context.parent_cmdline,"SYNTHETIC_PASSWORD_MARKER"));
+ assert(!strstr(ev->process_context.parent_cmdline,"SYNTHETIC_TOKEN_MARKER"));
+ assert(strstr(ev->process_context.parent_cmdline,"--safe keep"));
+ assert(strlen(ev->process_context.parent_cmdline)==strlen(original));
+ assert(!strcmp(facts->process_context.parent_cmdline,original)&&!strcmp(r->parent_cmdline,original));
+ memcpy(frozen,wire,n);
+ assert(edr_egress_frame_validate(wire,n,NULL,0)&&!memcmp(frozen,wire,n));
+ assert(edr_egress_frame_validate(wire,n,NULL,0)&&!memcmp(frozen,wire,n));
+ printf("quoted parent command: local_full=%zu projected=%zu ppid=21 known=1 markers_absent=1 frozen_bytes_unchanged=1\n",full,n);
+ free(ev);free(facts);free(r);free(wire);free(local);free(frozen);
+}
+
 static void unavailable_parent_purpose(void) {
  EdrBehaviorRecord *r=calloc(1,sizeof(*r));AVEBehaviorAlert a;
  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&wire);
@@ -957,5 +981,5 @@ static void engine_parent_alias_contract(void) {
  free(ev);free(wire);free(r);
 }
 
-int main(void) { engine_parent_alias_contract(); edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); process_snapshot_egress(); terminal_snapshot_bytes_unchanged(); parent_relation_projection(); unavailable_parent_purpose(); parent_resolution_diagnostics(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
+int main(void) { engine_parent_alias_contract(); edr_egress_set_rule_projection_validator(synthetic_projection_owner,NULL); process_snapshot_egress(); terminal_snapshot_bytes_unchanged(); parent_relation_projection(); quoted_parent_command_egress(); unavailable_parent_purpose(); parent_resolution_diagnostics(); network_detail_competition(); evidence_projection_v2(); operation_without_user_purpose(); matrix(); purpose_masks(); historical_projection(); association_boundary(); paired_batch_classification();
   puts("egress batch policy: synthetic matrix passed"); return 0; }
