@@ -130,6 +130,18 @@ edr_apply_test_warnings(test_command_contract)
 add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_rtq_collectors ${CMAKE_CURRENT_SOURCE_DIR}/test_rtq_collectors.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_rtq_collectors PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(WIN32)
+  target_link_libraries(test_rtq_collectors PRIVATE ws2_32 iphlpapi advapi32 wevtapi wintrust)
+endif()
+edr_apply_test_warnings(test_rtq_collectors)
+add_test(NAME rtq_collector_behavior COMMAND test_rtq_collectors)
+set_tests_properties(rtq_collector_behavior PROPERTIES TIMEOUT 60)
+
 add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_process.c
   ${CMAKE_SOURCE_DIR}/src/command/command_process.c
   ${CMAKE_SOURCE_DIR}/src/command/command_util.c

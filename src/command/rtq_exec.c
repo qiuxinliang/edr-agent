@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <iphlpapi.h>
@@ -33,6 +35,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/process_generation.h"
 #include "edr/response.h"
+#include "edr/rtq_contract.h"
 #include "edr/sha256.h"
 #include "edr/shell_exec.h"
 
@@ -56,6 +59,7 @@ typedef struct rtq_errors {
     int offset;
     int count;
     int warning_count;
+    int overflowed;
 } rtq_errors;
 
 typedef struct rtq_filter {
@@ -84,6 +88,12 @@ typedef struct rtq_filter {
     int file_cache_hits;
     uint32_t file_cache_candidates;
     int file_path_scanned;
+    int file_scan_limit;
+    int file_depth_limit;
+    int file_unavailable;
+    int file_hash_size_limit;
+    int file_path_missing;
+    int file_cache_failed;
 
     int has_registry;
     char registry_path[520];
@@ -99,8 +109,28 @@ typedef struct rtq_filter {
     char script_engine[64];
 } rtq_filter;
 
+#ifdef _WIN32
+static int wide_to_utf8_str(LPCWSTR src, char *out, size_t cap);
+static int utf8_to_wide_str(const char *src, WCHAR *out, size_t count) {
+    return src && out && count > 0 &&
+           MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, src, -1, out, (int)count) > 0;
+}
+static DWORD win_file_attributes(const char *path) {
+    WCHAR wide[1024];
+    if (!utf8_to_wide_str(path, wide, sizeof(wide) / sizeof(wide[0]))) {
+        SetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return GetFileAttributesW(wide);
+}
+#endif
+
 static int rtq_cancelled(const rtq_filter *f) {
     return f && f->command_id && edr_command_cancel_requested(f->command_id);
+}
+
+static int rtq_sampler_cancel_check(void *user) {
+    return rtq_cancelled((const rtq_filter *)user);
 }
 
 static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
@@ -129,7 +159,7 @@ static int parse_rtq_filter(const uint8_t *pl, size_t len, rtq_filter *f) {
     }
     {
         int v = 0;
-        if (edr_parse_json_int(pl, len, "process_pid_min", &v) && v >= 0) {
+        if (edr_parse_json_int(pl, len, "process_pid_min", &v) && v > 0) {
             f->has_process = 1; f->process_pid_min = v;
         }
     }
@@ -305,12 +335,18 @@ static void rtq_error_init(rtq_errors *errs) {
     errs->offset = 0;
     errs->count = 0;
     errs->warning_count = 0;
+    errs->overflowed = 0;
 }
 
 static void rtq_error_append(rtq_errors *errs, const char *source, const char *code,
                              const char *message, int retryable) {
-    if (!errs) return;
-    char row[2048];
+    if (!errs || errs->overflowed) return;
+    char diagnostic_key[192];
+    snprintf(diagnostic_key, sizeof(diagnostic_key), "\"source\":\"%s\",\"code\":\"%s\"", source ? source : "rtq", code ? code : "collector_failed");
+    if (strstr(errs->json, diagnostic_key)) return;
+    char row[512];
+    char bounded_message[129];
+    snprintf(bounded_message, sizeof(bounded_message), "%s", message ? message : "RTQ collector failed");
     int row_offset = 0;
     row[0] = '\0';
     if (!rtq_appendf(row, (int)sizeof(row), &row_offset, "{\"source\":\"") ||
@@ -319,24 +355,50 @@ static void rtq_error_append(rtq_errors *errs, const char *source, const char *c
         !append_json_escaped(row, (int)sizeof(row), &row_offset, code ? code : "collector_failed") ||
         !rtq_appendf(row, (int)sizeof(row), &row_offset, "\",\"message\":\"") ||
         !append_json_escaped(row, (int)sizeof(row), &row_offset,
-                             message ? message : "RTQ collector failed")) {
+                             bounded_message)) {
         return;
     }
     int warning = code && (strcmp(code, "partial_access") == 0 ||
-                           strcmp(code, "result_truncated") == 0);
+                           strcmp(code, "result_truncated") == 0 ||
+                           strcmp(code, "scan_limit") == 0 ||
+                           strcmp(code, "scan_depth_limit") == 0 ||
+                           strcmp(code, "field_unavailable") == 0 ||
+                           strcmp(code, "hash_size_limit") == 0);
     if (!rtq_appendf(row, (int)sizeof(row), &row_offset,
                      "\",\"retryable\":%s,\"severity\":\"%s\"}",
                      retryable ? "true" : "false", warning ? "warning" : "error")) {
         return;
     }
     int separator = errs->count > 0 ? 1 : 0;
-    if (separator + row_offset >= (int)sizeof(errs->json) - errs->offset) return;
+    if (errs->count >= 31 || separator + row_offset + 160 >= (int)sizeof(errs->json) - errs->offset) {
+        /* Reserve a terminal diagnostic so a later failure cannot disappear
+         * behind a full warning array. The signed projection keeps this code. */
+        const char *overflow = "{\"source\":\"command_result_transport\",\"code\":\"collector_failed\",\"severity\":\"error\",\"retryable\":false}";
+        if (separator) errs->json[errs->offset++] = ',';
+        size_t length = strlen(overflow);
+        memcpy(errs->json + errs->offset, overflow, length + 1);
+        errs->offset += (int)length;
+        errs->count++;
+        errs->overflowed = 1;
+        return;
+    }
     if (separator) errs->json[errs->offset++] = ',';
     memcpy(errs->json + errs->offset, row, (size_t)row_offset);
     errs->offset += row_offset;
     errs->json[errs->offset] = '\0';
     errs->count++;
     if (warning) errs->warning_count++;
+}
+
+static void rtq_sampler_complete_lines(char *output, const char *source, rtq_errors *errs) {
+    size_t length = strlen(output);
+    if (length < RTQ_SAMPLER_OUTPUT_MAX - 1u) return;
+    rtq_error_append(errs, source, "scan_limit", "sampler output exceeded bounded capacity", 0);
+    if (length && output[length - 1] != '\n') {
+        char *last = strrchr(output, '\n');
+        if (last) last[1] = '\0';
+        else output[0] = '\0';
+    }
 }
 
 static void trim_sampler_output(char *s) {
@@ -431,30 +493,57 @@ static int str_eq_icase(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
+static void canonical_network_state(const char *input, char *out, size_t cap) {
+    if (!edr_rtq_network_state_normalize(input, out, cap) && cap) out[0] = '\0';
+}
+
 static int file_has_ext(const char *path, const char *ext) {
     if (!ext || !ext[0]) return 1;
     if (!path) return 0;
     const char *dot = strrchr(path, '.');
     if (!dot) return 0;
-    return str_contains_icase(dot, ext);
+    return str_eq_icase(dot, ext) ||
+           (ext[0] != '.' && str_eq_icase(dot + 1, ext));
 }
 
-static int hash_file_if_needed(const char *path, const char *expected, char out65[65]) {
+/* 1 match/no hash requested, 0 mismatch, -1 unreadable, -2 size limit. */
+static int hash_file_if_needed(const rtq_filter *filter, const char *path, const char *expected, char out65[65]) {
     out65[0] = '\0';
     if (!expected || !expected[0]) return 1;
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
-    long sz = ftell(f);
-    if (sz < 0 || sz > RTQ_FILE_HASH_MAX) { fclose(f); return 0; }
-    rewind(f);
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-    if (!buf) { fclose(f); return 0; }
-    size_t got = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (got != (size_t)sz) { free(buf); return 0; }
-    edr_sha256_hex(buf, (size_t)sz, out65);
-    free(buf);
+#ifdef _WIN32
+    WCHAR wide[1024];
+    if (!utf8_to_wide_str(path, wide, sizeof(wide) / sizeof(wide[0]))) return -1;
+    FILE *file = _wfopen(wide, L"rb");
+#else
+    FILE *file = fopen(path, "rb");
+#endif
+    if (!file) return -1;
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return -1; }
+    long size = ftell(file);
+    if (size < 0) { fclose(file); return -1; }
+    if (size > RTQ_FILE_HASH_MAX) { fclose(file); return -2; }
+    rewind(file);
+    EdrSha256Ctx ctx;
+    edr_sha256_init(&ctx);
+    unsigned char chunk[32768];
+    for (;;) {
+        if (rtq_cancelled(filter)) { fclose(file); return -1; }
+        size_t count = fread(chunk, 1, sizeof(chunk), file);
+        if (count) edr_sha256_update(&ctx, chunk, count);
+        if (count < sizeof(chunk)) {
+            if (ferror(file)) { fclose(file); return -1; }
+            break;
+        }
+    }
+    fclose(file);
+    uint8_t digest[EDR_SHA256_DIGEST_LEN];
+    static const char hex[] = "0123456789abcdef";
+    edr_sha256_final(&ctx, digest);
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        out65[i * 2] = hex[digest[i] >> 4];
+        out65[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out65[64] = '\0';
     return str_eq_icase(out65, expected);
 }
 
@@ -511,7 +600,12 @@ static int append_file_result(rtq_filter *f, const char *path, char *buf, int ca
     if (f->file_size_max > 0 && (long long)st.st_size > f->file_size_max) return 0;
 
     char sha[65] = {0};
-    if (!hash_file_if_needed(path, f->file_sha256, sha)) return 0;
+    int hash_rc = hash_file_if_needed(f, path, f->file_sha256, sha);
+    if (hash_rc <= 0) {
+        if (hash_rc == -2) f->file_hash_size_limit = 1;
+        else if (hash_rc < 0) f->file_unavailable = 1;
+        return 0;
+    }
     char row[RTQ_ROW_CAP];
     int row_offset = 0;
     row[0] = '\0';
@@ -530,26 +624,43 @@ static int append_file_result(rtq_filter *f, const char *path, char *buf, int ca
 
 static void scan_files_limited(rtq_filter *f, const char *root, int depth, int *scanned,
                                char *buf, int cap, int *offset, int *total, int *truncated) {
-    if (!root || !root[0] || depth < 0 || *scanned >= RTQ_FILE_SCAN_MAX || *total >= RTQ_MAX_RESULTS) return;
+    if (rtq_cancelled(f) || !root || !root[0]) return;
+    if (depth < 0) { f->file_depth_limit = 1; return; }
+    if (*scanned >= RTQ_FILE_SCAN_MAX) { f->file_scan_limit = 1; return; }
+    if (*total >= RTQ_MAX_RESULTS) { *truncated = 1; return; }
     struct stat st;
-    if (stat(root, &st) != 0) return;
+    if (lstat(root, &st) != 0) {
+        if (errno == ENOENT && strcmp(root, f->file_path) == 0) f->file_path_missing = 1;
+        else f->file_unavailable = 1;
+        return;
+    }
+    /* Do not follow symlinks outside the requested bounded tree. */
+    if (S_ISLNK(st.st_mode)) { f->file_unavailable = 1; return; }
     if (S_ISREG(st.st_mode)) {
         (*scanned)++;
         (void)append_file_result(f, root, buf, cap, offset, total, truncated);
         return;
     }
     if (!S_ISDIR(st.st_mode)) return;
-    DIR *d = opendir(root);
-    if (!d) return;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL && *scanned < RTQ_FILE_SCAN_MAX && *total < RTQ_MAX_RESULTS) {
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+    DIR *dir = opendir(root);
+    if (!dir) { f->file_unavailable = 1; return; }
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (rtq_cancelled(f)) break;
+        if (*scanned >= RTQ_FILE_SCAN_MAX) { f->file_scan_limit = 1; break; }
+        if (*total >= RTQ_MAX_RESULTS || *truncated) break;
         char child[1024];
-        snprintf(child, sizeof(child), "%s/%s", root, de->d_name);
+        int written = snprintf(child, sizeof(child), "%s/%s", root, entry->d_name);
+        if (written < 0 || written >= (int)sizeof(child)) { f->file_unavailable = 1; continue; }
         scan_files_limited(f, child, depth - 1, scanned, buf, cap, offset, total, truncated);
+        errno = 0;
     }
-    closedir(d);
+    if (errno) f->file_unavailable = 1;
+    closedir(dir);
 }
+
 #endif
 
 static int str_contains_icase(const char *haystack, const char *needle) {
@@ -1025,8 +1136,8 @@ static int append_win_network(rtq_filter *f, const char *proto, const char *stat
                               const char *local_ip, int local_port, const char *remote_ip,
                               int remote_port, DWORD pid, char *buf, int cap, int *offset,
                               int *total, int *truncated) {
-    if (f->network_proto[0] && !str_contains_icase(proto, f->network_proto)) return 0;
-    if (f->network_state[0] && !str_contains_icase(state, f->network_state)) return 0;
+    if (f->network_proto[0] && !str_eq_icase(proto, f->network_proto)) return 0;
+    if (f->network_state[0] && !str_eq_icase(state, f->network_state)) return 0;
     if (f->network_remote_ip[0] && !str_contains_icase(remote_ip, f->network_remote_ip)) return 0;
     if (f->network_remote_port > 0 && remote_port != f->network_remote_port) return 0;
     if (*total >= RTQ_MAX_RESULTS) {
@@ -1052,62 +1163,100 @@ static int append_win_network(rtq_filter *f, const char *proto, const char *stat
     return rtq_commit_row(buf, cap, offset, total, row, row_offset, truncated);
 }
 
-static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
-                         rtq_errors *errs, int *truncated) {
-    int count = 0;
-    DWORD tcp_rc = ERROR_SUCCESS;
-    DWORD udp_rc = ERROR_SUCCESS;
-    DWORD sz = 0;
-    tcp_rc = GetExtendedTcpTable(NULL, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    PMIB_TCPTABLE_OWNER_PID tcp = (PMIB_TCPTABLE_OWNER_PID)malloc(sz);
-    if (tcp) tcp_rc = GetExtendedTcpTable(tcp, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    else if (sz > 0) tcp_rc = ERROR_OUTOFMEMORY;
-    if (tcp && tcp_rc == NO_ERROR) {
-        for (DWORD i = 0; i < tcp->dwNumEntries && *total < RTQ_MAX_RESULTS; i++) {
-            char lip[64], rip[64];
-            ipv4_to_text(tcp->table[i].dwLocalAddr, lip, sizeof(lip));
-            ipv4_to_text(tcp->table[i].dwRemoteAddr, rip, sizeof(rip));
-            int lp = ntohs((u_short)tcp->table[i].dwLocalPort);
-            int rp = ntohs((u_short)tcp->table[i].dwRemotePort);
-            if (append_win_network(f, "tcp", tcp_state_text(tcp->table[i].dwState), lip, lp,
-                                   rip, rp, tcp->table[i].dwOwningPid, buf, cap, offset,
-                                   total, truncated)) count++;
-        }
+/* The table can grow between size discovery and the read. Retry only that
+ * bounded race, retain cancellation, and never allocate an unbounded table. */
+static void *read_win_network_table(rtq_filter *f, int tcp, ULONG family, DWORD *error) {
+    DWORD size = 0;
+    *error = tcp ? GetExtendedTcpTable(NULL, &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0)
+                 : GetExtendedUdpTable(NULL, &size, FALSE, family, UDP_TABLE_OWNER_PID, 0);
+    for (int attempt = 0; attempt < 3 && !rtq_cancelled(f); attempt++) {
+        if (*error != ERROR_INSUFFICIENT_BUFFER || size == 0 || size > 4u * 1024u * 1024u) return NULL;
+        void *table = malloc(size);
+        if (!table) { *error = ERROR_OUTOFMEMORY; return NULL; }
+        *error = tcp ? GetExtendedTcpTable(table, &size, FALSE, family, TCP_TABLE_OWNER_PID_ALL, 0)
+                     : GetExtendedUdpTable(table, &size, FALSE, family, UDP_TABLE_OWNER_PID, 0);
+        if (*error == NO_ERROR) return table;
+        free(table);
     }
-    free(tcp);
-    sz = 0;
-    udp_rc = GetExtendedUdpTable(NULL, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    PMIB_UDPTABLE_OWNER_PID udp = (PMIB_UDPTABLE_OWNER_PID)malloc(sz);
-    if (udp) udp_rc = GetExtendedUdpTable(udp, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    else if (sz > 0) udp_rc = ERROR_OUTOFMEMORY;
-    if (udp && udp_rc == NO_ERROR) {
-        for (DWORD i = 0; i < udp->dwNumEntries && *total < RTQ_MAX_RESULTS; i++) {
-            char lip[64];
-            ipv4_to_text(udp->table[i].dwLocalAddr, lip, sizeof(lip));
-            int lp = ntohs((u_short)udp->table[i].dwLocalPort);
-            if (append_win_network(f, "udp", "", lip, lp, "", 0,
-                                   udp->table[i].dwOwningPid, buf, cap, offset, total,
-                                   truncated)) count++;
-        }
-    }
-    free(udp);
-    if (tcp_rc != NO_ERROR && udp_rc != NO_ERROR) {
-        char message[192];
-        snprintf(message, sizeof(message),
-                 "Windows IP helper collectors failed; tcp_error=%lu udp_error=%lu",
-                 (unsigned long)tcp_rc, (unsigned long)udp_rc);
-        rtq_error_append(errs, "network", "collector_failed", message, 1);
-    } else if (tcp_rc != NO_ERROR || udp_rc != NO_ERROR) {
-        char message[192];
-        snprintf(message, sizeof(message),
-                 "Windows IP helper collection partial; tcp_error=%lu udp_error=%lu",
-                 (unsigned long)tcp_rc, (unsigned long)udp_rc);
-        rtq_error_append(errs, "network", "partial_failure", message, 1);
-    }
-    return count;
+    return NULL;
 }
 
-static int append_win_file_result(rtq_filter *f, const char *path, const WIN32_FIND_DATAA *fd,
+static int ipv6_to_text(const UCHAR address[16], DWORD scope, char *out, size_t cap) {
+    char text[INET6_ADDRSTRLEN];
+    if (!InetNtopA(AF_INET6, (void *)address, text, sizeof(text))) return 0;
+    int length = scope ? snprintf(out, cap, "%s%%%lu", text, (unsigned long)scope)
+                       : snprintf(out, cap, "%s", text);
+    return length >= 0 && (size_t)length < cap;
+}
+
+static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
+                         rtq_errors *errs, int *truncated) {
+    int before = *total;
+    int requested = 0, failed = 0;
+    int include_tcp = !f->network_proto[0] || str_eq_icase(f->network_proto, "TCP");
+    int include_udp = !f->network_proto[0] || str_eq_icase(f->network_proto, "UDP");
+    if (f->network_state[0] && !str_eq_icase(f->network_state, "UNCONN") &&
+        !str_eq_icase(f->network_state, "UNKNOWN")) include_udp = 0;
+    /* Windows owner-PID UDP tables contain local endpoints only. A remote
+     * predicate cannot be established from that table, even on IPv6. */
+    if (include_udp && (f->network_remote_ip[0] || f->network_remote_port > 0)) {
+        rtq_error_append(errs, "network", include_tcp ? "field_unavailable" : "collector_unavailable",
+                         "Windows UDP owner tables do not expose remote peers", 0);
+        include_udp = 0;
+    }
+    for (int tcp = 1; tcp >= 0; tcp--) {
+        if ((tcp && !include_tcp) || (!tcp && !include_udp)) continue;
+        for (int version = 4; version <= 6; version += 2) {
+            if (rtq_cancelled(f) || *truncated) return *total - before;
+            DWORD error;
+            requested++;
+            void *table = read_win_network_table(f, tcp, version == 4 ? AF_INET : AF_INET6, &error);
+            if (!table) { failed++; continue; }
+            DWORD count = *(DWORD *)table;
+            for (DWORD i = 0; i < count; i++) {
+                if (rtq_cancelled(f) || *truncated) break;
+                char local[64] = {0}, remote[64] = {0};
+                DWORD local_port = 0, remote_port = 0, pid = 0, state = 0;
+                if (tcp && version == 4) {
+                    MIB_TCPROW_OWNER_PID *row = &((PMIB_TCPTABLE_OWNER_PID)table)->table[i];
+                    ipv4_to_text(row->dwLocalAddr, local, sizeof(local));
+                    ipv4_to_text(row->dwRemoteAddr, remote, sizeof(remote));
+                    local_port = row->dwLocalPort; remote_port = row->dwRemotePort;
+                    pid = row->dwOwningPid; state = row->dwState;
+                } else if (tcp) {
+                    MIB_TCP6ROW_OWNER_PID *row = &((PMIB_TCP6TABLE_OWNER_PID)table)->table[i];
+                    if (!ipv6_to_text(row->ucLocalAddr, row->dwLocalScopeId, local, sizeof(local)) ||
+                        !ipv6_to_text(row->ucRemoteAddr, row->dwRemoteScopeId, remote, sizeof(remote))) {
+                        rtq_error_append(errs, "network", "field_unavailable", "IPv6 address conversion failed", 0);
+                        continue;
+                    }
+                    local_port = row->dwLocalPort; remote_port = row->dwRemotePort;
+                    pid = row->dwOwningPid; state = row->dwState;
+                } else if (version == 4) {
+                    MIB_UDPROW_OWNER_PID *row = &((PMIB_UDPTABLE_OWNER_PID)table)->table[i];
+                    ipv4_to_text(row->dwLocalAddr, local, sizeof(local));
+                    local_port = row->dwLocalPort; pid = row->dwOwningPid;
+                } else {
+                    MIB_UDP6ROW_OWNER_PID *row = &((PMIB_UDP6TABLE_OWNER_PID)table)->table[i];
+                    if (!ipv6_to_text(row->ucLocalAddr, row->dwLocalScopeId, local, sizeof(local))) {
+                        rtq_error_append(errs, "network", "field_unavailable", "IPv6 address conversion failed", 0);
+                        continue;
+                    }
+                    local_port = row->dwLocalPort; pid = row->dwOwningPid;
+                }
+                (void)append_win_network(f, tcp ? "tcp" : "udp", tcp ? tcp_state_text(state) : "UNCONN",
+                                        local, ntohs((u_short)local_port), remote, ntohs((u_short)remote_port),
+                                        pid, buf, cap, offset, total, truncated);
+            }
+            free(table);
+        }
+    }
+    if (failed) rtq_error_append(errs, "network", failed == requested ? "collector_failed" : "partial_failure",
+                                  "Windows IP helper table collection failed", 1);
+    return *total - before;
+}
+
+static int append_win_file_result(rtq_filter *f, const char *path, const WIN32_FIND_DATAW *fd,
                                   char *buf, int cap, int *offset, int *total,
                                   int *truncated) {
     if (!path || !fd) return 0;
@@ -1124,7 +1273,12 @@ static int append_win_file_result(rtq_filter *f, const char *path, const WIN32_F
     if (f->file_size_min > 0 && sz.QuadPart < f->file_size_min) return 0;
     if (f->file_size_max > 0 && sz.QuadPart > f->file_size_max) return 0;
     char sha[65] = {0};
-    if (!hash_file_if_needed(path, f->file_sha256, sha)) return 0;
+    int hash_rc = hash_file_if_needed(f, path, f->file_sha256, sha);
+    if (hash_rc <= 0) {
+        if (hash_rc == -2) f->file_hash_size_limit = 1;
+        else if (hash_rc < 0) f->file_unavailable = 1;
+        return 0;
+    }
     char row[RTQ_ROW_CAP];
     int row_offset = 0;
     row[0] = '\0';
@@ -1143,40 +1297,56 @@ static int append_win_file_result(rtq_filter *f, const char *path, const WIN32_F
 
 static void scan_win_files_limited(rtq_filter *f, const char *root, int depth, int *scanned,
                                    char *buf, int cap, int *offset, int *total, int *truncated) {
-    if (rtq_cancelled(f)) return;
-    if (!root || !root[0] || depth < 0 || *scanned >= RTQ_FILE_SCAN_MAX || *total >= RTQ_MAX_RESULTS) return;
-    DWORD attr = GetFileAttributesA(root);
-    if (attr == INVALID_FILE_ATTRIBUTES) return;
-    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        WIN32_FIND_DATAA fd;
-        memset(&fd, 0, sizeof(fd));
-        HANDLE h = FindFirstFileA(root, &fd);
-        if (h != INVALID_HANDLE_VALUE) {
-            (*scanned)++;
-            (void)append_win_file_result(f, root, &fd, buf, cap, offset, total, truncated);
-            FindClose(h);
-        }
+    if (rtq_cancelled(f) || !root || !root[0]) return;
+    if (depth < 0) { f->file_depth_limit = 1; return; }
+    if (*scanned >= RTQ_FILE_SCAN_MAX) { f->file_scan_limit = 1; return; }
+    if (*total >= RTQ_MAX_RESULTS) { *truncated = 1; return; }
+    DWORD attr = win_file_attributes(root);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        DWORD error = GetLastError();
+        if ((error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
+            strcmp(root, f->file_path) == 0) f->file_path_missing = 1;
+        else f->file_unavailable = 1;
         return;
     }
+    if (attr & FILE_ATTRIBUTE_REPARSE_POINT) { f->file_unavailable = 1; return; }
     char pattern[1024];
-    snprintf(pattern, sizeof(pattern), "%s\\*", root);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    int written = snprintf(pattern, sizeof(pattern), "%s%s", root,
+                           attr & FILE_ATTRIBUTE_DIRECTORY ? "\\*" : "");
+    if (written < 0 || written >= (int)sizeof(pattern)) { f->file_unavailable = 1; return; }
+    WCHAR wide_pattern[1024];
+    if (!utf8_to_wide_str(pattern, wide_pattern, sizeof(wide_pattern) / sizeof(wide_pattern[0]))) {
+        f->file_unavailable = 1; return;
+    }
+    WIN32_FIND_DATAW data;
+    HANDLE handle = FindFirstFileW(wide_pattern, &data);
+    if (handle == INVALID_HANDLE_VALUE) {
+        if (GetLastError() != ERROR_FILE_NOT_FOUND) f->file_unavailable = 1;
+        return;
+    }
+    int stopped = 0;
     do {
-        if (rtq_cancelled(f)) break;
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
+        char name[1040];
+        if (!wide_to_utf8_str(data.cFileName, name, sizeof(name))) { f->file_unavailable = 1; continue; }
+        if (rtq_cancelled(f)) { stopped = 1; break; }
+        if (*scanned >= RTQ_FILE_SCAN_MAX) { f->file_scan_limit = 1; stopped = 1; break; }
+        if (*total >= RTQ_MAX_RESULTS || *truncated) { stopped = 1; break; }
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { f->file_unavailable = 1; continue; }
         char child[1024];
-        snprintf(child, sizeof(child), "%s\\%s", root, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            scan_win_files_limited(f, child, depth - 1, scanned, buf, cap, offset, total,
-                                   truncated);
+        written = attr & FILE_ATTRIBUTE_DIRECTORY
+                    ? snprintf(child, sizeof(child), "%s\\%s", root, name)
+                    : snprintf(child, sizeof(child), "%s", root);
+        if (written < 0 || written >= (int)sizeof(child)) { f->file_unavailable = 1; continue; }
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scan_win_files_limited(f, child, depth - 1, scanned, buf, cap, offset, total, truncated);
         } else {
             (*scanned)++;
-            (void)append_win_file_result(f, child, &fd, buf, cap, offset, total, truncated);
+            (void)append_win_file_result(f, child, &data, buf, cap, offset, total, truncated);
         }
-    } while (FindNextFileA(h, &fd) && *scanned < RTQ_FILE_SCAN_MAX && *total < RTQ_MAX_RESULTS);
-    FindClose(h);
+    } while (FindNextFileW(handle, &data));
+    if (!stopped && GetLastError() != ERROR_NO_MORE_FILES) f->file_unavailable = 1;
+    FindClose(handle);
 }
 
 static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *total,
@@ -1186,11 +1356,11 @@ static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *tota
     if (f->file_path[0]) f->file_path_scanned = 1;
     if (f->file_sha256[0]) {
         if (f->file_path[0]) {
-            DWORD attr = GetFileAttributesA(f->file_path);
-            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            DWORD attr = win_file_attributes(f->file_path);
+            if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
                 scan_win_files_limited(f, f->file_path, 0, &scanned, buf, cap, offset,
                                        total, truncated);
-            }
+            } else f->file_unavailable = 1;
         }
     } else if (f->file_path[0]) {
         scan_win_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap,
@@ -1225,23 +1395,52 @@ static int match_registry_key(rtq_filter *f, HKEY root, const char *subkey,
                               const char *display_path, int depth, int subtree,
                               int *keys_scanned, int *access_denied,
                               char *buf, int cap, int *offset, int *total,
-                              int *truncated) {
-    if (rtq_cancelled(f) || *keys_scanned >= 512 || *total >= RTQ_MAX_RESULTS) return 0;
+                              int *truncated, rtq_errors *errs) {
+    if (rtq_cancelled(f)) return 0;
+    if (*keys_scanned >= 512) { rtq_error_append(errs, "registry", "scan_limit", "registry key limit reached", 0); return 0; }
+    if (*total >= RTQ_MAX_RESULTS) { *truncated = 1; return 0; }
     HKEY key = NULL;
-    LONG open_rc = RegOpenKeyExA(root, subkey, 0, KEY_READ, &key);
+    WCHAR wide_subkey[1024];
+    if (!utf8_to_wide_str(subkey, wide_subkey, sizeof(wide_subkey) / sizeof(wide_subkey[0]))) {
+        rtq_error_append(errs, "registry", "field_unavailable", "registry path conversion failed", 0);
+        return 0;
+    }
+    LONG open_rc = RegOpenKeyExW(root, wide_subkey, 0, KEY_READ, &key);
     if (open_rc != ERROR_SUCCESS) {
         if (open_rc == ERROR_ACCESS_DENIED) (*access_denied)++;
+        else if (open_rc != ERROR_FILE_NOT_FOUND && open_rc != ERROR_PATH_NOT_FOUND)
+            rtq_error_append(errs, "registry", "enumeration_failed", "registry key open failed", 1);
+        else if (depth > 0)
+            rtq_error_append(errs, "registry", "field_unavailable", "registry child disappeared during enumeration", 0);
         return 0;
     }
     (*keys_scanned)++;
+    DWORD subkeys = 0, values = 0;
+    LONG info_rc = RegQueryInfoKeyW(key, NULL, NULL, NULL, &subkeys, NULL, NULL,
+                                  &values, NULL, NULL, NULL, NULL);
+    if (info_rc != ERROR_SUCCESS) rtq_error_append(errs, "registry", "enumeration_failed", "registry key metadata failed", 1);
+    if (values > 128 || (subtree && subkeys > 256)) rtq_error_append(errs, "registry", "scan_limit", "registry per-key enumeration limit reached", 0);
+    if (subtree && depth >= 4 && subkeys > 0) rtq_error_append(errs, "registry", "scan_depth_limit", "registry subtree depth limit reached", 0);
     int count = 0;
     for (DWORD i = 0; i < 128 && *total < RTQ_MAX_RESULTS; i++) {
         if (rtq_cancelled(f)) break;
-        char name[260];
-        BYTE data[1024];
-        DWORD name_len = sizeof(name), data_len = sizeof(data), type = 0;
-        LONG rc = RegEnumValueA(key, i, name, &name_len, NULL, &type, data, &data_len);
-        if (rc != ERROR_SUCCESS) break;
+        WCHAR wide_name[260], data[1024] = {0};
+        char name[1040];
+        DWORD name_len = sizeof(wide_name) / sizeof(wide_name[0]), data_len = sizeof(data), type = 0;
+        LONG rc = RegEnumValueW(key, i, wide_name, &name_len, NULL, &type, (BYTE *)data, &data_len);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc == ERROR_MORE_DATA) {
+            rtq_error_append(errs, "registry", "field_unavailable", "registry value exceeds bounded data capacity", 0);
+            continue;
+        }
+        if (rc != ERROR_SUCCESS) {
+            rtq_error_append(errs, "registry", "enumeration_failed", "registry value enumeration failed", 1);
+            break;
+        }
+        if (!wide_to_utf8_str(wide_name, name, sizeof(name))) {
+            if (!wide_name[0]) name[0] = '\0';
+            else { rtq_error_append(errs, "registry", "field_unavailable", "registry name conversion failed", 0); continue; }
+        }
         if (f->registry_value[0] && !str_contains_icase(name, f->registry_value)) continue;
         char row[RTQ_ROW_CAP];
         int row_offset = 0;
@@ -1254,13 +1453,31 @@ static int match_registry_key(rtq_filter *f, HKEY root, const char *subkey,
                                         "value", name[0] ? name : "(Default)") &&
                      rtq_appendf(row, (int)sizeof(row), &row_offset,
                                  ",\"reg_type\":%lu", (unsigned long)type);
-        if ((type == REG_SZ || type == REG_EXPAND_SZ) && data_len > 0) {
-            data[sizeof(data) - 1u] = 0;
-            if (row_ok) {
-                row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset,
-                                             "data", (const char *)data);
+        char display_data[4200] = {0};
+        if (type == REG_SZ || type == REG_EXPAND_SZ) {
+            if (data_len > sizeof(data) || data_len % sizeof(WCHAR) ||
+                (data_len > 0 && data[data_len / sizeof(WCHAR) - 1] != 0) ||
+                (data[0] && !wide_to_utf8_str(data, display_data, sizeof(display_data)))) {
+                rtq_error_append(errs, "registry", "field_unavailable", "registry string is not complete", 0);
+                continue;
+            }
+        } else if (type == REG_DWORD && data_len == sizeof(DWORD)) {
+            DWORD value; memcpy(&value, data, sizeof(value));
+            snprintf(display_data, sizeof(display_data), "%lu", (unsigned long)value);
+        } else if (type == REG_QWORD && data_len == sizeof(uint64_t)) {
+            uint64_t value; memcpy(&value, data, sizeof(value));
+            snprintf(display_data, sizeof(display_data), "%llu", (unsigned long long)value);
+        } else {
+            /* Bounded hex also preserves binary and MULTI_SZ bytes without
+             * inventing a single-string interpretation. */
+            static const char hex[] = "0123456789abcdef";
+            for (DWORD j = 0; j < data_len && j < sizeof(data); j++) {
+                display_data[j * 2] = hex[((BYTE *)data)[j] >> 4];
+                display_data[j * 2 + 1] = hex[((BYTE *)data)[j] & 15];
             }
         }
+        if (row_ok) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset,
+                                               "data", display_data);
         if (row_ok) row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset, "}");
         if (!row_ok || !rtq_commit_row(buf, cap, offset, total, row, row_offset, truncated)) {
             if (truncated) *truncated = 1;
@@ -1271,21 +1488,35 @@ static int match_registry_key(rtq_filter *f, HKEY root, const char *subkey,
     if (subtree && depth < 4 && *keys_scanned < 512 && *total < RTQ_MAX_RESULTS) {
         for (DWORD i = 0; i < 256 && *keys_scanned < 512 && *total < RTQ_MAX_RESULTS; i++) {
             if (rtq_cancelled(f)) break;
-            char child[260];
-            DWORD child_len = sizeof(child);
+            WCHAR wide_child[260];
+            char child[1040];
+            DWORD child_len = sizeof(wide_child) / sizeof(wide_child[0]);
             FILETIME modified;
-            LONG enum_rc = RegEnumKeyExA(key, i, child, &child_len, NULL, NULL, NULL, &modified);
+            LONG enum_rc = RegEnumKeyExW(key, i, wide_child, &child_len, NULL, NULL, NULL, &modified);
             if (enum_rc == ERROR_NO_MORE_ITEMS) break;
-            if (enum_rc != ERROR_SUCCESS) continue;
-            char child_subkey[780];
+            if (enum_rc != ERROR_SUCCESS) {
+                rtq_error_append(errs, "registry", "field_unavailable", "registry child key could not be enumerated", 0);
+                continue;
+            }
+            if (!wide_to_utf8_str(wide_child, child, sizeof(child))) {
+                rtq_error_append(errs, "registry", "field_unavailable", "registry child name conversion failed", 0);
+                continue;
+            }
+            char child_subkey[1024];
             char child_display[900];
-            snprintf(child_subkey, sizeof(child_subkey), "%s%s%s",
+            int key_length = snprintf(child_subkey, sizeof(child_subkey), "%s%s%s",
                      subkey, subkey[0] ? "\\" : "", child);
-            snprintf(child_display, sizeof(child_display), "%s\\%s", display_path, child);
+            int display_length = snprintf(child_display, sizeof(child_display), "%s\\%s", display_path, child);
+            if (key_length < 0 || key_length >= (int)sizeof(child_subkey) ||
+                display_length < 0 || display_length >= (int)sizeof(child_display)) {
+                rtq_error_append(errs, "registry", "field_unavailable", "registry child path exceeds bounded capacity", 0);
+                continue;
+            }
             count += match_registry_key(f, root, child_subkey, child_display, depth + 1,
                                         subtree, keys_scanned, access_denied,
-                                        buf, cap, offset, total, truncated);
+                                        buf, cap, offset, total, truncated, errs);
         }
+        if (*keys_scanned >= 512) rtq_error_append(errs, "registry", "scan_limit", "registry key limit reached", 0);
     }
     RegCloseKey(key);
     return count;
@@ -1305,7 +1536,7 @@ static int match_registry(rtq_filter *f, char *buf, int cap, int *offset, int *t
     int subtree = _stricmp(f->registry_mode, "subtree") == 0;
     int count = match_registry_key(f, root, subkey, f->registry_path, 0, subtree,
                                    &keys_scanned, &access_denied,
-                                   buf, cap, offset, total, truncated);
+                                   buf, cap, offset, total, truncated, errs);
     if (keys_scanned == 0) {
         rtq_error_append(errs, "registry", access_denied ? "access_denied" : "key_not_found",
                          access_denied ? "registry key access denied" : "registry key not found",
@@ -1526,7 +1757,7 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
         return -1;
     }
     int exit_code = 0;
-    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+    if (edr_shell_exec_cancellable(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code, rtq_sampler_cancel_check, f) != 0 ||
         exit_code != 0) {
         char msg[768];
         sampler_error_message(msg, sizeof(msg), cmd, exit_code, output);
@@ -1534,6 +1765,8 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
         free(output);
         return -1;
     }
+
+    rtq_sampler_complete_lines(output, "process", errs);
 
 #if !defined(__linux__)
     if (f->process_path[0]) {
@@ -1545,18 +1778,29 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
     int count = 0;
     char *save = NULL;
     char *line = strtok_r(output, "\n", &save);
-    while (line && *total < RTQ_MAX_RESULTS) {
+    while (line && !rtq_cancelled(f) && !*truncated) {
         char *cur = line;
         line = strtok_r(NULL, "\n", &save);
         int loc_pid = 0, loc_ppid = 0;
         char loc_user[64] = {0}, loc_comm[256] = {0};
-        char rest[2560] = {0};
-        (void)sscanf(cur, "%d %d %63s %255s %2559[^\n]",
-            &loc_pid, &loc_ppid, loc_user, loc_comm, rest);
+        char rest[8193] = {0};
+        int consumed = 0;
+        int columns = sscanf(cur, "%d %d %63s %255s %8192[^\n]%n",
+            &loc_pid, &loc_ppid, loc_user, loc_comm, rest, &consumed);
         if (loc_pid <= 0) continue;
+        if (columns < 5 || consumed < (int)strlen(cur)) {
+            rtq_error_append(errs, "process", "field_unavailable", "process sampler record exceeded field capacity", 0);
+            continue;
+        }
 
         char path[1024] = {0};
-        if (f->process_path[0]) read_proc_exe_path(loc_pid, path, sizeof(path));
+        if (f->process_path[0]) {
+            read_proc_exe_path(loc_pid, path, sizeof(path));
+            if (!path[0] || strlen(path) >= sizeof(path) - 1u) {
+                rtq_error_append(errs, "process", "field_unavailable", "requested process path could not be read completely", 0);
+                continue;
+            }
+        }
 
         int ok = 1;
         if (f->process_name[0] && !str_contains_icase(loc_comm, f->process_name)) ok = 0;
@@ -1665,12 +1909,17 @@ static int append_network_result(rtq_filter *f, const char *proto, const char *s
                                  const char *local_addr, const char *remote_addr,
                                  const char *tail, char *buf, int cap, int *offset, int *total,
                                  int *truncated) {
+    char normalized_state[32];
+    canonical_network_state(state, normalized_state, sizeof(normalized_state));
+    state = normalized_state;
+    proto = str_contains_icase(proto, "udp") ? "udp" : "tcp";
+    if (!state[0]) state = !strcmp(proto, "udp") ? "UNCONN" : "UNKNOWN";
     char remote_ip[128] = {0};
     int remote_port = 0;
     split_addr_port(remote_addr, remote_ip, sizeof(remote_ip), &remote_port);
 
-    if (f->network_proto[0] && !str_contains_icase(proto, f->network_proto)) return 0;
-    if (f->network_state[0] && !str_contains_icase(state, f->network_state)) return 0;
+    if (f->network_proto[0] && !str_eq_icase(proto, f->network_proto)) return 0;
+    if (f->network_state[0] && !str_eq_icase(state, f->network_state)) return 0;
     if (f->network_remote_ip[0] &&
         !str_contains_icase(remote_ip, f->network_remote_ip) &&
         !str_contains_icase(remote_addr, f->network_remote_ip)) return 0;
@@ -1710,7 +1959,7 @@ static int append_network_result(rtq_filter *f, const char *proto, const char *s
 }
 
 static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
-                           int *sampler_ok, char *err_msg, size_t err_cap, int *truncated) {
+                           int *sampler_ok, char *err_msg, size_t err_cap, int *truncated, rtq_errors *errs) {
     const char *cmd = "ss -tunapH";
     if (sampler_ok) *sampler_ok = 0;
     char *output = (char *)malloc(RTQ_SAMPLER_OUTPUT_MAX);
@@ -1719,18 +1968,19 @@ static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *
         return 0;
     }
     int exit_code = 0;
-    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+    if (edr_shell_exec_cancellable(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code, rtq_sampler_cancel_check, f) != 0 ||
         exit_code != 0) {
         if (err_msg && err_cap > 0) sampler_error_message(err_msg, err_cap, cmd, exit_code, output);
         free(output);
         return 0;
     }
     if (sampler_ok) *sampler_ok = 1;
+    rtq_sampler_complete_lines(output, "network", errs);
 
     int count = 0;
     char *save = NULL;
     char *line = strtok_r(output, "\n", &save);
-    while (line && *total < RTQ_MAX_RESULTS) {
+    while (line && !rtq_cancelled(f) && !*truncated) {
         char *cur = line;
         line = strtok_r(NULL, "\n", &save);
         char proto[16] = {0}, state[32] = {0}, recvq[32] = {0}, sendq[32] = {0};
@@ -1749,7 +1999,7 @@ static int scan_ss_network(rtq_filter *f, char *buf, int cap, int *offset, int *
 
 static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, int *total,
                                 int *sampler_ok, char *err_msg, size_t err_cap,
-                                int *truncated) {
+                                int *truncated, rtq_errors *errs) {
     const char *cmd = "netstat -an";
     if (sampler_ok) *sampler_ok = 0;
     char *output = (char *)malloc(RTQ_SAMPLER_OUTPUT_MAX);
@@ -1758,18 +2008,19 @@ static int scan_netstat_network(rtq_filter *f, char *buf, int cap, int *offset, 
         return 0;
     }
     int exit_code = 0;
-    if (edr_shell_exec(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code) != 0 ||
+    if (edr_shell_exec_cancellable(cmd, RTQ_SAMPLER_TIMEOUT_SEC, output, RTQ_SAMPLER_OUTPUT_MAX, &exit_code, rtq_sampler_cancel_check, f) != 0 ||
         exit_code != 0) {
         if (err_msg && err_cap > 0) sampler_error_message(err_msg, err_cap, cmd, exit_code, output);
         free(output);
         return 0;
     }
     if (sampler_ok) *sampler_ok = 1;
+    rtq_sampler_complete_lines(output, "network", errs);
 
     int count = 0;
     char *save = NULL;
     char *line = strtok_r(output, "\n", &save);
-    while (line && *total < RTQ_MAX_RESULTS) {
+    while (line && !rtq_cancelled(f) && !*truncated) {
         char *cur = line;
         line = strtok_r(NULL, "\n", &save);
         char proto[16] = {0}, recvq[32] = {0}, sendq[32] = {0};
@@ -1794,10 +2045,10 @@ static int match_network(rtq_filter *f, char *buf, int cap, int *offset, int *to
     char ss_err[768] = {0};
     char netstat_err[768] = {0};
     int count = scan_ss_network(f, buf, cap, offset, total, &ss_ok, ss_err, sizeof(ss_err),
-                                truncated);
+                                truncated, errs);
     if (ss_ok) return count;
     count = scan_netstat_network(f, buf, cap, offset, total, &netstat_ok, netstat_err,
-                                 sizeof(netstat_err), truncated);
+                                 sizeof(netstat_err), truncated, errs);
     if (!netstat_ok) {
         char msg[1600];
         snprintf(msg, sizeof(msg), "all network samplers failed; ss=%s; netstat=%s",
@@ -1816,10 +2067,10 @@ static int match_files(rtq_filter *f, char *buf, int cap, int *offset, int *tota
     if (f->file_sha256[0]) {
         if (f->file_path[0]) {
             struct stat st;
-            if (stat(f->file_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (lstat(f->file_path, &st) != 0 || S_ISREG(st.st_mode)) {
                 scan_files_limited(f, f->file_path, 0, &scanned, buf, cap, offset, total,
                                    truncated);
-            }
+            } else f->file_unavailable = 1;
         }
     } else if (f->file_path[0]) {
         scan_files_limited(f, f->file_path, RTQ_FILE_SCAN_DEPTH, &scanned, buf, cap, offset,
@@ -1840,7 +2091,11 @@ static int match_file_hash_cache(rtq_filter *f, char *buf, int cap, int *offset,
     f->file_cache_attempted = 1;
     size_t rows_cap = RTQ_MAX_RESULT_STR / 2u;
     char *rows = (char *)malloc(rows_cap);
-    if (!rows) return 0;
+    if (!rows) {
+        f->file_cache_failed = 1;
+        rtq_error_append(errs, "file_hash_cache", "oom", "hash cache allocation failed", 1);
+        return 0;
+    }
     uint32_t returned = 0;
     uint32_t scanned = 0;
     int cache_truncated = 0;
@@ -1849,6 +2104,7 @@ static int match_file_hash_cache(rtq_filter *f, char *buf, int cap, int *offset,
                                                       rows, rows_cap,
                                                       &returned, &scanned,
                                                       &cache_truncated) != 0) {
+        f->file_cache_failed = 1;
         rtq_error_append(errs, "file_hash_cache", "cache_query_failed",
                          "local evidence hash cache query failed", 1);
         free(rows);
@@ -1874,6 +2130,11 @@ static int match_files_cache_first(rtq_filter *f, char *buf, int cap, int *offse
     if (!f->file_sha256[0] || (cache_hits == 0 && f->file_path[0])) {
         (void)match_files(f, buf, cap, offset, total, truncated);
     }
+    if (f->file_scan_limit) rtq_error_append(errs, "file", "scan_limit", "file scan item limit reached", 0);
+    if (f->file_depth_limit) rtq_error_append(errs, "file", "scan_depth_limit", "file scan depth limit reached", 0);
+    if (f->file_unavailable) rtq_error_append(errs, "file", "field_unavailable", "some requested files could not be read", 0);
+    if (f->file_hash_size_limit) rtq_error_append(errs, "file", "hash_size_limit", "file exceeds bounded hash size", 0);
+    if (f->file_path_missing) rtq_error_append(errs, "file", "path_not_found", "requested path not found", 0);
     return *total - before;
 }
 
@@ -1894,6 +2155,9 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
         return;
     }
     filter.command_id = cmd_id;
+    char canonical_state[32];
+    canonical_network_state(filter.network_state, canonical_state, sizeof(canonical_state));
+    snprintf(filter.network_state, sizeof(filter.network_state), "%s", canonical_state);
 
     char *result = (char *)malloc(RTQ_MAX_RESULT_STR);
     if (!result) {
@@ -1980,11 +2244,17 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
 
     const char *cache_status = !filter.file_sha256[0]
                                    ? "not_requested"
-                                   : (filter.file_cache_hits > 0 ? "hit" : "miss");
+                                   : (filter.file_cache_failed ? "unavailable" :
+                                      filter.file_cache_hits > 0 ? "hit" : "miss");
+    const char *scope = filter.file_sha256[0]
+                           ? (filter.file_path[0] ? "cache_and_exact_path" : "cache_only")
+                           : (filter.file_path[0] ? "path_scan" : "bounded_default_roots");
+    if (errors.count) (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n],\"partial\":true");
+    else (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n]");
     (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset,
-        "\n],\"total\":%d,\"truncated\":%s,\"meta\":{\"file_hash\":{\"cache_status\":\"%s\",\"cache_attempted\":%s,"
+        ",\"total\":%d,\"truncated\":%s,\"meta\":{\"file_hash\":{\"scope\":\"%s\",\"cache_status\":\"%s\",\"cache_attempted\":%s,"
         "\"cache_hits\":%d,\"cache_candidates_scanned\":%u,\"path_scanned\":%s}},\"error\":",
-        total, output_truncated ? "true" : "false", cache_status,
+        total, output_truncated ? "true" : "false", scope, cache_status,
         filter.file_cache_attempted ? "true" : "false",
         filter.file_cache_hits, filter.file_cache_candidates,
         filter.file_path_scanned ? "true" : "false");

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define COUNT_OF(values) (sizeof(values) / sizeof((values)[0]))
+
 #ifdef _WIN32
 static void test_setenv(const char *name, const char *value) { _putenv_s(name, value); }
 #else
@@ -201,6 +203,55 @@ int main(void) {
   require_true(!validate("rtq_execute", "{\"file_sha256\":\"abc\"}",
                          reason, sizeof(reason)),
                "reject malformed RTQ SHA256");
+  const char *invalid_rtq[] = {
+    "{\"process_name\":\"powershell\",\"network_remote_port\":443}",
+    "{\"process_pid_min\":200,\"process_pid_max\":100}",
+    "{\"process_pid_max\":2147483648}",
+    "{\"process_pid_min\":4294967295}",
+    "{\"process_pid_min\":-1}",
+    "{\"process_pid_max\":1.5}",
+    "{\"network_proto\":\"T\"}",
+    "{\"network_state\":\"EST\"}",
+    "{\"network_proto\":\"UDP\",\"network_state\":\"ESTABLISHED\"}",
+    "{\"script_content\":\"download\",\"process_cmdline\":\"hidden\"}",
+    "{\"registry_value\":\"Updater\"}",
+    "{\"registry_path\":\"Software\"}",
+    "{\"registry_path\":\" HKLM\\\\Software\"}",
+    "{\"file_sha256\":\"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\"}",
+    "{\"process_name\":\"\"}",
+    "{\"process_name\":\"   \"}",
+    "{\"process_pid_min\":0}",
+    "{\"network_remote_port\":0}",
+    "{\"process_name\":\"power\\u0000shell\"}",
+    "{\"process_name\":\"bad\xc0\xaf\"}"
+  };
+  for (size_t i = 0; i < COUNT_OF(invalid_rtq); i++) {
+    if (validate("rtq_execute", invalid_rtq[i], reason, sizeof(reason))) {
+      fprintf(stderr, "FAIL: semantically invalid RTQ sample %zu was accepted\n", i);
+      return 1;
+    }
+    require_true(reason[0] != '\0', "invalid RTQ must report an actionable reason");
+  }
+  const char *valid_rtq[] = {
+    "{\"process_pid_min\":10,\"process_pid_max\":20}",
+    "{\"process_pid_min\":1,\"process_pid_max\":2147483647}",
+    "{\"process_name\":\"powershell\",\"process_pid_min\":0,\"process_pid_max\":0}",
+    "{\"script_content\":\"download\",\"process_cmdline\":\"download\",\"script_engine\":\"powershell\"}",
+    "{\"script_engine\":\"powershell\",\"process_name\":\"pwsh\"}",
+    "{\"network_proto\":\"tcp\",\"network_state\":\"SYN-RECV\",\"network_remote_port\":0}",
+    "{\"network_proto\":\"udp\",\"network_state\":\"UNCONN\"}",
+    "{\"registry_path\":\"HKLM\\\\Software\",\"registry_mode\":\"SUBTREE\"}",
+    "{\"registry_path\":\"HKEY_CURRENT_USER\"}",
+    "{\"file_sha256\":\"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789\"}",
+    "{\"process_name\":\"powershell\",\"registry_path\":\"\",\"registry_mode\":\"\"}",
+    "{\"process_cmdline\":\"literal \\\\u0000 text\"}"
+  };
+  for (size_t i = 0; i < COUNT_OF(valid_rtq); i++) {
+    if (!validate("rtq_execute", valid_rtq[i], reason, sizeof(reason))) {
+      fprintf(stderr, "FAIL: valid RTQ sample %zu: %s\n", i, reason);
+      return 1;
+    }
+  }
   require_true(validate("velo_query", "{\"scope\":\"inspect_process\",\"pid\":42,\"limit\":100,\"backend\":\"local_collector\",\"provider_requested\":\"auto\",\"fallback_reason\":\"\",\"initiated_by\":\"operator\"}", reason, sizeof(reason)),
                "current backend velo payload satisfies strict contract");
   require_true(validate("REFRESH_ATTACK_SURFACE", "{\"reason\":\"manual attack surface refresh\"}",

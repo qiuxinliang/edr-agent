@@ -205,9 +205,79 @@ static void rtq_diagnostic_purpose_tests(void) {
   puts("PASS: RTQ bounded diagnostics preserve warnings across projection, durable owner and final gate for all six query categories; real errors cannot be downgraded");
 }
 
+static void rtq_file_metadata_purpose_tests(void) {
+  const char *sha="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  char request[200],detail[1600],projected[16384],canonical[16384];
+  snprintf(request,sizeof(request),"{\"file_sha256\":\"%s\"}",sha);
+  EdrSoarCommandMeta m=task("rtq-cache-metadata","rtq_execute");
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)request,strlen(request),(int64_t)time(NULL)*1000)==0);
+  snprintf(detail,sizeof(detail),"{\"results\":[{\"type\":\"file\",\"path\":\"/tmp/cached.exe\",\"sha256\":\"%s\",\"size\":3,\"cache_hit\":true}],\"total\":1,\"truncated\":false,\"partial\":true,\"meta\":{\"file_hash\":{\"scope\":\"cache_only\",\"cache_status\":\"hit\",\"cache_attempted\":true,\"cache_hits\":1,\"cache_candidates_scanned\":7,\"path_scanned\":false,\"local_database\":\"UNRELATED-PATH\"},\"raw_cache\":\"UNRELATED-TEXT\"},\"errors\":[{\"source\":\"file\",\"code\":\"scan_limit\",\"severity\":\"warning\",\"retryable\":false}]}",sha);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0);
+  cJSON *root=cJSON_Parse(projected);CHECK(root);
+  cJSON *hash=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"meta"),"file_hash");CHECK(cJSON_IsObject(hash));
+  CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(hash,"scope")->valuestring,"cache_only"));
+  CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(hash,"cache_status")->valuestring,"hit"));
+  CHECK(cJSON_GetObjectItemCaseSensitive(hash,"cache_hits")->valueint==1);
+  CHECK(cJSON_GetObjectItemCaseSensitive(hash,"cache_candidates_scanned")->valueint==7);
+  CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(hash,"cache_attempted")));
+  CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(hash,"path_scanned")));
+  CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"partial")));
+  CHECK(!strstr(projected,"UNRELATED"));cJSON_Delete(root);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,projected,canonical,sizeof(canonical))==0 && !strcmp(projected,canonical));
+  CHECK(edr_command_state_finish("rtq-cache-metadata","rtq_execute",&m,"ok",1,0,detail,"",1)==0);
+  char *body=persisted_body("rtq-cache-metadata","rtq_execute");CHECK(allowed("tenant","ep",body));
+  CHECK(strstr(body,"cache_candidates_scanned") && strstr(body,"cache_only") && !strstr(body,"UNRELATED"));free(body);
+  const char *invalid_hash[]={
+    "{\"scope\":\"unbounded_full_disk\",\"cache_status\":\"miss\"}",
+    "{\"scope\":\"cache_only\",\"cache_status\":\"unknown\"}",
+    "{\"scope\":\"cache_only\",\"cache_status\":\"miss\",\"cache_hits\":-1}",
+    "{\"scope\":\"cache_only\",\"cache_status\":\"miss\",\"cache_hits\":\"1\"}",
+    "{\"scope\":\"cache_only\",\"cache_status\":\"miss\",\"path_scanned\":1}",
+    "{\"scope\":\"cache_only\",\"cache_status\":\"miss\",\"cache_candidates_scanned\":0.5}"};
+  for(size_t i=0;i<sizeof(invalid_hash)/sizeof(invalid_hash[0]);i++) {
+    snprintf(detail,sizeof(detail),"{\"results\":[],\"truncated\":false,\"meta\":{\"file_hash\":%s}}",invalid_hash[i]);
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))!=0);
+  }
+  /* Metadata is purpose-bound; unrelated process queries never gain cache data. */
+  m=task("rtq-unrequested-metadata","rtq_execute");
+  snprintf(detail,sizeof(detail),"{\"results\":[],\"truncated\":false,\"meta\":{\"file_hash\":{\"scope\":\"cache_only\",\"cache_status\":\"hit\",\"cache_hits\":1}}}");
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0 && !strstr(projected,"file_hash"));
+  m=task("rtq-extension-contract","rtq_execute");
+  const char *extension="{\"file_ext\":\".exe\"}";
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)extension,strlen(extension),(int64_t)time(NULL)*1000)==0);
+  const char *rows[]={"{\"results\":[{\"type\":\"file\",\"path\":\"/tmp/exact.EXE\",\"size\":3}],\"truncated\":false}",
+      "{\"results\":[{\"type\":\"file\",\"path\":\"/tmp/prefix.exec\",\"size\":3}],\"truncated\":false}"};
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,rows[0],projected,sizeof(projected))==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,rows[1],projected,sizeof(projected))!=0);
+  puts("PASS: RTQ cache completeness metadata survives projection, durable replay and final guard; unrequested metadata, invalid counters and extension-prefix rows remain rejected");
+}
+
+static void rtq_alias_and_sentinel_purpose_tests(void) {
+  static const struct {const char *request;const char *row;} cases[]={
+    {"{\"network_proto\":\"tcp\",\"network_state\":\"ESTAB\"}", "{\"type\":\"network\",\"proto\":\"TCP\",\"state\":\"ESTABLISHED\",\"local_ip\":\"::1\",\"remote_ip\":\"2001:db8::1\"}"},
+    {"{\"network_state\":\"SYN-RECV\"}","{\"type\":\"network\",\"proto\":\"tcp\",\"state\":\"SYN_RCVD\"}"},
+    {"{\"registry_path\":\"HKLM\\\\Software\\\\Allowed\",\"registry_mode\":\"SUBTREE\"}","{\"type\":\"registry\",\"key\":\"HKLM\\\\Software\\\\Allowed\\\\Child\",\"value\":\"number\",\"data\":\"1234\",\"reg_type\":4}"},
+    {"{\"file_ext\":\".exe\",\"process_pid_min\":0,\"process_pid_max\":0,\"network_remote_port\":0}","{\"type\":\"file\",\"path\":\"/tmp/fixture.exe\",\"size\":3}"},
+    {"{\"process_name\":\"foo\",\"process_pid_max\":0}","{\"type\":\"process\",\"name\":\"foo\",\"pid\":42}"}
+  };
+  char detail[1200],projected[16384],id[64];
+  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+    snprintf(id,sizeof(id),"rtq-direct-alias-%zu",i);
+    EdrSoarCommandMeta m=task(id,"rtq_execute");
+    CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)cases[i].request,strlen(cases[i].request),(int64_t)time(NULL)*1000)==0);
+    snprintf(detail,sizeof(detail),"{\"results\":[%s],\"truncated\":false,\"errors\":[]}",cases[i].row);
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0);
+    CHECK(edr_command_state_finish(id,"rtq_execute",&m,"ok",1,0,detail,"",1)==0);
+    char *body=persisted_body(id,"rtq_execute");CHECK(allowed("tenant","ep",body));free(body);
+  }
+  puts("PASS: supported direct state/mode aliases and unset numeric sentinels agree across projection and final authorization");
+}
+
 static void purpose_tests(void) {
   shell_open_purpose_tests();
   rtq_diagnostic_purpose_tests();
+  rtq_file_metadata_purpose_tests();
+  rtq_alias_and_sentinel_purpose_tests();
   EdrSoarCommandMeta q=task("purpose-query","rtq_execute");
   const char *injected="{\"results\":[{\"type\":\"process\",\"pid\":12,\"name\":\"foo\",\"user\":\"UNRELATED_IDENTITY\",\"cmdline\":\"UNRELATED_COMMAND\",\"extra\":{\"secret\":\"UNRELATED_NESTED\"}}],\"total\":1,\"raw_extra\":\"UNRELATED_TOP\"}";
   CHECK(edr_command_state_finish("purpose-query","rtq_execute",&q,"ok",1,0,injected,"",1)==0);

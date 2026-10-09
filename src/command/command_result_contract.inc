@@ -1,6 +1,7 @@
 /* The durable command owner owns both request-derived purposes and projection.
  * This file is compiled only as part of command_state.c. */
 #include "edr/shell_session.h"
+#include "edr/rtq_contract.h"
 static const char *result_text(const cJSON *o, const char *key) {
   const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);
   return cJSON_IsString(v) && v->valuestring ? v->valuestring : "";
@@ -170,8 +171,19 @@ static int result_query_category(const cJSON *q,const char *type) {
       !strcmp(type,"eventlog")?"eventlog_channel|eventlog_query":"";
   for(const cJSON *v=q?q->child:NULL;v;v=v->next)
     if(result_member(v->string,keys) &&
-       ((cJSON_IsString(v)&&v->valuestring&&v->valuestring[0])||cJSON_IsNumber(v)))return 1;
+       ((cJSON_IsString(v)&&v->valuestring&&v->valuestring[0])||(cJSON_IsNumber(v)&&v->valuedouble>0)))return 1;
   return 0;
+}
+static int result_rtq_optional_number(const cJSON *q,const char *key,const cJSON *row,const char *field,int compare) {
+  const cJSON *value=cJSON_GetObjectItemCaseSensitive(q,key);
+  if(cJSON_IsNumber(value) && value->valuedouble==0)return 1;
+  return result_filter_number(q,key,row,field,compare);
+}
+static int result_rtq_network_state(const cJSON *q,const cJSON *row) {
+  const char *wanted=result_text(q,"network_state");if(!*wanted)return 1;
+  char expected[32],actual[32];
+  return edr_rtq_network_state_normalize(wanted,expected,sizeof(expected)) &&
+         edr_rtq_network_state_normalize(result_text(row,"state"),actual,sizeof(actual)) && !strcmp(expected,actual);
 }
 static cJSON *result_live_row(const cJSON *q,const cJSON *row) {
   const char *type=result_text(row,"type");
@@ -184,22 +196,22 @@ static cJSON *result_live_row(const cJSON *q,const cJSON *row) {
     ok=result_contains(result_text(row,"cmdline"),cmd) &&
        (!*engine || result_contains(result_text(row,"name"),engine) || result_contains(result_text(row,"cmdline"),engine)) &&result_filter_text(q,"process_name",row,"name",0) && result_filter_text(q,"process_path",row,"path",0) &&
        result_filter_text(q,"process_cmdline",row,"cmdline",0) && result_filter_text(q,"process_user",row,"user",0) &&
-       result_filter_number(q,"process_pid_min",row,"pid",-1) && result_filter_number(q,"process_pid_max",row,"pid",1) &&
+       result_rtq_optional_number(q,"process_pid_min",row,"pid",-1) && result_rtq_optional_number(q,"process_pid_max",row,"pid",1) &&
        result_copy_fields(out,row,"type|name|path","pid","");
     if(ok && (*cmd || *engine))ok=result_copy_fields(out,row,"cmdline","","");
     if(ok && *result_text(q,"process_user"))ok=result_copy_fields(out,row,"user","","");
   } else if(!strcmp(type,"network")) {
-    ok=result_filter_text(q,"network_remote_ip",row,"remote_ip",0) && result_filter_number(q,"network_remote_port",row,"remote_port",0) &&
-       result_filter_text(q,"network_state",row,"state",0) && result_filter_text(q,"network_proto",row,"proto",0) &&
+    ok=result_filter_text(q,"network_remote_ip",row,"remote_ip",0) && result_rtq_optional_number(q,"network_remote_port",row,"remote_port",0) &&
+       result_rtq_network_state(q,row) && (!*result_text(q,"network_proto") || result_equal_icase(result_text(q,"network_proto"),result_text(row,"proto"))) &&
        result_copy_fields(out,row,"type|proto|state|local_ip|remote_ip","pid|local_port|remote_port","");
   } else if(!strcmp(type,"file")) {
     const char *path=result_text(row,"path"),*ext=result_text(q,"file_ext");size_t pn=strlen(path),en=strlen(ext);
     ok=result_filter_text(q,"file_path",row,"path",0) && (!*result_text(q,"file_sha256")||result_equal_icase(result_text(q,"file_sha256"),result_text(row,"sha256"))) &&
-       (!en||(pn>=en && result_contains(path+pn-en,ext))) &&
+       (!en||(pn>=en && result_equal_icase(path+pn-en,ext) && (ext[0]=='.'||(pn>en && path[pn-en-1]=='.')))) &&
        result_copy_fields(out,row,"type|path|sha256|source","size","cache_hit");
   } else if(!strcmp(type,"registry")) {
     const char *path=result_text(q,"registry_path");
-    ok=*path && result_registry_key(result_text(row,"key"),path,!strcmp(result_text(q,"registry_mode"),"subtree")) &&
+    ok=*path && result_registry_key(result_text(row,"key"),path,result_equal_icase(result_text(q,"registry_mode"),"subtree")) &&
        result_filter_text(q,"registry_value",row,"value",0) &&
        result_copy_fields(out,row,"type|key|value|data","reg_type","");
   } else if(!strcmp(type,"eventlog")) {
@@ -280,6 +292,25 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
   } else {
     cJSON_AddNumberToObject(out,"total",cJSON_GetArraySize(rows));
     cJSON_AddBoolToObject(out,"truncated",partial);
+    const cJSON *collection_partial=cJSON_GetObjectItemCaseSensitive(root,"partial");
+    if(collection_partial && !cJSON_IsBool(collection_partial)){cJSON_Delete(out);return NULL;}
+    if(cJSON_IsTrue(collection_partial))cJSON_AddBoolToObject(out,"partial",1);
+    if(result_query_category(q,"file")) {
+      const cJSON *meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
+      const cJSON *hash=cJSON_GetObjectItemCaseSensitive(meta,"file_hash");
+      if(hash) {
+        if(!cJSON_IsObject(hash) ||
+           !result_member(result_text(hash,"cache_status"),"not_requested|hit|miss|unavailable") ||
+           (cJSON_HasObjectItem(hash,"scope") && !result_member(result_text(hash,"scope"),"cache_only|cache_and_exact_path|path_scan|bounded_default_roots"))) {cJSON_Delete(out);return NULL;}
+        cJSON *projected_meta=cJSON_CreateObject(),*projected_hash=cJSON_CreateObject();
+        if(!projected_meta || !projected_hash || !result_copy_fields(projected_hash,hash,
+            "scope|cache_status","cache_hits|cache_candidates_scanned","cache_attempted|path_scanned")) {
+          cJSON_Delete(projected_meta);cJSON_Delete(projected_hash);cJSON_Delete(out);return NULL;
+        }
+        cJSON_AddItemToObject(projected_meta,"file_hash",projected_hash);
+        cJSON_AddItemToObject(out,"meta",projected_meta);
+      }
+    }
     /* Errors are finite diagnostics. Free text and sampler detail stay local. */
     cJSON *errors=cJSON_CreateArray();if(!errors){cJSON_Delete(out);return NULL;}
     cJSON_AddItemToObject(out,"errors",errors);
@@ -288,14 +319,14 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
     int warnings=0;
     for(const cJSON *error=input?input->child:NULL;error;error=error->next) {
       const char *source=result_text(error,"source"),*code=result_text(error,"code");
-      if(!result_member(source,"process|process_cmdline|parent_cmdline|network|registry|eventlog|file_hash_cache|command_result_transport") ||
-         !result_member(code,"snapshot_failed|too_long|collector_unavailable|partial_access|collector_failed|partial_failure|invalid_hive|access_denied|key_not_found|invalid_utf8|query_failed|render_context_failed|enumeration_failed|oom|sampler_timeout|sampler_failed|process_path_unsupported|cache_query_failed|platform_unsupported|result_truncated")) {cJSON_Delete(out);return NULL;}
+      if(!result_member(source,"process|process_cmdline|parent_cmdline|network|registry|eventlog|file|file_hash_cache|command_result_transport") ||
+         !result_member(code,"snapshot_failed|too_long|collector_unavailable|partial_access|collector_failed|partial_failure|invalid_hive|access_denied|key_not_found|invalid_utf8|query_failed|render_context_failed|enumeration_failed|oom|sampler_timeout|sampler_failed|process_path_unsupported|cache_query_failed|platform_unsupported|result_truncated|scan_limit|scan_depth_limit|field_unavailable|hash_size_limit|path_not_found")) {cJSON_Delete(out);return NULL;}
       cJSON *item=cJSON_CreateObject();if(!item){cJSON_Delete(out);return NULL;}
       const cJSON *retryable=cJSON_GetObjectItemCaseSensitive(error,"retryable");
       if(retryable && !cJSON_IsBool(retryable)){cJSON_Delete(item);cJSON_Delete(out);return NULL;}
       /* Classify finite codes here so free text or a forged severity cannot
        * downgrade a real collection failure. This survives durable replay. */
-      int warning=result_member(code,"partial_access|result_truncated");
+      int warning=result_member(code,"partial_access|result_truncated|scan_limit|scan_depth_limit|field_unavailable|hash_size_limit");
       cJSON_AddStringToObject(item,"source",source);cJSON_AddStringToObject(item,"code",code);
       cJSON_AddStringToObject(item,"severity",warning?"warning":"error");
       cJSON_AddBoolToObject(item,"retryable",cJSON_IsTrue(retryable));
