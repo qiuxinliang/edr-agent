@@ -25,6 +25,8 @@ if [[ ! -f "$pcre2_prefix/include/pcre2.h" || ! -f "$crypto_prefix/include/opens
 fi
 sources=(
  tests/test_p0_source_only_durable_contract.c tests/stub_command_fact_resolver.c
+ src/forensic/process_tree_cache.c
+ src/core/validation_trace.c
  src/preprocess/p0_source_only_contract.c src/preprocess/p0_rule_direct_emit.c
  src/preprocess/p0_deferred_snapshot.c src/preprocess/windows_file_identity.c
  src/preprocess/p0_rule_ir.c src/preprocess/p0_rule_match.c src/preprocess/behavior_record.c

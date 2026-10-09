@@ -974,6 +974,7 @@ if(EDR_PCRE2_AVAILABLE)
   add_executable(test_p0_observation_semantics
     ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_observation_semantics.c
+    ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
