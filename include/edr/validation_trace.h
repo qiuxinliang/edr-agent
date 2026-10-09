@@ -10,7 +10,10 @@
  * Unresolved identity remains unresolved in the output. */
 int edr_validation_trace_start(const char *path, const char *image, unsigned seconds);
 /* Parent diagnosis uses the same protected owner and bounds, but never records
- * request bodies. Environment startup selects it with
+ * request bodies. It selects normalized/identity_enriched/enriched/wire and
+ * actor/cache diagnostic stages before scope accounting. Only closed owner
+ * reason codes are retained; arbitrary producer text is never logged.
+ * Environment startup selects it with
  * EDR_VALIDATION_TRACE_PURPOSE=parent_identity; the default keeps the existing
  * egress-validation contract. Unknown explicit purposes are rejected. */
 int edr_validation_trace_start_parent(const char *path, const char *image, unsigned seconds);
@@ -39,7 +42,10 @@ void edr_validation_trace_bind(const EdrBehaviorRecord *record, const char *batc
                              const uint8_t *wire, size_t length);
 void edr_validation_trace_request(const char *batch_id, const void *body, size_t length,
                                   const char *content_type);
-/* Main-loop owner only; producers never wait for disk writes. */
+/* Main-loop owner only; producers never wait for disk writes. Footer `events`
+ * keeps its event-encoding attempt meaning; `persisted_events` counts complete
+ * event rows written by successful flushes. Capacity/lock/identity/batch/format
+ * losses are separate local diagnostic counters, never product loss or ACK. */
 void edr_validation_trace_flush(void);
 void edr_validation_trace_stop(void);
 #endif

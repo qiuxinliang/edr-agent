@@ -1641,6 +1641,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
        * partial evidence. A later 4688 join increments it independently. */
       if (br.evidence_revision == 0u) br.evidence_revision = 1u;
       (void)p0_bind_process_generation(&br);
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Capture the target token while the newly-created process is most
        * likely still alive.  Waiting for the bounded 4688 correlation window
        * made short-lived processes lose user identity even when their target
@@ -1677,6 +1678,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * Kernel-Network callback/logger identity. Failure preserves the source
      * observation but cannot authorize cross-process context borrowing. */
     if (!p0_bind_process_generation(&br)) {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Keep a network rule's independent endpoint facts; don't add a new
        * suppression gate merely because process attribution failed. Make
        * the missing context explicit, and prohibit stale tuple enrichment. */
@@ -1684,6 +1686,8 @@ static void process_one_slot(const EdrEventSlot *slot) {
       br.process_creation_filetime_100ns = 0u;
       snprintf(br.source_completeness, sizeof(br.source_completeness), "%s", "NOT_EVALUABLE");
       edr_p0_rule_observe_validation_stage(&br, "network_actor", br.process_generation_source);
+    } else {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
     }
   } else if (br.type == EDR_EVENT_FILE_READ) {
     /* Use the authenticated path projection before opening the actor: an
@@ -1710,9 +1714,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * that the queried live PID generation already existed, or the same event
      * time selects an exact retained StartKey/FILETIME generation. */
     (void)p0_bind_process_generation(&br);
+    edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
   } else if (br.kernel_file_activity) {
     const char *actor_stage = br.kernel_file_write ? "file_write_actor" : "file_activity_actor";
     if (!p0_bind_process_generation(&br)) {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Preserve the real writer PID/path and failure reason locally, but
        * never evaluate or act using a different occupant of that PID. */
       snprintf(br.source_completeness, sizeof(br.source_completeness), "%s", "NOT_EVALUABLE");
@@ -1727,6 +1733,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
       edr_local_evidence_cache_record_behavior(&br);
       return;
     }
+    edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
     edr_behavior_format_time_ns((int64_t)filetime_100ns_to_unix_ns(br.process_creation_filetime_100ns),
                          br.process_creation_time, sizeof(br.process_creation_time));
     (void)enrich_process_token_identity(&br);

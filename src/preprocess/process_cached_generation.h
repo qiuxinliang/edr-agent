@@ -4,6 +4,7 @@
 #include "edr/behavior_record.h"
 #include "edr/process_generation.h"
 #include "edr/process_tree_cache.h"
+#include "edr/validation_trace.h"
 #include "edr/windows_file_identity.h"
 #include <stdio.h>
 #include <string.h>
@@ -34,6 +35,12 @@ static inline int p0_adopt_generation_command_fact(EdrBehaviorRecord *br,
 /* Shared by live-query fallback and best-effort retention. This operation
  * performs no OS query and cannot assert a FileRead capability failure.
  * A source tuple, when present, must agree with the historical lifetime. */
+static inline int p0_cached_generation_reject(const EdrBehaviorRecord *br,
+                                             const char *reason) {
+  edr_validation_trace_event(br, "cached_generation", reason);
+  return 0;
+}
+
 static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
                                                       uint64_t source_start_key,
                                                       uint64_t source_creation) {
@@ -42,25 +49,36 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
   int snapshot_result;
   const char *name;
   if (!edr_behavior_has_process_actor(br) || br->type == EDR_EVENT_PROCESS_CREATE ||
-      !br->pid || br->event_time_ns <= 0) return 0;
+      !br->pid || br->event_time_ns <= 0)
+    return p0_cached_generation_reject(br, "cache_actor_ineligible");
   event_unix_ns = (uint64_t)br->event_time_ns;
   memset(&snapshot, 0, sizeof(snapshot));
   snapshot_result = source_start_key
       ? edr_pt_cache_snapshot_generation_at(br->pid, source_start_key, event_unix_ns, &snapshot)
       : edr_pt_cache_snapshot_at(br->pid, event_unix_ns, &snapshot);
-  if (snapshot_result != 0 ||
-      !snapshot.process_start_key || !snapshot.creation_filetime_100ns ||
-      !snapshot.start_time_ns || !snapshot.exe_path[0] ||
-      (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) ||
-      (source_start_key && source_start_key != snapshot.process_start_key) ||
-      (source_creation && source_creation != snapshot.creation_filetime_100ns)) return 0;
+  /* -2 means an existing PID had no eligible key/lifetime, not necessarily
+   * a pure timestamp failure. Diagnostics must not invent a narrower cause. */
+  if (snapshot_result != 0)
+    return p0_cached_generation_reject(br,
+        snapshot_result == -2 ? "cache_lookup_rejected" : "cache_miss");
+  if (!snapshot.process_start_key || !snapshot.creation_filetime_100ns ||
+      !snapshot.start_time_ns)
+    return p0_cached_generation_reject(br, "cache_generation_incomplete");
+  if (!snapshot.exe_path[0])
+    return p0_cached_generation_reject(br, "cache_image_unavailable");
+  if (snapshot.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH)
+    return p0_cached_generation_reject(br, "cache_image_truncated");
+  if ((source_start_key && source_start_key != snapshot.process_start_key) ||
+      (source_creation && source_creation != snapshot.creation_filetime_100ns))
+    return p0_cached_generation_reject(br, "cache_generation_mismatch");
   if (!edr_process_generation_contains_event(snapshot.creation_filetime_100ns,
-                                               event_unix_ns)) return 0;
+                                               event_unix_ns))
+    return p0_cached_generation_reject(br, "cache_event_time_rejected");
   if ((br->type == EDR_EVENT_NET_CONNECT || br->type == EDR_EVENT_NET_LISTEN) &&
       !source_start_key && !source_creation && !snapshot.exit_time_ns) {
     /* Preserve the stricter network contract: an open PID interval alone
      * does not independently prove an unattributed network actor. */
-    return 0;
+    return p0_cached_generation_reject(br, "cache_network_unproven");
   }
   br->process_start_key = snapshot.process_start_key;
   br->process_creation_filetime_100ns = snapshot.creation_filetime_100ns;
@@ -104,6 +122,17 @@ static inline int p0_bind_file_read_cached_generation(EdrBehaviorRecord *br,
                                            : "network_process_tree_cache_generation");
   if (br->type == EDR_EVENT_FILE_READ || br->kernel_file_activity)
     br->file_actor_generation_validated = 1u;
+  /* The reason describes the selected cache fact; record state describes the
+   * merged result, including a conflict against a known source value. */
+  const char *parent_reason = "cache_parent_unknown";
+  switch (edr_parent_pid_effective_state(snapshot.ppid, snapshot.parent_pid_state)) {
+    case EDR_PARENT_PID_KNOWN: parent_reason = "cache_parent_known"; break;
+    case EDR_PARENT_PID_EXPLICIT_ZERO: parent_reason = "cache_parent_explicit_zero"; break;
+    case EDR_PARENT_PID_INVALID: parent_reason = "cache_parent_invalid"; break;
+    case EDR_PARENT_PID_CONFLICT: parent_reason = "cache_parent_conflict"; break;
+    default: break;
+  }
+  edr_validation_trace_event(br, "cached_generation", parent_reason);
   return 1;
 }
 

@@ -7844,6 +7844,98 @@ static void test_pmfe_weak_scan_verdict_requires_durable_original(void) {
 #endif
 
 
+static void test_parent_cache_diagnostic_reasons(void) {
+  char path[640], line[2048];
+  const uint64_t creation = UINT64_C(134339443092584333);
+  const uint64_t birth = test_filetime_unix_ns(creation), key = 980100u;
+  EdrBehaviorRecord *observed = calloc(1u, sizeof(*observed));
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r));
+  const uint8_t states[] = {EDR_PARENT_PID_UNKNOWN, EDR_PARENT_PID_KNOWN,
+      EDR_PARENT_PID_EXPLICIT_ZERO, EDR_PARENT_PID_INVALID, EDR_PARENT_PID_CONFLICT};
+  const char *reasons[] = {"cache_parent_unknown", "cache_parent_known",
+      "cache_parent_explicit_zero", "cache_parent_invalid", "cache_parent_conflict"};
+  unsigned seen_states[5] = {0}, cache_miss = 0, lookup_rejected = 0, mismatch = 0;
+  unsigned unproven = 0, partial = 0;
+  assert(observed && r && make_test_sqlite_path(path, sizeof(path)) == 0);
+  assert(remove(path) == 0);
+  assert(edr_validation_trace_start_parent(path, "cmd.exe", 300) == 0);
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  edr_pt_cache_init();
+  for (unsigned i = 0; i < 5u; i++) {
+    init_record(observed, EDR_EVENT_PROCESS_CREATE);
+    observed->pid = 98010u + i; observed->event_time_ns = (int64_t)birth;
+    observed->process_start_key = key + i;
+    observed->process_creation_filetime_100ns = creation;
+    observed->ppid = i == 1u || i == 4u ? 299u : 0u;
+    observed->parent_pid_state = states[i];
+    strcpy(observed->process_name, "cmd.exe"); strcpy(observed->exe_path, "C:\\cmd.exe");
+    assert(edr_pt_cache_put_generation_with_parent_state(observed->pid, observed->ppid,
+        "cmd.exe", NULL, "C:\\cmd.exe", NULL, birth, key + i, creation, 0u, states[i]) == 0);
+    edr_local_evidence_cache_observe_process(observed);
+    *r = *observed; r->type = EDR_EVENT_FILE_READ;
+    r->event_time_ns = (int64_t)(birth + 1000000000u);
+    r->ppid = 0u; r->parent_pid_state = EDR_PARENT_PID_UNKNOWN;
+    snprintf(r->event_id, sizeof(r->event_id), "parent-cache-state-%u", i);
+    /* Both real owners report the selected parent fact, independently of the
+     * resulting record state. UNKNOWN cannot overwrite a known source. */
+    if (i == 0u) r->ppid = 299u;
+    assert(p0_bind_file_read_cached_generation(r, key + i, creation) == 1);
+    if (i == 0u) assert(r->ppid == 299u && r->parent_pid_state == EDR_PARENT_PID_KNOWN);
+    edr_local_evidence_cache_enrich_behavior(r);
+  }
+  init_record(r, EDR_EVENT_FILE_READ);
+  r->pid = 98999u; r->event_time_ns = (int64_t)(birth + 1000000000u);
+  strcpy(r->process_name, "cmd.exe"); strcpy(r->event_id, "parent-cache-miss");
+  assert(p0_bind_file_read_cached_generation(r, 0u, 0u) == 0);
+  edr_local_evidence_cache_enrich_behavior(r);
+  observed->pid = 98030u;
+  assert(edr_pt_cache_put_generation_with_parent_state(observed->pid, observed->ppid,
+      "cmd.exe", NULL, "C:\\cmd.exe", NULL, birth, key + 4u, creation, 0u,
+      observed->parent_pid_state) == 0);
+  edr_local_evidence_cache_observe_process(observed);
+  *r = *observed; r->type = EDR_EVENT_FILE_READ;
+  r->event_time_ns = (int64_t)(birth + 1000000000u);
+  strcpy(r->event_id, "parent-cache-mismatch"); r->process_start_key++;
+  assert(p0_bind_file_read_cached_generation(r, r->process_start_key, creation) == 0);
+  edr_local_evidence_cache_enrich_behavior(r);
+  r->process_start_key = key + 4u;
+  r->process_creation_filetime_100ns = creation + 1u;
+  strcpy(r->event_id, "parent-cache-birth-mismatch");
+  assert(p0_bind_file_read_cached_generation(r, key + 4u, creation + 1u) == 0);
+  r->process_creation_filetime_100ns = 0u;
+  strcpy(r->event_id, "parent-cache-unproven");
+  strcpy(r->exe_path, "C:\\different-instance.exe");
+  edr_local_evidence_cache_enrich_behavior(r);
+  observed->pid = 98020u; observed->process_start_key = 0u;
+  observed->process_creation_filetime_100ns = 0u;
+  edr_local_evidence_cache_observe_process(observed);
+  *r = *observed; r->type = EDR_EVENT_FILE_READ;
+  r->process_start_key = key + 20u; r->process_creation_filetime_100ns = creation;
+  strcpy(r->event_id, "parent-cache-partial");
+  edr_local_evidence_cache_enrich_behavior(r);
+  edr_validation_trace_stop();
+  FILE *f = fopen(path, "rb"); assert(f);
+  while (fgets(line, sizeof(line), f)) {
+    cJSON *row = cJSON_Parse(line); assert(row);
+    cJSON *reason = cJSON_GetObjectItemCaseSensitive(row, "reason");
+    if (cJSON_IsString(reason)) {
+      for (unsigned i = 0; i < 5u; i++) if (!strcmp(reason->valuestring, reasons[i])) seen_states[i]++;
+      if (!strcmp(reason->valuestring, "cache_miss")) cache_miss++;
+      if (!strcmp(reason->valuestring, "cache_lookup_rejected")) lookup_rejected++;
+      if (!strcmp(reason->valuestring, "cache_generation_mismatch")) mismatch++;
+      if (!strcmp(reason->valuestring, "cache_record_generation_unproven")) unproven++;
+      if (!strcmp(reason->valuestring, "cache_generation_incomplete")) partial++;
+    }
+    cJSON_Delete(row);
+  }
+  fclose(f);
+  for (unsigned i = 0; i < 5u; i++) assert(seen_states[i] >= 2u);
+  assert(cache_miss >= 2u && lookup_rejected && mismatch >= 2u && unproven && partial);
+  edr_pt_cache_shutdown(); edr_local_evidence_cache_close();
+  assert(remove(path) == 0); free(r); free(observed);
+  puts("real parent-cache diagnostics: five states, miss, rejected lookup, tuple mismatch, unproven and incomplete distinguished");
+}
+
 static void test_parent_pid_states_and_cache_owner(void) {
   static const struct { const char *text; uint32_t pid; uint8_t state; } cases[] = {
     {"", 0u, EDR_PARENT_PID_UNKNOWN},
@@ -8039,6 +8131,7 @@ int main(int argc, char **argv) {
 #endif
   test_command_preview_to_durable_fact();
   test_parent_pid_states_and_cache_owner();
+  test_parent_cache_diagnostic_reasons();
 #if defined(EDR_HAVE_SQLITE)
   test_parent_pid_state_persistence_and_migration();
 #endif

@@ -856,10 +856,22 @@ static const char *record_parent_generation_source(const EdrBehaviorRecord *r) {
 }
 
 static int proc_generation_matches_record(const ProcSlot *p,
-                                          const EdrBehaviorRecord *r) {
+                                          const EdrBehaviorRecord *r,
+                                          const char **diagnostic_reason) {
   EvidenceProcessGeneration generation;
-  return p && record_process_generation(r, &generation) &&
-         generation_equal(&p->generation, &generation);
+  if (!p || !record_process_generation(r, &generation)) {
+    if (diagnostic_reason) *diagnostic_reason = p ? "cache_record_generation_unproven" : "cache_miss";
+    return 0;
+  }
+  if (!generation_bound(&p->generation)) {
+    if (diagnostic_reason) *diagnostic_reason = "cache_generation_incomplete";
+    return 0;
+  }
+  if (!generation_equal(&p->generation, &generation)) {
+    if (diagnostic_reason) *diagnostic_reason = "cache_generation_mismatch";
+    return 0;
+  }
+  return 1;
 }
 
 static int proc_parent_generation_matches_record(const ProcSlot *p,
@@ -869,7 +881,7 @@ static int proc_parent_generation_matches_record(const ProcSlot *p,
    * history.  Requiring another snapshot here made a valid edge disappear
    * after the parent exit grace, or change when that PID was reused. */
   return p && edr_behavior_parent_pid_usable(r) && p->parent_pid_state == EDR_PARENT_PID_KNOWN &&
-         proc_generation_matches_record(p, r) &&
+         proc_generation_matches_record(p, r, NULL) &&
          generation_bound(&p->parent_generation) &&
          (r->ppid == 0u || p->ppid == r->ppid);
 }
@@ -1265,8 +1277,10 @@ void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r) {
 
 void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
   if (!r || network_actor_generation_unbound(r)) {
+    if (r) edr_validation_trace_event(r, "parent_cache", "cache_actor_unbound");
     return;
   }
+  const char *cache_reason = "cache_miss";
   evidence_cache_lock();
   EvidenceProcessGeneration parent_ref;
   if (record_parent_generation(r, &parent_ref)) {
@@ -1277,7 +1291,7 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
   ProcSlot *p = find_proc(r->pid, r->endpoint_id);
   if (p) {
     s_status.process_cache_hits++;
-    int process_safe = proc_generation_matches_record(p, r);
+    int process_safe = proc_generation_matches_record(p, r, &cache_reason);
     if (!process_safe) {
       if (!generation_bound(&p->generation)) s_status.identity_generation_unknown_rejects++;
       else s_status.identity_generation_mismatch_rejects++;
@@ -1286,6 +1300,13 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
         if (!r->username[0] && !r->user_sid[0]) s_status.identity_cache_misses++;
       }
     } else {
+      switch (edr_parent_pid_effective_state(p->ppid, p->parent_pid_state)) {
+        case EDR_PARENT_PID_KNOWN: cache_reason = "cache_parent_known"; break;
+        case EDR_PARENT_PID_EXPLICIT_ZERO: cache_reason = "cache_parent_explicit_zero"; break;
+        case EDR_PARENT_PID_INVALID: cache_reason = "cache_parent_invalid"; break;
+        case EDR_PARENT_PID_CONFLICT: cache_reason = "cache_parent_conflict"; break;
+        default: cache_reason = "cache_parent_unknown"; break;
+      }
       edr_parent_pid_merge(&r->ppid, &r->parent_pid_state, p->ppid, p->parent_pid_state);
       if (r->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
           r->parent_pid_state == EDR_PARENT_PID_INVALID)
@@ -1387,6 +1408,9 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
     copy_s(r->process_name, sizeof(r->process_name), base_name(r->exe_path));
   }
   evidence_cache_unlock();
+  /* Only a closed owner result, after unlocking; no PID-only lookup or new
+   * authority is introduced by this bounded local diagnostic. */
+  edr_validation_trace_event(r, "parent_cache", cache_reason);
 }
 
 static int ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
