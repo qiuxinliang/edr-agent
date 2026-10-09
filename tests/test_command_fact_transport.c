@@ -430,7 +430,8 @@ int main(int argc, char **argv) {
     assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue;") == 0);
     /* The transport positive has an actual full-command predicate: the
      * encoded-command token at the tail must survive local/deferred replay.
-     * Its unrelated parent command remains local, outside the projection. */
+     * IR8 explicitly requests the independently bound parent's full command
+     * through parent_context; it is retained without changing detection. */
     snapshot_rule = "R-EXEC-001";
     child->type = EDR_EVENT_PROCESS_CREATE;
     strcpy(child->process_name, "powershell.exe");
@@ -461,9 +462,13 @@ int main(int argc, char **argv) {
     assert(pb_decode(&input, edr_v1_BehaviorEvent_fields, decoded));
     assert(!strcmp(decoded->cmdline, command));
 #ifdef EDR_P0_TEST_REAL_IR
-    assert(expected_size > n && expected_size < n*2);
+    assert(expected_size > n*2);
     assert(decoded->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION);
-    assert(!decoded->process_context.parent_cmdline[0] && !decoded->behavior_alert.cmdline[0]);
+    assert(decoded->required_evidence_fields == (EDR_EVIDENCE_COMMAND |
+        EDR_EVIDENCE_USER | EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH |
+        EDR_EVIDENCE_PARENT_COMMAND));
+    assert(!strcmp(decoded->process_context.parent_cmdline, command));
+    assert(!decoded->behavior_alert.cmdline[0]);
 #else
     assert(expected_size > n*2 && !strcmp(decoded->process_context.parent_cmdline, command));
 #endif
