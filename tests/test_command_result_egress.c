@@ -360,6 +360,16 @@ static void purpose_tests(void) {
       "{\"results\":[{\"type\":\"process\",\"pid\":42,\"name\":\"powershell.exe\",\"cmdline\":\"powershell Write-Output synthetic\",\"user\":\"UNRELATED-TEXT\"}],\"truncated\":false}",1);
   typed_owner_case("script-query-wrong","rtq_execute","{\"script_content\":\"Write-Output\"}",
       "{\"results\":[{\"type\":\"process\",\"pid\":42,\"name\":\"powershell.exe\",\"cmdline\":\"powershell Get-Date\"}],\"truncated\":false}",0);
+  typed_owner_case("process-control-query","rtq_execute","{\"process_name\":\"foo\\u0001bar\"}",
+      "{\"results\":[{\"type\":\"process\",\"pid\":42,\"name\":\"foo\\u0001bar\"}],\"truncated\":false}",1);
+  EdrCommandStateRecord *control_record=calloc(1,sizeof(*control_record));CHECK(control_record);
+  CHECK(edr_command_state_begin("process-control-query","rtq_execute",NULL,NULL,control_record)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  cJSON *control_detail=cJSON_Parse(control_record->detail);CHECK(control_detail);
+  const cJSON *control_rows=cJSON_GetObjectItemCaseSensitive(control_detail,"results");
+  CHECK(cJSON_IsArray(control_rows)&&cJSON_GetArraySize(control_rows)==1);
+  const cJSON *control_name=cJSON_GetObjectItemCaseSensitive(control_rows->child,"name");
+  CHECK(cJSON_IsString(control_name)&&!strcmp(control_name->valuestring,"foo\001bar"));
+  cJSON_Delete(control_detail);free(control_record);
   typed_owner_case("unknown-query-key","rtq_execute","{\"process_unrelated\":\"x\"}",
       "{\"results\":[{\"type\":\"process\",\"pid\":42,\"name\":\"foo\"}],\"truncated\":false}",0);
   typed_owner_case("eventlog-query","rtq_execute","{\"eventlog_channel\":\"System\"}",

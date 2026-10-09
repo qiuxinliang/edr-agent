@@ -136,7 +136,7 @@ add_executable(test_rtq_collectors ${CMAKE_CURRENT_SOURCE_DIR}/test_rtq_collecto
 target_include_directories(test_rtq_collectors PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 if(WIN32)
-  target_link_libraries(test_rtq_collectors PRIVATE ws2_32 iphlpapi advapi32 wevtapi wintrust)
+  target_link_libraries(test_rtq_collectors PRIVATE ws2_32 iphlpapi advapi32 wevtapi)
 endif()
 edr_apply_test_warnings(test_rtq_collectors)
 add_test(NAME rtq_collector_behavior COMMAND test_rtq_collectors)
