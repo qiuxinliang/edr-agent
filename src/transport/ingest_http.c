@@ -3240,7 +3240,8 @@ static int write_response_chunk_to_file(FILE *f, size_t *written, size_t max_byt
 static EdrHttpAttemptOutcome read_http_response_to_file_from_recv(
     int (*recvfn)(void *ctx, char *buf, int cap), void *ctx,
     FILE *out, size_t max_bytes, int *out_reusable,
-    EdrAgentConfigHeaders *out_agent_config) {
+    EdrAgentConfigHeaders *out_agent_config, int allow_not_modified,
+    int *out_not_modified) {
   char buf[8192];
   size_t used = 0;
   size_t header_len = 0;
@@ -3249,6 +3250,7 @@ static EdrHttpAttemptOutcome read_http_response_to_file_from_recv(
   int status_code = 0;
   int reusable = 0;
   if (out_reusable) *out_reusable = 0;
+  if (out_not_modified) *out_not_modified = 0;
   if (!out || max_bytes == 0u) return EDR_HTTP_ATTEMPT_LOCAL_FAILURE;
   for (;;) {
     int n;
@@ -3265,6 +3267,14 @@ static EdrHttpAttemptOutcome read_http_response_to_file_from_recv(
       content_len = parse_content_length_header(buf);
       reusable = status_code >= 200 && status_code < 300 && content_len >= 0 &&
                  !headers_connection_close(buf) && !headers_chunked(buf);
+      if (status_code == 304 && allow_not_modified && out_agent_config && out_not_modified) {
+        parse_agent_config_headers(buf, out_agent_config);
+        *out_not_modified = 1;
+        /* 304 has no message body, even when Content-Length describes the
+         * selected representation. Do not read it or poison a reused socket. */
+        if (out_reusable) *out_reusable = !headers_connection_close(buf);
+        return EDR_HTTP_ATTEMPT_SUCCESS;
+      }
       if (status_code >= 200 && status_code < 300) {
         parse_agent_config_headers(buf, out_agent_config);
       }
@@ -4922,7 +4932,8 @@ static int edr_ingest_http_refresh_route_profile(int force) {
 
 static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
                               EdrAgentConfigHeaders *out_agent_config,
-                              int io_timeout_ms, int max_attempts) {
+                              int io_timeout_ms, int max_attempts,
+                              const char *cached_sha256) {
   char host[256];
   char path[1024];
   int port = 0;
@@ -4930,6 +4941,10 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   int rc = -1;
   char req[8192];
   if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
+  if (cached_sha256 && cached_sha256[0]) {
+    if (strlen(cached_sha256) != 64u || !out_agent_config) return -1;
+    for (size_t i = 0u; i < 64u; ++i) if (!isxdigit((unsigned char)cached_sha256[i])) return -1;
+  }
   if (!out || parse_url(url, host, sizeof(host), path, sizeof(path), &port, &https) != 0) {
     runtime_failure("invalid ingest url");
     return -1;
@@ -4973,13 +4988,27 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
       http_conn_close_locked();
       break;
     }
+    if (cached_sha256 && cached_sha256[0]) {
+      /* The existing signed builder ends with CRLF CRLF. Insert a validated
+       * opaque content validator before the final empty line. */
+      int extra = snprintf(req + rn - 2, sizeof(req) - (size_t)rn + 2u,
+                           "If-None-Match: \"%s\"\r\n\r\n", cached_sha256);
+      if (extra <= 0 || (size_t)extra >= sizeof(req) - (size_t)rn + 2u) {
+        runtime_failure("conditional get header build failed");
+        http_conn_close_locked();
+        break;
+      }
+      rn = rn - 2 + extra;
+    }
+    int not_modified = 0;
     EdrHttpAttemptOutcome response_outcome = EDR_HTTP_ATTEMPT_TRANSPORT_FAILURE;
     if (http_conn_write_all(conn, req, (size_t)rn) == 0) {
       response_outcome = read_http_response_to_file_from_recv(
-          http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config);
+          http_socket_recv_adapter, conn, out, max_bytes, &reusable, out_agent_config,
+          cached_sha256 && cached_sha256[0], &not_modified);
     }
     if (response_outcome == EDR_HTTP_ATTEMPT_SUCCESS) {
-      rc = 0;
+      rc = not_modified ? 1 : 0;
       conn->last_used_ms = unix_ms_now();
       socket_set_timeout_ms(conn->fd, (int)env_ul_clamped(
           "EDR_HTTP_SOCKET_TIMEOUT_MS", 10000ul, 1000ul, 120000ul));
@@ -5012,18 +5041,19 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   s_http_request_timeout_override_ms = 0;
   http_unlock();
   net_done();
-  if (rc != 0 && runtime_string_empty(s_last_error)) {
+  if (rc < 0 && runtime_string_empty(s_last_error)) {
     runtime_failure(https ? "https get failed" : "http get failed");
   }
   return rc;
 }
 
-int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
+int edr_ingest_http_get_url_to_file_conditional(const char *url,
                                                  const char *file_path,
                                                  size_t max_bytes,
                                                  EdrAgentConfigHeaders *headers,
                                                  int timeout_ms,
-                                                 int max_attempts) {
+                                                 int max_attempts,
+                                                 const char *cached_sha256) {
 	FILE *f;
 	size_t cap;
 	int rc;
@@ -5047,15 +5077,22 @@ int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
 	if (headers) {
 		memset(headers, 0, sizeof(*headers));
 	}
-	rc = native_get_to_file(url, f, cap, headers, timeout_ms, max_attempts);
-	fclose(f);
-	if (rc != 0) {
+	rc = native_get_to_file(url, f, cap, headers, timeout_ms, max_attempts, cached_sha256);
+	if (fclose(f) != 0 && rc >= 0) rc = -1;
+	if (rc < 0) {
 		(void)remove(file_path);
     note_http_request_failure();
     return -1;
   }
 	note_http_request_success();
-	return 0;
+	return rc;
+}
+
+int edr_ingest_http_get_url_to_file_meta_bounded(const char *url, const char *file_path,
+                                                 size_t max_bytes, EdrAgentConfigHeaders *headers,
+                                                 int timeout_ms, int max_attempts) {
+  return edr_ingest_http_get_url_to_file_conditional(url, file_path, max_bytes, headers,
+                                                    timeout_ms, max_attempts, NULL);
 }
 
 int edr_ingest_http_get_url_to_file_meta(const char *url, const char *file_path,

@@ -230,6 +230,18 @@ int edr_ingest_http_get_url_to_file_meta_bounded(const char *url,
                                                  int timeout_ms,
                                                  int max_attempts);
 
+/** Conditional maintenance GET. Return 1 for a header-only 304, 0 for a
+ * downloaded body, negative on failure. Only a SHA-256 hash is accepted as the
+ * validator; callers must authenticate fresh response metadata against their
+ * locally retained body before treating a 304 as accepted policy. */
+int edr_ingest_http_get_url_to_file_conditional(const char *url,
+                                                 const char *file_path,
+                                                 size_t max_bytes,
+                                                 EdrAgentConfigHeaders *headers,
+                                                 int timeout_ms,
+                                                 int max_attempts,
+                                                 const char *cached_sha256);
+
 int edr_ingest_http_post_config_status(const char *tenant_id,
                                        const char *endpoint_id,
                                        const char *agent_version,

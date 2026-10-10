@@ -15,6 +15,7 @@
 #include "edr/preprocess.h"
 #include "edr/resource.h"
 #include "edr/heartbeat.h"
+#include "edr/periodic_schedule.h"
 #include "edr/self_protect.h"
 #include "edr/watchdog.h"
 #include "edr/sensor_interest.h"
@@ -669,6 +670,13 @@ struct EdrAgent {
   /** 安装/注册后补采集：endpoint_id 首次变为有效时仅执行一次。 */
   int asurf_enrolled_posted;
   /** 本进程已成功应用的可信远程策略身份；用于消除相同策略轮询的重复副作用。 */
+  EdrPeriodicSchedule heartbeat_schedule;
+  EdrPeriodicSchedule health_schedule;
+  EdrPeriodicSchedule maintenance_schedule[4];
+  char applied_rules_hash[65];
+  char *cached_remote_body;
+  size_t cached_remote_body_len;
+  char cached_remote_body_hash[65];
   char applied_remote_config_hash[65];
   char applied_remote_config_sequence[32];
   int applied_remote_config_status_reported;
@@ -1399,6 +1407,7 @@ void edr_agent_destroy(EdrAgent *agent) {
   edr_event_bus_destroy(agent->event_bus);
   edr_config_free_heap(&agent->cfg);
   free(agent->config_path);
+  free(agent->cached_remote_body);
   free(agent);
 }
 
@@ -1552,7 +1561,7 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns);
 static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_ns);
 static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_sensor_interest_ns);
 static void edr_agent_poll_attack_surface(EdrAgent *agent);
-static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns);
+static void edr_agent_poll_heartbeat(EdrAgent *agent, uint64_t *last_heartbeat_ns);
 static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_ns, int force);
 
 static const char *edr_agent_native_architecture(const char *process_architecture,
@@ -2010,7 +2019,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
           break;
         }
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ATTACK_SURFACE, edr_agent_poll_attack_surface(agent));
-        edr_agent_poll_heartbeat(&last_heartbeat_ns);
+        edr_agent_poll_heartbeat(agent, &last_heartbeat_ns);
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_ENGINE_HEALTH,
                              edr_agent_poll_engine_health(agent, &last_health_ns, last_health_ns == 0u));
         /* The init-time collector prefetch may run before HTTP transport is
@@ -2112,11 +2121,11 @@ static void edr_agent_config_recovery_json(const EdrAgent *agent, char *out, siz
            agent->config_recovery_auto_repaired ? "true" : "false");
 }
 
-static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns) {
+static void edr_agent_poll_heartbeat(EdrAgent *agent, uint64_t *last_heartbeat_ns) {
   int interval = 60;
   const char *iv;
   uint64_t now;
-  if (!last_heartbeat_ns || !edr_ingest_http_configured()) {
+  if (!agent || !last_heartbeat_ns || !edr_ingest_http_configured()) {
     return;
   }
   iv = getenv("EDR_AGENT_HEARTBEAT_INTERVAL_S");
@@ -2127,7 +2136,8 @@ static void edr_agent_poll_heartbeat(uint64_t *last_heartbeat_ns) {
     }
   }
   now = edr_monotonic_ns();
-  if (now - *last_heartbeat_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->heartbeat_schedule, now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "heartbeat", 1, 0)) {
     return;
   }
   *last_heartbeat_ns = now;
@@ -2208,7 +2218,8 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
     }
   }
   uint64_t now = edr_monotonic_ns();
-  if (!force && now - *last_health_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->health_schedule, now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "engine_health", 1, force)) {
     return;
   }
   *last_health_ns = now;
@@ -2613,7 +2624,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)queue_capacity_metrics.projection_acked_rows,
         config_recovery_json,
         health_profile[0] ? health_profile : "basic",
-        agent->cfg.health_monitor.interval_s,
+        (uint32_t)interval,
         (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
         http_rt.http_fallback_available ? "true" : "false", http_rt.ok_count, http_rt.fail_count,
         http_rt.control_ack_ok_count, http_rt.control_ack_fail_count, http_rt.control_ack_pending_count,
@@ -2888,7 +2899,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
           agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
           runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
           (unsigned long long)wall_ms, capability_manifest_json,
-          agent->cfg.health_monitor.interval_s);
+          (uint32_t)interval);
       if (n_capability_only > 0 && (size_t)n_capability_only < sizeof(capability_only)) {
         (void)edr_ingest_http_post_engine_health_json(capability_only);
         fprintf(stderr, "[engine-health] posted capability-only fallback profile=basic\n");
@@ -3378,7 +3389,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
       (unsigned long long)wall_ms, capability_manifest_json, config_recovery_json,
-      health_profile[0] ? health_profile : "basic", agent->cfg.health_monitor.interval_s,
+      health_profile[0] ? health_profile : "basic", (uint32_t)interval,
       (unsigned long long)agent->cfg.health_monitor.expires_at_unix_ms, health_request_id,
 	      http_rt.http_fallback_available ? "true" : "false", http_rt.insecure_http ? "true" : "false",
 	      http_rt.ok_count, http_rt.fail_count,
@@ -3835,6 +3846,7 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
   if (cr == EDR_OK && rel) {
     edr_agent_clear_config_recovery(agent);
     (void)edr_agent_save_last_good_config(agent, agent->config_path);
+    agent->applied_rules_hash[0] = '\0';
     edr_preprocess_apply_config(&agent->cfg);
     edr_adaptive_collection_configure(&agent->cfg);
     edr_agent_apply_event_filter_config(&agent->cfg);
@@ -4334,6 +4346,36 @@ static void edr_agent_clear_remote_config_failure(void) {
   s_remote_config_failure_reason[0] = '\0';
 }
 
+static void edr_agent_cache_remote_body(EdrAgent *agent, const char *path, const char *hash) {
+  FILE *f = fopen(path, "rb");
+  char *body = NULL;
+  long length = -1;
+  if (!f) return;
+  if (fseek(f, 0L, SEEK_END) == 0) length = ftell(f);
+  if (length > 0 && length <= 1024L * 1024L && fseek(f, 0L, SEEK_SET) == 0) {
+    body = (char *)malloc((size_t)length);
+    if (body && fread(body, 1u, (size_t)length, f) != (size_t)length) {
+      free(body);
+      body = NULL;
+    }
+  }
+  fclose(f);
+  if (!body) return; /* Optimization unavailable; the next pull keeps its full body. */
+  free(agent->cached_remote_body);
+  agent->cached_remote_body = body;
+  agent->cached_remote_body_len = (size_t)length;
+  snprintf(agent->cached_remote_body_hash, sizeof(agent->cached_remote_body_hash), "%s", hash);
+}
+
+static int edr_agent_restore_cached_remote_body(EdrAgent *agent, const char *path) {
+  if (!agent->cached_remote_body || !agent->cached_remote_body_len) return -1;
+  FILE *f = fopen(path, "wb");
+  if (!f) return -1;
+  int ok = fwrite(agent->cached_remote_body, 1u, agent->cached_remote_body_len, f) == agent->cached_remote_body_len;
+  if (fclose(f) != 0) ok = 0;
+  return ok ? 0 : -1;
+}
+
 static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_ns,
                                          uint64_t *last_health_ns) {
   const char *url = getenv("EDR_REMOTE_CONFIG_URL");
@@ -4364,8 +4406,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     }
   }
   uint64_t now = edr_monotonic_ns();
-  if (*last_remote_ns != 0u &&
-      now - *last_remote_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->maintenance_schedule[0], now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "remote_config", 0, 0)) {
     return;
   }
   *last_remote_ns = now;
@@ -4382,8 +4424,22 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
 #endif
   EdrAgentConfigHeaders config_headers;
   memset(&config_headers, 0, sizeof(config_headers));
-  if (edr_agent_download_text_file(url, tmp, 1024u * 1024u, "remote TOML", &config_headers) != 0) {
+  const char *conditional_hash = agent->cached_remote_body &&
+      agent->cached_remote_body_len &&
+      strcmp(agent->cached_remote_body_hash, agent->applied_remote_config_hash) == 0
+          ? agent->cached_remote_body_hash : NULL;
+  int timeout_ms = 5000;
+  const char *timeout_env = getenv("EDR_AGENT_MAINTENANCE_TIMEOUT_MS");
+  if (timeout_env && atoi(timeout_env) >= 1000 && atoi(timeout_env) <= 15000)
+    timeout_ms = atoi(timeout_env);
+  int download_rc = edr_ingest_http_get_url_to_file_conditional(
+      url, tmp, 1024u * 1024u, &config_headers, timeout_ms, 1, conditional_hash);
+  if (download_rc < 0 || (download_rc == 1 && edr_agent_restore_cached_remote_body(agent, tmp) != 0)) {
     edr_agent_report_remote_config_failure(agent, NULL, "remote_config_download_failed", now);
+    free(agent->cached_remote_body);
+    agent->cached_remote_body = NULL;
+    agent->cached_remote_body_len = 0u;
+    (void)remove(tmp);
     return;
   }
   {
@@ -4391,6 +4447,13 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
     if (edr_agent_verify_config_headers(&agent->cfg, agent->cfg.offline.queue_db_path, tmp, &config_headers, verify_reason, sizeof(verify_reason)) != 0) {
       fprintf(stderr, "[config] remote TOML signature rejected: %s\n", verify_reason);
       edr_agent_report_remote_config_failure(agent, &config_headers, verify_reason, now);
+      /* A bad 304 must not pin a corrupt cache. Re-fetch a full signed body
+       * on the next bounded maintenance attempt. */
+      if (download_rc == 1) {
+        free(agent->cached_remote_body);
+        agent->cached_remote_body = NULL;
+        agent->cached_remote_body_len = 0u;
+      }
       (void)remove(tmp);
       return;
     }
@@ -4430,6 +4493,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
               (unsigned long long)agent->remote_config_unchanged_count);
       agent->remote_config_last_unchanged_log_ns = now;
     }
+    if (download_rc == 0) edr_agent_cache_remote_body(agent, tmp, config_headers.config_hash);
     edr_agent_clear_remote_config_failure();
     (void)remove(tmp);
     return;
@@ -4452,7 +4516,6 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   changed = edr_agent_apply_remote_policy(agent, &remote, tmp);
   edr_config_free_heap(&remote);
-  (void)remove(tmp);
   if ((changed & EDR_REMOTE_POLICY_COLLECTION_CHANGED) != 0) {
     (void)edr_agent_restart_collector(agent, "remote_policy_changed");
   }
@@ -4483,6 +4546,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
       }
     }
   }
+  agent->applied_rules_hash[0] = '\0';
   edr_preprocess_apply_config(&agent->cfg);
   edr_resource_reconfigure(&agent->cfg);
   edr_self_protect_apply_config(&agent->cfg);
@@ -4504,6 +4568,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
                                              "remote_config_persistence_failed", now);
       /* Keep the old applied identity so the next delivery retries persistence.
        * The live policy may be active; it must not be acknowledged as durable. */
+      (void)remove(tmp);
       return;
     }
     if (stat(agent->config_path, &persisted) == 0) agent->config_mtime = persisted.st_mtime;
@@ -4547,6 +4612,8 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
             config_headers.rollout_id[0] ? config_headers.rollout_id : "-",
             config_headers.rollout_bucket[0] ? config_headers.rollout_bucket : "-");
   }
+  edr_agent_cache_remote_body(agent, tmp, config_headers.config_hash);
+  (void)remove(tmp);
   edr_agent_clear_remote_config_failure();
   {
     const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
@@ -4611,8 +4678,8 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
     }
   }
   now = edr_monotonic_ns();
-  if (*last_rules_ns != 0u &&
-      now - *last_rules_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->maintenance_schedule[1], now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "rules", 0, 0)) {
     return;
   }
   *last_rules_ns = now;
@@ -4648,6 +4715,11 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
     (void)remove(tmp);
     return;
   }
+  if (rules_headers.config_hash[0] &&
+      strcmp(agent->applied_rules_hash, rules_headers.config_hash) == 0) {
+    (void)remove(tmp);
+    return;
+  }
   fp[0] = '\0';
   edr_config_fingerprint(tmp, fp, sizeof(fp));
   load_rc = edr_config_load_preprocessing_rules(tmp, &agent->cfg);
@@ -4656,7 +4728,9 @@ static void edr_agent_poll_rules(EdrAgent *agent, uint64_t *last_rules_ns) {
     fprintf(stderr, "[emit_rules] remote rules rejected: rc=%d\n", (int)load_rc);
     return;
   }
+  agent->applied_rules_hash[0] = '\0';
   edr_preprocess_apply_config(&agent->cfg);
+  snprintf(agent->applied_rules_hash, sizeof(agent->applied_rules_hash), "%s", rules_headers.config_hash);
   fprintf(stderr, "[emit_rules] remote rules hot-reloaded: version=%s rules=%u fingerprint=%s\n",
           agent->cfg.preprocessing.rules_version[0]
               ? agent->cfg.preprocessing.rules_version
@@ -4697,8 +4771,8 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
     }
   }
   now = edr_monotonic_ns();
-  if (*last_p0_bundle_ns != 0u &&
-      now - *last_p0_bundle_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->maintenance_schedule[2], now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "p0_bundle", 0, 0)) {
     return;
   }
   *last_p0_bundle_ns = now;
@@ -4770,8 +4844,8 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
     }
   }
   now = edr_monotonic_ns();
-  if (*last_sensor_interest_ns != 0u &&
-      now - *last_sensor_interest_ns < (uint64_t)interval * 1000000000ULL) {
+  if (!edr_periodic_schedule_due(&agent->maintenance_schedule[3], now, (uint32_t)interval,
+                                 agent->cfg.agent.endpoint_id, "sensor_interest", 0, 0)) {
     return;
   }
   *last_sensor_interest_ns = now;

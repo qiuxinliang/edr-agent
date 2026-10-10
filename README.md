@@ -413,6 +413,8 @@ cmake --build build
 
 ## 运行与日志
 
+- 心跳与基础健康首次立即发送，之后按终端和任务固定错相；不会增加配置周期的最大间隔。健康消息的 `monitor.interval_s` 表示实际生效周期，包括 `EDR_ENGINE_HEALTH_INTERVAL_S` 覆盖。维护拉取首次有界错相，P0 与 sensor-interest 签名协议保持不变。
+- 运行策略仅在本地仍有已接受的原始签名内容时携带 `If-None-Match`。304 必须提供新签名元数据并重新验证缓存哈希、签名、有效期和序列；缓存或验证失败后清除条件并重新拉取完整内容。已验证且内容相同的预处理规则跳过重复加载。
 - 退出时 stderr 汇总含：`wire_events`、`batches`、`batch_lz4`、`batch_timeout_flushes`、`bus_hw80`、`bus_dropped`、去重丢弃、`queue_pending`、HTTP 上报统计与 **`[command] handled` / `unknown`**。
 - 启动时若配置了 `[platform].rest_base_url`，传输层会打印 HTTP ingest/control 目标；旧 `server.address` 只作为兼容字段读取。
 - 成功加载配置文件路径时，stderr 会打印 **`[config] fingerprint=…`**（FNV-1a 十六进制）；热重载成功后再打一行 **`热重载 fingerprint=…`**。
