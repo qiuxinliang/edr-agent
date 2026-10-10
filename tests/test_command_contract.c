@@ -260,6 +260,32 @@ int main(void) {
   require_true(!validate("REFRESH_ATTACK_SURFACE", "{\"reason\":\"manual\",\"requested_at\":\"now\"}",
                          reason, sizeof(reason)),
                "reject the retired attack surface requested_at field");
+  const char *asurf_aliases[] = {"GET_ATTACK_SURFACE", "get_attack_surface", "REFRESH_ATTACK_SURFACE"};
+  const char *asurf_groups[] = {"full", "networkOnly", "inventoryOnly", "policyOnly"};
+  const char *invalid_asurf[] = {
+      "{\"collection_group\":\"listenersOnly\"}", "{\"collection_group\":\"networkonly\"}",
+      "{\"collection_group\":\"\"}", "{\"collection_group\":null}",
+      "{\"collection_group\":1}", "{\"collection_group\":true}",
+      "{\"collection_group\":[]}", "{\"collection_group\":{}}",
+      "{\"collection_group\":\"full\",\"collection_group\":\"policyOnly\"}",
+      "{\"collection_group\":\"networkOnly\",\"unknown\":true}",
+      "{\"collection_group\":\"networkOnly\"} trailing"
+  };
+  for (size_t alias = 0; alias < COUNT_OF(asurf_aliases); ++alias) {
+    require_true(validate(asurf_aliases[alias], "{}", reason, sizeof(reason)),
+                 "legacy attack surface object remains valid");
+    for (size_t group = 0; group < COUNT_OF(asurf_groups); ++group) {
+      char payload[160];
+      snprintf(payload, sizeof(payload), "{\"reason\":\"periodic_attack_surface\",\"collection_group\":\"%s\"}", asurf_groups[group]);
+      require_true(validate(asurf_aliases[alias], payload, reason, sizeof(reason)),
+                   "attack surface periodic group satisfies strict admission");
+    }
+    for (size_t sample = 0; sample < COUNT_OF(invalid_asurf); ++sample)
+      require_true(!validate(asurf_aliases[alias], invalid_asurf[sample], reason, sizeof(reason)),
+                   "invalid attack surface selector remains rejected");
+  }
+  require_true(!validate("noop", "{\"collection_group\":\"networkOnly\"}", reason, sizeof(reason)),
+               "collection_group is specific to attack surface commands");
   require_true(validate("forensic_deep", "{\"scope\":2,\"initiated_by\":\"operator\"}", reason, sizeof(reason)),
                "current deep-forensic payload satisfies strict contract");
   require_true(validate("forensic_targeted", "{\"scope\":\"targeted\",\"reason\":\"triage\",\"timeout_ms\":60000,\"items\":[{\"type\":\"file\",\"path\":\"C:\\\\Temp\\\\a.bin\"}],\"initiated_by\":\"operator\"}", reason, sizeof(reason)),

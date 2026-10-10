@@ -62,7 +62,7 @@ RUNTIME_EXPECTED = {
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_runtime_delivery", "p0_rule_ir_record_golden",
     "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
-    "periodic_schedule_boundaries", "attack_surface_sampled_groups",
+    "periodic_schedule_boundaries", "attack_surface_sampled_groups", "attack_surface_command_admission",
     "log_rotation_retention_and_restart", "conditional_policy_authenticated_cache",
     "runtime_rule_cold_start_schedule",
 }

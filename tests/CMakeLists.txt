@@ -1948,6 +1948,9 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
     ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
     --client $<TARGET_FILE:test_egress_tls_client>)
   set_tests_properties(egress_loopback_mtls PROPERTIES TIMEOUT 150)
+  add_test(NAME attack_surface_command_admission COMMAND test_egress_tls_client
+    --attack-surface-admission ${CMAKE_CURRENT_BINARY_DIR}/asurf-admission-state)
+  set_tests_properties(attack_surface_command_admission PROPERTIES TIMEOUT 30)
   add_executable(test_pmfe_lifecycle test_pmfe_lifecycle.c ${_egress_tls_sources})
   target_include_directories(test_pmfe_lifecycle PRIVATE
     $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
@@ -2104,8 +2107,11 @@ if(SQLite3_FOUND AND OpenSSL_FOUND AND EDR_WITH_INGEST_HTTPS_OPENSSL)
   add_test(NAME runtime_rule_cold_start_schedule COMMAND test_runtime_rule_startup)
 endif()
 
-add_executable(test_attack_surface_groups test_attack_surface_groups.c ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
-target_include_directories(test_attack_surface_groups PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson)
+add_executable(test_attack_surface_groups test_attack_surface_groups.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_registry.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_attack_surface_groups PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_attack_surface_groups)
 add_test(NAME attack_surface_sampled_groups COMMAND test_attack_surface_groups)
 
