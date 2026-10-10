@@ -715,8 +715,6 @@ jobs:
         run: |
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
-          & ctest --test-dir build -C Release --output-on-failure --no-tests=error --tests-regex '^windows_headless_log_stream_initialization$'
-          if ($LASTEXITCODE -ne 0) { throw "Headless logger initialization failed on native $env:EDR_RELEASE_ARCH runner" }
           $telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }
           $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
           if (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe')) {

@@ -25,6 +25,7 @@ LABEL = "^windows-release-gate$"
 WINDOWS_EXPECTED = {
     "agent_update_command_contract", "agent_update_packaging_contract",
     "windows_headless_runtime_contract", "command_registry_and_payload_contract",
+    "log_rotation_retention_and_restart", "windows_headless_log_stream_initialization",
     "command_process_identity_and_receipts",
     "pmfe_pe_architectures", "windows_native_manifest_behavior",
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
@@ -67,6 +68,10 @@ EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED | (
 PREVIOUSLY_UNBUILT = {
     "test_process_generation_windows", "test_response_file_security",
     "test_response_forensic_paths",
+}
+LOGGER_OWNERS = {
+    "log_rotation_retention_and_restart": "test_log_rotation",
+    "windows_headless_log_stream_initialization": "test_log_headless_windows",
 }
 
 
@@ -213,7 +218,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     else:
                         verify_sqlite_package_location(cache, include, library)
 
-    def fixture(self, directory, missing_target="", missing_test="", failing_test="", p0_inputs_available=True):
+    def fixture(self, directory, missing_target="", missing_test="", failing_test="", p0_inputs_available=True,
+                failing_executable=""):
         pairs = re.findall(r'^edr_windows_release_gate\((\w+) (\w+|"")\)$',
                            GATE.read_text(encoding="utf-8"), re.MULTILINE)
         self.assertEqual({name for name, _ in pairs}, WINDOWS_EXPECTED)
@@ -230,23 +236,35 @@ class WindowsReleaseGateTests(unittest.TestCase):
         pairs += runtime_pairs
         source = Path(directory)
         (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        if failing_executable:
+            (source / "failure.c").write_text("int main(void) { return 23; }\n", encoding="utf-8")
         lines = ["cmake_minimum_required(VERSION 3.19)", "project(GateFixture C)", "enable_testing()",
                  "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)",
                  # This fixture tests scheduling with tiny executables; real
                  # canonical bytes are verified by the native product tests.
                  f"set(EDR_P0_TEST_CONFIG_AVAILABLE {'TRUE' if p0_inputs_available else 'FALSE'})"]
+        # Preserve the logger declarations' order relative to the actual gate
+        # include; a fixture must not hide an early production include.
+        production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        gate_position = production.index("include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)")
+        late_loggers = {name for name in LOGGER_OWNERS
+                        if production.index(f"add_test(NAME {name} ") > gate_position}
+        after_gate = []
         registered_targets = set()
         for name, target in pairs:
+            declarations = after_gate if name in late_loggers else lines
             if target != '""' and target != missing_target and target not in registered_targets:
-                lines.append(f"add_executable({target} main.c)")
+                executable_source = "failure.c" if target == failing_executable else "main.c"
+                declarations.append(f"add_executable({target} {executable_source})")
                 registered_targets.add(target)
             if name != missing_test:
                 command = target if target != '""' else '"${CMAKE_COMMAND}" -E true'
                 if name == failing_test:
                     command = '"${CMAKE_COMMAND}" -E false'
-                lines.append(f"add_test(NAME {name} COMMAND {command})")
+                declarations.append(f"add_test(NAME {name} COMMAND {command})")
         lines.append(f'include("{RUNTIME_GATE.as_posix()}")')
         lines.append(f'include("{GATE.as_posix()}")')
+        lines.extend(after_gate)
         (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
         return source, source / "build", pairs
 
@@ -279,6 +297,42 @@ class WindowsReleaseGateTests(unittest.TestCase):
             source, build, _ = self.fixture(directory, missing_target="test_response_file_security")
             result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
             self.assertIn("Windows release gate executable target is missing", result.stderr)
+
+    def test_logger_executables_are_built_and_failures_block_windows_release(self):
+        for name, target in LOGGER_OWNERS.items():
+            with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
+                source, build, pairs = self.fixture(directory, failing_executable=target)
+                self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
+                                 "-DCMAKE_BUILD_TYPE=Release")
+                # Reproduce the release regression: build every other selected
+                # executable, leaving both logger owners absent.
+                other_targets = sorted({executable for _, executable in pairs
+                                        if executable != '""' and executable not in LOGGER_OWNERS.values()})
+                self.run_command("cmake", "--build", str(build), "--config", "Release",
+                                 "--target", *other_targets, "--parallel", "2")
+                missing = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
+                                           "-L", LABEL, "--no-tests=error", success=False)
+                self.assertEqual(missing.stdout.count("***Not Run"), 2,
+                                 missing.stdout + missing.stderr)
+                for owner in LOGGER_OWNERS:
+                    self.assertIn(owner + " (Not Run)", missing.stdout + missing.stderr)
+
+                self.run_command("cmake", "--build", str(build), "--config", "Release",
+                                 "--target", "windows_release_gate_tests", "--parallel", "2")
+                listing = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
+                                           "-L", LABEL, "--show-only=json-v1")
+                selected = {test["name"]: test for test in json.loads(listing.stdout)["tests"]}
+                for owner, executable in LOGGER_OWNERS.items():
+                    command = selected[owner]["command"]
+                    self.assertTrue(Path(command[0]).is_file(), command)
+                    self.assertEqual(Path(command[0]).stem, executable)
+                result = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
+                                          "-L", LABEL, "--no-tests=error", "--output-on-failure",
+                                          success=False)
+                failed = re.findall(r"^\s*\d+ - (\w+) \(Failed\)(?:[ \t]+.*)?$",
+                                    result.stdout, re.MULTILINE)
+                self.assertEqual(failed, [name], result.stdout + result.stderr)
+                self.assertNotIn("***Not Run", result.stdout + result.stderr)
 
     def test_missing_registration_fails_at_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
