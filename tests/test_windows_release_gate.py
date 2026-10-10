@@ -33,7 +33,7 @@ WINDOWS_EXPECTED = {
     "etw_process_payload_identity_native",
     "collector_health_disposition_json",
     "security_event_time_native", "security_event_time_failures", "wfas_provider_native",
-    "rtq_long_command_windows",
+    "rtq_long_command_windows", "rtq_collector_behavior",
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
