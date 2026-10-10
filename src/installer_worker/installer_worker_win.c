@@ -489,12 +489,17 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
     return 4;
   }
   SERVICE_STATUS_PROCESS ssp;
+  ZeroMemory(&ssp, sizeof(ssp));
   DWORD bytes = 0;
+  BOOL query_ok = FALSE;
+  DWORD query_error = ERROR_SUCCESS;
   int ok = 0;
   for (int i = 0; i < 40; ++i) {
     Sleep(250);
-    if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytes) &&
-        ssp.dwCurrentState == SERVICE_RUNNING) {
+    query_ok = QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytes);
+    query_error = query_ok ? ERROR_SUCCESS : GetLastError();
+    if (!query_ok) ZeroMemory(&ssp, sizeof(ssp));
+    if (query_ok && ssp.dwCurrentState == SERVICE_RUNNING) {
       ok = 1;
       break;
     }
@@ -509,10 +514,14 @@ static int start_service_by_name(const wchar_t *service_name, const wchar_t *log
       Sleep(250);
     }
   }
-  wchar_t line[512];
+  wchar_t line[1024];
   _snwprintf(line, sizeof(line) / sizeof(line[0]),
-             L"start_service name=%ls service_running=%d process_running=%d start_gle=%lu", service_name, ok,
-             process_ok, start_error);
+             L"start_service name=%ls service_running=%d process_running=%d start_gle=%lu "
+             L"query_ok=%d query_gle=%lu scm_state=%lu scm_pid=%lu scm_win32_exit=%lu "
+             L"scm_service_exit=%lu scm_checkpoint=%lu scm_wait_hint_ms=%lu", service_name, ok,
+             process_ok, start_error, query_ok ? 1 : 0, query_error, ssp.dwCurrentState,
+             ssp.dwProcessId, ssp.dwWin32ExitCode, ssp.dwServiceSpecificExitCode,
+             ssp.dwCheckPoint, ssp.dwWaitHint);
   line[(sizeof(line) / sizeof(line[0])) - 1] = 0;
   append_log_utf8(log_path, line);
   CloseServiceHandle(svc);
