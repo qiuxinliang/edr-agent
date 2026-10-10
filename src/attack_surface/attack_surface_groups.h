@@ -10,6 +10,21 @@ typedef enum {
   EDR_ASURF_POLICY, EDR_ASURF_NETWORK
 } EdrAttackSurfaceMode;
 
+/* Shared by strict command admission and the periodic collection owner.
+ * Listener-only ETW snapshots use their existing reason, not this selector. */
+static inline int edr_asurf_periodic_group_mode(const char *group,
+                                               EdrAttackSurfaceMode *out) {
+  EdrAttackSurfaceMode mode;
+  if (!group) return 0;
+  if (!strcmp(group, "full")) mode = EDR_ASURF_FULL;
+  else if (!strcmp(group, "networkOnly")) mode = EDR_ASURF_NETWORK;
+  else if (!strcmp(group, "inventoryOnly")) mode = EDR_ASURF_INVENTORY;
+  else if (!strcmp(group, "policyOnly")) mode = EDR_ASURF_POLICY;
+  else return 0;
+  if (out) *out = mode;
+  return 1;
+}
+
 static inline const char *edr_asurf_mode_name(EdrAttackSurfaceMode mode) {
   switch (mode) {
     case EDR_ASURF_LISTENERS: return "listenersOnly";
@@ -42,11 +57,7 @@ static inline EdrAttackSurfaceMode edr_asurf_periodic_payload_mode(
   cJSON *root = cJSON_ParseWithLength((const char *)payload, payload_len);
   EdrAttackSurfaceMode mode = EDR_ASURF_FULL;
   const cJSON *group = cJSON_GetObjectItemCaseSensitive(root, "collection_group");
-  if (cJSON_IsString(group) && group->valuestring) {
-    if (!strcmp(group->valuestring, "networkOnly")) mode = EDR_ASURF_NETWORK;
-    else if (!strcmp(group->valuestring, "inventoryOnly")) mode = EDR_ASURF_INVENTORY;
-    else if (!strcmp(group->valuestring, "policyOnly")) mode = EDR_ASURF_POLICY;
-  }
+  if (cJSON_IsString(group)) (void)edr_asurf_periodic_group_mode(group->valuestring, &mode);
   cJSON_Delete(root);
   return mode;
 }

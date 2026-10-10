@@ -3,6 +3,7 @@
 
 #include "edr/command_registry.h"
 #include "cJSON.h"
+#include "../attack_surface/attack_surface_groups.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -38,6 +39,10 @@ static const CommandFieldRule k_common_rules[] = {
     RULE("initiated_by", FIELD_STRING, 0, 0, 0, 32, 0),
     RULE("reason", FIELD_STRING, 0, 0, 0, 1024, 0),
     RULE("manual", FIELD_BOOL, 0, 0, 0, 0, 0),
+};
+
+static const CommandFieldRule k_attack_surface_rules[] = {
+    RULE("collection_group", FIELD_STRING, 0, 0, 0, 32, 0),
 };
 
 static const CommandFieldRule k_echo_rules[] = {
@@ -371,6 +376,8 @@ static void command_rules(EdrCommandKind kind, const CommandFieldRule **rules,
   *rules = NULL;
   *count = 0u;
   switch (kind) {
+    case EDR_COMMAND_KIND_ATTACK_SURFACE:
+      *rules = k_attack_surface_rules; *count = COUNT_OF(k_attack_surface_rules); break;
     case EDR_COMMAND_KIND_ECHO:
       *rules = k_echo_rules; *count = COUNT_OF(k_echo_rules); break;
     case EDR_COMMAND_KIND_TELEMETRY_PROFILE_UPDATE:
@@ -574,6 +581,11 @@ static int rtq_payload_text_valid(const uint8_t *payload, size_t length) {
 
 static int validate_semantics(EdrCommandKind kind, const cJSON *root,
                               char *reason, size_t reason_cap) {
+  if (kind == EDR_COMMAND_KIND_ATTACK_SURFACE) {
+    const cJSON *group = cJSON_GetObjectItemCaseSensitive(root, "collection_group");
+    if (group && !edr_asurf_periodic_group_mode(group->valuestring, NULL))
+      return contract_fail(reason, reason_cap, "attack surface collection_group is invalid");
+  }
   if (kind == EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL) {
     const char *schema=cJSON_GetObjectItemCaseSensitive(root,"schema")->valuestring;
     const char *mode=cJSON_GetObjectItemCaseSensitive(root,"target_kind")->valuestring;

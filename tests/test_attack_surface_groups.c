@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
+#include "edr/command_contract.h"
 #include "../src/attack_surface/attack_surface_groups.h"
 int main(void) {
   const char payload[] = "{\"collection_group\":\"inventoryOnly\"}";
@@ -7,6 +9,19 @@ int main(void) {
   assert(edr_asurf_periodic_payload_mode("auto-asurf-inventoryOnly-1", (const uint8_t *)payload, sizeof(payload)-1u) == EDR_ASURF_INVENTORY);
   assert(edr_asurf_samples_listeners(EDR_ASURF_NETWORK) && edr_asurf_samples_egress(EDR_ASURF_NETWORK));
   assert(!edr_asurf_samples_inventory(EDR_ASURF_NETWORK) && !edr_asurf_samples_policy(EDR_ASURF_NETWORK));
+  const char *groups[] = {"full", "networkOnly", "inventoryOnly", "policyOnly"};
+  const EdrAttackSurfaceMode modes[] = {EDR_ASURF_FULL, EDR_ASURF_NETWORK, EDR_ASURF_INVENTORY, EDR_ASURF_POLICY};
+  for (size_t i = 0; i < sizeof(groups)/sizeof(groups[0]); ++i) {
+    char request[160], reason[192];
+    snprintf(request, sizeof(request), "{\"reason\":\"periodic_attack_surface\",\"collection_group\":\"%s\"}", groups[i]);
+    assert(edr_command_contract_validate("GET_ATTACK_SURFACE", (const uint8_t *)request, strlen(request), reason, sizeof(reason)));
+    assert(edr_asurf_periodic_payload_mode("auto-asurf-group-1", (const uint8_t *)request, strlen(request)) == modes[i]);
+    assert(edr_asurf_periodic_payload_mode("cmd-manual", (const uint8_t *)request, strlen(request)) == EDR_ASURF_FULL);
+    cJSON *root = cJSON_Parse("{\"summary\":{\"listenerCount\":1,\"serviceCount\":2,\"suspiciousEgressCount\":3},\"listeners\":{},\"services\":{},\"securityPolicy\":{},\"egressTop\":[]}");
+    assert(edr_asurf_project_sampled_groups(root, modes[i]) == 0);
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(root, "snapshotKind")->valuestring, groups[i]));
+    cJSON_Delete(root);
+  }
   for (int mode=EDR_ASURF_FULL; mode<=EDR_ASURF_NETWORK; ++mode) {
     cJSON *root = cJSON_Parse("{\"summary\":{\"listenerCount\":1,\"serviceCount\":2,\"suspiciousEgressCount\":3},\"listeners\":{\"items\":[]},\"webServices\":[],\"processHighlights\":[],\"egressTop\":[],\"services\":{\"items\":[]},\"securityPolicy\":{},\"firewall\":{}}");
     assert(edr_asurf_project_sampled_groups(root, (EdrAttackSurfaceMode)mode) == 0);

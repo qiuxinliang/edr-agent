@@ -20,6 +20,7 @@
 #include "edr/command_executor.h"
 #include "edr/config.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/egress_request_policy.h"
 #include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/behavior_from_slot.h"
@@ -33,6 +34,7 @@
 static void pause_retry(void) { Sleep(1200u); }
 #else
 #include <time.h>
+#include <unistd.h>
 static void pause_retry(void) { struct timespec t = {1, 200000000L}; nanosleep(&t, NULL); }
 #endif
 
@@ -271,6 +273,61 @@ static int fixture_expire_result(const char *dir,const char *id,int64_t expiry) 
   if(ferror(f))ok=0;free(line);if(fclose(f))ok=0;return ok&&changed;
 }
 
+/* Reuse the complete production command receiver/executor already linked by
+ * this fixture. Internal group admission must reach the existing egress hold;
+ * accepting a selector never authorizes attack-surface collection or upload. */
+static void attack_surface_command_admission(const EdrSoarCommandMeta *signed_meta) {
+  const char *groups[] = {"full", "networkOnly", "inventoryOnly", "policyOnly"};
+  EdrCommandStateRecord *record = calloc(1u, sizeof(*record));
+  CHECK(record); if (!record) return;
+  for (size_t i = 0; i < sizeof(groups)/sizeof(groups[0]); ++i) {
+    char id[128], payload[160];
+    snprintf(id, sizeof(id), "auto-asurf-synthetic-%s", groups[i]);
+    snprintf(payload, sizeof(payload), "{\"reason\":\"periodic_attack_surface\",\"collection_group\":\"%s\"}", groups[i]);
+    edr_command_on_internal_envelope(id, "GET_ATTACK_SURFACE", (const uint8_t *)payload, strlen(payload), NULL);
+    for (unsigned wait = 0; wait < 4u && !edr_command_state_has_final(id, NULL); ++wait) pause_retry();
+    memset(record, 0, sizeof(*record));
+    CHECK(edr_command_state_begin(id, "GET_ATTACK_SURFACE", NULL, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+    CHECK(record->execution_status == EdrCmdExecFailed && record->exit_code == EDR_EGRESS_REQUEST_DENIED);
+    CHECK(strstr(record->detail, "attack_surface_policy_held") && !record->report_pending);
+    CHECK(record->result_authorization.expires_unix_ms == 0);
+  }
+  const char *invalid[] = {
+      "{\"collection_group\":\"listenersOnly\"}",
+      "{\"collection_group\":\"networkOnly\",\"unknown\":true}"
+  };
+  for (size_t i = 0; i < sizeof(invalid)/sizeof(invalid[0]); ++i) {
+    char id[128]; snprintf(id, sizeof(id), "auto-asurf-synthetic-invalid-%zu", i);
+    edr_command_on_internal_envelope(id, "GET_ATTACK_SURFACE", (const uint8_t *)invalid[i], strlen(invalid[i]), NULL);
+    memset(record, 0, sizeof(*record));
+    CHECK(edr_command_state_begin(id, "GET_ATTACK_SURFACE", NULL, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+    CHECK(record->execution_status == EdrCmdExecRejected && record->exit_code == 19);
+  }
+  const char *payload = "{\"collection_group\":\"networkOnly\"}";
+  EdrSoarCommandMeta forged = *signed_meta;
+  snprintf(forged.initiated_by, sizeof(forged.initiated_by), "agent_auto");
+  forged.idempotency_key[0] = '\0';
+  CHECK(edr_command_receive_envelope("auto-asurf-synthetic-external", "GET_ATTACK_SURFACE",
+      (const uint8_t *)payload, strlen(payload), &forged) == 0);
+  CHECK(!edr_command_state_has_final("auto-asurf-synthetic-external", &forged));
+  edr_command_on_internal_envelope("cmd-synthetic-not-internal", "GET_ATTACK_SURFACE",
+      (const uint8_t *)payload, strlen(payload), NULL);
+  CHECK(!edr_command_state_has_final("cmd-synthetic-not-internal", NULL));
+  EdrCommandInboxRecord *inbox = calloc(16u, sizeof(*inbox));
+  CHECK(inbox);
+  if (inbox) {
+    int count = edr_command_state_collect_inbox(inbox, 16u);
+    CHECK(count >= 0);
+    for (int i = 0; i < count; ++i) {
+      CHECK(strcmp(inbox[i].command_id, "auto-asurf-synthetic-external"));
+      CHECK(strcmp(inbox[i].command_id, "cmd-synthetic-not-internal"));
+      edr_command_state_free_inbox_record(&inbox[i]);
+    }
+    free(inbox);
+  }
+  free(record);
+}
+
 static int command_result_scenario(const char *path) {
 #ifdef _WIN32
   _putenv_s("EDR_COMMAND_STATE_DIR", path);
@@ -383,6 +440,7 @@ static int command_result_scenario(const char *path) {
     }
     CHECK(match);
   }
+  attack_surface_command_admission(&meta);
   CHECK(edr_command_executor_shutdown_timeout(5000) == 1);
   edr_command_bind_config(NULL); free(pending);
   printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
@@ -391,6 +449,39 @@ static int command_result_scenario(const char *path) {
 #endif
 
 int main(int argc, char **argv) {
+#ifdef EDR_TEST_EXTENDED_EGRESS
+  if (argc == 3 && !strcmp(argv[1], "--attack-surface-admission")) {
+    char path[1200], state[1280];
+#ifdef _WIN32
+    unsigned pid = (unsigned)GetCurrentProcessId();
+#else
+    unsigned pid = (unsigned)getpid();
+#endif
+    CHECK(snprintf(path, sizeof(path), "%s-%lld-%u", argv[2], (long long)time(NULL), pid) < (int)sizeof(path));
+    snprintf(state, sizeof(state), "%s/command_state.jsonl", path);
+    FILE *existing = fopen(state, "rb");
+    CHECK(!existing); if (existing) { fclose(existing); return 1; }
+#ifdef _WIN32
+    CHECK(_putenv_s("EDR_COMMAND_STATE_DIR", path) == 0);
+    CHECK(_putenv_s("EDR_COMMAND_REQUIRE_SIGNATURE", "1") == 0);
+#else
+    CHECK(setenv("EDR_COMMAND_STATE_DIR", path, 1) == 0);
+    CHECK(setenv("EDR_COMMAND_REQUIRE_SIGNATURE", "1", 1) == 0);
+#endif
+    EdrConfig cfg = {0};
+    snprintf(cfg.agent.endpoint_id, sizeof(cfg.agent.endpoint_id), "synthetic-endpoint");
+    snprintf(cfg.agent.tenant_id, sizeof(cfg.agent.tenant_id), "synthetic-tenant");
+    edr_command_bind_config(&cfg);
+    EdrSoarCommandMeta meta = {0};
+    meta.issued_at_unix_ms = (int64_t)time(NULL) * 1000;
+    meta.deadline_ms = 30000u;
+    attack_surface_command_admission(&meta);
+    CHECK(edr_command_executor_shutdown_timeout(5000u) == 1);
+    edr_command_bind_config(NULL);
+    printf("{\"mode\":\"attack-surface-admission\",\"received_groups\":4,\"egress_policy\":\"held\",\"failed_checks\":%u}\n", failed);
+    return failed ? 1 : 0;
+  }
+#endif
   if (argc != 7) {
     fprintf(stderr, "usage: test_egress_tls_client BASE_URL CA CLIENT_CERT CLIENT_KEY QUEUE_PATH MODE\n"); return 2;
   }
