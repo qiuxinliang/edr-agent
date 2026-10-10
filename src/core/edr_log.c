@@ -145,6 +145,7 @@ static int log_initialize_missing_streams(const char *path) {
  * If opening fails, the previous descriptors still retain every diagnostic. */
 #ifdef EDR_LOG_TESTING
 static unsigned s_log_test_fail_open_count;
+static unsigned s_log_test_fail_buffering_count;
 #endif
 static FILE *log_open_append(const char *path) {
 #ifdef _WIN32
@@ -180,6 +181,24 @@ static int log_bind_streams(FILE *file, const char *path) {
   SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(EDR_LOG_FILENO(stdout)));
 #endif
   return 0;
+}
+
+static int log_configure_stream_buffering(void) {
+#ifdef EDR_LOG_TESTING
+  if (s_log_test_fail_buffering_count) {
+    --s_log_test_fail_buffering_count;
+    errno = ENOMEM;
+    return -1;
+  }
+#endif
+  if (setvbuf(stderr, NULL, _IONBF, 0u) != 0) return -1;
+#ifdef _WIN32
+  /* UCRT treats _IOLBF as full buffering and rejects a zero buffer size.
+   * Keep Windows diagnostics immediately visible, including headless tasks. */
+  return setvbuf(stdout, NULL, _IONBF, 0u);
+#else
+  return setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+#endif
 }
 
 static int log_remove(const char *path) {
@@ -237,7 +256,10 @@ static int log_configure(const EdrConfig *cfg) {
   if (!file) return -1;
   log_stream_lock();
   fflush(stdout); fflush(stderr);
-  int rc = log_bind_streams(file, path);
+  /* Configure valid buffering before moving the owned descriptors so a
+   * configuration failure preserves the previous diagnostic destination. */
+  int rc = log_configure_stream_buffering();
+  if (rc == 0) rc = log_bind_streams(file, path);
   fclose(file);
   if (rc == 0) {
     snprintf(s_log_path, sizeof(s_log_path), "%s", path);
@@ -246,8 +268,6 @@ static int log_configure(const EdrConfig *cfg) {
     s_log_last_check_ns = 0u;
     s_log_prune_pending = 1;
     s_log_rebind_pending = 0;
-    setvbuf(stderr, NULL, _IONBF, 0u);
-    setvbuf(stdout, NULL, _IOLBF, 0u);
   }
   log_stream_unlock();
   return rc;
