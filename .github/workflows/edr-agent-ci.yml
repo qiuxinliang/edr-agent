@@ -34,14 +34,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ($env:P0_TEST_INPUTS_REF -cnotmatch '^[0-9a-f]{40}$') { throw 'Configure P0_TEST_INPUTS_REF as the full immutable canonical input commit SHA' }
           if ([string]::IsNullOrWhiteSpace($env:P0_TEST_INPUTS_SSH_KEY)) { throw 'Configure the read-only P0_TEST_INPUTS_SSH_KEY for canonical integration tests' }
+      - name: Verify private P0 checkout ACL contract
+        shell: pwsh
+        run: .\tests\test_private_p0_checkout.ps1
       - name: Checkout canonical P0 test inputs
-        uses: actions/checkout@v6
-        with:
-          repository: qiuxinliang/EDRAI
-          ref: ${{ vars.P0_TEST_INPUTS_REF }}
-          ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
-          persist-credentials: false
-          path: canonical-p0-test-inputs
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: .\scripts\checkout_private_p0_inputs.ps1 -Directory canonical-p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
       - name: Bind canonical P0 test input directory
         shell: pwsh
         env:

@@ -23,6 +23,8 @@ $relativePaths = @(
   "scripts\windows_isolate_host.ps1",
   "scripts\invoke_windows_native_capability_probe.ps1",
   "scripts\bootstrap_pinned_vcpkg.ps1",
+  "scripts\checkout_private_p0_inputs.ps1",
+  "tests\test_private_p0_checkout.ps1",
   "scripts\Invoke-VcpkgInstallWithRetry.ps1",
   "scripts\Initialize-VSEnvironment.ps1",
   "scripts\Assert-WindowsPeArchitecture.ps1",
