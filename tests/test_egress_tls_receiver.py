@@ -715,6 +715,8 @@ def main():
             print(f"mTLS scenario end: {mode} elapsed_ms={round((time.monotonic() - started) * 1000)} client_exit={result.returncode}",
                   file=sys.stderr, flush=True)
         if not args.baseline and not args.command_only and not args.update_download_only:
+            started = time.monotonic()
+            print("mTLS scenario begin: positive-crash-restart", file=sys.stderr, flush=True)
             try:
                 reports.append(crash_restart_scenario(args.client, root))
             except (AssertionError, RuntimeError, OSError, sqlite3.Error, ValueError, KeyError,
@@ -723,6 +725,8 @@ def main():
                                 "received_requests": None, "receiver_business_failures": 0,
                                 "diagnostic": {"stage": "crash_owner_cleanup",
                                                "error_type": type(error).__name__}})
+            print(f"mTLS scenario end: positive-crash-restart elapsed_ms={round((time.monotonic() - started) * 1000)} client_exit={reports[-1]['client_exit']}",
+                  file=sys.stderr, flush=True)
         failed = any(report["client_exit"] or report["receiver_business_failures"] for report in reports)
         failed |= any(report["received_requests"] for report in reports if not report["mode"].startswith("positive"))
         print(json.dumps({"synthetic_only": True, "production_connections": 0,
