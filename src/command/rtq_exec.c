@@ -312,6 +312,24 @@ static int append_json_kv_str(char *buf, int cap, int *offset, const char *key, 
            rtq_appendf(buf, cap, offset, "\"");
 }
 
+/* Shared event scope belongs to the batch. Charge its encoded bytes against
+ * the same fixed result budget so even escaped input cannot crowd out the
+ * diagnostics/footer needed by durable replay. */
+static int eventlog_batch_metadata(const rtq_filter *f, char *buf, int cap) {
+    int offset = 0;
+    if (!f || !buf || cap <= 0) return -1;
+    buf[0] = '\0';
+    if (!f->has_eventlog) return 0;
+    if (!rtq_appendf(buf, cap, &offset,
+                     "\"eventlog\":{\"schema\":\"" EDR_RTQ_EVENTLOG_BATCH_SCHEMA "\"") ||
+        !append_json_kv_str(buf, cap, &offset, "channel",
+                            f->eventlog_channel[0] ? f->eventlog_channel : "System") ||
+        !append_json_kv_str(buf, cap, &offset, "query",
+                            f->eventlog_query[0] ? f->eventlog_query : "*") ||
+        !rtq_appendf(buf, cap, &offset, "},")) return -1;
+    return offset;
+}
+
 static int rtq_commit_row(char *buf, int cap, int *offset, int *total,
                           const char *row, int row_len, int *truncated) {
     if (!buf || !offset || !total || !row || row_len <= 0 ||
@@ -1420,9 +1438,7 @@ static int match_eventlog(rtq_filter *f, char *buf, int cap, int *offset, int *t
             }
             char row[RTQ_ROW_CAP];
             int row_offset = 0;
-            int row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset, "{\"type\":\"eventlog\"") &&
-                         append_json_kv_str(row, (int)sizeof(row), &row_offset, "channel", f->eventlog_channel[0] ? f->eventlog_channel : "System") &&
-                         append_json_kv_str(row, (int)sizeof(row), &row_offset, "query", f->eventlog_query[0] ? f->eventlog_query : "*");
+            int row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset, "{\"type\":\"eventlog\"");
             if (!row_ok || !append_eventlog_evidence(render_ctx, events[i], row, (int)sizeof(row), &row_offset)) {
                 rtq_error_append(errs, "eventlog", "field_unavailable", "event system metadata could not be read completely", 0);
             } else {
@@ -1980,6 +1996,16 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     int has_file = filter.has_file;
     int has_registry = filter.has_registry;
     int has_eventlog = filter.has_eventlog;
+    char eventlog_meta[4096];
+    int eventlog_meta_len = eventlog_batch_metadata(&filter, eventlog_meta, (int)sizeof(eventlog_meta));
+    if (eventlog_meta_len < 0 || eventlog_meta_len >= RTQ_COLLECTOR_RESULT_CAP) {
+        free(result);
+        g_cmd_exec_fail++;
+        edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecFailed, 3,
+                                      "eventlog batch metadata exceeds result budget");
+        return;
+    }
+    const int collector_result_cap = RTQ_COLLECTOR_RESULT_CAP - eventlog_meta_len;
     int output_truncated = 0;
     rtq_errors errors;
     rtq_error_init(&errors);
@@ -1988,43 +2014,43 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
 
 #ifdef _WIN32
     if (has_proc) {
-        (void)match_processes(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_processes(&filter, result, collector_result_cap, &offset, &total,
                               &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_net) {
-        (void)match_network(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_network(&filter, result, collector_result_cap, &offset, &total,
                             &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_file) {
-        (void)match_files_cache_first(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset,
+        (void)match_files_cache_first(&filter, result, collector_result_cap, &offset,
                                       &total, &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_registry) {
-        (void)match_registry(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_registry(&filter, result, collector_result_cap, &offset, &total,
                              &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_eventlog) {
-        (void)match_eventlog(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_eventlog(&filter, result, collector_result_cap, &offset, &total,
                              &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
 #else
     if (has_proc) {
-        (void)match_processes(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_processes(&filter, result, collector_result_cap, &offset, &total,
                               &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_net) {
-        (void)match_network(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset, &total,
+        (void)match_network(&filter, result, collector_result_cap, &offset, &total,
                             &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
     if (has_file) {
-        (void)match_files_cache_first(&filter, result, RTQ_COLLECTOR_RESULT_CAP, &offset,
+        (void)match_files_cache_first(&filter, result, collector_result_cap, &offset,
                                       &total, &errors, &output_truncated);
     }
     if (rtq_cancelled(&filter)) goto cancelled;
@@ -2058,9 +2084,9 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     if (errors.count) (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n],\"partial\":true");
     else (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n]");
     (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset,
-        ",\"total\":%d,\"truncated\":%s,\"meta\":{\"file_hash\":{\"scope\":\"%s\",\"cache_status\":\"%s\",\"cache_attempted\":%s,"
+        ",\"total\":%d,\"truncated\":%s,\"meta\":{%s\"file_hash\":{\"scope\":\"%s\",\"cache_status\":\"%s\",\"cache_attempted\":%s,"
         "\"cache_hits\":%d,\"cache_candidates_scanned\":%u,\"path_scanned\":%s}},\"error\":",
-        total, output_truncated ? "true" : "false", scope, cache_status,
+        total, output_truncated ? "true" : "false", eventlog_meta, scope, cache_status,
         filter.file_cache_attempted ? "true" : "false",
         filter.file_cache_hits, filter.file_cache_candidates,
         filter.file_path_scanned ? "true" : "false");

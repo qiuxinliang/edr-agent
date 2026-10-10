@@ -185,7 +185,14 @@ static int result_rtq_network_state(const cJSON *q,const cJSON *row) {
   return edr_rtq_network_state_normalize(wanted,expected,sizeof(expected)) &&
          edr_rtq_network_state_normalize(result_text(row,"state"),actual,sizeof(actual)) && !strcmp(expected,actual);
 }
-static cJSON *result_live_row(const cJSON *q,const cJSON *row) {
+static int result_rtq_eventlog_batch(const cJSON *q,const cJSON *batch) {
+  const char *channel=result_text(q,"eventlog_channel"),*query=result_text(q,"eventlog_query");
+  return cJSON_IsObject(batch) && result_query_category(q,"eventlog") &&
+      !strcmp(result_text(batch,"schema"),EDR_RTQ_EVENTLOG_BATCH_SCHEMA) &&
+      !strcmp(result_text(batch,"channel"),*channel?channel:"System") &&
+      !strcmp(result_text(batch,"query"),*query?query:"*");
+}
+static cJSON *result_live_row(const cJSON *q,const cJSON *row,const cJSON *eventlog_batch) {
   const char *type=result_text(row,"type");
   if(!cJSON_IsObject(row)||!result_query_category(q,type))return NULL;
   cJSON *out=cJSON_CreateObject();if(!out)return NULL;
@@ -216,11 +223,19 @@ static cJSON *result_live_row(const cJSON *q,const cJSON *row) {
        result_copy_fields(out,row,"type|key|value|data","reg_type","");
   } else if(!strcmp(type,"eventlog")) {
     const char *channel=result_text(q,"eventlog_channel"),*query=result_text(q,"eventlog_query");
+    const cJSON *row_channel=cJSON_GetObjectItemCaseSensitive(row,"channel"),
+                *row_query=cJSON_GetObjectItemCaseSensitive(row,"query");
+    /* Compact rows inherit only the already verified signed batch scope.
+     * Old row fields, if supplied alongside the batch, must still agree. */
+    int scope_ok=eventlog_batch?
+        ((!row_channel || (cJSON_IsString(row_channel) && !strcmp(row_channel->valuestring,*channel?channel:"System"))) &&
+         (!row_query || (cJSON_IsString(row_query) && !strcmp(row_query->valuestring,*query?query:"*")))):
+        (!strcmp(result_text(row,"channel"),*channel?channel:"System") &&
+         !strcmp(result_text(row,"query"),*query?query:"*"));
     ok=*result_text(row,"provider") && *result_text(row,"timestamp") &&
        result_integer(row,"event_id",0,65535,NULL) && result_integer(row,"record_id",1,9007199254740991.0,NULL) &&
-       !strcmp(result_text(row,"channel"),*channel?channel:"System") &&
-       !strcmp(result_text(row,"query"),*query?query:"*") &&
-       result_copy_fields(out,row,"type|channel|query|provider|timestamp","event_id|record_id|level|process_id|thread_id","");
+       scope_ok && result_copy_fields(out,row,eventlog_batch?"type|provider|timestamp":"type|channel|query|provider|timestamp",
+                                     "event_id|record_id|level|process_id|thread_id","");
   }
   if(!ok){cJSON_Delete(out);return NULL;}return out;
 }
@@ -233,7 +248,7 @@ static cJSON *result_cached_row(const cJSON *q,const cJSON *row,const cJSON *con
     cJSON_AddStringToObject(request,"file_sha256",result_text(q,"file_sha256"));
     cJSON_AddStringToObject(request,"file_path",result_text(q,"file_path"));
     cJSON_AddStringToObject(request,"file_ext",result_text(q,"file_ext"));
-    cJSON *out=result_live_row(request,row);cJSON_Delete(request);return out;
+    cJSON *out=result_live_row(request,row,NULL);cJSON_Delete(request);return out;
   }
   double ts,issued,window;
   if(*result_text(q,"file_sha256"))return NULL; /* this scope selects only the hash-cache result shape */
@@ -274,11 +289,14 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
   const cJSON *q=cJSON_GetObjectItemCaseSensitive(contract,"request");
   const cJSON *rows=cJSON_GetObjectItemCaseSensitive(root,cached?"rows":"results");
   double max_rows;if(!cJSON_IsObject(q)||!cJSON_IsArray(rows)||!result_integer(contract,"max_rows",1,cached?1000:500,&max_rows)||cJSON_GetArraySize(rows)>max_rows)return NULL;
+  const cJSON *meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
+  const cJSON *eventlog_batch=cached?NULL:cJSON_GetObjectItemCaseSensitive(meta,"eventlog");
+  if(eventlog_batch && !result_rtq_eventlog_batch(q,eventlog_batch))return NULL;
   cJSON *out=cJSON_CreateObject(),*projected=cJSON_CreateArray();
   if(!out||!projected){cJSON_Delete(out);cJSON_Delete(projected);return NULL;}
   cJSON_AddItemToObject(out,cached?"rows":"results",projected);
   for(const cJSON *row=rows->child;row;row=row->next) {
-    cJSON *item=cached?result_cached_row(q,row,contract,a):result_live_row(q,row);
+    cJSON *item=cached?result_cached_row(q,row,contract,a):result_live_row(q,row,eventlog_batch);
     if(!item||!cJSON_AddItemToArray(projected,item)){cJSON_Delete(item);cJSON_Delete(out);return NULL;}
   }
   const cJSON *incomplete=cJSON_GetObjectItemCaseSensitive(root,cached?"partial":"truncated");
@@ -295,20 +313,35 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
     const cJSON *collection_partial=cJSON_GetObjectItemCaseSensitive(root,"partial");
     if(collection_partial && !cJSON_IsBool(collection_partial)){cJSON_Delete(out);return NULL;}
     if(cJSON_IsTrue(collection_partial))cJSON_AddBoolToObject(out,"partial",1);
+    if(eventlog_batch) {
+      cJSON *projected_meta=cJSON_CreateObject(),*projected_eventlog=cJSON_CreateObject();
+      if(!projected_meta || !projected_eventlog || !result_copy_fields(projected_eventlog,eventlog_batch,"schema|channel|query","","")) {
+        cJSON_Delete(projected_meta);cJSON_Delete(projected_eventlog);cJSON_Delete(out);return NULL;
+      }
+      if(!cJSON_AddItemToObject(projected_meta,"eventlog",projected_eventlog)) {
+        cJSON_Delete(projected_eventlog);cJSON_Delete(projected_meta);cJSON_Delete(out);return NULL;
+      }
+      if(!cJSON_AddItemToObject(out,"meta",projected_meta)) {
+        cJSON_Delete(projected_meta);cJSON_Delete(out);return NULL;
+      }
+    }
     if(result_query_category(q,"file")) {
-      const cJSON *meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
       const cJSON *hash=cJSON_GetObjectItemCaseSensitive(meta,"file_hash");
       if(hash) {
         if(!cJSON_IsObject(hash) ||
            !result_member(result_text(hash,"cache_status"),"not_requested|hit|miss|unavailable") ||
            (cJSON_HasObjectItem(hash,"scope") && !result_member(result_text(hash,"scope"),"cache_only|cache_and_exact_path|path_scan|bounded_default_roots"))) {cJSON_Delete(out);return NULL;}
-        cJSON *projected_meta=cJSON_CreateObject(),*projected_hash=cJSON_CreateObject();
-        if(!projected_meta || !projected_hash || !result_copy_fields(projected_hash,hash,
+        cJSON *projected_hash=cJSON_CreateObject();
+        if(!projected_hash || !result_copy_fields(projected_hash,hash,
             "scope|cache_status","cache_hits|cache_candidates_scanned","cache_attempted|path_scanned")) {
-          cJSON_Delete(projected_meta);cJSON_Delete(projected_hash);cJSON_Delete(out);return NULL;
+          cJSON_Delete(projected_hash);cJSON_Delete(out);return NULL;
         }
-        cJSON_AddItemToObject(projected_meta,"file_hash",projected_hash);
-        cJSON_AddItemToObject(out,"meta",projected_meta);
+        cJSON *projected_meta=cJSON_GetObjectItemCaseSensitive(out,"meta");
+        if(!projected_meta)projected_meta=cJSON_AddObjectToObject(out,"meta");
+        if(!projected_meta){cJSON_Delete(projected_hash);cJSON_Delete(out);return NULL;}
+        if(!cJSON_AddItemToObject(projected_meta,"file_hash",projected_hash)) {
+          cJSON_Delete(projected_hash);cJSON_Delete(out);return NULL;
+        }
       }
     }
     /* Errors are finite diagnostics. Free text and sampler detail stay local. */
