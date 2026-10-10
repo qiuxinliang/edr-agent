@@ -214,7 +214,7 @@ typedef struct EdrConfig {
     char level[16];
     char log_dir[1024];
     uint32_t max_log_size_mb;
-    uint32_t max_log_files;
+    uint32_t max_log_files; /* Total retained files, including active agent.log. */
   } logging;
 
   /** §8 远程指令策略（高危：kill / isolate / forensic） */

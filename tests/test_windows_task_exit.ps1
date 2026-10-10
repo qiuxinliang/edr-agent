@@ -24,6 +24,11 @@ try {
       $cfg = Join-Path $dir 'fixture.config'
       [IO.File]::WriteAllText($cfg, "$delay $code")
       $launcher = Write-TaskLauncher -Exe $exe -Config $cfg -Dir $dir
+      $logs = Join-Path $dir "logs"
+      [IO.Directory]::CreateDirectory($logs) | Out-Null
+      foreach ($stream in @("stdout", "stderr")) {
+        [IO.File]::WriteAllText((Join-Path $logs "startup-agent.$stream.log"), "previous-$stream")
+      }
       $p = Start-Process -FilePath "$PSHOME\powershell.exe" -ArgumentList @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $launcher)
       ) -WindowStyle Hidden -PassThru
@@ -37,6 +42,10 @@ try {
         $expected = if ($code -eq '0') { 0 } else { -1073741819 }
         $taskExit = if ($delay -lt 4000) { 4 } else { $expected }
         $log = [IO.File]::ReadAllText((Join-Path $dir 'logs/startup-task.log'))
+        foreach ($stream in @("stdout", "stderr")) {
+          $previous = [IO.File]::ReadAllText((Join-Path $logs "startup-agent.$stream.log.previous"))
+          if ($previous -ne "previous-$stream") { throw "Previous startup diagnostic was discarded" }
+        }
         $event = if ($delay -lt 4000) { 'process_exited_early' } else { 'process_exit' }
         if ($null -eq $p.ExitCode -or $p.ExitCode -ne $taskExit -or
             $log -notmatch "$event exit_code=$expected(?:\s|$)") {

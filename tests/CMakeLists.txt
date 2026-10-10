@@ -2074,3 +2074,18 @@ add_executable(test_attack_surface_groups test_attack_surface_groups.c ${CMAKE_S
 target_include_directories(test_attack_surface_groups PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_attack_surface_groups)
 add_test(NAME attack_surface_sampled_groups COMMAND test_attack_surface_groups)
+
+add_executable(test_log_rotation test_log_rotation.c)
+target_include_directories(test_log_rotation PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_log_rotation)
+add_test(NAME log_rotation_retention_and_restart COMMAND ${Python3_EXECUTABLE} -B
+  ${CMAKE_SOURCE_DIR}/tests/test_log_rotation.py --client $<TARGET_FILE:test_log_rotation>)
+set_tests_properties(log_rotation_retention_and_restart PROPERTIES TIMEOUT 30)
+
+if(WIN32)
+  add_executable(test_log_headless_windows test_log_headless_windows.c)
+  edr_apply_test_warnings(test_log_headless_windows)
+  add_test(NAME windows_headless_log_stream_initialization COMMAND test_log_headless_windows
+    $<TARGET_FILE:test_log_rotation>)
+  set_tests_properties(windows_headless_log_stream_initialization PROPERTIES TIMEOUT 30)
+endif()

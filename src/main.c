@@ -9,6 +9,8 @@
 #endif
 
 #include "edr/agent.h"
+#include "edr/edr_log.h"
+#include "edr/time_util.h"
 #include "edr/ave_sdk.h"
 #include "edr/collector.h"
 #include "edr/config.h"
@@ -452,6 +454,18 @@ static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hin
 #endif
 
 static int edr_agent_run_main(const char *config) {
+  /* Bind logs before subsystem initialization so startup failures survive the
+   * next service/task restart. --help and --test-config keep their CLI output. */
+  if (config && config[0]) {
+    EdrConfig logging_config;
+    memset(&logging_config, 0, sizeof(logging_config));
+    if (edr_config_load(config, &logging_config) == EDR_OK) {
+      if (edr_log_configure(&logging_config) != 0)
+        fprintf(stderr, "[logging] cannot open configured log directory; retaining inherited diagnostic streams\n");
+      edr_log_poll(edr_monotonic_ns());
+    }
+    edr_config_free_heap(&logging_config);
+  }
   EdrAgent *agent = edr_agent_create();
   if (!agent) {
     return 1;

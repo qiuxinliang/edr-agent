@@ -364,8 +364,12 @@ namespace FDSecurity {
   if (-not (Test-Path -LiteralPath `$exe)) { Write-FDTaskLog "missing_exe"; exit 2 }
   if (-not (Test-Path -LiteralPath `$cfg)) { Write-FDTaskLog "missing_config"; exit 3 }
   try { Unblock-File -LiteralPath `$exe -ErrorAction SilentlyContinue } catch {}
-  try { Remove-Item -LiteralPath `$stdoutPath -Force -ErrorAction SilentlyContinue } catch {}
-  try { Remove-Item -LiteralPath `$stderrPath -Force -ErrorAction SilentlyContinue } catch {}
+  foreach (`$startupLog in @(`$stdoutPath, `$stderrPath)) {
+    if (Test-Path -LiteralPath `$startupLog) {
+      try { Move-Item -LiteralPath `$startupLog -Destination (`$startupLog + ".previous") -Force -ErrorAction Stop }
+      catch { Write-FDTaskLog "startup_log_preserve_failed"; exit 5 }
+    }
+  }
   foreach (`$envName in @(
       "EDR_FORENSIC_COLLECTOR",
       "EDR_FORENSIC_COLLECTOR_BIN",

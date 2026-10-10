@@ -5,10 +5,18 @@
 #define EDR_EDR_LOG_H
 
 #include <stdio.h>
+#include <stdint.h>
+#include "edr/config.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** Configure in-process append-only stdout/stderr logging and bounded backups.
+ * A failed setup leaves the existing diagnostic streams available. */
+int edr_log_configure(const EdrConfig *cfg);
+/** Check the owned log once per second; rotate under CRT stream locks. */
+void edr_log_poll(uint64_t now_ns);
 
 /** 非 0：打印详细诊断（规则引擎、HTTP 传输横幅、上报面成功、WinDivert 包级日志等）。 */
 int edr_log_verbose(void);

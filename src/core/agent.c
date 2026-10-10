@@ -15,6 +15,7 @@
 #include "edr/preprocess.h"
 #include "edr/resource.h"
 #include "edr/heartbeat.h"
+#include "edr/edr_log.h"
 #include "edr/periodic_schedule.h"
 #include "edr/self_protect.h"
 #include "edr/watchdog.h"
@@ -2021,6 +2022,8 @@ EdrError edr_agent_run(EdrAgent *agent) {
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_SELF_PROTECT, edr_self_protect_poll());
         EDR_AGENT_TIMED_POLL(EDR_AGENT_POLL_CONFIG_RELOAD,
                              edr_agent_poll_config_reload(agent, &last_reload_ns));
+        (void)edr_log_configure(&agent->cfg);
+        edr_log_poll(edr_monotonic_ns());
         /* At most one potentially blocking maintenance download per loop. */
         switch (maintenance_slot++ & 3u) {
         case 0u:
