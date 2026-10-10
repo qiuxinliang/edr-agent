@@ -73,6 +73,14 @@ int main(int argc, char **argv) {
     snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s/agent.log/invalid", argv[1]);
     ok &= edr_log_configure(cfg) != 0;
     fprintf(stderr, "after-failed-config\n");
+  } else if (!strcmp(argv[2], "buffering-failure-config")) {
+    fprintf(stderr, "before-buffering-failure\n");
+    snprintf(cfg->logging.log_dir, sizeof(cfg->logging.log_dir), "%s/replacement", argv[1]);
+    s_log_test_fail_buffering_count = 1u;
+    ok &= edr_log_configure(cfg) != 0;
+    edr_log_poll(1000000000ULL);
+    fprintf(stderr, "after-buffering-failure\n");
+    fprintf(stdout, "stdout-after-buffering-failure\n");
   } else if (!strcmp(argv[2], "replacement-failure-retention")) {
     char bytes[4096]; memset(bytes, 'r', sizeof(bytes));
     for (unsigned i=0; i<257u; ++i) ok &= fwrite(bytes, 1u, sizeof(bytes), stderr) == sizeof(bytes);

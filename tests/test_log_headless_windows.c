@@ -3,6 +3,24 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+static void dump_fixture_tail(const char *directory, const char *name) {
+  char path[MAX_PATH + 20];
+  snprintf(path, sizeof(path), "%s/%s", directory, name);
+  DWORD attrs = GetFileAttributesA(path);
+  if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return;
+  FILE *file = fopen(path, "rb");
+  if (!file) return;
+  char tail[2049];
+  if (fseek(file, 0, SEEK_END) == 0) {
+    long size = ftell(file);
+    if (size >= 0 && fseek(file, size > 2048 ? size - 2048 : 0, SEEK_SET) == 0) {
+      size_t n = fread(tail, 1u, sizeof(tail) - 1u, file);
+      tail[n] = 0;
+      fprintf(stderr, "synthetic headless logging fixture: %s tail (max 2048 bytes):\n%s\n", name, tail);
+    }
+  }
+  fclose(file);
+}
 int main(int argc, char **argv) {
   assert(argc == 2);
   char temp[MAX_PATH], directory[MAX_PATH], command[2 * MAX_PATH + 80];
@@ -23,7 +41,11 @@ int main(int argc, char **argv) {
   DWORD code = 2u;
   assert(GetExitCodeProcess(pi.hProcess, &code));
   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-  if (wait != WAIT_OBJECT_0 || code != 0u) fprintf(stderr, "headless child failed: wait=%lu exit=%lu fixture=%s\n", (unsigned long)wait, (unsigned long)code, directory);
+  if (wait != WAIT_OBJECT_0 || code != 0u) {
+    fprintf(stderr, "headless child failed: wait=%lu exit=%lu fixture=%s\n", (unsigned long)wait, (unsigned long)code, directory);
+    dump_fixture_tail(directory, "agent.log");
+    dump_fixture_tail(directory, "headless.trace");
+  }
   assert(wait == WAIT_OBJECT_0 && code == 0u);
   char path[MAX_PATH + 20], data[128];
   snprintf(path, sizeof(path), "%s/agent.log", directory);
