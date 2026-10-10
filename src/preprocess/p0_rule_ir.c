@@ -48,11 +48,6 @@ void edr_p0_rule_ir_sensor_admission_lock(void) { (void)pthread_rwlock_rdlock(&s
 void edr_p0_rule_ir_sensor_admission_unlock(void) { (void)pthread_rwlock_unlock(&s_ir_sensor_pair_lock); }
 #endif
 
-#if defined(EDR_P0_IR_HAS_EMBED) && EDR_P0_IR_HAS_EMBED
-extern const unsigned char edr_p0_rule_ir_embed_bytes[];
-extern const size_t edr_p0_rule_ir_embed_len;
-#endif
-
 #if defined(_WIN32)
 #include <windows.h>
 #include <wchar.h>
@@ -675,7 +670,7 @@ static int try_linux_proc_exe(char *out, size_t cap) {
   if ((size_t)snprintf(out, cap, "%s/edr_config/p0_rule_bundle_ir_v1.json.enc", buf) >= cap) {
     return 0;
   }
-  return access(out, R_OK) == 0 ? 1 : 0;
+  return 1;
 #else
   (void)out;
   (void)cap;
@@ -847,24 +842,6 @@ static int p0_ir_candidate_load_default_paths_locked(p0_ir_candidate *candidate)
   if (!loaded) p0_ir_candidate_destroy(candidate);
   return loaded;
 }
-
-#if defined(EDR_P0_IR_HAS_EMBED) && EDR_P0_IR_HAS_EMBED
-static int p0_ir_candidate_load_json_locked(p0_ir_candidate *candidate,
-                                             const char *source_label,
-                                             const char *data,
-                                             size_t data_len) {
-  p0_ir_candidate *previous;
-  int loaded;
-  if (!candidate) return 0;
-  p0_ir_candidate_destroy(candidate);
-  previous = s_load_target;
-  s_load_target = candidate;
-  loaded = p0_ir_load_from_json_text(source_label, data, data_len);
-  s_load_target = previous;
-  if (!loaded) p0_ir_candidate_destroy(candidate);
-  return loaded;
-}
-#endif
 
 int edr_p0_rule_ir_validate_candidate_path(const char *path) {
   p0_ir_candidate *candidate = (p0_ir_candidate *)calloc(1, sizeof(*candidate));
@@ -2617,56 +2594,12 @@ void edr_p0_rule_ir_lazy_init(void) {
     return;
   }
   loaded = p0_ir_candidate_load_default_paths_locked(next);
-  if (!loaded && !s_publication_recovery_failed) {
-    fprintf(
-        stderr,
-        "[p0_rule_ir] no loadable file path (set EDR_P0_IR_PATH or place edr_config next to exe); trying "
-        "fallback\n"
-    );
-  }
-#if defined(EDR_P0_IR_HAS_EMBED) && EDR_P0_IR_HAS_EMBED
-  if (!loaded && !s_publication_recovery_failed) {
-    const char *embed_data = (const char *)edr_p0_rule_ir_embed_bytes;
-    size_t embed_len = edr_p0_rule_ir_embed_len;
-    char *decrypted = NULL;
-    if (embed_len > EDR_P0_ENCRYPT_ENVELOPE_MAX_BYTES) {
-      fprintf(stderr, "[p0_rule_ir] embedded envelope exceeds contract\n");
-      embed_len = 0u;
-    } else if (edr_p0_encrypt_is_edr1((const uint8_t *)embed_data, embed_len)) {
-      uint8_t *plain = NULL;
-      size_t plain_len = 0;
-      int dr = edr_p0_encrypt_decrypt_edr1((const uint8_t *)embed_data, embed_len, &plain, &plain_len);
-      if (dr == 0 && plain_len <= EDR_P0_ENCRYPT_PLAINTEXT_MAX_BYTES) {
-        decrypted = (char *)plain;
-        embed_data = decrypted;
-        embed_len = plain_len;
-      } else if (plain) {
-        free(plain);
-        embed_len = 0u;
-      }
-    } else if (embed_len > EDR_P0_ENCRYPT_PLAINTEXT_MAX_BYTES) {
-      fprintf(stderr, "[p0_rule_ir] embedded plaintext exceeds contract\n");
-      embed_len = 0u;
-    }
-    loaded = p0_ir_candidate_load_json_locked(
-        next, "embedded: p0_rule_bundle_ir_v1.json", embed_data, embed_len
-    );
-    if (loaded) {
-      next->source_envelope=malloc(edr_p0_rule_ir_embed_len);
-      if(next->source_envelope){memcpy(next->source_envelope,edr_p0_rule_ir_embed_bytes,edr_p0_rule_ir_embed_len);next->source_envelope_size=edr_p0_rule_ir_embed_len;}else loaded=0;
-      (void)edr_p0_bundle_dst_path(next->source_label,sizeof(next->source_label));
-    }
-    if (decrypted) {
-      free(decrypted);
-    }
-  }
-#endif
   if (loaded && !p0_ir_archive_candidate_locked(next,next->source_label)) loaded=0;
   if (!loaded) {
     fprintf(
         stderr,
-        "[p0_rule_ir] not loaded: no readable IR file and no embed (install edr_config JSON or build "
-        "with EDR_P0_IR_EMBED)\n"
+        "[p0_rule_ir] not ready: no verified cached P0 rule bundle; waiting for authenticated "
+        "platform download (EDR_P0_IR_PATH selects an explicit cache/test path)\n"
     );
     p0_ir_candidate_destroy(next);
     free(next);
@@ -2742,23 +2675,55 @@ void edr_p0_rule_ir_reload(void) {
   }
 }
 
+int edr_p0_rule_ir_prepare_download_path(const char *destination_path) {
+  char parent[2048];
+  const char *separator = NULL;
+  size_t length;
+  if (!destination_path || !destination_path[0]) return 0;
+  for (const char *p = destination_path; *p; ++p) {
+    if (*p == '/' || *p == '\\') separator = p;
+  }
+  if (separator && !separator[1]) return 0;
+  length = separator ? (size_t)(separator - destination_path) : 1u;
+  if (separator && length == 0u) length = 1u;
+#ifdef _WIN32
+  if (separator && length == 2u && destination_path[1] == ':') length = 3u;
+#endif
+  if (length >= sizeof(parent)) return 0;
+  if (separator) memcpy(parent, destination_path, length);
+  else parent[0] = '.';
+  parent[length] = '\0';
+#ifdef _WIN32
+  DWORD attributes = GetFileAttributesA(parent);
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    if (!CreateDirectoryA(parent, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+    attributes = GetFileAttributesA(parent);
+  }
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+      (attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+  struct stat info;
+  if (mkdir(parent, 0700) != 0 && errno != EEXIST) return 0;
+  return lstat(parent, &info) == 0 && S_ISDIR(info.st_mode) &&
+      info.st_uid == geteuid() && (info.st_mode & 022) == 0;
+#endif
+}
+
 int edr_p0_bundle_dst_path(char *out, size_t cap) {
+  if (!out || cap == 0u) return -1;
   const char *e = getenv("EDR_P0_IR_PATH");
   if (e && *e) {
-    snprintf(out, cap, "%s", e);
-    return 0;
+    return (size_t)snprintf(out, cap, "%s", e) < cap ? 0 : -1;
   }
 #ifdef _WIN32
   char ex[1024];
   if (edr_win_exe_dir(ex, sizeof(ex))) {
-    snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json.enc", ex);
-    return 0;
+    return (size_t)snprintf(out, cap, "%s\\edr_config\\p0_rule_bundle_ir_v1.json.enc", ex) < cap ? 0 : -1;
   }
 #else
   char tmp[2048];
   if (try_linux_proc_exe(tmp, sizeof(tmp))) {
-    snprintf(out, cap, "%s", tmp);
-    return 0;
+    return (size_t)snprintf(out, cap, "%s", tmp) < cap ? 0 : -1;
   }
 #endif
   return -1;

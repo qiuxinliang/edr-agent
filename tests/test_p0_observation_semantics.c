@@ -155,6 +155,12 @@ static void check_credential_pair(const char *label,const char *name,const char 
 int main(void) {
   deferred_fake_reset();edr_p0_rule_test_reset_dedup();edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  observation_rule="R-SOFTETHER-001";
+  check_case("SoftEther connect is local observation",EDR_EVENT_PROCESS_CREATE,"vpncmd.exe","vpncmd.exe /CLIENT localhost /CMD AccountConnect managed",0,NULL,0,1);
+  check_case("SoftEther startup is local observation",EDR_EVENT_PROCESS_CREATE,"vpncmd.exe","vpncmd.exe /CLIENT localhost /CMD AccountStartupSet managed",0,NULL,0,1);
+  observation_rule="R-EXFIL-006";
+  check_case("ordinary archive is local observation",EDR_EVENT_FILE_WRITE,"7z.exe","7z.exe a backup.zip Documents",0,"C:\\Users\\fixture\\Documents\\backup.zip",0,1);
+  observation_rule=NULL;
   parent_relation_case=1;
   check_case("parent relation R-EXEC-001",EDR_EVENT_PROCESS_CREATE,"powershell.exe","powershell.exe -enc SQBFAFgA",0,NULL,1,0);
   parent_relation_case=2;

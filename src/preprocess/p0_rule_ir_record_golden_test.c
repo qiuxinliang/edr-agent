@@ -476,6 +476,30 @@ int main(void) {
     return 1;
   }
 
+  /* IC3 2026-10-08 system-name masquerading: use the actor's exact image
+   * path, and retain system images even when a Temp path is a command argument. */
+  static const struct {
+    const char *name;
+    const char *image;
+    const char *command;
+    int want;
+  } masquerade_cases[] = {
+      {"dllhost.exe", "C:\\Users\\fixture\\AppData\\Local\\Temp\\dllhost.exe", "dllhost.exe", 1},
+      {"DiagTrack.exe", "C:\\Windows\\Temp\\DiagTrack.exe", "DiagTrack.exe", 1},
+      {"conhost.exe", "C:\\ProgramData\\Windows\\conhost.exe", "conhost.exe", 1},
+      {"dllhost.exe", "C:\\Windows\\System32\\dllhost.exe", "dllhost.exe", 0},
+      {"DiagTrack.exe", "C:\\Windows\\System32\\DiagTrack.exe", "DiagTrack.exe", 0},
+      {"conhost.exe", "C:\\Windows\\System32\\conhost.exe", "conhost.exe C:\\Windows\\Temp\\task.cmd", 0},
+  };
+  for (size_t i = 0u; i < sizeof(masquerade_cases) / sizeof(masquerade_cases[0]); ++i) {
+    edr_behavior_record_init(&br);
+    br.type = EDR_EVENT_PROCESS_CREATE;
+    snprintf(br.process_name, sizeof(br.process_name), "%s", masquerade_cases[i].name);
+    snprintf(br.exe_path, sizeof(br.exe_path), "%s", masquerade_cases[i].image);
+    snprintf(br.cmdline, sizeof(br.cmdline), "%s", masquerade_cases[i].command);
+    if (!check_br(masquerade_cases[i].image, &br, i_lolbin10, masquerade_cases[i].want)) return 1;
+  }
+
   fprintf(
       stderr,
       "[p0_ir_record] ok (file_read / file_write / network_connect / registry_set / process path golden)\n"

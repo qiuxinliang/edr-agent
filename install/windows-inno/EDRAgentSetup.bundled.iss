@@ -1,6 +1,6 @@
 ; FDSecurity — 完整/本地暂存版安装脚本（Inno 6, x64）
 ; 与 EDRAgentSetup.iss 行为一致（注册/开机任务等），但主程序与 DLL 来自**单独目录**（如 CI/本机
-; 输出目录 monorepo\edr-agent-win_2-2），并打齐：agent_preprocess 规则、脚本、data 说明。
+; 输出目录 monorepo\edr-agent-win_2-2），并打齐：脚本、data 说明。
 ;
 ; 默认 EDR_BIN_DIR=..\..\..\edr-agent-win_2-2（相对本 .iss 所在位置，即 monorepo 根下常见暂存名）
 ;
@@ -24,9 +24,6 @@
 #endif
 #ifndef EDR_AGENT_TOML_EXAMPLE
   #define EDR_AGENT_TOML_EXAMPLE "..\..\agent.toml.example"
-#endif
-#ifndef EDR_AGENT_PREPROCESS_TOML
-  #define EDR_AGENT_PREPROCESS_TOML "..\..\..\edr-backend\platform\config\agent_preprocess_rules_v1.toml"
 #endif
 #ifndef EDR_VERSION_FILE
   #define EDR_VERSION_FILE EDR_BIN_DIR + "\VERSION"
@@ -102,11 +99,8 @@ Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDive
 Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\ARCH"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#EDR_BIN_DIR}\package-capabilities.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_AGENT_PREPROCESS_TOML}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
-Source: "..\..\config\p0_rule_bundle_ir_v1.json.enc"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\..\config\sensor_interest_manifest.json"; DestDir: "{app}\edr_config"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\rules\forensic\*"; DestDir: "{app}\rules\forensic"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\src\shellcode_detector\rules\*"; DestDir: "{app}\rules\shellcode"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "..\..\src\webshell_detector\rules\*"; DestDir: "{app}\rules\webshell"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist

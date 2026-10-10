@@ -236,7 +236,7 @@ def configure_handler(config_dir):
     rules_toml = os.path.join(config_dir, "agent_preprocess_rules_v1.toml")
     p0_bundle = os.path.join(config_dir, "p0_rule_bundle_ir_v1.json.enc")
     sensor_interest = os.path.join(config_dir, "sensor_interest_manifest.json")
-    version = "edr-dynamic-rules-v1-r218-9ae52519"
+    version = "uninitialized"
     if os.path.isfile(rules_toml):
         try:
             with open(rules_toml, "r", encoding="utf-8") as f:
@@ -269,7 +269,8 @@ def main():
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         repo_root = os.path.dirname(script_dir)
-        config_dir = os.path.join(repo_root, "config")
+        config_dir = os.environ.get("EDR_BACKEND_CONFIG_DIR",
+                                     os.path.join(os.path.dirname(repo_root), "edr-backend", "platform", "config"))
 
     rules_toml = os.path.join(config_dir, "agent_preprocess_rules_v1.toml")
 

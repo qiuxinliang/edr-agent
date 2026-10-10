@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 <#
-  Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + preprocess TOML + scripts).
+  Builds FDSecuritySetup-bundled.exe (full layout: staged exe/DLLs + scripts).
   Run on Windows from the monorepo root OR from this directory.
 
   Default staging folder (relative to this .iss file): ..\..\..\edr-agent-win_2-2
@@ -353,11 +353,6 @@ if (Test-Path -LiteralPath $stagedVelociraptor -PathType Leaf) {
         throw "Velociraptor has an invalid Authenticode state: $($velociraptorSignature.Status) $($velociraptorSignature.StatusMessage)"
     }
     Write-Host "Verified upstream Velociraptor signature state: authenticode=$($velociraptorSignature.Status)"
-}
-
-$pre = Join-Path $repoRoot "edr-backend\platform\config\agent_preprocess_rules_v1.toml"
-if (-not (Test-Path -LiteralPath $pre)) {
-    Write-Warning "Preprocess TOML missing: $pre — run edr-backend/platform/config/generate_agent_preprocess_rules.py first."
 }
 
 if (-not (Test-Path -LiteralPath $Inno)) {

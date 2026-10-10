@@ -132,14 +132,6 @@ fi
 printf '%s\n' "{\"schema\":\"edr.windows.package-capabilities.v1\",\"target_arch\":\"${ARCH}\",\"arm64_emulation_supported\":false,\"arm64_emulation_network_packet_capture\":false,\"network_packet_capture\":${NETWORK_PACKET_CAPTURE},\"windows_firewall_isolation\":true,\"signature_status\":\"${SIGNATURE_STATUS}\",\"components\":{\"velociraptor\":{\"delivery\":\"${VELOCIRAPTOR_DELIVERY}\",\"binary_arch\":\"amd64\",\"execution_mode\":\"${VELOCIRAPTOR_EXECUTION_MODE}\",\"optional\":true,\"network_packet_capture\":false}}}" > "$OUT_DIR/package-capabilities.json"
 printf '%s\n' "$ARCH" > "$OUT_DIR/ARCH"
 
-PREP_TOML="$REPO_ROOT/edr-backend/platform/config/agent_preprocess_rules_v1.toml"
-if [[ -f "$PREP_TOML" ]]; then
-  cp -a "$PREP_TOML" "$OUT_DIR/agent_preprocess_rules_v1.toml"
-else
-  echo "Error: missing preprocess rules: $PREP_TOML" >&2
-  exit 1
-fi
-
 # detection rule sets (forensic / shellcode / webshell YARA + builtin fallback)
 if [[ -d "$EDR_AGENT_DIR/rules/forensic" ]]; then
   mkdir -p "$OUT_DIR/rules/forensic"
@@ -182,24 +174,6 @@ done
 if [[ -f "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" ]]; then
   mkdir -p "$OUT_DIR/config"
   cp -a "$EDR_AGENT_DIR/config/agent_windows_production.example.toml" "$OUT_DIR/config/"
-fi
-mkdir -p "$OUT_DIR/edr_config"
-for n in "p0_rule_bundle_ir_v1.json.enc" "sensor_interest_manifest.json"; do
-  if [[ -f "$EDR_AGENT_DIR/config/$n" ]]; then
-    cp -a "$EDR_AGENT_DIR/config/$n" "$OUT_DIR/edr_config/"
-  fi
-done
-if [[ -f "$OUT_DIR/edr_config/p0_rule_bundle_ir_v1.json" ]]; then
-  echo "Error: plaintext p0_rule_bundle_ir_v1.json must not be packaged" >&2
-  exit 1
-fi
-if [[ -f "$OUT_DIR/edr_config/p0_rule_bundle_manifest.json" ]]; then
-  echo "Error: plaintext p0_rule_bundle_manifest.json must not be packaged" >&2
-  exit 1
-fi
-if [[ ! -f "$OUT_DIR/edr_config/p0_rule_bundle_ir_v1.json.enc" ]]; then
-  echo "Error: missing encrypted p0_rule_bundle_ir_v1.json.enc" >&2
-  exit 1
 fi
 for n in "edr_install_wizard_enroll.ps1" "edr_windows_autorun.ps1"; do
   if [[ -f "$SCRIPT_DIR/$n" ]]; then
@@ -322,8 +296,8 @@ fi
 
 mkdir -p "$SCRIPT_DIR/Output"
 ( cd "$SCRIPT_DIR/Output" && rm -f "${OUT_NAME}.zip" && zip -r -q "${OUT_NAME}.zip" "$OUT_NAME" )
-if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bundle_manifest\.json)$' >/dev/null; then
-  echo "Error: plaintext P0 rules were found in $ZIP_PATH" >&2
+if unzip -Z1 "$ZIP_PATH" | grep -E '(^|/)(p0_rule_[^/]*|sensor_interest_manifest\.json|agent_preprocess_rules_v1[^/]*)$' >/dev/null; then
+  echo "Error: platform-owned rule data was found in $ZIP_PATH" >&2
   exit 1
 fi
 if ! unzip -Z1 "$ZIP_PATH" | grep -Ei '(^|/)(lib)?yara.*\.dll$' >/dev/null; then

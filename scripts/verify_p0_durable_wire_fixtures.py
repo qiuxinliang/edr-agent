@@ -29,7 +29,8 @@ from typing import Any
 
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = AGENT_ROOT.parent
-DEFAULT_P0_IR = AGENT_ROOT / "config" / "p0_rule_bundle_ir_v1.json"
+DEFAULT_P0_IR = Path(os.environ.get("EDR_BACKEND_CONFIG_DIR",
+    str(REPO_ROOT / "edr-backend" / "platform" / "config"))) / "p0_rule_bundle_ir_v1.json"
 DEFAULT_SOURCE_FIXTURE = (
     REPO_ROOT / "edr-backend" / "platform" / "internal" / "handler" /
     "testdata" / "p0_source_only_projected_wire_golden.json"

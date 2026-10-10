@@ -167,6 +167,11 @@ int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *de
   (void)staged_path; (void)destination_path; return 0;
 }
 
+int edr_p0_rule_ir_prepare_download_path(const char *destination_path) {
+  (void)destination_path;
+  return 0;
+}
+
 int edr_p0_bundle_dst_path(char *out, size_t cap) {
   (void)cap;
   if (out) out[0] = '\0';

@@ -1264,7 +1264,7 @@ static void print_terminal_durable_fixture(void) {
   printf("  \"agent_builder\": \"edr_p0_rule_try_emit+p0_build_terminal_intent_record+p0_build_terminal_result_record\",\n");
   printf("  \"agent_encoder\": \"edr_behavior_record_alloc_outbound_wire_facts+edr_behavior_record_encode_durable_wire\",\n");
   printf("  \"bat1_version\": 1,\n  \"bat1_length_byte_order\": \"little_endian\",\n");
-  printf("  \"reproduce_with\": \"EDR_P0_IR_PATH=edr-agent/config/p0_rule_bundle_ir_v1.json edr-agent/tests/test_p0_source_only_durable_contract --emit-terminal-authority-durable-fixture\",\n");
+  printf("  \"reproduce_with\": \"EDR_P0_IR_PATH=edr-backend/platform/config/p0_rule_bundle_ir_v1.json edr-agent/tests/test_p0_source_only_durable_contract --emit-terminal-authority-durable-fixture\",\n");
   printf("  \"not_evaluable_reasons\": [");
   for (i = 0u; i < edr_p0_source_only_reason_count(); ++i) {
     const EdrP0SourceOnlyReason *reason = &edr_p0_source_only_reason_table[i];

@@ -3,6 +3,7 @@
 # satisfy or change the release CMake PCRE2 producer-provenance gate.
 set -euo pipefail
 source_root="$(cd "$(dirname "$0")/.." && pwd)"
+rule_config="${EDR_BACKEND_CONFIG_DIR:?Set EDR_BACKEND_CONFIG_DIR to external canonical backend config; test input only}"
 pcre2_prefix="${EDR_TEST_PCRE2_PREFIX:-/opt/homebrew/opt/pcre2}"
 crypto_prefix="${EDR_TEST_OPENSSL_PREFIX:-/opt/homebrew/opt/openssl@3}"
 compiler="${CC:-clang}"
@@ -68,10 +69,10 @@ C
  -I"$source_root/include" -I"$crypto_prefix/include" \
  "$test_root/envelope.c" "$source_root/src/preprocess/encrypt_p0_rules.c" \
  -L"$crypto_prefix/lib" -lcrypto -o "$test_root/envelope"
-"$test_root/envelope" "$source_root/config/p0_rule_bundle_ir_v1.json" \
+"$test_root/envelope" "$rule_config/p0_rule_bundle_ir_v1.json" \
  "$test_root/fixture.enc" "$test_root/tampered.enc"
 cd "$test_root"
-EDR_P0_IR_PATH="$source_root/config/p0_rule_bundle_ir_v1.json" ./source_contract >plain.log 2>&1
+EDR_P0_IR_PATH="$rule_config/p0_rule_bundle_ir_v1.json" ./source_contract >plain.log 2>&1
 EDR_P0_IR_PATH="$test_root/fixture.enc" ./source_contract >encrypted.log 2>&1
 if EDR_P0_IR_PATH="$test_root/tampered.enc" ./source_contract >tampered.log 2>&1; then
   echo 'FAIL: tampered authenticated envelope admitted.' >&2

@@ -6,7 +6,7 @@ FDSecurity — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh
 在已正确配置 agent.toml 并完成与平台注册的前提下，本目录应足以支撑：
 
   • 进程 / ETW 等采集与事件总线、预处理、去重与 L2/L3/进程名门控（环境变量可调）
-  • 动态前置规则：同目录 agent_preprocess_rules_v1.toml（未在 agent.toml 内写满 [[preprocessing.rules]] 时自动加载）
+  • 动态前置规则、P0 规则与 SensorInterest：完成注册后经认证的平台通道下发；离线使用最近一次有效缓存，首次下发前 P0 未就绪
   • AVE：签名 IOC、哈希/证书白名单、规则引擎与本地行为启发式检测
   • 证书 Stage0：WinVerifyTrust + 内置信任链/厂商规则；可选 SQLite 见 data\README_OPTIONAL_DBS.txt
   • 上云：HTTPS/HTTP 入站；legacy gRPC 不属于标准产品路径
@@ -28,6 +28,6 @@ FDSecurity — 本 zip / Inno 完整负载说明（与 package_bundled_layout.sh
 
 四、与「仅 GitHub Release exe+DLL zip」的区别
 ------------------------------------------
-本包额外包含：agent_preprocess_rules_v1.toml、示例配置与安装脚本，用于性能与检测路径可对标的完整端形态。
+本包额外包含：示例配置与安装脚本，用于性能与检测路径可对标的完整端形态。
 
 (BUNDLE_README — keep in sync with package_bundled_layout.sh and EDRAgentSetup.bundled.iss)

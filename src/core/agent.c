@@ -4809,6 +4809,10 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
     fprintf(stderr, "[p0_rule_ir] remote bundle rejected: cannot resolve destination path\n");
     return;
   }
+  if (!edr_p0_rule_ir_prepare_download_path(dst)) {
+    fprintf(stderr, "[p0_rule_ir] remote bundle rejected: cache parent unavailable or unsafe: %s\n", dst);
+    return;
+  }
 #ifdef _WIN32
   if ((size_t)snprintf(tmp, sizeof(tmp), "%s.staged.%lu.%llu", dst,
                        (unsigned long)GetCurrentProcessId(),

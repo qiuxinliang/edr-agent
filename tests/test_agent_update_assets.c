@@ -121,11 +121,10 @@ int main(void) {
   contains(script, "ValidateSet(\"upgrade\", \"rollback\", \"repair\")", "updater exposes an explicit repair operation");
   contains(script, "$Operation -eq 'repair' -and $UpgradeClass -ne 'installer_required'", "repair requires the full installer path");
   contains(script, "$Operation -eq 'repair' -and $versionDirection -ne 0", "repair is restricted to the installed version");
-  contains(script, "function Assert-RequiredDetectionArtifacts", "updater validates the installed P0 configuration baseline");
-  contains(script, "edr_config\\p0_rule_bundle_ir_v1.json.enc", "updater requires the encrypted P0 rule artifact");
-  contains(script, "edr_config\\sensor_interest_manifest.json", "updater requires the sensor-interest artifact");
-  contains(script, "$Operation -eq 'upgrade' -and $UpgradeClass -ne 'installer_required'", "non-installer upgrades reject an incomplete configuration baseline without blocking rollback");
-  contains(script, "full installer completed without a usable P0 configuration", "full installer repair verifies P0 artifacts before success");
+  require_true(!strstr(script, "Assert-RequiredDetectionArtifacts"),
+               "updater accepts a cold cache awaiting authenticated runtime rules");
+  contains(script, "'upload_outbox','edr_config'",
+           "runtime mirror preserves the mutable downloaded detection cache");
   contains(script, "InternalName", "PE InternalName check exists");
   contains(script, "ProductVersion", "PE ProductVersion check exists");
   contains(script, "Get-PSDrive", "disk-space preflight exists");
@@ -477,12 +476,11 @@ int main(void) {
            "release package gate rejects the historical collector omission for every upgrade class");
   require_true(!strstr(workflow, "files = @($nativeIntegrityFiles)"),
                "release must not trigger PowerShell generic-list expansion inside an ordered manifest");
-  contains(workflow, "$runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot \"edr_config\"",
-           "release stages detection assets under the canonical edr_config package directory");
-  contains(workflow, "$_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc'",
-           "release package gate requires the encrypted P0 bundle at its canonical path");
-  contains(workflow, "$_ -eq 'edr_config/sensor_interest_manifest.json'",
-           "release package gate requires the sensor-interest manifest at its canonical path");
+  contains(workflow, "platform-owned rule data must not be packaged",
+           "package gate rejects plaintext, encrypted P0 and rule-derived manifests");
+  require_true(!strstr(workflow, "$runtimeDetectionDir") &&
+                   !strstr(workflow, "prepare_p0_release_bundle.py"),
+               "production build does not stage or regenerate server-owned rule data");
   contains(workflow, "arch: arm64", "release builds an ARM64 matrix target");
   contains(workflow, "triplet: arm64-windows", "release uses native ARM64 vcpkg dependencies");
   contains(workflow, "runtime_identifier: win-arm64", "release builds the ARM64 Setup UI");
@@ -891,12 +889,11 @@ int main(void) {
            "client build workflow packages native component SHA-256 identities");
   contains(client_build, "'native-package-integrity\\.json'",
            "client build workflow rejects packages missing native component integrity metadata");
-  contains(client_build, "$runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot \"edr_config\"",
-           "client build stages detection assets under the canonical edr_config package directory");
-  contains(client_build, "$_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc'",
-           "client build package gate requires the encrypted P0 bundle at its canonical path");
-  contains(client_build, "$_ -eq 'edr_config/sensor_interest_manifest.json'",
-           "client build package gate requires the sensor-interest manifest at its canonical path");
+  contains(client_build, "platform-owned rule data must not be packaged",
+           "package gate rejects plaintext, encrypted P0 and rule-derived manifests");
+  require_true(!strstr(client_build, "$runtimeDetectionDir") &&
+                   !strstr(client_build, "prepare_p0_release_bundle.py"),
+               "production build does not stage or regenerate server-owned rule data");
   require_true(!strstr(client_build, "uninstall\\.ps1"),
                "client build package gate must not require the removed PowerShell uninstaller");
   contains(client_build, "invoke_windows_native_capability_probe.ps1",
@@ -1086,22 +1083,10 @@ int main(void) {
                   "lifecycle captures the running Agent PID before verifying native uninstall cleanup");
   contains(lifecycle_smoke, "native-package-integrity.json",
            "lifecycle binds native uninstall components to the packaged SHA-256 manifest");
-  contains(lifecycle_smoke, "installedDetectionConfigDir = Join-Path $installDir \"edr_config\"",
-           "lifecycle maps package detection assets into the installed edr_config directory");
-  contains(lifecycle_smoke, "$baselinePackageRoot = [IO.Path]::GetFullPath($BaselinePackageDir)",
-           "lifecycle resolves the complete baseline package root independently of the binary location");
-  contains(lifecycle_smoke, "$targetPackageRoot = [IO.Path]::GetFullPath($TargetPackageDir)",
-           "lifecycle resolves the complete target package root independently of the binary location");
-  contains(lifecycle_smoke, "candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName",
-           "lifecycle resolves detection assets recursively from package roots");
-  contains(lifecycle_smoke, "$isPackageRoot = [string]::Equals($candidateDirectory, $normalizedPackageRoot",
-           "lifecycle accepts detection assets flattened by historical runtime ZIP producers");
-  contains(lifecycle_smoke, "$isDetectionConfigDirectory = $_.Directory.Name -eq \"edr_config\" -or $_.Directory.Name -eq \"config\"",
-           "lifecycle accepts canonical and legacy nested detection configuration directories");
-  contains(lifecycle_smoke, "$baselinePackageRoot, $targetPackageRoot",
-           "lifecycle can complete the installed fixture from the verified target detection assets when a legacy baseline omits them");
-  contains(lifecycle_smoke, "target and baseline packages are missing required detection artifact",
-           "lifecycle fails clearly when neither package contains the required detection asset");
+  require_true(!strstr(lifecycle_smoke, "candidateDetectionAssets"),
+               "lifecycle never repairs a cold cache from release rule bodies");
+  contains(lifecycle_smoke, "Cold installs may be",
+           "lifecycle records runtime enrollment readiness for cold installs");
   contains(lifecycle_smoke, "$_.name -ne \"p0_matcher_contract.json\"",
            "lifecycle removes the legacy PCRE2 contract entry from old baseline native manifests");
   contains(lifecycle_smoke, "$targetNativeHashes[$component.Name] = $actualHash",
@@ -1214,6 +1199,9 @@ int main(void) {
   snprintf(path, sizeof(path), "%s/src/core/agent.c", root);
   char *agent_core = read_file(path);
   require_true(agent_core != NULL, "read Agent capability manifest implementation");
+  contains_before(agent_core, "edr_p0_rule_ir_prepare_download_path(dst)",
+                  "edr_agent_download_text_file(url, tmp, 4u * 1024u * 1024u",
+                  "cold P0 delivery prepares the cache parent before the bounded stage download");
   contains(agent_core, "endpoint_uninstall_attestation_v1",
            "fixed Agent advertises the two-phase uninstall attestation protocol separately from the signed lifecycle command capability");
   free(agent_core);
