@@ -508,3 +508,9 @@ Preparation freezes that commit and verifies encrypted/plaintext equality plus
 the IR/SensorInterest pair. The input commit and combined SHA256 are retained in
 existing release provenance and checkpoints. Missing or changed inputs fail the
 release; the checkout is never included in installer or update assets.
+Linux preparation uses `actions/checkout` without persisting credentials. Windows
+uses the CI-only `checkout_private_p0_inputs.ps1` owner: it creates protected
+current-user ACLs, pins GitHub's official Ed25519 host key, fetches only the frozen
+commit with bounded retries, and deletes temporary SSH credentials in `finally`.
+Its native Windows security regression runs before the private checkout. Neither
+this helper nor the test inputs are included in runtime packages.

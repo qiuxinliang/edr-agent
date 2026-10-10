@@ -219,18 +219,18 @@ jobs:
             ${{ runner.tool_cache }}/Python/3.12.10/x64
             ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
           key: ${{ steps.python-cache.outputs.cache-primary-key }}
+      - name: Test private P0 checkout security and cleanup
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & .\tests\test_private_p0_checkout.ps1
       - name: Read frozen private P0 test inputs
-        uses: actions/checkout@v6
+        timeout-minutes: 5
         env:
-          GIT_CONFIG_COUNT: "1"
-          GIT_CONFIG_KEY_0: core.autocrlf
-          GIT_CONFIG_VALUE_0: "false"
-        with:
-          repository: qiuxinliang/EDRAI
-          ref: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}
-          ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
-          path: .p0-test-inputs
-          persist-credentials: false
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        shell: pwsh
+        run: |
+          & .\scripts\checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
       - name: Install pinned P0 test verification dependency
         shell: pwsh
         run: |

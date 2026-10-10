@@ -66,19 +66,49 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(prepare.index('Freeze private P0'), prepare.index('Read fixed private P0'))
         self.assertLess(prepare.index('verify-p0-inputs'), prepare.index('windows_release_checkpoint.py prepare'))
         self.assertLess(build.index('verify-p0-inputs'), build.index('Restore verified same-run package checkpoint'))
-        for job in (prepare, build):
-            checkout = job.split('repository: qiuxinliang/EDRAI', 1)[1].split('\n      - ', 1)[0]
-            self.assertIn('ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', checkout)
-            self.assertIn('path: .p0-test-inputs', checkout)
-            self.assertIn('persist-credentials: false', checkout)
-            self.assertIn('GIT_CONFIG_KEY_0: core.autocrlf', job)
-            self.assertNotIn('USB_SIGNING_TOKEN', checkout)
+        checkout = prepare.split('repository: qiuxinliang/EDRAI', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', checkout)
+        self.assertIn('path: .p0-test-inputs', checkout)
+        self.assertIn('persist-credentials: false', checkout)
+        self.assertIn('GIT_CONFIG_KEY_0: core.autocrlf', prepare)
+        self.assertNotIn('USB_SIGNING_TOKEN', checkout)
+        windows_checkout = build.split('- name: Read frozen private P0 test inputs\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('timeout-minutes: 5', windows_checkout)
+        self.assertIn('P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', windows_checkout)
+        self.assertIn(r'& .\scripts\checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF', windows_checkout)
+        self.assertNotIn('uses: actions/checkout', windows_checkout)
+        self.assertNotIn('RUNNER_TEMP:', windows_checkout)
+        self.assertNotIn('USB_SIGNING_TOKEN', windows_checkout)
+        regression = build.split('- name: Test private P0 checkout security and cleanup\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn(r'& .\tests\test_private_p0_checkout.ps1', regression)
+        self.assertNotIn('secrets.', regression)
+        self.assertNotIn('continue-on-error', regression)
+        self.assertLess(build.index('Test private P0 checkout security'), build.index('Read frozen private P0 test inputs'))
         for name in ('windows-build', 'usb-finalize', 'publish-release'):
             job = self.jobs[name]
             self.assertIn('P0_TEST_INPUTS_REF: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}', job)
             self.assertIn('P0_TEST_INPUTS_SHA256: ${{ needs.prepare-release.outputs.p0_test_inputs_sha256 }}', job)
         self.assertIn('"-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR"', build)
         self.assertIn('platform-owned rule data must not be packaged', build)
+
+    def test_private_checkout_owner_retains_bounded_strict_ssh_boundary(self):
+        owner = (ROOT / 'scripts/checkout_private_p0_inputs.ps1').read_text(encoding='utf-8')
+        for contract in ('SetAccessRuleProtection($true, $false)', 'Assert-P0PrivateAcl $temporary $owner',
+                         'Assert-P0PrivateAcl $file $owner', 'IdentityReference.Value -ne $Owner.Value',
+                         r'System32\OpenSSH\ssh.exe', 'ArgumentList.Add($argument)',
+                         "Environment.Remove('P0_TEST_INPUTS_SSH_KEY')", 'IdentitiesOnly=yes',
+                         'BatchMode=yes', 'StrictHostKeyChecking=yes', 'HostKeyAlgorithms=ssh-ed25519',
+                         'GlobalKnownHostsFile=', 'UserKnownHostsFile=', '$attempt -le 3',
+                         '-TimeoutSeconds 10', '-TimeoutSeconds 15', 'WaitForExit($TimeoutSeconds * 1000)',
+                         'Remove-Item -LiteralPath $temporary -Recurse -Force'):
+            self.assertIn(contract, owner)
+        self.assertNotIn('core.sshCommand', owner)
+        self.assertNotIn('StrictHostKeyChecking=no', owner)
+        self.assertNotIn('Write-Host $errorText', owner)
+        package = self.jobs['windows-build'].split('- name: Package (setup exe + runtime zip)\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertNotIn('checkout_private_p0_inputs.ps1', package)
+        self.assertNotIn('.p0-test-inputs', package)
+        self.assertNotIn('test_private_p0_checkout.ps1', package)
 
     def test_checkpoint_cleanup_follows_publication_with_scoped_permissions(self):
         publish = self.jobs['publish-release']
