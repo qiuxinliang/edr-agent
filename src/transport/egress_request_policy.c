@@ -28,7 +28,8 @@ int edr_egress_task_preflight(EdrEgressPurpose purpose, const char *command_id,
                               EdrEgressTaskScope *out) {
   EdrEgressTaskScope scope = {0};
   if (out) memset(out, 0, sizeof(*out));
-  if (purpose != EDR_EGRESS_UPGRADE_EVENT && purpose != EDR_EGRESS_UPGRADE_LOG)
+  if (purpose != EDR_EGRESS_UPGRADE_EVENT && purpose != EDR_EGRESS_UPGRADE_LOG &&
+      purpose != EDR_EGRESS_UPGRADE_DOWNLOAD)
     return EDR_EGRESS_REQUEST_DENIED;
   EdrEgressTaskScopeLookup lookup=atomic_load(&task_scope_lookup);
   if (!command_id || !command_id[0] || !lookup) return EDR_EGRESS_REQUEST_DENIED;
@@ -40,6 +41,8 @@ int edr_egress_task_preflight(EdrEgressPurpose purpose, const char *command_id,
       (strcmp(scope.operation, "upgrade") && strcmp(scope.operation, "rollback")) ||
       (purpose == EDR_EGRESS_UPGRADE_LOG && strcmp(scope.upgrade_class, "installer_required")))
     return EDR_EGRESS_REQUEST_DENIED;
+  if (purpose == EDR_EGRESS_UPGRADE_DOWNLOAD && scope.execution_authorized != 1)
+    return EDR_EGRESS_AUTHORIZATION_EXPIRED;
   if (out) *out = scope;
   return 0;
 }
@@ -282,12 +285,15 @@ static int deny(char *reason, size_t cap, const char *cause) {
   if (reason && cap) snprintf(reason, cap, "%s", cause);
   return EDR_EGRESS_REQUEST_DENIED;
 }
-static int token(const cJSON *v, size_t max) {
-  if (!cJSON_IsString(v) || !v->valuestring || strlen(v->valuestring) > max) return 0;
-  const unsigned char *p = (const unsigned char *)v->valuestring;
+static int token_string(const char *value, size_t max) {
+  if (!value || strlen(value) > max) return 0;
+  const unsigned char *p = (const unsigned char *)value;
   for (; *p; ++p) if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
                         (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' || *p == '.')) return 0;
   return 1;
+}
+static int token(const cJSON *v, size_t max) {
+  return cJSON_IsString(v) && token_string(v->valuestring, max);
 }
 static int listed(const char *s, const char *const *values, size_t count) {
   for (size_t i = 0; i < count; ++i) if (strcmp(s, values[i]) == 0) return 1;
@@ -761,6 +767,90 @@ static int control_get_valid(const char *path) {
     cJSON *v = cJSON_CreateString(route + strlen(prefix));
     int ok = v && v->valuestring[0] && token(v, 96u); cJSON_Delete(v); return ok;
   }
+  return 0;
+}
+
+int edr_egress_upgrade_download_validate(const char *command_id, const char *url,
+    const char *tenant_id, const char *endpoint_id, char *reason, size_t reason_cap) {
+  if (reason && reason_cap) reason[0] = 0;
+  EdrEgressTaskScope scope;
+  int rc = edr_egress_task_preflight(EDR_EGRESS_UPGRADE_DOWNLOAD, command_id, &scope);
+  if (rc) {
+    if (reason && reason_cap) snprintf(reason, reason_cap, "%s",
+        rc == EDR_EGRESS_AUTHORIZATION_EXPIRED ? "task_authorization_expired" :
+        rc == EDR_EGRESS_LOCAL_STATE_FAILURE ? "task_authority_unavailable" : "upgrade_download_task_denied");
+    return rc;
+  }
+  if (!tenant_id || strcmp(tenant_id, scope.tenant_id) || !endpoint_id ||
+      strcmp(endpoint_id, scope.endpoint_id) || !url || strlen(url) > 2048u)
+    return deny(reason, reason_cap, "upgrade_download_scope_denied");
+  int runtime = scope.runtime_manifest_url[0] && !strcmp(url, scope.runtime_manifest_url);
+  if ((!runtime && (!scope.artifact_url[0] || strcmp(url, scope.artifact_url))) ||
+      (runtime && strcmp(scope.upgrade_class, "runtime_bundle") && strcmp(scope.upgrade_class, "installer_required")))
+    return deny(reason, reason_cap, "upgrade_download_url_not_pinned");
+  /* The signed URL pins the origin as well as every query byte. Reject URL
+   * forms that could reinterpret that origin or escape the fixed API route. */
+  if (strncmp(url, "https://", 8u)) return deny(reason, reason_cap, "upgrade_download_url_invalid");
+  const char *path = strchr(url + 8u, '/');
+  if (!path || path == url + 8u || (size_t)(path - (url + 8u)) > 255u)
+    return deny(reason, reason_cap, "upgrade_download_url_invalid");
+  for (const char *p = url + 8u; p < path; ++p)
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || *p == '.' || *p == '-' || *p == ':'))
+      return deny(reason, reason_cap, "upgrade_download_url_invalid");
+  const char *port = memchr(url + 8u, ':', (size_t)(path - (url + 8u)));
+  const char *host_end = port ? port : path;
+  if (host_end == url + 8u || !isalnum((unsigned char)url[8]) ||
+      !isalnum((unsigned char)host_end[-1]))
+    return deny(reason, reason_cap, "upgrade_download_url_invalid");
+  if (port) {
+    unsigned number = 0u;
+    if (path - port < 2 || path - port > 6)
+      return deny(reason, reason_cap, "upgrade_download_url_invalid");
+    for (const char *p = port + 1; p < path; ++p) {
+      if (*p < '0' || *p > '9') return deny(reason, reason_cap, "upgrade_download_url_invalid");
+      number = number * 10u + (unsigned)(*p - '0');
+    }
+    if (!number || number > 65535u) return deny(reason, reason_cap, "upgrade_download_url_invalid");
+  }
+  char expected[160];
+  if (!token_string(scope.target_version, 64u) || !strcmp(scope.target_version, ".") ||
+      !strcmp(scope.target_version, ".."))
+    return deny(reason, reason_cap, "upgrade_download_version_denied");
+  int length = snprintf(expected, sizeof(expected), "/api/v1/agent/%s/%s?",
+                        runtime ? "runtime" : "download", scope.target_version);
+  if (length < 0 || (size_t)length >= sizeof(expected) || strncmp(path, expected, (size_t)length))
+    return deny(reason, reason_cap, "upgrade_download_route_denied");
+  const char *query = path + length;
+  static const char *const keys[] = {"platform", "arch", "task_id", "artifact_id", "package_id"};
+  size_t count = runtime ? 5u : 4u;
+  if (!query[0] || !control_query_valid(query, keys, count))
+    return deny(reason, reason_cap, "upgrade_download_query_denied");
+  const char *architecture = !strcmp(scope.architecture, "x64") ? "amd64" :
+                             !strcmp(scope.architecture, "arm64") ? "arm64" : NULL;
+  if (!architecture) return deny(reason, reason_cap, "upgrade_download_architecture_denied");
+  char copy[1600];
+  snprintf(copy, sizeof(copy), "%s", query);
+  size_t fields = 0u;
+  for (char *part = copy; part && part[0]; ++fields) {
+    char *next = strchr(part, '&'); if (next) *next++ = 0;
+    char *value = strchr(part, '='); *value++ = 0;
+    int matches = !strcmp(part, "platform") ? !strcmp(value, "windows") :
+                  !strcmp(part, "arch") ? !strcmp(value, architecture) :
+                  !strcmp(part, "task_id") ? !strcmp(value, scope.task_id) :
+                  !strcmp(part, "artifact_id") ? !strcmp(value, scope.artifact_id) : 1;
+    if (!matches) return deny(reason, reason_cap, "upgrade_download_query_scope_denied");
+    if (!strcmp(part, "package_id")) {
+      size_t n = strlen(value);
+      if (!n || value[0] < '1' || value[0] > '9' || n > 19u ||
+          (n == 19u && strcmp(value, "9223372036854775807") > 0))
+        return deny(reason, reason_cap, "upgrade_download_package_denied");
+      for (const char *p = value; *p; ++p) if (*p < '0' || *p > '9')
+        return deny(reason, reason_cap, "upgrade_download_package_denied");
+    }
+    part = next;
+  }
+  if (fields != count) return deny(reason, reason_cap, "upgrade_download_query_incomplete");
   return 0;
 }
 typedef struct { const char *path; char kind; } ControlField;

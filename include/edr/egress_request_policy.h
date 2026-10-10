@@ -16,12 +16,17 @@ typedef enum EdrEgressPurpose {
   EDR_EGRESS_ARTIFACT = 1,
   EDR_EGRESS_ATTACK_SURFACE = 2,
   EDR_EGRESS_UPGRADE_EVENT = 3,
-  EDR_EGRESS_UPGRADE_LOG = 4
+  EDR_EGRESS_UPGRADE_LOG = 4,
+  EDR_EGRESS_UPGRADE_DOWNLOAD = 5
 } EdrEgressPurpose;
 typedef struct EdrEgressTaskScope {
   char tenant_id[128], endpoint_id[128], command_id[128], task_id[129];
   char artifact_id[129], artifact_sha256[65], target_version[65];
   char operation[16], upgrade_class[32];
+  char artifact_url[2049], runtime_manifest_url[2049], architecture[16];
+  /* Computed by the inbox owner from the original signed execution deadline;
+   * result-delivery renewals cannot extend download execution authority. */
+  int execution_authorized;
 } EdrEgressTaskScope;
 /* Owner must resolve the signed, durable external agent_update inbox and its
  * current authority. 0 permits inspection; DENIED/EXPIRED hold; local failure retries. */
@@ -30,6 +35,10 @@ void edr_egress_set_task_scope_lookup(EdrEgressTaskScopeLookup lookup);
 int edr_egress_task_preflight(EdrEgressPurpose purpose, const char *command_id,
                               EdrEgressTaskScope *out);
 int edr_egress_is_policy_hold(int result);
+/* Only exact HTTPS artifact/runtime URLs from the signed durable task owner
+ * are download authority. Ordinary control GET validation stays unchanged. */
+int edr_egress_upgrade_download_validate(const char *command_id, const char *url,
+    const char *tenant_id, const char *endpoint_id, char *reason, size_t reason_cap);
 /* The upgrade owner compares path/hash/size against its durable journal. */
 typedef int (*EdrEgressUpgradeLogValidator)(const EdrEgressTaskScope *scope,
     const char *upload_id, const char *path, const char *sha256, uint64_t *size);

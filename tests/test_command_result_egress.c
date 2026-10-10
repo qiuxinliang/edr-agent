@@ -473,6 +473,153 @@ static void purpose_tests(void) {
   puts("PASS: real RTQ categories/filters/row and time bounds; unrelated data projected before freeze; final guard rejects injection; stdout owner and durable slot budget/ACK invariants");
 }
 
+/* QueueCommand's signed payload uses x64 while its URL uses amd64. These
+ * fixtures exercise the real protected-inbox owner, not a permissive callback. */
+static cJSON *download_payload(const char *arch) {
+  cJSON *o=cJSON_CreateObject();CHECK(o);
+  cJSON_AddStringToObject(o,"task_id","task-654");
+  cJSON_AddStringToObject(o,"artifact_id","artifact-654");
+  cJSON_AddStringToObject(o,"hash","0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+  cJSON_AddStringToObject(o,"version","3.2.654");
+  cJSON_AddStringToObject(o,"operation","upgrade");
+  cJSON_AddStringToObject(o,"upgrade_class","installer_required");
+  cJSON_AddStringToObject(o,"arch",arch);
+  char url[512];
+  snprintf(url,sizeof(url),"https://192.0.2.1:8080/api/v1/agent/download/3.2.654?platform=windows&arch=%s&task_id=task-654&artifact_id=artifact-654",!strcmp(arch,"x64")?"amd64":"arm64");
+  cJSON_AddStringToObject(o,"artifact_url",url);
+  snprintf(url,sizeof(url),"https://192.0.2.1:8080/api/v1/agent/runtime/3.2.654?platform=windows&arch=%s&task_id=task-654&artifact_id=artifact-654&package_id=7",!strcmp(arch,"x64")?"amd64":"arm64");
+  cJSON_AddStringToObject(o,"runtime_manifest_url",url);
+  return o;
+}
+static void download_store_raw(const char *id,const char *json,int expired,int unsigned_task) {
+  EdrSoarCommandMeta m=task(id,"agent_update");
+  m.issued_at_unix_ms=(int64_t)time(NULL)*1000-(expired?60000:0);m.deadline_ms=30000;
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t *)json,strlen(json),m.issued_at_unix_ms)==0);
+  if(unsigned_task)memset(&m.result_authorization,0,sizeof(m.result_authorization));
+  CHECK(edr_command_state_store_inbox(id,"agent_update",(const uint8_t *)json,strlen(json),&m)==0);
+}
+static char *download_store(const char *id,cJSON *payload,int expired,int unsigned_task) {
+  char *json=cJSON_PrintUnformatted(payload);CHECK(json);
+  download_store_raw(id,json,expired,unsigned_task);return json;
+}
+static int download_allowed(const char *id,const char *url) {
+  char why[128];return edr_egress_upgrade_download_validate(id,url,"tenant","ep",why,sizeof(why));
+}
+static void download_authority_tests(void) {
+  edr_egress_set_task_scope_lookup(edr_command_state_task_scope);
+  for(unsigned i=0;i<2;i++) {
+    const char *id=i?"download-arm64":"download-x64";
+    cJSON *o=download_payload(i?"arm64":"x64");char *json=download_store(id,o,0,0);
+    const char *raw=cJSON_GetObjectItemCaseSensitive(o,"artifact_url")->valuestring;
+    const char *runtime=cJSON_GetObjectItemCaseSensitive(o,"runtime_manifest_url")->valuestring;
+    CHECK(download_allowed(id,raw)==0 && download_allowed(id,runtime)==0);
+    char why[128];EdrEgressTaskScope scope;
+    CHECK(edr_egress_request_validate_for_scope("GET",raw,NULL,NULL,0,"tenant","ep",why,sizeof(why))==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(edr_egress_request_validate_for_scope("GET",runtime,NULL,NULL,0,"tenant","ep",why,sizeof(why))==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(edr_egress_task_preflight(EDR_EGRESS_ARTIFACT,id,&scope)==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(download_allowed(NULL,raw)==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(download_allowed("unowned-download",raw)==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(edr_egress_upgrade_download_validate(id,raw,"wrong","ep",why,sizeof(why))==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(edr_egress_upgrade_download_validate(id,raw,"tenant","wrong",why,sizeof(why))==EDR_EGRESS_REQUEST_DENIED);
+    char altered[1024];snprintf(altered,sizeof(altered),"%s&extra=1",raw);
+    CHECK(download_allowed(id,altered)==EDR_EGRESS_REQUEST_DENIED);
+    snprintf(altered,sizeof(altered),"%s",raw);altered[8]='x';
+    CHECK(download_allowed(id,altered)==EDR_EGRESS_REQUEST_DENIED);
+    edr_command_state_delete_inbox(id);free(json);cJSON_Delete(o);
+  }
+  /* Even exact bytes in a signed fixture cannot authorize malformed queries,
+   * route confusion, credentials, percent escapes, fragments or oversized IDs. */
+  static const struct {const char *url;const char *version;} invalid[]={
+    {"https://host/api/v1/agent/download/3.2.654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654&arch=arm64",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654&extra=1",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task%2D654&artifact_id=artifact-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=linux&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=amd64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=wrong&artifact_id=artifact-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=wrong",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654&package_id=7",NULL},
+    {"https://host/api/v1/agent/runtime/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"http://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://user@host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host:bad/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host:0/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host:65536/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654#x",NULL},
+    {"https://host/api/v1/agent/download/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654&",NULL},
+    {"https://host/api/v1/agent/download/../x?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654","../x"},
+    {"https://host/api/v1/agent/download/3.2.654/../x?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654","3.2.654/../x"},
+    {"https://host/api/v1/agent/download/3.2.654%2Fx?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654","3.2.654%2Fx"},
+    {"https://host/api/v1/agent/download/.?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654","."},
+    {"https://host/api/v1/agent/download/..?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654",".."},
+    {"https://host/api/v1/agent/download/3.2.654?x?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654","3.2.654?x"}
+  };
+  for(size_t i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
+    cJSON *o=download_payload("arm64");char id[64];snprintf(id,sizeof(id),"bad-download-%zu",i);
+    CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(o,"artifact_url"),invalid[i].url));
+    if(invalid[i].version)CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(o,"version"),invalid[i].version));
+    char *json=download_store(id,o,0,0);CHECK(download_allowed(id,invalid[i].url)==EDR_EGRESS_REQUEST_DENIED);
+    edr_command_state_delete_inbox(id);free(json);cJSON_Delete(o);
+  }
+  const char *packages[]={"0","-1","1.5","01","9223372036854775808","1x",""};
+  for(size_t i=0;i<sizeof(packages)/sizeof(packages[0]);i++) {
+    cJSON *o=download_payload("arm64");char id[64],url[512];snprintf(id,sizeof(id),"bad-package-%zu",i);
+    snprintf(url,sizeof(url),"https://host/api/v1/agent/runtime/3.2.654?platform=windows&arch=arm64&task_id=task-654&artifact_id=artifact-654&package_id=%s",packages[i]);
+    CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(o,"runtime_manifest_url"),url));
+    char *json=download_store(id,o,0,0);CHECK(download_allowed(id,url)==EDR_EGRESS_REQUEST_DENIED);
+    edr_command_state_delete_inbox(id);free(json);cJSON_Delete(o);
+  }
+  for(unsigned i=0;i<6;i++) {
+    cJSON *o=download_payload("arm64");char id[64];snprintf(id,sizeof(id),"unready-download-%u",i);
+    char raw[2300];snprintf(raw,sizeof(raw),"%s",cJSON_GetObjectItemCaseSensitive(o,"artifact_url")->valuestring);
+    if(i==2)cJSON_DeleteItemFromObjectCaseSensitive(o,"artifact_url");
+    if(i==3)cJSON_ReplaceItemInObjectCaseSensitive(o,"artifact_url",cJSON_CreateNumber(1));
+    if(i==4)cJSON_ReplaceItemInObjectCaseSensitive(o,"arch",cJSON_CreateBool(1));
+    if(i==5) {memset(raw,'x',sizeof(raw)-1);raw[sizeof(raw)-1]=0;CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(o,"artifact_url"),raw));}
+    char *json=download_store(id,o,i==0,i==1);
+    CHECK(download_allowed(id,raw)==(i==0?EDR_EGRESS_AUTHORIZATION_EXPIRED:EDR_EGRESS_REQUEST_DENIED));
+    if(i==0) {
+      /* An actual signed-delivery renewal changes only the result grant. */
+      EdrSoarCommandMeta grant=task("renew-1","result_delivery_renewal");
+      grant.result_authorization.expires_unix_ms+=60000;
+      char *request=renewal(id,"agent_update","upgrade_payload",json,grant.result_authorization.expires_unix_ms);
+      CHECK(renew(request,&grant)==0);free(request);
+      CHECK(download_allowed(id,raw)==EDR_EGRESS_AUTHORIZATION_EXPIRED);
+      EdrEgressTaskScope scope;CHECK(edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,id,&scope)==0);
+    }
+    edr_command_state_delete_inbox(id);free(json);cJSON_Delete(o);
+  }
+  cJSON *source=download_payload("arm64");char *source_json=cJSON_PrintUnformatted(source);CHECK(source_json);
+  const char *source_url=cJSON_GetObjectItemCaseSensitive(source,"artifact_url")->valuestring;
+  for(unsigned i=0;i<3;i++) {
+    char id[64],malformed[4096];snprintf(id,sizeof(id),"ambiguous-payload-%u",i);
+    if(i==0)snprintf(malformed,sizeof(malformed),"%.*s,\"artifact_url\":\"%s\"}",(int)strlen(source_json)-1,source_json,source_url);
+    else if(i==1)snprintf(malformed,sizeof(malformed),"%s{}",source_json);
+    else {
+      const char *field=strstr(source_json,"\"artifact_url\":\"");CHECK(field);
+      const char *end=strchr(field+strlen("\"artifact_url\":\""),'"');CHECK(end);
+      snprintf(malformed,sizeof(malformed),"%.*s\\u0000hidden%s",(int)(end-source_json),source_json,end);
+    }
+    /* Actual admission already rejects these bytes. Model a malformed old
+     * protected receipt explicitly to ensure the download owner also denies. */
+    EdrSoarCommandMeta receipt=task(id,"agent_update");
+    receipt.issued_at_unix_ms=(int64_t)time(NULL)*1000;receipt.deadline_ms=30000;
+    CHECK(edr_command_result_bind_contract(&receipt.result_authorization,(const uint8_t *)malformed,strlen(malformed),receipt.issued_at_unix_ms)!=0);
+    CHECK(edr_command_state_store_inbox(id,"agent_update",(const uint8_t *)malformed,strlen(malformed),&receipt)==0);
+    CHECK(download_allowed(id,source_url)==EDR_EGRESS_REQUEST_DENIED);
+    edr_command_state_delete_inbox(id);
+  }
+  free(source_json);cJSON_Delete(source);
+  cJSON *legacy=download_payload("arm64");cJSON_DeleteItemFromObjectCaseSensitive(legacy,"artifact_url");
+  cJSON_DeleteItemFromObjectCaseSensitive(legacy,"runtime_manifest_url");
+  char *json=download_store("legacy-update-event",legacy,0,0);EdrEgressTaskScope scope;
+  CHECK(edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,"legacy-update-event",&scope)==0);
+  CHECK(download_allowed("legacy-update-event","https://host/api/v1/agent/download/3.2.654")==EDR_EGRESS_REQUEST_DENIED);
+  edr_command_state_delete_inbox("legacy-update-event");free(json);cJSON_Delete(legacy);
+  puts("PASS: exact task-pinned QueueCommand downloads for both architectures; generic GET, malformed scope/query/version, unsigned and renewed-but-expired execution denied");
+}
+
 int main(void) {
   char path[256];snprintf(path,sizeof(path),"./command-egress-%ld",(long)pid());
   env("EDR_COMMAND_STATE_DIR",path);
@@ -607,6 +754,7 @@ int main(void) {
   body=wire("cmd-large-15","rtq_execute",large,"");
   CHECK(allowed("tenant","ep",body));free(body);
   purpose_tests();
+  download_authority_tests();
   puts("PASS: admitted task scope, exact terminal, durable retry, expiry, session binding, attachment denial");
   return 0;
 }

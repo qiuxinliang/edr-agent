@@ -349,7 +349,7 @@ int main(void) {
   require_true(update_contract_test != NULL, "read Agent update contract test");
   contains(update_contract_test, "int edr_command_cancel_requested",
            "Windows update contract target stubs cancellation dependency");
-  contains(update_contract_test, "int edr_ingest_http_get_url_to_file",
+  contains(update_contract_test, "int edr_ingest_http_get_agent_update_url_to_file",
            "Windows update contract target stubs download dependency");
   contains(update_contract_test, "void edr_ingest_http_get_runtime",
            "Windows update contract target stubs transport diagnostics dependency");

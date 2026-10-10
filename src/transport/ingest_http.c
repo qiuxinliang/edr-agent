@@ -3544,11 +3544,7 @@ static int native_post_json(const char *url, const char *body, size_t body_len) 
   return native_request("POST", url, "application/json", body, body_len, NULL, 0u);
 }
 
-static int egress_request_allowed(const char *method, const char *url,
-                                   const char *content_type, const void *body, size_t len) {
-  char reason[128];
-  int rc = edr_egress_request_validate_for_scope(method, url, content_type, body, len,
-                                                  s_tenant, s_endpoint, reason, sizeof(reason));
+static int record_egress_decision(int rc, const char *reason) {
   if (rc != 0) {
     /* Policy refusal is local. It must not trigger route failover, a circuit
      * penalty, or a receipt. Reasons contain schema codes, never payloads. */
@@ -3561,6 +3557,21 @@ static int egress_request_allowed(const char *method, const char *url,
     runtime_state_unlock();
   }
   return rc;
+}
+
+static int egress_request_allowed(const char *method, const char *url,
+                                   const char *content_type, const void *body, size_t len) {
+  char reason[128];
+  int rc = edr_egress_request_validate_for_scope(method, url, content_type, body, len,
+                                                  s_tenant, s_endpoint, reason, sizeof(reason));
+  return record_egress_decision(rc, reason);
+}
+
+static int egress_upgrade_download_allowed(const char *command_id, const char *url) {
+  char reason[128];
+  int rc = edr_egress_upgrade_download_validate(command_id, url, s_tenant, s_endpoint,
+                                                reason, sizeof(reason));
+  return record_egress_decision(rc, reason);
 }
 
 #ifdef EDR_HAVE_CURL_HTTP2
@@ -4933,14 +4944,16 @@ static int edr_ingest_http_refresh_route_profile(int force) {
 static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
                               EdrAgentConfigHeaders *out_agent_config,
                               int io_timeout_ms, int max_attempts,
-                              const char *cached_sha256) {
+                              const char *cached_sha256, const char *update_command_id) {
   char host[256];
   char path[1024];
   int port = 0;
   int https = 0;
   int rc = -1;
   char req[8192];
-  if (egress_request_allowed("GET", url, NULL, NULL, 0u) != 0) return EDR_EGRESS_REQUEST_DENIED;
+  int admission = update_command_id ? egress_upgrade_download_allowed(update_command_id, url) :
+                                     egress_request_allowed("GET", url, NULL, NULL, 0u);
+  if (admission != 0) return admission;
   if (cached_sha256 && cached_sha256[0]) {
     if (strlen(cached_sha256) != 64u || !out_agent_config) return -1;
     for (size_t i = 0u; i < 64u; ++i) if (!isxdigit((unsigned char)cached_sha256[i])) return -1;
@@ -4975,6 +4988,10 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   if (max_attempts > 3) max_attempts = 3;
   s_http_request_timeout_override_ms = io_timeout_ms;
   for (int attempt = 0; attempt < max_attempts; attempt++) {
+    if (update_command_id) {
+      admission = egress_upgrade_download_allowed(update_command_id, url);
+      if (admission != 0) { rc = admission; break; }
+    }
     int reusable = 0;
     int rn;
     EdrHttpConn *conn = http_conn_get_locked(host, port, https, 0);
@@ -5047,13 +5064,14 @@ static int native_get_to_file(const char *url, FILE *out, size_t max_bytes,
   return rc;
 }
 
-int edr_ingest_http_get_url_to_file_conditional(const char *url,
+static int get_url_to_file_conditional_owned(const char *url,
                                                  const char *file_path,
                                                  size_t max_bytes,
                                                  EdrAgentConfigHeaders *headers,
                                                  int timeout_ms,
                                                  int max_attempts,
-                                                 const char *cached_sha256) {
+                                                 const char *cached_sha256,
+                                                 const char *update_command_id) {
 	FILE *f;
 	size_t cap;
 	int rc;
@@ -5077,15 +5095,34 @@ int edr_ingest_http_get_url_to_file_conditional(const char *url,
 	if (headers) {
 		memset(headers, 0, sizeof(*headers));
 	}
-	rc = native_get_to_file(url, f, cap, headers, timeout_ms, max_attempts, cached_sha256);
+	rc = native_get_to_file(url, f, cap, headers, timeout_ms, max_attempts, cached_sha256,
+                          update_command_id);
 	if (fclose(f) != 0 && rc >= 0) rc = -1;
 	if (rc < 0) {
 		(void)remove(file_path);
+    if (update_command_id && (edr_egress_is_policy_hold(rc) ||
+        rc == EDR_EGRESS_LOCAL_STATE_FAILURE)) return rc;
     note_http_request_failure();
     return -1;
   }
 	note_http_request_success();
 	return rc;
+}
+
+int edr_ingest_http_get_url_to_file_conditional(const char *url,
+    const char *file_path, size_t max_bytes, EdrAgentConfigHeaders *headers,
+    int timeout_ms, int max_attempts, const char *cached_sha256) {
+  return get_url_to_file_conditional_owned(url, file_path, max_bytes, headers,
+      timeout_ms, max_attempts, cached_sha256, NULL);
+}
+
+int edr_ingest_http_get_agent_update_url_to_file(const char *command_id,
+    const char *url, const char *file_path, size_t max_bytes) {
+  /* Check durable authority before creating/truncating any staging file. */
+  int admission = egress_upgrade_download_allowed(command_id, url);
+  if (admission) return admission;
+  return get_url_to_file_conditional_owned(url, file_path, max_bytes, NULL, 0, 2,
+                                            NULL, command_id);
 }
 
 int edr_ingest_http_get_url_to_file_meta_bounded(const char *url, const char *file_path,

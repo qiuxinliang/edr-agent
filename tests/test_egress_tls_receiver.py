@@ -268,6 +268,8 @@ class Receiver(http.server.ThreadingHTTPServer):
         self.observations = []
         self.errors = []
         self.config_receipts = []
+        self.download_paths = set()
+        self.download_requests = 0
         self.lock = threading.Lock()
         with closing(sqlite3.connect(database)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -307,6 +309,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
             pass
+
+    def do_GET(self):
+        # Exact synthetic QueueCommand URLs only. The socket already requires
+        # a client certificate; no production endpoint or input is contacted.
+        with self.server.lock:
+            self.server.download_requests += 1
+            index = self.server.download_requests
+            self.server.observations.append({"path": self.path, "bytes": 0,
+                                             "sha256": hashlib.sha256(b"").hexdigest()})
+        if self.path not in self.server.download_paths or not self.connection.getpeercert():
+            self.server.errors.append("unexpected synthetic download")
+            self.reply({"code": "UNEXPECTED_DOWNLOAD"}, 403)
+            return
+        if index > 2:
+            # Exercise actual transport retry and subsequent authority expiry.
+            self.close_connection = True
+            return
+        body = b"synthetic-update"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -536,6 +562,7 @@ def main():
     parser.add_argument("--client", required=True)
     parser.add_argument("--baseline", action="store_true", help="run historical implementation; regression is expected to fail")
     parser.add_argument("--command-only", action="store_true", help="focus real signed result/renewal delivery without detector fixtures")
+    parser.add_argument("--update-download-only", action="store_true", help="focus signed updater downloads through real mTLS transport")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="edr-egress-mtls-") as temporary:
         root = Path(temporary)
@@ -546,11 +573,15 @@ def main():
         reports = []
         modes = ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host")
         if not args.baseline:
-            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command")
+            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command", "positive-update-download-x64", "positive-update-download-arm64",
+                      "wrong-update-download-ca", "wrong-update-download-host")
         if args.command_only:
             modes = ("positive-command",)
+        if args.update_download_only:
+            modes = ("positive-update-download-x64", "positive-update-download-arm64",
+                     "wrong-update-download-ca", "wrong-update-download-host")
         for mode in modes:
-            server = Receiver(root, "wrong-host" if mode == "wrong-host" else "server", root / f"receiver-{mode}.db")
+            server = Receiver(root, "wrong-host" if mode in ("wrong-host", "wrong-update-download-host") else "server", root / f"receiver-{mode}.db")
             try:
                 environment = os.environ.copy()
                 environment.pop("EDR_ZSTD_DICT_PATH", None)
@@ -601,9 +632,43 @@ def main():
                     environment["EDR_TEST_RENEWAL_SIGNATURE"]="cmd_synthetic_renewal|sigv2|ed25519|synthetic-key|"+signature
                     environment["EDR_TEST_RENEWAL_ISSUED"]=issued
                     environment["EDR_TEST_RENEWAL_PAYLOAD"]=payload
+                if "update-download" in mode:
+                    executable = shutil.which("openssl")
+                    for command in (
+                        ["genpkey", "-algorithm", "ED25519", "-out", "update.key"],
+                        ["pkey", "-in", "update.key", "-pubout", "-out", "update.pub"],
+                    ):
+                        subprocess.run([executable, *command], cwd=root, check=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                    architecture = "x64" if mode.endswith("x64") else "arm64"
+                    query_arch = "amd64" if architecture == "x64" else "arm64"
+                    raw_path = "/api/v1/agent/download/3.2.654?platform=windows&arch=" + query_arch + "&task_id=task-654&artifact_id=artifact-654"
+                    runtime_path = raw_path.replace("/download/", "/runtime/") + "&package_id=7"
+                    origin = f"https://localhost:{server.server_port}"
+                    issued = str(int(time.time() * 1000))
+                    payload = json.dumps({"schema": "edr.agent_update.v1", "task_id": "task-654",
+                        "operation": "upgrade", "initiated_by": "operator", "artifact_id": "artifact-654",
+                        "artifact_url": origin + raw_path, "hash": "a" * 64, "version": "3.2.654",
+                        "arch": architecture, "internal_name": "FDSensor", "publisher_thumbprint": "b" * 40,
+                        "publisher_subject": "Synthetic Publisher", "runtime_manifest_url": origin + runtime_path,
+                        "runtime_manifest_sha256": "c" * 64, "upgrade_class": "installer_required",
+                        "issued_at_unix_ms": int(issued), "deadline_unix_ms": int(issued) + 30000,
+                        "health_observe_ms": 300000}, separators=(",", ":"))
+                    canonical = "\n".join(("cmd_synthetic_update", "agent_update", "cmd_synthetic_update",
+                        issued, "30000", hashlib.sha256(payload.encode()).hexdigest())).encode()
+                    (root / "update.txt").write_bytes(canonical)
+                    subprocess.run([executable, "pkeyutl", "-sign", "-rawin", "-inkey", "update.key",
+                        "-in", "update.txt", "-out", "update.sig"], cwd=root, check=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                    signature = base64.urlsafe_b64encode((root / "update.sig").read_bytes()).decode().rstrip("=")
+                    environment["EDR_COMMAND_SIGNING_PUBLIC_KEY"] = (root / "update.pub").read_text()
+                    environment["EDR_TEST_UPDATE_SIGNATURE"] = "cmd_synthetic_update|sigv2|ed25519|synthetic-key|" + signature
+                    environment["EDR_TEST_UPDATE_PAYLOAD"] = payload
+                    environment["EDR_TEST_UPDATE_ISSUED"] = issued
+                    server.download_paths = {raw_path, runtime_path}
                 host = "127.0.0.1" if mode == "positive-ip" else "localhost"
                 result = subprocess.run([args.client, f"https://{host}:{server.server_port}/api/v1",
-                                         str(root / ("other-ca.pem" if mode == "wrong-ca" else "ca.pem")),
+                                         str(root / ("other-ca.pem" if mode in ("wrong-ca", "wrong-update-download-ca") else "ca.pem")),
                                          str(root / "client.pem"), str(root / "client.key"),
                                          str(root / f"agent-{mode}.db"), mode],
                                         capture_output=True, text=True, timeout=45, env=environment, cwd=root)
@@ -624,6 +689,8 @@ def main():
                         reports[-1]["business_alerts"] = db.execute("SELECT COALESCE(SUM(alert_created),0) FROM p0_association").fetchone()[0]
                         if reports[-1]["business_alerts"] != 1:
                             reports[-1]["receiver_business_failures"] += 1
+                if "update-download" in mode and len(server.observations) != 5:
+                    reports[-1]["receiver_business_failures"] += 1
                 if mode == "positive-command":
                     if len(server.observations) != 2 or reports[-1]["durable_batches"] != 1 or reports[-1]["duplicate_observations"] != 1:
                         reports[-1]["receiver_business_failures"] += 1
@@ -637,7 +704,7 @@ def main():
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
-        if not args.baseline and not args.command_only:
+        if not args.baseline and not args.command_only and not args.update_download_only:
             try:
                 reports.append(crash_restart_scenario(args.client, root))
             except (AssertionError, RuntimeError, OSError, sqlite3.Error, ValueError, KeyError,

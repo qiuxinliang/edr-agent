@@ -275,6 +275,11 @@ int edr_ingest_http_post_json_suffix(const char *suffix, const char *body_json,
 /** 复用当前 REST/mTLS/proxy 栈读取 API suffix；suffix 不带前导 /。 */
 int edr_ingest_http_get_suffix(const char *suffix, char *resp_body, size_t resp_body_cap);
 
+/* Downloads only an exact artifact/runtime URL owned by this signed durable
+ * agent_update command. Uses the existing bounded HTTPS/mTLS file transport. */
+int edr_ingest_http_get_agent_update_url_to_file(const char *command_id,
+    const char *url, const char *file_path, size_t max_bytes);
+
 /** 发送轻量在线心跳；独立于详细健康监控开关。 */
 int edr_ingest_http_post_heartbeat(void);
 

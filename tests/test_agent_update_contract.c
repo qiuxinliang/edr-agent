@@ -30,8 +30,10 @@ int edr_command_cancel_requested(const char *command_id) {
   return 0;
 }
 
-int edr_ingest_http_get_url_to_file(const char *url, const char *file_path,
+int edr_ingest_http_get_agent_update_url_to_file(const char *command_id,
+                                    const char *url, const char *file_path,
                                     size_t max_bytes) {
+  (void)command_id;
   (void)url;
   (void)file_path;
   (void)max_bytes;

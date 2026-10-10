@@ -15,6 +15,8 @@
 #include <time.h>
 #ifdef EDR_TEST_EXTENDED_EGRESS
 #include "edr/command_state.h"
+#include "edr/command_signature.h"
+#include "edr/agent_update_command.h"
 #include "cJSON.h"
 #include "edr/command_result_json.h"
 #include "edr/command_executor.h"
@@ -446,6 +448,82 @@ static int command_result_scenario(const char *path) {
   printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
   return failed ? 1 : 0;
 }
+static unsigned download_scope_calls, download_expire_at;
+static int download_clock_boundary(const char *id,EdrEgressTaskScope *scope) {
+  int rc=edr_command_state_task_scope(id,scope);
+  if(rc)return rc;
+  return ++download_scope_calls>=download_expire_at?EDR_EGRESS_AUTHORIZATION_EXPIRED:0;
+}
+static int file_absent(const char *path) {FILE *f=fopen(path,"rb");if(f){fclose(f);return 0;}return 1;}
+static int download_bytes_match(const char *path) {
+  char bytes[64]={0};FILE *f=fopen(path,"rb");if(!f)return 0;
+  size_t n=fread(bytes,1,sizeof(bytes),f);int ok=!ferror(f)&&n==16&&!memcmp(bytes,"synthetic-update",16);
+  if(fclose(f))ok=0;return ok;
+}
+static int update_download_scenario(const char *path,int bad_tls) {
+#ifdef _WIN32
+  _putenv_s("EDR_COMMAND_STATE_DIR",path);
+#else
+  setenv("EDR_COMMAND_STATE_DIR",path,1);
+#endif
+  const char *payload=getenv("EDR_TEST_UPDATE_PAYLOAD"),*signature=getenv("EDR_TEST_UPDATE_SIGNATURE"),
+             *issued=getenv("EDR_TEST_UPDATE_ISSUED");
+  CHECK(payload&&signature&&issued);if(!payload||!signature||!issued)return 1;
+  const char *id="cmd_synthetic_update";EdrSoarCommandMeta meta={0};
+  snprintf(meta.idempotency_key,sizeof(meta.idempotency_key),"%s",signature);
+  meta.issued_at_unix_ms=strtoll(issued,NULL,10);meta.deadline_ms=30000;
+  CommandSignaturePolicy policy={1};char reason[256];EdrAgentUpdateRequest request={0};
+  /* The real Ed25519 verifier precedes the protected receipt, using exactly
+   * the same authority binding as command admission. No updater is launched. */
+  CHECK(edr_command_signature_verify(id,"agent_update",(const uint8_t *)payload,strlen(payload),&meta,&policy,reason,sizeof(reason))==1);
+  CHECK(edr_command_signature_verify("cmd_forged_update","agent_update",(const uint8_t *)payload,strlen(payload),&meta,&policy,reason,sizeof(reason))==0);
+  CHECK(edr_agent_update_parse_request((const uint8_t *)payload,strlen(payload),&request,reason,sizeof(reason))==1);
+  char output[1400];snprintf(output,sizeof(output),"%s.download",path);
+  CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.artifact_url,output,4096)==EDR_EGRESS_REQUEST_DENIED);
+  CHECK(file_absent(output));
+  EdrCommandResultAuthorization *a=&meta.result_authorization;
+  snprintf(a->tenant_id,sizeof(a->tenant_id),"synthetic-tenant");
+  snprintf(a->endpoint_id,sizeof(a->endpoint_id),"synthetic-endpoint");
+  snprintf(a->command_id,sizeof(a->command_id),"%s",id);
+  snprintf(a->command_type,sizeof(a->command_type),"agent_update");
+  a->expires_unix_ms=meta.issued_at_unix_ms+86400000;
+  CHECK(edr_command_result_bind_contract(a,(const uint8_t *)payload,strlen(payload),meta.issued_at_unix_ms)==0);
+  CHECK(edr_command_state_store_inbox(id,"agent_update",(const uint8_t *)payload,strlen(payload),&meta)==0);
+  if(bad_tls) {
+    CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.artifact_url,output,4096)!=0);
+    CHECK(file_absent(output));
+  } else {
+    CHECK(edr_ingest_http_get_agent_update_url_to_file("cmd_forged_update",request.artifact_url,output,4096)==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(edr_ingest_http_get_url_to_file(request.artifact_url,output,4096)!=0 && file_absent(output));
+    char altered[2300];snprintf(altered,sizeof(altered),"%s&extra=1",request.artifact_url);
+    CHECK(edr_ingest_http_get_agent_update_url_to_file(id,altered,output,4096)==EDR_EGRESS_REQUEST_DENIED);
+    CHECK(file_absent(output));
+    CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.artifact_url,output,4096)==0);
+    CHECK(download_bytes_match(output));remove(output);
+    CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.runtime_manifest_url,output,4096)==0);
+    CHECK(download_bytes_match(output));remove(output);
+    /* Real transport failures must not become success just because the next
+     * purpose check passed. The synthetic receiver closes both retry sockets. */
+    CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.artifact_url,output,4096)!=0);
+    CHECK(file_absent(output));
+    EdrIngestHttpRuntime before,after;
+    for(unsigned expire=2;expire<=4;expire++) {
+      download_scope_calls=0;download_expire_at=expire;
+      edr_egress_set_task_scope_lookup(download_clock_boundary);
+      edr_ingest_http_get_runtime(&before);
+      CHECK(edr_ingest_http_get_agent_update_url_to_file(id,request.artifact_url,output,4096)==EDR_EGRESS_AUTHORIZATION_EXPIRED);
+      edr_ingest_http_get_runtime(&after);
+      CHECK(download_scope_calls==expire && file_absent(output));
+      CHECK(after.http_request_fail_count==before.http_request_fail_count && after.circuit_open==before.circuit_open);
+      CHECK(strstr(after.last_error,"egress_denied:task_authorization_expired"));
+    }
+    edr_egress_set_task_scope_lookup(edr_command_state_task_scope);
+  }
+  edr_command_state_delete_inbox(id);
+  printf("{\"mode\":\"signed-update-download\",\"signed_admission\":true,\"tls_rejection\":%s,\"failed_checks\":%u}\n",bad_tls?"true":"false",failed);
+  return failed?1:0;
+}
+
 #endif
 
 int main(int argc, char **argv) {
@@ -491,6 +569,7 @@ int main(int argc, char **argv) {
   int v2 = !strcmp(argv[6], "positive-v2");
   edr_ingest_http_configure_transport_options(0, 0, 0, 0, v2, "protobuf", v2 ? "zstd" : "none");
 #ifdef EDR_TEST_EXTENDED_EGRESS
+  if (strstr(argv[6], "update-download")) return update_download_scenario(argv[5],!strncmp(argv[6],"wrong-",6));
   if (!strcmp(argv[6], "positive-command")) return command_result_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-pmfe")) return pmfe_receipt_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-journal")) return journal_receipt_scenario(argv[5]);

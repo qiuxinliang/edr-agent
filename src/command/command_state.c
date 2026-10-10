@@ -1724,7 +1724,7 @@ int edr_command_state_task_scope(const char *command_id,EdrEgressTaskScope *out)
   rc=EDR_EGRESS_REQUEST_DENIED;
   if(valid && a->expires_unix_ms<=state_now_ms())rc=EDR_EGRESS_AUTHORIZATION_EXPIRED;
   else if(valid) {
-    cJSON *payload=cJSON_ParseWithLength((const char *)inbox.payload,inbox.payload_len);
+    cJSON *payload=edr_egress_parse_purpose_object(inbox.payload,inbox.payload_len);
     valid=scope_string(payload,"task_id",out->task_id,sizeof(out->task_id)) &&
       scope_string(payload,"artifact_id",out->artifact_id,sizeof(out->artifact_id)) &&
       scope_string(payload,"hash",out->artifact_sha256,sizeof(out->artifact_sha256)) &&
@@ -1734,6 +1734,15 @@ int edr_command_state_task_scope(const char *command_id,EdrEgressTaskScope *out)
       const cJSON *manifest=cJSON_GetObjectItemCaseSensitive(payload,"runtime_manifest_url");
       snprintf(out->upgrade_class,sizeof(out->upgrade_class),"%s",cJSON_IsString(manifest)&&manifest->valuestring[0]?"runtime_bundle":"binary_hot");
     }
+    /* Older task receipts can still own events without download URLs. New
+     * downloads require these exact signed fields at the purpose boundary. */
+    (void)scope_string(payload,"artifact_url",out->artifact_url,sizeof(out->artifact_url));
+    (void)scope_string(payload,"runtime_manifest_url",out->runtime_manifest_url,sizeof(out->runtime_manifest_url));
+    (void)scope_string(payload,"arch",out->architecture,sizeof(out->architecture));
+    int64_t issued=inbox.meta.issued_at_unix_ms;
+    out->execution_authorized=issued>0 && inbox.meta.deadline_ms>0 &&
+      issued<=INT64_MAX-(int64_t)inbox.meta.deadline_ms &&
+      issued+(int64_t)inbox.meta.deadline_ms>state_now_ms();
     if(valid) {
       snprintf(out->command_id,sizeof(out->command_id),"%s",command_id);
       snprintf(out->tenant_id,sizeof(out->tenant_id),"%s",a->tenant_id);
