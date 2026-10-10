@@ -193,25 +193,37 @@ class ReceiverResourcesTest(unittest.TestCase):
             output_path.write_bytes(b"unused signing fixture")
             return subprocess.CompletedProcess(arguments, 0)
 
-        output = io.StringIO()
-        with patch.object(receiver, "openssl_certificates"), \
-             patch.object(receiver, "Receiver", self.database_only_receiver), \
-             patch.object(receiver.subprocess, "run", side_effect=fail_client_with_unused_signing_fixture), \
-             patch.object(receiver, "crash_restart_scenario", side_effect=OSError("private detail")), \
-             patch("sys.argv", ["receiver", "--client", "unused"]), \
-             contextlib.redirect_stdout(output):
-            self.assertEqual(receiver.main(), 1)
-        report = json.loads(output.getvalue())
-        self.assertFalse(report["passed"])
-        self.assertEqual([item["mode"] for item in report["scenarios"]], [
+        original_modes = [
             "positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host",
             "positive-pmfe", "positive-journal", "positive-p0-journal",
-            "positive-command", "positive-crash-restart",
-        ])
-        self.assertTrue(all(item["client_exit"] == 1 for item in report["scenarios"]))
-        self.assertTrue(all(item["received_requests"] == 0 for item in report["scenarios"][:-1]))
-        self.assertEqual(report["scenarios"][-1]["diagnostic"]["stage"], "crash_owner_cleanup")
-        self.assertNotIn("private detail", output.getvalue())
+            "positive-command",
+        ]
+        download_modes = ["positive-update-download-x64", "positive-update-download-arm64",
+                          "wrong-update-download-ca", "wrong-update-download-host"]
+        for flags, expected_modes in (
+            ([], original_modes + download_modes + ["positive-crash-restart"]),
+            (["--exclude-update-download"], original_modes + ["positive-crash-restart"]),
+            (["--update-download-only"], download_modes),
+        ):
+            with self.subTest(flags=flags):
+                output = io.StringIO()
+                with patch.object(receiver, "openssl_certificates"), \
+                     patch.object(receiver, "Receiver", self.database_only_receiver), \
+                     patch.object(receiver.subprocess, "run", side_effect=fail_client_with_unused_signing_fixture), \
+                     patch.object(receiver, "crash_restart_scenario", side_effect=OSError("private detail")), \
+                     patch("sys.argv", ["receiver", "--client", "unused", *flags]), \
+                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(receiver.main(), 1)
+                report = json.loads(output.getvalue())
+                self.assertFalse(report["passed"])
+                self.assertEqual([item["mode"] for item in report["scenarios"]], expected_modes)
+                self.assertTrue(all(item["client_exit"] == 1 for item in report["scenarios"]))
+                for item in report["scenarios"]:
+                    if item["mode"] == "positive-crash-restart":
+                        self.assertEqual(item["diagnostic"]["stage"], "crash_owner_cleanup")
+                    else:
+                        self.assertEqual(item["received_requests"], 0)
+                self.assertNotIn("private detail", output.getvalue())
 
     def test_main_closes_sqlite_before_removing_temporary_databases(self):
         original_connect = sqlite3.connect

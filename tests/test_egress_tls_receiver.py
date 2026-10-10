@@ -18,6 +18,7 @@ import sqlite3
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -563,7 +564,10 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="run historical implementation; regression is expected to fail")
     parser.add_argument("--command-only", action="store_true", help="focus real signed result/renewal delivery without detector fixtures")
     parser.add_argument("--update-download-only", action="store_true", help="focus signed updater downloads through real mTLS transport")
+    parser.add_argument("--exclude-update-download", action="store_true", help="run the original mTLS contracts separately from the updater download contracts")
     args = parser.parse_args()
+    if args.exclude_update_download and args.update_download_only:
+        parser.error("--exclude-update-download and --update-download-only are mutually exclusive")
     with tempfile.TemporaryDirectory(prefix="edr-egress-mtls-") as temporary:
         root = Path(temporary)
         openssl_certificates(root)
@@ -580,7 +584,11 @@ def main():
         if args.update_download_only:
             modes = ("positive-update-download-x64", "positive-update-download-arm64",
                      "wrong-update-download-ca", "wrong-update-download-host")
+        if args.exclude_update_download:
+            modes = tuple(mode for mode in modes if "update-download" not in mode)
         for mode in modes:
+            started = time.monotonic()
+            print(f"mTLS scenario begin: {mode}", file=sys.stderr, flush=True)
             server = Receiver(root, "wrong-host" if mode in ("wrong-host", "wrong-update-download-host") else "server", root / f"receiver-{mode}.db")
             try:
                 environment = os.environ.copy()
@@ -704,6 +712,8 @@ def main():
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
+            print(f"mTLS scenario end: {mode} elapsed_ms={round((time.monotonic() - started) * 1000)} client_exit={result.returncode}",
+                  file=sys.stderr, flush=True)
         if not args.baseline and not args.command_only and not args.update_download_only:
             try:
                 reports.append(crash_restart_scenario(args.client, root))
