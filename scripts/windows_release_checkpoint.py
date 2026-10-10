@@ -26,6 +26,9 @@ UNSIGNED = ("WARNING: This Windows build is unsigned. Windows may show an unknow
             "Platform/Agent signature requirements are not changed by this release.\n")
 BROKEN_SETUP_BASELINE_MIN = (3, 2, 304)
 BROKEN_SETUP_BASELINE_MAX = (3, 2, 341)
+P0_TEST_INPUTS_REPOSITORY = "qiuxinliang/EDRAI"
+P0_TEST_INPUT_FILES = ("p0_rule_bundle_ir_v1.json", "p0_rule_bundle_ir_v1.json.enc",
+                       "sensor_interest_manifest.json")
 
 
 def windows_release_version(tag):
@@ -123,7 +126,77 @@ def source(env=os.environ):
         raise ValueError("Unsupported release mode")
     if result["mode"] == "usb" and result["upgrade_class"] == "binary_hot":
         raise ValueError("USB signing changes runtime identities; use auto or installer_required")
+    ref, sha = env.get("P0_TEST_INPUTS_REF", ""), env.get("P0_TEST_INPUTS_SHA256", "")
+    if ref or sha:
+        if not re.fullmatch(r"[0-9a-f]{40}", ref) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise ValueError("Private P0 test input identity requires a fixed commit and verified SHA256")
+        result["p0_test_inputs"] = dict(repository=P0_TEST_INPUTS_REPOSITORY, commit=ref, sha256=sha)
     return result
+
+
+def verify_p0_test_inputs(directory, ref, expected_sha=""):
+    """Check the private test snapshot before draft/checkpoint reuse; never print rules."""
+    if not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise ValueError("P0_TEST_INPUTS_REF must be a fixed 40-hex commit")
+    checkout = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+    if checkout.returncode or checkout.stdout.strip() != ref:
+        raise ValueError("Private P0 test input checkout does not match the frozen commit")
+    data = {}
+    for name in P0_TEST_INPUT_FILES:
+        path = Path(directory) / name
+        if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 4 * 1024**2:
+            raise ValueError(f"Missing, unsafe or oversized private P0 test input: {name}")
+        data[name] = path.read_bytes()
+    import encrypt_p0_rules as envelope
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    wire, plain = data[P0_TEST_INPUT_FILES[1]], data[P0_TEST_INPUT_FILES[0]]
+    if len(wire) < len(envelope.MAGIC) + envelope.NONCE_LEN + 16 or not wire.startswith(envelope.MAGIC):
+        raise ValueError("Private P0 encrypted test input is not an EDR1 envelope")
+    key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+    try:
+        decoded = AESGCM(key).decrypt(wire[4:4 + envelope.NONCE_LEN], wire[4 + envelope.NONCE_LEN:], None)
+    except Exception as error:
+        raise ValueError("Private P0 test input envelope authentication failed") from error
+    if decoded != plain:
+        raise ValueError("Private P0 plaintext/encrypted test inputs disagree")
+    def unique_object(pairs):
+        value = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("Duplicate private P0 test input JSON field")
+            value[name] = item
+        return value
+    ir = json.loads(plain, object_pairs_hook=unique_object)
+    sensor_raw = data[P0_TEST_INPUT_FILES[2]]
+    sensor = json.loads(sensor_raw, object_pairs_hook=unique_object)
+    if not isinstance(ir, dict) or not isinstance(sensor, dict):
+        raise ValueError("Private P0 test input JSON must contain objects")
+    count = ir.get("rule_count")
+    if (ir.get("kind") != "edr_p0_rule_bundle_ir_v1" or ir.get("ir_schema_version") not in (7, 8) or
+            type(count) is not int or count <= 0 or not isinstance(ir.get("rules"), list) or
+            len(ir["rules"]) != count or sensor.get("kind") != "edr_sensor_interest_manifest" or
+            sensor.get("p0_artifact_rule_count") != count or
+            not ir.get("rules_bundle_version") or sensor.get("rules_bundle_version") != ir["rules_bundle_version"] or
+            sensor.get("p0_artifact_sha256") != hashlib.sha256(plain).hexdigest()):
+        raise ValueError("Private P0 test input IR/SensorInterest identity mismatch")
+    fields = list(re.finditer(rb'"p0_artifact_sha256"\s*:\s*"([0-9a-f]{64})"', sensor_raw))
+    if len(fields) != 1 or ir.get("sensor_interest_manifest_hash_mode") != "raw-json-v1-p0-artifact-sha256-zeroed":
+        raise ValueError("Private P0 test input SensorInterest hash contract is invalid")
+    start, end = fields[0].span(1)
+    paired_sha = hashlib.sha256(sensor_raw[:start] + b"0" * 64 + sensor_raw[end:]).hexdigest()
+    if paired_sha != ir.get("sensor_interest_manifest_sha256"):
+        raise ValueError("Private P0 test input SensorInterest raw binding mismatch")
+    for name, raw in data.items():
+        committed = subprocess.run(["git", "-C", str(directory), "show", f"{ref}:{name}"],
+                                   capture_output=True, timeout=30)
+        if committed.returncode or committed.stdout != raw:
+            raise ValueError(f"Private P0 test input differs from its committed bytes: {name}")
+    hashes = {name: hashlib.sha256(raw).hexdigest() for name, raw in data.items()}
+    sha = hashlib.sha256(json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if expected_sha and sha != expected_sha:
+        raise ValueError("Private P0 test input digest differs from the frozen prepare job")
+    return sha
 
 
 def digest(path):
@@ -424,12 +497,22 @@ def cleanup_published_checkpoints(api, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published"))
+    parser.add_argument("command", choices=("source", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published", "verify-p0-inputs"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
     parser.add_argument("--baseline-tag", default="")
     args = parser.parse_args()
+    if args.command == "verify-p0-inputs":
+        ref = os.environ.get("P0_TEST_INPUTS_REF", "")
+        sha = verify_p0_test_inputs(args.directory, ref, os.environ.get("P0_TEST_INPUTS_SHA256", ""))
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+            stream.write(f"ref={ref}\nsha256={sha}\n")
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+            stream.write(f"P0_TEST_INPUTS_REF={ref}\nP0_TEST_INPUTS_SHA256={sha}\n")
+            stream.write(f"EDR_BACKEND_CONFIG_DIR={args.directory.resolve()}\n")
+        print("Verified private P0 test input snapshot and IR/SensorInterest binding")
+        return
     if args.command == "select-baseline":
         if not args.target_tag:
             parser.error("select-baseline requires --target-tag")

@@ -497,3 +497,14 @@ Real-rule integration tests require an explicit external backend config director
 `-DEDR_P0_TEST_CONFIG_DIR=/path/to/edr-backend/platform/config` for CMake, or
 `EDR_BACKEND_CONFIG_DIR` for the standalone real-IR runner. Windows release gates
 require these inputs. No such inputs are part of production build targets or packages.
+
+The independent Windows release reads the three canonical files from a fixed commit
+in private `qiuxinliang/EDRAI` into `.p0-test-inputs/` for tests:
+`p0_rule_bundle_ir_v1.json`, `p0_rule_bundle_ir_v1.json.enc`, and
+`sensor_interest_manifest.json` at the snapshot root. Configure repository
+variable `P0_TEST_INPUTS_REF` and dedicated read-only deploy-key secret
+`P0_TEST_INPUTS_SSH_KEY`; manual releases can pin `p0_test_inputs_ref` explicitly.
+Preparation freezes that commit and verifies encrypted/plaintext equality plus
+the IR/SensorInterest pair. The input commit and combined SHA256 are retained in
+existing release provenance and checkpoints. Missing or changed inputs fail the
+release; the checkout is never included in installer or update assets.

@@ -42,6 +42,10 @@ on:
           - binary_hot
           - runtime_bundle
           - installer_required
+      p0_test_inputs_ref:
+        description: Fixed private P0 test-input commit (40 hex); defaults to P0_TEST_INPUTS_REF repository variable
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -59,6 +63,7 @@ env:
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_RELEASE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || false }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
+  P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
 
 jobs:
   prepare-release:
@@ -67,8 +72,46 @@ jobs:
     outputs:
       published: ${{ steps.prepare.outputs.published }}
       baseline_tag: ${{ steps.baseline.outputs.baseline_tag }}
+      p0_test_inputs_ref: ${{ steps.freeze-inputs.outputs.ref }}
+      p0_test_inputs_sha256: ${{ steps.p0-inputs.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
+      - name: Freeze private P0 test input commit
+        id: freeze-inputs
+        env:
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          ref = os.environ.get('P0_TEST_INPUTS_REF', '').strip().lower()
+          if not re.fullmatch('[0-9a-f]{40}', ref):
+              raise SystemExit('P0_TEST_INPUTS_REF must name a fixed 40-hex private test-input commit')
+          if not os.environ.get('P0_TEST_INPUTS_SSH_KEY', '').strip():
+              raise SystemExit('P0_TEST_INPUTS_SSH_KEY read-only deploy key is required')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'ref={ref}\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write(f'P0_TEST_INPUTS_REF={ref}\n')
+          PY
+      - name: Read fixed private P0 test inputs
+        uses: actions/checkout@v6
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          repository: qiuxinliang/EDRAI
+          ref: ${{ steps.freeze-inputs.outputs.ref }}
+          ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+          path: .p0-test-inputs
+          persist-credentials: false
+      - name: Install pinned P0 test verification dependency
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --requirement requirements-release.txt
+      - name: Verify private P0 input identity and pair
+        id: p0-inputs
+        run: python3 scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs
       - name: Verify release ownership and checkpoint contracts
         run: |
           python3 tests/test_windows_release_checkpoint.py
@@ -141,6 +184,8 @@ jobs:
       EDR_RUNTIME_IDENTIFIER: ${{ matrix.runtime_identifier }}
       EDR_CMAKE_PROCESSOR: ${{ matrix.cmake_processor }}
       EDR_INCLUDE_WINDIVERT: ${{ matrix.include_windivert }}
+      P0_TEST_INPUTS_REF: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}
+      P0_TEST_INPUTS_SHA256: ${{ needs.prepare-release.outputs.p0_test_inputs_sha256 }}
       WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
       WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
       WINDOWS_SIGNING_SUBJECT: ${{ secrets.WINDOWS_SIGNING_SUBJECT }}
@@ -174,6 +219,28 @@ jobs:
             ${{ runner.tool_cache }}/Python/3.12.10/x64
             ${{ runner.tool_cache }}/Python/3.12.10/x64.complete
           key: ${{ steps.python-cache.outputs.cache-primary-key }}
+      - name: Read frozen private P0 test inputs
+        uses: actions/checkout@v6
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          repository: qiuxinliang/EDRAI
+          ref: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}
+          ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+          path: .p0-test-inputs
+          persist-credentials: false
+      - name: Install pinned P0 test verification dependency
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement .\requirements-release.txt
+          if ($LASTEXITCODE -ne 0) { throw 'P0 test verification dependency installation failed' }
+      - name: Verify frozen private P0 input identity and pair
+        shell: pwsh
+        run: |
+          python scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'P0 test inputs differ from the frozen prepare job' }
       - name: Restore verified same-run package checkpoint
         id: resume
         env:
@@ -187,13 +254,6 @@ jobs:
         if: steps.resume.outputs.restored != 'true'
         with:
           global-json-file: global.json
-      - name: Install pinned P0 encryption dependency
-        if: steps.resume.outputs.restored != 'true'
-        shell: pwsh
-        run: |
-          python --version
-          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement .\requirements-release.txt
-          python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography AESGCM ready')"
       - name: Validate release scripts with Windows PowerShell 5.1
         if: steps.resume.outputs.restored != 'true'
         shell: powershell
@@ -1323,7 +1383,10 @@ jobs:
 
   usb-finalize:
     name: Finalize USB release (one private handoff)
-    needs: windows-build
+    needs: [prepare-release, windows-build]
+    env:
+      P0_TEST_INPUTS_REF: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}
+      P0_TEST_INPUTS_SHA256: ${{ needs.prepare-release.outputs.p0_test_inputs_sha256 }}
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -1403,9 +1466,13 @@ jobs:
   publish-release:
     name: Publish combined Windows Release Bundle
     needs:
+      - prepare-release
       - windows-build
       - windows-lifecycle
       - usb-finalize
+    env:
+      P0_TEST_INPUTS_REF: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}
+      P0_TEST_INPUTS_SHA256: ${{ needs.prepare-release.outputs.p0_test_inputs_sha256 }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

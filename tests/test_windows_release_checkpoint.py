@@ -6,11 +6,14 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import encrypt_p0_rules as envelope
 spec = importlib.util.spec_from_file_location("checkpoint", ROOT / "scripts/windows_release_checkpoint.py")
 cp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cp)
@@ -19,6 +22,107 @@ gate = importlib.util.module_from_spec(gate_spec)
 gate_spec.loader.exec_module(gate)
 SOURCE = dict(tag="win_3.2.999", commit="a" * 40, repository="owner/agent", run_id="1234",
               mode="unsigned", upgrade_class="auto")
+
+
+class PrivateP0InputTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        sensor = dict(kind="edr_sensor_interest_manifest", p0_artifact_rule_count=1,
+                      rules_bundle_version="synthetic", p0_artifact_sha256="0" * 64)
+        raw = lambda value: (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+        ir = dict(kind="edr_p0_rule_bundle_ir_v1", ir_schema_version=8, rule_count=1,
+                  rules=[{"id": "SYNTHETIC"}], rules_bundle_version="synthetic",
+                  sensor_interest_manifest_hash_mode="raw-json-v1-p0-artifact-sha256-zeroed",
+                  sensor_interest_manifest_sha256=hashlib.sha256(raw(sensor)).hexdigest())
+        plain = raw(ir)
+        sensor["p0_artifact_sha256"] = hashlib.sha256(plain).hexdigest()
+        key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+        wire = envelope.aes_256_gcm_encrypt(plain, key)
+        for name, data in zip(cp.P0_TEST_INPUT_FILES, (plain, wire, raw(sensor))):
+            (self.directory / name).write_bytes(data)
+        subprocess.run(["git", "init", "-q", str(self.directory)], check=True)
+        subprocess.run(["git", "-C", str(self.directory), "add", "--", *cp.P0_TEST_INPUT_FILES], check=True)
+        subprocess.run(["git", "-C", str(self.directory), "-c", "user.name=P0 fixture",
+                        "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+                        "commit", "-qm", "synthetic test input"], check=True)
+        self.ref = subprocess.check_output(["git", "-C", str(self.directory), "rev-parse", "HEAD"], text=True).strip()
+
+    def test_exact_snapshot_produces_bound_digest_and_release_source(self):
+        sha = cp.verify_p0_test_inputs(self.directory, self.ref)
+        env = dict(EDR_AGENT_RELEASE_TAG=SOURCE["tag"], GITHUB_SHA=SOURCE["commit"],
+                   GITHUB_REPOSITORY=SOURCE["repository"], GITHUB_RUN_ID=SOURCE["run_id"],
+                   WINDOWS_RELEASE_MODE="unsigned", EDR_UPGRADE_CLASS_OVERRIDE="auto",
+                   P0_TEST_INPUTS_REF=self.ref, P0_TEST_INPUTS_SHA256=sha)
+        bound = cp.source(env)
+        self.assertEqual(bound["p0_test_inputs"], dict(repository="qiuxinliang/EDRAI", commit=self.ref, sha256=sha))
+        api = FakeGitHub()
+        cp.prepare(api, bound)
+        changed = copy.deepcopy(bound)
+        changed["p0_test_inputs"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "another commit"):
+            cp.prepare(api, changed)
+        env.pop("P0_TEST_INPUTS_SHA256")
+        with self.assertRaisesRegex(ValueError, "input identity"):
+            cp.source(env)
+
+    def test_verification_exports_absolute_test_directory_and_frozen_identity(self):
+        output_path, env_path = self.directory / "output.txt", self.directory / "environment.txt"
+        output = io.StringIO()
+        with patch.dict(cp.os.environ, dict(P0_TEST_INPUTS_REF=self.ref, P0_TEST_INPUTS_SHA256="",
+                                          GITHUB_OUTPUT=str(output_path), GITHUB_ENV=str(env_path))), \
+                patch.object(sys, "argv", ["checkpoint", "verify-p0-inputs", "--directory", str(self.directory)]), \
+                patch("sys.stdout", output):
+            cp.main()
+        exported = dict(line.split("=", 1) for line in env_path.read_text(encoding="utf-8").splitlines())
+        self.assertEqual(Path(exported["EDR_BACKEND_CONFIG_DIR"]), self.directory.resolve())
+        self.assertEqual(exported["P0_TEST_INPUTS_REF"], self.ref)
+        self.assertEqual(exported["P0_TEST_INPUTS_SHA256"], cp.verify_p0_test_inputs(self.directory, self.ref))
+        self.assertIn(f"sha256={exported['P0_TEST_INPUTS_SHA256']}", output_path.read_text(encoding="utf-8"))
+        self.assertNotIn("SYNTHETIC", output.getvalue())
+
+    def test_missing_file_and_moving_ref_fail(self):
+        with self.assertRaisesRegex(ValueError, "fixed 40-hex"):
+            cp.verify_p0_test_inputs(self.directory, "main")
+        with self.assertRaisesRegex(ValueError, "frozen commit"):
+            cp.verify_p0_test_inputs(self.directory, "0" * 40)
+        (self.directory / cp.P0_TEST_INPUT_FILES[2]).unlink()
+        with self.assertRaisesRegex(ValueError, "Missing, unsafe"):
+            cp.verify_p0_test_inputs(self.directory, self.ref)
+
+    def test_tampered_envelope_and_mismatched_plaintext_fail(self):
+        path = self.directory / cp.P0_TEST_INPUT_FILES[1]
+        wire = path.read_bytes()
+        path.write_bytes(wire[:-1] + bytes([wire[-1] ^ 1]))
+        with self.assertRaisesRegex(ValueError, "authentication failed"):
+            cp.verify_p0_test_inputs(self.directory, self.ref)
+        path.write_bytes(wire)
+        (self.directory / cp.P0_TEST_INPUT_FILES[0]).write_bytes(b"{}")
+        with self.assertRaisesRegex(ValueError, "plaintext/encrypted"):
+            cp.verify_p0_test_inputs(self.directory, self.ref)
+
+    def test_manifest_mutation_and_prepare_digest_mismatch_fail(self):
+        path = self.directory / cp.P0_TEST_INPUT_FILES[2]
+        original = path.read_bytes()
+        path.write_bytes(original + b" ")
+        with self.assertRaisesRegex(ValueError, "raw binding mismatch"):
+            cp.verify_p0_test_inputs(self.directory, self.ref)
+        path.write_bytes(original)
+        with self.assertRaisesRegex(ValueError, "frozen prepare job"):
+            cp.verify_p0_test_inputs(self.directory, self.ref, "0" * 64)
+
+    def test_coherent_pair_mutation_still_cannot_claim_the_frozen_commit(self):
+        ir_path, wire_path, sensor_path = (self.directory / name for name in cp.P0_TEST_INPUT_FILES)
+        original = ir_path.read_bytes()
+        changed = original + b"\n"
+        ir_path.write_bytes(changed)
+        key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+        wire_path.write_bytes(envelope.aes_256_gcm_encrypt(changed, key))
+        sensor_path.write_bytes(sensor_path.read_bytes().replace(
+            hashlib.sha256(original).hexdigest().encode(), hashlib.sha256(changed).hexdigest().encode()))
+        with self.assertRaisesRegex(ValueError, "committed bytes"):
+            cp.verify_p0_test_inputs(self.directory, self.ref)
 
 
 class FakeGitHub:
@@ -300,6 +404,16 @@ class ReleaseCheckpointTests(unittest.TestCase):
                 cp.verify_checkpoint(self.directory, dict(SOURCE, **{field: value}), "arm64")
         with self.assertRaises(ValueError):
             cp.verify_checkpoint(self.directory, SOURCE, "amd64")
+
+    def test_private_input_identity_remains_bound_to_manifest_and_checkpoint(self):
+        bound = dict(SOURCE, p0_test_inputs=dict(repository="qiuxinliang/EDRAI", commit="b" * 40, sha256="c" * 64))
+        self.bundle(bound)
+        cp.verify_checkpoint(self.directory, bound, "arm64")
+        for field, value in (("commit", "d" * 40), ("sha256", "e" * 64)):
+            changed = copy.deepcopy(bound)
+            changed["p0_test_inputs"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                cp.verify_checkpoint(self.directory, changed, "arm64")
 
     def test_exact_asset_closure_required(self):
         self.bundle()

@@ -57,7 +57,7 @@ RUNTIME_EXPECTED = {
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",
     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
     "webshell_semantic_rules", "pmfe_scan_detail_format", "command_signature_cross_language",
-    "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_rule_ir_record_golden",
+    "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_runtime_delivery", "p0_rule_ir_record_golden",
     "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
 }
@@ -213,7 +213,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     else:
                         verify_sqlite_package_location(cache, include, library)
 
-    def fixture(self, directory, missing_target="", missing_test="", failing_test=""):
+    def fixture(self, directory, missing_target="", missing_test="", failing_test="", p0_inputs_available=True):
         pairs = re.findall(r'^edr_windows_release_gate\((\w+) (\w+|"")\)$',
                            GATE.read_text(encoding="utf-8"), re.MULTILINE)
         self.assertEqual({name for name, _ in pairs}, WINDOWS_EXPECTED)
@@ -231,7 +231,10 @@ class WindowsReleaseGateTests(unittest.TestCase):
         source = Path(directory)
         (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
         lines = ["cmake_minimum_required(VERSION 3.19)", "project(GateFixture C)", "enable_testing()",
-                 "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)"]
+                 "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)",
+                 # This fixture tests scheduling with tiny executables; real
+                 # canonical bytes are verified by the native product tests.
+                 f"set(EDR_P0_TEST_CONFIG_AVAILABLE {'TRUE' if p0_inputs_available else 'FALSE'})"]
         registered_targets = set()
         for name, target in pairs:
             if target != '""' and target != missing_target and target not in registered_targets:
@@ -283,9 +286,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
             result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
             self.assertIn("Windows release gate test is not registered", result.stderr)
 
+    def test_missing_canonical_inputs_fail_before_gate_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, p0_inputs_available=False)
+            result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
+            self.assertIn("Windows release gate requires external canonical P0 inputs", result.stderr)
+
     def test_missing_runtime_target_fails_at_configuration(self):
         for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer",
-                       "test_p0_candidate_replay", "test_ave_parent_integrity"):
+                       "test_p0_candidate_replay", "test_p0_runtime_delivery", "test_ave_parent_integrity"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_target=target)
                 result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
@@ -298,7 +307,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                      "behavior_record_alert_proto_contract", "command_signature_cross_language",
                      "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
                      "windows_rule_semantic_audit", "installer_runtime_health_classification",
-                     "report_events_ack_contract", "ave_parent_integrity")
+                     "report_events_ack_contract", "p0_runtime_delivery", "ave_parent_integrity")
         if os.name != "nt":
             names += ("ave_parent_integrity_mutex",)
         for name in names:

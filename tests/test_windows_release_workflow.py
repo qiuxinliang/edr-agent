@@ -32,7 +32,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('needs: [prepare-release, usb-finalize]', self.jobs['windows-lifecycle'])
         publish = self.jobs['publish-release']
         needs = publish.split('    needs:\n', 1)[1].split('    runs-on:', 1)[0]
-        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['windows-build', 'windows-lifecycle', 'usb-finalize'])
+        self.assertEqual(re.findall(r'^      - ([\w-]+)$', needs, re.M), ['prepare-release', 'windows-build', 'windows-lifecycle', 'usb-finalize'])
         # No always() or job-level condition can bypass implicit successful needs.
         self.assertNotRegex(publish, r'(?m)^    if:')
         self.assertIn('windows-install-upgrade-rollback.yml', self.jobs['windows-lifecycle'])
@@ -57,6 +57,28 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('windows_release_checkpoint.py upload --arch', build)
         self.assertNotIn('gh release upload', build)
         self.assertNotIn('--notes-file', self.jobs['publish-release'])
+
+    def test_private_test_inputs_are_frozen_verified_and_never_persist_credentials(self):
+        prepare, build = self.jobs['prepare-release'], self.jobs['windows-build']
+        self.assertIn("inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF", self.text)
+        self.assertIn("re.fullmatch('[0-9a-f]{40}', ref)", prepare)
+        self.assertIn("P0_TEST_INPUTS_SSH_KEY read-only deploy key is required", prepare)
+        self.assertLess(prepare.index('Freeze private P0'), prepare.index('Read fixed private P0'))
+        self.assertLess(prepare.index('verify-p0-inputs'), prepare.index('windows_release_checkpoint.py prepare'))
+        self.assertLess(build.index('verify-p0-inputs'), build.index('Restore verified same-run package checkpoint'))
+        for job in (prepare, build):
+            checkout = job.split('repository: qiuxinliang/EDRAI', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn('ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', checkout)
+            self.assertIn('path: .p0-test-inputs', checkout)
+            self.assertIn('persist-credentials: false', checkout)
+            self.assertIn('GIT_CONFIG_KEY_0: core.autocrlf', job)
+            self.assertNotIn('USB_SIGNING_TOKEN', checkout)
+        for name in ('windows-build', 'usb-finalize', 'publish-release'):
+            job = self.jobs[name]
+            self.assertIn('P0_TEST_INPUTS_REF: ${{ needs.prepare-release.outputs.p0_test_inputs_ref }}', job)
+            self.assertIn('P0_TEST_INPUTS_SHA256: ${{ needs.prepare-release.outputs.p0_test_inputs_sha256 }}', job)
+        self.assertIn('"-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR"', build)
+        self.assertIn('platform-owned rule data must not be packaged', build)
 
     def test_checkpoint_cleanup_follows_publication_with_scoped_permissions(self):
         publish = self.jobs['publish-release']
@@ -187,7 +209,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                       'packaged forensic builtin hash does not match native-package-integrity.json',
                       'CMS signer thumbprint does not match manifest trust binding',
                       'CMS signer subject does not match manifest trust binding',
-                      'plaintext P0 rules must not be published'):
+                      'platform-owned rule data must not be packaged'):
             self.assertIn(check, build)
         self.assertIn('artifact-manifest.json.p7s', self.jobs['publish-release'])
 
