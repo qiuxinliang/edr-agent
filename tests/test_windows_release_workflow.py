@@ -1,5 +1,6 @@
 """Guard the restored job graph and retained release integrity boundaries."""
 from pathlib import Path
+import json
 import re
 import unittest
 from unittest.mock import patch
@@ -135,6 +136,144 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                         prepare.index('windows_release_checkpoint.py prepare'))
         self.assertIn("--label-regex '^windows-release-gate$'", self.jobs['windows-build'])
 
+    def assert_canonical_p0_test_inputs(self, build):
+        def step(name):
+            return build.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+
+        validation = step('Validate canonical P0 test input configuration')
+        regression = step('Verify private P0 checkout ACL contract')
+        checkout = step('Checkout canonical P0 test inputs')
+        binding = step('Bind canonical P0 test input directory')
+        self.assertIn('P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}', validation)
+        self.assertIn("-cnotmatch '^[0-9a-f]{40}$'", validation)
+        self.assertIn('IsNullOrWhiteSpace($env:P0_TEST_INPUTS_SSH_KEY)', validation)
+        self.assertNotIn('Write-Host $env:P0_TEST_INPUTS_SSH_KEY', validation)
+        self.assertIn('shell: pwsh', regression)
+        self.assertIn('run: .\\tests\\test_private_p0_checkout.ps1', regression)
+        self.assertNotIn('secrets.', regression)
+        self.assertIn('shell: pwsh', checkout)
+        self.assertIn('P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}', checkout)
+        self.assertIn('P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', checkout)
+        self.assertIn('run: .\\scripts\\checkout_private_p0_inputs.ps1 -Directory canonical-p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF', checkout)
+        self.assertNotIn('uses: actions/checkout', checkout)
+        self.assertIn("Join-Path $env:GITHUB_WORKSPACE 'canonical-p0-test-inputs'", binding)
+        self.assertIn('git -C $inputs rev-parse HEAD', binding)
+        self.assertIn('$actualRef -cne $env:P0_TEST_INPUTS_REF', binding)
+        for name in ('p0_rule_bundle_ir_v1.json', 'p0_rule_bundle_ir_v1.json.enc',
+                     'sensor_interest_manifest.json'):
+            self.assertIn(f"'{name}'", binding)
+        self.assertIn('-PathType Leaf', binding)
+        self.assertIn('"EDR_BACKEND_CONFIG_DIR=$inputs"', binding)
+        self.assertIn('-FilePath $env:GITHUB_ENV -Append -Encoding utf8', binding)
+        self.assertLess(build.index('name: Validate canonical P0'), build.index('name: Checkout canonical P0'))
+        self.assertLess(build.index('name: Verify private P0'), build.index('name: Checkout canonical P0'))
+        self.assertLess(build.index('name: Checkout canonical P0'), build.index('name: Bind canonical P0'))
+        self.assertLess(build.index('name: Bind canonical P0'), build.index('name: Configure'))
+        self.assertIn('"-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR"', build)
+        # Private source inputs must never become a downloadable build artifact.
+        for artifact in re.split(r'^      - ', build, flags=re.M):
+            if 'uses: actions/upload-artifact@' not in artifact:
+                continue
+            paths = re.search(r'^          path:(.*?)(?=^          \S|\Z)',
+                              artifact, re.M | re.S)[1]
+            self.assertNotIn('canonical-p0-test-inputs', paths)
+            self.assertNotRegex(paths, r'(?m)^\s*(?:\.|\$\{\{ github.workspace \}\})(?:/\*\*)?\s*$')
+
+    def test_all_windows_build_owners_bind_private_immutable_test_inputs(self):
+        for filename, job_name in (('edr-agent-ci.yml', 'build-windows'),
+                                   ('edr-agent-client-build.yml', 'windows-build')):
+            with self.subTest(workflow=filename):
+                text = (ROOT / '.github/workflows' / filename).read_text(encoding='utf-8')
+                jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+                                       text.split('\njobs:\n', 1)[1], re.M | re.S))
+                self.assert_canonical_p0_test_inputs(jobs[job_name])
+        # The release owner freezes its input identity once in prepare, then
+        # verifies the raw snapshot and pair before checkpoint reuse. Keep its
+        # stronger contract distinct from branch CI's configured input checkout.
+        self.test_private_test_inputs_are_frozen_verified_and_never_persist_credentials()
+        for name in ('Validate canonical P0 test input configuration',
+                     'Checkout canonical P0 test inputs', 'Bind canonical P0 test input directory'):
+            self.assertNotIn(f'- name: {name}\n', self.jobs['windows-build'])
+
+    def test_canonical_input_contract_rejects_mutable_refs_and_product_staging(self):
+        text = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        build = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+                               text.split('\njobs:\n', 1)[1], re.M | re.S))['windows-build']
+        changes = {
+            'mutable ref': ('-Ref $env:P0_TEST_INPUTS_REF', '-Ref main'),
+            'missing immutable check': ("-cnotmatch '^[0-9a-f]{40}$'", '-eq $null'),
+            'unverified checkout owner': ('run: .\\scripts\\checkout_private_p0_inputs.ps1', 'run: git clone'),
+            'private inputs in product': ('-Directory canonical-p0-test-inputs', '-Directory dist'),
+            'private inputs artifact': ('            edr-agent-win-exe.zip', '            canonical-p0-test-inputs/'),
+            'unverified checkout': ('$actualRef -cne $env:P0_TEST_INPUTS_REF', '$false'),
+            'missing native ACL regression': ('run: .\\tests\\test_private_p0_checkout.ps1', 'run: Write-Host skipped'),
+        }
+        for name, (before, after) in changes.items():
+            with self.subTest(case=name):
+                self.assertIn(before, build)
+                with self.assertRaises(AssertionError):
+                    self.assert_canonical_p0_test_inputs(build.replace(before, after, 1))
+
+    def assert_private_p0_checkout_owner(self, source):
+        self.assertIn("$env:OS -ne 'Windows_NT'", source)
+        self.assertIn("$Ref -cnotmatch '^[0-9a-f]{40}$'", source)
+        self.assertIn("'git@github.com:qiuxinliang/EDRAI.git'", source)
+        self.assertIn('[Security.Principal.WindowsIdentity]::GetCurrent().User', source)
+        self.assertIn('$acl.SetOwner($Owner)', source)
+        self.assertIn('$acl.SetAccessRuleProtection($true, $false)', source)
+        self.assertIn('$rule.IdentityReference.Value -ne $Owner.Value', source)
+        self.assertIn('$rule.IsInherited', source)
+        self.assertIn('Assert-P0PrivateAcl $temporary $owner', source)
+        self.assertIn('Set-P0PrivateAcl $file $owner; Assert-P0PrivateAcl $file $owner', source)
+        self.assertIn("'System32\\OpenSSH\\ssh.exe'", source)
+        self.assertIn('github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl', source)
+        for option in ('IdentitiesOnly=yes', 'IdentityAgent=none', 'StrictHostKeyChecking=yes',
+                       'HostKeyAlgorithms=ssh-ed25519', 'UserKnownHostsFile=', 'GlobalKnownHostsFile=',
+                       'ConnectTimeout=15', 'ConnectionAttempts=1'):
+            self.assertIn(option, source)
+        self.assertNotIn('StrictHostKeyChecking=no', source)
+        self.assertNotRegex(source, r'(?m)^\s*[^#\n]*ssh-keyscan')
+        self.assertIn(".Environment.Remove('P0_TEST_INPUTS_SSH_KEY')", source)
+        self.assertIn('$process.WaitForExit($TimeoutSeconds * 1000)', source)
+        self.assertIn('$process.Kill($true)', source)
+        self.assertIn('for ($attempt = 1; $attempt -le 3; $attempt++)', source)
+        self.assertIn("@('checkout', '--quiet', '--detach', 'FETCH_HEAD')", source)
+        cleanup = source.rsplit('  } finally {', 1)[1]
+        self.assertIn('Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction Stop', cleanup)
+        self.assertIn('-not $succeeded -and $createdCheckout', cleanup)
+        self.assertNotIn('Write-Host $env:P0_TEST_INPUTS_SSH_KEY', source)
+
+    def test_private_p0_checkout_has_one_safe_windows_owner(self):
+        source = (ROOT / 'scripts/checkout_private_p0_inputs.ps1').read_text(encoding='utf-8')
+        self.assert_private_p0_checkout_owner(source)
+        for before, after in (
+                ('$acl.SetAccessRuleProtection($true, $false)', '$acl.SetAccessRuleProtection($false, $true)'),
+                ('StrictHostKeyChecking=yes', 'StrictHostKeyChecking=no'),
+                (".Environment.Remove('P0_TEST_INPUTS_SSH_KEY')", ".Environment.Remove('UNRELATED')"),
+                ('Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction Stop', 'Write-Host retained'),
+                ('for ($attempt = 1; $attempt -le 3; $attempt++)', 'while ($true)')):
+            with self.subTest(boundary=before), self.assertRaises(AssertionError):
+                self.assert_private_p0_checkout_owner(source.replace(before, after, 1))
+
+    def test_windows_gates_use_pinned_openssl_before_any_ctest(self):
+        manifest = json.loads((ROOT / 'vcpkg.json').read_text(encoding='utf-8'))
+        openssl = [dependency for dependency in manifest['dependencies']
+                   if isinstance(dependency, dict) and dependency['name'] == 'openssl']
+        self.assertEqual(len(openssl), 1)
+        self.assertIn('tools', openssl[0]['features'])
+        for filename in ('edr-agent-ci.yml', 'edr-agent-client-build.yml', 'edr-agent-client-release.yml'):
+            with self.subTest(workflow=filename):
+                source = (ROOT / '.github/workflows' / filename).read_text(encoding='utf-8')
+                test = source.split('- name: Test\n', 1)[1].split('\n      - ', 1)[0]
+                if filename == 'edr-agent-client-release.yml':
+                    self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\\openssl'", test)
+                else:
+                    self.assertIn("Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\\x64-windows\\tools\\openssl'", test)
+                self.assertIn("-LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf", test)
+                self.assertIn('$env:PATH = "$opensslTools;$env:PATH"', test)
+                self.assertLess(test.index("'openssl.exe'"), test.index('& ctest '))
+                self.assertLess(test.index('$env:PATH ='), test.index('& ctest '))
+
     def assert_native_telemetry_release_gate(self, build):
         step = build.split('- name: Test\n', 1)[1].split('\n      - ', 1)[0]
         self.assertNotIn('continue-on-error:', step)
@@ -241,6 +380,13 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                       'CMS signer subject does not match manifest trust binding',
                       'platform-owned rule data must not be packaged'):
             self.assertIn(check, build)
+        for producer in (build.split('- name: Package (setup exe + runtime zip)\n', 1)[1],
+                         build.split('- name: Prepare release assets\n', 1)[1]):
+            boundary = producer.split('\n      - ', 1)[0]
+            for forbidden in ("'(^|/)p0_rule_[^/]*$'", "'(^|/)sensor_interest_manifest\\.json$'",
+                              "'(^|/)agent_preprocess_rules_v1[^/]*$'"):
+                self.assertIn(forbidden, boundary)
+            self.assertRegex(boundary, r"agent_preprocess_rules_v1\[\^/\]\*\$'\)\s*\{\s*throw\b")
         self.assertIn('artifact-manifest.json.p7s', self.jobs['publish-release'])
 
     def test_usb_finalization_retains_both_retry_boundaries_and_signature_gate(self):

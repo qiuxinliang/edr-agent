@@ -29,6 +29,39 @@ jobs:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v6
+      # Canonical backend rules are immutable integration-test inputs only;
+      # keep this private checkout outside every product/package staging path.
+      - name: Validate canonical P0 test input configuration
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:P0_TEST_INPUTS_REF -cnotmatch '^[0-9a-f]{40}$') { throw 'Configure P0_TEST_INPUTS_REF as the full immutable canonical input commit SHA' }
+          if ([string]::IsNullOrWhiteSpace($env:P0_TEST_INPUTS_SSH_KEY)) { throw 'Configure the read-only P0_TEST_INPUTS_SSH_KEY for canonical integration tests' }
+      - name: Verify private P0 checkout ACL contract
+        shell: pwsh
+        run: .\tests\test_private_p0_checkout.ps1
+      - name: Checkout canonical P0 test inputs
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: .\scripts\checkout_private_p0_inputs.ps1 -Directory canonical-p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
+      - name: Bind canonical P0 test input directory
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputs = Join-Path $env:GITHUB_WORKSPACE 'canonical-p0-test-inputs'
+          $actualRef = & git -C $inputs rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actualRef -cne $env:P0_TEST_INPUTS_REF) { throw 'Canonical P0 input checkout does not match the configured immutable commit' }
+          foreach ($name in @('p0_rule_bundle_ir_v1.json', 'p0_rule_bundle_ir_v1.json.enc', 'sensor_interest_manifest.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $inputs $name) -PathType Leaf)) { throw "Missing canonical P0 integration test input: $name" }
+          }
+          "EDR_BACKEND_CONFIG_DIR=$inputs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
@@ -298,6 +331,9 @@ jobs:
       - name: Test
         shell: pwsh
         run: |
+          $opensslTools = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\x64-windows\tools\openssl'
+          if (-not (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf)) { throw 'Pinned vcpkg OpenSSL executable is required for isolated TLS gate fixtures' }
+          $env:PATH = "$opensslTools;$env:PATH"
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Client build gate tests failed" }
 
