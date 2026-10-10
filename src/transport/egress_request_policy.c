@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,7 +60,9 @@ int edr_egress_upload_preflight(const char *command_id, const char *upload_id,
   return 0;
 }
 
-typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON, H_PROFILE } HealthType;
+typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON, H_PROFILE,
+  H_PROTOCOL, H_UINT, H_UPDATE_PROTOCOL, H_UPDATE_SOURCE, H_UPDATE_VERSION,
+  H_SHA256, H_UPDATE_ERROR, H_INSTALLER_REASON } HealthType;
 typedef struct { const char *path; HealthType type; } HealthField;
 #define N(p) {"engine_health." p, H_NUMBER}
 #define B(p) {"engine_health." p, H_BOOL}
@@ -96,9 +99,12 @@ static const HealthField health_fields[] = {
   N("communication.enterprise.protocol.control_stream_lease_deadline_unix_ms"),
   N("communication.enterprise.protocol.control_stream_lease_expired"),
   S("communication.enterprise.protocol.control_stream_status"),
+  {"engine_health.communication.enterprise.protocol.negotiated_protocol", H_PROTOCOL},
   B("communication.enterprise.protocol.long_poll_ready"),
   N("communication.enterprise.protocol.long_poll_last_success_unix_ms"),
   N("communication.enterprise.protocol.long_poll_last_failure_unix_ms"),
+  B("command_delivery.executor.started"),
+  {"engine_health.command_delivery.executor.live_workers", H_UINT},
   N("event_delivery.post_ok_count"), N("event_delivery.post_ok_body_bytes"),
   N("event_delivery.post_attempt_body_bytes"),
   N("event_bus.capacity"), N("event_bus.used"), N("event_bus.p0_reserved"),
@@ -318,10 +324,52 @@ static int valid_value(const cJSON *v, HealthType type) {
   if (type == H_PROFILE) return cJSON_IsString(v) && v->valuestring &&
       (!strcmp(v->valuestring, "basic") || !strcmp(v->valuestring, "diagnostic"));
   if (type == H_BOOL) return cJSON_IsBool(v);
-  if (type == H_NUMBER) return cJSON_IsNumber(v) && isfinite(v->valuedouble) &&
-      v->valuedouble >= 0 && v->valuedouble < 9007199254740992.0 && floor(v->valuedouble) == v->valuedouble;
+  if (type == H_NUMBER || type == H_UINT || type == H_UPDATE_PROTOCOL) {
+    double max = type == H_UINT ? (double)UINT_MAX :
+        type == H_UPDATE_PROTOCOL ? (double)INT_MAX : 9007199254740991.0;
+    return cJSON_IsNumber(v) && isfinite(v->valuedouble) && v->valuedouble >= 0 &&
+        v->valuedouble <= max && floor(v->valuedouble) == v->valuedouble;
+  }
   if (type == H_TOKEN) return token(v, 160u);
+  if (type == H_UPDATE_VERSION) return token(v, 64u);
   if (!cJSON_IsString(v) || !v->valuestring) return 0;
+  if (type == H_PROTOCOL) return !strcmp(v->valuestring, "h2") ||
+      !strcmp(v->valuestring, "http/1.1") || !strcmp(v->valuestring, "");
+  if (type == H_SHA256) {
+    size_t len = strlen(v->valuestring);
+    if (!len) return 1; /* Unavailable owners report an empty commitment. */
+    if (len != 64u) return 0;
+    for (size_t i = 0; i < len; ++i)
+      if (!isxdigit((unsigned char)v->valuestring[i])) return 0;
+    return 1;
+  }
+  if (type == H_UPDATE_SOURCE) {
+    static const char *const sources[] = {"", "embedded", "installed_sidecar",
+      "configured_sidecar", "unavailable", "unsupported"};
+    return listed(v->valuestring, sources, sizeof(sources) / sizeof(sources[0]));
+  }
+  if (type == H_UPDATE_ERROR || type == H_INSTALLER_REASON) {
+    /* Closed causes emitted by agent_update_command/full_installer_readiness.
+     * Unknown diagnostics must remain nonempty: the consumer treats empty
+     * updater_error_code as success and one exact baseline cause as repairable. */
+    static const char *const errors[] = {"", "detail_available_locally", "non_windows",
+      "updater_unavailable", "embedded_module_unavailable", "embedded_resource_lookup_failed",
+      "embedded_resource_read_failed", "embedded_resource_hash_failed", "embedded_module_path_failed",
+      "embedded_module_directory_failed", "embedded_materialized_path_too_long",
+      "embedded_temporary_path_too_long", "embedded_output_path_too_long",
+      "embedded_materialize_open_failed", "embedded_materialize_commit_failed",
+      "embedded_materialized_hash_mismatch", "installed_sidecar_unreadable",
+      "configured_sidecar_unreadable", "embedded_and_sidecar_missing"};
+    static const char *const baseline[] = {"ready", "platform_unsupported",
+      "updater_protocol_below_full_installer_baseline", "installation_directory_unavailable",
+      "probe_dependencies_unavailable", "installation_baseline_missing_FDSensor.exe",
+      "installation_baseline_missing_agent.toml", "installation_baseline_missing_unins000.exe",
+      "installation_baseline_missing_unins000.dat", "agent_config_unreadable",
+      "uninstaller_provenance_missing_or_mismatch", "current_module_identity_mismatch",
+      "installation_identity_mismatch", "installation_identity_conflict"};
+    return listed(v->valuestring, errors, sizeof(errors) / sizeof(errors[0])) ||
+        (type == H_INSTALLER_REASON && listed(v->valuestring, baseline, sizeof(baseline) / sizeof(baseline[0])));
+  }
   if (type == H_REASON) return health_reason(v->valuestring);
   return listed(v->valuestring, statuses, sizeof(statuses) / sizeof(statuses[0]));
 }
@@ -329,6 +377,15 @@ static int valid_value(const cJSON *v, HealthType type) {
 /* Capability names and leaf fields are both closed sets. They describe local
  * runtime availability, not a permission to send command results/artifacts. */
 static int capability_field(const char *path, HealthType *type) {
+  /* The upgrade dispatcher and completion owner consume these attestations.
+   * They do not authorize result payloads or apply to other command manifests. */
+  static const HealthField upgrade_fields[] = {
+    {"updater_source", H_UPDATE_SOURCE}, {"updater_version", H_UPDATE_VERSION},
+    {"updater_sha256", H_SHA256}, {"updater_protocol_version", H_UPDATE_PROTOCOL},
+    {"updater_materialized", H_BOOL}, {"updater_error_code", H_UPDATE_ERROR},
+    {"runtime_identity_sha256", H_SHA256}, {"full_installer_ready", H_BOOL},
+    {"full_installer_reason", H_INSTALLER_REASON}
+  };
   static const char *const features[] = {"pcre2", "yara", "shellcode_network", "webshell", "pmfe",
     "onnxruntime", "sqlite", "http2", "zstd", "velociraptor", "artifact_upload", "command_signing"};
   static const char *const commands[] = {"isolate_host", "restore_host", "kill_process", "rtq_execute",
@@ -350,6 +407,10 @@ static int capability_field(const char *path, HealthType *type) {
   char name[64]; memcpy(name, p, (size_t)(dot - p)); name[dot - p] = 0;
   if (!listed(name, names, count)) return 0;
   ++dot;
+  if (names == commands && !strcmp(name, "agent_update_v1")) {
+    for (size_t i = 0; i < sizeof(upgrade_fields) / sizeof(upgrade_fields[0]); ++i)
+      if (!strcmp(dot, upgrade_fields[i].path)) { *type = upgrade_fields[i].type; return 1; }
+  }
   if (strcmp(dot, "code_supported") == 0 || strcmp(dot, "build_supported") == 0 ||
       strcmp(dot, "policy_enabled") == 0 || strcmp(dot, "rules_ready") == 0 ||
       strcmp(dot, "artifact_upload_required") == 0 || strcmp(dot, "request_signing_configured") == 0) {
@@ -364,35 +425,6 @@ static int field_type(const char *path, HealthType *type) {
     if (strcmp(path, health_fields[i].path) == 0) { *type = health_fields[i].type; return 1; }
   }
   return capability_field(path, type);
-}
-static int duplicate_keys(const cJSON *v) {
-  const cJSON *a, *b;
-  cJSON_ArrayForEach(a, v) {
-    if (cJSON_IsObject(v)) for (b = a->next; b; b = b->next)
-      if (a->string && b->string && strcmp(a->string, b->string) == 0) return 1;
-    if (duplicate_keys(a)) return 1;
-  }
-  return 0;
-}
-static cJSON *parse_body(const void *body, size_t len) {
-  if (!body || !len || len > EDR_EGRESS_BATCH_WIRE_MAX_BYTES) return NULL;
-  const unsigned char *bytes = body;
-  if (memchr(body, 0, len)) return NULL;
-  /* cJSON exposes C strings. A decoded NUL would conceal a key/value suffix
-   * from every whitelist comparison while the original bytes still leave. */
-  for (size_t i = 0; i < len; ++i) {
-    if (bytes[i] != '\\' || i + 1u >= len) continue;
-    if (bytes[i + 1u] == 'u' && i + 5u < len && !memcmp(bytes + i + 2u, "0000", 4u)) return NULL;
-    ++i; /* An escaped backslash is literal, not a following Unicode escape. */
-  }
-  char *copy = malloc(len + 1u);
-  if (!copy) return NULL;
-  memcpy(copy, body, len); copy[len] = 0;
-  const char *end = NULL;
-  cJSON *root = cJSON_ParseWithLengthOpts(copy, len + 1u, &end, 1);
-  if (!cJSON_IsObject(root) || end != copy + len || duplicate_keys(root)) { cJSON_Delete(root); root = NULL; }
-  free(copy);
-  return root;
 }
 static int validate_health_node(const cJSON *v, const char *path, unsigned depth) {
   if (depth > 10u) return 0;
@@ -411,6 +443,12 @@ static int validate_health_node(const cJSON *v, const char *path, unsigned depth
 }
 static cJSON *project_node(const cJSON *v, const char *path, unsigned depth, int *allocation_failed) {
   if (depth > 10u) return NULL;
+  HealthType type;
+  if (field_type(path, &type) && (type == H_UPDATE_ERROR || type == H_INSTALLER_REASON)) {
+    cJSON *out = cJSON_CreateString(valid_value(v, type) ? v->valuestring : "detail_available_locally");
+    if (!out) *allocation_failed = 1;
+    return out;
+  }
   if (cJSON_IsObject(v)) {
     cJSON *out = cJSON_CreateObject();
     if (!out) { *allocation_failed = 1; return NULL; }
@@ -427,7 +465,6 @@ static cJSON *project_node(const cJSON *v, const char *path, unsigned depth, int
     if (!out->child) { cJSON_Delete(out); return NULL; }
     return out;
   }
-  HealthType type;
   if (!field_type(path, &type)) return NULL;
   cJSON *out = NULL;
   if (type == H_REASON && cJSON_IsString(v))
@@ -517,7 +554,7 @@ char *edr_egress_health_project(const char *body, char *reason, size_t cap) {
   int allocation_failed = 0;
   if (reason && cap) reason[0] = 0;
   if (!body || strlen(body) > 131072u) { deny(reason, cap, "health_input_limit"); return NULL; }
-  cJSON *root = parse_body(body, strlen(body));
+  cJSON *root = edr_egress_parse_purpose_object(body, strlen(body));
   cJSON *out = cJSON_CreateObject();
   if (!out) allocation_failed = 1;
   if (!root || !out || !identities(root) || cJSON_GetObjectItemCaseSensitive(root, "engine_health_update")) goto fail;
@@ -882,7 +919,7 @@ done:
   return wire;
 }
 static int validate_upgrade_event(const void *body,size_t len,const char *tenant,const char *endpoint,char *reason,size_t cap) {
-  cJSON *root=parse_body(body,len);
+  cJSON *root=edr_egress_parse_purpose_object(body,len);
   const cJSON *command=cJSON_GetObjectItemCaseSensitive(root,"command_id");
   EdrEgressTaskScope scope;
   int rc=cJSON_IsString(command)?edr_egress_task_preflight(EDR_EGRESS_UPGRADE_EVENT,command->valuestring,&scope):EDR_EGRESS_REQUEST_DENIED;
@@ -957,7 +994,7 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   if (batch && content_type && strcmp(content_type, "application/x-protobuf") == 0)
     return validate_proto_batch(body, len,tenant,endpoint, reason, cap);
   if (!content_type || strcmp(content_type, "application/json")) return deny(reason, cap, "egress_content_type_denied");
-  cJSON *root = parse_body(body, len);
+  cJSON *root = edr_egress_parse_purpose_object(body, len);
   if (!root) return deny(reason, cap, "egress_json_invalid");
   const cJSON *request_endpoint=cJSON_GetObjectItemCaseSensitive(root,"endpoint_id");
   const cJSON *request_tenant=cJSON_GetObjectItemCaseSensitive(root,"tenant_id");

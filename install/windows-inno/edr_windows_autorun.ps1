@@ -383,7 +383,7 @@ namespace FDSecurity {
   }
   # Optional local observation only; clear stale inherited values when the
   # administrator removes the machine-scoped, bounded validation session.
-  foreach (`$traceEnv in @("EDR_VALIDATION_TRACE_PATH", "EDR_VALIDATION_TRACE_IMAGE")) {
+  foreach (`$traceEnv in @("EDR_VALIDATION_TRACE_PATH", "EDR_VALIDATION_TRACE_IMAGE", "EDR_VALIDATION_TRACE_PURPOSE")) {
     [Environment]::SetEnvironmentVariable(`$traceEnv,
       [Environment]::GetEnvironmentVariable(`$traceEnv, "Machine"), "Process")
   }

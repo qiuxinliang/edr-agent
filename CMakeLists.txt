@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 cmake_policy(SET CMP0091 NEW)
 project(edr_agent
-  VERSION 0.1.0
+  VERSION 3.2.642
   DESCRIPTION "EDR endpoint agent"
   LANGUAGES C CXX
 )
@@ -920,6 +920,7 @@ add_library(edr_egress_policy STATIC
   src/command/sha256.c
   src/transport/egress_batch_policy.c
   src/transport/egress_request_policy.c
+  src/transport/egress_purpose_json.c
   src/proto/edr/v1/event.pb.c
   third_party/nanopb/pb_common.c
   third_party/nanopb/pb_encode.c
@@ -944,6 +945,8 @@ if(EDR_WITH_ZSTD AND EDR_ZSTD_AVAILABLE)
 endif()
 add_library(edr_validation_trace STATIC src/core/validation_trace.c src/command/sha256.c)
 target_include_directories(edr_validation_trace PUBLIC include)
+target_compile_definitions(edr_validation_trace PUBLIC
+  "EDR_AGENT_VERSION_STRING=\"${EDR_AGENT_VERSION_STRING}\"")
 edr_apply_common_warnings(edr_validation_trace)
 if(WIN32)
   target_link_libraries(edr_validation_trace PUBLIC advapi32)

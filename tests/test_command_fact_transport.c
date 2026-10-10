@@ -101,6 +101,60 @@ static void assert_retained_wire(const char *path, const char *sql,
   sqlite3_finalize(st); sqlite3_close(db);
 }
 
+static void deferred_parent_state_restart(void) {
+  for (uint8_t state = EDR_PARENT_PID_EXPLICIT_ZERO; state <= EDR_PARENT_PID_CONFLICT; ++state) {
+    char path[512], key[65], selected[65], rule[64];
+    char *snapshot = NULL; size_t size = 0;
+    uint8_t *retained = NULL; size_t retained_size = 0;
+    EdrBehaviorRecord *source = calloc(1, sizeof(*source));
+    EdrBehaviorRecord *restored = calloc(1, sizeof(*restored));
+    EdrP0RuleIrBinding binding = {0}, decoded_binding;
+    assert(source && restored);
+    temp_file(path); identity(source, 9001u);
+    strcpy(source->event_id, "deferred-parent-state-event");
+    source->parent_pid_state = state;
+    source->ppid = state == EDR_PARENT_PID_CONFLICT ? 299u : 0u;
+    strcpy(binding.rules_bundle_version, "synthetic-parent-state-r1");
+    memset(binding.artifact_sha256, 'a', 64u);
+    assert(edr_p0_deferred_snapshot_encode(source, &binding, "R-TEST-PARENT-STATE", &snapshot, &size));
+    assert(strstr(snapshot, "\"schema\":4"));
+    assert(edr_sha256_hex((const uint8_t *)snapshot, size, key) == 0);
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_retain(key, 1u, (const uint8_t *)snapshot, size) == EDR_OK);
+    edr_storage_queue_close();
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_peek(1u, selected, &retained, &retained_size) == 1);
+    assert(!strcmp(key, selected) && retained_size == size && !memcmp(retained, snapshot, size));
+    assert(edr_p0_deferred_snapshot_decode((const char *)retained, retained_size,
+        restored, &decoded_binding, rule, sizeof(rule)));
+    assert(restored->parent_pid_state == state && restored->ppid == source->ppid);
+    assert(!strcmp(rule, "R-TEST-PARENT-STATE") &&
+        !strcmp(decoded_binding.artifact_sha256, binding.artifact_sha256));
+    free(retained); retained = NULL;
+    /* Replace only the older reader's unsupported-schema verdict. The fail
+     * transition, restart, digest/owner retention and selection are real C
+     * SQLite code. This does not claim execution of an older Windows binary. */
+    assert(edr_storage_queue_p0_deferred_fail(key, "snapshot_invalid_or_unsupported") == EDR_OK);
+    edr_storage_queue_close();
+    assert(edr_storage_queue_open(path) == EDR_OK);
+    assert(edr_storage_queue_p0_deferred_contains(key) == 1);
+    assert_retained_wire(path, "SELECT payload FROM p0_deferred_match WHERE key_sha256=?;",
+        (const uint8_t *)snapshot, size, key);
+    assert(sql_number(path, "SELECT COUNT(*) FROM p0_deferred_match WHERE state='failed' AND "
+        "last_error='snapshot_invalid_or_unsupported' AND key_sha256=payload_sha256 AND "
+        "completed_at=0 AND terminal_reason='';") == 1);
+    assert(edr_storage_queue_p0_deferred_peek(1u, selected, &retained, &retained_size) == 0);
+    assert(!retained && !retained_size && !selected[0]);
+    unsigned before = delivered;
+    edr_storage_queue_poll_drain();
+    assert(delivered == before && edr_storage_queue_pending_count() == 0);
+    assert(sql_number(path, "SELECT COUNT(*) FROM event_queue;") == 0);
+    edr_storage_queue_close(); cleanup(path);
+    printf("deferred parent state=%u restart=exact unsupported=failed_retained no_delivery=1\n", state);
+    free(snapshot); free(source); free(restored);
+  }
+}
+
 #ifdef EDR_P0_TEST_REAL_IR
 /* Capture the real producer's immutable queue body, rather than constructing
  * a provenance string. The decoder only borrows that producer's alert for the
@@ -173,6 +227,29 @@ static void authorize_replayed_match(EdrBehaviorRecord *record, const EdrCommand
 }
 #endif
 
+#ifdef EDR_P0_TEST_REAL_IR
+static void verify_cookie_command_generation(void) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);identity(r,9701);
+  r->type=EDR_EVENT_FILE_READ;r->event_time_ns=INT64_C(1790152545794514400);
+  strcpy(r->event_id,"cookie-generation");strcpy(r->process_name,"mimikatz.exe");
+  strcpy(r->exe_path,"C:\\Tools\\mimikatz.exe");
+  strcpy(r->file_path,"C:\\Lab\\Cookies");strcpy(r->cmdline,"mimikatz.exe");
+  const char *command="mimikatz.exe \"dpapi::chrome /in:C:\\Lab\\Cookies /unprotect\"";
+  assert(edr_local_evidence_cache_save_command_fact(r,command)==0);
+  edr_behavior_mark_source_truncated(r,"source.cmdline");
+  char *complete=edr_local_evidence_cache_read_command_fact(r);assert(complete);
+  EdrCommandFacts facts={complete,NULL};assert(has_rule(r,&facts,"R-CRED-017"));free(complete);
+  /* A reused PID must not borrow the old full operation or object argument. */
+  for(int variant=0;variant<2;variant++) {
+    if(variant==0) r->process_start_key++; else r->process_creation_filetime_100ns++;
+    complete=edr_local_evidence_cache_read_command_fact(r);assert(!complete);
+    facts.subject=complete;assert(!has_rule(r,&facts,"R-CRED-017"));
+    if(variant==0) r->process_start_key--; else r->process_creation_filetime_100ns--;
+  }
+  free(r);puts("Cookie operation: real SQLite command owner accepts same generation; rejects reused PID start key and birth");
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifndef EDR_P0_TEST_REAL_IR
   if (argc == 2) {
@@ -199,6 +276,9 @@ int main(int argc, char **argv) {
   child->type = EDR_EVENT_FILE_READ; child->ppid = parent->pid;
   child->parent_process_start_key = parent->process_start_key;
   child->parent_process_creation_filetime_100ns = parent->process_creation_filetime_100ns;
+  /* This fixture starts after the native parent lifetime proof. The separate
+   * parent-binding regression exercises that proof and denial itself. */
+  strcpy(child->parent_resolution_source, "live_parent_generation");
   AVEBehaviorAlert bare_alert = {0};
   bare_alert.pid = child->pid; bare_alert.ppid = child->ppid; bare_alert.timestamp_ns = child->event_time_ns;
   bare_alert.anomaly_score = 0.91f;
@@ -206,6 +286,7 @@ int main(int argc, char **argv) {
 #ifdef EDR_P0_TEST_REAL_IR
   edr_p0_rule_test_set_file_read_collector_healthy(1);
   edr_p0_rule_test_reset_dedup();
+  verify_cookie_command_generation();
 #endif
   const size_t sizes[] = {8191u, 8192u, 12717u, EDR_PROCESS_COMMAND_FACT_CAP - 1u};
   for (size_t k = 0; k < sizeof(sizes)/sizeof(sizes[0]); ++k) {
@@ -240,7 +321,12 @@ int main(int argc, char **argv) {
     assert(fact && strlen(fact) == n && !strcmp(command, fact)); free(fact);
     /* Empty and nonempty preview must both resolve through the production
      * parent reference, even after the process-tree hot cache is gone. */
-    strcpy(child->cmdline, "inert.exe"); strcpy(child->parent_cmdline, "inert.exe");
+    strcpy(child->cmdline, "inert.exe");
+    /* Exercise a real cached full-fact restore after a preview cuts UTF-8
+     * at the legacy boundary, rather than only replacing a short ASCII stub. */
+    size_t preview_size = n < sizeof(child->parent_cmdline) ? n : sizeof(child->parent_cmdline) - 1u;
+    memcpy(child->parent_cmdline, command, preview_size);
+    child->parent_cmdline[preview_size] = 0;
     edr_behavior_mark_source_truncated(child, "source.cmdline");
     edr_behavior_mark_source_truncated(child, "source.parent_cmdline");
     if (n == 12717u) {
@@ -255,6 +341,11 @@ int main(int argc, char **argv) {
       assert(edr_pt_cache_put_generation(parent->pid, 0u, parent->process_name,
           parent->cmdline, "C:/test/inert-parent.exe", NULL, birth,
           parent->process_start_key, parent->process_creation_filetime_100ns) == 0);
+      uint64_t child_birth = (child->process_creation_filetime_100ns - UINT64_C(116444736000000000)) * 100u;
+      /* Prove this exact parent remained alive through the child's creation;
+       * an inferred cache interval is not authority for a parent-text edge. */
+      assert(edr_pt_cache_mark_alive_generation(parent->pid, parent->process_start_key,
+          parent->process_creation_filetime_100ns, child_birth) == 0);
       edr_local_evidence_cache_observe_process(parent);
       edr_local_evidence_cache_observe_process(child);
       assert(edr_local_evidence_cache_process_tree_generation_json(parent->pid, parent->endpoint_id,
@@ -352,7 +443,8 @@ int main(int argc, char **argv) {
     assert(sql_number(queue, "SELECT COUNT(*) FROM event_queue;") == 0);
     /* The transport positive has an actual full-command predicate: the
      * encoded-command token at the tail must survive local/deferred replay.
-     * Its unrelated parent command remains local, outside the projection. */
+     * IR8 explicitly requests the independently bound parent's full command
+     * through parent_context; it is retained without changing detection. */
     snapshot_rule = "R-EXEC-001";
     child->type = EDR_EVENT_PROCESS_CREATE;
     strcpy(child->process_name, "powershell.exe");
@@ -383,9 +475,13 @@ int main(int argc, char **argv) {
     assert(pb_decode(&input, edr_v1_BehaviorEvent_fields, decoded));
     assert(!strcmp(decoded->cmdline, command));
 #ifdef EDR_P0_TEST_REAL_IR
-    assert(expected_size > n && expected_size < n*2);
+    assert(expected_size > n*2);
     assert(decoded->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION);
-    assert(!decoded->process_context.parent_cmdline[0] && !decoded->behavior_alert.cmdline[0]);
+    assert(decoded->required_evidence_fields == (EDR_EVIDENCE_COMMAND |
+        EDR_EVIDENCE_USER | EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH |
+        EDR_EVIDENCE_PARENT_COMMAND));
+    assert(!strcmp(decoded->process_context.parent_cmdline, command));
+    assert(!decoded->behavior_alert.cmdline[0]);
 #else
     assert(expected_size > n*2 && !strcmp(decoded->process_context.parent_cmdline, command));
 #endif
@@ -542,5 +638,6 @@ int main(int argc, char **argv) {
   edr_local_evidence_cache_close();
   cleanup(db); cleanup(queue);
   free(parent); free(child); free(decoded); free(command);
+  deferred_parent_state_restart();
   return 0;
 }

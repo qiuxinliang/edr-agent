@@ -1302,6 +1302,8 @@ typedef struct {
   unsigned long pid;
   unsigned long epid;
   unsigned long ppid;
+  uint8_t parent_pid_state;
+  uint8_t has_ppid;
   unsigned long dport;
   unsigned long sport;
   int has_img;
@@ -1615,6 +1617,30 @@ static unsigned long parse_ulong_auto(const char *val) {
   return strtoul(val, NULL, 0);
 }
 
+static void parse_parent_pid(Etw1Fields *f, const char *value) {
+  char *end = NULL;
+  unsigned long long parsed;
+  uint8_t state;
+  if (!value || !value[0] || value[0] == '-' || value[0] == '+' ||
+      isspace((unsigned char)value[0])) {
+    parsed = 0u; state = EDR_PARENT_PID_INVALID;
+  } else {
+    errno = 0;
+    parsed = strtoull(value, &end, 0);
+    state = errno || !end || end == value || *end || parsed > UINT32_MAX
+        ? EDR_PARENT_PID_INVALID
+        : parsed ? EDR_PARENT_PID_KNOWN : EDR_PARENT_PID_EXPLICIT_ZERO;
+    if (state == EDR_PARENT_PID_INVALID) parsed = 0u;
+  }
+  if (!f->has_ppid) {
+    f->ppid = (unsigned long)parsed; f->parent_pid_state = state; f->has_ppid = 1u;
+  } else if (f->parent_pid_state != state || f->ppid != parsed) {
+    /* Preserve the first complete fact; conflicting aliases do not win by
+     * payload ordering and cannot authorize parent predicates. */
+    f->parent_pid_state = EDR_PARENT_PID_CONFLICT;
+  }
+}
+
 static int detail_token_value(const char *text, const char *key, char *out, size_t cap) {
   if (!text || !key || !out || cap == 0u) {
     return 0;
@@ -1741,7 +1767,7 @@ static void apply_kv(Etw1Fields *f, const char *key, const char *val) {
   } else if (strcmp(key, "hint_pid") == 0) {
     f->epid = parse_ulong_auto(val);
   } else if (strcmp(key, "ppid") == 0) {
-    f->ppid = parse_ulong_auto(val);
+    parse_parent_pid(f, val);
   } else if (strcmp(key, "user") == 0 || strcmp(key, "username") == 0) {
     (void)etw1_copy_text(f, f->user, sizeof(f->user), val, EDR_ETW_TRUNC_USERNAME);
   } else if (strcmp(key, "user_sid") == 0 || strcmp(key, "target_user_sid") == 0) {
@@ -2214,9 +2240,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.epid) {
       r->pid = (uint32_t)ef.epid;
     }
-    if (ef.ppid) {
-      r->ppid = (uint32_t)ef.ppid;
-    }
+    r->ppid = (uint32_t)ef.ppid;
+    r->parent_pid_state = ef.parent_pid_state;
     if (ef.has_img) {
       (void)copy_record_source_text(r, r->exe_path, sizeof(r->exe_path), ef.img, "exe_path");
       (void)copy_record_source_text(r, r->process_name, sizeof(r->process_name),
@@ -2550,5 +2575,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     r->cmdline[n] = '\0';
   }
 
+  if (r->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+      r->parent_pid_state == EDR_PARENT_PID_INVALID)
+    edr_behavior_clear_parent_context(r);
   apply_mitre_hints(r);
 }

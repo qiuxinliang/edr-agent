@@ -30,7 +30,7 @@ static int create_fixture(void) {
 #endif
 }
 
-static int write_bundle(unsigned schema, const char *event, const char *condition) {
+static int write_bundle_effect(unsigned schema, const char *event, const char *condition, const char *effect) {
   FILE *file = fopen(s_path, "wb");
   if (!file) return 0;
   int wrote = fprintf(file,
@@ -38,10 +38,14 @@ static int write_bundle(unsigned schema, const char *event, const char *conditio
       "\"rules_bundle_version\":\"exclusion-contract\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
-      "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"test\",\"event_type\":\"%s\",\"condition\":%s}]}",
-      schema, event, condition);
+      "\"rules\":[{\"effect\":\"%s\",\"id\":\"test\",\"event_type\":\"%s\",\"condition\":%s}]}",
+      schema, effect, event, condition);
   int closed = fclose(file);
   return wrote > 0 && closed == 0;
+}
+
+static int write_bundle(unsigned schema, const char *event, const char *condition) {
+  return write_bundle_effect(schema, event, condition, "security_alert");
 }
 
 static int load_rule(const char *event, const char *condition) {
@@ -69,6 +73,8 @@ static int matches(const EdrBehaviorRecord *record, int expected, const char *la
 static void record_init(EdrBehaviorRecord *record, EdrEventType type) {
   edr_behavior_record_init(record);
   record->type = type;
+  record->ppid = 21u;
+  record->parent_pid_state = EDR_PARENT_PID_KNOWN;
   record->net_dport = 1080u;
   snprintf(record->process_name, sizeof(record->process_name), "reader.exe");
   snprintf(record->parent_name, sizeof(record->parent_name), "launcher.exe");
@@ -342,10 +348,73 @@ static int candidate_contract(void) {
   return 1;
 }
 
+static int parent_predicate_states(void) {
+ const char *conditions[]={
+  "{\"process_name_in\":[\"tool.exe\"],\"parent_name_in\":[\"launcher.exe\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"parent_name_not_in\":[\"other.exe\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"parent_name_regex_any\":[\"^launcher\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"parent_name_not_regex_any\":[\"^other\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"process_chain_depth_gt\":1}"};
+ for(unsigned schema=7;schema<=8;schema++) for(unsigned i=0;i<sizeof(conditions)/sizeof(conditions[0]);i++) {
+  if(!write_bundle(schema,"process_create",conditions[i])||!edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
+  edr_p0_rule_ir_reload();
+  for(unsigned state=0;state<=EDR_PARENT_PID_CONFLICT;state++) {
+   EdrBehaviorRecord r;record_init(&r,EDR_EVENT_PROCESS_CREATE);strcpy(r.process_name,"tool.exe");
+   r.parent_pid_state=(uint8_t)state;r.ppid=(state==EDR_PARENT_PID_KNOWN||state==EDR_PARENT_PID_CONFLICT)?21:0;
+   r.process_chain_depth=2;
+   if(!matches(&r,state==EDR_PARENT_PID_KNOWN,"real parent predicate requires a usable parent observation"))return 0;
+  }
+ }
+ return 1;
+}
+
+static int evidence_purposes(void) {
+ const char *conditions[]={"{\"process_name_in\":[\"tool.exe\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"actor_attribution\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"parent_context\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"actor_attribution\",\"parent_context\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"parent_context\",\"actor_attribution\"]}"};
+ const uint64_t parent=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+ const uint64_t expected[]={0,0,EDR_EVIDENCE_USER,parent,EDR_EVIDENCE_USER|parent,EDR_EVIDENCE_USER|parent};
+ for(unsigned i=0;i<sizeof(conditions)/sizeof(conditions[0]);i++) {
+  if(!load_rule("process_create",conditions[i]))return 0;
+  EdrBehaviorRecord r;record_init(&r,EDR_EVENT_PROCESS_CREATE);strcpy(r.process_name,"tool.exe");
+  EdrP0RuleIrEvaluation eval;if(!edr_p0_rule_ir_evaluate_record(&r,NULL,&eval) || eval.match_count!=1)return 0;
+  EdrP0RuleIrMatch m;int ok=edr_p0_rule_ir_evaluation_get_match(&eval,0,&m) && m.required_evidence_fields==expected[i];
+  edr_p0_rule_ir_evaluation_free(&eval);if(!ok)return 0;
+  if(i>=3) for(unsigned state=0;state<=EDR_PARENT_PID_CONFLICT;state++) {
+   r.parent_pid_state=(uint8_t)state;r.ppid=state==EDR_PARENT_PID_KNOWN?21:0;
+   edr_behavior_clear_parent_context(&r);
+   if(!matches(&r,1,"optional parent purpose does not require available parent"))return 0;
+  }
+  if(i<3) {
+   if(!write_bundle(7,"process_create",conditions[i]) || !edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
+   edr_p0_rule_ir_reload();
+   if(!edr_p0_rule_ir_evaluate_record(&r,NULL,&eval) || eval.match_count!=1)return 0;
+   ok=edr_p0_rule_ir_evaluation_get_match(&eval,0,&m) && m.required_evidence_fields==expected[i];
+   edr_p0_rule_ir_evaluation_free(&eval);if(!ok)return 0;
+  }
+  strcpy(r.process_name,"other.exe");if(!matches(&r,0,"purpose does not match without predicate"))return 0;
+ }
+ const char *bad[]={"{\"evidence_purposes\":[\"actor_attribution\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"unknown\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":null}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"actor_attribution\",\"actor_attribution\"]}",
+  "{\"evidence_purposes\":[\"parent_context\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"parent_context\",\"parent_context\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"parent_context\",\"actor_attribution\",\"parent_context\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[],\"evidence_purposes\":[\"actor_attribution\"]}"};
+ for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++)if(!rejected_candidate(EDR_P0_RULE_IR_SCHEMA_VERSION,"process_create",bad[i]))return 0;
+ if(!rejected_candidate(7,"process_create",conditions[3]))return 0;
+ if(!write_bundle_effect(8,"process_create",conditions[3],"local_observation") ||
+    edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
+ puts("IR8 evidence purposes: actor and parent independently scoped; predicates unchanged; unknown/duplicate/purpose-only and IR7 parent purpose rejected, original IR7 masks preserved");return 1;
+}
 int main(void) {
   int okay = create_fixture() && name_exclusions() && empty_and_path_exclusions() &&
              network_positive_path_quality() && unknown_source_quality_exclusions() &&
-             script_exclusions_require_observed_names() && file_process_paths() && candidate_contract();
+             script_exclusions_require_observed_names() && file_process_paths() && candidate_contract() && parent_predicate_states() && evidence_purposes();
   edr_p0_rule_ir_shutdown();
   if (s_path[0]) remove(s_path);
   if (!okay) fprintf(stderr, "P0 exclusion/actor-path contract failed\n");

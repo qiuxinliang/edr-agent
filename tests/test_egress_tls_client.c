@@ -15,6 +15,7 @@
 #include <time.h>
 #ifdef EDR_TEST_EXTENDED_EGRESS
 #include "edr/command_state.h"
+#include "cJSON.h"
 #include "edr/command_result_json.h"
 #include "edr/command_executor.h"
 #include "edr/config.h"
@@ -245,6 +246,31 @@ static int p0_journal_receipt_scenario(const char *queue_path) {
 #endif
 
 #ifdef EDR_TEST_EXTENDED_EGRESS
+/* Clock-boundary fault injection into this scenario's isolated file only.
+ * Production finish is immutable and must not become a test expiry setter. */
+static int fixture_expire_result(const char *dir,const char *id,int64_t expiry) {
+  char path[1200];snprintf(path,sizeof(path),"%s/command_state.jsonl",dir);
+  FILE *f=fopen(path,"r+b");if(!f)return 0;
+  char *line=malloc(131072);if(!line){fclose(f);return 0;}
+  int changed=0,ok=1;
+  for(;;) {
+    long offset=ftell(f);if(!fgets(line,131072,f))break;long next=ftell(f);
+    cJSON *row=cJSON_Parse(line),*key=cJSON_GetObjectItemCaseSensitive(row,"command_id");
+    cJSON *grant=cJSON_GetObjectItemCaseSensitive(row,"result_authorization");
+    cJSON *old=cJSON_GetObjectItemCaseSensitive(grant,"expires_unix_ms");
+    if(cJSON_IsString(key)&&!strcmp(key->valuestring,id)&&cJSON_IsNumber(old)) {
+      char *value=strstr(line,"\"expires_unix_ms\":");
+      char before[32],after[32];snprintf(before,sizeof(before),"%lld",(long long)old->valuedouble);snprintf(after,sizeof(after),"%lld",(long long)expiry);
+      if(!value||strlen(before)!=strlen(after)){ok=0;cJSON_Delete(row);break;}
+      value+=strlen("\"expires_unix_ms\":");
+      if(strncmp(value,before,strlen(before))||fseek(f,offset+(long)(value-line),SEEK_SET)||fwrite(after,1,strlen(after),f)!=strlen(after)||fflush(f)||fseek(f,next,SEEK_SET)){ok=0;cJSON_Delete(row);break;}
+      changed++;
+    }
+    cJSON_Delete(row);
+  }
+  if(ferror(f))ok=0;free(line);if(fclose(f))ok=0;return ok&&changed;
+}
+
 static int command_result_scenario(const char *path) {
 #ifdef _WIN32
   _putenv_s("EDR_COMMAND_STATE_DIR", path);
@@ -287,8 +313,7 @@ static int command_result_scenario(const char *path) {
     expired.result_authorization.expires_unix_ms=(int64_t)time(NULL)*1000-1;
     /* Force only the clock boundary in durable state; the original command and
      * renewal both traverse the real Ed25519 admission and executor owners. */
-    CHECK(edr_command_state_finish(record->command_id,record->command_type,&expired,
-        record->response_status,record->execution_status,record->exit_code,record->detail,record->artifacts,1)==0);
+    CHECK(fixture_expire_result(path,record->command_id,expired.result_authorization.expires_unix_ms));
     record->result_authorization=expired.result_authorization;
     CHECK(edr_command_state_mark_report_held(record,"result_authorization_expired")==0);
     const char *renew_payload=getenv("EDR_TEST_RENEWAL_PAYLOAD");

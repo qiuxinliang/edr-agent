@@ -303,11 +303,6 @@ void edr_preprocess_copy_agent_ids(char *endpoint_id, size_t endpoint_cap,
   if (tenant_id && tenant_cap) tenant_id[0] = '\0';
 }
 
-int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out) {
-  (void)pid; (void)event_time_ns; (void)out;
-  return -1;
-}
-
 void edr_adaptive_collection_raise(int severity, const char *rule_id, uint32_t pid,
                                    uint32_t parent_pid, const char *process_name) {
   (void)severity; (void)rule_id; (void)pid; (void)parent_pid; (void)process_name;
@@ -353,11 +348,15 @@ static void make_record(EdrBehaviorRecord *record, const SourceFixtureCase *fixt
   }
 }
 
+static int s_terminal_inject_unrelated;
 static void make_terminal_record(EdrBehaviorRecord *record) {
   memset(record, 0, sizeof(*record));
   record->type = EDR_EVENT_PROCESS_CREATE;
   record->event_time_ns = 1720000000000000000LL;
   record->pid = 4242u;
+  /* This rule proves the known office parent; name alone is not a relation. */
+  record->ppid = 6000u;
+  record->parent_pid_state = EDR_PARENT_PID_KNOWN;
   record->process_start_key = 0x4242u;
   record->process_creation_filetime_100ns = 133444555666777888ULL;
   snprintf(record->event_id, sizeof(record->event_id), "%s", k_terminal_event_id);
@@ -378,6 +377,17 @@ static void make_terminal_record(EdrBehaviorRecord *record) {
            "live_process_identity");
   snprintf(record->source_completeness, sizeof(record->source_completeness), "%s", "COMPLETE");
   record->evidence_revision = 7u;
+  if (s_terminal_inject_unrelated) {
+    snprintf(record->username,sizeof(record->username),"synthetic-unrelated-user");
+    snprintf(record->identity_source,sizeof(record->identity_source),"creator_fallback");
+    snprintf(record->identity_quality,sizeof(record->identity_quality),"creator_fallback");
+    snprintf(record->user_sid,sizeof(record->user_sid),"synthetic-unrelated-sid");
+    snprintf(record->creator_username,sizeof(record->creator_username),"synthetic-creator");
+    snprintf(record->current_directory,sizeof(record->current_directory),"C:\\synthetic-cwd");
+    snprintf(record->grandparent_path,sizeof(record->grandparent_path),"C:\\synthetic-grandparent.exe");
+    snprintf(record->parent_cmdline,sizeof(record->parent_cmdline),"synthetic-parent-command");
+  }
+
   snprintf(record->parent_name, sizeof(record->parent_name), "%s", "winword.exe");
   snprintf(record->parent_resolution_status, sizeof(record->parent_resolution_status), "%s",
            "RESOLVED");
@@ -500,9 +510,43 @@ static int verify_terminal_fixture(void) {
           &s_terminal_records[0], &s_terminal_records[1])) {
     return 0;
   }
+  /* The test-only record builder carries the same matched descriptor that
+   * production emit_for_rule snapshots before constructing a fresh intent. */
+  EdrP0RuleIrEvaluation evaluation;
+  if (!edr_p0_rule_ir_evaluate_record(&input,NULL,&evaluation)) return 0;
+  int bound=0;
+  for (uint32_t m=0;m<evaluation.match_count;m++) {
+    EdrP0RuleIrMatch match;
+    if (edr_p0_rule_ir_evaluation_get_match(&evaluation,m,&match) && !strcmp(match.rule_id,k_terminal_rule_id)) {
+      s_terminal_records[0].evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;
+      s_terminal_records[0].required_evidence_fields=match.required_evidence_fields;
+      s_terminal_records[0].tactic_probability_state=1;
+      bound=1;
+    }
+  }
+  edr_p0_rule_ir_evaluation_free(&evaluation);
+  if (!bound) return 0;
+  /* Parent-predicate authority cannot be reconstructed from a name when the
+   * minimal parent relationship is unknown. Keep this fail-closed guard. */
+  EdrBehaviorRecord *unknown_parent = malloc(sizeof(*unknown_parent));
+  if (!unknown_parent) return 0;
+  *unknown_parent = s_terminal_records[0];
+  unknown_parent->ppid = 0u;
+  unknown_parent->parent_pid_state = EDR_PARENT_PID_UNKNOWN;
+  size_t rejected_len = 0u;
+  uint8_t *rejected = edr_behavior_record_alloc_outbound_wire_facts(
+      unknown_parent, NULL, NULL, &rejected_len);
+  free(unknown_parent);
+  if (rejected || rejected_len) { free(rejected); return 0; }
   for (i = 0u; i < TERMINAL_AUTHORITY_FRAMES; ++i) {
     s_terminal_expected_wire_lens[i] = edr_behavior_record_encode_durable_wire(
         &s_terminal_records[i], s_terminal_expected_wires[i], sizeof(s_terminal_expected_wires[i]));
+    if (i==TERMINAL_INTENT_FRAME) {
+      size_t n=0;
+      uint8_t *projected=edr_behavior_record_alloc_outbound_wire_facts(&s_terminal_records[i],NULL,NULL,&n);
+      if (!projected || n>sizeof(s_terminal_expected_wires[i])) {free(projected);return 0;}
+      memcpy(s_terminal_expected_wires[i],projected,n);s_terminal_expected_wire_lens[i]=n;free(projected);
+    }
     if (s_terminal_expected_wire_lens[i] <= 20u) {
       return 0;
     }
@@ -571,7 +615,7 @@ static int verify_terminal_fixture(void) {
     }
     if (i < TERMINAL_AUTHORITY_FRAMES) {
       if (decoded.has_behavior_alert ||
-          strcmp(decoded.exe_path, input.exe_path) != 0 ||
+          strcmp(decoded.exe_path, i==TERMINAL_SOURCE_FRAME?input.exe_path:k_terminal_canonical_image_path) != 0 ||
           s_terminal_wire_lens[i] != s_terminal_expected_wire_lens[i] ||
           memcmp(s_terminal_wires[i], s_terminal_expected_wires[i],
                  s_terminal_wire_lens[i]) != 0 ||
@@ -618,15 +662,23 @@ static int verify_terminal_fixture(void) {
         return 0;
       }
     } else if (!decoded.has_behavior_alert ||
-               strcmp(decoded.exe_path, input.exe_path) != 0 ||
+               strcmp(decoded.exe_path, i==TERMINAL_SOURCE_FRAME?input.exe_path:k_terminal_canonical_image_path) != 0 ||
                strcmp(decoded.ave_result_json, s_terminal_records[TERMINAL_SOURCE_FRAME].detection_context) != 0 ||
-               strcmp(decoded.behavior_alert.process_path,
-                      k_terminal_canonical_image_path) != 0 ||
+               decoded.behavior_alert.process_path[0] ||
                strstr(decoded.behavior_alert.user_subject_json,
                       "\"process_path\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\"") == NULL ||
                strstr(decoded.behavior_alert.user_subject_json,
                       "\\\\Device\\\\HarddiskVolume3") != NULL) {
       return 0;
+    }
+    if (i!=TERMINAL_SOURCE_FRAME) {
+      if (decoded.evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION ||
+          decoded.user_sid[0] || decoded.creator_username[0] || decoded.username[0] ||
+          decoded.process_context.has_current_directory || decoded.process_context.has_grandparent_path ||
+          decoded.process_context.has_parent_cmdline || decoded.which_detail==edr_v1_BehaviorEvent_process_tag ||
+          (decoded.has_behavior_alert && decoded.behavior_alert.tactic_probs_count)) {
+        fprintf(stderr,"FAIL: unrelated terminal evidence escaped projection frame=%zu\n",i);return 0;
+      }
     }
     {
       char reason[128];
@@ -639,6 +691,23 @@ static int verify_terminal_fixture(void) {
       if (admitted!=(i==TERMINAL_COMBINED_FRAME || i==TERMINAL_INTENT_FRAME)) {
         fprintf(stderr,"FAIL: terminal egress contract frame=%zu reason=%s\n",i,reason);
         return 0;
+      }
+      if (i!=TERMINAL_SOURCE_FRAME) {
+        uint8_t changed[65536];pb_ostream_t out;
+        unsigned calls=s_intent_authorizations;
+        strcpy(decoded.user_sid,"synthetic-after-freeze-sid");
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason)) ||
+            strcmp(reason,"alert_field_purpose_invalid") || calls!=s_intent_authorizations) {
+          fprintf(stderr,"FAIL: terminal irrelevant identity reached owner\n");return 0;
+        }
+        decoded.user_sid[0]=0;
+        decoded.evidence_projection_version++;
+        out=pb_ostream_from_buffer(changed,sizeof(changed));
+        if (!pb_encode(&out,edr_v1_BehaviorEvent_fields,&decoded) ||
+            edr_egress_frame_validate(changed,out.bytes_written,reason,sizeof(reason))) return 0;
+        decoded.evidence_projection_version--;
       }
       if (i==TERMINAL_COMBINED_FRAME) {
         uint8_t changed[65536]; pb_ostream_t out;
@@ -1127,6 +1196,42 @@ static void print_durable_fixture(void) {
   printf("  ]\n}\n");
 }
 
+static int verify_terminal_minimization(void) {
+  uint8_t (*baseline)[65536u+16u]=calloc(2,sizeof(*baseline));size_t lengths[2];
+  if (!baseline) return 0;
+  unsigned frames[]={TERMINAL_INTENT_FRAME,TERMINAL_COMBINED_FRAME};
+  size_t source_length=s_terminal_wire_lens[TERMINAL_SOURCE_FRAME];
+  for (unsigned i=0;i<2;i++) {
+    lengths[i]=s_terminal_wire_lens[frames[i]];
+    memcpy(baseline[i],s_terminal_wires[frames[i]],lengths[i]);
+  }
+  s_terminal_inject_unrelated=1;
+  if (!verify_terminal_fixture()) return 0;
+  for (unsigned i=0;i<2;i++) {
+    if (lengths[i]!=s_terminal_wire_lens[frames[i]] ||
+        memcmp(baseline[i],s_terminal_wires[frames[i]],lengths[i])) {
+      fprintf(stderr,"FAIL: unrelated injection changed terminal frozen bytes\n");return 0;
+    }
+  }
+  if (s_terminal_wire_lens[TERMINAL_SOURCE_FRAME]<=source_length) return 0;
+  fprintf(stderr,"terminal projected intent=%zu combined=%zu unrelated_injection_delta=0; local_source=%zu rich_local_source=%zu\n",
+      lengths[0],lengths[1],source_length,s_terminal_wire_lens[TERMINAL_SOURCE_FRAME]);
+  /* The historical full encoder retains its complete local representation;
+   * legacy projection is byte-identical, before any journal receipt lookup. */
+  edr_v1_BehaviorEvent *legacy=calloc(1,sizeof(*legacy));
+  uint8_t wire[65536u+16u],after[65536u];
+  if (!legacy) {free(baseline);return 0;}
+  size_t length=edr_behavior_record_encode_durable_wire(&s_terminal_records[0],wire,sizeof(wire));
+  pb_istream_t in=pb_istream_from_buffer(wire+16,length-16);pb_ostream_t out=pb_ostream_from_buffer(after,sizeof(after));
+  if (!pb_decode(&in,edr_v1_BehaviorEvent_fields,legacy) || legacy->evidence_projection_version ||
+      !legacy->user_sid[0] || !edr_egress_event_project(legacy,NULL,0) ||
+      !pb_encode(&out,edr_v1_BehaviorEvent_fields,legacy) || out.bytes_written!=length-16 ||
+      memcmp(after,wire+16,length-16)) return 0;
+  free(legacy);free(baseline);
+  s_terminal_inject_unrelated=0;
+  return verify_terminal_fixture();
+}
+
 static void print_terminal_authority_golden(void) {
   printf("{\n");
   printf("  \"tenant_id\": \"%s\",\n", k_terminal_tenant_id);
@@ -1143,7 +1248,7 @@ static void print_terminal_authority_golden(void) {
   printf(",\n  \"result\": ");
   fwrite(s_terminal_json[1], 1u, s_terminal_json_lens[1], stdout);
   printf(",\n  \"combined_expectations\": {\"outer_exe_path\":");
-  print_json_string(k_terminal_raw_image_path);
+  print_json_string(k_terminal_canonical_image_path);
   printf(",\"alert_process_path\":");
   print_json_string(k_terminal_canonical_image_path);
   printf(",\"subject_process_path\":");
@@ -1157,7 +1262,7 @@ static void print_terminal_durable_fixture(void) {
   int first = 1;
   printf("{\n  \"fixture_version\": 1,\n");
   printf("  \"agent_builder\": \"edr_p0_rule_try_emit+p0_build_terminal_intent_record+p0_build_terminal_result_record\",\n");
-  printf("  \"agent_encoder\": \"edr_behavior_record_encode_durable_wire\",\n");
+  printf("  \"agent_encoder\": \"edr_behavior_record_alloc_outbound_wire_facts+edr_behavior_record_encode_durable_wire\",\n");
   printf("  \"bat1_version\": 1,\n  \"bat1_length_byte_order\": \"little_endian\",\n");
   printf("  \"reproduce_with\": \"EDR_P0_IR_PATH=edr-agent/config/p0_rule_bundle_ir_v1.json edr-agent/tests/test_p0_source_only_durable_contract --emit-terminal-authority-durable-fixture\",\n");
   printf("  \"not_evaluable_reasons\": [");
@@ -1187,7 +1292,7 @@ static void print_terminal_durable_fixture(void) {
   printf("\",\n  \"combined_bat1_base64\": \"");
   print_base64(s_terminal_wires[2], s_terminal_wire_lens[2]);
   printf("\",\n  \"combined_expectations\": {\"outer_exe_path\":");
-  print_json_string(k_terminal_raw_image_path);
+  print_json_string(k_terminal_canonical_image_path);
   printf(",\"alert_process_path\":");
   print_json_string(k_terminal_canonical_image_path);
   printf(",\"subject_process_path\":");
@@ -1205,6 +1310,7 @@ int main(int argc, char **argv) {
       argc == 2 && strcmp(argv[1], "--emit-terminal-authority-durable-fixture") == 0;
   if (argc > 1 && !emit_contract && !emit_fixture && !emit_terminal_golden &&
       !emit_terminal_fixture) return 2;
+  edr_pt_cache_init();
   edr_p0_rule_ir_lazy_init();
   {
     const char *loaded_sha256 = NULL;
@@ -1245,9 +1351,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "terminal authority durable fixture failed\n");
     return 1;
   }
+  if (!verify_terminal_minimization()) {fprintf(stderr,"terminal minimization failed\n");return 1;}
   if (emit_contract) print_authority_contract();
   if (emit_fixture) print_durable_fixture();
   if (emit_terminal_golden) print_terminal_authority_golden();
   if (emit_terminal_fixture) print_terminal_durable_fixture();
+  edr_pt_cache_shutdown();
   return 0;
 }

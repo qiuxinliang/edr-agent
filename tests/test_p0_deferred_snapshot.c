@@ -26,6 +26,7 @@ int main(void) {
 #undef SIGNED
 #undef FLOAT
 #undef MITRE
+  original.parent_pid_state=EDR_PARENT_PID_KNOWN;
   original.process_start_key=UINT64_MAX;
   original.process_creation_filetime_100ns=UINT64_C(134337835418663457);
   original.event_time_ns=INT64_C(1789309942708556400);
@@ -38,7 +39,10 @@ int main(void) {
   assert(edr_p0_deferred_snapshot_encode(&original,&binding,"R-TEST",&json,&length));
   assert(edr_p0_deferred_snapshot_decode(json,length,&restored,&decoded,rule,sizeof(rule)));
 #define TEXT(n) assert(!strcmp(original.n,restored.n));
-#define UNSIGNED(n) assert(original.n==restored.n);
+#define UNSIGNED(n) if (!strcmp(#n,"parent_pid_state")) { \
+    assert(edr_parent_pid_effective_state(original.ppid,original.parent_pid_state)== \
+           edr_parent_pid_effective_state(restored.ppid,restored.parent_pid_state)); \
+  } else { assert(original.n==restored.n); }
 #define SIGNED(n) assert(original.n==restored.n);
 #define FLOAT(n) assert(original.n==restored.n);
 #define MITRE(n) for(size_t i=0;i<EDR_BR_MAX_MITRE;++i) assert(!strcmp(original.n[i],restored.n[i]));
@@ -53,7 +57,7 @@ int main(void) {
    * fields must fail explicitly, never restore a partial valid-looking record. */
   assert(!edr_p0_deferred_snapshot_decode(json,length-1u,&restored,&decoded,rule,sizeof(rule)));
   cJSON *root=cJSON_Parse(json); assert(root);
-  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),4);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),5);
   char *bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad);
@@ -63,23 +67,41 @@ int main(void) {
   bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad); cJSON_Delete(root);
+  /* Schema-3 remains byte-compatible and does not invent unavailable state. */
+  root=cJSON_Parse(json); assert(root);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),3);
+  record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_pid_state");
+  bad=cJSON_PrintUnformatted(root); assert(bad);
+  assert(edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
+  assert(restored.parent_pid_state==EDR_PARENT_PID_UNKNOWN);
+  char *v3=NULL; size_t v3_length=0;
+  assert(edr_p0_deferred_snapshot_encode(&restored,&decoded,rule,&v3,&v3_length));
+  assert(v3_length==strlen(bad) && !strcmp(v3,bad));
+  free(v3);free(bad);cJSON_Delete(root);
   /* Existing schema-2 rows preserve syscall outcomes after upgrade. */
   root=cJSON_Parse(json); assert(root);
   cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),2);
   cJSON_DeleteItemFromObjectCaseSensitive(root,"command_facts");
   record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_pid_state");
   cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_start_key");
   cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_creation_filetime_100ns");
   bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   assert(restored.syscall_result==INT64_MIN && restored.syscall_result_known==original.syscall_result_known);
   assert(!restored.parent_process_start_key && !restored.parent_process_creation_filetime_100ns);
-  free(bad); cJSON_Delete(root);
+  assert(restored.parent_pid_state==EDR_PARENT_PID_UNKNOWN);
+  char *v2=NULL; size_t v2_length=0;
+  assert(edr_p0_deferred_snapshot_encode(&restored,&decoded,rule,&v2,&v2_length));
+  assert(v2_length==strlen(bad) && !strcmp(v2,bad));
+  free(v2); free(bad); cJSON_Delete(root);
   /* Existing schema-1 durable rows survive upgrade with outcome unknown. */
   root=cJSON_Parse(json); assert(root);
   cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"schema"),1);
   cJSON_DeleteItemFromObjectCaseSensitive(root,"command_facts");
   record=cJSON_GetObjectItemCaseSensitive(root,"record");
+  cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_pid_state");
   cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_start_key");
   cJSON_DeleteItemFromObjectCaseSensitive(record,"parent_process_creation_filetime_100ns");
   const char *syscall_fields[] = {"syscall_name", "syscall_sensor", "syscall_result",
@@ -98,6 +120,34 @@ int main(void) {
   free(bad); bad=cJSON_PrintUnformatted(root); assert(bad);
   assert(!edr_p0_deferred_snapshot_decode(bad,strlen(bad),&restored,&decoded,rule,sizeof(rule)));
   free(bad); cJSON_Delete(root); free(json);
+  /* Legacy-representable KNOWN keeps its old format. Only new provenance needs
+   * schema 4; zero states and conflict survive exact durable roundtrip. */
+  for (uint8_t state=EDR_PARENT_PID_KNOWN;state<=EDR_PARENT_PID_CONFLICT;++state) {
+    static EdrBehaviorRecord item, back;
+    memset(&item,0,sizeof(item));
+    strcpy(item.event_id,"parent-state-event");strcpy(item.endpoint_id,"parent-state-endpoint");
+    strcpy(item.tenant_id,"parent-state-tenant");
+    item.pid=9001u;item.process_start_key=9001u;
+    item.process_creation_filetime_100ns=134337835418663457ULL;
+    item.parent_pid_state=state;
+    item.ppid=state==EDR_PARENT_PID_KNOWN || state==EDR_PARENT_PID_CONFLICT ? 299u : 0u;
+    char *wire=NULL,*again=NULL;size_t size=0,again_size=0;
+    assert(edr_p0_deferred_snapshot_encode(&item,&binding,"R-TEST",&wire,&size));
+    assert(strstr(wire,state==EDR_PARENT_PID_KNOWN ? "\"schema\":1" : "\"schema\":4"));
+    assert(edr_p0_deferred_snapshot_decode(wire,size,&back,&decoded,rule,sizeof(rule)));
+    assert(back.ppid==item.ppid);
+    assert(back.parent_pid_state==(state==EDR_PARENT_PID_KNOWN ? EDR_PARENT_PID_UNKNOWN : state));
+    assert(edr_parent_pid_effective_state(back.ppid,back.parent_pid_state)==state);
+    assert(edr_p0_deferred_snapshot_encode(&back,&decoded,rule,&again,&again_size));
+    assert(again_size==size && !memcmp(wire,again,size));
+    printf("parent state snapshot: state=%u ppid=%u roundtrip=exact\n",state,back.ppid);
+    free(again);free(wire);
+  }
+  EdrBehaviorRecord invalid=original;
+  invalid.parent_pid_state=EDR_PARENT_PID_KNOWN;invalid.ppid=0u;
+  assert(!edr_p0_deferred_snapshot_encode(&invalid,&binding,"R-TEST",&json,&length));
+  invalid.parent_pid_state=5u;
+  assert(!edr_p0_deferred_snapshot_encode(&invalid,&binding,"R-TEST",&json,&length));
   /* Worst-case JSON escaping of every bounded source string must fit the
    * storage contract, not just a short typical process command line. */
 #define TEXT(n) memset(original.n,1,sizeof(original.n)-1u); original.n[sizeof(original.n)-1u]=0;

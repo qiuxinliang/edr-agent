@@ -65,7 +65,7 @@ add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox
 target_include_directories(test_command_inbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_inbox PRIVATE Threads::Threads)
+target_link_libraries(test_command_inbox PRIVATE Threads::Threads edr_egress_policy)
 edr_apply_test_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -80,7 +80,7 @@ add_executable(test_command_upload_outbox
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_upload_outbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads)
+target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
   target_link_libraries(test_command_upload_outbox PRIVATE advapi32)
 endif()
@@ -130,6 +130,18 @@ edr_apply_test_warnings(test_command_contract)
 add_test(NAME command_registry_and_payload_contract COMMAND test_command_contract
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_rtq_collectors ${CMAKE_CURRENT_SOURCE_DIR}/test_rtq_collectors.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_rtq_collectors PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+if(WIN32)
+  target_link_libraries(test_rtq_collectors PRIVATE ws2_32 iphlpapi advapi32 wevtapi)
+endif()
+edr_apply_test_warnings(test_rtq_collectors)
+add_test(NAME rtq_collector_behavior COMMAND test_rtq_collectors)
+set_tests_properties(rtq_collector_behavior PROPERTIES TIMEOUT 60)
+
 add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_process.c
   ${CMAKE_SOURCE_DIR}/src/command/command_process.c
   ${CMAKE_SOURCE_DIR}/src/command/command_util.c
@@ -137,7 +149,7 @@ add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_pro
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_process PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
-target_link_libraries(test_command_process PRIVATE Threads::Threads)
+target_link_libraries(test_command_process PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
   target_link_libraries(test_command_process PRIVATE advapi32)
 endif()
@@ -156,6 +168,7 @@ add_executable(test_agent_update_contract
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_agent_update_contract PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_compile_definitions(test_agent_update_contract PRIVATE EDR_AGENT_UPDATE_TESTING=1)
 if(NOT WIN32)
   target_compile_definitions(test_agent_update_contract PRIVATE EDR_OS_POSIX=1)
 else()
@@ -209,9 +222,13 @@ if(WIN32)
   add_test(NAME windows_inplace_collector_transaction
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_inplace_collector_transaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  add_test(NAME windows_installer_log_redaction
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_installer_log_redaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
   set_tests_properties(
     windows_release_collector_pe_closure
     windows_inplace_collector_transaction
+    windows_installer_log_redaction
     PROPERTIES TIMEOUT 60)
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
@@ -425,6 +442,18 @@ if(WIN32)
   target_compile_definitions(test_kernel_file_io_windows PRIVATE EDR_FILE_OBJECT_BINDING_NO_MAIN=1)
   edr_apply_test_warnings(test_kernel_file_io_windows)
   add_test(NAME kernel_file_io_identity COMMAND test_kernel_file_io_windows)
+
+  add_executable(test_etw_process_payload_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_process_payload_windows.c
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+  target_include_directories(test_etw_process_payload_windows PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_definitions(test_etw_process_payload_windows PRIVATE EDR_TDH_TESTING=1)
+  target_link_libraries(test_etw_process_payload_windows PRIVATE tdh)
+  edr_apply_test_warnings(test_etw_process_payload_windows)
+  add_test(NAME etw_process_payload_identity_native COMMAND test_etw_process_payload_windows)
 
   # Keep the real collector decoder and discard unrelated service entry points.
   # MSVC needs packaged functions and non-incremental REF even in Debug builds.
@@ -649,6 +678,11 @@ if(WIN32)
       ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_exit.ps1
       -RepositoryRoot ${CMAKE_SOURCE_DIR} -Fixture $<TARGET_FILE:test_windows_task_exit_fixture>)
   set_tests_properties(windows_task_exit_behavior PROPERTIES TIMEOUT 60)
+  add_test(NAME windows_task_trace_environment
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+      ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_task_trace_environment.ps1
+      -RepositoryRoot ${CMAKE_SOURCE_DIR})
+  set_tests_properties(windows_task_trace_environment PROPERTIES TIMEOUT 30)
 endif()
 
 if(WIN32)
@@ -880,6 +914,33 @@ target_link_libraries(test_behavior_record_alert_emit PRIVATE edr_ave_test_commo
 edr_apply_test_warnings(test_behavior_record_alert_emit)
 add_test(NAME behavior_record_alert_emit_contract COMMAND test_behavior_record_alert_emit)
 
+# Real exact-cache enrichment, codec/gate and private queue. External policy,
+# batch and storage ports are isolated in the fixture; it sends no HTTP.
+set(_edr_ave_parent_sources
+  test_ave_parent_integrity.c stub_command_fact_resolver.c
+  ${CMAKE_SOURCE_DIR}/src/ave/ave_lf_mpmc.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/alert_governor.c
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+add_executable(test_ave_parent_integrity ${_edr_ave_parent_sources})
+target_link_libraries(test_ave_parent_integrity PRIVATE edr_ave_test_common)
+edr_apply_test_warnings(test_ave_parent_integrity)
+add_test(NAME ave_parent_integrity COMMAND test_ave_parent_integrity)
+if(NOT WIN32)
+  add_executable(test_ave_parent_integrity_mutex ${_edr_ave_parent_sources})
+  target_compile_definitions(test_ave_parent_integrity_mutex PRIVATE __STDC_NO_ATOMICS__=1)
+  target_link_libraries(test_ave_parent_integrity_mutex PRIVATE edr_ave_test_common)
+  edr_apply_test_warnings(test_ave_parent_integrity_mutex)
+  add_test(NAME ave_parent_integrity_mutex COMMAND test_ave_parent_integrity_mutex)
+endif()
+
 if(EDR_PCRE2_AVAILABLE)
   # This test emits durable wire bytes carrying the authenticated published IR
   # binding.  The explicit Debug stub has no matcher and cannot prove that
@@ -888,6 +949,7 @@ if(EDR_PCRE2_AVAILABLE)
   add_executable(test_p0_source_only_durable_contract
     ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_source_only_durable_contract.c
+    ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
@@ -924,6 +986,7 @@ if(EDR_PCRE2_AVAILABLE)
   add_executable(test_p0_observation_semantics
     ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_observation_semantics.c
+    ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_source_only_contract.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_direct_emit.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
@@ -1308,6 +1371,16 @@ endif()
 edr_apply_test_warnings(test_process_tree_cache)
 add_test(NAME process_tree_cache COMMAND test_process_tree_cache WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_parent_context_binding ${CMAKE_CURRENT_SOURCE_DIR}/test_parent_context_binding.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c)
+target_include_directories(test_parent_context_binding PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(UNIX)
+  target_link_libraries(test_parent_context_binding PRIVATE Threads::Threads)
+endif()
+edr_apply_test_warnings(test_parent_context_binding)
+add_test(NAME parent_context_binding COMMAND test_parent_context_binding WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
@@ -1320,6 +1393,7 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_match.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/windows_event_policy.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_stub.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
@@ -1707,8 +1781,11 @@ add_test(NAME endpoint_policy_v2_modes COMMAND test_policy_v2 WORKING_DIRECTORY 
 
 add_executable(test_forensic_result_contract
   ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_result_contract.c
-  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c)
-target_include_directories(test_forensic_result_contract PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c
+  ${CMAKE_SOURCE_DIR}/src/transport/egress_purpose_json.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_forensic_result_contract PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 edr_apply_test_warnings(test_forensic_result_contract)
 add_test(NAME forensic_result_contract COMMAND test_forensic_result_contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
@@ -1754,18 +1831,20 @@ add_executable(test_egress_batch_policy test_egress_batch_policy.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c)
-target_link_libraries(test_egress_batch_policy PRIVATE edr_egress_policy)
+target_link_libraries(test_egress_batch_policy PRIVATE edr_egress_policy edr_validation_trace)
 target_compile_definitions(test_egress_batch_policy PRIVATE EDR_HAVE_NANOPB=1)
 if(WIN32)
   target_link_libraries(test_egress_batch_policy PRIVATE ws2_32)
 endif()
 edr_apply_test_warnings(test_egress_batch_policy)
 add_test(NAME egress_batch_policy COMMAND test_egress_batch_policy)
-add_executable(test_egress_request_policy test_egress_request_policy.c)
+add_executable(test_egress_request_policy test_egress_request_policy.c
+  ${CMAKE_SOURCE_DIR}/src/command/agent_update_manifest.c)
 target_link_libraries(test_egress_request_policy PRIVATE edr_egress_policy)
 edr_apply_test_warnings(test_egress_request_policy)
 add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 add_executable(test_command_result_egress test_command_result_egress.c
+  ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
@@ -1775,6 +1854,17 @@ if(WIN32)
 endif()
 edr_apply_test_warnings(test_command_result_egress)
 add_test(NAME command_result_egress COMMAND test_command_result_egress)
+add_executable(test_command_result_compaction test_command_result_compaction.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
+target_link_libraries(test_command_result_compaction PRIVATE edr_egress_policy Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_command_result_compaction PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(test_command_result_compaction)
+add_test(NAME command_result_compaction COMMAND test_command_result_compaction)
+
 
 target_link_libraries(test_deep_collector_manifest PRIVATE edr_egress_policy)
 
@@ -1889,12 +1979,14 @@ endfunction()
 edr_minimization_test(egress_batch_policy test_egress_batch_policy)
 edr_minimization_test(egress_request_policy test_egress_request_policy)
 edr_minimization_test(command_result_egress test_command_result_egress)
+edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
 edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_candidate)
 edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)
 edr_minimization_test(detection_decision_combo test_detection_decision)
 edr_minimization_test(detection_regression_scenarios test_detection_regression)
 edr_minimization_test(detection_sensor_bridge test_detection_sensor_bridge)
+edr_minimization_test(etw_process_payload_identity_native test_etw_process_payload_windows)
 edr_minimization_test(telemetry_admission test_telemetry_admission)
 edr_minimization_test(deep_collector_manifest test_deep_collector_manifest)
 edr_minimization_test(p0_source_only_durable_contract test_p0_source_only_durable_contract)
@@ -1904,6 +1996,8 @@ edr_minimization_test(report_events_ack_contract test_report_events_ack)
 edr_minimization_test(health_upload test_health_upload)
 edr_minimization_test(behavior_record_alert_proto_contract test_behavior_record_alert_proto)
 edr_minimization_test(behavior_record_alert_emit_contract test_behavior_record_alert_emit)
+edr_minimization_test(ave_parent_integrity test_ave_parent_integrity)
+edr_minimization_test(ave_parent_integrity_mutex test_ave_parent_integrity_mutex)
 
 edr_minimization_test(validation_trace_contract test_validation_trace)
 

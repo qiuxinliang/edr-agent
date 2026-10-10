@@ -5,7 +5,7 @@
 #ifndef EDR_AVE_LF_MPMC_H
 #define EDR_AVE_LF_MPMC_H
 
-#include "edr/ave_sdk.h"
+#include "ave_behavior_pipeline.h"
 
 #include <stddef.h>
 
@@ -16,9 +16,9 @@ int ave_mpmc_init(AveMpmcQueue **out_q, size_t capacity);
 void ave_mpmc_destroy(AveMpmcQueue *q);
 
 /** 0 成功；-1 满 */
-int ave_mpmc_try_push(AveMpmcQueue *q, const AVEBehaviorEvent *e);
+int ave_mpmc_try_push(AveMpmcQueue *q, const EdrAveQueuedEvent *e);
 /** 0 成功；-1 空 */
-int ave_mpmc_try_pop(AveMpmcQueue *q, AVEBehaviorEvent *out);
+int ave_mpmc_try_pop(AveMpmcQueue *q, EdrAveQueuedEvent *out);
 
 size_t ave_mpmc_approx_depth(const AveMpmcQueue *q);
 

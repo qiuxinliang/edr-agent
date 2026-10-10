@@ -697,7 +697,8 @@ typedef struct AVEBehaviorEventV26 {
   uint8_t cert_revoked_ancestor;
 } AVEBehaviorEventV26;
 
-static int ave_feed_event_current(const AVEBehaviorEvent *event) {
+int edr_ave_feed_event_captured(const AVEBehaviorEvent *event,
+                                const EdrAveProcessIdentity *process) {
   if (!g_initialized) {
     return AVE_ERR_NOT_INITIALIZED;
   }
@@ -712,7 +713,7 @@ static int ave_feed_event_current(const AVEBehaviorEvent *event) {
   if (pcfg) {
     edr_ave_behavior_event_apply_ioc(pcfg, &ev);
   }
-  return edr_ave_bp_feed(&ev);
+  return edr_ave_bp_feed(&ev, process);
 }
 
 void AVE_FeedEvent(const AVEBehaviorEvent *event) {
@@ -744,14 +745,14 @@ void AVE_FeedEvent(const AVEBehaviorEvent *event) {
   current.behavior_flags = legacy->behavior_flags;
   current.target_has_motw = legacy->target_has_motw;
   current.cert_revoked_ancestor = legacy->cert_revoked_ancestor;
-  (void)ave_feed_event_current(&current);
+  (void)edr_ave_feed_event_captured(&current, NULL);
 }
 
 int AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size) {
   if (event_size != sizeof(AVEBehaviorEvent)) {
     return AVE_ERR_INVALID_PARAM;
   }
-  return ave_feed_event_current(event);
+  return edr_ave_feed_event_captured(event, NULL);
 }
 
 int AVE_GetProcessAnomalyScore(uint32_t pid, float *score_out) {

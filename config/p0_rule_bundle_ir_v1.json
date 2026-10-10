@@ -1,12 +1,12 @@
 {
   "kind": "edr_p0_rule_bundle_ir_v1",
-  "ir_schema_version": 6,
-  "rules_bundle_version": "edr-dynamic-rules-v1-r285-9ebc399b",
+  "ir_schema_version": 8,
+  "rules_bundle_version": "edr-dynamic-rules-v1-r285-1802f979",
   "source_ids_file": "p0_rule_ids_v1.txt",
   "source_dynamic_rules": "dynamic_rules_v1.json",
   "rule_count": 182,
   "sensor_interest_manifest_hash_mode": "raw-json-v1-p0-artifact-sha256-zeroed",
-  "sensor_interest_manifest_sha256": "a50f345d688d2f871634d659b0e7c41afb425e31b72897fa5a25f2a83a6b67c4",
+  "sensor_interest_manifest_sha256": "658d2f112b469c9cb9fcf0daa06ba972f9924b67e23eb8ea1a330fcb51f9bae3",
   "rules": [
     {
       "id": "R-EXEC-001",
@@ -27,6 +27,10 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution",
+          "parent_context"
         ]
       }
     },
@@ -50,6 +54,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -83,6 +90,9 @@
           "mshta.exe",
           "rundll32.exe",
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -112,6 +122,9 @@
           "wscript.exe",
           "cscript.exe",
           "mshta.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -133,6 +146,9 @@
         ],
         "process_name_in": [
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -156,6 +172,9 @@
         ],
         "process_name_in": [
           "rundll32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -177,6 +196,9 @@
         ],
         "process_name_in": [
           "certutil.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -199,6 +221,9 @@
         ],
         "process_name_in": [
           "mshta.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -220,6 +245,9 @@
         ],
         "process_name_in": [
           "wmic.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -239,6 +267,9 @@
           "(?i)\\\\currentversion\\\\run",
           "(?i)\\\\currentversion\\\\runonce",
           "(?i)\\\\currentversion\\\\runservices"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -262,6 +293,9 @@
           "userinit",
           "taskman",
           "uihost"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -287,6 +321,9 @@
         ],
         "process_name_in": [
           "schtasks.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -308,6 +345,9 @@
         "registry_value_name_in": [
           "debugger",
           "verifierdlls"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -328,6 +368,9 @@
         ],
         "registry_value_name_in": [
           "appinit_dlls"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -345,6 +388,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)\\\\session manager\\\\appcertdlls"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -366,6 +412,9 @@
             "value_name": "enablelua",
             "value": 0
           }
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -387,6 +436,9 @@
         ],
         "registry_value_name_in": [
           "disableregistrytools"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -408,6 +460,9 @@
         ],
         "registry_value_name_in": [
           "disabletaskmgr"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -444,6 +499,9 @@
             "value_name": "disablerealtimemonitoring",
             "value": 1
           }
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -466,6 +524,9 @@
         ],
         "process_name_in": [
           "reg.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -486,6 +547,9 @@
           "(?i)comsvcs\\.dll.*minidump",
           "(?i)sekurlsa::logonpasswords",
           "(?i)invoke\\-mimikatz"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -521,6 +585,9 @@
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\ntds\\.dit$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -596,6 +663,9 @@
           "(?i)httpd\\.exe$",
           "(?i)nginx\\.exe$",
           "(?i)php\\-cgi\\.exe$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -633,6 +703,9 @@
           "wmic.exe",
           "certutil.exe",
           "bitsadmin.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -662,6 +735,9 @@
           "wbadmin.exe",
           "bcdedit.exe",
           "wevtutil.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -689,6 +765,9 @@
           "powershell.exe",
           "pwsh.exe",
           "cmd.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -704,7 +783,10 @@
       ],
       "description": "父链深度异常（>80，系统进程自动钳制至≤10）",
       "condition": {
-        "process_chain_depth_gt": 80
+        "process_chain_depth_gt": 80,
+        "evidence_purposes": [
+          "actor_attribution"
+        ]
       }
     },
     {
@@ -726,6 +808,9 @@
         ],
         "process_name_in": [
           "msiexec.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -751,6 +836,9 @@
         ],
         "process_name_in": [
           "cmstp.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -771,6 +859,9 @@
         ],
         "process_name_in": [
           "msxsl.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -797,6 +888,9 @@
         ],
         "process_name_in": [
           "sc.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -814,6 +908,9 @@
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\start menu\\\\programs\\\\startup\\\\.*\\.(exe|lnk|bat|cmd|vbs|js|ps1)$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -836,6 +933,9 @@
         ],
         "process_name_in": [
           "netsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -856,6 +956,9 @@
           "(?i)psexec(64)?\\.exe",
           "(?i)\\\\\\\\[^\\\\]+\\\\admin\\$",
           "(?i)\\\\\\\\[^\\\\]+\\\\c\\$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -880,6 +983,9 @@
         ],
         "process_name_in": [
           "bitsadmin.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -905,6 +1011,9 @@
         ],
         "process_name_in": [
           "wmic.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -926,6 +1035,9 @@
         ],
         "process_name_in": [
           "wevtutil.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -949,6 +1061,9 @@
         ],
         "process_name_in": [
           "sc.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -972,6 +1087,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -994,6 +1112,9 @@
         ],
         "process_name_in": [
           "cmdkey.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1016,6 +1137,9 @@
         "process_name_in": [
           "net.exe",
           "net1.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1049,6 +1173,9 @@
           "cmd.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1074,6 +1201,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1096,6 +1226,9 @@
         ],
         "process_name_in": [
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1121,6 +1254,9 @@
           "installutil.exe",
           "regasm.exe",
           "msbuild.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1144,6 +1280,9 @@
         "process_name_in": [
           "wscript.exe",
           "cscript.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1170,6 +1309,9 @@
         ],
         "process_name_in": [
           "forfiles.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1191,6 +1333,9 @@
         ],
         "process_name_in": [
           "odbcconf.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1215,6 +1360,9 @@
           "nslookup.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1237,6 +1385,9 @@
           "nslookup.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1258,6 +1409,9 @@
           "(?i)\\bzenmap(\\.exe)?\\b",
           "(?i)test-netconnection\\s+[^\\n]{0,120}-port\\s+\\d+",
           "(?i)\\btnc\\s+[^\\n]{0,80}-port\\s+\\d+"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1280,6 +1434,9 @@
           "(?i)crowbar",
           "(?i)\\bcrackmapexec\\s+\\S+\\s+-u\\s+\\S+\\s+(-p|-P|--password|--pass)",
           "(?i)\\bnetexec\\s+\\S+\\s+-u\\s+\\S+\\s+(-p|-P|--password|--pass)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1299,6 +1456,9 @@
           "(?i)icmpsh",
           "(?i)ptunnel",
           "(?i)icmp\\s*shell"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1322,6 +1482,9 @@
           "(?i)ifm\\s+create\\s+full",
           "(?i)drsuapi",
           "(?i)Get-ADReplAccount"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1345,6 +1508,9 @@
           "(?i)Rubeus[^\\n]{0,120}kerberoast",
           "(?i)Get-DomainSPNTicket",
           "(?i)Get-NetUser[^\\n]{0,80}SPN"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1367,6 +1533,9 @@
           "(?i)Invoke-WMIExec[^\\n]{0,200}-Hash\\s+",
           "(?i)\\bcrackmapexec\\s+\\S+\\s+-u\\s+\\S+\\s+(-H|--hashes)\\s+\\S+",
           "(?i)\\bnetexec\\s+\\S+\\s+-u\\s+\\S+\\s+(-H|--hashes)\\s+\\S+"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1394,6 +1563,9 @@
           "7za.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1422,6 +1594,9 @@
           "sftp.exe",
           "pscp.exe",
           "plink.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1445,6 +1620,9 @@
           "(?i)\\baz\\s+storage\\s+blob\\s+upload\\b",
           "(?i)\\bgsutil\\s+-m\\s+cp\\s+",
           "(?i)\\bgsutil\\s+cp\\s+"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1468,6 +1646,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1491,6 +1672,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1519,6 +1703,9 @@
         "process_name_in": [
           "rundll32.exe",
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1540,6 +1727,9 @@
           "(?i)NtMapViewOfSection",
           "(?i)MiniDumpWriteDump",
           "(?i)InjectDll"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1560,6 +1750,9 @@
           "(?i)slui\\.exe\\s+runas",
           "(?i)\\\\System32\\\\fodhelper\\.exe",
           "(?i)\\\\System32\\\\ComputerDefaults\\.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1586,6 +1779,9 @@
           "(?i)SetThreadToken",
           "(?i)MakeToken",
           "(?i)sekurlsa::tickets"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1609,6 +1805,9 @@
           "(?i)Bypass-AMSI",
           "(?i)System\\.Management\\.Automation\\.AmsiUtils",
           "(?i)\\[Ref\\]\\.Assembly\\.GetType\\([^)]*AmsiUtils"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1639,6 +1838,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1659,6 +1861,9 @@
           "(?i)\\bsc\\.exe\\s+create\\s+\\S+\\s+binpath=\\s*[^\\n]*\\.sys",
           "(?i)\\bsc\\.exe\\s+create\\s+[^\\n]{0,200}type=\\s*kernel",
           "(?i)pnputil\\.exe[^\\n]{0,160}(/add-driver|/install)\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1686,6 +1891,9 @@
           "sdelete64.exe",
           "fsutil.exe",
           "format.com"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1710,6 +1918,9 @@
           "(?i)cryptonight",
           "(?i)minergate",
           "(?i)\\\\miner\\.exe\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1734,6 +1945,9 @@
           "(?i)slowhttptest",
           "(?i)icmp\\s+flood",
           "(?i)\\\\hping\\.exe\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1753,6 +1967,9 @@
           "(?i)msiexec\\.exe\\s+/i\\s+[\"']?https?://",
           "(?i)msiexec\\.exe[^\\n]{0,240}https?://[^\\s\"']+[^\\n]{0,80}/quiet",
           "(?i)regsvr32\\.exe\\s+/s\\s+/n\\s+/u\\s+/i:https?://"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1778,6 +1995,9 @@
         ],
         "process_name_in": [
           "signtool.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1802,6 +2022,9 @@
           "(?i)bcdedit\\s+.*\\bnx\\s+AlwaysOff\\b",
           "(?i)\\\\\\\\\\.\\\\PhysicalDrive0",
           "(?i)\\\\Device\\\\Harddisk0\\\\DR0"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1826,6 +2049,9 @@
         "process_name_in": [
           "net.exe",
           "net1.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1847,6 +2073,9 @@
           "(?i)dsmod\\s+user\\s+\\S+\\s+-pwd",
           "(?i)net\\s+user\\s+\\S+\\s+/active:yes",
           "(?i)net\\s+localgroup\\s+[^\\n]{0,80}\\s+/add"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1875,6 +2104,9 @@
           "bcp.exe",
           "mysqldump.exe",
           "mysql.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1892,6 +2124,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Software\\\\Microsoft\\\\AMSI\\\\Providers"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1910,6 +2145,9 @@
         "registry_path_regex_any": [
           "(?i)mscfile\\\\shell\\\\open\\\\command",
           "(?i)\\\\mscfile\\\\shell\\\\open\\\\command"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1927,6 +2165,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon\\\\Notify"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1946,6 +2187,9 @@
           "(?i)\\bNinjaCopy\\b",
           "(?i)\\\\\\\\\\.\\\\PhysicalDrive",
           "(?i)rawdisk|disksector"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1972,6 +2216,9 @@
           "powershell.exe",
           "pwsh.exe",
           "reg.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -1989,6 +2236,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Print\\\\Monitors"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2006,6 +2256,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Image File Execution Options\\\\(sethc|utilman|osk|Magnify|Narrator|DisplaySwitch)\\.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2024,6 +2277,9 @@
         "command_regex_any": [
           "(?i)\\.lnk\\b.{0,80}(powershell|cmd|mshta|rundll32)",
           "(?i)WScript\\.Shell.*\\.lnk"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2049,6 +2305,9 @@
           "powershell.exe",
           "pwsh.exe",
           "wmic.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2073,6 +2332,9 @@
           "sc.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2091,6 +2353,9 @@
         "registry_path_regex_any": [
           "(?i)Environment\\\\[^\\\\]*Path",
           "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Session Manager\\\\Environment"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2109,6 +2374,9 @@
         "registry_path_regex_any": [
           "(?i)CurrentVersion\\\\Explorer\\\\User Shell Folders",
           "(?i)Policies\\\\Explorer\\\\Run"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2127,6 +2395,9 @@
         "registry_path_regex_any": [
           "(?i)Explorer\\\\FileExts\\\\\\.[^\\\\]+\\\\UserChoice",
           "(?i)Classes\\\\\\.[^\\\\]+\\\\shell\\\\open\\\\command"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2145,6 +2416,9 @@
         "command_regex_any": [
           "(?i)\\bicacls(?:\\.exe)?\"?\\s+.{0,120}\\s/(grant(?::r)?|setintegritylevel)(?:\\s|$)",
           "(?i)\\battrib\\s+-r\\s+-s\\s+-h\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2169,6 +2443,9 @@
         ],
         "process_name_in": [
           "sc.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2186,6 +2463,9 @@
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\inetpub\\\\wwwroot\\\\[^\\\\]+\\.(aspx|ashx|php|jsp)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2208,6 +2488,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2227,6 +2510,9 @@
           "(?i)CurrentVersion\\\\Run\\\\",
           "(?i)CurrentVersion\\\\RunOnce",
           "(?i)Explorer\\\\StartupApproved\\\\Run"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2248,6 +2534,9 @@
         ],
         "process_name_in": [
           "rundll32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2267,6 +2556,9 @@
           "(?i)mimikatz.*pth",
           "(?i)sekurlsa::pth",
           "(?i)/user:.{0,40}/ntlm:"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2290,6 +2582,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2309,6 +2604,9 @@
           "(?i)mscfile\\\\shell\\\\open\\\\command",
           "(?i)ms-settings\\\\shell\\\\open\\\\command",
           "(?i)EventVwr\\.\\w+\\\\\\\\shell\\\\\\\\open\\\\\\\\command"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2327,6 +2625,9 @@
         "command_regex_any": [
           "(?i)^\\s*(?:(?:[a-z]:[\\\\/][^\\s\\x22\\x27;&|]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?|\\x22(?:[^\\x22\\r\\n]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?\\x22)(?:[ \\t]+-(?:nologo|noprofile|nop|noninteractive|noexit|sta|mta|(?:executionpolicy|ep|windowstyle|w)[ \\t]+[a-z]+))*[ \\t]+-(?:c|command)[ \\t]+\\x22?(?:(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[;&|\\r\\n]+|(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*#[^\\r\\n]*(?:\\r?\\n|$))[ \\t]*)*(?:&[ \\t]*\\{[ \\t]*)?(?:Add-MpPreference|&[ \\t]*[\\x22\\x27]?Add-MpPreference[\\x22\\x27]?)[ \\t]+(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[ \\t])?-ExclusionPath(?:[ \\t:]|$)",
           "(?i)^\\s*(?:(?:[a-z]:[\\\\/][^\\s\\x22\\x27;&|]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?|\\x22(?:[^\\x22\\r\\n]*[\\\\/])?(?:powershell|pwsh)(?:\\.exe)?\\x22)(?:[ \\t]+-(?:nologo|noprofile|nop|noninteractive|noexit|sta|mta|(?:executionpolicy|ep|windowstyle|w)[ \\t]+[a-z]+))*[ \\t]+-(?:c|command)[ \\t]+\\x22?(?:(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[;&|\\r\\n]+|(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*#[^\\r\\n]*(?:\\r?\\n|$))[ \\t]*)*(?:&[ \\t]*\\{[ \\t]*)?(?:Set-MpPreference|&[ \\t]*[\\x22\\x27]?Set-MpPreference[\\x22\\x27]?)[ \\t]+(?:(?:`[^\\r\\n]|[^\\x22\\x27`#;&|\\r\\n]|\\x27(?:[^\\x27]|\\x27\\x27)*\\x27|\\x22(?:`[^\\r\\n]|[^\\x22`])*\\x22)*[ \\t])?-DisableRealtimeMonitoring(?:[ \\t:]|$)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2344,6 +2645,9 @@
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\autorun\\.inf$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2363,6 +2667,9 @@
           "(?i)sekurlsa::tickets",
           "(?i)kerberos::ptt",
           "(?i)\\.kirbi\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2381,6 +2688,9 @@
         "file_path_regex_any": [
           "(?i)\\\\inetpub\\\\wwwroot\\\\[^\\\\]+\\.(aspx|ashx|php|jsp)",
           "(?i)\\\\www\\\\htdocs\\\\[^\\\\]+\\.php$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2399,6 +2709,9 @@
         "registry_path_regex_any": [
           "(?i)LSA\\\\Security Packages",
           "(?i)Lsa\\\\OSConfig\\\\Security Packages"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2416,6 +2729,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Windows NT\\\\CurrentVersion\\\\Windows\\\\AppInit_DLLs"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2435,6 +2751,9 @@
           "(?i)\\bdel\\b.{0,80}\\\\Windows\\\\(System32|SysWOW64)",
           "(?i)Remove-Item\\b.{0,80}\\.evtx",
           "(?i)wevtutil\\s+cl\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2456,6 +2775,9 @@
         ],
         "process_name_in": [
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2476,6 +2798,9 @@
         ],
         "process_name_in": [
           "installutil.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2497,6 +2822,9 @@
         "process_name_in": [
           "regsvcs.exe",
           "regasm.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2514,6 +2842,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Classes\\\\CLSID\\\\[^\\\\]+\\\\InprocServer32"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2531,6 +2862,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)CurrentControlSet\\\\Services\\\\NetSh"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2553,6 +2887,9 @@
         "process_name_in": [
           "certutil.exe",
           "certmgr.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2573,6 +2910,9 @@
         ],
         "registry_value_name_in": [
           "Authentication Packages"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2591,6 +2931,9 @@
         "registry_path_regex_any": [
           "(?i)Office\\\\\\d+\\.\\d+\\\\Word\\\\Startup",
           "(?i)Office\\\\\\d+\\.\\d+\\\\Excel\\\\Startup"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2613,6 +2956,9 @@
         ],
         "process_name_in": [
           "sdbinst.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2635,6 +2981,9 @@
         ],
         "process_name_in": [
           "mshta.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2653,6 +3002,9 @@
         "command_regex_any": [
           "(?i)SpoofSingleResponse|Invoke-NBNS",
           "(?i)Inveigh|Responder\\.py"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2671,6 +3023,9 @@
         "command_regex_any": [
           "(?i)\\bDDE\\b",
           "(?i)DynamicDataExchange"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2688,6 +3043,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Notification Packages"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2706,6 +3064,9 @@
         "command_regex_any": [
           "(?i)\\bMMC\\b.{0,40}\\.snapin",
           "(?i)DCOM\\s+127\\.0\\.0\\.1"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2723,6 +3084,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\Security Packages"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2740,6 +3104,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Control Panel\\\\Desktop\\\\SCRNSAVE\\.EXE"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2757,6 +3124,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)CurrentControlSet\\\\Control\\\\Session Manager\\\\AppCertDlls"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2774,6 +3144,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)Windows NT\\\\CurrentVersion\\\\Image File Execution Options\\\\"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2794,6 +3167,9 @@
         ],
         "command_regex_any": [
           "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2814,6 +3190,9 @@
         ],
         "command_regex_any": [
           "(?i)anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2842,6 +3221,9 @@
           "powershell.exe",
           "pwsh.exe",
           "cmd.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2860,6 +3242,9 @@
       "condition": {
         "registry_path_regex_any": [
           "(?i)\\\\services\\\\(anydesk|teamviewer|rustdesk|screenconnect|connectwise|splashtop|atera|meshcentral)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2889,6 +3274,9 @@
           "anydesk.exe",
           "teamviewer.exe",
           "screenconnect.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2913,6 +3301,9 @@
         "command_regex_any": [
           "(?i)(https?|ftp)://",
           "(?i)\\b(download|invoke-webrequest|bitsadmin|certutil)\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2934,6 +3325,9 @@
           "(?i)\\\\ProgramData\\\\Golden\\\\",
           "(?i)\\\\(Users\\\\Public|Public)\\\\501\\\\Setup64\\.exe\\b",
           "(?i)\\bSetup64\\.exe[^\\n]{0,160}\\\\ProgramData\\\\Golden\\\\"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2956,6 +3350,9 @@
         ],
         "process_name_in": [
           "computerdefaults.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -2978,6 +3375,9 @@
           "(?i)\\bZAM\\.exe\\b",
           "(?i)(WatchDog|Zemana)[^\\n]{0,120}(driver|kernel|service)",
           "(?i)\\bsc\\.exe\\s+(create|start)\\s+[^\\n]{0,160}(wsftprm|amsdk|wamsdk|ZAM)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3006,6 +3406,9 @@
           "programdata\\golden",
           "users\\public\\501",
           "setup64.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3028,6 +3431,9 @@
           "(?i)\\\\ProgramData\\\\Golden\\\\",
           "(?i)\\\\(wsftprm|amsdk|wamsdk)\\.sys$",
           "(?i)\\\\ZAM\\.exe$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3052,6 +3458,9 @@
           "(?i)\\\\Temp\\\\|\\\\AppData\\\\Local\\\\Temp\\\\",
           "(?i)\\\\AppData\\\\Roaming\\\\",
           "(?i)\\\\Users\\\\.+\\\\Downloads\\\\"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3084,6 +3493,9 @@
           "(?i)virtualalloc",
           "(?i)createremotethread",
           "(?i)writeprocessmemory"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3106,6 +3518,9 @@
           "(?i)\\-(w|windowstyle)\\s+hidden",
           "(?i)\\-(nop|noprofile)\\b",
           "(?i)\\-(ex|executionpolicy)\\s+bypass"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3128,6 +3543,9 @@
           "(?i)CreateProcess.*CREATE_SUSPENDED",
           "(?i)PROCESS_CREATION_FLAGS_SUSPENDED",
           "(?i)0x00000004.*CreateProcess"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3155,6 +3573,9 @@
           "(?i)rtlcreateuserthread",
           "(?i)setthreadcontext",
           "(?i)ntmapviewofsection"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3182,6 +3603,9 @@
           "(?i)set-amsi.*0",
           "(?i)\\[Runtime.InteropServices.Marshal\\]::",
           "(?i)\\[Ref\\]\\.Assembly"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3205,6 +3629,9 @@
         "process_name_in": [
           "rundll32.exe",
           "regsvr32.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3233,6 +3660,9 @@
           "(?i)wscript\\.shell",
           "(?i)start-process",
           "(?i)\\$env:"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3261,6 +3691,9 @@
           "(?i)downloadstring",
           "(?i)invoke-webrequest",
           "(?i)get-itemproperty"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3300,6 +3733,9 @@
           "outlook.exe",
           "eqnedt32.exe",
           "msaccess.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3326,6 +3762,9 @@
           "(?i)wmi.*__FilterToConsumerBinding",
           "(?i)wmic.*/namespace",
           "(?i)\\.mof\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3335,12 +3774,12 @@
       "severity": 1,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539",
         "T1555.003"
       ],
-      "description": "观察 Chrome、Edge 或 Firefox Cookie 文件读取。浏览器自身读取也会命中，保留原始事件并按中优先级观测，不据此确认会话窃取、认证绕过或横向移动，不单独触发自动隔离。Login Data 由 R-CRED-003 观察；工具名称出现在目标文件路径不构成工具执行证据。需结合真实访问者、目标用户归属及独立攻击证据研判。",
+      "description": "本地观察 Chrome、Edge 或 Firefox Cookie 文件读取；浏览器、备份或脚本自身读取不独立构成安全告警。保留原始采集条件与本地证据用于关联；明确解密操作且实际对象一致由 R-CRED-017 检测。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
@@ -3370,6 +3809,9 @@
           "(?i)ngrok.*tcp",
           "(?i)frp.*\\-c",
           "(?i)\\-(L|R|D)\\s+[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3399,6 +3841,9 @@
           "(?i)GetTypeFromProgID",
           "(?i)\\[Activator\\]::CreateInstance",
           "(?i)New-Object.*\\-ComObject"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3418,6 +3863,9 @@
         "file_path_regex_any": [
           "(?i)\\\\Windows\\\\System32\\\\config\\\\(SAM|SYSTEM|SECURITY)$",
           "(?i)\\\\Windows\\\\System32\\\\config\\\\RegBack\\\\(SAM|SYSTEM|SECURITY)$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3446,6 +3894,9 @@
           "tar.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3468,6 +3919,9 @@
           "(?i)\\\\Users\\\\[^\\\\]+\\\\[.]azure\\\\.*",
           "(?i)\\\\Users\\\\[^\\\\]+\\\\AppData\\\\Roaming\\\\gcloud\\\\.*",
           "(?i)\\\\Users\\\\[^\\\\]+\\\\AppData\\\\Roaming\\\\Microsoft\\\\Windows\\\\PowerShell\\\\PSReadLine\\\\ConsoleHost_history\\.txt$"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3494,6 +3948,9 @@
           8118,
           9001,
           9050
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3523,6 +3980,9 @@
           9300,
           11211,
           27017
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3552,6 +4012,9 @@
           "(?i)aws\\s+ec2\\s+describe",
           "(?i)aws\\s+sts\\s+get-caller",
           "(?i)aws\\s+iam\\s+list"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3576,6 +4039,9 @@
           "(?i)aws\\s+s3\\s+(cp|sync|mv).*\\-\\-recursive",
           "(?i)megatools\\s+(dl|put)",
           "(?i)onedrive\\-uploader"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3616,6 +4082,9 @@
           "cscript.exe",
           "curl.exe",
           "conhost.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3640,6 +4109,9 @@
         ],
         "process_name_in": [
           "mshta.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3662,6 +4134,9 @@
           "(?i)\\b(edrkillshifter|edrsandblast|edrsilencer|poortry|burntcigar|aukill|spyboy|terminator|gmer|backstab|hollowreaper|pchw|pchunter|hrsword)\\b",
           "(?i)\\bsc(\\.exe)?\\s+create\\s+[^\\n]{0,200}type=\\s*kernel",
           "(?i)\\bsc(\\.exe)?\\s+create\\s+\\S+\\s+binpath=\\s*[^\\n]{0,200}\\.sys"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3684,6 +4159,9 @@
           "(?i)\\bsc(\\.exe)?\\s+(stop|config)\\s+(WinDefend|WdNisSvc|Sense|MsMpSvc|CSFalconService|CylanceSvc|SentinelAgent|SentinelOne|CarbonBlack|CbDefense|Sophos|SepMasterService|TaniumClient|ElasticEndpoint|osqueryd)\\b",
           "(?i)\\b(net|net1)(\\.exe)?\\s+stop\\s+(WinDefend|WdNisSvc|Sense|MsMpSvc|CSFalconService|CylanceSvc|SentinelAgent|CarbonBlack|Sophos|SepMasterService|TaniumClient|ElasticEndpoint)\\b",
           "(?i)\\btaskkill(\\.exe)?[^\\n]{0,120}\\b(msmpeng|senseir|sense|csfalcon|sentinelagent|cylancesvc|carbonblack|cbdefense|sophos|elastic-endpoint|elastic-agent|osqueryd)\\b"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3712,6 +4190,9 @@
           "finger.exe",
           "MpCmdRun.exe",
           "desktopimgdownldr.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3733,6 +4214,9 @@
         ],
         "process_name_regex_any": [
           "(?i)(^|/)(sh|bash|dash|zsh|ksh|busybox|python|python3|perl|ruby|php)(\\s|$)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3761,6 +4245,9 @@
         ],
         "process_name_regex_any": [
           "(?i)(^|/)(curl|wget|nc|netcat|ncat|socat|openssl|base64|chmod|chattr|python|python3|perl|ruby|sh|bash|dash|busybox)(\\s|$)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3787,6 +4274,9 @@
         ],
         "process_name_regex_any": [
           "(?i)(^|/)(nginx|apache2|httpd|php-fpm[^/\\s]*|php-cgi|tomcat|java|uwsgi|gunicorn|node)(:|\\s|$)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3796,11 +4286,11 @@
       "severity": 3,
       "event_type": "process_create",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1003.001"
       ],
-      "description": "检测 nanodump、dumpert、SafetyKatz、SharpKatz、comsvcs MiniDump 等 LSASS 凭据转储工具和参数组合。",
+      "description": "本地观察 LSASS 转储工具词与参数文本；工具词、帮助和文档不能独立证明转储操作。明确操作由凭据操作规则检测，不宣称转储成功。",
       "condition": {
         "command_regex_any": [
           "(?i)(nanodump|dumpert|safetykatz|sharpkatz)",
@@ -3825,7 +4315,10 @@
       ],
       "description": "完整命令参数符合受支持凭据工具的明确提取操作；仅证明进程命令尝试，不宣称凭据读取或提取成功。帮助、文档、未知参数与不完整命令保留本地。",
       "condition": {
-        "operation": "credential_tool_attempt"
+        "operation": "credential_tool_attempt",
+        "evidence_purposes": [
+          "actor_attribution"
+        ]
       }
     },
     {
@@ -3849,6 +4342,9 @@
           "(?i)sc\\.exe\\s+\\\\\\\\[^\\s]+\\s+create",
           "(?i)schtasks\\.exe\\s+/create\\s+/s\\s+[^\\s]+",
           "(?i)wmic\\s+/node:[^\\s]+\\s+process\\s+call\\s+create"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3869,6 +4365,9 @@
           "(?i)(fodhelper|computerdefaults|eventvwr|wsreset|sdclt)\\.exe.*(cmd|powershell|rundll32|reg\\s+add)",
           "(?i)reg\\.exe\\s+add.*(ms-settings|mscfile|App Paths).*DelegateExecute",
           "(?i)SilentCleanup.*(cmd|powershell|regsvr32|rundll32)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3889,6 +4388,9 @@
           "(?i)(juicypotato|roguepotato|sweetpotato|godpotato|efspotato|printspoofer)",
           "(?i)(SeImpersonatePrivilege|ImpersonateNamedPipeClient|RpcImpersonateClient)",
           "(?i)(\\\\pipe\\\\spoolss|\\\\pipe\\\\efsrpc).*?(cmd|powershell|whoami)"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3914,6 +4416,9 @@
           "pwsh.exe",
           "wscript.exe",
           "cscript.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3923,11 +4428,11 @@
       "severity": 2,
       "event_type": "file_read",
       "enabled": true,
-      "effect": "security_alert",
+      "effect": "local_observation",
       "mitre_ttps": [
         "T1539"
       ],
-      "description": "解释器读取 Cookie 数据库；保留进程身份与文件路径供云关联，不单独自动阻断合法自动化。",
+      "description": "本地观察脚本解释器读取 Cookie 数据库；解释器身份与文件路径不能独立证明会话窃取，合法备份不独立上传。保留采集与本地关联；明确解密操作且实际对象一致由 R-CRED-017 检测。",
       "condition": {
         "file_path_regex_any": [
           "(?i)\\\\Network\\\\Cookies$",
@@ -3969,6 +4474,9 @@
           "pwsh.exe",
           "wscript.exe",
           "cscript.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -3993,6 +4501,9 @@
           "pwsh.exe",
           "wscript.exe",
           "cscript.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -4020,6 +4531,9 @@
           "python.exe",
           "pythonw.exe",
           "node.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -4048,6 +4562,9 @@
           "cmd.exe",
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -4070,6 +4587,9 @@
         "process_name_in": [
           "powershell.exe",
           "pwsh.exe"
+        ],
+        "evidence_purposes": [
+          "actor_attribution"
         ]
       }
     },
@@ -4083,15 +4603,19 @@
       "mitre_ttps": [
         "T1555.003"
       ],
-      "description": "实际读取对象与同一进程完整命令中显式 dpapi::chrome /in 路径一致且带 /unprotect；仅证明解密请求，不证明窃取成功。",
+      "description": "实际读取 Login Data 或 Cookies 对象与同一进程完整命令中显式 dpapi::chrome /in 路径一致且带 /unprotect；仅证明解密请求，不证明窃取成功。",
       "condition": {
         "file_path_regex_any": [
-          "(?i)\\\\login data$"
+          "(?i)\\\\login data$",
+          "(?i)\\\\cookies$"
         ],
         "process_name_in": [
           "mimikatz.exe"
         ],
-        "operation": "credential_db_decrypt"
+        "operation": "credential_db_decrypt",
+        "evidence_purposes": [
+          "actor_attribution"
+        ]
       }
     },
     {
@@ -4116,7 +4640,10 @@
           "netexec.exe",
           "crackmapexec.exe"
         ],
-        "operation": "remote_hash_auth"
+        "operation": "remote_hash_auth",
+        "evidence_purposes": [
+          "actor_attribution"
+        ]
       }
     }
   ]

@@ -370,6 +370,12 @@ static void test_policy_hold_before_hash(void) {
   if(!child){execl(test_executable,test_executable,"--held-restart",path,(char*)NULL);_exit(127);}
   int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
 #endif
+  /* A policy revision permits only a fresh admission decision, not upload or
+   * an ACK. The old business record and artifact must still be untouched. */
+  put(hold,"edr.egress-hold.v1\ncmd_hold\nminimal-egress-v3\n-3\n1\n");
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_REQUEST_DENIED && !attempted);
+  char held_command[160];assert(edr_hold_read(hold,held_command,sizeof(held_command))==EDR_EGRESS_REQUEST_DENIED);
+  contents(path,after,sizeof(after));assert(!strcmp(before,after) && !hashed_bytes && !upload_calls && !terminal_calls);
   policy_result=EDR_EGRESS_AUTHORIZATION_EXPIRED;
   assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_EGRESS_AUTHORIZATION_EXPIRED && !attempted);
   assert(remove(hold)==0);fail_flush=1;

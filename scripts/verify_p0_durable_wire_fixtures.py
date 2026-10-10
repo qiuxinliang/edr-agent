@@ -32,11 +32,11 @@ REPO_ROOT = AGENT_ROOT.parent
 DEFAULT_P0_IR = AGENT_ROOT / "config" / "p0_rule_bundle_ir_v1.json"
 DEFAULT_SOURCE_FIXTURE = (
     REPO_ROOT / "edr-backend" / "platform" / "internal" / "handler" /
-    "testdata" / "p0_source_only_durable_wire_golden.json"
+    "testdata" / "p0_source_only_projected_wire_golden.json"
 )
 DEFAULT_TERMINAL_FIXTURE = (
     REPO_ROOT / "edr-backend" / "platform" / "internal" / "handler" /
-    "testdata" / "enforcement_terminal_authority_durable_wire_golden.json"
+    "testdata" / "enforcement_terminal_projected_wire_golden.json"
 )
 
 FIXTURE_GENERATOR_KEY = "fixture_generator"

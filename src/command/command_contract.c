@@ -1,3 +1,4 @@
+#include "edr/rtq_contract.h"
 #include "edr/command_contract.h"
 
 #include "edr/command_registry.h"
@@ -143,10 +144,10 @@ static const CommandFieldRule k_rtq_rules[] = {
     RULE("process_path", FIELD_STRING, 0, 0, 0, 519, 0),
     RULE("process_cmdline", FIELD_STRING, 0, 0, 0, 4095, 0),
     RULE("process_user", FIELD_STRING, 0, 0, 0, 127, 0),
-    RULE("process_pid_min", FIELD_NUMBER, 0, 0, 4294967295.0, 0, 0),
-    RULE("process_pid_max", FIELD_NUMBER, 0, 1, 4294967295.0, 0, 0),
+    RULE("process_pid_min", FIELD_NUMBER, 0, 0, 2147483647.0, 0, 0),
+    RULE("process_pid_max", FIELD_NUMBER, 0, 0, 2147483647.0, 0, 0),
     RULE("network_remote_ip", FIELD_STRING, 0, 0, 0, 63, 0),
-    RULE("network_remote_port", FIELD_NUMBER, 0, 1, 65535, 0, 0),
+    RULE("network_remote_port", FIELD_NUMBER, 0, 0, 65535, 0, 0),
     RULE("network_state", FIELD_STRING, 0, 0, 0, 31, 0),
     RULE("network_proto", FIELD_STRING, 0, 0, 0, 15, 0),
     RULE("file_path", FIELD_STRING, 0, 0, 0, 519, 0),
@@ -449,6 +450,128 @@ static int has_nonempty_string(const cJSON *root, const char *name) {
   return cJSON_IsString(value) && value->valuestring && value->valuestring[0];
 }
 
+static const char *contract_string(const cJSON *root, const char *name) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, name);
+  return cJSON_IsString(value) && value->valuestring ? value->valuestring : "";
+}
+
+static int contract_equals_icase(const char *left, const char *right) {
+  while (*left && *right) {
+    if (tolower((unsigned char)*left++) != tolower((unsigned char)*right++)) return 0;
+  }
+  return *left == *right;
+}
+
+static int rtq_registry_path_valid(const char *path) {
+  static const char *const hives[] = {
+    "HKLM", "HKCU", "HKCR", "HKU", "HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER",
+    "HKEY_CLASSES_ROOT", "HKEY_USERS"
+  };
+  const char *slash = strchr(path, '\\');
+  size_t length = slash ? (size_t)(slash - path) : strlen(path);
+  char hive[32];
+  if (length >= sizeof(hive)) return 0;
+  memcpy(hive, path, length);
+  hive[length] = '\0';
+  for (size_t i = 0; i < COUNT_OF(hives); i++) {
+    if (contract_equals_icase(hive, hives[i])) return 1;
+  }
+  return 0;
+}
+
+static int validate_rtq_semantics(const cJSON *root, char *reason, size_t reason_cap) {
+  int collector = 0;
+  for (const cJSON *item = root->child; item; item = item->next) {
+    if (!find_rule(k_rtq_rules, COUNT_OF(k_rtq_rules), item->string)) continue;
+    int active = 0;
+    if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+      const char *p = item->valuestring;
+      while (*p && isspace((unsigned char)*p)) p++;
+      if (!*p) return contract_fail(reason, reason_cap, "RTQ text filters must not contain only whitespace");
+      active = 1;
+    } else if (cJSON_IsNumber(item) && item->valuedouble > 0) {
+      active = 1;
+    }
+    if (!active) continue;
+    int source = !strncmp(item->string, "process_", 8u) || !strncmp(item->string, "script_", 7u) ? 1 :
+                 !strncmp(item->string, "network_", 8u) ? 2 :
+                 !strncmp(item->string, "file_", 5u) ? 3 :
+                 !strncmp(item->string, "registry_", 9u) ? 4 : 5;
+    if (collector && collector != source) {
+      return contract_fail(reason, reason_cap, "mixed RTQ collectors cannot be combined with AND; run separate queries");
+    }
+    collector = source;
+  }
+  if (!collector) return contract_fail(reason, reason_cap, "rtq_execute requires at least one effective query field");
+  const cJSON *pid_min = cJSON_GetObjectItemCaseSensitive(root, "process_pid_min");
+  const cJSON *pid_max = cJSON_GetObjectItemCaseSensitive(root, "process_pid_max");
+  if (pid_min && pid_max && pid_max->valuedouble > 0 && pid_min->valuedouble > pid_max->valuedouble) {
+    return contract_fail(reason, reason_cap, "process_pid_min must not exceed process_pid_max");
+  }
+  const char *proto = contract_string(root, "network_proto");
+  const char *state = contract_string(root, "network_state");
+  if (*proto && !contract_equals_icase(proto, "TCP") && !contract_equals_icase(proto, "UDP")) {
+    return contract_fail(reason, reason_cap, "network_proto must be TCP or UDP");
+  }
+  if (*state && !edr_rtq_network_state_supported(state)) {
+    return contract_fail(reason, reason_cap, "network_state must be a complete supported connection state");
+  }
+  if (contract_equals_icase(proto, "UDP") && *state &&
+      !contract_equals_icase(state, "UNCONN") && !contract_equals_icase(state, "UNKNOWN")) {
+    return contract_fail(reason, reason_cap, "UDP does not expose TCP connection states");
+  }
+  const char *registry_mode = contract_string(root, "registry_mode");
+  const char *registry_path = contract_string(root, "registry_path");
+  if (*registry_mode && !contract_equals_icase(registry_mode, "exact") &&
+      !contract_equals_icase(registry_mode, "subtree")) {
+    return contract_fail(reason, reason_cap, "registry_mode must be exact or subtree");
+  }
+  if ((*registry_mode || has_nonempty_string(root, "registry_value")) && !*registry_path) {
+    return contract_fail(reason, reason_cap, "registry_path is required with registry_value or registry_mode");
+  }
+  if (*registry_path && !rtq_registry_path_valid(registry_path)) {
+    return contract_fail(reason, reason_cap, "registry_path must start with a supported Windows hive");
+  }
+  const char *sha = contract_string(root, "file_sha256");
+  if (*sha && (strlen(sha) != 64u || strspn(sha, "0123456789abcdefABCDEF") != 64u)) {
+    return contract_fail(reason, reason_cap, "file_sha256 must contain 64 hex characters");
+  }
+  const char *content = contract_string(root, "script_content");
+  const char *cmdline = contract_string(root, "process_cmdline");
+  if (*content && *cmdline && strcmp(content, cmdline)) {
+    return contract_fail(reason, reason_cap, "script_content and process_cmdline cannot carry different predicates");
+  }
+  return 1;
+}
+
+// cJSON strings use NUL termination. Reject encoded NUL before decoding so a
+// signed predicate cannot be shortened by string consumers after validation.
+static int rtq_payload_text_valid(const uint8_t *payload, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    unsigned char first = payload[i];
+    if (!first) return 0;
+    if (first < 0x80u) continue;
+    size_t extra = first >= 0xc2u && first <= 0xdfu ? 1u :
+                   first >= 0xe0u && first <= 0xefu ? 2u :
+                   first >= 0xf0u && first <= 0xf4u ? 3u : 0u;
+    if (!extra || i + extra >= length) return 0;
+    unsigned char second = payload[i + 1u];
+    if ((first == 0xe0u && second < 0xa0u) || (first == 0xedu && second >= 0xa0u) ||
+        (first == 0xf0u && second < 0x90u) || (first == 0xf4u && second >= 0x90u)) return 0;
+    for (size_t j = 1u; j <= extra; j++) {
+      if ((payload[i + j] & 0xc0u) != 0x80u) return 0;
+    }
+    i += extra;
+  }
+  for (size_t i = 0; i + 1u < length; i++) {
+    if (payload[i] != '\\') continue;
+    if (i + 5u < length && payload[i + 1u] == 'u' &&
+        !memcmp(payload + i + 2u, "0000", 4u)) return 0;
+    i++; // Skip escaped backslashes, including literal "\\\\u0000" text.
+  }
+  return 1;
+}
+
 static int validate_semantics(EdrCommandKind kind, const cJSON *root,
                               char *reason, size_t reason_cap) {
   if (kind == EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL) {
@@ -475,32 +598,7 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     if (errno || !n) return contract_fail(reason, reason_cap, "process creation time overflows uint64");
   }
   if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
-    const cJSON *registry_mode = cJSON_GetObjectItemCaseSensitive(root, "registry_mode");
-    if (registry_mode) {
-      if (!cJSON_IsString(registry_mode) || !registry_mode->valuestring ||
-          (strcmp(registry_mode->valuestring, "exact") != 0 &&
-           strcmp(registry_mode->valuestring, "subtree") != 0)) {
-        return contract_fail(reason, reason_cap,
-                             "registry_mode must be exact or subtree");
-      }
-      if (!has_nonempty_string(root, "registry_path")) {
-        return contract_fail(reason, reason_cap,
-                             "registry_mode requires registry_path");
-      }
-    }
-    const cJSON *sha = cJSON_GetObjectItemCaseSensitive(root, "file_sha256");
-    if (sha && cJSON_IsString(sha) && sha->valuestring && sha->valuestring[0]) {
-      if (strlen(sha->valuestring) != 64u) {
-        return contract_fail(reason, reason_cap,
-                             "file_sha256 must contain 64 hex characters");
-      }
-      for (const char *p = sha->valuestring; *p; p++) {
-        if (!isxdigit((unsigned char)*p)) {
-          return contract_fail(reason, reason_cap,
-                               "file_sha256 must contain 64 hex characters");
-        }
-      }
-    }
+    return validate_rtq_semantics(root, reason, reason_cap);
   }
   if (kind == EDR_COMMAND_KIND_PUT_FILE) {
     const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data_b64");
@@ -684,18 +782,6 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
       }
     }
   }
-  if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
-    int query_fields = 0;
-    for (const cJSON *item = root->child; item; item = item->next) {
-      if (item->string && strcmp(item->string, "initiated_by") != 0 &&
-          strcmp(item->string, "reason") != 0 && strcmp(item->string, "manual") != 0) {
-        query_fields++;
-      }
-    }
-    if (query_fields == 0) {
-      return contract_fail(reason, reason_cap, "rtq_execute requires at least one query field");
-    }
-  }
   return 1;
 }
 
@@ -742,6 +828,10 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
   }
   if (payload_len > 0u && !payload) {
     return contract_fail(reason, reason_cap, "command payload pointer is null");
+  }
+  if (descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE && payload_len > 0u &&
+      !rtq_payload_text_valid(payload, payload_len)) {
+    return contract_fail(reason, reason_cap, "RTQ payload must contain valid UTF-8 text without NUL");
   }
   if (payload_len == 0u) {
     return descriptor->payload_schema == EDR_COMMAND_PAYLOAD_NONE_OR_OBJECT

@@ -30,20 +30,24 @@ WINDOWS_EXPECTED = {
     "windows_native_uninstall_behavior", "process_generation_same_handle_command_line",
     "cmd_actor_and_script_artifact",
     "kernel_file_io_identity", "collector_file_read_windows", "etw_network_decode_native",
+    "etw_process_payload_identity_native",
     "collector_health_disposition_json",
     "security_event_time_native", "security_event_time_failures", "wfas_provider_native",
-    "rtq_long_command_windows",
+    "rtq_long_command_windows", "rtq_collector_behavior",
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
+    "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
-    "openssl_tls_handshake", "windows_task_exit_behavior", "validation_trace_contract",
+    "openssl_tls_handshake", "windows_task_exit_behavior", "windows_task_trace_environment",
+    "validation_trace_contract",
 }
 RUNTIME_EXPECTED = {
     "installer_runtime_health_classification", "report_events_ack_contract",
     "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
     "transport_durable_owner", "transport_v2_status_capacity", "ave_sdk_smoke",
+    "ave_parent_integrity",
     "process_evidence_pending", "telemetry_admission", "windows_event_policy", "health_upload", "pid_history_pmfe_generation",
     "behavior_record_alert_proto_contract",
     "behavior_record_alert_emit_contract", "p0_direct_emit_suppression", "p0_deferred_snapshot",
@@ -57,7 +61,9 @@ RUNTIME_EXPECTED = {
     "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
 }
-EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED
+NON_WINDOWS_RUNTIME_EXPECTED = {"ave_parent_integrity_mutex"}
+EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED | (
+    NON_WINDOWS_RUNTIME_EXPECTED if os.name != "nt" else set())
 PREVIOUSLY_UNBUILT = {
     "test_process_generation_windows", "test_response_file_security",
     "test_response_forensic_paths",
@@ -109,7 +115,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
         """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
         names = ("windows_release_collector_pe_closure",
-                 "windows_inplace_collector_transaction")
+                 "windows_inplace_collector_transaction",
+                 "windows_installer_log_redaction")
         definitions = (ROOT / "tests" / "CMakeLists.txt").read_text(encoding="utf-8")
         declarations = []
         for name in names:
@@ -124,7 +131,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
         # Carry the production deadlines into the fixture as well as commands.
         properties = re.search(
             r"  set_tests_properties\(\s*windows_release_collector_pe_closure\s*"
-            r"windows_inplace_collector_transaction\s*PROPERTIES TIMEOUT \d+\)", definitions)
+            r"windows_inplace_collector_transaction\s*windows_installer_log_redaction\s*"
+            r"PROPERTIES TIMEOUT \d+\)", definitions)
         self.assertIsNotNone(properties)
         declarations.append(properties.group(0))
 
@@ -211,7 +219,14 @@ class WindowsReleaseGateTests(unittest.TestCase):
         self.assertEqual({name for name, _ in pairs}, WINDOWS_EXPECTED)
         runtime_pairs = re.findall(r'^\s*edr_agent_runtime_gate\((\w+) (\w+)\)$',
                                    RUNTIME_GATE.read_text(encoding="utf-8"), re.MULTILINE)
-        self.assertEqual({name for name, _ in runtime_pairs}, RUNTIME_EXPECTED)
+        self.assertEqual({name for name, _ in runtime_pairs},
+                         RUNTIME_EXPECTED | NON_WINDOWS_RUNTIME_EXPECTED)
+        # The declarations include a real NOT WIN32 owner. Keep its mutex
+        # coverage on host fixtures without selecting a nonexistent Windows
+        # test/target in native release gates.
+        if os.name == "nt":
+            runtime_pairs = [(name, target) for name, target in runtime_pairs
+                             if name not in NON_WINDOWS_RUNTIME_EXPECTED]
         pairs += runtime_pairs
         source = Path(directory)
         (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
@@ -270,7 +285,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_missing_runtime_target_fails_at_configuration(self):
         for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer",
-                       "test_p0_candidate_replay"):
+                       "test_p0_candidate_replay", "test_ave_parent_integrity"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_target=target)
                 result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
@@ -279,11 +294,14 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_security_queue_and_detection_failures_block_both_gate_labels(self):
         # Inject failures in each newly required group, not just check labels in text.
-        for name in ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
+        names = ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
                      "behavior_record_alert_proto_contract", "command_signature_cross_language",
                      "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
                      "windows_rule_semantic_audit", "installer_runtime_health_classification",
-                     "report_events_ack_contract"):
+                     "report_events_ack_contract", "ave_parent_integrity")
+        if os.name != "nt":
+            names += ("ave_parent_integrity_mutex",)
+        for name in names:
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
@@ -293,15 +311,16 @@ class WindowsReleaseGateTests(unittest.TestCase):
                                               "--no-tests=error", "--output-on-failure", success=False)
                     self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
-    def test_installer_health_failure_blocks_windows_release(self):
-        name = "windows_installer_health_behavior"
-        with tempfile.TemporaryDirectory() as directory:
-            source, build, _ = self.fixture(directory, failing_test=name)
-            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
-            self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
-            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
-                                      "--no-tests=error", "--output-on-failure", success=False)
-            self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+    def test_installer_health_and_redaction_failures_block_windows_release(self):
+        for name in ("windows_installer_health_behavior", "windows_installer_log_redaction",
+                     "windows_task_trace_environment"):
+            with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, failing_test=name)
+                self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+                self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
+                result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                          "--no-tests=error", "--output-on-failure", success=False)
+                self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
     def test_empty_selection_fails(self):
         with tempfile.TemporaryDirectory() as directory:

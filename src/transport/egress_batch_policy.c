@@ -4,6 +4,7 @@
 #include "edr/transport_sink.h"
 #include "edr/types.h"
 #include "edr/evidence_projection.h"
+#include "edr/parent_pid.h"
 #include "edr/v1/event.pb.h"
 #include "cJSON.h"
 #include <pb_common.h>
@@ -221,6 +222,11 @@ static const JsonField dynamic_fields[]={E("subject_type",32,"edr_dynamic_rule")
   S("display_title",384),O("context",dynamic_context_fields),O("enforcement",enforcement_fields),END};
 static const JsonField p0_journal_enforcement_fields[]={B("requested"),B("attempted"),B("succeeded"),
   S("action",64),U("error_code"),S("message",160),END};
+/* New v2 terminals use the finite rule evidence context; legacy v0
+ * journal frames retain their original closed schema and exact ownership. */
+static const JsonField p0_projected_subject_fields[]={E("subject_type",32,"edr_dynamic_rule"),
+  S("rule_id",128),S("rules_bundle_version",255),S("rules_bundle_sha256",64),S("display_title",384),
+  O("context",dynamic_context_fields),O("enforcement",p0_journal_enforcement_fields),END};
 static const JsonField p0_journal_subject_fields[]={E("subject_type",32,"edr_dynamic_rule"),
   S("rule_id",128),S("rules_bundle_version",255),S("rules_bundle_sha256",64),S("display_title",384),
   O("context",p0_journal_subject_context_fields),O("enforcement",p0_journal_enforcement_fields),END};
@@ -317,6 +323,11 @@ static const JsonField p0_signature_fields[]={S("status",64),S("source",96),S("s
   S("thumbprint",192),S("revocation",64),S("quality",64),S("reason",160),END};
 static const JsonField p0_evidence_fields[]={O("artifact",p0_artifact_fields),S("file_identity",128),
   O("hash",p0_hash_fields),O("signature",p0_signature_fields),B("omitted"),S("reason",160),END};
+/* A matched ordinary P0 alert has a current response consumer for its actor's
+ * file metadata, independently of the fields used by the rule predicate.
+ * This closed snapshot explanation is not a file target, generic diagnostic
+ * context, or the action-authoritative terminal journal contract below. */
+static const JsonField p0_snapshot_context_fields[]={O("evidence",p0_evidence_fields),END};
 static const JsonField p0_terminal_process_fields[]={S("generation_key",32),
   {"creation_filetime_100ns",JS_U64,0,NULL,NULL},S("canonical_image_path",4096),
   S("file_identity",128),B("file_identity_available"),END};
@@ -441,6 +452,11 @@ static int engine_alert(const edr_v1_BehaviorEvent *ev, const cJSON *subject) {
   const cJSON *ctx = cJSON_GetObjectItemCaseSensitive(subject, "detection_context");
   const cJSON *process = cJSON_GetObjectItemCaseSensitive(ctx, "process");
   const cJSON *signals = cJSON_GetObjectItemCaseSensitive(ctx, "engine_signals");
+  const cJSON *parent = cJSON_GetObjectItemCaseSensitive(process, "parent_pid");
+  if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && parent &&
+      (!cJSON_IsNumber(parent) || parent->valuedouble < 0 || parent->valuedouble > UINT32_MAX ||
+       floor(parent->valuedouble) != parent->valuedouble ||
+        parent->valuedouble != ev->ppid)) return 0;
   const char *engine = string(ctx, "engine"), *rule = string(ctx, "rule_id");
   const cJSON *threshold=cJSON_GetObjectItemCaseSensitive(basis,"threshold");
   const cJSON *flags=cJSON_GetObjectItemCaseSensitive(basis,"behavior_flags");
@@ -597,7 +613,7 @@ static int operation_evidence_valid(const edr_v1_BehaviorEvent *ev) {
     return (ev->required_evidence_fields & EDR_EVIDENCE_NETWORK)!=0;
   if (!strcmp(ev->operation_evidence_json,"{\"kind\":\"credential_tool_attempt\"}"))
     return ev->type==EDR_EVENT_PROCESS_CREATE &&
-        ev->required_evidence_fields==(EDR_EVIDENCE_OPERATION|EDR_EVIDENCE_USER);
+        (ev->required_evidence_fields & ~EDR_EVIDENCE_USER)==EDR_EVIDENCE_OPERATION;
   return 0;
 }
 static int dynamic_context_purpose(cJSON *subject,uint64_t mask,int project) {
@@ -618,13 +634,58 @@ static int dynamic_context_purpose(cJSON *subject,uint64_t mask,int project) {
     }
   return 1;
 }
+/* Native target identity owners, not arbitrary display labels. This content
+ * purpose check never substitutes for rule authority or exact frame ownership. */
+static int target_identity_qualified(const edr_v1_BehaviorEvent *ev) {
+  if (!ev->username[0]) return 0;
+  if (!strcmp(ev->identity_source,"target_4688") && !strcmp(ev->identity_quality,"target_4688")) return 1;
+  if (strcmp(ev->identity_quality,"token_sid")) return 0;
+  static const char *sources[]={"kernel_process_token","token_query","token_cache",
+    "token_query_4688_validated","token_cache_4688_validated"};
+  for (size_t i=0;i<sizeof(sources)/sizeof(sources[0]);i++)
+    if (!strcmp(ev->identity_source,sources[i])) return 1;
+  return 0;
+}
+static int projected_version(uint32_t version) {
+  return version == EDR_EVIDENCE_PROJECTION_VERSION ||
+      version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION;
+}
+static int parent_pid_fields_valid(const edr_v1_BehaviorEvent *ev) {
+  if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION)
+    return !ev->has_parent_pid_state;
+  if (!ev->has_parent_pid_state) return 0;
+  /* A purpose authorizes available evidence; it is not a detection predicate.
+   * An unavailable/conflicting edge may carry diagnostics, never borrowed
+   * parent text or ancestry. This v3 check does not alter frozen v2 fields. */
+  if (ev->parent_pid_state != EDR_PARENT_PID_KNOWN &&
+      (ev->parent_name[0] || ev->parent_path[0] || ev->process_chain_depth ||
+       ev->process_context.has_parent_name || ev->process_context.parent_name[0] ||
+       ev->process_context.has_parent_path || ev->process_context.parent_path[0] ||
+       ev->process_context.has_parent_cmdline || ev->process_context.parent_cmdline[0] ||
+       ev->process_context.has_grandparent_pid || ev->process_context.grandparent_pid ||
+       ev->process_context.has_grandparent_name || ev->process_context.grandparent_name[0] ||
+       ev->process_context.has_grandparent_path || ev->process_context.grandparent_path[0] ||
+       (ev->which_detail == edr_v1_BehaviorEvent_process_tag &&
+        (ev->detail.process.parent_name[0] || ev->detail.process.parent_path[0] ||
+         ev->detail.process.parent_cmdline[0] || ev->detail.process.grandparent_pid ||
+         ev->detail.process.grandparent_name[0] || ev->detail.process.grandparent_path[0])))) return 0;
+  switch (ev->parent_pid_state) {
+    case EDR_PARENT_PID_KNOWN: return ev->ppid != 0;
+    case EDR_PARENT_PID_UNKNOWN:
+    case EDR_PARENT_PID_EXPLICIT_ZERO:
+    case EDR_PARENT_PID_INVALID: return ev->ppid == 0;
+    case EDR_PARENT_PID_CONFLICT: return 1;
+    default: return 0;
+  }
+}
 static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   uint64_t mask=ev->required_evidence_fields;
   char identity_source[sizeof(ev->identity_source)],identity_quality[sizeof(ev->identity_quality)];
   memcpy(identity_source,ev->identity_source,sizeof(identity_source));
   memcpy(identity_quality,ev->identity_quality,sizeof(identity_quality));
+  int keep_user=(mask & EDR_EVIDENCE_USER) && target_identity_qualified(ev);
   project_supplemental_identity(ev);
-  if (!(mask & EDR_EVIDENCE_USER)) ev->username[0]=0;
+  if (!keep_user) ev->username[0]=0;
   else {
     memcpy(ev->identity_source,identity_source,sizeof(identity_source));
     memcpy(ev->identity_quality,identity_quality,sizeof(identity_quality));
@@ -644,7 +705,13 @@ static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   c->has_grandparent_name=false;c->grandparent_name[0]=0;
   c->has_grandparent_path=false;c->grandparent_path[0]=0;
   if (!(mask & (EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND|EDR_EVIDENCE_CHAIN_DEPTH))) {
-    ev->ppid=0;ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+    if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION) {
+      ev->ppid=0;
+      ev->parent_resolution_status[0]=ev->parent_resolution_source[0]=ev->parent_creation_time[0]=0;
+    }
+    /* v3 collection diagnostics are independent of optional parent text.
+     * Preserve only captured values; absence and invalid/conflicting parent
+     * states never acquire a creation identity or a successful resolution. */
   }
   int keep=(ev->which_detail==edr_v1_BehaviorEvent_file_tag && (mask&EDR_EVIDENCE_FILE)) ||
     (ev->which_detail==edr_v1_BehaviorEvent_network_tag && (mask&EDR_EVIDENCE_NETWORK)) ||
@@ -673,7 +740,7 @@ static void project_evidence_fields(edr_v1_BehaviorEvent *ev) {
   }
 }
 static int projected_evidence_valid(const edr_v1_BehaviorEvent *ev,int dynamic,int *resource_unavailable) {
-  if (ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION ||
+  if (!projected_version(ev->evidence_projection_version) || !parent_pid_fields_valid(ev) ||
       (ev->required_evidence_fields & ~EDR_EVIDENCE_ALL) ||
       ((ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY_DATA) && !(ev->required_evidence_fields&EDR_EVIDENCE_REGISTRY)) ||
       ((ev->required_evidence_fields&EDR_EVIDENCE_NETWORK_AUX) && !(ev->required_evidence_fields&EDR_EVIDENCE_NETWORK)) ||
@@ -692,6 +759,71 @@ static int generation_matches(const cJSON *ctx,const char *key,uint64_t generati
   if (cJSON_IsNull(v)) return generation==0;
   char expected[32]; snprintf(expected,sizeof(expected),"%llu",(unsigned long long)generation);
   return generation && cJSON_IsString(v) && !strcmp(v->valuestring,expected);
+}
+static int p0_snapshot_actor_matches(const edr_v1_BehaviorEvent *ev,const cJSON *subject,const cJSON *ctx) {
+  const cJSON *source=cJSON_GetObjectItemCaseSensitive(subject,"context");
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  /* P0 copies this field from the same snapshot envelope into its subject;
+   * neither copy is an identity captured from the running image section. */
+  const cJSON *source_file=cJSON_GetObjectItemCaseSensitive(source,"file_identity");
+  const cJSON *snapshot_file=cJSON_GetObjectItemCaseSensitive(evidence,"file_identity");
+  return ev->pid && ev->process_start_key && ev->process_creation_filetime_100ns &&
+    ev->image_path_canonical[0] && dynamic_alert(ev,subject) &&
+    cJSON_IsString(source_file) && cJSON_IsString(snapshot_file) &&
+    !strcmp(source_file->valuestring,snapshot_file->valuestring) &&
+    cJSON_GetObjectItemCaseSensitive(source,"process_start_key") &&
+    cJSON_GetObjectItemCaseSensitive(source,"process_creation_filetime_100ns") &&
+    generation_matches(source,"process_start_key",ev->process_start_key) &&
+    generation_matches(source,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns) &&
+    same(source,"canonical_image_path",ev->image_path_canonical);
+}
+static int p0_snapshot_evidence_valid(cJSON *ctx) {
+  if (!json_fields(ctx,p0_snapshot_context_fields,0,0)) return 0;
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  if (!cJSON_IsObject(evidence)) return 0;
+  if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(evidence,"omitted")))
+    return string(evidence,"reason")[0] &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"artifact") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"file_identity") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"hash") &&
+      !cJSON_GetObjectItemCaseSensitive(evidence,"signature");
+  const cJSON *artifact=cJSON_GetObjectItemCaseSensitive(evidence,"artifact");
+  const cJSON *digest=cJSON_GetObjectItemCaseSensitive(evidence,"hash");
+  return same(artifact,"source","post_event_path_snapshot") &&
+    (same(artifact,"quality","non_authoritative") || same(artifact,"quality","NOT_EVALUABLE")) &&
+    (!string(digest,"value")[0] || hash(string(digest,"value"))) &&
+    (!same(digest,"quality","captured") || hash(string(digest,"value")));
+}
+static int p0_snapshot_context_valid(const edr_v1_BehaviorEvent *ev,const cJSON *subject,cJSON *ctx) {
+  if (!ev->ave_result_json[0]) return 1;
+  if (!p0_snapshot_evidence_valid(ctx)) return 0;
+  const cJSON *evidence=cJSON_GetObjectItemCaseSensitive(ctx,"evidence");
+  /* An omission reports only the inability to carry optional evidence. It
+   * contains no hash, signer, identity or authority from another actor. */
+  return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(evidence,"omitted")) ||
+    p0_snapshot_actor_matches(ev,subject,ctx);
+}
+static int project_p0_snapshot_context(edr_v1_BehaviorEvent *ev,const cJSON *subject,cJSON *ctx) {
+  const char *omission=NULL;
+  if (!cJSON_GetObjectItemCaseSensitive(ctx,"evidence")) {
+    ev->ave_result_json[0]=0; /* Generic score/context still stays local. */
+    return 1;
+  }
+  if (!json_fields(ctx,p0_snapshot_context_fields,1,0) || !p0_snapshot_evidence_valid(ctx))
+    omission="process_evidence_projection_invalid";
+  else if (!p0_snapshot_context_valid(ev,subject,ctx))
+    omission="process_evidence_actor_unavailable";
+  char *text=omission?NULL:cJSON_PrintUnformatted(ctx);
+  if (!omission && !text) return 0; /* Resource failure is retryable, never success. */
+  if (!omission && strlen(text)>=sizeof(ev->ave_result_json))
+    omission="process_evidence_projection_capacity";
+  if (omission) {
+    int n=snprintf(ev->ave_result_json,sizeof(ev->ave_result_json),
+      "{\"evidence\":{\"omitted\":true,\"reason\":\"%s\"}}",omission);
+    free(text);
+    return n>0 && (size_t)n<sizeof(ev->ave_result_json);
+  }
+  strcpy(ev->ave_result_json,text);free(text);return 1;
 }
 static int supplemental_identity_empty(const edr_v1_BehaviorEvent *ev) {
   return !ev->session_id && !ev->domain[0] && !ev->user_sid[0] && !ev->logon_id[0] &&
@@ -782,7 +914,9 @@ static int p0_terminal_tuple(const edr_v1_BehaviorEvent *ev,cJSON *ctx,const cha
 }
 static int p0_terminal_context_valid(const edr_v1_BehaviorEvent *ev,cJSON *subject,cJSON *ctx) {
   if (!same(subject,"subject_type","edr_dynamic_rule") || !dynamic_alert(ev,subject) ||
-      !json_fields(subject,p0_journal_subject_fields,0,0) || !p0_terminal_tuple(ev,ctx,"result",NULL)) return 0;
+      !json_fields(subject,projected_version(ev->evidence_projection_version)?
+        p0_projected_subject_fields:p0_journal_subject_fields,0,0) ||
+      !p0_terminal_tuple(ev,ctx,"result",NULL)) return 0;
   const cJSON *terminal=cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal");
   const cJSON *process=cJSON_GetObjectItemCaseSensitive(terminal,"process");
   const cJSON *source=cJSON_GetObjectItemCaseSensitive(subject,"context");
@@ -794,7 +928,10 @@ static int p0_terminal_context_valid(const edr_v1_BehaviorEvent *ev,cJSON *subje
     same(terminal,"rules_bundle_version",string(subject,"rules_bundle_version")) &&
     same(terminal,"rules_bundle_sha256",string(subject,"rules_bundle_sha256")) &&
     same(source,"process_path",path) &&
-    same(source,"canonical_image_path",path) && !strcmp(ev->behavior_alert.process_path,path) &&
+    same(source,"canonical_image_path",path) &&
+    (projected_version(ev->evidence_projection_version)?
+      (!ev->behavior_alert.process_path[0] && !strcmp(ev->exe_path,path)):
+      !strcmp(ev->behavior_alert.process_path,path)) &&
     same(source,"file_identity",string(process,"file_identity")) &&
     generation_matches(source,"process_start_key",ev->process_start_key) &&
     generation_matches(source,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns) &&
@@ -822,6 +959,12 @@ static int p0_pair_owned(const edr_v1_BehaviorEvent *ev,cJSON *ctx,const uint8_t
   void *user=atomic_load_explicit(&p0_pair_user,memory_order_relaxed);
   return validator && validator(&tuple,frame,len,user)==1;
 }
+static int terminal_projection_valid(const edr_v1_BehaviorEvent *ev,int *resource_unavailable) {
+  if (ev->evidence_projection_version==0) return 1; /* exact historical owner */
+  return projected_version(ev->evidence_projection_version) &&
+    !ev->has_ave_behavior_feed && ev->image_path_canonical[0] &&
+    !strcmp(ev->exe_path,ev->image_path_canonical) && projected_evidence_valid(ev,1,resource_unavailable);
+}
 static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *resource_unavailable) {
   if (ev->has_behavior_alert) {
     cJSON *subject=object(ev->behavior_alert.user_subject_json);
@@ -829,14 +972,15 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *res
     int dynamic=same(subject,"subject_type","edr_dynamic_rule");
     int fanout=same(subject,"subject_type","net_fanout");
     int terminal=cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")!=NULL;
-    int valid=terminal?p0_terminal_context_valid(ev,subject,ctx):
-      (fields && json_fields(subject,fields,0,0) && !ev->ave_result_json[0] &&
+    int valid=terminal?(p0_terminal_context_valid(ev,subject,ctx) && terminal_projection_valid(ev,resource_unavailable)):
+      (fields && json_fields(subject,fields,0,0) &&
+      (dynamic?p0_snapshot_context_valid(ev,subject,ctx):!ev->ave_result_json[0]) &&
       !ev->has_ave_behavior_feed && projected_evidence_valid(ev,dynamic,resource_unavailable));
     if (valid && dynamic) {
       const cJSON *context=cJSON_GetObjectItemCaseSensitive(subject,"context");
-      /* Terminal pairs retain the exact journal commitment. Their closed
-       * context is validated above; ordinary v2 projection is not their owner. */
-      valid=(terminal || dynamic_context_purpose(subject,ev->required_evidence_fields,0)) &&
+      /* Legacy terminal bytes retain their exact journal commitment; new
+       * terminals also enforce the captured rule evidence purpose. */
+      valid=((terminal && ev->evidence_projection_version==0) || dynamic_context_purpose(subject,ev->required_evidence_fields,0)) &&
         generation_matches(context,"process_start_key",ev->process_start_key) &&
         generation_matches(context,"process_creation_filetime_100ns",ev->process_creation_filetime_100ns);
     }
@@ -848,7 +992,7 @@ static int event_fields_valid(const edr_v1_BehaviorEvent *ev,cJSON *ctx,int *res
     return valid;
   }
   if (cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal"))
-    return p0_intent_fields_valid(ev,ctx,NULL);
+    return p0_intent_fields_valid(ev,ctx,NULL) && terminal_projection_valid(ev,resource_unavailable);
   if (ev->has_ave_behavior_feed) return 0;
   const JsonField *fields=standalone_fields(ev,ctx);
   if (!fields || !json_fields(ctx,fields,0,0) || !supplemental_identity_empty(ev)) return 0;
@@ -870,18 +1014,38 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
     cJSON_Delete(ctx); return 1;
   }
   if (cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")) {
-    if (!ev->has_behavior_alert) {
-      int valid=p0_intent_fields_valid(ev,ctx,NULL); cJSON_Delete(ctx);
-      if (!valid) return deny(reason,cap,"p0_terminal_requires_exact_journal_authority");
-      if (reason && cap) snprintf(reason,cap,"p0_intent_exact_journal_retained");
-      return 1; /* Pure encoding cannot query or authorize the journal. */
-    }
     cJSON *subject=ev->has_behavior_alert?object(ev->behavior_alert.user_subject_json):NULL;
-    int valid=ev->has_behavior_alert && p0_terminal_context_valid(ev,subject,ctx);
+    int fresh=projected_version(ev->evidence_projection_version);
+    int valid=ev->evidence_projection_version==0 || fresh;
+    if (valid && fresh) {
+      /* Only fresh producer bytes are projected. Never rewrite the uint64
+       * terminal JSON lexeme or use this function to resend a journal. */
+      if (ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && !ev->has_parent_pid_state) {
+        ev->has_parent_pid_state=true;
+        ev->parent_pid_state=ev->ppid?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+      }
+      valid=parent_pid_fields_valid(ev) && operation_evidence_valid(ev);
+      if (valid && subject) {
+        valid=json_fields(subject,p0_projected_subject_fields,1,0) &&
+          dynamic_context_purpose(subject,ev->required_evidence_fields,1);
+        char *text=valid?cJSON_PrintUnformatted(subject):NULL;
+        valid=text && strlen(text)<sizeof(ev->behavior_alert.user_subject_json);
+        if (valid) strcpy(ev->behavior_alert.user_subject_json,text);
+        free(text);
+      }
+      if (valid) {
+        ev->has_ave_behavior_feed=false; memset(&ev->ave_behavior_feed,0,sizeof(ev->ave_behavior_feed));
+        project_evidence_fields(ev);
+        /* The receiver reconstructs omitted display from the canonical actor;
+         * its original spelling remains in image_path_raw. */
+        if (ev->image_path_canonical[0]) strcpy(ev->exe_path,ev->image_path_canonical);
+      }
+    }
+    if (valid) valid=ev->has_behavior_alert?p0_terminal_context_valid(ev,subject,ctx):p0_intent_fields_valid(ev,ctx,NULL);
     cJSON_Delete(subject); cJSON_Delete(ctx);
     if (!valid) return deny(reason,cap,"p0_terminal_requires_exact_journal_authority");
-    if (reason && cap) snprintf(reason,cap,"p0_terminal_exact_journal_retained");
-    return 1; /* Existing journal hashes and ACK identity cover these bytes. */
+    if (reason && cap) snprintf(reason,cap,fresh?"p0_terminal_fields_projected":"p0_terminal_exact_journal_retained");
+    return 1; /* Neither schema nor projection replaces the exact pair owner. */
   }
   cJSON *subject=NULL,*iocs=NULL; char *subject_text=NULL,*ioc_text=NULL,*ctx_text=NULL;
   const JsonField *fields=NULL; int dynamic=0,fanout=0,recognized=0,valid=1;
@@ -917,14 +1081,20 @@ int edr_egress_event_project(edr_v1_BehaviorEvent *ev,char *reason,size_t cap) {
   }
   if (recognized && valid) {
     ev->has_ave_behavior_feed=false; memset(&ev->ave_behavior_feed,0,sizeof(ev->ave_behavior_feed));
-    if (dynamic && ev->evidence_projection_version!=EDR_EVIDENCE_PROJECTION_VERSION) valid=0;
+    if (dynamic && !projected_version(ev->evidence_projection_version)) valid=0;
     if (!dynamic) {ev->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;ev->required_evidence_fields=0;ev->operation_evidence_json[0]=0;}
+    if (valid && ev->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION && !ev->has_parent_pid_state) {
+      ev->has_parent_pid_state=true;
+      ev->parent_pid_state=ev->ppid?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+    }
+    if (valid && !parent_pid_fields_valid(ev)) valid=0;
     if (valid && !operation_evidence_valid(ev)) valid=0;
     if (valid) project_evidence_fields(ev);
     if (subject_text) {
       strcpy(ev->behavior_alert.user_subject_json,subject_text);
       if (ioc_text) strcpy(ev->behavior_alert.related_iocs_json,ioc_text);
-      ev->ave_result_json[0]=0; /* Redundant generic score/context stays local. */
+      if (dynamic) { if (valid) valid=project_p0_snapshot_context(ev,subject,ctx); }
+      else ev->ave_result_json[0]=0; /* Redundant generic score/context stays local. */
     } else if (ctx_text) {
       strcpy(ev->ave_result_json,ctx_text);
       if (ev->which_detail==edr_v1_BehaviorEvent_script_tag ||
@@ -977,12 +1147,14 @@ static int frame_validate(const uint8_t *frame,size_t len,char *reason,size_t ca
   int intent=!ev->has_behavior_alert && paired;
   int valid = !source_only && (alert_valid(ev) || standalone_engine(ev,ctx,frame,len) ||
     (intent && p0_intent_fields_valid(ev,ctx,NULL)));
-  if (valid && ev->has_behavior_alert && !paired) {
-    cJSON *subject=object(ev->behavior_alert.user_subject_json);
-    if (same(subject,"subject_type","edr_dynamic_rule")) {
+  if (valid && ((ev->has_behavior_alert && !paired) ||
+      (paired && projected_version(ev->evidence_projection_version)))) {
+    cJSON *subject=ev->has_behavior_alert?object(ev->behavior_alert.user_subject_json):NULL;
+    const cJSON *authority=paired?cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal"):subject;
+    if (paired || same(subject,"subject_type","edr_dynamic_rule")) {
       EdrEgressRuleProjectionValidator validator=atomic_load_explicit(&rule_projection_validator,memory_order_acquire);
       void *user=atomic_load_explicit(&rule_projection_user,memory_order_relaxed);
-      int proven=validator?validator(string(subject,"rule_id"),string(subject,"rules_bundle_sha256"),
+      int proven=validator?validator(string(authority,"rule_id"),string(authority,"rules_bundle_sha256"),
           ev->required_evidence_fields,ev->operation_evidence_json,user):0;
       if (proven!=1) {
         cJSON_Delete(subject); cJSON_Delete(ctx); free(ev);
@@ -1176,6 +1348,12 @@ int edr_egress_batch_project_alerts(const uint8_t *header,size_t header_len,
     char why[128]; int eligible=edr_egress_frame_validate(frame,n,why,sizeof(why));
     if (!eligible) {
       cJSON *ctx=event->ave_result_json[0]?object(event->ave_result_json):NULL;
+      /* A terminal is an exact action commitment, including when its
+       * purpose/owner is unavailable. Historical maintenance must hold it,
+       * never make a differently projected child from a failed terminal. */
+      if (cJSON_GetObjectItemCaseSensitive(ctx,"enforcement_terminal")) {
+        cJSON_Delete(ctx);deny(reason,cap,why);ok=0;break;
+      }
       const JsonField *engine_fields=standalone_fields(event,ctx);
       int candidate=event->has_behavior_alert || engine_fields;
       int source_only=same(ctx,"p0_disposition","NOT_EVALUABLE");

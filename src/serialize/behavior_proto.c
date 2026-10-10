@@ -1,5 +1,7 @@
 #include "edr/behavior_proto.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/evidence_projection.h"
+#include "edr/validation_trace.h"
 
 #include "edr/ave_sdk.h"
 #include "edr/pmfe.h"
@@ -13,6 +15,64 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include "parent_command_redaction.h"
+
+static int captured_decimal(const cJSON *object, const char *key, uint64_t *out) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (!cJSON_IsString(value) || !value->valuestring || !value->valuestring[0]) return 0;
+  uint64_t parsed = 0u;
+  for (const char *p = value->valuestring; *p; ++p) {
+    if (*p < '0' || *p > '9' || parsed > (UINT64_MAX - (unsigned)(*p - '0')) / 10u) return 0;
+    parsed = parsed * 10u + (unsigned)(*p - '0');
+  }
+  *out = parsed;
+  return 1;
+}
+
+static int captured_u32(const cJSON *object, const char *key, uint32_t *out) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, key);
+  if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) || value->valuedouble < 0 ||
+      value->valuedouble > UINT32_MAX || floor(value->valuedouble) != value->valuedouble) return 0;
+  *out = (uint32_t)value->valuedouble;
+  return 1;
+}
+
+int edr_behavior_alert_process_identity(const AVEBehaviorAlert *alert,
+                                        EdrAveProcessIdentity *identity) {
+  if (!alert || !identity) return -1;
+  memset(identity, 0, sizeof(*identity));
+  if (!alert->user_subject_json[0]) return 0;
+  cJSON *subject = cJSON_ParseWithOpts(alert->user_subject_json, NULL, 1);
+  /* Parse failure, including allocation failure, is not legacy absence.
+   * Otherwise a captured conflict can be promoted by a later successful parse. */
+  if (!subject) return -1;
+  const cJSON *capture = cJSON_GetObjectItemCaseSensitive(subject, "captured_process");
+  if (!capture) { cJSON_Delete(subject); return 0; }
+  const cJSON *basis = cJSON_GetObjectItemCaseSensitive(subject, "evaluation_basis");
+  const cJSON *owner = cJSON_GetObjectItemCaseSensitive(basis, "owner");
+  uint32_t state;
+  int valid = cJSON_IsString(owner) && !strcmp(owner->valuestring, "ave_behavior_pipeline") &&
+    cJSON_IsObject(capture) && cJSON_GetArraySize(capture) == 6 &&
+    captured_u32(capture, "pid", &identity->pid) && identity->pid == alert->pid &&
+    captured_u32(capture, "parent_pid", &identity->parent_pid) && identity->parent_pid == alert->ppid &&
+    captured_u32(capture, "parent_pid_state", &state) && state <= EDR_PARENT_PID_CONFLICT &&
+    captured_decimal(capture, "process_start_key", &identity->process_start_key) &&
+    captured_decimal(capture, "process_creation_filetime_100ns", &identity->process_creation_filetime_100ns);
+  if (valid) {
+    const cJSON *source = cJSON_GetObjectItemCaseSensitive(capture, "source_event_id");
+    valid = cJSON_IsString(source) && source->valuestring &&
+      strlen(source->valuestring) < sizeof(identity->source_event_id);
+    if (valid) memcpy(identity->source_event_id, source->valuestring, strlen(source->valuestring) + 1u);
+    identity->parent_pid_state = (uint8_t)state;
+    valid = valid && ((state == EDR_PARENT_PID_KNOWN && identity->parent_pid) ||
+      state == EDR_PARENT_PID_CONFLICT ||
+      ((state == EDR_PARENT_PID_UNKNOWN || state == EDR_PARENT_PID_EXPLICIT_ZERO ||
+        state == EDR_PARENT_PID_INVALID) && !identity->parent_pid));
+  }
+  cJSON_Delete(subject);
+  return valid ? 1 : -1;
+}
 
 static void copy_str(char *dst, size_t cap, const char *src) {
   if (!dst || cap == 0) {
@@ -434,17 +494,25 @@ static void fill_process_context(edr_v1_BehaviorEvent *m, const EdrBehaviorRecor
 }
 
 static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *r,
-                              EdrTransportCompleteness *transport) {
+                              EdrTransportCompleteness *transport, int outbound) {
+  /* Choose an authorized purpose before filling a oneof. Otherwise unrelated
+   * context can take its slot and projection later removes the real object.
+   * Full local/journal encoding keeps the historical selection and bytes. */
+  int projected = outbound && (r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_VERSION ||
+      r->evidence_projection_version == EDR_EVIDENCE_PROJECTION_LEGACY_VERSION);
+  uint64_t fields = r->required_evidence_fields;
   m->which_detail = 0;
   memset(&m->detail, 0, sizeof(m->detail));
 
-  if (r->dns_query[0]) {
+  if (r->dns_query[0] && (!projected || ((fields & EDR_EVIDENCE_NETWORK) &&
+      !r->net_dst[0] && (!(fields & EDR_EVIDENCE_NETWORK_AUX) || !r->network_aux_path[0])))) {
     m->which_detail = edr_v1_BehaviorEvent_dns_tag;
     copy_record_transport_field(m->detail.dns.query_name, sizeof(m->detail.dns.query_name),
                                 r->dns_query, sizeof(r->dns_query), transport, "dns_query");
     return;
   }
-  if (r->reg_key_path[0] || r->reg_value_name[0] || r->reg_value_data[0] || r->reg_op[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_REGISTRY)) &&
+      (r->reg_key_path[0] || r->reg_value_name[0] || r->reg_value_data[0] || r->reg_op[0])) {
     m->which_detail = edr_v1_BehaviorEvent_registry_tag;
     copy_record_transport_field(m->detail.registry.key_path, sizeof(m->detail.registry.key_path),
                                 r->reg_key_path, sizeof(r->reg_key_path), transport, "reg_key_path");
@@ -455,7 +523,8 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     copy_str(m->detail.registry.operation, sizeof(m->detail.registry.operation), r->reg_op);
     return;
   }
-  if (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_NETWORK)) &&
+      (r->net_dst[0] || r->net_src[0] || r->network_aux_path[0])) {
     m->which_detail = edr_v1_BehaviorEvent_network_tag;
     copy_str(m->detail.network.src_ip, sizeof(m->detail.network.src_ip), r->net_src);
     m->detail.network.src_port = r->net_sport;
@@ -467,7 +536,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
                                 sizeof(r->network_aux_path), transport, "network_aux_path");
     return;
   }
-  if (r->file_path[0] || r->file_op[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_FILE)) && (r->file_path[0] || r->file_op[0])) {
     m->which_detail = edr_v1_BehaviorEvent_file_tag;
     copy_str(m->detail.file.operation, sizeof(m->detail.file.operation), r->file_op);
     copy_record_transport_field(m->detail.file.target_path, sizeof(m->detail.file.target_path),
@@ -476,14 +545,14 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
     m->detail.file.target_has_motw = (r->file_target_has_motw != 0u);
     return;
   }
-  if (r->script_snippet[0]) {
+  if ((!projected || (fields & EDR_EVIDENCE_SCRIPT)) && r->script_snippet[0]) {
     m->which_detail = edr_v1_BehaviorEvent_script_tag;
     copy_record_transport_field(m->detail.script.snippet, sizeof(m->detail.script.snippet),
                                 r->script_snippet, sizeof(r->script_snippet), transport,
                                 "script_snippet");
     return;
   }
-  if (record_has_process_context(r)) {
+  if (!projected && record_has_process_context(r)) {
     m->which_detail = edr_v1_BehaviorEvent_process_tag;
     copy_record_transport_field(m->detail.process.parent_name,
                                 sizeof(m->detail.process.parent_name), r->parent_name,
@@ -512,7 +581,7 @@ static void fill_oneof_detail(edr_v1_BehaviorEvent *m, const EdrBehaviorRecord *
 }
 
 static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
-                                              const EdrBehaviorRecord *r) {
+                                              const EdrBehaviorRecord *r, int outbound) {
   EdrTransportCompleteness transport = {0};
   copy_str(msg->event_id, sizeof(msg->event_id), r->event_id);
   copy_str(msg->endpoint_id, sizeof(msg->endpoint_id), r->endpoint_id);
@@ -521,6 +590,12 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
   msg->event_time_ns = r->event_time_ns;
   msg->pid = r->pid;
   msg->ppid = r->ppid;
+  if (r->evidence_projection_version != EDR_EVIDENCE_PROJECTION_LEGACY_VERSION) {
+    msg->has_parent_pid_state = true;
+    msg->parent_pid_state = r->parent_pid_state;
+    if (msg->parent_pid_state == EDR_PARENT_PID_UNKNOWN && msg->ppid)
+      msg->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  }
   msg->process_chain_depth = r->process_chain_depth;
   copy_str(msg->process_name, sizeof(msg->process_name), r->process_name);
   copy_record_transport_field(msg->cmdline, sizeof(msg->cmdline), r->cmdline,
@@ -592,7 +667,7 @@ static void fill_behavior_record_event_fields(edr_v1_BehaviorEvent *msg,
   }
   msg->priority = r->priority;
 
-  fill_oneof_detail(msg, r, &transport);
+  fill_oneof_detail(msg, r, &transport, outbound);
   fill_ave_behavior_feed(msg, r, &transport);
 
   copy_str(msg->transport_completeness, sizeof(msg->transport_completeness),
@@ -675,8 +750,29 @@ static void fill_behavior_alert_fields(edr_v1_BehaviorEvent *msg, const AVEBehav
 }
 
 static size_t encode_behavior_event(edr_v1_BehaviorEvent *msg, uint8_t *out, size_t out_cap,
-                                    int outbound) {
+                                    int outbound, const EdrBehaviorRecord *source) {
   if (outbound && !edr_egress_event_project(msg,NULL,0)) return 0;
+  if (outbound) {
+    /* Complete facts have already replaced bounded previews. Minimize only
+     * newly generated wire copies before immutable bytes/hash are assigned;
+     * local facts and exact journal/retry bytes never pass this branch. */
+    parent_command_redact(msg->process_context.parent_cmdline);
+    if (msg->which_detail == edr_v1_BehaviorEvent_process_tag)
+      parent_command_redact(msg->detail.process.parent_cmdline);
+  }
+  if (outbound && edr_validation_trace_enabled()) {
+    const char *rule_id = "";
+    cJSON *subject = cJSON_Parse(msg->behavior_alert.user_subject_json);
+    const cJSON *rule = cJSON_GetObjectItemCaseSensitive(subject, "rule_id");
+    if (!cJSON_IsString(rule)) {
+      const cJSON *context = cJSON_GetObjectItemCaseSensitive(subject, "detection_context");
+      rule = cJSON_GetObjectItemCaseSensitive(context, "rule_id");
+    }
+    if (cJSON_IsString(rule)) rule_id = rule->valuestring;
+    edr_validation_trace_parent_wire(source, msg->ppid, msg->parent_pid_state,
+      msg->evidence_projection_version, msg->required_evidence_fields, rule_id, msg->event_id);
+    cJSON_Delete(subject);
+  }
   pb_ostream_t stream = pb_ostream_from_buffer(out, out_cap);
   if (!pb_encode(&stream, edr_v1_BehaviorEvent_fields, msg)) {
     return 0;
@@ -699,6 +795,24 @@ static void resolve_wire_omission(edr_v1_BehaviorEvent *msg, const char *field) 
     copy_str(msg->source_completeness, sizeof(msg->source_completeness), "COALESCED");
 }
 
+static void resolve_restored_command(edr_v1_BehaviorEvent *msg,
+                                      const char *source_field, const char *wire_field) {
+  resolve_wire_omission(msg, source_field);
+  resolve_wire_omission(msg, wire_field);
+  /* Other transport omissions keep their provenance; source omissions alone
+   * do not imply clipping by this encoder. Overflow markers stay conservative. */
+  int transport_omission = 0;
+  const char *item = msg->truncated_fields;
+  while (*item) {
+    const char *end = strchr(item, ',');
+    size_t n = end ? (size_t)(end - item) : strlen(item);
+    if (n && (n < 7u || memcmp(item, "source.", 7u))) transport_omission = 1;
+    if (!end) break;
+    item = end + 1u;
+  }
+  if (!transport_omission) copy_str(msg->transport_completeness, sizeof(msg->transport_completeness), "COMPLETE");
+}
+
 static size_t encode_record_facts(const EdrBehaviorRecord *r,
     const AVEBehaviorAlert *alert, const char *command, const char *parent_command,
     uint8_t *out, size_t out_cap,int outbound) {
@@ -706,12 +820,14 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   size_t result;
   if (!r || !out || out_cap < 16u ||
       (command && (!command[0] || strlen(command) >= EDR_PROCESS_COMMAND_FACT_CAP)) ||
-      (parent_command && (!parent_command[0] || strlen(parent_command) >= EDR_PROCESS_COMMAND_FACT_CAP)))
+      (parent_command && (!parent_command[0] || strlen(parent_command) >= EDR_PROCESS_COMMAND_FACT_CAP)) ||
+      (command && strlen(command) >= sizeof(((edr_v1_BehaviorEvent *)0)->cmdline)) ||
+      (parent_command && strlen(parent_command) >= sizeof(((edr_v1_BehaviorEvent *)0)->process_context.parent_cmdline)))
     return 0;
   /* Complete facts do not enlarge every hot record or Windows thread stack. */
   msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
   if (!msg) return 0;
-  fill_behavior_record_event_fields(msg, r);
+  fill_behavior_record_event_fields(msg, r, outbound);
   if (alert) fill_behavior_alert_fields(msg, alert);
   if (!outbound) {
     /* Local facts and exact terminal journals use their existing full wire
@@ -725,13 +841,13 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
   }
   if (command) {
     copy_str(msg->cmdline, sizeof(msg->cmdline), command);
-    resolve_wire_omission(msg, "source.cmdline");
+    resolve_restored_command(msg, "source.cmdline", "cmdline");
   }
   if (parent_command) {
     msg->has_process_context = true;
     msg->process_context.has_parent_cmdline = true;
     copy_str(msg->process_context.parent_cmdline, sizeof(msg->process_context.parent_cmdline), parent_command);
-    resolve_wire_omission(msg, "source.parent_cmdline");
+    resolve_restored_command(msg, "source.parent_cmdline", "parent_cmdline");
     /* The authoritative common context carries the fact once. Do not send
      * a duplicate long value through the deprecated ProcessDetail projection. */
     if (msg->which_detail == edr_v1_BehaviorEvent_process_tag) {
@@ -740,7 +856,7 @@ static size_t encode_record_facts(const EdrBehaviorRecord *r,
       else msg->detail.process.parent_cmdline[0] = 0;
     }
   }
-  result = encode_behavior_event(msg, out, out_cap,outbound);
+  result = encode_behavior_event(msg, out, out_cap,outbound,r);
   free(msg);
   return result;
 }
@@ -768,8 +884,36 @@ size_t edr_behavior_alert_encode_protobuf(const AVEBehaviorAlert *a, const char 
   edr_v1_BehaviorEvent *msg = (edr_v1_BehaviorEvent *)calloc(1u, sizeof(*msg));
   if (!msg) return 0;
   fill_behavior_alert_event_fields(msg, a, endpoint_id, tenant_id);
+  EdrAveProcessIdentity capture;
+  int captured = edr_behavior_alert_process_identity(a, &capture);
+  if (captured < 0) { free(msg); return 0; }
+  if (captured) {
+    msg->has_parent_pid_state = true;
+    msg->parent_pid_state = capture.parent_pid_state;
+    msg->process_start_key = capture.process_start_key;
+    msg->process_creation_filetime_100ns = capture.process_creation_filetime_100ns;
+  }
   fill_behavior_alert_fields(msg, a);
-  size_t result = encode_behavior_event(msg, out, out_cap,1);
+  /* Capture metadata is local-only and removed by the existing projector.
+   * Preserve the AVE wire event identity; link its triggering source locally. */
+  EdrBehaviorRecord *source = NULL;
+  if (captured && capture.source_event_id[0] && edr_validation_trace_enabled()) {
+    source = calloc(1u, sizeof(*source));
+    if (source) {
+      source->pid = a->pid;
+      source->event_time_ns = a->timestamp_ns;
+      source->type = EDR_EVENT_BEHAVIOR_ONNX_ALERT;
+      source->process_start_key = capture.process_start_key;
+      source->process_creation_filetime_100ns = capture.process_creation_filetime_100ns;
+      source->ppid = capture.parent_pid;
+      source->parent_pid_state = capture.parent_pid_state;
+      copy_str(source->event_id, sizeof(source->event_id), capture.source_event_id);
+      copy_str(source->process_name, sizeof(source->process_name), a->process_name);
+      copy_str(source->exe_path, sizeof(source->exe_path), a->process_path);
+    }
+  }
+  size_t result = encode_behavior_event(msg, out, out_cap,1,source);
+  free(source);
   free(msg);
   return result;
 }

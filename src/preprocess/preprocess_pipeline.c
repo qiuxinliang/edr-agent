@@ -39,6 +39,7 @@
 #include "edr/process_evidence_pending.h"
 #include "edr/process_generation.h"
 #include "edr/windows_file_identity.h"
+#include "parent_context_snapshot.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -347,6 +348,62 @@ static const char *p0_file_read_live_generation_reason(const char *live_reason) 
  * never a creation surrogate. */
 static const char *p0_process_path_basename(const char *path);
 
+/* The child handle and event lifetime have already been validated. Keep the
+ * numeric edge independent of optional parent image/command enrichment: a
+ * missed ProcessStart event must not leave a live, proven actor UNKNOWN. */
+static void p0_enrich_bound_parent_pid(EdrBehaviorRecord *br, HANDLE process,
+                                       const EdrLiveProcessGeneration *live) {
+  ProcessTreeEntry cached;
+  uint64_t event_ns = (uint64_t)br->event_time_ns;
+  const char *cause = "source_parent_preserved";
+  char reason[64];
+  uint32_t parent_pid = 0u;
+  uint8_t parent_state = EDR_PARENT_PID_UNKNOWN;
+  if (edr_pt_cache_snapshot_generation_at(br->pid, live->process_start_key,
+      event_ns, &cached) == 0 &&
+      cached.creation_filetime_100ns == live->creation_filetime_100ns) {
+    edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,
+                         cached.ppid, cached.parent_pid_state);
+    switch (edr_parent_pid_effective_state(cached.ppid, cached.parent_pid_state)) {
+      case EDR_PARENT_PID_KNOWN: cause = "cache_parent_known"; break;
+      case EDR_PARENT_PID_EXPLICIT_ZERO: cause = "cache_parent_explicit_zero"; break;
+      case EDR_PARENT_PID_INVALID: cause = "cache_parent_invalid"; break;
+      case EDR_PARENT_PID_CONFLICT: cause = "cache_parent_conflict"; break;
+      default: break;
+    }
+  }
+  if (edr_parent_pid_effective_state(br->ppid, br->parent_pid_state) ==
+      EDR_PARENT_PID_UNKNOWN) {
+    (void)edr_process_parent_pid_query_live(process, live, &parent_pid,
+                                           &parent_state, reason, sizeof(reason));
+    edr_parent_pid_merge(&br->ppid, &br->parent_pid_state, parent_pid, parent_state);
+    cause = reason;
+  }
+  if (edr_parent_pid_effective_state(br->ppid, br->parent_pid_state) !=
+      EDR_PARENT_PID_UNKNOWN) {
+    /* Retain only this proven child's numeric fact. Existing owner merge
+     * makes disagreements sticky; it never changes birth or resurrects exit.
+     * This path reads no parent process or optional sensitive context. */
+    if (edr_pt_cache_put_generation_with_parent_state(br->pid, br->ppid,
+        br->process_name, NULL, br->exe_path, NULL, event_ns,
+        live->process_start_key, live->creation_filetime_100ns,
+        edr_behavior_source_field_truncated(br, "source.exe_path") ||
+        edr_behavior_source_field_truncated(br, "source.image_path_canonical")
+            ? EDR_PTC_SOURCE_TRUNC_EXE_PATH : 0u, br->parent_pid_state) != 0) {
+      cause = "live_parent_cache_unavailable";
+    } else if (edr_pt_cache_snapshot_generation_at(br->pid, live->process_start_key,
+        event_ns, &cached) == 0 &&
+        cached.creation_filetime_100ns == live->creation_filetime_100ns) {
+      edr_parent_pid_merge(&br->ppid, &br->parent_pid_state,
+                           cached.ppid, cached.parent_pid_state);
+    }
+  }
+  if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+      br->parent_pid_state == EDR_PARENT_PID_INVALID)
+    edr_behavior_clear_parent_context(br);
+  edr_validation_trace_event(br, "parent_query", cause);
+}
+
 static int p0_bind_process_generation(EdrBehaviorRecord *br) {
   apply_agent_ids_to_record(br);
   HANDLE process = NULL;
@@ -514,9 +571,10 @@ static int p0_bind_process_generation(EdrBehaviorRecord *br) {
     copy_trunc(br->image_path_resolution_status, sizeof(br->image_path_resolution_status), "RESOLVED");
     copy_trunc(br->image_path_resolution_source, sizeof(br->image_path_resolution_source), "live_same_generation");
   }
-  CloseHandle(process);
   br->process_start_key = live.process_start_key;
   br->process_creation_filetime_100ns = live.creation_filetime_100ns;
+  p0_enrich_bound_parent_pid(br, process, &live);
+  CloseHandle(process);
   snprintf(br->process_generation_source, sizeof(br->process_generation_source), "%s",
            br->type == EDR_EVENT_PROCESS_CREATE
                ? (source_start_key != 0u ? "kernel_payload_live_telemetry"
@@ -557,6 +615,10 @@ static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
   char reason[64];
   uint64_t parent_creation_ns;
   uint64_t child_event_ns;
+  uint64_t child_birth_ns;
+  uint64_t parent_exit_ns;
+  uint64_t verified_at_ns;
+  FILETIME verified_at;
   if (out_parent) memset(out_parent, 0, sizeof(*out_parent));
   if (!child || !out_parent || child->type != EDR_EVENT_PROCESS_CREATE ||
       child->ppid == 0u || child->process_creation_filetime_100ns == 0u) {
@@ -564,6 +626,7 @@ static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
   }
   process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, child->ppid);
   if (!process) return 0;
+  GetSystemTimeAsFileTime(&verified_at);
   memset(&live, 0, sizeof(live));
   reason[0] = '\0';
   if (!edr_process_generation_query_live(process, &live, reason, sizeof(reason)) ||
@@ -582,9 +645,22 @@ static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
     return 0;
   }
   parent_creation_ns = filetime_100ns_to_unix_ns(live.creation_filetime_100ns);
+  child_birth_ns = filetime_100ns_to_unix_ns(child->process_creation_filetime_100ns);
+  parent_exit_ns = filetime_100ns_to_unix_ns(
+      ((uint64_t)exited.dwHighDateTime << 32u) | exited.dwLowDateTime);
+  verified_at_ns = filetime_100ns_to_unix_ns(
+      ((uint64_t)verified_at.dwHighDateTime << 32u) | verified_at.dwLowDateTime);
   child_event_ns = child->event_time_ns > 0 ? (uint64_t)child->event_time_ns : 0u;
-  if (parent_creation_ns == 0u || child_event_ns == 0u ||
+  if (parent_creation_ns == 0u || child_event_ns == 0u || child_birth_ns == 0u ||
+      (parent_exit_ns && parent_exit_ns < child_birth_ns) ||
       parent_creation_ns > child_event_ns + 100000000ULL) {
+    CloseHandle(process);
+    return 0;
+  }
+  if (!parent_exit_ns && verified_at_ns < child_birth_ns) {
+    /* A clock-discontinuous future birth cannot acquire a fabricated alive
+     * witness. Preserve PPID and leave parent text explicitly unproved. */
+    edr_validation_trace_event(child, "parent_context", "parent_clock_order_unproven");
     CloseHandle(process);
     return 0;
   }
@@ -597,6 +673,9 @@ static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
   out_parent->creation_filetime_100ns = live.creation_filetime_100ns;
   out_parent->start_time_ns = parent_creation_ns;
   out_parent->last_seen_ns = child_event_ns;
+  out_parent->exit_time_ns = parent_exit_ns;
+  out_parent->exit_time_observed = parent_exit_ns != 0u;
+  out_parent->verified_alive_until_ns = parent_exit_ns ? 0u : verified_at_ns;
   snprintf(out_parent->process_name, sizeof(out_parent->process_name), "%s",
            p0_process_path_basename(path));
   copy_command_preview(out_parent->cmdline, sizeof(out_parent->cmdline), cmdline ? cmdline : "");
@@ -621,6 +700,18 @@ static int p0_resolve_live_parent_generation(EdrBehaviorRecord *child,
   (void)edr_pt_cache_put_generation(
       child->ppid, 0u, p0_process_path_basename(path), cmdline, path, NULL,
       parent_creation_ns, live.process_start_key, live.creation_filetime_100ns);
+  if (parent_exit_ns)
+    (void)edr_pt_cache_mark_exit_generation(child->ppid, live.process_start_key,
+                                            parent_exit_ns);
+  else
+    (void)edr_pt_cache_mark_alive_generation(child->ppid, live.process_start_key,
+        live.creation_filetime_100ns, out_parent->verified_alive_until_ns);
+  {
+    ProcessTreeEntry retained;
+    if (edr_pt_cache_snapshot_generation_at(child->ppid, live.process_start_key,
+            parent_creation_ns, &retained) == 0 && retained.generation_conflict)
+      out_parent->generation_conflict = 1u;
+  }
   free(cmdline);
   /* The current record is already bound by the validated live handle. Cache
    * pressure or an older same-generation timestamp must not erase that fact;
@@ -998,10 +1089,11 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
   uint64_t child_birth_ns = filetime_100ns_to_unix_ns(br->process_creation_filetime_100ns);
   uint64_t parent_selector_ns = child_birth_ns != 0u ? child_birth_ns
       : (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0);
-  if (br->ppid > 0u) {
+  int parent_verified = 0;
+  if (edr_behavior_parent_pid_usable(br)) {
     ProcessTreeEntry parent;
     int parent_from_live = 0;
-    int parent_snapshot = edr_pt_cache_snapshot_at(
+    int parent_snapshot = edr_pt_cache_snapshot_parent_at(
         br->ppid, parent_selector_ns, &parent);
     if (parent_snapshot == 0 && br->process_creation_filetime_100ns != 0u &&
         parent.creation_filetime_100ns > br->process_creation_filetime_100ns)
@@ -1015,35 +1107,16 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
     }
 #endif
     if (parent_snapshot == 0 &&
-        parent.process_start_key != 0u &&
-        parent.creation_filetime_100ns != 0u && parent.start_time_ns != 0u) {
-      br->parent_process_start_key = parent.process_start_key;
-      br->parent_process_creation_filetime_100ns = parent.creation_filetime_100ns;
-      /* The historical cache, not raw 4688 fields or a current PID lookup,
-       * owns the parent generation.  Overwrite any earlier unbound display
-       * values so an A->B PID reuse cannot borrow B's path or FILETIME. */
-      snprintf(br->parent_name, sizeof(br->parent_name), "%s", parent.process_name);
-      snprintf(br->parent_path, sizeof(br->parent_path), "%s", parent.exe_path);
-      if ((parent.source_truncation_mask & EDR_PTC_SOURCE_TRUNC_EXE_PATH) ||
-          strlen(parent.exe_path) >= sizeof(br->parent_path))
-        edr_behavior_mark_source_truncated(br, "source.parent_path");
-      edr_behavior_format_time_ns((int64_t)filetime_100ns_to_unix_ns(
-                                parent.creation_filetime_100ns), br->parent_creation_time,
-                            sizeof(br->parent_creation_time));
-      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s",
-               parent_from_live ? "live_parent_generation" : "process_tree_cache");
-      snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
-               parent.process_name[0] && parent.exe_path[0] && br->parent_creation_time[0] &&
-               !edr_behavior_source_field_truncated(br, "source.parent_path") ?
-                   "RESOLVED" : "NOT_EVALUABLE");
+        p0_adopt_parent_snapshot(br, &parent, child_birth_ns, parent_from_live)) {
+      parent_verified = 1;
     } else {
       /* A PID-only lookup cannot establish a parent generation.  Keep the
        * source record and let the P0 pre-evaluation gate emit the registered
        * missing_parent_generation disposition instead of borrowing a current
        * process that may have reused this PID. */
-      br->parent_creation_time[0] = '\0';
+      edr_behavior_clear_parent_context(br);
       snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s",
-               "generation_unavailable");
+               "parent_generation_unproven");
       snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
                "NOT_EVALUABLE");
     }
@@ -1055,21 +1128,28 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
                          ((edr_behavior_source_field_truncated(br, "source.exe_path") ||
                            edr_behavior_source_field_truncated(br, "source.image_path_canonical"))
                               ? EDR_PTC_SOURCE_TRUNC_EXE_PATH : 0u);
-    (void)edr_pt_cache_put_generation_with_provenance(
+    (void)edr_pt_cache_put_generation_with_parent_state(
         br->pid, br->ppid, br->process_name, br->cmdline, br->exe_path, br->parent_name,
         (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), br->process_start_key,
-        br->process_creation_filetime_100ns, provenance);
+        br->process_creation_filetime_100ns, provenance, br->parent_pid_state);
+    ProcessTreeEntry own;
+    if (edr_pt_cache_snapshot_generation_at(br->pid, br->process_start_key,
+        (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0), &own) == 0 &&
+        own.creation_filetime_100ns == br->process_creation_filetime_100ns) {
+      edr_parent_pid_merge(&br->ppid, &br->parent_pid_state, own.ppid, own.parent_pid_state);
+      if (br->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+          br->parent_pid_state == EDR_PARENT_PID_INVALID)
+        edr_behavior_clear_parent_context(br);
+    }
   }
-  {
+  if (parent_verified && edr_behavior_parent_pid_usable(br)) {
     uint32_t chain_depth = 0u;
     uint8_t provenance = 0u;
     edr_pt_cache_fill_record_at_with_provenance(
         br->pid, parent_selector_ns,
         br->grandparent_name, sizeof(br->grandparent_name), br->grandparent_path,
-        sizeof(br->grandparent_path), &br->grandparent_pid, br->parent_cmdline,
-        sizeof(br->parent_cmdline), &chain_depth, &provenance);
-    if (provenance & EDR_PTC_RECORD_TRUNC_PARENT_CMDLINE)
-      edr_behavior_mark_source_truncated(br, "source.parent_cmdline");
+        sizeof(br->grandparent_path), &br->grandparent_pid, NULL,
+        0u, &chain_depth, &provenance);
     if (provenance & EDR_PTC_RECORD_TRUNC_GRANDPARENT_PATH)
       edr_behavior_mark_source_truncated(br, "source.grandparent_path");
     if (chain_depth > 0u) {
@@ -1397,7 +1477,11 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   }
   /* Token identity is bound to the same live ProcessStartKey/FILETIME handle,
    * not to a pathname artifact reopened after ProcessCreate. */
+  uint32_t previous_ppid = br.ppid;
+  uint8_t previous_parent_state = br.parent_pid_state;
   enrich_process_integrity_context(&br);
+  edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state,
+                                     "identity_enriched");
   edr_local_evidence_cache_observe_process(&br);
   if (!apply_process_evidence(&br, slot)) return;
   process_enriched_record(br, slot);
@@ -1407,11 +1491,14 @@ static void process_one_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
 static void process_enriched_record(EdrBehaviorRecord br, const EdrEventSlot *slot) {
   EdrCommandFacts command_facts = {0};
   int command_facts_resolved = 0;
+  uint32_t previous_ppid = br.ppid;
+  uint8_t previous_parent_state = br.parent_pid_state;
   edr_local_evidence_cache_enrich_behavior(&br);
   edr_behavior_enrich_file_activity(&br);
   edr_windows_event_policy_apply(&br);
   /* The history owner validates the exact generation for every event family. */
   edr_pid_history_pmfe_fill_record(&br);
+  edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state, "enriched");
 #ifdef _WIN32
   {
     const char *file_read_reason = p0_file_read_unavailable_reason(&br);
@@ -1612,6 +1699,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
   process_pending_process_creates();
 #endif
   edr_behavior_from_slot(slot, &br);
+  edr_validation_trace_event(&br, "normalized", "decoded");
   if (br.collector_evidence_gate[0]) {
     process_one_record(br, slot);
     return;
@@ -1624,6 +1712,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
        * partial evidence. A later 4688 join increments it independently. */
       if (br.evidence_revision == 0u) br.evidence_revision = 1u;
       (void)p0_bind_process_generation(&br);
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Capture the target token while the newly-created process is most
        * likely still alive.  Waiting for the bounded 4688 correlation window
        * made short-lived processes lose user identity even when their target
@@ -1635,7 +1724,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
       /* Publish already verified lightweight context before the correlation
        * wait. File/network events need not wait for this process's alert. */
       apply_agent_ids_to_record(&br);
+      uint32_t previous_ppid = br.ppid;
+      uint8_t previous_parent_state = br.parent_pid_state;
       enrich_process_integrity_context(&br);
+      edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state,
+                                         "identity_enriched");
       edr_local_evidence_cache_observe_process(&br);
     }
     int candidate = p0_process_create_candidate(&br);
@@ -1656,6 +1749,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * Kernel-Network callback/logger identity. Failure preserves the source
      * observation but cannot authorize cross-process context borrowing. */
     if (!p0_bind_process_generation(&br)) {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Keep a network rule's independent endpoint facts; don't add a new
        * suppression gate merely because process attribution failed. Make
        * the missing context explicit, and prohibit stale tuple enrichment. */
@@ -1663,6 +1757,8 @@ static void process_one_slot(const EdrEventSlot *slot) {
       br.process_creation_filetime_100ns = 0u;
       snprintf(br.source_completeness, sizeof(br.source_completeness), "%s", "NOT_EVALUABLE");
       edr_p0_rule_observe_validation_stage(&br, "network_actor", br.process_generation_source);
+    } else {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
     }
   } else if (br.type == EDR_EVENT_FILE_READ) {
     /* Use the authenticated path projection before opening the actor: an
@@ -1674,8 +1770,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
       /* Detection interest is not a retention-identity requirement. Reuse
        * an already captured historical actor when available, without a live
        * query or a new P0 gate for an unrelated/expired reader. */
+      uint32_t previous_ppid = br.ppid;
+      uint8_t previous_parent_state = br.parent_pid_state;
       (void)p0_bind_file_read_cached_generation(
           &br, br.process_start_key, br.process_creation_filetime_100ns);
+      edr_validation_trace_parent_change(&br, previous_ppid, previous_parent_state, "enriched");
       apply_agent_ids_to_record(&br);
       edr_p0_rule_observe_validation_stage(&br, "file_read_interest", "verified_path_miss");
       edr_local_evidence_cache_record_behavior(&br);
@@ -1686,9 +1785,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
      * that the queried live PID generation already existed, or the same event
      * time selects an exact retained StartKey/FILETIME generation. */
     (void)p0_bind_process_generation(&br);
+    edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
   } else if (br.kernel_file_activity) {
     const char *actor_stage = br.kernel_file_write ? "file_write_actor" : "file_activity_actor";
     if (!p0_bind_process_generation(&br)) {
+      edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
       /* Preserve the real writer PID/path and failure reason locally, but
        * never evaluate or act using a different occupant of that PID. */
       snprintf(br.source_completeness, sizeof(br.source_completeness), "%s", "NOT_EVALUABLE");
@@ -1703,6 +1804,7 @@ static void process_one_slot(const EdrEventSlot *slot) {
       edr_local_evidence_cache_record_behavior(&br);
       return;
     }
+    edr_validation_trace_event(&br, "actor_binding", br.process_generation_source);
     edr_behavior_format_time_ns((int64_t)filetime_100ns_to_unix_ns(br.process_creation_filetime_100ns),
                          br.process_creation_time, sizeof(br.process_creation_time));
     (void)enrich_process_token_identity(&br);

@@ -16,13 +16,13 @@
  * header and exports these literals, so a backend provenance record cannot
  * name a parser schema, capacity, or source grammar that this binary does
  * not actually compile. */
-/* v6 adds the closed credential-tool attempt grammar. Older binaries must not
- * receive a predicate they cannot execute; v5 is read only for frozen purpose
- * authority, never activated for new matches. */
-#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v6"
-#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@6"
+/* v8 adds explicit parent-context evidence without changing rule predicates.
+ * IR7 retains its original predicate and purpose semantics for staged upgrades;
+ * IR5/6 are read only for frozen purpose authority, never activated. */
+#define EDR_P0_MATCHER_SOURCE_SCHEMA "edr.dynamic-rules.source.v8"
+#define EDR_P0_MATCHER_RULE_SCHEMA "edr_p0_rule_bundle_ir_v1@8"
 #define EDR_P0_RULE_IR_BUNDLE_KIND "edr_p0_rule_bundle_ir_v1"
-#define EDR_P0_RULE_IR_SCHEMA_VERSION 6u
+#define EDR_P0_RULE_IR_SCHEMA_VERSION 8u
 #define EDR_P0_RULE_IR_MAX_RULES 256u
 
 typedef struct {

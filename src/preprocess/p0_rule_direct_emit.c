@@ -2929,7 +2929,7 @@ static int p0_prepare_enforcement(void *opaque) {
              "terminal_context_merge_failed");
     return 0;
   }
-  intent_wire = edr_behavior_record_alloc_durable_wire_facts(&intent, NULL, prepare->command_facts, &intent_wire_len);
+  intent_wire = edr_behavior_record_alloc_outbound_wire_facts(&intent, NULL, prepare->command_facts, &intent_wire_len);
   if (intent_wire_len == 0u ||
       !edr_behavior_durable_wire_batch_id("p0-enforcement-intent", intent_wire, intent_wire_len,
                                           intent_batch_id, sizeof(intent_batch_id))) {
@@ -3074,7 +3074,7 @@ static int p0_finish_enforcement_terminal(const p0_enforcement_prepare *prepare,
     return 0;
   }
   source_wire = edr_behavior_record_alloc_durable_wire_facts(&evidence, NULL, prepare->command_facts, &source_wire_len);
-  combined_wire = edr_behavior_record_alloc_durable_wire_facts(&evidence, alert, prepare->command_facts, &combined_wire_len);
+  combined_wire = edr_behavior_record_alloc_outbound_wire_facts(&evidence, alert, prepare->command_facts, &combined_wire_len);
   if (source_wire_len == 0u || combined_wire_len == 0u ||
       !edr_behavior_durable_wire_batch_id("p0-enforcement-source", source_wire, source_wire_len,
                                           source_batch_id, sizeof(source_batch_id)) ||

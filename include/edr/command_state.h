@@ -13,6 +13,14 @@ extern "C" {
 
 #define EDR_COMMAND_STATE_DETAIL_CAP 16384u
 
+/* Called only after external signature and command payload validation. */
+int edr_command_result_bind_contract(EdrCommandResultAuthorization *authority,
+    const uint8_t *payload, size_t payload_len, int64_t issued_unix_ms);
+/* Producer and final guard share this projection; no durable bytes are edited. */
+int edr_command_result_project_detail(const EdrCommandResultAuthorization *authority,
+    const char *command_type, int execution_status, int exit_code,
+    const char *detail, char *out, size_t out_cap);
+
 typedef struct EdrCommandStateRecord {
   char command_id[128];
   char command_type[64];

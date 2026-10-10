@@ -232,7 +232,7 @@ int main(void) {
     "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"sem\",\"event_type\":\"process_create\",\"condition\":{}}]}",
     "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"pcre\",\"event_type\":\"process_create\",\"condition\":{\"command_regex_any\":[\"[\"]}}]}",
     "{\"rules\":[{\"effect\":\"security_alert\",\"id\":\"net-unsupported\",\"event_type\":\"network_connect\",\"condition\":{\"remote_port_in\":[1080],\"command_regex_any\":[\"(?i)x\"]}}]}",
-    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":7,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"effect\":\"security_alert\",\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
+    "{\"kind\":\"edr_p0_rule_bundle_ir_v1\",\"ir_schema_version\":9,\"rules_bundle_version\":\"wrong-schema\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"effect\":\"security_alert\",\"id\":\"schema\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}",
     "{\"kind\":\"wrong_ir_kind\",\"ir_schema_version\":3,\"rules_bundle_version\":\"wrong-kind\",\"rule_count\":1,\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"rules\":[{\"effect\":\"security_alert\",\"id\":\"kind\",\"event_type\":\"process_create\",\"condition\":{\"process_name_in\":[\"tool.exe\"]}}]}" };
   if (!source || !source[0] || snprintf(source_path, sizeof(source_path), "%s", source) >= (int)sizeof(source_path)) {
     fprintf(stderr, "snapshot test missing EDR_P0_IR_PATH\n"); return 1;
@@ -316,7 +316,7 @@ int main(void) {
   snprintf(bad, sizeof(bad), "%s", bad_template);
   bad_fd = mkstemp(bad); if (bad_fd < 0 || !write_all(
       bad_fd,
-      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":6,"
+      "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":8,"
       "\"rules_bundle_version\":\"snapshot-test-v1\",\"rule_count\":1,"
       "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
       "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","

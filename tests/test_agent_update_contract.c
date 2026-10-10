@@ -1,4 +1,6 @@
 #include "edr/agent_update_command.h"
+#include "edr/full_installer_readiness.h"
+#include "edr/full_installer_windows_identity.h"
 #include "edr/command_contract.h"
 #include "edr/command_registry.h"
 #include "edr/ingest_http.h"
@@ -59,6 +61,73 @@ static void require_true(int value, const char *message) {
   if (!value) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
+/* Snapshot of the 623 installer-owned task and its five relevant launcher lines.
+ * OS/COM reads are replaced by this bounded snapshot; directory extraction,
+ * readiness dispatch and strict identity validation are production functions. */
+int edr_agent_update_test_install_directory(const char *expected,
+                                             char *directory, size_t cap);
+static const char *task_snapshot_directory = "C:\\Program Files\\FDSecurity";
+static const char *task_snapshot_powershell =
+    "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+static EdrFullInstallerTaskIdentity task_snapshot = {
+    "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "
+    "\"C:\\Program Files\\FDSecurity\\FDSensorTaskLaunch.ps1\"",
+    "C:\\Program Files\\FDSecurity", "SYSTEM", 5, 1,
+    "$exe = 'C:\\Program Files\\FDSecurity\\FDSensor.exe'\n"
+    "$cfg = 'C:\\Program Files\\FDSecurity\\agent.toml'\n"
+    "$wd = 'C:\\Program Files\\FDSecurity'\n"
+    "  $agentArgs = \"--config \" + (Quote-FDNativeArg $cfg)\n"
+    "  $p = Start-Process -FilePath $exe -ArgumentList $agentArgs -WorkingDirectory $wd "
+    "-WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath "
+    "-PassThru -ErrorAction Stop\n"};
+static int snapshot_prerequisite(void *ctx, const char *path) {
+  (void)ctx; (void)path; return 1;
+}
+static int snapshot_service_absent(void *ctx, const char *path) {
+  (void)ctx; (void)path; return 0;
+}
+static int snapshot_task_identity(void *ctx, const char *expected) {
+  (void)ctx;
+  char directory[512];
+  if (!edr_agent_update_test_install_directory(expected, directory, sizeof(directory))) return 0;
+  return edr_full_installer_task_identity_matches(
+      directory, task_snapshot_powershell, &task_snapshot);
+}
+static void test_installed_task_readiness_path(void) {
+  EdrFullInstallerReadinessDeps deps = {
+      NULL, snapshot_prerequisite, snapshot_prerequisite, snapshot_prerequisite,
+      snapshot_service_absent, snapshot_task_identity, snapshot_prerequisite};
+  char reason[128], directory[512];
+  require_true(edr_full_installer_baseline_ready(
+                   &deps, task_snapshot_directory, reason, sizeof(reason)) &&
+                   strcmp(reason, "ready") == 0,
+               "installed task survives readiness mixed-separator executable path");
+  const char *executable_paths[] = {
+      "C:\\Program Files\\FDSecurity\\FDSensor.exe",
+      "C:\\Program Files\\FDSecurity/FDSensor.exe"};
+  for (size_t i = 0u; i < sizeof(executable_paths) / sizeof(executable_paths[0]); ++i) {
+    require_true(edr_agent_update_test_install_directory(
+                     executable_paths[i], directory, sizeof(directory)) &&
+                     strcmp(directory, task_snapshot_directory) == 0,
+                 "production task adapter preserves the installed directory");
+  }
+  require_true(edr_agent_update_test_install_directory(
+                   "\\\\server\\share\\FDSecurity/FDSensor.exe", directory, sizeof(directory)) &&
+                   strcmp(directory, "\\\\server\\share\\FDSecurity") == 0,
+               "mixed separator extraction preserves a UNC directory");
+  require_true(!edr_agent_update_test_install_directory("FDSensor.exe", directory, sizeof(directory)) &&
+                   !edr_agent_update_test_install_directory(executable_paths[0], directory, 8u),
+               "missing directory and truncated executable identity are rejected");
+  task_snapshot.run_level = 0;
+  require_true(!edr_full_installer_baseline_ready(
+                   &deps, task_snapshot_directory, reason, sizeof(reason)) &&
+                   strcmp(reason, "installation_identity_mismatch") == 0,
+               "directory correction does not admit a lower-privilege task identity");
+  task_snapshot.run_level = 1;
+  puts("installed task readiness: production mixed-separator boundary and strict identity passed");
+}
+
 typedef struct RecoveryFinalizeProbe {
   int upload_calls;
   int flush_calls;
@@ -98,6 +167,7 @@ static int recovery_flush_probe(const char *outbox_dir,
 }
 
 int main(void) {
+  test_installed_task_readiness_path();
   const char *valid =
       "{\"schema\":\"edr.agent_update.v1\",\"task_id\":\"task-1\","
       "\"campaign_id\":\"campaign-1\",\"operation\":\"upgrade\","

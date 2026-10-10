@@ -1866,6 +1866,30 @@ static int p0_condition_dword_array_valid(const cJSON *branches) {
   return 1;
 }
 
+/* This finite purpose set is shared by validation, the retained matcher
+ * mask, and historical authority. Purposes never become predicates. */
+static int p0_ir_evidence_purposes(const cJSON *purposes, unsigned schema,
+                                   uint64_t *out_fields) {
+  uint64_t fields = 0u;
+  if (out_fields) *out_fields = 0u;
+  if (!purposes) return 1;
+  if (schema < 7u || !cJSON_IsArray(purposes) ||
+      cJSON_GetArraySize(purposes) > (schema >= 8u ? 2 : 1)) return 0;
+  const cJSON *purpose;
+  cJSON_ArrayForEach(purpose, purposes) {
+    uint64_t field;
+    if (!cJSON_IsString(purpose)) return 0;
+    if (!strcmp(purpose->valuestring, "actor_attribution")) field = EDR_EVIDENCE_USER;
+    else if (schema >= 8u && !strcmp(purpose->valuestring, "parent_context"))
+      field = EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH | EDR_EVIDENCE_PARENT_COMMAND;
+    else return 0;
+    if (fields & field) return 0;
+    fields |= field;
+  }
+  if (out_fields) *out_fields = fields;
+  return 1;
+}
+
 /* Conditions are a security contract, not an extensible bag of hints. A
  * field unknown to the event type must reject the entire candidate rather
  * than silently weakening a rule when an Agent parser has not implemented it.
@@ -1931,6 +1955,10 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "registry_value_name_in") == 0 ||
                 strcmp(key, "registry_value_data_in") == 0 ||
                 strcmp(key, "registry_dword_any") == 0;
+    }
+    if (schema_version >= 7u && !strcmp(key,"evidence_purposes")) {
+      if (!p0_ir_evidence_purposes(item, schema_version, NULL)) return 0;
+      continue;
     }
     if (schema_version >= 5u && strcmp(key,"operation")==0 &&
         ((strcmp(event_type,"file_read")==0 && cJSON_IsString(item) && !strcmp(item->valuestring,"credential_db_decrypt")) ||
@@ -2052,6 +2080,8 @@ static int p0_ir_rule_fields_complete(const struct p0_ir_one *r,
   int file_rule = strcmp(r->event_type, "file_read") == 0 ||
                   strcmp(r->event_type, "file_write") == 0;
   if (!p0_ir_source_markers_valid(br)) return 0;
+  if ((r->n_parent_in || r->n_parent_not_in || r->n_pr_rx || r->n_pr_not_rx || r->chain_gt) &&
+      !edr_behavior_parent_pid_usable(br)) return 0;
   if (edr_behavior_source_field_truncated(br, "source.source_completeness")) return 0;
   if (file_read &&
       (edr_behavior_source_field_truncated(br, "source.image_path_resolution_status") ||
@@ -2127,25 +2157,75 @@ static int p0_ir_match_rule_to_br(const struct p0_ir_one *r, const EdrBehaviorRe
 /* Retire the proven weak predicate from its authenticated historical artifact,
  * not by looking up today's rule ID or mutating a frozen frame. Other v5
  * purpose contracts remain usable for ACK loss/restart replay. */
-static int p0_ir_retired_credential_predicate(unsigned schema,
-    const struct p0_ir_one *rule, const cJSON *condition) {
-  static const char *patterns[]={
-    "(?i)(lazagne|sharpdpapi|seatbelt).*?(password|cred|vault|dpapi|cookie|browser)",
-    "(?i)(dpapi::|vault::|chrome.*login data|firefox.*logins\\.json)",
-    "(?i)(cookies|login data|key4\\.db).*?(copy|dump|decrypt)"};
-  if (schema!=5u || strcmp(rule->event_type,"process_create") ||
-      rule->effect!=EDR_P0_EFFECT_SECURITY_ALERT || cJSON_GetArraySize(condition)!=1) return 0;
-  const cJSON *a=cJSON_GetObjectItemCaseSensitive(condition,"command_regex_any");
-  if (!cJSON_IsArray(a) || cJSON_GetArraySize(a)!=3) return 0;
+static int p0_ir_exact_string_set(const cJSON *array,const char *const *expected,int count) {
+  if (!cJSON_IsArray(array) || cJSON_GetArraySize(array)!=count) return 0;
   unsigned seen=0;
-  for (int i=0;i<3;i++) {
-    const cJSON *v=cJSON_GetArrayItem(a,i);unsigned bit=0;
-    if (!cJSON_IsString(v)) return 0;
-    for (int j=0;j<3;j++) if (!strcmp(v->valuestring,patterns[j])) bit=1u<<j;
+  for (int i=0;i<count;i++) {
+    const cJSON *value=cJSON_GetArrayItem(array,i);unsigned bit=0;
+    if (!cJSON_IsString(value)) return 0;
+    for (int j=0;j<count;j++) if (!strcmp(value->valuestring,expected[j])) bit=1u<<j;
     if (!bit || (seen&bit)) return 0;
     seen|=bit;
   }
-  return seen==7u;
+  return seen==((1u<<count)-1u);
+}
+/* Known Cookie reads remain local even if an authenticated old IR7 bundle is
+ * offered again. Match the complete predicate, never a rule ID or keyword. */
+static int p0_ir_retired_cookie_predicate(unsigned schema,const struct p0_ir_one *rule,
+                                          const cJSON *condition) {
+  static const char *const browser_paths[]={"(?i)\\\\Google\\\\Chrome\\\\.*\\\\Cookies$",
+    "(?i)\\\\Microsoft\\\\Edge\\\\.*\\\\Cookies$",
+    "(?i)\\\\Mozilla\\\\Firefox\\\\.*\\\\cookies\\.sqlite$"};
+  static const char *const script_paths[]={"(?i)\\\\Network\\\\Cookies$",
+    "(?i)\\\\cookies\\.sqlite$"};
+  static const char *const script_names[]={"python.exe",
+    "pythonw.exe",
+    "node.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "wscript.exe",
+    "cscript.exe"};
+  if (schema<5u || schema>EDR_P0_RULE_IR_SCHEMA_VERSION || strcmp(rule->event_type,"file_read") ||
+      rule->effect!=EDR_P0_EFFECT_SECURITY_ALERT || !cJSON_IsObject(condition)) return 0;
+  int keys=cJSON_GetArraySize(condition);
+  const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(condition,"evidence_purposes");
+  if (purposes) {
+    if (!p0_ir_evidence_purposes(purposes, schema, NULL)) return 0;
+    keys--;
+  }
+  const cJSON *paths=cJSON_GetObjectItemCaseSensitive(condition,"file_path_regex_any");
+  return (keys==1 && p0_ir_exact_string_set(paths,browser_paths,3)) ||
+      (keys==2 && p0_ir_exact_string_set(paths,script_paths,2) &&
+       p0_ir_exact_string_set(cJSON_GetObjectItemCaseSensitive(condition,"process_name_in"),script_names,7));
+}
+static int p0_ir_retired_credential_predicate(unsigned schema,
+    const struct p0_ir_one *rule, const cJSON *condition) {
+  static const char *credential_patterns[]={
+    "(?i)(lazagne|sharpdpapi|seatbelt).*?(password|cred|vault|dpapi|cookie|browser)",
+    "(?i)(dpapi::|vault::|chrome.*login data|firefox.*logins\\.json)",
+    "(?i)(cookies|login data|key4\\.db).*?(copy|dump|decrypt)"};
+  static const char *dump_patterns[]={
+    "(?i)(nanodump|dumpert|safetykatz|sharpkatz)",
+    "(?i)comsvcs\\.dll.*MiniDump.*lsass",
+    "(?i)rundll32\\.exe.*comsvcs\\.dll.*#?24",
+    "(?i)procdump(64)?\\.exe.*(-ma|-mm).*lsass",
+    "(?i)taskmgr\\.exe.*lsass\\.dmp"};
+  if (p0_ir_retired_cookie_predicate(schema,rule,condition)) return 1;
+  if ((schema!=5u && schema!=6u) || strcmp(rule->event_type,"process_create") ||
+      rule->effect!=EDR_P0_EFFECT_SECURITY_ALERT || cJSON_GetArraySize(condition)!=1) return 0;
+  const cJSON *a=cJSON_GetObjectItemCaseSensitive(condition,"command_regex_any");
+  int count=cJSON_GetArraySize(a);
+  const char **patterns=count==5?dump_patterns:credential_patterns;
+  if (!cJSON_IsArray(a) || (count!=5 && !(schema==5u && count==3))) return 0;
+  unsigned seen=0;
+  for (int i=0;i<count;i++) {
+    const cJSON *v=cJSON_GetArrayItem(a,i);unsigned bit=0;
+    if (!cJSON_IsString(v)) return 0;
+    for (int j=0;j<count;j++) if (!strcmp(v->valuestring,patterns[j])) bit=1u<<j;
+    if (!bit || (seen&bit)) return 0;
+    seen|=bit;
+  }
+  return seen==((1u<<count)-1u);
 }
 #if defined(EDR_P0_RULE_IR_TESTING)
 int edr_p0_rule_ir_test_retired_purpose(unsigned schema,const char *rule_json) {
@@ -2215,7 +2295,9 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
         (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
-         !(s_load_target->purpose_only && schema_version->valuedouble == 5.0)) ||
+         schema_version->valuedouble != 7.0 &&
+         !(s_load_target->purpose_only && (schema_version->valuedouble == 5.0 ||
+                                          schema_version->valuedouble == 6.0))) ||
         !cJSON_IsString(version) || !version->valuestring || !version->valuestring[0] ||
         !cJSON_IsNumber(declared_count) || declared_count->valueint < 0 ||
         (uint32_t)declared_count->valueint != (uint32_t)cJSON_GetArraySize(rules) ||
@@ -2324,6 +2406,10 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (cJSON_IsString(op)) t.operation=!strcmp(op->valuestring,"credential_db_decrypt") ? 1 :
         !strcmp(op->valuestring,"remote_hash_auth") ? 2 : 3;
     t.retired_credential_predicate=p0_ir_retired_credential_predicate(parsed_schema_version,&t,jcond);
+    if (t.retired_credential_predicate && !s_load_target->purpose_only) {
+      semantic_ok=0;
+      break;
+    }
     if (t.operation) {
       const char *keys[]={"action","enforcement_action","impact","response"};
       for (size_t k=0;k<sizeof(keys)/sizeof(keys[0]);++k) {
@@ -2443,7 +2529,12 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     if (!semantic_ok) {
       break;
     }
-    t.required_evidence_fields = EDR_EVIDENCE_USER;
+    const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(jcond,"evidence_purposes");
+    if (t.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION && purposes && cJSON_GetArraySize(purposes)) { semantic_ok=0; break; }
+    /* Frozen IR5/6/7 ownership keeps its original mask. IR8 parent context is
+     * an independent consumer purpose, never inferred from an alert label. */
+    if (!p0_ir_evidence_purposes(purposes, parsed_schema_version, &t.required_evidence_fields)) { semantic_ok=0; break; }
+    if (parsed_schema_version < 7u) t.required_evidence_fields = EDR_EVIDENCE_USER;
     if (t.n_cmd_any || t.n_cmd_all) t.required_evidence_fields |= EDR_EVIDENCE_COMMAND;
     if (t.n_parent_in || t.n_parent_not_in || t.n_pr_rx || t.n_pr_not_rx)
       t.required_evidence_fields |= EDR_EVIDENCE_PARENT_NAME;

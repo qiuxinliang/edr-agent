@@ -21,7 +21,8 @@
 #include <time.h>
 
 #define EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP (EDR_COMMAND_STATE_DETAIL_CAP * 2u + 2u)
-#define EDR_COMMAND_STATE_LINE_CAP (EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP + 16384u)
+#define EDR_COMMAND_STATE_AUTH_CAP 16384u
+#define EDR_COMMAND_STATE_LINE_CAP (EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP + 16384u + EDR_COMMAND_STATE_AUTH_CAP)
 
 #ifdef _WIN32
 #include <io.h>
@@ -80,6 +81,8 @@ static void ack_scan_unlock(void) { pthread_mutex_unlock(&s_ack_scan_lock); }
 static EdrCommandStateFileInfo s_collect_cache_info;
 static int s_collect_cache_pending_zero;
 static int64_t s_last_compact_check_ms;
+static long s_compact_retained_floor;
+static char s_compact_retained_path[1024];
 
 static long state_env_long_clamped(const char *name, long defv, long minv, long maxv);
 static void state_ensure_dir(const char *path);
@@ -446,19 +449,6 @@ static int state_replace_file(const char *tmp_path, const char *dst_path) {
   (void)remove(tmp_path);
   return -1;
 #endif
-}
-
-static char *state_strdup_line(const char *s) {
-  if (!s) {
-    return NULL;
-  }
-  size_t n = strlen(s) + 1u;
-  char *p = (char *)malloc(n);
-  if (!p) {
-    return NULL;
-  }
-  memcpy(p, s, n);
-  return p;
 }
 
 static void state_default_path(char *out, size_t cap) {
@@ -861,6 +851,8 @@ static void state_idempotency_key(const EdrSoarCommandMeta *meta, char *out, siz
   out[n] = '\0';
 }
 
+#include "command_result_contract.inc"
+
 /* Kept inside the existing inbox/result records: no separate grant store. */
 static int authorization_json(const EdrCommandResultAuthorization *auth, char *out, size_t cap) {
   EdrCommandResultAuthorization empty = {0};
@@ -872,6 +864,7 @@ static int authorization_json(const EdrCommandResultAuthorization *auth, char *o
       cJSON_AddStringToObject(root, "tenant_id", auth->tenant_id) &&
       cJSON_AddStringToObject(root, "endpoint_id", auth->endpoint_id) &&
       cJSON_AddNumberToObject(root, "expires_unix_ms", (double)auth->expires_unix_ms) &&
+      (!auth->content_contract[0] || cJSON_AddItemToObject(root, "content_contract", cJSON_Parse(auth->content_contract))) &&
       cJSON_PrintPreallocated(root, out, (int)cap, 0);
   cJSON_Delete(root);
   return ok ? 0 : -1;
@@ -897,6 +890,10 @@ static void authorization_from_line(const char *line, EdrCommandResultAuthorizat
       expires->valuedouble == (double)(int64_t)expires->valuedouble) {
     auth->expires_unix_ms = (int64_t)expires->valuedouble;
   } else memset(auth, 0, sizeof(*auth));
+  const cJSON *contract = cJSON_GetObjectItemCaseSensitive(a, "content_contract");
+  if (auth->expires_unix_ms && cJSON_IsObject(contract) &&
+      !cJSON_PrintPreallocated((cJSON *)contract, auth->content_contract, sizeof(auth->content_contract), 0))
+    memset(auth, 0, sizeof(*auth));
   cJSON_Delete(root);
 }
 
@@ -1605,7 +1602,7 @@ int edr_command_state_store_inbox(const char *command_id, const char *command_ty
   json_escape_to(step, sizeof(step), sm->playbook_step_id);
   json_escape_to(idem, sizeof(idem), sm->idempotency_key);
   json_escape_to(by, sizeof(by), sm->initiated_by);
-  char auth[1536];
+  char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&sm->result_authorization, auth, sizeof(auth)) != 0) {
     fclose(f); (void)command_inbox_delete_path(tmp);
     state_lock_release(lock); free(hex); return -1;
@@ -2396,6 +2393,15 @@ static int command_state_finish(const char *command_id, const char *command_type
                              const EdrSoarCommandMeta *meta, const char *response_status,
                              int execution_status, int exit_code, const char *detail,
                              const char *artifacts, int report_pending, int once) {
+  const char *local_detail = detail;
+  char projected_detail[EDR_COMMAND_STATE_DETAIL_CAP];
+  int content_held=0;
+  if (meta && meta->result_authorization.content_contract[0]) {
+    content_held=edr_command_result_project_detail(&meta->result_authorization, command_type,
+          execution_status, exit_code, detail ? detail : "", projected_detail,
+          sizeof(projected_detail)) != 0;
+    if(!content_held)detail=projected_detail;
+  }
   int retry = count_prior_attempts(command_id, meta);
   char idem_key[128];
   state_idempotency_key(meta, idem_key, sizeof(idem_key));
@@ -2437,28 +2443,29 @@ static int command_state_finish(const char *command_id, const char *command_type
       edr_command_state_free_inbox_record(&inbox);
     }
   }
-  char auth[1536];
+  char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&final_authority, auth, sizeof(auth)) != 0) {state_lock_release(lock);return -1;}
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
            "\"idempotency_key\":%s,\"response_status\":%s,\"execution_status\":%d,"
            "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":%d,"
            "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
-           "\"report_next_retry_unix_ms\":0,\"report_last_error\":\"\","
+           "\"report_next_retry_unix_ms\":0,\"report_last_error\":\"%s\",\"report_policy_held\":%d,\"report_policy_version\":\"%s\","
            "\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
-           0u, 0LL,
+           0u, 0LL, content_held ? "result_content_contract_denied" : "", content_held,
+           content_held ? EDR_EGRESS_POLICY_VERSION : "",
            (long long)state_now_ms(), scid, run, step, boot, pid, art, det, auth);
-  int prior=once ? matching_terminal_locked(command_id,command_type,meta,response_status,
+  int prior=(once || final_authority.content_contract[0]) ? matching_terminal_locked(command_id,command_type,meta,response_status,
       execution_status,exit_code,detail,artifacts) : 0;
   int written=prior==0 ? append_state_line(line) : prior;
   state_lock_release(lock);
-  if(written!=0)return written;
+  if(written!=0)return written==1 && !once ? 0 : written;
   edr_local_evidence_cache_record_command_result(
       command_id, command_type, response_status ? response_status : "failed",
-      execution_status, exit_code, detail, artifacts);
+      execution_status, exit_code, local_detail, artifacts);
   edr_command_state_compact_if_needed();
   return 0;
 }
@@ -2545,81 +2552,75 @@ int edr_command_state_request_cancel(const char *command_id,
   return rc == 0 ? EDR_COMMAND_STATE_CANCEL_REQUESTED : EDR_COMMAND_STATE_CANCEL_ERROR;
 }
 
+/* Index only identity/offset, then decode the latest record for each owner.
+ * Retained ACK tombstones must not occupy a bounded result delivery batch. */
+typedef struct CommandPendingOffset {
+  char command_id[128];
+  long offset;
+} CommandPendingOffset;
+static int pending_compare_owner(const void *a,const void *b) {
+  const CommandPendingOffset *x=a,*y=b;int order=strcmp(x->command_id,y->command_id);
+  return order?order:(x->offset<y->offset?-1:x->offset>y->offset);
+}
 int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
-  if (!out || cap == 0u) {
-    return 0;
-  }
-  char path[1024];
-  state_default_path(path, sizeof(path));
+  if (!out || !cap) return 0;
+  char path[1024];state_default_path(path,sizeof(path));
   EdrCommandStateFileInfo info;
-  if (state_file_info(path, &info) != 0) {
-    s_collect_cache_pending_zero = 1;
-    memset(&s_collect_cache_info, 0, sizeof(s_collect_cache_info));
-    return 0;
-  }
-  if (s_collect_cache_pending_zero && state_file_info_same(info, s_collect_cache_info)) {
-    return 0;
-  }
-
-  enum { MAX_TRACKED_COMMANDS = 512 };
-  EdrCommandStateRecord *latest =
-      (EdrCommandStateRecord *)calloc(MAX_TRACKED_COMMANDS, sizeof(EdrCommandStateRecord));
-  if (!latest) {
-    return 0;
-  }
-  FILE *lock = state_lock_acquire();
-  FILE *f = state_open_read_secure(path, NULL);
-  if (!f) {
-    state_lock_release(lock);
-    free(latest);
-    return 0;
-  }
-  size_t latest_n = 0;
-  char line[EDR_COMMAND_STATE_LINE_CAP];
-  while (fgets(line, sizeof(line), f)) {
-    EdrCommandStateRecord rec;
-    fill_record_from_line(line, &rec);
-    if (!rec.final_record || !rec.command_id[0]) {
-      continue;
+  if (state_file_info(path,&info)!=0) return 0;
+  if (s_collect_cache_pending_zero && state_file_info_same(info,s_collect_cache_info)) return 0;
+  FILE *lock=state_lock_acquire();if(!lock)return 0;
+  FILE *f=state_open_read_secure(path,NULL);
+  if(!f){state_lock_release(lock);return 0;}
+  const size_t row_limit=65536u;size_t capacity=512u,count=0,n=0;
+  CommandPendingOffset *rows=calloc(capacity,sizeof(*rows));
+  EdrCommandStateRecord *rec=calloc(1,sizeof(*rec));
+  char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);
+  int ok=rows && rec && line,pending_exists=0;const char *failure="allocation_failed";
+  while(ok) {
+    long offset=ftell(f);if(offset<0){ok=0;failure="read_position_failed";break;}
+    if(!fgets(line,EDR_COMMAND_STATE_LINE_CAP,f))break;
+    size_t length=strlen(line);
+    if(!length || line[length-1]!='\n'){ok=0;failure="incomplete_record";break;}
+    cJSON *o=edr_egress_parse_purpose_object(line,length);
+    const cJSON *id=cJSON_GetObjectItemCaseSensitive(o,"command_id");
+    const cJSON *final=cJSON_GetObjectItemCaseSensitive(o,"final");
+    if(!cJSON_IsObject(o) || !cJSON_IsString(id) || !id->valuestring[0] ||
+        strlen(id->valuestring)>=sizeof(rows[0].command_id) || !cJSON_IsNumber(final) ||
+        (final->valuedouble!=0 && final->valuedouble!=1)) {
+      cJSON_Delete(o);ok=0;failure="invalid_record";break;
     }
-    size_t idx = latest_n;
-    for (size_t i = 0; i < latest_n; i++) {
-      if (strcmp(latest[i].command_id, rec.command_id) == 0) {
-        idx = i;
-        break;
+    if(final->valueint==1) {
+      if(count==capacity) {
+        size_t next=capacity>row_limit/2u?row_limit:capacity*2u;
+        CommandPendingOffset *grown=count<row_limit?realloc(rows,next*sizeof(*rows)):NULL;
+        if(!grown){cJSON_Delete(o);ok=0;failure="scratch_capacity_exhausted";break;}
+        rows=grown;capacity=next;
       }
+      strcpy(rows[count].command_id,id->valuestring);rows[count++].offset=offset;
     }
-    if (idx == latest_n) {
-      if (latest_n >= MAX_TRACKED_COMMANDS) {
-        continue;
+    cJSON_Delete(o);
+  }
+  if(ferror(f)){ok=0;failure="read_failed";}
+  if(ok) {
+    qsort(rows,count,sizeof(*rows),pending_compare_owner);
+    int64_t now_ms=state_now_ms();
+    for(size_t first=0;first<count && n<cap;) {
+      size_t end=first+1;while(end<count && !strcmp(rows[first].command_id,rows[end].command_id))end++;
+      if(fseek(f,rows[end-1].offset,SEEK_SET) || !fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+        ok=0;failure="latest_record_read_failed";break;
       }
-      latest_n++;
-    }
-    latest[idx] = rec;
-  }
-  fclose(f);
-  state_lock_release(lock);
-  size_t n = 0;
-  int pending_exists = 0;
-  int64_t now_ms = state_now_ms();
-  for (size_t i = 0; i < latest_n && n < cap; i++) {
-    if (!latest[i].report_pending || !latest[i].command_id[0]) {
-      continue;
-    }
-    pending_exists = 1;
-    if(latest[i].report_policy_held && !strcmp(latest[i].report_policy_version,EDR_EGRESS_POLICY_VERSION))continue;
-    if (latest[i].report_next_retry_unix_ms <= 0 ||
-        latest[i].report_next_retry_unix_ms <= now_ms) {
-      out[n++] = latest[i];
+      fill_record_from_line(line,rec);first=end;
+      if(!rec->report_pending)continue;
+      pending_exists=1;
+      if(rec->report_policy_held && !strcmp(rec->report_policy_version,EDR_EGRESS_POLICY_VERSION))continue;
+      if(rec->report_next_retry_unix_ms<=0 || rec->report_next_retry_unix_ms<=now_ms)out[n++]=*rec;
     }
   }
-  free(latest);
-  if (n == 0u && !pending_exists) {
-    s_collect_cache_info = info;
-    s_collect_cache_pending_zero = 1;
-  } else {
-    s_collect_cache_pending_zero = 0;
-  }
+  if(fclose(f)!=0){ok=0;failure="read_close_failed";}
+  if(!ok){fprintf(stderr,"[command_state] pending collection incomplete: %s\n",failure);n=0;}
+  free(line);free(rec);free(rows);state_lock_release(lock);
+  if(ok && !n && !pending_exists){s_collect_cache_info=info;s_collect_cache_pending_zero=1;}
+  else s_collect_cache_pending_zero=0;
   return (int)n;
 }
 
@@ -2692,6 +2693,10 @@ int edr_command_state_result_authorized(const char *tenant, const char *endpoint
     valid = !strcmp(a->command_id, latest->command_id) &&
         !strcmp(a->command_type, latest->command_type);
   }
+  char projected[EDR_COMMAND_STATE_DETAIL_CAP];
+  valid = valid && edr_command_result_project_detail(a, latest->command_type,
+      latest->execution_status, latest->exit_code, latest->detail,
+      projected, sizeof(projected)) == 0 && !strcmp(projected, latest->detail);
   int decision = io_failed ? EDR_EGRESS_LOCAL_STATE_FAILURE : valid && a->expires_unix_ms <= now ? EDR_EGRESS_AUTHORIZATION_EXPIRED : valid;
   free(latest); free(line); cJSON_Delete(root);
   return decision;
@@ -2731,7 +2736,7 @@ static int mark_report_waiting(const EdrCommandStateRecord *record,
   uint32_t attempts = held ? record->report_attempts : record->report_attempts < UINT32_MAX
                           ? record->report_attempts + 1u
                           : UINT32_MAX;
-  char auth[1536];
+  char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&record->result_authorization, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
@@ -2807,7 +2812,7 @@ int edr_command_state_mark_reported(const EdrCommandStateRecord *record) {
 #else
   int pid = record->process_id ? record->process_id : (int)getpid();
 #endif
-  char auth[1536];
+  char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&record->result_authorization, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
            "{\"record\":\"command_state\",\"final\":1,\"command_id\":%s,\"command_type\":%s,"
@@ -2843,107 +2848,130 @@ int edr_command_state_mark_report_rejected(const EdrCommandStateRecord *record,
   return edr_command_state_mark_reported(&rejected);
 }
 
-void edr_command_state_compact_if_needed(void) {
-  char path[1024];
-  state_default_path(path, sizeof(path));
-  long max_bytes = 1024L * 1024L;
-  const char *env = getenv("EDR_COMMAND_STATE_MAX_BYTES");
-  if (env && env[0]) {
-    long v = strtol(env, NULL, 10);
-    if (v >= 65536L) {
-      max_bytes = v;
+/* Compaction may discard superseded delivery history, never the durable
+ * execution/result owner. Offsets avoid retaining all result bodies in RAM. */
+typedef struct CommandCompactRow {
+  char command_id[128], idempotency_key[128];
+  long offset;
+  size_t length;
+  unsigned final_record, retain;
+} CommandCompactRow;
+static int compact_compare_offset(const void *a,const void *b) {
+  const CommandCompactRow *x=a,*y=b;
+  return x->offset<y->offset?-1:x->offset>y->offset;
+}
+static int compact_compare_command(const void *a,const void *b) {
+  const CommandCompactRow *x=a,*y=b;int order=strcmp(x->command_id,y->command_id);
+  return order?order:compact_compare_offset(a,b);
+}
+static int compact_compare_idempotency(const void *a,const void *b) {
+  const CommandCompactRow *x=a,*y=b;int order=strcmp(x->idempotency_key,y->idempotency_key);
+  return order?order:compact_compare_offset(a,b);
+}
+static void compact_keep_latest(CommandCompactRow *rows,size_t count,int by_idempotency) {
+  qsort(rows,count,sizeof(*rows),by_idempotency?compact_compare_idempotency:compact_compare_command);
+  for(size_t first=0;first<count;) {
+    const char *key=by_idempotency?rows[first].idempotency_key:rows[first].command_id;
+    size_t end=first+1,last_final=count;
+    while(end<count && !strcmp(key,by_idempotency?rows[end].idempotency_key:rows[end].command_id))end++;
+    if(key[0]) {
+      rows[end-1].retain=1;
+      /* begin/replay checks any final before a later running marker. Keep the
+       * latest final separately so compaction cannot reopen execution. */
+      for(size_t i=first;i<end;i++)if(rows[i].final_record)last_final=i;
+      if(last_final<count)rows[last_final].retain=1;
     }
+    first=end;
   }
-  int64_t now_ms = state_now_ms();
-  long interval_ms = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_INTERVAL_MS",
-                                            60000L, 5000L, 3600000L);
-  EdrCommandStateFileInfo current_info;
-  int have_current_info = state_file_info(path, &current_info) == 0;
-  long emergency_bytes = max_bytes > 0 && max_bytes <= (LONG_MAX / 2L) ? max_bytes * 2L : max_bytes;
-  int emergency_compact = have_current_info && current_info.size > emergency_bytes;
-  if (!emergency_compact && s_last_compact_check_ms > 0 && now_ms - s_last_compact_check_ms < interval_ms) {
-    return;
-  }
-  s_last_compact_check_ms = now_ms;
+}
 
-  FILE *lock = state_lock_acquire();
-  FILE *f = state_open_read_secure(path, NULL);
-  if (!f) {
-    state_lock_release(lock);
-    return;
-  }
-  if (fseek(f, 0, SEEK_END) != 0 || ftell(f) <= max_bytes) {
-    fclose(f);
-    state_lock_release(lock);
-    return;
-  }
+void edr_command_state_compact_if_needed(void) {
+  char path[1024];state_default_path(path,sizeof(path));
+  long max_bytes=state_env_long_clamped("EDR_COMMAND_STATE_MAX_BYTES",1024L*1024L,65536L,LONG_MAX);
+  int64_t now_ms=state_now_ms();
+  long interval_ms=state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_INTERVAL_MS",60000L,5000L,3600000L);
+  EdrCommandStateFileInfo current_info={0};
+  int have_current_info=state_file_info(path,&current_info)==0;
+  long emergency_bytes=max_bytes<=LONG_MAX/2L?max_bytes*2L:max_bytes;
+  int emergency_compact=have_current_info && current_info.size>emergency_bytes;
+  /* Necessary owners can exceed the soft target indefinitely. Revisit that
+   * retained floor at the normal interval, or after one max-file-size of new
+   * history; a retry append must not trigger a full scan/sort every time. */
+  if(emergency_compact && !strcmp(path,s_compact_retained_path) && s_compact_retained_floor>0 &&
+      (current_info.size<=s_compact_retained_floor || current_info.size-s_compact_retained_floor<max_bytes))
+    emergency_compact=0;
+  if(!emergency_compact && s_last_compact_check_ms>0 && now_ms-s_last_compact_check_ms<interval_ms)return;
+  s_last_compact_check_ms=now_ms;
+  FILE *lock=state_lock_acquire();if(!lock)return;
+  FILE *f=state_open_read_secure(path,NULL);
+  if(!f){state_lock_release(lock);return;}
+  if(fseek(f,0,SEEK_END) || ftell(f)<=max_bytes){fclose(f);state_lock_release(lock);return;}
   rewind(f);
-  long keep_lines_long = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_KEEP_LINES",
-                                                300L, 64L, 1200L);
-  long target_bytes = state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_TARGET_BYTES",
-                                             max_bytes / 2L, 32768L, max_bytes);
-  size_t keep_lines = (size_t)keep_lines_long;
-  char **lines = (char **)calloc(keep_lines, sizeof(char *));
-  size_t *line_lens = (size_t *)calloc(keep_lines, sizeof(size_t));
-  if (!lines || !line_lens) {
-    free(lines);
-    free(line_lens);
-    fclose(f);
-    state_lock_release(lock);
-    return;
+  long target_bytes=state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_TARGET_BYTES",max_bytes/2L,32768L,max_bytes);
+  size_t capacity=(size_t)state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_KEEP_LINES",300L,64L,1200L);
+  /* Bounded scratch memory; reaching the limit leaves the complete original
+   * file intact and observable instead of evicting live or ACKed ownership. */
+  const size_t row_limit=65536u;
+  CommandCompactRow *rows=calloc(capacity,sizeof(*rows));
+  char *buf=malloc(EDR_COMMAND_STATE_LINE_CAP);
+  size_t count=0,retained=0,retained_bytes=0;int ok=rows && buf;
+  const char *failure="allocation_failed";
+  while(ok) {
+    long offset=ftell(f);
+    if(offset<0){ok=0;failure="read_position_failed";break;}
+    if(!fgets(buf,EDR_COMMAND_STATE_LINE_CAP,f))break;
+    size_t length=strlen(buf);
+    if(!length || buf[length-1]!='\n'){ok=0;failure="incomplete_record";break;}
+    cJSON *o=edr_egress_parse_purpose_object(buf,length);
+    const cJSON *id=cJSON_GetObjectItemCaseSensitive(o,"command_id");
+    const cJSON *idem=cJSON_GetObjectItemCaseSensitive(o,"idempotency_key");
+    const cJSON *final=cJSON_GetObjectItemCaseSensitive(o,"final");
+    if(!cJSON_IsObject(o)||strcmp(result_text(o,"record"),"command_state") ||
+        !cJSON_IsString(id)||!id->valuestring[0]||strlen(id->valuestring)>=128 ||
+        !cJSON_IsString(idem)||strlen(idem->valuestring)>=128 || !cJSON_IsNumber(final) ||
+        (final->valuedouble!=0 && final->valuedouble!=1)) {
+      cJSON_Delete(o);ok=0;failure="invalid_record";break;
+    }
+    if(count==capacity) {
+      size_t next=capacity>row_limit/2u?row_limit:capacity*2u;
+      CommandCompactRow *grown=count<row_limit?realloc(rows,next*sizeof(*rows)):NULL;
+      if(!grown){cJSON_Delete(o);ok=0;failure="scratch_capacity_exhausted";break;}
+      rows=grown;capacity=next;
+    }
+    CommandCompactRow *row=&rows[count++];memset(row,0,sizeof(*row));
+    strcpy(row->command_id,id->valuestring);strcpy(row->idempotency_key,idem->valuestring);
+    row->offset=offset;row->length=length;row->final_record=final->valueint==1;
+    cJSON_Delete(o);
   }
-  size_t idx = 0;
-  size_t retained_bytes = 0u;
-  char buf[EDR_COMMAND_STATE_LINE_CAP];
-  while (fgets(buf, sizeof(buf), f)) {
-    size_t slot = idx % keep_lines;
-    if (lines[slot]) {
-      retained_bytes = retained_bytes >= line_lens[slot] ? retained_bytes - line_lens[slot] : 0u;
-      free(lines[slot]);
-      lines[slot] = NULL;
-      line_lens[slot] = 0u;
-    }
-    lines[slot] = state_strdup_line(buf);
-    if (lines[slot]) {
-      line_lens[slot] = strlen(lines[slot]);
-      retained_bytes += line_lens[slot];
-    }
-    idx++;
+  if(ferror(f)){ok=0;failure="read_failed";}
+  if(ok) {
+    compact_keep_latest(rows,count,0);compact_keep_latest(rows,count,1);
+    qsort(rows,count,sizeof(*rows),compact_compare_offset);
+    for(size_t i=0;i<count;i++)if(rows[i].retain){retained++;retained_bytes+=rows[i].length;}
+    if(retained_bytes>(size_t)target_bytes)
+      fprintf(stderr,"[command_state] compact retained necessary owners rows=%zu bytes=%zu target=%ld\n",retained,retained_bytes,target_bytes);
   }
-  fclose(f);
-  size_t start = idx > keep_lines ? idx - keep_lines : 0u;
-  while (start + 1u < idx && retained_bytes > (size_t)target_bytes) {
-    size_t slot = start % keep_lines;
-    if (lines[slot]) {
-      retained_bytes = retained_bytes >= line_lens[slot] ? retained_bytes - line_lens[slot] : 0u;
+  char tmp[1100];tmp[0]=0;
+  if(ok && retained<count) {
+    snprintf(tmp,sizeof(tmp),"%s.tmp.%lld",path,(long long)state_now_ms());
+    FILE *out=state_open_new_secure(tmp);
+    if(!out){ok=0;failure="temporary_open_failed";}
+    for(size_t i=0;out && ok && i<count;i++)if(rows[i].retain) {
+      if(fseek(f,rows[i].offset,SEEK_SET) || fread(buf,1,rows[i].length,f)!=rows[i].length ||
+          fwrite(buf,1,rows[i].length,out)!=rows[i].length){ok=0;failure="copy_failed";}
     }
-    start++;
-  }
-  char tmp[1100];
-  snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
-  FILE *out = state_open_new_secure(tmp);
-  if (out) {
-    for (size_t i = start; i < idx; i++) {
-      char *line = lines[i % keep_lines];
-      if (line) {
-        fputs(line, out);
-      }
-    }
-    int ok = state_flush_file(out) == 0;
-    if (fclose(out) != 0) {
-      ok = 0;
-    }
-    if (ok) {
-      (void)state_replace_file(tmp, path);
-    } else {
-      (void)command_inbox_delete_path(tmp);
+    if(out) {
+      if(state_flush_file(out)!=0){ok=0;failure="flush_failed";}
+      if(fclose(out)!=0){ok=0;failure="close_failed";}
     }
   }
-  for (size_t i = 0; i < keep_lines; i++) {
-    free(lines[i]);
+  if(fclose(f)!=0){ok=0;failure="read_close_failed";}
+  if(tmp[0]) {
+    if(ok && state_replace_file(tmp,path)!=0){ok=0;failure="replace_failed";}
+    if(!ok)(void)command_inbox_delete_path(tmp);
   }
-  free(line_lens);
-  free(lines);
-  s_collect_cache_pending_zero = 0;
-  state_lock_release(lock);
+  if(!ok)fprintf(stderr,"[command_state] compact retained original state: %s\n",failure);
+  s_compact_retained_floor=ok ? (retained_bytes>(size_t)target_bytes ? (long)retained_bytes : 0) : current_info.size;
+  snprintf(s_compact_retained_path,sizeof(s_compact_retained_path),"%s",path);
+  free(buf);free(rows);s_collect_cache_pending_zero=0;state_lock_release(lock);
 }

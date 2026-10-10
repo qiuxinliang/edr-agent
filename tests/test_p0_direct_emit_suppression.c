@@ -12,6 +12,8 @@
 #include "edr/storage_queue.h"
 #include "edr/behavior_proto.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/v1/event.pb.h"
+#include <pb_decode.h>
 #include "cJSON.h"
 #include "../src/collector/collector_self_identity.h"
 
@@ -232,6 +234,12 @@ uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
   return wire;
 }
 uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  (void)facts;
+  return edr_behavior_record_alloc_durable_wire(record, alert, length);
+}
+
+uint8_t *edr_behavior_record_alloc_outbound_wire_facts(const EdrBehaviorRecord *record,
     const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
   (void)facts;
   return edr_behavior_record_alloc_durable_wire(record, alert, length);
@@ -2492,6 +2500,53 @@ static void test_optional_failure_preserves_lossless_rule_source_binding(void) {
   g_test_bundle_identity = "test-p0-ir-v1";
 }
 
+static void test_non_enforcement_process_file_evidence_reaches_wire(void) {
+  EdrConfig policy={0};policy.policy_v2.script_mode=EDR_POLICY_MODE_ALERT;
+  edr_policy_v2_configure(&policy);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC","0",1)==0);
+  edr_p0_rule_test_reset_dedup();
+  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);assert(wire);
+  const char *digest="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const char *file_id="win-fileid-v1:0000000000000001:00112233445566778899aabbccddeeff";
+  /* Only matcher and external queue ports are isolated. The real P0 owner
+   * constructs the subject and purpose, then the production codec and final
+   * send gate must preserve the optional worker tuple without enforcement. */
+  for(unsigned kind=0;kind<3;kind++) {
+    EdrBehaviorRecord r;init_complete_process_record(&r,"dedup-test.exe");
+    r.pid=5396;r.process_start_key=UINT64_C(17732923532804077);
+    r.process_creation_filetime_100ns=UINT64_C(133444000000000001);
+    r.event_time_ns=INT64_C(1700000000000000000)+(int64_t)kind;
+    snprintf(r.event_id,sizeof(r.event_id),"process-file-egress-%u",kind);
+    snprintf(r.endpoint_id,sizeof(r.endpoint_id),"ep-file-evidence");
+    snprintf(r.tenant_id,sizeof(r.tenant_id),"tenant-file-evidence");
+    snprintf(r.detection_context,sizeof(r.detection_context),
+      "{\"evidence\":{\"artifact\":{\"source\":\"post_event_path_snapshot\",\"quality\":\"%s\",\"reason\":\"%s\"},"
+      "\"file_identity\":\"%s\",\"hash\":{\"value\":\"%s\",\"source\":\"background_file_hash\",\"quality\":\"%s\",\"reason\":\"%s\"},"
+      "\"signature\":{\"status\":\"%s\",\"source\":\"%s\",\"signer\":\"%s\",\"thumbprint\":\"%s\","
+      "\"revocation\":\"%s\",\"quality\":\"%s\",\"reason\":\"%s\"}}}",
+      kind==2?"NOT_EVALUABLE":"non_authoritative",kind==2?"file_identity_unavailable":"process_image_section_unavailable",
+      kind==2?"":file_id,kind==2?"":digest,kind==2?"unknown":"captured",kind==2?"file_identity_open_failed_win32_32":"",
+      kind?"unknown":"verified",kind==2?"WinVerifyTrust":"WinVerifyTrust_handle",kind?"":"Microsoft Corporation",kind?"":"00112233445566778899aabbccddeeff00112233",
+      kind==0?"cache_only":kind==1?"cache_only_failed":"unknown",kind?"unknown":"verified_cache_chain",
+      kind==0?"verified_cache_only":kind==1?"winverifytrust_800b0100":"file_identity_open_failed_win32_32");
+    assert(edr_p0_rule_try_emit(&r)==1);
+    cJSON *subject=cJSON_Parse(g_last_alert.user_subject_json);assert(subject);
+    assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(subject,"enforcement"),"requested")));
+    cJSON_Delete(subject);
+    size_t n=edr_behavior_record_alert_encode_protobuf(&g_last_record,&g_last_alert,wire,EDR_EGRESS_FRAME_MAX);
+    char reason[96];assert(n && edr_egress_frame_validate(wire,n,reason,sizeof(reason)));
+    edr_v1_BehaviorEvent *ev=calloc(1,sizeof(*ev));assert(ev);
+    pb_istream_t stream=pb_istream_from_buffer(wire,n);
+    assert(pb_decode(&stream,edr_v1_BehaviorEvent_fields,ev));
+    assert(!strcmp(ev->ave_result_json,r.detection_context));
+    assert(ev->process_start_key==r.process_start_key && ev->process_creation_filetime_100ns==r.process_creation_filetime_100ns);
+    assert(!strstr(ev->ave_result_json,"action_authoritative") && !strstr(ev->ave_result_json,"enforcement_terminal"));
+    free(ev);
+  }
+  free(wire);
+}
+
 #if !defined(_WIN32)
 typedef struct {
   EdrBehaviorRecord record;
@@ -3295,6 +3350,7 @@ int main(void) {
   test_p0_escape_overflow_degrades_without_silent_core_loss();
   test_p0_user_subject_overflow_degrades_without_losing_alert();
   test_optional_failure_preserves_lossless_rule_source_binding();
+  test_non_enforcement_process_file_evidence_reaches_wire();
 #if !defined(_WIN32)
   test_p0_pending_claim_allows_one_same_key();
   test_rate_rollback_does_not_reopen_new_window();

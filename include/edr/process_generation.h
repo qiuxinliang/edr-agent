@@ -33,6 +33,16 @@ int edr_process_generation_query_live(void *native_process_handle,
                                       EdrLiveProcessGeneration *out,
                                       char *reason, size_t reason_cap);
 
+/* Read only the numeric parent relation from the same child process object.
+ * The expected tuple must already be bound to the event; this function checks
+ * it again against telemetry and GetProcessTimes before accepting BasicInfo.
+ * Failure preserves UNKNOWN; no parent PID is opened or queried. */
+int edr_process_parent_pid_query_live(void *native_process_handle,
+                                      const EdrLiveProcessGeneration *expected,
+                                      uint32_t *out_parent_pid,
+                                      uint8_t *out_parent_state,
+                                      char *reason, size_t reason_cap);
+
 /* Validate the currently-open handle against the ETW ProcessStartKey. */
 int edr_process_generation_validate_live(void *native_process_handle,
                                          uint32_t expected_pid,

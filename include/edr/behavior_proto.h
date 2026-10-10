@@ -5,11 +5,17 @@
 #define EDR_BEHAVIOR_PROTO_H
 
 #include "behavior_record.h"
+#include "ave_process_identity.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 typedef struct AVEBehaviorAlert AVEBehaviorAlert;
+
+/* Read the producing owner's internal capture before projection removes it.
+ * Return 0 for legacy absence, 1 for valid capture, -1 for malformed capture. */
+int edr_behavior_alert_process_identity(const AVEBehaviorAlert *alert,
+                                        EdrAveProcessIdentity *identity);
 
 /* Values must be resolved from the same generation before entry. NULL uses
  * the record preview and preserves its omission metadata. */

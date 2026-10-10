@@ -120,7 +120,8 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
   ULONG cb = 0;
   ULONG st = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &pdd, &cb);
   if (st != ERROR_SUCCESS || cb == 0 || cb > 65536) {
-    ULONG result = st != ERROR_SUCCESS ? st : ERROR_NOT_FOUND;
+    ULONG result = st != ERROR_SUCCESS ? st
+                                      : (cb > 65536 ? ERROR_INSUFFICIENT_BUFFER : ERROR_NOT_FOUND);
     edr_tdh_note_property_status(result);
     return result;
   }
@@ -176,6 +177,11 @@ static ULONG edr_prop_utf8(PEVENT_RECORD rec, PCWSTR prop_name, char *out,
         HeapFree(GetProcessHeap(), 0, tmp);
       }
       return ERROR_SUCCESS;
+    }
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+      if (heap_tmp) HeapFree(GetProcessHeap(), 0, tmp);
+      edr_tdh_note_property_status(ERROR_INSUFFICIENT_BUFFER);
+      return ERROR_INSUFFICIENT_BUFFER;
     }
   }
 
@@ -321,6 +327,76 @@ typedef struct {
   PCWSTR name;
   const char *key;
 } EdrPropTry;
+
+/* An ETW1 field is a fact, not a preview: never write a partial line. Process
+ * identity precedes text, and loss metadata has its own bounded reservation. */
+static int edr_append_process_kv(char *out, size_t cap, size_t *off,
+                                 const char *key, char *value) {
+  size_t key_len = strlen(key), value_len = strlen(value);
+  if (*off >= cap || key_len + value_len + 2u >= cap - *off) return 0;
+  for (size_t i = 0u; i < value_len; ++i)
+    if (value[i] == '\r' || value[i] == '\n') value[i] = ' ';
+  return append_utf8(out, cap, off, "%s=%s\n", key, value) != 0u;
+}
+
+static void edr_process_loss(char *lost, size_t cap, const char *field) {
+  size_t used = strlen(lost), len = strlen(field);
+  if (used + (used ? 1u : 0u) + len >= cap) {
+    snprintf(lost, cap, "%s", "source.list_overflow");
+    return;
+  }
+  if (used) lost[used++] = ',';
+  memcpy(lost + used, field, len + 1u);
+}
+
+static int edr_append_process_alias(PEVENT_RECORD rec, const EdrPropTry *tries,
+                                    size_t n, char *line, size_t line_cap,
+                                    char *out, size_t cap, size_t *off,
+                                    char *lost, size_t lost_cap,
+                                    const char *field) {
+  for (size_t i = 0u; i < n; ++i) {
+    ULONG status = edr_prop_utf8(rec, tries[i].name, line, line_cap);
+    if (status == ERROR_INSUFFICIENT_BUFFER) {
+      edr_process_loss(lost, lost_cap, field);
+      return 1;
+    }
+    if (status == ERROR_SUCCESS && line[0]) {
+      /* The first available provider alias owns the canonical key. A later
+       * zero/empty alias cannot overwrite its process relationship. */
+      if (!edr_append_process_kv(out, cap, off, tries[i].key, line)) {
+        edr_process_loss(lost, lost_cap, field);
+        return 0;
+      }
+      return 1;
+    }
+  }
+  return 1;
+}
+
+static void edr_append_process_text(PEVENT_RECORD rec, const EdrPropTry *tries,
+                                     size_t n, char *line, size_t line_cap,
+                                     char *out, size_t cap, size_t *off,
+                                     char *lost, size_t lost_cap) {
+  for (size_t i = 0u; i < n;) {
+    size_t end = i + 1u;
+    const char *key = tries[i].key;
+    const char *field;
+    while (end < n && strcmp(key, tries[end].key) == 0) ++end;
+    if (strcmp(key, "img") == 0)
+      field = "source.exe_path,source.process_name,source.image_path_raw";
+    else if (strcmp(key, "cmd") == 0) field = "source.cmdline";
+    else if (strcmp(key, "parent_img") == 0)
+      field = "source.parent_path,source.parent_name";
+    else if (strcmp(key, "parent_cmdline") == 0) field = "source.parent_cmdline";
+    else if (strcmp(key, "cwd") == 0) field = "source.current_directory";
+    else if (strcmp(key, "user") == 0) field = "source.username";
+    else if (strcmp(key, "ip") == 0) field = "source.net_dst_ip";
+    else field = "source.sensor_detail";
+    (void)edr_append_process_alias(rec, tries + i, end - i, line, line_cap,
+                                   out, cap, off, lost, lost_cap, field);
+    i = end;
+  }
+}
 
 static void edr_try_append_all(PEVENT_RECORD rec, const EdrPropTry *tries, size_t n,
                                char *line_buf, size_t line_cap, char *out, size_t out_cap,
@@ -661,6 +737,12 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
 
   const size_t off_after_hdr = off;
 
+  static const EdrPropTry proc_identity_try[] = {
+      {L"ParentProcessId", "ppid"}, {L"ParentProcessID", "ppid"},
+      {L"ParentID", "ppid"}, {L"ParentId", "ppid"}, {L"CreatorProcessId", "ppid"},
+      {L"ProcessId", "epid"}, {L"ProcessID", "epid"}, {L"PID", "epid"},
+      {L"NewProcessId", "epid"}, {L"NewProcessID", "epid"},
+  };
   static const EdrPropTry proc_try[] = {
       {L"ImageFileName", "img"}, {L"ImageName", "img"}, {L"Filename", "img"},
       {L"ProcessName", "img"}, {L"NewProcessName", "img"}, {L"ApplicationName", "img"},
@@ -673,10 +755,6 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"ParentProcessCommandLine", "parent_cmdline"},
       {L"CreatorCommandLine", "parent_cmdline"},
       {L"CurrentDirectory", "cwd"}, {L"WorkingDirectory", "cwd"},
-      {L"ParentProcessId", "ppid"}, {L"ParentProcessID", "ppid"},
-      {L"ParentID", "ppid"}, {L"ParentId", "ppid"}, {L"CreatorProcessId", "ppid"},
-      {L"ProcessId", "epid"}, {L"ProcessID", "epid"}, {L"PID", "epid"},
-      {L"NewProcessId", "epid"}, {L"NewProcessID", "epid"},
   };
   static const EdrPropTry file_try[] = {
       {L"FileName", "file"},
@@ -749,6 +827,11 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"IssuerName", "cert_issuer"},
       {L"CertIssuerName", "cert_issuer"},
   };
+  static const EdrPropTry sec_identity_try[] = {
+      {L"CreatorProcessId", "ppid"}, {L"ParentProcessId", "ppid"},
+      {L"NewProcessId", "epid"}, {L"NewProcessID", "epid"},
+      {L"ProcessId", "epid"}, {L"ProcessID", "epid"},
+  };
   static const EdrPropTry sec_try[] = {
       {L"SubjectUserName", "user"},
       {L"NewProcessName", "img"},
@@ -764,12 +847,6 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
       {L"CreatorCommandLine", "parent_cmdline"},
       {L"CurrentDirectory", "cwd"},
       {L"WorkingDirectory", "cwd"},
-      {L"NewProcessId", "epid"},
-      {L"NewProcessID", "epid"},
-      {L"ProcessId", "epid"},
-      {L"ProcessID", "epid"},
-      {L"CreatorProcessId", "ppid"},
-      {L"ParentProcessId", "ppid"},
       {L"IpAddress", "ip"},
       {L"WorkstationName", "ws"},
   };
@@ -796,8 +873,19 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   const GUID *g = &rec->EventHeader.ProviderId;
 
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    char lost[192] = {0};
+    /* Numeric actor/parent facts and the exact target generation must survive
+     * large command text. Keep one value per canonical provider property. */
+    for (size_t i = 0u; i < sizeof(proc_identity_try) / sizeof(proc_identity_try[0]);) {
+      size_t end = i + 1u;
+      while (end < sizeof(proc_identity_try) / sizeof(proc_identity_try[0]) &&
+             strcmp(proc_identity_try[i].key, proc_identity_try[end].key) == 0) ++end;
+      if (!edr_append_process_alias(rec, proc_identity_try + i, end - i, line,
+            sizeof(line), (char *)out, out_cap, &off, lost, sizeof(lost),
+            strcmp(proc_identity_try[i].key, "ppid") == 0 ? "source.ppid" : "source.pid"))
+        return 0u;
+      i = end;
+    }
     {
       static const PCWSTR process_key_names[] = {
           L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
@@ -828,6 +916,18 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
                       ? "kernel_process_payload"
                       : (process_key != 0u ? "kernel_process_payload_key_only"
                                            : "kernel_process_payload_unavailable"));
+    }
+    /* The loss envelope is at most 246 bytes including its terminating NUL.
+     * Reserve it before optional text, rather than trying to append it after
+     * the event payload has already filled its fixed capacity. */
+    if (out_cap <= off + 256u) return 0u;
+    const size_t text_cap = out_cap - 256u;
+    edr_append_process_text(rec, proc_try, sizeof(proc_try) / sizeof(proc_try[0]),
+                             line, sizeof(line), (char *)out, text_cap, &off,
+                             lost, sizeof(lost));
+    if (lost[0]) {
+      append_utf8((char *)out, out_cap, &off, "source_completeness=TRUNCATED\n");
+      append_utf8((char *)out, out_cap, &off, "source_truncated_fields=%s\n", lost);
     }
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, file_try, sizeof(file_try) / sizeof(file_try[0]), line,
@@ -865,8 +965,25 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
     edr_try_append_all(rec, schannel_try, sizeof(schannel_try) / sizeof(schannel_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);
   } else if (memcmp(g, &EDR_ETW_GUID_SECURITY_AUDIT, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, sec_try, sizeof(sec_try) / sizeof(sec_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    char lost[192] = {0};
+    for (size_t i = 0u; i < sizeof(sec_identity_try) / sizeof(sec_identity_try[0]);) {
+      size_t end = i + 1u;
+      while (end < sizeof(sec_identity_try) / sizeof(sec_identity_try[0]) &&
+             strcmp(sec_identity_try[i].key, sec_identity_try[end].key) == 0) ++end;
+      if (!edr_append_process_alias(rec, sec_identity_try + i, end - i, line,
+            sizeof(line), (char *)out, out_cap, &off, lost, sizeof(lost),
+            strcmp(sec_identity_try[i].key, "ppid") == 0 ? "source.ppid" : "source.pid"))
+        return 0u;
+      i = end;
+    }
+    if (out_cap <= off + 256u) return 0u;
+    edr_append_process_text(rec, sec_try, sizeof(sec_try) / sizeof(sec_try[0]),
+                             line, sizeof(line), (char *)out, out_cap - 256u, &off,
+                             lost, sizeof(lost));
+    if (lost[0]) {
+      append_utf8((char *)out, out_cap, &off, "source_completeness=TRUNCATED\n");
+      append_utf8((char *)out, out_cap, &off, "source_truncated_fields=%s\n", lost);
+    }
   } else if (memcmp(g, &EDR_ETW_GUID_WMI_ACTIVITY, sizeof(GUID)) == 0) {
     edr_try_append_all(rec, wmi_try, sizeof(wmi_try) / sizeof(wmi_try[0]), line,
                        sizeof(line), (char *)out, out_cap, &off);

@@ -1,4 +1,5 @@
 #include "edr/egress_request_policy.h"
+#include "edr/agent_update_manifest.h"
 #include "cJSON.h"
 #ifdef NDEBUG
 #undef NDEBUG
@@ -61,7 +62,119 @@ static void test_health_leaf_delta(void) {
     assert((check("POST","ingest/engine-health/delta",body)==0)==(i<2));
   }
 }
+static cJSON *upgrade_entry(cJSON *root) {
+  cJSON *health = cJSON_GetObjectItemCaseSensitive(root, "engine_health");
+  cJSON *manifest = cJSON_GetObjectItemCaseSensitive(health, "capability_manifest");
+  return cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(manifest, "commands"), "agent_update_v1");
+}
+static void test_upgrade_health_consumers(void) {
+  EdrAgentUpdateRuntimeInfo info = {0};
+  info.ready = 1; info.protocol_version = 5; info.materialized = 1; info.full_installer_ready = 1;
+  snprintf(info.source, sizeof(info.source), "embedded");
+  snprintf(info.version, sizeof(info.version), "3.2.622");
+  memset(info.sha256, 'a', 64); memset(info.runtime_identity_sha256, 'b', 64);
+  snprintf(info.full_installer_reason, sizeof(info.full_installer_reason), "ready");
+  snprintf(info.installation_family, sizeof(info.installation_family), "embedded_full_installer");
+  snprintf(info.installation_baseline, sizeof(info.installation_baseline), "3.2.622");
+  char fragment[2048], body[4096], why[128];
+  assert(edr_agent_update_manifest_fragment(&info, fragment, sizeof(fragment)) == 0);
+  fragment[strlen(fragment) - 1u] = 0;
+  snprintf(body, sizeof(body), "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.622\",\"policy_version\":\"p\","
+      "\"engine_health\":{\"capability_manifest\":{\"commands\":{%s}},"
+      "\"communication\":{\"enterprise\":{\"protocol\":{\"negotiated_protocol\":\"h2\",\"control_stream_status\":\"connected\"}}},"
+      "\"command_delivery\":{\"executor\":{\"started\":true,\"live_workers\":4,\"private_detail\":\"synthetic-secret\"}}}}", fragment);
+  char *wire = edr_egress_health_project(body, why, sizeof(why)); assert(wire);
+  assert(check("POST", "ingest/engine-health", wire) == 0);
+  cJSON *root = cJSON_Parse(wire); assert(root);
+  cJSON *entry = upgrade_entry(root); assert(entry);
+  const char *fields[] = {"code_supported", "build_supported", "policy_enabled", "runtime_status",
+    "updater_source", "updater_version", "updater_sha256", "updater_protocol_version", "updater_materialized",
+    "updater_error_code", "runtime_identity_sha256", "full_installer_ready", "full_installer_reason"};
+  cJSON *source = cJSON_Parse(body); assert(source);
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+    assert(cJSON_Compare(cJSON_GetObjectItemCaseSensitive(entry, fields[i]),
+        cJSON_GetObjectItemCaseSensitive(upgrade_entry(source), fields[i]), 1));
+  assert(cJSON_GetArraySize(entry) == 13);
+  assert(strstr(wire, "\"negotiated_protocol\":\"h2\"") && strstr(wire, "\"started\":true") &&
+      strstr(wire, "\"live_workers\":4"));
+  assert(!strstr(wire, "installation_family") && !strstr(wire, "installation_baseline") && !strstr(wire, "synthetic-secret"));
+  cJSON_Delete(source);
+
+  /* The final gate rejects injected, mistyped or out-of-range facts. The
+   * projector never changes an unknown failure into the success sentinel. */
+  const char *invalid[][2] = {{"updater_source", "\"synthetic-secret\""},
+    {"updater_version", "\"3.2.622 private\""}, {"updater_sha256", "\"short\""},
+    {"runtime_identity_sha256", "\"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\""},
+    {"updater_protocol_version", "-1"}, {"updater_protocol_version", "5.5"},
+    {"updater_protocol_version", "2147483648"}, {"updater_protocol_version", "\"5\""},
+    {"updater_materialized", "1"}, {"full_installer_ready", "\"true\""},
+    {"updater_error_code", "\"synthetic-secret\""}, {"updater_error_code", "null"},
+    {"updater_error_code", "false"}, {"updater_error_code", "0"},
+    {"updater_error_code", "[\"synthetic-secret\"]"},
+    {"updater_error_code", "{\"text\":\"synthetic-secret\"}"},
+    {"full_installer_reason", "\"synthetic-secret\""}, {"full_installer_reason", "[\"synthetic-secret\"]"},
+    {"full_installer_reason", "{\"text\":\"synthetic-secret\"}"}, {"full_installer_reason", "true"}};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    cJSON *bad = cJSON_Duplicate(root, 1); assert(bad);
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(upgrade_entry(bad), invalid[i][0], cJSON_Parse(invalid[i][1])));
+    char *raw = cJSON_PrintUnformatted(bad); assert(raw);
+    assert(check("POST", "ingest/engine-health", raw) != 0);
+    char *projected = edr_egress_health_project(raw, why, sizeof(why)); assert(projected);
+    assert(check("POST", "ingest/engine-health", projected) == 0 && !strstr(projected, "synthetic-secret"));
+    cJSON *decoded = cJSON_Parse(projected); assert(decoded);
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(upgrade_entry(decoded), invalid[i][0]);
+    if (!strcmp(invalid[i][0], "updater_error_code") || !strcmp(invalid[i][0], "full_installer_reason"))
+      assert(cJSON_IsString(value) && !strcmp(value->valuestring, "detail_available_locally"));
+    else assert(value == NULL);
+    cJSON_Delete(decoded); free(projected); free(raw); cJSON_Delete(bad);
+  }
+
+  /* Failure causes needed by dispatch remain exact, but do not permit free
+   * text. A repairable missing uninstaller differs from a partial baseline. */
+  const char *causes[] = {"installation_baseline_missing_unins000.exe",
+    "installation_baseline_missing_unins000.dat", "installation_identity_conflict"};
+  for (size_t i = 0; i < sizeof(causes) / sizeof(causes[0]); ++i) {
+    cJSON *bad = cJSON_Duplicate(root, 1); assert(bad);
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(upgrade_entry(bad), "full_installer_ready", cJSON_CreateFalse()));
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(upgrade_entry(bad), "full_installer_reason", cJSON_CreateString(causes[i])));
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(upgrade_entry(bad), "updater_error_code", cJSON_CreateString("embedded_materialized_hash_mismatch")));
+    char *raw = cJSON_PrintUnformatted(bad); assert(raw);
+    char *projected = edr_egress_health_project(raw, why, sizeof(why)); assert(projected);
+    assert(check("POST", "ingest/engine-health", projected) == 0 && strstr(projected, causes[i]) &&
+        strstr(projected, "embedded_materialized_hash_mismatch"));
+    free(projected); free(raw); cJSON_Delete(bad);
+  }
+
+  cJSON *commands = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(
+      cJSON_GetObjectItemCaseSensitive(root, "engine_health"), "capability_manifest"), "commands");
+  assert(cJSON_AddItemToObject(commands, "rtq_execute", cJSON_Duplicate(entry, 1)));
+  char *cross = cJSON_PrintUnformatted(root); assert(cross);
+  assert(check("POST", "ingest/engine-health", cross) != 0);
+  char *projected = edr_egress_health_project(cross, why, sizeof(why)); assert(projected);
+  cJSON *decoded = cJSON_Parse(projected); assert(decoded);
+  commands = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(
+      cJSON_GetObjectItemCaseSensitive(decoded, "engine_health"), "capability_manifest"), "commands");
+  assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(commands, "rtq_execute")) == 4);
+  assert(check("POST", "ingest/engine-health", projected) == 0);
+  cJSON_Delete(decoded); free(projected); free(cross); free(wire); cJSON_Delete(root);
+
+  const char *leaves[][2] = {{"\"started\":\"true\"", "\"h2\""},
+    {"\"live_workers\":-1", "\"h2\""}, {"\"live_workers\":1.5", "\"h2\""},
+    {"\"live_workers\":4294967296", "\"h2\""}, {"\"live_workers\":4", "\"synthetic-secret\""}};
+  for (size_t i = 0; i < sizeof(leaves) / sizeof(leaves[0]); ++i) {
+    snprintf(body, sizeof(body), "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.622\",\"policy_version\":\"p\","
+        "\"engine_health\":{\"communication\":{\"enterprise\":{\"protocol\":{\"negotiated_protocol\":%s}}},"
+        "\"command_delivery\":{\"executor\":{%s}}}}", leaves[i][1], leaves[i][0]);
+    assert(check("POST", "ingest/engine-health", body) != 0);
+  }
+  const char *delta = "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.622\",\"policy_version\":\"p\","
+      "\"engine_health\":{\"capability_manifest\":{\"commands\":{\"agent_update_v1\":{\"updater_error_code\":\"embedded_materialized_hash_mismatch\"}}},"
+      "\"command_delivery\":{\"executor\":{\"started\":false,\"live_workers\":0}}},"
+      "\"engine_health_update\":{\"version\":2,\"base\":\"rev\",\"removed\":[]}}";
+  assert(check("POST", "ingest/engine-health/delta", delta) == 0);
+}
 int main(void) {
+  test_upgrade_health_consumers();
   test_health_leaf_delta();
   test_control_ack_transports();
   {

@@ -29,11 +29,23 @@ static const Field fields[] = {
 #undef TEXT
 #undef FIELD
 
-enum { SNAPSHOT_V2_FIELDS = 7, SNAPSHOT_V3_FIELDS = 2 };
+enum { SNAPSHOT_V2_FIELDS = 7, SNAPSHOT_V3_FIELDS = 2, SNAPSHOT_V4_FIELDS = 1 };
 static size_t snapshot_field_count(int schema) {
   size_t count = sizeof(fields)/sizeof(fields[0]);
-  if (schema == 1) return count - SNAPSHOT_V2_FIELDS - SNAPSHOT_V3_FIELDS;
-  return schema == 2 ? count - SNAPSHOT_V3_FIELDS : count;
+  if (schema == 1) return count - SNAPSHOT_V2_FIELDS - SNAPSHOT_V3_FIELDS - SNAPSHOT_V4_FIELDS;
+  if (schema == 2) return count - SNAPSHOT_V3_FIELDS - SNAPSHOT_V4_FIELDS;
+  return schema == 3 ? count - SNAPSHOT_V4_FIELDS : count;
+}
+
+static int parent_pid_state_valid(const EdrBehaviorRecord *r) {
+  switch (r->parent_pid_state) {
+    case EDR_PARENT_PID_KNOWN: return r->ppid != 0u;
+    case EDR_PARENT_PID_UNKNOWN:
+    case EDR_PARENT_PID_EXPLICIT_ZERO:
+    case EDR_PARENT_PID_INVALID: return r->ppid == 0u;
+    case EDR_PARENT_PID_CONFLICT: return 1;
+    default: return 0;
+  }
 }
 
 static uint64_t load_unsigned(const void *p, size_t n) {
@@ -87,6 +99,13 @@ int edr_p0_deferred_snapshot_encode_facts(const EdrBehaviorRecord *r,
            r->syscall_success_known ? 2 : 1;
   if (r->parent_process_start_key || r->parent_process_creation_filetime_100ns ||
       (facts && (facts->subject || facts->parent))) schema = 3;
+  /* KNOWN/nonzero and legacy UNKNOWN are already represented by PPID in the
+   * supported old layouts. Only provenance that those layouts cannot express
+   * needs schema 4; never append a field to schema 1/2/3 or rewrite old bytes. */
+  if (r->parent_pid_state != EDR_PARENT_PID_UNKNOWN) {
+    if (!parent_pid_state_valid(r)) return 0;
+    if (r->parent_pid_state != EDR_PARENT_PID_KNOWN) schema = 4;
+  }
   root = cJSON_CreateObject();
   if (!root || !cJSON_AddNumberToObject(root,"schema",schema) ||
       !cJSON_AddStringToObject(root,"rule_id",rule_id) ||
@@ -119,7 +138,7 @@ int edr_p0_deferred_snapshot_encode_facts(const EdrBehaviorRecord *r,
       if (!cJSON_AddStringToObject(record,f->name,number)) goto done;
     }
   }
-  if (schema == 3) {
+  if (schema >= 3) {
     cJSON *values = cJSON_AddObjectToObject(root, "command_facts");
     if (!values || !cJSON_AddStringToObject(values, "subject", facts && facts->subject ? facts->subject : "") ||
         !cJSON_AddStringToObject(values, "parent", facts && facts->parent ? facts->parent : "")) goto done;
@@ -150,8 +169,8 @@ int edr_p0_deferred_snapshot_decode_facts(const char *json, size_t length,
   if (!root || end != json+length || !cJSON_IsObject(root)) goto done;
   schema=cJSON_GetObjectItemCaseSensitive(root,"schema");
   record=cJSON_GetObjectItemCaseSensitive(root,"record");
-  if (!cJSON_IsNumber(schema) || (schema->valuedouble!=1.0 && schema->valuedouble!=2.0 && schema->valuedouble!=3.0)) goto done;
-  if (cJSON_GetArraySize(root) != (schema->valueint == 3 ? 6 : 5)) goto done;
+  if (!cJSON_IsNumber(schema) || (schema->valuedouble!=1.0 && schema->valuedouble!=2.0 && schema->valuedouble!=3.0 && schema->valuedouble!=4.0)) goto done;
+  if (cJSON_GetArraySize(root) != (schema->valueint >= 3 ? 6 : 5)) goto done;
   field_count = snapshot_field_count(schema->valueint);
   if (!cJSON_IsObject(record) || cJSON_GetArraySize(record)!=(int)field_count ||
       !copy_text(root,"rule_id",rule_id,rule_cap) ||
@@ -198,7 +217,8 @@ int edr_p0_deferred_snapshot_decode_facts(const char *json, size_t length,
   }
   if (!rule_id[0] || !r->event_id[0] || !r->endpoint_id[0] || !r->tenant_id[0] ||
       r->mitre_ttp_count<0 || r->mitre_ttp_count>(int)EDR_BR_MAX_MITRE) goto done;
-  if (schema->valueint == 3) {
+  if (schema->valueint == 4 && !parent_pid_state_valid(r)) goto done;
+  if (schema->valueint >= 3) {
     const cJSON *values = cJSON_GetObjectItemCaseSensitive(root, "command_facts");
     const char *names[] = {"subject", "parent"};
     if (!cJSON_IsObject(values) || cJSON_GetArraySize(values) != 2) goto done;

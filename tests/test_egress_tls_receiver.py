@@ -116,14 +116,38 @@ def is_proven_alert(frame):
                 subject["context"]["pid"] == alert[7][0]
         if subject["subject_type"] != "detection_context" or frame[4][0] != 70:
             return False
-        # Version 2's AVE evidence contract retains the predicate facts and
-        # owner, while unrelated process/identity strings remain local.
-        if frame.get(69) != [2] or 9 in frame or 2 in alert:
+        # Both declared AVE projections retain predicate facts and owner.
+        # v3 also carries the minimal parent fact independently of parent text.
+        version = frame.get(69)
+        if version not in ([2], [3]) or 9 in frame or 2 in alert:
             return False
         basis = subject["evaluation_basis"]
         context = subject["detection_context"]
-        if set(context["process"]) != {"pid", "parent_pid"} or basis["tactic_probs_computed"] is not False:
+        process_keys = set(context["process"])
+        if (version == [2] and process_keys != {"pid", "parent_pid"}) or \
+                (version == [3] and ("pid" not in process_keys or not process_keys <= {"pid", "parent_pid"})) or \
+                basis["tactic_probs_computed"] is not False:
             return False
+        if version == [2]:
+            if 73 in frame:
+                return False  # Frozen v2 never declared a parent-state field.
+        else:
+            state = frame.get(73)
+            parent = frame.get(7, [0])
+            json_parent = context["process"].get("parent_pid")
+            if len(parent) != 1 or type(parent[0]) is not int or not 0 <= parent[0] <= 0xffffffff or \
+                    not isinstance(state, list) or len(state) != 1 or type(state[0]) is not int or \
+                    state not in ([0], [1], [2], [3], [4]):
+                return False
+            if alert.get(12, [0]) != [0]:
+                return False
+            if (state == [1] and parent == [0]) or \
+                    (state in ([0], [2], [3]) and parent != [0]):
+                return False
+            if "parent_pid" in context["process"]:
+                if type(json_parent) not in (int, float) or not 0 <= json_parent <= 0xffffffff or \
+                        json_parent % 1 != 0 or json_parent != parent[0]:
+                    return False
         score = struct.unpack("<f", alert[1][0])[0]
         threshold = basis["threshold"]
         return basis["schema"] == "agent_detection_basis_v1" and \
@@ -558,9 +582,8 @@ def main():
                         environment[f"EDR_TEST_{label}_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
                         environment[f"EDR_TEST_{label}_ISSUED"] = issued
                     issued = str(int(time.time() * 1000))
-                    original = {"task_id":"cmd_synthetic_noop","status":"ok","exit_code":0,
-                                "evidence_refs":[],"upload_refs":[],"artifacts":[],"error":"",
-                                "retryable":False,"raw_detail":"noop"}
+                    original = {"schema":"edr.command.status.v1","status":1,"exit_code":0,
+                                "diagnostic":"command_completed"}
                     exact_detail = json.dumps(original,separators=(",",":"))
                     renewal = {"schema":"edr.result_delivery_renewal.v1","tenant_id":"synthetic-tenant",
                                "endpoint_id":"synthetic-endpoint","target_command_id":"cmd_synthetic_noop",

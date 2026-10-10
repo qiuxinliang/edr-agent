@@ -12,6 +12,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 static int s_queue_open;
 static EdrError s_enqueue_result;
@@ -28,11 +29,24 @@ int edr_policy_v2_alert_allowed(const char *triggered_tactics, const char *subje
   return 1;
 }
 
-int edr_pt_cache_snapshot_at(uint32_t pid, uint64_t event_time_ns, ProcessTreeEntry *out) {
+int edr_pt_cache_snapshot_generation_at(uint32_t pid, uint64_t key,
+                                        uint64_t event_time_ns, ProcessTreeEntry *out) {
+  (void)key;
   (void)pid;
   (void)event_time_ns;
   (void)out;
   s_snapshot_calls++;
+  return -1;
+}
+
+int edr_pt_cache_put_generation_with_parent_state(uint32_t pid, uint32_t ppid,
+    const char *name, const char *parent_name, const char *path, const char *cmd,
+    uint64_t timestamp, uint64_t key, uint64_t birth, uint8_t truncation, uint8_t state) {
+  (void)pid; (void)ppid; (void)name; (void)parent_name; (void)path; (void)cmd;
+  (void)timestamp; (void)key; (void)birth; (void)truncation; (void)state;
+  /* This durable-queue fixture has no captured generation and its cache
+   * always misses. Real conflict writes are tested by ave_parent_integrity. */
+  assert(!"unexpected generation cache write in durable-queue fixture");
   return -1;
 }
 

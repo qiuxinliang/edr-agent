@@ -32,6 +32,8 @@ extern "C" {
 typedef struct EdrPidHistory {
   uint32_t pid;
   uint32_t ppid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
   uint64_t create_time_ns;
   char process_name[256];
   char process_path[512];

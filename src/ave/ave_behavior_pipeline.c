@@ -172,7 +172,8 @@ static void ave_fill_related_iocs_json(AVEBehaviorAlert *al, const char *remote_
   }
 }
 
-static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_type, uint32_t parent_pid,
+static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_type,
+                                       const EdrAveProcessIdentity *capture,
                                        const char *cmdline, const char *target_path, const char *file_sha256, const char *remote_ip,
                                        const char *remote_domain, uint16_t remote_port, float shellcode_score,
                                        float webshell_score, float pmfe_confidence, float pmfe_dns_tunnel,
@@ -236,19 +237,24 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
    * alert. If their duplicate JSON projections overflow, retain unique file,
    * network and detector facts and disclose the omitted duplicates. */
   char process[2200];
+  char source_event_id[96];
+  json_escape_copy(capture->source_event_id, source_event_id, sizeof(source_event_id));
   for (unsigned compact = 0; compact < 2u; ++compact) {
     int process_written;
     if (compact) {
       process_written = snprintf(process, sizeof(process), "{\"pid\":%u,\"parent_pid\":%u}",
-                                 (unsigned)al->pid, (unsigned)parent_pid);
+                                 (unsigned)al->pid, (unsigned)capture->parent_pid);
     } else {
       process_written = snprintf(process, sizeof(process),
                                  "{\"pid\":%u,\"name\":\"%s\",\"path\":\"%s\",\"parent_pid\":%u,\"cmdline\":\"%s\"}",
-                                 (unsigned)al->pid, proc_name, proc_path, (unsigned)parent_pid, cmdline_esc);
+                                 (unsigned)al->pid, proc_name, proc_path, (unsigned)capture->parent_pid, cmdline_esc);
     }
     if (process_written < 0 || (size_t)process_written >= sizeof(process)) continue;
     int written = snprintf(al->user_subject_json, sizeof(al->user_subject_json),
-           "{\"subject_type\":\"detection_context\",\"evaluation_basis\":{"
+           "{\"subject_type\":\"detection_context\",\"captured_process\":{"
+           "\"pid\":%u,\"parent_pid\":%u,\"parent_pid_state\":%u,"
+           "\"process_start_key\":\"%llu\",\"process_creation_filetime_100ns\":\"%llu\","
+           "\"source_event_id\":\"%s\"},\"evaluation_basis\":{"
            "\"schema\":\"agent_detection_basis_v1\",\"owner\":\"ave_behavior_pipeline\",\"tactic_probs_computed\":false,"
            "\"predicate_matched\":true,\"threshold_met\":true,\"pid\":%u,"
            "\"timestamp_ns\":\"%lld\",\"threshold\":%.6f,\"event_count\":%u,"
@@ -263,6 +269,10 @@ static void ave_fill_detection_context(AVEBehaviorAlert *al, AVEEventType event_
            "\"shadow_copy_delete\":%s,\"ioc_ip_hit\":%s,\"ioc_domain_hit\":%s,\"ioc_sha256_hit\":%s},"
            "\"suppression\":{\"applied\":false,\"policy_version\":\"%s\"},"
            "\"recommended_forensics\":%s}}",
+           (unsigned)capture->pid, (unsigned)capture->parent_pid, (unsigned)capture->parent_pid_state,
+           (unsigned long long)capture->process_start_key,
+           (unsigned long long)capture->process_creation_filetime_100ns,
+           source_event_id,
            (unsigned)al->pid, (long long)al->timestamp_ns, (double)EDR_AVE_BEH_SCORE_HIGH,
            (unsigned)event_count, (unsigned)behavior_flags, (unsigned)event_type,
            engine, rule_id, (double)al->anomaly_score, process, file, network, policy,
@@ -797,7 +807,9 @@ static void ph_reset_lifecycle_for_pid_reuse(EdrPidHistory *sl, const AVEBehavio
   }
 }
 
-static void process_one_event(const AVEBehaviorEvent *e) {
+static void process_one_event(const EdrAveQueuedEvent *queued) {
+  const AVEBehaviorEvent *e = &queued->event;
+  const EdrAveProcessIdentity *capture = &queued->process;
   int64_t now = e->timestamp_ns > 0 ? e->timestamp_ns : wall_ns();
 
   lock_bp();
@@ -811,6 +823,13 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     }
   }
   EdrPidHistory *sl = &s_hist[si];
+  if (sl->valid && ((capture->process_start_key && sl->process_start_key &&
+                      capture->process_start_key != sl->process_start_key) ||
+                     (capture->process_creation_filetime_100ns && sl->process_creation_filetime_100ns &&
+                      capture->process_creation_filetime_100ns != sl->process_creation_filetime_100ns))) {
+    /* A reused PID may first be observed through file/network input. */
+    ph_reset_lifecycle_for_pid_reuse(sl, e, now);
+  }
   if (sl->valid && e->event_type == AVE_EVT_PROCESS_CREATE && sl->pid == e->pid) {
     ph_reset_lifecycle_for_pid_reuse(sl, e, now);
   }
@@ -849,6 +868,10 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     snprintf(sl->process_path, sizeof(sl->process_path), "%s", e->process_path);
   }
   sl->ppid = e->ppid;
+  if (capture->process_start_key) sl->process_start_key = capture->process_start_key;
+  if (capture->process_creation_filetime_100ns)
+    sl->process_creation_filetime_100ns = capture->process_creation_filetime_100ns;
+  if (!e->ppid) sl->parent_chain_depth = 0u;
   sl->events_since_last_inference++;
 
   uint32_t ec_prev = sl->event_count;
@@ -989,7 +1012,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
   uint32_t fl_copy = sl->flags;
   uint32_t event_count_copy = sl->event_count;
   uint32_t pid_copy = e->pid;
-  uint32_t ppid_copy = e->ppid;
+  EdrAveProcessIdentity capture_copy = *capture;
   AVEEventType evt_copy = e->event_type;
   AVEBehaviorCallback cb = s_callbacks.on_behavior_alert;
   void *ud = s_callbacks.user_data;
@@ -1035,7 +1058,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     AVEBehaviorAlert al;
     memset(&al, 0, sizeof(al));
     al.pid = pid_copy;
-    al.ppid = ppid_copy;
+    al.ppid = capture_copy.parent_pid;
     snprintf(al.cmdline, sizeof(al.cmdline), "%s", ev_cmdline);
     al.anomaly_score = an_copy;
     memcpy(al.tactic_probs, tactic_copy, sizeof(al.tactic_probs));
@@ -1059,7 +1082,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
     }
     /* Only the actual local evaluation owns outbound alert identity. */
     {
-      ave_fill_detection_context(&al, evt_copy, ppid_copy, ev_cmdline, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
+      ave_fill_detection_context(&al, evt_copy, &capture_copy, ev_cmdline, ev_tgt_path, ev_file_sha, ev_tgt_ip, ev_tgt_domain,
                                  ev_tgt_port, ev_shellcode_score, ev_webshell_score, ev_pmfe_confidence,
                                  ev_pmfe_dns_tunnel, ev_pmfe_pe_found, ev_ioc_ip_hit, ev_ioc_domain_hit,
                                  ev_ioc_sha256_hit, ev_script_content_score, ev_tls_anomaly_score,
@@ -1079,7 +1102,7 @@ static void process_one_event(const AVEBehaviorEvent *e) {
 static DWORD WINAPI worker_main(LPVOID arg) {
   (void)arg;
   for (;;) {
-    AVEBehaviorEvent ev;
+    EdrAveQueuedEvent ev;
     int drained = 0;
     if (s_q) {
       while (ave_mpmc_try_pop(s_q, &ev) == 0) {
@@ -1100,7 +1123,7 @@ static DWORD WINAPI worker_main(LPVOID arg) {
 static void *worker_main(void *arg) {
   (void)arg;
   for (;;) {
-    AVEBehaviorEvent ev;
+    EdrAveQueuedEvent ev;
     int drained = 0;
     if (s_q) {
       while (ave_mpmc_try_pop(s_q, &ev) == 0) {
@@ -1232,10 +1255,28 @@ int edr_ave_bp_start_monitor(const struct EdrConfig *cfg) {
   return AVE_OK;
 }
 
-int edr_ave_bp_feed(const AVEBehaviorEvent *event) {
+int edr_ave_bp_feed(const AVEBehaviorEvent *event,
+                    const EdrAveProcessIdentity *process) {
   if (!event) {
     return AVE_ERR_INVALID_PARAM;
   }
+  EdrAveQueuedEvent queued = {0};
+  queued.event = *event;
+  if (process) {
+    queued.process = *process;
+    if (process->pid != event->pid || process->parent_pid_state > EDR_PARENT_PID_CONFLICT ||
+        (process->parent_pid_state == EDR_PARENT_PID_KNOWN && !process->parent_pid) ||
+        ((process->parent_pid_state == EDR_PARENT_PID_UNKNOWN ||
+          process->parent_pid_state == EDR_PARENT_PID_EXPLICIT_ZERO ||
+          process->parent_pid_state == EDR_PARENT_PID_INVALID) && process->parent_pid))
+      return AVE_ERR_INVALID_PARAM;
+  } else {
+    queued.process.pid = event->pid;
+    queued.process.parent_pid = event->ppid;
+    queued.process.parent_pid_state = event->ppid ? EDR_PARENT_PID_KNOWN : EDR_PARENT_PID_UNKNOWN;
+  }
+  queued.event.ppid = queued.process.parent_pid_state == EDR_PARENT_PID_KNOWN ?
+                       queued.process.parent_pid : 0u;
   (void)bp_metric_inc(&s_bp_feed_total);
   lock_feed();
   if (atomic_load(&s_worker_stop)) {
@@ -1254,7 +1295,7 @@ int edr_ave_bp_feed(const AVEBehaviorEvent *event) {
     return AVE_ERR_NOT_INITIALIZED;
   }
   if (s_q) {
-    if (ave_mpmc_try_push(s_q, event) != 0) {
+    if (ave_mpmc_try_push(s_q, &queued) != 0) {
       (void)bp_metric_inc(&s_bp_queue_full_dropped);
       unlock_feed();
       return AVE_ERR_QUEUE_FULL;

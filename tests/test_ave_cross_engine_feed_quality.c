@@ -1,5 +1,6 @@
 #include "edr/ave_sdk.h"
 #include "edr/ave_cross_engine_feed.h"
+#include "edr/ave_process_identity.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -8,10 +9,12 @@
 
 static int g_feed_count;
 static AVEBehaviorEvent g_last_event;
+static EdrAveProcessIdentity g_last_process;
 
-AVE_EXPORT int AVE_CALL AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t event_size) {
+int edr_ave_feed_event_captured(const AVEBehaviorEvent *event, const EdrAveProcessIdentity *process) {
   assert(event != NULL);
-  assert(event_size == sizeof(*event));
+  assert(process != NULL);
+  g_last_process = *process;
   g_last_event = *event;
   g_feed_count++;
   return AVE_OK;
@@ -19,6 +22,7 @@ AVE_EXPORT int AVE_CALL AVE_FeedEventEx(const AVEBehaviorEvent *event, size_t ev
 
 static void reset_capture(void) {
   memset(&g_last_event, 0, sizeof(g_last_event));
+  memset(&g_last_process, 0, sizeof(g_last_process));
   g_feed_count = 0;
 }
 
@@ -220,7 +224,32 @@ static void test_linux_syscall_outcomes_do_not_create_injection_verdicts(void) {
   }
 }
 
+static void test_parent_state_is_not_a_confirmed_feature(void) {
+  EdrBehaviorRecord r;
+  make_enriched_record(&r, EDR_EVENT_FILE_WRITE, 5200u);
+  snprintf(r.file_path, sizeof(r.file_path), "C:/Synthetic/note.locked");
+  r.process_start_key = 991122u;
+  r.process_creation_filetime_100ns = 133444736000000000ULL;
+  snprintf(r.event_id, sizeof(r.event_id), "synthetic-captured-parent");
+  r.parent_pid_state = EDR_PARENT_PID_CONFLICT;
+  reset_capture(); edr_ave_cross_engine_feed_from_record(&r);
+  assert(g_feed_count == 1 && g_last_event.ppid == 0u);
+  assert(g_last_process.parent_pid == 100u && g_last_process.parent_pid_state == EDR_PARENT_PID_CONFLICT);
+  assert(g_last_process.process_start_key == r.process_start_key);
+  assert(g_last_process.process_creation_filetime_100ns == r.process_creation_filetime_100ns);
+  assert(!strcmp(g_last_process.source_event_id, r.event_id));
+  r.ppid = 0u;
+  for (unsigned state = 0; state <= EDR_PARENT_PID_CONFLICT; ++state) {
+    if (state == EDR_PARENT_PID_KNOWN) continue;
+    r.parent_pid_state = (uint8_t)state;
+    reset_capture(); edr_ave_cross_engine_feed_from_record(&r);
+    assert(g_feed_count == 1 && g_last_event.ppid == 0u);
+    assert(g_last_process.parent_pid == 0u && g_last_process.parent_pid_state == state);
+  }
+}
+
 int main(void) {
+  test_parent_state_is_not_a_confirmed_feature();
   test_linux_syscall_outcomes_do_not_create_injection_verdicts();
   test_pmfe_image_hint_requires_same_region_validation();
   test_rejects_pid_only_process_create();
