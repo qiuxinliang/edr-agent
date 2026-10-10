@@ -80,7 +80,8 @@ int main(void) {
       !contains(transport, "edr_ingest_http_set_policy_version(cfg->applied_remote_policy.version)") ||
       contains(transport, "edr_ingest_http_set_policy_version(cfg->preprocessing.rules_version)") ||
       !contains(ingest, "desired_version && desired_version[0] ? desired_version : \"\"") ||
-      !ordered_before(agent, "edr_agent_verify_config_headers(&agent->cfg",
+      !contains(agent, "return edr_agent_verify_config_headers(cfg, queue_db_path, tmp, headers, reason, reason_cap);") ||
+      !ordered_before(agent, "edr_agent_verify_policy_response(&agent->cfg",
                       "if (config_headers.config_hash[0] &&") ||
       !ordered_before(agent, "if (config_headers.config_hash[0] &&",
                       "EdrError ce = edr_config_load(tmp, &remote);") ||

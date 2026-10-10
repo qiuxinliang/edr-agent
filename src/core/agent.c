@@ -4800,7 +4800,8 @@ static void edr_agent_poll_p0_bundle(EdrAgent *agent, uint64_t *last_p0_bundle_n
   }
   now = edr_monotonic_ns();
   if (!edr_periodic_schedule_due(&agent->maintenance_schedule[2], now, (uint32_t)interval,
-                                 agent->cfg.agent.endpoint_id, "p0_bundle", 0, 0)) {
+                                 agent->cfg.agent.endpoint_id, "p0_bundle",
+                                 !edr_p0_rule_ir_is_ready(), 0)) {
     return;
   }
   *last_p0_bundle_ns = now;
@@ -4876,8 +4877,12 @@ static void edr_agent_poll_sensor_interest(EdrAgent *agent, uint64_t *last_senso
     }
   }
   now = edr_monotonic_ns();
+  EdrSensorInterestStatus sensor_status;
+  memset(&sensor_status, 0, sizeof(sensor_status));
+  edr_sensor_interest_get_status(&sensor_status);
   if (!edr_periodic_schedule_due(&agent->maintenance_schedule[3], now, (uint32_t)interval,
-                                 agent->cfg.agent.endpoint_id, "sensor_interest", 0, 0)) {
+                                 agent->cfg.agent.endpoint_id, "sensor_interest",
+                                 !sensor_status.loaded, 0)) {
     return;
   }
   *last_sensor_interest_ns = now;

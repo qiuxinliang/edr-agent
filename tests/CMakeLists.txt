@@ -2100,6 +2100,13 @@ if(SQLite3_FOUND AND OpenSSL_FOUND AND EDR_WITH_INGEST_HTTPS_OPENSSL)
   add_test(NAME conditional_policy_authenticated_cache COMMAND ${Python3_EXECUTABLE} -B
     ${CMAKE_SOURCE_DIR}/tests/test_conditional_policy.py --client $<TARGET_FILE:test_conditional_policy>)
   set_tests_properties(conditional_policy_authenticated_cache PROPERTIES TIMEOUT 60)
+
+  add_executable(test_runtime_rule_startup test_runtime_rule_startup.c ${_conditional_policy_sources})
+  target_include_directories(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
+  target_link_libraries(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_runtime_rule_startup)
+  add_test(NAME runtime_rule_cold_start_schedule COMMAND test_runtime_rule_startup)
 endif()
 
 add_executable(test_attack_surface_groups test_attack_surface_groups.c ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)

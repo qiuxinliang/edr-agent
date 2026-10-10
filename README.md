@@ -413,7 +413,7 @@ cmake --build build
 ## 运行与日志
 
 - `[logging] log_dir` 下的 `agent.log` 由进程内追加写入 stdout/stderr，重启保留已有内容。`max_log_size_mb` 达到阈值后轮转；主循环每秒检查一次，因此突发输出可超过阈值约一个检查周期。`max_log_files` 为含当前文件的总保留数量（1～100）；减少数量时清理超额备份。打开或轮转失败保留已有诊断流并限频报告原因。Windows 任务启动器另保留上一份 `startup-agent.stdout/stderr.log.previous`，用于配置加载前的启动失败诊断。
-- 心跳与基础健康首次立即发送，之后按终端和任务固定错相；不会增加配置周期的最大间隔。健康消息的 `monitor.interval_s` 表示实际生效周期，包括 `EDR_ENGINE_HEALTH_INTERVAL_S` 覆盖。维护拉取首次有界错相，P0 与 sensor-interest 签名协议保持不变。
+- 心跳与基础健康首次立即发送，之后按终端和任务固定错相；不会增加配置周期的最大间隔。健康消息的 `monitor.interval_s` 表示实际生效周期，包括 `EDR_ENGINE_HEALTH_INTERVAL_S` 覆盖。维护拉取首次有界错相；P0 未就绪或 sensor-interest 未加载时首次立即拉取，已有已验证缓存才错相，签名协议保持不变。
 - 运行策略仅在本地仍有已接受的原始签名内容时携带 `If-None-Match`。304 必须提供新签名元数据并重新验证缓存哈希、签名、有效期和序列；缓存或验证失败后清除条件并重新拉取完整内容。已验证且内容相同的预处理规则跳过重复加载。
 - 退出时 stderr 汇总含：`wire_events`、`batches`、`batch_lz4`、`batch_timeout_flushes`、`bus_hw80`、`bus_dropped`、去重丢弃、`queue_pending`、HTTP 上报统计与 **`[command] handled` / `unknown`**。
 - 启动时若配置了 `[platform].rest_base_url`，传输层会打印 HTTP ingest/control 目标；旧 `server.address` 只作为兼容字段读取。
