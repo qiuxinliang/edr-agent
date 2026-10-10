@@ -1980,11 +1980,6 @@ edr_apply_test_warnings(test_validation_trace)
 add_test(NAME validation_trace_contract COMMAND test_validation_trace)
 set_tests_properties(validation_trace_contract PROPERTIES TIMEOUT 20)
 
-include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
-if(WIN32)
-  include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
-endif()
-
 add_executable(test_builtin_forensic_bundle ${CMAKE_CURRENT_SOURCE_DIR}/test_builtin_forensic_bundle.c)
 edr_apply_test_warnings(test_builtin_forensic_bundle)
 add_test(NAME builtin_forensic_bundle COMMAND test_builtin_forensic_bundle)
@@ -2127,6 +2122,13 @@ if(WIN32)
   add_test(NAME windows_headless_log_stream_initialization COMMAND test_log_headless_windows
     $<TARGET_FILE:test_log_rotation>)
   set_tests_properties(windows_headless_log_stream_initialization PROPERTIES TIMEOUT 30)
+endif()
+
+# Gate declarations require the complete test/target graph before binding
+# their build dependencies and labels, including the periodic/runtime owners.
+include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)
+if(WIN32)
+  include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)
 endif()
 
 if(NOT EDR_P0_TEST_CONFIG_AVAILABLE)

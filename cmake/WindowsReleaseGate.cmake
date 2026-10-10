@@ -60,3 +60,6 @@ edr_windows_release_gate(windows_task_exit_behavior test_windows_task_exit_fixtu
 edr_windows_release_gate(windows_task_trace_environment "")
 
 edr_windows_release_gate(validation_trace_contract test_validation_trace)
+if(TARGET test_log_headless_windows)
+  edr_windows_release_gate(windows_headless_log_stream_initialization test_log_headless_windows)
+endif()

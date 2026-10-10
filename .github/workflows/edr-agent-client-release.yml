@@ -187,6 +187,41 @@ jobs:
         if: steps.resume.outputs.restored != 'true'
         with:
           global-json-file: global.json
+      # Canonical backend rules are immutable integration-test inputs only;
+      # keep this private checkout outside every product/package staging path.
+      - name: Validate canonical P0 test input configuration
+        if: steps.resume.outputs.restored != 'true'
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:P0_TEST_INPUTS_REF -cnotmatch '^[0-9a-f]{40}$') { throw 'Configure P0_TEST_INPUTS_REF as the full immutable canonical input commit SHA' }
+          if ([string]::IsNullOrWhiteSpace($env:P0_TEST_INPUTS_SSH_KEY)) { throw 'Configure the read-only P0_TEST_INPUTS_SSH_KEY for canonical integration tests' }
+      - name: Checkout canonical P0 test inputs
+        if: steps.resume.outputs.restored != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: qiuxinliang/EDRAI
+          ref: ${{ vars.P0_TEST_INPUTS_REF }}
+          ssh-key: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+          persist-credentials: false
+          path: canonical-p0-test-inputs
+      - name: Bind canonical P0 test input directory
+        if: steps.resume.outputs.restored != 'true'
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputs = Join-Path $env:GITHUB_WORKSPACE 'canonical-p0-test-inputs'
+          $actualRef = & git -C $inputs rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actualRef -cne $env:P0_TEST_INPUTS_REF) { throw 'Canonical P0 input checkout does not match the configured immutable commit' }
+          foreach ($name in @('p0_rule_bundle_ir_v1.json', 'p0_rule_bundle_ir_v1.json.enc', 'sensor_interest_manifest.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $inputs $name) -PathType Leaf)) { throw "Missing canonical P0 integration test input: $name" }
+          }
+          "EDR_BACKEND_CONFIG_DIR=$inputs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Install pinned P0 encryption dependency
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
@@ -649,13 +684,13 @@ jobs:
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
         run: |
+          $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
+          if (-not (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf)) { throw 'Pinned vcpkg OpenSSL executable is required for isolated TLS gate fixtures' }
+          $env:PATH = "$opensslTools;$env:PATH"
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
           $telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }
-          $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
-          if (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe')) {
-            $telemetryArgs.OpenSslBin = $opensslTools
-          }
+          $telemetryArgs.OpenSslBin = $opensslTools
           & .\tests\run_telemetry_windows_native.ps1 @telemetryArgs
           if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }
 

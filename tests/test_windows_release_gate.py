@@ -41,6 +41,7 @@ WINDOWS_EXPECTED = {
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
     "openssl_tls_handshake", "windows_task_exit_behavior", "windows_task_trace_environment",
     "validation_trace_contract",
+    "windows_headless_log_stream_initialization",
 }
 RUNTIME_EXPECTED = {
     "installer_runtime_health_classification", "report_events_ack_contract",
@@ -60,6 +61,10 @@ RUNTIME_EXPECTED = {
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_rule_ir_record_golden",
     "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
+    "periodic_schedule_boundaries", "attack_surface_sampled_groups",
+    "log_rotation_retention_and_restart", "conditional_policy_authenticated_cache",
+    "runtime_rule_cold_start_schedule",
+    "p0_runtime_delivery",
 }
 NON_WINDOWS_RUNTIME_EXPECTED = {"ave_parent_integrity_mutex"}
 EXPECTED = WINDOWS_EXPECTED | RUNTIME_EXPECTED | (
@@ -213,8 +218,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     else:
                         verify_sqlite_package_location(cache, include, library)
 
-    def fixture(self, directory, missing_target="", missing_test="", failing_test=""):
-        pairs = re.findall(r'^edr_windows_release_gate\((\w+) (\w+|"")\)$',
+    def fixture(self, directory, missing_target="", missing_test="", failing_test="",
+                canonical_available=True):
+        pairs = re.findall(r'^\s*edr_windows_release_gate\((\w+) (\w+|"")\)$',
                            GATE.read_text(encoding="utf-8"), re.MULTILINE)
         self.assertEqual({name for name, _ in pairs}, WINDOWS_EXPECTED)
         runtime_pairs = re.findall(r'^\s*edr_agent_runtime_gate\((\w+) (\w+)\)$',
@@ -232,6 +238,10 @@ class WindowsReleaseGateTests(unittest.TestCase):
         (source / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
         lines = ["cmake_minimum_required(VERSION 3.19)", "project(GateFixture C)", "enable_testing()",
                  "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)"]
+        # This isolated dependency-graph fixture has no P0 consumer. It models
+        # the already-validated external input precondition; the real product
+        # CMake validates all canonical files before initializing this gate.
+        lines.append(f"set(EDR_P0_TEST_CONFIG_AVAILABLE {'TRUE' if canonical_available else 'FALSE'})")
         registered_targets = set()
         for name, target in pairs:
             if target != '""' and target != missing_target and target not in registered_targets:
@@ -247,6 +257,41 @@ class WindowsReleaseGateTests(unittest.TestCase):
         (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
         return source, source / "build", pairs
 
+    def test_external_canonical_inputs_are_required_by_release_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, canonical_available=False)
+            result = self.run_command('cmake', '-S', str(source), '-B', str(build), success=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('requires external canonical P0 inputs', result.stdout + result.stderr)
+
+    def test_gates_initialize_after_periodic_and_runtime_registration(self):
+        source = (ROOT / 'tests/CMakeLists.txt').read_text(encoding='utf-8')
+        for include in ('include(${CMAKE_SOURCE_DIR}/cmake/AgentRuntimeGate.cmake)',
+                        'include(${CMAKE_SOURCE_DIR}/cmake/WindowsReleaseGate.cmake)'):
+            self.assertEqual(source.count(include), 1)
+            for name in ('periodic_schedule_boundaries', 'attack_surface_sampled_groups',
+                         'log_rotation_retention_and_restart', 'conditional_policy_authenticated_cache',
+                         'runtime_rule_cold_start_schedule', 'windows_headless_log_stream_initialization'):
+                self.assertLess(source.index(f'add_test(NAME {name} '), source.index(include))
+
+    def test_periodic_and_runtime_failures_block_native_release(self):
+        for name in ('periodic_schedule_boundaries', 'attack_surface_sampled_groups',
+                     'log_rotation_retention_and_restart', 'conditional_policy_authenticated_cache',
+                     'runtime_rule_cold_start_schedule', 'windows_headless_log_stream_initialization'):
+            with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, failing_test=name)
+                self.run_command('cmake', '-S', str(source), '-B', str(build))
+                # The complete build-dependency graph is verified for both
+                # generators below. These failing commands are CMake -E false;
+                # select exactly this labelled test to exclude incidental
+                # missing executables from the failure evidence.
+                result = self.run_command('ctest', '--test-dir', str(build), '--output-on-failure',
+                                          '--no-tests=error', '--label-regex', LABEL,
+                                          '--tests-regex', f'^{name}$', success=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name, result.stdout + result.stderr)
+                self.assertIn('0% tests passed, 1 tests failed out of 1', result.stdout + result.stderr)
+
     def test_build_target_covers_every_selected_test_in_both_generators(self):
         for generator in ("Ninja", "Ninja Multi-Config"):
             with self.subTest(generator=generator), tempfile.TemporaryDirectory() as directory:
@@ -257,7 +302,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     old_targets = [target for _, target in pairs if target != '""' and target not in PREVIOUSLY_UNBUILT]
                     self.run_command("cmake", "--build", str(build), "--target", *old_targets)
                     failed = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
-                                              "-L", LABEL, "--no-tests=error", success=False)
+                                              "-L", LABEL, "--parallel", "4", "--no-tests=error", success=False)
                     self.assertEqual(failed.stdout.count("***Not Run"), 3, failed.stdout + failed.stderr)
                 self.run_command("cmake", "--build", str(build), "--config", "Release",
                                  "--target", "windows_release_gate_tests", "--parallel", "2")
@@ -268,7 +313,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 for test in tests:
                     self.assertTrue(test.get("command") and Path(test["command"][0]).is_file(), test)
                 passed = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
-                                          "-L", LABEL, "--no-tests=error", "--output-on-failure")
+                                          "-L", LABEL, "--parallel", "4", "--no-tests=error", "--output-on-failure")
                 self.assertIn("100% tests passed", passed.stdout)
 
     def test_missing_target_fails_at_configuration(self):
@@ -308,7 +353,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
                 for label in (LABEL, "^agent-runtime-gate$"):
                     result = self.run_command("ctest", "--test-dir", str(build), "-L", label,
-                                              "--no-tests=error", "--output-on-failure", success=False)
+                                              "--parallel", "4", "--no-tests=error", "--output-on-failure", success=False)
                     self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
     def test_installer_health_and_redaction_failures_block_windows_release(self):
@@ -319,7 +364,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
                 self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
                 result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
-                                          "--no-tests=error", "--output-on-failure", success=False)
+                                          "--parallel", "4", "--no-tests=error", "--output-on-failure", success=False)
                 self.assertIn(name + " (Failed)", result.stdout + result.stderr)
 
     def test_empty_selection_fails(self):
