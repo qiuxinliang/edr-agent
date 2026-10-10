@@ -19,6 +19,115 @@ static int check(const char *method, const char *path, const char *body) {
   return edr_egress_request_validate(method, path, body ? "application/json" : NULL,
       body, body ? strlen(body) : 0u, reason, sizeof(reason));
 }
+static void test_diagnostic_health_commitments(void) {
+  const char *diagnostic = "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.648\",\"policy_version\":\"p\",\"engine_health\":{"
+      "\"monitor\":{\"profile\":\"diagnostic\",\"request_id\":\"hm-1791650000000\"},"
+      "\"command_delivery\":{\"executor\":{\"started\":true,\"accepting\":true,\"live_workers\":2}},"
+      "\"sensor_health\":{\"sensor_interest\":{\"enabled\":true,\"loaded\":true,"
+      "\"version\":\"edr-sensor-interest-v1-r289\",\"rules_version\":\"edr-dynamic-rules-v1-r289-8c5791d1\","
+      "\"full_admission\":{\"file_read\":true,\"file_write\":true,\"registry_set\":true,\"contract_valid\":true,\"p0_binding_valid\":true},"
+      "\"p0_artifact_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+      "\"p0_rule_coverage_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+      "\"manifest_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+      "\"manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\",\"p0_artifact_rule_count\":183,\"snapshot_epoch\":9}}}}";
+  const char *basic = "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.648\",\"policy_version\":\"p\",\"engine_health\":{"
+      "\"monitor\":{\"profile\":\"basic\",\"request_id\":\"\"},\"command_delivery\":{\"executor\":{\"accepting\":false}}}}";
+  const char *cases[] = {basic, diagnostic};
+  for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); ++index) {
+    cJSON *expected = cJSON_Parse(cases[index]); assert(expected);
+    cJSON *raw = cJSON_Duplicate(expected, 1); assert(raw);
+    cJSON *health = cJSON_GetObjectItemCaseSensitive(raw, "engine_health");
+    cJSON *sensors = cJSON_GetObjectItemCaseSensitive(health, "sensor_health");
+    if (!sensors) sensors = cJSON_AddObjectToObject(health, "sensor_health");
+    assert(sensors);
+    cJSON *filter = cJSON_AddObjectToObject(sensors, "event_filter"); assert(filter);
+    cJSON *drop = cJSON_AddObjectToObject(filter, "last_drop"); assert(drop);
+    assert(cJSON_AddStringToObject(drop, "path", "synthetic-private-path"));
+    assert(cJSON_AddStringToObject(drop, "cmdline", "synthetic-private-command"));
+    assert(cJSON_AddStringToObject(drop, "process", "synthetic-private-process"));
+    assert(cJSON_AddStringToObject(health, "username", "synthetic-private-user"));
+    cJSON *monitor = cJSON_GetObjectItemCaseSensitive(health, "monitor");
+    assert(cJSON_AddStringToObject(monitor, "reason", "synthetic-private-reason"));
+    cJSON *interest = cJSON_GetObjectItemCaseSensitive(sensors, "sensor_interest");
+    if (interest) {
+      assert(cJSON_AddStringToObject(interest, "cmdline", "synthetic-private-command"));
+      assert(cJSON_AddStringToObject(interest, "path", "synthetic-private-path"));
+      assert(cJSON_AddStringToObject(interest, "raw_event", "synthetic-private-event"));
+      assert(cJSON_AddNumberToObject(interest, "process_names", 12));
+      assert(cJSON_AddNumberToObject(interest, "matched", 99));
+      cJSON *admission = cJSON_GetObjectItemCaseSensitive(interest, "full_admission");
+      assert(cJSON_AddStringToObject(admission, "username", "synthetic-private-user"));
+    }
+    char *input = cJSON_PrintUnformatted(raw); assert(input);
+    assert(check("POST", "ingest/engine-health", input) != 0);
+    char reason[128];
+    char *wire = edr_egress_health_project(input, reason, sizeof(reason)); assert(wire);
+    assert(!strstr(wire, "synthetic-private") && !strstr(wire, "last_drop"));
+    cJSON *projected = cJSON_Parse(wire); assert(projected);
+    /* Compare every retained leaf, including an absent SI subtree for basic. */
+    assert(cJSON_Compare(projected, expected, 1));
+    assert(check("POST", "ingest/engine-health", wire) == 0);
+    cJSON *update = cJSON_AddObjectToObject(projected, "engine_health_update"); assert(update);
+    assert(cJSON_AddNumberToObject(update, "version", 2));
+    assert(cJSON_AddStringToObject(update, "base", "rev"));
+    assert(cJSON_AddArrayToObject(update, "removed"));
+    char *delta = cJSON_PrintUnformatted(projected); assert(delta);
+    assert(check("POST", "ingest/engine-health/delta", delta) == 0);
+    free(delta); free(wire); free(input); cJSON_Delete(projected); cJSON_Delete(raw); cJSON_Delete(expected);
+  }
+  cJSON *unloaded = cJSON_Parse(diagnostic); assert(unloaded);
+  cJSON *health = cJSON_GetObjectItemCaseSensitive(unloaded, "engine_health");
+  cJSON *interest = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health, "sensor_health"), "sensor_interest");
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(interest, "loaded", cJSON_CreateFalse()));
+  const char *hashes[] = {"p0_artifact_sha256", "p0_rule_coverage_sha256", "manifest_sha256"};
+  for (size_t i = 0; i < sizeof(hashes) / sizeof(hashes[0]); ++i)
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(interest, hashes[i], cJSON_CreateString("")));
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(interest, "snapshot_epoch", cJSON_CreateNumber(0)));
+  char *wire = cJSON_PrintUnformatted(unloaded); assert(wire);
+  assert(check("POST", "ingest/engine-health", wire) == 0);
+  char reason[128];
+  char *projected_wire = edr_egress_health_project(wire, reason, sizeof(reason)); assert(projected_wire);
+  cJSON *projected = cJSON_Parse(projected_wire); assert(projected && cJSON_Compare(projected, unloaded, 1));
+  free(projected_wire); free(wire); cJSON_Delete(projected); cJSON_Delete(unloaded);
+  const char *invalid[][3] = {
+    {"monitor", "request_id", "\"synthetic private path\""},
+    {"executor", "accepting", "\"true\""},
+    {"interest", "enabled", "\"true\""}, {"interest", "loaded", "1"},
+    {"interest", "version", "\"synthetic private path\""},
+    {"interest", "rules_version", "\"synthetic/private/path\""},
+    {"interest", "manifest_hash_mode", "\"synthetic private detail\""},
+    {"interest", "p0_artifact_sha256", "\"bad-hash\""},
+    {"interest", "p0_rule_coverage_sha256", "\"bbbb\""},
+    {"interest", "manifest_sha256", "\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\""},
+    {"interest", "p0_artifact_rule_count", "-1"},
+    {"interest", "p0_artifact_rule_count", "4294967296"},
+    {"interest", "snapshot_epoch", "1.5"}, {"interest", "snapshot_epoch", "-1"},
+    {"admission", "file_read", "1"}, {"admission", "file_write", "\"true\""},
+    {"admission", "registry_set", "null"}, {"admission", "contract_valid", "{}"},
+    {"admission", "p0_binding_valid", "[]"}
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    cJSON *raw = cJSON_Parse(diagnostic); assert(raw);
+    health = cJSON_GetObjectItemCaseSensitive(raw, "engine_health");
+    interest = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health, "sensor_health"), "sensor_interest");
+    cJSON *parent = interest;
+    if (!strcmp(invalid[i][0], "monitor")) parent = cJSON_GetObjectItemCaseSensitive(health, "monitor");
+    else if (!strcmp(invalid[i][0], "executor")) parent = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health, "command_delivery"), "executor");
+    else if (!strcmp(invalid[i][0], "admission")) parent = cJSON_GetObjectItemCaseSensitive(interest, "full_admission");
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(parent, invalid[i][1], cJSON_Parse(invalid[i][2])));
+    wire = cJSON_PrintUnformatted(raw); assert(wire);
+    assert(check("POST", "ingest/engine-health", wire) != 0);
+    cJSON *update = cJSON_AddObjectToObject(raw, "engine_health_update"); assert(update);
+    assert(cJSON_AddNumberToObject(update, "version", 2)); assert(cJSON_AddStringToObject(update, "base", "rev"));
+    assert(cJSON_AddArrayToObject(update, "removed"));
+    char *delta = cJSON_PrintUnformatted(raw); assert(delta);
+    assert(check("POST", "ingest/engine-health/delta", delta) != 0);
+    free(delta); free(wire); cJSON_Delete(raw);
+  }
+  const char *removed = "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.648\",\"policy_version\":\"p\",\"engine_health\":{},"
+      "\"engine_health_update\":{\"version\":2,\"base\":\"rev\",\"removed\":[\"/monitor/request_id\",\"/command_delivery/executor/accepting\",\"/sensor_health/sensor_interest\"]}}";
+  assert(check("POST", "ingest/engine-health/delta", removed) == 0);
+}
 static void test_control_ack_transports(void) {
   /* Existing server CommandEnvelope transports, including queued ACK replay. */
   const char *allowed[] = {"https_control", "https_control_stream", "https_long_poll",
@@ -174,6 +283,7 @@ static void test_upgrade_health_consumers(void) {
   assert(check("POST", "ingest/engine-health/delta", delta) == 0);
 }
 int main(void) {
+  test_diagnostic_health_commitments();
   test_upgrade_health_consumers();
   test_health_leaf_delta();
   test_control_ack_transports();
