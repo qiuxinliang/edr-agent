@@ -280,7 +280,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                      'runtime_rule_cold_start_schedule', 'windows_headless_log_stream_initialization'):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
-                self.run_command('cmake', '-S', str(source), '-B', str(build))
+                self.run_command('cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja')
                 # The complete build-dependency graph is verified for both
                 # generators below. These failing commands are CMake -E false;
                 # select exactly this labelled test to exclude incidental
