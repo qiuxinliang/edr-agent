@@ -13,17 +13,17 @@
 extern "C" {
 #endif
 
-/**
- * §19.8：整包快照模式下，周期 POST 与 JSON `ttlSeconds` 使用的有效间隔（秒）。
- * 取 `port_interval_s`、`service_interval_s`、`policy_interval_s`、`full_snapshot_interval_s` 的**最小值**（`conn_interval_s` 仅用于 refresh-request 轮询，不参与）。
- * 结果钳在 60～604800。
- */
+/** Legacy aggregate ttlSeconds compatibility value; new consumers use each
+ * sampled group's groupTTLSeconds and server-derived collection timestamp. */
 uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg);
+/** Periods in seconds: full, network(listeners+egress), inventory, policy. */
+void edr_attack_surface_periodic_intervals(const EdrConfig *cfg, uint32_t intervals[4]);
 
-/**
- * 执行采集并通过内置 HTTP 传输栈上报。detail 为 SOAR/审计短句（如 "uploaded_http_ok"）。
- * @return 0 成功；非 0 为失败码（可映射 CommandExecutionResult）。
- */
+/** Defer automatic group scheduling while a collector owns the snapshot lock. */
+int edr_attack_surface_collection_running(void);
+
+/** Collect and upload through the internal HTTP stack; nonzero returns an
+ * actionable command failure through detail. */
 int edr_attack_surface_execute(const char *command_id, const uint8_t *payload,
                                size_t payload_len, const EdrConfig *cfg,
                                char *detail, size_t detail_cap);

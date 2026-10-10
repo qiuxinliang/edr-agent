@@ -2069,3 +2069,8 @@ if(SQLite3_FOUND AND OpenSSL_FOUND AND EDR_WITH_INGEST_HTTPS_OPENSSL)
     ${CMAKE_SOURCE_DIR}/tests/test_conditional_policy.py --client $<TARGET_FILE:test_conditional_policy>)
   set_tests_properties(conditional_policy_authenticated_cache PROPERTIES TIMEOUT 60)
 endif()
+
+add_executable(test_attack_surface_groups test_attack_surface_groups.c ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_attack_surface_groups PRIVATE ${CMAKE_SOURCE_DIR}/third_party/cjson)
+edr_apply_test_warnings(test_attack_surface_groups)
+add_test(NAME attack_surface_sampled_groups COMMAND test_attack_surface_groups)

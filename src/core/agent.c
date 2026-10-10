@@ -673,6 +673,7 @@ struct EdrAgent {
   EdrPeriodicSchedule heartbeat_schedule;
   EdrPeriodicSchedule health_schedule;
   EdrPeriodicSchedule maintenance_schedule[4];
+  EdrPeriodicSchedule attack_surface_schedule[4];
   char applied_rules_hash[65];
   char *cached_remote_body;
   size_t cached_remote_body_len;
@@ -1965,6 +1966,7 @@ EdrError edr_agent_run(EdrAgent *agent) {
       {
         uint64_t t0 = edr_monotonic_ns();
         agent->asurf_last_post_ns = t0;
+        memset(agent->attack_surface_schedule, 0, sizeof(agent->attack_surface_schedule));
         agent->asurf_last_pending_check_ns = t0;
       }
       /* §B2 伴生 watchdog：启用时 spawn/adopt 互守进程（抗 kill）。 */
@@ -3853,6 +3855,7 @@ static void edr_agent_poll_config_reload(EdrAgent *agent, uint64_t *last_reload_
     edr_resource_reconfigure(&agent->cfg);
     edr_self_protect_apply_config(&agent->cfg);
     agent->asurf_last_post_ns = 0;
+    memset(agent->attack_surface_schedule, 0, sizeof(agent->attack_surface_schedule));
     {
       const char *post_reload = getenv("EDR_ATTACK_SURFACE_POST_ON_CONFIG_RELOAD");
       if (post_reload && post_reload[0] == '1' && agent->cfg.attack_surface.enabled &&
@@ -4278,6 +4281,7 @@ static int edr_agent_apply_remote_policy(EdrAgent *agent, const EdrConfig *remot
   if (edr_agent_toml_has_section(tmp, "attack_surface")) {
     if (edr_attack_surface_policy_changed(&agent->cfg, remote)) {
       agent->asurf_last_post_ns = 0u;
+      memset(agent->attack_surface_schedule, 0, sizeof(agent->attack_surface_schedule));
       agent->asurf_last_pending_check_ns = 0u;
     }
     edr_agent_apply_attack_surface_policy(&agent->cfg, remote);
@@ -4626,6 +4630,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   {
     uint64_t t0 = edr_monotonic_ns();
     agent->asurf_last_post_ns = t0;
+    memset(agent->attack_surface_schedule, 0, sizeof(agent->attack_surface_schedule));
     agent->asurf_last_pending_check_ns = t0;
   }
   {
@@ -4885,6 +4890,27 @@ static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns) 
                                    (const uint8_t *)payload, strlen(payload), NULL);
 }
 
+static void edr_agent_attack_surface_reset_schedules(EdrAgent *agent, uint64_t now) {
+  uint32_t intervals[4];
+  const char *jobs[] = {"full", "network", "inventory", "policy"};
+  edr_attack_surface_periodic_intervals(&agent->cfg, intervals);
+  for (size_t i = 0; i < 4u; ++i) {
+    EdrPeriodicSchedule *schedule = &agent->attack_surface_schedule[i];
+    schedule->interval_s = intervals[i];
+    schedule->next_ns = now + (uint64_t)intervals[i] * 1000000000ULL -
+        (uint64_t)edr_periodic_phase_ms(agent->cfg.agent.endpoint_id, jobs[i], intervals[i]) * 1000000ULL;
+  }
+}
+
+static void edr_agent_queue_attack_surface_group(const char *group, uint64_t now_ns) {
+  char command_id[96], payload[192];
+  snprintf(command_id, sizeof(command_id), "auto-asurf-%s-%llu", group,
+           (unsigned long long)(now_ns / 1000000ULL));
+  snprintf(payload, sizeof(payload), "{\"reason\":\"periodic_attack_surface\",\"collection_group\":\"%s\"}", group);
+  edr_command_on_internal_envelope(command_id, "GET_ATTACK_SURFACE",
+                                  (const uint8_t *)payload, strlen(payload), NULL);
+}
+
 /**
  * Attack-surface collection can enumerate services, software and network state,
  * so the main loop only schedules a durable internal bulk command. Manual
@@ -4925,12 +4951,24 @@ static void edr_agent_poll_attack_surface(EdrAgent *agent) {
     }
   }
 
-  uint32_t sec = edr_attack_surface_effective_periodic_interval_s(cfg);
-  const uint64_t interval_ns = (uint64_t)sec * 1000000000ULL;
-
-  if (now - agent->asurf_last_post_ns < interval_ns) {
-    return;
+  if (!agent->attack_surface_schedule[0].next_ns)
+    edr_agent_attack_surface_reset_schedules(agent, agent->asurf_last_post_ns ? agent->asurf_last_post_ns : now);
+  if (edr_attack_surface_collection_running()) return;
+  uint32_t intervals[4];
+  const char *groups[] = {"full", "networkOnly", "inventoryOnly", "policyOnly"};
+  edr_attack_surface_periodic_intervals(cfg, intervals);
+  for (size_t i = 0; i < 4u; ++i) {
+    if (edr_periodic_schedule_due(&agent->attack_surface_schedule[i], now, intervals[i],
+                                  cfg->agent.endpoint_id, groups[i], 0, 0)) {
+      agent->asurf_last_post_ns = now;
+      if (i == 0u) {
+        /* A full snapshot samples all groups and wins over coincident partial timers. */
+        edr_agent_queue_attack_surface("periodic_attack_surface", now);
+        edr_agent_attack_surface_reset_schedules(agent, now);
+      } else {
+        edr_agent_queue_attack_surface_group(groups[i], now);
+      }
+      return; /* At most one automatic bulk command per main-loop iteration. */
+    }
   }
-  agent->asurf_last_post_ns = now;
-  edr_agent_queue_attack_surface("periodic_attack_surface", now);
 }

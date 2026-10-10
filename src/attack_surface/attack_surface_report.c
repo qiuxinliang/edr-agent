@@ -1,6 +1,7 @@
 /* §19 攻击面：GET_ATTACK_SURFACE — 轻量采集 + 复用内置 HTTP 传输栈 POST 平台 */
 
 #include "edr/attack_surface_report.h"
+#include "attack_surface_groups.h"
 #include "edr/attack_surface_egress.h"
 #include "edr/attack_surface_inventory.h"
 #include "edr/security_policy_collect.h"
@@ -346,6 +347,19 @@ static int collect_listeners_platform(AsListener *out, int max_out, int *truncat
   return collect_listeners_none(out, max_out, truncated);
 }
 #endif
+
+static uint32_t attack_surface_clamp_interval(uint32_t value) {
+  if (value < 60u) return 60u;
+  return value > 604800u ? 604800u : value;
+}
+void edr_attack_surface_periodic_intervals(const EdrConfig *cfg, uint32_t intervals[4]) {
+  uint32_t network = cfg->attack_surface.port_interval_s < cfg->attack_surface.conn_interval_s
+                         ? cfg->attack_surface.port_interval_s : cfg->attack_surface.conn_interval_s;
+  intervals[0] = attack_surface_clamp_interval(cfg->attack_surface.full_snapshot_interval_s);
+  intervals[1] = attack_surface_clamp_interval(network);
+  intervals[2] = attack_surface_clamp_interval(cfg->attack_surface.service_interval_s);
+  intervals[3] = attack_surface_clamp_interval(cfg->attack_surface.policy_interval_s);
+}
 
 uint32_t edr_attack_surface_effective_periodic_interval_s(const EdrConfig *cfg) {
   if (!cfg) {
@@ -706,7 +720,8 @@ static void asurf_execute_unlock(void) {
 #endif
 
 static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsListener *L, int nL,
-                               int truncated_ss, int listeners_only) {
+                               int truncated_ss, EdrAttackSurfaceMode mode) {
+  const int listeners_only = !edr_asurf_samples_inventory(mode);
   FILE *f = fopen(path, "wb");
   if (!f) {
     return -1;
@@ -734,16 +749,16 @@ static int write_snapshot_json(const char *path, const EdrConfig *cfg, const AsL
   int nEg = 0;
   int suspEg = 0;
   int egTrunc = 0;
-  if (listeners_only) {
-    memset(&sp, 0, sizeof(sp));
-    nEg = 0;
-    suspEg = 0;
-    egTrunc = 0;
-  } else {
+  memset(&sp, 0, sizeof(sp));
+  if (mode == EDR_ASURF_FULL) {
     asurf_gather_policy_and_egress(cfg, &sp, Eg, EDR_ASURF_EGRESS_OUT_MAX, &nEg, &suspEg, &egTrunc);
-    if (!cfg->attack_surface.egress_enabled) { nEg = 0; suspEg = 0; egTrunc = 0; }
-    if (!cfg->attack_surface.defender_enabled) memset(&sp, 0, sizeof(sp));
+  } else if (edr_asurf_samples_policy(mode)) {
+    edr_security_policy_snap_collect(cfg, &sp);
+  } else if (edr_asurf_samples_egress(mode)) {
+    edr_asurf_collect_egress(cfg, Eg, EDR_ASURF_EGRESS_OUT_MAX, &nEg, &suspEg, &egTrunc);
   }
+  if (!cfg->attack_surface.egress_enabled) { nEg = 0; suspEg = 0; egTrunc = 0; }
+  if (!cfg->attack_surface.defender_enabled) memset(&sp, 0, sizeof(sp));
 
   EdrAsurfInventorySummary inv;
   memset(&inv, 0, sizeof(inv));
@@ -1055,14 +1070,17 @@ static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t
   uint64_t started_ms = asurf_monotonic_ms();
   AsListener L[EDR_ASURF_LISTENERS_MAX];
   int truncated = 0;
-  int nL = (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
+  EdrAttackSurfaceMode mode = edr_asurf_periodic_payload_mode(command_id, payload, payload_len);
+  if (asurf_listeners_only_mode(command_id, payload, payload_len)) mode = EDR_ASURF_LISTENERS;
+  int nL = edr_asurf_samples_listeners(mode) &&
+           (cfg->attack_surface.listeners_enabled || cfg->attack_surface.public_service_enabled)
              ? collect_listeners_platform(L, EDR_ASURF_LISTENERS_MAX, &truncated) : 0;
   if (nL < 0) {
     snprintf(detail, detail_cap, "listener_collection_failed");
     return 3;
   }
   uint64_t listeners_done_ms = asurf_monotonic_ms();
-  int listeners_only = asurf_listeners_only_mode(command_id, payload, payload_len);
+
 
   char jsonpath[512];
   snprintf(jsonpath, sizeof(jsonpath), "/tmp/edr_asurf_%d_%lld.json", EDR_GETPID(),
@@ -1080,7 +1098,7 @@ static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t
     win_path_fwd_slashes(jsonpath);
   }
 #endif
-  if (write_snapshot_json(jsonpath, cfg, L, nL, truncated, listeners_only) != 0) {
+  if (write_snapshot_json(jsonpath, cfg, L, nL, truncated, mode) != 0) {
     snprintf(detail, detail_cap, "write_json_failed");
     return 3;
   }
@@ -1093,6 +1111,47 @@ static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t
     snprintf(detail, detail_cap, "read_json_failed");
     return 3;
   }
+  cJSON *projected = cJSON_ParseWithLength(body, body_len);
+  if (edr_asurf_project_sampled_groups(projected, mode) != 0) {
+    cJSON_Delete(projected);
+    free(body);
+    snprintf(detail, detail_cap, "partial_snapshot_projection_failed");
+    return 3;
+  }
+  cJSON *group_ttl = cJSON_AddObjectToObject(projected, "groupTTLSeconds");
+  if (!group_ttl) {
+    cJSON_Delete(projected); free(body);
+    snprintf(detail, detail_cap, "group_ttl_serialization_failed");
+    return 3;
+  }
+  uint32_t intervals[4];
+  edr_attack_surface_periodic_intervals(cfg, intervals);
+  uint32_t full_s = intervals[0];
+  uint32_t periods[] = {intervals[1], intervals[2], intervals[3], intervals[1]};
+  const char *groups[] = {"listeners", "inventory", "policy", "egress"};
+  int sampled[] = {edr_asurf_samples_listeners(mode), edr_asurf_samples_inventory(mode),
+                    edr_asurf_samples_policy(mode), edr_asurf_samples_egress(mode)};
+  for (size_t i = 0u; i < 4u; ++i) {
+    if (!sampled[i]) continue;
+    uint32_t period = periods[i] < 60u ? 60u : periods[i];
+    if (full_s < period) period = full_s;
+    uint64_t ttl = (uint64_t)period * 3u;
+    if (ttl < 300u) ttl = 300u;
+    if (ttl > 86400u) ttl = 86400u;
+    if (!cJSON_AddNumberToObject(group_ttl, groups[i], (double)ttl)) {
+      cJSON_Delete(projected); free(body);
+      snprintf(detail, detail_cap, "group_ttl_serialization_failed");
+      return 3;
+    }
+  }
+  char *sampled_body = cJSON_PrintUnformatted(projected);
+  cJSON_Delete(projected);
+  free(body);
+  if (!sampled_body) {
+    snprintf(detail, detail_cap, "partial_snapshot_serialization_failed");
+    return 3;
+  }
+  body = sampled_body;
   uint64_t snapshot_done_ms = asurf_monotonic_ms();
 
   char suffix[512];
@@ -1106,12 +1165,20 @@ static int edr_attack_surface_execute_impl(const char *command_id, const uint8_t
   uint64_t uploaded_ms = asurf_monotonic_ms();
   snprintf(detail, detail_cap,
            "uploaded_http_ok mode=%s listeners_ms=%llu snapshot_ms=%llu upload_ms=%llu total_ms=%llu",
-           listeners_only ? "listeners_only" : "full",
+           edr_asurf_mode_name(mode),
            (unsigned long long)(listeners_done_ms - started_ms),
            (unsigned long long)(snapshot_done_ms - listeners_done_ms),
            (unsigned long long)(uploaded_ms - snapshot_done_ms),
            (unsigned long long)(uploaded_ms - started_ms));
   return 0;
+}
+
+int edr_attack_surface_collection_running(void) {
+#ifdef _WIN32
+  return InterlockedCompareExchange(&s_asurf_execute_running, 0, 0) != 0;
+#else
+  return __atomic_load_n(&s_asurf_execute_running, __ATOMIC_ACQUIRE) != 0u;
+#endif
 }
 
 int edr_attack_surface_execute(const char *command_id, const uint8_t *payload,
