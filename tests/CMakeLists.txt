@@ -1,3 +1,18 @@
+# Canonical P0 rules are test inputs supplied explicitly outside the Agent tree.
+# They are never consumed by production targets or copied to release artifacts.
+set(EDR_P0_TEST_CONFIG_DIR "" CACHE PATH "External canonical backend P0 config for integration tests only")
+set(EDR_P0_TEST_CONFIG_AVAILABLE FALSE)
+if(EDR_P0_TEST_CONFIG_DIR)
+  foreach(_p0_input p0_rule_bundle_ir_v1.json p0_rule_bundle_ir_v1.json.enc sensor_interest_manifest.json)
+    if(NOT EXISTS "${EDR_P0_TEST_CONFIG_DIR}/${_p0_input}")
+      message(FATAL_ERROR "Missing canonical test input: ${EDR_P0_TEST_CONFIG_DIR}/${_p0_input}")
+    endif()
+  endforeach()
+  set(EDR_P0_TEST_CONFIG_AVAILABLE TRUE)
+else()
+  message(STATUS "Canonical P0 integration tests unavailable: set EDR_P0_TEST_CONFIG_DIR to external backend config")
+endif()
+
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -492,10 +507,12 @@ if(WIN32)
   # Exercise production EDR1 admission. Keep the durable purpose archive in
   # this fixture's build directory, never beside checked-in release inputs.
   set(_etw_network_rule_fixture "${CMAKE_CURRENT_BINARY_DIR}/etw-network-rules")
-  configure_file(${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc
-    ${_etw_network_rule_fixture}/p0_rule_bundle_ir_v1.json.enc COPYONLY)
-  configure_file(${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json
-    ${_etw_network_rule_fixture}/sensor_interest_manifest.json COPYONLY)
+  if(EDR_P0_TEST_CONFIG_AVAILABLE)
+    configure_file(${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc
+      ${_etw_network_rule_fixture}/p0_rule_bundle_ir_v1.json.enc COPYONLY)
+    configure_file(${EDR_P0_TEST_CONFIG_DIR}/sensor_interest_manifest.json
+      ${_etw_network_rule_fixture}/sensor_interest_manifest.json COPYONLY)
+  endif()
   add_executable(test_etw_network_decode_windows
     ${CMAKE_CURRENT_SOURCE_DIR}/test_etw_network_decode_windows.c
     ${CMAKE_CURRENT_SOURCE_DIR}/collector_network_stubs.c
@@ -982,7 +999,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_source_only_durable_contract)
   add_test(NAME p0_source_only_durable_contract COMMAND test_p0_source_only_durable_contract)
   set_tests_properties(p0_source_only_durable_contract PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
   add_executable(test_p0_observation_semantics
     ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_observation_semantics.c
@@ -1021,7 +1038,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_observation_semantics)
   add_test(NAME p0_observation_semantics COMMAND test_p0_observation_semantics)
   set_tests_properties(p0_observation_semantics PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
 else()
   message(STATUS
     "P0 source-only durable fixture: not registered because the non-production "
@@ -1161,6 +1178,7 @@ if(EDR_PCRE2_AVAILABLE)
   add_test(NAME windows_rule_semantic_audit
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/scripts/verify_windows_rule_audit.py
       --replay $<TARGET_FILE:test_p0_candidate_replay>
+      --bundle ${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json
       --output ${CMAKE_BINARY_DIR}/windows-rule-audit-result.json
       ${_edr_windows_rule_audit_native_args}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -1186,7 +1204,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_rule_ir_record_golden)
   add_test(NAME p0_rule_ir_record_golden COMMAND test_p0_rule_ir_record_golden WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   set_tests_properties(p0_rule_ir_record_golden PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
 
   add_executable(test_p0_rule_ir_exclusions
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_exclusions.c
@@ -1228,7 +1246,7 @@ if(EDR_PCRE2_AVAILABLE)
     edr_apply_test_warnings(test_p0_rule_ir_snapshot)
     add_test(NAME p0_rule_ir_snapshot COMMAND test_p0_rule_ir_snapshot WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
     set_tests_properties(p0_rule_ir_snapshot PROPERTIES
-      ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+      ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
 
     if(EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
       add_executable(test_p0_rule_ir_envelope_boundary
@@ -1254,6 +1272,20 @@ if(EDR_PCRE2_AVAILABLE)
       edr_apply_test_warnings(test_p0_rule_ir_envelope_boundary)
       add_test(NAME p0_rule_ir_envelope_boundary COMMAND test_p0_rule_ir_envelope_boundary
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+      get_target_property(_runtime_delivery_sources test_p0_rule_ir_envelope_boundary SOURCES)
+      list(REMOVE_ITEM _runtime_delivery_sources ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_envelope_boundary.c)
+      add_executable(test_p0_runtime_delivery test_p0_runtime_delivery.c ${_runtime_delivery_sources})
+      target_include_directories(test_p0_runtime_delivery PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+      target_compile_definitions(test_p0_runtime_delivery PRIVATE EDR_P0_ENCRYPT_TESTING=1 EDR_HAVE_OPENSSL_FL=1)
+      if(EDR_PCRE2_TARGET)
+        target_link_libraries(test_p0_runtime_delivery PRIVATE ${EDR_PCRE2_TARGET} OpenSSL::Crypto Threads::Threads)
+      else()
+        target_include_directories(test_p0_runtime_delivery PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+        target_link_libraries(test_p0_runtime_delivery PRIVATE ${EDR_PCRE2_LIBRARY} OpenSSL::Crypto Threads::Threads)
+      endif()
+      edr_apply_test_warnings(test_p0_runtime_delivery)
+      add_test(NAME p0_runtime_delivery COMMAND test_p0_runtime_delivery WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
     endif()
   endif()
 
@@ -1280,7 +1312,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_validation_matrix)
   add_test(NAME p0_validation_matrix COMMAND test_p0_validation_matrix WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   set_tests_properties(p0_validation_matrix PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${CMAKE_SOURCE_DIR}/config/sensor_interest_manifest.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${EDR_P0_TEST_CONFIG_DIR}/sensor_interest_manifest.json")
 endif()
 
 add_executable(test_windows_event_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_event_policy.c
@@ -1473,7 +1505,7 @@ if(SQLite3_FOUND)
   add_test(NAME command_fact_transport COMMAND test_command_fact_transport)
   if(EDR_PCRE2_AVAILABLE)
     set_tests_properties(command_fact_transport PROPERTIES
-      ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json")
+      ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
   endif()
 endif()
 
@@ -2012,7 +2044,7 @@ if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   target_link_libraries(test_p0_operation PRIVATE ${EDR_PCRE2_TARGET} OpenSSL::Crypto edr_ave_test_common)
   edr_apply_test_warnings(test_p0_operation)
   add_test(NAME p0_operation COMMAND test_p0_operation)
-  set_tests_properties(p0_operation PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
+  set_tests_properties(p0_operation PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
   add_executable(test_p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive.c ${_p0_operation_sources})
   target_include_directories(test_p0_rule_ir_purpose_archive PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_p0_rule_ir_purpose_archive PRIVATE
@@ -2020,7 +2052,7 @@ if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   target_link_libraries(test_p0_rule_ir_purpose_archive PRIVATE ${EDR_PCRE2_TARGET} OpenSSL::Crypto edr_ave_test_common)
   edr_apply_test_warnings(test_p0_rule_ir_purpose_archive)
   add_test(NAME p0_rule_ir_purpose_archive COMMAND test_p0_rule_ir_purpose_archive)
-  set_tests_properties(p0_rule_ir_purpose_archive PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${CMAKE_SOURCE_DIR}/config/p0_rule_bundle_ir_v1.json.enc")
+  set_tests_properties(p0_rule_ir_purpose_archive PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
 elseif(EDR_PCRE2_AVAILABLE)
   message(STATUS "P0 encrypted operation/purpose fixtures require EDR_WITH_P0_RULES_OPENSSL and OpenSSL::Crypto")
 endif()
@@ -2051,3 +2083,17 @@ if(TEST windows_rule_semantic_audit)
     "EDR_P0_PURPOSE_ARCHIVE_BASE=${CMAKE_CURRENT_BINARY_DIR}/windows-rule-audit-authority")
 endif()
 edr_minimization_test(p0_validation_matrix test_p0_validation_matrix)
+
+if(NOT EDR_P0_TEST_CONFIG_AVAILABLE)
+  foreach(_p0_integration p0_source_only_durable_contract p0_observation_semantics
+      p0_rule_ir_record_golden p0_rule_ir_snapshot p0_validation_matrix
+      p0_operation p0_rule_ir_purpose_archive
+      windows_rule_semantic_audit etw_network_decode_native)
+    if(TEST ${_p0_integration})
+      set_tests_properties(${_p0_integration} PROPERTIES DISABLED TRUE)
+    endif()
+  endforeach()
+  if(EDR_PCRE2_AVAILABLE AND TEST command_fact_transport)
+    set_tests_properties(command_fact_transport PROPERTIES DISABLED TRUE)
+  endif()
+endif()

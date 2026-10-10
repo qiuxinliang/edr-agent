@@ -283,7 +283,6 @@ cmake --build build
 | `EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT` | 按 **tenant_id** 独立滑动 60s 内条数上限；**默认 60/分**；`0` 为关闭**每租户**限流（仍受上项全局限制，若有）。`tenant_id` 空串视为同桶。 |
 | `EDR_P0_MAX_EMITS_PER_MIN_PER_ENDPOINT` | 按 **endpoint_id** 独立滑动 60s 内条数上限；**默认 0=关闭**；与上两项叠加。`endpoint_id` 空串同桶。 |
 | P0 rule-bundle identity | 不使用环境变量或编译期常量。P0 直出在一次保留的、已验证 IR 快照中同时取得匹配规则、`rules_bundle_version`、SHA-256 与 epoch；同一帧链只使用该副本，避免规则重载时混用不同代际。 |
-| （CMake）`EDR_P0_IR_EMBED` | 默认 **ON**（需 **Python3**）：构建时从 `config/p0_rule_bundle_ir_v1.json` 生成 `edr_p0_rule_ir_embed.c` 并入链接；运行期**先**读外置 JSON（`EDR_P0_IR_PATH` / `edr_config/`），读失败或**无可求值** P0 规则时再 **回退** 到嵌入字节。`p0_rule_bundle_ir_v1` 中 `event_type` 与 Go `dynamicrules` 同构（如 `process_create` / `file_write` / `network_connect` / `registry_set`）。设为 **OFF** 可跳过生成（无 Python 的极简环境）。 |
 | （开发）P0 C 对拍 | 改 `p0_golden_vectors.json` 后 **`python3 edr-agent/scripts/gen_p0_golden_vectors_inc.py`**（**仅** `process_create` 写入 `p0_golden_vectors_data.inc`；其它 event 由 Go 金线 + **`edr_p0_ir_record_golden_test`** 覆盖，需 **PCRE2**）。`ctest -R edr_p0_` 或跑 `edr_p0_golden_test` / `edr_p0_ir_record_golden_test`。无 PCRE2 时 PC 行仍 **legacy** 与 Go 对拍。 |
 | （开发）A4.1 总线 | **`ctest -R test_event_bus_mpmc_stress`** 或 **`bash scripts/run_event_bus_mpmc_stress.sh`**；长 soak 见 `docs/OPS_PROFILE_AND_RELEASE.md` 与测试源 `tests/test_event_bus_mpmc_stress.c`（`[ms] [producers] [cap]`）。 |
 | （monorepo）合并前**推荐** | 仓库根 **`bash edr-backend/scripts/recommended_p0_pr_gates.sh`**：六段**机读**（version、金线、TDH try-order、ETW1 槽文本、**A2.3 P3 UserData 十六进制金体**、**Go P0 manifest**）。`edr-agent` **CI** Ubuntu **precheck** 与上式 **6/6** 一致（另含 preprocess gray-release 预检）。全量 B2.4 留档用 **`bash edr-backend/scripts/collect_p0_b24_evidence.sh`** 或一键 **`bash edr-backend/scripts/p0_pack_machine_gates.sh`**。 |
@@ -482,3 +481,16 @@ cmake --build build
 | **P7（末段）** | **§3.2 Linux 内核态采集** | 路线图：**`docs/AGT012_LINUX_EBPF_P7.md`**（**AGT-012** 已关闭文档交付；**探针代码** 按 P7.x PR）。当前 Linux 主路径仍为 **inotify M1**。 |
 
 **原则**：**Linux 内核态采集（P7）最后投入**；其余在 `edr-agent/README.md` 与实现保持同步迭代。
+
+P0 rule data is owned by the backend and is not checked into or compiled into
+this Agent, and is not carried in installers or update ZIPs. The Agent obtains
+its verified P0 bundle and paired SensorInterest manifest through authenticated
+runtime delivery and retains the last good cache under `edr_config/` for offline
+recovery. Without a validated IR cache, a cold installation reports the IR engine
+as unready. The runtime controller verifies the paired SensorInterest manifest
+separately. Installer runtime rollback excludes this mutable cache.
+
+Real-rule integration tests require an explicit external backend config directory:
+`-DEDR_P0_TEST_CONFIG_DIR=/path/to/edr-backend/platform/config` for CMake, or
+`EDR_BACKEND_CONFIG_DIR` for the standalone real-IR runner. Windows release gates
+require these inputs. No such inputs are part of production build targets or packages.

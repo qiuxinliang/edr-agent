@@ -1,3 +1,7 @@
+if(NOT EDR_P0_TEST_CONFIG_AVAILABLE)
+  message(FATAL_ERROR "Windows release gate requires external canonical P0 inputs: set EDR_P0_TEST_CONFIG_DIR; no Agent bundle is supplied")
+endif()
+
 # One declaration binds each required CTest to its build dependency. Both
 # Windows workflows build this target and select this label; neither keeps a
 # second executable/test allowlist that can drift when a gate is added.

@@ -128,6 +128,7 @@ jobs:
             -DEDR_REQUIRE_SQLITE=ON `
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
+            "-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR" `
             -DEDR_BUILD_TESTS=ON
       - name: Build
         env:
@@ -180,6 +181,7 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DEDR_WITH_YARA=ON \
             -DEDR_BUILD_TESTS=ON \
+            "-DEDR_P0_TEST_CONFIG_DIR=$EDR_BACKEND_CONFIG_DIR" \
             -DEDR_REQUIRE_PCRE2=OFF \
             -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON
       - name: Build

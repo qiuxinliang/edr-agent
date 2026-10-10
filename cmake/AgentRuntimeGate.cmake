@@ -69,3 +69,7 @@ edr_agent_runtime_gate(health_upload test_health_upload)
 
 edr_agent_runtime_gate(installer_runtime_health_classification test_runtime_health)
 edr_agent_runtime_gate(report_events_ack_contract test_report_events_ack)
+
+if(TEST p0_runtime_delivery)
+  edr_agent_runtime_gate(p0_runtime_delivery test_p0_runtime_delivery)
+endif()

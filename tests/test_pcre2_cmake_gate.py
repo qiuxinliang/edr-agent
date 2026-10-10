@@ -786,7 +786,8 @@ class PCRE2CMakeGateTests(unittest.TestCase):
             emitted_terminal = root / "emitted-terminal.json"
             copied_source.write_bytes(source_fixture.read_bytes())
             copied_terminal.write_bytes(terminal_fixture.read_bytes())
-            p0_ir = AGENT_ROOT / "config" / "p0_rule_bundle_ir_v1.json"
+            p0_ir = Path(os.environ.get("EDR_BACKEND_CONFIG_DIR",
+                str(REPO_ROOT / "edr-backend" / "platform" / "config"))) / "p0_rule_bundle_ir_v1.json"
             p0_ir_value = json.loads(p0_ir.read_text(encoding="utf-8"))
             p0_ir_sha256 = hashlib.sha256(p0_ir.read_bytes()).hexdigest()
             synthetic_source = json.loads(source_fixture.read_text(encoding="utf-8"))

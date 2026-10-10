@@ -349,11 +349,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-downloads') | Out-Null
           New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE '.cache/vcpkg-bincache') | Out-Null
 
-      - name: Prepare P0 rule bundle
-        if: steps.resume.outputs.restored != 'true'
-        shell: pwsh
-        run: python .\scripts\prepare_p0_release_bundle.py
-
       - name: Validate release tag (semver)
         if: steps.resume.outputs.restored != 'true'
         shell: bash
@@ -510,6 +505,7 @@ jobs:
             -DEDR_WITH_YARA=ON `
             -DEDR_REQUIRE_YARA=ON `
             -DEDR_ENABLE_IPO=ON `
+            "-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR" `
             -DEDR_BUILD_TESTS=ON
           if (-not $?) { throw "cmake configure failed" }
 
@@ -864,21 +860,6 @@ jobs:
           )) {
             if (Test-Path $p) { $null = $items.Add($p) }
           }
-          $runtimeDetectionStagingRoot = Join-Path $env:RUNNER_TEMP ("edr-runtime-detection-" + $env:EDR_RELEASE_ARCH)
-          $runtimeDetectionDir = Join-Path $runtimeDetectionStagingRoot "edr_config"
-          Remove-Item -LiteralPath $runtimeDetectionStagingRoot -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $runtimeDetectionDir -Force | Out-Null
-          foreach ($detectionAssetName in @("p0_rule_bundle_ir_v1.json.enc", "sensor_interest_manifest.json")) {
-            $detectionAssetSource = Join-Path "config" $detectionAssetName
-            if (-not (Test-Path -LiteralPath $detectionAssetSource -PathType Leaf)) {
-              throw "missing required detection asset: $detectionAssetSource"
-            }
-            if ((Get-Item -LiteralPath $detectionAssetSource).Length -le 0) {
-              throw "required detection asset is empty: $detectionAssetSource"
-            }
-            Copy-Item -LiteralPath $detectionAssetSource -Destination (Join-Path $runtimeDetectionDir $detectionAssetName) -Force
-          }
-          $null = $items.Add($runtimeDetectionDir)
           $forensicRulesDir = "rules\forensic"
           $requiredForensicRules = @(
             "credential_theft.yar",
@@ -973,19 +954,10 @@ jobs:
           try {
             $entries = $zipObj.Entries.FullName
             $normalizedEntries = @($entries | ForEach-Object { $_.Replace('\', '/') })
-            if ($entries -match '(^|/|\\)p0_rule_bundle_ir_v1\.json$') {
-              throw "plaintext P0 rule bundle must not be packaged"
-            }
-            if ($entries -match '(^|/|\\)p0_rule_bundle_manifest\.json$') {
-              throw "plaintext P0 rule manifest must not be packaged"
-            }
-            $encryptedP0Entries = @($normalizedEntries | Where-Object { $_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc' })
-            if ($encryptedP0Entries.Count -ne 1) {
-              throw "package must contain exactly one edr_config/p0_rule_bundle_ir_v1.json.enc; found $($encryptedP0Entries.Count)"
-            }
-            $sensorManifestEntries = @($normalizedEntries | Where-Object { $_ -eq 'edr_config/sensor_interest_manifest.json' })
-            if ($sensorManifestEntries.Count -ne 1) {
-              throw "package must contain exactly one edr_config/sensor_interest_manifest.json; found $($sensorManifestEntries.Count)"
+            if ($normalizedEntries -match '(^|/)p0_rule_[^/]*$' -or
+                $normalizedEntries -match '(^|/)sensor_interest_manifest\.json$' -or
+                $normalizedEntries -match '(^|/)agent_preprocess_rules_v1[^/]*$') {
+              throw "platform-owned rule data must not be packaged"
             }
             $builtinCollectorEntries = @($zipObj.Entries | Where-Object {
               $_.FullName.Replace('\', '/') -ceq 'collector/forensic_collector_builtin.exe'
@@ -1208,16 +1180,10 @@ jobs:
           $zipObj = [System.IO.Compression.ZipFile]::OpenRead($runtimeAsset)
           try {
             $entries = @($zipObj.Entries.FullName | ForEach-Object { $_.Replace('\', '/') })
-            if ($entries -match '(^|/)(p0_rule_bundle_ir_v1\.json|p0_rule_bundle_manifest\.json)$') {
-              throw "plaintext P0 rules must not be published"
-            }
-            $encryptedP0Entries = @($entries | Where-Object { $_ -eq 'edr_config/p0_rule_bundle_ir_v1.json.enc' })
-            if ($encryptedP0Entries.Count -ne 1) {
-              throw "release asset must contain exactly one edr_config/p0_rule_bundle_ir_v1.json.enc; found $($encryptedP0Entries.Count)"
-            }
-            $sensorManifestEntries = @($entries | Where-Object { $_ -eq 'edr_config/sensor_interest_manifest.json' })
-            if ($sensorManifestEntries.Count -ne 1) {
-              throw "release asset must contain exactly one edr_config/sensor_interest_manifest.json; found $($sensorManifestEntries.Count)"
+            if ($entries -match '(^|/)p0_rule_[^/]*$' -or
+                $entries -match '(^|/)sensor_interest_manifest\.json$' -or
+                $entries -match '(^|/)agent_preprocess_rules_v1[^/]*$') {
+              throw "platform-owned rule data must not be packaged"
             }
             $rootVersionEntries = @($entries | Where-Object { $_ -eq 'VERSION' })
             if ($rootVersionEntries.Count -ne 1) {

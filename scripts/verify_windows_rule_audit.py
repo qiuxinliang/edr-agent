@@ -68,6 +68,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--replay", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--bundle", type=Path, required=True,
+                        help="external canonical P0 JSON; test input only")
     parser.add_argument("--cases", type=Path, default=root / "tests/fixtures/windows_rule_audit_cases.json")
     parser.add_argument("--native-windows", action="store_true",
                         help="require a Windows kernel and a replay PE matching its native architecture")
@@ -75,7 +77,7 @@ def main():
     # Never leave an earlier success artifact behind when this run is unavailable.
     args.output.unlink(missing_ok=True)
     native_architecture = verify_native_replay(root, args.replay) if args.native_windows else None
-    bundle = root / "config/p0_rule_bundle_ir_v1.json"
+    bundle = args.bundle.resolve()
     raw = bundle.read_bytes()
     ir = json.loads(raw)
     cases = json.loads(args.cases.read_text(encoding="utf-8"))["cases"]

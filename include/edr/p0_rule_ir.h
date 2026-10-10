@@ -81,7 +81,7 @@ enum {
 /* 在首次需匹配时惰性加载；可多次调用。 */
 void edr_p0_rule_ir_lazy_init(void);
 
-/* 热重载：清空已加载规则，重新从外部文件 / embed 加载。 */
+/* 热重载：重新从已验证的外部缓存文件加载。 */
 void edr_p0_rule_ir_reload(void);
 
 /* Retire the active snapshot.  In-flight readers complete before its regex
@@ -97,6 +97,11 @@ int edr_p0_rule_ir_validate_candidate_path(const char *path);
  * candidate becomes active.  On failure both prior disk and memory state are
  * retained; the caller owns cleanup of the staged path. */
 int edr_p0_rule_ir_install_staged_bundle(const char *staged_path, const char *destination_path);
+
+/* Prepare the immediate cache parent before a same-directory download stage.
+ * Reject non-directories and symlink/reparse parents; require an owned,
+ * non-writable-by-others POSIX directory and never create ancestors. */
+int edr_p0_rule_ir_prepare_download_path(const char *destination_path);
 
 #if defined(EDR_P0_RULE_IR_TESTING)
 /* Inject the Nth parent-directory durability barrier failure.  The test seam

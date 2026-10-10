@@ -353,44 +353,8 @@ try {
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   Copy-Item -Path (Join-Path $baselineRoot "*") -Destination $installDir -Recurse -Force
-  # Runtime ZIPs before the canonical edr_config\ layout flattened these
-  # assets at the archive root. Normalize either verified package layout into
-  # the installed directory before the Agent starts.
-  $installedDetectionConfigDir = Join-Path $installDir "edr_config"
-  New-Item -ItemType Directory -Path $installedDetectionConfigDir -Force | Out-Null
-  foreach ($detectionAssetName in @("p0_rule_bundle_ir_v1.json.enc", "sensor_interest_manifest.json")) {
-    $installedDetectionAsset = Join-Path $installedDetectionConfigDir $detectionAssetName
-    if (Test-Path -LiteralPath $installedDetectionAsset -PathType Leaf) {
-      continue
-    }
-    $packagedDetectionAsset = $null
-    foreach ($packageRoot in @($baselinePackageRoot, $targetPackageRoot)) {
-      $normalizedPackageRoot = [IO.Path]::GetFullPath($packageRoot).TrimEnd([char[]]@('\', '/'))
-      $candidateDetectionAssets = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File -Filter $detectionAssetName |
-        Where-Object {
-          $candidateDirectory = [IO.Path]::GetFullPath($_.Directory.FullName).TrimEnd([char[]]@('\', '/'))
-          $isPackageRoot = [string]::Equals($candidateDirectory, $normalizedPackageRoot, [StringComparison]::OrdinalIgnoreCase)
-          $isDetectionConfigDirectory = $_.Directory.Name -eq "edr_config" -or $_.Directory.Name -eq "config"
-          $_.Length -gt 0 -and ($isPackageRoot -or $isDetectionConfigDirectory)
-        })
-      if ($candidateDetectionAssets.Count -gt 1) {
-        throw "package contains multiple candidate detection artifacts: $detectionAssetName"
-      }
-      if ($candidateDetectionAssets.Count -eq 1) {
-        $packagedDetectionAsset = $candidateDetectionAssets[0].FullName
-        break
-      }
-    }
-    if (-not $packagedDetectionAsset) {
-      throw "target and baseline packages are missing required detection artifact: $detectionAssetName"
-    }
-    $packagedDetectionAssetFullPath = [IO.Path]::GetFullPath($packagedDetectionAsset)
-    $targetPackageRootWithSeparator = $targetPackageRoot.TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
-    if ($packagedDetectionAssetFullPath.StartsWith($targetPackageRootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) {
-      Write-Warning "baseline package omitted $detectionAssetName; using the target package's verified detection asset for the installed lifecycle fixture"
-    }
-    Copy-Item -LiteralPath $packagedDetectionAsset -Destination $installedDetectionAsset -Force
-  }
+  # Detection rules are enrolled and cached at runtime. Cold installs may be
+  # unready until authenticated platform delivery; package data cannot repair it.
 
   $template = [IO.File]::ReadAllText($baselineTemplate)
   $escapedInstallDir = $installDir.Replace("\", "\\")

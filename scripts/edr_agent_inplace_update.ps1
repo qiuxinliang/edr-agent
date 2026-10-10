@@ -279,7 +279,7 @@ function Invoke-FullInstallerRuntimeMirror {
     [Parameter(Mandatory = $true)][string]$Stage
   )
   New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-  $mutableDirectories = @('certs','queue','evidence','state','logs','diagnostics','forensic','isolation','upload_outbox')
+  $mutableDirectories = @('certs','queue','evidence','state','logs','diagnostics','forensic','isolation','upload_outbox','edr_config')
   $arguments = @($Source, $Destination, '/MIR', '/XJ', '/R:2', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/XD') +
     $mutableDirectories + @('/XF', 'agent.toml', '*.pid')
   & robocopy.exe @arguments | Out-Null
@@ -345,23 +345,6 @@ function Assert-InstalledRuntimeIdentity {
   foreach ($component in $required) {
     if (-not $seen.ContainsKey($component.ToLowerInvariant())) {
       throw "installed Runtime component identity is missing required component: $component"
-    }
-  }
-}
-
-function Assert-RequiredDetectionArtifacts {
-  param(
-    [Parameter(Mandatory = $true)][string]$InstallDirectory,
-    [Parameter(Mandatory = $true)][string]$Context
-  )
-  foreach ($relativePath in @(
-    'edr_config\p0_rule_bundle_ir_v1.json.enc',
-    'edr_config\sensor_interest_manifest.json'
-  )) {
-    $artifactPath = Join-Path $InstallDirectory $relativePath
-    if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf) -or
-        (Get-Item -LiteralPath $artifactPath).Length -le 0) {
-      throw "$Context required detection artifact is missing or empty: $relativePath"
     }
   }
 }
@@ -1326,10 +1309,6 @@ try {
     if ($RuntimeManifestSha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'RuntimeManifestSha256 is required for runtime manifest' }
     if ((Get-Sha256 -Path $RuntimeManifest) -ne $RuntimeManifestSha256.ToLowerInvariant()) { throw 'runtime manifest SHA256 mismatch' }
   }
-  if ($Operation -eq 'upgrade' -and $UpgradeClass -ne 'installer_required') {
-    Assert-RequiredDetectionArtifacts -InstallDirectory $installFull `
-      -Context "$UpgradeClass cannot repair the installed baseline; use installer_required:"
-  }
   $verifiedStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'verified' }
   if ($UpgradeClass -eq 'installer_required') {
     $setupPackage = Get-SetupInstallerFromPackage -PackagePath $RuntimeManifest -DestinationDirectory (Split-Path -Parent $stagedPath) `
@@ -1369,8 +1348,6 @@ try {
     if ((Get-Sha256 -Path (Join-Path $installFull 'agent.toml')) -ne (Get-Sha256 -Path $fullInstallerConfigBackupPath)) {
       throw 'full installer modified protected agent.toml identity configuration'
     }
-    Assert-RequiredDetectionArtifacts -InstallDirectory $installFull `
-      -Context 'full installer completed without a usable P0 configuration:'
     if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf) -or (Get-Sha256 -Path $currentPath) -ne $expectedHash) {
       throw 'full installer completed but installed FDSensor does not match the task-pinned release hash'
     }

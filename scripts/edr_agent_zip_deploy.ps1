@@ -107,7 +107,7 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $rootFull = [System.IO.Path]::GetFullPath($packageRoot).TrimEnd([char]'\')
 $installFull = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd([char]'\')
 if (-not $NoCopy -and ($rootFull -ine $installFull)) {
-  $exclude = @("agent.toml", "queue", "evidence", "logs", "forensic", "isolation")
+  $exclude = @("agent.toml", "queue", "evidence", "logs", "forensic", "isolation", "edr_config", "agent_preprocess_rules_v1.toml")
   Get-ChildItem -LiteralPath $packageRoot -Force | Where-Object {
     $exclude -notcontains $_.Name
   } | ForEach-Object {
