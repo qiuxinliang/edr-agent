@@ -40,6 +40,7 @@ $relativePaths = @(
   "tests\test_windows_install_compatibility.ps1",
   "tests\test_windows_install_cng_behavior.ps1",
   "tests\test_windows_installer_acl.ps1",
+  "tests\test_windows_setup_failure.ps1",
   "tests\test_vcpkg_install_retry.ps1",
   "tests\test_vs_host_architecture.ps1",
   "tests\test_windows_task_exit.ps1",

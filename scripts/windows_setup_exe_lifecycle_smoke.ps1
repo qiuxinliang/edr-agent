@@ -314,9 +314,10 @@ try {
   }
   $status = "succeeded"
 } catch {
+  $lifecycleFailure = $_
   Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
-  Add-Evidence "lifecycle" "failed" $_.Exception.Message
-  throw
+  Add-Evidence "lifecycle" "failed" $lifecycleFailure.Exception.Message
+  throw $lifecycleFailure
 } finally {
   # PowerShell 7 can throw "Argument types do not match" when a generic
   # List[object] is expanded with @($list) inside an ordered hashtable. Convert

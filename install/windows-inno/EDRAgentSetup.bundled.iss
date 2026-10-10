@@ -827,7 +827,7 @@ begin
     + 'Reason: ' + EdrFailureReason + #13#10 + #13#10
     + 'Diagnostics bundle:' + #13#10 + EdrDiagnosticsBundle + #13#10 + #13#10
     + 'Stage log:' + #13#10 + EdrStageLog;
-  MsgBox(Msg, mbError, MB_OK);
+  SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
   RaiseException(EdrFailureReason);
 end;
 
@@ -1386,6 +1386,13 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
     EdrRunInstallWorkflow;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  { Inno may handle a post-install script exception and otherwise exit successfully. }
+  if EdrInstallFailed then Result := 4
+  else Result := 0;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
