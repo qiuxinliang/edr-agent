@@ -1087,6 +1087,8 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
   test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  /* These counters describe the processing minute, not the whole fixture. */
+  edr_local_evidence_cache_test_set_now_unix_ns(base);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
@@ -1189,7 +1191,60 @@ static void test_context_write_budget_cannot_starve_later_candidate(void) {
                 "\"critical_context\":{\"mode\":\"capacity_bound\",\"used\":0,\"limit\":0") != NULL);
   assert(strstr(health_json, "\"ordinary_context\":{\"used\":4,\"limit\":4") != NULL);
 
+  /* Only processing time advances. The late event above could not renew the
+   * pool, whereas the next processing minute must reset it even when its
+   * first admitted context is critical and therefore budget-exempt. */
+  {
+    EdrEvidenceCacheStatus after_critical, after_ordinary;
+    char candidate_id[160];
+    int64_t next_minute = (base / (60LL * 1000000000LL) + 1LL) *
+                          (60LL * 1000000000LL);
+    edr_local_evidence_cache_test_set_now_unix_ns(next_minute);
+    critical_context.event_time_ns = base + 30000000LL;
+    snprintf(critical_context.event_id, sizeof(critical_context.event_id),
+             "budget-critical-next-minute");
+    edr_local_evidence_cache_record_behavior(&critical_context);
+    edr_local_evidence_cache_get_status(&after_critical);
+    assert(after_critical.write_budget_used == 0u);
+    assert(after_critical.write_budget_ordinary_context_used == 0u);
+    assert(after_critical.write_budget_critical_context_used == 0u);
+    assert(after_critical.write_budget_context_dropped == status.write_budget_context_dropped);
+    assert(after_critical.write_budget_critical_context_dropped == 0u);
+    assert(after_critical.write_budget_candidate_dropped == 0u);
+    assert(after_critical.candidate_admitted == 17u);
+    assert(after_critical.candidate_rejected == 0u);
+    assert(after_critical.artifacts_written == 40u);
+
+    context.event_time_ns = base + 31000000LL;
+    snprintf(context.event_id, sizeof(context.event_id), "budget-context-next-minute");
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_get_status(&after_ordinary);
+    assert(after_ordinary.write_budget_used == 1u);
+    assert(after_ordinary.write_budget_ordinary_context_used == 1u);
+    assert(after_ordinary.write_budget_ordinary_context_limit == 4u);
+    assert(after_ordinary.write_budget_context_dropped == status.write_budget_context_dropped);
+    assert(after_ordinary.write_budget_ordinary_context_dropped ==
+           status.write_budget_ordinary_context_dropped);
+    assert(after_ordinary.write_budget_critical_context_dropped == 0u);
+    assert(after_ordinary.write_budget_candidate_dropped == 0u);
+    assert(after_ordinary.candidate_admitted == 17u);
+    assert(after_ordinary.candidate_rejected == 0u);
+    assert(after_ordinary.artifacts_written == 41u);
+
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+    assert(sqlite_table_count(db, "p0_candidates") == 17u);
+    assert(sqlite_table_count(db, EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) == 41u);
+    sqlite_candidate_id_for_source_event(db, "budget-candidate-a", candidate_id,
+                                         sizeof(candidate_id));
+    assert(sqlite_post_artifact_count(db, candidate_id, "budget-context-0") == 1u);
+    assert(sqlite_post_artifact_count(db, candidate_id, "budget-context-late") == 0u);
+    assert(sqlite_post_artifact_count(db, candidate_id, "budget-critical-next-minute") == 1u);
+    assert(sqlite_post_artifact_count(db, candidate_id, "budget-context-next-minute") == 1u);
+  }
+
   edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   (void)remove(db);
@@ -1221,6 +1276,7 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  edr_local_evidence_cache_test_set_now_unix_ns(base);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
   init_record(&candidate_a, EDR_EVENT_NET_CONNECT);
@@ -1319,6 +1375,7 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   assert(sqlite_post_artifact_count(db, candidate_b_id, "post-context-over-budget") == 0u);
 
   edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   (void)remove(db);
@@ -2523,6 +2580,7 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
   test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "6");
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   base = ((int64_t)ts.tv_sec / 60LL) * 60LL * 1000000000LL + 10000000000LL;
+  edr_local_evidence_cache_test_set_now_unix_ns(base);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
 
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
@@ -2601,6 +2659,7 @@ static void test_candidate_enrichment_reuses_stable_fallback_under_context_press
   sqlite_candidate_id_for_source_event(db, "", candidate_id, sizeof(candidate_id));
   sqlite_assert_candidate_enrichment(db, candidate_id, "", "475395",
                                       "target_live_telemetry_refresh", "COMPLETE");
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
   (void)remove(db);
   (void)remove("local_evidence_cache_stable_enrichment.sqlite-wal");
