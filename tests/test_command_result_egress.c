@@ -205,6 +205,85 @@ static void rtq_diagnostic_purpose_tests(void) {
   puts("PASS: RTQ bounded diagnostics preserve warnings across projection, durable owner and final gate for all six query categories; real errors cannot be downgraded");
 }
 
+static void rtq_eventlog_batch_purpose_tests(void) {
+  const char *request="{\"eventlog_channel\":\"Security\",\"eventlog_query\":\"*[System[EventID=4624]]\"}";
+  const char *detail="{\"results\":[{\"type\":\"eventlog\",\"provider\":\"Synthetic\",\"timestamp\":\"2026-10-10T06:24:44.000Z\",\"event_id\":4624,\"record_id\":2998278,\"level\":0,\"process_id\":12,\"thread_id\":34,\"xml\":\"UNRELATED-TEXT\"}],\"total\":1,\"truncated\":true,\"partial\":true,\"meta\":{\"eventlog\":{\"schema\":\"edr.rtq.eventlog-batch.v1\",\"channel\":\"Security\",\"query\":\"*[System[EventID=4624]]\",\"raw_xml\":\"UNRELATED-TEXT\"}},\"errors\":[{\"source\":\"command_result_transport\",\"code\":\"result_truncated\",\"severity\":\"warning\",\"retryable\":false},{\"source\":\"eventlog\",\"code\":\"enumeration_failed\",\"severity\":\"warning\",\"retryable\":true}]}";
+  char projected[16384],canonical[16384];
+  EdrSoarCommandMeta m=task("eventlog-compact","rtq_execute");
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)request,strlen(request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0);
+  CHECK(!strstr(projected,"UNRELATED") && strstr(projected,"collector_diagnostic"));
+  cJSON *root=cJSON_Parse(projected);CHECK(root);
+  const cJSON *row=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root,"results"),0);
+  const cJSON *batch=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"meta"),"eventlog");
+  CHECK(cJSON_IsObject(batch) && !strcmp(cJSON_GetObjectItemCaseSensitive(batch,"schema")->valuestring,"edr.rtq.eventlog-batch.v1"));
+  CHECK(!cJSON_HasObjectItem(row,"channel") && !cJSON_HasObjectItem(row,"query"));
+  CHECK(cJSON_GetObjectItemCaseSensitive(row,"record_id")->valuedouble==2998278);
+  CHECK(cJSON_GetObjectItemCaseSensitive(row,"event_id")->valueint==4624);
+  CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"partial")) && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"truncated")));
+  CHECK(cJSON_GetObjectItemCaseSensitive(root,"warning_count")->valueint==1);
+  cJSON_Delete(root);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,projected,canonical,sizeof(canonical))==0 && !strcmp(projected,canonical));
+  CHECK(edr_command_state_finish("eventlog-compact","rtq_execute",&m,"ok",1,0,detail,"",1)==0);
+  edr_command_state_compact_if_needed();
+  EdrCommandStateRecord *stored=calloc(1,sizeof(*stored));CHECK(stored);
+  CHECK(edr_command_state_begin("eventlog-compact","rtq_execute",NULL,NULL,stored)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(!strcmp(stored->detail,projected) && !strcmp(stored->result_authorization.content_contract,m.result_authorization.content_contract));
+  char *body=persisted_body("eventlog-compact","rtq_execute");
+  CHECK(allowed("tenant","ep",body) && !allowed("other-tenant","ep",body) && !allowed("tenant","other-endpoint",body));
+  free(body);free(stored);
+  for(int variant=0;variant<14;variant++) {
+    root=cJSON_Parse(detail);CHECK(root);
+    cJSON *meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
+    cJSON *scope=cJSON_GetObjectItemCaseSensitive(meta,"eventlog");
+    cJSON *item=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root,"results"),0);
+    switch(variant) {
+      case 0: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope,"channel"),"System"));break;
+      case 1: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope,"query"),"*"));break;
+      case 2: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope,"schema"),"edr.rtq.eventlog-batch.v2"));break;
+      case 3: cJSON_DeleteItemFromObjectCaseSensitive(scope,"channel");break;
+      case 4: cJSON_DeleteItemFromObjectCaseSensitive(scope,"query");break;
+      case 5: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(meta,"eventlog",cJSON_CreateArray()));break;
+      case 6: cJSON_DeleteItemFromObjectCaseSensitive(root,"meta");break;
+      case 7: CHECK(cJSON_AddStringToObject(item,"channel","System"));break;
+      case 8: CHECK(cJSON_AddStringToObject(item,"query","*"));break;
+      case 9: CHECK(cJSON_AddNumberToObject(item,"channel",1));break;
+      case 10: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(scope,"query",cJSON_CreateNull()));break;
+      /* Keep the unsafe boundary literal exact instead of letting the fixture
+       * serializer round a large double back into the accepted range. */
+      case 11: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(item,"record_id",cJSON_CreateRaw("9007199254740992")));break;
+      case 12: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(item,"event_id"),65536);break;
+      case 13: cJSON_DeleteItemFromObjectCaseSensitive(item,"timestamp");break;
+    }
+    char *invalid=cJSON_PrintUnformatted(root);CHECK(invalid);
+    int rc=edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,invalid,canonical,sizeof(canonical));
+    if(rc==0)fprintf(stderr,"FAIL: compact eventlog negative variant %d admitted\n",variant);
+    CHECK(rc!=0);
+    free(invalid);cJSON_Delete(root);
+  }
+  root=cJSON_Parse(detail);CHECK(root);
+  cJSON *compatible=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root,"results"),0);
+  CHECK(cJSON_AddStringToObject(compatible,"channel","Security") && cJSON_AddStringToObject(compatible,"query","*[System[EventID=4624]]"));
+  char *compatible_detail=cJSON_PrintUnformatted(root);CHECK(compatible_detail);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,compatible_detail,canonical,sizeof(canonical))==0 && !strcmp(canonical,projected));
+  free(compatible_detail);cJSON_Delete(root);
+  EdrSoarCommandMeta process=task("eventlog-unrequested-batch","rtq_execute");
+  CHECK(edr_command_result_project_detail(&process.result_authorization,"rtq_execute",1,0,detail,canonical,sizeof(canonical))!=0);
+  const char *defaults="{\"results\":[],\"truncated\":false,\"meta\":{\"eventlog\":{\"schema\":\"edr.rtq.eventlog-batch.v1\",\"channel\":\"System\",\"query\":\"*\"}}}";
+  const char *default_request="{\"eventlog_query\":\"*\"}";
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)default_request,strlen(default_request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,defaults,canonical,sizeof(canonical))==0);
+  const char *mixed_request="{\"eventlog_channel\":\"Security\",\"file_path\":\"/tmp/foo\"}";
+  const char *mixed="{\"results\":[{\"type\":\"file\",\"path\":\"/tmp/foo\",\"size\":1}],\"truncated\":false,\"meta\":{\"eventlog\":{\"schema\":\"edr.rtq.eventlog-batch.v1\",\"channel\":\"Security\",\"query\":\"*\"},\"file_hash\":{\"scope\":\"path_scan\",\"cache_status\":\"not_requested\",\"path_scanned\":true}}}";
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)mixed_request,strlen(mixed_request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,mixed,canonical,sizeof(canonical))==0);
+  root=cJSON_Parse(canonical);CHECK(root);
+  cJSON *mixed_meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
+  CHECK(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(mixed_meta,"eventlog")) && cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(mixed_meta,"file_hash")));
+  cJSON_Delete(root);
+  puts("PASS: compact eventlog scope is signed-request-bound, compatible, idempotent and durable; wrong scopes/types and unrequested batches are held; diagnostics and mixed file metadata survive");
+}
+
 static void rtq_file_metadata_purpose_tests(void) {
   const char *sha="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   char request[200],detail[1600],projected[16384],canonical[16384];
@@ -276,6 +355,7 @@ static void rtq_alias_and_sentinel_purpose_tests(void) {
 static void purpose_tests(void) {
   shell_open_purpose_tests();
   rtq_diagnostic_purpose_tests();
+  rtq_eventlog_batch_purpose_tests();
   rtq_file_metadata_purpose_tests();
   rtq_alias_and_sentinel_purpose_tests();
   EdrSoarCommandMeta q=task("purpose-query","rtq_execute");

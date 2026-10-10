@@ -390,6 +390,70 @@ static void complete_row_and_cancellation_tests(const char *root) {
   puts("PASS: bounded output preserves complete JSON rows and cooperative cancellation reports terminal failure");
 }
 
+static void eventlog_batch_budget_tests(void) {
+  rtq_filter filter; memset(&filter, 0, sizeof(filter));
+  char metadata[4096], encoded[4200];
+  CHECK(eventlog_batch_metadata(&filter, metadata, sizeof(metadata)) == 0 && !metadata[0]);
+  filter.has_eventlog = 1;
+  int metadata_len = eventlog_batch_metadata(&filter, metadata, sizeof(metadata));
+  CHECK(metadata_len > 0);
+  CHECK(snprintf(encoded, sizeof(encoded), "{%s\"fixture\":true}", metadata) < (int)sizeof(encoded));
+  cJSON *object = cJSON_Parse(encoded); CHECK(object);
+  const cJSON *batch = member(object, "eventlog");
+  CHECK(!strcmp(text(batch, "schema"), EDR_RTQ_EVENTLOG_BATCH_SCHEMA));
+  CHECK(!strcmp(text(batch, "channel"), "System") && !strcmp(text(batch, "query"), "*"));
+  cJSON_Delete(object);
+  CHECK(eventlog_batch_metadata(&filter, metadata, 32) < 0);
+
+  snprintf(filter.eventlog_channel, sizeof(filter.eventlog_channel), "%s", "Security");
+  snprintf(filter.eventlog_query, sizeof(filter.eventlog_query), "%s", "*[System[EventID=4624 or EventID=4625] and EventData[Data[@Name='TargetUserName']='Synthetic']]" );
+  metadata_len = eventlog_batch_metadata(&filter, metadata, sizeof(metadata)); CHECK(metadata_len > 0);
+  const char *row = "{\"type\":\"eventlog\",\"provider\":\"Synthetic\",\"timestamp\":\"2026-10-10T06:24:44.000Z\",\"event_id\":4624,\"record_id\":2998278,\"level\":0,\"process_id\":12,\"thread_id\":34}";
+  char legacy_row[1200];
+  int row_len = (int)strlen(row), legacy_len = row_len - 1;
+  memcpy(legacy_row, row, (size_t)legacy_len); legacy_row[legacy_len] = 0;
+  CHECK(append_json_kv_str(legacy_row, sizeof(legacy_row), &legacy_len, "channel", filter.eventlog_channel));
+  CHECK(append_json_kv_str(legacy_row, sizeof(legacy_row), &legacy_len, "query", filter.eventlog_query));
+  CHECK(rtq_appendf(legacy_row, sizeof(legacy_row), &legacy_len, "}"));
+  char compact_result[RTQ_MAX_RESULT_STR], legacy_result[RTQ_MAX_RESULT_STR];
+  int compact_offset=0, legacy_offset=0, compact_total=0, legacy_total=0, compact_truncated=0, legacy_truncated=0;
+  CHECK(rtq_appendf(compact_result, sizeof(compact_result), &compact_offset, "{\"results\":["));
+  CHECK(rtq_appendf(legacy_result, sizeof(legacy_result), &legacy_offset, "{\"results\":["));
+  while(rtq_commit_row(compact_result, RTQ_COLLECTOR_RESULT_CAP-metadata_len, &compact_offset, &compact_total, row, row_len, &compact_truncated)) {}
+  while(rtq_commit_row(legacy_result, RTQ_COLLECTOR_RESULT_CAP, &legacy_offset, &legacy_total, legacy_row, legacy_len, &legacy_truncated)) {}
+  CHECK(compact_truncated && legacy_truncated && compact_total > legacy_total);
+  CHECK(compact_offset+metadata_len < RTQ_COLLECTOR_RESULT_CAP);
+  CHECK(rtq_appendf(compact_result, sizeof(compact_result), &compact_offset, "],\"meta\":{%s\"fixture\":true},\"truncated\":true}", metadata));
+  CHECK(rtq_appendf(legacy_result, sizeof(legacy_result), &legacy_offset, "],\"truncated\":true}"));
+  object=cJSON_Parse(compact_result); CHECK(object && cJSON_GetArraySize(member(object, "results"))==compact_total);
+  CHECK(!member(member(object, "results")->child, "channel") && !member(member(object, "results")->child, "query")); cJSON_Delete(object);
+  object=cJSON_Parse(legacy_result); CHECK(object && cJSON_GetArraySize(member(object, "results"))==legacy_total); cJSON_Delete(object);
+  CHECK(compact_offset < RTQ_MAX_RESULT_STR);
+  printf("PASS: the same fixed result budget retains %d compact rows versus %d legacy rows for the scoped fixture; complete rows and common query survive\n", compact_total, legacy_total);
+
+  /* Worst-case JSON expansion is charged once, not multiplied by row count. */
+  memset(filter.eventlog_channel, 1, sizeof(filter.eventlog_channel)-1);
+  filter.eventlog_channel[sizeof(filter.eventlog_channel)-1]=0;
+  memset(filter.eventlog_query, 1, sizeof(filter.eventlog_query)-1);
+  filter.eventlog_query[sizeof(filter.eventlog_query)-1]=0;
+  metadata_len=eventlog_batch_metadata(&filter, metadata, sizeof(metadata));
+  CHECK(metadata_len > 6*((int)sizeof(filter.eventlog_channel)+(int)sizeof(filter.eventlog_query)-2));
+  CHECK(snprintf(encoded, sizeof(encoded), "{%s\"fixture\":true}", metadata) < (int)sizeof(encoded));
+  object=cJSON_Parse(encoded); CHECK(object);
+  batch=member(object, "eventlog");
+  CHECK(!strcmp(text(batch, "channel"), filter.eventlog_channel) && !strcmp(text(batch, "query"), filter.eventlog_query));
+  cJSON_Delete(object);
+  reset_boundaries();
+  cJSON *request=cJSON_CreateObject(); CHECK(request);
+  CHECK(cJSON_AddStringToObject(request, "eventlog_channel", filter.eventlog_channel));
+  CHECK(cJSON_AddStringToObject(request, "eventlog_query", filter.eventlog_query));
+  object=collect(request); CHECK(object && strlen(capture_detail)<RTQ_MAX_RESULT_STR);
+  batch=member(member(object, "meta"), "eventlog");
+  CHECK(!strcmp(text(batch, "channel"), filter.eventlog_channel) && !strcmp(text(batch, "query"), filter.eventlog_query));
+  cJSON_Delete(object);cJSON_Delete(request);
+  puts("PASS: absent/default/oversized/escaped batch scopes keep the existing footer and durable JSON budgets");
+}
+
 static void escaped_string_tests(void) {
   const char controls[] = {'f', 'i', 'x', 1, 2, 31, '\b', '\f', '\t', '\n', '\r', '"', '\\', (char)0xc3, (char)0xa9, 0};
   char buffer[256] = "{\"type\":\"process\""; int offset = (int)strlen(buffer);
@@ -708,8 +772,11 @@ static void windows_system_event_test(void) {
   reset_boundaries(); event_render_calls = event_xml_calls = 0;
   cJSON *request = cJSON_CreateObject(); CHECK(request); CHECK(cJSON_AddStringToObject(request, "eventlog_channel", "System"));
   cJSON *result = collect(request); CHECK(integer(result, "total") > 0 && event_render_calls > 0 && event_xml_calls == 0);
+  const cJSON *batch=member(member(result, "meta"), "eventlog");
+  CHECK(!strcmp(text(batch, "schema"), EDR_RTQ_EVENTLOG_BATCH_SCHEMA));
+  CHECK(!strcmp(text(batch, "channel"), "System") && !strcmp(text(batch, "query"), "*"));
   for (const cJSON *row = member(result, "results")->child; row; row = row->next) {
-    CHECK(!strcmp(text(row, "type"), "eventlog") && !strcmp(text(row, "channel"), "System"));
+    CHECK(!strcmp(text(row, "type"), "eventlog") && !member(row, "channel") && !member(row, "query"));
     CHECK(strlen(text(row, "provider")) > 0 && strlen(text(row, "timestamp")) > 0);
     CHECK(integer(row, "event_id") >= 0 && integer(row, "event_id") <= 65535);
     CHECK(cJSON_IsNumber(member(row, "record_id")) && member(row, "record_id")->valuedouble >= 1);
@@ -776,7 +843,7 @@ int main(int argc, char **argv) {
   (void)argc; (void)argv;
 #endif
   char root[520]; fixture_root(root);
-  file_semantics_tests(root); file_boundary_tests(root); diagnostic_and_cache_budget_tests(); complete_row_and_cancellation_tests(root); escaped_string_tests();
+  file_semantics_tests(root); file_boundary_tests(root); diagnostic_and_cache_budget_tests(); complete_row_and_cancellation_tests(root); eventlog_batch_budget_tests(); escaped_string_tests();
 #ifndef _WIN32
   process_field_tests(); process_capacity_tests(); sampler_tests();
   puts("SKIP: Windows native process, event metadata, System events, registry and IPv6 branches require a Windows test host");

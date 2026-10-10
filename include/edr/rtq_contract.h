@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define EDR_RTQ_EVENTLOG_BATCH_SCHEMA "edr.rtq.eventlog-batch.v1"
+
 /* The validator, live collector and signed result projection share the same
  * state spelling. The signed request itself is never rewritten. */
 static inline int edr_rtq_network_state_normalize(const char *input, char *out, size_t cap) {
