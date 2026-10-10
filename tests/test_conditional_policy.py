@@ -24,6 +24,14 @@ class Receiver(http.server.BaseHTTPRequestHandler):
         pass
     def do_POST(self):
         import json
+        if self.path == "/api/v1/ingest/config-status":
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            self.wfile.flush()
+            return
         assert self.path == "/api/v1/ingest/engine-health"
         assert self.connection.getpeercert()
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -42,7 +50,7 @@ class Receiver(http.server.BaseHTTPRequestHandler):
         type(self).calls += 1
         assert self.path == "/api/v1/agent/runtime-policy.toml"
         assert self.connection.getpeercert()
-        assert (self.headers.get("If-None-Match") is None) == (step == 0)
+        assert (self.headers.get("If-None-Match") is None) == (step in (0, 11, 13))
         body = b"[synthetic]\nvalue = 1\n" if step < 2 else b"[synthetic]\nvalue = 2\n"
         if step >= 7:
             body = b"[synthetic]\nvalue = 3\n"
@@ -51,11 +59,11 @@ class Receiver(http.server.BaseHTTPRequestHandler):
             digest = "0" * 64
         fields = dict(schema="agent-config-signature-v1", version="synthetic-v1", sequence=1 if step == 9 else 2,
                       configHash=digest, previousHash="", nonce=f"synthetic-{step}",
-                      expiresAt="2000-01-01T00:00:00Z" if step == 5 else "2099-01-01T00:00:00Z",
+                      expiresAt="2000-01-01T00:00:00Z" if step in (5, 12) else "2099-01-01T00:00:00Z",
                       signingKeyId="synthetic-key")
         payload = json.dumps(fields, separators=(",", ":")).encode()
-        self.send_response(200 if step in (0, 2, 7) else 304)
-        if step != 4:
+        self.send_response(200 if step in (0, 2, 7, 11, 13) else 304)
+        if step not in (4, 10):
             for header, value in {
                 "X-Rules-Version": fields["version"], "X-Agent-Config-Hash": digest,
                 "X-Agent-Config-Sequence": str(fields["sequence"]), "X-Agent-Config-Previous-Hash": "",
@@ -66,9 +74,9 @@ class Receiver(http.server.BaseHTTPRequestHandler):
             }.items():
                 self.send_header(header, value)
         # The 304 selected-representation length must never be consumed as a body.
-        self.send_header("Content-Length", str(len(body)) if step in (0, 2, 6, 7) else "0")
+        self.send_header("Content-Length", str(len(body)) if step in (0, 2, 6, 7, 11, 13) else "0")
         self.end_headers()
-        if step in (0, 2, 7):
+        if step in (0, 2, 7, 11, 13):
             self.wfile.write(body)
         self.wfile.flush()
 
@@ -88,11 +96,11 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            env = dict(os.environ, EDR_AGENT_CONFIG_SIGNING_SECRET=SECRET, EDR_ENGINE_HEALTH_INTERVAL_S="120")
+            env = dict(os.environ, EDR_AGENT_CONFIG_SIGNING_SECRET=SECRET, EDR_ENGINE_HEALTH_INTERVAL_S="120", EDR_REMOTE_CONFIG_AUTO_PULL="1", EDR_REMOTE_CONFIG_POLL_S="60", EDR_REMOTE_CONFIG_URL=f"https://127.0.0.1:{server.server_port}/api/v1/agent/runtime-policy.toml")
             subprocess.run([args.client, f"https://127.0.0.1:{server.server_port}/api/v1",
                             str(root / "ca.pem"), str(root / "client.pem"), str(root / "client.key"),
                             str(root / "queue.db"), str(root / "response.toml")], env=env, check=True, timeout=45)
-            assert Receiver.calls == 10
+            assert Receiver.calls == 14
             assert Receiver.health_profiles == ["basic", "diagnostic"]
         finally:
             server.shutdown()

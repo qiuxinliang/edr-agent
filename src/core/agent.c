@@ -632,6 +632,26 @@ static int edr_agent_verify_config_headers(const EdrConfig *cfg, const char *que
   return edr_agent_signed_config_identity_matches_headers(headers, reason, reason_cap);
 }
 
+/* A conditional response is useful only with fresh authenticated metadata,
+ * even when legacy unsigned 200 policies are accepted by local configuration. */
+static int edr_agent_verify_policy_response(const EdrConfig *cfg, const char *queue_db_path,
+    const char *tmp, const EdrAgentConfigHeaders *headers, int not_modified,
+    char *reason, size_t reason_cap) {
+  if (not_modified) {
+#ifndef EDR_HAVE_OPENSSL_HTTP
+    snprintf(reason, reason_cap, "conditional policy signature verification unavailable");
+    return -1;
+#endif
+    if (!headers || !headers->signature[0] || !headers->signed_payload_b64[0] ||
+        !headers->sequence[0] || !headers->config_hash[0] || !headers->nonce[0] ||
+        !headers->expires_at[0] || !headers->signing_key_id[0]) {
+      snprintf(reason, reason_cap, "conditional policy missing fresh signed metadata");
+      return -1;
+    }
+  }
+  return edr_agent_verify_config_headers(cfg, queue_db_path, tmp, headers, reason, reason_cap);
+}
+
 static int edr_agent_replace_file(const char *src, const char *dst) {
   if (!src || !src[0] || !dst || !dst[0]) {
     return -1;
@@ -4448,7 +4468,7 @@ static void edr_agent_poll_remote_config(EdrAgent *agent, uint64_t *last_remote_
   }
   {
     char verify_reason[192];
-    if (edr_agent_verify_config_headers(&agent->cfg, agent->cfg.offline.queue_db_path, tmp, &config_headers, verify_reason, sizeof(verify_reason)) != 0) {
+    if (edr_agent_verify_policy_response(&agent->cfg, agent->cfg.offline.queue_db_path, tmp, &config_headers, download_rc == 1, verify_reason, sizeof(verify_reason)) != 0) {
       fprintf(stderr, "[config] remote TOML signature rejected: %s\n", verify_reason);
       edr_agent_report_remote_config_failure(agent, &config_headers, verify_reason, now);
       /* A bad 304 must not pin a corrupt cache. Re-fetch a full signed body
