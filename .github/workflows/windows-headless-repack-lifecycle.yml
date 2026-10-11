@@ -1,0 +1,205 @@
+name: No-build Headless repack lifecycle
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Immutable published unsigned source tag
+        required: true
+        default: win_3.2.659
+        type: string
+      source_commit:
+        description: Exact original Agent source SHA (not the workflow executor)
+        required: true
+        default: ef35eea018400def9985cf6daf286654fcca8a85
+        type: string
+      source_run:
+        description: Original successful dual-native build run
+        required: true
+        default: '38097447538'
+        type: string
+      private_repack_release_id:
+        description: Complete private Headless repack Release ID
+        required: true
+        type: string
+      private_repack_run:
+        description: Successful private repack workflow run ID
+        required: true
+        type: string
+      private_repack_attempt:
+        description: Exact private repack attempt
+        required: true
+        default: '1'
+        type: string
+      private_repack_commit:
+        description: Exact reviewed private repack executor SHA
+        required: true
+        type: string
+      publisher_thumbprint:
+        description: Pinned code-signing certificate SHA-1 thumbprint (uppercase)
+        required: true
+        type: string
+      publisher_subject:
+        description: Exact code-signing certificate subject
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: headless-repack-lifecycle-${{ inputs.private_repack_run }}-${{ inputs.private_repack_attempt }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  native-lifecycle:
+    # Never execute installers on the USB signing machine or a self-hosted host.
+    # Main registers this dispatcher only; its old checkout lacks the consumer.
+    if: github.repository == 'qiuxinliang/edr-agent' && github.ref == 'refs/heads/codex/release-workflow-convergence'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      SOURCE_TAG: ${{ inputs.source_tag }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      SOURCE_RUN: ${{ inputs.source_run }}
+      PRIVATE_RELEASE_ID: ${{ inputs.private_repack_release_id }}
+      PRIVATE_RUN: ${{ inputs.private_repack_run }}
+      PRIVATE_ATTEMPT: ${{ inputs.private_repack_attempt }}
+      PRIVATE_COMMIT: ${{ inputs.private_repack_commit }}
+      PUBLISHER_THUMBPRINT: ${{ inputs.publisher_thumbprint }}
+      PUBLISHER_SUBJECT: ${{ inputs.publisher_subject }}
+      NATIVE_ARCH: ${{ matrix.arch }}
+      BASELINE_TAG: win_3.2.658
+    steps:
+      - name: Checkout reviewed lifecycle consumer (executor)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          path: consumer
+
+      - name: Verify clean native hosted host and required credentials
+        shell: pwsh
+        env:
+          ACTIONS_TOKEN_PRESENT: ${{ secrets.USB_SIGNING_TOKEN != '' }}
+          RELEASE_TOKEN_PRESENT: ${{ secrets.USB_SIGNING_RELEASE_TOKEN != '' }}
+          LIFECYCLE_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:LIFECYCLE_RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'A clean GitHub-hosted Windows machine is required' }
+          if ($env:ACTIONS_TOKEN_PRESENT -ne 'true' -or $env:RELEASE_TOKEN_PRESENT -ne 'true') {
+            throw 'USB_SIGNING_TOKEN (Actions read) and USB_SIGNING_RELEASE_TOKEN (private Contents read/write) are required'
+          }
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class EdrNativeHost {
+            [DllImport("kernel32.dll")] public static extern void GetNativeSystemInfo(IntPtr info);
+          }
+          '@
+          $info = [Runtime.InteropServices.Marshal]::AllocHGlobal(64)
+          try {
+            [EdrNativeHost]::GetNativeSystemInfo($info)
+            $actual = [Runtime.InteropServices.Marshal]::ReadInt16($info)
+          } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+          $expected = if ($env:NATIVE_ARCH -eq 'arm64') { 12 } else { 9 }
+          if ($actual -ne $expected) { throw 'Runner kernel architecture is not native for this lifecycle' }
+          $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevated hosted runner required' }
+          if (Get-Service -Name FDSecurityAgent,EdrAgent,FDSecurityAgentCISmoke -ErrorAction SilentlyContinue) { throw 'Existing EDR service: refusing destructive lifecycle on a non-clean host' }
+          if (Get-Process -Name FDSensor,EDRAgent,FDSecurityInstallerWorker -ErrorAction SilentlyContinue) { throw 'Existing EDR process: refusing lifecycle' }
+          foreach ($path in @('C:\Program Files\FDSecurity', 'C:\ProgramData\FDSecurity', 'C:\edr-agent-lifecycle-smoke', 'C:\edr-agent-setup-lifecycle-smoke')) {
+            if (Test-Path -LiteralPath $path) { throw "Existing EDR state: $path" }
+          }
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+
+      - name: Admit original successful builds and verified private Headless package
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+        run: |
+          & python consumer/scripts/headless_repack_lifecycle.py stage `
+            --source-tag $env:SOURCE_TAG --source-commit $env:SOURCE_COMMIT --source-run $env:SOURCE_RUN `
+            --private-release-id $env:PRIVATE_RELEASE_ID --private-run $env:PRIVATE_RUN `
+            --private-attempt $env:PRIVATE_ATTEMPT --private-commit $env:PRIVATE_COMMIT `
+            --thumbprint $env:PUBLISHER_THUMBPRINT --subject $env:PUBLISHER_SUBJECT `
+            --baseline-tag $env:BASELINE_TAG --arch $env:NATIVE_ARCH --root lifecycle-input
+          if ($LASTEXITCODE -ne 0) { throw 'Independent Headless package admission failed; no installer was executed' }
+          & ./consumer/scripts/Verify-HeadlessRepackLifecycle.ps1 -Root lifecycle-input `
+            -Architecture $env:NATIVE_ARCH -Thumbprint $env:PUBLISHER_THUMBPRINT -Subject $env:PUBLISHER_SUBJECT
+
+      - name: Checkout exact original source for existing lifecycle harness only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+          path: source
+
+      - name: Execute real Headless install, repair, upgrade, rollback and uninstall
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git -C source rev-parse HEAD).Trim() -cne $env:SOURCE_COMMIT) { throw 'Lifecycle source checkout mismatch' }
+          # Only adds synchronous installed-file hash assertions to a temporary
+          # original-harness copy; preserves every original rollback/checkpoint.
+          & ./consumer/scripts/Verify-HeadlessRepackLifecycle.ps1 -Mode RunSetup `
+            -Root lifecycle-input -SourceDirectory source -Architecture $env:NATIVE_ARCH `
+            -Thumbprint $env:PUBLISHER_THUMBPRINT -Subject $env:PUBLISHER_SUBJECT `
+            -EvidenceDirectory setup-exe-evidence
+
+      - name: Execute embedded binary updater, rollback and native uninstall
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          & ./source/scripts/windows_release_lifecycle_smoke.ps1 `
+            -TargetPackageDir lifecycle-input/target/runtime -BaselinePackageDir lifecycle-input/baseline/runtime `
+            -TargetVersion $env:SOURCE_TAG.Substring(4) -BaselineVersion $env:BASELINE_TAG.Substring(4) `
+            -Architecture $env:NATIVE_ARCH -EvidenceDir runtime-evidence
+
+      - name: Preserve admission and precise acceptance scope
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path setup-exe-evidence | Out-Null
+          foreach ($name in @('admission.json','signature-verification.json','result.json')) {
+            $path = Join-Path lifecycle-input $name
+            if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path setup-exe-evidence $name) }
+          }
+          @'
+          ## No-build Headless lifecycle
+          Agent binaries reused from the immutable published source; no compilation, Setup UI signing, public Release upload, or latest promotion.
+          Setup coverage: fresh install, repair, baseline upgrade, rollback and uninstall on a clean native host.
+          Runtime coverage: embedded binary_hot updater and native uninstall, not runtime_bundle deployment, cloud enrollment, heartbeat or RTR.
+          Unsigned baseline rollback uses the existing optional-signature/SHA-256 contract, not a signed-only rollback claim.
+          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Retain complete evidence in owned private draft Release
+        if: always()
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+          LIFECYCLE_STATUS: ${{ job.status }}
+        run: |
+          & python consumer/scripts/upload_windows_lifecycle_evidence.py --target-tag $env:SOURCE_TAG `
+            --arch $env:NATIVE_ARCH --job-status $env:LIFECYCLE_STATUS --workspace $env:GITHUB_WORKSPACE `
+            --output-dir "$env:RUNNER_TEMP/headless-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:NATIVE_ARCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Private evidence transfer failed; acceptance is incomplete' }
