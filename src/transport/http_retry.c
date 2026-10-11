@@ -1,5 +1,6 @@
 #include "edr/http_retry.h"
 #include "edr/detection_decision.h"
+#include "edr/p0_rule_ir.h"
 
 #include <ctype.h>
 #include <stddef.h>
@@ -117,10 +118,12 @@ int edr_http_build_request_headers(const EdrHttpRequestAttemptSpec *spec,
                "X-Tenant-ID: %s\r\n"
                "X-Endpoint-ID: %s\r\n"
                "X-EDR-Suppression-Contract: " EDR_DETECTION_SUPPRESSION_CONTRACT "\r\n"
+               "X-EDR-P0-IR-Schema: %u\r\n"
                "X-User-ID: %s\r\n"
                "X-Permission-Set: %s\r\n",
                spec->tenant_id && spec->tenant_id[0] ? spec->tenant_id : "demo-tenant",
                spec->endpoint_id ? spec->endpoint_id : "",
+               (unsigned)EDR_P0_RULE_IR_SCHEMA_VERSION,
                spec->user_id && spec->user_id[0] ? spec->user_id : "edr-agent",
                spec->permission_set && spec->permission_set[0]
                    ? spec->permission_set

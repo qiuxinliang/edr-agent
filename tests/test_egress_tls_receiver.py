@@ -9,6 +9,7 @@ import argparse
 from contextlib import closing
 import base64
 import hashlib
+import http.client
 import http.server
 import json
 import os
@@ -271,6 +272,8 @@ class Receiver(http.server.ThreadingHTTPServer):
         self.config_receipts = []
         self.download_paths = set()
         self.download_requests = 0
+        self.rule_downloads_enabled = False
+        self.rule_download_receipts = []
         self.lock = threading.Lock()
         with closing(sqlite3.connect(database)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -312,6 +315,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if self.server.rule_downloads_enabled and self.path in (
+                "/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):
+            # This synthetic oracle mirrors the current server's schema8
+            # negotiation. It never handles real rule inputs or activation.
+            schema = self.headers.get_all("X-EDR-P0-IR-Schema") or []
+            status = 200 if schema == ["8"] and self.connection.getpeercert() else 412
+            with self.server.lock:
+                self.server.rule_download_receipts.append({"path": self.path, "status": status,
+                                                          "exact_single_schema": schema == ["8"]})
+            if status != 200:
+                self.reply({"code": "P0_IR_SCHEMA_UNSUPPORTED"}, 412)
+                return
+            body = b"synthetic-rule-artifact"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         # Exact synthetic QueueCommand URLs only. The socket already requires
         # a client certificate; no production endpoint or input is contacted.
         with self.server.lock:
@@ -558,6 +581,23 @@ def crash_restart_scenario(client, root):
     return failure
 
 
+def reject_rule_schema_probes(root, server):
+    """Two bounded loopback mTLS negatives, outside the Agent product API."""
+    context = ssl.create_default_context(cafile=str(root / "ca.pem"))
+    context.load_cert_chain(root / "client.pem", root / "client.key")
+    for path, headers in (("/api/v1/agent/p0-bundle.enc", {}),
+                          ("/api/v1/agent/sensor-interest.json", {"X-EDR-P0-IR-Schema": "7"})):
+        connection = http.client.HTTPSConnection("localhost", server.server_port, context=context, timeout=2)
+        try:
+            connection.request("GET", path, headers=headers)
+            response = connection.getresponse()
+            response.read(4096)
+            if response.status != 412:
+                raise RuntimeError("synthetic unsupported rule schema must return 412")
+        finally:
+            connection.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True)
@@ -591,6 +631,7 @@ def main():
             print(f"mTLS scenario begin: {mode}", file=sys.stderr, flush=True)
             server = Receiver(root, "wrong-host" if mode in ("wrong-host", "wrong-update-download-host") else "server", root / f"receiver-{mode}.db")
             try:
+                server.rule_downloads_enabled = mode == "positive" and not args.baseline
                 environment = os.environ.copy()
                 environment.pop("EDR_ZSTD_DICT_PATH", None)
                 environment.pop("EDR_CONTROL_DICT_PATH", None)
@@ -680,6 +721,8 @@ def main():
                                          str(root / "client.pem"), str(root / "client.key"),
                                          str(root / f"agent-{mode}.db"), mode],
                                         capture_output=True, text=True, timeout=45, env=environment, cwd=root)
+                if mode == "positive" and not args.baseline and result.returncode == 0:
+                    reject_rule_schema_probes(root, server)
             finally:
                 server.finish()
             reports.append({"mode": mode, "client_exit": result.returncode,
@@ -708,6 +751,16 @@ def main():
                                 {"status": "failed", "verified": False,
                                  "reason": "config_validation_failed", "contract": "2"}]
                     if server.config_receipts != expected:
+                        reports[-1]["receiver_business_failures"] += 1
+                if mode == "positive" and not args.baseline:
+                    reports[-1]["rule_file_downloads"] = getattr(server, "rule_download_receipts", [])
+                    expected = [
+                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 200, "exact_single_schema": True},
+                        {"path": "/api/v1/agent/sensor-interest.json", "status": 200, "exact_single_schema": True},
+                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
+                    ]
+                    if reports[-1]["rule_file_downloads"] != expected:
                         reports[-1]["receiver_business_failures"] += 1
             if result.returncode and not args.baseline:
                 # Safe synthetic assertion names only; no body or credentials.

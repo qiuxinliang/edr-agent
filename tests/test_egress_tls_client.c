@@ -42,6 +42,43 @@ static void pause_retry(void) { struct timespec t = {1, 200000000L}; nanosleep(&
 
 static unsigned failed;
 #define CHECK(expr) do { if (!(expr)) { fprintf(stderr, "synthetic TLS check failed: %s\n", #expr); failed++; } } while (0)
+
+#ifdef EDR_TEST_EXTENDED_EGRESS
+static void rule_file_downloads(const char *base, const char *queue_path) {
+  static const char *routes[] = {"/agent/p0-bundle.enc", "/agent/sensor-interest.json"};
+  static const char expected[] = "synthetic-rule-artifact";
+  unsigned verified = 0u;
+  for (size_t i = 0u; i < sizeof(routes) / sizeof(routes[0]); ++i) {
+    char url[1024], output[1400], bytes[64] = {0};
+    int url_size = snprintf(url, sizeof(url), "%s%s", base, routes[i]);
+    int path_size = snprintf(output, sizeof(output), "%s.rule-download", queue_path);
+    CHECK(url_size > 0 && (size_t)url_size < sizeof(url) &&
+          path_size > 0 && (size_t)path_size < sizeof(output));
+    if (url_size <= 0 || (size_t)url_size >= sizeof(url) || path_size <= 0 ||
+        (size_t)path_size >= sizeof(output)) continue;
+    /* Use the exact bounded native file GET consumer called by both polls.
+     * Downloading synthetic bytes proves transport, never rule activation. */
+    int rc = edr_ingest_http_get_url_to_file_meta_bounded(url, output, 4096u, NULL, 2000, 1);
+    CHECK(rc == 0);
+    FILE *file = fopen(output, "rb");
+    if (rc == 0) {
+      CHECK(file);
+      if (file) {
+        size_t size = fread(bytes, 1u, sizeof(bytes), file);
+        int exact = !ferror(file) && size == sizeof(expected) - 1u &&
+                    !memcmp(bytes, expected, sizeof(expected) - 1u);
+        CHECK(exact);
+        if (exact) verified++;
+      }
+    } else {
+      CHECK(!file); /* Failed/412 downloads must not retain a partial file. */
+    }
+    if (file) CHECK(fclose(file) == 0);
+    if (rc == 0) CHECK(remove(output) == 0);
+  }
+  printf("{\"rule_file_downloads\":%u,\"rule_activation_claimed\":false}\n", verified);
+}
+#endif
 static void wr(uint8_t *p, uint32_t value) { for (unsigned i = 0; i < 4u; ++i) p[i] = (uint8_t)(value >> (i * 8u)); }
 static int row_count(const char *db_path, const char *batch_id, const char *status) {
   sqlite3 *db = NULL; sqlite3_stmt *stmt = NULL; int count = -1;
@@ -598,6 +635,10 @@ int main(int argc, char **argv) {
     printf("{\"mode\":\"%s\",\"tls_rejected\":%s}\n", argv[6], rc != 0 ? "true" : "false");
     return rc != 0 ? 0 : 1;
   }
+#ifdef EDR_TEST_EXTENDED_EGRESS
+  if (!strcmp(argv[6], "positive") && !getenv("EDR_TEST_CRASH_AFTER_LOST_ACK"))
+    rule_file_downloads(argv[1], argv[5]);
+#endif
   EdrBehaviorRecord *r = calloc(1, sizeof(*r));
   uint8_t *ordinary = malloc(256u * 1024u), *alert = malloc(256u * 1024u);
   if (!r || !ordinary || !alert) return 2;

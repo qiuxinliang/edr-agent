@@ -1,6 +1,7 @@
 #include "edr/http_retry.h"
 #include "edr/request_signing.h"
 #include "edr/detection_decision.h"
+#include "edr/p0_rule_ir.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -102,6 +103,43 @@ static RetryFixture fixture_with(const char *first, const char *second) {
   return fixture;
 }
 
+static int p0_file_get_headers(EdrHttpRequestAttemptSpec *spec) {
+  const char *paths[] = {"/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"};
+  char expected_schema[16];
+  int ok = 1;
+  snprintf(expected_schema, sizeof(expected_schema), "%u", (unsigned)EDR_P0_RULE_IR_SCHEMA_VERSION);
+  for (size_t i = 0u; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    char headers[4096], schema[16], contract[8], nonce[33], timestamp[32], signature[65], body_hash[65];
+    const char *first;
+    spec->method = "GET"; spec->path = paths[i]; spec->body = NULL; spec->body_len = 0u;
+    int header_size = edr_http_build_request_headers(spec, 1700000000000LL, headers, sizeof(headers));
+    ok &= expect(header_size > 0,
+                 "native rule file GET must build signed headers");
+    first = strstr(headers, "\r\nX-EDR-P0-IR-Schema: ");
+    ok &= expect(first && !strstr(first + 2, "\r\nX-EDR-P0-IR-Schema: ") &&
+                 copy_header(headers, "X-EDR-P0-IR-Schema", schema, sizeof(schema)) == 0 &&
+                 strcmp(schema, expected_schema) == 0,
+                 "native P0/SI file GET must advertise exactly one compiled IR schema");
+    ok &= expect(copy_header(headers, "X-EDR-Suppression-Contract", contract, sizeof(contract)) == 0 &&
+                 strcmp(contract, EDR_DETECTION_SUPPRESSION_CONTRACT) == 0 &&
+                 copy_header(headers, "X-EDR-Nonce", nonce, sizeof(nonce)) == 0 && strlen(nonce) == 32u &&
+                 copy_header(headers, "X-EDR-Timestamp-Ms", timestamp, sizeof(timestamp)) == 0 &&
+                 strcmp(timestamp, "1700000000000") == 0 &&
+                 copy_header(headers, "X-EDR-Signature", signature, sizeof(signature)) == 0 && strlen(signature) == 64u &&
+                 copy_header(headers, "X-EDR-Content-SHA256", body_hash, sizeof(body_hash)) == 0 &&
+                 strcmp(body_hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0,
+                 "rule schema metadata must preserve suppression and signed empty GET identity");
+    ok &= expect(edr_http_build_request_headers(spec, 1700000000000LL, headers, 16u) < 0,
+                 "rule file GET must fail when the request header buffer is too small");
+    if (header_size > 0 && (size_t)header_size < sizeof(headers)) {
+      ok &= expect(edr_http_build_request_headers(spec, 1700000000000LL, headers, (size_t)header_size) < 0 &&
+                   edr_http_build_request_headers(spec, 1700000000000LL, headers, (size_t)header_size + 1u) == header_size,
+                   "signed rule file GET must reject truncation at its exact final header boundary");
+    }
+  }
+  return ok;
+}
+
 int main(void) {
   static const char body[] = "{\"command_id\":\"cmd-stable-1\"}";
   EdrRequestSigningConfig signing;
@@ -146,6 +184,12 @@ int main(void) {
     spec.body = body;
     spec.body_len = sizeof(body) - 1u;
   }
+
+  ok &= p0_file_get_headers(&spec);
+  spec.method = "POST";
+  spec.path = "/api/v1/ingest/report-command-result";
+  spec.body = body;
+  spec.body_len = sizeof(body) - 1u;
 
   RetryFixture lost_response = fixture_with(NULL, "HTTP/1.1 200 OK");
   outcome = edr_http_execute_request_attempts(
