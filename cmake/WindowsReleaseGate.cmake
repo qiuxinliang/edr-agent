@@ -61,3 +61,5 @@ edr_windows_release_gate(windows_task_exit_behavior test_windows_task_exit_fixtu
 edr_windows_release_gate(windows_task_trace_environment "")
 
 edr_windows_release_gate(validation_trace_contract test_validation_trace)
+edr_windows_release_gate(egress_command_delivery_mtls test_egress_tls_client)
+edr_windows_release_gate(egress_receiver_resources "")

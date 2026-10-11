@@ -42,6 +42,7 @@ WINDOWS_EXPECTED = {
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
     "openssl_tls_handshake", "windows_task_exit_behavior", "windows_task_trace_environment",
     "validation_trace_contract",
+    "egress_command_delivery_mtls", "egress_receiver_resources",
     "windows_headless_log_stream_initialization",
 }
 RUNTIME_EXPECTED = {
@@ -330,6 +331,28 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 passed = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
                                           "-L", LABEL, "--parallel", "4", "--no-tests=error", "--output-on-failure")
                 self.assertIn("100% tests passed", passed.stdout)
+
+    def test_command_delivery_and_resource_failures_block_windows_gate(self):
+        names = ("egress_command_delivery_mtls", "egress_receiver_resources")
+        for name in names:
+            with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
+                source, build, pairs = self.fixture(directory, failing_test=name)
+                self.assertEqual(dict(pairs)["egress_command_delivery_mtls"], "test_egress_tls_client")
+                self.assertEqual(dict(pairs)["egress_receiver_resources"], '""')
+                self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+                listing = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                           "-R", "^(egress_command_delivery_mtls|egress_receiver_resources)$",
+                                           "--show-only=json-v1")
+                tests = json.loads(listing.stdout)["tests"]
+                self.assertEqual({test["name"] for test in tests}, set(names))
+                for test in tests:
+                    properties = {item["name"]: item["value"] for item in test["properties"]}
+                    self.assertIn("windows-release-gate", properties["LABELS"])
+                result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                          "-R", f"^{name}$", "--no-tests=error",
+                                          "--output-on-failure", success=False)
+                self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+                self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout + result.stderr)
 
     def test_missing_target_fails_at_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
