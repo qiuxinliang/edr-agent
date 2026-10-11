@@ -101,6 +101,10 @@ class SourceAdmission(unittest.TestCase):
     def test_success_is_exact_source(self):
         self.assertEqual(self.check(), self.owner)
 
+    def test_662_published_release_branch(self):
+        self.run['head_branch'] = 'codex/rtq-result-delivery-pressure'
+        self.assertEqual(self.check(), self.owner)
+
     def test_rejects_wrong_sha_status_fork_and_event(self):
         for key, value in [('head_sha', 'f' * 40), ('status', 'in_progress'), ('conclusion', 'failure'),
                            ('event', 'pull_request'), ('head_branch', 'arbitrary'),

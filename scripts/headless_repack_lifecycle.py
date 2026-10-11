@@ -22,7 +22,8 @@ from windows_usb_bundle import headless_manifest
 
 PUBLIC = 'qiuxinliang/edr-agent'
 PRIVATE = 'qiuxinliang/edr-agent-signing'
-BRANCHES = {'main', 'codex/release-workflow-convergence', 'codex/ic3-p0-deployment', 'codex/rtq-process-batches'}
+BRANCHES = {'main', 'codex/release-workflow-convergence', 'codex/ic3-p0-deployment', 'codex/rtq-process-batches',
+            'codex/rtq-result-delivery-pressure'}
 ARCHES = {'amd64': 0x8664, 'arm64': 0xAA64}
 NATIVE = {'FDSensor.exe', 'FDSecurityInstallerWorker.exe', 'uninstall.exe',
           'collector/forensic_collector_builtin.exe'}
