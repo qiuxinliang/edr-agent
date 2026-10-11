@@ -407,7 +407,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply({"code": "OK", "data": {"accepted": True, "invalid_frames": 0, "ack": ack}})
             elif self.path == "/api/v1/ingest/report-command-result":
                 result = body["result"]
-                if self.server.command_delivery_mode:
+                if self.server.command_delivery_mode is True:
                     command_id = result["command_id"]
                     if body["endpoint_id"] != "synthetic-endpoint" or \
                             result["endpoint_id"] != "synthetic-endpoint" or \
@@ -636,6 +636,24 @@ def reject_rule_schema_probes(root, server):
             connection.close()
 
 
+def command_delivery_failure_diagnostic(mode, result, metrics):
+    # Child assertions are static source expressions. Select only their fixed
+    # prefix and the delivery scenario's numeric/boolean metrics; never copy
+    # arbitrary child logs, request bodies or inherited endpoint configuration.
+    selected = {"mode": mode, "client_exit": result.returncode}
+    for metric in metrics:
+        if metric.get("mode") == mode:
+            for name in ("real_delivery_thread", "historical_replay", "elapsed_ms", "failed_checks"):
+                value = metric.get(name)
+                if isinstance(value, (bool, int)):
+                    selected[name] = value
+    print("mTLS command delivery failure: " + json.dumps(selected, sort_keys=True),
+          file=sys.stderr, flush=True)
+    for line in result.stderr.splitlines():
+        if line.startswith("synthetic TLS check failed: ") and len(line) <= 512:
+            print(line, file=sys.stderr, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True)
@@ -658,8 +676,6 @@ def main():
         if not args.baseline:
             modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command", "positive-update-download-x64", "positive-update-download-arm64",
                       "wrong-update-download-ca", "wrong-update-download-host")
-            modes += ("positive-command-delivery-pressure", "positive-command-delivery-recovered",
-                      "positive-command-delivery-invariants", "positive-command-delivery-batch")
         if args.command_only:
             modes = ("positive-command",)
         if args.command_delivery_only:
@@ -760,7 +776,11 @@ def main():
                     environment["EDR_TEST_UPDATE_PAYLOAD"] = payload
                     environment["EDR_TEST_UPDATE_ISSUED"] = issued
                     server.download_paths = {raw_path, runtime_path}
-                host = "127.0.0.1" if mode == "positive-ip" else "localhost"
+                # The receiver listens only on IPv4. Delivery deadlines measure
+                # the queue owner, without localhost's refused IPv6 connection
+                # path. The existing IP SAN still requires real TLS identity;
+                # the original scenarios retain DNS/hostname coverage.
+                host = "127.0.0.1" if mode == "positive-ip" or server.command_delivery_mode is True else "localhost"
                 result = subprocess.run([args.client, f"https://{host}:{server.server_port}/api/v1",
                                          str(root / ("other-ca.pem" if mode in ("wrong-ca", "wrong-update-download-ca") else "ca.pem")),
                                          str(root / "client.pem"), str(root / "client.key"),
@@ -777,6 +797,8 @@ def main():
                             "receiver_business_failures": len(server.errors),
                             "classes": {path: sum(item["path"] == path for item in server.observations)
                                         for path in sorted({item["path"] for item in server.observations})}})
+            if server.command_delivery_mode is True and result.returncode:
+                command_delivery_failure_diagnostic(mode, result, reports[-1]["client_metrics"])
             if mode.startswith("positive"):
                 with closing(sqlite3.connect(server.database)) as db, db:
                     reports[-1]["durable_batches"] = db.execute("SELECT COUNT(*) FROM receipt").fetchone()[0]
@@ -790,7 +812,7 @@ def main():
                 if mode == "positive-command":
                     if len(server.observations) != 2 or reports[-1]["durable_batches"] != 1 or reports[-1]["duplicate_observations"] != 1:
                         reports[-1]["receiver_business_failures"] += 1
-                if server.command_delivery_mode:
+                if server.command_delivery_mode is True:
                     expected = {"cmd_delivery_slow": 1, "cmd_delivery_fresh": 1}
                     if mode.endswith("invariants"):
                         expected = {"cmd_delivery_retry": 2, "cmd_delivery_fresh": 1}
@@ -816,7 +838,7 @@ def main():
                     ]
                     if reports[-1]["rule_file_downloads"] != expected:
                         reports[-1]["receiver_business_failures"] += 1
-            if result.returncode and not args.baseline:
+            if result.returncode and not args.baseline and server.command_delivery_mode is not True:
                 # Safe synthetic assertion names only; no body or credentials.
                 print(result.stderr[-4000:])
             print(f"mTLS scenario end: {mode} elapsed_ms={round((time.monotonic() - started) * 1000)} client_exit={result.returncode}",

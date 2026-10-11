@@ -303,6 +303,12 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         runner = (ROOT / 'tests/run_telemetry_windows_native.ps1').read_text(encoding='utf-8')
         self.assertIn("$ErrorActionPreference = 'Stop'", runner)
         self.assertIn('--target telemetry_minimization_tests', runner)
+        self.assertIn("'egress_command_delivery_mtls'", runner)
+        tests = (ROOT / 'tests/CMakeLists.txt').read_text(encoding='utf-8')
+        self.assertIn('add_test(NAME egress_command_delivery_mtls', tests)
+        self.assertIn('--client $<TARGET_FILE:test_egress_tls_client> --command-delivery-only)', tests)
+        self.assertIn('set_tests_properties(egress_command_delivery_mtls PROPERTIES TIMEOUT 150)', tests)
+        self.assertIn('edr_minimization_test(egress_command_delivery_mtls test_egress_tls_client)', tests)
         command = "-L '^telemetry-minimization$'"
         self.assertIn(command, runner)
         self.assertRegex(runner.split(command, 1)[1],

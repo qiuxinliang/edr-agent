@@ -139,6 +139,11 @@ class ReceiverResourcesTest(unittest.TestCase):
             errors = []
             config_receipts = []
             server_port = 1
+            command_delivery_mode = False
+
+            def __init__(self):
+                self.command_delivery_attempts = {}
+                self.command_delivery_hashes = {}
 
             def finish(self):
                 pass
@@ -200,10 +205,13 @@ class ReceiverResourcesTest(unittest.TestCase):
         ]
         download_modes = ["positive-update-download-x64", "positive-update-download-arm64",
                           "wrong-update-download-ca", "wrong-update-download-host"]
+        delivery_modes = ["positive-command-delivery-pressure", "positive-command-delivery-recovered",
+                          "positive-command-delivery-invariants", "positive-command-delivery-batch"]
         for flags, expected_modes in (
             ([], original_modes + download_modes + ["positive-crash-restart"]),
             (["--exclude-update-download"], original_modes + ["positive-crash-restart"]),
             (["--update-download-only"], download_modes),
+            (["--command-delivery-only"], delivery_modes),
         ):
             with self.subTest(flags=flags):
                 output = io.StringIO()
@@ -224,6 +232,39 @@ class ReceiverResourcesTest(unittest.TestCase):
                     else:
                         self.assertEqual(item["received_requests"], 0)
                 self.assertNotIn("private detail", output.getvalue())
+
+    def test_delivery_failure_diagnostics_are_immediate_and_keep_json_output(self):
+        mode = "positive-command-delivery-pressure"
+        metrics = {"mode": mode, "real_delivery_thread": True, "historical_replay": False,
+                   "elapsed_ms": 8891, "failed_checks": 1, "private_field": "private detail"}
+        failed_client = subprocess.CompletedProcess([], 1, stdout=json.dumps(metrics) + "\n",
+            stderr='synthetic TLS check failed: delivery_wait("cmd_delivery_fresh", 1, 4000u)\n'
+                   'private arbitrary log content\n')
+
+        class FlushedDiagnostics(io.StringIO):
+            flushed = []
+
+            def flush(stream):
+                stream.flushed.append(stream.getvalue())
+                super().flush()
+
+        output, diagnostics = io.StringIO(), FlushedDiagnostics()
+        with patch.object(receiver, "openssl_certificates"), \
+             patch.object(receiver, "Receiver", self.database_only_receiver), \
+             patch.object(receiver.subprocess, "run", return_value=failed_client), \
+             patch("sys.argv", ["receiver", "--client", "unused", "--command-delivery-only"]), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
+            self.assertEqual(receiver.main(), 1)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["scenarios"]), 4)
+        self.assertTrue(all(item["client_exit"] == 1 for item in report["scenarios"]))
+        self.assertTrue(all(item["command_delivery_attempts"] == {} for item in report["scenarios"]))
+        self.assertIn('"failed_checks": 1', diagnostics.getvalue())
+        self.assertIn('synthetic TLS check failed: delivery_wait("cmd_delivery_fresh", 1, 4000u)', diagnostics.getvalue())
+        self.assertNotIn("private", diagnostics.getvalue())
+        failure_flush = next(text for text in diagnostics.flushed if "synthetic TLS check failed:" in text)
+        self.assertNotIn(f"mTLS scenario end: {mode}", failure_flush)
 
     def test_main_closes_sqlite_before_removing_temporary_databases(self):
         original_connect = sqlite3.connect

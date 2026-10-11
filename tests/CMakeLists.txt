@@ -1948,6 +1948,12 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
     ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
     --client $<TARGET_FILE:test_egress_tls_client> --exclude-update-download)
   set_tests_properties(egress_loopback_mtls PROPERTIES TIMEOUT 150)
+  # The delivery timing contracts need their own finite budget; the original
+  # DNS/TLS and signed-admission scenarios retain the original deadline.
+  add_test(NAME egress_command_delivery_mtls COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
+    --client $<TARGET_FILE:test_egress_tls_client> --command-delivery-only)
+  set_tests_properties(egress_command_delivery_mtls PROPERTIES TIMEOUT 150)
   # Keep the original contracts' finite budget while admitting the new signed
   # download contracts through the same native client and real mTLS receiver.
   add_test(NAME egress_update_download_mtls COMMAND ${Python3_EXECUTABLE}
@@ -2027,6 +2033,7 @@ edr_minimization_test(telemetry_admission test_telemetry_admission)
 edr_minimization_test(deep_collector_manifest test_deep_collector_manifest)
 edr_minimization_test(p0_source_only_durable_contract test_p0_source_only_durable_contract)
 edr_minimization_test(egress_loopback_mtls test_egress_tls_client)
+edr_minimization_test(egress_command_delivery_mtls test_egress_tls_client)
 edr_minimization_test(egress_update_download_mtls test_egress_tls_client)
 edr_minimization_test(pmfe_lifecycle_policy_switch test_pmfe_lifecycle)
 edr_minimization_test(report_events_ack_contract test_report_events_ack)
