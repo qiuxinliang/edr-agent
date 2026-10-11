@@ -179,6 +179,12 @@ static uint32_t s_upload_outbox_fail_streak;
 static int64_t s_result_outbox_next_flush_ms;
 static int64_t s_compact_next_allowed_ms;
 
+static void command_result_outbox_allow_flush(void) {
+  delivery_health_lock();
+  s_result_outbox_next_flush_ms = 0;
+  delivery_health_unlock();
+}
+
 static uint32_t command_u32_env_clamped(const char *name, uint32_t defv, uint32_t minv, uint32_t maxv) {
   const char *e = getenv(name);
   uint32_t v = defv;
@@ -5755,22 +5761,27 @@ static void command_delivery_run_once(void) {
   delivery_health_unlock();
   edr_command_executor_wake();
   uint32_t result_ms = 0u;
-  if (s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms) {
+  /* Resource pressure can clear while a result interval is pending. A prior
+   * pressure sample must not defer new completed commands after recovery. */
+  delivery_health_lock();
+  if (!pressure) s_result_outbox_next_flush_ms = 0;
+  int result_due = s_result_outbox_next_flush_ms <= 0 || now >= s_result_outbox_next_flush_ms;
+  delivery_health_unlock();
+  if (result_due) {
     step_start = command_monotonic_ms();
     flush_command_result_outbox();
     result_ms = command_elapsed_ms_u32(step_start);
+    int64_t next_flush_ms = 0;
     if (pressure) {
       uint32_t next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_PRESSURE_INTERVAL_MS",
                                                  5000u, 1000u, 60000u);
-      if (result_ms >=
-          command_u32_env_clamped("EDR_COMMAND_DELIVERY_SLOW_MS", 750u, 100u, 60000u)) {
-        next_ms = command_u32_env_clamped("EDR_COMMAND_RESULT_SLOW_BACKOFF_MS",
-                                          300000u, next_ms, 1800000u);
-      }
-      s_result_outbox_next_flush_ms = now + (int64_t)next_ms;
-    } else {
-      s_result_outbox_next_flush_ms = 0;
+      /* Delivery failures already persist per-record backoff. A slow successful
+       * batch must not impose that backoff on subsequently completed results. */
+      next_flush_ms = now + (int64_t)next_ms;
     }
+    delivery_health_lock();
+    s_result_outbox_next_flush_ms = next_flush_ms;
+    delivery_health_unlock();
   }
   delivery_health_lock();
   s_delivery_health.last_result_ms = result_ms;
@@ -6004,7 +6015,7 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   int existing_final=edr_command_state_has_final(id,sm);
   if(existing_final) {
     audit_both(id,existing_final>0 ? "duplicate command suppressed before admission; original durable result retained" : "command duplicate check unavailable; receipt deferred");
-    if(existing_final>0)s_result_outbox_next_flush_ms=0;
+    if(existing_final>0)command_result_outbox_allow_flush();
     return existing_final>0 ? 0 : -1;
   }
 
@@ -6080,7 +6091,7 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
     /* Duplicate delivery neither changes result identity nor grants authority.
      * Existing retry/backoff/ACK/hold state remains authoritative. */
     audit_both(id, "duplicate command suppressed; original durable result retained");
-    s_result_outbox_next_flush_ms = 0;
+    command_result_outbox_allow_flush();
     return 0;
   }
   if (dup_rc == EDR_COMMAND_STATE_BEGIN_DUP_RUNNING) {
@@ -6364,7 +6375,7 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
     case EDR_COMMAND_KIND_RESULT_DELIVERY_RENEWAL: {
       int rc=edr_command_state_renew_delivery(id,payload,payload_len,sm);
       if(rc==0) {
-        s_result_outbox_next_flush_ms=0;
+        command_result_outbox_allow_flush();
         audit_both(id,"signed result delivery renewal durably applied; original execution retained");
         soar_emit_ex(id,sm,EdrCmdExecOk,0,"delivery_authorization_renewed","ok",NULL);
       } else {

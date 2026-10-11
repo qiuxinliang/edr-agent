@@ -274,6 +274,9 @@ class Receiver(http.server.ThreadingHTTPServer):
         self.download_requests = 0
         self.rule_downloads_enabled = False
         self.rule_download_receipts = []
+        self.command_delivery_mode = False
+        self.command_delivery_attempts = {}
+        self.command_delivery_hashes = {}
         self.lock = threading.Lock()
         with closing(sqlite3.connect(database)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -404,6 +407,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply({"code": "OK", "data": {"accepted": True, "invalid_frames": 0, "ack": ack}})
             elif self.path == "/api/v1/ingest/report-command-result":
                 result = body["result"]
+                if self.server.command_delivery_mode:
+                    command_id = result["command_id"]
+                    if body["endpoint_id"] != "synthetic-endpoint" or \
+                            result["endpoint_id"] != "synthetic-endpoint" or \
+                            not command_id.startswith("cmd_delivery_") or \
+                            result["command_type"] != "rtq_execute" or result["status"] != 1 or \
+                            command_id in ("cmd_delivery_held", "cmd_delivery_acked"):
+                        raise ValueError("unowned or suppressed delivery fixture reached receiver")
+                    stable = dict(result)
+                    stable.pop("finished_unix_ms")
+                    digest = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
+                    with self.server.lock:
+                        previous_hash = self.server.command_delivery_hashes.get(command_id)
+                        if previous_hash and previous_hash != digest:
+                            raise ValueError("delivery retry changed terminal body")
+                        self.server.command_delivery_hashes[command_id] = digest
+                        attempt = self.server.command_delivery_attempts.get(command_id, 0) + 1
+                        self.server.command_delivery_attempts[command_id] = attempt
+                    # A slow successful ACK must not defer subsequently completed
+                    # commands. A genuine 503 retains its own durable retry clock.
+                    if command_id in ("cmd_delivery_slow", "cmd_delivery_retry") and attempt == 1:
+                        time.sleep(0.2)
+                    if command_id == "cmd_delivery_retry" and attempt == 1:
+                        self.reply({"code": "SYNTHETIC_RETRYABLE_FAILURE"}, 503)
+                        return
+                    with closing(sqlite3.connect(self.server.database)) as db, db:
+                        db.execute("PRAGMA synchronous=FULL")
+                        previous = db.execute("SELECT sha,observations FROM receipt WHERE batch_id=?", (command_id,)).fetchone()
+                        if previous and previous[0] != digest:
+                            raise ValueError("delivery retry changed terminal body")
+                        count = previous[1] + 1 if previous else 1
+                        db.execute("INSERT INTO receipt VALUES(?,?,?) ON CONFLICT(batch_id) DO UPDATE SET observations=excluded.observations",
+                                   (command_id, digest, count))
+                    self.reply({"code": "OK", "data": {"accepted": True, "complete": True}})
+                    return
                 if body["endpoint_id"] != "synthetic-endpoint" or result["command_id"] != "cmd_synthetic_noop" or result["command_type"] != "noop" or result["status"] != 1:
                     raise ValueError("unowned command result reached receiver")
                 stable = dict(result)
@@ -603,6 +641,7 @@ def main():
     parser.add_argument("--client", required=True)
     parser.add_argument("--baseline", action="store_true", help="run historical implementation; regression is expected to fail")
     parser.add_argument("--command-only", action="store_true", help="focus real signed result/renewal delivery without detector fixtures")
+    parser.add_argument("--command-delivery-only", action="store_true", help="focus the real result-delivery thread, pressure recovery and per-record retry")
     parser.add_argument("--update-download-only", action="store_true", help="focus signed updater downloads through real mTLS transport")
     parser.add_argument("--exclude-update-download", action="store_true", help="run the original mTLS contracts separately from the updater download contracts")
     args = parser.parse_args()
@@ -619,8 +658,13 @@ def main():
         if not args.baseline:
             modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command", "positive-update-download-x64", "positive-update-download-arm64",
                       "wrong-update-download-ca", "wrong-update-download-host")
+            modes += ("positive-command-delivery-pressure", "positive-command-delivery-recovered",
+                      "positive-command-delivery-invariants", "positive-command-delivery-batch")
         if args.command_only:
             modes = ("positive-command",)
+        if args.command_delivery_only:
+            modes = ("positive-command-delivery-pressure", "positive-command-delivery-recovered",
+                     "positive-command-delivery-invariants", "positive-command-delivery-batch")
         if args.update_download_only:
             modes = ("positive-update-download-x64", "positive-update-download-arm64",
                      "wrong-update-download-ca", "wrong-update-download-host")
@@ -632,6 +676,7 @@ def main():
             server = Receiver(root, "wrong-host" if mode in ("wrong-host", "wrong-update-download-host") else "server", root / f"receiver-{mode}.db")
             try:
                 server.rule_downloads_enabled = mode == "positive" and not args.baseline
+                server.command_delivery_mode = mode.startswith("positive-command-delivery-")
                 environment = os.environ.copy()
                 environment.pop("EDR_ZSTD_DICT_PATH", None)
                 environment.pop("EDR_CONTROL_DICT_PATH", None)
@@ -745,6 +790,15 @@ def main():
                 if mode == "positive-command":
                     if len(server.observations) != 2 or reports[-1]["durable_batches"] != 1 or reports[-1]["duplicate_observations"] != 1:
                         reports[-1]["receiver_business_failures"] += 1
+                if server.command_delivery_mode:
+                    expected = {"cmd_delivery_slow": 1, "cmd_delivery_fresh": 1}
+                    if mode.endswith("invariants"):
+                        expected = {"cmd_delivery_retry": 2, "cmd_delivery_fresh": 1}
+                    elif mode.endswith("batch"):
+                        expected = {f"cmd_delivery_batch_{index:02d}": 1 for index in range(18)}
+                    reports[-1]["command_delivery_attempts"] = server.command_delivery_attempts
+                    if server.command_delivery_attempts != expected:
+                        reports[-1]["receiver_business_failures"] += 1
                 if mode in ("positive", "positive-ip", "positive-v2"):
                     reports[-1]["config_receipts"] = server.config_receipts
                     expected = [{"status": "applied", "verified": True, "reason": "", "contract": "2"},
@@ -767,7 +821,7 @@ def main():
                 print(result.stderr[-4000:])
             print(f"mTLS scenario end: {mode} elapsed_ms={round((time.monotonic() - started) * 1000)} client_exit={result.returncode}",
                   file=sys.stderr, flush=True)
-        if not args.baseline and not args.command_only and not args.update_download_only:
+        if not args.baseline and not args.command_only and not args.command_delivery_only and not args.update_download_only:
             started = time.monotonic()
             print("mTLS scenario begin: positive-crash-restart", file=sys.stderr, flush=True)
             try:

@@ -485,6 +485,168 @@ static int command_result_scenario(const char *path) {
   printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
   return failed ? 1 : 0;
 }
+
+/* Only the result-delivery boundary is synthetic: completed RTQ records are
+ * persisted by the real owner and sent by its actual background thread. The
+ * receiver requires real mTLS and complete application ACKs. No collector or
+ * service loop is started, and these are not historical endpoint replays. */
+static void delivery_env(const char *name, const char *value) {
+#ifdef _WIN32
+  CHECK(_putenv_s(name, value) == 0);
+#else
+  CHECK(setenv(name, value, 1) == 0);
+#endif
+}
+static uint64_t delivery_clock_ms(void) {
+#ifdef _WIN32
+  return GetTickCount64();
+#else
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+#endif
+}
+static void delivery_pause(void) {
+#ifdef _WIN32
+  Sleep(20u);
+#else
+  struct timespec interval = {0, 20000000L};
+  nanosleep(&interval, NULL);
+#endif
+}
+static int delivery_record(const char *id, EdrCommandStateRecord *record) {
+  return edr_command_state_begin(id, "rtq_execute", NULL, NULL, record) ==
+      EDR_COMMAND_STATE_BEGIN_DUP_FINAL;
+}
+static int delivery_wait(const char *id, int reported, uint32_t timeout_ms) {
+  EdrCommandStateRecord *record = calloc(1u, sizeof(*record));
+  CHECK(record);
+  if (!record) return 0;
+  uint64_t deadline = delivery_clock_ms() + timeout_ms;
+  int ready = 0;
+  do {
+    if (delivery_record(id, record)) {
+      ready = reported ? !record->report_pending : record->report_attempts > 0u;
+      if (ready) break;
+    }
+    delivery_pause();
+  } while (delivery_clock_ms() < deadline);
+  free(record);
+  return ready;
+}
+static void delivery_finish(const char *id) {
+  const char *query = "{\"process_pid_min\":1000}";
+  const char *detail = "{\"results\":[{\"type\":\"process\",\"pid\":1000,\"name\":\"synthetic.exe\"}],"
+      "\"total\":1,\"truncated\":false,\"errors\":[],\"error\":null}";
+  EdrSoarCommandMeta meta = {0};
+  meta.issued_at_unix_ms = (int64_t)time(NULL) * 1000;
+  meta.deadline_ms = 30000u;
+  EdrCommandResultAuthorization *authority = &meta.result_authorization;
+  snprintf(authority->command_id, sizeof(authority->command_id), "%s", id);
+  snprintf(authority->command_type, sizeof(authority->command_type), "%s", "rtq_execute");
+  snprintf(authority->tenant_id, sizeof(authority->tenant_id), "%s", "synthetic-tenant");
+  snprintf(authority->endpoint_id, sizeof(authority->endpoint_id), "%s", "synthetic-endpoint");
+  authority->expires_unix_ms = meta.issued_at_unix_ms + 120000;
+  CHECK(edr_command_result_bind_contract(authority, (const uint8_t *)query,
+      strlen(query), meta.issued_at_unix_ms) == 0);
+  CHECK(edr_command_state_finish(id, "rtq_execute", &meta, "ok", 1, 0, detail, "", 1) == 0);
+}
+static int delivery_wait_poll_complete(uint32_t timeout_ms) {
+  uint64_t deadline = delivery_clock_ms() + timeout_ms;
+  EdrCommandDeliveryHealth health = {0};
+  do {
+    edr_command_get_delivery_health(&health);
+    if (health.last_result_ms > 0u) return 1;
+    delivery_pause();
+  } while (delivery_clock_ms() < deadline);
+  return 0;
+}
+static int command_delivery_scenario(const char *path, const char *mode) {
+  delivery_env("EDR_COMMAND_STATE_DIR", path);
+  delivery_env("EDR_COMMAND_DELIVERY_POLL_MS", "1000");
+  delivery_env("EDR_COMMAND_RESULT_PRESSURE_INTERVAL_MS",
+      !strcmp(mode, "positive-command-delivery-recovered") ||
+      !strcmp(mode, "positive-command-delivery-batch") ? "60000" : "1000");
+  delivery_env("EDR_COMMAND_DELIVERY_SLOW_MS", "100");
+  delivery_env("EDR_PREPROCESS_THROTTLE", "1");
+  delivery_env("EDR_COMMAND_RESULT_RETRY_BASE_MS", "8000");
+  delivery_env("EDR_COMMAND_RESULT_RETRY_MAX_MS", "8000");
+  EdrConfig cfg = {0};
+  snprintf(cfg.agent.tenant_id, sizeof(cfg.agent.tenant_id), "%s", "synthetic-tenant");
+  snprintf(cfg.agent.endpoint_id, sizeof(cfg.agent.endpoint_id), "%s", "synthetic-endpoint");
+  edr_command_bind_config(&cfg);
+  uint64_t started = delivery_clock_ms();
+  if (!strcmp(mode, "positive-command-delivery-batch")) {
+    for (unsigned i = 0u; i < 18u; ++i) {
+      char id[128];
+      snprintf(id, sizeof(id), "cmd_delivery_batch_%02u", i);
+      delivery_finish(id);
+    }
+    edr_command_poll_reliable_delivery();
+    CHECK(delivery_wait_poll_complete(4000u));
+    EdrCommandStateRecord *record = calloc(1u, sizeof(*record));
+    CHECK(record);
+    unsigned reported = 0u;
+    if (record) {
+      for (unsigned i = 0u; i < 18u; ++i) {
+        char id[128];
+        snprintf(id, sizeof(id), "cmd_delivery_batch_%02u", i);
+        CHECK(delivery_record(id, record));
+        reported += !record->report_pending;
+      }
+      free(record);
+    }
+    CHECK(reported == 16u);
+    delivery_env("EDR_PREPROCESS_THROTTLE", "0");
+    CHECK(delivery_wait("cmd_delivery_batch_17", 1, 4000u));
+  } else if (!strcmp(mode, "positive-command-delivery-invariants")) {
+    delivery_finish("cmd_delivery_held");
+    delivery_finish("cmd_delivery_acked");
+    EdrCommandStateRecord *record = calloc(1u, sizeof(*record));
+    CHECK(record);
+    if (record) {
+      CHECK(delivery_record("cmd_delivery_held", record));
+      CHECK(edr_command_state_mark_report_held(record, "synthetic_policy_hold") == 0);
+      CHECK(delivery_record("cmd_delivery_acked", record));
+      CHECK(edr_command_state_mark_reported(record) == 0);
+    }
+    delivery_finish("cmd_delivery_retry");
+    edr_command_poll_reliable_delivery();
+    CHECK(delivery_wait("cmd_delivery_retry", 0, 4000u));
+    delivery_finish("cmd_delivery_fresh");
+    CHECK(delivery_wait("cmd_delivery_fresh", 1, 4000u));
+    if (record) {
+      CHECK(delivery_record("cmd_delivery_retry", record));
+      CHECK(record->report_pending && record->report_attempts == 1u &&
+          record->report_next_retry_unix_ms > (int64_t)time(NULL) * 1000);
+      CHECK(delivery_record("cmd_delivery_held", record));
+      CHECK(record->report_policy_held && record->report_attempts == 0u);
+      CHECK(delivery_record("cmd_delivery_acked", record));
+      CHECK(!record->report_pending && record->report_attempts == 0u);
+      free(record);
+    }
+    CHECK(delivery_wait("cmd_delivery_retry", 1, 10000u));
+  } else {
+    delivery_finish("cmd_delivery_slow");
+    edr_command_poll_reliable_delivery();
+    CHECK(delivery_wait("cmd_delivery_slow", 1, 4000u));
+    CHECK(delivery_wait_poll_complete(4000u));
+    EdrCommandDeliveryHealth health = {0};
+    edr_command_get_delivery_health(&health);
+    CHECK(health.last_result_ms >= 100u);
+    if (!strcmp(mode, "positive-command-delivery-recovered"))
+      delivery_env("EDR_PREPROCESS_THROTTLE", "0");
+    delivery_finish("cmd_delivery_fresh");
+    CHECK(delivery_wait("cmd_delivery_fresh", 1, 4000u));
+  }
+  CHECK(edr_command_delivery_shutdown_timeout(5000u) == 1);
+  CHECK(edr_command_executor_shutdown_timeout(5000u) == 1);
+  edr_command_bind_config(NULL);
+  printf("{\"mode\":\"%s\",\"real_delivery_thread\":true,\"historical_replay\":false,"
+      "\"elapsed_ms\":%llu,\"failed_checks\":%u}\n", mode,
+      (unsigned long long)(delivery_clock_ms() - started), failed);
+  return failed ? 1 : 0;
+}
 static unsigned download_scope_calls, download_expire_at;
 static int download_clock_boundary(const char *id,EdrEgressTaskScope *scope) {
   int rc=edr_command_state_task_scope(id,scope);
@@ -608,6 +770,8 @@ int main(int argc, char **argv) {
 #ifdef EDR_TEST_EXTENDED_EGRESS
   if (strstr(argv[6], "update-download")) return update_download_scenario(argv[5],!strncmp(argv[6],"wrong-",6));
   if (!strcmp(argv[6], "positive-command")) return command_result_scenario(argv[5]);
+  if (!strncmp(argv[6], "positive-command-delivery-", 26u))
+    return command_delivery_scenario(argv[5], argv[6]);
   if (!strcmp(argv[6], "positive-pmfe")) return pmfe_receipt_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-journal")) return journal_receipt_scenario(argv[5]);
   if (!strcmp(argv[6], "positive-p0-journal")) return p0_journal_receipt_scenario(argv[5]);
