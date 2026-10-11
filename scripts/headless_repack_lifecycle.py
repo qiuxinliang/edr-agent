@@ -22,7 +22,7 @@ from windows_usb_bundle import headless_manifest
 
 PUBLIC = 'qiuxinliang/edr-agent'
 PRIVATE = 'qiuxinliang/edr-agent-signing'
-BRANCHES = {'main', 'codex/release-workflow-convergence', 'codex/ic3-p0-deployment'}
+BRANCHES = {'main', 'codex/release-workflow-convergence', 'codex/ic3-p0-deployment', 'codex/rtq-process-batches'}
 ARCHES = {'amd64': 0x8664, 'arm64': 0xAA64}
 NATIVE = {'FDSensor.exe', 'FDSecurityInstallerWorker.exe', 'uninstall.exe',
           'collector/forensic_collector_builtin.exe'}
@@ -147,7 +147,7 @@ def public_source(tag, commit=None, run_id=None):
     return dict(release_id=release['id'], owner=owner, attempt=str(run['run_attempt']), assets=assets)
 
 
-def validate_transfer(release, run, args, source):
+def validate_transfer(release, run, args, source, signing_jobs=None):
     if not (release.get('body') or '').startswith(PREFIX):
         raise ValueError('Unknown private transfer ownership format')
     owner = json.loads(release['body'][len(PREFIX):], object_pairs_hook=unique)
@@ -166,12 +166,23 @@ def validate_transfer(release, run, args, source):
             or run.get('repository', {}).get('full_name') != PRIVATE
             or run.get('head_repository', {}).get('full_name') != PRIVATE
             or str(run.get('id')) != str(args.private_run)
-            or str(run.get('run_attempt')) != str(args.private_attempt)
+            or not re.fullmatch(r'[1-9][0-9]*', str(run.get('run_attempt', '')))
+            or int(run['run_attempt']) < int(args.private_attempt)
             or run.get('head_sha') != args.private_commit or run.get('event') != 'workflow_dispatch'
             or run.get('head_branch') != 'main'
             or run.get('path') != '.github/workflows/published-headless-repack.yml'
             or run.get('status') != 'completed' or run.get('conclusion') != 'success'):
         raise ValueError('Private repack source/executor/scope/success mismatch')
+    if 'baseline_tag' in owner:
+        if owner['baseline_tag'] != args.baseline_tag:
+            raise ValueError('Acceptance baseline differs from pinned signing selection')
+        matches = [j for j in (signing_jobs or []) if j.get('name') == 'Sign and repackage Headless']
+        if (len(matches) != 1 or matches[0].get('status') != 'completed'
+                or matches[0].get('conclusion') != 'success'
+                or str(matches[0].get('run_attempt')) != str(args.private_attempt)):
+            raise ValueError('Reused signing attempt lacks its successful exact signing job')
+    elif str(run['run_attempt']) != str(args.private_attempt):
+        raise ValueError('Legacy repack requires its exact successful attempt')
     return owner
 
 
@@ -469,7 +480,16 @@ def stage(args):
         raise ValueError('Baseline must be genuinely older than target')
     release = api(PRIVATE, f'releases/{args.private_release_id}', True)
     private_run = api(PRIVATE, f'actions/runs/{args.private_run}')
-    owner = validate_transfer(release, private_run, args, source)
+    # Automatic dispatch can start this consumer just before the private
+    # transfer job exits. Wait only for that exact run; never accept in-progress.
+    for _ in range(12):
+        if private_run.get('status') == 'completed': break
+        if private_run.get('head_sha') != args.private_commit:
+            raise ValueError('Private executor changed while waiting for completion')
+        time.sleep(5)
+        private_run = api(PRIVATE, f'actions/runs/{args.private_run}')
+    signing_jobs = jobs(PRIVATE, args.private_run, args.private_attempt)
+    owner = validate_transfer(release, private_run, args, source, signing_jobs)
     assets = checked_assets(api(PRIVATE, f'releases/{args.private_release_id}/assets?per_page=100', True))
     root.mkdir(parents=True)
     fetch(PRIVATE, assets['result.json'], root / 'result.json')
@@ -494,7 +514,7 @@ def stage(args):
     if public_source(args.source_tag, args.source_commit, args.source_run) != source or public_source(args.baseline_tag) != baseline:
         raise ValueError('Published source changed during admission')
     latest_assets = checked_assets(api(PRIVATE, f'releases/{args.private_release_id}/assets?per_page=100', True))
-    if asset_identity(latest_assets) != asset_identity(assets) or validate_transfer(api(PRIVATE, f'releases/{args.private_release_id}', True), api(PRIVATE, f'actions/runs/{args.private_run}'), args, source) != owner:
+    if asset_identity(latest_assets) != asset_identity(assets) or validate_transfer(api(PRIVATE, f'releases/{args.private_release_id}', True), api(PRIVATE, f'actions/runs/{args.private_run}'), args, source, jobs(PRIVATE, args.private_run, args.private_attempt)) != owner:
         raise ValueError('Private transfer changed during admission')
     evidence = dict(schema='edr.headless-lifecycle-input.v1', source=source, baseline=baseline,
                     transfer=owner, private_release_id=args.private_release_id,

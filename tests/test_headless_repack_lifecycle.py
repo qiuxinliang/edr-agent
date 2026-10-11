@@ -144,6 +144,19 @@ class TransferAdmission(unittest.TestCase):
         self.assertEqual(m.validate_transfer(self.release, self.run, self.args, self.source), self.owner)
         m.validate_result(self.receipt, self.owner, self.assets, '3.2.659', 'A' * 40)
 
+    def test_continuous_delivery_requires_exact_signing_job_and_pinned_baseline(self):
+        self.args.baseline_tag='win_3.2.658'
+        self.owner['baseline_tag']=self.args.baseline_tag
+        self.release['body']=m.PREFIX+json.dumps(self.owner)
+        self.run['run_attempt']=2
+        job=dict(name='Sign and repackage Headless',status='completed',conclusion='success',run_attempt=1)
+        self.assertEqual(m.validate_transfer(self.release,self.run,self.args,self.source,[job]),self.owner)
+        for jobs in ([],[job,job],[dict(job,run_attempt=2)],[dict(job,conclusion='failure')],[dict(job,status='in_progress')]):
+            with self.subTest(jobs=jobs),self.assertRaises(ValueError):
+                m.validate_transfer(self.release,self.run,self.args,self.source,jobs)
+        self.args.baseline_tag='win_3.2.657'
+        with self.assertRaises(ValueError): m.validate_transfer(self.release,self.run,self.args,self.source,[job])
+
     def test_refuses_stale_partial_or_foreign_private_run(self):
         for key, value in [('run_attempt', 2), ('conclusion', 'failure'), ('status', 'in_progress'),
                            ('path', '.github/workflows/sign.yml'), ('head_sha', 'f' * 40)]:

@@ -1,4 +1,5 @@
 name: No-build Headless repack lifecycle
+run-name: Headless acceptance / ${{ inputs.private_repack_run }} / ${{ inputs.private_repack_attempt }}
 
 on:
   workflow_dispatch:
@@ -6,17 +7,19 @@ on:
       source_tag:
         description: Immutable published unsigned source tag
         required: true
-        default: win_3.2.659
         type: string
       source_commit:
         description: Exact original Agent source SHA (not the workflow executor)
         required: true
-        default: ef35eea018400def9985cf6daf286654fcca8a85
         type: string
       source_run:
         description: Original successful dual-native build run
         required: true
-        default: '38097447538'
+        type: string
+      baseline_tag:
+        description: Pinned older successful unsigned baseline
+        required: true
+        default: win_3.2.658
         type: string
       private_repack_release_id:
         description: Complete private Headless repack Release ID
@@ -81,7 +84,7 @@ jobs:
       PUBLISHER_THUMBPRINT: ${{ inputs.publisher_thumbprint }}
       PUBLISHER_SUBJECT: ${{ inputs.publisher_subject }}
       NATIVE_ARCH: ${{ matrix.arch }}
-      BASELINE_TAG: win_3.2.658
+      BASELINE_TAG: ${{ inputs.baseline_tag }}
     steps:
       - name: Checkout reviewed lifecycle consumer (executor)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
