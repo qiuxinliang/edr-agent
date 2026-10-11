@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define EDR_RTQ_PROCESS_BATCH_SCHEMA "edr.rtq.process-batch.v1"
+
 #define EDR_RTQ_EVENTLOG_BATCH_SCHEMA "edr.rtq.eventlog-batch.v1"
 
 /* The validator, live collector and signed result projection share the same

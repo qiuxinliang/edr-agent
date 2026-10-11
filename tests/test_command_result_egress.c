@@ -284,6 +284,66 @@ static void rtq_eventlog_batch_purpose_tests(void) {
   puts("PASS: compact eventlog scope is signed-request-bound, compatible, idempotent and durable; wrong scopes/types and unrequested batches are held; diagnostics and mixed file metadata survive");
 }
 
+static void rtq_process_batch_purpose_tests(void) {
+  const char *request="{\"process_pid_min\":1000,\"process_pid_max\":3000,\"process_name\":\"foo\"}";
+  const char *detail="{\"results\":[{\"type\":\"process\",\"pid\":1004,\"name\":\"foo.exe\"},{\"type\":\"process\",\"pid\":1012,\"name\":\"foo.exe\"}],\"total\":2,\"truncated\":true,\"partial\":true,\"meta\":{\"process\":{\"schema\":\"edr.rtq.process-batch.v1\",\"order\":\"pid_asc\",\"scan_complete\":true,\"pid_min\":1000,\"pid_max\":3000,\"snapshot_pid_max\":2996,\"returned_count\":2,\"last_pid\":1012,\"has_more\":true,\"next_pid_min\":1013,\"unrelated\":\"UNRELATED-TEXT\"}},\"errors\":[{\"source\":\"process\",\"code\":\"field_unavailable\",\"retryable\":false},{\"source\":\"command_result_transport\",\"code\":\"result_truncated\",\"retryable\":false}]}";
+  EdrSoarCommandMeta m=task("process-batch","rtq_execute");char projected[16384],canonical[16384];
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)request,strlen(request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,projected,sizeof(projected))==0);
+  CHECK(strstr(projected,"edr.rtq.process-batch.v1") && !strstr(projected,"UNRELATED-TEXT"));
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,projected,canonical,sizeof(canonical))==0 && !strcmp(projected,canonical));
+  CHECK(edr_command_state_finish("process-batch","rtq_execute",&m,"ok",1,0,detail,"",1)==0);
+  char *body=persisted_body("process-batch","rtq_execute");CHECK(allowed("tenant","ep",body));free(body);
+  for(int variant=0;variant<23;variant++) {
+    cJSON *root=cJSON_Parse(detail);CHECK(root);
+    cJSON *batch=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"meta"),"process");
+    cJSON *rows=cJSON_GetObjectItemCaseSensitive(root,"results");
+    const char *numeric[]={"pid_min","pid_max","snapshot_pid_max","returned_count","last_pid","next_pid_min"};
+    switch(variant) {
+      case 0: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(batch,"schema"),"forged"));break;
+      case 1: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(batch,"order"),"unsorted"));break;
+      case 2: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"pid_min"),999);break;
+      case 3: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"pid_max"),2999);break;
+      case 4: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"snapshot_pid_max"),1000);break;
+      case 5: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"returned_count"),1);break;
+      case 6: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"last_pid"),1004);break;
+      case 7: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"next_pid_min"),1014);break;
+      case 8: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(batch,"scan_complete",cJSON_CreateFalse()));break;
+      case 9: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(batch,"has_more",cJSON_CreateFalse()));break;
+      case 10: CHECK(cJSON_ReplaceItemInObjectCaseSensitive(root,"truncated",cJSON_CreateFalse()));break;
+      case 11: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(root,"total"),1);break;
+      case 12: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(rows->child,"pid"),1012);break;
+      case 13: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(rows->child,"pid"),999);break;
+      case 14: CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(rows->child,"name"),"other.exe"));break;
+      case 15: cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"snapshot_pid_max"),3001);break;
+      case 16: {cJSON *error=cJSON_CreateObject();CHECK(error);cJSON_AddStringToObject(error,"source","process");cJSON_AddStringToObject(error,"code","scan_limit");cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(root,"errors"),error);break;}
+      default: cJSON_DeleteItemFromObjectCaseSensitive(batch,numeric[variant-17]);break;
+    }
+    char *invalid=cJSON_PrintUnformatted(root);CHECK(invalid);
+    int rc=edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,invalid,canonical,sizeof(canonical));
+    if(rc==0)fprintf(stderr,"FAIL: process batch negative variant %d admitted\n",variant);
+    CHECK(rc!=0);free(invalid);cJSON_Delete(root);
+  }
+  cJSON *root=cJSON_Parse(detail);CHECK(root);
+  cJSON *batch=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root,"meta"),"process");
+  CHECK(cJSON_ReplaceItemInObjectCaseSensitive(batch,"scan_complete",cJSON_CreateFalse()));
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(batch,"next_pid_min"),0);
+  cJSON *error=cJSON_CreateObject();CHECK(error);cJSON_AddStringToObject(error,"source","process");cJSON_AddStringToObject(error,"code","scan_limit");cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(root,"errors"),error);
+  char *incomplete=cJSON_PrintUnformatted(root);CHECK(incomplete);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,incomplete,canonical,sizeof(canonical))==0);
+  free(incomplete);cJSON_Delete(root);
+  const char *full="{\"results\":[{\"type\":\"process\",\"pid\":1004,\"name\":\"foo.exe\"}],\"total\":1,\"truncated\":false,\"meta\":{\"process\":{\"schema\":\"edr.rtq.process-batch.v1\",\"order\":\"pid_asc\",\"scan_complete\":true,\"pid_min\":1000,\"pid_max\":3000,\"snapshot_pid_max\":2996,\"returned_count\":1,\"last_pid\":1004,\"has_more\":false,\"next_pid_min\":0}}}";
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,full,canonical,sizeof(canonical))==0);
+  const char *mixed_request="{\"process_pid_min\":1000,\"process_pid_max\":3000,\"file_path\":\"/tmp/foo\"}";
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)mixed_request,strlen(mixed_request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,detail,canonical,sizeof(canonical))!=0);
+  const char *zero_progress="{\"results\":[],\"total\":0,\"truncated\":true,\"meta\":{\"process\":{\"schema\":\"edr.rtq.process-batch.v1\",\"order\":\"pid_asc\",\"scan_complete\":true,\"pid_min\":1,\"pid_max\":2147483647,\"snapshot_pid_max\":3000,\"returned_count\":0,\"last_pid\":0,\"has_more\":true,\"next_pid_min\":0}},\"errors\":[{\"source\":\"command_result_transport\",\"code\":\"result_truncated\"}]}";
+  const char *default_request="{\"process_name\":\"foo\"}";
+  CHECK(edr_command_result_bind_contract(&m.result_authorization,(const uint8_t*)default_request,strlen(default_request),(int64_t)time(NULL)*1000)==0);
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"rtq_execute",1,0,zero_progress,canonical,sizeof(canonical))==0);
+  puts("PASS: process batch signed scope, ordered PID rows, counts, cursor, scan failure and no-progress contracts survive projection/durable egress; forged cursors, scope, completeness and filtered rows are held");
+}
+
 static void rtq_file_metadata_purpose_tests(void) {
   const char *sha="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   char request[200],detail[1600],projected[16384],canonical[16384];
@@ -356,6 +416,7 @@ static void purpose_tests(void) {
   shell_open_purpose_tests();
   rtq_diagnostic_purpose_tests();
   rtq_eventlog_batch_purpose_tests();
+  rtq_process_batch_purpose_tests();
   rtq_file_metadata_purpose_tests();
   rtq_alias_and_sentinel_purpose_tests();
   EdrSoarCommandMeta q=task("purpose-query","rtq_execute");

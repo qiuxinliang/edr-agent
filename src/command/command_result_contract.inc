@@ -192,6 +192,56 @@ static int result_rtq_eventlog_batch(const cJSON *q,const cJSON *batch) {
       !strcmp(result_text(batch,"channel"),*channel?channel:"System") &&
       !strcmp(result_text(batch,"query"),*query?query:"*");
 }
+/* Process continuation is derived only from an ascending, fully enumerated
+ * bounded batch in the signed PID scope. Rows keep their normal filter checks. */
+static int result_rtq_process_batch(const cJSON *q,const cJSON *root,const cJSON *batch,const cJSON *rows) {
+  if(!cJSON_IsObject(batch) || !result_query_category(q,"process") ||
+      result_query_category(q,"network") || result_query_category(q,"file") ||
+      result_query_category(q,"registry") || result_query_category(q,"eventlog") ||
+      strcmp(result_text(batch,"schema"),EDR_RTQ_PROCESS_BATCH_SCHEMA) ||
+      strcmp(result_text(batch,"order"),"pid_asc"))return 0;
+  double minimum=1,maximum=INT_MAX,n;
+  if(cJSON_HasObjectItem(q,"process_pid_min")) {
+    if(!result_integer(q,"process_pid_min",0,INT_MAX,&n))return 0;
+    if(n>0)minimum=n;
+  }
+  if(cJSON_HasObjectItem(q,"process_pid_max")) {
+    if(!result_integer(q,"process_pid_max",0,INT_MAX,&n))return 0;
+    if(n>0)maximum=n;
+  }
+  double batch_min,batch_max,snapshot_max,count,last,next,total;
+  const cJSON *scan=cJSON_GetObjectItemCaseSensitive(batch,"scan_complete"),
+      *more=cJSON_GetObjectItemCaseSensitive(batch,"has_more"),
+      *truncated=cJSON_GetObjectItemCaseSensitive(root,"truncated");
+  if(minimum>maximum || !cJSON_IsBool(scan) || !cJSON_IsBool(more) || !cJSON_IsBool(truncated) ||
+      !result_integer(batch,"pid_min",1,INT_MAX,&batch_min) || batch_min!=minimum ||
+      !result_integer(batch,"pid_max",1,INT_MAX,&batch_max) || batch_max!=maximum ||
+      !result_integer(batch,"snapshot_pid_max",0,INT_MAX,&snapshot_max) ||
+      (snapshot_max && (snapshot_max<minimum || snapshot_max>maximum)) ||
+      !result_integer(batch,"returned_count",0,500,&count) || count!=cJSON_GetArraySize(rows) ||
+      !result_integer(root,"total",0,500,&total) || total!=count ||
+      !result_integer(batch,"last_pid",0,INT_MAX,&last) ||
+      !result_integer(batch,"next_pid_min",0,INT_MAX,&next) ||
+      cJSON_IsTrue(more)!=cJSON_IsTrue(truncated))return 0;
+  double previous=0;
+  for(const cJSON *row=rows->child;row;row=row->next) {
+    if(strcmp(result_text(row,"type"),"process") || !result_integer(row,"pid",minimum,maximum,&n) ||
+        n<=previous || n>snapshot_max)return 0;
+    previous=n;
+  }
+  if(last!=previous || (cJSON_IsTrue(more) && snapshot_max<=last))return 0;
+  double expected=cJSON_IsTrue(scan) && cJSON_IsTrue(more) && last>0 && last<snapshot_max?last+1:0;
+  if(next!=expected)return 0;
+  int scan_failure=0,capacity_failure=0;
+  const cJSON *errors=cJSON_GetObjectItemCaseSensitive(root,"errors");
+  for(const cJSON *error=errors?errors->child:NULL;error;error=error->next) {
+    if(!strcmp(result_text(error,"source"),"process") &&
+        result_member(result_text(error,"code"),"snapshot_failed|enumeration_failed|scan_limit|oom|collector_failed"))scan_failure=1;
+    if(!strcmp(result_text(error,"source"),"command_result_transport") &&
+        !strcmp(result_text(error,"code"),"result_truncated"))capacity_failure=1;
+  }
+  return cJSON_IsTrue(scan)!=scan_failure && cJSON_IsTrue(more)==capacity_failure;
+}
 static cJSON *result_live_row(const cJSON *q,const cJSON *row,const cJSON *eventlog_batch) {
   const char *type=result_text(row,"type");
   if(!cJSON_IsObject(row)||!result_query_category(q,type))return NULL;
@@ -292,6 +342,8 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
   const cJSON *meta=cJSON_GetObjectItemCaseSensitive(root,"meta");
   const cJSON *eventlog_batch=cached?NULL:cJSON_GetObjectItemCaseSensitive(meta,"eventlog");
   if(eventlog_batch && !result_rtq_eventlog_batch(q,eventlog_batch))return NULL;
+  const cJSON *process_batch=cached?NULL:cJSON_GetObjectItemCaseSensitive(meta,"process");
+  if(process_batch && (eventlog_batch || !result_rtq_process_batch(q,root,process_batch,rows)))return NULL;
   cJSON *out=cJSON_CreateObject(),*projected=cJSON_CreateArray();
   if(!out||!projected){cJSON_Delete(out);cJSON_Delete(projected);return NULL;}
   cJSON_AddItemToObject(out,cached?"rows":"results",projected);
@@ -323,6 +375,16 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
       }
       if(!cJSON_AddItemToObject(out,"meta",projected_meta)) {
         cJSON_Delete(projected_meta);cJSON_Delete(out);return NULL;
+      }
+    }
+    if(process_batch) {
+      cJSON *projected_meta=cJSON_AddObjectToObject(out,"meta"),*projected_process=cJSON_CreateObject();
+      if(!projected_meta || !projected_process || !result_copy_fields(projected_process,process_batch,
+          "schema|order","pid_min|pid_max|snapshot_pid_max|returned_count|last_pid|next_pid_min","scan_complete|has_more")) {
+        cJSON_Delete(projected_process);cJSON_Delete(out);return NULL;
+      }
+      if(!cJSON_AddItemToObject(projected_meta,"process",projected_process)) {
+        cJSON_Delete(projected_process);cJSON_Delete(out);return NULL;
       }
     }
     if(result_query_category(q,"file")) {

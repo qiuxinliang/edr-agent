@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <process.h>
 #include <winevt.h>
+#include <tlhelp32.h>
 #define test_pid _getpid
 #else
 #include <dirent.h>
@@ -46,6 +47,22 @@ static int event_render_calls, event_xml_calls;
 static BOOL WINAPI fixture_evt_render(EVT_HANDLE context, EVT_HANDLE fragment, DWORD flags,
     DWORD size, PVOID buffer, PDWORD used, PDWORD count);
 #define EvtRender fixture_evt_render
+static int process_fixture_active, process_fixture_count, process_fixture_index;
+static int process_fixture_fail_after = -1, process_fixture_snapshot_failed;
+static DWORD process_fixture_pids[4097], process_fixture_missing_path;
+static HANDLE WINAPI fixture_snapshot(DWORD flags,DWORD pid);
+static BOOL WINAPI fixture_process_first(HANDLE h,LPPROCESSENTRY32W entry);
+static BOOL WINAPI fixture_process_next(HANDLE h,LPPROCESSENTRY32W entry);
+static BOOL WINAPI fixture_close_handle(HANDLE h);
+static HANDLE WINAPI fixture_open_process(DWORD access,BOOL inherit,DWORD pid);
+static BOOL WINAPI fixture_process_path(HANDLE h,DWORD flags,LPWSTR out,PDWORD size);
+#define CreateToolhelp32Snapshot fixture_snapshot
+#define Process32FirstW fixture_process_first
+#define Process32NextW fixture_process_next
+#define CloseHandle fixture_close_handle
+#define OpenProcess fixture_open_process
+#define QueryFullProcessImageNameW fixture_process_path
+
 #endif
 
 /* Include the real owner so bounded scan behavior can be tested without
@@ -54,6 +71,53 @@ static BOOL WINAPI fixture_evt_render(EVT_HANDLE context, EVT_HANDLE fragment, D
 
 #ifdef _WIN32
 #undef EvtRender
+#undef CreateToolhelp32Snapshot
+#undef Process32FirstW
+#undef Process32NextW
+#undef CloseHandle
+#undef OpenProcess
+#undef QueryFullProcessImageNameW
+#define PROCESS_FIXTURE_SNAPSHOT ((HANDLE)(uintptr_t)0x7ffe)
+#define PROCESS_FIXTURE_HANDLE_BASE ((uintptr_t)0x10000000)
+static int fixture_handle(HANDLE h) {
+  return process_fixture_active && (uintptr_t)h >= PROCESS_FIXTURE_HANDLE_BASE && (uintptr_t)h < PROCESS_FIXTURE_HANDLE_BASE + 100000;
+}
+static HANDLE WINAPI fixture_snapshot(DWORD flags,DWORD pid) {
+  if(!process_fixture_active)return CreateToolhelp32Snapshot(flags,pid);
+  CHECK(flags==TH32CS_SNAPPROCESS && pid==0);
+  if(process_fixture_snapshot_failed){SetLastError(ERROR_ACCESS_DENIED);return INVALID_HANDLE_VALUE;}
+  process_fixture_index=0;return PROCESS_FIXTURE_SNAPSHOT;
+}
+static BOOL fixture_process_entry(LPPROCESSENTRY32W entry) {
+  CHECK(entry && entry->dwSize==sizeof(*entry));
+  if(process_fixture_fail_after>=0 && process_fixture_index>=process_fixture_fail_after) {SetLastError(ERROR_ACCESS_DENIED);return FALSE;}
+  if(process_fixture_index>=process_fixture_count){SetLastError(ERROR_NO_MORE_FILES);return FALSE;}
+  entry->th32ProcessID=process_fixture_pids[process_fixture_index++];
+  wcscpy(entry->szExeFile,L"rtq-fixture-process.exe");return TRUE;
+}
+static BOOL WINAPI fixture_process_first(HANDLE h,LPPROCESSENTRY32W entry) {
+  return process_fixture_active && h==PROCESS_FIXTURE_SNAPSHOT?fixture_process_entry(entry):Process32FirstW(h,entry);
+}
+static BOOL WINAPI fixture_process_next(HANDLE h,LPPROCESSENTRY32W entry) {
+  return process_fixture_active && h==PROCESS_FIXTURE_SNAPSHOT?fixture_process_entry(entry):Process32NextW(h,entry);
+}
+static BOOL WINAPI fixture_close_handle(HANDLE h) {
+  return process_fixture_active && (h==PROCESS_FIXTURE_SNAPSHOT || fixture_handle(h))?TRUE:CloseHandle(h);
+}
+static HANDLE WINAPI fixture_open_process(DWORD access,BOOL inherit,DWORD pid) {
+  if(!process_fixture_active)return OpenProcess(access,inherit,pid);
+  CHECK(access==PROCESS_QUERY_LIMITED_INFORMATION && !inherit);
+  return (HANDLE)(PROCESS_FIXTURE_HANDLE_BASE + pid);
+}
+static BOOL WINAPI fixture_process_path(HANDLE h,DWORD flags,LPWSTR out,PDWORD size) {
+  if(!fixture_handle(h))return QueryFullProcessImageNameW(h,flags,out,size);
+  CHECK(flags==0 && out && size);
+  DWORD pid=(DWORD)((uintptr_t)h-PROCESS_FIXTURE_HANDLE_BASE);
+  if(pid==process_fixture_missing_path){SetLastError(ERROR_ACCESS_DENIED);return FALSE;}
+  WCHAR path[220];int n=swprintf(path,220,L"C:\\RTQFixture\\bounded-native-collector-query-pagination-long-enough-to-require-many-complete-pages\\process-%lu.exe",(unsigned long)pid);
+  CHECK(n>0 && (DWORD)n<*size);memcpy(out,path,(size_t)(n+1)*sizeof(WCHAR));*size=(DWORD)n;return TRUE;
+}
+
 static BOOL WINAPI fixture_evt_render(EVT_HANDLE context, EVT_HANDLE fragment, DWORD flags,
     DWORD size, PVOID buffer, PDWORD used, PDWORD count) {
   event_render_calls++;
@@ -162,6 +226,10 @@ static int has_diagnostic(const cJSON *result, const char *code, const char *sev
 }
 static void reset_boundaries(void) {
   cancel_after = -1; cancel_checks = 0;
+#ifdef _WIN32
+  process_fixture_active=process_fixture_count=process_fixture_index=0;
+  process_fixture_fail_after=-1;process_fixture_snapshot_failed=0;process_fixture_missing_path=0;
+#endif
   capture_count = capture_exit = 0; capture_detail[0] = capture_response_status[0] = 0;
   ps_fixture = ps_args_fixture = ss_fixture = netstat_fixture = ""; ps_rc = ps_args_rc = ss_rc = netstat_rc = sampler_calls = 0;
   sampler_command[0] = 0; commandline_calls = 0;
@@ -454,6 +522,24 @@ static void eventlog_batch_budget_tests(void) {
   puts("PASS: absent/default/oversized/escaped batch scopes keep the existing footer and durable JSON budgets");
 }
 
+static void process_batch_budget_tests(void) {
+  rtq_filter filter;memset(&filter,0,sizeof(filter));char metadata[RTQ_PROCESS_META_CAP],object[RTQ_PROCESS_META_CAP+32];
+  CHECK(process_batch_metadata(&filter,metadata,sizeof(metadata))==0 && !metadata[0]);
+  filter.process_batch_enabled=filter.process_scan_complete=filter.process_has_more=1;
+  filter.process_pid_min=1000;filter.process_pid_max=filter.process_snapshot_pid_max=INT_MAX;
+  filter.process_returned_count=500;filter.process_last_pid=INT_MAX-1;
+  CHECK(process_batch_metadata(&filter,metadata,sizeof(metadata))>0);
+  CHECK(snprintf(object,sizeof(object),"{%s\"fixture\":true}",metadata)<(int)sizeof(object));
+  cJSON *root=cJSON_Parse(object);CHECK(root);const cJSON *batch=member(root,"process");
+  CHECK(!strcmp(text(batch,"schema"),EDR_RTQ_PROCESS_BATCH_SCHEMA) && integer(batch,"next_pid_min")==INT_MAX);
+  CHECK(integer(batch,"returned_count")==500 && integer(batch,"pid_min")==1000);
+  cJSON_Delete(root);CHECK(process_batch_metadata(&filter,metadata,32)<0);
+  filter.process_scan_complete=0;CHECK(process_batch_metadata(&filter,metadata,sizeof(metadata))>0);
+  CHECK(snprintf(object,sizeof(object),"{%s\"fixture\":true}",metadata)<(int)sizeof(object));root=cJSON_Parse(object);CHECK(root);
+  CHECK(integer(member(root,"process"),"next_pid_min")==0);cJSON_Delete(root);
+  puts("PASS: process batch footer fits its charged reserve at integer limits and never advances after an incomplete scan");
+}
+
 static void escaped_string_tests(void) {
   const char controls[] = {'f', 'i', 'x', 1, 2, 31, '\b', '\f', '\t', '\n', '\r', '"', '\\', (char)0xc3, (char)0xa9, 0};
   char buffer[256] = "{\"type\":\"process\""; int offset = (int)strlen(buffer);
@@ -482,6 +568,7 @@ static void process_field_tests(void) {
   reset_boundaries(); char fixture[256], args[256]; snprintf(fixture, sizeof(fixture), "%d fixture program\n", test_pid()); ps_fixture = fixture;
   cJSON *request = process_request("fixture", NULL, NULL), *result = collect(request);
   CHECK(integer(result, "total") == 1 && sampler_calls == 1 && !strcmp(sampler_command, "ps -eo pid,comm"));
+  CHECK(!member(member(result,"meta"),"process"));
   const cJSON *row = member(result, "results")->child;
   CHECK(!strcmp(text(row, "name"), "fixture program"));
   CHECK(!member(row, "cmdline") && !member(row, "user") && !member(row, "ppid"));
@@ -655,6 +742,77 @@ static void sampler_tests(void) {
   puts("PASS: production POSIX sampler parsing, IPv6 address fields, state normalization, fallback/failure and saturation diagnostics");
 }
 #else
+/* Exercise the production collector with only external Toolhelp/process-handle
+ * replies isolated. Deliberately reversed PIDs would lose rows with a cursor
+ * derived from the old unsorted enumeration. */
+static void process_fixture_init(int count) {
+  process_fixture_active=1;process_fixture_count=count;
+  for(int i=0;i<count;i++)process_fixture_pids[i]=(DWORD)(1000+4*(count-1-i));
+}
+static void windows_process_batch_tests(void) {
+  reset_boundaries();process_fixture_init(301);process_fixture_pids[300]=900;process_fixture_missing_path=1008;
+  int minimum=1000,initial_max=0,pages=0,seen=0,previous=0,optional_warning=0;
+  for(;;) {
+    cJSON *request=cJSON_CreateObject();CHECK(request);
+    CHECK(cJSON_AddNumberToObject(request,"process_pid_min",minimum));
+    if(initial_max)CHECK(cJSON_AddNumberToObject(request,"process_pid_max",initial_max));
+    cJSON *result=collect(request);cJSON_Delete(request);
+    const cJSON *batch=member(member(result,"meta"),"process");CHECK(cJSON_IsObject(batch));
+    CHECK(!strcmp(text(batch,"schema"),EDR_RTQ_PROCESS_BATCH_SCHEMA) && !strcmp(text(batch,"order"),"pid_asc"));
+    CHECK(cJSON_IsTrue(member(batch,"scan_complete")) && integer(batch,"pid_min")==minimum);
+    if(!initial_max)initial_max=integer(batch,"snapshot_pid_max");
+    CHECK(initial_max==2200 && integer(batch,"snapshot_pid_max")==initial_max);
+    CHECK(integer(batch,"returned_count")==integer(result,"total"));
+    CHECK(integer(batch,"pid_max")== (pages?initial_max:INT_MAX));
+    for(const cJSON *row=member(result,"results")->child;row;row=row->next) {
+      int pid=integer(row,"pid");CHECK(pid>=minimum && pid<=initial_max && pid>previous);
+      CHECK(pid==1004+seen*4); /* PID1000 was replaced by the out-of-range row. */
+      previous=pid;seen++;
+      if(pid==1008){CHECK(!member(row,"path"));optional_warning=has_diagnostic(result,"field_unavailable","warning");}
+    }
+    CHECK(integer(batch,"last_pid")==previous);
+    int next=integer(batch,"next_pid_min"),more=cJSON_IsTrue(member(batch,"has_more"));
+    CHECK(more==cJSON_IsTrue(member(result,"truncated")));
+    if(more)CHECK(next==previous+1 && has_diagnostic(result,"result_truncated","warning"));
+    else CHECK(next==0);
+    cJSON_Delete(result);pages++;CHECK(pages<20);
+    if(!more)break;
+    minimum=next;
+  }
+  CHECK(seen==300 && pages>1 && optional_warning && commandline_calls==0);
+
+  reset_boundaries();process_fixture_init(4);process_fixture_fail_after=2;
+  cJSON *request=cJSON_CreateObject();CHECK(cJSON_AddNumberToObject(request,"process_pid_min",1000));
+  cJSON *result=collect(request);const cJSON *batch=member(member(result,"meta"),"process");
+  CHECK(cJSON_IsFalse(member(batch,"scan_complete")) && integer(batch,"next_pid_min")==0);
+  CHECK(has_diagnostic(result,"enumeration_failed","error"));cJSON_Delete(result);
+  reset_boundaries();process_fixture_init(4097);result=collect(request);batch=member(member(result,"meta"),"process");
+  CHECK(cJSON_IsFalse(member(batch,"scan_complete")) && integer(batch,"next_pid_min")==0);
+  CHECK(has_diagnostic(result,"scan_limit","warning"));cJSON_Delete(result);
+  reset_boundaries();process_fixture_init(2);process_fixture_snapshot_failed=1;result=collect(request);batch=member(member(result,"meta"),"process");
+  CHECK(cJSON_IsFalse(member(batch,"scan_complete")) && integer(batch,"snapshot_pid_max")==0);
+  CHECK(has_diagnostic(result,"snapshot_failed","error"));cJSON_Delete(result);
+
+  reset_boundaries();process_fixture_init(2);
+  rtq_filter f;memset(&f,0,sizeof(f));f.command_id="fixture-process-no-progress";f.has_process=1;f.process_pid_min=1000;f.process_batch_enabled=1;
+  rtq_errors errors;rtq_error_init(&errors);char rows[64]="",metadata[512],object[550];int offset=0,total=0,truncated=0;
+  CHECK(match_processes(&f,rows,sizeof(rows),&offset,&total,&errors,&truncated)==0);
+  CHECK(truncated && f.process_has_more && f.process_scan_complete && f.process_last_pid==0);
+  CHECK(process_batch_metadata(&f,metadata,sizeof(metadata))>0);
+  CHECK(snprintf(object,sizeof(object),"{%s\"fixture\":true}",metadata)>0);result=cJSON_Parse(object);CHECK(result);
+  CHECK(integer(member(result,"process"),"next_pid_min")==0);cJSON_Delete(result);
+  cJSON_DeleteItemFromObjectCaseSensitive(request,"process_pid_min");
+  CHECK(cJSON_AddNumberToObject(request,"process_pid_min",5000));result=collect(request);batch=member(member(result,"meta"),"process");
+  CHECK(integer(result,"total")==0 && cJSON_IsTrue(member(batch,"scan_complete")));
+  CHECK(integer(batch,"snapshot_pid_max")==0 && integer(batch,"last_pid")==0 && integer(batch,"next_pid_min")==0);
+  cJSON_Delete(result);cJSON_Delete(request);
+  reset_boundaries();process_fixture_init(3);cancel_after=1;
+  const char *payload="{\"process_pid_min\":1000}";
+  edr_response_rtq_execute("fixture-process-cancel",(const uint8_t*)payload,strlen(payload),NULL);
+  CHECK(capture_execution==EdrCmdExecFailed && capture_exit==130 && !strcmp(capture_response_status,"cancelled"));
+  reset_boundaries();
+  puts("PASS: unsorted Windows snapshots produce finite ascending PID batches with full coverage, optional-field diagnostics, no-progress hold, scan failures, empty ranges and cancellation");
+}
 static void windows_process_fields_test(void) {
   reset_boundaries(); cJSON *request = cJSON_CreateObject(); CHECK(request);
   CHECK(cJSON_AddNumberToObject(request, "process_pid_min", test_pid()));
@@ -843,12 +1001,12 @@ int main(int argc, char **argv) {
   (void)argc; (void)argv;
 #endif
   char root[520]; fixture_root(root);
-  file_semantics_tests(root); file_boundary_tests(root); diagnostic_and_cache_budget_tests(); complete_row_and_cancellation_tests(root); eventlog_batch_budget_tests(); escaped_string_tests();
+  file_semantics_tests(root); file_boundary_tests(root); diagnostic_and_cache_budget_tests(); complete_row_and_cancellation_tests(root); eventlog_batch_budget_tests(); process_batch_budget_tests(); escaped_string_tests();
 #ifndef _WIN32
   process_field_tests(); process_capacity_tests(); sampler_tests();
   puts("SKIP: Windows native process, event metadata, System events, registry and IPv6 branches require a Windows test host");
 #else
-  windows_process_fields_test(); windows_unicode_process_test(root); windows_event_metadata_tests(); windows_system_event_test(); windows_registry_tests(); windows_ipv6_test();
+  windows_process_batch_tests(); windows_process_fields_test(); windows_unicode_process_test(root); windows_event_metadata_tests(); windows_system_event_test(); windows_registry_tests(); windows_ipv6_test();
 #endif
   remove_tree(root);
   return 0;

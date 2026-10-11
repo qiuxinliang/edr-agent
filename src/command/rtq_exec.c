@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,8 @@
 #define RTQ_RESULT_FOOTER_RESERVE 5120
 #define RTQ_COLLECTOR_RESULT_CAP (RTQ_MAX_RESULT_STR - RTQ_RESULT_FOOTER_RESERVE)
 #define RTQ_ROW_CAP RTQ_MAX_RESULT_STR
+#define RTQ_PROCESS_SCAN_MAX 4096
+#define RTQ_PROCESS_META_CAP 512
 #define RTQ_FILE_HASH_MAX  (64 * 1024 * 1024)
 #define RTQ_FILE_SCAN_MAX  2000
 #define RTQ_FILE_SCAN_DEPTH 3
@@ -68,6 +71,12 @@ typedef struct rtq_filter {
     char process_user[128];
     int process_pid_min;
     int process_pid_max;
+    int process_batch_enabled;
+    int process_scan_complete;
+    int process_snapshot_pid_max;
+    int process_returned_count;
+    int process_last_pid;
+    int process_has_more;
 
     int has_network;
     char network_remote_ip[64];
@@ -327,6 +336,26 @@ static int eventlog_batch_metadata(const rtq_filter *f, char *buf, int cap) {
         !append_json_kv_str(buf, cap, &offset, "query",
                             f->eventlog_query[0] ? f->eventlog_query : "*") ||
         !rtq_appendf(buf, cap, &offset, "},")) return -1;
+    return offset;
+}
+
+/* A cursor certifies the bounded enumeration, not a retained live snapshot.
+ * Subsequent signed queries keep the first batch's upper PID bound. */
+static int process_batch_metadata(const rtq_filter *f, char *buf, int cap) {
+    int offset = 0;
+    if (!f || !buf || cap <= 0) return -1;
+    buf[0] = '\0';
+    if (!f->process_batch_enabled) return 0;
+    int next = f->process_scan_complete && f->process_has_more &&
+               f->process_last_pid > 0 && f->process_last_pid < f->process_snapshot_pid_max
+                   ? f->process_last_pid + 1 : 0;
+    if (!rtq_appendf(buf, cap, &offset,
+        "\"process\":{\"schema\":\"" EDR_RTQ_PROCESS_BATCH_SCHEMA "\",\"order\":\"pid_asc\","
+        "\"scan_complete\":%s,\"pid_min\":%d,\"pid_max\":%d,\"snapshot_pid_max\":%d,"
+        "\"returned_count\":%d,\"last_pid\":%d,\"has_more\":%s,\"next_pid_min\":%d},",
+        f->process_scan_complete ? "true" : "false", f->process_pid_min > 0 ? f->process_pid_min : 1,
+        f->process_pid_max > 0 ? f->process_pid_max : INT_MAX, f->process_snapshot_pid_max,
+        f->process_returned_count, f->process_last_pid, f->process_has_more ? "true" : "false", next)) return -1;
     return offset;
 }
 
@@ -741,6 +770,16 @@ static int query_process_cmdline_native(DWORD pid, char *cmd, size_t cap, DWORD 
     return -1;
 }
 
+typedef struct process_snapshot_entry {
+    DWORD pid;
+    WCHAR name[MAX_PATH];
+} process_snapshot_entry;
+
+static int process_snapshot_pid_compare(const void *left, const void *right) {
+    const process_snapshot_entry *a = left, *b = right;
+    return a->pid > b->pid ? 1 : a->pid < b->pid ? -1 : 0;
+}
+
 static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *total,
                            rtq_errors *errs, int *truncated) {
     HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -749,90 +788,127 @@ static int match_processes(rtq_filter *f, char *buf, int cap, int *offset, int *
                          "CreateToolhelp32Snapshot failed", 1);
         return -1;
     }
+    process_snapshot_entry *entries = calloc(RTQ_PROCESS_SCAN_MAX, sizeof(*entries));
+    if (!entries) {
+        CloseHandle(h);
+        rtq_error_append(errs, "process", "oom", "process snapshot allocation failed", 1);
+        return -1;
+    }
     PROCESSENTRY32W pe;
+    memset(&pe, 0, sizeof(pe));
     pe.dwSize = sizeof(pe);
+    size_t entry_count = 0;
+    int has_entry = Process32FirstW(h, &pe);
+    DWORD enumeration_error = has_entry ? ERROR_SUCCESS : GetLastError();
+    while (has_entry && !rtq_cancelled(f)) {
+        if (entry_count == RTQ_PROCESS_SCAN_MAX) {
+            rtq_error_append(errs, "process", "scan_limit", "process snapshot exceeds the bounded scan limit", 0);
+            break;
+        }
+        entries[entry_count].pid = pe.th32ProcessID;
+        memcpy(entries[entry_count].name, pe.szExeFile, sizeof(entries[entry_count].name));
+        entries[entry_count].name[MAX_PATH - 1] = 0;
+        if (pe.th32ProcessID <= INT_MAX && pe.th32ProcessID >= (DWORD)(f->process_pid_min > 0 ? f->process_pid_min : 1) &&
+            (f->process_pid_max <= 0 || pe.th32ProcessID <= (DWORD)f->process_pid_max) &&
+            (int)pe.th32ProcessID > f->process_snapshot_pid_max) f->process_snapshot_pid_max = (int)pe.th32ProcessID;
+        entry_count++;
+        has_entry = Process32NextW(h, &pe);
+        if (!has_entry) enumeration_error = GetLastError();
+    }
+    f->process_scan_complete = !has_entry && !rtq_cancelled(f) &&
+        (enumeration_error == ERROR_SUCCESS || enumeration_error == ERROR_NO_MORE_FILES);
+    if (!has_entry && enumeration_error != ERROR_SUCCESS && enumeration_error != ERROR_NO_MORE_FILES)
+        rtq_error_append(errs, "process", "enumeration_failed", "process snapshot enumeration failed", 1);
+    CloseHandle(h);
+    /* Toolhelp order is not a pagination contract. Sort the owned, bounded
+     * snapshot before applying filters or stopping at the result budget. */
+    qsort(entries, entry_count, sizeof(*entries), process_snapshot_pid_compare);
+    for (size_t i = 1; i < entry_count; i++) {
+        if (entries[i - 1].pid == entries[i].pid) {
+            f->process_scan_complete = 0;
+            rtq_error_append(errs, "process", "enumeration_failed", "process snapshot contained duplicate PIDs", 1);
+            free(entries);
+            return -1;
+        }
+    }
     int count = 0;
     int cmdline_queried = 0;
     int cmdline_sampled = 0;
     int cmdline_access_denied = 0;
     int cmdline_too_long = 0;
     int cmdline_failed = 0;
-    int has_entry = Process32FirstW(h, &pe);
-    DWORD enumeration_error = has_entry ? ERROR_SUCCESS : GetLastError();
-    if (has_entry) {
-        do {
-            if (rtq_cancelled(f)) break;
-            char name[780] = {0};
-            if (!wide_to_utf8_str(pe.szExeFile, name, sizeof(name))) {
-                rtq_error_append(errs, "process", "field_unavailable", "process name could not be read completely", 0);
-                continue;
-            }
+    for (size_t entry_index = 0; entry_index < entry_count; entry_index++) {
+        if (rtq_cancelled(f)) break;
+        DWORD pid = entries[entry_index].pid;
+        if (pid < (DWORD)(f->process_pid_min > 0 ? f->process_pid_min : 1) || pid > INT_MAX ||
+            (f->process_pid_max > 0 && pid > (DWORD)f->process_pid_max)) continue;
+        char name[780] = {0};
+        if (!wide_to_utf8_str(entries[entry_index].name, name, sizeof(name))) {
+            rtq_error_append(errs, "process", "field_unavailable", "process name could not be read completely", 0);
+            continue;
+        }
 
-            int ok = 1;
-            if (f->process_name[0] && !str_contains_icase(name, f->process_name)) ok = 0;
-            if (f->process_pid_max > 0 && (int)pe.th32ProcessID > f->process_pid_max) ok = 0;
-            if (f->process_pid_min > 0 && (int)pe.th32ProcessID < f->process_pid_min) ok = 0;
+        int ok = 1;
+        if (f->process_name[0] && !str_contains_icase(name, f->process_name)) ok = 0;
 
-            char path[520] = {0};
-            char user[260] = {0};
-            char cmdline[8193] = {0};
-            if (ok && f->process_path[0]) {
-                query_process_path(pe.th32ProcessID, path, sizeof(path));
-                if (!path[0]) rtq_error_append(errs, "process", "field_unavailable", "process path could not be read", 0);
-                if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
-            }
-            if (ok && f->process_user[0]) {
-                query_process_user(pe.th32ProcessID, user, sizeof(user));
-                if (!user[0]) rtq_error_append(errs, "process", "field_unavailable", "requested process owner could not be read", 0);
-                if (!user[0] || !str_contains_icase(user, f->process_user)) ok = 0;
-            }
-            if (ok && (f->process_cmdline[0] || f->script_content[0] || f->script_engine[0])) {
-                DWORD cmdline_error = ERROR_SUCCESS;
-                cmdline_queried++;
-                int cmdline_rc = query_process_cmdline_native(pe.th32ProcessID, cmdline,
-                                                              sizeof(cmdline), &cmdline_error);
-                if (cmdline_rc >= 0) cmdline_sampled++;
-                else if (cmdline_error == ERROR_ACCESS_DENIED) cmdline_access_denied++;
-                else if (cmdline_error == ERROR_INSUFFICIENT_BUFFER) cmdline_too_long++;
-                else cmdline_failed++;
-                if (f->process_cmdline[0] && !str_contains_icase(cmdline, f->process_cmdline)) ok = 0;
-                if (f->script_engine[0] && !str_contains_icase(name, f->script_engine) &&
-                    !str_contains_icase(cmdline, f->script_engine)) ok = 0;
-            }
+        char path[520] = {0};
+        char user[260] = {0};
+        char cmdline[8193] = {0};
+        if (ok && f->process_path[0]) {
+            query_process_path(pid, path, sizeof(path));
+            if (!path[0]) rtq_error_append(errs, "process", "field_unavailable", "process path could not be read", 0);
+            if (!path[0] || !str_contains_icase(path, f->process_path)) ok = 0;
+        }
+        if (ok && f->process_user[0]) {
+            query_process_user(pid, user, sizeof(user));
+            if (!user[0]) rtq_error_append(errs, "process", "field_unavailable", "requested process owner could not be read", 0);
+            if (!user[0] || !str_contains_icase(user, f->process_user)) ok = 0;
+        }
+        if (ok && (f->process_cmdline[0] || f->script_content[0] || f->script_engine[0])) {
+            DWORD cmdline_error = ERROR_SUCCESS;
+            cmdline_queried++;
+            int cmdline_rc = query_process_cmdline_native(pid, cmdline,
+                                                          sizeof(cmdline), &cmdline_error);
+            if (cmdline_rc >= 0) cmdline_sampled++;
+            else if (cmdline_error == ERROR_ACCESS_DENIED) cmdline_access_denied++;
+            else if (cmdline_error == ERROR_INSUFFICIENT_BUFFER) cmdline_too_long++;
+            else cmdline_failed++;
+            if (f->process_cmdline[0] && !str_contains_icase(cmdline, f->process_cmdline)) ok = 0;
+            if (f->script_engine[0] && !str_contains_icase(name, f->script_engine) &&
+                !str_contains_icase(cmdline, f->script_engine)) ok = 0;
+        }
 
-            if (ok) {
-                if (!path[0]) query_process_path(pe.th32ProcessID, path, sizeof(path));
-                if (!path[0]) rtq_error_append(errs, "process", "field_unavailable", "process path could not be read", 0);
+        if (ok) {
+            if (!path[0]) query_process_path(pid, path, sizeof(path));
+            if (!path[0]) rtq_error_append(errs, "process", "field_unavailable", "process path could not be read", 0);
 
-                char row[RTQ_ROW_CAP];
-                int row_offset = 0;
-                row[0] = '\0';
-                int row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset,
-                    "{\"type\":\"process\",\"pid\":%lu,\"name\":\"",
-                    (unsigned long)pe.th32ProcessID) &&
-                    append_json_escaped(row, (int)sizeof(row), &row_offset, name) &&
-                    rtq_appendf(row, (int)sizeof(row), &row_offset, "\"");
-                if (row_ok && path[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "path", path);
-                if (row_ok && user[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "user", user);
-                if (row_ok && cmdline[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "cmdline", cmdline);
-                if (row_ok && row_offset < (int)sizeof(row) - 1) {
-                    row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset, "}");
-                } else {
-                    row_ok = 0;
-                }
-                if (!row_ok || !rtq_commit_row(buf, cap, offset, total, row, row_offset, truncated)) {
-                    if (truncated) *truncated = 1;
-                    break;
-                }
-                count++;
+            char row[RTQ_ROW_CAP];
+            int row_offset = 0;
+            row[0] = '\0';
+            int row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset,
+                "{\"type\":\"process\",\"pid\":%lu,\"name\":\"",
+                (unsigned long)pid) &&
+                append_json_escaped(row, (int)sizeof(row), &row_offset, name) &&
+                rtq_appendf(row, (int)sizeof(row), &row_offset, "\"");
+            if (row_ok && path[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "path", path);
+            if (row_ok && user[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "user", user);
+            if (row_ok && cmdline[0]) row_ok = append_json_kv_str(row, (int)sizeof(row), &row_offset, "cmdline", cmdline);
+            if (row_ok && row_offset < (int)sizeof(row) - 1) {
+                row_ok = rtq_appendf(row, (int)sizeof(row), &row_offset, "}");
+            } else {
+                row_ok = 0;
             }
-        } while ((has_entry = Process32NextW(h, &pe)) != FALSE);
-        if (!has_entry) enumeration_error = GetLastError();
+            if (!row_ok || !rtq_commit_row(buf, cap, offset, total, row, row_offset, truncated)) {
+                if (truncated) *truncated = 1;
+                f->process_has_more = 1;
+                break;
+            }
+            count++;
+            f->process_returned_count = count;
+            f->process_last_pid = (int)pid;
+        }
     }
-    if (!*truncated && !rtq_cancelled(f) && enumeration_error != ERROR_SUCCESS && enumeration_error != ERROR_NO_MORE_FILES) {
-        rtq_error_append(errs, "process", "enumeration_failed", "process snapshot enumeration failed", 1);
-    }
-    CloseHandle(h);
+    free(entries);
     if (cmdline_queried && cmdline_too_long > 0) {
         char message[256];
         snprintf(message, sizeof(message),
@@ -2005,7 +2081,12 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                                       "eventlog batch metadata exceeds result budget");
         return;
     }
-    const int collector_result_cap = RTQ_COLLECTOR_RESULT_CAP - eventlog_meta_len;
+#ifdef _WIN32
+    filter.process_batch_enabled = has_proc && !has_net && !has_file && !has_registry && !has_eventlog &&
+        (filter.process_pid_max <= 0 || filter.process_pid_max >= (filter.process_pid_min > 0 ? filter.process_pid_min : 1));
+#endif
+    const int collector_result_cap = RTQ_COLLECTOR_RESULT_CAP - eventlog_meta_len -
+        (filter.process_batch_enabled ? RTQ_PROCESS_META_CAP : 0);
     int output_truncated = 0;
     rtq_errors errors;
     rtq_error_init(&errors);
@@ -2074,6 +2155,14 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
                          0);
     }
 
+    char process_meta[RTQ_PROCESS_META_CAP];
+    if (process_batch_metadata(&filter, process_meta, (int)sizeof(process_meta)) < 0) {
+        free(result);
+        g_cmd_exec_fail++;
+        edr_command_emit_always_typed(cmd_id, "rtq_execute", sm, EdrCmdExecFailed, 3,
+                                      "process batch metadata exceeds result budget");
+        return;
+    }
     const char *cache_status = !filter.file_sha256[0]
                                    ? "not_requested"
                                    : (filter.file_cache_failed ? "unavailable" :
@@ -2084,9 +2173,9 @@ void edr_response_rtq_execute(const char *cmd_id, const uint8_t *pl,
     if (errors.count) (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n],\"partial\":true");
     else (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset, "\n]");
     (void)rtq_appendf(result, RTQ_MAX_RESULT_STR, &offset,
-        ",\"total\":%d,\"truncated\":%s,\"meta\":{%s\"file_hash\":{\"scope\":\"%s\",\"cache_status\":\"%s\",\"cache_attempted\":%s,"
+        ",\"total\":%d,\"truncated\":%s,\"meta\":{%s%s\"file_hash\":{\"scope\":\"%s\",\"cache_status\":\"%s\",\"cache_attempted\":%s,"
         "\"cache_hits\":%d,\"cache_candidates_scanned\":%u,\"path_scanned\":%s}},\"error\":",
-        total, output_truncated ? "true" : "false", eventlog_meta, scope, cache_status,
+        total, output_truncated ? "true" : "false", eventlog_meta, process_meta, scope, cache_status,
         filter.file_cache_attempted ? "true" : "false",
         filter.file_cache_hits, filter.file_cache_candidates,
         filter.file_path_scanned ? "true" : "false");
