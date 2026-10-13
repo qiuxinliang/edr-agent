@@ -1,0 +1,13 @@
+# Kernel-process identity aliases moved intact from proc_try in d7b6e300.
+# Emitted before optional text so large commands cannot crowd out PID/PPID.
+# First available alias owns each canonical field; later aliases cannot overwrite it.
+ParentProcessId
+ParentProcessID
+ParentID
+ParentId
+CreatorProcessId
+ProcessId
+ProcessID
+PID
+NewProcessId
+NewProcessID

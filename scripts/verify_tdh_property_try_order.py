@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A2.3：回归 edr_tdh_win.c 中 `proc_try`（及可选 `file_try`）与 fixtures 一致，防无意中重排小表。
+# A2.3：核对进程正文、独立身份及文件字段别名的完整顺序。
 # 无需 Windows / TDH 运行时。仓库根：python3 edr-agent/scripts/verify_tdh_property_try_order.py
 from __future__ import annotations
 
@@ -54,50 +54,36 @@ def _load_fixture(path: Path) -> list[str]:
     return lines
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parent.parent
+def _check_orders(root: Path) -> dict[str, int]:
     c_file = root / "src" / "collector" / "etw_tdh_win.c"
-    if not c_file.is_file():
-        print("FAIL: missing", c_file, file=sys.stderr)
-        return 1
     src = c_file.read_text(encoding="utf-8")
     fx_dir = root / "fixtures" / "tdh"
+    counts = {}
+    for name, fixture in (
+        ("proc_try", "kernel_process_prop_try_v1.txt"),
+        ("proc_identity_try", "kernel_process_identity_try_v1.txt"),
+        ("file_try", "kernel_file_prop_try_v1.txt"),
+    ):
+        actual = _parse_c_wstr_array(src, name)
+        expected = _load_fixture(fx_dir / fixture)
+        if actual != expected:
+            difference = next(
+                (f"first diff at [{i}]: C={a!r} fixture={b!r}"
+                 for i, (a, b) in enumerate(zip(actual, expected)) if a != b),
+                f"length C={len(actual)} fixture={len(expected)}",
+            )
+            raise ValueError(f"{name} order differs from {fixture}: {difference}")
+        counts[name] = len(actual)
+    return counts
+
+
+def main() -> int:
     try:
-        proc_c = _parse_c_wstr_array(src, "proc_try")
-    except ValueError as e:
-        print("FAIL: parse C:", e, file=sys.stderr)
+        counts = _check_orders(Path(__file__).resolve().parent.parent)
+    except (OSError, ValueError) as error:
+        print("FAIL:", error, file=sys.stderr)
         return 1
-    f_proc = fx_dir / "kernel_process_prop_try_v1.txt"
-    if f_proc.is_file():
-        want = _load_fixture(f_proc)
-        if proc_c != want:
-            print("FAIL: proc_try order differs from fixture", f_proc, file=sys.stderr)
-            for i, (a, b) in enumerate(zip(proc_c, want)):
-                if a != b:
-                    print(f"  first diff at [{i}]: C={a!r} fixture={b!r}", file=sys.stderr)
-                    break
-            else:
-                n = min(len(proc_c), len(want))
-                if len(proc_c) != len(want):
-                    print(
-                        f"  length C={len(proc_c)} fixture={len(want)} (cmp first {n})",
-                        file=sys.stderr,
-                    )
-            return 1
-    else:
-        print("WARN: no fixture, skip proc_try check:", f_proc, file=sys.stderr)
-    try:
-        file_c = _parse_c_wstr_array(src, "file_try")
-    except ValueError as e:
-        print("FAIL: parse C file_try:", e, file=sys.stderr)
-        return 1
-    f_file = fx_dir / "kernel_file_prop_try_v1.txt"
-    if f_file.is_file():
-        want_f = _load_fixture(f_file)
-        if file_c != want_f:
-            print("FAIL: file_try order differs from", f_file, file=sys.stderr)
-            return 1
-    print("OK: TDH EdrPropTry order matches fixtures (proc", len(proc_c), "file", len(file_c), ")")
+    print("OK: TDH EdrPropTry order matches fixtures", counts)
     return 0
 
 

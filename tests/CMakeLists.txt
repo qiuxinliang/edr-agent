@@ -16,6 +16,8 @@ endif()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME tdh_property_alias_order_contract
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_tdh_property_try_order.py)
 add_custom_target(test_python_installer_config_contract DEPENDS edr_agent)
 add_test(NAME python_installer_config_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_python_installer_config_contract.py

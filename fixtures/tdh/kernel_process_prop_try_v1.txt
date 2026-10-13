@@ -1,5 +1,6 @@
-# Kernel-process proc_try order; freeze the collector contract present since 7b9a33bf.
-# Image aliases precede command aliases; preserve parent command, CWD and PID fallback fields.
+# Kernel-process optional text aliases; identity moved to proc_identity_try in d7b6e300.
+# Image aliases precede command aliases; preserve parent command and CWD fallbacks.
+# All ten PID aliases remain frozen in kernel_process_identity_try_v1.txt.
 # Intentional collector changes must update this fixture after review.
 ImageFileName
 ImageName
@@ -21,13 +22,3 @@ ParentProcessCommandLine
 CreatorCommandLine
 CurrentDirectory
 WorkingDirectory
-ParentProcessId
-ParentProcessID
-ParentID
-ParentId
-CreatorProcessId
-ProcessId
-ProcessID
-PID
-NewProcessId
-NewProcessID
