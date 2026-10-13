@@ -3,11 +3,13 @@ as successful. The deliberately failing baseline client isolates main's
 resource lifetime before TemporaryDirectory removes its database files.
 """
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 from pathlib import Path
 import sqlite3
+import ssl
 import struct
 import subprocess
 import tempfile
@@ -18,6 +20,46 @@ spec = importlib.util.spec_from_file_location(
     "egress_receiver", Path(__file__).with_name("test_egress_tls_receiver.py"))
 receiver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(receiver)
+
+
+class RuleDownloadSchemaTest(unittest.TestCase):
+    def test_current_schema_is_exact_and_rejects_unsupported_headers_over_mtls(self):
+        with tempfile.TemporaryDirectory(prefix="edr-rule-schema-") as temporary:
+            root = Path(temporary)
+            receiver.openssl_certificates(root)
+            server = receiver.Receiver(root, "server", root / "receipts.db")
+            server.rule_downloads_enabled = True
+            context = ssl.create_default_context(cafile=str(root / "ca.pem"))
+            context.load_cert_chain(root / "client.pem", root / "client.key")
+            try:
+                for path in ("/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):
+                    for values in (("9",), (), ("7",), ("8",), ("10",),
+                                   ("9", "9"), ("9,9",), ("9", "8")):
+                        with self.subTest(path=path, values=values):
+                            connection = http.client.HTTPSConnection(
+                                "localhost", server.server_port, context=context, timeout=2)
+                            try:
+                                connection.putrequest("GET", path)
+                                for value in values:
+                                    connection.putheader("X-EDR-P0-IR-Schema", value)
+                                connection.endheaders()
+                                response = connection.getresponse()
+                                body = response.read(4096)
+                                self.assertEqual(response.status, 200 if values == ("9",) else 412)
+                                if values == ("9",):
+                                    self.assertEqual(body, b"synthetic-rule-artifact")
+                                else:
+                                    self.assertEqual(json.loads(body)["code"], "P0_IR_SCHEMA_UNSUPPORTED")
+                            finally:
+                                connection.close()
+                self.assertEqual(len(server.rule_download_receipts), 16)
+                self.assertEqual(sum(item["status"] == 200 for item in server.rule_download_receipts), 2)
+                receiver.reject_rule_schema_probes(root, server)
+                self.assertEqual(len(server.rule_download_receipts), 23)
+                self.assertTrue(all(item["status"] == 412 and not item["exact_single_schema"]
+                                    for item in server.rule_download_receipts[-7:]))
+            finally:
+                server.finish()
 
 
 class AlertParentProjectionTest(unittest.TestCase):

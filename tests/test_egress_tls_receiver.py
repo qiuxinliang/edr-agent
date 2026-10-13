@@ -320,13 +320,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.server.rule_downloads_enabled and self.path in (
                 "/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):
-            # This synthetic oracle mirrors the current server's schema8
+            # This synthetic oracle mirrors the current server's schema9
             # negotiation. It never handles real rule inputs or activation.
             schema = self.headers.get_all("X-EDR-P0-IR-Schema") or []
-            status = 200 if schema == ["8"] and self.connection.getpeercert() else 412
+            status = 200 if schema == ["9"] and self.connection.getpeercert() else 412
             with self.server.lock:
                 self.server.rule_download_receipts.append({"path": self.path, "status": status,
-                                                          "exact_single_schema": schema == ["8"]})
+                                                          "exact_single_schema": schema == ["9"]})
             if status != 200:
                 self.reply({"code": "P0_IR_SCHEMA_UNSUPPORTED"}, 412)
                 return
@@ -620,14 +620,22 @@ def crash_restart_scenario(client, root):
 
 
 def reject_rule_schema_probes(root, server):
-    """Two bounded loopback mTLS negatives, outside the Agent product API."""
+    """Bounded loopback mTLS negatives, outside the Agent product API."""
     context = ssl.create_default_context(cafile=str(root / "ca.pem"))
     context.load_cert_chain(root / "client.pem", root / "client.key")
-    for path, headers in (("/api/v1/agent/p0-bundle.enc", {}),
-                          ("/api/v1/agent/sensor-interest.json", {"X-EDR-P0-IR-Schema": "7"})):
+    for path, values in (("/api/v1/agent/p0-bundle.enc", ()),
+                         ("/api/v1/agent/sensor-interest.json", ("7",)),
+                         ("/api/v1/agent/p0-bundle.enc", ("8",)),
+                         ("/api/v1/agent/sensor-interest.json", ("10",)),
+                         ("/api/v1/agent/p0-bundle.enc", ("9", "9")),
+                         ("/api/v1/agent/sensor-interest.json", ("9,9",)),
+                         ("/api/v1/agent/p0-bundle.enc", ("9", "8"))):
         connection = http.client.HTTPSConnection("localhost", server.server_port, context=context, timeout=2)
         try:
-            connection.request("GET", path, headers=headers)
+            connection.putrequest("GET", path)
+            for value in values:
+                connection.putheader("X-EDR-P0-IR-Schema", value)
+            connection.endheaders()
             response = connection.getresponse()
             response.read(4096)
             if response.status != 412:
@@ -835,6 +843,11 @@ def main():
                         {"path": "/api/v1/agent/sensor-interest.json", "status": 200, "exact_single_schema": True},
                         {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
                         {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
+                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
                     ]
                     if reports[-1]["rule_file_downloads"] != expected:
                         reports[-1]["receiver_business_failures"] += 1
