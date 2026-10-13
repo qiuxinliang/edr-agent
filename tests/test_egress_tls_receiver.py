@@ -620,16 +620,15 @@ def crash_restart_scenario(client, root):
 
 
 def reject_rule_schema_probes(root, server):
-    """Bounded loopback mTLS negatives, outside the Agent product API."""
+    """Two bounded loopback mTLS negatives, outside the Agent product API.
+
+    The full malformed-header matrix has its own real-TLS receiver test, so
+    these original client scenarios retain their finite execution budget.
+    """
     context = ssl.create_default_context(cafile=str(root / "ca.pem"))
     context.load_cert_chain(root / "client.pem", root / "client.key")
     for path, values in (("/api/v1/agent/p0-bundle.enc", ()),
-                         ("/api/v1/agent/sensor-interest.json", ("7",)),
-                         ("/api/v1/agent/p0-bundle.enc", ("8",)),
-                         ("/api/v1/agent/sensor-interest.json", ("10",)),
-                         ("/api/v1/agent/p0-bundle.enc", ("9", "9")),
-                         ("/api/v1/agent/sensor-interest.json", ("9,9",)),
-                         ("/api/v1/agent/p0-bundle.enc", ("9", "8"))):
+                         ("/api/v1/agent/sensor-interest.json", ("7",))):
         connection = http.client.HTTPSConnection("localhost", server.server_port, context=context, timeout=2)
         try:
             connection.putrequest("GET", path)
@@ -843,11 +842,6 @@ def main():
                         {"path": "/api/v1/agent/sensor-interest.json", "status": 200, "exact_single_schema": True},
                         {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
                         {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
-                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
-                        {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
-                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
-                        {"path": "/api/v1/agent/sensor-interest.json", "status": 412, "exact_single_schema": False},
-                        {"path": "/api/v1/agent/p0-bundle.enc", "status": 412, "exact_single_schema": False},
                     ]
                     if reports[-1]["rule_file_downloads"] != expected:
                         reports[-1]["receiver_business_failures"] += 1

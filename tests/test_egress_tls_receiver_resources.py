@@ -54,10 +54,6 @@ class RuleDownloadSchemaTest(unittest.TestCase):
                                 connection.close()
                 self.assertEqual(len(server.rule_download_receipts), 16)
                 self.assertEqual(sum(item["status"] == 200 for item in server.rule_download_receipts), 2)
-                receiver.reject_rule_schema_probes(root, server)
-                self.assertEqual(len(server.rule_download_receipts), 23)
-                self.assertTrue(all(item["status"] == 412 and not item["exact_single_schema"]
-                                    for item in server.rule_download_receipts[-7:]))
             finally:
                 server.finish()
 
