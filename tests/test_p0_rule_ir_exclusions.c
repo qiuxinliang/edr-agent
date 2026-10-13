@@ -388,8 +388,8 @@ static int evidence_purposes(void) {
    edr_behavior_clear_parent_context(&r);
    if(!matches(&r,1,"optional parent purpose does not require available parent"))return 0;
   }
-  if(i<3) {
-   if(!write_bundle(7,"process_create",conditions[i]) || !edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
+  for(unsigned schema=7;schema<=8;schema++) if(schema==8 || i<3) {
+   if(!write_bundle(schema,"process_create",conditions[i]) || !edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
    edr_p0_rule_ir_reload();
    if(!edr_p0_rule_ir_evaluate_record(&r,NULL,&eval) || eval.match_count!=1)return 0;
    ok=edr_p0_rule_ir_evaluation_get_match(&eval,0,&m) && m.required_evidence_fields==expected[i];
@@ -411,10 +411,43 @@ static int evidence_purposes(void) {
     edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
  puts("IR8 evidence purposes: actor and parent independently scoped; predicates unchanged; unknown/duplicate/purpose-only and IR7 parent purpose rejected, original IR7 masks preserved");return 1;
 }
+static int subject_command_purpose(void) {
+ const char *conditions[]={
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"subject_command\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"subject_command\",\"parent_context\",\"actor_attribution\"]}"};
+ const uint64_t parent=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+ for(unsigned i=0;i<2;i++) {
+  if(!load_rule("process_create",conditions[i]))return 0;
+  EdrBehaviorRecord r;record_init(&r,EDR_EVENT_PROCESS_CREATE);strcpy(r.process_name,"tool.exe");
+  for(unsigned command=0;command<3;command++) {
+   r.cmdline[0]=0;r.source_truncated_fields[0]=0;
+   if(command)strcpy(r.cmdline,"tool.exe --captured");
+   if(command==2)edr_behavior_mark_source_truncated(&r,"source.cmdline");
+   EdrP0RuleIrEvaluation eval;if(!edr_p0_rule_ir_evaluate_record(&r,NULL,&eval) || eval.match_count!=1)return 0;
+   EdrP0RuleIrMatch m;int ok=edr_p0_rule_ir_evaluation_get_match(&eval,0,&m) &&
+     m.required_evidence_fields==(EDR_EVIDENCE_COMMAND|(i?EDR_EVIDENCE_USER|parent:0));
+   edr_p0_rule_ir_evaluation_free(&eval);if(!ok)return 0;
+  }
+  strcpy(r.process_name,"other.exe");if(!matches(&r,0,"command purpose cannot supply a predicate"))return 0;
+  for(unsigned schema=7;schema<=8;schema++)if(!rejected_candidate(schema,"process_create",conditions[i]))return 0;
+  if(!write_bundle_effect(9,"process_create",conditions[i],"local_observation") || edr_p0_rule_ir_validate_candidate_path(s_path))return 0;
+ }
+ const char *bad[]={
+  "{\"evidence_purposes\":[\"subject_command\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"subject_command\",\"subject_command\"]}",
+  "{\"process_name_in\":[\"tool.exe\"],\"operation\":\"credential_tool_attempt\",\"evidence_purposes\":[\"subject_command\"]}"};
+ for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++)if(!rejected_candidate(9,"process_create",bad[i]))return 0;
+ const struct {const char *event,*condition;} other[]={
+  {"network_connect","{\"remote_port_in\":[443],\"evidence_purposes\":[\"subject_command\"]}"},
+  {"file_write","{\"file_path_regex_any\":[\"test\"],\"evidence_purposes\":[\"subject_command\"]}"},
+  {"registry_set","{\"registry_path_regex_any\":[\"test\"],\"evidence_purposes\":[\"subject_command\"]}"}};
+ for(unsigned i=0;i<sizeof(other)/sizeof(other[0]);i++)if(!rejected_candidate(9,other[i].event,other[i].condition))return 0;
+ puts("IR9 subject command: optional evidence does not change matching; IR7/8, other events, observations, operations and duplicate purposes reject");return 1;
+}
 int main(void) {
   int okay = create_fixture() && name_exclusions() && empty_and_path_exclusions() &&
              network_positive_path_quality() && unknown_source_quality_exclusions() &&
-             script_exclusions_require_observed_names() && file_process_paths() && candidate_contract() && parent_predicate_states() && evidence_purposes();
+             script_exclusions_require_observed_names() && file_process_paths() && candidate_contract() && parent_predicate_states() && evidence_purposes() && subject_command_purpose();
   edr_p0_rule_ir_shutdown();
   if (s_path[0]) remove(s_path);
   if (!okay) fprintf(stderr, "P0 exclusion/actor-path contract failed\n");

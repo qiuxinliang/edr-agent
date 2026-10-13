@@ -1846,12 +1846,13 @@ static int p0_condition_dword_array_valid(const cJSON *branches) {
 /* This finite purpose set is shared by validation, the retained matcher
  * mask, and historical authority. Purposes never become predicates. */
 static int p0_ir_evidence_purposes(const cJSON *purposes, unsigned schema,
+                                   const char *event_type,
                                    uint64_t *out_fields) {
   uint64_t fields = 0u;
   if (out_fields) *out_fields = 0u;
   if (!purposes) return 1;
   if (schema < 7u || !cJSON_IsArray(purposes) ||
-      cJSON_GetArraySize(purposes) > (schema >= 8u ? 2 : 1)) return 0;
+      cJSON_GetArraySize(purposes) > (schema >= 9u ? 3 : schema >= 8u ? 2 : 1)) return 0;
   const cJSON *purpose;
   cJSON_ArrayForEach(purpose, purposes) {
     uint64_t field;
@@ -1859,6 +1860,8 @@ static int p0_ir_evidence_purposes(const cJSON *purposes, unsigned schema,
     if (!strcmp(purpose->valuestring, "actor_attribution")) field = EDR_EVIDENCE_USER;
     else if (schema >= 8u && !strcmp(purpose->valuestring, "parent_context"))
       field = EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH | EDR_EVIDENCE_PARENT_COMMAND;
+    else if (schema >= 9u && !strcmp(event_type, "process_create") &&
+             !strcmp(purpose->valuestring, "subject_command")) field = EDR_EVIDENCE_COMMAND;
     else return 0;
     if (fields & field) return 0;
     fields |= field;
@@ -1934,7 +1937,7 @@ static int p0_condition_keys_supported(const char *event_type, const cJSON *cond
                 strcmp(key, "registry_dword_any") == 0;
     }
     if (schema_version >= 7u && !strcmp(key,"evidence_purposes")) {
-      if (!p0_ir_evidence_purposes(item, schema_version, NULL)) return 0;
+      if (!p0_ir_evidence_purposes(item, schema_version, event_type, NULL)) return 0;
       continue;
     }
     if (schema_version >= 5u && strcmp(key,"operation")==0 &&
@@ -2167,7 +2170,7 @@ static int p0_ir_retired_cookie_predicate(unsigned schema,const struct p0_ir_one
   int keys=cJSON_GetArraySize(condition);
   const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(condition,"evidence_purposes");
   if (purposes) {
-    if (!p0_ir_evidence_purposes(purposes, schema, NULL)) return 0;
+    if (!p0_ir_evidence_purposes(purposes, schema, rule->event_type, NULL)) return 0;
     keys--;
   }
   const cJSON *paths=cJSON_GetObjectItemCaseSensitive(condition,"file_path_regex_any");
@@ -2272,6 +2275,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
         (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
+         schema_version->valuedouble != 8.0 &&
          schema_version->valuedouble != 7.0 &&
          !(s_load_target->purpose_only && (schema_version->valuedouble == 5.0 ||
                                           schema_version->valuedouble == 6.0))) ||
@@ -2508,9 +2512,14 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     }
     const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(jcond,"evidence_purposes");
     if (t.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION && purposes && cJSON_GetArraySize(purposes)) { semantic_ok=0; break; }
-    /* Frozen IR5/6/7 ownership keeps its original mask. IR8 parent context is
-     * an independent consumer purpose, never inferred from an alert label. */
-    if (!p0_ir_evidence_purposes(purposes, parsed_schema_version, &t.required_evidence_fields)) { semantic_ok=0; break; }
+    /* Frozen IR5/6/7/8 ownership keeps its original mask. Optional parent and
+     * subject-command evidence are consumer purposes, never predicates. */
+    if (!p0_ir_evidence_purposes(purposes, parsed_schema_version, etbuf, &t.required_evidence_fields)) { semantic_ok=0; break; }
+    /* Operation evidence deliberately replaces raw credential-tool commands;
+     * an optional consumer purpose cannot reopen that disclosure boundary. */
+    if (t.operation && (t.required_evidence_fields & EDR_EVIDENCE_COMMAND)) {
+      p0_ir_free_pcre_in_rule(&t); semantic_ok=0; break;
+    }
     if (parsed_schema_version < 7u) t.required_evidence_fields = EDR_EVIDENCE_USER;
     if (t.n_cmd_any || t.n_cmd_all) t.required_evidence_fields |= EDR_EVIDENCE_COMMAND;
     if (t.n_parent_in || t.n_parent_not_in || t.n_pr_rx || t.n_pr_not_rx)

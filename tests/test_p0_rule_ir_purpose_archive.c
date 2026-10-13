@@ -1,6 +1,12 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/encrypt_p0_rules.h"
 #include "edr/sha256.h"
+#include "edr/ave_sdk.h"
+#include "edr/behavior_proto.h"
+#include "edr/egress_batch_policy.h"
+#include "edr/v1/event.pb.h"
+#include <pb_decode.h>
+#include <pb_encode.h>
 #include "cJSON.h"
 #include <assert.h>
 #include <stdio.h>
@@ -20,6 +26,75 @@
 #endif
 static void save(const char *path,const void *bytes,size_t size){FILE *f=fopen(path,"wb");assert(f);assert(fwrite(bytes,1,size,f)==size);assert(!fclose(f));}
 static unsigned char *read_bytes(const char *path,size_t *size){FILE *f=fopen(path,"rb");assert(f);assert(!fseek(f,0,SEEK_END));long n=ftell(f);assert(n>0);rewind(f);unsigned char *p=malloc((size_t)n);assert(p && fread(p,1,(size_t)n,f)==(size_t)n);fclose(f);*size=(size_t)n;return p;}
+static int retained_projection_owner(const char *rule,const char *sha,uint64_t fields,const char *operation,void *user) {
+ (void)user;return edr_p0_rule_ir_projection_matches(rule,sha,fields,operation);
+}
+static void current_consumer_projection_contract(void) {
+ static const struct {const char *rule,*name,*path,*command;} cases[]={
+  {"R-EXEC-002","powershell.exe","C:\\Windows\\System32\\powershell.exe","powershell.exe -w hidden -nop"},
+  {"R-SIGN-001","signtool.exe","C:\\Tools\\signtool.exe","signtool.exe sign C:\\Temp\\sample.exe"},
+  {"R-MITRE-WIN-T1044","icacls.exe","C:\\Windows\\System32\\icacls.exe","icacls.exe C:\\Temp\\sample.exe /grant Everyone:F"},
+  {"R-LOLBIN-010","cmd.exe","C:\\Temp\\cmd.exe","cmd.exe /c echo fixture"}
+ };
+ const uint64_t expected=EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_NAME|
+   EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+ EdrBehaviorRecord *r=calloc(1,sizeof(*r));edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));
+ uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*frozen=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&event&&wire&&frozen);
+ edr_egress_set_rule_projection_validator(retained_projection_owner,NULL);
+ for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) for(unsigned parent=0;parent<2;parent++)
+  for(unsigned command=0;command<(i==3?2u:1u);command++) {
+   edr_behavior_record_init(r);r->type=EDR_EVENT_PROCESS_CREATE;r->pid=42;
+   r->process_start_key=456;r->process_creation_filetime_100ns=789;r->event_time_ns=1700000000000000000LL;
+   r->ppid=parent?21:0;r->parent_pid_state=parent?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+   strcpy(r->event_id,"consumer-projection-fixture");strcpy(r->endpoint_id,"fixture-endpoint");strcpy(r->tenant_id,"fixture-tenant");
+   strcpy(r->process_name,cases[i].name);strcpy(r->exe_path,cases[i].path);
+   if(!command)strcpy(r->cmdline,cases[i].command);
+   strcpy(r->parent_resolution_status,parent?"RESOLVED":"NOT_EVALUABLE");
+   strcpy(r->parent_resolution_source,parent?"process_tree_cache_verified":"generation_unavailable");
+   if(parent) {
+    strcpy(r->parent_name,"launcher.exe");strcpy(r->parent_path,"C:\\Tools\\launcher.exe");
+    strcpy(r->parent_cmdline,"launcher.exe --captured");strcpy(r->parent_creation_time,"2026-10-09T08:00:08.063129700Z");
+   }
+   EdrP0RuleIrEvaluation eval;EdrP0RuleIrMatch match={0};int found=0;
+   assert(edr_p0_rule_ir_evaluate_record(r,NULL,&eval));
+   for(uint32_t m=0;m<eval.match_count;m++) {
+    assert(edr_p0_rule_ir_evaluation_get_match(&eval,m,&match));
+    if(!strcmp(match.rule_id,cases[i].rule)){found=1;break;}
+   }
+   if(!found)fprintf(stderr,"consumer projection did not match %s parent=%u command_missing=%u\n",cases[i].rule,parent,command);
+   assert(found&&match.required_evidence_fields==expected);
+   r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;r->required_evidence_fields=match.required_evidence_fields;
+   AVEBehaviorAlert alert={0};alert.pid=r->pid;alert.timestamp_ns=r->event_time_ns;alert.anomaly_score=.7f;
+   int written=snprintf(alert.user_subject_json,sizeof(alert.user_subject_json),
+    "{\"subject_type\":\"edr_dynamic_rule\",\"rule_id\":\"%s\",\"rules_bundle_version\":\"%s\","
+    "\"rules_bundle_sha256\":\"%s\",\"context\":{\"pid\":42,\"event_type\":%d,"
+    "\"source_event_id\":\"consumer-projection-fixture\",\"endpoint_id\":\"fixture-endpoint\",\"tenant_id\":\"fixture-tenant\"}}",
+    match.rule_id,eval.binding.rules_bundle_version,eval.binding.artifact_sha256,(int)r->type);
+   assert(written>0&&(size_t)written<sizeof(alert.user_subject_json));edr_p0_rule_ir_evaluation_free(&eval);
+   size_t n=edr_behavior_record_alert_encode_protobuf(r,&alert,wire,EDR_EGRESS_FRAME_MAX);assert(n);
+   pb_istream_t in=pb_istream_from_buffer(wire,n);memset(event,0,sizeof(*event));
+   assert(pb_decode(&in,edr_v1_BehaviorEvent_fields,event));
+   assert(!strcmp(event->cmdline,r->cmdline));
+   assert(event->has_process_context&&event->process_context.has_parent_name==(bool)parent);
+   assert(event->process_context.has_parent_path==(bool)parent&&event->process_context.has_parent_cmdline==(bool)parent);
+   assert(!strcmp(event->process_context.parent_name,r->parent_name)&&!strcmp(event->process_context.parent_path,r->parent_path));
+   assert(!strcmp(event->process_context.parent_cmdline,r->parent_cmdline));
+   assert(!strcmp(event->parent_resolution_status,r->parent_resolution_status)&&!strcmp(event->parent_resolution_source,r->parent_resolution_source));
+   assert(!strcmp(event->parent_creation_time,r->parent_creation_time)&&event->ppid==r->ppid);
+   assert(event->process_start_key==r->process_start_key&&event->process_creation_filetime_100ns==r->process_creation_filetime_100ns);
+   assert(strstr(event->behavior_alert.user_subject_json,cases[i].rule));
+   memcpy(frozen,wire,n);assert(edr_egress_frame_validate(wire,n,NULL,0));
+   assert(edr_egress_frame_validate(wire,n,NULL,0)&&!memcmp(wire,frozen,n));
+   /* Self-reported masks cannot extend the retained rule's authority, even
+    * when the newly requested field is absent from these exact bytes. */
+   event->required_evidence_fields|=EDR_EVIDENCE_FILE;
+   pb_ostream_t out=pb_ostream_from_buffer(wire,EDR_EGRESS_FRAME_MAX);
+   assert(pb_encode(&out,edr_v1_BehaviorEvent_fields,event));
+   assert(!edr_egress_frame_validate(wire,out.bytes_written,NULL,0));
+  }
+ edr_egress_set_rule_projection_validator(NULL,NULL);free(r);free(event);free(wire);free(frozen);
+ puts("four current rules: retained match -> serializer -> immutable egress; parent gaps stay explicit and LOLBIN missing command still matches");
+}
 static void legacy_purpose_contract(const char *base,const unsigned char *plain,size_t size,
                                     const EdrP0RuleIrMatch *valid) {
  cJSON *j=cJSON_ParseWithLength((const char*)plain,size);assert(j);
@@ -133,7 +208,14 @@ static void parent_purpose_contract(const char *base,const unsigned char *plain,
   cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"ir_schema_version"),schema);
   cJSON_ArrayForEach(item,cJSON_GetObjectItemCaseSensitive(j,"rules"))
    if(!strcmp(cJSON_GetObjectItemCaseSensitive(item,"id")->valuestring,"R-EXEC-001"))rule=item;
-  assert(rule);cJSON *condition=cJSON_GetObjectItemCaseSensitive(rule,"condition");
+  assert(rule);
+  /* Freeze this historical rule independently of newer purposes on unrelated
+   * current rules; relabeling an entire IR9 bundle as IR7/8 is not a fixture. */
+  cJSON *single=cJSON_CreateArray(),*frozen_rule=cJSON_Duplicate(rule,1);assert(single&&frozen_rule);
+  assert(cJSON_AddItemToArray(single,frozen_rule));
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(j,"rules",single));
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(j,"rule_count"),1);
+  cJSON *condition=cJSON_GetObjectItemCaseSensitive(frozen_rule,"condition");
   cJSON_DeleteItemFromObjectCaseSensitive(condition,"evidence_purposes");
   cJSON *purposes=cJSON_AddArrayToObject(condition,"evidence_purposes");assert(purposes);
   assert(cJSON_AddItemToArray(purposes,cJSON_CreateString("actor_attribution")));
@@ -155,6 +237,33 @@ static void parent_purpose_contract(const char *base,const unsigned char *plain,
  }
  puts("IR7 and IR8 parent purpose archives: exact independent masks and frozen bytes survive restart");
 }
+static void subject_command_purpose_contract(const char *base) {
+ for(unsigned schema=7;schema<=9;schema++) {
+  char json[1024],sha[65],archive[400];unsigned char *encrypted=NULL;size_t encrypted_size=0;
+  int n=snprintf(json,sizeof(json),
+   "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":%u,"
+   "\"rules_bundle_version\":\"synthetic-subject-purpose\",\"rule_count\":1,"
+   "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+   "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
+   "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"synthetic-subject\",\"event_type\":\"process_create\","
+   "\"condition\":{\"process_name_in\":[\"tool.exe\"]%s}}]}",schema,
+   schema==9?",\"evidence_purposes\":[\"subject_command\"]":"");
+  assert(n>0&&(size_t)n<sizeof(json));
+  assert(edr_sha256_hex((const uint8_t*)json,(size_t)n,sha)==0);
+  assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)json,(size_t)n,&encrypted,&encrypted_size)==0);
+  snprintf(archive,sizeof(archive),"%s.purpose-%s.edr1",base,sha);save(archive,encrypted,encrypted_size);
+  assert(edr_p0_rule_ir_validate_candidate_path(archive));
+  const uint64_t expected=schema==9?EDR_EVIDENCE_COMMAND:0;
+  for(int restart=0;restart<2;restart++) {
+   assert(edr_p0_rule_ir_projection_matches("synthetic-subject",sha,expected,"")==1);
+   assert(edr_p0_rule_ir_projection_matches("synthetic-subject",sha,expected^EDR_EVIDENCE_COMMAND,"")==0);
+   edr_p0_rule_ir_shutdown();edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+  }
+  size_t after_size;unsigned char *after=read_bytes(archive,&after_size);
+  assert(after_size==encrypted_size&&!memcmp(after,encrypted,after_size));free(after);free(encrypted);
+ }
+ puts("IR7/8/9 subject-command authority: historical zero masks and IR9 command mask remain exact after restart; archive bytes unchanged");
+}
 int main(void){
  static const struct {const char *id;unsigned schema;int retired;const char *rule;} corpus[]={
 #include "../src/preprocess/p0_retired_purpose_vectors.inc"
@@ -175,10 +284,12 @@ int main(void){
  snprintf(base,sizeof(base),"p0-purpose-test-%lu.edr1",pid);snprintf(stage,sizeof(stage),"p0-purpose-stage-%lu.edr1",pid);
  assert(setenv("EDR_P0_IR_PATH",base,1)==0);assert(setenv("EDR_P0_PURPOSE_ARCHIVE_BASE",base,1)==0);save(base,raw,size);
  edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+ current_consumer_projection_contract();
  EdrBehaviorRecord br;edr_behavior_record_init(&br);br.type=EDR_EVENT_PROCESS_CREATE;strcpy(br.process_name,"procdump.exe");strcpy(br.cmdline,"procdump.exe -ma lsass C:\\Temp\\lsass.dmp");
  EdrP0RuleIrEvaluation eval;assert(edr_p0_rule_ir_evaluate_record(&br,NULL,&eval));assert(eval.match_count);EdrP0RuleIrMatch match;assert(edr_p0_rule_ir_evaluation_get_match(&eval,0,&match));char sha[65];strcpy(sha,eval.binding.artifact_sha256);edr_p0_rule_ir_evaluation_free(&eval);
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));
  parent_purpose_contract(base,plain,plain_size);
+ subject_command_purpose_contract(base);
  legacy_purpose_contract(base,plain,plain_size,&match);
  dump_purpose_contract(base,plain,plain_size,&match);
  cookie_purpose_contract(base,plain,plain_size,&match);

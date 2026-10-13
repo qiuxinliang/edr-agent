@@ -2057,7 +2057,11 @@ if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   edr_apply_test_warnings(test_p0_operation)
   add_test(NAME p0_operation COMMAND test_p0_operation)
   set_tests_properties(p0_operation PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
-  add_executable(test_p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive.c ${_p0_operation_sources})
+  add_executable(test_p0_rule_ir_purpose_archive test_p0_rule_ir_purpose_archive.c ${_p0_operation_sources}
+    ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+    ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
   target_include_directories(test_p0_rule_ir_purpose_archive PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
   target_compile_definitions(test_p0_rule_ir_purpose_archive PRIVATE
     EDR_P0_ENCRYPT_TESTING=1 EDR_P0_RULE_IR_TESTING=1 EDR_HAVE_OPENSSL_FL=1)

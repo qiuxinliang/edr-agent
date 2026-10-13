@@ -32,7 +32,7 @@ class PrivateP0InputTests(unittest.TestCase):
         sensor = dict(kind="edr_sensor_interest_manifest", p0_artifact_rule_count=1,
                       rules_bundle_version="synthetic", p0_artifact_sha256="0" * 64)
         raw = lambda value: (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
-        ir = dict(kind="edr_p0_rule_bundle_ir_v1", ir_schema_version=8, rule_count=1,
+        ir = dict(kind="edr_p0_rule_bundle_ir_v1", ir_schema_version=9, rule_count=1,
                   rules=[{"id": "SYNTHETIC"}], rules_bundle_version="synthetic",
                   sensor_interest_manifest_hash_mode="raw-json-v1-p0-artifact-sha256-zeroed",
                   sensor_interest_manifest_sha256=hashlib.sha256(raw(sensor)).hexdigest())
@@ -48,6 +48,30 @@ class PrivateP0InputTests(unittest.TestCase):
                         "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
                         "commit", "-qm", "synthetic test input"], check=True)
         self.ref = subprocess.check_output(["git", "-C", str(self.directory), "rev-parse", "HEAD"], text=True).strip()
+
+    def test_ir7_ir8_ir9_inputs_remain_bound_and_future_schema_rejects(self):
+        ir_path, wire_path, sensor_path = (self.directory / name for name in cp.P0_TEST_INPUT_FILES)
+        ir, sensor = json.loads(ir_path.read_bytes()), json.loads(sensor_path.read_bytes())
+        raw = lambda value: (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+        key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+        for schema in (7, 8, 9, 10):
+            with self.subTest(schema=schema):
+                ir["ir_schema_version"] = schema
+                plain = raw(ir)
+                sensor["p0_artifact_sha256"] = hashlib.sha256(plain).hexdigest()
+                ir_path.write_bytes(plain)
+                wire_path.write_bytes(envelope.aes_256_gcm_encrypt(plain, key))
+                sensor_path.write_bytes(raw(sensor))
+                subprocess.run(["git", "-C", str(self.directory), "add", "--", *cp.P0_TEST_INPUT_FILES], check=True)
+                subprocess.run(["git", "-C", str(self.directory), "-c", "user.name=P0 fixture",
+                                "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
+                                "commit", "-qm", "synthetic schema input"], check=True)
+                ref = subprocess.check_output(["git", "-C", str(self.directory), "rev-parse", "HEAD"], text=True).strip()
+                if schema == 10:
+                    with self.assertRaises(ValueError):
+                        cp.verify_p0_test_inputs(self.directory, ref)
+                else:
+                    self.assertRegex(cp.verify_p0_test_inputs(self.directory, ref), r"^[0-9a-f]{64}$")
 
     def test_exact_snapshot_produces_bound_digest_and_release_source(self):
         sha = cp.verify_p0_test_inputs(self.directory, self.ref)
