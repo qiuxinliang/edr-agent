@@ -61,7 +61,7 @@ RUNTIME_EXPECTED = {
     "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
     "webshell_semantic_rules", "pmfe_scan_detail_format", "command_signature_cross_language",
     "storage_queue_sqlite_contract", "p0_source_only_durable_contract", "p0_runtime_delivery", "p0_rule_ir_record_golden",
-    "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit",
+    "p0_rule_ir_exclusions", "p0_validation_matrix", "windows_rule_semantic_audit", "process_command_admission",
     "pmfe_same_region_evidence", "pmfe_injection_generation",
     "periodic_schedule_boundaries", "attack_surface_sampled_groups", "attack_surface_command_admission",
     "log_rotation_retention_and_restart", "conditional_policy_authenticated_cache",
@@ -410,6 +410,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_missing_runtime_target_fails_at_configuration(self):
         for target in ("test_request_signing", "test_security_event_xml", "test_process_create_coalescer",
+                       "test_process_command_admission",
                        "test_p0_candidate_replay", "test_p0_runtime_delivery", "test_ave_parent_integrity"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_target=target)
@@ -422,6 +423,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
         names = ("request_signing", "storage_queue_sqlite_contract", "detection_sensor_bridge",
                      "behavior_record_alert_proto_contract", "command_signature_cross_language",
                      "security_event_xml_bounded_command_line", "process_create_coalescer_state_machine",
+                     "process_command_admission",
                      "windows_rule_semantic_audit", "installer_runtime_health_classification",
                      "report_events_ack_contract", "p0_runtime_delivery", "ave_parent_integrity")
         if os.name != "nt":
