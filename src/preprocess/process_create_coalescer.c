@@ -192,19 +192,22 @@ static int kernel_independent_of_4688(const EdrBehaviorRecord *record) {
 }
 
 static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *security) {
-  int kernel_cmd_explicitly_truncated;
+  int kernel_cmd_incomplete;
   int security_cmd_truncated;
   int kernel_parent_bound;
   if (!kernel || !security) return;
   kernel_parent_bound = edr_behavior_parent_context_bound(kernel);
-  kernel_cmd_explicitly_truncated =
+  kernel_cmd_incomplete =
       source_list_has(kernel->source_truncated_fields, "source.cmdline",
-                      sizeof("source.cmdline") - 1u);
+                      sizeof("source.cmdline") - 1u) ||
+      source_list_has(kernel->source_truncated_fields, "source.cmdline_quality_unknown",
+                      sizeof("source.cmdline_quality_unknown") - 1u);
   security_cmd_truncated = source_field_truncated(security->source_truncated_fields,
-                                                  "source.cmdline");
+                                                  "source.cmdline") ||
+      source_field_truncated(security->source_truncated_fields, "source.cmdline_quality_unknown");
   if (security->cmdline[0] &&
       (!kernel->cmdline[0] ||
-       (kernel_cmd_explicitly_truncated && !security_cmd_truncated))) {
+       (kernel_cmd_incomplete && !security_cmd_truncated))) {
     memcpy(kernel->cmdline, security->cmdline, sizeof(kernel->cmdline));
     memcpy(kernel->command_line_origin, security->command_line_origin,
            sizeof(kernel->command_line_origin));
@@ -212,11 +215,18 @@ static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *secur
       remove_source_list_item(kernel->source_truncated_fields,
                               sizeof(kernel->source_truncated_fields),
                               "source.cmdline");
+      remove_source_list_item(kernel->source_truncated_fields,
+                              sizeof(kernel->source_truncated_fields),
+                              "source.cmdline_quality_unknown");
     }
     merge_adopted_field_truncation(kernel->source_truncated_fields,
                                    sizeof(kernel->source_truncated_fields),
                                    security->source_truncated_fields,
                                    "source.cmdline");
+    merge_adopted_field_truncation(kernel->source_truncated_fields,
+                                   sizeof(kernel->source_truncated_fields),
+                                   security->source_truncated_fields,
+                                   "source.cmdline_quality_unknown");
   }
   /* A captured parent lifetime owns its incomplete text too. An advisory
    * 4688 observation has no proof for that parent generation; only the exact

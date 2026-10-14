@@ -187,6 +187,11 @@ int edr_p0_rule_ir_rule_id_at(int index, const char **out_id);
 int edr_p0_rule_ir_br_matches_index(const EdrBehaviorRecord *br, int index);
 /* 采集/缓存前置降噪：判断事件、端口或进程名是否落入 P0 动态规则兴趣面。 */
 int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br);
+/* A process command is absent/incomplete and at least one command-dependent
+ * rule cannot yet be excluded by reliable observed fields. This only reserves
+ * bounded correlation/source retention; it never authorizes an alert, action,
+ * or optional file scan. Complete commands retain the existing matching path. */
+int edr_p0_rule_ir_process_create_command_pending(const EdrBehaviorRecord *br);
 int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port);
 int edr_p0_rule_ir_is_interesting_process_name(const char *process_name);
 

@@ -88,6 +88,19 @@ int main(void) {
     free(source);
     return 3;
   }
+  /* The IR/coalescer integration test covers the partial-command behavior;
+   * this source contract protects its pressure and optional-I/O wiring. */
+  const char *pending_guard = strstr(throttle_proven_miss,
+      "if (edr_p0_rule_ir_process_create_command_pending(br)) return 0;");
+  const char *miss_return = strstr(throttle_proven_miss,
+      "return edr_p0_rule_ir_br_matches_any(br) ? 0 : 1;");
+  if (!pending_guard || !miss_return || pending_guard >= miss_return ||
+      !strstr(source, "!p0_process_evidence_candidate(br)") ||
+      !strstr(source, "if (evidence_candidate && !br.is_security_4688) {")) {
+    fprintf(stderr, "incomplete commands must survive pressure without expanding optional file scans\n");
+    free(source);
+    return 4;
+  }
   free(source);
   return 0;
 }

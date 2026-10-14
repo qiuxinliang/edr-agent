@@ -335,8 +335,8 @@ int main(void) {
   /* A complete generation-bound Kernel/live command is the selected value;
    * a clipped 4688 prefix must not revoke it merely because other 4688 fields
    * are useful enrichment. */
-  edr_process_coalescer_reset();
-  {
+  for (unsigned unknown = 0; unknown < 2; ++unknown) {
+    edr_process_coalescer_reset();
     static EdrBehaviorRecord kernel;
     static EdrBehaviorRecord security;
     rec(&kernel, 911u, 0, 0xa111u, "C:\\kernel-complete.exe", 1110000000LL);
@@ -346,7 +346,7 @@ int main(void) {
              "live_same_generation");
     snprintf(security.cmdline, sizeof(security.cmdline), "%s", "kernel-complete.exe --clipped");
     snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
-             "source.cmdline,source.exe_hash");
+             unknown ? "source.cmdline_quality_unknown,source.exe_hash" : "source.cmdline,source.exe_hash");
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
@@ -358,27 +358,27 @@ int main(void) {
 
   /* When Kernel has no command, the 4688 prefix becomes the selected value and
    * its truncation declaration must remain attached to that value. */
-  edr_process_coalescer_reset();
-  {
+  for (unsigned unknown = 0; unknown < 2; ++unknown) {
+    edr_process_coalescer_reset();
     static EdrBehaviorRecord kernel;
     static EdrBehaviorRecord security;
     rec(&kernel, 912u, 0, 0xa112u, "C:\\security-prefix.exe", 1120000000LL);
     rec(&security, 912u, 1, 0u, "C:\\security-prefix.exe", 1120000100LL);
     snprintf(security.source_truncated_fields, sizeof(security.source_truncated_fields), "%s",
-             "source.cmdline");
+             unknown ? "source.cmdline_quality_unknown" : "source.cmdline");
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
                    strcmp(out.cmdline, security.cmdline) == 0 &&
-                   strstr(out.source_truncated_fields, "source.cmdline") != NULL,
+                   strcmp(out.source_truncated_fields, security.source_truncated_fields) == 0,
                "selected truncated 4688 command keeps source.cmdline provenance");
   }
 
   /* A complete 4688 command can replace a clipped Kernel value from the same
    * bounded correlation. Only the superseded command marker is removed; other
    * Kernel source omissions remain conservative. */
-  edr_process_coalescer_reset();
-  {
+  for (unsigned quality = 0; quality < 3; ++quality) {
+    edr_process_coalescer_reset();
     static EdrBehaviorRecord kernel;
     static EdrBehaviorRecord security;
     rec(&kernel, 913u, 0, 0xa113u, "C:\\security-complete.exe", 1130000000LL);
@@ -386,14 +386,16 @@ int main(void) {
     snprintf(kernel.cmdline, sizeof(kernel.cmdline), "%s", "security-complete.exe --kernel-prefix");
     snprintf(kernel.source_completeness, sizeof(kernel.source_completeness), "%s", "TRUNCATED");
     snprintf(kernel.source_truncated_fields, sizeof(kernel.source_truncated_fields), "%s",
-             "source.cmdline");
+             quality == 0 ? "source.cmdline,source.exe_hash" : quality == 1
+                 ? "source.cmdline_quality_unknown,source.exe_hash"
+                 : "source.cmdline,source.cmdline_quality_unknown,source.exe_hash");
     snprintf(security.cmdline, sizeof(security.cmdline), "%s",
              "security-complete.exe --complete-security-command");
     ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
                    edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1 &&
                    strcmp(out.cmdline, security.cmdline) == 0 &&
-                   !strstr(out.source_truncated_fields, "source.cmdline"),
+                   strcmp(out.source_truncated_fields, "source.exe_hash") == 0,
                "complete 4688 command replaces truncated Kernel command and clears its marker");
   }
 

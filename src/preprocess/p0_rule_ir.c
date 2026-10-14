@@ -334,17 +334,21 @@ static int name_in_list(const char *full_lower, const char (*list)[128], int n) 
   return 0;
 }
 
-static int pcre2_ok_one(const pcre2_code *re, const char *s) {
+static int pcre2_result_one(const pcre2_code *re, const char *s) {
   PCRE2_SIZE sl = s ? strlen(s) : 0;
   pcre2_match_data *md = pcre2_match_data_create_from_pattern((pcre2_code *)re, NULL);
   if (!md) {
-    return 0;
+    return PCRE2_ERROR_NOMEMORY;
   }
   int rc = pcre2_match(
       (pcre2_code *)re, (PCRE2_SPTR) s, sl, 0, 0, md, NULL
   );
   pcre2_match_data_free(md);
-  return (rc >= 0) ? 1 : 0;
+  return rc;
+}
+
+static int pcre2_ok_one(const pcre2_code *re, const char *s) {
+  return pcre2_result_one(re, s) >= 0;
 }
 
 static int any_pcre(pcre2_code *const *res, int n, const char *s) {
@@ -3226,6 +3230,68 @@ int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
       p0_ir_snapshot_release(snapshot);
       return 1;
     }
+  }
+  p0_ir_snapshot_release(snapshot);
+  return 0;
+}
+
+/* A regex error is unknown, not proof that an incomplete record is ordinary. */
+static int p0_ir_patterns_prove_miss(pcre2_code *const *patterns, int count,
+                                    const char *value) {
+  if (!count) return 0;
+  for (int i = 0; i < count; ++i) {
+    if (!patterns[i] || pcre2_result_one(patterns[i], value) != PCRE2_ERROR_NOMATCH)
+      return 0;
+  }
+  return 1;
+}
+
+int edr_p0_rule_ir_process_create_command_pending(const EdrBehaviorRecord *br) {
+  p0_ir_candidate *snapshot;
+  const char *name, *parent, *path;
+  char name_lower[1024], parent_lower[1024];
+  if (!br || br->type != EDR_EVENT_PROCESS_CREATE) return 0;
+  if (!p0_ir_source_markers_valid(br) || edr_behavior_p0_source_quality_hard_reject(br))
+    return 1;
+  if (br->cmdline[0] &&
+      !edr_behavior_source_field_truncated(br, "source.cmdline") &&
+      !edr_behavior_source_field_truncated(br, "source.cmdline_quality_unknown"))
+    return 0;
+
+  edr_p0_rule_ir_lazy_init();
+  snapshot = p0_ir_snapshot_acquire();
+  if (!snapshot || !snapshot->ready) {
+    p0_ir_snapshot_release(snapshot);
+    return 1;
+  }
+  name = p0_exclusion_field_available(br, "source.process_name", br->process_name)
+      ? br->process_name : NULL;
+  parent = edr_behavior_parent_context_bound(br) &&
+      p0_exclusion_field_available(br, "source.parent_name", br->parent_name)
+      ? br->parent_name : NULL;
+  path = strcmp(br->image_path_resolution_status, "RESOLVED") == 0 &&
+      !edr_behavior_source_field_truncated(br, "source.image_path_resolution_status") &&
+      !edr_behavior_source_field_truncated(br, "source.image_path_canonical") &&
+      p0_exclusion_field_available(br, "source.exe_path", br->exe_path)
+      ? br->exe_path : NULL;
+  ascii_lower_truncate(name_lower, sizeof(name_lower), name);
+  ascii_lower_truncate(parent_lower, sizeof(parent_lower), parent);
+  for (int i = 0; i < snapshot->n; ++i) {
+    const struct p0_ir_one *rule = &snapshot->rule[i];
+    if (!rule->in_use || strcmp(rule->event_type, "process_create") != 0 ||
+        (!rule->n_cmd_any && !rule->n_cmd_all && !rule->operation)) continue;
+    if (name && ((rule->n_name_in &&
+          !name_in_list(name_lower, (const char (*)[128])rule->name_in, rule->n_name_in)) ||
+        p0_ir_patterns_prove_miss(rule->re_pn_rx, rule->n_pn_rx, name))) continue;
+    if (parent && ((rule->n_parent_in &&
+          !name_in_list(parent_lower, (const char (*)[128])rule->parent_in, rule->n_parent_in)) ||
+        p0_ir_patterns_prove_miss(rule->re_pr_rx, rule->n_pr_rx, parent))) continue;
+    if (path && p0_ir_patterns_prove_miss(rule->re_ppath_rx, rule->n_ppath_rx, path)) continue;
+    if (p0_rule_excludes_fields(rule, br, name, parent, NULL, NULL)) continue;
+    /* Command/operation predicates remain unknown. Chain depth may also be
+     * enriched later; a partial chain cannot prove an upper bound. */
+    p0_ir_snapshot_release(snapshot);
+    return 1;
   }
   p0_ir_snapshot_release(snapshot);
   return 0;

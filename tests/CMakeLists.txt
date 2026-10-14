@@ -1208,6 +1208,28 @@ if(EDR_PCRE2_AVAILABLE)
   set_tests_properties(p0_rule_ir_record_golden PROPERTIES
     ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
 
+  get_target_property(_process_command_ir_sources test_p0_rule_ir_record_golden SOURCES)
+  list(REMOVE_ITEM _process_command_ir_sources ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c)
+  add_executable(test_process_command_admission test_process_command_admission.c
+    ${_process_command_ir_sources} ${CMAKE_SOURCE_DIR}/src/preprocess/process_create_coalescer.c)
+  target_include_directories(test_process_command_admission PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_compile_definitions(test_process_command_admission PRIVATE EDR_P0_RULE_IR_TESTING=1)
+  if(EDR_PCRE2_TARGET)
+    target_link_libraries(test_process_command_admission PRIVATE ${EDR_PCRE2_TARGET})
+  else()
+    target_include_directories(test_process_command_admission PRIVATE ${EDR_PCRE2_INCLUDE_DIR})
+    target_link_libraries(test_process_command_admission PRIVATE ${EDR_PCRE2_LIBRARY})
+  endif()
+  if(NOT WIN32)
+    target_link_libraries(test_process_command_admission PRIVATE Threads::Threads)
+  endif()
+  edr_apply_test_warnings(test_process_command_admission)
+  add_test(NAME process_command_admission COMMAND test_process_command_admission)
+  set_tests_properties(process_command_admission PROPERTIES
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json"
+    TIMEOUT 60)
+
   add_executable(test_p0_rule_ir_exclusions
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_rule_ir_exclusions.c
     ${EDR_P0_RULE_IR_IMPLEMENTATION_SOURCE}
@@ -2164,7 +2186,7 @@ endif()
 
 if(NOT EDR_P0_TEST_CONFIG_AVAILABLE)
   foreach(_p0_integration p0_source_only_durable_contract p0_observation_semantics
-      p0_rule_ir_record_golden p0_rule_ir_snapshot p0_validation_matrix
+      p0_rule_ir_record_golden p0_rule_ir_snapshot p0_validation_matrix process_command_admission
       p0_operation p0_rule_ir_purpose_archive
       windows_rule_semantic_audit etw_network_decode_native)
     if(TEST ${_p0_integration})

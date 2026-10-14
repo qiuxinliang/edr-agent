@@ -133,6 +133,11 @@ int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *br) {
   return 0;
 }
 
+int edr_p0_rule_ir_process_create_command_pending(const EdrBehaviorRecord *br) {
+  /* An unavailable matcher cannot prove a partial process record ordinary. */
+  return br && br->type == EDR_EVENT_PROCESS_CREATE;
+}
+
 int edr_p0_rule_ir_is_interesting_remote_port(uint32_t port) {
   (void)port;
   return 0;

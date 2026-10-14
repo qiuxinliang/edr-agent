@@ -1268,16 +1268,25 @@ static void poll_summary_flush(void) {
   edr_local_evidence_cache_flush_summaries(now_ns, NULL);
 }
 
-static int p0_process_create_candidate(const EdrBehaviorRecord *br) {
+static int p0_process_evidence_candidate(const EdrBehaviorRecord *br) {
 #ifdef _WIN32
   if (!br || br->type != EDR_EVENT_PROCESS_CREATE) return 0;
-  /* Fast manifest-backed prefilter.  A full rule match is allowed when all
-   * fields are present; otherwise only a process/path interest match may
-   * reserve bounded coalescer capacity. */
+  /* Keep optional hash/signature work on its existing interest surface.
+   * Waiting for an incomplete command must not itself start a file scan. */
   if (edr_p0_rule_ir_br_matches_any(br)) return 1;
   return edr_p0_rule_ir_is_interesting_process_name(br->process_name) ||
          edr_p0_rule_ir_is_interesting_process_name(br->exe_path) ||
          edr_p0_rule_ir_is_interesting_process_name(br->image_path_canonical);
+#else
+  (void)br;
+  return 0;
+#endif
+}
+
+static int p0_process_create_candidate(const EdrBehaviorRecord *br) {
+#ifdef _WIN32
+  return edr_p0_rule_ir_process_create_command_pending(br) ||
+         p0_process_evidence_candidate(br);
 #else
   (void)br;
   return 0;
@@ -1342,7 +1351,7 @@ static int apply_process_evidence(EdrBehaviorRecord *br, const EdrEventSlot *slo
 #ifdef _WIN32
   EdrProcessEvidence evidence;
   if (!edr_behavior_has_process_actor(br)) return 1;
-  if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_create_candidate(br)) ||
+  if ((br->type == EDR_EVENT_PROCESS_CREATE && !p0_process_evidence_candidate(br)) ||
       (br->type != EDR_EVENT_PROCESS_CREATE && !edr_p0_rule_ir_br_matches_any(br))) return 1;
   uint64_t now = edr_monotonic_ns();
   int ready = edr_process_evidence_request(
@@ -1384,6 +1393,7 @@ static int p0_resource_throttle_proven_miss(const EdrBehaviorRecord *br) {
    * This is an unknown result, never a proven miss for pressure shedding. */
   if (edr_behavior_source_field_truncated(br, "source.cmdline") ||
       edr_behavior_source_field_truncated(br, "source.cmdline_quality_unknown")) return 0;
+  if (edr_p0_rule_ir_process_create_command_pending(br)) return 0;
   return edr_p0_rule_ir_br_matches_any(br) ? 0 : 1;
 }
 
@@ -1707,9 +1717,11 @@ static void process_one_slot(const EdrEventSlot *slot) {
                                          "identity_enriched");
       edr_local_evidence_cache_observe_process(&br);
     }
-    int candidate = p0_process_create_candidate(&br);
+    int evidence_candidate = p0_process_evidence_candidate(&br);
+    int candidate = evidence_candidate ||
+        edr_p0_rule_ir_process_create_command_pending(&br);
     /* Start bounded evidence work before waiting for an out-of-order 4688. */
-    if (candidate && !br.is_security_4688) {
+    if (evidence_candidate && !br.is_security_4688) {
       EdrProcessEvidence ignored;
       (void)edr_process_evidence_request(br.image_path_canonical[0] ? br.image_path_canonical : br.exe_path,
                                          br.process_start_key,
