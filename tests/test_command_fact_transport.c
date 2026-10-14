@@ -8,6 +8,7 @@
 #include "edr/p0_rule_ir.h"
 #include "edr/egress_batch_policy.h"
 #include "edr/evidence_projection.h"
+#include "../src/preprocess/parent_context_snapshot.h"
 #ifdef EDR_P0_TEST_REAL_IR
 #include "edr/p0_rule_direct_emit.h"
 #endif
@@ -71,6 +72,73 @@ static void identity(EdrBehaviorRecord *r, uint32_t pid) {
   strcpy(r->endpoint_id, "ep-command-fact"); strcpy(r->tenant_id, "tenant-command-fact");
   r->pid = pid; r->process_start_key = UINT64_C(15481123719095963) + pid;
   r->process_creation_filetime_100ns = UINT64_C(134346261457945144) + pid;
+}
+
+static void bind_parent_for_command_fact(EdrBehaviorRecord *child,
+                                         const EdrBehaviorRecord *parent,
+                                         const char *command) {
+  EdrCommandFacts unproven = {0};
+  const uint64_t parent_birth = p0_parent_birth_ns(parent->process_creation_filetime_100ns);
+  const uint64_t child_birth = p0_parent_birth_ns(child->process_creation_filetime_100ns);
+  edr_behavior_clear_parent_context(child);
+  child->parent_process_start_key = parent->process_start_key;
+  child->parent_process_creation_filetime_100ns = parent->process_creation_filetime_100ns;
+  strcpy(child->parent_resolution_source, "live_parent_generation");
+  strcpy(child->parent_resolution_status, "RESOLVED");
+  edr_behavior_mark_source_truncated(child, "source.cmdline");
+  /* A label and tuple alone used to stand in for adoption in this fixture.
+   * They must not authorize reading another process's complete command. */
+  assert(!edr_behavior_parent_context_bound(child));
+  edr_local_evidence_cache_resolve_commands(child, &unproven.subject, &unproven.parent);
+  assert(unproven.subject && !strcmp(unproven.subject, command) && !unproven.parent);
+  free(unproven.subject);
+  edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(parent->pid, 0u, parent->process_name,
+      "inert.exe", parent->exe_path, NULL, parent_birth,
+      parent->process_start_key, parent->process_creation_filetime_100ns) == 0);
+  assert(!p0_enrich_parent_context(child, NULL));
+  assert(!edr_behavior_parent_context_bound(child));
+  assert(edr_pt_cache_mark_alive_generation(parent->pid, parent->process_start_key,
+      parent->process_creation_filetime_100ns, child_birth) == 0);
+  /* Use the production adoption boundary after a real lifetime witness,
+   * then remove the hot cache before command resolution and transport. */
+  assert(p0_enrich_parent_context(child, NULL));
+  assert(edr_behavior_parent_context_bound(child));
+  assert(child->parent_process_start_key == parent->process_start_key &&
+      child->parent_process_creation_filetime_100ns == parent->process_creation_filetime_100ns);
+  edr_pt_cache_shutdown();
+}
+
+static void verify_bound_command_reference(const EdrBehaviorRecord *child,
+                                           const char *command) {
+  EdrBehaviorRecord *copy = malloc(sizeof(*copy)); assert(copy);
+  for (unsigned variant = 0; variant < 12u; ++variant) {
+    EdrCommandFacts facts = {0};
+    *copy = *child;
+    copy->parent_cmdline[0] = 0;
+    switch (variant) {
+      case 1: memset(&copy->parent_context_binding, 0, sizeof(copy->parent_context_binding)); break;
+      case 2: ++copy->process_start_key; break;
+      case 3: ++copy->process_creation_filetime_100ns; break;
+      case 4: ++copy->parent_process_start_key; break;
+      case 5: ++copy->parent_process_creation_filetime_100ns; break;
+      case 6: ++copy->ppid; break;
+      case 7: strcpy(copy->parent_resolution_status, "CONFLICT"); break;
+      case 8: strcpy(copy->parent_resolution_source, "source_reported"); break;
+      case 9: copy->parent_pid_state = EDR_PARENT_PID_CONFLICT; break;
+      case 10: copy->tenant_id[0] = 'X'; break;
+      case 11: copy->endpoint_id[0] = 'X'; break;
+      default: break;
+    }
+    edr_local_evidence_cache_resolve_commands(copy, &facts.subject, &facts.parent);
+    if (variant == 0u) assert(facts.parent && !strcmp(facts.parent, command));
+    else assert(!facts.parent);
+    if (variant == 2u || variant == 3u || variant == 10u || variant == 11u)
+      assert(!facts.subject);
+    else assert(facts.subject && !strcmp(facts.subject, command));
+    free(facts.subject); free(facts.parent);
+  }
+  free(copy);
 }
 
 static sqlite3 *read_queue(const char *path) {
@@ -266,6 +334,7 @@ int main(int argc, char **argv) {
   assert(edr_local_evidence_cache_open(db, 8, 24) == 0);
   identity(parent, 8740); identity(child, 9000);
   strcpy(parent->process_name, "inert-parent.exe");
+  strcpy(parent->exe_path, "C:/test/inert-parent.exe");
   strcpy(child->process_name, "inert-child.exe");
   strcpy(child->exe_path, "C:/test/inert-child.exe");
   strcpy(child->image_path_resolution_status, "RESOLVED");
@@ -274,11 +343,6 @@ int main(int argc, char **argv) {
   strcpy(child->file_path, "C:\\test\\Login Data"); strcpy(child->file_op, "read");
   child->event_time_ns = INT64_C(1790152545794514400);
   child->type = EDR_EVENT_FILE_READ; child->ppid = parent->pid;
-  child->parent_process_start_key = parent->process_start_key;
-  child->parent_process_creation_filetime_100ns = parent->process_creation_filetime_100ns;
-  /* This fixture starts after the native parent lifetime proof. The separate
-   * parent-binding regression exercises that proof and denial itself. */
-  strcpy(child->parent_resolution_source, "live_parent_generation");
   AVEBehaviorAlert bare_alert = {0};
   bare_alert.pid = child->pid; bare_alert.ppid = child->ppid; bare_alert.timestamp_ns = child->event_time_ns;
   bare_alert.anomaly_score = 0.91f;
@@ -322,6 +386,7 @@ int main(int argc, char **argv) {
     /* Empty and nonempty preview must both resolve through the production
      * parent reference, even after the process-tree hot cache is gone. */
     strcpy(child->cmdline, "inert.exe");
+    bind_parent_for_command_fact(child, parent, command);
     /* Exercise a real cached full-fact restore after a preview cuts UTF-8
      * at the legacy boundary, rather than only replacing a short ASCII stub. */
     size_t preview_size = n < sizeof(child->parent_cmdline) ? n : sizeof(child->parent_cmdline) - 1u;
@@ -367,8 +432,10 @@ int main(int argc, char **argv) {
     }
     EdrCommandFacts captured = {0};
     edr_local_evidence_cache_resolve_commands(child, &captured.subject, &captured.parent);
-#ifdef EDR_P0_TEST_REAL_IR
     assert(captured.subject && captured.parent);
+    assert(!strcmp(captured.subject, command) && !strcmp(captured.parent, command));
+    verify_bound_command_reference(child, command);
+#ifdef EDR_P0_TEST_REAL_IR
     assert(has_rule(child, &captured, "R-CRED-003"));
     strcpy(child->file_path, "C:\\Chrome\\Network\\Cookies");
     strcpy(child->process_name, "powershell.exe");

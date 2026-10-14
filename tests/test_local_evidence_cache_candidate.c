@@ -6705,21 +6705,77 @@ static uint32_t near_full_migration_fixture(const char *path) {
   return budget;
 }
 
+static int near_full_migration_can_resume(int rc, const EdrEvidenceMigrationResult *result,
+                                         unsigned attempts) {
+  /* The API deadline bounds one invocation, not completion of an entire
+   * cache. No cancellation callback is supplied by the caller below. */
+  return rc == -1 && attempts < 3 && !result->complete && result->format == 1 &&
+         result->moved_refs > 0 && result->elapsed_ms >= 60000 &&
+         strcmp(result->error, "migration cancelled or deadline exceeded; resume from committed batches") == 0;
+}
+
+static void test_near_full_migration_resume_admission(void) {
+  EdrEvidenceMigrationResult result = {0};
+  result.format = 1; result.moved_refs = 64; result.elapsed_ms = 60000;
+  strcpy(result.error, "migration cancelled or deadline exceeded; resume from committed batches");
+  assert(near_full_migration_can_resume(-1, &result, 1));
+  assert(near_full_migration_can_resume(-1, &result, 2));
+  assert(!near_full_migration_can_resume(-1, &result, 3));
+  assert(!near_full_migration_can_resume(0, &result, 1));
+  result.moved_refs = 0;
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+  result.moved_refs = 64; result.elapsed_ms = 59999;
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+  result.elapsed_ms = 60000; result.complete = 1;
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+  result.complete = 0; result.format = 2;
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+  result.format = 1;
+  strcpy(result.error, "migration reference batch exceeds physical reserve; committed batches remain resumable");
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+  strcpy(result.error, "migration SQLite failure: database or disk is full");
+  assert(!near_full_migration_can_resume(-1, &result, 1));
+}
+
+static void near_full_migrate_to_completion(const char *path, uint32_t budget,
+                                           uint64_t committed) {
+  EdrEvidenceMigrationResult result;
+  /* Keep the original per-invocation deadline and storage budget. At most
+   * three calls may finish already committed work; the CTest timeout still
+   * applies to the whole test. An error or lack of progress is never retried. */
+  for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+    int rc = edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result);
+    fprintf(stderr, "near-full migration result: attempt=%u rc=%d elapsed_ms=%llu moved=%llu batches=%llu peak_bytes=%llu budget_bytes=%llu\n",
+            attempt, rc, (unsigned long long)result.elapsed_ms, (unsigned long long)result.moved_refs,
+            (unsigned long long)result.batches, (unsigned long long)result.peak_physical_bytes,
+            (unsigned long long)budget * 1048576u);
+    if (rc) fprintf(stderr, "near-full migration: %s (%llu moved)\n", result.error, (unsigned long long)result.moved_refs);
+    assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
+    /* Reject every other failure before treating its result as committed
+     * progress, including a zero-progress deadline and exhaustion of retries. */
+    assert(rc == 0 || near_full_migration_can_resume(rc, &result, attempt));
+    assert(committed <= 4099 && result.moved_refs <= 4099 - committed);
+    committed += result.moved_refs;
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    compact_assert_projection(db);
+    assert(compact_scalar(db, "PRAGMA user_version") == result.format);
+    assert((uint64_t)compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == committed);
+    assert((uint64_t)compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 4099 - committed);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    if (rc == 0) {
+      assert(result.complete && result.format == 2 && committed == 4099);
+      return;
+    }
+  }
+  assert(0 && "near-full migration did not complete within three bounded invocations");
+}
+
 static void test_compact_near_full_migration_releases_clean_pages(void) {
   char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
   uint32_t budget = near_full_migration_fixture(path);
-  sqlite3 *db = NULL;
-  EdrEvidenceMigrationResult result;
-  int rc = edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result);
-  fprintf(stderr, "near-full migration result: rc=%d elapsed_ms=%llu moved=%llu batches=%llu peak_bytes=%llu budget_bytes=%llu\n",
-          rc, (unsigned long long)result.elapsed_ms, (unsigned long long)result.moved_refs,
-          (unsigned long long)result.batches, (unsigned long long)result.peak_physical_bytes,
-          (unsigned long long)budget * 1048576u);
-  if (rc) fprintf(stderr, "near-full migration: %s (%llu moved)\n", result.error, (unsigned long long)result.moved_refs);
-  assert(rc == 0 && result.complete && result.format == 2);
-  assert(result.moved_refs == 4099 && result.peak_physical_bytes <= (uint64_t)budget * 1048576);
-  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
-  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  near_full_migrate_to_completion(path, budget, 0);
+  cleanup_test_sqlite_path(path);
 }
 
 static int migration_cancel_after_progress(void *context) {
@@ -6742,11 +6798,8 @@ static void test_compact_near_full_cancel_resume(void) {
   sqlite3 *db = NULL;
   assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
   assert(sqlite3_close(db) == SQLITE_OK);
-  assert(edr_local_evidence_cache_migrate(path, budget, 60000, NULL, NULL, &result) == 0);
-  assert(result.complete && result.format == 2 && result.moved_refs + committed == 4099);
-  assert(result.peak_physical_bytes <= (uint64_t)budget * 1048576);
-  assert(sqlite3_open(path, &db) == SQLITE_OK); compact_assert_projection(db);
-  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  near_full_migrate_to_completion(path, budget, committed);
+  cleanup_test_sqlite_path(path);
 }
 
 static void test_compact_near_full_existing_page_rewrites(void) {
@@ -8451,6 +8504,7 @@ int main(int argc, char **argv) {
   test_compact_process_crash_recovery();
   test_compact_full_busy_and_unknown_format();
   test_compact_migration_budget_and_storage_types();
+  test_near_full_migration_resume_admission();
   test_compact_near_full_migration_releases_clean_pages();
   test_compact_near_full_cancel_resume();
   test_compact_near_full_existing_page_rewrites();
