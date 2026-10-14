@@ -546,6 +546,41 @@ static int edr_prop_exact(PEVENT_RECORD rec, PCWSTR name, void *out, ULONG size)
   if (rc == ERROR_SUCCESS) rc = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &p, size, out);
   edr_tdh_note_property_status(rc); return rc == ERROR_SUCCESS;
 }
+
+int edr_tdh_kernel_process_stop(PEVENT_RECORD rec, EdrKernelProcessStop *out,
+                                 const char **reason) {
+  EdrKernelProcessStop parsed = {0};
+  uint64_t exit_filetime = 0u;
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  if (out) memset(out, 0, sizeof(*out));
+  if (reason) *reason = "stop_descriptor_unavailable";
+  /* Native provider metadata for ProcessStop v0/v1/v2 declares ProcessID as
+   * UInt32 and CreateTime/ExitTime as FILETIME. v2's ProcessSequenceNumber is
+   * not a ProcessStartKey. Unknown schemas and generic aliases cannot grant
+   * lifecycle authority. TDH handles each version's distinct field offsets. */
+  if (!out || !rec ||
+      memcmp(&rec->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) != 0 ||
+      rec->EventHeader.EventDescriptor.Id != 2u ||
+      rec->EventHeader.EventDescriptor.Task != 2u ||
+      rec->EventHeader.EventDescriptor.Opcode != 2u ||
+      rec->EventHeader.EventDescriptor.Version > 2u) return 0;
+  if (reason) *reason = "stop_target_pid_unavailable";
+  if (!edr_prop_exact(rec, L"ProcessID", &parsed.pid, sizeof(parsed.pid)) || !parsed.pid) return 0;
+  if (reason) *reason = "stop_target_birth_unavailable";
+  if (!edr_prop_exact(rec, L"CreateTime", &parsed.creation_filetime_100ns,
+                       sizeof(parsed.creation_filetime_100ns)) ||
+      parsed.creation_filetime_100ns <= epoch) return 0;
+  if (reason) *reason = "stop_exit_time_unavailable";
+  if (!edr_prop_exact(rec, L"ExitTime", &exit_filetime, sizeof(exit_filetime)) ||
+      exit_filetime <= epoch) return 0;
+  if (reason) *reason = "stop_lifetime_invalid";
+  if (exit_filetime < parsed.creation_filetime_100ns ||
+      exit_filetime - epoch > (uint64_t)INT64_MAX / 100u) return 0;
+  parsed.exit_time_ns = (exit_filetime - epoch) * 100u;
+  *out = parsed;
+  if (reason) *reason = "stop_target_lifetime_captured";
+  return 1;
+}
 static int edr_tcpip_listener_fields(PEVENT_RECORD rec, uint32_t *pid, uint64_t *key,
                                       char address[64], unsigned *port) {
   uint32_t status = 0, family = 0, size = 0; BYTE raw[28] = {0};
@@ -655,19 +690,32 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_PROCESS, sizeof(GUID)) == 0) {
     uint32_t target_pid = 0u;
     uint64_t target_birth = 0u;
-    if ((type == EDR_EVENT_PROCESS_CREATE || type == EDR_EVENT_PROCESS_TERMINATE) &&
+    if (type == EDR_EVENT_PROCESS_CREATE &&
         edr_prop_exact(rec, L"ProcessID", &target_pid, sizeof(target_pid)) &&
         target_pid && target_pid == out_event->pid &&
         edr_prop_exact(rec, L"CreateTime", &target_birth, sizeof(target_birth))) {
       out_event->process_creation_filetime_100ns = target_birth;
     }
-    static const PCWSTR process_key_names[] = {
-        L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
-    for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {
-      if (edr_prop_u64(rec, process_key_names[i], &out_event->process_start_key) ==
-          ERROR_SUCCESS) {
-        break;
+    if (type != EDR_EVENT_PROCESS_TERMINATE) {
+      static const PCWSTR process_key_names[] = {
+          L"ProcessStartKey", L"UniqueProcessKey", L"ProcessKey"};
+      for (size_t i = 0u; i < sizeof(process_key_names) / sizeof(process_key_names[0]); ++i) {
+        if (edr_prop_u64(rec, process_key_names[i], &out_event->process_start_key) ==
+            ERROR_SUCCESS) {
+          break;
+        }
       }
+    }
+    if (type == EDR_EVENT_PROCESS_TERMINATE) {
+      /* Even diagnostics/AVE must not substitute the logger or a generic
+       * payload alias for the process named by the native Stop schema. */
+      out_event->pid = 0u;
+      out_event->process_start_key = 0u;
+      out_event->process_creation_filetime_100ns = 0u;
+      if (edr_prop_exact(rec, L"ProcessID", &target_pid, sizeof(target_pid)))
+        out_event->pid = target_pid;
+      if (target_pid && edr_prop_exact(rec, L"CreateTime", &target_birth, sizeof(target_birth)))
+        out_event->process_creation_filetime_100ns = target_birth;
     }
   }
   if (memcmp(g, &EDR_ETW_GUID_KERNEL_FILE, sizeof(GUID)) == 0) {

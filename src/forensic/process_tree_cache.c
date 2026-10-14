@@ -55,6 +55,20 @@ static uint64_t g_pt_oldest_ns;
 static bool g_pt_initialized;
 static EdrProcessTreeCacheMetrics g_pt_metrics;
 
+/* Target declarations only: no strings, heap allocation, event or actor
+ * snapshots. ProcessStart supplies the native generation before consumption. */
+typedef struct {
+  uint32_t pid;
+  uint64_t process_start_key;
+  uint64_t creation_filetime_100ns;
+  uint64_t exit_time_ns;
+  uint64_t retained_at_ns;
+  uint8_t conflict;
+} PTPendingExit;
+static PTPendingExit g_pt_pending_exits[EDR_PTC_PENDING_EXIT_CAPACITY];
+_Static_assert(sizeof(g_pt_pending_exits) <= 8192u,
+               "pending exits must remain a small fixed lifecycle buffer");
+
 #ifdef _WIN32
 static SRWLOCK g_pt_lock = SRWLOCK_INIT;
 static void pt_lock(void) { AcquireSRWLockExclusive(&g_pt_lock); }
@@ -64,6 +78,44 @@ static pthread_mutex_t g_pt_lock = PTHREAD_MUTEX_INITIALIZER;
 static void pt_lock(void) { (void)pthread_mutex_lock(&g_pt_lock); }
 static void pt_unlock(void) { (void)pthread_mutex_unlock(&g_pt_lock); }
 #endif
+
+#ifdef EDR_PTC_TESTING
+static uint64_t g_pt_test_monotonic_ns;
+void edr_pt_cache_test_set_monotonic_ns(uint64_t now_ns) {
+  pt_lock();
+  g_pt_test_monotonic_ns = now_ns;
+  pt_unlock();
+}
+#endif
+
+static uint64_t pt_monotonic_ns(void) {
+#ifdef EDR_PTC_TESTING
+  if (g_pt_test_monotonic_ns) return g_pt_test_monotonic_ns;
+#endif
+#ifdef _WIN32
+  return (uint64_t)GetTickCount64() * UINT64_C(1000000);
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
+  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static void pt_clear_pending_exit_locked(PTPendingExit *pending) {
+  memset(pending, 0, sizeof(*pending));
+  if (g_pt_metrics.pending_exits) g_pt_metrics.pending_exits--;
+}
+
+static void pt_expire_pending_exits_locked(uint64_t now_ns) {
+  for (size_t i = 0u; i < EDR_PTC_PENDING_EXIT_CAPACITY; ++i) {
+    PTPendingExit *pending = &g_pt_pending_exits[i];
+    if (pending->pid && (!now_ns || now_ns < pending->retained_at_ns ||
+        now_ns - pending->retained_at_ns >= EDR_PTC_PENDING_EXIT_TTL_NS)) {
+      pt_clear_pending_exit_locked(pending);
+      g_pt_metrics.pending_exits_expired++;
+    }
+  }
+}
 
 #ifdef _WIN32
 static const char *g_key_proc_names[] = {
@@ -108,6 +160,8 @@ static void pt_clear_table_locked(void) {
     pt_release_entry(&g_pt_table[i].entry);
   }
   memset(g_pt_table, 0, sizeof(g_pt_table));
+  memset(g_pt_pending_exits, 0, sizeof(g_pt_pending_exits));
+  g_pt_metrics.pending_exits = 0u;
 }
 
 static void pt_store_fact(char *inline_value, size_t inline_cap,
@@ -348,6 +402,71 @@ static const PTStoredEntry *pt_get_at_locked(uint32_t pid, uint64_t event_time_n
   return best;
 }
 
+static EdrProcessExitResult pt_apply_exit_locked(size_t index, uint64_t exit_time_ns) {
+  PTStoredEntry *entry = &g_pt_table[index].entry;
+  if (!exit_time_ns || exit_time_ns < entry->start_time_ns) {
+    g_pt_metrics.exit_observations_invalid++;
+    return EDR_PTC_EXIT_INVALID;
+  }
+  if (entry->generation_conflict ||
+      (entry->exit_time_observed && entry->exit_time_ns != exit_time_ns) ||
+      entry->verified_alive_until_ns > exit_time_ns) {
+    entry->generation_conflict = 1u;
+    g_pt_metrics.exit_observations_conflict++;
+    return EDR_PTC_EXIT_CONFLICT;
+  }
+  if (entry->exit_time_observed) {
+    g_pt_metrics.exit_observations_duplicate++;
+    return EDR_PTC_EXIT_APPLIED;
+  }
+  /* Do not overwrite an inferred bound when this exit contradicts another
+   * exact generation. Keep the original interval and poison both claims. */
+  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+    PTStoredEntry *other = &g_pt_table[i].entry;
+    if (i == index || !g_pt_table[i].occupied || other->pid != entry->pid ||
+        !other->process_start_key || !other->creation_filetime_100ns) continue;
+    if ((other->process_start_key == entry->process_start_key) !=
+            (other->creation_filetime_100ns == entry->creation_filetime_100ns) ||
+        (other->start_time_ns > entry->start_time_ns &&
+         exit_time_ns > other->start_time_ns)) {
+      other->generation_conflict = entry->generation_conflict = 1u;
+    }
+  }
+  if (entry->generation_conflict) {
+    g_pt_metrics.exit_observations_conflict++;
+    return EDR_PTC_EXIT_CONFLICT;
+  }
+  entry->exit_time_ns = exit_time_ns;
+  entry->exit_time_observed = 1u;
+  if (entry->last_seen_ns < exit_time_ns) entry->last_seen_ns = exit_time_ns;
+  g_pt_metrics.exits_marked++;
+  return EDR_PTC_EXIT_APPLIED;
+}
+
+static void pt_consume_pending_exit_locked(size_t index) {
+  PTStoredEntry *entry = &g_pt_table[index].entry;
+  pt_expire_pending_exits_locked(pt_monotonic_ns());
+  for (size_t i = 0u; i < EDR_PTC_PENDING_EXIT_CAPACITY; ++i) {
+    PTPendingExit *pending = &g_pt_pending_exits[i];
+    if (pending->pid != entry->pid) continue;
+    if (pending->creation_filetime_100ns != entry->creation_filetime_100ns) {
+      if (pending->process_start_key == entry->process_start_key) {
+        pending->conflict = entry->generation_conflict = 1u;
+        g_pt_metrics.exit_observations_conflict++;
+      }
+      continue;
+    }
+    if (pending->conflict || (pending->process_start_key &&
+        pending->process_start_key != entry->process_start_key)) {
+      entry->generation_conflict = 1u;
+      g_pt_metrics.exit_observations_conflict++;
+    } else if (pt_apply_exit_locked(index, pending->exit_time_ns) == EDR_PTC_EXIT_APPLIED) {
+      g_pt_metrics.pending_exits_applied++;
+    }
+    pt_clear_pending_exit_locked(pending);
+  }
+}
+
 static int pt_put_locked(uint32_t pid, uint32_t ppid,
                          const char *process_name, const char *cmdline,
                          const char *exe_path, const char *parent_name,
@@ -439,6 +558,7 @@ static int pt_put_locked(uint32_t pid, uint32_t ppid,
   if (exact_generation) {
     pt_flag_lifetime_conflicts_locked(target);
     if (!was_occupied) pt_bound_new_exact_interval_locked(target);
+    pt_consume_pending_exit_locked(target);
   }
   if (e->last_seen_ns > g_pt_oldest_ns || g_pt_oldest_ns == 0) {
     g_pt_oldest_ns = e->last_seen_ns;
@@ -623,6 +743,12 @@ int edr_pt_cache_mark_alive_generation(uint32_t pid, uint64_t process_start_key,
     if (!g_pt_table[i].occupied || entry->pid != pid ||
         !pt_generation_equal(entry, process_start_key, creation_filetime_100ns))
       continue;
+    if (entry->exit_time_ns && verified_alive_until_ns > entry->exit_time_ns) {
+      entry->generation_conflict = 1u;
+      g_pt_metrics.exit_observations_conflict++;
+      rc = -2;
+      break;
+    }
     if (!entry->generation_conflict &&
         verified_alive_until_ns >= entry->start_time_ns &&
         (!entry->exit_time_ns || verified_alive_until_ns <= entry->exit_time_ns)) {
@@ -674,25 +800,194 @@ int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t process_start_key,
   int rc = -1;
   if (!pid || !process_start_key) return -1;
   pt_lock();
-  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+  for (size_t i = 0u; i < PT_HT_CAPACITY && g_pt_initialized; ++i) {
     PTStoredEntry *entry = &g_pt_table[i].entry;
     if (!g_pt_table[i].occupied || entry->pid != pid ||
         entry->process_start_key != process_start_key) {
       continue;
     }
     if (exit_time_ns == 0u) exit_time_ns = pt_wall_ns();
-    if (entry->start_time_ns == 0u || exit_time_ns >= entry->start_time_ns) {
-      entry->exit_time_ns = exit_time_ns;
-      entry->exit_time_observed = 1u;
-      pt_flag_lifetime_conflicts_locked(i);
-      entry->last_seen_ns = exit_time_ns;
-      g_pt_metrics.exits_marked++;
-      rc = 0;
-    }
+    rc = pt_apply_exit_locked(i, exit_time_ns);
     break;
   }
   pt_unlock();
   return rc;
+}
+
+EdrProcessExitResult edr_pt_cache_observe_exit_generation(
+    uint32_t pid, uint64_t target_process_start_key,
+    uint64_t creation_filetime_100ns, uint64_t exit_time_ns) {
+  uint64_t birth_ns = 0u;
+  EdrProcessExitResult rc = EDR_PTC_EXIT_INVALID;
+  pt_lock();
+  const uint64_t now_ns = pt_monotonic_ns();
+  pt_expire_pending_exits_locked(now_ns);
+  if (!g_pt_initialized || !pid || !now_ns ||
+      !pt_creation_birth_unix_ns(creation_filetime_100ns, &birth_ns) ||
+      !exit_time_ns || exit_time_ns < birth_ns) {
+    g_pt_metrics.exit_observations_invalid++;
+    goto done;
+  }
+  size_t found = PT_HT_CAPACITY;
+  int conflict = 0;
+  for (size_t i = 0u; i < PT_HT_CAPACITY; ++i) {
+    PTStoredEntry *entry = &g_pt_table[i].entry;
+    if (!g_pt_table[i].occupied || entry->pid != pid ||
+        !entry->process_start_key || !entry->creation_filetime_100ns) continue;
+    const int same_birth = entry->creation_filetime_100ns == creation_filetime_100ns;
+    const int same_key = target_process_start_key &&
+                        entry->process_start_key == target_process_start_key;
+    if ((same_birth && target_process_start_key && !same_key) ||
+        (same_key && !same_birth)) {
+      entry->generation_conflict = 1u;
+      conflict = 1;
+    }
+    if (same_birth) {
+      if (found != PT_HT_CAPACITY) {
+        entry->generation_conflict = g_pt_table[found].entry.generation_conflict = 1u;
+        conflict = 1;
+      }
+      found = i;
+    }
+  }
+  if (conflict) {
+    g_pt_metrics.exit_observations_conflict++;
+    rc = EDR_PTC_EXIT_CONFLICT;
+    goto done;
+  }
+  if (found != PT_HT_CAPACITY) {
+    rc = pt_apply_exit_locked(found, exit_time_ns);
+    goto done;
+  }
+
+  size_t empty = EDR_PTC_PENDING_EXIT_CAPACITY;
+  size_t same = EDR_PTC_PENDING_EXIT_CAPACITY;
+  for (size_t i = 0u; i < EDR_PTC_PENDING_EXIT_CAPACITY; ++i) {
+    PTPendingExit *pending = &g_pt_pending_exits[i];
+    if (!pending->pid) {
+      if (empty == EDR_PTC_PENDING_EXIT_CAPACITY) empty = i;
+      continue;
+    }
+    if (pending->pid != pid) continue;
+    if (pending->creation_filetime_100ns == creation_filetime_100ns) {
+      same = i;
+      continue;
+    }
+    if (target_process_start_key && pending->process_start_key == target_process_start_key) {
+      pending->conflict = 1u;
+      conflict = 1;
+    }
+  }
+  if (same != EDR_PTC_PENDING_EXIT_CAPACITY) {
+    PTPendingExit *pending = &g_pt_pending_exits[same];
+    if (conflict || pending->conflict || pending->exit_time_ns != exit_time_ns ||
+        (pending->process_start_key && target_process_start_key &&
+         pending->process_start_key != target_process_start_key)) {
+      pending->conflict = 1u;
+      g_pt_metrics.exit_observations_conflict++;
+      rc = EDR_PTC_EXIT_CONFLICT;
+    } else {
+      /* Additional identity can constrain a declaration; duplicates must
+       * never extend its retention or change its original exit time. */
+      if (!pending->process_start_key) pending->process_start_key = target_process_start_key;
+      g_pt_metrics.exit_observations_duplicate++;
+      rc = EDR_PTC_EXIT_PENDING;
+    }
+    goto done;
+  }
+  if (empty == EDR_PTC_PENDING_EXIT_CAPACITY) {
+    g_pt_metrics.pending_exits_capacity_rejected++;
+    rc = EDR_PTC_EXIT_CAPACITY;
+    goto done;
+  }
+  g_pt_pending_exits[empty] = (PTPendingExit){
+      .pid = pid, .process_start_key = target_process_start_key,
+      .creation_filetime_100ns = creation_filetime_100ns,
+      .exit_time_ns = exit_time_ns, .retained_at_ns = now_ns,
+      .conflict = (uint8_t)conflict};
+  g_pt_metrics.pending_exits_stored++;
+  g_pt_metrics.pending_exits++;
+  if (conflict) g_pt_metrics.exit_observations_conflict++;
+  rc = conflict ? EDR_PTC_EXIT_CONFLICT : EDR_PTC_EXIT_PENDING;
+done:
+  pt_unlock();
+  return rc;
+}
+
+int edr_pt_cache_parent_binding_conflicts(
+    uint32_t child_pid, uint64_t child_process_start_key,
+    uint64_t child_creation_filetime_100ns, uint32_t parent_pid,
+    uint64_t parent_process_start_key, uint64_t parent_creation_filetime_100ns) {
+  uint64_t child_birth_ns = 0u, parent_birth_ns = 0u;
+  int conflict = 0;
+  if (!child_pid || !parent_pid || child_pid == parent_pid ||
+      !child_process_start_key || !parent_process_start_key ||
+      !pt_creation_birth_unix_ns(child_creation_filetime_100ns, &child_birth_ns) ||
+      !pt_creation_birth_unix_ns(parent_creation_filetime_100ns, &parent_birth_ns) ||
+      parent_birth_ns > child_birth_ns) return 1;
+  pt_lock();
+  pt_expire_pending_exits_locked(pt_monotonic_ns());
+  for (size_t i = 0u; i < PT_HT_CAPACITY && g_pt_initialized; ++i) {
+    const PTStoredEntry *entry = &g_pt_table[i].entry;
+    if (!g_pt_table[i].occupied || !entry->process_start_key ||
+        !entry->creation_filetime_100ns ||
+        (entry->pid != child_pid && entry->pid != parent_pid)) continue;
+    const int is_child = entry->pid == child_pid;
+    const uint64_t key = is_child ? child_process_start_key : parent_process_start_key;
+    const uint64_t birth = is_child ? child_creation_filetime_100ns : parent_creation_filetime_100ns;
+    const int same_key = entry->process_start_key == key;
+    const int same_birth = entry->creation_filetime_100ns == birth;
+    if (same_key != same_birth) {
+      conflict = 1;
+      break;
+    }
+    if (same_key) {
+      if (entry->generation_conflict ||
+          (is_child && (entry->parent_pid_state == EDR_PARENT_PID_CONFLICT ||
+                        entry->parent_pid_state == EDR_PARENT_PID_INVALID ||
+                        entry->parent_pid_state == EDR_PARENT_PID_EXPLICIT_ZERO ||
+                        (entry->parent_pid_state == EDR_PARENT_PID_KNOWN &&
+                         entry->ppid != parent_pid))) ||
+          (!is_child && entry->exit_time_ns && entry->exit_time_ns < child_birth_ns)) {
+        conflict = 1;
+        break;
+      }
+    } else if (!is_child &&
+               ((entry->start_time_ns > parent_birth_ns && entry->start_time_ns <= child_birth_ns) ||
+                (entry->start_time_ns < parent_birth_ns &&
+                 (entry->verified_alive_until_ns > parent_birth_ns ||
+                  (entry->exit_time_observed && entry->exit_time_ns > parent_birth_ns))))) {
+      /* Match the lifetime-conflict checks even when the saved parent's entry
+       * was evicted: an older generation cannot survive its birth, and reuse
+       * before the child disproves its continued lifetime. */
+      conflict = 1;
+      break;
+    }
+  }
+  for (size_t i = 0u; !conflict && i < EDR_PTC_PENDING_EXIT_CAPACITY; ++i) {
+    const PTPendingExit *pending = &g_pt_pending_exits[i];
+    const int is_child = pending->pid == child_pid;
+    if (!is_child && pending->pid != parent_pid) continue;
+    const uint64_t key = is_child ? child_process_start_key : parent_process_start_key;
+    const uint64_t birth = is_child ? child_creation_filetime_100ns : parent_creation_filetime_100ns;
+    if (pending->creation_filetime_100ns == birth) {
+      conflict = pending->conflict ||
+                 (pending->process_start_key && pending->process_start_key != key) ||
+                 (!is_child && pending->exit_time_ns < child_birth_ns);
+    } else if (pending->process_start_key && pending->process_start_key == key) {
+      conflict = 1;
+    } else if (!is_child &&
+               ((pending->creation_filetime_100ns > birth &&
+                 pending->creation_filetime_100ns <= child_creation_filetime_100ns) ||
+                (pending->creation_filetime_100ns < birth &&
+                 pending->exit_time_ns > parent_birth_ns))) {
+      /* A provider-proved target birth/exit can disprove an old lifetime;
+       * it still cannot positively authorize parent text without Start. */
+      conflict = 1;
+    }
+  }
+  pt_unlock();
+  return conflict;
 }
 
 int edr_pt_cache_remove(uint32_t pid) {
@@ -1009,6 +1304,7 @@ int edr_pt_cache_find_key_proc(const char *name, uint32_t *out_pid) {
 void edr_pt_cache_get_metrics(EdrProcessTreeCacheMetrics *out) {
   if (!out) return;
   pt_lock();
+  pt_expire_pending_exits_locked(pt_monotonic_ns());
   *out = g_pt_metrics;
   pt_unlock();
 }

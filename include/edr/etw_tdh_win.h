@@ -35,6 +35,17 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
                                         const char *prov_tag,
                                         EdrSensorInterestEvent *out_event);
 
+/* A Kernel-Process Stop target declaration, not a native StartKey proof.
+ * The PTC owner may apply it only to an unambiguous native Start generation.
+ * ExitTime is the provider's FILETIME, never the notification/header time. */
+typedef struct {
+  uint32_t pid;
+  uint64_t creation_filetime_100ns;
+  uint64_t exit_time_ns;
+} EdrKernelProcessStop;
+int edr_tdh_kernel_process_stop(PEVENT_RECORD rec, EdrKernelProcessStop *out,
+                                 const char **reason);
+
 /* Kernel-File Read/Write do not carry a filename. These typed helpers expose
  * only the documented FileKey / FileObject / FileName schema used by the
  * bounded event-time binding caches; callers must first verify the

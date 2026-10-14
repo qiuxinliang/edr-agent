@@ -56,6 +56,19 @@ void edr_sensor_interest_lazy_init(void) { abort(); }
 void edr_sensor_interest_get_status(EdrSensorInterestStatus *status) { abort(); }
 void edr_pmfe_on_process_lifecycle_hint(void) { abort(); }
 int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t key, uint64_t at) { abort(); }
+unsigned edr_collector_test_stop_calls;
+uint32_t edr_collector_test_stop_pid;
+uint64_t edr_collector_test_stop_key, edr_collector_test_stop_birth, edr_collector_test_stop_exit;
+EdrProcessExitResult edr_collector_test_stop_result = EDR_PTC_EXIT_PENDING;
+EdrProcessExitResult edr_pt_cache_observe_exit_generation(
+    uint32_t pid, uint64_t key, uint64_t birth, uint64_t at) {
+  ++edr_collector_test_stop_calls;
+  edr_collector_test_stop_pid = pid;
+  edr_collector_test_stop_key = key;
+  edr_collector_test_stop_birth = birth;
+  edr_collector_test_stop_exit = at;
+  return edr_collector_test_stop_result;
+}
 void AVE_CALL AVE_NotifyProcessExit(uint32_t pid) { abort(); }
 void edr_etw_observability_on_slot_payload_empty(void) { abort(); }
 void edr_etw_observability_on_callback(const char *tag) { abort(); }

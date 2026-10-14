@@ -156,7 +156,8 @@ int main(void) {
                                  "static DWORD WINAPI edr_etw_consumer_thread(");
   char *admission = slice_between(collector,
                                   "static int edr_collector_should_admit_slot(EdrEventSlot *slot,\n"
-                                  "                                          EdrSensorInterestEvent *network_interest) {",
+                                  "                                          EdrSensorInterestEvent *network_interest,\n"
+                                  "                                          EdrNetworkAdmissionTrace *trace) {",
                                   "static void edr_collector_decode_mapped_event(");
   char *decode = slice_between(collector,
                                "static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record,",
@@ -171,16 +172,15 @@ int main(void) {
   ok &= require_contains(decode, "edr_tdh_build_sensor_interest_event",
                          "terminate handling must use the TDH-parsed target PID");
   ok &= require_contains(decode,
-                         "edr_collector_event_process_start_key(event_record, &exit_start_key)",
-                         "terminate handling must capture the ETW ProcessStartKey");
-  ok &= require_contains(decode,
-                         "edr_pt_cache_mark_exit_generation(interest_event.pid, exit_start_key,",
-                         "terminate handling must mark only the exact process-tree generation exited");
+                         "edr_collector_observe_process_stop(event_record)",
+                         "terminate handling must use the typed target lifetime owner");
+  ok &= require_absent(decode, "&exit_start_key",
+                         "terminate handling must not borrow the ETW logger StartKey");
   ok &= require_absent(decode, "edr_pt_cache_mark_exit(interest_event.pid",
                           "terminate handling must not close a PID generation by PID alone");
   ok &= require_contains(decode, "AVE_NotifyProcessExit(interest_event.pid)",
                          "terminate handling must notify AVE history from the collector path");
-  ok &= require_before(decode, "edr_pt_cache_mark_exit_generation(interest_event.pid, exit_start_key,",
+  ok &= require_before(decode, "edr_collector_observe_process_stop(event_record)",
                        "edr_sensor_interest_should_admit(&interest_event)",
                        "terminate lifecycle marking must happen before sensor-interest filtering");
 
@@ -218,6 +218,7 @@ int main(void) {
                        "collector must not manufacture a parent name from a PID");
 
   char *pipeline = read_source(root, "src/preprocess/preprocess_pipeline.c");
+  char *parent_snapshot = read_source(root, "src/preprocess/parent_context_snapshot.h");
   if (!pipeline) {
     ok = 0;
   } else {
@@ -233,26 +234,32 @@ int main(void) {
     ok &= require_contains(pipeline, "edr_process_generation_query_live",
                            "target generation must be validated against a live target handle");
     ok &= require_contains(pipeline,
-                           "edr_process_command_line_query_live(process, command_line",
+                           "edr_process_command_line_query_alloc(process, reason, sizeof(reason))",
                            "Kernel ProcessStart must read command line from its validated handle");
     ok &= require_before(pipeline,
-                         "edr_process_command_line_query_live(process, command_line",
-                         "CloseHandle(process);\n  br->process_start_key = live.process_start_key;",
+                         "edr_process_command_line_query_alloc(process, reason, sizeof(reason))",
+                         "p0_enrich_bound_parent_pid(br, process, &live);\n  CloseHandle(process);",
                          "same-generation command line must be read before closing the validated handle");
     ok &= require_before(pipeline,
                          "p0_adopt_generation_command_fact(br, command_line, 0, \"live_same_generation\")",
-                         "CloseHandle(process);\n  br->process_start_key = live.process_start_key;",
+                         "p0_enrich_bound_parent_pid(br, process, &live);\n  CloseHandle(process);",
                          "queried command must be adopted with its same-generation provenance");
     ok &= require_contains(pipeline, "live_same_generation_unavailable",
                            "failed live command-line queries must remain explicit and source-only");
     ok &= require_before(pipeline, "(void)enrich_process_token_identity(&br);",
                          "switch (edr_process_coalescer_submit",
                          "short-lived target token identity must be captured before the 4688 wait");
-    ok &= require_contains(
-        pipeline,
-        "not_evaluable_reason && p0_process_create_candidate(&br) &&\n"
-        "        !edr_p0_rule_ir_br_matches_any(&br)",
-        "a complete authenticated-IR match must not be suppressed by unrelated short-lived-process enrichment loss");
+    char *source_gate = slice_between(pipeline,
+        "if (not_evaluable_reason && p0_process_create_candidate(&br)) {",
+        "if (source_only) {");
+    ok &= require_contains(source_gate, "edr_p0_rule_process_create_hard_reject(&br)",
+        "source-only bypass must preserve hard evidence rejection");
+    ok &= require_contains(source_gate,
+        "edr_p0_rule_ir_evaluate_record(&br, &command_facts, &evaluation)",
+        "a candidate must evaluate the authenticated IR with complete command facts");
+    ok &= require_contains(source_gate, "source_only = evaluation.match_count == 0u;",
+        "a complete authenticated-IR match must not be suppressed by unrelated enrichment loss");
+    free(source_gate);
     ok &= require_contains(pipeline, "LookupAccountSidA",
                            "token fallback must retain username and domain when Windows resolves the SID");
     ok &= require_contains(pipeline, "parent_creation_time",
@@ -274,9 +281,14 @@ int main(void) {
                            "authoritative process creates must retain an exact generation history");
     ok &= require_contains(pipeline, "edr_pt_cache_fill_record_at",
                            "parent-chain enrichment must traverse at the source event time");
-    ok &= require_contains(pipeline, "parent.process_start_key != 0u",
+    ok &= require_contains(pipeline, "p0_enrich_parent_context(br, p0_resolve_live_parent_generation)",
+                           "parent enrichment must use the shared proof-preserving owner");
+    ok &= require_contains(parent_snapshot,
+                           "p0_adopt_parent_snapshot(r, &parent, child_birth_ns, parent_from_live)",
+                           "parent selection must pass the complete generation proof to adoption");
+    ok &= require_contains(parent_snapshot, "!parent->process_start_key",
                            "parent resolution must require the cached ProcessStartKey");
-    ok &= require_contains(pipeline, "parent.creation_filetime_100ns != 0u",
+    ok &= require_contains(parent_snapshot, "!parent->creation_filetime_100ns",
                            "parent resolution must require the cached creation FILETIME");
     ok &= require_contains(pipeline, "filetime_100ns_to_unix_ns",
                            "parent generation timestamps must derive from real creation FILETIME");
@@ -317,7 +329,6 @@ int main(void) {
                              "target-4688 identity mismatches must be explicitly non-evaluable");
     }
     free(token_enrichment);
-    free(pipeline);
   }
 
   ok &= require_contains(process_cache, "edr_pt_cache_put_generation",
@@ -326,7 +337,7 @@ int main(void) {
                          "process cache must close only an exact StartKey generation");
   ok &= require_contains(agent, "\\\"p0_acceptance\\\":{",
                          "basic health must expose P0 acceptance counters");
-  ok &= require_contains(agent, "\\\"evidence_cache\\\":{\\\"db_open\\\":%s,\\\"utilization_bps\\\":%u",
+  ok &= require_contains(agent, "\\\"evidence_cache\\\":{\\\"db_open\\\":%s,\\\"storage_format\\\":%u,\\\"utilization_bps\\\":%u",
                          "basic health must expose evidence-cache utilization");
   ok &= require_contains(agent, "\\\"maintenance\\\":{\\\"runs\\\":%llu",
                          "basic health must expose evidence-cache maintenance counters");
@@ -413,7 +424,7 @@ int main(void) {
                        "direct ETW feed must not own process-tree lifecycle state");
 
   ok &= require_contains(alert_emit,
-                         "edr_pt_cache_snapshot_at(alert->pid, event_time_ns, &snapshot)",
+                         "edr_pt_cache_snapshot_generation_at(alert->pid, capture.process_start_key, event_time_ns, &snapshot)",
                          "alert enrichment must validate snapshots at the source event time");
   ok &= require_contains(alert_emit,
                          "alert->timestamp_ns > 0 ? (uint64_t)alert->timestamp_ns : 0u",
@@ -578,5 +589,7 @@ int main(void) {
   free(process_cache);
   free(evidence_worker);
   free(evidence_wait);
+  free(pipeline);
+  free(parent_snapshot);
   return ok ? 0 : 1;
 }

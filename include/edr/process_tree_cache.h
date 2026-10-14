@@ -15,6 +15,16 @@
 #define EDR_PTC_STR_LONG  8192u
 #define EDR_PTC_STR_PATH  4096u
 #define EDR_PTC_EXIT_GRACE_NS (30ULL * 1000000000ULL)
+#define EDR_PTC_PENDING_EXIT_CAPACITY 128u
+#define EDR_PTC_PENDING_EXIT_TTL_NS (30ULL * 1000000000ULL)
+
+typedef enum {
+  EDR_PTC_EXIT_APPLIED = 0,
+  EDR_PTC_EXIT_PENDING = 1,
+  EDR_PTC_EXIT_INVALID = -1,
+  EDR_PTC_EXIT_CONFLICT = -2,
+  EDR_PTC_EXIT_CAPACITY = -3
+} EdrProcessExitResult;
 
 enum {
   EDR_PTC_SOURCE_TRUNC_CMDLINE = 1u << 0,
@@ -140,6 +150,30 @@ int edr_pt_cache_mark_exit(uint32_t pid, uint64_t exit_time_ns);
 int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t process_start_key,
                                       uint64_t exit_time_ns);
 
+/* The caller must prove that PID, exact creation FILETIME and exit UTC time
+ * belong to the provider's target, not its logger. A zero target StartKey is
+ * permitted only as a PID+birth declaration: it becomes a lifetime witness
+ * after matching one conflict-free native StartKey+birth from ProcessStart.
+ * Early exits occupy at most 128 fixed slots for 30 monotonic seconds. Exact
+ * repeats do not renew retention; full storage rejects new declarations.
+ * No event is created, replayed or emitted. Zero/fabricated times are invalid. */
+EdrProcessExitResult edr_pt_cache_observe_exit_generation(
+    uint32_t pid, uint64_t target_process_start_key,
+    uint64_t creation_filetime_100ns, uint64_t exit_time_ns);
+
+/* Recheck negative evidence for a previously proved binding in one locked
+ * scan. Zero includes cache absence and does NOT establish a new proof.
+ * One means invalid input or a known generation/lifetime/PPID conflict. */
+int edr_pt_cache_parent_binding_conflicts(
+    uint32_t child_pid, uint64_t child_process_start_key,
+    uint64_t child_creation_filetime_100ns, uint32_t parent_pid,
+    uint64_t parent_process_start_key, uint64_t parent_creation_filetime_100ns);
+
+#ifdef EDR_PTC_TESTING
+/* Deterministic expiry tests only; absent from production builds. */
+void edr_pt_cache_test_set_monotonic_ns(uint64_t now_ns);
+#endif
+
 /** 移除条目。返回 0 成功，-1 未找到。 */
 int edr_pt_cache_remove(uint32_t pid);
 
@@ -185,6 +219,14 @@ typedef struct {
   uint64_t snapshot_misses;
   uint64_t snapshot_time_rejects;
   uint64_t exits_marked;
+  uint64_t exit_observations_invalid;
+  uint64_t exit_observations_duplicate;
+  uint64_t exit_observations_conflict;
+  uint64_t pending_exits_stored;
+  uint64_t pending_exits_applied;
+  uint64_t pending_exits_expired;
+  uint64_t pending_exits_capacity_rejected;
+  uint32_t pending_exits;
   uint64_t evictions;
   uint32_t entries;
 } EdrProcessTreeCacheMetrics;

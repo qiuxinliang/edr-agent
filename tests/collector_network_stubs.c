@@ -10,6 +10,7 @@
 #include "edr/sensor_interest.h"
 #include "../src/collector/ave_etw_feed_win.h"
 #include <assert.h>
+#include "edr/process_tree_cache.h"
 #include <stdlib.h>
 void edr_correlation_observe_interest(const EdrSensorInterestEvent *event) { (void)event; }
 void edr_ave_etw_feed_from_event(EVENT_RECORD *record, EdrEventType type,
@@ -22,6 +23,8 @@ int edr_policy_v2_ransomware_enabled(const char *control) { abort(); }
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { abort(); }
 void edr_pmfe_on_process_lifecycle_hint(void) { abort(); }
 int edr_pt_cache_mark_exit_generation(uint32_t pid, uint64_t key, uint64_t at) { abort(); }
+EdrProcessExitResult edr_pt_cache_observe_exit_generation(
+    uint32_t pid, uint64_t key, uint64_t birth, uint64_t at) { abort(); }
 void AVE_CALL AVE_NotifyProcessExit(uint32_t pid) { abort(); }
 unsigned edr_network_test_empty_payloads;
 void edr_etw_observability_on_slot_payload_empty(void) { ++edr_network_test_empty_payloads; }

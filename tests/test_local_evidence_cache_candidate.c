@@ -9,6 +9,7 @@
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "../src/preprocess/process_cached_generation.h"
+#include "../src/preprocess/parent_context_snapshot.h"
 #include "../src/collector/process_command_preview.h"
 #include "cJSON.h"
 
@@ -4945,6 +4946,100 @@ static void test_process_cache_preserves_full_facts_and_source_provenance(void) 
   free(observed);
 }
 
+static void test_preprocess_parent_proof_survives_reentry_and_local_eviction(void) {
+  const uint64_t c = (uint64_t)time(NULL) * UINT64_C(1000000000);
+  const uint64_t a = c - UINT64_C(1000000000);
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  EdrBehaviorRecord *other = calloc(1u, sizeof(*other)); assert(other);
+  for (unsigned evict = 0u; evict < 2u; ++evict) {
+    assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+    edr_pt_cache_shutdown(); edr_pt_cache_init();
+    init_record(r, EDR_EVENT_PROCESS_CREATE);
+    r->pid = 20u; r->ppid = 10u; r->parent_pid_state = EDR_PARENT_PID_KNOWN;
+    r->event_time_ns = (int64_t)c; r->process_start_key = 20u;
+    r->process_creation_filetime_100ns = test_unix_ns_to_filetime(c);
+    strcpy(r->endpoint_id, "parent-reentry-test");
+    strcpy(r->process_name, "child.exe");
+    assert(edr_pt_cache_put_generation(10u, 0u, "parent.exe", "CAPTURED_PARENT_COMMAND",
+        "C:/isolated/parent.exe", NULL, a, 10u, test_unix_ns_to_filetime(a)) == 0);
+    assert(edr_pt_cache_mark_alive_generation(10u, 10u, test_unix_ns_to_filetime(a), c) == 0);
+    /* The same production parent stage runs before coalescing and again on
+     * release; local evidence is observed/enriched between those boundaries. */
+    assert(p0_enrich_parent_context(r, NULL));
+    edr_local_evidence_cache_observe_process(r);
+    if (evict) {
+      for (unsigned i = 0u; i < 1025u; ++i) {
+        init_record(other, EDR_EVENT_PROCESS_CREATE);
+        other->pid = 1000u + i; other->process_start_key = 1000u + i;
+        other->process_creation_filetime_100ns = test_unix_ns_to_filetime(c + i + 1u);
+        other->event_time_ns = (int64_t)(c + i + 1u);
+        strcpy(other->endpoint_id, r->endpoint_id);
+        edr_local_evidence_cache_observe_process(other);
+      }
+    }
+    edr_pt_cache_shutdown(); edr_pt_cache_init();
+    *other = *r; edr_behavior_clear_parent_context(other);
+    edr_local_evidence_cache_enrich_behavior(other);
+    assert((other->parent_process_start_key != 0u) == !evict);
+    assert(p0_enrich_parent_context(r, NULL));
+    edr_local_evidence_cache_observe_process(r);
+    edr_local_evidence_cache_enrich_behavior(r);
+    assert(edr_behavior_parent_context_bound(r));
+    assert(r->parent_process_start_key == 10u);
+    assert(!strcmp(r->parent_cmdline, "CAPTURED_PARENT_COMMAND"));
+    assert(!strcmp(r->parent_resolution_status, "RESOLVED"));
+    if (!evict) {
+      uint8_t *bound_wire = malloc(EDR_EGRESS_FRAME_MAX);
+      uint8_t *unbound_wire = malloc(EDR_EGRESS_FRAME_MAX);
+      assert(bound_wire && unbound_wire);
+      size_t bound_size = edr_behavior_record_encode_protobuf(r, bound_wire, EDR_EGRESS_FRAME_MAX);
+      *other = *r; other->parent_context_binding = (EdrParentContextBinding){0};
+      size_t unbound_size = edr_behavior_record_encode_protobuf(other, unbound_wire, EDR_EGRESS_FRAME_MAX);
+      assert(bound_size && bound_size == unbound_size);
+      assert(!memcmp(bound_wire, unbound_wire, bound_size));
+      free(bound_wire); free(unbound_wire);
+    }
+    /* A replacement child lifetime cannot reuse the old proof after both
+     * caches lose the original, even though its display fields say RESOLVED. */
+    if (evict) {
+      ++r->process_start_key;
+      ++r->process_creation_filetime_100ns;
+      assert(!p0_enrich_parent_context(r, NULL));
+      edr_local_evidence_cache_observe_process(r);
+      edr_local_evidence_cache_enrich_behavior(r);
+      assert(!edr_behavior_parent_context_bound(r) && !r->parent_cmdline[0]);
+    }
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+  }
+  /* A partial first snapshot must not prevent a later same-tuple metadata
+   * fill. The new parent text exists only in PTC, not a parent ProcSlot. */
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  edr_pt_cache_init();
+  init_record(r, EDR_EVENT_PROCESS_CREATE);
+  r->pid = 20u; r->ppid = 10u; r->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  r->process_start_key = 20u; r->process_creation_filetime_100ns = test_unix_ns_to_filetime(c);
+  r->event_time_ns = (int64_t)c;
+  strcpy(r->endpoint_id, "parent-reentry-test");
+  assert(edr_pt_cache_put_generation(10u, 0u, NULL, NULL, NULL, NULL,
+      a, 10u, test_unix_ns_to_filetime(a)) == 0);
+  assert(edr_pt_cache_mark_alive_generation(10u, 10u, test_unix_ns_to_filetime(a), c) == 0);
+  assert(p0_enrich_parent_context(r, NULL));
+  assert(!strcmp(r->parent_resolution_status, "NOT_EVALUABLE"));
+  edr_local_evidence_cache_observe_process(r);
+  assert(edr_pt_cache_put_generation(10u, 0u, "completed-parent.exe", "COMPLETED_COMMAND",
+      "C:/isolated/completed-parent.exe", NULL, a, 10u, test_unix_ns_to_filetime(a)) == 0);
+  assert(p0_enrich_parent_context(r, NULL));
+  edr_local_evidence_cache_observe_process(r);
+  edr_local_evidence_cache_enrich_behavior(r);
+  assert(edr_behavior_parent_context_bound(r));
+  assert(!strcmp(r->parent_name, "completed-parent.exe"));
+  assert(!strcmp(r->parent_path, "C:/isolated/completed-parent.exe"));
+  assert(!strcmp(r->parent_cmdline, "COMPLETED_COMMAND"));
+  assert(!strcmp(r->parent_resolution_status, "RESOLVED"));
+  edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+  free(other); free(r);
+}
+
 static void test_parent_text_requires_proved_lifetime_and_survives_cache_eviction(void) {
   const uint32_t parent_pid = 97001u, child_pid = 97002u;
   const uint64_t now = (uint64_t)time(NULL) * UINT64_C(1000000000);
@@ -5032,6 +5127,7 @@ static void test_parent_text_requires_proved_lifetime_and_survives_cache_evictio
   r->parent_process_start_key = 100u;
   r->parent_process_creation_filetime_100ns = test_unix_ns_to_filetime(a);
   strcpy(r->parent_resolution_source, "live_parent_generation");
+  edr_behavior_bind_parent_context(r);
   edr_local_evidence_cache_enrich_behavior(r);
   assert(r->ppid == parent_pid && r->parent_pid_state == EDR_PARENT_PID_KNOWN);
   assert(!r->parent_process_start_key && !r->parent_name[0] && !r->parent_path[0] && !r->parent_cmdline[0]);
@@ -8452,6 +8548,7 @@ int main(int argc, char **argv) {
   test_parent_only_nonprocess_record_does_not_create_process_slot();
   test_process_cache_preserves_full_facts_and_source_provenance();
   test_grandparent_cache_requires_verified_lifecycle_parent_edge();
+  test_preprocess_parent_proof_survives_reentry_and_local_eviction();
   test_parent_text_requires_proved_lifetime_and_survives_cache_eviction();
   test_parent_edge_repairs_late_real_generation_at_child_birth();
   test_rtq_signed_scope_and_legacy_aliases();

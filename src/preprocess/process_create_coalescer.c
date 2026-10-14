@@ -194,7 +194,9 @@ static int kernel_independent_of_4688(const EdrBehaviorRecord *record) {
 static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *security) {
   int kernel_cmd_explicitly_truncated;
   int security_cmd_truncated;
+  int kernel_parent_bound;
   if (!kernel || !security) return;
+  kernel_parent_bound = edr_behavior_parent_context_bound(kernel);
   kernel_cmd_explicitly_truncated =
       source_list_has(kernel->source_truncated_fields, "source.cmdline",
                       sizeof("source.cmdline") - 1u);
@@ -216,14 +218,17 @@ static void merge_4688(EdrBehaviorRecord *kernel, const EdrBehaviorRecord *secur
                                    security->source_truncated_fields,
                                    "source.cmdline");
   }
-  if (!kernel->parent_name[0] && security->parent_name[0]) {
+  /* A captured parent lifetime owns its incomplete text too. An advisory
+   * 4688 observation has no proof for that parent generation; only the exact
+   * cache/live owner may complete this snapshot on the next enrichment. */
+  if (!kernel_parent_bound && !kernel->parent_name[0] && security->parent_name[0]) {
     memcpy(kernel->parent_name, security->parent_name, sizeof(kernel->parent_name));
     merge_adopted_field_truncation(kernel->source_truncated_fields,
                                    sizeof(kernel->source_truncated_fields),
                                    security->source_truncated_fields,
                                    "source.parent_name");
   }
-  if (!kernel->parent_path[0] && security->parent_path[0]) {
+  if (!kernel_parent_bound && !kernel->parent_path[0] && security->parent_path[0]) {
     memcpy(kernel->parent_path, security->parent_path, sizeof(kernel->parent_path));
     merge_adopted_field_truncation(kernel->source_truncated_fields,
                                    sizeof(kernel->source_truncated_fields),

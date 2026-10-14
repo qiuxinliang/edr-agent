@@ -4280,6 +4280,46 @@ static void edr_collector_file_context_failure(EdrEventType type, const char *re
             (unsigned)type, (unsigned long long)count, reason ? reason : "binding_unavailable");
 }
 
+static int edr_collector_observe_process_stop(PEVENT_RECORD record) {
+  EdrKernelProcessStop stop;
+  EdrSensorInterestEvent observation;
+  const char *reason = NULL;
+  int result = -4;
+  unsigned disposition = 0u;
+  /* Bounded per-disposition counters, independent of optional raw tracing.
+   * Logging is sampled; no process text or environment is recorded. */
+  static volatile LONG64 counts[6];
+  if (edr_tdh_kernel_process_stop(record, &stop, &reason)) {
+    /* ProcessStop v0/v1/v2 has no native target StartKey. An ETW extended key
+     * belongs to the logger, including when a different process records Stop.
+     * PID+CreateTime is only a target declaration: the PTC owner must bind it
+     * to a unique native Start tuple before granting any lifetime proof. */
+    result = edr_pt_cache_observe_exit_generation(
+        stop.pid, 0u, stop.creation_filetime_100ns, stop.exit_time_ns);
+    switch (result) {
+      case EDR_PTC_EXIT_APPLIED: disposition = 1u; reason = "stop_applied_or_duplicate"; break;
+      case EDR_PTC_EXIT_PENDING: disposition = 2u; reason = "stop_pending_native_start"; break;
+      case EDR_PTC_EXIT_CONFLICT: disposition = 3u; reason = "stop_generation_conflict"; break;
+      case EDR_PTC_EXIT_CAPACITY: disposition = 4u; reason = "stop_pending_capacity"; break;
+      default: disposition = 5u; reason = "stop_owner_unavailable_or_invalid"; break;
+    }
+  }
+  memset(&observation, 0, sizeof(observation));
+  observation.type = EDR_EVENT_PROCESS_TERMINATE;
+  observation.pid = stop.pid;
+  observation.process_creation_filetime_100ns = stop.creation_filetime_100ns;
+  edr_validation_trace_interest(&observation, (int64_t)stop.exit_time_ns,
+                                "process_exit_binding", reason);
+  uint64_t count = (uint64_t)InterlockedIncrement64(&counts[disposition]);
+  if (count <= 3u || (count & (count - 1u)) == 0u)
+    fprintf(stderr, "[collector] process_stop target_pid=%u logger_pid=%lu birth=%llu exit_ns=%llu result=%d count=%llu reason=%s\n",
+            stop.pid, record ? (unsigned long)record->EventHeader.ProcessId : 0ul,
+            (unsigned long long)stop.creation_filetime_100ns,
+            (unsigned long long)stop.exit_time_ns, result,
+            (unsigned long long)count, reason);
+  return result;
+}
+
 static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEventType ty,
                                               const char *tag, uint64_t timestamp_ns) {
   EdrSensorInterestEvent interest_event;
@@ -4368,18 +4408,12 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         (void)edr_collector_event_process_start_key(event_record,
                                                     &interest_event.process_start_key);
       }
-      if (ty == EDR_EVENT_PROCESS_TERMINATE && interest_event.pid != 0u) {
-        uint64_t exit_start_key = 0u;
-        /* A delayed terminate for A must never close a later PID reuse B.
-         * Use the same documented extended StartKey as process-create; if it
-         * is absent, retain history rather than applying a PID-only close. */
-        if (edr_collector_event_process_start_key(event_record, &exit_start_key) &&
-            exit_start_key != 0u) {
-          (void)edr_pt_cache_mark_exit_generation(interest_event.pid, exit_start_key,
-                                                   timestamp_ns);
+      if (ty == EDR_EVENT_PROCESS_TERMINATE) {
+        (void)edr_collector_observe_process_stop(event_record);
+        if (interest_event.pid != 0u) {
+          AVE_NotifyProcessExit(interest_event.pid);
+          edr_validation_trace_interest(&interest_event, (int64_t)timestamp_ns, "process_exit", "ave_notified");
         }
-        AVE_NotifyProcessExit(interest_event.pid);
-        edr_validation_trace_interest(&interest_event, (int64_t)timestamp_ns, "process_exit", "ave_notified");
       }
       if ((ty == EDR_EVENT_REG_CREATE_KEY || ty == EDR_EVENT_REG_SET_VALUE ||
            ty == EDR_EVENT_REG_DELETE_KEY) && !interest_event.registry_path[0]) {
@@ -4583,6 +4617,10 @@ void edr_collector_file_io_test_canary_clock(uint64_t processing_ns) {
 
 void edr_collector_file_io_test_observe_process(const EdrBehaviorRecord *record) {
   edr_collector_pid_cache_update(record);
+}
+
+int edr_collector_process_stop_test_observe(EVENT_RECORD *record) {
+  return edr_collector_observe_process_stop(record);
 }
 
 uint64_t edr_collector_file_io_test_new_epoch(void) {

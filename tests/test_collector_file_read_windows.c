@@ -4,6 +4,7 @@
 #include "edr/etw_tdh_win.h"
 #include "edr/file_object_binding.h"
 #include "edr/p0_source_only_contract.h"
+#include "edr/process_tree_cache.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -830,7 +831,93 @@ static void test_open_binding_under_close_pressure(unsigned version, size_t widt
   }
 }
 
+/* The native TDH provider decodes these real ProcessStop v0/v1/v2 layouts.
+ * Only the PTC update sink is captured: this verifies the actual collector
+ * hands it target birth/ExitTime, never logger StartKey/header notification. */
+static void test_process_stop_target_binding(void) {
+  extern unsigned edr_collector_test_stop_calls;
+  extern uint32_t edr_collector_test_stop_pid;
+  extern uint64_t edr_collector_test_stop_key, edr_collector_test_stop_birth,
+                  edr_collector_test_stop_exit;
+  extern EdrProcessExitResult edr_collector_test_stop_result;
+  const uint64_t birth = UINT64_C(134364124853938854);
+  const uint64_t exit = birth + UINT64_C(20000000);
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  for (unsigned version = 0u; version <= 2u; ++version) {
+    for (unsigned width = 4u; width <= 8u; width += 4u) {
+    Fixture f;
+    size_t used = 0u;
+    memset(&f, 0, sizeof(f));
+    f.record.EventHeader.ProviderId = EDR_ETW_GUID_KERNEL_PROCESS;
+    f.record.EventHeader.Flags = width == 8u ? EVENT_HEADER_FLAG_64_BIT_HEADER
+                                            : EVENT_HEADER_FLAG_32_BIT_HEADER;
+    f.record.EventHeader.ProcessId = 4u; /* Different logger, as in native ETW. */
+    f.record.EventHeader.EventDescriptor.Id = 2u;
+    f.record.EventHeader.EventDescriptor.Task = 2u;
+    f.record.EventHeader.EventDescriptor.Opcode = 2u;
+    f.record.EventHeader.EventDescriptor.Version = (BYTE)version;
+    f.record.EventHeader.EventDescriptor.Level = 4u;
+    f.record.EventHeader.EventDescriptor.Keyword = 0x10u;
+    f.record.EventHeader.TimeStamp.QuadPart = (LONGLONG)(exit + 112896u);
+    number(&f, &used, 7448u, 4u);
+    if (version == 2u) number(&f, &used, 987654u, 8u); /* SequenceNumber != native key. */
+    number(&f, &used, birth, 8u);
+    number(&f, &used, exit, 8u);
+    for (unsigned i = 0u; i < 3u; ++i) number(&f, &used, 0u, 4u);
+    for (unsigned i = 0u; i < 2u; ++i) number(&f, &used, 0u, 8u);
+    if (version >= 1u) {
+      number(&f, &used, 0u, 8u);
+      for (unsigned i = 0u; i < 5u; ++i) number(&f, &used, 0u, 4u);
+    }
+    memcpy(f.data + used, "fixture.exe", sizeof("fixture.exe"));
+    used += sizeof("fixture.exe");
+    f.record.UserData = f.data;
+    f.record.UserDataLength = (USHORT)used;
+    uint64_t logger_key = UINT64_C(9999999);
+    EVENT_HEADER_EXTENDED_DATA_ITEM extended = {0};
+    extended.ExtType = 13u;
+    extended.DataSize = sizeof(logger_key);
+    extended.DataPtr = (ULONGLONG)(ULONG_PTR)&logger_key;
+    f.record.ExtendedData = &extended;
+    f.record.ExtendedDataCount = 1u;
+    edr_collector_test_stop_result = EDR_PTC_EXIT_PENDING;
+    unsigned before = edr_collector_test_stop_calls;
+    assert(edr_collector_process_stop_test_observe(&f.record) == EDR_PTC_EXIT_PENDING);
+    assert(edr_collector_test_stop_calls == before + 1u);
+    assert(edr_collector_test_stop_pid == 7448u && edr_collector_test_stop_key == 0u);
+    assert(edr_collector_test_stop_birth == birth);
+    assert(edr_collector_test_stop_exit == (exit - epoch) * 100u);
+    EdrSensorInterestEvent interest;
+    assert(edr_tdh_build_sensor_interest_event(&f.record, EDR_EVENT_PROCESS_TERMINATE,
+                                               "kproc", &interest));
+    assert(interest.pid == 7448u && !interest.process_start_key);
+    assert(interest.process_creation_filetime_100ns == birth);
+    /* No logger extension is necessary; a different one cannot change target. */
+    f.record.ExtendedDataCount = 0u;
+    edr_collector_test_stop_result = EDR_PTC_EXIT_APPLIED;
+    assert(edr_collector_process_stop_test_observe(&f.record) == EDR_PTC_EXIT_APPLIED);
+    assert(edr_collector_test_stop_key == 0u && edr_collector_test_stop_birth == birth);
+    edr_collector_test_stop_result = EDR_PTC_EXIT_CONFLICT;
+    assert(edr_collector_process_stop_test_observe(&f.record) == EDR_PTC_EXIT_CONFLICT);
+    edr_collector_test_stop_result = EDR_PTC_EXIT_CAPACITY;
+    assert(edr_collector_process_stop_test_observe(&f.record) == EDR_PTC_EXIT_CAPACITY);
+    before = edr_collector_test_stop_calls;
+    f.record.UserDataLength = 2u;
+    assert(edr_collector_process_stop_test_observe(&f.record) == -4);
+    assert(edr_collector_test_stop_calls == before);
+    f.record.UserDataLength = (USHORT)used;
+    uint64_t invalid_exit = birth - 1u;
+    memcpy(f.data + 4u + (version == 2u ? 8u : 0u) + 8u, &invalid_exit, 8u);
+    assert(edr_collector_process_stop_test_observe(&f.record) == -4);
+    assert(edr_collector_test_stop_calls == before);
+    printf("process_stop v%u header%u native TDH target binding and rejection passed\n",
+           version, width * 8u);
+    }
+  }
+}
+
 int main(void) {
+  test_process_stop_target_binding();
   setvbuf(stderr, NULL, _IONBF, 0);
   fprintf(stderr, "[fixture] native collector diagnostic build; no ETW consumer is started, "
                   "so capability_healthy=0 is expected independently of Read publication\n");

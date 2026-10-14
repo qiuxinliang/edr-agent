@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #define EDR_BR_STR_SHORT 256u
 #define EDR_BR_STR_LONG 4096u
@@ -28,6 +29,18 @@ typedef struct EdrCommandFacts {
   char *subject;
   char *parent;
 } EdrCommandFacts;
+
+/* Internal proof binding, written only after a parent lifetime is validated.
+ * This travels with hot-record copies; neither ETW decoding nor wire decoding
+ * may manufacture it from display text or a RESOLVED label. */
+typedef struct {
+  uint32_t child_pid;
+  uint32_t parent_pid;
+  uint64_t child_start_key;
+  uint64_t child_creation_filetime_100ns;
+  uint64_t parent_start_key;
+  uint64_t parent_creation_filetime_100ns;
+} EdrParentContextBinding;
 
 typedef struct {
   char event_id[EDR_BR_ID_LEN];
@@ -188,6 +201,7 @@ typedef struct {
    * command-fact reference through asynchronous record copies. */
   uint64_t parent_process_start_key;
   uint64_t parent_process_creation_filetime_100ns;
+  EdrParentContextBinding parent_context_binding;
   char process_generation_source[64];
   char parent_creation_time[64];
   char command_line_origin[64];
@@ -203,6 +217,7 @@ static inline void edr_behavior_clear_parent_context(EdrBehaviorRecord *r) {
   r->parent_name[0] = r->parent_path[0] = r->parent_cmdline[0] = '\0';
   r->parent_creation_time[0] = '\0';
   r->parent_process_start_key = r->parent_process_creation_filetime_100ns = 0u;
+  r->parent_context_binding = (EdrParentContextBinding){0};
   r->grandparent_pid = r->process_chain_depth = 0u;
   r->grandparent_name[0] = r->grandparent_path[0] = '\0';
   r->sibling_names[0] = '\0';
@@ -212,6 +227,29 @@ static inline void edr_behavior_clear_parent_context(EdrBehaviorRecord *r) {
 static inline int edr_behavior_parent_pid_usable(const EdrBehaviorRecord *r) {
   return r && r->ppid != 0u &&
       edr_parent_pid_effective_state(r->ppid, r->parent_pid_state) == EDR_PARENT_PID_KNOWN;
+}
+
+/* Call only at a verified parent adoption boundary, never on decoded labels. */
+static inline void edr_behavior_bind_parent_context(EdrBehaviorRecord *r) {
+  r->parent_context_binding = (EdrParentContextBinding){
+      r->pid, r->ppid, r->process_start_key, r->process_creation_filetime_100ns,
+      r->parent_process_start_key, r->parent_process_creation_filetime_100ns};
+}
+
+static inline int edr_behavior_parent_context_bound(const EdrBehaviorRecord *r) {
+  return edr_behavior_parent_pid_usable(r) && r->pid != r->ppid &&
+      r->pid && r->process_start_key && r->process_creation_filetime_100ns &&
+      r->parent_process_start_key && r->parent_process_creation_filetime_100ns &&
+      r->parent_process_creation_filetime_100ns <= r->process_creation_filetime_100ns &&
+      r->parent_context_binding.child_pid == r->pid &&
+      r->parent_context_binding.parent_pid == r->ppid &&
+      r->parent_context_binding.child_start_key == r->process_start_key &&
+      r->parent_context_binding.child_creation_filetime_100ns == r->process_creation_filetime_100ns &&
+      r->parent_context_binding.parent_start_key == r->parent_process_start_key &&
+      r->parent_context_binding.parent_creation_filetime_100ns == r->parent_process_creation_filetime_100ns &&
+      strcmp(r->parent_resolution_status, "CONFLICT") != 0 &&
+      (strcmp(r->parent_resolution_source, "live_parent_generation") == 0 ||
+       strcmp(r->parent_resolution_source, "process_tree_cache_verified") == 0);
 }
 
 void edr_behavior_record_init(EdrBehaviorRecord *r);

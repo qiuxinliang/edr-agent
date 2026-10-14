@@ -61,6 +61,292 @@ static char *make_text(size_t length, char seed) {
   return value;
 }
 
+static void reset_exit_test(void) {
+  edr_pt_cache_init();
+  edr_pt_cache_test_set_monotonic_ns(UINT64_C(1000000000));
+}
+
+static void put_exact(uint32_t pid, uint32_t ppid, uint64_t key, uint64_t birth) {
+  assert(edr_pt_cache_put_generation(pid, ppid, "parent.exe", "parent --original",
+      "C:/parent.exe", "", birth, key, test_unix_ns_to_filetime(birth)) == 0);
+}
+
+static void test_exit_observation_order_and_idempotence(void) {
+  const uint64_t birth = UINT64_C(1700000000000000000);
+  const uint64_t child = birth + UINT64_C(1000000);
+  const uint64_t exit = child + UINT64_C(1000000);
+  const uint64_t ft = test_unix_ns_to_filetime(birth);
+  ProcessTreeEntry entry;
+  EdrProcessTreeCacheMetrics metrics;
+  reset_exit_test();
+  /* A target PID+CreateTime declaration does not create a process or proof. */
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == -1);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -1);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.entries == 0u && metrics.pending_exits == 1u);
+  assert(metrics.exits_marked == 0u && metrics.pending_exits_stored == 1u);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == 0);
+  assert(entry.process_start_key == 9000u && entry.creation_filetime_100ns == ft);
+  assert(entry.exit_time_observed && entry.exit_time_ns == exit);
+  assert(!strcmp(entry.cmdline, "parent --original"));
+  /* Both strong and existing live-parent callers share the same no-op rule. */
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9000u, ft, exit) == EDR_PTC_EXIT_APPLIED);
+  assert(edr_pt_cache_mark_exit_generation(9000u, 9000u, exit) == 0);
+  put_exact(9000u, 4u, 9000u, birth);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.entries == 1u && metrics.pending_exits == 0u);
+  assert(metrics.exits_marked == 1u && metrics.pending_exits_applied == 1u);
+  assert(metrics.exit_observations_duplicate == 3u);
+  assert(edr_pt_cache_snapshot_generation_at(9000u, 9000u, child, &entry) == 0);
+  assert(entry.start_time_ns == birth && entry.exit_time_ns == exit);
+
+  /* A different PID reuse cannot consume the older declaration. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  put_exact(9000u, 4u, 9001u, exit + 100u);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && !entry.exit_time_observed);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits == 1u && metrics.pending_exits_applied == 0u);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == 0);
+  assert(entry.process_start_key == 9000u);
+  assert(edr_pt_cache_snapshot_generation_at(9000u, 9001u, exit + 100u, &entry) == 0);
+  assert(!entry.exit_time_observed && !entry.generation_conflict);
+
+  /* Legacy key-only calls do not create speculative pending state. */
+  reset_exit_test();
+  assert(edr_pt_cache_mark_exit_generation(9000u, 9000u, exit) == -1);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -2);
+}
+
+static void test_exit_observation_conflicts(void) {
+  const uint64_t birth = UINT64_C(1700000000000000000);
+  const uint64_t child = birth + 1000u, exit = birth + 2000u;
+  const uint64_t ft = test_unix_ns_to_filetime(birth);
+  ProcessTreeEntry entry;
+  EdrProcessTreeCacheMetrics metrics;
+  /* Earlier and later conflicting exits must never rewrite the first exit. */
+  for (int earlier = 0; earlier < 2; ++earlier) {
+    reset_exit_test();
+    put_exact(9000u, 4u, 9000u, birth);
+    assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_APPLIED);
+    assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft,
+        earlier ? exit - 100u : exit + 100u) == EDR_PTC_EXIT_CONFLICT);
+    assert(edr_pt_cache_snapshot(9000u, &entry) == 0);
+    assert(entry.exit_time_ns == exit && entry.generation_conflict);
+    assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -2);
+    put_exact(9000u, 4u, 9000u, birth);
+    assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && entry.generation_conflict);
+    edr_pt_cache_get_metrics(&metrics);
+    assert(metrics.exits_marked == 1u);
+  }
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit + 100u) == EDR_PTC_EXIT_CONFLICT);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0);
+  assert(entry.generation_conflict && !entry.exit_time_observed);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -2);
+
+  /* A target key constraint may not be replaced by the arriving native key. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9001u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0);
+  assert(entry.generation_conflict && !entry.exit_time_observed);
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9001u, ft, exit) == EDR_PTC_EXIT_CONFLICT);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && entry.generation_conflict);
+
+  /* Same birth/multiple keys and same key/different births are contradictory. */
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  put_exact(9000u, 4u, 9001u, birth);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_CONFLICT);
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9000u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9000u, ft + 1u, exit) == EDR_PTC_EXIT_CONFLICT);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && entry.generation_conflict);
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 9000u, ft + 1u, exit) == EDR_PTC_EXIT_CONFLICT);
+
+  /* A claimed exit before a same-handle alive witness is not safe closure. */
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_mark_alive_generation(9000u, 9000u, ft, exit + 100u) == 0);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_CONFLICT);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -2);
+
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_APPLIED);
+  assert(edr_pt_cache_mark_alive_generation(9000u, 9000u, ft, exit + 100u) == -2);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0);
+  assert(entry.generation_conflict && entry.exit_time_ns == exit);
+  assert(edr_pt_cache_snapshot_parent_at(9000u, child, &entry) == -2);
+
+  /* A Stop crossing a known PID reuse cannot expand the old lifetime. */
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  put_exact(9000u, 4u, 9001u, child);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_CONFLICT);
+  assert(edr_pt_cache_snapshot_generation_at(9000u, 9000u, birth, &entry) == 0);
+  assert(entry.exit_time_ns == child && !entry.exit_time_observed && entry.generation_conflict);
+  assert(edr_pt_cache_snapshot_generation_at(9000u, 9001u, child, &entry) == 0 && entry.generation_conflict);
+}
+
+static void test_pending_exit_bounds_and_restart(void) {
+  const uint64_t birth = UINT64_C(1700000000000000000), exit = birth + 1000u;
+  const uint64_t ft = test_unix_ns_to_filetime(birth);
+  const uint64_t monotonic_start = UINT64_C(1000000000);
+  ProcessTreeEntry entry;
+  EdrProcessTreeCacheMetrics metrics;
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(0u, 0u, ft, exit) == EDR_PTC_EXIT_INVALID);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, 0u, exit) == EDR_PTC_EXIT_INVALID);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, UINT64_MAX, exit) == EDR_PTC_EXIT_INVALID);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, 0u) == EDR_PTC_EXIT_INVALID);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, birth - 1u) == EDR_PTC_EXIT_INVALID);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits == 0u && metrics.exit_observations_invalid == 5u);
+  for (uint32_t i = 0u; i < EDR_PTC_PENDING_EXIT_CAPACITY; ++i)
+    assert(edr_pt_cache_observe_exit_generation(10000u + i, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  assert(edr_pt_cache_observe_exit_generation(20000u, 0u, ft, exit) == EDR_PTC_EXIT_CAPACITY);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.entries == 0u && metrics.pending_exits == EDR_PTC_PENDING_EXIT_CAPACITY);
+  assert(metrics.pending_exits_capacity_rejected == 1u);
+  /* A duplicate at the boundary neither needs space nor renews its deadline. */
+  edr_pt_cache_test_set_monotonic_ns(monotonic_start + EDR_PTC_PENDING_EXIT_TTL_NS - 1u);
+  assert(edr_pt_cache_observe_exit_generation(10000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  edr_pt_cache_test_set_monotonic_ns(monotonic_start + EDR_PTC_PENDING_EXIT_TTL_NS);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits == 0u && metrics.pending_exits_expired == EDR_PTC_PENDING_EXIT_CAPACITY);
+  put_exact(10000u, 4u, 10000u, birth);
+  assert(edr_pt_cache_snapshot(10000u, &entry) == 0 && !entry.exit_time_observed);
+  assert(edr_pt_cache_observe_exit_generation(20000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+
+  /* Put also expires old declarations even without a metrics/Stop request. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  edr_pt_cache_test_set_monotonic_ns(monotonic_start + EDR_PTC_PENDING_EXIT_TTL_NS);
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && !entry.exit_time_observed);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits_expired == 1u && metrics.pending_exits_applied == 0u);
+
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_PENDING);
+  edr_pt_cache_shutdown();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, exit) == EDR_PTC_EXIT_INVALID);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits == 0u);
+  edr_pt_cache_init();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0 && !entry.exit_time_observed);
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.pending_exits_stored == 0u && metrics.pending_exits_applied == 0u);
+}
+
+static void test_known_parent_binding_conflicts(void) {
+  const uint64_t birth = UINT64_C(1700000000000000000), child = birth + 1000u;
+  const uint64_t ft = test_unix_ns_to_filetime(birth), cft = test_unix_ns_to_filetime(child);
+#define BINDING_CONFLICT() edr_pt_cache_parent_binding_conflicts(9001u, 9001u, cft, 9000u, 9000u, ft)
+  reset_exit_test();
+  assert(!BINDING_CONFLICT()); /* Missing entries do not disprove a saved proof. */
+  put_exact(9000u, 4u, 9000u, birth);
+  put_exact(9001u, 9000u, 9001u, child);
+  assert(!BINDING_CONFLICT());
+  put_exact(9000u, 4u, 9100u, child + 1000u);
+  assert(!BINDING_CONFLICT()); /* Later reuse is not a conflicting parent. */
+  put_exact(9001u, 9999u, 9001u, child);
+  assert(BINDING_CONFLICT());
+  reset_exit_test();
+  assert(edr_pt_cache_put_generation_with_parent_state(9001u, 0u, "child", "", "", "",
+      child, 9001u, cft, 0u, EDR_PARENT_PID_EXPLICIT_ZERO) == 0);
+  assert(BINDING_CONFLICT());
+  reset_exit_test();
+  put_exact(9000u, 4u, 9000u, birth);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, child - 100u) == EDR_PTC_EXIT_APPLIED);
+  assert(BINDING_CONFLICT());
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft, child - 100u) == EDR_PTC_EXIT_PENDING);
+  assert(BINDING_CONFLICT()); /* An exact target exit is also negative evidence. */
+  reset_exit_test();
+  put_exact(9000u, 4u, 9100u, birth);
+  assert(BINDING_CONFLICT());
+  reset_exit_test();
+  put_exact(9001u, 9000u, 9001u, child + 100u);
+  assert(BINDING_CONFLICT());
+  reset_exit_test();
+  put_exact(9000u, 4u, 9100u, birth + 100u);
+  assert(BINDING_CONFLICT()); /* Native reuse before child disproves old proof. */
+  assert(edr_pt_cache_mark_alive_generation(9000u, 9100u, ft + 1u, child) == 0);
+  assert(BINDING_CONFLICT()); /* Another proved generation covers child birth. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft + 1u, child + 100u) == EDR_PTC_EXIT_PENDING);
+  assert(BINDING_CONFLICT()); /* Target birth alone disproves the old lifetime. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, cft + 1u, child + 200u) == EDR_PTC_EXIT_PENDING);
+  assert(!BINDING_CONFLICT()); /* Reuse strictly after the child stays harmless. */
+  reset_exit_test();
+  put_exact(9000u, 4u, 9100u, birth - 100u);
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft - 1u, birth + 100u) == EDR_PTC_EXIT_APPLIED);
+  assert(BINDING_CONFLICT()); /* Older exact exit overlaps the saved birth. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft - 1u, birth + 100u) == EDR_PTC_EXIT_PENDING);
+  assert(BINDING_CONFLICT()); /* Same negative proof while Start is pending. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft - 2u, birth - 100u) == EDR_PTC_EXIT_PENDING);
+  assert(!BINDING_CONFLICT()); /* An unrelated older process already exited. */
+  reset_exit_test();
+  assert(edr_pt_cache_observe_exit_generation(9000u, 0u, ft - 1u, birth) == EDR_PTC_EXIT_PENDING);
+  assert(!BINDING_CONFLICT()); /* Adjacent lifetimes are not an overlap. */
+  assert(edr_pt_cache_parent_binding_conflicts(0u, 9001u, cft, 9000u, 9000u, ft));
+#undef BINDING_CONFLICT
+}
+
+#ifndef _WIN32
+static void *repeat_lifecycle_start(void *unused) {
+  (void)unused;
+  for (unsigned i = 0u; i < 200u; ++i)
+    put_exact(9000u, 4u, 9000u, UINT64_C(1700000000000000000));
+  return NULL;
+}
+static void *repeat_lifecycle_stop(void *unused) {
+  (void)unused;
+  const uint64_t birth = UINT64_C(1700000000000000000);
+  for (unsigned i = 0u; i < 200u; ++i) {
+    EdrProcessExitResult rc = edr_pt_cache_observe_exit_generation(
+        9000u, 0u, test_unix_ns_to_filetime(birth), birth + 1000u);
+    assert(rc == EDR_PTC_EXIT_APPLIED || rc == EDR_PTC_EXIT_PENDING);
+  }
+  return NULL;
+}
+static void test_concurrent_lifecycle_observations(void) {
+  pthread_t start, stop;
+  EdrProcessTreeCacheMetrics metrics;
+  ProcessTreeEntry entry;
+  reset_exit_test();
+  assert(!pthread_create(&start, NULL, repeat_lifecycle_start, NULL));
+  assert(!pthread_create(&stop, NULL, repeat_lifecycle_stop, NULL));
+  assert(!pthread_join(start, NULL));
+  assert(!pthread_join(stop, NULL));
+  edr_pt_cache_get_metrics(&metrics);
+  assert(metrics.entries == 1u && metrics.pending_exits == 0u);
+  assert(metrics.exits_marked == 1u && metrics.exit_observations_duplicate == 199u);
+  assert(metrics.exit_observations_conflict == 0u);
+  assert(edr_pt_cache_snapshot(9000u, &entry) == 0);
+  assert(entry.exit_time_observed && entry.exit_time_ns == UINT64_C(1700000000000001000));
+}
+#endif
+
 int main(void) {
   ProcessTreeEntry entry;
   edr_pt_cache_init();
@@ -330,6 +616,14 @@ int main(void) {
   assert(pthread_join(reader, NULL) == 0);
 #endif
 
+  test_exit_observation_order_and_idempotence();
+  test_exit_observation_conflicts();
+  test_pending_exit_bounds_and_restart();
+  test_known_parent_binding_conflicts();
+#ifndef _WIN32
+  test_concurrent_lifecycle_observations();
+#endif
+  edr_pt_cache_test_set_monotonic_ns(0u);
   edr_pt_cache_shutdown();
   printf("test_process_tree_cache: ok\n");
   return 0;

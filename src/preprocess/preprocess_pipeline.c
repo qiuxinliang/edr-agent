@@ -1082,45 +1082,21 @@ static void enrich_process_integrity_context(EdrBehaviorRecord *br) {
     return;
   }
 #ifdef _WIN32
-  if (!br->process_start_key || !br->process_creation_filetime_100ns) return;
+  if (!br->process_start_key || !br->process_creation_filetime_100ns) {
+    (void)p0_enrich_parent_context(br, NULL);
+    return;
+  }
 #else
   if (br->type != EDR_EVENT_PROCESS_CREATE) return;
 #endif
   uint64_t child_birth_ns = filetime_100ns_to_unix_ns(br->process_creation_filetime_100ns);
   uint64_t parent_selector_ns = child_birth_ns != 0u ? child_birth_ns
       : (uint64_t)(br->event_time_ns > 0 ? br->event_time_ns : 0);
-  int parent_verified = 0;
-  if (edr_behavior_parent_pid_usable(br)) {
-    ProcessTreeEntry parent;
-    int parent_from_live = 0;
-    int parent_snapshot = edr_pt_cache_snapshot_parent_at(
-        br->ppid, parent_selector_ns, &parent);
-    if (parent_snapshot == 0 && br->process_creation_filetime_100ns != 0u &&
-        parent.creation_filetime_100ns > br->process_creation_filetime_100ns)
-      parent_snapshot = -2;
 #ifdef _WIN32
-    if ((parent_snapshot != 0 || parent.process_start_key == 0u ||
-         parent.creation_filetime_100ns == 0u || parent.start_time_ns == 0u) &&
-        p0_resolve_live_parent_generation(br, &parent)) {
-      parent_snapshot = 0;
-      parent_from_live = 1;
-    }
+  int parent_verified = p0_enrich_parent_context(br, p0_resolve_live_parent_generation);
+#else
+  int parent_verified = p0_enrich_parent_context(br, NULL);
 #endif
-    if (parent_snapshot == 0 &&
-        p0_adopt_parent_snapshot(br, &parent, child_birth_ns, parent_from_live)) {
-      parent_verified = 1;
-    } else {
-      /* A PID-only lookup cannot establish a parent generation.  Keep the
-       * source record and let the P0 pre-evaluation gate emit the registered
-       * missing_parent_generation disposition instead of borrowing a current
-       * process that may have reused this PID. */
-      edr_behavior_clear_parent_context(br);
-      snprintf(br->parent_resolution_source, sizeof(br->parent_resolution_source), "%s",
-               "parent_generation_unproven");
-      snprintf(br->parent_resolution_status, sizeof(br->parent_resolution_status), "%s",
-               "NOT_EVALUABLE");
-    }
-  }
   if (edr_process_create_is_lifecycle_authoritative(br) && br->process_start_key != 0u &&
       br->process_creation_filetime_100ns != 0u) {
     uint8_t provenance = (edr_behavior_source_field_truncated(br, "source.cmdline")

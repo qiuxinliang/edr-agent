@@ -2621,7 +2621,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"enable_failures\":%llu,\"reason\":\"%s\"}},"
         "\"process_identity\":{\"missing_create\":%llu,\"collector_cache_hits\":%llu,"
         "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
-        "\"snapshot_rejects\":%llu},"
+        "\"snapshot_rejects\":%llu,\"exit_invalid\":%llu,\"exit_duplicate\":%llu,\"exit_conflict\":%llu,"
+        "\"pending_exits\":%u,\"pending_exits_stored\":%llu,\"pending_exits_applied\":%llu,"
+        "\"pending_exits_expired\":%llu,\"pending_exits_capacity_rejected\":%llu},"
         "\"agent_self_sources\":{\"direct_pid\":%llu,\"security_event\":%llu,"
         "\"record\":%llu,\"interest\":%llu,\"fuse_provider\":%llu},"
         "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
@@ -2885,6 +2887,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)process_cache_metrics.snapshot_hits,
         (unsigned long long)process_cache_metrics.snapshot_misses,
         (unsigned long long)process_cache_metrics.snapshot_time_rejects,
+        (unsigned long long)process_cache_metrics.exit_observations_invalid,
+        (unsigned long long)process_cache_metrics.exit_observations_duplicate,
+        (unsigned long long)process_cache_metrics.exit_observations_conflict,
+        process_cache_metrics.pending_exits,
+        (unsigned long long)process_cache_metrics.pending_exits_stored,
+        (unsigned long long)process_cache_metrics.pending_exits_applied,
+        (unsigned long long)process_cache_metrics.pending_exits_expired,
+        (unsigned long long)process_cache_metrics.pending_exits_capacity_rejected,
         (unsigned long long)ch.agent_self_direct_pid_suppressed,
         (unsigned long long)ch.agent_self_security_event_suppressed,
         (unsigned long long)ch.agent_self_record_suppressed,
@@ -3330,6 +3340,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"collector_cache_misses\":%llu,\"snapshot_hits\":%llu,\"snapshot_misses\":%llu,"
       "\"snapshot_rejects\":%llu,\"cache_entries\":%u,\"cache_puts\":%llu,"
       "\"cache_updates\":%llu,\"cache_put_rejects\":%llu,\"cache_exits\":%llu,\"cache_evictions\":%llu,"
+      "\"exit_invalid\":%llu,\"exit_duplicate\":%llu,\"exit_conflict\":%llu,\"pending_exits\":%u,"
+      "\"pending_exits_stored\":%llu,\"pending_exits_applied\":%llu,\"pending_exits_expired\":%llu,"
+      "\"pending_exits_capacity_rejected\":%llu,"
       "\"parent_attempts\":%llu,\"parent_succeeded\":%llu,\"parent_access_denied\":%llu,"
       "\"parent_exited\":%llu,\"parent_other_failed\":%llu},"
       "\"agent_self_fuse\":{\"active\":%s,\"provider_degraded\":%s,"
@@ -3657,6 +3670,14 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       (unsigned long long)process_cache_metrics.put_time_rejects,
       (unsigned long long)process_cache_metrics.exits_marked,
       (unsigned long long)process_cache_metrics.evictions,
+      (unsigned long long)process_cache_metrics.exit_observations_invalid,
+      (unsigned long long)process_cache_metrics.exit_observations_duplicate,
+      (unsigned long long)process_cache_metrics.exit_observations_conflict,
+      process_cache_metrics.pending_exits,
+      (unsigned long long)process_cache_metrics.pending_exits_stored,
+      (unsigned long long)process_cache_metrics.pending_exits_applied,
+      (unsigned long long)process_cache_metrics.pending_exits_expired,
+      (unsigned long long)process_cache_metrics.pending_exits_capacity_rejected,
       (unsigned long long)parent_metrics.attempts,
       (unsigned long long)parent_metrics.succeeded,
       (unsigned long long)parent_metrics.access_denied,

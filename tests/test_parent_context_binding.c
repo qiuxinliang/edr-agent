@@ -36,6 +36,115 @@ static void save_record(const char *directory, const char *name, EdrBehaviorReco
   assert(fclose(f) == 0);
 }
 
+static unsigned live_queries;
+static int unavailable_live_parent(EdrBehaviorRecord *r, ProcessTreeEntry *parent) {
+  (void)r; (void)parent; ++live_queries; return 0;
+}
+
+static void test_repeated_parent_enrichment(void) {
+  const uint64_t a = UINT64_C(2000000000000000000);
+  const uint64_t c = a + UINT64_C(3000000000);
+  EdrBehaviorRecord *r = child(c);
+  EdrBehaviorRecord *proved = malloc(sizeof(*proved)); assert(proved);
+  reset(); put(7001u, 100u, a, "parent-A.exe", "A_SYNTHETIC_TEXT");
+  assert(edr_pt_cache_mark_alive_generation(7001u, 100u, filetime(a), c) == 0);
+  assert(p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(edr_behavior_parent_context_bound(r));
+  *proved = *r;
+
+  reset(); live_queries = 0;
+  assert(p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!memcmp(r, proved, sizeof(*r)) && live_queries == 0u);
+  /* A later PID occupant cannot replace a proved parent at child birth. */
+  put(7001u, 300u, c + 100u, "parent-B.exe", "B_SYNTHETIC_TEXT");
+  assert(p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!memcmp(r, proved, sizeof(*r)));
+
+  /* Binding applies to both generations, not just text/status or a numeric PID. */
+  reset();
+  for (unsigned mutation = 0u; mutation < 13u; ++mutation) {
+    *r = *proved;
+    switch (mutation) {
+      case 0: ++r->pid; break;
+      case 1: ++r->process_start_key; break;
+      case 2: ++r->process_creation_filetime_100ns; break;
+      case 3: ++r->ppid; break;
+      case 4: ++r->parent_process_start_key; break;
+      case 5: ++r->parent_process_creation_filetime_100ns; break;
+      case 6: r->parent_pid_state = EDR_PARENT_PID_CONFLICT; break;
+      case 7: r->parent_pid_state = EDR_PARENT_PID_INVALID; break;
+      case 8: strcpy(r->parent_resolution_source, "process_tree_cache"); break;
+      case 9: r->parent_context_binding = (EdrParentContextBinding){0}; break;
+      case 10: r->process_start_key = 0u; break;
+      case 11: r->process_creation_filetime_100ns = 0u; break;
+      case 12: strcpy(r->parent_resolution_status, "CONFLICT"); break;
+    }
+    assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+    assert(!r->parent_cmdline[0] && !r->parent_process_start_key);
+    assert(!r->parent_context_binding.child_start_key);
+  }
+
+  /* A proved edge and incomplete display text are independent facts. */
+  *r = *proved;
+  strcpy(r->parent_resolution_status, "NOT_EVALUABLE");
+  edr_behavior_mark_source_truncated(r, "source.parent_path");
+  assert(p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(edr_behavior_parent_context_bound(r));
+  assert(!strcmp(r->parent_resolution_status, "NOT_EVALUABLE"));
+  assert(edr_behavior_source_field_truncated(r, "source.parent_path"));
+
+  /* The proof survives missing text, then exact same-generation metadata can
+   * complete it without opening a new live process or retaining truncation. */
+  r->parent_name[0] = r->parent_cmdline[0] = '\0';
+  edr_behavior_mark_source_truncated(r, "source.parent_cmdline");
+  put(7001u, 100u, a, "parent-A.exe", "COMPLETE_SAME_GENERATION_COMMAND");
+  live_queries = 0;
+  assert(p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!strcmp(r->parent_cmdline, "COMPLETE_SAME_GENERATION_COMMAND"));
+  assert(!strcmp(r->parent_resolution_status, "RESOLVED"));
+  assert(!edr_behavior_source_field_truncated(r, "source.parent_path"));
+  assert(!edr_behavior_source_field_truncated(r, "source.parent_cmdline"));
+  assert(live_queries == 0u);
+
+  /* New explicit conflicts retract the old proof even if a live query could
+   * return a current PID occupant. The conflicting evidence must win. */
+  *r = *proved;
+  put(7001u, 100u, a, "parent-A.exe", "A_SYNTHETIC_TEXT");
+  put(7001u, 101u, a, "parent-X.exe", "X_SYNTHETIC_TEXT");
+  live_queries = 0;
+  assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  assert(live_queries == 0u && !r->parent_cmdline[0]);
+
+  reset(); *r = *proved;
+  assert(edr_pt_cache_put_generation_with_parent_state(r->pid, 4242u, "child", NULL,
+      "child", NULL, c, r->process_start_key, filetime(c), 0u, EDR_PARENT_PID_KNOWN) == 0);
+  assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+
+  reset(); *r = *proved;
+  put(7001u, 100u, a, "parent-A.exe", "A_SYNTHETIC_TEXT");
+  assert(edr_pt_cache_mark_exit_generation(7001u, 100u, c - 100u) == 0);
+  assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+
+  reset(); *r = *proved;
+  assert(edr_pt_cache_observe_exit_generation(7001u, 0u, filetime(a + 100u), c + 100u)
+      == EDR_PTC_EXIT_PENDING);
+  assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!r->parent_context_binding.child_start_key && !r->parent_cmdline[0]);
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  /* Losing the negative cache entry cannot resurrect a revoked record proof. */
+  reset(); live_queries = 0;
+  put(7001u, 100u, a, "parent-A.exe", "A_SYNTHETIC_TEXT");
+  assert(edr_pt_cache_mark_alive_generation(7001u, 100u, filetime(a), c) == 0);
+  assert(!p0_enrich_parent_context(r, unavailable_live_parent));
+  assert(!strcmp(r->parent_resolution_source, "parent_generation_conflict"));
+  assert(!r->parent_context_binding.child_start_key && live_queries == 0u);
+  free(proved); free(r); reset();
+  assert(!p0_enrich_parent_context(NULL, unavailable_live_parent));
+}
+
 int main(int argc, char **argv) {
   const uint64_t a = UINT64_C(2000000000000000000);
   const uint64_t i = a + UINT64_C(2000000000);
@@ -44,6 +153,8 @@ int main(int argc, char **argv) {
   const char *output_directory = argc == 2 ? argv[1] : NULL;
   ProcessTreeEntry parent;
   EdrBehaviorRecord *r;
+
+  test_repeated_parent_enrichment();
 
   reset(); put(7001u, 100u, a, "parent-A.exe", "A_SYNTHETIC_TEXT");
   put(7001u, 300u, b, "parent-B.exe", "B_SYNTHETIC_TEXT");

@@ -800,7 +800,8 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
   uint64_t selector_ns;
   if (!edr_behavior_parent_pid_usable(r) || !snapshot ||
       network_actor_generation_unbound(r) ||
-      strcmp(r->parent_resolution_source, "parent_generation_conflict") == 0) {
+      strcmp(r->parent_resolution_source, "parent_generation_conflict") == 0 ||
+      strcmp(r->parent_resolution_status, "CONFLICT") == 0) {
     return 0;
   }
   if (!generation_birth_unix_ns(r->process_creation_filetime_100ns, &child_birth_ns))
@@ -844,11 +845,7 @@ static int record_parent_snapshot(const EdrBehaviorRecord *r,
 }
 
 static int record_parent_context_proven(const EdrBehaviorRecord *r) {
-  return edr_behavior_parent_pid_usable(r) && r->parent_process_start_key &&
-      r->parent_process_creation_filetime_100ns &&
-      r->process_creation_filetime_100ns >= r->parent_process_creation_filetime_100ns &&
-      (strcmp(r->parent_resolution_source, "live_parent_generation") == 0 ||
-       strcmp(r->parent_resolution_source, "process_tree_cache_verified") == 0);
+  return edr_behavior_parent_context_bound(r);
 }
 
 static int cached_parent_source_proven(const char *source) {
@@ -872,6 +869,7 @@ static void apply_proven_parent_reference(EdrBehaviorRecord *r,
   if (strcmp(r->parent_resolution_source, "live_parent_generation") != 0)
     copy_s(r->parent_resolution_source, sizeof(r->parent_resolution_source),
            "process_tree_cache_verified");
+  edr_behavior_bind_parent_context(r);
 }
 
 static int record_parent_generation(const EdrBehaviorRecord *r,
@@ -1350,9 +1348,10 @@ void edr_local_evidence_cache_enrich_behavior(EdrBehaviorRecord *r) {
   }
   const char *cache_reason = "cache_miss";
   evidence_cache_lock();
-  if (record_parent_context_proven(r) &&
-      parent_tuple_conflicted(r->ppid, r->parent_process_start_key,
-                               r->parent_process_creation_filetime_100ns)) {
+  if (strcmp(r->parent_resolution_status, "CONFLICT") == 0 ||
+      (record_parent_context_proven(r) &&
+       parent_tuple_conflicted(r->ppid, r->parent_process_start_key,
+                                r->parent_process_creation_filetime_100ns))) {
     edr_behavior_clear_parent_context(r);
     copy_s(r->parent_resolution_source, sizeof(r->parent_resolution_source),
            "parent_generation_conflict");

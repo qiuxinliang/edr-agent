@@ -121,7 +121,52 @@ static void test_payload(size_t command_chars, int duplicate_alias, WCHAR charac
   assert(edr_tdh_build_slot_payload(&event, security_audit ? "sec" : "kproc", slot.data, 32u) == 0u);
 }
 
+static void test_stop_target_fields(void) {
+  const uint64_t epoch = UINT64_C(116444736000000000);
+  for (int fault = 0; fault <= 15; ++fault) {
+    EVENT_RECORD event = {0};
+    EdrKernelProcessStop stop;
+    const char *reason = NULL;
+    uint32_t pid = fault == 14 ? 0u : 701u;
+    uint64_t pid_wide = pid;
+    uint64_t birth = fault == 5 ? 0u : UINT64_C(134364124853938854);
+    uint64_t exit = fault == 6 ? 0u : birth + UINT64_C(20000000);
+    uint64_t arbitrary_key = 999u;
+    if (fault == 7) exit = birth - 1u;
+    if (fault == 8) exit = UINT64_MAX;
+    event.EventHeader.ProviderId = fault == 12 ? EDR_ETW_GUID_SECURITY_AUDIT
+                                               : EDR_ETW_GUID_KERNEL_PROCESS;
+    event.EventHeader.ProcessId = 4u;
+    event.EventHeader.EventDescriptor.Id = 2u;
+    event.EventHeader.EventDescriptor.Task = fault == 10 ? 3u : 2u;
+    event.EventHeader.EventDescriptor.Opcode = fault == 11 ? 1u : 2u;
+    event.EventHeader.EventDescriptor.Version = fault == 9 ? 3u : 2u;
+    event.EventHeader.TimeStamp.QuadPart = (LONGLONG)(birth + 90000000u);
+    s_record = &event;
+    s_count = 0u;
+    add(fault == 1 ? L"ProcessId" : L"ProcessID",
+        fault == 2 ? (const void *)&pid_wide : (const void *)&pid,
+        fault == 2 ? sizeof(pid_wide) : sizeof(pid));
+    add(fault == 15 ? L"CreationTime" : L"CreateTime", &birth, fault == 3 ? 4u : sizeof(birth));
+    add(fault == 13 ? L"Timestamp" : L"ExitTime", &exit, fault == 4 ? 4u : sizeof(exit));
+    add(L"ProcessStartKey", &arbitrary_key, sizeof(arbitrary_key));
+    add(L"UniqueProcessKey", &arbitrary_key, sizeof(arbitrary_key));
+    add(L"ProcessSequenceNumber", &arbitrary_key, sizeof(arbitrary_key));
+    memset(&stop, 0xa5, sizeof(stop));
+    int accepted = edr_tdh_kernel_process_stop(&event, &stop, &reason);
+    assert(reason && reason[0]);
+    if (fault == 0) {
+      assert(accepted && stop.pid == pid && stop.creation_filetime_100ns == birth);
+      assert(stop.exit_time_ns == (exit - epoch) * 100u);
+    } else {
+      assert(!accepted && !stop.pid && !stop.creation_filetime_100ns && !stop.exit_time_ns);
+    }
+  }
+  puts("typed Stop target fields: exact widths, missing/alias identities, bad times and descriptors rejected");
+}
+
 int main(void) {
+  test_stop_target_fields();
   for (int security_audit = 0; security_audit <= 1; ++security_audit) {
     test_payload(16u, 0, L'x', security_audit);
     test_payload(4050u, 0, L'x', security_audit);

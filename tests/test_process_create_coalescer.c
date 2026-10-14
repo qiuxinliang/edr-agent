@@ -116,6 +116,42 @@ int main(void) {
   static EdrBehaviorRecord out;
   int ok = 1;
 
+  /* A proved kernel parent tuple owns even its absent display fields. 4688
+   * may enrich the child command/token, but cannot lend unrelated parent text
+   * or manufacture the internal proof stamp for an unproved kernel record. */
+  for (unsigned bound = 0u; bound < 2u; ++bound) {
+    static EdrBehaviorRecord kernel;
+    static EdrBehaviorRecord security;
+    edr_process_coalescer_reset();
+    rec(&kernel, 4500u, 0, 50u, "C:\\child.exe", 1789252694245704300LL);
+    rec(&security, 4500u, 1, 0u, "C:\\child.exe", 1789252694245719700LL);
+    kernel.process_creation_filetime_100ns = 133801632000000000ULL;
+    kernel.parent_process_start_key = 40u;
+    kernel.parent_process_creation_filetime_100ns = 133801631000000000ULL;
+    strcpy(kernel.parent_resolution_source, "process_tree_cache_verified");
+    strcpy(kernel.parent_resolution_status, "NOT_EVALUABLE");
+    if (bound) edr_behavior_bind_parent_context(&kernel);
+    strcpy(security.parent_name, "unproved-audit-parent.exe");
+    strcpy(security.parent_path, "C:\\unproved-audit-parent.exe");
+    security.parent_context_binding = (EdrParentContextBinding){
+        4500u, 4u, 999u, 133801632000000000ULL, 999u, 133801631000000000ULL};
+    ok &= need(edr_process_coalescer_submit(&kernel, 1, 10u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_submit(&security, 1, 20u, &out) == EDR_PROCESS_COALESCE_HOLD &&
+                   edr_process_coalescer_poll(WINDOW_NS + 20u, &out) == 1,
+               "parent proof fixture coalesces at the existing deadline");
+    ok &= need(!memcmp(&out.parent_context_binding, &kernel.parent_context_binding,
+                       sizeof(kernel.parent_context_binding)),
+               "only the kernel internal parent binding crosses the merge");
+    ok &= need(strcmp(out.cmdline, security.cmdline) == 0 &&
+                   strcmp(out.user_sid, security.user_sid) == 0,
+               "parent protection preserves command and token enrichment");
+    ok &= need(bound ? (!out.parent_name[0] && !out.parent_path[0] &&
+                         edr_behavior_parent_context_bound(&out))
+                     : (!strcmp(out.parent_name, security.parent_name) &&
+                        !edr_behavior_parent_context_bound(&out)),
+               "advisory parent text never attaches to a proved kernel parent generation");
+  }
+
   /* A failed EvtRender must remain non-correlatable. Once the real recorded
    * timestamp is available, the same source pair may merge; callback time is
    * never an acceptable substitute and no safety gate is relaxed. */
