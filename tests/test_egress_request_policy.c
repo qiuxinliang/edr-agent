@@ -19,6 +19,91 @@ static int check(const char *method, const char *path, const char *body) {
   return edr_egress_request_validate(method, path, body ? "application/json" : NULL,
       body, body ? strlen(body) : 0u, reason, sizeof(reason));
 }
+static const char *const parent_exit_metrics[] = {
+  "exit_invalid", "exit_duplicate", "exit_conflict", "pending_exits",
+  "pending_exits_stored", "pending_exits_applied", "pending_exits_expired",
+  "pending_exits_capacity_rejected"
+};
+static cJSON *parent_exit_health(const char *profile, int zero) {
+  cJSON *root = cJSON_Parse("{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.669\","
+      "\"policy_version\":\"p\",\"engine_health\":{\"monitor\":{},"
+      "\"resource\":{\"process_id\":1234,\"cpu_percent\":2},"
+      "\"sensor_health\":{\"process_identity\":{\"missing_create\":9}}}}");
+  assert(root);
+  cJSON *health = cJSON_GetObjectItemCaseSensitive(root, "engine_health");
+  assert(cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(health, "monitor"), "profile", profile));
+  cJSON *identity = cJSON_GetObjectItemCaseSensitive(
+      cJSON_GetObjectItemCaseSensitive(health, "sensor_health"), "process_identity");
+  for (size_t i = 0; i < sizeof(parent_exit_metrics) / sizeof(parent_exit_metrics[0]); ++i)
+    assert(cJSON_AddNumberToObject(identity, parent_exit_metrics[i], zero ? 0 : (double)(i + 1u)));
+  return root;
+}
+static void check_health_routes(cJSON *root, int allowed) {
+  char *body = cJSON_PrintUnformatted(root); assert(body);
+  assert((check("POST", "ingest/engine-health", body) == 0) == allowed);
+  free(body);
+  cJSON *update = cJSON_AddObjectToObject(root, "engine_health_update"); assert(update);
+  assert(cJSON_AddNumberToObject(update, "version", 2));
+  assert(cJSON_AddStringToObject(update, "base", "rev"));
+  assert(cJSON_AddArrayToObject(update, "removed"));
+  body = cJSON_PrintUnformatted(root); assert(body);
+  assert((check("POST", "ingest/engine-health/delta", body) == 0) == allowed);
+  free(body); cJSON_DeleteItemFromObjectCaseSensitive(root, "engine_health_update");
+}
+static void test_parent_exit_health_projection(void) {
+  /* Both monitor profiles publish these bounded diagnostics. This exercises
+   * the real projection/HTTP gate, not the Agent's runtime snapshot builder. */
+  const char *profiles[] = {"basic", "diagnostic"};
+  for (size_t profile = 0; profile < 2u; ++profile) {
+    for (int zero = 0; zero < 2; ++zero) {
+      cJSON *expected = parent_exit_health(profiles[profile], zero);
+      cJSON *raw = cJSON_Duplicate(expected, 1); assert(raw);
+      cJSON *health = cJSON_GetObjectItemCaseSensitive(raw, "engine_health");
+      cJSON *identity = cJSON_GetObjectItemCaseSensitive(
+          cJSON_GetObjectItemCaseSensitive(health, "sensor_health"), "process_identity");
+      assert(cJSON_AddStringToObject(identity, "parent_path", "synthetic-private-parent"));
+      assert(cJSON_AddNumberToObject(identity, "unknown_counter", 7));
+      assert(cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(health, "resource"),
+                                    "process_path", "synthetic-private-agent"));
+      check_health_routes(raw, 0);
+      char *body = cJSON_PrintUnformatted(raw); assert(body);
+      char reason[128]; char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+      cJSON *projected = cJSON_Parse(wire); assert(projected);
+      assert(cJSON_Compare(projected, expected, 1));
+      assert(!strstr(wire, "synthetic-private") && !strstr(wire, "unknown_counter"));
+      check_health_routes(projected, 1);
+      free(body); free(wire); cJSON_Delete(projected); cJSON_Delete(raw); cJSON_Delete(expected);
+    }
+  }
+  const char *invalid[] = {"\"synthetic-private-counter\"", "true", "null", "{}", "[]",
+                           "-1", "1.5", "1e20"};
+  const size_t count = sizeof(parent_exit_metrics) / sizeof(parent_exit_metrics[0]);
+  for (size_t field = 0; field <= count; ++field) {
+    for (size_t value = 0; value < sizeof(invalid) / sizeof(invalid[0]); ++value) {
+      cJSON *raw = parent_exit_health("basic", 0);
+      cJSON *health = cJSON_GetObjectItemCaseSensitive(raw, "engine_health");
+      cJSON *parent = field == count ? cJSON_GetObjectItemCaseSensitive(health, "resource") :
+          cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health, "sensor_health"), "process_identity");
+      const char *key = field == count ? "process_id" : parent_exit_metrics[field];
+      assert(cJSON_ReplaceItemInObjectCaseSensitive(parent, key, cJSON_Parse(invalid[value])));
+      check_health_routes(raw, 0);
+      char *body = cJSON_PrintUnformatted(raw); assert(body);
+      char reason[128]; char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+      cJSON_DeleteItemFromObjectCaseSensitive(parent, key);
+      cJSON *projected = cJSON_Parse(wire); assert(projected);
+      assert(cJSON_Compare(projected, raw, 1));
+      check_health_routes(projected, 1);
+      free(body); free(wire); cJSON_Delete(projected); cJSON_Delete(raw);
+    }
+  }
+  cJSON *raw = parent_exit_health("basic", 0);
+  cJSON *resource = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(raw, "engine_health"), "resource");
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(resource, "process_id", cJSON_CreateNumber(4294967295.0)));
+  check_health_routes(raw, 1);
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(resource, "process_id", cJSON_CreateNumber(4294967296.0)));
+  check_health_routes(raw, 0);
+  cJSON_Delete(raw);
+}
 static void test_diagnostic_health_commitments(void) {
   const char *diagnostic = "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.648\",\"policy_version\":\"p\",\"engine_health\":{"
       "\"monitor\":{\"profile\":\"diagnostic\",\"request_id\":\"hm-1791650000000\"},"
@@ -283,6 +368,7 @@ static void test_upgrade_health_consumers(void) {
   assert(check("POST", "ingest/engine-health/delta", delta) == 0);
 }
 int main(void) {
+  test_parent_exit_health_projection();
   test_diagnostic_health_commitments();
   test_upgrade_health_consumers();
   test_health_leaf_delta();
