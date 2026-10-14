@@ -656,6 +656,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
             lines.append('target_compile_definitions(test_p0_direct_emit_suppression PRIVATE EDR_P0_DIRECT_EMIT_TESTING=1)')
             if with_sqlite:
                 lines += [
+                    # Mirror the real target's private test-clock definition.
+                    'target_compile_definitions(test_process_tree_cache PRIVATE EDR_PTC_TESTING=1)',
                     'target_compile_definitions(test_behavior_record_alert_emit PRIVATE EDR_HAVE_NANOPB=1 EDR_HAVE_SQLITE=1 EDR_OS_WINDOWS=1)',
                     'target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_SQLITE=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)',
                     'if(TARGET SQLite3::SQLite3)',
