@@ -7,7 +7,7 @@ This section describes the development patch prepared from
 `codex/rtq-result-delivery-pressure`. It supersedes the third batch's list of
 unfinished features only where implementation and evidence are explicitly stated
 below. HEAD remains 10 commits ahead of audit 662 and one ahead of the comparison
-SHA. Earlier batch results below remain historical evidence, not current gates.
+SHA at preparation. Earlier batch results below remain historical evidence, not current gates.
 
 The user has now authorized completing the implementation and deploying through
 the client for verification. The selected endpoint is the existing UTM Windows
@@ -17,6 +17,24 @@ by this single-client validation. Native CI and deployment results are pending
 at the source freeze. Permanent historical-data disposal is still a separate
 authorization. Additive metadata classifies new writes; it does not silently
 convert old payloads into disposable inventory.
+
+### Candidate release verification
+
+The reviewed 66-file implementation was committed and pushed as
+`caa4c4ad9b9f94a80600028d38f88f44d7786384`. Candidate 3.2.674 run
+`38680417809` stopped at the native Windows release build-dependency gate:
+MSVC rejected the queue test's local identifier `small`, which collides with
+the Windows SDK `rpcndr.h` type macro. No client deployment occurred. The fix
+only renames the two test locals and adds the SDK macro to the existing
+non-Windows declaration fixture; production behavior is unchanged. The focused
+cross-platform compile check passes, and queue storage / real-codec recovery
+tests pass 2/2 (13.90 s). Raw results are
+`/tmp/edr-675-windows-macro-check.log` and `/tmp/edr-675-queue-gates.log`.
+
+The immutable release owner binds 3.2.674 to the previous source/run, so the
+corrected source proceeds as candidate 3.2.675, without promoting GitHub latest.
+The failed draft and CI evidence remain intact. Native gate and single-client
+deployment results will be appended after they actually complete.
 
 ### Effective policy and ownership
 

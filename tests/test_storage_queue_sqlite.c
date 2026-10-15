@@ -391,7 +391,7 @@ static uint64_t assert_capacity_matches_inventory(const char *path) {
 
 static void assert_retention_health_projection(void) {
   EdrStorageQueueCapacityMetrics metrics;
-  char json[2048], small[8];
+  char json[2048], small_buffer[8];
   cJSON *root, *field, *local;
   edr_storage_queue_get_capacity_metrics(&metrics);
   assert(metrics.accounting_available && metrics.ledger_version == 1u);
@@ -415,7 +415,7 @@ static void assert_retention_health_projection(void) {
   assert(!strstr(json,"source_event_id") && !strstr(json,"payload") && !strstr(json,"cmdline"));
   assert(cJSON_GetArraySize(local) == 2);
   cJSON_Delete(root);
-  assert(edr_queue_retention_health_json(&metrics, small, sizeof(small)) == -1 && small[0] == '\0');
+  assert(edr_queue_retention_health_json(&metrics, small_buffer, sizeof(small_buffer)) == -1 && small_buffer[0] == '\0');
   metrics.accounting_available = 0u;
   assert(edr_queue_retention_health_json(&metrics, json, sizeof(json)) == 0);
   root = cJSON_Parse(json); assert(cJSON_IsObject(root));
@@ -4332,7 +4332,7 @@ static void test_terminal_state_ledger_transaction_and_constant_read(void) {
   assert(edr_storage_queue_enforcement_terminal_precreate("state-ledger-rollback","state-event","state-rule","generation","state-intent",wire,sizeof(wire))==EDR_ENFORCEMENT_TERMINAL_PRECREATE_ERROR);
   assert(terminal_journal_count(path)==0);assert_terminal_state_counts(path);
   assert(edr_storage_queue_enforcement_terminal_precreate("state-ledger-owner","state-event","state-rule","generation","state-intent",wire,sizeof(wire))==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
-  assert_terminal_state_counts(path);uint64_t small=edr_storage_queue_test_last_terminal_vm_steps();assert(small>0u);
+  assert_terminal_state_counts(path);uint64_t small_vm_steps=edr_storage_queue_test_last_terminal_vm_steps();assert(small_vm_steps>0u);
   /* An independent legacy-style SQL writer also updates all state counts.
    * Rollback must undo the owner and counters as one SQLite transaction. */
   sqlite_exec_path(path,"BEGIN IMMEDIATE;UPDATE enforcement_terminal_journal SET state='failed',intent_policy_held=1;ROLLBACK;");
@@ -4342,7 +4342,7 @@ static void test_terminal_state_ledger_transaction_and_constant_read(void) {
   sqlite_exec_path(path,"WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<5000) "
       "INSERT INTO enforcement_terminal_journal(idempotency_key,source_event_key,rule_id,process_generation_key,state,created_at,updated_at) "
       "SELECT 'state-legacy-'||i,'source-'||i,'legacy-rule','generation','failed',1,1 FROM n;");
-  assert_terminal_state_counts(path);uint64_t large=edr_storage_queue_test_last_terminal_vm_steps();assert(large<=small+4u);
+  assert_terminal_state_counts(path);uint64_t large=edr_storage_queue_test_last_terminal_vm_steps();assert(large<=small_vm_steps+4u);
   edr_storage_queue_enforcement_terminal_get_metrics(&metrics);assert(metrics.failed==5000u);
   sqlite_exec_path(path,"UPDATE enforcement_terminal_journal SET state='local_retained',intent_acked=1,combined_acked=1,source_acked=0 WHERE idempotency_key='state-legacy-1';");
   assert_terminal_state_counts(path);edr_storage_queue_enforcement_terminal_get_metrics(&metrics);assert(metrics.local_retained==1u && metrics.failed==4999u);
@@ -4357,7 +4357,7 @@ static void test_terminal_state_ledger_transaction_and_constant_read(void) {
   sqlite_exec_path(path,"UPDATE queue_meta SET terminal_count_pending=0,terminal_count_failed=0,terminal_count_unknown=0,terminal_count_policy_held=0,terminal_count_local_retained=0;");
   assert(edr_storage_queue_open(path)==EDR_OK);assert_terminal_state_counts(path);
   edr_storage_queue_enforcement_terminal_get_metrics(&metrics);assert(metrics.pending==1u && metrics.failed==4999u && metrics.outcome_unknown==1u && metrics.policy_held_frames==2u);
-  fprintf(stderr,"[queue-test] terminal state refresh vm_steps small=%llu retained_5000=%llu; rollback/legacy writer/reopen calibration passed\n",(unsigned long long)small,(unsigned long long)large);
+  fprintf(stderr,"[queue-test] terminal state refresh vm_steps small=%llu retained_5000=%llu; rollback/legacy writer/reopen calibration passed\n",(unsigned long long)small_vm_steps,(unsigned long long)large);
   edr_storage_queue_close();remove(path);
 }
 

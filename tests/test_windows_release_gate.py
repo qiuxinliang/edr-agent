@@ -500,7 +500,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
             source = Path(directory)
             build = source / "build"
             (source / "windows.h").write_text(
-                'void Sleep(unsigned long);\n', encoding="utf-8")
+                '/* Windows SDK rpcndr.h reserves small as a type macro. */\n'
+                '#define small char\nvoid Sleep(unsigned long);\n', encoding="utf-8")
             (source / "process.h").write_text(
                 'int _getpid(void);\nint _putenv_s(const char *, const char *);\n', encoding="utf-8")
             (source / "no_posix.h").write_text(
