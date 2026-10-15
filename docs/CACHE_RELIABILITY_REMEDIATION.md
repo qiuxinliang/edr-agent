@@ -270,7 +270,40 @@ the same final Python source also passed the host POSIX path, recorded in
 `/tmp/edr-680-native-acl-host-check.json`. The removed PowerShell startup cost
 was a fixture problem; it does not change the installed Agent or explain the
 two historical 679 upgrade failures. Official native release gates and actual
-680 client deployment are still required.
+new-client deployment are still required.
+
+The repair was committed and pushed as
+`c07ebb942205200e4f942e2ab7580a4c164aaf3d`, after the strict synthetic-CA
+fixture repair `508b915b275efd893024069482955a861cba6390`. A subsequent
+cross-consumer check found a stale test in `test_windows_release_gate.py`
+which AST-extracted the removed `windows_ps` helper. Its focused invocation
+reproduced StopIteration; it is not a runtime lock or ACL failure. The obsolete
+test is removed with that absent consumer; the separate packaging PowerShell
+environment-isolation tests remain, and real Windows ACL behavior is covered
+by the complete preflight fixtures above. No unused helper is restored merely
+to satisfy an obsolete test.
+
+Candidate 680 run `38728352109` had already started against c07ebb94. It was
+cancelled at 11:36:42 UTC before native runtime/telemetry gates completed.
+Preparation had bound draft release `413734807` to that source and run; it has
+no assets or publication time. It is retained unchanged, not reused for a
+different source. The next candidate is 681. Cancelled is not a passing gate;
+the original run logs are
+`/private/tmp/edr-680-release-run-y83yo3c7/raw-logs.zip` (SHA-256
+`705af759e2ab614ff4125055ad6cbb4ce1cedf9bb2763b9ede89c0d4435c453b`).
+No additional installed-client upgrade was attempted.
+
+The complete host release-contract entry point ran all 25 fixtures in
+448.808 seconds: 24 passed and one exposed another stale test adapter. Its
+compile-only simulated Windows header lacked the SRWLOCK/CONDITION_VARIABLE
+types and declarations now used by the real cache concurrency tests. Nine
+lines add only those SDK-compatible declarations/initializers, with no runtime
+stub or production change. Both consumers of that temporary header (with and
+without SQLite) then passed in 2.893 seconds. Thus all 25 distinct contracts
+have passing results across the original run and two focused rechecks; the
+original full run remains failed, not 26 independent tests or a rewritten
+success. Raw results are
+`/private/tmp/edr-680-gate-acl-consumer-g74hy48y/{full.log,result.json,two-consumers-green.log,two-consumers-result.json}`.
 
 ## Follow-up: bounded maintenance selection and Windows concurrency coverage
 
