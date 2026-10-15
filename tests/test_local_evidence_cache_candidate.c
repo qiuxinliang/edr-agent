@@ -4588,12 +4588,40 @@ static void test_context_manifest_discloses_32_item_truncation(void) {
   (void)remove("local_evidence_cache_manifest_32.sqlite-shm");
 }
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+typedef HANDLE EvidenceCacheTestThread;
+typedef DWORD (WINAPI *EvidenceCacheTestThreadMain)(void *);
+#define EVIDENCE_CACHE_TEST_THREAD_MAIN DWORD WINAPI
+static EvidenceCacheTestThread evidence_cache_test_start_thread(
+    EvidenceCacheTestThreadMain entry, void *context) {
+  HANDLE thread = CreateThread(NULL, 0, entry, context, 0, NULL);
+  assert(thread != NULL);
+  return thread;
+}
+static void evidence_cache_test_join_thread(EvidenceCacheTestThread thread) {
+  assert(WaitForSingleObject(thread, 30000) == WAIT_OBJECT_0);
+  assert(CloseHandle(thread));
+}
+#else
+typedef pthread_t EvidenceCacheTestThread;
+typedef void *(*EvidenceCacheTestThreadMain)(void *);
+#define EVIDENCE_CACHE_TEST_THREAD_MAIN void *
+static EvidenceCacheTestThread evidence_cache_test_start_thread(
+    EvidenceCacheTestThreadMain entry, void *context) {
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, entry, context) == 0);
+  return thread;
+}
+static void evidence_cache_test_join_thread(EvidenceCacheTestThread thread) {
+  assert(pthread_join(thread, NULL) == 0);
+}
+#endif
+
 typedef struct {
   const char *path;
 } EvidenceCacheConcurrencyContext;
 
-static void *evidence_cache_concurrent_writer(void *opaque) {
+static EVIDENCE_CACHE_TEST_THREAD_MAIN evidence_cache_concurrent_writer(void *opaque) {
   EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
   (void)ctx;
   for (unsigned i = 0u; i < 80u; ++i) {
@@ -4621,10 +4649,10 @@ static void *evidence_cache_concurrent_writer(void *opaque) {
     edr_local_evidence_cache_record_behavior(&r);
     edr_local_evidence_cache_poll_maintenance();
   }
-  return NULL;
+  return 0;
 }
 
-static void *evidence_cache_concurrent_reader(void *opaque) {
+static EVIDENCE_CACHE_TEST_THREAD_MAIN evidence_cache_concurrent_reader(void *opaque) {
   EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
   (void)ctx;
   for (unsigned i = 0u; i < 80u; ++i) {
@@ -4641,16 +4669,16 @@ static void *evidence_cache_concurrent_reader(void *opaque) {
     (void)edr_local_evidence_cache_process_tree_json(88000u, "ep-concurrent", tree,
                                                       sizeof(tree));
   }
-  return NULL;
+  return 0;
 }
 
-static void *evidence_cache_concurrent_lifecycle(void *opaque) {
+static EVIDENCE_CACHE_TEST_THREAD_MAIN evidence_cache_concurrent_lifecycle(void *opaque) {
   EvidenceCacheConcurrencyContext *ctx = (EvidenceCacheConcurrencyContext *)opaque;
   for (unsigned i = 0u; i < 20u; ++i) {
     edr_local_evidence_cache_close();
     assert(edr_local_evidence_cache_open(ctx->path, 8u, 24u) == 0);
   }
-  return NULL;
+  return 0;
 }
 
 /* Preprocess writers, main-thread health/RTQ readers, and close/reopen must
@@ -4659,18 +4687,18 @@ static void *evidence_cache_concurrent_lifecycle(void *opaque) {
 static void test_concurrent_cache_lifecycle_snapshot_and_queries(void) {
   const char *db = "local_evidence_cache_concurrent.sqlite";
   EvidenceCacheConcurrencyContext ctx = {db};
-  pthread_t writer, reader, lifecycle;
+  EvidenceCacheTestThread writer, reader, lifecycle;
   (void)remove(db);
   (void)remove("local_evidence_cache_concurrent.sqlite-wal");
   (void)remove("local_evidence_cache_concurrent.sqlite-shm");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   edr_pt_cache_init();
-  assert(pthread_create(&writer, NULL, evidence_cache_concurrent_writer, &ctx) == 0);
-  assert(pthread_create(&reader, NULL, evidence_cache_concurrent_reader, &ctx) == 0);
-  assert(pthread_create(&lifecycle, NULL, evidence_cache_concurrent_lifecycle, &ctx) == 0);
-  assert(pthread_join(writer, NULL) == 0);
-  assert(pthread_join(reader, NULL) == 0);
-  assert(pthread_join(lifecycle, NULL) == 0);
+  writer = evidence_cache_test_start_thread(evidence_cache_concurrent_writer, &ctx);
+  reader = evidence_cache_test_start_thread(evidence_cache_concurrent_reader, &ctx);
+  lifecycle = evidence_cache_test_start_thread(evidence_cache_concurrent_lifecycle, &ctx);
+  evidence_cache_test_join_thread(writer);
+  evidence_cache_test_join_thread(reader);
+  evidence_cache_test_join_thread(lifecycle);
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
   edr_local_evidence_cache_close();
   edr_pt_cache_shutdown();
@@ -4680,23 +4708,36 @@ static void test_concurrent_cache_lifecycle_snapshot_and_queries(void) {
 }
 
 typedef struct {
+#if defined(_WIN32)
+  SRWLOCK mutex;
+  CONDITION_VARIABLE cond;
+#else
   pthread_mutex_t mutex;
   pthread_cond_t cond;
+#endif
   unsigned ready;
   int go;
 } EvidenceCacheMutexTimingContext;
 
-static void *evidence_cache_mutex_timing_worker(void *opaque) {
+static EVIDENCE_CACHE_TEST_THREAD_MAIN evidence_cache_mutex_timing_worker(void *opaque) {
   EvidenceCacheMutexTimingContext *ctx = (EvidenceCacheMutexTimingContext *)opaque;
+#if defined(_WIN32)
+  AcquireSRWLockExclusive(&ctx->mutex);
+  ctx->ready++;
+  WakeAllConditionVariable(&ctx->cond);
+  while (!ctx->go) assert(SleepConditionVariableSRW(&ctx->cond, &ctx->mutex, 10000, 0));
+  ReleaseSRWLockExclusive(&ctx->mutex);
+#else
   pthread_mutex_lock(&ctx->mutex);
   ctx->ready++;
   pthread_cond_broadcast(&ctx->cond);
   while (!ctx->go) pthread_cond_wait(&ctx->cond, &ctx->mutex);
   pthread_mutex_unlock(&ctx->mutex);
+#endif
   for (unsigned i = 0u; i < 8u; ++i) {
     edr_local_evidence_cache_test_hold_mutex(1u);
   }
-  return NULL;
+  return 0;
 }
 
 /* Fixed log2 telemetry must distinguish a genuine zero-sample startup from
@@ -4738,11 +4779,24 @@ static void test_mutex_lock_observability_contract(void) {
 
   edr_local_evidence_cache_test_reset_mutex_timing();
   EvidenceCacheMutexTimingContext ctx = {
+#if defined(_WIN32)
+      SRWLOCK_INIT, CONDITION_VARIABLE_INIT, 0u, 0};
+#else
       PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0u, 0};
-  pthread_t workers[4];
+#endif
+  EvidenceCacheTestThread workers[4];
   for (size_t i = 0u; i < sizeof(workers) / sizeof(workers[0]); ++i) {
-    assert(pthread_create(&workers[i], NULL, evidence_cache_mutex_timing_worker, &ctx) == 0);
+    workers[i] = evidence_cache_test_start_thread(evidence_cache_mutex_timing_worker, &ctx);
   }
+#if defined(_WIN32)
+  AcquireSRWLockExclusive(&ctx.mutex);
+  while (ctx.ready < sizeof(workers) / sizeof(workers[0])) {
+    assert(SleepConditionVariableSRW(&ctx.cond, &ctx.mutex, 10000, 0));
+  }
+  ctx.go = 1;
+  WakeAllConditionVariable(&ctx.cond);
+  ReleaseSRWLockExclusive(&ctx.mutex);
+#else
   pthread_mutex_lock(&ctx.mutex);
   while (ctx.ready < sizeof(workers) / sizeof(workers[0])) {
     pthread_cond_wait(&ctx.cond, &ctx.mutex);
@@ -4750,18 +4804,21 @@ static void test_mutex_lock_observability_contract(void) {
   ctx.go = 1;
   pthread_cond_broadcast(&ctx.cond);
   pthread_mutex_unlock(&ctx.mutex);
+#endif
   for (size_t i = 0u; i < sizeof(workers) / sizeof(workers[0]); ++i) {
-    assert(pthread_join(workers[i], NULL) == 0);
+    evidence_cache_test_join_thread(workers[i]);
   }
+#if !defined(_WIN32)
   assert(pthread_cond_destroy(&ctx.cond) == 0);
   assert(pthread_mutex_destroy(&ctx.mutex) == 0);
+#endif
   edr_local_evidence_cache_get_status(&st);
   assert(st.mutex_lock_samples == 32u);
   assert(st.mutex_hold_total_ns > 0u && st.mutex_hold_max_ns > 0u);
   assert(st.mutex_wait_total_ns > 0u && st.mutex_wait_max_ns > 0u);
   edr_local_evidence_cache_close();
 }
-#endif
+#undef EVIDENCE_CACHE_TEST_THREAD_MAIN
 #endif
 
 static void test_identity_generation_match_delta(void) {
@@ -9851,10 +9908,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_context_manifest_utf8_backslash_and_invalid_rejection());
   RUN_CACHE_CASE("context", test_context_manifest_discloses_32_item_truncation());
   RUN_CACHE_CASE("context", test_candidate_structured_evidence_and_durable_identity());
-#if !defined(_WIN32)
   RUN_CACHE_CASE("context", test_concurrent_cache_lifecycle_snapshot_and_queries());
   RUN_CACHE_CASE("context", test_mutex_lock_observability_contract());
-#endif
 #endif
   RUN_CACHE_CASE("context", test_identity_generation_match_delta());
   RUN_CACHE_CASE("context", test_unbound_network_actor_never_borrows_open_pid_interval());

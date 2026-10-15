@@ -1,5 +1,206 @@
 # Cache reliability remediation
 
+## 2026-10-15 candidate 679: native gates passed, client upgrade rolled back
+
+Current candidate source is `d0c49a193bb14d42e76bd0bb0412a6241c181044`,
+branch `codex/rtq-result-delivery-pressure` (16 commits ahead of audit 662,
+seven ahead of comparison `3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`).
+The sections below retain preparation and failed-candidate history; their
+pending-release statements describe those earlier checkpoints.
+
+Run `38701907504` completed all seven jobs successfully. AMD64 runtime gates
+passed 99/99 in 278.42 s and standalone telemetry 38/38 in 442.28 s; ARM64
+passed 99/99 in 462.75 s and 38/38 in 465.98 s. The labels overlap in 25 tests
+and must not be added as independent coverage. Actual Inno fixtures passed
+in 10.00 s / 61.42 s. Both native lifecycle jobs verified fresh installation,
+baseline 673 installation, repair, upgrade to 679, embedded updater, rollback
+and uninstall; `setup_rollback_skipped=false`. Fresh-install runtime-policy
+pull warned with exit 2 on both architectures, so this CI success does not
+certify online signed-policy synchronization.
+
+Raw logs are `/tmp/edr-679-ci-all.zip` (SHA-256
+`2c76a1da2847ca4496b1e701ba47209eaeaeca7514a02034c7a147b5e7006a7a`),
+`/tmp/edr-679-ci-summary.json` and
+`/tmp/edr-679-ci-lifecycle-{amd64,arm64}.zip`. The immutable build input is
+P0 commit `896eb2f06c9ffa608085217d4d1e84494b43e564`. Release `win_3.2.679`
+is a prerelease; GitHub latest remains `win_3.2.591`. The workflow pins source
+and assets; GitHub platform Immutable Releases is not enabled.
+
+The verified ARM64 full Bundle was imported through the existing client as
+`artifact_1792054540294394000`. Its binary SHA-256 is
+`17d58fe456c94670e562f8ec73d0cda972a59a9615518bb301854c7cacf4fc2b`.
+The UI then queued only the authorized UTM endpoint at 09:03:35 UTC:
+task `agent_upgrade_1792055015959878000`, command
+`agent_update_1792055018219079000`. Download, verification and installation
+events have matching task/artifact/version identities. At 09:04:31 UTC the
+task failed with `full_installer_rollback_completed`. This is a recovery
+outcome, not the initial failure cause. The same command's local journal is
+`failed_rolled_back`, sequence 5, and `acked.seq=5` with no policy hold; its
+failure event was acknowledged, not converted into a successful upgrade.
+
+The actual process checked at 09:04:44 UTC was PID 9152, started 09:03:55 UTC,
+running the original 673 binary SHA-256
+`9641df3791f7c1f42fe98ecdce75e44f664ca94e60eb97f3d18a7882054163ca`.
+The UI shows online 673 and failed upgrade. A fresh exact-endpoint policy
+sample confirms signed v528 applied and current P0 healthy on that old
+process. Deployment of 679 and its new storage behavior are **not verified**.
+Failure diagnosis must precede another upgrade attempt; no cache was cleared
+and the planned post-upgrade evidence comparison has not been run.
+
+Bounded local evidence is under `/private/tmp/edr-678-client-acceptance/`:
+`upgrade-679-identity.json`, `upgrade-679-state-after-old-binary.json`,
+`upgrade-679-local-after.json`, `upgrade-679-local-invocation.json`,
+`postupgrade-679-path-identity.json` and `upgrade-679-rolled-back.jpg`.
+The directory name reflects its creation before the final candidate, not the
+version actually tested. The authorized two-candidate baseline is explicitly
+a partial association sample; both selected full-command keys were absent,
+so it cannot establish live full-command preservation.
+
+Subsequent bounded diagnosis identified installer exit 7 and the exact guard
+refusal `local_storage_preflight_failed`. The updater's
+`INSTALL_BASELINE_UNSUPPORTED` code is a broad classifier for exit 7 plus
+`PrepareToInstall`/baseline/uninstall text; it does not prove an unsupported
+baseline or insufficient space. See `upgrade-679-failure-selected.json` and
+`upgrade-679-installer-rejection.json` in the same evidence directory.
+The verified release EXE plus all 20 root DLLs then passed the existing
+preflight entry point in an independent temporary directory: exit 0, 343 ms,
+floor 143,479,824 bytes. Owner bytes, owner/parent ACL and configuration hash/ACL
+were unchanged. This direct diagnostic cached the process Handle and redirected
+output, unlike the original Inno launcher; it is not a reproduction of that
+launcher. `release-679-isolated-preflight.json` retains the exact boundary.
+
+The rollback verification did **not** establish preservation of the two old
+candidate samples: both original row IDs were absent, and the bounded sampler
+returned `no_candidate_sample_not_proof`. No replacement candidates were chosen.
+The first failed call's stdout was not saved because a host assertion preceded
+the save; this diagnostic defect and observed exit 3 are explicitly recorded in
+`evidence-subset-rollback-first-read-failure.json`. One identical bounded read
+then saved the refusal as `evidence-subset-after-679-rollback-diagnostic.json`.
+Neither call passed the comparison. The 673 source contains both age retirement
+and pressure deletion of oldest candidates, but the available evidence does not
+identify which path removed these specific rows or establish deletion timing.
+The three previously frozen queue samples did retain all sampled immutable bytes
+and identities (`postrollback-679-queue-compare.json`). The command owner probe
+returned a bounded read/parse failure, not an ACK. These distinct outcomes must
+not be summarized as complete old-evidence preservation.
+
+A diagnostic installer containing the exact 679 EXE and 20 DLLs also ran the
+original Inno preflight command successfully (`launch=1`, `code=0`, floor
+143,479,824 bytes, 3,430 ms). It always refuses before copying files, even when
+preflight succeeds. Its exit 7 is that intentional fixture refusal, not the
+production failure. The owner/configuration hashes and ACLs were unchanged;
+the normal inventory lock may be created/hardened. See
+`679-inno-original-launcher.json`. This result did not establish a fix.
+
+One controlled retry through the client at 09:48:50 UTC used the same verified
+artifact: task `agent_upgrade_1792057730709453000`, command
+`agent_update_1792057733222511000`. It again failed at
+`local_storage_preflight_failed`, installer exit 7, and rolled back. The exact
+4,096-byte diagnostic log SHA-256 is
+`3f9568c352eec2eed9cde6cf55c2daea942f94261f189c9729edcbb2bddc9136`.
+The task's sequence-5 failed-rollback event was acknowledged; this is neither
+a successful deployment nor proof of the separate command-result ACK.
+The numeric child-preflight exit code was not retained by the production log,
+so the initial cause remains unresolved. No speculative launcher change or
+additional real upgrade retry has been made.
+
+A temporary process observer bound the same Setup hash and captured only its
+two start events. It then rejected a Stop event whose name or parent identity
+did not match, before saving that event's fields. It exited without timeout
+and removed both subscriptions. Its two starts and zero exits do not establish
+the preflight cause or a complete process history. Original results remain at
+`/tmp/edr-679-process-observer-ma99grty/`; the diagnostic gap is not hidden by
+the installer result.
+
+At 09:50:11 UTC the actual process was PID 6228, started 09:49:09.517875 UTC,
+still 673 with the original binary hash. Two fresh endpoint samples show
+ordinary health timestamps advancing from 09:54:14 to 09:56:14 UTC on that
+same process; management is online, control stream connected/ready with a
+valid lease, and no circuit/fallback. Signed v528 was verified/applied after
+rollback and P0 is ready/healthy. Both samples report `resource.pressure=true`:
+management recovered, but overall healthy operation and 679 deployment are
+not established. Retry evidence uses `retry-679-*` and
+`postretry-679-path-identity.json` in the same bounded evidence directory;
+`retry-679-rolled-back.jpg` shows the actual client result.
+
+The same frozen, always-refuse diagnostic installer was then invoked once by
+an isolated SYSTEM/Highest scheduled task, without startup triggers or retries.
+It returned `launch=1;code=4;guard=1;floor=0` in 3,712 ms, localizing this
+diagnostic failure to the Agent preflight's owner-accounting/policy path rather
+than failure to launch PowerShell. The task was removed and actual Agent PID
+6228/generation, owner/configuration bytes and ACLs remained unchanged. Current
+direct guest execution is also SYSTEM, ARM64, session 0; the historical direct
+success used a different owner-file snapshot. These observations alone do not
+prove a scheduler or identity cause. Evidence is
+`/tmp/edr-679-scheduled-fixture-sb9ftict/fixture-result.json` and `task-result.json`.
+
+An adjacent direct invocation of that same diagnostic installer succeeded
+(`code=0`, 1,983 ms), as did one direct invocation of the actual 679 EXE with
+bounded stderr classification (exit 0, 173 ms, empty stderr). Their owner-file
+snapshots differ from the scheduled invocation, so neither success eliminates
+the previously observed failure or establishes its cause. No direct probe was
+repeated to obtain a desired result. Results are
+`/tmp/edr-679-adjacent-direct-wabhxl49/comparison.json` and
+`/tmp/edr-679-reason-preflight-6dy33i78/result.json`.
+
+## Follow-up: bounded maintenance selection and Windows concurrency coverage
+
+The additional full UTM queue test exposed an actual read-amplification path
+in the shared capacity-cost expressions: `length(CAST(blob AS BLOB))` loads
+the payload before the maintenance time check. A real SQLite VFS that adds
+1 ms to each main-file read, without replacing I/O or its result, measured
+3,078 reads / 12,607,072 bytes / 3.878 s and no dispositions in the first slice.
+The minimal fix uses `length(column)` only when SQLite reports BLOB storage;
+all other types retain the original CAST expression. The same experiment then
+needed 521 reads / 2,134,008 bytes / 0.651 s and retired one eligible journal.
+No frozen payload, identity, retention condition, capacity limit or schema
+changed. Startup already recreates the accounting triggers and recalibrates
+the nine-category ledger; their accounting semantics remain equal.
+
+The regression adds one 30 ms delay after the first 128 KiB of real main-file
+reads in each maintenance slice. With identical fixture input and the original
+40-turn bound, the old production source fails (2.699 s, 44 deferred rows and
+eight eligible journals remain); the fixed source passes (0.937 s, eight
+delayed slices). Final payload/oversize protection, complete eligible cleanup
+and independent ledger checks are unchanged. Type-equivalence tests exercise
+real INSERT/UPDATE triggers and reopen calibration for BLOB, UTF-8 TEXT with
+embedded NUL, NULL and numeric storage. A single indivisible SQLite delete can
+still exceed 20 ms: that is a cooperative scheduling budget, not a hard lock
+duration guarantee. Raw red/green, commands and source identities are in
+`/private/tmp/edr-680-queue-case-gates/`; the per-read experiment is in
+`/private/tmp/edr-680-queue-blob-cost/`.
+
+Previously POSIX-only cache lifecycle/query and mutex tests now also use
+Win32 threads and bounded waits. The unchanged context group passed 78/78 on
+the host (3.798 s) and the UTM diagnostic build (10.625 s). This adds Windows
+execution coverage; the lifecycle stress test alone does not prove every
+concurrent record survived. Queue competing drain, stale connection ACK and
+concurrent deferred-retain cases likewise execute on Windows. These UTM builds
+use MinGW AMD64 under ARM64 emulation and do not replace native MSVC CI.
+The dead-letter storm's 1,024 attempts / 91 admissions / 933 explicit refusals
+and finite critical-reserve behavior are recorded in the acceptance table.
+
+The current host build completed `edr_agent`, `agent_runtime_gate_tests` and
+`telemetry_minimization_tests`. CTest selected 66 distinct tests: 61 passed and
+five loopback server tests failed solely at sandbox socket binding (72.13 s).
+Those five were rerun with local-listener permission and passed 5/5 (54.39 s);
+the original failures remain recorded. Thus all 66 selected contracts passed
+across the two runs, not 71 independent tests. Commands, source SHA-256 values
+and results are `/tmp/edr-680-local-gate-provenance.json`,
+`/tmp/edr-680-local-final-gates.log` and
+`/tmp/edr-680-local-network-gates.log`. The host still uses the explicitly
+documented P0 stub; it is not native Windows field acceptance.
+
+The final fixed queue executable also passed the complete UTM suite once in
+30.219 s (exit 0, no timeout), including the unchanged 40-turn fixture, slow
+VFS, type accounting, dead-letter storm and all Windows thread cases. EXE
+SHA-256 is `780d9419be09cb10f8fa36249831ca59a2e0b3ce7a81c531fa2425b9793d9eb0`;
+source identities and full results are retained under
+`/private/tmp/edr-680-queue-case-gates/` and
+`/private/tmp/edr-680-queue-case-native/`. The earlier failed full run is not
+reclassified as passed; this is the verified result after the production
+cost-expression repair. Native MSVC AMD64/ARM64 CI remains required.
+
 ## 2026-10-15 fourth batch: value retention, bounded owners and physical admission
 
 This section describes the development patch prepared from
@@ -668,14 +869,14 @@ migration is not part of the authorized deployment.
 | --- | --- | --- |
 | 1. Sustainable rotation, retained causality | Queue comparison covers 12 windows without full-fact delivery; cache comparison covers 8 virtual hours with exact parent generations and complete selected groups. Protected or oversized old owners cause explicit refusal. | Windows new-client sustained operation; no claim of guaranteed days at arbitrary input rates. |
 | 2. Same-budget comparison | Frozen old/current sources, identical encoded inputs, retained event ranges, complete chains, sampled DB/WAL/SHM, CPU and VFS issued writes are recorded above. | Device-level I/O and a production workload are not represented by the host fixture. |
-| 3. Critical reserve | Ordinary full stock cannot consume terminal/action completion reserve; finite critical exhaustion refuses before action. | Native release gate and installed-client health. |
-| 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. | Final source gate. |
-| 5. Result budget | Real insert, growth, 1,000 serial copies and four concurrent writers; busy and commit failure preserve existing bytes; owner JSONL and optional copy failure are separate. | Native release gate and client result delivery. |
-| 6. Pressure/network cases | Candidate dedupe/aggregation, unique and high-priority capacity, long subject/parent commands, query-pin refusal, dead-letter ownership, offline/ACK loss and policy refusal are exercised. Loopback mTLS sends actual HTTP 429 and 503, retains pending retry clocks, admits fresh work, and accepts the exact retry body only after a successful receipt. | Final loopback test result and installed-client reconnect/delivery. |
-| 7. Concurrency/restart | Real concurrent query/lifecycle tests, bounded queue snapshots, generation-bound projections, ACK/retirement rollback and child-process termination around migration/retirement commits. | Native process/crash cases in the release gate. A killed process is not a hardware power-loss test. |
-| 8. Time/physical pressure | Wall/monotonic window rules, SQLite busy, pinned readers, runtime zero-space ACK refusal, guarded checkpoint and isolated native NTFS disk-full/recovery. | Actual installed database headroom and startup outcome. |
-| 9. Frozen identity | Exact old payload/hash/batch/owner comparisons, known PPID, PID reuse, uint64 generation and old-binary guarded rollback tests. | New native sensor and installed-client identity checks; old policy-3 delivery downgrade remains unsupported. |
-| 10. Minimal egress | Real protobuf/RAW/LZ4 round trips, bounded authorized query and final HTTP field assertions; source facts stay local after ordinary delivery. | Native gates and actual client/server consumers. |
+| 3. Critical reserve | Ordinary full stock cannot consume terminal/action completion reserve; finite critical exhaustion refuses before action. Both 679 native gates passed. | Installed new-client admission and health. |
+| 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. Final production source passed both 679 native gates. | No promise of unlimited critical admission. |
+| 5. Result budget | Real insert, growth, 1,000 serial copies and four concurrent writers; busy and commit failure preserve existing bytes; owner JSONL and optional copy failure are separate. Both 679 native gates passed. | Installed new-client necessary result and durable server receipt. |
+| 6. Pressure/network cases | Candidate dedupe/aggregation, unique and high-priority capacity, long commands, pin refusal, offline/ACK loss and policy refusal; real loopback mTLS 429/503 with exact successful receipts. Additional fixed-budget dead-letter storm: 1,024 attempts, 91 admits, 933 explicit refusals, 59 saturated waves, 420,693-byte logical plateau; reserved terminal and precreated result remain usable; source uploads/ACKs zero. | Storm uses this queue fixture's transport/codec stubs; it does not replace actual wire tests. Installed-client reconnect/delivery remains separate. |
+| 7. Concurrency/restart | 679 native child-process migration/reclaim crash cases passed. Previously POSIX-only cache lifecycle/query and mutex tests now execute on UTM, as do queue competing drains, stale event/journal connections and concurrent deferred retain. | New Windows test bridges still require native MSVC CI. MinGW AMD64 on ARM64 emulation is additional evidence. A killed process is not hardware power loss. The additional full UTM queue run failed its old 40-slice fixture; retain this failure separately from focused passes. |
+| 8. Time/physical pressure | Wall/monotonic window rules, SQLite busy, pinned readers, zero-space ACK refusal, guarded checkpoint and isolated native NTFS disk-full/recovery. | 679 real upgrade refused preflight and rolled back; isolated original release preflight passes do not certify installed new-client startup. Physical admission is not an atomic directory quota. |
+| 9. Frozen identity | Exact payload/hash/batch/owner, known PPID, PID reuse, uint64 generation and guarded old-reader tests passed both native gates. Three sampled old queue owners remain unchanged after the failed upgrade. | Two original evidence candidate samples are missing after rollback: preservation is unverified and deletion timing/cause unknown. New installed-client checks remain pending; old policy-3 delivery downgrade remains unsupported. |
+| 10. Minimal egress | Real protobuf/RAW/LZ4 round trips, bounded authorized query and final HTTP field assertions; source facts stay local after ordinary delivery; both 679 native gates passed. | Actual client/server consumers and unenumerated wire routes must not be inferred from server-filtered rows or empty completed-batch payloads. |
 
 The Windows release must compile AMD64 and ARM64, run its native gate and actual
 ISCC install/repair/rollback fixture, and retain immutable source/artifact

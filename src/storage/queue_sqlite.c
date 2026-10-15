@@ -438,8 +438,14 @@ static int queue_sql_sum_locked(const char *sql, uint64_t *out) {
  * retained payload, including dead-letter and policy-held payloads, remains
  * charged. Text is measured as UTF-8 bytes (SQLite length(TEXT) counts Unicode
  * characters and stops at NUL); producer estimates use the same byte unit. */
+/* length(BLOB) can use SQLite's record header. Casting an already-BLOB wire
+ * materializes its complete bytes during bounded maintenance selection.
+ * Historical non-BLOB values retain the original UTF-8/NUL byte accounting. */
+#define QUEUE_LEDGER_PAYLOAD_BYTES(p, column) \
+  "(CASE WHEN typeof(" p column ")='blob' THEN length(" p column ") " \
+  "ELSE length(CAST(" p column " AS BLOB)) END)"
 #define QUEUE_LEDGER_EVENT_COST(p) \
-  "length(CAST(" p "batch_id AS BLOB))+length(CAST(" p "payload AS BLOB))+512+" \
+  "length(CAST(" p "batch_id AS BLOB))+" QUEUE_LEDGER_PAYLOAD_BYTES(p, "payload") "+512+" \
   "CASE WHEN " p "recovery_version>0 THEN 512 ELSE 0 END+" \
   "CASE WHEN " p "retention_policy_version=2 THEN 512+" \
   "length(CAST(" p "local_source_event_id AS BLOB))+length(CAST(" p "local_reason AS BLOB))+" \
@@ -455,13 +461,13 @@ static int queue_sql_sum_locked(const char *sql, uint64_t *out) {
   QUEUE_SQL_STRINGIFY(EDR_TERMINAL_STATE_RESERVE_BYTES) " THEN " \
   QUEUE_SQL_STRINGIFY(EDR_TERMINAL_STATE_RESERVE_BYTES) " ELSE NULL END+" \
   "length(CAST(" p "intent_batch_id AS BLOB))+" \
-  "COALESCE(length(CAST(" p "intent_wire AS BLOB)),0)+1024+" \
-  "MAX(length(CAST(" p "source_batch_id AS BLOB))+COALESCE(length(CAST(" p "source_wire AS BLOB)),0)+" \
-  "length(CAST(" p "combined_batch_id AS BLOB))+COALESCE(length(CAST(" p "combined_wire AS BLOB)),0)," p "reserved_bytes)+" \
+  "COALESCE(" QUEUE_LEDGER_PAYLOAD_BYTES(p, "intent_wire") ",0)+1024+" \
+  "MAX(length(CAST(" p "source_batch_id AS BLOB))+COALESCE(" QUEUE_LEDGER_PAYLOAD_BYTES(p, "source_wire") ",0)+" \
+  "length(CAST(" p "combined_batch_id AS BLOB))+COALESCE(" QUEUE_LEDGER_PAYLOAD_BYTES(p, "combined_wire") ",0)," p "reserved_bytes)+" \
   "CASE WHEN " p "retention_policy_version=3 THEN 2048 ELSE 0 END"
 #define QUEUE_LEDGER_DEFERRED_COST(p) \
   "length(CAST(" p "key_sha256 AS BLOB))+length(CAST(" p "payload_sha256 AS BLOB))+" \
-  "COALESCE(length(CAST(" p "payload AS BLOB)),0)+512+CASE WHEN " p "state='completed' " \
+  "COALESCE(" QUEUE_LEDGER_PAYLOAD_BYTES(p, "payload") ",0)+512+CASE WHEN " p "state='completed' " \
   "THEN length(CAST(" p "terminal_reason AS BLOB)) ELSE 255 END"
 #define QUEUE_LEDGER_META_COST(p) \
   "CASE WHEN length(CAST(" p "legacy_lineage AS BLOB))>0 THEN 2048 ELSE 0 END+" \

@@ -101,14 +101,58 @@ static unsigned s_send_value_calls[256];
 static uint8_t s_last_payload[131072];
 static size_t s_last_payload_len;
 
-#if !defined(_WIN32)
-static int s_block_send;
-static int s_send_started;
+/* Same concurrency fixture on both production platforms; Windows previously
+ * skipped the stale-generation, competing-drain and deferred-retain cases. */
+#if defined(_WIN32)
+typedef HANDLE QueueTestThread;
+typedef DWORD (WINAPI *QueueTestThreadMain)(void *);
+#define QUEUE_TEST_THREAD_MAIN DWORD WINAPI
+static QueueTestThread queue_test_start_thread(QueueTestThreadMain entry, void *context) {
+  HANDLE thread = CreateThread(NULL, 0, entry, context, 0, NULL);
+  assert(thread != NULL);
+  return thread;
+}
+static void queue_test_join_thread(QueueTestThread thread) {
+  assert(WaitForSingleObject(thread, 30000) == WAIT_OBJECT_0);
+  assert(CloseHandle(thread));
+}
+static SRWLOCK s_send_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_send_cond = CONDITION_VARIABLE_INIT;
+static void send_state_lock(void) { AcquireSRWLockExclusive(&s_send_lock); }
+static void send_state_unlock(void) { ReleaseSRWLockExclusive(&s_send_lock); }
+static void send_state_wake_all(void) { WakeAllConditionVariable(&s_send_cond); }
+static void send_state_wait(void) {
+  assert(SleepConditionVariableSRW(&s_send_cond, &s_send_lock, 30000, 0));
+}
+#else
+typedef pthread_t QueueTestThread;
+typedef void *(*QueueTestThreadMain)(void *);
+#define QUEUE_TEST_THREAD_MAIN void *
+static QueueTestThread queue_test_start_thread(QueueTestThreadMain entry, void *context) {
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, entry, context) == 0);
+  return thread;
+}
+static void queue_test_join_thread(QueueTestThread thread) {
+  assert(pthread_join(thread, NULL) == 0);
+}
 static pthread_mutex_t s_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_send_cond = PTHREAD_COND_INITIALIZER;
+static void send_state_lock(void) { assert(pthread_mutex_lock(&s_send_lock) == 0); }
+static void send_state_unlock(void) { assert(pthread_mutex_unlock(&s_send_lock) == 0); }
+static void send_state_wake_all(void) { assert(pthread_cond_broadcast(&s_send_cond) == 0); }
+static void send_state_wait(void) {
+  struct timespec deadline;
+  assert(timespec_get(&deadline, TIME_UTC) == TIME_UTC);
+  deadline.tv_sec += 30;
+  assert(pthread_cond_timedwait(&s_send_cond, &s_send_lock, &deadline) == 0);
+}
+#endif
+static int s_block_send;
+static int s_send_started;
 
 static void reset_send_state(int send_ok) {
-  pthread_mutex_lock(&s_send_lock);
+  send_state_lock();
   s_send_ok = send_ok;
   s_configured = 1;
   s_circuit_open = 0;
@@ -120,61 +164,44 @@ static void reset_send_state(int send_ok) {
   s_last_payload_len = 0u;
   s_block_send = 0;
   s_send_started = 0;
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_unlock();
 }
 
 static void block_next_send(void) {
-  pthread_mutex_lock(&s_send_lock);
+  send_state_lock();
   s_block_send = 1;
   s_send_started = 0;
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_unlock();
 }
 
 static void wait_for_send(void) {
-  pthread_mutex_lock(&s_send_lock);
-  while (!s_send_started) pthread_cond_wait(&s_send_cond, &s_send_lock);
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_lock();
+  while (!s_send_started) send_state_wait();
+  send_state_unlock();
 }
 
 static void release_send(void) {
-  pthread_mutex_lock(&s_send_lock);
+  send_state_lock();
   s_block_send = 0;
-  pthread_cond_broadcast(&s_send_cond);
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_wake_all();
+  send_state_unlock();
 }
 
 static unsigned send_calls_for(uint8_t value) {
   unsigned calls;
-  pthread_mutex_lock(&s_send_lock);
+  send_state_lock();
   calls = s_send_value_calls[value];
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_unlock();
   return calls;
 }
 
 static unsigned total_send_calls(void) {
   unsigned calls;
-  pthread_mutex_lock(&s_send_lock);
+  send_state_lock();
   calls = s_send_calls;
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_unlock();
   return calls;
 }
-#else
-static void reset_send_state(int send_ok) {
-  s_send_ok = send_ok;
-  s_configured = 1;
-  s_circuit_open = 0;
-  s_reject_value = -1;
-  s_receipt_body = NULL;
-  s_telemetry_deferred = s_defer_during_send = 0;
-  s_send_calls = 0u;
-  memset(s_send_value_calls, 0, sizeof(s_send_value_calls));
-  s_last_payload_len = 0u;
-}
-
-static unsigned send_calls_for(uint8_t value) { return s_send_value_calls[value]; }
-static unsigned total_send_calls(void) { return s_send_calls; }
-#endif
-
 int edr_ingest_http_configured(void) { return s_configured; }
 int edr_ingest_http_circuit_open(void) { return s_circuit_open; }
 int edr_ingest_http_telemetry_deferred(void) { return s_telemetry_deferred; }
@@ -184,9 +211,7 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   (void)batch_id;
   assert(header_len == 12u);
   assert(payload_len + header_len <= sizeof(s_last_payload));
-#if !defined(_WIN32)
-  pthread_mutex_lock(&s_send_lock);
-#endif
+  send_state_lock();
   /* Force allocator churn after queue finalized its SQLite statement. */
   void *churn = malloc(32768u);
   assert(churn != NULL);
@@ -196,24 +221,17 @@ int edr_transport_v2_report_events(const char *batch_id, const uint8_t *header12
   s_last_payload_len = header_len + payload_len;
   if (s_defer_during_send) s_telemetry_deferred = 1;
   free(churn);
-#if !defined(_WIN32)
   s_send_calls++;
   if (payload_len >= 5u) s_send_value_calls[payload[4]]++;
   if (s_block_send) {
     s_send_started = 1;
-    pthread_cond_broadcast(&s_send_cond);
-    while (s_block_send) pthread_cond_wait(&s_send_cond, &s_send_lock);
+    send_state_wake_all();
+    while (s_block_send) send_state_wait();
   }
   int result = (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value) &&
       (!s_receipt_body || edr_report_events_acknowledged(s_receipt_body, "test-endpoint", batch_id, header12, header_len, payload, payload_len))) ? 0 : -1;
-  pthread_mutex_unlock(&s_send_lock);
+  send_state_unlock();
   return result;
-#else
-  s_send_calls++;
-  if (payload_len >= 5u) s_send_value_calls[payload[4]]++;
-  return (s_send_ok && (payload_len < 5u || payload[4] != s_reject_value) &&
-      (!s_receipt_body || edr_report_events_acknowledged(s_receipt_body, "test-endpoint", batch_id, header12, header_len, payload, payload_len))) ? 0 : -1;
-#endif
 }
 
 static void make_wire(uint8_t out[20], uint8_t value) {
@@ -338,7 +356,7 @@ static void assert_sqlite_write_rejected(const char *path, const char *sql) {
 static uint64_t assert_capacity_matches_inventory(const char *path) {
   EdrStorageQueueCapacityMetrics metrics;
   uint64_t expected = sqlite_scalar_path(path,
-      "SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(payload)+512+"
+      "SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(CAST(payload AS BLOB))+512+"
       "CASE WHEN recovery_version>0 THEN 512 ELSE 0 END),0) FROM event_queue;");
   uint64_t typed_cost=sqlite_scalar_path(path,
       "SELECT COALESCE(SUM(512+length(CAST(local_source_event_id AS BLOB))+length(CAST(local_reason AS BLOB))+"
@@ -351,13 +369,13 @@ static uint64_t assert_capacity_matches_inventory(const char *path) {
   expected += sqlite_scalar_path(path,
       "SELECT COALESCE(SUM(length(CAST(idempotency_key AS BLOB))+length(CAST(source_event_key AS BLOB))+length(CAST(rule_id AS BLOB))+"
       "length(CAST(process_generation_key AS BLOB))+15+length(CAST(intent_batch_id AS BLOB))+"
-      "COALESCE(length(intent_wire),0)+1024+"
-      "MAX(length(CAST(source_batch_id AS BLOB))+COALESCE(length(source_wire),0)+"
-      "length(CAST(combined_batch_id AS BLOB))+COALESCE(length(combined_wire),0),reserved_bytes)+"
+      "COALESCE(length(CAST(intent_wire AS BLOB)),0)+1024+"
+      "MAX(length(CAST(source_batch_id AS BLOB))+COALESCE(length(CAST(source_wire AS BLOB)),0)+"
+      "length(CAST(combined_batch_id AS BLOB))+COALESCE(length(CAST(combined_wire AS BLOB)),0),reserved_bytes)+"
       "CASE WHEN retention_policy_version=3 THEN 2048 ELSE 0 END),0) "
       "FROM enforcement_terminal_journal;");
   expected += sqlite_scalar_path(path,
-      "SELECT COALESCE(SUM(length(CAST(key_sha256 AS BLOB))+length(CAST(payload_sha256 AS BLOB))+COALESCE(length(payload),0)+"
+      "SELECT COALESCE(SUM(length(CAST(key_sha256 AS BLOB))+length(CAST(payload_sha256 AS BLOB))+COALESCE(length(CAST(payload AS BLOB)),0)+"
       "512+CASE WHEN state='completed' THEN length(CAST(terminal_reason AS BLOB)) ELSE 255 END),0) "
       "FROM p0_deferred_match;");
   expected += sqlite_scalar_path(path, "SELECT COUNT(*)*512 FROM queue_projection_relations;");
@@ -381,7 +399,7 @@ static uint64_t assert_capacity_matches_inventory(const char *path) {
     for (unsigned i = 0u; i < 4u; ++i) {
       snprintf(query, sizeof(query), "SELECT COUNT(*) FROM event_queue WHERE retention_class=%u;", i);
       assert(rows[i] == sqlite_scalar_path(path, query));
-      snprintf(query, sizeof(query), "SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(payload)+512+"
+      snprintf(query, sizeof(query), "SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(CAST(payload AS BLOB))+512+"
                "CASE WHEN recovery_version>0 THEN 512 ELSE 0 END),0) FROM event_queue WHERE retention_class=%u;", i);
       assert(bytes[i] == sqlite_scalar_path(path, query)+(i==1u?typed_cost:0u));
     }
@@ -533,22 +551,21 @@ static void p0_deferred_exec_sql(const char *path, const char *sql) {
   assert(sqlite3_close(db) == SQLITE_OK);
 }
 
-#if !defined(_WIN32)
 typedef struct { unsigned id; } EnqueueWork;
-static void *enqueue_worker(void *arg) {
+static QUEUE_TEST_THREAD_MAIN enqueue_worker(void *arg) {
   EnqueueWork *work = arg;
   uint8_t wire[20];
   char batch_id[64];
   make_wire(wire, (uint8_t)work->id);
   snprintf(batch_id, sizeof(batch_id), "concurrent-%u", work->id);
   assert(edr_storage_queue_enqueue(batch_id, wire, sizeof(wire), 0, 0) == EDR_OK);
-  return NULL;
+  return 0;
 }
 
-static void *drain_worker(void *arg) {
+static QUEUE_TEST_THREAD_MAIN drain_worker(void *arg) {
   (void)arg;
   edr_storage_queue_poll_drain();
-  return NULL;
+  return 0;
 }
 
 typedef struct {
@@ -559,13 +576,12 @@ typedef struct {
   EdrError result;
 } DeferredRetainWork;
 
-static void *deferred_retain_worker(void *arg) {
+static QUEUE_TEST_THREAD_MAIN deferred_retain_worker(void *arg) {
   DeferredRetainWork *work = (DeferredRetainWork *)arg;
   work->result = edr_storage_queue_p0_deferred_retain(
       work->key, work->family_mask, work->payload, work->payload_len);
-  return NULL;
+  return 0;
 }
-#endif
 
 static int terminal_journal_count(const char *path) {
   sqlite3 *db = NULL;
@@ -2518,12 +2534,11 @@ static void test_zero_or_invalid_limit_remains_finite(void) {
   (void)remove(path);
 }
 
-#if !defined(_WIN32)
 static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void) {
   char old_path[256];
   char new_path[256];
   uint8_t intent[20];
-  pthread_t stale_drain;
+  QueueTestThread stale_drain;
   snprintf(old_path, sizeof(old_path), "edr-terminal-journal-old-%ld.db", (long)TEST_PID);
   snprintf(new_path, sizeof(new_path), "edr-terminal-journal-new-%ld.db", (long)TEST_PID);
   (void)remove(old_path);
@@ -2537,7 +2552,7 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
   reset_send_state(1);
   block_next_send();
   test_sleep_ms(250u);
-  assert(pthread_create(&stale_drain, NULL, drain_worker, NULL) == 0);
+  stale_drain = queue_test_start_thread(drain_worker, NULL);
   wait_for_send();
 
   /* The new database deliberately reuses row id, idempotency key, and wire.
@@ -2550,7 +2565,7 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
              "same-terminal-intent", intent, sizeof(intent)) ==
          EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
   release_send();
-  assert(pthread_join(stale_drain, NULL) == 0);
+  queue_test_join_thread(stale_drain);
   assert(terminal_journal_state_is(new_path, "same-terminal-key", "pending_intent"));
   assert(terminal_journal_intent_acked(new_path, "same-terminal-key") == 0);
 
@@ -2562,7 +2577,6 @@ static void test_terminal_journal_stale_generation_cannot_ack_reopened_row(void)
   (void)remove(old_path);
   (void)remove(new_path);
 }
-#endif
 
 static void test_retry_backoff_and_fairness_survive_reopen(void) {
   char path[256];
@@ -2934,10 +2948,9 @@ static void test_p0_deferred_match_durable_lifecycle(void) {
   free(selected_payload);
   selected_payload = NULL;
 
-#if !defined(_WIN32)
   {
     enum { workers = 12 };
-    pthread_t threads[workers];
+    QueueTestThread threads[workers];
     DeferredRetainWork work[workers];
     for (unsigned i = 0u; i < workers; ++i) {
       work[i].key = key_a;
@@ -2945,15 +2958,14 @@ static void test_p0_deferred_match_durable_lifecycle(void) {
       work[i].payload = snapshot_a;
       work[i].payload_len = sizeof(snapshot_a) - 1u;
       work[i].result = EDR_ERR_INTERNAL;
-      assert(pthread_create(&threads[i], NULL, deferred_retain_worker, &work[i]) == 0);
+      threads[i] = queue_test_start_thread(deferred_retain_worker, &work[i]);
     }
     for (unsigned i = 0u; i < workers; ++i) {
-      assert(pthread_join(threads[i], NULL) == 0);
+      queue_test_join_thread(threads[i]);
       assert(work[i].result == EDR_OK);
     }
     assert(p0_deferred_count(path, "pending") == 1);
   }
-#endif
 
   reset_send_state(1);
   test_sleep_ms(250u);
@@ -3943,6 +3955,46 @@ static void test_capacity_ledger_calibration_and_bounded_admission(void) {
   edr_storage_queue_close(); remove(path);
 }
 
+/* Mixed historical SQLite storage classes retain their original byte costs.
+ * These fixture writes exercise real insert/update triggers and reopen
+ * calibration; they do not make malformed historical payloads deliverable. */
+static void test_payload_byte_cost_preserves_storage_classes(void) {
+  static const char *values[]={"x'00ff0102'","CAST(x'F09F92BE00C3A9' AS TEXT)",
+      "123","1.25","x''","''"};
+  char path[256];snprintf(path,sizeof(path),"edr-payload-byte-types-%ld.db",(long)TEST_PID);remove(path);
+  assert(edr_storage_queue_open(path)==EDR_OK);
+  for(unsigned i=0;i<sizeof(values)/sizeof(values[0]);++i) {
+    char *sql=sqlite3_mprintf(
+      "INSERT INTO event_queue(batch_id,payload,created_at,status) VALUES('type-%u',%s,1,'local_evidence');"
+      "INSERT INTO p0_deferred_match(key_sha256,family_mask,payload,payload_len,payload_sha256,state,created_at,updated_at) "
+      "VALUES(printf('%%064d',%u),1,%s,1,printf('%%064d',%u),'failed',1,1);"
+      "INSERT INTO enforcement_terminal_journal(idempotency_key,source_event_key,rule_id,process_generation_key,state,"
+      "intent_wire,source_wire,combined_wire,intent_acked,source_acked,combined_acked,created_at,updated_at) "
+      "VALUES('type-%u','type-source','type-rule','type-generation','completed',%s,%s,%s,1,1,1,1,1);",
+      i,values[i],i+1u,values[i],i+1u,i,values[i],values[i],values[i]);
+    assert(sql);sqlite_exec_path(path,sql);sqlite3_free(sql);assert_capacity_matches_inventory(path);
+  }
+  sqlite_exec_path(path,
+    "INSERT INTO p0_deferred_match(key_sha256,family_mask,payload,payload_len,payload_sha256,state,created_at,updated_at,completed_at) "
+    "VALUES(printf('%064d',99),1,NULL,1,printf('%064d',99),'completed',1,1,1);"
+    "INSERT INTO enforcement_terminal_journal(idempotency_key,source_event_key,rule_id,process_generation_key,state,"
+    "intent_wire,source_wire,combined_wire,intent_acked,source_acked,combined_acked,created_at,updated_at) "
+    "VALUES('type-null','type-source','type-rule','type-generation','completed',NULL,NULL,NULL,1,1,1,1,1);");
+  uint64_t before=assert_capacity_matches_inventory(path);
+  sqlite_exec_path(path,
+    "UPDATE event_queue SET payload=CAST(x'F09F92BE00C3A900C3A9' AS TEXT) WHERE batch_id='type-0';"
+    "UPDATE p0_deferred_match SET payload=CAST(x'F09F92BE00C3A900C3A9' AS TEXT) WHERE key_sha256=printf('%064d',1);"
+    "UPDATE enforcement_terminal_journal SET intent_wire=CAST(x'F09F92BE00C3A900C3A9' AS TEXT),"
+    "source_wire=CAST(x'F09F92BE00C3A900C3A9' AS TEXT),combined_wire=CAST(x'F09F92BE00C3A900C3A9' AS TEXT) WHERE idempotency_key='type-0';");
+  assert(assert_capacity_matches_inventory(path)==before+5u*(10u-4u));
+  uint64_t expected=assert_capacity_matches_inventory(path);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(assert_capacity_matches_inventory(path)==expected);
+  assert(sqlite_scalar_path(path,"SELECT count(*) FROM event_queue WHERE batch_id='type-0' AND typeof(payload)='text' AND length(CAST(payload AS BLOB))=10;")==1u);
+  assert(sqlite_scalar_path(path,"SELECT count(*) FROM enforcement_terminal_journal WHERE idempotency_key='type-null' AND intent_wire IS NULL AND source_wire IS NULL AND combined_wire IS NULL;")==1u);
+  edr_storage_queue_close();remove(path);
+}
+
 static EdrStorageQueueLocalEvidenceOwner diagnostic_owner(void) {
   EdrStorageQueueLocalEvidenceOwner owner={0};
   owner.version=1u;owner.diagnostic_reason="missing_cmdline";
@@ -4150,6 +4202,62 @@ static uint64_t synthetic_count(const char *path,const char *sql) {
   assert(sqlite3_prepare_v2(db,sql,-1,&st,NULL)==SQLITE_OK && sqlite3_step(st)==SQLITE_ROW);
   result=(uint64_t)sqlite3_column_int64(st,0);sqlite3_finalize(st);sqlite3_close(db);return result;
 }
+typedef struct { sqlite3_file base; sqlite3_file *real; } QueueReadFile;
+static sqlite3_vfs *queue_read_vfs_parent;
+static int queue_slow_read_enabled,queue_slow_read_active,queue_slow_read_delayed;
+static uint64_t queue_slow_read_bytes,queue_slow_read_delays;
+#define QUEUE_READ_FILE(f) (((QueueReadFile *)(f))->real)
+static int bench_close(sqlite3_file *f) { return QUEUE_READ_FILE(f)->pMethods->xClose(QUEUE_READ_FILE(f)); }
+static int bench_read(sqlite3_file *f,void *b,int n,sqlite3_int64 o) {
+  if(queue_slow_read_active) {
+    queue_slow_read_bytes+=(unsigned)n;
+    /* A real large read crosses the slice once. No clock, return value or
+     * SQLite data is fabricated; small metadata-only reads remain cheap. */
+    if(!queue_slow_read_delayed && queue_slow_read_bytes>=128u*1024u) {
+      queue_slow_read_delayed=1;queue_slow_read_delays++;test_sleep_ms(30u);
+    }
+  }
+  return QUEUE_READ_FILE(f)->pMethods->xRead(QUEUE_READ_FILE(f),b,n,o);
+}
+static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {return QUEUE_READ_FILE(f)->pMethods->xWrite(QUEUE_READ_FILE(f),b,n,o);}
+static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return QUEUE_READ_FILE(f)->pMethods->xTruncate(QUEUE_READ_FILE(f),n); }
+static int bench_sync(sqlite3_file *f,int flags) {return QUEUE_READ_FILE(f)->pMethods->xSync(QUEUE_READ_FILE(f),flags);}
+static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return QUEUE_READ_FILE(f)->pMethods->xFileSize(QUEUE_READ_FILE(f),n); }
+static int bench_lock(sqlite3_file *f,int n) { return QUEUE_READ_FILE(f)->pMethods->xLock(QUEUE_READ_FILE(f),n); }
+static int bench_unlock(sqlite3_file *f,int n) { return QUEUE_READ_FILE(f)->pMethods->xUnlock(QUEUE_READ_FILE(f),n); }
+static int bench_reserved(sqlite3_file *f,int *n) { return QUEUE_READ_FILE(f)->pMethods->xCheckReservedLock(QUEUE_READ_FILE(f),n); }
+static int bench_control(sqlite3_file *f,int n,void *p) { return QUEUE_READ_FILE(f)->pMethods->xFileControl(QUEUE_READ_FILE(f),n,p); }
+static int bench_sector(sqlite3_file *f) { return QUEUE_READ_FILE(f)->pMethods->xSectorSize(QUEUE_READ_FILE(f)); }
+static int bench_characteristics(sqlite3_file *f) { return QUEUE_READ_FILE(f)->pMethods->xDeviceCharacteristics(QUEUE_READ_FILE(f)); }
+static int bench_map(sqlite3_file *f,int p,int n,int e,void volatile **o) { return QUEUE_READ_FILE(f)->pMethods->xShmMap(QUEUE_READ_FILE(f),p,n,e,o); }
+static int bench_shm_lock(sqlite3_file *f,int o,int n,int flags) { return QUEUE_READ_FILE(f)->pMethods->xShmLock(QUEUE_READ_FILE(f),o,n,flags); }
+static void bench_barrier(sqlite3_file *f) { QUEUE_READ_FILE(f)->pMethods->xShmBarrier(QUEUE_READ_FILE(f)); }
+static int bench_unmap(sqlite3_file *f,int d) { return QUEUE_READ_FILE(f)->pMethods->xShmUnmap(QUEUE_READ_FILE(f),d); }
+static int bench_fetch(sqlite3_file *f,sqlite3_int64 o,int n,void **p) {
+  if (QUEUE_READ_FILE(f)->pMethods->iVersion<3 || !QUEUE_READ_FILE(f)->pMethods->xFetch) { *p=NULL; return SQLITE_OK; }
+  return QUEUE_READ_FILE(f)->pMethods->xFetch(QUEUE_READ_FILE(f),o,n,p);
+}
+static int bench_unfetch(sqlite3_file *f,sqlite3_int64 o,void *p) {
+  return QUEUE_READ_FILE(f)->pMethods->iVersion>=3 && QUEUE_READ_FILE(f)->pMethods->xUnfetch ? QUEUE_READ_FILE(f)->pMethods->xUnfetch(QUEUE_READ_FILE(f),o,p) : SQLITE_OK;
+}
+static const sqlite3_io_methods queue_read_methods = {3,bench_close,bench_read,bench_write,bench_truncate,bench_sync,bench_size,
+  bench_lock,bench_unlock,bench_reserved,bench_control,bench_sector,bench_characteristics,bench_map,bench_shm_lock,bench_barrier,bench_unmap,bench_fetch,bench_unfetch};
+static int queue_read_open(sqlite3_vfs *v,const char *name,sqlite3_file *file,int flags,int *out) {
+  (void)v; QueueReadFile *f=(QueueReadFile *)file;
+  f->real=(sqlite3_file *)(f+1); memset(f->real,0,(size_t)queue_read_vfs_parent->szOsFile);
+  int rc=queue_read_vfs_parent->xOpen(queue_read_vfs_parent,name,f->real,flags,out);
+  if (f->real->pMethods) f->base.pMethods=&queue_read_methods;
+  return rc;
+}
+#undef QUEUE_READ_FILE
+
+static void legacy_slice_cleanup(void) {
+  queue_slow_read_bytes=0u;queue_slow_read_delayed=0;
+  queue_slow_read_active=queue_slow_read_enabled;
+  edr_storage_queue_test_run_cleanup();
+  queue_slow_read_active=0;
+}
+
 static void test_legacy_maintenance_bounded_slices(void) {
   char path[256];sqlite3 *db=NULL;uint8_t wire[20];make_wire(wire,0xc5u);
   EdrStorageQueueCapacityMetrics before,after;
@@ -4173,16 +4281,16 @@ static void test_legacy_maintenance_bounded_slices(void) {
       "COMMIT;",NULL,NULL,NULL)==SQLITE_OK);
   sqlite3_close(db);edr_storage_queue_get_capacity_metrics(&before);
   assert(test_setenv("EDR_STORAGE_MIN_FREE_MB","4294967295")==0);
-  edr_storage_queue_test_run_cleanup();
+  legacy_slice_cleanup();
   assert(synthetic_count(path,"SELECT count(*) FROM p0_deferred_match;")==300u);
   assert(test_unsetenv("EDR_STORAGE_MIN_FREE_MB")==0);
-  edr_storage_queue_test_run_cleanup();edr_storage_queue_get_capacity_metrics(&after);
+  legacy_slice_cleanup();edr_storage_queue_get_capacity_metrics(&after);
   assert(after.retention_evicted_rows-before.retention_evicted_rows<=128u);
   assert(before.used_bytes-after.used_bytes<=4u*1024u*1024u);
   assert(synthetic_count(path,"SELECT count(*) FROM p0_deferred_match;")>=172u);
   for(unsigned pass=0;pass<40u && (synthetic_count(path,"SELECT count(*) FROM p0_deferred_match;") ||
       synthetic_count(path,"SELECT count(*) FROM enforcement_terminal_journal WHERE idempotency_key LIKE 'synthetic-bounded-%';"));++pass) {
-    before=after;edr_storage_queue_test_run_cleanup();edr_storage_queue_get_capacity_metrics(&after);
+    before=after;legacy_slice_cleanup();edr_storage_queue_get_capacity_metrics(&after);
     assert(after.retention_evicted_rows-before.retention_evicted_rows<=128u);
     assert(before.used_bytes-after.used_bytes<=4u*1024u*1024u);
   }
@@ -4192,6 +4300,20 @@ static void test_legacy_maintenance_bounded_slices(void) {
   assert(after.maintenance_oversize_holds>0u);
   assert_capacity_matches_inventory(path);
   edr_storage_queue_close();remove(path);edr_storage_queue_configure(0u,0u);
+}
+
+static void test_legacy_maintenance_with_slow_read(void) {
+  queue_read_vfs_parent=sqlite3_vfs_find(NULL);assert(queue_read_vfs_parent);
+  sqlite3_vfs vfs=*queue_read_vfs_parent;vfs.zName="queue-slow-read";vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(QueueReadFile);vfs.xOpen=queue_read_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  queue_slow_read_enabled=1;queue_slow_read_delays=0u;
+  test_legacy_maintenance_bounded_slices();
+  assert(queue_slow_read_delays>0u);
+  fprintf(stderr,"[queue-test] slow-read maintenance completed original 40-round fixture; delayed_reads=%llu\n",(unsigned long long)queue_slow_read_delays);
+  queue_slow_read_enabled=0;
+  assert(sqlite3_vfs_register(queue_read_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
 }
 
 typedef struct LocalQueryFixture {
@@ -4479,6 +4601,156 @@ static void test_runtime_physical_retry_ack_and_checkpoint(void) {
   assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB")==0);
 }
 
+/* Sustained expiry is not reclamation: failed delivery remains charged after
+ * it leaves pending. Use the real SQLite maintenance/admission owners, with
+ * only time eligibility accelerated; transport/codec are this suite's stubs. */
+static void test_dead_letter_storm_is_bounded_and_reserves_terminal(void) {
+  enum { waves = 64, per_wave = 16, wire_bytes = 4096 };
+  char path[256], batch[64];
+  uint8_t wire[wire_bytes], terminal[20], intent[20], source[20], combined[20];
+  uint8_t *ordinary_tail, *terminal_tail;
+  size_t ordinary_tail_len, terminal_tail_len;
+  unsigned admitted = 0u, rejected = 0u, saturated_waves = 0u;
+  uint64_t plateau_bytes = 0u, plateau_physical = 0u, peak_physical = 0u;
+  uint64_t physical_slack, page_size, terminal_limit;
+  EdrStorageQueueCapacityMetrics initial, before, after, saturated, frozen;
+  snprintf(path, sizeof(path), "edr-dead-letter-storm-%ld.db", (long)TEST_PID);
+  remove(path);
+  assert(test_setenv("EDR_QUEUE_MAX_DB_MB", "1") == 0);
+  assert(test_setenv("EDR_QUEUE_RETENTION_HOURS", "1") == 0);
+  make_large_wire(wire, sizeof(wire), 0xc1u);
+  make_wire(terminal, 0xc2u); make_wire(intent, 0xc3u);
+  make_wire(source, 0xc4u); make_wire(combined, 0xc5u);
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  reset_send_state(1); s_circuit_open = 1;
+  edr_storage_queue_get_capacity_metrics(&initial);
+  assert(initial.max_bytes == 1024u * 1024u && initial.used_bytes == 0u);
+  page_size = sqlite_scalar_path(path, "PRAGMA page_size;");
+  /* Permit bounded SQLite page/WAL reuse, not an exact file-length promise.
+   * Rejected writes may not create a growing per-attempt diagnostic store. */
+  physical_slack = 64u * (page_size + 24u) + 32u;
+  for (unsigned wave = 0u; wave < waves; ++wave) {
+    for (unsigned item = 0u; item < per_wave; ++item) {
+      EdrError result;
+      snprintf(batch, sizeof(batch), "dead-storm-%04u", wave * per_wave + item);
+      result = edr_storage_queue_enqueue(batch, wire, sizeof(wire), 0, 0);
+      if (result == EDR_ERR_QUEUE_FULL) rejected++;
+      else {
+        assert(result == EDR_OK && rejected == 0u);
+        admitted++;
+      }
+    }
+    edr_storage_queue_get_capacity_metrics(&before);
+    /* Do not write status or the ledger: production maintenance must perform
+     * the pending -> dead_letter transition without deleting frozen bytes. */
+    sqlite_exec_path(path, "UPDATE event_queue SET created_at=1 WHERE status='pending';");
+    for (unsigned slice = 0u; slice < 32u && edr_storage_queue_pending_count(); ++slice)
+      edr_storage_queue_test_run_cleanup();
+    edr_storage_queue_test_run_cleanup();
+    edr_storage_queue_poll_drain();
+    edr_storage_queue_get_capacity_metrics(&after);
+    assert(edr_storage_queue_pending_count() == 0u);
+    assert(edr_storage_queue_dead_letter_count() == admitted);
+    assert(after.used_bytes == before.used_bytes);
+    assert(after.retained_nonpending_bytes == after.used_bytes);
+    assert(after.used_bytes <= after.ordinary_limit_bytes);
+    assert(after.ordinary_rejected - initial.ordinary_rejected == rejected);
+    assert(after.enqueue_capacity_rejected - initial.enqueue_capacity_rejected == rejected);
+    assert(after.enqueue_admitted - initial.enqueue_admitted == admitted);
+    assert(after.enqueue_transaction_failures == initial.enqueue_transaction_failures);
+    assert(after.maintenance_failures == initial.maintenance_failures);
+    assert(after.delivery_acked == initial.delivery_acked && total_send_calls() == 0u);
+    assert(assert_capacity_matches_inventory(path) == after.used_bytes);
+    assert(sqlite_scalar_path(path, "SELECT COUNT(*) FROM event_queue;") == admitted);
+    assert(sqlite_scalar_path(path, "SELECT COUNT(*) FROM delivery_receipts_v1;") == 0u);
+    if (after.physical_bytes > peak_physical) peak_physical = after.physical_bytes;
+    if (rejected) {
+      if (!saturated_waves) {
+        plateau_bytes = after.used_bytes;
+        plateau_physical = after.physical_bytes;
+      }
+      saturated_waves++;
+      assert(after.used_bytes == plateau_bytes);
+      assert(after.physical_bytes <= plateau_physical + physical_slack);
+    }
+  }
+  assert(admitted >= 64u && rejected > admitted * 8u && saturated_waves >= waves / 2u);
+  assert((uint64_t)waves * per_wave * sizeof(wire) >= initial.max_bytes * 4u);
+  saturated = after;
+  /* Fill the remaining ordinary gap exactly: the 20-byte terminal below
+   * must use its reservation, not leftover space between 4 KiB records. */
+  assert(after.ordinary_limit_bytes > after.used_bytes + 512u + strlen("dead-tail") + 20u);
+  ordinary_tail_len = (size_t)(after.ordinary_limit_bytes - after.used_bytes - 512u - strlen("dead-tail"));
+  ordinary_tail = malloc(ordinary_tail_len); assert(ordinary_tail);
+  make_large_wire(ordinary_tail, ordinary_tail_len, 0xc6u);
+  assert(edr_storage_queue_enqueue("dead-tail", ordinary_tail, ordinary_tail_len, 0, 0) == EDR_OK);
+  sqlite_exec_path(path, "UPDATE event_queue SET created_at=1 WHERE status='pending';");
+  for (unsigned slice = 0u; slice < 32u && edr_storage_queue_pending_count(); ++slice)
+    edr_storage_queue_test_run_cleanup();
+  assert(edr_storage_queue_pending_count() == 0u);
+  assert(assert_capacity_matches_inventory(path) == after.ordinary_limit_bytes);
+  assert(edr_storage_queue_enqueue("dead-full", terminal, sizeof(terminal), 0, 0) == EDR_ERR_QUEUE_FULL);
+  /* Reconnect with a willing transport: dead letters are not a backlog to
+   * upload for capacity, and no ACK may be fabricated by this empty drain. */
+  reset_send_state(1); test_sleep_ms(250u); edr_storage_queue_poll_drain();
+  assert(total_send_calls() == 0u);
+  assert(sqlite_scalar_path(path, "SELECT COUNT(*) FROM delivery_receipts_v1;") == 0u);
+  s_circuit_open = 1;
+  assert(edr_storage_queue_enqueue("dead-terminal-20", terminal, sizeof(terminal), 0,
+                                   EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) == EDR_OK);
+  assert(edr_storage_queue_enforcement_terminal_precreate(
+      "dead-journal", "dead-event", "R-TERMINAL", "dead-generation", "dead-intent", intent,
+      sizeof(intent)) == EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  edr_storage_queue_get_capacity_metrics(&before);
+  terminal_limit = before.max_bytes - before.p0_source_only_reserve_bytes;
+  assert(terminal_limit > before.used_bytes + 512u + strlen("dead-terminal-tail") + 20u);
+  terminal_tail_len = (size_t)(terminal_limit - before.used_bytes - 512u - strlen("dead-terminal-tail"));
+  terminal_tail = malloc(terminal_tail_len); assert(terminal_tail);
+  make_large_wire(terminal_tail, terminal_tail_len, 0xc7u);
+  assert(edr_storage_queue_enqueue("dead-terminal-tail", terminal_tail, terminal_tail_len, 0,
+                                   EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) == EDR_OK);
+  assert(assert_capacity_matches_inventory(path) == terminal_limit);
+  assert(edr_storage_queue_enqueue("dead-terminal-full", terminal, sizeof(terminal), 0,
+                                   EDR_STORAGE_QUEUE_SEVERITY_TERMINAL) == EDR_ERR_QUEUE_FULL);
+  assert(edr_storage_queue_enforcement_terminal_precreate(
+      "dead-journal-full", "dead-event-full", "R-TERMINAL", "dead-generation-full", "dead-intent-full",
+      intent, sizeof(intent)) == EDR_ENFORCEMENT_TERMINAL_PRECREATE_ERROR);
+  edr_storage_queue_get_capacity_metrics(&after);
+  assert(after.high_priority_rejected - before.high_priority_rejected == 2u);
+  assert(terminal_journal_count(path) == 1);
+  assert(edr_storage_queue_enforcement_terminal_update(
+      "dead-journal", "dead-source", source, sizeof(source), "dead-combined", combined,
+      sizeof(combined)) == EDR_OK);
+  assert(terminal_journal_state_is(path, "dead-journal", "ready"));
+  edr_storage_queue_get_capacity_metrics(&frozen);
+  assert(frozen.used_bytes <= terminal_limit);
+  assert(frozen.delivery_acked == initial.delivery_acked);
+  assert(assert_capacity_matches_inventory(path) == frozen.used_bytes);
+  edr_storage_queue_close();
+  assert(edr_storage_queue_open(path) == EDR_OK);
+  assert(assert_capacity_matches_inventory(path) == frozen.used_bytes);
+  assert(edr_storage_queue_dead_letter_count() == admitted + 1u);
+  for (unsigned i = 0u; i < admitted; ++i) {
+    snprintf(batch, sizeof(batch), "dead-storm-%04u", i);
+    assert(batch_retained_exact(path, batch, "dead_letter", wire, sizeof(wire)));
+  }
+  assert(batch_retained_exact(path, "dead-tail", "dead_letter", ordinary_tail, ordinary_tail_len));
+  assert(batch_retained_exact(path, "dead-terminal-20", "pending", terminal, sizeof(terminal)));
+  assert(batch_retained_exact(path, "dead-terminal-tail", "pending", terminal_tail, terminal_tail_len));
+  assert(terminal_journal_state_is(path, "dead-journal", "ready"));
+  assert(terminal_journal_intent_acked(path, "dead-journal") == 0);
+  assert(sqlite_scalar_path(path, "SELECT COUNT(*) FROM delivery_receipts_v1;") == 0u);
+  assert(total_send_calls() == 0u);
+  printf("dead-letter storm: attempts=%u admitted=%u rejected=%u saturated_waves=%u "
+         "logical_plateau=%llu physical_peak=%llu reserved_terminal=1 frozen_result=1 ack=0 sent=0\n",
+         waves * per_wave, admitted, rejected, saturated_waves,
+         (unsigned long long)saturated.used_bytes, (unsigned long long)peak_physical);
+  edr_storage_queue_close(); free(ordinary_tail); free(terminal_tail); remove(path);
+  reset_send_state(1);
+  assert(test_unsetenv("EDR_QUEUE_MAX_DB_MB") == 0);
+  assert(test_unsetenv("EDR_QUEUE_RETENTION_HOURS") == 0);
+}
+
 int main(void) {
   char path[256];
   char old_path[256];
@@ -4494,10 +4766,12 @@ int main(void) {
   test_typed_local_bounded_slices_and_pressure();
   test_typed_local_snapshot_busy_and_physical_guard();
   test_legacy_maintenance_bounded_slices();
+  test_legacy_maintenance_with_slow_read();
   test_typed_local_query_snapshot();
   test_capacity_ledger_owner_transitions_and_rollback();
   test_retention_upgrade_preserves_legacy_identity();
   test_capacity_ledger_calibration_and_bounded_admission();
+  test_payload_byte_cost_preserves_storage_classes();
   test_exact_ack_receipt_atomic_recovery();
   test_missing_source_meta_preserves_owner_recovery();
   test_terminal_policy_hold_does_not_block_combined_alert();
@@ -4531,23 +4805,22 @@ int main(void) {
   edr_storage_queue_poll_drain();
   assert(status_count(path, "dead_letter") == 1);
 
-#if !defined(_WIN32)
   enum { workers = 20 };
-  pthread_t threads[workers];
+  QueueTestThread threads[workers];
   EnqueueWork work[workers];
   for (unsigned i = 0u; i < workers; i++) {
     work[i].id = i + 32u;
-    assert(pthread_create(&threads[i], NULL, enqueue_worker, &work[i]) == 0);
+    threads[i] = queue_test_start_thread(enqueue_worker, &work[i]);
   }
-  for (unsigned i = 0u; i < workers; i++) assert(pthread_join(threads[i], NULL) == 0);
+  for (unsigned i = 0u; i < workers; i++) queue_test_join_thread(threads[i]);
   assert(edr_storage_queue_pending_count() >= workers);
   reset_send_state(1);
   test_sleep_ms(250u);
-  pthread_t draining[workers];
+  QueueTestThread draining[workers];
   for (unsigned i = 0u; i < workers; i++) {
-    assert(pthread_create(&draining[i], NULL, drain_worker, NULL) == 0);
+    draining[i] = queue_test_start_thread(drain_worker, NULL);
   }
-  for (unsigned i = 0u; i < workers; i++) assert(pthread_join(draining[i], NULL) == 0);
+  for (unsigned i = 0u; i < workers; i++) queue_test_join_thread(draining[i]);
   for (unsigned i = 0u; i < workers; i++) assert(send_calls_for((uint8_t)(i + 32u)) <= 1u);
   for (unsigned round = 0u; round < 3u; round++) {
     test_sleep_ms(250u);
@@ -4568,15 +4841,15 @@ int main(void) {
   reset_send_state(1);
   block_next_send();
   test_sleep_ms(250u);
-  pthread_t stale_drain;
-  assert(pthread_create(&stale_drain, NULL, drain_worker, NULL) == 0);
+  QueueTestThread stale_drain;
+  stale_drain = queue_test_start_thread(drain_worker, NULL);
   wait_for_send();
   edr_storage_queue_close();
   assert(edr_storage_queue_open(new_path) == EDR_OK);
   assert(edr_storage_queue_enqueue("new-p0", wire_b, sizeof(wire_b), 0, 1) == EDR_OK);
   assert(batch_row_id(new_path, "new-p0") == 1);
   release_send();
-  assert(pthread_join(stale_drain, NULL) == 0);
+  queue_test_join_thread(stale_drain);
   assert(status_count(new_path, "pending") == 1);
   assert(send_calls_for(1u) == 1u);
   test_sleep_ms(250u);
@@ -4594,7 +4867,6 @@ int main(void) {
   edr_storage_queue_close();
   (void)remove(old_path);
   (void)remove(new_path);
-#endif
   edr_storage_queue_close();
   (void)remove(path);
   test_terminal_journal_durable_commits_and_exact_replay();
@@ -4622,6 +4894,7 @@ int main(void) {
   test_terminal_journal_backpressure_cap();
   test_logical_capacity_recovers_and_reserves_terminal();
   test_source_only_capacity_is_distinct_and_bounded();
+  test_dead_letter_storm_is_bounded_and_reserves_terminal();
   test_queue_and_terminal_metric_denominators();
   test_zero_or_invalid_limit_remains_finite();
   test_local_v3_source_evidence_is_not_remote_ack();
@@ -4636,9 +4909,7 @@ int main(void) {
   test_p0_deferred_match_durable_lifecycle();
   test_p0_deferred_capacity_atomic_handoff();
   test_p0_deferred_retained_payload_cap();
-#if !defined(_WIN32)
   test_terminal_journal_stale_generation_cannot_ack_reopened_row();
-#endif
   test_terminal_local_reserved_bound_and_event_time();
   test_terminal_state_ledger_transaction_and_constant_read();
   return 0;
