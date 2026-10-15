@@ -3055,7 +3055,7 @@ failed:
 
 static int sqlite_maintenance_checkpoint(int mode);
 
-static int sqlite_size_budget_allow(void) {
+static int sqlite_size_budget_allow_mode(int allow_retirement) {
   if (!sqlite_physical_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return 0;
   if (!db_size_over_limit()) {
     s_last_capacity_failure_ns = 0u;
@@ -3086,8 +3086,11 @@ static int sqlite_size_budget_allow(void) {
   /* Damp repeated failures, not successful reclamation. A fast writer can
    * refill the recovered space within ten seconds; rejecting it merely because
    * the previous cleanup succeeded recently turns throughput gains into loss. */
-  if (s_last_capacity_failure_ns == 0u ||
-      now - s_last_capacity_failure_ns >= 10000000000ULL) {
+  /* An existing candidate update must not retire its own owner or dependencies
+   * to make room, then recreate them through the upsert. It can reset a reusable
+   * WAL above, but otherwise refuses until normal maintenance frees space. */
+  if (allow_retirement && (s_last_capacity_failure_ns == 0u ||
+      now - s_last_capacity_failure_ns >= 10000000000ULL)) {
     s_last_maintenance_ns = now;
     int maintenance_result = sqlite_maintenance(0);
     if (!db_size_over_limit()) {
@@ -3106,6 +3109,10 @@ static int sqlite_size_budget_allow(void) {
   s_status.db_budget_dropped++;
   set_error("evidence cache size budget exceeded");
   return 0;
+}
+
+static int sqlite_size_budget_allow(void) {
+  return sqlite_size_budget_allow_mode(1);
 }
 
 typedef struct {
@@ -4791,7 +4798,7 @@ done:
  * a fresh admission and charging it against the bounded new-candidate budget. */
 static int sqlite_candidate_exists(const char *candidate_id) {
   sqlite3_stmt *st = NULL;
-  int exists = 0;
+  int exists = -1;
   if (!s_db || !candidate_id || !candidate_id[0]) {
     return 0;
   }
@@ -4800,8 +4807,12 @@ static int sqlite_candidate_exists(const char *candidate_id) {
     set_error("prepare p0_candidates lookup failed");
     return -1;
   }
-  sqlite3_bind_text(st, 1, candidate_id, -1, SQLITE_TRANSIENT);
-  exists = sqlite3_step(st) == SQLITE_ROW;
+  if (sqlite3_bind_text(st, 1, candidate_id, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) exists = 1;
+    else if (rc == SQLITE_DONE) exists = 0;
+  }
+  if (exists < 0) set_error("p0_candidates lookup failed; existing owner state unknown");
   sqlite3_finalize(st);
   return exists;
 }
@@ -7714,17 +7725,17 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     }
     if (!candidate_existing) {
       s_status.candidate_admission_attempts++;
-      /* P0/P1 candidates are deliberately outside the telemetry-rate budget.
-       * Durable size/retention and transaction outcomes remain authoritative
-       * resource and failure bounds. */
-      if (!sqlite_size_budget_allow()) {
-        record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_CAPACITY);
-        s_status.candidate_rejected++;
-        s_status.records_dropped++;
-        context_ring_capture(r);
-        s_status.hot_ring_ingested++;
-        goto done;
-      }
+    }
+    /* P0/P1 candidates are outside the telemetry-rate budget, but both new
+     * admissions and existing-owner updates obey the same storage budget.
+     * Repeated updates can otherwise grow a reader-pinned WAL indefinitely. */
+    if (!sqlite_size_budget_allow_mode(!candidate_existing)) {
+      record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_CAPACITY);
+      s_status.candidate_rejected++;
+      s_status.records_dropped++;
+      context_ring_capture(r);
+      s_status.hot_ring_ingested++;
+      goto done;
     }
     s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
     if (sqlite_record_candidate(r, candidate_id, pre_count, post_until_ns) != 0) {

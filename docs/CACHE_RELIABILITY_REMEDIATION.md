@@ -1,8 +1,137 @@
 # Cache reliability remediation
 
+## 2026-10-15 post-681 validation: exact boundary and existing-owner updates
+
+An independent synthetic fixture reproduced the 681 strict-boundary assertion
+at exactly 240 live 4,096-byte pages (983,040 bytes). The inclusive target then
+passed the original next-candidate admission, retained owner/shared fact,
+reference integrity and reopen checks. A 241-page control required actual
+retirement before admission. The permanent regression preserves the original
+pressure input and bounded maintenance loops, then fills only a separate
+synthetic padding table to force the exact boundary. Host retention passed all
+38 cases in 8.39 s with its unchanged 150-second deadline. Evidence and source
+hashes are in `/private/tmp/edr-681-exact-capacity/`.
+
+This result does not establish a hard physical cap: the next candidate's
+transaction produced a 90,672-byte WAL, temporarily taking DB+WAL to 1,073,712
+bytes, 25,136 bytes above the 1 MiB admission budget. A subsequent distinct
+candidate reset/reused the WAL. The headroom is a cleanup target; it is not a
+reservation covering every possible transaction or the whole Agent directory.
+
+The follow-up same-ID experiment found a separate real admission bypass.
+`edr_local_evidence_cache_record_behavior` checked `sqlite_size_budget_allow`
+only for a new candidate. With a real pinned reader, 200 identical updates to
+one candidate all committed: DB stayed 237,568 bytes while WAL grew to
+13,937,992 bytes. There were no capacity rejections or physical-floor failures.
+Changing only the next event ID caused the expected WAL-reset rejection.
+The original owner and fact/reference digests stayed intact, so the defect is
+unbounded repeated WAL admission, not evidence corruption in this experiment.
+This is a synthetic mechanism proof, not the cause of any particular UTM cache
+size. Original results, counters and object hashes are retained in
+`/private/tmp/edr-681-same-id-8ci6diie/`; no endpoint evidence was sampled.
+
+The repair makes existing-owner updates use the same physical and DB+WAL
+admission check. They may reset a reusable WAL, but cannot run retirement to
+delete their own owner/dependencies and recreate them through an upsert. New
+candidate and context admission keep their existing retirement policy; updates
+still do not consume the new-candidate admission count. The identical 200-call
+experiment, replacing only the cache object, committed 11 updates then rejected
+189: DB+WAL stayed at 1,106,920 bytes from the twelfth attempt onward. Original
+owner/fact/reference hashes matched, materialized context remained readable,
+and reopen passed. This is bounded refusal after one admitted transaction's
+overshoot, not an exact physical quota. Raw results and compile provenance are
+in `/private/tmp/edr-682-same-id-green-cdm60i54/` (1.767 s, original 45 s limit).
+
+The same owner decision now treats candidate lookup bind/step errors as unknown
+state rather than absence. A real SQLite trace-triggered interrupt at that
+SELECT made the old code incorrectly admit/write once; the repaired code wrote
+nothing and reported one storage rejection with an unknown-owner cause, with
+no maintenance. The host fixture uses a temporary `sqlite3_open` passthrough
+interposer solely to obtain the connection handle; it is not a production API.
+Evidence is in
+`/var/folders/gv/5p7lbk210d7c1nnzqvn2cfvc0000gn/T/edr-682-lookup-final-7_46uc0n/`.
+Its first two fixture attempts are retained separately: this host's auto-extension
+API was unavailable, then the initial fixture lacked the network port needed to
+qualify as a candidate. Neither fixture failure is counted as a product pass.
+
+The permanent `test_existing_candidate_update_honors_capacity` fails against
+the frozen old object at its first required rejection and passes with the new
+object. It verifies two consecutive refusals without WAL growth or retirement,
+full owner/fact/reference/materialized-row preservation, an unchanged imported
+policy-0 owner, successful same-ID enrichment after the reader closes, and
+query/reference integrity after reopen. The initial fixture's attempted policy
+downgrade was correctly rejected by the existing trigger; that failed fixture
+is retained, and the final fixture creates a separate default-policy-0 owner.
+No trigger or timeout was weakened.
+
+Final host commands:
+
+```sh
+cmake --build /private/tmp/edr-cache-assessment-egress-build --target test_local_evidence_cache_candidate -j4
+ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -R '^local_evidence_cache_(candidate|migration|retention)$'
+```
+
+The three cache suites passed 3/3 in 13.11 s: context 78 cases, migration 10,
+retention 39 (127 total). Exact executed commands, logs and source hashes are
+recorded in `/private/tmp/edr-682-existing-capacity-regression/host-results.json`.
+The cache source SHA-256 is
+`42a96d03b8d3243371a208c89d4b818ae49762629c6b16690aa3989a3d4d40f9`;
+the test SHA-256 is
+`ed880fb83def7d6aa899a41946f51afc4a968f0422d4884447bbe67abff328f4`.
+
+Fresh Windows synthetic validation also passed once per suite: retention 39
+cases in 27.828 s and context 78 in 8.860 s, both exit 0, no timeout, unchanged
+150-second limits. The exact-boundary case took 272 ms and the existing-owner
+capacity/recovery case 99 ms. All 30 C inputs (including SQLite), 219 project
+headers and two SQLite headers were hashed before compilation and checked
+afterward; no earlier objects were reused. Host and guest EXE SHA-256 matched
+`21b836f7f5d92735b8e9e1dd3b98bec095b85a23c46c9c5f456031c63eda12f0`.
+Results, raw logs and precompile provenance are under
+`/private/tmp/edr-682-native-retention-43da53c2b7/`; downloaded log hashes matched
+the guest runner's result. This is MinGW x64 under UTM ARM64 emulation, with
+the existing P0 IR test stub and historical diagnostic version string. It is
+not a native ARM64 release or a client upgrade. Only an exclusive synthetic
+temporary directory was used; the installed Agent and its real cache were
+untouched. Native release/lifecycle gates and deployment remain separate.
+
+## 2026-10-15 candidate 681: retained ARM64 boundary failure, no deployment
+
+Candidate source `8fb522b0d32725e4d1bd8d65f80efb10e920796c` is on
+`codex/rtq-result-delivery-pressure`, 20 commits ahead of audit 662 and 11 ahead
+of comparison `3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`.
+[Run 38730044427](https://github.com/qiuxinliang/edr-agent/actions/runs/38730044427)
+finished **failed**. AMD64 passed 99/99 runtime gates in 332.88 s and 38/38
+standalone telemetry gates in 466.13 s, then packaged successfully. ARM64 passed
+99/99 runtime gates in 563.85 s, but standalone telemetry passed only 37/38 in
+576.06 s. Overlapping labels are not independent coverage. Finalization,
+installer lifecycle and publication were skipped; no 681 client deployment ran.
+Draft release `413746983` remains bound to this source and run, with five AMD64
+assets only. Its tag does not exist and latest remains `win_3.2.591` (release
+`403052409`). The draft is preserved, not reused for a different source.
+
+The first ARM64 failure is
+`test_capacity_reserves_wal_room_below_live_limit`, in the retention suite:
+`db=983040 wal=0 retired=43`, followed by the assertion
+`db_bytes + wal_bytes < 960 * 1024`. The suite failed after 64.22 s, not its
+150-second deadline. The same suite had passed in the earlier runtime gate on
+that runner. Production's 1 MiB cleanup target is 960 KiB inclusive; this exact
+boundary already leaves 64 KiB headroom. This source observation alone does not
+prove that the next candidate transaction fits: a deterministic boundary fixture
+must exercise the real write, reopen and reference-integrity assertions before
+changing the test contract. No timeout, retry count or production retention rule
+has been relaxed to turn this run green.
+
+Full logs: `/private/tmp/edr-681-release-run-9fa6mv19/raw-logs.zip`, 1,189,083 bytes,
+CRC verified, SHA-256
+`1a2049f5d7d357d1a64d25c264d879b3003a29aae8b49ebaf7970500af4cf9e5`.
+The same directory contains `edr-681-ci-summary.json` and
+`arm64-first-failure-excerpt.log`. Initial timed-out downloads remain partial;
+the complete ARM64 entry extracted from the partial archive matches the final
+CRC-verified archive. Prior failures and skipped stages remain failures/skips.
+
 ## 2026-10-15 candidate 679: native gates passed, client upgrade rolled back
 
-Current candidate source is `d0c49a193bb14d42e76bd0bb0412a6241c181044`,
+The historical 679 checkpoint source was `d0c49a193bb14d42e76bd0bb0412a6241c181044`,
 branch `codex/rtq-result-delivery-pressure` (16 commits ahead of audit 662,
 seven ahead of comparison `3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`).
 The sections below retain preparation and failed-candidate history; their
@@ -718,10 +847,20 @@ contract, including command safety settings.
 | --- | --- | --- |
 | `max_queue_size_mb` | Existing compiled default 512 MiB remains; explicit sample/deployed values override it. | Queue logical owner payload/metadata ledger. Not an Agent directory limit. |
 | `retention_hours` | Existing 72 h default | Queue typed diagnostic target; protected owner/legacy data may outlive it. |
+| `evidence_cache_max_size_mb` | Existing compiled default 128 MiB; explicit deployed values override it. | Independent evidence DB+WAL admission target; SHM reporting and containing-volume headroom remain separate. |
 | `evidence_cache_retention_hours` | Existing 24 h compiled default | Recent local evidence target. Pressure can shorten it through whole-group retirement. |
 | `evidence_cache_selected_retention_hours` | New 0 resolves to the existing queue retention window, at least the recent window. Explicit 1..87600 h must not be shorter than recent. | Selected candidate target, not a guaranteed retention duration under every load. |
 | `command_state_owner_budget_mb` | New 0 derives 39,438,000 bytes from the existing 300-record compaction working window, two maximal 65,730-byte records per owner. | Independent bounded JSONL owner inventory. The existing 1 MiB `EDR_COMMAND_STATE_MAX_BYTES` remains a soft compaction trigger. |
 | `storage_min_free_mb` | New 0 derives `3 * max(owner_budget, startup_protected_floor) + 24 MiB`; a positive value can raise this floor. | Actual containing-volume free-space admission. With the default owner budget: 143,479,824 bytes. |
+
+Existing reserve formulas are retained, not newly established production sizing.
+Terminal reserve starts at `Q/8`, is raised to the bounded intent/final-frame/owner
+minimum, capped at 4 MiB, and falls back to `Q/2` if it reaches the queue budget.
+The source-only lane derives from eight bounded retry slots and is capped at
+half the post-terminal space. Evidence live-page headroom is `min(E/16, 8 MiB)`.
+These formulas and the synthetic workload checks do not establish an optimal
+production partition or a guaranteed retention window. Deployed effective values
+must be recorded separately from compiled defaults and earlier UTM snapshots.
 
 The physical derivation covers owner plus atomic-compaction copies, two 4 MiB
 SQLite checkpoint double-writes and the existing 4 MiB terminal reserve twice.
@@ -1058,7 +1197,7 @@ migration is not part of the authorized deployment.
 | 1. Sustainable rotation, retained causality | Queue comparison covers 12 windows without full-fact delivery; cache comparison covers 8 virtual hours with exact parent generations and complete selected groups. Protected or oversized old owners cause explicit refusal. | Windows new-client sustained operation; no claim of guaranteed days at arbitrary input rates. |
 | 2. Same-budget comparison | Frozen old/current sources, identical encoded inputs, retained event ranges, complete chains, sampled DB/WAL/SHM, CPU and VFS issued writes are recorded above. | Device-level I/O and a production workload are not represented by the host fixture. |
 | 3. Critical reserve | Ordinary full stock cannot consume terminal/action completion reserve; finite critical exhaustion refuses before action. Both 679 native gates passed. | Installed new-client admission and health. |
-| 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. Final production source passed both 679 native gates. | No promise of unlimited critical admission. |
+| 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. The 679 checkpoint source passed both native gates; later source revisions require their own completed gates. | No promise of unlimited critical admission. |
 | 5. Result budget | Real insert, growth, 1,000 serial copies and four concurrent writers; busy and commit failure preserve existing bytes; owner JSONL and optional copy failure are separate. Both 679 native gates passed. | Installed new-client necessary result and durable server receipt. |
 | 6. Pressure/network cases | Candidate dedupe/aggregation, unique and high-priority capacity, long commands, pin refusal, offline/ACK loss and policy refusal; real loopback mTLS 429/503 with exact successful receipts. Additional fixed-budget dead-letter storm: 1,024 attempts, 91 admits, 933 explicit refusals, 59 saturated waves, 420,693-byte logical plateau; reserved terminal and precreated result remain usable; source uploads/ACKs zero. | Storm uses this queue fixture's transport/codec stubs; it does not replace actual wire tests. Installed-client reconnect/delivery remains separate. |
 | 7. Concurrency/restart | 679 native child-process migration/reclaim crash cases passed. Previously POSIX-only cache lifecycle/query and mutex tests now execute on UTM, as do queue competing drains, stale event/journal connections and concurrent deferred retain. The fixed full queue and new Windows cases passed native AMD64 CI on e6130ee3. | The original full UTM 40-slice failure is retained; the verified BLOB-cost repair subsequently passed that unchanged fixture and the full suite. Native ARM64 still needs the follow-up gates. MinGW AMD64 on ARM64 emulation is additional evidence. A killed process is not hardware power loss. The AMD64 CI as a whole remains failed on its separate synthetic-CA fixture. |

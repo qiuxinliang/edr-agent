@@ -2365,6 +2365,186 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
   cleanup_test_sqlite_path(db);
 }
 
+/* Reach the inclusive target independently of how many groups one real
+ * maintenance slice retires. Padding is explicitly synthetic allocation,
+ * not evidence or a change to any retained payload, owner or reference. */
+static void sqlite_fill_exact_capacity_target(const char *db, uint64_t target) {
+  sqlite3 *raw = NULL;
+  sqlite3_stmt *st = NULL;
+  sqlite3_int64 pages, free_pages, page_size;
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(raw,
+      "SELECT page_count,freelist_count,page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;",
+      -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  pages = sqlite3_column_int64(st, 0);
+  free_pages = sqlite3_column_int64(st, 1);
+  page_size = sqlite3_column_int64(st, 2);
+  assert(page_size == 4096 && target % (uint64_t)page_size == 0u);
+  sqlite3_int64 target_pages = (sqlite3_int64)(target / (uint64_t)page_size);
+  assert(pages <= target_pages && free_pages >= 0 && free_pages <= pages);
+  assert(sqlite3_reset(st) == SQLITE_OK);
+  if (pages - free_pages < target_pages) {
+    assert(sqlite3_exec(raw,
+        "CREATE TABLE capacity_boundary_fixture(payload BLOB);",
+        NULL, NULL, NULL) == SQLITE_OK);
+  }
+  /* A row is no larger than an original 2500-byte fixture reference. The
+   * page-count bound includes the initial table page and its first row. */
+  for (sqlite3_int64 row = 0; row < target_pages; ++row) {
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    pages = sqlite3_column_int64(st, 0);
+    free_pages = sqlite3_column_int64(st, 1);
+    assert(sqlite3_reset(st) == SQLITE_OK);
+    if (pages - free_pages == target_pages) break;
+    assert(pages - free_pages < target_pages);
+    assert(sqlite3_exec(raw,
+        "BEGIN;INSERT INTO capacity_boundary_fixture VALUES(zeroblob(2500));",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_int64 live_pages = sqlite3_column_int64(st, 0) - sqlite3_column_int64(st, 1);
+    assert(sqlite3_reset(st) == SQLITE_OK);
+    if (live_pages > target_pages) {
+      /* A B-tree split can allocate two pages. Roll it back and allocate
+       * just the last synthetic page instead of crossing the target. */
+      assert(sqlite3_exec(raw,
+          "ROLLBACK;CREATE TABLE capacity_boundary_edge(payload BLOB);",
+          NULL, NULL, NULL) == SQLITE_OK);
+    } else {
+      assert(sqlite3_exec(raw, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+    }
+  }
+  sqlite3_finalize(st);
+  assert(sqlite3_exec(raw, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  assert(sqlite_scalar_integer(db, "SELECT page_count FROM pragma_page_count;") == target_pages);
+  assert(sqlite_scalar_integer(db, "SELECT freelist_count FROM pragma_freelist_count;") == 0);
+}
+
+/* Existing owners still consume capacity when enrichment/replay rewrites WAL.
+ * A real reader prevents reset; refusal must preserve the owner and its
+ * evidence, then recover after the reader releases its snapshot. */
+static void test_existing_candidate_update_honors_capacity(void) {
+  char db[512], candidate_id[160];
+  sqlite3 *raw = NULL, *reader = NULL;
+  sqlite3_stmt *pin = NULL, *st = NULL;
+  EdrBehaviorRecord candidate, context;
+  EdrEvidenceCacheStatus initial, before, after;
+  struct timespec ts;
+  assert(make_test_sqlite_path(db, sizeof(db)) == 0);
+  assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority = 3u;
+  candidate.pid = 74406u;
+  candidate.ppid = 74400u;
+  candidate.event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  set_record_generation(&candidate, UINT64_C(0x74406));
+  snprintf(candidate.tenant_id, sizeof(candidate.tenant_id), "synthetic-tenant");
+  snprintf(candidate.endpoint_id, sizeof(candidate.endpoint_id), "existing-capacity");
+  snprintf(candidate.event_id, sizeof(candidate.event_id), "existing-capacity-candidate");
+  snprintf(candidate.process_name, sizeof(candidate.process_name), "powershell.exe");
+  snprintf(candidate.cmdline, sizeof(candidate.cmdline), "powershell.exe -File synthetic.ps1");
+  snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.4.6");
+  candidate.net_dport = 445u;
+  edr_local_evidence_cache_record_behavior(&candidate);
+  sqlite_candidate_id_for_source_event(db, candidate.event_id, candidate_id, sizeof(candidate_id));
+  context = candidate;
+  context.priority = 1u;
+  context.type = EDR_EVENT_PROCESS_CREATE;
+  context.event_time_ns += 3000000LL;
+  context.net_dst[0] = '\0';
+  context.net_dport = 0u;
+  snprintf(context.event_id, sizeof(context.event_id), "existing-capacity-context");
+  snprintf(context.process_name, sizeof(context.process_name), "helper.exe");
+  snprintf(context.cmdline, sizeof(context.cmdline), "helper.exe --synthetic-context");
+  assert(!edr_local_evidence_cache_is_candidate(&context));
+  edr_local_evidence_cache_record_behavior(&context);
+  assert(sqlite_post_artifact_count(db, candidate_id, context.event_id) == 1u);
+  assert(sqlite3_open(db, &raw) == SQLITE_OK);
+  /* An unrelated imported owner must also survive pressure unchanged. The
+   * existing legacy-writer test covers enrichment of that owner's own ID. */
+  assert(sqlite3_exec(raw,
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns) VALUES('legacy-preserve',1);"
+      "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL) == SQLITE_OK);
+  edr_local_evidence_cache_get_status(&initial);
+  assert(initial.candidate_admitted == 1u);
+  assert(initial.db_bytes + initial.wal_bytes < 1024u * 1024u);
+  assert(sqlite3_open_v2(db, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(sqlite3_exec(reader, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(reader, "SELECT candidate_id FROM p0_candidates WHERE retention_policy_version=1;", -1, &pin, NULL) == SQLITE_OK);
+  assert(sqlite3_step(pin) == SQLITE_ROW);
+  assert(strcmp((const char *)sqlite3_column_text(pin, 0), candidate_id) == 0);
+  before = initial;
+  for (unsigned replay = 0; replay < 200u &&
+       before.db_bytes + before.wal_bytes <= 1024u * 1024u; ++replay) {
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&before);
+  }
+  assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
+  assert(before.p0_candidates_written > initial.p0_candidates_written);
+  assert(before.candidate_rejected == initial.candidate_rejected);
+  assert(sqlite3_exec(raw,
+      "CREATE TEMP TABLE before_owner AS SELECT * FROM p0_candidates;"
+      "CREATE TEMP TABLE before_facts AS SELECT * FROM context_facts;"
+      "CREATE TEMP TABLE before_refs AS SELECT * FROM candidate_context_refs;"
+      "CREATE TEMP TABLE before_materialized AS SELECT * FROM " EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW ";",
+      NULL, NULL, NULL) == SQLITE_OK);
+  for (unsigned refusal = 0; refusal < 2u; ++refusal) {
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.candidate_rejected == before.candidate_rejected + 1u);
+    assert(after.db_budget_dropped == before.db_budget_dropped + 1u);
+    assert(after.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
+           before.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] + 1u);
+    assert(after.records_written == before.records_written);
+    assert(after.p0_candidates_written == before.p0_candidates_written);
+    assert(after.candidate_admitted == initial.candidate_admitted);
+    assert(after.candidate_admission_attempts == initial.candidate_admission_attempts);
+    assert(after.maintenance_runs == initial.maintenance_runs);
+    assert(after.retention_groups_retired == initial.retention_groups_retired);
+    assert(after.db_bytes == before.db_bytes && after.wal_bytes == before.wal_bytes);
+    assert(strstr(after.last_error, "WAL reset blocked") != NULL);
+    before = after;
+  }
+  const char *unchanged[] = {
+      "SELECT * FROM before_owner EXCEPT SELECT * FROM p0_candidates;",
+      "SELECT * FROM before_facts EXCEPT SELECT * FROM context_facts;",
+      "SELECT * FROM before_refs EXCEPT SELECT * FROM candidate_context_refs;",
+      "SELECT * FROM before_materialized EXCEPT SELECT * FROM " EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW ";"};
+  for (size_t i = 0; i < sizeof(unchanged) / sizeof(unchanged[0]); ++i) {
+    assert(sqlite3_prepare_v2(raw, unchanged[i], -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st); st = NULL;
+  }
+  sqlite3_finalize(pin);
+  assert(sqlite3_exec(reader, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(reader) == SQLITE_OK);
+  snprintf(candidate.cmdline, sizeof(candidate.cmdline), "powershell.exe -File recovered.ps1");
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.records_written == before.records_written + 1u);
+  assert(after.p0_candidates_written == before.p0_candidates_written + 1u);
+  assert(after.candidate_rejected == before.candidate_rejected);
+  assert(after.db_budget_dropped == before.db_budget_dropped);
+  assert(after.candidate_admitted == initial.candidate_admitted);
+  assert(after.candidate_admission_attempts == initial.candidate_admission_attempts);
+  assert(after.maintenance_runs == initial.maintenance_runs);
+  assert(after.retention_groups_retired == initial.retention_groups_retired);
+  assert(sqlite3_close(raw) == SQLITE_OK);
+  for (unsigned reopen = 0; reopen < 2u; ++reopen) {
+    assert(sqlite_scalar_integer(db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_policy_version=1 AND local_retention_state='retained' AND cmdline='powershell.exe -File recovered.ps1';") == 1);
+    assert(sqlite_scalar_integer(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='legacy-preserve' AND retention_policy_version=0 AND local_retention_state='retained' AND event_time_ns=1;") == 1);
+    assert(sqlite_table_count(db, "p0_candidates") == 2u);
+    assert(sqlite_post_artifact_count(db, candidate_id, context.event_id) == 1u);
+    assert(sqlite_scalar_integer(db, "SELECT COUNT(*) FROM candidate_context_refs r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL;") == 0);
+    edr_local_evidence_cache_close();
+    if (!reopen) assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  }
+  cleanup_test_sqlite_path(db);
+}
+
 static void test_capacity_reserves_wal_room_below_live_limit(void) {
   char db[512], sql[1024];
   sqlite3 *raw = NULL;
@@ -2409,8 +2589,11 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
   assert(sqlite3_close(raw) == SQLITE_OK);
   edr_local_evidence_cache_get_status(&before);
   assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
+  assert(sqlite_scalar_integer(db,
+      "SELECT (page_count-freelist_count)*page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;") > 960u * 1024u);
   after=before;
-  for(unsigned cycle=0; after.db_bytes+after.wal_bytes>=960u*1024u &&
+  for(unsigned cycle=0; after.db_bytes+after.wal_bytes>960u*1024u &&
       cycle<(unsigned)rows+1u; ++cycle) {
     s_test_monotonic_ns+=60000000000ULL;
     edr_local_evidence_cache_poll_maintenance();
@@ -2425,11 +2608,18 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
     assert(after.maintenance_runs==runs);
   }
   assert(after.db_capacity_evicted > before.db_capacity_evicted);
-  if(after.db_bytes+after.wal_bytes>=960u*1024u)
+  if(after.db_bytes+after.wal_bytes>960u*1024u)
     fprintf(stderr,"WAL reserve convergence failed: db=%llu wal=%llu retired=%llu cause=%s\n",
         (unsigned long long)after.db_bytes,(unsigned long long)after.wal_bytes,
         (unsigned long long)after.retention_groups_retired,after.last_error);
-  assert(after.db_bytes + after.wal_bytes < 960u * 1024u);
+  assert(after.db_bytes + after.wal_bytes <= 960u * 1024u);
+  /* Production stops retiring at live <= target. Force that exact boundary
+   * after proving real above-target reclamation, then exercise admission and
+   * reopen below. This is a pre-write admission budget, not a hard bound
+   * on the WAL allocation during an individual SQLite transaction. */
+  sqlite_fill_exact_capacity_target(db, 960u * 1024u);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.db_bytes == 960u * 1024u && after.wal_bytes == 0u);
   uint64_t retained_groups=sqlite_table_count(db,"p0_candidates");
   assert(retained_groups>=1u && retained_groups<(uint64_t)rows+1u);
   assert(sqlite_table_count(db,"candidate_context_refs")==retained_groups);
@@ -9887,6 +10077,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_capacity_success_does_not_throttle_next_reclaim());
   RUN_CACHE_CASE("retention", test_capacity_progress_with_slow_checkpoint());
   RUN_CACHE_CASE("retention", test_capacity_reserves_wal_room_below_live_limit());
+  RUN_CACHE_CASE("retention", test_existing_candidate_update_honors_capacity());
   RUN_CACHE_CASE("retention", test_capacity_allows_wal_transaction_after_reclaim());
   RUN_CACHE_CASE("retention", test_capacity_reclaims_wal_tail_without_evicting_evidence(119u));
   RUN_CACHE_CASE("retention", test_capacity_reclaims_wal_tail_without_evicting_evidence(121u));
