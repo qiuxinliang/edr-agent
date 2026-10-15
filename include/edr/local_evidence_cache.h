@@ -190,6 +190,8 @@ typedef struct {
   uint32_t context_windows_utilization_bps;
   uint32_t candidate_dedup_utilization_bps;
   uint32_t db_utilization_bps;
+  /* Health-only snapshot: durable store unavailable or resource throttle active.
+   * Ingestion admission uses its own predicate, not this field. */
   uint32_t pressure_active;
   /* Completed module-mutex samples for this process. Wait/hold percentiles
    * are conservative upper bounds from a fixed 64-bucket log2(ns)

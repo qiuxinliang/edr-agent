@@ -50,6 +50,64 @@ static void check_health_routes(cJSON *root, int allowed) {
   assert((check("POST", "ingest/engine-health/delta", body) == 0) == allowed);
   free(body); cJSON_DeleteItemFromObjectCaseSensitive(root, "engine_health_update");
 }
+static void test_evidence_pressure_health_projection(void) {
+  const char *profiles[] = {"basic", "diagnostic"};
+  for (size_t profile = 0; profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
+    for (int pressure = 0; pressure <= 1; ++pressure) {
+      cJSON *expected = cJSON_Parse("{\"endpoint_id\":\"ep\",\"agent_version\":\"test-v1\","
+          "\"policy_version\":\"p\",\"engine_health\":{\"monitor\":{},\"evidence_cache\":{}}}");
+      assert(expected);
+      cJSON *health = cJSON_GetObjectItemCaseSensitive(expected, "engine_health");
+      assert(cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(health, "monitor"), "profile", profiles[profile]));
+      assert(cJSON_AddBoolToObject(cJSON_GetObjectItemCaseSensitive(health, "evidence_cache"), "pressure_active", pressure));
+      check_health_routes(expected, 1);
+
+      cJSON *raw = cJSON_Duplicate(expected, 1); assert(raw);
+      cJSON *cache = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(raw, "engine_health"), "evidence_cache");
+      assert(cJSON_AddStringToObject(cache, "last_error", "synthetic-private-database-error"));
+      assert(cJSON_AddStringToObject(cache, "command_line", "synthetic-private-command"));
+      assert(cJSON_AddStringToObject(cache, "path", "synthetic-private-path"));
+      assert(cJSON_AddStringToObject(cache, "index", "synthetic-private-index"));
+      assert(cJSON_AddStringToObject(cache, "dictionary", "synthetic-private-dictionary"));
+      assert(cJSON_AddStringToObject(cache, "payload_hash", "synthetic-private-hash"));
+      cJSON *event = cJSON_AddObjectToObject(cache, "raw_event"); assert(event);
+      assert(cJSON_AddStringToObject(event, "payload", "synthetic-private-event"));
+      assert(cJSON_AddNumberToObject(cache, "db_bytes", 8192));
+      assert(cJSON_AddBoolToObject(cache, "db_open", 1));
+      check_health_routes(raw, 0);
+      char *body = cJSON_PrintUnformatted(raw); assert(body);
+      char reason[128]; char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+      cJSON *projected = cJSON_Parse(wire); assert(projected);
+      /* The top-level cache exposes exactly one boolean, including false. */
+      assert(cJSON_Compare(projected, expected, 1));
+      cache = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(projected, "engine_health"), "evidence_cache");
+      assert(cJSON_GetArraySize(cache) == 1);
+      const cJSON *value = cJSON_GetObjectItemCaseSensitive(cache, "pressure_active");
+      assert(cJSON_IsBool(value) && cJSON_IsTrue(value) == pressure);
+      assert(!strstr(wire, "synthetic-private"));
+      check_health_routes(projected, 1);
+      free(body); free(wire); cJSON_Delete(projected); cJSON_Delete(raw); cJSON_Delete(expected);
+    }
+  }
+  const char *invalid[] = {"\"true\"", "\"false\"", "\"synthetic-private\"", "0", "1", "-1", "null", "{}", "[]"};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    cJSON *raw = cJSON_Parse("{\"endpoint_id\":\"ep\",\"agent_version\":\"test-v1\","
+        "\"policy_version\":\"p\",\"engine_health\":{\"monitor\":{\"profile\":\"basic\"},"
+        "\"evidence_cache\":{\"pressure_active\":false}}}");
+    assert(raw);
+    cJSON *health = cJSON_GetObjectItemCaseSensitive(raw, "engine_health");
+    cJSON *cache = cJSON_GetObjectItemCaseSensitive(health, "evidence_cache");
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(cache, "pressure_active", cJSON_Parse(invalid[i])));
+    check_health_routes(raw, 0);
+    char *body = cJSON_PrintUnformatted(raw); assert(body);
+    char reason[128]; char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+    cJSON *projected = cJSON_Parse(wire); assert(projected);
+    cJSON_DeleteItemFromObjectCaseSensitive(health, "evidence_cache");
+    assert(cJSON_Compare(projected, raw, 1));
+    check_health_routes(projected, 1);
+    free(body); free(wire); cJSON_Delete(projected); cJSON_Delete(raw);
+  }
+}
 static void test_parent_exit_health_projection(void) {
   /* Both monitor profiles publish these bounded diagnostics. This exercises
    * the real projection/HTTP gate, not the Agent's runtime snapshot builder. */
@@ -392,6 +450,7 @@ static void test_storage_health_is_numeric_and_bounded(void) {
 }
 
 int main(void) {
+  test_evidence_pressure_health_projection();
   test_storage_health_is_numeric_and_bounded();
   test_parent_exit_health_projection();
   test_diagnostic_health_commitments();

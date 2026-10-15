@@ -412,6 +412,54 @@ static void test_identity_status_counter_basics(void) {
 }
 
 #if defined(EDR_HAVE_SQLITE)
+static void assert_cache_health_pressure(int db_open, int pressure) {
+  EdrEvidenceCacheStatus status;
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_open == db_open);
+  assert(status.pressure_active == (uint32_t)pressure);
+  const size_t capacities[] = {16384u, 1600u};
+  for (size_t i = 0u; i < sizeof(capacities) / sizeof(capacities[0]); ++i) {
+    char fragment[16384], document[16400];
+    edr_local_evidence_cache_status_json(fragment, capacities[i]);
+    int written = snprintf(document, sizeof(document), "{%s}", fragment);
+    assert(written > 0 && (size_t)written < sizeof(document));
+    cJSON *root = cJSON_Parse(document); assert(root);
+    cJSON *cache = cJSON_GetObjectItemCaseSensitive(root, "evidence_cache");
+    cJSON *open_value = cJSON_GetObjectItemCaseSensitive(cache, "db_open");
+    cJSON *pressure_value = cJSON_GetObjectItemCaseSensitive(cache, "pressure_active");
+    assert(cJSON_IsBool(open_value) && cJSON_IsTrue(open_value) == db_open);
+    assert(cJSON_IsBool(pressure_value) && cJSON_IsTrue(pressure_value) == pressure);
+    if (i == 1u) {
+      cJSON *truncated = cJSON_GetObjectItemCaseSensitive(cache, "status");
+      assert(cJSON_IsString(truncated) && strcmp(truncated->valuestring, "truncated") == 0);
+    }
+    cJSON_Delete(root);
+  }
+}
+
+static void test_unavailable_cache_health_is_degraded(void) {
+  char parent_file[512], invalid_child[544];
+  assert(make_test_sqlite_path(parent_file, sizeof(parent_file)) == 0);
+  int written = snprintf(invalid_child, sizeof(invalid_child), "%s/child.db", parent_file);
+  assert(written > 0 && (size_t)written < sizeof(invalid_child));
+  s_test_pressure = false;
+  edr_local_evidence_cache_close();
+  assert_cache_health_pressure(0, 1);
+  /* A regular file cannot be the database's parent directory. The real open
+   * fails without resource throttling and must remain visibly degraded. */
+  assert(edr_local_evidence_cache_open(invalid_child, 8u, 24u) != 0);
+  assert_cache_health_pressure(0, 1);
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  assert_cache_health_pressure(1, 0);
+  s_test_pressure = true;
+  assert_cache_health_pressure(1, 1);
+  s_test_pressure = false;
+  assert_cache_health_pressure(1, 0);
+  edr_local_evidence_cache_close();
+  assert_cache_health_pressure(0, 1);
+  cleanup_test_sqlite_path(parent_file);
+}
+
 static uint64_t sqlite_table_count(const char *path, const char *table) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
@@ -10053,6 +10101,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_behavior_summary_local_only_flush());
   RUN_CACHE_CASE("context", test_identity_status_counter_basics());
 #if defined(EDR_HAVE_SQLITE)
+  RUN_CACHE_CASE("context", test_unavailable_cache_health_is_degraded());
   RUN_CACHE_CASE("context", test_ordinary_aggregation_preserves_pre_context_actions());
   RUN_CACHE_CASE("context", test_ordinary_aggregation_scope_objects_and_incomplete_keys());
   RUN_CACHE_CASE("context", test_ordinary_aggregation_closed_slot_holes_and_capacity());

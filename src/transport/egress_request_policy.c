@@ -77,6 +77,7 @@ typedef struct { const char *path; HealthType type; } HealthField;
  * deliberately absent. Diagnostic detail remains in the existing local owner. */
 static const HealthField health_fields[] = {
   N("reported_at_unix_ms"),
+  B("evidence_cache.pressure_active"),
   B("config_recovery.active"), B("config_recovery.safe_mode"),
   B("config_recovery.last_good_used"), B("config_recovery.auto_repaired"),
   N("config_recovery.fields_extracted"), S("config_recovery.mode"), R("config_recovery.reason"),

@@ -20,6 +20,7 @@ class Receiver(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     calls = 0
     health_profiles = []
+    evidence_pressure = []
     def log_message(self, *_):
         pass
     def do_POST(self):
@@ -38,6 +39,10 @@ class Receiver(http.server.BaseHTTPRequestHandler):
         monitor = data["engine_health"]["monitor"]
         assert monitor["interval_s"] == 120
         type(self).health_profiles.append(monitor["profile"])
+        cache = data["engine_health"]["evidence_cache"]
+        assert set(cache) == {"pressure_active"}
+        assert type(cache["pressure_active"]) is bool
+        type(self).evidence_pressure.append(cache["pressure_active"])
         self.send_response(200)
         reply = b'{"data":{"accepted":true}}'
         self.send_header("Content-Length", str(len(reply)))
@@ -96,12 +101,13 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            env = dict(os.environ, EDR_AGENT_CONFIG_SIGNING_SECRET=SECRET, EDR_ENGINE_HEALTH_INTERVAL_S="120", EDR_REMOTE_CONFIG_AUTO_PULL="1", EDR_REMOTE_CONFIG_POLL_S="60", EDR_REMOTE_CONFIG_URL=f"https://127.0.0.1:{server.server_port}/api/v1/agent/runtime-policy.toml")
+            env = dict(os.environ, EDR_AGENT_CONFIG_SIGNING_SECRET=SECRET, EDR_ENGINE_HEALTH_INTERVAL_S="120", EDR_PREPROCESS_THROTTLE="0", EDR_REMOTE_CONFIG_AUTO_PULL="1", EDR_REMOTE_CONFIG_POLL_S="60", EDR_REMOTE_CONFIG_URL=f"https://127.0.0.1:{server.server_port}/api/v1/agent/runtime-policy.toml")
             subprocess.run([args.client, f"https://127.0.0.1:{server.server_port}/api/v1",
                             str(root / "ca.pem"), str(root / "client.pem"), str(root / "client.key"),
                             str(root / "queue.db"), str(root / "response.toml")], env=env, check=True, timeout=45)
             assert Receiver.calls == 14
-            assert Receiver.health_profiles == ["basic", "diagnostic"]
+            assert Receiver.health_profiles == ["basic", "diagnostic", "basic", "diagnostic"]
+            assert Receiver.evidence_pressure == [True, True, False, False]
         finally:
             server.shutdown()
             server.server_close()

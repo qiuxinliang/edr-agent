@@ -65,6 +65,9 @@ int main(int argc, char **argv) {
   /* Exercise actual basic/leased diagnostic JSON with an env cadence override. */
   snprintf(agent->cfg.agent.endpoint_id, sizeof(agent->cfg.agent.endpoint_id), "synthetic-endpoint");
   agent->cfg.health_monitor.interval_s = 60u;
+  edr_resource_init(&agent->cfg);
+  assert(!edr_resource_preprocess_throttle_active());
+  edr_local_evidence_cache_close();
   uint64_t last_health_ns = 0u;
   agent->cfg.health_monitor.enabled = false;
   edr_agent_poll_engine_health(agent, &last_health_ns, 1);
@@ -73,6 +76,18 @@ int main(int argc, char **argv) {
   snprintf(agent->cfg.health_monitor.profile, sizeof(agent->cfg.health_monitor.profile), "diagnostic");
   edr_agent_poll_engine_health(agent, &last_health_ns, 1);
   assert(agent->health_schedule.interval_s == 120u);
+  /* A real synthetic SQLite cache clears the unavailable-cache pressure flag;
+   * both profiles must preserve that false value through projection and HTTPS. */
+  assert(edr_local_evidence_cache_open(":memory:", 8u, 24u) == 0);
+  assert(!edr_resource_preprocess_throttle_active());
+  agent->cfg.health_monitor.enabled = false;
+  edr_agent_poll_engine_health(agent, &last_health_ns, 1);
+  assert(agent->health_schedule.interval_s == 120u);
+  agent->cfg.health_monitor.enabled = true;
+  edr_agent_poll_engine_health(agent, &last_health_ns, 1);
+  assert(agent->health_schedule.interval_s == 120u);
+  edr_local_evidence_cache_close();
+  edr_resource_shutdown();
   free(agent->cached_remote_body); free(agent);
   return 0;
 }

@@ -7984,7 +7984,9 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
                     (uint64_t)sizeof(s_context_ring) + (uint64_t)sizeof(s_context_windows) +
                     (uint64_t)sizeof(s_metrics) + (uint64_t)sizeof(s_candidate_dedupe) +
                     (uint64_t)sizeof(s_ordinary_agg);
-  st.pressure_active = evidence_cache_pressure_active() ? 1u : 0u;
+  /* Health degradation must also describe an unavailable durable store. Keep
+   * the ingestion throttle predicate independent of this snapshot field. */
+  st.pressure_active = (!st.db_open || evidence_cache_pressure_active()) ? 1u : 0u;
 #if defined(EDR_HAVE_SQLITE)
   refresh_db_size_status();
   st.db_bytes = s_status.db_bytes;
@@ -9477,8 +9479,8 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
     /* This function supplies a JSON member, not a complete document.  Keep
      * that member syntactically valid for older callers with a small buffer
      * instead of handing the enclosing health document a cut-off fragment. */
-    (void)snprintf(out, cap, "\"evidence_cache\":{\"db_open\":%s,\"status\":\"truncated\"}",
-                   st.db_open ? "true" : "false");
+    (void)snprintf(out, cap, "\"evidence_cache\":{\"db_open\":%s,\"pressure_active\":%s,\"status\":\"truncated\"}",
+                   st.db_open ? "true" : "false", st.pressure_active ? "true" : "false");
   }
 }
 

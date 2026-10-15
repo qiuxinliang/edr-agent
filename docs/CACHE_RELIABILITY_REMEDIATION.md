@@ -102,6 +102,33 @@ in 46 ms internally and preserved the DB's identity/size/mtime; result SHA-256
 This does not certify the Agent's linked SQLite or actual aggregate execution.
 An isolated replay of the production startup inventory remains required.
 
+The attempt to use that installed Agent DLL from the diagnostic PowerShell
+host did not reach SQLite. The second, explicitly loaded attempt returned
+Win32 193 in 13 ms, with the DLL digest unchanged and no database opened.
+Its original result SHA-256 is
+`eb70f125c795c43bf9f8bc01b1bab5358d33de10c6121b2334fe53c2c809197f`.
+`IsWow64Process2` returning process-machine 0 / native-machine ARM64 does not
+establish the CLR host's compatibility with a pure ARM64 DLL. This is a
+diagnostic-host loading failure, not evidence of an Agent SQL failure or of
+the ten-second inventory deadline. The earlier generic loading failure is
+also retained; neither attempt read evidence rows.
+
+A separate, not-yet-released health correction restores the existing
+`evidence_cache.pressure_active` boolean to both real health producers and
+the final minimal projection. The status snapshot treats an unavailable
+durable store as degraded; the ingestion throttle predicate is unchanged.
+The existing backend consumes this boolean and the existing frontend derives
+degraded display status from it. No backend deployment, additional evidence
+fields, error text, paths or commands are required. Four focused host checks
+passed, including actual mTLS basic/diagnostic requests for closed/open
+synthetic caches and full/delta field gates. The first sandbox loopback bind
+failure is preserved, followed by a successful run of only that affected
+test. Result SHA-256:
+`09366f1efdd993976f80128ee165fce458e029a117123b8d97e4e80f4833fe91`.
+The oversize capability-only fallback has source review, not a new exercised
+oversize case. Windows and endpoint validation are pending. This correction
+does not repair the evidence store's startup failure.
+
 The old C# command probe returned a generic parse/read failure. Its strict
 UTF-8 decoder runs before command filtering, so unrelated old invalid UTF-8
 can abort it; that output alone cannot prove the actual exception. A new

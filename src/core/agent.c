@@ -2545,6 +2545,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"engine_health\":{"
         "\"reported_at_unix_ms\":%llu,"
         "\"capability_manifest\":%s,"
+        "\"evidence_cache\":{\"pressure_active\":%s},"
         "\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"result_delivery_renewal_supported\":true,\"denied_requests\":%lu,"
         "\"policy_held_rows\":%llu,\"local_evidence_rows\":%llu,\"capacity_limit_defaulted\":%s,"
         "\"terminal_policy_held_frames\":%llu,\"terminal_local_retained\":%llu,\"legacy_owner_unacknowledged\":%llu,"
@@ -2703,6 +2704,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
         runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
         (unsigned long long)wall_ms, capability_manifest_json,
+        evidence_status.pressure_active ? "true" : "false",
         http_rt.egress_denied_count,
         (unsigned long long)queue_capacity_metrics.policy_held_rows,
         (unsigned long long)queue_capacity_metrics.local_evidence_rows,
@@ -2994,11 +2996,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
           capability_only, sizeof(capability_only),
           "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
           "\"engine_health\":{\"reported_at_unix_ms\":%llu,\"capability_manifest\":%s,"
+          "\"evidence_cache\":{\"pressure_active\":%s},"
           "\"monitor\":{\"enabled\":true,\"profile\":\"basic\",\"interval_s\":%u},"
           "\"health_status\":\"degraded\",\"health_error\":\"basic health payload too large\"}}",
           agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
           runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
           (unsigned long long)wall_ms, capability_manifest_json,
+          evidence_status.pressure_active ? "true" : "false",
           (uint32_t)interval);
       if (n_capability_only > 0 && (size_t)n_capability_only < sizeof(capability_only)) {
         (void)edr_ingest_http_post_engine_health_json(capability_only);
