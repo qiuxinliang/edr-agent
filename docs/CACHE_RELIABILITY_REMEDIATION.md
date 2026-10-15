@@ -1,5 +1,110 @@
 # Cache reliability remediation
 
+## 2026-10-16 candidate 686 preparation: 685 reopening recovered, health fix verified locally
+
+The local runtime change is `3e8e73c7e01bfee8f90bdd682db07202194392bc`.
+It restores only the existing evidence-pressure health boolean and its closed
+store meaning; it does not change retention, upload or startup deadlines.
+The four focused host checks and actual mTLS producer/projection checks passed.
+Windows CI and deployment of this change are still pending. Only Headless
+client artifacts will be downloaded; no Setup UI package is a client input.
+
+The first 685 startup failure below remains preserved. One controlled restart
+of the same installed 685 bytes subsequently recovered actual native opening.
+The first restart helper refused in preflight because an unnecessary historical
+journal enumeration exceeded its diagnostic count limit; it issued no stop or
+start. That original result SHA-256 is
+`0b81ae587ce3389cc8bf60cd624dbe9af623457199d36b7ae457e26efd45ce6a`.
+The replacement removed historical journal reads instead of increasing that
+limit. It checked the exact completed 685 journal/checkpoint, current task and
+process generation, no running local updater, and a fresh backend count of zero
+unfinished upgrades for this endpoint. It did not classify or delete history.
+
+The actual restart issued one stop and one start through the existing
+`FDSecurityAgent` task. No fallback kill, timeout or recovery start was needed.
+The Agent, launcher, configuration and task definition hashes stayed unchanged.
+New PID 8432 has guest CIM birth `2026-10-15T21:24:10.7171330Z`, version 3.2.685,
+and the same installed Agent SHA `1bccb92f...c1307`. Restart result SHA-256:
+`b974081ae2582a65d4c9881153b1bad9fa84a8964cc6d9c74937ec9879b93e06`.
+Guest creation time and health report time remain separate clocks.
+
+The first new-generation health report has `db_open=true`, physical guard
+failures 0, cause 0, and connected/leased control stream. It reports 7,950
+legacy candidates at opening. DB bytes are 530,051,072 and sampled physical
+DB/WAL/SHM bytes 535,942,512; near-budget occupancy is not itself a failure.
+This first report also has resource pressure during initialization and zero
+candidate admissions/rejections, so it is not sustained-write acceptance.
+Health result SHA-256:
+`37ce315f4aeddc80a5f5b4f9eaff48254890d56faa55e8c9a050451013bc7671`.
+The bounded post-restart cache probe now reads all supported components,
+matches all nine queue ledger categories and preserves the three original
+sampled owners' immutable bytes/identities/ACK flags. Its SHA-256 is
+`080cafe42e1f30e5b1d742f89ebd2059ecbf8412b66550656a15b2a8ef0c6f85`.
+No real cache cleanup or manual migration was performed. This proves current
+native reopening recovered; the original transient cause is still unknown.
+A later fresh 8432 report at backend report time 21:34:01.162 remains open,
+with zero guard failures and resource pressure cleared. Control stream is
+connected/leased, P0 is ready with the same r289 artifact hash, and policy v528
+has a new-generation verified/applied receipt with matching hashes. Candidate
+requests/admissions/rejections still read zero in this quiet interval; this
+does not establish sustained field writing or a seventy-two-hour window.
+
+An actual client RTQ query targeted only this endpoint and `pid = 8432`.
+Session `rtq_1792099754845833000`, run `rtqrun_1792099754918708000` completed
+with one success, zero errors, and one FDSensor row. The durable run has
+`status=success`, PID range 8432..8432, and exactly four row keys:
+`type`, `name`, `path`, `pid`. No command line, user or process tree was requested
+or returned. The initial metadata verifier mistakenly expected `completed`,
+which is not `rtqRunStatus()`'s success value; its original failure is retained.
+The original snapshot was reclassified offline using the authoritative success
+contract, without repeating the query. The exact command is
+`cmd_rtq_ep-ff84e69e4_1792099754918710000`; its stable local final is success,
+exit 0, PID 8432, pending 0 and no held/error state. Local/server result length
+390 and SHA `de6441e50dbf6f1bc0165efbcd71746d5b4e0e8c8221e8deb6c13ad6f136b789`
+match, and the actual durable result verifier reports both `accepted=true`
+and `execution_succeeded=true`. Receipt result SHA-256:
+`48970b7f2aa9e4f5747e16ae6e227814ade708da8a993fa7cb5998278e9a0feb`.
+The combined offline reclassification SHA-256 is
+`160e90cb7bf212d7f14be5866096f29b295c6337739ca87358020a468fd595a4`.
+This closes the sampled live-process `rtq_execute` consumer/result-owner check;
+it does not certify cached-evidence `rtq_query` or independently captured
+network application ACKs.
+Screenshot: `/private/tmp/edr-678-client-acceptance/rtq-685-pid8432-completed.png`.
+
+A fresh same-protocol benchmark binds all 1,068 tracked source/header bytes to
+3e8 before and after execution, including the actual current codec objects.
+Three original commands passed once; evidence variants use five fresh runs
+each and queue variants one run each. Full results and commands are under
+`/private/tmp/edr-evidence-health-3e8e73c7-kdw6tlbd/`; `RESULTS.json` SHA-256 is
+`cce60dacad007def38bef3b0d484a08e38db3e2a56148493c3c038f478c42e84`,
+`SUMMARY.txt` SHA-256 is
+`1ce0f5b2ee1a8c37417e626e94a71d03ae94e0cfbafcfab0b22ddff61596fa61`.
+
+| Evidence case: 8 MiB, 192 candidates + 48 facts over eight simulated hours | Old 673 / 1 h | Current / 1 h | Current / 4 h |
+| --- | ---: | ---: | ---: |
+| Selected candidates | 6 | 6 | 24 |
+| Self-contained parent bindings | 0 | 6 | 24 |
+| Reconstructable with process cache | 6 | 6 | 24 |
+| Actual selected timestamp span, seconds | 20 | 20 | 10,820 |
+| Median process CPU, seconds | 0.171884 | 0.303208 | 0.288581 |
+| Sampled physical peak, bytes | 2,305,312 | 3,272,648 | 3,379,192 |
+| Final physical bytes | 2,251,752 | 677,048 | 791,832 |
+| VFS issued write bytes | 17,364,348 | 31,429,500 | 28,981,320 |
+
+With the identical 1 MiB logical queue and 48 unique 128 KiB real BAT1 inputs,
+old 662/current admit 7/36 and refuse 41/12; latest retained age is 36,070/60 s.
+The 20-byte terminal is refused/accepted with exact readback and zero ordinary
+source uploads in the sender-stub scope. CPU is 0.148379/0.316862 s and sampled
+physical peak 1,890,896/4,956,096 bytes. SQLite total changes are 106/347.
+Current four-hour evidence CPU (+67.893%) and queue CPU (+113.549%) cost more in this
+synthetic comparison; there is no performance-improvement claim. Retention,
+binding, physical samples and issued writes match the earlier 1ba experiment;
+CPU/read differences are separately recorded and not attributed to this health
+change. These remain macOS debug/synthetic measurements, VFS rather than device
+I/O, sampled peaks rather than a directory hard cap, one parent generation per
+candidate rather than arbitrary chain completeness, and 3 h 20 s of timestamp
+span rather than a continuous four-hour or UTM 72-hour retention guarantee.
+
 ## 2026-10-16 candidate 685: installed, evidence-store startup not accepted
 
 Runtime source is `1ba4e34cc0b656c7cc1d7d31fa19db20f5d84c2d`, branch
@@ -112,6 +217,17 @@ establish the CLR host's compatibility with a pure ARM64 DLL. This is a
 diagnostic-host loading failure, not evidence of an Agent SQL failure or of
 the ten-second inventory deadline. The earlier generic loading failure is
 also retained; neither attempt read evidence rows.
+
+One subsequent read-only execution of all seven exact inventory aggregates
+completed in 1,421 ms with guest Python SQLite 3.49.1. Every result had integer
+type and rc 0; artifacts took 1,015 ms and p0_candidates 281 ms. No aggregate
+value or individual row was exported, and DB identity/size/mtime remained
+unchanged. Result SHA-256:
+`74485ddc8f79d59cd996eaf969116dbb4664d5e4f4d766f67cac40501c53e7eb`.
+This read used a 200 ms busy timeout and the current, potentially warm state.
+The Agent's owner has no busy handler here and uses SQLite 3.53.4 in its
+startup connection. This rules out a reproducible failure of these scans in
+the diagnostic's conditions, without identifying the earlier startup cause.
 
 A separate, not-yet-released health correction restores the existing
 `evidence_cache.pressure_active` boolean to both real health producers and
