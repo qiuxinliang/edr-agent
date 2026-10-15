@@ -1406,7 +1406,7 @@ static void load_upload(toml_table_t *t, EdrConfig *cfg) {
   }
 }
 
-static void load_offline(toml_table_t *t, EdrConfig *cfg) {
+static int load_offline(toml_table_t *t, EdrConfig *cfg) {
   take_string(toml_string_in(t, "queue_db_path"), cfg->offline.queue_db_path,
               sizeof(cfg->offline.queue_db_path));
   take_string(toml_string_in(t, "evidence_cache_path"), cfg->offline.evidence_cache_path,
@@ -1435,6 +1435,26 @@ static void load_offline(toml_table_t *t, EdrConfig *cfg) {
       cfg->offline.evidence_cache_retention_hours = (uint32_t)d.u.i;
     }
   }
+  struct { const char *name; uint32_t *value; uint32_t max; } fields[] = {
+    {"evidence_cache_selected_retention_hours", &cfg->offline.evidence_cache_selected_retention_hours, 87600u},
+    {"command_state_owner_budget_mb", &cfg->offline.command_state_owner_budget_mb, 1048576u},
+    {"storage_min_free_mb", &cfg->offline.storage_min_free_mb, 1048576u}
+  };
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    if (!toml_raw_in(t, fields[i].name)) continue;
+    toml_datum_t d = toml_int_in(t, fields[i].name);
+    if (!d.ok || d.u.i < 0 || (uint64_t)d.u.i > fields[i].max) {
+      fprintf(stderr, "invalid offline.%s (expected 0..%u)\n", fields[i].name, fields[i].max);
+      return -1;
+    }
+    *fields[i].value = (uint32_t)d.u.i;
+  }
+  if (cfg->offline.evidence_cache_selected_retention_hours &&
+      cfg->offline.evidence_cache_selected_retention_hours < cfg->offline.evidence_cache_retention_hours) {
+    fprintf(stderr, "offline.evidence_cache_selected_retention_hours must cover the recent window\n");
+    return -1;
+  }
+  return 0;
 }
 
 static void load_resource_limit(toml_table_t *t, EdrConfig *cfg) {
@@ -2238,6 +2258,9 @@ void edr_config_apply_defaults(EdrConfig *cfg) {
 #endif
   cfg->offline.evidence_cache_max_size_mb = 128u;
   cfg->offline.evidence_cache_retention_hours = 24u;
+  cfg->offline.evidence_cache_selected_retention_hours = 0u;
+  cfg->offline.command_state_owner_budget_mb = 0u;
+  cfg->offline.storage_min_free_mb = 0u;
 
   cfg->resource_limit.cpu_limit_percent = 1u;
   cfg->resource_limit.memory_limit_mb = 100u;
@@ -2916,7 +2939,7 @@ EdrError edr_config_load(const char *path, EdrConfig *cfg) {
   {
     toml_table_t *t = toml_table_in(root, "offline");
     if (t) {
-      load_offline(t, cfg);
+      if (load_offline(t, cfg) != 0) { toml_free(root); return EDR_ERR_CONFIG_PARSE; }
     }
   }
   {
@@ -3041,12 +3064,17 @@ EdrError edr_config_reload_if_modified(const char *path, EdrConfig *cfg, time_t 
   if (*mtime_cache != (time_t)0 && st.st_mtime == *mtime_cache) {
     return EDR_OK;
   }
-  EdrError e = edr_config_load(path, cfg);
+  EdrConfig candidate = {0};
+  EdrError e = edr_config_load(path, &candidate);
   if (e == EDR_OK) {
+    edr_config_free_heap(cfg);
+    *cfg = candidate;
     *mtime_cache = st.st_mtime;
     if (out_reloaded) {
       *out_reloaded = 1;
     }
+  } else {
+    edr_config_free_heap(&candidate);
   }
   return e;
 }

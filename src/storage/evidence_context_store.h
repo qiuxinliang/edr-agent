@@ -24,6 +24,9 @@ typedef struct {
 int edr_context_store_check_format(EdrContextStore *store, sqlite3 *db);
 int edr_context_store_open(EdrContextStore *store, sqlite3 *db);
 int edr_context_store_begin_upgrade(EdrContextStore *store);
+/* Installed by the cache owner after its additive retention metadata exists.
+ * Durable SQL guards keep older maintenance from independently breaking groups. */
+int edr_context_store_install_retention_guards(EdrContextStore *store);
 /* Caller owns a stopped Agent/exclusive connection. Each batch commits all
  * moves atomically, and never deletes a fact or a candidate for capacity. */
 int edr_context_store_migrate_batch(EdrContextStore *store, unsigned limit,
@@ -44,5 +47,29 @@ int edr_context_store_expire(EdrContextStore *store, sqlite3_int64 cutoff,
  * facts/dictionary entries. Counts describe committed rows, excluding keys. */
 int edr_context_store_evict(EdrContextStore *store, int orphans_only,
                             unsigned limit, unsigned *removed, unsigned *facts_removed);
+
+typedef struct {
+  unsigned candidates, references, artifacts, facts;
+  unsigned work_rows; /* Includes examined dictionaries and shared facts. */
+  /* Conservative literal field bytes examined for this group, including
+   * shared facts. This bounds work; it is not reclaimed or physical bytes. */
+  uint64_t payload_bytes;
+} EdrContextRetirement;
+
+/* Caller owns BEGIN IMMEDIATE and has checked investigation/action/window
+ * protection. Only a policy-1 retirement_eligible candidate can be removed.
+ * Returns 0 for a complete group, 1 for protected/over-budget, -1 on error.
+ * A private savepoint rolls back this helper on either unsuccessful result;
+ * the caller still owns commit/rollback. Counts become durable only on commit.
+ * Result 1 reports examined work (saturating the exceeded limit), but no
+ * deleted rows. The caller must charge that work to its maintenance slice.
+ * max_rows is 1..4096, including dictionaries and conservatively shared facts.
+ * SQLite may materialize one oversized row before its size is known; these
+ * work limits therefore bound group traversal, not physical I/O or memory. */
+int edr_context_store_retire_candidate(EdrContextStore *store,
+                                       const char *candidate_id,
+                                       unsigned max_rows, uint64_t max_bytes,
+                                       int (*yield_required)(void *), void *yield_context,
+                                       EdrContextRetirement *out);
 
 #endif

@@ -189,6 +189,11 @@ typedef struct EdrConfig {
     char evidence_cache_path[1024];
     uint32_t evidence_cache_max_size_mb;
     uint32_t evidence_cache_retention_hours;
+    /* 0 derives selected from retention_hours, at least the recent window. */
+    uint32_t evidence_cache_selected_retention_hours;
+    /* Independent owner budget and volume free-space floor; 0 derives safely. */
+    uint32_t command_state_owner_budget_mb;
+    uint32_t storage_min_free_mb;
   } offline;
 
   struct {

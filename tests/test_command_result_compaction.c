@@ -2,6 +2,7 @@
 #include "edr/command_result_json.h"
 #include "edr/egress_request_policy.h"
 #include "edr/sha256.h"
+#include "edr/storage_physical_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +15,13 @@
 #else
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #define pid getpid
 #define env(k,v) setenv(k,v,1)
 #endif
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);exit(1);}}while(0)
-void edr_local_evidence_cache_record_command_result(const char *a,const char *b,const char *c,
-    int d,int e,const char *f,const char *g) {(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;}
+int edr_local_evidence_cache_record_command_result(const char *a,const char *b,const char *c,
+    int d,int e,const char *f,const char *g) {(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static EdrSoarCommandMeta task(const char *id) {
   EdrSoarCommandMeta m={0};
   snprintf(m.result_authorization.command_id,sizeof(m.result_authorization.command_id),"%s",id);
@@ -125,12 +127,203 @@ static void test_many_ack_collection(const char *exe,const char *directory) {
   EdrCommandStateRecord *r=record("many-ack-519");CHECK(!r->report_pending);free(r);
   remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
 }
+static void verify_owner_reservation_after_restart(void) {
+  EdrCommandStateCapacityStats stats;
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0);
+  CHECK(stats.reserved_owner_count==1 && stats.reserved_bytes==3u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  CHECK(edr_command_state_begin("budget-first","shell_open",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_DUP_RUNNING);
+  CHECK(edr_command_state_replay_begin_policy("budget-first","shell_open",NULL,0,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  CHECK(edr_command_state_replay_begin_policy("budget-first","shell_open",NULL,0,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_REPLAY_BLOCKED);
+}
+
+static void test_owner_capacity(const char *exe,const char *directory) {
+  char path[1024],lock[1100],limit[64];
+  snprintf(path,sizeof(path),"%s/owner_budget.jsonl",directory);
+  snprintf(limit,sizeof(limit),"%llu",(unsigned long long)(5u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP));
+  CHECK(env("EDR_COMMAND_STATE_DB",path)==0);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES",limit)==0);
+  CHECK(env("EDR_COMMAND_STATE_MAX_BYTES","104857600")==0);
+  CHECK(edr_command_state_begin("budget-first","shell_open",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  EdrCommandStateCapacityStats before,after;
+  CHECK(edr_command_state_get_capacity_stats(&before)==0);
+  CHECK(before.reserved_bytes==3u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  CHECK(before.legacy_bytes==0 && before.budget_bytes==(uint64_t)strtoull(limit,NULL,10));
+  CHECK(edr_command_state_begin("budget-refused","shell_open",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  CHECK(edr_command_state_get_capacity_stats(&after)==0);
+  CHECK(after.admission_rejected>before.admission_rejected && !strcmp(after.last_error,"state_owner_budget_exhausted"));
+  CHECK(after.new_record_bytes==before.new_record_bytes && after.reserved_bytes==before.reserved_bytes);
+  run_child(exe,"--owner-reopen",path);
+  char detail[EDR_COMMAND_STATE_DETAIL_CAP],artifacts[1024];
+  memset(detail,'\\',sizeof(detail)-1);detail[sizeof(detail)-1]=0;
+  memset(artifacts,'\\',sizeof(artifacts)-1);artifacts[sizeof(artifacts)-1]=0;
+  CHECK(edr_command_state_finish_once("budget-first","shell_open",NULL,"ok",1,0,detail,artifacts,1)==0);
+  EdrCommandStateRecord *r=record("budget-first");
+  CHECK(!strcmp(r->detail,detail) && !strcmp(r->artifacts,artifacts));
+  CHECK(edr_command_state_get_capacity_stats(&before)==0);
+  CHECK(before.reserved_bytes==EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  for(unsigned i=0;i<1000;i++) {
+    CHECK(edr_command_state_mark_report_retry(r,"synthetic offline retry",1)==0);
+    free(r);r=record("budget-first");CHECK(r->report_attempts==i+1u);
+    CHECK(edr_command_state_get_capacity_stats(&after)==0);
+    CHECK(after.new_record_bytes+after.reserved_bytes<=after.budget_bytes);
+  }
+  CHECK(edr_command_state_mark_report_held(r,"policy remains held")==0);free(r);r=record("budget-first");
+  CHECK(r->report_policy_held && r->report_pending && !strcmp(r->detail,detail));
+  CHECK(edr_command_state_mark_reported(r)==0);free(r);r=record("budget-first");
+  CHECK(!r->report_pending && !strcmp(r->detail,detail));free(r);
+  CHECK(edr_command_state_get_capacity_stats(&after)==0);CHECK(after.reserved_bytes==0);
+  CHECK(edr_command_state_begin("budget-refused","shell_open",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  CHECK(edr_command_state_replay_begin_policy("budget-first","shell_open",NULL,0,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  size_t n;unsigned char *bytes=file_bytes(path,&n);CHECK(n<=after.budget_bytes);free(bytes);
+  printf("command owner budget: budget=%llu bytes=%zu retries=1000 denied=%llu\n",
+      (unsigned long long)after.budget_bytes,n,(unsigned long long)after.admission_rejected);
+  remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0")==0);
+}
+
+static void test_legacy_owner_capacity(const char *directory) {
+  char path[1024],lock[1100];snprintf(path,sizeof(path),"%s/owner_legacy.jsonl",directory);
+  CHECK(env("EDR_COMMAND_STATE_DB",path)==0);
+  FILE *f=fopen(path,"wb");CHECK(f);
+  const char *legacy="{\"record\":\"command_state\",\"final\":1,\"command_id\":\"legacy-final\",\"idempotency_key\":\"legacy-idem\",\"report_pending\":1,\"report_policy_held\":1,\"detail\":\"unclassified retained bytes\"}\n";
+  CHECK(fputs(legacy,f)>=0 && fclose(f)==0);
+#ifndef _WIN32
+  CHECK(chmod(path,0600)==0);
+#endif
+  EdrCommandStateCapacityStats stats;
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0);
+  CHECK(stats.legacy_bytes==strlen(legacy) && stats.new_record_bytes==0 && stats.reserved_bytes==0);
+  CHECK(edr_command_state_begin("legacy-final","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(edr_command_state_begin("new-after-legacy","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  size_t n;unsigned char *bytes=file_bytes(path,&n);CHECK(!memcmp(bytes,legacy,strlen(legacy)));free(bytes);
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0 && stats.legacy_bytes==strlen(legacy));
+  f=fopen(path,"ab");CHECK(f && fputs("{\"record\":\"incomplete",f)>=0 && fclose(f)==0);
+  size_t before_n,after_n;unsigned char *before=file_bytes(path,&before_n);
+  CHECK(edr_command_state_begin("blocked-by-unknown","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  unsigned char *after=file_bytes(path,&after_n);CHECK(before_n==after_n&&!memcmp(before,after,before_n));
+  CHECK(edr_command_state_get_capacity_stats(&stats)!=0 && stats.persistence_failed>0);
+  free(before);free(after);remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+}
+
+static void test_physical_owner_completion(const char *directory) {
+  char path[1024],lock[1100],floor[64];snprintf(path,sizeof(path),"%s/owner_physical.jsonl",directory);
+  CHECK(env("EDR_COMMAND_STATE_DB",path)==0);
+  CHECK(edr_command_state_begin("physical-held","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  uint64_t available=0;CHECK(edr_storage_volume_available(path,&available)==0);
+  snprintf(floor,sizeof(floor),"%llu",(unsigned long long)(available/(1024u*1024u)+1024u));
+  CHECK(env("EDR_STORAGE_MIN_FREE_MB",floor)==0);
+  EdrCommandStateCapacityStats before,after;CHECK(edr_command_state_get_capacity_stats(&before)==0);
+  CHECK(edr_command_state_begin("physical-denied","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  CHECK(edr_command_state_get_capacity_stats(&after)==0);
+  CHECK(after.new_record_bytes==before.new_record_bytes && after.reserved_bytes==before.reserved_bytes);
+  CHECK(!strcmp(after.last_error,"volume_free_space_exhausted"));
+  /* Existing durable obligations may consume the global floor, while a new
+   * action cannot. This fixture does not fill the actual filesystem. */
+  CHECK(edr_command_state_finish_once("physical-held","noop",NULL,"ok",1,0,"frozen result","",1)==0);
+  EdrCommandStateRecord *r=record("physical-held");CHECK(r->report_pending);
+  CHECK(edr_command_state_mark_report_retry(r,"offline",1)==0);free(r);r=record("physical-held");
+  CHECK(edr_command_state_mark_reported(r)==0);free(r);r=record("physical-held");
+  CHECK(!r->report_pending);free(r);
+  CHECK(env("EDR_STORAGE_MIN_FREE_MB","invalid")==0);
+  CHECK(edr_command_state_begin("physical-invalid-config","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  CHECK(edr_command_state_get_capacity_stats(&after)==0 && !strcmp(after.last_error,"physical_configuration_invalid"));
+  CHECK(env("EDR_STORAGE_MIN_FREE_MB","0")==0);
+  remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+}
+
+static void test_owner_budget_reduction(const char *directory) {
+  char path[1024],lock[1100],limit[64],detail[EDR_COMMAND_STATE_DETAIL_CAP];
+  snprintf(path,sizeof(path),"%s/owner_reduced.jsonl",directory);
+  CHECK(env("EDR_COMMAND_STATE_DB",path)==0);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0")==0);
+  memset(detail,'\\',sizeof(detail)-1u);detail[sizeof(detail)-1u]=0;
+  for(unsigned i=0;i<8;i++) {
+    char id[64];snprintf(id,sizeof(id),"reduced-owner-%u",i);
+    CHECK(edr_command_state_begin(id,"noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  }
+  snprintf(limit,sizeof(limit),"%u",5u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES",limit)==0);
+  EdrCommandStateCapacityStats calibrated;
+  CHECK(edr_command_state_get_capacity_stats(&calibrated)==0);
+  CHECK(calibrated.protected_floor_bytes >= calibrated.new_record_bytes + calibrated.legacy_bytes +
+      calibrated.reserved_bytes + EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  CHECK(calibrated.protected_floor_bytes > calibrated.budget_bytes);
+  CHECK(edr_command_state_begin("reduced-new-denied","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  for(unsigned i=0;i<8;i++) {
+    char id[64];snprintf(id,sizeof(id),"reduced-owner-%u",i);
+    CHECK(edr_command_state_finish_once(id,"noop",NULL,"ok",1,0,detail,"",1)==0);
+  }
+  EdrCommandStateCapacityStats before,after;
+  CHECK(edr_command_state_get_capacity_stats(&before)==0);
+  CHECK(before.reserved_owner_count==8 && before.protected_floor_bytes>before.budget_bytes);
+  /* A limit reduction must neither revoke a durable result reservation nor
+   * turn retry history into unbounded grace. Each update compacts first. */
+  for(unsigned i=0;i<128;i++) {
+    EdrCommandStateRecord *r=record("reduced-owner-0");
+    CHECK(!strcmp(r->detail,detail) && r->report_pending);
+    CHECK(edr_command_state_mark_report_retry(r,"offline after limit reduction",1)==0);free(r);
+    CHECK(edr_command_state_get_capacity_stats(&after)==0);
+    CHECK(after.new_record_bytes+after.reserved_bytes<=after.protected_floor_bytes);
+    CHECK(after.protected_floor_bytes<=before.protected_floor_bytes+EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+  }
+  CHECK(edr_command_state_begin("reduced-new-denied","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  for(unsigned i=0;i<8;i++) {
+    char id[64];snprintf(id,sizeof(id),"reduced-owner-%u",i);
+    EdrCommandStateRecord *r=record(id);CHECK(edr_command_state_mark_reported(r)==0);free(r);
+    r=record(id);CHECK(!r->report_pending && !strcmp(r->detail,detail));free(r);
+  }
+  CHECK(edr_command_state_get_capacity_stats(&after)==0 && after.reserved_bytes==0);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0")==0);
+  remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+}
+
+static void test_owner_record_slot_reservation(const char *directory) {
+  char path[1024],lock[1100];snprintf(path,sizeof(path),"%s/owner_slots.jsonl",directory);
+  CHECK(env("EDR_COMMAND_STATE_DB",path)==0);
+  CHECK(env("EDR_COMMAND_STATE_MAX_BYTES","104857600")==0);
+  EdrCommandStateCapacityStats stats;
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","4294967296")==0);
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0 && stats.budget_bytes==4294967296ULL);
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","invalid")==0);
+  CHECK(edr_command_state_begin("invalid-budget","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  CHECK(edr_command_state_get_capacity_stats(&stats)!=0 && !strcmp(stats.last_error,"physical_configuration_invalid"));
+  CHECK(env("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0")==0);
+  FILE *f=fopen(path,"wb");CHECK(f);
+  /* Tiny immutable ACK owners fit the byte budget but can consume every
+   * scratch row of the existing bounded compactor. Reserve that resource too. */
+  for(unsigned i=0;i<65531u;i++) CHECK(fprintf(f,
+      "{\"record\":\"command_state\",\"final\":1,\"command_id\":\"slot-owner-%u\","
+      "\"idempotency_key\":\"\",\"report_pending\":0,\"storage_policy_version\":1,\"reserved_state_bytes\":0}\n",i)>0);
+  CHECK(fclose(f)==0);
+#ifndef _WIN32
+  CHECK(chmod(path,0600)==0);
+#endif
+  CHECK(edr_command_state_begin("slot-reserved","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  CHECK(edr_command_state_begin("slot-denied","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_ERROR);
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0);
+  CHECK(!strcmp(stats.last_error,"state_owner_record_slots_exhausted"));
+  CHECK(stats.record_count+stats.reserved_record_slots+1u<=65536u);
+  CHECK(stats.new_record_bytes+stats.reserved_bytes<stats.budget_bytes);
+  CHECK(edr_command_state_finish_once("slot-reserved","noop",NULL,"ok",1,0,"reserved result","",1)==0);
+  for(unsigned i=0;i<4u;i++) {
+    EdrCommandStateRecord *r=record("slot-reserved");
+    CHECK(edr_command_state_mark_report_retry(r,"offline",1)==0);free(r);
+    CHECK(edr_command_state_get_capacity_stats(&stats)==0);
+    CHECK(stats.record_count+stats.reserved_record_slots<=65536u);
+  }
+  EdrCommandStateRecord *r=record("slot-reserved");CHECK(edr_command_state_mark_reported(r)==0);free(r);
+  r=record("slot-reserved");CHECK(!r->report_pending && !strcmp(r->detail,"reserved result"));free(r);
+  CHECK(edr_command_state_get_capacity_stats(&stats)==0 && stats.reserved_record_slots==0);
+  remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+}
+
 int main(int argc,char **argv) {
   if(argc==3) {
     CHECK(env("EDR_COMMAND_STATE_DB",argv[2])==0);
     if(!strcmp(argv[1],"--verify"))verify_owners();
     else if(!strcmp(argv[1],"--compact"))edr_command_state_compact_if_needed();
     else if(!strcmp(argv[1],"--many"))verify_many_ack_collection();
+    else if(!strcmp(argv[1],"--owner-reopen"))verify_owner_reservation_after_restart();
     else CHECK(0);return 0;
   }
   char directory[256],path[1024],lock[1100];
@@ -155,5 +348,10 @@ int main(int argc,char **argv) {
   assert_corruption_preserved(argv[0],path,"{\"record\":\"incomplete");
   remove(path);remove(lock);
   test_many_ack_collection(argv[0],directory);
+  test_owner_capacity(argv[0],directory);
+  test_legacy_owner_capacity(directory);
+  test_physical_owner_completion(directory);
+  test_owner_budget_reduction(directory);
+  test_owner_record_slot_reservation(directory);
   puts("command compaction: pending/held/ACK owners survive compaction and process restart; replay cannot reopen ACK; corrupt owner/tail retained; soft-floor retry scans bounded; >512 ACK owners cannot starve pending batches");return 0;
 }

@@ -5,6 +5,43 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* One volatile chunk per bounded session, never an unbounded result queue.
+ * Durable command-state admission owns completion. On pressure stop reading
+ * the pipe and reject new input; retry the exact sequence with capped backoff.
+ * Explicit cancellation/shutdown reports any undurable bytes. */
+typedef struct {
+  char data[EDR_SS_STREAM_CHUNK_BYTES];
+  size_t len;
+  uint64_t retry_after_ms;
+  unsigned refusals;
+  bool ready, closed;
+  int exit_code;
+} ShellPending;
+
+static int flush_pending(ShellPending *p, const char *id, uint64_t *sequence,
+    const EdrCommandResultAuthorization *authority, uint64_t now,
+    edr_ss_write_fn write_fn, void *user) {
+  if (!p->ready) return 0;
+  if (now < p->retry_after_ms) return -1;
+  if (!write_fn || write_fn(id, *sequence, p->closed ? NULL : p->data, p->len,
+      p->exit_code, p->closed, authority, user) != 0) {
+    if (!p->refusals) fprintf(stderr,
+        "[shell] durable output refused; input and pipe reads paused seq=%llu bytes=%zu closed=%d\n",
+        (unsigned long long)*sequence,p->len,p->closed ? 1 : 0);
+    if (p->refusals < 5u) p->refusals++;
+    p->retry_after_ms=now+(250u << (p->refusals-1u));
+    return -1;
+  }
+  ++*sequence;
+  memset(p,0,sizeof(*p));
+  return 0;
+}
+static void cancel_pending(const ShellPending *p) {
+  if (p->ready) fprintf(stderr,
+      "[shell] explicit cancellation discarded undurable output bytes=%zu closed=%d\n",
+      p->len,p->closed ? 1 : 0);
+}
+
 #ifdef _WIN32
 #include <windows.h>
 
@@ -18,6 +55,10 @@ typedef struct {
   uint64_t start_ms;
   uint64_t next_seq;
   bool active;
+  bool exited;
+  bool pipe_failure_reported;
+  int exit_code;
+  ShellPending pending;
 } ShellSession;
 
 static ShellSession g_sessions[EDR_SS_MAX_SESSIONS];
@@ -83,6 +124,7 @@ void edr_shell_session_shutdown(void) {
       if (g_sessions[i].process) {
         TerminateProcess(g_sessions[i].process, 1);
       }
+      cancel_pending(&g_sessions[i].pending);
       close_session_handles(&g_sessions[i]);
     }
   }
@@ -199,7 +241,7 @@ int edr_shell_session_input(const char *session_id,
     return -1;
   }
   ShellSession *s = find_by_id(session_id);
-  if (!s) {
+  if (!s || s->pending.ready || s->exited) {
     sessions_unlock();
     return -1;
   }
@@ -222,6 +264,7 @@ void edr_shell_session_close(const char *session_id) {
   }
 
   if (s->process) TerminateProcess(s->process, 0);
+  cancel_pending(&s->pending);
   close_session_handles(s);
   (void)memset(s, 0, sizeof(*s));
   sessions_unlock();
@@ -229,63 +272,50 @@ void edr_shell_session_close(const char *session_id) {
 
 void edr_shell_session_poll(void) {
   sessions_lock();
-  if (!g_initialized) {
-    sessions_unlock();
-    return;
-  }
-
-  uint64_t now = GetTickCount64();
-
-  for (uint32_t i = 0; i < g_max_sessions; i++) {
-    ShellSession *s = &g_sessions[i];
-    if (!s->active) continue;
-
-    DWORD avail = 0;
-    if (!PeekNamedPipe(s->stdout_r, NULL, 0, NULL, &avail, NULL)) {
-      if (g_write_fn) {
-        DWORD ec = 0;
-        GetExitCodeProcess(s->process, &ec);
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, &s->result_authorization, g_write_user);
-      }
-      close_session_handles(s);
-      (void)memset(s, 0, sizeof(*s));
-      continue;
+  if (!g_initialized) { sessions_unlock(); return; }
+  uint64_t now=GetTickCount64();
+  for(uint32_t i=0;i<g_max_sessions;i++) {
+    ShellSession *s=&g_sessions[i];
+    if(!s->active) continue;
+    if(!s->exited && g_timeout_s && now-s->start_ms>(uint64_t)g_timeout_s*1000u) {
+      /* TerminateProcess is asynchronous; observe actual exit below before
+       * emitting a close marker or releasing the pipe handles. */
+      TerminateProcess(s->process,1);
     }
-
-    if (avail > 0) {
-      uint32_t cap = g_max_output_kb * 1024;
-      if (cap > EDR_SS_STREAM_CHUNK_BYTES) cap = EDR_SS_STREAM_CHUNK_BYTES;
-      if (avail > cap) avail = cap;
-      char *buf = (char *)malloc(avail + 1);
-      if (buf) {
-        DWORD got = 0;
-        if (ReadFile(s->stdout_r, buf, avail, &got, NULL) && got > 0) {
-          if (g_write_fn) {
-            g_write_fn(s->session_id, s->next_seq++, buf, got, 0, false, &s->result_authorization, g_write_user);
-          }
-        }
-        free(buf);
+    if(s->pending.ready) {
+      bool closing=s->pending.closed;
+      if(flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+          now,g_write_fn,g_write_user)!=0) continue;
+      if(closing) {close_session_handles(s);memset(s,0,sizeof(*s));continue;}
+    }
+    DWORD ec=0,avail=0;
+    if(!s->exited && GetExitCodeProcess(s->process,&ec) && ec!=STILL_ACTIVE) {
+      s->exited=true;s->exit_code=(int)ec;
+    }
+    BOOL pipe_ok=PeekNamedPipe(s->stdout_r,NULL,0,NULL,&avail,NULL);
+    if(!pipe_ok && !s->exited && !s->pipe_failure_reported) {
+      DWORD pipe_error=GetLastError();
+      s->pipe_failure_reported=true;
+      fprintf(stderr,"[shell] output pipe unavailable while process is active; "
+          "waiting for actual exit or timeout error=%lu\n",(unsigned long)pipe_error);
+    }
+    if(pipe_ok && avail>0) {
+      uint32_t cap=g_max_output_kb>=2u?EDR_SS_STREAM_CHUNK_BYTES:g_max_output_kb*1024u;
+      if(avail>cap) avail=cap;
+      DWORD got=0;
+      if(avail && ReadFile(s->stdout_r,s->pending.data,avail,&got,NULL) && got>0) {
+        s->pending.len=got;s->pending.ready=true;
+        (void)flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+            now,g_write_fn,g_write_user);
+        continue; /* Drain all remaining pipe bytes before the close marker. */
       }
     }
-
-    DWORD ec = 0;
-    if (GetExitCodeProcess(s->process, &ec) && ec != STILL_ACTIVE) {
-      if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, (int)ec, true, &s->result_authorization, g_write_user);
-      }
-      close_session_handles(s);
-      (void)memset(s, 0, sizeof(*s));
-      continue;
-    }
-
-    uint64_t elapsed = now - s->start_ms;
-    if (g_timeout_s > 0 && elapsed > (uint64_t)g_timeout_s * 1000ULL) {
-      TerminateProcess(s->process, 1);
-      if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, &s->result_authorization, g_write_user);
-      }
-      close_session_handles(s);
-      (void)memset(s, 0, sizeof(*s));
+    /* A child may close stdout before it finishes. Pipe EOF/failure is not
+     * process completion and must not release the Job or invent exit code 0. */
+    if(s->exited) {
+      s->pending.ready=true;s->pending.closed=true;s->pending.exit_code=s->exit_code;
+      if(flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+          now,g_write_fn,g_write_user)==0) {close_session_handles(s);memset(s,0,sizeof(*s));}
     }
   }
   sessions_unlock();
@@ -319,6 +349,9 @@ typedef struct {
   uint64_t start_ms;
   uint64_t next_seq;
   bool active;
+  bool exited;
+  int exit_code;
+  ShellPending pending;
 } ShellSession;
 
 static ShellSession g_sessions[EDR_SS_MAX_SESSIONS];
@@ -380,8 +413,11 @@ void edr_shell_session_shutdown(void) {
   sessions_lock();
   for (uint32_t i = 0; i < g_max_sessions; i++) {
     if (g_sessions[i].active) {
-      kill(g_sessions[i].child_pid, SIGKILL);
-      waitpid(g_sessions[i].child_pid, NULL, WNOHANG);
+      if(!g_sessions[i].exited) {
+        kill(g_sessions[i].child_pid, SIGKILL);
+        waitpid(g_sessions[i].child_pid, NULL, WNOHANG);
+      }
+      cancel_pending(&g_sessions[i].pending);
       if (g_sessions[i].stdin_fd >= 0)  close(g_sessions[i].stdin_fd);
       if (g_sessions[i].stdout_fd >= 0) close(g_sessions[i].stdout_fd);
     }
@@ -456,7 +492,7 @@ int edr_shell_session_input(const char *session_id,
     return -1;
   }
   ShellSession *s = find_by_id(session_id);
-  if (!s || s->stdin_fd < 0) {
+  if (!s || s->stdin_fd < 0 || s->pending.ready || s->exited) {
     sessions_unlock();
     return -1;
   }
@@ -472,8 +508,11 @@ void edr_shell_session_close(const char *session_id) {
     sessions_unlock();
     return;
   }
-  kill(s->child_pid, SIGKILL);
-  waitpid(s->child_pid, NULL, WNOHANG);
+  if(!s->exited) {
+    kill(s->child_pid, SIGKILL);
+    waitpid(s->child_pid, NULL, WNOHANG);
+  }
+  cancel_pending(&s->pending);
   if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
   if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
   (void)memset(s, 0, sizeof(*s));
@@ -482,57 +521,45 @@ void edr_shell_session_close(const char *session_id) {
 
 void edr_shell_session_poll(void) {
   sessions_lock();
-  if (!g_initialized) {
-    sessions_unlock();
-    return;
-  }
-
-  uint64_t now = ms_now();
-
-  for (uint32_t i = 0; i < g_max_sessions; i++) {
-    ShellSession *s = &g_sessions[i];
-    if (!s->active) continue;
-
-    uint32_t cap = g_max_output_kb * 1024;
-    if (cap > EDR_SS_STREAM_CHUNK_BYTES) cap = EDR_SS_STREAM_CHUNK_BYTES;
-    char *buf = (char *)malloc(cap);
-    if (!buf) continue;
-
-    ssize_t n = read(s->stdout_fd, buf, cap);
-    if (n > 0) {
-      if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, buf, (size_t)n, 0, false, &s->result_authorization, g_write_user);
+  if(!g_initialized) {sessions_unlock();return;}
+  uint64_t now=ms_now();
+  for(uint32_t i=0;i<g_max_sessions;i++) {
+    ShellSession *s=&g_sessions[i];
+    if(!s->active) continue;
+    if(!s->exited && g_timeout_s && now-s->start_ms>(uint64_t)g_timeout_s*1000u) {
+      kill(s->child_pid,SIGKILL); /* waitpid below records the actual exit. */
+    }
+    if(!s->exited) {
+      int status=0;pid_t wr=waitpid(s->child_pid,&status,WNOHANG);
+      if(wr>0) {s->exited=true;s->exit_code=WIFEXITED(status)?WEXITSTATUS(status):1;}
+    }
+    if(s->pending.ready) {
+      bool closing=s->pending.closed;
+      if(flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+          now,g_write_fn,g_write_user)!=0) continue;
+      if(closing) {
+        if(s->stdin_fd>=0) close(s->stdin_fd);
+        if(s->stdout_fd>=0) close(s->stdout_fd);
+        memset(s,0,sizeof(*s));continue;
       }
     }
-
-    int status = 0;
-    pid_t wr = waitpid(s->child_pid, &status, WNOHANG);
-    if (wr > 0) {
-      int ec = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-      if (g_write_fn) {
-        g_write_fn(s->session_id, s->next_seq++, NULL, 0, ec, true, &s->result_authorization, g_write_user);
-      }
-      if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
-      if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
-      (void)memset(s, 0, sizeof(*s));
-      free(buf);
-      continue;
+    uint32_t cap=g_max_output_kb>=2u?EDR_SS_STREAM_CHUNK_BYTES:g_max_output_kb*1024u;
+    ssize_t n=read(s->stdout_fd,s->pending.data,cap);
+    if(n>0) {
+      s->pending.len=(size_t)n;s->pending.ready=true;
+      (void)flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+          now,g_write_fn,g_write_user);
+      continue; /* Never lose buffered output when the producer has exited. */
     }
-
-    if (n <= 0 && g_timeout_s > 0) {
-      uint64_t elapsed = now - s->start_ms;
-      if (elapsed > (uint64_t)g_timeout_s * 1000ULL) {
-        kill(s->child_pid, SIGKILL);
-        waitpid(s->child_pid, NULL, WNOHANG);
-        if (g_write_fn) {
-          g_write_fn(s->session_id, s->next_seq++, NULL, 0, 1, true, &s->result_authorization, g_write_user);
-        }
-        if (s->stdin_fd >= 0)  { close(s->stdin_fd);  s->stdin_fd = -1; }
-        if (s->stdout_fd >= 0) { close(s->stdout_fd); s->stdout_fd = -1; }
-        (void)memset(s, 0, sizeof(*s));
+    if(s->exited) {
+      s->pending.ready=true;s->pending.closed=true;s->pending.exit_code=s->exit_code;
+      if(flush_pending(&s->pending,s->session_id,&s->next_seq,&s->result_authorization,
+          now,g_write_fn,g_write_user)==0) {
+        if(s->stdin_fd>=0) close(s->stdin_fd);
+        if(s->stdout_fd>=0) close(s->stdout_fd);
+        memset(s,0,sizeof(*s));
       }
     }
-    free(buf);
   }
   sessions_unlock();
 }

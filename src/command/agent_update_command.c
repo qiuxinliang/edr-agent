@@ -17,6 +17,7 @@
 
 #ifdef _WIN32
 #define COBJMACROS
+#include "edr/storage_physical_guard.h"
 #include "edr/windows_resource_ids.h"
 #include <ole2.h>
 #include <taskschd.h>
@@ -1592,6 +1593,18 @@ int edr_agent_update_execute(const char *command_id, const uint8_t *payload,
     cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);
     return result;
   }
+  EdrStoragePhysicalSnapshot space;
+  uint64_t download_peak = (uint64_t)EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES *
+      (req.runtime_manifest_url[0] ? 2u : 1u);
+  if (edr_storage_physical_admit(staged, download_peak, 0, &space) != 0) {
+    int result = update_failure(&req, command_id, outbox_dir, 2u, "staging_capacity",
+                                space.cause, 3, detail, detail_cap);
+    cleanup_prelaunch_update_work(root, staged, manifest, launcher, invocation);
+    return result;
+  }
+  /* The signed request may require more space; local safety may only tighten it.
+   * The updater also measures expansion and replacement peaks on each volume. */
+  if (req.min_free_bytes < space.min_free_bytes) req.min_free_bytes = space.min_free_bytes;
   if (edr_ingest_http_get_agent_update_url_to_file(command_id, req.artifact_url, staged,
                                                  EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES) != 0) {
     char download_error[256];

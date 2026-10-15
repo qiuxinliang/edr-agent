@@ -94,6 +94,8 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
   $script:LastSetupLog = $log
   $arguments = @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+    # Preserve the supported 673 caller contract: the new installer must derive
+    # its local floor even when an old embedded updater sends no new argument.
     ('/DIR="{0}"' -f $InstallDir),
     '/TASKS="windowsservice"',
     ('/LOG="{0}"' -f $log)

@@ -73,6 +73,66 @@ EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *payload, size_t payload_len,
     int compressed, int recovery_audit);
+/* The validated P0 producer may declare a self-contained diagnostic gate.
+ * Only registered non-direct source-only reasons qualify; matched-rule,
+ * legacy and unclassified records keep the retain-only API above. Policy 2
+ * permits expiry after the configured recent-evidence window, subject to
+ * transactional owner/dependency checks. This never authorizes delivery/ACK.
+ * The producer must validate the record and bind this reason to the exact
+ * frozen wire before calling; replay never upgrades an older row's policy. */
+typedef struct {
+  uint32_t version; /* 1 */
+  const char *diagnostic_reason;
+  const char *endpoint_id;
+  const char *tenant_id;
+  int64_t event_time_ns;
+  uint32_t event_type;
+  uint32_t pid;
+  uint32_t parent_pid;
+  uint64_t process_start_key;
+  uint64_t process_creation_filetime_100ns;
+  uint64_t parent_process_start_key;
+  uint64_t parent_process_creation_filetime_100ns;
+} EdrStorageQueueLocalEvidenceOwner;
+EdrError edr_storage_queue_p0_source_only_commit_local_typed(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *payload, size_t payload_len,
+    int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner);
+
+/* Internal storage reader for the existing authorized cached-RTQ consumer.
+ * It grants no authority and never returns raw wire to the remote caller.
+ * The consumer must verify decoded scope/identity and project only fields
+ * required by its signed request. Only typed diagnostic policy-2 and terminal-source policy-3 records are indexed.
+ * A single finite query slot owns copied bytes, not a durable retention pin;
+ * retirement may proceed while visit runs on the independent snapshot. */
+typedef struct {
+  const char *tenant_id, *endpoint_id;
+  int64_t from_ns, until_ns;
+  int has_type, has_process_start_key, has_process_creation_filetime_100ns;
+  uint32_t event_type, pid;
+  uint64_t process_start_key, process_creation_filetime_100ns;
+  unsigned max_rows, max_scan; /* snapshot rows <=1000; inspected rows <=20100 */
+  size_t max_payload_bytes; /* nonzero, <=4 MiB across all copied wires */
+  uint64_t until_mono_ns; /* caller's finite authorization/execution deadline */
+} EdrStorageQueueLocalQuery;
+typedef struct {
+  unsigned scanned, copied;
+  size_t payload_bytes;
+} EdrStorageQueueLocalQueryStats;
+/* Called after releasing the queue mutex. Arguments last only for this
+ * callback; return 1 to continue, 0 to stop, -1 to fail the entire query. */
+typedef int (*EdrStorageQueueLocalQueryVisit)(const char *event_id,
+    const EdrStorageQueueLocalEvidenceOwner *owner,
+    const uint8_t *wire, size_t wire_len, void *user);
+/* Must be nonblocking and must not reenter storage. Nonzero cancels. */
+typedef int (*EdrStorageQueueLocalQueryCancel)(void *user);
+/* 0 complete, 1 partial (row/scan/aggregate-byte or visit stop);
+ * -1 invalid, -2 busy/unavailable, -3 integrity, -4 indivisible wire exceeds
+ * byte budget, -5 cancelled/deadline, -6 consumer decode/projection failure.
+ * Negative results must not be rendered as an empty successful investigation. */
+int edr_storage_queue_query_local_snapshot(const EdrStorageQueueLocalQuery *query,
+    EdrStorageQueueLocalQueryVisit visit, EdrStorageQueueLocalQueryCancel cancel,
+    void *user, EdrStorageQueueLocalQueryStats *stats);
 
 /* Explicit, offline operator recovery. Check opens existing SQLite READONLY;
  * apply requires a matching immutable inventory and owner tuple, owns the
@@ -239,6 +299,39 @@ typedef struct {
    * files are high-water diagnostics and do not strand an empty queue. */
   uint64_t used_bytes;
   uint64_t retained_nonpending_bytes;
+  /* Independent local retention creation classes, not delivery/ACK states.
+   * Legacy and unclassified rows remain protected. Version 1 permits only
+   * retained records; these counters never authorize expiry or deletion. */
+  uint64_t retention_legacy_rows;
+  uint64_t retention_legacy_bytes;
+  uint64_t retention_local_rows;
+  uint64_t retention_local_bytes;
+  uint64_t retention_delivery_rows;
+  uint64_t retention_delivery_bytes;
+  /* Newly created recovery projections. Recovered originals retain their
+   * original creation class, including legacy/unclassified protection. */
+  uint64_t retention_recovery_rows;
+  uint64_t retention_recovery_bytes;
+  uint64_t terminal_journal_bytes;
+  uint64_t deferred_bytes;
+  uint64_t projection_relation_bytes;
+  uint64_t recovery_metadata_bytes;
+  /* Policy 2 expiry is local disposal, never an ACK. Fixed durable aggregates
+   * have constant metadata cost; no per-event tombstones accumulate. */
+  uint64_t local_retired_rows;
+  uint64_t local_retired_bytes;
+  uint64_t local_retention_protected_slices;
+  uint64_t local_retention_integrity_failures;
+  uint64_t local_retention_typed_rows;
+  uint64_t local_retention_unclassified_rows;
+  uint32_t local_retention_policy_version;
+  uint64_t physical_admission_failures;
+  uint64_t physical_available_bytes;
+  uint64_t physical_required_bytes;
+  uint64_t physical_min_free_bytes;
+  uint32_t physical_failure_kind; /* 0=none, 1=low space, 2=observation/configuration error */
+  /* Zero means the bounded transactional ledger could not be read. */
+  uint32_t ledger_version;
   /* Durable local diagnostics and policy holds retain their original wires. */
   uint64_t local_evidence_rows;
   uint64_t policy_held_rows;
@@ -291,6 +384,12 @@ typedef struct {
    * already-confirmed terminal records. Ordinary evidence is retained with a
    * terminal reason; capacity never evicts pending/local/held evidence. */
   uint64_t retention_evicted_rows;
+  /* Process-lifetime counts: oversized indivisible owners remain retained;
+   * a failed maintenance transaction leaves its owners and cursor unchanged. */
+  uint64_t terminal_local_retired_rows;
+  uint64_t terminal_local_retired_bytes;
+  uint64_t maintenance_oversize_holds;
+  uint64_t maintenance_failures;
   uint64_t pending_rows;
   /* Matched P0 snapshots awaiting replay or retained after an explicit unsafe
    * replay decision. Their payload bytes and the metadata-only completed
@@ -313,10 +412,27 @@ EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate
 /* Stores both final one-frame BAT1 wires atomically.  It does not enqueue
  * them; callers may use the normal queue for prompt delivery and this journal
  * replays only frames that remain unacknowledged. */
+/* Current P0 producer measures a complete local intent before execution.
+ * Only the minimized intent bytes are stored; this size reserves both final
+ * frame bounds plus local owner metadata without transmitting full commands.
+ * The same immutable record/command-facts snapshot must supply final freeze. */
+EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate_local_source_bound(
+    const char *idempotency_key,const char *source_event_key,const char *rule_id,
+    const char *process_generation_key,const char *intent_batch_id,const uint8_t *intent_wire,
+    size_t intent_wire_len,size_t full_local_intent_len);
+
 EdrError edr_storage_queue_enforcement_terminal_update(
     const char *idempotency_key, const char *source_batch_id, const uint8_t *source_wire,
     size_t source_wire_len, const char *combined_batch_id, const uint8_t *combined_wire,
     size_t combined_wire_len);
+/* New P0 terminal owner: source is explicitly local evidence from freeze,
+ * never a pending delivery or synthetic ACK. The pre-action reservation must
+ * include its bounded metadata. Legacy update/replay never gains this policy. */
+EdrError edr_storage_queue_enforcement_terminal_update_local_source(
+    const char *idempotency_key, const char *source_batch_id, const uint8_t *source_wire,
+    size_t source_wire_len, const char *combined_batch_id, const uint8_t *combined_wire,
+    size_t combined_wire_len, const char *source_event_id,
+    const EdrStorageQueueLocalEvidenceOwner *owner);
 void edr_storage_queue_enforcement_terminal_get_metrics(
     EdrEnforcementTerminalJournalMetrics *out);
 void edr_storage_queue_get_capacity_metrics(EdrStorageQueueCapacityMetrics *out);
@@ -331,6 +447,8 @@ void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count);
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count);
 /* Aborts the next deferred-match FULL commits, including atomic handoff. */
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
+void edr_storage_queue_test_fail_next_local_retention_commits(unsigned count);
+void edr_storage_queue_test_set_local_retention_elapsed(uint64_t seconds);
 /* Freeze the deferred retry/peek wall clock in Unix seconds; a negative value
  * restores real time. The override is test-only and survives database reopen. */
 void edr_storage_queue_test_set_p0_deferred_time(int64_t unix_seconds);

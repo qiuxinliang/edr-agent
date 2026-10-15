@@ -112,6 +112,13 @@ retention_hours      = 72
 evidence_cache_path  = "C:\\Program Files\\FDSecurity\\evidence\\evidence_cache.db"
 evidence_cache_max_size_mb = 512
 evidence_cache_retention_hours = 72
+# 0: selected evidence uses retention_hours, at least the recent window; pressure may shorten it.
+evidence_cache_selected_retention_hours = 0
+# 0: derive the command owner budget from the serialized result and recovery window.
+command_state_owner_budget_mb = 0
+# Volume free-space admission floor, separate from queue/evidence budgets; 0 derives automatically.
+# Explicit values may raise, but cannot reduce, the completion/compaction safety reserve.
+storage_min_free_mb = 0
 
 [resource_limit]
 cpu_limit_percent    = 10

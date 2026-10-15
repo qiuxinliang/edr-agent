@@ -1,4 +1,5 @@
 #include "edr/command_state.h"
+#include "edr/local_evidence_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,9 @@ static void test_setenv(const char *name, const char *value) { _putenv_s(name, v
 static void test_setenv(const char *name, const char *value) { setenv(name, value, 1); }
 #endif
 
-void edr_local_evidence_cache_record_command_result(
+static int s_copy_outcome;
+static unsigned s_copy_calls;
+int edr_local_evidence_cache_record_command_result(
     const char *command_id, const char *command_type, const char *status,
     int execution_status, int exit_code, const char *detail, const char *artifacts) {
   (void)command_id;
@@ -28,6 +31,8 @@ void edr_local_evidence_cache_record_command_result(
   (void)exit_code;
   (void)detail;
   (void)artifacts;
+  ++s_copy_calls;
+  return s_copy_outcome;
 }
 
 static void require_true(int ok, const char *msg) {
@@ -126,6 +131,46 @@ static void verify_once_terminals(void) {
                (probes[0].rc == 1 && probes[1].rc == 0), "one atomic terminal commit under contention");
 }
 
+typedef struct CapacityProbe { const char *id; int rc; } CapacityProbe;
+#ifdef _WIN32
+static DWORD WINAPI capacity_probe(void *opaque) {
+#else
+static void *capacity_probe(void *opaque) {
+#endif
+  CapacityProbe *probe=opaque;
+  probe->rc=edr_command_state_begin(probe->id,"shell_open",NULL,NULL,NULL);
+#ifdef _WIN32
+  return 0;
+#else
+  return NULL;
+#endif
+}
+static void verify_capacity_contention(const char *state_dir,const char *original) {
+  char path[1024],lock[1100],limit[64];snprintf(path,sizeof(path),"%s/capacity.jsonl",state_dir);
+  snprintf(limit,sizeof(limit),"%llu",(unsigned long long)(5u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP));
+  test_setenv("EDR_COMMAND_STATE_DB",path);test_setenv("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES",limit);
+  CapacityProbe probes[2]={{"parallel-a",-9},{"parallel-b",-9}};
+#ifdef _WIN32
+  HANDLE threads[2];
+  for(unsigned i=0;i<2;i++){threads[i]=CreateThread(NULL,0,capacity_probe,&probes[i],0,NULL);require_true(threads[i]!=NULL,"create capacity contender");}
+  require_true(WaitForMultipleObjects(2,threads,TRUE,10000)==WAIT_OBJECT_0,"join capacity contenders");
+  for(unsigned i=0;i<2;i++)CloseHandle(threads[i]);
+#else
+  pthread_t threads[2];
+  for(unsigned i=0;i<2;i++)require_true(pthread_create(&threads[i],NULL,capacity_probe,&probes[i])==0,"create capacity contender");
+  for(unsigned i=0;i<2;i++)require_true(pthread_join(threads[i],NULL)==0,"join capacity contender");
+#endif
+  require_true((probes[0].rc==EDR_COMMAND_STATE_BEGIN_READY && probes[1].rc==EDR_COMMAND_STATE_BEGIN_ERROR) ||
+      (probes[1].rc==EDR_COMMAND_STATE_BEGIN_READY && probes[0].rc==EDR_COMMAND_STATE_BEGIN_ERROR),
+      "one budget reservation wins under concurrent pre-action admission");
+  EdrCommandStateCapacityStats stats;require_true(edr_command_state_get_capacity_stats(&stats)==0,"read capacity ledger");
+  require_true(stats.reserved_owner_count==1 && stats.reserved_bytes==3u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP &&
+      stats.new_record_bytes+stats.reserved_bytes+stats.update_headroom_bytes<=stats.budget_bytes,
+      "concurrent owner reservations cannot overcommit");
+  remove(path);snprintf(lock,sizeof(lock),"%s.lock",path);remove(lock);
+  test_setenv("EDR_COMMAND_STATE_DB",original);test_setenv("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0");
+}
+
 int main(void) {
   char state_dir[512];
   char state_path[sizeof(state_dir) + sizeof("/command_state.jsonl")];
@@ -147,6 +192,7 @@ int main(void) {
   test_setenv("EDR_COMMAND_INBOX_DIR", inbox_dir);
   test_setenv("EDR_COMMAND_ACK_DIR", ack_dir);
   verify_once_terminals();
+  verify_capacity_contention(state_dir,state_path);
 
   EdrSoarCommandMeta meta;
   memset(&meta, 0, sizeof(meta));
@@ -219,11 +265,20 @@ int main(void) {
   require_true(edr_command_state_store_inbox("cmd-inbox-final", "echo",
                                             payload, sizeof(payload) - 1u, &meta) == 0,
                "store final inbox");
+  s_copy_outcome = EDR_EVIDENCE_COMMAND_RESULT_CAPACITY;
+  unsigned copy_calls_before = s_copy_calls;
   require_true(edr_command_state_finish("cmd-inbox-final", "echo", &meta, "ok", 1, 0,
                                         "done", NULL, 0) == 0,
                "persist final command state");
+  require_true(s_copy_calls == copy_calls_before + 1u, "terminal owner attempted detailed local copy");
+  s_copy_outcome = EDR_EVIDENCE_COMMAND_RESULT_STORED;
   n = edr_command_state_collect_inbox(records, 4);
-  require_true(n == 0, "final command is not replayed from inbox");
+  require_true(n == 0, "copy capacity rejection does not replay completed inbox action");
+  EdrCommandStateRecord copy_rejected_owner;
+  int copy_rejected_retries = 0;
+  require_true(edr_command_state_begin("cmd-inbox-final", "echo", &meta,
+      &copy_rejected_retries, &copy_rejected_owner) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL,
+      "copy capacity rejection preserves durable idempotency owner");
 
   EdrSoarCommandMeta replay_meta = meta;
   snprintf(replay_meta.idempotency_key, sizeof(replay_meta.idempotency_key), "%s", "idem-replay|sigv1|placeholder");

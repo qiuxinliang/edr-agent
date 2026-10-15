@@ -12,6 +12,7 @@
 #include "edr/storage_queue.h"
 #include "edr/behavior_proto.h"
 #include "edr/egress_batch_policy.h"
+#include "edr/event_batch.h"
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
 #include "cJSON.h"
@@ -80,6 +81,10 @@ static uint64_t g_source_latch_epoch = UINT64_C(1);
 static char g_source_latch_batch[128];
 static int g_terminal_update_allowed = 1;
 static int g_terminal_source_enqueue_allowed = 1;
+static unsigned g_terminal_source_enqueue_calls;
+static int g_terminal_real_codec;
+static size_t g_terminal_full_intent_len,g_terminal_outbound_intent_len;
+static size_t g_terminal_source_len,g_terminal_combined_len,g_terminal_preaction_bound;
 static int g_ir_ready = 1;
 static int g_ir_evaluation_available = 1;
 static int g_command_only_match = 0;
@@ -233,14 +238,37 @@ uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *record,
                   : edr_behavior_record_encode_durable_wire(record, wire, 20u);
   return wire;
 }
+/* The focused reservation case uses the production protobuf encoder. Other
+ * cases retain the intentionally small wire stub that isolates concurrency. */
+static uint8_t *terminal_real_codec_wire(const EdrBehaviorRecord *record,
+    const AVEBehaviorAlert *alert,const EdrCommandFacts *facts,size_t *length,int outbound) {
+  uint8_t *wire=malloc(EDR_EVENT_BATCH_CAP);assert(wire && facts);
+  size_t n=outbound?edr_behavior_record_encode_protobuf_facts(record,alert,facts->subject,facts->parent,
+      wire+16u,EDR_EVENT_BATCH_CAP-16u):edr_behavior_record_encode_protobuf_full_facts(record,alert,
+      facts->subject,facts->parent,wire+16u,EDR_EVENT_BATCH_CAP-16u);
+  assert(n>0u);*length=n+16u;g_last_record=*record;
+  uint32_t header[]={UINT32_C(0x31544142),1u,(uint32_t)n+4u,(uint32_t)n};
+  for(unsigned i=0;i<4u;++i) for(unsigned b=0;b<4u;++b) wire[i*4u+b]=(uint8_t)(header[i]>>(b*8u));
+  edr_v1_BehaviorEvent *decoded=calloc(1,sizeof(*decoded));assert(decoded);
+  pb_istream_t input=pb_istream_from_buffer(wire+16u,n);
+  assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,decoded));
+  if(outbound) assert(!decoded->cmdline[0] && !decoded->process_context.parent_cmdline[0]);
+  else assert(!strcmp(decoded->cmdline,facts->subject) && !strcmp(decoded->process_context.parent_cmdline,facts->parent));
+  if(strstr(record->detection_context,"\"phase\":\"intent\"")) {
+    if(outbound) g_terminal_outbound_intent_len=*length; else g_terminal_full_intent_len=*length;
+  } else if(outbound) g_terminal_combined_len=*length; else g_terminal_source_len=*length;
+  free(decoded);return wire;
+}
 uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *record,
     const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  if(g_terminal_real_codec) return terminal_real_codec_wire(record,alert,facts,length,0);
   (void)facts;
   return edr_behavior_record_alloc_durable_wire(record, alert, length);
 }
 
 uint8_t *edr_behavior_record_alloc_outbound_wire_facts(const EdrBehaviorRecord *record,
     const AVEBehaviorAlert *alert, const EdrCommandFacts *facts, size_t *length) {
+  if(g_terminal_real_codec) return terminal_real_codec_wire(record,alert,facts,length,1);
   (void)facts;
   return edr_behavior_record_alloc_durable_wire(record, alert, length);
 }
@@ -274,7 +302,7 @@ EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate
     const char *intent_batch, const uint8_t *intent_wire, size_t intent_wire_len) {
   int empty = -1;
   if (!g_durable_emit_allowed || !key || !source || !rule || !generation || !intent_batch ||
-      !intent_wire || intent_wire_len != 20u) {
+      !intent_wire || (g_terminal_real_codec ? (intent_wire_len<=20u || intent_wire_len>EDR_EVENT_BATCH_CAP) : intent_wire_len!=20u)) {
     return EDR_ENFORCEMENT_TERMINAL_PRECREATE_ERROR;
   }
   atomic_fetch_add_explicit(&g_terminal_precreate_calls, 1, memory_order_relaxed);
@@ -314,6 +342,18 @@ EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate
   return EDR_ENFORCEMENT_TERMINAL_PRECREATE_ERROR;
 }
 
+EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate_local_source_bound(
+    const char *key,const char *event,const char *rule,const char *generation,
+    const char *batch,const uint8_t *wire,size_t length,size_t full_local_intent_length) {
+  assert(full_local_intent_length>0u);
+  if(g_terminal_real_codec) {
+    assert(full_local_intent_length==g_terminal_full_intent_len && length==g_terminal_outbound_intent_len);
+    assert(atomic_load(&g_enforcement_side_effects)==0);
+    g_terminal_preaction_bound=full_local_intent_length;
+  }
+  return edr_storage_queue_enforcement_terminal_precreate(key,event,rule,generation,batch,wire,length);
+}
+
 EdrError edr_storage_queue_enforcement_terminal_update(
     const char *key, const char *source_batch_id, const uint8_t *source_wire, size_t source_wire_len,
     const char *combined_batch_id, const uint8_t *combined_wire, size_t combined_wire_len) {
@@ -336,6 +376,15 @@ EdrError edr_storage_queue_enforcement_terminal_update(
   terminal_unlock();
   return EDR_ERR_SQLITE_WRITE;
 }
+EdrError edr_storage_queue_enforcement_terminal_update_local_source(
+    const char *key,const char *source_id,const uint8_t *source,size_t source_len,
+    const char *combined_id,const uint8_t *combined,size_t combined_len,const char *event_id,
+    const EdrStorageQueueLocalEvidenceOwner *owner) {
+  assert(event_id && event_id[0] && owner && owner->version==1u && owner->endpoint_id[0] && owner->tenant_id[0]);
+  assert(!strcmp(owner->diagnostic_reason,"enforcement_terminal_result") && owner->process_start_key && owner->process_creation_filetime_100ns);
+  return edr_storage_queue_enforcement_terminal_update(key,source_id,source,source_len,combined_id,combined,combined_len);
+}
+
 
 EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire, size_t wire_len,
                                    int compressed, int severity) {
@@ -344,6 +393,7 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire, si
   (void)compressed;
   (void)severity;
   if (!batch_id) return EDR_ERR_INVALID_ARG;
+  if (strstr(batch_id, "p0-enforcement-source") != NULL) g_terminal_source_enqueue_calls++;
   if (strstr(batch_id, "combined") != NULL) {
     if (!g_combined_emit_allowed) return EDR_ERR_SQLITE_WRITE;
     if (atomic_load_explicit(&g_block_combined, memory_order_acquire)) {
@@ -406,6 +456,19 @@ EdrError edr_storage_queue_p0_source_only_latch_get(
   out->recovery_required = g_source_latch_recovery_required;
   return EDR_OK;
 }
+static _Atomic int g_typed_local_commits;
+/* Storage is stubbed here; SQLite ownership/expiry is covered by queue tests. */
+EdrError edr_storage_queue_p0_source_only_commit_local_typed(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *wire, size_t wire_len,
+    int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner) {
+  assert(owner && owner->version == 1u && owner->diagnostic_reason);
+  assert(owner->tenant_id[0] && owner->endpoint_id[0]);
+  atomic_fetch_add(&g_typed_local_commits, 1);
+  return edr_storage_queue_p0_source_only_commit_local(expected, event_id,
+      batch_id, wire, wire_len, compressed, recovery_audit);
+}
+
 EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *wire, size_t wire_len,
@@ -533,7 +596,7 @@ int edr_p0_rule_ir_evaluation_get_match(const EdrP0RuleIrEvaluation *evaluation,
   snprintf(out_match->mitre_csv, sizeof(out_match->mitre_csv), "%s", "T1059");
   out_match->severity = 3;
   out_match->effect=EDR_P0_EFFECT_SECURITY_ALERT;
-  out_match->required_evidence_fields=EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND;
+  out_match->required_evidence_fields=EDR_EVIDENCE_USER|(g_terminal_real_codec?0u:EDR_EVIDENCE_COMMAND);
   return 1;
 }
 void edr_p0_rule_ir_evaluation_free(EdrP0RuleIrEvaluation *evaluation) {
@@ -601,6 +664,7 @@ void edr_p0_rule_ir_stats_init(void) {}
 
 static void init_record(EdrBehaviorRecord *r) {
   edr_behavior_record_init(r);
+  snprintf(r->tenant_id,sizeof(r->tenant_id),"tenant_default");
   r->type = EDR_EVENT_PROCESS_CREATE;
   r->priority = 0u;
   r->pid = 4242u;
@@ -1766,6 +1830,28 @@ static void test_ir_evaluation_failure_durably_preserves_source_without_alert(vo
   assert(edr_p0_rule_try_emit(&r) == 0);
   assert(g_durable_count == 1);
   g_ir_evaluation_available = 1;
+}
+
+static void test_source_only_retention_classification_requires_scope(void) {
+  EdrBehaviorRecord r;
+  assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1)==0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1)==0);
+  for (int complete_scope=0; complete_scope<2; ++complete_scope) {
+    edr_p0_rule_test_reset_dedup();
+    g_source_latch=0; g_ir_ready=1; g_ir_evaluation_available=0;
+    g_durable_emit_allowed=1; g_durable_count=0;
+    atomic_store(&g_typed_local_commits,0);
+    init_complete_process_record(&r,"powershell.exe");
+    r.event_time_ns=1200; r.pid=99891u;
+    snprintf(r.event_id,sizeof(r.event_id),"scope-classification-%d",complete_scope);
+    snprintf(r.endpoint_id,sizeof(r.endpoint_id),"ep-scope");
+    r.tenant_id[0]=0;
+    if(complete_scope)snprintf(r.tenant_id,sizeof(r.tenant_id),"tenant-scope");
+    assert(edr_p0_rule_try_emit(&r)==0);
+    assert(g_durable_count==1);
+    assert(atomic_load(&g_typed_local_commits)==complete_scope);
+  }
+  g_ir_evaluation_available=1;
 }
 
 /* A source-only assertion is never discarded merely because SQLite is
@@ -2963,6 +3049,27 @@ static void test_enforcement_terminal_rejects_missing_authority(void) {
   assert(edr_p0_rule_try_emit(&record) == 0);
   assert(atomic_load(&g_enforcement_side_effects) == 0);
 
+  /* Every source-owner prerequisite is checked before journal admission and
+   * before the irreversible executor, not discovered by final freeze. */
+  for(unsigned missing=0;missing<6u;++missing) {
+    edr_p0_rule_test_reset_dedup();init_record(&record);
+    record.pid=99330u+missing;
+    snprintf(record.event_id,sizeof(record.event_id),"terminal-owner-missing-%u",missing);
+    snprintf(record.process_name,sizeof(record.process_name),"dedup-test.exe");
+    if(missing==0u) record.tenant_id[0]=0;
+    else if(missing==1u) record.endpoint_id[0]=0;
+    else if(missing==2u) record.event_time_ns=-1;
+    else if(missing==3u) record.pid=0;
+    else if(missing==4u) record.process_start_key=0;
+    else record.process_creation_filetime_100ns=0;
+    int updates_before=atomic_load(&g_terminal_update_calls);
+    precreate_before=atomic_load(&g_terminal_precreate_calls);
+    assert(edr_p0_rule_try_emit(&record)==0);
+    assert(atomic_load(&g_enforcement_side_effects)==0);
+    assert(atomic_load(&g_terminal_precreate_calls)==precreate_before);
+    assert(atomic_load(&g_terminal_update_calls)==updates_before);
+  }
+
   /* A post-event path snapshot may still carry useful detection evidence, but
    * never owns a terminal action.  The rule alert survives; neither the
    * terminal journal nor even the test executor may observe an action. */
@@ -3018,6 +3125,50 @@ static void test_enforcement_terminal_rejects_missing_authority(void) {
   edr_policy_enforcement_test_set_execute_hook(NULL);
 }
 
+static void test_terminal_preaction_bound_uses_full_local_commands(void) {
+  EdrConfig policy={0};EdrBehaviorRecord record;EdrCommandFacts facts={0};
+  /* Only the bounded result envelope and alert submessage can grow; source
+   * record and borrowed command facts are reused through the synchronous
+   * prepare/execute/freeze call. Include protobuf tags and scalar slack. */
+  assert(sizeof(record.detection_context)+edr_v1_BehaviorAlert_size+1024u<65552u);
+  policy.policy_v2.script_mode=EDR_POLICY_MODE_BLOCK;edr_policy_v2_configure(&policy);
+  assert(test_setenv("EDR_P0_DIRECT_EMIT","1",1)==0);
+  assert(test_setenv("EDR_P0_DEDUP_SEC","0",1)==0);
+  edr_p0_rule_test_reset_dedup();edr_p0_rule_test_set_monotonic_ms(3085u);
+  g_durable_emit_allowed=g_combined_emit_allowed=g_terminal_update_allowed=1;
+  atomic_store(&g_enforcement_side_effects,0);g_terminal_real_codec=1;
+  g_terminal_full_intent_len=g_terminal_outbound_intent_len=0u;
+  g_terminal_source_len=g_terminal_combined_len=g_terminal_preaction_bound=0u;
+  facts.subject=malloc(98301u);facts.parent=malloc(98301u);assert(facts.subject && facts.parent);
+  memset(facts.subject,'s',98300u);facts.subject[98300]=0;
+  memset(facts.parent,'p',98300u);facts.parent[98300]=0;
+  init_complete_process_record(&record,"dedup-test.exe");record.pid=99441u;
+  snprintf(record.cmdline,sizeof(record.cmdline),"%.100s",facts.subject);
+  snprintf(record.parent_cmdline,sizeof(record.parent_cmdline),"%.100s",facts.parent);
+  record.parent_pid_state=EDR_PARENT_PID_KNOWN;
+  record.event_time_ns=488u;snprintf(record.endpoint_id,sizeof(record.endpoint_id),"ep-long-local-bound");
+  snprintf(record.event_id,sizeof(record.event_id),"two-large-local-commands");
+  record.parent_process_start_key=UINT64_C(0x4241);record.parent_process_creation_filetime_100ns=1u;
+  edr_policy_enforcement_test_set_execute_hook(test_enforcement_execute_hook);
+  assert(edr_p0_rule_try_emit_with_command_facts(&record,&facts)==1);
+  assert(atomic_load(&g_enforcement_side_effects)==1);
+  assert(g_terminal_full_intent_len>196600u && g_terminal_outbound_intent_len<65536u);
+  assert(g_terminal_preaction_bound==g_terminal_full_intent_len);
+  size_t old_reserve=2u*(g_terminal_outbound_intent_len+65552u+255u)+2048u;
+  size_t final_cost=g_terminal_source_len+g_terminal_combined_len+510u+2048u;
+  size_t frame=g_terminal_preaction_bound+65552u;
+  if(frame>EDR_EVENT_BATCH_CAP) frame=EDR_EVENT_BATCH_CAP;
+  size_t new_reserve=2u*(frame+255u)+2048u;
+  assert(final_cost>old_reserve && final_cost<=new_reserve);
+  assert(g_terminal_source_len<=g_terminal_full_intent_len+65552u);
+  assert(g_terminal_combined_len<=g_terminal_full_intent_len+65552u);
+  printf("terminal reservation real codec: commands=98300+98300 intent=%zu local_intent=%zu source=%zu combined=%zu old_reserve=%zu new_reserve=%zu final_cost=%zu\n",
+      g_terminal_outbound_intent_len,g_terminal_full_intent_len,g_terminal_source_len,g_terminal_combined_len,old_reserve,new_reserve,final_cost);
+  assert(strlen(facts.subject)==98300u && strlen(facts.parent)==98300u);
+  free(facts.subject);free(facts.parent);g_terminal_real_codec=0;
+  edr_policy_enforcement_test_set_execute_hook(NULL);
+}
+
 static void test_enforcement_terminal_survives_normal_enqueue_failures(void) {
   EdrConfig block_policy;
   EdrBehaviorRecord record;
@@ -3033,6 +3184,7 @@ static void test_enforcement_terminal_survives_normal_enqueue_failures(void) {
   g_terminal_update_allowed = 1;
   atomic_store(&g_enforcement_side_effects, 0);
   updates_before = atomic_load(&g_terminal_update_calls);
+  g_terminal_source_enqueue_calls=0u;
   edr_policy_enforcement_test_set_execute_hook(test_enforcement_execute_hook);
 
   init_record(&record);
@@ -3042,7 +3194,8 @@ static void test_enforcement_terminal_survives_normal_enqueue_failures(void) {
   snprintf(record.process_name, sizeof(record.process_name), "dedup-test.exe");
   g_terminal_source_enqueue_allowed = 0;
   g_combined_emit_allowed = 1;
-  assert(edr_p0_rule_try_emit(&record) == 0);
+  /* Source is journal-owned and no longer depends on ordinary admission. */
+  assert(edr_p0_rule_try_emit(&record) == 1);
   assert(atomic_load(&g_enforcement_side_effects) == 1);
   assert(atomic_load(&g_terminal_update_calls) == updates_before + 1);
 
@@ -3065,6 +3218,7 @@ static void test_enforcement_terminal_survives_normal_enqueue_failures(void) {
   assert(edr_p0_rule_try_emit(&record) == 0);
   assert(atomic_load(&g_enforcement_side_effects) == 3);
   assert(atomic_load(&g_terminal_update_calls) == updates_before + 3);
+  assert(g_terminal_source_enqueue_calls==0u);
   g_terminal_source_enqueue_allowed = 1;
   g_combined_emit_allowed = 1;
   edr_policy_enforcement_test_set_execute_hook(NULL);
@@ -3338,6 +3492,7 @@ int main(void) {
   test_not_evaluable_with_preview_stays_source_only();
   test_p0_bundle_sha256_is_required_and_attached();
   test_ir_evaluation_failure_durably_preserves_source_without_alert();
+  test_source_only_retention_classification_requires_scope();
   test_source_only_retry_lane_is_exact_and_overflow_latched();
   test_restart_latch_requires_durable_loss_audit();
   test_ir_not_ready_durably_preserves_every_p0_event_group();
@@ -3358,6 +3513,7 @@ int main(void) {
   test_enforcement_requires_durable_intent_and_one_owner();
   test_enforcement_critical_lane_bypasses_ordinary_alert_rate();
   test_enforcement_terminal_preserves_evidence_and_never_reexecutes();
+  test_terminal_preaction_bound_uses_full_local_commands();
   test_enforcement_terminal_survives_normal_enqueue_failures();
   test_enforcement_terminal_crash_window_never_reexecutes();
   test_enforcement_terminal_rejects_missing_authority();

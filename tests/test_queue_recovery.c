@@ -5,6 +5,7 @@
 #include "edr/transport_sink.h"
 #include "edr/sha256.h"
 #include "edr/types.h"
+#include "edr/time_util.h"
 #include "edr/v1/event.pb.h"
 #include "cJSON.h"
 #include "lz4.h"
@@ -355,6 +356,11 @@ static void historic_projection_and_receipt(int compressed) {
   size_t len; uint8_t *wire=make_wire(1,1,compressed,"synthetic-endpoint",&len);
   initialize(path,wire,len,1);
   uint64_t owner_before=sql_number(path,"SELECT source_latch_owner FROM queue_meta;");
+  uint64_t retention_class_before=sql_number(path,
+      "SELECT retention_class FROM event_queue WHERE batch_id='legacy-batch';");
+  uint64_t retention_policy_before=sql_number(path,
+      "SELECT retention_policy_version FROM event_queue WHERE batch_id='legacy-batch';");
+  assert(retention_class_before==2 && retention_policy_before==1);
   char before_sha[65],after_sha[65]; file_sha(path,before_sha);
   EdrStorageQueueRecoveryReport report; EdrStorageQueueRecoveryRequest request=checked(path,&report);
   file_sha(path,after_sha); assert(!strcmp(before_sha,after_sha));
@@ -368,6 +374,10 @@ static void historic_projection_and_receipt(int compressed) {
   assert(report.legacy_owner_unacknowledged==1);
   original_equal(path,"legacy-batch",wire,len);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==2);
+  assert(sql_number(path,"SELECT retention_class FROM event_queue WHERE batch_id='legacy-batch';")==retention_class_before);
+  assert(sql_number(path,"SELECT retention_policy_version FROM event_queue WHERE batch_id='legacy-batch';")==retention_policy_before);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE origin_row_id>0 AND retention_class=3 "
+      "AND retention_policy_version=1 AND local_retention_state='retained';")==1);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE recovery_state='projection_pending';")==1);
   assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE projector_version='" EDR_EGRESS_PROJECTOR_VERSION "';")==1);
   assert(edr_storage_queue_recover_v1(path,&request,&report)==EDR_OK && report.applied);
@@ -399,6 +409,8 @@ static void historic_projection_and_receipt(int compressed) {
   assert(edr_storage_queue_open(path)==EDR_OK);
   EdrStorageQueueCapacityMetrics capacity; edr_storage_queue_get_capacity_metrics(&capacity);
   assert(capacity.legacy_owner_unacknowledged==1 && capacity.projection_pending_rows==1);
+  assert(capacity.accounting_available && capacity.retention_delivery_rows==1 && capacity.retention_recovery_rows==1);
+  uint64_t retained_original_bytes=capacity.retention_delivery_bytes;
   sends=0; receipt_mode=2; edr_storage_queue_poll_drain(); assert(sends==1);
   char resumed_sha[65]; edr_sha256_hex(sent_wire,sent_len,resumed_sha);
   assert(!strcmp(projected_id,sent_id) && !strcmp(projected_sha,resumed_sha));
@@ -422,6 +434,16 @@ static void historic_projection_and_receipt(int compressed) {
   assert(sql_number(path,"SELECT source_latch_owner FROM queue_meta;")==3);
   assert(sql_number(path,"SELECT source_latch_loss_detected FROM queue_meta;")==1);
   original_equal(path,"legacy-batch",wire,len);
+  /* The projection's real parsed receipt releases its own delivery owner.
+   * It neither changes the original creation class nor retires original bytes. */
+  assert(sql_number(path,"SELECT retention_class FROM event_queue WHERE batch_id='legacy-batch';")==retention_class_before);
+  assert(sql_number(path,"SELECT retention_policy_version FROM event_queue WHERE batch_id='legacy-batch';")==retention_policy_before);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE batch_id='legacy-batch' "
+      "AND local_retention_state='retained';")==1);
+  edr_storage_queue_get_capacity_metrics(&capacity);
+  assert(capacity.accounting_available && capacity.retention_recovery_rows==0 && capacity.retention_delivery_rows==1);
+  assert(capacity.retention_delivery_bytes==retained_original_bytes);
+  assert(capacity.projection_acked_rows==1 && capacity.projection_pending_rows==0);
   /* Only a NEW explicit local audit, not the projection's receipt, resolves
    * current-v3 durability loss. The production P0 owner additionally requires
    * healthy authenticated IR and its FULL probe before invoking this. */
@@ -699,6 +721,196 @@ static void process_crash_boundaries(void) {
     remove(path); free(wire);
   }
 }
+static void typed_local_real_codec(int compressed) {
+  char path[512],reason[96];test_path(path,sizeof(path),"typed-local-codec",compressed);remove(path);
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)),*decoded=calloc(1,sizeof(*decoded));
+  uint8_t *frame=malloc(EDR_EGRESS_FRAME_MAX),*raw=malloc(EDR_EGRESS_FRAME_MAX+4u);
+  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX+64u);assert(event && decoded && frame && raw && wire);
+  strcpy(event->event_id,"typed-real-source");strcpy(event->endpoint_id,"synthetic-endpoint");
+  strcpy(event->tenant_id,"synthetic-tenant");event->type=EDR_EVENT_PROCESS_CREATE;
+  event->event_time_ns=INT64_C(1700000000000000000);event->pid=42u;event->ppid=4u;
+  event->process_start_key=UINT64_MAX;event->process_creation_filetime_100ns=UINT64_C(133444444444444444);
+  event->has_parent_pid_state=true;event->parent_pid_state=1u;
+  strcpy(event->parent_name,"ordinary-parent");strcpy(event->parent_path,"synthetic-parent-path");
+  event->has_process_context=true;event->process_context.has_parent_cmdline=true;
+  strcpy(event->process_context.parent_cmdline,"ordinary-parent --necessary-local-context");
+  memset(event->cmdline,'x',90000u);event->cmdline[90000]='\0';
+  strcpy(event->ave_result_json,"{\"p0_disposition\":\"NOT_EVALUABLE\",\"source_contract_version\":\"p0-source-only-v2\","
+      "\"stage\":\"pre_evaluation\",\"gate_id\":\"P0_PROCESS_EVIDENCE_GATE\",\"reason\":\"evidence_enrichment_timeout\"}");
+  pb_ostream_t output=pb_ostream_from_buffer(frame,EDR_EGRESS_FRAME_MAX);
+  assert(pb_encode(&output,edr_v1_BehaviorEvent_fields,event));
+  wr(raw,(uint32_t)output.bytes_written);memcpy(raw+4,frame,output.bytes_written);
+  size_t raw_length=output.bytes_written+4u,wire_length;
+  wr(wire,compressed?EDR_TRANSPORT_BATCH_MAGIC_LZ4:EDR_TRANSPORT_BATCH_MAGIC_RAW);
+  wr(wire+4,1u);wr(wire+8,(uint32_t)raw_length);
+  if(compressed) {
+    int length=LZ4_compress_default((const char *)raw,(char *)wire+12,(int)raw_length,EDR_EGRESS_FRAME_MAX+52);
+    assert(length>0);wire_length=(size_t)length+12u;
+  } else {memcpy(wire+12,raw,raw_length);wire_length=raw_length+12u;}
+  assert(!edr_egress_batch_validate(wire,12,wire+12,wire_length-12,reason,sizeof(reason)));
+  assert(!strcmp(reason,"source_only_requires_local_owner_v3"));
+  /* Independent full frame decoding proves this is not a dictionary/delta
+   * requiring another queue row; long command and ordinary parent survive. */
+  memset(raw,0,raw_length);
+  if(compressed) assert(LZ4_decompress_safe((const char *)wire+12,(char *)raw,(int)(wire_length-12),(int)raw_length)==(int)raw_length);
+  else memcpy(raw,wire+12,raw_length);
+  pb_istream_t input=pb_istream_from_buffer(raw+4,rd(raw));
+  assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,decoded));
+  assert(strlen(decoded->cmdline)==90000u && !strcmp(decoded->cmdline,event->cmdline));
+  assert(decoded->ppid==4u && decoded->has_parent_pid_state && decoded->parent_pid_state==1u);
+  assert(decoded->process_start_key==UINT64_MAX && !strcmp(decoded->process_context.parent_cmdline,event->process_context.parent_cmdline));
+  EdrStorageQueueLocalEvidenceOwner owner={0};EdrStorageQueueP0SourceOnlyLatch latch;
+  owner.version=1u;owner.diagnostic_reason="evidence_enrichment_timeout";
+  owner.endpoint_id=event->endpoint_id;owner.tenant_id=event->tenant_id;owner.event_time_ns=event->event_time_ns;
+  owner.event_type=event->type;owner.pid=event->pid;owner.parent_pid=event->ppid;
+  owner.process_start_key=event->process_start_key;owner.process_creation_filetime_100ns=event->process_creation_filetime_100ns;
+  owner.parent_process_start_key=111u;owner.parent_process_creation_filetime_100ns=UINT64_C(133444444000000000);
+  edr_storage_queue_configure(4u,1u);edr_storage_queue_test_set_delivery_time(1700000000);
+  edr_storage_queue_test_set_local_retention_elapsed(0u);assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,event->event_id,"typed-real-batch",wire,wire_length,compressed,0,&owner)==EDR_OK);
+  original_equal(path,"typed-real-batch",wire,wire_length);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE local_parent_start_key='111' AND local_parent_pid=4 AND local_start_key='18446744073709551615';")==1u);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  owner.tenant_id="";
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,event->event_id,"unclassified-real-batch",wire,wire_length,compressed,0,&owner)==EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_source_only_commit_local(&latch,event->event_id,"unclassified-real-batch",wire,wire_length,compressed,0)==EDR_OK);
+  sends=0;receipt_mode=1;edr_storage_queue_poll_drain();assert(sends==0);
+  edr_storage_queue_test_set_delivery_time(1700003601);edr_storage_queue_test_set_local_retention_elapsed(3601u);
+  edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE batch_id='typed-real-batch';")==0u);
+  assert(sql_number(path,"SELECT COUNT(*) FROM delivery_receipts_v1;")==0u);
+  original_equal(path,"unclassified-real-batch",wire,wire_length);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  edr_storage_queue_poll_drain();assert(sends==0);
+  original_equal(path,"unclassified-real-batch",wire,wire_length);
+  edr_storage_queue_close();edr_storage_queue_test_set_delivery_time(-1);
+  edr_storage_queue_test_set_local_retention_elapsed(UINT64_MAX);edr_storage_queue_configure(0u,0u);
+  free(event);free(decoded);free(frame);free(raw);free(wire);remove(path);
+}
+
+typedef struct TerminalLocalQueryFixture {
+  const EdrTestP0TerminalFixture *frame;
+  unsigned visits;
+} TerminalLocalQueryFixture;
+static int terminal_local_query_visit(const char *event,const EdrStorageQueueLocalEvidenceOwner *owner,
+    const uint8_t *wire,size_t len,void *arg) {
+  TerminalLocalQueryFixture *state=arg;const EdrTestP0TerminalFixture *f=state->frame;
+  assert(!strcmp(event,f->source_event_id) && !strcmp(owner->diagnostic_reason,"enforcement_terminal_result"));
+  assert(owner->pid==4242u && owner->process_start_key==UINT64_C(0xfedcba9876543210) &&
+      owner->process_creation_filetime_100ns==UINT64_C(133444000000000000));
+  assert(len==f->length[1] && !memcmp(wire,f->wire[1],len));state->visits++;return 1;
+}
+static void terminal_typed_source_lifecycle(void) {
+  char path[512],why[96];test_path(path,sizeof(path),"typed-terminal",0);remove(path);
+  EdrTestP0TerminalFixture f;assert(edr_test_p0_terminal_fixture_init(&f,41u,"synthetic-tenant","synthetic-endpoint"));
+  EdrStorageQueueLocalEvidenceOwner owner={0};owner.version=1u;owner.diagnostic_reason="enforcement_terminal_result";
+  owner.endpoint_id="synthetic-endpoint";owner.tenant_id="synthetic-tenant";owner.event_type=EDR_EVENT_PROCESS_CREATE;
+  owner.event_time_ns=1700000000000000041LL;owner.pid=4242u;owner.process_start_key=UINT64_C(0xfedcba9876543210);
+  owner.process_creation_filetime_100ns=UINT64_C(133444000000000000);
+  const int64_t started=1700000100;edr_storage_queue_configure(8u,1u);
+  edr_storage_queue_test_set_delivery_time(started);edr_storage_queue_test_set_local_retention_elapsed(0u);
+  assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      f.generation_key,"typed-intent",f.wire[0],f.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  uint64_t reserved=sql_number(path,"SELECT reserved_bytes FROM enforcement_terminal_journal;");
+  assert(reserved>=f.length[1]+f.length[2]+strlen("typed-source")+strlen("typed-combined")+2048u);
+  assert(sql_number(path,"SELECT local_owner_reserved FROM enforcement_terminal_journal;")==2048u);
+  EdrStorageQueueCapacityMetrics before,after;edr_storage_queue_get_capacity_metrics(&before);
+  edr_storage_queue_test_fail_next_terminal_commits(1u);
+  assert(edr_storage_queue_enforcement_terminal_update_local_source(f.terminal_key,"typed-source",f.wire[1],f.length[1],
+      "typed-combined",f.wire[2],f.length[2],f.source_event_id,&owner)==EDR_ERR_SQLITE_WRITE);
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE retention_policy_version=0 AND source_wire IS NULL AND local_owner_reserved=2048;")==1u);
+  edr_storage_queue_get_capacity_metrics(&after);assert(before.used_bytes==after.used_bytes);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  /* Recovered intent ownership never authorizes the side effect again. */
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      f.generation_key,"typed-intent",f.wire[0],f.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_EXISTING);
+  assert(edr_storage_queue_enforcement_terminal_update_local_source(f.terminal_key,"typed-source",f.wire[1],f.length[1],
+      "typed-combined",f.wire[2],f.length[2],f.source_event_id,&owner)==EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&after);assert(after.used_bytes<=before.used_bytes);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==0u);
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE retention_policy_version=3 AND local_owner_reserved=0 AND reserved_bytes=0 AND source_acked=0 AND source_policy_held=0;")==1u);
+  assert(edr_egress_batch_validate(f.wire[0],12,f.wire[0]+12,f.length[0]-12,why,sizeof(why)));
+  assert(edr_egress_batch_validate(f.wire[2],12,f.wire[2]+12,f.length[2]-12,why,sizeof(why)));
+  assert(!edr_egress_batch_validate(f.wire[1],12,f.wire[1]+12,f.length[1]-12,why,sizeof(why)));
+  assert(edr_storage_queue_enforcement_terminal_update_local_source(f.terminal_key,"typed-source",f.wire[1],f.length[1],
+      "typed-combined",f.wire[2],f.length[2],f.source_event_id,&owner)==EDR_OK);
+  owner.process_start_key++;
+  assert(edr_storage_queue_enforcement_terminal_update_local_source(f.terminal_key,"typed-source",f.wire[1],f.length[1],
+      "typed-combined",f.wire[2],f.length[2],f.source_event_id,&owner)==EDR_ERR_INVALID_ARG);
+  owner.process_start_key--;
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      "startkey-fedcba9876543211","typed-intent",f.wire[0],f.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CONFLICT);
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      f.generation_key,"typed-intent",f.wire[1],f.length[1])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CONFLICT);
+  TerminalLocalQueryFixture qf={&f,0u};EdrStorageQueueLocalQuery q={0};EdrStorageQueueLocalQueryStats qs;
+  q.tenant_id=owner.tenant_id;q.endpoint_id=owner.endpoint_id;q.from_ns=owner.event_time_ns;q.until_ns=owner.event_time_ns;
+  q.max_rows=4u;q.max_scan=8u;q.max_payload_bytes=65536u;q.until_mono_ns=edr_monotonic_ns()+UINT64_C(60000000000);
+  q.pid=owner.pid;q.has_process_start_key=q.has_process_creation_filetime_100ns=1;
+  q.process_start_key=owner.process_start_key;q.process_creation_filetime_100ns=owner.process_creation_filetime_100ns;
+  assert(edr_storage_queue_query_local_snapshot(&q,terminal_local_query_visit,NULL,&qf,&qs)==0 && qf.visits==1u);
+  /* Wrong receipt keeps the exact intent; combined can independently finish. */
+  sends=0;receipt_mode=2;edr_storage_queue_poll_drain();assert(sends==1u && !strcmp(sent_id,"typed-intent"));
+  assert(sql_number(path,"SELECT intent_acked FROM enforcement_terminal_journal;")==0u);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  receipt_mode=1;sends=0;edr_storage_queue_poll_drain();assert(sends==1u && !strcmp(sent_id,"typed-combined"));
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE state='ready' AND source_acked=0 AND source_policy_held=0 AND combined_acked=1;")==1u);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  edr_storage_queue_test_set_delivery_time(started+2);sends=0;edr_storage_queue_poll_drain();
+  assert(sends==1u && !strcmp(sent_id,"typed-intent"));
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE state='local_retained' AND intent_acked=1 AND combined_acked=1 AND source_acked=0 AND source_policy_held=0;")==1u);
+  assert(sql_number(path,"SELECT completed_at FROM enforcement_terminal_journal;")==(uint64_t)started+2u);
+  char receipt_sha[65],receipt_sql[256];
+  edr_sha256_hex((const uint8_t *)"typed-source",strlen("typed-source"),receipt_sha);
+  snprintf(receipt_sql,sizeof(receipt_sql),"SELECT COUNT(*) FROM delivery_receipts_v1 WHERE batch_id_sha256='%s';",receipt_sha);
+  assert(sql_number(path,receipt_sql)==0u);
+  assert(sql_number(path,"SELECT COUNT(*) FROM delivery_receipts_v1;")==2u);
+  edr_sha256_hex((const uint8_t *)"typed-intent",strlen("typed-intent"),receipt_sha);
+  snprintf(receipt_sql,sizeof(receipt_sql),"SELECT COUNT(*) FROM delivery_receipts_v1 WHERE batch_id_sha256='%s';",receipt_sha);
+  assert(sql_number(path,receipt_sql)==1u);
+  edr_sha256_hex((const uint8_t *)"typed-combined",strlen("typed-combined"),receipt_sha);
+  snprintf(receipt_sql,sizeof(receipt_sql),"SELECT COUNT(*) FROM delivery_receipts_v1 WHERE batch_id_sha256='%s';",receipt_sha);
+  assert(sql_number(path,receipt_sql)==1u);
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      f.generation_key,"typed-intent",f.wire[0],f.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_EXISTING);
+  edr_storage_queue_get_capacity_metrics(&before);
+  /* Same-process wall-clock jump alone cannot expire the retained bytes. */
+  edr_storage_queue_test_set_delivery_time(started+10000);edr_storage_queue_test_set_local_retention_elapsed(0u);
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal;")==1u);
+  edr_storage_queue_test_set_delivery_time(started-10000);edr_storage_queue_test_set_local_retention_elapsed(10000u);
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal;")==1u);
+  edr_storage_queue_test_set_delivery_time(started+3601);edr_storage_queue_test_set_local_retention_elapsed(3601u);
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal;")==1u); /* delivery was +2 */
+  edr_storage_queue_test_set_delivery_time(started+3603);edr_storage_queue_test_set_local_retention_elapsed(3603u);
+  sql_exec(path,"UPDATE queue_meta SET source_latch_recovery_batch_id='typed-source';");
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal;")==1u);
+  sql_exec(path,"UPDATE queue_meta SET source_latch_recovery_batch_id='';"
+      "CREATE TRIGGER test_retirement_abort BEFORE DELETE ON enforcement_terminal_journal BEGIN SELECT RAISE(ABORT,'synthetic retirement rollback'); END;");
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE local_retention_state='retained';")==1u);
+  assert(sql_number(path,"SELECT terminal_local_retired_rows FROM queue_meta;")==0u);
+  edr_storage_queue_get_capacity_metrics(&after);assert(before.used_bytes==after.used_bytes);
+  sql_exec(path,"DROP TRIGGER test_retirement_abort;");
+  qf.visits=0u;assert(edr_storage_queue_query_local_snapshot(&q,terminal_local_query_visit,NULL,&qf,&qs)==0 && qf.visits==1u);
+  for(unsigned i=0;i<5u;i++) edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal;")==0u);
+  edr_storage_queue_get_capacity_metrics(&after);assert(after.used_bytes==0u);
+  assert(sql_number(path,"SELECT terminal_local_retired_rows FROM queue_meta;")==1u);
+  assert(sql_number(path,"SELECT terminal_local_retired_bytes FROM queue_meta;")==before.used_bytes);
+  qf.visits=0u;assert(edr_storage_queue_query_local_snapshot(&q,terminal_local_query_visit,NULL,&qf,&qs)==0 && qf.visits==0u);
+  sends=0;edr_storage_queue_poll_drain();assert(sends==0u);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  edr_storage_queue_get_capacity_metrics(&after);assert(after.used_bytes==0u);
+  assert(sql_number(path,"SELECT terminal_local_retired_rows FROM queue_meta;")==1u);
+  edr_storage_queue_close();edr_storage_queue_configure(0u,0u);edr_storage_queue_test_set_delivery_time(-1);
+  edr_storage_queue_test_set_local_retention_elapsed(UINT64_MAX);edr_test_p0_terminal_fixture_free(&f);remove(path);
+}
+
 int main(int argc,char **argv) {
   if (argc==4 && !strcmp(argv[1],"--crash-child")) {
     EdrStorageQueueRecoveryReport report;
@@ -711,6 +923,8 @@ int main(int argc,char **argv) {
 #else
   assert(_putenv_s("EDR_QUEUE_DRAIN_INTERVAL_MS","0")==0);
 #endif
+  terminal_typed_source_lifecycle();
+  typed_local_real_codec(0);typed_local_real_codec(1);
   terminal_hold_and_independent_retry();
   historical_paired_alert_requires_original_intent_owner();
   historical_known_outcome_missing_intent_receipt();

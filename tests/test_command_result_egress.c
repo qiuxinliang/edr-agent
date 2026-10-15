@@ -18,9 +18,10 @@
 #define env(k,v) setenv(k,v,1)
 #endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); exit(1); } } while(0)
-void edr_local_evidence_cache_record_command_result(const char *id,const char *type,const char *status,
+int edr_local_evidence_cache_record_command_result(const char *id,const char *type,const char *status,
     int execution,int code,const char *detail,const char *artifacts) {
   (void)id;(void)type;(void)status;(void)execution;(void)code;(void)detail;(void)artifacts;
+  return 0;
 }
 static int allowed(const char *tenant,const char *endpoint,const char *body) {
   char why[128];
@@ -442,6 +443,17 @@ static void purpose_tests(void) {
   b=persisted_body("cached-purpose","rtq_query");CHECK(!strstr(b,"UNREQUESTED")&&allowed("tenant","ep",b));free(b);
   snprintf(cached,sizeof(cached),"{\"rows\":[{\"event_time_ns\":%.0f,\"type\":1,\"pid\":12,\"endpoint_id\":\"ep\",\"process_name\":\"foo\"}]}",(double)(now-120000)*1000000);
   CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,cached,projected,sizeof(projected))!=0);
+  q=task("cached-absence","rtq_query");
+  const char *absent="{\"rows\":[],\"partial\":false,\"availability_reason\":\"not_collected_or_expired\",\"absence_is_evidence\":false}";
+  CHECK(edr_command_state_finish("cached-absence","rtq_query",&q,"ok",1,0,absent,"",1)==0);
+  b=persisted_body("cached-absence","rtq_query");
+  CHECK(allowed("tenant","ep",b) && strstr(b,"not_collected_or_expired")); free(b);
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
+      "{\"rows\":[],\"availability_reason\":\"not_collected_or_expired\",\"absence_is_evidence\":true}",projected,sizeof(projected))!=0);
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
+      "{\"rows\":[],\"availability_reason\":\"RAW_COMMAND_SECRET\",\"absence_is_evidence\":false}",projected,sizeof(projected))!=0);
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
+      "{\"rows\":[],\"availability_reason\":\"available\",\"absence_is_evidence\":false}",projected,sizeof(projected))!=0);
   q=task("status-purpose","noop");
   CHECK(edr_command_state_finish("status-purpose","noop",&q,"ok",1,0,"UNRELATED arbitrary stdout and diagnostic","",1)==0);
   b=persisted_body("status-purpose","noop");CHECK(!strstr(b,"UNRELATED")&&strstr(b,"command_completed")&&allowed("tenant","ep",b));

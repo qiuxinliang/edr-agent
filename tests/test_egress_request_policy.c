@@ -367,7 +367,32 @@ static void test_upgrade_health_consumers(void) {
       "\"engine_health_update\":{\"version\":2,\"base\":\"rev\",\"removed\":[]}}";
   assert(check("POST", "ingest/engine-health/delta", delta) == 0);
 }
+static void test_storage_health_is_numeric_and_bounded(void) {
+  const char *raw="{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"storage_protection\":{\"directory_hard_limit\":false,\"min_free_bytes\":143479824,\"queue_available_bytes\":200000000,\"command_owner\":{\"accounting_available\":true,\"reserved_bytes\":197190,\"admission_rejected\":2,\"raw_command\":\"PRIVATE_COMMAND\"}},\"queue_local_retention\":{\"retirement_enabled\":true,\"local_retention_policy_version\":2,\"retired_rows\":100,\"unclassified_rows\":4,\"payload\":\"PRIVATE_FACT\"}}}";
+  char why[128];
+  assert(check("POST","ingest/engine-health",raw)!=0);
+  char *projected=edr_egress_health_project(raw,why,sizeof(why)); assert(projected);
+  assert(strstr(projected,"reserved_bytes") && strstr(projected,"retired_rows"));
+  assert(!strstr(projected,"PRIVATE_") && !strstr(projected,"raw_command"));
+  assert(check("POST","ingest/engine-health",projected)==0);
+  cJSON *o=cJSON_Parse(projected); assert(o);
+  cJSON *q=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(o,"engine_health"),"queue_local_retention");
+  cJSON_AddNumberToObject(q,"maintenance_oversize_holds",1);
+  cJSON_AddNumberToObject(q,"terminal_local_retired_rows",3);
+  cJSON_AddNumberToObject(q,"terminal_local_retired_bytes",4000);
+  cJSON_AddNumberToObject(q,"physical_admission_failures",2);
+  cJSON_AddNumberToObject(q,"physical_failure_kind",1);
+  char *metrics=cJSON_PrintUnformatted(o); assert(metrics);
+  assert(check("POST","ingest/engine-health",metrics)==0);
+  free(metrics);
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(q,"retired_rows",cJSON_CreateString("PRIVATE_FACT")));
+  char *bad=cJSON_PrintUnformatted(o); assert(bad);
+  assert(check("POST","ingest/engine-health",bad)!=0);
+  free(bad); cJSON_Delete(o); free(projected);
+}
+
 int main(void) {
+  test_storage_health_is_numeric_and_bounded();
   test_parent_exit_health_projection();
   test_diagnostic_health_commitments();
   test_upgrade_health_consumers();

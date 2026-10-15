@@ -127,7 +127,9 @@ int main(void) {
            "runtime mirror preserves the mutable downloaded detection cache");
   contains(script, "InternalName", "PE InternalName check exists");
   contains(script, "ProductVersion", "PE ProductVersion check exists");
-  contains(script, "Get-PSDrive", "disk-space preflight exists");
+  contains(script, "GetDiskFreeSpaceExW", "disk-space preflight queries the actual containing volume");
+  contains(script, "Assert-UpdateFreeSpace", "disk-space preflight includes operation growth and safety floor");
+  contains(script, "/EDR_MIN_FREE_BYTES=", "full installer receives the local disk safety floor");
   contains(script, "Resolve-DeploymentMode", "auto deployment mode exists");
   contains(script, "Stop-Service", "service stop path exists");
   contains(script, "Start-ScheduledTask", "scheduled-task start path exists");
@@ -235,6 +237,8 @@ int main(void) {
   require_true(baseline_repair_lifecycle != NULL, "read Windows Setup lifecycle smoke");
   contains(baseline_repair_lifecycle, "Assert-BaselineRepair", "native Windows lifecycle exercises the missing-uninstaller repair path");
   contains(baseline_repair_lifecycle, "EDR_REPAIR_BASELINE=1", "lifecycle invokes the explicit repair mode");
+  require_true(!strstr(baseline_repair_lifecycle, "/EDR_MIN_FREE_BYTES="),
+               "lifecycle exercises old embedded updater contract without the new optional floor argument");
   contains(baseline_repair_lifecycle, "New-BaselineRepairBackup $backupDir",
            "lifecycle creates the repair authorization backup without traversing hardened runtime data");
   contains(baseline_repair_lifecycle,
@@ -263,8 +267,15 @@ int main(void) {
   contains(inno, "Name: \"{app}\\*.dll\"; Check: ShouldReconcileRuntimeDlls",
            "full installer removes obsolete root DLLs only during an identity-preserving upgrade");
   contains(inno,
-           "Source: \"{#EDR_BIN_DIR}\\collector\\forensic_collector_builtin.exe\"; DestDir: \"{app}\\collector\"; Flags: ignoreversion",
+           "Source: \"{#EdrSizedSource(EDR_BIN_DIR + \"\\collector\\forensic_collector_builtin.exe\")}\"; DestDir: \"{app}\\collector\"; Flags: ignoreversion",
            "full installer requires the independently built C forensic fallback");
+  require_true(count_occurrences(inno, "\nSource: ") ==
+                   count_occurrences(inno, "\nSource: \"{#EdrSizedSource("),
+               "every bundled file entry participates in expanded-size accounting");
+  contains_before(inno,
+                  "Result := EdrCheckInstallSpace(AppDir, EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline);",
+                  "  SaveEnrollParamsFileIfNeeded;\n  Cmd :=",
+                  "full installer checks space before enrollment writes and runtime stop");
   contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
            "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
   contains(inno, "Name: \"windowsservice\"; Description: \"Run as the FDSecurity Windows service (recommended)\"",

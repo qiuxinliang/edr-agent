@@ -16,6 +16,8 @@ endif()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME evidence_startup_index_manifest
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_startup_index_manifest.py)
 add_test(NAME tdh_property_alias_order_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_tdh_property_try_order.py)
 add_custom_target(test_python_installer_config_contract DEPENDS edr_agent)
@@ -126,15 +128,19 @@ if(WIN32)
 endif()
 add_test(NAME response_file_security_behavior COMMAND test_response_file_security)
 
-if(NOT WIN32)
-  add_executable(test_shell_session_stream
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_session_stream.c
-    ${CMAKE_SOURCE_DIR}/src/shell/shell_session.c)
-  target_include_directories(test_shell_session_stream PRIVATE ${CMAKE_SOURCE_DIR}/include)
-  edr_apply_test_warnings(test_shell_session_stream)
-  add_test(NAME shell_session_stream_completeness COMMAND test_shell_session_stream
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_executable(test_shell_session_stream
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_shell_session_stream.c
+  ${CMAKE_SOURCE_DIR}/src/shell/shell_session.c)
+target_include_directories(test_shell_session_stream PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_shell_session_stream PRIVATE Threads::Threads)
+if(WIN32)
+  target_sources(test_shell_session_stream PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/platform/windows_spawn_lock.c)
 endif()
+edr_apply_test_warnings(test_shell_session_stream)
+add_test(NAME shell_session_stream_completeness COMMAND test_shell_session_stream
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(shell_session_stream_completeness PROPERTIES TIMEOUT 45)
 
 add_executable(test_command_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_command_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_contract.c
@@ -242,10 +248,22 @@ if(WIN32)
   add_test(NAME windows_installer_log_redaction
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_installer_log_redaction.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
+  add_test(NAME windows_update_physical_guard
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_update_physical_guard.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1'")
+  add_test(NAME windows_inno_evidence_space
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_inno_evidence_space.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}' -PreflightExe '$<TARGET_FILE:edr_agent>'")
+  set_tests_properties(windows_inno_evidence_space PROPERTIES TIMEOUT 360)
+  add_test(NAME windows_storage_space_preflight
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_storage_space_preflight.ps1' -Raw -Encoding UTF8))) -PreflightExe '$<TARGET_FILE:edr_agent>'")
+  set_tests_properties(windows_storage_space_preflight PROPERTIES TIMEOUT 90)
   set_tests_properties(
     windows_release_collector_pe_closure
     windows_inplace_collector_transaction
     windows_installer_log_redaction
+    windows_update_physical_guard
     PROPERTIES TIMEOUT 60)
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
@@ -1444,6 +1462,8 @@ add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/t
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
   ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c
   ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
+  ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
+  ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c
   ${CMAKE_SOURCE_DIR}/src/storage/evidence_context_store.c
   ${CMAKE_SOURCE_DIR}/src/storage/evidence_cache_migration.c
   ${CMAKE_SOURCE_DIR}/src/forensic/process_tree_cache.c
@@ -1988,6 +2008,9 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
   add_test(NAME attack_surface_command_admission COMMAND test_egress_tls_client
     --attack-surface-admission ${CMAKE_CURRENT_BINARY_DIR}/asurf-admission-state)
   set_tests_properties(attack_surface_command_admission PROPERTIES TIMEOUT 30)
+  add_test(NAME authorized_local_query_contract COMMAND test_egress_tls_client
+    --local-query-contract ${CMAKE_CURRENT_BINARY_DIR}/authorized-local-query-state)
+  set_tests_properties(authorized_local_query_contract PROPERTIES TIMEOUT 30)
   add_executable(test_pmfe_lifecycle test_pmfe_lifecycle.c ${_egress_tls_sources})
   target_include_directories(test_pmfe_lifecycle PRIVATE
     $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
@@ -2047,6 +2070,7 @@ edr_minimization_test(egress_batch_policy test_egress_batch_policy)
 edr_minimization_test(egress_request_policy test_egress_request_policy)
 edr_minimization_test(command_result_egress test_command_result_egress)
 edr_minimization_test(command_result_compaction test_command_result_compaction)
+edr_minimization_test(authorized_local_query_contract test_egress_tls_client)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
 edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_candidate)
 edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)
@@ -2176,6 +2200,31 @@ if(WIN32)
     $<TARGET_FILE:test_log_rotation>)
   set_tests_properties(windows_headless_log_stream_initialization PROPERTIES TIMEOUT 30)
 endif()
+
+# Real filesystem query plus deterministic boundary arithmetic, no fake disk provider.
+add_executable(test_storage_physical_guard test_storage_physical_guard.c)
+target_include_directories(test_storage_physical_guard PRIVATE ${PROJECT_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_storage_physical_guard)
+add_test(NAME storage_physical_guard COMMAND test_storage_physical_guard)
+
+# Installer compatibility preflight uses the exact production CLI implementation,
+# real TOML parser and real command owner calibration; it never starts an Agent.
+add_executable(storage_space_preflight_client storage_space_preflight_client.c
+  ${CMAKE_SOURCE_DIR}/src/config/config.c
+  ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
+target_include_directories(storage_space_preflight_client PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party/tomlc99)
+target_link_libraries(storage_space_preflight_client PRIVATE edr_egress_policy Threads::Threads)
+if(WIN32)
+  target_link_libraries(storage_space_preflight_client PRIVATE advapi32)
+endif()
+edr_apply_test_warnings(storage_space_preflight_client)
+add_test(NAME storage_space_preflight COMMAND ${Python3_EXECUTABLE} -B
+  ${CMAKE_SOURCE_DIR}/tests/test_storage_space_preflight.py --client $<TARGET_FILE:storage_space_preflight_client>)
+set_tests_properties(storage_space_preflight PROPERTIES TIMEOUT 60)
 
 # Gate declarations require the complete test/target graph before binding
 # their build dependencies and labels, including the periodic/runtime owners.

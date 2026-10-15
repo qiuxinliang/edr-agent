@@ -129,9 +129,10 @@ int edr_response_forensic_complete_queued_upload(const char *id, const char *typ
   if (fail_terminal_receipt) { fail_terminal_receipt = 0; fail_publish = 1; }
   return rc < 0 ? rc : 0;
 }
-void edr_local_evidence_cache_record_command_result(const char *id, const char *type,
+int edr_local_evidence_cache_record_command_result(const char *id, const char *type,
     const char *status, int execution, int code, const char *detail, const char *artifacts) {
   (void)id; (void)type; (void)status; (void)execution; (void)code; (void)detail; (void)artifacts;
+  return 0;
 }
 static void put(const char *path, const char *text) {
   FILE *f = fopen(path, "wb"); assert(f);

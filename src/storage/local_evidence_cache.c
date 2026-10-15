@@ -1,6 +1,13 @@
 #include "edr/egress_request_policy.h"
 #include "edr/validation_trace.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/command.h"
+#include "edr/storage_physical_guard.h"
+#include "edr/storage_queue.h"
+#include "edr/transport_sink.h"
+#ifdef EDR_HAVE_LZ4
+#include "lz4.h"
+#endif
 
 #include "edr/p0_rule_ir.h"
 #include "edr/p0_rule_match.h"
@@ -19,6 +26,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -249,6 +257,7 @@ static uint32_t s_ring_pos;
 static uint32_t s_context_ring_pos;
 static uint32_t s_context_window_next;
 static EdrEvidenceCacheStatus s_status;
+static atomic_uint_fast64_t s_query_pin_exhausted;
 static uint64_t s_last_maintenance_ns;
 static uint64_t s_last_capacity_failure_ns;
 static int64_t s_write_budget_minute;
@@ -1669,7 +1678,7 @@ static MetricSlot *metric_slot_for(const EdrBehaviorRecord *r, int64_t event_tim
    * force a database transaction for every event. */
   MetricSlot *m = empty ? empty : (clean ? clean : oldest);
 #if defined(EDR_HAVE_SQLITE)
-  if (!empty && metric_slot_pending(m) && sqlite_flush_metrics(0) != 0) {
+  if (!empty && metric_slot_pending(m) && (sqlite_flush_metrics(0) != 0 || metric_slot_pending(m))) {
     /* Existing slots can keep accumulating. Do not erase their pending counts
      * merely to accept another key while storage is unavailable. */
     s_status.metric_unrecorded++;
@@ -2494,7 +2503,16 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
 /* Only physical reclamation is resumable. No row identities or SQLite
  * statements survive a poll, and admission/startup can take over at any time. */
 static unsigned s_maintenance_reclaim_pages;
+/* Two bounded keyset cursors prevent protected old groups from starving newer
+ * eligible groups. Losing a cursor on restart only repeats safe validation. */
+static struct { int value_class; sqlite3_int64 time; char id[160]; } s_retirement_cursor[2];
+static struct { sqlite3_int64 time; char id[80]; } s_command_retirement_cursor;
 static int sqlite_maintenance(int defer_reclaim);
+typedef struct { uint64_t deadline_ns, bytes_left; unsigned rows_left; } EvidenceMaintenanceSlice;
+static unsigned s_maintenance_stage;
+static int sqlite_retire_command_facts(sqlite3_int64 cutoff, EvidenceMaintenanceSlice *slice);
+static int sqlite_maintenance_yield(const EvidenceMaintenanceSlice *slice);
+static int sqlite_maintenance_charge(EvidenceMaintenanceSlice *slice,unsigned rows,uint64_t bytes);
 
 static int exec_sql(const char *sql) {
   char *err = NULL;
@@ -2558,6 +2576,18 @@ static int sqlite_ensure_p0_candidate_columns(void) {
        "ALTER TABLE p0_candidates ADD COLUMN identity_source TEXT;"},
       {"identity_quality",
        "ALTER TABLE p0_candidates ADD COLUMN identity_quality TEXT;"},
+      {"retention_policy_version",
+       "ALTER TABLE p0_candidates ADD COLUMN retention_policy_version INTEGER NOT NULL DEFAULT 0;"},
+      {"local_retention_state",
+       "ALTER TABLE p0_candidates ADD COLUMN local_retention_state TEXT NOT NULL DEFAULT 'retained';"},
+      {"retention_value_class",
+       "ALTER TABLE p0_candidates ADD COLUMN retention_value_class INTEGER NOT NULL DEFAULT 0;"},
+      {"retention_value_reason",
+       "ALTER TABLE p0_candidates ADD COLUMN retention_value_reason TEXT NOT NULL DEFAULT 'unclassified';"},
+      {"subject_command_fact_id",
+       "ALTER TABLE p0_candidates ADD COLUMN subject_command_fact_id TEXT NOT NULL DEFAULT '';"},
+      {"parent_command_fact_id",
+       "ALTER TABLE p0_candidates ADD COLUMN parent_command_fact_id TEXT NOT NULL DEFAULT '';"},
   };
   for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
     int has_column = sqlite_p0_candidates_has_column(columns[i].name);
@@ -2566,6 +2596,77 @@ static int sqlite_ensure_p0_candidate_columns(void) {
     }
   }
   return 0;
+}
+
+static int sqlite_ensure_command_fact_ownership(void) {
+  static const struct { const char *name, *sql; } fields[] = {
+    {"command_retention_policy", "ALTER TABLE artifacts ADD COLUMN command_retention_policy INTEGER NOT NULL DEFAULT 0;"},
+    {"command_owner_pid", "ALTER TABLE artifacts ADD COLUMN command_owner_pid INTEGER NOT NULL DEFAULT 0;"},
+    {"command_owner_start_key", "ALTER TABLE artifacts ADD COLUMN command_owner_start_key TEXT NOT NULL DEFAULT '';"},
+    {"command_owner_creation", "ALTER TABLE artifacts ADD COLUMN command_owner_creation TEXT NOT NULL DEFAULT '';"}
+  };
+  for (unsigned i = 0; i < sizeof(fields)/sizeof(fields[0]); ++i) {
+    sqlite3_stmt *st = NULL; int found = 0, rc;
+    if (sqlite3_prepare_v2(s_db, "PRAGMA table_info(artifacts);", -1, &st, NULL) != SQLITE_OK) return -1;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+      const char *name = (const char *)sqlite3_column_text(st, 1);
+      if (name && !strcmp(name, fields[i].name)) found = 1;
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE || (!found && exec_sql(fields[i].sql))) return -1;
+  }
+  return exec_sql("CREATE INDEX IF NOT EXISTS idx_command_fact_retirement ON artifacts(created_ns,artifact_id) WHERE artifact_type='process_command_line' AND command_retention_policy=1;");
+}
+
+/* Additive ownership only. A replay/enrichment of an old candidate does not
+ * promote it to a policy whose dependencies were never registered. */
+static int sqlite_retention_metadata_open(void) {
+  sqlite3_stmt *st = NULL;
+  if (sqlite_ensure_command_fact_ownership() != 0) return -1;
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT COUNT(*) FROM p0_candidates WHERE typeof(retention_policy_version)!='integer' "
+      "OR retention_policy_version NOT IN (0,1) OR local_retention_state IS NULL "
+      "OR local_retention_state!='retained';", -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int64(st, 0) != 0) goto failed;
+  sqlite3_finalize(st); st = NULL;
+  if (exec_sql(
+      "CREATE INDEX IF NOT EXISTS idx_candidates_retention ON p0_candidates(retention_policy_version,event_time_ns,candidate_id);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_query_scope_time ON p0_candidates(endpoint_id,tenant_id,event_time_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_retention_value ON p0_candidates(retention_policy_version,retention_value_class,event_time_ns,candidate_id);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_subject_command ON p0_candidates(subject_command_fact_id);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_parent_command ON p0_candidates(parent_command_fact_id);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_retention_generation ON p0_candidates(endpoint_id,tenant_id,pid,process_start_key,process_creation_filetime_100ns,candidate_id);"
+      "CREATE INDEX IF NOT EXISTS idx_artifacts_candidate_owner ON artifacts(candidate_id,artifact_type,upload_status);"
+      "CREATE INDEX IF NOT EXISTS idx_candidates_retention_unknown_generation ON p0_candidates(endpoint_id,tenant_id,pid) "
+      "WHERE process_start_key IS NULL OR process_start_key IN ('','0') "
+      "OR process_creation_filetime_100ns IS NULL OR process_creation_filetime_100ns IN ('','0');"
+      "CREATE INDEX IF NOT EXISTS idx_artifacts_pmfe_retention ON artifacts(upload_status,created_ns,artifact_id) "
+      "WHERE artifact_type='pmfe_followup_local_v1' AND "
+      "(upload_status IS NULL OR upload_status NOT IN ('completed','expired','conflict'));"
+      "DROP TRIGGER IF EXISTS candidate_retention_v1_insert;"
+      "CREATE TRIGGER candidate_retention_v1_insert BEFORE INSERT ON p0_candidates "
+      "WHEN typeof(NEW.retention_policy_version)!='integer' OR NEW.retention_policy_version NOT IN(0,1) "
+      "OR NEW.local_retention_state IS NOT 'retained' BEGIN SELECT RAISE(ABORT,'unsupported candidate retention policy'); END;"
+      "DROP TRIGGER IF EXISTS candidate_retention_v1_update;"
+      "CREATE TRIGGER candidate_retention_v1_update BEFORE UPDATE OF retention_policy_version,local_retention_state ON p0_candidates "
+      "WHEN NEW.retention_policy_version IS NOT OLD.retention_policy_version OR "
+      "NEW.local_retention_state IS NULL OR NEW.local_retention_state NOT IN('retained','retirement_eligible') "
+      "OR (NEW.local_retention_state='retirement_eligible' AND NEW.retention_policy_version!=1) "
+      "BEGIN SELECT RAISE(ABORT,'unsupported candidate retention transition'); END;") != 0) goto failed;
+  if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_policy_version=0 OR retention_value_class=0;",
+      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) goto failed;
+  uint64_t legacy = (uint64_t)sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st); st = NULL;
+  if (edr_context_store_install_retention_guards(&s_context_store)!=0) { set_error(s_context_store.error); goto failed; }
+  if (exec_sql("COMMIT;") != 0) goto failed;
+  s_status.retention_legacy_candidates = legacy;
+  return 0;
+failed:
+  sqlite3_finalize(st);
+  (void)exec_sql("ROLLBACK;");
+  set_error("candidate retention metadata unavailable or unsupported; evidence preserved");
+  return -1;
 }
 
 /* `process_cache` keeps only the most recent known generation for a PID, but
@@ -2779,7 +2880,180 @@ static uint64_t sqlite_capacity_live_target(void) {
   return limit - headroom;
 }
 
+static int sqlite_physical_write_allow(uint64_t payload_bytes) {
+  EdrStoragePhysicalSnapshot snapshot={0};
+  int overflow=payload_bytes>(UINT64_MAX-8u*1024u*1024u)/3u;
+  int rc=overflow ? -2 : edr_storage_physical_admit(s_status.path,payload_bytes*3u+8u*1024u*1024u,0,&snapshot);
+  if(rc) {
+    set_error(overflow ? "physical_size_overflow" : snapshot.cause);
+    ++s_status.db_budget_dropped;
+    if(rc==-1) ++s_status.physical_refusals; else ++s_status.physical_guard_failures;
+    s_status.physical_cause_code=overflow ? 3u : rc==-1 ? 1u : 2u;
+    return 0;
+  }
+  return 1;
+}
+
+
+/* SQLite page accounting includes logical pages still present only in WAL.
+ * A delete can dirty any existing index/overflow page, and a checkpoint can
+ * extend the DB while its WAL must remain. Use a whole existing-page copy
+ * plus the bounded slice envelope, then the common WAL/temp multiplier.
+ * This deliberately may hold maintenance near the physical floor. */
+static int sqlite_database_page_bytes(uint64_t *bytes, uint64_t *page_size) {
+  sqlite3_stmt *st=NULL;
+  int ok=sqlite3_prepare_v2(s_db,"SELECT page_count,page_size FROM pragma_page_count,pragma_page_size;",-1,&st,NULL)==SQLITE_OK &&
+      sqlite3_step(st)==SQLITE_ROW;
+  sqlite3_int64 pages=ok ? sqlite3_column_int64(st,0) : -1;
+  sqlite3_int64 size=ok ? sqlite3_column_int64(st,1) : -1;
+  sqlite3_finalize(st);
+  if(pages<0 || size<=0 || (uint64_t)pages>UINT64_MAX/(uint64_t)size) {
+    set_error("physical maintenance page accounting unavailable");
+    ++s_status.physical_guard_failures; s_status.physical_cause_code=2u;
+    return 0;
+  }
+  *bytes=(uint64_t)pages*(uint64_t)size;
+  if(page_size) *page_size=(uint64_t)size;
+  return 1;
+}
+
+static int sqlite_database_write_allow(uint64_t work_bytes) {
+  uint64_t current=0;
+  if(!sqlite_database_page_bytes(&current,NULL)) return 0;
+  return sqlite_physical_write_allow(current>UINT64_MAX-work_bytes ? UINT64_MAX : current+work_bytes);
+}
+
+static uint64_t s_evidence_wal_page_size;
+/* Preserve the normal 1000-page passive checkpoint cadence, but guard the
+ * actual accumulated WAL. A long reader can leave far more than 1000 pages;
+ * a fixed per-event allowance cannot authorize copying that entire backlog.
+ * This callback runs after commit: refusal must never report a false failed
+ * commit, and the already committed WAL remains the durable owner. */
+static int sqlite_guarded_autocheckpoint(void *unused, sqlite3 *db, const char *name, int pages) {
+  (void)unused;
+  if (pages < 1000) return SQLITE_OK;
+  uint64_t frame=s_evidence_wal_page_size+24u;
+  if (!frame || (uint64_t)pages>(UINT64_MAX-32u)/frame ||
+      !sqlite_physical_write_allow((uint64_t)pages*frame+32u)) return SQLITE_OK;
+  int rc=sqlite3_wal_checkpoint_v2(db,name,SQLITE_CHECKPOINT_PASSIVE,NULL,NULL);
+  if(rc!=SQLITE_OK) set_error("automatic evidence checkpoint deferred; committed WAL retained");
+  return SQLITE_OK;
+}
+
+/* Cost manifest for the actual CREATE INDEX declarations in this owner and
+ * evidence_context_store.c. The source contract test compares both sets.
+ * Kind 0 always applies, 1 is the legacy context layout, 2 is compact. */
+static const struct { const char *name, *table; unsigned layout; } startup_index_cost_manifest[] = {
+    {"idx_command_fact_retirement", "artifacts", 0},
+    {"idx_candidates_retention", "p0_candidates", 0},
+    {"idx_candidates_query_scope_time", "p0_candidates", 0},
+    {"idx_candidates_retention_value", "p0_candidates", 0},
+    {"idx_candidates_subject_command", "p0_candidates", 0},
+    {"idx_candidates_parent_command", "p0_candidates", 0},
+    {"idx_candidates_retention_generation", "p0_candidates", 0},
+    {"idx_artifacts_candidate_owner", "artifacts", 0},
+    {"idx_candidates_retention_unknown_generation", "p0_candidates", 0},
+    {"idx_artifacts_pmfe_retention", "artifacts", 0},
+    {"idx_process_cache_parent", "process_cache", 0},
+    {"idx_event_cache_ep_time", "event_cache", 0},
+    {"idx_event_cache_pid_time", "event_cache", 0},
+    {"idx_p0_candidates_ep_time", "p0_candidates", 0},
+    {"idx_p0_candidates_pid_time", "p0_candidates", 0},
+    {"idx_artifacts_ep_time", "artifacts", 0},
+    {"idx_artifacts_pmfe_state_created", "artifacts", 0},
+    {"idx_file_evidence_sha", "file_evidence", 0},
+    {"idx_process_cache_retention", "process_cache", 0},
+    {"idx_file_evidence_retention", "file_evidence", 0},
+    {"idx_network_ioc_retention", "network_ioc", 0},
+    {"idx_registry_evidence_retention", "registry_evidence", 0},
+    {"idx_command_results_retention", "command_results", 0},
+    {"idx_artifacts_pmfe_terminal_retention", "artifacts", 0},
+    {"idx_context_facts_ep_time", "context_facts", 1},
+    {"idx_candidate_context_refs_candidate", "candidate_context_refs", 1},
+    {"idx_candidate_context_refs_fact", "candidate_context_refs", 1},
+    {"idx_compact_context_candidate_time", "compact_context_refs", 2},
+    {"idx_compact_context_fact", "compact_context_refs", 2},
+    {"idx_compact_context_time", "compact_context_refs", 2},
+};
+
+static int sqlite_startup_probe_cancel(void *deadline) {
+  return evidence_cache_clock_ns() >= *(const uint64_t *)deadline;
+}
+
+static int sqlite_table_index_inventory(const char *table, uint64_t *bytes) {
+  sqlite3_stmt *st=NULL; char *query=NULL, *next=NULL; unsigned columns=0;
+  char *pragma=sqlite3_mprintf("PRAGMA table_info(\"%w\");",table);
+  if(!pragma || sqlite3_prepare_v2(s_db,pragma,-1,&st,NULL)!=SQLITE_OK) {sqlite3_free(pragma);return 0;}
+  sqlite3_free(pragma);
+  query=sqlite3_mprintf("SELECT COALESCE(SUM(128");
+  if(!query) goto failed;
+  int rc;
+  while((rc=sqlite3_step(st))==SQLITE_ROW) {
+    const char *column=(const char *)sqlite3_column_text(st,1);
+    if(!column) goto failed;
+    next=sqlite3_mprintf("%s+16+COALESCE(length(CAST(\"%w\" AS BLOB)),0)",query,column);
+    sqlite3_free(query);query=next;next=NULL;
+    if(!query) goto failed;
+    ++columns;
+  }
+  sqlite3_finalize(st);st=NULL;
+  if(rc!=SQLITE_DONE) goto failed;
+  if(!columns) {*bytes=0;sqlite3_free(query);return 1;}
+  next=sqlite3_mprintf("%s),0) FROM \"%w\";",query,table);
+  sqlite3_free(query);query=next;next=NULL;
+  if(!query || sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW ||
+      sqlite3_column_type(st,0)!=SQLITE_INTEGER || sqlite3_column_int64(st,0)<0) goto failed;
+  *bytes=(uint64_t)sqlite3_column_int64(st,0);
+  sqlite3_finalize(st);sqlite3_free(query);return 1;
+failed:
+  sqlite3_finalize(st);sqlite3_free(query);return 0;
+}
+
+static int sqlite_startup_schema_write_allow(void) {
+  sqlite3_stmt *st=NULL; uint64_t current=0,growth=0;
+  uint64_t inventory[sizeof(startup_index_cost_manifest)/sizeof(startup_index_cost_manifest[0])]={0};
+  unsigned char measured[sizeof(startup_index_cost_manifest)/sizeof(startup_index_cost_manifest[0])]={0};
+  if(!sqlite_database_page_bytes(&current,NULL)) return 0;
+  growth=current;
+  uint64_t deadline=evidence_cache_clock_ns()+10000000000ULL;
+  sqlite3_progress_handler(s_db,10000,sqlite_startup_probe_cancel,&deadline);
+  for(unsigned i=0;i<sizeof(startup_index_cost_manifest)/sizeof(startup_index_cost_manifest[0]);++i) {
+    unsigned layout=startup_index_cost_manifest[i].layout;
+    if((layout==1u && s_context_store.format) || (layout==2u && !s_context_store.format)) continue;
+    if(sqlite3_prepare_v2(s_db,"SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1;",-1,&st,NULL)!=SQLITE_OK ||
+        sqlite3_bind_text(st,1,startup_index_cost_manifest[i].name,-1,SQLITE_STATIC)!=SQLITE_OK) goto failed;
+    int rc=sqlite3_step(st);
+    sqlite3_finalize(st);st=NULL;
+    if(rc==SQLITE_ROW) continue;
+    if(rc!=SQLITE_DONE) goto failed;
+    unsigned owner=i;
+    for(unsigned j=0;j<i;++j) if(measured[j] && !strcmp(startup_index_cost_manifest[j].table,startup_index_cost_manifest[i].table)) {owner=j;break;}
+    if(!measured[owner]) {
+      if(!sqlite_table_index_inventory(startup_index_cost_manifest[i].table,&inventory[owner])) goto failed;
+      measured[owner]=1;
+    }
+    /* Twice the entire source row inventory, including 128 bytes/row and
+     * 16/column serialization allowance, covers a sparse B-tree index whose
+     * keys are a subset of those rows. Do not charge unrelated blob tables. */
+    if(inventory[owner]>(UINT64_MAX-growth)/2u) goto overflow;
+    growth+=inventory[owner]*2u;
+  }
+  sqlite3_progress_handler(s_db,0,NULL,NULL);
+  if(growth>UINT64_MAX-EDR_EVIDENCE_MANIFEST_MAX_BYTES) return sqlite_physical_write_allow(UINT64_MAX);
+  return sqlite_physical_write_allow(growth+EDR_EVIDENCE_MANIFEST_MAX_BYTES);
+overflow:
+  sqlite3_progress_handler(s_db,0,NULL,NULL);
+  return sqlite_physical_write_allow(UINT64_MAX);
+failed:
+  sqlite3_finalize(st);sqlite3_progress_handler(s_db,0,NULL,NULL);
+  set_error("physical startup index accounting failed or exceeded 10s; existing cache preserved");
+  ++s_status.physical_guard_failures; s_status.physical_cause_code=2u; return 0;
+}
+
+static int sqlite_maintenance_checkpoint(int mode);
+
 static int sqlite_size_budget_allow(void) {
+  if (!sqlite_physical_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return 0;
   if (!db_size_over_limit()) {
     s_last_capacity_failure_ns = 0u;
     return 1;
@@ -2790,6 +3064,7 @@ static int sqlite_size_budget_allow(void) {
    * cap. An active reader can prevent reset; physical admission still wins. */
   uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
   if (s_status.db_bytes < limit) {
+    if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return 0;
     int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
                                       NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -2813,6 +3088,7 @@ static int sqlite_size_budget_allow(void) {
     s_last_maintenance_ns = now;
     int maintenance_result = sqlite_maintenance(0);
     if (!db_size_over_limit()) {
+      s_maintenance_reclaim_pages = 0u;
       s_last_capacity_failure_ns = 0u;
       return 1;
     }
@@ -3100,6 +3376,7 @@ static int upsert_process_sqlite(const EdrBehaviorRecord *r) {
      * restarted lifetime in SQLite. */
     return 0;
   }
+  if (!sqlite_physical_write_allow(sizeof(*r))) return -1;
   parent_known = record_parent_snapshot(r, &parent_snapshot);
   command_record_provenance(r, command_fields);
   memset(&parent_generation, 0, sizeof(parent_generation));
@@ -3674,7 +3951,8 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   cJSON *root = NULL;
   cJSON *context = NULL;
   EvidenceProcessGeneration generation;
-  int generation_known;
+  ProcessTreeEntry parent_snapshot;
+  int generation_known, parent_known;
   const char *generation_source;
   int ok;
   int rc = -1;
@@ -3684,6 +3962,7 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
+  parent_known = record_parent_snapshot(r, &parent_snapshot);
   s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
   root = manifest_create_object();
   if (!root) {
@@ -3703,6 +3982,13 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
        manifest_add_text(root, "endpoint_id", r->endpoint_id) &&
        manifest_add_i64(root, "event_time_ns", record_time_ns(r)) &&
        manifest_add_u64(root, "pid", r->pid) &&
+       manifest_add_u64(root, "ppid", r->ppid) &&
+       manifest_add_u64(root, "parent_pid_state", edr_parent_pid_effective_state(r->ppid, r->parent_pid_state)) &&
+       manifest_add_u64_text(root, "parent_process_start_key", parent_known ? parent_snapshot.process_start_key : 0u) &&
+       manifest_add_u64_text(root, "parent_creation_filetime_100ns", parent_known ? parent_snapshot.creation_filetime_100ns : 0u) &&
+       manifest_add_text(root, "parent_process_generation_source", parent_known ? record_parent_generation_source(r) : "") &&
+       manifest_add_text(root, "parent_process_name", parent_known ? parent_snapshot.process_name : "") &&
+       manifest_add_text(root, "parent_exe_path", parent_known ? parent_snapshot.exe_path : "") &&
        manifest_add_u64_text(root, "process_start_key",
                              generation_known ? generation.process_start_key : 0u) &&
        manifest_add_u64_text(root, "process_creation_filetime_100ns",
@@ -3781,7 +4067,9 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
                                                      char **out) {
   cJSON *root = NULL;
   EvidenceProcessGeneration generation;
+  ProcessTreeEntry parent_snapshot;
   int generation_known;
+  int parent_generation_known;
   const char *generation_source;
   int ok;
   int rc = -1;
@@ -3790,6 +4078,7 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
     return -1;
   }
   generation_known = record_process_generation(r, &generation);
+  parent_generation_known = record_parent_snapshot(r, &parent_snapshot);
   generation_source = generation_known ? record_process_generation_source(r) : "";
   s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
   root = manifest_create_object();
@@ -3812,6 +4101,14 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
        manifest_add_u64_text(root, "process_creation_filetime_100ns",
                              generation_known ? generation.creation_filetime_100ns : 0u) &&
        manifest_add_text(root, "process_generation_source", generation_source) &&
+       manifest_add_u64_text(root, "parent_process_start_key",
+                             parent_generation_known ? parent_snapshot.process_start_key : 0u) &&
+       manifest_add_u64_text(root, "parent_creation_filetime_100ns",
+                             parent_generation_known ? parent_snapshot.creation_filetime_100ns : 0u) &&
+       manifest_add_text(root, "parent_process_generation_source",
+                          parent_generation_known ? record_parent_generation_source(r) : "") &&
+       manifest_add_text(root, "parent_process_name", parent_generation_known ? parent_snapshot.process_name : "") &&
+       manifest_add_text(root, "parent_exe_path", parent_generation_known ? parent_snapshot.exe_path : "") &&
        manifest_add_text(root, "source_completeness", r->source_completeness) &&
        manifest_add_text(root, "source_truncated_fields", r->source_truncated_fields) &&
        manifest_add_text(root, "process_name", r->process_name) &&
@@ -3935,6 +4232,7 @@ static int insert_artifact_sqlite(const EdrBehaviorRecord *r, const char *candid
     return -1;
   }
   s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
+  if (!sqlite_physical_write_allow(manifest_json ? strlen(manifest_json) : 0u)) return -1;
   const char *sql =
       "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,"
       "sha256,manifest_json,created_ns,upload_status,minio_key) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
@@ -4120,6 +4418,52 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
       exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
+  /* Admission can run maintenance after the fanout was prepared. A retired
+   * candidate may therefore still be named by this call's saved RAM IDs even
+   * though maintenance cleared its window. Recheck every changed target in
+   * the write transaction before inserting either a shared fact or any ref.
+   * An old retained candidate is still a valid owner; this does not promote
+   * its retention policy. Reject the complete fanout if any owner is missing. */
+  sqlite3_stmt *owner = NULL;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT 1 FROM p0_candidates WHERE candidate_id=?1 "
+      "AND local_retention_state='retained' AND endpoint_id=?2 AND tenant_id=?3;",
+      -1, &owner, NULL) != SQLITE_OK) {
+    set_error("prepare context retained-owner validation failed");
+    sqlite_rollback_silent();
+    return -1;
+  }
+  for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
+    const PreparedContextRef *ref = &prepared->refs[i];
+    if (ref->candidate_index >= EDR_EVIDENCE_CONTEXT_WINDOWS ||
+        !candidate_ids[ref->candidate_index][0]) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+      set_error("context retained-owner identity unavailable; fanout rejected");
+      sqlite3_finalize(owner);
+      sqlite_rollback_silent();
+      return -1;
+    }
+    int rc = sqlite3_bind_text(owner, 1, candidate_ids[ref->candidate_index], -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(owner, 2, r->endpoint_id, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(owner, 3, r->tenant_id, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(owner);
+    if (rc != SQLITE_ROW) {
+      if (rc == SQLITE_DONE) {
+        s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+        set_error("context candidate retired or scope changed; fanout rejected");
+      } else set_error("read context retained-owner validation failed");
+      sqlite3_finalize(owner);
+      sqlite_rollback_silent();
+      return -1;
+    }
+    if (sqlite3_reset(owner) != SQLITE_OK || sqlite3_clear_bindings(owner) != SQLITE_OK) {
+      set_error("reset context retained-owner validation failed");
+      sqlite3_finalize(owner);
+      sqlite_rollback_silent();
+      return -1;
+    }
+  }
+  sqlite3_finalize(owner);
   written_ns = (sqlite3_int64)now_unix_ns();
   if (prepared->fact_insert) {
     static const char fact_sql[] =
@@ -4459,11 +4803,40 @@ static int sqlite_candidate_exists(const char *candidate_id) {
   return exists;
 }
 
+static int command_fact_key(const EdrBehaviorRecord *r, char key[80]);
+
+/* This is a bounded investigation preference, never an irreversible pin.
+ * Ordinary low-severity ancestors/context remain in the selected group. */
+static int candidate_value_class(const EdrBehaviorRecord *r, uint32_t pre_count,
+                                 int generation_known, const char **reason) {
+  if (r->type == EDR_EVENT_PROTOCOL_SHELLCODE || r->type == EDR_EVENT_WEBSHELL_DETECTED ||
+      r->type == EDR_EVENT_PMFE_SCAN_RESULT || r->type == EDR_EVENT_BEHAVIOR_ONNX_ALERT) {
+    *reason = "detector_evidence"; return 2;
+  }
+  if (generation_known && pre_count) { *reason = "causal_context"; return 2; }
+  *reason = "recent_detail"; return 1;
+}
+
+static int candidate_command_reference(const EdrBehaviorRecord *r, char key[80]) {
+  sqlite3_stmt *st = NULL;
+  key[0] = 0;
+  if (!command_fact_key(r, key)) return 0;
+  if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM artifacts WHERE artifact_id=? AND "
+      "endpoint_id=? AND tenant_id=? AND artifact_type='process_command_line' "
+      "AND upload_status='embedded';", -1, &st, NULL) != SQLITE_OK) return -1;
+  bind_text(st, 1, key); bind_text(st, 2, r->endpoint_id); bind_text(st, 3, r->tenant_id);
+  int step = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (step == SQLITE_DONE) key[0] = 0;
+  return step == SQLITE_ROW || step == SQLITE_DONE ? 0 : -1;
+}
+
 static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candidate_id,
                                    uint32_t pre_count, int64_t post_until_ns) {
   EvidenceProcessGeneration generation;
   int generation_known;
-  const char *generation_source;
+  const char *generation_source, *value_reason;
+  char subject_command[80] = "", parent_command[80] = "";
   char normalized_command[EDR_BR_STR_LONG];
   char script_path[EDR_BR_STR_LONG];
   int normalized_command_truncated;
@@ -4473,6 +4846,7 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   }
   generation_known = record_process_generation(r, &generation);
   generation_source = generation_known ? record_process_generation_source(r) : "";
+  int value_class = candidate_value_class(r, pre_count, generation_known, &value_reason);
   normalized_command_truncated = edr_p0_normalize_command_for_evidence(
       r->cmdline, normalized_command, sizeof(normalized_command));
   (void)edr_p0_extract_script_path(r->cmdline, script_path,
@@ -4489,14 +4863,25 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
     sqlite_rollback_silent();
     return -1;
   }
+  EdrBehaviorRecord *parent_identity = (EdrBehaviorRecord *)calloc(1, sizeof(*parent_identity));
+  if (!parent_identity) { sqlite_rollback_silent(); set_error("command dependency allocation failed"); return -1; }
+  copy_s(parent_identity->tenant_id, sizeof(parent_identity->tenant_id), r->tenant_id);
+  copy_s(parent_identity->endpoint_id, sizeof(parent_identity->endpoint_id), r->endpoint_id);
+  parent_identity->pid = r->ppid;
+  parent_identity->process_start_key = r->parent_process_start_key;
+  parent_identity->process_creation_filetime_100ns = r->parent_process_creation_filetime_100ns;
+  int dependency_rc = candidate_command_reference(r, subject_command);
+  if (!dependency_rc && record_parent_context_proven(r)) dependency_rc = candidate_command_reference(parent_identity, parent_command);
+  free(parent_identity);
+  if (dependency_rc) { sqlite_rollback_silent(); set_error("command dependency lookup failed"); return -1; }
   const char *sql =
       "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,type,pid,ppid,"
       "process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,reg_key_path,"
       "reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns,"
       "process_start_key,process_creation_filetime_100ns,process_generation_source,"
       "source_completeness,source_truncated_fields,normalized_command,normalized_command_truncated,script_path,exe_hash,"
-      "username,user_sid,identity_source,identity_quality) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "username,user_sid,identity_source,identity_quality,retention_policy_version,retention_value_class,retention_value_reason,subject_command_fact_id,parent_command_fact_id) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?) "
       "ON CONFLICT(candidate_id) DO UPDATE SET "
       "tenant_id=CASE WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE p0_candidates.tenant_id END,"
       "event_time_ns=CASE WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
@@ -4545,7 +4930,11 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE p0_candidates.username END,"
       "user_sid=CASE WHEN excluded.user_sid<>'' THEN excluded.user_sid ELSE p0_candidates.user_sid END,"
       "identity_source=CASE WHEN excluded.identity_source<>'' THEN excluded.identity_source ELSE p0_candidates.identity_source END,"
-      "identity_quality=CASE WHEN excluded.identity_quality<>'' THEN excluded.identity_quality ELSE p0_candidates.identity_quality END;";
+      "identity_quality=CASE WHEN excluded.identity_quality<>'' THEN excluded.identity_quality ELSE p0_candidates.identity_quality END,"
+      "retention_value_reason=CASE WHEN p0_candidates.retention_policy_version=1 AND p0_candidates.retention_value_class=1 AND excluded.retention_value_class=2 THEN excluded.retention_value_reason ELSE p0_candidates.retention_value_reason END,"
+      "retention_value_class=CASE WHEN p0_candidates.retention_policy_version=1 AND p0_candidates.retention_value_class=1 THEN MAX(p0_candidates.retention_value_class,excluded.retention_value_class) ELSE p0_candidates.retention_value_class END,"
+      "subject_command_fact_id=CASE WHEN excluded.subject_command_fact_id<>'' THEN excluded.subject_command_fact_id ELSE p0_candidates.subject_command_fact_id END,"
+      "parent_command_fact_id=CASE WHEN excluded.parent_command_fact_id<>'' THEN excluded.parent_command_fact_id ELSE p0_candidates.parent_command_fact_id END;";
   sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare p0_candidates failed");
@@ -4591,6 +4980,10 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   bind_text(st, 32, r->user_sid);
   bind_text(st, 33, r->identity_source);
   bind_text(st, 34, r->identity_quality);
+  sqlite3_bind_int(st, 35, value_class);
+  bind_text(st, 36, value_reason);
+  bind_text(st, 37, subject_command);
+  bind_text(st, 38, parent_command);
   if (sqlite3_step(st) != SQLITE_DONE) {
     set_error("insert p0_candidates failed");
     sqlite3_finalize(st);
@@ -4626,7 +5019,9 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
 /* The cache mutex serializes producers with this bounded batch. Watermarks
  * describe only successfully committed counts from this process, so reopening
  * in the same minute adds new observations without replacing earlier totals. */
-static int sqlite_flush_metrics(int final_attempt) {
+static int sqlite_flush_metrics_slice(int final_attempt, EvidenceMaintenanceSlice *slice) {
+  unsigned char written[EDR_EVIDENCE_METRIC_SLOTS][METRIC_COUNT]={{0}};
+  unsigned written_rows=0;
   int pending = 0, began = 0, rc;
   sqlite3_stmt *st = NULL;
   uint64_t now = edr_monotonic_ns();
@@ -4642,6 +5037,7 @@ static int sqlite_flush_metrics(int final_attempt) {
     if (metric_slot_pending(m)) pending = 1;
   }
   if (!pending) return 0;
+  if (!sqlite_physical_write_allow(sizeof(s_metrics))) goto failed;
   if (!final_attempt && now < s_metric_retry_after_ns) return -1;
   if (!s_db) { set_error("metrics flush has no database"); goto failed; }
   if (!sqlite3_get_autocommit(s_db)) {
@@ -4664,6 +5060,8 @@ static int sqlite_flush_metrics(int final_attempt) {
     for (size_t j = 0; m->minute_unix != 0 && j < METRIC_COUNT; ++j) {
       uint64_t delta = metric_slot_value(m, j) - m->committed[j];
       if (!delta) continue;
+      if (slice && (written_rows>=128u || !sqlite_maintenance_charge(slice,1,
+              strlen(m->endpoint_id)+strlen(metric_names[j])+32u))) goto commit_metrics;
       if (delta > (uint64_t)INT64_MAX ||
           sqlite3_bind_int64(st, 1, m->minute_unix) != SQLITE_OK ||
           sqlite3_bind_text(st, 2, m->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
@@ -4677,8 +5075,10 @@ static int sqlite_flush_metrics(int final_attempt) {
       if (sqlite3_reset(st) != SQLITE_OK || sqlite3_clear_bindings(st) != SQLITE_OK) {
         set_error("metrics statement reset failed"); goto failed;
       }
+      written[i][j]=1; ++written_rows;
     }
   }
+commit_metrics:
   sqlite3_finalize(st);
   st = NULL;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
@@ -4693,7 +5093,7 @@ static int sqlite_flush_metrics(int final_attempt) {
   }
   for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
     MetricSlot *m = &s_metrics[i];
-    for (size_t j = 0; j < METRIC_COUNT; ++j) m->committed[j] = metric_slot_value(m, j);
+    for (size_t j = 0; j < METRIC_COUNT; ++j) if(written[i][j]) m->committed[j] = metric_slot_value(m, j);
   }
   s_metric_retry_after_ns = 0u;
   return 0;
@@ -4708,6 +5108,12 @@ failed:
   s_metric_retry_after_ns = now > UINT64_MAX - 60000000000ULL
                                ? UINT64_MAX : now + 60000000000ULL;
   return -1;
+}
+
+static int sqlite_flush_metrics(int final_attempt) {
+  EvidenceMaintenanceSlice slice={evidence_cache_clock_ns()+20000000ULL,
+      4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
+  return sqlite_flush_metrics_slice(final_attempt,final_attempt ? NULL : &slice);
 }
 
 /* DELETE changes live pages, not the allocated file length. Use live pages
@@ -4731,27 +5137,6 @@ static int sqlite_live_size_over_limit(uint64_t limit) {
   return over;
 }
 
-static int sqlite_collect_context_facts(void) {
-  unsigned removed = 0;
-  int rc = edr_context_store_collect_facts(&s_context_store, &removed);
-  /* A later dictionary cleanup can fail after the fact DELETE committed. */
-  s_status.db_retention_evicted += removed;
-  if (rc != 0) {
-    set_error(s_context_store.error);
-    return -1;
-  }
-  return 0;
-}
-
-static int sqlite_evict_context_refs(int orphans, unsigned limit, unsigned *facts_removed) {
-  unsigned removed = 0;
-  if (edr_context_store_evict(&s_context_store, orphans, limit, &removed, facts_removed) != 0) {
-    set_error(s_context_store.error);
-    return -1;
-  }
-  return (int)removed;
-}
-
 static int sqlite_maintenance_error(const char *stage, int rc) {
   char error[sizeof(s_status.last_error)];
   snprintf(error, sizeof(error), "maintenance %s: sqlite=%d/%d %s", stage,
@@ -4760,29 +5145,290 @@ static int sqlite_maintenance_error(const char *stage, int rc) {
   return -1;
 }
 
-static int sqlite_maintenance_delete(const char *query, const char *stage,
-                                    const sqlite3_int64 *cutoff, uint64_t *counter) {
-  sqlite3_stmt *st = NULL;
-  int rc = sqlite3_prepare_v2(s_db, query, -1, &st, NULL);
-  if (rc == SQLITE_OK && cutoff) rc = sqlite3_bind_int64(st, 1, *cutoff);
-  if (rc == SQLITE_OK) rc = sqlite3_step(st);
-  if (rc != SQLITE_DONE) sqlite_maintenance_error(stage, rc);
-  else *counter += (uint64_t)sqlite3_changes(s_db);
-  sqlite3_finalize(st);
-  return rc == SQLITE_DONE ? 0 : -1;
+/* One maintenance turn shares time, row and literal-byte work budgets across
+ * all tables. These are cooperative work bounds, not a hard SQLite I/O limit. */
+static int sqlite_maintenance_yield(const EvidenceMaintenanceSlice *slice) {
+  return !slice->rows_left || !slice->bytes_left || evidence_cache_clock_ns() >= slice->deadline_ns;
+}
+static int sqlite_maintenance_charge(EvidenceMaintenanceSlice *slice, unsigned rows, uint64_t bytes) {
+  if (sqlite_maintenance_yield(slice) || rows > slice->rows_left || bytes > slice->bytes_left) {
+    slice->rows_left = 0; slice->bytes_left = 0; return 0;
+  }
+  slice->rows_left -= rows; slice->bytes_left -= bytes; return 1;
+}
+
+/* Reconstructible indexes and optional query copies have no delivery owner.
+ * Only fixed internal identifiers enter this SQL; values remain bound. Read
+ * lengths, not large payloads, then delete a bounded transaction of rowids. */
+static int sqlite_maintenance_delete(const char *table, const char *clock_column,
+    const char *condition, const char *byte_expression, sqlite3_int64 cutoff,
+    EvidenceMaintenanceSlice *slice) {
+  sqlite3_stmt *st=NULL, *del=NULL;
+  sqlite3_int64 ids[128]; unsigned count=0, removed=0;
+  char sql[2048]; int step=SQLITE_DONE, began=0;
+  if (sqlite_maintenance_yield(slice)) return 0;
+  if (!sqlite_database_write_allow(slice->bytes_left)) return -1;
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) goto failed;
+  began=1;
+  int length=snprintf(sql,sizeof(sql),"SELECT rowid,64+(%s) FROM %s WHERE %s<?1 AND (%s) ORDER BY %s,rowid LIMIT 128;",
+      byte_expression,table,clock_column,condition,clock_column);
+  if(length<0 || (size_t)length>=sizeof(sql)) { set_error("maintenance statement exceeds fixed buffer"); goto failed; }
+  if (sqlite3_prepare_v2(s_db,sql,-1,&st,NULL)!=SQLITE_OK || sqlite3_bind_int64(st,1,cutoff)!=SQLITE_OK) goto failed;
+  while (!sqlite_maintenance_yield(slice) && (step=sqlite3_step(st))==SQLITE_ROW) {
+    sqlite3_int64 bytes=sqlite3_column_int64(st,1);
+    if (bytes<0) goto failed;
+    /* Account selection plus deletion before accepting a row. An oversized
+     * legacy copy stays present and exhausts this slice, never half-deletes. */
+    if (!sqlite_maintenance_charge(slice,2,(uint64_t)bytes)) break;
+    ids[count++]=sqlite3_column_int64(st,0);
+  }
+  if (step!=SQLITE_DONE && step!=SQLITE_ROW) goto failed;
+  sqlite3_finalize(st); st=NULL;
+  snprintf(sql,sizeof(sql),"DELETE FROM %s WHERE rowid=?1 AND %s<?2 AND (%s);",table,clock_column,condition);
+  if (sqlite3_prepare_v2(s_db,sql,-1,&del,NULL)!=SQLITE_OK) goto failed;
+  for (unsigned i=0;i<count && evidence_cache_clock_ns()<slice->deadline_ns;++i) {
+    if (sqlite3_bind_int64(del,1,ids[i])!=SQLITE_OK || sqlite3_bind_int64(del,2,cutoff)!=SQLITE_OK ||
+        sqlite3_step(del)!=SQLITE_DONE) goto failed;
+    removed+=(unsigned)sqlite3_changes(s_db);
+    if (sqlite3_reset(del)!=SQLITE_OK) goto failed;
+  }
+  sqlite3_finalize(del); del=NULL;
+  if (exec_sql("COMMIT;")!=0) goto failed;
+  s_status.db_retention_evicted+=removed;
+  return 0;
+failed:
+  sqlite_maintenance_error(table,sqlite3_errcode(s_db));
+  sqlite3_finalize(st); sqlite3_finalize(del);
+  if(began) sqlite_rollback_silent();
+  return -1;
 }
 
 static int sqlite_maintenance_checkpoint(int mode) {
+  if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return -1;
   int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, mode, NULL, NULL);
   return rc == SQLITE_OK ? 0 : sqlite_maintenance_error("checkpoint", rc);
 }
 
 static int sqlite_maintenance_reclaim(unsigned pages) {
   char sql[64];
+  uint64_t bytes=0, page_size=0;
+  if (!sqlite_database_page_bytes(&bytes,&page_size) ||
+      !sqlite_database_write_allow((uint64_t)pages*page_size)) return -1;
   snprintf(sql, sizeof(sql), "PRAGMA incremental_vacuum(%u);", pages);
   if (exec_sql(sql) != 0)
     return sqlite_maintenance_error("incremental vacuum", sqlite3_errcode(s_db));
   return sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE);
+}
+
+static int sqlite_retention_protect_pmfe_locked(EvidenceMaintenanceSlice *slice);
+static int context_window_nominally_ended(const ContextWindowSlot *w,
+                                         int64_t event_time_ns, uint64_t mono_ns);
+
+/* These six fixed aggregate rows are disposition evidence, not ACK receipts
+ * or per-record tombstones. Their size is bounded independently of traffic and
+ * they share the existing metrics table's physical budget. */
+static int sqlite_retention_record_locked(int pressure, uint64_t groups,
+                                          uint64_t rows, uint64_t bytes) {
+  static const char *const names[2][3] = {
+    {"local_retention_v1_expired_groups", "local_retention_v1_expired_rows", "local_retention_v1_expired_work_bytes"},
+    {"local_retention_v1_capacity_groups", "local_retention_v1_capacity_rows", "local_retention_v1_capacity_work_bytes"}
+  };
+  uint64_t values[] = {groups, rows, bytes};
+  sqlite3_stmt *st = NULL;
+  if (!groups) return 0;
+  if (sqlite3_prepare_v2(s_db,
+      "INSERT INTO metrics(minute_unix,endpoint_id,metric_name,value) VALUES(0,'',?,?) "
+      "ON CONFLICT(minute_unix,endpoint_id,metric_name) DO UPDATE SET value=metrics.value+excluded.value "
+      "WHERE typeof(metrics.value)='integer' AND metrics.value>=0 "
+      "AND metrics.value<=9223372036854775807-excluded.value;", -1, &st, NULL) != SQLITE_OK) goto failed;
+  for (unsigned i = 0; i < 3u; ++i) {
+    if (values[i] > INT64_MAX || sqlite3_bind_text(st, 1, names[pressure != 0][i], -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 2, (sqlite3_int64)values[i]) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1 ||
+        sqlite3_reset(st) != SQLITE_OK || sqlite3_clear_bindings(st) != SQLITE_OK) goto failed;
+  }
+  sqlite3_finalize(st); return 0;
+failed:
+  sqlite3_finalize(st);
+  set_error("local retirement disposition write failed or counter overflowed; group preserved");
+  return -1;
+}
+
+/* Cooperative wall-time bound. SQLite I/O and the current statement may
+ * overrun; the next boundary yields, and helper rollback preserves the group. */
+static int sqlite_retirement_yield(void *deadline) {
+  return evidence_cache_clock_ns() >= *(const uint64_t *)deadline;
+}
+
+/* A whole candidate and its causal context are the unit of retirement. Legacy
+ * rows, unknown owners and oversized groups stay present. A bounded number of
+ * groups is examined; shared facts are charged conservatively to the work
+ * budget even when another reference keeps them alive. */
+static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
+                                          unsigned *retired, EvidenceMaintenanceSlice *slice) {
+  enum { MAX_CANDIDATES = 1000, MAX_WORK_ROWS = 4096 };
+  char (*ids)[160] = NULL;
+  sqlite3_int64 times[MAX_CANDIDATES];
+  int classes[MAX_CANDIDATES];
+  unsigned char held_ids[MAX_CANDIDATES] = {0};
+  unsigned char eligible[MAX_CANDIDATES] = {0};
+  sqlite3_stmt *st = NULL;
+  unsigned count = 0u, processed = 0u, groups = 0u, held = 0u, work_rows = 0u;
+  uint64_t work_bytes = 0u, retired_work_bytes = 0u, removed_rows = 0u, byte_limit = 0u;
+  int rc = -1, began = 0, step;
+  int64_t now = now_unix_ns(); uint64_t mono = edr_monotonic_ns();
+  uint64_t deadline = slice->deadline_ns;
+  *retired = 0u;
+  if (sqlite_maintenance_yield(slice)) return 0;
+  if (!sqlite_database_write_allow(slice->bytes_left)) return -1;
+  ids = calloc(MAX_CANDIDATES, sizeof(*ids));
+  if (!ids) { set_error("local retirement selector allocation failed"); goto done; }
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) {
+    sqlite_maintenance_error("candidate retirement begin", sqlite3_errcode(s_db));
+    goto done;
+  }
+  began = 1;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT page_size FROM pragma_page_size;", -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int64(st, 0) <= 0) goto storage_failed;
+  uint64_t page_size = (uint64_t)sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st); st = NULL;
+  if (sqlite3_prepare_v2(s_db, "PRAGMA wal_autocheckpoint;", -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_step(st) != SQLITE_ROW) goto storage_failed;
+  sqlite3_int64 pages = sqlite3_column_int64(st, 0);
+  /* SQLite's default checkpoint is 1000 pages. A disabled checkpoint does not
+   * grant an unbounded reclamation transaction. The existing 1 MiB manifest
+   * envelope gives a second upper bound of four such envelopes per slice. */
+  uint64_t checkpoint_pages = pages > 0 && pages < 1000 ? (uint64_t)pages : 1000u;
+  byte_limit = page_size * checkpoint_pages;
+  if (byte_limit > 4u * EDR_EVIDENCE_MANIFEST_MAX_BYTES) byte_limit = 4u * EDR_EVIDENCE_MANIFEST_MAX_BYTES;
+  if (byte_limit > slice->bytes_left) byte_limit = slice->bytes_left;
+  sqlite3_finalize(st); st = NULL;
+  if (exec_sql("CREATE TEMP TABLE IF NOT EXISTS evidence_retention_protected(candidate_id TEXT PRIMARY KEY);"
+               "DELETE FROM evidence_retention_protected;") != 0) goto done;
+  if (sqlite3_prepare_v2(s_db,
+      "INSERT OR IGNORE INTO evidence_retention_protected(candidate_id) VALUES(?);", -1, &st, NULL) != SQLITE_OK) goto storage_failed;
+  for (unsigned i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; ++i) {
+    const ContextWindowSlot *w = &s_context_windows[i];
+    if (!w->pid || context_window_nominally_ended(w, now, mono)) continue;
+    if (!sqlite_maintenance_charge(slice,1,strlen(w->candidate_id)+32u)) { rc=0; goto done; }
+    if (sqlite3_bind_text(st, 1, w->candidate_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE || sqlite3_reset(st) != SQLITE_OK) goto storage_failed;
+  }
+  sqlite3_finalize(st); st = NULL;
+  int protection = sqlite_retention_protect_pmfe_locked(slice);
+  if (protection != 0) { if (protection > 0) rc=0; goto done; }
+  if (sqlite_maintenance_yield(slice)) { rc=0; goto done; }
+  if (byte_limit > slice->bytes_left) byte_limit=slice->bytes_left;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT candidate_id,event_time_ns,local_retention_state='retained' AND created_ns>0 "
+      "AND context_post_until_ns>0 AND context_post_until_ns<?1 "
+      "AND (?2=1 OR (event_time_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END "
+      "AND created_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END)) "
+      "AND retention_value_class IN(1,2) "
+      "AND NOT EXISTS(SELECT 1 FROM evidence_retention_protected x WHERE x.candidate_id=p.candidate_id),retention_value_class "
+      "FROM p0_candidates p WHERE retention_policy_version=1 AND event_time_ns>0 "
+      "AND (retention_value_class,event_time_ns,candidate_id)>(?6,?4,?5) "
+      "ORDER BY retention_value_class,event_time_ns,candidate_id LIMIT 1000;", -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 1, now) != SQLITE_OK || sqlite3_bind_int(st, 2, pressure != 0) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 3, cutoff) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 4, s_retirement_cursor[pressure != 0].time) != SQLITE_OK ||
+      sqlite3_bind_text(st, 5, s_retirement_cursor[pressure != 0].id, -1, SQLITE_STATIC) != SQLITE_OK ||
+      sqlite3_bind_int(st, 6, s_retirement_cursor[pressure != 0].value_class) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 7, now - (sqlite3_int64)s_status.selected_retention_hours * 3600LL * 1000000000LL) != SQLITE_OK) goto storage_failed;
+  /* An empty indexed seek may wrap once without increasing the 1000-row
+   * inspection budget. Late imports and a refilled cache can sort before the
+   * previous cursor; they must not require a minute-long poll to be visible. */
+  for (unsigned seek = 0; seek < 2u; ++seek) {
+    while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+      const char *id = (const char *)sqlite3_column_text(st, 0);
+      int n = sqlite3_column_bytes(st, 0);
+      if (!id || n <= 0 || n >= (int)sizeof(ids[0]) || strlen(id) != (size_t)n || count >= MAX_CANDIDATES) {
+        set_error("local retirement candidate identity unavailable; group preserved"); goto done;
+      }
+      if (!sqlite_maintenance_charge(slice,1,(uint64_t)n+32u)) break;
+      times[count] = sqlite3_column_int64(st, 1);
+      eligible[count] = sqlite3_column_int(st, 2) == 1;
+      classes[count] = sqlite3_column_int(st, 3);
+      memcpy(ids[count++], id, (size_t)n + 1u);
+    }
+    if (step != SQLITE_DONE && step != SQLITE_ROW) goto storage_failed;
+    if (count || sqlite_maintenance_yield(slice) || seek || !s_retirement_cursor[pressure != 0].time) break;
+    if (sqlite3_reset(st) != SQLITE_OK || sqlite3_bind_int64(st, 4, 0) != SQLITE_OK ||
+        sqlite3_bind_text(st, 5, "", -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_int(st, 6, 0) != SQLITE_OK) goto storage_failed;
+  }
+  sqlite3_finalize(st); st = NULL;
+  for (unsigned i = 0; i < count && work_rows < MAX_WORK_ROWS && work_bytes < byte_limit; ++i) {
+    if (sqlite_maintenance_yield(slice)) break;
+    EdrContextRetirement disposition;
+    processed = i + 1u;
+    if (!eligible[i] || work_rows == MAX_WORK_ROWS) {
+      held_ids[i] = 1; ++held;
+      continue;
+    }
+    if (sqlite3_prepare_v2(s_db,
+        "UPDATE p0_candidates SET local_retention_state='retirement_eligible' "
+        "WHERE candidate_id=? AND retention_policy_version=1 AND local_retention_state='retained';",
+        -1, &st, NULL) != SQLITE_OK || sqlite3_bind_text(st, 1, ids[i], -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) goto storage_failed;
+    sqlite3_finalize(st); st = NULL;
+    int decision = edr_context_store_retire_candidate(&s_context_store, ids[i],
+        slice->rows_left < MAX_WORK_ROWS-work_rows ? slice->rows_left : MAX_WORK_ROWS-work_rows,
+        slice->bytes_left < byte_limit-work_bytes ? slice->bytes_left : byte_limit-work_bytes,
+        sqlite_retirement_yield, &deadline, &disposition);
+    if (decision < 0) { set_error(s_context_store.error); goto done; }
+    work_rows += disposition.work_rows;
+    work_bytes += disposition.payload_bytes;
+    slice->rows_left -= disposition.work_rows;
+    slice->bytes_left -= disposition.payload_bytes;
+    if (decision > 0) {
+      ++held;
+      if (sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET local_retention_state='retained' WHERE candidate_id=?;",
+          -1, &st, NULL) != SQLITE_OK || sqlite3_bind_text(st, 1, ids[i], -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+          sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) goto storage_failed;
+      sqlite3_finalize(st); st = NULL;
+      held_ids[i] = 1;
+      continue;
+    }
+    retired_work_bytes += disposition.payload_bytes;
+    removed_rows += disposition.candidates + disposition.references + disposition.artifacts + disposition.facts;
+    ++groups;
+  }
+  if (sqlite_retention_record_locked(pressure, groups, removed_rows, retired_work_bytes) != 0 ||
+      sqlite_commit_candidate_transaction() != 0) goto done;
+  began = 0;
+  if (processed) {
+    s_retirement_cursor[pressure != 0].value_class = classes[processed - 1u];
+    s_retirement_cursor[pressure != 0].time = times[processed - 1u];
+    snprintf(s_retirement_cursor[pressure != 0].id, sizeof(s_retirement_cursor[0].id), "%s", ids[processed - 1u]);
+  } else if (!count) {
+    memset(&s_retirement_cursor[pressure != 0], 0, sizeof(s_retirement_cursor[0]));
+  }
+  /* Retired groups must not be resurrected by late events in a nominally ended
+   * RAM window. Clear only committed IDs, never an attempted/rolled-back group. */
+  for (unsigned i = 0; i < processed; ++i) {
+    if (held_ids[i]) continue;
+    for (unsigned j = 0; j < EDR_EVIDENCE_CONTEXT_WINDOWS; ++j)
+      if (!strcmp(s_context_windows[j].candidate_id, ids[i])) memset(&s_context_windows[j], 0, sizeof(s_context_windows[j]));
+    for (unsigned j = 0; j < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; ++j)
+      if (!strcmp(s_candidate_dedupe[j].candidate_id, ids[i])) memset(&s_candidate_dedupe[j], 0, sizeof(s_candidate_dedupe[j]));
+  }
+  s_status.retention_groups_retired += groups;
+  s_status.retention_groups_held += held;
+  if (pressure) s_status.db_capacity_evicted += removed_rows;
+  else s_status.db_retention_evicted += removed_rows;
+  *retired = groups;
+  rc = 0;
+  goto done;
+storage_failed:
+  sqlite_maintenance_error("candidate group retirement", sqlite3_errcode(s_db));
+done:
+  sqlite3_finalize(st);
+  if (began) sqlite_rollback_silent();
+  if (rc != 0) s_status.retention_failures++;
+  free(ids);
+  return rc;
 }
 
 /* Called under the owner lock, once per preprocess turn. The caller releases
@@ -4819,6 +5465,7 @@ failed:
   s_maintenance_reclaim_pages = 0u;
   s_last_maintenance_ns = edr_monotonic_ns();
 finish:
+  if (!s_maintenance_reclaim_pages) s_last_maintenance_ns=edr_monotonic_ns();
   (void)sqlite3_db_release_memory(s_db);
   (void)sqlite3_release_memory(0);
   refresh_db_size_status();
@@ -4826,118 +5473,158 @@ finish:
 
 static int sqlite_maintenance(int defer_reclaim) {
   s_maintenance_reclaim_pages = 0u;
-  if (!s_db) {
-    set_error("maintenance database unavailable");
-    return -1;
-  }
+  if (!s_db) { set_error("maintenance database unavailable"); return -1; }
+  EvidenceMaintenanceSlice slice={evidence_cache_clock_ns()+20000000ULL,
+      4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
   s_status.maintenance_runs++;
-  /* Diagnostic flush failures do not prevent evidence reclamation. Preserve
-   * their failed result while letting a later storage error identify itself. */
-  int result = sqlite_flush_metrics(0);
+  if (!sqlite_database_write_allow(slice.bytes_left)) return -1;
+  int result = sqlite_flush_metrics_slice(0,&slice);
+  if (result != 0) goto failed;
   sqlite3_int64 cutoff = now_unix_ns() - (int64_t)s_status.retention_hours * 3600LL * 1000000000LL;
   sqlite3_int64 cutoff_minute = (cutoff / 1000000000LL) / 60LL;
-  const char *tables[] = {"p0_candidates", "process_cache", "file_evidence", "network_ioc",
-                          "registry_evidence", "artifacts", "candidate_context_refs",
-                          "command_results"};
-  const char *cols[] = {"event_time_ns", "last_seen_ns", "last_seen_ns", "last_seen_ns",
-                        "last_seen_ns", "created_ns", "created_ns", "updated_ns"};
-  for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
-    char sql[256];
-    if (strcmp(tables[i], "p0_candidates") == 0 || strcmp(tables[i], "artifacts") == 0) {
-      /* Existing time indexes cover rowid selection without reading wide
-       * command/manifest payloads for rows that will survive retention. */
-      if (!strcmp(tables[i], "artifacts"))
-        snprintf(sql,sizeof(sql),"DELETE FROM artifacts WHERE created_ns<? AND "
-                 "(COALESCE(artifact_type,'')!='pmfe_followup_local_v1' OR upload_status IN ('completed','expired','conflict'));" );
-      else snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE rowid IN "
-                    "(SELECT rowid FROM %s WHERE %s < ?);", tables[i], tables[i], cols[i]);
+  unsigned retired = 0u;
+  /* Rotate the starting stage after every slice so a large candidate backlog
+   * cannot starve reconstructible copies or shared-command reclamation. */
+  static const struct { const char *table,*clock,*condition,*bytes; } ttl[] = {
+    {"process_cache","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(tenant_id AS BLOB)),0)+COALESCE(length(CAST(name AS BLOB)),0)+COALESCE(length(CAST(path AS BLOB)),0)+COALESCE(length(CAST(cmdline AS BLOB)),0)+COALESCE(length(CAST(parent_name AS BLOB)),0)+COALESCE(length(CAST(parent_path AS BLOB)),0)+COALESCE(length(CAST(username AS BLOB)),0)+COALESCE(length(CAST(domain AS BLOB)),0)+COALESCE(length(CAST(user_sid AS BLOB)),0)+COALESCE(length(CAST(logon_id AS BLOB)),0)+COALESCE(length(CAST(identity_source AS BLOB)),0)+COALESCE(length(CAST(identity_quality AS BLOB)),0)+COALESCE(length(CAST(exe_hash AS BLOB)),0)+COALESCE(length(CAST(cmdline_truncated_fields AS BLOB)),0)+COALESCE(length(CAST(process_start_key AS BLOB)),0)+COALESCE(length(CAST(process_creation_filetime_100ns AS BLOB)),0)+COALESCE(length(CAST(process_generation_source AS BLOB)),0)+COALESCE(length(CAST(parent_process_start_key AS BLOB)),0)+COALESCE(length(CAST(parent_process_creation_filetime_100ns AS BLOB)),0)+COALESCE(length(CAST(parent_process_generation_source AS BLOB)),0)+64"},
+    {"file_evidence","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(path AS BLOB)),0)+COALESCE(length(CAST(sha256 AS BLOB)),0)"},
+    {"network_ioc","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(remote_ip AS BLOB)),0)+COALESCE(length(CAST(remote_url AS BLOB)),0)"},
+    {"registry_evidence","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(key_path AS BLOB)),0)+COALESCE(length(CAST(value_name AS BLOB)),0)+COALESCE(length(CAST(op AS BLOB)),0)"},
+    {"command_results","updated_ns","1","COALESCE(length(CAST(command_id AS BLOB)),0)+COALESCE(length(CAST(command_type AS BLOB)),0)+COALESCE(length(CAST(status AS BLOB)),0)+COALESCE(length(CAST(detail AS BLOB)),0)+COALESCE(length(CAST(artifacts AS BLOB)),0)"},
+    {"artifacts","created_ns","artifact_type='pmfe_followup_local_v1' AND upload_status IN('completed','expired','conflict')","COALESCE(length(CAST(artifact_id AS BLOB)),0)+COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(tenant_id AS BLOB)),0)+COALESCE(length(CAST(candidate_id AS BLOB)),0)+COALESCE(length(CAST(path AS BLOB)),0)+COALESCE(length(CAST(sha256 AS BLOB)),0)+COALESCE(length(CAST(manifest_json AS BLOB)),0)+COALESCE(length(CAST(minio_key AS BLOB)),0)+64"},
+    {"metrics","minute_unix","NOT(minute_unix=0 AND endpoint_id='' AND metric_name IN('local_retention_v1_expired_groups','local_retention_v1_expired_rows','local_retention_v1_expired_work_bytes','local_retention_v1_capacity_groups','local_retention_v1_capacity_rows','local_retention_v1_capacity_work_bytes'))","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"}
+  };
+  for (unsigned pass=0;pass<9u && !sqlite_maintenance_yield(&slice);++pass) {
+    unsigned stage=s_maintenance_stage;
+    s_maintenance_stage=(stage+1u)%9u;
+    if (stage==0) {
+      if (sqlite_retire_candidate_groups(0,cutoff,&retired,&slice)!=0) goto failed;
+    } else if(stage==6) {
+      if (sqlite_retire_command_facts(cutoff,&slice)!=0) goto failed;
     } else {
-      snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s < ?;", tables[i], cols[i]);
+      unsigned i=stage<6 ? stage-1 : stage-2;
+      if(sqlite_maintenance_delete(ttl[i].table,ttl[i].clock,ttl[i].condition,ttl[i].bytes,
+           i==6 ? cutoff_minute : cutoff,&slice)!=0) goto failed;
     }
-    if (sqlite_maintenance_delete(sql, tables[i], &cutoff, &s_status.db_retention_evicted) != 0) goto failed;
   }
-  if (sqlite_maintenance_delete("DELETE FROM metrics WHERE minute_unix < ?;", "metrics",
-                               &cutoff_minute, &s_status.db_retention_evicted) != 0) goto failed;
-  unsigned expired_compact = 0;
-  if (edr_context_store_expire(&s_context_store, cutoff, &expired_compact) != 0) {
-    set_error(s_context_store.error);
-    goto failed;
-  }
-  s_status.db_retention_evicted += expired_compact;
-  if (sqlite_collect_context_facts() != 0) goto failed;
   if (db_size_over_limit()) {
-    /* Physical pressure includes WAL pages. A live set just below the cap
-     * otherwise survives every cleanup and rejects the next WAL transaction.
-     * Keep room for two default ~4 MiB checkpoint batches: the transaction
-     * crossing a checkpoint can leave a larger WAL on disk. Bound the reserve
-     * to 1/16 of a small cache. This is reclaimed only on pressure;
-     * the configured physical admission cap and retention remain unchanged. */
     uint64_t target = sqlite_capacity_live_target();
-    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
-    for (int pass = 0; pass < 4; pass++) {
-      int over = sqlite_live_size_over_limit(target);
-      if (over < 0) goto failed;
-      if (!over) break;
-      /* Reclaim bounded old refs with no surviving candidate first. Their
-       * facts are shared, so remove only facts with no remaining refs.
-       * Each orphan batch is bounded to 4096 refs so it can recover the WAL
-       * reserve without repacking partially used pages. A productive orphan
-       * batch must not evict live candidates or command artifacts in the same pass. */
-      unsigned fact_changes = 0;
-      int orphan_changes = sqlite_evict_context_refs(1, 4096u, &fact_changes);
-      if (orphan_changes < 0) goto failed;
-      if (orphan_changes > 0) {
-        s_status.db_capacity_evicted += (uint64_t)orphan_changes + fact_changes;
-        continue;
-      }
-      if (sqlite_maintenance_delete("DELETE FROM p0_candidates WHERE rowid IN (SELECT rowid FROM p0_candidates ORDER BY event_time_ns ASC LIMIT 1000);",
-                                   "capacity p0_candidates", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
-      if (sqlite_maintenance_delete("DELETE FROM artifacts WHERE rowid IN (SELECT rowid FROM artifacts WHERE COALESCE(artifact_type,'')!='pmfe_followup_local_v1' OR upload_status IN ('completed','expired','conflict') ORDER BY created_ns ASC LIMIT 1000);",
-                                   "capacity artifacts", NULL, &s_status.db_capacity_evicted) != 0) goto failed;
-      int ref_changes = sqlite_evict_context_refs(0, 1000u, &fact_changes);
-      if (ref_changes < 0) goto failed;
-      s_status.db_capacity_evicted += (uint64_t)ref_changes + fact_changes;
+    if (!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE)!=0) goto failed;
+    for (unsigned pass=0;pass<4u && !sqlite_maintenance_yield(&slice);++pass) {
+      int over=sqlite_live_size_over_limit(target);
+      if(over<0) goto failed;
+      if(!over) break;
+      if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice)!=0) goto failed;
+      if(!retired && !s_retirement_cursor[1].time) break;
     }
-    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto failed;
+    if (!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE)!=0) goto failed;
     refresh_db_size_status();
-    if (s_status.db_bytes + s_status.wal_bytes > target) {
-      /* Preserve the 4096-page cycle budget. Routine maintenance yields before
-       * reclaiming 256 pages per later poll; startup and required admission
-       * retain synchronous recovery and the same physical capacity check. */
-      if (defer_reclaim) s_maintenance_reclaim_pages = 4096u;
-      else if (sqlite_maintenance_reclaim(4096u) != 0) goto failed;
+    if (s_status.db_bytes+s_status.wal_bytes>target) {
+      s_maintenance_reclaim_pages=4096u;
+      /* One current 256-page reclamation statement, then later owner polls.
+       * Startup/admission obey the same bound and may reject until it drains. */
+      if(!defer_reclaim && !sqlite_maintenance_yield(&slice)) sqlite_maintenance_reclaim_poll();
     }
-  } else {
-    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_PASSIVE) != 0) goto failed;
-  }
-  if (exec_sql("PRAGMA shrink_memory;") != 0) {
-    sqlite_maintenance_error("release pager memory", sqlite3_errcode(s_db));
-    goto failed;
-  }
+  } else if(!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_PASSIVE)!=0) goto failed;
   goto finish;
 failed:
-  s_maintenance_reclaim_pages = 0u;
-  result = -1;
+  s_maintenance_reclaim_pages=0u; result=-1;
 finish:
-  /* Each completed statement/batch stays committed. Failed attempts retain
-   * the normal minute poll or existing capacity-failure backoff, never a
-   * per-event retry loop. Release pager memory on both outcomes. */
   (void)sqlite3_db_release_memory(s_db);
   (void)sqlite3_release_memory(0);
   refresh_db_size_status();
   return result;
 }
+
 #endif
 
-void edr_local_evidence_cache_record_command_result(
+/* Admission reads SQLite's own page accounting rather than scanning payload
+ * tables. The transaction includes the old-row lookup, growth check, write and
+ * final page check; both in-process writers and other SQLite writers serialize.
+ * No pressure cleanup is performed for this optional detailed copy. */
+#if defined(EDR_HAVE_SQLITE)
+static int sqlite_command_result_budget(uint64_t incoming, const char *command_id) {
+  sqlite3_stmt *st = NULL;
+  uint64_t live = 0u, prior = 0u;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT (page_count-freelist_count)*page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;",
+      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW ||
+      sqlite3_column_int64(st, 0) < 0) {
+    sqlite3_finalize(st);
+    set_error("command result page accounting failed");
+    return -1;
+  }
+  live = (uint64_t)sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st);
+  st = NULL;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT length(CAST(command_id AS BLOB))+"
+      "COALESCE(length(CAST(command_type AS BLOB)),0)+"
+      "COALESCE(length(CAST(status AS BLOB)),0)+"
+      "COALESCE(length(CAST(detail AS BLOB)),0)+"
+      "COALESCE(length(CAST(artifacts AS BLOB)),0) "
+      "FROM command_results WHERE command_id=?;", -1, &st, NULL) != SQLITE_OK) {
+    sqlite3_finalize(st);
+    set_error("command result prior size lookup failed");
+    return -1;
+  }
+  if (sqlite3_bind_text(st, 1, command_id, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+    sqlite3_finalize(st);
+    set_error("command result prior identity binding failed");
+    return -1;
+  }
+  int rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW && sqlite3_column_int64(st, 0) >= 0)
+    prior = (uint64_t)sqlite3_column_int64(st, 0);
+  else if (rc != SQLITE_DONE) {
+    sqlite3_finalize(st);
+    set_error("command result prior size lookup failed");
+    return -1;
+  }
+  sqlite3_finalize(st);
+  uint64_t limit = (uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL;
+  uint64_t growth = incoming > prior ? incoming - prior : 0u;
+  /* Reject a huge first write/update before SQLite can spill it to WAL.
+   * The post-write live-page check also charges record/index/page overhead. */
+  return live <= limit && growth <= limit - live;
+}
+#endif
+
+int edr_local_evidence_cache_record_command_result(
     const char *command_id, const char *command_type, const char *status,
     int execution_status, int exit_code, const char *detail, const char *artifacts) {
+  int outcome = EDR_EVIDENCE_COMMAND_RESULT_UNAVAILABLE;
   evidence_cache_lock();
 #if defined(EDR_HAVE_SQLITE)
-  if (!s_db || !command_id || !command_id[0]) {
-    evidence_cache_unlock();
-    return;
+  sqlite3_stmt *st = NULL;
+  int began = 0;
+  if (!command_id || !command_id[0]) {
+    outcome = EDR_EVIDENCE_COMMAND_RESULT_INVALID;
+    set_error("command result identity missing");
+    goto finish;
   }
+  if (!s_db) {
+    set_error("command result database unavailable");
+    goto finish;
+  }
+  /* This is the existing DB+WAL admission scope, not an Agent-directory or
+   * SHM/log hard cap. Reclamation remains on the existing maintenance path. */
+  const char *fields[] = {command_id, command_type, status, detail, artifacts};
+  uint64_t incoming = 0u;
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    size_t bytes = fields[i] ? strlen(fields[i]) : 0u;
+    if (bytes > UINT64_MAX - incoming) goto capacity;
+    incoming += bytes;
+  }
+  outcome = EDR_EVIDENCE_COMMAND_RESULT_STORAGE;
+  if (!sqlite_physical_write_allow(incoming)) { outcome = EDR_EVIDENCE_COMMAND_RESULT_CAPACITY; ++s_status.command_results_capacity_rejected; goto finish; }
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) goto finish;
+  began = 1;
+  if (db_size_over_limit()) goto capacity;
+  int admitted = sqlite_command_result_budget(incoming, command_id);
+  if (admitted < 0) goto finish;
+  if (!admitted) goto capacity;
   const char *sql =
       "INSERT INTO command_results(command_id,command_type,status,execution_status,exit_code,"
       "detail,artifacts,updated_ns) VALUES(?,?,?,?,?,?,?,?) "
@@ -4945,27 +5632,51 @@ void edr_local_evidence_cache_record_command_result(
       "status=excluded.status,execution_status=excluded.execution_status,"
       "exit_code=excluded.exit_code,detail=excluded.detail,artifacts=excluded.artifacts,"
       "updated_ns=excluded.updated_ns;";
-  sqlite3_stmt *st = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare command_results failed");
-    evidence_cache_unlock();
-    return;
+    goto finish;
   }
-  bind_text(st, 1, command_id);
-  bind_text(st, 2, command_type);
-  bind_text(st, 3, status);
-  sqlite3_bind_int64(st, 4, (sqlite3_int64)execution_status);
-  sqlite3_bind_int64(st, 5, (sqlite3_int64)exit_code);
-  bind_text(st, 6, detail);
-  bind_text(st, 7, artifacts);
-  sqlite3_bind_int64(st, 8, (sqlite3_int64)now_unix_ns());
-  if (sqlite3_step(st) == SQLITE_DONE) {
-    s_status.command_results_written++;
-  } else {
-    set_error("upsert command_results failed");
+  const int parameters[] = {1, 2, 3, 6, 7};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    if (sqlite3_bind_text(st, parameters[i], fields[i] ? fields[i] : "", -1,
+                         SQLITE_TRANSIENT) != SQLITE_OK) {
+      set_error("command result text binding failed");
+      goto finish;
+    }
   }
+  if (sqlite3_bind_int64(st, 4, (sqlite3_int64)execution_status) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 5, (sqlite3_int64)exit_code) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 8, (sqlite3_int64)now_unix_ns()) != SQLITE_OK) {
+    set_error("command result metadata binding failed");
+    goto finish;
+  }
+  int rc = sqlite3_step(st);
   sqlite3_finalize(st);
-  evidence_cache_unlock();
+  st = NULL;
+  if (rc != SQLITE_DONE) {
+    set_error("upsert command_results failed");
+    goto finish;
+  }
+  int over = sqlite_live_size_over_limit((uint64_t)s_status.max_db_mb * 1024ULL * 1024ULL);
+  if (over < 0) goto finish;
+  if (over) goto capacity;
+  if (exec_sql("COMMIT;") != 0) goto finish;
+  began = 0;
+  outcome = EDR_EVIDENCE_COMMAND_RESULT_STORED;
+  s_status.command_results_written++;
+  goto finish;
+capacity:
+  outcome = EDR_EVIDENCE_COMMAND_RESULT_CAPACITY;
+  s_status.command_results_capacity_rejected++;
+  s_status.db_budget_dropped++;
+  set_error("command result copy size budget exceeded");
+finish:
+  sqlite3_finalize(st);
+  if (began && sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL) != SQLITE_OK &&
+      !sqlite3_get_autocommit(s_db)) {
+    set_error("command result rollback failed; database transaction remains active");
+    outcome = EDR_EVIDENCE_COMMAND_RESULT_STORAGE;
+  }
 #else
   (void)command_id;
   (void)command_type;
@@ -4974,8 +5685,12 @@ void edr_local_evidence_cache_record_command_result(
   (void)exit_code;
   (void)detail;
   (void)artifacts;
-  evidence_cache_unlock();
 #endif
+  if (outcome != EDR_EVIDENCE_COMMAND_RESULT_STORED &&
+      outcome != EDR_EVIDENCE_COMMAND_RESULT_CAPACITY)
+    s_status.command_results_failed++;
+  evidence_cache_unlock();
+  return outcome;
 }
 
 /* A command fact is immutable for one exact process generation. The existing
@@ -4999,6 +5714,83 @@ static int command_fact_key(const EdrBehaviorRecord *r, char key[80]) {
   memcpy(key, "command:", 8u);
   for (size_t i = 0; i < 32u; ++i) snprintf(key + 8u + 2u*i, 3u, "%02x", digest[i]);
   return 1;
+}
+
+/* Full commands are shared by exact generation. Candidate references and both
+ * subject/parent process-cache tuples own them; frozen queue wire is inline.
+ * Unknown older artifacts are deliberately outside this retirement authority. */
+static int sqlite_retire_command_facts(sqlite3_int64 cutoff, EvidenceMaintenanceSlice *slice) {
+  if (sqlite_maintenance_yield(slice)) return 0;
+  if (!sqlite_database_write_allow(slice->bytes_left)) return -1;
+  sqlite3_int64 cursor_time = s_command_retirement_cursor.time;
+  const char *cursor_id = s_command_retirement_cursor.id;
+  sqlite3_stmt *st = NULL, *del = NULL;
+  char ids[128][80]; unsigned count = 0, inspected = 0;
+  uint64_t work_bytes = 0;
+  sqlite3_int64 last_time = cursor_time; char last_id[80];
+  copy_s(last_id, sizeof(last_id), cursor_id);
+  if (exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT artifact_id,created_ns,endpoint_id,tenant_id,command_owner_pid,command_owner_start_key,command_owner_creation,"
+      "length(CAST(manifest_json AS BLOB)) FROM artifacts a WHERE artifact_type='process_command_line' "
+      "AND command_retention_policy=1 AND created_ns>0 AND created_ns<?1 AND (created_ns,artifact_id)>(?2,?3) "
+      "AND upload_status IN('embedded','conflict') AND candidate_id='' AND COALESCE(minio_key,'')='' "
+      "ORDER BY created_ns,artifact_id LIMIT 128;", -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 1, cutoff) != SQLITE_OK || sqlite3_bind_int64(st, 2, cursor_time) != SQLITE_OK ||
+      sqlite3_bind_text(st, 3, cursor_id, -1, SQLITE_STATIC) != SQLITE_OK) goto failed;
+  int step;
+  while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+    if (sqlite_maintenance_yield(slice)) break;
+    const char *id = (const char *)sqlite3_column_text(st, 0), *ep = (const char *)sqlite3_column_text(st, 2);
+    const char *tenant = (const char *)sqlite3_column_text(st, 3);
+    uint32_t pid = (uint32_t)sqlite3_column_int64(st, 4);
+    uint64_t start = 0, creation = 0;
+    const char *start_text = (const char *)sqlite3_column_text(st, 5), *creation_text = (const char *)sqlite3_column_text(st, 6);
+    ++inspected;
+    sqlite3_int64 bytes = sqlite3_column_int64(st, 7);
+    if (bytes < 0 || !sqlite_maintenance_charge(slice,2,(uint64_t)bytes+128u)) break;
+    if (id && sqlite3_column_bytes(st,0)==72 && strlen(id)==72u) {
+      last_time=sqlite3_column_int64(st,1); copy_s(last_id,sizeof(last_id),id);
+    }
+    if (!id || strlen(id) != 72u || sqlite3_column_bytes(st, 0) != 72 || !ep || !ep[0] || !tenant || !tenant[0] || !pid ||
+        !sqlite_decimal_u64(start_text, &start) || !sqlite_decimal_u64(creation_text, &creation) || !start || !creation) continue;
+    last_time = sqlite3_column_int64(st, 1); copy_s(last_id, sizeof(last_id), id);
+    if ((uint64_t)bytes > 4u * EDR_EVIDENCE_MANIFEST_MAX_BYTES - work_bytes) break;
+    work_bytes += (uint64_t)bytes;
+    int ram_owner = 0;
+    for (unsigned i = 0; i < EDR_EVIDENCE_PROC_SLOTS && !ram_owner; ++i) {
+      const ProcSlot *p = &s_proc[i];
+      if (!strcmp(p->endpoint_id, ep) && !strcmp(p->tenant_id, tenant) &&
+          ((p->pid == pid && p->generation.process_start_key == start && p->generation.creation_filetime_100ns == creation) ||
+           (p->ppid == pid && p->parent_generation.process_start_key == start && p->parent_generation.creation_filetime_100ns == creation))) ram_owner = 1;
+    }
+    if (!ram_owner) copy_s(ids[count++], sizeof(ids[0]), id);
+  }
+  if (step != SQLITE_DONE && step != SQLITE_ROW) goto failed;
+  sqlite3_finalize(st); st = NULL;
+  if (sqlite3_prepare_v2(s_db,
+      "DELETE FROM artifacts WHERE artifact_id=?1 AND artifact_type='process_command_line' AND command_retention_policy=1 "
+      "AND NOT EXISTS(SELECT 1 FROM p0_candidates WHERE subject_command_fact_id=?1 OR parent_command_fact_id=?1) "
+      "AND NOT EXISTS(SELECT 1 FROM process_cache p WHERE p.endpoint_id=artifacts.endpoint_id AND p.tenant_id=artifacts.tenant_id "
+      "AND ((p.pid=artifacts.command_owner_pid AND p.process_start_key=artifacts.command_owner_start_key AND p.process_creation_filetime_100ns=artifacts.command_owner_creation) "
+      "OR (p.ppid=artifacts.command_owner_pid AND p.parent_process_start_key=artifacts.command_owner_start_key AND p.parent_process_creation_filetime_100ns=artifacts.command_owner_creation)));",
+      -1, &del, NULL) != SQLITE_OK) goto failed;
+  uint64_t removed = 0;
+  for (unsigned i = 0; i < count; ++i) {
+    if (evidence_cache_clock_ns() >= slice->deadline_ns) break;
+    if (sqlite3_bind_text(del, 1, ids[i], -1, SQLITE_TRANSIENT) != SQLITE_OK || sqlite3_step(del) != SQLITE_DONE) goto failed;
+    removed += (unsigned)sqlite3_changes(s_db);
+    if (sqlite3_reset(del) != SQLITE_OK) goto failed;
+  }
+  sqlite3_finalize(del); del = NULL;
+  if (exec_sql("COMMIT;") != 0) goto failed;
+  if (inspected) { s_command_retirement_cursor.time = last_time; copy_s(s_command_retirement_cursor.id, sizeof(s_command_retirement_cursor.id), last_id); }
+  else memset(&s_command_retirement_cursor, 0, sizeof(s_command_retirement_cursor));
+  s_status.db_retention_evicted += removed;
+  return 0;
+failed:
+  sqlite3_finalize(st); sqlite3_finalize(del); sqlite_rollback_silent();
+  set_error("command fact retirement failed; uncommitted facts preserved"); return -1;
 }
 
 static char *read_command_fact_locked(const EdrBehaviorRecord *r) {
@@ -5044,50 +5836,63 @@ int edr_local_evidence_cache_save_command_fact(const EdrBehaviorRecord *r, const
   sqlite3_stmt *st = NULL;
   cJSON *root = NULL;
   char *json = NULL;
+  int began = 0;
   size_t n = command ? strlen(command) : 0u;
   set_error("complete command fact unavailable: invalid identity, encoding, or storage");
-  if (s_db && command_fact_key(r, key) && n && n < EDR_PROCESS_COMMAND_FACT_CAP &&
-      manifest_utf8_valid(command) && edr_sha256_hex((const uint8_t *)command, n, hash) == 0) {
-    char *prior = read_command_fact_locked(r);
-    if (prior) {
-      rc = strcmp(prior, command) == 0 ? 0 : -1;
-      if (rc) {
-        /* Equal previews can conceal different tails. Retain the original
-         * evidence but invalidate this ambiguous generation reference, also
-         * after restart. It must never silently resolve to the earlier tail. */
-        if (sqlite3_prepare_v2(s_db,
-            "UPDATE artifacts SET upload_status='conflict' WHERE artifact_id=?",
-            -1, &st, NULL) == SQLITE_OK) {
-          bind_text(st, 1, key);
-          if (sqlite3_step(st) != SQLITE_DONE)
-            set_error("command fact conflict could not be persisted");
-          else set_error("same-generation command fact conflict; reference invalidated");
-        }
-      }
-      free(prior);
-    } else if (sqlite_size_budget_allow()) {
-      root = cJSON_CreateObject();
-      if (manifest_add_text(root, "command_line", command) &&
-          manifest_add_text(root, "reference", key) &&
-          (json = cJSON_PrintUnformatted(root)) != NULL &&
-          sqlite3_prepare_v2(s_db,
-            "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,"
-            "sha256,manifest_json,created_ns,upload_status) "
-            "VALUES(?,?,?,'','process_command_line',?,?,?,'embedded') "
-            "ON CONFLICT(artifact_id) DO NOTHING", -1, &st, NULL) == SQLITE_OK) {
-        bind_text(st, 1, key); bind_text(st, 2, r->endpoint_id); bind_text(st, 3, r->tenant_id);
-        bind_text(st, 4, hash); bind_text(st, 5, json);
-        sqlite3_bind_int64(st, 6, (sqlite3_int64)now_unix_ns());
-        if (sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(s_db) == 1) {
-          s_status.artifacts_written++;
-          rc = 0;
-        } else set_error("command fact commit failed or existing fact invalid");
-      }
+  if (!s_db || !command_fact_key(r, key) || !n || n >= EDR_PROCESS_COMMAND_FACT_CAP ||
+      !manifest_utf8_valid(command) || edr_sha256_hex((const uint8_t *)command, n, hash)) goto done;
+  /* Pressure work precedes the owner transaction. All subsequent reads and
+   * admission serialize with other SQLite writers, including process writes. */
+  if (!sqlite_size_budget_allow() || exec_sql("BEGIN IMMEDIATE;")) goto done;
+  began = 1;
+  char *prior = read_command_fact_locked(r);
+  if (prior) {
+    int equal = !strcmp(prior, command);
+    free(prior);
+    if (!equal) {
+      if (sqlite3_prepare_v2(s_db, "UPDATE artifacts SET upload_status='conflict' WHERE artifact_id=?",
+          -1, &st, NULL) != SQLITE_OK || sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+          sqlite3_step(st) != SQLITE_DONE) { set_error("command fact conflict could not be persisted"); goto done; }
+      sqlite3_finalize(st); st = NULL;
     }
+    if (exec_sql("COMMIT;")) goto done;
+    began = 0; rc = equal ? 0 : -1;
+    if (!equal) set_error("same-generation command fact conflict; reference invalidated");
+    goto done;
   }
+  root = cJSON_CreateObject();
+  if (!manifest_add_text(root, "command_line", command) || !manifest_add_text(root, "reference", key) ||
+      !(json = cJSON_PrintUnformatted(root))) { set_error("command fact serialization failed"); goto done; }
+  if (sqlite3_prepare_v2(s_db, "SELECT (page_count-freelist_count)*page_size FROM pragma_page_count,pragma_freelist_count,pragma_page_size;",
+      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int64(st, 0) < 0) {
+    set_error("command fact page accounting failed"); goto done;
+  }
+  uint64_t live = (uint64_t)sqlite3_column_int64(st, 0), limit = (uint64_t)s_status.max_db_mb * 1024u * 1024u;
+  sqlite3_finalize(st); st = NULL;
+  if (live > limit || strlen(json) + strlen(key) + strlen(r->tenant_id) + strlen(r->endpoint_id) + sizeof(hash) > limit - live) {
+    set_error("command fact capacity exhausted"); ++s_status.db_budget_dropped; goto done;
+  }
+  if (sqlite3_prepare_v2(s_db,
+      "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,sha256,manifest_json,created_ns,upload_status,minio_key,"
+      "command_retention_policy,command_owner_pid,command_owner_start_key,command_owner_creation) "
+      "VALUES(?,?,?,'','process_command_line',?,?,?,'embedded','',1,?,?,?) ON CONFLICT(artifact_id) DO NOTHING;", -1, &st, NULL) != SQLITE_OK) goto done;
+  bind_text(st, 1, key); bind_text(st, 2, r->endpoint_id); bind_text(st, 3, r->tenant_id);
+  bind_text(st, 4, hash); bind_text(st, 5, json);
+  sqlite3_bind_int64(st, 6, (sqlite3_int64)now_unix_ns()); sqlite3_bind_int64(st, 7, r->pid);
+  char start[32], creation[32];
+  sqlite_u64_decimal(r->process_start_key, start); sqlite_u64_decimal(r->process_creation_filetime_100ns, creation);
+  bind_text(st, 8, start); bind_text(st, 9, creation);
+  if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) {
+    set_error("command fact commit failed or existing fact invalid"); goto done;
+  }
+  sqlite3_finalize(st); st = NULL;
+  if (sqlite_live_size_over_limit(limit) != 0) { set_error("command fact page budget exceeded"); ++s_status.db_budget_dropped; goto done; }
+  if (exec_sql("COMMIT;")) goto done;
+  began = 0; ++s_status.artifacts_written; rc = 0;
+done:
   sqlite3_finalize(st);
-  cJSON_free(json);
-  cJSON_Delete(root);
+  if (began) sqlite_rollback_silent();
+  cJSON_free(json); cJSON_Delete(root);
 #else
   (void)r; (void)command;
 #endif
@@ -5253,7 +6058,7 @@ static cJSON *pmfe_read_locked(const char *key, char state[32]) {
 }
 static int pmfe_write_locked(const char *key, cJSON *root, const char *state) {
   char *json = cJSON_PrintUnformatted(root); sqlite3_stmt *st = NULL; int rc = -1;
-  if (!json || strlen(json) > EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+  if (!json || strlen(json) > EDR_EVIDENCE_MANIFEST_MAX_BYTES || !sqlite_physical_write_allow(json ? strlen(json) : 0u) ||
       exec_sql("PRAGMA synchronous=FULL;") || exec_sql("BEGIN IMMEDIATE;")) goto done;
   if (sqlite3_prepare_v2(s_db,
       "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,sha256,manifest_json,created_ns,upload_status)"
@@ -5290,6 +6095,162 @@ static int pmfe_task_from_root(const cJSON *root, EdrPmfeFollowupTask *t) {
   copy_s(t->tenant_id,sizeof(t->tenant_id),pmfe_text(root,"tenant_id"));
   return t->process_start_key && t->process_creation_filetime_100ns &&
       t->source_event_time_ns>0 && pmfe_key(t->source_alert_id,t->endpoint_id,t->tenant_id,t->association_id);
+}
+/* The caller owns the cache mutex and an IMMEDIATE transaction, and has
+ * cleared temp.evidence_retention_protected. PMFE's immutable wire proves the
+ * owner scope; its artifacts.candidate_id is a source event id, not a P0 id.
+ * Provider enrichment may reuse another source's candidate id. Protect the
+ * whole proven process generation as well as the canonical source id rather
+ * than scan every bundle's bounded source_event_ids array. An unbound older
+ * candidate in that PID scope cannot safely be classified as a non-alias.
+ * The existing 4096-reference maintenance batch bound also bounds this
+ * temporary selector. Exhaustion stops reclamation, never weakens the pin. */
+static int sqlite_retention_protect_pmfe_locked(EvidenceMaintenanceSlice *slice) {
+  enum { PROTECTED_LIMIT = 4096 };
+  sqlite3_stmt *owners = NULL, *insert = NULL, *generation = NULL, *unknown = NULL;
+  sqlite3_stmt *count_stmt = NULL;
+  EdrBehaviorRecord *identity = NULL;
+  cJSON *root = NULL;
+  const char *failure = "retention PMFE protection storage failure";
+  unsigned owner_count = 0u, protected_count = 0u, generation_rows = 0u;
+  int rc = -1, step;
+  if (!s_db || sqlite3_get_autocommit(s_db)) {
+    set_error("retention PMFE protection requires a transaction");
+    return -1;
+  }
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT COUNT(*) FROM temp.evidence_retention_protected;",
+      -1, &count_stmt, NULL) != SQLITE_OK ||
+      sqlite3_step(count_stmt) != SQLITE_ROW ||
+      sqlite3_column_type(count_stmt, 0) != SQLITE_INTEGER ||
+      sqlite3_column_int64(count_stmt, 0) < 0 ||
+      sqlite3_column_int64(count_stmt, 0) > PROTECTED_LIMIT) goto done;
+  protected_count = (unsigned)sqlite3_column_int64(count_stmt, 0);
+  sqlite3_finalize(count_stmt); count_stmt = NULL;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT artifact_id,upload_status,endpoint_id,tenant_id,candidate_id,length(CAST(manifest_json AS BLOB)) FROM artifacts "
+      "WHERE artifact_type='" PMFE_ASSOC_TYPE "' "
+      "AND (upload_status IS NULL OR upload_status NOT IN ('completed','expired','conflict')) "
+      "ORDER BY upload_status,created_ns,artifact_id LIMIT 65;",
+      -1, &owners, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db,
+      "INSERT OR IGNORE INTO temp.evidence_retention_protected(candidate_id) VALUES(?);",
+      -1, &insert, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db,
+      "SELECT candidate_id FROM p0_candidates WHERE endpoint_id=? AND tenant_id=? AND pid=? "
+      "AND process_start_key=? AND process_creation_filetime_100ns=? "
+      "ORDER BY candidate_id LIMIT 4097;",
+      -1, &generation, NULL) != SQLITE_OK ||
+      sqlite3_prepare_v2(s_db,
+      "SELECT 1 FROM p0_candidates INDEXED BY idx_candidates_retention_unknown_generation "
+      "WHERE endpoint_id=? AND tenant_id=? AND pid=? "
+      "AND (process_start_key IS NULL OR process_start_key IN ('','0') "
+      "OR process_creation_filetime_100ns IS NULL OR process_creation_filetime_100ns IN ('','0')) LIMIT 1;",
+      -1, &unknown, NULL) != SQLITE_OK) goto done;
+  while ((step = sqlite3_step(owners)) == SQLITE_ROW) {
+    sqlite3_int64 bytes=sqlite3_column_int64(owners,5);
+    if (bytes<0) goto done;
+    if (!sqlite_maintenance_charge(slice,1,(uint64_t)bytes+128u)) { rc=1; goto done; }
+    if (++owner_count > PMFE_ASSOC_CAP) {
+      failure = "retention PMFE protection owner limit exceeded";
+      goto done;
+    }
+    const char *key = (const char *)sqlite3_column_text(owners, 0);
+    const char *state = (const char *)sqlite3_column_text(owners, 1);
+    if (!key || strlen(key) != 69u || sqlite3_column_bytes(owners, 0) != 69 ||
+        !state || sqlite3_column_bytes(owners, 1) != (int)strlen(state) ||
+        (strcmp(state, "scheduled") && strcmp(state, "running") &&
+         strcmp(state, "result_bound") && strcmp(state, "result_acked"))) {
+      failure = "retention PMFE protection owner state invalid";
+      goto done;
+    }
+    char verified_state[32]; EdrPmfeFollowupTask task;
+    root = pmfe_read_locked(key, verified_state);
+    if (!root || strcmp(state, verified_state) || !pmfe_task_from_root(root, &task) ||
+        strcmp(key, task.association_id)) {
+      failure = "retention PMFE protection owner validation failed";
+      goto done;
+    }
+    const char *source = pmfe_text(root, "original_event_id");
+    const char *scope[] = {task.endpoint_id, task.tenant_id, source};
+    for (unsigned column = 2u; column <= 4u; ++column) {
+      const char *stored = (const char *)sqlite3_column_text(owners, (int)column);
+      if (!stored || sqlite3_column_bytes(owners, (int)column) != (int)strlen(stored) ||
+          strcmp(stored, scope[column - 2u])) {
+        failure = "retention PMFE protection owner scope invalid";
+        goto done;
+      }
+    }
+    if (!source[0] || strlen(source) >= sizeof(identity->event_id)) {
+      failure = "retention PMFE protection source identity invalid";
+      goto done;
+    }
+    if (!identity && !(identity = calloc(1u, sizeof(*identity)))) {
+      failure = "retention PMFE protection allocation failed";
+      goto done;
+    }
+    copy_s(identity->event_id, sizeof(identity->event_id), source);
+    copy_s(identity->endpoint_id, sizeof(identity->endpoint_id), task.endpoint_id);
+    copy_s(identity->tenant_id, sizeof(identity->tenant_id), task.tenant_id);
+    char canonical[160], start[32], creation[32];
+    candidate_id_for(identity, canonical, sizeof(canonical));
+    sqlite_u64_decimal(task.process_start_key, start);
+    sqlite_u64_decimal(task.process_creation_filetime_100ns, creation);
+    sqlite3_reset(insert);
+    if (!canonical[0] || sqlite3_bind_text(insert, 1, canonical, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(insert) != SQLITE_DONE) goto done;
+    protected_count += (unsigned)sqlite3_changes(s_db);
+    if (protected_count > PROTECTED_LIMIT) {
+      failure = "retention PMFE protection candidate limit exceeded";
+      goto done;
+    }
+    sqlite3_reset(unknown);
+    if (sqlite3_bind_text(unknown, 1, task.endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(unknown, 2, task.tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(unknown, 3, task.pid) != SQLITE_OK) goto done;
+    step = sqlite3_step(unknown);
+    if (step != SQLITE_DONE) {
+      if (step == SQLITE_ROW) failure = "retention PMFE protection candidate generation unavailable";
+      goto done;
+    }
+    sqlite3_reset(generation);
+    if (sqlite3_bind_text(generation, 1, task.endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(generation, 2, task.tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(generation, 3, task.pid) != SQLITE_OK ||
+        sqlite3_bind_text(generation, 4, start, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(generation, 5, creation, -1, SQLITE_TRANSIENT) != SQLITE_OK) goto done;
+    while ((step = sqlite3_step(generation)) == SQLITE_ROW) {
+      if (!sqlite_maintenance_charge(slice,1,160u)) { rc=1; goto done; }
+      if (++generation_rows > PROTECTED_LIMIT) {
+        failure = "retention PMFE protection generation scan limit exceeded";
+        goto done;
+      }
+      const char *candidate = (const char *)sqlite3_column_text(generation, 0);
+      if (!candidate || !candidate[0] || strlen(candidate) >= sizeof(canonical) ||
+          sqlite3_column_bytes(generation, 0) != (int)strlen(candidate)) {
+        failure = "retention PMFE protection candidate identity invalid";
+        goto done;
+      }
+      sqlite3_reset(insert);
+      if (sqlite3_bind_text(insert, 1, candidate, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+          sqlite3_step(insert) != SQLITE_DONE) goto done;
+      protected_count += (unsigned)sqlite3_changes(s_db);
+      if (protected_count > PROTECTED_LIMIT) {
+        failure = "retention PMFE protection candidate limit exceeded";
+        goto done;
+      }
+    }
+    if (step != SQLITE_DONE) goto done;
+    cJSON_Delete(root); root = NULL;
+  }
+  if (step != SQLITE_DONE) goto done;
+  rc = 0;
+done:
+  sqlite3_finalize(count_stmt); sqlite3_finalize(owners); sqlite3_finalize(insert);
+  sqlite3_finalize(generation); sqlite3_finalize(unknown);
+  cJSON_Delete(root); free(identity);
+  if (rc<0) set_error(failure);
+  return rc;
 }
 static cJSON *pmfe_result_root_locked(const EdrBehaviorRecord *r, char key[80], char state[32]) {
   if (!r || r->type!=EDR_EVENT_PMFE_SCAN_RESULT || !r->process_start_key ||
@@ -5684,6 +6645,9 @@ static void evidence_cache_close_locked(void) {
   /* Completed slices are SQLite commits; remaining free pages are discovered
    * by normal startup maintenance, with no durable scheduler state to replay. */
   s_maintenance_reclaim_pages = 0u;
+  s_maintenance_stage=0;
+  memset(s_retirement_cursor, 0, sizeof(s_retirement_cursor));
+  memset(&s_command_retirement_cursor, 0, sizeof(s_command_retirement_cursor));
   if (s_db) {
     if (sqlite_flush_metrics(1) != 0) {
       uint64_t lost = 0u;
@@ -5701,7 +6665,7 @@ static void evidence_cache_close_locked(void) {
       fprintf(stderr, "[evidence-cache] closing with %llu uncommitted diagnostic counts: %s\n",
               (unsigned long long)lost, s_status.last_error);
     }
-    (void)exec_sql("PRAGMA wal_checkpoint(TRUNCATE);");
+    (void)sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE);
     sqlite3_close(s_db);
     s_db = NULL;
   }
@@ -5725,29 +6689,38 @@ static int sqlite_auto_vacuum_mode(void) {
 static int sqlite_ensure_incremental_vacuum(void) {
   int mode = sqlite_auto_vacuum_mode();
   if (mode == 2) return 0;
+  if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return -1;
   if (mode < 0 || exec_sql("PRAGMA auto_vacuum=INCREMENTAL;") != 0) {
     set_error("evidence cache incremental vacuum setup failed");
     return -1;
   }
-  if (sqlite_auto_vacuum_mode() != 2 && exec_sql("VACUUM;") != 0) {
-    set_error("evidence cache incremental vacuum migration failed");
-    return -1;
+  if (sqlite_auto_vacuum_mode() != 2) {
+    if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return -1;
+    if (exec_sql("VACUUM;") != 0) {
+      set_error("evidence cache incremental vacuum migration failed");
+      return -1;
+    }
   }
   if (sqlite_auto_vacuum_mode() != 2) {
     set_error("evidence cache incremental vacuum unavailable");
     return -1;
   }
-  if (sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
-                              NULL, NULL) != SQLITE_OK) {
-    set_error("evidence cache migration checkpoint blocked");
-    return -1;
-  }
+  if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) return -1;
   return 0;
 }
 #endif
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours) {
+  return edr_local_evidence_cache_open_with_policy(path, max_db_mb,
+                                                   retention_hours, retention_hours);
+}
+
+int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_mb,
+                                              uint32_t retention_hours,
+                                              uint32_t selected_hours) {
+  if (retention_hours > (uint32_t)(INT64_MAX/3600000000000LL) ||
+      selected_hours > (uint32_t)(INT64_MAX/3600000000000LL)) return -1;
   evidence_cache_lock();
   evidence_cache_close_locked();
   memset(&s_status, 0, sizeof(s_status));
@@ -5769,9 +6742,20 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   s_write_budget_ordinary_context_count = 0u;
   s_status.max_db_mb = max_db_mb ? max_db_mb : 128u;
   s_status.retention_hours = retention_hours ? retention_hours : 24u;
+  s_status.selected_retention_hours = selected_hours >= s_status.retention_hours
+      ? selected_hours : s_status.retention_hours;
   copy_s(s_status.path, sizeof(s_status.path), (path && path[0]) ? path : "local_evidence_cache.db");
 
 #if defined(EDR_HAVE_SQLITE)
+  char startup_wal[sizeof(s_status.path)+5u];
+  snprintf(startup_wal,sizeof(startup_wal),"%s-wal",s_status.path);
+  uint64_t startup_bytes=path_size_bytes(s_status.path), startup_wal_bytes=path_size_bytes(startup_wal);
+  uint64_t startup_work = startup_wal_bytes>UINT64_MAX-EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+      startup_bytes>UINT64_MAX-startup_wal_bytes-EDR_EVIDENCE_MANIFEST_MAX_BYTES
+      ? UINT64_MAX : startup_bytes+startup_wal_bytes+EDR_EVIDENCE_MANIFEST_MAX_BYTES;
+  if (!sqlite_physical_write_allow(startup_work)) {
+    evidence_cache_unlock(); return -1;
+  }
   if (sqlite3_open(s_status.path, &s_db) != SQLITE_OK || !s_db) {
     char err[160];
     snprintf(err, sizeof(err), "sqlite open failed: %s",
@@ -5784,6 +6768,12 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     evidence_cache_unlock();
     return -1;
   }
+  /* Never let last-close perform an unchecked checkpoint. The explicit
+   * guarded checkpoint above may defer, leaving committed WAL bytes intact. */
+  if (sqlite3_db_config(s_db,SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,1,NULL)!=SQLITE_OK) {
+    set_error("cannot disable unguarded evidence close checkpoint");
+    sqlite3_close(s_db); s_db=NULL; evidence_cache_unlock(); return -1;
+  }
   s_status.db_open = 1;
   if (edr_context_store_check_format(&s_context_store, s_db) != 0) {
     set_error(s_context_store.error);
@@ -5792,6 +6782,17 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
     return -1;
   }
   s_status.storage_format = (uint32_t)s_context_store.format;
+  if (!sqlite_startup_schema_write_allow()) {
+    sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
+    evidence_cache_unlock(); return -1;
+  }
+  uint64_t startup_logical=0,startup_page_size=0;
+  if (!sqlite_database_page_bytes(&startup_logical,&startup_page_size)) {
+    sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
+    evidence_cache_unlock(); return -1;
+  }
+  s_evidence_wal_page_size=startup_page_size;
+  (void)sqlite3_wal_hook(s_db,sqlite_guarded_autocheckpoint,NULL);
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   s_test_commit_failures = 0u;
   s_test_manifest_allocation_failures = 0u;
@@ -5865,6 +6866,13 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
       "endpoint_id TEXT NOT NULL,key_path TEXT NOT NULL,value_name TEXT NOT NULL,op TEXT NOT NULL,"
       "pid INTEGER NOT NULL,last_seen_ns INTEGER,"
       "PRIMARY KEY(endpoint_id,key_path,value_name,op,pid));"
+      "CREATE INDEX IF NOT EXISTS idx_process_cache_retention ON process_cache(last_seen_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_file_evidence_retention ON file_evidence(last_seen_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_network_ioc_retention ON network_ioc(last_seen_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_registry_evidence_retention ON registry_evidence(last_seen_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_command_results_retention ON command_results(updated_ns);"
+      "CREATE INDEX IF NOT EXISTS idx_artifacts_pmfe_terminal_retention ON artifacts(created_ns) "
+      "WHERE artifact_type='pmfe_followup_local_v1' AND upload_status IN('completed','expired','conflict');"
       "CREATE TABLE IF NOT EXISTS forensic_jobs ("
       "task_id TEXT PRIMARY KEY,status TEXT,evidence_refs TEXT,upload_refs TEXT,error TEXT,"
       "retryable INTEGER,updated_ns INTEGER);";
@@ -5881,13 +6889,17 @@ int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
   }
   if (sqlite_ensure_process_cache_generation_columns() != 0 ||
       sqlite_ensure_p0_candidate_columns() != 0 ||
+      sqlite_retention_metadata_open() != 0 ||
       sqlite_migrate_legacy_context_artifacts() != 0) {
     evidence_cache_close_locked();
     evidence_cache_unlock();
     return -1;
   }
   sqlite_maintenance(0);
-  (void)exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';");
+  if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES) ||
+      exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';") != 0) {
+    evidence_cache_close_locked(); evidence_cache_unlock(); return -1;
+  }
   evidence_cache_unlock();
   edr_egress_set_pmfe_association_validator(pmfe_association_validate,NULL);
   edr_egress_set_pmfe_receipt_handler(pmfe_receipt_handler,NULL);
@@ -6837,6 +7849,7 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   }
   evidence_cache_lock();
   EdrEvidenceCacheStatus st = s_status;
+  st.query_pin_exhausted=atomic_load_explicit(&s_query_pin_exhausted,memory_order_relaxed);
   st.write_budget_used = s_write_budget_count;
 #if defined(EDR_HAVE_SQLITE)
   EvidenceWriteBudgetLimits write_limits = sqlite_write_budget_limits();
@@ -7004,6 +8017,7 @@ typedef struct {
   uint64_t process_creation_filetime_100ns;
   uint32_t limit;
   uint32_t time_window_s;
+  int64_t from_ns, until_ns;
   char endpoint_id[48];
   char process_name_contains[513];
   char process_path_contains[4097];
@@ -7104,31 +8118,6 @@ static int json_get_string(const char *json, const char *key, char *out, size_t 
   }
   out[o] = '\0';
   return out[0] ? 0 : -1;
-}
-
-static int json_get_u32(const char *json, const char *key, uint32_t *out) {
-  if (!json || !key || !out) {
-    return -1;
-  }
-  char pat[80];
-  snprintf(pat, sizeof(pat), "\"%s\"", key);
-  const char *p = strstr(json, pat);
-  if (!p) {
-    return -1;
-  }
-  const char *colon = strchr(p + strlen(pat), ':');
-  if (!colon) {
-    return -1;
-  }
-  while (*++colon && (isspace((unsigned char)*colon) || *colon == '"')) {
-  }
-  char *end = NULL;
-  unsigned long v = strtoul(colon, &end, 10);
-  if (end == colon || v > 0xffffffffUL) {
-    return -1;
-  }
-  *out = (uint32_t)v;
-  return 0;
 }
 
 static int json_get_u64(const char *json, const char *key, uint64_t *out) {
@@ -7272,7 +8261,8 @@ static int rtq_match_common(const RtqFilter *f, uint32_t type, uint32_t pid,
                             const char *file_path, const char *remote_ip, uint32_t remote_port,
                             const char *registry_key, uint64_t process_start_key,
                             uint64_t process_creation_filetime_100ns) {
-  int64_t cutoff = now_unix_ns() - (int64_t)f->time_window_s * 1000000000LL;
+  int64_t cutoff = f->from_ns ? f->from_ns : now_unix_ns() - (int64_t)f->time_window_s * 1000000000LL;
+  if (f->until_ns && (event_time_ns <= 0 || event_time_ns > f->until_ns)) return 0;
   if (event_time_ns > 0 && event_time_ns < cutoff) {
     return 0;
   }
@@ -7510,6 +8500,430 @@ static void append_json_array_items(char *out, size_t cap, size_t *off, int *fir
     appendf(out, cap, off, "%.*s", (int)n, b);
     *first = 0;
   }
+}
+
+/* A synchronous request owns at most one cache snapshot and the existing
+ * signed result envelope (<=16383 bytes). Try-lock failure is a visible finite
+ * pin-capacity refusal; no investigation can leave a permanent cache pin. */
+static int evidence_cache_try_query_lock(void) {
+#if defined(_WIN32)
+  if (!TryAcquireSRWLockExclusive(&s_evidence_cache_lock)) return 0;
+#else
+  if (pthread_mutex_trylock(&s_evidence_cache_lock) != 0) return 0;
+#endif
+  s_evidence_cache_lock_tls.wait_ns = 0;
+  s_evidence_cache_lock_tls.acquired_ns = evidence_cache_clock_ns();
+  return 1;
+}
+
+static int authorized_query_number(const cJSON *root, const char *name,
+                                  int64_t min, int64_t max, int64_t *out) {
+  const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, name);
+  if (!cJSON_IsNumber(v) || v->valuedouble < (double)min || v->valuedouble > (double)max ||
+      v->valuedouble != (double)(int64_t)v->valuedouble) return 0;
+  *out = (int64_t)v->valuedouble; return 1;
+}
+
+static cJSON *authorized_query_row(const RtqFilter *f, const char *source,
+    int64_t ts, uint32_t type, uint32_t pid, uint32_t ppid, const char *const fields[16]) {
+  static const char *const names[16] = {"endpoint_id", "process_name", "exe_path", "cmdline",
+    "file_path", "dns_query", "remote_ip", "registry_key", "registry_value", "registry_op",
+    "process_start_key", "process_creation_filetime_100ns", "process_generation_source",
+    "source_completeness", "source_truncated_fields", "dst_port"};
+  cJSON *row = cJSON_CreateObject();
+  if (!row || !cJSON_AddStringToObject(row, "source", source) ||
+      !cJSON_AddNumberToObject(row, "event_time_ns", (double)ts) ||
+      !cJSON_AddNumberToObject(row, "type", type) || !cJSON_AddNumberToObject(row, "pid", pid) ||
+      !cJSON_AddNumberToObject(row, "ppid", ppid)) goto failed;
+  for (unsigned i = 0; i < 15; ++i) {
+    if (i == 3 && !f->cmdline_contains[0]) continue;
+    if (i == 4 && !f->file_path_contains[0] && (!f->has_type || f->type != EDR_EVENT_FILE_WRITE)) continue;
+    if (i == 5 && (!f->has_type || f->type != EDR_EVENT_NET_DNS_QUERY)) continue;
+    if (i == 6 && !f->remote_ip[0] && !f->remote_port && (!f->has_type || f->type != EDR_EVENT_NET_CONNECT)) continue;
+    if (i >= 7 && i <= 9 && !f->registry_key_contains[0] && (!f->has_type || f->type != EDR_EVENT_REG_SET_VALUE)) continue;
+    const char *value = fields[i] ? fields[i] : "";
+    if (strlen(value) > 8192u || !manifest_utf8_valid(value) || !cJSON_AddStringToObject(row, names[i], value)) goto failed;
+  }
+  if (f->remote_ip[0] || f->remote_port || (f->has_type && f->type == EDR_EVENT_NET_CONNECT)) {
+    if (!cJSON_AddNumberToObject(row, "dst_port", fields[15] ? strtoul(fields[15], NULL, 10) : 0)) goto failed;
+  }
+  return row;
+failed:
+  cJSON_Delete(row); return NULL;
+}
+
+#if defined(EDR_HAVE_SQLITE)
+typedef struct { int64_t expires_ms; uint64_t until_mono_ns; } EvidenceQueryDeadline;
+static int authorized_query_interrupted(void *arg) {
+  const EvidenceQueryDeadline *deadline = (const EvidenceQueryDeadline *)arg;
+  return now_unix_ns()/1000000LL >= deadline->expires_ms ||
+         edr_monotonic_ns() >= deadline->until_mono_ns;
+}
+
+typedef struct {
+  const RtqFilter *filter;
+  EvidenceQueryDeadline *deadline;
+  cJSON *rows;
+  size_t envelope, *encoded_bytes;
+  unsigned *returned;
+  int *matched,*partial;
+  const char *error;
+} EvidenceQueueQuery;
+
+static int authorized_queue_cancel(void *opaque) {
+  EvidenceQueueQuery *q=opaque;
+  return authorized_query_interrupted(q->deadline);
+}
+static uint32_t evidence_wire_u32(const uint8_t *p) {
+  return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);
+}
+/* The frozen terminal protocol contains a numeric uint64 birth timestamp.
+ * Bind its decimal lexeme before cJSON can round it through double. Ambiguous
+ * duplicate members are rejected; this does not rewrite the frozen payload. */
+static const cJSON *evidence_unique_member(const cJSON *object,const char *name) {
+  const cJSON *found=NULL,*item=NULL;
+  if(!cJSON_IsObject(object)) return NULL;
+  cJSON_ArrayForEach(item,object) if(item->string && !strcmp(item->string,name)) {
+    if(found) return NULL;
+    found=item;
+  }
+  return found;
+}
+static int evidence_member_equals(const cJSON *object,const char *name,const char *expected) {
+  const cJSON *item=evidence_unique_member(object,name);
+  return cJSON_IsString(item) && !strcmp(item->valuestring,expected);
+}
+static int evidence_terminal_source_valid(const edr_v1_BehaviorEvent *event) {
+  if(event->has_behavior_alert || !event->process_start_key || !event->process_creation_filetime_100ns) return 0;
+  cJSON *ctx=cJSON_ParseWithOpts(event->ave_result_json,NULL,1);
+  const cJSON *terminal=evidence_unique_member(ctx,"enforcement_terminal");
+  const cJSON *process=evidence_unique_member(terminal,"process");
+  const cJSON *pid=evidence_unique_member(terminal,"process_pid");
+  const cJSON *birth=evidence_unique_member(process,"creation_filetime_100ns");
+  char generation[32];
+  snprintf(generation,sizeof(generation),"startkey-%016llx",(unsigned long long)event->process_start_key);
+  int valid=evidence_member_equals(terminal,"phase","result") &&
+      evidence_member_equals(terminal,"source_event_key",event->event_id) &&
+      evidence_member_equals(terminal,"source_event_id",event->event_id) &&
+      cJSON_IsNumber(pid) && pid->valuedouble==(double)event->pid &&
+      evidence_member_equals(process,"generation_key",generation) && cJSON_IsNumber(birth);
+  static const char key[]="\"creation_filetime_100ns\"";
+  const char *p=event->ave_result_json; unsigned found=0;
+  while(valid && (p=strstr(p,key))) {
+    p+=sizeof(key)-1u; while(isspace((unsigned char)*p)) ++p;
+    if(*p++!=':') { valid=0; break; }
+    while(isspace((unsigned char)*p)) ++p;
+    uint64_t value=0; unsigned digits=0;
+    if(*p<'1' || *p>'9') { valid=0; break; }
+    while(*p>='0' && *p<='9') {
+      if(value>(UINT64_MAX-(uint64_t)(*p-'0'))/10u) { valid=0; break; }
+      value=value*10u+(uint64_t)(*p++-'0'); ++digits;
+    }
+    while(isspace((unsigned char)*p)) ++p;
+    if(!valid || digits>20 || value!=event->process_creation_filetime_100ns ||
+        (*p!=',' && *p!='}') || found++) { valid=0; break; }
+  }
+  cJSON_Delete(ctx); return valid && found==1u;
+}
+/* Existing BAT1/BLZ4 framing and nanopb messages, projected through the same
+ * signed-purpose field selector as candidate rows. No raw wire enters JSON. */
+static int authorized_queue_visit(const char *event_id,const EdrStorageQueueLocalEvidenceOwner *owner,
+    const uint8_t *wire,size_t size,void *opaque) {
+  EvidenceQueueQuery *q=opaque;
+  const RtqFilter *f=q->filter;
+  uint8_t *decoded=NULL;
+  edr_v1_BehaviorEvent *event=NULL;
+  cJSON *row=NULL; char *encoded=NULL;
+  int result=-1;
+  if(authorized_queue_cancel(q)) { q->error="evidence query deadline reached"; return -1; }
+  if(!wire || size<=16 || size>4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES || evidence_wire_u32(wire+4)!=1u) goto malformed;
+  uint32_t magic=evidence_wire_u32(wire),raw=evidence_wire_u32(wire+8);
+  if(raw<5 || raw>4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES) goto malformed;
+  const uint8_t *body=wire+12;
+  if(magic==EDR_TRANSPORT_BATCH_MAGIC_RAW) { if(raw!=size-12) goto malformed; }
+  else if(magic==EDR_TRANSPORT_BATCH_MAGIC_LZ4) {
+#ifdef EDR_HAVE_LZ4
+    decoded=malloc(raw); if(!decoded) goto allocation_failed;
+    if(LZ4_decompress_safe((const char*)body,(char*)decoded,(int)(size-12),(int)raw)!=(int)raw) goto malformed;
+    body=decoded;
+#else
+    q->error="evidence query compressed decoder unavailable"; goto done;
+#endif
+  } else goto malformed;
+  if(evidence_wire_u32(body)!=raw-4u) goto malformed;
+  event=calloc(1,sizeof(*event)); if(!event) goto allocation_failed;
+  pb_istream_t stream=pb_istream_from_buffer(body+4,raw-4);
+  if(!pb_decode(&stream,edr_v1_BehaviorEvent_fields,event) || stream.bytes_left ||
+      strcmp(event->event_id,event_id) || strcmp(event->tenant_id,owner->tenant_id) ||
+      strcmp(event->endpoint_id,owner->endpoint_id) || event->event_time_ns!=owner->event_time_ns ||
+      event->type!=(int32_t)owner->event_type || event->pid!=owner->pid || event->ppid!=owner->parent_pid ||
+      event->process_start_key!=owner->process_start_key ||
+      event->process_creation_filetime_100ns!=owner->process_creation_filetime_100ns) goto malformed;
+  if(!strcmp(owner->diagnostic_reason,"enforcement_terminal_result") && !evidence_terminal_source_valid(event)) goto malformed;
+  const char *file=event->which_detail==edr_v1_BehaviorEvent_file_tag ? event->detail.file.target_path : "";
+  const char *ip=event->which_detail==edr_v1_BehaviorEvent_network_tag ? event->detail.network.dst_ip : "";
+  const char *dns=event->which_detail==edr_v1_BehaviorEvent_dns_tag ? event->detail.dns.query_name : "";
+  const char *reg=event->which_detail==edr_v1_BehaviorEvent_registry_tag ? event->detail.registry.key_path : "";
+  const char *value=event->which_detail==edr_v1_BehaviorEvent_registry_tag ? event->detail.registry.value_name : "";
+  const char *op=event->which_detail==edr_v1_BehaviorEvent_registry_tag ? event->detail.registry.operation : "";
+  uint32_t port=event->which_detail==edr_v1_BehaviorEvent_network_tag ? event->detail.network.dst_port : 0u;
+  if(!rtq_match_common(f,(uint32_t)event->type,event->pid,event->event_time_ns,event->endpoint_id,event->process_name,
+      event->cmdline,event->exe_path,file,ip,port,reg,event->process_start_key,event->process_creation_filetime_100ns)) {
+    result=1; goto done;
+  }
+  if(f->cmdline_contains[0] && strlen(event->cmdline)>8192u) { q->error="requested command exceeds the authorized field byte budget"; goto done; }
+  char start[32],creation[32],port_text[16];
+  sqlite_u64_decimal(event->process_start_key,start); sqlite_u64_decimal(event->process_creation_filetime_100ns,creation);
+  snprintf(port_text,sizeof(port_text),"%u",port);
+  const char *fields[16]={event->endpoint_id,event->process_name,event->exe_path,event->cmdline,file,dns,ip,reg,value,op,
+      start,creation,event->process_generation_source,event->source_completeness,event->truncated_fields,port_text};
+  row=authorized_query_row(f,"event_queue",event->event_time_ns,(uint32_t)event->type,event->pid,event->ppid,fields);
+  if(!row || !(encoded=cJSON_PrintUnformatted(row))) goto allocation_failed;
+  *q->matched=1;
+  size_t bytes=strlen(encoded)+1u;
+  if(*q->returned>=f->limit || *q->encoded_bytes>q->envelope || bytes>q->envelope-*q->encoded_bytes) {
+    *q->partial=1; result=0; goto done;
+  }
+  if(!cJSON_AddItemToArray(q->rows,row)) goto allocation_failed;
+  row=NULL; *q->encoded_bytes+=bytes; ++*q->returned;
+  result=*q->returned<f->limit ? 1 : 0;
+  if(!result) *q->partial=1;
+  goto done;
+malformed:
+  q->error="evidence query local wire identity or encoding invalid"; goto done;
+allocation_failed:
+  q->error="evidence query local projection allocation failed";
+done:
+  cJSON_free(encoded); cJSON_Delete(row); free(event); free(decoded); return result;
+}
+
+#endif
+
+int edr_local_evidence_cache_query_authorized_json(const char *command_id,
+    const EdrSoarCommandMeta *meta, char *out, size_t cap) {
+  if (!out || cap < 256u) return -1;
+  copy_s(out, cap, "evidence query authorization invalid");
+  if (!command_id || !meta) return -1;
+  const EdrCommandResultAuthorization *a = &meta->result_authorization;
+  if (!memchr(a->command_id, 0, sizeof(a->command_id)) ||
+      !memchr(a->command_type, 0, sizeof(a->command_type)) ||
+      !memchr(a->tenant_id, 0, sizeof(a->tenant_id)) || !a->tenant_id[0] ||
+      !memchr(a->endpoint_id, 0, sizeof(a->endpoint_id)) || !a->endpoint_id[0] ||
+      !memchr(a->content_contract, 0, sizeof(a->content_contract)) ||
+      strcmp(a->command_id, command_id) || strcmp(a->command_type, "rtq_query")) return -1;
+  int64_t now_ms = now_unix_ns()/1000000LL;
+  if (meta->issued_at_unix_ms <= 0 || !meta->deadline_ms ||
+      meta->issued_at_unix_ms > INT64_MAX-(int64_t)meta->deadline_ms ||
+      now_ms < meta->issued_at_unix_ms || now_ms >= meta->issued_at_unix_ms+meta->deadline_ms ||
+      now_ms >= a->expires_unix_ms) { copy_s(out, cap, "evidence query authorization expired"); return -1; }
+  cJSON *contract = edr_egress_parse_purpose_object(a->content_contract, strlen(a->content_contract));
+  const cJSON *kind = cJSON_GetObjectItemCaseSensitive(contract, "kind");
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(contract, "schema");
+  const cJSON *request = cJSON_GetObjectItemCaseSensitive(contract, "request");
+  int64_t max_bytes, max_rows, window, issued;
+  char *request_json = NULL;
+  RtqFilter filter;
+  if (!cJSON_IsString(kind) || strcmp(kind->valuestring, "cached_rtq") ||
+      !cJSON_IsString(schema) || strcmp(schema->valuestring, "edr.command.result-purpose.v1") ||
+      !cJSON_IsObject(request) || !authorized_query_number(contract, "max_bytes", 256, 16383, &max_bytes) ||
+      !authorized_query_number(contract, "max_rows", 1, 1000, &max_rows) ||
+      !authorized_query_number(contract, "window_s", 1, 604800, &window) ||
+      !authorized_query_number(contract, "issued_unix_ms", 1, INT64_MAX/1000000LL-300000, &issued) ||
+      issued != meta->issued_at_unix_ms || !(request_json = cJSON_PrintUnformatted(request)) ||
+      parse_rtq_filter(request_json, &filter) || filter.limit != (uint32_t)max_rows ||
+      filter.time_window_s != (uint32_t)window ||
+      (filter.endpoint_id[0] && strcmp(filter.endpoint_id, a->endpoint_id)) ||
+      strlen(a->endpoint_id) >= sizeof(filter.endpoint_id)) {
+    cJSON_free(request_json); cJSON_Delete(contract); return -1;
+  }
+  cJSON_free(request_json); cJSON_Delete(contract);
+  if (filter.file_sha256[0] && (filter.pid || filter.has_process_start_key || filter.has_process_creation_filetime_100ns ||
+      filter.process_name_contains[0] || filter.process_path_contains[0] || filter.cmdline_contains[0] ||
+      filter.remote_ip[0] || filter.remote_port || filter.registry_key_contains[0] ||
+      (filter.has_type && filter.type != EDR_EVENT_FILE_WRITE))) {
+    copy_s(out, cap, "evidence hash query does not support the requested combined scope"); return -1;
+  }
+  copy_s(filter.endpoint_id, sizeof(filter.endpoint_id), a->endpoint_id);
+  int64_t from_ns = (issued-window*1000LL)*1000000LL;
+  int64_t until_ns = (issued+300000LL)*1000000LL;
+  /* Match the frozen request's clock, not a later execution wall clock. */
+  filter.from_ns = from_ns; filter.until_ns = until_ns;
+  size_t envelope = cap-1u < (size_t)max_bytes ? cap-1u : (size_t)max_bytes;
+  if (!evidence_cache_try_query_lock()) {
+    atomic_fetch_add_explicit(&s_query_pin_exhausted,1u,memory_order_relaxed);
+    copy_s(out, cap, "evidence query pin capacity exhausted"); return -2;
+  }
+  int rc = -1, partial = 0, matched = 0;
+  unsigned scanned = 0, returned = 0;
+  size_t encoded_bytes = 256u; /* bounded result metadata and separators */
+  cJSON *result = cJSON_CreateObject(), *rows = result ? cJSON_AddArrayToObject(result, "rows") : NULL;
+#if defined(EDR_HAVE_SQLITE)
+  sqlite3_stmt *st = NULL;
+  EdrBehaviorRecord *command_identity = NULL;
+  int transaction = 0;
+  EvidenceQueryDeadline deadline = {meta->issued_at_unix_ms+meta->deadline_ms, 0};
+  if (deadline.expires_ms > a->expires_unix_ms) deadline.expires_ms = a->expires_unix_ms;
+  uint64_t mono = edr_monotonic_ns(), remaining = (uint64_t)(deadline.expires_ms-now_ms)*1000000ULL;
+  deadline.until_mono_ns = UINT64_MAX-mono < remaining ? UINT64_MAX : mono+remaining;
+  if (!s_db || !rows) { copy_s(out, cap, "evidence query storage unavailable"); goto finish; }
+  if (filter.cmdline_contains[0]) {
+    command_identity = calloc(1, sizeof(*command_identity));
+    if (!command_identity) goto allocation_failed;
+    copy_s(command_identity->tenant_id, sizeof(command_identity->tenant_id), a->tenant_id);
+    copy_s(command_identity->endpoint_id, sizeof(command_identity->endpoint_id), a->endpoint_id);
+  }
+  sqlite3_progress_handler(s_db, 1000, authorized_query_interrupted, &deadline);
+  if (exec_sql("BEGIN;") != 0) { copy_s(out, cap, "evidence query snapshot busy"); goto finish; }
+  transaction = 1;
+  if (!filter.file_sha256[0]) {
+    for (unsigned i = 0; i < EDR_EVIDENCE_RING_SLOTS && returned < filter.limit; ++i) {
+      const RingSlot *r = &s_ring[(s_ring_pos+EDR_EVIDENCE_RING_SLOTS-1u-i)%EDR_EVIDENCE_RING_SLOTS];
+      if (!r->used || strcmp(r->tenant_id, a->tenant_id) || strcmp(r->endpoint_id, a->endpoint_id)) continue;
+      ++scanned;
+      if (!rtq_match_common(&filter, r->type, r->pid, r->event_time_ns, r->endpoint_id, r->process_name, "", "", r->file_path,
+          r->net_dst, r->net_dport, "", r->generation.process_start_key, r->generation.creation_filetime_100ns)) continue;
+      char start[32], creation[32], port[16];
+      sqlite_u64_decimal(r->generation.process_start_key, start); sqlite_u64_decimal(r->generation.creation_filetime_100ns, creation);
+      snprintf(port, sizeof(port), "%u", r->net_dport);
+      const char *fields[16] = {r->endpoint_id, r->process_name, "", "", r->file_path, "", r->net_dst, "", "", "",
+          start, creation, r->process_generation_source, r->source_completeness, r->source_truncated_fields, port};
+      cJSON *row = authorized_query_row(&filter, "ring", r->event_time_ns, r->type, r->pid, r->ppid, fields);
+      if (!row) goto allocation_failed;
+      matched = 1;
+      char *encoded = cJSON_PrintUnformatted(row);
+      if (!encoded) { cJSON_Delete(row); goto allocation_failed; }
+      size_t row_bytes = strlen(encoded)+1u; cJSON_free(encoded);
+      if (encoded_bytes > envelope || row_bytes > envelope-encoded_bytes) { cJSON_Delete(row); partial=1; break; }
+      if (!cJSON_AddItemToArray(rows, row)) { cJSON_Delete(row); goto allocation_failed; }
+      encoded_bytes += row_bytes; ++returned;
+    }
+  }
+  const char *sql = filter.file_sha256[0] ?
+      "SELECT f.path,f.sha256,f.pid,f.last_seen_ns FROM file_evidence f "
+      "WHERE f.endpoint_id=?1 AND f.last_seen_ns>=?3 AND f.last_seen_ns<=?4 AND f.sha256=?6 COLLATE NOCASE "
+      "AND EXISTS(SELECT 1 FROM p0_candidates p WHERE p.endpoint_id=f.endpoint_id AND p.tenant_id=?2 AND p.file_path=f.path "
+      "AND p.event_time_ns=f.last_seen_ns AND p.local_retention_state='retained' AND (?7=0 OR p.type=?7)) ORDER BY f.last_seen_ns DESC LIMIT ?5;" :
+      "SELECT event_time_ns,type,pid,ppid,endpoint_id,process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,"
+      "reg_key_path,reg_value_name,reg_op,process_start_key,process_creation_filetime_100ns,process_generation_source,"
+      "source_completeness,source_truncated_fields,subject_command_fact_id FROM p0_candidates "
+      "WHERE endpoint_id=?1 AND tenant_id=?2 AND event_time_ns>=?3 AND event_time_ns<=?4 AND local_retention_state='retained' "
+      "ORDER BY event_time_ns DESC LIMIT ?5;";
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_text(st, 1, a->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_text(st, 2, a->tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 3, from_ns) != SQLITE_OK || sqlite3_bind_int64(st, 4, until_ns) != SQLITE_OK ||
+      sqlite3_bind_int(st, 5, (int)(filter.limit*20u+100u)) != SQLITE_OK ||
+      (filter.file_sha256[0] && (sqlite3_bind_text(st, 6, filter.file_sha256, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+       sqlite3_bind_int64(st, 7, filter.has_type ? filter.type : 0u) != SQLITE_OK))) {
+    copy_s(out, cap, "evidence query snapshot prepare failed"); goto finish;
+  }
+  int step = SQLITE_DONE;
+  while (returned < filter.limit && (step = sqlite3_step(st)) == SQLITE_ROW) {
+    ++scanned;
+    cJSON *row = NULL;
+    if (filter.file_sha256[0]) {
+      const char *path = (const char *)sqlite3_column_text(st, 0), *sha = (const char *)sqlite3_column_text(st, 1);
+      if (!contains_ci(path, filter.file_path_contains) || !path_ext_matches(path, filter.file_ext)) continue;
+      row = cJSON_CreateObject();
+      if (!row || !cJSON_AddStringToObject(row, "type", "file") || !cJSON_AddStringToObject(row, "source", "file_evidence") ||
+          !cJSON_AddStringToObject(row, "path", path ? path : "") || !cJSON_AddStringToObject(row, "sha256", sha ? sha : "") ||
+          !cJSON_AddBoolToObject(row, "cache_hit", 1)) { cJSON_Delete(row); goto allocation_failed; }
+    } else {
+      int64_t ts = sqlite3_column_int64(st, 0);
+      uint32_t type = (uint32_t)sqlite3_column_int64(st, 1), pid = (uint32_t)sqlite3_column_int64(st, 2), ppid = (uint32_t)sqlite3_column_int64(st, 3);
+      const int columns[] = {4,5,6,7,8,9,10,12,13,14,15,16,17,18,19,11};
+      const char *fields[16];
+      for (unsigned i = 0; i < 16; ++i) fields[i] = (const char *)sqlite3_column_text(st, columns[i]);
+      uint64_t start = 0, creation = 0;
+      (void)sqlite_decimal_u64(fields[10], &start); (void)sqlite_decimal_u64(fields[11], &creation);
+      char *complete_command = NULL;
+      const char *command_ref = (const char *)sqlite3_column_text(st, 20);
+      if (command_identity && command_ref && command_ref[0]) {
+        command_identity->pid = pid; command_identity->process_start_key = start;
+        command_identity->process_creation_filetime_100ns = creation;
+        char expected_ref[80];
+        if (!command_fact_key(command_identity, expected_ref) || strcmp(expected_ref, command_ref) ||
+            !(complete_command = read_command_fact_locked(command_identity))) {
+          copy_s(out, cap, "evidence query command fact unavailable or conflicted"); goto finish;
+        }
+        fields[3] = complete_command;
+      }
+      if (!rtq_match_common(&filter, type, pid, ts, fields[0], fields[1], fields[3], fields[2], fields[4], fields[6],
+          (uint32_t)sqlite3_column_int64(st, 11), fields[7], start, creation)) { free(complete_command); continue; }
+      if (complete_command && strlen(complete_command) > 8192u) {
+        free(complete_command); copy_s(out, cap, "requested command exceeds the authorized field byte budget"); goto finish;
+      }
+      row = authorized_query_row(&filter, "p0_candidates", ts, type, pid, ppid, fields);
+      free(complete_command);
+      if (!row) goto allocation_failed;
+    }
+    matched = 1;
+    char *encoded = cJSON_PrintUnformatted(row);
+    if (!encoded) { cJSON_Delete(row); goto allocation_failed; }
+    size_t row_bytes = strlen(encoded)+1u; cJSON_free(encoded);
+    if (encoded_bytes > envelope || row_bytes > envelope-encoded_bytes || returned == filter.limit) {
+      cJSON_Delete(row); partial = 1; break;
+    }
+    if (!cJSON_AddItemToArray(rows, row)) { cJSON_Delete(row); goto allocation_failed; }
+    encoded_bytes += row_bytes; ++returned;
+  }
+  if (step != SQLITE_DONE && step != SQLITE_ROW) { copy_s(out, cap, "evidence query snapshot failed or deadline reached"); goto finish; }
+  if (returned == filter.limit || scanned >= filter.limit*20u+100u) partial = 1;
+  sqlite3_finalize(st); st = NULL;
+  if (authorized_query_interrupted(&deadline)) { copy_s(out, cap, "evidence query deadline reached"); goto finish; }
+  if (exec_sql("COMMIT;") != 0) { copy_s(out, cap, "evidence query snapshot close failed"); goto finish; }
+  transaction = 0;
+  if(!filter.file_sha256[0] && returned<filter.limit) {
+    EdrStorageQueueLocalQuery query={0};
+    query.tenant_id=a->tenant_id; query.endpoint_id=a->endpoint_id;
+    query.from_ns=from_ns; query.until_ns=until_ns; query.has_type=filter.has_type;
+    query.event_type=filter.type; query.pid=filter.pid;
+    query.has_process_start_key=filter.has_process_start_key;
+    query.has_process_creation_filetime_100ns=filter.has_process_creation_filetime_100ns;
+    query.process_start_key=filter.process_start_key; query.process_creation_filetime_100ns=filter.process_creation_filetime_100ns;
+    query.max_rows=1000; query.max_scan=filter.limit*20u+100u;
+    query.max_payload_bytes=4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES; query.until_mono_ns=deadline.until_mono_ns;
+    EvidenceQueueQuery context={&filter,&deadline,rows,envelope,&encoded_bytes,&returned,&matched,&partial,NULL};
+    EdrStorageQueueLocalQueryStats query_stats={0};
+    int queue_result=edr_storage_queue_query_local_snapshot(&query,authorized_queue_visit,authorized_queue_cancel,&context,&query_stats);
+    scanned+=query_stats.scanned;
+    if(queue_result<0) {
+      if(queue_result==-2) atomic_fetch_add_explicit(&s_query_pin_exhausted,1u,memory_order_relaxed);
+      copy_s(out,cap,context.error ? context.error : queue_result==-2 ? "evidence query queue pin unavailable or exhausted" :
+          queue_result==-4 ? "evidence query local wire exceeds snapshot byte budget" :
+          queue_result==-5 ? "evidence query deadline reached" : "evidence query queue integrity or storage failure");
+      goto finish;
+    }
+    if(queue_result>0) partial=1;
+  }
+#else
+  (void)from_ns; (void)until_ns; (void)scanned; (void)encoded_bytes;
+  copy_s(out, cap, "evidence query storage unavailable"); goto finish;
+#endif
+  if (matched && !returned) { copy_s(out, cap, "evidence query result byte budget exhausted"); goto finish; }
+  const char *reason = matched ? "available" :
+      until_ns < now_unix_ns()-(int64_t)s_status.selected_retention_hours*3600LL*1000000000LL ?
+      "outside_retention_window" : "not_collected_or_expired";
+  if (!cJSON_AddStringToObject(result, "source", "mixed") || !cJSON_AddBoolToObject(result, "partial", partial) ||
+      !cJSON_AddStringToObject(result, "availability_reason", reason) || !cJSON_AddBoolToObject(result, "absence_is_evidence", 0) ||
+      !cJSON_AddNumberToObject(result, "rows_scanned", scanned) || !cJSON_AddNumberToObject(result, "rows_returned", returned)) goto allocation_failed;
+  char *encoded = cJSON_PrintUnformatted(result);
+  if (!encoded) goto allocation_failed;
+  if (strlen(encoded) <= envelope) { copy_s(out, cap, encoded); rc = 0; }
+  else copy_s(out, cap, "evidence query result byte budget exhausted");
+  cJSON_free(encoded); goto finish;
+allocation_failed:
+  copy_s(out, cap, "evidence query result allocation or field validation failed");
+finish:
+#if defined(EDR_HAVE_SQLITE)
+  sqlite3_finalize(st);
+  if (s_db) sqlite3_progress_handler(s_db, 0, NULL, NULL);
+  if (transaction) sqlite_rollback_silent();
+  free(command_identity);
+#endif
+  cJSON_Delete(result);
+  evidence_cache_unlock();
+  return rc;
 }
 
 int edr_local_evidence_cache_query_json(const char *payload_json, char *out, size_t cap) {
@@ -7883,10 +9297,17 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
       "{\"scope\":\"current_process\",\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
       "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s,"
       "\"pmfe_followup\":{\"scheduled\":%u,\"running\":%u,\"result_bound\":%u,\"result_acked_await_queue\":%u,"
-      "\"active\":%u,\"expired\":%u,\"capacity\":64,\"failures\":%llu,\"cause_code\":%u}}",
+      "\"active\":%u,\"expired\":%u,\"capacity\":64,\"failures\":%llu,\"cause_code\":%u},"
+      "\"budget_protection\":{\"physical_refusals\":%llu,\"physical_guard_failures\":%llu,\"query_pin_exhausted\":%llu,\"cause_code\":%u},"
+      "\"local_retention\":{\"policy_version\":1,\"groups_retired\":%llu,\"held_decisions\":%llu,"
+      "\"failures\":%llu,\"legacy_candidates_at_open\":%llu,\"recent_hours\":%u,\"selected_hours\":%u}}",
       ordinary_reasons, candidate_failures, context_failures,
       st->pmfe_scheduled,st->pmfe_running,st->pmfe_result_bound,st->pmfe_result_acked,
-      st->pmfe_active,st->pmfe_expired,(unsigned long long)st->pmfe_failures,st->pmfe_cause_code);
+      st->pmfe_active,st->pmfe_expired,(unsigned long long)st->pmfe_failures,st->pmfe_cause_code,
+      (unsigned long long)st->physical_refusals,(unsigned long long)st->physical_guard_failures,
+      (unsigned long long)st->query_pin_exhausted,st->physical_cause_code,
+      (unsigned long long)st->retention_groups_retired,(unsigned long long)st->retention_groups_held,
+      (unsigned long long)st->retention_failures,(unsigned long long)st->retention_legacy_candidates,st->retention_hours,st->selected_retention_hours);
   if (written < 0 || (size_t)written >= cap) { out[0] = '\0'; return -1; }
   return 0;
 }
@@ -7934,7 +9355,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"p0_candidates\":{\"written\":%llu,\"rows\":%llu},"
            "\"artifacts\":{\"written\":%llu,\"context_facts_written\":%llu,"
            "\"context_refs_written\":%llu,\"context_ref_write_sources\":%s},"
-           "\"command_results\":{\"written\":%llu},\"metrics\":{\"minutes\":%u}},"
+           "\"command_results\":{\"written\":%llu,\"capacity_rejected\":%llu,\"failed\":%llu},\"metrics\":{\"minutes\":%u}},"
            "\"coalesced\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu},"
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu},"
            "\"accounting\":%s,"
@@ -8022,7 +9443,9 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (unsigned long long)st.artifacts_written,
            (unsigned long long)st.context_facts_written,
            (unsigned long long)st.context_refs_written, context_ref_sources,
-           (unsigned long long)st.command_results_written, st.metrics_minutes,
+           (unsigned long long)st.command_results_written,
+           (unsigned long long)st.command_results_capacity_rejected,
+           (unsigned long long)st.command_results_failed, st.metrics_minutes,
            (unsigned long long)st.file_coalesced,
            (unsigned long long)st.registry_coalesced,
            (unsigned long long)st.network_coalesced,

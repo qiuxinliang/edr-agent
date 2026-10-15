@@ -38,7 +38,8 @@ The source-only semantic evidence codec remains `p0-source-only-v2`. It is retai
 locally unchanged. Its **delivery owner** is explicitly version 3 in queue meta;
 this is not a new server protocol. The current source-only producer uses
 `edr_storage_queue_p0_source_only_latch_prepare_local` and
-`edr_storage_queue_p0_source_only_commit_local`.
+`edr_storage_queue_p0_source_only_commit_local_typed`. The untyped API remains
+for existing supported recovery/test consumers and cannot authorize retirement.
 
 ```mermaid
 stateDiagram-v2
@@ -61,9 +62,19 @@ pending retry owner and the existing FULL probe. Retaining another source cannot
 erase an overflow loss: an explicit local loss audit must be committed first.
 
 Local wires and held wires count toward the configured queue logical byte limit.
-They are not automatically deleted or evicted to make room. Capacity exhaustion
-returns explicit backpressure and activates existing observable family recovery
-handling. Physical WAL/SHM size remains a diagnostic, not admission authority.
+New local-v3 writes use the ordinary admission ceiling, leaving the existing
+terminal and remote source-only reservations unavailable to local facts. Capacity
+checking, payload insertion and local latch resolution share the FULL transaction.
+This does not reclassify old inventory or change remote-v2 admission behavior.
+New typed non-DIRECT diagnostics carry independent retention policy 2: expiry
+requires both insertion and event time to pass the configured target, exact
+scope/generation/hash validation, and a transaction-local recheck of all delivery,
+journal, projection, recovery and lineage owners. Unknown/untyped or referenced
+records stay protected. Retirement increments bounded reason counters and never
+sets ACK. Capacity exhaustion returns explicit backpressure and activates the
+existing observable family recovery handling. DB/WAL/SHM are separately measured;
+physical headroom now gates writes and checkpoints on their containing volume,
+without converting the logical queue budget into a whole-directory hard limit.
 Local retention does not have an unbounded separate outbox or worker. A configured
 zero limit now uses the finite 512 MiB default; a zero, invalid or out-of-range
 environment override falls back to the finite configured limit and reports
@@ -75,10 +86,11 @@ The limit covers retained logical bytes, not an enforced physical disk ceiling.
 
 ## Historical compatibility and release blockers
 
-The only schema extension records owner version; historical entries default to
-remote-v2. It does not modify payloads, batch IDs, compression or existing ACK
-semantics. This schema code was exercised only against disposable test databases
-in this task. No actual endpoint queue was opened or migrated.
+Additive owner, retention and accounting metadata preserve existing payloads,
+batch IDs, compression and ACK semantics. Historical retention policy 0 remains
+protected; the older delivery-owner migration still defaults historical entries
+to remote-v2. Migration tests use disposable databases. Actual endpoint deployment
+and migration status is recorded separately in `CACHE_RELIABILITY_REMEDIATION.md`.
 
 Missing singleton metadata is not confirmation of its former owner. Opening
 inventories all retained severity-2 wires, including `policy_held` and `corrupt`.
@@ -198,6 +210,16 @@ runtime consumers, without rewriting an existing original payload.
 
 ## Independent enforcement terminal frames
 
+New policy-3 terminals reserve full local source/result completion before action,
+using the actual full local intent size. Their journal is the sole full-source
+owner: no ordinary source duplicate or remote source obligation is created.
+Only intent and minimized combined frames require receipts. After both exact
+receipts, the independent local window starts; expiry may retire the journal
+only after all dependency/owner checks. Source ACK and source policy-held remain
+zero. Unknown outcomes and legacy policy-0 journals stay protected. The older
+compatibility rules below describe the three-frame delivery model and its legacy
+recovery behavior; they do not grant old journals the new retirement policy.
+
 Intent, source and combined frames each retain their own immutable ID/body,
 receipt flag, policy reason, hold flag, retry counter and durable deadline.
 Send-time policy rejection commits only that frame's `policy_held`; it does not
@@ -239,8 +261,8 @@ frame is never treated as successful logical alert migration.
 A known `ready` final outcome with source held/ACK 0 and **separate real intent
 and combined receipts** enters `local_retained`. This explicitly means local
 source retention plus remote intent/combined confirmation; it is not remote source ACK or an unknown action outcome.
-All wires/action identities/hashes remain retained and counted in finite capacity,
-and TTL cannot purge this state. It releases the 1,024 pending-action slot gate so
+All wires/action identities/hashes remain retained and counted in finite capacity;
+legacy policy-0 TTL cannot purge this state. It releases the 1,024 pending-action slot gate so
 an accumulated retained history does not permanently stop new actions. Exhausting
 total logical capacity still denies pre-action admission visibly. An
 `outcome_unknown` action never qualifies for this transition or re-execution.

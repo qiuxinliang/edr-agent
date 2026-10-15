@@ -53,9 +53,10 @@ int edr_parse_json_string(const uint8_t *p, size_t n, const char *k, char *out, 
 int edr_parse_json_int(const uint8_t *p, size_t n, const char *k, int *out) {
   (void)p; (void)n; (void)k; (void)out; return 0;
 }
-void edr_local_evidence_cache_record_command_result(const char *id, const char *type,
+int edr_local_evidence_cache_record_command_result(const char *id, const char *type,
     const char *status, int execution, int code, const char *detail, const char *artifacts) {
   (void)id; (void)type; (void)status; (void)execution; (void)code; (void)detail; (void)artifacts;
+  return 0;
 }
 
 static void verify_receipt(const char *id, int status, const char *reason) {

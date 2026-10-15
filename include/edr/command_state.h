@@ -12,6 +12,9 @@ extern "C" {
 #endif
 
 #define EDR_COMMAND_STATE_DETAIL_CAP 16384u
+/* Includes escaping, authorization and additive owner-capacity metadata. */
+#define EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP (EDR_COMMAND_STATE_DETAIL_CAP * 2u + 2u + 16384u + 16384u + 192u)
+#define EDR_COMMAND_STATE_DEFAULT_OWNER_BUDGET_BYTES (300ULL * 2ULL * EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP)
 
 /* Called only after external signature and command payload validation. */
 int edr_command_result_bind_contract(EdrCommandResultAuthorization *authority,
@@ -88,6 +91,19 @@ typedef struct EdrCommandStateQuarantineStats {
   char last_record_kind[32];
   char last_reason[96];
 } EdrCommandStateQuarantineStats;
+
+/* Independent JSONL owner admission budget; legacy bytes are protected and
+ * reported separately. This does not change the soft compaction target. */
+typedef struct EdrCommandStateCapacityStats {
+  uint64_t budget_bytes, new_record_bytes, legacy_bytes, reserved_bytes, protected_floor_bytes;
+  uint64_t reserved_owner_count, update_headroom_bytes, admission_rejected, persistence_failed, calibrations;
+  uint64_t record_count, reserved_record_slots;
+  char last_error[96];
+} EdrCommandStateCapacityStats;
+int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out);
+/* Installer preflight: validate existing ACLs; never repair ACLs, create parent
+ * directories or rewrite/compact the owner. Only the normal lock may be created. */
+int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out);
 
 enum {
   EDR_COMMAND_STATE_BEGIN_ERROR = -1,

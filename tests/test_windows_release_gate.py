@@ -38,6 +38,8 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
+    "windows_update_physical_guard", "windows_inno_evidence_space",
+    "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
     "openssl_tls_handshake", "windows_task_exit_behavior", "windows_task_trace_environment",
@@ -46,6 +48,8 @@ WINDOWS_EXPECTED = {
     "windows_headless_log_stream_initialization",
 }
 RUNTIME_EXPECTED = {
+    "storage_physical_guard", "storage_space_preflight", "shell_session_stream_completeness",
+    "authorized_local_query_contract", "evidence_startup_index_manifest",
     "installer_runtime_health_classification", "report_events_ack_contract",
     "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
@@ -126,7 +130,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
         """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
         names = ("windows_release_collector_pe_closure",
                  "windows_inplace_collector_transaction",
-                 "windows_installer_log_redaction")
+                 "windows_installer_log_redaction", "windows_update_physical_guard")
         definitions = (ROOT / "tests" / "CMakeLists.txt").read_text(encoding="utf-8")
         declarations = []
         for name in names:
@@ -142,6 +146,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
         properties = re.search(
             r"  set_tests_properties\(\s*windows_release_collector_pe_closure\s*"
             r"windows_inplace_collector_transaction\s*windows_installer_log_redaction\s*"
+            r"windows_update_physical_guard\s*"
             r"PROPERTIES TIMEOUT \d+\)", definitions)
         self.assertIsNotNone(properties)
         declarations.append(properties.group(0))
@@ -499,7 +504,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
             (source / "process.h").write_text(
                 'int _getpid(void);\nint _putenv_s(const char *, const char *);\n', encoding="utf-8")
             (source / "no_posix.h").write_text(
-                '#include <stdlib.h>\n#pragma GCC poison setenv unsetenv getpid usleep\n',
+                '#include <stdlib.h>\n#pragma GCC poison setenv unsetenv getpid usleep\n'
+                '/* DLL annotations only; preserve the real Windows API branch. */\n'
+                '#define __declspec(x)\n#define __stdcall\n#define __cdecl\n',
                 encoding="utf-8")
             lines = [
                 'cmake_minimum_required(VERSION 3.20)', 'project(QueueWindowsBranch C)',
@@ -514,7 +521,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 'find_package(SQLite3 REQUIRED)', cmake_source[begin:end],
                 f'add_library(queue_probe OBJECT "{(ROOT / "tests/test_storage_queue_sqlite.c").as_posix()}")',
                 definitions[0].replace("test_storage_queue_sqlite", "queue_probe"),
-                f'target_include_directories(queue_probe PRIVATE "{(ROOT / "include").as_posix()}")',
+                f'target_include_directories(queue_probe PRIVATE "{(ROOT / "include").as_posix()}" '
+                f'"{(ROOT / "third_party/cjson").as_posix()}")',
                 'if(TARGET SQLite3::SQLite3)',
                 '  target_link_libraries(queue_probe PRIVATE SQLite3::SQLite3)',
                 'else()', '  target_link_libraries(queue_probe PRIVATE SQLite::SQLite3)', 'endif()',
@@ -602,14 +610,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 '/* Windows SDK rpcndr.h exposes this MIDL type macro. */\n'
                 '#define small char\n'
                 'typedef uint32_t DWORD;\n#define WINAPI\n'
-                'typedef void *HANDLE;\ntypedef int BOOL;\n'
+                'typedef void *HANDLE;\ntypedef void *LPVOID;\ntypedef int BOOL;\n'
                 'HANDLE CreateThread(void *, size_t, DWORD (WINAPI *)(void *), void *, DWORD, DWORD *);\n'
-                '#define FALSE 0\n#define CREATE_NO_WINDOW 0x08000000\n#define WAIT_OBJECT_0 0\n'
+                '#define FALSE 0\n#define TRUE 1\n#define CREATE_NO_WINDOW 0x08000000\n#define WAIT_OBJECT_0 0\n'
                 'typedef struct { DWORD cb; } STARTUPINFOA;\n'
                 'typedef struct { HANDLE hProcess, hThread; } PROCESS_INFORMATION;\n'
                 'DWORD GetModuleFileNameA(HANDLE, char *, DWORD);\n'
                 'BOOL CreateProcessA(const char *, char *, void *, void *, BOOL, DWORD, void *, const char *, STARTUPINFOA *, PROCESS_INFORMATION *);\n'
                 'DWORD WaitForSingleObject(HANDLE, DWORD);\n'
+                'DWORD WaitForMultipleObjects(DWORD, const HANDLE *, BOOL, DWORD);\nvoid Sleep(DWORD);\n'
                 'BOOL TerminateProcess(HANDLE, unsigned);\n'
                 'BOOL GetExitCodeProcess(HANDLE, DWORD *);\nBOOL CloseHandle(HANDLE);\n'
                 'void ExitProcess(unsigned);\n'

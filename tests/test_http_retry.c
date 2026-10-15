@@ -226,6 +226,14 @@ int main(void) {
                    unavailable.calls == 1u,
                "an HTTP 503 response must be left to the durable retry layer");
 
+  RetryFixture limited = fixture_with("HTTP/1.1 429 Too Many Requests", "HTTP/1.1 200 OK");
+  outcome = edr_http_execute_request_attempts(
+      &spec, 2u, attempt_now_ms, &limited,
+      capture_transmission, &limited, &attempts);
+  ok &= expect(outcome == EDR_HTTP_ATTEMPT_RESPONSE_FAILURE && attempts == 1u &&
+                   limited.calls == 1u,
+               "an HTTP 429 response must be left to the durable retry layer");
+
   RetryFixture disconnected = fixture_with(NULL, NULL);
   outcome = edr_http_execute_request_attempts(
       &spec, 2u, attempt_now_ms, &disconnected,

@@ -1,4 +1,5 @@
 #include "edr/validation_trace.h"
+#include "core/storage_space_preflight.h"
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -432,6 +433,7 @@ static int edr_windows_install(const EdrWindowsInstallOptions *opt) {
 
 static void print_usage(const char *argv0) {
   fprintf(stderr, "       %s --evidence-cache-format-capabilities\n", argv0);
+  fprintf(stderr, "       %s --storage-space-preflight (--config <path>|--defaults) --output <new file>\n", argv0);
 #ifdef _WIN32
   fprintf(stderr, "       %s --evidence-cache-migrate --config <absolute path> "
                   "--evidence-cache-rollback-exe <absolute path> [--migration-timeout-ms <1..600000>]\n", argv0);
@@ -541,6 +543,10 @@ static int edr_agent_run_main(const char *config) {
   }
   {
     const EdrConfig *ac = edr_agent_get_config(agent);
+    uint32_t recent_hours = ac ? ac->offline.evidence_cache_retention_hours : 24u;
+    uint32_t selected_hours = ac ? ac->offline.evidence_cache_selected_retention_hours : 0u;
+    if (!selected_hours) selected_hours = ac ? ac->offline.retention_hours : 72u;
+    if (selected_hours < recent_hours) selected_hours = recent_hours;
     const char *epath = getenv("EDR_EVIDENCE_CACHE_PATH");
     if ((!epath || !epath[0]) && ac && ac->offline.evidence_cache_path[0]) {
       epath = ac->offline.evidence_cache_path;
@@ -548,18 +554,18 @@ static int edr_agent_run_main(const char *config) {
 #ifdef _WIN32
     edr_ensure_parent_dirs_win(epath);
 #endif
-    if (edr_local_evidence_cache_open(epath,
+    if (edr_local_evidence_cache_open_with_policy(epath,
                                       ac ? ac->offline.evidence_cache_max_size_mb : 128u,
-                                      ac ? ac->offline.evidence_cache_retention_hours : 24u) != 0) {
+                                      recent_hours, selected_hours) != 0) {
 #ifdef _WIN32
       if (epath && epath[0] && !edr_path_is_absolute_win(epath)) {
         char fallback[MAX_PATH * 4];
         snprintf(fallback, sizeof(fallback), "%s",
                  "C:\\Program Files\\FDSecurity\\evidence\\local_evidence_cache.db");
         edr_ensure_parent_dirs_win(fallback);
-        if (edr_local_evidence_cache_open(fallback,
+        if (edr_local_evidence_cache_open_with_policy(fallback,
                                           ac ? ac->offline.evidence_cache_max_size_mb : 128u,
-                                          ac ? ac->offline.evidence_cache_retention_hours : 24u) == 0) {
+                                          recent_hours, selected_hours) == 0) {
           fprintf(stderr, "[local_evidence_cache] using install-dir path (%s)\n", fallback);
         } else {
           EdrEvidenceCacheStatus st;
@@ -760,6 +766,8 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 #endif
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && !strcmp(argv[1], "--storage-space-preflight"))
+    return edr_storage_space_preflight_main(argc, argv);
   if (argc>=2 && !strcmp(argv[1],"--queue-recover-v1"))
     return edr_storage_queue_maintenance_main(argc,argv);
   if (argc == 2 && !strcmp(argv[1], "--evidence-cache-format-capabilities")) {

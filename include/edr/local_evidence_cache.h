@@ -50,6 +50,8 @@ typedef struct {
    * does not change admission, retention, or upload behavior. */
   uint64_t context_ref_writes_by_event_type[EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS];
   uint64_t command_results_written;
+  uint64_t command_results_capacity_rejected;
+  uint64_t command_results_failed;
   /* Durable PMFE ownership counts contain no event identifiers or evidence.
    * The ACK count remains active until its original queue row is removed. */
   uint32_t pmfe_scheduled;
@@ -106,6 +108,9 @@ typedef struct {
   uint32_t write_budget_ordinary_context_used;
   uint32_t write_budget_ordinary_context_limit;
   uint64_t db_budget_dropped;
+  uint64_t physical_refusals, physical_guard_failures, query_pin_exhausted;
+  /* 0 none, 1 volume floor, 2 guard/config query failure, 3 size overflow. */
+  uint32_t physical_cause_code;
   uint64_t pressure_dropped;
   uint64_t ordinary_coalesced;
   uint64_t file_coalesced;
@@ -145,6 +150,13 @@ typedef struct {
   uint64_t aggregate_slot_evictions;
   uint64_t db_retention_evicted;
   uint64_t db_capacity_evicted;
+  /* Current-process group decisions. Held counts are decisions, not distinct
+   * groups. Retirement never acknowledges a delivery or an action. */
+  uint64_t retention_groups_retired;
+  uint64_t retention_groups_held;
+  uint64_t retention_failures;
+  /* Startup inventory of legacy candidates that this policy cannot retire. */
+  uint64_t retention_legacy_candidates;
   uint64_t identity_target_4688;
   uint64_t identity_creator_fallback;
   uint64_t identity_cache;
@@ -194,6 +206,7 @@ typedef struct {
   uint64_t static_bytes;
   uint32_t max_db_mb;
   uint32_t retention_hours;
+  uint32_t selected_retention_hours;
   uint64_t db_bytes;
   uint64_t wal_bytes;
   uint64_t shm_bytes;
@@ -240,6 +253,11 @@ int edr_local_evidence_cache_maintenance_main(int argc, char **argv);
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
                                   uint32_t retention_hours);
+/* Policy is installed before startup maintenance. Legacy/unclassified groups
+ * are protected; selected applies only to explicitly classified new groups. */
+int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_mb,
+                                              uint32_t recent_hours,
+                                              uint32_t selected_hours);
 void edr_local_evidence_cache_close(void);
 
 /* Existing bounded artifacts partition owns immutable original/result wire,
@@ -289,8 +307,18 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r);
 /** 是否属于可落库/可上传的告警候选。普通 ETW 只进入 hot ring 与滑动指标。 */
 int edr_local_evidence_cache_is_candidate(const EdrBehaviorRecord *r);
 
-/** 命令结果分区镜像，供本地可靠投递和运维诊断使用。 */
-void edr_local_evidence_cache_record_command_result(
+/* This detailed local copy is not the command delivery/idempotency owner.
+ * It may contain evidence absent from the projected owner, so rejection is
+ * explicit. A caller that already persisted the terminal owner must not retry
+ * execution merely because this copy failed. */
+typedef enum {
+  EDR_EVIDENCE_COMMAND_RESULT_STORED = 0,
+  EDR_EVIDENCE_COMMAND_RESULT_UNAVAILABLE = 1,
+  EDR_EVIDENCE_COMMAND_RESULT_CAPACITY = 2,
+  EDR_EVIDENCE_COMMAND_RESULT_STORAGE = 3,
+  EDR_EVIDENCE_COMMAND_RESULT_INVALID = 4
+} EdrEvidenceCommandResultOutcome;
+int edr_local_evidence_cache_record_command_result(
     const char *command_id, const char *command_type, const char *status,
     int execution_status, int exit_code, const char *detail, const char *artifacts);
 
@@ -350,6 +378,12 @@ int edr_local_evidence_cache_context_ref_write_sources_json(char *out, size_t ca
  * 优先返回内存 ring，SQLite 可用时补历史。file_sha256 只查缓存，不触发文件系统扫描。
  */
 int edr_local_evidence_cache_query_json(const char *payload_json, char *out, size_t cap);
+struct EdrSoarCommandMeta;
+/* Existing signed rtq_query consumer only. Reads its frozen result purpose,
+ * checks execution expiry and exact scope, and never accepts a caller-supplied
+ * replacement request. The bounded synchronous export holds the cache owner. */
+int edr_local_evidence_cache_query_authorized_json(const char *command_id,
+    const struct EdrSoarCommandMeta *meta, char *out, size_t cap);
 
 /**
  * RTQ file hash cache lookup. Returns a JSON array of file rows from local

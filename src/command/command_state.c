@@ -1,6 +1,7 @@
 #include "edr/command_state.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/sha256.h"
+#include "edr/storage_physical_guard.h"
 
 #include "cJSON.h"
 
@@ -22,13 +23,19 @@
 
 #define EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP (EDR_COMMAND_STATE_DETAIL_CAP * 2u + 2u)
 #define EDR_COMMAND_STATE_AUTH_CAP 16384u
-#define EDR_COMMAND_STATE_LINE_CAP (EDR_COMMAND_STATE_ESCAPED_DETAIL_CAP + 16384u + EDR_COMMAND_STATE_AUTH_CAP)
+#define EDR_COMMAND_STATE_LINE_CAP EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP
+/* Three bounded records cover queued -> running -> terminal -> receipt ACK.
+ * The independent owner budget defaults to the existing 300-row compaction
+ * working window at two maximal records per owner. MAX_BYTES stays soft. */
+#define EDR_COMMAND_STATE_OWNER_DEFAULT_BYTES EDR_COMMAND_STATE_DEFAULT_OWNER_BUDGET_BYTES
+#define EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT 65536u
 
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
 #include <windows.h>
 #include <sddl.h>
+#include <aclapi.h>
 #else
 #include <dirent.h>
 #include <pthread.h>
@@ -40,6 +47,7 @@
 typedef struct EdrCommandStateFileInfo {
   long size;
   long mtime;
+  uint64_t identity, modified_ticks;
 } EdrCommandStateFileInfo;
 
 static EdrCommandStateQuarantineStats s_quarantine_stats;
@@ -85,6 +93,13 @@ static long s_compact_retained_floor;
 static char s_compact_retained_path[1024];
 
 static long state_env_long_clamped(const char *name, long defv, long minv, long maxv);
+static int state_compact_locked(int force, int reserved_write);
+static int state_capacity_failure(const char *reason, int capacity);
+static int state_physical_allow(const char *path,uint64_t growth,int reserved_write) {
+  EdrStoragePhysicalSnapshot snapshot;
+  int rc=edr_storage_physical_admit(path,growth,reserved_write,&snapshot);
+  return rc==0 ? 0 : state_capacity_failure(snapshot.cause ? snapshot.cause : "state_physical_guard_failed",rc==-1);
+}
 static void state_ensure_dir(const char *path);
 static int state_prepare_dir(const char *path);
 static int state_prepare_parent_dir(const char *path);
@@ -144,6 +159,57 @@ static int state_windows_secure_existing(const char *path, int want_dir) {
   LocalFree(descriptor);
   return ok ? 0 : -1;
 }
+
+/* Installer inventory must validate, not repair, the owner store's ACL. The
+ * same handle is checked and read, so a reparse point cannot redirect it after
+ * the check. Only the normal lock file may be created by this operation. */
+static HANDLE state_windows_open_inventory(const char *path, int want_dir) {
+  HANDLE h = CreateFileA(path, READ_CONTROL | FILE_READ_ATTRIBUTES | (want_dir ? 0 : GENERIC_READ),
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | (want_dir ? FILE_FLAG_BACKUP_SEMANTICS : 0), NULL);
+  if (h == INVALID_HANDLE_VALUE) {
+    DWORD e = GetLastError();
+    errno = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? ENOENT : EACCES;
+    return h;
+  }
+  BY_HANDLE_FILE_INFORMATION info;
+  PSID owner = NULL, system = NULL, admins = NULL, owner_rights = NULL;
+  PACL acl = NULL;
+  PSECURITY_DESCRIPTOR sd = NULL;
+  HANDLE token = NULL;
+  union { TOKEN_USER align; unsigned char bytes[512]; } user_buffer;
+  DWORD user_bytes = sizeof(user_buffer);
+  int ok = GetFileInformationByHandle(h, &info) &&
+    !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+    (!!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == !!want_dir) &&
+    GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &owner, NULL, &acl, NULL, &sd) == ERROR_SUCCESS && owner && acl && IsValidAcl(acl) &&
+    ConvertStringSidToSidA("S-1-5-18", &system) &&
+    ConvertStringSidToSidA("S-1-5-32-544", &admins) &&
+    ConvertStringSidToSidA("S-1-3-4", &owner_rights) &&
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+    GetTokenInformation(token, TokenUser, user_buffer.bytes, user_bytes, &user_bytes);
+  if (ok) {
+    PSID user = ((TOKEN_USER *)user_buffer.bytes)->User.Sid;
+    ok = EqualSid(owner, system) || EqualSid(owner, admins) || EqualSid(owner, user);
+    for (DWORD i = 0; ok && i < acl->AceCount; ++i) {
+      ACE_HEADER *ace = NULL;
+      ok = GetAce(acl, i, (void **)&ace) != 0;
+      if (!ok || (ace->AceFlags & INHERIT_ONLY_ACE)) continue;
+      if (ace->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+      if (ace->AceType != ACCESS_ALLOWED_ACE_TYPE) { ok = 0; break; }
+      PSID sid = &((ACCESS_ALLOWED_ACE *)ace)->SidStart;
+      ok = EqualSid(sid, system) || EqualSid(sid, admins) || EqualSid(sid, owner_rights) || EqualSid(sid, owner);
+    }
+  }
+  if (token) CloseHandle(token);
+  if (sd) LocalFree(sd);
+  if (system) LocalFree(system);
+  if (admins) LocalFree(admins);
+  if (owner_rights) LocalFree(owner_rights);
+  if (!ok) { CloseHandle(h); errno = EACCES; return INVALID_HANDLE_VALUE; }
+  return h;
+}
 #endif
 
 static long state_env_long_clamped(const char *name, long defv, long minv, long maxv) {
@@ -184,11 +250,23 @@ static int state_file_info(const char *path, EdrCommandStateFileInfo *out) {
 #endif
   out->size = (long)st.st_size;
   out->mtime = (long)st.st_mtime;
+  out->identity = (uint64_t)st.st_ino;
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA data;
+  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return -1;
+  out->modified_ticks = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32u) |
+                         data.ftLastWriteTime.dwLowDateTime;
+#elif defined(__APPLE__)
+  out->modified_ticks=(uint64_t)st.st_mtimespec.tv_sec*1000000000u+(uint64_t)st.st_mtimespec.tv_nsec;
+#else
+  out->modified_ticks=(uint64_t)st.st_mtim.tv_sec*1000000000u+(uint64_t)st.st_mtim.tv_nsec;
+#endif
   return 0;
 }
 
 static int state_file_info_same(EdrCommandStateFileInfo a, EdrCommandStateFileInfo b) {
-  return a.size == b.size && a.mtime == b.mtime;
+  return a.size == b.size && a.mtime == b.mtime && a.identity == b.identity &&
+         a.modified_ticks == b.modified_ticks;
 }
 
 #ifndef _WIN32
@@ -278,6 +356,8 @@ static FILE *state_open_read_secure(const char *path, struct stat *out_st) {
 #ifdef O_NOFOLLOW
   flags |= O_NOFOLLOW;
 #endif
+
+
   int fd = open(path, flags);
   if (fd < 0) {
     return NULL;
@@ -448,6 +528,20 @@ static int state_replace_file(const char *tmp_path, const char *dst_path) {
   }
   (void)remove(tmp_path);
   return -1;
+#endif
+}
+
+static FILE *state_open_read_inventory(const char *path) {
+#ifdef _WIN32
+  HANDLE h = state_windows_open_inventory(path, 0);
+  if (h == INVALID_HANDLE_VALUE) return NULL;
+  int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+  if (fd < 0) { CloseHandle(h); return NULL; }
+  FILE *f = _fdopen(fd, "rb");
+  if (!f) _close(fd);
+  return f;
+#else
+  return state_open_read_secure(path, NULL);
 #endif
 }
 
@@ -644,6 +738,56 @@ static int state_prepare_dir(const char *path) {
 #else
   return state_dir_private_existing(path);
 #endif
+}
+
+static FILE *state_inventory_lock_acquire(int *absent_parent) {
+  char path[1024], parent[1024], lock_path[1100];
+  *absent_parent = 0;
+  state_default_path(path, sizeof(path));
+  if (state_parent_dir(path, parent, sizeof(parent)) != 0) return NULL;
+  errno = 0;
+#ifdef _WIN32
+  HANDLE directory = state_windows_open_inventory(parent, 1);
+  if (directory == INVALID_HANDLE_VALUE) {
+    if (errno == ENOENT) *absent_parent = 1;
+    return NULL;
+  }
+  CloseHandle(directory);
+#else
+  if (state_dir_secure_existing(parent) != 0) {
+    if (errno == ENOENT) *absent_parent = 1;
+    return NULL;
+  }
+  struct stat parent_info;
+  if (lstat(parent, &parent_info) != 0 || (parent_info.st_mode & (S_IRWXG | S_IRWXO))) {
+    errno = EACCES; return NULL;
+  }
+#endif
+  snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+#ifdef _WIN32
+  HANDLE h = CreateFileA(lock_path, GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+      FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (h == INVALID_HANDLE_VALUE) return NULL;
+  BY_HANDLE_FILE_INFORMATION info;
+  if (!GetFileInformationByHandle(h, &info) ||
+      (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+      state_windows_secure_existing(lock_path, 0) != 0) { CloseHandle(h); return NULL; }
+  int fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+  if (fd < 0) { CloseHandle(h); return NULL; }
+  FILE *f = _fdopen(fd, "r+b");
+  if (!f) { _close(fd); return NULL; }
+  OVERLAPPED ov = {0};
+  if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) { fclose(f); return NULL; }
+#else
+  int fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+  if (fd < 0) return NULL;
+  if (state_file_secure_fd(fd, NULL) != 0) { close(fd); return NULL; }
+  FILE *f = state_fdopen_checked(fd, "r+b");
+  if (!f) return NULL;
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) { fclose(f); return NULL; }
+#endif
+  return f;
 }
 
 static void json_escape_to(char *dst, size_t cap, const char *s) {
@@ -1317,6 +1461,7 @@ int edr_command_state_upsert_pending_ack(const EdrControlAckRecord *record) {
     state_lock_release(lock);
     return -1;
   }
+  if(state_physical_allow(path,32u*1024u,0)!=0) {state_lock_release(lock);return -1;}
   snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
   FILE *f = state_open_new_secure(tmp);
   if (!f) {
@@ -1584,6 +1729,10 @@ int edr_command_state_store_inbox(const char *command_id, const char *command_ty
     state_lock_release(lock);free(hex);return same ? 0 : -1;
   }
   if(prior_errno!=ENOENT) {state_lock_release(lock);free(hex);return -1;}
+  if(payload_len>(UINT64_MAX-EDR_COMMAND_STATE_AUTH_CAP-4096u)/2u ||
+      state_physical_allow(path,payload_len*2u+EDR_COMMAND_STATE_AUTH_CAP+4096u,0)!=0) {
+    state_lock_release(lock);free(hex);return -1;
+  }
   snprintf(tmp, sizeof(tmp), "%s.tmp.%lld", path, (long long)state_now_ms());
   FILE *f = state_open_new_secure(tmp);
   if (!f) {
@@ -1963,18 +2112,252 @@ void edr_command_state_free_inbox_record(EdrCommandInboxRecord *record) {
   memset(record, 0, sizeof(*record));
 }
 
-static int append_state_line(const char *line) {
+/* All fields in this in-memory ledger are protected by the existing file lock.
+ * An external writer/replacement invalidates the size/mtime snapshot. Old rows
+ * lacking policy metadata are measured separately and never adopted as free. */
+typedef struct CommandCapacityOwner {
+  char command_id[128];
+  uint64_t reserved;
+} CommandCapacityOwner;
+static struct {
   char path[1024];
-  state_default_path(path, sizeof(path));
-  FILE *f = state_open_append_secure(path);
-  if (!f) {
-    return -1;
+  EdrCommandStateFileInfo file;
+  int valid;
+  CommandCapacityOwner *owners;
+  size_t count, capacity;
+  EdrCommandStateCapacityStats stats;
+} s_capacity;
+
+static uint64_t state_owner_budget(void) {
+  const char *value=getenv("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES");uint64_t bytes=0;
+  if(value && value[0] && edr_storage_parse_u64(value,&bytes)!=0)return 0;
+  if(!bytes)return EDR_COMMAND_STATE_OWNER_DEFAULT_BYTES;
+  return bytes<5u*EDR_COMMAND_STATE_LINE_CAP ? 5u*EDR_COMMAND_STATE_LINE_CAP : bytes;
+}
+
+static int state_capacity_failure(const char *reason, int capacity) {
+  if (capacity) s_capacity.stats.admission_rejected++;
+  else s_capacity.stats.persistence_failed++;
+  snprintf(s_capacity.stats.last_error, sizeof(s_capacity.stats.last_error), "%s", reason);
+  uint64_t count = capacity ? s_capacity.stats.admission_rejected : s_capacity.stats.persistence_failed;
+  if ((count & (count - 1u)) == 0u)
+    fprintf(stderr, "[command_state] %s; owners/reservations retained (count=%llu)\n",
+            reason, (unsigned long long)count);
+  errno = capacity ? ENOSPC : EIO;
+  return -1;
+}
+
+static size_t state_capacity_owner_position(const char *id, int *found) {
+  size_t lo=0, hi=s_capacity.count;
+  while(lo<hi) {
+    size_t mid=lo+(hi-lo)/2u;
+    int cmp=strcmp(s_capacity.owners[mid].command_id,id);
+    if(cmp<0)lo=mid+1u;else hi=mid;
   }
-  int ok = fputs(line, f) >= 0 && fputc('\n', f) != EOF && state_flush_file(f) == 0;
-  if (fclose(f) != 0) {
-    ok = 0;
+  *found=lo<s_capacity.count && !strcmp(s_capacity.owners[lo].command_id,id);
+  return lo;
+}
+
+static int state_capacity_set_owner(const char *id, uint64_t reserve) {
+  int found=0;size_t at=state_capacity_owner_position(id,&found);
+  if(found) {
+    s_capacity.stats.reserved_bytes-=s_capacity.owners[at].reserved;
+    if(!reserve) {
+      memmove(s_capacity.owners+at,s_capacity.owners+at+1u,
+              (s_capacity.count-at-1u)*sizeof(*s_capacity.owners));
+      s_capacity.count--;return 0;
+    }
+  } else {
+    if(!reserve)return 0;
+    if(s_capacity.count==s_capacity.capacity) {
+      size_t next=s_capacity.capacity ? s_capacity.capacity*2u : 128u;
+      if(next>EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT)next=EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT;
+      if(next<=s_capacity.count)return -1;
+      CommandCapacityOwner *grown=realloc(s_capacity.owners,next*sizeof(*grown));
+      if(!grown)return -1;
+      s_capacity.owners=grown;s_capacity.capacity=next;
+    }
+    memmove(s_capacity.owners+at+1u,s_capacity.owners+at,
+            (s_capacity.count-at)*sizeof(*s_capacity.owners));
+    s_capacity.count++;snprintf(s_capacity.owners[at].command_id,128,"%s",id);
   }
-  return ok ? 0 : -1;
+  s_capacity.owners[at].reserved=reserve;s_capacity.stats.reserved_bytes+=reserve;return 0;
+}
+
+static int state_capacity_refresh_locked_mode(const char *path, int inventory) {
+  EdrCommandStateFileInfo info={0};errno=0;
+  if(state_file_info(path,&info)!=0 && errno!=ENOENT)
+    return state_capacity_failure("state_capacity_stat_failed",0);
+  if(!inventory && s_capacity.valid && !strcmp(path,s_capacity.path) && state_file_info_same(info,s_capacity.file))return 0;
+  s_capacity.valid=0;s_capacity.count=0;
+  s_capacity.stats.new_record_bytes=0;s_capacity.stats.legacy_bytes=0;s_capacity.stats.reserved_bytes=0;
+  s_capacity.stats.record_count=0;
+  s_capacity.stats.protected_floor_bytes=0;
+  FILE *f=inventory ? state_open_read_inventory(path) : state_open_read_secure(path,NULL);
+  if(!f && errno!=ENOENT)return state_capacity_failure("state_capacity_read_failed",0);
+  char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);
+  int ok=line!=NULL;
+  while(ok && f && fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+    size_t n=strlen(line);
+    s_capacity.stats.record_count++;
+    cJSON *o=n && line[n-1]=='\n' ? edr_egress_parse_purpose_object(line,n) : NULL;
+    const cJSON *id=cJSON_GetObjectItemCaseSensitive(o,"command_id");
+    const cJSON *policy=cJSON_GetObjectItemCaseSensitive(o,"storage_policy_version");
+    const cJSON *reserve=cJSON_GetObjectItemCaseSensitive(o,"reserved_state_bytes");
+    const cJSON *final=cJSON_GetObjectItemCaseSensitive(o,"final");
+    ok=cJSON_IsObject(o) && !strcmp(result_text(o,"record"),"command_state") &&
+      cJSON_IsString(id) && id->valuestring[0] && strlen(id->valuestring)<128u &&
+      cJSON_IsNumber(final) && (final->valuedouble==0 || final->valuedouble==1);
+    if(ok && !policy && !reserve) {
+      s_capacity.stats.legacy_bytes+=n;
+      ok=state_capacity_set_owner(id->valuestring,0)==0;
+    } else if(ok) {
+      ok=cJSON_IsNumber(policy) && policy->valuedouble==1 && cJSON_IsNumber(reserve) &&
+        reserve->valuedouble>=0 && reserve->valuedouble<=3u*EDR_COMMAND_STATE_LINE_CAP &&
+        reserve->valuedouble==(double)(uint64_t)reserve->valuedouble;
+      if(ok) {
+        const cJSON *pending=cJSON_GetObjectItemCaseSensitive(o,"report_pending");
+        uint64_t expected=final->valueint ?
+          (cJSON_IsNumber(pending) && pending->valuedouble==1 ? EDR_COMMAND_STATE_LINE_CAP : 0u) :
+          (!strcmp(result_text(o,"response_status"),"queued") ? 3u : 2u)*EDR_COMMAND_STATE_LINE_CAP;
+        ok=reserve->valuedouble==(double)expected;
+      }
+      if(ok) {
+        s_capacity.stats.new_record_bytes+=n;
+        ok=state_capacity_set_owner(id->valuestring,(uint64_t)reserve->valuedouble)==0;
+      }
+    }
+    cJSON_Delete(o);
+  }
+  if(f){if(ferror(f))ok=0;if(fclose(f)!=0)ok=0;}
+  free(line);
+  if(!ok)return state_capacity_failure("state_capacity_unclassified_or_incomplete_record",0);
+  s_capacity.file=info;snprintf(s_capacity.path,sizeof(s_capacity.path),"%s",path);s_capacity.valid=1;
+  s_capacity.stats.calibrations++;
+  return 0;
+}
+
+static int state_capacity_refresh_locked(const char *path) {
+  return state_capacity_refresh_locked_mode(path, 0);
+}
+
+static int append_state_line(const char *line) {
+  char path[1024];state_default_path(path,sizeof(path));
+  if(state_capacity_refresh_locked(path)!=0)return -1;
+  cJSON *o=edr_egress_parse_purpose_object(line,strlen(line));
+  const cJSON *id=cJSON_GetObjectItemCaseSensitive(o,"command_id");
+  const cJSON *final=cJSON_GetObjectItemCaseSensitive(o,"final");
+  if(!cJSON_IsObject(o) || !cJSON_IsString(id) || !id->valuestring[0] ||
+      strlen(id->valuestring)>=128u || !cJSON_IsNumber(final) ||
+      (final->valuedouble!=0 && final->valuedouble!=1)) {
+    cJSON_Delete(o);return state_capacity_failure("state_capacity_invalid_record",0);
+  }
+  char command_id[128];snprintf(command_id,sizeof(command_id),"%s",id->valuestring);
+  const cJSON *pending=cJSON_GetObjectItemCaseSensitive(o,"report_pending");
+  int preaction=!final->valueint &&
+    (!strcmp(result_text(o,"response_status"),"queued") ||
+     !strcmp(result_text(o,"response_status"),"running") ||
+     !strcmp(result_text(o,"response_status"),"replaying"));
+  uint64_t reserve=final->valueint ?
+    (cJSON_IsNumber(pending) && pending->valuedouble==1 ? EDR_COMMAND_STATE_LINE_CAP : 0u) :
+    (!strcmp(result_text(o,"response_status"),"queued") ? 3u : 2u)*EDR_COMMAND_STATE_LINE_CAP;
+  cJSON_DeleteItemFromObjectCaseSensitive(o,"storage_policy_version");
+  cJSON_DeleteItemFromObjectCaseSensitive(o,"reserved_state_bytes");
+  char *stored=malloc(EDR_COMMAND_STATE_LINE_CAP);
+  int ok=stored && cJSON_AddNumberToObject(o,"storage_policy_version",1) &&
+    cJSON_AddNumberToObject(o,"reserved_state_bytes",(double)reserve) &&
+    cJSON_PrintPreallocated(o,stored,EDR_COMMAND_STATE_LINE_CAP,0);
+  cJSON_Delete(o);
+  if(!ok){free(stored);return state_capacity_failure("state_capacity_record_encoding_failed",0);}
+  size_t bytes=strlen(stored)+1u;
+  uint64_t budget=state_owner_budget();
+  if(!budget){free(stored);return state_capacity_failure("physical_configuration_invalid",0);}
+  for(int attempt=0;attempt<2;attempt++) {
+    int found=0;size_t at=state_capacity_owner_position(command_id,&found);
+    uint64_t prior=found?s_capacity.owners[at].reserved:0u;
+    uint64_t charged=s_capacity.stats.new_record_bytes+s_capacity.stats.reserved_bytes-prior;
+    uint64_t scratch=(!prior || preaction) ? EDR_COMMAND_STATE_LINE_CAP : 0u;
+    uint64_t slots=s_capacity.stats.record_count+1u+
+      (s_capacity.stats.reserved_bytes-prior+reserve+scratch)/EDR_COMMAND_STATE_LINE_CAP;
+    uint64_t effective=budget;
+    /* Lowering a configured limit cannot revoke a durable result obligation.
+     * Only after compaction, an existing owner may use its protected retained
+     * floor plus one bounded update record; no new owner receives this grace. */
+    if(attempt && prior && !preaction && charged+reserve+EDR_COMMAND_STATE_LINE_CAP>effective) {
+      effective=charged+reserve+EDR_COMMAND_STATE_LINE_CAP;
+      s_capacity.stats.protected_floor_bytes=effective;
+    }
+    if(slots<=EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT &&
+        charged<=effective && reserve<=effective-charged && scratch<=effective-charged-reserve &&
+        bytes<=effective-charged-reserve-scratch)break;
+    if(attempt || state_compact_locked(1,prior>0 && !preaction)!=0 || state_capacity_refresh_locked(path)!=0) {
+      free(stored);return state_capacity_failure(slots>EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT ?
+          "state_owner_record_slots_exhausted" : "state_owner_budget_exhausted",1);
+    }
+  }
+  /* Reserve ledger memory before durable mutation: a successful write must
+   * never be followed by an unaccountable allocation failure. */
+  int found=0;size_t at=state_capacity_owner_position(command_id,&found);
+  uint64_t prior=found?s_capacity.owners[at].reserved:0u;
+  uint64_t growth=bytes+s_capacity.stats.reserved_bytes-prior+reserve;
+  if(state_physical_allow(path,growth,prior>0 && !preaction)!=0) {free(stored);return -1;}
+  if(state_capacity_set_owner(command_id,reserve)!=0) {
+    free(stored);return state_capacity_failure("state_capacity_owner_limit",1);
+  }
+  FILE *f=state_open_append_secure(path);
+  ok=f && fputs(stored,f)>=0 && fputc('\n',f)!=EOF && state_flush_file(f)==0;
+  if(f && fclose(f)!=0)ok=0;
+  free(stored);
+  if(!ok) {
+    s_capacity.valid=0;
+    return state_capacity_failure("state_capacity_append_failed",0);
+  }
+  s_capacity.stats.new_record_bytes+=bytes;
+  s_capacity.stats.record_count++;
+  s_capacity.valid=state_file_info(path,&s_capacity.file)==0;
+  s_capacity.stats.budget_bytes=budget;
+  return 0;
+}
+
+static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inventory) {
+  if(!out)return -1;
+  int absent_parent = 0;
+  FILE *lock = inventory ? state_inventory_lock_acquire(&absent_parent) : state_lock_acquire();
+  if (!lock) {
+    if (!absent_parent) return -1;
+    memset(out, 0, sizeof(*out));
+    out->budget_bytes = state_owner_budget();
+    out->update_headroom_bytes = EDR_COMMAND_STATE_LINE_CAP;
+    return out->budget_bytes ? 0 : -1;
+  }
+  char path[1024];state_default_path(path,sizeof(path));
+  int rc=state_capacity_refresh_locked_mode(path, inventory);
+  s_capacity.stats.budget_bytes=state_owner_budget();
+  if(!s_capacity.stats.budget_bytes)rc=state_capacity_failure("physical_configuration_invalid",0);
+  if (rc == 0) {
+    uint64_t protected_bytes = s_capacity.stats.new_record_bytes;
+    uint64_t additions[] = {s_capacity.stats.legacy_bytes, s_capacity.stats.reserved_bytes, EDR_COMMAND_STATE_LINE_CAP};
+    for (size_t i=0; i<sizeof(additions)/sizeof(additions[0]); ++i) {
+      if (additions[i] > UINT64_MAX-protected_bytes) { rc=state_capacity_failure("state_capacity_size_overflow",0); break; }
+      protected_bytes += additions[i];
+    }
+    /* Calibration must expose commitments before the first append after a
+     * restart or budget reduction, including protected legacy physical bytes. */
+    if (rc == 0) s_capacity.stats.protected_floor_bytes = protected_bytes > s_capacity.stats.budget_bytes
+        ? protected_bytes : 0u;
+  }
+  s_capacity.stats.reserved_owner_count=s_capacity.count;
+  s_capacity.stats.reserved_record_slots=s_capacity.stats.reserved_bytes/EDR_COMMAND_STATE_LINE_CAP;
+  s_capacity.stats.update_headroom_bytes=EDR_COMMAND_STATE_LINE_CAP;
+  *out=s_capacity.stats;state_lock_release(lock);return rc;
+}
+
+int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out) {
+  return state_get_capacity_stats(out, 0);
+}
+
+int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out) {
+  return state_get_capacity_stats(out, 1);
 }
 
 static int append_state_line_locked(const char *line) {
@@ -2079,7 +2462,7 @@ int edr_command_state_renew_delivery(const char *renewal_id,const uint8_t *paylo
   char *updated=cJSON_PrintUnformatted(target);if(!updated){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto locked_done;}
   if(upgrade) {
     char tmp[1300];snprintf(tmp,sizeof(tmp),"%s.renewal.tmp.%lld",path,(long long)now);
-    FILE *f=state_open_new_secure(tmp);int ok=f!=NULL;
+    FILE *f=state_physical_allow(tmp,strlen(updated)+1u,0)==0 ? state_open_new_secure(tmp) : NULL;int ok=f!=NULL;
     if(f){ok=fputs(updated,f)>=0 && fputc('\n',f)!=EOF && state_flush_file(f)==0;if(fclose(f))ok=0;}
     if(ok)ok=state_replace_file(tmp,path)==0;
     if(!ok)(void)command_inbox_delete_path(tmp);
@@ -2472,9 +2855,25 @@ static int command_state_finish(const char *command_id, const char *command_type
   int written=prior==0 ? append_state_line(line) : prior;
   state_lock_release(lock);
   if(written!=0)return written==1 && !once ? 0 : written;
-  edr_local_evidence_cache_record_command_result(
+  int copy_outcome = edr_local_evidence_cache_record_command_result(
       command_id, command_type, response_status ? response_status : "failed",
       execution_status, exit_code, local_detail, artifacts);
+  /* The terminal delivery/idempotency owner is already durable. Local detail
+   * rejection is observable, but must not turn a completed action into an
+   * execution retry. Log at powers of two to bound diagnostics during storms;
+   * exact current-process counts remain in evidence-cache health. */
+  if (copy_outcome != EDR_EVIDENCE_COMMAND_RESULT_STORED &&
+      copy_outcome != EDR_EVIDENCE_COMMAND_RESULT_UNAVAILABLE) {
+    static uint64_t copy_failures;
+    FILE *diagnostic_lock = state_lock_acquire();
+    if (diagnostic_lock) {
+      ++copy_failures;
+      if ((copy_failures & (copy_failures - 1u)) == 0u)
+        fprintf(stderr, "[command_state] terminal owner retained; local result copy outcome=%d failures=%llu\n",
+                copy_outcome, (unsigned long long)copy_failures);
+      state_lock_release(diagnostic_lock);
+    }
+  }
   edr_command_state_compact_if_needed();
   return 0;
 }
@@ -2894,7 +3293,7 @@ static void compact_keep_latest(CommandCompactRow *rows,size_t count,int by_idem
   }
 }
 
-void edr_command_state_compact_if_needed(void) {
+static int state_compact_locked(int force, int reserved_write) {
   char path[1024];state_default_path(path,sizeof(path));
   long max_bytes=state_env_long_clamped("EDR_COMMAND_STATE_MAX_BYTES",1024L*1024L,65536L,LONG_MAX);
   int64_t now_ms=state_now_ms();
@@ -2909,12 +3308,12 @@ void edr_command_state_compact_if_needed(void) {
   if(emergency_compact && !strcmp(path,s_compact_retained_path) && s_compact_retained_floor>0 &&
       (current_info.size<=s_compact_retained_floor || current_info.size-s_compact_retained_floor<max_bytes))
     emergency_compact=0;
-  if(!emergency_compact && s_last_compact_check_ms>0 && now_ms-s_last_compact_check_ms<interval_ms)return;
+  if(!force && !emergency_compact && s_last_compact_check_ms>0 && now_ms-s_last_compact_check_ms<interval_ms)return 0;
   s_last_compact_check_ms=now_ms;
-  FILE *lock=state_lock_acquire();if(!lock)return;
   FILE *f=state_open_read_secure(path,NULL);
-  if(!f){state_lock_release(lock);return;}
-  if(fseek(f,0,SEEK_END) || ftell(f)<=max_bytes){fclose(f);state_lock_release(lock);return;}
+  if(!f)return errno==ENOENT ? 0 : -1;
+  if(fseek(f,0,SEEK_END)){fclose(f);return -1;}
+  if(!force && ftell(f)<=max_bytes){fclose(f);return 0;}
   rewind(f);
   long target_bytes=state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_TARGET_BYTES",max_bytes/2L,32768L,max_bytes);
   size_t capacity=(size_t)state_env_long_clamped("EDR_COMMAND_STATE_COMPACT_KEEP_LINES",300L,64L,1200L);
@@ -2961,6 +3360,10 @@ void edr_command_state_compact_if_needed(void) {
       fprintf(stderr,"[command_state] compact retained necessary owners rows=%zu bytes=%zu target=%ld\n",retained,retained_bytes,target_bytes);
   }
   char tmp[1100];tmp[0]=0;
+  if(ok && retained<count && state_physical_allow(path,retained_bytes+
+      (reserved_write ? s_capacity.stats.reserved_bytes : 0u),reserved_write)!=0) {
+    ok=0;failure="physical_compaction_space_unavailable";
+  }
   if(ok && retained<count) {
     snprintf(tmp,sizeof(tmp),"%s.tmp.%lld",path,(long long)state_now_ms());
     FILE *out=state_open_new_secure(tmp);
@@ -2982,5 +3385,11 @@ void edr_command_state_compact_if_needed(void) {
   if(!ok)fprintf(stderr,"[command_state] compact retained original state: %s\n",failure);
   s_compact_retained_floor=ok ? (retained_bytes>(size_t)target_bytes ? (long)retained_bytes : 0) : current_info.size;
   snprintf(s_compact_retained_path,sizeof(s_compact_retained_path),"%s",path);
-  free(buf);free(rows);s_collect_cache_pending_zero=0;state_lock_release(lock);
+  free(buf);free(rows);s_collect_cache_pending_zero=0;s_capacity.valid=0;
+  return ok ? 0 : -1;
+}
+
+void edr_command_state_compact_if_needed(void) {
+  FILE *lock=state_lock_acquire();if(!lock)return;
+  (void)state_compact_locked(0,0);state_lock_release(lock);
 }

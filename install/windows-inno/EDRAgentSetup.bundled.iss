@@ -45,6 +45,8 @@
   #define MyAppVersion "1.0.0"
 #endif
 
+#include "EvidenceSpaceMeasure.iss"
+
 [Setup]
 AppId={{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}
 AppName={#MyAppName}
@@ -81,49 +83,51 @@ Name: "windowsautorun"; Description: "Legacy scheduled-task compatibility"; Grou
 Type: files; Name: "{app}\*.dll"; Check: ShouldReconcileRuntimeDlls
 
 [Files]
-Source: "{#EDR_BIN_DIR}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\" + MyAppExeName)}"; DestDir: "{app}"; Flags: ignoreversion
 #ifdef EDR_ALLOW_POWERSHELL_FALLBACK
-Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\FDSecurityInstallerWorker.exe")}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 #else
-Source: "{#EDR_BIN_DIR}\FDSecurityInstallerWorker.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\FDSecurityInstallerWorker.exe")}"; DestDir: "{app}"; Flags: ignoreversion
 #endif
-Source: "{#EDR_BIN_DIR}\uninstall.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\native-package-integrity.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\*.dll"; DestDir: "{app}"; Excludes: "WinDivert.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\uninstall.exe")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\native-package-integrity.json")}"; DestDir: "{app}"; Flags: ignoreversion
+#define EdrBeforeDllBytes EdrExpandedBytes
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\*.dll", False, "WinDivert.dll")}"; DestDir: "{app}"; Excludes: "WinDivert.dll,*.pdb,*.ilk,*.exp,*.lib,*.xml"; Flags: ignoreversion skipifsourcedoesntexist
 #ifndef EDR_TARGET_ARM64
-Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert.dll"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
-Source: "{#EDR_WINDIVERT_RUNTIME_DIR}\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
+Source: "{#EdrSizedSource(EDR_WINDIVERT_RUNTIME_DIR + "\WinDivert.dll")}"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
+Source: "{#EdrSizedSource(EDR_WINDIVERT_RUNTIME_DIR + "\WinDivert64.sys")}"; DestDir: "{app}"; Flags: ignoreversion; Check: not IsArm64
 #endif
-Source: "{#EDR_WINDIVERT_LICENSE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
-Source: "{#EDR_WINDIVERT_SOURCE}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion
-Source: "{#EDR_VERSION_FILE}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\ARCH"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\package-capabilities.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#EDR_AGENT_TOML_EXAMPLE}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\..\config\agent_windows_production.example.toml"; DestDir: "{app}\config"; Flags: ignoreversion
-Source: "..\..\rules\forensic\*"; DestDir: "{app}\rules\forensic"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\..\src\shellcode_detector\rules\*"; DestDir: "{app}\rules\shellcode"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "..\..\src\webshell_detector\rules\*"; DestDir: "{app}\rules\webshell"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-Source: "..\..\scripts\edr_agent_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\scripts\edr_agent_preflight.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\scripts\edr_agent_inplace_update.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\scripts\edr_agent_postinstall_verify.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\scripts\windows_service_install.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\scripts\windows_isolate_host.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "edr_install_wizard_enroll.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "edr_windows_autorun.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "bundle_extra\README_OPTIONAL_DBS.txt"; DestDir: "{app}\data"; DestName: "README_OPTIONAL_DBS.txt"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "bundle_extra\BUNDLE_README.txt"; DestDir: "{app}"; DestName: "BUNDLE_README.txt"; Flags: ignoreversion skipifsourcedoesntexist
+#expr EdrPreflightDllBytes = EdrExpandedBytes - EdrBeforeDllBytes
+Source: "{#EdrSizedSource(EDR_WINDIVERT_LICENSE)}"; DestDir: "{app}\licenses"; DestName: "WinDivert-LICENSE.txt"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_WINDIVERT_SOURCE)}"; DestDir: "{app}\licenses"; DestName: "WinDivert-SOURCE.json"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_VERSION_FILE)}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\ARCH")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\package-capabilities.json")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_AGENT_TOML_EXAMPLE)}"; DestDir: "{app}"; DestName: "agent.toml.example"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource("..\..\config\agent_windows_production.example.toml")}"; DestDir: "{app}\config"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\rules\forensic\*", True)}"; DestDir: "{app}\rules\forensic"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#EdrSizedSource("..\..\src\shellcode_detector\rules\*", True)}"; DestDir: "{app}\rules\shellcode"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#EdrSizedSource("..\..\src\webshell_detector\rules\*", True)}"; DestDir: "{app}\rules\webshell"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#EdrSizedSource("..\..\scripts\edr_agent_install.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\scripts\edr_agent_preflight.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\scripts\edr_agent_inplace_update.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\scripts\edr_agent_postinstall_verify.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\scripts\windows_service_install.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("..\..\scripts\windows_isolate_host.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("edr_install_wizard_enroll.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("edr_windows_autorun.ps1")}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#EdrSizedSource("bundle_extra\README_OPTIONAL_DBS.txt")}"; DestDir: "{app}\data"; DestName: "README_OPTIONAL_DBS.txt"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource("bundle_extra\BUNDLE_README.txt")}"; DestDir: "{app}"; DestName: "BUNDLE_README.txt"; Flags: ignoreversion skipifsourcedoesntexist
 ; 取证采集器白名单: standard 包只允许小型 adapter/builtin 与许可说明进入安装包。
 ; velociraptor.exe 体积大，standard 包默认不写入 staging，由平台按需下发。
 ; offline/full 构建可显式写入 collector\velociraptor.exe；ARM64 包中该单一文件
 ; 为 AMD64 用户态子进程，由 Windows x64 仿真执行，不允许携带驱动。
 ; C baseline 是独立恢复边界，Build-BundledInstaller.ps1 已验证存在、架构匹配且不与 adapter 同体。
-Source: "{#EDR_BIN_DIR}\collector\forensic_collector.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#EDR_BIN_DIR}\collector\forensic_collector_builtin.exe"; DestDir: "{app}\collector"; Flags: ignoreversion
-Source: "{#EDR_BIN_DIR}\collector\velociraptor.exe"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#EDR_BIN_DIR}\collector\*.LICENSE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#EDR_BIN_DIR}\collector\*.SOURCE.txt"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\collector\forensic_collector.exe")}"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\collector\forensic_collector_builtin.exe")}"; DestDir: "{app}\collector"; Flags: ignoreversion
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\collector\velociraptor.exe")}"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\collector\*.LICENSE.txt")}"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#EdrSizedSource(EDR_BIN_DIR + "\collector\*.SOURCE.txt")}"; DestDir: "{app}\collector"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Parameters: "--config ""{app}\agent.toml"""
@@ -205,6 +209,8 @@ var
   EdrStageLog: string;
   EdrCurrentStage: string;
   EdrHadExistingInstallation: Boolean;
+
+#include "EvidenceSpaceGuard.iss"
 
 function EdrCmdLineParamValue(const Flag: string): string;
 var
@@ -519,6 +525,9 @@ begin
       Exit;
     end;
   end;
+  Result := EdrCheckInstallSpace(AppDir, EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline);
+  if Result <> '' then
+    Exit;
   SaveEnrollParamsFileIfNeeded;
   Cmd := '-NoProfile -ExecutionPolicy Bypass -Command "'
     + '$d=''' + AppDir + ''';'

@@ -1,3 +1,4 @@
+#include "cJSON.h"
 #include "edr/validation_trace.h"
 /*
  * P0 直出：与 edr-backend/platform/config/p0_golden_vectors.json + dynamicrules 对拍（CI：
@@ -1317,8 +1318,35 @@ static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
     free(wire);
     return 0;
   }
-  int ok = edr_storage_queue_p0_source_only_commit_local(
-             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit) == EDR_OK;
+  /* Classification is supplied by the validated producer, never inferred
+   * from local_evidence status. The owner binds to these exact frozen bytes. */
+  EdrStorageQueueLocalEvidenceOwner owner = {0};
+  cJSON *context = edr_p0_source_only_validate_record(record)
+                       ? cJSON_Parse(record->detection_context) : NULL;
+  const cJSON *reason = cJSON_GetObjectItemCaseSensitive(context, "reason");
+  const EdrP0SourceOnlyReason *contract = cJSON_IsString(reason)
+      ? edr_p0_source_only_reason_find(reason->valuestring) : NULL;
+  int typed = contract && contract->stage != EDR_P0_SOURCE_ONLY_STAGE_DIRECT &&
+      record->endpoint_id[0] && record->tenant_id[0] && record->event_time_ns >= 0;
+  if (typed) {
+    owner.version = 1u;
+    owner.diagnostic_reason = contract->reason;
+    owner.endpoint_id = record->endpoint_id;
+    owner.tenant_id = record->tenant_id;
+    owner.event_time_ns = record->event_time_ns;
+    owner.event_type = record->type;
+    owner.pid = record->pid;
+    owner.parent_pid = record->ppid;
+    owner.process_start_key = record->process_start_key;
+    owner.process_creation_filetime_100ns = record->process_creation_filetime_100ns;
+    owner.parent_process_start_key = record->parent_process_start_key;
+    owner.parent_process_creation_filetime_100ns = record->parent_process_creation_filetime_100ns;
+  }
+  int ok = (typed ? edr_storage_queue_p0_source_only_commit_local_typed(
+             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit, &owner)
+           : edr_storage_queue_p0_source_only_commit_local(
+             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit)) == EDR_OK;
+  cJSON_Delete(context);
   free(wire);
   return ok;
 }
@@ -2831,7 +2859,8 @@ typedef struct p0_enforcement_prepare {
 static int p0_fill_terminal_authority(p0_enforcement_prepare *prepare) {
   const char *canonical_path;
   if (!prepare || !prepare->record || !prepare->result || !prepare->rule_id ||
-      !prepare->rule_id[0]) {
+      !prepare->rule_id[0] || !prepare->record->endpoint_id[0] || !prepare->record->tenant_id[0] ||
+      prepare->record->event_time_ns<0) {
     return 0;
   }
   if (!p0_terminal_identity(prepare->record, prepare->rule_id, prepare->idempotency_key,
@@ -2940,9 +2969,20 @@ static int p0_prepare_enforcement(void *opaque) {
     free(intent_wire);
     return 0;
   }
-  precreate = edr_storage_queue_enforcement_terminal_precreate(
+  /* Outbound projection may omit both large command bodies. Measure the
+   * complete local form from this same borrowed immutable facts snapshot
+   * before executing; discard it after deriving the bounded reservation. */
+  size_t local_intent_len=0u;
+  uint8_t *local_intent=edr_behavior_record_alloc_durable_wire_facts(
+      &intent,NULL,prepare->command_facts,&local_intent_len);
+  free(local_intent);
+  if(!local_intent_len) {
+    snprintf(prepare->failure_reason,sizeof(prepare->failure_reason),"terminal_local_bound_encoding_failed");
+    free(intent_wire);return 0;
+  }
+  precreate = edr_storage_queue_enforcement_terminal_precreate_local_source_bound(
       prepare->idempotency_key, prepare->source_event_key, prepare->rule_id,
-      prepare->process_generation_key, intent_batch_id, intent_wire, intent_wire_len);
+      prepare->process_generation_key, intent_batch_id, intent_wire, intent_wire_len,local_intent_len);
   if (precreate != EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED) {
     fprintf(stderr,
             "[P0] terminal intent %s; enforcement skipped rule=%s pid=%u key=%s\n",
@@ -3061,7 +3101,6 @@ static int p0_finish_enforcement_terminal(const p0_enforcement_prepare *prepare,
   char combined_batch_id[128];
   size_t source_wire_len;
   size_t combined_wire_len;
-  int source_enqueued;
   int combined_enqueued;
   if (!prepare || !prepare->record || !prepare->result || !prepare->journal_precreated ||
       !prepare->executed || !alert) {
@@ -3087,23 +3126,32 @@ static int p0_finish_enforcement_terminal(const p0_enforcement_prepare *prepare,
     free(source_wire); free(combined_wire);
     return 0;
   }
-  if (edr_storage_queue_enforcement_terminal_update(
+  EdrStorageQueueLocalEvidenceOwner owner={0};
+  owner.version=1u;owner.diagnostic_reason="enforcement_terminal_result";
+  owner.endpoint_id=evidence.endpoint_id;owner.tenant_id=evidence.tenant_id;
+  owner.event_time_ns=evidence.event_time_ns;owner.event_type=evidence.type;
+  owner.pid=evidence.pid;owner.parent_pid=evidence.ppid;
+  owner.process_start_key=evidence.process_start_key;owner.process_creation_filetime_100ns=evidence.process_creation_filetime_100ns;
+  owner.parent_process_start_key=evidence.parent_process_start_key;
+  owner.parent_process_creation_filetime_100ns=evidence.parent_process_creation_filetime_100ns;
+  if (edr_storage_queue_enforcement_terminal_update_local_source(
           prepare->idempotency_key, source_batch_id, source_wire, source_wire_len,
-          combined_batch_id, combined_wire, combined_wire_len) != EDR_OK) {
+          combined_batch_id, combined_wire, combined_wire_len,evidence.event_id,&owner) != EDR_OK) {
     fprintf(stderr,
             "[P0] terminal audit storage failure: result journal update failed rule=%s pid=%u key=%s\n",
             prepare->rule_id, prepare->record->pid, prepare->idempotency_key);
     free(source_wire); free(combined_wire);
     return 0;
   }
-  source_enqueued = edr_storage_queue_enqueue(source_batch_id, source_wire, source_wire_len, 0, 1) == EDR_OK;
+  /* The journal is the single local owner of the full source. Only the
+   * necessary alert gets an ordinary immediate-delivery copy. */
   combined_enqueued =
       edr_storage_queue_enqueue(combined_batch_id, combined_wire, combined_wire_len, 0, 1) == EDR_OK;
   free(source_wire); free(combined_wire);
-  if (!source_enqueued || !combined_enqueued) {
+  if (!combined_enqueued) {
     fprintf(stderr,
-            "[P0] terminal journal retained after ordinary enqueue failure rule=%s pid=%u source=%d combined=%d\n",
-            prepare->rule_id, prepare->record->pid, source_enqueued, combined_enqueued);
+            "[P0] terminal journal retained after ordinary enqueue failure rule=%s pid=%u combined=%d\n",
+            prepare->rule_id, prepare->record->pid, combined_enqueued);
     return 0;
   }
   return 1;

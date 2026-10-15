@@ -579,6 +579,70 @@ static void test_typed_suppression_persistence_and_revocation(void) {
   remove(primary); remove(lkg);
 }
 
+static void test_evidence_storage_policy_config(void) {
+  EdrConfig cfg = {0};
+  edr_config_apply_defaults(&cfg);
+  assert(cfg.offline.max_queue_size_mb == 512u);
+  assert(cfg.offline.evidence_cache_retention_hours == 24u);
+  assert(cfg.offline.evidence_cache_selected_retention_hours == 0u);
+  assert(cfg.offline.command_state_owner_budget_mb == 0u);
+  assert(cfg.offline.storage_min_free_mb == 0u);
+  const char *cases[] = {
+    "evidence_cache_retention_hours=24\nevidence_cache_selected_retention_hours=72\ncommand_state_owner_budget_mb=64\nstorage_min_free_mb=512\n",
+    "evidence_cache_selected_retention_hours=12\n",
+    "command_state_owner_budget_mb=-1\n",
+    "storage_min_free_mb=1048577\n",
+    "storage_min_free_mb=\"invalid\"\n",
+    "evidence_cache_selected_retention_hours=87601\n"
+  };
+  for (size_t i=0; i<sizeof(cases)/sizeof(cases[0]); ++i) {
+    FILE *f=fopen("edr_test_storage_policy.toml","wb"); assert(f);
+    fputs("[offline]\n",f); fputs(cases[i],f); fclose(f);
+    EdrError result=edr_config_load("edr_test_storage_policy.toml",&cfg);
+    assert(result==(i==0 ? EDR_OK : EDR_ERR_CONFIG_PARSE));
+    if (!i) {
+      assert(cfg.offline.evidence_cache_selected_retention_hours==72u);
+      assert(cfg.offline.command_state_owner_budget_mb==64u);
+      assert(cfg.offline.storage_min_free_mb==512u);
+    }
+  }
+  remove("edr_test_storage_policy.toml"); edr_config_free_heap(&cfg);
+}
+
+static void test_invalid_storage_reload_preserves_active_config(void) {
+  const char *path = "edr_test_reload_storage_policy.toml";
+  FILE *f = fopen(path, "wb"); assert(f);
+  fputs("[agent]\nendpoint_id=\"active-endpoint\"\n"
+        "[command]\nallow_dangerous=false\nallow_lifecycle_maintenance=false\n"
+        "[attack_surface]\nhigh_risk_immediate_ports=[22,3389]\n"
+        "[offline]\nstorage_min_free_mb=512\n", f);
+  fclose(f);
+  EdrConfig cfg = {0};
+  assert(edr_config_load(path, &cfg) == EDR_OK);
+  EdrConfig before = cfg;
+  assert(before.attack_surface.high_risk_immediate_ports_count == 2);
+  uint16_t *ports = cfg.attack_surface.high_risk_immediate_ports;
+  f = fopen(path, "wb"); assert(f);
+  fputs("[agent]\nendpoint_id=\"partial-replacement\"\n"
+        "[offline]\nstorage_min_free_mb=-1\n", f);
+  fclose(f);
+  time_t cached = 0;
+  int reloaded = 1;
+  assert(edr_config_reload_if_modified(path, &cfg, &cached, &reloaded) == EDR_ERR_CONFIG_PARSE);
+  assert(cached == 0 && reloaded == 0);
+  assert(memcmp(&before, &cfg, sizeof(cfg)) == 0);
+  assert(cfg.attack_surface.high_risk_immediate_ports == ports && ports[0] == 22 && ports[1] == 3389);
+  f = fopen(path, "wb"); assert(f);
+  fputs("[agent]\nendpoint_id=\"accepted-endpoint\"\n"
+        "[offline]\nstorage_min_free_mb=1024\n", f);
+  fclose(f);
+  assert(edr_config_reload_if_modified(path, &cfg, &cached, &reloaded) == EDR_OK);
+  assert(cached != 0 && reloaded == 1);
+  assert(!strcmp(cfg.agent.endpoint_id, "accepted-endpoint") && cfg.offline.storage_min_free_mb == 1024);
+  edr_config_free_heap(&cfg);
+  remove(path);
+}
+
 int main(void) {
   const char *fn = "edr_test_cfg_fp.toml";
   FILE *f = fopen(fn, "wb");
@@ -593,6 +657,8 @@ int main(void) {
   if (!fp[0]) {
     return 1;
   }
+  test_evidence_storage_policy_config();
+  test_invalid_storage_reload_preserves_active_config();
   test_effective_policy_survives_restart_and_recovery();
   test_typed_suppression_persistence_and_revocation();
   test_detection_policy_fp_feedback_maps_to_env();

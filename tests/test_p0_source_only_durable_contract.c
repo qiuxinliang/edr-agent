@@ -240,6 +240,16 @@ EdrError edr_storage_queue_enqueue(const char *batch_id, const uint8_t *wire,
   return EDR_OK;
 }
 
+/* Storage is stubbed here; SQLite ownership/expiry is covered by queue tests. */
+EdrError edr_storage_queue_p0_source_only_commit_local_typed(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *wire, size_t wire_len,
+    int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner) {
+  assert(owner && owner->version == 1u && owner->diagnostic_reason);
+  return edr_storage_queue_p0_source_only_commit_local(expected, event_id,
+      batch_id, wire, wire_len, compressed, recovery_audit);
+}
+
 EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *wire, size_t wire_len,
@@ -276,6 +286,13 @@ EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate
   return EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED;
 }
 
+EdrEnforcementTerminalPrecreate edr_storage_queue_enforcement_terminal_precreate_local_source_bound(
+    const char *key,const char *event,const char *rule,const char *generation,
+    const char *batch,const uint8_t *wire,size_t length,size_t full_local_intent_length) {
+  assert(full_local_intent_length>0u);
+  return edr_storage_queue_enforcement_terminal_precreate(key,event,rule,generation,batch,wire,length);
+}
+
 EdrError edr_storage_queue_enforcement_terminal_update(
     const char *idempotency_key, const char *source_batch_id, const uint8_t *source_wire,
     size_t source_wire_len, const char *combined_batch_id, const uint8_t *combined_wire,
@@ -291,6 +308,15 @@ EdrError edr_storage_queue_enforcement_terminal_update(
   s_terminal_updated = 1;
   return EDR_OK;
 }
+EdrError edr_storage_queue_enforcement_terminal_update_local_source(
+    const char *key,const char *source_id,const uint8_t *source,size_t source_len,
+    const char *combined_id,const uint8_t *combined,size_t combined_len,const char *event_id,
+    const EdrStorageQueueLocalEvidenceOwner *owner) {
+  assert(event_id && event_id[0] && owner && owner->version==1u && owner->endpoint_id[0] && owner->tenant_id[0]);
+  assert(!strcmp(owner->diagnostic_reason,"enforcement_terminal_result") && owner->process_start_key && owner->process_creation_filetime_100ns);
+  return edr_storage_queue_enforcement_terminal_update(key,source_id,source,source_len,combined_id,combined,combined_len);
+}
+
 
 int edr_event_batch_push(const uint8_t *wire, size_t wire_len) {
   (void)wire; (void)wire_len;

@@ -426,11 +426,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         attempt = self.server.command_delivery_attempts.get(command_id, 0) + 1
                         self.server.command_delivery_attempts[command_id] = attempt
                     # A slow successful ACK must not defer subsequently completed
-                    # commands. A genuine 503 retains its own durable retry clock.
+                    # commands. Genuine 503/429 responses retain each owner's
+                    # durable retry clock and do not create a receipt.
                     if command_id in ("cmd_delivery_slow", "cmd_delivery_retry") and attempt == 1:
                         time.sleep(0.2)
                     if command_id == "cmd_delivery_retry" and attempt == 1:
                         self.reply({"code": "SYNTHETIC_RETRYABLE_FAILURE"}, 503)
+                        return
+                    if command_id == "cmd_delivery_rate_limited" and attempt == 1:
+                        self.reply({"code": "SYNTHETIC_RATE_LIMIT"}, 429)
                         return
                     with closing(sqlite3.connect(self.server.database)) as db, db:
                         db.execute("PRAGMA synchronous=FULL")
@@ -822,7 +826,11 @@ def main():
                 if server.command_delivery_mode is True:
                     expected = {"cmd_delivery_slow": 1, "cmd_delivery_fresh": 1}
                     if mode.endswith("invariants"):
-                        expected = {"cmd_delivery_retry": 2, "cmd_delivery_fresh": 1}
+                        expected = {"cmd_delivery_retry": 2,
+                                    "cmd_delivery_rate_limited": 2,
+                                    "cmd_delivery_fresh": 1}
+                        if reports[-1]["durable_batches"] != 3 or reports[-1]["duplicate_observations"] != 0:
+                            reports[-1]["receiver_business_failures"] += 1
                     elif mode.endswith("batch"):
                         expected = {f"cmd_delivery_batch_{index:02d}": 1 for index in range(18)}
                     reports[-1]["command_delivery_attempts"] = server.command_delivery_attempts

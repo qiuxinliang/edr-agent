@@ -36,7 +36,9 @@ param(
   [string]$ServiceName = "FDSecurityAgent",
   [string]$UpdaterTaskName = "",
   [string]$StagingDirectory = "",
-  [ValidateRange(0, 1099511627776)]
+  # The signed request retains its 1 TiB limit in the Agent parser. This
+  # parameter also carries a larger locally derived completion safety floor.
+  [ValidateRange(0, 9007199254740991)]
   [UInt64]$MinFreeBytes = 0,
   [string]$CommandId = "manual",
   [Parameter(Mandatory = $true)]
@@ -64,6 +66,40 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $AgentUpdateUpdaterProtocolVersion = 5
 
+# MinFreeBytes is the Agent's independently configured volume safety floor.
+# Growth includes temporary copies; it must remain available in addition to the floor.
+function Assert-UpdateFreeSpace {
+  param([Parameter(Mandatory = $true)][string]$Path, [UInt64]$GrowthBytes)
+  if ($GrowthBytes -gt ([UInt64]::MaxValue - $MinFreeBytes)) { throw 'update space arithmetic overflow' }
+  $required = [UInt64]($GrowthBytes + $MinFreeBytes)
+  if (-not ('FDSecurityUpdateDiskSpace' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FDSecurityUpdateDiskSpace {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool GetDiskFreeSpaceExW(string path, out ulong available, out ulong total, out ulong free);
+}
+'@
+  }
+  $directory = [System.IO.Path]::GetFullPath($Path)
+  $depth = 0
+  while (-not [System.IO.Directory]::Exists($directory)) {
+    if (++$depth -gt 64) { throw 'update volume lookup exceeded parent limit' }
+    $parent = [System.IO.Path]::GetDirectoryName($directory)
+    if (-not $parent -or $parent -eq $directory) { throw 'update volume directory unavailable' }
+    $directory = $parent
+  }
+  [UInt64]$available = 0; [UInt64]$total = 0; [UInt64]$free = 0
+  # Use the actual directory, including mounted volumes; the drive-letter root
+  # can refer to a different filesystem from the installation/staging path.
+  if (-not [FDSecurityUpdateDiskSpace]::GetDiskFreeSpaceExW($directory, [ref]$available, [ref]$total, [ref]$free)) {
+    throw (New-Object System.ComponentModel.Win32Exception([Runtime.InteropServices.Marshal]::GetLastWin32Error()))
+  }
+  if ($available -lt $required) { throw "insufficient disk space: required=$required available=$available" }
+}
+
 function Get-SetupInstallerFromPackage {
   param(
     [Parameter(Mandatory = $true)][string]$PackagePath,
@@ -86,6 +122,10 @@ function Get-SetupInstallerFromPackage {
     $manifestEntry = $entries['setup-ui-manifest.json']
     $setupEntry = $entries['fdsecuritysetup.exe']
     if (-not $manifestEntry -or -not $setupEntry) { throw 'full installer package must contain setup-ui-manifest.json and FDSecuritySetup.exe' }
+    if ($manifestEntry.Length -gt 1MB -or $setupEntry.Length -le 0 -or $setupEntry.Length -gt 256MB) {
+      throw 'full installer package exceeds bounded manifest or setup size'
+    }
+    Assert-UpdateFreeSpace -Path $DestinationDirectory -GrowthBytes ([UInt64]$setupEntry.Length)
     $reader = New-Object System.IO.StreamReader($manifestEntry.Open(), [System.Text.UTF8Encoding]::new($false), $true)
     try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
     if ([string]$manifest.version -ne $ExpectedVersion -or ([string]$manifest.agent_binary_sha256).ToLowerInvariant() -ne $ExpectedAgentSha256) {
@@ -208,6 +248,7 @@ function Invoke-FullInstallerUpgrade {
   $logPath = Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId
   $arguments = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/CLOSEAPPLICATIONS',
     (('/TASKS="{0}"' -f $runtimeTask)),
+    ('/EDR_MIN_FREE_BYTES=' + $MinFreeBytes.ToString([Globalization.CultureInfo]::InvariantCulture)),
     '/EDR_KEEP_OFFLINE_QUEUE=1','/EDR_KEEP_EVIDENCE_CACHE=1',("/LOG=`"$logPath`""))
   $uninstallerExe = Join-Path $InstallDir 'unins000.exe'
   $uninstallerData = Join-Path $InstallDir 'unins000.dat'
@@ -280,6 +321,27 @@ function Invoke-FullInstallerRuntimeMirror {
   )
   New-Item -ItemType Directory -Force -Path $Destination | Out-Null
   $mutableDirectories = @('certs','queue','evidence','state','logs','diagnostics','forensic','isolation','upload_outbox','edr_config')
+  if ($Stage -eq 'backup') {
+    # Count only the runtime tree mirrored below; mutable evidence is excluded.
+    [UInt64]$runtimeBytes = 0
+    $pendingDirectories = New-Object 'System.Collections.Generic.Stack[string]'
+    $pendingDirectories.Push($Source)
+    while ($pendingDirectories.Count -gt 0) {
+      $directory = $pendingDirectories.Pop()
+      foreach ($entry in Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) {
+        if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+        if ($entry.PSIsContainer) {
+          if ($mutableDirectories -notcontains $entry.Name) { $pendingDirectories.Push($entry.FullName) }
+        } elseif ($entry.Name -ne 'agent.toml' -and $entry.Extension -ne '.pid') {
+          if ([UInt64]$entry.Length -gt ([UInt64]::MaxValue - $runtimeBytes)) { throw 'runtime backup size overflow' }
+          $runtimeBytes += [UInt64]$entry.Length
+        }
+      }
+    }
+    # Preserve room for the backup and the installer's replacement work.
+    if ($runtimeBytes -gt [UInt64]::MaxValue / 2) { throw 'runtime backup peak overflow' }
+    Assert-UpdateFreeSpace -Path $Destination -GrowthBytes ($runtimeBytes * 2)
+  }
   $arguments = @($Source, $Destination, '/MIR', '/XJ', '/R:2', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/XD') +
     $mutableDirectories + @('/XF', 'agent.toml', '*.pid')
   & robocopy.exe @arguments | Out-Null
@@ -504,6 +566,13 @@ function Get-RuntimeUpdatePlan {
       if ($files.Count -lt $required.Count -or $files.Count -gt 64) {
         throw 'runtime package integrity manifest must contain the native uninstall chain and at most 61 app-local DLLs or the fixed forensic fallback'
       }
+      [UInt64]$expandedBytes = 0
+      foreach ($componentSpec in $files) {
+        $entry = $entries[([string]$componentSpec.name).ToLowerInvariant()]
+        if (-not $entry -or $entry.Length -le 0 -or $entry.Length -gt 256MB) { throw 'runtime package component size is invalid' }
+        $expandedBytes += [UInt64]$entry.Length
+      }
+      Assert-UpdateFreeSpace -Path $manifestDirectory -GrowthBytes ($expandedBytes + 1MB)
       $sourceRoot = Join-Path $manifestDirectory 'runtime-components'
       New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
       $declared = @{}
@@ -1274,9 +1343,7 @@ try {
 
   Set-UpdateStage -Stage "validate_candidate"
   $candidateLength = (Get-Item -LiteralPath $stagedPath).Length
-  $requiredFree = [Math]::Max([UInt64]($candidateLength * 3), $MinFreeBytes)
-  $drive = Get-PSDrive -Name ([System.IO.Path]::GetPathRoot($installFull).Substring(0,1))
-  if ([UInt64]$drive.Free -lt $requiredFree) { throw "insufficient disk space: required=$requiredFree available=$($drive.Free)" }
+  Assert-UpdateFreeSpace -Path $installFull -GrowthBytes ([UInt64]($candidateLength * 3))
   $stagedHash = Get-Sha256 -Path $stagedPath
   if ($stagedHash -ne $expectedHash) {
     throw "staged Agent hash mismatch: expected=$expectedHash actual=$stagedHash"
@@ -1390,6 +1457,12 @@ try {
   if ((Get-Sha256 -Path $candidatePath) -ne $expectedHash) {
     throw "candidate Agent hash changed after local staging"
   }
+  [UInt64]$runtimePeakBytes = 0
+  foreach ($item in $runtimePlan) {
+    # Source is already expanded; include staging, replacement and rollback copies.
+    $runtimePeakBytes += [UInt64]((Get-Item -LiteralPath $item.SourcePath).Length * 3)
+  }
+  Assert-UpdateFreeSpace -Path $installFull -GrowthBytes $runtimePeakBytes
   Stage-RuntimeUpdatePlan -Plan $runtimePlan
 
   if ($DrainDelaySeconds -gt 0) {

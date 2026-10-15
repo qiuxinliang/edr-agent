@@ -29,6 +29,7 @@
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #include "collector_health_json.h"
+#include "queue_retention_health_json.h"
 #include "edr/command.h"
 #include "edr/command_executor.h"
 #include "edr/response_capability_manifest.h"
@@ -46,6 +47,8 @@
 #include "edr/policy_v2.h"
 #include "edr/pmfe.h"
 #include "edr/storage_queue.h"
+#include "edr/storage_physical_guard.h"
+#include "edr/storage_space_policy.h"
 #include "edr/transport_sink.h"
 #include "edr/transport_v2.h"
 #include "edr/windows_event_policy.h"
@@ -671,6 +674,9 @@ struct EdrAgent {
   EdrEventBus *event_bus;
   char *config_path;
   EdrConfig cfg;
+  struct {
+    uint32_t owner_budget_mb, min_free_mb, selected_hours;
+  } storage_startup_policy;
   time_t config_mtime;
   int shutdown;
   int collector_started;
@@ -948,6 +954,11 @@ static int edr_agent_write_config_snapshot(const char *path, const EdrConfig *cf
   edr_agent_write_toml_string(fp, "evidence_cache_path", cfg->offline.evidence_cache_path);
   fprintf(fp, "max_queue_size_mb = %u\n", cfg->offline.max_queue_size_mb);
   fprintf(fp, "evidence_cache_max_size_mb = %u\n", cfg->offline.evidence_cache_max_size_mb);
+  fprintf(fp, "retention_hours = %u\n", cfg->offline.retention_hours);
+  fprintf(fp, "evidence_cache_retention_hours = %u\n", cfg->offline.evidence_cache_retention_hours);
+  fprintf(fp, "evidence_cache_selected_retention_hours = %u\n", cfg->offline.evidence_cache_selected_retention_hours);
+  fprintf(fp, "command_state_owner_budget_mb = %u\n", cfg->offline.command_state_owner_budget_mb);
+  fprintf(fp, "storage_min_free_mb = %u\n", cfg->offline.storage_min_free_mb);
   fprintf(fp, "\n[resource_limit]\n");
   fprintf(fp, "cpu_limit_percent = %u\n", cfg->resource_limit.cpu_limit_percent);
   fprintf(fp, "memory_limit_mb = %u\n", cfg->resource_limit.memory_limit_mb);
@@ -1543,6 +1554,15 @@ EdrError edr_agent_init(EdrAgent *agent, const char *config_path) {
       }
     }
   }
+  /* Bind only accepted startup configuration; parsing and reload validation
+   * alone do not alter the active storage environment. */
+  agent->storage_startup_policy.owner_budget_mb = agent->cfg.offline.command_state_owner_budget_mb;
+  agent->storage_startup_policy.min_free_mb = agent->cfg.offline.storage_min_free_mb;
+  agent->storage_startup_policy.selected_hours = agent->cfg.offline.evidence_cache_selected_retention_hours;
+  int storage_policy_rc = edr_storage_policy_apply(&agent->cfg, EDR_STORAGE_POLICY_STARTUP);
+  if (storage_policy_rc == -1) return EDR_ERR_INTERNAL;
+  if (storage_policy_rc == -2)
+    fprintf(stderr, "[storage] command owner accounting unavailable; disk admission held\n");
   edr_detection_apply_profile(&agent->cfg);
   edr_policy_v2_configure(&agent->cfg);
   if (agent->cfg.correlation.configured) {
@@ -2469,6 +2489,49 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_p0_rule_get_emit_metrics(&p0_emit_metrics);
   json_escape_small(p0_emit_metrics.source_only_terminal_reason, source_only_reason, sizeof(source_only_reason));
   edr_storage_queue_get_capacity_metrics(&queue_capacity_metrics);
+  EdrCommandStateCapacityStats owner_capacity = {0};
+  int owner_capacity_ok = edr_command_state_get_capacity_stats(&owner_capacity) == 0;
+  EdrStoragePhysicalSnapshot queue_volume = {0}, evidence_volume = {0};
+  int queue_volume_rc = edr_storage_physical_admit(agent->cfg.offline.queue_db_path, 0, 0, &queue_volume);
+  const char *evidence_path = getenv("EDR_EVIDENCE_CACHE_PATH");
+  if (!evidence_path || !evidence_path[0]) evidence_path = agent->cfg.offline.evidence_cache_path;
+  if (evidence_status.path[0]) evidence_path = evidence_status.path;
+  int evidence_volume_rc = edr_storage_physical_admit(evidence_path, 0, 0, &evidence_volume);
+  char storage_protection_json[1536];
+  snprintf(storage_protection_json, sizeof(storage_protection_json),
+      "{\"directory_hard_limit\":false,\"policy_restart_required\":%s,\"min_free_bytes\":%llu,"
+      "\"queue_probe_ok\":%s,\"queue_space_available\":%s,\"queue_available_bytes\":%llu,"
+      "\"evidence_probe_ok\":%s,\"evidence_space_available\":%s,\"evidence_available_bytes\":%llu,"
+      "\"command_owner\":{\"accounting_available\":%s,\"budget_bytes\":%llu,"
+      "\"new_record_bytes\":%llu,\"legacy_bytes\":%llu,\"reserved_bytes\":%llu,"
+      "\"protected_floor_bytes\":%llu,\"reserved_owner_count\":%llu,\"update_headroom_bytes\":%llu,"
+      "\"record_count\":%llu,\"reserved_record_slots\":%llu,"
+      "\"admission_rejected\":%llu,\"persistence_failed\":%llu}}",
+      (agent->storage_startup_policy.owner_budget_mb != agent->cfg.offline.command_state_owner_budget_mb ||
+       agent->storage_startup_policy.min_free_mb != agent->cfg.offline.storage_min_free_mb ||
+       agent->storage_startup_policy.selected_hours != agent->cfg.offline.evidence_cache_selected_retention_hours)
+          ? "true" : "false",
+      (unsigned long long)queue_volume.min_free_bytes,
+      queue_volume_rc != -2 ? "true" : "false", queue_volume_rc == 0 ? "true" : "false",
+      (unsigned long long)queue_volume.available_bytes,
+      evidence_volume_rc != -2 ? "true" : "false", evidence_volume_rc == 0 ? "true" : "false",
+      (unsigned long long)evidence_volume.available_bytes,
+      owner_capacity_ok ? "true" : "false",
+      (unsigned long long)owner_capacity.budget_bytes,
+      (unsigned long long)owner_capacity.new_record_bytes,
+      (unsigned long long)owner_capacity.legacy_bytes,
+      (unsigned long long)owner_capacity.reserved_bytes,
+      (unsigned long long)owner_capacity.protected_floor_bytes,
+      (unsigned long long)owner_capacity.reserved_owner_count,
+      (unsigned long long)owner_capacity.update_headroom_bytes,
+      (unsigned long long)owner_capacity.record_count,
+      (unsigned long long)owner_capacity.reserved_record_slots,
+      (unsigned long long)owner_capacity.admission_rejected,
+      (unsigned long long)owner_capacity.persistence_failed);
+  char queue_retention_json[2048];
+  if (edr_queue_retention_health_json(&queue_capacity_metrics, queue_retention_json,
+                                      sizeof(queue_retention_json)) != 0)
+    snprintf(queue_retention_json, sizeof(queue_retention_json), "{\"accounting_available\":false}");
   edr_storage_queue_enforcement_terminal_get_metrics(&terminal_journal_metrics);
   if (edr_local_evidence_cache_context_ref_write_sources_json(
           context_ref_sources_json, sizeof(context_ref_sources_json)) < 0) {
@@ -2607,6 +2670,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"used_bytes\":%llu,\"max_bytes\":%llu,\"pending_rows\":%llu,"
         "\"p0_source_only_rejected\":%llu,\"deferred_pending\":%llu,\"deferred_failed\":%llu,"
         "\"deferred_storage_failures\":%llu,\"deferred_retry_degraded\":%s}},"
+        "\"storage_protection\":%s,\"queue_local_retention\":%s,"
         "\"p0_offline_queue_capacity\":{\"delivery\":{\"selected\":%llu,\"sent\":%llu,\"acked\":%llu,\"requeued\":%llu,\"failed\":%llu,\"resource_deferred\":%llu,\"receipt_failures\":%llu}},"
         "\"sensor_health\":{\"etw_or_inotify_enabled\":%s,"
         "\"powershell_visible\":%s,\"amsi_visible\":%s,"
@@ -2836,6 +2900,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         (unsigned long long)queue_capacity_metrics.p0_deferred_failed_rows,
         (unsigned long long)p0_emit_metrics.deferred_storage_failures,
         p0_emit_metrics.deferred_retry_degraded ? "true" : "false",
+        storage_protection_json, queue_retention_json,
         (unsigned long long)queue_capacity_metrics.delivery_selected,
         (unsigned long long)queue_capacity_metrics.delivery_sent,
         (unsigned long long)queue_capacity_metrics.delivery_acked,
@@ -3077,6 +3142,9 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                  (unsigned long long)queue_capacity_metrics.shm_bytes,
                  (unsigned long long)queue_capacity_metrics.physical_bytes,
                  queue_capacity_metrics.accounting_available);
+  if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
+      p0_health_json, sizeof(p0_health_json), &p0_health_used,
+      ",\"storage_protection\":%s,\"queue_local_retention\":%s", storage_protection_json, queue_retention_json);
   if (p0_health_ok) p0_health_ok = edr_agent_append_json_fragment(
       p0_health_json, sizeof(p0_health_json), &p0_health_used,
       ",\"egress\":{\"policy_version\":\"" EDR_EGRESS_POLICY_VERSION "\",\"task_results_supported\":true,\"result_delivery_renewal_supported\":true,\"denied_requests\":%lu,"

@@ -25,6 +25,9 @@
 #include "edr/egress_request_policy.h"
 #include "edr/detection_decision.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/p0_source_only_contract.h"
+#include "lz4.h"
+#include <pb_decode.h>
 #include "edr/behavior_from_slot.h"
 #include "edr/behavior_alert_emit.h"
 #include "edr/event_bus.h"
@@ -389,7 +392,44 @@ static int command_result_scenario(const char *path) {
   CHECK(edr_command_receive_envelope("cmd_synthetic_forged", "noop", (const uint8_t *)"{}", 2, &meta) == 0);
   CHECK(edr_ingest_http_post_command_result_typed("cmd_synthetic_forged", "noop", &meta, 1, 0, "forged") != 0);
   CHECK(edr_command_receive_envelope("cmd_synthetic_noop", "noop", (const uint8_t *)"[]", 2, &meta) == 0);
-  CHECK(edr_command_receive_envelope("cmd_synthetic_noop", "noop", (const uint8_t *)"{}", 2, &meta) == 1);
+  char owner_limit[64];
+  snprintf(owner_limit,sizeof(owner_limit),"%u",5u*EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP);
+#ifdef _WIN32
+  CHECK(_putenv_s("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES",owner_limit)==0);
+#else
+  CHECK(setenv("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES",owner_limit,1)==0);
+#endif
+  CHECK(edr_command_state_begin("synthetic-capacity-owner","noop",NULL,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  EdrCommandExecutorHealth before_capacity,after_capacity;
+  edr_command_executor_get_health(&before_capacity);
+  /* This is the real signed receive path, durable inbox and executor. A full
+   * owner budget leaves the receipt unacknowledged and performs no noop. */
+  CHECK(edr_command_receive_envelope("cmd_synthetic_noop", "noop", (const uint8_t *)"{}", 2, &meta) == -1);
+  edr_command_executor_wake();pause_retry();
+  edr_command_executor_get_health(&after_capacity);
+  CHECK(after_capacity.executed_count==before_capacity.executed_count);
+  CHECK(!edr_command_state_has_final("cmd_synthetic_noop",&meta));
+  EdrCommandStateCapacityStats capacity;
+  CHECK(edr_command_state_get_capacity_stats(&capacity)==0);
+  CHECK(capacity.admission_rejected>0 && !strcmp(capacity.last_error,"state_owner_budget_exhausted"));
+  EdrCommandInboxRecord *retained_inbox=calloc(8u,sizeof(*retained_inbox));CHECK(retained_inbox);
+  int retained_command=0;
+  if(retained_inbox) {
+    int count=edr_command_state_collect_inbox(retained_inbox,8u);
+    for(int i=0;i<count;i++) {
+      if(!strcmp(retained_inbox[i].command_id,"cmd_synthetic_noop"))retained_command=1;
+      edr_command_state_free_inbox_record(&retained_inbox[i]);
+    }
+    free(retained_inbox);
+  }
+  CHECK(retained_command);
+#ifdef _WIN32
+  CHECK(_putenv_s("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0")==0);
+#else
+  CHECK(setenv("EDR_COMMAND_STATE_OWNER_BUDGET_BYTES","0",1)==0);
+#endif
+  /* Restoring admission lets the same durable inbox execute exactly once;
+   * the rejected receive did not need to recreate or replace its payload. */
   edr_command_executor_wake();
   EdrCommandStateRecord *pending = calloc(8u, sizeof(*pending)); CHECK(pending);
   int found = -1;
@@ -400,6 +440,8 @@ static int command_result_scenario(const char *path) {
       if (!strcmp(pending[i].command_id, "cmd_synthetic_noop")) found = i;
   }
   CHECK(found >= 0);
+  pause_retry();edr_command_executor_get_health(&after_capacity);
+  CHECK(after_capacity.executed_count==before_capacity.executed_count+1u);
   if (found >= 0) {
     EdrCommandStateRecord *record = &pending[found];
     CHECK(record->execution_status == 1 && record->result_authorization.expires_unix_ms > 0);
@@ -482,7 +524,7 @@ static int command_result_scenario(const char *path) {
   attack_surface_command_admission(&meta);
   CHECK(edr_command_executor_shutdown_timeout(5000) == 1);
   edr_command_bind_config(NULL); free(pending);
-  printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
+  printf("{\"mode\":\"positive-command\",\"signed_admission\":true,\"capacity_rejection_no_execution\":true,\"retained_inbox_replayed_once\":true,\"signed_renewal\":true,\"original_result_retained\":true,\"failed_checks\":%u}\n", failed);
   return failed ? 1 : 0;
 }
 
@@ -611,12 +653,17 @@ static int command_delivery_scenario(const char *path, const char *mode) {
       CHECK(edr_command_state_mark_reported(record) == 0);
     }
     delivery_finish("cmd_delivery_retry");
+    delivery_finish("cmd_delivery_rate_limited");
     edr_command_poll_reliable_delivery();
     CHECK(delivery_wait("cmd_delivery_retry", 0, 4000u));
+    CHECK(delivery_wait("cmd_delivery_rate_limited", 0, 4000u));
     delivery_finish("cmd_delivery_fresh");
     CHECK(delivery_wait("cmd_delivery_fresh", 1, 4000u));
     if (record) {
       CHECK(delivery_record("cmd_delivery_retry", record));
+      CHECK(record->report_pending && record->report_attempts == 1u &&
+          record->report_next_retry_unix_ms > (int64_t)time(NULL) * 1000);
+      CHECK(delivery_record("cmd_delivery_rate_limited", record));
       CHECK(record->report_pending && record->report_attempts == 1u &&
           record->report_next_retry_unix_ms > (int64_t)time(NULL) * 1000);
       CHECK(delivery_record("cmd_delivery_held", record));
@@ -626,6 +673,7 @@ static int command_delivery_scenario(const char *path, const char *mode) {
       free(record);
     }
     CHECK(delivery_wait("cmd_delivery_retry", 1, 10000u));
+    CHECK(delivery_wait("cmd_delivery_rate_limited", 1, 10000u));
   } else {
     delivery_finish("cmd_delivery_slow");
     edr_command_poll_reliable_delivery();
@@ -723,10 +771,178 @@ static int update_download_scenario(const char *path,int bad_tls) {
   return failed?1:0;
 }
 
+/* Runs real storage, RAW/BLZ4 codec, frozen request purpose, durable result
+ * owner and final HTTP gate. Signature admission and TLS remain covered by
+ * the existing signed loopback suite; this mode opens no network connection. */
+static void local_query_source(unsigned number,int compressed,int mismatch) {
+  EdrBehaviorRecord *source=calloc(1,sizeof(*source)),*record=calloc(1,sizeof(*record));
+  uint8_t *raw=malloc(1048576u),*wire=malloc(1048576u);
+  CHECK(source && record && raw && wire); if(!source||!record||!raw||!wire) goto done;
+  edr_behavior_record_init(source); source->type=EDR_EVENT_PROCESS_CREATE;
+  source->pid=42+number; source->ppid=21; source->process_start_key=1000+number;
+  source->process_creation_filetime_100ns=133700000000000000ULL+number;
+  source->event_time_ns=(int64_t)time(NULL)*1000000000LL;
+  snprintf(source->endpoint_id,sizeof(source->endpoint_id),"synthetic-endpoint");
+  snprintf(source->tenant_id,sizeof(source->tenant_id),"%s",number==2 ? "other-tenant" : "synthetic-tenant");
+  snprintf(source->event_id,sizeof(source->event_id),"local-query-source-%u",number);
+  snprintf(source->process_name,sizeof(source->process_name),"query-visible.exe");
+  snprintf(source->cmdline,sizeof(source->cmdline),"private-unrequested-command");
+  CHECK(edr_p0_source_only_build_pre_evaluation_record(source,"coalescer_backpressure",record));
+  CHECK(edr_p0_source_only_validate_record(record));
+  char command[6001]; memset(command,'x',6000); command[6000]=0;
+  memcpy(command,"query-visible ",14); memcpy(command+5989,"tail-needle",11);
+  size_t n=edr_behavior_record_encode_protobuf_full_facts(record,NULL,number==1 ? command : NULL,NULL,raw+4,1048572u);
+  CHECK(n>0); if(!n) goto done; wr(raw,(uint32_t)n);
+  size_t body=n+4;
+  wr(wire,compressed ? EDR_TRANSPORT_BATCH_MAGIC_LZ4 : EDR_TRANSPORT_BATCH_MAGIC_RAW);
+  wr(wire+4,1); wr(wire+8,(uint32_t)body);
+  if(compressed) { int z=LZ4_compress_default((const char*)raw,(char*)wire+12,(int)body,1048564);CHECK(z>0);body=(size_t)z; }
+  else memcpy(wire+12,raw,body);
+  char why[128]; CHECK(!edr_egress_batch_validate(wire,12,wire+12,body,why,sizeof(why)));
+  EdrStorageQueueP0SourceOnlyLatch latch;
+  CHECK(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  EdrStorageQueueLocalEvidenceOwner owner={0}; owner.version=1; owner.diagnostic_reason="coalescer_backpressure";
+  owner.endpoint_id=record->endpoint_id; owner.tenant_id=record->tenant_id;owner.event_time_ns=record->event_time_ns;
+  owner.event_type=record->type;owner.pid=mismatch ? 99u : record->pid;owner.parent_pid=record->ppid;
+  owner.process_start_key=record->process_start_key;owner.process_creation_filetime_100ns=record->process_creation_filetime_100ns;
+  CHECK(edr_storage_queue_p0_source_only_commit_local_typed(&latch,record->event_id,record->event_id,wire,body+12,compressed,0,&owner)==EDR_OK);
+done:
+  free(source);free(record);free(raw);free(wire);
+}
+
+static void local_query_terminal_source(unsigned number,int mismatch) {
+  EdrTestP0TerminalFixture fixture;
+  int initialized=edr_test_p0_terminal_fixture_init(&fixture,number,"synthetic-tenant","synthetic-endpoint");
+  CHECK(initialized); if(!initialized) return;
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event)); CHECK(event);
+  if(!event) { edr_test_p0_terminal_fixture_free(&fixture); return; }
+  int64_t stamp=(int64_t)time(NULL)*1000000000LL;
+  for(unsigned kind=0;kind<3;++kind) {
+    memset(event,0,sizeof(*event));
+    pb_istream_t in=pb_istream_from_buffer(fixture.wire[kind]+16,fixture.length[kind]-16);
+    CHECK(pb_decode(&in,edr_v1_BehaviorEvent_fields,event));
+    event->event_time_ns=stamp;
+    if(event->has_behavior_alert)event->behavior_alert.timestamp_ns=stamp;
+    if(mismatch && kind==1) {
+      char *birth=strstr(event->ave_result_json,"133444000000000000"); CHECK(birth);
+      if(birth) birth[17]='1'; /* Same double, different exact uint64 lexeme. */
+    }
+    pb_ostream_t out=pb_ostream_from_buffer(fixture.wire[kind]+16,65520);
+    CHECK(pb_encode(&out,edr_v1_BehaviorEvent_fields,event));
+    fixture.length[kind]=out.bytes_written+16;
+    wr(fixture.wire[kind]+8,(uint32_t)out.bytes_written+4);wr(fixture.wire[kind]+12,(uint32_t)out.bytes_written);
+  }
+  char intent[64],source[64],combined[64];
+  snprintf(intent,sizeof(intent),"query-terminal-intent-%u",number);
+  snprintf(source,sizeof(source),"query-terminal-source-%u",number);
+  snprintf(combined,sizeof(combined),"query-terminal-combined-%u",number);
+  CHECK(edr_storage_queue_enforcement_terminal_precreate(fixture.terminal_key,fixture.source_event_id,
+      fixture.rule_id,fixture.generation_key,intent,fixture.wire[0],fixture.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  EdrStorageQueueLocalEvidenceOwner owner={0};owner.version=1;owner.diagnostic_reason="enforcement_terminal_result";
+  owner.tenant_id="synthetic-tenant";owner.endpoint_id="synthetic-endpoint";owner.event_time_ns=stamp;
+  owner.event_type=EDR_EVENT_PROCESS_CREATE;owner.pid=4242;owner.process_start_key=UINT64_C(0xfedcba9876543210);
+  owner.process_creation_filetime_100ns=UINT64_C(133444000000000000);
+  CHECK(edr_storage_queue_enforcement_terminal_update_local_source(fixture.terminal_key,source,fixture.wire[1],
+      fixture.length[1],combined,fixture.wire[2],fixture.length[2],fixture.source_event_id,&owner)==EDR_OK);
+  free(event);edr_test_p0_terminal_fixture_free(&fixture);
+}
+
+static int local_query_contract_scenario(const char *prefix) {
+  char queue[1400],cache[1400],state[1400];
+  snprintf(queue,sizeof(queue),"%s.queue",prefix);snprintf(cache,sizeof(cache),"%s.cache",prefix);
+  /* A CTest rerun is a new authorization session. Never overwrite a previous
+   * frozen owner or relax its conflict check just to make the fixture repeat. */
+#ifdef _WIN32
+  snprintf(state,sizeof(state),"%s.state-%lu-%llu",prefix,(unsigned long)GetCurrentProcessId(),
+      (unsigned long long)GetTickCount64());
+  int state_created=CreateDirectoryA(state,NULL)!=0;
+  CHECK(state_created);if(!state_created)return 1;
+  CHECK(_putenv_s("EDR_COMMAND_STATE_DIR",state)==0);
+#else
+  snprintf(state,sizeof(state),"%s.state.XXXXXX",prefix);
+  char *state_created=mkdtemp(state);CHECK(state_created);if(!state_created)return 1;
+  CHECK(setenv("EDR_COMMAND_STATE_DIR",state,1)==0);
+#endif
+  EdrConfig cfg={0};snprintf(cfg.agent.tenant_id,sizeof(cfg.agent.tenant_id),"synthetic-tenant");
+  snprintf(cfg.agent.endpoint_id,sizeof(cfg.agent.endpoint_id),"synthetic-endpoint");edr_command_bind_config(&cfg);
+  edr_egress_set_command_result_validator(edr_command_state_result_authorized);
+  edr_storage_queue_configure(16,1);CHECK(edr_storage_queue_open(queue)==EDR_OK);
+  CHECK(edr_local_evidence_cache_open_with_policy(cache,16,1,4)==0);
+  for(unsigned i=0;i<3;++i)local_query_source(i,i==1,0);
+  EdrSoarCommandMeta meta={0};meta.issued_at_unix_ms=(int64_t)time(NULL)*1000;meta.deadline_ms=60000;
+  EdrCommandResultAuthorization *a=&meta.result_authorization;
+  snprintf(a->command_id,sizeof(a->command_id),"local-query-contract");snprintf(a->command_type,sizeof(a->command_type),"rtq_query");
+  snprintf(a->tenant_id,sizeof(a->tenant_id),"synthetic-tenant");snprintf(a->endpoint_id,sizeof(a->endpoint_id),"synthetic-endpoint");
+  a->expires_unix_ms=meta.issued_at_unix_ms+60000;
+  const char *request="{\"event_type\":\"1\",\"process_name\":\"query-visible\",\"limit\":10}";
+  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  char output[16384],projected[16384],reason[128];
+  int queried=edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output));CHECK(queried==0);
+  cJSON *result=queried==0 ? cJSON_Parse(output) : NULL;CHECK(result);
+  if(result)CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(result,"rows"))==2);
+  CHECK(!strstr(output,"private-unrequested-command") && !strstr(output,"tail-needle") && !strstr(output,"other-tenant"));
+  CHECK(strstr(output,"event_queue"));cJSON_Delete(result);
+  CHECK(edr_command_result_project_detail(a,"rtq_query",1,0,output,projected,sizeof(projected))==0);
+  CHECK(edr_command_state_finish(a->command_id,"rtq_query",&meta,"ok",1,0,projected,"",1)==0);
+  CHECK(edr_command_state_finish(a->command_id,"rtq_query",&meta,"ok",1,0,projected,"",1)==0);
+  CHECK(edr_command_state_finish(a->command_id,"rtq_query",&meta,"failed",0,1,"conflicting-result","",1)<0);
+  char *body=edr_command_result_http_json(a->endpoint_id,"test-v1",a->command_id,"rtq_query",1,0,projected,meta.issued_at_unix_ms,"","","");CHECK(body);
+  if(body) { int gate=edr_egress_request_validate_for_scope("POST","ingest/report-command-result","application/json",body,strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason));
+    if(gate)fprintf(stderr,"local query final gate cause=%s\n",reason);
+    CHECK(gate==0);free(body); }
+  request="{\"pid\":43,\"process_cmdline\":\"tail-needle\"}";
+  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
+  result=cJSON_Parse(output);CHECK(result);
+  if(result) {
+    cJSON *rows=cJSON_GetObjectItemCaseSensitive(result,"rows");CHECK(cJSON_GetArraySize(rows)==1);
+    const cJSON *command=cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(rows,0),"cmdline");
+    CHECK(cJSON_IsString(command) && strlen(command->valuestring)==6000 && strstr(command->valuestring,"tail-needle"));cJSON_Delete(result);
+  }
+  CHECK(edr_command_result_project_detail(a,"rtq_query",1,0,output,projected,sizeof(projected))==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,512)<0 && strstr(output,"byte budget"));
+  local_query_terminal_source(1,0);
+  snprintf(a->command_id,sizeof(a->command_id),"local-query-terminal");
+  request="{\"pid\":4242}";
+  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
+  result=cJSON_Parse(output);CHECK(result);
+  if(result)CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(result,"rows"))==1);
+  cJSON_Delete(result);
+  CHECK(!strstr(output,"synthetic-required-rule-fact") && !strstr(output,"terminal_key"));
+  CHECK(edr_command_result_project_detail(a,"rtq_query",1,0,output,projected,sizeof(projected))==0);
+  CHECK(edr_command_state_finish(a->command_id,"rtq_query",&meta,"ok",1,0,projected,"",1)==0);
+  body=edr_command_result_http_json(a->endpoint_id,"test-v1",a->command_id,"rtq_query",1,0,projected,meta.issued_at_unix_ms,"","","");CHECK(body);
+  if(body) { CHECK(edr_egress_request_validate_for_scope("POST","ingest/report-command-result","application/json",body,
+      strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason))==0);free(body); }
+  local_query_terminal_source(2,1);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))<0 && strstr(output,"identity"));
+  local_query_source(3,0,1);
+  request="{\"pid\":99}";CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))<0 && strstr(output,"identity"));
+  edr_storage_queue_close();edr_local_evidence_cache_close();remove(queue);remove(cache);
+  char fixture_file[1500];
+  const char *sidecars[]={"-wal","-shm"};
+  for(unsigned i=0;i<2;++i) {
+    snprintf(fixture_file,sizeof(fixture_file),"%s%s",queue,sidecars[i]);remove(fixture_file);
+    snprintf(fixture_file,sizeof(fixture_file),"%s%s",cache,sidecars[i]);remove(fixture_file);
+  }
+  snprintf(fixture_file,sizeof(fixture_file),"%s/command_state.jsonl",state);CHECK(remove(fixture_file)==0);
+  snprintf(fixture_file,sizeof(fixture_file),"%s/command_state.jsonl.lock",state);CHECK(remove(fixture_file)==0);
+#ifdef _WIN32
+  CHECK(RemoveDirectoryA(state)!=0);
+#else
+  CHECK(rmdir(state)==0);
+#endif
+  printf("{\"mode\":\"local-query-contract\",\"raw_lz4_scope_projection_final_gate\":true,\"terminal_source_scope_projection_final_gate\":true,\"network_started\":false,\"failed_checks\":%u}\n",failed);
+  return failed ? 1 : 0;
+}
+
 #endif
 
 int main(int argc, char **argv) {
 #ifdef EDR_TEST_EXTENDED_EGRESS
+  if(argc==3 && !strcmp(argv[1],"--local-query-contract"))return local_query_contract_scenario(argv[2]);
   if (argc == 3 && !strcmp(argv[1], "--attack-surface-admission")) {
     char path[1200], state[1280];
 #ifdef _WIN32

@@ -2216,7 +2216,7 @@ static void do_rtr_shell(const char *cmd_id, const uint8_t *pl, size_t len,
   soar_emit_ex(cmd_id, sm, EdrCmdExecOk, 0, detail, "ok", NULL);
 }
 
-static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *data, size_t len,
+static int shell_stream_output_cb(const char *sid, uint64_t seq, const char *data, size_t len,
                                    int exit_code, bool closed,
                                    const EdrCommandResultAuthorization *authorization, void *user) {
   (void)user;
@@ -2224,14 +2224,14 @@ static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *da
   if (!command_copy_bounded_cstr_exact(sid_copy, sizeof(sid_copy), sid, EDR_SS_ID_LEN) ||
       !sid_copy[0]) {
     audit_both("", "shell_stream rejected: invalid session id");
-    return;
+    return -1;
   }
   char cmd_id[160];
   int cmd_id_written = snprintf(cmd_id, sizeof(cmd_id), "%s.s%06llu", sid_copy,
                                 (unsigned long long)seq);
   if (cmd_id_written < 0 || (size_t)cmd_id_written >= sizeof(cmd_id)) {
     audit_both("", "shell_stream rejected: stream command id is too long");
-    return;
+    return -1;
   }
 
   char *sessionj = json_escape_alloc_cmd(sid_copy);
@@ -2278,8 +2278,9 @@ static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *da
   (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
                                          sizeof(dummy.soar_correlation_id), sid_copy,
                                          sizeof(sid_copy));
-  if (edr_command_state_finish(cmd_id, "shell_stream", &dummy, closed ? "closed" : "ok",
-                               (int)EdrCmdExecOk, exit_code, detail, "", 1) == 0) {
+  int persisted = edr_command_state_finish(cmd_id, "shell_stream", &dummy, closed ? "closed" : "ok",
+                               (int)EdrCmdExecOk, exit_code, detail, "", 1);
+  if (persisted == 0) {
     edr_command_state_delete_inbox(cmd_id);
   } else {
     audit_both(cmd_id, "shell_stream state persist failed");
@@ -2287,24 +2288,14 @@ static void shell_stream_output_cb(const char *sid, uint64_t seq, const char *da
   free(detail);
   free(sessionj);
   free(dataj);
-  return;
+  return persisted == 0 ? 0 : -1;
 
 persist_failure:
   free(sessionj);
   free(dataj);
-  {
-    EdrSoarCommandMeta dummy;
-    memset(&dummy, 0, sizeof(dummy));
-    if (authorization) dummy.result_authorization = *authorization;
-    (void)command_copy_bounded_cstr_exact(dummy.soar_correlation_id,
-                                           sizeof(dummy.soar_correlation_id), sid_copy,
-                                           sizeof(sid_copy));
-    if (edr_command_state_finish(cmd_id, "shell_stream", &dummy, "failed",
-                                 (int)EdrCmdExecFailed, 5,
-                                 "shell stream chunk was rejected before durable serialization", "", 1) != 0) {
-      audit_both(cmd_id, "shell_stream failure state persist failed");
-    }
-  }
+  /* Keep the original bytes with their owner; a substitute failure result
+   * would consume the same sequence and silently discard the actual output. */
+  return -1;
 }
 
 static void ensure_shell_session_initialized(void) {
@@ -3697,21 +3688,12 @@ static void do_rtq_query(const char *cmd_id, const uint8_t *pl, size_t len, cons
     soar_emit(cmd_id,sm,EdrCmdExecRejected,1,"readonly RTQ disabled");
     return;
   }
-  char payload[4096];
-  if (pl && len > 0u) {
-    if (len >= sizeof(payload)) {
-      len = sizeof(payload) - 1u;
-    }
-    memcpy(payload, pl, len);
-    payload[len] = '\0';
-  } else {
-    snprintf(payload, sizeof(payload), "{\"limit\":50,\"time_window_s\":600}");
-  }
+  (void)pl; (void)len; /* Only the already verified frozen purpose owns this query. */
   char detail[12000];
-  if (edr_local_evidence_cache_query_json(payload, detail, sizeof(detail)) != 0) {
+  if (edr_local_evidence_cache_query_authorized_json(cmd_id, sm, detail, sizeof(detail)) != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "rtq_query: failed");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "rtq query failed");
+    audit_both(cmd_id, "rtq_query: scoped query rejected or unavailable");
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, detail);
     return;
   }
   s_handled++;

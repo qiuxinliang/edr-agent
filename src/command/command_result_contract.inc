@@ -359,6 +359,18 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
     cJSON_AddStringToObject(out,"source","mixed");
     cJSON_AddBoolToObject(out,"partial",partial);
     cJSON_AddNumberToObject(out,"rows_returned",cJSON_GetArraySize(rows));
+    const cJSON *availability=cJSON_GetObjectItemCaseSensitive(root,"availability_reason");
+    const cJSON *absence=cJSON_GetObjectItemCaseSensitive(root,"absence_is_evidence");
+    if (availability || absence) {
+      if (!cJSON_IsString(availability) || !cJSON_IsFalse(absence) ||
+          !result_member(availability->valuestring,"available|outside_retention_window|not_collected_or_expired") ||
+          (cJSON_GetArraySize(rows)>0 && strcmp(availability->valuestring,"available")) ||
+          (cJSON_GetArraySize(rows)==0 && !strcmp(availability->valuestring,"available"))) {
+        cJSON_Delete(out); return NULL;
+      }
+      if (!cJSON_AddStringToObject(out,"availability_reason",availability->valuestring) ||
+          !cJSON_AddBoolToObject(out,"absence_is_evidence",0)) { cJSON_Delete(out); return NULL; }
+    }
   } else {
     cJSON_AddNumberToObject(out,"total",cJSON_GetArraySize(rows));
     cJSON_AddBoolToObject(out,"truncated",partial);
