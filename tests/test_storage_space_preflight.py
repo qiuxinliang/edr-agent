@@ -1,39 +1,83 @@
 """Execute the production local preflight against synthetic files only."""
 import argparse
-import base64
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+import time
+import uuid
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--client', type=Path, required=True)
 args = parser.parse_args()
 client = str(args.client.resolve())
 
-def windows_ps(script):
-    encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-    # Windows Python normalizes environment keys to uppercase. Remove every
-    # spelling so PS5.1 rebuilds its own path instead of importing CI's PS7 modules.
-    env = {key: value for key, value in os.environ.items()
-           if key.upper() != 'PSMODULEPATH'}
-    return subprocess.check_output(['powershell.exe', '-NoProfile', '-NonInteractive',
-                                    '-EncodedCommand', encoded], env=env, timeout=10).decode().strip()
+if os.name == 'nt':
+    import ctypes
+    from ctypes import wintypes
+    # Independent OS ACL boundary: no production security helper or subprocess.
+    acl_api = ctypes.WinDLL('advapi32', use_last_error=True)
+    acl_kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    acl_api.GetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD)]
+    acl_api.GetFileSecurityW.restype = wintypes.BOOL
+    acl_api.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    acl_api.SetFileSecurityW.restype = wintypes.BOOL
+    acl_api.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD)]
+    acl_api.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    acl_api.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+    acl_api.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    acl_kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    acl_kernel.LocalFree.restype = ctypes.c_void_p
+
+    def free_security_buffer(buffer):
+        if acl_kernel.LocalFree(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 def private_acl(path, unsafe=False):
     if os.name == 'nt':
-        quoted = "'" + str(path).replace("'", "''") + "'"
         sddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)' + ('(A;;FA;;;WD)' if unsafe else '')
-        windows_ps("$ErrorActionPreference='Stop';$p=" + quoted + ";$a=Get-Acl -LiteralPath $p;"
-                   "$a.SetSecurityDescriptorSddlForm('" + sddl + "',"
-                   "[Security.AccessControl.AccessControlSections]::Access);Set-Acl -LiteralPath $p -AclObject $a")
+        descriptor = ctypes.c_void_p()
+        if not acl_api.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION:
+            # set the same protected DACL without changing owner or group.
+            if not acl_api.SetFileSecurityW(str(path), 0x80000004, descriptor):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            free_security_buffer(descriptor)
 
 def permissions(path):
     if os.name == 'nt':
-        quoted = "'" + str(path).replace("'", "''") + "'"
-        return windows_ps("$ErrorActionPreference='Stop';(Get-Acl -LiteralPath " + quoted + ').Sddl')
+        # OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+        # DACL_SECURITY_INFORMATION, including the descriptor control flags.
+        size = wintypes.DWORD()
+        ok = acl_api.GetFileSecurityW(str(path), 7, None, 0, ctypes.byref(size))
+        error = ctypes.get_last_error()
+        if ok or error != 122 or not size.value:  # ERROR_INSUFFICIENT_BUFFER
+            raise ctypes.WinError(error)
+        descriptor = ctypes.create_string_buffer(size.value)
+        if not acl_api.GetFileSecurityW(str(path), 7, descriptor, len(descriptor), ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        text = ctypes.c_void_p()
+        if not acl_api.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, 1, 7, ctypes.byref(text), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            assert text.value, 'empty security descriptor'
+            return ctypes.wstring_at(text.value)
+        finally:
+            free_security_buffer(text)
     st = path.stat()
     return (st.st_mode, st.st_uid, st.st_gid)
 
@@ -116,12 +160,92 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
         assert permissions(state.parent) == rejected_parent_acl and state.read_bytes() == before
         private_acl(state.parent)
         import msvcrt
-        with Path(str(state)+'.lock').open('r+b') as lock:
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateEventW.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel.SetEvent.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        def contended_inventory(name, release, deadline=False, attempt_cap=False):
+            prefix = 'Local\\EDRInventory-' + uuid.uuid4().hex
+            events = {}
+            child = None
+            output = root/(name+'.floor')
             try:
-                invoke('owner-lock-busy', ['--config', str(config)], 4)
+                for label in ('observed', 'sleeping', 'resume'):
+                    ctypes.set_last_error(0)
+                    handle = kernel.CreateEventW(None, True, False, prefix+'-'+label)
+                    assert handle and ctypes.get_last_error() != 183, 'event must be exclusive'
+                    events[label] = handle
+                mode = 'deadline' if deadline else ('attempt_cap' if attempt_cap else 'observe')
+                child_env = dict(env, EDR_PREFLIGHT_TEST_MODE=mode,
+                                 EDR_PREFLIGHT_TEST_EVENT_PREFIX=prefix)
+                with Path(str(state)+'.lock').open('r+b') as lock:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    started = time.monotonic()
+                    try:
+                        child = subprocess.Popen([client, '--storage-space-preflight', '--config', str(config),
+                                                  '--output', str(output)], env=child_env,
+                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        # A real LockFileEx failure, not elapsed startup time,
+                        # authorizes the parent to release its actual byte lock.
+                        assert kernel.WaitForSingleObject(events['observed'], 5000) == 0, name
+                        if deadline:
+                            assert kernel.WaitForSingleObject(events['sleeping'], 5000) == 0, name
+                        if release:
+                            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                            locked = False
+                        if deadline:
+                            assert kernel.SetEvent(events['resume']), name
+                        stdout, stderr = child.communicate(timeout=5)
+                    finally:
+                        if locked:
+                            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                elapsed = time.monotonic()-started
+                expected = 0 if release and not deadline else 7
+                assert child.returncode == expected, (name, child.returncode, stderr.decode(errors='replace'))
+                assert not stdout and elapsed < 8, (name, elapsed)
+                trace = re.findall(rb'inventory_test attempts=(\d+) conflicts=(\d+) sleeps=(\d+) mode=(observe|deadline|attempt_cap)', stderr)
+                assert len(trace) == 1, (name, stderr)
+                attempts, conflicts, sleeps = (int(value) for value in trace[0][:3])
+                assert conflicts >= 1 and sleeps >= 1, name
+                if deadline:
+                    # The real lock is now free: an erroneous post-deadline
+                    # attempt would succeed and invalidate this assertion.
+                    assert attempts == conflicts == sleeps == 1, name
+                elif attempt_cap:
+                    assert attempts == conflicts == 41 and sleeps == 40, name
+                elif release:
+                    assert attempts >= 2 and attempts > conflicts, name
+                else:
+                    assert attempts == conflicts and elapsed >= 0.9, (name, elapsed)
+                if expected:
+                    assert b'storage preflight: owner_lock_timeout\n' in stderr.replace(b'\r\n', b'\n'), name
+                    assert not output.exists(), (name, 'failure emitted usable floor')
+                else:
+                    assert output.read_bytes() == str(64*1024*1024).encode(), name
+                assert hashlib.sha256(state.read_bytes()).hexdigest() == before_hash, name
             finally:
-                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=3)
+                for handle in events.values():
+                    assert kernel.CloseHandle(handle)
+            print(json.dumps({'case': name, 'exit': child.returncode,
+                              'attempts': attempts, 'conflicts': conflicts, 'sleeps': sleeps,
+                              'clock_mode': trace[0][3].decode('ascii'),
+                              'elapsed_seconds': round(elapsed, 6)}, sort_keys=True), flush=True)
+
+        contended_inventory('owner-lock-released', release=True)
+        contended_inventory('owner-lock-timeout', release=False)
+        contended_inventory('owner-lock-deadline', release=True, deadline=True)
+        contended_inventory('owner-lock-attempt-cap', release=False, attempt_cap=True)
+        assert permissions(state) == owner_permissions and permissions(state.parent) == parent_permissions
     config.write_text('[offline\n')
     invoke('corrupt-config', ['--config', str(config)], 3)
     invoke('ambiguous', ['--config', str(config), '--defaults'], 2)

@@ -57,6 +57,9 @@ function Invoke-Preflight([string]$Name, [string[]]$Cli, [int]$Expected = 0) {
         $stderr = $process.StandardError.ReadToEnd()
         Assert-Preflight ($process.ExitCode -eq $Expected) ($Name + ': unexpected exit ' + $process.ExitCode + ': ' + $stderr)
         Assert-Preflight (-not $stdout) ($Name + ': unexpected stdout')
+        if ($Expected -eq 7) {
+            Assert-Preflight ($stderr.Trim() -eq 'storage preflight: owner_lock_timeout') ($Name + ': timeout cause missing')
+        }
         $cases.Count++
         if ($Expected -ne 0) {
             Assert-Preflight (-not (Test-Path -LiteralPath $output)) ($Name + ': failure emitted a usable floor')
@@ -116,7 +119,7 @@ try {
     $lock = [IO.File]::Open(($state + '.lock'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
     try {
         $lock.Lock(0, 1)
-        Invoke-Preflight 'owner-lock-busy' @('--config', $config) 4
+        Invoke-Preflight 'owner-lock-busy' @('--config', $config) 7
         $lock.Unlock(0, 1)
     } finally { $lock.Dispose() }
     [IO.File]::WriteAllText($config, "[offline`n", $utf8)

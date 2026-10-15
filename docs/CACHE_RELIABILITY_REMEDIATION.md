@@ -185,6 +185,93 @@ This establishes lock contention as the cause of this diagnostic failure.
 It does not identify the lock holder or prove that both historical ARM64
 679 upgrade failures had the same cause; their child error was not retained.
 
+### Follow-up: bounded inventory lock contention and installer diagnostics
+
+The pending repair changes only the Windows read-only inventory lock: retry
+actual `ERROR_LOCK_VIOLATION` on the same validated handle, with a 1,000 ms
+monotonic budget, sleeps of at most 25 ms and an independent 41-attempt cap.
+Other errors fail immediately. The ordinary runtime lock, owner/parent ACL and
+reparse checks, parser, protected bytes and existing 15-second installer child
+watchdog remain unchanged. The contention budget leaves room for normal
+calibration observed at 120/173 ms; it is not a hard bound on arbitrary disk I/O
+or scheduling and does not guarantee every owner will complete in 15 seconds.
+Exhaustion propagates a typed status through policy to preflight exit 7. It
+does not read an unlocked owner or replace an unavailable inventory with zero.
+
+Inno logs one fixed diagnostic line separating launcher failure (numeric
+Win32 code) from child exit (numeric exit and fixed reason). It does not collect
+raw child output, command text or paths. The existing updater still redacts and
+retains at most 4,096 bytes; the coarse updater error classifier is unchanged.
+The original PowerShell command and watchdog are preserved byte-for-byte.
+
+Host build and the seven focused CTest contracts passed in 20.56 seconds:
+preflight, command inbox/process/outbox/result/compaction and update packaging.
+Commands and build-source hashes are in `/tmp/edr-680-lock-host-provenance.json`;
+logs are `/tmp/edr-680-lock-host-{build,tests}.log`. This does not execute the
+Windows retry branch. The Windows test client alone receives private clock,
+sleep and observation hooks; LockFileEx and owner I/O remain real. The product
+does not contain the test environment controls or event names.
+
+The first UTM fixture run establishes a narrow red/green result. An old-source
+observer build failed after an observed real lock conflict (one attempt, zero
+sleeps, exit 4). The repaired build passed all four new lock assertions:
+release-after-conflict succeeded (2 attempts), a held lock timed out (exit 7,
+1.047 seconds), reaching the deadline prevented a second attempt, and a frozen
+test clock still stopped at 41 attempts / 40 sleeps. However, the complete
+Python fixture exceeded its original 60-second bound during later checks.
+Its original result remains **timeout**, not a passing gate. The retained logs
+show repeated PowerShell ACL-query process initialization; batching paired
+owner/parent ACL reads preserves both SDDL comparisons and the original bound.
+Raw old/new stdout, stderr and timing are under
+`/private/tmp/edr-680-inventory-lock-fix/native/`.
+
+The first independent installer test run likewise remains failed: its original
+12 real preflight cases passed, then the synthetic child compilation used an
+Add-Type option unsupported by Windows PowerShell 5.1. The fixture correction
+uses its existing default AnyCPU compiler mode. The redaction run separately
+failed at the existing snapshot Move-Item with a sharing violation; the writer
+was disposed before the move, but the available log cannot identify the holder
+or case. Fixed case labels are added for diagnosis without production retries
+or expanded collection. These failures and subsequent results must be reported
+separately. No additional real upgrade has been attempted for this repair.
+
+After removing only the unsupported compiler option, the real Inno fixture
+passed 19/19 in 58.375 seconds, including the original 12 cases and seven
+failure-diagnostic cases. The real child watchdog case took 17.229 seconds
+including launch/installer overhead; the original child limit remains 15
+seconds. Every injected failure refused before the marker and payload copy.
+The one labeled redaction rerun passed 26/26 in 6.235 seconds with the original
+4,096-byte UTF-8/hash/size checks. Its prior sharing violation did not recur;
+the holder/cause remains unknown and no production fix is claimed for it.
+Source hashes, exact commands and raw logs are in
+`/private/tmp/edr-680-inno-diag-fixed-a0d5_t1c/handoff.json`.
+
+The paired-ACL Python fixture still exceeded 60 seconds (63.078 seconds after
+cleanup), after all four lock cases passed again; stderr contains the 15
+PowerShell module initializations and no assertion/traceback. That full result
+also remains failed, at
+`/private/tmp/edr-680-inventory-lock-fixed-3a8c734eece4/result.json`.
+The existing one-process native PowerShell preflight fixture separately passed
+13/13 in 9.016 seconds using the same plain helper and original 90-second bound;
+see `/private/tmp/edr-680-preflight-ps13-85cd1a426e26/result.json`. These helpers
+are MinGW AMD64 on ARM64 emulation, not the pending official MSVC release.
+
+The final Python fixture replaces only its independent Windows ACL test I/O
+with ctypes calls to Get/SetFileSecurityW and the system SDDL converters. The
+same protected DACL and unsafe Everyone ACE are applied; every owner/group/DACL
+comparison still performs a fresh OS read. No production security helper,
+cache, extra dependency or test timeout is introduced. The complete fixture
+then passed once in 2.062 seconds, exit 0 with no stderr, including all original
+checks and the four real lock cases, under the unchanged 60-second limit.
+Original command owner bytes and ACL assertions remain intact. Results and
+source hashes are in
+`/private/tmp/edr-680-inventory-native-acl-40a2f4cbc00c/result.json`;
+the same final Python source also passed the host POSIX path, recorded in
+`/tmp/edr-680-native-acl-host-check.json`. The removed PowerShell startup cost
+was a fixture problem; it does not change the installed Agent or explain the
+two historical 679 upgrade failures. Official native release gates and actual
+680 client deployment are still required.
+
 ## Follow-up: bounded maintenance selection and Windows concurrency coverage
 
 The additional full UTM queue test exposed an actual read-amplification path

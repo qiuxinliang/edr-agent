@@ -101,8 +101,12 @@ typedef struct EdrCommandStateCapacityStats {
   char last_error[96];
 } EdrCommandStateCapacityStats;
 int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out);
-/* Installer preflight: validate existing ACLs; never repair ACLs, create parent
- * directories or rewrite/compact the owner. Only the normal lock may be created. */
+/* Installer preflight: validate existing owner/parent ACLs; never repair them,
+ * create parent directories or rewrite/compact the owner. Only the normal lock
+ * metadata may be created/secured. Windows lock contention uses a 1000 ms
+ * monotonic budget and at most 41 attempts; other
+ * failures do not retry. On failure, out->last_error is a fixed local reason. */
+enum { EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT = -2 };
 int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out);
 
 enum {

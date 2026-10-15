@@ -34,6 +34,9 @@ static int edr_storage_space_preflight_main(int argc, char **argv) {
   }
   int rc = edr_storage_policy_apply(&cfg, defaults ? EDR_STORAGE_POLICY_DEFAULTS : EDR_STORAGE_POLICY_READ_ONLY);
   edr_config_free_heap(&cfg);
+  if (rc == EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT) {
+    fprintf(stderr, "storage preflight: owner_lock_timeout\n"); return 7;
+  }
   uint64_t floor = 0;
   if (rc || edr_storage_min_free_bytes(&floor) || floor > 9007199254740991ULL) {
     fprintf(stderr, "storage preflight: owner accounting or policy unavailable\n"); return 4;

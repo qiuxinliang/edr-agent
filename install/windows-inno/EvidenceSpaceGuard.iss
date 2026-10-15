@@ -108,10 +108,43 @@ begin
   Result := #39 + Quoted + #39;
 end;
 
+function EdrSpacePreflightExitReason(const Code: Integer): string;
+begin
+  case Code of
+    0: Result := 'success';
+    2: Result := 'invalid_arguments';
+    3: Result := 'configuration_unavailable';
+    4: Result := 'owner_accounting_or_policy_unavailable';
+    5: Result := 'floor_output_failed';
+    7: Result := 'owner_lock_timeout';
+    124: Result := 'child_watchdog_timeout';
+  else
+    Result := 'unclassified_exit';
+  end;
+end;
+
+function EdrExecSpacePreflight(const Launcher, Command, WorkDir: string): string;
+var
+  Code: Integer;
+  Launched: Boolean;
+begin
+  Result := 'EDR: local storage preflight failed; existing runtime was not stopped.';
+  Launched := Exec(Launcher, Command, WorkDir, SW_HIDE, ewWaitUntilTerminated, Code);
+  if not Launched then
+  begin
+    Log('EDR storage preflight: stage=launch_failed; win32_code=' + IntToStr(Code));
+    Exit;
+  end;
+  // Fixed reasons and numeric status only: no command, path or child output.
+  Log('EDR storage preflight: stage=child_exit; exit_code=' + IntToStr(Code) +
+    '; reason=' + EdrSpacePreflightExitReason(Code));
+  if Code = 0 then Result := '';
+end;
+
 function EdrComputeLocalSpaceFloor(const AppDir: string; const Required: Boolean;
   const PassedFloor: Int64; var FloorBytes: Int64): string;
 var
-  Code, Extracted: Integer;
+  Extracted: Integer;
   ProbeDir, ProbeExe, OutputPath, ConfigPath, Arguments, Command: string;
   Decimal: AnsiString;
 begin
@@ -155,12 +188,9 @@ begin
       + '(' + Arguments + ')' + ' -WorkingDirectory ' + EdrSpacePsQuote(ProbeDir)
       + ' -PassThru;try{if(-not $p.WaitForExit(15000)){$p.Kill();exit 124};'
       + '$p.Refresh();exit $p.ExitCode}finally{$p.Dispose()}"';
-    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-      Command, ProbeDir, SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
-    begin
-      Result := 'EDR: local storage preflight failed; existing runtime was not stopped.';
-      Exit;
-    end;
+    Result := EdrExecSpacePreflight(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      Command, ProbeDir);
+    if Result <> '' then Exit;
     if not LoadStringFromFile(OutputPath, Decimal) or
        not EdrParseSpaceFloor(String(Decimal), FloorBytes) then
     begin

@@ -2227,6 +2227,7 @@ target_include_directories(storage_space_preflight_client PRIVATE
 target_link_libraries(storage_space_preflight_client PRIVATE edr_egress_policy Threads::Threads)
 if(WIN32)
   target_link_libraries(storage_space_preflight_client PRIVATE advapi32)
+  target_compile_definitions(storage_space_preflight_client PRIVATE EDR_COMMAND_STATE_INVENTORY_TEST=1)
 endif()
 edr_apply_test_warnings(storage_space_preflight_client)
 add_test(NAME storage_space_preflight COMMAND ${Python3_EXECUTABLE} -B

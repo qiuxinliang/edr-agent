@@ -42,6 +42,9 @@ $cases = @(
   @{ Name='truncate_after_redaction'; Raw=('a' * 4300) + "`npassword=`"" + ('FICTIONAL_LONG ' * 800) + '"'; Forbidden=@('FICTIONAL_LONG') },
   @{ Name='utf8_tail'; Raw=([string] [char] 0x4E2D * 1500); Forbidden=@([string] [char] 0xFFFD) },
   @{ Name='supplementary_tail'; Raw=([char]::ConvertFromUtf32(0x1F600) * 1500); Forbidden=@([string] [char] 0xFFFD) },
+  @{ Name='preflight_lock_timeout'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=child_exit; exit_code=7; reason=owner_lock_timeout"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=child_exit; exit_code=7; reason=owner_lock_timeout' },
+  @{ Name='preflight_child_watchdog'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=child_exit; exit_code=124; reason=child_watchdog_timeout"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=child_exit; exit_code=124; reason=child_watchdog_timeout' },
+  @{ Name='preflight_launch_failed'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=launch_failed; win32_code=2"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=launch_failed; win32_code=2' },
   @{ Name='unterminated_quote'; Raw='password="FICTIONAL_FIRST FICTIONAL_SECOND'; Forbidden=@('FICTIONAL_FIRST', 'FICTIONAL_SECOND'); Unterminated=$true }
 )
 
@@ -50,6 +53,7 @@ New-Item -ItemType Directory -Path $root | Out-Null
 $failures = @()
 try {
   foreach ($case in $cases) {
+    Write-Host "[installer-redaction] case=$($case.Name) begin"
     $path = Join-Path $root ($case.Name + '.log')
     $raw = "phase=install`r`n" + $case.Raw
     if (-not $case.ContainsKey('Unterminated')) { $raw += "`r`nphase=done error_code=1603" }
@@ -60,6 +64,9 @@ try {
     $snapshot = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
     foreach ($marker in $case.Forbidden) {
       if ($snapshot.Contains($marker)) { $failures += "$($case.Name): forbidden marker survived" }
+    }
+    if ($case.ContainsKey('Required') -and -not $snapshot.Contains($case.Required)) {
+      $failures += "$($case.Name): fixed preflight diagnostic was lost from bounded snapshot"
     }
     if ($evidence.Status -cne 'ready' -or $evidence.Path -cne "$path.redacted" -or
         $evidence.Sha256 -cne (Get-Sha256 -Path $evidence.Path) -or

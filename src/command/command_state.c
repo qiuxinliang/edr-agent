@@ -740,9 +740,64 @@ static int state_prepare_dir(const char *path) {
 #endif
 }
 
-static FILE *state_inventory_lock_acquire(int *absent_parent) {
+#ifdef _WIN32
+/* Only the installer inventory waits for a transient writer. The 1 s budget
+ * leaves the rest of the original 15 s installer watchdog for calibration;
+ * it is not a guarantee about disk or process scheduling latency. */
+#define STATE_INVENTORY_LOCK_WAIT_MS 1000u
+#define STATE_INVENTORY_LOCK_POLL_MS 25u
+#ifdef EDR_COMMAND_STATE_INVENTORY_TEST
+/* This observer/clock is linked only by the existing preflight test client.
+ * LockFileEx and all owner I/O remain real in that consumer. */
+extern ULONGLONG edr_command_state_inventory_test_now(void);
+extern void edr_command_state_inventory_test_sleep(DWORD milliseconds);
+extern void edr_command_state_inventory_test_observe(DWORD error);
+#define state_inventory_now_ms edr_command_state_inventory_test_now
+#define state_inventory_sleep_ms edr_command_state_inventory_test_sleep
+#else
+#define state_inventory_now_ms GetTickCount64
+#define state_inventory_sleep_ms Sleep
+#endif
+
+static int state_inventory_lock_wait(HANDLE handle) {
+  ULONGLONG started = state_inventory_now_ms();
+  int first = 1;
+  unsigned attempts = 0;
+  for (;;) {
+    if (!first && state_inventory_now_ms() - started >= STATE_INVENTORY_LOCK_WAIT_MS) {
+      SetLastError(ERROR_LOCK_VIOLATION);
+      return EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT;
+    }
+    first = 0;
+    attempts++;
+    OVERLAPPED overlapped = {0};
+    BOOL locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                            0, 1, 0, &overlapped);
+    DWORD error = locked ? ERROR_SUCCESS : GetLastError();
+#ifdef EDR_COMMAND_STATE_INVENTORY_TEST
+    edr_command_state_inventory_test_observe(error);
+#endif
+    if (locked) return 0;
+    if (error != ERROR_LOCK_VIOLATION) { SetLastError(error); return -1; }
+    ULONGLONG elapsed = state_inventory_now_ms() - started;
+    if (elapsed >= STATE_INVENTORY_LOCK_WAIT_MS ||
+        attempts >= STATE_INVENTORY_LOCK_WAIT_MS / STATE_INVENTORY_LOCK_POLL_MS + 1u) {
+      SetLastError(error);
+      return EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT;
+    }
+    DWORD remaining = (DWORD)(STATE_INVENTORY_LOCK_WAIT_MS - elapsed);
+    state_inventory_sleep_ms(remaining < STATE_INVENTORY_LOCK_POLL_MS
+        ? remaining : STATE_INVENTORY_LOCK_POLL_MS);
+  }
+}
+#endif
+
+static FILE *state_inventory_lock_acquire(int *absent_parent, int *status,
+                                          char *reason, size_t reason_cap) {
   char path[1024], parent[1024], lock_path[1100];
   *absent_parent = 0;
+  *status = -1;
+  snprintf(reason, reason_cap, "state_inventory_parent_unavailable");
   state_default_path(path, sizeof(path));
   if (state_parent_dir(path, parent, sizeof(parent)) != 0) return NULL;
   errno = 0;
@@ -764,29 +819,40 @@ static FILE *state_inventory_lock_acquire(int *absent_parent) {
   }
 #endif
   snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+  snprintf(reason, reason_cap, "state_inventory_lock_open_failed");
 #ifdef _WIN32
   HANDLE h = CreateFileA(lock_path, GENERIC_READ | GENERIC_WRITE,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
       FILE_FLAG_OPEN_REPARSE_POINT, NULL);
   if (h == INVALID_HANDLE_VALUE) return NULL;
+  snprintf(reason, reason_cap, "state_inventory_lock_security_failed");
   BY_HANDLE_FILE_INFORMATION info;
   if (!GetFileInformationByHandle(h, &info) ||
       (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
       state_windows_secure_existing(lock_path, 0) != 0) { CloseHandle(h); return NULL; }
   int fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+  snprintf(reason, reason_cap, "state_inventory_lock_stream_failed");
   if (fd < 0) { CloseHandle(h); return NULL; }
   FILE *f = _fdopen(fd, "r+b");
   if (!f) { _close(fd); return NULL; }
-  OVERLAPPED ov = {0};
-  if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) { fclose(f); return NULL; }
+  int lock_rc = state_inventory_lock_wait(h);
+  if (lock_rc != 0) {
+    DWORD error = GetLastError();
+    *status = lock_rc;
+    snprintf(reason, reason_cap, "%s", lock_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT
+        ? "state_inventory_lock_timeout" : "state_inventory_lock_failed");
+    fclose(f); SetLastError(error); return NULL;
+  }
 #else
   int fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
   if (fd < 0) return NULL;
   if (state_file_secure_fd(fd, NULL) != 0) { close(fd); return NULL; }
   FILE *f = state_fdopen_checked(fd, "r+b");
   if (!f) return NULL;
+  snprintf(reason, reason_cap, "state_inventory_lock_failed");
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) { fclose(f); return NULL; }
 #endif
+  *status = 0;
   return f;
 }
 
@@ -2321,13 +2387,18 @@ static int append_state_line(const char *line) {
 
 static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inventory) {
   if(!out)return -1;
+  if (inventory) memset(out, 0, sizeof(*out));
   int absent_parent = 0;
-  FILE *lock = inventory ? state_inventory_lock_acquire(&absent_parent) : state_lock_acquire();
+  int inventory_status = -1;
+  FILE *lock = inventory ? state_inventory_lock_acquire(&absent_parent,
+      &inventory_status, out->last_error, sizeof(out->last_error)) : state_lock_acquire();
   if (!lock) {
-    if (!absent_parent) return -1;
+    if (!absent_parent) return inventory ? inventory_status : -1;
     memset(out, 0, sizeof(*out));
     out->budget_bytes = state_owner_budget();
     out->update_headroom_bytes = EDR_COMMAND_STATE_LINE_CAP;
+    if (!out->budget_bytes)
+      snprintf(out->last_error, sizeof(out->last_error), "physical_configuration_invalid");
     return out->budget_bytes ? 0 : -1;
   }
   char path[1024];state_default_path(path,sizeof(path));
