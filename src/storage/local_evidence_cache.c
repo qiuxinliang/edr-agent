@@ -2500,9 +2500,12 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
 }
 
 #if defined(EDR_HAVE_SQLITE)
-/* Only physical reclamation is resumable. No row identities or SQLite
- * statements survive a poll, and admission/startup can take over at any time. */
+/* Bounded reclamation intent survives a poll, never a SQLite statement or
+ * uncommitted deletion. Admission/startup can take over at any time. */
 static unsigned s_maintenance_reclaim_pages;
+/* Once pressure starts, finish recovering the WAL working target even if one
+ * partial slice brings the file just below the hard admission limit. */
+static int s_maintenance_pressure_pending;
 /* Two bounded keyset cursors prevent protected old groups from starving newer
  * eligible groups. Losing a cursor on restart only repeats safe validation. */
 static struct { int value_class; sqlite3_int64 time; char id[160]; } s_retirement_cursor[2];
@@ -5507,13 +5510,17 @@ static int sqlite_maintenance(int defer_reclaim) {
            i==6 ? cutoff_minute : cutoff,&slice)!=0) goto failed;
     }
   }
-  if (db_size_over_limit()) {
+  if (db_size_over_limit()) s_maintenance_pressure_pending=1;
+  if (s_maintenance_pressure_pending) {
     uint64_t target = sqlite_capacity_live_target();
-    if (!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE)!=0) goto failed;
+    /* Decide from live pages before checkpointing. A slow checkpoint can use
+     * the entire cooperative time slice on every turn and otherwise starve
+     * pressure retirement forever. Free pages do not justify eviction; the
+     * live-page check below still protects that case. Checkpoint after work. */
     for (unsigned pass=0;pass<4u && !sqlite_maintenance_yield(&slice);++pass) {
       int over=sqlite_live_size_over_limit(target);
       if(over<0) goto failed;
-      if(!over) break;
+      if(!over) { s_maintenance_pressure_pending=0; break; }
       if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice)!=0) goto failed;
       if(!retired && !s_retirement_cursor[1].time) break;
     }
@@ -6645,6 +6652,7 @@ static void evidence_cache_close_locked(void) {
   /* Completed slices are SQLite commits; remaining free pages are discovered
    * by normal startup maintenance, with no durable scheduler state to replay. */
   s_maintenance_reclaim_pages = 0u;
+  s_maintenance_pressure_pending=0;
   s_maintenance_stage=0;
   memset(s_retirement_cursor, 0, sizeof(s_retirement_cursor));
   memset(&s_command_retirement_cursor, 0, sizeof(s_command_retirement_cursor));

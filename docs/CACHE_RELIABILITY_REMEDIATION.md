@@ -36,6 +36,81 @@ corrected source proceeds as candidate 3.2.675, without promoting GitHub latest.
 The failed draft and CI evidence remain intact. Native gate and single-client
 deployment results will be appended after they actually complete.
 
+Candidate 3.2.675, source `5b461f9146ee2994b3dde6e8e6740105dea8f5db`, run
+`38681945395`, passed the native compilation gates on both architectures but
+failed runtime gates: AMD64 92/97 (266.36 s), ARM64 91/97 (459.15 s). Neither
+package, full installer lifecycle nor final publication ran. The subsequent
+standalone telemetry label runner was also skipped; overlapping labels within
+the 97 tests must not be counted as an additional run. The client remains 673.
+
+Four common failures were test portability defects: Python's Windows default
+encoding when reading UTF-8 source, an LF-only installer order assertion, a
+superseded literal Source assertion after actual expanded-size accounting, and
+case-sensitive removal of `PSModulePath` from Windows Python's uppercase
+environment keys. The fixes preserve the actual preflight-before-runtime-stop,
+mandatory uninstaller, ACL, and original source-path contracts. Static installer
+mutations cover missing refusal exits, reordered checks/stops, wrong uninstaller
+and changed size-macro return values. Native Windows Python / PowerShell 5.1
+reproduced the old module-autoload failure and passed with the corrected launcher;
+the parent environment remains unchanged.
+
+The candidate pressure test also exposed a real slow-I/O starvation path:
+checkpointing before the pressure loop can consume every 20 ms maintenance
+slice. Retirement now checks live pages before checkpointing. The existing
+post-work and bounded reclamation checkpoints remain; free pages alone never
+authorize evidence retirement. A real SQLite VFS adds 30 ms only to main-DB
+sync, without replacing I/O results. The unchanged 800-group / two-round /
+32-retry admission and referential-integrity assertions fail against 675's
+production source (1.952 s) and pass after the change (1.257 s). Raw red/green
+results: `/tmp/edr-676-slow-cache/{red,green}.log`. A separate MinGW/SQLite 3.53.4
+UTM diagnostic initially showed productive but insufficient work in 32 turns;
+that diagnostic is not the MSVC Release gate and is not proof of one common
+root cause for every native failure.
+
+The same native diagnostic also captured a partial-cycle boundary: DB
+1,036,288 bytes, WAL 0, below the 1 MiB admission limit but above the existing
+960 KiB WAL working target. Later turns used only the hard limit and stopped
+pressure retirement prematurely. An in-memory pending-pressure bit now retains
+the interrupted cycle until the live-page target is met; each later transaction
+rechecks ownership, pins and physical space. It stores no row payload or pending
+transaction, resets on close, and grants no additional deletion authority.
+The convergence tests now allow one turn per classified fixture group plus the
+16 existing physical-reclaim continuations, and fail early after 32 turns with
+no new retired groups or lower physical minimum. The WAL test allows multiple
+bounded maintenance cycles, still proving each physical drain does not rerun
+retirement, the original working target is recovered, and the next candidate
+needs no further maintenance. No budget, retention dependency or successful
+admission assertion was relaxed.
+
+ARM64 additionally timed out in the Inno synthetic fixture, whose old failure
+output omitted the case and installer log. The follow-up adds bounded per-case
+logs and owned-process-tree cleanup, retaining its 30 s / 45 s bounds and the
+product's 15 s preflight bound. It does not claim to resolve the unknown timeout
+cause. AMD64's actual Inno fixture passed (17.07 s), and the actual Agent's native
+preflight fixture passed on AMD64 (1.36 s) and ARM64 (3.13 s). These are distinct
+from the Python launcher failure. Complete 675 logs are retained in
+`/tmp/edr-675-ci-all.zip` and `/tmp/edr-675-ci-{amd64,arm64}.log`.
+
+The final follow-up source passes all 64 local gate tests in one run (122.88 s),
+including real loopback TLS/codec checks. The build and test commands are:
+
+```sh
+cmake --build /tmp/edr-cache-assessment-egress-build --target edr_agent agent_runtime_gate_tests telemetry_minimization_tests -j4
+PATH=/opt/homebrew/opt/openssl@3/bin:$PATH ctest --test-dir /tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -L 'agent-runtime-gate|telemetry-minimization'
+```
+
+Raw logs: `/tmp/edr-676-final2-{build,gates}.log`. The local P0 sensor stub
+boundary described below remains unchanged. The exact current cache/test
+source also passes UTM native `--candidate-retention-pressure` (4,924 ms) and
+`--slow-checkpoint-retention` (3,241 ms), with real SQLite 3.53.4 and no surviving
+synthetic database files. This MinGW x64 process on Windows ARM64 is additional
+Windows I/O evidence, not a replacement for MSVC's two-architecture CI. Complete
+compile/link inputs and source hashes are in
+`/tmp/edr-676-native-candidate-latest/provenance.json`, and the two `*.runner.log`
+files in that directory retain process exit/timeout results. Source advances
+to candidate 3.2.676; publication and deployment remain conditional on the
+native gates. GitHub latest was verified unchanged at `win_3.2.591`.
+
 ### Effective policy and ownership
 
 | Data / actual owner | Retention and protection | Delivery obligation |

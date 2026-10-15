@@ -2309,12 +2309,33 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&after);
     /* An admission may yield after its work budget. Existing bounded failure
-     * backoff and later maintenance must still converge, without fake ACKs. */
-    for (unsigned retry=0; after.candidate_admitted==before.candidate_admitted && retry<32; ++retry) {
+     * backoff and later maintenance must still converge, without fake ACKs.
+     * Allow one turn per fixture group plus the bounded reclamation drain;
+     * a fixed 32 turns incorrectly assumes equal throughput on all disks.
+     * Still fail early if 32 turns make no durable reclamation progress. */
+    unsigned stalled=0, retry_limit=(unsigned)before_refs+16u;
+    uint64_t best_bytes=after.db_bytes+after.wal_bytes;
+    uint64_t retired_seen=after.retention_groups_retired;
+    for (unsigned retry=0; after.candidate_admitted==before.candidate_admitted &&
+         retry<retry_limit && stalled<32u; ++retry) {
       s_test_monotonic_ns+=60000000000ULL;
       edr_local_evidence_cache_poll_maintenance();
       edr_local_evidence_cache_record_behavior(&candidate);
       edr_local_evidence_cache_get_status(&after);
+      uint64_t bytes=after.db_bytes+after.wal_bytes;
+      if(after.retention_groups_retired>retired_seen || bytes<best_bytes) stalled=0;
+      else ++stalled;
+      if(bytes<best_bytes) best_bytes=bytes;
+      retired_seen=after.retention_groups_retired;
+    }
+    if (after.candidate_admitted != before.candidate_admitted + 1u) {
+      fprintf(stderr,"capacity convergence failed: round=%u retired=%llu held=%llu "
+          "maintenance=%llu db=%llu wal=%llu retention_failures=%llu cause=%s\n",round,
+          (unsigned long long)(after.retention_groups_retired-before.retention_groups_retired),
+          (unsigned long long)(after.retention_groups_held-before.retention_groups_held),
+          (unsigned long long)(after.maintenance_runs-before.maintenance_runs),
+          (unsigned long long)after.db_bytes,(unsigned long long)after.wal_bytes,
+          (unsigned long long)(after.retention_failures-before.retention_failures),after.last_error);
     }
     assert(after.candidate_admitted == before.candidate_admitted + 1u);
     assert(after.maintenance_runs >= before.maintenance_runs + 1u);
@@ -2374,17 +2395,26 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
   assert(sqlite3_close(raw) == SQLITE_OK);
   edr_local_evidence_cache_get_status(&before);
   assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
-  s_test_monotonic_ns = 61000000000ull;
-  edr_local_evidence_cache_poll_maintenance();
-  edr_local_evidence_cache_get_status(&after);
-  assert(after.db_capacity_evicted > before.db_capacity_evicted);
-  /* Routine reclamation now yields before shrinking; complete its bounded
-   * slices at the same clock time, without rerunning retention or GC. */
-  uint64_t runs = after.maintenance_runs;
-  for (unsigned slice = 0; slice < 16u; ++slice)
+  after=before;
+  for(unsigned cycle=0; after.db_bytes+after.wal_bytes>=960u*1024u &&
+      cycle<(unsigned)rows+1u; ++cycle) {
+    s_test_monotonic_ns+=60000000000ULL;
     edr_local_evidence_cache_poll_maintenance();
-  edr_local_evidence_cache_get_status(&after);
-  assert(after.maintenance_runs == runs);
+    edr_local_evidence_cache_get_status(&after);
+    /* Drain only the bounded physical reclaim slices at the same clock time.
+     * Further retirement needs another maintenance turn, not a larger lock
+     * holding period on slower machines. */
+    uint64_t runs=after.maintenance_runs;
+    for(unsigned slice=0;slice<16u;++slice)
+      edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs==runs);
+  }
+  assert(after.db_capacity_evicted > before.db_capacity_evicted);
+  if(after.db_bytes+after.wal_bytes>=960u*1024u)
+    fprintf(stderr,"WAL reserve convergence failed: db=%llu wal=%llu retired=%llu cause=%s\n",
+        (unsigned long long)after.db_bytes,(unsigned long long)after.wal_bytes,
+        (unsigned long long)after.retention_groups_retired,after.last_error);
   assert(after.db_bytes + after.wal_bytes < 960u * 1024u);
   uint64_t retained_groups=sqlite_table_count(db,"p0_candidates");
   assert(retained_groups>=1u && retained_groups<(uint64_t)rows+1u);
@@ -7038,10 +7068,11 @@ static void test_maintenance_query_copy_slices(void) {
 
 /* Test-only VFS accounting measures SQLite's issued reads/writes, including
  * WAL and checkpoint copies. It is not a hardware disk-controller counter. */
-typedef struct { sqlite3_file base; sqlite3_file *real; } RetentionBenchFile;
+typedef struct { sqlite3_file base; sqlite3_file *real; int main_database; } RetentionBenchFile;
 static sqlite3_vfs *retention_bench_vfs_parent;
 static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_syncs;
 static int retention_raise_floor_on_write;
+static unsigned retention_checkpoint_delay_ms;
 #define BENCH_FILE(f) (((RetentionBenchFile *)(f))->real)
 static int bench_close(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xClose(BENCH_FILE(f)); }
 static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) { retention_bench_reads+=(unsigned)n; return BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o); }
@@ -7055,7 +7086,20 @@ static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
   retention_bench_writes+=(unsigned)n; return BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o);
 }
 static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
-static int bench_sync(sqlite3_file *f,int flags) { ++retention_bench_syncs; return BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags); }
+static int bench_sync(sqlite3_file *f,int flags) {
+  ++retention_bench_syncs;
+  /* Preserve the real filesystem result, but make checkpoint I/O slower than
+   * one maintenance slice. This must not starve actual group retirement. */
+  if (retention_checkpoint_delay_ms && ((RetentionBenchFile *)f)->main_database) {
+#if defined(_WIN32)
+    Sleep(retention_checkpoint_delay_ms);
+#else
+    struct timespec delay={0,(long)retention_checkpoint_delay_ms*1000000L};
+    nanosleep(&delay,NULL);
+#endif
+  }
+  return BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags);
+}
 static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return BENCH_FILE(f)->pMethods->xFileSize(BENCH_FILE(f),n); }
 static int bench_lock(sqlite3_file *f,int n) { return BENCH_FILE(f)->pMethods->xLock(BENCH_FILE(f),n); }
 static int bench_unlock(sqlite3_file *f,int n) { return BENCH_FILE(f)->pMethods->xUnlock(BENCH_FILE(f),n); }
@@ -7078,12 +7122,26 @@ static const sqlite3_io_methods retention_bench_methods = {3,bench_close,bench_r
   bench_lock,bench_unlock,bench_reserved,bench_control,bench_sector,bench_characteristics,bench_map,bench_shm_lock,bench_barrier,bench_unmap,bench_fetch,bench_unfetch};
 static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *file,int flags,int *out) {
   (void)v; RetentionBenchFile *f=(RetentionBenchFile *)file;
+  f->main_database=(flags & SQLITE_OPEN_MAIN_DB)!=0;
   f->real=(sqlite3_file *)(f+1); memset(f->real,0,(size_t)retention_bench_vfs_parent->szOsFile);
   int rc=retention_bench_vfs_parent->xOpen(retention_bench_vfs_parent,name,f->real,flags,out);
   if (f->real->pMethods) f->base.pMethods=&retention_bench_methods;
   return rc;
 }
 #undef BENCH_FILE
+
+static void test_capacity_progress_with_slow_checkpoint(void) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="slow-checkpoint-retention"; vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile); vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  retention_checkpoint_delay_ms=30u;
+  test_capacity_success_does_not_throttle_next_reclaim();
+  retention_checkpoint_delay_ms=0u;
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
 
 static void test_physical_floor_holds_maintenance_and_startup(void) {
   char path[512]; sqlite3 *db=NULL,*reader=NULL;
@@ -9580,6 +9638,9 @@ int main(int argc, char **argv) {
     test_critical_context_still_honors_retention();
     return 0;
   }
+  if (argc == 2 && strcmp(argv[1], "--slow-checkpoint-retention") == 0) {
+    test_capacity_progress_with_slow_checkpoint(); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--value-retention-benchmark") == 0) {
     test_retention_value_benchmark(); return 0;
   }
@@ -9713,6 +9774,7 @@ int main(int argc, char **argv) {
   test_capacity_reclaims_free_pages_before_evicting_candidates();
   test_capacity_preserves_unclassified_refs_and_reports_refusal();
   test_capacity_success_does_not_throttle_next_reclaim();
+  test_capacity_progress_with_slow_checkpoint();
   test_capacity_reserves_wal_room_below_live_limit();
   test_capacity_allows_wal_transaction_after_reclaim();
   test_capacity_reclaims_wal_tail_without_evicting_evidence(119u);

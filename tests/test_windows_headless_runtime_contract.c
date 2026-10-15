@@ -580,8 +580,18 @@ int main(void) {
                          "commercial Setup fails closed instead of entering the lab PowerShell fallback");
   ok &= require_contains(inno, "(not EdrInstallerWorkerExists) and (not EdrPowerShellFallbackAllowed)",
                          "commercial Setup checks the native worker before any install stage");
-  ok &= require_contains(inno, "Source: \"{#EDR_BIN_DIR}\\uninstall.exe\"",
-                         "Setup UI must package the same native uninstaller as the release ZIP");
+  ok &= require_contains(inno,
+                         "Source: \"{#EdrSizedSource(EDR_BIN_DIR + \"\\uninstall.exe\")}\"; DestDir: \"{app}\"; Flags: ignoreversion",
+                         "Setup UI must size and package the same required native uninstaller as the release ZIP");
+  ok &= require_contains(inno, "#include \"EvidenceSpaceMeasure.iss\"",
+                         "Setup file sources must use the shared expanded-size accounting owner");
+  char *space_measure = read_source(root, "install/windows-inno/EvidenceSpaceMeasure.iss");
+  if (!space_measure) { free(inno); return 1; }
+  ok &= require_contains(space_measure, "#define EdrSizedSource(str Source, int Recursive = False, str ExcludeName = \"\")",
+                         "source size accounting must accept the original release path");
+  ok &= require_contains(space_measure, "EdrMeasureExclude = ExcludeName, EdrMeasureDirectory, Source",
+                         "source size accounting must return the original release path unchanged");
+  free(space_measure);
   ok &= require_contains(inno, "AppId={{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}",
                          "bundled Setup must retain the exact native-owned Inno registration identity");
   ok &= require_contains(inno, "Name: \"{autoprograms}\\{#MyAppName}\"",

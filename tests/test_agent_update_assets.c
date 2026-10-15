@@ -272,10 +272,23 @@ int main(void) {
   require_true(count_occurrences(inno, "\nSource: ") ==
                    count_occurrences(inno, "\nSource: \"{#EdrSizedSource("),
                "every bundled file entry participates in expanded-size accounting");
-  contains_before(inno,
-                  "Result := EdrCheckInstallSpace(AppDir, EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline);",
-                  "  SaveEnrollParamsFileIfNeeded;\n  Cmd :=",
-                  "full installer checks space before enrollment writes and runtime stop");
+  const char *prepare_to_install = strstr(inno, "function PrepareToInstall(var NeedsRestart: Boolean): string;");
+  const char *prepare_end = prepare_to_install ? strstr(prepare_to_install, "function EdrDeploymentPlanText: string;") : NULL;
+  const char *space_check = prepare_to_install ? strstr(prepare_to_install,
+      "  Result := EdrCheckInstallSpace(AppDir, EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline);") : NULL;
+  const char *save_enroll = prepare_to_install ? strstr(prepare_to_install, "  SaveEnrollParamsFileIfNeeded;") : NULL;
+  const char *stop_service = prepare_to_install ? strstr(prepare_to_install, "Stop-Service -Name") : NULL;
+  const char *stop_process = prepare_to_install ? strstr(prepare_to_install, "Stop-Process -Name") : NULL;
+  require_true(prepare_end && space_check && save_enroll && stop_service && stop_process &&
+                   space_check < save_enroll && save_enroll < stop_service && save_enroll < stop_process &&
+                   stop_service < prepare_end && stop_process < prepare_end,
+               "PrepareToInstall checks space before its enrollment parameter write and runtime stop");
+  contains_adjacent_lines(space_check,
+      "  Result := EdrCheckInstallSpace(AppDir, EdrHadExistingInstallation or EdrCmdUpgradeExisting or EdrCmdRepairBaseline);",
+      "  if Result <> '' then",
+      "PrepareToInstall immediately checks the storage preflight result with LF or CRLF sources");
+  contains_adjacent_lines(space_check, "  if Result <> '' then", "    Exit;",
+      "PrepareToInstall exits on storage preflight refusal before writing parameters or stopping runtime");
   contains(inno, "Result := EdrCmdUpgradeExisting or EdrCmdRepairBaseline",
            "Runtime DLL reconciliation is restricted to verified upgrades or backed-up baseline repair");
   contains(inno, "Name: \"windowsservice\"; Description: \"Run as the FDSecurity Windows service (recommended)\"",

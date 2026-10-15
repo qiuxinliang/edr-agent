@@ -126,6 +126,37 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def test_preflight_powershell_launcher_removes_module_path_case_insensitively(self):
+        """Exercise the actual helper and a child process with Windows-normalized keys."""
+        import ast
+        import base64
+        from types import SimpleNamespace
+
+        source = ROOT / "tests" / "test_storage_space_preflight.py"
+        helper = next(node for node in ast.parse(source.read_text(encoding="utf-8")).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "windows_ps")
+        probe = ("import json,os; print(json.dumps({'module_path_present':"
+                 "any(k.upper()=='PSMODULEPATH' for k in os.environ),"
+                 "'sentinel':os.environ.get('EDR_PREFLIGHT_ENV_SENTINEL')}))")
+        def run_child(command, **kwargs):
+            self.assertEqual(command[0], "powershell.exe")
+            return subprocess.check_output([sys.executable, "-c", probe], **kwargs)
+
+        for spelling in ("PSModulePath", "PSMODULEPATH", "psmodulepath"):
+            with self.subTest(spelling=spelling):
+                inherited = {key: value for key, value in os.environ.items()
+                             if key.upper() != "PSMODULEPATH"}
+                inherited.update({spelling: "foreign PowerShell 7 modules",
+                                  "EDR_PREFLIGHT_ENV_SENTINEL": "preserved"})
+                original = inherited.copy()
+                namespace = {"base64": base64, "os": SimpleNamespace(environ=inherited),
+                             "subprocess": SimpleNamespace(check_output=run_child)}
+                exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), namespace)
+                result = json.loads(namespace["windows_ps"]("Get-Acl -LiteralPath $env:TEMP"))
+                self.assertFalse(result["module_path_present"], result)
+                self.assertEqual(result["sentinel"], "preserved")
+                self.assertEqual(inherited, original, "launcher mutated its parent environment")
+
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
         """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
         names = ("windows_release_collector_pe_closure",

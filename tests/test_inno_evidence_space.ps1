@@ -11,16 +11,64 @@ if (-not $Inno) {
     else { $Inno = (Get-Command ISCC.exe -ErrorAction Stop).Source }
 }
 if (-not (Test-Path -LiteralPath $Inno)) { throw "Inno compiler unavailable: $Inno" }
-function Invoke-SpaceFixtureProcess([string]$Path, [string[]]$Arguments, [int]$TimeoutMs) {
-    $process = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru
+function Write-SpaceFixtureLogTail([string]$Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    Write-Host "[inno-space] bounded log tail: $Path"
     try {
+        Get-Content -LiteralPath $Path -Tail 40 | ForEach-Object {
+            if ($_.Length -gt 1000) { Write-Host ($_.Substring(0,1000) + ' [truncated]') }
+            else { Write-Host $_ }
+        }
+    } catch { Write-Host "[inno-space] cannot read diagnostic log: $($_.Exception.Message)" }
+}
+function Invoke-SpaceFixtureProcess([string]$Path, [string[]]$Arguments, [int]$TimeoutMs,
+                                   [string]$Stage, [string]$LogPath) {
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host "[inno-space] stage=$Stage start timeout_ms=$TimeoutMs executable=$([IO.Path]::GetFileName($Path))"
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru
+        $null = $process.Handle
+        Write-Host "[inno-space] stage=$Stage started pid=$($process.Id) launch_ms=$($elapsed.ElapsedMilliseconds)"
         if (-not $process.WaitForExit($TimeoutMs)) {
-            & taskkill.exe /PID $process.Id /T /F | Out-Null
-            throw "space fixture process timed out: $Path"
+            throw "space fixture process timed out: stage=$Stage pid=$($process.Id) elapsed_ms=$($elapsed.ElapsedMilliseconds) executable=$Path"
         }
         $process.Refresh()
+        Write-Host "[inno-space] stage=$Stage exit=$($process.ExitCode) elapsed_ms=$($elapsed.ElapsedMilliseconds)"
         return $process.ExitCode
-    } finally { $process.Dispose() }
+    } catch {
+        Write-Host "[inno-space] stage=$Stage failed elapsed_ms=$($elapsed.ElapsedMilliseconds): $($_.Exception.Message)"
+        if ($process -and -not $process.HasExited) {
+            # Only the still-owned fixture PID and its descendants; never match
+            # FDSensor or installer names belonging to an installed client.
+            Write-Host "[inno-space] stage=$Stage terminating owned pid=$($process.Id) window=$($process.MainWindowTitle)"
+            $killLog = $LogPath + '.cleanup.log'
+            $killError = $LogPath + '.cleanup-error.log'
+            $killer = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\taskkill.exe') `
+                -ArgumentList @('/PID',[string]$process.Id,'/T','/F') -PassThru `
+                -RedirectStandardOutput $killLog -RedirectStandardError $killError
+            try {
+                $null = $killer.Handle
+                if (-not $killer.WaitForExit(5000)) {
+                    $killer.Kill()
+                    Write-Host '[inno-space] owned process-tree cleanup exceeded 5000ms'
+                } else {
+                    $killer.Refresh()
+                    Write-Host "[inno-space] stage=$Stage cleanup_exit=$($killer.ExitCode)"
+                }
+            } finally { $killer.Dispose() }
+            Write-SpaceFixtureLogTail $killLog
+            Write-SpaceFixtureLogTail $killError
+            if (-not $process.WaitForExit(2000)) {
+                Write-Host "[inno-space] stage=$Stage ERROR owned root pid=$($process.Id) remains alive"
+            }
+        }
+        Write-SpaceFixtureLogTail $LogPath
+        throw
+    } finally {
+        $elapsed.Stop()
+        if ($process) { $process.Dispose() }
+    }
 }
 $root = Join-Path $env:TEMP ('edr-inno-space-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $root
@@ -84,6 +132,7 @@ var
   Bytes, FreeBytes, TotalBytes: Int64;
   TempDir: string;
 begin
+  Log('EDR space fixture: InitializeSetup entered');
   Require(EdrParseSpaceFloor('0', Bytes) and (Bytes = 0), 'zero rejected');
   Require(EdrParseSpaceFloor('3298560049152', Bytes) and (Bytes = 3298560049152), 'large owner floor rejected');
   Require(EdrParseSpaceFloor('9007199254740991', Bytes) and (Bytes = 9007199254740991), 'maximum floor rejected');
@@ -109,7 +158,9 @@ begin
 end;
 function PrepareToInstall(var NeedsRestart: Boolean): string;
 begin
+  Log('EDR space fixture: PrepareToInstall entered');
   Result := EdrCheckInstallSpace(ExpandConstant('{app}'), ExpandConstant('{param:REQUIRED|0}') = '1');
+  Log('EDR space fixture: PrepareToInstall returned: ' + Result);
   if Result <> '' then Exit;
   Require(SaveStringToFile(ExpandConstant('{param:MARKER}'), 'passed-before-copy', False), 'marker failed');
 end;
@@ -117,7 +168,7 @@ end;
     $script = $script.Replace('@MEASURE@',$measure).Replace('@GUARD@',$guard).Replace('@ROOT@',$root).Replace('@SOURCES@',$sources.Replace("'","''")).Replace('@EXPECTED@',[string]$expectedExpanded)
     $scriptPath = Join-Path $root 'space-fixture.iss'
     [IO.File]::WriteAllText($scriptPath,$script,[Text.Encoding]::UTF8)
-    $compileExit = Invoke-SpaceFixtureProcess $Inno @('/Qp', ('"' + $scriptPath + '"')) 45000
+    $compileExit = Invoke-SpaceFixtureProcess $Inno @('/Qp', ('"' + $scriptPath + '"')) 45000 'compile' (Join-Path $root 'compile.log')
     if ($compileExit -ne 0) { throw "Inno fixture compilation failed: $compileExit" }
     $exe = Join-Path $root 'space-fixture.exe'
     if (-not (Test-Path -LiteralPath $exe)) { throw 'Inno did not emit fixture executable' }
@@ -153,9 +204,12 @@ end;
             [IO.File]::WriteAllBytes((Join-Path $dest 'unins000.msg'), (New-Object byte[] 128))
         }
         $arguments = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="' + $dest + '"'),('/LOG="' + $log + '"'),('/MARKER="' + $marker + '"')) + $case.Arguments
-        $fixtureExit = Invoke-SpaceFixtureProcess $exe $arguments 30000
+        $fixtureExit = Invoke-SpaceFixtureProcess $exe $arguments 30000 $case.Name $log
         $passed = $fixtureExit -eq 0
-        if ($passed -ne $case.Pass) { throw "unexpected fixture exit for $($case.Name): $fixtureExit; see $log" }
+        if ($passed -ne $case.Pass) {
+            Write-SpaceFixtureLogTail $log
+            throw "unexpected fixture exit for $($case.Name): $fixtureExit; see $log"
+        }
         if ((Test-Path -LiteralPath $marker) -ne $case.Pass) { throw "guard executed writes on rejection: $($case.Name)" }
         if ((Test-Path -LiteralPath (Join-Path $dest 'one.bin')) -ne $case.Pass) { throw "guard did not precede file copy: $($case.Name)" }
         $logText = [IO.File]::ReadAllText($log)

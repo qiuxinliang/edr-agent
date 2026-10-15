@@ -4,8 +4,8 @@ import pathlib
 import re
 
 root = pathlib.Path(__file__).resolve().parents[1]
-cache = (root / "src/storage/local_evidence_cache.c").read_text()
-context = (root / "src/storage/evidence_context_store.c").read_text()
+cache = (root / "src/storage/local_evidence_cache.c").read_text(encoding="utf-8")
+context = (root / "src/storage/evidence_context_store.c").read_text(encoding="utf-8")
 declarations = re.compile(
     r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(IF NOT EXISTS\s+)?(\w+)\s+ON\s+(\w+)")
 

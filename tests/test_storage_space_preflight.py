@@ -15,8 +15,10 @@ client = str(args.client.resolve())
 
 def windows_ps(script):
     encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
-    env = dict(os.environ)
-    env.pop('PSModulePath', None)
+    # Windows Python normalizes environment keys to uppercase. Remove every
+    # spelling so PS5.1 rebuilds its own path instead of importing CI's PS7 modules.
+    env = {key: value for key, value in os.environ.items()
+           if key.upper() != 'PSMODULEPATH'}
     return subprocess.check_output(['powershell.exe', '-NoProfile', '-NonInteractive',
                                     '-EncodedCommand', encoded], env=env, timeout=10).decode().strip()
 
