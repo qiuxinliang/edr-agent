@@ -1,9 +1,222 @@
 # Cache reliability remediation
 
+## 2026-10-16 candidate 684: queued inventory release acceptance
+
+Runtime source is `b7c8bd4b279d79fb72ae9db377df50e8f2981a91`, branch
+`codex/rtq-result-delivery-pressure`: 25 commits after audit 662 and 16 after
+comparison `3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`. This task commit changes
+only the eight inventory/diagnostic regression files and this report. It
+preserves the already-committed build/transport work in parents `3c5eb039` and
+`5d12b3c5`. The shared worktree was clean after the task commit.
+
+Candidate 683 was already owned by another run/source, so this repair uses
+`win_3.2.684`, [run 38771099974](https://github.com/qiuxinliang/edr-agent/actions/runs/38771099974),
+draft release 414041732, dispatched once at 2026-10-15 16:41:24 UTC. Its exact
+source/run/P0 owner marker was verified. Fixed P0 remains
+`896eb2f06c9ffa608085217d4d1e84494b43e564`, aggregate
+`4fe0f9d1d199c95c1e6ce33ce4422d5352c0653369a1b5cc8e875cc678c7a62b`.
+The pre-publication snapshot is
+`/private/tmp/edr-684-release-run-84zk8mn4/before-publication.json`, SHA-256
+`1c2e2dca7afabd63615e588f9ad8da7463c93ebb49699a76314ca2d9421238d1`;
+GitHub latest was 591 / 403052409. Normal Git transport failed with HTTP/2
+framing and then a bounded HTTP/1.1 low-speed timeout. The existing Git Data
+API transport verified all nine blob identities, the exact tree and exact
+original commit SHA before a `force=false` fast-forward from 5d12 to b7c8.
+No replacement commit, history rewrite or repeated dispatch was used.
+
+Both native build/package jobs succeeded. AMD64's complete original job log
+verified actual release 100/100 in 336.78 seconds and telemetry remainder
+13/13 in 192.54 seconds. The current runner inventory is release=100,
+telemetry=38, telemetry_remaining=13; 25 telemetry cases already passed in the
+release group. Earlier virtual runner self-test selections in other steps do
+not count as native execution. The permanent `storage_space_preflight` passed
+in 18.42 seconds, real Windows CLI in 2.48 seconds, Inno evidence-space test
+in 35.25 seconds, and installer redaction in 1.67 seconds. Original AMD64 log
+SHA-256 is `3c09b673eb26da17be1ee7f15722ca5eed21b807b3947dc18d04f4a1a38493d8`.
+ARM64's decoded job log verified release 100/100 in 483.70 seconds and telemetry
+remainder 13/13 in 216.07 seconds. Its permanent preflight, real CLI, Inno and
+redaction cases passed in 18.73, 6.64, 88.86 and 22.84 seconds respectively.
+All seven jobs completed successfully at 17:17:26 UTC. Both real Setup/runtime
+lifecycle jobs exercised 682 -> 684 -> 682 once; they do not cover this live
+673 baseline. Setup rollback was enabled and its step succeeded; its separate
+stage JSON was not downloaded. The baseline service bootstrap uses
+`-SkipPreflight`, distinct from the new Inno preflight. Mode-specific unsigned
+USB/signing steps were skipped, not passed tests.
+
+Interrupted log/ZIP transports remain preserved as partials. Complete decoded
+job logs were obtained through the GitHub job-log connector instead, with exact
+run/source/job IDs and normalized-LF hashes in
+`/private/tmp/edr-684-release-run-84zk8mn4/monitor/complete-job-logs-provenance.json`
+(SHA-256 `e3f23fce146e7718a34b408b21039d5d41dc0d4a1bd653fc128a84b4a9fd4f0f`).
+Actual Test step intervals, all per-case names/ordinals and 100+13 completions
+were checked; earlier runner self-test selections were excluded. ARM64's two
+CTest summaries omit an explicit failed-count phrase, so only those summaries
+were normalized; the 113 individual Passed results remained mandatory. No
+complete CI archive or archive CRC was claimed. Independent audit is
+`monitor/final-ci-job-audit.json`, SHA-256
+`a46effdb616296580d373ec7232fc54d6c96a40e47d6f057767ee1f6ff3ba62c`.
+
+The Headless verifier completed with exit 0 in 19.069 seconds using those job
+logs. Only the manifest, ARM64 Agent and Headless ZIP were downloaded, with
+SHA-256 `45f56dd1b040f13d0f546a5e75ef1987b31c4f58a4a314810625bd77cd0b2f43`,
+`b29b73477d67136257821839993b677c05fe8cf27da885574583ec7caa1322bc`, and
+`0d7144b279c0179751a352d319ac2a910a52f59da4be390fa521c32eec5b73b1`.
+Runtime closure, ZIP CRC, embedded installer, source/P0 identity and unchanged
+latest were verified. No separate Setup or Setup UI asset was downloaded.
+The pin is `/private/tmp/edr-684-release-verification/headless-artifact-pin.json`,
+SHA-256 `8a15722280ff6468fa14fd7f609e2959a8f1cc88545e6fc0b48a9fc998d0bcc1`.
+The revised verifier `verify_headless_from_job_logs.py` has SHA-256
+`22d30567f667e9b53fbcc3f50586817191cc0fd52593a5e528d356f78121a2b7`;
+the original verifier and its failed transport executions remain preserved.
+
+### Actual single-client attempt: refused and rolled back
+
+The client UI imported exactly those three Headless assets as
+`artifact_1792085918951790000`, leaving Setup UI unbound, then submitted one
+upgrade for WIN-FAC3AC1PS5O. Task `agent_upgrade_1792086016008146000` and command
+`agent_update_1792086018219530000` bind version 684, ARM64, the Agent hash above,
+runtime package 242 and package hash
+`7076e290bf8532986e307347979ac9cacec75c3fc231657e88f5eb7d5e46bc58`.
+Events 1 through 5 match all task pins. The actual terminal event at
+2026-10-15 17:41:08.608 UTC is `failed/full_installer_rollback_completed`.
+No health-observation phase completed and no further upgrade retry or RTQ was
+issued. The redacted installer log again identifies
+`stage=child_exit; exit_code=7; reason=owner_lock_timeout` (line 32), followed by
+local-storage-preflight failure. Log length is 4,096 bytes, SHA-256
+`a31383c758e6043d7c9a61c8c2663f2e155af28c8ebf55a526276b9771acbe41`.
+The journal is `failed_rolled_back`, SHA-256
+`62df71ecfc24b6983a43bc7d909c37c81579912e39940440cbfbc1944f44a4d8`;
+the bounded selected-field reader verified exact task/command/artifact/hash
+identity before interpreting it. The coarse report code
+`INSTALL_BASELINE_UNSUPPORTED` does not supersede the specific installer cause.
+
+Post-failure identity at guest 17:53:36.5399761 UTC is 673, PID 8316, created
+17:40:41.9017470 guest UTC, using the original installed binary hash
+`9641df3791f7c1f42fe98ecdce75e44f664ca94e60eb97f3d18a7882054163ca` and existing
+scheduled-task owner/configuration. These guest timestamps are not assumed
+synchronized with backend UTC. Queue/evidence overrides remain 512 MiB/72 h.
+All three original frozen queue owners still match the pre-679 baseline with
+no immutable-field changes or ACK transitions. Unsupported old-schema ledger
+queries remain unverified, not passed. The two earlier missing local candidates
+remain missing and have not been replaced or resampled. Local checkpoint 5
+matches the exact failure journal's last event; this proves failure-event ACK,
+not deployment success or command-result ACK.
+
+The backend's actual package 242 archive was independently read with exact-ID
+scope. Its two members are the original Headless embedded installer and its
+unchanged protocol manifest, renamed for the existing full-installer protocol;
+there is no graphical Setup UI executable. The actual installer SHA-256 is
+`dcd20d5348c466deba8bee0247d1c87a648fbb1e64356eb80cc083145da0579b`, identical
+to the Headless member. The endpoint's exact journal-derived staging directory
+still contained `runtime-package.zip`, `FDSecuritySetup.exe` and
+`FDSensor.next.exe`; all three matched the pinned package/installer/Agent hashes.
+This excludes a wrong stored or staged installer. The historical extracted
+preflight child's own image hash was not captured, so it is not independently
+attested by these staging reads. No broad temporary-directory search was used.
+
+Raw bounded results are in `/private/tmp/edr-678-client-acceptance/`:
+`upgrade-684-task-current-01.json`, `upgrade-684-failure-selected.json`,
+`upgrade-684-installer-rejection.json`, `postfailure-684-path-identity.json`,
+`postfailure-684-cache.json`, `upgrade-684-failure-event-ack.json` and
+`upgrade-684-staging-selected.json`. UI rollback proof is
+`upgrade-684-rolled-back.png`. Backend package audit is
+`/private/tmp/edr-684-package-242-audit-xs_bvt1r/result.json`, SHA-256
+`d19635c9771b6aa99aee29bcaae2cd0a82422b0e20b7c9fe3cf4e9d8af0fa933`.
+
+**The live failure remains unresolved.** Exit 7 covers a pending request that
+expires, an immediately successful request whose caller resumes after the
+one-second deadline, and expiration before submission. It identifies neither
+a historical holder nor continuous contention. Existing 673/current owner
+paths can perform whole-file scans, sorting and repeated full-line JSON parsing
+inside the lock, but their actual live hold times were not measured. No
+updater self-lock path was found. The configured 10% resource threshold is not
+a Job CPU hard cap; Agent self-protection sets only `BREAKAWAY_OK`, and the
+updater is launched through a SYSTEM scheduled task. Those source facts do not
+establish a scheduling cause. A direct, single execution of the pinned Headless
+CLI under bounded diagnostic conditions is the next discriminating check;
+another release or upgrade is not justified by the same unexplained result.
+
+The exact 673 tag (`6bedb86bf9811bc304f4c97fdd62212ef437423f`) was also traced,
+rather than assuming the current updater describes the old one. Its
+`installer_required` branch verifies the package, backs up runtime/configuration
+while excluding mutable stores, then invokes Setup while the old Agent remains
+running. Only its failure handler stops, restores and restarts the old runtime.
+Six default executor lanes can each call `has_final` before lane filtering for
+the still-retained update inbox, producing independent whole-owner scans.
+These are verified possible contention paths, not measured live holders.
+The source-bound trace is
+`/private/tmp/edr-684-673-owner-trace-efs1okcy/manifest.json`, SHA-256
+`6ccd280059e9ba0b844ac1157d04ed568ca6878779a7b913c4f07a5b77ae0a87`.
+Its synthetic scan benchmark was deliberately not implemented because a host
+timing result would not discriminate this Windows admission failure.
+
+### Bounded direct stock-CLI discriminator
+
+A single direct invocation of the published 684 ARM64 executable completed at
+guest 18:08:07.277984 UTC: child 10476 returned 0 in 0.140 seconds with a valid
+new floor file containing `143479824`. No timeout, forced termination, output
+overflow or incomplete cleanup occurred; both output streams were completely
+empty. The original Headless ZIP was verified again, and only its actual
+FDSensor plus 20 root DLLs (21 files) were copied into a newly created directory
+whose protected inheritable DACL permits only SYSTEM and Administrators.
+All member hashes were checked before execution. No Setup or installer was
+executed, no configuration was copied, and no Agent initialization, network,
+cache migration/maintenance or service/task operation was performed.
+
+The operation used the installed config and explicitly fixed the existing
+owner path in a six-variable child environment. The 1,000 ms admission and
+15-second stock CLI watchdog were unchanged; an outer 20-second limit targets
+only its owned child handle. Output drains are bounded to 64 KiB each and
+export only fixed reasons, byte counts and hashes. The wrapper's 32 offline
+checks cover input/member digests, unsafe paths, existing/invalid output,
+output overflow and exact-child termination with a surviving unrelated
+sentinel. Those host tests do not prove Windows ACL/termination APIs; the
+actual run verified directory creation/ACL and normal native completion, not
+the Windows forced-termination branch.
+
+The owner was 6,379,595 bytes; its size/mtime and the existing lock's size/mtime
+were unchanged during this sample. The stock CLI can normalize the lock DACL
+and holds the owner lock while scanning; metadata equality is not proof of
+zero filesystem writes. Before/after identity reads both identify PID 8316,
+the same 673 binary and process creation time. The Agent was not stopped or
+replaced by this diagnostic. This does not prove every owner byte unchanged
+or reproduce the installation-time load.
+
+Frozen inputs and the actual result are under
+`/private/tmp/edr-684-direct-preflight-bx9n96e0/`; result SHA-256 is
+`56237552407ff7e5b98915c9449c881eb373a7a9a33d463d8c6e15d75af1a5de`.
+Its closure ZIP SHA-256 is
+`c369522a9f40c7f179f76e45f9832e31c0134c426c42489ed957c5072815682c`,
+containing no Setup/configuration. The independent review confirmed these
+results. This proves the pinned CLI can calibrate the current owner in this
+controlled launch context, not that the actual upgrade succeeds. Inno's
+PowerShell launcher inherits its environment, whereas this diagnostic fixed
+six variables; empty Machine/User overrides do not attest historical process
+environment. Installation-time contention and inherited context remain open.
+
+A second, separately marked single execution retained the same verified
+closure, six-variable environment, config/owner paths and working directory,
+but used the exact Guard PowerShell `Start-Process` / `WaitForExit(15000)` /
+exit-code path without executing an installer. It returned 0 with the same
+valid floor in 1.407 seconds, including PowerShell startup/wait. Both streams
+were completely empty, with no forced termination or incomplete cleanup.
+The live owner was then 6,381,669 bytes and unchanged within that sample; it
+was not frozen to the first sample, so this is not a historical single-factor
+replay. It excludes that launcher hop being inherently unable to run the
+current pinned CLI under the controlled environment. It does not attest the
+historical inherited environment, lock pressure or scheduling. The exact
+summary is
+`/private/tmp/edr-678-client-acceptance/direct-preflight-684-guard-hop.json`.
+The wrapper source SHA-256 is
+`ec6ff777016178069fe44be97c7e17a4e99426432282d3e9d398d5f7c607c725`.
+If its outer PowerShell process had been killed, descendant exit would have
+been explicitly unverified and further experiments stopped; this branch was
+not exercised. No further client upgrade was issued.
+
 ## 2026-10-16 queued inventory: mechanism and cancellation validation
 
-The 682 live refusal is still `owner_lock_timeout`; the installed endpoint has
-not been upgraded again. The following results establish a synthetic mechanism
+At this pre-684 checkpoint, the 682 live refusal was `owner_lock_timeout` and
+no further upgrade had yet been attempted. The following results establish a synthetic mechanism
 and its failure boundaries, not the identity of the historical live holder.
 No Setup UI package was downloaded or used during this work.
 
