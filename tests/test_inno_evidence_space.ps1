@@ -278,6 +278,7 @@ public static class SpacePreflightFailureFixture {
         @{Name='owner-unavailable'; Mode='4'; Code=4; Reason='owner_accounting_or_policy_unavailable'},
         @{Name='floor-output-failed'; Mode='5'; Code=5; Reason='floor_output_failed'},
         @{Name='owner-lock-timeout'; Mode='7'; Code=7; Reason='owner_lock_timeout'},
+        @{Name='deadline-unavailable'; Mode='8'; Code=8; Reason='deadline_unavailable'},
         @{Name='child-watchdog'; Mode='watchdog'; Code=124; Reason='child_watchdog_timeout'},
         @{Name='launcher-unavailable'; Mode='7'; LaunchFailure=$true}
     )

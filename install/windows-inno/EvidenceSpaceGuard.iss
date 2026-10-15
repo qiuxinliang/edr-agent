@@ -117,6 +117,7 @@ begin
     4: Result := 'owner_accounting_or_policy_unavailable';
     5: Result := 'floor_output_failed';
     7: Result := 'owner_lock_timeout';
+    8: Result := 'deadline_unavailable';
     124: Result := 'child_watchdog_timeout';
   else
     Result := 'unclassified_exit';

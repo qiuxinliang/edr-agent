@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <io.h>
+#include <intrin.h>
 #else
 #include <unistd.h>
 #endif
@@ -14,7 +15,7 @@
 /* Explicit local operation only. No Agent init, store maintenance, migration,
  * enrollment, collection, or network. Existing owner's normal lock protects
  * its read/calibration; the JSONL is never appended or compacted here. */
-static int edr_storage_space_preflight_main(int argc, char **argv) {
+static int edr_storage_space_preflight_body(int argc, char **argv) {
   const char *config = NULL, *output = NULL;
   int defaults = 0;
   for (int i = 2; i < argc; ++i) {
@@ -62,5 +63,79 @@ static int edr_storage_space_preflight_main(int argc, char **argv) {
 #endif
   return 0;
 }
+
+#ifdef _WIN32
+#define EDR_STORAGE_PREFLIGHT_WATCHDOG_MS 15000u
+/* Only this explicit, short-lived CLI starts a thread. The Agent service does
+ * not start it. TerminateProcess avoids DLL detach while another thread may
+ * be inside an I/O or loader call; kernel completion is not hard real-time. */
+typedef struct EdrStoragePreflightDeadline {
+  ULONGLONG started;
+  HANDLE stop;
+  volatile LONG state; /* 0 running, 1 completed, 2 expired */
+} EdrStoragePreflightDeadline;
+
+static void edr_storage_preflight_terminate(UINT code) {
+  TerminateProcess(GetCurrentProcess(), code);
+  /* Only an unrecoverable termination failure reaches this instruction.
+   * It does not run CRT/DLL cleanup and its exception status is not 124. */
+  __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+}
+
+static DWORD WINAPI edr_storage_preflight_watchdog(LPVOID context) {
+  EdrStoragePreflightDeadline *deadline = (EdrStoragePreflightDeadline *)context;
+  ULONGLONG elapsed = GetTickCount64() - deadline->started;
+  DWORD wait = elapsed >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS ? WAIT_TIMEOUT
+      : WaitForSingleObject(deadline->stop,
+          (DWORD)(EDR_STORAGE_PREFLIGHT_WATCHDOG_MS - elapsed));
+  elapsed = GetTickCount64() - deadline->started;
+  if (wait == WAIT_FAILED) edr_storage_preflight_terminate(8u);
+  if (elapsed >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS || wait != WAIT_OBJECT_0) {
+    if (InterlockedCompareExchange(&deadline->state, 2, 0) == 0)
+      edr_storage_preflight_terminate(124u);
+  } else if (InterlockedCompareExchange(&deadline->state, 0, 0) != 1) {
+    edr_storage_preflight_terminate(8u);
+  }
+  return 0;
+}
+
+static int edr_storage_space_preflight_main(int argc, char **argv) {
+  EdrStoragePreflightDeadline deadline = {0};
+  deadline.started = GetTickCount64();
+  deadline.stop = CreateEventA(NULL, TRUE, FALSE, NULL);
+  if (!deadline.stop) {
+    fprintf(stderr, "storage preflight: deadline_unavailable\n"); return 8;
+  }
+  HANDLE worker = CreateThread(NULL, 0, edr_storage_preflight_watchdog, &deadline, 0, NULL);
+  if (!worker) {
+    CloseHandle(deadline.stop);
+    fprintf(stderr, "storage preflight: deadline_unavailable\n"); return 8;
+  }
+  int rc = edr_storage_space_preflight_body(argc, argv);
+  ULONGLONG elapsed = GetTickCount64() - deadline.started;
+  if (elapsed >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS ||
+      InterlockedCompareExchange(&deadline.state, 1, 0) != 0)
+    edr_storage_preflight_terminate(124u);
+  if (!SetEvent(deadline.stop)) edr_storage_preflight_terminate(124u);
+  elapsed = GetTickCount64() - deadline.started;
+  if (elapsed >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS ||
+      WaitForSingleObject(worker, (DWORD)(EDR_STORAGE_PREFLIGHT_WATCHDOG_MS - elapsed)) != WAIT_OBJECT_0)
+    edr_storage_preflight_terminate(124u);
+  if (GetTickCount64() - deadline.started >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS)
+    edr_storage_preflight_terminate(124u);
+  int closed_worker = CloseHandle(worker);
+  int closed_stop = CloseHandle(deadline.stop);
+  if (!closed_worker || !closed_stop) {
+    fprintf(stderr, "storage preflight: deadline_unavailable\n"); return 8;
+  }
+  if (GetTickCount64() - deadline.started >= EDR_STORAGE_PREFLIGHT_WATCHDOG_MS)
+    edr_storage_preflight_terminate(124u);
+  return rc;
+}
+#else
+static int edr_storage_space_preflight_main(int argc, char **argv) {
+  return edr_storage_space_preflight_body(argc, argv);
+}
+#endif
 
 #endif

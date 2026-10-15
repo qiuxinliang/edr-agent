@@ -741,54 +741,113 @@ static int state_prepare_dir(const char *path) {
 }
 
 #ifdef _WIN32
-/* Only the installer inventory waits for a transient writer. The 1 s budget
- * leaves the rest of the original 15 s installer watchdog for calibration;
- * it is not a guarantee about disk or process scheduling latency. */
+/* Inventory alone queues one request. Admission has a 1 s monotonic budget;
+ * cancellation and release drain their OVERLAPPED before its storage expires.
+ * The explicit preflight CLI has a separate preflight-operation watchdog. */
 #define STATE_INVENTORY_LOCK_WAIT_MS 1000u
-#define STATE_INVENTORY_LOCK_POLL_MS 25u
 #ifdef EDR_COMMAND_STATE_INVENTORY_TEST
-/* This observer/clock is linked only by the existing preflight test client.
- * LockFileEx and all owner I/O remain real in that consumer. */
-extern ULONGLONG edr_command_state_inventory_test_now(void);
-extern void edr_command_state_inventory_test_sleep(DWORD milliseconds);
-extern void edr_command_state_inventory_test_observe(DWORD error);
-#define state_inventory_now_ms edr_command_state_inventory_test_now
-#define state_inventory_sleep_ms edr_command_state_inventory_test_sleep
+extern void edr_command_state_inventory_test_observe(unsigned phase, DWORD error);
+extern void edr_command_state_inventory_test_before_cancel(HANDLE completion_event);
+extern BOOL edr_command_state_inventory_test_unlock(HANDLE, DWORD, DWORD, DWORD, LPOVERLAPPED);
+#define state_inventory_unlock_api edr_command_state_inventory_test_unlock
+#define state_inventory_observe(p, e) edr_command_state_inventory_test_observe((p), (e))
 #else
-#define state_inventory_now_ms GetTickCount64
-#define state_inventory_sleep_ms Sleep
+#define state_inventory_observe(p, e) ((void)(p), (void)(e))
+#define state_inventory_unlock_api UnlockFileEx
 #endif
 
-static int state_inventory_lock_wait(HANDLE handle) {
-  ULONGLONG started = state_inventory_now_ms();
-  int first = 1;
-  unsigned attempts = 0;
-  for (;;) {
-    if (!first && state_inventory_now_ms() - started >= STATE_INVENTORY_LOCK_WAIT_MS) {
-      SetLastError(ERROR_LOCK_VIOLATION);
-      return EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT;
-    }
-    first = 0;
-    attempts++;
-    OVERLAPPED overlapped = {0};
-    BOOL locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                            0, 1, 0, &overlapped);
-    DWORD error = locked ? ERROR_SUCCESS : GetLastError();
-#ifdef EDR_COMMAND_STATE_INVENTORY_TEST
-    edr_command_state_inventory_test_observe(error);
-#endif
-    if (locked) return 0;
-    if (error != ERROR_LOCK_VIOLATION) { SetLastError(error); return -1; }
-    ULONGLONG elapsed = state_inventory_now_ms() - started;
-    if (elapsed >= STATE_INVENTORY_LOCK_WAIT_MS ||
-        attempts >= STATE_INVENTORY_LOCK_WAIT_MS / STATE_INVENTORY_LOCK_POLL_MS + 1u) {
-      SetLastError(error);
-      return EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT;
-    }
-    DWORD remaining = (DWORD)(STATE_INVENTORY_LOCK_WAIT_MS - elapsed);
-    state_inventory_sleep_ms(remaining < STATE_INVENTORY_LOCK_POLL_MS
-        ? remaining : STATE_INVENTORY_LOCK_POLL_MS);
+/* Phases are test-only: 1 request, 2 pending, 3 cancel result, 4 lock
+ * completion, 5 unlock request, 6 unlock pending, 7 unlock completion,
+ * 8 admission expired, 9 inventory scan begins. No owner bytes are exposed. */
+static int state_inventory_unlock(HANDLE handle) {
+  OVERLAPPED overlapped = {0};
+  overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+  if (!overlapped.hEvent) return -1;
+  BOOL unlocked = state_inventory_unlock_api(handle, 0, 1, 0, &overlapped);
+  DWORD error = unlocked ? ERROR_SUCCESS : GetLastError();
+  state_inventory_observe(5u, error);
+  if (!unlocked && error == ERROR_IO_PENDING) {
+    state_inventory_observe(6u, error);
+    DWORD transferred = 0;
+    unlocked = GetOverlappedResult(handle, &overlapped, &transferred, TRUE);
+    error = unlocked ? ERROR_SUCCESS : GetLastError();
   }
+  state_inventory_observe(7u, error);
+  if (!CloseHandle(overlapped.hEvent) && unlocked) {
+    error = GetLastError(); unlocked = FALSE;
+  }
+  SetLastError(error);
+  return unlocked ? 0 : -1;
+}
+
+static int state_inventory_lock_wait(HANDLE handle) {
+  const ULONGLONG started = GetTickCount64();
+  OVERLAPPED overlapped = {0};
+  overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+  if (!overlapped.hEvent) return -1;
+  BOOL locked = FALSE;
+  DWORD error = ERROR_SUCCESS;
+  int expired = GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
+  int failed_wait = 0;
+  if (!expired) {
+    locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped);
+    error = locked ? ERROR_SUCCESS : GetLastError();
+    state_inventory_observe(1u, error);
+    if (!locked && error == ERROR_IO_PENDING) {
+      state_inventory_observe(2u, error);
+      ULONGLONG elapsed = GetTickCount64() - started;
+      DWORD wait = elapsed >= STATE_INVENTORY_LOCK_WAIT_MS ? WAIT_TIMEOUT
+          : WaitForSingleObject(overlapped.hEvent,
+              (DWORD)(STATE_INVENTORY_LOCK_WAIT_MS - elapsed));
+      DWORD wait_error = wait == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+      expired = wait == WAIT_TIMEOUT || GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
+      failed_wait = wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT;
+      if (expired || failed_wait) {
+        if (expired) state_inventory_observe(8u, ERROR_TIMEOUT);
+#ifdef EDR_COMMAND_STATE_INVENTORY_TEST
+        edr_command_state_inventory_test_before_cancel(overlapped.hEvent);
+#endif
+        BOOL cancelled = CancelIoEx(handle, &overlapped);
+        DWORD cancel_error = cancelled ? ERROR_SUCCESS : GetLastError();
+        state_inventory_observe(3u, cancel_error);
+        /* CancelIoEx only requests cancellation. Even ERROR_NOT_FOUND may
+         * mean a grant raced with timeout. Drain before releasing the event. */
+      }
+      DWORD transferred = 0;
+      locked = GetOverlappedResult(handle, &overlapped, &transferred, TRUE);
+      error = locked ? ERROR_SUCCESS : GetLastError();
+      state_inventory_observe(4u, error);
+      if (failed_wait && !locked) error = wait_error;
+    } else if (locked) {
+      state_inventory_observe(4u, ERROR_SUCCESS);
+    }
+  }
+  expired = expired || GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
+  int rc = locked && !expired && !failed_wait ? 0 : (expired
+      ? EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT : -1);
+  if (locked && rc != 0) {
+    /* Late grant never authorizes an owner read. Release the same byte and
+     * confirm completion while its independent OVERLAPPED remains alive. */
+    if (state_inventory_unlock(handle) != 0) { error = GetLastError(); rc = -1; }
+  }
+  if (!CloseHandle(overlapped.hEvent) && rc == 0) {
+    error = GetLastError();
+    /* The lock itself must still be released if closing its event fails. */
+    (void)state_inventory_unlock(handle);
+    rc = -1;
+  }
+  if (rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT) error = ERROR_TIMEOUT;
+  SetLastError(error);
+  return rc;
+}
+
+static int state_inventory_lock_release(FILE *lock) {
+  HANDLE handle = (HANDLE)_get_osfhandle(_fileno(lock));
+  int rc = state_inventory_unlock(handle);
+  DWORD error = rc ? GetLastError() : ERROR_SUCCESS;
+  if (fclose(lock) != 0 && !rc) { rc = -1; error = ERROR_WRITE_FAULT; }
+  SetLastError(error);
+  return rc;
 }
 #endif
 
@@ -823,7 +882,7 @@ static FILE *state_inventory_lock_acquire(int *absent_parent, int *status,
 #ifdef _WIN32
   HANDLE h = CreateFileA(lock_path, GENERIC_READ | GENERIC_WRITE,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-      FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OVERLAPPED, NULL);
   if (h == INVALID_HANDLE_VALUE) return NULL;
   snprintf(reason, reason_cap, "state_inventory_lock_security_failed");
   BY_HANDLE_FILE_INFORMATION info;
@@ -2402,6 +2461,9 @@ static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inven
     return out->budget_bytes ? 0 : -1;
   }
   char path[1024];state_default_path(path,sizeof(path));
+#ifdef _WIN32
+  if (inventory) state_inventory_observe(9u, ERROR_SUCCESS);
+#endif
   int rc=state_capacity_refresh_locked_mode(path, inventory);
   s_capacity.stats.budget_bytes=state_owner_budget();
   if(!s_capacity.stats.budget_bytes)rc=state_capacity_failure("physical_configuration_invalid",0);
@@ -2420,7 +2482,17 @@ static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inven
   s_capacity.stats.reserved_owner_count=s_capacity.count;
   s_capacity.stats.reserved_record_slots=s_capacity.stats.reserved_bytes/EDR_COMMAND_STATE_LINE_CAP;
   s_capacity.stats.update_headroom_bytes=EDR_COMMAND_STATE_LINE_CAP;
-  *out=s_capacity.stats;state_lock_release(lock);return rc;
+  *out=s_capacity.stats;
+#ifdef _WIN32
+  if (inventory) {
+    if (state_inventory_lock_release(lock) != 0) {
+      snprintf(out->last_error, sizeof(out->last_error), "state_inventory_unlock_failed");
+      return -1;
+    }
+  } else
+#endif
+    state_lock_release(lock);
+  return rc;
 }
 
 int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out) {

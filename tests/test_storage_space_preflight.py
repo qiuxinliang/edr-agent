@@ -170,81 +170,140 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel.CloseHandle.restype = wintypes.BOOL
 
-        def contended_inventory(name, release, deadline=False, attempt_cap=False):
+        def queued_inventory(name, mode='observe', release=False, held=True, expected=7):
+            # The ordinary event and subprocess bounds stay 5 s / 8 s. Only the
+            # dedicated self-watchdog case has an absolute 25 s parent budget.
+            watchdog = mode == 'stall'
             prefix = 'Local\\EDRInventory-' + uuid.uuid4().hex
             events = {}
             child = None
+            lock = None
+            locked = False
             output = root/(name+'.floor')
+            labels = ('q-pending', 'q-cancel-entered', 'q-grant', 'q-resume',
+                      'q-completion-ready', 'q-completion-resume', 'q-stall-entered',
+                      'q-stall-resume', 'q-finished', 'q-finish-resume')
+            started = time.monotonic()
             try:
-                for label in ('observed', 'sleeping', 'resume'):
+                for label in labels:
                     ctypes.set_last_error(0)
                     handle = kernel.CreateEventW(None, True, False, prefix+'-'+label)
                     assert handle and ctypes.get_last_error() != 183, 'event must be exclusive'
                     events[label] = handle
-                mode = 'deadline' if deadline else ('attempt_cap' if attempt_cap else 'observe')
-                child_env = dict(env, EDR_PREFLIGHT_TEST_MODE=mode,
-                                 EDR_PREFLIGHT_TEST_EVENT_PREFIX=prefix)
-                with Path(str(state)+'.lock').open('r+b') as lock:
+                if held:
+                    lock = Path(str(state)+'.lock').open('r+b')
                     msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
                     locked = True
-                    started = time.monotonic()
-                    try:
-                        child = subprocess.Popen([client, '--storage-space-preflight', '--config', str(config),
-                                                  '--output', str(output)], env=child_env,
-                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        # A real LockFileEx failure, not elapsed startup time,
-                        # authorizes the parent to release its actual byte lock.
-                        assert kernel.WaitForSingleObject(events['observed'], 5000) == 0, name
-                        if deadline:
-                            assert kernel.WaitForSingleObject(events['sleeping'], 5000) == 0, name
-                        if release:
-                            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-                            locked = False
-                        if deadline:
-                            assert kernel.SetEvent(events['resume']), name
-                        stdout, stderr = child.communicate(timeout=5)
-                    finally:
-                        if locked:
-                            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-                elapsed = time.monotonic()-started
-                expected = 0 if release and not deadline else 7
-                assert child.returncode == expected, (name, child.returncode, stderr.decode(errors='replace'))
-                assert not stdout and elapsed < 8, (name, elapsed)
-                trace = re.findall(rb'inventory_test attempts=(\d+) conflicts=(\d+) sleeps=(\d+) mode=(observe|deadline|attempt_cap)', stderr)
-                assert len(trace) == 1, (name, stderr)
-                attempts, conflicts, sleeps = (int(value) for value in trace[0][:3])
-                assert conflicts >= 1 and sleeps >= 1, name
-                if deadline:
-                    # The real lock is now free: an erroneous post-deadline
-                    # attempt would succeed and invalidate this assertion.
-                    assert attempts == conflicts == sleeps == 1, name
-                elif attempt_cap:
-                    assert attempts == conflicts == 41 and sleeps == 40, name
+                child_env = dict(env, EDR_PREFLIGHT_TEST_MODE=mode,
+                                 EDR_PREFLIGHT_TEST_EVENT_PREFIX=prefix)
+                child_started = time.monotonic()
+                child = subprocess.Popen([client, '--storage-space-preflight', '--config', str(config),
+                                          '--output', str(output)], env=child_env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                def wait_event(label):
+                    assert kernel.WaitForSingleObject(events[label], 5000) == 0, (name, label)
+                def release_holder():
+                    nonlocal locked
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                    locked = False
+                if held:
+                    # A real ERROR_IO_PENDING establishes contention. No
+                    # startup sleep may stand in for a pending OS lock request.
+                    wait_event('q-pending')
+                if mode == 'late_grant':
+                    wait_event('q-cancel-entered')
+                    release_holder()
+                    wait_event('q-grant')  # child observed its real kernel event
+                    assert kernel.SetEvent(events['q-resume'])
+                elif mode == 'completion_expired':
+                    release_holder()
+                    wait_event('q-completion-ready')
+                    time.sleep(1.1)  # real monotonic deadline; no fake clock
+                    assert kernel.SetEvent(events['q-completion-resume'])
                 elif release:
-                    assert attempts >= 2 and attempts > conflicts, name
+                    release_holder()
+                if watchdog:
+                    wait_event('q-stall-entered')
+                    # A native unsignalled event deliberately blocks cleanup.
+                    # The real CLI watchdog, not parent.kill, must end it.
+                    remaining = 25-(time.monotonic()-started)
+                    assert remaining > 0
+                    stdout, stderr = child.communicate(timeout=remaining)
+                    child_elapsed = time.monotonic()-child_started
                 else:
-                    assert attempts == conflicts and elapsed >= 0.9, (name, elapsed)
+                    wait_event('q-finished')
+                    assert child.poll() is None, (name, 'child exited before release proof')
+                    if locked:
+                        release_holder()
+                    # A distinct handle must acquire the byte while the child
+                    # remains alive; process exit cannot explain its release.
+                    with Path(str(state)+'.lock').open('r+b') as probe:
+                        msvcrt.locking(probe.fileno(), msvcrt.LK_NBLCK, 1)
+                        msvcrt.locking(probe.fileno(), msvcrt.LK_UNLCK, 1)
+                    assert kernel.SetEvent(events['q-finish-resume'])
+                    stdout, stderr = child.communicate(timeout=5)
+                    child_elapsed = time.monotonic()-child_started
+                elapsed = time.monotonic()-started
+                assert child.returncode == expected, (name, child.returncode, stderr.decode(errors='replace'))
+                assert not stdout and elapsed < (25 if watchdog else 8), (name, elapsed)
+                trace = [json.loads(value) for value in re.findall(rb'queued_test (\{[^\r\n]+\})', stderr)]
+                assert len(trace) == 1, (name, stderr)
+                observed = trace[0]
+                assert observed['mode'] == mode
+                if mode in ('watchdog_event_failure', 'watchdog_thread_failure'):
+                    assert observed['requests'] == observed['inventory_scan_calls'] == 0
+                    assert b'deadline_unavailable' in stderr
+                else:
+                    assert observed['requests'] == 1, observed
+                    assert observed['lock_pending'] == int(held), observed
+                    if watchdog:
+                        assert observed['point'] == 'cleanup_stall_entered' and child_elapsed >= 14.5
+                        assert observed['cancel_calls'] == observed['inventory_scan_calls'] == 0
+                    else:
+                        assert observed['point'] == 'returned' and observed['rc'] == expected
+                        assert observed['lock_completions'] == 1
+                        assert observed['lock_completion_error'] == (995 if held and not release and mode == 'observe' else 0)
+                        assert observed['inventory_scan_calls'] == int(expected in (0, 4))
+                        if mode == 'late_grant':
+                            assert observed['cancel_calls'] == 1 and observed['cancel_error'] in (0, 1168)
+                        elif held and not release and mode == 'observe':
+                            assert observed['cancel_calls'] == 1 and observed['cancel_error'] == 0
+                        else:
+                            assert observed['cancel_calls'] == 0
+                        unlocks = int(observed['lock_completion_error'] == 0)
+                        assert observed['unlock_requests'] == observed['unlock_completions'] == unlocks
+                        assert observed['unlock_completion_error'] == (5 if mode == 'unlock_failure' else 0)
                 if expected:
-                    assert b'storage preflight: owner_lock_timeout\n' in stderr.replace(b'\r\n', b'\n'), name
                     assert not output.exists(), (name, 'failure emitted usable floor')
                 else:
                     assert output.read_bytes() == str(64*1024*1024).encode(), name
+                if expected == 7:
+                    assert child_elapsed >= 0.9, (name, 'admission expired before its budget')
+                    assert b'storage preflight: owner_lock_timeout\n' in stderr.replace(b'\r\n', b'\n')
                 assert hashlib.sha256(state.read_bytes()).hexdigest() == before_hash, name
             finally:
                 if child is not None and child.poll() is None:
                     child.kill()
                     child.communicate(timeout=3)
+                if locked:
+                    release_holder()
+                if lock is not None:
+                    lock.close()
                 for handle in events.values():
                     assert kernel.CloseHandle(handle)
-            print(json.dumps({'case': name, 'exit': child.returncode,
-                              'attempts': attempts, 'conflicts': conflicts, 'sleeps': sleeps,
-                              'clock_mode': trace[0][3].decode('ascii'),
-                              'elapsed_seconds': round(elapsed, 6)}, sort_keys=True), flush=True)
+            print(json.dumps({'case': name, 'exit': child.returncode, 'observation': observed,
+                              'elapsed_seconds': round(elapsed, 6),
+                              'child_elapsed_seconds': round(child_elapsed, 6)}, sort_keys=True), flush=True)
 
-        contended_inventory('owner-lock-released', release=True)
-        contended_inventory('owner-lock-timeout', release=False)
-        contended_inventory('owner-lock-deadline', release=True, deadline=True)
-        contended_inventory('owner-lock-attempt-cap', release=False, attempt_cap=True)
+        queued_inventory('owner-lock-released', release=True, expected=0)
+        queued_inventory('owner-lock-timeout')
+        queued_inventory('owner-lock-late-grant', mode='late_grant')
+        queued_inventory('owner-lock-completion-expired', mode='completion_expired')
+        queued_inventory('owner-unlock-failure', mode='unlock_failure', held=False, expected=4)
+        queued_inventory('watchdog-event-unavailable', mode='watchdog_event_failure', held=False, expected=8)
+        queued_inventory('watchdog-thread-unavailable', mode='watchdog_thread_failure', held=False, expected=8)
+        queued_inventory('preflight-cleanup-watchdog', mode='stall', expected=124)
         assert permissions(state) == owner_permissions and permissions(state.parent) == parent_permissions
     config.write_text('[offline\n')
     invoke('corrupt-config', ['--config', str(config)], 3)

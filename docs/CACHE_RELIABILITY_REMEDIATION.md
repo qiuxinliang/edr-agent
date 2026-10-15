@@ -1,5 +1,94 @@
 # Cache reliability remediation
 
+## 2026-10-16 queued inventory: mechanism and cancellation validation
+
+The 682 live refusal is still `owner_lock_timeout`; the installed endpoint has
+not been upgraded again. The following results establish a synthetic mechanism
+and its failure boundaries, not the identity of the historical live holder.
+No Setup UI package was downloaded or used during this work.
+
+The frozen prototype changes only inventory locking: one overlapped exclusive
+request on the existing byte-0/length-1 lock, with the unchanged 1,000 ms
+monotonic admission deadline. Cancellation is followed by real completion;
+`ERROR_NOT_FOUND` is not treated as cancellation success. A late grant is
+explicitly released and cannot authorize owner scanning. Inventory unlock or
+close failure propagates through policy and prevents a successful floor file.
+Ordinary runtime locks, POSIX locking, installer stop order and rollback are
+unchanged. The standalone preflight CLI now owns a short-lived 15-second
+watchdog thread, since cancellation completion itself cannot be assumed to
+finish within the admission deadline. It joins on normal completion, terminates
+the preflight process on expiry, and uses fail-fast only if self-termination
+unexpectedly returns. It adds no Agent-service thread or configuration. Child
+8 means `deadline_unavailable`; the installer still consumes a floor only after
+child exit 0. This is not a hard real-time guarantee about kernel or scheduling
+failure.
+
+The first paired experiment preserved the old executable, owner/configuration,
+two blocking workers targeting 20 ms holds, one-second admission and all test
+deadlines. Old polling observed 32 actual conflicts and exited 7; the queued
+request observed real `ERROR_IO_PENDING` and returned successfully in 47 ms.
+Independent review then found that the worker's hold statistic was sampled
+before calling UnlockFileEx. That original result remains intact and does not
+bound unlock-call latency. A measurement-only revision moved the statistic
+after successful unlock, leaving both executables, workload and deadlines
+unchanged. Its single run again observed old 32-conflict timeout and new queued
+success, this time in 78 ms. Old complete hold bounds were 32/47 ms; new were
+32/46 ms. Both sides' uncontended controls passed. The new child remained alive
+while a third process acquired and released the same lock, ruling out process
+exit as the explanation for release. All synthetic owner hashes matched and
+no parent-forced process cleanup was needed. This does not establish Windows
+FIFO fairness or an unconditional admission guarantee.
+
+Nine separately selected native cases passed: short-holder release, continuous
+hold timeout, late grant, delayed completion observation, event-creation
+failure, thread-creation failure, unlock failure, cleanup-stall release and
+cleanup-stall timeout. Continuous hold completed cancellation with Win32 995;
+late grant observed cancel 1168, real successful completion and explicit unlock,
+then returned 7 with zero inventory scans. The resource-failure cases returned
+8 before any lock request; injected unlock failure returned 4 without a floor.
+The controlled native wait was terminated by the CLI watchdog with exit 124 at
+15.093 seconds, measured before any post-exit probe. Its release control returned
+7 after actual cancellation. These injection cases do not claim reproduced
+kernel failures. Native asynchronous-unlock pending and a precisely simultaneous
+15-second completion/deadline race have not been forced or claimed as tested.
+
+Raw results and exact invocations are under
+`/private/tmp/edr-683-lock-contention-4y4xiv5c/queued-harness/`:
+`paired-frozen-v2/execution-a24cae354eac/`,
+`paired-measurement-v3/execution-e8daab22e49f/`, and the nine
+`race-frozen-v1/execution-*/` records. The measurement-corrected result SHA-256
+is `f9737ad9a053a89171e09d805bfd6fee08e408e8a288126e40d3f4a977e2c97e`;
+watchdog raw result SHA-256 is
+`f26f5e9e657684f17ed5f1b18dc1ee914b636187f61b9168db9e2e13a9e0e305`.
+Commands were the frozen `execute_paired_once.py` and
+`execute_selected_case_once.py --case <case>`, each with recorded executable,
+script and output hashes. These are MinGW AMD64 helpers under ARM64 Windows
+emulation, not the MSVC ARM64 release. The permanent fixture retains the existing
+non-lock cases and 60-second suite bound. The final permanent fixture was then
+freshly built from all 18 translation-unit compilations (plain and fixture
+variants) and run once in an exclusive UTM temporary directory. It passed in
+19.25 seconds, exit 0, with no timeout, forced termination or stderr. The
+original ACL, legacy-owner, corruption, configuration and exclusive-output
+cases remained enabled; owner bytes and ACLs remained unchanged. The dedicated
+watchdog case exited 124 at 15.031 seconds. Its eight case observations and
+final suite result are preserved in
+`/private/tmp/edr-683-inventory-full-fixture-vhbj7qxs/results/`;
+`result.json` SHA-256 is
+`59dd1238d10fb21862fd40a1d9e78d9441d5f964949bb2800db8192d604a0338`.
+The host executed the frozen `plan.json` prepare/start/poll/collect commands,
+with a 60-second guest test deadline and a separate 75-second transport bound.
+An initial local collection attempt found the already-created empty results
+directory; no test rerun occurred. Collection then verified output hashes.
+The eight-file permanent patch matches frozen-v2 manifest
+`372477ba6a4afb0331df7c7482ab15d3e4c8e137b3e12e642661c2c7d2b47150`.
+After integration, the host built `storage_space_preflight_client` and
+`test_command_result_compaction` and ran
+`ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure -R '^(storage_space_preflight|command_result_compaction)$'`:
+2/2 passed in 21.25 seconds (20.71 and 0.54 seconds). The existing host build
+uses a non-production PCRE2 stub; these focused storage tests do not establish
+P0 rule enforcement. Native MSVC builds, new release and client acceptance
+remain pending at this checkpoint.
+
 ## 2026-10-15 candidate 682: Headless validation, live inventory-lock refusal
 
 Source `4aee784a6bcbe8d1f309e1c3b4d662f5eb9cea0a` was committed and pushed to
@@ -75,6 +164,36 @@ a long critical section, repeated competition or an unreleased lock, and
 does not identify the holder. Runtime full-owner scans and installer/runtime
 coordination remain under investigation. Raising the timeout or repeating
 the deployment is not an established repair.
+
+The next observation was one bounded three-second check of the existing lock,
+with the exact PID 7600 generation and lock-file identity checked before/after.
+All 116 nonblocking attempts acquired and immediately released it, with zero
+conflicts. The owner remained 6,302,598 bytes with unchanged modification time;
+Agent CPU increased by 0.640625 user seconds and 0.984375 kernel seconds. No
+owner contents or ACLs were read/changed. Four native synthetic checks first
+verified the observer's missing-file refusal, availability, real Win32 33,
+release-after-conflict and reacquisition. These results establish availability
+in that later window, not availability during the failed upgrade or a known
+historical lock holder. Evidence is `owner-lock-682-{selftest,live}.json` and
+their invocation records in the same acceptance directory.
+
+One independent synthetic Windows experiment then used the actual preflight
+test client and two runtime-style blocking byte-lock workers, all on the same
+new synthetic owner/config/lock. Uncontended before/after calls succeeded on
+their first attempt (0.110 s / 0.031 s). With two workers targeting 20 ms holds,
+the existing preflight timed out in 1.046 s: 32 attempts, 32 actual Win32 33
+conflicts and 32 sleeps. Workers acquired 21/18 times, with maximum observed
+holds of only 47/31 ms. All owner bytes were unchanged and every process exited
+normally. This proves that short, repeated lock competition can exhaust the
+polling admission window without any single one-second holder. It does not
+prove the historical holder, Windows fairness or a repaired implementation.
+The original result and all 14 hashed raw outputs are under
+`/private/tmp/edr-683-lock-contention-4y4xiv5c/execution-124bd4acf302/`;
+`raw/result.json` SHA-256 is
+`f60a5f08e4e4bdcaf8b14f91ff9c21af1c0bd7fcd1408b909ca52f5de24980a2`.
+No live upgrade retry, timeout increase or production lock change followed
+this experiment. A queued-lock prototype and its cancellation/CLI deadline
+contract are being evaluated separately before any production patch.
 
 ## 2026-10-15 post-681 validation: exact boundary and existing-owner updates
 

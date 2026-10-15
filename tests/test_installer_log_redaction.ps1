@@ -43,6 +43,7 @@ $cases = @(
   @{ Name='utf8_tail'; Raw=([string] [char] 0x4E2D * 1500); Forbidden=@([string] [char] 0xFFFD) },
   @{ Name='supplementary_tail'; Raw=([char]::ConvertFromUtf32(0x1F600) * 1500); Forbidden=@([string] [char] 0xFFFD) },
   @{ Name='preflight_lock_timeout'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=child_exit; exit_code=7; reason=owner_lock_timeout"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=child_exit; exit_code=7; reason=owner_lock_timeout' },
+  @{ Name='preflight_deadline_unavailable'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=child_exit; exit_code=8; reason=deadline_unavailable"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=child_exit; exit_code=8; reason=deadline_unavailable' },
   @{ Name='preflight_child_watchdog'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=child_exit; exit_code=124; reason=child_watchdog_timeout"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=child_exit; exit_code=124; reason=child_watchdog_timeout' },
   @{ Name='preflight_launch_failed'; Raw=('a' * 4300) + "`r`nEDR storage preflight: stage=launch_failed; win32_code=2"; Forbidden=@([string] [char] 0xFFFD); Required='EDR storage preflight: stage=launch_failed; win32_code=2' },
   @{ Name='unterminated_quote'; Raw='password="FICTIONAL_FIRST FICTIONAL_SECOND'; Forbidden=@('FICTIONAL_FIRST', 'FICTIONAL_SECOND'); Unterminated=$true }

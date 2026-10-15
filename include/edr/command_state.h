@@ -103,9 +103,13 @@ typedef struct EdrCommandStateCapacityStats {
 int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out);
 /* Installer preflight: validate existing owner/parent ACLs; never repair them,
  * create parent directories or rewrite/compact the owner. Only the normal lock
- * metadata may be created/secured. Windows lock contention uses a 1000 ms
- * monotonic budget and at most 41 attempts; other
- * failures do not retry. On failure, out->last_error is a fixed local reason. */
+ * metadata may be created/secured. Windows queues one lock request within a
+ * 1000 ms monotonic admission budget. A timed-out request is cancelled and
+ * completion confirmed; a late grant is released without reading the owner.
+ * Unlock completion is checked before success. The explicit preflight CLI has
+ * a separate 15 s operation watchdog for acquisition, cleanup and accounting;
+ * this is not a hard real-time guarantee about kernel I/O or scheduling.
+ * On failure, out->last_error is a fixed local reason. */
 enum { EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT = -2 };
 int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out);
 
