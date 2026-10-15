@@ -36,6 +36,8 @@ def openssl_certificates(root: Path):
 
     for name in ("ca", "other-ca"):
         run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
             "-subj", f"/CN=Synthetic-{name}", "-keyout", f"{name}.key", "-out", f"{name}.pem")
     for name, usage, san in (("server", "serverAuth", "DNS:localhost,IP:127.0.0.1"),
                              ("wrong-host", "serverAuth", "DNS:wrong.invalid"),

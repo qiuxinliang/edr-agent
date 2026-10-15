@@ -30,6 +30,7 @@ class RuleDownloadSchemaTest(unittest.TestCase):
             server = receiver.Receiver(root, "server", root / "receipts.db")
             server.rule_downloads_enabled = True
             context = ssl.create_default_context(cafile=str(root / "ca.pem"))
+            context.verify_flags |= ssl.VERIFY_X509_STRICT
             context.load_cert_chain(root / "client.pem", root / "client.key")
             try:
                 for path in ("/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):

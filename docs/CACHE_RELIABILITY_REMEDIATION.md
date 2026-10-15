@@ -143,6 +143,48 @@ repeated to obtain a desired result. Results are
 `/tmp/edr-679-adjacent-direct-wabhxl49/comparison.json` and
 `/tmp/edr-679-reason-preflight-6dy33i78/result.json`.
 
+One subsequent SYSTEM scheduled invocation of that bounded stderr wrapper also
+passed: actual 679 preflight exit 0 in 120 ms, floor 143,479,824 bytes, empty
+stderr. Its owner snapshot again differed from the prior failure. The temporary
+task was removed; the installed Agent remained the same PID 6228 generation.
+See `/tmp/edr-679-scheduled-reason-rcut0d6_/`. This does not explain the earlier
+code 4 or justify another upgrade retry. Source inspection confirms that the
+full-installer updater does not stop the Agent before Setup; after a Setup
+failure its rollback branch does stop and restart the old runtime. The guard's
+"existing runtime was not stopped" message describes its own preflight stage,
+not the subsequent updater recovery.
+
+A temporary diagnostic executable records a fixed first-observed inventory
+branch and typed numeric error only after the real preflight returns. It is a
+MinGW AMD64 diagnostic build, not the published ARM64 679 binary. Its baseline
+and instrumented forms passed six isolated Windows cases / 12 calls in
+137.484 s: clean and absent-parent inventories succeed, an externally held
+lock returns 4 with Win32 33, unsafe parent ACL returns 4 with a policy reason,
+and a torn owner returns 4 with the existing unclassified-record reason. An
+existing diagnostic sidecar is preserved and makes diagnostic success return
+6 instead of overwriting it. All calls had no timeout and left their synthetic
+owner bytes and owner/parent ACL unchanged. A first setup attempt failed while
+reading the schema after changing the staging-directory ACL, before any of the
+12 calls; that failure is retained. Removing only that unrelated staging ACL
+operation allowed the unchanged cases to run. Raw results and the failed-setup
+record are in `/private/tmp/edr-680-inventory-oracles-fixed-2bfd37a90618/`.
+These results validate diagnostic discrimination, not a historical failure
+cause; an observed missing parent can legitimately accompany preflight exit 0.
+
+The single subsequent SYSTEM always-refuse Inno probe captured a specific
+failure at 10:51:37 UTC: preflight exit 4, phase
+`lock_exclusive_nonblocking`, valid Win32 `ERROR_LOCK_VIOLATION` (33).
+The original Inno launch command was unchanged; only the tested diagnostic
+executable supplied the bounded sidecar. The fixture refused before copying
+files (exit 7, 2,759 ms, no timeout, dummy destination absent), removed its
+temporary task, and left Agent PID 6228/generation and the 6,152,971-byte
+command owner, configuration and checked ACLs unchanged. See
+`/private/tmp/edr-680-inventory-inno-rct_r0tr/fixture-result.json` (SHA-256
+`f2cdd7c93ed22dfe6435ecc462d82c2fbe8263cd3c07a276fcde465b63f28ff9`).
+This establishes lock contention as the cause of this diagnostic failure.
+It does not identify the lock holder or prove that both historical ARM64
+679 upgrade failures had the same cause; their child error was not retained.
+
 ## Follow-up: bounded maintenance selection and Windows concurrency coverage
 
 The additional full UTM queue test exposed an actual read-amplification path
@@ -200,6 +242,32 @@ source identities and full results are retained under
 `/private/tmp/edr-680-queue-case-native/`. The earlier failed full run is not
 reclassified as passed; this is the verified result after the production
 cost-expression repair. Native MSVC AMD64/ARM64 CI remains required.
+
+Commit `e6130ee3f227a6013128f761143042a87fe97308` contains this follow-up
+(17 ahead of audit 662, eight ahead of the comparison SHA). Its nonpublishing
+Windows CI run `38719364108` built with MSVC 14.44.35207 on native AMD64 and
+passed 98/99 selected tests in 294.31 s, including the new storage cases.
+The remaining `egress_receiver_resources` test failed the real TLS handshake:
+Python 3.14.8 rejected the synthetic CA because it lacks a key usage extension.
+The later zero-receipts assertion is a consequence of those 16 handshake
+failures. The run is failed, not a release gate pass. Full original output is
+`/private/tmp/edr-680-native-ci/native-ci.log`; strict TLS verification remains
+enabled in the certificate fixture repair below.
+
+The minimal fixture repair explicitly gives both synthetic CAs critical
+`basicConstraints=CA:TRUE` and `keyUsage=keyCertSign,cRLSign`. The existing
+resource test now also enables `VERIFY_X509_STRICT` on older Python versions;
+no production verification option or expected receipt count changes. With
+OpenSSL 3.6.2, the old generator reproduced strict error 92 (exit 2), while
+the fixed server/client chains passed and wrong-CA/wrong-host chains still
+failed. The resource suite passed 9/9 in 0.838 s and its four direct real mTLS
+consumers passed in 52.91 s. An initial sandbox-only loopback bind refusal is
+retained separately; the successful run used local-listener permission.
+Commands, source hashes and red/green results are in
+`/private/tmp/edr-680-native-ci/tls-fix-result.json`. Native validation of this
+fixture repair remains pending. The Windows run's 99 tests are the actual
+expected conditional set: `p0_runtime_delivery` is registered only on
+non-Windows, not a missing test from the 100-name static candidate list.
 
 ## 2026-10-15 fourth batch: value retention, bounded owners and physical admission
 
@@ -873,7 +941,7 @@ migration is not part of the authorized deployment.
 | 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. Final production source passed both 679 native gates. | No promise of unlimited critical admission. |
 | 5. Result budget | Real insert, growth, 1,000 serial copies and four concurrent writers; busy and commit failure preserve existing bytes; owner JSONL and optional copy failure are separate. Both 679 native gates passed. | Installed new-client necessary result and durable server receipt. |
 | 6. Pressure/network cases | Candidate dedupe/aggregation, unique and high-priority capacity, long commands, pin refusal, offline/ACK loss and policy refusal; real loopback mTLS 429/503 with exact successful receipts. Additional fixed-budget dead-letter storm: 1,024 attempts, 91 admits, 933 explicit refusals, 59 saturated waves, 420,693-byte logical plateau; reserved terminal and precreated result remain usable; source uploads/ACKs zero. | Storm uses this queue fixture's transport/codec stubs; it does not replace actual wire tests. Installed-client reconnect/delivery remains separate. |
-| 7. Concurrency/restart | 679 native child-process migration/reclaim crash cases passed. Previously POSIX-only cache lifecycle/query and mutex tests now execute on UTM, as do queue competing drains, stale event/journal connections and concurrent deferred retain. | New Windows test bridges still require native MSVC CI. MinGW AMD64 on ARM64 emulation is additional evidence. A killed process is not hardware power loss. The additional full UTM queue run failed its old 40-slice fixture; retain this failure separately from focused passes. |
+| 7. Concurrency/restart | 679 native child-process migration/reclaim crash cases passed. Previously POSIX-only cache lifecycle/query and mutex tests now execute on UTM, as do queue competing drains, stale event/journal connections and concurrent deferred retain. The fixed full queue and new Windows cases passed native AMD64 CI on e6130ee3. | The original full UTM 40-slice failure is retained; the verified BLOB-cost repair subsequently passed that unchanged fixture and the full suite. Native ARM64 still needs the follow-up gates. MinGW AMD64 on ARM64 emulation is additional evidence. A killed process is not hardware power loss. The AMD64 CI as a whole remains failed on its separate synthetic-CA fixture. |
 | 8. Time/physical pressure | Wall/monotonic window rules, SQLite busy, pinned readers, zero-space ACK refusal, guarded checkpoint and isolated native NTFS disk-full/recovery. | 679 real upgrade refused preflight and rolled back; isolated original release preflight passes do not certify installed new-client startup. Physical admission is not an atomic directory quota. |
 | 9. Frozen identity | Exact payload/hash/batch/owner, known PPID, PID reuse, uint64 generation and guarded old-reader tests passed both native gates. Three sampled old queue owners remain unchanged after the failed upgrade. | Two original evidence candidate samples are missing after rollback: preservation is unverified and deletion timing/cause unknown. New installed-client checks remain pending; old policy-3 delivery downgrade remains unsupported. |
 | 10. Minimal egress | Real protobuf/RAW/LZ4 round trips, bounded authorized query and final HTTP field assertions; source facts stay local after ordinary delivery; both 679 native gates passed. | Actual client/server consumers and unenumerated wire routes must not be inferred from server-filtered rows or empty completed-batch payloads. |
