@@ -16,6 +16,8 @@ $relativePaths = @(
   "scripts\Restore-SetupUiLocked.ps1",
   "scripts\checkout_private_p0_inputs.ps1",
   "tests\test_private_p0_checkout.ps1",
+  "tests\run_telemetry_windows_native.ps1",
+  "tests\test_native_gate_runner.ps1",
   "scripts\edr_agent_install.ps1",
   "scripts\edr_agent_preflight.ps1",
   "scripts\edr_agent_inplace_update.ps1",

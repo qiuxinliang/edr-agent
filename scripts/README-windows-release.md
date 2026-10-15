@@ -76,11 +76,16 @@ The prepare job runs checkpoint behavior, workflow wiring, and the portable
 The same packaging contract remains in the Windows CTest gate. This catches
 workflow/helper contract drift early without replacing native validation.
 
-The release **Test** step first runs `windows-release-gate`, then invokes
-`tests/run_telemetry_windows_native.ps1 -BuildDir build -Configuration Release`
-on each native architecture. The existing runner builds and executes the
-authoritative `telemetry-minimization` CTest group, including the isolated
-loopback mTLS receiver. It uses the configured vcpkg `tools/openssl` executable
+The release **Test** step invokes
+`tests/run_telemetry_windows_native.ps1 -BuildDir build -Configuration Release -IncludeReleaseGate`
+on each native architecture. The runner builds both gate targets, clears inherited
+endpoint overrides, and runs `windows-release-gate` first. Only after that succeeds
+does it run `telemetry-minimization` excluding the already-passed release label.
+Required telemetry contracts must be present in the labelled inventory; an empty
+release gate fails. Without `-IncludeReleaseGate`, the standalone runner still
+executes the entire telemetry group. Both phases remain sequential with their
+original deadlines, including the isolated loopback mTLS receiver. The runner
+uses the configured vcpkg `tools/openssl` executable
 when available, otherwise the installed OpenSSL executable. Missing dependencies
 or failed tests stop packaging and checkpoint sealing; a source-bound checkpoint
 can only be reused after these gates passed in that same run. These tests use
@@ -97,10 +102,57 @@ Python installer. No new runner, service or signing system is needed.
 
 Release gate fixture tests run with at most two independent workers, with per-case
 logs and timings. All discovered cases and negative controls remain selected;
-native product CTest and lifecycle jobs are not removed or parallelized by this
-change. The fixture driver fails on an empty selection or any failed case. Measure
-the next Windows CI runs before claiming a wall-clock improvement; local contract
-tests do not establish hosted Python cache hit rate or native release performance.
+native product CTest and lifecycle jobs remain mandatory and sequential. The
+fixture driver fails on an empty selection or any failed case.
+
+## Build performance investigation (2026-10-15)
+
+Successful GitHub job/step metadata and CTest logs show that the recent increase
+is primarily validation work, rather than dependency downloads or packaging:
+
+| Successful run | Total release | ARM64 gate self-tests | ARM64 Ninja build | ARM64 Test | ARM64 lifecycle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [2026-10-04](https://github.com/qiuxinliang/edr-agent/actions/runs/37208653818) | 23m08s | 4m04s | 1m15s | 3m13s | 5m41s |
+| [2026-10-11](https://github.com/qiuxinliang/edr-agent/actions/runs/38117339774) | 39m47s | 5m52s | 2m38s | 8m50s | 14m31s |
+| [2026-10-15](https://github.com/qiuxinliang/edr-agent/actions/runs/38742901613) | 50m53s | 6m55s | 2m36s | 16m34s | 15m50s |
+
+The latest run installed vcpkg dependencies in 5s/9s and packaged in 17s/19s
+(AMD64/ARM64). Its Test step ran 99 release tests followed by 38 telemetry tests:
+137 executions for 112 distinct tests. The second execution of the 25 shared tests
+took 211.95s/212.48s. These are observed redundant costs in the old workflow,
+not a measured end-to-end improvement from the new workflow. The unsigned run
+does not establish USB or hosted certificate signing performance.
+
+Three changes remove repeated work while retaining the existing contracts:
+
+- Gate self-tests share the identical fixture body as an OBJECT library while
+  keeping every executable as a separate build dependency. Failure-injection
+  cases select the exact failing labelled test and require one failure with no
+  missing executable. Complete graph, missing-target, real executable failure,
+  and both Ninja generator checks remain. The two affected groups (17 host
+  subcases) passed in 543.218s before and 5.508s after on macOS; these local
+  samples ran alongside other checks and are not a hosted-run benchmark.
+- The four full-runtime fixtures share assertion-enabled production objects.
+  `agent.c` remains separate for fixtures that embed and substitute it;
+  `pmfe_engine.c` remains separate for lifecycle-only test hooks. The verified
+  macOS build graph reduced their compile units from 522 to 138 (384 fewer).
+  Product objects, feature definitions, dependency verification, and native
+  installer CRT settings are unchanged.
+- Native release and telemetry execution uses the two-phase selection above.
+  The telemetry-only path remains available and complete. Runtime tests are
+  not broadly parallelized: existing fixtures can share build-directory state.
+
+Validation: full fixture dependency/negative-control checks; real CTest execution
+counts and failure propagation for both labels; nine orchestration cases executed
+against the real PowerShell runner with only external commands substituted;
+workflow/packaging contracts; and eight existing runtime behavior tests, including
+mTLS, conditional policy, local query, startup, and PMFE lifecycle. Local runtime
+checks used macOS Debug and the explicitly non-production PCRE2 stub. PowerShell
+validation used 7.6.6 on macOS. The release now runs the orchestration regression
+on both Windows architectures and parses both runner scripts with Windows
+PowerShell 5.1 before building. A new Windows run is still required to measure
+the actual MSVC build and end-to-end improvement. Native installer lifecycle,
+trust, signatures, immutable checkpoints, and publication gates remain required.
 
 ## Windows rule validation
 

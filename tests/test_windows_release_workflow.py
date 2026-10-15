@@ -134,7 +134,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"', prepare)
         self.assertLess(prepare.index('tests/test_agent_update_assets.c'),
                         prepare.index('windows_release_checkpoint.py prepare'))
-        self.assertIn("--label-regex '^windows-release-gate$'", self.jobs['windows-build'])
+        self.assertIn('$telemetryArgs.IncludeReleaseGate = $true', self.jobs['windows-build'])
 
     def assert_canonical_p0_test_inputs(self, build):
         def step(name):
@@ -271,8 +271,10 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                     self.assertIn("Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\\x64-windows\\tools\\openssl'", test)
                 self.assertIn("-LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf", test)
                 self.assertIn('$env:PATH = "$opensslTools;$env:PATH"', test)
-                self.assertLess(test.index("'openssl.exe'"), test.index('& ctest '))
-                self.assertLess(test.index('$env:PATH ='), test.index('& ctest '))
+                command = ('& .\\tests\\run_telemetry_windows_native.ps1' if filename == 'edr-agent-client-release.yml'
+                           else '& ctest ')
+                self.assertLess(test.index("'openssl.exe'"), test.index(command))
+                self.assertLess(test.index('$env:PATH ='), test.index(command))
 
     def assert_native_telemetry_release_gate(self, build):
         step = build.split('- name: Test\n', 1)[1].split('\n      - ', 1)[0]
@@ -280,7 +282,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("if: steps.resume.outputs.restored != 'true'", step)
         call = '& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs'
         self.assertIn(call, step)
-        self.assertLess(step.index("--label-regex '^windows-release-gate$'"), step.index(call))
+        self.assertIn('$telemetryArgs.IncludeReleaseGate = $true', step)
+        self.assertLess(step.index('$telemetryArgs.IncludeReleaseGate = $true'), step.index(call))
+        self.assertNotIn('& ctest ', step)
         # PowerShell arrays splat positional values, including strings that
         # look like parameter names. A script's named parameters require a
         # hashtable; the old array bound Configuration='build' on native CI.
@@ -302,7 +306,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assert_native_telemetry_release_gate(self.jobs['windows-build'])
         runner = (ROOT / 'tests/run_telemetry_windows_native.ps1').read_text(encoding='utf-8')
         self.assertIn("$ErrorActionPreference = 'Stop'", runner)
-        self.assertIn('--target telemetry_minimization_tests', runner)
+        self.assertIn("$buildTargets = @('telemetry_minimization_tests')", runner)
+        self.assertIn("$buildTargets += 'windows_release_gate_tests'", runner)
+        self.assertIn('--target $buildTargets', runner)
         self.assertIn("'egress_command_delivery_mtls'", runner)
         tests = (ROOT / 'tests/CMakeLists.txt').read_text(encoding='utf-8')
         self.assertIn('add_test(NAME egress_command_delivery_mtls', tests)
@@ -317,11 +323,43 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertNotRegex(self.jobs['publish-release'], r'(?m)^    if:')
         self.assertIn('      - windows-build\n', self.jobs['publish-release'])
 
+    def assert_native_release_test_deduplication(self, runner):
+        release = "--no-tests=error --label-regex '^windows-release-gate$'"
+        telemetry = "-L '^telemetry-minimization$' @telemetryExclusions"
+        self.assertIn('[switch]$IncludeReleaseGate', runner)
+        self.assertIn("$telemetryExclusions = @()", runner)
+        self.assertIn("$telemetryExclusions = @('--label-exclude', '^windows-release-gate$')", runner)
+        self.assertIn('if ($IncludeReleaseGate)', runner)
+        self.assertIn("if ($releaseTests.Count -eq 0) { throw", runner)
+        self.assertIn('$name -notin @($telemetryTests.name)', runner)
+        self.assertLess(runner.index(release), runner.index(telemetry))
+        self.assertRegex(runner.split(release, 1)[1],
+                         r"\s*if \(\$LASTEXITCODE -ne 0\) \{ throw 'Native Windows release gate failed\.' \}")
+        self.assertIn('--output-on-failure --no-tests=error --timeout 150', runner)
+        self.assertIn('$remaining.Count -gt 0', runner)
+        self.assertIn('$_.name -notin @($releaseTests.name)', runner)
+
+    def test_native_release_deduplication_requires_successful_complete_first_gate(self):
+        runner = (ROOT / 'tests/run_telemetry_windows_native.ps1').read_text(encoding='utf-8')
+        self.assert_native_release_test_deduplication(runner)
+        preflight = self.jobs['windows-build'].split('- name: Verify hosted release workflow contract\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('& .\\tests\\test_native_gate_runner.ps1', preflight)
+        self.assertNotIn('continue-on-error', preflight)
+        for before, after in (
+            ("if ($LASTEXITCODE -ne 0) { throw 'Native Windows release gate failed.' }", '# ignored release failure'),
+            ('$name -notin @($telemetryTests.name)', '$name -notin @($inventory.tests.name)'),
+            ("if ($releaseTests.Count -eq 0) { throw", "if ($false) { throw"),
+            ("$telemetryExclusions = @()", "$telemetryExclusions = @('--label-exclude', '^windows-release-gate$')"),
+        ):
+            with self.subTest(boundary=before), self.assertRaises(AssertionError):
+                self.assert_native_release_test_deduplication(runner.replace(before, after, 1))
+
     def test_native_telemetry_gate_rejects_missing_call_and_failure_bypass(self):
         build = self.jobs['windows-build']
         self.assert_native_telemetry_release_gate(build)
         call = '& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs'
         cases = {
+            'missing release gate': build.replace('$telemetryArgs.IncludeReleaseGate = $true', '', 1),
             'missing runner': build.replace(call, '# runner omitted', 1),
             'ignored failure': build.replace('- name: Test\n', '- name: Test\n        continue-on-error: true\n', 1),
             'unchecked runner failure': build.replace("if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }",

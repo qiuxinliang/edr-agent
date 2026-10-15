@@ -843,8 +843,15 @@ int main(void) {
            "release workflow packages native component SHA-256 identities");
   contains(client_release, "'windows_release_gate_tests'",
            "release workflow builds every executable in the shared gate");
-  contains(client_release, "--no-tests=error --label-regex '^windows-release-gate$'",
-           "release workflow runs the shared gate and rejects an empty selection");
+  contains(client_release, "$telemetryArgs.IncludeReleaseGate = $true",
+           "release workflow requires the shared release gate before remaining telemetry tests");
+  snprintf(path, sizeof(path), "%s/tests/run_telemetry_windows_native.ps1", root);
+  char *native_gate_runner = read_file(path);
+  contains(native_gate_runner, "--no-tests=error --label-regex '^windows-release-gate$'",
+           "native release runner rejects an empty release gate");
+  contains(native_gate_runner, "if ($LASTEXITCODE -ne 0) { throw 'Native Windows release gate failed.' }",
+           "release gate failure prevents telemetry exclusion and packaging");
+  free(native_gate_runner);
   snprintf(path, sizeof(path), "%s/cmake/WindowsReleaseGate.cmake", root);
   char *release_gate = read_file(path);
   contains(release_gate, "message(FATAL_ERROR \"Windows release gate test is not registered:",
@@ -854,7 +861,7 @@ int main(void) {
   contains(release_gate, "edr_windows_release_gate(pmfe_pe_architectures test_pmfe_pe_arch)",
            "PE architecture contract is both built and executed");
   free(release_gate);
-  contains(client_release, "Release tests failed on native $env:EDR_RELEASE_ARCH runner",
+  contains(client_release, "if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }",
            "release workflow executes the contract suite natively on AMD64 and ARM64");
   contains(client_release, "Windows release product, installer or gate-test build failed with exit code $LASTEXITCODE",
            "release workflow reports failures from its explicit product, native installer, and gate-test target allowlist");

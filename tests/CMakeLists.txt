@@ -1985,13 +1985,28 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
       endif()
     endif()
   endforeach()
-  add_executable(test_egress_tls_client test_egress_tls_client.c ${_egress_tls_sources})
-  target_include_directories(test_egress_tls_client PRIVATE
+  # These fixtures exercise the same runtime owners with identical features.
+  # Compile those owners once, retaining assertion-enabled test objects rather
+  # than reusing the product's release objects. agent.c is embedded by the
+  # policy/startup fixtures; pmfe_engine.c has lifecycle-only timing hooks.
+  # Keep both translation units in each fixture so their substitutions and
+  # test-only definitions cannot leak into another fixture or the product.
+  set(_runtime_test_agent_source ${CMAKE_SOURCE_DIR}/src/core/agent.c)
+  set(_runtime_test_pmfe_source ${CMAKE_SOURCE_DIR}/src/pmfe/pmfe_engine.c)
+  list(REMOVE_ITEM _egress_tls_sources
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
+  add_library(edr_runtime_test_common OBJECT ${_egress_tls_sources})
+  target_include_directories(edr_runtime_test_common PUBLIC
     $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
-  target_compile_definitions(test_egress_tls_client PRIVATE
+  target_compile_definitions(edr_runtime_test_common PUBLIC
     $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
-  target_link_libraries(test_egress_tls_client PRIVATE
+  target_link_libraries(edr_runtime_test_common PUBLIC
     $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  edr_apply_test_warnings(edr_runtime_test_common)
+
+  add_executable(test_egress_tls_client test_egress_tls_client.c
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
+  target_link_libraries(test_egress_tls_client PRIVATE edr_runtime_test_common)
   target_compile_definitions(test_egress_tls_client PRIVATE EDR_TEST_EXTENDED_EGRESS=1)
   edr_apply_test_warnings(test_egress_tls_client)
   add_test(NAME egress_loopback_mtls COMMAND ${Python3_EXECUTABLE}
@@ -2016,13 +2031,10 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
   add_test(NAME authorized_local_query_contract COMMAND test_egress_tls_client
     --local-query-contract ${CMAKE_CURRENT_BINARY_DIR}/authorized-local-query-state)
   set_tests_properties(authorized_local_query_contract PROPERTIES TIMEOUT 30)
-  add_executable(test_pmfe_lifecycle test_pmfe_lifecycle.c ${_egress_tls_sources})
-  target_include_directories(test_pmfe_lifecycle PRIVATE
-    $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
-  target_compile_definitions(test_pmfe_lifecycle PRIVATE
-    $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS> EDR_PMFE_LIFECYCLE_TESTING=1)
-  target_link_libraries(test_pmfe_lifecycle PRIVATE
-    $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  add_executable(test_pmfe_lifecycle test_pmfe_lifecycle.c
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
+  target_compile_definitions(test_pmfe_lifecycle PRIVATE EDR_PMFE_LIFECYCLE_TESTING=1)
+  target_link_libraries(test_pmfe_lifecycle PRIVATE edr_runtime_test_common)
   edr_apply_test_warnings(test_pmfe_lifecycle)
   add_test(NAME pmfe_lifecycle_policy_switch COMMAND test_pmfe_lifecycle)
   set_tests_properties(pmfe_lifecycle_policy_switch PROPERTIES TIMEOUT 60)
@@ -2166,21 +2178,15 @@ edr_apply_test_warnings(test_periodic_schedule)
 add_test(NAME periodic_schedule_boundaries COMMAND test_periodic_schedule)
 
 if(SQLite3_FOUND AND OpenSSL_FOUND AND EDR_WITH_INGEST_HTTPS_OPENSSL)
-  set(_conditional_policy_sources ${_egress_tls_sources})
-  list(REMOVE_ITEM _conditional_policy_sources ${CMAKE_SOURCE_DIR}/src/core/agent.c)
-  add_executable(test_conditional_policy test_conditional_policy.c ${_conditional_policy_sources})
-  target_include_directories(test_conditional_policy PRIVATE $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
-  target_compile_definitions(test_conditional_policy PRIVATE $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
-  target_link_libraries(test_conditional_policy PRIVATE $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  add_executable(test_conditional_policy test_conditional_policy.c ${_runtime_test_pmfe_source})
+  target_link_libraries(test_conditional_policy PRIVATE edr_runtime_test_common)
   edr_apply_test_warnings(test_conditional_policy)
   add_test(NAME conditional_policy_authenticated_cache COMMAND ${Python3_EXECUTABLE} -B
     ${CMAKE_SOURCE_DIR}/tests/test_conditional_policy.py --client $<TARGET_FILE:test_conditional_policy>)
   set_tests_properties(conditional_policy_authenticated_cache PROPERTIES TIMEOUT 60)
 
-  add_executable(test_runtime_rule_startup test_runtime_rule_startup.c ${_conditional_policy_sources})
-  target_include_directories(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
-  target_compile_definitions(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>)
-  target_link_libraries(test_runtime_rule_startup PRIVATE $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  add_executable(test_runtime_rule_startup test_runtime_rule_startup.c ${_runtime_test_pmfe_source})
+  target_link_libraries(test_runtime_rule_startup PRIVATE edr_runtime_test_common)
   edr_apply_test_warnings(test_runtime_rule_startup)
   add_test(NAME runtime_rule_cold_start_schedule COMMAND test_runtime_rule_startup)
 endif()

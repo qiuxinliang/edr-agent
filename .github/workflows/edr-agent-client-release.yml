@@ -261,7 +261,10 @@ jobs:
       - name: Verify hosted release workflow contract
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
-        run: python tests/test_windows_release_workflow.py
+        run: |
+          python tests/test_windows_release_workflow.py
+          if ($LASTEXITCODE -ne 0) { throw 'Release workflow contract failed' }
+          & .\tests\test_native_gate_runner.ps1
       - name: Verify USB response integrity regressions
         if: steps.resume.outputs.restored != 'true'
         shell: powershell
@@ -716,10 +719,9 @@ jobs:
           $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
           if (-not (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf)) { throw 'Pinned vcpkg OpenSSL executable is required for isolated TLS gate fixtures' }
           $env:PATH = "$opensslTools;$env:PATH"
-          & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
-          if ($LASTEXITCODE -ne 0) { throw "Release tests failed on native $env:EDR_RELEASE_ARCH runner" }
           $telemetryArgs = @{ BuildDir = 'build'; Configuration = 'Release' }
           $telemetryArgs.OpenSslBin = $opensslTools
+          $telemetryArgs.IncludeReleaseGate = $true
           & .\tests\run_telemetry_windows_native.ps1 @telemetryArgs
           if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }
 

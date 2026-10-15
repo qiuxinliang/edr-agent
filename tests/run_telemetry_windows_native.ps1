@@ -3,7 +3,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$BuildDir,
   [ValidateSet('Debug','RelWithDebInfo','Release')][string]$Configuration = 'Debug',
-  [string]$OpenSslBin = ''
+  [string]$OpenSslBin = '',
+  [switch]$IncludeReleaseGate
 )
 $ErrorActionPreference = 'Stop'
 $build = (Resolve-Path -LiteralPath $BuildDir).Path
@@ -23,6 +24,12 @@ try {
   $listing = & ctest --test-dir $build -C $Configuration -N --show-only=json-v1
   if ($LASTEXITCODE -ne 0) { throw 'CTest inventory failed.' }
   $inventory = ($listing -join "`n") | ConvertFrom-Json
+  $telemetryTests = @($inventory.tests | Where-Object {
+    'telemetry-minimization' -in @($_.properties | Where-Object name -EQ 'LABELS' | ForEach-Object value)
+  })
+  $releaseTests = @($inventory.tests | Where-Object {
+    'windows-release-gate' -in @($_.properties | Where-Object name -EQ 'LABELS' | ForEach-Object value)
+  })
   $required = @('egress_batch_policy','egress_request_policy','command_result_egress','command_result_compaction','egress_receiver_resources','queue_recovery_real_codec',
     'local_evidence_cache_candidate','local_evidence_cache_migration','local_evidence_cache_retention',
     'storage_queue_sqlite_contract','deep_collector_manifest',
@@ -30,12 +37,31 @@ try {
     'p0_source_only_durable_contract','p0_operation','p0_rule_ir_purpose_archive','p0_observation_semantics','ave_sdk_smoke','egress_loopback_mtls','egress_command_delivery_mtls','egress_update_download_mtls','report_events_ack_contract',
     'pmfe_lifecycle_policy_switch')
   foreach ($name in $required) {
-    if ($name -notin @($inventory.tests.name)) { throw "Required native test missing: $name. A stub or incomplete dependency build cannot pass this runner." }
+    if ($name -notin @($telemetryTests.name)) { throw "Required native telemetry test missing or unlabelled: $name. A stub or incomplete dependency build cannot pass this runner." }
   }
-  & cmake --build $build --config $Configuration --target telemetry_minimization_tests --parallel 4
+  $buildTargets = @('telemetry_minimization_tests')
+  $telemetryExclusions = @()
+  if ($IncludeReleaseGate) {
+    if ($releaseTests.Count -eq 0) { throw 'Required Windows release gate is empty.' }
+    $buildTargets += 'windows_release_gate_tests'
+    $telemetryExclusions = @('--label-exclude', '^windows-release-gate$')
+  }
+  & cmake --build $build --config $Configuration --target $buildTargets --parallel 4
   if ($LASTEXITCODE -ne 0) { throw 'Native contract executables failed to build.' }
-  & ctest --test-dir $build -C $Configuration -L '^telemetry-minimization$' --output-on-failure --timeout 150
-  if ($LASTEXITCODE -ne 0) { throw 'Native telemetry contract failed; no release or deployment performed.' }
+  if ($IncludeReleaseGate) {
+    # Keep the original per-test release deadlines and sequential execution.
+    # Only a successful release gate permits excluding its tests below.
+    & ctest --test-dir $build -C $Configuration --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
+    if ($LASTEXITCODE -ne 0) { throw 'Native Windows release gate failed.' }
+  }
+  $remaining = @($telemetryTests | Where-Object { -not $IncludeReleaseGate -or $_.name -notin @($releaseTests.name) })
+  Write-Host ("Native gate selection: release={0} telemetry={1} telemetry_remaining={2}" -f $releaseTests.Count, $telemetryTests.Count, $remaining.Count)
+  # An empty remainder is legitimate only after all telemetry tests passed in
+  # the release gate. Standalone telemetry still runs its complete label.
+  if ($remaining.Count -gt 0) {
+    & ctest --test-dir $build -C $Configuration -L '^telemetry-minimization$' @telemetryExclusions --output-on-failure --no-tests=error --timeout 150
+    if ($LASTEXITCODE -ne 0) { throw 'Native telemetry contract failed; no release or deployment performed.' }
+  }
   Write-Output 'PASS: native synthetic contracts and loopback mTLS. This does not certify native sensor collection or execute real queue migration.'
 } finally {
   $env:PATH = $oldPath

@@ -250,10 +250,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
         if failing_executable:
             (source / "failure.c").write_text("int main(void) { return 23; }\n", encoding="utf-8")
         lines = ["cmake_minimum_required(VERSION 3.19)", "project(GateFixture C)", "enable_testing()",
+                 # Each executable must still be a distinct build dependency.
+                 # Its identical body need only be compiled once per fixture.
+                 "add_library(gate_fixture_success OBJECT main.c)",
                  "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)",
                  # This fixture tests scheduling with tiny executables; real
                  # canonical bytes are verified by the native product tests.
                  f"set(EDR_P0_TEST_CONFIG_AVAILABLE {'TRUE' if p0_inputs_available else 'FALSE'})"]
+        if failing_executable:
+            lines.append("add_library(gate_fixture_failure OBJECT failure.c)")
         # Preserve the logger declarations' order relative to the actual gate
         # include; a fixture must not hide an early production include.
         production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
@@ -265,8 +270,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
         for name, target in pairs:
             declarations = after_gate if name in late_loggers else lines
             if target != '""' and target != missing_target and target not in registered_targets:
-                executable_source = "failure.c" if target == failing_executable else "main.c"
-                declarations.append(f"add_executable({target} {executable_source})")
+                executable_object = ("gate_fixture_failure" if target == failing_executable
+                                     else "gate_fixture_success")
+                declarations.append(f"add_executable({target} $<TARGET_OBJECTS:{executable_object}>)")
                 registered_targets.add(target)
             if name != missing_test:
                 command = target if target != '""' else '"${CMAKE_COMMAND}" -E true'
@@ -438,11 +444,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
-                self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
+                # Full executable dependency coverage is exercised above for
+                # both generators. These commands are CMake -E false, so only
+                # the selected test's label and failure propagation are in scope.
                 for label in (LABEL, "^agent-runtime-gate$"):
                     result = self.run_command("ctest", "--test-dir", str(build), "-L", label,
-                                              "--parallel", "4", "--no-tests=error", "--output-on-failure", success=False)
+                                              "-R", f"^{name}$", "--no-tests=error", "--output-on-failure", success=False)
                     self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+                    self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout + result.stderr)
+                    self.assertNotIn("***Not Run", result.stdout + result.stderr)
 
     def test_installer_health_and_redaction_failures_block_windows_release(self):
         for name in ("windows_installer_health_behavior", "windows_installer_log_redaction",
@@ -450,10 +460,54 @@ class WindowsReleaseGateTests(unittest.TestCase):
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, failing_test=name)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
-                self.run_command("cmake", "--build", str(build), "--target", "windows_release_gate_tests", "--parallel", "2")
                 result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
-                                          "--parallel", "4", "--no-tests=error", "--output-on-failure", success=False)
+                                          "-R", f"^{name}$", "--no-tests=error", "--output-on-failure", success=False)
                 self.assertIn(name + " (Failed)", result.stdout + result.stderr)
+                self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout + result.stderr)
+                self.assertNotIn("***Not Run", result.stdout + result.stderr)
+
+    def test_release_and_remaining_telemetry_select_each_contract_once(self):
+        """Exercise CTest's label exclusion with observable execution counts."""
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            execution_log = source / "executed.txt"
+            (source / "record.cmake").write_text(
+                f'file(APPEND "{execution_log.as_posix()}" "${{NAME}}\\n")\n'
+                'if("$ENV{EDR_GATE_FIXTURE_FAIL}" STREQUAL "${NAME}")\n'
+                '  message(FATAL_ERROR "Injected ${NAME} failure")\n'
+                'endif()\n', encoding="utf-8")
+            lines = ["cmake_minimum_required(VERSION 3.19)",
+                     "project(LabelSelection NONE)", "enable_testing()"]
+            for name, labels in (
+                ("release_only", "windows-release-gate"),
+                ("shared", "windows-release-gate;telemetry-minimization"),
+                ("telemetry_only", "telemetry-minimization"),
+            ):
+                lines += [
+                    f'add_test(NAME {name} COMMAND "${{CMAKE_COMMAND}}" -DNAME={name} '
+                    f'-P "{(source / "record.cmake").as_posix()}")',
+                    f'set_tests_properties({name} PROPERTIES LABELS "{labels}")',
+                ]
+            (source / "CMakeLists.txt").write_text("\n".join(lines), encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            release = ("ctest", "--test-dir", str(build), "-L", LABEL,
+                       "--no-tests=error", "--output-on-failure")
+            remaining = ("ctest", "--test-dir", str(build), "-L", "^telemetry-minimization$",
+                         "-LE", LABEL, "--no-tests=error", "--output-on-failure")
+            for failure in ("", "release_only", "shared", "telemetry_only"):
+                with self.subTest(failure=failure):
+                    execution_log.unlink(missing_ok=True)
+                    env = os.environ.copy()
+                    env["EDR_GATE_FIXTURE_FAIL"] = failure
+                    self.run_command(*release, env=env,
+                                     success=failure not in ("release_only", "shared"))
+                    self.run_command(*remaining, env=env, success=failure != "telemetry_only")
+                    self.assertCountEqual(execution_log.read_text(encoding="utf-8").splitlines(),
+                                          ["release_only", "shared", "telemetry_only"])
+            # A misspelled label must not turn an omitted phase into success.
+            self.run_command("ctest", "--test-dir", str(build), "-L", "^missing-telemetry$",
+                             "-LE", LABEL, "--no-tests=error", success=False)
 
     def test_empty_selection_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -841,7 +895,11 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIsNotNone(probe_step)
             prefix_var = "VCPKG_INSTALLED_ROOT" if "release" in workflow else "VCPKG_INSTALLED_X64"
             self.assertIn('CMAKE_PREFIX_PATH: ${{ env.' + prefix_var + ' }}', probe_step[1])
-            self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
+            if workflow == "edr-agent-client-release.yml":
+                self.assertIn("& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs", source)
+                self.assertIn("$telemetryArgs.IncludeReleaseGate = $true", source)
+            else:
+                self.assertIn("ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'", source)
 
         source = (ROOT / ".github/workflows/edr-agent-ci.yml").read_text(encoding="utf-8")
         build_step = re.search(r'- name: Build\n(.*?)(?=\n      - name:)', source, re.DOTALL)
