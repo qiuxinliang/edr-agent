@@ -1,5 +1,141 @@
 # Cache reliability remediation
 
+## 2026-10-16 candidate 685: installed, evidence-store startup not accepted
+
+Runtime source is `1ba4e34cc0b656c7cc1d7d31fa19db20f5d84c2d`, branch
+`codex/rtq-result-delivery-pressure`, 28 commits after audit 662 and 19 after
+the requested comparison SHA. [CI run 38794126996](https://github.com/qiuxinliang/edr-agent/actions/runs/38794126996)
+completed successfully at 20:11:26 UTC on October 15. All seven jobs succeeded.
+The actual native Test-step intervals, excluding runner self-tests, contain
+100 release and 13 remaining telemetry cases per architecture, 113 unique:
+
+| Architecture | Release / remaining | CTest group durations |
+| --- | --- | --- |
+| AMD64 | 100/100, 13/13 | 334.09 s, 191.77 s |
+| ARM64 | 100/100, 13/13 | 480.54 s, 214.15 s |
+
+Both real Setup and separate runtime lifecycles passed 684 -> 685 -> 684.
+Conditional unsigned/USB skips remain skips. The Setup assertions do not
+independently measure its installed Agent SHA; the binary-hot lifecycle's
+installed hash is evidence for that separate path only. Complete decoded-LF
+job logs and step/skip audit are under
+`/private/tmp/edr-685-release-draft-5aw5euur/monitor/`; final audit SHA-256 is
+`cd06663b890bf9ab5abf206bb1f48a9994e0e53c74887ba9c7c68dce87af00c1`.
+
+Release `414191493`, tag `win_3.2.685`, is a candidate; GitHub latest remains
+591. Only the manifest, raw ARM64 Agent and Headless ZIP were downloaded and
+imported through the actual client. No Setup UI or separate Setup download was
+used. Headless pin `headless-artifact-pin.json`, SHA-256
+`6dfe4b85857d6f4ec74cbabf6f52768d656c4272f3696db75812a55948c666c8`,
+binds source, run, release, actual native gates, runtime closure and these files:
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Manifest | 2,367 | `19d737aea7862b408026fe76c8d5338de6d57b5390a25be98dc0f25db104f3f8` |
+| ARM64 Agent | 3,213,824 | `1bccb92f01b8aaafebb2803e74f1f6b73c472de213367ba60839f0b34c2c1307` |
+| Headless ZIP | 14,215,708 | `6944daa8204dafb064a4ba5aba9917cf44abce45e239bd23966ace65aa29c151` |
+
+The ZIP's embedded installer hash is
+`d0afeb21150bb122498cf364c1f5a14b4c8d4dc9298dec89c75002f47e020804`.
+The existing client created artifact `artifact_1792095336606925000` with no
+Setup UI binding. Exactly one UTM upgrade was submitted:
+task `agent_upgrade_1792095442526674000`, command
+`agent_update_1792095443218661000`, runtime package 244/hash
+`36db0124269b7fab0119b0dbc3d72f54718cf6768c89dfe0c03d0a06fa259a09`.
+It entered installation at 20:17:32.237 UTC and the backend task completed
+at 20:24:18.211 UTC, with no failure code. The observation configuration is
+300 seconds; recorded health_check_at 20:19:46.836 and deadline 20:24:16.836
+span 270 seconds. These fields do not independently attest 300 continuous
+healthy seconds.
+
+The installed `C:\Program Files\FDSecurity\FDSensor.exe` reports 3.2.685 and
+matches the exact raw Agent hash. Its new process is PID 3272, with guest CIM
+creation time `2026-10-15T20:19:16.9830310Z`. The existing scheduled-task owner
+and 512 MiB/72-hour queue and evidence overrides remain. Selected retention
+therefore also derives to 72 hours; this deployment did not shorten the recent
+window or promise a longer interval under arbitrary load. Guest creation,
+source-health clocks and backend receipt timestamps are distinct observations.
+
+The exact local journal is succeeded, scope-matched and stable during read;
+last event 6 has checkpoint ACK 6 with no policy hold. The task verifier ran
+with `--require-complete`, the fresh exact baseline, journal and invocation:
+`backend_and_local_upgrade_completion_verified=true`. Its result SHA-256 is
+`adb6128371094c65a287bc937d8258b07b6960456870f895988697063d804399`.
+This proves successful upgrade/event delivery, not every evidence capability.
+The earlier 684 failure's cause remains unresolved: one later success after
+diagnostic changes, prelaunch hash I/O and a different load/time is not a
+controlled causal repair of that historical failure.
+
+Two new 685/PID3272 health reports have increasing backend receipt times
+20:20:17.277 -> 20:24:17.829 UTC, connected/leased control stream, P0 ready and
+artifact healthy. The signed policy receipt is verified/applied at version
+528 with matching desired/reported hash. Original three queue owners retain
+identical sampled immutable fields and ACK flags. Ledger categories are
+exactly 0..8, each matching recomputed bytes/rows, with zero invalid costs;
+the sampled sum is 122,552,867 bytes / 70,167 rows. Independent summary SHA-256:
+`53abe48e95a4b7722d1c657df7b48be27f6e27a24f45746f14dfb91a54ba2d0b`.
+The original two missing candidate samples are not replaced or certified.
+
+**Overall evidence-store acceptance is still false.** Both health reports
+show `db_open=false`, `physical_guard_failures=1`, cause 2, and all five
+observed candidate admissions refused. The main evidence file is 523,784,192
+bytes, sampled DB/WAL/SHM total 529,275,992 bytes. Near-budget occupancy alone
+does not explain or excuse failed opening; retention counters initialized
+before successful opening do not prove an empty legacy inventory.
+
+The launcher's inherited startup stderr was read within bounds and was empty.
+Current source redirects diagnostics to configured `logs/agent.log` before
+subsystem initialization. A second exact-path/new-process check read only its
+first/last 64 KiB and emitted fixed classifications, no raw lines: one
+`physical startup index accounting failed or exceeded 10s; existing cache preserved`.
+The log was stable during that read; result SHA-256 is
+`5e4fe09d19aa733fa320845cabf7214d76257f243de95e7a8a17252994877522`.
+That combined error does not distinguish prepare/bind/step/type/allocation
+failure from the ten-second progress deadline. No timeout increase, real-cache
+cleanup or speculative runtime patch follows from it.
+
+A separate 8-second read-only schema/EXPLAIN diagnostic found 16 missing
+declared indexes; all generated inventory SELECTs prepared successfully with
+guest Python SQLite 3.49.1, without executing any row-data query. It completed
+in 46 ms internally and preserved the DB's identity/size/mtime; result SHA-256
+`c35a6a5e81109f19cf0156db087f164cf06e7fdd26268d65e2f4ce55205f1adc`.
+This does not certify the Agent's linked SQLite or actual aggregate execution.
+An isolated replay of the production startup inventory remains required.
+
+The old C# command probe returned a generic parse/read failure. Its strict
+UTF-8 decoder runs before command filtering, so unrelated old invalid UTF-8
+can abort it; that output alone cannot prove the actual exception. A new
+fixed-command diagnostic, tested with 27 synthetic cases, reads bytes first
+and strictly validates matching JSON only. One 15 ms read found the exact
+upgrade final, success/exit0/PID3272, pending0/held0 and stable owner metadata;
+only status, lengths and hashes were exported. It neither repairs nor
+certifies unrelated legacy rows. The existing generic backend-result verifier
+found zero rows for this command; its original `accepted=false` result remains.
+Source review of both 673 and 1ba confirms that this direct-UI agent_update
+task uses the dedicated journal/event consumer. `command_should_report()`
+requires SOAR/playbook association, an explicit environment opt-in or a cmd_
+prefix; ordinary agent_update_ dispatch does not request generic reporting.
+After terminal journal/checkpoint recovery, `soar_emit_ex_policy()` may write
+the local final with pending0 directly, without mark_reported. Backend
+`PostAgentUpgradeEvent()` / `ApplyEvent()` commits the corresponding
+agent_upgrade_events/task transaction before accepted=true and does not write
+endpoint_command_results. Thus the generic-table verifier is inapplicable to
+this task; its zero rows are not evidence of false ACK or loss. The specialized
+require-complete correlation above is the applicable successful consumer
+boundary. General RTQ/result delivery remains a separate acceptance item.
+
+The closed backend-receipt metadata window 20:20:17.277 -> 20:29:00 UTC
+contains zero batches/jobs/events and one unrelated isolate_status result,
+without truncation or hash mismatch. No payload/detail was retrieved; wire
+verification and negative-wire claims remain false. Admission generation is
+unclassified and may represent old frozen backlog. This is not proof of
+current encoding, useful event delivery or actual wire minimization. Its raw
+metadata summary SHA-256 is
+`b4655068c477a3e720ab591aa042c7480d1c3577f136cc882f0e96b6d8156ad9`.
+All scoped client evidence and first diagnostic failures remain under
+`/private/tmp/edr-678-client-acceptance/`. No RTQ or second upgrade has been
+issued after this 685 deployment; evidence-store startup is the active blocker.
+
 ## 2026-10-16 inventory failure classification: diagnostic change
 
 The direct native CLI, Guard launcher, current SYSTEM-task and isolated
@@ -99,6 +235,98 @@ The PowerShell result is `ps-run.json`, SHA-256
 Independent review verified the source/cleanup boundaries and raw result
 identities. These are emulated AMD64 diagnostics on ARM64 Windows, separate
 from the forthcoming native MSVC gates and installed-client acceptance.
+
+## 2026-10-16 final-source retention comparison
+
+The original comparison predates later queue/evidence edits. Both existing
+protocols were therefore executed once again against clean source
+`1ba4e34cc0b656c7cc1d7d31fa19db20f5d84c2d`, without changing inputs, budgets,
+assertions or older artifacts. All 1,068 tracked source/header files in the
+current snapshot matched that commit and the working tree byte-for-byte;
+actual linked C inputs and the freshly checked codec dependency set matched.
+One copied, untracked generated Python file was unused by C compilation.
+
+The evidence comparison uses the same 8 MiB budget, one-hour recent target,
+192 candidates and 48 low-severity context facts over eight simulated hourly
+bursts. Each variant has five fresh samples; medians are:
+
+| Metric | Old 673, selected 1 h | Current, selected 1 h | Current, selected 4 h |
+| --- | ---: | ---: | ---: |
+| Selected evidence | 6 | 6 | 24 |
+| Parent chain complete inside retained manifest | 0/6 | 6/6 | 24/24 |
+| Reconstructable with manifest or process cache | 6/6 | 6/6 | 24/24 |
+| Actual selected-event timestamp span | 20 s | 20 s | 10,820 s |
+| Sampled DB + WAL + SHM peak | 2,305,312 B | 3,272,648 B | 3,379,192 B |
+| Final pre-close DB + WAL + SHM | 2,251,752 B | 677,048 B | 791,832 B |
+| Process CPU | 0.159455 s | 0.285535 s | 0.279193 s |
+| SQLite VFS issued writes | 17,364,348 B | 31,429,500 B | 28,981,320 B |
+
+The old version's missing manifest links do not mean all chains were lost:
+the process cache could reconstruct its six retained parent bindings. The new
+four-hour selection retains 24 self-contained bindings and measured timestamps
+span three hours and 20 seconds under the hourly-burst input. This is one known
+parent generation/name per candidate, not proof of arbitrary attack-chain
+completeness or continuous sampling. Four hours is an explicit test setting,
+not an unbounded-load promise or a change to the UTM's 72-hour overrides.
+
+The increased value has measured cost. Current four-hour CPU is 75.092% higher,
+issued VFS writes 66.901% higher and sampled physical peak 46.583% higher than
+old one-hour retention; final pre-close physical sum is 64.835% lower. The
+current one-hour costs are also recorded above. These regressions are not
+presented as a storage/CPU optimization.
+
+The queue comparison uses the same real protobuf BAT1 input stream: 48 unique
+128 KiB records over 12 simulated windows, a one-hour target and a 1 MiB logical
+budget. The old queue implementation is audit 662, sharing the current codec,
+time utility, ACK parser and other headers; this is not an old-Agent binary
+performance comparison.
+
+| Queue metric | Audit 662 | Current |
+| --- | ---: | ---: |
+| Total admitted / refused | 7 / 41 | 36 / 12 |
+| Final-window admitted / refused | 0 / 4 | 3 / 1 |
+| Retained rows / valid embedded parent fields | 7 / 7 | 3 / 3 |
+| Retained event timestamp span | 3,721 s | 120 s |
+| Latest retained event age | 36,070 s | 60 s |
+| Sampled DB + WAL + SHM peak | 1,890,896 B | 4,956,096 B |
+| User + system CPU | 0.140968 s | 0.314808 s |
+| SQLite total_changes proxy | 106 | 347 |
+| 20-byte terminal admitted / exact readback | no / no | yes / yes |
+| Source upload calls | 0 | 0 |
+
+Current rotation sustains three admissions and one explicit refusal per window;
+it retains a shorter but fresh interval rather than old frozen inventory.
+Critical reserve admits the exact 20-byte terminal without sending local facts
+or fabricating ACK. This embedded-parent-field check is not a traversal of
+separate parent entities. CPU is 123.319% higher and sampled physical peak
+162.103% higher. The 1 MiB logical budget is plainly not a physical hard cap.
+
+Commands, compiler flags, complete source snapshots, library identities,
+per-run raw stdout/stderr and checksum index are under
+`/private/tmp/edr-evidence-685-33286iba/`, with `SUMMARY.txt` SHA-256
+`8b79eadb23355b8c9393e0a3bbf2c3390f395e0e0352ef4db8bc0daef85f5a54`
+and `RESULTS.json` SHA-256
+`2020c633c4a2a430466eb8b6359b389034c3438da40468764515aecc6d5966f3`.
+Actual commands were:
+
+```sh
+cmake --build /private/tmp/edr-cache-assessment-egress-build --target edr_egress_policy --verbose
+python3 tests/run_evidence_retention_comparison.py --output /private/tmp/edr-evidence-685-33286iba/evidence --baseline 6bedb86bf9811bc304f4c97fdd62212ef437423f --runs 5
+python3 tests/run_queue_retention_comparison.py --output /private/tmp/edr-evidence-685-33286iba/queue --codec-build /private/tmp/edr-cache-assessment-egress-build
+```
+
+All exited zero; the protocols ran sequentially. These are macOS test/debug
+compilations without release optimization, synthetic clocks/inputs and real
+storage/codec code with declared unrelated action/network substitutes. The
+unchanged harness version macro is 3.2.642, not the source/release identity.
+VFS bytes measure issued SQLite I/O, not device writes; queue OS block counters
+are zero/unavailable and total_changes is a mutation-count proxy. Evidence
+CPU excludes later reconstruction queries; queue CPU includes fixture queries.
+Physical sums are samples, not continuous peaks, allocated blocks or the whole
+Agent directory. The evidence fixture records the DB/WAL/SHM sum rather than
+separate component values; queue endpoint components and total_changes are
+sampled before the terminal insertion. No Windows production-performance claim
+follows.
 
 ## 2026-10-16 candidate 684: queued inventory release acceptance
 
@@ -1901,7 +2129,7 @@ releases and benchmark revisions remain historical evidence, not overwritten pas
 | Required acceptance | Implemented and exercised contract | Remaining consumer closure / limits |
 | --- | --- | --- |
 | 1. Sustainable rotation, retained causality | Same-input queue comparison covers 12 virtual windows without full-fact delivery; evidence comparison covers 8 virtual hours with exact-generation causal groups. Current retention contracts passed native AMD64 and ARM64 in 684. | Sustained operation of the installed new client remains unverified. Retention targets depend on workload and protected inventory. |
-| 2. Same-budget comparison | Frozen baseline/current sources and identical encoded inputs compare retained time ranges, chain completeness, sampled DB/WAL/SHM, CPU and issued VFS writes. | These are the recorded benchmark revisions, not a new performance measurement of b7c8. Physical-device I/O and production throughput are unverified. |
+| 2. Same-budget comparison | The final-source 1ba4e34 comparison above reruns the unchanged protocols and identical encoded inputs, measuring retained time ranges, chain completeness, sampled DB/WAL/SHM, CPU and issued VFS writes. Increased CPU, issued writes and physical peaks are explicit. | These are macOS synthetic/debug measurements. Native Windows performance, physical-device I/O and production throughput are unverified. |
 | 3. Critical reserve | Real queue/SQLite tests fill ordinary local inventory exactly, admit terminal/journal owners, reject finite critical exhaustion and freeze previously reserved results. Both 684 native gates passed. | Queue fixture codec/transport are stubs; installed new-client admission/health remains unverified. This is a logical reserve, not physical block reservation. |
 | 4. 20-byte terminal | The original 20-byte regression passes with ordinary inventory exactly full, original local bytes retained, no source uploads and no fabricated ACKs. Both 684 native gates passed. | Critical capacity remains finite. No real-cache pressure experiment is claimed. |
 | 5. Result budget | Real evidence SQLite tests cover insert, expansion, 1,000 serial attempts, four writer threads, busy and COMMIT failure; rejection returns explicit outcomes. Separate authoritative-owner tests cover reserved completion and capacity refusal. Both 684 native gates passed. | These are separate fixtures: command-state/egress tests stub the optional SQLite query copy. Installed-client necessary-result persistence and server receipt remain unverified. |
