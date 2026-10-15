@@ -122,7 +122,7 @@ jobs:
           python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography AESGCM ready')"
       - name: Install build tools
         shell: pwsh
-        run: choco install ninja innosetup -y --no-progress
+        run: .\scripts\Ensure-WindowsBuildTools.ps1
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |

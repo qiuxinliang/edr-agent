@@ -265,6 +265,7 @@ jobs:
           python tests/test_windows_release_workflow.py
           if ($LASTEXITCODE -ne 0) { throw 'Release workflow contract failed' }
           & .\tests\test_native_gate_runner.ps1
+          & .\tests\test_windows_build_tools.ps1
       - name: Verify USB response integrity regressions
         if: steps.resume.outputs.restored != 'true'
         shell: powershell
@@ -404,7 +405,7 @@ jobs:
       - name: Install build tools
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
-        run: choco install ninja innosetup -y --no-progress
+        run: .\scripts\Ensure-WindowsBuildTools.ps1
       - name: Verify native silent installer failure returns diagnostics
         if: steps.resume.outputs.restored != 'true'
         shell: powershell

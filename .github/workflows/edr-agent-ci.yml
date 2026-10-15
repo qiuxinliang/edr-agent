@@ -142,7 +142,7 @@ jobs:
           key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
       - name: Install Ninja
         shell: pwsh
-        run: choco install ninja -y --no-progress
+        run: .\scripts\Ensure-WindowsBuildTools.ps1 -NinjaOnly
       - name: Configure (vcpkg HTTPS + SQLite + YARA, no gRPC, Ninja)
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg

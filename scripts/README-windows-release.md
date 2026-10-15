@@ -76,6 +76,15 @@ The prepare job runs checkpoint behavior, workflow wiring, and the portable
 The same packaging contract remains in the Windows CTest gate. This catches
 workflow/helper contract drift early without replacing native validation.
 
+Release and client builds use `scripts/Ensure-WindowsBuildTools.ps1` to reuse
+working runner tools. It dry-runs a Ninja 1.10 graph and compiles an output-free
+Inno Setup 6 probe with the installer's `x64os`/`arm64` architecture expressions
+and modern wizard. Inno is checked at the same default path used by the packaging
+script. CI uses `-NinjaOnly` because it does not package an installer. Each failed
+probe permits one Chocolatey install of that tool, followed by the same probe;
+installation failure or an unusable result terminates with a diagnostic. There
+is no upgrade command, unconditional reinstall, or unbounded repair loop.
+
 The release **Test** step invokes
 `tests/run_telemetry_windows_native.ps1 -BuildDir build -Configuration Release -IncludeReleaseGate`
 on each native architecture. The runner builds both gate targets, clears inherited
@@ -153,6 +162,34 @@ on both Windows architectures and parses both runner scripts with Windows
 PowerShell 5.1 before building. A new Windows run is still required to measure
 the actual MSVC build and end-to-end improvement. Native installer lifecycle,
 trust, signatures, immutable checkpoints, and publication gates remain required.
+
+Follow-up (2026-10-16): four small test-only object groups reuse identical cJSON,
+SHA256, detection, and AVE codec compile variants across 23 consumers. Comparing
+compiler, definitions, ordered includes, and options against the previous graph
+verified 47 fewer compilations overall and 31 fewer in the runtime/telemetry gate
+union. Product and P0/mutex/injected variants remain separate. The new socket
+contract adds one compilation, making that host gate union 578 -> 548.
+
+The four packaging CTests now receive a deliberately foreign `PSModulePath`
+before their existing launcher removes it. The launcher regression verifies the
+configured environment and both isolation controls; Windows runs each real
+packaging test once in its native gate. Logger failure fixtures build and select
+only the two logger owners; complete dependency closure still runs with both
+Ninja generators.
+
+The HTTP socket owner also monitors `exceptfds`: Winsock signals refused
+nonblocking connections there, so a refused address no longer needs to consume
+the full connection timeout before trying the next address. Success still
+requires write readiness and a zero `SO_ERROR`. The same private implementation
+is exercised by deterministic socket error/timeout controls and real loopback
+success/refusal tests, now included in the runtime and Windows release gates.
+
+Follow-up validation: all 23 affected object-consumer tests, the complete fixture
+dependency checks for both generators, packaging/logger regressions, and all
+three real mTLS fixtures passed locally. Removing exception monitoring again
+fails the socket regression. Its Windows branch compiles and links with MinGW
+under `-Wall -Wextra -Werror`. These checks used macOS Debug/non-production P0
+stub, not native Windows/MSVC; the Windows timing benefit remains unmeasured.
 
 ## Windows rule validation
 

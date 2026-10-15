@@ -51,7 +51,7 @@ RUNTIME_EXPECTED = {
     "storage_physical_guard", "storage_space_preflight", "shell_session_stream_completeness",
     "authorized_local_query_contract", "evidence_startup_index_manifest",
     "installer_runtime_health_classification", "report_events_ack_contract",
-    "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "command_result_json_contract",
+    "command_inbox_persistence", "command_upload_outbox_recovery", "request_signing", "http_retry_contract", "socket_connect_timeout_contract", "command_result_json_contract",
     "event_bus_wait_and_mpmc", "event_batch_max_age", "response_capability_manifest_contract",
     "transport_durable_owner", "transport_v2_status_capacity", "ave_sdk_smoke",
     "ave_parent_integrity",
@@ -128,7 +128,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
         return result
 
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
-        """Exercise the actual CTest launch boundary; run the fixtures on Windows."""
+        """Exercise the launcher; the native gate runs each packaging fixture."""
         names = ("windows_release_collector_pe_closure",
                  "windows_inplace_collector_transaction",
                  "windows_installer_log_redaction", "windows_update_physical_guard")
@@ -143,22 +143,20 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 "${CMAKE_CURRENT_SOURCE_DIR}", (ROOT / "tests").as_posix()).replace(
                 "${CMAKE_SOURCE_DIR}", ROOT.as_posix()))
 
-        # Carry the production deadlines into the fixture as well as commands.
+        # Carry the production deadline and polluted environment into the probe.
         properties = re.search(
             r"  set_tests_properties\(\s*windows_release_collector_pe_closure\s*"
             r"windows_inplace_collector_transaction\s*windows_installer_log_redaction\s*"
             r"windows_update_physical_guard\s*"
-            r"PROPERTIES TIMEOUT \d+\)", definitions)
+            r"PROPERTIES TIMEOUT \d+[^)]*\)", definitions)
         self.assertIsNotNone(properties)
         declarations.append(properties.group(0))
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
             build = source / "build"
-            foreign_modules = source / "foreign modules"
-            foreign_modules.mkdir()
-            inherited = os.environ.copy()
-            inherited["PSModulePath"] = str(foreign_modules)
+            foreign_modules = build / "foreign-powershell-modules"
+            foreign_modules.mkdir(parents=True)
             (source / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\n"
                 "project(packaging_launch_boundary NONE)\nenable_testing()\n"
@@ -170,17 +168,23 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertEqual({test["name"] for test in tests}, set(names))
             probe = [sys.executable, "-c",
                      "import os; assert 'PSModulePath' not in os.environ"]
-            # Negative control: the intermediate process inherits the foreign path.
-            self.run_command(*probe, success=False, env=inherited)
             for test in tests:
-                command = test["command"]
-                host_index = command.index("powershell.exe")
-                # Execute the real wrapper on every host, without simulating Windows.
-                self.run_command(*command[:host_index], *probe, env=inherited)
-            if os.name == "nt":
-                self.run_command("ctest", "--test-dir", str(build),
-                                 "--output-on-failure", env=inherited, timeout=150)
-            self.assertEqual(inherited["PSModulePath"], str(foreign_modules))
+                with self.subTest(test=test["name"]):
+                    properties = {item["name"]: item["value"] for item in test["properties"]}
+                    test_env = dict(value.split("=", 1) for value in properties["ENVIRONMENT"])
+                    self.assertTrue(Path(test_env["PSModulePath"]).samefile(foreign_modules))
+                    inherited = os.environ.copy()
+                    inherited.update(test_env)
+                    command = test["command"]
+                    host_index = command.index("powershell.exe")
+                    wrapper = command[:host_index]
+                    self.assertIn("--unset=PSModulePath", wrapper)
+                    # Removing isolation must expose the production CTest's
+                    # polluted input; the unchanged wrapper must remove it.
+                    self.run_command(*(arg for arg in wrapper if arg != "--unset=PSModulePath"),
+                                     *probe, success=False, env=inherited)
+                    self.run_command(*wrapper, *probe, env=inherited)
+                    self.assertEqual(inherited["PSModulePath"], test_env["PSModulePath"])
 
     def test_sqlite_header_relocation_includes_vcpkg_companion(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -373,39 +377,41 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIn("Windows release gate executable target is missing", result.stderr)
 
     def test_logger_executables_are_built_and_failures_block_windows_release(self):
+        logger_pattern = "^(" + "|".join(map(re.escape, LOGGER_OWNERS)) + ")$"
         for name, target in LOGGER_OWNERS.items():
             with self.subTest(test=name), tempfile.TemporaryDirectory() as directory:
-                source, build, pairs = self.fixture(directory, failing_executable=target)
+                source, build, _ = self.fixture(directory, failing_executable=target)
                 self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja",
                                  "-DCMAKE_BUILD_TYPE=Release")
-                # Reproduce the release regression: build every other selected
-                # executable, leaving both logger owners absent.
-                other_targets = sorted({executable for _, executable in pairs
-                                        if executable != '""' and executable not in LOGGER_OWNERS.values()})
-                self.run_command("cmake", "--build", str(build), "--config", "Release",
-                                 "--target", *other_targets, "--parallel", "2")
+                # Both generators' complete dependency closure is checked above.
+                # Isolate the logger regression here so unrelated executables
+                # neither mask missing loggers nor repeat the full gate build.
                 missing = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
-                                           "-L", LABEL, "--no-tests=error", success=False)
+                                           "-L", LABEL, "-R", logger_pattern,
+                                           "--no-tests=error", success=False)
                 self.assertEqual(missing.stdout.count("***Not Run"), 2,
                                  missing.stdout + missing.stderr)
                 for owner in LOGGER_OWNERS:
                     self.assertIn(owner + " (Not Run)", missing.stdout + missing.stderr)
 
                 self.run_command("cmake", "--build", str(build), "--config", "Release",
-                                 "--target", "windows_release_gate_tests", "--parallel", "2")
+                                 "--target", *LOGGER_OWNERS.values(), "--parallel", "2")
                 listing = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
-                                           "-L", LABEL, "--show-only=json-v1")
+                                           "-L", LABEL, "-R", logger_pattern, "--show-only=json-v1")
                 selected = {test["name"]: test for test in json.loads(listing.stdout)["tests"]}
+                self.assertEqual(set(selected), set(LOGGER_OWNERS))
                 for owner, executable in LOGGER_OWNERS.items():
                     command = selected[owner]["command"]
                     self.assertTrue(Path(command[0]).is_file(), command)
                     self.assertEqual(Path(command[0]).stem, executable)
                 result = self.run_command("ctest", "--test-dir", str(build), "-C", "Release",
-                                          "-L", LABEL, "--no-tests=error", "--output-on-failure",
+                                          "-L", LABEL, "-R", logger_pattern,
+                                          "--no-tests=error", "--output-on-failure",
                                           success=False)
                 failed = re.findall(r"^\s*\d+ - (\w+) \(Failed\)(?:[ \t]+.*)?$",
                                     result.stdout, re.MULTILINE)
                 self.assertEqual(failed, [name], result.stdout + result.stderr)
+                self.assertIn("50% tests passed, 1 tests failed out of 2", result.stdout + result.stderr)
                 self.assertNotIn("***Not Run", result.stdout + result.stderr)
 
     def test_missing_registration_fails_at_configuration(self):

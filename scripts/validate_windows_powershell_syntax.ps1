@@ -14,6 +14,8 @@ $relativePaths = @(
   "scripts\validate_windows_powershell_syntax.ps1",
   "scripts\Validate-DependencyLocks.ps1",
   "scripts\Restore-SetupUiLocked.ps1",
+  "scripts\Ensure-WindowsBuildTools.ps1",
+  "tests\test_windows_build_tools.ps1",
   "scripts\checkout_private_p0_inputs.ps1",
   "tests\test_private_p0_checkout.ps1",
   "tests\run_telemetry_windows_native.ps1",

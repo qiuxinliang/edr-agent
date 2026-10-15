@@ -259,12 +259,15 @@ if(WIN32)
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_storage_space_preflight.ps1' -Raw -Encoding UTF8))) -PreflightExe '$<TARGET_FILE:edr_agent>'")
   set_tests_properties(windows_storage_space_preflight PROPERTIES TIMEOUT 90)
+  # Exercise isolation in the native gate itself, without rerunning these
+  # packaging fixtures inside the build-dependency probe.
   set_tests_properties(
     windows_release_collector_pe_closure
     windows_inplace_collector_transaction
     windows_installer_log_redaction
     windows_update_physical_guard
-    PROPERTIES TIMEOUT 60)
+    PROPERTIES TIMEOUT 60
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")
@@ -685,6 +688,15 @@ add_executable(test_http_budget ${CMAKE_CURRENT_SOURCE_DIR}/test_http_budget.c)
 target_include_directories(test_http_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/transport)
 edr_apply_test_warnings(test_http_budget)
 add_test(NAME http_telemetry_budget COMMAND test_http_budget)
+
+add_executable(test_socket_connect ${CMAKE_CURRENT_SOURCE_DIR}/test_socket_connect.c)
+target_include_directories(test_socket_connect PRIVATE ${CMAKE_SOURCE_DIR}/src/transport)
+if(WIN32)
+  target_link_libraries(test_socket_connect PRIVATE ws2_32)
+endif()
+edr_apply_test_warnings(test_socket_connect)
+add_test(NAME socket_connect_timeout_contract COMMAND test_socket_connect)
+set_tests_properties(socket_connect_timeout_contract PROPERTIES TIMEOUT 20)
 
 add_executable(test_yara_delivery_contract ${CMAKE_CURRENT_SOURCE_DIR}/test_yara_delivery_contract.c)
 edr_apply_test_warnings(test_yara_delivery_contract)
@@ -2239,6 +2251,58 @@ edr_apply_test_warnings(storage_space_preflight_client)
 add_test(NAME storage_space_preflight COMMAND ${Python3_EXECUTABLE} -B
   ${CMAKE_SOURCE_DIR}/tests/test_storage_space_preflight.py --client $<TARGET_FILE:storage_space_preflight_client>)
 set_tests_properties(storage_space_preflight PROPERTIES TIMEOUT 60)
+
+# Reuse only the explicitly matched test compile variants below. Consumers
+# retain their own include/definition/link contracts; TARGET_OBJECTS adds no
+# usage requirements. Product, P0, mutex and storage-injection variants remain
+# independently compiled, and every shared object keeps test assertions on.
+add_library(edr_test_cjson OBJECT ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+add_library(edr_test_sha256 OBJECT ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+add_library(edr_test_detection_common OBJECT
+  ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_record.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
+  ${CMAKE_SOURCE_DIR}/src/detection/policy_v2.c)
+foreach(_shared_test_target edr_test_cjson edr_test_sha256 edr_test_detection_common)
+  target_include_directories(${_shared_test_target} PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  edr_apply_test_warnings(${_shared_test_target})
+endforeach()
+
+add_library(edr_test_ave_codec OBJECT
+  ${CMAKE_SOURCE_DIR}/src/serialize/behavior_proto.c
+  ${CMAKE_SOURCE_DIR}/src/proto/edr/v1/event.pb.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_common.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_encode.c
+  ${CMAKE_SOURCE_DIR}/third_party/nanopb/pb_decode.c)
+target_link_libraries(edr_test_ave_codec PRIVATE edr_ave_test_common)
+edr_apply_test_warnings(edr_test_ave_codec)
+
+set(edr_test_cjson_consumers
+  test_response_capability_manifest test_shell_policy test_response_forensic_paths
+  test_command_contract test_rtq_collectors test_telemetry_admission
+  test_command_result_json test_attack_surface_inventory_policy test_security_policy_linux
+  test_detection_decision test_detection_regression test_detection_sensor_bridge
+  test_p0_deferred_snapshot test_collection_admission
+  test_forensic_result_contract test_collector_health_json test_health_upload
+  test_report_events_ack test_attack_surface_groups)
+set(edr_test_sha256_consumers
+  test_rtq_collectors test_collection_admission test_report_events_ack)
+set(edr_test_detection_common_consumers
+  test_telemetry_admission test_detection_decision test_detection_regression test_detection_sensor_bridge)
+set(edr_test_ave_codec_consumers
+  test_behavior_record_alert_proto test_ave_parent_integrity test_ave_sdk test_ave_pipeline)
+foreach(_shared_test_target edr_test_cjson edr_test_sha256 edr_test_detection_common edr_test_ave_codec)
+  get_target_property(_shared_test_sources ${_shared_test_target} SOURCES)
+  foreach(_consumer IN LISTS ${_shared_test_target}_consumers)
+    if(TARGET ${_consumer})
+      get_target_property(_consumer_sources ${_consumer} SOURCES)
+      list(REMOVE_ITEM _consumer_sources ${_shared_test_sources})
+      set_property(TARGET ${_consumer} PROPERTY SOURCES ${_consumer_sources})
+      target_sources(${_consumer} PRIVATE $<TARGET_OBJECTS:${_shared_test_target}>)
+    endif()
+  endforeach()
+endforeach()
 
 # Gate declarations require the complete test/target graph before binding
 # their build dependencies and labels, including the periodic/runtime owners.
