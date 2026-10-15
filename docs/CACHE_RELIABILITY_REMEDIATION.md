@@ -1,5 +1,81 @@
 # Cache reliability remediation
 
+## 2026-10-15 candidate 682: Headless validation, live inventory-lock refusal
+
+Source `4aee784a6bcbe8d1f309e1c3b4d662f5eb9cea0a` was committed and pushed to
+`codex/rtq-result-delivery-pressure`: 21 commits after audit 662, 12 after
+comparison `3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`. Native release
+[run 38742901613](https://github.com/qiuxinliang/edr-agent/actions/runs/38742901613)
+passed all seven jobs on its first attempt. AMD64 runtime passed 99/99 in
+317.97 s and standalone telemetry 38/38 in 451.19 s; ARM64 passed 99/99 in
+480.58 s and 38/38 in 477.75 s. These labels overlap. Both native installer
+and embedded-updater lifecycle jobs passed, but their upgrade/rollback
+baseline was 679, not the live endpoint's 673. Optional signing and formal
+non-candidate publication were skipped, not passed. Synthetic telemetry and
+loopback mTLS do not prove real sensor coverage or endpoint queue migration.
+More specifically, the direct Setup lifecycle upgraded 679 to 682; the other
+runtime lifecycle used the candidate updater with `binary_hot` and checked
+embedded-script materialization. Neither exercised the live 673 embedded
+updater's `installer_required` route with its active command owner. Changing
+only the candidate updater would not change that old updater's first hop.
+
+Release `win_3.2.682` (413844804) is a candidate prerelease, pinned to that
+source and P0 `896eb2f06c9ffa608085217d4d1e84494b43e564`. GitHub latest remained
+`win_3.2.591` (403052409) before and after artifact verification. Full CI logs
+are `/private/tmp/edr-682-release-run-nnqsguly/raw-logs.zip`, CRC verified,
+SHA-256 `16ba674adbea5a2871a20717837b6a4df933b4f5e6a31b0b44d6a85ce292697d`.
+
+At the user's instruction the optional Setup UI transfer was stopped; its
+incomplete bytes and failed-transfer records remain separate. It was not
+resumed or imported. The completed acceptance verified only the ARM64 binary,
+artifact manifest and Headless ZIP, including ZIP CRC/path checks, native PE,
+23 runtime components, runtime identity and the embedded full installer.
+Headless still legitimately contains the installer required for this upgrade
+class; it does not require the separate Setup UI package. Binary SHA-256 is
+`560d28d01a3c38bbb48fe3faf0c38b43f3633d2a8918b0cd660898d3b0d20302`;
+Headless ZIP SHA-256 is
+`8356f0f7fca37ebe845b5914e2c05c62d78fd871e3f4c5b928feec458688dafc`.
+`/private/tmp/edr-682-release-verification/headless-artifact-pin.json` records
+the exact scope; it is not a successful five-asset verification.
+
+The client imported those three files as `artifact_1792076398357833000`, with
+Setup UI unbound, and queued only the authorized UTM endpoint at 15:04:24 UTC.
+Task `agent_upgrade_1792076664225887000` / command
+`agent_update_1792076665090123000` reached verified and installing, then failed
+at 15:05:16.726 UTC with `full_installer_rollback_completed`. All five event
+identity pins match; no new-version health observation occurred. No retry was
+made. The exact task-bound 4,096-byte redacted diagnostic contains
+`stage=child_exit; exit_code=7; reason=owner_lock_timeout`, followed by the
+storage-preflight refusal. This directly identifies the child inventory lock
+timeout for this attempt. The outer Setup exit 7 and coarse
+`INSTALL_BASELINE_UNSUPPORTED` classifier are different facts; neither proves
+a damaged baseline. The bounded classifier exported fixed codes and hashes,
+not raw log lines, configuration or owner contents.
+
+At 15:14:31 UTC the actual process was PID 7600, started 15:04:49.361294 UTC,
+running 673 at the original installation path with binary SHA-256
+`9641df3791f7c1f42fe98ecdce75e44f664ca94e60eb97f3d18a7882054163ca`.
+Its exact upgrade journal is `failed_rolled_back`, `succeeded=false`, with
+`last_event_seq=acked.seq=5` and no policy hold. This is acknowledged delivery
+of the failed-upgrade event, not upgrade success or command-result ACK.
+One post-failure cache probe retained all three sampled frozen queue owners
+against both the immediate 682 baseline and the original 679 baseline, with
+no changed bytes, dropped owner or ACK transition. Nine-category accounting
+remains unverified because the running 673 schema does not support it. The
+two missing old candidate samples were not replaced or resampled.
+
+Evidence is under `/private/tmp/edr-678-client-acceptance/`:
+`upgrade-682-task-current-01.json`, `upgrade-682-failure-selected.json`,
+`upgrade-682-installer-rejection.json`, `postfailure-682-summary.json` and
+`upgrade-682-rolled-back.png`. The 682 diagnostic log SHA-256 is
+`268bdaf369f6e34b78387d63a017231a0d75e3960c5eeb27af73e8c2c93675fa`.
+Source review finds identical 673/682 runtime lock open/release logic and the
+same exclusive byte range as inventory. The timeout alone cannot distinguish
+a long critical section, repeated competition or an unreleased lock, and
+does not identify the holder. Runtime full-owner scans and installer/runtime
+coordination remain under investigation. Raising the timeout or repeating
+the deployment is not an established repair.
+
 ## 2026-10-15 post-681 validation: exact boundary and existing-owner updates
 
 An independent synthetic fixture reproduced the 681 strict-boundary assertion
