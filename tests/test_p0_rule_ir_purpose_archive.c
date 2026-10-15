@@ -29,19 +29,49 @@ static unsigned char *read_bytes(const char *path,size_t *size){FILE *f=fopen(pa
 static int retained_projection_owner(const char *rule,const char *sha,uint64_t fields,const char *operation,void *user) {
  (void)user;return edr_p0_rule_ir_projection_matches(rule,sha,fields,operation);
 }
-static void current_consumer_projection_contract(void) {
- static const struct {const char *rule,*name,*path,*command;} cases[]={
-  {"R-EXEC-002","powershell.exe","C:\\Windows\\System32\\powershell.exe","powershell.exe -w hidden -nop"},
-  {"R-SIGN-001","signtool.exe","C:\\Tools\\signtool.exe","signtool.exe sign C:\\Temp\\sample.exe"},
-  {"R-MITRE-WIN-T1044","icacls.exe","C:\\Windows\\System32\\icacls.exe","icacls.exe C:\\Temp\\sample.exe /grant Everyone:F"},
-  {"R-LOLBIN-010","cmd.exe","C:\\Temp\\cmd.exe","cmd.exe /c echo fixture"}
+static uint64_t consumer_expected_fields(const cJSON *bundle,const char *id,uint64_t predicates) {
+ const cJSON *rules=cJSON_GetObjectItemCaseSensitive(bundle,"rules"),*rule=NULL,*item;
+ assert(cJSON_IsArray(rules));
+ cJSON_ArrayForEach(item,rules) {
+  const cJSON *rule_id=cJSON_GetObjectItemCaseSensitive(item,"id");
+  if(cJSON_IsString(rule_id)&&!strcmp(rule_id->valuestring,id)){assert(!rule);rule=item;}
+ }
+ assert(rule);
+ const cJSON *condition=cJSON_GetObjectItemCaseSensitive(rule,"condition");
+ const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(condition,"evidence_purposes");
+ assert(cJSON_IsArray(purposes));
+ uint64_t fields=predicates;unsigned seen=0;
+ /* The external frozen bundle owns optional disclosure. Keep this oracle
+  * independent of the matcher: fixed case predicates plus only the three
+  * purposes reviewed here. New/duplicate purposes or missing actor require
+  * review, rather than silently learning authority from the runtime mask. */
+ cJSON_ArrayForEach(item,purposes) {
+  unsigned bit=0;uint64_t field=0;assert(cJSON_IsString(item));
+  if(!strcmp(item->valuestring,"actor_attribution")){bit=1u;field=EDR_EVIDENCE_USER;}
+  else if(!strcmp(item->valuestring,"parent_context")) {
+   bit=2u;field=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+  } else if(!strcmp(item->valuestring,"subject_command")){bit=4u;field=EDR_EVIDENCE_COMMAND;}
+  if(!bit || (seen&bit))fprintf(stderr,"consumer purpose requires review: rule=%s purpose=%.64s\n",id,item->valuestring);
+  assert(bit && !(seen&bit));seen|=bit;fields|=field;
+ }
+ assert(seen&1u);
+ return fields;
+}
+static void current_consumer_projection_contract(const unsigned char *plain,size_t size) {
+ static const struct {const char *rule,*name,*path,*command;uint64_t predicates;} cases[]={
+  {"R-EXEC-002","powershell.exe","C:\\Windows\\System32\\powershell.exe","powershell.exe -w hidden -nop",EDR_EVIDENCE_COMMAND},
+  {"R-SIGN-001","signtool.exe","C:\\Tools\\signtool.exe","signtool.exe sign C:\\Temp\\sample.exe",EDR_EVIDENCE_COMMAND},
+  {"R-MITRE-WIN-T1044","icacls.exe","C:\\Windows\\System32\\icacls.exe","icacls.exe C:\\Temp\\sample.exe /grant Everyone:F",EDR_EVIDENCE_COMMAND},
+  {"R-LOLBIN-010","cmd.exe","C:\\Temp\\cmd.exe","cmd.exe /c echo fixture",0}
  };
- const uint64_t expected=EDR_EVIDENCE_USER|EDR_EVIDENCE_COMMAND|EDR_EVIDENCE_PARENT_NAME|
-   EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
+ cJSON *bundle=cJSON_ParseWithLength((const char*)plain,size);assert(bundle);
  EdrBehaviorRecord *r=calloc(1,sizeof(*r));edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));
  uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX),*frozen=malloc(EDR_EGRESS_FRAME_MAX);assert(r&&event&&wire&&frozen);
  edr_egress_set_rule_projection_validator(retained_projection_owner,NULL);
- for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) for(unsigned parent=0;parent<2;parent++)
+ for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
+  const uint64_t expected=consumer_expected_fields(bundle,cases[i].rule,cases[i].predicates);
+  printf("consumer projection rule=%s expected_mask=0x%llx\n",cases[i].rule,(unsigned long long)expected);
+  for(unsigned parent=0;parent<2;parent++)
   for(unsigned command=0;command<(i==3?2u:1u);command++) {
    edr_behavior_record_init(r);r->type=EDR_EVENT_PROCESS_CREATE;r->pid=42;
    r->process_start_key=456;r->process_creation_filetime_100ns=789;r->event_time_ns=1700000000000000000LL;
@@ -61,7 +91,9 @@ static void current_consumer_projection_contract(void) {
     assert(edr_p0_rule_ir_evaluation_get_match(&eval,m,&match));
     if(!strcmp(match.rule_id,cases[i].rule)){found=1;break;}
    }
-   if(!found)fprintf(stderr,"consumer projection did not match %s parent=%u command_missing=%u\n",cases[i].rule,parent,command);
+   if(!found || match.required_evidence_fields!=expected)
+    fprintf(stderr,"consumer projection contract: rule=%s parent=%u command_missing=%u found=%d expected_mask=0x%llx actual_mask=0x%llx\n",
+     cases[i].rule,parent,command,found,(unsigned long long)expected,(unsigned long long)match.required_evidence_fields);
    assert(found&&match.required_evidence_fields==expected);
    r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;r->required_evidence_fields=match.required_evidence_fields;
    AVEBehaviorAlert alert={0};alert.pid=r->pid;alert.timestamp_ns=r->event_time_ns;alert.anomaly_score=.7f;
@@ -74,11 +106,14 @@ static void current_consumer_projection_contract(void) {
    size_t n=edr_behavior_record_alert_encode_protobuf(r,&alert,wire,EDR_EGRESS_FRAME_MAX);assert(n);
    pb_istream_t in=pb_istream_from_buffer(wire,n);memset(event,0,sizeof(*event));
    assert(pb_decode(&in,edr_v1_BehaviorEvent_fields,event));
-   assert(!strcmp(event->cmdline,r->cmdline));
-   assert(event->has_process_context&&event->process_context.has_parent_name==(bool)parent);
-   assert(event->process_context.has_parent_path==(bool)parent&&event->process_context.has_parent_cmdline==(bool)parent);
-   assert(!strcmp(event->process_context.parent_name,r->parent_name)&&!strcmp(event->process_context.parent_path,r->parent_path));
-   assert(!strcmp(event->process_context.parent_cmdline,r->parent_cmdline));
+   assert(event->required_evidence_fields==expected);
+   assert(!strcmp(event->cmdline,(expected&EDR_EVIDENCE_COMMAND)?r->cmdline:""));
+   assert(event->has_process_context&&event->process_context.has_parent_name==(bool)(parent&&(expected&EDR_EVIDENCE_PARENT_NAME)));
+   assert(event->process_context.has_parent_path==(bool)(parent&&(expected&EDR_EVIDENCE_PARENT_PATH)));
+   assert(event->process_context.has_parent_cmdline==(bool)(parent&&(expected&EDR_EVIDENCE_PARENT_COMMAND)));
+   assert(!strcmp(event->process_context.parent_name,(expected&EDR_EVIDENCE_PARENT_NAME)?r->parent_name:""));
+   assert(!strcmp(event->process_context.parent_path,(expected&EDR_EVIDENCE_PARENT_PATH)?r->parent_path:""));
+   assert(!strcmp(event->process_context.parent_cmdline,(expected&EDR_EVIDENCE_PARENT_COMMAND)?r->parent_cmdline:""));
    assert(!strcmp(event->parent_resolution_status,r->parent_resolution_status)&&!strcmp(event->parent_resolution_source,r->parent_resolution_source));
    assert(!strcmp(event->parent_creation_time,r->parent_creation_time)&&event->ppid==r->ppid);
    assert(event->process_start_key==r->process_start_key&&event->process_creation_filetime_100ns==r->process_creation_filetime_100ns);
@@ -87,13 +122,20 @@ static void current_consumer_projection_contract(void) {
    assert(edr_egress_frame_validate(wire,n,NULL,0)&&!memcmp(wire,frozen,n));
    /* Self-reported masks cannot extend the retained rule's authority, even
     * when the newly requested field is absent from these exact bytes. */
-   event->required_evidence_fields|=EDR_EVIDENCE_FILE;
-   pb_ostream_t out=pb_ostream_from_buffer(wire,EDR_EGRESS_FRAME_MAX);
-   assert(pb_encode(&out,edr_v1_BehaviorEvent_fields,event));
-   assert(!edr_egress_frame_validate(wire,out.bytes_written,NULL,0));
+   const uint64_t unauthorized[]={EDR_EVIDENCE_FILE,EDR_EVIDENCE_COMMAND,
+    EDR_EVIDENCE_PARENT_NAME,EDR_EVIDENCE_PARENT_PATH,EDR_EVIDENCE_PARENT_COMMAND};
+   for(unsigned field=0;field<sizeof(unauthorized)/sizeof(unauthorized[0]);field++) {
+    if(expected&unauthorized[field])continue;
+    event->required_evidence_fields=expected|unauthorized[field];
+    pb_ostream_t out=pb_ostream_from_buffer(wire,EDR_EGRESS_FRAME_MAX);
+    assert(pb_encode(&out,edr_v1_BehaviorEvent_fields,event));
+    assert(!edr_egress_frame_validate(wire,out.bytes_written,NULL,0));
+   }
   }
+ }
  edr_egress_set_rule_projection_validator(NULL,NULL);free(r);free(event);free(wire);free(frozen);
- puts("four current rules: retained match -> serializer -> immutable egress; parent gaps stay explicit and LOLBIN missing command still matches");
+ cJSON_Delete(bundle);
+ puts("four frozen rules: exact declared authority -> serializer -> immutable egress; unauthorized text omitted, parent gaps explicit, LOLBIN missing command still matches");
 }
 static void legacy_purpose_contract(const char *base,const unsigned char *plain,size_t size,
                                     const EdrP0RuleIrMatch *valid) {
@@ -284,7 +326,7 @@ int main(void){
  snprintf(base,sizeof(base),"p0-purpose-test-%lu.edr1",pid);snprintf(stage,sizeof(stage),"p0-purpose-stage-%lu.edr1",pid);
  assert(setenv("EDR_P0_IR_PATH",base,1)==0);assert(setenv("EDR_P0_PURPOSE_ARCHIVE_BASE",base,1)==0);save(base,raw,size);
  edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
- current_consumer_projection_contract();
+ current_consumer_projection_contract(plain,plain_size);
  EdrBehaviorRecord br;edr_behavior_record_init(&br);br.type=EDR_EVENT_PROCESS_CREATE;strcpy(br.process_name,"procdump.exe");strcpy(br.cmdline,"procdump.exe -ma lsass C:\\Temp\\lsass.dmp");
  EdrP0RuleIrEvaluation eval;assert(edr_p0_rule_ir_evaluate_record(&br,NULL,&eval));assert(eval.match_count);EdrP0RuleIrMatch match;assert(edr_p0_rule_ir_evaluation_get_match(&eval,0,&match));char sha[65];strcpy(sha,eval.binding.artifact_sha256);edr_p0_rule_ir_evaluation_free(&eval);
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));

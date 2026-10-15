@@ -111,6 +111,66 @@ files in that directory retain process exit/timeout results. Source advances
 to candidate 3.2.676; publication and deployment remain conditional on the
 native gates. GitHub latest was verified unchanged at `win_3.2.591`.
 
+Candidate 3.2.676, source `114755d033aa00140d37c2f019d2f091a326b3d9`,
+run `38685993380`, passed both native compilation gates. AMD64 passed 96/97
+runtime tests (292.96 s); its only failure was the incremental-reclaim fixture
+requiring exactly 256 pages reclaimed during open. Actual Inno (19.37 s), native
+Agent preflight (1.51 s) and Python preflight (6.06 s) passed. The standalone
+telemetry invocation was skipped after the CTest failure. No package was deployed.
+Raw log: `/tmp/edr-676-ci-amd64.log`.
+
+ARM64 passed all 97 release-gate tests (462.28 s), including the complete cache
+fixture (94.32 s) and the actual 12-case Inno fixture (63.40 s). The earlier ARM64
+Inno timeout did not recur; its historical cause is not established by this pass.
+The subsequent independent telemetry run passed 35/36 (455.37 s). Its sole failure
+was `p0_rule_ir_purpose_archive`: the test hardcoded a wider evidence mask than
+the exact frozen private input authorized. The frozen 183-rule JSON is 162,946
+bytes, SHA-256 `7a2aed69535960e643cd85614fee677949e179c7d8abe823a041b6b4be8c392d`,
+from private input commit `896eb2f06c9ffa608085217d4d1e84494b43e564`.
+Package, full installer lifecycle and publication did not run. Complete logs are
+preserved in `/tmp/edr-676-ci-all.zip` (CRC checked); the exact ARM64 Test step is
+`/tmp/edr-676-ci-arm64-test.log`. The next run must retain this explicit input
+commit, rather than implicitly follow a changed repository variable.
+
+The four-rule purpose fixture now derives optional fields independently from the
+decrypted frozen input's three explicitly reviewed purposes, plus fixed predicate
+requirements per case. Missing actor attribution, duplicate or unknown purposes
+fail for review. It checks both authorized text restoration and unauthorized text
+omission, retaining generation/gap/frozen-byte checks and rejecting forged command
+or parent-field masks at the real final egress gate. No rule, production matcher
+or upload permission changed. The former test fails with the exact CI input
+(0.825 s) but passes unchanged with the newer workspace input
+`6b7390644145ba56439a7554ffce57fc2bf5657e80c64d3e90fb75d1da9506e6`
+(0.310 s). The corrected test passes both (1.067 s / 0.307 s). Five related real
+P0 operation, golden, exclusion, snapshot and command-admission tests also pass.
+These local builds use real PCRE2, OpenSSL, protobuf/LZ4 and egress code, without
+the P0 stub; they are test-only macOS builds and do not replace the verified
+native Windows producer. Exact sources, compiler/link arguments, input hashes
+and raw results are in `/tmp/edr-677-purpose-real-build/`.
+
+The incremental-reclaim fixture assumed immediate work which the deadline does not
+promise. With the real slow-sync VFS, its original assertion fails with 8,201
+free pages both before and after open (1.255 s). The test now allows 0..256 pages
+at open; if zero, the very next poll, without advancing time, must reclaim exactly
+256 pages without another retirement run. All original per-slice/per-cycle bounds,
+no-work-after-drain, two-cycle convergence, zero evidence eviction and retained
+fact assertions remain. The slow-sync case passes (3.191 s), and the complete
+local cache fixture passes (12.50 s). Production code is unchanged. These results
+prove the deferred-work contract; the original native failure did not record the
+page delta and does not independently establish this as its only cause.
+Raw evidence: `/tmp/edr-677-reclaim-{red,green}.log` and
+`/tmp/edr-677-cache-full.log`. On the UTM guest, the same updated fixture passes
+both the slow-checkpoint case (5.875 s) and the complete candidate test (44.656 s),
+each once with exit 0 and no timeout. This is MinGW x64 under Windows ARM64 with
+real SQLite, in an exclusive synthetic directory; the installed client, services
+and real cache were not changed. The test object was rebuilt; all 28 production
+C files and 219 headers were checked against `114755d0`, and the 29 reused object
+hashes and exact link inputs are recorded in
+`/tmp/edr-677-native-candidate/provenance.json`. Its predecessor's provenance HEAD
+label was stale; source hashes, rather than that label, establish the production
+source identity. Raw `slow.result.json` / `full.result.json` and their hashed
+stdout/stderr remain in the same directory. Formal release closure is pending.
+
 ### Effective policy and ownership
 
 | Data / actual owner | Retention and protection | Delivery obligation |
@@ -291,6 +351,7 @@ and `tests/evidence_retention_comparison.c`. It exports untouched HEAD
 same 8 MiB budget, 8 simulated hours, 192 candidates and 48 low-severity causal
 facts. Five runs per variant use the same 63,064 encoded input bytes, SHA-256
 `11ff7f03c2ee274b9127d9510f45afe0df5e7dec3d40d938cb1d57f7371efa64`.
+The final candidate source `114755d0` was remeasured after the slow-disk fixes.
 The following are medians; the old 1 h versus current 1 h columns isolate code
 changes, while current 4 h also changes the selected retention policy.
 
@@ -302,8 +363,8 @@ changes, while current 4 h also changes the selected retention policy.
 | Oldest retained selected evidence at final sample | 59 min | 59 min | 3 h 59 min |
 | Sampled DB+WAL+SHM peak bytes | 2,305,312 | 3,272,648 | 3,379,192 |
 | Final DB+WAL+SHM before close | 2,251,752 | 677,048 | 791,832 |
-| CPU seconds | 0.168914 | 0.340674 | 0.305419 |
-| SQLite VFS read bytes | 3,756,188 | 8,618,764 | 6,140,684 |
+| CPU seconds | 0.163813 | 0.285384 | 0.306514 |
+| SQLite VFS read bytes | 2,928,796 | 4,555,532 | 7,951,116 |
 | SQLite VFS write bytes | 17,364,348 | 31,429,500 | 28,981,320 |
 | SQLite VFS sync calls | 32 | 53 | 53 |
 
@@ -311,10 +372,13 @@ Old evidence was not wholly absent: six chains were reconstructible through the
 process cache. The new self-contained owner removes that dependency for retained
 chains. The workload is sparse hourly bursts, not a promise of continuous
 four-hour visibility. Compared with original HEAD, the selected-4 h case costs
-66.9% more VFS write bytes and 80.8% more CPU in this fixture. VFS issued writes
+66.9% more VFS write bytes and 87.1% more CPU in this fixture. VFS issued writes
 are measured, not physical-device writes. This is a value/cost tradeoff, not a
 performance-improvement claim. Raw runs, exact compiler argv and source hashes:
-`/tmp/edr-evidence-physical-final-20261015/`. The earlier frozen comparison predates the final maintenance/checkpoint guards and is historical evidence.
+`/tmp/edr-evidence-676-20261015/`. Earlier results in
+`/tmp/edr-evidence-physical-final-20261015/` and the initial frozen comparison
+remain historical evidence. CPU/read counts vary with the host and OS cache;
+these medians do not establish device I/O or production throughput.
 
 The terminal size regression uses two 98,300-byte synthetic commands. Required
 outbound fields omit them: intent is 1,128 bytes while the measured full local
@@ -449,7 +513,7 @@ cmake --build /tmp/edr-cache-assessment-egress-build --target edr_agent agent_ru
 PATH=/opt/homebrew/opt/openssl@3/bin:$PATH ctest --test-dir /tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -L 'agent-runtime-gate|telemetry-minimization'
 python3 tests/test_storage_space_preflight.py --client /tmp/edr-cache-assessment-egress-build/edr_agent
 python3 tests/run_queue_retention_comparison.py --output /tmp/edr-queue-physical-final-20261015 --codec-build /tmp/edr-cache-assessment-egress-build
-python3 tests/run_evidence_retention_comparison.py --output /tmp/edr-evidence-physical-final-20261015 --runs 5
+python3 tests/run_evidence_retention_comparison.py --output /tmp/edr-evidence-676-20261015 --baseline 6bedb86bf9811bc304f4c97fdd62212ef437423f --runs 5
 ```
 
 Final build and test logs: `/tmp/edr-cache-completion-queue-final-build.log`,
