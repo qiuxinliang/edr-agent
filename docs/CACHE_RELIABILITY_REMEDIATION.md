@@ -237,6 +237,67 @@ configuration to fail. The executed commands and tool-output transcripts are
 retained in `/private/tmp/edr-678-registration-checks/`; these are transcripts,
 not independently redirected complete raw logs. `git diff --check` passes.
 
+Candidate 3.2.678, source `58b1f175d0cc1ebd1c8d36d3f9795d23f9633547`,
+run `38695879937`, passed AMD64 runtime 99/99 (311.77 s) and standalone
+telemetry 38/38 (440.16 s), including actual package compilation (4.547 s).
+ARM64 passed 98/99 runtime tests (473.59 s). All three cache groups passed:
+context 15.42 s, migration 47.72 s and retention 50.42 s. AMD64's corresponding
+groups passed in 14.58/62.91/61.31 s, then 14.37/60.42/58.68 s in standalone
+telemetry. The partitioned fixtures retained their 150 s deadlines.
+
+The sole failure was ARM64 `windows_inno_evidence_space`: actual ISCC compilation
+passed (1.256 s), but the first `first-install-default` synthetic installer
+exceeded its 30 s process deadline (30.240 s). Its real log reached
+`InitializeSetup`, passed parser/native directory checks and entered
+`PrepareToInstall`, then logged temporary executable/DLL extraction. No later
+preflight-return marker appeared. Exact owned-process-tree cleanup succeeded.
+ARM64 standalone telemetry, package, both full install/upgrade/rollback lifecycle
+jobs and combined publication did not run. The installed UTM client remains 673.
+
+Complete evidence is `/tmp/edr-678-ci-all.zip` (1,163,712 bytes, CRC verified,
+SHA-256 `8df5a22e73851a5297f88556f0b82867a80ef50fbdf4f16f7c1f3ac7afff8074`),
+`/tmp/edr-678-ci-summary.json` and `/tmp/edr-678-ci-arm64-inno-failure.log`.
+The log establishes the stalled interval, not a specific stalled subprocess:
+cleanup lists PID parentage without image names or creation timestamps. The
+34.25 s Python preflight test is cumulative across multiple processes, not a
+single preflight duration. The synthetic installer reports 32-bit install mode;
+the actual installers configure architecture-specific 64-bit mode. Separately,
+the production launcher's 15 s wait starts only after PowerShell and
+`Start-Process` return, so it does not bound that earlier interval. These are
+distinct candidate mechanisms under investigation, not a basis to increase
+timeouts or claim the real installer necessarily fails.
+
+A UTM single-factor experiment held the production includes, diagnostic probe
+and 30 s fixture / 15 s child wait constant. The old first-install fixture used
+32-bit mode and launched SysWOW64 PowerShell (x86); adding native install mode
+launched System32 PowerShell (ARM64). An external observer recorded owned process
+images and creation times. Both cases succeeded: 6.052 s versus 2.621 s; the
+observed PowerShell-to-probe interval was about 4.343 s versus 1.656 s. This proves
+the test/production architecture mismatch, not the historical timeout's unique
+cause. Raw evidence: `/tmp/edr-678-inno-bitness-o3_qv1m2/evidence/`.
+
+The shared fixture now uses `x64os arm64` for both architecture directives, the
+union of the two native production packages' respective settings. It asserts
+64-bit install mode and logs the effective system PowerShell path. Production
+package restrictions, preflight code, all 12 case expectations and every deadline
+remain unchanged. Independent review found no changed product admission contract.
+The host installer/configuration and packaging checks pass 2/2 (0.24 s), with
+raw output `/tmp/edr-679-installer-contracts.log`. Full native closure still
+requires the next candidate's actual release executables and lifecycle jobs.
+
+The corrected complete fixture passes all 12 cases on UTM: six expected successes
+and six expected refusals. A separate synthetic probe sleeping for 60 s was
+terminated by the unchanged production 15 s child wait: the observer captured
+PowerShell exit 124, the installer refused with exit 7 after 17.396 s, neither
+the before-copy marker nor `one.bin` existed, and no owned process survived.
+The fixture's 30 s outer cleanup was not invoked. Evidence and exact source hashes
+are under `/tmp/edr-678-inno-sleep-full-c4ojop21/`. These experiments use the
+real production includes and a preflight-only diagnostic executable, not the full
+release Agent; the sleep probe is deliberately synthetic. They validate the child
+deadline and fixture correction, not a bound on PowerShell startup before that
+wait or a reconstruction of the historical CI timeout. Source advances to
+candidate 3.2.679 with the same frozen P0 inputs and without changing latest.
+
 ### Effective policy and ownership
 
 | Data / actual owner | Retention and protection | Delivery obligation |

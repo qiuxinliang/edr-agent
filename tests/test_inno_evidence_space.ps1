@@ -102,6 +102,10 @@ AppName=EDR space contract fixture
 AppVersion=1
 DefaultDirName={tmp}\edr-space-fixture
 PrivilegesRequired=lowest
+; Production packages use x64os or arm64 for both directives. This shared
+; fixture runs on either native runner, preserving its 64-bit system paths.
+ArchitecturesAllowed=x64os arm64
+ArchitecturesInstallIn64BitMode=x64os arm64
 Uninstallable=no
 CreateAppDir=yes
 DisableWelcomePage=yes
@@ -133,6 +137,9 @@ var
   TempDir: string;
 begin
   Log('EDR space fixture: InitializeSetup entered');
+  Require(Is64BitInstallMode, 'production native install mode missing');
+  Log('EDR space fixture: native PowerShell=' +
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'));
   Require(EdrParseSpaceFloor('0', Bytes) and (Bytes = 0), 'zero rejected');
   Require(EdrParseSpaceFloor('3298560049152', Bytes) and (Bytes = 3298560049152), 'large owner floor rejected');
   Require(EdrParseSpaceFloor('9007199254740991', Bytes) and (Bytes = 9007199254740991), 'maximum floor rejected');
