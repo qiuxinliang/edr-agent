@@ -1,6 +1,188 @@
 # Cache reliability remediation
 
-## 2026-10-16 candidate 687 preparation: final retrieval boundary review
+## 2026-10-16 final 687 Headless deployment and evidence acceptance
+
+Runtime source is `97064865522c6aebd050fab9675c7eb34697ece6` on
+`codex/rtq-result-delivery-pressure`. The final documentation commit is not a
+different runtime build. This source is 32 commits after audit baseline
+`0ae3fb28e553223358db1a83ebd26432336af9e7` and 23 after comparison
+`3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`. The implementation, configuration,
+lifecycle, migration and measured comparisons below remain applicable; this
+section records the final delivery and its limits, rather than certifying all
+ten requirements as field passes.
+
+### Release and actual single-client upgrade
+
+Run [38814603184](https://github.com/qiuxinliang/edr-agent/actions/runs/38814603184)
+completed all seven jobs successfully. Each native architecture executed and
+passed 100 release and 13 remaining telemetry tests, 113 unique tests. Both
+real Setup and binary-hot lifecycle jobs exercised 685 -> 687 -> 685. Setup
+asserts version, PE architecture, files and runtime health; the independent
+installed-Agent SHA assertions belong to binary-hot verification. The final
+host regression passed 67/67 as recorded below. Mode-specific skipped steps
+remain skips. Candidate 686 also completed CI, but was never downloaded or
+installed on the client.
+
+Release `414318483` is the source/run/P0-bound `win_3.2.687` prerelease.
+GitHub latest remained `win_3.2.591`. Only these three ARM64 assets were
+downloaded and imported through the client UI:
+
+| Input | Bytes | SHA-256 |
+| --- | ---: | --- |
+| Artifact manifest | 2,367 | `f07603196a8dbae270260049af339227dbee4e1dc3d31609ac14d5dfc83247fe` |
+| Agent | 3,215,872 | `6c33f6233b8355d6b30d4bd94082be13ee7d139e2b8b7bd425c1e5214dab8740` |
+| Headless ZIP | 14,216,191 | `125825d514a8463d67d6260e6b67b9c70db821f59f1a34c864f1bd3dc2d40498` |
+
+No Setup UI package or separate Setup executable was downloaded. The complete
+Headless ZIP contains its required installer; member paths, CRC, runtime
+closure, manifest identity and embedded installer hashes were verified.
+`headless-artifact-pin.json` SHA-256 is
+`30cb49702d25f189c6408d8663a0635f7b26149d74237fb6550c9b0cfa5f8639`.
+The release proof directory is
+`/private/tmp/edr-687-release-draft-60k9gvk5/`. Its four CI logs contain only
+environment/credential-sanitized text with protected execution records checked
+unchanged in memory before persistence. Full raw logs were not preserved.
+Final log provenance SHA-256:
+`ea622761a32cfbf9c3cd681869fe5a24cb4776c1417b597293bf69c5d782f564`.
+
+The UI imported `artifact_1792104251397459000` and submitted exactly one task,
+`agent_upgrade_1792104294189391000`, for WIN-FAC3AC1PS5O. Its command is
+`agent_update_1792104295100925000`, runtime package 246 SHA-256
+`26f8345c2b063073534956d7cad34e79917bba10cb82b7f0c5298250f17ac845`.
+Actual installed version is 3.2.687, with the Agent hash above, PID 8400 and
+guest CIM birth `2026-10-15T22:46:46.5939720Z`. The same identity remained at
+guest `23:00:24.5353277Z`. The existing scheduled-task owner and explicit
+512 MiB/72-hour queue/evidence overrides remain. No Machine/User path override
+was observed; this is not a full process-environment inspection. No manual
+restart or real-cache cleanup was performed in this deployment.
+
+Backend health observation ran from `22:46:40.087` to `22:51:40.087` UTC;
+the task completed at `22:51:40.088`. This is the configured 300-second
+observation interval, not proof of uninterrupted physical sampling. Backend
+and guest clock values are not interchangeable. Initially the local succeeded
+journal had sequence 6 while ACK was 4. Bounded guest-side log classification
+found HTTP 409 / `INVALID_UPGRADE_TRANSITION`, specifically
+`health_check -> restarting`. The matching 4,096-byte redacted installer log
+was already durably indexed; its local/server SHA is
+`1569cdb7dd8e09c495b2aa62276d3273dddf428da38864de098fee946165ba9f`.
+
+After backend completion, the normal retry path accepted late events 5 and 6
+at `22:51:40.892` and `.987`; local ACK advanced to 6. No checkpoint, event or
+server row was manually changed. Exact task/command/artifact pins, continuous
+events 1..6, terminal journal, absent policy hold and ACK 6 then passed the
+unchanged `--require-complete` verifier. Its result SHA-256 is
+`ce7f6488d54ca1a3346baefa59daeb24c03680b1a121e22537db8330478378e0`.
+The initial incomplete check is retained, not relabeled as success. The
+observation/event ordering still causes avoidable temporary 409 retries in
+this existing backend flow; this Agent delivery does not claim to repair it.
+At two later same-PID reports, HTTP success increased 239 -> 242 while the
+cumulative failure count remained 208; control ACK pending was 0 and h2
+control remained connected and leased. These observations do not erase the
+208 historical failures or prove an independent wire ACK capture.
+
+An actual UI live query targeted only PID 8400 on this endpoint. Session
+`rtq_1792104472196503000`, run `rtqrun_1792104472258614000`, returned one
+FDSensor row with exactly `type`, `name`, `path`, `pid`. The command is
+`cmd_rtq_ep-ff84e69e4_1792104472258618000`. Its stable local owner and actual
+backend result matched type/status/exit/390-byte length/SHA
+`216cc77e8aa43e24d2175a91ba4cf5ec95bf6bdb8c5f5a1b3b1c3c800789b096`;
+both `accepted` and `execution_succeeded` are true, with no pending/held error.
+Receipt SHA-256:
+`126692a2e406e5e9c53db864ad469da187a336697cff112c86f61d83046288e3`.
+This verifies the live consumer and necessary result delivery, not the absent
+cached-query producer described below.
+
+An additional generic-result lookup for the upgrade command returned no row;
+its original exit 3 is preserved. That is not a generic-result ACK. The actual
+upgrade owner has one successful terminal, no pending/held/error state and
+empty SOAR/playbook correlation fields. `command_stub.c:command_should_report`
+reports the `cmd_`/SOAR route; this ordinary `agent_update_` command uses the
+dedicated upgrade-event consumer above. Its 92-byte local final is therefore
+not certified as an `endpoint_command_results` receipt. The offline route
+classification is `upgrade-687-delivery-consumer-classified.json` in the same
+acceptance directory. The separate RTQ receipt proves the generic result path.
+
+### Real capacity degradation remains visible
+
+The last pre-upgrade 685 generation must not be replaced by post-restart zero
+counters. At backend report `22:38:07.561`, PID 8432 reported 1,735 candidate
+requests, 37 new admissions and 1,698 refusals. At `22:44:09.194` the same
+generation had 1,741/43/1,698. Candidate requests can include owner updates;
+these are not counts of unique lost events. The aggregate does not identify
+every refusal as capacity, CPU, SQLite or transaction failure. CPU throttle
+directly skips ordinary noncandidate/noncontext facts, not all candidates.
+
+The 687 generation later reported 12 requests, 4 new admissions and 8 refusals
+at `22:58:38.150`, with four retired groups, 241 held decisions and zero
+recorded retirement/physical-guard failures. Ordinary candidate admission is
+still degraded; an upgrade success and a false pressure boolean do not mean
+all writes succeed. The boolean means closed evidence store or resource
+throttle, not all logical-budget refusals. Rejection counters remain the
+existing minimal-health evidence of those refusals.
+
+The bounded before/after SQLite aggregates show the same 7,950 policy-0/class-0
+legacy candidate count and earliest/latest times. They do not prove per-row
+identity, content or hash preservation. Policy-1/class-2 retained candidates
+changed 7 -> 14. Durable retirement counters changed 30 -> 41 groups,
+784 -> 1,041 rows, and 1,306,985 -> 1,720,215 work bytes. These cross-generation
+deltas prove some actual retirement, not equivalent disk bytes freed or work
+attributable solely to 687. Held decisions can repeat and are not unique pins.
+Unknown legacy owners remain protected instead of being silently classified
+or deleted. Their occupancy can limit new retention.
+
+The final sampled DB was 536,829,952 bytes and WAL 45,352 bytes: together
+536,875,304, 4,392 bytes above the 512 MiB setting. Including SHM gave
+536,908,072 bytes. These pre-write admission checks and bounded maintenance
+are not an atomic post-transaction physical cap or Agent-directory quota.
+Free-space guards remained available with about 20.95 GB free. Near-budget
+occupancy alone is not failure; the observed refusals are a distinct fact.
+No capacity increase, bulk upload, fake ACK or real-cache deletion was used.
+
+All nine queue ledger categories matched. The three original queue owners
+still matched their immutable bytes, identities and ACK flags after the
+upgrade. This does not replace the two original candidate samples missing
+after the earlier 679 rollback; that preservation gap remains unclosed within
+the authorized evidence scope. No replacement samples were taken. P0 r289
+was ready/healthy with 183 rules; the new-generation v528 configuration
+receipt was verified/applied with matching desired/reported hashes and no
+restart required.
+
+The supported investigation value is recent detail plus selected candidates,
+full command objects and protected process-generation/causal dependencies,
+with independently owned necessary deliveries. Defaults target 24-hour recent
+detail and 72-hour selected retention; this UTM explicitly targets 72/72 hours.
+These are workload-dependent goals. Under pressure, eligible complete groups
+retire and shared content deduplicates; protected/unknown owners and finite
+critical reserves can force explicit refusal. A fixed retained duration under
+all loads is not promised. The measured eight-hour synthetic comparison below
+records retained timestamp span, parent reconstruction, physical peaks, writes
+and increased CPU cost, not a Windows 72-hour field guarantee.
+
+Actual acceptance commands and original JSON results are under
+`/private/tmp/edr-678-client-acceptance/`. The 26-file
+`final-687-evidence-index.json` has SHA-256
+`ddce675c98f3218edd95c5335e84eb3f27f5184a27d7dec13f6d51bd9d4204d0`.
+Relevant commands:
+
+```sh
+python3 -B /private/tmp/edr-687-release-draft-60k9gvk5/verify_headless_from_job_logs.v4.py
+python3 -B /tmp/edr-678-run-live-probe.py --output /private/tmp/edr-678-client-acceptance/postdeploy-687-cache-final.json
+python3 -B /tmp/edr-674-probe-compare.py /private/tmp/edr-678-client-acceptance/predeploy-687-cache.json /private/tmp/edr-678-client-acceptance/postdeploy-687-cache-final.json
+python3 -B /private/tmp/edr-678-client-acceptance/run_687_upgrade_receipt_after_observation.py
+python3 -B /private/tmp/edr-687-acceptance-prep-48o12l8r/upgrade_task_readonly.py --task-id agent_upgrade_1792104294189391000 --baseline /private/tmp/edr-678-client-acceptance/upgrade-687-baseline.json --upgrade-probe /private/tmp/edr-678-client-acceptance/upgrade-687-local-journal-after-observation.json --upgrade-invocation /private/tmp/edr-678-client-acceptance/upgrade-687-local-journal-after-observation-invocation.json --require-complete --output /private/tmp/edr-678-client-acceptance/upgrade-687-final-verified.json
+python3 -B /private/tmp/edr-678-client-acceptance/command_result_verify_readonly.py --command-id cmd_rtq_ep-ff84e69e4_1792104472258618000 --version 3.2.687 --local-probe /private/tmp/edr-678-client-acceptance/rtq-687-pid8400-command-owner-byte.json --output /private/tmp/edr-678-client-acceptance/rtq-687-pid8400-command-result-verified.json
+```
+
+These exclusive-output commands are a record of execution, not instructions
+to rerun mutations or overwrite evidence. Final cache JSON SHA-256:
+`3412525df4543446e2875c08ad5faba56fc530a41a95331a08a5f57044d1e2b9`.
+The final UI screenshot is
+`/private/tmp/edr-678-client-acceptance/deployment-687-headless-completed.png`.
+The Windows sustained-load/device-I/O/power-loss and actual wire-body closure
+conditions below remain explicit. No absent cached-query consumer or historical
+candidate preservation gap is certified by the successful Headless deployment.
+
+## 2026-10-16 historical 687 preparation: final retrieval boundary review
 
 The existing client UI and backend implement live `rtq_execute`, not a callable
 cached-evidence `rtq_query` producer. The successful PID 8432 operation below
@@ -14,9 +196,9 @@ and final result gate support exact process generations, but
 `process_creation_filetime_100ns` before reaching them. Existing deeper-layer
 tests did not establish compatibility with the real command-contract entrance.
 The scoped follow-up aligns that existing entrance and tests it; it does not
-create a backend producer or change routine uploads. Candidate 686 continues
-its source-bound native CI, but will not be downloaded or installed: the final
-candidate must include the entrance correction and pass its own native gates.
+create a backend producer or change routine uploads. At this preparation
+checkpoint candidate 686 was still in CI. It was not downloaded or installed;
+the final 687 candidate subsequently passed its own native gates above.
 
 ### Interface proposal for a future authorized cached-query consumer
 
@@ -64,7 +246,8 @@ Raw build/test logs, source digests and actual command results:
 `/private/tmp/edr-687-final-gates-wm455m_6/`; `RESULTS.json` SHA-256 is
 `ca9c60bf0e6efe0455fd46222b2649bdda69708c327d0a45fbf22ab6c6b240e9`.
 These host checks retain the documented macOS sensor/P0 stub limits. Windows
-gates and final single-client Headless upgrade remain pending. Storage/codec
+gates and the single-client Headless upgrade were pending at this checkpoint
+and are recorded in the final section above. Storage/codec
 implementation bytes are unchanged from the measured 3e8 benchmark below;
 that benchmark is not relabeled as a new measurement of this contract correction.
 The older aggregate acceptance table below is the historical 684 checkpoint;
@@ -85,7 +268,8 @@ child-process crash tests are narrower evidence. Final routine-upload assurance
 uses real encoders/final gates and the synthetic TLS consumer; a claim about
 actual endpoint wire bodies additionally requires an authorized scoped capture
 and comparison of received fields. No such capture is claimed here. The two
-historically missing candidate samples remain unrecoverable preservation gaps;
+historically missing candidate samples remain unclosed preservation gaps within
+the authorized evidence scope;
 new samples or a successful upgrade cannot close them retroactively.
 
 ## 2026-10-16 candidate 686 preparation: 685 reopening recovered, health fix verified locally
@@ -94,7 +278,8 @@ The local runtime change is `3e8e73c7e01bfee8f90bdd682db07202194392bc`.
 It restores only the existing evidence-pressure health boolean and its closed
 store meaning; it does not change retention, upload or startup deadlines.
 The four focused host checks and actual mTLS producer/projection checks passed.
-Windows CI and deployment of this change are still pending. Only Headless
+Windows CI and deployment were pending at this historical checkpoint and
+subsequently completed in 687 above. Only Headless
 client artifacts will be downloaded; no Setup UI package is a client input.
 
 The first 685 startup failure below remains preserved. One controlled restart
@@ -2245,8 +2430,9 @@ limit bound this operation; release/cancellation ends the pin.
 
 Real RAW/LZ4 decoding, scope checks, result projection, command-state persistence,
 HTTP JSON and final egress assertions pass in `authorized_local_query_contract`.
-Default queries omit complete commands. Explicitly authorized fields can match
-and restore a 6,000-byte command. Terminal journal originals use the same path
+Default queries omit complete commands. The existing command-line filter scope
+in the local fixture can match and restore a 6,000-byte command. This does not
+establish a remote field-selection API or business necessity. Terminal journal originals use the same path
 with exact integer generation validation. Query absence returns one of
 `outside_retention_window` or `not_collected_or_expired` and
 `absence_is_evidence=false`; it never proves the behavior did not occur.
