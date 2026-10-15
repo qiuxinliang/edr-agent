@@ -182,6 +182,14 @@ static const CommandFieldRule k_cached_query_rules[] = {
     RULE("file_sha256", FIELD_STRING, 0, 0, 0, 64, 0),
 };
 
+/* list_connections shares the cached filter rules, but does not consume this
+ * cached-evidence identity scope. */
+static const CommandFieldRule k_cached_query_identity_rules[] = {
+    RULE("endpoint_id", FIELD_STRING, 0, 0, 0, 127, 0),
+    RULE("process_start_key", FIELD_STRING, 0, 0, 0, 20, 0),
+    RULE("process_creation_filetime_100ns", FIELD_STRING, 0, 0, 0, 20, 0),
+};
+
 static const CommandFieldRule k_process_tree_rules[] = {
     RULE("pid", FIELD_NUMBER, 1, 1, 4294967295.0, 0, 0),
     RULE("endpoint_id", FIELD_STRING, 0, 0, 0, 128, 0),
@@ -609,6 +617,22 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
     unsigned long long n = strtoull(value, NULL, 10);
     if (errno || !n) return contract_fail(reason, reason_cap, "process creation time overflows uint64");
   }
+  if (kind == EDR_COMMAND_KIND_RTQ_QUERY) {
+    const cJSON *endpoint = cJSON_GetObjectItemCaseSensitive(root, "endpoint_id");
+    if (endpoint && !endpoint->valuestring[0])
+      return contract_fail(reason, reason_cap, "cached query endpoint_id must not be empty");
+    const char *generation_fields[] = {"process_start_key", "process_creation_filetime_100ns"};
+    for (size_t i = 0; i < COUNT_OF(generation_fields); ++i) {
+      const cJSON *generation = cJSON_GetObjectItemCaseSensitive(root, generation_fields[i]);
+      if (!generation) continue;
+      const char *value = generation->valuestring;
+      if (!value[0] || value[0] == '0' || strspn(value, "0123456789") != strlen(value))
+        return contract_fail(reason, reason_cap, "cached query generation must be a positive decimal uint64 string");
+      errno = 0;
+      unsigned long long n = strtoull(value, NULL, 10);
+      if (errno || !n) return contract_fail(reason, reason_cap, "cached query generation overflows uint64");
+    }
+  }
   if (kind == EDR_COMMAND_KIND_RTQ_EXECUTE) {
     return validate_rtq_semantics(root, reason, reason_cap);
   }
@@ -841,7 +865,7 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
   if (payload_len > 0u && !payload) {
     return contract_fail(reason, reason_cap, "command payload pointer is null");
   }
-  if (descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE && payload_len > 0u &&
+  if ((descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE || descriptor->kind == EDR_COMMAND_KIND_RTQ_QUERY) && payload_len > 0u &&
       !rtq_payload_text_valid(payload, payload_len)) {
     return contract_fail(reason, reason_cap, "RTQ payload must contain valid UTF-8 text without NUL");
   }
@@ -887,6 +911,8 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
       }
     }
     const CommandFieldRule *rule = find_rule(rules, rule_count, field->string);
+    if (!rule && descriptor->kind == EDR_COMMAND_KIND_RTQ_QUERY)
+      rule = find_rule(k_cached_query_identity_rules, COUNT_OF(k_cached_query_identity_rules), field->string);
     if (!rule && descriptor->kind != EDR_COMMAND_KIND_AGENT_UPDATE) {
       rule = find_rule(k_common_rules, COUNT_OF(k_common_rules), field->string);
     }

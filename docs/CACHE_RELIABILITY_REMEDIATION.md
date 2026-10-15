@@ -1,5 +1,93 @@
 # Cache reliability remediation
 
+## 2026-10-16 candidate 687 preparation: final retrieval boundary review
+
+The existing client UI and backend implement live `rtq_execute`, not a callable
+cached-evidence `rtq_query` producer. The successful PID 8432 operation below
+therefore proves only its live query and durable result owner. The backend's
+permission/catalog aliases are not an executable cached-query route. No generic
+command API, new remote-control authority or backend database insertion was added.
+
+An Agent-only ingress mismatch was found at source `1b3fb19f`: the cached parser
+and final result gate support exact process generations, but
+`k_cached_query_rules` rejected `endpoint_id`, `process_start_key` and
+`process_creation_filetime_100ns` before reaching them. Existing deeper-layer
+tests did not establish compatibility with the real command-contract entrance.
+The scoped follow-up aligns that existing entrance and tests it; it does not
+create a backend producer or change routine uploads. Candidate 686 continues
+its source-bound native CI, but will not be downloaded or installed: the final
+candidate must include the entrance correction and pass its own native gates.
+
+### Interface proposal for a future authorized cached-query consumer
+
+This is an interface and acceptance proposal, not an exposed HTTP API. The
+current internal contract derives result purpose from command type and binds
+tenant/endpoint through authenticated delivery plus the local configuration.
+Signature canonical bytes bind command ID/type, idempotency key, issue/deadline
+and payload digest; tenant and endpoint are not separate canonical fields.
+Neither a signature nor a syntactically accepted field proves business necessity.
+
+| Required boundary | Current implementation and condition before exposing a consumer |
+| --- | --- |
+| Tenant, endpoint and task | Preserve authenticated tenant/endpoint routing, local configuration and signed command/task ownership; reject cross-scope requests and result receipts. Any future producer must derive these identities from its authorized investigation task, never an arbitrary UI payload. |
+| Business purpose and fields | Require an authorized investigation purpose and a necessary returned-field allowlist. Current cached queries have a fixed projection, with complete command text omitted unless explicitly requested by their existing filter contract; there is no request `fields` key. A future producer must not infer necessity merely from authorization. |
+| Time and process generation | Bound the requested event interval and exact process instance. Current internal queries use issue time minus `time_window_s` with an existing 300-second future tolerance, not a caller-specified closed interval. Exact generation fields are decimal uint64 strings; PID alone is not a generation. |
+| Bytes, lifetime and pins | Intersect caller limits with server/local limits, include JSON encoding overhead, and reject expiry, cancellation or pin exhaustion. Current internal result authority is fixed at 16,383 bytes and `do_rtq_query` further limits detail to 11,999 bytes; request `max_bytes` is unsupported. |
+| Missing evidence | Preserve `outside_retention_window` / `not_collected_or_expired` and `absence_is_evidence=false`; lack of a row is not lack of behavior. |
+| End-to-end acceptance | Before exposing a producer, exercise its actual signature verification, receive validation, local SQLite query, real result encoding/final gate and durable consumer receipt. Cover wrong scope/task/generation, extra fields, expiry, byte/pin exhaustion and absence. Existing local tests start no network and do not certify this absent producer. |
+
+The source audit is `/private/tmp/edr-cached-rtq-producer-audit-1b3fb19f.md`,
+SHA-256 `b8960a6ab2e0086640a0f1fef500a9ccd35afdfcb9013f5eb34fedd3cbc22621`.
+The old-source regression actually fails at the entrance with the new exact
+endpoint/generation request (CTest exit 8); after the correction, all three
+focused contract/result/local-query tests pass. Their raw commands, RED/GREEN
+outputs and source digests are under
+`/private/tmp/edr-cached-rtq-ingress-pceb67m5/`; manifest SHA-256 is
+`9f5492b6ffbe3e73d2745a6cca16aedeecefca3eb40d86ad4ecc81e92a55b25a`.
+The local-query fixture first invokes the production ingress validator, then
+uses real SQLite and RAW/LZ4 encoding, a reused PID with two process generations,
+the durable result owner, HTTP JSON and final gate. It rejects wrong endpoint,
+mixed generations and individually forged scope fields. It explicitly reports
+`signature_verified=false` and `network_started=false`; separate signature/TLS
+tests do not turn this fixture into a signed cached-query end-to-end test.
+The complete host runtime/telemetry regression then passed **67/67** in 131.33 s
+(54 runtime and 31 telemetry cases with overlap). It includes the existing
+cross-language signature and real loopback mTLS tests. All 1,068 tracked C/header
+file bytes stayed unchanged throughout the build and run. Commands:
+
+```sh
+cmake --build /private/tmp/edr-cache-assessment-egress-build --target edr_agent agent_runtime_gate_tests telemetry_minimization_tests -j4
+PATH=/opt/homebrew/opt/openssl@3/bin:$PATH ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -L 'agent-runtime-gate|telemetry-minimization'
+```
+
+Raw build/test logs, source digests and actual command results:
+`/private/tmp/edr-687-final-gates-wm455m_6/`; `RESULTS.json` SHA-256 is
+`ca9c60bf0e6efe0455fd46222b2649bdda69708c327d0a45fbf22ab6c6b240e9`.
+These host checks retain the documented macOS sensor/P0 stub limits. Windows
+gates and final single-client Headless upgrade remain pending. Storage/codec
+implementation bytes are unchanged from the measured 3e8 benchmark below;
+that benchmark is not relabeled as a new measurement of this contract correction.
+The older aggregate acceptance table below is the historical 684 checkpoint;
+subsequent source, CI and client sections record later observations without
+turning the original missing two candidate samples into preservation passes.
+
+### Windows conditions that remain separate from this delivery
+
+An installed-client quiet interval cannot prove a 72-hour retained history.
+Native Windows performance closure requires the same measured unique/repeated/
+high-severity inputs and encoded sizes, running beyond the configured windows,
+with CPU, issued and device I/O, sampled and continuous physical peaks, retained
+event times and exact-generation dependency reconstruction recorded together.
+That load must use disposable synthetic stores, not delete real endpoint caches.
+Hardware power-loss closure requires interruption during real filesystem commit
+and restart with ledger, frozen identity, idempotency and receipt verification;
+child-process crash tests are narrower evidence. Final routine-upload assurance
+uses real encoders/final gates and the synthetic TLS consumer; a claim about
+actual endpoint wire bodies additionally requires an authorized scoped capture
+and comparison of received fields. No such capture is claimed here. The two
+historically missing candidate samples remain unrecoverable preservation gaps;
+new samples or a successful upgrade cannot close them retroactively.
+
 ## 2026-10-16 candidate 686 preparation: 685 reopening recovered, health fix verified locally
 
 The local runtime change is `3e8e73c7e01bfee8f90bdd682db07202194392bc`.
@@ -2143,10 +2231,13 @@ ARM64 emulation, not a native ARM64 Agent deployment.
 
 ### Authorized lookup and rollback boundaries
 
-The existing signed `rtq_query` route now consumes its frozen purpose contract,
-not an independently truncated payload. It checks tenant/endpoint, command/task,
-purpose, issue/expiry, event window, requested fields and actual encoded output
-bytes. A finite query slot owns a copied snapshot; queue locks/SQLite reads end
+The internal `rtq_query` handler consumes its frozen purpose contract rather
+than an independently truncated payload. It checks tenant/endpoint, command/task,
+derived purpose, issue/expiry, event window, fixed result projection and actual
+encoded output bytes. The final retrieval review above distinguishes this
+internal implementation from the absent backend/UI producer and identifies the
+ingress correction. Request `fields` and `max_bytes` controls are not implemented.
+A finite query slot owns a copied snapshot; queue locks/SQLite reads end
 before projection callbacks. Busy, expired, oversized and corrupt reads fail
 with a cause. There is no automatic permanent severity pin. One in-flight query,
 1,000 result rows, 4 MiB copied queue bytes and the existing final result byte
@@ -2264,10 +2355,12 @@ with policy-3 journals is unsupported because the old binary cannot finish the
 new delivery sequence. Installed real cache cleanup or permanent legacy-data
 migration is not part of the authorized deployment.
 
-### Acceptance evidence and release closure
+### Historical 684 acceptance checkpoint
 
-Current aggregate status below includes the completed 684 gates; earlier failed
+This historical aggregate status includes the completed 684 gates; earlier failed
 releases and benchmark revisions remain historical evidence, not overwritten passes.
+References to current or remaining verification in this table are specific to
+that checkpoint. Later observations and final status are recorded at the top.
 
 | Required acceptance | Implemented and exercised contract | Remaining consumer closure / limits |
 | --- | --- | --- |

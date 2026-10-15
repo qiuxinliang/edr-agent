@@ -26,6 +26,45 @@ static int validate(const char *type, const char *payload, char *reason, size_t 
                                        reason, reason_cap);
 }
 
+static void test_cached_query_identity(void) {
+  char reason[256], payload[512];
+  require_true(validate("rtq_query", "{\"endpoint_id\":\"ep-1\",\"pid\":42,"
+      "\"process_start_key\":\"18446744073709551615\","
+      "\"process_creation_filetime_100ns\":\"133700000000000001\","
+      "\"time_window_s\":600,\"limit\":1}", reason, sizeof(reason)),
+      "cached query accepts exact endpoint and lossless generation scope");
+  const char *fields[] = {"process_start_key", "process_creation_filetime_100ns"};
+  const char *invalid_values[] = {"0", "1", "null", "true", "{}", "[]", "\"\"",
+      "\"0\"", "\"01\"", "\"-1\"", "\"+1\"", "\" 1\"", "\"1 \"",
+      "\"1e3\"", "\"1.0\"", "\"18446744073709551616\"",
+      "\"184467440737095516150\"", "\"1\\u00002\""};
+  for (size_t field = 0; field < COUNT_OF(fields); ++field) {
+    snprintf(payload, sizeof(payload), "{\"%s\":\"1\"}", fields[field]);
+    require_true(validate("RTQ_QUERY", payload, reason, sizeof(reason)),
+        "cached query accepts optional positive generation identity");
+    require_true(!validate("list_connections", payload, reason, sizeof(reason)),
+        "cached generation scope does not expand another command contract");
+    for (size_t value = 0; value < COUNT_OF(invalid_values); ++value) {
+      snprintf(payload, sizeof(payload), "{\"%s\":%s}", fields[field], invalid_values[value]);
+      require_true(!validate("rtq_query", payload, reason, sizeof(reason)) && reason[0],
+          "cached query rejects unsafe generation identity with a cause");
+    }
+  }
+  const char *invalid_queries[] = {"{\"endpoint_id\":\"\"}", "{\"endpoint_id\":1}",
+      "{\"endpoint_id\":\"ep\\u0000other\"}", "{\"endpoint_id\":\"bad\xc0\xaf\"}",
+      "{\"process_start_key\":\"1\",\"process_start_key\":\"2\"}",
+      "{\"pid\":42,\"unknown_scope\":1}", "{\"fields\":[\"pid\"]}", "{\"max_bytes\":512}"};
+  for (size_t i = 0; i < COUNT_OF(invalid_queries); ++i)
+    require_true(!validate("rtq_query", invalid_queries[i], reason, sizeof(reason)) && reason[0],
+        "cached query retains strict endpoint and unknown-field rejection");
+  char endpoint[129]; memset(endpoint, 'e', sizeof(endpoint)); endpoint[127] = 0;
+  snprintf(payload, sizeof(payload), "{\"endpoint_id\":\"%s\"}", endpoint);
+  require_true(validate("rtq_query", payload, reason, sizeof(reason)), "cached endpoint fits exact scope buffer");
+  endpoint[127] = 'e'; endpoint[128] = 0;
+  snprintf(payload, sizeof(payload), "{\"endpoint_id\":\"%s\"}", endpoint);
+  require_true(!validate("rtq_query", payload, reason, sizeof(reason)), "cached endpoint cannot be truncated");
+}
+
 int main(void) {
   char reason[256];
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup("RTR_GET_FILE");
@@ -252,6 +291,7 @@ int main(void) {
       return 1;
     }
   }
+  test_cached_query_identity();
   require_true(validate("velo_query", "{\"scope\":\"inspect_process\",\"pid\":42,\"limit\":100,\"backend\":\"local_collector\",\"provider_requested\":\"auto\",\"fallback_reason\":\"\",\"initiated_by\":\"operator\"}", reason, sizeof(reason)),
                "current backend velo payload satisfies strict contract");
   require_true(validate("REFRESH_ATTACK_SURFACE", "{\"reason\":\"manual attack surface refresh\"}",

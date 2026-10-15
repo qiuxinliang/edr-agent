@@ -15,6 +15,7 @@
 #include <time.h>
 #ifdef EDR_TEST_EXTENDED_EGRESS
 #include "edr/command_state.h"
+#include "edr/command_contract.h"
 #include "edr/command_signature.h"
 #include "edr/agent_update_command.h"
 #include "cJSON.h"
@@ -774,12 +775,12 @@ static int update_download_scenario(const char *path,int bad_tls) {
 /* Runs real storage, RAW/BLZ4 codec, frozen request purpose, durable result
  * owner and final HTTP gate. Signature admission and TLS remain covered by
  * the existing signed loopback suite; this mode opens no network connection. */
-static void local_query_source(unsigned number,int compressed,int mismatch) {
+static void local_query_source(unsigned number,int compressed,int mismatch,uint32_t pid) {
   EdrBehaviorRecord *source=calloc(1,sizeof(*source)),*record=calloc(1,sizeof(*record));
   uint8_t *raw=malloc(1048576u),*wire=malloc(1048576u);
   CHECK(source && record && raw && wire); if(!source||!record||!raw||!wire) goto done;
   edr_behavior_record_init(source); source->type=EDR_EVENT_PROCESS_CREATE;
-  source->pid=42+number; source->ppid=21; source->process_start_key=1000+number;
+  source->pid=pid; source->ppid=21; source->process_start_key=1000+number;
   source->process_creation_filetime_100ns=133700000000000000ULL+number;
   source->event_time_ns=(int64_t)time(NULL)*1000000000LL;
   snprintf(source->endpoint_id,sizeof(source->endpoint_id),"synthetic-endpoint");
@@ -808,6 +809,75 @@ static void local_query_source(unsigned number,int compressed,int mismatch) {
   CHECK(edr_storage_queue_p0_source_only_commit_local_typed(&latch,record->event_id,record->event_id,wire,body+12,compressed,0,&owner)==EDR_OK);
 done:
   free(source);free(record);free(raw);free(wire);
+}
+
+static int local_query_bind_request(EdrSoarCommandMeta *meta,const char *request) {
+  char reason[256];
+  if (!edr_command_contract_validate("rtq_query",(const uint8_t *)request,strlen(request),reason,sizeof(reason))) {
+    fprintf(stderr,"cached query ingress rejected: %s\n",reason);
+    return -1;
+  }
+  return edr_command_result_bind_contract(&meta->result_authorization,(const uint8_t *)request,
+      strlen(request),meta->issued_at_unix_ms);
+}
+
+static void local_query_identity_scope(const EdrSoarCommandMeta *base) {
+  EdrSoarCommandMeta meta=*base;
+  EdrCommandResultAuthorization *a=&meta.result_authorization;
+  snprintf(a->command_id,sizeof(a->command_id),"local-query-generation");
+  /* A second real local fact reuses PID 42 with a distinct process instance. */
+  local_query_source(4,0,0,42);
+  const char *request="{\"endpoint_id\":\"synthetic-endpoint\",\"pid\":42,\"process_start_key\":\"1000\","
+      "\"process_creation_filetime_100ns\":\"133700000000000000\",\"time_window_s\":600,\"limit\":1}";
+  CHECK(local_query_bind_request(&meta,request)==0);
+  char output[16384],projected[16384],reason[128];
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
+  cJSON *result=cJSON_Parse(output);CHECK(result);
+  cJSON *rows=result?cJSON_GetObjectItemCaseSensitive(result,"rows"):NULL;
+  cJSON *row=rows?cJSON_GetArrayItem(rows,0):NULL;
+  CHECK(cJSON_GetArraySize(rows)==1 && row);
+  if (row) {
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(row,"process_start_key")->valuestring,"1000"));
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(row,"process_creation_filetime_100ns")->valuestring,"133700000000000000"));
+  }
+  CHECK(!strstr(output,"cmdline") && !strstr(output,"private-unrequested-command") && !strstr(output,"other-tenant"));
+  CHECK(edr_command_result_project_detail(a,"rtq_query",1,0,output,projected,sizeof(projected))==0);
+  CHECK(edr_command_state_finish(a->command_id,"rtq_query",&meta,"ok",1,0,projected,"",1)==0);
+  char *body=edr_command_result_http_json(a->endpoint_id,"test-v1",a->command_id,"rtq_query",1,0,projected,
+      meta.issued_at_unix_ms,"","","");CHECK(body);
+  if(body) { CHECK(edr_egress_request_validate_for_scope("POST","ingest/report-command-result","application/json",
+      body,strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason))==0);free(body); }
+  const char *fields[]={"endpoint_id","process_start_key","process_creation_filetime_100ns"};
+  const char *wrong[]={"other-endpoint","1004","133700000000000004"};
+  for(unsigned i=0;row && i<3;++i) {
+    cJSON *forged=cJSON_Duplicate(result,1);CHECK(forged);
+    if(!forged)continue;
+    cJSON *forged_row=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(forged,"rows"),0);
+    CHECK(cJSON_ReplaceItemInObjectCaseSensitive(forged_row,fields[i],cJSON_CreateString(wrong[i])));
+    char *json=cJSON_PrintUnformatted(forged);CHECK(json);
+    if(json) {
+      CHECK(edr_command_result_project_detail(a,"rtq_query",1,0,json,projected,sizeof(projected))!=0);
+      body=edr_command_result_http_json(a->endpoint_id,"test-v1",a->command_id,"rtq_query",1,0,json,
+          meta.issued_at_unix_ms,"","","");CHECK(body);
+      if(body) { CHECK(edr_egress_request_validate_for_scope("POST","ingest/report-command-result","application/json",
+          body,strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason))!=0);free(body); }
+      free(json);
+    }
+    cJSON_Delete(forged);
+  }
+  cJSON_Delete(result);
+  request="{\"endpoint_id\":\"other-endpoint\",\"pid\":42,\"limit\":1}";
+  CHECK(local_query_bind_request(&meta,request)==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))<0 &&
+      strstr(output,"authorization invalid"));
+  /* Both generation components must match, even though each belongs to PID42. */
+  request="{\"pid\":42,\"process_start_key\":\"1000\",\"process_creation_filetime_100ns\":\"133700000000000004\","
+      "\"time_window_s\":600,\"limit\":1}";
+  CHECK(local_query_bind_request(&meta,request)==0);
+  CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
+  result=cJSON_Parse(output);CHECK(result);
+  if(result) { CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(result,"rows"))==0);
+    CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(result,"absence_is_evidence")));cJSON_Delete(result); }
 }
 
 static void local_query_terminal_source(unsigned number,int mismatch) {
@@ -868,14 +938,14 @@ static int local_query_contract_scenario(const char *prefix) {
   edr_egress_set_command_result_validator(edr_command_state_result_authorized);
   edr_storage_queue_configure(16,1);CHECK(edr_storage_queue_open(queue)==EDR_OK);
   CHECK(edr_local_evidence_cache_open_with_policy(cache,16,1,4)==0);
-  for(unsigned i=0;i<3;++i)local_query_source(i,i==1,0);
+  for(unsigned i=0;i<3;++i)local_query_source(i,i==1,0,42+i);
   EdrSoarCommandMeta meta={0};meta.issued_at_unix_ms=(int64_t)time(NULL)*1000;meta.deadline_ms=60000;
   EdrCommandResultAuthorization *a=&meta.result_authorization;
   snprintf(a->command_id,sizeof(a->command_id),"local-query-contract");snprintf(a->command_type,sizeof(a->command_type),"rtq_query");
   snprintf(a->tenant_id,sizeof(a->tenant_id),"synthetic-tenant");snprintf(a->endpoint_id,sizeof(a->endpoint_id),"synthetic-endpoint");
   a->expires_unix_ms=meta.issued_at_unix_ms+60000;
   const char *request="{\"event_type\":\"1\",\"process_name\":\"query-visible\",\"limit\":10}";
-  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(local_query_bind_request(&meta,request)==0);
   char output[16384],projected[16384],reason[128];
   int queried=edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output));CHECK(queried==0);
   cJSON *result=queried==0 ? cJSON_Parse(output) : NULL;CHECK(result);
@@ -890,8 +960,9 @@ static int local_query_contract_scenario(const char *prefix) {
   if(body) { int gate=edr_egress_request_validate_for_scope("POST","ingest/report-command-result","application/json",body,strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason));
     if(gate)fprintf(stderr,"local query final gate cause=%s\n",reason);
     CHECK(gate==0);free(body); }
+  local_query_identity_scope(&meta);
   request="{\"pid\":43,\"process_cmdline\":\"tail-needle\"}";
-  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(local_query_bind_request(&meta,request)==0);
   CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
   result=cJSON_Parse(output);CHECK(result);
   if(result) {
@@ -904,7 +975,7 @@ static int local_query_contract_scenario(const char *prefix) {
   local_query_terminal_source(1,0);
   snprintf(a->command_id,sizeof(a->command_id),"local-query-terminal");
   request="{\"pid\":4242}";
-  CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  CHECK(local_query_bind_request(&meta,request)==0);
   CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))==0);
   result=cJSON_Parse(output);CHECK(result);
   if(result)CHECK(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(result,"rows"))==1);
@@ -917,8 +988,8 @@ static int local_query_contract_scenario(const char *prefix) {
       strlen(body),a->tenant_id,a->endpoint_id,reason,sizeof(reason))==0);free(body); }
   local_query_terminal_source(2,1);
   CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))<0 && strstr(output,"identity"));
-  local_query_source(3,0,1);
-  request="{\"pid\":99}";CHECK(edr_command_result_bind_contract(a,(const uint8_t*)request,strlen(request),meta.issued_at_unix_ms)==0);
+  local_query_source(3,0,1,45);
+  request="{\"pid\":99}";CHECK(local_query_bind_request(&meta,request)==0);
   CHECK(edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output))<0 && strstr(output,"identity"));
   edr_storage_queue_close();edr_local_evidence_cache_close();remove(queue);remove(cache);
   char fixture_file[1500];
@@ -934,7 +1005,7 @@ static int local_query_contract_scenario(const char *prefix) {
 #else
   CHECK(rmdir(state)==0);
 #endif
-  printf("{\"mode\":\"local-query-contract\",\"raw_lz4_scope_projection_final_gate\":true,\"terminal_source_scope_projection_final_gate\":true,\"network_started\":false,\"failed_checks\":%u}\n",failed);
+  printf("{\"mode\":\"local-query-contract\",\"ingress_contract_verified\":true,\"signature_verified\":false,\"raw_lz4_scope_projection_final_gate\":true,\"terminal_source_scope_projection_final_gate\":true,\"network_started\":false,\"failed_checks\":%u}\n",failed);
   return failed ? 1 : 0;
 }
 
