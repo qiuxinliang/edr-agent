@@ -26,6 +26,8 @@ import shutil
 import statistics
 import subprocess
 import tarfile
+from retention_comparison_support import (dependencies, compiler_flags, compile_command,
+    runtime_environment, verify_native, compiler_identity, execute_benchmark)
 
 SOURCES = [
     'src/preprocess/detection_decision.c', 'src/preprocess/detection_profile.c',
@@ -59,7 +61,9 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--baseline', default='6bedb86bf9811bc304f4c97fdd62212ef437423f')
 parser.add_argument('--runs', type=int, default=5)
-parser.add_argument('--cc', default=os.environ.get('CC', 'cc'))
+parser.add_argument('--cc', default=os.environ.get('CC', 'cl' if os.name == 'nt' else 'cc'))
+parser.add_argument('--dependency-prefix', type=Path)
+parser.add_argument('--native-machine', choices=('amd64', 'arm64'))
 args = parser.parse_args()
 repo = Path(__file__).resolve().parents[1]
 out = args.output.resolve()
@@ -88,6 +92,7 @@ for folder in ('src', 'include', 'third_party'):
     shutil.copytree(repo/folder, current/folder)
 harness = out/'evidence_retention_comparison.c'
 harness.write_bytes((repo/'tests/evidence_retention_comparison.c').read_bytes())
+(out/'retention_benchmark_support.h').write_bytes((repo/'tests/retention_benchmark_support.h').read_bytes())
 # Verify the complete exported baseline (including transitive headers), not a
 # hybrid of old C and new headers. Ignore directories; no source is patched.
 for path in old.rglob('*'):
@@ -96,60 +101,76 @@ for path in old.rglob('*'):
         expected = capture(['git', 'show', revision + ':' + relative], cwd=repo)
         if path.read_bytes() != expected:
             raise RuntimeError('Baseline source mismatch: ' + relative)
-flags = ['-g', '-std=c11', '-D_DEFAULT_SOURCE', '-Wall', '-Wextra',
-         '-Wno-unused-parameter', '-Wno-unused-function', '-UNDEBUG',
-         '-DEDR_AGENT_VERSION_STRING="3.2.642"', '-DEDR_HAVE_LZ4=1',
-         '-DEDR_HAVE_ZSTD=1', '-DEDR_HAVE_NANOPB=1', '-DEDR_HAVE_SQLITE=1',
-         '-DEDR_LOCAL_EVIDENCE_CACHE_TESTING=1', '-DPB_FIELD_32BIT=1']
-try:
-    dependency = shlex.split(capture(
-        ['pkg-config', '--cflags', '--libs', 'sqlite3', 'libzstd'], text=True, stderr=subprocess.DEVNULL))
-except (FileNotFoundError, subprocess.CalledProcessError):
-    dependency = ['-lsqlite3', '-lzstd']
-    if Path('/opt/homebrew/include').is_dir():
-        dependency = ['-isystem', '/opt/homebrew/include', '-L/opt/homebrew/lib',
-                      '-Wl,-rpath,/opt/homebrew/lib', *dependency]
+defines = ['EDR_AGENT_VERSION_STRING="3.2.642"', 'EDR_HAVE_LZ4=1',
+           'EDR_HAVE_ZSTD=1', 'EDR_HAVE_NANOPB=1', 'EDR_HAVE_SQLITE=1',
+           'EDR_LOCAL_EVIDENCE_CACHE_TESTING=1', 'PB_FIELD_32BIT=1']
+dependency_includes, dependency, dependency_hashes = dependencies(args.dependency_prefix)
 metadata = {'baseline_revision': revision,
             'current_head': capture(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
             'current_is_working_tree_snapshot': True, 'harness_sha256': digest(harness.read_bytes()),
-            'runs': args.runs, 'metrics_are_synthetic': True}
+            'runs': args.runs, 'metrics_are_synthetic': True,
+            'runner_sha256': digest(Path(__file__).read_bytes()),
+            'measurement_header_sha256': digest((out/'retention_benchmark_support.h').read_bytes()),
+            'runner_support_sha256': digest((repo/'tests/retention_comparison_support.py').read_bytes()),
+            'dependency_sha256': dependency_hashes, 'native_machine_required': args.native_machine,
+            'compiler': compiler_identity(args.cc),
+            'measurement_scope': 'Cache open, writes and maintenance through close; final forensic SQL inventory excluded from CPU/I/O counters',
+            'cpu_clock': 'GetProcessTimes' if os.name == 'nt' else 'getrusage',
+            'wall_clock': 'QueryPerformanceCounter' if os.name == 'nt' else 'CLOCK_MONOTONIC',
+            'io_boundary': 'SQLite-issued VFS bytes and optional Windows process-issued bytes; not device I/O',
+            'time_boundary': '8 simulated event hours, not an 8-hour wall-clock soak'}
 (out/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
 summaries = {}
+frozen_sources = []
 for name, source, selected in [('old',old,1), ('current_1h',current,1), ('current_4h',current,4)]:
     sources = SOURCES + (QUEUE_SOURCES if source == current else [])
-    command = [args.cc, *flags]
+    selected_defines = list(defines)
     if source == current:
-        command += ['-DBENCH_REAL_QUEUE=1', '-DBENCH_SOURCE="current"',
-                    '-DBENCH_SELECTED_HOURS='+str(selected),
-                    '-DBENCH_OPEN(path,selected)=edr_local_evidence_cache_open_with_policy(path,8,1,selected)']
-    for folder in ('.','include','third_party/cjson','third_party/nanopb','src/proto','third_party/lz4'):
-        command += ['-I'+str(source/folder)]
-    binary = out/(name+'_benchmark')
-    command += [str(harness), *[str(source/p) for p in sources], '-o', str(binary),
-                *dependency, '-lm', '-pthread']
+        selected_defines += ['BENCH_REAL_QUEUE=1', 'BENCH_SOURCE="current"',
+                    'BENCH_SELECTED_HOURS='+str(selected),
+                    'BENCH_OPEN(path,selected)=edr_local_evidence_cache_open_with_policy(path,8,1,selected)']
+    include_paths = [source/folder for folder in
+        ('.','include','third_party/cjson','third_party/nanopb','src/proto','third_party/lz4')]
+    binary = out/(name+'_benchmark'+('.exe' if os.name == 'nt' else ''))
+    flags = compiler_flags(selected_defines, [out, *include_paths, *dependency_includes], args.native_machine)
+    command = compile_command(args.cc, flags, [harness, *[source/p for p in sources]], binary, dependency)
     (out/(name+'-compile.json')).write_text(json.dumps(command,indent=2)+'\n')
     hashes = {p.relative_to(source).as_posix():digest(p.read_bytes())
               for p in source.rglob('*') if p.is_file() and not p.is_symlink()}
+    frozen_sources.append((source, hashes))
     (out/(name+'-source-sha256.json')).write_text(json.dumps(hashes,sort_keys=True,indent=2)+'\n')
     with (out/(name+'-build.log')).open('w') as log:
         run(command, cwd=out, stdout=log, stderr=subprocess.STDOUT)
     samples=[]
     with (out/(name+'-runs.log')).open('w') as log:
         for index in range(args.runs):
-            result=run([str(binary)],cwd=out,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
-            log.write(result.stdout);log.flush()
-            (out/(name+'-run-'+str(index)+'-stderr.log')).write_text(result.stderr)
-            lines=[x for x in result.stdout.splitlines() if x.startswith('retention_value_benchmark ')]
+            synthetic=out/('synthetic-'+name+'-'+str(index)); synthetic.mkdir()
+            execution=execute_benchmark([str(binary)],synthetic,
+                runtime_environment(synthetic,args.dependency_prefix),60)
+            stdout=(synthetic/'stdout.log').read_text(encoding='utf-8')
+            log.write(stdout);log.flush()
+            if execution['exit_code']!=0 or execution['timed_out']:
+                raise RuntimeError('Benchmark failed; partial output and terminal status preserved: '+str(synthetic))
+            lines=[x for x in stdout.splitlines() if x.startswith('retention_value_benchmark ')]
             if len(lines)!=1:raise RuntimeError('Missing benchmark output: '+name)
             values=dict(item.split('=',1) for item in lines[0].split()[1:])
+            verify_native(binary, values, args.native_machine)
             samples.append(values)
-    sums={key:statistics.median((float if key in ('cpu_seconds','sqlite_write_amplification') else int)(row[key]) for row in samples)
-          for key in samples[0] if key not in ('source','input_sha256')}
+    sums={key:statistics.median((float if key.endswith('seconds') or key=='sqlite_write_amplification' else int)(row[key]) for row in samples)
+          for key in samples[0] if key not in ('source','input_sha256','sqlite_version')}
     sums['input_sha256']=samples[0]['input_sha256']
-    if any(row['input_sha256']!=sums['input_sha256'] for row in samples):
+    sums['sqlite_version']=samples[0]['sqlite_version']
+    if any(row['input_sha256']!=sums['input_sha256'] or row['sqlite_version']!=sums['sqlite_version'] for row in samples):
         raise RuntimeError('Nonidentical benchmark inputs')
     summaries[name]=sums
     print(json.dumps({'variant':name,'median':sums}),flush=True)
 if len({x['input_sha256'] for x in summaries.values()}) != 1:
     raise RuntimeError('Baseline and current input digests differ')
+for source, hashes in frozen_sources:
+    for relative, expected in hashes.items():
+        if digest((source/relative).read_bytes()) != expected:
+            raise RuntimeError('Frozen source changed during comparison: '+relative)
+for path, expected in dependency_hashes.items():
+    if digest(Path(path).read_bytes()) != expected:
+        raise RuntimeError('Dependency changed during comparison: '+path)
 (out/'summary.json').write_text(json.dumps(summaries,indent=2)+'\n')

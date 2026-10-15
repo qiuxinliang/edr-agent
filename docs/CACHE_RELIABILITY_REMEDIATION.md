@@ -1,5 +1,212 @@
 # Cache reliability remediation
 
+## 2026-10-16 native comparison preparation and a new producer recovery regression
+
+The comparison runners now support native Windows MSVC with the existing locked
+VS/vcpkg owners. Their dedicated CI builds synthetic test executables only,
+checks PE architecture and `IsWow64Process2` (emulation is rejected), and records
+`GetProcessTimes`, QPC, process-issued I/O and forwarded SQLite VFS I/O. It uses
+`contents:read`, has no installer/release/client operation and uploads only
+synthetic JSON/JSONL/logs. Narrow test/workflow push paths allow its first run on
+the development branch without changing the default branch. The installed 687
+Agent and routine upload projection are unaffected by these test-only changes.
+
+Independent review found a defect in the historical queue comparison: after
+each refused input it additionally committed the previous successful wire.
+Those extra writes differed between implementations and were absent from the
+reported input count/hash. Historical queue CPU/I/O and rotation results must
+therefore not be treated as a strict equal-total-input comparison or complete
+producer recovery proof. Original results remain preserved. The evidence-store
+comparison did not contain that fallback.
+
+The corrected queue comparison separately records the identical externally
+offered stream and the implementation-dependent actual commit/retry streams,
+with counts, bytes and SHA-256. It retains one exact failed snapshot/latch,
+retries it before accepting another input and explicitly counts deferred inputs.
+This is a queue model, not the real eight-slot/250 ms P0 producer. A separate
+`owner_loss` case deliberately drops that handoff and preserves the resulting
+recovery hold. No unrelated previous wire clears a failed owner. Every retained
+128 KiB wire is compared exactly, including a 90 KiB command, parent command and
+parent process generation; current windows verify all nine ledger categories
+against actual tables plus SQLite integrity/FK checks.
+
+Fresh macOS preflight results, with equal 1 MiB logical budgets, a one-hour target
+and 12 simulated windows, are:
+
+| Unique-input model | Old 662 queue | Current queue |
+| --- | ---: | ---: |
+| Offered new inputs | 48 | 48 |
+| Initial success / refusal / deferred | 7 / 1 / 40 | 3 / 34 / 11 |
+| Exact retry calls / successes | 40 / 0 | 44 / 33 |
+| Final retained rows / freshest age | 7 / 36,070 s | 3 / 120 s |
+| Retained timestamp span | 3,721 s | 3,541 s |
+| CPU user + system | 0.297385 s | 0.555719 s |
+| SQLite-issued write bytes | 1,524,932 | 20,017,796 |
+| Sampled DB/WAL/SHM peak bytes | 1,557,176 | 4,745,976 |
+| 20-byte terminal | Refused | Admitted and exact bytes read back |
+
+Replay (384 offered inputs), priority-3 and owner-loss cases also ran. Source
+sender calls remained zero under the declared sender stub. Queue CPU/I/O includes
+encoding, retries, per-window forensic inventory and terminal readback, before
+final close. The focused baseline pairs historical queue C/header with shared
+current codec/support; it is not a whole historical Agent build. Costs include
+different measured retry counts, not equal actual storage-call streams.
+
+The unchanged 8 MiB evidence workload was rerun five times per variant. Old 1 h,
+current 1 h and current 4 h retain 6/6/24 selected owners; self-contained parent
+chains are 0/6/24 and reconstruction with process cache is 6/6/24. All admit 192
+candidates, have identical protobuf input SHA, zero orphan references and valid
+SQLite structure. Current 4 h selected span is 10,820 s, not continuous four-hour
+coverage. Its median CPU is 0.300911 s, VFS writes 28,981,320 B, sampled peak
+3,379,192 B and final DB/WAL/SHM 791,832 B. This workload does not fill 8 MiB;
+the queue model supplies actual pressure. VFS/process-issued bytes are not
+physical-device write amplification. Simulated time is not a Windows soak.
+
+Commands and original outputs:
+
+```sh
+python3 -B tests/run_queue_retention_comparison.py --output /private/tmp/edr-windows-queue-frozen-20261016d --codec-build /private/tmp/edr-cache-assessment-egress-build --scenarios unique replay high_severity owner_loss
+python3 -B tests/run_evidence_retention_comparison.py --output /private/tmp/edr-windows-evidence-frozen-20261016d --runs 5
+```
+
+Seven frozen test/workflow file hashes and all execution manifests are indexed by
+`/private/tmp/edr-retention-comparison-handoff-2qczi__k/MANIFEST.json`, SHA-256
+`fa96dd953cf15498fca6b072eaae12ef80df051232cb17a92f2576966d17b7ee`.
+Queue summary SHA is
+`bccd94e08f6c3e0881af1b39a37f13ef8eae8de2c0268dd94a3c0ba08620a5dc`;
+evidence summary SHA is
+`b1c29affda9f203a387b2271d2011226188a593dfca5f81016ef2a999c21e16c`.
+Actual exit-17 and timeout subprocess output preservation passed 2/2; Windows
+MinGW branch compile-only checks passed 2/2. These are not native Windows runtime
+measurements; CI execution is pending at this preparation checkpoint.
+
+Tracing the new owner-loss counterexample also exposed a separate real-producer
+regression. A true SQLite/producer fixture fills the 1 MiB queue with 42 local
+records, then submits two different sources before their 250 ms retry deadline.
+Both remain in RAM, but repeated prepare converts the global latch to
+`recovery_required`. After two simulated hours and 16 real cleanup/recovery/retry
+turns, both are still pending and the original 42 rows cannot retire. The RED
+assertion aborts; it is not a successful degradation acceptance. Original proof:
+`/private/tmp/edr-p0-capacity-recovery-red-g43bpl63/RESULTS.json`.
+The serial comparison above does not close this real eight-slot producer path.
+Production repair, overflow/concurrency/restart regression and release/client
+validation remain required. This queue defect is distinct from the live
+evidence-store candidate-capacity refusal category below; no claim is made that
+it caused those 484 refusals.
+
+## 2026-10-16 follow-up: classify real admission refusals without disposing of evidence
+
+This follow-up starts at Agent HEAD
+`cddb191e836a882f7b1e2d252db14b874fc51104`; the installed 687 runtime remains
+`97064865522c6aebd050fab9675c7eb34697ece6`. The single UTM process is still PID
+8400 with the published Agent SHA recorded in the final 687 section below.
+Native `GetProcessTimes` returns exact
+creation FILETIME `134365780065939722`; CIM's displayed timestamp loses the
+last two 100 ns ticks. Two initial probes refused that mismatched generation
+before opening SQLite. Their original failures remain preserved. The corrected
+probe binds the independently verified native value and retains exact identity,
+path, sidecar/reparse and before/after generation checks.
+
+### Observed capacity and refusal category
+
+At the `23:20:40.250` UTC health report, this generation records 509 candidate
+requests, 25 new admissions and 484 refusals. The bounded read at guest
+`23:15:28.348` found 484 `candidate_capacity_refused` metric increments in five
+event-time minute buckets, for the configured endpoint and fixed
+`22:47 <= event time < 23:20` interval. This supports the capacity-gate category
+for this batch; it does not prove the specific DB/WAL/physical subcause of every
+attempt. Metrics use event timestamps, are not process-scoped and can omit
+unflushed, old-timestamp or unrecorded failures. Absent metric groups are not
+zero. Requests can update an existing owner; 484 is not a unique-lost-event count.
+
+The separate read-only page/retention aggregate at `23:20:43.797` measured:
+
+| Measurement | Bytes / count |
+| --- | ---: |
+| Main DB: 131,070 pages x 4,096 bytes | 536,862,720 B |
+| Free pages / freelist bytes | 0 / 0 B |
+| WAL / SHM | 12,392 / 32,768 B |
+| DB + WAL versus configured 536,870,912 B budget | 4,200 B over |
+| Policy 0, class 0, retained candidate owners | 7,950 |
+| Policy 1 retained recent / selected owners | 1 / 12 |
+
+File sizes matched before/after the 125 ms read. The 94 ms metric read and the
+geometry read use SQLite `mode=ro`, query-only, an eight-second deadline and
+1.5-second busy timeout. They export fixed aggregate fields, not candidate,
+fact, event or command rows. No checkpoint, migration, VACUUM, fake ACK or cache
+cleanup was performed. This page geometry does not attribute all bytes to the
+7,950 unknown owners or identify a historical WAL blocker. Zero reported physical
+refusals/retirement failures also does not prove every logical-budget write fits.
+
+`sqlite_size_budget_allow_mode` accounts DB plus WAL; a small WAL can cross
+the configured threshold even when the main DB is slightly below it. Existing
+owner growth must pass this gate too. A long reader or reusable-WAL failure can
+therefore reject a write. `candidate_pressure` instead reports a closed store
+or resource throttle. It is not a summary of all capacity refusals. Ordinary
+noncandidate/noncontext telemetry has a rate limit; candidates are exempt from
+that particular throttle. These are source-verified distinctions, not a claim
+that this live snapshot reproduced a particular SQLite reader failure.
+
+The existing host retention suite was rerun after this diagnosis: **1/1 CTest,
+39 retention cases passed in 7.26 s**. It includes existing-owner expansion
+under a real reader-pinned WAL, recovery after reader release, unclassified
+owner/shared-context protection, bounded reclaim, rollback/restart and result
+copy budgets. The command and immutable copied original output, test-binary and
+source hashes are in
+`/private/tmp/edr-687-capacity-followup-20261016/RESULTS.json`, SHA-256
+`d38551e6cc735cc1595febb4aa8a2cec9fc3d743d11ec98c046c6659bae14d84`.
+
+```sh
+ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -R '^local_evidence_cache_retention$'
+```
+
+The aggregate metric proof SHA-256 is
+`90d3dbe203d33917af778a1d265f8c71bc3b33609b9fa91fac1826d6daa063a5`;
+page/retention proof SHA-256 is
+`3faa72549877bef6ec1e8624d7e97292c8c1dd3954374d0cbca9cdad003b8460`.
+The refusal category does not justify changing retention policy to delete
+unknown old evidence, enlarging the budget or expanding routine uploads.
+
+### Legacy inventory disposition: proposal, no real-data migration
+
+The 7,950 owners remain separately measured and protected. Their aggregate
+policy/class label is insufficient to establish original purpose, delivery or
+recovery ownership. An eventual authorized disposition must use this sequence:
+
+1. Work from a consistent, integrity-checked copy with a capacity/physical-peak
+   estimate and immutable original-byte/identity manifest. Classify only owners
+   whose record format, writer and original lifecycle can be established.
+   Inspect complete linked delivery, frozen journal, recovery/projection,
+   investigation-pin, lineage, exact process-generation, entity and delta-base
+   dependencies. An absent ACK alone cannot decide local value or retirement.
+2. Produce a reviewable dry-run plan for complete causal groups, showing owner
+   class, policy version, byte estimates, protection reasons and proposed local
+   retention outcome. Unknown, conflicting, busy or incomplete groups stay
+   protected. Do not infer all 7,950 owners are disposable or promise enough
+   capacity will become available.
+3. After separate migration authorization, add bounded classification metadata;
+   preserve old frozen bytes, hashes, batch IDs and owner/lineage/generation
+   bindings. Recheck all protection and dependency predicates within the same
+   transaction before changing an owner. Use deterministic checkpoints and
+   bounded rows/time/bytes; verify restart and concurrent ACK/query behavior on
+   a synthetic copy first. Projection ACK only releases its own delivery edge.
+4. Treat permanent retirement as a separately authorized operation. Re-evaluate
+   the complete group in its transaction, record bounded policy/reason/stats
+   without inventing ACKs, and retain dependencies needed by surviving groups.
+   Before deletion, rollback can restore classification metadata. After a
+   committed deletion, recovery requires the authorized verified backup; metadata
+   rollback cannot recreate payload. Routine downgrade across unsupported
+   policy-3 delivery owners remains unsupported.
+
+If the plan cannot legally release enough stock, expose the protected-byte risk
+and continue finite, observable admission refusal. No fixed retention duration
+is guaranteed in that condition. A future disk-budget change or evidence export
+requires a separate concrete operational decision; routine full-fact upload is
+not a capacity remedy. The original two missing candidate samples remain an
+unclosed preservation gap; aggregate counts and replacement samples cannot
+close it. The cached-evidence consumer remains an interface/test proposal below,
+not a newly exposed remote-control route.
+
 ## 2026-10-16 final 687 Headless deployment and evidence acceptance
 
 Runtime source is `97064865522c6aebd050fab9675c7eb34697ece6` on

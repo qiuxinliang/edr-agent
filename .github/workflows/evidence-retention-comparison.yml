@@ -1,0 +1,103 @@
+# Test-only, manually dispatched equal-input comparison. No product build,
+# installer, release, endpoint connection or cache migration is performed.
+name: Evidence retention native comparison
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tests/evidence_retention_comparison.c
+      - tests/queue_retention_comparison.c
+      - tests/run_evidence_retention_comparison.py
+      - tests/run_queue_retention_comparison.py
+      - tests/retention_benchmark_support.h
+      - tests/retention_comparison_support.py
+      - .github/workflows/evidence-retention-comparison.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evidence-retention-comparison-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,read"
+
+jobs:
+  compare:
+    name: Native storage comparison ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+            msvc_arch: x64
+            triplet: x64-windows
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+            msvc_arch: arm64
+            triplet: arm64-windows
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Initialize the locked native compiler owner
+        shell: pwsh
+        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+      - name: Identify existing locked dependency cache
+        id: vcpkg-key
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .cache/vcpkg-downloads, .cache/vcpkg-bincache | Out-Null
+          python scripts/vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency cache identity failed' }
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.vcpkg-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.vcpkg-key.outputs.restore-prefix }}
+      - name: Bootstrap existing pinned vcpkg owner
+        shell: pwsh
+        run: .\scripts\bootstrap_pinned_vcpkg.ps1
+      - name: Install and ABI-check the existing manifest closure
+        shell: pwsh
+        run: |
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') -MaxAttempts 3 -InitialBackoffSeconds 30
+      - name: Equal-input native evidence and pressure comparisons
+        shell: pwsh
+        run: |
+          $results = Join-Path $env:RUNNER_TEMP 'retention-results'
+          if (Test-Path -LiteralPath $results) { throw 'Synthetic result directory must be new' }
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          python -B tests/run_evidence_retention_comparison.py --output "$results/evidence" --runs 5 --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Native evidence comparison failed; inspect preserved logs' }
+          python -B tests/run_queue_retention_comparison.py --output "$results/queue" --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}' --scenarios unique replay high_severity owner_loss
+          if ($LASTEXITCODE -ne 0) { throw 'Native queue pressure comparison failed; inspect preserved logs' }
+      - name: Preserve measurements and failure logs only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-retention-native-${{ matrix.arch }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/retention-results/**/*.json
+            ${{ runner.temp }}/retention-results/**/*.jsonl
+            ${{ runner.temp }}/retention-results/**/*.log

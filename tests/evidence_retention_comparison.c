@@ -186,45 +186,7 @@ static int64_t compact_scalar(sqlite3 *db, const char *sql) {
 #define BENCH_SELECTED_HOURS 1
 #define BENCH_OPEN(path,selected) edr_local_evidence_cache_open(path,8,1)
 #endif
-/* Test-only VFS accounting measures SQLite's issued reads/writes, including
- * WAL and checkpoint copies. It is not a hardware disk-controller counter. */
-typedef struct { sqlite3_file base; sqlite3_file *real; } RetentionBenchFile;
-static sqlite3_vfs *retention_bench_vfs_parent;
-static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_syncs;
-#define BENCH_FILE(f) (((RetentionBenchFile *)(f))->real)
-static int bench_close(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xClose(BENCH_FILE(f)); }
-static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) { retention_bench_reads+=(unsigned)n; return BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o); }
-static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) { retention_bench_writes+=(unsigned)n; return BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o); }
-static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
-static int bench_sync(sqlite3_file *f,int flags) { ++retention_bench_syncs; return BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags); }
-static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return BENCH_FILE(f)->pMethods->xFileSize(BENCH_FILE(f),n); }
-static int bench_lock(sqlite3_file *f,int n) { return BENCH_FILE(f)->pMethods->xLock(BENCH_FILE(f),n); }
-static int bench_unlock(sqlite3_file *f,int n) { return BENCH_FILE(f)->pMethods->xUnlock(BENCH_FILE(f),n); }
-static int bench_reserved(sqlite3_file *f,int *n) { return BENCH_FILE(f)->pMethods->xCheckReservedLock(BENCH_FILE(f),n); }
-static int bench_control(sqlite3_file *f,int n,void *p) { return BENCH_FILE(f)->pMethods->xFileControl(BENCH_FILE(f),n,p); }
-static int bench_sector(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xSectorSize(BENCH_FILE(f)); }
-static int bench_characteristics(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xDeviceCharacteristics(BENCH_FILE(f)); }
-static int bench_map(sqlite3_file *f,int p,int n,int e,void volatile **o) { return BENCH_FILE(f)->pMethods->xShmMap(BENCH_FILE(f),p,n,e,o); }
-static int bench_shm_lock(sqlite3_file *f,int o,int n,int flags) { return BENCH_FILE(f)->pMethods->xShmLock(BENCH_FILE(f),o,n,flags); }
-static void bench_barrier(sqlite3_file *f) { BENCH_FILE(f)->pMethods->xShmBarrier(BENCH_FILE(f)); }
-static int bench_unmap(sqlite3_file *f,int d) { return BENCH_FILE(f)->pMethods->xShmUnmap(BENCH_FILE(f),d); }
-static int bench_fetch(sqlite3_file *f,sqlite3_int64 o,int n,void **p) {
-  if (BENCH_FILE(f)->pMethods->iVersion<3 || !BENCH_FILE(f)->pMethods->xFetch) { *p=NULL; return SQLITE_OK; }
-  return BENCH_FILE(f)->pMethods->xFetch(BENCH_FILE(f),o,n,p);
-}
-static int bench_unfetch(sqlite3_file *f,sqlite3_int64 o,void *p) {
-  return BENCH_FILE(f)->pMethods->iVersion>=3 && BENCH_FILE(f)->pMethods->xUnfetch ? BENCH_FILE(f)->pMethods->xUnfetch(BENCH_FILE(f),o,p) : SQLITE_OK;
-}
-static const sqlite3_io_methods retention_bench_methods = {3,bench_close,bench_read,bench_write,bench_truncate,bench_sync,bench_size,
-  bench_lock,bench_unlock,bench_reserved,bench_control,bench_sector,bench_characteristics,bench_map,bench_shm_lock,bench_barrier,bench_unmap,bench_fetch,bench_unfetch};
-static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *file,int flags,int *out) {
-  (void)v; RetentionBenchFile *f=(RetentionBenchFile *)file;
-  f->real=(sqlite3_file *)(f+1); memset(f->real,0,(size_t)retention_bench_vfs_parent->szOsFile);
-  int rc=retention_bench_vfs_parent->xOpen(retention_bench_vfs_parent,name,f->real,flags,out);
-  if (f->real->pMethods) f->base.pMethods=&retention_bench_methods;
-  return rc;
-}
-#undef BENCH_FILE
+#include "retention_benchmark_support.h"
 
 static void test_retention_value_benchmark(void) {
   const int64_t base=INT64_C(1700000000000000000);
@@ -240,7 +202,7 @@ static void test_retention_value_benchmark(void) {
     edr_local_evidence_cache_test_set_now_unix_ns(base);
     retention_bench_reads=retention_bench_writes=retention_bench_syncs=0;
     edr_sha256_init(&benchmark_input_hash); benchmark_input_bytes=0;
-    clock_t cpu_begin=clock();
+    RetentionBenchMetrics metrics_begin=retention_bench_metrics();
     assert(BENCH_OPEN(path,selected)==0);
     for (unsigned hour=0;hour<8;++hour) {
       int64_t stamp=base+(int64_t)hour*3600000000000LL;
@@ -275,7 +237,8 @@ static void test_retention_value_benchmark(void) {
     EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
     if (status.physical_bytes>physical_peak) physical_peak=status.physical_bytes;
     edr_local_evidence_cache_close();
-    double cpu_seconds=(double)(clock()-cpu_begin)/CLOCKS_PER_SEC;
+    RetentionBenchMetrics metrics_end=retention_bench_metrics();
+    double cpu_seconds=metrics_end.user_seconds+metrics_end.system_seconds-metrics_begin.user_seconds-metrics_begin.system_seconds;
     uint64_t reads=retention_bench_reads,writes=retention_bench_writes,syncs=retention_bench_syncs;
     assert(sqlite3_open(path,&db)==SQLITE_OK);
     char sql[256];
@@ -284,6 +247,11 @@ static void test_retention_value_benchmark(void) {
     snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM p0_candidates WHERE type=%d",(int)EDR_EVENT_PMFE_SCAN_RESULT);
     int valuable=(int)compact_scalar(db,sql);
     sqlite3_stmt *st=NULL;
+    assert(sqlite3_prepare_v2(db,"PRAGMA integrity_check",-1,&st,NULL)==SQLITE_OK);
+    assert(sqlite3_step(st)==SQLITE_ROW && !strcmp((const char *)sqlite3_column_text(st,0),"ok"));
+    sqlite3_finalize(st);
+    int64_t orphan_refs=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL");
+    assert(orphan_refs==0);
     snprintf(sql,sizeof(sql),"SELECT MIN(event_time_ns),MAX(event_time_ns) FROM p0_candidates WHERE type=%d",(int)EDR_EVENT_PMFE_SCAN_RESULT);
     assert(sqlite3_prepare_v2(db,sql,-1,&st,NULL)==SQLITE_OK);
     assert(sqlite3_step(st)==SQLITE_ROW);
@@ -313,9 +281,16 @@ static void test_retention_value_benchmark(void) {
     sqlite3_finalize(st);
     uint8_t digest[32]; char input_sha[65]; edr_sha256_final(&benchmark_input_hash,digest);
     for (unsigned j=0;j<32;++j) snprintf(input_sha+2*j,3,"%02x",digest[j]);
-    printf("retention_value_benchmark source=%s selected_hours=%u input_candidates=192 low_context=48 recent=%d selected=%d selected_min_ns=%lld selected_max_ns=%lld complete_parent_chains=%u retained_post_context=%u reconstructable_chains_with_process_cache=%u physical_peak_bytes=%llu final_db_wal_shm_bytes=%llu cpu_seconds=%.6f sqlite_vfs_read_bytes=%llu sqlite_vfs_write_bytes=%llu sqlite_vfs_syncs=%llu input_protobuf_bytes=%llu input_sha256=%s sqlite_write_amplification=%.6f\n",
+    printf("retention_value_benchmark source=%s selected_hours=%u input_candidates=192 low_context=48 recent=%d selected=%d selected_min_ns=%lld selected_max_ns=%lld complete_parent_chains=%u retained_post_context=%u reconstructable_chains_with_process_cache=%u physical_peak_bytes=%llu final_db_wal_shm_bytes=%llu cpu_seconds=%.6f sqlite_vfs_read_bytes=%llu sqlite_vfs_write_bytes=%llu sqlite_vfs_syncs=%llu input_protobuf_bytes=%llu input_sha256=%s sqlite_write_amplification=%.6f wall_seconds=%.6f cpu_user_seconds=%.6f cpu_system_seconds=%.6f process_io_available=%d process_read_bytes=%llu process_write_bytes=%llu native_machine=%u process_machine=%u integrity_ok=1 orphan_references=%lld candidate_requests=%llu candidate_admitted=%llu candidate_rejected=%llu candidate_deduped=%llu sqlite_version=%s\n",
       BENCH_SOURCE,selected,recent,valuable,(long long)earliest,(long long)latest,intact,retained_post_context,reconstructable,(unsigned long long)physical_peak,
-      (unsigned long long)status.physical_bytes,cpu_seconds,(unsigned long long)reads,(unsigned long long)writes,(unsigned long long)syncs,(unsigned long long)benchmark_input_bytes,input_sha,(double)writes/(double)benchmark_input_bytes);
+      (unsigned long long)status.physical_bytes,cpu_seconds,(unsigned long long)reads,(unsigned long long)writes,(unsigned long long)syncs,(unsigned long long)benchmark_input_bytes,input_sha,(double)writes/(double)benchmark_input_bytes,
+      metrics_end.wall_seconds-metrics_begin.wall_seconds,metrics_end.user_seconds-metrics_begin.user_seconds,
+      metrics_end.system_seconds-metrics_begin.system_seconds,metrics_end.process_io_available,
+      (unsigned long long)(metrics_end.process_read_bytes-metrics_begin.process_read_bytes),
+      (unsigned long long)(metrics_end.process_write_bytes-metrics_begin.process_write_bytes),
+      metrics_end.native_machine,metrics_end.process_machine,(long long)orphan_refs,
+      (unsigned long long)status.candidate_requests,(unsigned long long)status.candidate_admitted,
+      (unsigned long long)status.candidate_rejected,(unsigned long long)status.candidate_deduped,sqlite3_libversion());
     sqlite3_close(db); cleanup_test_sqlite_path(path); free(r);
   }
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
