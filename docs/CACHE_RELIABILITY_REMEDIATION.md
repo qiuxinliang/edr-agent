@@ -132,9 +132,10 @@ inside the lock, but their actual live hold times were not measured. No
 updater self-lock path was found. The configured 10% resource threshold is not
 a Job CPU hard cap; Agent self-protection sets only `BREAKAWAY_OK`, and the
 updater is launched through a SYSTEM scheduled task. Those source facts do not
-establish a scheduling cause. A direct, single execution of the pinned Headless
-CLI under bounded diagnostic conditions is the next discriminating check;
-another release or upgrade is not justified by the same unexplained result.
+establish a scheduling cause. The subsequent bounded direct, launcher and
+SYSTEM-task discriminators below all passed; none reproduces the real active
+installation context. Another behavior repair or timeout increase is not
+justified by this unexplained aggregate exit code alone.
 
 The exact 673 tag (`6bedb86bf9811bc304f4c97fdd62212ef437423f`) was also traced,
 rather than assuming the current updater describes the old one. Its
@@ -212,6 +213,199 @@ The wrapper source SHA-256 is
 If its outer PowerShell process had been killed, descendant exit would have
 been explicitly unverified and further experiments stopped; this branch was
 not exercised. No further client upgrade was issued.
+
+### Isolated old-scanner overlap: timeout not reproduced
+
+One no-holder control and one concurrent old-scanner case ran in fresh private
+UTM directories, with no installed paths or real owner contents read. Both used
+the same generated 6,379,595 bytes: 4,096 unique final IDs, half held and half
+future not-due, 1,557–1,558 bytes per line and 766–770 detail bytes. This is a
+fixed invented distribution, not the endpoint's unknown row count or contents.
+The input SHA-256 is
+`b6d85f9167e05fbf2c918ccdf4af7924a95571dcac60be194c623aed63922940`.
+
+The 673 scanner and b7 inventory diagnostic were compiled fresh from their exact
+commits in 32 translation-unit invocations and two successful links (12.57 s).
+Original source/header hashes were independently checked. The old business
+code differs only by two row counters and an API observation bridge; lock
+parameters/return semantics are preserved. Timing includes the counter and
+grant-event observation overhead. Both executables are MinGW AMD64 on ARM64
+Windows emulation, not the native ARM64 release or an ARM64 timing guarantee.
+The new diagnostic uses existing observe-only test hooks, with no fault,
+retry or completion-delay injection. Its preload wait is outside the original
+CLI; the unchanged operation still has one-second admission and 15-second
+watchdog. The old holder never waits for the controller while holding its lock.
+
+The no-holder control returned 0 in 47 ms. The single real
+`collect_pending(..., 16)` scanned and restored all 4,096 rows, returned zero
+due results with empty stderr, and held the actual byte lock for 580.486958 ms,
+measured after acquisition through successful Unlock return. Concurrent b7
+observed real `ERROR_IO_PENDING` (997), completed the lock at 578 ms and returned
+0 with a valid floor in 641 ms. Thus overlap was proven, but this fixed
+single-scanner load **did not reproduce exit 7**. It does not justify raising
+the timeout or declaring the historical failure explained. No workload/row-count
+increase or repeated run was used to seek a failure.
+
+Both cases preserved owner/config/lock content hashes and DACL hashes, plus
+their directory DACL. Every child exited normally, every event handle closed,
+and no forced cleanup occurred. An independent review found a failure-cleanup
+short circuit before execution; the driver was corrected to attempt each owned
+process and handle independently and fail on incomplete cleanup. The original
+driver and exact correction remain preserved, not passed as runtime results.
+
+Build, input validation, independent-review source and actual results are under
+`/private/tmp/edr-684-active-inbox-n5saczo3/`. Reviewed manifest SHA-256 is
+`3ebf1eafc4e85b115d82dbc44123a99b6f3540e5703986f9c183bb438e13ff20`;
+executables are pinned as `d999be9a98f55f55169a04bb79e5969a3655816ab899d304a2c801142c17afd6`
+and `6bd1c593772dfe7df7b79beee44eb83ab0dd22523689a80dd503aa11660b715c`.
+The host transport completed in 5.493 seconds. Independent review verified the
+v2 cleanup, host transport and actual result identities: guest result SHA-256
+`2232c19e5ffe5678e5d0357ff3c1851afdaf416b1c987a5a9c87fd755d6f88ec`,
+host result SHA-256
+`6274d523a3f2d9522a711cd8a82691c394818e3682d5a4389b5b0e454ea4032d`.
+The six-lane active-inbox scenario is not implemented by this probe and is not
+claimed as tested here.
+
+### Operational owner format: aggregate discriminator only
+
+A bounded read of the installed owner returned only physical-format and
+semantic counts, with no IDs, commands, row hashes, file hash or raw data
+exported. It used the existing selected-field reader (16 MiB total, 65,536 rows,
+1 MiB per row and eight-second deadline), verified stable file identity during
+the read and performed no lock/ACL mutation. This was not a replacement sample
+of the two missing original evidence candidates.
+
+The first aggregate was 6,394,043 bytes / 5,637 physical lines. A second read was
+needed because the first combined decoding and JSON failures. That read was
+6,396,117 bytes / 5,639 lines: 5,616 strictly decoded final rows with distinct
+IDs, no decoded nonfinal rows, one pending/currently held result and no decoded
+future-not-due result. All 23 excluded rows failed UTF-8 decoding; none reached
+a JSON-syntax failure. Line lengths were 865..13,404 bytes, with 2,825 / 2,781 /
+33 lines in the <=1 KiB / <=4 KiB / <=16 KiB buckets. Parsed detail values totalled
+1,410,226 bytes. These parsed-subset counts do not classify the 23 excluded rows
+or prove that the owner's protected inventory consists only of those rows.
+
+The whole input contained 4,952 bytes >=0x80. Source inspection explains why a
+strict Python decoder and the production inventory can disagree: old JSON
+escaping copies bytes >=0x20 without validating UTF-8, while cJSON's string
+parser copies ordinary non-backslash bytes without requiring UTF-8. Therefore
+the 23 strict-decoder exclusions are not established JSON-syntax corruption or
+an inventory-classification failure. No old frozen bytes were reencoded,
+reclassified, removed or uploaded. The two reads are separate changing live
+snapshots, not a frozen before/after workload comparison.
+
+Results and bounded scripts are under `/private/tmp/edr-678-client-acceptance/`:
+`owner-format-684-aggregate.json`, `owner-format-684-aggregate-v2.json`,
+`run_684_owner_format_aggregate.py` and `run_684_owner_format_aggregate_v2.py`.
+Their physical-size/line-count distribution can inform an explicitly generated
+fixture; it cannot reconstruct the endpoint contents, encoding, identity or
+causal workload. No native ARM64 compiler is installed in this UTM, so isolated
+MinGW diagnostics remain AMD64 emulation and are reported separately from the
+published native ARM64 executable and CI gates.
+
+### Current SYSTEM task context, selected fields only
+
+One new temporary SYSTEM/Highest task, with no trigger or restart and a
+60-second execution limit, sampled only the two command-owner environment
+variables as fixed classifications plus its own process attributes. It did not
+open an owner/config path, execute an installer or enumerate another process.
+Both `EDR_COMMAND_STATE_DB` and `EDR_COMMAND_STATE_DIR` were `unset`; SYSTEM was
+true, priority was `below_normal`, and job membership was true. Membership
+alone establishes no Job CPU limit. This samples a new task's current context,
+not the failed historical installer or the current Agent's private environment.
+
+The sample exited zero, the exact new diagnostic task was removed, and the
+separate host-finally cleanup independently found it absent. No task restart or
+retry occurred. The frozen source/plan and actual result are in
+`/private/tmp/edr-684-task-context-fj1a21xa/`; manifest SHA-256 is
+`428c0a50b38691fdfee4f40d286e269d276ca3e1e5b3e13a73382fdc84ab7628`,
+result SHA-256 is
+`b7d100b4ca33751adcfd8dc2b7a4a9a2dcf5e4f0d2e4731d869e7360d5847b64`.
+The 13 offline input/classification/hash checks are separate from this actual
+Windows API/task execution. No current wrong inherited owner-path override was
+observed; installation-time contention and the historical context remain open.
+
+### Natural six-worker inbox pair: timeout still not reproduced
+
+The next isolated pair used the exact 673 executor/registry/cancel translation
+units, unchanged default 1/2/2/1 workers and normal 1,000 ms idle wait. Its
+diagnostic callback allocates 16 records, calls the real lane-filtered inbox
+collector, frees the records and returns zero. It does not recover, dispatch or
+execute a command; no delivery collector, repeated wake, worker barrier or
+injected delay is present. The active inbox is written by real `store_inbox`
+against a private synthetic identity before timing. The b7 observe-only
+inventory executable is byte-identical to the prior probe, with unchanged
+one-second admission and 15-second watchdog.
+
+Both cases use entirely generated 6,396,117 bytes / 5,639 unique ASCII final
+rows, matching the physical length buckets above but not the real contents,
+encoding, detail/escape distribution or the 23 excluded rows' unknown semantics.
+Input SHA-256 is
+`3623783e1c672793e4239d8952bfd8b739fbed72cc8247649535548ee0df4d00`.
+The first host invocation was refused by the private-directory name guard
+before directory creation or fixture upload. That failed record is preserved.
+A separate v2 host corrects only the fresh guest path and independent output
+names, and evaluates the actual bootstrap/driver path predicates offline.
+Neither workload nor binary was changed in response to a runtime result.
+
+The empty-inbox control returned zero in 63 ms; the active-inbox case observed
+real `ERROR_IO_PENDING` (997), acquired at 62 ms and completed/unlocked with a
+valid floor and exit zero at 109 ms. All six distinct workers each scanned the
+full 5,639 lines in the active case; actual acquired-through-successful-Unlock
+hold intervals were 19.984375..25.236750 ms. Both cases preserved owner, config,
+lock and active-inbox bytes/ACLs and directory ACLs. All processes exited
+normally, all handles closed, no forced cleanup or observation overflow occurred.
+Independent review verified source provenance, concurrency/measurement boundaries,
+the path correction and raw result identity. This natural six-worker synthetic
+scenario also **did not reproduce exit 7**, and provides no basis to preselect an
+installer/timeout change. Its simplified callback and emulated AMD64 diagnostic
+binaries do not represent complete native ARM64 upgrade recovery or the real
+installation-time workload.
+
+Frozen source, the successful 19-TU/one-link build (7.178 s), manifest and both
+host attempts are under `/private/tmp/edr-684-active-inbox-six-lwgr6op6/`.
+Manifest SHA-256 is
+`d5ac458d844d7a815018df41a24231e7d1447c17ecdc2c4bbbdd6ba8133dfbb1`;
+guest result SHA-256 is
+`333621b17feb681f4d13d364da47d25d7fadee3948b9ada0a657b2c52edb80f2`,
+host v2 result SHA-256 is
+`de288a2a33fd513d64afdba35e697d5bcbfd14e00484649a1d509003042942cc`.
+
+### Native stock preflight inside a current SYSTEM task
+
+One separate temporary SYSTEM/Highest task ran the same published ARM64
+executable through the original Guard PowerShell launcher. Its inherited
+environment was not cleaned or overridden: before touching config/owner
+metadata, the helper classified both owner variables and rejected any unknown
+path. Both were `unset`, SYSTEM was true, priority was `below_normal` and job
+membership was true. The original 21-file Headless closure was reverified; no
+installer/config was copied and no Setup or Agent lifecycle action ran.
+
+The Guard returned zero in 1.703 seconds with a new valid floor `143479824`.
+No forced termination, timeout, stream overflow or incomplete cleanup occurred.
+Owner size 6,407,603 bytes and owner/lock mtime/size were stable within this
+read; the existing production lock DACL normalizer still prevents a claim of
+zero filesystem writes. The exact diagnostic task was removed; host-finally
+independently found it absent. The native one-second admission and 15-second
+watchdog/Guard wait were unchanged. The wrapper's 20-second launcher bound and
+30-second task-observation limit do not extend native lock admission.
+
+The wrapper owns the PowerShell launcher, so its empty captured streams are
+not independent attestation of all native stderr. The native exit is propagated
+by the Guard; its completion plus the verified numeric floor establish this
+single successful preflight. On forced launcher termination, native cleanup
+would be explicitly unconfirmed; that path was not exercised. Task/host exit
+zero by itself only means summary capture and cleanup, not upgrade acceptance.
+
+Frozen inputs and actual result are under
+`/private/tmp/edr-684-task-preflight-sh17692n/`. Manifest SHA-256 is
+`2f068aff69150a41b46e64f13e3a8d6600c42d01be5d31d5c1f50cb1bc083d5e`,
+result SHA-256 is
+`dc0a1d5d6eafe31ea6f2d823653a5efc1be7a45b379d2f10b12909f5874732f0`.
+This excludes a new SYSTEM task with inherited context and the launcher being
+inherently unable to calibrate the current owner. It does not reproduce the
+historical active update or attest its environment/lock holder. No further
+actual upgrade, cache cleanup, ACK mutation or Setup UI download was performed.
 
 ## 2026-10-16 queued inventory: mechanism and cancellation validation
 
@@ -1590,9 +1784,10 @@ corrected failures remain separately recorded. Release ownership/workflow Python
 contracts passed 48 and 21 cases. Modified Python syntax, control-character
 scan and `git diff --check` passed for all 66 task files.
 
-Remaining release closure is native AMD64/ARM64 release builds and actual ISCC
-lifecycle plus client upgrade/health/outbound verification. Until those run,
-this section does not certify deployment or all ten acceptance items. The old
+Current release closure is recorded in the 684 section above: native AMD64/ARM64
+gates and actual ISCC lifecycle passed for runtime source b7c8bd4, but the single
+UTM upgrade failed and rolled back to 673. Installed new-client health/outbound
+verification remains incomplete. This does not certify all ten acceptance items. The old
 reader maintenance result above covers synthetic formats 0/1/2; routine downgrade
 with policy-3 journals is unsupported because the old binary cannot finish the
 new delivery sequence. Installed real cache cleanup or permanent legacy-data
@@ -1600,23 +1795,26 @@ migration is not part of the authorized deployment.
 
 ### Acceptance evidence and release closure
 
-| Required acceptance | Implemented and exercised contract | Remaining consumer closure |
-| --- | --- | --- |
-| 1. Sustainable rotation, retained causality | Queue comparison covers 12 windows without full-fact delivery; cache comparison covers 8 virtual hours with exact parent generations and complete selected groups. Protected or oversized old owners cause explicit refusal. | Windows new-client sustained operation; no claim of guaranteed days at arbitrary input rates. |
-| 2. Same-budget comparison | Frozen old/current sources, identical encoded inputs, retained event ranges, complete chains, sampled DB/WAL/SHM, CPU and VFS issued writes are recorded above. | Device-level I/O and a production workload are not represented by the host fixture. |
-| 3. Critical reserve | Ordinary full stock cannot consume terminal/action completion reserve; finite critical exhaustion refuses before action. Both 679 native gates passed. | Installed new-client admission and health. |
-| 4. 20-byte terminal | Exact 20-byte payload admitted with full ordinary local stock, zero source uploads and zero fabricated ACKs. The 679 checkpoint source passed both native gates; later source revisions require their own completed gates. | No promise of unlimited critical admission. |
-| 5. Result budget | Real insert, growth, 1,000 serial copies and four concurrent writers; busy and commit failure preserve existing bytes; owner JSONL and optional copy failure are separate. Both 679 native gates passed. | Installed new-client necessary result and durable server receipt. |
-| 6. Pressure/network cases | Candidate dedupe/aggregation, unique and high-priority capacity, long commands, pin refusal, offline/ACK loss and policy refusal; real loopback mTLS 429/503 with exact successful receipts. Additional fixed-budget dead-letter storm: 1,024 attempts, 91 admits, 933 explicit refusals, 59 saturated waves, 420,693-byte logical plateau; reserved terminal and precreated result remain usable; source uploads/ACKs zero. | Storm uses this queue fixture's transport/codec stubs; it does not replace actual wire tests. Installed-client reconnect/delivery remains separate. |
-| 7. Concurrency/restart | 679 native child-process migration/reclaim crash cases passed. Previously POSIX-only cache lifecycle/query and mutex tests now execute on UTM, as do queue competing drains, stale event/journal connections and concurrent deferred retain. The fixed full queue and new Windows cases passed native AMD64 CI on e6130ee3. | The original full UTM 40-slice failure is retained; the verified BLOB-cost repair subsequently passed that unchanged fixture and the full suite. Native ARM64 still needs the follow-up gates. MinGW AMD64 on ARM64 emulation is additional evidence. A killed process is not hardware power loss. The AMD64 CI as a whole remains failed on its separate synthetic-CA fixture. |
-| 8. Time/physical pressure | Wall/monotonic window rules, SQLite busy, pinned readers, zero-space ACK refusal, guarded checkpoint and isolated native NTFS disk-full/recovery. | 679 real upgrade refused preflight and rolled back; isolated original release preflight passes do not certify installed new-client startup. Physical admission is not an atomic directory quota. |
-| 9. Frozen identity | Exact payload/hash/batch/owner, known PPID, PID reuse, uint64 generation and guarded old-reader tests passed both native gates. Three sampled old queue owners remain unchanged after the failed upgrade. | Two original evidence candidate samples are missing after rollback: preservation is unverified and deletion timing/cause unknown. New installed-client checks remain pending; old policy-3 delivery downgrade remains unsupported. |
-| 10. Minimal egress | Real protobuf/RAW/LZ4 round trips, bounded authorized query and final HTTP field assertions; source facts stay local after ordinary delivery; both 679 native gates passed. | Actual client/server consumers and unenumerated wire routes must not be inferred from server-filtered rows or empty completed-batch payloads. |
+Current aggregate status below includes the completed 684 gates; earlier failed
+releases and benchmark revisions remain historical evidence, not overwritten passes.
 
-The Windows release must compile AMD64 and ARM64, run its native gate and actual
-ISCC install/repair/rollback fixture, and retain immutable source/artifact
-identity. UTM standalone helpers and macOS sensor stubs cannot replace those
-steps. After the candidate release passes, the existing client upgrade command
+| Required acceptance | Implemented and exercised contract | Remaining consumer closure / limits |
+| --- | --- | --- |
+| 1. Sustainable rotation, retained causality | Same-input queue comparison covers 12 virtual windows without full-fact delivery; evidence comparison covers 8 virtual hours with exact-generation causal groups. Current retention contracts passed native AMD64 and ARM64 in 684. | Sustained operation of the installed new client remains unverified. Retention targets depend on workload and protected inventory. |
+| 2. Same-budget comparison | Frozen baseline/current sources and identical encoded inputs compare retained time ranges, chain completeness, sampled DB/WAL/SHM, CPU and issued VFS writes. | These are the recorded benchmark revisions, not a new performance measurement of b7c8. Physical-device I/O and production throughput are unverified. |
+| 3. Critical reserve | Real queue/SQLite tests fill ordinary local inventory exactly, admit terminal/journal owners, reject finite critical exhaustion and freeze previously reserved results. Both 684 native gates passed. | Queue fixture codec/transport are stubs; installed new-client admission/health remains unverified. This is a logical reserve, not physical block reservation. |
+| 4. 20-byte terminal | The original 20-byte regression passes with ordinary inventory exactly full, original local bytes retained, no source uploads and no fabricated ACKs. Both 684 native gates passed. | Critical capacity remains finite. No real-cache pressure experiment is claimed. |
+| 5. Result budget | Real evidence SQLite tests cover insert, expansion, 1,000 serial attempts, four writer threads, busy and COMMIT failure; rejection returns explicit outcomes. Separate authoritative-owner tests cover reserved completion and capacity refusal. Both 684 native gates passed. | These are separate fixtures: command-state/egress tests stub the optional SQLite query copy. Installed-client necessary-result persistence and server receipt remain unverified. |
+| 6. Pressure/network cases | Repeated/unique/high-priority input, long commands, pin exhaustion, offline/ACK loss, policy refusal and bounded dead-letter storms are covered. Real loopback mTLS exercises 429/503 and exact receipts. Both 684 native gates passed. | Storm codec/transport are stubs. The TLS receiver is a synthetic business consumer; installed-client reconnect/delivery remains separate. |
+| 7. Concurrency/restart | Real SQLite lifecycle/query concurrency, competing drains, stale connections, deferred retain and child-process migration/reclaim recovery run on both Windows architectures in 684. | Earlier failed runs remain history. Abrupt process termination is not hardware power loss; installed real-cache migration was not performed. MinGW AMD64 emulation is separate additional evidence. |
+| 8. Time/physical pressure | Clock movement, busy, long readers, zero-space receipt refusal, guarded checkpoints and isolated NTFS disk-full/recovery are covered. Both 684 native gates passed. | Actual 684 upgrade still refused preflight and rolled back. Standalone successful preflight does not certify the installer context. Physical protection is admission checking, not an atomic directory quota. |
+| 9. Frozen identity | Native tests cover frozen payload/hash/batch/owner, PPID, PID reuse and exact uint64 generation. Three sampled original queue owners remained unchanged after the actual failed 684 attempt. | The original two candidate samples remain missing; preservation and deletion timing/cause are unverified. New samples or a later successful upgrade cannot retroactively close that historical gap. Old policy-3 delivery downgrade remains unsupported. |
+| 10. Minimal egress | Production protobuf/RAW/LZ4 encoding and final frame/request gates reject local source facts and unnecessary fields. Real loopback mTLS checks the received synthetic requests. These suites passed both 684 architectures. | Authorized-query contract opens no network; queue recovery uses synthetic transport receipts. Current installed-client/backend consumers remain unverified. Application-body counters and filtered server rows are not wire capture. |
+
+684 compiled AMD64 and ARM64, passed its native gates and actual ISCC lifecycle,
+and retained immutable source/artifact identity. Those results do not replace
+installed-client acceptance. UTM standalone helpers and macOS sensor stubs cannot
+replace native release gates. A further justified client upgrade command
 must select only the named lab endpoint; verify installed path/version/hash,
 new process start, health, protected inventory and real result/receipt behavior.
 No migration/verification step may clear the real cache, relabel an unknown old
