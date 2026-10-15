@@ -118,6 +118,8 @@ begin
     5: Result := 'floor_output_failed';
     7: Result := 'owner_lock_timeout';
     8: Result := 'deadline_unavailable';
+    9: Result := 'owner_lock_granted_expired';
+    10: Result := 'owner_lock_deadline_before_request';
     124: Result := 'child_watchdog_timeout';
   else
     Result := 'unclassified_exit';
@@ -172,6 +174,9 @@ begin
 #endif
     ProbeDir := ExpandConstant('{tmp}') + '\{app}';
     ProbeExe := ProbeDir + '\FDSensor.exe';
+    // Bind the extracted preflight image to the Headless Agent digest without
+    // exposing a temporary path or relying on an installed VERSION file.
+    Log('EDR storage preflight image: sha256=' + Lowercase(GetSHA256OfFile(ProbeExe)));
     OutputPath := ExpandConstant('{tmp}\edr-storage-space.floor');
     if FileExists(OutputPath) then DeleteFile(OutputPath);
     Arguments := '''--storage-space-preflight --output ''+[char]34+' +

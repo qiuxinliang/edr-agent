@@ -109,8 +109,14 @@ int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out);
  * Unlock completion is checked before success. The explicit preflight CLI has
  * a separate 15 s operation watchdog for acquisition, cleanup and accounting;
  * this is not a hard real-time guarantee about kernel I/O or scheduling.
- * On failure, out->last_error is a fixed local reason. */
-enum { EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT = -2 };
+ * On failure, out->last_error is a fixed local reason. Granted-expired means
+ * the final admission check found an acquired lock too late; it does not
+ * identify when the kernel granted the lock. */
+enum {
+  EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT = -2,
+  EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED = -3,
+  EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST = -4
+};
 int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out);
 
 enum {

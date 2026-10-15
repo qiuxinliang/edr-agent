@@ -81,6 +81,7 @@ try {
     $sources = Join-Path $root 'sources'
     $null = New-Item -ItemType Directory -Path (Join-Path $sources 'tree\nested') -Force
     Copy-Item -LiteralPath $PreflightExe -Destination (Join-Path $sources 'FDSensor.exe')
+    $expectedPreflightHash = (Get-FileHash -LiteralPath $PreflightExe -Algorithm SHA256).Hash.ToLowerInvariant()
     # Actual built FDSensor plus its app-local dependencies, not a fake CLI.
     Get-ChildItem -LiteralPath (Split-Path -Parent $PreflightExe) -Filter '*.dll' -File | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $sources
@@ -231,6 +232,7 @@ end;
         if ($case.Pass -and -not $logText.Contains("expanded_files=$expectedExpanded")) { throw 'measured source size missing from actual gate log' }
         if ($case.Pass) {
             if (-not $logText.Contains('EDR storage preflight: stage=child_exit; exit_code=0; reason=success')) { throw 'successful preflight exit was not logged' }
+            if (-not $logText.Contains("EDR storage preflight image: sha256=$expectedPreflightHash")) { throw 'extracted preflight image hash was not attested' }
             $growthMatch = [regex]::Match($logText,"expanded_files=$expectedExpanded; installation_growth=(\d+); floor=(\d+)")
             if (-not $growthMatch.Success) { throw 'actual installation growth log missing' }
             if ([Int64]$growthMatch.Groups[2].Value -lt 27MB) { throw 'local floor was bypassed' }
@@ -264,6 +266,7 @@ public static class SpacePreflightFailureFixture {
 }
 '@
     Add-Type -TypeDefinition $failureSource -OutputAssembly $failureChild -OutputType ConsoleApplication
+    $expectedFailureHash = (Get-FileHash -LiteralPath $failureChild -Algorithm SHA256).Hash.ToLowerInvariant()
     Copy-Item -LiteralPath $failureChild -Destination (Join-Path $sources 'FDSensor.exe') -Force
     $failureExpanded = 110592 + (Get-Item -LiteralPath $failureChild).Length + $runtimeDllBytes
     $failureScript = $script.Replace('OutputBaseFilename=space-fixture','OutputBaseFilename=space-failure-fixture').Replace("#if EdrExpandedBytes != $expectedExpanded","#if EdrExpandedBytes != $failureExpanded")
@@ -279,6 +282,8 @@ public static class SpacePreflightFailureFixture {
         @{Name='floor-output-failed'; Mode='5'; Code=5; Reason='floor_output_failed'},
         @{Name='owner-lock-timeout'; Mode='7'; Code=7; Reason='owner_lock_timeout'},
         @{Name='deadline-unavailable'; Mode='8'; Code=8; Reason='deadline_unavailable'},
+        @{Name='owner-lock-granted-expired'; Mode='9'; Code=9; Reason='owner_lock_granted_expired'},
+        @{Name='owner-lock-deadline-before-request'; Mode='10'; Code=10; Reason='owner_lock_deadline_before_request'},
         @{Name='child-watchdog'; Mode='watchdog'; Code=124; Reason='child_watchdog_timeout'},
         @{Name='launcher-unavailable'; Mode='7'; LaunchFailure=$true}
     )
@@ -296,10 +301,15 @@ public static class SpacePreflightFailureFixture {
         if ((Test-Path -LiteralPath $marker) -or (Test-Path -LiteralPath (Join-Path $dest 'one.bin'))) { throw "failure reached protected actions or file copy: $($case.Name)" }
         $logText = [IO.File]::ReadAllText($log)
         $diagnostics = @($logText -split '\r?\n' | Where-Object { $_.Contains('EDR storage preflight: ') })
+        $imageDiagnostics = @($logText -split '\r?\n' | Where-Object { $_.Contains('EDR storage preflight image: ') })
         if ($diagnostics.Count -ne 1) { throw "preflight diagnostic was missing or unbounded: $($case.Name)" }
         if ($case.LaunchFailure) {
+            if ($imageDiagnostics.Count -ne 0) { throw 'launcher-only fixture incorrectly attested an image' }
             if ($diagnostics[0] -notmatch 'EDR storage preflight: stage=launch_failed; win32_code=[23]$') { throw 'native Exec failure was not distinguished from child exit' }
-        } elseif (-not $diagnostics[0].EndsWith("EDR storage preflight: stage=child_exit; exit_code=$($case.Code); reason=$($case.Reason)")) { throw "wrong child failure classification: $($case.Name)" }
+        } else {
+            if ($imageDiagnostics.Count -ne 1 -or -not $imageDiagnostics[0].EndsWith("EDR storage preflight image: sha256=$expectedFailureHash")) { throw "wrong extracted preflight image identity: $($case.Name)" }
+            if (-not $diagnostics[0].EndsWith("EDR storage preflight: stage=child_exit; exit_code=$($case.Code); reason=$($case.Reason)")) { throw "wrong child failure classification: $($case.Name)" }
+        }
         if ($case.Mode -eq 'watchdog') {
             if (-not (Test-Path -LiteralPath $pidFile)) { throw 'watchdog fixture child never started' }
             $identity = [IO.File]::ReadAllText($pidFile)

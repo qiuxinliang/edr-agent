@@ -747,6 +747,7 @@ static int state_prepare_dir(const char *path) {
 #define STATE_INVENTORY_LOCK_WAIT_MS 1000u
 #ifdef EDR_COMMAND_STATE_INVENTORY_TEST
 extern void edr_command_state_inventory_test_observe(unsigned phase, DWORD error);
+extern void edr_command_state_inventory_test_before_request(void);
 extern void edr_command_state_inventory_test_before_cancel(HANDLE completion_event);
 extern BOOL edr_command_state_inventory_test_unlock(HANDLE, DWORD, DWORD, DWORD, LPOVERLAPPED);
 #define state_inventory_unlock_api edr_command_state_inventory_test_unlock
@@ -787,7 +788,11 @@ static int state_inventory_lock_wait(HANDLE handle) {
   if (!overlapped.hEvent) return -1;
   BOOL locked = FALSE;
   DWORD error = ERROR_SUCCESS;
-  int expired = GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
+#ifdef EDR_COMMAND_STATE_INVENTORY_TEST
+  edr_command_state_inventory_test_before_request();
+#endif
+  const int deadline_before_request = GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
+  int expired = deadline_before_request;
   int failed_wait = 0;
   if (!expired) {
     locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped);
@@ -824,7 +829,9 @@ static int state_inventory_lock_wait(HANDLE handle) {
   }
   expired = expired || GetTickCount64() - started >= STATE_INVENTORY_LOCK_WAIT_MS;
   int rc = locked && !expired && !failed_wait ? 0 : (expired
-      ? EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT : -1);
+      ? (deadline_before_request ? EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST
+          : (locked ? EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED
+              : EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT)) : -1);
   if (locked && rc != 0) {
     /* Late grant never authorizes an owner read. Release the same byte and
      * confirm completion while its independent OVERLAPPED remains alive. */
@@ -836,7 +843,9 @@ static int state_inventory_lock_wait(HANDLE handle) {
     (void)state_inventory_unlock(handle);
     rc = -1;
   }
-  if (rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT) error = ERROR_TIMEOUT;
+  if (rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT ||
+      rc == EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED ||
+      rc == EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST) error = ERROR_TIMEOUT;
   SetLastError(error);
   return rc;
 }
@@ -898,8 +907,14 @@ static FILE *state_inventory_lock_acquire(int *absent_parent, int *status,
   if (lock_rc != 0) {
     DWORD error = GetLastError();
     *status = lock_rc;
-    snprintf(reason, reason_cap, "%s", lock_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT
-        ? "state_inventory_lock_timeout" : "state_inventory_lock_failed");
+    const char *lock_reason = "state_inventory_lock_failed";
+    if (lock_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT)
+      lock_reason = "state_inventory_lock_timeout";
+    else if (lock_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED)
+      lock_reason = "state_inventory_lock_granted_expired";
+    else if (lock_rc == EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST)
+      lock_reason = "state_inventory_lock_deadline_before_request";
+    snprintf(reason, reason_cap, "%s", lock_reason);
     fclose(f); SetLastError(error); return NULL;
   }
 #else

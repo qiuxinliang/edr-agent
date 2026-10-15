@@ -216,8 +216,9 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
                     release_holder()
                     wait_event('q-grant')  # child observed its real kernel event
                     assert kernel.SetEvent(events['q-resume'])
-                elif mode == 'completion_expired':
-                    release_holder()
+                elif mode in ('completion_expired', 'completion_expired_unlock_failure'):
+                    if held:
+                        release_holder()
                     wait_event('q-completion-ready')
                     time.sleep(1.1)  # real monotonic deadline; no fake clock
                     assert kernel.SetEvent(events['q-completion-resume'])
@@ -254,6 +255,13 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
                 if mode in ('watchdog_event_failure', 'watchdog_thread_failure'):
                     assert observed['requests'] == observed['inventory_scan_calls'] == 0
                     assert b'deadline_unavailable' in stderr
+                elif mode == 'before_request':
+                    assert observed['point'] == 'returned' and observed['rc'] == 10
+                    assert observed['elapsed_ms'] >= 1100 and child_elapsed >= 1.0
+                    assert all(observed[key] == 0 for key in (
+                        'requests', 'lock_pending', 'cancel_calls', 'lock_completions',
+                        'unlock_requests', 'unlock_pending', 'unlock_completions',
+                        'inventory_scan_calls')), observed
                 else:
                     assert observed['requests'] == 1, observed
                     assert observed['lock_pending'] == int(held), observed
@@ -264,7 +272,8 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
                         assert observed['point'] == 'returned' and observed['rc'] == expected
                         assert observed['lock_completions'] == 1
                         assert observed['lock_completion_error'] == (995 if held and not release and mode == 'observe' else 0)
-                        assert observed['inventory_scan_calls'] == int(expected in (0, 4))
+                        assert observed['inventory_scan_calls'] == int(
+                            expected in (0, 4) and mode != 'completion_expired_unlock_failure')
                         if mode == 'late_grant':
                             assert observed['cancel_calls'] == 1 and observed['cancel_error'] in (0, 1168)
                         elif held and not release and mode == 'observe':
@@ -273,14 +282,20 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
                             assert observed['cancel_calls'] == 0
                         unlocks = int(observed['lock_completion_error'] == 0)
                         assert observed['unlock_requests'] == observed['unlock_completions'] == unlocks
-                        assert observed['unlock_completion_error'] == (5 if mode == 'unlock_failure' else 0)
+                        assert observed['unlock_completion_error'] == (
+                            5 if mode in ('unlock_failure', 'completion_expired_unlock_failure') else 0)
+                        if mode == 'completion_expired_unlock_failure':
+                            assert child_elapsed >= 1.0
+                            assert b'storage preflight: owner accounting or policy unavailable\n' in stderr.replace(b'\r\n', b'\n')
                 if expected:
                     assert not output.exists(), (name, 'failure emitted usable floor')
                 else:
                     assert output.read_bytes() == str(64*1024*1024).encode(), name
-                if expected == 7:
+                if expected in (7, 9, 10):
                     assert child_elapsed >= 0.9, (name, 'admission expired before its budget')
-                    assert b'storage preflight: owner_lock_timeout\n' in stderr.replace(b'\r\n', b'\n')
+                    reason = {7: b'owner_lock_timeout', 9: b'owner_lock_granted_expired',
+                              10: b'owner_lock_deadline_before_request'}[expected]
+                    assert b'storage preflight: ' + reason + b'\n' in stderr.replace(b'\r\n', b'\n')
                 assert hashlib.sha256(state.read_bytes()).hexdigest() == before_hash, name
             finally:
                 if child is not None and child.poll() is None:
@@ -298,8 +313,11 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
 
         queued_inventory('owner-lock-released', release=True, expected=0)
         queued_inventory('owner-lock-timeout')
-        queued_inventory('owner-lock-late-grant', mode='late_grant')
-        queued_inventory('owner-lock-completion-expired', mode='completion_expired')
+        queued_inventory('owner-lock-late-grant', mode='late_grant', expected=9)
+        queued_inventory('owner-lock-completion-expired', mode='completion_expired', expected=9)
+        queued_inventory('owner-lock-immediate-completion-expired', mode='completion_expired', held=False, expected=9)
+        queued_inventory('owner-lock-expired-unlock-failure', mode='completion_expired_unlock_failure', held=False, expected=4)
+        queued_inventory('owner-lock-deadline-before-request', mode='before_request', held=False, expected=10)
         queued_inventory('owner-unlock-failure', mode='unlock_failure', held=False, expected=4)
         queued_inventory('watchdog-event-unavailable', mode='watchdog_event_failure', held=False, expected=8)
         queued_inventory('watchdog-thread-unavailable', mode='watchdog_thread_failure', held=False, expected=8)

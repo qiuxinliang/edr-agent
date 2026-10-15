@@ -1,5 +1,105 @@
 # Cache reliability remediation
 
+## 2026-10-16 inventory failure classification: diagnostic change
+
+The direct native CLI, Guard launcher, current SYSTEM-task and isolated
+old-scanner/six-worker checks below did not reproduce the actual installation
+failure. The remaining live boundary is the active installer context. Historical
+child exit 7 combines distinct admission outcomes and cannot identify which
+occurred. This change makes the existing failure useful to the existing Inno
+consumer; it is **not a root-cause repair or a completed deployment**.
+
+Only the original expired-return branch is classified. The original success
+condition, one queued byte lock, one-second admission, cancellation/completion,
+unlock error precedence and 15-second CLI watchdog remain unchanged. No new
+configuration, output file, table, thread, retry, upload or authorization was
+added. Ordinary runtime locking and STARTUP policy behavior
+are unchanged; the new mappings are restricted to READ_ONLY inventory.
+
+| Observed admission outcome | Child exit / fixed reason |
+| --- | --- |
+| Other existing expiration without an acquired lock | `7 / owner_lock_timeout` (unchanged; not proof of continuous contention) |
+| Acquired lock present, final admission check expired | `9 / owner_lock_granted_expired` |
+| Initial deadline check expired before LockFileEx submission | `10 / owner_lock_deadline_before_request` |
+
+Exit 9 does not establish when the kernel granted the lock: caller scheduling
+after an earlier grant also satisfies it. An unlock failure still overrides
+expiration classification and yields accounting failure. Expired admission
+never authorizes an owner scan, and every nonzero result prohibits successful
+floor output as before. The Inno process can
+itself return outer installer exit 7 after any rejected child; diagnosis must
+read the existing log's `stage=child_exit` code and fixed reason, not confuse
+that outer installer code with the preflight child's code.
+
+The existing installer log also gains a SHA-256 of the extracted preflight
+executable immediately before invocation. It reads only that already extracted
+binary and logs a fixed hash field, with no temporary path, environment or owner
+content. This one additional binary read occurs before the native CLI starts;
+it does not extend CLI admission/watchdog limits. The existing exception handler
+rejects hash/read failures. This supplies the missing prelaunch-image identity
+for the next attempt, rather than inferring it from an installed VERSION or
+another test's binary-hot replacement. It does not retrospectively attest the
+684 child or independently measure the loaded image after launch. The supported
+Inno [built-in hash function](https://jrsoftware.org/ishelp/topic_isxfunc_getsha256offile.htm)
+requires no added dependency.
+
+The permanent Windows fixture uses real kernel pending/completion events for
+7/9, a test-only 1,100 ms monotonic delay after event creation for 10, and an
+immediate-acquisition/completion-delay case for 9. A combined expired-grant plus
+failed-unlock case requires exit 4, no scan/floor and handle-close release while
+the child remains alive; it does not claim a successful Unlock. Inno tests
+exercise refusal for 9/10 and compare the actual extracted image hash with the
+supplied executable. Bounded-redaction tests preserve both reasons and the hash
+after a long prefix. Production builds contain no environment-selected test
+mode. No further actual upgrade has been issued.
+
+Local validation at this source checkpoint:
+
+- Built `edr_agent` and `storage_space_preflight_client`, then ran
+  `ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure -R '^storage_space_preflight$'`:
+  pass, 0.78 s. The host build retains its previously declared nonproduction
+  PCRE2/P0 boundary; this diagnostic does not claim host P0 enforcement.
+- The first packaging-contract execution used a stale test executable and
+  failed an assertion absent from current source. After building the specific
+  `test_agent_update_assets` target, its case passed in 0.74 s; after the final
+  Guard/hash edit it passed again in 0.01 s. No assertion or workflow was
+  weakened. Original failed and corrected logs remain under
+  `/private/tmp/edr-preflight-classification-host-48pnqoof/`.
+- Fresh MinGW AMD64 compilation (18 translation-unit invocations, two links,
+  no reused objects) and all input digests passed. In the single isolated UTM
+  run, the permanent Python fixture with `--client fixture.exe` completed in
+  22.703 s, exit 0, with all 11 classification/failure cases and zero stderr.
+  Pending cancellation remained 7 (1.047 s); late/completion/immediate-completion
+  expiration returned 9 (1.031 / 1.125 / 1.125 s); the expired-grant/unlock failure
+  returned 4 with no scan (1.125 s); before-request expiration returned 10 with
+  no lock request/scan (1.140 s); the actual CLI watchdog self-exited 124 at
+  15.031 s. No parent timeout or forced termination was needed.
+- Each non-watchdog case proved a third-party handle could reacquire the byte
+  while the test child was alive. Both injected unlock failures rely on final
+  handle close, not successful Unlock. The watchdog case has no live-child
+  reacquisition assertion. Every case checks the synthetic owner SHA, and the
+  whole suite checks owner/parent owner-group-DACL preservation; this is not a
+  claim about SACL, config, lock hash/ACL or hardware power-loss behavior.
+- Three current PowerShell files parsed in Windows PowerShell 5.1, and the real
+  updater's bounded redactor passed all 30 synthetic cases, including 9/10 and
+  the prelaunch image digest. This UTM has no Inno compiler at the standard
+  installed path, so the new Inno includes/hash assertions remain pending CI;
+  no compiler/package was downloaded.
+
+Raw fixture results, original rejected execution plans and corrected plan are
+under `/private/tmp/edr-preflight-classification-fixture-x0v9_bas/`.
+Corrected plan SHA-256 is
+`4bc5263d7ae6fad8a6de58ec43c64df0e36ed5dda12e577a3235835c0d6a8a0c`;
+result SHA-256 is
+`baf166a94f054f3bd756cd5ec0dadc316944fbf1ee7ca09cd4fb672e8b865d85`,
+stdout SHA-256 is
+`03fc991da8f1741f5c7e6cf324e4374e834e33f765bc06b39a1306409413a4ba`.
+The PowerShell result is `ps-run.json`, SHA-256
+`b067ce2f5df509ab87af32e4ad8a867f36af7e0789790a453f9e4c9a0df2365a`.
+Independent review verified the source/cleanup boundaries and raw result
+identities. These are emulated AMD64 diagnostics on ARM64 Windows, separate
+from the forthcoming native MSVC gates and installed-client acceptance.
+
 ## 2026-10-16 candidate 684: queued inventory release acceptance
 
 Runtime source is `b7c8bd4b279d79fb72ae9db377df50e8f2981a91`, branch

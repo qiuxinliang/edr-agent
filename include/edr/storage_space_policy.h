@@ -21,7 +21,11 @@ enum EdrStoragePolicyInventory {
   EDR_STORAGE_POLICY_READ_ONLY
 };
 
-enum { EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT = -3 };
+enum {
+  EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT = -3,
+  EDR_STORAGE_POLICY_INVENTORY_LOCK_GRANTED_EXPIRED = -4,
+  EDR_STORAGE_POLICY_INVENTORY_DEADLINE_BEFORE_REQUEST = -5
+};
 
 static inline int edr_storage_policy_apply(const EdrConfig *cfg, enum EdrStoragePolicyInventory inventory_owner) {
   char owner_bytes[32], free_mb[32], protected_bytes[32];
@@ -40,9 +44,14 @@ static inline int edr_storage_policy_apply(const EdrConfig *cfg, enum EdrStorage
   else snprintf(protected_bytes, sizeof(protected_bytes), "%llu",
                 (unsigned long long)owner.protected_floor_bytes);
   if (edr_storage_policy_setenv("EDR_STORAGE_OWNER_PROTECTED_BYTES", protected_bytes)) return -1;
-  if (inventory_owner == EDR_STORAGE_POLICY_READ_ONLY &&
-      owner_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT)
-    return EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT;
+  if (inventory_owner == EDR_STORAGE_POLICY_READ_ONLY) {
+    if (owner_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT)
+      return EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT;
+    if (owner_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED)
+      return EDR_STORAGE_POLICY_INVENTORY_LOCK_GRANTED_EXPIRED;
+    if (owner_rc == EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST)
+      return EDR_STORAGE_POLICY_INVENTORY_DEADLINE_BEFORE_REQUEST;
+  }
   return unavailable ? -2 : 0;
 }
 

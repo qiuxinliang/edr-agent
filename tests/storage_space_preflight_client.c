@@ -25,7 +25,9 @@ static HANDLE q_cli_create_thread(LPSECURITY_ATTRIBUTES a,SIZE_T size,LPTHREAD_S
 #undef CreateEventA
 #undef CreateThread
 BOOL edr_command_state_inventory_test_unlock(HANDLE h,DWORD reserved,DWORD low,DWORD high,LPOVERLAPPED ov) {
-  if (q_injected_mode("unlock_failure")) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+  if (q_injected_mode("unlock_failure") || q_injected_mode("completion_expired_unlock_failure")) {
+    SetLastError(ERROR_ACCESS_DENIED); return FALSE;
+  }
   return UnlockFileEx(h,reserved,low,high,ov);
 }
 #endif
@@ -68,7 +70,8 @@ static void q_init(void) {
   q_mode = getenv("EDR_PREFLIGHT_TEST_MODE");
   if (!q_mode) return;
   q_require((!strcmp(q_mode,"observe") || !strcmp(q_mode,"late_grant") ||
-      !strcmp(q_mode,"completion_expired") || !strcmp(q_mode,"stall") ||
+      !strcmp(q_mode,"completion_expired") || !strcmp(q_mode,"completion_expired_unlock_failure") ||
+      !strcmp(q_mode,"before_request") || !strcmp(q_mode,"stall") ||
       !strcmp(q_mode,"watchdog_event_failure") || !strcmp(q_mode,"watchdog_thread_failure") || !strcmp(q_mode,"unlock_failure")));
   const char *prefix = getenv("EDR_PREFLIGHT_TEST_EVENT_PREFIX");
   q_require(prefix && !strncmp(prefix,"Local\\EDRInventory-",19) && strlen(prefix)<96u);
@@ -83,12 +86,21 @@ static void q_init(void) {
   q_finished=q_event(prefix,"q-finished");
   q_finish_resume=q_event(prefix,"q-finish-resume");
 }
+void edr_command_state_inventory_test_before_request(void) {
+  if (q_mode && !strcmp(q_mode,"before_request")) {
+    const ULONGLONG started = GetTickCount64();
+    ULONGLONG elapsed;
+    while ((elapsed = GetTickCount64() - started) < 1100u)
+      Sleep((DWORD)(1100u - elapsed));
+  }
+}
 void edr_command_state_inventory_test_observe(unsigned phase, DWORD error) {
   if (!q_mode) return;
   q_require(phase>0u && phase<10u && q_count[phase]<16u);
   q_count[phase]++; q_error[phase]=error;
   if (phase==2u) q_require(SetEvent(q_pending));
-  if (phase==4u && error==ERROR_SUCCESS && !strcmp(q_mode,"completion_expired")) {
+  if (phase==4u && error==ERROR_SUCCESS &&
+      (!strcmp(q_mode,"completion_expired") || !strcmp(q_mode,"completion_expired_unlock_failure"))) {
     q_require(SetEvent(q_completion_ready));
     q_require(WaitForSingleObject(q_completion_resume,5000u)==WAIT_OBJECT_0);
   }

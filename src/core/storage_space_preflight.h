@@ -38,6 +38,12 @@ static int edr_storage_space_preflight_body(int argc, char **argv) {
   if (rc == EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT) {
     fprintf(stderr, "storage preflight: owner_lock_timeout\n"); return 7;
   }
+  if (rc == EDR_STORAGE_POLICY_INVENTORY_LOCK_GRANTED_EXPIRED) {
+    fprintf(stderr, "storage preflight: owner_lock_granted_expired\n"); return 9;
+  }
+  if (rc == EDR_STORAGE_POLICY_INVENTORY_DEADLINE_BEFORE_REQUEST) {
+    fprintf(stderr, "storage preflight: owner_lock_deadline_before_request\n"); return 10;
+  }
   uint64_t floor = 0;
   if (rc || edr_storage_min_free_bytes(&floor) || floor > 9007199254740991ULL) {
     fprintf(stderr, "storage preflight: owner accounting or policy unavailable\n"); return 4;
