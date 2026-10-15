@@ -171,6 +171,72 @@ label was stale; source hashes, rather than that label, establish the production
 source identity. Raw `slow.result.json` / `full.result.json` and their hashed
 stdout/stderr remain in the same directory. Formal release closure is pending.
 
+Candidate 3.2.677, source `525b782e5868b9e9dac0b745ac11ef5c9827a26b`,
+run `38689930815`, passed both 97-test release gates: AMD64 308.49 s and
+ARM64 548.15 s. AMD64 also passed standalone telemetry 36/36 (441.82 s),
+compiled the complete Inno package and uploaded its candidate bundle. ARM64
+standalone telemetry passed 35/36 (552.84 s): its sole failure was the aggregate
+`local_evidence_cache_candidate` executable being killed at 150.04 s. The same
+executable had already passed the first ARM64 invocation in 174.20 s; AMD64's
+two invocations passed in 127.65/121.12 s. No assertion failed in the timed-out
+invocation. It reported two completed near-full migrations (34.765/29.094 s),
+then entered bounded reclamation. The first release invocation had no individual
+CTest timeout; the standalone runner imposed 150 s on every test. These facts
+establish an aggregate-fixture/deadline mismatch, not a cache deadlock or a
+claim that any arbitrarily slow disk must finish in that time.
+
+The actual Inno preflight fixture passed on both architectures (20.67/61.76 s),
+and the corrected P0 purpose fixture passed (1.11/0.99 s). ARM64 package, the
+separate complete installer/upgrade/rollback lifecycle, and combined publication
+were skipped. No client was upgraded. Complete evidence is
+`/tmp/edr-677-ci-all.zip` (CRC checked), `/tmp/edr-677-ci-summary.json` and the
+architecture-specific `*-test.log` files. The ZIP SHA-256 is
+`f83e7c514aae83624ac7ef514960643079c6097119a70045dd906d719e7e2d4e`.
+
+The follow-up keeps every original fixture body, assertion, conditional branch
+and default execution order, using one case list filtered into context,
+migration and retention CTests. The existing executable and manual full run
+remain. All three groups retain a 150 s deadline and share a CTest resource lock;
+runtime, telemetry and Windows release labels require all three. An unknown or
+empty selector fails instead of running no cases successfully. Begin/end case
+markers with diagnostic wall time identify the active operation on timeout;
+they do not change simulated clocks, admission or product deadlines. POSIX
+coverage remains 126 call expressions (78 context, 10 migration, 38 retention),
+Windows 124 (76/10/38); the two distinct 119/121 MiB WAL fixtures both remain.
+CTest totals grow by two through partitioning, not additional behavior coverage.
+
+The three host processes passed in 4.296/1.984/7.475 s and the unchanged-order
+full run in 12.164 s. Their executed call lists match the original list exactly,
+with no omission or duplication; five invalid-argument cases refuse before any
+case starts. Raw progress and digest evidence are in
+`/tmp/edr-678-host-suites/` and `/tmp/edr-678-cache-suite-plan.json`. Current CTest
+inventory confirms all three selectors, labels, deadlines and resource lock.
+Independent review found every original test function and pre-existing child
+command dispatch byte-identical. Production source is unchanged from
+`114755d0`; candidate 3.2.678 still requires release CI and actual deployment.
+
+The isolated UTM Windows runs also pass, with the same 150 s per-process limit:
+context 76 cases / 9.203 s, migration 10 / 11.141 s, retention 38 / 25.985 s,
+and the default full run 124 / 41.531 s. Their begin/end lists were compared
+directly with the original `525b782e` Windows call list, including both WAL
+tail sizes. Original production sources and linked objects remain unchanged.
+The test-source SHA-256 is
+`30b24da8e09b772bcbda6471c59a16bb2b2cd04f475da9e0a348a3193b794dc1`;
+the isolated executable SHA-256 is
+`74185ad7005619c558468ef44b59aded4a3f4642fa5323bc8e2491eb0f155820`.
+Commands, per-case raw logs and build provenance are retained in
+`/tmp/edr-678-native-suites-eq_rk90d/`. This uses MinGW AMD64 under UTM,
+real SQLite 3.53.4 and the existing P0 stub; it is not an MSVC ARM64 or actual
+P0 release certification. Only an exclusive synthetic guest directory was used.
+
+Four registration/failure-propagation regressions passed (475.872 s), including
+both generators and 14 injected failure classes across runtime/Windows labels.
+Two native-telemetry release-workflow checks and the Windows SQLite compile
+contract also passed. Removing any of the three suite registrations causes
+configuration to fail. The executed commands and tool-output transcripts are
+retained in `/private/tmp/edr-678-registration-checks/`; these are transcripts,
+not independently redirected complete raw logs. `git diff --check` passes.
+
 ### Effective policy and ownership
 
 | Data / actual owner | Retention and protection | Delivery obligation |

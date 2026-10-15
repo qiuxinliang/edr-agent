@@ -9635,6 +9635,31 @@ static void test_parent_pid_state_persistence_and_migration(void) {
 }
 #endif
 
+/* Keep one case list for the full manual run and bounded CTest suites. Case
+ * bodies and their order are unchanged; progress identifies the active case
+ * if a native runner exhausts its finite suite deadline. Wall time below is
+ * diagnostic only and never changes a fixture's simulated clock or policy. */
+static uint64_t cache_case_wall_ms(void) {
+  struct timespec now;
+  assert(timespec_get(&now, TIME_UTC) == TIME_UTC);
+  return (uint64_t)now.tv_sec * UINT64_C(1000) + (uint64_t)now.tv_nsec / UINT64_C(1000000);
+}
+
+#define RUN_CACHE_CASE(suite, expression) do { \
+  if (strcmp(selected_suite, "all") == 0 || strcmp(selected_suite, suite) == 0) { \
+    uint64_t case_started = cache_case_wall_ms(); \
+    fprintf(stderr, "cache-case begin suite=%s case=%s\n", suite, #expression); \
+    fflush(stderr); \
+    expression; \
+    uint64_t case_finished = cache_case_wall_ms(); \
+    fprintf(stderr, "cache-case ok suite=%s case=%s elapsed_ms=%llu\n", \
+            suite, #expression, (unsigned long long)(case_finished >= case_started ? \
+            case_finished - case_started : 0)); \
+    fflush(stderr); \
+    completed_cases++; \
+  } \
+} while (0)
+
 int main(int argc, char **argv) {
 #if !defined(_WIN32)
   s_test_executable = argv[0];
@@ -9699,142 +9724,161 @@ int main(int argc, char **argv) {
 #else
   (void)argc; (void)argv;
 #endif
-  test_pmfe_names_and_negative_values_are_not_signals();
+  const char *selected_suite = "all";
+  unsigned completed_cases = 0;
+  if (argc == 3 && strcmp(argv[1], "--suite") == 0) {
+    selected_suite = argv[2];
+    if (strcmp(selected_suite, "context") != 0 &&
+        strcmp(selected_suite, "migration") != 0 &&
+        strcmp(selected_suite, "retention") != 0) {
+      fprintf(stderr, "unknown cache suite: expected context, migration or retention\n");
+      return 2;
+    }
+  } else if (argc != 1) {
+    fprintf(stderr, "unknown cache test arguments\n");
+    return 2;
+  }
+  RUN_CACHE_CASE("context", test_pmfe_names_and_negative_values_are_not_signals());
 #if defined(EDR_HAVE_SQLITE)
-  test_pmfe_recovery_query_cost_and_index_upgrade();
-  test_pmfe_durable_followup_binding_and_receipt_lifecycle();
-  test_pmfe_recovery_retry_capacity_and_inconclusive();
-  test_pmfe_scope_restoration_and_corruption();
-  test_pmfe_abrupt_restart_durable_states();
-  test_pmfe_weak_scan_verdict_requires_durable_original();
-  test_candidate_retirement_respects_verified_pmfe_generation();
+  RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
+  RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
+  RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());
+  RUN_CACHE_CASE("context", test_pmfe_scope_restoration_and_corruption());
+  RUN_CACHE_CASE("context", test_pmfe_abrupt_restart_durable_states());
+  RUN_CACHE_CASE("context", test_pmfe_weak_scan_verdict_requires_durable_original());
+  RUN_CACHE_CASE("retention", test_candidate_retirement_respects_verified_pmfe_generation());
 #endif
-  test_delayed_file_actor_with_exact_start_key();
+  RUN_CACHE_CASE("context", test_delayed_file_actor_with_exact_start_key());
 #if defined(EDR_HAVE_SQLITE)
-  test_metric_dispositions_and_resource_failures();
-  test_metrics_commit_watermark_restart_and_failure();
-  test_metrics_slot_reuse_and_failed_handoff();
-  test_metrics_commit_failure_close_and_retention_boundary();
-  test_selected_window_and_command_fact_dependencies();
-  test_authorized_query_scope_and_absence();
-  test_physical_floor_rejects_evidence_copy();
-  test_maintenance_query_copy_slices();
-  test_physical_floor_holds_maintenance_and_startup();
-  test_compact_process_crash_recovery();
-  test_compact_full_busy_and_unknown_format();
-  test_compact_migration_budget_and_storage_types();
-  test_near_full_migration_resume_admission();
-  test_compact_near_full_migration_releases_clean_pages();
-  test_compact_near_full_cancel_resume();
-  test_compact_near_full_existing_page_rewrites();
-  test_compact_format_resume_and_projection();
-  test_context_fact_collection_preserves_references();
-  test_context_batch_reclaim_recovery_and_scope();
-  test_context_batch_reclaim_limit();
-  test_maintenance_failure_retains_cause_and_retry_interval();
-  test_sliced_reclaim_yields_preserves_projection_and_backoff();
-  test_sliced_reclaim_process_restart();
-  test_candidate_group_shared_facts_and_legacy_protection();
-  test_candidate_group_delete_and_commit_rollback();
-  test_candidate_retention_writer_does_not_promote_legacy();
-  test_candidate_group_oversize_and_active_window();
-  test_retention_accounting_maximum_width_is_bounded();
-  test_candidate_retirement_cursor_skips_protected_prefix();
-  test_context_prepared_before_pressure_cannot_resurrect_retired_group();
-  test_legacy_payload_retention_protection_and_projection();
-  test_compact_runtime_replay_enrichment_and_failure();
-  test_process_command_quality_survives_update_and_reopen();
-  test_legacy_command_quality_is_unknown_until_observed();
+  RUN_CACHE_CASE("context", test_metric_dispositions_and_resource_failures());
+  RUN_CACHE_CASE("context", test_metrics_commit_watermark_restart_and_failure());
+  RUN_CACHE_CASE("context", test_metrics_slot_reuse_and_failed_handoff());
+  RUN_CACHE_CASE("context", test_metrics_commit_failure_close_and_retention_boundary());
+  RUN_CACHE_CASE("retention", test_selected_window_and_command_fact_dependencies());
+  RUN_CACHE_CASE("retention", test_authorized_query_scope_and_absence());
+  RUN_CACHE_CASE("retention", test_physical_floor_rejects_evidence_copy());
+  RUN_CACHE_CASE("retention", test_maintenance_query_copy_slices());
+  RUN_CACHE_CASE("retention", test_physical_floor_holds_maintenance_and_startup());
+  RUN_CACHE_CASE("migration", test_compact_process_crash_recovery());
+  RUN_CACHE_CASE("migration", test_compact_full_busy_and_unknown_format());
+  RUN_CACHE_CASE("migration", test_compact_migration_budget_and_storage_types());
+  RUN_CACHE_CASE("migration", test_near_full_migration_resume_admission());
+  RUN_CACHE_CASE("migration", test_compact_near_full_migration_releases_clean_pages());
+  RUN_CACHE_CASE("migration", test_compact_near_full_cancel_resume());
+  RUN_CACHE_CASE("migration", test_compact_near_full_existing_page_rewrites());
+  RUN_CACHE_CASE("migration", test_compact_format_resume_and_projection());
+  RUN_CACHE_CASE("retention", test_context_fact_collection_preserves_references());
+  RUN_CACHE_CASE("retention", test_context_batch_reclaim_recovery_and_scope());
+  RUN_CACHE_CASE("retention", test_context_batch_reclaim_limit());
+  RUN_CACHE_CASE("retention", test_maintenance_failure_retains_cause_and_retry_interval());
+  RUN_CACHE_CASE("retention", test_sliced_reclaim_yields_preserves_projection_and_backoff());
+  RUN_CACHE_CASE("retention", test_sliced_reclaim_process_restart());
+  RUN_CACHE_CASE("retention", test_candidate_group_shared_facts_and_legacy_protection());
+  RUN_CACHE_CASE("retention", test_candidate_group_delete_and_commit_rollback());
+  RUN_CACHE_CASE("retention", test_candidate_retention_writer_does_not_promote_legacy());
+  RUN_CACHE_CASE("retention", test_candidate_group_oversize_and_active_window());
+  RUN_CACHE_CASE("retention", test_retention_accounting_maximum_width_is_bounded());
+  RUN_CACHE_CASE("retention", test_candidate_retirement_cursor_skips_protected_prefix());
+  RUN_CACHE_CASE("retention", test_context_prepared_before_pressure_cannot_resurrect_retired_group());
+  RUN_CACHE_CASE("retention", test_legacy_payload_retention_protection_and_projection());
+  RUN_CACHE_CASE("migration", test_compact_runtime_replay_enrichment_and_failure());
+  RUN_CACHE_CASE("context", test_process_command_quality_survives_update_and_reopen());
+  RUN_CACHE_CASE("context", test_legacy_command_quality_is_unknown_until_observed());
 #endif
-  test_command_preview_to_durable_fact();
-  test_parent_pid_states_and_cache_owner();
-  test_parent_cache_diagnostic_reasons();
+  RUN_CACHE_CASE("context", test_command_preview_to_durable_fact());
+  RUN_CACHE_CASE("context", test_parent_pid_states_and_cache_owner());
+  RUN_CACHE_CASE("context", test_parent_cache_diagnostic_reasons());
 #if defined(EDR_HAVE_SQLITE)
-  test_parent_pid_state_persistence_and_migration();
+  RUN_CACHE_CASE("context", test_parent_pid_state_persistence_and_migration());
 #endif
-  test_retained_file_read_cached_actor();
-  test_cached_actor_recovery_preserves_captured_identity();
-  test_checknetisolation_standard_low_risk_is_not_candidate();
-  test_checknetisolation_high_risk_port_is_candidate();
-  test_checknetisolation_p1_context_is_candidate();
-  test_weak_file_event_is_not_candidate();
-  test_weak_file_event_p1_context_is_candidate();
-  test_high_signal_process_is_candidate();
-  test_command_evidence_normalization_and_script_path();
-  test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise();
-  test_behavior_summary_flush_coalesced_events();
-  test_behavior_summary_below_threshold_no_emit();
-  test_behavior_summary_local_only_flush();
-  test_identity_status_counter_basics();
+  RUN_CACHE_CASE("context", test_retained_file_read_cached_actor());
+  RUN_CACHE_CASE("context", test_cached_actor_recovery_preserves_captured_identity());
+  RUN_CACHE_CASE("context", test_checknetisolation_standard_low_risk_is_not_candidate());
+  RUN_CACHE_CASE("context", test_checknetisolation_high_risk_port_is_candidate());
+  RUN_CACHE_CASE("context", test_checknetisolation_p1_context_is_candidate());
+  RUN_CACHE_CASE("context", test_weak_file_event_is_not_candidate());
+  RUN_CACHE_CASE("context", test_weak_file_event_p1_context_is_candidate());
+  RUN_CACHE_CASE("context", test_high_signal_process_is_candidate());
+  RUN_CACHE_CASE("context", test_command_evidence_normalization_and_script_path());
+  RUN_CACHE_CASE("context", test_nonstandard_checknetisolation_path_not_suppressed_by_p1_noise());
+  RUN_CACHE_CASE("context", test_behavior_summary_flush_coalesced_events());
+  RUN_CACHE_CASE("context", test_behavior_summary_below_threshold_no_emit());
+  RUN_CACHE_CASE("context", test_behavior_summary_local_only_flush());
+  RUN_CACHE_CASE("context", test_identity_status_counter_basics());
 #if defined(EDR_HAVE_SQLITE)
-  test_ordinary_aggregation_preserves_pre_context_actions();
-  test_ordinary_aggregation_scope_objects_and_incomplete_keys();
-  test_ordinary_aggregation_closed_slot_holes_and_capacity();
-  test_context_window_prefers_nominal_end_and_retains_late_events();
-  test_context_window_protection_requires_both_clocks();
-  test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
-  test_legacy_post_context_normalizes_without_losing_variants();
-  test_legacy_context_corrupt_fact_blocks_reference();
-  test_malformed_legacy_context_manifests_are_rejected();
-  test_invalid_legacy_post_context_rolls_back_normalization();
-  test_context_write_budget_cannot_starve_later_candidate();
-  test_post_context_exact_replay_charges_only_durable_changes();
-  test_critical_context_high_fanout_is_atomically_bounded();
-  test_incremental_cache_migration_recovers_from_blockers();
-  test_startup_cache_context_filter_preserves_risk_and_boundaries();
-  test_critical_context_distinct_events_exceed_legacy_fixed_limit();
-  test_command_result_copy_budget();
-  test_critical_context_still_honors_database_capacity();
-  test_incremental_reclaim_is_bounded_and_preserves_evidence();
-  test_capacity_reclaims_free_pages_before_evicting_candidates();
-  test_capacity_preserves_unclassified_refs_and_reports_refusal();
-  test_capacity_success_does_not_throttle_next_reclaim();
-  test_capacity_progress_with_slow_checkpoint();
-  test_capacity_reserves_wal_room_below_live_limit();
-  test_capacity_allows_wal_transaction_after_reclaim();
-  test_capacity_reclaims_wal_tail_without_evicting_evidence(119u);
-  test_capacity_reclaims_wal_tail_without_evicting_evidence(121u);
-  test_runtime_pressure_preserves_unclassified_shared_context();
-  test_critical_context_still_honors_retention();
-  test_candidate_enrichment_reuses_stable_fallback_under_context_pressure();
-  test_candidate_fallback_preserves_path_and_generation_boundaries();
-  test_candidate_known_to_unknown_keeps_generation_and_completeness();
-  test_candidate_distinct_source_ids_bridge_only_known_to_unknown();
-  test_candidate_source_generation_presence_ablation();
-  test_candidate_provider_provenance_semantic_ablation();
-  test_candidate_cross_provider_snapshot_and_provenance_converge();
-  test_candidate_dedupe_rejection_reason_observability();
-  test_candidate_completeness_monotonically_upgrades();
-  test_candidate_reuse_requires_generation_and_full_semantics();
-  test_process_cache_generation_migration_and_restart_safe_rtq();
-  test_snapshot_generation_persists_candidate_manifests_and_rtq();
-  test_context_generation_multicandidate_and_artifact_identity();
-  test_context_manifest_utf8_backslash_and_invalid_rejection();
-  test_context_manifest_discloses_32_item_truncation();
-  test_candidate_structured_evidence_and_durable_identity();
+  RUN_CACHE_CASE("context", test_ordinary_aggregation_preserves_pre_context_actions());
+  RUN_CACHE_CASE("context", test_ordinary_aggregation_scope_objects_and_incomplete_keys());
+  RUN_CACHE_CASE("context", test_ordinary_aggregation_closed_slot_holes_and_capacity());
+  RUN_CACHE_CASE("context", test_context_window_prefers_nominal_end_and_retains_late_events());
+  RUN_CACHE_CASE("context", test_context_window_protection_requires_both_clocks());
+  RUN_CACHE_CASE("context", test_candidate_commit_failure_leaves_no_dedupe_or_context_state());
+  RUN_CACHE_CASE("context", test_legacy_post_context_normalizes_without_losing_variants());
+  RUN_CACHE_CASE("context", test_legacy_context_corrupt_fact_blocks_reference());
+  RUN_CACHE_CASE("context", test_malformed_legacy_context_manifests_are_rejected());
+  RUN_CACHE_CASE("context", test_invalid_legacy_post_context_rolls_back_normalization());
+  RUN_CACHE_CASE("retention", test_context_write_budget_cannot_starve_later_candidate());
+  RUN_CACHE_CASE("retention", test_post_context_exact_replay_charges_only_durable_changes());
+  RUN_CACHE_CASE("retention", test_critical_context_high_fanout_is_atomically_bounded());
+  RUN_CACHE_CASE("migration", test_incremental_cache_migration_recovers_from_blockers());
+  RUN_CACHE_CASE("context", test_startup_cache_context_filter_preserves_risk_and_boundaries());
+  RUN_CACHE_CASE("retention", test_critical_context_distinct_events_exceed_legacy_fixed_limit());
+  RUN_CACHE_CASE("retention", test_command_result_copy_budget());
+  RUN_CACHE_CASE("retention", test_critical_context_still_honors_database_capacity());
+  RUN_CACHE_CASE("retention", test_incremental_reclaim_is_bounded_and_preserves_evidence());
+  RUN_CACHE_CASE("retention", test_capacity_reclaims_free_pages_before_evicting_candidates());
+  RUN_CACHE_CASE("retention", test_capacity_preserves_unclassified_refs_and_reports_refusal());
+  RUN_CACHE_CASE("retention", test_capacity_success_does_not_throttle_next_reclaim());
+  RUN_CACHE_CASE("retention", test_capacity_progress_with_slow_checkpoint());
+  RUN_CACHE_CASE("retention", test_capacity_reserves_wal_room_below_live_limit());
+  RUN_CACHE_CASE("retention", test_capacity_allows_wal_transaction_after_reclaim());
+  RUN_CACHE_CASE("retention", test_capacity_reclaims_wal_tail_without_evicting_evidence(119u));
+  RUN_CACHE_CASE("retention", test_capacity_reclaims_wal_tail_without_evicting_evidence(121u));
+  RUN_CACHE_CASE("retention", test_runtime_pressure_preserves_unclassified_shared_context());
+  RUN_CACHE_CASE("retention", test_critical_context_still_honors_retention());
+  RUN_CACHE_CASE("retention", test_candidate_enrichment_reuses_stable_fallback_under_context_pressure());
+  RUN_CACHE_CASE("context", test_candidate_fallback_preserves_path_and_generation_boundaries());
+  RUN_CACHE_CASE("context", test_candidate_known_to_unknown_keeps_generation_and_completeness());
+  RUN_CACHE_CASE("context", test_candidate_distinct_source_ids_bridge_only_known_to_unknown());
+  RUN_CACHE_CASE("context", test_candidate_source_generation_presence_ablation());
+  RUN_CACHE_CASE("context", test_candidate_provider_provenance_semantic_ablation());
+  RUN_CACHE_CASE("context", test_candidate_cross_provider_snapshot_and_provenance_converge());
+  RUN_CACHE_CASE("context", test_candidate_dedupe_rejection_reason_observability());
+  RUN_CACHE_CASE("context", test_candidate_completeness_monotonically_upgrades());
+  RUN_CACHE_CASE("context", test_candidate_reuse_requires_generation_and_full_semantics());
+  RUN_CACHE_CASE("context", test_process_cache_generation_migration_and_restart_safe_rtq());
+  RUN_CACHE_CASE("context", test_snapshot_generation_persists_candidate_manifests_and_rtq());
+  RUN_CACHE_CASE("context", test_context_generation_multicandidate_and_artifact_identity());
+  RUN_CACHE_CASE("context", test_context_manifest_utf8_backslash_and_invalid_rejection());
+  RUN_CACHE_CASE("context", test_context_manifest_discloses_32_item_truncation());
+  RUN_CACHE_CASE("context", test_candidate_structured_evidence_and_durable_identity());
 #if !defined(_WIN32)
-  test_concurrent_cache_lifecycle_snapshot_and_queries();
-  test_mutex_lock_observability_contract();
+  RUN_CACHE_CASE("context", test_concurrent_cache_lifecycle_snapshot_and_queries());
+  RUN_CACHE_CASE("context", test_mutex_lock_observability_contract());
 #endif
 #endif
-  test_identity_generation_match_delta();
-  test_unbound_network_actor_never_borrows_open_pid_interval();
-  test_sid_only_identity_enriches_same_generation();
-  test_unknown_generation_identity_never_survives_to_later_kernel_generation();
-  test_security_4688_identity_none_is_not_lifecycle_authoritative();
-  test_known_generation_rejects_late_and_zero_time_identity_updates();
-  test_identity_generation_mismatch_and_quality_order();
-  test_kernel_generation_a_to_b_resets_cached_identity_once();
-  test_delayed_generation_mismatch_withholds_all_process_enrichment();
-  test_unknown_to_bound_generation_clears_provisional_metadata();
-  test_parent_only_nonprocess_record_does_not_create_process_slot();
-  test_process_cache_preserves_full_facts_and_source_provenance();
-  test_grandparent_cache_requires_verified_lifecycle_parent_edge();
-  test_preprocess_parent_proof_survives_reentry_and_local_eviction();
-  test_parent_text_requires_proved_lifetime_and_survives_cache_eviction();
-  test_parent_edge_repairs_late_real_generation_at_child_birth();
-  test_rtq_signed_scope_and_legacy_aliases();
-  test_file_sha256_query_uses_file_evidence_cache();
+  RUN_CACHE_CASE("context", test_identity_generation_match_delta());
+  RUN_CACHE_CASE("context", test_unbound_network_actor_never_borrows_open_pid_interval());
+  RUN_CACHE_CASE("context", test_sid_only_identity_enriches_same_generation());
+  RUN_CACHE_CASE("context", test_unknown_generation_identity_never_survives_to_later_kernel_generation());
+  RUN_CACHE_CASE("context", test_security_4688_identity_none_is_not_lifecycle_authoritative());
+  RUN_CACHE_CASE("context", test_known_generation_rejects_late_and_zero_time_identity_updates());
+  RUN_CACHE_CASE("context", test_identity_generation_mismatch_and_quality_order());
+  RUN_CACHE_CASE("context", test_kernel_generation_a_to_b_resets_cached_identity_once());
+  RUN_CACHE_CASE("context", test_delayed_generation_mismatch_withholds_all_process_enrichment());
+  RUN_CACHE_CASE("context", test_unknown_to_bound_generation_clears_provisional_metadata());
+  RUN_CACHE_CASE("context", test_parent_only_nonprocess_record_does_not_create_process_slot());
+  RUN_CACHE_CASE("context", test_process_cache_preserves_full_facts_and_source_provenance());
+  RUN_CACHE_CASE("context", test_grandparent_cache_requires_verified_lifecycle_parent_edge());
+  RUN_CACHE_CASE("context", test_preprocess_parent_proof_survives_reentry_and_local_eviction());
+  RUN_CACHE_CASE("context", test_parent_text_requires_proved_lifetime_and_survives_cache_eviction());
+  RUN_CACHE_CASE("context", test_parent_edge_repairs_late_real_generation_at_child_birth());
+  RUN_CACHE_CASE("context", test_rtq_signed_scope_and_legacy_aliases());
+  RUN_CACHE_CASE("context", test_file_sha256_query_uses_file_evidence_cache());
+  if (completed_cases == 0) {
+    fprintf(stderr, "cache suite contained no enabled cases\n");
+    return 2;
+  }
+  fprintf(stderr, "cache-suite ok suite=%s cases=%u\n", selected_suite, completed_cases);
   puts("test_local_evidence_cache_candidate: ok");
   return 0;
 }

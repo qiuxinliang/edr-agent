@@ -24,7 +24,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'CTest inventory failed.' }
   $inventory = ($listing -join "`n") | ConvertFrom-Json
   $required = @('egress_batch_policy','egress_request_policy','command_result_egress','command_result_compaction','egress_receiver_resources','queue_recovery_real_codec',
-    'local_evidence_cache_candidate','storage_queue_sqlite_contract','deep_collector_manifest',
+    'local_evidence_cache_candidate','local_evidence_cache_migration','local_evidence_cache_retention',
+    'storage_queue_sqlite_contract','deep_collector_manifest',
     'etw_process_payload_identity_native','collector_file_read_windows','process_tree_cache','parent_context_binding','process_create_coalescer_state_machine',
     'p0_source_only_durable_contract','p0_operation','p0_rule_ir_purpose_archive','p0_observation_semantics','ave_sdk_smoke','egress_loopback_mtls','egress_command_delivery_mtls','egress_update_download_mtls','report_events_ack_contract',
     'pmfe_lifecycle_policy_switch')
