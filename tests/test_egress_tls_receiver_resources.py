@@ -22,6 +22,20 @@ receiver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(receiver)
 
 
+class RuleSchemaAuthorityTest(unittest.TestCase):
+    def test_reads_one_literal_schema_without_a_version_fallback(self):
+        with patch.object(receiver.Path, "read_text", return_value="#define EDR_P0_RULE_IR_SCHEMA_VERSION 17u\n"):
+            self.assertEqual(receiver.current_p0_ir_schema(), "17")
+        for text in ("", "#define EDR_P0_RULE_IR_SCHEMA_VERSION 0u\n",
+                     "#define EDR_P0_RULE_IR_SCHEMA_VERSION 010u\n",
+                     "#define EDR_P0_RULE_IR_SCHEMA_VERSION (10 + 1)\n",
+                     "#define EDR_P0_RULE_IR_SCHEMA_VERSION 10u\n" * 2,
+                     "#define EDR_P0_RULE_IR_SCHEMA_VERSION 10u\n#define EDR_P0_RULE_IR_SCHEMA_VERSION bad\n"):
+            with self.subTest(text=text), patch.object(receiver.Path, "read_text", return_value=text):
+                with self.assertRaises(RuntimeError):
+                    receiver.current_p0_ir_schema()
+
+
 class RuleDownloadSchemaTest(unittest.TestCase):
     def test_current_schema_is_exact_and_rejects_unsupported_headers_over_mtls(self):
         with tempfile.TemporaryDirectory(prefix="edr-rule-schema-") as temporary:
@@ -29,13 +43,15 @@ class RuleDownloadSchemaTest(unittest.TestCase):
             receiver.openssl_certificates(root)
             server = receiver.Receiver(root, "server", root / "receipts.db")
             server.rule_downloads_enabled = True
+            current = receiver.current_p0_ir_schema()
+            previous, future = str(int(current) - 1), str(int(current) + 1)
             context = ssl.create_default_context(cafile=str(root / "ca.pem"))
             context.verify_flags |= ssl.VERIFY_X509_STRICT
             context.load_cert_chain(root / "client.pem", root / "client.key")
             try:
                 for path in ("/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):
-                    for values in (("9",), (), ("7",), ("8",), ("10",),
-                                   ("9", "9"), ("9,9",), ("9", "8")):
+                    for values in ((current,), (), ("0",), (previous,), (future,),
+                                   (current, current), (current + "," + current,), (current, previous)):
                         with self.subTest(path=path, values=values):
                             connection = http.client.HTTPSConnection(
                                 "localhost", server.server_port, context=context, timeout=2)
@@ -46,8 +62,8 @@ class RuleDownloadSchemaTest(unittest.TestCase):
                                 connection.endheaders()
                                 response = connection.getresponse()
                                 body = response.read(4096)
-                                self.assertEqual(response.status, 200 if values == ("9",) else 412)
-                                if values == ("9",):
+                                self.assertEqual(response.status, 200 if values == (current,) else 412)
+                                if values == (current,):
                                     self.assertEqual(body, b"synthetic-rule-artifact")
                                 else:
                                     self.assertEqual(json.loads(body)["code"], "P0_IR_SCHEMA_UNSUPPORTED")

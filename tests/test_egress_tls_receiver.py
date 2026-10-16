@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import ssl
@@ -23,6 +24,18 @@ import sys
 import tempfile
 import threading
 import time
+
+
+def current_p0_ir_schema():
+    """Use the same single matcher authority as the compiled HTTP owners."""
+    header = Path(__file__).resolve().parents[1] / "include/edr/p0_rule_ir.h"
+    definitions = re.findall(
+        r"^\s*#\s*define\s+EDR_P0_RULE_IR_SCHEMA_VERSION\b([^\r\n]*)$",
+        header.read_text(encoding="utf-8"), re.MULTILINE)
+    value = re.fullmatch(r"\s*([1-9][0-9]*)[uU]?\s*", definitions[0]) if len(definitions) == 1 else None
+    if value is None:
+        raise RuntimeError("exactly one literal positive Agent P0 IR schema is required")
+    return value[1]
 
 
 def openssl_certificates(root: Path):
@@ -267,6 +280,7 @@ class Receiver(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, certificate_root: Path, certificate: str, database: Path):
+        self.rule_ir_schema = current_p0_ir_schema()
         super().__init__(("127.0.0.1", 0), Handler)
         self.database = database
         self.observations = []
@@ -322,13 +336,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.server.rule_downloads_enabled and self.path in (
                 "/api/v1/agent/p0-bundle.enc", "/api/v1/agent/sensor-interest.json"):
-            # This synthetic oracle mirrors the current server's schema9
-            # negotiation. It never handles real rule inputs or activation.
+            # Require exactly the current compiled-client capability claim.
+            # This synthetic oracle never handles real IR bytes/activation;
+            # production max9/max10 can both fetch IR9. Historical bundle
+            # compatibility has its own backend matrix, not this strict claim.
             schema = self.headers.get_all("X-EDR-P0-IR-Schema") or []
-            status = 200 if schema == ["9"] and self.connection.getpeercert() else 412
+            exact_single_schema = schema == [self.server.rule_ir_schema]
+            status = 200 if exact_single_schema and self.connection.getpeercert() else 412
             with self.server.lock:
                 self.server.rule_download_receipts.append({"path": self.path, "status": status,
-                                                          "exact_single_schema": schema == ["9"]})
+                                                          "exact_single_schema": exact_single_schema})
             if status != 200:
                 self.reply({"code": "P0_IR_SCHEMA_UNSUPPORTED"}, 412)
                 return
