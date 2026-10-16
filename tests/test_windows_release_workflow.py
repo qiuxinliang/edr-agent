@@ -28,6 +28,80 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("vars.WINDOWS_RELEASE_MODE || 'unsigned'", self.text)
         self.assertIn('(UNSIGNED Windows AMD64 + ARM64)', self.jobs['publish-release'])
 
+    def test_headless_scope_is_explicit_and_validated_before_release_operations(self):
+        scope = self.text.split('      package_scope:', 1)[1].split('      upgrade_class:', 1)[0]
+        self.assertEqual(re.findall(r'^          - (\w+)$', scope, re.M), ['full', 'headless'])
+        self.assertIn('default: full', scope)
+        self.assertIn("inputs.package_scope || 'full'", self.text)
+        prepare = self.jobs['prepare-release']
+        self.assertIn('run: python3 scripts/windows_release_checkpoint.py validate-scope', prepare)
+        self.assertLess(prepare.index('validate-scope'), prepare.index('Freeze private P0'))
+        self.assertLess(prepare.index('validate-scope'), prepare.index('windows_release_checkpoint.py prepare'))
+        self.assertIn('python3 tests/test_windows_lifecycle_workflow.py', prepare)
+        lifecycle = self.jobs['windows-lifecycle']
+        self.assertIn('      package_scope:', lifecycle)
+        self.assertIn("inputs.package_scope || 'full'", lifecycle)
+
+    def test_headless_never_restores_or_builds_setup_ui(self):
+        build = self.jobs['windows-build']
+        for step_prefix in ('uses: actions/setup-dotnet@v5',
+                            'name: Verify locked Setup UI NuGet closure and publish before native dependency build'):
+            step = build.split('- ' + step_prefix + '\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("if: steps.resume.outputs.restored != 'true' && env.EDR_RELEASE_PACKAGE_SCOPE == 'full'", step)
+        regression = build.split('- name: Verify Headless installer manifest contract\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("if: steps.resume.outputs.restored != 'true' && env.EDR_RELEASE_PACKAGE_SCOPE == 'headless'", regression)
+        self.assertIn('shell: powershell', regression)
+        self.assertIn(r'run: .\tests\test_headless_installer_manifest.ps1', regression)
+        self.assertLess(build.index('name: Verify Headless installer manifest contract'),
+                        build.index('name: Package (setup exe + runtime zip)'))
+        package = build.split('- name: Package (setup exe + runtime zip)\n', 1)[1].split('\n      - ', 1)[0]
+        headless, full = package.split("if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'headless') {", 1)[1].split('          } else {', 1)
+        for required in (r'& .\scripts\Write-HeadlessInstallerManifest.ps1', '-SetupExe $setupDest',
+                         '-AppVersion $env:EDR_AGENT_VERSION', '-TargetArch $env:EDR_RELEASE_ARCH',
+                         '-AgentBinarySha256 $agentBinarySha256', '-RuntimeIdentitySha256 $runtimeIdentitySha256',
+                         '-PackageCapabilitiesPath $packageCapabilitiesPath', '-OutputPath $manifestDest',
+                         '$null = $items.Add($manifestDest)'):
+            self.assertIn(required, headless)
+        self.assertNotIn('Build-SetupUi.ps1', headless)
+        self.assertNotIn('setup-ui-manifest', headless)
+        for standalone in ('$releasePackageDir = ', '$releaseSetup = ',
+                           'Copy-Item -LiteralPath $setupDest -Destination $releaseSetup',
+                           'Copy-Item -LiteralPath ($setupDest + ".arch") -Destination ($releaseSetup + ".arch")'):
+            self.assertIn(standalone, full)
+            self.assertEqual(package.count(standalone), 1)
+            self.assertNotIn(standalone, headless)
+        self.assertNotIn('Restore-SetupUiLocked.ps1', package)
+        self.assertEqual(package.count('Build-SetupUi.ps1'), 1)
+        self.assertIn('Build-SetupUi.ps1', full)
+        self.assertIn('GetEntry("setup-ui-manifest.$extension")', full)
+        self.assertLess(package.index('Build-BundledInstaller.ps1'), package.index("if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'headless')"))
+        self.assertIn('$null = $items.Add($setupDest)', package)
+        self.assertIn('Headless runtime package contains a Setup UI component', package)
+        self.assertIn("'full-installer-manifest\\.json'", package)
+
+    def test_headless_assets_share_the_checkpoint_and_publication_owner(self):
+        build = self.jobs['windows-build']
+        assets = build.split('- name: Prepare release assets\n', 1)[1].split('\n      - ', 1)[0]
+        full_assets = assets.split("if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'full') {", 1)[1].split('          }', 1)[0]
+        for required in ('$setupAsset = ', '$setupUiAsset = ',
+                         'Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset',
+                         'Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset'):
+            self.assertIn(required, full_assets)
+            self.assertEqual(assets.count(required), 1)
+        self.assertIn('Copy-Item -LiteralPath $src -Destination $runtimeAsset', assets)
+        self.assertIn('Copy-Item -LiteralPath $agentBinary -Destination $agentAsset', assets)
+        # Scope is release/checkpoint ownership metadata, outside the closed
+        # build_provenance object consumed by the existing backend verifier.
+        self.assertIn('build_provenance = ($provenance | ConvertFrom-Json)', assets)
+        self.assertNotIn('$provenance.package_scope', assets)
+        self.assertIn('windows_release_checkpoint.py seal --arch', build)
+        self.assertIn('windows_release_checkpoint.py upload --arch', build)
+        publish = self.jobs['publish-release']
+        self.assertIn('windows_release_checkpoint.py verify-assets', publish)
+        self.assertNotIn('for suffix in', publish)
+        self.assertLess(publish.index('verify-assets'), publish.index('gh release edit'))
+        self.assertIn('--draft=false --prerelease=true --latest=false', publish)
+
     def test_publication_still_requires_build_and_lifecycle_success(self):
         self.assertIn('needs: prepare-release', self.jobs['windows-build'])
         self.assertIn('needs: [prepare-release, usb-finalize]', self.jobs['windows-lifecycle'])
@@ -431,7 +505,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
                               "'(^|/)agent_preprocess_rules_v1[^/]*$'"):
                 self.assertIn(forbidden, boundary)
             self.assertRegex(boundary, r"agent_preprocess_rules_v1\[\^/\]\*\$'\)\s*\{\s*throw\b")
-        self.assertIn('artifact-manifest.json.p7s', self.jobs['publish-release'])
+        self.assertIn('windows_release_checkpoint.py verify-assets', self.jobs['publish-release'])
+        checkpoint = (ROOT / 'scripts/windows_release_checkpoint.py').read_text(encoding='utf-8')
+        self.assertIn('artifact-manifest.json.p7s', checkpoint)
 
     def test_usb_finalization_retains_both_retry_boundaries_and_signature_gate(self):
         build, finish = self.jobs['windows-build'], self.jobs['usb-finalize']

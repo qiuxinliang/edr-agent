@@ -4,11 +4,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
+import struct
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -685,6 +688,368 @@ class ParallelGateTests(unittest.TestCase):
             gate.run_parallel_cases([], 2, io.StringIO())
         with self.assertRaises(ValueError):
             gate.run_parallel_cases([], 8, io.StringIO())
+
+
+class HeadlessReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def environment(self, **changes):
+        value = dict(EDR_RELEASE_PACKAGE_SCOPE="headless", EDR_RELEASE_CANDIDATE="true",
+                     EDR_AGENT_RELEASE_TAG=SOURCE["tag"], GITHUB_SHA=SOURCE["commit"],
+                     GITHUB_REPOSITORY=SOURCE["repository"], GITHUB_RUN_ID=SOURCE["run_id"],
+                     WINDOWS_RELEASE_MODE="unsigned", EDR_UPGRADE_CLASS_OVERRIDE="auto")
+        value.update(changes)
+        return value
+
+    def test_scope_is_early_explicit_and_does_not_change_backend_source_schema(self):
+        self.assertEqual(cp.source(self.environment()), SOURCE)
+        self.assertEqual(cp.validate_scope({}), "full")
+        for fields in (dict(WINDOWS_RELEASE_MODE="signed"), dict(WINDOWS_RELEASE_MODE="usb"),
+                       dict(EDR_RELEASE_CANDIDATE="false"), dict(EDR_RELEASE_PACKAGE_SCOPE="unknown")):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                cp.source(self.environment(**fields))
+
+    def test_unsupported_headless_request_fails_before_any_github_boundary(self):
+        for change in (dict(EDR_RELEASE_CANDIDATE="false"),dict(WINDOWS_RELEASE_MODE="signed"),dict(WINDOWS_RELEASE_MODE="usb")):
+            with self.subTest(change=change),patch.dict(os.environ,self.environment(**change),clear=True),\
+                    patch.object(sys,'argv',['checkpoint','prepare']),patch.object(cp,'GitHub') as api:
+                with self.assertRaisesRegex(ValueError,'requires unsigned'):
+                    cp.main()
+                api.assert_not_called()
+
+    def test_owner_marker_is_bound_both_ways_and_legacy_full_shape_is_unchanged(self):
+        full, headless = FakeGitHub(), FakeGitHub()
+        cp.prepare(full, SOURCE)
+        self.assertEqual(full.info["body"], cp.UNSIGNED + "<!-- edr-release-source:" + json.dumps(SOURCE, sort_keys=True) + " -->")
+        cp.prepare(headless, SOURCE, package_scope="headless")
+        self.assertEqual(cp.MARKER.findall(headless.info["body"]), cp.MARKER.findall(full.info["body"]))
+        for api, scope in ((full, "headless"), (headless, "full")):
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, "scope"):
+                cp.prepare(api, SOURCE, package_scope=scope)
+        headless.info["body"] += "\n<!-- edr-release-package-scope:headless -->"
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            cp.verify_owner(headless, SOURCE, package_scope="headless")
+
+    def bundle(self, arch="arm64", scope="headless"):
+        directory = self.root / arch
+        directory.mkdir()
+        names = cp.asset_names(SOURCE, arch, package_scope=scope)
+        manifest = next(name for name in names if name.endswith("artifact-manifest.json"))
+        for name in names - {manifest}:
+            (directory / name).write_bytes(name.encode())
+        entries = [dict(name=name, size=(directory/name).stat().st_size, sha256=cp.digest(directory/name))
+                   for name in names if name != manifest]
+        (directory/manifest).write_text(json.dumps(dict(version="3.2.999", build_provenance=SOURCE,
+            signature={"status":"unsigned"}, artifacts=entries)))
+        cp.seal(directory, SOURCE, arch, package_scope=scope)
+        return directory
+
+    def test_headless_checkpoint_upload_missing_digest_and_remote_extra(self):
+        directory = self.bundle()
+        record = cp.verify_checkpoint(directory, SOURCE, "arm64", package_scope="headless")
+        self.assertEqual(len(record["files"]), 3)
+        self.assertEqual(record["package_scope"], "headless")
+        self.assertEqual(record["source"], SOURCE)
+        with self.assertRaises(ValueError):
+            cp.verify_checkpoint(directory, SOURCE, "arm64")
+        api = FakeGitHub()
+        cp.prepare(api, SOURCE, package_scope="headless")
+        cp.upload(api, directory, SOURCE, "arm64", package_scope="headless")
+        for asset in api.info["assets"]:
+            del asset["digest"]
+        cp.upload(api, directory, SOURCE, "arm64", package_scope="headless")
+        self.assertEqual(set(api.downloads), set(record["files"]))
+        self.assertFalse(any("setup" in name for name in api.downloads))
+        api.info["assets"].append(dict(name="forbidden-setup-ui.zip", size=1))
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            cp.upload(api, directory, SOURCE, "arm64", package_scope="headless")
+        self.assertEqual(len(api.uploads), 3)
+
+    def test_headless_dist_rejects_every_extra_and_cross_scope_restore(self):
+        directory = self.bundle()
+        for name in ("extra.txt", "standalone-setup.exe", "setup-ui.zip"):
+            (directory/name).write_bytes(b"forbidden")
+            with self.assertRaisesRegex(ValueError, "exact complete"):
+                cp.verify_checkpoint(directory, SOURCE, "arm64", package_scope="headless")
+            (directory/name).unlink()
+        api = FakeGitHub()
+        api.artifacts = [dict(name="release-checkpoint-arm64", expired=False)]
+        api.checkpoint = {path.name:path.read_bytes() for path in directory.iterdir()}
+        with self.assertRaises(ValueError):
+            cp.restore(api, self.root/'restored', SOURCE, "arm64")
+        full = self.bundle("amd64", "full")
+        api.artifacts = [dict(name="release-checkpoint-amd64", expired=False)]
+        api.checkpoint = {path.name:path.read_bytes() for path in full.iterdir()}
+        with self.assertRaises(ValueError):
+            cp.restore(api, self.root/'restored-headless', SOURCE, "amd64", package_scope="headless")
+
+    def test_published_headless_reuse_requires_candidate_state_and_complete_assets(self):
+        api = FakeGitHub()
+        cp.prepare(api, SOURCE, package_scope="headless")
+        for arch in ("amd64", "arm64"):
+            cp.upload(api, self.bundle(arch), SOURCE, arch, package_scope="headless")
+        api.info.update(draft=False, prerelease=True)
+        self.assertTrue(cp.prepare(api, SOURCE, package_scope="headless"))
+        api.info["prerelease"] = False
+        with self.assertRaisesRegex(ValueError, "prerelease candidate"):
+            cp.prepare(api, SOURCE, package_scope="headless")
+
+    def test_verify_assets_is_same_authority_and_requires_both_architectures(self):
+        api = FakeGitHub()
+        cp.prepare(api, SOURCE, package_scope="headless")
+        for arch in ("amd64", "arm64"):
+            cp.upload(api, self.bundle(arch), SOURCE, arch, package_scope="headless")
+        cp.verify_assets(api, SOURCE, package_scope="headless")
+        api.info["assets"].pop()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            cp.verify_assets(api, SOURCE, package_scope="headless")
+
+    @staticmethod
+    def pe(machine, signed=False):
+        value = bytearray(512)
+        value[:2] = b"MZ"
+        struct.pack_into('<I', value, 60, 128)
+        value[128:132] = b"PE\0\0"
+        struct.pack_into('<H', value, 132, machine)
+        size, magic, start = (224, 0x10b, 96) if machine == 0x14c else (240, 0x20b, 112)
+        struct.pack_into('<H', value, 148, size)
+        struct.pack_into('<H', value, 152, magic)
+        struct.pack_into('<I', value, 152+start-4, 16)
+        if signed:
+            struct.pack_into('<II', value, 152+start+32, 480, 16)
+        return bytes(value)
+
+    def stage_fixture(self, arch="arm64", baseline=False, change=None, extra_zip=None):
+        tag = "win_3.2.687" if baseline else SOURCE["tag"]
+        version = tag[4:]
+        source = dict(SOURCE, tag=tag)
+        machine = {"amd64":0x8664,"arm64":0xaa64}[arch]
+        data = {"FDSensor.exe":self.pe(machine), "edr_agent_setup.exe":self.pe(0x14c),
+                "FDSecurityInstallerWorker.exe":self.pe(machine), "uninstall.exe":self.pe(machine),
+                "VERSION":version.encode()}
+        integrity = dict(schema="edr.windows.native-package-integrity.v1", files=[
+            dict(name=name, sha256=hashlib.sha256(data[name]).hexdigest()) for name in
+            ("FDSecurityInstallerWorker.exe","uninstall.exe")])
+        data["native-package-integrity.json"] = json.dumps(integrity).encode()
+        full = dict(version=version,target_arch=arch,setup_target_arch=arch,
+                    agent_binary_sha256=hashlib.sha256(data["FDSensor.exe"]).hexdigest(),
+                    runtime_identity_sha256=hashlib.sha256(data["native-package-integrity.json"]).hexdigest(),
+                    setup_exe_sha256=hashlib.sha256(data["edr_agent_setup.exe"]).hexdigest(),
+                    setup_exe_signed=False,publisher_thumbprint="",capabilities={"signature_status":"unsigned"},
+                    upgrade_protocol="edr.windows.full-installer-upgrade.v1",preserves_existing_identity=True,
+                    preserves_offline_queue=True,preserves_evidence_cache=True)
+        if baseline:
+            full["ui_exe_sha256"] = "f"*64 # Not a claim that the old UI bytes were downloaded/verified.
+        if change:
+            change(data,full)
+        data["full-installer-manifest.json"] = json.dumps(full).encode()
+        data["package-capabilities.json"] = json.dumps(dict(signature_status="unsigned",target_arch=arch)).encode()
+        downloads = self.root/'downloads';downloads.mkdir()
+        prefix=f"edr-agent-{tag}-windows-{arch}-"
+        archive=downloads/(prefix+'exe.zip')
+        with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_STORED) as z:
+            for name,raw in data.items():z.writestr(name,raw)
+            if extra_zip:z.writestr(*extra_zip)
+        raw = data['FDSensor.exe']
+        payload=[dict(name=archive.name,size=archive.stat().st_size,sha256=cp.digest(archive)),
+                 dict(name=prefix+'FDSensor.exe',size=len(raw),sha256=hashlib.sha256(raw).hexdigest(),
+                      version=version,platform='windows',arch=arch,update=dict(internal_name='FDSensor',
+                          internal_version=version,runtime_identity_sha256=full['runtime_identity_sha256']))]
+        manifest=downloads/(prefix+'artifact-manifest.json')
+        manifest.write_text(json.dumps(dict(schema_version=1,version=version,build_provenance=source,
+            signature={'status':'unsigned'},artifacts=payload)))
+        assets=[]
+        for i,(name,length,sha) in enumerate([(archive.name,archive.stat().st_size,cp.digest(archive)),
+                (manifest.name,manifest.stat().st_size,cp.digest(manifest)),
+                (prefix+'FDSensor.exe',len(raw),hashlib.sha256(raw).hexdigest())],1):
+            assets.append(dict(id=i,name=name,size=length,digest='sha256:'+sha,
+                url=f'https://api.github.com/repos/{SOURCE["repository"]}/releases/assets/{i}'))
+        body='<!-- edr-release-source:'+json.dumps(source)+' -->'
+        if not baseline:body+='\n<!-- edr-release-package-scope:headless -->'
+        else:assets.append(dict(name='old-setup-ui.zip'))
+        metadata=self.root/'release.json';metadata.write_text(json.dumps(dict(id=123,tag_name=tag,
+            draft=not baseline,prerelease=True,target_commitish=source['commit'],body=body,assets=assets)))
+        options=(dict(published_baseline=True,target_tag=SOURCE['tag']) if baseline else
+                 dict(expected_source_commit=SOURCE['commit'],expected_run_id=SOURCE['run_id']))
+        return downloads,self.root/'staged',metadata,tag,arch,source['commit'],SOURCE['repository'],options
+
+    def stage(self, fixture):
+        *args,options=fixture
+        return cp.stage_headless(*args,**options)
+
+    def test_stage_real_zip_and_manifest_on_both_architectures(self):
+        for arch in ('amd64','arm64'):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temp:
+                self.root=Path(temp)
+                fixture=self.stage_fixture(arch)
+                result=self.stage(fixture)
+                self.assertEqual(result['target_arch'],arch)
+                self.assertTrue(Path(result['setup_exe']).is_file())
+                self.assertFalse(any('SetupUI' in path.name for path in Path(result['runtime_dir']).rglob('*')))
+                with self.assertRaisesRegex(ValueError,'fresh destination'):
+                    self.stage(fixture)
+
+    def test_baseline_full_release_verifies_headless_subset_without_ui_bytes(self):
+        result=self.stage(self.stage_fixture(baseline=True))
+        self.assertEqual(result['package_scope'],'full')
+        self.assertEqual(result['validation_scope'],'headless_subset')
+        self.assertEqual(result['version'],'3.2.687')
+
+    def test_stage_cli_uses_only_local_inputs_and_returns_authoritative_paths(self):
+        fixture=self.stage_fixture()
+        directory,destination,metadata,tag,arch,commit,repository,_=fixture
+        argv=['checkpoint','stage-headless','--tag',tag,'--arch',arch,'--directory',str(directory),
+              '--destination',str(destination),'--release-metadata',str(metadata),'--tag-commit',commit,
+              '--expected-source-commit',commit,'--expected-run-id',SOURCE['run_id']]
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':repository},clear=True),\
+                patch.object(sys,'argv',argv),patch.object(cp,'GitHub') as api,patch('sys.stdout',new_callable=io.StringIO) as output:
+            cp.main()
+        api.assert_not_called()
+        result=json.loads(output.getvalue())
+        self.assertEqual(result['runtime_dir'],str(destination.resolve()))
+        self.assertEqual(result['setup_exe'],str((destination/'edr_agent_setup.exe').resolve()))
+
+    def test_unsigned_pe_gate_rejects_a_certificate_table(self):
+        path=self.root/'signed.exe';path.write_bytes(self.pe(0x14c,signed=True))
+        with self.assertRaisesRegex(ValueError,'certificate table'):
+            cp.pe_machine(path)
+
+    def test_native_payload_does_not_permit_native_inno_bootstrap(self):
+        for arch, machine in (("amd64", 0x8664), ("arm64", 0xaa64)):
+            def change(data, full):
+                data["edr_agent_setup.exe"] = self.pe(machine)
+                full["setup_exe_sha256"] = hashlib.sha256(data["edr_agent_setup.exe"]).hexdigest()
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temp:
+                self.root = Path(temp)
+                fixture = self.stage_fixture(arch, change=change)
+                with self.assertRaisesRegex(ValueError, "architecture mismatch"):
+                    self.stage(fixture)
+                self.assertFalse(fixture[1].exists())
+
+    def test_external_json_root_and_canonical_scalar_types_fail_with_value_error(self):
+        fixture = self.stage_fixture()
+        metadata = fixture[2]
+        original = json.loads(metadata.read_text())
+        malformed = [[], dict(original, body=[]), dict(original, target_commitish=None)]
+        for field in ("tag", "commit", "repository", "run_id", "mode", "upgrade_class"):
+            info = copy.deepcopy(original)
+            provenance = dict(SOURCE, **{field: None})
+            info["body"] = '<!-- edr-release-source:' + json.dumps(provenance) + ' -->'
+            malformed.append(info)
+        for info in malformed:
+            with self.subTest(info=info), self.assertRaises(ValueError):
+                metadata.write_text(json.dumps(info))
+                self.stage(fixture)
+        self.assertFalse(fixture[1].exists())
+
+    def test_external_nested_manifest_types_fail_with_value_error(self):
+        for field in ("signature", "update"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp:
+                self.root = Path(temp)
+                fixture = self.stage_fixture()
+                manifest_path = next(fixture[0].glob('*artifact-manifest.json'))
+                manifest = json.loads(manifest_path.read_text())
+                if field == "signature":
+                    manifest[field] = []
+                else:
+                    next(entry for entry in manifest['artifacts'] if entry['name'].endswith('FDSensor.exe'))[field] = []
+                manifest_path.write_text(json.dumps(manifest))
+                self.refresh_download_hashes(fixture)
+                with self.assertRaises(ValueError):
+                    self.stage(fixture)
+                self.assertFalse(fixture[1].exists())
+        with tempfile.TemporaryDirectory() as temp:
+            self.root = Path(temp)
+            fixture = self.stage_fixture(change=lambda data, full: full.update(capabilities=[]))
+            with self.assertRaisesRegex(ValueError, "manifest identity"):
+                self.stage(fixture)
+            self.assertFalse(fixture[1].exists())
+
+    def test_stage_rejects_coherent_but_wrong_embedded_contracts(self):
+        cases=[lambda d,m:m.update(preserves_evidence_cache=False),lambda d,m:m.update(setup_exe_sha256='0'*64),
+               lambda d,m:m.update(target_arch='amd64'),lambda d,m:m.update(version='3.2.1'),
+               lambda d,m:m.update(ui_exe_sha256='0'*64),lambda d,m:d.update(VERSION=b'3.2.1'),
+               lambda d,m:d.update({'uninstall.exe':b'changed'}),
+               lambda d,m:d.update({'edr_agent_setup.exe':self.pe(0x14c,signed=True)})]
+        for change in cases:
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as temp:
+                self.root=Path(temp)
+                fixture=self.stage_fixture(change=change)
+                with self.assertRaises(ValueError):self.stage(fixture)
+                self.assertFalse(fixture[1].exists())
+
+    def test_stage_rejects_path_escape_and_crc_corruption_without_publishing_stage(self):
+        fixture=self.stage_fixture(extra_zip=('../escape',b'bad'))
+        with self.assertRaisesRegex(ValueError,'Unsafe'):self.stage(fixture)
+        self.assertFalse(fixture[1].exists())
+        self.assertFalse((self.root/'escape').exists())
+
+    @staticmethod
+    def refresh_download_hashes(fixture):
+        directory,_,metadata,*_=fixture
+        archive=next(directory.glob('*exe.zip'))
+        manifest_path=next(directory.glob('*artifact-manifest.json'))
+        manifest=json.loads(manifest_path.read_text())
+        for entry in manifest['artifacts']:
+            if entry['name']==archive.name:
+                entry.update(size=archive.stat().st_size,sha256=cp.digest(archive))
+        manifest_path.write_text(json.dumps(manifest))
+        info=json.loads(metadata.read_text())
+        for asset in info['assets']:
+            if asset.get('name') in (archive.name,manifest_path.name):
+                path=directory/asset['name']
+                asset.update(size=path.stat().st_size,digest='sha256:'+cp.digest(path))
+        metadata.write_text(json.dumps(info))
+
+    def test_crc_failure_cannot_publish_a_partial_stage_even_with_matching_outer_hashes(self):
+        fixture=self.stage_fixture()
+        archive=next(fixture[0].glob('*exe.zip'))
+        with zipfile.ZipFile(archive) as z:
+            entry=z.getinfo('VERSION')
+        raw=bytearray(archive.read_bytes())
+        offset=entry.header_offset+30+len(entry.filename.encode())+len(entry.extra)
+        raw[offset]^=1
+        archive.write_bytes(raw)
+        self.refresh_download_hashes(fixture)
+        with self.assertRaisesRegex(zipfile.BadZipFile,'CRC'):
+            self.stage(fixture)
+        self.assertFalse(fixture[1].exists())
+
+    def test_stage_pins_source_run_tag_publication_and_download_scope(self):
+        fixture=self.stage_fixture()
+        *args,options=fixture
+        for key,value in (('expected_source_commit','b'*40),('expected_run_id','999')):
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                cp.stage_headless(*args,**dict(options,**{key:value}))
+        metadata=fixture[2];original=json.loads(metadata.read_text())
+        for mutate in (lambda x:x.update(tag_name='win_3.2.998'),
+                       lambda x:x.update(target_commitish='b'*40),
+                       lambda x:x['assets'][0].update(digest='sha256:'+'0'*64),
+                       lambda x:x['assets'].append(dict(name='forbidden-setup-ui.zip'))):
+            changed=copy.deepcopy(original);mutate(changed);metadata.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):self.stage(fixture)
+        metadata.write_text(json.dumps(original))
+        (fixture[0]/'setup-ui.zip').write_bytes(b'forbidden')
+        with self.assertRaisesRegex(ValueError,'exactly'):self.stage(fixture)
+        self.assertFalse(fixture[1].exists())
+
+    def test_headless_baseline_selection_accepts_only_its_complete_metadata_subset(self):
+        info=dict(tag_name='win_3.2.687',draft=False,assets=[])
+        for arch in ('amd64','arm64'):
+            for suffix in ('exe.zip','FDSensor.exe','artifact-manifest.json'):
+                info['assets'].append(dict(id=len(info['assets'])+1,name=f'edr-agent-win_3.2.687-windows-{arch}-{suffix}',
+                    size=1,url='https://api.github.com/synthetic',digest='sha256:'+'a'*64))
+        selected=cp.select_baseline([info],SOURCE['tag'],package_scope='headless')
+        self.assertEqual(selected['tag'],'win_3.2.687')
+        self.assertTrue(selected['setup_rollback_supported'])
+        with self.assertRaisesRegex(ValueError,'setup.exe'):
+            cp.select_baseline([info],SOURCE['tag'])
+        info['assets'].pop()
+        with self.assertRaises(ValueError):
+            cp.select_baseline([info],SOURCE['tag'],package_scope='headless')
 
 
 if __name__ == "__main__":

@@ -32,6 +32,14 @@ on:
         required: true
         default: false
         type: boolean
+      package_scope:
+        description: Headless publishes only runtime, Agent and manifest; currently requires unsigned candidate
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - headless
       upgrade_class:
         description: Upgrade path classification; binary_hot additionally requires post-build identity proof against the previous immutable Release
         required: true
@@ -62,6 +70,7 @@ env:
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_RELEASE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || false }}
+  EDR_RELEASE_PACKAGE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.package_scope || 'full' }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
   P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
 
@@ -76,6 +85,8 @@ jobs:
       p0_test_inputs_sha256: ${{ steps.p0-inputs.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
+      - name: Validate supported package scope before release operations
+        run: python3 scripts/windows_release_checkpoint.py validate-scope
       - name: Freeze private P0 test input commit
         id: freeze-inputs
         env:
@@ -116,6 +127,7 @@ jobs:
         run: |
           python3 tests/test_windows_release_checkpoint.py
           python3 tests/test_windows_release_workflow.py
+          python3 tests/test_windows_lifecycle_workflow.py
           python3 tests/test_windows_usb_bundle.py
           cc -std=c11 -Wall -Wextra -Werror tests/test_agent_update_assets.c -o "$RUNNER_TEMP/test_agent_update_assets"
           EDR_SOURCE_DIR="$GITHUB_WORKSPACE" "$RUNNER_TEMP/test_agent_update_assets"
@@ -251,7 +263,7 @@ jobs:
           python scripts/windows_release_checkpoint.py $command --arch $env:EDR_RELEASE_ARCH
           if ($LASTEXITCODE -ne 0) { throw 'Release checkpoint verification failed; refusing unsafe reuse' }
       - uses: actions/setup-dotnet@v5
-        if: steps.resume.outputs.restored != 'true'
+        if: steps.resume.outputs.restored != 'true' && env.EDR_RELEASE_PACKAGE_SCOPE == 'full'
         with:
           global-json-file: global.json
       - name: Validate release scripts with Windows PowerShell 5.1
@@ -271,13 +283,17 @@ jobs:
         shell: powershell
         run: .\tests\test_windows_usb_signatures.ps1
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
-        if: steps.resume.outputs.restored != 'true'
+        if: steps.resume.outputs.restored != 'true' && env.EDR_RELEASE_PACKAGE_SCOPE == 'full'
         shell: pwsh
         run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
       - name: Round-trip Windows package capabilities for AMD64 and ARM64
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
         run: .\scripts\test_windows_package_capabilities_contract.ps1
+      - name: Verify Headless installer manifest contract
+        if: steps.resume.outputs.restored != 'true' && env.EDR_RELEASE_PACKAGE_SCOPE == 'headless'
+        shell: powershell
+        run: .\tests\test_headless_installer_manifest.ps1
       - name: Resolve Windows release signing mode
         if: steps.resume.outputs.restored != 'true'
         shell: pwsh
@@ -975,43 +991,58 @@ jobs:
             Write-Host "::warning::Bundled setup is intentionally unsigned for this release."
           }
           $null = $items.Add($setupDest)
-          $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE "build\Release"
-          New-Item -ItemType Directory -Path $releasePackageDir -Force | Out-Null
-          $releaseSetup = Join-Path $releasePackageDir "FDSecuritySetup.exe"
-          Copy-Item -LiteralPath $setupDest -Destination $releaseSetup -Force
-          Copy-Item -LiteralPath ($setupDest + ".arch") -Destination ($releaseSetup + ".arch") -Force
 
-          $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
-          if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
-            $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
-            $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
-          }
           $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
           $runtimeIdentitySha256 = (Get-FileHash -LiteralPath $nativeIntegrityPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -ExpectedSignatureStatus $signatureStatus -OutputZip $setupUiZip
-          if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
-          if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
-          Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
-          Write-Host "Setup UI package is uploaded as a separate release asset and is not nested into the runtime zip."
-
-          # Keep the same installer manifest/CMS in Headless without the UI runtime.
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $setupUiArchive = [System.IO.Compression.ZipFile]::OpenRead($setupUiZip)
-          try {
-            foreach ($extension in @('json', 'p7s')) {
-              $entry = $setupUiArchive.GetEntry("setup-ui-manifest.$extension")
-              if ($null -eq $entry) {
-                if ($extension -eq 'json' -or $env:WINDOWS_RELEASE_SIGNED -eq 'true') {
-                  throw "missing full installer manifest component: $extension"
-                }
-                continue
-              }
-              $manifestDest = Join-Path $env:GITHUB_WORKSPACE "full-installer-manifest.$extension"
-              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $manifestDest, $true)
-              $null = $items.Add($manifestDest)
+          if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'headless') {
+            $manifestDest = Join-Path $env:GITHUB_WORKSPACE 'full-installer-manifest.json'
+            & .\scripts\Write-HeadlessInstallerManifest.ps1 `
+              -SetupExe $setupDest `
+              -AppVersion $env:EDR_AGENT_VERSION `
+              -TargetArch $env:EDR_RELEASE_ARCH `
+              -AgentBinarySha256 $agentBinarySha256 `
+              -RuntimeIdentitySha256 $runtimeIdentitySha256 `
+              -PackageCapabilitiesPath $packageCapabilitiesPath `
+              -OutputPath $manifestDest
+            if (-not $?) { throw 'Headless full installer manifest generation failed' }
+            if (-not (Test-Path -LiteralPath $manifestDest -PathType Leaf)) { throw 'missing Headless full installer manifest' }
+            $null = $items.Add($manifestDest)
+          } else {
+            $releasePackageDir = Join-Path $env:GITHUB_WORKSPACE "build\Release"
+            New-Item -ItemType Directory -Path $releasePackageDir -Force | Out-Null
+            $releaseSetup = Join-Path $releasePackageDir "FDSecuritySetup.exe"
+            Copy-Item -LiteralPath $setupDest -Destination $releaseSetup -Force
+            Copy-Item -LiteralPath ($setupDest + ".arch") -Destination ($releaseSetup + ".arch") -Force
+            $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
+            if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+              $env:EDR_WINDOWS_SIGNING_CERT_BASE64 = $env:WINDOWS_SIGNING_PFX_BASE64
+              $env:EDR_WINDOWS_SIGNING_CERT_PASSWORD = $env:WINDOWS_SIGNING_PFX_PASSWORD
             }
-          } finally {
-            $setupUiArchive.Dispose()
+            & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -ExpectedSignatureStatus $signatureStatus -OutputZip $setupUiZip
+            if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
+            if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
+            Copy-Item -LiteralPath $setupUiZip -Destination (Join-Path $releasePackageDir "FDSecuritySetupUI.zip") -Force
+            Write-Host "Setup UI package is uploaded as a separate release asset and is not nested into the runtime zip."
+
+            # Full bundles retain the existing shared installer manifest/CMS.
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $setupUiArchive = [System.IO.Compression.ZipFile]::OpenRead($setupUiZip)
+            try {
+              foreach ($extension in @('json', 'p7s')) {
+                $entry = $setupUiArchive.GetEntry("setup-ui-manifest.$extension")
+                if ($null -eq $entry) {
+                  if ($extension -eq 'json' -or $env:WINDOWS_RELEASE_SIGNED -eq 'true') {
+                    throw "missing full installer manifest component: $extension"
+                  }
+                  continue
+                }
+                $manifestDest = Join-Path $env:GITHUB_WORKSPACE "full-installer-manifest.$extension"
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $manifestDest, $true)
+                $null = $items.Add($manifestDest)
+              }
+            } finally {
+              $setupUiArchive.Dispose()
+            }
           }
 
           Compress-Archive -Path $items.ToArray() -DestinationPath $zip -Force
@@ -1021,6 +1052,10 @@ jobs:
           try {
             $entries = $zipObj.Entries.FullName
             $normalizedEntries = @($entries | ForEach-Object { $_.Replace('\', '/') })
+            if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'headless' -and
+                $normalizedEntries -match '(?i)(^|/)(FDSecuritySetupUI\.exe|(?:edr_agent_setup_ui|FDSecuritySetupUI)\.zip|setup-ui-manifest\.(?:json|p7s))$') {
+              throw 'Headless runtime package contains a Setup UI component'
+            }
             if ($normalizedEntries -match '(^|/)p0_rule_[^/]*$' -or
                 $normalizedEntries -match '(^|/)sensor_interest_manifest\.json$' -or
                 $normalizedEntries -match '(^|/)agent_preprocess_rules_v1[^/]*$') {
@@ -1169,6 +1204,7 @@ jobs:
               'uninstall\.exe',
               'collector[/\\]forensic_collector_builtin\.exe',
               'native-package-integrity\.json',
+              'full-installer-manifest\.json',
               'p0_matcher_contract\.json',
               'agent_windows_production\.example\.toml'
             )
@@ -1220,19 +1256,21 @@ jobs:
           $src = "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-exe.zip"
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
-          if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
 
           $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
           $runtimeAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-exe.zip"
 
-          $setupAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup.exe"
-          $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup-ui.zip"
           $agentAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-FDSensor.exe"
           Copy-Item -LiteralPath $src -Destination $runtimeAsset -Force
 
-          Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
-          Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
+          if ($env:EDR_RELEASE_PACKAGE_SCOPE -eq 'full') {
+            if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
+            $setupAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup.exe"
+            $setupUiAsset = Join-Path $dist "edr-agent-$ref-windows-$env:EDR_RELEASE_ARCH-setup-ui.zip"
+            Copy-Item -LiteralPath "edr_agent_setup.exe" -Destination $setupAsset -Force
+            Copy-Item -LiteralPath "edr_agent_setup_ui.zip" -Destination $setupUiAsset -Force
+          }
           $agentBinary = @("build\Release\FDSensor.exe", "build\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $agentBinary) { throw "FDSensor.exe not found for raw update asset" }
           if ($env:WINDOWS_RELEASE_SIGNED -eq 'true') {
@@ -1493,27 +1531,7 @@ jobs:
       - name: Verify combined AMD64/ARM64 asset set
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t assets < <(
-            gh release view "${EDR_AGENT_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --json assets --jq '.assets[].name'
-          )
-          has_asset() {
-            local expected="$1"
-            printf '%s\n' "${assets[@]}" | grep -Fxq "${expected}"
-          }
-          for arch in amd64 arm64; do
-            for suffix in exe.zip setup.exe setup-ui.zip FDSensor.exe artifact-manifest.json; do
-              name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-${suffix}"
-              has_asset "${name}" || { echo "::error::missing combined release asset: ${name}"; exit 1; }
-            done
-            if [[ "${WINDOWS_RELEASE_MODE}" == "signed" || "${WINDOWS_RELEASE_MODE}" == "usb" ]]; then
-              name="edr-agent-${EDR_AGENT_RELEASE_TAG}-windows-${arch}-artifact-manifest.json.p7s"
-              has_asset "${name}" || { echo "::error::missing signed manifest: ${name}"; exit 1; }
-            fi
-          done
+        run: python3 scripts/windows_release_checkpoint.py verify-assets
 
       - name: Publish signed Windows release
         if: env.EDR_RELEASE_CANDIDATE != 'true' && (env.WINDOWS_RELEASE_MODE == 'signed' || env.WINDOWS_RELEASE_MODE == 'usb')
@@ -1559,3 +1577,4 @@ jobs:
     with:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
       baseline_tag: ${{ needs.prepare-release.outputs.baseline_tag }}
+      package_scope: ${{ github.event_name == 'workflow_dispatch' && inputs.package_scope || 'full' }}

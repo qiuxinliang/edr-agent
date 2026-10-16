@@ -17,6 +17,9 @@ on:
       - include/edr/storage_queue.h
       - src/transport/egress_batch_policy.c
       - include/edr/egress_batch_policy.h
+      # Candidate verification binds measurements to the release owners' source.
+      - .github/workflows/edr-agent-client-release.yml
+      - .github/workflows/windows-install-upgrade-rollback.yml
       - .github/workflows/evidence-retention-comparison.yml
 
 permissions:

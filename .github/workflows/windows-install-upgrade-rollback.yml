@@ -12,6 +12,11 @@ on:
         required: false
         default: ''
         type: string
+      package_scope:
+        description: Release asset scope; headless uses its hash-bound embedded installer
+        required: false
+        default: full
+        type: string
       architecture:
         description: Native architecture to validate (all, amd64, or arm64)
         required: false
@@ -33,6 +38,14 @@ on:
         required: false
         default: ''
         type: string
+      package_scope:
+        description: Release asset scope; headless uses its hash-bound embedded installer
+        required: false
+        default: full
+        type: choice
+        options:
+          - full
+          - headless
       architecture:
         description: Native architecture to validate (all, amd64, or arm64)
         required: false
@@ -80,6 +93,7 @@ jobs:
           LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
           LIFECYCLE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
           LIFECYCLE_MATRIX_ARCH: ${{ matrix.arch }}
+          LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
         run: |
           $architecture = $env:LIFECYCLE_ARCHITECTURE
           if ($architecture -cnotin @('all', 'amd64', 'arm64')) {
@@ -87,6 +101,9 @@ jobs:
           }
           if ($env:LIFECYCLE_MATRIX_ARCH -eq 'invalid') {
             throw "invalid lifecycle matrix architecture for input: $architecture"
+          }
+          if ($env:LIFECYCLE_PACKAGE_SCOPE -cnotin @('full', 'headless')) {
+            throw "package_scope must be full or headless"
           }
           [int]$repeatCount = 0
           $repeatText = $env:LIFECYCLE_REPEAT_COUNT
@@ -109,12 +126,20 @@ jobs:
           python-version: '3.12.10'
           architecture: x64
 
+      - name: Verify lifecycle package scope contract
+        shell: pwsh
+        run: python tests/test_windows_lifecycle_workflow.py
+
       - name: Resolve release tags
         shell: pwsh
+        env:
+          LIFECYCLE_TARGET_TAG: ${{ inputs.target_tag }}
+          LIFECYCLE_BASELINE_TAG: ${{ inputs.baseline_tag }}
+          LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
         run: |
-          $target = '${{ inputs.target_tag }}'.Trim()
-          $requestedBaseline = '${{ inputs.baseline_tag }}'.Trim()
-          $selectionArgs = @('select-baseline', '--target-tag', $target)
+          $target = $env:LIFECYCLE_TARGET_TAG.Trim()
+          $requestedBaseline = $env:LIFECYCLE_BASELINE_TAG.Trim()
+          $selectionArgs = @('select-baseline', '--target-tag', $target, '--package-scope', $env:LIFECYCLE_PACKAGE_SCOPE)
           if ($requestedBaseline) { $selectionArgs += @('--baseline-tag', $requestedBaseline) }
           $selectionJson = & python .\scripts\windows_release_checkpoint.py @selectionArgs
           if ($LASTEXITCODE -ne 0) { throw 'published Windows baseline selection failed' }
@@ -123,6 +148,9 @@ jobs:
           $baseline = $selectedBaseline.tag
           $baselineState = $selectedBaseline.state
           $baselineSetupRollbackSupported = [bool]$selectedBaseline.setup_rollback_supported
+          if ($env:LIFECYCLE_PACKAGE_SCOPE -ceq 'headless' -and -not $baselineSetupRollbackSupported) {
+            throw 'Headless lifecycle requires a published baseline with real installer rollback support'
+          }
           Write-Host "Lifecycle target=$target baseline=$baseline baseline_state=$baselineState setup_rollback_supported=$baselineSetupRollbackSupported"
           "TARGET_TAG=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TARGET_VERSION=$($target.Substring(4))" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -136,10 +164,14 @@ jobs:
 
       - name: Download immutable runtime and Setup EXE release packages
         shell: pwsh
+        env:
+          LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
         run: |
           New-Item -ItemType Directory -Force -Path downloads\target, downloads\baseline | Out-Null
 
-          function Get-ImmutableAsset([string]$Tag, [string]$Expected) {
+          $script:immutableReleases = @{}
+          function Get-ImmutableRelease([string]$Tag) {
+            if ($script:immutableReleases.ContainsKey($Tag)) { return $script:immutableReleases[$Tag] }
             $releaseOutput = gh api `
               "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
             if ($LASTEXITCODE -ne 0) {
@@ -152,6 +184,12 @@ jobs:
               throw "release '$Tag' was not found in the authenticated draft/published release list; visible tags: $availableTags"
             }
             $release = $releaseMatches[0]
+            $script:immutableReleases[$Tag] = $release
+            return $release
+          }
+
+          function Get-ImmutableAsset([string]$Tag, [string]$Expected) {
+            $release = Get-ImmutableRelease $Tag
             $matches = @($release.assets | Where-Object { $_.name -eq $expected })
             if ($matches.Count -ne 1) {
               $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
@@ -246,35 +284,107 @@ jobs:
 
           $targetRuntime = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip"
           $baselineRuntime = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-exe.zip"
-          $targetSetup = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-setup.exe"
-          $baselineSetup = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-setup.exe"
           Download-ImmutableAsset $env:TARGET_TAG $targetRuntime downloads\target
           Download-ImmutableAsset $env:BASELINE_TAG $baselineRuntime downloads\baseline
-          Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\target
-          Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\baseline
 
-          $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
-          $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
-          if ($targetZip.Count -ne 1) {
-            throw "target '$env:TARGET_TAG' resolved to $($targetZip.Count) runtime ZIP files; expected exactly one"
+          if ($env:LIFECYCLE_PACKAGE_SCOPE -ceq 'full') {
+            $targetSetup = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-setup.exe"
+            $baselineSetup = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-setup.exe"
+            Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\target
+            Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\baseline
+            $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
+            $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
+            if ($targetZip.Count -ne 1 -or $baselineZip.Count -ne 1) {
+              throw 'expected exactly one target and baseline runtime ZIP'
+            }
+            Expand-Archive -LiteralPath $targetZip[0].FullName -DestinationPath packages\target -Force
+            Expand-Archive -LiteralPath $baselineZip[0].FullName -DestinationPath packages\baseline -Force
+          } elseif ($env:LIFECYCLE_PACKAGE_SCOPE -ceq 'headless') {
+            # Only ZIP + artifact manifest enter each strict staging input directory.
+            Download-ImmutableAsset $env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\target
+            Download-ImmutableAsset $env:BASELINE_TAG "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\baseline
+            New-Item -ItemType Directory -Path release-metadata -ErrorAction Stop | Out-Null
+
+            function Resolve-ReleaseTagCommit([string]$Tag, $Release) {
+              # Exit 2 means an absent ref. Authentication/transport failures must fail closed.
+              $refs = @(& git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 ls-remote --exit-code origin "refs/tags/$Tag" "refs/tags/$Tag^{}" 2>$null)
+              $status = $LASTEXITCODE
+              if ($status -eq 2 -and $Release.draft -eq $true -and
+                  "$($Release.target_commitish)" -cmatch '^[0-9a-f]{40}$') {
+                return "$($Release.target_commitish)"
+              }
+              if ($status -ne 0) { throw "cannot resolve immutable source tag '$Tag' (git exit $status)" }
+              $direct = @()
+              $peeled = @()
+              foreach ($line in $refs) {
+                $fields = "$line" -split '\s+'
+                if ($fields.Count -ne 2 -or $fields[0] -cnotmatch '^[0-9a-f]{40}$') {
+                  throw "invalid git tag response for '$Tag'"
+                }
+                if ($fields[1] -ceq "refs/tags/$Tag") { $direct += $fields[0] }
+                elseif ($fields[1] -ceq "refs/tags/$Tag^{}") { $peeled += $fields[0] }
+                else { throw "unexpected git ref for '$Tag'" }
+              }
+              if ($direct.Count -ne 1 -or $peeled.Count -gt 1) { throw "ambiguous immutable source tag '$Tag'" }
+              if ($peeled.Count -eq 1) { return $peeled[0] }
+              return $direct[0]
+            }
+
+            $targetRelease = Get-ImmutableRelease $env:TARGET_TAG
+            $baselineRelease = Get-ImmutableRelease $env:BASELINE_TAG
+            $targetCommit = Resolve-ReleaseTagCommit $env:TARGET_TAG $targetRelease
+            $baselineCommit = Resolve-ReleaseTagCommit $env:BASELINE_TAG $baselineRelease
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            [IO.File]::WriteAllText((Join-Path $PWD 'release-metadata/target.json'), ($targetRelease | ConvertTo-Json -Depth 100), $utf8)
+            [IO.File]::WriteAllText((Join-Path $PWD 'release-metadata/baseline.json'), ($baselineRelease | ConvertTo-Json -Depth 100), $utf8)
+            $targetStageJson = & python .\scripts\windows_release_checkpoint.py stage-headless `
+              --tag $env:TARGET_TAG --arch '${{ matrix.arch }}' `
+              --directory downloads\target --destination packages\target `
+              --release-metadata release-metadata\target.json --tag-commit $targetCommit `
+              --expected-source-commit $env:GITHUB_SHA --expected-run-id $env:GITHUB_RUN_ID
+            if ($LASTEXITCODE -ne 0) { throw 'target Headless package verification and staging failed' }
+            $targetStage = $targetStageJson | ConvertFrom-Json -ErrorAction Stop
+            $baselineStageJson = & python .\scripts\windows_release_checkpoint.py stage-headless `
+              --tag $env:BASELINE_TAG --arch '${{ matrix.arch }}' `
+              --directory downloads\baseline --destination packages\baseline `
+              --release-metadata release-metadata\baseline.json --tag-commit $baselineCommit `
+              --published-baseline --target-tag $env:TARGET_TAG
+            if ($LASTEXITCODE -ne 0) { throw 'baseline Headless package verification and staging failed' }
+            $baselineStage = $baselineStageJson | ConvertFrom-Json -ErrorAction Stop
+            if (-not $targetStage.setup_exe -or -not $baselineStage.setup_exe) {
+              throw 'verified embedded installer paths are required'
+            }
+            "TARGET_SETUP_EXE=$($targetStage.setup_exe)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "BASELINE_SETUP_EXE=$($baselineStage.setup_exe)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $targetStageJson | Set-Content -LiteralPath release-metadata\target-stage.json
+            $baselineStageJson | Set-Content -LiteralPath release-metadata\baseline-stage.json
+          } else {
+            throw 'package_scope must be full or headless'
           }
-          if ($baselineZip.Count -ne 1) {
-            throw "baseline '$env:BASELINE_TAG' resolved to $($baselineZip.Count) runtime ZIP files; expected exactly one"
-          }
-          Expand-Archive -LiteralPath $targetZip[0].FullName -DestinationPath packages\target -Force
-          Expand-Archive -LiteralPath $baselineZip[0].FullName -DestinationPath packages\baseline -Force
 
       - name: Execute real Setup EXE install, upgrade, rollback, and uninstall
         shell: pwsh
+        env:
+          LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
         run: |
-          $targetSetup = @(Get-ChildItem downloads\target -Filter "*-setup.exe" -File)
-          $baselineSetup = @(Get-ChildItem downloads\baseline -Filter "*-setup.exe" -File)
-          if ($targetSetup.Count -ne 1 -or $baselineSetup.Count -ne 1) {
-            throw "expected exactly one target and baseline Setup EXE"
+          if ($env:LIFECYCLE_PACKAGE_SCOPE -ceq 'headless') {
+            $targetSetupPath = $env:TARGET_SETUP_EXE
+            $baselineSetupPath = $env:BASELINE_SETUP_EXE
+            if (-not $targetSetupPath -or -not $baselineSetupPath) {
+              throw 'verified embedded installer paths are required'
+            }
+          } else {
+            $targetSetup = @(Get-ChildItem downloads\target -Filter "*-setup.exe" -File)
+            $baselineSetup = @(Get-ChildItem downloads\baseline -Filter "*-setup.exe" -File)
+            if ($targetSetup.Count -ne 1 -or $baselineSetup.Count -ne 1) {
+              throw "expected exactly one target and baseline Setup EXE"
+            }
+            $targetSetupPath = $targetSetup[0].FullName
+            $baselineSetupPath = $baselineSetup[0].FullName
           }
           $lifecycleParams = @{
-            BaselineSetupExe = $baselineSetup[0].FullName
-            TargetSetupExe = $targetSetup[0].FullName
+            BaselineSetupExe = $baselineSetupPath
+            TargetSetupExe = $targetSetupPath
             BaselineVersion = $env:BASELINE_VERSION
             TargetVersion = $env:TARGET_VERSION
             Architecture = '${{ matrix.arch }}'
@@ -443,5 +553,6 @@ jobs:
           path: |
             setup-exe-evidence
             runtime-evidence
+            release-metadata
           if-no-files-found: warn
           retention-days: 7

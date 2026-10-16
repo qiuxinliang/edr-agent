@@ -1,5 +1,142 @@
 # Cache reliability remediation
 
+## 2026-10-16 native measurements accepted; Headless-only release path prepared
+
+Native comparison run **38829816969**, source
+`21b7e4d4c278448e628f5e1ddd6a3d26dfb6078f`, passed on real AMD64 and ARM64.
+The two exact synthetic artifacts contain 30 evidence executions (three
+variants, five samples, two architectures), 16 queue executions and 192 queue
+window inventories. Input digests match before/after and across architectures.
+All child exits, native-machine checks, payload readbacks, integrity/orphan and
+nine-category ledger checks passed. Each architecture's current 1,072 source
+files and baseline 1,067 Git blobs/four link closures were verified against the
+immutable revisions, including Windows checkout line endings.
+
+| Evidence workload, same 8 MiB budget / 192 candidates | Old 1 h | Current 1 h | Current 4 h |
+| --- | ---: | ---: | ---: |
+| Embedded complete parent chains | 0 | 6 | 24 |
+| Reconstructable with process cache | 6 | 6 | 24 |
+| Selected first/last event span, seconds | 20 | 20 | 10,820 |
+| Sampled DB/WAL/SHM peak, bytes | 2,305,312 | 3,272,648 | 3,379,192 |
+| SQLite VFS issued writes, bytes | 17,364,348 | 41,859,900 | 39,641,320 |
+| AMD64 median process CPU, seconds | 0.515625 | 1.328125 | 1.328125 |
+| ARM64 median process CPU, seconds | 0.515625 | 1.390625 | 1.359375 |
+
+At the same 1 MiB logical queue budget, unique-input pressure changed the
+freshest retained age from 36,070 to 120 seconds, successful exact retries from
+0 to 33, and the 20-byte terminal from refusal to admission with exact readback.
+Its sampled physical peak rose from 1,557,176 to 5,166,168 bytes; VFS writes
+rose from 1,524,932 to 20,038,348 bytes (13.14 times). CPU rose from 0.203125 to
+0.484375 seconds on AMD64 and 0.125 to 0.5625 seconds on ARM64. The historical
+queue stalls while current code continues retry/maintenance work; these are
+whole-workload costs, including encoding and forensic inventory, rather than
+normalized per-event overhead. The existing logical budget remains distinct
+from DB/WAL/SHM and global disk protection.
+
+These costs are material. Issued VFS/process I/O is not device write
+amplification; the windows use simulated event time, not an eight-hour wall
+clock soak. Four hourly selected cohorts span 3 h 20 s, not continuous or
+arbitrary-load four-hour retention. Historical embedded-chain count zero does
+not mean all old evidence is unreconstructable. The intentional missing-RAM
+`owner_loss` negative control remains recovery-held; the real eight-slot
+producer/audit fix is verified by its separate regression and release gates.
+The comparison sender is an isolated aborting/stub boundary, not a whole-client
+packet capture or proof about every production consumer.
+
+The complete raw synthetic artifacts, per-file hashes, recomputed sample
+medians and bounded source bindings are indexed by
+`/private/tmp/edr-native21b7-monitor/RESULTS.json`, SHA-256
+`c7fad575af6bcb018dd7dfee879c84d89e6fc93b3930fdd455f8ac8a1868a7c2`.
+The root also independently checked both artifact ZIP digests/CRC and all 46
+execution exit codes before release preflight. Earlier failed runs and their
+partial samples remain preserved and excluded from the accepted comparison.
+
+### Release scope and preserved installer boundaries
+
+Automatic approval review rejected the original full-688 workflow dispatch
+before process creation: that workflow additionally builds/downloads Setup UI
+and standalone Setup assets beyond the explicit Headless-only instruction.
+No dispatch intent, workflow run, tag, release or deployment was created.
+The rejected command has not been retried through another interface.
+
+The prepared replacement changes the existing release owner, without creating
+a parallel build/release implementation. Build-only `package_scope` defaults to
+`full`. Its `headless` choice currently requires **unsigned + candidate=true**;
+unsupported combinations fail before release operations. This limited mode
+has a current consumer: the authorized single-UTM Headless candidate validation.
+Signed/USB and existing full consumers retain their supported path.
+
+Headless skips Setup UI/.NET restore and build, does not prepare/upload UI or
+standalone Setup assets, and requires exactly three assets per architecture:
+Agent, Headless ZIP and artifact manifest. Combined publication requires the
+six exact assets. The installer remains inside Headless and receives a real
+`full-installer-manifest.json`: version, native payload architecture, original
+component hashes, unsigned capabilities and preservation protocol. The writer
+checks bounded regular inputs before reading, the existing x86 Inno bootstrap
+rule separately from native payload architecture, a real **NotSigned** result,
+unchanged installer bytes and exclusive bounded manifest creation. It does not
+invent a UI hash or fall back to synthesized legacy metadata.
+
+Scope belongs to a separate release HTML ownership marker and Headless
+checkpoint metadata. The canonical `build_provenance` schema is unchanged,
+because the deployed backend rejects unknown provenance fields. Existing full
+checkpoint shapes and source markers remain compatible; scope cannot be
+borrowed in either direction.
+
+The lifecycle job downloads only the target/baseline Headless ZIP and artifact
+manifest. Its existing checkpoint owner validates immutable release/tag/source/
+run bindings, native Agent and runtime hashes, the embedded installer, bounded
+ZIP extraction/CRC and actual preservation manifest before a fresh atomic
+stage. It feeds the verified embedded installers to the unchanged real Setup
+install/repair/upgrade/rollback/uninstall script. Baseline 687 cannot skip Setup
+rollback. The existing runtime lifecycle remains required. A full baseline's
+Headless subset does not certify its unrelated UI or standalone Setup bytes.
+
+No updater or backend implementation change is required for this package
+format. Existing `BuildHeadlessFullInstaller` maps the verified Headless
+installer/manifest to the existing protocol-5 wire filenames, without a UI
+executable. It preserves supplied manifest bytes rather than using the legacy
+missing-manifest fallback. Backend late-health-event patch `f8f5d4a2` remains
+separately undeployed, pending its earlier API update/restart approval.
+
+### Current verification checkpoint, not a release success claim
+
+The composed host contracts passed **117/117**: checkpoint 67 (48 existing tests
+unchanged, 19 additions), USB 9, binary compatibility 7, release workflow 25 and
+lifecycle workflow 9. Both YAML owners and the host C asset contract passed.
+Independent reviews checked scope isolation, closed provenance, typed external
+JSON, strict Inno bootstrap rejection, actual ZIP/hash validation and atomic
+staging. Raw host commands/results are in
+`/private/tmp/edr-headless-checkpoint-final-oac3qlvm/RESULTS.json`, SHA-256
+`86d7d5dfb6a5a51f5b16e2f65176f5a641af56cb986a93f6dd18dbf175417722`.
+The root reran the final composed 117 tests, C compile/contract and diff check
+with zero source drift; command/log index
+`/private/tmp/edr-headless-composed-gates-j4j0y92m/RESULTS.json`, SHA-256
+`5dd6c1e52c7a9f6dab4edc0e007cb7a7bcce3cdd44a94621903535999a0bfb5f`.
+Existing backend `TestHeadlessFullInstaller*` tests also passed 2/2 locally,
+covering protocol-5 transport, supplied-manifest byte preservation and invalid
+inputs. Those use synthetic PE/CMS fixtures, not a new installed consumer.
+
+On the single UTM, the initial synthetic unit invocation via `-File` was blocked
+by its existing execution policy and remains **failed**, not passed or skipped.
+No policy was changed, and script content was not re-executed inline to evade
+that denial. Only three task source files and inert JSON data were staged in a
+new owned temporary directory, without Agent/cache/installer access. A separate
+data-only AST check passed for the final ten modified PowerShell workflow/source
+bodies; it executes no content and is not a unit or lifecycle acceptance result.
+Its proof is
+`/private/tmp/edr-headless-manifest-native-hy6q2feo/FINAL_AST_RESULTS.json`, SHA-256
+`378465eec01d29b651660d3dff648587ade680f39b9c08648352f996f1eb8fd8`.
+The mandatory isolated CI unit step uses an explicit Authenticode fixture;
+the actual package writer subsequently calls the real cmdlet on the real
+installer. Windows unit execution, final-source native comparison, all 114
+release gates per architecture, real lifecycle and single-client deployment
+remain required at this checkpoint. The earlier runtime 68-test host gate is
+unchanged by these release/build-only edits. No Setup UI product package was
+downloaded, no real cache was cleaned, and no new historical evidence sample
+was substituted. The two unavailable old candidates and 7,950 unclassified
+owners remain the separately recorded limitations.
+
 ## 2026-10-16 source-owner recovery repair: host acceptance complete, native validation pending
 
 The real eight-slot P0 producer regression described below now has a production
