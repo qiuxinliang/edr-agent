@@ -51,7 +51,7 @@ try {
   if ($IncludeReleaseGate) {
     # Keep the original per-test release deadlines and sequential execution.
     # Only a successful release gate permits excluding its tests below.
-    & ctest --test-dir $build -C $Configuration --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
+    & ctest --test-dir $build -C $Configuration --output-on-failure --no-tests=error --label-regex '^windows-release-gate$' --output-junit (Join-Path $build 'native-release-results.xml')
     if ($LASTEXITCODE -ne 0) { throw 'Native Windows release gate failed.' }
   }
   $remaining = @($telemetryTests | Where-Object { -not $IncludeReleaseGate -or $_.name -notin @($releaseTests.name) })
@@ -59,7 +59,7 @@ try {
   # An empty remainder is legitimate only after all telemetry tests passed in
   # the release gate. Standalone telemetry still runs its complete label.
   if ($remaining.Count -gt 0) {
-    & ctest --test-dir $build -C $Configuration -L '^telemetry-minimization$' @telemetryExclusions --output-on-failure --no-tests=error --timeout 150
+    & ctest --test-dir $build -C $Configuration -L '^telemetry-minimization$' @telemetryExclusions --output-on-failure --no-tests=error --timeout 150 --output-junit (Join-Path $build 'native-telemetry-results.xml')
     if ($LASTEXITCODE -ne 0) { throw 'Native telemetry contract failed; no release or deployment performed.' }
   }
   Write-Output 'PASS: native synthetic contracts and loopback mTLS. This does not certify native sensor collection or execute real queue migration.'

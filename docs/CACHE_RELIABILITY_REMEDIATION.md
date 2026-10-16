@@ -1,5 +1,122 @@
 # Cache reliability remediation
 
+## 2026-10-16 real fixture link repaired; native preflight coverage expanded
+
+Source `de50fc52855c40e26b65e744f5241b5b2ab14725` passed native storage
+comparison **38837645962** on AMD64 and ARM64. Both architectures also passed
+the manifest fixture, 26 dependency-graph/compiler checks and PCRE2 isolation.
+Root acceptance rehashed both ZIPs and all 210 indexed measurement files,
+checked 46 successful child exits and 192 queue windows:
+`/private/tmp/edr-nativede50-monitor-aintswpq/ROOT_ARTIFACT_ACCEPTANCE.json`,
+SHA-256 `ab0166762ef54ac18e901602d00e3dd27018560daca78e311a9f80329ce294a1`.
+These comparisons compile their storage owners directly; those checks did
+**not** link every native release test.
+
+Headless candidate **3.2.690**, run **38838840141**, failed both architectures
+at `Build (Ninja)`. Manifest and dependency checks passed; both UI steps were
+skipped. The first actual linker error was
+`edr_storage_queue_p0_source_only_commit_local_typed_handoff` missing from
+`test_p0_source_only_durable_contract`. This fixture compiles the real producer
+but intentionally substitutes the queue boundary. Its old typed/untyped capture
+ports did not implement the new handoff API. The observation fixture includes
+the same source and shares the repair. This is a test-port link failure, not
+evidence of an absent production SQLite implementation.
+
+The added port preserves exact wire/owner capture and tuple checks, clears
+successor output before failure, and only publishes a fresh counter/epoch after
+a successful capture. Its comment distinguishes this in-memory test model from
+the real FULL SQLite/crash tests. No production source, assertion, label or gate
+was removed. An isolated host build reproduced the missing symbol, then both
+real fixture targets passed **2/2** after the correction. Evidence is under
+`/private/tmp/edr-durable-handoff-link-zf5yrcvy/`; this uses host PCRE2 and is not
+a Windows release dependency attestation.
+The capture-port probe passed seven failure/fresh-successor boundary cases.
+Its results SHA-256 is
+`f2110b7d7e0e292f4c2cd3727d818f87b1cf01baaf2f4220d361f037bb45eb21`.
+
+Local validation commands were `python3 -B tests/test_windows_release_gate.py
+--parallel 2` (26/26), `python3 -B tests/test_windows_release_workflow.py`
+(25/25), and `python3 -B tests/test_windows_lifecycle_workflow.py` (9/9).
+Their original output is in `/private/tmp/edr-691-release-gate-host.log`,
+`/private/tmp/edr-691-release-workflow-host.log` and
+`/private/tmp/edr-691-lifecycle-workflow-host.log`. Ruby Psych parsed the updated
+workflow and `git diff --check` passed. The modified PowerShell orchestration
+fixture has not been executed on this host; it runs before the actual native
+contracts in the new Windows preflight.
+
+The comparison workflow now checks out/verifies the same canonical private P0
+inputs through the existing read-only owner and configures the native Release
+build with the existing SQLite/YARA, OpenSSL, static PCRE2 and IPO settings.
+It reuses `run_telemetry_windows_native.ps1 -IncludeReleaseGate` to build the
+two existing aggregate targets and run their real tests **before** comparing
+storage workloads. Expected selection for this source is 101 release tests and
+13 remaining telemetry tests, with 26 overlapping tests executed once. The
+earlier 26-case micro-build graph regression remains a separate check.
+Native contract dependencies include Agent and installer-worker binaries;
+this preflight does not package, install, publish or contact an endpoint.
+
+The existing runner now retains separate release and telemetry JUnit files;
+otherwise the second CTest invocation overwrites `LastTest.log`. Its orchestration
+fixture checks independent output paths while preserving phase failure ordering
+and deadlines. Contract results use a separate artifact, leaving the existing
+measurement archive paths unchanged. Actual new-source Windows execution,
+114 non-skipped results, comparison artifacts and embedded-installer lifecycle
+are still required before candidate 691 can be accepted. Failed 688/689/690
+drafts remain unpublished; no Setup UI or standalone Setup package is downloaded.
+
+690 metadata is indexed by
+`/private/tmp/edr-690-headless-monitor-vcglnlqn/RESULTS.json`, SHA-256
+`9b6efbe474dff5484edf964d25930d773f44733b43f5c7f1ade432f02eac9f22`.
+Failure excerpts and provenance are in
+`/private/tmp/edr-690-headless-release-84ceh69c/failure-116774083571.sanitized-excerpt.proof.json`
+and the corresponding ARM64 `116774083614` proof. Complete decoded logs were
+sanitized and hashed in memory before saving only compiler-error excerpts;
+raw environments/logs were not persisted. Packaging, native test execution,
+child lifecycle and publication did not run for 690.
+
+### Authorized local API deployment and bounded UTM preservation baseline
+
+The separately authorized API source
+`f8f5d4a256899f8ee4d4c525b4bef299470acdfd` was deployed by the existing
+`restart_local_edr_api.sh` owner. Its actual Go 1.25.0 binary SHA-256 is
+`11c76ce41f5b57151b78be5503bcb0395e92d6085ed170a496f38e26855df707`,
+with new API PID 61704 and unchanged worker PID 46698/generation. Root checked
+binary/source identity, actual verified TLS, health/readiness, protected-route
+401, frontend response, unchanged configuration and a 195-second stability
+window. Deployment results SHA-256:
+`3b57fdfe07eba49f23604da30395e87a8be6546df169931f5bd21c446cf73069`,
+in `/private/tmp/edr-api-f8-local-deploy-pe2tqqeb/RESULTS.json`.
+This does not yet accept the actual client late-health/event-order/log consumer.
+The worker was intentionally preserved and is not claimed to run the new image.
+
+The UTM remains on the same 687 process generation: PID 8400, native FILETIME
+`134365780065939722`, executable SHA-256
+`6c33f6233b8355d6b30d4bd94082be13ee7d139e2b8b7bd425c1e5214dab8740`.
+A bounded read-only native Python probe completed in 891 ms, returned 27 SQL
+rows and hashed 6,645,154 bytes, including before/after executable checks.
+Its original three queue-owner summary projections exactly match the old
+baseline, and all nine stored ledger categories match recomputed costs/counts.
+Summary `/private/tmp/edr-678-client-acceptance/predeploy-690-native-queue-v3.json`
+has SHA-256 `91176e67a3dc6b01ce4d9abd3fc0076422956530aa54b8228ac7f63dbe161e0b`;
+root acceptance SHA-256 is
+`3fc031cc5c4db6af33721cce1e6b7b2ed6a9848a606a17b3348fb1db4870d151`.
+No evidence database or new/replacement owner sample was read. Missing auxiliary
+source-audit columns are explicitly unsupported, not zero. SQLite read-only
+access can use existing SHM bookkeeping; this is not proof of untouched physical
+bytes or preservation of every historical row.
+
+The initial probe refused its self-architecture assumption before opening a DB.
+A separate bounded self observation pinned Python's PE, path, size and digest;
+the correction retains the exact native Agent identity guard. The next host
+attempt failed with AppleScript -10827 in the restricted environment. Both
+failed attempts/intents remain preserved. A separate escalated read-only VM
+status succeeded, followed by the one manually reviewed, distinct v3 attempt
+above. This does not retry an unknown guest outcome automatically or bypass
+Windows PowerShell policy. The two originally missing evidence candidates remain
+missing and were not resampled; the historical 7,950-row aggregate is not new
+per-record preservation evidence. Actual new-client upgrade validation remains
+open.
+
 ## 2026-10-16 fixture closure verified; independent gate inventory corrected
 
 Source `b0cc94e666dab7adf3ebb5d77e6470bdf9c25db5` passed test-only native

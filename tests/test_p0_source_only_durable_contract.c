@@ -250,6 +250,41 @@ EdrError edr_storage_queue_p0_source_only_commit_local_typed(
       batch_id, wire, wire_len, compressed, recovery_audit);
 }
 
+EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *wire, size_t wire_len,
+    int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner,
+    EdrStorageQueueP0SourceOnlyLatch *successor) {
+  EdrStorageQueueP0SourceOnlyLatch next;
+  if (successor) {
+    memset(successor, 0, sizeof(*successor));
+    if (!expected || expected->latch_counter >= (uint64_t)INT64_MAX) {
+      return EDR_ERR_INVALID_ARG;
+    }
+    next = *expected;
+  }
+  EdrError result = owner ? edr_storage_queue_p0_source_only_commit_local_typed(
+      expected, event_id, batch_id, wire, wire_len, compressed, recovery_audit, owner) :
+      edr_storage_queue_p0_source_only_commit_local(expected, event_id,
+          batch_id, wire, wire_len, compressed, recovery_audit);
+  /* This capture port models only the producer's in-memory handoff. The
+   * real SQLite capacity fixture verifies its FULL transaction and crash gap.
+   * Do not reuse prepare_local here: golden fixtures intentionally use a fixed
+   * tuple there, whereas a successor must have a fresh prepared identity. */
+  if (result == EDR_OK && successor) {
+    next.latch_counter++;
+    next.latch_epoch = next.latch_counter;
+    next.latched = 1;
+    next.recovery_required = 0;
+    next.owner_version = EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3;
+    next.recovery_event_id[0] = '\0';
+    next.recovery_batch_id[0] = '\0';
+    s_source_latch = next;
+    *successor = next;
+  }
+  return result;
+}
+
 EdrError edr_storage_queue_p0_source_only_commit_local(
     const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
     const char *batch_id, const uint8_t *wire, size_t wire_len,

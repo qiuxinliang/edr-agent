@@ -81,6 +81,10 @@ try {
     }
     foreach ($arguments in $state.testArguments) {
       if ($arguments -notcontains '--no-tests=error') { throw "${case}: empty test selection can pass." }
+      $resultFlag = [Array]::IndexOf($arguments, '--output-junit')
+      if ($resultFlag -lt 0 -or $resultFlag + 1 -ge $arguments.Count) { throw "${case}: native results are not retained." }
+      $resultName = if ($arguments -contains '-L') { 'native-telemetry-results.xml' } else { 'native-release-results.xml' }
+      if ($arguments[$resultFlag + 1] -cne (Join-Path $root $resultName)) { throw "${case}: native phases overwrite or misplace their results." }
       if ($arguments -contains '-L') {
         if (($arguments -contains '--label-exclude') -ne ($case -ne 'standalone')) { throw "${case}: wrong telemetry exclusion." }
         if ($arguments -notcontains '150') { throw "${case}: telemetry deadline changed." }

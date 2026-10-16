@@ -1,5 +1,5 @@
-# Test-only comparison for the storage owners or manual dispatch. No product build,
-# installer, release, endpoint connection or cache migration is performed.
+# Native contracts and storage comparisons before a candidate release. Contract
+# dependencies are built; no packaging, installation, release or endpoint access.
 name: Evidence retention native comparison
 
 on:
@@ -24,6 +24,13 @@ on:
       - tests/test_headless_installer_manifest.ps1
       - tests/test_windows_release_gate.py
       - tests/test_pcre2_cmake_gate.py
+      - tests/test_p0_source_only_durable_contract.c
+      - tests/test_p0_observation_semantics.c
+      - tests/run_telemetry_windows_native.ps1
+      - tests/test_native_gate_runner.ps1
+      - tests/CMakeLists.txt
+      - cmake/AgentRuntimeGate.cmake
+      - cmake/WindowsReleaseGate.cmake
       - .github/workflows/evidence-retention-comparison.yml
 
 permissions:
@@ -52,13 +59,16 @@ jobs:
             runner: windows-2022
             msvc_arch: x64
             triplet: x64-windows
+            cmake_processor: AMD64
           - arch: arm64
             runner: windows-11-vs2026-arm
             msvc_arch: arm64
             triplet: arm64-windows
+            cmake_processor: ARM64
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -75,6 +85,19 @@ jobs:
       - name: Initialize the locked native compiler owner
         shell: pwsh
         run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+      - name: Read fixed private P0 contract inputs
+        timeout-minutes: 5
+        env:
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        shell: pwsh
+        run: .\scripts\checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
+      - name: Verify private P0 contract input identity and pair
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement requirements-release.txt
+          if ($LASTEXITCODE -ne 0) { throw 'P0 contract verification dependency installation failed' }
+          python -B scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'P0 contract input verification failed' }
       - name: Identify existing locked dependency cache
         id: vcpkg-key
         shell: pwsh
@@ -96,7 +119,7 @@ jobs:
       - name: Install and ABI-check the existing manifest closure
         shell: pwsh
         run: |
-          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') -MaxAttempts 3 -InitialBackoffSeconds 30
+          & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe (Join-Path $env:VCPKG_ROOT 'vcpkg.exe') -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 3 -InitialBackoffSeconds 30
       - name: Verify release gate build dependencies
         env:
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/${{ matrix.triplet }}
@@ -106,6 +129,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows release gate dependency regression failed' }
           python -B tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v
           if ($LASTEXITCODE -ne 0) { throw 'Windows PCRE2 header isolation regression failed' }
+      - name: Build and execute actual native release and telemetry contracts
+        shell: pwsh
+        run: |
+          & .\tests\test_native_gate_runner.ps1
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
+          cmake -B contract-build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain" `
+            "-DCMAKE_PREFIX_PATH=$prefix" `
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed" `
+            '-DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_processor }}' `
+            '-DEDR_WINDOWS_TARGET_ARCH=${{ matrix.arch }}' `
+            -DVCPKG_MANIFEST_FEATURES=yara `
+            '-DEDR_PCRE2_PRODUCER_TARGET=windows/${{ matrix.arch }}' `
+            "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" `
+            -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON -DEDR_WITH_P0_RULES_OPENSSL=ON `
+            -DEDR_REQUIRE_SQLITE=ON -DEDR_WITH_YARA=ON -DEDR_REQUIRE_YARA=ON `
+            -DEDR_ENABLE_IPO=ON "-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR" `
+            -DEDR_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { throw 'Native contract configuration failed' }
+          $opensslTools = Join-Path $prefix 'tools/openssl'
+          & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
+          if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
       - name: Equal-input native evidence and pressure comparisons
         shell: pwsh
         run: |
@@ -127,3 +173,15 @@ jobs:
             ${{ runner.temp }}/retention-results/**/*.json
             ${{ runner.temp }}/retention-results/**/*.jsonl
             ${{ runner.temp }}/retention-results/**/*.log
+      - name: Preserve native contract results separately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-contracts-native-${{ matrix.arch }}-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            contract-build/native-release-results.xml
+            contract-build/native-telemetry-results.xml
+            contract-build/Testing/Temporary/LastTest.log
+            contract-build/windows-rule-audit-result.json
