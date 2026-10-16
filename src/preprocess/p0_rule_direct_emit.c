@@ -38,13 +38,23 @@
 static SRWLOCK s_p0_state_lock = SRWLOCK_INIT;
 static void p0_state_lock(void) { AcquireSRWLockExclusive(&s_p0_state_lock); }
 static void p0_state_unlock(void) { ReleaseSRWLockExclusive(&s_p0_state_lock); }
+static SRWLOCK s_p0_source_io_lock = SRWLOCK_INIT;
+static void p0_source_io_lock(void) { AcquireSRWLockExclusive(&s_p0_source_io_lock); }
+static void p0_source_io_unlock(void) { ReleaseSRWLockExclusive(&s_p0_source_io_lock); }
 #else
 #include <pthread.h>
 #include <time.h>
 static pthread_mutex_t s_p0_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static void p0_state_lock(void) { pthread_mutex_lock(&s_p0_state_lock); }
 static void p0_state_unlock(void) { pthread_mutex_unlock(&s_p0_state_lock); }
+static pthread_mutex_t s_p0_source_io_lock = PTHREAD_MUTEX_INITIALIZER;
+static void p0_source_io_lock(void) { pthread_mutex_lock(&s_p0_source_io_lock); }
+static void p0_source_io_unlock(void) { pthread_mutex_unlock(&s_p0_source_io_lock); }
 #endif
+
+/* Serialize the crash-gap tuple with its exact RAM owner. This lock can span
+ * bounded SQLite I/O; the short P0 state lock never does. Public entry points
+ * acquire it once and call only io_owned helpers, avoiding recursive locking. */
 
 /* Only an exact source-event replay is deduplicated.  PID, timestamp, and
  * rule alone are never an identity: different actions can legitimately
@@ -91,7 +101,6 @@ typedef struct p0_source_only_retry_slot {
   uint64_t next_retry_ms;
   uint8_t pending;
   uint8_t latch_valid;
-  uint8_t recovery_audit;
 } p0_source_only_retry_slot;
 typedef struct p0_source_only_committed_slot {
   char source_event_id[EDR_BR_ID_LEN];
@@ -120,6 +129,7 @@ static int s_p0_source_only_persistent_latch_active;
 static int s_p0_source_only_recovery_verified;
 static int s_p0_source_only_loss_detected;
 static int s_p0_source_only_loss_audit_durable;
+static uint64_t s_p0_source_only_audit_retry_after_ms;
 /* A restart cannot reconstruct which event families an existing durable
  * latch covered, so startup begins globally fused. During one process
  * lifetime, known source-only faults only pause their owning family. */
@@ -135,7 +145,6 @@ static void p0_reset_rate_state_locked(void);
 #endif
 static int p0_build_source_only_delivery_record(
     const EdrStorageQueueP0SourceOnlyLatch *latch, EdrBehaviorRecord *out);
-static int p0_source_only_record_is_delivery_loss(const EdrBehaviorRecord *record);
 #ifdef EDR_P0_DIRECT_EMIT_TESTING
 static uint64_t s_p0_test_monotonic_ms;
 static int s_p0_test_file_read_collector_healthy = 1;
@@ -159,6 +168,7 @@ void edr_p0_rule_test_reset_dedup(void) {
   s_p0_source_only_retry_next = 0u;
   s_p0_source_only_committed_next = 0u;
   s_p0_source_only_retry_generation = 0u;
+  s_p0_source_only_audit_retry_after_ms = 0u;
   s_p0_deferred_next_poll_ms = 0u;
   s_p0_deferred_storage_failures = 0u;
   s_p0_deferred_consecutive_failures = 0u;
@@ -1152,10 +1162,32 @@ static void p0_source_only_nonce_hex(const uint8_t nonce[16], char out[33]) {
 
 static void p0_source_only_set_latch_locked(const EdrStorageQueueP0SourceOnlyLatch *latch) {
   if (!latch) return;
+  char nonce[33];p0_source_only_nonce_hex(latch->queue_nonce,nonce);
+  if (s_p0_source_only_latch_counter != latch->latch_counter ||
+      s_p0_source_only_latch_epoch != latch->latch_epoch ||
+      strcmp(s_p0_source_only_queue_nonce,nonce)) s_p0_source_only_audit_retry_after_ms=0u;
   s_p0_source_only_persistent_latch_active = latch->latched ? 1 : 0;
   s_p0_source_only_latch_counter = latch->latch_counter;
   s_p0_source_only_latch_epoch = latch->latch_epoch;
   p0_source_only_nonce_hex(latch->queue_nonce, s_p0_source_only_queue_nonce);
+}
+
+/* Called only after the matching FULL commit succeeded. A successor covers
+ * all exact RAM records before a clean queue close can claim no gap exists. */
+static void p0_source_only_note_commit_latch_locked(
+    const EdrStorageQueueP0SourceOnlyLatch *previous,
+    const EdrStorageQueueP0SourceOnlyLatch *successor) {
+  EdrStorageQueueP0SourceOnlyLatch current=*previous;
+  if (successor && successor->latched) current=*successor;
+  else {
+    current.latched=0;current.recovery_required=0;current.latch_epoch=0;
+    current.recovery_event_id[0]=current.recovery_batch_id[0]=0;
+  }
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i) if(s_p0_source_only_retry[i].pending) {
+    s_p0_source_only_retry[i].latch=current;
+    s_p0_source_only_retry[i].latch_valid=current.latched?1u:0u;
+  }
+  p0_source_only_set_latch_locked(&current);
 }
 
 static void p0_source_only_mark_unhealthy_locked(const char *reason, int unrecoverable) {
@@ -1216,24 +1248,35 @@ static void p0_source_only_note_owner_resolved_locked(void) {
   }
 }
 
-static void p0_source_only_note_delivery_loss_durable_locked(
-    const EdrBehaviorRecord *record) {
-  if (!p0_source_only_record_is_delivery_loss(record)) return;
-  s_p0_source_only_loss_detected = 1;
-  s_p0_source_only_loss_audit_durable = 1;
-}
-
 /* Do not take the P0 state lock while executing SQLite.  This has no private
  * persistence: it only prepares the one queue_meta latch used by the normal
  * event_queue severity-2 insert path. */
-static void p0_source_only_sync_persistent_latch(void) {
+static void p0_source_only_sync_persistent_latch_io_owned(void) {
   int required;
-  EdrStorageQueueP0SourceOnlyLatch latch;
+  EdrStorageQueueP0SourceOnlyLatch latch={0};
+  uint64_t counter,epoch;char nonce[33],current_nonce[33];
   p0_state_lock();
   required = s_p0_source_only_latch_sync_required;
+  counter=s_p0_source_only_latch_counter;epoch=s_p0_source_only_latch_epoch;
+  snprintf(nonce,sizeof(nonce),"%s",s_p0_source_only_queue_nonce);
   p0_state_unlock();
   if (!required) return;
-  if (edr_storage_queue_p0_source_only_latch_prepare_local(&latch) != EDR_OK || !latch.latched) {
+  EdrError status=edr_storage_queue_p0_source_only_latch_get(&latch);
+  p0_source_only_nonce_hex(latch.queue_nonce,current_nonce);
+  /* Repeated overflow coalesces into the already durable loss boundary.
+   * Never rewrite the same strict tuple per rejected source, or reuse a
+   * different queue generation merely because its owner also reports loss. */
+  int already_durable=status==EDR_OK && latch.latched && latch.recovery_required &&
+      latch.owner_version==EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3 &&
+      latch.latch_counter==counter && latch.latch_epoch==epoch && !strcmp(nonce,current_nonce);
+  if (!already_durable) status=edr_storage_queue_p0_source_only_latch_prepare_local(&latch);
+  /* This path represents known loss, unlike an ordinary exact RAM retry.
+   * A recreated queue first returns prepared; turn that same tuple into the
+   * recovery owner before releasing the sync requirement. Failure of either
+   * FULL transaction keeps the loss fused and retryable. */
+  if (status==EDR_OK && latch.latched && !latch.recovery_required)
+    status=edr_storage_queue_p0_source_only_latch_prepare_local(&latch);
+  if (status != EDR_OK || !latch.latched || !latch.recovery_required) {
     if (latch.latched && latch.owner_version == EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_REMOTE_V2) {
       p0_state_lock();
       p0_source_only_set_latch_locked(&latch);
@@ -1246,6 +1289,12 @@ static void p0_source_only_sync_persistent_latch(void) {
   s_p0_source_only_latch_sync_required = 0;
   p0_source_only_set_latch_locked(&latch);
   p0_state_unlock();
+}
+
+static void p0_source_only_sync_persistent_latch(void) {
+  p0_source_io_lock();
+  p0_source_only_sync_persistent_latch_io_owned();
+  p0_source_io_unlock();
 }
 
 static int p0_source_only_exact_pending_locked(const char *event_id,
@@ -1306,7 +1355,8 @@ static int p0_source_only_prepare_record(const EdrBehaviorRecord *record,
 
 static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
                                          const EdrStorageQueueP0SourceOnlyLatch *latch,
-                                         int recovery_audit) {
+                                         int recovery_audit,
+                                         EdrStorageQueueP0SourceOnlyLatch *successor) {
   uint8_t *wire;
   char batch_id[EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX];
   size_t wire_len;
@@ -1342,8 +1392,8 @@ static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
     owner.parent_process_start_key = record->parent_process_start_key;
     owner.parent_process_creation_filetime_100ns = record->parent_process_creation_filetime_100ns;
   }
-  int ok = (typed ? edr_storage_queue_p0_source_only_commit_local_typed(
-             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit, &owner)
+  int ok = (typed || successor ? edr_storage_queue_p0_source_only_commit_local_typed_handoff(
+             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit, typed?&owner:NULL,successor)
            : edr_storage_queue_p0_source_only_commit_local(
              latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit)) == EDR_OK;
   cJSON_Delete(context);
@@ -1363,7 +1413,7 @@ static int p0_source_only_latch_equal(const EdrStorageQueueP0SourceOnlyLatch *le
 static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
                                       const char *semantic_sha256,
                                       const EdrStorageQueueP0SourceOnlyLatch *latch,
-                                      int latch_valid, int recovery_audit) {
+                                      int latch_valid) {
   uint64_t now = p0_monotonic_ms();
   uint32_t free_index = P0_SOURCE_ONLY_RETRY_SLOTS;
   p0_state_lock();
@@ -1384,7 +1434,7 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
     p0_source_only_mark_unhealthy_for_event_locked(
         "source_only_retry_capacity_exhausted", 1, record->type);
     p0_state_unlock();
-    p0_source_only_sync_persistent_latch();
+    p0_source_only_sync_persistent_latch_io_owned();
     return P0_SOURCE_ONLY_DURABLE_UNHEALTHY;
   }
   {
@@ -1393,7 +1443,6 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
     slot->record = *record;
     if (latch_valid && latch) slot->latch = *latch;
     slot->latch_valid = latch_valid ? 1u : 0u;
-    slot->recovery_audit = recovery_audit ? 1u : 0u;
     snprintf(slot->source_event_id, sizeof(slot->source_event_id), "%s", record->event_id);
     snprintf(slot->source_semantic_sha256, sizeof(slot->source_semantic_sha256), "%s",
              semantic_sha256);
@@ -1408,7 +1457,7 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
   return P0_SOURCE_ONLY_DURABLE_PENDING;
 }
 
-static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int recovery_audit) {
+static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record) {
   EdrBehaviorRecord durable;
   EdrStorageQueueP0SourceOnlyLatch latch;
   char semantic_sha256[65];
@@ -1418,7 +1467,7 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
     p0_source_only_mark_unhealthy_for_event_locked(
         "source_only_identity_unavailable", 1, record ? record->type : 0);
     p0_state_unlock();
-    p0_source_only_sync_persistent_latch();
+    p0_source_only_sync_persistent_latch_io_owned();
     return P0_SOURCE_ONLY_DURABLE_UNHEALTHY;
   }
 
@@ -1427,24 +1476,31 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
     p0_state_unlock();
     return P0_SOURCE_ONLY_DURABLE_COMMITTED;
   }
+  int pending = p0_source_only_retry_has_pending_locked();
   p0_state_unlock();
+
+  /* A known failed assertion still owns the prepared tuple. A new prepare
+   * would turn it into an unknown-loss boundary and prohibit TTL reclamation
+   * needed by that exact retry. Retain later sources without touching it. */
+  if (pending) {
+    return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0);
+  }
 
   memset(&latch, 0, sizeof(latch));
   if (edr_storage_queue_p0_source_only_latch_prepare_local(&latch) == EDR_OK && latch.latched) {
     p0_state_lock();
     p0_source_only_set_latch_locked(&latch);
     p0_state_unlock();
-    if (p0_source_only_enqueue_record(&durable, &latch, recovery_audit)) {
+    if (!latch.recovery_required && p0_source_only_enqueue_record(&durable, &latch,0,NULL)) {
       p0_state_lock();
       /* v3 owns the full diagnostic wire locally. A FULL local commit is
        * distinct from delivery/ACK and clears only the exact local-v3 latch.
        * The normal recovery probe still checks IR and pending retry ownership
        * before restoring the affected detection capability. */
-      p0_source_only_set_latch_locked(&latch);
+      p0_source_only_note_commit_latch_locked(&latch,NULL);
       p0_source_only_mark_unhealthy_for_event_locked(
           "source_only_local_recovery_probe_pending", 0, durable.type);
       p0_source_only_remember_committed_locked(durable.event_id, semantic_sha256);
-      p0_source_only_note_delivery_loss_durable_locked(&durable);
       s_p0_emit_source_only_backpressure_emitted++;
       p0_state_unlock();
       return P0_SOURCE_ONLY_DURABLE_COMMITTED;
@@ -1454,7 +1510,7 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
     p0_source_only_mark_unhealthy_for_event_locked(
         "source_only_durable_unavailable", 0, durable.type);
     p0_state_unlock();
-    return p0_source_only_store_retry(&durable, semantic_sha256, &latch, 1, recovery_audit);
+    return p0_source_only_store_retry(&durable, semantic_sha256, &latch, 1);
   }
 
   p0_state_lock();
@@ -1462,22 +1518,35 @@ static int p0_source_only_submit_record(const EdrBehaviorRecord *record, int rec
   p0_source_only_mark_unhealthy_for_event_locked(
       "source_only_latch_prepare_failed", 0, durable.type);
   p0_state_unlock();
-  return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0, recovery_audit);
+  return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0);
+}
+
+static int p0_source_only_submit_record(const EdrBehaviorRecord *record) {
+  p0_source_io_lock();
+  int result = p0_source_only_submit_record_io_owned(record);
+  p0_source_io_unlock();
+  return result;
 }
 
 static int p0_source_only_submit(const EdrBehaviorRecord *record) {
-  return p0_source_only_submit_record(record, 0);
+  return p0_source_only_submit_record(record);
 }
 
-int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out) {
+static int p0_source_only_poll_durable_retry_io_owned(EdrBehaviorRecord *committed_out) {
   EdrBehaviorRecord record;
   EdrStorageQueueP0SourceOnlyLatch latch;
   uint64_t generation = 0u;
   uint64_t now = p0_monotonic_ms();
   uint32_t selected = P0_SOURCE_ONLY_RETRY_SLOTS;
   int latch_valid = 0;
-  int recovery_audit = 0;
   if (committed_out) memset(committed_out, 0, sizeof(*committed_out));
+
+  p0_source_only_sync_persistent_latch_io_owned();
+  p0_state_lock();
+  int unresolved_loss = s_p0_source_only_latch_sync_required ||
+      (s_p0_source_only_unrecoverable && !s_p0_source_only_loss_audit_durable);
+  p0_state_unlock();
+  if (unresolved_loss) return 0;
 
   p0_state_lock();
   for (uint32_t offset = 0u; offset < P0_SOURCE_ONLY_RETRY_SLOTS; ++offset) {
@@ -1491,7 +1560,6 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
     record = slot->record;
     latch = slot->latch;
     latch_valid = slot->latch_valid ? 1 : 0;
-    recovery_audit = slot->recovery_audit ? 1 : 0;
     generation = slot->generation;
     slot->next_retry_ms = now == 0u ? 0u : now + P0_SOURCE_ONLY_RETRY_MS;
     s_p0_source_only_retry_next = (candidate + 1u) % P0_SOURCE_ONLY_RETRY_SLOTS;
@@ -1502,12 +1570,22 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
   p0_state_unlock();
   if (selected == P0_SOURCE_ONLY_RETRY_SLOTS) return 0;
 
-  if (latch_valid) {
+  {
     EdrStorageQueueP0SourceOnlyLatch current;
-    /* Each v3 commit clears its exact local tuple. Other retained RAM slots
-     * must acquire a new tuple rather than retrying a resolved owner forever. */
-    if (edr_storage_queue_p0_source_only_latch_get(&current) != EDR_OK ||
-        !current.latched || !p0_source_only_latch_equal(&current, &latch)) latch_valid = 0;
+    int current_valid=edr_storage_queue_p0_source_only_latch_get(&current)==EDR_OK;
+    if (current_valid && current.recovery_required) return 0;
+    /* A prior owner may have resolved or the database may have reopened.
+     * Never retry against a tuple that the current queue no longer owns. */
+    if (latch_valid && (!current_valid || !current.latched ||
+        !p0_source_only_latch_equal(&current, &latch))) latch_valid = 0;
+    /* Other exact RAM records share the same known crash-gap owner until
+     * one commits. Round-robin retry must adopt it rather than preparing a
+     * second unknown assertion while the first is still capacity blocked. */
+    if (!latch_valid && current_valid && current.latched &&
+        current.owner_version==EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3 &&
+        !current.recovery_required && !current.recovery_batch_id[0]) {
+      latch=current;latch_valid=1;
+    }
   }
   if (!latch_valid || !latch.latched) {
     if (edr_storage_queue_p0_source_only_latch_prepare_local(&latch) != EDR_OK || !latch.latched) {
@@ -1522,68 +1600,27 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
       return 0;
     }
     latch_valid = 1;
-    p0_state_lock();
-    if (s_p0_source_only_retry[selected].pending &&
-        s_p0_source_only_retry[selected].generation == generation) {
-      s_p0_source_only_retry[selected].latch = latch;
-      s_p0_source_only_retry[selected].latch_valid = 1u;
-      p0_source_only_set_latch_locked(&latch);
-    }
-    p0_state_unlock();
   }
+  p0_state_lock();
+  if (s_p0_source_only_retry[selected].pending &&
+      s_p0_source_only_retry[selected].generation == generation) {
+    s_p0_source_only_retry[selected].latch = latch;
+    s_p0_source_only_retry[selected].latch_valid = 1u;
+    p0_source_only_set_latch_locked(&latch);
+  }
+  p0_state_unlock();
 
-  /* A recovery audit may begin after a database recreation, which first
-   * yields a fresh prepared latch. Convert that same retained tuple to the
-   * recovery state before claiming it as a loss audit; never bind an audit to
-   * a normal source assertion. */
-  if (recovery_audit && !latch.recovery_required) {
-    if (edr_storage_queue_p0_source_only_latch_prepare_local(&latch) != EDR_OK ||
-        !latch.latched || !latch.recovery_required) {
-      p0_state_lock();
-      if (s_p0_source_only_retry[selected].pending &&
-          s_p0_source_only_retry[selected].generation == generation) {
-        s_p0_emit_source_only_backpressure_failed++;
-        p0_source_only_mark_unhealthy_for_event_locked(
-            "source_only_recovery_latch_prepare_failed", 0, record.type);
-      }
-      p0_state_unlock();
-      return 0;
-    }
-    p0_state_lock();
-    if (s_p0_source_only_retry[selected].pending &&
-        s_p0_source_only_retry[selected].generation == generation) {
-      s_p0_source_only_retry[selected].latch = latch;
-      s_p0_source_only_retry[selected].latch_valid = 1u;
-      p0_source_only_set_latch_locked(&latch);
-    }
-    p0_state_unlock();
-  }
-
-  if (recovery_audit) {
-    EdrBehaviorRecord audit, prepared;
-    char semantic[65];
-    /* A recreated database/new loss tuple needs its own audit identity. An
-     * uncommitted RAM assertion may be rebound; no committed batch is edited. */
-    if (!p0_build_source_only_delivery_record(&latch, &audit) ||
-        !p0_source_only_prepare_record(&audit, &prepared, semantic)) return 0;
-    p0_state_lock();
-    if (s_p0_source_only_retry[selected].pending &&
-        s_p0_source_only_retry[selected].generation == generation) {
-      s_p0_source_only_retry[selected].record = prepared;
-      snprintf(s_p0_source_only_retry[selected].source_event_id,
-               sizeof(s_p0_source_only_retry[selected].source_event_id), "%s", prepared.event_id);
-      snprintf(s_p0_source_only_retry[selected].source_semantic_sha256,
-               sizeof(s_p0_source_only_retry[selected].source_semantic_sha256), "%s", semantic);
-      record = prepared;
-    }
-    p0_state_unlock();
-  }
-  if (!p0_source_only_enqueue_record(&record, &latch, recovery_audit)) {
+  p0_state_lock();
+  int other_pending=0;
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i)
+    if(i!=selected && s_p0_source_only_retry[i].pending) other_pending=1;
+  p0_state_unlock();
+  EdrStorageQueueP0SourceOnlyLatch successor={0};
+  if (!p0_source_only_enqueue_record(&record, &latch,0,other_pending?&successor:NULL)) {
     EdrStorageQueueP0SourceOnlyLatch current;
-    /* Another P0 source may have converted the global latch while this slot
-     * waited for I/O. Do not retry forever with a stale tuple: turn the
-     * current metadata into recovery-required and retain this source for the
-     * next exact queue attempt. */
+    /* A queue lifecycle or external recovery can replace this tuple despite
+     * producer serialization. Keep the source and require explicit recovery
+     * of the new owner rather than retrying the obsolete tuple forever. */
     if (edr_storage_queue_p0_source_only_latch_get(&current) == EDR_OK &&
         current.latched && !p0_source_only_latch_equal(&current, &latch) &&
         edr_storage_queue_p0_source_only_latch_prepare_local(&current) == EDR_OK &&
@@ -1618,13 +1655,19 @@ int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out)
   p0_source_only_remember_committed_locked(
       s_p0_source_only_retry[selected].source_event_id,
       s_p0_source_only_retry[selected].source_semantic_sha256);
-  p0_source_only_note_delivery_loss_durable_locked(
-      &s_p0_source_only_retry[selected].record);
   memset(&s_p0_source_only_retry[selected], 0, sizeof(s_p0_source_only_retry[selected]));
+  p0_source_only_note_commit_latch_locked(&latch,&successor);
   s_p0_source_only_retry_committed++;
   s_p0_emit_source_only_backpressure_emitted++;
   p0_state_unlock();
   return 1;
+}
+
+int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out) {
+  p0_source_io_lock();
+  int result = p0_source_only_poll_durable_retry_io_owned(committed_out);
+  p0_source_io_unlock();
+  return result;
 }
 
 int edr_p0_rule_source_only_capability_healthy(char *reason, size_t reason_cap) {
@@ -1682,7 +1725,7 @@ static int p0_source_only_ir_recovery_healthy(void) {
 /* Called at startup and preprocess retry. Healthy follows an owner-specific
  * resolved latch plus verified local durability and authenticated IR. Legacy
  * remote-v2 ACK ownership is preserved; local-v3 retention owns NEW diagnostics. */
-int edr_p0_rule_source_only_recover_after_queue_open(void) {
+static int p0_source_only_recover_io_owned(void) {
   EdrStorageQueueP0SourceOnlyLatch latch;
   EdrBehaviorRecord audit;
   EdrError status;
@@ -1696,7 +1739,7 @@ int edr_p0_rule_source_only_recover_after_queue_open(void) {
     return 0;
   }
 
-  p0_source_only_sync_persistent_latch();
+  p0_source_only_sync_persistent_latch_io_owned();
   p0_state_lock();
   if (s_p0_source_only_recovery_verified && !s_p0_source_only_terminal_unhealthy) {
     p0_state_unlock();
@@ -1774,9 +1817,10 @@ int edr_p0_rule_source_only_recover_after_queue_open(void) {
   }
   p0_state_unlock();
 
-  /* A locally retained record still owns the exact assertion.  Do not turn
-   * it into a capability-loss audit merely because its next retry is later. */
-  if (pending) return 0;
+  /* Known RAM owners keep their prepared tuple. A genuine recovery-required
+   * loss must first be audited even when all eight retry slots are occupied;
+   * waiting for ordinary admission here would prevent legal TTL reclamation. */
+  if (pending && !latch.recovery_required) return 0;
 
   /* A bound latch already has a durable source/audit BAT1.  Only the remote
    * ACK may advance it; re-emitting here would make a second authority. */
@@ -1804,8 +1848,40 @@ int edr_p0_rule_source_only_recover_after_queue_open(void) {
     p0_state_unlock();
     return 0;
   }
-  (void)p0_source_only_submit_record(&audit, 1);
+  uint64_t now=p0_monotonic_ms();
+  p0_state_lock();
+  if (now && s_p0_source_only_audit_retry_after_ms &&
+      now<s_p0_source_only_audit_retry_after_ms) {
+    p0_state_unlock();return 0;
+  }
+  s_p0_source_only_audit_retry_after_ms=now ?
+      (now>UINT64_MAX-P0_SOURCE_ONLY_RETRY_MS?UINT64_MAX:now+P0_SOURCE_ONLY_RETRY_MS):0u;
+  p0_state_unlock();
+  EdrStorageQueueP0SourceOnlyLatch successor={0};
+  if (p0_source_only_enqueue_record(&audit,&latch,1,pending?&successor:NULL)) {
+    p0_state_lock();
+    /* Only the storage owner's canonical current-tuple FULL commit grants
+     * this authority. Ordinary source records can never assert it by text. */
+    s_p0_source_only_loss_detected = 1;
+    s_p0_source_only_loss_audit_durable = 1;
+    p0_source_only_note_commit_latch_locked(&latch,&successor);
+    s_p0_source_only_audit_retry_after_ms=0u;
+    s_p0_emit_source_only_backpressure_emitted++;
+    p0_state_unlock();
+  } else {
+    p0_state_lock();
+    s_p0_emit_source_only_backpressure_failed++;
+    p0_source_only_wait_for_recovery_locked("source_only_loss_audit_storage_pending");
+    p0_state_unlock();
+  }
   return 0;
+}
+
+int edr_p0_rule_source_only_recover_after_queue_open(void) {
+  p0_source_io_lock();
+  int result = p0_source_only_recover_io_owned();
+  p0_source_io_unlock();
+  return result;
 }
 
 typedef struct p0_dedup_reservation {
@@ -2735,14 +2811,6 @@ static int p0_build_source_only_delivery_record(
       nonce_hex, (unsigned long long)latch->latch_counter,
       (unsigned long long)latch->latch_epoch, commitment, commitment);
   return written >= 0 && (size_t)written < sizeof(out->detection_context);
-}
-
-static int p0_source_only_record_is_delivery_loss(const EdrBehaviorRecord *record) {
-  return record && record->type == EDR_EVENT_CAPABILITY_AUDIT &&
-         strstr(record->detection_context, "\"stage\":\"source_only_delivery\"") != NULL &&
-         strstr(record->detection_context,
-                "\"gate_id\":\"P0_SOURCE_ONLY_DURABILITY_GATE\"") != NULL &&
-         strstr(record->detection_context, "\"loss_detected\":true") != NULL;
 }
 
 /* A producer that cannot take an admission owner must still leave a durable,

@@ -3,6 +3,9 @@
 #include "edr/p0_terminal_identity.h"
 #include "edr/transport_sink.h"
 #include "edr/types.h"
+#include "edr/sha256.h"
+#include "edr/p0_source_only_contract.h"
+#include <limits.h>
 #include "edr/evidence_projection.h"
 #include "edr/parent_pid.h"
 #include "edr/v1/event.pb.h"
@@ -1232,6 +1235,93 @@ static int event_decode(const uint8_t *frame,size_t n,edr_v1_BehaviorEvent *even
   memset(event,0,sizeof(*event)); stream=pb_istream_from_buffer(frame,n);
   return pb_decode(&stream,edr_v1_BehaviorEvent_fields,event)?1:deny(reason,cap,"event_decode_failed");
 }
+static int local_audit_decimal(const char *text, uint64_t *out) {
+  uint64_t n=0u;
+  if (!text || !text[0] || text[0]=='0') return 0;
+  for (const char *p=text; *p; ++p) {
+    if (*p<'0' || *p>'9' || n>((uint64_t)INT64_MAX-(uint64_t)(*p-'0'))/10u) return 0;
+    n=n*10u+(uint64_t)(*p-'0');
+  }
+  *out=n; return 1;
+}
+int edr_egress_p0_local_recovery_audit_decode(const uint8_t *wire,size_t len,
+    const char *event_id,const char *batch_id,const char *endpoint,const char *tenant,
+    EdrEgressP0LocalRecoveryAudit *out) {
+  static const char hex[]="0123456789abcdef";
+  static const char domain[]="edr-p0-source-only-delivery-v2";
+  EdrEgressP0LocalRecoveryAudit tuple={0};
+  char commitment[65], expected_id[48], expected_batch[80], wire_sha[65];
+  /* This one fixed audit encodes to at most 760 RAW BAT1 bytes with 47/63
+   * scope bytes and two signed-64-bit (19-digit) counters, verified by the
+   * real producer test. 1024 bounds only its canonical protobuf re-encoding;
+   * it is not a general event or command-size assumption. */
+  uint8_t digest[32], number[8], prefix[4], encoded[1024];
+  int valid=0;
+  if (out) memset(out,0,sizeof(*out));
+  if (!out || !wire || len<=16u || len>sizeof(encoded)+16u || !event_id || !batch_id ||
+      !endpoint || !endpoint[0] || strlen(endpoint)>=48u || !strcmp(endpoint,"auto") ||
+      !tenant || !tenant[0] || strlen(tenant)>=64u ||
+      u32(wire)!=EDR_TRANSPORT_BATCH_MAGIC_RAW || u32(wire+4)!=1u ||
+      u32(wire+8)!=len-12u || u32(wire+12)!=len-16u) return 0;
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));
+  edr_v1_BehaviorEvent *expected=calloc(1,sizeof(*expected));
+  cJSON *ctx=NULL;
+  if (!event || !expected || !event_decode(wire+16,len-16,event,NULL,0)) goto done;
+  ctx=object(event->ave_result_json);
+  const cJSON *delivery=cJSON_GetObjectItemCaseSensitive(ctx,"source_only_delivery");
+  const char *nonce=string(delivery,"queue_nonce");
+  if (strlen(nonce)!=32u || !local_audit_decimal(string(delivery,"latch_counter"),&tuple.latch_counter) ||
+      !local_audit_decimal(string(delivery,"latch_epoch"),&tuple.latch_epoch)) goto done;
+  unsigned nonzero=0u;
+  for (unsigned i=0;i<16u;i++) {
+    const char *a=strchr(hex,nonce[i*2u]),*b=strchr(hex,nonce[i*2u+1u]);
+    if (!a || !b) goto done;
+    tuple.queue_nonce[i]=(uint8_t)(((unsigned)(a-hex)<<4u)|(unsigned)(b-hex));
+    nonzero|=tuple.queue_nonce[i];
+  }
+  if (!nonzero) goto done;
+  EdrSha256Ctx sha; edr_sha256_init(&sha);
+  put_u32(prefix,(uint32_t)(sizeof(domain)-1u));
+  edr_sha256_update(&sha,prefix,sizeof(prefix));
+  edr_sha256_update(&sha,(const uint8_t *)domain,sizeof(domain)-1u);
+  edr_sha256_update(&sha,tuple.queue_nonce,sizeof(tuple.queue_nonce));
+  for (unsigned field=0;field<2u;field++) {
+    uint64_t n=field?tuple.latch_epoch:tuple.latch_counter;
+    for (unsigned i=0;i<8u;i++) number[i]=(uint8_t)(n>>(i*8u));
+    edr_sha256_update(&sha,number,sizeof(number));
+  }
+  edr_sha256_final(&sha,digest);
+  for (unsigned i=0;i<32u;i++) {commitment[i*2u]=hex[digest[i]>>4u];commitment[i*2u+1u]=hex[digest[i]&15u];}
+  commitment[64]=0;
+  snprintf(expected_id,sizeof(expected_id),"p0sl-%.40s",commitment);
+  if (strcmp(event_id,expected_id) || edr_sha256_hex(wire,len,wire_sha)!=0) goto done;
+  snprintf(expected_batch,sizeof(expected_batch),"p0-source-%s",wire_sha);
+  if (strcmp(batch_id,expected_batch)) goto done;
+  snprintf(expected->event_id,sizeof(expected->event_id),"%s",expected_id);
+  snprintf(expected->endpoint_id,sizeof(expected->endpoint_id),"%s",endpoint);
+  snprintf(expected->tenant_id,sizeof(expected->tenant_id),"%s",tenant);
+  expected->type=EDR_EVENT_CAPABILITY_AUDIT;
+  expected->has_parent_pid_state=true;
+  snprintf(expected->identity_source,sizeof(expected->identity_source),"source_only_delivery");
+  snprintf(expected->identity_quality,sizeof(expected->identity_quality),"unknown");
+  snprintf(expected->source_completeness,sizeof(expected->source_completeness),"NOT_EVALUABLE");
+  snprintf(expected->transport_completeness,sizeof(expected->transport_completeness),"COMPLETE");
+  int written=snprintf(expected->ave_result_json,sizeof(expected->ave_result_json),
+      "{\"p0_disposition\":\"NOT_EVALUABLE\",\"reason\":\"pending_assertion_lost_on_restart\","
+      "\"source_contract_version\":\"" EDR_P0_SOURCE_ONLY_CONTRACT_VERSION "\",\"stage\":\"source_only_delivery\","
+      "\"gate_id\":\"" EDR_P0_SOURCE_ONLY_DURABILITY_GATE "\",\"loss_detected\":true,"
+      "\"source_only_delivery\":{\"queue_nonce\":\"%s\",\"latch_counter\":\"%llu\",\"latch_epoch\":\"%llu\","
+      "\"commitment_sha256\":\"%s\",\"latch_id\":\"%s\"}}",nonce,
+      (unsigned long long)tuple.latch_counter,(unsigned long long)tuple.latch_epoch,commitment,expected_id);
+  if (written<0 || (size_t)written>=sizeof(expected->ave_result_json)) goto done;
+  pb_ostream_t stream=pb_ostream_from_buffer(encoded,sizeof(encoded));
+  valid=pb_encode(&stream,edr_v1_BehaviorEvent_fields,expected) &&
+      stream.bytes_written==len-16u && !memcmp(encoded,wire+16,len-16u);
+  if (valid) *out=tuple;
+done:
+  cJSON_Delete(ctx);free(event);free(expected);return valid;
+}
+
 static int p0_wire_matches(const EdrEgressP0PairAssociation *intent,
     const uint8_t *wire,size_t len,int combined) {
   if (!intent || !wire || len<=16 || len>EDR_EGRESS_FRAME_MAX+16u ||

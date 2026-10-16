@@ -1,5 +1,118 @@
 # Cache reliability remediation
 
+## 2026-10-16 source-owner recovery repair: host acceptance complete, native validation pending
+
+The real eight-slot P0 producer regression described below now has a production
+repair. `p0_rule_direct_emit.c` serializes source-owner I/O with a separate mutex;
+the short state mutex never spans SQLite. Different pending sources share the
+known prepared handoff rather than preparing it repeatedly. Exact deduplication,
+eight RAM slots, round-robin retry and the existing 250 ms retry boundary remain.
+Ordinary capacity refusal therefore does not manufacture a restart-loss claim.
+
+A genuine overflow or lost handoff still requires a durable local gap audit.
+The audit is written directly, without a ninth RAM slot. Only a successful FULL
+commit of the canonical audit grants durable-loss status. Remaining RAM owners
+receive a fresh prepared successor atomically with the committed payload; clean
+close or a crash between audit commit and RAM drain cannot erase that recovery
+obligation. A recreated queue must establish strict recovery before clearing a
+known loss. Repeated strict-loss retries are bounded and do not rewrite the
+same latch indefinitely. Legacy remote-v2 recovery ownership remains protected.
+
+### Finite capacity and ownership
+
+`queue_sqlite.c` gives only the canonical local recovery audit access to the
+existing finite source reserve. The codec re-encodes and byte-compares a single
+minimal RAW/BAT1 proof, binding scope, nonce, counter, epoch, domain commitment,
+event ID and batch identity. Extra JSON/protobuf fields, commands, false flags,
+wrong tuples and malformed markers do not gain this ownership. This local
+classification grants no upload permission: the existing final egress gate
+continues to reject these source-only audit records.
+
+Let M be the existing queue logical budget, T its existing terminal reserve,
+and S its existing source reserve. Ordinary admission stays within M-T-S.
+New local audits must fit both their S-byte sublimit and total M-T. Terminal
+admission excludes only the actual canonical audit bytes, capped at S, from
+its M-S charge, and always checks total M. Repeated terminal records cannot
+borrow S; audit exhaustion explicitly refuses and preserves the recovery fuse.
+No configured budget, default retention window, percentage, or physical-disk
+claim is introduced. Existing reserve derivation remains in
+`queue_terminal_reserve_bytes` / `queue_p0_source_only_reserve_bytes`.
+
+Admission reads the original nine-row ledger plus one fixed metadata row, not
+an event-table SUM. Two new primitive counters in `queue_meta` are calibrated
+transactionally at startup and maintained by triggers. Measured SQLite VM
+steps remain 63 with both small and 5,000-row inventories. The original
+three-column ledger schema is unchanged. Canonical audit rows retain supported
+class 1 / policy 2, using a new controlled terminal-reason marker. Only the
+verified current writer creates it; query and TTL retirement verify the bytes
+again. Existing unclassified or malformed records remain protected.
+
+The replay path rechecks the frozen row inside the FULL transaction. A second
+SQLite connection deleting that row before BEGIN cannot clear the latch or
+return a successor. Calibration/commit failure rolls back both payload and
+counters. These protections do not reserve physical blocks or separate the
+shared database, lock, WAL, index and disk fault domains.
+
+### Verification and rollback boundary
+
+The final host build of `edr_agent`, `agent_runtime_gate_tests` and
+`telemetry_minimization_tests` passed. The combined labels selected 68 tests:
+62 passed in the sandbox; six loopback-listener tests were blocked by sandbox
+bind permission. The unchanged six tests passed after the scoped loopback
+rerun, 6/6 in 55.14 s. Both manifests report zero source drift across 697
+C/header/CMake entries. Original sandbox failures remain failures in their log.
+
+```sh
+cmake --build /private/tmp/edr-cache-assessment-egress-build --target edr_agent agent_runtime_gate_tests telemetry_minimization_tests -j4
+PATH=/opt/homebrew/opt/openssl@3/bin:$PATH ctest --test-dir /private/tmp/edr-cache-assessment-egress-build --output-on-failure --no-tests=error -L 'agent-runtime-gate|telemetry-minimization'
+```
+
+Raw commands, exit codes and hashes are in
+`/private/tmp/edr-source-recovery-integrated-20261016/RESULTS.json` and
+`LOOPBACK_RESULTS.json`. Focused producer tests cover two failed sources,
+in-flight concurrent submission, eight-slot overflow, FULL failure/backoff,
+queue recreation, clean close, child `_Exit(95)`, V2 ownership and exact payload
+preservation. Their network/action adapters are explicitly isolated; they do
+not certify an installed Windows consumer. Queue/codec tests additionally cover
+hostile proofs, critical exhaustion, a 20-byte terminal and journal under local
+pressure, calibration rollback, external-writer replay deletion and exact
+ledger agreement.
+
+The old-687 storage owner (`97064865`) opened the new synthetic database,
+performed expired cleanup and a terminal write, and reopened it successfully;
+the original new-audit bytes, prepared successor and ledger identity survived.
+The new reader then verified it again: 4/4 round-trip steps passed. Manifest:
+`/private/tmp/edr-audit-687-compat-fczsy341/manifest.json`, SHA-256
+`efcac7e9faf90a829d192355add28fe867fcb713d15c42d22dfb314585a8ebef`.
+This executes the actual old queue owner with current shared codec/support,
+not the complete old binary or a real-client rollback. Old readers conservatively
+hold the unfamiliar marker; rollback does not authorize deleting it. No old
+payload is re-encoded or reclassified by this change.
+
+Native comparison runs 38825102163 and 38827617869 failed before measurement:
+first Git autocrlf changed baseline bytes; then Windows tarfile produced an
+unreadable nanopb symlink (Errno 22) on both architectures. Their failures are
+preserved. The archive invocation now fixes LF locally, validates every Git
+blob/link closure, and on Windows materializes verified target bytes. Eleven
+export/failure boundaries plus complete host runner smoke protocols pass;
+manifest `/private/tmp/edr-native-b783-symlink-zw3yw1k2/RESULTS.json`, SHA-256
+`688c516821b8f0eb0fb01f06014fdb275cb6a4d5a7a220aee5371a15606fe716`.
+A new source-pinned native AMD64/ARM64 run remains required before interpreting
+Windows CPU/I/O or publishing the repaired client candidate. Simulated windows,
+issued I/O and sampled file peaks do not prove elapsed soak duration or device
+write amplification.
+
+Separately, parent commit `f8f5d4a256899f8ee4d4c525b4bef299470acdfd`
+fixes late upgrade progress during the existing health observation and moves
+the installer-log gate into the same row-lock transaction as journal advance.
+Real isolated MySQL barrier tests and handler regressions passed; deployed-schema
+EXPLAIN remains skipped. The local API binary is prepared but **not deployed**,
+pending the separately requested backend update/restart approval. The installed
+UTM client remains 687 at this checkpoint. No Setup UI download, real cache
+cleanup, replacement evidence sample, fake ACK or expanded routine upload was
+performed. The 7,950 unknown legacy owners and the two unavailable historical
+candidate samples remain the separately recorded limitations below.
+
 ## 2026-10-16 native comparison preparation and a new producer recovery regression
 
 The comparison runners now support native Windows MSVC with the existing locked

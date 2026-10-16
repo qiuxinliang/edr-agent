@@ -102,6 +102,16 @@ int edr_egress_p0_combined_matches(const EdrEgressP0PairAssociation *intent,
     const uint8_t *combined_full_wire, size_t wire_len);
 int edr_egress_p0_intent_matches(const EdrEgressP0PairAssociation *intent,
     const uint8_t *intent_full_wire, size_t wire_len);
+/* Local-only canonical recovery proof. Decoding does not authorize egress.
+ * Scope, frozen identity and every encoded field are checked; queue admission
+ * must additionally match this tuple to its current durable latch. */
+typedef struct {
+  uint8_t queue_nonce[16];
+  uint64_t latch_counter, latch_epoch;
+} EdrEgressP0LocalRecoveryAudit;
+int edr_egress_p0_local_recovery_audit_decode(const uint8_t *full_wire, size_t wire_len,
+    const char *event_id, const char *batch_id, const char *endpoint_id,
+    const char *tenant_id, EdrEgressP0LocalRecoveryAudit *out);
 /* Maintenance classification only: 1 = a decoded paired result/alert exists,
  * 0 = fully decoded with none, -1 = unsupported/corrupt/indeterminate. This
  * never establishes the presence of its required intent or receiver alert. */

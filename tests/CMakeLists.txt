@@ -1405,6 +1405,32 @@ edr_apply_test_warnings(test_p0_direct_emit_suppression)
 add_test(NAME p0_direct_emit_suppression COMMAND test_p0_direct_emit_suppression WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(p0_direct_emit_suppression PROPERTIES TIMEOUT 120)
 
+if(SQLite3_FOUND)
+  get_target_property(_p0_capacity_sources test_p0_direct_emit_suppression SOURCES)
+  list(REMOVE_ITEM _p0_capacity_sources ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_direct_emit_suppression.c)
+  add_executable(test_p0_source_only_capacity_recovery
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_source_only_capacity_recovery.c
+    ${_p0_capacity_sources}
+    ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
+    ${CMAKE_SOURCE_DIR}/src/core/time_util.c
+    ${CMAKE_SOURCE_DIR}/src/transport/report_events_ack.c)
+  target_include_directories(test_p0_source_only_capacity_recovery PRIVATE
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+  target_compile_definitions(test_p0_source_only_capacity_recovery PRIVATE
+    EDR_P0_DIRECT_EMIT_TESTING=1 EDR_HAVE_NANOPB=1 EDR_HAVE_SQLITE=1 EDR_STORAGE_QUEUE_TESTING=1)
+  target_link_libraries(test_p0_source_only_capacity_recovery PRIVATE
+    Threads::Threads edr_egress_policy edr_validation_trace)
+  if(TARGET SQLite3::SQLite3)
+    target_link_libraries(test_p0_source_only_capacity_recovery PRIVATE SQLite3::SQLite3)
+  else()
+    target_link_libraries(test_p0_source_only_capacity_recovery PRIVATE SQLite::SQLite3)
+  endif()
+  edr_apply_test_warnings(test_p0_source_only_capacity_recovery)
+  add_test(NAME p0_source_only_capacity_recovery COMMAND test_p0_source_only_capacity_recovery)
+  set_tests_properties(p0_source_only_capacity_recovery PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 60)
+endif()
+
 add_executable(test_p0_deferred_snapshot test_p0_deferred_snapshot.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -2105,6 +2131,7 @@ edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_c
 edr_minimization_test(local_evidence_cache_migration test_local_evidence_cache_candidate)
 edr_minimization_test(local_evidence_cache_retention test_local_evidence_cache_candidate)
 edr_minimization_test(storage_queue_sqlite_contract test_storage_queue_sqlite)
+edr_minimization_test(p0_source_only_capacity_recovery test_p0_source_only_capacity_recovery)
 edr_minimization_test(detection_decision_combo test_detection_decision)
 edr_minimization_test(detection_regression_scenarios test_detection_regression)
 edr_minimization_test(detection_sensor_bridge test_detection_sensor_bridge)

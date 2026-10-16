@@ -93,10 +93,18 @@ def export_git_snapshot(repo, revision, destination, folders, binding_path):
             resolved, closure = resolve(target, seen | {relative})
             return resolved, [relative, *closure]
 
-        # Check the complete closure before extraction. Tarfile may create a
-        # real symlink or copy its target when Windows denies symlink creation.
+        # Check the complete closure before extraction. Windows tarfile links
+        # may be created successfully but remain unreadable (EINVAL). Materialize
+        # their verified targets without depending on native symlink behavior.
         closures = {relative: resolve(relative, set()) for relative in expected}
-        tar.extractall(destination)
+        if os.name == 'nt':
+            tar.extractall(destination, members=[member for member in entries.values()
+                                                if not member.issym()])
+            for relative, member in entries.items():
+                if member.issym():
+                    (destination/relative).write_bytes(expected[closures[relative][0]])
+        else:
+            tar.extractall(destination)
         for relative, blob in expected.items():
             path, member = destination/relative, entries[relative]
             resolved, closure = closures[relative]

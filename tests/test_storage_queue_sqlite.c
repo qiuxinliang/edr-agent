@@ -89,6 +89,14 @@ int edr_egress_p0_combined_matches(const EdrEgressP0PairAssociation *tuple,
     const uint8_t *wire,size_t len) { (void)tuple; (void)wire; (void)len; return 0; }
 int edr_egress_p0_intent_matches(const EdrEgressP0PairAssociation *tuple,
     const uint8_t *wire,size_t len) { (void)tuple; (void)wire; (void)len; return 0; }
+/* Canonical privileged audit semantics run with the real codec in
+ * test_queue_recovery. This storage-only suite never grants that privilege. */
+int edr_egress_p0_local_recovery_audit_decode(const uint8_t *wire,size_t len,
+    const char *event,const char *batch,const char *endpoint,const char *tenant,
+    EdrEgressP0LocalRecoveryAudit *out) {
+  (void)wire;(void)len;(void)event;(void)batch;(void)endpoint;(void)tenant;
+  if(out) memset(out,0,sizeof(*out));return 0;
+}
 static int s_send_ok;
 static int s_configured = 1;
 static int s_circuit_open;

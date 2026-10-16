@@ -99,6 +99,16 @@ EdrError edr_storage_queue_p0_source_only_commit_local_typed(
     const char *batch_id, const uint8_t *payload, size_t payload_len,
     int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner);
 
+/* Non-NULL successor requests an atomic clear -> fresh prepared handoff for
+ * another in-memory owner. Output is zero on failure, exposed only after FULL
+ * commit. A NULL owner preserves the supported untyped local retain-only path;
+ * only a canonical typed recovery audit may use the bounded recovery lane. */
+EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
+    const EdrStorageQueueP0SourceOnlyLatch *expected, const char *event_id,
+    const char *batch_id, const uint8_t *payload, size_t payload_len,
+    int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner,
+    EdrStorageQueueP0SourceOnlyLatch *successor);
+
 /* Internal storage reader for the existing authorized cached-RTQ consumer.
  * It grants no authority and never returns raw wire to the remote caller.
  * The consumer must verify decoded scope/identity and project only fields
@@ -448,6 +458,9 @@ void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count);
 /* Aborts the next deferred-match FULL commits, including atomic handoff. */
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
 void edr_storage_queue_test_fail_next_local_retention_commits(unsigned count);
+void edr_storage_queue_test_fail_next_capacity_calibration_commits(unsigned count);
+/* One-shot external-SQLite-only test barrier. Must not reenter queue APIs. */
+void edr_storage_queue_test_before_source_replay_transaction(void (*callback)(void *), void *user);
 void edr_storage_queue_test_set_local_retention_elapsed(uint64_t seconds);
 /* Freeze the deferred retry/peek wall clock in Unix seconds; a negative value
  * restores real time. The override is test-only and survives database reopen. */

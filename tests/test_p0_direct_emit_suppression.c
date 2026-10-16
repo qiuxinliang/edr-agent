@@ -494,6 +494,20 @@ EdrError edr_storage_queue_p0_source_only_commit_local(
   }
   return EDR_OK;
 }
+EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
+    const EdrStorageQueueP0SourceOnlyLatch *expected,const char *event_id,
+    const char *batch_id,const uint8_t *wire,size_t wire_len,int compressed,
+    int recovery_audit,const EdrStorageQueueLocalEvidenceOwner *owner,
+    EdrStorageQueueP0SourceOnlyLatch *successor) {
+  if(successor) memset(successor,0,sizeof(*successor));
+  EdrError result=owner?edr_storage_queue_p0_source_only_commit_local_typed(
+      expected,event_id,batch_id,wire,wire_len,compressed,recovery_audit,owner):
+      edr_storage_queue_p0_source_only_commit_local(expected,event_id,batch_id,wire,wire_len,compressed,recovery_audit);
+  /* This unit port models the result; the real SQLite regression proves the
+   * clear-to-successor transition is atomic with the full frozen payload. */
+  if(result==EDR_OK && successor) return edr_storage_queue_p0_source_only_latch_prepare_local(successor);
+  return result;
+}
 EdrError edr_storage_queue_p0_source_only_recovery_probe(void) { return EDR_OK; }
 
 bool edr_resource_preprocess_throttle_active(void) { return false; }
@@ -1855,8 +1869,8 @@ static void test_source_only_retention_classification_requires_scope(void) {
 }
 
 /* A source-only assertion is never discarded merely because SQLite is
- * temporarily unavailable.  The fixed retry handoff keeps the exact record,
- * and an overflow remains latched even after unrelated later commits. */
+ * temporarily unavailable. The fixed retry handoff keeps each exact record;
+ * an overflow needs its own durable audit before those records may drain. */
 static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   EdrBehaviorRecord r;
   EdrBehaviorRecord committed;
@@ -1914,9 +1928,19 @@ static void test_source_only_retry_lane_is_exact_and_overflow_latched(void) {
   while (edr_p0_rule_poll_source_only_durable_retry(&committed)) { }
   assert(edr_p0_rule_source_only_capability_healthy(reason, sizeof(reason)) == 0);
   assert(strcmp(reason, "source_only_retry_capacity_exhausted") == 0);
+  edr_p0_rule_source_only_set_runtime_identity("tenant-overflow", "endpoint-overflow");
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 0);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.source_only_retry_pending == 8u);
+  assert(metrics.source_only_loss_detected && metrics.source_only_terminal_unhealthy);
+  while (edr_p0_rule_poll_source_only_durable_retry(&committed)) { }
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 1);
+  edr_p0_rule_get_emit_metrics(&metrics);
+  assert(metrics.source_only_retry_pending == 0u);
+  assert(metrics.source_only_retry_committed == 8u);
+  assert(metrics.source_only_retry_capacity_exhausted == 1u);
+  assert(metrics.source_only_loss_detected && !metrics.source_only_terminal_unhealthy);
   g_ir_evaluation_available = 1;
-  /* Keep the intentionally latched test fault from affecting unrelated
-   * enforcement cases below; production never invokes this test-only reset. */
   edr_p0_rule_test_reset_dedup();
 }
 
@@ -1942,10 +1966,14 @@ static void test_restart_latch_requires_durable_loss_audit(void) {
   edr_p0_rule_get_emit_metrics(&metrics);
   assert(metrics.source_only_terminal_unhealthy == 1);
   assert(metrics.source_only_loss_detected == 1);
+  assert(metrics.source_only_retry_pending == 0u); /* The audit is not a ninth RAM slot. */
+  assert(g_durable_count == 0);
 
   g_durable_emit_allowed = 1;
   edr_p0_rule_test_set_monotonic_ms(8000u);
-  assert(edr_p0_rule_poll_source_only_durable_retry(&committed) == 1);
+  assert(edr_p0_rule_poll_source_only_durable_retry(&committed) == 0);
+  assert(edr_p0_rule_source_only_recover_after_queue_open() == 0);
+  committed = g_last_record;
   assert(committed.type == EDR_EVENT_CAPABILITY_AUDIT);
   assert(strstr(committed.detection_context,
                 "\"stage\":\"source_only_delivery\"") != NULL);
@@ -3391,6 +3419,10 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
   assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN", "0", 1) == 0);
   assert(test_setenv("EDR_P0_MAX_EMITS_PER_MIN_PER_TENANT", "0", 1) == 0);
   edr_p0_rule_test_reset_dedup();
+  /* This case starts with an available source store. Earlier enforcement
+   * fault cases intentionally leave their fake queue latch populated. */
+  g_source_latch = 0;
+  g_durable_emit_allowed = 1;
   edr_p0_rule_test_set_monotonic_ms(3100u);
   g_emit_count = 0;
   g_combined_emit_allowed = 1;

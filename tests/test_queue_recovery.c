@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 #define TEST_PID getpid()
 #endif
 
@@ -911,6 +912,266 @@ static void terminal_typed_source_lifecycle(void) {
   edr_storage_queue_test_set_local_retention_elapsed(UINT64_MAX);edr_test_p0_terminal_fixture_free(&f);remove(path);
 }
 
+/* The producer-linked capacity fixture separately verifies the real record
+ * builder. This direct frozen-wire fixture exercises hostile fields and exact
+ * identity at the queue/codec boundary with no producer minimization. */
+static size_t local_recovery_wire(const EdrStorageQueueP0SourceOnlyLatch *latch,
+    const char *endpoint,const char *tenant,int extra,uint8_t wire[1040],char id[48],char batch[80]) {
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));assert(event);
+  uint8_t number[8],digest[32],prefix[4];char commitment[65],nonce[33],shahex[65];
+  static const char hex[]="0123456789abcdef",domain[]="edr-p0-source-only-delivery-v2";
+  EdrSha256Ctx sha;edr_sha256_init(&sha);wr(prefix,(uint32_t)strlen(domain));
+  edr_sha256_update(&sha,prefix,4u);edr_sha256_update(&sha,(const uint8_t *)domain,strlen(domain));
+  edr_sha256_update(&sha,latch->queue_nonce,16u);
+  for(unsigned field=0;field<2u;field++) {
+    uint64_t n=field?latch->latch_epoch:latch->latch_counter;
+    for(unsigned i=0;i<8u;i++) number[i]=(uint8_t)(n>>(8u*i));
+    edr_sha256_update(&sha,number,8u);
+  }
+  edr_sha256_final(&sha,digest);
+  for(unsigned i=0;i<32u;i++) {commitment[i*2u]=hex[digest[i]>>4];commitment[i*2u+1u]=hex[digest[i]&15u];}
+  commitment[64]=0;
+  for(unsigned i=0;i<16u;i++) {nonce[i*2u]=hex[latch->queue_nonce[i]>>4];nonce[i*2u+1u]=hex[latch->queue_nonce[i]&15u];}
+  nonce[32]=0;snprintf(id,48,"p0sl-%.40s",commitment);
+  snprintf(event->event_id,sizeof(event->event_id),"%s",id);
+  snprintf(event->endpoint_id,sizeof(event->endpoint_id),"%s",endpoint);
+  snprintf(event->tenant_id,sizeof(event->tenant_id),"%s",tenant);
+  event->type=EDR_EVENT_CAPABILITY_AUDIT;event->has_parent_pid_state=true;
+  strcpy(event->identity_source,"source_only_delivery");strcpy(event->identity_quality,"unknown");
+  strcpy(event->source_completeness,"NOT_EVALUABLE");strcpy(event->transport_completeness,"COMPLETE");
+  snprintf(event->ave_result_json,sizeof(event->ave_result_json),
+    "{\"p0_disposition\":\"NOT_EVALUABLE\",\"reason\":\"pending_assertion_lost_on_restart\","
+    "\"source_contract_version\":\"p0-source-only-v2\",\"stage\":\"source_only_delivery\","
+    "\"gate_id\":\"P0_SOURCE_ONLY_DURABILITY_GATE\",\"loss_detected\":true,"
+    "\"source_only_delivery\":{\"queue_nonce\":\"%s\",\"latch_counter\":\"%llu\",\"latch_epoch\":\"%llu\","
+    "\"commitment_sha256\":\"%s\",\"latch_id\":\"%s\"}}",nonce,
+    (unsigned long long)latch->latch_counter,(unsigned long long)latch->latch_epoch,commitment,id);
+  if(extra==1) strcpy(event->cmdline,"unnecessary full command");
+  if(extra==2) {cJSON *ctx=cJSON_Parse(event->ave_result_json);assert(ctx);cJSON_AddBoolToObject(ctx,"extra",1);
+    char *text=cJSON_PrintUnformatted(ctx);assert(text);strcpy(event->ave_result_json,text);free(text);cJSON_Delete(ctx);}
+  if(extra==3) event->pid=42u;
+  pb_ostream_t output=pb_ostream_from_buffer(wire+16,1024u);
+  assert(pb_encode(&output,edr_v1_BehaviorEvent_fields,event));free(event);
+  size_t len=output.bytes_written+16u;wr(wire,EDR_TRANSPORT_BATCH_MAGIC_RAW);wr(wire+4,1u);
+  wr(wire+8,(uint32_t)len-12u);wr(wire+12,(uint32_t)len-16u);
+  assert(edr_sha256_hex(wire,len,shahex)==0);snprintf(batch,80,"p0-source-%s",shahex);return len;
+}
+static EdrStorageQueueLocalEvidenceOwner local_audit_owner(void) {
+  EdrStorageQueueLocalEvidenceOwner owner={0};owner.version=1u;
+  owner.diagnostic_reason="pending_assertion_lost_on_restart";owner.event_type=EDR_EVENT_CAPABILITY_AUDIT;
+  owner.endpoint_id="synthetic-endpoint";owner.tenant_id="synthetic-tenant";return owner;
+}
+static int local_audit_visit(const char *id,const EdrStorageQueueLocalEvidenceOwner *owner,
+    const uint8_t *wire,size_t len,void *arg) {
+  unsigned *count=arg;char batch[80],sha[65];EdrEgressP0LocalRecoveryAudit decoded;
+  assert(edr_sha256_hex(wire,len,sha)==0);snprintf(batch,sizeof(batch),"p0-source-%s",sha);
+  assert(edr_egress_p0_local_recovery_audit_decode(wire,len,id,batch,owner->endpoint_id,owner->tenant_id,&decoded));
+  (*count)++;return 1;
+}
+typedef struct { uint8_t *wire; size_t length; EdrError result; } LocalAuditWriter;
+#ifdef _WIN32
+static DWORD WINAPI local_audit_other_writer(LPVOID arg) {
+#else
+static void *local_audit_other_writer(void *arg) {
+#endif
+  LocalAuditWriter *writer=arg;
+  writer->result=edr_storage_queue_enqueue("parallel-terminal",writer->wire,writer->length,0,1);
+#ifdef _WIN32
+  return 0;
+#else
+  return NULL;
+#endif
+}
+static void local_audit_counter_matches(const char *path) {
+  uint64_t expected=sql_number(path,
+    "SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(payload)+512+CASE WHEN recovery_version>0 THEN 512 ELSE 0 END+"
+    "512+length(CAST(local_source_event_id AS BLOB))+length(CAST(local_reason AS BLOB))+"
+    "4*(length(CAST(local_endpoint_id AS BLOB))+length(CAST(local_tenant_id AS BLOB)))+"
+    "2*(length(CAST(local_start_key AS BLOB))+length(CAST(local_birth AS BLOB)))+"
+    "length(CAST(local_parent_start_key AS BLOB))+length(CAST(local_parent_birth AS BLOB))+"
+    "length(CAST(local_payload_sha256 AS BLOB))+length(CAST(local_owner_sha256 AS BLOB))),0) FROM event_queue "
+    "WHERE terminal_reason='source_only_local_recovery_v3' AND retention_class=1 AND retention_policy_version=2;");
+  assert(sql_number(path,"SELECT source_audit_bytes FROM queue_meta;")==expected);
+  assert(sql_number(path,"SELECT source_audit_rows FROM queue_meta;")==sql_number(path,
+      "SELECT COUNT(*) FROM event_queue WHERE terminal_reason='source_only_local_recovery_v3' AND retention_class=1 AND retention_policy_version=2;"));
+}
+static void local_replay_retired_before_write(void *arg) {
+  const char *path=arg;
+  sql_exec(path,"BEGIN IMMEDIATE;UPDATE event_queue SET local_retention_state='retirement_eligible' WHERE batch_id='race-original';"
+    "UPDATE event_queue SET local_retention_state='retired' WHERE batch_id='race-original';"
+    "DELETE FROM event_queue WHERE batch_id='race-original';COMMIT;");
+}
+static void local_recovery_audit_capacity_and_handoff(void) {
+  char path[512],id[48],batch[80],other_id[48],other_batch[80];uint8_t wire[1040],other[1040];
+  test_path(path,sizeof(path),"local-audit-capacity",0);remove(path);
+  edr_storage_queue_configure(1u,1u);edr_storage_queue_test_set_delivery_time(100000);
+  edr_storage_queue_test_set_local_retention_elapsed(0u);assert(edr_storage_queue_open(path)==EDR_OK);
+  EdrStorageQueueLocalEvidenceOwner ordinary={0},audit=local_audit_owner();
+  ordinary.version=1u;ordinary.diagnostic_reason="missing_cmdline";ordinary.endpoint_id=audit.endpoint_id;
+  ordinary.tenant_id=audit.tenant_id;ordinary.event_type=EDR_EVENT_PROCESS_CREATE;ordinary.event_time_ns=INT64_C(100000000000000);
+  uint8_t *large=calloc(1,8192u);assert(large);EdrStorageQueueP0SourceOnlyLatch latch,after,successor;
+  unsigned admitted=0u;
+  for(unsigned i=0;i<100u;i++) {
+    char key[48];snprintf(key,sizeof(key),"ordinary-pressure-%u",i);
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+    EdrError result=edr_storage_queue_p0_source_only_commit_local_typed(&latch,key,key,large,8192u,0,0,&ordinary);
+    if(result==EDR_ERR_QUEUE_FULL) break;
+    assert(result==EDR_OK);admitted++;
+  }
+  assert(admitted>1u);free(large);
+  /* Consume the sub-8KiB tail with a real ordinary owner so a much smaller
+   * audit cannot accidentally fit below the ordinary ceiling. */
+  uint8_t tail[20]={0};
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,"ordinary-tail","ordinary-tail",tail,sizeof(tail),0,0,&ordinary)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK && latch.recovery_required);
+  size_t len=local_recovery_wire(&latch,audit.endpoint_id,audit.tenant_id,0,wire,id,batch);
+  EdrEgressP0LocalRecoveryAudit decoded;
+  assert(edr_egress_p0_local_recovery_audit_decode(wire,len,id,batch,audit.endpoint_id,audit.tenant_id,&decoded));
+  assert(!edr_egress_batch_validate(wire,12,wire+12,len-12,NULL,0));
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,id,batch,wire,len,0,0,&audit)==EDR_ERR_QUEUE_FULL);
+  for(int extra=1;extra<=3;extra++) {
+    size_t n=local_recovery_wire(&latch,audit.endpoint_id,audit.tenant_id,extra,other,other_id,other_batch);
+    assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,other_id,other_batch,other,n,0,1,&audit)==EDR_ERR_INVALID_ARG);
+  }
+  EdrStorageQueueP0SourceOnlyLatch wrong=latch;wrong.queue_nonce[0]^=1u;
+  size_t n=local_recovery_wire(&wrong,audit.endpoint_id,audit.tenant_id,0,other,other_id,other_batch);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,other_id,other_batch,other,n,0,1,&audit)==EDR_ERR_INVALID_ARG);
+  audit.endpoint_id="other-endpoint";
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,id,batch,wire,len,0,1,&audit)==EDR_ERR_INVALID_ARG);
+  audit=local_audit_owner();
+  EdrStorageQueueCapacityMetrics before,metrics;edr_storage_queue_get_capacity_metrics(&before);
+  edr_storage_queue_test_fail_next_p0_latch_commits(1u);memset(&successor,0xa5,sizeof(successor));
+  assert(edr_storage_queue_p0_source_only_commit_local_typed_handoff(&latch,id,batch,wire,len,0,1,&audit,&successor)==EDR_ERR_SQLITE_WRITE);
+  assert(!successor.latched && !successor.latch_counter);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.recovery_required && after.latch_counter==latch.latch_counter);
+  edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.used_bytes==before.used_bytes);
+  assert(sql_number(path,"SELECT source_audit_rows FROM queue_meta;")==0u);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed_handoff(&latch,id,batch,wire,len,0,1,&audit,&successor)==EDR_OK);
+  assert(successor.latched && !successor.recovery_required && successor.latch_counter>latch.latch_counter);
+  original_equal(path,batch,wire,len);local_audit_counter_matches(path);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE retention_class=1 AND status='local_evidence' AND retention_policy_version=2 AND terminal_reason='source_only_local_recovery_v3';")==1u);
+  assert(edr_storage_queue_pending_count()==0u && sql_number(path,"SELECT COUNT(*) FROM delivery_receipts_v1;")==0u);
+  EdrStorageQueueLocalQuery query={0};EdrStorageQueueLocalQueryStats stats;unsigned visits=0u;
+  query.endpoint_id=audit.endpoint_id;query.tenant_id=audit.tenant_id;query.has_type=1;query.event_type=72u;
+  query.max_rows=8u;query.max_scan=8u;query.max_payload_bytes=4096u;query.until_mono_ns=edr_monotonic_ns()+UINT64_C(1000000000);
+  assert(edr_storage_queue_query_local_snapshot(&query,local_audit_visit,NULL,&visits,&stats)==0 && visits==1u);
+  uint8_t terminal[20]={0};wr(terminal,EDR_TRANSPORT_BATCH_MAGIC_RAW);wr(terminal+4,1u);wr(terminal+8,8u);wr(terminal+12,4u);
+  assert(edr_storage_queue_enqueue("terminal-20",terminal,sizeof(terminal),0,1)==EDR_OK);
+  sqlite3 *external=db_open(path);
+  assert(sqlite3_exec(external,"BEGIN IMMEDIATE;UPDATE event_queue SET recovery_version=1 WHERE terminal_reason='source_only_local_recovery_v3';",NULL,NULL,NULL)==SQLITE_OK);
+  LocalAuditWriter writer={terminal,sizeof(terminal),EDR_ERR_SQLITE_WRITE};
+#ifdef _WIN32
+  HANDLE thread=CreateThread(NULL,0,local_audit_other_writer,&writer,0,NULL);assert(thread);Sleep(10);
+#else
+  pthread_t thread;assert(pthread_create(&thread,NULL,local_audit_other_writer,&writer)==0);usleep(10000);
+#endif
+  assert(sqlite3_exec(external,"COMMIT;",NULL,NULL,NULL)==SQLITE_OK);assert(sqlite3_close(external)==SQLITE_OK);
+#ifdef _WIN32
+  assert(WaitForSingleObject(thread,5000)==WAIT_OBJECT_0);CloseHandle(thread);
+#else
+  assert(pthread_join(thread,NULL)==0);
+#endif
+  assert(writer.result==EDR_OK);local_audit_counter_matches(path);original_equal(path,batch,wire,len);
+  EdrTestP0TerminalFixture f;assert(edr_test_p0_terminal_fixture_init(&f,92u,audit.tenant_id,audit.endpoint_id));
+  assert(edr_storage_queue_enforcement_terminal_precreate(f.terminal_key,f.source_event_id,f.rule_id,
+      f.generation_key,"audit-terminal-intent",f.wire[0],f.length[0])==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.used_bytes<=metrics.max_bytes);
+  assert(metrics.used_bytes==sql_number(path,"SELECT SUM(logical_bytes) FROM queue_capacity_ledger_v1;"));
+  edr_test_p0_terminal_fixture_free(&f);edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.latched);
+  original_equal(path,batch,wire,len);edr_storage_queue_close();remove(path);
+
+  /* Audit reserve exhaustion is finite, even when every input has priority 0.
+   * No terminal slot or global ceiling is borrowed to append another audit. */
+  test_path(path,sizeof(path),"local-audit-capacity",1);remove(path);assert(edr_storage_queue_open(path)==EDR_OK);
+  unsigned audits=0u;
+  for(unsigned i=0;i<1000u;i++) {
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+    assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK && latch.recovery_required);
+    len=local_recovery_wire(&latch,audit.endpoint_id,audit.tenant_id,0,wire,id,batch);
+    EdrError result=edr_storage_queue_p0_source_only_commit_local_typed(&latch,id,batch,wire,len,0,1,&audit);
+    if(result==EDR_ERR_QUEUE_FULL) break;
+    assert(result==EDR_OK);audits++;
+  }
+  assert(audits>1u && audits<1000u);edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(sql_number(path,"SELECT source_audit_bytes FROM queue_meta;")<=metrics.p0_source_only_reserve_bytes);
+  assert(edr_storage_queue_enqueue("terminal-20",terminal,sizeof(terminal),0,1)==EDR_OK);
+  assert(edr_storage_queue_enforcement_terminal_precreate("audit-full-terminal","audit-full-source","rule","generation",
+      "audit-full-intent",terminal,sizeof(terminal))==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.used_bytes<=metrics.max_bytes);
+  edr_storage_queue_close();remove(path);
+
+  /* Canonical audit TTL is local policy, with no delivery receipt. Prepared
+   * successor protects the remaining RAM owner across a clean close. */
+  test_path(path,sizeof(path),"local-audit-capacity",2);remove(path);assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  len=local_recovery_wire(&latch,audit.endpoint_id,audit.tenant_id,0,wire,id,batch);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed_handoff(&latch,id,batch,wire,len,0,1,&audit,&successor)==EDR_OK);
+  local_audit_counter_matches(path);edr_storage_queue_close();
+  sql_exec(path,"UPDATE queue_meta SET source_audit_bytes=0,source_audit_rows=0;");
+  edr_storage_queue_test_fail_next_capacity_calibration_commits(1u);
+  assert(edr_storage_queue_open(path)!=EDR_OK);
+  assert(sql_number(path,"SELECT source_audit_bytes FROM queue_meta;")==0u);
+  assert(sql_number(path,"SELECT source_audit_rows FROM queue_meta;")==0u);
+  original_equal(path,batch,wire,len);
+  assert(edr_storage_queue_open(path)==EDR_OK);local_audit_counter_matches(path);
+  edr_storage_queue_test_set_delivery_time(103601);edr_storage_queue_test_set_local_retention_elapsed(3601u);
+  edr_storage_queue_test_run_cleanup();
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==0u);
+  assert(sql_number(path,"SELECT local_retired_rows FROM queue_meta;")==1u);
+  assert(sql_number(path,"SELECT COUNT(*) FROM delivery_receipts_v1;")==0u);
+  edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.used_bytes==0u);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.latched &&
+      after.latch_counter==successor.latch_counter);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&after)==EDR_OK && after.recovery_required &&
+      after.latch_counter==successor.latch_counter);
+  edr_storage_queue_close();remove(path);
+  test_path(path,sizeof(path),"local-audit-capacity",3);remove(path);
+  assert(edr_storage_queue_open(path)==EDR_OK);
+  uint8_t *terminal_large=calloc(1,8192u);assert(terminal_large);unsigned terminals=0u;
+  for(unsigned i=0;i<200u;i++) {
+    char key[48];snprintf(key,sizeof(key),"terminal-flood-%u",i);
+    EdrError result=edr_storage_queue_enqueue(key,terminal_large,8192u,0,1);
+    if(result==EDR_ERR_QUEUE_FULL) break;
+    assert(result==EDR_OK);terminals++;
+  }
+  assert(terminals>1u && terminals<200u);edr_storage_queue_get_capacity_metrics(&metrics);
+  assert(metrics.used_bytes<=metrics.max_bytes-metrics.p0_source_only_reserve_bytes);
+  assert(sql_number(path,"SELECT source_audit_bytes FROM queue_meta;")==0u);
+  assert(sql_number(path,"SELECT COUNT(*) FROM pragma_table_info('queue_capacity_ledger_v1');")==3u);
+  free(terminal_large);edr_storage_queue_close();remove(path);
+  /* A corrupt marker cannot make valid metadata/hash authorize noncanonical
+   * detailed fields through the local reader or retirement. Bypass the marker
+   * immutability trigger only in this deliberately hostile isolated fixture. */
+  test_path(path,sizeof(path),"local-audit-capacity",4);remove(path);assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  len=local_recovery_wire(&latch,audit.endpoint_id,audit.tenant_id,1,wire,id,batch);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,id,batch,wire,len,0,0,&audit)==EDR_OK);
+  sql_exec(path,"DROP TRIGGER event_queue_local_audit_marker_immutable;UPDATE event_queue SET terminal_reason='source_only_local_recovery_v3';");
+  visits=0u;query.until_mono_ns=edr_monotonic_ns()+UINT64_C(1000000000);
+  assert(edr_storage_queue_query_local_snapshot(&query,local_audit_visit,NULL,&visits,&stats)==-3 && visits==0u);
+  edr_storage_queue_test_set_delivery_time(107202);edr_storage_queue_test_set_local_retention_elapsed(7202u);
+  edr_storage_queue_test_run_cleanup();assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==1u);
+  assert(sql_number(path,"SELECT local_retention_integrity_failures FROM queue_meta;")>0u);
+  edr_storage_queue_close();remove(path);edr_storage_queue_configure(0u,0u);
+  edr_storage_queue_test_set_delivery_time(-1);edr_storage_queue_test_set_local_retention_elapsed(UINT64_MAX);
+  test_path(path,sizeof(path),"local-audit-capacity",5);remove(path);assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local_typed(&latch,"race-original","race-original",tail,sizeof(tail),0,0,&ordinary)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  edr_storage_queue_test_before_source_replay_transaction(local_replay_retired_before_write,path);
+  memset(&successor,0xa5,sizeof(successor));
+  assert(edr_storage_queue_p0_source_only_commit_local_typed_handoff(&latch,"race-original","race-original",tail,sizeof(tail),0,0,&ordinary,&successor)==EDR_ERR_SQLITE_WRITE);
+  assert(!successor.latched && !successor.latch_counter);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.latched && after.latch_counter==latch.latch_counter);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==0u);
+  edr_storage_queue_close();remove(path);
+  puts("local recovery audit: canonical scope/tuple/field proof, finite reserve, terminal20+journal, FULL rollback/handoff, TTL and zero ACK passed");
+}
+
 int main(int argc,char **argv) {
   if (argc==4 && !strcmp(argv[1],"--crash-child")) {
     EdrStorageQueueRecoveryReport report;
@@ -923,6 +1184,7 @@ int main(int argc,char **argv) {
 #else
   assert(_putenv_s("EDR_QUEUE_DRAIN_INTERVAL_MS","0")==0);
 #endif
+  local_recovery_audit_capacity_and_handoff();
   terminal_typed_source_lifecycle();
   typed_local_real_codec(0);typed_local_real_codec(1);
   terminal_hold_and_independent_retry();
