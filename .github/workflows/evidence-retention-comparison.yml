@@ -20,6 +20,8 @@ on:
       # Candidate verification binds measurements to the release owners' source.
       - .github/workflows/edr-agent-client-release.yml
       - .github/workflows/windows-install-upgrade-rollback.yml
+      - scripts/Write-HeadlessInstallerManifest.ps1
+      - tests/test_headless_installer_manifest.ps1
       - .github/workflows/evidence-retention-comparison.yml
 
 permissions:
@@ -63,6 +65,11 @@ jobs:
         with:
           python-version: '3.12.10'
           architecture: x64
+      # Exercise the same isolated fixture before any candidate release. The
+      # synthetic PE is parsed only; no installer or endpoint is executed.
+      - name: Verify Headless installer manifest contract
+        shell: powershell
+        run: .\tests\test_headless_installer_manifest.ps1
       - name: Initialize the locked native compiler owner
         shell: pwsh
         run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'

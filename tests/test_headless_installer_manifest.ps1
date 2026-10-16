@@ -8,8 +8,16 @@ $null = [Management.Automation.Language.Parser]::ParseFile($writer, [ref]$tokens
 if ($parseErrors.Count) { throw 'Headless installer writer parse failure' }
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('edr-headless-manifest-test-' + [Guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $scratch
-$script:signatureStatus = 'NotSigned'
-function Get-AuthenticodeSignature { param($LiteralPath, $ErrorAction) [pscustomobject]@{ Status = $script:signatureStatus } }
+# The writer runs in a child script scope. Capture a mutable holder explicitly;
+# $script: inside its mock would resolve against that caller's script scope.
+$signatureFixture = [pscustomobject]@{ Status = 'NotSigned'; Calls = 0; LastStatus = ''; LastPath = '' }
+Set-Item -Path Function:Get-AuthenticodeSignature -Value ({
+  param($LiteralPath, $ErrorAction)
+  $signatureFixture.Calls = $signatureFixture.Calls + 1
+  $signatureFixture.LastStatus = $signatureFixture.Status
+  $signatureFixture.LastPath = $LiteralPath
+  [pscustomobject]@{ Status = $signatureFixture.Status }
+}.GetNewClosure())
 function Reject([scriptblock] $Call, [string] $ExpectedCause = '') {
   $failure = $null
   try { & $Call } catch { $failure = $_.Exception.Message }
@@ -31,6 +39,10 @@ try {
     AgentBinarySha256 = ('A' * 64); RuntimeIdentitySha256 = ('B' * 64); PackageCapabilitiesPath = $caps }
   $out = Join-Path $scratch 'full-installer-manifest.json'
   & $writer @fixtureParameters -OutputPath $out
+  if ($signatureFixture.Calls -ne 1 -or $signatureFixture.LastStatus -cne 'NotSigned' -or
+      $signatureFixture.LastPath -cne $setup) {
+    throw 'Child writer did not use the captured Authenticode fixture'
+  }
   $actual = [IO.File]::ReadAllText($out) | ConvertFrom-Json
   if ($actual.version -cne '3.2.688' -or $actual.target_arch -cne 'arm64' -or $actual.setup_target_arch -cne 'arm64' -or
       $actual.agent_binary_sha256 -cne ('a' * 64) -or $actual.runtime_identity_sha256 -cne ('b' * 64) -or
@@ -48,11 +60,15 @@ try {
   if ((Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash -cne $savedHash) { throw 'Existing manifest was overwritten' }
   $bad = Join-Path $scratch 'bad.json'
   foreach ($status in @('Valid', 'UnknownError', 'HashMismatch')) {
-    $script:signatureStatus = $status
-    Reject { & $writer @fixtureParameters -OutputPath $bad }
+    $signatureFixture.Status = $status
+    $callsBefore = $signatureFixture.Calls
+    Reject { & $writer @fixtureParameters -OutputPath $bad } 'explicitly NotSigned Authenticode result'
+    if ($signatureFixture.Calls -ne ($callsBefore + 1) -or $signatureFixture.LastStatus -cne $status) {
+      throw 'Child writer did not observe the updated Authenticode fixture status'
+    }
     if (Test-Path -LiteralPath $bad) { throw 'Rejected signature produced a manifest' }
   }
-  $script:signatureStatus = 'NotSigned'
+  $signatureFixture.Status = 'NotSigned'
   [IO.File]::WriteAllText($setup + '.arch', ('x' * 33))
   Reject { & $writer @fixtureParameters -OutputPath $bad } 'metadata exceeds its bound'
   [IO.File]::WriteAllText($setup + '.arch', 'arm64')
@@ -83,7 +99,11 @@ try {
   [IO.File]::WriteAllText($caps, '{"schema":"edr.windows.package-capabilities.v1","target_arch":"amd64","signature_status":"unsigned"}')
   $fixtureParameters.TargetArch = 'amd64'
   $amdOutput = Join-Path $scratch 'amd64-manifest.json'
+  $callsBefore = $signatureFixture.Calls
   & $writer @fixtureParameters -OutputPath $amdOutput
+  if ($signatureFixture.Calls -ne ($callsBefore + 1) -or $signatureFixture.LastStatus -cne 'NotSigned') {
+    throw 'AMD64 child writer did not use the restored Authenticode fixture status'
+  }
   $amd = [IO.File]::ReadAllText($amdOutput) | ConvertFrom-Json
   if ($amd.target_arch -cne 'amd64' -or $amd.setup_target_arch -cne 'amd64' -or
       $amd.capabilities.target_arch -cne 'amd64' -or $amd.setup_exe_signed -or

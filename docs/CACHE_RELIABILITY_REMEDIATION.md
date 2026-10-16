@@ -1,5 +1,54 @@
 # Cache reliability remediation
 
+## 2026-10-16 final-source comparison passed; 688 stopped at fixture gate
+
+Exact source `7ee8f0e8ba131047cdeaea1eea78afd31433460c` passed native
+comparison run **38833893655** on AMD64 and ARM64: 46 executions and 192 queue
+windows. The root independently rehashed all 210 indexed synthetic files,
+checked both ZIP digests/CRC and all child exits. Results are indexed by
+`/private/tmp/edr-native7ee8-monitor-olwkaohx/RESULTS.json`, SHA-256
+`d4dde4741b2f5f7206d6674f08a09582a547086394cdcd7fe74888d38725c8a0`.
+The capacity, chain and I/O results match the prior measurements below; measured
+CPU medians vary between runs and remain workload costs, not device-level or
+fixed-retention guarantees.
+
+The genuine Headless-only release run **38834728878** created an immutable
+source/run/scope-bound **draft** for 3.2.688, then both architectures failed
+`Verify Headless installer manifest contract`. Both actual .NET/Setup UI steps
+were **skipped**. Native product build, packaging, lifecycle and publication
+were skipped; the single UTM remains 3.2.687. This failure is preserved, and its
+draft will not be relabeled or reused for changed source. No Setup/UI package
+was downloaded and latest remains unchanged.
+
+The sanitized AMD64 log shows the first synthetic ARM64 positive passed the
+Inno bootstrap check, then failed the writer's strict `NotSigned` check. The
+test double used `$script:signatureStatus` across a child-script invocation.
+The narrow fixture correction captures a mutable holder with `GetNewClosure`
+and asserts actual mock calls, paths and status changes across both positives
+and all signature rejection cases. The real writer and its signature guard
+are unchanged. Real Windows execution is still required to confirm this
+correction; parsing is not a passing behavioral result.
+Host release/lifecycle contracts passed 34/34, YAML parsed and diff checks
+passed with unchanged production owners. The raw command/log manifest is
+`/private/tmp/edr-headless-fixture-closure-gates-50e935bd/RESULTS.json`, SHA-256
+`db4c7f2ad7913e6bd47cb4cdd231a3f7c8ecd043a3d81d7271402d799f342679`.
+
+The existing test-only comparison workflow now runs that same isolated
+PowerShell 5.1 fixture before dependency/native measurements and triggers on
+its two owners. This allows the fixture and final-source comparison to pass
+before another candidate dispatch. Its synthetic PE is only parsed; no
+installer, endpoint, cache or execution policy is modified. The next candidate
+will use a fresh version after those gates pass, preserving 688's failed draft.
+
+Failure metadata is in
+`/private/tmp/edr-688-headless-monitor-ims4iw80/RESULTS.json`, SHA-256
+`f8f5dcd7395c8d1499ded9673892fb5926eefc5a07f3e4e884ee37e94a587638`.
+The complete decoded AMD64 log was sanitized and hashed in memory before any
+file write; full environments and credential-like records were omitted.
+Its saved sanitized SHA-256 is
+`aef99597950c532e90c1b8acb9bfa0ecb319bf09c68d27ac278f7672d87d082b`;
+this single failed-job diagnostic is not a four-job successful-release proof.
+
 ## 2026-10-16 native measurements accepted; Headless-only release path prepared
 
 Native comparison run **38829816969**, source
