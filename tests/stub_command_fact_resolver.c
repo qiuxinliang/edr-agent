@@ -2,11 +2,27 @@
  * is exercised by test_command_fact_transport, not replaced in that test. */
 #include "edr/local_evidence_cache.h"
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static const char *s_test_subject_fact;
 static int s_test_resolve_calls;
 static int s_test_fail_after = -1;
+static atomic_int s_test_alert_context_calls;
+static atomic_int s_test_alert_context_outcome;
+void edr_test_set_stub_alert_context_outcome(int outcome) {
+  atomic_store(&s_test_alert_context_calls, 0);
+  atomic_store(&s_test_alert_context_outcome, outcome);
+}
+int edr_test_stub_alert_context_count(void) {
+  return atomic_load(&s_test_alert_context_calls);
+}
+int edr_local_evidence_cache_record_alert_context(const EdrBehaviorRecord *record,
+                                                  const EdrCommandFacts *facts) {
+  (void)record; (void)facts;
+  atomic_fetch_add(&s_test_alert_context_calls, 1);
+  return atomic_load(&s_test_alert_context_outcome);
+}
 void edr_test_set_stub_command_fact(const char *subject) {
   s_test_subject_fact = subject;
 }

@@ -65,7 +65,45 @@ static void test_cached_query_identity(void) {
   require_true(!validate("rtq_query", payload, reason, sizeof(reason)), "cached endpoint cannot be truncated");
 }
 
+static void test_parent_context_contract(void) {
+  const char *payload = "{\"pid\":42,\"endpoint_id\":\"ep-1\",\"source_event_id\":\"source-1\","
+      "\"process_start_key\":\"18446744073709551615\",\"process_creation_filetime_100ns\":\"133700000000000001\","
+      "\"view\":\"parent_context\",\"fields\":[\"name\"],\"max_bytes\":2048,\"from_ns\":\"100\",\"until_ns\":\"200\"}";
+  char reason[256]; EdrParentContextRequest request;
+  require_true(validate("rtr_process_tree", payload, reason, sizeof(reason)), "bounded generation-bound parent context accepted");
+  require_true(edr_command_parent_context_request_parse((const uint8_t *)payload, strlen(payload), &request, reason, sizeof(reason)) &&
+      request.child_pid == 42 && request.child_process_start_key == UINT64_MAX && request.fields == 1 && request.max_bytes == 2048 &&
+      !strcmp(request.source_event_id, "source-1"), "executor receives exact parsed scope");
+  const char *changes[][2] = {
+      {"\"fields\":[\"name\"]", "\"fields\":[\"name\",\"cmdline\"]"},
+      {"\"max_bytes\":2048", "\"max_bytes\":16383"},
+  };
+  for (size_t i=0;i<COUNT_OF(changes);i++) {
+    char modified[1024]; const char *at=strstr(payload,changes[i][0]);
+    snprintf(modified,sizeof(modified),"%.*s%s%s",(int)(at-payload),payload,changes[i][1],at+strlen(changes[i][0]));
+    require_true(validate("rtr_process_tree",modified,reason,sizeof(reason)),"explicit fields and real detail cap supported");
+  }
+  const char *invalid[][2] = {
+      {"\"source_event_id\":\"source-1\"", "\"source_event_id\":\"\""},
+      {"\"process_start_key\":\"18446744073709551615\"", "\"process_start_key\":\"18446744073709551616\""},
+      {"\"process_start_key\":\"18446744073709551615\"", "\"process_start_key\":18446744073709551615"},
+      {"\"fields\":[\"name\"]", "\"fields\":[\"name\",\"name\"]"},
+      {"\"fields\":[\"name\"]", "\"fields\":[\"name\",\"body\"]"},
+      {"\"fields\":[\"name\"]", "\"fields\":[\"cmdline\"]"},
+      {"\"max_bytes\":2048", "\"max_bytes\":16384"},
+      {"\"until_ns\":\"200\"", "\"until_ns\":\"600000000101\""},
+      {"\"view\":\"parent_context\"", "\"view\":\"tree\""},
+  };
+  for (size_t i=0;i<COUNT_OF(invalid);i++) {
+    char modified[1024]; const char *at=strstr(payload,invalid[i][0]);
+    snprintf(modified,sizeof(modified),"%.*s%s%s",(int)(at-payload),payload,invalid[i][1],at+strlen(invalid[i][0]));
+    require_true(!validate("rtr_process_tree",modified,reason,sizeof(reason)) && reason[0],"parent context rejects scope widening with a cause");
+  }
+  require_true(!validate("rtr_process_tree","{\"pid\":42,\"endpoint_id\":\"ep-1\"}",reason,sizeof(reason)),"no PID-only fallback");
+}
+
 int main(void) {
+  test_parent_context_contract();
   char reason[256];
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup("RTR_GET_FILE");
   require_true(descriptor != NULL, "registered alias lookup");

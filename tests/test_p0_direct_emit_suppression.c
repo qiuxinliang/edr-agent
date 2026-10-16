@@ -3477,7 +3477,31 @@ static void test_p0_pending_table_backpressure_preserves_all_claims(void) {
 }
 #endif
 
+extern void edr_test_set_stub_alert_context_outcome(int outcome);
+extern int edr_test_stub_alert_context_count(void);
+static void test_normal_alert_context_refusal_does_not_block_delivery(void) {
+  for (int outcome = -1; outcome <= 1; ++outcome) {
+    EdrBehaviorRecord record;
+    assert(test_setenv("EDR_P0_DIRECT_EMIT", "1", 1) == 0);
+    assert(test_setenv("EDR_P0_DEDUP_SEC", "0", 1) == 0);
+    edr_p0_rule_test_reset_dedup();
+    edr_p0_rule_test_set_monotonic_ms(1000u);
+    edr_test_set_stub_alert_context_outcome(outcome);
+    g_emit_count = 0;
+    init_record(&record);
+    record.pid = 99881u;
+    record.event_time_ns = 1000000000LL;
+    strcpy(record.process_name, "dedup-test.exe");
+    strcpy(record.event_id, "normal-local-context-refusal");
+    assert(edr_p0_rule_try_emit(&record) > 0);
+    assert(g_emit_count == 1);
+    assert(edr_test_stub_alert_context_count() == 1);
+  }
+  edr_test_set_stub_alert_context_outcome(0);
+}
+
 int main(void) {
+  test_normal_alert_context_refusal_does_not_block_delivery();
   test_internal_markers_do_not_skip_p0();
   test_self_noise_requires_exact_live_owner();
   test_internal_marker_without_process_name_survives_deferred_replay();

@@ -2,6 +2,7 @@
 #include "edr/command_contract.h"
 
 #include "edr/command_registry.h"
+#include "edr/command_state.h"
 #include "cJSON.h"
 #include "../attack_surface/attack_surface_groups.h"
 
@@ -192,7 +193,15 @@ static const CommandFieldRule k_cached_query_identity_rules[] = {
 
 static const CommandFieldRule k_process_tree_rules[] = {
     RULE("pid", FIELD_NUMBER, 1, 1, 4294967295.0, 0, 0),
-    RULE("endpoint_id", FIELD_STRING, 0, 0, 0, 128, 0),
+    RULE("endpoint_id", FIELD_STRING, 1, 0, 0, 127, 0),
+    RULE("source_event_id", FIELD_STRING, 1, 0, 0, 95, 0),
+    RULE("process_start_key", FIELD_STRING, 1, 0, 0, 20, 0),
+    RULE("process_creation_filetime_100ns", FIELD_STRING, 1, 0, 0, 20, 0),
+    RULE("view", FIELD_STRING, 1, 0, 0, 32, 0),
+    RULE("fields", FIELD_ARRAY, 1, 0, 0, 0, 3),
+    RULE("max_bytes", FIELD_NUMBER, 1, 512, EDR_COMMAND_STATE_DETAIL_CAP - 1u, 0, 0),
+    RULE("from_ns", FIELD_STRING, 1, 0, 0, 19, 0),
+    RULE("until_ns", FIELD_STRING, 1, 0, 0, 19, 0),
 };
 
 static const CommandFieldRule k_modules_rules[] = {
@@ -587,8 +596,54 @@ static int rtq_payload_text_valid(const uint8_t *payload, size_t length) {
   return 1;
 }
 
+static int parent_context_decimal(const cJSON *root, const char *key, uint64_t max,
+                                  uint64_t *out) {
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+  const char *s = cJSON_IsString(item) ? item->valuestring : "";
+  if (!s || !*s || *s == '0' || strlen(s) > 20u || strspn(s, "0123456789") != strlen(s)) return 0;
+  errno = 0;
+  unsigned long long n = strtoull(s, NULL, 10);
+  if (errno || n == 0 || n > max) return 0;
+  *out = (uint64_t)n;
+  return 1;
+}
+
+static int parent_context_request(const cJSON *root, EdrParentContextRequest *out,
+                                   char *reason, size_t reason_cap) {
+  EdrParentContextRequest q = {0};
+  uint64_t from, until;
+  const char *endpoint = contract_string(root, "endpoint_id");
+  const char *source = contract_string(root, "source_event_id");
+  if (strcmp(contract_string(root, "view"), "parent_context") || !*endpoint || strlen(endpoint) >= sizeof(q.endpoint_id) ||
+      !*source || strlen(source) >= sizeof(q.source_event_id) || strspn(source, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-") != strlen(source) ||
+      !parent_context_decimal(root, "process_start_key", UINT64_MAX, &q.child_process_start_key) ||
+      !parent_context_decimal(root, "process_creation_filetime_100ns", UINT64_MAX, &q.child_creation_filetime_100ns) ||
+      !parent_context_decimal(root, "from_ns", INT64_MAX, &from) ||
+      !parent_context_decimal(root, "until_ns", INT64_MAX, &until) ||
+      until < from || until - from > 600000000000ULL)
+    return contract_fail(reason, reason_cap, "parent_context requires exact child generation and a window of at most 600 seconds");
+  const cJSON *fields = cJSON_GetObjectItemCaseSensitive(root, "fields");
+  if (!cJSON_IsArray(fields) || cJSON_GetArraySize(fields) < 1)
+    return contract_fail(reason, reason_cap, "parent_context requires explicit fields");
+  for (const cJSON *field = fields->child; field; field = field->next) {
+    const char *s = cJSON_IsString(field) ? field->valuestring : "";
+    uint32_t bit = !strcmp(s, "name") ? 1u : !strcmp(s, "path") ? 2u : !strcmp(s, "cmdline") ? 4u : 0u;
+    if (!bit || (q.fields & bit)) return contract_fail(reason, reason_cap, "parent_context fields must be unique name/path/cmdline values");
+    q.fields |= bit;
+  }
+  if (!(q.fields & 1u)) return contract_fail(reason, reason_cap, "parent_context requires the name identity field");
+  q.child_pid = (uint32_t)cJSON_GetObjectItemCaseSensitive(root, "pid")->valuedouble;
+  q.max_bytes = (uint32_t)cJSON_GetObjectItemCaseSensitive(root, "max_bytes")->valuedouble;
+  q.from_ns = (int64_t)from; q.until_ns = (int64_t)until;
+  memcpy(q.endpoint_id, endpoint, strlen(endpoint) + 1u);
+  memcpy(q.source_event_id, source, strlen(source) + 1u);
+  if (out) *out = q;
+  return 1;
+}
+
 static int validate_semantics(EdrCommandKind kind, const cJSON *root,
                               char *reason, size_t reason_cap) {
+  if (kind == EDR_COMMAND_KIND_PROCESS_TREE) return parent_context_request(root, NULL, reason, reason_cap);
   if (kind == EDR_COMMAND_KIND_ATTACK_SURFACE) {
     const cJSON *group = cJSON_GetObjectItemCaseSensitive(root, "collection_group");
     if (group && !edr_asurf_periodic_group_mode(group->valuestring, NULL))
@@ -865,7 +920,8 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
   if (payload_len > 0u && !payload) {
     return contract_fail(reason, reason_cap, "command payload pointer is null");
   }
-  if ((descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE || descriptor->kind == EDR_COMMAND_KIND_RTQ_QUERY) && payload_len > 0u &&
+  if ((descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE || descriptor->kind == EDR_COMMAND_KIND_RTQ_QUERY ||
+       descriptor->kind == EDR_COMMAND_KIND_PROCESS_TREE) && payload_len > 0u &&
       !rtq_payload_text_valid(payload, payload_len)) {
     return contract_fail(reason, reason_cap, "RTQ payload must contain valid UTF-8 text without NUL");
   }
@@ -939,4 +995,13 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
   int valid = validate_semantics(descriptor->kind, root, reason, reason_cap);
   cJSON_Delete(root);
   return valid;
+}
+
+int edr_command_parent_context_request_parse(const uint8_t *payload, size_t payload_len,
+    EdrParentContextRequest *out, char *reason, size_t reason_cap) {
+  if (!out || !edr_command_contract_validate("rtr_process_tree", payload, payload_len, reason, reason_cap)) return 0;
+  cJSON *root = cJSON_ParseWithLength((const char *)payload, payload_len);
+  int ok = root && parent_context_request(root, out, reason, reason_cap);
+  cJSON_Delete(root);
+  return ok;
 }

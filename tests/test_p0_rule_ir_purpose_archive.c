@@ -42,7 +42,7 @@ static uint64_t consumer_expected_fields(const cJSON *bundle,const char *id,uint
  assert(cJSON_IsArray(purposes));
  uint64_t fields=predicates;unsigned seen=0;
  /* The external frozen bundle owns optional disclosure. Keep this oracle
-  * independent of the matcher: fixed case predicates plus only the three
+  * independent of the matcher: fixed case predicates plus only the explicit
   * purposes reviewed here. New/duplicate purposes or missing actor require
   * review, rather than silently learning authority from the runtime mask. */
  cJSON_ArrayForEach(item,purposes) {
@@ -51,6 +51,7 @@ static uint64_t consumer_expected_fields(const cJSON *bundle,const char *id,uint
   else if(!strcmp(item->valuestring,"parent_context")) {
    bit=2u;field=EDR_EVIDENCE_PARENT_NAME|EDR_EVIDENCE_PARENT_PATH|EDR_EVIDENCE_PARENT_COMMAND;
   } else if(!strcmp(item->valuestring,"subject_command")){bit=4u;field=EDR_EVIDENCE_COMMAND;}
+  else if(!strcmp(item->valuestring,"parent_identity")){bit=8u;field=EDR_EVIDENCE_PARENT_NAME;}
   if(!bit || (seen&bit))fprintf(stderr,"consumer purpose requires review: rule=%s purpose=%.64s\n",id,item->valuestring);
   assert(bit && !(seen&bit));seen|=bit;fields|=field;
  }
@@ -62,7 +63,9 @@ static void current_consumer_projection_contract(const unsigned char *plain,size
   {"R-EXEC-002","powershell.exe","C:\\Windows\\System32\\powershell.exe","powershell.exe -w hidden -nop",EDR_EVIDENCE_COMMAND},
   {"R-SIGN-001","signtool.exe","C:\\Tools\\signtool.exe","signtool.exe sign C:\\Temp\\sample.exe",EDR_EVIDENCE_COMMAND},
   {"R-MITRE-WIN-T1044","icacls.exe","C:\\Windows\\System32\\icacls.exe","icacls.exe C:\\Temp\\sample.exe /grant Everyone:F",EDR_EVIDENCE_COMMAND},
-  {"R-LOLBIN-010","cmd.exe","C:\\Temp\\cmd.exe","cmd.exe /c echo fixture",0}
+  {"R-LOLBIN-010","cmd.exe","C:\\Temp\\cmd.exe","cmd.exe /c echo fixture",0},
+  {"R-DISC-001","cmd.exe","C:\\Windows\\System32\\cmd.exe","cmd.exe /c whoami & hostname",EDR_EVIDENCE_COMMAND},
+  {"R-EXFIL-001","powershell.exe","C:\\Windows\\System32\\powershell.exe","powershell.exe Compress-Archive C:\\Temp\\fixture C:\\Temp\\fixture.zip",EDR_EVIDENCE_COMMAND}
  };
  cJSON *bundle=cJSON_ParseWithLength((const char*)plain,size);assert(bundle);
  EdrBehaviorRecord *r=calloc(1,sizeof(*r));edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));
@@ -71,11 +74,12 @@ static void current_consumer_projection_contract(const unsigned char *plain,size
  for(unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++) {
   const uint64_t expected=consumer_expected_fields(bundle,cases[i].rule,cases[i].predicates);
   printf("consumer projection rule=%s expected_mask=0x%llx\n",cases[i].rule,(unsigned long long)expected);
-  for(unsigned parent=0;parent<2;parent++)
+  for(unsigned state=0;state<=4;state++)
   for(unsigned command=0;command<(i==3?2u:1u);command++) {
+   const unsigned parent=state==EDR_PARENT_PID_KNOWN;
    edr_behavior_record_init(r);r->type=EDR_EVENT_PROCESS_CREATE;r->pid=42;
    r->process_start_key=456;r->process_creation_filetime_100ns=789;r->event_time_ns=1700000000000000000LL;
-   r->ppid=parent?21:0;r->parent_pid_state=parent?EDR_PARENT_PID_KNOWN:EDR_PARENT_PID_UNKNOWN;
+   r->ppid=(parent||state==EDR_PARENT_PID_CONFLICT)?21:0;r->parent_pid_state=(EdrParentPidState)state;
    strcpy(r->event_id,"consumer-projection-fixture");strcpy(r->endpoint_id,"fixture-endpoint");strcpy(r->tenant_id,"fixture-tenant");
    strcpy(r->process_name,cases[i].name);strcpy(r->exe_path,cases[i].path);
    if(!command)strcpy(r->cmdline,cases[i].command);
@@ -135,7 +139,7 @@ static void current_consumer_projection_contract(const unsigned char *plain,size
  }
  edr_egress_set_rule_projection_validator(NULL,NULL);free(r);free(event);free(wire);free(frozen);
  cJSON_Delete(bundle);
- puts("four frozen rules: exact declared authority -> serializer -> immutable egress; unauthorized text omitted, parent gaps explicit, LOLBIN missing command still matches");
+ puts("six current rules and five parent states: exact declared authority -> serializer -> immutable egress; name-only defaults, unauthorized text omitted, parent gaps explicit, LOLBIN missing command still matches");
 }
 static void legacy_purpose_contract(const char *base,const unsigned char *plain,size_t size,
                                     const EdrP0RuleIrMatch *valid) {
@@ -306,6 +310,36 @@ static void subject_command_purpose_contract(const char *base) {
  }
  puts("IR7/8/9 subject-command authority: historical zero masks and IR9 command mask remain exact after restart; archive bytes unchanged");
 }
+static void parent_identity_purpose_contract(const char *base) {
+ for(unsigned schema=7;schema<=10;schema++) for(unsigned identity=0;identity<2;identity++) {
+  char json[1024],sha[65],archive[400];unsigned char *encrypted=NULL;size_t encrypted_size=0;
+  int n=snprintf(json,sizeof(json),
+   "{\"kind\":\"" EDR_P0_RULE_IR_BUNDLE_KIND "\",\"ir_schema_version\":%u,"
+   "\"rules_bundle_version\":\"synthetic-parent-identity\",\"rule_count\":1,"
+   "\"sensor_interest_manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+   "\"sensor_interest_manifest_hash_mode\":\"raw-json-v1-p0-artifact-sha256-zeroed\","
+   "\"rules\":[{\"effect\":\"security_alert\",\"id\":\"synthetic-parent\",\"event_type\":\"process_create\","
+   "\"condition\":{\"process_name_in\":[\"tool.exe\"],\"evidence_purposes\":[\"actor_attribution\"%s]}}]}",schema,
+   identity?",\"parent_identity\"":"");
+  assert(n>0&&(size_t)n<sizeof(json));
+  assert(edr_sha256_hex((const uint8_t*)json,(size_t)n,sha)==0);
+  assert(edr_p0_encrypt_encrypt_edr1_for_test((const uint8_t*)json,(size_t)n,&encrypted,&encrypted_size)==0);
+  snprintf(archive,sizeof(archive),"%s.purpose-%s.edr1",base,sha);save(archive,encrypted,encrypted_size);
+  assert(edr_p0_rule_ir_validate_candidate_path(archive)==(int)(!identity||schema==10));
+  if(!identity||schema==10) {
+   const uint64_t expected=EDR_EVIDENCE_USER|(identity?EDR_EVIDENCE_PARENT_NAME:0);
+   for(int restart=0;restart<2;restart++) {
+    assert(edr_p0_rule_ir_projection_matches("synthetic-parent",sha,expected,"")==1);
+    assert(edr_p0_rule_ir_projection_matches("synthetic-parent",sha,expected|EDR_EVIDENCE_PARENT_PATH,"")==0);
+    if(!identity)assert(!edr_p0_rule_ir_projection_matches("synthetic-parent",sha,expected|EDR_EVIDENCE_PARENT_NAME,""));
+    edr_p0_rule_ir_shutdown();edr_p0_rule_ir_lazy_init();assert(edr_p0_rule_ir_is_ready());
+   }
+  }
+  size_t after_size;unsigned char *after=read_bytes(archive,&after_size);
+  assert(after_size==encrypted_size&&!memcmp(after,encrypted,after_size));free(after);free(encrypted);
+ }
+ puts("IR7/8/9 frozen actor masks unchanged; only IR10 accepts explicit name-only purpose; archive bytes survive restart");
+}
 int main(void){
  static const struct {const char *id;unsigned schema;int retired;const char *rule;} corpus[]={
 #include "../src/preprocess/p0_retired_purpose_vectors.inc"
@@ -332,10 +366,12 @@ int main(void){
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));
  parent_purpose_contract(base,plain,plain_size);
  subject_command_purpose_contract(base);
- legacy_purpose_contract(base,plain,plain_size,&match);
- dump_purpose_contract(base,plain,plain_size,&match);
+ parent_identity_purpose_contract(base);
+ EdrP0RuleIrMatch historical=match;historical.required_evidence_fields&=~EDR_EVIDENCE_PARENT_NAME;
+ legacy_purpose_contract(base,plain,plain_size,&historical);
+ dump_purpose_contract(base,plain,plain_size,&historical);
  cookie_purpose_contract(base,plain,plain_size,&match);
- assert(!edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields|EDR_EVIDENCE_PARENT_NAME,match.operation_evidence));
+ assert(!edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields|EDR_EVIDENCE_PARENT_PATH,match.operation_evidence));
  unsigned char *changed=malloc(plain_size+1),*encrypted=NULL;size_t encrypted_size=0;assert(changed);memcpy(changed,plain,plain_size);changed[plain_size]='\n';assert(edr_p0_encrypt_encrypt_edr1_for_test(changed,plain_size+1,&encrypted,&encrypted_size)==0);save(stage,encrypted,encrypted_size);
  assert(edr_p0_rule_ir_install_staged_bundle(stage,base));
  assert(edr_p0_rule_ir_projection_matches(match.rule_id,sha,match.required_evidence_fields,match.operation_evidence));

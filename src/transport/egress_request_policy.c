@@ -487,7 +487,8 @@ static int capability_field(const char *path, HealthType *type) {
   static const char *const commands[] = {"isolate_host", "restore_host", "kill_process", "rtq_execute",
     "rtq_registry", "rtq_eventlog", "yara_scan", "memory_dump", "targeted_forensic", "targeted_forensic_file",
     "targeted_forensic_process", "targeted_forensic_registry", "targeted_forensic_memory", "agent_update_v1",
-    "endpoint_lifecycle_v1", "endpoint_uninstall_attestation_v1", "velociraptor_query", "result_delivery_renewal"};
+    "endpoint_lifecycle_v1", "endpoint_uninstall_attestation_v1", "velociraptor_query", "result_delivery_renewal",
+    "parent_context_query_v1"};
   const char *p = NULL;
   const char *prefix = "engine_health.capability_manifest.features.";
   const char *const *names = features;
@@ -507,6 +508,9 @@ static int capability_field(const char *path, HealthType *type) {
     for (size_t i = 0; i < sizeof(upgrade_fields) / sizeof(upgrade_fields[0]); ++i)
       if (!strcmp(dot, upgrade_fields[i].path)) { *type = upgrade_fields[i].type; return 1; }
   }
+  if (names == commands && !strcmp(name, "parent_context_query_v1") &&
+      strcmp(dot, "code_supported") && strcmp(dot, "build_supported") &&
+      strcmp(dot, "policy_enabled") && strcmp(dot, "runtime_status")) return 0;
   if (strcmp(dot, "code_supported") == 0 || strcmp(dot, "build_supported") == 0 ||
       strcmp(dot, "policy_enabled") == 0 || strcmp(dot, "rules_ready") == 0 ||
       strcmp(dot, "artifact_upload_required") == 0 || strcmp(dot, "request_signing_configured") == 0) {

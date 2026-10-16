@@ -41,7 +41,7 @@ typedef struct {
   uint64_t hot_ring_ingested;
   uint64_t p0_candidates_written;
   uint64_t artifacts_written;
-  /* Physical normalized post-context writes. `artifacts_written` remains the
+  /* Physical normalized local-context writes. `artifacts_written` remains the
    * count of candidate-visible materialized artifacts changed. */
   uint64_t context_facts_written;
   uint64_t context_refs_written;
@@ -305,6 +305,49 @@ void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r);
 
 /** 记录一条行为元数据；函数内部会维护内存环与 SQLite。 */
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r);
+
+/* Matched normal alerts retain their original local context before outbound
+ * projection. This is best-effort investigation storage, never delivery or
+ * action authority: a refusal must not prevent the alert queue handoff.
+ * Returns 0 on commit, 1 when the snapshot committed but a command fact was
+ * refused, and negative when the snapshot could not be retained. */
+int edr_local_evidence_cache_record_alert_context(const EdrBehaviorRecord *record,
+                                                  const EdrCommandFacts *facts);
+
+enum {
+  EDR_PARENT_CONTEXT_FIELD_NAME = 1u,
+  EDR_PARENT_CONTEXT_FIELD_PATH = 2u,
+  EDR_PARENT_CONTEXT_FIELD_CMDLINE = 4u
+};
+enum {
+  EDR_PARENT_CONTEXT_ERROR_INVALID = -1,
+  EDR_PARENT_CONTEXT_ERROR_STORAGE = -2,
+  EDR_PARENT_CONTEXT_ERROR_BUDGET = -3,
+  EDR_PARENT_CONTEXT_ERROR_EXPIRED = -4,
+  EDR_PARENT_CONTEXT_ERROR_INTEGRITY = -5,
+  EDR_PARENT_CONTEXT_ERROR_BUSY = -6
+};
+
+typedef struct {
+  const char *tenant_id;
+  const char *endpoint_id;
+  const char *source_event_id;
+  uint32_t child_pid;
+  uint64_t child_process_start_key;
+  uint64_t child_creation_filetime_100ns;
+  int64_t from_ns, until_ns;
+  int64_t expires_unix_ms;
+  uint32_t fields;
+} EdrParentContextQuery;
+
+/* Existing signed parent-context request consumer only. Exact source and
+ * child lifetime select a retained immutable fact, never a current PID or a
+ * live process. fields uses the enum above; identity is always included.
+ * Returns 0 for a bounded edr.parent-context.v1 result (including explicit
+ * unavailable_or_expired); negative for invalid scope, expiry, storage or
+ * output-budget failure. Caller owns the signed-purpose/authorization check. */
+int edr_local_evidence_cache_query_parent_context_json(
+    const EdrParentContextQuery *query, char *out, size_t cap);
 
 /** 是否属于可落库/可上传的告警候选。普通 ETW 只进入 hot ring 与滑动指标。 */
 int edr_local_evidence_cache_is_candidate(const EdrBehaviorRecord *r);

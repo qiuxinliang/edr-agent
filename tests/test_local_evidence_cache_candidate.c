@@ -9955,11 +9955,242 @@ static uint64_t cache_case_wall_ms(void) {
   } \
 } while (0)
 
+#if defined(EDR_HAVE_SQLITE)
+static void test_normal_alert_parent_context_retention(void) {
+  for (int format = 0; format <= 2; format += 2) {
+    for (unsigned long_command = 0; long_command < 2u; ++long_command) {
+      char path[512], output[16384], parent_path[1025];
+      char *command = malloc(12001u);
+      EdrBehaviorRecord *first = calloc(1u, sizeof(*first));
+      EdrBehaviorRecord *second = calloc(1u, sizeof(*second));
+      assert(command && first && second);
+      if (long_command) fill_text(command, 12001u, 12000u, 'A');
+      else strcpy(command, "parent.exe --retained-synthetic-argument");
+      memset(parent_path, 'p', sizeof(parent_path) - 1u);
+      memcpy(parent_path, "C:/retained/", 12u); parent_path[sizeof(parent_path) - 1u] = 0;
+      int64_t now = (int64_t)time(NULL) * INT64_C(1000000000);
+      uint64_t parent_time = (uint64_t)(now - INT64_C(8000000000));
+      uint64_t child_time = (uint64_t)(now - INT64_C(6000000000));
+      assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+      cleanup_test_sqlite_path(path);
+      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      edr_local_evidence_cache_close();
+      sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+      retention_upgrade_refs(db, format); sqlite3_close(db);
+      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      edr_pt_cache_init();
+      assert(edr_pt_cache_put_generation(701u, 4u, "retained-parent.exe", command,
+          parent_path, NULL, parent_time, UINT64_C(18446744073709551613),
+          test_unix_ns_to_filetime(parent_time)) == 0);
+      assert(edr_pt_cache_mark_alive_generation(701u, UINT64_C(18446744073709551613),
+          test_unix_ns_to_filetime(parent_time), child_time + UINT64_C(2000000000)) == 0);
+      init_record(first, EDR_EVENT_PROCESS_CREATE);
+      strcpy(first->endpoint_id, "ep-retained-parent"); strcpy(first->tenant_id, "tenant-retained-parent");
+      strcpy(first->event_id, "retained-parent-source-1");
+      first->pid = 702u; first->ppid = 701u; first->parent_pid_state = EDR_PARENT_PID_KNOWN;
+      first->process_start_key = UINT64_C(18446744073709551614);
+      first->process_creation_filetime_100ns = test_unix_ns_to_filetime(child_time);
+      first->event_time_ns = (int64_t)child_time;
+      strcpy(first->process_name, "ordinary-child.exe"); strcpy(first->exe_path, "C:/retained/ordinary-child.exe");
+      strcpy(first->cmdline, "ordinary-child.exe --safe");
+      first->parent_process_start_key = UINT64_C(18446744073709551613);
+      first->parent_process_creation_filetime_100ns = test_unix_ns_to_filetime(parent_time);
+      strcpy(first->parent_resolution_source, "live_parent_generation");
+      strcpy(first->parent_resolution_status, "RESOLVED");
+      strcpy(first->parent_name, "retained-parent.exe");
+      snprintf(first->parent_path, sizeof(first->parent_path), "%s", parent_path);
+      edr_behavior_mark_source_truncated(first, "source.parent_path");
+      snprintf(first->parent_cmdline, sizeof(first->parent_cmdline), "%s", command);
+      if (long_command) edr_behavior_mark_source_truncated(first, "source.parent_cmdline");
+      edr_behavior_bind_parent_context(first);
+      assert(!edr_local_evidence_cache_is_candidate(first));
+      EdrCommandFacts facts = {NULL, command};
+      assert(edr_local_evidence_cache_record_alert_context(first, &facts) == 0);
+      assert(edr_local_evidence_cache_record_alert_context(first, &facts) == 0);
+      *second = *first;
+      second->pid = 703u; second->process_start_key = UINT64_C(18446744073709551615);
+      second->process_creation_filetime_100ns += UINT64_C(10000000);
+      second->event_time_ns += INT64_C(1000000000);
+      strcpy(second->event_id, "retained-parent-source-2"); edr_behavior_bind_parent_context(second);
+      assert(edr_local_evidence_cache_record_alert_context(second, &facts) == 0);
+      edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line'") == 3);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 2);
+      assert(compact_scalar(db, "SELECT MAX(length(manifest_template_json)) FROM context_facts") < 4096);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts WHERE upload_status='pending' OR COALESCE(minio_key,'')<>''") == 0);
+      /* Reconstructible PID slots are not the snapshot owner. */
+      compact_exec(db, "DELETE FROM process_cache;"); sqlite3_close(db);
+      edr_pt_cache_init();
+      assert(edr_pt_cache_put_generation(701u, 0u, "replacement.exe", "replacement-only",
+          "C:/replacement.exe", NULL, (uint64_t)now, 9u, test_unix_ns_to_filetime((uint64_t)now)) == 0);
+      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      EdrParentContextQuery query = {first->tenant_id, first->endpoint_id, first->event_id,
+          first->pid, first->process_start_key, first->process_creation_filetime_100ns,
+          first->event_time_ns - INT64_C(1000000000), first->event_time_ns + INT64_C(1000000000),
+          (int64_t)time(NULL) * 1000LL + 60000LL, EDR_PARENT_CONTEXT_FIELD_NAME};
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, 2048u) == 0);
+      cJSON *answer = cJSON_Parse(output), *parent = cJSON_GetObjectItemCaseSensitive(answer, "parent");
+      assert(cJSON_IsObject(parent));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "name")->valuestring, "retained-parent.exe"));
+      assert(!cJSON_HasObjectItem(parent, "path") && !cJSON_HasObjectItem(parent, "cmdline"));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "process_start_key")->valuestring, "18446744073709551613"));
+      assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(answer, "absence_is_evidence")));
+      cJSON_Delete(answer);
+      query.fields |= EDR_PARENT_CONTEXT_FIELD_PATH | EDR_PARENT_CONTEXT_FIELD_CMDLINE;
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+      answer = cJSON_Parse(output); parent = cJSON_GetObjectItemCaseSensitive(answer, "parent");
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "path")->valuestring, parent_path));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "path_quality")->valuestring, "complete"));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "cmdline")->valuestring, command));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "cmdline_quality")->valuestring, "complete"));
+      cJSON_Delete(answer);
+      if (long_command) assert(edr_local_evidence_cache_query_parent_context_json(&query, output, 2048u) == EDR_PARENT_CONTEXT_ERROR_BUDGET);
+      const char *original_source = query.source_event_id;
+      query.source_event_id = "another-source-same-child";
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+      answer = cJSON_Parse(output);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "availability_reason")->valuestring, "unavailable_or_expired"));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "source_event_id")->valuestring, query.source_event_id));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "event_time_ns")->valuestring, "0"));
+      assert(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(answer, "parent"))); cJSON_Delete(answer);
+      query.source_event_id = original_source; query.child_creation_filetime_100ns++;
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+      assert(strstr(output, "unavailable_or_expired")); query.child_creation_filetime_100ns--;
+      query.expires_unix_ms = 1;
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == EDR_PARENT_CONTEXT_ERROR_EXPIRED);
+      query.expires_unix_ms = (int64_t)time(NULL) * 1000LL + 60000LL;
+      edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+      /* Existing group retirement accepts these local-only references and
+       * preserves a command shared with the other child's retained group. */
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      EdrContextStore store; assert(edr_context_store_open(&store, db) == 0);
+      sqlite3_stmt *st = NULL;
+      assert(sqlite3_prepare_v2(db, "SELECT candidate_id FROM p0_candidates WHERE pid=702;", -1, &st, NULL) == SQLITE_OK);
+      assert(sqlite3_step(st) == SQLITE_ROW);
+      char candidate[160]; snprintf(candidate, sizeof(candidate), "%s", sqlite3_column_text(st, 0)); sqlite3_finalize(st);
+      compact_exec(db, "BEGIN IMMEDIATE;");
+      char *sql = sqlite3_mprintf("UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id=%Q", candidate);
+      assert(sql); compact_exec(db, sql); sqlite3_free(sql);
+      EdrContextRetirement retired;
+      assert(edr_context_store_retire_candidate(&store, candidate, 128u, 1024u * 1024u, NULL, NULL, &retired) == 0);
+      compact_exec(db, "COMMIT;");
+      assert(retired.candidates == 1u && retired.references == 1u && retired.facts == 1u);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 1);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line'") == 3);
+      if (!format) retention_upgrade_refs(db, 2);
+      sqlite3_close(db);
+      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      query.child_pid = second->pid; query.child_process_start_key = second->process_start_key;
+      query.child_creation_filetime_100ns = second->process_creation_filetime_100ns;
+      query.source_event_id = second->event_id; query.until_ns += INT64_C(1000000000);
+      assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+      assert(strstr(output, "retained-parent.exe"));
+      edr_local_evidence_cache_close();
+      cleanup_test_sqlite_path(path); free(first); free(second); free(command);
+    }
+  }
+}
+
+static void test_alert_parent_context_refusal_and_unresolved(void) {
+  char path[512], output[2048];
+  EdrBehaviorRecord *record = calloc(1u, sizeof(*record)); assert(record);
+  int64_t now = (int64_t)time(NULL) * INT64_C(1000000000);
+  init_record(record, EDR_EVENT_PROCESS_CREATE);
+  strcpy(record->endpoint_id, "ep-parent-refusal"); strcpy(record->tenant_id, "tenant-parent-refusal");
+  record->pid = 98001u; record->process_start_key = 123u;
+  record->process_creation_filetime_100ns = test_unix_ns_to_filetime((uint64_t)now);
+  record->event_time_ns = now;
+  strcpy(record->process_name, "ordinary-child.exe");
+  strcpy(record->cmdline, "ordinary-child.exe --safe");
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0); cleanup_test_sqlite_path(path);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  strcpy(record->event_id, "parent-commit-refusal");
+  EdrEvidenceCacheStatus before, after;
+  edr_local_evidence_cache_get_status(&before);
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_record_alert_context(record, NULL) < 0);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.candidate_rejected == before.candidate_rejected + 1u);
+  assert(after.context_facts_written == before.context_facts_written);
+  assert(sqlite_table_count(path, "context_facts") == 0u);
+  assert(sqlite_table_count(path, "p0_candidates") == 0u);
+  test_setenv("EDR_STORAGE_MIN_FREE_MB", "1073741824");
+  strcpy(record->event_id, "parent-capacity-refusal");
+  assert(edr_local_evidence_cache_record_alert_context(record, NULL) < 0);
+  test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
+  edr_local_evidence_cache_get_status(&before);
+  assert(before.candidate_rejected == after.candidate_rejected + 1u);
+  assert(sqlite_table_count(path, "p0_candidates") == 0u);
+  const uint8_t states[] = {EDR_PARENT_PID_UNKNOWN, EDR_PARENT_PID_EXPLICIT_ZERO,
+      EDR_PARENT_PID_INVALID, EDR_PARENT_PID_CONFLICT};
+  for (unsigned i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+    snprintf(record->event_id, sizeof(record->event_id), "unresolved-parent-%u", i);
+    record->parent_pid_state = states[i];
+    record->ppid = states[i] == EDR_PARENT_PID_UNKNOWN || states[i] == EDR_PARENT_PID_EXPLICIT_ZERO ? 0u : 98000u;
+    strcpy(record->parent_name, "UNPROVED-NAME-MUST-NOT-LEAK");
+    strcpy(record->parent_path, "UNPROVED-PATH-MUST-NOT-LEAK");
+    strcpy(record->parent_cmdline, "UNPROVED-COMMAND-MUST-NOT-LEAK");
+    assert(edr_local_evidence_cache_record_alert_context(record, NULL) == 0);
+    EdrParentContextQuery query = {record->tenant_id, record->endpoint_id, record->event_id,
+        record->pid, record->process_start_key, record->process_creation_filetime_100ns,
+        now - 1000000000LL, now + 1000000000LL, (int64_t)time(NULL) * 1000LL + 60000LL, 7u};
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+    cJSON *answer = cJSON_Parse(output);
+    assert(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(answer, "parent")));
+    assert(cJSON_GetObjectItemCaseSensitive(answer, "parent_pid_state")->valuedouble == states[i]);
+    assert(!strstr(output, "UNPROVED"));
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "availability_reason")->valuestring,
+        states[i] == EDR_PARENT_PID_CONFLICT ? "parent_conflict" : "parent_unresolved"));
+    cJSON_Delete(answer);
+  }
+  record->ppid = 98000u; record->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  record->parent_process_start_key = 122u;
+  record->parent_process_creation_filetime_100ns = record->process_creation_filetime_100ns - 10000000u;
+  strcpy(record->parent_resolution_source, "live_parent_generation");
+  strcpy(record->parent_resolution_status, "RESOLVED");
+  strcpy(record->parent_name, "retained-original.exe");
+  strcpy(record->parent_path, "C:/retained-original.exe");
+  strcpy(record->parent_cmdline, "retained-original.exe --original-tail");
+  strcpy(record->event_id, "original-parent-command");
+  edr_behavior_bind_parent_context(record);
+  assert(edr_local_evidence_cache_record_alert_context(record, NULL) == 0);
+  strcpy(record->event_id, "different-parent-command-prefix");
+  strcpy(record->parent_cmdline, "DIFFERENT_PREFIX");
+  edr_behavior_mark_source_truncated(record, "source.parent_cmdline");
+  assert(edr_local_evidence_cache_record_alert_context(record, NULL) == 0);
+  EdrParentContextQuery partial = {record->tenant_id, record->endpoint_id, record->event_id,
+      record->pid, record->process_start_key, record->process_creation_filetime_100ns,
+      now - 1000000000LL, now + 1000000000LL, (int64_t)time(NULL) * 1000LL + 60000LL, 7u};
+  assert(edr_local_evidence_cache_query_parent_context_json(&partial, output, sizeof(output)) == 0);
+  cJSON *partial_result = cJSON_Parse(output);
+  cJSON *partial_parent = cJSON_GetObjectItemCaseSensitive(partial_result, "parent");
+  assert(cJSON_IsObject(partial_parent));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(partial_parent, "cmdline_quality")->valuestring, "truncated"));
+  assert(!cJSON_GetObjectItemCaseSensitive(partial_parent, "cmdline")->valuestring[0]);
+  assert(!strstr(output, "original-tail")); cJSON_Delete(partial_result);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "UPDATE context_facts SET manifest_template_json=replace(manifest_template_json,'edr.local-alert-parent-context.v1','edr.local-alert-parent-context.v9');");
+  sqlite3_close(db);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  EdrParentContextQuery query = {record->tenant_id, record->endpoint_id, record->event_id,
+      record->pid, record->process_start_key, record->process_creation_filetime_100ns,
+      now - 1000000000LL, now + 1000000000LL, (int64_t)time(NULL) * 1000LL + 60000LL, 1u};
+  assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == EDR_PARENT_CONTEXT_ERROR_INTEGRITY);
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path); free(record);
+}
+#endif
+
 int main(int argc, char **argv) {
 #if !defined(_WIN32)
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--alert-parent-context") == 0) {
+    test_normal_alert_parent_context_retention();
+    test_alert_parent_context_refusal_and_unresolved(); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--command-result-budget") == 0) {
     test_command_result_copy_budget(); return 0;
   }
@@ -10035,6 +10266,8 @@ int main(int argc, char **argv) {
   }
   RUN_CACHE_CASE("context", test_pmfe_names_and_negative_values_are_not_signals());
 #if defined(EDR_HAVE_SQLITE)
+  RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
+  RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
   RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
   RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
   RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());

@@ -105,10 +105,14 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   if(!cJSON_IsObject(request)){cJSON_Delete(request);return -1;}
   const char *kind=!strcmp(a->command_type,"rtq_execute")?"rtq":
       !strcmp(a->command_type,"rtq_query")?"cached_rtq":
+      !strcmp(a->command_type,"rtr_process_tree") && !strcmp(result_text(request,"view"),"parent_context")?"parent_context":
       !strcmp(a->command_type,"shell_open")?"shell_stream":
       !strcmp(a->command_type,"rtr_shell")?"shell_output":
       result_member(a->command_type,"kill_process|isolate_host|restore_host|isolate_status|pmfe_scan|yara_scan|collect_forensic|forensic|deep_forensic|targeted_forensic|memory_dump|velo_query")?"typed":
       result_member(a->command_type,"noop|echo|telemetry_profile_update|put_file|forensic_cancel|rtr_rm_file|quarantine_file|unquarantine_file|shell_open|shell_input|shell_close|update_server_address|result_delivery_renewal|agent_update|agent_restart_service|agent_offboard|agent_uninstall")?"status":"unsupported";
+  if(!strcmp(kind,"parent_context") && !result_integer(request,"max_bytes",512,EDR_COMMAND_STATE_DETAIL_CAP-1u,NULL)) {
+    cJSON_Delete(request);return -1; /* Keep the finite status-only rejection grant above. */
+  }
   cJSON *contract=cJSON_CreateObject();int ok=contract!=NULL;
   unsigned rows=500,window=600;uint32_t event_type=0;int has_type=0;
   if(!strcmp(kind,"cached_rtq")) {
@@ -132,7 +136,8 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   }
   if(ok)ok=cJSON_AddStringToObject(contract,"schema","edr.command.result-purpose.v1") &&
       cJSON_AddStringToObject(contract,"kind",kind) &&
-      cJSON_AddNumberToObject(contract,"max_bytes",!strcmp(kind,"status")?1024:16383) &&
+      cJSON_AddNumberToObject(contract,"max_bytes",!strcmp(kind,"status")?1024:
+          !strcmp(kind,"parent_context")?cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(request,"max_bytes")):16383) &&
       cJSON_AddNumberToObject(contract,"max_rows",rows) &&
       cJSON_AddNumberToObject(contract,"max_chunks",63) &&
       cJSON_AddNumberToObject(contract,"window_s",window) &&
@@ -152,6 +157,73 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   cJSON_Delete(contract);cJSON_Delete(request);
   if(!ok)a->content_contract[0]=0;
   return ok?0:-1;
+}
+
+static int result_parent_decimal(const cJSON *o,const char *key,uint64_t maximum,uint64_t *out) {
+  const char *s=result_text(o,key);
+  if(!*s || *s=='0' || strlen(s)>20u || strspn(s,"0123456789")!=strlen(s))return 0;
+  errno=0;unsigned long long n=strtoull(s,NULL,10);
+  if(errno || !n || n>maximum)return 0;
+  if(out)*out=(uint64_t)n;return 1;
+}
+static int result_parent_field(const cJSON *request,const char *key) {
+  const cJSON *fields=cJSON_GetObjectItemCaseSensitive(request,"fields");
+  if(!cJSON_IsArray(fields))return 0;
+  for(const cJSON *f=fields->child;f;f=f->next)if(cJSON_IsString(f) && !strcmp(f->valuestring,key))return 1;
+  return 0;
+}
+static cJSON *result_parent_context(const cJSON *body,const cJSON *contract,const EdrCommandResultAuthorization *a) {
+  const cJSON *q=cJSON_GetObjectItemCaseSensitive(contract,"request"),
+      *child=cJSON_GetObjectItemCaseSensitive(body,"child"),*parent=cJSON_GetObjectItemCaseSensitive(body,"parent");
+  uint64_t from,until,event_time;
+  double pid,ppid,state,bytes;
+  const char *reason=result_text(body,"availability_reason");
+  int available=!strcmp(reason,"available"),absent=!strcmp(reason,"unavailable_or_expired");
+  if(!cJSON_IsObject(q) || strcmp(result_text(q,"view"),"parent_context") ||
+      strcmp(result_text(q,"endpoint_id"),a->endpoint_id) || !*result_text(q,"source_event_id") ||
+      strcmp(result_text(body,"schema"),"edr.parent-context.v1") ||
+      strcmp(result_text(body,"source_event_id"),result_text(q,"source_event_id")) ||
+      !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(body,"absence_is_evidence")) ||
+      !result_member(reason,"available|unavailable_or_expired|parent_unresolved|parent_conflict") ||
+      !result_integer(contract,"max_bytes",512,EDR_COMMAND_STATE_DETAIL_CAP-1u,&bytes) ||
+      !result_parent_decimal(q,"from_ns",INT64_MAX,&from) || !result_parent_decimal(q,"until_ns",INT64_MAX,&until) || until<from || until-from>600000000000ULL ||
+      !result_parent_decimal(q,"process_start_key",UINT64_MAX,NULL) ||
+      !result_parent_decimal(q,"process_creation_filetime_100ns",UINT64_MAX,NULL) ||
+      !result_integer(q,"pid",1,UINT32_MAX,&pid) || !cJSON_IsObject(child) ||
+      !result_filter_number(q,"pid",child,"pid",0) ||
+      strcmp(result_text(child,"process_start_key"),result_text(q,"process_start_key")) ||
+      strcmp(result_text(child,"process_creation_filetime_100ns"),result_text(q,"process_creation_filetime_100ns")) ||
+      !result_integer(body,"parent_pid",0,UINT32_MAX,&ppid) || !result_integer(body,"parent_pid_state",0,4,&state) ||
+      !result_parent_field(q,"name"))return NULL;
+  if(absent) { if(strcmp(result_text(body,"event_time_ns"),"0") || !cJSON_IsNull(parent) || ppid!=0 || state!=0)return NULL; }
+  else if(!result_parent_decimal(body,"event_time_ns",INT64_MAX,&event_time) || event_time<from || event_time>until)return NULL;
+  if(!available && !cJSON_IsNull(parent))return NULL;
+  cJSON *out=cJSON_CreateObject(),*actor=cJSON_CreateObject(),*p=available?cJSON_CreateObject():cJSON_CreateNull();
+  if(!out||!actor||!p){cJSON_Delete(out);cJSON_Delete(actor);cJSON_Delete(p);return NULL;}
+  cJSON_AddItemToObject(out,"child",actor);cJSON_AddItemToObject(out,"parent",p);
+  int ok=result_copy_fields(out,body,"schema|availability_reason|source_event_id|event_time_ns","parent_pid|parent_pid_state","absence_is_evidence") &&
+      result_copy_fields(actor,child,"process_start_key|process_creation_filetime_100ns","pid","");
+  if(available) {
+    double parent_pid;
+    ok=ok && cJSON_IsObject(parent) && state==1 &&
+        result_integer(parent,"pid",1,UINT32_MAX,&parent_pid) && parent_pid==ppid &&
+        result_integer(parent,"parent_pid_state",1,1,NULL) &&
+        result_parent_decimal(parent,"process_start_key",UINT64_MAX,NULL) &&
+        result_parent_decimal(parent,"process_creation_filetime_100ns",UINT64_MAX,NULL) &&
+        result_copy_fields(p,parent,"process_start_key|process_creation_filetime_100ns","pid|parent_pid_state","");
+    const char *keys[]={"name","path","cmdline"};
+    for(size_t i=0;ok && i<3;i++)if(result_parent_field(q,keys[i])) {
+      const cJSON *v=cJSON_GetObjectItemCaseSensitive(parent,keys[i]);
+      ok=cJSON_IsString(v) && v->valuestring && strlen(v->valuestring)<EDR_COMMAND_STATE_DETAIL_CAP &&
+          cJSON_AddItemToObject(p,keys[i],cJSON_Duplicate(v,1));
+      if(ok && i>0) {
+        const char *quality=i==1?"path_quality":"cmdline_quality";
+        ok=result_member(result_text(parent,quality),"complete|truncated|missing|unknown") &&
+            cJSON_AddStringToObject(p,quality,result_text(parent,quality));
+      }
+    }
+  }
+  if(!ok){cJSON_Delete(out);return NULL;}return out;
 }
 
 static cJSON *result_status(int status,int code) {
@@ -505,6 +577,7 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
   else if(!strcmp(type,"rtr_shell") && !strcmp(kind,"shell_output") && body && cJSON_HasObjectItem(body,"output"))projected=result_shell(body,contract,a,0);
   else if(status==1 && !strcmp(type,"rtq_execute") && !strcmp(kind,"rtq"))projected=result_query(body,contract,a,0);
   else if(status==1 && !strcmp(type,"rtq_query") && !strcmp(kind,"cached_rtq"))projected=result_query(body,contract,a,1);
+  else if(status==1 && !strcmp(type,"rtr_process_tree") && !strcmp(kind,"parent_context"))projected=result_parent_context(body,contract,a);
   else if(!strcmp(type,a->command_type) && !strcmp(kind,"typed")) {
     int rc=result_typed(type,a->command_id,body,cJSON_GetObjectItemCaseSensitive(contract,"request"),status,exit_code,&projected);
     if(rc<0 || (rc==0&&status==1))goto done;

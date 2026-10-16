@@ -1864,6 +1864,10 @@ static int p0_ir_evidence_purposes(const cJSON *purposes, unsigned schema,
     if (!strcmp(purpose->valuestring, "actor_attribution")) field = EDR_EVIDENCE_USER;
     else if (schema >= 8u && !strcmp(purpose->valuestring, "parent_context"))
       field = EDR_EVIDENCE_PARENT_NAME | EDR_EVIDENCE_PARENT_PATH | EDR_EVIDENCE_PARENT_COMMAND;
+    else if (schema >= 10u && !strcmp(purpose->valuestring, "parent_identity") &&
+             (!strcmp(event_type, "process_create") || !strcmp(event_type, "file_read") ||
+              !strcmp(event_type, "file_write") || !strcmp(event_type, "network_connect") ||
+              !strcmp(event_type, "registry_set"))) field = EDR_EVIDENCE_PARENT_NAME;
     else if (schema >= 9u && !strcmp(event_type, "process_create") &&
              !strcmp(purpose->valuestring, "subject_command")) field = EDR_EVIDENCE_COMMAND;
     else return 0;
@@ -2279,6 +2283,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
         strcmp(kind->valuestring, EDR_P0_RULE_IR_BUNDLE_KIND) != 0 ||
         !cJSON_IsNumber(schema_version) ||
         (schema_version->valuedouble != (double)EDR_P0_RULE_IR_SCHEMA_VERSION &&
+         schema_version->valuedouble != 9.0 &&
          schema_version->valuedouble != 8.0 &&
          schema_version->valuedouble != 7.0 &&
          !(s_load_target->purpose_only && (schema_version->valuedouble == 5.0 ||
@@ -2516,7 +2521,7 @@ static int p0_ir_load_from_json_text(const char *source_label, const char *data,
     }
     const cJSON *purposes=cJSON_GetObjectItemCaseSensitive(jcond,"evidence_purposes");
     if (t.effect==EDR_P0_EFFECT_LOCAL_OBSERVATION && purposes && cJSON_GetArraySize(purposes)) { semantic_ok=0; break; }
-    /* Frozen IR5/6/7/8 ownership keeps its original mask. Optional parent and
+    /* Frozen IR5/6/7/8/9 ownership keeps its original mask. Optional parent and
      * subject-command evidence are consumer purposes, never predicates. */
     if (!p0_ir_evidence_purposes(purposes, parsed_schema_version, etbuf, &t.required_evidence_fields)) { semantic_ok=0; break; }
     /* Operation evidence deliberately replaces raw credential-tool commands;

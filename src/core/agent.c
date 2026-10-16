@@ -1629,6 +1629,7 @@ static const char *edr_agent_native_architecture(const char *process_architectur
 
 static int edr_agent_capability_manifest_json(const EdrAgent *agent,
                                               const EdrIngestHttpRuntime *http_rt,
+                                              const EdrEvidenceCacheStatus *evidence_status,
                                               char *out, size_t out_cap) {
   if (!out || out_cap == 0u) return -1;
 #ifdef _WIN32
@@ -1706,6 +1707,11 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
 #endif
   int rtq_policy = agent && (agent->cfg.command.allow_rtq_readonly ||
                               agent->cfg.command.allow_dangerous);
+  /* This view reads only the durable local owner; a compiled SQLite backend
+   * alone does not establish that the store opened successfully. */
+  const char *parent_context_runtime = !sqlite_build ? "unavailable"
+      : !rtq_policy ? "disabled"
+      : evidence_status && evidence_status->db_open ? "healthy" : "unavailable";
   const char *command_enabled_env = getenv("EDR_CMD_ENABLED");
   const char *command_dangerous_env = getenv("EDR_CMD_DANGEROUS");
   int dangerous_policy = (agent && agent->cfg.command.allow_dangerous) ||
@@ -1869,6 +1875,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "%s"
       "\"result_delivery_renewal\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":true,\"runtime_status\":\"%s\"},"
       "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"parent_context_query_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"yara_scan\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"artifact_upload_required\":%s},"
@@ -1930,6 +1937,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       response_command_capability,
       signing_build ? "true" : "false", !signing_build ? "unavailable" : signing_key_configured ? "healthy" : "degraded",
       rtq_policy ? "true" : "false",
+      sqlite_build ? "true" : "false", rtq_policy ? "true" : "false", parent_context_runtime,
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       yara_command_build ? "true" : "false", yara_command_policy ? "true" : "false",
@@ -2349,6 +2357,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   EdrProcessEvidenceMetrics process_evidence_metrics;
   EdrCommandDeliveryHealth cdh;
   EdrCommandExecutorHealth ceh;
+  EdrEvidenceCacheStatus evidence_status;
   EdrWindowsEventFilterStatus event_filter_status;
   EdrP0RuleIrBinding p0_ir_binding;
   int p0_ir_ready;
@@ -2363,6 +2372,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&process_evidence_metrics, 0, sizeof(process_evidence_metrics));
   memset(&cdh, 0, sizeof(cdh));
   memset(&ceh, 0, sizeof(ceh));
+  memset(&evidence_status, 0, sizeof(evidence_status));
   memset(&event_filter_status, 0, sizeof(event_filter_status));
   memset(&p0_ir_binding, 0, sizeof(p0_ir_binding));
   edr_ingest_http_get_runtime(&http_rt);
@@ -2376,9 +2386,10 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   edr_process_evidence_worker_get_metrics(&process_evidence_metrics);
   edr_command_get_delivery_health(&cdh);
   edr_command_executor_get_health(&ceh);
+  edr_local_evidence_cache_get_status(&evidence_status);
   ave_ok = (AVE_GetStatus(&avst) == AVE_OK);
   int capability_manifest_ok = edr_agent_capability_manifest_json(
-      agent, &http_rt, capability_manifest_json,
+      agent, &http_rt, &evidence_status, capability_manifest_json,
       sizeof(capability_manifest_json));
   if (capability_manifest_ok != 0) {
     snprintf(capability_manifest_json, sizeof(capability_manifest_json),
@@ -2471,16 +2482,13 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   /* P0 acceptance metrics are required in every health profile.  The basic
    * profile is the normal production profile and cannot hide the exact
    * dedup/cache/durability state used by release validation. */
-  EdrEvidenceCacheStatus evidence_status;
   EdrP0DedupMetrics p0_metrics;
   EdrP0EmitMetrics p0_emit_metrics;
   EdrStorageQueueCapacityMetrics queue_capacity_metrics;
   EdrEnforcementTerminalJournalMetrics terminal_journal_metrics;
-  memset(&evidence_status, 0, sizeof(evidence_status));
   memset(&p0_metrics, 0, sizeof(p0_metrics));
   memset(&p0_emit_metrics, 0, sizeof(p0_emit_metrics));
   memset(&queue_capacity_metrics, 0, sizeof(queue_capacity_metrics));
-  edr_local_evidence_cache_get_status(&evidence_status);
   char evidence_accounting_json[4096];
   if (edr_local_evidence_cache_accounting_json(&evidence_status, evidence_accounting_json,
                                               sizeof(evidence_accounting_json)) != 0)

@@ -693,6 +693,61 @@ static void download_authority_tests(void) {
   puts("PASS: exact task-pinned QueueCommand downloads for both architectures; generic GET, malformed scope/query/version, unsigned and renewed-but-expired execution denied");
 }
 
+static void parent_context_result_tests(void) {
+  EdrSoarCommandMeta invalid=task("parent-invalid-budget","rtr_process_tree");
+  const char *invalid_request="{\"view\":\"parent_context\"}";
+  CHECK(edr_command_result_bind_contract(&invalid.result_authorization,(const uint8_t *)invalid_request,strlen(invalid_request),(int64_t)time(NULL)*1000)!=0);
+  CHECK(edr_command_state_finish("parent-invalid-budget","rtr_process_tree",&invalid,"rejected",2,19,"invalid parent budget","",1)==0);
+  EdrCommandStateRecord *rejected=calloc(1,sizeof(*rejected));CHECK(rejected);
+  CHECK(edr_command_state_begin("parent-invalid-budget","rtr_process_tree",NULL,NULL,rejected)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(!rejected->report_policy_held);
+  char *rejection_wire=edr_command_result_http_json("ep","test","parent-invalid-budget","rtr_process_tree",2,19,rejected->detail,(int64_t)time(NULL)*1000,"","","");
+  CHECK(rejection_wire && allowed("tenant","ep",rejection_wire));free(rejection_wire);free(rejected);
+  const char *request="{\"pid\":42,\"endpoint_id\":\"ep\",\"source_event_id\":\"source-1\",\"view\":\"parent_context\","
+      "\"process_start_key\":\"9007199254740993\",\"process_creation_filetime_100ns\":\"133700000000000001\","
+      "\"fields\":[\"name\"],\"max_bytes\":2048,\"from_ns\":\"100\",\"until_ns\":\"200\"}";
+  const char *detail="{\"schema\":\"edr.parent-context.v1\",\"availability_reason\":\"available\",\"absence_is_evidence\":false,"
+      "\"source_event_id\":\"source-1\",\"event_time_ns\":\"150\",\"parent_pid\":20,\"parent_pid_state\":1,"
+      "\"child\":{\"pid\":42,\"process_start_key\":\"9007199254740993\",\"process_creation_filetime_100ns\":\"133700000000000001\"},"
+      "\"parent\":{\"pid\":20,\"parent_pid_state\":1,\"process_start_key\":\"10\",\"process_creation_filetime_100ns\":\"133700000000000000\","
+      "\"name\":\"parent.exe\",\"path\":\"UNRELATED-TEXT\",\"cmdline\":\"UNRELATED-TEXT\"}}";
+  typed_owner_case("parent-name-only","rtr_process_tree",request,detail,1);
+  char *wire_body=persisted_body("parent-name-only","rtr_process_tree");
+  CHECK(!strstr(wire_body,"UNRELATED-TEXT"));free(wire_body);
+  cJSON *q=cJSON_Parse(request),*d=cJSON_Parse(detail);CHECK(q && d);
+  cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(q,"fields"),cJSON_CreateString("cmdline"));
+  cJSON *parent=cJSON_GetObjectItemCaseSensitive(d,"parent");
+  cJSON_ReplaceItemInObjectCaseSensitive(parent,"cmdline",cJSON_CreateString("parent --explicitly-requested"));
+  cJSON_AddStringToObject(parent,"cmdline_quality","complete");
+  char *full_q=cJSON_PrintUnformatted(q),*full_d=cJSON_PrintUnformatted(d);CHECK(full_q&&full_d);
+  typed_owner_case("parent-command-requested","rtr_process_tree",full_q,full_d,1);
+  cJSON_ReplaceItemInObjectCaseSensitive(q,"max_bytes",cJSON_CreateNumber(512));
+  char large_command[901];memset(large_command,'x',900);large_command[900]=0;
+  cJSON_ReplaceItemInObjectCaseSensitive(parent,"cmdline",cJSON_CreateString(large_command));
+  char *small_q=cJSON_PrintUnformatted(q),*large_d=cJSON_PrintUnformatted(d);CHECK(small_q&&large_d);
+  typed_owner_case("parent-command-over-budget","rtr_process_tree",small_q,large_d,0);
+  cJSON_free(small_q);cJSON_free(large_d);
+  cJSON_ReplaceItemInObjectCaseSensitive(parent,"cmdline",cJSON_CreateString("parent --explicitly-requested"));
+  cJSON_ReplaceItemInObjectCaseSensitive(q,"max_bytes",cJSON_CreateNumber(2048));
+  cJSON *child=cJSON_GetObjectItemCaseSensitive(d,"child");
+  cJSON_ReplaceItemInObjectCaseSensitive(child,"process_start_key",cJSON_CreateString("9007199254740992"));
+  char *wrong=cJSON_PrintUnformatted(d);CHECK(wrong);
+  typed_owner_case("parent-wrong-generation","rtr_process_tree",full_q,wrong,0);cJSON_free(wrong);
+  cJSON_ReplaceItemInObjectCaseSensitive(child,"process_start_key",cJSON_CreateString("9007199254740993"));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"source_event_id",cJSON_CreateString("other-source"));
+  wrong=cJSON_PrintUnformatted(d);CHECK(wrong);
+  typed_owner_case("parent-wrong-source","rtr_process_tree",full_q,wrong,0);cJSON_free(wrong);
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"source_event_id",cJSON_CreateString("source-1"));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"availability_reason",cJSON_CreateString("unavailable_or_expired"));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"event_time_ns",cJSON_CreateString("0"));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"parent_pid",cJSON_CreateNumber(0));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"parent_pid_state",cJSON_CreateNumber(0));
+  cJSON_ReplaceItemInObjectCaseSensitive(d,"parent",cJSON_CreateNull());
+  wrong=cJSON_PrintUnformatted(d);CHECK(wrong);
+  typed_owner_case("parent-explicit-unavailable","rtr_process_tree",full_q,wrong,1);cJSON_free(wrong);
+  cJSON_Delete(q);cJSON_Delete(d);cJSON_free(full_q);cJSON_free(full_d);
+}
+
 int main(void) {
   char path[256];snprintf(path,sizeof(path),"./command-egress-%ld",(long)pid());
   env("EDR_COMMAND_STATE_DIR",path);
@@ -828,6 +883,7 @@ int main(void) {
   CHECK(allowed("tenant","ep",body));free(body);
   purpose_tests();
   download_authority_tests();
+  parent_context_result_tests();
   puts("PASS: admitted task scope, exact terminal, durable retry, expiry, session binding, attachment denial");
   return 0;
 }

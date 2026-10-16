@@ -3413,6 +3413,28 @@ static void p0_observe_rule_disposition(const EdrBehaviorRecord *br,
           repetition);
 }
 
+typedef struct {
+  const EdrBehaviorRecord *record;
+  const EdrCommandFacts *facts;
+} P0AlertContextPrepare;
+
+static int p0_prepare_local_alert_context(void *opaque) {
+  const P0AlertContextPrepare *context = (const P0AlertContextPrepare *)opaque;
+  int outcome = edr_local_evidence_cache_record_alert_context(context->record, context->facts);
+  if (outcome != 0) {
+    static uint64_t refusals;
+    p0_state_lock();
+    uint64_t count = ++refusals;
+    p0_state_unlock();
+    if ((count & (count - 1u)) == 0u)
+      fprintf(stderr, "[P0] alert delivery continues after local parent context refusal outcome=%d count=%llu\n",
+          outcome, (unsigned long long)count);
+  }
+  /* This copy grants no delivery/action authority. Its capacity or storage
+   * failure must never consume the alert's critical queue reservation. */
+  return 1;
+}
+
 static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int severity, const char *title,
                         const char *mitre_comma, const EdrP0RuleIrBinding *binding,
                         const EdrP0RuleIrMatch *match, const char *known_fp_reason, const char *deferred_key,
@@ -3954,12 +3976,14 @@ static int emit_for_rule(const EdrBehaviorRecord *br, const char *rule_id, int s
     if (delivery_gated) *delivery_gated = 1;
     return 0;
   }
+  P0AlertContextPrepare local_context = {br, command_facts};
   EdrBehaviorRecordAlertEmitOutcome emit_outcome = enforcement.requested
       ? (p0_finish_enforcement_terminal(&enforcement_prepare, &a)
              ? EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED
              : EDR_BEHAVIOR_RECORD_ALERT_EMIT_PREPARE_OR_QUEUE_FAILED)
       : (deferred_key ? edr_behavior_record_alert_emit_deferred(br, &a, deferred_key, command_facts)
-                      : edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(br, &a, NULL, NULL));
+                      : edr_behavior_record_alert_emit_to_batch_with_prepare_outcome(
+                            br, &a, p0_prepare_local_alert_context, &local_context));
   if (terminal_reason && enforcement.requested &&
       emit_outcome == EDR_BEHAVIOR_RECORD_ALERT_EMIT_ACCEPTED)
     *terminal_reason = "terminal_journal_owned";

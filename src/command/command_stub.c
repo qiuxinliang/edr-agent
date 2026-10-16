@@ -3704,64 +3704,64 @@ static void do_rtq_query(const char *cmd_id, const uint8_t *pl, size_t len, cons
 
 static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t len,
                                 const EdrSoarCommandMeta *sm) {
-  long pid = -1;
-  if (parse_pid_json(pl, len, &pid) != 0) {
-    s_exec_fail++;
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "invalid pid payload");
-    return;
-  }
-  if (pid <= 0) {
-    s_exec_fail++;
-    audit_both(cmd_id, "rtr_process_tree: pid required");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2, "pid is required");
-    return;
-  }
-  char endpoint_id[64];
-  if (parse_json_string_field(pl, len, "endpoint_id", endpoint_id, sizeof(endpoint_id)) != 0) {
-    endpoint_id[0] = '\0';
-  }
-  uint64_t process_start_key = 0u;
-  uint64_t process_creation_filetime_100ns = 0u;
-  int has_process_start_key =
-      parse_json_u64_field(pl, len, "process_start_key", &process_start_key) == 0;
-  int has_process_creation_filetime =
-      parse_json_u64_field(pl, len, "process_creation_filetime_100ns",
-                           &process_creation_filetime_100ns) == 0;
-  if (has_process_start_key != has_process_creation_filetime) {
-    s_exec_fail++;
-    audit_both(cmd_id, "rtr_process_tree: process generation tuple is incomplete");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2,
-              "process_start_key and process_creation_filetime_100ns are both required");
-    return;
-  }
-  if (!has_process_start_key) {
-    s_exec_fail++;
-    audit_both(cmd_id, "rtr_process_tree: generation-bound lookup required");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 2,
-              "generation-bound process tree lookup requires process_start_key and process_creation_filetime_100ns");
-    return;
-  }
-  char detail[12000];
-  int r = edr_local_evidence_cache_process_tree_generation_json(
-      (uint32_t)pid, endpoint_id, process_start_key,
-      process_creation_filetime_100ns, detail, sizeof(detail));
-  if (r == -3) {
-    s_exec_fail++;
-    audit_both(cmd_id, "rtr_process_tree: serialization or output budget exhausted");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 4,
-              "cached process tree exceeds response budget or cannot be serialized");
-    return;
-  }
+  (void)pl; (void)len; /* The signed frozen request owns both query and fields. */
+  const char *failure = "parent_context authorization invalid";
+  cJSON *contract = NULL;
+  char *request_json = NULL;
+  EdrParentContextRequest request;
+  EdrParentContextQuery query = {0};
+  struct timespec wall;
+  if (!edr_command_rtq_readonly_enabled()) { failure = "readonly RTQ disabled"; goto rejected; }
+  if (!cmd_id || !sm || !memchr(sm->result_authorization.content_contract, 0, sizeof(sm->result_authorization.content_contract)) ||
+      !memchr(sm->result_authorization.command_id, 0, sizeof(sm->result_authorization.command_id)) ||
+      !memchr(sm->result_authorization.command_type, 0, sizeof(sm->result_authorization.command_type)) ||
+      !memchr(sm->result_authorization.tenant_id, 0, sizeof(sm->result_authorization.tenant_id)) ||
+      !memchr(sm->result_authorization.endpoint_id, 0, sizeof(sm->result_authorization.endpoint_id)) ||
+      strcmp(sm->result_authorization.command_id, cmd_id) || strcmp(sm->result_authorization.command_type, "rtr_process_tree") ||
+      !sm->result_authorization.tenant_id[0] || !sm->result_authorization.endpoint_id[0] ||
+      sm->issued_at_unix_ms <= 0 || !sm->deadline_ms || sm->deadline_ms > 30000u ||
+      sm->issued_at_unix_ms > INT64_MAX - sm->deadline_ms || timespec_get(&wall, TIME_UTC) != TIME_UTC) goto rejected;
+  int64_t now_ms = (int64_t)wall.tv_sec * 1000LL + wall.tv_nsec / 1000000LL;
+  query.expires_unix_ms = sm->issued_at_unix_ms + sm->deadline_ms;
+  if (query.expires_unix_ms > sm->result_authorization.expires_unix_ms) query.expires_unix_ms = sm->result_authorization.expires_unix_ms;
+  if (now_ms < sm->issued_at_unix_ms || now_ms >= query.expires_unix_ms) { failure = "parent_context authorization expired"; goto rejected; }
+  contract = edr_egress_parse_purpose_object(sm->result_authorization.content_contract, strlen(sm->result_authorization.content_contract));
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(contract, "schema"), *kind = cJSON_GetObjectItemCaseSensitive(contract, "kind"),
+      *frozen = cJSON_GetObjectItemCaseSensitive(contract, "request"), *max_bytes = cJSON_GetObjectItemCaseSensitive(contract, "max_bytes"),
+      *issued = cJSON_GetObjectItemCaseSensitive(contract, "issued_unix_ms");
+  char reason[256];
+  if (!cJSON_IsString(schema) || strcmp(schema->valuestring, "edr.command.result-purpose.v1") ||
+      !cJSON_IsString(kind) || strcmp(kind->valuestring, "parent_context") || !cJSON_IsObject(frozen) ||
+      !cJSON_IsNumber(issued) || issued->valuedouble != (double)sm->issued_at_unix_ms ||
+      !(request_json = cJSON_PrintUnformatted(frozen)) ||
+      !edr_command_parent_context_request_parse((const uint8_t *)request_json, strlen(request_json), &request, reason, sizeof(reason)) ||
+      strcmp(request.endpoint_id, sm->result_authorization.endpoint_id) || !cJSON_IsNumber(max_bytes) || max_bytes->valuedouble != request.max_bytes) goto rejected;
+  query.tenant_id = sm->result_authorization.tenant_id; query.endpoint_id = request.endpoint_id;
+  query.source_event_id = request.source_event_id; query.child_pid = request.child_pid;
+  query.child_process_start_key = request.child_process_start_key; query.child_creation_filetime_100ns = request.child_creation_filetime_100ns;
+  query.from_ns = request.from_ns; query.until_ns = request.until_ns; query.fields = request.fields;
+  char detail[EDR_COMMAND_STATE_DETAIL_CAP];
+  int r = edr_local_evidence_cache_query_parent_context_json(&query, detail, (size_t)request.max_bytes + 1u);
+  cJSON_free(request_json); cJSON_Delete(contract);
   if (r != 0) {
     s_exec_fail++;
-    audit_both(cmd_id, "rtr_process_tree: no cached process");
-    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, "process not found in local evidence cache");
+    const char *cause = r == EDR_PARENT_CONTEXT_ERROR_BUDGET ? "parent_context budget_exceeded" :
+        r == EDR_PARENT_CONTEXT_ERROR_EXPIRED ? "parent_context authorization expired" :
+        r == EDR_PARENT_CONTEXT_ERROR_INTEGRITY ? "parent_context retained integrity conflict" :
+        r == EDR_PARENT_CONTEXT_ERROR_BUSY ? "parent_context cache busy" :
+        r == EDR_PARENT_CONTEXT_ERROR_STORAGE ? "parent_context storage unavailable" : "parent_context scope invalid";
+    soar_emit(cmd_id, sm, EdrCmdExecFailed, 3, cause);
     return;
   }
   s_handled++;
   s_exec_ok++;
-  audit_both(cmd_id, "rtr_process_tree: ok");
+  audit_both(cmd_id, "rtr_process_tree: bounded parent_context complete");
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
+  return;
+rejected:
+  cJSON_free(request_json); cJSON_Delete(contract);
+  s_exec_fail++;
+  soar_emit(cmd_id, sm, EdrCmdExecRejected, 2, failure);
 }
 
 static void do_rtr_list_connections(const char *cmd_id, const uint8_t *pl, size_t len,

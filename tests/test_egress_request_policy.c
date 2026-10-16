@@ -319,6 +319,38 @@ static cJSON *upgrade_entry(cJSON *root) {
   cJSON *manifest = cJSON_GetObjectItemCaseSensitive(health, "capability_manifest");
   return cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(manifest, "commands"), "agent_update_v1");
 }
+static void test_parent_context_capability_health_projection(void) {
+  const struct { int build, policy; const char *runtime; } states[] = {
+    {1, 1, "healthy"}, {1, 1, "unavailable"}, {1, 0, "disabled"}, {0, 1, "unavailable"}
+  };
+  for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+    char body[2048], why[128];
+    snprintf(body, sizeof(body), "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.692\","
+        "\"policy_version\":\"p\",\"engine_health\":{\"capability_manifest\":{\"commands\":{"
+        "\"parent_context_query_v1\":{\"code_supported\":true,\"build_supported\":%s,"
+        "\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"rules_count\":7,\"source_event_id\":\"synthetic-private-source\","
+        "\"parent\":{\"cmdline\":\"synthetic-private-command\",\"path\":\"synthetic-private-path\"}}}}}}",
+        states[i].build ? "true" : "false", states[i].policy ? "true" : "false", states[i].runtime);
+    assert(check("POST", "ingest/engine-health", body) != 0);
+    char *wire = edr_egress_health_project(body, why, sizeof(why)); assert(wire);
+    assert(!strstr(wire, "synthetic-private") && !strstr(wire, "source_event_id"));
+    cJSON *decoded = cJSON_Parse(wire); assert(decoded);
+    cJSON *commands = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(decoded, "engine_health"), "capability_manifest"), "commands");
+    cJSON *entry = cJSON_GetObjectItemCaseSensitive(commands, "parent_context_query_v1");
+    assert(cJSON_IsObject(entry) && cJSON_GetArraySize(entry) == 4);
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "code_supported")));
+    assert(cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(entry, "build_supported")) &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "build_supported")) == states[i].build);
+    assert(cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(entry, "policy_enabled")) &&
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "policy_enabled")) == states[i].policy);
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(entry, "runtime_status")->valuestring, states[i].runtime));
+    check_health_routes(decoded, 1);
+    assert(cJSON_ReplaceItemInObjectCaseSensitive(entry, "build_supported", cJSON_CreateString("true")));
+    check_health_routes(decoded, 0);
+    cJSON_Delete(decoded); free(wire);
+  }
+}
 static void test_upgrade_health_consumers(void) {
   EdrAgentUpdateRuntimeInfo info = {0};
   info.ready = 1; info.protocol_version = 5; info.materialized = 1; info.full_installer_ready = 1;
@@ -455,6 +487,7 @@ int main(void) {
   test_parent_exit_health_projection();
   test_diagnostic_health_commitments();
   test_upgrade_health_consumers();
+  test_parent_context_capability_health_projection();
   test_health_leaf_delta();
   test_control_ack_transports();
   {
