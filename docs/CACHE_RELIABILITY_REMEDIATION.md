@@ -1,5 +1,48 @@
 # Cache reliability remediation
 
+## 2026-10-16 fixture closure verified; independent gate inventory corrected
+
+Source `b0cc94e666dab7adf3ebb5d77e6470bdf9c25db5` passed test-only native
+run **38835470424**: the real PowerShell 5.1 manifest fixture succeeded on both
+AMD64 and ARM64 before all 46 storage comparisons and 192 queue windows passed.
+The root rehashed both ZIPs/all 210 indexed files and checked every child exit.
+Results: `/private/tmp/edr-nativeb0cc-monitor-t11x9ngt/RESULTS.json`, SHA-256
+`e6eefe6f0d7c1b07d2194b5ff46af8055e79e58bf86d934781da693758034fd7`.
+This closes the fixture behavior failure, without changing the real writer.
+
+Headless release **38836260547**, version 3.2.689, then failed both architectures
+at `Verify release gate build dependencies`. Both manifest units passed and both
+UI steps were skipped. Product build/test/package/lifecycle/publication were
+not run. Its source-bound draft remains unpublished, alongside failed 688.
+The sanitized AMD64 trace identifies thirteen fixture failures: the independent
+`RUNTIME_EXPECTED` set omitted registered `p0_source_only_capacity_recovery`.
+Actual gate registration and the independently derived 114-case inventory
+already included it; this is not evidence of a missing production target.
+
+A host RED reproduced the same omitted-name assertion. The correction explicitly
+adds that required name to the independent fixture set, adds its executable to
+missing-target rejection, and injects its failure under **both** runtime/release
+labels. The entire gate fixture passed **26/26**, with no skips (97.02 s), plus
+the existing PCRE2 header isolation check **1/1** (7.19 s). Raw commands/logs:
+`/private/tmp/edr-release-gate-inventory-green-4n1kjlek/RESULTS.json`, SHA-256
+`dfdf6c86f64741704cacbdc4d609f54e0ef8ca3e3328d8824a5db714d8a65c7e`.
+No production source, gate declaration, label or assertion was removed.
+
+The same two existing release preflight commands now run in the test-only
+comparison workflow with its selected native SQLite prefix, before another
+candidate dispatch. Real Windows preflight, new-source comparison, 114 native
+cases and full embedded-installer lifecycle remain required; host fixtures
+do not substitute for them. Candidate 690 will use a new immutable source only
+after those preflight/comparison results pass.
+
+689 metadata: `/private/tmp/edr-689-headless-monitor-oh_ak_uc/RESULTS.json`,
+SHA-256 `3c8506fea9e519f10fcfd9e8d593accc8ad31bdcb5bc85e3ecd8198e98612ff2`.
+Saved sanitized AMD64 log SHA-256:
+`37e2ebc3e93b7d593f60d958e9fd478a1bf78c483a5e541533319a97c04c73d6`.
+Raw decoded logs/environments were never persisted. The UTM remains 687.
+The user has now separately authorized local API patch `f8f5d4a2` deployment;
+its runtime checks and the client event-order acceptance remain pending.
+
 ## 2026-10-16 final-source comparison passed; 688 stopped at fixture gate
 
 Exact source `7ee8f0e8ba131047cdeaea1eea78afd31433460c` passed native
