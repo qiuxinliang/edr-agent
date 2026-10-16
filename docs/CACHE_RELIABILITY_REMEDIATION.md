@@ -1,5 +1,141 @@
 # Cache reliability remediation
 
+## 2026-10-17 parent evidence availability follow-up
+
+This follow-up changes tests and this document. It does not change production
+retirement policy, increase a budget, migrate legacy data or publish another
+Agent. The single UTM still runs Headless 3.2.692 from
+`a978ec83deacf7cd78c273d82630b457c5f39251`. Its native process generation and
+executable digest matched before and after the bounded read-only probes.
+
+The previous sample's exact candidate, fixed `:alert_parent_context` reference
+and bundle are now absent. Both command-result query copies remain. The two
+durable outbox payloads bind the same source and child generation, and both
+event windows contain the previously returned event time. The first UI window
+has a four-nanosecond rounding difference at its bounds; this is far inside
+the one-second margin and does not explain the miss. Outbox payload inspection
+does not independently verify transport signatures. No per-source disposition
+record exists for the absent group. Aggregate capacity counters, absent expiry
+counters and today's empty point lookup cannot prove its historical removal
+time or exact cause.
+
+The only normal production path that deletes a candidate, its bundle and its
+fixed parent reference together is `edr_context_store_retire_candidate`, called
+by bounded cache maintenance. Query field selection occurs after candidate/ref
+selection; adding path/command fields does not consume or retire a snapshot.
+A missing complete command can produce an explicit quality result or integrity
+error, and output-budget/authentication expiry failures have their own errors.
+They must not be described as a successful full-details retrieval.
+
+### Controlled storage reproduction
+
+`test_alert_parent_context_pressure_counterfactual` exercises the production
+SQLite cache, context store, query and maintenance implementations. Both stores
+receive the same source, exact process generations, causal-context class 2
+candidate and synthetic protected policy-0 occupancy (about 2 MiB). Only their
+cache budget differs: 16 MiB control versus 1 MiB pressure. The protected
+occupancy deliberately models a legacy database already exceeding the new
+budget; it is not an admissible new-data write or a physical-cap test.
+
+Both field sets (name, and name/path/command) initially succeed. Maintenance
+preserves the active 120-second post window. At a simulated age of 121 seconds,
+the pressure store retires exactly one complete group, records capacity rather
+than expiry disposition, and both queries return `unavailable_or_expired` with
+`absence_is_evidence=false`. The control remains queryable. Four retired rows
+mean candidate, bundle, reference and fact, not four alerts. The two shared
+command objects remain independently owned. A separate regression verifies
+that a parent with no collected command remains available with
+`cmdline_quality=missing` and an empty command.
+
+These are passing tests of the existing degradation contract, not a retention
+repair or proof of the old field sample's historical cause. The standalone
+`--alert-parent-pressure` option preserves the synthetic databases for review;
+the ordinary context suite cleans up its own temporary fixtures. Assertions
+are enabled in the tested host build. The target uses real SQLite and storage
+owners but includes `p0_rule_ir_stub.c`; it does not prove live rule matching,
+Windows concurrency, or wall-clock load endurance.
+
+### New bounded UTM roundtrip
+
+One additional harmless action, with no guest file, network or privilege change,
+produced one selected R-DISC source. The existing source-bound signed query
+returned 4,795 bytes. Parent name (10 bytes), path (62 bytes) and complete
+command (4,132 bytes) matched independent WinAPI lengths and SHA-256 digests.
+An identical field/source/generation/window query, completed 234 seconds later,
+returned the exact same result bytes and digest. The new class-2 candidate and
+739-byte immutable local parent fact were independently present at the
+intervening point lookup. This proves successful retained-evidence retrieval
+after process exit for this sample; it does not establish a minimum lifetime
+for other groups or explain the older missing group.
+
+The original source remains byte-identical, with mask 2051, parent name and
+identity, and no parent path/command. Its two completed automatic model audits
+have matching 19,712-byte canonical inputs, preserve parent name and exact birth
+identity, and mark parent command as policy-omitted. No manual model invocation
+or reanalysis was requested. Investigation returned only this owned synthetic
+sample through the existing scoped channel; its raw path/command were not
+exported into the diagnostic report. This is not a whole-network packet audit.
+
+### Retention boundary and remaining closure
+
+The effective UTM recent/selected settings are both 72 hours, but pressure may
+retire classified groups after their post window, including class 2. Selected
+value is a preference, not a permanent pin or minimum lifetime. The post window
+is based on event time; a late event may have no remaining post-window time
+when committed. Query authorization expiry and execution-time protection do
+not grant a continuing retention lease. The new UTM sample used a 60-second
+post window; the controlled fixture explicitly used 120 seconds. Neither is a
+general investigation retention promise.
+
+The read-only health sample still reports 7,950 unclassified legacy candidates
+at process open and near-budget occupancy. This count is not their byte cost,
+nor proof that every old owner is necessary. The current booleans and aggregate
+counts cannot certify the available investigation window of an individual
+source. Legacy ownership must be established before classification or disposal.
+Do not solve this by uploading local facts, treating delivery ACK as retirement
+authorization, bulk-marking old owners, increasing capacity, or clearing cache.
+
+Production migration/disposal remains plan-only pending separate authorization.
+A reviewable plan must identify the supported record type and owner, incomplete
+deliveries/journals/lineage and investigation dependencies, frozen byte/identity
+invariants, a bounded dry run, expected logical release and possible physical
+peak, restart-safe metadata changes and rollback. Unknown rows stay protected.
+The previously authorized two old hash-only samples cannot be silently replaced
+by new samples or expanded into an unrestricted export. Insufficient legally
+reclaimable space must remain an observable refusal/degraded retention state.
+
+Before claiming sustained investigation retention, run representative unique,
+duplicate and high-severity workloads beyond the effective window and compare
+queryable time span, chain completeness, write amplification, CPU/I/O, locks and
+DB/WAL/SHM peaks at the same budget. Also close the actual Windows startup-owner
+restart gap and cached-IR10 downgrade sequence; prior CI lifecycle success does
+not cover a 691 parser consuming cached IR10 or the failed UTM service restart.
+No such Windows soak or downgrade was performed in this follow-up.
+
+Actual focused commands:
+
+```sh
+cmake --build /private/tmp/edr-build-reuse-20261016-after --target test_local_evidence_cache_candidate --parallel 2
+/private/tmp/edr-build-reuse-20261016-after/tests/test_local_evidence_cache_candidate --alert-parent-pressure
+/private/tmp/edr-build-reuse-20261016-after/tests/test_local_evidence_cache_candidate --alert-parent-context
+/private/tmp/edr-build-reuse-20261016-after/tests/test_local_evidence_cache_candidate --value-retention
+ctest --test-dir /private/tmp/edr-build-reuse-20261016-after -R '^local_evidence_cache_candidate$' --output-on-failure --timeout 150
+```
+
+The final context CTest passed 1/1 in 3.29 seconds, including an explicit
+maintenance-run assertion for the active-window protection phase. The focused
+pressure reproduction and physical/query retention checks also exited zero.
+These results are host checks; the new regression was not run natively on
+Windows in this follow-up. Existing 692 release CI is separate evidence.
+
+The original mechanism baseline, source/binary/log digests and preserved
+synthetic database identities are in
+`/private/tmp/edr-parent-repair-20261016/parent-pressure-fixture/baseline-metadata.json`.
+The bounded live point lookups, outbox/request projections, new action truth and
+two hash-only query results are in
+`/private/tmp/edr-parent-availability-20261017/`. Failed diagnostic preparation
+attempts remain unverified and are not counted as successful field checks.
+
 ## 2026-10-16 candidate 3.2.691 and single-UTM validation accepted with limits
 
 The deployed Agent source is `b178608ffb3cbaf32615f8a6f6e32ec6cba54622`,

@@ -10092,6 +10092,143 @@ static void test_normal_alert_parent_context_retention(void) {
   }
 }
 
+static void parent_pressure_query(EdrParentContextQuery *query, const char *phase,
+                                  int available) {
+  char output[16384];
+  const uint32_t fields[] = {EDR_PARENT_CONTEXT_FIELD_NAME,
+      EDR_PARENT_CONTEXT_FIELD_NAME | EDR_PARENT_CONTEXT_FIELD_PATH | EDR_PARENT_CONTEXT_FIELD_CMDLINE};
+  for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    query->fields = fields[i];
+    assert(edr_local_evidence_cache_query_parent_context_json(query, output,
+        i ? sizeof(output) : 2048u) == 0);
+    cJSON *answer = cJSON_Parse(output); assert(answer);
+    cJSON *parent = cJSON_GetObjectItemCaseSensitive(answer, "parent");
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "source_event_id")->valuestring,
+        query->source_event_id));
+    assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(answer, "absence_is_evidence")));
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "availability_reason")->valuestring,
+        available ? "available" : "unavailable_or_expired"));
+    if (available) {
+      assert(cJSON_IsObject(parent));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "name")->valuestring,
+          "pressure-parent.exe"));
+      assert(cJSON_HasObjectItem(parent, "path") == (i != 0));
+      assert(cJSON_HasObjectItem(parent, "cmdline") == (i != 0));
+      if (i) {
+        assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "cmdline")->valuestring,
+            "pressure-parent.exe --synthetic-retained"));
+        assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "cmdline_quality")->valuestring, "complete"));
+      }
+    } else {
+      assert(cJSON_IsNull(parent));
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(answer, "event_time_ns")->valuestring, "0"));
+    }
+    printf("parent_pressure_query phase=%s fields=%u available=%d bytes=%zu\n",
+        phase, fields[i], available, strlen(output));
+    cJSON_Delete(answer);
+  }
+}
+
+/* Same source, class and age in two real databases. Only the cache byte budget
+ * differs. No retirement helper is called directly: production maintenance
+ * must observe the protected legacy occupancy and make its own decision. */
+static void test_alert_parent_context_pressure_counterfactual(int preserve) {
+  const int64_t now = INT64_C(1700000000000000000);
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+  for (int pressure = 0; pressure <= 1; ++pressure) {
+    char seed[512], path[512], candidate[160]; sqlite3 *db = NULL;
+    EdrEvidenceCacheStatus before, protected, after;
+    EdrBehaviorRecord *record = calloc(1u, sizeof(*record));
+    EdrBehaviorRecord *prior = calloc(1u, sizeof(*prior)); assert(record && prior);
+    assert(make_test_sqlite_path(seed, sizeof(seed)) == 0);
+    int n = snprintf(path, sizeof(path), "%s-parent-%s.db", seed, pressure ? "pressure" : "control");
+    assert(n > 0 && (size_t)n < sizeof(path) && rename(seed, path) == 0);
+    s_test_monotonic_ns = UINT64_C(1000000000);
+    edr_local_evidence_cache_test_set_now_unix_ns(now);
+    assert(edr_local_evidence_cache_open_with_policy(path, pressure ? 1u : 16u, 72u, 72u) == 0);
+    init_record(record, EDR_EVENT_PROCESS_CREATE);
+    strcpy(record->endpoint_id, "synthetic-pressure-endpoint");
+    strcpy(record->tenant_id, "synthetic-pressure-tenant");
+    strcpy(record->event_id, "same-selected-parent-source");
+    record->pid = 98102u; record->ppid = 98101u;
+    record->parent_pid_state = EDR_PARENT_PID_KNOWN;
+    record->process_start_key = 12002u;
+    record->process_creation_filetime_100ns = test_unix_ns_to_filetime((uint64_t)(now - INT64_C(6000000000)));
+    record->parent_process_start_key = 12001u;
+    record->parent_process_creation_filetime_100ns = record->process_creation_filetime_100ns - UINT64_C(20000000);
+    record->event_time_ns = now;
+    strcpy(record->process_name, "ordinary-child.exe");
+    strcpy(record->exe_path, "C:/synthetic/ordinary-child.exe");
+    strcpy(record->cmdline, "ordinary-child.exe --synthetic-safe");
+    strcpy(record->parent_name, "pressure-parent.exe");
+    strcpy(record->parent_path, "C:/synthetic/pressure-parent.exe");
+    strcpy(record->parent_cmdline, "pressure-parent.exe --synthetic-retained");
+    strcpy(record->parent_resolution_source, "live_parent_generation");
+    strcpy(record->parent_resolution_status, "RESOLVED");
+    edr_behavior_bind_parent_context(record);
+    *prior = *record; prior->event_time_ns -= INT64_C(1000000000);
+    strcpy(prior->event_id, "same-selected-parent-prior-context");
+    assert(!edr_local_evidence_cache_is_candidate(prior));
+    edr_local_evidence_cache_record_behavior(prior);
+    EdrCommandFacts facts = {record->cmdline, record->parent_cmdline};
+    assert(edr_local_evidence_cache_record_alert_context(record, &facts) == 0);
+    sqlite_candidate_id_for_source_event(path, record->event_id, candidate, sizeof(candidate));
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2 AND retention_value_reason='causal_context'") == 1);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 1);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 1);
+    EdrParentContextQuery query = {record->tenant_id, record->endpoint_id, record->event_id,
+        record->pid, record->process_start_key, record->process_creation_filetime_100ns,
+        now - INT64_C(1000000000), now + INT64_C(1000000000),
+        now / 1000000LL + 30000LL, EDR_PARENT_CONTEXT_FIELD_NAME};
+    parent_pressure_query(&query, pressure ? "pressure_before" : "control_before", 1);
+    edr_local_evidence_cache_get_status(&before);
+    retention_group_fixture(db, "protected-legacy-occupancy", 0, now, now, now + 1);
+    compact_exec(db, "UPDATE artifacts SET manifest_json=printf('%02097152d',1) WHERE candidate_id='protected-legacy-occupancy';"
+                     "PRAGMA wal_checkpoint(TRUNCATE);");
+    assert(compact_scalar(db, "SELECT page_count*page_size FROM pragma_page_count,pragma_page_size") > 1048576);
+    /* Both source time and post window remain unchanged while real pressure
+     * maintenance runs. Merely querying does not consume a snapshot. */
+    for (unsigned pass = 0; pass < 4u; ++pass) retention_poll();
+    edr_local_evidence_cache_get_status(&protected);
+    assert(protected.maintenance_runs > before.maintenance_runs);
+    assert(protected.retention_groups_retired == before.retention_groups_retired);
+    parent_pressure_query(&query, pressure ? "pressure_post_window_protected" : "control_post_window_protected", 1);
+    edr_local_evidence_cache_test_set_now_unix_ns(now + INT64_C(121000000000));
+    query.expires_unix_ms = (now + INT64_C(121000000000)) / 1000000LL + 30000LL;
+    for (unsigned pass = 0; pass < 16u; ++pass) retention_poll();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs > protected.maintenance_runs);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='protected-legacy-occupancy'") == 1);
+    assert(compact_scalar(db, "SELECT COALESCE(SUM(value),0) FROM metrics WHERE metric_name='local_retention_v1_expired_groups'") == 0);
+    if (pressure) {
+      assert(after.retention_groups_retired == before.retention_groups_retired + 1u);
+      assert(after.db_capacity_evicted > before.db_capacity_evicted);
+      assert(after.db_retention_evicted == before.db_retention_evicted);
+      assert(compact_scalar(db, "SELECT value FROM metrics WHERE metric_name='local_retention_v1_capacity_groups'") == 1);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 1);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 0);
+      parent_pressure_query(&query, "pressure_after_retirement", 0);
+    } else {
+      assert(after.retention_groups_retired == before.retention_groups_retired);
+      assert(after.db_capacity_evicted == before.db_capacity_evicted);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 2);
+      parent_pressure_query(&query, "control_same_source_same_age", 1);
+    }
+    printf("parent_pressure_counterfactual pressure=%d budget_mb=%u age_s=121 selected_hours=72 retired_groups=%llu capacity_rows=%llu db=%s candidate=%s preserved=%d\n",
+        pressure, pressure ? 1u : 16u,
+        (unsigned long long)(after.retention_groups_retired - before.retention_groups_retired),
+        (unsigned long long)(after.db_capacity_evicted - before.db_capacity_evicted), path, candidate, preserve);
+    assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+    if (!preserve) cleanup_test_sqlite_path(path);
+    free(prior); free(record);
+  }
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = UINT64_C(1000000000);
+}
+
 static void test_alert_parent_context_refusal_and_unresolved(void) {
   char path[512], output[2048];
   EdrBehaviorRecord *record = calloc(1u, sizeof(*record)); assert(record);
@@ -10151,6 +10288,20 @@ static void test_alert_parent_context_refusal_and_unresolved(void) {
   strcpy(record->parent_resolution_status, "RESOLVED");
   strcpy(record->parent_name, "retained-original.exe");
   strcpy(record->parent_path, "C:/retained-original.exe");
+  record->parent_cmdline[0] = 0;
+  strcpy(record->event_id, "parent-command-not-collected");
+  edr_behavior_bind_parent_context(record);
+  assert(edr_local_evidence_cache_record_alert_context(record, NULL) == 0);
+  EdrParentContextQuery missing = {record->tenant_id, record->endpoint_id, record->event_id,
+      record->pid, record->process_start_key, record->process_creation_filetime_100ns,
+      now - 1000000000LL, now + 1000000000LL, (int64_t)time(NULL) * 1000LL + 60000LL, 7u};
+  assert(edr_local_evidence_cache_query_parent_context_json(&missing, output, sizeof(output)) == 0);
+  cJSON *missing_result = cJSON_Parse(output), *missing_parent = cJSON_GetObjectItemCaseSensitive(missing_result, "parent");
+  assert(cJSON_IsObject(missing_parent));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(missing_result, "availability_reason")->valuestring, "available"));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(missing_parent, "cmdline_quality")->valuestring, "missing"));
+  assert(!cJSON_GetObjectItemCaseSensitive(missing_parent, "cmdline")->valuestring[0]);
+  cJSON_Delete(missing_result);
   strcpy(record->parent_cmdline, "retained-original.exe --original-tail");
   strcpy(record->event_id, "original-parent-command");
   edr_behavior_bind_parent_context(record);
@@ -10190,6 +10341,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--alert-parent-context") == 0) {
     test_normal_alert_parent_context_retention();
     test_alert_parent_context_refusal_and_unresolved(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--alert-parent-pressure") == 0) {
+    test_alert_parent_context_pressure_counterfactual(1); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--command-result-budget") == 0) {
     test_command_result_copy_budget(); return 0;
@@ -10268,6 +10422,7 @@ int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
   RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
+  RUN_CACHE_CASE("context", test_alert_parent_context_pressure_counterfactual(0));
   RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
   RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
   RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());
