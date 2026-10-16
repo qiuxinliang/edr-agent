@@ -16,18 +16,16 @@ and headers are byte-checked against the requested commit before compilation.
 """
 import argparse
 import hashlib
-import io
 import json
 import os
-import posixpath
 from pathlib import Path
 import shlex
 import shutil
 import statistics
 import subprocess
-import tarfile
 from retention_comparison_support import (dependencies, compiler_flags, compile_command,
-    runtime_environment, verify_native, compiler_identity, execute_benchmark)
+    runtime_environment, verify_native, compiler_identity, execute_benchmark,
+    failure_report, export_git_snapshot, verify_git_snapshot)
 
 SOURCES = [
     'src/preprocess/detection_decision.c', 'src/preprocess/detection_profile.c',
@@ -72,40 +70,28 @@ if out == repo or repo in out.parents or args.runs < 1 or args.runs > 100:
 if out.exists() and any(out.iterdir()):
     parser.error('Use an empty output directory; existing data is never removed.')
 out.mkdir(parents=True, exist_ok=True)
+failure = failure_report(out)
+failure['stage'] = 'baseline_revision'
 revision = capture(['git', 'rev-parse', args.baseline + '^{commit}'], cwd=repo, text=True).strip()
 old, current = out/'baseline', out/'current'
 old.mkdir()
-archive = capture(['git', 'archive', revision, 'src', 'include', 'third_party'], cwd=repo)
-with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-    # git archive contains trusted tracked source paths, no external inputs.
-    for member in tar.getmembers():
-        if member.name.startswith('/') or '..' in Path(member.name).parts:
-            raise RuntimeError('Unexpected archive path')
-        if member.issym():
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), member.linkname))
-            if target.startswith('/') or target == '..' or target.startswith('../'):
-                raise RuntimeError('Archive symlink escapes source snapshot')
-        elif not (member.isfile() or member.isdir()):
-            raise RuntimeError('Unsupported archive entry')
-    tar.extractall(old)
+failure['stage'] = 'baseline_export'
+baseline_binding = export_git_snapshot(repo, revision, old, ('src', 'include', 'third_party'),
+                                      out/'baseline-source-binding.json')
+failure['stage'] = 'current_snapshot'
 for folder in ('src', 'include', 'third_party'):
     shutil.copytree(repo/folder, current/folder)
 harness = out/'evidence_retention_comparison.c'
 harness.write_bytes((repo/'tests/evidence_retention_comparison.c').read_bytes())
 (out/'retention_benchmark_support.h').write_bytes((repo/'tests/retention_benchmark_support.h').read_bytes())
-# Verify the complete exported baseline (including transitive headers), not a
-# hybrid of old C and new headers. Ignore directories; no source is patched.
-for path in old.rglob('*'):
-    if path.is_file() and not path.is_symlink():
-        relative = path.relative_to(old).as_posix()
-        expected = capture(['git', 'show', revision + ':' + relative], cwd=repo)
-        if path.read_bytes() != expected:
-            raise RuntimeError('Baseline source mismatch: ' + relative)
 defines = ['EDR_AGENT_VERSION_STRING="3.2.642"', 'EDR_HAVE_LZ4=1',
            'EDR_HAVE_ZSTD=1', 'EDR_HAVE_NANOPB=1', 'EDR_HAVE_SQLITE=1',
            'EDR_LOCAL_EVIDENCE_CACHE_TESTING=1', 'PB_FIELD_32BIT=1']
+failure['stage'] = 'dependency_resolution'
 dependency_includes, dependency, dependency_hashes = dependencies(args.dependency_prefix)
+failure['stage'] = 'compiler_identity'
 metadata = {'baseline_revision': revision,
+            'baseline_source_binding_sha256': digest((out/'baseline-source-binding.json').read_bytes()),
             'current_head': capture(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),
             'current_is_working_tree_snapshot': True, 'harness_sha256': digest(harness.read_bytes()),
             'runs': args.runs, 'metrics_are_synthetic': True,
@@ -123,6 +109,7 @@ metadata = {'baseline_revision': revision,
 summaries = {}
 frozen_sources = []
 for name, source, selected in [('old',old,1), ('current_1h',current,1), ('current_4h',current,4)]:
+    failure['stage'] = 'variant_prepare'
     sources = SOURCES + (QUEUE_SOURCES if source == current else [])
     selected_defines = list(defines)
     if source == current:
@@ -139,8 +126,10 @@ for name, source, selected in [('old',old,1), ('current_1h',current,1), ('curren
               for p in source.rglob('*') if p.is_file() and not p.is_symlink()}
     frozen_sources.append((source, hashes))
     (out/(name+'-source-sha256.json')).write_text(json.dumps(hashes,sort_keys=True,indent=2)+'\n')
+    failure['stage'] = 'compile'
     with (out/(name+'-build.log')).open('w') as log:
         run(command, cwd=out, stdout=log, stderr=subprocess.STDOUT)
+    failure['stage'] = 'execute_and_validate'
     samples=[]
     with (out/(name+'-runs.log')).open('w') as log:
         for index in range(args.runs):
@@ -166,6 +155,8 @@ for name, source, selected in [('old',old,1), ('current_1h',current,1), ('curren
     print(json.dumps({'variant':name,'median':sums}),flush=True)
 if len({x['input_sha256'] for x in summaries.values()}) != 1:
     raise RuntimeError('Baseline and current input digests differ')
+failure['stage'] = 'verify_frozen_sources'
+verify_git_snapshot(old, baseline_binding)
 for source, hashes in frozen_sources:
     for relative, expected in hashes.items():
         if digest((source/relative).read_bytes()) != expected:

@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from retention_comparison_support import (CODEC_SOURCES, compiler_flags,
-    compile_command, dependencies, digest, includes, runtime_environment, verify_native, compiler_identity, execute_benchmark)
+    compile_command, dependencies, digest, includes, runtime_environment, verify_native, compiler_identity, execute_benchmark, failure_report)
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
@@ -35,6 +35,8 @@ if len(set(args.scenarios)) != len(args.scenarios):
 if os.name != 'nt' and not args.codec_build:
     parser.error('Build the real codec first and pass --codec-build on POSIX.')
 out.mkdir(parents=True, exist_ok=True)
+failure = failure_report(out)
+failure['stage'] = 'source_snapshot'
 head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
 baseline = subprocess.check_output(['git', 'rev-parse', args.baseline+'^{commit}'], cwd=root, text=True).strip()
 source = out/'source'
@@ -45,6 +47,7 @@ for name in ('queue_retention_comparison.c', 'retention_benchmark_support.h'):
 source_hashes = {p.relative_to(source).as_posix(): digest(p) for p in source.rglob('*')
                  if p.is_file() and not p.is_symlink()}
 (out/'current-source-sha256.json').write_text(json.dumps(source_hashes, sort_keys=True, indent=2)+'\n')
+failure['stage'] = 'dependency_resolution'
 dep_includes, libraries, dep_hashes = dependencies(args.dependency_prefix)
 defines = ['EDR_HAVE_SQLITE=1', 'EDR_STORAGE_QUEUE_TESTING=1', 'PB_FIELD_32BIT=1',
            'EDR_HAVE_LZ4=1', 'EDR_HAVE_ZSTD=1', 'EDR_AGENT_VERSION_STRING="3.2.642"']
@@ -53,6 +56,7 @@ def build(command, path, cwd):
     with path.open('x', encoding='utf-8') as log:
         subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=240)
 
+failure['stage'] = 'codec_prepare'
 if os.name == 'nt' and not args.codec_build:
     codec = out/'codec'; codec.mkdir()
     objects = codec/'objects'; objects.mkdir()
@@ -69,8 +73,9 @@ else:
     name = 'edr_egress_policy.lib' if os.name == 'nt' else 'libedr_egress_policy.a'
     original_library = args.codec_build.resolve()/name
     if not original_library.is_file():
-        parser.error('Missing real codec library: '+str(original_library))
+        raise RuntimeError('Missing real codec library: '+str(original_library))
     library = out/name; shutil.copyfile(original_library, library)
+failure['stage'] = 'compiler_identity'
 metadata = {'current_head': head, 'baseline_revision': baseline,
     'baseline_scope': 'Original queue_sqlite.c and storage_queue.h; shared current codec, support and other headers as in the existing comparison protocol',
     'codec_sha256': digest(library), 'dependency_sha256': dep_hashes,
@@ -125,6 +130,7 @@ int benchmark_ledger_categories_verified(void) {
 '''
 results = {}
 for name, revision in [('baseline_662', baseline), ('current', None)]:
+    failure['stage'] = 'queue_source_binding'
     work = out/name; (work/'include/edr').mkdir(parents=True)
     def contents(path):
         return subprocess.check_output(['git','show',revision+':'+path],cwd=root) if revision else (source/path).read_bytes()
@@ -149,7 +155,9 @@ for name, revision in [('baseline_662', baseline), ('current', None)]:
         'header_sha256':hashlib.sha256(header).hexdigest(), 'instrumented_sha256':digest(work/'queue_sqlite.c'),
         'time_binding':'After the one existing time.h include; only queue calls use the fixed fixture clock',
         'ledger_helper':'Read-only SUM/COUNT against each of nine actual categories; no recalibration'},indent=2)+'\n')
+    failure['stage'] = 'compile'
     build(command, work/'build.log', work)
+    failure['stage'] = 'execute_and_validate'
     for scenario in args.scenarios:
         data = work/('synthetic-'+scenario); data.mkdir()
         execution = execute_benchmark([str(binary), str(data/'synthetic.db'), scenario],
@@ -187,6 +195,7 @@ for scenario in args.scenarios:
     after = results['current/'+scenario]['measurement']
     if before['input_stream_sha256']!=after['input_stream_sha256'] or before['input_records']!=after['input_records']:
         raise RuntimeError('Before/after encoded input streams differ: '+scenario)
+failure['stage'] = 'verify_frozen_sources'
 for path, expected in dep_hashes.items():
     if digest(path)!=expected:
         raise RuntimeError('Dependency changed during comparison: '+path)

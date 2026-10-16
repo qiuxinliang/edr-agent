@@ -1,4 +1,4 @@
-# Test-only, manually dispatched equal-input comparison. No product build,
+# Test-only comparison for the storage owners or manual dispatch. No product build,
 # installer, release, endpoint connection or cache migration is performed.
 name: Evidence retention native comparison
 
@@ -12,6 +12,11 @@ on:
       - tests/run_queue_retention_comparison.py
       - tests/retention_benchmark_support.h
       - tests/retention_comparison_support.py
+      - src/storage/local_evidence_cache.c
+      - src/storage/queue_sqlite.c
+      - include/edr/storage_queue.h
+      - src/transport/egress_batch_policy.c
+      - include/edr/egress_batch_policy.h
       - .github/workflows/evidence-retention-comparison.yml
 
 permissions:

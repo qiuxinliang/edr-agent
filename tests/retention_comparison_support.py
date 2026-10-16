@@ -1,11 +1,15 @@
 """Test-only compiler/process boundary for source-bound retention comparisons."""
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
 import time
 
 CODEC_SOURCES = [
@@ -20,6 +24,105 @@ CODEC_SOURCES = [
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def failure_report(directory):
+    """Retain an early stage failure without exception text, argv or environment."""
+    state = {'stage': 'prepare'}
+    original = sys.excepthook
+
+    def report(kind, error, traceback):
+        causes = {subprocess.TimeoutExpired: 'bounded_subprocess_timed_out',
+                  subprocess.CalledProcessError: 'bounded_subprocess_failed',
+                  FileNotFoundError: 'required_file_or_tool_missing'}
+        record = {'stage': state['stage'], 'type': kind.__name__,
+                  'cause': causes.get(kind, 'comparison_stage_failed')}
+        try:
+            with (directory/'failure.json').open('x', encoding='utf-8') as output:
+                output.write(json.dumps(record, indent=2)+'\n')
+        except OSError:
+            print('Unable to persist bounded comparison failure metadata', file=sys.stderr)
+        original(kind, error, traceback)
+
+    sys.excepthook = report
+    return state
+
+
+def export_git_snapshot(repo, revision, destination, folders, binding_path):
+    """Export exact Git bytes, checking link blobs and materialized target closure."""
+    # Git archive otherwise applies a Windows runner's core.autocrlf=true.
+    # This invocation changes no repository or global Git configuration.
+    archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false',
+        '-c', 'core.eol=lf', 'archive', revision, *folders], cwd=repo, timeout=30)
+    bindings, expected = {}, {}
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        entries = {}
+        for member in tar.getmembers():
+            path = PurePosixPath(member.name)
+            if (path.is_absolute() or '..' in path.parts or '\\' in member.name or
+                    ':' in member.name or member.name in entries):
+                raise RuntimeError('Unexpected archive path')
+            if not (member.isfile() or member.isdir() or member.issym()):
+                raise RuntimeError('Unsupported archive entry')
+            entries[member.name] = member
+            if member.issym():
+                target = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), member.linkname))
+                if (target.startswith('/') or target == '..' or target.startswith('../') or
+                        '\\' in member.linkname or ':' in member.linkname):
+                    raise RuntimeError('Archive symlink escapes source snapshot')
+        for relative, member in entries.items():
+            if member.isdir():
+                continue
+            blob = subprocess.check_output(['git', 'show', revision+':'+relative], cwd=repo, timeout=30)
+            archived = member.linkname.encode('utf-8') if member.issym() else tar.extractfile(member).read()
+            if archived != blob:
+                raise RuntimeError('Baseline Git blob mismatch: '+relative)
+            expected[relative] = blob
+        tracked = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', '-z',
+            revision, '--', *folders], cwd=repo, timeout=30)
+        if set(expected) != {name.decode('utf-8') for name in tracked.split(b'\0') if name}:
+            raise RuntimeError('Baseline archive does not cover the complete tracked source tree')
+
+        def resolve(relative, seen):
+            if relative in seen or relative not in expected:
+                raise RuntimeError('Baseline symlink target closure is missing or cyclic')
+            member = entries[relative]
+            if not member.issym():
+                return relative, [relative]
+            target = posixpath.normpath(posixpath.join(posixpath.dirname(relative), member.linkname))
+            resolved, closure = resolve(target, seen | {relative})
+            return resolved, [relative, *closure]
+
+        # Check the complete closure before extraction. Tarfile may create a
+        # real symlink or copy its target when Windows denies symlink creation.
+        closures = {relative: resolve(relative, set()) for relative in expected}
+        tar.extractall(destination)
+        for relative, blob in expected.items():
+            path, member = destination/relative, entries[relative]
+            resolved, closure = closures[relative]
+            if path.read_bytes() != expected[resolved]:
+                raise RuntimeError('Baseline materialized source mismatch: '+relative)
+            physical_link = os.readlink(path) if path.is_symlink() else None
+            if member.issym() and path.is_symlink() and path.resolve() != (destination/resolved).resolve():
+                raise RuntimeError('Baseline symlink resolves outside its declared target')
+            bindings[relative] = {'kind': 'symlink' if member.issym() else 'file',
+                'git_blob_sha256': hashlib.sha256(blob).hexdigest(), 'git_blob_bytes': len(blob),
+                'resolved_path': resolved, 'materialized_sha256': digest(path),
+                'physical_symlink_target': physical_link,
+                'target_closure_sha256': {name: hashlib.sha256(expected[name]).hexdigest() for name in closure}}
+    record = {'revision': revision, 'git_archive_autocrlf': False, 'git_archive_eol': 'lf',
+              'all_tracked_blobs_verified': True, 'entries': bindings}
+    with binding_path.open('x', encoding='utf-8') as output:
+        output.write(json.dumps(record, sort_keys=True, indent=2)+'\n')
+    return record
+
+
+def verify_git_snapshot(directory, binding):
+    for relative, record in binding['entries'].items():
+        path = directory/relative
+        actual_link = os.readlink(path) if path.is_symlink() else None
+        if actual_link != record['physical_symlink_target'] or digest(path) != record['materialized_sha256']:
+            raise RuntimeError('Frozen Git source or symlink changed: '+relative)
 
 
 def includes(source):
