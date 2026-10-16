@@ -1,5 +1,206 @@
 # Cache reliability remediation
 
+## 2026-10-16 candidate 3.2.691 and single-UTM validation accepted with limits
+
+The deployed Agent source is `b178608ffb3cbaf32615f8a6f6e32ec6cba54622`,
+not a later documentation commit. Candidate release `win_3.2.691`, release
+414491995, was published by run
+[38843805355](https://github.com/qiuxinliang/edr-agent/actions/runs/38843805355).
+All seven jobs succeeded. Both architectures executed 114 unique native tests
+(101 release plus 13 remaining telemetry cases), with no skipped cases. Both
+Setup UI build steps were skipped. The published asset set contains exactly
+six files: Agent EXE, manifest and Headless ZIP for each architecture. This host
+downloaded only the three ARM64 files. GitHub latest remains `win_3.2.591`.
+
+Actual lifecycle summaries additionally prove the published 3.2.687 baseline:
+each architecture completed the source-defined 20 Setup events, including
+fresh installation, baseline repair, upgrade, real rollback and uninstall;
+`setup_rollback_skipped=false`. Native runtime installation, upgrade, embedded
+updater, rollback and native uninstall all passed. Only allowlisted summary
+fields were retained; artifact ZIPs, diagnostic bodies and environment blocks
+were not saved. These are CI runner results, not a rollback performed on the UTM.
+
+The authorized local API deployment uses backend source
+`f8f5d4a256899f8ee4d4c525b4bef299470acdfd`. Its existing startup owner, verified
+TLS and separate worker were preserved as documented below. Headless import
+does not create rollout tasks. The UI imported the verified ARM64 bundle and
+then submitted exactly one upgrade for the existing demo-tenant UTM. The task
+was manually bound from its unique endpoint/version/UI-time-window row, rather
+than the bulk response's newly generated display task ID. Actual dispatch used
+attempt 1, `installer_required`, and derived protocol-5 package 248; that
+package's digest differs intentionally from the downloaded Headless ZIP.
+
+The six contiguous dedicated upgrade events, their immutable artifact/package
+pins and the local ACK checkpoint agree at seq 6. The terminal local journal
+succeeded. Its installer-log identity, SHA-256 and 4,096-byte length match the
+backend's redacted durable index; no raw installer log was exported. The worker
+completed the same task at `2026-10-16T04:03:42.635Z`, after the unchanged
+health window `03:58:42.633Z` to `04:03:42.633Z`. A later fresh heartbeat reports
+3.2.691, control connected, offline queue pending 0 and no current integrity,
+maintenance or command-owner persistence failures. This is the worker's
+deadline/fresh-health acceptance, not continuous measurement of every instant
+in the 300-second window. The previous process's cumulative errors are not
+erased or compared with the new process's counters as if they were one series.
+
+The native process check independently bound PID 8860, ARM64 PE/process identity,
+the exact creation FILETIME string `134365967271592798`, and EXE SHA-256
+`d7d2da2e5d8c16e5bce65dbd0c0feb73b1617b8475ebdb2be9d221531de85613`.
+The generation is later than the UI action by an exact integer comparison.
+The original three frozen queue-owner projections remain exactly equal to the
+pre-upgrade baseline, and all nine ledger categories match recomputed costs and
+counts. The bounded post-check took 1,172 ms, returned 30 rows and hashed
+6,669,730 bytes. New source-audit counters report one row/2,164 bytes; this
+observation does not certify complete source context. Probe filenames retaining
+`690` are the frozen diagnostic owner contract; their actual binary binding is
+691, not the failed 690 candidate. No evidence DB or replacement owner was read.
+
+The generic-result comparator for this upgrade returned exit 3 and zero rows;
+that result remains unchanged. The 92-byte local final exactly matches the
+source-defined `edr.command.status.v1` projection. The plain `agent_update_`
+producer has no SOAR/playbook association and uses the dedicated upgrade-event
+consumer. `command_should_report` separately selects the `cmd_`/SOAR route
+(or explicit debug opt-in). Consequently the generic table is not this plain
+upgrade's receipt. Its zero rows are not a generic ACK, nor a reason to add
+another upload. Current producer/source classification was reviewed separately;
+actual process environment overrides were not exported. The previously accepted
+390-byte RTQ receipt belongs to another command and is not a new691 RTQ test.
+
+### Retention, pressure and migration interpretation
+
+Code defaults target 24 hours of recent detail and the longer selected window
+derived from offline retention (normally 72 hours). The UTM retains its existing
+configuration: recent and selected targets are both 72 hours, and evidence DB
+admission is configured to 512 MiB. The queue's separate 512 MiB remains its
+logical budget; the evidence DB code default remains 128 MiB. Neither number
+is an Agent-directory physical quota. Before
+upgrade the evidence store was already near its budget and rejecting candidates.
+At the final snapshot it occupied 536,756,328 bytes including measured physical
+components; the new process reported 8 candidate requests, 8 admissions, no
+refusals and 15 groups retired by normal retention policy. This short snapshot
+does not guarantee future capacity or 72 hours under every input load.
+
+No manual cache clearing or legacy migration was performed. Normal maintenance
+can retire already-classified eligible groups. Unclassified legacy owners remain
+protected and separately accounted, and can still prevent ordinary admissions.
+The reported 7,950 legacy candidates are an aggregate, not preservation evidence
+for every row or its causal chain. The two historically missing evidence samples
+were not replaced and cannot be retrospectively certified. Upgrade/rollback
+does not grant permission to classify or delete ambiguous old payloads. Future
+legacy migration or permanent manual disposal still needs its separate plan and
+authorization; old frozen bytes and identities must remain unchanged.
+
+Critical delivery and journal reservations are finite and cannot be borrowed by
+ordinary evidence. At the default queue budget the existing terminal rule yields
+4 MiB, while the source-recovery reserve is bounded at 530,552 bytes. These
+compatibility defaults and measured frame floors are not a field peak-rate times
+business-window sizing proof. If protected owners or pins exhaust their bounds,
+ordinary admission is refused visibly; if reliable action/result durability
+cannot be reserved, actions fail at their existing safety boundary. Capacity is
+not restored by sending all local facts or fabricating ACKs. Volume-free guards
+and bounded stores remain shared with SQLite/WAL/filesystem failure domains;
+`directory_hard_limit=false` is explicitly reported.
+
+Routine egress remains `minimal-egress-v4` with the existing `basic` health
+profile. The actual encoding/final-gate and loopback mTLS native tests support
+the minimization claim; this deployment did not independently capture every
+packet or network ACK. The local cached-evidence RTQ producer is still not
+exposed in the UI/backend; its authorized interface/tests are not an end-to-end
+live cached query. No new long-lived remote permission was created.
+
+The f8 normal client event/log/ACK consumer completed in the field. However,
+the bounded state observation started at `health_check/seq6`; it did not directly
+capture the pre-late-event `health_check/seq4` state or every deadline field.
+The accepted event times are consistent with the repaired order, but this is not
+full field coverage of the late-event, NULL-installing or TOCTOU race branches.
+Those rely on the separately recorded real MySQL barrier/transaction tests.
+Other remaining limits include a wall-clock soak, device-level I/O attribution,
+hardware power loss and deliberate live Windows full-disk/clock/long-reader
+fault injection. Synthetic and process-crash coverage is not relabeled as those
+field tests. The defined single-UTM deployment is accepted; all broad field
+criteria are not claimed closed.
+
+The final evidence index is
+`/private/tmp/edr-678-client-acceptance/ROOT_691_RELEASE_CLIENT_ACCEPTANCE.json`,
+SHA-256 `6429f9d4819b17a517c369d7d211dd10e3252d1e8ff62e9cf1e19444633cff9b`.
+It binds 27 original inputs, including the unchanged exit-3 comparison, actual
+task/receipt/health, bounded preservation result and completed UI screenshot.
+Headless pin SHA-256 is
+`072a56ce348e89ca86ae8b10f6b42a67df461c7df35803b94646a9e2b826aa00`;
+the actual lifecycle summary proof is
+`f5ebe5ebce2298978576fd1f31c2b5c2ea93db2e0b6be43fc4ed91fc06d5dbc1`.
+Earlier pending/failed entries below remain historical snapshots.
+
+### Actual b178 native comparison and measured costs
+
+Source `b178608ffb3cbaf32615f8a6f6e32ec6cba54622` completed native comparison
+run [38841307129](https://github.com/qiuxinliang/edr-agent/actions/runs/38841307129)
+on AMD64 and ARM64. This closes the earlier preflight omission: the real native
+release and telemetry executables were built and executed before measurements.
+The 26-case dependency-graph regression remains a separate, narrower check.
+The production tree's 1,072 tracked entries match the previously verified runtime;
+this source adds fixture, runner, workflow and documentation corrections.
+
+Each architecture passed exactly 101 release tests and 13 remaining telemetry
+contracts: 114 unique test names, 228 executions across both architectures.
+The 39 telemetry declarations overlap 26 release tests; those run only once.
+Both per-architecture JUnit files (four files total) were checked against the source-derived inventory,
+with no missing, duplicate, extra, failed, disabled or skipped test cases.
+The rule audit passed all 150 exact source cases on each architecture, with
+its native-kernel/PE architecture guard enabled. This is constructed-event PCRE2
+replay, not native sensor collection or an endpoint process-generation proof.
+
+All four synthetic ZIP artifacts were checked by digest, path/type bounds and
+CRC, including every extracted member; the two measurement ZIPs contain 105
+files each and the two contract ZIPs contain four files each. Root acceptance
+rehashed all 265 indexed supporting evidence files. This is evidence-file
+integrity, not 265 tests. The workloads contain 30 evidence and 16 queue
+executions, all successful without timeout, and 192 queue-window inventories.
+
+P0 source binding came only from two strictly allowlisted CI environment fields,
+not from `verify-p0-inputs` stdout. Both logs reported the same fixed private
+ref `896eb2f06c9ffa608085217d4d1e84494b43e564` and aggregate SHA-256
+`4fe0f9d1d199c95c1e6ce33ce4422d5352c0653369a1b5cc8e875cc678c7a62b`.
+The canonical verification step and its source were bound to the actual jobs.
+Missing, malformed, conflicting or out-of-environment observations cannot become
+verified metadata. Raw decoded logs were hashed inside V8; environment blocks
+and credentials were removed before any disk write. These selected fields are
+not an independent AEAD recheck, sensor-generation attestation or invented stdout.
+
+The exact-run measurement costs remain material:
+
+The 1 h and 4 h columns are fixture policy settings, not deployed defaults or fixed coverage guarantees.
+
+| Evidence workload: 8 MiB, 192 candidates plus 48 context inputs | Old 1 h | Current 1 h | Current 4 h |
+| --- | ---: | ---: | ---: |
+| Embedded complete parent chains | 0 | 6 | 24 |
+| Reconstructable chains including process cache | 6 | 6 | 24 |
+| Selected first-to-last event span, seconds | 20 | 20 | 10,820 |
+| Sampled DB/WAL/SHM peak, bytes | 2,305,312 | 3,272,648 | 3,379,192 |
+| SQLite VFS issued writes, bytes | 17,364,348 | 41,859,900 | 39,641,320 |
+| AMD64 median process CPU, seconds | 0.484375 | 1.109375 | 1.125 |
+| ARM64 median process CPU, seconds | 0.5 | 1.296875 | 1.328125 |
+
+The unique-input queue comparison uses the same 1 MiB logical budget and offered
+wire stream. Freshest retained age changes from 36,070 to 120 seconds, exact
+successful retries from 0 to 33, and the 20-byte terminal payload from refusal
+to admission with exact readback. Sampled physical peak rises from 1,557,176 to
+5,166,168 bytes and issued VFS writes from 1,524,932 to 20,038,348 bytes (13.14x).
+AMD64 CPU rises from 0.203125 to 0.453125 seconds; ARM64 from 0.171875 to 0.40625.
+The old variant stalls while current code continues admissions, retries and
+maintenance. These are equal-offered-input workload outcomes, not equal completed
+work or isolated per-event overhead. VFS/process-issued I/O is not device I/O.
+Eight simulated event hours and twelve queue windows are not a wall-clock soak;
+10,820 seconds of selected cohorts is not continuous four-hour coverage.
+The deliberate missing-RAM `owner_loss` control remains recovery-held. Real
+producer ownership/crash regressions are separate contracts. No local-fact
+upload or synthetic ACK is used to obtain rotation. Defaults remain retention
+targets, and neither the logical queue budget nor these peaks define a directory quota.
+
+Primary comparison proofs: `/private/tmp/edr-native-b178-monitor-oum6lfsv/ROOT_ACCEPTANCE.json`
+(SHA-256 `6609a35db219c810008311df3f348ef4cf6d9343bcf4eba423c6add925c7c219`)
+and `/private/tmp/edr-b178-comparison-safe-capture-6b_3plww/ROOT_LOG_ACCEPTANCE.json`
+(SHA-256 `1ff78afed795a53cc20fe3bc23c2090e86e7e4ab598b4838d08223c8d1a3e82d`).
+
 ## 2026-10-16 real fixture link repaired; native preflight coverage expanded
 
 Source `de50fc52855c40e26b65e744f5241b5b2ab14725` passed native storage
