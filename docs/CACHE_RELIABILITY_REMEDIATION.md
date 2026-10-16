@@ -97,8 +97,15 @@ blob/link closure, and on Windows materializes verified target bytes. Eleven
 export/failure boundaries plus complete host runner smoke protocols pass;
 manifest `/private/tmp/edr-native-b783-symlink-zw3yw1k2/RESULTS.json`, SHA-256
 `688c516821b8f0eb0fb01f06014fdb275cb6a4d5a7a220aee5371a15606fe716`.
-A new source-pinned native AMD64/ARM64 run remains required before interpreting
-Windows CPU/I/O or publishing the repaired client candidate. Simulated windows,
+Run 38828995933 at repaired runtime source `9547f675` passed the Windows
+baseline export and completed five old-variant AMD64 samples, but the current
+variant did not compile: MSVC C5102 ignored a function-style `/D BENCH_OPEN`
+and C4013 then rejected its call. The same macro now lives in the existing
+current-variant C branch; policy hours and workload assertions are unchanged.
+Fifteen fresh host samples (three variants, five each) and three MSVC argv
+branch checks passed; this is not native execution. Original partial measurements
+remain partial. A new source-pinned native AMD64/ARM64 run remains required
+before interpreting Windows CPU/I/O or publishing the repaired client candidate. Simulated windows,
 issued I/O and sampled file peaks do not prove elapsed soak duration or device
 write amplification.
 

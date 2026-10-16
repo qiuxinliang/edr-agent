@@ -114,8 +114,7 @@ for name, source, selected in [('old',old,1), ('current_1h',current,1), ('curren
     selected_defines = list(defines)
     if source == current:
         selected_defines += ['BENCH_REAL_QUEUE=1', 'BENCH_SOURCE="current"',
-                    'BENCH_SELECTED_HOURS='+str(selected),
-                    'BENCH_OPEN(path,selected)=edr_local_evidence_cache_open_with_policy(path,8,1,selected)']
+                    'BENCH_SELECTED_HOURS='+str(selected)]
     include_paths = [source/folder for folder in
         ('.','include','third_party/cjson','third_party/nanopb','src/proto','third_party/lz4')]
     binary = out/(name+'_benchmark'+('.exe' if os.name == 'nt' else ''))

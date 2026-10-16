@@ -185,6 +185,8 @@ static int64_t compact_scalar(sqlite3 *db, const char *sql) {
 #define BENCH_SOURCE "old_head"
 #define BENCH_SELECTED_HOURS 1
 #define BENCH_OPEN(path,selected) edr_local_evidence_cache_open(path,8,1)
+#else
+#define BENCH_OPEN(path,selected) edr_local_evidence_cache_open_with_policy(path,8,1,selected)
 #endif
 #include "retention_benchmark_support.h"
 
