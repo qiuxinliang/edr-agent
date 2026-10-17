@@ -235,6 +235,40 @@ assertions; synchronous writer/reader failure fixtures preserve owner hashes,
 report refusal, retain the minute backoff and recover after bounded polls.
 Windows gates and UTM execution must be reported separately for the new commit.
 
+A second native run, `38992350718` / `4c0f0c78`, passed AMD64 release
+101/101 and telemetry 13/13 execution records. ARM64 passed the original
+sliced, slow-checkpoint and synchronous-refusal contracts, then failed the
+separate live-capacity convergence assertion after its unchanged 128 owner
+turns. The 3.2.693 Headless candidate run was cancelled before publication;
+its lifecycle stage was skipped. These results do not authorize an ARM64 soak.
+
+Controlled host counterfactuals retained the same production I/O results and
+original assertions. Delaying main-DB sync by 30 ms still converged; adding
+1 ms to main-DB reads exposed a live-retirement stall. Eager selection could
+spend the cooperative deadline collecting IDs before processing a group.
+Streaming indexed keyset selection restored inspection progress, but ordinary
+unexpired-row inspection still consumed the turn before pressure work.
+The repair processes one selected group before selecting another and uses
+the existing candidate stage for pressure only after actual live pages exceed
+the existing target and hard-over/pending pressure is established. Allocated
+free pages alone never authorize capacity eviction. The same whole-group,
+owner, floor, row/byte/time and commit-only cursor guards remain in force.
+
+The artificial 1 ms-per-read full diagnostic still does not meet its original
+128-turn final-size assertion, although real pressure retirement now progresses.
+That failure is retained as a throughput boundary, not relabelled as a pass.
+A separate fixed-turn liveness/protection regression and the unchanged normal
+convergence fixture verify different contracts; native results must establish
+the normal fixture separately. No unlimited-load or arbitrary-I/O-latency
+convergence guarantee follows from bounded work slices.
+
+Failed-gate private diagnostics now permit precisely two fixed CLIs: sliced
+reclaim and capacity reclaim. They still cannot run a long soak or certify
+acceptance. Both ARM64 contracts are repeated twelve times after the actual
+native suites; the workflow stops at the first failure. Existing packaging,
+Release/PE/DLL/source/hash checks, separate failed artifact identity and the
+native gate remain required.
+
 At this source commit, host checks and short real-clock smoke runs are
 available; native Windows CI, the two-window UTM load and isolated recovery
 results are still pending and must be appended as separate acceptance evidence.

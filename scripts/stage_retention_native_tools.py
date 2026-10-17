@@ -4,7 +4,7 @@
 This is a private CI diagnostic artifact, not an Agent/installer/release payload.
 The fixture uses real storage/query owners but has test-only rule matcher stubs.
 The caller supplies the actual prior native-contract outcome. Failed-gate tools
-are limited to isolated sliced-reclaim reproduction, never acceptance evidence.
+are limited to the two fixed reclaim reproductions, never acceptance evidence.
 Staging success is not a native-contract or later comparison result.
 """
 import argparse
@@ -231,9 +231,10 @@ def stage(args):
     if not prior_passed:
         # This restriction is consumed by the private supervisor, not by any
         # product/release owner. The workflow must preserve its gate failure.
-        manifest["allowed_diagnostic_argv"] = [["--sliced-reclaim-contract"]]
+        manifest["allowed_diagnostic_argv"] = [["--sliced-reclaim-contract"],
+                                               ["--capacity-reclaim-contract"]]
         manifest["limitations"] += ["prior_native_contracts_failed",
-                                    "isolated_sliced_reclaim_reproduction_only",
+                                    "isolated_sliced_and_capacity_reclaim_reproduction_only",
                                     "not_long_soak_or_release_acceptance"]
     output = Path(os.path.abspath(args.output))
     real_path(output.parent, directory=True)

@@ -1,6 +1,6 @@
 # Native contracts and storage comparisons before a candidate release. Contract
 # dependencies are built; private compiled tools preserve their actual gate outcome.
-# Failed-gate tools are restricted to isolated sliced-reclaim reproduction.
+# Failed-gate tools are restricted to the two fixed isolated reclaim contracts.
 # No product packaging, installation, release or endpoint access.
 name: Evidence retention native comparison
 
@@ -161,7 +161,7 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
-      - name: Repeat the ARM64 sliced-reclaim contract
+      - name: Repeat the ARM64 bounded-reclaim contracts
         id: sliced
         if: ${{ matrix.arch == 'arm64' }}
         timeout-minutes: 5
@@ -175,14 +175,15 @@ jobs:
           logs = pathlib.Path(os.environ['RUNNER_TEMP'])/'retention-sliced-contract'
           logs.mkdir(exist_ok=False)
           for index in range(12):
-              with (logs/f'case-{index:02d}.log').open('xb') as output:
-                  result = subprocess.run([str(root/'contract-build/tests/test_local_evidence_cache_candidate.exe'), '--sliced-reclaim-contract'], stdout=output, stderr=subprocess.STDOUT, timeout=180)
-              print(f'sliced_contract_run={index+1} return_code={result.returncode}', flush=True)
-              if result.returncode:
-                  raise SystemExit(1)
+              for label, argv in [('sliced', '--sliced-reclaim-contract'), ('capacity', '--capacity-reclaim-contract')]:
+                  with (logs/f'case-{label}-{index:02d}.log').open('xb') as output:
+                      result = subprocess.run([str(root/'contract-build/tests/test_local_evidence_cache_candidate.exe'), argv], stdout=output, stderr=subprocess.STDOUT, timeout=180)
+                  print(f'{label}_contract_run={index+1} return_code={result.returncode}', flush=True)
+                  if result.returncode:
+                      raise SystemExit(1)
           '@
           python -B -c $probe
-          if ($LASTEXITCODE -ne 0) { throw 'ARM64 sliced-reclaim contract failed; inspect the first failure log' }
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 bounded-reclaim contract failed; inspect the first failure log' }
       - name: Stage the compiled private native diagnostic tool
         id: native-tools
         if: ${{ always() && (steps.contracts.outcome == 'success' || steps.contracts.outcome == 'failure') }}

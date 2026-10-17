@@ -2171,6 +2171,70 @@ static void classify_pressure_fixture_groups(sqlite3 *db, const char *prefix) {
   assert(sql); assert(sqlite3_exec(db,sql,NULL,NULL,NULL)==SQLITE_OK); sqlite3_free(sql);
 }
 
+typedef struct {
+  uint64_t wall_us, runs, retired, held, failures, active_ms, db_bytes, wal_bytes;
+  unsigned clock_valid, clock_cause;
+} CapacityReclaimTurn;
+
+static sqlite3_int64 sliced_diagnostic_scalar(sqlite3 *db, const char *sql);
+static void capacity_reclaim_slow_boundary(int enabled);
+
+static CapacityReclaimTurn capacity_reclaim_turn(const EdrEvidenceCacheStatus *status,
+                                                uint64_t wall_us) {
+  CapacityReclaimTurn turn = {wall_us,status->maintenance_runs,status->retention_groups_retired,
+      status->retention_groups_held,status->retention_failures,status->retention_active_ms,
+      status->db_bytes,status->wal_bytes,status->retention_clock_valid,status->retention_clock_cause_code};
+  return turn;
+}
+
+/* Diagnostic-only SQL never substitutes a value or failure for the original
+ * contract assertions. Print a bounded numeric trace only after nonconvergence. */
+static void capacity_reclaim_failure(const char *path, unsigned phase, unsigned turns,
+    uint64_t started, const EdrEvidenceCacheStatus *status, const CapacityReclaimTurn *trace) {
+  sqlite3 *db = NULL;
+  sqlite3_int64 pages=-1, free_pages=-1, page_size=-1, rows=-1, bulk=-1, command_bytes=-1;
+  if (sqlite3_open_v2(path,&db,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK) {
+    pages=sliced_diagnostic_scalar(db,"PRAGMA page_count");
+    free_pages=sliced_diagnostic_scalar(db,"PRAGMA freelist_count");
+    page_size=sliced_diagnostic_scalar(db,"PRAGMA page_size");
+    rows=sliced_diagnostic_scalar(db,"SELECT COUNT(*) FROM p0_candidates");
+    bulk=sliced_diagnostic_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id LIKE 'bulk-%'");
+    command_bytes=sliced_diagnostic_scalar(db,"SELECT COALESCE(SUM(length(CAST(cmdline AS BLOB))),0) FROM p0_candidates WHERE candidate_id LIKE 'bulk-%'");
+  }
+  if (db) sqlite3_close(db);
+  uint64_t max_wall=0, total_wall=0;
+  for (unsigned i=1;i<=turns;++i) {
+    if (trace[i].wall_us>max_wall) max_wall=trace[i].wall_us;
+    total_wall+=trace[i].wall_us;
+  }
+  fprintf(stderr,"capacity_reclaim_failure phase=%u turns=%u real_wall_us=%llu poll_total_wall_us=%llu poll_max_wall_us=%llu sqlite_version=%s page_size=%lld pages=%lld free_pages=%lld live_bytes=%lld candidate_rows=%lld bulk_rows=%lld bulk_command_bytes=%lld cursor_observable=0",
+      phase,turns,(unsigned long long)((soak_monotonic_ns()-started)/1000u),
+      (unsigned long long)total_wall,(unsigned long long)max_wall,sqlite3_libversion(),
+      (long long)page_size,(long long)pages,(long long)free_pages,
+      (long long)(pages>=free_pages && free_pages>=0 && page_size>0 ? (pages-free_pages)*page_size : -1),
+      (long long)rows,(long long)bulk,(long long)command_bytes);
+#define CAPACITY_STATUS(field) fprintf(stderr," " #field "=%llu",(unsigned long long)status->field)
+  CAPACITY_STATUS(db_bytes); CAPACITY_STATUS(wal_bytes); CAPACITY_STATUS(shm_bytes);
+  CAPACITY_STATUS(db_capacity_evicted); CAPACITY_STATUS(maintenance_runs);
+  CAPACITY_STATUS(retention_groups_retired); CAPACITY_STATUS(retention_groups_held);
+  CAPACITY_STATUS(retention_failures); CAPACITY_STATUS(retention_clock_valid);
+  CAPACITY_STATUS(retention_clock_cause_code); CAPACITY_STATUS(retention_clock_failures);
+  CAPACITY_STATUS(retention_active_ms); CAPACITY_STATUS(physical_refusals);
+  CAPACITY_STATUS(physical_guard_failures); CAPACITY_STATUS(physical_cause_code);
+#undef CAPACITY_STATUS
+  fprintf(stderr," cause=%.159s\n",status->last_error);
+  for (unsigned i=0;i<=turns;++i) {
+    if (i>=4u && i%16u && i+8u<=turns) continue;
+    const CapacityReclaimTurn *t=&trace[i];
+    fprintf(stderr,"capacity_reclaim_turn phase=%u turn=%u wall_us=%llu runs=%llu retired=%llu held=%llu failures=%llu active_ms=%llu clock_valid=%u clock_cause=%u db_bytes=%llu wal_bytes=%llu\n",
+        phase,i,(unsigned long long)t->wall_us,(unsigned long long)t->runs,
+        (unsigned long long)t->retired,(unsigned long long)t->held,(unsigned long long)t->failures,
+        (unsigned long long)t->active_ms,t->clock_valid,t->clock_cause,
+        (unsigned long long)t->db_bytes,(unsigned long long)t->wal_bytes);
+  }
+  fflush(stderr);
+}
+
 /* Freed pages are reclaimable space, not live evidence to evict. Exercise
  * reopen maintenance using a real SQLite file, without touching a live cache. */
 static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
@@ -2180,6 +2244,8 @@ static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
   EdrEvidenceCacheStatus status;
   sqlite3 *raw = NULL;
   char *error = NULL;
+  CapacityReclaimTurn trace[129];
+  unsigned turns; uint64_t phase_started;
 
   assert(make_test_sqlite_path(db, sizeof(db)) == 0);
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
@@ -2207,12 +2273,17 @@ static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
   sqlite3_free(error);
   assert(sqlite3_close(raw) == SQLITE_OK);
 
+  phase_started=soak_monotonic_ns();
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
-  edr_local_evidence_cache_get_status(&status);
-  for(unsigned slice=0;slice<128 && status.db_bytes+status.wal_bytes>1048576;++slice) {
+  edr_local_evidence_cache_get_status(&status); trace[0]=capacity_reclaim_turn(&status,0);
+  for(turns=0;turns<128 && status.db_bytes+status.wal_bytes>1048576;++turns) {
     s_test_monotonic_ns+=60000000000ULL;
+    uint64_t poll_started=soak_monotonic_ns();
     edr_local_evidence_cache_poll_maintenance();edr_local_evidence_cache_get_status(&status);
+    trace[turns+1u]=capacity_reclaim_turn(&status,(soak_monotonic_ns()-poll_started)/1000u);
   }
+  if (status.db_bytes+status.wal_bytes>1048576u)
+    capacity_reclaim_failure(db,1u,turns,phase_started,&status,trace);
   assert(status.db_capacity_evicted == 0u);
   assert(sqlite_table_count(db, "p0_candidates") == 1u);
   assert(status.db_bytes + status.wal_bytes <= 1024u * 1024u);
@@ -2232,12 +2303,19 @@ static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
   sqlite3_free(error);
   assert(sqlite3_close(raw) == SQLITE_OK);
   assert(sqlite_table_count(db, "p0_candidates") == 1101u);
+  phase_started=soak_monotonic_ns();
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
-  edr_local_evidence_cache_get_status(&status);
-  for(unsigned slice=0;slice<128 && status.db_bytes+status.wal_bytes>1048576;++slice) {
+  edr_local_evidence_cache_get_status(&status); trace[0]=capacity_reclaim_turn(&status,0);
+  capacity_reclaim_slow_boundary(1);
+  for(turns=0;turns<128 && status.db_bytes+status.wal_bytes>1048576;++turns) {
     s_test_monotonic_ns+=60000000000ULL;
+    uint64_t poll_started=soak_monotonic_ns();
     edr_local_evidence_cache_poll_maintenance();edr_local_evidence_cache_get_status(&status);
+    trace[turns+1u]=capacity_reclaim_turn(&status,(soak_monotonic_ns()-poll_started)/1000u);
   }
+  capacity_reclaim_slow_boundary(0);
+  if (status.db_bytes+status.wal_bytes>1048576u)
+    capacity_reclaim_failure(db,2u,turns,phase_started,&status,trace);
   assert(status.db_capacity_evicted > 0u);
   assert(sqlite_table_count(db, "p0_candidates") < 1101u);
   assert(sqlite_scalar_integer(db, "SELECT COUNT(*) FROM artifacts a WHERE a.candidate_id LIKE 'bulk-%' "
@@ -7403,9 +7481,50 @@ static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_s
 static int retention_raise_floor_on_write;
 static unsigned retention_checkpoint_delay_ms;
 static uint64_t retention_delayed_checkpoint_syncs;
+static unsigned retention_main_read_delay_ms;
+static int retention_main_read_high_resolution;
+static uint64_t retention_high_resolution_reads, retention_read_delay_min_ns, retention_read_delay_max_ns;
+static unsigned capacity_checkpoint_delay_ms, capacity_main_read_delay_ms;
+
+static void capacity_reclaim_slow_boundary(int enabled) {
+  retention_checkpoint_delay_ms=enabled ? capacity_checkpoint_delay_ms : 0u;
+  retention_main_read_delay_ms=enabled ? capacity_main_read_delay_ms : 0u;
+}
 #define BENCH_FILE(f) (((RetentionBenchFile *)(f))->real)
 static int bench_close(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xClose(BENCH_FILE(f)); }
-static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) { retention_bench_reads+=(unsigned)n; return BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o); }
+static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) {
+  int measured=retention_main_read_delay_ms && retention_main_read_high_resolution &&
+      ((RetentionBenchFile *)f)->main_database;
+  uint64_t read_started=measured ? soak_monotonic_ns() : 0u;
+  if (retention_main_read_delay_ms && ((RetentionBenchFile *)f)->main_database) {
+    if (retention_main_read_high_resolution) {
+      uint64_t started=soak_monotonic_ns(), elapsed;
+      /* A real, test-only latency boundary, not a simulated deadline. Keep
+       * Sleep(1) granularity out of the registered progress contract. CPU
+       * preemption may still overrun: record actual bounds, not hard realtime. */
+      do { elapsed=soak_monotonic_ns()-started; }
+      while (elapsed<(uint64_t)retention_main_read_delay_ms*1000000u);
+    } else {
+#if defined(_WIN32)
+      Sleep(retention_main_read_delay_ms);
+#else
+      struct timespec delay={0,(long)retention_main_read_delay_ms*1000000L};
+      nanosleep(&delay,NULL);
+#endif
+    }
+  }
+  retention_bench_reads+=(unsigned)n;
+  int result=BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o);
+  if (measured) {
+    /* Include both the imposed wait and the actual underlying filesystem read. */
+    uint64_t elapsed=soak_monotonic_ns()-read_started;
+    if (!retention_high_resolution_reads || elapsed<retention_read_delay_min_ns)
+      retention_read_delay_min_ns=elapsed;
+    if (elapsed>retention_read_delay_max_ns) retention_read_delay_max_ns=elapsed;
+    ++retention_high_resolution_reads;
+  }
+  return result;
+}
 static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
   /* Explicit test boundary: policy changes after admission but before the
    * post-commit WAL hook. No free-space query or SQLite result is fabricated. */
@@ -7460,6 +7579,24 @@ static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *fi
   return rc;
 }
 #undef BENCH_FILE
+
+static void test_capacity_reclaim_with_slow_io(unsigned checkpoint_ms, unsigned read_ms) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="capacity-reclaim-slow-io"; vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile); vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  capacity_checkpoint_delay_ms=checkpoint_ms; capacity_main_read_delay_ms=read_ms;
+  uint64_t syncs_before=retention_delayed_checkpoint_syncs;
+  test_capacity_reclaims_free_pages_before_evicting_candidates();
+  if (checkpoint_ms) assert(retention_delayed_checkpoint_syncs>syncs_before);
+  printf("capacity_reclaim_slow_io checkpoint_ms=%u main_read_ms=%u delayed_checkpoint_syncs=%llu\n",
+      checkpoint_ms,read_ms,(unsigned long long)(retention_delayed_checkpoint_syncs-syncs_before));
+  capacity_checkpoint_delay_ms=capacity_main_read_delay_ms=0u;
+  capacity_reclaim_slow_boundary(0);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
 
 static void test_capacity_progress_with_slow_checkpoint(void) {
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
@@ -10265,9 +10402,14 @@ static void parent_fixture_owner_hash(sqlite3 *db, uint32_t pid, char hash[65]) 
       "SELECT json_array(p.candidate_id,p.endpoint_id,p.tenant_id,p.pid,p.ppid,p.event_time_ns,"
       "p.process_start_key,p.process_creation_filetime_100ns,p.subject_command_fact_id,"
       "p.parent_command_fact_id,p.alert_context_protect_until_active_ms,r.artifact_id,"
-      "r.fact_id,f.manifest_template_json) FROM p0_candidates p "
+      "r.fact_id,f.manifest_template_json,b.artifact_id,b.endpoint_id,b.tenant_id,"
+      "b.candidate_id,b.artifact_type,b.path,b.sha256,b.manifest_json,b.created_ns,"
+      "b.upload_status,b.minio_key) FROM p0_candidates p "
       "JOIN context_reference_projection r ON r.artifact_id=p.candidate_id||':alert_parent_context' "
       "JOIN context_facts f ON f.fact_id=r.fact_id "
+      "JOIN artifacts b ON b.artifact_id=p.candidate_id||':p0_context_bundle:candidate' "
+      "AND b.candidate_id=p.candidate_id AND b.endpoint_id=p.endpoint_id "
+      "AND b.tenant_id=p.tenant_id AND b.artifact_type='p0_context_bundle' "
       "WHERE p.endpoint_id='synthetic-floor-endpoint' AND p.tenant_id='synthetic-floor-tenant' AND p.pid=?1";
   assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
   assert(sqlite3_bind_int64(st, 1, pid) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
@@ -10275,6 +10417,100 @@ static void parent_fixture_owner_hash(sqlite3 *db, uint32_t pid, char hash[65]) 
   int bytes = sqlite3_column_bytes(st, 0); assert(value && bytes > 0);
   assert(edr_sha256_hex(value, (size_t)bytes, hash) == 0);
   assert(sqlite3_step(st) == SQLITE_DONE); sqlite3_finalize(st);
+}
+
+/* A finite progress contract under controlled 1ms reads, not a promise that
+ * arbitrary I/O converges to the hard budget in a fixed number of turns. */
+static void test_capacity_reclaim_bounded_progress_preserves_parent_floor(void) {
+  char path[512], original_hash[65], current_hash[65]; sqlite3 *db=NULL;
+  EdrBehaviorRecord *original=calloc(1u,sizeof(*original)); assert(original);
+  struct timespec stamp; assert(timespec_get(&stamp,TIME_UTC)==TIME_UTC);
+  int64_t now=(int64_t)stamp.tv_sec*INT64_C(1000000000)+stamp.tv_nsec;
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  init_floor_parent(original,now);
+  EdrCommandFacts facts={original->cmdline,original->parent_cmdline};
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,1u)==0);
+  assert(edr_local_evidence_cache_record_alert_context(original,&facts)==0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1100) "
+      "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,cmdline,created_ns,context_post_until_ns,retention_policy_version,retention_value_class,retention_value_reason) "
+      "SELECT 'bulk-' || x,'pressure-endpoint','pressure-tenant',(SELECT MAX(event_time_ns) FROM p0_candidates),"
+      "printf('%02500d',x),CAST(strftime('%s','now') AS INTEGER)*1000000000,1,1,1,'recent_detail' FROM n;"
+      "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,manifest_json,created_ns,upload_status,minio_key) "
+      "SELECT candidate_id||':p0_context_bundle:candidate',endpoint_id,tenant_id,candidate_id,'p0_context_bundle','{}',created_ns,'local_manifest','' "
+      "FROM p0_candidates WHERE candidate_id LIKE 'bulk-%';");
+  assert(sqlite3_close(db)==SQLITE_OK);
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="bounded-progress-high-resolution-read"; vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile); vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,1u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  parent_fixture_owner_hash(db,original->pid,original_hash);
+  EdrParentContextQuery query=floor_query(original,now);
+  parent_pressure_query(&query,"bounded_progress_before",1);
+  EdrEvidenceCacheStatus before,after;
+  edr_local_evidence_cache_get_status(&before);
+  assert(before.db_bytes+before.wal_bytes>1048576u && before.retention_clock_valid);
+  CapacityReclaimTurn trace[17]; trace[0]=capacity_reclaim_turn(&before,0);
+  uint64_t started=soak_monotonic_ns();
+  retention_high_resolution_reads=retention_read_delay_min_ns=retention_read_delay_max_ns=0;
+  retention_main_read_high_resolution=1; retention_main_read_delay_ms=1u;
+  for (unsigned turn=0;turn<16u;++turn) {
+    s_test_monotonic_ns+=UINT64_C(60000000000);
+    uint64_t poll_started=soak_monotonic_ns();
+    edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
+    trace[turn+1u]=capacity_reclaim_turn(&after,(soak_monotonic_ns()-poll_started)/1000u);
+  }
+  retention_main_read_delay_ms=0; retention_main_read_high_resolution=0;
+  if (after.retention_groups_retired<=before.retention_groups_retired)
+    capacity_reclaim_failure(path,3u,16u,started,&after,trace);
+  assert(retention_high_resolution_reads>0u && retention_read_delay_min_ns>=1000000u);
+  assert(after.retention_groups_retired>before.retention_groups_retired);
+  assert(after.db_capacity_evicted>before.db_capacity_evicted);
+  assert(after.retention_failures==before.retention_failures);
+  assert(after.retention_clock_valid && after.retention_clock_cause_code==before.retention_clock_cause_code);
+  assert(after.retention_clock_failures==before.retention_clock_failures && after.retention_active_ms>=before.retention_active_ms);
+  assert(after.physical_refusals==before.physical_refusals && after.physical_guard_failures==before.physical_guard_failures);
+  parent_fixture_owner_hash(db,original->pid,current_hash); assert(!strcmp(original_hash,current_hash));
+  query.expires_unix_ms=(int64_t)time(NULL)*1000+30000;
+  parent_pressure_query(&query,"bounded_progress_floor_retained",1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts a WHERE a.candidate_id LIKE 'bulk-%' AND NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=a.candidate_id)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection r WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=r.candidate_id)")==0);
+  int blocked_full_admission=0;
+  if (after.db_bytes+after.wal_bytes>1048576u) {
+    /* Hold a real writer lock: an unlocked admission is allowed to recover
+     * capacity and succeed, and this regression makes no contrary promise. */
+    compact_exec(db,"BEGIN IMMEDIATE;");
+    EdrBehaviorRecord *candidate=malloc(sizeof(*candidate)); assert(candidate); *candidate=*original;
+    candidate->type=EDR_EVENT_NET_CONNECT; candidate->priority=3u;
+    candidate->pid++; candidate->process_start_key++; candidate->process_creation_filetime_100ns++;
+    strcpy(candidate->event_id,"bounded-progress-full-refusal"); candidate->net_dport=445;
+    edr_behavior_bind_parent_context(candidate);
+    EdrEvidenceCacheStatus failed; edr_local_evidence_cache_record_behavior(candidate);
+    edr_local_evidence_cache_get_status(&failed);
+    assert(failed.candidate_rejected==after.candidate_rejected+1u && failed.candidate_admitted==after.candidate_admitted);
+    assert(failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]==after.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]+1u);
+    assert(failed.candidate_transaction_failures==after.candidate_transaction_failures);
+    compact_exec(db,"ROLLBACK;"); free(candidate); blocked_full_admission=1;
+    parent_fixture_owner_hash(db,original->pid,current_hash); assert(!strcmp(original_hash,current_hash));
+    query.expires_unix_ms=(int64_t)time(NULL)*1000+30000;
+    parent_pressure_query(&query,"bounded_progress_after_refusal",1);
+  }
+  printf("capacity_reclaim_progress turns=16 retired_delta=%llu held_delta=%llu clock_valid=1 protected_owner_sha256=%s delayed_read_count=%llu delayed_read_min_ns=%llu delayed_read_max_ns=%llu not_hard_realtime=1 blocked_full_admission=%d\n",
+      (unsigned long long)(after.retention_groups_retired-before.retention_groups_retired),
+      (unsigned long long)(after.retention_groups_held-before.retention_groups_held),original_hash,
+      (unsigned long long)retention_high_resolution_reads,(unsigned long long)retention_read_delay_min_ns,
+      (unsigned long long)retention_read_delay_max_ns,blocked_full_admission);
+  assert(sqlite3_close(db)==SQLITE_OK); edr_local_evidence_cache_close();
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+  s_test_monotonic_ns=UINT64_C(1000000000); cleanup_test_sqlite_path(path); free(original);
 }
 
 static void test_candidate_live_size_query_failure_is_storage(void) {
@@ -11198,6 +11434,18 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-progress") == 0) {
+    test_capacity_reclaim_bounded_progress_preserves_parent_floor(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-contract") == 0) {
+    test_capacity_reclaims_free_pages_before_evicting_candidates(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-slow-checkpoint") == 0) {
+    test_capacity_reclaim_with_slow_io(30u,0u); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-slow-read") == 0) {
+    test_capacity_reclaim_with_slow_io(0u,1u); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--live-size-query-failure") == 0) {
     test_candidate_live_size_query_failure_is_storage(); return 0;
   }
@@ -11402,6 +11650,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_critical_context_still_honors_database_capacity());
   RUN_CACHE_CASE("retention", test_incremental_reclaim_is_bounded_and_preserves_evidence());
   RUN_CACHE_CASE("retention", test_capacity_reclaims_free_pages_before_evicting_candidates());
+  RUN_CACHE_CASE("retention", test_capacity_reclaim_bounded_progress_preserves_parent_floor());
   RUN_CACHE_CASE("retention", test_capacity_preserves_unclassified_refs_and_reports_refusal());
   RUN_CACHE_CASE("retention", test_capacity_success_does_not_throttle_next_reclaim());
   RUN_CACHE_CASE("retention", test_capacity_progress_with_slow_checkpoint());

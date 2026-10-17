@@ -88,6 +88,7 @@ class NativeToolsTests(unittest.TestCase):
         self.assertEqual(manifest["purpose"], "private_isolated_storage_diagnostics")
         self.assertEqual(manifest["prior_contract_status"], "passed")
         self.assertIs(manifest["native_contracts_passed_before_staging"], True)
+        self.assertNotIn("allowed_diagnostic_argv", manifest)
         self.assertFalse(manifest["product_payload"])
         self.assertEqual(manifest["provenance"]["compiler"]["sha256"], TOOLS.digest(self.compiler))
         self.assertEqual(manifest["provenance"]["vcpkg_status"]["sha256"], TOOLS.digest(self.prefix.parent / "vcpkg" / "status"))
@@ -102,7 +103,6 @@ class NativeToolsTests(unittest.TestCase):
         self.assertIs(manifest["native_contracts_passed_before_staging"], False)
         self.assertEqual(manifest["native_contract_status_authority"],
                          "prior_failed_workflow_step_not_parsed_by_stager")
-        self.assertEqual(manifest["allowed_diagnostic_argv"], [["--sliced-reclaim-contract"]])
         self.assertIn("not_long_soak_or_release_acceptance", manifest["limitations"])
         self.assertEqual(manifest["equal_input_comparison_status"], "not_run_at_staging")
         self.assertFalse(manifest["product_payload"])
@@ -114,6 +114,17 @@ class NativeToolsTests(unittest.TestCase):
         copied.write_bytes(original[:-1] + b"x")
         with self.assertRaisesRegex(ValueError, "hash/size mismatch"):
             TOOLS.verify_stage(self.args.output, manifest)
+
+    def test_failed_gate_diagnostics_are_exactly_two_fixed_single_case_commands(self):
+        self.args.prior_contract_status = "failed"
+        manifest = self.stage()
+        self.assertEqual(manifest["allowed_diagnostic_argv"],
+                         [["--sliced-reclaim-contract"], ["--capacity-reclaim-contract"]])
+        self.assertIn("isolated_sliced_and_capacity_reclaim_reproduction_only",
+                      manifest["limitations"])
+        self.assertNotIn(["--suite", "retention"], manifest["allowed_diagnostic_argv"])
+        self.assertNotIn(["--alert-parent-soak", "7380"], manifest["allowed_diagnostic_argv"])
+        self.assertIs(manifest["native_contracts_passed_before_staging"], False)
 
     def test_unknown_prior_gate_state_cannot_be_staged(self):
         for status in ("failure", "skipped", "cancelled", "", None):
@@ -281,7 +292,7 @@ class NativeToolsTests(unittest.TestCase):
     def test_workflow_upload_is_before_comparison_and_separate_from_release(self):
         workflow = (ROOT / ".github/workflows/evidence-retention-comparison.yml").read_text()
         contracts = workflow.index("- name: Build and execute actual native release")
-        sliced = workflow.index("- name: Repeat the ARM64 sliced-reclaim contract")
+        sliced = workflow.index("- name: Repeat the ARM64 bounded-reclaim contracts")
         stage = workflow.index("- name: Stage the compiled private native diagnostic tool")
         upload = workflow.index("- name: Preserve the private native diagnostic tool separately")
         comparison = workflow.index("- name: Equal-input native evidence")
@@ -297,7 +308,12 @@ class NativeToolsTests(unittest.TestCase):
         compare_block = workflow[comparison:measurements]
         self.assertIn("id: contracts", contract_block)
         self.assertIn("id: sliced", repeat_block)
+        self.assertIn("if: ${{ matrix.arch == 'arm64' }}", repeat_block)
+        self.assertIn("timeout-minutes: 5", repeat_block)
         self.assertIn("range(12)", repeat_block)
+        self.assertIn("for label, argv in [('sliced', '--sliced-reclaim-contract'), ('capacity', '--capacity-reclaim-contract')]:", repeat_block)
+        self.assertIn("case-{label}-{index:02d}.log", repeat_block)
+        self.assertIn("timeout=180", repeat_block)
         self.assertIn("raise SystemExit(1)", repeat_block)
         self.assertIn("always() && (steps.contracts.outcome == 'success' || steps.contracts.outcome == 'failure')", stage_block)
         self.assertIn("'${{ steps.contracts.outcome }}' -eq 'success'", stage_block)
