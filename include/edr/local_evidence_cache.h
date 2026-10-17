@@ -413,6 +413,8 @@ void edr_local_evidence_cache_test_fail_next_commits(unsigned count);
 void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count);
 /* Denies the next live-page SELECT through SQLite's authorizer. */
 void edr_local_evidence_cache_test_fail_next_live_size_queries(unsigned count);
+/* Denies an actual post-capacity ROLLBACK through SQLite's authorizer. */
+void edr_local_evidence_cache_test_fail_next_capacity_rollbacks(unsigned count);
 /* Historical counterfactual only; persists across close/open until disabled. */
 void edr_local_evidence_cache_test_force_original_memory_trim(int enabled);
 typedef struct {

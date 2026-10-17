@@ -1,5 +1,66 @@
 # Cache reliability remediation
 
+## 2026-10-17 pressure continuation follow-up
+
+Two synthetic counterfactuals use the unchanged production cache from
+`f77443550b442e901236c7cfabeaf906599a75ca`. At an exact allocated-page limit
+with no free pages, an incoming context can pass the physical precheck and
+then exceed the live-page budget. Its transaction correctly rolls back, but
+did not request subsequent pressure work. Separately, an empty physical reclaim
+could reset the maintenance cadence while a protected-prefix scan remained
+unfinished. The next one-second owner poll made no progress in both fixtures.
+These failures do not identify the cause of every historical full cache.
+
+The follow-up changes only the existing in-memory maintenance scheduler.
+Post-write capacity refusal requests later work after verified rollback; it
+does not retry or accept the refused write. Failed rollback reports storage
+failure and leaves maintenance in backoff while the transaction remains open.
+Unfinished pressure work may resume on subsequent owner turns. A bounded
+activation follows the existing nine-stage rotation, preserves its keyset
+cursor, then parks. Exhausting the current indexed interval is not proof of
+a database-wide snapshot scan. A time-slice yield never claims interval
+exhaustion. New refusals do not renew an active scan or reset error backoff.
+
+Parked polling keeps its minute cadence; admission retains its existing
+ten-second opportunity. SQLite errors, an unfinished transaction and resource
+pressure keep the separate minute backoff. Existing cooperative 20 ms, row,
+byte and reclaim-page bounds remain unchanged; an individual SQLite statement
+can exceed them. This is a work-scheduling bound, not a hard CPU/I/O quota or
+a retirement-latency guarantee. There is no new durable table, configuration,
+retention exception, upload permission or inline admission retry.
+
+Host verification passed three cache suites and seven existing focused reclaim
+calls, plus the three new fixed fault/continuation calls. The primary workspace
+then rebuilt the targets and passed four CTests, including the final egress
+gate, in 47.005 seconds. Original test lines and assertions remain unchanged.
+Production SQLite compilation excludes the TESTING-only rollback fault API.
+An additional no-SQLite compile fails at the same pre-existing undeclared
+`manifest_utf8_valid` call as f774; it is not counted as a pass. The supported
+Windows release requires SQLite and still needs its own native execution.
+
+The frozen f774 native workflow `38997141789` passed the actual release and
+telemetry contracts on both architectures, including twelve repetitions of
+each existing reclaim contract. Its Headless-only 3.2.694 prerelease was
+published by `38999365081`; no Setup UI package was downloaded and no new
+Agent was installed on the real store. These results do not validate the
+new scheduler. Its own native and UTM results must be bound to its eventual
+commit and artifacts.
+
+The original f774 UTM synthetic soak is retained as a separate baseline.
+The user confirmed host/VM sleep or pause; read-only receipts show several
+UTC observation gaps with much smaller changes in native effective elapsed
+time. Paused time does not count as load. The real 692 Agent also changed
+process generation during observation, with the same executable hash; its
+restart cause was not established. Neither a running soak nor its eventual
+effective-duration result proves uninterrupted UTC endurance, a 72-hour
+production window, whole-Agent recovery or a real-store migration.
+
+Raw counterfactuals, failed iterations, native artifacts and bounded UTM
+receipts remain in the private acceptance directory. Final test commands,
+results and source/asset bindings must be recorded there after completion.
+Real-data migration, including opening real-data copies with a new cache
+runtime, and permanent deletion remain separately authorized operations.
+
 ## 2026-10-17 active-residence repair and read-only legacy inventory
 
 This section supersedes the retention-policy limits described in the earlier

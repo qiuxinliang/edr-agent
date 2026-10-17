@@ -445,6 +445,7 @@ static EdrContextStore s_context_store;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_commit_failures;
 static unsigned s_test_live_size_query_failures;
+static unsigned s_test_capacity_rollback_failures;
 static int s_test_commit_active;
 static int s_test_force_original_memory_trim;
 
@@ -454,6 +455,13 @@ static int evidence_cache_test_deny_query(void *opaque, int action,
   (void)opaque; (void)action; (void)arg1; (void)arg2;
   (void)database; (void)trigger;
   return SQLITE_DENY;
+}
+
+static int evidence_cache_test_deny_rollback(void *opaque, int action,
+    const char *arg1, const char *arg2, const char *database, const char *trigger) {
+  (void)opaque; (void)arg2; (void)database; (void)trigger;
+  return action == SQLITE_TRANSACTION && arg1 && !strcmp(arg1,"ROLLBACK")
+      ? SQLITE_DENY : SQLITE_OK;
 }
 
 /* SQLite calls this synchronously from COMMIT. Returning non-zero aborts the
@@ -2530,6 +2538,18 @@ static unsigned s_maintenance_reclaim_pages;
 /* Once pressure starts, finish recovering the WAL working target even if one
  * partial slice brings the file just below the hard admission limit. */
 static int s_maintenance_pressure_pending;
+/* Pressure is an intent, not permission to retry failed work or repeatedly
+ * scan a fully protected cache. Only a successful unfinished pass is runnable
+ * on the next owner turn. Exhausted intervals/activations and failures retain
+ * the minute poll gate. */
+enum { MAINTENANCE_IDLE, MAINTENANCE_RUNNABLE, MAINTENANCE_PARKED, MAINTENANCE_BACKOFF };
+static unsigned s_maintenance_work_state;
+/* One activation permits at most one existing TTL-stage revolution of
+ * successful owner turns. The cursor survives this pause: changing/inserting
+ * keys or repeatedly yielding before selection cannot create a hot full-cache
+ * scan. This is a scheduling bound, not a retirement latency guarantee. */
+enum { MAINTENANCE_STAGE_COUNT = 9 };
+static unsigned s_maintenance_pressure_turns;
 /* Two bounded keyset cursors prevent protected old groups from starving newer
  * eligible groups. Losing a cursor on restart only repeats safe validation. */
 static struct { int value_class; sqlite3_int64 time; char id[160]; } s_retirement_cursor[2];
@@ -2540,6 +2560,54 @@ static unsigned s_maintenance_stage;
 static int sqlite_retire_command_facts(sqlite3_int64 cutoff, EvidenceMaintenanceSlice *slice);
 static int sqlite_maintenance_yield(const EvidenceMaintenanceSlice *slice);
 static int sqlite_maintenance_charge(EvidenceMaintenanceSlice *slice,unsigned rows,uint64_t bytes);
+
+static void sqlite_maintenance_park(unsigned state) {
+  s_maintenance_work_state = state;
+  s_last_maintenance_ns = edr_monotonic_ns();
+}
+
+enum { MAINTENANCE_POLL, MAINTENANCE_RECLAIM, MAINTENANCE_ADMISSION };
+static int sqlite_maintenance_can_run(unsigned kind) {
+  uint64_t now = edr_monotonic_ns();
+  if ((s_maintenance_work_state == MAINTENANCE_BACKOFF ||
+       (s_maintenance_work_state == MAINTENANCE_PARKED && kind == MAINTENANCE_POLL)) &&
+      (now < s_last_maintenance_ns || now - s_last_maintenance_ns < 60000000000ULL)) {
+    if (s_maintenance_work_state == MAINTENANCE_PARKED)
+      set_error("maintenance deferred after bounded pressure inspection");
+    return 0;
+  }
+  if (evidence_cache_pressure_active()) {
+    sqlite_maintenance_park(MAINTENANCE_BACKOFF);
+    set_error("maintenance deferred by resource pressure");
+    (void)sqlite3_db_release_memory(s_db);
+    (void)sqlite3_release_memory(0);
+    return 0;
+  }
+  if (!sqlite3_get_autocommit(s_db)) {
+    sqlite_maintenance_park(MAINTENANCE_BACKOFF);
+    set_error("maintenance deferred by an unfinished database transaction");
+    return 0;
+  }
+  if (s_maintenance_work_state == MAINTENANCE_BACKOFF ||
+      (s_maintenance_work_state == MAINTENANCE_PARKED && kind != MAINTENANCE_RECLAIM)) {
+    s_maintenance_work_state = s_maintenance_pressure_pending
+        ? MAINTENANCE_RUNNABLE : MAINTENANCE_IDLE;
+    s_maintenance_pressure_turns = 0u;
+  }
+  return 1;
+}
+
+static void sqlite_schedule_capacity_pressure(void) {
+  /* Never turn another refusal into a new scan of a protected-full cache, or
+   * override an existing error/resource cooldown. No write is retried here. */
+  if (!s_maintenance_pressure_pending) {
+    s_maintenance_pressure_pending = 1;
+    if (s_maintenance_work_state == MAINTENANCE_IDLE) {
+      s_maintenance_work_state = MAINTENANCE_RUNNABLE;
+      s_maintenance_pressure_turns = 0u;
+    }
+  }
+}
 
 static int exec_sql(const char *sql) {
   char *err = NULL;
@@ -3303,7 +3371,6 @@ static int sqlite_size_budget_allow_mode(int allow_retirement) {
    * WAL above, but otherwise refuses until normal maintenance frees space. */
   if (allow_retirement && (s_last_capacity_failure_ns == 0u ||
       now - s_last_capacity_failure_ns >= 10000000000ULL)) {
-    s_last_maintenance_ns = now;
     int maintenance_result = sqlite_maintenance(0);
     if (!db_size_over_limit()) {
       s_maintenance_reclaim_pages = 0u;
@@ -5392,7 +5459,25 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
     s_persistence_failure = EDR_EVIDENCE_FAILURE_CAPACITY;
     ++s_status.db_budget_dropped;
     set_error("candidate context page budget exceeded; protected evidence preserved");
-    sqlite_rollback_silent(); return -1;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+    int deny_rollback = s_test_capacity_rollback_failures > 0u;
+    if (deny_rollback) {
+      --s_test_capacity_rollback_failures;
+      (void)sqlite3_set_authorizer(s_db,evidence_cache_test_deny_rollback,NULL);
+    }
+#endif
+    sqlite_rollback_silent();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+    if (deny_rollback) (void)sqlite3_set_authorizer(s_db,NULL,NULL);
+#endif
+    if (!sqlite3_get_autocommit(s_db)) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
+      set_error("candidate capacity rollback did not finish; maintenance deferred");
+      sqlite_maintenance_park(MAINTENANCE_BACKOFF);
+      return -1;
+    }
+    sqlite_schedule_capacity_pressure();
+    return -1;
   }
   if (sqlite_commit_candidate_transaction() != 0) {
     sqlite_rollback_silent(); return -1;
@@ -5670,7 +5755,8 @@ static int sqlite_retirement_yield(void *deadline) {
  * groups is examined; shared facts are charged conservatively to the work
  * budget even when another reference keeps them alive. */
 static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
-                                          unsigned *retired, EvidenceMaintenanceSlice *slice) {
+                                          unsigned *retired, EvidenceMaintenanceSlice *slice,
+                                          int *range_exhausted) {
   enum { MAX_CANDIDATES = 1000, MAX_WORK_ROWS = 4096 };
   char (*ids)[160] = NULL;
   sqlite3_int64 times[MAX_CANDIDATES];
@@ -5686,6 +5772,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   int64_t now = now_unix_ns(); uint64_t mono = edr_monotonic_ns();
   uint64_t deadline = slice->deadline_ns;
   *retired = 0u;
+  *range_exhausted = 0;
   if (sqlite_maintenance_yield(slice)) return 0;
   if (!sqlite_database_write_allow(slice->bytes_left)) return -1;
   ids = calloc(MAX_CANDIDATES, sizeof(*ids));
@@ -5760,8 +5847,13 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
     if (sqlite_maintenance_yield(slice)) break;
     step = sqlite3_step(select_st);
     if (step == SQLITE_DONE) {
-      if (count || wrapped || !s_retirement_cursor[pressure != 0].time ||
-          sqlite_maintenance_yield(slice)) break;
+      /* EOF exhausts this indexed interval, not a snapshot of the whole
+       * cache. An empty tail still needs its one wrap; a deadline before that
+       * wrap leaves unfinished work and must preserve the committed cursor. */
+      if (count || wrapped || !s_retirement_cursor[pressure != 0].time) {
+        *range_exhausted = 1; break;
+      }
+      if (sqlite_maintenance_yield(slice)) break;
       if (sqlite3_reset(select_st) != SQLITE_OK || sqlite3_bind_int64(select_st, 4, 0) != SQLITE_OK ||
           sqlite3_bind_text(select_st, 5, "", -1, SQLITE_STATIC) != SQLITE_OK ||
           sqlite3_bind_int(select_st, 6, 0) != SQLITE_OK) goto storage_failed;
@@ -5831,7 +5923,7 @@ next_candidate:
     s_retirement_cursor[pressure != 0].value_class = classes[processed - 1u];
     s_retirement_cursor[pressure != 0].time = times[processed - 1u];
     snprintf(s_retirement_cursor[pressure != 0].id, sizeof(s_retirement_cursor[0].id), "%s", ids[processed - 1u]);
-  } else if (!count) {
+  } else if (!count && *range_exhausted) {
     memset(&s_retirement_cursor[pressure != 0], 0, sizeof(s_retirement_cursor[0]));
   }
   /* Retired groups must not be resurrected by late events in a nominally ended
@@ -5867,6 +5959,7 @@ done:
 static int sqlite_maintenance_reclaim_poll(void) {
   sqlite3_stmt *st = NULL;
   int result = 0, trim_memory;
+  if (!sqlite_maintenance_can_run(MAINTENANCE_RECLAIM)) return -1;
   unsigned pages = s_maintenance_reclaim_pages < 256u
                        ? s_maintenance_reclaim_pages : 256u;
   int rc = sqlite3_prepare_v2(s_db, "PRAGMA freelist_count;", -1, &st, NULL);
@@ -5896,9 +5989,10 @@ failed:
   /* Restart from a fresh maintenance cycle after the existing minute backoff.
    * A delayed slice must not turn failure into a per-event retry loop. */
   s_maintenance_reclaim_pages = 0u;
-  s_last_maintenance_ns = edr_monotonic_ns();
+  sqlite_maintenance_park(MAINTENANCE_BACKOFF);
 finish:
-  if (!s_maintenance_reclaim_pages) s_last_maintenance_ns=edr_monotonic_ns();
+  if (!s_maintenance_reclaim_pages && s_maintenance_work_state != MAINTENANCE_RUNNABLE)
+    s_last_maintenance_ns=edr_monotonic_ns();
   /* An empty reclaim turn must not discard the working set needed by the
    * unfinished pressure slice. Actual reclamation, errors and resource
    * pressure retain the existing memory release boundary. */
@@ -5916,14 +6010,19 @@ finish:
 }
 
 static int sqlite_maintenance(int defer_reclaim) {
+  if (!s_db) { set_error("maintenance database unavailable"); return -1; }
+  /* Admission keeps its existing ten-second failure gate; a completed scan
+   * must not turn that contract into a minute. Errors/resources still wait a
+   * minute, and ordinary polls do not restart a protected-full scan. */
+  if (!sqlite_maintenance_can_run(defer_reclaim ? MAINTENANCE_POLL : MAINTENANCE_ADMISSION)) return -1;
+  s_last_maintenance_ns = edr_monotonic_ns();
   unsigned pending_reclaim_pages = s_maintenance_reclaim_pages;
   s_maintenance_reclaim_pages = 0u;
-  if (!s_db) { set_error("maintenance database unavailable"); return -1; }
   EvidenceMaintenanceSlice slice={evidence_cache_clock_ns()+20000000ULL,
       4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
   s_status.maintenance_runs++;
-  if (!sqlite_database_write_allow(slice.bytes_left)) return -1;
-  int result = 0, trim_memory;
+  int result = 0, trim_memory, pressure_range_exhausted = 0;
+  if (!sqlite_database_write_allow(slice.bytes_left)) goto failed;
   /* Admission may take over an already scheduled reclaim slice. Consume at
    * most that one existing 256-page operation before optional TTL/clock writes
    * and their checkpoint can exhaust this turn's cooperative deadline. The
@@ -5951,9 +6050,9 @@ static int sqlite_maintenance(int defer_reclaim) {
     {"metrics","minute_unix","NOT(minute_unix=0 AND endpoint_id='' AND metric_name IN('local_retention_v1_expired_groups','local_retention_v1_expired_rows','local_retention_v1_expired_work_bytes','local_retention_v1_capacity_groups','local_retention_v1_capacity_rows','local_retention_v1_capacity_work_bytes','" RETENTION_ACTIVE_CLOCK_KEY "'))","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"}
   };
   if (db_size_over_limit()) s_maintenance_pressure_pending=1;
-  for (unsigned pass=0;pass<9u && !sqlite_maintenance_yield(&slice);++pass) {
+  for (unsigned pass=0;pass<MAINTENANCE_STAGE_COUNT && !sqlite_maintenance_yield(&slice);++pass) {
     unsigned stage=s_maintenance_stage;
-    s_maintenance_stage=(stage+1u)%9u;
+    s_maintenance_stage=(stage+1u)%MAINTENANCE_STAGE_COUNT;
     if (stage==0) {
       int pressure = 0;
       /* Share the existing candidate turn with live pressure. A dense set of
@@ -5964,7 +6063,9 @@ static int sqlite_maintenance(int defer_reclaim) {
         if (pressure < 0) goto failed;
         if (!pressure) s_maintenance_pressure_pending=0;
       }
-      if (sqlite_retire_candidate_groups(pressure,cutoff,&retired,&slice)!=0) goto failed;
+      int complete = 0;
+      if (sqlite_retire_candidate_groups(pressure,cutoff,&retired,&slice,&complete)!=0) goto failed;
+      if (pressure) pressure_range_exhausted = complete;
     } else if(stage==6) {
       if (sqlite_retire_command_facts(cutoff,&slice)!=0) goto failed;
     } else {
@@ -5980,11 +6081,11 @@ static int sqlite_maintenance(int defer_reclaim) {
      * the entire cooperative time slice on every turn and otherwise starve
      * pressure retirement forever. Free pages do not justify eviction; the
      * live-page check below still protects that case. Checkpoint after work. */
-    for (unsigned pass=0;pass<4u && !sqlite_maintenance_yield(&slice);++pass) {
+    for (unsigned pass=0;pass<4u && !pressure_range_exhausted && !sqlite_maintenance_yield(&slice);++pass) {
       int over=sqlite_live_size_over_limit(target);
       if(over<0) goto failed;
       if(!over) { s_maintenance_pressure_pending=0; break; }
-      if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice)!=0) goto failed;
+      if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice,&pressure_range_exhausted)!=0) goto failed;
       if(!retired && !s_retirement_cursor[1].time) break;
     }
     if (!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE)!=0) goto failed;
@@ -6001,6 +6102,17 @@ static int sqlite_maintenance(int defer_reclaim) {
 failed:
   s_maintenance_reclaim_pages=0u; result=-1;
 finish:
+  if (result != 0 || evidence_cache_pressure_active())
+    sqlite_maintenance_park(MAINTENANCE_BACKOFF);
+  else if (!s_maintenance_pressure_pending) {
+    s_maintenance_work_state = MAINTENANCE_IDLE;
+    s_maintenance_pressure_turns = 0u;
+  } else if (pressure_range_exhausted ||
+             ++s_maintenance_pressure_turns >= MAINTENANCE_STAGE_COUNT) {
+    sqlite_maintenance_park(MAINTENANCE_PARKED);
+    s_last_capacity_failure_ns = s_last_maintenance_ns;
+  } else
+    s_maintenance_work_state = MAINTENANCE_RUNNABLE;
   /* Preserve the bounded pager between unfinished pressure turns; repeatedly
    * starting a cold preflight can spend every cooperative slice before a
    * group commits. Completed work and resource/error paths still trim. */
@@ -7127,6 +7239,8 @@ static void evidence_cache_close_locked(void) {
    * by normal startup maintenance, with no durable scheduler state to replay. */
   s_maintenance_reclaim_pages = 0u;
   s_maintenance_pressure_pending=0;
+  s_maintenance_work_state=MAINTENANCE_IDLE;
+  s_maintenance_pressure_turns=0u;
   s_maintenance_stage=0;
   memset(s_retirement_cursor, 0, sizeof(s_retirement_cursor));
   memset(&s_command_retirement_cursor, 0, sizeof(s_command_retirement_cursor));
@@ -7281,6 +7395,7 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   s_test_commit_failures = 0u;
   s_test_live_size_query_failures = 0u;
+  s_test_capacity_rollback_failures = 0u;
   s_test_manifest_allocation_failures = 0u;
   s_test_commit_active = 0;
   (void)sqlite3_commit_hook(s_db, evidence_cache_test_commit_hook, NULL);
@@ -7434,6 +7549,12 @@ void edr_local_evidence_cache_test_fail_next_commits(unsigned count) {
 void edr_local_evidence_cache_test_fail_next_live_size_queries(unsigned count) {
   evidence_cache_lock();
   s_test_live_size_query_failures = count;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_fail_next_capacity_rollbacks(unsigned count) {
+  evidence_cache_lock();
+  s_test_capacity_rollback_failures = count;
   evidence_cache_unlock();
 }
 
@@ -8432,6 +8553,7 @@ finished:
 
 void edr_local_evidence_cache_poll_maintenance(void) {
   uint64_t now = edr_monotonic_ns();
+  int runnable = 0;
   evidence_cache_lock();
 #if defined(EDR_HAVE_SQLITE)
   if (s_db && s_maintenance_reclaim_pages != 0u) {
@@ -8439,14 +8561,18 @@ void edr_local_evidence_cache_poll_maintenance(void) {
     evidence_cache_unlock();
     return;
   }
+  /* Repeated polls at one owner timestamp only drain the existing physical
+   * slices. A retirement continuation belongs to a later owner turn. */
+  runnable = s_maintenance_work_state == MAINTENANCE_RUNNABLE && now > s_last_maintenance_ns;
 #endif
-  if (now - s_last_maintenance_ns < 60000000000ULL) {
+  if (!runnable && now - s_last_maintenance_ns < 60000000000ULL) {
     evidence_cache_unlock();
     return;
   }
-  s_last_maintenance_ns = now;
 #if defined(EDR_HAVE_SQLITE)
   sqlite_maintenance(1);
+#else
+  s_last_maintenance_ns = now;
 #endif
   evidence_cache_unlock();
 }
