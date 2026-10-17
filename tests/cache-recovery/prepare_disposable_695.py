@@ -2,6 +2,7 @@
 No catalog, endpoint, enrollment, S3, publish, permission mutation or retry.
 """
 import argparse
+from contextlib import contextmanager
 import base64
 import hashlib
 import importlib.util
@@ -108,12 +109,25 @@ def save(path,raw):
 def json_save(path,value):save(path,(json.dumps(value,indent=2)+'\n').encode())
 
 
+@contextmanager
+def original_imports(path):
+    before=list(sys.path);sys.path.insert(0,str(path.parent))
+    try:yield
+    finally:sys.path[:]=before
+
+
 def module(path,name):
     spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec)
-    sys.path.insert(0,str(path.parent))
-    try:spec.loader.exec_module(m)
-    finally:sys.path.pop(0)
+    with original_imports(path):spec.loader.exec_module(m)
     return m
+
+
+def failure_cause(exc):
+    if isinstance(exc,ModuleNotFoundError):
+        name=exc.name
+        safe=type(name)is str and len(name)<=128 and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*',name)
+        return 'missing_module:'+(name if safe else 'unclassified')
+    return str(exc)if isinstance(exc,ValueError)else type(exc).__name__
 
 
 def verified_preflight(raw):
@@ -201,9 +215,11 @@ def download_headless(root,checkpoint,tag,commit,run,baseline=False):
         need(len(raw)==a['size'] and digest(raw)==a['digest'][7:],'asset_full_hash_size')
         save(directory/name,raw)
     metadata=root/('baseline-release.json'if baseline else 'target-release.json');json_save(metadata,info)
-    stage=checkpoint.stage_headless(directory,root/('baseline-runtime'if baseline else 'target-runtime'),metadata,tag,'arm64',commit,REPO,
-        expected_source_commit=None if baseline else commit,expected_run_id=None if baseline else run,
-        published_baseline=baseline,target_tag='win_3.2.695'if baseline else None)
+    # The original owner imports its sibling validators lazily during staging.
+    with original_imports(Path(checkpoint.__file__)):
+        stage=checkpoint.stage_headless(directory,root/('baseline-runtime'if baseline else 'target-runtime'),metadata,tag,'arm64',commit,REPO,
+            expected_source_commit=None if baseline else commit,expected_run_id=None if baseline else run,
+            published_baseline=baseline,target_tag='win_3.2.695'if baseline else None)
     json_save(root/('baseline-stage.json'if baseline else 'target-stage.json'),stage)
     return stage,directory
 
@@ -287,5 +303,5 @@ if __name__=='__main__':
     try:main()
     except Exception as exc:
         # Avoid third-party HTTP text, URLs, bodies, credentials or path dumps.
-        print('disposable_preparation_failed:'+str(exc)if isinstance(exc,ValueError)else'disposable_preparation_failed:'+type(exc).__name__,file=sys.stderr)
+        print('disposable_preparation_failed:'+failure_cause(exc),file=sys.stderr)
         sys.exit(1)

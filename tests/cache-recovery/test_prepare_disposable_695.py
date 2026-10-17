@@ -159,6 +159,49 @@ class Contracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'github_failed_415_no_retry_or_scope_expansion')as c:
             M.bounded_process([sys.executable,'-c','import sys;sys.stderr.write("HTTP 415 fake-private-url");sys.exit(1)'],100,2)
         self.assertNotIn('fake-private-url',str(c.exception))
+    def test_original_lazy_stage_imports_and_path_restore_on_validation_error(self):
+        # Use the actual original stage owner and its siblings; only HTTP is a stub.
+        script=Path(__file__).resolve().parents[2]/'scripts/windows_release_checkpoint.py'
+        siblings=('windows_usb_bundle','verify_binary_hot_compatibility','windows_release_checkpoint')
+        filtered=[p for p in sys.path if p!=str(script.parent)]
+        with tempfile.TemporaryDirectory()as d,patch.dict(sys.modules),patch.object(sys,'path',filtered):
+            for name in siblings:sys.modules.pop(name,None)
+            before=list(sys.path);checkpoint=M.module(script,'original_checkpoint_contract')
+            self.assertEqual(sys.path,before)
+            tag='win_3.2.695';raw=b'public synthetic invalid stage input';assets=[]
+            for arch in ('arm64','amd64'):
+                for suffix in ('exe.zip','artifact-manifest.json','FDSensor.exe'):
+                    assets.append({'id':len(assets)+1,'name':'edr-agent-'+tag+'-windows-'+arch+'-'+suffix,
+                      'size':len(raw),'digest':'sha256:'+M.digest(raw)})
+            info={'id':123,'assets':assets} # Deliberately not canonical release metadata.
+            with patch.object(M,'release',return_value=info),patch.object(M,'gh',return_value=raw):
+                with self.assertRaisesRegex(ValueError,'Release metadata tag, ID or publication state mismatch'):
+                    M.download_headless(Path(d),checkpoint,tag,M.SOURCE,M.TARGET_RUN)
+            self.assertEqual(sys.path,before)
+            self.assertFalse((Path(d)/'target-runtime').exists())
+    def test_module_load_failure_restores_complete_original_search_path(self):
+        with tempfile.TemporaryDirectory()as d:
+            owner=Path(d)/'broken.py';owner.write_text('import sys\nsys.path.append("synthetic module mutation")\nraise RuntimeError("synthetic failure")\n')
+            before=list(sys.path)
+            with self.assertRaisesRegex(RuntimeError,'synthetic failure'):M.module(owner,'broken_original')
+            self.assertEqual(sys.path,before)
+    def test_original_import_context_success_restores_complete_path(self):
+        with tempfile.TemporaryDirectory()as d:
+            owner=Path(d)/'owner.py';before=list(sys.path)
+            with M.original_imports(owner):
+                self.assertEqual(sys.path[0],str(owner.parent));sys.path.append('synthetic inner mutation')
+            self.assertEqual(sys.path,before)
+    def test_missing_module_cause_is_safe_qualified_name_only(self):
+        exc=ModuleNotFoundError('private path and arbitrary message',name='windows_usb_bundle')
+        self.assertEqual(M.failure_cause(exc),'missing_module:windows_usb_bundle')
+        self.assertEqual(M.failure_cause(ModuleNotFoundError('private',name='safe.module_2')),'missing_module:safe.module_2')
+    def test_unsafe_missing_module_name_is_not_exported(self):
+        for name in (None,'private/path','private\nmodule','a'*129,'bad-name','token?secret'):
+            with self.subTest(name=name):
+                self.assertEqual(M.failure_cause(ModuleNotFoundError('private message',name=name)),'missing_module:unclassified')
+    def test_other_exception_diagnostics_remain_sanitized(self):
+        self.assertEqual(M.failure_cause(RuntimeError('private message')),'RuntimeError')
+        self.assertEqual(M.failure_cause(ValueError('typed_known_cause')),'typed_known_cause')
     def test_binary_bytes_unchanged(self):
         raw=M.bounded_process([sys.executable,'-c','import sys;sys.stdout.buffer.write(bytes([0,255,0,10]))'],4,2)
         self.assertEqual(raw,bytes([0,255,0,10]))
