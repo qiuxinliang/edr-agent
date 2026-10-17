@@ -673,6 +673,7 @@ jobs:
           python -I -B tests/cache-recovery/prepare_disposable_695.py finalize --workspace "$PWD" --output "$env:EDR_PRIVATE_RECOVERY_PREP"
           if ($LASTEXITCODE -ne 0) { throw 'Original builder output binding failed' }
       - name: Execute only disposable local rollback and normal repair subset
+        shell: powershell
         run: |
           $binding=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'recovery-input.json'
           $sha=(Get-FileHash $binding -Algorithm SHA256).Hash.ToLowerInvariant()

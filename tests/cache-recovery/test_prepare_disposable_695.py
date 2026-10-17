@@ -2,6 +2,7 @@
 import importlib.util
 import base64
 import json
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -99,6 +100,21 @@ class Contracts(unittest.TestCase):
         self.assertIn("'source-owner/full_installer.go'",text)
         self.assertIn("'zz_private_695_p5_export_test.go'",text)
         self.assertIn('retention-days: 7',text)
+    def assert_recovery_execution_host(self,text):
+        step=re.search(r'^      - name: Execute only disposable local rollback and normal repair subset\n(.*?)(?=^      - |\Z)',text,re.M|re.S)
+        self.assertIsNotNone(step)
+        # This sole driver consumer matches its #Requires5.1 child launcher;
+        # inheriting the job's pwsh host must not silently return.
+        self.assertEqual(re.findall(r'^        shell: (.+)$',step[1],re.M),['powershell'])
+    def test_manual_execution_uses_matching_windows_powershell_host(self):
+        workflow=Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml'
+        text=workflow.read_text();self.assert_recovery_execution_host(text)
+        header='      - name: Execute only disposable local rollback and normal repair subset\n'
+        selected=header+'        shell: powershell\n'
+        self.assertEqual(text.count(selected),1)
+        for replacement in [header,header+'        shell: pwsh\n']:
+            with self.subTest(shell=replacement),self.assertRaises(AssertionError):
+                self.assert_recovery_execution_host(text.replace(selected,replacement,1))
     def assert_transport(self,argv,cap,seconds,endpoint,accept,expected_cap):
         self.assertEqual(argv,['gh','api','--method','GET',endpoint,'-H','Accept: '+accept])
         self.assertEqual(cap,expected_cap);self.assertEqual(seconds,150)
