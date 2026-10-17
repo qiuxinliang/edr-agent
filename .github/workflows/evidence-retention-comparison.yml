@@ -15,10 +15,14 @@ on:
       - tests/retention_comparison_support.py
       - scripts/stage_retention_native_tools.py
       - tests/test_stage_retention_native_tools.py
+      - tests/test_local_evidence_cache_candidate.c
+      - tests/test_egress_request_policy.c
       - src/storage/local_evidence_cache.c
+      - include/edr/local_evidence_cache.h
       - src/storage/queue_sqlite.c
       - include/edr/storage_queue.h
       - src/transport/egress_batch_policy.c
+      - src/transport/egress_request_policy.c
       - include/edr/egress_batch_policy.h
       # Candidate verification binds measurements to the release owners' source.
       - .github/workflows/edr-agent-client-release.yml
@@ -184,7 +188,7 @@ jobs:
           $results = Join-Path $env:RUNNER_TEMP 'retention-results'
           if (Test-Path -LiteralPath $results) { throw 'Synthetic result directory must be new' }
           $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
-          python -B tests/run_evidence_retention_comparison.py --output "$results/evidence" --runs 5 --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}'
+          python -B tests/run_evidence_retention_comparison.py --output "$results/evidence" --baseline 0ae3fb28e553223358db1a83ebd26432336af9e7 --runs 5 --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}'
           if ($LASTEXITCODE -ne 0) { throw 'Native evidence comparison failed; inspect preserved logs' }
           python -B tests/run_queue_retention_comparison.py --output "$results/queue" --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}' --scenarios unique replay high_severity owner_loss
           if ($LASTEXITCODE -ne 0) { throw 'Native queue pressure comparison failed; inspect preserved logs' }

@@ -23,6 +23,7 @@ import shlex
 import shutil
 import statistics
 import subprocess
+import re
 from retention_comparison_support import (dependencies, compiler_flags, compile_command,
     runtime_environment, verify_native, compiler_identity, execute_benchmark,
     failure_report, export_git_snapshot, verify_git_snapshot)
@@ -54,6 +55,14 @@ def capture(command, **kwargs):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+def parent_binding_api(header):
+    """Detect the actual inline API in each frozen production header."""
+    text = header.read_text(encoding='utf-8')
+    text = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+                  ' ', text, flags=re.S)
+    return bool(re.search(r'\bstatic\s+inline\s+void\s+edr_behavior_bind_parent_context\s*'
+                          r'\(\s*EdrBehaviorRecord\s*\*\s*\w+\s*\)\s*\{', text))
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
@@ -104,7 +113,8 @@ metadata = {'baseline_revision': revision,
             'cpu_clock': 'GetProcessTimes' if os.name == 'nt' else 'getrusage',
             'wall_clock': 'QueryPerformanceCounter' if os.name == 'nt' else 'CLOCK_MONOTONIC',
             'io_boundary': 'SQLite-issued VFS bytes and optional Windows process-issued bytes; not device I/O',
-            'time_boundary': '8 simulated event hours, not an 8-hour wall-clock soak'}
+            'time_boundary': '8 simulated event hours, not an 8-hour wall-clock soak',
+            'source_api_features': {}}
 (out/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
 summaries = {}
 frozen_sources = []
@@ -112,6 +122,16 @@ for name, source, selected in [('old',old,1), ('current_1h',current,1), ('curren
     failure['stage'] = 'variant_prepare'
     sources = SOURCES + (QUEUE_SOURCES if source == current else [])
     selected_defines = list(defines)
+    binding_header = source/'include/edr/behavior_record.h'
+    binding_api = parent_binding_api(binding_header)
+    if source == current and not binding_api:
+        raise RuntimeError('Current source requires its real parent-context binding API')
+    selected_defines += ['BENCH_HAS_PARENT_CONTEXT_BINDING='+str(int(binding_api))]
+    metadata['source_api_features'][name] = {
+        'parent_context_binding_api': binding_api,
+        'behavior_record_header_sha256': digest(binding_header.read_bytes()),
+        'fixture_behavior': 'call_production_inline' if binding_api else 'legacy_tuple_source_unchanged'}
+    (out/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
     if source == current:
         selected_defines += ['BENCH_REAL_QUEUE=1', 'BENCH_SOURCE="current"',
                     'BENCH_SELECTED_HOURS='+str(selected)]

@@ -37,7 +37,7 @@ file pages, not a promise that deleting one record returns those bytes to disk.
 | dictionaries without a current main candidate | 1,000 (763 with bundle, 237 without) | Unknown external/recovery ownership, protected |
 | shared fact templates | 16,058 shared facts, 10,286,009 unique template bytes | Owner degree 2..128; preserve every surviving dependency |
 | single-owner fact templates | 4,281 facts, 3,897,438 template bytes | One dictionary owner is not proof that its external duties ended |
-| command_results | 1,900 rows, 746,381 column-value bytes | Query copies; not the main evidence-space consumer here |
+| command_results | 1,900 rows, 746,381 column-value bytes | Local terminal-result copies; not the main evidence-space consumer here |
 
 Column-value lengths exclude SQLite record headers, page slack and indexes.
 The difference between dictionary and main counts (994) is not an orphan
@@ -118,9 +118,11 @@ bytes, hash, batch ID, lineage, ACK, parent binding or classification are
 rewritten. Old zero rows have no new minimum-residence promise. Ambiguous
 owners remain protected and individually counted rather than bulk-classified.
 
-Even this additive change is a real-store migration. Installing it on the
-UTM's real cache requires a separate concrete authorization after synthetic
-and native verification. No migration has been run on either real snapshot.
+Even this additive change is a real-store migration. Cache open also invokes
+the existing legacy-artifact migration, maintenance and PMFE running-to-scheduled
+restoration. Installing it on the UTM's real cache requires a separate concrete
+authorization covering these side effects after synthetic and native verification.
+No migration has been run on either real snapshot.
 Old-data reclassification/disposal requires a second bounded plan proving
 record type, all surviving owners and concurrency/recovery protection. The
 current read-only findings authorize no deletion, including of diagnostic copies.
@@ -135,16 +137,44 @@ Read-only inspection found `FDSecurityAgent` running as SYSTEM via its existing
 PowerShell launcher with unlimited task runtime; the three guessed SCM service
 names are absent. No real task was restarted in this inventory.
 
+The actual a978 cache owner was subsequently compiled against its unchanged
+source and exercised on new synthetic stores at 16 MiB and 1 MiB: new seed,
+old open/maintenance/replay/new context/command-result copy, then new reopen.
+Frozen owner, bundle, refs, command objects, seven guards and clock stayed
+unchanged, and the exact query result survived. Old open succeeds, but its
+metrics cleanup repeatedly hits the clock guard. Its two aggregate failure
+counters remain zero and a later successful write clears last_error. This is
+not a healthy transparent rollback or a durable old-runtime degradation signal;
+an operational rollback gate must account for it. No actual installed Agent
+or cached-IR downgrade was performed by this storage-only experiment.
+
 ### Verification boundary for this patch
 
 The host equal-input comparison ran the actual storage/codec owners against
-unchanged baseline source with identical input digest and 8 MiB budget over
+unchanged baseline `6bedb86bf9811bc304f4c97fdd62212ef437423f`, with identical
+input digest and 8 MiB budget over
 eight **simulated** event hours. One run each retained 6 complete embedded
 parent chains with a 1 h selected target and 24 with 4 h; baseline retained zero
 embedded chains and six reconstructable cache chains. All three had zero
-orphan refs and successful integrity checks. Current write amplification and
+orphan refs and successful integrity checks. These chain improvements reflect
+the accumulated retention/snapshot changes; the separate 121-second versus
+floor-expiry fixture isolates the new minimum-residence behavior.
+Current write amplification and
 CPU/I/O are recorded, not hidden by smaller final files. This is not Windows
 wall-clock endurance or a native-device I/O measurement.
+
+The full host runner also passed three runs per variant against both requested
+references: audit `0ae3fb28e553223358db1a83ebd26432336af9e7` and comparison
+`3de0dc680c78c335f8ab6ba37eef0d0f5d8f46e2`. All input hashes are identical.
+Audit 662 lacks the later inline parent-binding API: the test runner records
+the frozen header hash and calls that API only where it actually exists.
+The old tuple/source values and all frozen production bytes are unchanged;
+current source must call its real binding API. Wrong feature configurations
+are compile-time failures. The native workflow now explicitly selects audit
+662 as its evidence-comparison baseline. Host medians against 662 were
+0.167/0.369/0.375 CPU seconds and 275/562/523 SQLite write amplification for
+old/current-1h/current-4h respectively. Better chain retention is not a claim
+of lower CPU, writes or physical peak.
 
 The new `--alert-parent-soak <seconds>` fixture uses actual QPC/CLOCK_MONOTONIC,
 1 h recent/selected targets and a new 64 MiB synthetic database. It offers

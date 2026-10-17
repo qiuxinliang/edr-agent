@@ -197,6 +197,14 @@ static int64_t compact_scalar(sqlite3 *db, const char *sql) {
 #endif
 #include "retention_benchmark_support.h"
 
+#if !defined(BENCH_HAS_PARENT_CONTEXT_BINDING) || \
+    (BENCH_HAS_PARENT_CONTEXT_BINDING != 0 && BENCH_HAS_PARENT_CONTEXT_BINDING != 1)
+#error "Runner must select the parent-binding API from the frozen source header"
+#endif
+#if defined(BENCH_REAL_QUEUE) && !BENCH_HAS_PARENT_CONTEXT_BINDING
+#error "Current source must use its production parent-context binding API"
+#endif
+
 static void test_retention_value_benchmark(void) {
   const int64_t base=INT64_C(1700000000000000000);
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
@@ -229,7 +237,9 @@ static void test_retention_value_benchmark(void) {
         r->parent_process_start_key=r->ppid; r->parent_process_creation_filetime_100ns=133700000000000000ULL+r->ppid;
         snprintf(r->parent_resolution_source,sizeof(r->parent_resolution_source),"live_parent_generation");
         snprintf(r->parent_name,sizeof(r->parent_name),"ordinary-parent.exe"); snprintf(r->parent_path,sizeof(r->parent_path),"C:\\ordinary-parent.exe");
+#if BENCH_HAS_PARENT_CONTEXT_BINDING
         edr_behavior_bind_parent_context(r);
+#endif
         if (!(item%4)) r->type=EDR_EVENT_PMFE_SCAN_RESULT;
         benchmark_input(r); edr_local_evidence_cache_record_behavior(r);
         if (!(item%4)) {
