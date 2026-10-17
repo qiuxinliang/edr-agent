@@ -862,7 +862,7 @@ function Start-AgentRuntime {
 }
 
 function Get-UnixTimeMilliseconds {
-  return [UInt64][Math]::Floor((((Get-Date).ToUniversalTime()) - [DateTime]'1970-01-01T00:00:00Z').TotalMilliseconds)
+  return [UInt64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 }
 
 function Wait-AgentHealthObservation {
@@ -872,11 +872,27 @@ function Wait-AgentHealthObservation {
     [string]$TaskPath,
     [string]$WindowsServiceName,
     [string]$ExecutablePath,
-    [UInt64]$ObserveUntilUnixMs
+    [UInt64]$ObserveForMs
   )
 
-  $nextCheckpoint = Get-UnixTimeMilliseconds
-  while ((Get-UnixTimeMilliseconds) -lt $ObserveUntilUnixMs) {
+  if ($ObserveForMs -gt [UInt64][Int64]::MaxValue) {
+    throw 'health observation duration exceeds supported elapsed range'
+  }
+  # UTC fields are durable diagnostics, never elapsed-time authority. A new
+  # process cannot recover Stopwatch credit, so every interrupted observation
+  # starts a complete conservative window, including legacy unversioned epochs.
+  $started = Get-UnixTimeMilliseconds
+  $journal['health_observation_clock_version'] = 1
+  $journal['health_observation_started_at_unix_ms'] = $started
+  # Legacy updaters only trust a positive value here. Zero intentionally
+  # requests their existing fresh-window path after a downgrade/restart.
+  $journal['health_observation_deadline_unix_ms'] = 0
+  $journal['health_observation_utc_deadline_unix_ms'] = $started + $ObserveForMs
+  $journal['health_last_checked_unix_ms'] = $started
+  Set-UpdateStage -Stage 'health_observation'
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  [Int64]$nextCheckpoint = 0
+  while ($watch.ElapsedMilliseconds -lt $ObserveForMs) {
     if (@(Get-AgentProcesses -ExecutablePath $ExecutablePath).Count -eq 0) {
       throw 'FDSensor.exe exited during the local health observation window'
     }
@@ -891,13 +907,13 @@ function Wait-AgentHealthObservation {
         throw 'Agent scheduled task stopped during the local health observation window'
       }
     }
-    $now = Get-UnixTimeMilliseconds
-    if ($now -ge $nextCheckpoint) {
-      $journal['health_last_checked_unix_ms'] = $now
+    $elapsed = $watch.ElapsedMilliseconds
+    if ($elapsed -ge $nextCheckpoint) {
+      $journal['health_last_checked_unix_ms'] = Get-UnixTimeMilliseconds
       Set-UpdateStage -Stage 'health_observation'
-      $nextCheckpoint = $now + 10000
+      $nextCheckpoint = $elapsed + 10000
     }
-    $remainingMs = [Int64]$ObserveUntilUnixMs - [Int64](Get-UnixTimeMilliseconds)
+    $remainingMs = [Int64]$ObserveForMs - $watch.ElapsedMilliseconds
     if ($remainingMs -gt 0) {
       $sleepMs = [int][Math]::Min(1000, [Math]::Max(100, $remainingMs))
       Start-Sleep -Milliseconds $sleepMs
@@ -1011,8 +1027,10 @@ $journal = [ordered]@{
   failed_path = $failedPath
   resolved_deployment_mode = $null
   previous_sha256 = $null
+  health_observation_clock_version = 0
   health_observation_started_at_unix_ms = 0
   health_observation_deadline_unix_ms = 0
+  health_observation_utc_deadline_unix_ms = 0
   health_last_checked_unix_ms = 0
   runtime_files = @()
   full_installer_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerBackupPath } else { $null }
@@ -1172,7 +1190,8 @@ try {
     $journal['error'] = $prior.error
     $priorProperties = @($prior.PSObject.Properties.Name)
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
-        'health_observation_started_at_unix_ms','health_observation_deadline_unix_ms','health_last_checked_unix_ms',
+        'health_observation_clock_version','health_observation_started_at_unix_ms','health_observation_deadline_unix_ms',
+        'health_observation_utc_deadline_unix_ms','health_last_checked_unix_ms',
         'expected_runtime_identity_sha256')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
@@ -1232,8 +1251,7 @@ try {
     $currentMatchesBackup = (Test-Path -LiteralPath $backupPath -PathType Leaf) -and
       $currentHash -eq (Get-Sha256 -Path $backupPath)
     $binaryCommitDetected = $currentMatchesCandidate -or ([bool]$prior.replacement_committed -and -not $currentMatchesBackup)
-    $resumeHealthObservation = [string]$prior.stage -eq 'health_observation' -and
-      [UInt64]$journal['health_observation_deadline_unix_ms'] -gt 0
+    $resumeHealthObservation = [string]$prior.stage -eq 'health_observation'
     $expectedRecoveredHealthStatus = if ($Operation -eq 'rollback') {
       'rollback_health_check'
     } else {
@@ -1309,24 +1327,17 @@ try {
         -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
         -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
     }
-    if (-not $resumeHealthObservation) {
-      $observationStarted = Get-UnixTimeMilliseconds
-      $journal['health_observation_started_at_unix_ms'] = $observationStarted
-      $journal['health_observation_deadline_unix_ms'] = $observationStarted + $HealthObserveMs
-      $observingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'restarting' }
-      Add-UpdateEvent -Status $observingStatus -Progress 90 -Detail @{
-        stage = 'local_health_observation'; health_observe_ms = $HealthObserveMs; local_watchdog = 'observing'; recovered = $true
-      }
-    }
-    $observeUntil = [UInt64]$journal['health_observation_deadline_unix_ms']
-    if ($observeUntil -le 0) {
-      $observeUntil = (Get-UnixTimeMilliseconds) + $HealthObserveMs
-      $journal['health_observation_deadline_unix_ms'] = $observeUntil
+    # No absolute timestamp, clock version or offline interval can supply
+    # trustworthy elapsed credit after process restart. The durable passed
+    # branch above remains idempotent and does not reopen health observation.
+    $observingStatus = if ($Operation -eq 'rollback') { 'rolling_back' } else { 'restarting' }
+    Add-UpdateEvent -Status $observingStatus -Progress 90 -Detail @{
+      stage = 'local_health_observation'; health_observe_ms = $HealthObserveMs; local_watchdog = 'observing'; recovered = $true
     }
     Set-UpdateStage -Stage 'health_observation'
     Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
       -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
-      -ObserveUntilUnixMs $observeUntil
+      -ObserveForMs $HealthObserveMs
     $healthStatus = if ($Operation -eq 'rollback') { 'rollback_health_check' } else { 'health_check' }
     Add-UpdateEvent -Status $healthStatus -Progress 100 -Detail @{
       stage = 'local_health_observation_passed'; health_observe_ms = $HealthObserveMs; local_watchdog = 'passed'; recovered = $true
@@ -1422,12 +1433,11 @@ try {
       Assert-InstalledRuntimeIdentity -InstallDirectory $installFull -ExpectedIdentitySha256 ([string]$setupPackage.RuntimeIdentitySha256)
     }
     $report['installed_sha256'] = Get-Sha256 -Path $currentPath
-    $observationDeadline = (Get-UnixTimeMilliseconds) + $HealthObserveMs
     Add-UpdateEvent -Status 'restarting' -Progress 90 -Detail @{ stage = 'full_installer_health_observation'; health_observe_ms = $HealthObserveMs }
     Set-UpdateStage -Stage 'health_observation'
     Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
       -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
-      -ObserveUntilUnixMs $observationDeadline
+      -ObserveForMs $HealthObserveMs
     Add-UpdateEvent -Status 'health_check' -Progress 100 -Detail @{ stage = 'full_installer_health_passed'; upgrade_class = $UpgradeClass }
     $report['status'] = 'succeeded'
     Set-UpdateStage -Stage 'completed' -Status 'succeeded'
@@ -1492,17 +1502,13 @@ try {
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
     -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
   $report["installed_sha256"] = Get-Sha256 -Path $currentPath
-  $observationStarted = Get-UnixTimeMilliseconds
-  $observationDeadline = $observationStarted + $HealthObserveMs
-  $journal['health_observation_started_at_unix_ms'] = $observationStarted
-  $journal['health_observation_deadline_unix_ms'] = $observationDeadline
   Add-UpdateEvent -Status $restartingStatus -Progress 90 -Detail @{
     stage = 'local_health_observation'; health_observe_ms = $HealthObserveMs; local_watchdog = 'observing'
   }
   Set-UpdateStage -Stage 'health_observation'
   Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
-    -ObserveUntilUnixMs $observationDeadline
+    -ObserveForMs $HealthObserveMs
   $healthStatus = if ($Operation -eq 'rollback') { 'rollback_health_check' } else { 'health_check' }
   Add-UpdateEvent -Status $healthStatus -Progress 100 -Detail @{
     stage = 'local_health_observation_passed'; health_observe_ms = $HealthObserveMs; local_watchdog = 'passed'
@@ -1555,9 +1561,9 @@ try {
       }
       Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath `
         -WindowsServiceName $ServiceName -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
-      $rollbackObserveUntil = (Get-UnixTimeMilliseconds) + [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
+      $rollbackObserveMs = [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
       Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath `
-        -WindowsServiceName $ServiceName -ExecutablePath $currentPath -ObserveUntilUnixMs $rollbackObserveUntil
+        -WindowsServiceName $ServiceName -ExecutablePath $currentPath -ObserveForMs $rollbackObserveMs
       $report['rollback'] = 'succeeded'
       $report['status'] = 'failed_rolled_back'
       $report['installed_sha256'] = Get-Sha256 -Path $currentPath
@@ -1602,11 +1608,11 @@ try {
       Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
         -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName `
         -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
-      $rollbackObserveUntil = (Get-UnixTimeMilliseconds) + [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
+      $rollbackObserveMs = [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
       Set-UpdateStage -Stage 'rollback_health_observation'
       Wait-AgentHealthObservation -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
         -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath `
-        -ObserveUntilUnixMs $rollbackObserveUntil
+        -ObserveForMs $rollbackObserveMs
       $report["rollback"] = "succeeded"
       $report["status"] = "failed_rolled_back"
       $report["installed_sha256"] = Get-Sha256 -Path $currentPath

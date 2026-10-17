@@ -23,6 +23,7 @@ $relativePaths = @(
   "scripts\edr_agent_install.ps1",
   "scripts\edr_agent_preflight.ps1",
   "scripts\edr_agent_inplace_update.ps1",
+  "tests\test_windows_updater_health_clock.ps1",
   "scripts\edr_agent_postinstall_verify.ps1",
   "scripts\edr_agent_zip_deploy.ps1",
   "scripts\windows_service_install.ps1",

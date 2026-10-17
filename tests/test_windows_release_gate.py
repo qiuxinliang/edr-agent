@@ -5,6 +5,7 @@ The host admission probe only adapts OS locks/clock; it is not Windows emulation
 The actual tests still run natively in the normal Windows CTest gate.
 """
 import json
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import io
 import os
@@ -38,7 +39,7 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
-    "windows_update_physical_guard", "windows_inno_evidence_space",
+    "windows_update_physical_guard", "windows_updater_health_clock", "windows_inno_evidence_space",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
@@ -186,6 +187,48 @@ class WindowsReleaseGateTests(unittest.TestCase):
                                      *probe, success=False, env=inherited)
                     self.run_command(*wrapper, *probe, env=inherited)
                     self.assertEqual(inherited["PSModulePath"], test_env["PSModulePath"])
+
+    def test_updater_health_clock_uses_checkout_sha_and_isolated_powershell(self):
+        production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        start = production.index("  # Pin the actual checkout bytes at configure time;")
+        end = production.index("  add_test(NAME windows_installer_acl_behavior", start)
+        fragment = production[start:end].replace(
+            "${CMAKE_CURRENT_SOURCE_DIR}", (ROOT / "tests").as_posix()).replace(
+            "${CMAKE_SOURCE_DIR}", ROOT.as_posix())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(UpdaterClockPin NONE)\nenable_testing()\n"
+                + fragment, encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            listed = self.run_command("ctest", "--test-dir", str(build), "--show-only=json-v1")
+            tests = json.loads(listed.stdout)["tests"]
+            self.assertEqual([test["name"] for test in tests], ["windows_updater_health_clock"])
+            command = tests[0]["command"]
+            expected = hashlib.sha256((ROOT / "scripts/edr_agent_inplace_update.ps1").read_bytes()).hexdigest()
+            self.assertIn("--unset=PSModulePath", command)
+            self.assertIn("powershell.exe", command)
+            self.assertIn("-NonInteractive", command)
+            self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
+            self.assertIn("-UpdaterPath '" + (ROOT / "scripts/edr_agent_inplace_update.ps1").as_posix() + "'", command[-1])
+            properties = {item["name"]: item["value"] for item in tests[0]["properties"]}
+            self.assertEqual(properties["TIMEOUT"], 30)
+            self.assertEqual(properties["ENVIRONMENT"], ["PSModulePath=" + (build / "foreign-powershell-modules").as_posix()])
+
+    def test_updater_health_clock_is_required_and_failure_blocks_windows_gate(self):
+        name = "windows_updater_health_clock"
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, missing_test=name)
+            result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
+            self.assertIn("Windows release gate test is not registered: " + name, result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, failing_test=name)
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                      "-R", "^" + name + "$", "--no-tests=error", "--output-on-failure", success=False)
+            self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
+            self.assertNotIn("***Not Run", result.stdout)
 
     def test_sqlite_header_relocation_includes_vcpkg_companion(self):
         with tempfile.TemporaryDirectory() as directory:

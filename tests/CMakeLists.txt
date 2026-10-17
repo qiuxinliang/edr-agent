@@ -268,6 +268,16 @@ if(WIN32)
     windows_update_physical_guard
     PROPERTIES TIMEOUT 60
     ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
+  # Pin the actual checkout bytes at configure time; no private/source hash is embedded.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1")
+  file(SHA256 "${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1"
+    _edr_updater_health_source_sha256)
+  add_test(NAME windows_updater_health_clock
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_health_clock.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1' -UpdaterSha256 '${_edr_updater_health_source_sha256}'")
+  set_tests_properties(windows_updater_health_clock PROPERTIES TIMEOUT 30
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")
