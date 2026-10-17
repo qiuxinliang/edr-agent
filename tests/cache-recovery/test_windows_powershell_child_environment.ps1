@@ -70,22 +70,56 @@ function ReadSmall([string]$Path) {
   } finally {$s.Dispose()}
 }
 
+# Failure-only public synthetic output. Never reads an active child's logs.
+function ReadProbeFailureLog([string]$Path) {
+  $before=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if($before.PSIsContainer -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Length -gt 4096){throw 'probe_failure_log_bound'}
+  $beforeLength=[long]$before.Length
+  $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+  try {
+    if($stream.Length -gt 4096){throw 'probe_failure_log_bound'}
+    $buffer=New-Object byte[] 4097;$count=0
+    while($count -lt $buffer.Length){$n=$stream.Read($buffer,$count,$buffer.Length-$count);if($n -eq 0){break};$count+=$n}
+    if($count -gt 4096 -or $stream.Length -ne $count){throw 'probe_failure_log_bound_or_changed'}
+  }finally{$stream.Dispose()}
+  $after=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if($after.PSIsContainer -or ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $after.Length -gt 4096){throw 'probe_failure_log_bound'}
+  if($count -ne $beforeLength -or $count -ne $after.Length -or $before.CreationTimeUtc -ne $after.CreationTimeUtc -or $before.LastWriteTimeUtc -ne $after.LastWriteTimeUtc){throw 'probe_failure_log_changed'}
+  $sha=[Security.Cryptography.SHA256]::Create()
+  try{$digest=([BitConverter]::ToString($sha.ComputeHash($buffer,0,$count))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  $validUtf8=$true
+  try{$null=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$count)}catch{$validUtf8=$false}
+  return @{status='captured';bytes=$count;sha256=$digest;raw_base64=[Convert]::ToBase64String($buffer,0,$count);utf8_valid=$validUtf8}
+}
+function WriteProbeFailure($Value) {
+  # Keep the first ErrorRecord even if diagnostic emission itself is unavailable.
+  $script:lastProbeFailure=$Value
+  try{[Console]::Error.WriteLine(($Value | ConvertTo-Json -Depth 8 -Compress));[Console]::Error.Flush()}
+  catch{$script:lastProbeDiagnosticEmissionFailureType=$_.Exception.GetType().FullName}
+}
 function Probe([string]$Label,[bool]$Isolated,[string]$ModulePath,[string]$Script=$worker,[int]$ExpectedExit=-1) {
   $out=Join-Path $dir ($Label+'.out');$err=Join-Path $dir ($Label+'.err');$p=$null
-  $clock=[Diagnostics.Stopwatch]::StartNew()
+  $clock=[Diagnostics.Stopwatch]::StartNew();$phase='prepare';$primary=$null
   try {
     [Environment]::SetEnvironmentVariable('PSModulePath',$ModulePath,[EnvironmentVariableTarget]::Process)
     $inherited=[Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process)
     try {
+      $phase='launch'
       if ($Isolated) {$p=StartWindowsPowerShellChild $Script $out $err}
       else {$p=Start-Process -FilePath $winps -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$Script+'"')) -PassThru -RedirectStandardOutput $out -RedirectStandardError $err}
       if ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -cne $inherited) {throw 'launch_changed_parent_modulepath'}
     } finally {[Environment]::SetEnvironmentVariable('PSModulePath',$original,[EnvironmentVariableTarget]::Process)}
     # Test-only .NET Framework observation fix, never part of driver WaitProcess.
     if($CacheOwnedHandleForTest){$ownedHandle=$p.Handle;if($ownedHandle -eq [IntPtr]::Zero){throw 'test_handle_cache_failed'}}
-    $code=WaitProcess $p 5 'probe_child_terminal_unknown_no_retry'
+    # A valid cold PS5.1 launch took 4786ms on the previous actual runner.
+    # Ten seconds is this synthetic fixture's bounded startup budget, not a
+    # product SLO. A timeout still fails and uses the unchanged owned cleanup.
+    $phase='wait_terminal'
+    $code=WaitProcess $p 10 'probe_child_terminal_unknown_no_retry'
+    $phase='read_public_output'
     $stdout=ReadSmall $out;$stderr=ReadSmall $err
     if ($stderr.Length) {throw 'probe_stderr_nonempty'}
+    $phase='verify_child_contract'
     $data=$stdout | ConvertFrom-Json -ErrorAction Stop
     if ($data.schema -cne 'edr.ps51-public-file-probe.v1' -or $data.child_pid -ne $p.Id -or $data.ps_major -ne 5) {throw 'actual_ps51_child_identity'}
     $good=$data.hash_available -eq $true -and $data.hash_read_succeeded -eq $true -and $data.service_command_discoverable -eq $true -and $data.sha256 -ceq $expected
@@ -93,12 +127,31 @@ function Probe([string]$Label,[bool]$Isolated,[string]$ModulePath,[string]$Scrip
     if ($Isolated -and -not $good) {throw 'isolated_child_missing_builtin_cmdlet'}
     if (-not $Isolated -and $code -notin @(0,71)) {throw 'unexpected_old_probe_exit'}
     $null=$rows.Add(@{case=$Label;isolated=$Isolated;actual_pid=$p.Id;worker_pid=$data.child_pid;ps_major=$data.ps_major;exit_code=$code;hash_available=$data.hash_available;hash_read_succeeded=$data.hash_read_succeeded;hash_lookup_cause=$data.hash_lookup_cause;hash_command_type=$data.hash_command_type;hash_module=$data.hash_module;service_command_discoverable=$data.service_command_discoverable;hash_match=($data.sha256 -ceq $expected);elapsed_ms=$clock.ElapsedMilliseconds;parent_process_environment_restored=$true;requested_empty_modulepath=($ModulePath -ceq '');actual_inherited_key_present=($null -ne $inherited);native_child_executed=$true})
-  } finally {
-    [Environment]::SetEnvironmentVariable('PSModulePath',$original,[EnvironmentVariableTarget]::Process)
+  } catch {$primary=$_;throw} finally {
+    $cleanupType=$null;$restoreType=$null
+    try{[Environment]::SetEnvironmentVariable('PSModulePath',$original,[EnvironmentVariableTarget]::Process)}catch{$restoreType=$_.Exception.GetType().FullName}
+    $observation=@{actual_pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null}
     if ($null -ne $p) {
-      if (-not $p.HasExited) {$p.Kill();if(-not $p.WaitForExit(10000)){throw 'probe_cleanup_unknown'}}
-      $p.Dispose()
+      try{if(-not $p.HasExited){$p.Kill();if(-not $p.WaitForExit(10000)){throw 'probe_cleanup_unknown'}}}catch{$cleanupType=$_.Exception.GetType().FullName}
+      try{$observation.actual_pid=$p.Id;$observation.birth_filetime=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}catch{$observation.identity_observation_failure_type=$_.Exception.GetType().FullName}
+      try{$p.Refresh();if($p.HasExited){$observation.terminal_known=$true;$exit=$p.ExitCode;if($null -ne $exit -and $exit -is [int]){$observation.exit_known=$true;$observation.exit_code=$exit}}}catch{$observation.terminal_observation_failure_type=$_.Exception.GetType().FullName}
     }
+    if($null -ne $primary -or $cleanupType -or $restoreType){
+      $logs=@{}
+      foreach($kind in @('stdout','stderr')){
+        if($observation.terminal_known){
+          try{$path=if($kind -ceq 'stdout'){$out}else{$err};$logs[$kind]=ReadProbeFailureLog $path}
+          catch{$logs[$kind]=@{status='capture_failed';exception_type=$_.Exception.GetType().FullName}}
+        }else{$logs[$kind]=@{status='not_captured';reason='owned_child_terminal_unknown'}}
+      }
+      $cause=if($null -ne $primary -and $primary.Exception.Message -ceq 'probe_child_terminal_unknown_no_retry'){'probe_child_terminal_unknown_no_retry'}else{'probe_contract_or_io_failure'}
+      $value=@{schema='edr.ps51-public-probe-failure.v1';case=$Label;phase=$phase;requested_wait_seconds=10;elapsed_ms=$clock.ElapsedMilliseconds;child=$observation;primary_failure_type=$(if($null -ne $primary){$primary.Exception.GetType().FullName}else{$null});primary_cause=$cause;cleanup_failure_type=$cleanupType;environment_restore_failure_type=$restoreType;public_logs=$logs;automatic_retry=$false;updater_main_executed=$false;scm_operations=0}
+      # Snapshot precedes Dispose, and both diagnostic and Dispose failures must
+      # remain secondary to the original finite-operation failure.
+      if($null -ne $p){try{$p.Dispose()}catch{$value.dispose_failure_type=$_.Exception.GetType().FullName}}
+      WriteProbeFailure $value
+      if($null -eq $primary){throw 'probe_cleanup_or_environment_restore_unknown'}
+    }elseif($null -ne $p){$p.Dispose()}
   }
 }
 
