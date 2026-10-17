@@ -201,6 +201,60 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         evidence = lifecycle.split('- name: Upload Windows lifecycle evidence', 1)[1]
         self.assertIn('retention-days: 7', evidence)
 
+    def assert_lifecycle_reusable_permissions(self, caller_job, callee_text):
+        # Named permission maps in these two source-owned workflow blocks.
+        # A job map replaces workflow defaults; a skipped job still declares
+        # the permissions the reusable workflow requests from its caller.
+        ranks = {'none': 0, 'read': 1, 'write': 2}
+
+        def permission_map(text, indent):
+            match = re.search(r'^' + indent + r'permissions:\n'
+                              r'((?:' + indent + r'  [^\n]*\n)+)', text, re.M)
+            if match is None:
+                return None
+            pairs = []
+            for line in match[1].splitlines():
+                if not line.strip() or line.strip().startswith('#'):
+                    continue
+                item = re.fullmatch(indent + r'  ([\w-]+): ([\w]+)', line)
+                self.assertIsNotNone(item, 'unsupported named permission declaration')
+                pairs.append(item.groups())
+            self.assertEqual(len(pairs), len(dict(pairs)), 'duplicate named permission')
+            for _, level in pairs:
+                self.assertIn(level, ranks)
+            return dict(pairs)
+
+        allowed = permission_map(caller_job, '    ')
+        self.assertIsNotNone(allowed, 'lifecycle caller keeps explicit job permissions')
+        defaults = permission_map(callee_text.split('\njobs:\n', 1)[0], '')
+        self.assertIsNotNone(defaults, 'lifecycle callee declares workflow permissions')
+        callee_jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+                                      callee_text.split('\njobs:\n', 1)[1], re.M | re.S))
+        self.assertIn('native-lifecycle', callee_jobs)
+        self.assertIn('recover-synthetic-owner', callee_jobs)
+        for name, body in callee_jobs.items():
+            required = permission_map(body, '    ')
+            if required is None:
+                required = defaults
+            for scope, level in required.items():
+                self.assertGreaterEqual(ranks[allowed.get(scope, 'none')], ranks[level],
+                                        f'lifecycle caller cannot grant {name} {scope}:{level}')
+
+    def test_reusable_lifecycle_permissions_cover_actual_callee_jobs(self):
+        callee = (ROOT / '.github/workflows/windows-install-upgrade-rollback.yml').read_text(encoding='utf-8')
+        self.assert_lifecycle_reusable_permissions(self.jobs['windows-lifecycle'], callee)
+
+    def test_reusable_lifecycle_rejects_missing_actions_read_even_for_manual_job(self):
+        callee = (ROOT / '.github/workflows/windows-install-upgrade-rollback.yml').read_text(encoding='utf-8')
+        caller = self.jobs['windows-lifecycle']
+        self.assertEqual(caller.count('      actions: read\n'), 1)
+        # Keep the callee manual-only condition, and the caller workflow-level
+        # actions:read: neither restores an omitted explicit job permission.
+        self.assertIn("inputs.cache_recovery_subset == true", callee)
+        self.assertIn('  actions: read', self.text.split('\njobs:\n', 1)[0])
+        with self.assertRaisesRegex(AssertionError, 'recover-synthetic-owner actions:read'):
+            self.assert_lifecycle_reusable_permissions(caller.replace('      actions: read\n', '', 1), callee)
+
     def test_source_packaging_contract_runs_before_native_build(self):
         prepare = self.jobs['prepare-release']
         self.assertIn('python3 tests/test_windows_release_workflow.py', prepare)

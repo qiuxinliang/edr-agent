@@ -1573,6 +1573,7 @@ jobs:
     needs: [prepare-release, usb-finalize]
     permissions:
       contents: write
+      actions: read
     uses: ./.github/workflows/windows-install-upgrade-rollback.yml
     with:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
