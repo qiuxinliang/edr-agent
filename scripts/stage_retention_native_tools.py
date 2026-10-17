@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Stage an already-tested native SQLite diagnostic tool; never build or download.
+"""Stage a compiled native SQLite diagnostic tool; never build or download.
 
 This is a private CI diagnostic artifact, not an Agent/installer/release payload.
 The fixture uses real storage/query owners but has test-only rule matcher stubs.
-Staging success records earlier native contracts, not a later comparison result.
+The caller supplies the actual prior native-contract outcome. Failed-gate tools
+are limited to isolated sliced-reclaim reproduction, never acceptance evidence.
+Staging success is not a native-contract or later comparison result.
 """
 import argparse
 import hashlib
@@ -150,6 +152,10 @@ def verify_stage(directory, manifest):
 
 def stage(args):
     deadline = time.monotonic() + 120
+    prior_status = getattr(args, "prior_contract_status", "passed")
+    if prior_status not in ("passed", "failed"):
+        raise ValueError("Prior native-contract status must be passed or failed")
+    prior_passed = prior_status == "passed"
     if not re.fullmatch(r"[0-9a-f]{40}", args.source_sha) or not re.fullmatch(r"[1-9][0-9]*", args.run_id) or not re.fullmatch(r"[1-9][0-9]*", args.run_attempt):
         raise ValueError("Exact source/run identity is required")
     repo = real_path(args.repo, directory=True)
@@ -211,15 +217,24 @@ def stage(args):
         provenance[label] = {"name": path.name, "bytes": path.stat().st_size, "sha256": digest(path)}
     manifest = {"schema": "edr.retention-native-tools.v1", "source_sha": args.source_sha,
                 "arch": args.arch, "run_id": args.run_id, "run_attempt": args.run_attempt,
-                "purpose": "private_isolated_storage_diagnostics", "product_payload": False,
-                "native_contracts_passed_before_staging": True,
-                "native_contract_status_authority": "prior_successful_workflow_step_not_parsed_by_stager",
+                "purpose": "private_isolated_storage_diagnostics" if prior_passed else "private_failed_gate_diagnostics",
+                "product_payload": False, "prior_contract_status": prior_status,
+                "native_contracts_passed_before_staging": prior_passed,
+                "native_contract_status_authority": ("prior_successful_workflow_step_not_parsed_by_stager" if prior_passed
+                                                     else "prior_failed_workflow_step_not_parsed_by_stager"),
                 "equal_input_comparison_status": "not_run_at_staging",
                 "limitations": ["test_only_rule_matcher_stubs", "not_live_endpoint_load_evidence",
                                 "not_a_whole_workflow_or_release_gate_result"],
                 "msvc_redist_version": redist.name, "provenance": provenance,
                 "os_imports_not_packaged": sorted({d for f in files.values() for d in f["imports"] if d in OS_DLLS}),
                 "files": [{k: v for k, v in f.items() if k != "source"} for _, f in sorted(files.items())]}
+    if not prior_passed:
+        # This restriction is consumed by the private supervisor, not by any
+        # product/release owner. The workflow must preserve its gate failure.
+        manifest["allowed_diagnostic_argv"] = [["--sliced-reclaim-contract"]]
+        manifest["limitations"] += ["prior_native_contracts_failed",
+                                    "isolated_sliced_reclaim_reproduction_only",
+                                    "not_long_soak_or_release_acceptance"]
     output = Path(os.path.abspath(args.output))
     real_path(output.parent, directory=True)
     if output.exists() or output.is_symlink():
@@ -253,11 +268,15 @@ def main():
     for flag in ("repo", "build-dir", "dependency-prefix", "msvc-redist-root", "compiler", "dumpbin", "output"):
         parser.add_argument("--" + flag, type=Path, required=True)
     parser.add_argument("--arch", choices=sorted(MACHINES), required=True)
+    parser.add_argument("--prior-contract-status", choices=("passed", "failed"), default="passed",
+                        help="actual workflow step outcome; not independently verified by this stager")
     for flag in ("source-sha", "run-id", "run-attempt"):
         parser.add_argument("--" + flag, required=True)
     manifest = stage(parser.parse_args())
     print(json.dumps({"staged": True, "source_sha": manifest["source_sha"],
                       "arch": manifest["arch"], "files": len(manifest["files"]),
+                      "purpose": manifest["purpose"], "prior_contract_status": manifest["prior_contract_status"],
+                      "native_contracts_passed_before_staging": manifest["native_contracts_passed_before_staging"],
                       "whole_workflow_pass_claimed": False}))
 
 

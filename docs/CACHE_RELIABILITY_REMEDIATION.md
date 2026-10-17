@@ -186,12 +186,29 @@ admission plus two reopens; short smoke runs are labelled separately.
 The 64 MiB fixture and 256 MiB safety-stop peak are test parameters, not new
 production defaults or physical guarantees.
 
-The native comparison workflow now preserves only the tested cache fixture
+The native comparison workflow now preserves only the compiled cache fixture
 and its verified transitive DLL closure as a private seven-day diagnostic
 artifact before comparisons run. It is neither a product release nor a Setup
 UI package. Native architecture/hash checks and actual contract results are
 required before isolated UTM execution. Packaging-only offline tests or a
 later comparison failure cannot establish the whole workflow passed.
+
+The first native run of `abb2c664` passed AMD64 release 101/101 and telemetry
+13/13 execution records. ARM64 release passed 100/101; the sliced-reclaim
+candidate-admission assertion failed and telemetry did not continue. No ARM64
+tool or UTM load result was produced by that run. The failure's entry-stage,
+page accounting, clock and real elapsed-time diagnostics now preserve the
+original assertions, with twelve independent ARM64 repetitions stopping at
+the first failure. Its cause is not inferred from the assertion alone.
+
+A separately named failed-gate artifact may preserve the compiled tool for
+this isolated sliced-reclaim reproduction only. Its manifest explicitly records
+the externally supplied failed step outcome, false native-contract pass and
+the single permitted diagnostic argv. Release/PE/DLL/hash checks remain required.
+It cannot authorize a long soak or release acceptance, and the CI job remains
+failed. Post-write accounting-query failures also now retain their storage
+cause instead of being misreported as capacity; real SQLite authorization-fault
+tests exercise rollback and successful recovery through both producer entries.
 
 At this source commit, host checks and short real-clock smoke runs are
 available; native Windows CI, the two-window UTM load and isolated recovery

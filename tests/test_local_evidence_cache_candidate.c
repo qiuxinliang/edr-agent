@@ -8590,6 +8590,16 @@ static void run_sliced_cache_consumer(void) {
 #endif
 }
 
+/* Failure-only diagnostics must not mask the original contract assertion if
+ * this auxiliary SQLite reader is unavailable. -1 means not observed. */
+static sqlite3_int64 sliced_diagnostic_scalar(sqlite3 *db, const char *sql) {
+  sqlite3_stmt *st = NULL; sqlite3_int64 value = -1;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK &&
+      sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_INTEGER)
+    value = sqlite3_column_int64(st, 0);
+  sqlite3_finalize(st); return value;
+}
+
 /* Real owner calls on both sides of each yield: full projections survive in
  * formats 0/1/2, another thread can read/write, and new expiry work waits for
  * the next cycle instead of being repeated by each page slice. */
@@ -8674,9 +8684,49 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
     snprintf(candidate.event_id, sizeof(candidate.event_id), "slice-required-candidate");
     snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.11");
     candidate.net_dport = 445;
+    sqlite3_int64 pages_before = sliced_diagnostic_scalar(db, "PRAGMA page_count");
+    sqlite3_int64 free_before = sliced_diagnostic_scalar(db, "PRAGMA freelist_count");
+    sqlite3_int64 page_size = sliced_diagnostic_scalar(db, "PRAGMA page_size");
+    sqlite3_int64 count_before = sliced_diagnostic_scalar(db, "SELECT COUNT(*) FROM p0_candidates");
     edr_local_evidence_cache_get_status(&before);
+    uint64_t candidate_wall_started = soak_monotonic_ns();
     edr_local_evidence_cache_record_behavior(&candidate);
+    uint64_t candidate_wall_finished = soak_monotonic_ns();
     edr_local_evidence_cache_get_status(&after);
+    if (after.candidate_admitted != before.candidate_admitted + 1) {
+      sqlite3_int64 pages_after = sliced_diagnostic_scalar(db, "PRAGMA page_count");
+      sqlite3_int64 free_after = sliced_diagnostic_scalar(db, "PRAGMA freelist_count");
+      fprintf(stderr, "sliced_candidate_failure format=%d sqlite_version=%s requested_candidate=%d owner_call_wall_us=%llu page_size=%lld pages=%lld->%lld free_pages=%lld->%lld live_bytes=%lld->%lld candidate_rows=%lld->%lld target_rows=%lld",
+          format, sqlite3_libversion(), edr_local_evidence_cache_is_candidate(&candidate),
+          (unsigned long long)(candidate_wall_finished >= candidate_wall_started ?
+              (candidate_wall_finished-candidate_wall_started)/1000u : 0u),
+          (long long)page_size, (long long)pages_before, (long long)pages_after,
+          (long long)free_before, (long long)free_after,
+          (long long)(pages_before >= free_before && free_before >= 0 && page_size > 0 ? (pages_before-free_before)*page_size : -1),
+          (long long)(pages_after >= free_after && free_after >= 0 && page_size > 0 ? (pages_after-free_after)*page_size : -1),
+          (long long)count_before, (long long)sliced_diagnostic_scalar(db,"SELECT COUNT(*) FROM p0_candidates"),
+          (long long)sliced_diagnostic_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE endpoint_id='ep-slice' AND pid=74501"));
+#define SLICED_STATUS(field) fprintf(stderr, " " #field "=%llu->%llu", \
+          (unsigned long long)before.field, (unsigned long long)after.field)
+      SLICED_STATUS(db_open); SLICED_STATUS(candidate_requests);
+      SLICED_STATUS(candidate_admission_attempts); SLICED_STATUS(candidate_admitted);
+      SLICED_STATUS(candidate_reused); SLICED_STATUS(candidate_deduped);
+      SLICED_STATUS(candidate_rejected); SLICED_STATUS(candidate_transaction_failures);
+      SLICED_STATUS(write_budget_candidate_dropped); SLICED_STATUS(db_budget_dropped);
+      SLICED_STATUS(max_db_mb); SLICED_STATUS(db_bytes); SLICED_STATUS(wal_bytes);
+      SLICED_STATUS(shm_bytes); SLICED_STATUS(physical_bytes);
+      SLICED_STATUS(maintenance_runs); SLICED_STATUS(retention_groups_retired);
+      SLICED_STATUS(retention_groups_held); SLICED_STATUS(retention_failures);
+      SLICED_STATUS(retention_clock_valid); SLICED_STATUS(retention_clock_cause_code);
+      SLICED_STATUS(retention_clock_failures); SLICED_STATUS(retention_active_ms);
+#undef SLICED_STATUS
+      for (unsigned reason = 0; reason < EDR_EVIDENCE_FAILURE_REASON_COUNT; ++reason)
+        fprintf(stderr," candidate_failure_%u=%llu->%llu", reason,
+            (unsigned long long)before.candidate_failure_reasons[reason],
+            (unsigned long long)after.candidate_failure_reasons[reason]);
+      fprintf(stderr, " cause=%.159s\n", after.last_error);
+      fflush(stderr);
+    }
     assert(after.maintenance_runs == before.maintenance_runs + 1);
     assert(after.candidate_admitted == before.candidate_admitted + 1);
     assert(after.candidate_rejected == before.candidate_rejected);
@@ -10198,6 +10248,112 @@ static EdrParentContextQuery floor_query(const EdrBehaviorRecord *r, int64_t now
   return query;
 }
 
+static void parent_fixture_owner_hash(sqlite3 *db, uint32_t pid, char hash[65]) {
+  sqlite3_stmt *st = NULL;
+  const char *sql =
+      "SELECT json_array(p.candidate_id,p.endpoint_id,p.tenant_id,p.pid,p.ppid,p.event_time_ns,"
+      "p.process_start_key,p.process_creation_filetime_100ns,p.subject_command_fact_id,"
+      "p.parent_command_fact_id,p.alert_context_protect_until_active_ms,r.artifact_id,"
+      "r.fact_id,f.manifest_template_json) FROM p0_candidates p "
+      "JOIN context_reference_projection r ON r.artifact_id=p.candidate_id||':alert_parent_context' "
+      "JOIN context_facts f ON f.fact_id=r.fact_id "
+      "WHERE p.endpoint_id='synthetic-floor-endpoint' AND p.tenant_id='synthetic-floor-tenant' AND p.pid=?1";
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_int64(st, 1, pid) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+  const uint8_t *value = sqlite3_column_text(st, 0);
+  int bytes = sqlite3_column_bytes(st, 0); assert(value && bytes > 0);
+  assert(edr_sha256_hex(value, (size_t)bytes, hash) == 0);
+  assert(sqlite3_step(st) == SQLITE_DONE); sqlite3_finalize(st);
+}
+
+static void test_candidate_live_size_query_failure_is_storage(void) {
+  const int64_t now = INT64_C(1700000000000000000);
+  for (unsigned alert_entry = 0; alert_entry < 2u; ++alert_entry) {
+    char path[512], original_hash[65], after_hash[65]; sqlite3 *db = NULL;
+    char query_before[16384], query_after[16384];
+    EdrBehaviorRecord *original = calloc(1u, sizeof(*original));
+    EdrBehaviorRecord *candidate = calloc(1u, sizeof(*candidate)); assert(original && candidate);
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(now);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+    assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) == 0);
+    init_floor_parent(original, now);
+    EdrCommandFacts facts = {original->cmdline, original->parent_cmdline};
+    assert(edr_local_evidence_cache_record_alert_context(original, &facts) == 0);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    parent_fixture_owner_hash(db, original->pid, original_hash);
+    EdrParentContextQuery query = floor_query(original, now); query.fields = 7u;
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, query_before, sizeof(query_before)) == 0);
+    sqlite3_int64 candidates = compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates");
+    sqlite3_int64 artifacts = compact_scalar(db, "SELECT COUNT(*) FROM artifacts");
+    sqlite3_int64 refs = compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection");
+    sqlite3_int64 fact_count = compact_scalar(db, "SELECT COUNT(*) FROM context_facts");
+    *candidate = *original;
+    candidate->pid++; candidate->process_start_key++; candidate->process_creation_filetime_100ns++;
+    strcpy(candidate->event_id, alert_entry ? "live-query-alert-context" : "live-query-behavior");
+    /* Empty command inputs avoid an earlier command-fact live-size query.
+     * With ample capacity the one-shot denial reaches candidate post-write. */
+    candidate->cmdline[0] = candidate->parent_cmdline[0] = 0;
+    if (!alert_entry) {
+      candidate->type = EDR_EVENT_NET_CONNECT; candidate->priority = 3u;
+      strcpy(candidate->net_dst, "192.0.2.31"); candidate->net_dport = 445u;
+      assert(edr_local_evidence_cache_is_candidate(candidate));
+    }
+    edr_behavior_bind_parent_context(candidate);
+    EdrEvidenceCacheStatus before, failed, recovered;
+    edr_local_evidence_cache_get_status(&before);
+    edr_local_evidence_cache_test_fail_next_live_size_queries(1u);
+    if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) < 0);
+    else edr_local_evidence_cache_record_behavior(candidate);
+    edr_local_evidence_cache_get_status(&failed);
+    assert(failed.candidate_requests == before.candidate_requests + 1u);
+    assert(failed.candidate_admission_attempts == before.candidate_admission_attempts + 1u);
+    assert(failed.candidate_admitted == before.candidate_admitted);
+    assert(failed.candidate_rejected == before.candidate_rejected + 1u);
+    assert(failed.candidate_transaction_failures == before.candidate_transaction_failures + 1u);
+    assert(failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] ==
+        before.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] + 1u);
+    assert(failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
+        before.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]);
+    assert(failed.db_budget_dropped == before.db_budget_dropped);
+    assert(strstr(failed.last_error, "live-page size query failed"));
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == candidates);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts") == artifacts);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == refs);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == fact_count);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE endpoint_id='synthetic-floor-endpoint' AND pid=99103") == 0);
+    parent_fixture_owner_hash(db, original->pid, after_hash);
+    assert(!strcmp(original_hash, after_hash));
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, query_after, sizeof(query_after)) == 0);
+    assert(!strcmp(query_before, query_after));
+    /* The real authorizer and transaction have recovered; an identical new
+     * input can now commit, rather than becoming a false dedupe/reuse hit. */
+    if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) == 0);
+    else edr_local_evidence_cache_record_behavior(candidate);
+    edr_local_evidence_cache_get_status(&recovered);
+    assert(recovered.candidate_admitted == before.candidate_admitted + 1u);
+    assert(recovered.candidate_rejected == failed.candidate_rejected);
+    assert(recovered.candidate_transaction_failures == failed.candidate_transaction_failures);
+    assert(recovered.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE] ==
+        failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_STORAGE]);
+    assert(recovered.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
+        before.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]);
+    assert(recovered.db_budget_dropped == before.db_budget_dropped);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == candidates + 1);
+    parent_fixture_owner_hash(db, original->pid, after_hash);
+    assert(!strcmp(original_hash, after_hash));
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, query_after, sizeof(query_after)) == 0);
+    assert(!strcmp(query_before, query_after));
+    printf("live_size_query_failure entry=%s storage_delta=1 capacity_delta=0 transaction_failed=1 rolled_back=1 recovered=1 original_owner_sha256=%s\n",
+        alert_entry ? "alert_context" : "record_behavior", original_hash);
+    assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+    edr_local_evidence_cache_test_fail_next_live_size_queries(0u);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+    edr_local_evidence_cache_test_set_now_unix_ns(0);
+    cleanup_test_sqlite_path(path); free(original); free(candidate);
+  }
+}
+
 static void test_alert_parent_floor_clock_and_identity(void) {
   const int64_t now = INT64_C(1700000000000000000), hour_ms = INT64_C(3600000);
   char path[512]; sqlite3 *db = NULL;
@@ -10934,6 +11090,12 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--live-size-query-failure") == 0) {
+    test_candidate_live_size_query_failure_is_storage(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--sliced-reclaim-contract") == 0) {
+    test_sliced_reclaim_yields_preserves_projection_and_backoff(); return 0;
+  }
   if (argc == 3 && strcmp(argv[1], "--alert-parent-soak") == 0) {
     char *end = NULL; errno = 0;
     unsigned long duration = strtoul(argv[2], &end, 10);
@@ -11036,6 +11198,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_alert_parent_floor_clock_and_identity());
   RUN_CACHE_CASE("context", test_alert_parent_floor_invalid_clock_and_legacy_guards());
   RUN_CACHE_CASE("context", test_alert_parent_floor_post_commit_clock_regression());
+  RUN_CACHE_CASE("context", test_candidate_live_size_query_failure_is_storage());
   RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
   RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
   RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());

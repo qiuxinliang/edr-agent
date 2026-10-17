@@ -85,11 +85,71 @@ class NativeToolsTests(unittest.TestCase):
         self.assertEqual(manifest["source_sha"], "a" * 40)
         self.assertEqual(manifest["run_id"], "123")
         self.assertEqual(manifest["equal_input_comparison_status"], "not_run_at_staging")
+        self.assertEqual(manifest["purpose"], "private_isolated_storage_diagnostics")
+        self.assertEqual(manifest["prior_contract_status"], "passed")
+        self.assertIs(manifest["native_contracts_passed_before_staging"], True)
         self.assertFalse(manifest["product_payload"])
         self.assertEqual(manifest["provenance"]["compiler"]["sha256"], TOOLS.digest(self.compiler))
         self.assertEqual(manifest["provenance"]["vcpkg_status"]["sha256"], TOOLS.digest(self.prefix.parent / "vcpkg" / "status"))
         self.assertFalse((self.args.output / "kernel32.dll").exists())
         TOOLS.verify_stage(self.args.output, manifest)
+
+    def test_failed_gate_artifact_is_explicitly_not_acceptance(self):
+        self.args.prior_contract_status = "failed"
+        manifest = self.stage()
+        self.assertEqual(manifest["purpose"], "private_failed_gate_diagnostics")
+        self.assertEqual(manifest["prior_contract_status"], "failed")
+        self.assertIs(manifest["native_contracts_passed_before_staging"], False)
+        self.assertEqual(manifest["native_contract_status_authority"],
+                         "prior_failed_workflow_step_not_parsed_by_stager")
+        self.assertEqual(manifest["allowed_diagnostic_argv"], [["--sliced-reclaim-contract"]])
+        self.assertIn("not_long_soak_or_release_acceptance", manifest["limitations"])
+        self.assertEqual(manifest["equal_input_comparison_status"], "not_run_at_staging")
+        self.assertFalse(manifest["product_payload"])
+        self.assertEqual({f["name"] for f in manifest["files"]},
+                         {TOOLS.TOOL, "sqlite3.dll", "vcruntime140.dll"})
+        TOOLS.verify_stage(self.args.output, manifest)
+        copied = self.args.output / "sqlite3.dll"
+        original = copied.read_bytes()
+        copied.write_bytes(original[:-1] + b"x")
+        with self.assertRaisesRegex(ValueError, "hash/size mismatch"):
+            TOOLS.verify_stage(self.args.output, manifest)
+
+    def test_unknown_prior_gate_state_cannot_be_staged(self):
+        for status in ("failure", "skipped", "cancelled", "", None):
+            with self.subTest(status=status):
+                self.args.prior_contract_status = status
+                with self.assertRaisesRegex(ValueError, "status must be passed or failed"):
+                    self.stage()
+                self.assertFalse(self.args.output.exists())
+
+    def test_cli_defaults_passed_and_accepts_explicit_failed(self):
+        argv = ["stage_retention_native_tools.py"]
+        for flag in ("repo", "build-dir", "dependency-prefix", "msvc-redist-root", "compiler", "dumpbin", "output",
+                     "arch", "source-sha", "run-id", "run-attempt"):
+            argv.extend(["--" + flag, str(getattr(self.args, flag.replace("-", "_")))])
+        for status in (None, "failed"):
+            expected = status or "passed"
+            command = argv + (["--prior-contract-status", status] if status else [])
+            # Only CLI parsing is under test here; the actual manifest/file
+            # owner is exercised by the real stage() tests above.
+            result = {"source_sha": self.args.source_sha, "arch": self.args.arch, "files": [],
+                      "purpose": "fixture", "prior_contract_status": expected,
+                      "native_contracts_passed_before_staging": expected == "passed"}
+            with self.subTest(status=status), patch("sys.argv", command), \
+                    patch.object(TOOLS, "stage", return_value=result) as stage, patch("builtins.print"):
+                TOOLS.main()
+                self.assertEqual(stage.call_args.args[0].prior_contract_status, expected)
+
+    def test_missing_compiled_executable_has_no_fallback_in_either_status(self):
+        self.exe.unlink()
+        # A similarly named file in a different build location is not an owner.
+        pe(self.build / "Release" / TOOLS.TOOL)
+        for status in ("passed", "failed"):
+            self.args.prior_contract_status = status
+            with self.subTest(status=status), self.assertRaises(FileNotFoundError):
+                self.stage()
+            self.assertFalse(self.args.output.exists())
 
     def test_both_native_architectures(self):
         self.args.arch = "amd64"
@@ -102,13 +162,30 @@ class NativeToolsTests(unittest.TestCase):
         self.assertEqual(self.stage()["arch"], "amd64")
 
     def test_wrong_architecture_exe_and_dependency(self):
-        for path in (self.exe, self.sqlite, self.runtime):
-            with self.subTest(file=path.name):
-                pe(path, "amd64")
-                with self.assertRaisesRegex(ValueError, "architecture mismatch"):
-                    self.stage()
-                self.assertFalse(self.args.output.exists())
-                pe(path)
+        for status in ("passed", "failed"):
+            self.args.prior_contract_status = status
+            for path in (self.exe, self.sqlite, self.runtime):
+                with self.subTest(status=status, file=path.name):
+                    pe(path, "amd64")
+                    with self.assertRaisesRegex(ValueError, "architecture mismatch"):
+                        self.stage()
+                    self.assertFalse(self.args.output.exists())
+                    pe(path)
+
+    def test_failed_gate_keeps_dependency_path_and_release_validation(self):
+        self.args.prior_contract_status = "failed"
+        self.dependencies[TOOLS.TOOL] = ["missing.dll", "kernel32.dll"]
+        with self.assertRaisesRegex(ValueError, "Unresolved non-OS"):
+            self.stage()
+        self.dependencies[TOOLS.TOOL] = ["../outside.dll", "kernel32.dll"]
+        with self.assertRaisesRegex(ValueError, "Invalid dependency name"):
+            self.stage()
+        self.dependencies[TOOLS.TOOL] = ["sqlite3.dll", "kernel32.dll"]
+        (self.build / "CMakeCache.txt").write_text(
+            f"CMAKE_C_COMPILER:FILEPATH={self.compiler}\nCMAKE_BUILD_TYPE:STRING=Debug\n")
+        with self.assertRaisesRegex(ValueError, "Release contract"):
+            self.stage()
+        self.assertFalse(self.args.output.exists())
 
     def test_unknown_dependency_and_missing_sqlite_fail(self):
         for name in ("missing.dll", "api-ms-win-invented-l1-1-0.dll"):
@@ -204,15 +281,42 @@ class NativeToolsTests(unittest.TestCase):
     def test_workflow_upload_is_before_comparison_and_separate_from_release(self):
         workflow = (ROOT / ".github/workflows/evidence-retention-comparison.yml").read_text()
         contracts = workflow.index("- name: Build and execute actual native release")
-        stage = workflow.index("- name: Stage the tested private native diagnostic tool")
+        sliced = workflow.index("- name: Repeat the ARM64 sliced-reclaim contract")
+        stage = workflow.index("- name: Stage the compiled private native diagnostic tool")
         upload = workflow.index("- name: Preserve the private native diagnostic tool separately")
         comparison = workflow.index("- name: Equal-input native evidence")
-        self.assertLess(contracts, stage)
+        measurements = workflow.index("- name: Preserve measurements and failure logs only")
+        self.assertLess(contracts, sliced)
+        self.assertLess(sliced, stage)
         self.assertLess(stage, upload)
         self.assertLess(upload, comparison)
-        self.assertIn("evidence-native-tools-${{ matrix.arch }}-${{ github.sha }}", workflow)
-        self.assertIn("steps.native-tools.outcome == 'success'", workflow)
-        self.assertIn("retention-days: 7", workflow)
+        contract_block = workflow[contracts:sliced]
+        repeat_block = workflow[sliced:stage]
+        stage_block = workflow[stage:upload]
+        upload_block = workflow[upload:comparison]
+        compare_block = workflow[comparison:measurements]
+        self.assertIn("id: contracts", contract_block)
+        self.assertIn("id: sliced", repeat_block)
+        self.assertIn("range(12)", repeat_block)
+        self.assertIn("raise SystemExit(1)", repeat_block)
+        self.assertIn("always() && (steps.contracts.outcome == 'success' || steps.contracts.outcome == 'failure')", stage_block)
+        self.assertIn("'${{ steps.contracts.outcome }}' -eq 'success'", stage_block)
+        self.assertIn("'${{ matrix.arch }}' -ne 'arm64' -or '${{ steps.sliced.outcome }}' -eq 'success'", stage_block)
+        self.assertIn("{ 'passed' } else { 'failed' }", stage_block)
+        self.assertIn("--prior-contract-status \"$prior\"", stage_block)
+        self.assertIn("if ($prior -eq 'passed') { 'evidence-native-tools' } else { 'evidence-failed-gate-tools' }", stage_block)
+        self.assertIn("artifact_prefix=$artifactPrefix", stage_block)
+        self.assertIn("$env:GITHUB_OUTPUT", stage_block)
+        self.assertIn("always() && steps.native-tools.outcome == 'success'", upload_block)
+        self.assertIn("name: ${{ steps.native-tools.outputs.artifact_prefix }}-${{ matrix.arch }}-${{ github.sha }}", upload_block)
+        self.assertIn("retention-days: 7", upload_block)
+        self.assertIn("id: comparisons", compare_block)
+        # No status override: Actions' normal success condition skips this
+        # step after either native contract failure. Their failures stay fatal.
+        self.assertNotIn("if:", compare_block)
+        self.assertNotIn("continue-on-error:", workflow[contracts:measurements])
+        self.assertIn("always() && (steps.comparisons.outcome == 'success' || steps.comparisons.outcome == 'failure')",
+                      workflow[measurements:])
 
 
 if __name__ == "__main__":

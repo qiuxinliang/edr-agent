@@ -411,6 +411,8 @@ void edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(int64
  * after the durable boundary succeeds. */
 void edr_local_evidence_cache_test_fail_next_commits(unsigned count);
 void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count);
+/* Denies the next live-page SELECT through SQLite's authorizer. */
+void edr_local_evidence_cache_test_fail_next_live_size_queries(unsigned count);
 typedef struct {
   uint64_t queries;
   uint64_t vm_steps;

@@ -444,7 +444,16 @@ static sqlite3 *s_db;
 static EdrContextStore s_context_store;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_commit_failures;
+static unsigned s_test_live_size_query_failures;
 static int s_test_commit_active;
+
+static int evidence_cache_test_deny_query(void *opaque, int action,
+                                         const char *arg1, const char *arg2,
+                                         const char *database, const char *trigger) {
+  (void)opaque; (void)action; (void)arg1; (void)arg2;
+  (void)database; (void)trigger;
+  return SQLITE_DENY;
+}
 
 /* SQLite calls this synchronously from COMMIT. Returning non-zero aborts the
  * actual commit, so tests exercise the same accounting boundary as a durable
@@ -5372,7 +5381,13 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
     }
     sqlite3_finalize(st); st = NULL;
   }
-  if (sqlite_live_size_over_limit((uint64_t)s_status.max_db_mb * 1024u * 1024u) != 0) {
+  int live_size_over = sqlite_live_size_over_limit(
+      (uint64_t)s_status.max_db_mb * 1024u * 1024u);
+  if (live_size_over < 0) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
+    sqlite_rollback_silent(); return -1;
+  }
+  if (live_size_over > 0) {
     s_persistence_failure = EDR_EVIDENCE_FAILURE_CAPACITY;
     ++s_status.db_budget_dropped;
     set_error("candidate context page budget exceeded; protected evidence preserved");
@@ -5502,6 +5517,13 @@ static int sqlite_flush_metrics(int final_attempt) {
 static int sqlite_live_size_over_limit(uint64_t limit) {
   sqlite3_stmt *st = NULL;
   int over = -1;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  int deny_query = s_test_live_size_query_failures > 0u;
+  if (deny_query) {
+    --s_test_live_size_query_failures;
+    (void)sqlite3_set_authorizer(s_db, evidence_cache_test_deny_query, NULL);
+  }
+#endif
   if (sqlite3_prepare_v2(s_db,
       "SELECT (page_count-freelist_count)*page_size "
       "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;",
@@ -5512,6 +5534,9 @@ static int sqlite_live_size_over_limit(uint64_t limit) {
     }
   }
   sqlite3_finalize(st);
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (deny_query) (void)sqlite3_set_authorizer(s_db, NULL, NULL);
+#endif
   if (over < 0) set_error("evidence cache live-page size query failed");
   return over;
 }
@@ -7192,6 +7217,7 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   (void)sqlite3_wal_hook(s_db,sqlite_guarded_autocheckpoint,NULL);
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   s_test_commit_failures = 0u;
+  s_test_live_size_query_failures = 0u;
   s_test_manifest_allocation_failures = 0u;
   s_test_commit_active = 0;
   (void)sqlite3_commit_hook(s_db, evidence_cache_test_commit_hook, NULL);
@@ -7339,6 +7365,12 @@ void edr_local_evidence_cache_test_fail_next_manifest_allocations(unsigned count
 void edr_local_evidence_cache_test_fail_next_commits(unsigned count) {
   evidence_cache_lock();
   s_test_commit_failures = count;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_fail_next_live_size_queries(unsigned count) {
+  evidence_cache_lock();
+  s_test_live_size_query_failures = count;
   evidence_cache_unlock();
 }
 #endif
