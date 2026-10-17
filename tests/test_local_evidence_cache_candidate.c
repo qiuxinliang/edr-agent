@@ -11311,11 +11311,27 @@ finished:
   cleanup_test_sqlite_path(path); free(old); free(protected); free(incoming);
 }
 
+/* Fixture diagnostics only: real time and existing VFS request counters do
+ * not drive test clocks, deadlines, budgets or acceptance. Flush each bounded
+ * line so a native CTest timeout retains its last completed phase. rd/wr are
+ * cumulative requested bytes and sync counts callbacks, not device I/O.
+ * clock_valid describes this diagnostic timer, not the retention clock. */
+static void pressure_continuation_phase(const char *phase, unsigned n, uint64_t started) {
+  uint64_t now = soak_monotonic_ns();
+  fprintf(stderr, "[pressure_fixture] phase=%s n=%u us=%llu rd=%llu wr=%llu sync=%llu clock_valid=%u\n",
+      phase, n, (unsigned long long)(now >= started ? (now-started)/1000u : 0u),
+      (unsigned long long)retention_bench_reads, (unsigned long long)retention_bench_writes,
+      (unsigned long long)retention_bench_syncs, (unsigned)(started && now >= started));
+  fflush(stderr);
+}
+
 static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   const int64_t now = INT64_C(1700000000000000000);
   char path[512], before_hash[65], after_hash[65]; sqlite3 *db = NULL;
   EdrBehaviorRecord *record = calloc(1u,sizeof(*record)), *anchor = calloc(1u,sizeof(*anchor));
   assert(record && anchor);
+  uint64_t phase_started=soak_monotonic_ns();
+  pressure_continuation_phase("begin",0u,phase_started);
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
   sqlite3_vfs vfs=*retention_bench_vfs_parent;
   vfs.zName="pressure-continuation-bound"; vfs.pNext=NULL;
@@ -11326,6 +11342,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_test_set_now_unix_ns(now);
   edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
   assert(edr_local_evidence_cache_open_with_policy(path,32u,1u,1u) == 0);
+  pressure_continuation_phase("initial_open_done",0u,phase_started);
   init_floor_parent(record,now);
   uint32_t protected_pid = record->pid;
   uint64_t start_key = record->process_start_key, birth = record->process_creation_filetime_100ns;
@@ -11333,34 +11350,55 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   EdrCommandFacts facts = {record->cmdline,record->parent_cmdline};
   /* More than the shared 4096-row slice: the first full-protected scan is
    * necessarily unfinished, but a finite activation must subsequently park. */
+  pressure_continuation_phase("seed_begin",0u,phase_started);
   for (unsigned n = 0; n < 4200u; ++n) {
     snprintf(record->event_id,sizeof(record->event_id),"protected-pressure-%04u",n);
     record->pid = protected_pid+n; record->process_start_key = start_key+n;
     record->process_creation_filetime_100ns = birth+n;
     edr_behavior_bind_parent_context(record);
     assert(edr_local_evidence_cache_record_alert_context(record,&facts) == 0);
+    if ((n&255u)==255u) pressure_continuation_phase("seed_progress",n+1u,phase_started);
   }
+  pressure_continuation_phase("seed_done",4200u,phase_started);
   edr_local_evidence_cache_close();
+  pressure_continuation_phase("seed_close_done",4200u,phase_started);
   assert(edr_local_evidence_cache_open_with_policy(path,1u,1u,1u) == 0);
+  pressure_continuation_phase("pressure_reopen_done",4200u,phase_started);
   assert(sqlite3_open(path,&db) == SQLITE_OK);
   assert(compact_scalar(db,"PRAGMA freelist_count") == 0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE alert_context_protect_until_active_ms>(SELECT value FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms')") == 4200);
+  pressure_continuation_phase("owner_hash_begin",0u,phase_started);
   parent_fixture_owner_hash(db,protected_pid,before_hash);
+  pressure_continuation_phase("owner_hash_done",0u,phase_started);
   EdrParentContextQuery protected_query = floor_query(anchor,now);
+  pressure_continuation_phase("initial_query_begin",0u,phase_started);
   parent_pressure_query(&protected_query,"pressure_full_before",1);
+  pressure_continuation_phase("initial_query_done",0u,phase_started);
   EdrEvidenceCacheStatus before, empty, after;
+  pressure_continuation_phase("initial_status_begin",0u,phase_started);
   edr_local_evidence_cache_get_status(&before);
+  pressure_continuation_phase("initial_status_done",0u,phase_started);
   s_test_monotonic_ns += UINT64_C(1000000000);
+  pressure_continuation_phase("empty_poll_begin",0u,phase_started);
   edr_local_evidence_cache_poll_maintenance(); /* Zero free pages, no vacuum. */
+  pressure_continuation_phase("empty_poll_done",0u,phase_started);
+  pressure_continuation_phase("empty_status_begin",0u,phase_started);
   edr_local_evidence_cache_get_status(&empty);
+  pressure_continuation_phase("empty_turn_done",0u,phase_started);
   assert(empty.maintenance_runs == before.maintenance_runs);
   s_test_monotonic_ns += UINT64_C(1000000000);
-  edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
+  pressure_continuation_phase("continuation_poll_begin",0u,phase_started);
+  edr_local_evidence_cache_poll_maintenance();
+  pressure_continuation_phase("continuation_poll_done",0u,phase_started);
+  pressure_continuation_phase("continuation_status_begin",0u,phase_started);
+  edr_local_evidence_cache_get_status(&after);
+  pressure_continuation_phase("continuation_status_done",0u,phase_started);
   fprintf(stderr,"pressure_continuation_empty runs=%llu->%llu->%llu retired=%llu held=%llu\n",
       (unsigned long long)before.maintenance_runs,(unsigned long long)empty.maintenance_runs,
       (unsigned long long)after.maintenance_runs,(unsigned long long)after.retention_groups_retired,
       (unsigned long long)after.retention_groups_held);
   assert(after.maintenance_runs == empty.maintenance_runs+1u);
+  pressure_continuation_phase("continuation_done",0u,phase_started);
   for (unsigned turn = 0; turn < 16u; ++turn) {
     s_test_monotonic_ns += UINT64_C(1000000);
     edr_local_evidence_cache_poll_maintenance();
@@ -11368,6 +11406,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_get_status(&before);
   assert(before.maintenance_runs <= empty.maintenance_runs+9u);
   assert(before.retention_groups_retired == 0u && before.retention_clock_valid);
+  pressure_continuation_phase("protected_park_done",0u,phase_started);
   /* Repeated full-cache refusals must not rearm a completed protected scan. */
   strcpy(record->event_id,"protected-pressure-refused");
   record->pid++; record->process_start_key++; record->process_creation_filetime_100ns++;
@@ -11380,6 +11419,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_get_status(&after);
   assert(after.maintenance_runs == before.maintenance_runs);
   assert(after.retention_groups_retired == 0u);
+  pressure_continuation_phase("hot_refusals_done",0u,phase_started);
   parent_fixture_owner_hash(db,protected_pid,after_hash); assert(!strcmp(before_hash,after_hash));
   printf("pressure_protected_full owners=4200 hot_turns=100 extra_runs=0 retired=0 hot_wall_us=%llu\n",
       (unsigned long long)((soak_monotonic_ns()-hot_started)/1000u));
@@ -11395,6 +11435,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
   assert(after.maintenance_runs == before.maintenance_runs+1u);
   printf("pressure_protected_full cadence_s=10 refused_1s_turns=10 maintenance_starts=1\n");
+  pressure_continuation_phase("admission_10s_done",0u,phase_started);
   for (unsigned turn = 0; turn < 16u; ++turn) {
     s_test_monotonic_ns += UINT64_C(1000000);
     edr_local_evidence_cache_poll_maintenance();
@@ -11402,6 +11443,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   /* BUSY and real SQL failure retain the minute error backoff even after the
    * writer releases, and another refused write cannot erase that backoff. */
   s_test_monotonic_ns += UINT64_C(61000000000);
+  pressure_continuation_phase("busy_begin",0u,phase_started);
   compact_exec(db,"BEGIN IMMEDIATE;");
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&before);
   fprintf(stderr,"pressure_continuation_busy cause=%s\n",before.last_error);
@@ -11416,6 +11458,8 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   }
   edr_local_evidence_cache_get_status(&after); assert(after.maintenance_runs == before.maintenance_runs);
   s_test_monotonic_ns += UINT64_C(60000000000);
+  pressure_continuation_phase("busy_backoff_done",0u,phase_started);
+  pressure_continuation_phase("sql_failure_begin",0u,phase_started);
   compact_exec(db,"ALTER TABLE registry_evidence RENAME TO continuation_registry_blocked;");
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&before);
   fprintf(stderr,"pressure_continuation_failure cause=%s\n",before.last_error);
@@ -11424,16 +11468,20 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   for (unsigned turn = 0; turn < 100u; ++turn) edr_local_evidence_cache_poll_maintenance();
   edr_local_evidence_cache_get_status(&after); assert(after.maintenance_runs == before.maintenance_runs);
   s_test_monotonic_ns += UINT64_C(60000000000);
+  pressure_continuation_phase("sql_backoff_done",0u,phase_started);
+  pressure_continuation_phase("resource_begin",0u,phase_started);
   s_test_pressure = true;
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&before);
   assert(strstr(before.last_error,"resource pressure")); s_test_pressure = false;
   for (unsigned turn = 0; turn < 100u; ++turn) edr_local_evidence_cache_poll_maintenance();
   edr_local_evidence_cache_get_status(&after); assert(after.maintenance_runs == before.maintenance_runs);
+  pressure_continuation_phase("resource_backoff_done",0u,phase_started);
   s_test_monotonic_ns += UINT64_C(60000000000);
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
   assert(after.maintenance_runs == before.maintenance_runs+1u);
   assert(after.retention_groups_retired == 0u);
   assert(after.retention_clock_valid);
+  pressure_continuation_phase("recovery_60s_done",0u,phase_started);
   parent_fixture_owner_hash(db,protected_pid,after_hash); assert(!strcmp(before_hash,after_hash));
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates") == 4200);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection r WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=r.candidate_id)") == 0);
@@ -11443,20 +11491,26 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   /* Force cold-pager real two-ms reads so the protected range cannot finish
    * within nine cooperative turns. Even continual deadline yields must park,
    * retain the cursor/owner, and resume only after the existing cooldown. */
+  pressure_continuation_phase("slow_reopen_begin",0u,phase_started);
   edr_local_evidence_cache_test_force_original_memory_trim(1);
   assert(edr_local_evidence_cache_open_with_policy(path,1u,1u,1u)==0);
+  pressure_continuation_phase("slow_reopen_done",0u,phase_started);
   edr_local_evidence_cache_get_status(&before); assert(before.maintenance_runs==1u);
   for (unsigned turn=0;turn<16u;++turn) {
     s_test_monotonic_ns+=UINT64_C(1000000); edr_local_evidence_cache_poll_maintenance();
   }
   edr_local_evidence_cache_get_status(&before);
+  pressure_continuation_phase("slow_activation_begin",0u,phase_started);
   retention_main_read_delay_ms=2u; retention_main_read_high_resolution=1;
   retention_high_resolution_reads=retention_read_delay_max_ns=0u; retention_read_delay_min_ns=UINT64_MAX;
   s_test_monotonic_ns+=UINT64_C(60000000000);
   for (unsigned turn=0;turn<40u;++turn) {
     s_test_monotonic_ns+=UINT64_C(1000000); edr_local_evidence_cache_poll_maintenance();
+    pressure_continuation_phase("slow_poll_done",turn+1u,phase_started);
   }
+  pressure_continuation_phase("slow_status_begin",0u,phase_started);
   edr_local_evidence_cache_get_status(&after);
+  pressure_continuation_phase("slow_status_done",0u,phase_started);
   assert(after.maintenance_runs==before.maintenance_runs+9u &&
       after.retention_groups_held-before.retention_groups_held<4200u);
   assert(after.retention_groups_retired==0u && after.retention_clock_valid);
@@ -11467,17 +11521,21 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
     edr_local_evidence_cache_poll_maintenance();
   }
   edr_local_evidence_cache_get_status(&before); assert(before.maintenance_runs==after.maintenance_runs);
+  pressure_continuation_phase("slow_hot_refusals_done",0u,phase_started);
   retention_main_read_delay_ms=2u;
   s_test_monotonic_ns+=UINT64_C(60000000000);
   for (unsigned turn=0;turn<3u;++turn) {
     s_test_monotonic_ns+=UINT64_C(1000000); edr_local_evidence_cache_poll_maintenance();
   }
+  pressure_continuation_phase("slow_resumed_status_begin",0u,phase_started);
   edr_local_evidence_cache_get_status(&before); assert(before.maintenance_runs>after.maintenance_runs);
+  pressure_continuation_phase("slow_resumed_status_done",0u,phase_started);
   assert(before.retention_groups_retired==0u && before.retention_clock_valid);
   assert(retention_high_resolution_reads>0u && retention_read_delay_min_ns>=UINT64_C(2000000));
   printf("pressure_slow_reader activation_turns=9 unfinished_held=%llu hot_refusals=100 extra_runs=0 resumes_after_60s=1 reads=%llu min_ns=%llu max_ns=%llu\n",
       (unsigned long long)after.retention_groups_held,(unsigned long long)retention_high_resolution_reads,
       (unsigned long long)retention_read_delay_min_ns,(unsigned long long)retention_read_delay_max_ns);
+  pressure_continuation_phase("slow_done",0u,phase_started);
   retention_main_read_delay_ms=0u; retention_main_read_high_resolution=0;
   edr_local_evidence_cache_test_force_original_memory_trim(0);
   assert(sqlite3_open(path,&db)==SQLITE_OK);
@@ -11490,6 +11548,7 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_test_set_now_unix_ns(0);
   edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
   s_test_monotonic_ns = UINT64_C(1000000000); cleanup_test_sqlite_path(path); free(record); free(anchor);
+  pressure_continuation_phase("end",0u,phase_started);
 }
 
 /* The pre-floor 121-second counterexample is preserved in the private baseline
