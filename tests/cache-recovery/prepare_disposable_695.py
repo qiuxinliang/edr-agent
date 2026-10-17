@@ -83,10 +83,21 @@ def bounded_process(argv,cap,seconds):
 
 
 def gh(endpoint,cap=1048576,binary=False):
-    need(endpoint.startswith('repos/'+REPO+'/'),'fixed_repository_only')
-    args=['gh','api','--method','GET',endpoint]
-    if binary:args+=['-H','Accept: application/octet-stream']
-    raw=bounded_process(args,cap,150)
+    prefix='repos/'+REPO+'/'
+    need(endpoint.startswith(prefix),'fixed_repository_only')
+    kind='metadata';accept='application/vnd.github+json'
+    if binary:
+        if re.fullmatch(re.escape(prefix)+r'releases/assets/[1-9][0-9]*',endpoint):
+            kind='release_asset';accept='application/octet-stream'
+        else:
+            need(re.fullmatch(re.escape(prefix)+r'actions/artifacts/[1-9][0-9]*/zip',endpoint),'fixed_binary_endpoint_required')
+            kind='actions_artifact_zip'
+    elif re.fullmatch(re.escape(prefix)+r'actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*',endpoint):kind='actions_run_metadata'
+    elif re.fullmatch(re.escape(prefix)+r'actions/artifacts/[1-9][0-9]*',endpoint):kind='actions_artifact_metadata'
+    # Actions ZIP downloads require JSON Accept but still return binary bytes.
+    args=['gh','api','--method','GET',endpoint,'-H','Accept: '+accept]
+    try:raw=bounded_process(args,cap,150)
+    except ValueError as exc:raise ValueError('github_'+kind+':'+str(exc))from None
     return raw if binary else strict_json(raw)
 
 

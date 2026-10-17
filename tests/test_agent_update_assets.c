@@ -94,7 +94,53 @@ static void function_excludes(const char *text, const char *function_name, const
   free(body);
 }
 
+/* This workflow permits one explicit manual-subset selector, not a matrix
+ * selector: GitHub evaluates job-level if before expanding strategy.matrix. */
+static int native_lifecycle_job_if_is_supported(const char *text) {
+  const char *job = text ? strstr(text, "  native-lifecycle:") : NULL;
+  const char *allowed = "    if: ${{ !inputs.cache_recovery_subset }}";
+  const char *line;
+  int conditions = 0;
+  if (!job || (job != text && job[-1] != '\n')) return 0;
+  line = strchr(job, '\n');
+  while (line) {
+    size_t length;
+    line++;
+    /* The next two-space job key ends this job. Ignore blank/comment lines. */
+    if (line[0] == ' ' && line[1] == ' ' && line[2] && line[2] != ' ' &&
+        line[2] != '\r' && line[2] != '\n' && line[2] != '#') break;
+    if (strncmp(line, "    if:", 7u) == 0) {
+      length = strcspn(line, "\r\n");
+      if (++conditions != 1 || length != strlen(allowed) ||
+          strncmp(line, allowed, length) != 0) return 0;
+    }
+    line = strchr(line, '\n');
+  }
+  return 1;
+}
+
 int main(void) {
+  require_true(native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    strategy:\n      matrix: {}\n") &&
+                   native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset }}\n    strategy:\n      matrix: {}\n") &&
+                   native_lifecycle_job_if_is_supported(
+                   "jobs:\r\n  native-lifecycle:\r\n    if: ${{ !inputs.cache_recovery_subset }}\r\n    strategy:\r\n      matrix: {}\r\n"),
+               "lifecycle job condition accepts no gate or only the explicit manual gate in LF and CRLF");
+  require_true(native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    steps:\n      - name: example\n        if: ${{ matrix.arch == 'arm64' }}\n  recover-synthetic-owner:\n    if: ${{ matrix.arch == 'arm64' }}\n"),
+               "lifecycle job condition excludes nested step and sibling job conditions");
+  require_true(!native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ matrix.arch == 'arm64' }}\n    strategy:\n      matrix: {}\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\r\n  native-lifecycle:\r\n    strategy:\r\n      matrix: {}\r\n    if: ${{ matrix.arch == 'arm64' }}\r\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset && matrix.arch == 'arm64' }}\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset }}\n    if: ${{ matrix.arch == 'arm64' }}\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\n  other:\n    if: ${{ !inputs.cache_recovery_subset }}\n"),
+               "lifecycle job condition rejects real matrix selectors, compound or duplicate gates and missing job");
   require_true(has_adjacent_lines("step\n  if: always()\n", "step", "  if: always()"),
                "adjacent-line helper accepts LF workflow lines");
   require_true(has_adjacent_lines("step\r\n  if: always()\r\n", "step", "  if: always()"),
@@ -741,7 +787,7 @@ int main(void) {
            "ARM64-only input expands to its single native ARM64 matrix row");
   contains(lifecycle, "windows-11-arm",
            "ARM64-only runs retain the native Windows ARM runner");
-  require_true(!strstr(lifecycle, "native-lifecycle:\n    if:") && !strstr(lifecycle, "native-lifecycle:\r\n    if:"),
+  require_true(native_lifecycle_job_if_is_supported(lifecycle),
                "architecture selection does not use a matrix-dependent job-level if");
   contains(lifecycle, "invalid architecture input: $architecture",
            "invalid reusable-workflow architecture fails closed before lifecycle work");

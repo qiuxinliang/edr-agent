@@ -99,6 +99,66 @@ class Contracts(unittest.TestCase):
         self.assertIn("'source-owner/full_installer.go'",text)
         self.assertIn("'zz_private_695_p5_export_test.go'",text)
         self.assertIn('retention-days: 7',text)
+    def assert_transport(self,argv,cap,seconds,endpoint,accept,expected_cap):
+        self.assertEqual(argv,['gh','api','--method','GET',endpoint,'-H','Accept: '+accept])
+        self.assertEqual(cap,expected_cap);self.assertEqual(seconds,150)
+    def test_actions_zip_accept_json_preserves_binary_response(self):
+        endpoint='repos/'+M.REPO+'/actions/artifacts/'+str(M.TOOL_ID)+'/zip';raw=bytes([0,255,0,10])
+        def receiver(argv,cap,seconds):
+            # Strict synthetic receiver: Actions download rejects release media type.
+            if argv[-2:]!=['-H','Accept: application/vnd.github+json']:
+                raise ValueError('read_only_github_failed_415_no_retry_or_scope_expansion')
+            self.assert_transport(argv,cap,seconds,endpoint,'application/vnd.github+json',len(raw));return raw
+        with patch.object(M,'bounded_process',side_effect=receiver)as call:
+            self.assertEqual(M.gh(endpoint,len(raw),True),raw);self.assertEqual(call.call_count,1)
+    def test_release_asset_keeps_octet_stream_and_binary_response(self):
+        endpoint='repos/'+M.REPO+'/releases/assets/123';raw=bytes([0,255,0,10])
+        def receiver(argv,cap,seconds):
+            self.assert_transport(argv,cap,seconds,endpoint,'application/octet-stream',len(raw));return raw
+        with patch.object(M,'bounded_process',side_effect=receiver):self.assertEqual(M.gh(endpoint,len(raw),True),raw)
+    def test_metadata_explicit_json_accept_and_parse(self):
+        endpoint='repos/'+M.REPO+'/actions/runs/'+M.TOOL_RUN+'/attempts/1'
+        def receiver(argv,cap,seconds):
+            self.assert_transport(argv,cap,seconds,endpoint,'application/vnd.github+json',1048576);return b'{"id":123}'
+        with patch.object(M,'bounded_process',side_effect=receiver):self.assertEqual(M.gh(endpoint),{'id':123})
+    def tool_receiver(self,calls,zip_body=None,zip_failure=False):
+        prefix='repos/'+M.REPO
+        def receiver(argv,cap,seconds):
+            endpoint=argv[4];calls.append(endpoint)
+            if endpoint==prefix+'/actions/runs/'+M.TOOL_RUN+'/attempts/1':
+                self.assert_transport(argv,cap,seconds,endpoint,'application/vnd.github+json',1048576)
+                return json.dumps({'id':int(M.TOOL_RUN),'run_attempt':1,'head_sha':M.SOURCE,'status':'completed','conclusion':'success'}).encode()
+            if endpoint==prefix+'/actions/artifacts/'+str(M.TOOL_ID):
+                self.assert_transport(argv,cap,seconds,endpoint,'application/vnd.github+json',1048576)
+                return json.dumps({'id':M.TOOL_ID,'name':'evidence-native-tools-arm64-'+M.SOURCE,'size_in_bytes':M.TOOL_SIZE,
+                  'digest':'sha256:'+M.TOOL_SHA,'expired':False,'workflow_run':{'id':int(M.TOOL_RUN),'head_sha':M.SOURCE}}).encode()
+            self.assertEqual(endpoint,prefix+'/actions/artifacts/'+str(M.TOOL_ID)+'/zip')
+            self.assert_transport(argv,cap,seconds,endpoint,'application/vnd.github+json',M.TOOL_SIZE)
+            if zip_failure:raise ValueError('read_only_github_failed_415_no_retry_or_scope_expansion')
+            return zip_body
+        return receiver
+    def test_actions_415_is_one_request_no_fallback_or_extract(self):
+        calls=[]
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'bounded_process',side_effect=self.tool_receiver(calls,zip_failure=True)):
+            root=Path(d)
+            with self.assertRaisesRegex(ValueError,'github_actions_artifact_zip:read_only_github_failed_415_no_retry_or_scope_expansion'):
+                M.native_tools(root,None,Path('/never-read'))
+            self.assertEqual(calls,['repos/'+M.REPO+'/actions/runs/'+M.TOOL_RUN+'/attempts/1',
+              'repos/'+M.REPO+'/actions/artifacts/'+str(M.TOOL_ID),'repos/'+M.REPO+'/actions/artifacts/'+str(M.TOOL_ID)+'/zip'])
+            self.assertFalse((root/'native-tools').exists())
+    def test_changed_tool_bytes_still_refused_before_extract(self):
+        calls=[]
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'bounded_process',side_effect=self.tool_receiver(calls,zip_body=b'wrong synthetic archive')):
+            root=Path(d)
+            with self.assertRaisesRegex(ValueError,'tool_archive_full_hash_size'):M.native_tools(root,None,Path('/never-read'))
+            self.assertEqual(len(calls),3);self.assertFalse((root/'native-tools').exists())
+    def test_unsupported_binary_endpoint_refused_before_io(self):
+        with patch.object(M,'bounded_process',side_effect=AssertionError('must not call GitHub')):
+            with self.assertRaisesRegex(ValueError,'fixed_binary_endpoint_required'):M.gh('repos/'+M.REPO+'/unknown',1,True)
+    def test_415_never_prints_raw_stderr(self):
+        with self.assertRaisesRegex(ValueError,'github_failed_415_no_retry_or_scope_expansion')as c:
+            M.bounded_process([sys.executable,'-c','import sys;sys.stderr.write("HTTP 415 fake-private-url");sys.exit(1)'],100,2)
+        self.assertNotIn('fake-private-url',str(c.exception))
     def test_binary_bytes_unchanged(self):
         raw=M.bounded_process([sys.executable,'-c','import sys;sys.stdout.buffer.write(bytes([0,255,0,10]))'],4,2)
         self.assertEqual(raw,bytes([0,255,0,10]))
