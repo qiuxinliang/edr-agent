@@ -32,6 +32,104 @@ function ReadBounded([string]$Path,[int]$Cap) {
   Need ($count -eq $before.Length -and $before.Length -eq $after.Length -and $before.LastWriteTimeUtc -eq $after.LastWriteTimeUtc -and ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'input_changed_during_bounded_read'
   return [Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$count)
 }
+# QA only: strict byte snapshot is shared by live journal polling and final copy.
+# It does not change ReadBounded/PinnedJson's immutable-input/terminal contract.
+function ReadOwnedBytes([string]$Path,[int]$Cap=1048576) {
+  Need ($Cap -gt 0 -and $Cap -le 1048576) 'owned_read_cap_invalid'
+  $path=[IO.Path]::GetFullPath($Path);$before=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  Need (-not $before.PSIsContainer -and ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_regular_cap_required'
+  $beforeLength=[long]$before.Length
+  Need ($beforeLength -ge 0 -and $beforeLength -le $Cap) 'owned_read_regular_cap_required'
+  $s=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+  try {
+    Need ($s.Length -le $Cap) 'owned_read_cap_exceeded'
+    $buffer=New-Object byte[] ([int]($beforeLength+1));$count=0
+    while($count -lt $buffer.Length){$n=$s.Read($buffer,$count,$buffer.Length-$count);if($n -eq 0){break};$count+=$n}
+    Need ($s.Length -le $Cap) 'owned_read_cap_exceeded'
+    $streamLength=$s.Length
+  } finally {$s.Dispose()}
+  # Separate the hard shape/cap check from a legitimate replacement transient.
+  $after=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  Need (-not $after.PSIsContainer -and ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_regular_cap_required'
+  $afterLength=[long]$after.Length
+  Need ($afterLength -ge 0 -and $afterLength -le $Cap) 'owned_read_regular_cap_required'
+  if($count -ne $beforeLength -or $streamLength -ne $beforeLength -or $beforeLength -ne $afterLength -or
+     $before.LastWriteTimeUtc -ne $after.LastWriteTimeUtc -or $before.CreationTimeUtc -ne $after.CreationTimeUtc){throw 'owned_source_changed'}
+  $bytes=New-Object byte[] $count
+  if($count){[Buffer]::BlockCopy($buffer,0,$bytes,0,$count)}
+  return @{bytes=$bytes;length=$count}
+}
+function ReadOwnedUpdateJson([ValidateSet('journal','report')][string]$Kind,[string]$Path,$Owner,[switch]$Live) {
+  Need (-not $Live -or $Kind -ceq 'journal') 'live_read_only_owned_journal'
+  try {$raw=ReadOwnedBytes $Path}
+  catch {
+    if($Live){
+      $e=$_.Exception;$reason=$null
+      if($e.Message -ceq 'owned_source_changed'){$reason='source_changed'}
+      for($depth=0;$depth -lt 8 -and $null -ne $e;$depth++){
+        if($e -is [Management.Automation.ItemNotFoundException] -or $e -is [IO.FileNotFoundException] -or $e -is [IO.DirectoryNotFoundException]){$reason='not_found';break}
+        if($e -is [IO.IOException] -and ($e.HResult -band 65535) -in @(32,33)){$reason='sharing';break}
+        $e=$e.InnerException
+      }
+      if($reason){return @{state='transient';reason=$reason}}
+    }
+    throw
+  }
+  # Decode/parse/identity failures are never transients or an empty success.
+  $text=[Text.UTF8Encoding]::new($false,$true).GetString($raw.bytes)
+  Need ($text.TrimStart().StartsWith('{',[StringComparison]::Ordinal)) 'owned_json_object_required'
+  $value=$text | ConvertFrom-Json -ErrorAction Stop
+  Need ($value -is [pscustomobject]) 'owned_json_object_required'
+  if($Kind -ceq 'journal'){
+    foreach($key in @('task_id','command_id','hash','version','operation','upgrade_class','artifact_id','stage')){Need ($value.$key -is [string]) 'owned_journal_field_type'}
+    Need (($value.schema_version -is [int] -or $value.schema_version -is [long]) -and $value.schema_version -eq 2 -and $value.task_id -ceq $Owner.task_id -and $value.command_id -ceq $Owner.command_id -and
+      $value.hash -ceq $Owner.hash -and $value.version -ceq $Owner.version -and $value.operation -ceq $Owner.operation -and
+      $value.upgrade_class -ceq $Owner.class -and $value.artifact_id -ceq $Owner.artifact_id) 'owned_journal_identity'
+  }else{
+    foreach($key in @('target_version','operation','upgrade_class','expected_architecture','expected_sha256','runtime_manifest')){Need ($value.$key -is [string]) 'owned_report_field_type'}
+    Need ($value.target_version -ceq $Owner.version -and $value.operation -ceq $Owner.operation -and
+      $value.upgrade_class -ceq $Owner.class -and $value.expected_architecture -ceq $Owner.arch -and
+      $value.expected_sha256 -ceq $Owner.hash -and [string]$value.runtime_manifest -ieq [string]$Owner.manifest) 'owned_report_identity'
+  }
+  return @{state='ready';value=$value;bytes=$raw.bytes;length=$raw.length}
+}
+function SaveOwnedOriginal([ValidateSet('journal','report')][string]$Kind,[string]$Path,$Owner,[string]$Label) {
+  $read=ReadOwnedUpdateJson $Kind $Path $Owner
+  $destination=Join-Path $script:root ($Label+'.original-'+$Kind+'.json')
+  $s=[IO.File]::Open($destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+  try{$s.Write($read.bytes,0,$read.length);$s.Flush($true)}finally{$s.Dispose()}
+  return @{status='captured';bytes=$read.length;original_bytes_preserved=$true;identity_verified=$true}
+}
+function SaveTransitionFinalEvidence($Child,$Diagnostic,$Owner,[string]$Label,[string]$Journal,[string]$Report) {
+  $failed=$false
+  $Diagnostic.terminal_known=$false;$Diagnostic.exit_known=$false;$Diagnostic.exit_code=$null
+  if($null -ne $Child){
+    try {
+      $Child.Refresh()
+      if($Child.HasExited){
+        $Diagnostic.terminal_known=$true
+        $exit=$Child.ExitCode
+        if($null -ne $exit -and $exit -is [int]){$Diagnostic.exit_known=$true;$Diagnostic.exit_code=$exit}
+      }
+    }catch{$Diagnostic.child_status_exception_type=$_.Exception.GetType().FullName}
+  }
+  if($Diagnostic.terminal_known -and $Diagnostic.exit_known){
+    foreach($kind in @('report','journal')){
+      try {
+        $path=if($kind -ceq 'report'){$Report}else{$Journal}
+        $Diagnostic.originals[$kind]=SaveOwnedOriginal $kind $path $Owner $Label
+      }catch{
+        $failed=$true
+        $Diagnostic.originals[$kind]=@{status='capture_failed';exception_type=$_.Exception.GetType().FullName;hresult=$_.Exception.HResult}
+      }
+    }
+  }else{
+    $failed=$true
+    foreach($kind in @('report','journal')){$Diagnostic.originals[$kind]=@{status='not_captured';reason='child_terminal_or_exit_unknown'}}
+  }
+  return $failed
+}
+
 function PinnedJson([string]$Path,[string]$Expected,[UInt64]$Cap=1048576) {
   $path=Regular $Path $Cap; Need ($Expected -cmatch '^[a-f0-9]{64}$' -and (SHA $path) -ceq $Expected) 'input_pin_mismatch'
   $text=ReadBounded $path $Cap
@@ -43,6 +141,16 @@ function Save([string]$Name,$Value) {
   $data=[Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 16)+"`n")
   $h=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
   try {$h.Write($data,0,$data.Length);$h.Flush($true)} finally {$h.Dispose()}
+}
+function SaveRecoverySummary($Value,[bool]$PrimaryFailure) {
+  try {Save 'recovery-subset-summary.json' $Value;return @{saved=$true}}
+  catch {
+    if(-not $PrimaryFailure){throw}
+    $failureType=$_.Exception.GetType().FullName
+    # A secondary diagnostic write must not replace the original update error.
+    Write-Warning -Message ('secondary_summary_capture_failed type='+$failureType) -WarningAction Continue
+    return @{saved=$false;exception_type=$failureType}
+  }
 }
 function StartWindowsPowerShellChild([string]$ScriptPath,[string]$StandardOutput,[string]$StandardError) {
   # pwsh's module path is not a Windows PowerShell module path. Match the
@@ -127,68 +235,98 @@ function Snapshot([string]$Name,[string]$Expected='') {
 }
 function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]$Updater) {
   $id=[Guid]::NewGuid().ToString('N');$command='ci-cache-recovery-'+$id
-  $work=Join-Path ([IO.Path]::GetTempPath()) ('FDSecurity\agent-update\'+$command)
-  Need (-not (Test-Path -LiteralPath $work)) 'update_work_already_exists'
-  New-Item -ItemType Directory -Path $work | Out-Null
-  $staged=Join-Path $work 'FDSensor.next.exe';Copy-Item -LiteralPath $script:targetAgent -Destination $staged
-  $issued=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  $params=@{InstallDir=$script:install;StagedBinary=$staged;ExpectedSha256=$script:target.agent_binary_sha256;
-    TargetVersion=$script:target.version;ExpectedArchitecture=$script:updateArch;
-    TrustedPublisherThumbprint='SHA256_ONLY_UNSIGNED';TrustedPublisherSubject='Unsigned release; SHA-256 integrity only';
-    DeploymentMode='service';ServiceName='FDSecurityAgent';CommandId=$command;TaskId=$id;
-    Operation=$Operation;ArtifactId=('ci-cache-recovery-'+$script:target.version);
-    UpgradeClass=$script:actualClass;RuntimeManifest=$script:package;RuntimeManifestSha256=$script:binding.protocol5_package.sha256;
-    StagingDirectory=$work;IssuedAtUnixMs=$issued;DeadlineUnixMs=($issued+900000);HealthObserveMs=30000;
-    MinFreeBytes=$script:effectiveMinFreeBytes;
-    MinCurrentVersion=[string]$script:raw[0].update.min_current_version;
-    MaxCurrentVersion=[string]$script:raw[0].update.max_current_version}
-  $paramFile=Join-Path $script:root ($Label+'.parameters.xml');$params | Export-Clixml -LiteralPath $paramFile
-  $invoke=Join-Path $script:root ($Label+'.invoke.ps1')
-  Need ($Updater -notmatch "['\r\n]" -and $paramFile -notmatch "['\r\n]") 'invocation_path'
-  [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;exit `$LASTEXITCODE"),[Text.UTF8Encoding]::new($false))
   $journal=Join-Path $env:ProgramData ('FDSecurity\state\agent-update-'+$command+'.journal.json')
   $report=Join-Path $env:ProgramData ('FDSecurity\logs\agent-update-'+$command+'-report.json')
-  Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
-  $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))
-  $triggered=$false;$deadline=[DateTime]::UtcNow.AddSeconds(900)
-  while (-not $child.HasExited -and [DateTime]::UtcNow -lt $deadline) {
-    if ($FailHealth -and -not $triggered -and (Test-Path -LiteralPath $journal)) {
-      $jp=Regular $journal 1048576
-      # Atomic writer may be between replacements. A read error is unknown,
-      # never success or a second update. Only a complete matching row acts.
-      $j=(ReadBounded $jp 1048576) | ConvertFrom-Json -ErrorAction Stop
-      Need ($j.task_id -eq $id -and $j.command_id -eq $command -and $j.hash -ceq $script:target.agent_binary_sha256 -and $j.upgrade_class -eq 'installer_required') 'journal_identity'
-      if ($j.stage -eq 'health_observation') {
-        $native=Installed $script:target.agent_binary_sha256 $script:target.version
-        Snapshot ($Label+'-before-trigger') $script:seed | Out-Null
-        $backup=Join-Path ([string]$j.full_installer_backup_path) 'FDSensor.exe'
-        Need ((SHA (Regular $backup 16777216)) -ceq $script:baseline.agent_binary_sha256) 'actual_previous_backup_not692'
-        $again=Installed $script:target.agent_binary_sha256 $script:target.version
-        Need ($again.pid -eq $native.pid -and $again.birth_filetime -eq $native.birth_filetime) 'trigger_generation_changed'
-        Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));action='stop_exact_owned_service';fixture_only=$true}
-        ServiceAction 'Stop' ($Label+'-health-stop')
-        $triggered=$true
+  $owner=@{task_id=$id;command_id=$command;hash=$script:target.agent_binary_sha256;version=$script:target.version;operation=$Operation;class=$script:actualClass;artifact_id=('ci-cache-recovery-'+$script:target.version);arch=$script:updateArch;manifest=$script:package}
+  $diagnostic=@{label=$Label;task_id=$id;command_id=$command;phase='prepare';child_pid=$null;child_birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null;poll_attempts=0;poll_transients=@{not_found=0;sharing=0;source_changed=0};primary_failure_type=$null;originals=@{report=@{status='not_attempted'};journal=@{status='not_attempted'}}}
+  $null=$script:transitionDiagnostics.Add($diagnostic)
+  $child=$null;$primaryFailure=$false;$clock=[Diagnostics.Stopwatch]::StartNew()
+  try {
+    $work=Join-Path ([IO.Path]::GetTempPath()) ('FDSecurity\agent-update\'+$command)
+    Need (-not (Test-Path -LiteralPath $work)) 'update_work_already_exists'
+    New-Item -ItemType Directory -Path $work | Out-Null
+    $staged=Join-Path $work 'FDSensor.next.exe';Copy-Item -LiteralPath $script:targetAgent -Destination $staged
+    $issued=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $params=@{InstallDir=$script:install;StagedBinary=$staged;ExpectedSha256=$script:target.agent_binary_sha256;
+      TargetVersion=$script:target.version;ExpectedArchitecture=$script:updateArch;
+      TrustedPublisherThumbprint='SHA256_ONLY_UNSIGNED';TrustedPublisherSubject='Unsigned release; SHA-256 integrity only';
+      DeploymentMode='service';ServiceName='FDSecurityAgent';CommandId=$command;TaskId=$id;
+      Operation=$Operation;ArtifactId=('ci-cache-recovery-'+$script:target.version);
+      UpgradeClass=$script:actualClass;RuntimeManifest=$script:package;RuntimeManifestSha256=$script:binding.protocol5_package.sha256;
+      StagingDirectory=$work;IssuedAtUnixMs=$issued;DeadlineUnixMs=($issued+900000);HealthObserveMs=30000;
+      MinFreeBytes=$script:effectiveMinFreeBytes;
+      MinCurrentVersion=[string]$script:raw[0].update.min_current_version;
+      MaxCurrentVersion=[string]$script:raw[0].update.max_current_version}
+    $paramFile=Join-Path $script:root ($Label+'.parameters.xml');$params | Export-Clixml -LiteralPath $paramFile
+    $invoke=Join-Path $script:root ($Label+'.invoke.ps1')
+    Need ($Updater -notmatch "['\r\n]" -and $paramFile -notmatch "['\r\n]") 'invocation_path'
+    [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;exit `$LASTEXITCODE"),[Text.UTF8Encoding]::new($false))
+    Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
+    $diagnostic.phase='launch'
+    $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))
+    $diagnostic.child_pid=$child.Id
+    try{$diagnostic.child_birth_filetime=$child.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}catch{$diagnostic.child_birth_exception_type=$_.Exception.GetType().FullName}
+    $triggered=$false;$deadline=[DateTime]::UtcNow.AddSeconds(900)
+    while (-not $child.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+      if ($FailHealth -and -not $triggered) {
+        $diagnostic.phase='live_journal_read'
+        $diagnostic.poll_attempts++
+      $reading=ReadOwnedUpdateJson 'journal' $journal $owner -Live
+        if($reading.state -ceq 'transient'){$diagnostic.poll_transients[$reading.reason]++}
+        elseif($reading.state -ceq 'ready' -and $reading.value.stage -ceq 'health_observation') {
+          $diagnostic.phase='health_observation_bind'
+          $j=$reading.value
+          $native=Installed $script:target.agent_binary_sha256 $script:target.version
+          Snapshot ($Label+'-before-trigger') $script:seed | Out-Null
+          $backup=Join-Path ([string]$j.full_installer_backup_path) 'FDSensor.exe'
+          Need ((SHA (Regular $backup 16777216)) -ceq $script:baseline.agent_binary_sha256) 'actual_previous_backup_not692'
+          $again=Installed $script:target.agent_binary_sha256 $script:target.version
+          Need ($again.pid -eq $native.pid -and $again.birth_filetime -eq $native.birth_filetime) 'trigger_generation_changed'
+          Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));action='stop_exact_owned_service';fixture_only=$true}
+          ServiceAction 'Stop' ($Label+'-health-stop')
+          $triggered=$true
+        }
       }
+      Start-Sleep -Milliseconds 100;$child.Refresh()
     }
-    Start-Sleep -Milliseconds 100;$child.Refresh()
+    $diagnostic.phase='wait_terminal'
+    $code=WaitProcess $child 1 'updater_terminal_unknown_no_retry'
+    Need ($null -ne $code -and $code -is [int]) 'owned_child_exit_unavailable'
+    $diagnostic.terminal_known=$true;$diagnostic.exit_known=$true;$diagnostic.exit_code=$code
+    $diagnostic.phase='terminal_report_read'
+    $result=(ReadOwnedUpdateJson 'report' $report $owner).value
+    $diagnostic.phase='terminal_journal_read'
+    $j=(ReadOwnedUpdateJson 'journal' $journal $owner).value
+    Need ($j.task_id -eq $id -and $j.command_id -eq $command -and $j.hash -ceq $script:target.agent_binary_sha256) 'terminal_journal_binding'
+    $diagnostic.phase='terminal_contract'
+    if ($FailHealth) {
+      Need ($triggered -and $code -ne 0 -and $result.status -eq 'failed_rolled_back' -and $result.rollback -eq 'succeeded' -and $j.status -eq 'failed_rolled_back') 'real_automatic_rollback_not_observed'
+      Installed $script:baseline.agent_binary_sha256 '3.2.692' | Out-Null
+    } else {
+      Need ($code -eq 0 -and $result.status -eq 'succeeded' -and $j.status -eq 'succeeded') 'normal_updater_not_succeeded'
+      Installed $script:target.agent_binary_sha256 $script:target.version | Out-Null
+      if ($Operation -eq 'repair') {Need ($result.installer_baseline_mode -eq 'repair_baseline') 'normal_missing_inno_repair_not_observed'}
+    }
+    $diagnostic.phase='after_snapshot'
+    Snapshot ($Label+'-after') $script:seed | Out-Null
+    $diagnostic.phase='completed'
+  }catch{
+    $primaryFailure=$true
+    $diagnostic.primary_failure_phase=$diagnostic.phase
+    $diagnostic.primary_failure_type=$_.Exception.GetType().FullName
+    $diagnostic.primary_failure_hresult=$_.Exception.HResult
+    throw
+  }finally{
+    try{$captureFailed=SaveTransitionFinalEvidence $child $diagnostic $owner $Label $journal $report}
+    catch{$captureFailed=$true;$diagnostic.evidence_observer_exception_type=$_.Exception.GetType().FullName}
+    $diagnostic.elapsed_ms=$clock.ElapsedMilliseconds
+    if(-not $primaryFailure -and $captureFailed){
+      $diagnostic.primary_failure_phase='terminal_evidence_capture'
+      $diagnostic.primary_failure_type='System.InvalidOperationException'
+      throw 'terminal_original_evidence_unavailable'
+    }
   }
-  $code=WaitProcess $child 1 'updater_terminal_unknown_no_retry'
-  $result=(ReadBounded $report 1048576) | ConvertFrom-Json
-  $j=(ReadBounded $journal 1048576) | ConvertFrom-Json
-  Need ($j.task_id -eq $id -and $j.command_id -eq $command -and $j.hash -ceq $script:target.agent_binary_sha256) 'terminal_journal_binding'
-  Copy-Item -LiteralPath $report -Destination (Join-Path $script:root ($Label+'.original-report.json'))
-  Copy-Item -LiteralPath $journal -Destination (Join-Path $script:root ($Label+'.original-journal.json'))
-  if ($FailHealth) {
-    Need ($triggered -and $code -ne 0 -and $result.status -eq 'failed_rolled_back' -and $result.rollback -eq 'succeeded' -and $j.status -eq 'failed_rolled_back') 'real_automatic_rollback_not_observed'
-    Installed $script:baseline.agent_binary_sha256 '3.2.692' | Out-Null
-  } else {
-    Need ($code -eq 0 -and $result.status -eq 'succeeded' -and $j.status -eq 'succeeded') 'normal_updater_not_succeeded'
-    Installed $script:target.agent_binary_sha256 $script:target.version | Out-Null
-    if ($Operation -eq 'repair') {Need ($result.installer_baseline_mode -eq 'repair_baseline') 'normal_missing_inno_repair_not_observed'}
-  }
-  Snapshot ($Label+'-after') $script:seed | Out-Null
 }
-
 # Refuse missing immutable inputs before creating any machine or fixture state.
 $binding=PinnedJson $InputJson $InputSha256
 Need ($binding.schema -eq 'edr.ci-cache-recovery-input.v1' -and $binding.prepared_only -is [bool] -and $binding.prepared_only -eq $false) 'recovery_input_unbound'
@@ -238,7 +376,8 @@ foreach ($stage in @($baseline,$target)) {
   Need ((SHA (Regular (Join-Path $stage.runtime_dir 'FDSensor.exe') 16777216)) -ceq $stage.agent_binary_sha256) 'staged_agent_hash'
   Need ((SHA (Regular $stage.setup_exe 268435456)) -ceq $stage.setup_exe_sha256) 'staged_headless_setup_hash'
 }
-$completed=$false
+$completed=$false;$mainPrimaryFailure=$false
+$transitionDiagnostics=New-Object Collections.ArrayList
 try {
   $temp=Join-Path $root 'seed-temp';New-Item -ItemType Directory -Path $temp | Out-Null
   $oldTemp=$env:TEMP;$oldTmp=$env:TMP
@@ -308,7 +447,7 @@ try {
   ServiceAction 'Start' 'repair-start'
   Transition 'repair' 'normal-headless-repair' $false $newUpdater
   $completed=$true
-} finally {
-  Save 'recovery-subset-summary.json' @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false}
+} catch {$mainPrimaryFailure=$true;throw} finally {
+  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics)} $mainPrimaryFailure | Out-Null
 }
 Need $completed 'recovery_subset_incomplete'

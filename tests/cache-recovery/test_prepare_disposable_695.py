@@ -132,7 +132,7 @@ class Contracts(unittest.TestCase):
         self.assertIn("finally {",helper)
         self.assertIn("[Environment]::SetEnvironmentVariable('PSModulePath',$previousModulePath,[EnvironmentVariableTarget]::Process)",helper)
         self.assertNotIn('EnvironmentVariableTarget]::Machine',helper);self.assertNotIn('EnvironmentVariableTarget]::User',helper)
-        self.assertEqual(len(re.findall(r'^  \$(?:owned|child)=StartWindowsPowerShellChild ',driver,re.M)),2)
+        self.assertEqual(len(re.findall(r'^[ \t]+\$(?:owned|child)=StartWindowsPowerShellChild ',driver,re.M)),2)
         wait=driver[driver.index('function WaitProcess('):driver.index('function ServiceAction(')]
         self.assertNotIn('.Handle',wait)
         workflow=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
