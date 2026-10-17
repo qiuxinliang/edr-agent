@@ -15,7 +15,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   return EDR_OK;
 }
 
-int edr_collector_stop(void) { return 1; }
+int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {
+  (void)shutdown_observer; return 1; }
 
 void edr_collector_stop_orphan_etw_session(void) {}
 

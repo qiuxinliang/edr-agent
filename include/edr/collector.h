@@ -5,6 +5,7 @@
 #define EDR_COLLECTOR_H
 
 #include "edr/error.h"
+#include "edr/shutdown_progress.h"
 #include <stdint.h>
 
 struct EdrEventBus;
@@ -308,7 +309,7 @@ EdrError edr_collector_start(struct EdrEventBus *bus, const struct EdrConfig *cf
  * 停止会话并 join 消费线程（可重复调用）。仅在线程和 A4.4 已全部 join
  * 后返回 1；超时返回 0 并保留所有仍被线程引用的资源。
  */
-int edr_collector_stop(void);
+int edr_collector_stop(const EdrShutdownObserver *shutdown_observer);
 
 /**
  * 按固定会话名尝试停止可能残留的 ETW 实时会话（无需本进程曾 StartTrace）。

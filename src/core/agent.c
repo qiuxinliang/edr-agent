@@ -1419,7 +1419,7 @@ void edr_agent_destroy(EdrAgent *agent) {
     return;
   }
   if (agent->collector_started) {
-    if (!edr_collector_stop()) {
+    if (!edr_collector_stop(NULL)) {
       fprintf(stderr, "[agent] destroy deferred: collector still owns dependencies\n");
       return;
     }
@@ -1967,7 +1967,7 @@ static int edr_agent_collection_enabled(const EdrConfig *cfg) {
 static void edr_agent_queue_attack_surface(const char *reason, uint64_t now_ns);
 static int edr_agent_restart_collector(EdrAgent *agent, const char *reason);
 
-EdrError edr_agent_run(EdrAgent *agent) {
+EdrError edr_agent_run(EdrAgent *agent, const EdrShutdownObserver *shutdown_observer) {
   if (!agent || !agent->event_bus) {
     return EDR_ERR_INVALID_ARG;
   }
@@ -2102,10 +2102,13 @@ EdrError edr_agent_run(EdrAgent *agent) {
       }
       /* §B2 干净退出：写 stop stamp，阻止伴生 watchdog 复活本进程。 */
       /* 取证异步:agent 退出前 kill 在跑的 velo(POSIX fork 子进程不随父退出消失)并补报。 */
+      edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_MAIN_LOOP_EXITED);
       edr_response_forensic_async_abort_shutdown();
+      edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_FORENSIC_ABORT_RETURNED);
       edr_watchdog_agent_on_shutdown(&agent->cfg);
+      edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_WATCHDOG_STOP_RETURNED);
       if (agent->collector_started) {
-        if (edr_collector_stop()) {
+        if (edr_collector_stop(shutdown_observer)) {
           agent->collector_started = 0;
         } else {
           fprintf(stderr,
@@ -4137,7 +4140,7 @@ static int edr_agent_restart_collector(EdrAgent *agent, const char *reason) {
     return 0;
   }
   if (agent->collector_started) {
-    if (!edr_collector_stop()) {
+    if (!edr_collector_stop(NULL)) {
       /* A timed-out ETW/A4.4 join retains thread-owned buffers.  It is not a
        * recoverable start failure: do not create a second provider epoch. */
 #ifdef _WIN32

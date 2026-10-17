@@ -635,13 +635,13 @@ int main(void) {
                          "collector start must create a consumer readiness handshake");
   ok &= require_order_in_function(
       collector, "EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {",
-      "int edr_collector_stop(void) {",
+      "int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {",
       "if (!cfg || !cfg->collection.etw_enabled)",
       "InterlockedCompareExchange(&s_started, 1, 0)",
       "a disabled collector must return before claiming the running lifecycle");
   ok &= require_order_in_function(
       collector, "EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {",
-      "int edr_collector_stop(void) {",
+      "int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {",
       "InterlockedExchange(&s_consumer_open_ok, 0);",
       "s_bus = bus;",
       "a new collector startup must begin with readiness revoked");
@@ -680,13 +680,13 @@ int main(void) {
       "InterlockedExchange(&s_consumer_running, 1);",
       "consumer readiness must only be asserted after OpenTrace succeeds");
   ok &= require_order_in_function(
-      collector, "int edr_collector_stop(void) {",
+      collector, "int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {",
       "int edr_collector_get_health(EdrCollectorHealth *out_health) {",
       "InterlockedExchange(&s_stopping, 1);",
       "ControlTraceW(s_session_handle, g_session_name, &stop, EVENT_TRACE_CONTROL_STOP);",
       "collector stop must revoke health before stopping the ETW session");
   ok &= require_order_in_function(
-      collector, "int edr_collector_stop(void) {",
+      collector, "int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {",
       "int edr_collector_get_health(EdrCollectorHealth *out_health) {",
       "InterlockedExchange(&s_consumer_running, 0);",
       "InterlockedExchange(&s_started, 0);",
@@ -774,7 +774,7 @@ int main(void) {
       "P0 disposition observations must never log the complete command line");
   ok &= require_contains(agent, "remote_policy_changed",
                          "collector restart logs must identify policy changes separately");
-  ok &= require_contains(agent, "if (!edr_collector_stop())",
+  ok &= require_contains(agent, "if (!edr_collector_stop(NULL))",
                          "agent restart must require a complete collector join before a new epoch");
 
   free(cmake);

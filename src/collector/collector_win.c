@@ -5149,7 +5149,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
             (unsigned long)GetLastError());
     edr_collector_file_read_metadata_gate_consumer_unavailable(
         "file_read_metadata_consumer_ready_event_failed");
-    (void)edr_collector_stop();
+    (void)edr_collector_stop(NULL);
     return EDR_ERR_INTERNAL;
   }
   edr_network_trace_start_from_env();
@@ -5161,7 +5161,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
      * a later surviving decoder dereference freed/repurposed state. */
     edr_collector_file_read_metadata_gate_consumer_unavailable(
         "file_read_metadata_consumer_thread_failed");
-    (void)edr_collector_stop();
+    (void)edr_collector_stop(NULL);
     return EDR_ERR_INTERNAL;
   }
 
@@ -5177,7 +5177,7 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
               (long)InterlockedCompareExchange(&s_consumer_running, 0, 0));
       edr_collector_file_read_metadata_gate_consumer_unavailable(
           "file_read_metadata_consumer_not_ready");
-      (void)edr_collector_stop();
+      (void)edr_collector_stop(NULL);
       return EDR_ERR_INTERNAL;
     }
   }
@@ -5189,12 +5189,13 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   return EDR_OK;
 }
 
-int edr_collector_stop(void) {
+int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {
   DWORD wait_status;
   if (InterlockedCompareExchange(&s_started, 1, 1) != 1) {
     return 1;
   }
 
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_COLLECTOR_ENTERED);
   InterlockedExchange(&s_stopping, 1);
 
   if (s_session_handle != INVALID_PROCESSTRACE_HANDLE) {
@@ -5204,14 +5205,20 @@ int edr_collector_stop(void) {
     s_session_handle = INVALID_PROCESSTRACE_HANDLE;
   }
 
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_ETW_CONTROL_RETURNED);
+
   if (s_registry_watch_stop_event) {
     SetEvent(s_registry_watch_stop_event);
   }
+
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_REGISTRY_STOP_SIGNAL_RETURNED);
 
   if (s_security_sub) {
     EvtClose(s_security_sub);
     s_security_sub = NULL;
   }
+
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_SECURITY_CLOSE_RETURNED);
 
   if (s_consumer_thread) {
     wait_status = WaitForSingleObject(s_consumer_thread, 30000);
@@ -5223,6 +5230,8 @@ int edr_collector_stop(void) {
     }
   }
 
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_ETW_JOIN_PHASE_DONE);
+
   if (s_registry_watch_thread) {
     wait_status = WaitForSingleObject(s_registry_watch_thread, 30000);
     if (wait_status != WAIT_OBJECT_0) {
@@ -5233,12 +5242,16 @@ int edr_collector_stop(void) {
     }
   }
 
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_REGISTRY_JOIN_PHASE_DONE);
+
   /* No decoder can retain ETW-owned UserData: it only owns queue copies.
    * Do not reset the FileKey provider epoch until every A4.4 worker joined. */
   if (!edr_a44_split_path_stop()) {
     return 0;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_A44_JOIN_PHASE_DONE);
   edr_network_trace_stop();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_NETWORK_TRACE_STOP_RETURNED);
 
   if (s_consumer_thread) {
     CloseHandle(s_consumer_thread);
@@ -5268,6 +5281,7 @@ int edr_collector_stop(void) {
   s_collector_cfg = NULL;
   InterlockedExchange(&s_stopping, 0);
   InterlockedExchange(&s_started, 0);
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_COLLECTOR_CLEANUP_DONE);
   return 1;
 }
 

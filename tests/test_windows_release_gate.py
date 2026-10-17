@@ -978,6 +978,278 @@ class WindowsReleaseGateTests(unittest.TestCase):
             # Windows, not return after only the admission-specific cases.
             self.assertIn("test_p0_direct_emit_suppression: ok", completed.stdout)
 
+
+    def test_shutdown_progress_real_boundaries_and_existing_callers(self):
+        """Check the observer's concrete owners; no timer or delivery field is added."""
+        header = (ROOT / "include/edr/shutdown_progress.h").read_text(encoding="utf-8")
+        stages = re.findall(r"\b(EDR_SHUTDOWN_[A-Z0-9_]+)\s*=\s*(\d+)", header)
+        self.assertEqual([int(value) for _, value in stages], list(range(1, 29)))
+        owners = {name: [] for name, _ in stages[1:]}
+        for rel in ("src/main.c", "src/core/agent.c", "src/collector/collector_win.c"):
+            source = (ROOT / rel).read_text(encoding="utf-8")
+            emitted = re.findall(r"edr_shutdown_progress\(shutdown_observer, (EDR_SHUTDOWN_[A-Z0-9_]+)\);", source)
+            for name in emitted:
+                owners[name].append(rel)
+            self.assertEqual([int(dict(stages)[name]) for name in emitted],
+                             sorted(int(dict(stages)[name]) for name in emitted))
+        self.assertTrue(all(len(paths) == 1 for paths in owners.values()), owners)
+        agent = (ROOT / "src/core/agent.c").read_text(encoding="utf-8")
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
+        win = (ROOT / "src/collector/collector_win.c").read_text(encoding="utf-8")
+        self.assertEqual(agent.count("edr_collector_stop(NULL)"), 2)
+        self.assertEqual(agent.count("edr_collector_stop(shutdown_observer)"), 1)
+        self.assertEqual(win.count("edr_collector_stop(NULL)"), 3)
+        self.assertIn("e = edr_agent_run(agent, shutdown_observer);", main)
+        self.assertIn("if (g_service_status_handle) {\n    shutdown_observer = &service_shutdown_observer;", main)
+        self.assertIn("const EdrShutdownObserver *shutdown_observer = NULL;", main)
+        # Compare the drain/control actions after removing diagnostics against
+        # their established ownership order, not a fictitious successful stop.
+        collector = win[win.index("int edr_collector_stop("):win.index("\nint edr_collector_get_health(")]
+        actions = ("InterlockedExchange(&s_stopping, 1);", "ControlTraceW(",
+                   "SetEvent(s_registry_watch_stop_event)", "EvtClose(s_security_sub)",
+                   "WaitForSingleObject(s_consumer_thread, 30000)",
+                   "WaitForSingleObject(s_registry_watch_thread, 30000)",
+                   "edr_a44_split_path_stop()", "edr_network_trace_stop()",
+                   "edr_collector_file_key_cache_reset()", "InterlockedExchange(&s_started, 0)")
+        self.assertEqual([collector.index(action) for action in actions],
+                         sorted(collector.index(action) for action in actions))
+        tail = main[main.index("e = edr_agent_run(agent, shutdown_observer);"):main.index("\nstatic int edr_agent_config_test_main")]
+        actions = ("edr_ingest_http_stop_command_poll_timeout(10000u)",
+                   "edr_command_delivery_shutdown_timeout(10000u)",
+                   "edr_command_executor_shutdown_timeout(30000u)", "edr_preprocess_stop()",
+                   "edr_pmfe_shutdown()", "edr_shellcode_detector_shutdown()",
+                   "edr_webshell_detector_shutdown()", "edr_net_fanout_shutdown()",
+                   "edr_transport_shutdown()", "edr_validation_trace_stop()",
+                   "edr_local_evidence_cache_close()", "edr_storage_queue_close()", "edr_agent_destroy(agent)")
+        self.assertEqual([tail.index(action) for action in actions], sorted(tail.index(action) for action in actions))
+
+    def test_shutdown_progress_executes_service_and_collector_owners(self):
+        """Execute actual C owners with simulated SCM/ETW I/O, not a service stop."""
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
+        start = main.index("static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms) {")
+        service = main[start:main.index("\nstatic void WINAPI edr_service_main", start)]
+        win = (ROOT / "src/collector/collector_win.c").read_text(encoding="utf-8")
+        start = win.index("int edr_collector_stop(")
+        collector = win[start:win.index("\nint edr_collector_get_health", start)]
+        probe = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "edr/agent.h"
+#include "edr/collector.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+typedef uint32_t DWORD;
+typedef int BOOL;
+typedef void *HANDLE;
+typedef void *SERVICE_STATUS_HANDLE;
+typedef pthread_mutex_t SRWLOCK;
+#define SRWLOCK_INIT PTHREAD_MUTEX_INITIALIZER
+#define WINAPI
+#define NO_ERROR 0u
+#define SERVICE_WIN32_OWN_PROCESS 16u
+#define SERVICE_START_PENDING 2u
+#define SERVICE_STOP_PENDING 3u
+#define SERVICE_STOPPED 1u
+#define SERVICE_RUNNING 4u
+#define SERVICE_ACCEPT_STOP 1u
+#define SERVICE_ACCEPT_SHUTDOWN 4u
+#define SERVICE_CONTROL_STOP 1u
+#define SERVICE_CONTROL_SHUTDOWN 5u
+#define WAIT_OBJECT_0 0u
+#define WAIT_TIMEOUT 258u
+typedef struct { DWORD dwServiceType, dwCurrentState, dwControlsAccepted,
+  dwWin32ExitCode, dwServiceSpecificExitCode, dwCheckPoint, dwWaitHint; } SERVICE_STATUS;
+static void AcquireSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_lock(p) == 0); }
+static void ReleaseSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_unlock(p) == 0); }
+#endif
+static EdrAgent *g_agent_for_ctrl;
+static SERVICE_STATUS_HANDLE g_service_status_handle;
+static SERVICE_STATUS g_service_status;
+static SRWLOCK g_service_status_lock = SRWLOCK_INIT;
+static int held, attempts, failures, shutdowns;
+static SERVICE_STATUS accepted[512];
+static unsigned accepted_count;
+static void locked(SRWLOCK *p) { AcquireSRWLockExclusive(p); assert(!held); held = 1; }
+static void unlocked(SRWLOCK *p) { assert(held); held = 0; ReleaseSRWLockExclusive(p); }
+#define AcquireSRWLockExclusive locked
+#define ReleaseSRWLockExclusive unlocked
+static BOOL fake_SetServiceStatus(SERVICE_STATUS_HANDLE h, SERVICE_STATUS *s) {
+  assert(h && held);
+  assert(s->dwServiceType == SERVICE_WIN32_OWN_PROCESS);
+  assert(s->dwControlsAccepted == (s->dwCurrentState == SERVICE_RUNNING ?
+      SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0));
+  if (s->dwCurrentState == SERVICE_STOP_PENDING) assert(s->dwWaitHint == 30000);
+  attempts++;
+  if (failures) { failures--; return 0; }
+  assert(accepted_count < 512); accepted[accepted_count++] = *s; return 1;
+}
+#define SetServiceStatus fake_SetServiceStatus
+#define GetLastError() 5u
+void edr_agent_shutdown(EdrAgent *agent) {
+  assert(agent == g_agent_for_ctrl); locked(&g_service_status_lock); shutdowns++; unlocked(&g_service_status_lock);
+}
+SERVICE_SOURCE
+static void publish_all(void) {
+  for (int i = EDR_SHUTDOWN_MAIN_LOOP_EXITED; i <= EDR_SHUTDOWN_AGENT_DESTROY_RETURNED; i++) {
+    edr_service_shutdown_progress(NULL, (EdrShutdownStage)i);
+    edr_service_ctrl_handler(SERVICE_CONTROL_STOP);
+  }
+}
+#ifdef _WIN32
+static DWORD WINAPI concurrent(void *unused) { (void)unused; publish_all(); return 0; }
+#else
+static void *concurrent(void *unused) { (void)unused; publish_all(); return NULL; }
+#endif
+/* Collector calls are simulated; all lifecycle control flow below is actual. */
+#define INVALID_PROCESSTRACE_HANDLE ((uintptr_t)-1)
+#define EVENT_TRACE_CONTROL_STOP 1u
+typedef struct { struct { DWORD BufferSize; } Wnode; } EVENT_TRACE_PROPERTIES;
+static volatile int s_started, s_stopping, s_consumer_open_ok, s_consumer_running;
+static uintptr_t s_session_handle;
+static HANDLE s_registry_watch_stop_event, s_security_sub, s_consumer_thread,
+  s_registry_watch_thread, s_consumer_ready_event;
+static unsigned s_consumer_thread_id, s_registry_watch_thread_id;
+static void *s_bus, *s_collector_cfg;
+static const wchar_t *g_session_name = L"synthetic";
+static unsigned waits, close_count, actions, reports;
+static DWORD fail_wait;
+static int a44_ok;
+static EdrShutdownStage reported[32];
+static int fake_collector_InterlockedCompareExchange(volatile int *p, int desired, int expected) {
+  int old=*p; if (old == expected) *p=desired; return old;
+}
+static int fake_collector_InterlockedExchange(volatile int *p, int value) { int old=*p; *p=value; return old; }
+static DWORD fake_collector_ControlTraceW(uintptr_t h, const wchar_t *name, EVENT_TRACE_PROPERTIES *p, unsigned mode) {
+  assert(h == 1 && name && p->Wnode.BufferSize == sizeof(*p) && mode == EVENT_TRACE_CONTROL_STOP); actions++; return 5;
+}
+static BOOL fake_collector_SetEvent(HANDLE h) { assert(h); actions++; return 1; }
+static BOOL fake_collector_EvtClose(HANDLE h) { assert(h); actions++; return 1; }
+static DWORD fake_collector_WaitForSingleObject(HANDLE h, DWORD ms) { assert(h && ms == 30000); waits++; actions++; return waits == fail_wait ? WAIT_TIMEOUT : WAIT_OBJECT_0; }
+static BOOL fake_collector_CloseHandle(HANDLE h) { assert(h); close_count++; actions++; return 1; }
+static int edr_a44_split_path_stop(void) { actions++; return a44_ok; }
+static void edr_network_trace_stop(void) { actions++; }
+static void edr_collector_file_key_cache_reset(void) { actions++; }
+static void edr_collector_file_read_metadata_gate_session_reset(void) { actions++; }
+
+#undef InterlockedCompareExchange
+#define InterlockedCompareExchange fake_collector_InterlockedCompareExchange
+#undef InterlockedExchange
+#define InterlockedExchange fake_collector_InterlockedExchange
+#undef ControlTraceW
+#define ControlTraceW fake_collector_ControlTraceW
+#undef SetEvent
+#define SetEvent fake_collector_SetEvent
+#undef EvtClose
+#define EvtClose fake_collector_EvtClose
+#undef WaitForSingleObject
+#define WaitForSingleObject fake_collector_WaitForSingleObject
+#undef CloseHandle
+#define CloseHandle fake_collector_CloseHandle
+COLLECTOR_SOURCE
+#undef InterlockedCompareExchange
+#undef InterlockedExchange
+#undef ControlTraceW
+#undef SetEvent
+#undef EvtClose
+#undef WaitForSingleObject
+#undef CloseHandle
+static void collect_report(void *context, EdrShutdownStage stage) {
+  assert(context == &reports && reports < 32); reported[reports++] = stage;
+}
+static void reset_collector(void) {
+  s_started=1; s_stopping=0; s_consumer_running=1; s_consumer_open_ok=1;
+  s_session_handle=1; s_consumer_thread=(HANDLE)(uintptr_t)2;
+  s_registry_watch_thread=(HANDLE)(uintptr_t)3; s_registry_watch_stop_event=(HANDLE)(uintptr_t)4;
+  s_consumer_ready_event=(HANDLE)(uintptr_t)5; s_security_sub=(HANDLE)(uintptr_t)6;
+  s_bus=(void *)(uintptr_t)7; s_collector_cfg=(void *)(uintptr_t)8;
+  waits=close_count=actions=reports=0; fail_wait=0; a44_ok=1;
+}
+int main(void) {
+  EdrShutdownObserver observer={collect_report, &reports}, empty={0};
+  edr_shutdown_progress(NULL, EDR_SHUTDOWN_MAIN_LOOP_EXITED);
+  edr_shutdown_progress(&empty, EDR_SHUTDOWN_MAIN_LOOP_EXITED);
+  edr_service_shutdown_progress(NULL, EDR_SHUTDOWN_MAIN_LOOP_EXITED); assert(attempts == 0);
+  g_service_status_handle=(SERVICE_STATUS_HANDLE)(uintptr_t)1;
+  g_agent_for_ctrl=(EdrAgent *)(uintptr_t)2;
+  edr_service_set_status(SERVICE_START_PENDING, NO_ERROR, 30000);
+  edr_service_set_status(SERVICE_START_PENDING, NO_ERROR, 30000);
+  assert(g_service_status.dwCheckPoint == 2);
+  edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
+  edr_service_shutdown_progress(NULL, EDR_SHUTDOWN_MAIN_LOOP_EXITED); assert(attempts == 3);
+  edr_service_ctrl_handler(SERVICE_CONTROL_STOP);
+  assert(shutdowns == 1 && g_service_status.dwCheckPoint == 1);
+  edr_service_ctrl_handler(SERVICE_CONTROL_STOP);
+  assert(shutdowns == 2 && attempts == 4 && g_service_status.dwCheckPoint == 1);
+  edr_service_shutdown_progress(NULL, (EdrShutdownStage)0);
+  edr_service_shutdown_progress(NULL, (EdrShutdownStage)999); assert(attempts == 4);
+  failures=1; edr_service_shutdown_progress(NULL, EDR_SHUTDOWN_MAIN_LOOP_EXITED);
+  assert(attempts == 5 && accepted[accepted_count-1].dwCheckPoint == 1 && g_service_status.dwCheckPoint == 2);
+  edr_service_shutdown_progress(NULL, EDR_SHUTDOWN_MAIN_LOOP_EXITED); assert(attempts == 5);
+#ifdef _WIN32
+  HANDLE threads[4];
+  for (unsigned i=0;i<4;i++) { threads[i]=CreateThread(NULL,0,concurrent,NULL,0,NULL); assert(threads[i]); }
+  for (unsigned i=0;i<4;i++) { assert(WaitForSingleObject(threads[i],10000) == WAIT_OBJECT_0); assert(CloseHandle(threads[i])); }
+#else
+  pthread_t threads[4];
+  for (unsigned i=0;i<4;i++) assert(pthread_create(&threads[i], NULL, concurrent, NULL) == 0);
+  for (unsigned i=0;i<4;i++) assert(pthread_join(threads[i], NULL) == 0);
+#endif
+  assert(g_service_status.dwCheckPoint == EDR_SHUTDOWN_AGENT_DESTROY_RETURNED);
+  DWORD last=0;
+  for (unsigned i=0;i<accepted_count;i++) if (accepted[i].dwCurrentState == SERVICE_STOP_PENDING) {
+    assert(accepted[i].dwCheckPoint > last); last=accepted[i].dwCheckPoint;
+  }
+  edr_service_set_status(SERVICE_STOPPED, NO_ERROR, 0);
+  int before=attempts;
+  edr_service_shutdown_progress(NULL, EDR_SHUTDOWN_AGENT_DESTROY_RETURNED); assert(attempts == before);
+  reset_collector(); assert(edr_collector_stop(NULL) == 1); unsigned plain_actions=actions;
+  assert(reports == 0 && s_started == 0 && !s_bus && !s_consumer_thread);
+  edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
+  edr_service_ctrl_handler(SERVICE_CONTROL_STOP);
+  unsigned accepted_before=accepted_count;
+  failures=32;
+  EdrShutdownObserver refused_scm={edr_service_shutdown_progress, NULL};
+  reset_collector(); assert(edr_collector_stop(&refused_scm) == 1 && actions == plain_actions);
+  assert(accepted_count == accepted_before && accepted[accepted_count-1].dwCheckPoint == 1);
+  assert(g_service_status.dwCheckPoint == EDR_SHUTDOWN_COLLECTOR_CLEANUP_DONE);
+  failures=0;
+  edr_service_set_status(SERVICE_STOPPED, NO_ERROR, 0);
+  reset_collector(); assert(edr_collector_stop(&observer) == 1 && actions == plain_actions);
+  assert(reports == 9 && reported[0] == EDR_SHUTDOWN_COLLECTOR_ENTERED && reported[8] == EDR_SHUTDOWN_COLLECTOR_CLEANUP_DONE);
+  reset_collector(); fail_wait=1; assert(edr_collector_stop(&observer) == 0);
+  assert(reported[reports-1] == EDR_SHUTDOWN_SECURITY_CLOSE_RETURNED && s_started == 1 && s_bus && s_consumer_thread && close_count == 0);
+  reset_collector(); fail_wait=2; assert(edr_collector_stop(&observer) == 0);
+  assert(reported[reports-1] == EDR_SHUTDOWN_ETW_JOIN_PHASE_DONE && s_started == 1 && s_registry_watch_thread && close_count == 0);
+  reset_collector(); a44_ok=0; assert(edr_collector_stop(&observer) == 0);
+  assert(reported[reports-1] == EDR_SHUTDOWN_REGISTRY_JOIN_PHASE_DONE && s_started == 1 && s_bus && close_count == 0);
+  reset_collector(); s_started=0; assert(edr_collector_stop(&observer) == 1 && reports == 0 && actions == 0);
+  return 0;
+}
+'''
+        probe = probe.replace("SERVICE_SOURCE", service).replace("COLLECTOR_SOURCE", collector)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "probe.c").write_text(probe, encoding="utf-8")
+            (source / "abi.c").write_text(
+                '#include "edr/agent.h"\n#include "edr/collector.h"\n'
+                'extern EdrError edr_agent_run(EdrAgent *, const EdrShutdownObserver *);\n'
+                'extern int edr_collector_stop(const EdrShutdownObserver *);\n', encoding="utf-8")
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.20)\nproject(ShutdownProgress C)\n'
+                'set(CMAKE_C_STANDARD 11)\nfind_package(Threads REQUIRED)\n'
+                'add_library(abi OBJECT abi.c)\nadd_executable(progress probe.c)\n'
+                f'include_directories("{(ROOT / "include").as_posix()}")\n'
+                'target_link_libraries(progress PRIVATE Threads::Threads)\n'
+                'enable_testing()\nadd_test(NAME shutdown_progress COMMAND progress)\n', encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            self.run_command("cmake", "--build", str(build))
+            self.run_command("ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error")
+
     def test_file_read_consumer_lifecycle_gate_behavior(self):
         """Execute the production readiness predicate for every lifecycle combination.
 

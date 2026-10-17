@@ -950,7 +950,8 @@ EdrError edr_collector_start(EdrEventBus *bus, const EdrConfig *cfg) {
   return EDR_OK;
 }
 
-int edr_collector_stop(void) {
+int edr_collector_stop(const EdrShutdownObserver *shutdown_observer) {
+  (void)shutdown_observer;
   if (!s_started) {
     return 1;
   }

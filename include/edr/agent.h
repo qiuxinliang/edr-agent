@@ -4,6 +4,7 @@
 #include "config.h"
 #include "error.h"
 #include "event_bus.h"
+#include "shutdown_progress.h"
 
 typedef struct EdrAgent EdrAgent;
 
@@ -14,7 +15,7 @@ void edr_agent_destroy(EdrAgent *agent);
 EdrError edr_agent_init(EdrAgent *agent, const char *config_path);
 
 /** 阻塞运行直至 shutdown；循环内包含资源轮询、自保护 tick、可选配置热重载。 */
-EdrError edr_agent_run(EdrAgent *agent);
+EdrError edr_agent_run(EdrAgent *agent, const EdrShutdownObserver *shutdown_observer);
 
 void edr_agent_shutdown(EdrAgent *agent);
 

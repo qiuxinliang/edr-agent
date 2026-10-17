@@ -53,6 +53,7 @@ static void edr_on_sigint(int s) {
 static EdrAgent *g_agent_for_ctrl;
 static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
+static SRWLOCK g_service_status_lock = SRWLOCK_INIT;
 static const char *g_service_name = "FDSecurityAgent";
 static const char *g_service_config_path;
 
@@ -453,9 +454,17 @@ static void print_usage(const char *argv0) {
 
 #ifdef _WIN32
 static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms);
+static void edr_service_shutdown_progress(void *context, EdrShutdownStage stage);
 #endif
 
 static int edr_agent_run_main(const char *config) {
+  const EdrShutdownObserver *shutdown_observer = NULL;
+#ifdef _WIN32
+  EdrShutdownObserver service_shutdown_observer = {edr_service_shutdown_progress, NULL};
+  if (g_service_status_handle) {
+    shutdown_observer = &service_shutdown_observer;
+  }
+#endif
   /* Bind logs before subsystem initialization so startup failures survive the
    * next service/task restart. --help and --test-config keep their CLI output. */
   if (config && config[0]) {
@@ -622,27 +631,32 @@ static int edr_agent_run_main(const char *config) {
 #ifdef _WIN32
   edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
 #endif
-  e = edr_agent_run(agent);
+  e = edr_agent_run(agent, shutdown_observer);
   if (e != EDR_OK) {
     fprintf(stderr, "[shutdown] Agent run/collector stop failed; retaining dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_AGENT_RUN_DRAIN_DONE);
   if (!edr_ingest_http_stop_command_poll_timeout(10000u)) {
     fprintf(stderr, "[shutdown] command transport threads are still active; preserving dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_CONTROL_TRANSPORT_STOPPED);
   if (!edr_command_delivery_shutdown_timeout(10000u)) {
     fprintf(stderr, "[shutdown] result delivery thread is still active; preserving dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_RESULT_DELIVERY_STOPPED);
   if (!edr_command_executor_shutdown_timeout(30000u)) {
     fprintf(stderr, "[shutdown] command workers did not stop after cancellation; preserving dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_COMMAND_WORKERS_STOPPED);
   if (!edr_preprocess_stop()) {
     fprintf(stderr, "[shutdown] preprocessing did not finish; retaining dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_PREPROCESS_STOPPED);
   {
     uint64_t dd = 0, rr = 0;
     edr_dedup_get_stats(&dd, &rr);
@@ -694,18 +708,28 @@ static int edr_agent_run_main(const char *config) {
       }
     }
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_SHUTDOWN_STATS_DONE);
   edr_pmfe_shutdown();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_PMFE_STOP_RETURNED);
   edr_shellcode_detector_shutdown();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_SHELLCODE_STOP_RETURNED);
   edr_webshell_detector_shutdown();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_WEBSHELL_STOP_RETURNED);
   edr_net_fanout_shutdown();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_NET_FANOUT_STOP_RETURNED);
   if (!edr_transport_shutdown()) {
     fprintf(stderr, "[shutdown] telemetry worker remains active; retaining queue dependencies for process exit\n");
     return 1;
   }
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_TELEMETRY_STOPPED);
   edr_validation_trace_stop();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_VALIDATION_TRACE_STOP_RETURNED);
   edr_local_evidence_cache_close();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_EVIDENCE_CACHE_CLOSE_RETURNED);
   edr_storage_queue_close();
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_QUEUE_CLOSE_RETURNED);
   edr_agent_destroy(agent);
+  edr_shutdown_progress(shutdown_observer, EDR_SHUTDOWN_AGENT_DESTROY_RETURNED);
   return e == EDR_OK ? 0 : 1;
 }
 
@@ -725,7 +749,16 @@ static int edr_agent_config_test_main(const char *config) {
 
 #ifdef _WIN32
 static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms) {
+  DWORD status_error = NO_ERROR;
+  int status_failed = 0;
   if (!g_service_status_handle) {
+    return;
+  }
+  AcquireSRWLockExclusive(&g_service_status_lock);
+  /* Repeated controls do not manufacture progress or rewind a real phase. */
+  if (state == SERVICE_STOP_PENDING &&
+      g_service_status.dwCurrentState == SERVICE_STOP_PENDING) {
+    ReleaseSRWLockExclusive(&g_service_status_lock);
     return;
   }
   g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -734,12 +767,48 @@ static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hin
   g_service_status.dwWaitHint = wait_hint_ms;
   g_service_status.dwControlsAccepted =
       (state == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
-  if (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING) {
+  if (state == SERVICE_STOP_PENDING) {
+    g_service_status.dwCheckPoint = EDR_SHUTDOWN_STOP_REQUESTED;
+  } else if (state == SERVICE_START_PENDING) {
     g_service_status.dwCheckPoint++;
   } else {
     g_service_status.dwCheckPoint = 0;
   }
-  SetServiceStatus(g_service_status_handle, &g_service_status);
+  if (!SetServiceStatus(g_service_status_handle, &g_service_status)) {
+    status_error = GetLastError();
+    status_failed = 1;
+  }
+  ReleaseSRWLockExclusive(&g_service_status_lock);
+  if (status_failed) {
+    fprintf(stderr, "[shutdown] SCM status publication failed error=%lu\n",
+            (unsigned long)status_error);
+  }
+}
+
+static void edr_service_shutdown_progress(void *context, EdrShutdownStage stage) {
+  DWORD status_error = NO_ERROR;
+  int status_failed = 0;
+  (void)context;
+  if (!g_service_status_handle || stage < EDR_SHUTDOWN_MAIN_LOOP_EXITED ||
+      stage > EDR_SHUTDOWN_AGENT_DESTROY_RETURNED) {
+    return;
+  }
+  AcquireSRWLockExclusive(&g_service_status_lock);
+  if (g_service_status.dwCurrentState == SERVICE_STOP_PENDING &&
+      (DWORD)stage > g_service_status.dwCheckPoint) {
+    /* The API may reject this diagnostic. Never change drain/exit semantics,
+     * retry a stage, or claim that an attempted checkpoint was accepted. */
+    g_service_status.dwCheckPoint = (DWORD)stage;
+    if (!SetServiceStatus(g_service_status_handle, &g_service_status)) {
+      status_error = GetLastError();
+      status_failed = 1;
+    }
+  }
+  ReleaseSRWLockExclusive(&g_service_status_lock);
+  if (status_failed) {
+    fprintf(stderr, "[shutdown] SCM stage publication failed stage=%u error=%lu\n",
+            (unsigned)stage, (unsigned long)status_error);
+  }
 }
 
 static void WINAPI edr_service_ctrl_handler(DWORD ctrl) {
