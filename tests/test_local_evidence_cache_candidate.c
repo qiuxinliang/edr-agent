@@ -11351,10 +11351,13 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   /* More than the shared 4096-row slice: the first full-protected scan is
    * necessarily unfinished, but a finite activation must subsequently park. */
   pressure_continuation_phase("seed_begin",0u,phase_started);
+  /* Keep 4200 unique source snapshots with two complete child generations.
+   * The anchor has its own tuple; independent-lifetime/process/command
+   * inventory scale is a separate workload from this scheduler contract. */
   for (unsigned n = 0; n < 4200u; ++n) {
     snprintf(record->event_id,sizeof(record->event_id),"protected-pressure-%04u",n);
-    record->pid = protected_pid+n; record->process_start_key = start_key+n;
-    record->process_creation_filetime_100ns = birth+n;
+    record->pid = protected_pid+(n!=0u); record->process_start_key = start_key+(n!=0u);
+    record->process_creation_filetime_100ns = birth+(n!=0u);
     edr_behavior_bind_parent_context(record);
     assert(edr_local_evidence_cache_record_alert_context(record,&facts) == 0);
     if ((n&255u)==255u) pressure_continuation_phase("seed_progress",n+1u,phase_started);
@@ -11367,6 +11370,10 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   assert(sqlite3_open(path,&db) == SQLITE_OK);
   assert(compact_scalar(db,"PRAGMA freelist_count") == 0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE alert_context_protect_until_active_ms>(SELECT value FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms')") == 4200);
+  assert(compact_scalar(db,"SELECT COUNT(DISTINCT pid||':'||process_start_key||':'||process_creation_filetime_100ns) FROM p0_candidates") == 2);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND upload_status='embedded'") == 3);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates p JOIN context_reference_projection r ON r.candidate_id=p.candidate_id AND r.artifact_id=p.candidate_id||':alert_parent_context' JOIN context_facts f ON f.fact_id=r.fact_id") == 4200);
+  assert(compact_scalar(db,"SELECT COUNT(DISTINCT json_extract(f.manifest_template_json,'$.source_event_id')) FROM p0_candidates p JOIN context_reference_projection r ON r.candidate_id=p.candidate_id AND r.artifact_id=p.candidate_id||':alert_parent_context' JOIN context_facts f ON f.fact_id=r.fact_id") == 4200);
   pressure_continuation_phase("owner_hash_begin",0u,phase_started);
   parent_fixture_owner_hash(db,protected_pid,before_hash);
   pressure_continuation_phase("owner_hash_done",0u,phase_started);
