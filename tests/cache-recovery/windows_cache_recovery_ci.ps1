@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
+#Requires -PSEdition Core
 <#!
 Disposable GitHub-hosted Windows only. Requires caller-verified immutable
 Headless stages, a REAL backend-built protocol5 installer package and passed
@@ -43,6 +44,19 @@ function Save([string]$Name,$Value) {
   $h=[IO.File]::Open($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
   try {$h.Write($data,0,$data.Length);$h.Flush($true)} finally {$h.Dispose()}
 }
+function StartWindowsPowerShellChild([string]$ScriptPath,[string]$StandardOutput,[string]$StandardError) {
+  # pwsh's module path is not a Windows PowerShell module path. Match the
+  # existing CTest startup owner: let PS5.1 rebuild its own default path.
+  # This driver is sequential; only the current process value is changed,
+  # just while Start-Process copies the child environment, then restored.
+  $previousModulePath=[Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process)
+  try {
+    [Environment]::SetEnvironmentVariable('PSModulePath',$null,[EnvironmentVariableTarget]::Process)
+    return (Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$ScriptPath+'"')) -PassThru -RedirectStandardOutput $StandardOutput -RedirectStandardError $StandardError)
+  } finally {
+    [Environment]::SetEnvironmentVariable('PSModulePath',$previousModulePath,[EnvironmentVariableTarget]::Process)
+  }
+}
 function WaitProcess($Process,[int]$Seconds,[string]$Cause) {
   if (-not $Process.WaitForExit($Seconds*1000)) {
     # This object denotes only our own child; unknown update state is preserved.
@@ -64,7 +78,7 @@ function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Lab
   else {$body+="Start-Service -InputObject `$s -ErrorAction Stop;`$s.WaitForStatus('Running',[TimeSpan]::FromSeconds(30));"}
   $body+='exit 0'
   [IO.File]::WriteAllText($worker,$body,[Text.UTF8Encoding]::new($false))
-  $owned=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$worker+'"')) -PassThru -RedirectStandardOutput (Join-Path $script:root ($Label+'.service.stdout.log')) -RedirectStandardError (Join-Path $script:root ($Label+'.service.stderr.log'))
+  $owned=StartWindowsPowerShellChild $worker (Join-Path $script:root ($Label+'.service.stdout.log')) (Join-Path $script:root ($Label+'.service.stderr.log'))
   Need ((WaitProcess $owned 45 'service_control_unknown_no_retry') -eq 0) 'service_control_failed'
 }
 function ConfigBinding {
@@ -135,7 +149,7 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
   $journal=Join-Path $env:ProgramData ('FDSecurity\state\agent-update-'+$command+'.journal.json')
   $report=Join-Path $env:ProgramData ('FDSecurity\logs\agent-update-'+$command+'-report.json')
   Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
-  $child=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$invoke+'"')) -PassThru -RedirectStandardOutput (Join-Path $script:root ($Label+'.stdout.log')) -RedirectStandardError (Join-Path $script:root ($Label+'.stderr.log'))
+  $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))
   $triggered=$false;$deadline=[DateTime]::UtcNow.AddSeconds(900)
   while (-not $child.HasExited -and [DateTime]::UtcNow -lt $deadline) {
     if ($FailHealth -and -not $triggered -and (Test-Path -LiteralPath $journal)) {

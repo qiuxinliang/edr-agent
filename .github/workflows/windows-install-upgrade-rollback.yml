@@ -672,8 +672,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Original builder/preflight SHA gate failed; no recovery launch' }
           python -I -B tests/cache-recovery/prepare_disposable_695.py finalize --workspace "$PWD" --output "$env:EDR_PRIVATE_RECOVERY_PREP"
           if ($LASTEXITCODE -ne 0) { throw 'Original builder output binding failed' }
+      - name: Verify process-scoped Windows PowerShell child module environment
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $driver=Join-Path $PWD 'tests/cache-recovery/windows_cache_recovery_ci.ps1'
+          $driverSha=(Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
+          & (Join-Path $PWD 'tests/cache-recovery/test_windows_powershell_child_environment.ps1') -DriverSource $driver -DriverSha256 $driverSha
+          if ($LASTEXITCODE -ne 0) { throw 'Process-scoped Windows PowerShell child module environment contract failed' }
       - name: Execute only disposable local rollback and normal repair subset
-        shell: powershell
+        shell: pwsh
         run: |
           $binding=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'recovery-input.json'
           $sha=(Get-FileHash $binding -Algorithm SHA256).Hash.ToLowerInvariant()

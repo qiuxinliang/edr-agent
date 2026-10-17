@@ -103,18 +103,53 @@ class Contracts(unittest.TestCase):
     def assert_recovery_execution_host(self,text):
         step=re.search(r'^      - name: Execute only disposable local rollback and normal repair subset\n(.*?)(?=^      - |\Z)',text,re.M|re.S)
         self.assertIsNotNone(step)
-        # This sole driver consumer matches its #Requires5.1 child launcher;
-        # inheriting the job's pwsh host must not silently return.
-        self.assertEqual(re.findall(r'^        shell: (.+)$',step[1],re.M),['powershell'])
-    def test_manual_execution_uses_matching_windows_powershell_host(self):
+        # Native child exit observation is source-verified only under Core.
+        self.assertEqual(re.findall(r'^        shell: (.+)$',step[1],re.M),['pwsh'])
+    def test_manual_execution_uses_supported_powershell_core_host(self):
         workflow=Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml'
         text=workflow.read_text();self.assert_recovery_execution_host(text)
         header='      - name: Execute only disposable local rollback and normal repair subset\n'
-        selected=header+'        shell: powershell\n'
+        selected=header+'        shell: pwsh\n'
         self.assertEqual(text.count(selected),1)
-        for replacement in [header,header+'        shell: pwsh\n']:
+        for replacement in [header,header+'        shell: powershell\n']:
             with self.subTest(shell=replacement),self.assertRaises(AssertionError):
                 self.assert_recovery_execution_host(text.replace(selected,replacement,1))
+    def assert_driver_supported_host(self,text):
+        self.assertEqual(text.splitlines()[:2],['#Requires -Version 7.0','#Requires -PSEdition Core'])
+    def test_driver_rejects_legacy_or_unspecified_host(self):
+        text=Path(__file__).with_name('windows_cache_recovery_ci.ps1').read_text()
+        self.assert_driver_supported_host(text)
+        for bad in [text.replace('#Requires -Version 7.0\n','',1),
+                    text.replace('#Requires -Version 7.0','#Requires -Version 5.1',1),
+                    text.replace('#Requires -PSEdition Core\n','',1),
+                    text.replace('#Requires -PSEdition Core','#Requires -PSEdition Desktop',1)]:
+            with self.assertRaises(AssertionError):self.assert_driver_supported_host(bad)
+    def test_process_scoped_legacy_child_helper_and_workflow_consumer(self):
+        driver=Path(__file__).with_name('windows_cache_recovery_ci.ps1').read_text()
+        helper=driver[driver.index('function StartWindowsPowerShellChild('):driver.index('function WaitProcess(')]
+        self.assertIn("[Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process)",helper)
+        self.assertIn("[Environment]::SetEnvironmentVariable('PSModulePath',$null,[EnvironmentVariableTarget]::Process)",helper)
+        self.assertIn("finally {",helper)
+        self.assertIn("[Environment]::SetEnvironmentVariable('PSModulePath',$previousModulePath,[EnvironmentVariableTarget]::Process)",helper)
+        self.assertNotIn('EnvironmentVariableTarget]::Machine',helper);self.assertNotIn('EnvironmentVariableTarget]::User',helper)
+        self.assertEqual(len(re.findall(r'^  \$(?:owned|child)=StartWindowsPowerShellChild ',driver,re.M)),2)
+        wait=driver[driver.index('function WaitProcess('):driver.index('function ServiceAction(')]
+        self.assertNotIn('.Handle',wait)
+        workflow=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
+        check='      - name: Verify process-scoped Windows PowerShell child module environment\n'
+        self.assertEqual(workflow.count(check),1)
+        body=workflow[workflow.index(check):workflow.index('      - name: Execute only disposable local rollback and normal repair subset\n')]
+        self.assertIn('        shell: pwsh\n        timeout-minutes: 2\n',body)
+        self.assertIn("'tests/cache-recovery/test_windows_powershell_child_environment.ps1'",body)
+        self.assertIn('-DriverSource $driver -DriverSha256 $driverSha',body)
+        self.assertIn('if ($LASTEXITCODE -ne 0)',body)
+        self.assertNotIn('CacheOwnedHandleForTest',body);self.assertNotIn('RequireCounterfactualFailureForTest',body)
+        contract=Path(__file__).with_name('test_windows_powershell_child_environment.ps1').read_text()
+        self.assertIn("  Probe 'original_parent_direct' $false $original $worker $(if($PSVersionTable.PSVersion.Major -eq 5){0}else{-1})\n  Probe 'isolated_parent_direct' $true $original $worker 0\n",contract)
+        self.assertIn('if ($rows.Count -ne 9) {exit 3}',contract)
+        self.assertIn('parent_default_modulepath_counterfactual_reproduced=$parentDefaultProven',contract)
+        self.assertIn('if ($RequireCounterfactualFailureForTest -and -not $proven) {exit 3}',contract)
+        self.assertTrue(contract.endswith('\nexit 0\n'))
     def assert_transport(self,argv,cap,seconds,endpoint,accept,expected_cap):
         self.assertEqual(argv,['gh','api','--method','GET',endpoint,'-H','Accept: '+accept])
         self.assertEqual(cap,expected_cap);self.assertEqual(seconds,150)
