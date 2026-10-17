@@ -254,8 +254,8 @@ the existing target and hard-over/pending pressure is established. Allocated
 free pages alone never authorize capacity eviction. The same whole-group,
 owner, floor, row/byte/time and commit-only cursor guards remain in force.
 
-The artificial 1 ms-per-read full diagnostic still does not meet its original
-128-turn final-size assertion, although real pressure retirement now progresses.
+For 4c/67ed, the artificial 1 ms-per-read full diagnostic did not meet its
+original 128-turn final-size assertion, although pressure retirement progressed.
 That failure is retained as a throughput boundary, not relabelled as a pass.
 A separate fixed-turn liveness/protection regression and the unchanged normal
 convergence fixture verify different contracts; native results must establish
@@ -268,6 +268,42 @@ acceptance. Both ARM64 contracts are repeated twelve times after the actual
 native suites; the workflow stops at the first failure. Existing packaging,
 Release/PE/DLL/source/hash checks, separate failed artifact identity and the
 native gate remain required.
+
+The next actual run, `38995107248` / `67edb2be`, failed both architectures
+at the newly registered global-read-delay progress assertion: 16 polls made
+only eight additional maintenance runs and no additional retirement. The
+original normal 128-turn capacity assertions passed before that failure.
+Clock and owner state remained valid; held counters include work-budget yields
+as well as protection. Neither a pin-only cause nor a missing index is proven.
+Failure-only output now includes actual read-delay count/minimum/maximum.
+
+A separate private selector-scoped differential preserved the real filesystem
+results, 20 ms slice, 16 turns and all owner assertions: the 4c eager selector
+failed while 67ed streaming passed. This supports the selector repair, but does
+not replace the failing global-delay test or establish its Windows cause.
+
+The narrow pager-continuation candidate preserves the existing approximately
+1 MiB SQLite pager target between unfinished pressure slices and empty reclaim
+turns. Errors, resource pressure, completed work and actual page reclamation
+retain memory release. The pager target is not a hard bound on process RSS,
+dirty pages, schema, temporary memory or the whole Agent. No deadline, work,
+owner, reference or retention rule changes. Host old/new comparisons both
+passed, with no consistent performance direction; Windows causality and the
+candidate's acceptance remain unverified. The candidate's host build, six
+current contract CLIs and three cache suites pass. The forced-original-trim
+host case also passes, so it supplies no failure-to-success causality. A single
+candidate execution of the original global-delay 128-turn diagnostic passes;
+its assertions and earlier failed runs remain unchanged and retained. This is
+one diagnostic observation, not a universal latency or fixed-turn guarantee.
+
+Only TESTING builds include a force-original-trim counterfactual switch. Its
+opt-in CLI runs the same global-delay fixture and unchanged assertions, then
+clears the switch on a normal return. Both Windows architectures record that
+historical result separately and must still pass all three current reclaim
+CLIs twelve times. Historical failure is not acceptance; historical success is
+non-reproduction. Passed diagnostic artifacts require both actual suites and
+repeated current contracts to succeed. Failed artifacts retain exactly the
+two existing diagnostic commands and cannot run the soak.
 
 At this source commit, host checks and short real-clock smoke runs are
 available; native Windows CI, the two-window UTM load and isolated recovery

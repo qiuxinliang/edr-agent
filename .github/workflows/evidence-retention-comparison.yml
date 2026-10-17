@@ -161,9 +161,8 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
-      - name: Repeat the ARM64 bounded-reclaim contracts
+      - name: Repeat the native bounded-reclaim contracts
         id: sliced
-        if: ${{ matrix.arch == 'arm64' }}
         timeout-minutes: 5
         shell: pwsh
         run: |
@@ -175,7 +174,12 @@ jobs:
           logs = pathlib.Path(os.environ['RUNNER_TEMP'])/'retention-sliced-contract'
           logs.mkdir(exist_ok=False)
           for index in range(12):
-              for label, argv in [('sliced', '--sliced-reclaim-contract'), ('capacity', '--capacity-reclaim-contract')]:
+              # Historical test-only trim behavior is a same-binary discriminator,
+              # never a replacement for the three current contracts below.
+              with (logs/f'historical-trim-{index:02d}.log').open('xb') as output:
+                  baseline = subprocess.run([str(root/'contract-build/tests/test_local_evidence_cache_candidate.exe'), '--capacity-reclaim-progress-trim-baseline'], stdout=output, stderr=subprocess.STDOUT, timeout=180)
+              print(f'historical_trim_run={index+1} return_code={baseline.returncode} acceptance_claimed=false', flush=True)
+              for label, argv in [('sliced', '--sliced-reclaim-contract'), ('capacity', '--capacity-reclaim-contract'), ('progress', '--capacity-reclaim-progress')]:
                   with (logs/f'case-{label}-{index:02d}.log').open('xb') as output:
                       result = subprocess.run([str(root/'contract-build/tests/test_local_evidence_cache_candidate.exe'), argv], stdout=output, stderr=subprocess.STDOUT, timeout=180)
                   print(f'{label}_contract_run={index+1} return_code={result.returncode}', flush=True)
@@ -183,7 +187,7 @@ jobs:
                       raise SystemExit(1)
           '@
           python -B -c $probe
-          if ($LASTEXITCODE -ne 0) { throw 'ARM64 bounded-reclaim contract failed; inspect the first failure log' }
+          if ($LASTEXITCODE -ne 0) { throw 'Native bounded-reclaim contract failed; inspect the first failure log' }
       - name: Stage the compiled private native diagnostic tool
         id: native-tools
         if: ${{ always() && (steps.contracts.outcome == 'success' || steps.contracts.outcome == 'failure') }}
@@ -196,7 +200,7 @@ jobs:
           $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
           $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
           if (-not $env:VCToolsRedistDir) { throw 'Initialized MSVC redist owner is missing' }
-          $prior = if ('${{ steps.contracts.outcome }}' -eq 'success' -and ('${{ matrix.arch }}' -ne 'arm64' -or '${{ steps.sliced.outcome }}' -eq 'success')) { 'passed' } else { 'failed' }
+          $prior = if ('${{ steps.contracts.outcome }}' -eq 'success' -and '${{ steps.sliced.outcome }}' -eq 'success') { 'passed' } else { 'failed' }
           $artifactPrefix = if ($prior -eq 'passed') { 'evidence-native-tools' } else { 'evidence-failed-gate-tools' }
           "artifact_prefix=$artifactPrefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           python -B scripts/stage_retention_native_tools.py --repo "$env:GITHUB_WORKSPACE" --build-dir "$env:GITHUB_WORKSPACE/contract-build" --dependency-prefix "$prefix" --msvc-redist-root "$env:VCToolsRedistDir" --compiler "$compiler" --dumpbin "$dumpbin" --output "$env:RUNNER_TEMP/evidence-native-tools" --arch '${{ matrix.arch }}' --source-sha '${{ github.sha }}' --run-id '${{ github.run_id }}' --run-attempt '${{ github.run_attempt }}' --prior-contract-status "$prior"

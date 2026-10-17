@@ -446,6 +446,7 @@ static EdrContextStore s_context_store;
 static unsigned s_test_commit_failures;
 static unsigned s_test_live_size_query_failures;
 static int s_test_commit_active;
+static int s_test_force_original_memory_trim;
 
 static int evidence_cache_test_deny_query(void *opaque, int action,
                                          const char *arg1, const char *arg2,
@@ -5865,7 +5866,7 @@ done:
  * the lock and returns to event processing before any subsequent slice. */
 static int sqlite_maintenance_reclaim_poll(void) {
   sqlite3_stmt *st = NULL;
-  int result = 0;
+  int result = 0, trim_memory;
   unsigned pages = s_maintenance_reclaim_pages < 256u
                        ? s_maintenance_reclaim_pages : 256u;
   int rc = sqlite3_prepare_v2(s_db, "PRAGMA freelist_count;", -1, &st, NULL);
@@ -5898,8 +5899,18 @@ failed:
   s_last_maintenance_ns = edr_monotonic_ns();
 finish:
   if (!s_maintenance_reclaim_pages) s_last_maintenance_ns=edr_monotonic_ns();
-  (void)sqlite3_db_release_memory(s_db);
-  (void)sqlite3_release_memory(0);
+  /* An empty reclaim turn must not discard the working set needed by the
+   * unfinished pressure slice. Actual reclamation, errors and resource
+   * pressure retain the existing memory release boundary. */
+  trim_memory = result != 0 || pages != 0u ||
+      !s_maintenance_pressure_pending || evidence_cache_pressure_active();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_force_original_memory_trim) trim_memory = 1;
+#endif
+  if (trim_memory) {
+    (void)sqlite3_db_release_memory(s_db);
+    (void)sqlite3_release_memory(0);
+  }
   refresh_db_size_status();
   return result;
 }
@@ -5912,7 +5923,7 @@ static int sqlite_maintenance(int defer_reclaim) {
       4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
   s_status.maintenance_runs++;
   if (!sqlite_database_write_allow(slice.bytes_left)) return -1;
-  int result = 0;
+  int result = 0, trim_memory;
   /* Admission may take over an already scheduled reclaim slice. Consume at
    * most that one existing 256-page operation before optional TTL/clock writes
    * and their checkpoint can exhaust this turn's cooperative deadline. The
@@ -5990,8 +6001,18 @@ static int sqlite_maintenance(int defer_reclaim) {
 failed:
   s_maintenance_reclaim_pages=0u; result=-1;
 finish:
-  (void)sqlite3_db_release_memory(s_db);
-  (void)sqlite3_release_memory(0);
+  /* Preserve the bounded pager between unfinished pressure turns; repeatedly
+   * starting a cold preflight can spend every cooperative slice before a
+   * group commits. Completed work and resource/error paths still trim. */
+  trim_memory = result != 0 || !s_maintenance_pressure_pending ||
+      !sqlite_maintenance_yield(&slice) || evidence_cache_pressure_active();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_force_original_memory_trim) trim_memory = 1;
+#endif
+  if (trim_memory) {
+    (void)sqlite3_db_release_memory(s_db);
+    (void)sqlite3_release_memory(0);
+  }
   refresh_db_size_status();
   return result;
 }
@@ -7413,6 +7434,12 @@ void edr_local_evidence_cache_test_fail_next_commits(unsigned count) {
 void edr_local_evidence_cache_test_fail_next_live_size_queries(unsigned count) {
   evidence_cache_lock();
   s_test_live_size_query_failures = count;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_force_original_memory_trim(int enabled) {
+  evidence_cache_lock();
+  s_test_force_original_memory_trim = enabled != 0;
   evidence_cache_unlock();
 }
 #endif

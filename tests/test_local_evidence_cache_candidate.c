@@ -10468,8 +10468,19 @@ static void test_capacity_reclaim_bounded_progress_preserves_parent_floor(void) 
     trace[turn+1u]=capacity_reclaim_turn(&after,(soak_monotonic_ns()-poll_started)/1000u);
   }
   retention_main_read_delay_ms=0; retention_main_read_high_resolution=0;
-  if (after.retention_groups_retired<=before.retention_groups_retired)
+  if (after.retention_groups_retired<=before.retention_groups_retired) {
+    fprintf(stderr,"capacity_reclaim_delayed_read_failure delayed_read_count=%llu delayed_read_min_ns=%llu delayed_read_max_ns=%llu hard_over=%d capacity_evicted=%llu held=%llu floor_held=%llu clock_valid=%u clock_cause=%u active_ms=%llu pressure_cursor_observable=0 not_hard_realtime=1\n",
+        (unsigned long long)retention_high_resolution_reads,
+        (unsigned long long)retention_read_delay_min_ns,
+        (unsigned long long)retention_read_delay_max_ns,
+        after.db_bytes+after.wal_bytes>1048576u,
+        (unsigned long long)after.db_capacity_evicted,
+        (unsigned long long)after.retention_groups_held,
+        (unsigned long long)after.retention_floor_held,
+        after.retention_clock_valid,after.retention_clock_cause_code,
+        (unsigned long long)after.retention_active_ms);
     capacity_reclaim_failure(path,3u,16u,started,&after,trace);
+  }
   assert(retention_high_resolution_reads>0u && retention_read_delay_min_ns>=1000000u);
   assert(after.retention_groups_retired>before.retention_groups_retired);
   assert(after.db_capacity_evicted>before.db_capacity_evicted);
@@ -11434,6 +11445,11 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-progress-trim-baseline") == 0) {
+    edr_local_evidence_cache_test_force_original_memory_trim(1);
+    test_capacity_reclaim_bounded_progress_preserves_parent_floor();
+    edr_local_evidence_cache_test_force_original_memory_trim(0); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--capacity-reclaim-progress") == 0) {
     test_capacity_reclaim_bounded_progress_preserves_parent_floor(); return 0;
   }
