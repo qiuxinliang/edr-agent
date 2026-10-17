@@ -11788,7 +11788,321 @@ static void test_alert_parent_context_refusal_and_unresolved(void) {
 }
 #endif
 
+/* Test EXE only; no production API or arbitrary database path argument.
+ * The caller owns a consistent backup, ACL, passed-tool/source provenance and
+ * the 90-second owned-process watchdog. This entry does not replace that caller. */
+#if defined(_WIN32) && defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+#include "edr/storage_physical_guard.h"
+
+#define WC_ROOT "C:\\EDR_RETENTION_SYNTHETIC_20261017"
+#define WC_BYTES (UINT64_C(512) * 1024u * 1024u)
+#define WC_CAP 4096u
+
+typedef struct {
+  BY_HANDLE_FILE_INFORMATION id;
+  FILE_BASIC_INFO basic;
+} WcIdentity;
+
+static int wc_hex(const char *s, size_t n) {
+  if (!s || strlen(s) != n) return 0;
+  for (size_t i=0; i<n; ++i)
+    if (!((s[i]>='0' && s[i]<='9') || (s[i]>='a' && s[i]<='f'))) return 0;
+  return 1;
+}
+
+static int wc_time(ULONGLONG started) {
+  ULONGLONG now=GetTickCount64();
+  return now>=started && now-started<=60000u;
+}
+
+static uint64_t wc_size(const WcIdentity *s) {
+  return ((uint64_t)s->id.nFileSizeHigh<<32) | s->id.nFileSizeLow;
+}
+
+static int wc_identity(HANDLE h, int directory, WcIdentity *out) {
+  memset(out,0,sizeof(*out));
+  if (GetFileType(h)!=FILE_TYPE_DISK ||
+      !GetFileInformationByHandle(h,&out->id) ||
+      !GetFileInformationByHandleEx(h,FileBasicInfo,&out->basic,sizeof(out->basic)) ||
+      (out->id.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+      !!(out->id.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)!=!!directory) return 0;
+  return directory || out->id.nNumberOfLinks==1u;
+}
+
+static int wc_same_file(const WcIdentity *a, const WcIdentity *b) {
+  return a->id.dwVolumeSerialNumber==b->id.dwVolumeSerialNumber &&
+      a->id.nFileIndexHigh==b->id.nFileIndexHigh &&
+      a->id.nFileIndexLow==b->id.nFileIndexLow;
+}
+
+static int wc_unchanged(const WcIdentity *a, const WcIdentity *b) {
+  /* Same Win32 handle API on both sides. Last access is intentionally excluded:
+   * this probe reads the file. Creation/change/write times are not interchangeable. */
+  return wc_same_file(a,b) && wc_size(a)==wc_size(b) &&
+      a->id.nNumberOfLinks==b->id.nNumberOfLinks &&
+      a->basic.CreationTime.QuadPart==b->basic.CreationTime.QuadPart &&
+      a->basic.LastWriteTime.QuadPart==b->basic.LastWriteTime.QuadPart &&
+      a->basic.ChangeTime.QuadPart==b->basic.ChangeTime.QuadPart &&
+      a->basic.FileAttributes==b->basic.FileAttributes;
+}
+
+static int wc_final_path(HANDLE h, const char *path) {
+  char actual[512], expected[512];
+  DWORD n=GetFinalPathNameByHandleA(h,actual,sizeof(actual),FILE_NAME_NORMALIZED|VOLUME_NAME_DOS);
+  int m=snprintf(expected,sizeof(expected),"\\\\?\\%s",path);
+  return n && n<sizeof(actual) && m>0 && (size_t)m<sizeof(expected) &&
+      _stricmp(actual,expected)==0;
+}
+
+static HANDLE wc_open(const char *path, int directory, DWORD access, DWORD share) {
+  HANDLE h=CreateFileA(path,access,share,NULL,OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT|(directory ? FILE_FLAG_BACKUP_SEMANTICS : 0),NULL);
+  WcIdentity id;
+  if (h!=INVALID_HANDLE_VALUE && (!wc_identity(h,directory,&id) || !wc_final_path(h,path))) {
+    CloseHandle(h); h=INVALID_HANDLE_VALUE;
+  }
+  return h;
+}
+
+static int wc_absent(const char *path) {
+  DWORD a=GetFileAttributesA(path);
+  return a==INVALID_FILE_ATTRIBUTES && GetLastError()==ERROR_FILE_NOT_FOUND;
+}
+
+static int wc_no_sidecars(const char *baseline) {
+  static const char *const suffix[]={"-wal","-shm","-journal"};
+  char p[512];
+  for (size_t i=0;i<3u;++i) {
+    int n=snprintf(p,sizeof(p),"%s%s",baseline,suffix[i]);
+    if (n<=0 || (size_t)n>=sizeof(p) || !wc_absent(p)) return 0;
+  }
+  return 1;
+}
+
+static int wc_case_entries(const char *path) {
+  char glob[512]; WIN32_FIND_DATAA d;
+  if (snprintf(glob,sizeof(glob),"%s\\*",path)<0) return 0;
+  HANDLE search=FindFirstFileA(glob,&d);
+  if (search==INVALID_HANDLE_VALUE) return 0;
+  int good=1; unsigned found=0;
+  do {
+    if (!strcmp(d.cFileName,".") || !strcmp(d.cFileName,"..")) continue;
+    if ((d.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        (strcmp(d.cFileName,"manifest.json") && strcmp(d.cFileName,"baseline.db"))) {good=0;break;}
+    ++found;
+  } while (FindNextFileA(search,&d));
+  if (good && GetLastError()!=ERROR_NO_MORE_FILES) good=0;
+  FindClose(search); return good && found==2u;
+}
+
+static void wc_digest_hex(EdrSha256Ctx *ctx, char out[65]) {
+  static const char hex[]="0123456789abcdef"; uint8_t digest[32];
+  edr_sha256_final(ctx,digest);
+  for (size_t i=0;i<32u;++i) {out[2u*i]=hex[digest[i]>>4];out[2u*i+1u]=hex[digest[i]&15u];}
+  out[64]='\0';
+}
+
+/* Same locked source handle for hash/copy/hash. No SQLite open on baseline. */
+static int wc_hash_copy(HANDLE in, HANDLE out, uint64_t bytes, ULONGLONG started, char hash[65]) {
+  unsigned char block[65536]; EdrSha256Ctx ctx; LARGE_INTEGER zero; zero.QuadPart=0;
+  if (!SetFilePointerEx(in,zero,NULL,FILE_BEGIN)) return 0;
+  edr_sha256_init(&ctx);
+  for (uint64_t done=0;done<bytes;) {
+    DWORD n=0, want=(DWORD)((bytes-done)<sizeof(block) ? bytes-done : sizeof(block));
+    if (!wc_time(started) || !ReadFile(in,block,want,&n,NULL) || n!=want) return 0;
+    edr_sha256_update(&ctx,block,n);
+    if (out!=INVALID_HANDLE_VALUE) {
+      DWORD written=0;
+      if (!WriteFile(out,block,n,&written,NULL) || written!=n) return 0;
+    }
+    done+=n;
+  }
+  DWORD extra=0;
+  if (!ReadFile(in,block,1u,&extra,NULL) || extra || !wc_time(started)) return 0;
+  wc_digest_hex(&ctx,hash); return 1;
+}
+
+static const cJSON *wc_item(const cJSON *root, const char *key) {
+  return cJSON_GetObjectItemCaseSensitive(root,key);
+}
+
+static int wc_manifest(const char *raw, size_t bytes, const char *token, cJSON **result) {
+  static const char *const keys[]={"schema","token","source_commit","exe_sha256",
+      "baseline_sha256","baseline_bytes","budget_mb","recent_hours","selected_hours"};
+  /* Closed ASCII schema needs no escapes. Reject embedded NUL/escaped NUL,
+   * non-ASCII and ambiguous duplicate keys instead of accepting a prefix. */
+  for (size_t i=0;i<bytes;++i)
+    if (!raw[i] || (unsigned char)raw[i]>126u || raw[i]=='\\' ||
+        ((unsigned char)raw[i]<32u && raw[i]!='\n' && raw[i]!='\r' && raw[i]!='\t')) return 0;
+  cJSON *root=cJSON_ParseWithLengthOpts(raw,bytes+1u,NULL,1);
+  if (!cJSON_IsObject(root)) {cJSON_Delete(root);return 0;}
+  unsigned seen=0;
+  for (const cJSON *p=root->child;p;p=p->next) {
+    unsigned i=0; for (;i<9u;++i) if (p->string && !strcmp(p->string,keys[i])) break;
+    if (i==9u || (seen&(1u<<i))) {cJSON_Delete(root);return 0;}
+    seen|=1u<<i;
+  }
+  const cJSON *schema=wc_item(root,"schema"), *t=wc_item(root,"token"),
+      *source=wc_item(root,"source_commit"), *exe=wc_item(root,"exe_sha256"),
+      *baseline=wc_item(root,"baseline_sha256"), *n=wc_item(root,"baseline_bytes"),
+      *budget=wc_item(root,"budget_mb"), *recent=wc_item(root,"recent_hours"),
+      *selected=wc_item(root,"selected_hours");
+  int good=seen==511u && cJSON_IsString(schema) &&
+      !strcmp(schema->valuestring,"edr.test.normal-open-work-copy.v1") &&
+      cJSON_IsString(t) && !strcmp(t->valuestring,token) &&
+      cJSON_IsString(source) && wc_hex(source->valuestring,40u) &&
+      cJSON_IsString(exe) && wc_hex(exe->valuestring,64u) &&
+      cJSON_IsString(baseline) && wc_hex(baseline->valuestring,64u) &&
+      cJSON_IsNumber(n) && n->valuedouble>=512.0 && n->valuedouble<=WC_BYTES &&
+      n->valuedouble==(double)(uint64_t)n->valuedouble &&
+      cJSON_IsNumber(budget) && budget->valuedouble==512.0 &&
+      cJSON_IsNumber(recent) && recent->valuedouble==72.0 &&
+      cJSON_IsNumber(selected) && selected->valuedouble==72.0;
+  if (!good) {cJSON_Delete(root);return 0;}
+  *result=root; return 1;
+}
+
+static int wc_work_bytes(const char *directory, const char *work, uint64_t *main_bytes, uint64_t *total) {
+  static const char *const suffix[]={"","-wal","-shm","-journal"};
+  char p[512]; WIN32_FIND_DATAA d; *main_bytes=*total=0;
+  if (snprintf(p,sizeof(p),"%s\\*",directory)<0) return 0;
+  HANDLE search=FindFirstFileA(p,&d);
+  if (search==INVALID_HANDLE_VALUE) return 0;
+  int good=1;
+  do {
+    if (!strcmp(d.cFileName,".") || !strcmp(d.cFileName,"..")) continue;
+    if ((d.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        (strcmp(d.cFileName,"work.db") && strcmp(d.cFileName,"work.db-wal") &&
+         strcmp(d.cFileName,"work.db-shm") && strcmp(d.cFileName,"work.db-journal"))) {good=0;break;}
+  } while (FindNextFileA(search,&d));
+  if (good && GetLastError()!=ERROR_NO_MORE_FILES) good=0;
+  FindClose(search); if (!good) return 0;
+  for (size_t i=0;i<4u;++i) {
+    if (snprintf(p,sizeof(p),"%s%s",work,suffix[i])<0) return 0;
+    if (wc_absent(p)) {if (!i) return 0;continue;}
+    HANDLE h=wc_open(p,0,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE);
+    WcIdentity id;
+    if (h==INVALID_HANDLE_VALUE) return 0;
+    int good=wc_identity(h,0,&id); CloseHandle(h);
+    if (!good || *total>UINT64_MAX-wc_size(&id)) return 0;
+    if (!i) *main_bytes=wc_size(&id);
+    *total+=wc_size(&id);
+  }
+  return 1;
+}
+
+static int run_normal_open_work_copy(const char *token, const char *approved_manifest_sha) {
+  char directory[256], manifest[320], baseline[320], workdir[320], work[352];
+  char raw[WC_CAP+1u], manifest_hash[65]="", baseline_hash[65]="", copy_hash[65]="",
+      after_hash[65]="", exe_hash[65]="", work_after_hash[65]="";
+  wchar_t exe_path[32768];
+  HANDLE root=INVALID_HANDLE_VALUE, dir=INVALID_HANDLE_VALUE, mh=INVALID_HANDLE_VALUE,
+      src=INVALID_HANDLE_VALUE, dst=INVALID_HANDLE_VALUE, wh=INVALID_HANDLE_VALUE,
+      wd=INVALID_HANDLE_VALUE, exe=INVALID_HANDLE_VALUE;
+  WcIdentity mi, bi, after, wi; EdrEvidenceCacheStatus status; memset(&status,0,sizeof(status));
+  cJSON *m=NULL; const char *cause="invalid_arguments"; DWORD error=0;
+  ULONGLONG started=GetTickCount64(); int rc=2, owner_rc=-99, owner_called=0, baseline_verified=0;
+  uint64_t main_bytes=0, physical=0, floor=0, available=0, bytes=0;
+#define WC_NEED(condition, reason) do {SetLastError(ERROR_SUCCESS);if (!(condition)) {cause=reason;error=GetLastError();goto done;}} while(0)
+  WC_NEED(wc_hex(token,32u) && wc_hex(approved_manifest_sha,64u),"invalid_arguments");
+  WC_NEED(snprintf(directory,sizeof(directory),WC_ROOT "\\copy-rehearsal-%s",token)>0,"path_format");
+  WC_NEED(snprintf(manifest,sizeof(manifest),"%s\\manifest.json",directory)>0 &&
+      snprintf(baseline,sizeof(baseline),"%s\\baseline.db",directory)>0 &&
+      snprintf(workdir,sizeof(workdir),"%s\\work",directory)>0 &&
+      snprintf(work,sizeof(work),"%s\\work.db",workdir)>0,"path_format");
+  root=wc_open(WC_ROOT,1,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE);
+  dir=wc_open(directory,1,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE);
+  WC_NEED(root!=INVALID_HANDLE_VALUE && dir!=INVALID_HANDLE_VALUE,"private_root_identity");
+  WC_NEED(wc_case_entries(directory) && wc_no_sidecars(baseline),"input_layout_or_sidecar");
+  mh=wc_open(manifest,0,GENERIC_READ,FILE_SHARE_READ);
+  WC_NEED(mh!=INVALID_HANDLE_VALUE && wc_identity(mh,0,&mi) && wc_size(&mi)>0 &&
+      wc_size(&mi)<=WC_CAP,"manifest_identity_or_size");
+  WC_NEED(wc_hash_copy(mh,INVALID_HANDLE_VALUE,wc_size(&mi),started,manifest_hash) &&
+      !strcmp(manifest_hash,approved_manifest_sha),"manifest_sha_not_approved");
+  LARGE_INTEGER zero; zero.QuadPart=0; DWORD got=0;
+  WC_NEED(SetFilePointerEx(mh,zero,NULL,FILE_BEGIN) && ReadFile(mh,raw,(DWORD)wc_size(&mi),&got,NULL) &&
+      got==wc_size(&mi),"manifest_read"); raw[got]='\0';
+  WC_NEED(wc_manifest(raw,got,token,&m),"manifest_schema");
+  DWORD exe_chars=GetModuleFileNameW(NULL,exe_path,(DWORD)(sizeof(exe_path)/sizeof(exe_path[0])));
+  WC_NEED(exe_chars && exe_chars<sizeof(exe_path)/sizeof(exe_path[0]),"tool_path");
+  exe=CreateFileW(exe_path,GENERIC_READ,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+  WC_NEED(exe!=INVALID_HANDLE_VALUE && wc_identity(exe,0,&after) && wc_size(&after)>0 &&
+      wc_size(&after)<=UINT64_C(64)*1024u*1024u &&
+      wc_hash_copy(exe,INVALID_HANDLE_VALUE,wc_size(&after),started,exe_hash) &&
+      !strcmp(exe_hash,wc_item(m,"exe_sha256")->valuestring),"tool_sha_mismatch");
+  src=wc_open(baseline,0,GENERIC_READ,FILE_SHARE_READ);
+  bytes=(uint64_t)wc_item(m,"baseline_bytes")->valuedouble;
+  WC_NEED(src!=INVALID_HANDLE_VALUE && wc_identity(src,0,&bi) && wc_size(&bi)==bytes &&
+      wc_hash_copy(src,INVALID_HANDLE_VALUE,bytes,started,baseline_hash) &&
+      !strcmp(baseline_hash,wc_item(m,"baseline_sha256")->valuestring),"baseline_identity_size_or_sha");
+  WC_NEED(edr_storage_min_free_bytes(&floor)==0 &&
+      edr_storage_volume_available(baseline,&available)==0 &&
+      bytes<=UINT64_MAX-floor && available>=bytes+floor,"copy_free_space_floor");
+  /* CREATE_NEW and a fresh work directory: never overwrite a prior experiment. */
+  WC_NEED(CreateDirectoryA(workdir,NULL),"work_already_exists_or_create_failed");
+  wd=wc_open(workdir,1,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE);
+  WC_NEED(wd!=INVALID_HANDLE_VALUE,"work_directory_identity");
+  dst=CreateFileA(work,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+  WC_NEED(dst!=INVALID_HANDLE_VALUE && wc_hash_copy(src,dst,bytes,started,copy_hash) &&
+      !strcmp(copy_hash,baseline_hash) && FlushFileBuffers(dst),"work_copy_or_flush");
+  WC_NEED(CloseHandle(dst),"work_close"); dst=INVALID_HANDLE_VALUE;
+  wh=wc_open(work,0,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE);
+  WC_NEED(wh!=INVALID_HANDLE_VALUE && wc_identity(wh,0,&wi) &&
+      !wc_same_file(&bi,&wi) && wc_size(&wi)==bytes &&
+      wc_hash_copy(wh,INVALID_HANDLE_VALUE,bytes,started,copy_hash) &&
+      !strcmp(copy_hash,baseline_hash),"work_identity_copy_hash_or_alias");
+  WC_NEED(wc_identity(src,0,&after) && wc_unchanged(&bi,&after) && wc_no_sidecars(baseline),"baseline_changed_before_owner");
+  WC_NEED(wc_time(started),"pre_owner_deadline");
+  /* Existing real providers; no 2023 fixture time and no durable clock UPDATE.
+   * The real owner still performs its normal DDL/startup maintenance. */
+  s_test_real_monotonic=1;
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(-1);
+  owner_called=1;
+  owner_rc=edr_local_evidence_cache_open_with_policy(work,512u,72u,72u);
+  edr_local_evidence_cache_get_status(&status);
+  edr_local_evidence_cache_close();
+  WC_NEED(wc_time(started),"owner_or_status_exceeded_internal_deadline");
+  WC_NEED(wc_identity(src,0,&after) && wc_unchanged(&bi,&after) &&
+      wc_hash_copy(src,INVALID_HANDLE_VALUE,bytes,started,after_hash) &&
+      !strcmp(after_hash,baseline_hash) && wc_no_sidecars(baseline),"baseline_changed_after_owner");
+  baseline_verified=1;
+  WC_NEED(wc_identity(mh,0,&after) && wc_unchanged(&mi,&after),"manifest_changed");
+  WC_NEED(wc_identity(wh,0,&after) && wc_same_file(&wi,&after) &&
+      wc_hash_copy(wh,INVALID_HANDLE_VALUE,wc_size(&after),started,work_after_hash),"work_final_identity_or_hash");
+  WC_NEED(wc_work_bytes(workdir,work,&main_bytes,&physical),"work_physical_metadata");
+  rc=owner_rc==0 ? 0 : 1; cause=owner_rc==0 ? "owner_open_completed" : "owner_open_failed"; error=0;
+done:
+  if (owner_called) edr_local_evidence_cache_close();
+  if (exe!=INVALID_HANDLE_VALUE) CloseHandle(exe);
+  if (wh!=INVALID_HANDLE_VALUE) CloseHandle(wh);
+  if (dst!=INVALID_HANDLE_VALUE) CloseHandle(dst);
+  if (src!=INVALID_HANDLE_VALUE) CloseHandle(src);
+  if (mh!=INVALID_HANDLE_VALUE) CloseHandle(mh);
+  if (wd!=INVALID_HANDLE_VALUE) CloseHandle(wd);
+  if (dir!=INVALID_HANDLE_VALUE) CloseHandle(dir);
+  if (root!=INVALID_HANDLE_VALUE) CloseHandle(root);
+  printf("{\"schema\":\"edr.test.normal-open-work-copy-result.v1\",\"cause\":\"%s\",\"win32_error\":%lu,\"exit_code\":%d,\"owner_called\":%s,\"owner_open_rc\":%d,\"manifest_sha256\":\"%s\",\"tool_sha256\":\"%s\",\"baseline_before_sha256\":\"%s\",\"baseline_after_sha256\":\"%s\",\"baseline_identity_unchanged\":%s,\"work_after_sha256\":\"%s\",\"baseline_bytes\":%llu,\"work_main_bytes_final\":%llu,\"work_physical_bytes_final\":%llu,\"work_main_over_budget\":%s,\"storage_floor_bytes\":%llu,\"volume_available_before_copy\":%llu,\"clock_valid\":%u,\"clock_cause\":%u,\"retention_active_ms\":%llu,\"legacy_candidates\":%llu,\"retired_groups\":%llu,\"real_clock_providers\":%s,\"physical_peak_measured\":false,\"owner_semantic_integrity_proven\":false,\"migration_accepted\":false}\n",
+      cause,(unsigned long)error,rc,owner_called ? "true":"false",owner_rc,manifest_hash,exe_hash,
+      baseline_hash,after_hash,baseline_verified ? "true":"false",work_after_hash,(unsigned long long)bytes,(unsigned long long)main_bytes,
+      (unsigned long long)physical,main_bytes>WC_BYTES ? "true":"false",(unsigned long long)floor,
+      (unsigned long long)available,status.retention_clock_valid,status.retention_clock_cause_code,
+      (unsigned long long)status.retention_active_ms,(unsigned long long)status.retention_legacy_candidates,
+      (unsigned long long)status.retention_groups_retired,owner_called ? "true":"false");
+  fflush(stdout); cJSON_Delete(m); return rc;
+#undef WC_NEED
+}
+#endif
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "--normal-open-work-copy") == 0) {
+#if defined(_WIN32) && defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+    if (argc == 4) return run_normal_open_work_copy(argv[2], argv[3]);
+#endif
+    fprintf(stderr, "work-copy rehearsal requires native Windows SQLite test build, token and approved manifest SHA\n");
+    return 2;
+  }
 #if !defined(_WIN32)
   s_test_executable = argv[0];
 #endif
