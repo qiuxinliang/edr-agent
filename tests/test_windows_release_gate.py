@@ -214,7 +214,13 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertIn("-UpdaterPath '" + (ROOT / "scripts/edr_agent_inplace_update.ps1").as_posix() + "'", command[-1])
             properties = {item["name"]: item["value"] for item in tests[0]["properties"]}
             self.assertEqual(properties["TIMEOUT"], 30)
-            self.assertEqual(properties["ENVIRONMENT"], ["PSModulePath=" + (build / "foreign-powershell-modules").as_posix()])
+            environment = properties["ENVIRONMENT"]
+            self.assertEqual(len(environment), 1)
+            self.assertTrue(environment[0].startswith("PSModulePath="))
+            # CMake can canonicalize a Windows 8.3 temporary-directory alias.
+            selected_modules = Path(environment[0][len("PSModulePath="):])
+            self.assertTrue(selected_modules.is_absolute())
+            self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
 
     def test_updater_health_clock_is_required_and_failure_blocks_windows_gate(self):
         name = "windows_updater_health_clock"

@@ -15,6 +15,7 @@ import time
 SOURCE='694a4f47cfd55a7c98f8dab62617520c0c6251b1'
 FILE_CAP=1024*1024
 TOTAL_CAP=8*1024*1024
+WINDOWS_STAT=os.name=='nt'
 SHA=re.compile('[0-9a-f]{64}')
 LABELS={'health-failed-upgrade':('upgrade',True),'normal-recovery-upgrade':('upgrade',False),'normal-headless-repair':('repair',False)}
 METADATA=('recovery-subset-summary.json','seed-owner.json','storage-floor-proof.json','692-before-upgrade.json',
@@ -50,17 +51,28 @@ def no_reparse(path):
 def identity(s):return(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
 
 
+def cross_identity(s):
+    if not WINDOWS_STAT:return identity(s)
+    # Windows lstat ctime can mean birth while fstat ctime means ChangeTime.
+    # Bind path to FD using birth, but retain each API's own ctime stability.
+    birth=getattr(s,'st_birthtime_ns',None)
+    need(type(birth)is int,'windows_birthtime_required')
+    return(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,birth)
+
+
 def take(path,cap=FILE_CAP):
     no_reparse(path);before=path.lstat()
     need(stat.S_ISREG(before.st_mode) and 0<=before.st_size<=cap,'file_bound_or_type')
     flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)
     fd=os.open(path,flags)
     with os.fdopen(fd,'rb')as f:
-        need(identity(os.fstat(f.fileno()))==identity(before),'opened_file_identity_changed')
+        opened=os.fstat(f.fileno())
+        need(cross_identity(opened)==cross_identity(before),'opened_file_identity_changed')
         raw=f.read(before.st_size+1)
         after_handle=os.fstat(f.fileno())
     no_reparse(path);after_path=path.lstat()
-    need(len(raw)==before.st_size and identity(before)==identity(after_handle)==identity(after_path),'file_changed_during_bounded_read')
+    need(len(raw)==before.st_size and identity(opened)==identity(after_handle) and identity(before)==identity(after_path) and
+         cross_identity(before)==cross_identity(after_handle)==cross_identity(after_path),'file_changed_during_bounded_read')
     return raw
 
 

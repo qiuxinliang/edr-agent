@@ -1,5 +1,6 @@
 """Pure synthetic files only; no installer, native process, network or real DB."""
 import hashlib
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
@@ -126,6 +127,56 @@ class Contracts(unittest.TestCase):
                 os.utime(p,ns=(before.st_atime_ns,before.st_mtime_ns+1000000000));return raw
         with patch.object(M.os,'fdopen',side_effect=lambda *a,**k:Reader(real(*a,**k))):
             with self.assertRaisesRegex(ValueError,'file_changed'):M.take(p)
+    @contextmanager
+    def windows_stat_semantics(self,path,*,path_change=False,handle_change=False,
+                               birth_change=False,missing_birth=False,wrong_handle_inode=False,windows=True):
+        # A real file/FD/read with only the documented stat time semantics mocked.
+        # Win lstat ctime may be birth; fstat ctime may be ChangeTime.
+        real_lstat=Path.lstat;real_fstat=M.os.fstat;handle_calls=0
+        def project(s,handle,after):
+            values=dict(st_mode=s.st_mode,st_dev=s.st_dev,
+              st_ino=s.st_ino+(1 if handle and wrong_handle_inode else 0),
+              st_size=s.st_size,st_mtime_ns=s.st_mtime_ns,
+              st_ctime_ns=(200 if handle else 100)+(1 if after and (handle_change if handle else path_change) else 0),
+              st_file_attributes=getattr(s,'st_file_attributes',0))
+            if not missing_birth:values['st_birthtime_ns']=100+(1 if after and birth_change else 0)
+            return types.SimpleNamespace(**values)
+        def lstat(p):
+            s=real_lstat(p)
+            return project(s,False,handle_calls>=2)if p==path else s
+        def fstat(fd):
+            nonlocal handle_calls
+            handle_calls+=1
+            return project(real_fstat(fd),True,handle_calls>=2)
+        with patch.object(M,'WINDOWS_STAT',windows,create=True),patch.object(Path,'lstat',lstat),patch.object(M.os,'fstat',fstat):
+            yield
+    def test_windows_cross_api_only_ctime_difference_is_allowed(self):
+        p=self.root/'windows-times';p.write_bytes(b'public synthetic')
+        with self.windows_stat_semantics(p):self.assertEqual(M.take(p),b'public synthetic')
+    def test_windows_path_ctime_change_is_refused(self):
+        p=self.root/'path-change';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,path_change=True):
+            with self.assertRaisesRegex(ValueError,'file_changed_during_bounded_read'):M.take(p)
+    def test_windows_handle_ctime_change_is_refused(self):
+        p=self.root/'handle-change';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,handle_change=True):
+            with self.assertRaisesRegex(ValueError,'file_changed_during_bounded_read'):M.take(p)
+    def test_windows_birthtime_required(self):
+        p=self.root/'no-birth';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,missing_birth=True):
+            with self.assertRaisesRegex(ValueError,'windows_birthtime_required'):M.take(p)
+    def test_windows_birthtime_change_is_refused(self):
+        p=self.root/'birth-change';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,birth_change=True):
+            with self.assertRaisesRegex(ValueError,'file_changed_during_bounded_read'):M.take(p)
+    def test_windows_different_handle_inode_is_refused(self):
+        p=self.root/'different-handle';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,wrong_handle_inode=True):
+            with self.assertRaisesRegex(ValueError,'opened_file_identity_changed'):M.take(p)
+    def test_nonwindows_cross_api_ctime_difference_still_refused(self):
+        p=self.root/'nonwindows-times';p.write_bytes(b'abc')
+        with self.windows_stat_semantics(p,windows=False):
+            with self.assertRaisesRegex(ValueError,'opened_file_identity_changed'):M.take(p)
     def test_existing_destination_never_overwritten(self):
         self.output.mkdir();(self.output/'sentinel').write_bytes(b'preserve')
         with self.assertRaisesRegex(ValueError,'exclusive_output'):self.collect()
