@@ -1,5 +1,6 @@
 # Native contracts and storage comparisons before a candidate release. Contract
-# dependencies are built; no packaging, installation, release or endpoint access.
+# dependencies are built; only a private diagnostic test tool is staged.
+# No product packaging, installation, release or endpoint access.
 name: Evidence retention native comparison
 
 on:
@@ -12,6 +13,8 @@ on:
       - tests/run_queue_retention_comparison.py
       - tests/retention_benchmark_support.h
       - tests/retention_comparison_support.py
+      - scripts/stage_retention_native_tools.py
+      - tests/test_stage_retention_native_tools.py
       - src/storage/local_evidence_cache.c
       - src/storage/queue_sqlite.c
       - include/edr/storage_queue.h
@@ -152,6 +155,29 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
+      - name: Stage the tested private native diagnostic tool
+        id: native-tools
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          python -B tests/test_stage_retention_native_tools.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostic packaging regressions failed' }
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction Stop).Source
+          if (-not $env:VCToolsRedistDir) { throw 'Initialized MSVC redist owner is missing' }
+          python -B scripts/stage_retention_native_tools.py --repo "$env:GITHUB_WORKSPACE" --build-dir "$env:GITHUB_WORKSPACE/contract-build" --dependency-prefix "$prefix" --msvc-redist-root "$env:VCToolsRedistDir" --compiler "$compiler" --dumpbin "$dumpbin" --output "$env:RUNNER_TEMP/evidence-native-tools" --arch '${{ matrix.arch }}' --source-sha '${{ github.sha }}' --run-id '${{ github.run_id }}' --run-attempt '${{ github.run_attempt }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Native diagnostic tool dependency closure failed' }
+      # Preserve this independent stage before comparisons run. A later failure
+      # remains a failure; this artifact does not certify the complete workflow.
+      - name: Preserve the private native diagnostic tool separately
+        if: ${{ success() && steps.native-tools.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-native-tools-${{ matrix.arch }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ runner.temp }}/evidence-native-tools/
       - name: Equal-input native evidence and pressure comparisons
         shell: pwsh
         run: |

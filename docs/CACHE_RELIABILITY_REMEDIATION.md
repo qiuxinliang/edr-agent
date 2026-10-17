@@ -1,5 +1,175 @@
 # Cache reliability remediation
 
+## 2026-10-17 active-residence repair and read-only legacy inventory
+
+This section supersedes the retention-policy limits described in the earlier
+same-day diagnostic follow-up below. The implementation baseline is
+`81ea271a0cb5bde6781ad07495251a777fbaa8d7`; the live UTM continues to run
+Headless 3.2.692, source `a978ec83deacf7cd78c273d82630b457c5f39251`.
+No new Agent has been installed on the real evidence store in this change.
+
+### Verified old-data and capacity classification
+
+The authorized read-only inventory used SQLite read transactions and backup
+into two new SYSTEM/Administrators-only files inside the UTM. Original database
+rows were never updated; there was no checkpoint, VACUUM, export of raw events,
+or cache cleanup. The two database snapshots are individually consistent, not
+one atomic cross-database snapshot. Diagnostic copies are themselves real-data
+copies and remain protected pending separate disposal authorization.
+
+The evidence copy is 536,678,400 bytes, SHA-256
+`3dc356e165203067bb43f01b5dd7161a1cc0faef0cab34b8ced63eeda9361538`.
+The queue copy is 137,666,560 bytes, SHA-256
+`9efd42bb0621752c33d117cf1435a2a8d4c8d6789a378aa8f8e657a43ee91194`.
+A read-only B-tree/overflow-page walk attributes every page: evidence tables
+340,828,160 bytes, indexes 195,194,880, pointer maps 655,360, and zero free
+pages. The parser was independently checked on synthetic 512/4096-byte page
+files with auto-vacuum both disabled and incremental. Page ownership measures
+file pages, not a promise that deleting one record returns those bytes to disk.
+
+| Evidence owner | Observed size or relationship | Classification |
+| --- | --- | --- |
+| artifacts table | 211,877,888 file-page bytes | Bundles and shared command content; owners must be proved |
+| compact_context_refs table | 93,716,480 file-page bytes, 1,206,877 refs | All refs link a fact in this snapshot; indexes separately cost space |
+| policy-0 main candidates | 7,950, each with one bundle | Legacy protection remains; 184,189,439 bundle-manifest bytes are associated |
+| policy-1 main candidates | 1, with one bundle | Existing typed policy; not retroactively given a new floor |
+| bundles without a current main candidate | 763, 17,116,461 manifest bytes | Still have dictionary/ref owners; not deletion candidates |
+| dictionaries without a current main candidate | 1,000 (763 with bundle, 237 without) | Unknown external/recovery ownership, protected |
+| shared fact templates | 16,058 shared facts, 10,286,009 unique template bytes | Owner degree 2..128; preserve every surviving dependency |
+| single-owner fact templates | 4,281 facts, 3,897,438 template bytes | One dictionary owner is not proof that its external duties ended |
+| command_results | 1,900 rows, 746,381 column-value bytes | Query copies; not the main evidence-space consumer here |
+
+Column-value lengths exclude SQLite record headers, page slack and indexes.
+The difference between dictionary and main counts (994) is not an orphan
+count: six policy-0 mains lack a dictionary, while 1,000 dictionaries lack a
+main. Fanout-multiplied template bytes are neither actual disk occupancy nor
+reclaimable space. No index has been declared unnecessary from size alone.
+
+The queue snapshot contains 69,892 old `local_evidence` rows with class/policy
+0/0, 7,752 typed local rows with class/policy 1/2, 93 dead letters and six
+policy-held rows. All nine stored capacity-ledger categories exactly match a
+read-only recomputation: 141,684,182 logical bytes. The old local class-0 rows
+alone contain 81,035,555 payload bytes; their status does not prove a safe
+retirement owner. No incomplete terminal journal or projection relation was
+present in this particular queue snapshot. This does not prove absence at a
+different time or eliminate command-state, delivery and investigation owners.
+
+The directory inventory also counts primary evidence, queue, logs, state,
+other runtime/dependency directories and the 674,410,496-byte diagnostic copies
+separately. File-length totals are not allocated disk blocks or a directory
+hard limit. The existing 512 MiB queue budget and 512 MiB evidence configuration
+retain their meanings; neither becomes a total Agent-directory limit.
+The existing disk free-space guard remains independent. No fixed capacity
+partition percentage or larger cache default was introduced.
+
+### New-record lifecycle and capacity behavior
+
+`sqlite_record_candidate` grants a minimum residence only when its existing
+transaction first freezes the source-bound `:alert_parent_context` ref. The
+candidate gains `alert_context_protect_until_active_ms`; one permanent integer
+metrics row, `local_retention_v1_active_ms`, owns the committed active clock.
+This is a finite normal-retention floor, not a renewable investigation pin,
+not a remote ACK, and not an automatic permanent high-severity exemption.
+The configured `selected_retention_hours` supplies its duration. Existing
+recent/selected defaults and business windows are unchanged.
+
+Active time uses actual monotonic time while the cache is open, accumulated
+only through successfully committed candidate/retirement transactions. Offline
+time, a crash's uncommitted interval, and time inside a commit do not consume
+the floor. Wall-clock jumps cannot expire it. Replays and queries do not renew
+it. Once granted, exact source/process identity and command-object references
+remain immutable. Missing, corrupt, regressed or overflowed clock state holds
+protected evidence and refuses new promises with an observable closed cause.
+A post-commit clock failure preserves the successful durable write; it does
+not falsely claim that the committed owner was rolled back.
+
+Normal TTL and pressure retirement both check the floor in the owner
+transaction, followed by the existing whole-group reference/dependency checks.
+Independent SQL transition/delete guards enforce the floor even when an older
+runtime re-creates its own v1 policy triggers. Shared facts and complete command
+objects remain owned while any retained reference requires them. Post-write
+live-page admission includes candidate, bundle, refs and indexes before commit.
+When the ordinary evidence budget cannot honor another context, admission is
+refused explicitly. The existing separate critical delivery/journal path and
+its bounded reserves remain authoritative; this cache fixture alone does not
+prove a successful alert delivery.
+
+After the floor and other dependencies end, the existing bounded policy can
+retire whole groups, preserve bounded disposition counts, and reuse capacity.
+It need not upload local facts or forge delivery ACKs. The active-clock design
+can extend residence during downtime/heavy fsync; it cannot promise all alerts
+will acquire detailed context at every load, especially while legacy occupancy
+cannot legally be reclaimed. Partial command capture remains explicitly partial.
+
+Only six numeric health fields are added to the existing minimal health
+projection: active_ms, clock_valid, clock_failures, clock_cause_code,
+parent_protections and floor_held. They carry no owner IDs, raw facts or commands.
+Projection and the final request gate are tested together with private-field,
+negative-number and string rejection cases. The accounting JSON's worst-case
+formatted size is 1,889 bytes plus NUL, within its existing 2,048-byte producer
+buffer. No routine evidence-upload permission was added.
+
+### Migration, downgrade and operational gates
+
+New metadata consists of one default-zero candidate column, one constant
+clock row and seven independent SQL guards, installed through the existing
+restart-safe schema/metadata owner. Old rows retain zero; no historical frozen
+bytes, hash, batch ID, lineage, ACK, parent binding or classification are
+rewritten. Old zero rows have no new minimum-residence promise. Ambiguous
+owners remain protected and individually counted rather than bulk-classified.
+
+Even this additive change is a real-store migration. Installing it on the
+UTM's real cache requires a separate concrete authorization after synthetic
+and native verification. No migration has been run on either real snapshot.
+Old-data reclassification/disposal requires a second bounded plan proving
+record type, all surviving owners and concurrency/recovery protection. The
+current read-only findings authorize no deletion, including of diagnostic copies.
+
+Downgrade is conservative but not transparent: old code cannot advance the
+new clock or remove the independent guards, and may explicitly fail maintenance
+rather than retire new protected owners. Do not drop guards/reset the clock
+or restore an older snapshot over newly accepted owners. The pre-floor 692
+parser understands cached IR10; 691 does not. A real startup/rollback trial
+must use the verified Scheduled Task owner, not a guessed SCM service name.
+Read-only inspection found `FDSecurityAgent` running as SYSTEM via its existing
+PowerShell launcher with unlimited task runtime; the three guessed SCM service
+names are absent. No real task was restarted in this inventory.
+
+### Verification boundary for this patch
+
+The host equal-input comparison ran the actual storage/codec owners against
+unchanged baseline source with identical input digest and 8 MiB budget over
+eight **simulated** event hours. One run each retained 6 complete embedded
+parent chains with a 1 h selected target and 24 with 4 h; baseline retained zero
+embedded chains and six reconstructable cache chains. All three had zero
+orphan refs and successful integrity checks. Current write amplification and
+CPU/I/O are recorded, not hidden by smaller final files. This is not Windows
+wall-clock endurance or a native-device I/O measurement.
+
+The new `--alert-parent-soak <seconds>` fixture uses actual QPC/CLOCK_MONOTONIC,
+1 h recent/selected targets and a new 64 MiB synthetic database. It offers
+unique/replay/high-severity cases and long/missing/unknown parent commands,
+then bounded pressure. It queries fixed early and later owners, samples
+DB/WAL/SHM, CPU/process/VFS I/O, and reopens the same database hourly. A full
+7,380-second run must observe capacity refusal, later retirement and recovered
+admission plus two reopens; short smoke runs are labelled separately.
+The 64 MiB fixture and 256 MiB safety-stop peak are test parameters, not new
+production defaults or physical guarantees.
+
+The native comparison workflow now preserves only the tested cache fixture
+and its verified transitive DLL closure as a private seven-day diagnostic
+artifact before comparisons run. It is neither a product release nor a Setup
+UI package. Native architecture/hash checks and actual contract results are
+required before isolated UTM execution. Packaging-only offline tests or a
+later comparison failure cannot establish the whole workflow passed.
+
+At this source commit, host checks and short real-clock smoke runs are
+available; native Windows CI, the two-window UTM load and isolated recovery
+results are still pending and must be appended as separate acceptance evidence.
+The live 72 h production setting has not completed a 72 h new-policy endurance
+run. Synthetic power-loss/fault fixtures cannot certify actual UTM power-loss
+behavior, real-cache upgrade/downgrade or live collection under the new binary.
+
 ## 2026-10-17 parent evidence availability follow-up
 
 This follow-up changes tests and this document. It does not change production

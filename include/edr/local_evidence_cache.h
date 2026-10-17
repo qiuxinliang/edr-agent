@@ -16,6 +16,8 @@
 /* Fixed-width counters keep health payloads deterministic while covering all
  * wire event values currently assigned by types.h and future values. */
 #define EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS 256u
+/* Feature discovery for the existing baseline/current comparison harness. */
+#define EDR_PARENT_CONTEXT_ACTIVE_RETENTION_V1 1
 
 /* Disjoint decisions for ordinary inputs that did not request durable storage. */
 typedef enum {
@@ -157,6 +159,17 @@ typedef struct {
   uint64_t retention_failures;
   /* Startup inventory of legacy candidates that this policy cannot retire. */
   uint64_t retention_legacy_candidates;
+  /* Minimum parent-snapshot residence uses committed, cache-open monotonic
+   * elapsed time. Offline time is not credited; this is not an investigation
+   * command lease or a guarantee that every new snapshot can be admitted. */
+  uint64_t retention_active_ms;
+  uint64_t retention_parent_protections;
+  uint64_t retention_floor_held;
+  uint64_t retention_clock_failures;
+  uint32_t retention_clock_valid;
+  /* 0 none, 1 missing, 2 invalid, 3 monotonic unavailable/regressed,
+   * 4 overflow, 5 storage/commit state unavailable. */
+  uint32_t retention_clock_cause_code;
   uint64_t identity_target_4688;
   uint64_t identity_creator_fallback;
   uint64_t identity_cache;
@@ -307,8 +320,10 @@ void edr_local_evidence_cache_observe_process(const EdrBehaviorRecord *r);
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r);
 
 /* Matched normal alerts retain their original local context before outbound
- * projection. This is best-effort investigation storage, never delivery or
- * action authority: a refusal must not prevent the alert queue handoff.
+ * projection. Admission is best effort, never delivery or action authority:
+ * a refusal must not prevent the alert queue handoff. A newly frozen context
+ * ref receives selected_retention_hours of minimum committed active-clock
+ * residence. Replays/queries do not renew it; offline time is not credited.
  * Returns 0 on commit, 1 when the snapshot committed but a command fact was
  * refused, and negative when the snapshot could not be retained. */
 int edr_local_evidence_cache_record_alert_context(const EdrBehaviorRecord *record,
@@ -387,6 +402,10 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *statu
 /* Test-only wall clock for historical replay and retention checks. Survives
  * cache close/open; pass zero to restore the real clock after the scenario. */
 void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns);
+/* -1 restores the real clock; 0 simulates an unavailable monotonic clock. */
+void edr_local_evidence_cache_test_set_retention_monotonic_ms(int64_t now_ms);
+/* One-shot sample override after a successful owner commit; -1 disables it. */
+void edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(int64_t now_ms);
 /* Aborts the next candidate-cache transaction commits from SQLite's commit
  * hook. This is test-only evidence that counters and dedupe state move only
  * after the durable boundary succeeds. */

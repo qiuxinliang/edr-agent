@@ -648,10 +648,24 @@ static int identity_quality_rank(const char *q) {
 
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static int64_t s_test_now_unix_ns;
+static int64_t s_test_retention_monotonic_ms = -1;
+static int64_t s_test_retention_after_commit_ms = -1;
 
 void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns) {
   evidence_cache_lock();
   s_test_now_unix_ns = now_ns;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_set_retention_monotonic_ms(int64_t now_ms) {
+  evidence_cache_lock();
+  s_test_retention_monotonic_ms = now_ms;
+  evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(int64_t now_ms) {
+  evidence_cache_lock();
+  s_test_retention_after_commit_ms = now_ms;
   evidence_cache_unlock();
 }
 #endif
@@ -2531,6 +2545,189 @@ static int exec_sql(const char *sql) {
   return 0;
 }
 
+#define RETENTION_ACTIVE_CLOCK_KEY "local_retention_v1_active_ms"
+#define RETENTION_ACTIVE_CLOCK_ROW \
+  "minute_unix=0 AND endpoint_id='' AND metric_name='" RETENTION_ACTIVE_CLOCK_KEY "'"
+#define RETENTION_FLOOR_ELAPSED \
+  "EXISTS(SELECT 1 FROM metrics WHERE " RETENTION_ACTIVE_CLOCK_ROW \
+  " AND typeof(value)='integer' AND value>=OLD.alert_context_protect_until_active_ms)"
+
+/* This clock has one durable INTEGER row, not one timer per event. Only
+ * successfully committed owner transactions advance its base. Reopening does
+ * not credit offline time, and a crash can only extend the minimum residence. */
+static struct {
+  uint64_t base_ms, anchor_ms, pending_ms, pending_mono_ms;
+  int valid, pending;
+} s_retention_clock;
+
+static uint64_t retention_monotonic_ms(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_retention_monotonic_ms >= 0)
+    return (uint64_t)s_test_retention_monotonic_ms;
+#endif
+  return evidence_cache_clock_ns() / 1000000u;
+}
+
+static int retention_clock_error(unsigned cause, const char *message) {
+  s_retention_clock.valid = s_retention_clock.pending = 0;
+  s_status.retention_clock_valid = 0u;
+  s_status.retention_clock_cause_code = cause;
+  ++s_status.retention_clock_failures;
+  set_error(message);
+  return -1;
+}
+
+static void sqlite_retention_clock_committed(void) {
+  if (!s_retention_clock.pending) return;
+  uint64_t now = retention_monotonic_ms();
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_retention_after_commit_ms >= 0) {
+    now = (uint64_t)s_test_retention_after_commit_ms;
+    s_test_retention_after_commit_ms = -1;
+  }
+#endif
+  s_retention_clock.base_ms = s_retention_clock.pending_ms;
+  s_status.retention_active_ms = s_retention_clock.base_ms;
+  s_retention_clock.pending = 0;
+  /* Exclude the commit interval itself, so a slow fsync cannot shorten a
+   * protection interval measured from the successful admission boundary. */
+  if (!now || now < s_retention_clock.pending_mono_ms) {
+    (void)retention_clock_error(3u, "retention monotonic clock unavailable after committed owner transaction");
+    return;
+  }
+  s_retention_clock.anchor_ms = now;
+}
+
+static int sqlite_retention_clock_stage(void) {
+  sqlite3_stmt *st = NULL;
+  uint64_t now = retention_monotonic_ms();
+  if (!s_retention_clock.valid) {
+    set_error("retention clock remains unavailable; original clock cause preserved");
+    return -1;
+  }
+  if (sqlite3_get_autocommit(s_db))
+    return retention_clock_error(5u, "retention clock requires a valid owner transaction");
+  if (!now || now < s_retention_clock.anchor_ms)
+    return retention_clock_error(3u, "retention monotonic clock unavailable or regressed; parent evidence preserved");
+  uint64_t elapsed = now - s_retention_clock.anchor_ms;
+  if (elapsed > (uint64_t)INT64_MAX || s_retention_clock.base_ms > (uint64_t)INT64_MAX - elapsed)
+    return retention_clock_error(4u, "retention active clock overflow; parent evidence preserved");
+  uint64_t tick = s_retention_clock.base_ms + elapsed;
+  int cause = 5;
+  if (sqlite3_prepare_v2(s_db, "SELECT value FROM metrics WHERE " RETENTION_ACTIVE_CLOCK_ROW ";",
+      -1, &st, NULL) != SQLITE_OK) goto failed;
+  int step = sqlite3_step(st);
+  if (step == SQLITE_DONE) { cause = 1; goto failed; }
+  if (step != SQLITE_ROW) goto failed;
+  if (sqlite3_column_type(st, 0) != SQLITE_INTEGER || sqlite3_column_int64(st, 0) < 0 ||
+      (uint64_t)sqlite3_column_int64(st, 0) != s_retention_clock.base_ms) { cause = 2; goto failed; }
+  sqlite3_finalize(st); st = NULL;
+  if (sqlite3_prepare_v2(s_db, "UPDATE metrics SET value=?1 WHERE " RETENTION_ACTIVE_CLOCK_ROW ";",
+      -1, &st, NULL) != SQLITE_OK || sqlite3_bind_int64(st, 1, (sqlite3_int64)tick) != SQLITE_OK ||
+      sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) goto failed;
+  sqlite3_finalize(st);
+  s_retention_clock.pending_ms = tick;
+  s_retention_clock.pending_mono_ms = now;
+  s_retention_clock.pending = 1;
+  return 0;
+failed:
+  sqlite3_finalize(st);
+  return retention_clock_error((unsigned)cause, "retention active clock missing, invalid or unavailable; parent evidence preserved");
+}
+
+/* Stable names are intentional: supported older owners replace their own v1
+ * policy triggers at open, but cannot discard these minimum-residence guards.
+ * Old maintenance may fail explicitly; it must not delete newer protected
+ * evidence or reset the seventh permanent metrics row. */
+static int sqlite_parent_floor_guards(void) {
+  static const char *const guards[] = {
+    "CREATE TRIGGER IF NOT EXISTS retention_active_clock_v1_insert BEFORE INSERT ON metrics "
+      "WHEN NEW.minute_unix=0 AND NEW.endpoint_id='' AND NEW.metric_name='" RETENTION_ACTIVE_CLOCK_KEY "' "
+      "AND (typeof(NEW.value)!='integer' OR NEW.value<0) "
+      "BEGIN SELECT RAISE(ABORT,'invalid retention active clock'); END;",
+    "CREATE TRIGGER IF NOT EXISTS retention_active_clock_v1_update BEFORE UPDATE ON metrics "
+      "WHEN OLD.minute_unix=0 AND OLD.endpoint_id='' AND OLD.metric_name='" RETENTION_ACTIVE_CLOCK_KEY "' "
+      "AND (NEW.minute_unix IS NOT OLD.minute_unix OR NEW.endpoint_id IS NOT OLD.endpoint_id "
+      "OR NEW.metric_name IS NOT OLD.metric_name OR typeof(OLD.value)!='integer' OR OLD.value<0 "
+      "OR typeof(NEW.value)!='integer' OR NEW.value<OLD.value) "
+      "BEGIN SELECT RAISE(ABORT,'retention active clock cannot move backwards'); END;",
+    "CREATE TRIGGER IF NOT EXISTS retention_active_clock_v1_delete BEFORE DELETE ON metrics "
+      "WHEN OLD.minute_unix=0 AND OLD.endpoint_id='' AND OLD.metric_name='" RETENTION_ACTIVE_CLOCK_KEY "' "
+      "BEGIN SELECT RAISE(ABORT,'retention active clock owner required'); END;",
+    "CREATE TRIGGER IF NOT EXISTS alert_context_floor_v1_insert BEFORE INSERT ON p0_candidates "
+      "WHEN typeof(NEW.alert_context_protect_until_active_ms)!='integer' OR NEW.alert_context_protect_until_active_ms!=0 "
+      "BEGIN SELECT RAISE(ABORT,'parent floor requires a newly frozen context reference'); END;",
+    "CREATE TRIGGER IF NOT EXISTS alert_context_floor_v1_update BEFORE UPDATE ON p0_candidates "
+      "WHEN typeof(OLD.alert_context_protect_until_active_ms)!='integer' OR OLD.alert_context_protect_until_active_ms<0 "
+      "OR typeof(NEW.alert_context_protect_until_active_ms)!='integer' OR NEW.alert_context_protect_until_active_ms<0 "
+      "OR (OLD.alert_context_protect_until_active_ms!=0 AND ("
+      "NEW.alert_context_protect_until_active_ms IS NOT OLD.alert_context_protect_until_active_ms "
+      "OR NEW.candidate_id IS NOT OLD.candidate_id OR NEW.endpoint_id IS NOT OLD.endpoint_id "
+      "OR NEW.tenant_id IS NOT OLD.tenant_id OR NEW.pid IS NOT OLD.pid OR NEW.ppid IS NOT OLD.ppid "
+      "OR NEW.event_time_ns IS NOT OLD.event_time_ns OR NEW.process_start_key IS NOT OLD.process_start_key "
+      "OR NEW.process_creation_filetime_100ns IS NOT OLD.process_creation_filetime_100ns "
+      "OR NEW.subject_command_fact_id IS NOT OLD.subject_command_fact_id "
+      "OR NEW.parent_command_fact_id IS NOT OLD.parent_command_fact_id)) "
+      "OR (OLD.alert_context_protect_until_active_ms=0 AND NEW.alert_context_protect_until_active_ms>0 "
+      "AND NOT EXISTS(SELECT 1 FROM metrics WHERE " RETENTION_ACTIVE_CLOCK_ROW " AND typeof(value)='integer' "
+      "AND value>=0 AND value<NEW.alert_context_protect_until_active_ms)) "
+      "BEGIN SELECT RAISE(ABORT,'frozen parent floor or query identity changed'); END;",
+    "CREATE TRIGGER IF NOT EXISTS alert_context_floor_v1_eligible BEFORE UPDATE OF local_retention_state ON p0_candidates "
+      "WHEN NEW.local_retention_state='retirement_eligible' AND ("
+      "typeof(OLD.alert_context_protect_until_active_ms)!='integer' OR OLD.alert_context_protect_until_active_ms<0 "
+      "OR (OLD.alert_context_protect_until_active_ms>0 AND NOT " RETENTION_FLOOR_ELAPSED ")) "
+      "BEGIN SELECT RAISE(ABORT,'parent context minimum residence protects this group'); END;",
+    "CREATE TRIGGER IF NOT EXISTS alert_context_floor_v1_delete BEFORE DELETE ON p0_candidates "
+      "WHEN typeof(OLD.alert_context_protect_until_active_ms)!='integer' OR OLD.alert_context_protect_until_active_ms<0 "
+      "OR (OLD.alert_context_protect_until_active_ms>0 AND NOT " RETENTION_FLOOR_ELAPSED ") "
+      "BEGIN SELECT RAISE(ABORT,'parent context minimum residence protects this group'); END;"
+  };
+  for (unsigned i = 0; i < sizeof(guards) / sizeof(guards[0]); ++i)
+    if (exec_sql(guards[i]) != 0) return -1;
+  return 0;
+}
+
+static int sqlite_retention_clock_open(void) {
+  sqlite3_stmt *st = NULL;
+  uint64_t now = retention_monotonic_ms();
+  int cause = 5;
+  if (!now) return retention_clock_error(3u, "retention monotonic clock unavailable at cache open");
+  if (sqlite3_prepare_v2(s_db, "SELECT value FROM metrics WHERE " RETENTION_ACTIVE_CLOCK_ROW ";",
+      -1, &st, NULL) != SQLITE_OK) goto failed;
+  int step = sqlite3_step(st);
+  uint64_t base = 0u;
+  if (step == SQLITE_ROW) {
+    if (sqlite3_column_type(st, 0) != SQLITE_INTEGER || sqlite3_column_int64(st, 0) < 0) { cause = 2; goto failed; }
+    base = (uint64_t)sqlite3_column_int64(st, 0);
+  } else if (step == SQLITE_DONE) {
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE "
+        "typeof(alert_context_protect_until_active_ms)!='integer' OR alert_context_protect_until_active_ms!=0 LIMIT 1;",
+        -1, &st, NULL) != SQLITE_OK) goto failed;
+    step = sqlite3_step(st);
+    if (step == SQLITE_ROW) { cause = 1; goto failed; }
+    if (step != SQLITE_DONE) goto failed;
+    sqlite3_finalize(st); st = NULL;
+    if (exec_sql("INSERT INTO metrics(minute_unix,endpoint_id,metric_name,value) VALUES(0,'','" RETENTION_ACTIVE_CLOCK_KEY "',0);") != 0)
+      goto failed;
+  } else goto failed;
+  sqlite3_finalize(st); st = NULL;
+  if (sqlite_parent_floor_guards() != 0) goto failed;
+  s_retention_clock.base_ms = base;
+  s_retention_clock.anchor_ms = now;
+  s_retention_clock.pending_ms = base;
+  s_retention_clock.pending_mono_ms = now;
+  s_retention_clock.pending = s_retention_clock.valid = 1;
+  s_status.retention_clock_valid = 1u;
+  s_status.retention_clock_cause_code = 0u;
+  return 0;
+failed:
+  sqlite3_finalize(st);
+  return retention_clock_error((unsigned)cause, "retention active clock missing or invalid at cache open; existing evidence preserved");
+}
+
+static int sqlite_live_size_over_limit(uint64_t limit);
+
 /* Old on-disk caches predate durable process-generation proof and explicit
  * source omission provenance. Use PRAGMA discovery before each deterministic
  * ALTER so reopening an existing cache is restart-safe and never drops
@@ -2591,6 +2788,8 @@ static int sqlite_ensure_p0_candidate_columns(void) {
        "ALTER TABLE p0_candidates ADD COLUMN subject_command_fact_id TEXT NOT NULL DEFAULT '';"},
       {"parent_command_fact_id",
        "ALTER TABLE p0_candidates ADD COLUMN parent_command_fact_id TEXT NOT NULL DEFAULT '';"},
+      {"alert_context_protect_until_active_ms",
+       "ALTER TABLE p0_candidates ADD COLUMN alert_context_protect_until_active_ms INTEGER NOT NULL DEFAULT 0;"},
   };
   for (size_t i = 0u; i < sizeof(columns) / sizeof(columns[0]); ++i) {
     int has_column = sqlite_p0_candidates_has_column(columns[i].name);
@@ -2662,12 +2861,15 @@ static int sqlite_retention_metadata_open(void) {
   uint64_t legacy = (uint64_t)sqlite3_column_int64(st, 0);
   sqlite3_finalize(st); st = NULL;
   if (edr_context_store_install_retention_guards(&s_context_store)!=0) { set_error(s_context_store.error); goto failed; }
+  if (sqlite_retention_clock_open() != 0) goto failed;
   if (exec_sql("COMMIT;") != 0) goto failed;
+  sqlite_retention_clock_committed();
   s_status.retention_legacy_candidates = legacy;
   return 0;
 failed:
   sqlite3_finalize(st);
   (void)exec_sql("ROLLBACK;");
+  s_retention_clock.pending = 0;
   set_error("candidate retention metadata unavailable or unsupported; evidence preserved");
   return -1;
 }
@@ -4593,6 +4795,7 @@ static void sqlite_rollback_silent(void) {
     (void)sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, &err);
   }
   sqlite3_free(err);
+  s_retention_clock.pending = 0;
 }
 
 static int sqlite_commit_candidate_transaction(void) {
@@ -4608,6 +4811,7 @@ static int sqlite_commit_candidate_transaction(void) {
     sqlite_rollback_silent();
     return -1;
   }
+  sqlite_retention_clock_committed();
   return 0;
 }
 
@@ -4988,6 +5192,10 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   if (exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
+  if (sqlite_retention_clock_stage() != 0) {
+    sqlite_rollback_silent();
+    return -1;
+  }
   if (upsert_process_sqlite(r) != 0) {
     sqlite_rollback_silent();
     return -1;
@@ -5141,10 +5349,37 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   cJSON_free(manifest);
   unsigned parent_facts = 0u, parent_refs = 0u;
   if (artifact_rc != 0 || (alert_parent && sqlite_record_alert_parent_context(r,
-          candidate_id, alert_parent, parent_command, &parent_facts, &parent_refs) != 0) ||
-      sqlite_commit_candidate_transaction() != 0) {
+          candidate_id, alert_parent, parent_command, &parent_facts, &parent_refs) != 0)) {
     sqlite_rollback_silent();
     return -1;
+  }
+  /* Grant a minimum residence only when this transaction first freezes the
+   * exact source's parent ref. Replays, ordinary upserts and queries never
+   * renew a protection, and historical zero rows are not backfilled. */
+  if (parent_refs) {
+    uint64_t duration = (uint64_t)s_status.selected_retention_hours * 3600000u;
+    if (!duration || s_retention_clock.pending_ms > (uint64_t)INT64_MAX - duration) {
+      (void)retention_clock_error(4u, "parent context minimum residence overflow");
+      sqlite_rollback_silent(); return -1;
+    }
+    if (sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET alert_context_protect_until_active_ms=?1 "
+        "WHERE candidate_id=?2 AND alert_context_protect_until_active_ms=0;", -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 1, (sqlite3_int64)(s_retention_clock.pending_ms + duration)) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, candidate_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s_db) != 1) {
+      sqlite3_finalize(st); sqlite_rollback_silent();
+      set_error("parent context minimum residence could not be committed"); return -1;
+    }
+    sqlite3_finalize(st); st = NULL;
+  }
+  if (sqlite_live_size_over_limit((uint64_t)s_status.max_db_mb * 1024u * 1024u) != 0) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_CAPACITY;
+    ++s_status.db_budget_dropped;
+    set_error("candidate context page budget exceeded; protected evidence preserved");
+    sqlite_rollback_silent(); return -1;
+  }
+  if (sqlite_commit_candidate_transaction() != 0) {
+    sqlite_rollback_silent(); return -1;
   }
   /* These counters describe durable candidate commits, never a statement
    * that was later rolled back. */
@@ -5154,6 +5389,7 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   s_status.artifacts_written += parent_refs;
   s_status.context_facts_written += parent_facts;
   s_status.context_refs_written += parent_refs;
+  s_status.retention_parent_protections += parent_refs;
   if ((unsigned)r->type < EDR_LOCAL_EVIDENCE_EVENT_TYPE_BUCKETS)
     s_status.context_ref_writes_by_event_type[(unsigned)r->type] += parent_refs;
   return 0;
@@ -5415,8 +5651,9 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   int classes[MAX_CANDIDATES];
   unsigned char held_ids[MAX_CANDIDATES] = {0};
   unsigned char eligible[MAX_CANDIDATES] = {0};
+  unsigned char floor_protected[MAX_CANDIDATES] = {0};
   sqlite3_stmt *st = NULL;
-  unsigned count = 0u, processed = 0u, groups = 0u, held = 0u, work_rows = 0u;
+  unsigned count = 0u, processed = 0u, groups = 0u, held = 0u, floor_held = 0u, work_rows = 0u;
   uint64_t work_bytes = 0u, retired_work_bytes = 0u, removed_rows = 0u, byte_limit = 0u;
   int rc = -1, began = 0, step;
   int64_t now = now_unix_ns(); uint64_t mono = edr_monotonic_ns();
@@ -5431,6 +5668,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
     goto done;
   }
   began = 1;
+  if (sqlite_retention_clock_stage() != 0) goto done;
   if (sqlite3_prepare_v2(s_db,
       "SELECT page_size FROM pragma_page_size;", -1, &st, NULL) != SQLITE_OK ||
       sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int64(st, 0) <= 0) goto storage_failed;
@@ -5468,8 +5706,12 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       "AND context_post_until_ns>0 AND context_post_until_ns<?1 "
       "AND (?2=1 OR (event_time_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END "
       "AND created_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END)) "
+      "AND typeof(alert_context_protect_until_active_ms)='integer' "
+      "AND alert_context_protect_until_active_ms>=0 AND alert_context_protect_until_active_ms<=?8 "
       "AND retention_value_class IN(1,2) "
-      "AND NOT EXISTS(SELECT 1 FROM evidence_retention_protected x WHERE x.candidate_id=p.candidate_id),retention_value_class "
+      "AND NOT EXISTS(SELECT 1 FROM evidence_retention_protected x WHERE x.candidate_id=p.candidate_id),retention_value_class,"
+      "typeof(alert_context_protect_until_active_ms)!='integer' OR alert_context_protect_until_active_ms<0 "
+      "OR alert_context_protect_until_active_ms>?8 "
       "FROM p0_candidates p WHERE retention_policy_version=1 AND event_time_ns>0 "
       "AND (retention_value_class,event_time_ns,candidate_id)>(?6,?4,?5) "
       "ORDER BY retention_value_class,event_time_ns,candidate_id LIMIT 1000;", -1, &st, NULL) != SQLITE_OK ||
@@ -5478,7 +5720,8 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       sqlite3_bind_int64(st, 4, s_retirement_cursor[pressure != 0].time) != SQLITE_OK ||
       sqlite3_bind_text(st, 5, s_retirement_cursor[pressure != 0].id, -1, SQLITE_STATIC) != SQLITE_OK ||
       sqlite3_bind_int(st, 6, s_retirement_cursor[pressure != 0].value_class) != SQLITE_OK ||
-      sqlite3_bind_int64(st, 7, now - (sqlite3_int64)s_status.selected_retention_hours * 3600LL * 1000000000LL) != SQLITE_OK) goto storage_failed;
+      sqlite3_bind_int64(st, 7, now - (sqlite3_int64)s_status.selected_retention_hours * 3600LL * 1000000000LL) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 8, (sqlite3_int64)s_retention_clock.pending_ms) != SQLITE_OK) goto storage_failed;
   /* An empty indexed seek may wrap once without increasing the 1000-row
    * inspection budget. Late imports and a refilled cache can sort before the
    * previous cursor; they must not require a minute-long poll to be visible. */
@@ -5493,6 +5736,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       times[count] = sqlite3_column_int64(st, 1);
       eligible[count] = sqlite3_column_int(st, 2) == 1;
       classes[count] = sqlite3_column_int(st, 3);
+      floor_protected[count] = sqlite3_column_int(st, 4) != 0;
       memcpy(ids[count++], id, (size_t)n + 1u);
     }
     if (step != SQLITE_DONE && step != SQLITE_ROW) goto storage_failed;
@@ -5508,6 +5752,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
     processed = i + 1u;
     if (!eligible[i] || work_rows == MAX_WORK_ROWS) {
       held_ids[i] = 1; ++held;
+      if (floor_protected[i]) ++floor_held;
       continue;
     }
     if (sqlite3_prepare_v2(s_db,
@@ -5559,6 +5804,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   }
   s_status.retention_groups_retired += groups;
   s_status.retention_groups_held += held;
+  s_status.retention_floor_held += floor_held;
   if (pressure) s_status.db_capacity_evicted += removed_rows;
   else s_status.db_retention_evicted += removed_rows;
   *retired = groups;
@@ -5635,7 +5881,7 @@ static int sqlite_maintenance(int defer_reclaim) {
     {"registry_evidence","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(key_path AS BLOB)),0)+COALESCE(length(CAST(value_name AS BLOB)),0)+COALESCE(length(CAST(op AS BLOB)),0)"},
     {"command_results","updated_ns","1","COALESCE(length(CAST(command_id AS BLOB)),0)+COALESCE(length(CAST(command_type AS BLOB)),0)+COALESCE(length(CAST(status AS BLOB)),0)+COALESCE(length(CAST(detail AS BLOB)),0)+COALESCE(length(CAST(artifacts AS BLOB)),0)"},
     {"artifacts","created_ns","artifact_type='pmfe_followup_local_v1' AND upload_status IN('completed','expired','conflict')","COALESCE(length(CAST(artifact_id AS BLOB)),0)+COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(tenant_id AS BLOB)),0)+COALESCE(length(CAST(candidate_id AS BLOB)),0)+COALESCE(length(CAST(path AS BLOB)),0)+COALESCE(length(CAST(sha256 AS BLOB)),0)+COALESCE(length(CAST(manifest_json AS BLOB)),0)+COALESCE(length(CAST(minio_key AS BLOB)),0)+64"},
-    {"metrics","minute_unix","NOT(minute_unix=0 AND endpoint_id='' AND metric_name IN('local_retention_v1_expired_groups','local_retention_v1_expired_rows','local_retention_v1_expired_work_bytes','local_retention_v1_capacity_groups','local_retention_v1_capacity_rows','local_retention_v1_capacity_work_bytes'))","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"}
+    {"metrics","minute_unix","NOT(minute_unix=0 AND endpoint_id='' AND metric_name IN('local_retention_v1_expired_groups','local_retention_v1_expired_rows','local_retention_v1_expired_work_bytes','local_retention_v1_capacity_groups','local_retention_v1_capacity_rows','local_retention_v1_capacity_work_bytes','" RETENTION_ACTIVE_CLOCK_KEY "'))","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"}
   };
   for (unsigned pass=0;pass<9u && !sqlite_maintenance_yield(&slice);++pass) {
     unsigned stage=s_maintenance_stage;
@@ -6872,6 +7118,9 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   evidence_cache_lock();
   evidence_cache_close_locked();
   memset(&s_status, 0, sizeof(s_status));
+#if defined(EDR_HAVE_SQLITE)
+  memset(&s_retention_clock, 0, sizeof(s_retention_clock));
+#endif
   memset(s_proc, 0, sizeof(s_proc));
   memset(s_ring, 0, sizeof(s_ring));
   memset(s_context_ring, 0, sizeof(s_context_ring));
@@ -9800,14 +10049,19 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
       "\"active\":%u,\"expired\":%u,\"capacity\":64,\"failures\":%llu,\"cause_code\":%u},"
       "\"budget_protection\":{\"physical_refusals\":%llu,\"physical_guard_failures\":%llu,\"query_pin_exhausted\":%llu,\"cause_code\":%u},"
       "\"local_retention\":{\"policy_version\":1,\"groups_retired\":%llu,\"held_decisions\":%llu,"
-      "\"failures\":%llu,\"legacy_candidates_at_open\":%llu,\"recent_hours\":%u,\"selected_hours\":%u}}",
+      "\"failures\":%llu,\"legacy_candidates_at_open\":%llu,\"recent_hours\":%u,\"selected_hours\":%u,"
+      "\"active_ms\":%llu,\"clock_valid\":%u,\"clock_failures\":%llu,\"clock_cause_code\":%u,"
+      "\"parent_protections\":%llu,\"floor_held\":%llu}}",
       ordinary_reasons, candidate_failures, context_failures,
       st->pmfe_scheduled,st->pmfe_running,st->pmfe_result_bound,st->pmfe_result_acked,
       st->pmfe_active,st->pmfe_expired,(unsigned long long)st->pmfe_failures,st->pmfe_cause_code,
       (unsigned long long)st->physical_refusals,(unsigned long long)st->physical_guard_failures,
       (unsigned long long)st->query_pin_exhausted,st->physical_cause_code,
       (unsigned long long)st->retention_groups_retired,(unsigned long long)st->retention_groups_held,
-      (unsigned long long)st->retention_failures,(unsigned long long)st->retention_legacy_candidates,st->retention_hours,st->selected_retention_hours);
+      (unsigned long long)st->retention_failures,(unsigned long long)st->retention_legacy_candidates,st->retention_hours,st->selected_retention_hours,
+      (unsigned long long)st->retention_active_ms,st->retention_clock_valid,
+      (unsigned long long)st->retention_clock_failures,st->retention_clock_cause_code,
+      (unsigned long long)st->retention_parent_protections,(unsigned long long)st->retention_floor_held);
   if (written < 0 || (size_t)written >= cap) { out[0] = '\0'; return -1; }
   return 0;
 }

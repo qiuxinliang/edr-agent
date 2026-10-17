@@ -11,6 +11,7 @@
 #include "edr/egress_batch_policy.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
+#include "edr/sha256.h"
 #include "../src/preprocess/process_cached_generation.h"
 #include "../src/preprocess/parent_context_snapshot.h"
 #include "../src/collector/process_command_preview.h"
@@ -23,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -36,6 +38,8 @@ static void test_unsetenv(const char *name) { assert(_putenv_s(name, "") == 0); 
 #include <sys/wait.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
 extern char **environ;
 static const char *s_test_executable;
 static void test_setenv(const char *name, const char *value) {
@@ -52,7 +56,23 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 static bool s_test_pressure;
 bool edr_resource_preprocess_throttle_active(void) { return s_test_pressure; }
 static uint64_t s_test_monotonic_ns = 1000000000ull;
-uint64_t edr_monotonic_ns(void) { return s_test_monotonic_ns; }
+static int s_test_real_monotonic;
+static uint64_t soak_monotonic_ns(void) {
+#if defined(_WIN32)
+  LARGE_INTEGER ticks, frequency;
+  assert(QueryPerformanceCounter(&ticks) && QueryPerformanceFrequency(&frequency));
+  assert(ticks.QuadPart >= 0 && frequency.QuadPart > 0 &&
+      (uint64_t)frequency.QuadPart <= UINT64_MAX / UINT64_C(1000000000));
+  return (uint64_t)(ticks.QuadPart / frequency.QuadPart) * UINT64_C(1000000000) +
+      (uint64_t)(ticks.QuadPart % frequency.QuadPart) * UINT64_C(1000000000) / (uint64_t)frequency.QuadPart;
+#else
+  struct timespec now; assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+  return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+#endif
+}
+uint64_t edr_monotonic_ns(void) {
+  return s_test_real_monotonic ? soak_monotonic_ns() : s_test_monotonic_ns;
+}
 /* The parser's unrelated enforcement side effect is outside this fixture. */
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
@@ -7699,7 +7719,8 @@ static void test_candidate_group_shared_facts_and_legacy_protection(void) {
     assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM materialized_artifacts EXCEPT SELECT * FROM retention_expected)") == 0);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM (SELECT * FROM retention_expected_candidates EXCEPT SELECT * FROM p0_candidates)") == 0);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 6);
-    assert(compact_scalar(db, "SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'local_retention_v1_%'") == 3);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'local_retention_v1_%' AND metric_name!='local_retention_v1_active_ms'") == 3);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms' AND typeof(value)='integer' AND value>=0") == 1);
     assert(compact_scalar(db, "SELECT value FROM metrics WHERE metric_name='local_retention_v1_expired_groups'") == 1);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
     assert(sqlite3_close(db) == SQLITE_OK);
@@ -9082,7 +9103,7 @@ static void test_metric_dispositions_and_resource_failures(void) {
   assert(cJSON_GetObjectItemCaseSensitive(failures, "candidate_resource_failed")->valuedouble == 1.0);
   assert(cJSON_GetObjectItemCaseSensitive(cache, "physical_bytes") != NULL);
   cJSON *retention=cJSON_GetObjectItemCaseSensitive(accounting,"local_retention");
-  assert(cJSON_IsObject(retention)&&cJSON_GetArraySize(retention)==7);
+  assert(cJSON_IsObject(retention)&&cJSON_GetArraySize(retention)==13);
   assert(cJSON_GetObjectItemCaseSensitive(retention,"recent_hours")->valuedouble==status.retention_hours);
   assert(cJSON_GetObjectItemCaseSensitive(retention,"selected_hours")->valuedouble==status.selected_retention_hours);
   assert(cJSON_GetObjectItemCaseSensitive(retention,"policy_version")->valueint==1);
@@ -9090,6 +9111,12 @@ static void test_metric_dispositions_and_resource_failures(void) {
   assert(cJSON_GetObjectItemCaseSensitive(retention,"held_decisions")->valuedouble==(double)status.retention_groups_held);
   assert(cJSON_GetObjectItemCaseSensitive(retention,"failures")->valuedouble==(double)status.retention_failures);
   assert(cJSON_GetObjectItemCaseSensitive(retention,"legacy_candidates_at_open")->valuedouble==(double)status.retention_legacy_candidates);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"active_ms")->valuedouble==(double)status.retention_active_ms);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"clock_valid")->valueint==(int)status.retention_clock_valid);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"clock_failures")->valuedouble==(double)status.retention_clock_failures);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"clock_cause_code")->valueint==(int)status.retention_clock_cause_code);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"parent_protections")->valuedouble==(double)status.retention_parent_protections);
+  assert(cJSON_GetObjectItemCaseSensitive(retention,"floor_held")->valuedouble==(double)status.retention_floor_held);
   char *retention_json=cJSON_PrintUnformatted(retention); assert(retention_json);
   assert(!strstr(retention_json,"metric-reasons")&&!strstr(retention_json,"resource-candidate")&&!strstr(retention_json,"cmdline"));
   cJSON_free(retention_json);
@@ -9171,7 +9198,7 @@ static void test_metrics_commit_watermark_restart_and_failure(void) {
   /* Expired in-memory slots must not resurrect rows deleted by retention. */
   edr_local_evidence_cache_test_set_now_unix_ns((minute + 25 * 60) * 60000000000LL);
   metric_test_poll();
-  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics") == 0);
+  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics WHERE metric_name!='local_retention_v1_active_ms'") == 0);
   assert(sqlite3_open(path, &raw) == SQLITE_OK);
   compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
                     "BEGIN SELECT RAISE(ABORT,'expired metrics resurrected'); END;");
@@ -9180,7 +9207,7 @@ static void test_metrics_commit_watermark_restart_and_failure(void) {
   metric_test_poll();
   edr_local_evidence_cache_get_status(&after);
   assert(after.metric_write_failures == before.metric_write_failures);
-  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics") == 0);
+  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics WHERE metric_name!='local_retention_v1_active_ms'") == 0);
   compact_exec(raw, "DROP TRIGGER metrics_deny;");
   assert(sqlite3_close(raw) == SQLITE_OK);
   edr_local_evidence_cache_close();
@@ -9973,6 +10000,7 @@ static void test_normal_alert_parent_context_retention(void) {
       uint64_t child_time = (uint64_t)(now - INT64_C(6000000000));
       assert(make_test_sqlite_path(path, sizeof(path)) == 0);
       cleanup_test_sqlite_path(path);
+      edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
       assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
       edr_local_evidence_cache_close();
       sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
@@ -10060,6 +10088,10 @@ static void test_normal_alert_parent_context_retention(void) {
       query.expires_unix_ms = 1;
       assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == EDR_PARENT_CONTEXT_ERROR_EXPIRED);
       query.expires_unix_ms = (int64_t)time(NULL) * 1000LL + 60000LL;
+      /* The following shared-command retirement checks are about an owner
+       * whose selected floor has elapsed, never about bypassing a live floor. */
+      edr_local_evidence_cache_test_set_retention_monotonic_ms(INT64_C(24)*3600000 + 2000);
+      retention_poll();
       edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
       /* Existing group retirement accepts these local-only references and
        * preserves a command shared with the other child's retained group. */
@@ -10087,6 +10119,7 @@ static void test_normal_alert_parent_context_retention(void) {
       assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
       assert(strstr(output, "retained-parent.exe"));
       edr_local_evidence_cache_close();
+      edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
       cleanup_test_sqlite_path(path); free(first); free(second); free(command);
     }
   }
@@ -10129,9 +10162,546 @@ static void parent_pressure_query(EdrParentContextQuery *query, const char *phas
   }
 }
 
-/* Same source, class and age in two real databases. Only the cache byte budget
- * differs. No retirement helper is called directly: production maintenance
- * must observe the protected legacy occupancy and make its own decision. */
+static void init_floor_parent(EdrBehaviorRecord *r, int64_t event_ns) {
+  init_record(r, EDR_EVENT_PROCESS_CREATE);
+  strcpy(r->tenant_id, "synthetic-floor-tenant");
+  strcpy(r->endpoint_id, "synthetic-floor-endpoint");
+  strcpy(r->event_id, "synthetic-floor-source");
+  r->pid = 99102u; r->ppid = 99101u;
+  r->process_start_key = 99102u;
+  r->process_creation_filetime_100ns = test_unix_ns_to_filetime((uint64_t)(event_ns - INT64_C(1000000000)));
+  r->parent_process_start_key = 99101u;
+  r->parent_process_creation_filetime_100ns = r->process_creation_filetime_100ns - UINT64_C(10000000);
+  r->parent_pid_state = EDR_PARENT_PID_KNOWN;
+  r->event_time_ns = event_ns;
+  strcpy(r->process_name, "floor-child.exe");
+  strcpy(r->exe_path, "C:/synthetic/floor-child.exe");
+  strcpy(r->cmdline, "floor-child.exe --synthetic");
+  strcpy(r->parent_name, "pressure-parent.exe");
+  strcpy(r->parent_path, "C:/synthetic/pressure-parent.exe");
+  strcpy(r->parent_cmdline, "pressure-parent.exe --synthetic-retained");
+  strcpy(r->parent_resolution_source, "live_parent_generation");
+  strcpy(r->parent_resolution_status, "RESOLVED");
+  edr_behavior_bind_parent_context(r);
+}
+
+static int64_t floor_active_ms(sqlite3 *db) {
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms' AND typeof(value)='integer' AND value>=0") == 1);
+  return compact_scalar(db, "SELECT value FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms'");
+}
+
+static EdrParentContextQuery floor_query(const EdrBehaviorRecord *r, int64_t now_ns) {
+  EdrParentContextQuery query = {r->tenant_id, r->endpoint_id, r->event_id,
+      r->pid, r->process_start_key, r->process_creation_filetime_100ns,
+      r->event_time_ns - INT64_C(1000000000), r->event_time_ns + INT64_C(1000000000),
+      now_ns / 1000000 + 30000, EDR_PARENT_CONTEXT_FIELD_NAME};
+  return query;
+}
+
+static void test_alert_parent_floor_clock_and_identity(void) {
+  const int64_t now = INT64_C(1700000000000000000), hour_ms = INT64_C(3600000);
+  char path[512]; sqlite3 *db = NULL;
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 2u) == 0);
+  /* A very late event receives H from admission, never from old event time. */
+  init_floor_parent(r, now - INT64_C(172800000000000));
+  EdrCommandFacts facts = {r->cmdline, r->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  int64_t active = floor_active_ms(db);
+  int64_t deadline = compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates");
+  assert(deadline == active + 2 * hour_ms);
+  EdrParentContextQuery query = floor_query(r, now);
+  parent_pressure_query(&query, "late_event_floor", 1);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(2000);
+  retention_poll();
+  assert(floor_active_ms(db) == active + 1000);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  strcpy(r->detection_context, "{\"severity\":\"P0\"}");
+  assert(edr_local_evidence_cache_is_candidate(r));
+  edr_local_evidence_cache_record_behavior(r);
+  parent_pressure_query(&query, "upsert_replay_query_no_renewal", 1);
+  assert(compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates") == deadline);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 1);
+  /* A protected source must keep the original query identity and command
+   * dependencies. The rejected SQL executes against the real guard layer. */
+  const char *mutations[] = {"candidate_id='wrong-source-owner'", "pid=pid+1", "ppid=ppid+1", "process_start_key='wrong-generation'",
+      "process_creation_filetime_100ns='1'", "event_time_ns=event_time_ns+1",
+      "endpoint_id='wrong-endpoint'", "tenant_id='wrong-tenant'",
+      "subject_command_fact_id='wrong-command'", "parent_command_fact_id='wrong-parent-command'"};
+  for (unsigned i = 0; i < sizeof(mutations)/sizeof(mutations[0]); ++i) {
+    char *sql = sqlite3_mprintf("UPDATE p0_candidates SET %s", mutations[i]); assert(sql);
+    assert(sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+    sqlite3_free(sql);
+  }
+  parent_pressure_query(&query, "identity_dependencies_frozen", 1);
+  int64_t persisted = floor_active_ms(db);
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  /* A new monotonic origin after reopen contributes zero offline time. Large
+   * forward/backward wall jumps alone cannot consume the active floor. */
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(INT64_C(10000000));
+  edr_local_evidence_cache_test_set_now_unix_ns(now + INT64_C(864000000000000));
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 2u) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(floor_active_ms(db) == persisted);
+  query.expires_unix_ms = (now + INT64_C(864000000000000))/1000000 + 30000;
+  parent_pressure_query(&query, "reopen_offline_not_elapsed", 1);
+  edr_local_evidence_cache_test_set_now_unix_ns(now - INT64_C(864000000000000));
+  query.expires_unix_ms = (now - INT64_C(864000000000000))/1000000 + 30000;
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(INT64_C(10001000));
+  retention_poll();
+  assert(floor_active_ms(db) == persisted + 1000);
+  assert(compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates") == deadline);
+  parent_pressure_query(&query, "wall_backward_still_retained", 1);
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  /* Model an already-frozen historical ref from before the floor column.
+   * Removing this one guard is fixture construction, never a runtime path. */
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "DROP TRIGGER alert_context_floor_v1_update;"
+      "UPDATE p0_candidates SET alert_context_protect_until_active_ms=0;");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 2u) == 0);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  parent_pressure_query(&query, "legacy_frozen_ref_not_backfilled", 1);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  cleanup_test_sqlite_path(path); free(r);
+}
+
+static void test_alert_parent_floor_invalid_clock_and_legacy_guards(void) {
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512]; sqlite3 *db = NULL;
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) == 0);
+  init_floor_parent(r, now);
+  EdrCommandFacts facts = {r->cmdline, r->parent_cmdline};
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) < 0);
+  assert(sqlite_table_count(path, "p0_candidates") == 0u);
+  assert(sqlite_table_count(path, "context_reference_projection") == 0u);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  int64_t deadline = compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates");
+  assert(deadline > 0);
+  EdrParentContextQuery query = floor_query(r, now);
+  strcpy(r->event_id, "clock-fault-new-source");
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(0);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) < 0);
+  for (unsigned pass = 0; pass < 2u; ++pass) retention_poll();
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 1);
+  query.source_event_id = "synthetic-floor-source";
+  parent_pressure_query(&query, "clock_fault_preserves_owner", 1);
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) == 0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(999);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) < 0);
+  edr_local_evidence_cache_close();
+  /* Reinstall the legacy names exactly as the old open path does. Independent
+   * floor/clock guards must survive; old TTL maintenance is refused, not
+   * called a compatible rollback or silently accepted. */
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "DROP TRIGGER IF EXISTS candidate_retention_v1_insert;"
+      "CREATE TRIGGER candidate_retention_v1_insert BEFORE INSERT ON p0_candidates "
+      "WHEN typeof(NEW.retention_policy_version)!='integer' OR NEW.retention_policy_version NOT IN(0,1) "
+      "OR NEW.local_retention_state IS NOT 'retained' BEGIN SELECT RAISE(ABORT,'unsupported candidate retention policy'); END;"
+      "DROP TRIGGER IF EXISTS candidate_retention_v1_update;"
+      "CREATE TRIGGER candidate_retention_v1_update BEFORE UPDATE OF retention_policy_version,local_retention_state ON p0_candidates "
+      "WHEN NEW.retention_policy_version IS NOT OLD.retention_policy_version OR "
+      "NEW.local_retention_state IS NULL OR NEW.local_retention_state NOT IN('retained','retirement_eligible') "
+      "OR (NEW.local_retention_state='retirement_eligible' AND NEW.retention_policy_version!=1) "
+      "BEGIN SELECT RAISE(ABORT,'unsupported candidate retention transition'); END;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name GLOB 'alert_context_floor_v1_*'") == 4);
+  assert(sqlite3_exec(db, "UPDATE p0_candidates SET local_retention_state='retirement_eligible'", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+  assert(sqlite3_exec(db, "DELETE FROM metrics WHERE minute_unix<1700000000", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+  assert(sqlite3_exec(db, "UPDATE metrics SET value='bad' WHERE metric_name='local_retention_v1_active_ms'", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+  assert(compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates") == deadline);
+  /* Missing clock with a committed positive floor is corruption, not an
+   * empty legacy database. Construct it only after removing its own guards. */
+  compact_exec(db, "DROP TRIGGER retention_active_clock_v1_insert;"
+      "DROP TRIGGER retention_active_clock_v1_update;DROP TRIGGER retention_active_clock_v1_delete;"
+      "DELETE FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms';");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) < 0);
+  assert(sqlite_table_count(path, "p0_candidates") == 1u);
+  assert(sqlite_table_count(path, "context_reference_projection") == 1u);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "INSERT INTO metrics(minute_unix,endpoint_id,metric_name,value) VALUES(0,'','local_retention_v1_active_ms',9223372036854775807)");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) == 0);
+  /* A new deadline cannot overflow even when an otherwise valid clock row is
+   * at INT64_MAX; neither the existing snapshot nor a partial owner is lost. */
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) < 0);
+  assert(sqlite_table_count(path, "p0_candidates") == 1u);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  cleanup_test_sqlite_path(path); free(r);
+}
+
+static void test_alert_parent_floor_post_commit_clock_regression(void) {
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512]; EdrEvidenceCacheStatus before, after;
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 16u, 1u, 1u) == 0);
+  init_floor_parent(r, now); EdrCommandFacts facts = {r->cmdline, r->parent_cmdline};
+  edr_local_evidence_cache_get_status(&before);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(10000);
+  /* 5000 exceeds the old anchor but precedes the staged 10000 sample. The
+   * owner already committed: report success plus invalid clock, not rollback. */
+  edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(5000);
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  edr_local_evidence_cache_get_status(&after);
+  assert(!after.retention_clock_valid && after.retention_clock_cause_code == 3u);
+  assert(after.retention_clock_failures == before.retention_clock_failures + 1u);
+  assert(after.candidate_rejected == before.candidate_rejected);
+  assert(sqlite_table_count(path, "p0_candidates") == 1u);
+  assert(sqlite_table_count(path, "context_reference_projection") == 1u);
+  EdrParentContextQuery query = floor_query(r, now);
+  parent_pressure_query(&query, "post_commit_clock_invalid_owner_durable", 1);
+  strcpy(r->event_id, "post-commit-clock-new-owner-refused");
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) < 0);
+  edr_local_evidence_cache_get_status(&after);
+  assert(!after.retention_clock_valid && after.retention_clock_cause_code == 3u);
+  assert(after.retention_clock_failures == before.retention_clock_failures + 1u);
+  edr_local_evidence_cache_test_set_now_unix_ns(now + INT64_C(7200000000000));
+  for (unsigned pass = 0; pass < 4u; ++pass) retention_poll();
+  assert(sqlite_table_count(path, "p0_candidates") == 1u);
+  query.source_event_id = "synthetic-floor-source";
+  query.expires_unix_ms = (now + INT64_C(7200000000000))/1000000 + 30000;
+  parent_pressure_query(&query, "post_commit_invalid_clock_blocks_retirement", 1);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_retention_after_commit_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  cleanup_test_sqlite_path(path); free(r);
+}
+
+typedef struct {
+  EdrBehaviorRecord *record;
+  unsigned kind;
+  int64_t protect_until_active_ms;
+} ParentSoakOwner;
+
+typedef struct {
+  double user, kernel;
+  uint64_t read_bytes, write_bytes;
+  unsigned native_machine, process_machine;
+  int io_available;
+} ParentSoakProcess;
+
+static ParentSoakProcess parent_soak_process(void) {
+  ParentSoakProcess value = {0};
+#if defined(_WIN32)
+  FILETIME created, exited, kernel, user; IO_COUNTERS io;
+  USHORT process_machine = 0, native_machine = 0;
+  assert(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
+  assert(GetProcessIoCounters(GetCurrentProcess(), &io));
+  assert(IsWow64Process2(GetCurrentProcess(), &process_machine, &native_machine));
+  value.user = ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime) / 1e7;
+  value.kernel = ((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) / 1e7;
+  value.read_bytes = io.ReadTransferCount; value.write_bytes = io.WriteTransferCount;
+  value.native_machine = native_machine; value.process_machine = process_machine;
+  value.io_available = 1;
+#else
+  struct rusage usage; assert(getrusage(RUSAGE_SELF, &usage) == 0);
+  value.user = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6;
+  value.kernel = usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+#endif
+  return value;
+}
+
+static uint64_t parent_soak_file_bytes(const char *path) {
+#if defined(_WIN32)
+  WIN32_FILE_ATTRIBUTE_DATA data;
+  if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) {
+    assert(GetLastError() == ERROR_FILE_NOT_FOUND); return 0;
+  }
+  assert(!(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT));
+  return (uint64_t)data.nFileSizeHigh << 32 | data.nFileSizeLow;
+#else
+  struct stat data;
+  if (lstat(path, &data) != 0) { assert(errno == ENOENT); return 0; }
+  assert(S_ISREG(data.st_mode) && data.st_size >= 0); return (uint64_t)data.st_size;
+#endif
+}
+
+static int64_t parent_soak_now_ns(void) {
+  struct timespec now; assert(timespec_get(&now, TIME_UTC) == TIME_UTC);
+  return (int64_t)now.tv_sec * INT64_C(1000000000) + now.tv_nsec;
+}
+
+static void parent_soak_check_owner(ParentSoakOwner *owner, int64_t active_ms,
+                                  char *long_command, uint64_t *available,
+                                  uint64_t *unavailable, uint64_t *unresolved) {
+  EdrParentContextQuery query = floor_query(owner->record, parent_soak_now_ns());
+  for (unsigned full = 0; full < 2u; ++full) {
+    char output[16384]; query.fields = full ? 7u : 1u;
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, output,
+        full ? sizeof(output) : 2048u) == 0);
+    cJSON *root = cJSON_Parse(output); assert(root);
+    const cJSON *parent = cJSON_GetObjectItemCaseSensitive(root, "parent");
+    const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "availability_reason");
+    assert(cJSON_IsString(reason));
+    assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "absence_is_evidence")));
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(root, "source_event_id")->valuestring, owner->record->event_id));
+    if (!strcmp(reason->valuestring, "unavailable_or_expired")) {
+      assert(active_ms >= owner->protect_until_active_ms);
+      assert(cJSON_IsNull(parent)); ++*unavailable;
+    } else if (owner->kind == 5u) {
+      assert(!strcmp(reason->valuestring, "parent_unresolved") && cJSON_IsNull(parent));
+      assert(cJSON_GetObjectItemCaseSensitive(root, "parent_pid_state")->valueint == EDR_PARENT_PID_UNKNOWN);
+      ++*unresolved;
+      if (full) printf("parent_soak_owner source=%s kind=%u availability=parent_unresolved active_ms=%lld floor_ms=%lld\n",
+          owner->record->event_id, owner->kind, (long long)active_ms, (long long)owner->protect_until_active_ms);
+    } else {
+      assert(!strcmp(reason->valuestring, "available") && cJSON_IsObject(parent));
+      assert(cJSON_GetObjectItemCaseSensitive(parent, "pid")->valueint == (int)owner->record->ppid);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "name")->valuestring, "pressure-parent.exe"));
+      char identity[32]; snprintf(identity, sizeof(identity), "%llu", (unsigned long long)owner->record->parent_process_start_key);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "process_start_key")->valuestring, identity));
+      snprintf(identity, sizeof(identity), "%llu", (unsigned long long)owner->record->parent_process_creation_filetime_100ns);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "process_creation_filetime_100ns")->valuestring, identity));
+      assert(cJSON_HasObjectItem(parent, "path") == (full != 0));
+      assert(cJSON_HasObjectItem(parent, "cmdline") == (full != 0));
+      if (full) {
+        const char *expected = owner->kind == 3u ? long_command : owner->kind == 4u ? "" : "pressure-parent.exe --synthetic-retained";
+        const cJSON *command = cJSON_GetObjectItemCaseSensitive(parent, "cmdline");
+        assert(cJSON_IsString(command) && !strcmp(command->valuestring, expected));
+        assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent, "cmdline_quality")->valuestring,
+            owner->kind == 4u ? "missing" : "complete"));
+        char digest[65]; assert(edr_sha256_hex((const uint8_t *)expected, strlen(expected), digest) == 0);
+        printf("parent_soak_owner source=%s kind=%u active_ms=%lld floor_ms=%lld command_length=%zu command_sha256=%s\n",
+            owner->record->event_id, owner->kind, (long long)active_ms,
+            (long long)owner->protect_until_active_ms, strlen(expected), digest);
+      }
+      ++*available;
+    }
+    cJSON_Delete(root);
+  }
+}
+
+/* One real SQLite database, real wall/monotonic time, no live cache or event
+ * producer. Duration is never converted into simulated cache age. The bounded
+ * burst attempts to fill the synthetic 64MiB budget; protected-full refusal is
+ * an observed outcome, not a reason to discard an old owner. */
+static int run_alert_parent_soak(unsigned duration_s) {
+  enum { OWNER_LIMIT = 12, BURST_LIMIT = 8192 };
+#if !defined(_WIN32)
+  if (duration_s >= 7380u) {
+    fprintf(stderr, "two-window acceptance requires native Windows ARM64; use a short smoke on this host\n");
+    return 2;
+  }
+#endif
+  char directory[512], path[640], sidecar[672], long_command[12001];
+  ParentSoakOwner owners[OWNER_LIMIT] = {{0}};
+  EdrBehaviorRecord *record = calloc(1u, sizeof(*record));
+  EdrBehaviorRecord *previous = calloc(1u, sizeof(*previous)); assert(record && previous);
+  assert(make_test_sqlite_path(directory, sizeof(directory)) == 0);
+  assert(remove(directory) == 0);
+#if defined(_WIN32)
+  assert(CreateDirectoryA(directory, NULL));
+#else
+  assert(mkdir(directory, 0700) == 0);
+#endif
+  assert(snprintf(path, sizeof(path), "%s/cache.db", directory) < (int)sizeof(path));
+  fill_text(long_command, sizeof(long_command), 12000u, 'A');
+  retention_bench_vfs_parent = sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs = *retention_bench_vfs_parent;
+  vfs.zName = "alert-parent-real-soak"; vfs.pNext = NULL;
+  vfs.szOsFile += (int)sizeof(RetentionBenchFile); vfs.xOpen = retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs, 1) == SQLITE_OK);
+  retention_bench_reads = retention_bench_writes = retention_bench_syncs = 0;
+  s_test_real_monotonic = 1;
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+  assert(edr_local_evidence_cache_open_with_policy(path, 64u, 1u, 1u) == 0);
+  ParentSoakProcess begin = parent_soak_process();
+  if (duration_s >= 7380u) {
+    assert(begin.native_machine == 0xAA64u && begin.process_machine == 0u && begin.io_available);
+  }
+  uint64_t started = soak_monotonic_ns(), next_tick = started, next_summary = started;
+  uint64_t next_reopen = started + UINT64_C(3600000000000), next_anchor = next_reopen;
+  uint64_t offered = 0, accepted = 0, refused = 0, partial = 0, repeated = 0;
+  uint64_t burst = 0, query_available = 0, query_unavailable = 0, query_unresolved = 0, reopened = 0;
+  uint64_t peak_db = 0, peak_wal = 0, peak_shm = 0, peak_total = 0, retired_before_reopen = 0;
+  uint64_t admission_after_refusal = 0; unsigned owner_count = 0;
+  int pressure_observed = 0;
+  uint64_t first_pressure_active_ms = 0;
+  printf("parent_soak_begin label=%s duration_s=%u budget_mb=64 recent_hours=1 selected_hours=1 tick_records=1 burst_limit=%u physical_peak_boundary=per_operation_and_100ms_samples directory=%s native_machine=%u process_machine=%u io_available=%d\n",
+      duration_s >= 7380u ? "wall_clock_two_window" : "short_smoke", duration_s,
+      BURST_LIMIT, directory, begin.native_machine, begin.process_machine, begin.io_available);
+  fflush(stdout);
+  for (;;) {
+    uint64_t current = soak_monotonic_ns();
+    assert(current >= started);
+    if (current - started >= (uint64_t)duration_s * UINT64_C(1000000000)) break;
+    if (current >= next_tick) {
+      unsigned count = (current - started >= UINT64_C(60000000000) && !pressure_observed && burst < BURST_LIMIT) ? 33u : 1u;
+      for (unsigned item = 0; item < count; ++item) {
+        if (item) ++burst;
+        unsigned kind = (unsigned)(offered % 6u); int replay = kind == 1u && offered != 0;
+        if (replay) { *record = *previous; ++repeated; }
+        else {
+          init_floor_parent(record, parent_soak_now_ns());
+          snprintf(record->event_id, sizeof(record->event_id), "parent-soak-%llu", (unsigned long long)offered);
+          record->pid += (uint32_t)offered; record->ppid += (uint32_t)offered;
+          record->process_start_key += offered; record->parent_process_start_key += offered;
+          if (kind == 2u) { record->priority = 3u; strcpy(record->detection_context, "{\"severity\":\"P0\",\"rule_id\":\"SYNTHETIC-SOAK\"}"); }
+          if (kind == 3u) {
+            snprintf(record->parent_cmdline, sizeof(record->parent_cmdline), "%s", long_command);
+            edr_behavior_mark_source_truncated(record, "source.parent_cmdline");
+          } else if (kind == 4u) record->parent_cmdline[0] = 0;
+          else if (kind == 5u) {
+            record->ppid = 0; record->parent_pid_state = EDR_PARENT_PID_UNKNOWN;
+            record->parent_process_start_key = record->parent_process_creation_filetime_100ns = 0;
+            record->parent_name[0] = record->parent_path[0] = record->parent_cmdline[0] = 0;
+            record->parent_resolution_source[0] = record->parent_resolution_status[0] = 0;
+          }
+          edr_behavior_bind_parent_context(record); *previous = *record;
+        }
+        EdrCommandFacts facts = {record->cmdline, kind == 3u ? long_command : record->parent_cmdline};
+        EdrEvidenceCacheStatus before_write; edr_local_evidence_cache_get_status(&before_write);
+        int rc = edr_local_evidence_cache_record_alert_context(record, &facts); ++offered;
+        uint64_t observed_db = parent_soak_file_bytes(path);
+        snprintf(sidecar, sizeof(sidecar), "%s-wal", path);
+        uint64_t observed_wal = parent_soak_file_bytes(sidecar);
+        snprintf(sidecar, sizeof(sidecar), "%s-shm", path);
+        uint64_t observed_shm = parent_soak_file_bytes(sidecar);
+        if (observed_db > peak_db) peak_db = observed_db;
+        if (observed_wal > peak_wal) peak_wal = observed_wal;
+        if (observed_shm > peak_shm) peak_shm = observed_shm;
+        if (observed_db + observed_wal + observed_shm > peak_total)
+          peak_total = observed_db + observed_wal + observed_shm;
+        assert(peak_total <= UINT64_C(256)*1024*1024);
+        if (rc < 0) {
+          EdrEvidenceCacheStatus after_write; edr_local_evidence_cache_get_status(&after_write);
+          assert(after_write.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] >
+              before_write.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]);
+          ++refused;
+          if (!pressure_observed) first_pressure_active_ms = after_write.retention_active_ms;
+          pressure_observed = 1;
+        }
+        else {
+          ++accepted; if (rc > 0) ++partial;
+          if (!replay && pressure_observed && owner_count &&
+              before_write.retention_active_ms >= (uint64_t)owners[0].protect_until_active_ms)
+            ++admission_after_refusal;
+          if (!replay && rc == 0 && (owner_count < 6u || (current >= next_anchor && owner_count < OWNER_LIMIT))) {
+            ParentSoakOwner *owner = &owners[owner_count++];
+            owner->record = malloc(sizeof(*record)); assert(owner->record); *owner->record = *record;
+            owner->kind = kind;
+            sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+            assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+            assert(sqlite3_prepare_v2(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates WHERE endpoint_id=?1 AND tenant_id=?2 AND pid=?3 AND process_start_key=?4 AND process_creation_filetime_100ns=?5", -1, &st, NULL) == SQLITE_OK);
+            char start[32], birth[32];
+            snprintf(start, sizeof(start), "%llu", (unsigned long long)record->process_start_key);
+            snprintf(birth, sizeof(birth), "%llu", (unsigned long long)record->process_creation_filetime_100ns);
+            assert(sqlite3_bind_text(st, 1, record->endpoint_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_bind_text(st, 2, record->tenant_id, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_bind_int64(st, 3, record->pid) == SQLITE_OK);
+            assert(sqlite3_bind_text(st, 4, start, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_bind_text(st, 5, birth, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_step(st) == SQLITE_ROW); owner->protect_until_active_ms = sqlite3_column_int64(st, 0);
+            assert(owner->protect_until_active_ms > 0 && sqlite3_step(st) == SQLITE_DONE);
+            sqlite3_finalize(st); assert(sqlite3_close(db) == SQLITE_OK);
+            if (current >= next_anchor) next_anchor += UINT64_C(3600000000000);
+          }
+        }
+        if (pressure_observed) break;
+      }
+      edr_local_evidence_cache_poll_maintenance();
+      next_tick = soak_monotonic_ns() + UINT64_C(1000000000);
+    }
+    EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+    uint64_t db_bytes = parent_soak_file_bytes(path);
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", path); uint64_t wal_bytes = parent_soak_file_bytes(sidecar);
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", path); uint64_t shm_bytes = parent_soak_file_bytes(sidecar);
+    if (db_bytes > peak_db) peak_db = db_bytes;
+    if (wal_bytes > peak_wal) peak_wal = wal_bytes;
+    if (shm_bytes > peak_shm) peak_shm = shm_bytes;
+    if (db_bytes + wal_bytes + shm_bytes > peak_total) peak_total = db_bytes + wal_bytes + shm_bytes;
+    assert(peak_total <= UINT64_C(256)*1024*1024); /* synthetic safety stop, not a product budget */
+    if (current >= next_summary) {
+      for (unsigned i = 0; i < owner_count; ++i)
+        parent_soak_check_owner(&owners[i], (int64_t)status.retention_active_ms, long_command, &query_available, &query_unavailable, &query_unresolved);
+      sqlite3 *db = NULL;
+      assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+      int64_t retained = compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retained'");
+      int64_t chains = compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates p JOIN context_reference_projection r ON r.candidate_id=p.candidate_id AND r.artifact_id=p.candidate_id||':alert_parent_context' JOIN context_facts f ON f.fact_id=r.fact_id AND f.endpoint_id=p.endpoint_id AND f.tenant_id=p.tenant_id WHERE p.local_retention_state='retained'");
+      assert(chains == retained);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates p WHERE (subject_command_fact_id<>'' AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.artifact_id=p.subject_command_fact_id)) OR (parent_command_fact_id<>'' AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.artifact_id=p.parent_command_fact_id))") == 0);
+      int64_t oldest = compact_scalar(db, "SELECT COALESCE(MIN(event_time_ns),0) FROM p0_candidates"), latest = compact_scalar(db, "SELECT COALESCE(MAX(event_time_ns),0) FROM p0_candidates");
+      assert(sqlite3_close(db) == SQLITE_OK);
+      ParentSoakProcess measured = parent_soak_process();
+      printf("parent_soak_sample elapsed_s=%.3f offered=%llu accepted=%llu refused=%llu partial=%llu replay=%llu burst=%llu retained=%lld complete_chains=%lld event_span_s=%.3f oldest_event_ns=%lld latest_event_ns=%lld active_ms=%llu retired=%llu floor_held=%llu query_parent_available=%llu query_unavailable=%llu query_parent_unresolved=%llu admission_after_refusal=%llu reopen=%llu db_bytes=%llu wal_bytes=%llu shm_bytes=%llu physical_peak_bytes=%llu sampled_peak_db_bytes=%llu sampled_peak_wal_bytes=%llu sampled_peak_shm_bytes=%llu cpu_user_s=%.6f cpu_kernel_s=%.6f process_read_bytes=%llu process_write_bytes=%llu io_available=%d vfs_read_bytes=%llu vfs_write_bytes=%llu vfs_syncs=%llu\n",
+          (soak_monotonic_ns()-started)/1e9, (unsigned long long)offered, (unsigned long long)accepted,
+          (unsigned long long)refused, (unsigned long long)partial, (unsigned long long)repeated, (unsigned long long)burst,
+          (long long)retained, (long long)chains, (latest-oldest)/1e9, (long long)oldest, (long long)latest,
+          (unsigned long long)status.retention_active_ms, (unsigned long long)(retired_before_reopen+status.retention_groups_retired),
+          (unsigned long long)status.retention_floor_held, (unsigned long long)query_available, (unsigned long long)query_unavailable, (unsigned long long)query_unresolved,
+          (unsigned long long)admission_after_refusal, (unsigned long long)reopened,
+          (unsigned long long)db_bytes, (unsigned long long)wal_bytes, (unsigned long long)shm_bytes,
+          (unsigned long long)peak_total, (unsigned long long)peak_db, (unsigned long long)peak_wal, (unsigned long long)peak_shm,
+          measured.user-begin.user, measured.kernel-begin.kernel,
+          (unsigned long long)(measured.read_bytes-begin.read_bytes), (unsigned long long)(measured.write_bytes-begin.write_bytes), measured.io_available,
+          (unsigned long long)retention_bench_reads, (unsigned long long)retention_bench_writes, (unsigned long long)retention_bench_syncs);
+      fflush(stdout); next_summary = soak_monotonic_ns() + UINT64_C(60000000000);
+    }
+    if (current >= next_reopen) {
+      retired_before_reopen += status.retention_groups_retired;
+      edr_local_evidence_cache_close();
+      assert(edr_local_evidence_cache_open_with_policy(path, 64u, 1u, 1u) == 0);
+      ++reopened; next_reopen += UINT64_C(3600000000000);
+    }
+#if defined(_WIN32)
+    Sleep(100);
+#else
+    struct timespec delay = {0, 100000000}; assert(nanosleep(&delay, NULL) == 0);
+#endif
+  }
+  EdrEvidenceCacheStatus final; edr_local_evidence_cache_get_status(&final);
+  for (unsigned i = 0; i < owner_count; ++i) {
+    parent_soak_check_owner(&owners[i], (int64_t)final.retention_active_ms, long_command, &query_available, &query_unavailable, &query_unresolved);
+    free(owners[i].record);
+  }
+  if (duration_s >= 7380u) {
+    assert(pressure_observed && refused > 0u && owner_count >= 6u);
+    assert(first_pressure_active_ms < (uint64_t)owners[0].protect_until_active_ms);
+    assert(retired_before_reopen + final.retention_groups_retired > 0u);
+    assert(admission_after_refusal > 0u && reopened >= 2u);
+  }
+  edr_local_evidence_cache_close();
+  printf("parent_soak_end label=%s wall_seconds=%.3f requested_seconds=%u offered=%llu accepted=%llu refused=%llu partial=%llu query_parent_available=%llu query_unavailable=%llu query_parent_unresolved=%llu retired=%llu admission_after_refusal=%llu physical_peak_bytes=%llu db_preserved=1 directory=%s\n",
+      duration_s >= 7380u ? "wall_clock_two_window" : "short_smoke", (soak_monotonic_ns()-started)/1e9, duration_s,
+      (unsigned long long)offered, (unsigned long long)accepted, (unsigned long long)refused, (unsigned long long)partial,
+      (unsigned long long)query_available, (unsigned long long)query_unavailable, (unsigned long long)query_unresolved,
+      (unsigned long long)(retired_before_reopen+final.retention_groups_retired), (unsigned long long)admission_after_refusal,
+      (unsigned long long)peak_total, directory);
+  fflush(stdout);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent, 1) == SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs) == SQLITE_OK);
+  s_test_real_monotonic = 0; test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  free(record); free(previous); return 0;
+}
+
+/* The pre-floor 121-second counterexample is preserved in the private baseline
+ * artifact. This regression accepts only the new contract: pressure cannot
+ * retire the exact owner until selected-hours of active cache time pass. */
 static void test_alert_parent_context_pressure_counterfactual(int preserve) {
   const int64_t now = INT64_C(1700000000000000000);
   test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
@@ -10144,6 +10714,7 @@ static void test_alert_parent_context_pressure_counterfactual(int preserve) {
     int n = snprintf(path, sizeof(path), "%s-parent-%s.db", seed, pressure ? "pressure" : "control");
     assert(n > 0 && (size_t)n < sizeof(path) && rename(seed, path) == 0);
     s_test_monotonic_ns = UINT64_C(1000000000);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
     edr_local_evidence_cache_test_set_now_unix_ns(now);
     assert(edr_local_evidence_cache_open_with_policy(path, pressure ? 1u : 16u, 72u, 72u) == 0);
     init_record(record, EDR_EVENT_PROCESS_CREATE);
@@ -10177,6 +10748,8 @@ static void test_alert_parent_context_pressure_counterfactual(int preserve) {
     assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2 AND retention_value_reason='causal_context'") == 1);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 1);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 1);
+    assert(compact_scalar(db, "SELECT alert_context_protect_until_active_ms FROM p0_candidates WHERE retention_value_class=2") ==
+        compact_scalar(db, "SELECT value FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_active_ms'") + INT64_C(72)*3600000);
     EdrParentContextQuery query = {record->tenant_id, record->endpoint_id, record->event_id,
         record->pid, record->process_start_key, record->process_creation_filetime_100ns,
         now - INT64_C(1000000000), now + INT64_C(1000000000),
@@ -10195,12 +10768,34 @@ static void test_alert_parent_context_pressure_counterfactual(int preserve) {
     assert(protected.retention_groups_retired == before.retention_groups_retired);
     parent_pressure_query(&query, pressure ? "pressure_post_window_protected" : "control_post_window_protected", 1);
     edr_local_evidence_cache_test_set_now_unix_ns(now + INT64_C(121000000000));
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(122000);
     query.expires_unix_ms = (now + INT64_C(121000000000)) / 1000000LL + 30000LL;
     for (unsigned pass = 0; pass < 16u; ++pass) retention_poll();
     edr_local_evidence_cache_get_status(&after);
     assert(after.maintenance_runs > protected.maintenance_runs);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='protected-legacy-occupancy'") == 1);
     assert(compact_scalar(db, "SELECT COALESCE(SUM(value),0) FROM metrics WHERE metric_name='local_retention_v1_expired_groups'") == 0);
+    assert(after.retention_groups_retired == before.retention_groups_retired);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 1);
+    parent_pressure_query(&query, pressure ? "pressure_121s_floor_protected" : "control_121s_floor_protected", 1);
+    if (pressure) {
+      *prior = *record;
+      strcpy(prior->event_id, "floor-full-new-context-refused");
+      prior->pid++; prior->process_start_key++;
+      prior->process_creation_filetime_100ns++;
+      edr_behavior_bind_parent_context(prior);
+      assert(edr_local_evidence_cache_record_alert_context(prior, &facts) < 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 1);
+      parent_pressure_query(&query, "pressure_refusal_preserves_first_owner", 1);
+    }
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000 + INT64_C(72)*3600000 - 1);
+    for (unsigned pass = 0; pass < 2u; ++pass) retention_poll();
+    parent_pressure_query(&query, pressure ? "pressure_H_minus_1ms" : "control_H_minus_1ms", 1);
+    /* This is a controlled active clock, not a wall-clock soak. Keep event
+     * age at 121s so only pressure, rather than ordinary expiry, can retire. */
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000 + INT64_C(72)*3600000 + 1000);
+    for (unsigned pass = 0; pass < 16u; ++pass) retention_poll();
+    edr_local_evidence_cache_get_status(&after);
     if (pressure) {
       assert(after.retention_groups_retired == before.retention_groups_retired + 1u);
       assert(after.db_capacity_evicted > before.db_capacity_evicted);
@@ -10216,7 +10811,7 @@ static void test_alert_parent_context_pressure_counterfactual(int preserve) {
       assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 2);
       parent_pressure_query(&query, "control_same_source_same_age", 1);
     }
-    printf("parent_pressure_counterfactual pressure=%d budget_mb=%u age_s=121 selected_hours=72 retired_groups=%llu capacity_rows=%llu db=%s candidate=%s preserved=%d\n",
+    printf("parent_pressure_counterfactual pressure=%d budget_mb=%u protected_age_s=121 after_floor_s=259201 selected_hours=72 retired_groups=%llu capacity_rows=%llu db=%s candidate=%s preserved=%d\n",
         pressure, pressure ? 1u : 16u,
         (unsigned long long)(after.retention_groups_retired - before.retention_groups_retired),
         (unsigned long long)(after.db_capacity_evicted - before.db_capacity_evicted), path, candidate, preserve);
@@ -10226,6 +10821,7 @@ static void test_alert_parent_context_pressure_counterfactual(int preserve) {
   }
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
   s_test_monotonic_ns = UINT64_C(1000000000);
 }
 
@@ -10338,12 +10934,26 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 3 && strcmp(argv[1], "--alert-parent-soak") == 0) {
+    char *end = NULL; errno = 0;
+    unsigned long duration = strtoul(argv[2], &end, 10);
+    if (errno || !argv[2][0] || !end || *end || duration < 1u || duration > 86400u) {
+      fprintf(stderr, "alert parent soak duration must be 1..86400 real seconds\n"); return 2;
+    }
+    return run_alert_parent_soak((unsigned)duration);
+  }
   if (argc == 2 && strcmp(argv[1], "--alert-parent-context") == 0) {
     test_normal_alert_parent_context_retention();
     test_alert_parent_context_refusal_and_unresolved(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--alert-parent-pressure") == 0) {
     test_alert_parent_context_pressure_counterfactual(1); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--alert-parent-floor") == 0) {
+    test_alert_parent_context_pressure_counterfactual(0);
+    test_alert_parent_floor_clock_and_identity();
+    test_alert_parent_floor_invalid_clock_and_legacy_guards();
+    test_alert_parent_floor_post_commit_clock_regression(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--command-result-budget") == 0) {
     test_command_result_copy_budget(); return 0;
@@ -10423,6 +11033,9 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
   RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
   RUN_CACHE_CASE("context", test_alert_parent_context_pressure_counterfactual(0));
+  RUN_CACHE_CASE("context", test_alert_parent_floor_clock_and_identity());
+  RUN_CACHE_CASE("context", test_alert_parent_floor_invalid_clock_and_legacy_guards());
+  RUN_CACHE_CASE("context", test_alert_parent_floor_post_commit_clock_regression());
   RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
   RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
   RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());

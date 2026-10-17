@@ -457,6 +457,39 @@ static void test_upgrade_health_consumers(void) {
       "\"engine_health_update\":{\"version\":2,\"base\":\"rev\",\"removed\":[]}}";
   assert(check("POST", "ingest/engine-health/delta", delta) == 0);
 }
+static void test_retention_floor_health_is_numeric_and_bounded(void) {
+  const char *raw = "{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\","
+      "\"engine_health\":{\"p0_acceptance\":{\"evidence_cache\":{\"accounting\":{\"local_retention\":{"
+      "\"active_ms\":259200001,\"clock_valid\":1,\"clock_failures\":0,\"clock_cause_code\":0,"
+      "\"parent_protections\":3,\"floor_held\":4,\"candidate_id\":\"PRIVATE_OWNER\","
+      "\"command\":\"PRIVATE_COMMAND\",\"facts\":[\"PRIVATE_FACT\"]}}}}}}";
+  char why[128];
+  assert(check("POST", "ingest/engine-health", raw) != 0);
+  char *projected = edr_egress_health_project(raw, why, sizeof(why));
+  assert(projected && !strstr(projected, "PRIVATE_") && !strstr(projected, "candidate_id"));
+  assert(check("POST", "ingest/engine-health", projected) == 0);
+  cJSON *o = cJSON_Parse(projected); assert(o);
+  cJSON *floor = cJSON_GetObjectItemCaseSensitive(o, "engine_health");
+  floor = cJSON_GetObjectItemCaseSensitive(floor, "p0_acceptance");
+  floor = cJSON_GetObjectItemCaseSensitive(floor, "evidence_cache");
+  floor = cJSON_GetObjectItemCaseSensitive(floor, "accounting");
+  floor = cJSON_GetObjectItemCaseSensitive(floor, "local_retention");
+  const char *fields[] = {"active_ms", "clock_valid", "clock_failures", "clock_cause_code",
+                          "parent_protections", "floor_held"};
+  const double values[] = {259200001, 1, 0, 0, 3, 4};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    cJSON *value = cJSON_GetObjectItemCaseSensitive(floor, fields[i]);
+    assert(cJSON_IsNumber(value) && value->valuedouble == values[i]);
+  }
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(floor, "active_ms", cJSON_CreateNumber(-1)));
+  char *bad = cJSON_PrintUnformatted(o); assert(bad);
+  assert(check("POST", "ingest/engine-health", bad) != 0); free(bad);
+  assert(cJSON_ReplaceItemInObjectCaseSensitive(floor, "active_ms", cJSON_CreateString("PRIVATE_CLOCK")));
+  bad = cJSON_PrintUnformatted(o); assert(bad);
+  assert(check("POST", "ingest/engine-health", bad) != 0); free(bad);
+  cJSON_Delete(o); free(projected);
+}
+
 static void test_storage_health_is_numeric_and_bounded(void) {
   const char *raw="{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"storage_protection\":{\"directory_hard_limit\":false,\"min_free_bytes\":143479824,\"queue_available_bytes\":200000000,\"command_owner\":{\"accounting_available\":true,\"reserved_bytes\":197190,\"admission_rejected\":2,\"raw_command\":\"PRIVATE_COMMAND\"}},\"queue_local_retention\":{\"retirement_enabled\":true,\"local_retention_policy_version\":2,\"retired_rows\":100,\"unclassified_rows\":4,\"payload\":\"PRIVATE_FACT\"}}}";
   char why[128];
@@ -484,6 +517,7 @@ static void test_storage_health_is_numeric_and_bounded(void) {
 int main(void) {
   test_evidence_pressure_health_projection();
   test_storage_health_is_numeric_and_bounded();
+  test_retention_floor_health_is_numeric_and_bounded();
   test_parent_exit_health_projection();
   test_diagnostic_health_commitments();
   test_upgrade_health_consumers();

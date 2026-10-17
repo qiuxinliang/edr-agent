@@ -69,6 +69,13 @@ static bool s_test_pressure;
 bool edr_resource_preprocess_throttle_active(void) { return s_test_pressure; }
 static uint64_t s_test_monotonic_ns = 1000000000ull;
 uint64_t edr_monotonic_ns(void) { return s_test_monotonic_ns; }
+static void benchmark_sync_retention_clock(void) {
+#ifdef EDR_PARENT_CONTEXT_ACTIVE_RETENTION_V1
+  /* Use the same simulated monotonic sample as the baseline fixture. Older
+   * source closures have no durable active clock and need no invented hook. */
+  edr_local_evidence_cache_test_set_retention_monotonic_ms((int64_t)(s_test_monotonic_ns / 1000000u));
+#endif
+}
 /* The parser's unrelated enforcement side effect is outside this fixture. */
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { (void)record; }
 
@@ -202,6 +209,7 @@ static void test_retention_value_benchmark(void) {
     EdrBehaviorRecord *r=calloc(1,sizeof(*r)); assert(r);
     assert(make_test_sqlite_path(path,sizeof(path))==0);
     edr_local_evidence_cache_test_set_now_unix_ns(base);
+    benchmark_sync_retention_clock();
     retention_bench_reads=retention_bench_writes=retention_bench_syncs=0;
     edr_sha256_init(&benchmark_input_hash); benchmark_input_bytes=0;
     RetentionBenchMetrics metrics_begin=retention_bench_metrics();
@@ -210,6 +218,7 @@ static void test_retention_value_benchmark(void) {
       int64_t stamp=base+(int64_t)hour*3600000000000LL;
       edr_local_evidence_cache_test_set_now_unix_ns(stamp);
       s_test_monotonic_ns+=60000000000ULL;
+      benchmark_sync_retention_clock();
       edr_local_evidence_cache_poll_maintenance(); { uint64_t sampled=benchmark_physical_bytes(path); if (sampled>physical_peak) physical_peak=sampled; }
       for (unsigned item=0;item<24;++item) {
         init_record(r,EDR_EVENT_NET_CONNECT); r->priority=3; r->pid=5000u+hour*24u+item; set_record_generation(r,r->pid);
@@ -233,10 +242,16 @@ static void test_retention_value_benchmark(void) {
       }
       for(unsigned minute=1;minute<60;++minute) {
         edr_local_evidence_cache_test_set_now_unix_ns(stamp+(int64_t)minute*60000000000LL);
-        s_test_monotonic_ns+=60000000000ULL; edr_local_evidence_cache_poll_maintenance(); { uint64_t sampled=benchmark_physical_bytes(path); if (sampled>physical_peak) physical_peak=sampled; }
+        s_test_monotonic_ns+=60000000000ULL; benchmark_sync_retention_clock();
+        edr_local_evidence_cache_poll_maintenance(); { uint64_t sampled=benchmark_physical_bytes(path); if (sampled>physical_peak) physical_peak=sampled; }
       }
     }
     EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+#ifdef EDR_PARENT_CONTEXT_ACTIVE_RETENTION_V1
+    assert(status.retention_clock_valid);
+    assert(status.retention_active_ms >= UINT64_C(7)*3600000 &&
+        status.retention_active_ms <= UINT64_C(8)*3600000);
+#endif
     if (status.physical_bytes>physical_peak) physical_peak=status.physical_bytes;
     edr_local_evidence_cache_close();
     RetentionBenchMetrics metrics_end=retention_bench_metrics();
@@ -298,6 +313,9 @@ static void test_retention_value_benchmark(void) {
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
   edr_local_evidence_cache_test_set_now_unix_ns(0);
+#ifdef EDR_PARENT_CONTEXT_ACTIVE_RETENTION_V1
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+#endif
 }
 
 
