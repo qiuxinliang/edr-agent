@@ -11936,7 +11936,11 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_candidate_live_size_query_failure_is_storage());
   RUN_CACHE_CASE("retention", test_pressure_continuation_postwrite_refusal(0));
   RUN_CACHE_CASE("retention", test_pressure_continuation_postwrite_refusal(1));
-  RUN_CACHE_CASE("retention", test_pressure_continuation_empty_reclaim_and_backoff());
+  /* This full-cost contract has its own 150-second CTest. Keep the default
+   * all-cases order while not charging it to the retention aggregate. */
+  if (strcmp(selected_suite, "all") == 0) {
+    RUN_CACHE_CASE("retention", test_pressure_continuation_empty_reclaim_and_backoff());
+  }
   RUN_CACHE_CASE("context", test_pmfe_recovery_query_cost_and_index_upgrade());
   RUN_CACHE_CASE("context", test_pmfe_durable_followup_binding_and_receipt_lifecycle());
   RUN_CACHE_CASE("context", test_pmfe_recovery_retry_capacity_and_inconclusive());

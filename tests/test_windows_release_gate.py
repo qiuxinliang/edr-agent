@@ -59,7 +59,7 @@ RUNTIME_EXPECTED = {
     "behavior_record_alert_proto_contract",
     "behavior_record_alert_emit_contract", "p0_direct_emit_suppression", "p0_deferred_snapshot",
     "process_tree_cache", "local_evidence_cache_candidate", "local_evidence_cache_migration",
-    "local_evidence_cache_retention", "command_fact_transport",
+    "local_evidence_cache_retention", "local_evidence_cache_pressure_continuation", "command_fact_transport",
     "python_installer_config_contract",
     "detection_decision_combo", "detection_regression_scenarios",
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",
@@ -708,6 +708,24 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 'BOOL GetExitCodeProcess(HANDLE, DWORD *);\nBOOL CloseHandle(HANDLE);\n'
                 'void ExitProcess(unsigned);\n'
                 'typedef struct { DWORD dwLowDateTime, dwHighDateTime; } FILETIME;\n'
+                'typedef uint16_t USHORT;\n'
+                'typedef union { struct { DWORD LowPart; int32_t HighPart; }; int64_t QuadPart; } LARGE_INTEGER;\n'
+                'typedef struct { uint64_t ReadOperationCount, WriteOperationCount, OtherOperationCount; '
+                'uint64_t ReadTransferCount, WriteTransferCount, OtherTransferCount; } IO_COUNTERS;\n'
+                'BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *);\n'
+                'BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *);\n'
+                'HANDLE WINAPI GetCurrentProcess(void);\n'
+                'BOOL WINAPI GetProcessTimes(HANDLE, FILETIME *, FILETIME *, FILETIME *, FILETIME *);\n'
+                'BOOL WINAPI GetProcessIoCounters(HANDLE, IO_COUNTERS *);\n'
+                'BOOL WINAPI IsWow64Process2(HANDLE, USHORT *, USHORT *);\n'
+                'typedef struct { DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime; '
+                'DWORD nFileSizeHigh, nFileSizeLow; } WIN32_FILE_ATTRIBUTE_DATA;\n'
+                'typedef enum { GetFileExInfoStandard, GetFileExMaxInfoLevel } GET_FILEEX_INFO_LEVELS;\n'
+                '#define ERROR_FILE_NOT_FOUND 2\n#define FILE_ATTRIBUTE_REPARSE_POINT 0x00000400\n'
+                'BOOL WINAPI GetFileAttributesExA(const char *, GET_FILEEX_INFO_LEVELS, void *);\n'
+                'DWORD WINAPI GetLastError(void);\n'
+                'typedef struct { DWORD nLength; void *lpSecurityDescriptor; BOOL bInheritHandle; } SECURITY_ATTRIBUTES;\n'
+                'BOOL WINAPI CreateDirectoryA(const char *, SECURITY_ATTRIBUTES *);\n'
                 'DWORD GetTempPathA(DWORD, char *);\n'
                 'unsigned GetTempFileNameA(const char *, const char *, unsigned, char *);\n'
                 'void GetSystemTimeAsFileTime(FILETIME *);\n'

@@ -246,6 +246,7 @@ jobs:
           retention-days: 14
           path: |
             contract-build/native-release-results.xml
+            contract-build/native-release-LastTest.log
             contract-build/native-telemetry-results.xml
             contract-build/Testing/Temporary/LastTest.log
             contract-build/windows-rule-audit-result.json

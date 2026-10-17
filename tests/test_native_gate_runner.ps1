@@ -14,6 +14,9 @@ $invokeRunner = [scriptblock]::Create($runner)
 $root = Join-Path ([IO.Path]::GetTempPath()) ('edr-native-gate-test-' + [Guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $root
 $null = New-Item -ItemType File -Path (Join-Path $root 'CMakeCache.txt')
+$lastTest = Join-Path $root 'Testing/Temporary/LastTest.log'
+$savedRelease = Join-Path $root 'native-release-LastTest.log'
+$null = New-Item -ItemType Directory -Path (Split-Path $lastTest -Parent) -Force
 $oldMarker = [Environment]::GetEnvironmentVariable('EDR_GATE_RUNNER_TEST', 'Process')
 
 $state = [pscustomobject]@{ Scenario = ''; BuildArguments = @(); Inventory = @(); Phases = $null; TestArguments = $null }
@@ -33,12 +36,21 @@ function ctest {
   $phase = if ($arguments -contains '--label-regex') { 'release' } else { 'telemetry' }
   $state.phases.Add($phase)
   $state.testArguments.Add($arguments)
+  if ($state.scenario -eq 'release log missing' -and $phase -eq 'release') {
+    if (Test-Path -LiteralPath $lastTest) { Remove-Item -LiteralPath $lastTest -Force }
+  } elseif ($state.scenario -eq 'release log oversized' -and $phase -eq 'release') {
+    [IO.File]::WriteAllBytes($lastTest, (New-Object byte[] (8 * 1024 * 1024 + 1)))
+  } else {
+    [IO.File]::WriteAllText($lastTest, "synthetic $phase $($state.scenario)`n")
+  }
   $global:LASTEXITCODE = if ($state.scenario -eq "$phase failure") { 1 } else { 0 }
 }
 
 try {
-  foreach ($case in @('standalone', 'combined', 'all overlap', 'release failure', 'telemetry failure',
+  foreach ($case in @('standalone', 'combined', 'combined again', 'all overlap', 'release failure', 'telemetry failure',
+                      'release log missing', 'release log oversized',
                       'build failure', 'empty release', 'unlabelled required', 'missing required')) {
+    if ($case -eq 'combined again' -and [IO.File]::ReadAllText($savedRelease) -cne "synthetic release combined`n") { throw 'Repeat fixture did not retain the first invocation.' }
     $state.scenario = $case
     $state.phases = New-Object 'System.Collections.Generic.List[string]'
     $state.testArguments = New-Object 'System.Collections.Generic.List[object]'
@@ -53,6 +65,7 @@ try {
       if ($case -eq 'unlabelled required' -and $name -eq $required[0]) { $labels = @('windows-release-gate') }
       $state.inventory += @{ name = $name; properties = @(@{ name = 'LABELS'; value = $labels }) }
     }
+    if ($case -eq 'combined') { $validCombinedInventory = $state.inventory }
     $env:EDR_GATE_RUNNER_TEST = 'must be restored'
     $caught = ''
     try { & $invokeRunner -BuildDir $root -IncludeReleaseGate:($case -ne 'standalone') | Out-Null }
@@ -61,6 +74,9 @@ try {
     $expectedPhases = switch ($case) {
       'standalone' { 'telemetry' }
       'combined' { 'release,telemetry' }
+      'combined again' { 'release,telemetry' }
+      'release log missing' { 'release' }
+      'release log oversized' { 'release' }
       'all overlap' { 'release' }
       'release failure' { 'release' }
       'telemetry failure' { 'release,telemetry' }
@@ -69,6 +85,8 @@ try {
     if (($state.phases -join ',') -cne $expectedPhases) { throw "${case}: unexpected phases $($state.phases -join ','); error: $caught" }
     $expectedError = switch ($case) {
       'release failure' { 'Native Windows release gate failed' }
+      'release log missing' { 'Native release LastTest log is missing' }
+      'release log oversized' { 'Native release LastTest exceeds the 8MiB' }
       'telemetry failure' { 'Native telemetry contract failed' }
       'build failure' { 'Native contract executables failed to build' }
       'empty release' { 'Required Windows release gate is empty' }
@@ -79,6 +97,11 @@ try {
     if (($expectedError -and -not $caught.Contains($expectedError)) -or (-not $expectedError -and $caught)) {
       throw "${case}: expected error '$expectedError', got '$caught'"
     }
+    if ($case -in @('combined', 'combined again', 'all overlap', 'telemetry failure')) {
+      if ([IO.File]::ReadAllText($savedRelease) -cne "synthetic release $case`n") { throw "${case}: stale or incomplete release log." }
+      $lastPhase = if ($case -eq 'all overlap') { 'release' } else { 'telemetry' }
+      if ([IO.File]::ReadAllText($lastTest) -cne "synthetic $lastPhase $case`n") { throw "${case}: fixture did not overwrite the current LastTest." }
+    } elseif (Test-Path -LiteralPath $savedRelease) { throw "${case}: failed or standalone invocation retained a stale release log." }
     foreach ($arguments in $state.testArguments) {
       if ($arguments -notcontains '--no-tests=error') { throw "${case}: empty test selection can pass." }
       $resultFlag = [Array]::IndexOf($arguments, '--output-junit')
@@ -95,6 +118,40 @@ try {
       if (($state.buildArguments -contains 'windows_release_gate_tests') -ne ($case -ne 'standalone')) { throw "${case}: wrong release build target." }
     }
     Write-Host "PASS: native gate runner $case"
+  }
+  # Each early-preflight failure follows a real successful mocked invocation
+  # in this same BuildDir; a previous pass log must not remain as this result.
+  foreach ($earlyFailure in @('missing cache', 'missing openssl')) {
+    $state.scenario = 'prior success ' + $earlyFailure
+    $state.inventory = $validCombinedInventory
+    $state.phases = New-Object 'System.Collections.Generic.List[string]'
+    $state.testArguments = New-Object 'System.Collections.Generic.List[object]'
+    & $invokeRunner -BuildDir $root -IncludeReleaseGate | Out-Null
+    if ([IO.File]::ReadAllText($savedRelease) -cne "synthetic release $($state.scenario)`n") { throw "${earlyFailure}: prior success fixture did not publish a complete log." }
+    $state.phases.Clear()
+    $state.testArguments.Clear()
+    $cachePath = Join-Path $root 'CMakeCache.txt'
+    $earlyArgs = @{ BuildDir = $root; IncludeReleaseGate = $true }
+    if ($earlyFailure -eq 'missing cache') {
+      Remove-Item -LiteralPath $cachePath -Force
+      $expectedEarlyError = 'Configure a native Windows EDR build'
+    } else {
+      $emptyOpenSsl = Join-Path $root 'empty-openssl'
+      $null = New-Item -ItemType Directory -Path $emptyOpenSsl
+      $earlyArgs.OpenSslBin = $emptyOpenSsl
+      $expectedEarlyError = 'OpenSslBin must contain openssl.exe'
+    }
+    $caught = ''
+    try { & $invokeRunner @earlyArgs | Out-Null }
+    catch { $caught = $_.Exception.Message }
+    finally {
+      if (!(Test-Path -LiteralPath $cachePath)) { $null = New-Item -ItemType File -Path $cachePath }
+    }
+    if (-not $caught.Contains($expectedEarlyError)) { throw "${earlyFailure}: expected early preflight failure, got '$caught'." }
+    if (Test-Path -LiteralPath $savedRelease) { throw "${earlyFailure}: early failure retained a previous pass log." }
+    if ($state.phases.Count -ne 0) { throw "${earlyFailure}: early preflight unexpectedly reached CTest." }
+    if ($env:EDR_GATE_RUNNER_TEST -cne 'must be restored') { throw "${earlyFailure}: early preflight changed the inherited environment." }
+    Write-Host "PASS: native gate runner early $earlyFailure"
   }
 } finally {
   [Environment]::SetEnvironmentVariable('EDR_GATE_RUNNER_TEST', $oldMarker, 'Process')
