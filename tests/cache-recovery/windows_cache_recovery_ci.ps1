@@ -178,17 +178,161 @@ function WaitProcess($Process,[int]$Seconds,[string]$Cause) {
   }
   $Process.Refresh(); return $Process.ExitCode
 }
-function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label) {
-  $worker=Join-Path $script:root ($Label+'.service.ps1')
-  Need (-not (Test-Path -LiteralPath $worker)) 'service_worker_exists'
-  $body="`$ErrorActionPreference='Stop';`$s=Get-Service -Name FDSecurityAgent -ErrorAction Stop;"
-  if ($Action -eq 'Stop') {$body+="Stop-Service -InputObject `$s -Force -ErrorAction Stop;`$s.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(30));"}
-  else {$body+="Start-Service -InputObject `$s -ErrorAction Stop;`$s.WaitForStatus('Running',[TimeSpan]::FromSeconds(30));"}
-  $body+='exit 0'
-  [IO.File]::WriteAllText($worker,$body,[Text.UTF8Encoding]::new($false))
-  $owned=StartWindowsPowerShellChild $worker (Join-Path $script:root ($Label+'.service.stdout.log')) (Join-Path $script:root ($Label+'.service.stderr.log'))
-  Need ((WaitProcess $owned 45 'service_control_unknown_no_retry') -eq 0) 'service_control_failed'
+# QA diagnostics only. The action and its existing 45/30 second limits are unchanged.
+function ServiceObserverError($Record) {
+  $e=$Record.Exception;$types=New-Object Collections.ArrayList;$native=$null
+  for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
+    $null=$types.Add($e.GetType().FullName)
+    if($e -is [ComponentModel.Win32Exception]){$native=$e.NativeErrorCode}
+    $e=$e.InnerException
+  }
+  return @{exception_types=@($types);hresult=$Record.Exception.HResult;native_error_code=$native}
 }
+function ServiceWorkerSource([ValidateSet('Stop','Start')][string]$Action) {
+  $source=@'
+$ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+function EventLine([string]$Phase,[string]$State='') {
+  [Console]::Out.WriteLine((@{schema='edr.service-action.phase.v1';phase=$Phase;state=$State}|ConvertTo-Json -Compress));[Console]::Out.Flush()
+}
+try {
+  EventLine 'query_initial'
+  $s=Get-Service -Name FDSecurityAgent -ErrorAction Stop
+  EventLine 'initial_state' ([string]$s.Status)
+  EventLine 'request___ACTION__'
+  __REQUEST__
+  EventLine 'wait_status_30'
+  $s.WaitForStatus('__STATUS__',[TimeSpan]::FromSeconds(30))
+  EventLine 'completed'
+  exit 0
+}catch{
+  $e=$_.Exception;$types=New-Object Collections.ArrayList;$native=$null
+  for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
+    $null=$types.Add($e.GetType().FullName)
+    if($e -is [ComponentModel.Win32Exception]){$native=$e.NativeErrorCode};$e=$e.InnerException
+  }
+  [Console]::Error.WriteLine((@{schema='edr.service-action.exception.v1';exception_types=@($types);hresult=$_.Exception.HResult;native_error_code=$native}|ConvertTo-Json -Compress));[Console]::Error.Flush()
+  exit 1
+}
+'@
+  $request=if($Action -eq 'Stop'){'Stop-Service -InputObject $s -Force -ErrorAction Stop'}else{'Start-Service -InputObject $s -ErrorAction Stop'}
+  $status=if($Action -eq 'Stop'){'Stopped'}else{'Running'}
+  return $source.Replace('__ACTION__',$Action.ToLowerInvariant()).Replace('__REQUEST__',$request).Replace('__STATUS__',$status)
+}
+function ServiceSamplerSource {
+  # A separate owned process is the only observer that calls SCM/CIM. A hung
+  # read cannot extend the parent's original WaitProcess(45) control boundary.
+  return @'
+$ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+$clock=[Diagnostics.Stopwatch]::StartNew();$written=0
+for($i=0;$i -lt 46;$i++){
+  $row=[ordered]@{schema='edr.service-scm-sample.v1';index=$i;elapsed_ms=$clock.ElapsedMilliseconds;state='Unknown';checkpoint=$null;wait_hint_ms=$null;service_pid=$null;win32_exit_code=$null;service_exit_code=$null;pid_birth_filetime=$null;exception_types=@();hresult=$null;native_error_code=$null;birth_exception_type=$null}
+  try {
+    $services=@(Get-CimInstance Win32_Service -Filter "Name='FDSecurityAgent'" -Property @('State','CheckPoint','WaitHint','ProcessId','ExitCode','ServiceSpecificExitCode') -ErrorAction Stop)
+    if($services.Count -ne 1){throw [InvalidOperationException]::new('service_record_count')}
+    $s=$services[0]
+    if([string]$s.State -notin @('Stopped','Start Pending','Stop Pending','Running','Continue Pending','Pause Pending','Paused','Unknown')){throw [InvalidOperationException]::new('service_state_outside_contract')}
+    $row.state=[string]$s.State
+    foreach($field in @(@('checkpoint','CheckPoint'),@('wait_hint_ms','WaitHint'),@('service_pid','ProcessId'),@('win32_exit_code','ExitCode'),@('service_exit_code','ServiceSpecificExitCode'))){
+      $number=$s.($field[1]);if($null -ne $number){$row[$field[0]]=[uint32]$number}
+    }
+    if($row.service_pid -gt 0){
+      try{$p=[Diagnostics.Process]::GetProcessById([int]$row.service_pid);try{$row.pid_birth_filetime=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}finally{$p.Dispose()}}
+      catch{$row.birth_exception_type=$_.Exception.GetType().FullName}
+    }
+  }catch{
+    $e=$_.Exception;$types=New-Object Collections.ArrayList
+    for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
+      $null=$types.Add($e.GetType().FullName)
+      if($e -is [ComponentModel.Win32Exception]){$row.native_error_code=$e.NativeErrorCode};$e=$e.InnerException
+    }
+    $row.exception_types=@($types);$row.hresult=$_.Exception.HResult
+  }
+  $line=$row|ConvertTo-Json -Depth 4 -Compress;$bytes=[Text.Encoding]::UTF8.GetByteCount($line)+2
+  if($written+$bytes -gt 16384){exit 2}
+  [Console]::Out.WriteLine($line);[Console]::Out.Flush();$written+=$bytes
+  if($clock.ElapsedMilliseconds -ge 45000){break};Start-Sleep -Milliseconds 1000
+}
+exit 0
+'@
+}
+function ServiceChildStatus($Child,$Value) {
+  $Value.terminal_known=$false;$Value.exit_known=$false;$Value.exit_code=$null
+  if($null -eq $Child){return $false}
+  try{
+    $Value.pid=$Child.Id
+    if($null -eq $Value.birth_filetime){$Value.birth_filetime=$Child.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()}
+    $Child.Refresh();$Value.terminal_known=[bool]$Child.HasExited
+    if($Value.terminal_known){$code=$Child.ExitCode;if($null -ne $code -and $code -is [int]){$Value.exit_known=$true;$Value.exit_code=$code}}
+  }catch{$Value.status_error=ServiceObserverError $_}
+  return ($Value.terminal_known -and $Value.exit_known -and $null -ne $Value.birth_filetime)
+}
+function ServiceRaw([string]$Path,[int]$Cap) {
+  # Reuse the existing stable, bounded byte owner; the digest is of these same
+  # bytes, rather than a second path read. No original product log is selected.
+  $raw=ReadOwnedBytes $Path $Cap
+  $null=[Text.UTF8Encoding]::new($false,$true).GetString($raw.bytes)
+  $sha=[Security.Cryptography.SHA256]::Create()
+  try{$digest=([BitConverter]::ToString($sha.ComputeHash($raw.bytes))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  return @{status='captured';bytes=$raw.length;sha256=$digest;base64=[Convert]::ToBase64String($raw.bytes);original_bytes_preserved=$true}
+}
+function FinishServiceObserver($Child,$Value,[string]$Stdout,[string]$Stderr,[int]$Cap,[switch]$Cancel,[switch]$Combined) {
+  $failed=$false
+  if($null -ne $Child -and $Cancel){
+    try{$Child.Refresh();if(-not $Child.HasExited){$Value.cancel_requested=$true;$Child.Kill();Need ($Child.WaitForExit(1000)) 'service_sampler_reap_unknown'}}
+    catch{$failed=$true;$Value.cleanup_error=ServiceObserverError $_}
+  }
+  if(-not (ServiceChildStatus $Child $Value)){$failed=$true}
+  $remaining=$Cap
+  foreach($stream in @('stdout','stderr')){
+    if(-not $Value.terminal_known){$Value[$stream]=@{status='not_captured';reason='owned_child_terminal_unknown'};continue}
+    try{
+      $path=if($stream -ceq 'stdout'){$Stdout}else{$Stderr};$limit=if($Combined){[Math]::Max(1,$remaining)}else{$Cap}
+      $capture=ServiceRaw $path $limit;Need (-not $Combined -or $capture.bytes -le $remaining) 'service_combined_raw_cap'
+      $Value[$stream]=$capture;if($Combined){$remaining-=$capture.bytes}
+    }
+    catch{$failed=$true;$Value[$stream]=@{status='capture_failed';error=(ServiceObserverError $_)}}
+  }
+  return $failed
+}
+function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label) {
+  $worker=Join-Path $script:root ($Label+'.service.ps1');$stdout=Join-Path $script:root ($Label+'.service.stdout.log');$stderr=Join-Path $script:root ($Label+'.service.stderr.log')
+  $value=@{label=$Label;action=$Action;phase='prepare';started_at_utc=[DateTime]::UtcNow.ToString('o');worker_source_sha256=$null;primary_failure=$null;worker=@{pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null};sampler=@{requested=$false;pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null}}
+  $null=$script:serviceActionDiagnostics.Add($value)
+  $owned=$null;$sampler=$null;$samplerOut=$null;$samplerErr=$null;$primary=$false;$observerFailed=$false;$clock=[Diagnostics.Stopwatch]::StartNew()
+  try{
+    Need (-not (Test-Path -LiteralPath $worker)) 'service_worker_exists'
+    [IO.File]::WriteAllText($worker,(ServiceWorkerSource $Action),[Text.UTF8Encoding]::new($false));$value.worker_source_sha256=SHA $worker
+    if($Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){
+      $value.sampler.requested=$true
+      $samplerScript=Join-Path $script:root ($Label+'.service-sampler.ps1');$samplerOut=Join-Path $script:root ($Label+'.service-sampler.stdout.log');$samplerErr=Join-Path $script:root ($Label+'.service-sampler.stderr.log')
+      try{
+        Need (-not (Test-Path -LiteralPath $samplerScript)) 'service_sampler_exists'
+        [IO.File]::WriteAllText($samplerScript,(ServiceSamplerSource),[Text.UTF8Encoding]::new($false));$value.sampler.source_sha256=SHA $samplerScript
+        $sampler=StartWindowsPowerShellChild $samplerScript $samplerOut $samplerErr
+        $null=ServiceChildStatus $sampler $value.sampler
+      }catch{$observerFailed=$true;$value.sampler.launch_error=ServiceObserverError $_}
+    }
+    $value.phase='launch_action'
+    $owned=StartWindowsPowerShellChild $worker $stdout $stderr
+    $null=ServiceChildStatus $owned $value.worker
+    $value.phase='wait_action_45';$value.wait_started_at_utc=[DateTime]::UtcNow.ToString('o');$waitClock=[Diagnostics.Stopwatch]::StartNew()
+    try{$code=WaitProcess $owned 45 'service_control_unknown_no_retry'}finally{$value.wait_elapsed_ms=$waitClock.ElapsedMilliseconds;$value.wait_finished_at_utc=[DateTime]::UtcNow.ToString('o')}
+    Need ($null -ne $code -and $code -is [int]) 'service_control_exit_unknown'
+    Need ($code -eq 0) 'service_control_failed'
+    $value.phase='action_returned'
+  }catch{$primary=$true;$value.primary_failure=ServiceObserverError $_;throw}
+  finally{
+    if($value.sampler.requested){
+      try{if(FinishServiceObserver $sampler $value.sampler $samplerOut $samplerErr 16384 -Cancel -Combined){$observerFailed=$true}}
+      catch{$observerFailed=$true;$value.sampler.observer_error=ServiceObserverError $_}
+    }
+    try{if(FinishServiceObserver $owned $value.worker $stdout $stderr 4096){$observerFailed=$true}}
+    catch{$observerFailed=$true;$value.worker.observer_error=ServiceObserverError $_}
+    $value.elapsed_ms=$clock.ElapsedMilliseconds;$value.finished_at_utc=[DateTime]::UtcNow.ToString('o');$value.observer_complete=(-not $observerFailed)
+    if(-not $primary -and $observerFailed){throw 'service_action_diagnostic_incomplete'}
+  }
+}
+
 function ConfigBinding {
   $path=Regular $script:configPath 131072
   Need ((SHA $path) -ceq $script:configSha256) 'fixture_configuration_hash_changed'
@@ -378,6 +522,7 @@ foreach ($stage in @($baseline,$target)) {
 }
 $completed=$false;$mainPrimaryFailure=$false
 $transitionDiagnostics=New-Object Collections.ArrayList
+$serviceActionDiagnostics=New-Object Collections.ArrayList
 try {
   $temp=Join-Path $root 'seed-temp';New-Item -ItemType Directory -Path $temp | Out-Null
   $oldTemp=$env:TEMP;$oldTmp=$env:TMP
@@ -448,6 +593,6 @@ try {
   Transition 'repair' 'normal-headless-repair' $false $newUpdater
   $completed=$true
 } catch {$mainPrimaryFailure=$true;throw} finally {
-  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics)} $mainPrimaryFailure | Out-Null
+  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics);service_action_diagnostics=@($serviceActionDiagnostics)} $mainPrimaryFailure | Out-Null
 }
 Need $completed 'recovery_subset_incomplete'

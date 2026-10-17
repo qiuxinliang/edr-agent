@@ -14,7 +14,7 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_changed'}
-$wanted=@('Need','Regular','SHA','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary')
+$wanted=@('Need','Regular','SHA','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction')
 $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
 if ($functions.Count -ne $wanted.Count) {throw 'function_inventory'}
 # Only these source-owned function definitions are loaded, never driver top-level.
@@ -210,5 +210,90 @@ try {
     }catch{$primaryCaught=$_.Exception.Message}
     Checked ($primaryCaught -ceq 'public-original-primary') 'summary_failure_replaced_primary'
   }finally{Invoke-Expression $originalSave}
+  # Service observers: only public temporary files and fake exact-owned child
+  # objects. StartWindowsPowerShellChild is shadowed; no generated SCM script runs.
+  $script:serviceMock='';$script:serviceMockId=2147483000;$script:serviceWaits=New-Object Collections.ArrayList
+  function ServiceMockChild([string]$Role) {
+    $script:serviceMockId++
+    $v=[pscustomobject]@{Id=$script:serviceMockId;StartTime=[DateTime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime();HasExited=$false;ExitCode=$null;Role=$Role;Killed=$false;WaitCount=0}
+    $v | Add-Member ScriptMethod Refresh {}
+    $v | Add-Member ScriptMethod Kill {
+      if($this.Role -ceq 'sampler' -and $script:serviceMock -ceq 'timeout_and_sampler_cleanup'){throw [IO.IOException]::new('public-cleanup-error')}
+      $this.Killed=$true;$this.HasExited=$true;$this.ExitCode=[int]-1
+    }
+    $v | Add-Member ScriptMethod WaitForExit {
+      param($Ms)
+      $null=$script:serviceWaits.Add([int]$Ms);$this.WaitCount++
+      if($this.Role -ceq 'worker'){
+        if($script:serviceMock -ceq 'timeout_and_sampler_cleanup' -and $this.WaitCount -eq 1){return $false}
+        $this.HasExited=$true
+        if(-not $this.Killed){$this.ExitCode=if($script:serviceMock -ceq 'nonzero'){[int]7}elseif($script:serviceMock -ceq 'null_exit'){$null}else{[int]0}}
+      }
+      return $true
+    }
+    return $v
+  }
+  function StartWindowsPowerShellChild([string]$ScriptPath,[string]$StandardOutput,[string]$StandardError) {
+    $role=if($ScriptPath.EndsWith('.service-sampler.ps1',[StringComparison]::Ordinal)){'sampler'}else{'worker'}
+    if($role -ceq 'sampler' -and $script:serviceMock -ceq 'sampler_launch'){throw [InvalidOperationException]::new('public-launch-error')}
+    $public=if($role -ceq 'sampler'){'{"schema":"edr.service-scm-sample.v1","state":"Unknown"}'}else{'{"schema":"edr.service-action.phase.v1","phase":"completed","state":""}'}
+    if($role -ceq 'worker' -and $script:serviceMock -ceq 'oversize'){$public='x'*4097}
+    [IO.File]::WriteAllText($StandardOutput,$public,[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllBytes($StandardError,[byte[]]@())
+    return (ServiceMockChild $role)
+  }
+  function ServiceCase([string]$Mode) {
+    $script:serviceMock=$Mode;$script:serviceWaits=New-Object Collections.ArrayList
+    $script:root=Join-Path $dir ('service-'+$Mode);New-Item -ItemType Directory -Path $script:root | Out-Null
+    $script:serviceActionDiagnostics=New-Object Collections.ArrayList
+  }
+  foreach($action in @('Stop','Start','stop')){
+    $body=ServiceWorkerSource $action;$pt=$null;$pe=$null
+    $null=[Management.Automation.Language.Parser]::ParseInput($body,[ref]$pt,[ref]$pe)
+    Checked (@($pe).Count -eq 0 -and $body.Contains("Get-Service -Name FDSecurityAgent -ErrorAction Stop") -and $body.Contains("[TimeSpan]::FromSeconds(30)")) 'worker_source_parse_and_fixed_owner'
+  }
+  $samplerSource=ServiceSamplerSource;$pt=$null;$pe=$null
+  $samplerAst=[Management.Automation.Language.Parser]::ParseInput($samplerSource,[ref]$pt,[ref]$pe)
+  Checked (@($pe).Count -eq 0 -and $samplerSource.Contains('$i -lt 46') -and $samplerSource.Contains('16384') -and $samplerSource.Contains("Name='FDSecurityAgent'")) 'sampler_source_bounds_and_parse'
+  # Execute only the source-owned nullable scalar loop, with no CIM invocation.
+  $nullable=@($samplerAst.FindAll({param($n) $n -is [Management.Automation.Language.ForEachStatementAst] -and $n.Variable.VariablePath.UserPath -ceq 'field'},$true))
+  if($nullable.Count -ne 1){throw 'sampler_nullable_loop_inventory'}
+  $row=@{checkpoint=$null;wait_hint_ms=$null;service_pid=$null;win32_exit_code=$null;service_exit_code=$null}
+  $s=[pscustomobject]@{CheckPoint=$null;WaitHint=$null;ProcessId=$null;ExitCode=$null;ServiceSpecificExitCode=$null}
+  Invoke-Expression $nullable[0].Extent.Text
+  Checked ($null -eq $row.checkpoint -and $null -eq $row.wait_hint_ms -and $null -eq $row.service_pid -and $null -eq $row.win32_exit_code -and $null -eq $row.service_exit_code) 'nullable_scm_fields_not_zero'
+  $s=[pscustomobject]@{CheckPoint=0;WaitHint=1000;ProcessId=0;ExitCode=5;ServiceSpecificExitCode=0}
+  Invoke-Expression $nullable[0].Extent.Text
+  Checked ($row.checkpoint -eq 0 -and $row.wait_hint_ms -eq 1000 -and $row.service_pid -eq 0 -and $row.win32_exit_code -eq 5 -and $row.service_exit_code -eq 0) 'observed_scm_zero_and_nonzero_preserved'
+  try{throw [ComponentModel.Win32Exception]::new(5,'private-error-not-exported')}catch{$typed=ServiceObserverError $_}
+  Checked ($typed.native_error_code -eq 5 -and ($typed|ConvertTo-Json -Compress) -notmatch 'private-error-not-exported') 'native_error_actual_chain_only'
+  try{throw [IO.IOException]::new('private-error-not-exported')}catch{$typed=ServiceObserverError $_}
+  Checked ($null -eq $typed.native_error_code) 'native_error_not_invented'
+  ServiceCase 'normal';ServiceAction 'Stop' 'health-failed-upgrade-health-stop'
+  $v=$serviceActionDiagnostics[0]
+  Checked ($serviceWaits[0] -eq 45000 -and $v.worker.terminal_known -and $v.worker.exit_known -and $v.worker.exit_code -eq 0 -and $v.sampler.cancel_requested -and $v.sampler.terminal_known -and $v.observer_complete) 'observed_stop_exact_wait_and_sampler_cleanup'
+  $bytes=[Convert]::FromBase64String($v.worker.stdout.base64);$sha=[Security.Cryptography.SHA256]::Create()
+  try{$digest=([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  Checked ($bytes.Length -eq $v.worker.stdout.bytes -and $digest -ceq $v.worker.stdout.sha256 -and $v.worker.stdout.original_bytes_preserved) 'service_raw_same_bytes_hash'
+  ServiceCase 'repair';ServiceAction 'Start' 'repair-start'
+  Checked (-not $serviceActionDiagnostics[0].sampler.requested -and $serviceWaits.Count -eq 1 -and $serviceWaits[0] -eq 45000) 'repair_no_sampler_or_extra_control'
+  ServiceCase 'nonzero';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_control_failed'
+  Checked ($serviceActionDiagnostics[0].worker.exit_known -and $serviceActionDiagnostics[0].worker.exit_code -eq 7) 'service_nonzero_recorded'
+  ServiceCase 'null_exit';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_control_exit_unknown'
+  Checked ($serviceActionDiagnostics[0].worker.terminal_known -and -not $serviceActionDiagnostics[0].worker.exit_known) 'service_null_not_pass'
+  ServiceCase 'timeout_and_sampler_cleanup';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_control_unknown_no_retry'
+  $v=$serviceActionDiagnostics[0]
+  Checked ($serviceWaits[0] -eq 45000 -and $serviceWaits[1] -eq 10000 -and $null -ne $v.sampler.cleanup_error -and $v.sampler.stdout.status -ceq 'not_captured' -and $null -ne $v.primary_failure) 'cleanup_failure_preserves_primary_and_no_live_read'
+  ServiceCase 'sampler_launch';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_action_diagnostic_incomplete'
+  Checked ($serviceActionDiagnostics[0].worker.exit_code -eq 0 -and $null -ne $serviceActionDiagnostics[0].sampler.launch_error) 'sampler_launch_unknown_not_pass'
+  ServiceCase 'oversize';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_action_diagnostic_incomplete'
+  Checked ($serviceActionDiagnostics[0].worker.stdout.status -ceq 'capture_failed') 'worker_raw_cap_hard_failure'
+  $rawOut=Join-Path $dir 'public-sampler-out';$rawErr=Join-Path $dir 'public-sampler-err'
+  [IO.File]::WriteAllText($rawOut,('a'*16000),[Text.UTF8Encoding]::new($false));[IO.File]::WriteAllText($rawErr,('b'*500),[Text.UTF8Encoding]::new($false))
+  $s=ServiceMockChild 'sampler';$s.HasExited=$true;$s.ExitCode=[int]0
+  $v=@{pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null}
+  $failed=FinishServiceObserver $s $v $rawOut $rawErr 16384 -Combined
+  Checked ($failed -and $v.stdout.bytes -eq 16000 -and $v.stderr.status -ceq 'capture_failed' -and -not $v.stderr.ContainsKey('base64')) 'sampler_combined_cap_no_extra_raw'
+  [IO.File]::WriteAllBytes($rawOut,[byte[]]@(255))
+  FailsType {ServiceRaw $rawOut 4096} ([Text.DecoderFallbackException])
   Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false native_child_executed=false')
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}
