@@ -60,6 +60,31 @@ on:
         required: false
         default: 1
         type: number
+      cache_recovery_subset:
+        description: 'Manual disposable exact 692-to-695 cache subset only; default keeps the existing lifecycle gate'
+        required: false
+        default: false
+        type: boolean
+      backend_builder_base64:
+        description: 'Subset only: original backend builder canonical base64; fixed SHA695c9a0d'
+        required: false
+        default: ''
+        type: string
+      handler_verification_json:
+        description: 'Subset only: actual original-handler verification; NOT platform HTTP authentication'
+        required: false
+        default: ''
+        type: string
+      handler_verification_sha256:
+        description: 'Subset only: exact original-handler verification UTF8 SHA256'
+        required: false
+        default: ''
+        type: string
+      higher_min_free_bytes:
+        description: 'Subset only: optional explicit higher floor; 0 uses actual native owner plus manifest minimum'
+        required: false
+        default: '0'
+        type: string
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -76,6 +101,7 @@ concurrency:
 
 jobs:
   native-lifecycle:
+    if: ${{ !inputs.cache_recovery_subset }}
     strategy:
       fail-fast: false
       matrix:
@@ -556,3 +582,144 @@ jobs:
             release-metadata
           if-no-files-found: warn
           retention-days: 7
+
+  recover-synthetic-owner:
+    if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && github.repository == 'qiuxinliang/edr-agent'
+    permissions:
+      contents: read
+      actions: read
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate fixed manual cache recovery cohort
+        env:
+          RECOVERY_TARGET_TAG: ${{ inputs.target_tag }}
+          RECOVERY_BASELINE_TAG: ${{ inputs.baseline_tag }}
+          RECOVERY_PACKAGE_SCOPE: ${{ inputs.package_scope }}
+          RECOVERY_ARCHITECTURE: ${{ inputs.architecture }}
+        run: |
+          if ($env:RECOVERY_TARGET_TAG -cne 'win_3.2.695' -or $env:RECOVERY_BASELINE_TAG -cne 'win_3.2.692' -or $env:RECOVERY_PACKAGE_SCOPE -cne 'headless' -or $env:RECOVERY_ARCHITECTURE -cne 'arm64') { throw 'Manual cache recovery requires exact 695/692 Headless ARM64 cohort' }
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: qiuxinliang/edr-agent
+          ref: 694a4f47cfd55a7c98f8dab62617520c0c6251b1
+          path: canonical-agent
+          persist-credentials: false
+      - name: Verify exact source, syntax, and pure helper contracts
+        env:
+          EDR_RECOVERY_NATIVE_STAGE_OWNER: ${{ github.workspace }}/canonical-agent/scripts/stage_retention_native_tools.py
+        run: |
+          $sha = (git -C canonical-agent rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sha -cne '694a4f47cfd55a7c98f8dab62617520c0c6251b1') { throw 'Pinned Agent checkout mismatch' }
+          git -C canonical-agent diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'Agent source changed' }
+          $errors=$null;$tokens=$null
+          [Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'tests/cache-recovery/windows_cache_recovery_ci.ps1'),[ref]$tokens,[ref]$errors) | Out-Null
+          if (@($errors).Count) { throw 'Recovery driver PowerShell parse failed' }
+          $driver=Join-Path $PWD 'tests/cache-recovery/windows_cache_recovery_ci.ps1'
+          $driverSha=(Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
+          & (Join-Path $PWD 'tests/cache-recovery/test_recovery_driver_contracts.ps1') -DriverSource $driver -DriverSha256 $driverSha
+          if (-not $?) { throw 'Pure driver function contracts failed' }
+          python -I -B tests/cache-recovery/test_cache_recovery_snapshot.py
+          if ($LASTEXITCODE -ne 0) { throw 'Read-only synthetic snapshot/native-manifest checks failed' }
+          python -I -B tests/cache-recovery/test_prepare_disposable_695.py
+          if ($LASTEXITCODE -ne 0) { throw 'Preparation negative contracts failed' }
+          python -I -B tests/cache-recovery/test_collect_recovery_artifacts.py
+          if ($LASTEXITCODE -ne 0) { throw 'Private QA collector bounds/identity contracts failed' }
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Bind original-handler verification and prepare exact published inputs
+        timeout-minutes: 20
+        env:
+          # Same-repository read token only. A missing scope/403 is terminal;
+          # no PAT, cross-repository token, fallback or permission expansion.
+          GH_TOKEN: ${{ github.token }}
+          P5_BACKEND_OWNER_BASE64: ${{ inputs.backend_builder_base64 }}
+          P5_HANDLER_VERIFICATION_JSON: ${{ inputs.handler_verification_json }}
+          P5_HANDLER_VERIFICATION_SHA256: ${{ inputs.handler_verification_sha256 }}
+          P5_HIGHER_MIN_FREE_BYTES: ${{ inputs.higher_min_free_bytes }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('edr-private-p5-recovery-'+[guid]::NewGuid().ToString('N'))
+          "EDR_PRIVATE_RECOVERY_PREP=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "EDR_PRIVATE_RECOVERY_METADATA=$(Join-Path $env:RUNNER_TEMP ('uncreated-recovery-metadata-'+[guid]::NewGuid().ToString('N')))" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          python -I -B tests/cache-recovery/prepare_disposable_695.py prepare --workspace "$PWD" --output "$root"
+          if ($LASTEXITCODE -ne 0) { throw 'Preparation failed; no fallback, retry, scope change or recovery launch' }
+      - name: Run original stdlib builder by file-list overlay and require original-handler P5 SHA
+        timeout-minutes: 3
+        env:
+          GOPROXY: 'off'
+          GOSUMDB: 'off'
+          GOTOOLCHAIN: local
+          GO111MODULE: 'off'
+          GOWORK: 'off'
+          CGO_ENABLED: '0'
+        run: |
+          $env:EDR_P5_EXPORT_OWNER=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'source-owner/full_installer.go'
+          $virtual=Join-Path (Split-Path $env:EDR_P5_EXPORT_OWNER -Parent) 'zz_private_695_p5_export_test.go'
+          $env:EDR_P5_EXPORT_BINDING=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'p5-binding.json'
+          $env:EDR_P5_EXPORT_BINDING_SHA256=(Get-FileHash $env:EDR_P5_EXPORT_BINDING -Algorithm SHA256).Hash.ToLowerInvariant()
+          go test -overlay (Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'overlay.json') $env:EDR_P5_EXPORT_OWNER $virtual -run '^TestPrivateP5Export695$' -count=1 -timeout=30s -v
+          if ($LASTEXITCODE -ne 0) { throw 'Original builder/preflight SHA gate failed; no recovery launch' }
+          python -I -B tests/cache-recovery/prepare_disposable_695.py finalize --workspace "$PWD" --output "$env:EDR_PRIVATE_RECOVERY_PREP"
+          if ($LASTEXITCODE -ne 0) { throw 'Original builder output binding failed' }
+      - name: Execute only disposable local rollback and normal repair subset
+        run: |
+          $binding=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'recovery-input.json'
+          $sha=(Get-FileHash $binding -Algorithm SHA256).Hash.ToLowerInvariant()
+          $before=@(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'edr-cache-recovery-*' | ForEach-Object FullName)
+          try {
+            & (Join-Path $PWD 'tests/cache-recovery/windows_cache_recovery_ci.ps1') -InputJson $binding -InputSha256 $sha
+            if ($LASTEXITCODE -ne 0) { throw 'Disposable recovery subset failed or unknown' }
+          } finally {
+            $fresh=@(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory -Filter 'edr-cache-recovery-*' | Where-Object {$_.FullName -notin $before})
+            if ($fresh.Count -eq 1 -and ($fresh[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+              $summary=Join-Path $fresh[0].FullName 'recovery-subset-summary.json'
+              if (Test-Path -LiteralPath $summary -PathType Leaf) {
+                $meta=Get-Content -Raw -LiteralPath $summary | ConvertFrom-Json -ErrorAction Stop
+                if ($meta.input_sha256 -cne $sha) { throw 'Recovery metadata owner binding mismatch' }
+                "EDR_PRIVATE_RECOVERY_METADATA=$($fresh[0].FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              }
+            }
+          }
+      - name: Freeze fixed synthetic transition raw evidence and hashes
+        id: collect-cache-qa
+        if: always()
+        timeout-minutes: 2
+        run: |
+          if ($env:EDR_PRIVATE_RECOVERY_PREP -and $env:EDR_PRIVATE_RECOVERY_METADATA) {
+            $binding=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'recovery-input.json'
+            if ((Test-Path -LiteralPath $binding -PathType Leaf) -and (Test-Path -LiteralPath $env:EDR_PRIVATE_RECOVERY_METADATA -PathType Container)) {
+              $sha=(Get-FileHash -LiteralPath $binding -Algorithm SHA256).Hash.ToLowerInvariant()
+              $qa=Join-Path $env:RUNNER_TEMP ('edr-cache-recovery-qa-'+[guid]::NewGuid().ToString('N'))
+              python -I -B tests/cache-recovery/collect_recovery_artifacts.py --source "$env:EDR_PRIVATE_RECOVERY_METADATA" --binding "$binding" --binding-sha256 "$sha" --output "$qa"
+              if ($LASTEXITCODE -ne 0) { throw 'Private CI fixture raw evidence collection failed; no unverified files uploaded' }
+              "directory=$qa" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              'available=true' | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            } else {
+              'available=false' | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Output 'No bound recovery fixture observed; no source directory exported'
+            }
+          } else {
+            'available=false' | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Output 'Preparation did not establish a bound recovery fixture; no source directory exported'
+          }
+      - name: Retain bounded synthetic transition raw evidence, never Agent data
+        if: always() && steps.collect-cache-qa.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: disposable-cache-recovery-695-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: ${{ steps.collect-cache-qa.outputs.directory }}
+# Manual subset does not register/promote packages, upload Release assets, use
+# platform API auth, migrate real data, or claim the immutable 695 clock fixed.

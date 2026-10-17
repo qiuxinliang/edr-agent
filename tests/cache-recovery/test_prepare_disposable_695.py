@@ -1,0 +1,105 @@
+"""Pure local negative checks; no GitHub, installer, Agent or real receipt."""
+import importlib.util
+import base64
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+SPEC=importlib.util.spec_from_file_location('prepare',Path(__file__).with_name('prepare_disposable_695.py'))
+M=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(M)
+class Contracts(unittest.TestCase):
+    def response(self):
+        return {'code':'OK','message':'synthetic only','data':{'valid':True,'upgradeReady':True,'upgradeBlockers':[],
+          'version':'3.2.695','arch':'arm64','platform':'windows','binarySha256':'a'*64,'signatureMode':'unsigned_integrity',
+          'trustedSigner':False,'policySnapshot':'optional-signing-v1','packages':[{'packageType':'headless','sha256':'b'*64},{'packageType':'full_installer','sha256':'c'*64}]}}
+    def verification(self):
+        response=json.dumps(self.response())
+        return {'schema':'edr.ci-original-handler-verification.v1','origin':'ci_original_handler_verification',
+          'authenticated_platform_http':False,'verification_passed':True,'source_sha':M.SOURCE,'target_release_run':M.TARGET_RUN,
+          'version':'3.2.695','arch':'arm64','handler_owner_sha256':M.HANDLER_SHA,'builder_owner_sha256':M.BUILDER_SHA,
+          'binary_sha256':'a'*64,'headless_sha256':'b'*64,'manifest_sha256':'d'*64,'preflight_response_utf8':response,
+          'preflight_response_sha256':M.digest(response.encode()),'p5_sha256':'c'*64,'db_or_artifactstore_written':False,
+          'evidence_cache_opened':False,'product_binaries_executed':False}
+    def check_verification(self,value):
+        raw=json.dumps(value);return M.verified_handler_receipt(raw,M.digest(raw.encode()))
+    def test_fixed_original_handler_scope(self):
+        v,raw,d,p=self.check_verification(self.verification())
+        self.assertIs(v['authenticated_platform_http'],False);self.assertEqual(p['full_installer'],'c'*64)
+    def test_raw_http_response_is_not_handler_verification(self):
+        with self.assertRaisesRegex(ValueError,'scope_required'):self.check_verification(self.response())
+    def test_changed_verification_scope_or_identity_rejected(self):
+        for key,value in [('origin','authenticated_http'),('authenticated_platform_http',True),('verification_passed',False),
+            ('source_sha','0'*40),('target_release_run','0'),('handler_owner_sha256','0'*64),('builder_owner_sha256','0'*64),
+            ('db_or_artifactstore_written',True),('evidence_cache_opened',True),('product_binaries_executed',True),
+            ('preflight_response_sha256','0'*64),('p5_sha256','0'*64),('binary_sha256','0'*64),('unexpected',True)]:
+            v=self.verification();v[key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):self.check_verification(v)
+    def test_receipt_pin_required(self):
+        raw=json.dumps(self.verification())
+        with self.assertRaisesRegex(ValueError,'receipt_pin_required'):M.verified_handler_receipt(raw,'0'*64)
+    def test_builder_carrier_roundtrip_only(self):
+        # Synthetic carrier tests do not recreate the business builder.
+        raw=b'public synthetic carrier';encoded=base64.b64encode(raw).decode()
+        with patch.object(M,'BUILDER_SHA',M.digest(raw)):
+            self.assertEqual(M.verified_builder_input(encoded),raw)
+            for bad in [encoded+'\n',encoded[:-1],encoded+'=', 'non-ascii-\u00ff']:
+                with self.subTest(value=bad),self.assertRaises(ValueError):M.verified_builder_input(bad)
+        with self.assertRaisesRegex(ValueError,'fixed_original_builder_sha_required'):M.verified_builder_input(encoded)
+    def test_owner_rejected_before_io(self):
+        v=json.dumps(self.verification())
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('must not call GitHub')):
+            target=Path(d)/'new'
+            with self.assertRaisesRegex(ValueError,'base64_required'):M.prepare(Path(d),target,v,M.digest(v.encode()),'1','')
+            self.assertFalse(target.exists())
+    def test_synthetic_receipt_parser_only(self):
+        d,p=M.verified_preflight(json.dumps(self.response()).encode());self.assertEqual(p['full_installer'],'c'*64)
+    def test_incomplete_receipt_rejected(self):
+        for key,value in [('valid',False),('upgradeReady',False),('upgradeBlockers',['synthetic blocker']),('policySnapshot','required-signing-v1'),('arch','amd64')]:
+            j=self.response();j['data'][key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):M.verified_preflight(json.dumps(j).encode())
+    def test_duplicate_json_key_rejected(self):
+        with self.assertRaisesRegex(ValueError,'duplicate_json_key'):M.strict_json(b'{"code":"OK","code":"OK"}')
+    def test_unbound_before_any_io_or_directory_creation(self):
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('network must not run')):
+            target=Path(d)/'new'
+            with self.assertRaisesRegex(ValueError,'original_handler_receipt_pin_required'):M.prepare(Path(d),target,'UNBOUND','UNBOUND','1','UNBOUND')
+            self.assertFalse(target.exists())
+    def test_stdout_cap(self):
+        with self.assertRaisesRegex(ValueError,'output_bound'):M.bounded_process([sys.executable,'-c','print("x"*100)'],10,2)
+    def test_timeout_no_retry(self):
+        with self.assertRaisesRegex(ValueError,'timeout_no_retry'):M.bounded_process([sys.executable,'-c','import time;time.sleep(5)'],100,.05)
+    def test_403_never_prints_raw_stderr(self):
+        with self.assertRaisesRegex(ValueError,'github_failed_403_no_retry_or_scope_expansion')as c:
+            M.bounded_process([sys.executable,'-c','import sys;sys.stderr.write("HTTP 403 fake-private-token");sys.exit(1)'],100,2)
+        self.assertNotIn('fake-private-token',str(c.exception))
+    def test_no_fallback_after_missing_actions_read(self):
+        with patch.object(M,'gh',side_effect=ValueError('read_only_github_failed_403_no_retry_or_scope_expansion'))as call:
+            with self.assertRaisesRegex(ValueError,'403'):M.native_tools(Path('/unused'),None,None)
+            self.assertEqual(call.call_count,1)
+    def test_manual_workflow_scope(self):
+        workflow=Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml'
+        full=workflow.read_text();text=full[full.index('  recover-synthetic-owner:'): ]
+        self.assertIn('    permissions:\n      contents: read\n      actions: read\n',text)
+        self.assertIn('  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset }}',full)
+        self.assertIn('inputs.cache_recovery_subset == true',text)
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && github.repository == 'qiuxinliang/edr-agent'",text)
+        self.assertIn('runs-on: windows-11-arm',text);self.assertIn('timeout-minutes: 90',text)
+        self.assertNotIn('secrets.',text);self.assertNotIn('write-all',text)
+        self.assertIn('GH_TOKEN: ${{ github.token }}',text)
+        for item in ('backend_builder_base64','handler_verification_json','handler_verification_sha256','higher_min_free_bytes'):
+            self.assertIn('${{ inputs.'+item+' }}',text)
+        # Dispatch data is passed through env, never concatenated as shell source.
+        in_run=False
+        for line in text.splitlines():
+            if line.startswith('        run: |'):in_run=True;continue
+            if in_run and line and not line.startswith('          '):in_run=False
+            if in_run:self.assertNotIn('${{ inputs.',line)
+        self.assertIn("'source-owner/full_installer.go'",text)
+        self.assertIn("'zz_private_695_p5_export_test.go'",text)
+        self.assertIn('retention-days: 7',text)
+    def test_binary_bytes_unchanged(self):
+        raw=M.bounded_process([sys.executable,'-c','import sys;sys.stdout.buffer.write(bytes([0,255,0,10]))'],4,2)
+        self.assertEqual(raw,bytes([0,255,0,10]))
+if __name__=='__main__':unittest.main(verbosity=2)
