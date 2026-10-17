@@ -210,6 +210,31 @@ failed. Post-write accounting-query failures also now retain their storage
 cause instead of being misreported as capacity; real SQLite authorization-fault
 tests exercise rollback and successful recovery through both producer entries.
 
+The follow-up native run `38990743328`, source `6a777afa`, also failed the
+original sliced-admission assertion. AMD64 diagnostics identified a rejection
+before the candidate transaction: 319 allocated pages, 258 free pages and
+249,856 live bytes were unchanged, with zero WAL and no clock failure. The
+53,852 microsecond owner call is measured wall time; the active-clock increment
+is not a commit-duration measurement. Normal cache synchronization is NORMAL,
+not the separate PMFE FULL path.
+
+A host counterfactual delays only the final admission call's actual main-DB
+`xSync` by 30 ms and retains its real filesystem result. The unchanged assertion
+fails before the fix with the same no-progress/pre-transaction signature.
+Synchronous maintenance had discarded an existing reclaim continuation, then
+could spend its cooperative 20 ms slice on optional TTL/clock work and a
+checkpoint before reaching reclamation.
+
+The repair prioritizes exactly one existing pending reclaim operation, up to
+256 pages, before that optional work and returns. It neither resets the deadline
+nor loops, changes a cap, retires a live owner or bypasses physical admission.
+Its helper now propagates the existing precise failure to admission. A single
+SQLite statement can still exceed the cooperative time slice. Slow-checkpoint
+and ordinary three-format fixtures pass on the host with their original
+assertions; synchronous writer/reader failure fixtures preserve owner hashes,
+report refusal, retain the minute backoff and recover after bounded polls.
+Windows gates and UTM execution must be reported separately for the new commit.
+
 At this source commit, host checks and short real-clock smoke runs are
 available; native Windows CI, the two-window UTM load and isolated recovery
 results are still pending and must be appended as separate acceptance evidence.

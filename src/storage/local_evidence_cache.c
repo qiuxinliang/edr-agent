@@ -5847,8 +5847,9 @@ done:
 
 /* Called under the owner lock, once per preprocess turn. The caller releases
  * the lock and returns to event processing before any subsequent slice. */
-static void sqlite_maintenance_reclaim_poll(void) {
+static int sqlite_maintenance_reclaim_poll(void) {
   sqlite3_stmt *st = NULL;
+  int result = 0;
   unsigned pages = s_maintenance_reclaim_pages < 256u
                        ? s_maintenance_reclaim_pages : 256u;
   int rc = sqlite3_prepare_v2(s_db, "PRAGMA freelist_count;", -1, &st, NULL);
@@ -5874,6 +5875,7 @@ static void sqlite_maintenance_reclaim_poll(void) {
   }
   goto finish;
 failed:
+  result = -1;
   /* Restart from a fresh maintenance cycle after the existing minute backoff.
    * A delayed slice must not turn failure into a per-event retry loop. */
   s_maintenance_reclaim_pages = 0u;
@@ -5883,16 +5885,29 @@ finish:
   (void)sqlite3_db_release_memory(s_db);
   (void)sqlite3_release_memory(0);
   refresh_db_size_status();
+  return result;
 }
 
 static int sqlite_maintenance(int defer_reclaim) {
+  unsigned pending_reclaim_pages = s_maintenance_reclaim_pages;
   s_maintenance_reclaim_pages = 0u;
   if (!s_db) { set_error("maintenance database unavailable"); return -1; }
   EvidenceMaintenanceSlice slice={evidence_cache_clock_ns()+20000000ULL,
       4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
   s_status.maintenance_runs++;
   if (!sqlite_database_write_allow(slice.bytes_left)) return -1;
-  int result = sqlite_flush_metrics_slice(0,&slice);
+  int result = 0;
+  /* Admission may take over an already scheduled reclaim slice. Consume at
+   * most that one existing 256-page operation before optional TTL/clock writes
+   * and their checkpoint can exhaust this turn's cooperative deadline. The
+   * reclaim helper performs its own guarded checkpoint; never start a second
+   * slice here. Free-page reclamation does not retire an evidence owner. */
+  if (!defer_reclaim && pending_reclaim_pages != 0u) {
+    s_maintenance_reclaim_pages = pending_reclaim_pages;
+    if (sqlite_maintenance_yield(&slice)) goto finish;
+    return sqlite_maintenance_reclaim_poll();
+  }
+  result = sqlite_flush_metrics_slice(0,&slice);
   if (result != 0) goto failed;
   sqlite3_int64 cutoff = now_unix_ns() - (int64_t)s_status.retention_hours * 3600LL * 1000000000LL;
   sqlite3_int64 cutoff_minute = (cutoff / 1000000000LL) / 60LL;
@@ -5941,7 +5956,8 @@ static int sqlite_maintenance(int defer_reclaim) {
       s_maintenance_reclaim_pages=4096u;
       /* One current 256-page reclamation statement, then later owner polls.
        * Startup/admission obey the same bound and may reject until it drains. */
-      if(!defer_reclaim && !sqlite_maintenance_yield(&slice)) sqlite_maintenance_reclaim_poll();
+      if(!defer_reclaim && !sqlite_maintenance_yield(&slice) &&
+          sqlite_maintenance_reclaim_poll()!=0) goto failed;
     }
   } else if(!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_PASSIVE)!=0) goto failed;
   goto finish;
@@ -8366,7 +8382,7 @@ void edr_local_evidence_cache_poll_maintenance(void) {
   evidence_cache_lock();
 #if defined(EDR_HAVE_SQLITE)
   if (s_db && s_maintenance_reclaim_pages != 0u) {
-    sqlite_maintenance_reclaim_poll();
+    (void)sqlite_maintenance_reclaim_poll();
     evidence_cache_unlock();
     return;
   }

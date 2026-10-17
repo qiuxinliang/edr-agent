@@ -7402,6 +7402,7 @@ static sqlite3_vfs *retention_bench_vfs_parent;
 static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_syncs;
 static int retention_raise_floor_on_write;
 static unsigned retention_checkpoint_delay_ms;
+static uint64_t retention_delayed_checkpoint_syncs;
 #define BENCH_FILE(f) (((RetentionBenchFile *)(f))->real)
 static int bench_close(sqlite3_file *f) { return BENCH_FILE(f)->pMethods->xClose(BENCH_FILE(f)); }
 static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) { retention_bench_reads+=(unsigned)n; return BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o); }
@@ -7420,6 +7421,7 @@ static int bench_sync(sqlite3_file *f,int flags) {
   /* Preserve the real filesystem result, but make checkpoint I/O slower than
    * one maintenance slice. This must not starve actual group retirement. */
   if (retention_checkpoint_delay_ms && ((RetentionBenchFile *)f)->main_database) {
+    ++retention_delayed_checkpoint_syncs;
 #if defined(_WIN32)
     Sleep(retention_checkpoint_delay_ms);
 #else
@@ -8592,6 +8594,8 @@ static void run_sliced_cache_consumer(void) {
 
 /* Failure-only diagnostics must not mask the original contract assertion if
  * this auxiliary SQLite reader is unavailable. -1 means not observed. */
+static unsigned sliced_candidate_checkpoint_delay_ms;
+
 static sqlite3_int64 sliced_diagnostic_scalar(sqlite3 *db, const char *sql) {
   sqlite3_stmt *st = NULL; sqlite3_int64 value = -1;
   if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK &&
@@ -8689,9 +8693,15 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
     sqlite3_int64 page_size = sliced_diagnostic_scalar(db, "PRAGMA page_size");
     sqlite3_int64 count_before = sliced_diagnostic_scalar(db, "SELECT COUNT(*) FROM p0_candidates");
     edr_local_evidence_cache_get_status(&before);
+    uint64_t delayed_syncs_before = retention_delayed_checkpoint_syncs;
+    assert(retention_checkpoint_delay_ms == 0u);
+    retention_checkpoint_delay_ms = sliced_candidate_checkpoint_delay_ms;
     uint64_t candidate_wall_started = soak_monotonic_ns();
     edr_local_evidence_cache_record_behavior(&candidate);
     uint64_t candidate_wall_finished = soak_monotonic_ns();
+    retention_checkpoint_delay_ms = 0u;
+    if (sliced_candidate_checkpoint_delay_ms)
+      assert(retention_delayed_checkpoint_syncs > delayed_syncs_before);
     edr_local_evidence_cache_get_status(&after);
     if (after.candidate_admitted != before.candidate_admitted + 1) {
       sqlite3_int64 pages_after = sliced_diagnostic_scalar(db, "PRAGMA page_count");
@@ -8724,7 +8734,8 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
         fprintf(stderr," candidate_failure_%u=%llu->%llu", reason,
             (unsigned long long)before.candidate_failure_reasons[reason],
             (unsigned long long)after.candidate_failure_reasons[reason]);
-      fprintf(stderr, " cause=%.159s\n", after.last_error);
+      fprintf(stderr, " delayed_checkpoint_syncs=%llu cause=%.159s\n",
+          (unsigned long long)(retention_delayed_checkpoint_syncs-delayed_syncs_before), after.last_error);
       fflush(stderr);
     }
     assert(after.maintenance_runs == before.maintenance_runs + 1);
@@ -10546,6 +10557,103 @@ static void test_alert_parent_floor_post_commit_clock_regression(void) {
   cleanup_test_sqlite_path(path); free(r);
 }
 
+static void sliced_live_owner_hash(sqlite3 *db, char hash[65]) {
+  sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(db,
+      "SELECT json_array(p.candidate_id,p.event_time_ns,p.pid,p.ppid,p.process_start_key,"
+      "p.process_creation_filetime_100ns,p.alert_context_protect_until_active_ms,"
+      "a.artifact_id,a.manifest_json,a.upload_status,a.minio_key) "
+      "FROM p0_candidates p JOIN materialized_artifacts a ON a.candidate_id=p.candidate_id "
+      "WHERE p.candidate_id='live' AND a.artifact_id='d';", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  const uint8_t *value = sqlite3_column_text(st, 0);
+  int bytes = sqlite3_column_bytes(st, 0); assert(value && bytes > 0);
+  assert(edr_sha256_hex(value, (size_t)bytes, hash) == 0);
+  assert(sqlite3_step(st) == SQLITE_DONE); sqlite3_finalize(st);
+}
+
+static void test_synchronous_reclaim_failure_preserves_owner_and_backoff(void) {
+  for (unsigned reader = 0; reader < 2u; ++reader) {
+    char path[512], original_hash[65], current_hash[65]; sqlite3 *db = NULL;
+    EdrEvidenceCacheStatus before, failed, after;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    reclaim_fixture(path, 0);
+    assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    sliced_reclaim_padding(db);
+    sqlite3_int64 initial = compact_scalar(db, "PRAGMA freelist_count");
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    sliced_live_owner_hash(db, original_hash); compact_assert_projection(db);
+    compact_exec(db, reader ? "BEGIN;SELECT COUNT(*) FROM p0_candidates;" : "BEGIN IMMEDIATE;");
+    EdrBehaviorRecord candidate; struct timespec stamp;
+    assert(timespec_get(&stamp, TIME_UTC) == TIME_UTC);
+    init_record(&candidate, EDR_EVENT_NET_CONNECT);
+    candidate.priority = 3; candidate.pid = 74502; set_record_generation(&candidate, 74502);
+    candidate.event_time_ns = (int64_t)stamp.tv_sec * INT64_C(1000000000) + stamp.tv_nsec;
+    strcpy(candidate.endpoint_id, "ep-slice-busy");
+    strcpy(candidate.event_id, "slice-required-busy-candidate");
+    strcpy(candidate.net_dst, "192.0.2.12"); candidate.net_dport = 445;
+    edr_local_evidence_cache_get_status(&before);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&failed);
+    assert(failed.maintenance_runs == before.maintenance_runs + 1u);
+    assert(failed.candidate_rejected == before.candidate_rejected + 1u);
+    assert(failed.candidate_admitted == before.candidate_admitted);
+    assert(failed.candidate_transaction_failures == before.candidate_transaction_failures);
+    assert(failed.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
+        before.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] + 1u);
+    assert(failed.db_budget_dropped == before.db_budget_dropped + 1u);
+    assert(strstr(failed.last_error, reader ? "maintenance checkpoint" : "maintenance incremental vacuum"));
+    assert(strstr(failed.last_error, "sqlite=5/5"));
+    compact_exec(db, "ROLLBACK;");
+    compact_assert_projection(db); sliced_live_owner_hash(db, current_hash);
+    assert(!strcmp(original_hash, current_hash));
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE endpoint_id='ep-slice-busy'") == 0);
+    initial = compact_scalar(db, "PRAGMA freelist_count");
+    for (unsigned i = 0; i < 100u; ++i) edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == failed.maintenance_runs);
+    assert(!strcmp(after.last_error, failed.last_error));
+    assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    s_test_monotonic_ns += UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.maintenance_runs == failed.maintenance_runs + 1u);
+    for (unsigned i = 0; i < 64u && after.db_bytes + after.wal_bytes > 1048576u; ++i) {
+      edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
+    }
+    assert(after.db_bytes + after.wal_bytes <= 1048576u);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.candidate_admitted == failed.candidate_admitted + 1u);
+    assert(after.candidate_rejected == failed.candidate_rejected);
+    sliced_live_owner_hash(db, current_hash); assert(!strcmp(original_hash, current_hash));
+    printf("synchronous_reclaim_failure blocker=%s transaction_failed=0 original_owner_sha256=%s hot_polls=100 recovered=1\n",
+        reader ? "pinned_reader_checkpoint" : "writer_vacuum", original_hash);
+    assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+    s_test_monotonic_ns = UINT64_C(1000000000); cleanup_test_sqlite_path(path);
+  }
+}
+
+/* Delay only main-database syncs in the final admission call. SQLite still
+ * executes every real write/checkpoint and returns its real filesystem result;
+ * neither the 20ms slice nor any existing assertion is changed. */
+static void test_sliced_reclaim_with_slow_checkpoint(void) {
+  retention_bench_vfs_parent = sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs = *retention_bench_vfs_parent;
+  vfs.zName = "sliced-admission-slow-checkpoint"; vfs.pNext = NULL;
+  vfs.szOsFile += (int)sizeof(RetentionBenchFile); vfs.xOpen = retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs, 1) == SQLITE_OK);
+  sliced_candidate_checkpoint_delay_ms = 30u;
+  test_sliced_reclaim_yields_preserves_projection_and_backoff();
+  sliced_candidate_checkpoint_delay_ms = 0u;
+  assert(retention_checkpoint_delay_ms == 0u);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent, 1) == SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs) == SQLITE_OK);
+}
+
 typedef struct {
   EdrBehaviorRecord *record;
   unsigned kind;
@@ -11096,6 +11204,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--sliced-reclaim-contract") == 0) {
     test_sliced_reclaim_yields_preserves_projection_and_backoff(); return 0;
   }
+  if (argc == 2 && strcmp(argv[1], "--synchronous-reclaim-failure") == 0) {
+    test_synchronous_reclaim_failure_preserves_owner_and_backoff(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--sliced-reclaim-slow-checkpoint") == 0) {
+    test_sliced_reclaim_with_slow_checkpoint(); return 0;
+  }
   if (argc == 3 && strcmp(argv[1], "--alert-parent-soak") == 0) {
     char *end = NULL; errno = 0;
     unsigned long duration = strtoul(argv[2], &end, 10);
@@ -11231,6 +11345,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_context_batch_reclaim_limit());
   RUN_CACHE_CASE("retention", test_maintenance_failure_retains_cause_and_retry_interval());
   RUN_CACHE_CASE("retention", test_sliced_reclaim_yields_preserves_projection_and_backoff());
+  RUN_CACHE_CASE("retention", test_sliced_reclaim_with_slow_checkpoint());
+  RUN_CACHE_CASE("retention", test_synchronous_reclaim_failure_preserves_owner_and_backoff());
   RUN_CACHE_CASE("retention", test_sliced_reclaim_process_restart());
   RUN_CACHE_CASE("retention", test_candidate_group_shared_facts_and_legacy_protection());
   RUN_CACHE_CASE("retention", test_candidate_group_delete_and_commit_rollback());
