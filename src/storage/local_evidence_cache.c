@@ -8601,6 +8601,7 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   }
   evidence_cache_lock();
   EdrEvidenceCacheStatus st = s_status;
+  int capacity_pressure = 0;
   st.query_pin_exhausted=atomic_load_explicit(&s_query_pin_exhausted,memory_order_relaxed);
   st.write_budget_used = s_write_budget_count;
 #if defined(EDR_HAVE_SQLITE)
@@ -8717,20 +8718,30 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
                     (uint64_t)sizeof(s_context_ring) + (uint64_t)sizeof(s_context_windows) +
                     (uint64_t)sizeof(s_metrics) + (uint64_t)sizeof(s_candidate_dedupe) +
                     (uint64_t)sizeof(s_ordinary_agg);
-  /* Health degradation must also describe an unavailable durable store. Keep
-   * the ingestion throttle predicate independent of this snapshot field. */
-  st.pressure_active = (!st.db_open || evidence_cache_pressure_active()) ? 1u : 0u;
 #if defined(EDR_HAVE_SQLITE)
   refresh_db_size_status();
   st.db_bytes = s_status.db_bytes;
   st.wal_bytes = s_status.wal_bytes;
   st.shm_bytes = s_status.shm_bytes;
   st.physical_bytes = s_status.physical_bytes;
+  uint64_t capacity = (uint64_t)st.max_db_mb * 1024ULL * 1024ULL;
+  capacity_pressure = st.db_open && capacity > 0u &&
+      (st.db_bytes > capacity || st.wal_bytes > capacity - st.db_bytes);
+  if (capacity_pressure && !st.last_error[0]) {
+    /* Snapshot only: do not overwrite an operational failure, count a write
+     * refusal, or persist a stale capacity error after space is recovered. */
+    copy_s(st.last_error, sizeof(st.last_error),
+           "evidence cache DB/WAL over configured capacity; retained data remains readable");
+  }
   st.db_utilization_bps = utilization_bps(st.db_bytes + st.wal_bytes,
                                           (uint64_t)st.max_db_mb * 1024ULL * 1024ULL);
   refresh_candidate_inventory_status(&st);
   pmfe_refresh_inventory(&st);
 #endif
+  /* This is health degradation, not the ingestion throttle predicate. An
+   * opened protected legacy store can remain readable while over capacity. */
+  st.pressure_active = (!st.db_open || evidence_cache_pressure_active() ||
+                        capacity_pressure) ? 1u : 0u;
   *out = st;
   evidence_cache_unlock();
 }

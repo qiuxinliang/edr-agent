@@ -11786,6 +11786,92 @@ static void test_alert_parent_context_refusal_and_unresolved(void) {
   assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == EDR_PARENT_CONTEXT_ERROR_INTEGRITY);
   edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path); free(record);
 }
+/* Health is a read-only view of configured DB/WAL pressure, not a new
+ * admission rule or proof that protected inventory can be reclaimed. */
+static void test_capacity_health_snapshot_preserves_readable_owners(void) {
+  const uint64_t limit = UINT64_C(128) * 1024u * 1024u;
+  const char *capacity_error = "evidence cache DB/WAL over configured capacity; retained data remains readable";
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512], before_hash[65], after_hash[65]; sqlite3 *db = NULL;
+  EdrBehaviorRecord *record = calloc(1u, sizeof(*record)); assert(record);
+  EdrEvidenceCacheStatus normal, exact, over, recovered, wal, original_error;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  fprintf(stderr, "capacity_health_fixture synthetic_db=%s limit_bytes=%llu\n", path, (unsigned long long)limit); fflush(stderr);
+  s_test_pressure = false;
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path, 128u, 24u, 72u) == 0);
+  edr_local_evidence_cache_get_status(&normal);
+  assert(normal.db_open && !normal.pressure_active && !normal.last_error[0]);
+  s_test_pressure = true;
+  edr_local_evidence_cache_get_status(&normal); assert(normal.pressure_active);
+  s_test_pressure = false;
+  edr_local_evidence_cache_get_status(&normal); assert(!normal.pressure_active);
+  init_floor_parent(record, now);
+  EdrCommandFacts facts = {record->cmdline, record->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(record, &facts) == 0);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,pid,cmdline,created_ns,context_post_until_ns) "
+      "VALUES('legacy-health-owner','legacy-health-endpoint','legacy-health-tenant',9000000000000000100,17,'public legacy owner',9000000000000000100,1);"
+      "CREATE TABLE health_bulk(payload BLOB);INSERT INTO health_bulk VALUES(zeroblob(132120576));");
+  parent_fixture_owner_hash(db, record->pid, before_hash);
+  sqlite_fill_exact_capacity_target(path, limit);
+  edr_local_evidence_cache_get_status(&exact);
+  assert(exact.db_bytes == limit && exact.wal_bytes == 0u);
+  assert(exact.db_utilization_bps == 10000u && !exact.pressure_active && !exact.last_error[0]);
+  compact_exec(db, "CREATE TABLE health_extra_0(x);CREATE TABLE health_extra_1(x);PRAGMA wal_checkpoint(TRUNCATE);");
+  edr_local_evidence_cache_get_status(&over);
+  assert(over.db_bytes == limit + 8192u && over.wal_bytes == 0u);
+  assert(over.db_utilization_bps == 10000u && over.pressure_active && over.db_open);
+  assert(!strcmp(over.last_error, capacity_error));
+  assert(over.db_budget_dropped == exact.db_budget_dropped);
+  assert(over.records_dropped == exact.records_dropped);
+  EdrParentContextQuery query = floor_query(record, now);
+  parent_pressure_query(&query, "capacity_health_main_over", 1);
+  parent_fixture_owner_hash(db, record->pid, after_hash); assert(!strcmp(before_hash, after_hash));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='legacy-health-owner' AND retention_policy_version=0 AND pid=17 AND cmdline='public legacy owner'") == 1);
+  char health[32768]; edr_local_evidence_cache_status_json(health, sizeof(health));
+  assert(strstr(health, "\"pressure_active\":true") && strstr(health, capacity_error));
+  compact_exec(db, "DROP TABLE health_extra_0;DROP TABLE health_extra_1;PRAGMA incremental_vacuum;PRAGMA wal_checkpoint(TRUNCATE);");
+  edr_local_evidence_cache_get_status(&recovered);
+  assert(recovered.db_bytes == limit && recovered.wal_bytes == 0u);
+  assert(!recovered.pressure_active && !recovered.last_error[0]);
+  compact_exec(db, "UPDATE capacity_boundary_fixture SET payload=CAST(substr(payload,1,2499)||x'01' AS BLOB) WHERE rowid=1;");
+  edr_local_evidence_cache_get_status(&wal);
+  assert(wal.db_bytes == limit && wal.wal_bytes > 0u && wal.pressure_active);
+  assert(!strcmp(wal.last_error, capacity_error));
+  parent_pressure_query(&query, "capacity_health_wal_over", 1);
+  compact_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);");
+  edr_local_evidence_cache_get_status(&recovered);
+  assert(recovered.db_bytes == limit && recovered.wal_bytes == 0u);
+  assert(!recovered.pressure_active && !recovered.last_error[0]);
+  compact_exec(db, "CREATE TABLE health_extra_0(x);CREATE TABLE health_extra_1(x);PRAGMA wal_checkpoint(TRUNCATE);");
+  EdrBehaviorRecord *incoming = malloc(sizeof(*incoming)); assert(incoming); *incoming = *record;
+  incoming->pid++; incoming->process_start_key++; incoming->process_creation_filetime_100ns++;
+  strcpy(incoming->event_id, "capacity-health-new-refused"); edr_behavior_bind_parent_context(incoming);
+  assert(edr_local_evidence_cache_record_alert_context(incoming, &facts) < 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE pid=99103") == 0);
+  assert(edr_local_evidence_cache_record_command_result("", "test", "failed", 0, 1, "", "") == EDR_EVIDENCE_COMMAND_RESULT_INVALID);
+  edr_local_evidence_cache_get_status(&original_error);
+  assert(original_error.pressure_active && original_error.db_open);
+  assert(!strcmp(original_error.last_error, "command result identity missing"));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM command_results") == 0);
+  compact_exec(db, "DROP TABLE health_extra_0;DROP TABLE health_extra_1;PRAGMA incremental_vacuum;PRAGMA wal_checkpoint(TRUNCATE);");
+  edr_local_evidence_cache_get_status(&recovered);
+  assert(recovered.db_bytes == limit && recovered.wal_bytes == 0u && !recovered.pressure_active);
+  assert(!strcmp(recovered.last_error, original_error.last_error));
+  parent_pressure_query(&query, "capacity_health_recovered", 1);
+  parent_fixture_owner_hash(db, record->pid, after_hash); assert(!strcmp(before_hash, after_hash));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='legacy-health-owner' AND retention_policy_version=0 AND pid=17 AND cmdline='public legacy owner'") == 1);
+  printf("capacity_health_snapshot exact_bytes=%llu over_bytes=%llu exact_bps=%u over_bps=%u wal_bytes=%llu old_owner_unchanged=1 query_readable=1 original_error_preserved=1 recovered=1\n",
+      (unsigned long long)exact.db_bytes, (unsigned long long)over.db_bytes,
+      exact.db_utilization_bps, over.db_utilization_bps, (unsigned long long)wal.wal_bytes);
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  cleanup_test_sqlite_path(path); free(record); free(incoming);
+}
+
 #endif
 
 /* Test EXE only; no production API or arbitrary database path argument.
@@ -12107,6 +12193,9 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--capacity-health-snapshot") == 0) {
+    test_capacity_health_snapshot_preserves_readable_owners(); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--pressure-continuation-empty") == 0) {
     test_pressure_continuation_empty_reclaim_and_backoff(); return 0;
   }
@@ -12265,6 +12354,7 @@ int main(int argc, char **argv) {
 #endif
   RUN_CACHE_CASE("context", test_delayed_file_actor_with_exact_start_key());
 #if defined(EDR_HAVE_SQLITE)
+  RUN_CACHE_CASE("context", test_capacity_health_snapshot_preserves_readable_owners());
   RUN_CACHE_CASE("context", test_metric_dispositions_and_resource_failures());
   RUN_CACHE_CASE("context", test_metrics_commit_watermark_restart_and_failure());
   RUN_CACHE_CASE("context", test_metrics_slot_reuse_and_failed_handoff());
