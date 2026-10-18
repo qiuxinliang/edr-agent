@@ -9,7 +9,7 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $source=$DriverSource
 $sourceFile=Get-Item -LiteralPath $source -Force
-if ($sourceFile.PSIsContainer -or ($sourceFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $sourceFile.Length -gt 65536 -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_pin'}
+if ($sourceFile.PSIsContainer -or ($sourceFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $sourceFile.Length -gt 131072 -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_pin'}
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
@@ -268,6 +268,10 @@ try {
   Checked ($typed.native_error_code -eq 5 -and ($typed|ConvertTo-Json -Compress) -notmatch 'private-error-not-exported') 'native_error_actual_chain_only'
   try{throw [IO.IOException]::new('private-error-not-exported')}catch{$typed=ServiceObserverError $_}
   Checked ($null -eq $typed.native_error_code) 'native_error_not_invented'
+  try{throw 'stop_log_anchor_changed'}catch{$typed=ServiceObserverError $_}
+  Checked ($typed.cause_code -ceq 'stop_log_anchor_changed') 'observer_exact_need_code'
+  try{throw 'private-synthetic-path stop_log_anchor_changed private-text'}catch{$typed=ServiceObserverError $_}
+  Checked ($typed.cause_code -ceq 'unknown' -and ($typed|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-synthetic-path|private-text') 'observer_unknown_text_never_exported'
   ServiceCase 'normal';ServiceAction 'Stop' 'health-failed-upgrade-health-stop'
   $v=$serviceActionDiagnostics[0]
   Checked ($serviceWaits[0] -eq 45000 -and $v.worker.terminal_known -and $v.worker.exit_known -and $v.worker.exit_code -eq 0 -and $v.sampler.cancel_requested -and $v.sampler.terminal_known -and $v.observer_complete) 'observed_stop_exact_wait_and_sampler_cleanup'

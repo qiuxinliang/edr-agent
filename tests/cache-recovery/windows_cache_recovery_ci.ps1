@@ -181,12 +181,14 @@ function WaitProcess($Process,[int]$Seconds,[string]$Cause) {
 # QA diagnostics only. The action and its existing 45/30 second limits are unchanged.
 function ServiceObserverError($Record) {
   $e=$Record.Exception;$types=New-Object Collections.ArrayList;$native=$null
+  $causeCode='unknown';$allowed=@('stop_log_anchor_changed','stop_log_anchor_read_changed','stop_log_changed_during_read','stop_log_config_bound','stop_log_config_changed','stop_log_config_hash_changed','stop_log_fixed_local_path','stop_log_fixture_logging_literal','stop_log_fixture_logging_section','stop_log_initial_offset_not_line_boundary','stop_log_line_bound','stop_log_matches_bound','stop_log_native_binding','stop_log_new_bytes_bound','stop_log_numeric_shape','stop_log_parent_reparse','stop_log_read_changed','stop_log_regular_identity','stop_log_resolved_path_changed','stop_log_rotation_or_replacement','stop_log_target_generation_not_live','stop_log_truncated_or_changed','stop_log_window_bound','stop_log_window_deadline_after_io')
   for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
     $null=$types.Add($e.GetType().FullName)
     if($e -is [ComponentModel.Win32Exception]){$native=$e.NativeErrorCode}
+    if($causeCode -ceq 'unknown' -and [string]$e.Message -cin $allowed){$causeCode=[string]$e.Message}
     $e=$e.InnerException
   }
-  return @{exception_types=@($types);hresult=$Record.Exception.HResult;native_error_code=$native}
+  return @{exception_types=@($types);hresult=$Record.Exception.HResult;native_error_code=$native;cause_code=$causeCode}
 }
 function ServiceWorkerSource([ValidateSet('Stop','Start')][string]$Action) {
   $source=@'
@@ -373,8 +375,8 @@ function NewStopLogContext($Native,[string]$DriverSource) {
   $d=@{schema='edr.ci-selected-shutdown-log.v1';requested=$true;status='unknown';phase='prepare';cause='not_observed';driver_source_sha256=$null;target=@{pid=$Native.pid;birth_filetime=$Native.birth_filetime;exe_sha256=$Native.exe_sha256;config_sha256=$Native.config_sha256};observation_after_failed_action_only=$true;action_result_can_change=$false;max_observe_ms=60000;max_new_bytes=65536;max_line_bytes=4096;max_matches=64;bytes_read=0;matches=@();trailing_bytes=0;cleanup_error_types=@()}
   $c=@{diagnostic=$d;native=$Native;stream=$null;process=$null;hash=$null;agentPath=$script:agent;configPath=$script:configPath;logDirectory=(Join-Path $script:install 'logs');logPath=(Join-Path $script:install 'logs\agent.log');fileIdentity=$null;offset=[long]0;anchorOffset=[long]0;anchor=[byte[]]@();pending='';ready=$false}
   try {
-    $d.phase='source';$d.driver_source_sha256=SHA (Regular $DriverSource 65536)
-    Need ($Native.fixture_config_binding_verified -eq $true -and $Native.service_config_argv_verified -eq $true -and $Native.config_sha256 -ceq $script:configSha256) 'stop_log_native_binding'
+    $d.phase='source';$d.driver_source_sha256=SHA (Regular $DriverSource 131072)
+    Need ($Native.fixture_config_binding_verified -eq $true -and (($Native.ContainsKey('runtime_mode') -and $Native.runtime_mode -ceq 'scheduled_task' -and $Native.task_config_argv_verified -eq $true) -or ((-not $Native.ContainsKey('runtime_mode') -or $Native.runtime_mode -ceq 'service') -and $Native.service_config_argv_verified -eq $true)) -and $Native.config_sha256 -ceq $script:configSha256) 'stop_log_native_binding'
     $d.phase='config';StopLogConfig $c.configPath $Native.config_sha256 $c.logDirectory
     $d.phase='target';$c.process=Get-Process -Id $Native.pid -ErrorAction Stop;$null=$c.process.Handle;StopLogTarget $c
     $d.phase='open_log';$f=StopLogOpen $c.logPath;$c.stream=$f.stream;$c.fileIdentity=$f.info.Identity;$c.offset=[long]$f.info.Length
@@ -512,6 +514,197 @@ function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Lab
   }
 }
 
+# QA runtime mode comes only from the SHA-bound input, never package reclassification.
+function RecoveryMode($Value) {
+  Need ($Value -is [string] -and $Value -cin @('service','scheduled_task')) 'closed_recovery_runtime_mode_required'
+  return $Value
+}
+function TaskDefinition {
+  param([string]$Install,[string]$Agent,[string]$Config)
+  $tasks=@(Get-ScheduledTask -TaskPath '\' -TaskName 'FDSecurityAgent' -ErrorAction Stop)
+  Need ($tasks.Count -eq 1) 'exact_task_count'
+  $task=$tasks[0];$actions=@($task.Actions)
+  Need ($task.TaskPath -ceq '\' -and $task.TaskName -ceq 'FDSecurityAgent' -and $task.Settings.Enabled -eq $true -and
+    [string]$task.State -cin @('Ready','Queued','Running') -and $actions.Count -eq 1) 'exact_task_definition'
+  Need ([string]$task.Principal.UserId -cin @('S-1-5-18','SYSTEM','NT AUTHORITY\SYSTEM') -and
+    [string]$task.Principal.LogonType -ceq 'ServiceAccount' -and [string]$task.Principal.RunLevel -ceq 'Highest') 'task_system_principal'
+  $launcher=Regular (Join-Path $Install 'FDSensorTaskLaunch.ps1') 131072
+  $expectedPowerShell=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $expectedArgs='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$launcher+'"'
+  Need ($actions[0].Execute -ieq $expectedPowerShell -and $actions[0].Arguments -ceq $expectedArgs -and $actions[0].WorkingDirectory -ieq $Install) 'task_action_config_owner'
+  $before=SHA $launcher;$tokens=$null;$errors=$null
+  $ast=[Management.Automation.Language.Parser]::ParseFile($launcher,[ref]$tokens,[ref]$errors)
+  Need (@($errors).Count -eq 0) 'task_launcher_parse'
+  # Read only original launcher's three public top-level single-quoted literals.
+  # The launcher is never dot-sourced/executed by this verifier.
+  foreach($pair in @(@('exe',$Agent),@('cfg',$Config),@('wd',$Install))){
+    $assign=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and $_.Left.VariablePath.UserPath -ceq $pair[0]})
+    Need ($assign.Count -eq 1 -and $assign[0].Right.Extent.Text -cmatch "^'([^']|'')*'$") 'task_launcher_literal_required'
+    $right=$assign[0].Right
+    Need ($right -is [Management.Automation.Language.CommandExpressionAst] -and $right.Redirections.Count -eq 0 -and
+      $right.Expression -is [Management.Automation.Language.StringConstantExpressionAst] -and
+      $right.Expression.StringConstantType -eq [Management.Automation.Language.StringConstantType]::SingleQuoted) 'task_launcher_literal_required'
+    Need ([string]$right.Expression.Value -ieq $pair[1]) 'task_launcher_config_binding'
+  }
+  Need ((SHA $launcher) -ceq $before) 'task_launcher_changed'
+  $xml=Export-ScheduledTask -TaskPath '\' -TaskName 'FDSecurityAgent' -ErrorAction Stop
+  $sha=[Security.Cryptography.SHA256]::Create()
+  try{$xmlHash=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$xml)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  return @{state=[string]$task.State;launcher_sha256=$before;definition_sha256=$xmlHash;task_path='\';task_name='FDSecurityAgent';system_principal_verified=$true;action_config_verified=$true}
+}
+function TaskProcesses {
+  param([string]$Agent,[string]$Config)
+  $records=@(Get-CimInstance Win32_Process -Filter "Name='FDSensor.exe'" -ErrorAction Stop)
+  $selected=@($records | Where-Object {$_.ExecutablePath -ieq $Agent})
+  Need (-not @($records | Where-Object {[string]::IsNullOrWhiteSpace([string]$_.ExecutablePath)})) 'task_process_path_unknown'
+  Need ($selected.Count -le 1) 'task_process_ambiguous'
+  if(-not $selected.Count){return @()}
+  $record=$selected[0];$expected='"'+$Agent+'" --config "'+$Config+'"'
+  Need ([string]$record.CommandLine -ieq $expected -and [regex]::Matches([string]$record.CommandLine,'(?i)(?<!\S)--config(?=\s)').Count -eq 1) 'task_process_config_argv_binding'
+  $p=Get-Process -Id $record.ProcessId -ErrorAction Stop
+  Need ($p.Path -ieq $Agent) 'task_process_path'
+  $birth=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+  $again=Get-Process -Id $p.Id -ErrorAction Stop
+  Need ($again.Path -ieq $Agent -and $again.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $birth) 'task_generation_changed'
+  return @(@{pid=$p.Id;birth_filetime=$birth})
+}
+function InstalledTask {
+  param([string]$ExpectedHash)
+  Need (-not @(Get-CimInstance Win32_Service -Filter "Name='FDSecurityAgent'" -ErrorAction Stop)) 'task_mode_service_alias_present'
+  $before=TaskDefinition $script:install $script:agent $script:configPath
+  $rows=@(TaskProcesses $script:agent $script:configPath)
+  Need ($before.state -ceq 'Running' -and $rows.Count -eq 1) 'exact_task_not_running'
+  $after=TaskDefinition $script:install $script:agent $script:configPath
+  Need ($after.state -ceq 'Running' -and $after.definition_sha256 -ceq $before.definition_sha256 -and $after.launcher_sha256 -ceq $before.launcher_sha256) 'task_definition_changed'
+  ConfigBinding
+  return @{pid=$rows[0].pid;birth_filetime=$rows[0].birth_filetime;exe_sha256=$ExpectedHash;config_sha256=$script:configSha256;fixture_config_binding_verified=$true;task_config_argv_verified=$true;runtime_mode='scheduled_task';task_definition_sha256=$before.definition_sha256;task_launcher_sha256=$before.launcher_sha256;task_system_principal_verified=$true}
+}
+function TaskNativeBinding($Native) {
+  $keys=@('pid','birth_filetime','exe_sha256','config_sha256','fixture_config_binding_verified','task_config_argv_verified','runtime_mode','task_definition_sha256','task_launcher_sha256','task_system_principal_verified')
+  Need ($Native -is [hashtable] -and $Native.Count -eq $keys.Count -and @($Native.Keys | Where-Object {$_ -cnotin $keys}).Count -eq 0) 'task_native_closed_fields'
+  Need ($Native.pid -is [int] -and $Native.pid -gt 0 -and $Native.birth_filetime -is [string] -and $Native.birth_filetime -cmatch '^[1-9][0-9]{1,19}$' -and $Native.runtime_mode -ceq 'scheduled_task') 'task_native_identity_shape'
+  foreach($name in @('exe_sha256','config_sha256','task_definition_sha256','task_launcher_sha256')){Need ($Native[$name] -is [string] -and $Native[$name] -cmatch '^[a-f0-9]{64}$') 'task_native_sha_shape'}
+  foreach($name in @('fixture_config_binding_verified','task_config_argv_verified','task_system_principal_verified')){Need ($Native[$name] -is [bool] -and $Native[$name] -eq $true) 'task_native_proof_required'}
+}
+function TaskDefinitionMatches($Definition,$Expected) {
+  Need ($Definition.definition_sha256 -ceq $Expected.task_definition_sha256 -and $Definition.launcher_sha256 -ceq $Expected.task_launcher_sha256) 'task_definition_or_launcher_changed'
+}
+function TaskChildPrelude {
+  $driver=Regular $script:driverSourcePath 131072
+  Need ($driver -notmatch "['\r\n]" -and $script:install -notmatch "['\r\n]" -and $script:agent -notmatch "['\r\n]" -and $script:configPath -notmatch "['\r\n]") 'task_child_literal_path'
+  $source=@'
+$ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+$driver='__DRIVER__';$file=Get-Item -LiteralPath $driver -Force -ErrorAction Stop
+if($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $file.Length -gt 131072 -or (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne '__HASH__'){throw 'task_driver_pin'}
+$tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($driver,[ref]$tokens,[ref]$errors)
+if(@($errors).Count -or (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant() -cne '__HASH__'){throw 'task_driver_changed'}
+$wanted=@('Need','Regular','SHA','TaskDefinition','TaskProcesses','TaskDefinitionMatches')
+$functions=@($ast.FindAll({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
+if($functions.Count -ne $wanted.Count){throw 'task_child_function_inventory'}
+foreach($f in $functions){Invoke-Expression $f.Extent.Text}
+$install='__INSTALL__';$agent='__AGENT__';$config='__CONFIG__'
+'@
+  return $source.Replace('__DRIVER__',$driver).Replace('__HASH__',(SHA $driver)).Replace('__INSTALL__',$script:install).Replace('__AGENT__',$script:agent).Replace('__CONFIG__',$script:configPath)
+}
+function TaskWorkerSource([ValidateSet('Stop','Start')][string]$Action,$Native) {
+  TaskNativeBinding $Native
+  $body=@'
+try {
+  $expected=@{task_definition_sha256='__DEFINITION__';task_launcher_sha256='__LAUNCHER__'}
+  $definition=TaskDefinition $install $agent $config;TaskDefinitionMatches $definition $expected;$rows=@(TaskProcesses $agent $config)
+  __BEFORE__
+  [Console]::Out.WriteLine('{"schema":"edr.task-action.phase.v1","phase":"request___ACTION__"}');[Console]::Out.Flush()
+  __REQUEST__
+  $clock=[Diagnostics.Stopwatch]::StartNew();$done=$false
+  while($clock.ElapsedMilliseconds -lt 30000){
+    $definition=TaskDefinition $install $agent $config;TaskDefinitionMatches $definition $expected;$rows=@(TaskProcesses $agent $config)
+    if(__DONE__){$done=$true;break}
+    Start-Sleep -Milliseconds 100
+  }
+  Need $done 'task_status_wait_30_exhausted'
+  [Console]::Out.WriteLine('{"schema":"edr.task-action.phase.v1","phase":"completed"}');[Console]::Out.Flush();exit 0
+}catch{
+  [Console]::Error.WriteLine((@{schema='edr.task-action.exception.v1';exception_type=$_.Exception.GetType().FullName;hresult=$_.Exception.HResult}|ConvertTo-Json -Compress));[Console]::Error.Flush();exit 1
+}
+'@
+  if($Action -ceq 'Stop'){
+    $before="Need (`$definition.state -ceq 'Running' -and `$rows.Count -eq 1 -and `$rows[0].pid -eq "+$Native.pid+" -and `$rows[0].birth_filetime -ceq '"+$Native.birth_filetime+"') 'task_stop_generation_changed'"
+    $request="Stop-ScheduledTask -TaskPath '\' -TaskName 'FDSecurityAgent' -ErrorAction Stop"
+    $done="`$definition.state -ceq 'Ready' -and `$rows.Count -eq 0"
+  }else{
+    $before="Need (`$definition.state -ceq 'Ready' -and `$rows.Count -eq 0) 'task_start_prior_owner_present'"
+    $request="Start-ScheduledTask -TaskPath '\' -TaskName 'FDSecurityAgent' -ErrorAction Stop"
+    $done="`$definition.state -ceq 'Running' -and `$rows.Count -eq 1"
+  }
+  return (TaskChildPrelude)+"`n"+$body.Replace('__DEFINITION__',$Native.task_definition_sha256).Replace('__LAUNCHER__',$Native.task_launcher_sha256).Replace('__BEFORE__',$before).Replace('__ACTION__',$Action.ToLowerInvariant()).Replace('__REQUEST__',$request).Replace('__DONE__',$done)
+}
+function TaskSamplerSource {
+  return (TaskChildPrelude)+"`n"+@'
+$clock=[Diagnostics.Stopwatch]::StartNew();$written=0
+for($i=0;$i -lt 46;$i++){
+  $row=[ordered]@{schema='edr.scheduled-task-sample.v1';index=$i;elapsed_ms=$clock.ElapsedMilliseconds;state='Unknown';agent_count=$null;pid=$null;birth_filetime=$null;system_principal_verified=$false;action_config_verified=$false;exception_type=$null}
+  try{$d=TaskDefinition $install $agent $config;$rows=@(TaskProcesses $agent $config);$row.state=$d.state;$row.agent_count=$rows.Count;$row.system_principal_verified=$true;$row.action_config_verified=$true;if($rows.Count -eq 1){$row.pid=$rows[0].pid;$row.birth_filetime=$rows[0].birth_filetime}}
+  catch{$row.exception_type=$_.Exception.GetType().FullName}
+  $line=$row|ConvertTo-Json -Depth 4 -Compress;$bytes=[Text.Encoding]::UTF8.GetByteCount($line)+2
+  if($written+$bytes -gt 16384){exit 2};[Console]::Out.WriteLine($line);[Console]::Out.Flush();$written+=$bytes
+  if($clock.ElapsedMilliseconds -ge 45000){break};Start-Sleep -Milliseconds 1000
+}
+exit 0
+'@
+}
+
+function TaskAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label,$Native,$LogContext=$null) {
+  TaskNativeBinding $Native
+  $worker=Join-Path $script:root ($Label+'.task.ps1');$stdout=Join-Path $script:root ($Label+'.task.stdout.log');$stderr=Join-Path $script:root ($Label+'.task.stderr.log')
+  $value=@{label=$Label;action=$Action;phase='prepare';started_at_utc=[DateTime]::UtcNow.ToString('o');worker_source_sha256=$null;primary_failure=$null;worker=@{pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null};sampler=@{requested=$false;pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null}}
+  $null=$script:taskActionDiagnostics.Add($value)
+  if($null -ne $LogContext){$value.shutdown_log_observation=$LogContext.diagnostic}
+  $owned=$null;$sampler=$null;$samplerOut=$null;$samplerErr=$null;$primary=$false;$observerFailed=$false;$clock=[Diagnostics.Stopwatch]::StartNew()
+  try{
+    Need (-not (Test-Path -LiteralPath $worker)) 'task_worker_exists'
+    [IO.File]::WriteAllText($worker,(TaskWorkerSource $Action $Native),[Text.UTF8Encoding]::new($false));$value.worker_source_sha256=SHA $worker
+    if($Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){
+      $value.sampler.requested=$true
+      $samplerScript=Join-Path $script:root ($Label+'.task-sampler.ps1');$samplerOut=Join-Path $script:root ($Label+'.task-sampler.stdout.log');$samplerErr=Join-Path $script:root ($Label+'.task-sampler.stderr.log')
+      try{
+        Need (-not (Test-Path -LiteralPath $samplerScript)) 'task_sampler_exists'
+        [IO.File]::WriteAllText($samplerScript,(TaskSamplerSource),[Text.UTF8Encoding]::new($false));$value.sampler.source_sha256=SHA $samplerScript
+        $sampler=StartWindowsPowerShellChild $samplerScript $samplerOut $samplerErr
+        $null=ServiceChildStatus $sampler $value.sampler
+      }catch{$observerFailed=$true;$value.sampler.launch_error=ServiceObserverError $_}
+    }
+    $value.phase='launch_action'
+    $owned=StartWindowsPowerShellChild $worker $stdout $stderr
+    $null=ServiceChildStatus $owned $value.worker
+    $value.phase='wait_action_45';$value.wait_started_at_utc=[DateTime]::UtcNow.ToString('o');$waitClock=[Diagnostics.Stopwatch]::StartNew()
+    try{$code=WaitProcess $owned 45 'task_control_unknown_no_retry'}finally{$value.wait_elapsed_ms=$waitClock.ElapsedMilliseconds;$value.wait_finished_at_utc=[DateTime]::UtcNow.ToString('o')}
+    Need ($null -ne $code -and $code -is [int]) 'task_control_exit_unknown'
+    Need ($code -eq 0) 'task_control_failed'
+    $value.phase='action_returned'
+  }catch{$primary=$true;$value.primary_failure=ServiceObserverError $_;throw}
+  finally{
+    if($value.sampler.requested){
+      try{if(FinishServiceObserver $sampler $value.sampler $samplerOut $samplerErr 16384 -Cancel -Combined){$observerFailed=$true}}
+      catch{$observerFailed=$true;$value.sampler.observer_error=ServiceObserverError $_}
+    }
+    try{if(FinishServiceObserver $owned $value.worker $stdout $stderr 4096){$observerFailed=$true}}
+    catch{$observerFailed=$true;$value.worker.observer_error=ServiceObserverError $_}
+    # The original action's decision/timing above is frozen before observation.
+    $value.elapsed_ms=$clock.ElapsedMilliseconds;$value.finished_at_utc=[DateTime]::UtcNow.ToString('o');$value.observer_complete=(-not $observerFailed)
+    if($null -ne $LogContext){
+      try{if($primary -and $Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){ObserveStopLog $LogContext 60000}}
+      catch{$LogContext.diagnostic.status='unknown';$LogContext.diagnostic.cause='observer_exception';$LogContext.diagnostic.error=ServiceObserverError $_}
+      finally{CloseStopLogContext $LogContext}
+    }
+    if(-not $primary -and $observerFailed){throw 'task_action_diagnostic_incomplete'}
+  }
+}
+
+function RuntimeAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label,$Native=$null,$LogContext=$null) {
+  if($script:runtimeMode -ceq 'service'){ServiceAction $Action $Label $LogContext}
+  else{TaskAction $Action $Label $Native $LogContext}
+}
+
 function ConfigBinding {
   $path=Regular $script:configPath 131072
   Need ((SHA $path) -ceq $script:configSha256) 'fixture_configuration_hash_changed'
@@ -536,6 +729,7 @@ function Installed([string]$ExpectedHash,[string]$Version) {
     $componentPath=Regular (Join-Path $script:install $component.name) 67108864
     Need ((SHA $componentPath) -ceq $component.sha256.ToLowerInvariant()) 'installed_runtime_component_hash'
   }
+  if($script:runtimeMode -ceq 'scheduled_task'){return (InstalledTask $ExpectedHash)}
   $s=Get-CimInstance Win32_Service -Filter "Name='FDSecurityAgent'" -ErrorAction Stop
   Need ($s.State -eq 'Running' -and $s.ProcessId -gt 0) 'exact_service_not_running'
   $p=Get-Process -Id $s.ProcessId -ErrorAction Stop
@@ -546,7 +740,7 @@ function Installed([string]$ExpectedHash,[string]$Version) {
   $again=Get-Process -Id $p.Id -ErrorAction Stop
   Need ($again.Path -ieq $script:agent -and $again.StartTime.ToUniversalTime().ToFileTimeUtc() -eq $p.StartTime.ToUniversalTime().ToFileTimeUtc()) 'service_generation_changed_during_configuration_check'
   ConfigBinding
-  return @{pid=$p.Id;birth_filetime=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();exe_sha256=$ExpectedHash;config_sha256=$script:configSha256;fixture_config_binding_verified=$true;service_config_argv_verified=$true}
+  return @{pid=$p.Id;birth_filetime=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();exe_sha256=$ExpectedHash;config_sha256=$script:configSha256;fixture_config_binding_verified=$true;service_config_argv_verified=$true;runtime_mode='service'}
 }
 function Snapshot([string]$Name,[string]$Expected='') {
   $path=Join-Path $script:root ($Name+'.json')
@@ -573,18 +767,19 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $params=@{InstallDir=$script:install;StagedBinary=$staged;ExpectedSha256=$script:target.agent_binary_sha256;
       TargetVersion=$script:target.version;ExpectedArchitecture=$script:updateArch;
       TrustedPublisherThumbprint='SHA256_ONLY_UNSIGNED';TrustedPublisherSubject='Unsigned release; SHA-256 integrity only';
-      DeploymentMode='service';ServiceName='FDSecurityAgent';CommandId=$command;TaskId=$id;
+      DeploymentMode=$script:runtimeMode;ServiceName='FDSecurityAgent';CommandId=$command;TaskId=$id;
       Operation=$Operation;ArtifactId=('ci-cache-recovery-'+$script:target.version);
       UpgradeClass=$script:actualClass;RuntimeManifest=$script:package;RuntimeManifestSha256=$script:binding.protocol5_package.sha256;
       StagingDirectory=$work;IssuedAtUnixMs=$issued;DeadlineUnixMs=($issued+900000);HealthObserveMs=30000;
       MinFreeBytes=$script:effectiveMinFreeBytes;
       MinCurrentVersion=[string]$script:raw[0].update.min_current_version;
       MaxCurrentVersion=[string]$script:raw[0].update.max_current_version}
+    if($script:runtimeMode -ceq 'scheduled_task'){$params.ScheduledTaskName='FDSecurityAgent';$params.ScheduledTaskPath='\'}
     $paramFile=Join-Path $script:root ($Label+'.parameters.xml');$params | Export-Clixml -LiteralPath $paramFile
     $invoke=Join-Path $script:root ($Label+'.invoke.ps1')
     Need ($Updater -notmatch "['\r\n]" -and $paramFile -notmatch "['\r\n]") 'invocation_path'
     [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;exit `$LASTEXITCODE"),[Text.UTF8Encoding]::new($false))
-    Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
+    Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;runtime_mode=$script:runtimeMode;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
     $diagnostic.phase='launch'
     $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))
     $diagnostic.child_pid=$child.Id
@@ -599,15 +794,16 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
         elseif($reading.state -ceq 'ready' -and $reading.value.stage -ceq 'health_observation') {
           $diagnostic.phase='health_observation_bind'
           $j=$reading.value
+          Need ($j.resolved_deployment_mode -ceq $script:runtimeMode) 'health_journal_runtime_mode'
           $native=Installed $script:target.agent_binary_sha256 $script:target.version
           Snapshot ($Label+'-before-trigger') $script:seed | Out-Null
           $backup=Join-Path ([string]$j.full_installer_backup_path) 'FDSensor.exe'
           Need ((SHA (Regular $backup 16777216)) -ceq $script:baseline.agent_binary_sha256) 'actual_previous_backup_not692'
           $again=Installed $script:target.agent_binary_sha256 $script:target.version
           Need ($again.pid -eq $native.pid -and $again.birth_filetime -eq $native.birth_filetime) 'trigger_generation_changed'
-          Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));action='stop_exact_owned_service';fixture_only=$true}
+          Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));runtime_mode=$script:runtimeMode;action=$(if($script:runtimeMode -ceq 'service'){'stop_exact_owned_service'}else{'stop_exact_owned_task'});fixture_only=$true}
           $logContext=NewStopLogContext $native $PSCommandPath
-          ServiceAction 'Stop' ($Label+'-health-stop') $logContext
+          RuntimeAction 'Stop' ($Label+'-health-stop') $native $logContext
           $triggered=$true
         }
       }
@@ -621,6 +817,7 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $result=(ReadOwnedUpdateJson 'report' $report $owner).value
     $diagnostic.phase='terminal_journal_read'
     $j=(ReadOwnedUpdateJson 'journal' $journal $owner).value
+    Need ($j.resolved_deployment_mode -ceq $script:runtimeMode) 'terminal_journal_runtime_mode'
     Need ($j.task_id -eq $id -and $j.command_id -eq $command -and $j.hash -ceq $script:target.agent_binary_sha256) 'terminal_journal_binding'
     $diagnostic.phase='terminal_contract'
     if ($FailHealth) {
@@ -652,12 +849,14 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
   }
 }
 # Refuse missing immutable inputs before creating any machine or fixture state.
+$script:driverSourcePath=$PSCommandPath
 $binding=PinnedJson $InputJson $InputSha256
 Need ($binding.schema -eq 'edr.ci-cache-recovery-input.v1' -and $binding.prepared_only -is [bool] -and $binding.prepared_only -eq $false) 'recovery_input_unbound'
 Need ($env:OS -eq 'Windows_NT' -and $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted') 'disposable_github_hosted_windows_only'
 $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 Need ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'existing_elevated_ci_owner_required'
 Need ($binding.arch -in @('arm64','amd64')) 'native_arch_required'
+$runtimeMode=RecoveryMode $binding.runtime_mode
 $baseline=PinnedJson $binding.baseline.stage_path $binding.baseline.stage_sha256
 $target=PinnedJson $binding.target.stage_path $binding.target.stage_sha256
 Need ($baseline.version -eq '3.2.692' -and $baseline.source_commit -ceq 'a978ec83deacf7cd78c273d82630b457c5f39251' -and $baseline.target_arch -eq $binding.arch) 'exact692_stage_required'
@@ -703,6 +902,7 @@ foreach ($stage in @($baseline,$target)) {
 $completed=$false;$mainPrimaryFailure=$false
 $transitionDiagnostics=New-Object Collections.ArrayList
 $serviceActionDiagnostics=New-Object Collections.ArrayList
+$taskActionDiagnostics=New-Object Collections.ArrayList
 try {
   $temp=Join-Path $root 'seed-temp';New-Item -ItemType Directory -Path $temp | Out-Null
   $oldTemp=$env:TEMP;$oldTmp=$env:TMP
@@ -754,7 +954,8 @@ try {
   if ($effectiveMinFreeBytes -lt [UInt64]$binding.requested_min_free_bytes) {$effectiveMinFreeBytes=[UInt64]$binding.requested_min_free_bytes}
   Save 'storage-floor-proof.json' @{schema='edr.ci-original-storage-floor.v1';native_owner='src/core/storage_space_preflight.h';agent_sha256=$target.agent_binary_sha256;config_sha256=$configSha256;native_output_sha256=(SHA $floorPath);native_floor_bytes=$localFloor;manifest_min_free_bytes=[UInt64]$raw[0].update.min_free_bytes;explicit_higher_override_bytes=[UInt64]$binding.requested_min_free_bytes;effective_min_free_bytes=$effectiveMinFreeBytes;formula='max(native_original_owner_floor,manifest_minimum,explicit_higher_override)';agent_initialized=$false;cache_migrated=$false}
   ConfigBinding
-  $setup=Start-Process -FilePath $baseline.setup_exe -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$install+'"'),'/TASKS="windowsservice"') -PassThru
+  $installTask=if($runtimeMode -ceq 'service'){'/TASKS="windowsservice"'}else{'/TASKS="windowsautorun"'}
+  $setup=Start-Process -FilePath $baseline.setup_exe -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$install+'"'),$installTask) -PassThru
   Need ((WaitProcess $setup 600 'baseline_setup_timeout') -eq 0) 'baseline_setup_failed'
   Installed $baseline.agent_binary_sha256 '3.2.692' | Out-Null
   Snapshot '692-before-upgrade' $seed | Out-Null
@@ -767,12 +968,13 @@ try {
   $newUpdater=Join-Path $install ('edr_agent_inplace_update-'+$target.version+'.ps1')
   Need ((SHA (Regular $newUpdater 1048576)) -ceq (SHA (Join-Path $target.runtime_dir 'edr_agent_inplace_update.ps1'))) 'actual_new_embedded_updater_required'
   Installed $target.agent_binary_sha256 $target.version | Out-Null
-  ServiceAction 'Stop' 'repair-stop'
+  $repairNative=Installed $target.agent_binary_sha256 $target.version
+  RuntimeAction 'Stop' 'repair-stop' $repairNative
   foreach ($name in @('unins000.exe','unins000.dat')) {Remove-Item -LiteralPath (Regular (Join-Path $install $name) 16777216) -Force}
-  ServiceAction 'Start' 'repair-start'
+  RuntimeAction 'Start' 'repair-start' $repairNative
   Transition 'repair' 'normal-headless-repair' $false $newUpdater
   $completed=$true
 } catch {$mainPrimaryFailure=$true;throw} finally {
-  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics);service_action_diagnostics=@($serviceActionDiagnostics)} $mainPrimaryFailure | Out-Null
+  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics);runtime_mode=$runtimeMode;service_action_diagnostics=@($serviceActionDiagnostics);task_action_diagnostics=@($taskActionDiagnostics)} $mainPrimaryFailure | Out-Null
 }
 Need $completed 'recovery_subset_incomplete'

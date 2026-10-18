@@ -21,17 +21,57 @@ class Contracts(unittest.TestCase):
         stages={}
         for label,version,source,digest in [('target','3.2.695',M.SOURCE,self.target),('baseline','3.2.692','a978ec83deacf7cd78c273d82630b457c5f39251',self.baseline)]:
             p=self.root/(label+'.json');self.write(p,{'version':version,'source_commit':source,'target_arch':'arm64','agent_binary_sha256':digest});stages[label]={'stage_path':str(p),'stage_sha256':M.sha(p.read_bytes())}
-        self.binding=self.root/'input.json';self.write(self.binding,{'schema':'edr.ci-cache-recovery-input.v1','prepared_only':False,'arch':'arm64','target':dict(stages['target'],source_sha=M.SOURCE),'baseline':stages['baseline'],'protocol5_package':{'path':self.package}})
+        self.binding=self.root/'input.json';self.write(self.binding,{'schema':'edr.ci-cache-recovery-input.v1','runtime_mode':'service','prepared_only':False,'arch':'arm64','target':dict(stages['target'],source_sha=M.SOURCE),'baseline':stages['baseline'],'protocol5_package':{'path':self.package}})
         self.pin=M.sha(self.binding.read_bytes())
-        summary={'schema':'edr.ci-cache-recovery-result.v1','input_sha256':self.pin,'target_source':M.SOURCE,'baseline':'win_3.2.692','status':'local_subset_passed','real_data_touched':False,'library_prepared_schema':True}
+        summary={'schema':'edr.ci-cache-recovery-result.v1','input_sha256':self.pin,'target_source':M.SOURCE,'baseline':'win_3.2.692','status':'local_subset_passed','real_data_touched':False,'library_prepared_schema':True,'runtime_mode':'service','service_action_diagnostics':[],'task_action_diagnostics':[]}
         for name in M.METADATA:self.write(self.source/name,summary if name=='recovery-subset-summary.json'else{'synthetic_metadata':True})
         for i,(label,(op,failed))in enumerate(M.LABELS.items()):
             task=str(i+1)*32
-            self.write(self.source/(label+'.intent.json'),{'task_id':task,'command_id':'ci-cache-recovery-'+task,'operation':op,'class':'installer_required','expected_hash':self.target,'health_failure_requested':failed,'no_automatic_retry':True})
+            self.write(self.source/(label+'.intent.json'),{'task_id':task,'command_id':'ci-cache-recovery-'+task,'operation':op,'class':'installer_required','runtime_mode':'service','expected_hash':self.target,'health_failure_requested':failed,'no_automatic_retry':True})
             self.write(self.source/(label+'.original-report.json'),{'target_version':'3.2.695','operation':op,'upgrade_class':'installer_required','expected_architecture':'arm64','expected_sha256':self.target,'runtime_manifest':self.package,'status':'synthetic_only'})
-            self.write(self.source/(label+'.original-journal.json'),{'schema_version':2,'task_id':task,'command_id':'ci-cache-recovery-'+task,'hash':self.target,'version':'3.2.695','operation':op,'upgrade_class':'installer_required','artifact_id':'ci-cache-recovery-3.2.695'})
+            self.write(self.source/(label+'.original-journal.json'),{'schema_version':2,'resolved_deployment_mode':'service','task_id':task,'command_id':'ci-cache-recovery-'+task,'hash':self.target,'version':'3.2.695','operation':op,'upgrade_class':'installer_required','artifact_id':'ci-cache-recovery-3.2.695'})
             (self.source/(label+'.stdout.log')).write_bytes(b'public synthetic stdout\n');(self.source/(label+'.stderr.log')).write_bytes(b'')
-        self.write(self.source/'health-failed-upgrade.health-trigger.json',{'action':'stop_exact_owned_service','fixture_only':True,'actual_previous_sha256':self.baseline,'native':{'exe_sha256':self.target,'fixture_config_binding_verified':True,'service_config_argv_verified':True},'owner_snapshot_sha256':M.sha((self.source/'health-failed-upgrade-before-trigger.json').read_bytes())})
+        self.write(self.source/'health-failed-upgrade.health-trigger.json',{'runtime_mode':'service','action':'stop_exact_owned_service','fixture_only':True,'actual_previous_sha256':self.baseline,'native':{'runtime_mode':'service','exe_sha256':self.target,'fixture_config_binding_verified':True,'service_config_argv_verified':True},'owner_snapshot_sha256':M.sha((self.source/'health-failed-upgrade-before-trigger.json').read_bytes())})
+    def mode_fixture(self,mode):
+        value=json.loads(self.binding.read_bytes());value['runtime_mode']=mode;self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+        self.mutate('recovery-subset-summary.json','input_sha256',self.pin)
+        self.mutate('recovery-subset-summary.json','runtime_mode',mode)
+        for label in M.LABELS:
+            self.mutate(label+'.intent.json','runtime_mode',mode)
+            self.mutate(label+'.original-journal.json','resolved_deployment_mode',mode)
+        key='health-failed-upgrade.health-trigger.json';value=json.loads((self.source/key).read_bytes())
+        value.update(runtime_mode=mode,action='stop_exact_owned_task'if mode=='scheduled_task'else'stop_exact_owned_service')
+        value['native']={'runtime_mode':mode,'exe_sha256':self.target,'fixture_config_binding_verified':True,
+                         'task_config_argv_verified'if mode=='scheduled_task'else'service_config_argv_verified':True}
+        self.write(self.source/key,value)
+    def test_task_mode_roundtrip_uses_distinct_bound_identity(self):
+        self.mode_fixture('scheduled_task');self.collect();value=json.loads((self.output/'manifest.json').read_bytes())
+        self.assertEqual(value['runtime_mode'],'scheduled_task');self.assertEqual(len(value['files']),24)
+    def test_missing_or_invalid_mode_is_never_service_fallback(self):
+        for mode in (None,True,1,'auto','Service'):
+            with self.subTest(mode=mode):
+                value=json.loads(self.binding.read_bytes());value['runtime_mode']=mode;self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+                with self.assertRaisesRegex(ValueError,'closed_recovery_runtime_mode'):self.collect()
+                self.assertFalse(self.output.exists())
+    def test_task_refuses_service_intent_journal_trigger_or_summary(self):
+        cases=[('normal-recovery-upgrade.intent.json','runtime_mode','service','phase_intent_identity'),
+               ('normal-headless-repair.original-journal.json','resolved_deployment_mode','service','phase_journal_identity'),
+               ('health-failed-upgrade.health-trigger.json','action','stop_exact_owned_service','health_trigger_identity'),
+               ('recovery-subset-summary.json','runtime_mode','service','owned_summary_identity'),
+               ('recovery-subset-summary.json','service_action_diagnostics',[{'label':'public'}],'mode_action_diagnostics')]
+        for name,key,value,cause in cases:
+            with self.subTest(name=name,key=key):
+                self.mode_fixture('scheduled_task');self.mutate(name,key,value)
+                with self.assertRaisesRegex(ValueError,cause):self.collect()
+                self.assertFalse(self.output.exists())
+                # Restore every modified field without replacing the original evidence shape.
+                self.mode_fixture('scheduled_task')
+                if key=='service_action_diagnostics':self.mutate(name,key,[])
+    def test_task_cannot_reuse_service_native_argv_proof(self):
+        self.mode_fixture('scheduled_task');name='health-failed-upgrade.health-trigger.json';value=json.loads((self.source/name).read_bytes())
+        value['native'].pop('task_config_argv_verified');value['native']['service_config_argv_verified']=True;self.write(self.source/name,value)
+        with self.assertRaisesRegex(ValueError,'health_trigger_identity'):self.collect()
+        self.assertFalse(self.output.exists())
     def write(self,p,v):p.write_bytes((json.dumps(v)+'\n').encode())
     def collect(self):return M.collect(self.source,self.binding,self.pin,self.output,self.root)
     def mutate(self,name,key,value):

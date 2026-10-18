@@ -11,6 +11,43 @@ from unittest.mock import patch
 SPEC=importlib.util.spec_from_file_location('prepare',Path(__file__).with_name('prepare_disposable_695.py'))
 M=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(M)
 class Contracts(unittest.TestCase):
+    def test_closed_runtime_mode_requires_exact_strings_before_io(self):
+        for mode in ('service','scheduled_task'):
+            self.assertEqual(M.runtime_mode(mode),mode)
+        for mode in (None,True,1,'Service','auto','scheduled_task;public',''):
+            with self.subTest(mode=mode),self.assertRaisesRegex(ValueError,'closed_recovery_runtime_mode'):
+                M.runtime_mode(mode)
+            with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('no external')):
+                root=Path(d)/'fresh'
+                with self.assertRaisesRegex(ValueError,'closed_recovery_runtime_mode'):
+                    M.prepare(Path(d),root,'UNBOUND','UNBOUND','0','UNBOUND','697',mode)
+                self.assertFalse(root.exists())
+    def test_finalize_refuses_mode_mismatch_before_package_io(self):
+        with tempfile.TemporaryDirectory()as d:
+            root=Path(d);p,unused,pin=M.cohort('697')
+            (root/'prepared.json').write_text(json.dumps({'source_sha':p['source'],'cohort_id':'697','cohort_catalog_sha256':pin,'runtime_mode':'service'}))
+            with self.assertRaisesRegex(ValueError,'prepared_runtime_mode'):
+                M.finalize(root,root,'697','scheduled_task')
+    def test_runtime_modes_are_isolated_without_dispatch_input(self):
+        text=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
+        before,job=text.split('  recover-synthetic-owner:',1)
+        self.assertNotIn('runtime_mode:',before)
+        self.assertIn('      fail-fast: false\n      matrix:\n        runtime_mode: [service, scheduled_task]\n',job)
+        self.assertIn('RECOVERY_RUNTIME_MODE: ${{ matrix.runtime_mode }}',job)
+        self.assertEqual(job.count('--runtime-mode "$env:RECOVERY_RUNTIME_MODE"'),2)
+        self.assertIn('outputs.id }}-${{ matrix.runtime_mode }}-metadata-',job)
+        self.assertIn('test_recovery_task_contracts.ps1',job)
+        self.assertIn('$meta.runtime_mode -cne $env:RECOVERY_RUNTIME_MODE',job)
+        driver=Path(__file__).with_name('windows_cache_recovery_ci.ps1').read_text()
+        self.assertIn("$runtimeMode=RecoveryMode $binding.runtime_mode",driver)
+        self.assertIn("DeploymentMode=$script:runtimeMode",driver)
+        self.assertIn("$params.ScheduledTaskName='FDSecurityAgent';$params.ScheduledTaskPath='\\'",driver)
+        self.assertIn("RuntimeAction 'Start' 'repair-start' $repairNative",driver)
+        self.assertIn('TaskNativeBinding $Native',driver)
+        worker=driver[driver.index('function TaskWorkerSource('):driver.index('function TaskSamplerSource')]
+        self.assertEqual(worker.count('TaskDefinitionMatches $definition $expected'),2)
+        # Immutable product manifest still has its original service descriptor.
+        self.assertIn("$raw[0].update.deployment_mode -eq 'service'",driver)
     def response(self):
         return {'code':'OK','message':'synthetic only','data':{'valid':True,'upgradeReady':True,'upgradeBlockers':[],
           'version':'3.2.695','arch':'arm64','platform':'windows','binarySha256':'a'*64,'signatureMode':'unsigned_integrity',
@@ -78,7 +115,7 @@ class Contracts(unittest.TestCase):
         self.assertIn('ref: ${{ steps.recovery-cohort.outputs.source }}',workflow)
         self.assertIn('profile --target-tag "$env:RECOVERY_TARGET_TAG"',workflow)
         self.assertIn('--cohort "$env:RECOVERY_COHORT"',workflow)
-        self.assertIn('name: disposable-cache-recovery-${{ steps.recovery-cohort.outputs.id }}-metadata-',workflow)
+        self.assertIn('name: disposable-cache-recovery-${{ steps.recovery-cohort.outputs.id }}-${{ matrix.runtime_mode }}-metadata-',workflow)
     def test_fixed_original_handler_scope(self):
         v,raw,d,p=self.check_verification(self.verification())
         self.assertIs(v['authenticated_platform_http'],False);self.assertEqual(p['full_installer'],'c'*64)
@@ -186,7 +223,7 @@ class Contracts(unittest.TestCase):
         self.assertIn("finally {",helper)
         self.assertIn("[Environment]::SetEnvironmentVariable('PSModulePath',$previousModulePath,[EnvironmentVariableTarget]::Process)",helper)
         self.assertNotIn('EnvironmentVariableTarget]::Machine',helper);self.assertNotIn('EnvironmentVariableTarget]::User',helper)
-        self.assertEqual(len(re.findall(r'^[ \t]+\$(?:owned|child)=StartWindowsPowerShellChild ',driver,re.M)),2)
+        self.assertEqual(len(re.findall(r'^[ \t]+\$(?:owned|child)=StartWindowsPowerShellChild ',driver,re.M)),3)
         wait=driver[driver.index('function WaitProcess('):driver.index('function ServiceObserverError(')]
         self.assertNotIn('.Handle',wait)
         workflow=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()

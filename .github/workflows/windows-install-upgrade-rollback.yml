@@ -588,8 +588,14 @@ jobs:
     permissions:
       contents: read
       actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime_mode: [service, scheduled_task]
     runs-on: windows-11-arm
     timeout-minutes: 90
+    env:
+      RECOVERY_RUNTIME_MODE: ${{ matrix.runtime_mode }}
     defaults:
       run:
         shell: pwsh
@@ -640,6 +646,8 @@ jobs:
           $driverSha=(Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
           & (Join-Path $PWD 'tests/cache-recovery/test_recovery_driver_contracts.ps1') -DriverSource $driver -DriverSha256 $driverSha
           if (-not $?) { throw 'Pure driver function contracts failed' }
+          & (Join-Path $PWD 'tests/cache-recovery/test_recovery_task_contracts.ps1') -DriverSource $driver -DriverSha256 $driverSha
+          if (-not $?) { throw 'Pure Task mode function contracts failed' }
           python -I -B tests/cache-recovery/test_cache_recovery_snapshot.py
           if ($LASTEXITCODE -ne 0) { throw 'Read-only synthetic snapshot/native-manifest checks failed' }
           python -I -B tests/cache-recovery/test_prepare_disposable_695.py
@@ -665,7 +673,7 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP ('edr-private-p5-recovery-'+[guid]::NewGuid().ToString('N'))
           "EDR_PRIVATE_RECOVERY_PREP=$root" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           "EDR_PRIVATE_RECOVERY_METADATA=$(Join-Path $env:RUNNER_TEMP ('uncreated-recovery-metadata-'+[guid]::NewGuid().ToString('N')))" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
-          python -I -B tests/cache-recovery/prepare_disposable_695.py prepare --workspace "$PWD" --output "$root" --cohort "$env:RECOVERY_COHORT"
+          python -I -B tests/cache-recovery/prepare_disposable_695.py prepare --workspace "$PWD" --output "$root" --cohort "$env:RECOVERY_COHORT" --runtime-mode "$env:RECOVERY_RUNTIME_MODE"
           if ($LASTEXITCODE -ne 0) { throw 'Preparation failed; no fallback, retry, scope change or recovery launch' }
       - name: Run original stdlib builder by file-list overlay and require original-handler P5 SHA
         timeout-minutes: 3
@@ -684,7 +692,7 @@ jobs:
           $env:EDR_P5_EXPORT_BINDING_SHA256=(Get-FileHash $env:EDR_P5_EXPORT_BINDING -Algorithm SHA256).Hash.ToLowerInvariant()
           go test -overlay (Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'overlay.json') $env:EDR_P5_EXPORT_OWNER $virtual -run '^TestPrivateP5Export$' -count=1 -timeout=30s -v
           if ($LASTEXITCODE -ne 0) { throw 'Original builder/preflight SHA gate failed; no recovery launch' }
-          python -I -B tests/cache-recovery/prepare_disposable_695.py finalize --workspace "$PWD" --output "$env:EDR_PRIVATE_RECOVERY_PREP" --cohort "$env:RECOVERY_COHORT"
+          python -I -B tests/cache-recovery/prepare_disposable_695.py finalize --workspace "$PWD" --output "$env:EDR_PRIVATE_RECOVERY_PREP" --cohort "$env:RECOVERY_COHORT" --runtime-mode "$env:RECOVERY_RUNTIME_MODE"
           if ($LASTEXITCODE -ne 0) { throw 'Original builder output binding failed' }
       - name: Verify process-scoped Windows PowerShell child module environment
         shell: pwsh
@@ -709,7 +717,7 @@ jobs:
               $summary=Join-Path $fresh[0].FullName 'recovery-subset-summary.json'
               if (Test-Path -LiteralPath $summary -PathType Leaf) {
                 $meta=Get-Content -Raw -LiteralPath $summary | ConvertFrom-Json -ErrorAction Stop
-                if ($meta.input_sha256 -cne $sha) { throw 'Recovery metadata owner binding mismatch' }
+                if ($meta.input_sha256 -cne $sha -or $meta.runtime_mode -cne $env:RECOVERY_RUNTIME_MODE) { throw 'Recovery metadata owner binding mismatch' }
                 "EDR_PRIVATE_RECOVERY_METADATA=$($fresh[0].FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
               }
             }
@@ -740,7 +748,7 @@ jobs:
         if: always() && steps.collect-cache-qa.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: disposable-cache-recovery-${{ steps.recovery-cohort.outputs.id }}-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          name: disposable-cache-recovery-${{ steps.recovery-cohort.outputs.id }}-${{ matrix.runtime_mode }}-metadata-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: error
           path: ${{ steps.collect-cache-qa.outputs.directory }}

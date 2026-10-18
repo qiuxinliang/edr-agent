@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 if ($env:OS -ne 'Windows_NT') {throw 'windows_required_not_native_tested_on_host'}
 $source=Get-Item -LiteralPath $DriverSource -Force
-if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $source.Length -gt 65536) {throw 'driver_regular_bound'}
+if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $source.Length -gt 131072) {throw 'driver_regular_bound'}
 function FileSHA([string]$Path) {
   $sha=[Security.Cryptography.SHA256]::Create()
   try {return ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Path)))).Replace('-','').ToLowerInvariant()} finally {$sha.Dispose()}

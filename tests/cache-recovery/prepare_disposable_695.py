@@ -285,7 +285,13 @@ def native_tools(root,snapshot,stage_owner,profile=None):
     return out
 
 
-def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_id='695'):
+def runtime_mode(value):
+    need(type(value)is str and value in ('service','scheduled_task'),'closed_recovery_runtime_mode_required')
+    return value
+
+
+def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_id='695',mode='service'):
+    mode=runtime_mode(mode)
     profile,baseline_profile,profile_sha=cohort(cohort_id)
     need(not root.exists(),'fresh_private_output_required')
     verification,receipt_raw,d,packages=verified_handler_receipt(receipt,receipt_sha,profile)
@@ -313,20 +319,22 @@ def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_
       'preflight':{'path':str(root/'preflight.json'),'sha256':digest(receipt_raw),'bytes':len(receipt_raw)}}
     json_save(root/'p5-binding.json',binding)
     json_save(root/'overlay.json',{'Replace':{str(owner.with_name('zz_private_p5_export_test.go')):str(workspace/'tests/cache-recovery/verified_headless_p5_export_test.go')}})
-    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'target_run':profile['release_run'],'tool_run':profile['native_run'],
+    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','runtime_mode':mode,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'target_run':profile['release_run'],'tool_run':profile['native_run'],
       'verification_origin':'ci_original_handler_verification','authenticated_platform_http':False,
       'original_handler_verification_sha256':receipt_sha,'preflight_sha256':digest(receipt_raw),'builder_owner_sha256':profile['builder_owner_sha256'],'expected_p5_sha256':packages['full_installer'],'requested_min_free_bytes':effective_floor,'catalog_written':False,
       'endpoint_task_created':False,'recovery_started':False,'stage_owner_sha256':digest(stage_owner.read_bytes()),'native_manifest_sha256':digest((tool/'manifest.json').read_bytes())})
 
 
-def finalize(workspace,root,cohort_id='695'):
+def finalize(workspace,root,cohort_id='695',mode='service'):
+    mode=runtime_mode(mode)
     profile,baseline_profile,profile_sha=cohort(cohort_id)
     p=strict_json((root/'prepared.json').read_bytes());need(p['source_sha']==profile['source'] and p['cohort_id']==cohort_id and p['cohort_catalog_sha256']==profile_sha,'prepared_source')
+    need(p.get('runtime_mode')==mode,'prepared_runtime_mode')
     package=root/('verified-p5-'+profile['version']+'-arm64.zip');need(package.is_file() and not package.is_symlink() and package.stat().st_size<=256*1024**2 and
         digest(package.read_bytes())==p['expected_p5_sha256'],'original_builder_output_preflight_hash_required')
     manifest=root/'target-download'/('edr-agent-'+profile['tag']+'-windows-arm64-artifact-manifest.json')
     stage=root/'target-stage.json';baseline=root/'baseline-stage.json';tools=root/'native-tools/manifest.json';owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py'
-    j={'schema':'edr.ci-cache-recovery-input.v1','prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
+    j={'schema':'edr.ci-cache-recovery-input.v1','runtime_mode':mode,'prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
        'snapshot_helper_sha256':digest((workspace/'tests/cache-recovery/cache_recovery_snapshot.py').read_bytes()),'requested_min_free_bytes':p['requested_min_free_bytes'],
        'baseline':{'stage_path':str(baseline),'stage_sha256':digest(baseline.read_bytes())},
        'target':{'source_sha':profile['source'],'stage_path':str(stage),'stage_sha256':digest(stage.read_bytes()),'artifact_manifest_path':str(manifest),'artifact_manifest_sha256':digest(manifest.read_bytes())},
@@ -336,7 +344,7 @@ def finalize(workspace,root,cohort_id='695'):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697'],default='695');selection.add_argument('--target-tag');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697'],default='695');selection.add_argument('--target-tag');parser.add_argument('--runtime-mode',choices=['service','scheduled_task'],default='service');args=parser.parse_args()
     need(args.mode=='profile' or args.target_tag is None,'target_tag_descriptor_only')
     if args.target_tag is not None:
         matches=[key for key in ('695','697')if cohort(key,False)[0]['tag']==args.target_tag]
@@ -349,8 +357,8 @@ def main():
     args.output.resolve().relative_to(Path(os.environ['RUNNER_TEMP']).resolve())
     if args.mode=='prepare':
         need(bool(os.environ.get('GH_TOKEN')),'existing_read_token_missing_no_new_permission')
-        prepare(args.workspace.resolve(),args.output.resolve(),os.environ.get('P5_HANDLER_VERIFICATION_JSON',''),os.environ.get('P5_HANDLER_VERIFICATION_SHA256',''),os.environ.get('P5_HIGHER_MIN_FREE_BYTES','0'),os.environ.get('P5_BACKEND_OWNER_BASE64',''),args.cohort)
-    else:finalize(args.workspace.resolve(),args.output.resolve(),args.cohort)
+        prepare(args.workspace.resolve(),args.output.resolve(),os.environ.get('P5_HANDLER_VERIFICATION_JSON',''),os.environ.get('P5_HANDLER_VERIFICATION_SHA256',''),os.environ.get('P5_HIGHER_MIN_FREE_BYTES','0'),os.environ.get('P5_BACKEND_OWNER_BASE64',''),args.cohort,args.runtime_mode)
+    else:finalize(args.workspace.resolve(),args.output.resolve(),args.cohort,args.runtime_mode)
     print(json.dumps({'status':'prepared_inputs_only'if args.mode=='prepare'else'bound_original_builder_output','real_recovery_pass_claimed':False,'catalog_or_endpoint_task':False}))
 
 if __name__=='__main__':

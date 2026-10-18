@@ -92,6 +92,7 @@ def read_binding(path,pin):
          b.get('cohort_catalog_sha256')==profile_sha,'cohort_catalog_sha_mismatch')
     need(b.get('schema')=='edr.ci-cache-recovery-input.v1' and b.get('prepared_only')is False and b.get('arch')=='arm64' and
          b.get('target',{}).get('source_sha')==profile['source'],'binding_scope')
+    mode=_PROFILE_OWNER.runtime_mode(b.get('runtime_mode'))
     stages={}
     for which,version in (('target',profile['version']),('baseline',baseline_profile['version'])):
         spec=b.get(which,{});raw=take(Path(spec.get('stage_path','')))
@@ -114,13 +115,13 @@ def phase_identity(data,b,stages):
         task=intent.get('task_id');need(type(task)is str and re.fullmatch('[0-9a-f]{32}',task) and
             intent.get('command_id')=='ci-cache-recovery-'+task and intent.get('operation')==operation and
             intent.get('class')=='installer_required' and intent.get('expected_hash')==target and
-            intent.get('health_failure_requested')is health_fail and intent.get('no_automatic_retry')is True,'phase_intent_identity')
+            intent.get('runtime_mode')==b['runtime_mode'] and intent.get('health_failure_requested')is health_fail and intent.get('no_automatic_retry')is True,'phase_intent_identity')
         key=label+'.original-journal.json'
         if key in data:
             j=strict_json(data[key]);need(j.get('schema_version')==2 and type(j.get('schema_version'))is int and
               j.get('task_id')==task and j.get('command_id')==intent['command_id'] and j.get('hash')==target and
               j.get('version')==version and j.get('operation')==operation and j.get('upgrade_class')=='installer_required' and
-              j.get('artifact_id')=='ci-cache-recovery-'+version,'phase_journal_identity')
+              j.get('artifact_id')=='ci-cache-recovery-'+version and j.get('resolved_deployment_mode')==b['runtime_mode'],'phase_journal_identity')
         key=label+'.original-report.json'
         if key in data:
             j=strict_json(data[key]);need(j.get('target_version')==version and j.get('operation')==operation and
@@ -130,9 +131,9 @@ def phase_identity(data,b,stages):
     key='health-failed-upgrade.health-trigger.json'
     if key in data:
         j=strict_json(data[key]);n=j.get('native',{});snapshot='health-failed-upgrade-before-trigger.json'
-        need('health-failed-upgrade.intent.json'in data and snapshot in data and j.get('action')=='stop_exact_owned_service' and j.get('fixture_only')is True and
+        need('health-failed-upgrade.intent.json'in data and snapshot in data and j.get('runtime_mode')==b['runtime_mode'] and j.get('action')==('stop_exact_owned_service'if b['runtime_mode']=='service'else'stop_exact_owned_task') and j.get('fixture_only')is True and
           j.get('actual_previous_sha256')==stages['baseline']['agent_binary_sha256'] and n.get('exe_sha256')==target and
-          n.get('fixture_config_binding_verified')is True and n.get('service_config_argv_verified')is True and
+          n.get('fixture_config_binding_verified')is True and n.get('runtime_mode')==b['runtime_mode'] and n.get('service_config_argv_verified'if b['runtime_mode']=='service'else'task_config_argv_verified')is True and
           j.get('owner_snapshot_sha256')==sha(data[snapshot]),'health_trigger_identity')
 
 
@@ -152,14 +153,17 @@ def collect(source,binding,pin,output,runner_temp):
     need('recovery-subset-summary.json'in data,'owned_summary_required')
     summary=strict_json(data['recovery-subset-summary.json'])
     need(summary.get('schema')=='edr.ci-cache-recovery-result.v1' and summary.get('input_sha256')==pin and summary.get('target_source')==stages['target']['source_commit'] and
-         summary.get('baseline')=='win_3.2.692' and summary.get('status')in ('local_subset_passed','failed_or_unknown') and
+         summary.get('runtime_mode')==b['runtime_mode'] and summary.get('baseline')=='win_3.2.692' and summary.get('status')in ('local_subset_passed','failed_or_unknown') and
          summary.get('real_data_touched')is False and summary.get('library_prepared_schema')is True,'owned_summary_identity')
+    selected='service_action_diagnostics'if b['runtime_mode']=='service'else'task_action_diagnostics'
+    opposite='task_action_diagnostics'if b['runtime_mode']=='service'else'service_action_diagnostics'
+    need(type(summary.get(selected))is list and summary.get(opposite)==[],'mode_action_diagnostics')
     for name in METADATA:
         if name in data:strict_json(data[name])
     phase_identity(data,b,stages)
     need(summary['status']!='local_subset_passed' or not missing,'passed_subset_missing_raw_evidence')
     manifest={'schema':'edr.ci-synthetic-recovery-artifacts.v1','purpose':'private_ci_fixture_raw_qa_evidence','input_sha256':pin,
-      'target_source':stages['target']['source_commit'],'target_version':stages['target']['version'],'baseline':'win_3.2.692','arch':'arm64',
+      'runtime_mode':b['runtime_mode'],'target_source':stages['target']['source_commit'],'target_version':stages['target']['version'],'baseline':'win_3.2.692','arch':'arm64',
       'recovery_status':summary['status'],'collector_status':'collected_fixed_whitelist','complete_file_inventory':not missing,
       'not_observed_files':missing,'source_terminal_state_proven_by_collector':False,
       'files':[{'name':name,'bytes':len(data[name]),'sha256':sha(data[name])}for name in ALLOW if name in data],
