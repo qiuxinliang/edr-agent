@@ -381,6 +381,104 @@ try {
     $oldTarget=(Get-Item Function:\StopLogTarget).ScriptBlock
     function StopLogTarget($Context) {throw 'stop_log_target_generation_not_live'}
     try{ResetPublicLog;$ctx=PublicLogContext;Checked (-not $ctx.ready -and $ctx.diagnostic.cause -ceq 'context_binding_unknown') 'log_target_exit_binding_is_unknown'}finally{CloseStopLogContext $ctx;Set-Item Function:\StopLogTarget $oldTarget}
+    # Held-object state seams. These mocks test acceptance/failure decisions;
+    # they do not prove .NET Framework Process behavior after a real exit.
+    function PublicMockHeldProcess($Context,[bool]$Exited,$Code=7) {
+      $mock=[pscustomobject]@{Handle=$Context.processHandle;HasExited=$Exited;ExitCode=$Code;Id=$Context.native.pid;StartTime=$self.StartTime;Path=$Context.agentPath}
+      $mock|Add-Member ScriptMethod Refresh {}; $mock|Add-Member ScriptMethod Dispose {}
+      $Context.process.Dispose();$Context.process=$mock
+    }
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+    PublicAppend "[preprocess] shutdown timed out; retaining worker dependencies`n"
+    ObserveStopLog $ctx 500
+    Checked ($ctx.diagnostic.held_process.has_exited -and $ctx.diagnostic.held_process.exit_code_known -and $ctx.diagnostic.held_process.exit_code -eq 7 -and $ctx.diagnostic.final_tail.attempted -and $ctx.diagnostic.final_tail.sealed -and $ctx.diagnostic.polls -eq 1 -and $ctx.diagnostic.matches.Count -eq 1 -and -not $ctx.diagnostic.action_result_can_change) 'log_known_held_exit_reads_one_final_fixed_line'
+    $sealedOffset=$ctx.offset;PublicAppend "[preprocess] shutdown timed out: AVE still owns the batch sink`n"
+    Fails {ReadStopLogSlice $ctx 2} 'stop_log_final_tail_already_attempted'
+    Checked ($ctx.offset -eq $sealedOffset -and $ctx.diagnostic.matches.Count -eq 1) 'log_append_after_seal_not_consumed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true $null
+    PublicAppend "[preprocess] shutdown timed out; retaining worker dependencies`n"
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_target_exit_code_unknown'
+    Checked ($ctx.diagnostic.held_process.has_exited -and -not $ctx.diagnostic.held_process.exit_code_known -and -not $ctx.diagnostic.final_tail.attempted -and $ctx.diagnostic.bytes_read -eq 0) 'log_unknown_exit_code_never_reads_tail';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+    $ctx.process.PSObject.Properties.Remove('ExitCode')
+    $ctx.process|Add-Member ScriptProperty ExitCode {throw [InvalidOperationException]::new('unexported-test-message')}
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_target_exit_code_unknown'
+    Checked (-not $ctx.diagnostic.held_process.exit_code_known -and -not $ctx.diagnostic.final_tail.attempted -and ($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'unexported-test-message') 'log_throwing_exit_code_no_tail_or_raw_error';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $false 7;$ctx.process.Id++
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_target_generation_not_live'
+    Checked (-not $ctx.diagnostic.held_process.has_exited -and -not $ctx.diagnostic.held_process.live_identity_verified -and -not $ctx.diagnostic.final_tail.attempted) 'log_live_mismatch_not_relabelled_exit';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;$ctx.process.Handle=[IntPtr]::Zero
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_held_handle_changed';CloseStopLogContext $ctx
+    # NewStopLogContext refuses a target already exited before its initial bind.
+    $oldGetProcessFunction=Get-Item Function:\Get-Process -ErrorAction SilentlyContinue
+    $initialDead=[pscustomobject]@{Handle=[IntPtr]1;HasExited=$true;ExitCode=[int]7;Id=$PID;StartTime=$self.StartTime;Path=$script:agent}
+    $initialDead|Add-Member ScriptMethod Refresh {}; $initialDead|Add-Member ScriptMethod Dispose {}
+    function Get-Process {[CmdletBinding()]param([int]$Id);return $initialDead}
+    try {
+      ResetPublicLog;$ctx=PublicLogContext
+      Checked (-not $ctx.ready -and $ctx.diagnostic.cause -ceq 'context_binding_unknown' -and -not $ctx.diagnostic.final_tail.attempted) 'log_initially_exited_context_never_bound';CloseStopLogContext $ctx
+    }finally{Remove-Item Function:\Get-Process;if($null -ne $oldGetProcessFunction){Set-Item Function:\Get-Process $oldGetProcessFunction.ScriptBlock}}
+    # A context which was not live-bound before Stop can never gain final-tail authority.
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;$ctx.ready=$false
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_target_generation_not_live'
+    Checked (-not $ctx.diagnostic.final_tail.attempted) 'log_initial_dead_or_unbound_target_no_tail';CloseStopLogContext $ctx
+    # The exit happens during a live read. Discard that buffer; one later final
+    # read from the unchanged offset is allowed only inside Observe's budget.
+    $oldInfo=(Get-Item Function:\StopLogInfo).ScriptBlock;$script:heldInfoCalls=0
+    function StopLogInfo($Stream) {
+      if([Object]::ReferenceEquals($Stream,$ctx.stream)){$script:heldInfoCalls++;if($script:heldInfoCalls -eq 2){$ctx.process.HasExited=$true}}
+      & $oldInfo $Stream
+    }
+    try {
+      ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $false 7;$script:heldInfoCalls=0
+      PublicAppend "[preprocess] shutdown failed: pending batch has no durable owner`n"
+      ReadStopLogSlice $ctx 1
+      Checked ($ctx.exitTailPending -and $ctx.diagnostic.bytes_read -eq 0 -and $ctx.diagnostic.matches.Count -eq 0) 'log_transition_read_not_committed'
+      ObserveStopLog $ctx 500
+      Checked ($ctx.diagnostic.final_tail.sealed -and $ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_batch_handoff_failed') 'log_transition_then_one_final_tail';CloseStopLogContext $ctx
+      ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $false 7;$script:heldInfoCalls=0
+      PublicAppend (((('x'*3999)+"`n"))*10)
+      ReadStopLogSlice $ctx 1
+      Checked ($ctx.diagnostic.read_attempt_bytes -eq 40000 -and $ctx.diagnostic.bytes_read -eq 0) 'log_discarded_read_charged_to_same_budget'
+      ObserveStopLog $ctx 500
+      Checked ($ctx.diagnostic.status -ceq 'unknown' -and $ctx.diagnostic.error.cause_code -ceq 'stop_log_new_bytes_bound' -and $ctx.diagnostic.read_attempt_bytes -eq 40000 -and -not $ctx.diagnostic.final_tail.sealed) 'log_final_tail_cannot_reread_past_total_budget';CloseStopLogContext $ctx
+    }finally{Set-Item Function:\StopLogInfo $oldInfo}
+    # Existing file/config/anchor/cap boundaries remain active after known exit.
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+    Move-Item -LiteralPath $logPath -Destination ($logPath+'.final-old')
+    [IO.File]::WriteAllText($logPath,"replacement`n",[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_rotation_or_replacement';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;[IO.File]::WriteAllText($logPath,'',[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_truncated_or_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;[IO.File]::AppendAllText($script:configPath,"#changed`n",[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_config_hash_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;[IO.File]::WriteAllText($logPath,(('x'*128)+"`n"),[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_anchor_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;PublicAppend ('x'*65537)
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_new_bytes_bound';CloseStopLogContext $ctx
+    # A final read sees a growing file: do not seal or submit its bytes.
+    $oldInfo=(Get-Item Function:\StopLogInfo).ScriptBlock;$script:heldInfoCalls=0
+    function StopLogInfo($Stream) {
+      if([Object]::ReferenceEquals($Stream,$ctx.stream)){$script:heldInfoCalls++;if($script:heldInfoCalls -eq 2){PublicAppend "public concurrent append`n"}}
+      & $oldInfo $Stream
+    }
+    try {
+      ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7;$script:heldInfoCalls=0
+      PublicAppend "[preprocess] shutdown timed out; retaining worker dependencies`n"
+      Fails {ReadStopLogSlice $ctx 1} 'stop_log_final_tail_changed_during_read'
+      Checked ($ctx.diagnostic.final_tail.attempted -and -not $ctx.diagnostic.final_tail.sealed -and $ctx.diagnostic.bytes_read -eq 0) 'log_unstable_final_tail_unknown';CloseStopLogContext $ctx
+    }finally{Set-Item Function:\StopLogInfo $oldInfo}
+    $oldSlice=(Get-Item Function:\ReadStopLogSlice).ScriptBlock
+    function ReadStopLogSlice($Context,[long]$ElapsedMs) {& $oldSlice $Context $ElapsedMs;Start-Sleep -Milliseconds 120}
+    try {
+      ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+      PublicAppend "[preprocess] shutdown timed out; retaining worker dependencies`n"
+      ObserveStopLog $ctx 100
+      Checked ($ctx.diagnostic.status -ceq 'unknown' -and -not $ctx.diagnostic.within_observation_budget -and $ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.polls -eq 1) 'log_final_tail_slow_io_never_accepts_deadline_overrun';CloseStopLogContext $ctx
+    }finally{Set-Item Function:\ReadStopLogSlice $oldSlice}
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+    ObserveStopLog $ctx 500
+    Checked ($ctx.diagnostic.status -ceq 'unknown' -and $ctx.diagnostic.cause -ceq 'held_process_exited_final_tail_no_match_not_exclusion') 'log_final_tail_zero_matches_still_not_exclusion';CloseStopLogContext $ctx
     # Integration seam only: no 60s delay. Original Stop action fails first;
     # a secondary log exception must not replace that primary failure.
     $oldObserve=(Get-Item Function:\ObserveStopLog).ScriptBlock;$script:logObserveCalls=0;$script:primaryFrozenBeforeLog=$false
@@ -396,6 +494,11 @@ try {
       ServiceAction 'Stop' 'health-failed-upgrade-health-stop' $ctx
       Checked ($logObserveCalls -eq $beforeCalls -and $serviceActionDiagnostics[0].worker.exit_code -eq 0 -and $null -eq $ctx.stream) 'log_not_run_for_successful_control'
     }finally{Set-Item Function:\ObserveStopLog $oldObserve}
+    ResetPublicLog;$ctx=PublicLogContext;PublicMockHeldProcess $ctx $true 7
+    PublicAppend "[preprocess] shutdown timed out; retaining worker dependencies`n"
+    ServiceCase 'log-final-tail-primary';$script:serviceMock='nonzero'
+    Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop' $ctx} 'service_control_failed'
+    Checked ($serviceActionDiagnostics[0].worker.exit_code -eq 7 -and $null -ne $serviceActionDiagnostics[0].primary_failure -and $serviceActionDiagnostics[0].shutdown_log_observation.final_tail.sealed -and -not $serviceActionDiagnostics[0].shutdown_log_observation.action_result_can_change) 'log_completed_final_tail_does_not_change_primary_action_failure'
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'
