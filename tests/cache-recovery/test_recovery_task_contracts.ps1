@@ -54,6 +54,25 @@ try {
   function ConfigBinding {}
   $rows=@(TaskProcesses $agent $configPath);Check ($rows.Count -eq 1 -and $rows[0].pid -eq 1234) 'one_bound_task_generation'
   $native=InstalledTask ('b'*64);Check ($native.task_config_argv_verified -and $native.runtime_mode -ceq 'scheduled_task') 'installed_task_native_binding'
+  # The original launcher uses WindowsPowerShell5.1 Start-Process. Its fixed
+  # argv may have terminal SP/TAB; no leading, embedded, CR/LF or extra argv is accepted.
+  $canonicalCommandLine=[string]$processRows[0].CommandLine
+  foreach($suffix in @(' ',"`t"," `t `t")){
+    $processRows[0].CommandLine=$canonicalCommandLine+$suffix
+    $padded=@(TaskProcesses $agent $configPath)
+    Check ($padded.Count -eq 1 -and $padded[0].pid -eq 1234 -and $padded[0].birth_filetime -ceq $native.birth_filetime) 'task_terminal_ascii_padding_same_generation'
+  }
+  foreach($badLine in @(
+    (' '+$canonicalCommandLine),
+    $canonicalCommandLine.Replace(' --config ','  --config '),
+    ($canonicalCommandLine+"`r"),($canonicalCommandLine+"`n"),($canonicalCommandLine+"`r`n"),
+    ($canonicalCommandLine+' --service'),
+    $canonicalCommandLine.Replace($configPath,(Join-Path $dir 'other.toml')),
+    $canonicalCommandLine.Replace($agent,(Join-Path $dir 'other.exe')))){
+    $processRows[0].CommandLine=$badLine
+    Fails {TaskProcesses $agent $configPath} 'task_process_config_argv_binding'
+  }
+  $processRows[0].CommandLine=$canonicalCommandLine
   $processRows[0].CommandLine+=' --config "public"';Fails {TaskProcesses $agent $configPath} 'task_process_config_argv_binding';$processRows[0].CommandLine='"'+$agent+'" --config "'+$configPath+'"'
   $single=$processRows[0];$processRows=@($single,$single);Fails {TaskProcesses $agent $configPath} 'task_process_ambiguous';$processRows=@($single)
   $script:processCalls=0;$script:changeBirth=$true;Fails {TaskProcesses $agent $configPath} 'task_generation_changed';$script:changeBirth=$false
@@ -94,5 +113,5 @@ try {
     Check ($waits[0] -eq 45000) 'task_exact_outer_wait_45'
   }
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}
-if($count -ne 42){throw 'task_pure_check_inventory'}
+if($count -ne 53){throw 'task_pure_check_inventory'}
 [Console]::Out.WriteLine(('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false native_child_executed=false'))

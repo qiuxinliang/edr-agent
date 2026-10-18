@@ -560,7 +560,9 @@ function TaskProcesses {
   Need ($selected.Count -le 1) 'task_process_ambiguous'
   if(-not $selected.Count){return @()}
   $record=$selected[0];$expected='"'+$Agent+'" --config "'+$Config+'"'
-  Need ([string]$record.CommandLine -ieq $expected -and [regex]::Matches([string]$record.CommandLine,'(?i)(?<!\S)--config(?=\s)').Count -eq 1) 'task_process_config_argv_binding'
+  # WindowsPowerShell5.1 Start-Process may append horizontal argument padding.
+  # Only terminal ASCII SP/TAB is insignificant; every other byte layout stays exact.
+  Need (([string]$record.CommandLine).TrimEnd([char[]]@(' ',"`t")) -ieq $expected -and [regex]::Matches([string]$record.CommandLine,'(?i)(?<!\S)--config(?=\s)').Count -eq 1) 'task_process_config_argv_binding'
   $p=Get-Process -Id $record.ProcessId -ErrorAction Stop
   Need ($p.Path -ieq $Agent) 'task_process_path'
   $birth=$p.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
