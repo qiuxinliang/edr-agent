@@ -21,6 +21,23 @@ function Regular([string]$Path,[UInt64]$Cap) {
   return $p.FullName
 }
 function SHA([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+# Natural embedded-updater readiness, matching the existing lifecycle-smoke
+# contract. Never copy the sidecar or invoke a resolver to create this file.
+function Wait-EmbeddedUpdaterMaterialized {
+  param([string]$Version,[string]$ExpectedScript,[int]$Seconds=45)
+  Need ($Seconds -ge 1 -and $Seconds -le 45) 'embedded_updater_readiness_bound'
+  $materialized=Join-Path $script:install ("edr_agent_inplace_update-{0}.ps1" -f $Version)
+  $expectedHash=SHA (Regular $ExpectedScript 1048576)
+  for($i=0;$i -lt $Seconds;$i++) {
+    if(Test-Path -LiteralPath $materialized) {
+      $actualHash=SHA (Regular $materialized 1048576)
+      Need ($actualHash -ceq $expectedHash) 'embedded_updater_hash_mismatch'
+      return $materialized
+    }
+    Start-Sleep -Seconds 1
+  }
+  throw 'embedded_updater_materialization_timeout'
+}
 function ReadBounded([string]$Path,[int]$Cap) {
   $path=Regular $Path $Cap;$before=Get-Item -LiteralPath $path -Force
   $s=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
@@ -991,13 +1008,14 @@ try {
   Need ((WaitProcess $setup 600 'baseline_setup_timeout') -eq 0) 'baseline_setup_failed'
   Installed $baseline.agent_binary_sha256 '3.2.692' | Out-Null
   Snapshot '692-before-upgrade' $seed | Out-Null
-  $oldUpdater=Join-Path $install 'edr_agent_inplace_update-3.2.692.ps1'
+  $oldUpdater=Wait-EmbeddedUpdaterMaterialized -Version '3.2.692' -ExpectedScript (Join-Path $baseline.runtime_dir 'edr_agent_inplace_update.ps1')
   Need ((SHA (Regular $oldUpdater 1048576)) -ceq (SHA (Join-Path $baseline.runtime_dir 'edr_agent_inplace_update.ps1'))) 'actual692_embedded_updater_required'
   Transition 'upgrade' 'health-failed-upgrade' $true $oldUpdater
   # After automatic rollback the exact692 embedded owner is required again.
+  $oldUpdater=Wait-EmbeddedUpdaterMaterialized -Version '3.2.692' -ExpectedScript (Join-Path $baseline.runtime_dir 'edr_agent_inplace_update.ps1')
   Need ((SHA (Regular $oldUpdater 1048576)) -ceq (SHA (Join-Path $baseline.runtime_dir 'edr_agent_inplace_update.ps1'))) 'restored692_updater_required'
   Transition 'upgrade' 'normal-recovery-upgrade' $false $oldUpdater
-  $newUpdater=Join-Path $install ('edr_agent_inplace_update-'+$target.version+'.ps1')
+  $newUpdater=Wait-EmbeddedUpdaterMaterialized -Version $target.version -ExpectedScript (Join-Path $target.runtime_dir 'edr_agent_inplace_update.ps1')
   Need ((SHA (Regular $newUpdater 1048576)) -ceq (SHA (Join-Path $target.runtime_dir 'edr_agent_inplace_update.ps1'))) 'actual_new_embedded_updater_required'
   Installed $target.agent_binary_sha256 $target.version | Out-Null
   $repairNative=Installed $target.agent_binary_sha256 $target.version

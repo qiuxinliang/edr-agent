@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Pure local function tests: no SCM, native child, installer, Agent, or network.
+# Pure local function tests: one public PowerShell file-writer child; no SCM, installer, Agent, or network.
 [CmdletBinding()]
 param(
   [string]$DriverSource=(Join-Path $PSScriptRoot 'windows_cache_recovery_ci.ps1'),
@@ -14,7 +14,7 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_changed'}
-$wanted=@('Need','Regular','SHA','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
+$wanted=@('Need','Regular','SHA','Wait-EmbeddedUpdaterMaterialized','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
 $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
 if ($functions.Count -ne $wanted.Count) {throw 'function_inventory'}
 # Only these source-owned function definitions are loaded, never driver top-level.
@@ -81,6 +81,49 @@ function DiagnosticStub {
 $dir=Join-Path ([IO.Path]::GetTempPath()) ('edr-driver-contract-'+[Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $dir | Out-Null
 try {
+  # Real public files exercise the source-owned readiness function. Only this
+  # same-host PowerShell worker writes; no installer/Agent/resolver is invoked.
+  $readinessHadInstall=$null -ne (Get-Variable -Name install -Scope Script -ErrorAction SilentlyContinue)
+  if($readinessHadInstall){$readinessOldInstall=$script:install}
+  $script:install=Join-Path $dir 'public-updater-readiness';New-Item -ItemType Directory -Path $script:install | Out-Null
+  try {
+    $publicExpected=Join-Path $dir 'public-expected-updater.ps1'
+    [IO.File]::WriteAllText($publicExpected,'public-updater-body',[Text.UTF8Encoding]::new($false))
+    $publicReady=Join-Path $script:install 'edr_agent_inplace_update-0.0.1.ps1'
+    FailsType {Regular $publicReady 1048576} ([Management.Automation.ItemNotFoundException])
+    $writerSource=Join-Path $dir 'public-updater-file-writer.ps1'
+    $writerBody=@'
+$ErrorActionPreference='Stop'
+Start-Sleep -Milliseconds 300
+[IO.File]::WriteAllText('__DEST__.public-tmp','public-updater-body',[Text.UTF8Encoding]::new($false))
+[IO.File]::Move('__DEST__.public-tmp','__DEST__')
+'@
+    [IO.File]::WriteAllText($writerSource,$writerBody.Replace('__DEST__',$publicReady.Replace("'","''")),[Text.UTF8Encoding]::new($false))
+    $writerOut=Join-Path $dir 'public-updater-file-writer.stdout';$writerErr=Join-Path $dir 'public-updater-file-writer.stderr'
+    $hostExe=(Microsoft.PowerShell.Management\Get-Process -Id $PID).Path
+    $writer=$null;$writerPrimary=$null
+    try {
+      $writer=Microsoft.PowerShell.Management\Start-Process -FilePath $hostExe -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$writerSource+'"')) -PassThru -RedirectStandardOutput $writerOut -RedirectStandardError $writerErr
+      # Test only: cache this owned handle before terminal on Windows PowerShell.
+      $null=$writer.Handle
+      $ready=Wait-EmbeddedUpdaterMaterialized -Version '0.0.1' -ExpectedScript $publicExpected -Seconds 10
+      Checked ($ready -ceq $publicReady -and (SHA (Regular $ready 1048576)) -ceq (SHA $publicExpected)) 'embedded_updater_delayed_natural_file_ready'
+      Need ($writer.WaitForExit(5000)) 'public_updater_writer_terminal_unknown'
+      $writer.Refresh()
+      Checked ($writer.HasExited -and $writer.ExitCode -is [int] -and $writer.ExitCode -eq 0 -and (Get-Item -LiteralPath $writerOut).Length -eq 0 -and (Get-Item -LiteralPath $writerErr).Length -eq 0) 'public_updater_writer_known_exit_and_empty_streams'
+    }catch{$writerPrimary=$_;throw}finally{
+      if($null -ne $writer){
+        try{if(-not $writer.HasExited){$writer.Kill();Need ($writer.WaitForExit(5000)) 'public_updater_writer_cleanup_unknown'}}
+        catch{if($null -eq $writerPrimary){throw};[Console]::Error.WriteLine('public_updater_writer_secondary_cleanup_unknown')}
+        finally{try{$writer.Dispose()}catch{if($null -eq $writerPrimary){throw};[Console]::Error.WriteLine('public_updater_writer_secondary_dispose_unknown')}}
+      }
+    }
+    Checked ((Wait-EmbeddedUpdaterMaterialized -Version '0.0.1' -ExpectedScript $publicExpected -Seconds 1) -ceq $publicReady) 'embedded_updater_stable_correct_file_ready'
+    [IO.File]::WriteAllText($publicReady,'wrong-public-updater-body',[Text.UTF8Encoding]::new($false))
+    Fails {Wait-EmbeddedUpdaterMaterialized -Version '0.0.1' -ExpectedScript $publicExpected -Seconds 1} 'embedded_updater_hash_mismatch'
+    Remove-Item -LiteralPath $publicReady -Force
+    Fails {Wait-EmbeddedUpdaterMaterialized -Version '0.0.1' -ExpectedScript $publicExpected -Seconds 1} 'embedded_updater_materialization_timeout'
+  }finally{if($readinessHadInstall){$script:install=$readinessOldInstall}else{Remove-Variable -Name install -Scope Script -ErrorAction SilentlyContinue}}
   $configPath=Join-Path $dir 'public.toml'
   $expectedConfigPairs=@(@('endpoint_id','public-synthetic'),@('tenant_id','synthetic'),@('evidence_cache_path',(Join-Path $dir 'cache.db')))
   $lines=@($expectedConfigPairs | ForEach-Object {$_[0]+' = "'+$_[1].Replace('\','\\')+'"'})
@@ -507,5 +550,5 @@ try {
     $self.Dispose()
     foreach($name in @('install','agent','configPath','configSha256')){if($originalLogVariables.ContainsKey($name)){Set-Variable -Name $name -Value $originalLogVariables[$name] -Scope Script}else{Remove-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue}}
   }
-  Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false native_child_executed=false')
+  Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false product_or_service_child_executed=false public_powershell_fixture_child_executed=true')
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}
