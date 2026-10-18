@@ -294,10 +294,183 @@ function FinishServiceObserver($Child,$Value,[string]$Stdout,[string]$Stderr,[in
   }
   return $failed
 }
-function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label) {
+# QA-only selected log observer. Never changes an action/rollback result.
+function StopLogNative {
+  if($null -eq ('EdrRecoveryLogReadV1' -as [type])){
+    Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class EdrRecoveryLogReadV1 {
+ [StructLayout(LayoutKind.Sequential)] public struct Info {
+  public uint Attributes,CreationLow,CreationHigh,AccessLow,AccessHigh,WriteLow,WriteHigh;
+  public uint Volume,SizeHigh,SizeLow,Links,IndexHigh,IndexLow;
+  public ulong Length { get { return ((ulong)SizeHigh << 32) | SizeLow; } }
+  public string Identity { get { return Volume.ToString("x8")+":"+IndexHigh.ToString("x8")+IndexLow.ToString("x8")+":"+CreationHigh.ToString("x8")+CreationLow.ToString("x8"); } }
+ }
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
+ [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle handle,out Info info);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,StringBuilder path,uint capacity,uint flags);
+}
+'@
+  }
+}
+function StopLogInfo($Stream) {
+  $v=New-Object EdrRecoveryLogReadV1+Info
+  if(-not [EdrRecoveryLogReadV1]::GetFileInformationByHandle($Stream.SafeFileHandle,[ref]$v)){throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())}
+  Need (($v.Attributes -band 0x410) -eq 0 -and $v.Links -eq 1 -and $v.Length -le [long]::MaxValue) 'stop_log_regular_identity'
+  return $v
+}
+function StopLogOpen([string]$Path) {
+  StopLogNative
+  $full=[IO.Path]::GetFullPath($Path)
+  Need ($full -cmatch '^[A-Za-z]:\\' -and $full -notmatch '[\r\n]') 'stop_log_fixed_local_path'
+  $parent=Split-Path -Parent $full
+  while($parent){
+    $item=Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+    Need ($item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'stop_log_parent_reparse'
+    $next=Split-Path -Parent $parent;if($next -ceq $parent){break};$parent=$next
+  }
+  $handle=[EdrRecoveryLogReadV1]::CreateFileW($full,[uint32]2147483648,7,[IntPtr]::Zero,3,0x00200000,[IntPtr]::Zero)
+  if($handle.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();$handle.Dispose();throw [ComponentModel.Win32Exception]::new($code)}
+  $stream=$null
+  try {
+    # A one-byte buffer with only bulk Read calls avoids stale read-ahead
+    # across deliberate Seek/revalidation boundaries on Windows PowerShell.
+    $stream=[IO.FileStream]::new($handle,[IO.FileAccess]::Read,1,$false)
+    $v=StopLogInfo $stream
+    $name=New-Object Text.StringBuilder 1024
+    $n=[EdrRecoveryLogReadV1]::GetFinalPathNameByHandleW($stream.SafeFileHandle,$name,1024,0)
+    Need ($n -gt 0 -and $n -lt 1024 -and $name.ToString().StartsWith('\\?\',[StringComparison]::Ordinal) -and $name.ToString().Substring(4).Equals($full,[StringComparison]::OrdinalIgnoreCase)) 'stop_log_resolved_path_changed'
+    return @{stream=$stream;info=$v}
+  }catch{if($null -ne $stream){$stream.Dispose()}else{$handle.Dispose()};throw}
+}
+function StopLogConfig([string]$Path,[string]$Expected,[string]$ExpectedLog) {
+  $f=StopLogOpen $Path
+  try {
+    Need ($f.info.Length -gt 0 -and $f.info.Length -le 131072) 'stop_log_config_bound'
+    $buffer=New-Object byte[] ([int]$f.info.Length+1);$used=0
+    while($used -lt $buffer.Length){$n=$f.stream.Read($buffer,$used,$buffer.Length-$used);if($n -eq 0){break};$used+=$n}
+    $after=StopLogInfo $f.stream
+    Need ($used -eq $f.info.Length -and $after.Identity -ceq $f.info.Identity -and $after.Length -eq $f.info.Length -and $after.WriteHigh -eq $f.info.WriteHigh -and $after.WriteLow -eq $f.info.WriteLow) 'stop_log_config_changed'
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{$hash=([BitConverter]::ToString($sha.ComputeHash($buffer,0,$used))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+    Need ($hash -ceq $Expected) 'stop_log_config_hash_changed'
+    $text=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$used)
+    # Recognize only this public fixture's known literal, not a general TOML parser.
+    $sections=[regex]::Matches($text,'(?ms)^\[logging\][^\r\n]*\r?\n(?<body>.*?)(?=^\[|\z)')
+    Need ($sections.Count -eq 1) 'stop_log_fixture_logging_section'
+    $body=$sections[0].Groups['body'].Value;$encoded=[regex]::Escape($ExpectedLog.Replace('\','\\'))
+    Need ([regex]::Matches($text,'(?m)^log_dir\s*=').Count -eq 1 -and [regex]::Matches($body,('(?m)^log_dir\s*=\s*"'+$encoded+'"[^\S\r\n]*(?:#[^\r\n]*)?\r?$')).Count -eq 1) 'stop_log_fixture_logging_literal'
+  }finally{$f.stream.Dispose()}
+}
+function StopLogTarget($Context) {
+  $Context.process.Refresh()
+  Need (-not $Context.process.HasExited -and $Context.process.Id -eq $Context.native.pid -and $Context.process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $Context.native.birth_filetime -and $Context.process.Path -ieq $Context.agentPath) 'stop_log_target_generation_not_live'
+}
+function NewStopLogContext($Native,[string]$DriverSource) {
+  $d=@{schema='edr.ci-selected-shutdown-log.v1';requested=$true;status='unknown';phase='prepare';cause='not_observed';driver_source_sha256=$null;target=@{pid=$Native.pid;birth_filetime=$Native.birth_filetime;exe_sha256=$Native.exe_sha256;config_sha256=$Native.config_sha256};observation_after_failed_action_only=$true;action_result_can_change=$false;max_observe_ms=60000;max_new_bytes=65536;max_line_bytes=4096;max_matches=64;bytes_read=0;matches=@();trailing_bytes=0;cleanup_error_types=@()}
+  $c=@{diagnostic=$d;native=$Native;stream=$null;process=$null;hash=$null;agentPath=$script:agent;configPath=$script:configPath;logDirectory=(Join-Path $script:install 'logs');logPath=(Join-Path $script:install 'logs\agent.log');fileIdentity=$null;offset=[long]0;anchorOffset=[long]0;anchor=[byte[]]@();pending='';ready=$false}
+  try {
+    $d.phase='source';$d.driver_source_sha256=SHA (Regular $DriverSource 65536)
+    Need ($Native.fixture_config_binding_verified -eq $true -and $Native.service_config_argv_verified -eq $true -and $Native.config_sha256 -ceq $script:configSha256) 'stop_log_native_binding'
+    $d.phase='config';StopLogConfig $c.configPath $Native.config_sha256 $c.logDirectory
+    $d.phase='target';$c.process=Get-Process -Id $Native.pid -ErrorAction Stop;$null=$c.process.Handle;StopLogTarget $c
+    $d.phase='open_log';$f=StopLogOpen $c.logPath;$c.stream=$f.stream;$c.fileIdentity=$f.info.Identity;$c.offset=[long]$f.info.Length
+    if($c.offset -gt 0){$last=New-Object byte[] 1;$null=$c.stream.Seek($c.offset-1,[IO.SeekOrigin]::Begin);Need ($c.stream.Read($last,0,1) -eq 1 -and $last[0] -eq 10) 'stop_log_initial_offset_not_line_boundary'}
+    $anchorLength=[int][Math]::Min(64,$c.offset);$c.anchorOffset=$c.offset-$anchorLength;$c.anchor=New-Object byte[] $anchorLength
+    $null=$c.stream.Seek($c.anchorOffset,[IO.SeekOrigin]::Begin);$got=0
+    while($got -lt $anchorLength){$n=$c.stream.Read($c.anchor,$got,$anchorLength-$got);Need ($n -gt 0) 'stop_log_anchor_read_changed';$got+=$n}
+    $null=$c.stream.Seek($c.offset,[IO.SeekOrigin]::Begin)
+    $c.hash=[Security.Cryptography.SHA256]::Create()
+    $d.file_identity=$c.fileIdentity;$d.start_offset=$c.offset;$d.end_offset=$c.offset;$d.phase='bound_before_stop';$c.ready=$true
+  }catch{$d.cause='context_binding_unknown';$d.error=ServiceObserverError $_}
+  return $c
+}
+function StopLogAnchor($Context) {
+  $buffer=New-Object byte[] $Context.anchor.Length;$got=0
+  $null=$Context.stream.Seek($Context.anchorOffset,[IO.SeekOrigin]::Begin)
+  while($got -lt $buffer.Length){$n=$Context.stream.Read($buffer,$got,$buffer.Length-$got);Need ($n -gt 0) 'stop_log_anchor_changed';$got+=$n}
+  for($i=0;$i -lt $buffer.Length;$i++){Need ($buffer[$i] -eq $Context.anchor[$i]) 'stop_log_anchor_changed'}
+  $null=$Context.stream.Seek($Context.offset,[IO.SeekOrigin]::Begin)
+}
+function ReadStopLogSlice($Context,[long]$ElapsedMs) {
+  StopLogTarget $Context
+  StopLogConfig $Context.configPath $Context.native.config_sha256 $Context.logDirectory
+  $path=StopLogOpen $Context.logPath
+  try {Need ($path.info.Identity -ceq $Context.fileIdentity) 'stop_log_rotation_or_replacement'}finally{$path.stream.Dispose()}
+  $before=StopLogInfo $Context.stream
+  Need ($before.Identity -ceq $Context.fileIdentity -and $before.Length -ge $Context.offset) 'stop_log_truncated_or_changed'
+  StopLogAnchor $Context
+  $want=[long]$before.Length-$Context.offset
+  Need ($want -le (65536-$Context.diagnostic.bytes_read)) 'stop_log_new_bytes_bound'
+  if($want -eq 0){return}
+  $buffer=New-Object byte[] ([int]$want);$used=0
+  while($used -lt $buffer.Length){$n=$Context.stream.Read($buffer,$used,$buffer.Length-$used);Need ($n -gt 0) 'stop_log_read_changed';$used+=$n}
+  $after=StopLogInfo $Context.stream
+  StopLogTarget $Context
+  StopLogConfig $Context.configPath $Context.native.config_sha256 $Context.logDirectory
+  $path=StopLogOpen $Context.logPath
+  try {Need ($path.info.Identity -ceq $Context.fileIdentity) 'stop_log_rotation_or_replacement'}finally{$path.stream.Dispose()}
+  Need ($after.Identity -ceq $Context.fileIdentity -and $after.Length -ge $before.Length) 'stop_log_changed_during_read'
+  StopLogAnchor $Context
+  $null=$Context.hash.TransformBlock($buffer,0,$used,$buffer,0)
+  $Context.diagnostic.bytes_read+=$used;$Context.offset+=$used;$Context.diagnostic.end_offset=$Context.offset
+  $text=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$used)
+  $text=$Context.pending+$text;$parts=$text.Split([char]10);$Context.pending=$parts[$parts.Length-1]
+  Need ([Text.Encoding]::UTF8.GetByteCount($Context.pending) -le 4096) 'stop_log_line_bound'
+  for($i=0;$i -lt $parts.Length-1;$i++){
+    $line=$parts[$i];if($line.EndsWith("`r",[StringComparison]::Ordinal)){$line=$line.Substring(0,$line.Length-1)}
+    Need ([Text.Encoding]::UTF8.GetByteCount($line) -le 4096) 'stop_log_line_bound'
+    $match=$null
+    if($line -cmatch '^\[shutdown\] SCM stage publication failed stage=([0-9]{1,2}) error=([0-9]{1,10})$'){
+      Need ([int]$Matches[1] -ge 2 -and [int]$Matches[1] -le 28 -and [uint64]$Matches[2] -le [uint32]::MaxValue) 'stop_log_numeric_shape'
+      $match=@{kind='scm_stage_publication_failed';stage=[int]$Matches[1];error=[uint32]$Matches[2]}
+    }elseif($line -cmatch '^\[shutdown\] SCM status publication failed error=([0-9]{1,10})$'){
+      Need ([uint64]$Matches[1] -le [uint32]::MaxValue) 'stop_log_numeric_shape';$match=@{kind='scm_status_publication_failed';stage=$null;error=[uint32]$Matches[1]}
+    }elseif($line -ceq '[preprocess] shutdown timed out; retaining worker dependencies'){$match=@{kind='preprocess_thread_join_timeout'}}
+    elseif($line -ceq '[preprocess] shutdown timed out: AVE still owns the batch sink'){$match=@{kind='preprocess_AVE_drain_timeout'}}
+    elseif($line -ceq '[preprocess] shutdown failed: pending batch has no durable owner'){$match=@{kind='preprocess_batch_handoff_failed'}}
+    if($null -ne $match){
+      Need ($Context.diagnostic.matches.Count -lt 64) 'stop_log_matches_bound'
+      $match.read_started_elapsed_ms=$ElapsedMs;$Context.diagnostic.matches+=,$match
+    }
+  }
+  $Context.diagnostic.trailing_bytes=[Text.Encoding]::UTF8.GetByteCount($Context.pending)
+}
+function ObserveStopLog($Context,[int]$MaxMilliseconds=60000) {
+  if(-not $Context.ready){return}
+  $clock=[Diagnostics.Stopwatch]::StartNew();$Context.diagnostic.phase='post_failure_observation';$Context.diagnostic.polls=0;$Context.diagnostic.requested_observe_ms=$MaxMilliseconds
+  try {
+    Need ($MaxMilliseconds -ge 0 -and $MaxMilliseconds -le 60000) 'stop_log_window_bound'
+    while($clock.ElapsedMilliseconds -lt $MaxMilliseconds){
+      $Context.diagnostic.polls++;ReadStopLogSlice $Context $clock.ElapsedMilliseconds
+      Need ($clock.ElapsedMilliseconds -le $MaxMilliseconds) 'stop_log_window_deadline_after_io'
+      $remaining=$MaxMilliseconds-$clock.ElapsedMilliseconds
+      if($remaining -gt 0){Start-Sleep -Milliseconds ([int][Math]::Min(1000,$remaining))}
+    }
+    $Context.diagnostic.status=if($Context.diagnostic.matches.Count){'selected_fixed_lines_observed'}else{'unknown'}
+    $Context.diagnostic.cause=if($Context.diagnostic.matches.Count){'fixed_matches_only_not_recovery_success'}else{'no_matching_line_observed_not_exclusion'}
+  }catch{$Context.diagnostic.status='unknown';$Context.diagnostic.cause='bounded_log_observation_incomplete';$Context.diagnostic.error=ServiceObserverError $_}
+  finally{$Context.diagnostic.elapsed_ms=$clock.ElapsedMilliseconds;$Context.diagnostic.within_observation_budget=($clock.ElapsedMilliseconds -le $MaxMilliseconds);if(-not $Context.diagnostic.within_observation_budget){$Context.diagnostic.status='unknown';$Context.diagnostic.cause='observation_deadline_exceeded'};$Context.diagnostic.phase='observation_finished'}
+}
+function CloseStopLogContext($Context) {
+  if($null -ne $Context.hash){
+    try{$null=$Context.hash.TransformFinalBlock([byte[]]@(),0,0);$Context.diagnostic.validated_new_bytes_sha256=([BitConverter]::ToString($Context.hash.Hash)).Replace('-','').ToLowerInvariant()}
+    catch{$Context.diagnostic.cleanup_error_types+=,$_.Exception.GetType().FullName;$Context.diagnostic.status='unknown'}
+    finally{try{$Context.hash.Dispose()}catch{$Context.diagnostic.cleanup_error_types+=,$_.Exception.GetType().FullName;$Context.diagnostic.status='unknown'};$Context.hash=$null}
+  }
+  foreach($name in @('stream','process')){
+    if($null -ne $Context[$name]){try{$Context[$name].Dispose()}catch{$Context.diagnostic.cleanup_error_types+=,$_.Exception.GetType().FullName;$Context.diagnostic.status='unknown'};$Context[$name]=$null}
+  }
+}
+
+function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Label,$LogContext=$null) {
   $worker=Join-Path $script:root ($Label+'.service.ps1');$stdout=Join-Path $script:root ($Label+'.service.stdout.log');$stderr=Join-Path $script:root ($Label+'.service.stderr.log')
   $value=@{label=$Label;action=$Action;phase='prepare';started_at_utc=[DateTime]::UtcNow.ToString('o');worker_source_sha256=$null;primary_failure=$null;worker=@{pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null};sampler=@{requested=$false;pid=$null;birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null}}
   $null=$script:serviceActionDiagnostics.Add($value)
+  if($null -ne $LogContext){$value.shutdown_log_observation=$LogContext.diagnostic}
   $owned=$null;$sampler=$null;$samplerOut=$null;$samplerErr=$null;$primary=$false;$observerFailed=$false;$clock=[Diagnostics.Stopwatch]::StartNew()
   try{
     Need (-not (Test-Path -LiteralPath $worker)) 'service_worker_exists'
@@ -328,7 +501,13 @@ function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Lab
     }
     try{if(FinishServiceObserver $owned $value.worker $stdout $stderr 4096){$observerFailed=$true}}
     catch{$observerFailed=$true;$value.worker.observer_error=ServiceObserverError $_}
+    # The original action's decision/timing above is frozen before observation.
     $value.elapsed_ms=$clock.ElapsedMilliseconds;$value.finished_at_utc=[DateTime]::UtcNow.ToString('o');$value.observer_complete=(-not $observerFailed)
+    if($null -ne $LogContext){
+      try{if($primary -and $Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){ObserveStopLog $LogContext 60000}}
+      catch{$LogContext.diagnostic.status='unknown';$LogContext.diagnostic.cause='observer_exception';$LogContext.diagnostic.error=ServiceObserverError $_}
+      finally{CloseStopLogContext $LogContext}
+    }
     if(-not $primary -and $observerFailed){throw 'service_action_diagnostic_incomplete'}
   }
 }
@@ -427,7 +606,8 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
           $again=Installed $script:target.agent_binary_sha256 $script:target.version
           Need ($again.pid -eq $native.pid -and $again.birth_filetime -eq $native.birth_filetime) 'trigger_generation_changed'
           Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));action='stop_exact_owned_service';fixture_only=$true}
-          ServiceAction 'Stop' ($Label+'-health-stop')
+          $logContext=NewStopLogContext $native $PSCommandPath
+          ServiceAction 'Stop' ($Label+'-health-stop') $logContext
           $triggered=$true
         }
       }

@@ -14,7 +14,7 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_changed'}
-$wanted=@('Need','Regular','SHA','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction')
+$wanted=@('Need','Regular','SHA','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
 $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
 if ($functions.Count -ne $wanted.Count) {throw 'function_inventory'}
 # Only these source-owned function definitions are loaded, never driver top-level.
@@ -295,5 +295,110 @@ try {
   Checked ($failed -and $v.stdout.bytes -eq 16000 -and $v.stderr.status -ceq 'capture_failed' -and -not $v.stderr.ContainsKey('base64')) 'sampler_combined_cap_no_extra_raw'
   [IO.File]::WriteAllBytes($rawOut,[byte[]]@(255))
   FailsType {ServiceRaw $rawOut 4096} ([Text.DecoderFallbackException])
+  # New selected-log tests: real public files/Win32 file identity, current test
+  # process as the public target stand-in. No Agent, service, or native child.
+  $originalLogVariables=@{}
+  foreach($name in @('install','agent','configPath','configSha256')){$v=Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue;if($null -ne $v){$originalLogVariables[$name]=$v.Value}}
+  StopLogNative
+  Checked ([Runtime.InteropServices.Marshal]::SizeOf([type]'EdrRecoveryLogReadV1+Info') -eq 52) 'log_native_file_information_layout'
+  # Canonicalize this existing public temp directory by its own handle, so
+  # RUNNER~1 and the long name are not confused with a different file.
+  $publicDirectoryHandle=[EdrRecoveryLogReadV1]::CreateFileW($dir,0x80,7,[IntPtr]::Zero,3,0x02200000,[IntPtr]::Zero)
+  Need (-not $publicDirectoryHandle.IsInvalid) 'public_log_test_directory_handle'
+  try{$publicDirectoryName=New-Object Text.StringBuilder 1024;$n=[EdrRecoveryLogReadV1]::GetFinalPathNameByHandleW($publicDirectoryHandle,$publicDirectoryName,1024,0);Need ($n -gt 4 -and $n -lt 1024) 'public_log_test_directory_name';$publicDirectory=$publicDirectoryName.ToString().Substring(4)}finally{$publicDirectoryHandle.Dispose()}
+  $script:install=Join-Path $publicDirectory 'public-log-fixture';$null=New-Item -ItemType Directory -Path (Join-Path $script:install 'logs')
+  $self=Get-Process -Id $PID
+  $script:agent=$self.Path;$script:configPath=Join-Path $script:install 'agent.toml'
+  $logPath=Join-Path $script:install 'logs\agent.log'
+  $publicConfig='[logging]'+"`n"+'log_dir = "'+(Join-Path $script:install 'logs').Replace('\','\\')+'"'+"`n"
+  function ResetPublicLog {
+    [IO.File]::WriteAllText($script:configPath,$publicConfig,[Text.UTF8Encoding]::new($false));$script:configSha256=SHA $script:configPath
+    [IO.File]::WriteAllText($logPath,"public pre-trigger line`n",[Text.UTF8Encoding]::new($false))
+  }
+  function PublicLogContext {
+    $native=@{pid=$PID;birth_filetime=$self.StartTime.ToUniversalTime().ToFileTimeUtc().ToString();exe_sha256=('a'*64);config_sha256=$script:configSha256;fixture_config_binding_verified=$true;service_config_argv_verified=$true}
+    return (NewStopLogContext $native $source)
+  }
+  function PublicAppend([string]$Text) {[IO.File]::AppendAllText($logPath,$Text,[Text.UTF8Encoding]::new($false))}
+  $ctx=$null
+  try {
+    ResetPublicLog;$ctx=PublicLogContext
+    Checked ($ctx.ready -and $ctx.diagnostic.driver_source_sha256 -ceq $DriverSha256 -and $ctx.diagnostic.start_offset -gt 0 -and $ctx.diagnostic.file_identity) 'log_real_file_identity_source_and_before_offset'
+    PublicAppend "unexported-test-message and command body`n[shutdown] SCM stage publication failed stage=18 error=5`n[preprocess] shutdown timed out; retaining worker dependencies`n"
+    ReadStopLogSlice $ctx 1
+    Checked ($ctx.diagnostic.matches.Count -eq 2 -and $ctx.diagnostic.matches[0].kind -ceq 'scm_stage_publication_failed' -and $ctx.diagnostic.matches[0].stage -eq 18 -and $ctx.diagnostic.matches[0].error -eq 5 -and $ctx.diagnostic.matches[1].kind -ceq 'preprocess_thread_join_timeout') 'log_only_fixed_numeric_and_preprocess_lines'
+    Checked (($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'unexported-test-message|command body') 'log_other_body_never_exported'
+    PublicAppend '[preprocess] shutdown timed out: AVE still '
+    ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches.Count -eq 2 -and $ctx.diagnostic.trailing_bytes -gt 0) 'log_partial_line_not_classified'
+    PublicAppend "owns the batch sink`n";ReadStopLogSlice $ctx 3
+    Checked ($ctx.diagnostic.matches.Count -eq 3 -and $ctx.diagnostic.matches[2].kind -ceq 'preprocess_AVE_drain_timeout') 'log_partial_line_joins_before_exact_match'
+    PublicAppend "prefix [shutdown] SCM status publication failed error=5`n[Preprocess] shutdown timed out; retaining worker dependencies`n[shutdown] SCM status publication failed error=5`r`r`n";ReadStopLogSlice $ctx 4
+    Checked ($ctx.diagnostic.matches.Count -eq 3) 'log_near_matches_not_classified'
+    $publicBytes=[IO.File]::ReadAllBytes($logPath);$sha=[Security.Cryptography.SHA256]::Create()
+    try{$expectedNewHash=([BitConverter]::ToString($sha.ComputeHash($publicBytes,[int]$ctx.diagnostic.start_offset,[int]$ctx.diagnostic.bytes_read))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+    CloseStopLogContext $ctx;Checked ($ctx.diagnostic.validated_new_bytes_sha256 -ceq $expectedNewHash) 'log_exact_validated_new_source_bytes_hash'
+    Checked ($null -eq $ctx.stream -and $null -eq $ctx.process -and $ctx.diagnostic.cleanup_error_types.Count -eq 0) 'log_owned_readers_closed_no_kill'
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend "[shutdown] SCM stage publication failed stage=99 error=5`n"
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_numeric_shape';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;Move-Item -LiteralPath $logPath -Destination ($logPath+'.old')
+    [IO.File]::WriteAllText($logPath,"replacement`n",[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_rotation_or_replacement';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;[IO.File]::WriteAllText($logPath,'',[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_truncated_or_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;[IO.File]::WriteAllText($logPath,(('x'*128)+"`n"),[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_anchor_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;[IO.File]::AppendAllText($script:configPath,"#changed`n",[Text.UTF8Encoding]::new($false))
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_config_hash_changed';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ('x'*65537)
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_new_bytes_bound';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;$publicChunk=('x'*4095)+"`n"
+    PublicAppend ($publicChunk*8);ReadStopLogSlice $ctx 1
+    PublicAppend ($publicChunk*8);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.bytes_read -eq 65536 -and $ctx.diagnostic.matches.Count -eq 0) 'log_cumulative_budget_across_reads'
+    PublicAppend "`n";Fails {ReadStopLogSlice $ctx 3} 'stop_log_new_bytes_bound';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ('x'*4090);ReadStopLogSlice $ctx 1
+    PublicAppend ('x'*7);Fails {ReadStopLogSlice $ctx 2} 'stop_log_line_bound';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend (('x'*4097)+"`n")
+    Fails {ReadStopLogSlice $ctx 1} 'stop_log_line_bound';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;ObserveStopLog $ctx 0
+    Checked ($ctx.diagnostic.status -ceq 'unknown' -and $ctx.diagnostic.matches.Count -eq 0 -and -not $ctx.diagnostic.action_result_can_change) 'log_absence_is_unknown_not_exclusion_or_success';CloseStopLogContext $ctx
+    # Test-only real read followed by an injected delay exceeding the selected
+    # small observation window. No hard-realtime/storage-latency claim.
+    $oldSlice=(Get-Item Function:\ReadStopLogSlice).ScriptBlock;$script:delayedSliceReads=0
+    function ReadStopLogSlice($Context,[long]$ElapsedMs) {& $oldSlice $Context $ElapsedMs;$script:delayedSliceReads++;Start-Sleep -Milliseconds 120}
+    try {
+      ResetPublicLog;$ctx=PublicLogContext;PublicAppend "[preprocess] shutdown failed: pending batch has no durable owner`n"
+      $primarySentinel=@{type='unchanged-original-action-failure';exit_code=[int]-1}
+      ObserveStopLog $ctx 100
+      Checked ($delayedSliceReads -eq 1 -and $ctx.diagnostic.status -ceq 'unknown' -and -not $ctx.diagnostic.within_observation_budget -and $ctx.diagnostic.matches.Count -eq 1 -and $primarySentinel.exit_code -eq -1 -and $primarySentinel.type -ceq 'unchanged-original-action-failure') 'log_after_io_deadline_preserves_matches_but_not_success'
+    }finally{CloseStopLogContext $ctx;Set-Item Function:\ReadStopLogSlice $oldSlice}
+    # A deterministic target-exit seam, not a real target/process operation.
+    $oldTarget=(Get-Item Function:\StopLogTarget).ScriptBlock
+    function StopLogTarget($Context) {throw 'stop_log_target_generation_not_live'}
+    try{ResetPublicLog;$ctx=PublicLogContext;Checked (-not $ctx.ready -and $ctx.diagnostic.cause -ceq 'context_binding_unknown') 'log_target_exit_binding_is_unknown'}finally{CloseStopLogContext $ctx;Set-Item Function:\StopLogTarget $oldTarget}
+    # Integration seam only: no 60s delay. Original Stop action fails first;
+    # a secondary log exception must not replace that primary failure.
+    $oldObserve=(Get-Item Function:\ObserveStopLog).ScriptBlock;$script:logObserveCalls=0;$script:primaryFrozenBeforeLog=$false
+    function ObserveStopLog($Context,[int]$MaxMilliseconds=60000) {
+      $script:logObserveCalls++;$script:primaryFrozenBeforeLog=($null -ne $script:serviceActionDiagnostics[0].primary_failure -and $script:serviceActionDiagnostics[0].worker.exit_code -eq 7 -and $MaxMilliseconds -eq 60000)
+      throw [IO.IOException]::new('unexported-test-message')
+    }
+    try {
+      ResetPublicLog;$ctx=PublicLogContext;ServiceCase 'log-secondary';$script:serviceMock='nonzero'
+      Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop' $ctx} 'service_control_failed'
+      Checked ($primaryFrozenBeforeLog -and $logObserveCalls -eq 1 -and $serviceActionDiagnostics[0].worker.exit_code -eq 7 -and $serviceActionDiagnostics[0].shutdown_log_observation.status -ceq 'unknown' -and $null -eq $ctx.stream) 'log_secondary_does_not_mask_original_failure'
+      ResetPublicLog;$ctx=PublicLogContext;ServiceCase 'log-normal';$beforeCalls=$logObserveCalls
+      ServiceAction 'Stop' 'health-failed-upgrade-health-stop' $ctx
+      Checked ($logObserveCalls -eq $beforeCalls -and $serviceActionDiagnostics[0].worker.exit_code -eq 0 -and $null -eq $ctx.stream) 'log_not_run_for_successful_control'
+    }finally{Set-Item Function:\ObserveStopLog $oldObserve}
+    $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
+    for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
+    Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'
+  }finally{
+    if($null -ne $ctx){CloseStopLogContext $ctx}
+    $self.Dispose()
+    foreach($name in @('install','agent','configPath','configSha256')){if($originalLogVariables.ContainsKey($name)){Set-Variable -Name $name -Value $originalLogVariables[$name] -Scope Script}else{Remove-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue}}
+  }
   Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false native_child_executed=false')
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}

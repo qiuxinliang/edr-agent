@@ -84,6 +84,38 @@ class Contracts(unittest.TestCase):
         for item in j['files']:
             raw=(self.output/item['name']).read_bytes();self.assertEqual(len(raw),item['bytes']);self.assertEqual(M.sha(raw),item['sha256'])
         self.assertLessEqual(sum(p.stat().st_size for p in self.output.iterdir()),M.TOTAL_CAP)
+    def selected_log_summary(self):
+        value=json.loads((self.source/'recovery-subset-summary.json').read_bytes())
+        value['status']='failed_or_unknown'
+        value['service_action_diagnostics']=[{'label':'health-failed-upgrade-health-stop',
+            'worker':{'terminal_known':True,'exit_known':True,'exit_code':-1},
+            'primary_failure':{'type':'System.RuntimeException','native_error_code':None},
+            'shutdown_log_observation':{'schema':'edr.ci-selected-shutdown-log.v1',
+                'status':'selected_fixed_lines_observed','action_result_can_change':False,
+                'max_observe_ms':60000,'max_new_bytes':65536,'max_line_bytes':4096,'max_matches':64,
+                'driver_source_sha256':'f'*64,'file_identity':'00000001:0000000200000003:0000000400000005',
+                'start_offset':1234,'end_offset':2222,'bytes_read':988,'validated_new_bytes_sha256':'a'*64,
+                'target':{'pid':123,'birth_filetime':'134367592099796881','exe_sha256':'b'*64,'config_sha256':'c'*64},
+                'matches':[{'kind':'scm_stage_publication_failed','stage':28,'error':4294967295,
+                    'read_started_elapsed_ms':59999}for unused in range(64)]}}]
+        return value
+    def test_selected_shutdown_metadata_roundtrips_inside_original_inventory(self):
+        value=self.selected_log_summary();self.write(self.source/'recovery-subset-summary.json',value)
+        raw=(self.source/'recovery-subset-summary.json').read_bytes()
+        self.assertLess(len(raw),16384)
+        result=self.collect();manifest=json.loads((self.output/'manifest.json').read_bytes())
+        self.assertEqual(result['files'],24);self.assertFalse(result['recovery_pass_claimed'])
+        self.assertEqual((self.output/'recovery-subset-summary.json').read_bytes(),raw)
+        item=next(x for x in manifest['files']if x['name']=='recovery-subset-summary.json')
+        self.assertEqual((item['bytes'],item['sha256']),(len(raw),M.sha(raw)))
+        self.assertEqual(set(p.name for p in self.output.iterdir()),set(M.ALLOW)|{'manifest.json'})
+        self.assertEqual(manifest['recovery_status'],'failed_or_unknown')
+        self.assertNotIn('agent.log',set(M.ALLOW))
+    def test_selected_shutdown_metadata_still_has_original_summary_file_cap(self):
+        value=self.selected_log_summary();value['oversize_synthetic_only']='x'*M.FILE_CAP
+        self.write(self.source/'recovery-subset-summary.json',value)
+        with self.assertRaisesRegex(ValueError,'file_bound'):self.collect()
+        self.assertFalse(self.output.exists())
     def test_unknown_files_are_never_read_or_exported(self):
         for name in ('agent.log','agent.toml','cache.db','environment.json','parameters.xml'):(self.source/name).write_bytes(b'not an exportable file')
         self.collect();self.assertEqual(set(p.name for p in self.output.iterdir()),set(M.ALLOW)|{'manifest.json'})
