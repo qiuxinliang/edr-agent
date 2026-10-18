@@ -7546,6 +7546,55 @@ static int retention_main_read_high_resolution;
 static uint64_t retention_high_resolution_reads, retention_read_delay_min_ns, retention_read_delay_max_ns;
 static unsigned capacity_checkpoint_delay_ms, capacity_main_read_delay_ms;
 
+/* Only the single-threaded pressure fixture enables these diagnostics. Cache
+ * QPC frequency once; two raw clock queries surround only each real delegate,
+ * after any imposed delay. Do not subtract an assumed clock-call overhead. */
+typedef struct { uint64_t calls, ticks, maximum; } RetentionDelegateTiming;
+static RetentionDelegateTiming retention_delegate_timing[3];
+static uint64_t retention_delegate_hz;
+static int retention_delegate_enabled;
+static void retention_delegate_diagnostic_failure(void) {
+  fputs("[pressure_fixture] diagnostic_failure=delegate_timer_or_output\n",stderr);
+  abort(); /* Never turn an unavailable/retrograde diagnostic timer into zero. */
+}
+static uint64_t retention_delegate_tick(void) {
+#if defined(_WIN32)
+  LARGE_INTEGER now;
+  if (!QueryPerformanceCounter(&now) || now.QuadPart<0)
+    retention_delegate_diagnostic_failure();
+  return (uint64_t)now.QuadPart;
+#else
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC,&now)!=0 || now.tv_sec<0 || now.tv_nsec<0 || now.tv_nsec>=1000000000L)
+    retention_delegate_diagnostic_failure();
+  return (uint64_t)now.tv_sec*UINT64_C(1000000000)+(uint64_t)now.tv_nsec;
+#endif
+}
+static void retention_delegate_reset(int enabled) {
+  retention_delegate_enabled=0; retention_delegate_hz=0;
+  memset(retention_delegate_timing,0,sizeof(retention_delegate_timing));
+  if (!enabled) return;
+#if defined(_WIN32)
+  LARGE_INTEGER frequency;
+  if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0)
+    retention_delegate_diagnostic_failure();
+  retention_delegate_hz=(uint64_t)frequency.QuadPart;
+#else
+  retention_delegate_hz=UINT64_C(1000000000);
+#endif
+  retention_delegate_enabled=1;
+}
+static void retention_delegate_record(unsigned index, uint64_t started) {
+  uint64_t ended=retention_delegate_tick();
+  RetentionDelegateTiming *value=&retention_delegate_timing[index];
+  if (ended<started || value->calls==UINT64_MAX || UINT64_MAX-value->ticks<ended-started)
+    retention_delegate_diagnostic_failure();
+  uint64_t elapsed=ended-started;
+  ++value->calls; value->ticks+=elapsed;
+  if (elapsed>value->maximum) value->maximum=elapsed;
+}
+
+
 static void capacity_reclaim_slow_boundary(int enabled) {
   retention_checkpoint_delay_ms=enabled ? capacity_checkpoint_delay_ms : 0u;
   retention_main_read_delay_ms=enabled ? capacity_main_read_delay_ms : 0u;
@@ -7574,7 +7623,9 @@ static int bench_read(sqlite3_file *f, void *b, int n, sqlite3_int64 o) {
     }
   }
   retention_bench_reads+=(unsigned)n;
+  uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
   int result=BENCH_FILE(f)->pMethods->xRead(BENCH_FILE(f),b,n,o);
+  if (retention_delegate_enabled) retention_delegate_record(0u,delegate_started);
   if (measured) {
     /* Include both the imposed wait and the actual underlying filesystem read. */
     uint64_t elapsed=soak_monotonic_ns()-read_started;
@@ -7592,7 +7643,11 @@ static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
     retention_raise_floor_on_write=0;
     test_setenv("EDR_STORAGE_MIN_FREE_MB","1073741824");
   }
-  retention_bench_writes+=(unsigned)n; return BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o);
+  retention_bench_writes+=(unsigned)n;
+  uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
+  int result=BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o);
+  if (retention_delegate_enabled) retention_delegate_record(1u,delegate_started);
+  return result;
 }
 static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
 static int bench_sync(sqlite3_file *f,int flags) {
@@ -7608,7 +7663,10 @@ static int bench_sync(sqlite3_file *f,int flags) {
     nanosleep(&delay,NULL);
 #endif
   }
-  return BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags);
+  uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
+  int result=BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags);
+  if (retention_delegate_enabled) retention_delegate_record(2u,delegate_started);
+  return result;
 }
 static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return BENCH_FILE(f)->pMethods->xFileSize(BENCH_FILE(f),n); }
 static int bench_lock(sqlite3_file *f,int n) { return BENCH_FILE(f)->pMethods->xLock(BENCH_FILE(f),n); }
@@ -11439,13 +11497,32 @@ finished:
  * line so a native CTest timeout retains its last completed phase. rd/wr are
  * cumulative requested bytes and sync counts callbacks, not device I/O.
  * clock_valid describes this diagnostic timer, not the retention clock. */
+static ParentSoakProcess pressure_continuation_process_begin;
 static void pressure_continuation_phase(const char *phase, unsigned n, uint64_t started) {
   uint64_t now = soak_monotonic_ns();
-  fprintf(stderr, "[pressure_fixture] phase=%s n=%u us=%llu rd=%llu wr=%llu sync=%llu clock_valid=%u\n",
-      phase, n, (unsigned long long)(now >= started ? (now-started)/1000u : 0u),
-      (unsigned long long)retention_bench_reads, (unsigned long long)retention_bench_writes,
-      (unsigned long long)retention_bench_syncs, (unsigned)(started && now >= started));
-  fflush(stderr);
+  ParentSoakProcess process=parent_soak_process();
+  if (!retention_delegate_enabled || !retention_delegate_hz ||
+      process.user<pressure_continuation_process_begin.user || process.kernel<pressure_continuation_process_begin.kernel ||
+      process.io_available!=pressure_continuation_process_begin.io_available ||
+      process.read_bytes<pressure_continuation_process_begin.read_bytes || process.write_bytes<pressure_continuation_process_begin.write_bytes)
+    retention_delegate_diagnostic_failure();
+  double scale=1e6/(double)retention_delegate_hz;
+  char line[1024];
+  int length=snprintf(line,sizeof(line),
+      "[pressure_fixture] phase=%s n=%u us=%llu rd=%llu wr=%llu sync=%llu clock_valid=%u "
+      "vfs_r=%llu/%.3f/%.3f vfs_w=%llu/%.3f/%.3f vfs_s=%llu/%.3f/%.3f "
+      "cpu_user_s=%.6f cpu_kernel_s=%.6f io_available=%d issued_rd=%llu issued_wr=%llu timer_hz=%llu\n",
+      phase,n,(unsigned long long)(now>=started ? (now-started)/1000u : 0u),
+      (unsigned long long)retention_bench_reads,(unsigned long long)retention_bench_writes,
+      (unsigned long long)retention_bench_syncs,(unsigned)(started && now>=started),
+      (unsigned long long)retention_delegate_timing[0].calls,retention_delegate_timing[0].ticks*scale,retention_delegate_timing[0].maximum*scale,
+      (unsigned long long)retention_delegate_timing[1].calls,retention_delegate_timing[1].ticks*scale,retention_delegate_timing[1].maximum*scale,
+      (unsigned long long)retention_delegate_timing[2].calls,retention_delegate_timing[2].ticks*scale,retention_delegate_timing[2].maximum*scale,
+      process.user-pressure_continuation_process_begin.user,process.kernel-pressure_continuation_process_begin.kernel,
+      process.io_available,(unsigned long long)(process.read_bytes-pressure_continuation_process_begin.read_bytes),
+      (unsigned long long)(process.write_bytes-pressure_continuation_process_begin.write_bytes),(unsigned long long)retention_delegate_hz);
+  if (length<0 || (size_t)length>=sizeof(line) || fputs(line,stderr)==EOF || fflush(stderr)!=0)
+    retention_delegate_diagnostic_failure();
 }
 
 static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
@@ -11453,6 +11530,8 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   char path[512], before_hash[65], after_hash[65]; sqlite3 *db = NULL;
   EdrBehaviorRecord *record = calloc(1u,sizeof(*record)), *anchor = calloc(1u,sizeof(*anchor));
   assert(record && anchor);
+  retention_delegate_reset(1);
+  pressure_continuation_process_begin=parent_soak_process();
   uint64_t phase_started=soak_monotonic_ns();
   pressure_continuation_phase("begin",0u,phase_started);
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
@@ -11679,6 +11758,8 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
   s_test_monotonic_ns = UINT64_C(1000000000); cleanup_test_sqlite_path(path); free(record); free(anchor);
   pressure_continuation_phase("end",0u,phase_started);
+  retention_delegate_reset(0);
+  memset(&pressure_continuation_process_begin,0,sizeof(pressure_continuation_process_begin));
 }
 
 /* The pre-floor 121-second counterexample is preserved in the private baseline
