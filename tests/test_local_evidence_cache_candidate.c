@@ -8729,6 +8729,63 @@ static void run_sliced_cache_consumer(void) {
 #endif
 }
 
+/* This fixed public fixture must finish within nine normal due cycles;
+ * exhaustion fails. This is not general liveness: a prelude can consume a
+ * whole cooperative 20ms turn before any TTL stage. Each cycle may interleave
+ * one physical-reclaim tranche, bounded here by ceil(initial free/256)+one
+ * terminal poll. Failed work never earns a simulated due advance. */
+static int sliced_ttl_cycle_status_ok(const EdrEvidenceCacheStatus *status) {
+  /* Fail closed on new owner diagnostics, especially real SQLITE_BUSY/error
+   * backoff. These are the pre-existing non-error pressure/copy diagnostics
+   * emitted by this fixed public fixture, not a production error classifier. */
+  return status->db_open && (!status->last_error[0] ||
+      !strcmp(status->last_error,"command result copy size budget exceeded") ||
+      !strcmp(status->last_error,"evidence cache DB/WAL over configured capacity; retained data remains readable"));
+}
+static int sliced_finish_due_expiry_cycles(sqlite3 *db) {
+  enum { slice_pages=256, ttl_stages=9 };
+  sqlite3_int64 free_pages=compact_scalar(db,"PRAGMA freelist_count");
+  assert(free_pages>0 && (uint64_t)free_pages<UINT32_MAX-2u*slice_pages);
+  unsigned reclaim_polls=(unsigned)(((uint64_t)free_pages+slice_pages-1u)/slice_pages)+1u;
+  unsigned polls=0,cycles=0,due_advances=0;sqlite3_int64 remaining=1,first_remaining=-1;
+  EdrEvidenceCacheStatus before,after,first;edr_local_evidence_cache_get_status(&before);after=before;first=before;
+  int valid=sliced_ttl_cycle_status_ok(&before);
+  uint64_t cycle_base=s_test_monotonic_ns;
+  for(unsigned cycle=0;valid && remaining && cycle<ttl_stages;cycle++) {
+    /* Only successful incomplete normal work reaches another due minute.
+     * A failed owner returns below before this advance: never jump BACKOFF. */
+    if(cycle) {s_test_monotonic_ns+=UINT64_C(60000000000);++due_advances;}
+    uint64_t prior_runs=after.maintenance_runs;
+    edr_local_evidence_cache_poll_maintenance();++polls;
+    edr_local_evidence_cache_get_status(&after);
+    remaining=compact_scalar(db,"SELECT COUNT(*) FROM file_evidence WHERE path='next-cycle'");
+    if(!cycle) {first=after;first_remaining=remaining;}
+    valid=sliced_ttl_cycle_status_ok(&after) && after.maintenance_runs==prior_runs+1u;
+    if(!valid) break;
+    ++cycles;
+    for(unsigned reclaim=0;reclaim<=reclaim_polls;reclaim++) {
+      /* The original query plus optional command-copy attempt can enter
+       * between turns (copy admission may refuse under pressure). A fixed
+       * external writer really commits; generic projections remain exact. */
+      run_sliced_cache_consumer();compact_assert_projection(db);
+      compact_exec(db,"BEGIN IMMEDIATE;UPDATE command_results SET detail=detail WHERE command_id='between-slices';COMMIT;");
+      assert(sqlite3_changes(db)==1);
+      if(reclaim==reclaim_polls) break;
+      sqlite3_int64 old_free=compact_scalar(db,"PRAGMA freelist_count");
+      edr_local_evidence_cache_poll_maintenance();++polls;
+      edr_local_evidence_cache_get_status(&after);
+      sqlite3_int64 next_free=compact_scalar(db,"PRAGMA freelist_count");
+      assert(old_free-next_free>=0 && old_free-next_free<=slice_pages);
+      valid=sliced_ttl_cycle_status_ok(&after) && after.maintenance_runs==prior_runs+1u;
+      if(!valid) break;
+    }
+  }
+  assert(polls<=ttl_stages*(1u+reclaim_polls));
+  int accepted=valid && !remaining && cycles>0;
+  fprintf(stderr,"sliced_ttl_cycles first_turn_incomplete=%d first_cycle_started=%d cycles=%u stage_bound=%u polls=%u bound=%u reclaim_pages=%lld reclaim_polls_per_cycle=%u remaining=%lld simulated_due_advances=%u fake_ns_delta=%llu accepted=%d cause=%s\n",first_remaining!=0,first.maintenance_runs==before.maintenance_runs+1u,cycles,ttl_stages,polls,ttl_stages*(1u+reclaim_polls),(long long)free_pages,reclaim_polls,(long long)remaining,due_advances,(unsigned long long)(s_test_monotonic_ns-cycle_base),accepted,after.last_error);fflush(stderr);
+  return accepted;
+}
+
 /* Failure-only diagnostics must not mask the original contract assertion if
  * this auxiliary SQLite reader is unavailable. -1 means not observed. */
 static unsigned sliced_candidate_checkpoint_delay_ms;
@@ -8778,9 +8835,15 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
      * 100 immediate polls may not retry even when the blocker disappears. */
     sliced_reclaim_padding(db);
     s_test_monotonic_ns += UINT64_C(60000000000);
-    edr_local_evidence_cache_poll_maintenance();
-    assert(compact_scalar(db, "SELECT COUNT(*) FROM file_evidence WHERE path='next-cycle'") == 0);
+    assert(sliced_finish_due_expiry_cycles(db));
+    /* TTL may have drained physical slices before completing. Give the
+     * unchanged BUSY/reader assertions their own fresh reclaim fixture. */
+    assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+    assert(make_test_sqlite_path(path,sizeof(path))==0);reclaim_fixture(path,format);
+    assert(edr_local_evidence_cache_open(path,1,24)==0 && sqlite3_open(path,&db)==SQLITE_OK);
+    sliced_reclaim_padding(db);
     s_test_monotonic_ns += UINT64_C(120000000000);
+    edr_local_evidence_cache_poll_maintenance(); /* Schedule this fresh physical cycle. */
     compact_exec(db, "BEGIN IMMEDIATE;");
     edr_local_evidence_cache_poll_maintenance();
     edr_local_evidence_cache_get_status(&before);
