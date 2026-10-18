@@ -7269,9 +7269,65 @@ static void retention_upgrade_refs(sqlite3 *db, int format) {
   assert(store.format == format);
 }
 
+/* This fixed fixture permits at most nine normal due periods for cooperative
+ * expiry work. Missing required facts fail immediately, before any due advance.
+ * This is neither a hot error retry nor a universal retirement latency bound. */
+static int selected_command_fact_owned(sqlite3 *db,const char *id,const EdrBehaviorRecord *r) {
+  sqlite3_stmt *st=NULL;char start[32],birth[32];
+  snprintf(start,sizeof(start),"%llu",(unsigned long long)r->process_start_key);
+  snprintf(birth,sizeof(birth),"%llu",(unsigned long long)r->process_creation_filetime_100ns);
+  assert(sqlite3_prepare_v2(db,"SELECT EXISTS(SELECT 1 FROM p0_candidates WHERE subject_command_fact_id=?1 OR parent_command_fact_id=?1) OR EXISTS(SELECT 1 FROM process_cache WHERE endpoint_id=?2 AND tenant_id=?3 AND ((pid=?4 AND process_start_key=?5 AND process_creation_filetime_100ns=?6) OR (ppid=?4 AND parent_process_start_key=?5 AND parent_process_creation_filetime_100ns=?6)))",-1,&st,NULL)==SQLITE_OK);
+  assert(sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC)==SQLITE_OK && sqlite3_bind_text(st,2,r->endpoint_id,-1,SQLITE_STATIC)==SQLITE_OK && sqlite3_bind_text(st,3,r->tenant_id,-1,SQLITE_STATIC)==SQLITE_OK && sqlite3_bind_int64(st,4,r->pid)==SQLITE_OK && sqlite3_bind_text(st,5,start,-1,SQLITE_STATIC)==SQLITE_OK && sqlite3_bind_text(st,6,birth,-1,SQLITE_STATIC)==SQLITE_OK);
+  assert(sqlite3_step(st)==SQLITE_ROW);int owned=sqlite3_column_int(st,0);assert(sqlite3_finalize(st)==SQLITE_OK);return owned;
+}
+static void selected_assert_command_dependencies(sqlite3 *db,const EdrBehaviorRecord *r,const char *subject,const char *parent,int selected_required) {
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates p WHERE p.subject_command_fact_id<>'' AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.artifact_id=p.subject_command_fact_id)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates p WHERE p.parent_command_fact_id<>'' AND NOT EXISTS(SELECT 1 FROM artifacts a WHERE a.artifact_id=p.parent_command_fact_id)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2")<=1);
+  if(selected_required)assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2")==1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='unclassified-old'")==1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_id='old-command'")==1);
+  EdrBehaviorRecord *identity=malloc(sizeof(*identity));assert(identity);*identity=*r;
+  for(unsigned which=0;which<2u;++which) {
+    if(which){identity->pid=r->ppid;identity->process_start_key=r->parent_process_start_key;identity->process_creation_filetime_100ns=r->parent_process_creation_filetime_100ns;}
+    const char *id=which?parent:subject;int owned=selected_command_fact_owned(db,id,identity);
+    if(selected_required)assert(owned);
+    if(owned){
+      sqlite3_stmt *st=NULL;assert(sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_id=? AND artifact_type='process_command_line' AND command_retention_policy=1",-1,&st,NULL)==SQLITE_OK);
+      assert(sqlite3_bind_text(st,1,id,-1,SQLITE_STATIC)==SQLITE_OK && sqlite3_step(st)==SQLITE_ROW && sqlite3_column_int(st,0)==1);assert(sqlite3_finalize(st)==SQLITE_OK);
+      /* The production read owner verifies exact generation, SHA and manifest. */
+      char *full=edr_local_evidence_cache_read_command_fact(identity);assert(full);
+      assert(!strcmp(full,which?"ordinary-parent --full-tail":"selected --preview full-tail"));free(full);
+    }
+  }
+  free(identity);
+}
+static int selected_finish_due_command_retirement(sqlite3 *db,const EdrBehaviorRecord *r,const char *subject,const char *parent,int selected_required) {
+  enum { due_periods=9 };EdrEvidenceCacheStatus before,after;
+  edr_local_evidence_cache_get_status(&before);after=before;
+  uint64_t original_failures=before.retention_failures;
+  for(unsigned turn=0;turn<=due_periods;++turn) {
+    selected_assert_command_dependencies(db,r,subject,parent,selected_required);
+    sqlite3_int64 facts=compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND command_retention_policy=1");
+    sqlite3_int64 selected=compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2");
+    sqlite3_int64 unrelated=compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND command_owner_pid=999");
+    int valid=after.db_open && after.retention_clock_valid && !after.last_error[0] && after.retention_failures==original_failures;
+    int done=valid && facts==(selected_required?2:0) && selected==(selected_required?1:0) && unrelated==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='recent-comparison'")==0;
+    fprintf(stderr,"selected_command_due turn=%u bound=%u selected_required=%d facts=%lld selected=%lld unrelated=%lld runs=%llu valid=%d done=%d simulated_due_ns=%llu\n",turn,due_periods,selected_required,(long long)facts,(long long)selected,(long long)unrelated,(unsigned long long)after.maintenance_runs,valid,done,(unsigned long long)turn*UINT64_C(60000000000));fflush(stderr);
+    if(done)return 1;
+    if(!valid || turn==due_periods)return 0;
+    s_test_monotonic_ns+=UINT64_C(60000000000); /* Existing normal due cadence only. */
+    edr_local_evidence_cache_poll_maintenance();edr_local_evidence_cache_get_status(&after);
+    if(after.maintenance_runs!=before.maintenance_runs+1u)return 0;
+    before=after;
+  }
+  return 0;
+}
+
 static void test_selected_window_and_command_fact_dependencies(void) {
   const int64_t now = INT64_C(1700000000000000000);
-  char path[512]; sqlite3 *db = NULL;
+  char path[512],subject_fact[80],parent_fact[80]; sqlite3 *db = NULL;
   EdrBehaviorRecord *r = calloc(1, sizeof(*r)); assert(r);
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
   edr_local_evidence_cache_test_set_now_unix_ns(now);
@@ -7308,27 +7364,31 @@ static void test_selected_window_and_command_fact_dependencies(void) {
   assert(!strcmp(cJSON_GetObjectItemCaseSensitive(fact_json,"parent_creation_filetime_100ns")->valuestring,"133700000000000700"));
   cJSON_Delete(fact_json); sqlite3_finalize(fact);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2 AND retention_value_reason='detector_evidence' AND subject_command_fact_id<>'' AND parent_command_fact_id<>''")==1);
+  assert(sqlite3_prepare_v2(db,"SELECT subject_command_fact_id,parent_command_fact_id FROM p0_candidates WHERE retention_value_class=2",-1,&fact,NULL)==SQLITE_OK && sqlite3_step(fact)==SQLITE_ROW);
+  assert(sqlite3_column_bytes(fact,0)==72 && sqlite3_column_bytes(fact,1)==72);
+  snprintf(subject_fact,sizeof(subject_fact),"%s",sqlite3_column_text(fact,0));snprintf(parent_fact,sizeof(parent_fact),"%s",sqlite3_column_text(fact,1));
+  assert(sqlite3_step(fact)==SQLITE_DONE && sqlite3_finalize(fact)==SQLITE_OK);fact=NULL;
   retention_group_fixture(db,"recent-comparison",1,now,now,now+1);
   retention_group_fixture(db,"unclassified-old",0,now,now,now+1);
   compact_exec(db,"INSERT INTO artifacts(artifact_id,artifact_type,manifest_json,created_ns,upload_status) VALUES('old-command','process_command_line','{\"old\":true}',1,'embedded');");
   sqlite3_close(db);
   edr_local_evidence_cache_test_set_now_unix_ns(now+INT64_C(7200000000000));
   assert(edr_local_evidence_cache_open_with_policy(path,16,1,4)==0);
-  edr_local_evidence_cache_close();
   assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(selected_finish_due_command_retirement(db,r,subject_fact,parent_fact,1));
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2")==1);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='recent-comparison'")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND command_retention_policy=1")==2);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_id='old-command'")==1);
-  sqlite3_close(db);
+  sqlite3_close(db);edr_local_evidence_cache_close();
   edr_local_evidence_cache_test_set_now_unix_ns(now+INT64_C(18000000000000));
   assert(edr_local_evidence_cache_open_with_policy(path,16,1,4)==0);
-  edr_local_evidence_cache_close();
   assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(selected_finish_due_command_retirement(db,r,subject_fact,parent_fact,0));
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_value_class=2")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND command_retention_policy=1")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='unclassified-old'")==1);
-  sqlite3_close(db); cleanup_test_sqlite_path(path); free(parent); free(r);
+  sqlite3_close(db);edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path); free(parent); free(r);
   edr_local_evidence_cache_test_set_now_unix_ns(0);
 }
 
