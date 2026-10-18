@@ -25,6 +25,60 @@ class Contracts(unittest.TestCase):
           'evidence_cache_opened':False,'product_binaries_executed':False}
     def check_verification(self,value):
         raw=json.dumps(value);return M.verified_handler_receipt(raw,M.digest(raw.encode()))
+    def test_legacy_695_and_bound_697_are_separate(self):
+        old,base,pin=M.cohort()
+        self.assertEqual((old['source'],old['release_run'],old['native_run'],int(old['native_artifact_id'])),
+          (M.SOURCE,M.TARGET_RUN,M.TOOL_RUN,M.TOOL_ID))
+        self.assertEqual(old['tag'],'win_3.2.695');self.assertEqual(base['tag'],'win_3.2.692')
+        self.assertEqual(pin,M.digest(M.cohort_catalog_raw()))
+        draft=M.cohort('697',False)[0]
+        self.assertEqual(draft['source'],'f672059aec426aafe00b216c482dc151b96226c9')
+        self.assertEqual(draft['version'],'3.2.697')
+        self.assertEqual(draft['native_run'],'39078106854')
+        self.assertEqual(draft['release_run'],'39080074060')
+        self.assertEqual(draft['release_id'],'416133839')
+        self.assertEqual(draft['native_artifact_id'],'12118710280')
+        self.assertEqual(M.cohort('697')[0],draft)
+    def test_697_unbound_refuses_before_external_io_or_state(self):
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('external I/O forbidden'))as call:
+            value=json.loads(M.cohort_catalog_raw());value['profiles']['697']['release_run']='UNBOUND'
+            catalog=Path(d)/'missing-pin.json';catalog.write_text(json.dumps(value))
+            root=Path(d)/'must-not-exist'
+            with patch.object(M,'PROFILE_FILE',catalog),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                M.prepare(Path(d),root,'UNBOUND','UNBOUND','1','UNBOUND','697')
+            self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+    def test_unknown_cohort_never_falls_back(self):
+        for value in ('696','698','win_3.2.697','697;public','',697,None):
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'unsupported_recovery_cohort'):M.cohort(value)
+    def test_profile_cli_is_closed_and_exact_bound_cohort_has_descriptor(self):
+        script=str(Path(__file__).with_name('prepare_disposable_695.py'))
+        import subprocess
+        for tag in ('win_3.2.696','win_3.2.695;public'):
+            r=subprocess.run([sys.executable,'-I','-B',script,'profile','--target-tag',tag],capture_output=True,timeout=3)
+            self.assertNotEqual(r.returncode,0);self.assertEqual(r.stdout,b'')
+        for cid in ('695','697'):
+            c=M.cohort(cid)[0]
+            r=subprocess.run([sys.executable,'-I','-B',script,'profile','--target-tag',c['tag']],capture_output=True,timeout=3)
+            self.assertEqual(r.returncode,0);self.assertEqual(r.stderr,b'')
+            self.assertEqual(json.loads(r.stdout)['source_sha'],c['source'])
+    def test_profile_catalog_rejects_unknown_fields_and_large_input(self):
+        with tempfile.TemporaryDirectory()as d:
+            p=Path(d)/'public-catalog.json';value=json.loads(M.cohort_catalog_raw())
+            value['profiles']['695']['unexpected']='not allowed';p.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',p),self.assertRaisesRegex(ValueError,'profile_shape'):M.cohort()
+            p.write_bytes(b'x'*16385)
+            with patch.object(M,'PROFILE_FILE',p),self.assertRaisesRegex(ValueError,'catalog_bound'):M.cohort()
+    def test_shared_profile_go_and_workflow_consumers_are_bound(self):
+        parent=Path(__file__).parent
+        go=(parent/'verified_headless_p5_export_test.go').read_text()
+        self.assertIn('//go:embed recovery_cohorts.json',go)
+        self.assertIn('p5BindingCohort(b)',go)
+        self.assertIn('"verified-p5-"+b.Version+"-"+b.Arch+".zip"',go)
+        workflow=(parent.parents[1]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
+        self.assertIn('ref: ${{ steps.recovery-cohort.outputs.source }}',workflow)
+        self.assertIn('profile --target-tag "$env:RECOVERY_TARGET_TAG"',workflow)
+        self.assertIn('--cohort "$env:RECOVERY_COHORT"',workflow)
+        self.assertIn('name: disposable-cache-recovery-${{ steps.recovery-cohort.outputs.id }}-metadata-',workflow)
     def test_fixed_original_handler_scope(self):
         v,raw,d,p=self.check_verification(self.verification())
         self.assertIs(v['authenticated_platform_http'],False);self.assertEqual(p['full_installer'],'c'*64)
@@ -98,7 +152,7 @@ class Contracts(unittest.TestCase):
             if in_run and line and not line.startswith('          '):in_run=False
             if in_run:self.assertNotIn('${{ inputs.',line)
         self.assertIn("'source-owner/full_installer.go'",text)
-        self.assertIn("'zz_private_695_p5_export_test.go'",text)
+        self.assertIn("'zz_private_p5_export_test.go'",text)
         self.assertIn('retention-days: 7',text)
     def assert_recovery_execution_host(self,text):
         step=re.search(r'^      - name: Execute only disposable local rollback and normal repair subset\n(.*?)(?=^      - |\Z)',text,re.M|re.S)

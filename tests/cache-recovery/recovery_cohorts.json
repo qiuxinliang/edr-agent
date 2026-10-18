@@ -1,0 +1,58 @@
+{
+  "schema": "edr.ci-recovery-cohorts.v1",
+  "baseline": {
+    "source": "a978ec83deacf7cd78c273d82630b457c5f39251",
+    "version": "3.2.692",
+    "tag": "win_3.2.692",
+    "release_run": "38912075743",
+    "release_id": "415024985"
+  },
+  "profiles": {
+    "695": {
+      "id": "695",
+      "source": "694a4f47cfd55a7c98f8dab62617520c0c6251b1",
+      "version": "3.2.695",
+      "tag": "win_3.2.695",
+      "release_run": "39054352162",
+      "release_id": "415961990",
+      "native_run": "39051197046",
+      "native_artifact_id": "12107948816",
+      "native_artifact_size": "1202069",
+      "native_artifact_sha256": "35e66cef15bd99617a52ac0d066f129f0864b262af0f3398eadac5ccd505f91b",
+      "native_uncompressed_bytes": "2968759",
+      "native_member_count": "4",
+      "handler_owner_sha256": "96b52a37672645e79607a4ed33365abe0d88dada7667237aa6aa59cbd154027f",
+      "builder_owner_sha256": "695c9a0de7d9fe7714918147982aec29aa8061c058702a427a9dee268f2e43a9",
+      "handler_receipt_sha256": "409a692f1a5379252fb542cb68cae9b6e27f8fa456ce83e6550347e24da03fe6",
+      "binary_sha256": "b20517f6289960ed0ac1c26e45768ad8ab7d6d77dcbf6f0698c2abd337abcae3",
+      "headless_sha256": "5d81f92009712261d6e70c789cc0c32ce374c7cb04d97dd5379ad451a1e38656",
+      "artifact_manifest_sha256": "667c9ff31f1d84979e74f374981391ab8f668dc8e253e0c03734f7c116d6204d",
+      "preflight_response_sha256": "5da6322ed7749bc4bac6687b0445409b6763df63408872d34584bea4c2fdd1af",
+      "p5_sha256": "7ffc719a162ccfc5ec2fdc68dc9385f8f137da9e3e5a464a67201664a3d098f7",
+      "runtime_identity_sha256": "7d030972b5c8796693168ad4d81655510db1ae83b7290190b09dc47fb32f774d"
+    },
+    "697": {
+      "id": "697",
+      "source": "f672059aec426aafe00b216c482dc151b96226c9",
+      "version": "3.2.697",
+      "tag": "win_3.2.697",
+      "release_run": "39080074060",
+      "release_id": "416133839",
+      "native_run": "39078106854",
+      "native_artifact_id": "12118710280",
+      "native_artifact_size": "1208547",
+      "native_artifact_sha256": "332468d9b24a2f14173b3c71d1b08f5b4faeedab0477ab858501abffe67f4e31",
+      "native_uncompressed_bytes": "2981047",
+      "native_member_count": "4",
+      "handler_owner_sha256": "96b52a37672645e79607a4ed33365abe0d88dada7667237aa6aa59cbd154027f",
+      "builder_owner_sha256": "695c9a0de7d9fe7714918147982aec29aa8061c058702a427a9dee268f2e43a9",
+      "handler_receipt_sha256": "5263b6bee76c8bcb8c64645f241dfe1261bebff8925e6623a17841bc33cae57d",
+      "binary_sha256": "15f258a42fb092786dd975a8fe194575469250cb23efb14c75f4236c0fe838b2",
+      "headless_sha256": "29cf67a947fc67608cf7573587875e9037daa4abae74943eff5ff1eac3ec03c2",
+      "artifact_manifest_sha256": "0b5dc3a6dc14d58fe7e5a70943e3fa0dead5b83bce84bb8c0ab16ccc5fb2879c",
+      "preflight_response_sha256": "d0de8331967bbe52c25c19200691081d12464bd5ed840bd1a9f8778dd0e8d576",
+      "p5_sha256": "aeead1e75ba84453ec6c03f4b487dfa5381ceb29069c39be95ee79cec8997d3c",
+      "runtime_identity_sha256": "de8fd1ee148a9a25d32c724e093e06af8f7dfb49a6b4329dcf1fe95272c951ba"
+    }
+  }
+}

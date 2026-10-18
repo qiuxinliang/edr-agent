@@ -1,4 +1,38 @@
-# Disposable exact 692 → 695 recovery subset
+# Disposable exact 692 → 695 / 697 recovery cohorts
+
+The existing `prepare_disposable_695.py` filename remains the compatibility entry
+point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
+pin owner shared by preparation, the manual workflow selector, the original Go
+file-list exporter, and the bounded raw-evidence collector. Only the literal
+695 and 697 selectors exist; there is no caller source/run/asset URL override.
+The Go overlay embeds the same JSON bytes copied into its existing source-owner
+directory; this adds no product dependency or runtime component.
+
+Cohort 695 retains the original source/run/tool and published Headless/preflight
+pins below. Cohort 697 names source `f672059aec426aafe00b216c482dc151b96226c9`
+and native run `39078106854/1`. Its bound candidate release is `416133839`,
+run `39080074060/1`; passed native artifact is `12118710280`. Actual original
+handler proof SHA starts `5263b6bee76c`; the independently exported P5 SHA is
+`aeead1e75ba84453ec6c03f4b487dfa5381ceb29069c39be95ee79cec8997d3c`.
+The full exact pins live only in the authoritative JSON, not these short labels.
+The workflow first checks out its own QA source to read this data, then resolves
+the closed profile before product checkout. Any missing/UNBOUND pin still refuses
+before product I/O, and never selects695 as a fallback.
+
+These actual published/byte/preflight/export bindings do not imply a697 recovery
+pass. Root must separately approve applying this QA data and a single disposable
+run; no live API authentication, catalog import or endpoint deployment happened
+in the in-process handler verification. The original 695 bytes and failed
+cohorts are immutable evidence. The driver, 45/30/900-second limits, service
+sampler and collector's 24-name/1MiB-per-file/8MiB-total contract are unchanged.
+The new artifact name includes its actual cohort; 697 cannot be labelled 695.
+
+This QA profile exists only for the current shutdown-stage investigation. After
+that diagnostic cohort has a fixed accepted/failed evidence record and no active
+consumer, remove its executable selector/profile together while retaining the
+immutable external evidence; it is not a generic release catalog or product
+configuration. Do not edit a closed profile to retarget a different product.
+
 
 This is a manually dispatched, GitHub-hosted Windows ARM64 test. It uses the
 existing Headless checkpoint, backend builder, native storage fixture and embedded
@@ -35,7 +69,7 @@ inputs (ten total). Only explicit `cache_recovery_subset=true` selects this
 manual-only job; the normal native job keeps its original default behavior. This
 independent job explicitly overrides inherited permissions with `contents: read`
 and `actions: read`, a same-repository token, one disposable `windows-11-arm`
-runner and a 90-minute outer job limit. It fails unless target695, baseline692,
+runner and a 90-minute outer job limit. It fails unless the selected exact target profile is closed, baseline692,
 Headless and ARM64 are explicitly selected. Dispatch data travels through environment variables, never shell
 source interpolation. No cross-repository or P0 key is needed. Missing permission,
 HTTP 403, missing/expired artifact or a failed exact-byte check is terminal;

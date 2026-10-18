@@ -3,6 +3,7 @@ Never copies Agent logs/configs/databases/products/environments or credentials.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import ntpath
 import os
@@ -12,7 +13,10 @@ import stat
 import sys
 import time
 
-SOURCE='694a4f47cfd55a7c98f8dab62617520c0c6251b1'
+# Reuse the fixed preparation data owner under -I, without sys.path mutation.
+_SPEC=importlib.util.spec_from_file_location('recovery_cohort_owner',Path(__file__).with_name('prepare_disposable_695.py'))
+_PROFILE_OWNER=importlib.util.module_from_spec(_SPEC);_SPEC.loader.exec_module(_PROFILE_OWNER)
+SOURCE=_PROFILE_OWNER.cohort()[0]['source']
 FILE_CAP=1024*1024
 TOTAL_CAP=8*1024*1024
 WINDOWS_STAT=os.name=='nt'
@@ -83,22 +87,25 @@ def save(path,raw):
 def read_binding(path,pin):
     need(type(pin)is str and SHA.fullmatch(pin),'binding_sha_shape');raw=take(path)
     need(sha(raw)==pin,'binding_sha_mismatch');b=strict_json(raw)
+    profile,baseline_profile,profile_sha=_PROFILE_OWNER.cohort(b.get('cohort_id','695'))
+    need((b.get('cohort_id','695')=='695' and b.get('cohort_catalog_sha256')is None) or
+         b.get('cohort_catalog_sha256')==profile_sha,'cohort_catalog_sha_mismatch')
     need(b.get('schema')=='edr.ci-cache-recovery-input.v1' and b.get('prepared_only')is False and b.get('arch')=='arm64' and
-         b.get('target',{}).get('source_sha')==SOURCE,'binding_scope')
+         b.get('target',{}).get('source_sha')==profile['source'],'binding_scope')
     stages={}
-    for which,version in (('target','3.2.695'),('baseline','3.2.692')):
+    for which,version in (('target',profile['version']),('baseline',baseline_profile['version'])):
         spec=b.get(which,{});raw=take(Path(spec.get('stage_path','')))
         need(type(spec.get('stage_sha256'))is str and sha(raw)==spec['stage_sha256'],'stage_sha_mismatch')
         v=strict_json(raw)
         need(v.get('version')==version and v.get('target_arch')=='arm64' and SHA.fullmatch(v.get('agent_binary_sha256','')),'stage_scope')
         stages[which]=v
-    need(stages['target'].get('source_commit')==SOURCE,'target_source')
-    need(stages['baseline'].get('source_commit')=='a978ec83deacf7cd78c273d82630b457c5f39251','baseline_source')
+    need(stages['target'].get('source_commit')==profile['source'],'target_source')
+    need(stages['baseline'].get('source_commit')==baseline_profile['source'],'baseline_source')
     return b,stages
 
 
 def phase_identity(data,b,stages):
-    target=stages['target']['agent_binary_sha256']
+    target=stages['target']['agent_binary_sha256'];version=stages['target']['version']
     for label,(operation,health_fail)in LABELS.items():
         key=label+'.intent.json';intent=strict_json(data[key])if key in data else None
         children=[label+s for s in ('.original-report.json','.original-journal.json','.stdout.log','.stderr.log')]
@@ -112,11 +119,11 @@ def phase_identity(data,b,stages):
         if key in data:
             j=strict_json(data[key]);need(j.get('schema_version')==2 and type(j.get('schema_version'))is int and
               j.get('task_id')==task and j.get('command_id')==intent['command_id'] and j.get('hash')==target and
-              j.get('version')=='3.2.695' and j.get('operation')==operation and j.get('upgrade_class')=='installer_required' and
-              j.get('artifact_id')=='ci-cache-recovery-3.2.695','phase_journal_identity')
+              j.get('version')==version and j.get('operation')==operation and j.get('upgrade_class')=='installer_required' and
+              j.get('artifact_id')=='ci-cache-recovery-'+version,'phase_journal_identity')
         key=label+'.original-report.json'
         if key in data:
-            j=strict_json(data[key]);need(j.get('target_version')=='3.2.695' and j.get('operation')==operation and
+            j=strict_json(data[key]);need(j.get('target_version')==version and j.get('operation')==operation and
               j.get('upgrade_class')=='installer_required' and j.get('expected_architecture')=='arm64' and
               j.get('expected_sha256')==target and type(j.get('runtime_manifest'))is str and
               ntpath.normcase(ntpath.normpath(j['runtime_manifest']))==ntpath.normcase(ntpath.normpath(b['protocol5_package']['path'])),'phase_report_identity')
@@ -144,7 +151,7 @@ def collect(source,binding,pin,output,runner_temp):
         total+=len(raw);need(total<=TOTAL_CAP,'aggregate_bytes_bound');data[name]=raw
     need('recovery-subset-summary.json'in data,'owned_summary_required')
     summary=strict_json(data['recovery-subset-summary.json'])
-    need(summary.get('schema')=='edr.ci-cache-recovery-result.v1' and summary.get('input_sha256')==pin and summary.get('target_source')==SOURCE and
+    need(summary.get('schema')=='edr.ci-cache-recovery-result.v1' and summary.get('input_sha256')==pin and summary.get('target_source')==stages['target']['source_commit'] and
          summary.get('baseline')=='win_3.2.692' and summary.get('status')in ('local_subset_passed','failed_or_unknown') and
          summary.get('real_data_touched')is False and summary.get('library_prepared_schema')is True,'owned_summary_identity')
     for name in METADATA:
@@ -152,7 +159,7 @@ def collect(source,binding,pin,output,runner_temp):
     phase_identity(data,b,stages)
     need(summary['status']!='local_subset_passed' or not missing,'passed_subset_missing_raw_evidence')
     manifest={'schema':'edr.ci-synthetic-recovery-artifacts.v1','purpose':'private_ci_fixture_raw_qa_evidence','input_sha256':pin,
-      'target_source':SOURCE,'target_version':'3.2.695','baseline':'win_3.2.692','arch':'arm64',
+      'target_source':stages['target']['source_commit'],'target_version':stages['target']['version'],'baseline':'win_3.2.692','arch':'arm64',
       'recovery_status':summary['status'],'collector_status':'collected_fixed_whitelist','complete_file_inventory':not missing,
       'not_observed_files':missing,'source_terminal_state_proven_by_collector':False,
       'files':[{'name':name,'bytes':len(data[name]),'sha256':sha(data[name])}for name in ALLOW if name in data],

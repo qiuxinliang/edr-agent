@@ -36,6 +36,48 @@ class Contracts(unittest.TestCase):
     def collect(self):return M.collect(self.source,self.binding,self.pin,self.output,self.root)
     def mutate(self,name,key,value):
         p=self.source/name;j=json.loads(p.read_bytes());j[key]=value;self.write(p,j)
+    @contextmanager
+    def synthetic_bound_697(self):
+        # This temporary public catalog tests routing only, never a published artifact.
+        catalog=json.loads(M._PROFILE_OWNER.cohort_catalog_raw());c=catalog['profiles']['697']
+        for key,value in c.items():
+            if value=='UNBOUND':c[key]='7'*64 if key.endswith('_sha256')else '1'
+        path=self.root/'synthetic-catalog.json';self.write(path,catalog)
+        with patch.object(M._PROFILE_OWNER,'PROFILE_FILE',path):
+            yield c,M.sha(path.read_bytes())
+    def set_697_fixture(self,c,pin):
+        binding=json.loads(self.binding.read_bytes());binding['cohort_id']='697';binding['cohort_catalog_sha256']=pin;binding['target']['source_sha']=c['source']
+        stage=Path(binding['target']['stage_path']);value=json.loads(stage.read_bytes());value.update(version=c['version'],source_commit=c['source']);self.write(stage,value)
+        binding['target']['stage_sha256']=M.sha(stage.read_bytes());self.write(self.binding,binding);self.pin=M.sha(self.binding.read_bytes())
+        self.mutate('recovery-subset-summary.json','input_sha256',self.pin);self.mutate('recovery-subset-summary.json','target_source',c['source'])
+        for label in M.LABELS:
+            self.mutate(label+'.original-report.json','target_version',c['version'])
+            self.mutate(label+'.original-journal.json','version',c['version'])
+            self.mutate(label+'.original-journal.json','artifact_id','ci-cache-recovery-'+c['version'])
+    def test_unbound_697_is_not_a_legacy_695_fallback(self):
+        value=json.loads(self.binding.read_bytes());value['cohort_id']='697';value['target']['source_sha']='f672059aec426aafe00b216c482dc151b96226c9';self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+        catalog=json.loads(M._PROFILE_OWNER.cohort_catalog_raw());catalog['profiles']['697']['release_run']='UNBOUND'
+        path=self.root/'missing-pin.json';self.write(path,catalog)
+        with patch.object(M._PROFILE_OWNER,'PROFILE_FILE',path),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):self.collect()
+        self.assertFalse(self.output.exists())
+    def test_closed_synthetic_697_has_accurate_artifact_identity(self):
+        with self.synthetic_bound_697()as(c,pin):
+            self.set_697_fixture(c,pin);self.collect();result=json.loads((self.output/'manifest.json').read_bytes())
+            self.assertEqual(result['target_version'],'3.2.697');self.assertEqual(result['target_source'],c['source'])
+            self.assertEqual(len(result['files']),24);self.assertFalse(result['source_terminal_state_proven_by_collector'])
+    def test_697_requires_exact_catalog_hash(self):
+        with self.synthetic_bound_697()as(c,pin):
+            self.set_697_fixture(c,pin)
+            value=json.loads(self.binding.read_bytes());value.pop('cohort_catalog_sha256');self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+            with self.assertRaisesRegex(ValueError,'catalog_sha_mismatch'):self.collect()
+            self.assertFalse(self.output.exists())
+    def test_697_rejects_old_695_journal_and_profile_hash(self):
+        with self.synthetic_bound_697()as(c,pin):
+            self.set_697_fixture(c,pin);self.mutate('health-failed-upgrade.original-journal.json','version','3.2.695')
+            with self.assertRaisesRegex(ValueError,'phase_journal_identity'):self.collect()
+            self.assertFalse(self.output.exists())
+        value=json.loads(self.binding.read_bytes());value['cohort_catalog_sha256']='0'*64;self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+        with self.synthetic_bound_697(),self.assertRaisesRegex(ValueError,'catalog_sha_mismatch'):self.collect()
     def test_fixed_complete_inventory_hashes_and_zero_stderr(self):
         r=self.collect();self.assertEqual(r['files'],24);self.assertFalse(r['recovery_pass_claimed'])
         j=json.loads((self.output/'manifest.json').read_bytes());self.assertTrue(j['complete_file_inventory'])

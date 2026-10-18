@@ -17,16 +17,8 @@ import zipfile
 import io
 
 REPO='qiuxinliang/edr-agent'
-SOURCE='694a4f47cfd55a7c98f8dab62617520c0c6251b1'
-BASELINE='a978ec83deacf7cd78c273d82630b457c5f39251'
-TARGET_RUN='39054352162'
-TOOL_RUN='39051197046'
-TOOL_ID=12107948816
-TOOL_SIZE=1202069
-TOOL_SHA='35e66cef15bd99617a52ac0d066f129f0864b262af0f3398eadac5ccd505f91b'
-BUILDER_SHA='695c9a0de7d9fe7714918147982aec29aa8061c058702a427a9dee268f2e43a9'
-HANDLER_SHA='96b52a37672645e79607a4ed33365abe0d88dada7667237aa6aa59cbd154027f'
 SHA=re.compile(r'[0-9a-f]{64}')
+PROFILE_FILE=Path(__file__).with_name('recovery_cohorts.json')
 
 
 def need(ok,cause):
@@ -44,6 +36,44 @@ def strict_json(raw):
         return result
     return json.loads(raw.decode('utf-8','strict'),object_pairs_hook=pairs,
                       parse_constant=lambda unused: (_ for _ in ()).throw(ValueError('json_constant')))
+
+
+def cohort_catalog_raw():
+    with PROFILE_FILE.open('rb')as f:raw=f.read(16385)
+    need(0<len(raw)<=16384,'cohort_catalog_bound')
+    return raw
+
+
+def cohort(cohort_id='695',require_bound=True):
+    # One checked-in QA data owner; no caller-selected file/source/run/URL.
+    need(cohort_id in ('695','697'),'unsupported_recovery_cohort')
+    raw=cohort_catalog_raw()
+    catalog=strict_json(raw)
+    need(type(catalog)is dict and set(catalog)=={'schema','baseline','profiles'} and catalog['schema']=='edr.ci-recovery-cohorts.v1' and
+         type(catalog['profiles'])is dict and set(catalog['profiles'])=={'695','697'},'cohort_catalog_shape')
+    c=catalog['profiles'][cohort_id]
+    keys={'id','source','version','tag','release_run','release_id','native_run','native_artifact_id','native_artifact_size',
+          'native_artifact_sha256','native_uncompressed_bytes','native_member_count','handler_owner_sha256','builder_owner_sha256',
+          'handler_receipt_sha256','binary_sha256','headless_sha256','artifact_manifest_sha256','preflight_response_sha256','p5_sha256','runtime_identity_sha256'}
+    need(type(c)is dict and set(c)==keys and all(type(v)is str for v in c.values()) and c['id']==cohort_id and
+         c['version']=='3.2.'+cohort_id and c['tag']=='win_'+c['version'] and re.fullmatch('[0-9a-f]{40}',c['source']),'cohort_profile_shape')
+    base=catalog['baseline'];need(type(base)is dict and set(base)=={'source','version','tag','release_run','release_id'} and
+         all(type(v)is str for v in base.values()) and base['version']=='3.2.692' and base['tag']=='win_3.2.692' and
+         re.fullmatch('[0-9a-f]{40}',base['source']) and all(re.fullmatch('[1-9][0-9]*',base[k]) for k in ('release_run','release_id')),'cohort_baseline_shape')
+    if require_bound:
+        need(all(v!='UNBOUND' for v in c.values()),'recovery_cohort_UNBOUND')
+        need(all(SHA.fullmatch(c[k]) for k in c if k.endswith('_sha256')) and
+             all(re.fullmatch('[1-9][0-9]*',c[k]) for k in ('release_run','release_id','native_run','native_artifact_id',
+                 'native_artifact_size','native_uncompressed_bytes','native_member_count')),'cohort_pin_shape')
+    return c,base,digest(raw)
+
+
+# Backward-compatible defaults for existing 695 parser/unit consumers. Execution
+# boundaries resolve the selected closed profile again, never mutate globals.
+_DEFAULT,_BASELINE,_=cohort()
+SOURCE=_DEFAULT['source'];BASELINE=_BASELINE['source'];TARGET_RUN=_DEFAULT['release_run']
+TOOL_RUN=_DEFAULT['native_run'];TOOL_ID=int(_DEFAULT['native_artifact_id']);TOOL_SIZE=int(_DEFAULT['native_artifact_size'])
+TOOL_SHA=_DEFAULT['native_artifact_sha256'];BUILDER_SHA=_DEFAULT['builder_owner_sha256'];HANDLER_SHA=_DEFAULT['handler_owner_sha256']
 
 
 def bounded_process(argv,cap,seconds):
@@ -130,11 +160,12 @@ def failure_cause(exc):
     return str(exc)if isinstance(exc,ValueError)else type(exc).__name__
 
 
-def verified_preflight(raw):
+def verified_preflight(raw,profile=None):
+    profile=profile or cohort()[0]
     p=strict_json(raw)
     need(type(p)is dict and p.get('code')=='OK' and type(p.get('data'))is dict,'actual_preflight_required')
     d=p['data'];need(d.get('valid')is True and d.get('upgradeReady')is True and d.get('upgradeBlockers')==[] and
-        d.get('version')=='3.2.695' and d.get('arch')=='arm64' and d.get('platform')=='windows' and
+        d.get('version')==profile['version'] and d.get('arch')=='arm64' and d.get('platform')=='windows' and
         d.get('signatureMode')=='unsigned_integrity' and d.get('trustedSigner')is False and
         d.get('policySnapshot')=='optional-signing-v1','actual_preflight_not_ready_or_supported_unsigned_scope')
     packages=d.get('packages');need(type(packages)is list and len(packages)==2,'preflight_package_count')
@@ -147,16 +178,17 @@ def verified_preflight(raw):
     return d,by
 
 
-def verified_builder_input(value):
+def verified_builder_input(value,profile=None):
     need(type(value)is str and 0<len(value)<=65536,'original_builder_base64_required')
     try:raw=base64.b64decode(value.encode('ascii','strict'),validate=True)
     except (ValueError,UnicodeError):raise ValueError('original_builder_base64_invalid')
-    need(base64.b64encode(raw).decode('ascii')==value and len(raw)<=65536 and digest(raw)==BUILDER_SHA,
+    need(base64.b64encode(raw).decode('ascii')==value and len(raw)<=65536 and digest(raw)==(profile['builder_owner_sha256']if profile else BUILDER_SHA),
          'fixed_original_builder_sha_required')
     return raw
 
 
-def verified_handler_receipt(value,expected_sha):
+def verified_handler_receipt(value,expected_sha,profile=None):
+    profile=profile or cohort()[0]
     need(type(expected_sha)is str and SHA.fullmatch(expected_sha),'original_handler_receipt_pin_required')
     raw=value.encode('utf-8','strict');need(0<len(raw)<=65536 and digest(raw)==expected_sha,'original_handler_receipt_pin_required')
     p=strict_json(raw)
@@ -166,9 +198,9 @@ def verified_handler_receipt(value,expected_sha):
           'evidence_cache_opened','product_binaries_executed'}
     need(type(p)is dict and set(p)==keys and p.get('schema')=='edr.ci-original-handler-verification.v1' and
          p.get('origin')=='ci_original_handler_verification' and p.get('authenticated_platform_http')is False and
-         p.get('verification_passed')is True and p.get('source_sha')==SOURCE and p.get('target_release_run')==TARGET_RUN and
-         p.get('version')=='3.2.695' and p.get('arch')=='arm64' and p.get('handler_owner_sha256')==HANDLER_SHA and
-         p.get('builder_owner_sha256')==BUILDER_SHA and p.get('db_or_artifactstore_written')is False and
+         p.get('verification_passed')is True and p.get('source_sha')==profile['source'] and p.get('target_release_run')==profile['release_run'] and
+         p.get('version')==profile['version'] and p.get('arch')=='arm64' and p.get('handler_owner_sha256')==profile['handler_owner_sha256'] and
+         p.get('builder_owner_sha256')==profile['builder_owner_sha256'] and p.get('db_or_artifactstore_written')is False and
          p.get('evidence_cache_opened')is False and p.get('product_binaries_executed')is False,
          'original_handler_verification_scope_required')
     need(all(type(p.get(k))is str and SHA.fullmatch(p[k]) for k in
@@ -177,18 +209,21 @@ def verified_handler_receipt(value,expected_sha):
     need(type(p['preflight_response_utf8'])is str,'original_handler_response_required')
     response=p['preflight_response_utf8'].encode('utf-8','strict')
     need(0<len(response)<=32768 and digest(response)==p['preflight_response_sha256'],'original_handler_response_hash')
-    d,packages=verified_preflight(response)
+    d,packages=verified_preflight(response,profile)
     need(d['binarySha256']==p['binary_sha256'] and packages['headless']==p['headless_sha256'] and
          packages['full_installer']==p['p5_sha256'],'original_handler_response_identity')
     return p,response,d,packages
 
 
-def release(tag,commit,run,baseline=False):
+def release(tag,commit,run,baseline=False,profile=None):
+    profile,base,unused=cohort(profile['id']if profile else '695')
+    expected=base if baseline else profile
+    need((tag,commit,run)==(expected['tag'],expected['source'],expected['release_run']),'fixed_cohort_release_identity')
     info=gh('repos/'+REPO+'/releases/tags/'+tag)
     need(info.get('tag_name')==tag and info.get('draft')is False and bool(info.get('published_at')),
          'published_exact_release_required_no_draft_permission')
-    if not baseline:need(info.get('prerelease')is True,'target_candidate_prerelease_required')
-    if baseline:need(info.get('id')==415024985,'exact692_release_id')
+    if not baseline:need(info.get('prerelease')is True and info.get('id')==int(profile['release_id']),'target_candidate_prerelease_required')
+    if baseline:need(info.get('id')==int(base['release_id']),'exact692_release_id')
     # No broad release listing or GraphQL/draft access is needed.
     assets=gh('repos/'+REPO+'/releases/'+str(info['id'])+'/assets?per_page=100')
     need(type(assets)is list and 1<=len(assets)<=12,'bounded_exact_release_assets');info['assets']=assets
@@ -201,8 +236,9 @@ def release(tag,commit,run,baseline=False):
     return info
 
 
-def download_headless(root,checkpoint,tag,commit,run,baseline=False):
-    info=release(tag,commit,run,baseline)
+def download_headless(root,checkpoint,tag,commit,run,baseline=False,profile=None):
+    profile=profile or cohort()[0]
+    info=release(tag,commit,run,baseline,profile)
     # Reuse the existing authoritative six-asset Headless publication contract.
     checkpoint.check_headless_remote_assets(info,{'tag':tag,'mode':'unsigned'},complete=True)
     directory=root/('baseline-download' if baseline else 'target-download');directory.mkdir()
@@ -219,84 +255,102 @@ def download_headless(root,checkpoint,tag,commit,run,baseline=False):
     with original_imports(Path(checkpoint.__file__)):
         stage=checkpoint.stage_headless(directory,root/('baseline-runtime'if baseline else 'target-runtime'),metadata,tag,'arm64',commit,REPO,
             expected_source_commit=None if baseline else commit,expected_run_id=None if baseline else run,
-            published_baseline=baseline,target_tag='win_3.2.695'if baseline else None)
+            published_baseline=baseline,target_tag=profile['tag']if baseline else None)
     json_save(root/('baseline-stage.json'if baseline else 'target-stage.json'),stage)
     return stage,directory
 
 
-def native_tools(root,snapshot,stage_owner):
-    run=gh('repos/'+REPO+'/actions/runs/'+TOOL_RUN+'/attempts/1')
-    need(run.get('id')==int(TOOL_RUN) and run.get('run_attempt')==1 and run.get('head_sha')==SOURCE and
+def native_tools(root,snapshot,stage_owner,profile=None):
+    profile=cohort(profile['id']if profile else '695')[0]
+    source=profile['source'];run_id=profile['native_run'];tool_id=int(profile['native_artifact_id'])
+    tool_size=int(profile['native_artifact_size']);tool_sha=profile['native_artifact_sha256']
+    run=gh('repos/'+REPO+'/actions/runs/'+run_id+'/attempts/1')
+    need(run.get('id')==int(run_id) and run.get('run_attempt')==1 and run.get('head_sha')==source and
         run.get('status')=='completed' and run.get('conclusion')=='success','exact_passed_tool_run')
-    a=gh('repos/'+REPO+'/actions/artifacts/'+str(TOOL_ID))
-    need(a.get('id')==TOOL_ID and a.get('name')=='evidence-native-tools-arm64-'+SOURCE and
-        a.get('size_in_bytes')==TOOL_SIZE and a.get('digest')=='sha256:'+TOOL_SHA and a.get('expired')is False and
-        a.get('workflow_run',{}).get('id')==int(TOOL_RUN) and a.get('workflow_run',{}).get('head_sha')==SOURCE,
+    a=gh('repos/'+REPO+'/actions/artifacts/'+str(tool_id))
+    need(a.get('id')==tool_id and a.get('name')=='evidence-native-tools-arm64-'+source and
+        a.get('size_in_bytes')==tool_size and a.get('digest')=='sha256:'+tool_sha and a.get('expired')is False and
+        a.get('workflow_run',{}).get('id')==int(run_id) and a.get('workflow_run',{}).get('head_sha')==source,
         'exact_passed_tool_artifact')
-    raw=gh('repos/'+REPO+'/actions/artifacts/'+str(TOOL_ID)+'/zip',TOOL_SIZE,True)
-    need(len(raw)==TOOL_SIZE and digest(raw)==TOOL_SHA,'tool_archive_full_hash_size')
+    raw=gh('repos/'+REPO+'/actions/artifacts/'+str(tool_id)+'/zip',tool_size,True)
+    need(len(raw)==tool_size and digest(raw)==tool_sha,'tool_archive_full_hash_size')
     out=root/'native-tools';out.mkdir()
     with zipfile.ZipFile(io.BytesIO(raw))as archive:
-        files=archive.infolist();need(len(files)==4 and sum(f.file_size for f in files)==2968759,'tool_archive_inventory')
+        files=archive.infolist();need(len(files)==int(profile['native_member_count']) and sum(f.file_size for f in files)==int(profile['native_uncompressed_bytes']),'tool_archive_inventory')
         for f in files:
             need(re.fullmatch('[a-z0-9_.-]+',f.filename) and not f.is_dir() and not((f.external_attr>>16)&0o170000)==0o120000 and
                 not f.flag_bits&1 and 0<f.file_size<=64*1024**2 and f.file_size<=max(1,f.compress_size)*200,'tool_archive_path_bound')
             body=archive.read(f);need(len(body)==f.file_size,'tool_archive_size');save(out/f.filename,body)
-    snapshot.validate_native_tools(out/'manifest.json',digest((out/'manifest.json').read_bytes()),stage_owner,digest(stage_owner.read_bytes()),'arm64',SOURCE,TOOL_RUN)
+    snapshot.validate_native_tools(out/'manifest.json',digest((out/'manifest.json').read_bytes()),stage_owner,digest(stage_owner.read_bytes()),'arm64',source,run_id)
     return out
 
 
-def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64):
+def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_id='695'):
+    profile,baseline_profile,profile_sha=cohort(cohort_id)
     need(not root.exists(),'fresh_private_output_required')
-    verification,receipt_raw,d,packages=verified_handler_receipt(receipt,receipt_sha)
-    owner_raw=verified_builder_input(owner_b64)
+    verification,receipt_raw,d,packages=verified_handler_receipt(receipt,receipt_sha,profile)
+    owner_raw=verified_builder_input(owner_b64,profile)
+    need(receipt_sha==profile['handler_receipt_sha256'] and verification['p5_sha256']==profile['p5_sha256'] and
+         verification['binary_sha256']==profile['binary_sha256'] and verification['headless_sha256']==profile['headless_sha256'] and
+         verification['manifest_sha256']==profile['artifact_manifest_sha256'] and verification['preflight_response_sha256']==profile['preflight_response_sha256'],
+         'exact_cohort_original_handler_pin')
     need(re.fullmatch('(0|[1-9][0-9]{0,12})',effective_floor) and int(effective_floor)<=1099511627776,'optional_explicit_higher_disk_floor_required')
+    profile_raw=cohort_catalog_raw();need(digest(profile_raw)==profile_sha,'cohort_catalog_changed')
     root.mkdir();save(root/'preflight.json',receipt_raw);save(root/'original-handler-verification.json',receipt.encode('utf-8'))
-    source_owner=root/'source-owner';source_owner.mkdir();owner=source_owner/'full_installer.go';save(owner,owner_raw)
+    source_owner=root/'source-owner';source_owner.mkdir();owner=source_owner/'full_installer.go';save(owner,owner_raw);save(source_owner/'recovery_cohorts.json',profile_raw)
     checkpoint=module(workspace/'canonical-agent/scripts/windows_release_checkpoint.py','original_checkpoint')
     snapshot=module(workspace/'tests/cache-recovery/cache_recovery_snapshot.py','original_private_snapshot')
-    stage_owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py';tool=native_tools(root,snapshot,stage_owner)
-    target,downloads=download_headless(root,checkpoint,'win_3.2.695',SOURCE,TARGET_RUN)
-    baseline,unused=download_headless(root,checkpoint,'win_3.2.692',BASELINE,'38912075743',True)
-    zip_path=downloads/'edr-agent-win_3.2.695-windows-arm64-exe.zip'
-    manifest=downloads/'edr-agent-win_3.2.695-windows-arm64-artifact-manifest.json'
-    need(digest(zip_path.read_bytes())==packages['headless'] and target['agent_binary_sha256']==d['binarySha256'] and
+    stage_owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py';tool=native_tools(root,snapshot,stage_owner,profile)
+    target,downloads=download_headless(root,checkpoint,profile['tag'],profile['source'],profile['release_run'],profile=profile)
+    baseline,unused=download_headless(root,checkpoint,baseline_profile['tag'],baseline_profile['source'],baseline_profile['release_run'],True,profile)
+    zip_path=downloads/('edr-agent-'+profile['tag']+'-windows-arm64-exe.zip')
+    manifest=downloads/('edr-agent-'+profile['tag']+'-windows-arm64-artifact-manifest.json')
+    need(digest(zip_path.read_bytes())==packages['headless'] and target['agent_binary_sha256']==d['binarySha256'] and target['runtime_identity_sha256']==profile['runtime_identity_sha256'] and
          digest(manifest.read_bytes())==verification['manifest_sha256'],'original_handler_download_binding')
-    binding={'schema':'edr.private-verified-headless-p5-input.v1','prepared_only':False,'source_sha':SOURCE,'version':'3.2.695','arch':'arm64',
+    binding={'schema':'edr.private-verified-headless-p5-input.v1','prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'version':profile['version'],'arch':'arm64',
       'agent_sha256':target['agent_binary_sha256'],'runtime_identity_sha256':target['runtime_identity_sha256'],'builder_owner_sha256':digest(owner.read_bytes()),
       'headless':{'path':str(zip_path),'sha256':packages['headless'],'bytes':zip_path.stat().st_size},
       'preflight':{'path':str(root/'preflight.json'),'sha256':digest(receipt_raw),'bytes':len(receipt_raw)}}
     json_save(root/'p5-binding.json',binding)
-    json_save(root/'overlay.json',{'Replace':{str(owner.with_name('zz_private_695_p5_export_test.go')):str(workspace/'tests/cache-recovery/verified_headless_p5_export_test.go')}})
-    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','source_sha':SOURCE,'target_run':TARGET_RUN,'tool_run':TOOL_RUN,
+    json_save(root/'overlay.json',{'Replace':{str(owner.with_name('zz_private_p5_export_test.go')):str(workspace/'tests/cache-recovery/verified_headless_p5_export_test.go')}})
+    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'target_run':profile['release_run'],'tool_run':profile['native_run'],
       'verification_origin':'ci_original_handler_verification','authenticated_platform_http':False,
-      'original_handler_verification_sha256':receipt_sha,'preflight_sha256':digest(receipt_raw),'builder_owner_sha256':BUILDER_SHA,'expected_p5_sha256':packages['full_installer'],'requested_min_free_bytes':effective_floor,'catalog_written':False,
+      'original_handler_verification_sha256':receipt_sha,'preflight_sha256':digest(receipt_raw),'builder_owner_sha256':profile['builder_owner_sha256'],'expected_p5_sha256':packages['full_installer'],'requested_min_free_bytes':effective_floor,'catalog_written':False,
       'endpoint_task_created':False,'recovery_started':False,'stage_owner_sha256':digest(stage_owner.read_bytes()),'native_manifest_sha256':digest((tool/'manifest.json').read_bytes())})
 
 
-def finalize(workspace,root):
-    p=strict_json((root/'prepared.json').read_bytes());need(p['source_sha']==SOURCE,'prepared_source')
-    package=root/'verified-p5-3.2.695-arm64.zip';need(package.is_file() and not package.is_symlink() and package.stat().st_size<=256*1024**2 and
+def finalize(workspace,root,cohort_id='695'):
+    profile,baseline_profile,profile_sha=cohort(cohort_id)
+    p=strict_json((root/'prepared.json').read_bytes());need(p['source_sha']==profile['source'] and p['cohort_id']==cohort_id and p['cohort_catalog_sha256']==profile_sha,'prepared_source')
+    package=root/('verified-p5-'+profile['version']+'-arm64.zip');need(package.is_file() and not package.is_symlink() and package.stat().st_size<=256*1024**2 and
         digest(package.read_bytes())==p['expected_p5_sha256'],'original_builder_output_preflight_hash_required')
-    manifest=root/'target-download/edr-agent-win_3.2.695-windows-arm64-artifact-manifest.json'
+    manifest=root/'target-download'/('edr-agent-'+profile['tag']+'-windows-arm64-artifact-manifest.json')
     stage=root/'target-stage.json';baseline=root/'baseline-stage.json';tools=root/'native-tools/manifest.json';owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py'
-    j={'schema':'edr.ci-cache-recovery-input.v1','prepared_only':False,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
+    j={'schema':'edr.ci-cache-recovery-input.v1','prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
        'snapshot_helper_sha256':digest((workspace/'tests/cache-recovery/cache_recovery_snapshot.py').read_bytes()),'requested_min_free_bytes':p['requested_min_free_bytes'],
        'baseline':{'stage_path':str(baseline),'stage_sha256':digest(baseline.read_bytes())},
-       'target':{'source_sha':SOURCE,'stage_path':str(stage),'stage_sha256':digest(stage.read_bytes()),'artifact_manifest_path':str(manifest),'artifact_manifest_sha256':digest(manifest.read_bytes())},
+       'target':{'source_sha':profile['source'],'stage_path':str(stage),'stage_sha256':digest(stage.read_bytes()),'artifact_manifest_path':str(manifest),'artifact_manifest_sha256':digest(manifest.read_bytes())},
        'protocol5_package':{'path':str(package),'sha256':p['expected_p5_sha256'],'builder_owner':'edr-backend/platform/internal/installer/full_installer.go','builder_output_verified_by_caller':True},
-       'native_tools':{'manifest_path':str(tools),'manifest_sha256':digest(tools.read_bytes()),'run_id':TOOL_RUN,'validation_owner_path':str(owner),'validation_owner_sha256':digest(owner.read_bytes())}}
+       'native_tools':{'manifest_path':str(tools),'manifest_sha256':digest(tools.read_bytes()),'run_id':profile['native_run'],'validation_owner_path':str(owner),'validation_owner_sha256':digest(owner.read_bytes())}}
     json_save(root/'recovery-input.json',j)
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['prepare','finalize']);parser.add_argument('--workspace',type=Path,required=True);parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697'],default='695');selection.add_argument('--target-tag');args=parser.parse_args()
+    need(args.mode=='profile' or args.target_tag is None,'target_tag_descriptor_only')
+    if args.target_tag is not None:
+        matches=[key for key in ('695','697')if cohort(key,False)[0]['tag']==args.target_tag]
+        need(len(matches)==1,'unsupported_recovery_target_tag');args.cohort=matches[0]
+    profile,unused,profile_sha=cohort(args.cohort)
+    if args.mode=='profile':
+        print(json.dumps({'cohort_id':args.cohort,'source_sha':profile['source'],'tag':profile['tag'],'version':profile['version'],'cohort_catalog_sha256':profile_sha}));return
+    need(args.workspace is not None and args.output is not None,'workspace_and_output_required')
     need(os.name=='nt' and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted','disposable_windows_ci_only')
     args.output.resolve().relative_to(Path(os.environ['RUNNER_TEMP']).resolve())
     if args.mode=='prepare':
         need(bool(os.environ.get('GH_TOKEN')),'existing_read_token_missing_no_new_permission')
-        prepare(args.workspace.resolve(),args.output.resolve(),os.environ.get('P5_HANDLER_VERIFICATION_JSON',''),os.environ.get('P5_HANDLER_VERIFICATION_SHA256',''),os.environ.get('P5_HIGHER_MIN_FREE_BYTES','0'),os.environ.get('P5_BACKEND_OWNER_BASE64',''))
-    else:finalize(args.workspace.resolve(),args.output.resolve())
+        prepare(args.workspace.resolve(),args.output.resolve(),os.environ.get('P5_HANDLER_VERIFICATION_JSON',''),os.environ.get('P5_HANDLER_VERIFICATION_SHA256',''),os.environ.get('P5_HIGHER_MIN_FREE_BYTES','0'),os.environ.get('P5_BACKEND_OWNER_BASE64',''),args.cohort)
+    else:finalize(args.workspace.resolve(),args.output.resolve(),args.cohort)
     print(json.dumps({'status':'prepared_inputs_only'if args.mode=='prepare'else'bound_original_builder_output','real_recovery_pass_claimed':False,'catalog_or_endpoint_task':False}))
 
 if __name__=='__main__':

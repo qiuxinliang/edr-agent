@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,8 +18,21 @@ import (
 	"testing"
 )
 
-const p5Source = "694a4f47cfd55a7c98f8dab62617520c0c6251b1"
-const p5Version = "3.2.695"
+// The same QA data file is copied byte-for-byte by the existing prepare owner
+// into this file-list overlay's source-owner directory before compilation.
+//
+//go:embed recovery_cohorts.json
+var p5CohortBytes []byte
+
+// Legacy 695 synthetic fixture oracles consume the same authoritative data.
+var p5Source, p5Version = func() (string, string) {
+	c, e := p5Cohort("695")
+	if e != nil {
+		panic(e)
+	}
+	return c["source"], c["version"]
+}()
+
 const p5Arch = "arm64"
 const p5Max = 256 << 20
 
@@ -31,6 +45,8 @@ type p5File struct {
 }
 type p5Binding struct {
 	Schema       string `json:"schema"`
+	CohortID     string `json:"cohort_id,omitempty"`
+	CatalogSHA   string `json:"cohort_catalog_sha256,omitempty"`
 	PreparedOnly *bool  `json:"prepared_only"`
 	Source       string `json:"source_sha"`
 	Version      string `json:"version"`
@@ -118,6 +134,72 @@ func p5JSON(raw []byte, out any) error {
 	typed.DisallowUnknownFields()
 	return typed.Decode(out)
 }
+func p5Cohort(id string) (map[string]string, error) {
+	if id != "695" && id != "697" {
+		return nil, errors.New("unsupported_recovery_cohort")
+	}
+	var catalog struct {
+		Schema   string                       `json:"schema"`
+		Baseline map[string]string            `json:"baseline"`
+		Profiles map[string]map[string]string `json:"profiles"`
+	}
+	if e := p5JSON(p5CohortBytes, &catalog); e != nil {
+		return nil, e
+	}
+	if len(p5CohortBytes) > 16384 || catalog.Schema != "edr.ci-recovery-cohorts.v1" || len(catalog.Profiles) != 2 ||
+		catalog.Profiles["695"] == nil || catalog.Profiles["697"] == nil {
+		return nil, errors.New("cohort_catalog_shape")
+	}
+	base := catalog.Baseline
+	if len(base) != 5 || base["version"] != "3.2.692" || base["tag"] != "win_3.2.692" ||
+		!regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(base["source"]) ||
+		!regexp.MustCompile(`^[1-9][0-9]*$`).MatchString(base["release_run"]) ||
+		!regexp.MustCompile(`^[1-9][0-9]*$`).MatchString(base["release_id"]) {
+		return nil, errors.New("cohort_baseline_shape")
+	}
+	c := catalog.Profiles[id]
+	keys := []string{"id", "source", "version", "tag", "release_run", "release_id", "native_run", "native_artifact_id", "native_artifact_size",
+		"native_artifact_sha256", "native_uncompressed_bytes", "native_member_count", "handler_owner_sha256", "builder_owner_sha256",
+		"handler_receipt_sha256", "binary_sha256", "headless_sha256", "artifact_manifest_sha256", "preflight_response_sha256", "p5_sha256", "runtime_identity_sha256"}
+	if len(c) != len(keys) || c["id"] != id || c["version"] != "3.2."+id || c["tag"] != "win_"+c["version"] {
+		return nil, errors.New("cohort_profile_shape")
+	}
+	for _, k := range keys {
+		if c[k] == "" || c[k] == "UNBOUND" {
+			return nil, errors.New("recovery_cohort_UNBOUND")
+		}
+	}
+	if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(c["source"]) {
+		return nil, errors.New("cohort_source_shape")
+	}
+	for _, k := range []string{"release_run", "release_id", "native_run", "native_artifact_id", "native_artifact_size", "native_uncompressed_bytes", "native_member_count"} {
+		if !regexp.MustCompile(`^[1-9][0-9]*$`).MatchString(c[k]) {
+			return nil, errors.New("cohort_pin_shape")
+		}
+	}
+	for k, v := range c {
+		if strings.HasSuffix(k, "_sha256") && !p5SHA.MatchString(v) {
+			return nil, errors.New("cohort_pin_shape")
+		}
+	}
+	return c, nil
+}
+func p5BindingCohort(b p5Binding) (map[string]string, error) {
+	id := b.CohortID
+	if id == "" {
+		id = "695"
+	} // Existing 695 inputs only; source/version must still match.
+	c, e := p5Cohort(id)
+	if e != nil {
+		return nil, e
+	}
+	if b.Source != c["source"] || b.Version != c["version"] ||
+		(b.CatalogSHA != "" && b.CatalogSHA != p5Hash(p5CohortBytes)) ||
+		(id != "695" && b.CatalogSHA == "") {
+		return nil, errors.New("actual_inputs_UNBOUND")
+	}
+	return c, nil
+}
 func p5Bounded(path string, cap int64) ([]byte, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("absolute_local_file_required")
@@ -177,7 +259,10 @@ func p5Pinned(f p5File, cap int64) ([]byte, error) {
 	return raw, nil
 }
 func p5BuildVerified(b p5Binding, headless, receipt, owner []byte) ([]byte, error) {
-	if b.Schema != "edr.private-verified-headless-p5-input.v1" || b.PreparedOnly == nil || *b.PreparedOnly || b.Source != p5Source || b.Version != p5Version || b.Arch != p5Arch {
+	if _, e := p5BindingCohort(b); e != nil {
+		return nil, e
+	}
+	if b.Schema != "edr.private-verified-headless-p5-input.v1" || b.PreparedOnly == nil || *b.PreparedOnly || b.Arch != p5Arch {
 		return nil, errors.New("actual_inputs_UNBOUND")
 	}
 	if !p5SHA.MatchString(b.AgentSHA) || !p5SHA.MatchString(b.RuntimeSHA) || !p5SHA.MatchString(b.OwnerSHA) || p5Hash(owner) != b.OwnerSHA {
@@ -264,6 +349,9 @@ func p5Export(bindingPath, bindingSHA, ownerPath string) (string, error) {
 	if b.PreparedOnly == nil || *b.PreparedOnly {
 		return "", errors.New("actual_inputs_UNBOUND")
 	}
+	if _, e := p5BindingCohort(b); e != nil {
+		return "", e
+	}
 	headless, e := p5Pinned(b.Headless, p5Max)
 	if e != nil {
 		return "", e
@@ -280,13 +368,13 @@ func p5Export(bindingPath, bindingSHA, ownerPath string) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	output := filepath.Join(filepath.Dir(bindingPath), "verified-p5-3.2.695-arm64.zip")
+	output := filepath.Join(filepath.Dir(bindingPath), "verified-p5-"+b.Version+"-"+b.Arch+".zip")
 	if e = p5WriteExclusive(output, body); e != nil {
 		return "", e
 	}
 	return p5Hash(body), nil
 }
-func TestPrivateP5Export695(t *testing.T) {
+func TestPrivateP5Export(t *testing.T) {
 	sum, e := p5Export(os.Getenv("EDR_P5_EXPORT_BINDING"), os.Getenv("EDR_P5_EXPORT_BINDING_SHA256"), os.Getenv("EDR_P5_EXPORT_OWNER"))
 	if e != nil {
 		t.Fatal(e)
@@ -484,4 +572,66 @@ func TestPrivateP5SyntheticContracts(t *testing.T) {
 		}
 	})
 	t.Log("synthetic_only=true actual695_inputs_consumed=false actual_preflight_received=false network_or_catalog_or_endpoint=false")
+}
+
+func TestPrivateP5CohortSelection(t *testing.T) {
+	c, e := p5Cohort("695")
+	if e != nil || c["source"] != p5Source || c["version"] != p5Version {
+		t.Fatal("legacy_profile_changed", e)
+	}
+	c697, e := p5Cohort("697")
+	if e != nil || c697["source"] != "f672059aec426aafe00b216c482dc151b96226c9" || c697["release_run"] != "39080074060" {
+		t.Fatal("bound_697_profile_mismatch", e)
+	}
+	for _, id := range []string{"696", "698", "win_3.2.697", ""} {
+		if _, e = p5Cohort(id); e == nil {
+			t.Fatal("unknown_cohort_fallback", id)
+		}
+	}
+	if _, e = p5BindingCohort(p5Binding{Source: p5Source, Version: p5Version}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = p5BindingCohort(p5Binding{CohortID: "697", Source: p5Source, Version: p5Version}); e == nil {
+		t.Fatal("cross_cohort_accepted")
+	}
+	if _, e = p5BindingCohort(p5Binding{Source: p5Source, Version: p5Version, CatalogSHA: strings.Repeat("0", 64)}); e == nil {
+		t.Fatal("catalog_hash_accepted")
+	}
+	// Only this test replaces public catalog bytes; routing is not download/recovery proof.
+	original := append([]byte(nil), p5CohortBytes...)
+	defer func() { p5CohortBytes = original }()
+	var fixture map[string]any
+	if e := json.Unmarshal(original, &fixture); e != nil {
+		t.Fatal(e)
+	}
+	fake := fixture["profiles"].(map[string]any)["697"].(map[string]any)
+	fake["release_run"] = "UNBOUND"
+	p5CohortBytes, _ = json.Marshal(fixture)
+	if _, e = p5Cohort("697"); e == nil || e.Error() != "recovery_cohort_UNBOUND" {
+		t.Fatal("unbound_697_not_refused", e)
+	}
+	for k, v := range fake {
+		if v == "UNBOUND" {
+			if strings.HasSuffix(k, "_sha256") {
+				fake[k] = strings.Repeat("7", 64)
+			} else {
+				fake[k] = "1"
+			}
+		}
+	}
+	p5CohortBytes, _ = json.Marshal(fixture)
+	bound := p5Binding{CohortID: "697", Source: fake["source"].(string), Version: fake["version"].(string), CatalogSHA: p5Hash(p5CohortBytes)}
+	if _, e = p5BindingCohort(bound); e != nil {
+		t.Fatal("synthetic_697_routing", e)
+	}
+	bound.CatalogSHA = ""
+	if _, e = p5BindingCohort(bound); e == nil {
+		t.Fatal("697_missing_catalog_hash")
+	}
+	delete(fixture["baseline"].(map[string]any), "release_id")
+	p5CohortBytes, _ = json.Marshal(fixture)
+	if _, e = p5Cohort("695"); e == nil {
+		t.Fatal("missing_baseline_field")
+	}
+
 }
