@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 SPEC=importlib.util.spec_from_file_location('prepare',Path(__file__).with_name('prepare_disposable_695.py'))
 M=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(M)
+P698_PRODUCT_PINS=('release_id','handler_receipt_sha256','binary_sha256','headless_sha256','artifact_manifest_sha256','preflight_response_sha256','p5_sha256','runtime_identity_sha256')
 class Contracts(unittest.TestCase):
     def test_closed_runtime_mode_requires_exact_strings_before_io(self):
         for mode in ('service','scheduled_task'):
@@ -84,8 +85,58 @@ class Contracts(unittest.TestCase):
             with patch.object(M,'PROFILE_FILE',catalog),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
                 M.prepare(Path(d),root,'UNBOUND','UNBOUND','1','UNBOUND','697')
             self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+    def test_698_profile_and_each_missing_product_pin_refuse_before_io(self):
+        c,base,pin=M.cohort('698',False)
+        self.assertEqual((c['source'],c['release_run'],c['native_run'],c['native_artifact_id']),
+          ('ae8c293bf892f4cec7cf083977723f7c9666f6ce','39133741161','39104973569','12128098967'))
+        self.assertEqual(c['native_artifact_sha256'],'fa18cc72103ad4b74d4f397d670a281afe3574ef36d2047927c3c4bc8e33719c')
+        self.assertEqual(c['builder_owner_sha256'],M.BUILDER_SHA)
+        self.assertEqual(M.cohort('698')[0],c)
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['698']
+        for k in P698_PRODUCT_PINS:fixture[k]='8'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('external forbidden'))as call:
+            root=Path(d)/'must-not-exist';catalog=Path(d)/'temporary-missing-pin.json'
+            for key in P698_PRODUCT_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                with patch.object(M,'PROFILE_FILE',catalog):
+                    for mode in ('service','scheduled_task'):
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.prepare(Path(d),root,'UNBOUND','UNBOUND','1','UNBOUND','698',mode)
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.finalize(Path(d),root,'698',mode)
+                fixture[key]=original
+            self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+    def test_698_every_unbound_pin_is_required_and_synthetic_routing_is_exact(self):
+        # Temporary parser-only bytes are not a published artifact or real proof.
+        value=json.loads(M.cohort_catalog_raw());c=value['profiles']['698']
+        for k in P698_PRODUCT_PINS:c[k]='8'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            catalog=Path(d)/'synthetic-parser-only.json';catalog.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',catalog):
+                self.assertEqual(M.cohort('698')[0],c)
+                for k in P698_PRODUCT_PINS:
+                    original=c[k];c[k]='UNBOUND';catalog.write_text(json.dumps(value))
+                    with self.subTest(pin=k),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):M.cohort('698')
+                    c[k]=original
+    def test_698_cli_refuses_each_missing_pin_without_descriptor_or_product_io(self):
+        import subprocess
+        owner=Path(__file__).with_name('prepare_disposable_695.py').read_bytes()
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['698']
+        for k in P698_PRODUCT_PINS:fixture[k]='8'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            # The CLI reads its own fixed sibling catalog; no caller override is added.
+            script=Path(d)/'prepare_disposable_695.py';script.write_bytes(owner)
+            catalog=script.with_name('recovery_cohorts.json')
+            for key in P698_PRODUCT_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                for selection in (['--cohort','698'],['--target-tag','win_3.2.698']):
+                    with self.subTest(pin=key,selection=selection):
+                        r=subprocess.run([sys.executable,'-I','-B',str(script),'profile',*selection],capture_output=True,timeout=3)
+                        self.assertNotEqual(r.returncode,0);self.assertEqual(r.stdout,b'')
+                        self.assertEqual(r.stderr.decode('utf-8','strict').splitlines(),['disposable_preparation_failed:recovery_cohort_UNBOUND'])
+                fixture[key]=original
     def test_unknown_cohort_never_falls_back(self):
-        for value in ('696','698','win_3.2.697','697;public','',697,None):
+        for value in ('696','699','win_3.2.697','697;public','',697,None):
             with self.subTest(value=value),self.assertRaisesRegex(ValueError,'unsupported_recovery_cohort'):M.cohort(value)
     def test_profile_cli_is_closed_and_exact_bound_cohort_has_descriptor(self):
         script=str(Path(__file__).with_name('prepare_disposable_695.py'))

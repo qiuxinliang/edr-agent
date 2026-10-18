@@ -46,11 +46,11 @@ def cohort_catalog_raw():
 
 def cohort(cohort_id='695',require_bound=True):
     # One checked-in QA data owner; no caller-selected file/source/run/URL.
-    need(cohort_id in ('695','697'),'unsupported_recovery_cohort')
+    need(cohort_id in ('695','697','698'),'unsupported_recovery_cohort')
     raw=cohort_catalog_raw()
     catalog=strict_json(raw)
     need(type(catalog)is dict and set(catalog)=={'schema','baseline','profiles'} and catalog['schema']=='edr.ci-recovery-cohorts.v1' and
-         type(catalog['profiles'])is dict and set(catalog['profiles'])=={'695','697'},'cohort_catalog_shape')
+         type(catalog['profiles'])is dict and set(catalog['profiles'])=={'695','697','698'},'cohort_catalog_shape')
     c=catalog['profiles'][cohort_id]
     keys={'id','source','version','tag','release_run','release_id','native_run','native_artifact_id','native_artifact_size',
           'native_artifact_sha256','native_uncompressed_bytes','native_member_count','handler_owner_sha256','builder_owner_sha256',
@@ -344,10 +344,10 @@ def finalize(workspace,root,cohort_id='695',mode='service'):
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697'],default='695');selection.add_argument('--target-tag');parser.add_argument('--runtime-mode',choices=['service','scheduled_task'],default='service');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697','698'],default='695');selection.add_argument('--target-tag');parser.add_argument('--runtime-mode',choices=['service','scheduled_task'],default='service');args=parser.parse_args()
     need(args.mode=='profile' or args.target_tag is None,'target_tag_descriptor_only')
     if args.target_tag is not None:
-        matches=[key for key in ('695','697')if cohort(key,False)[0]['tag']==args.target_tag]
+        matches=[key for key in ('695','697','698')if cohort(key,False)[0]['tag']==args.target_tag]
         need(len(matches)==1,'unsupported_recovery_target_tag');args.cohort=matches[0]
     profile,unused,profile_sha=cohort(args.cohort)
     if args.mode=='profile':

@@ -100,6 +100,26 @@ class Contracts(unittest.TestCase):
         path=self.root/'missing-pin.json';self.write(path,catalog)
         with patch.object(M._PROFILE_OWNER,'PROFILE_FILE',path),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):self.collect()
         self.assertFalse(self.output.exists())
+    def test_698_each_missing_pin_refuses_before_stage_read_or_output(self):
+        value=json.loads(self.binding.read_bytes());value['cohort_id']='698'
+        value['target']['source_sha']='ae8c293bf892f4cec7cf083977723f7c9666f6ce'
+        pins=('release_id','handler_receipt_sha256','binary_sha256','headless_sha256','artifact_manifest_sha256','preflight_response_sha256','p5_sha256','runtime_identity_sha256')
+        catalog=json.loads(M._PROFILE_OWNER.cohort_catalog_raw());fixture=catalog['profiles']['698']
+        for k in pins:fixture[k]='8'*64 if k.endswith('_sha256')else '1'
+        original_take=M.take
+        def binding_only(path,*args,**kwargs):
+            self.assertEqual(path,self.binding,'unbound profile must refuse before product/stage I/O')
+            return original_take(path,*args,**kwargs)
+        catalog_path=self.root/'temporary-missing-pin.json'
+        for key in pins:
+            original=fixture[key];fixture[key]='UNBOUND';self.write(catalog_path,catalog)
+            value['cohort_catalog_sha256']=M.sha(catalog_path.read_bytes())
+            for mode in ('service','scheduled_task'):
+                value['runtime_mode']=mode;self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+                with self.subTest(pin=key,mode=mode),patch.object(M._PROFILE_OWNER,'PROFILE_FILE',catalog_path),patch.object(M,'take',side_effect=binding_only),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                    self.collect()
+                self.assertFalse(self.output.exists())
+            fixture[key]=original
     def test_closed_synthetic_697_has_accurate_artifact_identity(self):
         with self.synthetic_bound_697()as(c,pin):
             self.set_697_fixture(c,pin);self.collect();result=json.loads((self.output/'manifest.json').read_bytes())

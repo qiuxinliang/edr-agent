@@ -1,10 +1,10 @@
-# Disposable exact 692 → 695 / 697 recovery cohorts
+# Disposable exact 692 → 695 / 697 / 698 recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695 and 697 selectors exist; there is no caller source/run/asset URL override.
+695, 697 and 698 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
 
@@ -15,17 +15,34 @@ run `39080074060/1`; passed native artifact is `12118710280`. Actual original
 handler proof SHA starts `5263b6bee76c`; the independently exported P5 SHA is
 `aeead1e75ba84453ec6c03f4b487dfa5381ceb29069c39be95ee79cec8997d3c`.
 The full exact pins live only in the authoritative JSON, not these short labels.
+
+Cohort 698 is bound to published product source
+`ae8c293bf892f4cec7cf083977723f7c9666f6ce`, release `416480584`, run
+`39133741161/1`, and passed ARM64 native run `39104973569/1`, artifact
+`12128098967`. The complete ZIP was verified after one explicit206 Range
+continuation of the preserved failed900-second download. The independent
+complete-file readback, original staging owner and offline PE/manifest checker
+passed; the failed download receipt remains immutable and is not relabelled.
+Actual original-handler receipt SHA starts `afbd08abbc83`; its P5 response and
+independent original-builder export match
+`cb3c5dcc2b813a6aa04830e696b4581d29cd81994ddc9a3f6cad0d764e4a79f5`.
+The full exact pins live only in the authoritative JSON. This proves actual
+local preflight/export bytes, not authenticated live API or recovery success.
+The native tool manifest remains separate from the product artifact manifest.
+Existing695/697 data and the original builder owner remain unchanged. Missing
+pins are still rejected; negative tests inject each missing pin into temporary
+catalog bytes rather than requiring this actual catalog to remain UNBOUND.
 The workflow first checks out its own QA source to read this data, then resolves
 the closed profile before product checkout. Any missing/UNBOUND pin still refuses
 before product I/O, and never selects695 as a fallback.
 
-These actual published/byte/preflight/export bindings do not imply a697 recovery
+These actual published/byte/preflight/export bindings do not imply a697 or698 recovery
 pass. Root must separately approve applying this QA data and a single disposable
 run; no live API authentication, catalog import or endpoint deployment happened
 in the in-process handler verification. The original 695 bytes and failed
 cohorts are immutable evidence. The driver, 45/30/900-second limits, service
 sampler and collector's 24-name/1MiB-per-file/8MiB-total contract are unchanged.
-The new artifact name includes its actual cohort; 697 cannot be labelled 695.
+The new artifact name includes its actual cohort; 697 and698 cannot be labelled695.
 
 This QA profile exists only for the current shutdown-stage investigation. After
 that diagnostic cohort has a fixed accepted/failed evidence record and no active
