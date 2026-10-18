@@ -542,6 +542,24 @@ Start-Sleep -Milliseconds 300
     ServiceCase 'log-final-tail-primary';$script:serviceMock='nonzero'
     Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop' $ctx} 'service_control_failed'
     Checked ($serviceActionDiagnostics[0].worker.exit_code -eq 7 -and $null -ne $serviceActionDiagnostics[0].primary_failure -and $serviceActionDiagnostics[0].shutdown_log_observation.final_tail.sealed -and -not $serviceActionDiagnostics[0].shutdown_log_observation.action_result_can_change) 'log_completed_final_tail_does_not_change_primary_action_failure'
+    # Actual public log files: only the fixed numeric join frontier is projected.
+    $joinLine='[preprocess] worker join diagnostic wait_rc=258 error=0 phase_before=0 phase_after=2 loops_before=17 loops_after=18 slots_before=3 slots_after=3 stop=1 exited=0'
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinLine+"`n");ReadStopLogSlice $ctx 1
+    $numeric=$ctx.diagnostic.matches[0]
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $numeric.kind -ceq 'preprocess_worker_join' -and $numeric.wait_rc -eq 258 -and $numeric.error -eq 0 -and $numeric.phase[0] -eq 0 -and $numeric.phase[1] -eq 2 -and $numeric.loops[0] -eq 17 -and $numeric.loops[1] -eq 18 -and $numeric.slots[0] -eq 3 -and $numeric.slots[1] -eq 3 -and $numeric.stop -eq 1 -and $numeric.exited -eq 0) 'join_numeric_public_file_projection';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext
+    PublicAppend ($joinLine.Replace('wait_rc=258 error=0','wait_rc=4294967295 error=5').Replace('phase_after=2','phase_after=12').Replace('slots_after=3','slots_after=18446744073709551615')+"`n");ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].wait_rc -eq [uint32]::MaxValue -and $ctx.diagnostic.matches[0].error -eq 5 -and $ctx.diagnostic.matches[0].slots[1] -eq [uint64]::MaxValue) 'join_wait_failed_actual_error_and_uint64_max';CloseStopLogContext $ctx
+    foreach($bad in @($joinLine.Replace('wait_rc=258','wait_rc=0'),$joinLine.Replace('error=0','error=5'),$joinLine.Replace('phase_after=2','phase_after=13'),$joinLine.Replace('slots_after=3','slots_after=18446744073709551616'))){
+      ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($bad+"`n");Fails {ReadStopLogSlice $ctx 3} 'stop_log_numeric_shape';CloseStopLogContext $ctx
+    }
+    ResetPublicLog;$ctx=PublicLogContext
+    PublicAppend ('unexported-test-message '+$joinLine+"`n"+$joinLine+' command-body-path'+"`n");ReadStopLogSlice $ctx 4
+    Checked ($ctx.diagnostic.matches.Count -eq 0 -and ($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'unexported-test-message|command-body-path') 'join_near_match_exports_no_raw_text';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend $joinLine;ReadStopLogSlice $ctx 5
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_partial_numeric_line_not_projected'
+    PublicAppend "`n";ReadStopLogSlice $ctx 6
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join') 'join_partial_numeric_line_completed_once';CloseStopLogContext $ctx
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'

@@ -473,6 +473,12 @@ function ReadStopLogSlice($Context,[long]$ElapsedMs) {
       $match=@{kind='scm_stage_publication_failed';stage=[int]$Matches[1];error=[uint32]$Matches[2]}
     }elseif($line -cmatch '^\[shutdown\] SCM status publication failed error=([0-9]{1,10})$'){
       Need ([uint64]$Matches[1] -le [uint32]::MaxValue) 'stop_log_numeric_shape';$match=@{kind='scm_status_publication_failed';stage=$null;error=[uint32]$Matches[1]}
+    }elseif($line -cmatch '^\[preprocess\] worker join diagnostic wait_rc=([0-9]{1,10}) error=([0-9]{1,10}) phase_before=([0-9]{1,2}) phase_after=([0-9]{1,2}) loops_before=([0-9]{1,20}) loops_after=([0-9]{1,20}) slots_before=([0-9]{1,20}) slots_after=([0-9]{1,20}) stop=([01]) exited=([01])$'){
+      $fields=@();for($field=1;$field -le 10;$field++){$fields+=,[string]$Matches[$field]}
+      Need ([uint64]$fields[0] -in @([uint64]258,[uint64]4294967295) -and [uint64]$fields[1] -le [uint32]::MaxValue -and ([uint64]$fields[0] -eq 4294967295 -or [uint64]$fields[1] -eq 0) -and [int]$fields[2] -le 12 -and [int]$fields[3] -le 12) 'stop_log_numeric_shape'
+      $counts=@();for($field=4;$field -le 7;$field++){$value=[uint64]0;Need ([uint64]::TryParse($fields[$field],[ref]$value)) 'stop_log_numeric_shape';$counts+=,$value}
+      # Independent loads only; this numeric frontier is not an atomic stack.
+      $match=@{kind='preprocess_worker_join';wait_rc=[uint32]$fields[0];error=[uint32]$fields[1];phase=@([int]$fields[2],[int]$fields[3]);loops=@($counts[0],$counts[1]);slots=@($counts[2],$counts[3]);stop=[int]$fields[8];exited=[int]$fields[9]}
     }elseif($line -ceq '[preprocess] shutdown timed out; retaining worker dependencies'){$match=@{kind='preprocess_thread_join_timeout'}}
     elseif($line -ceq '[preprocess] shutdown timed out: AVE still owns the batch sink'){$match=@{kind='preprocess_AVE_drain_timeout'}}
     elseif($line -ceq '[preprocess] shutdown failed: pending batch has no durable owner'){$match=@{kind='preprocess_batch_handoff_failed'}}

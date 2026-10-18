@@ -64,6 +64,27 @@ static atomic_int s_stop_preprocess;
 static atomic_int s_preprocess_exited = 1;
 static int s_preprocess_joined;
 
+/* Diagnostic owner only: independent relaxed loads describe a coarse frontier,
+ * never an atomic stack snapshot or a successful shutdown. No per-event clock. */
+typedef enum {
+  PREPROCESS_PHASE_NOT_STARTED = 0,
+  PREPROCESS_PHASE_PENDING_EVIDENCE = 1,
+  PREPROCESS_PHASE_PMFE_RECOVERY = 2,
+  PREPROCESS_PHASE_SLOT = 3,
+  PREPROCESS_PHASE_PENDING_CREATE = 4,
+  PREPROCESS_PHASE_P0_RETRY = 5,
+  PREPROCESS_PHASE_BATCH = 6,
+  PREPROCESS_PHASE_CACHE = 7,
+  PREPROCESS_PHASE_CORRELATION = 8,
+  PREPROCESS_PHASE_SUMMARY = 9,
+  PREPROCESS_PHASE_EVENT_WAIT = 10,
+  PREPROCESS_PHASE_STOP_DRAIN = 11,
+  PREPROCESS_PHASE_WORKER_EXIT = 12
+} PreprocessWorkerPhase;
+static atomic_uint s_worker_phase;
+static atomic_uint_fast64_t s_worker_completed_loops;
+static atomic_uint_fast64_t s_worker_completed_slots;
+
 static EdrEventBus *s_bus;
 static unsigned s_telemetry_sampling_pct = 100u;
 static uint64_t s_sampling_dropped;
@@ -1810,55 +1831,88 @@ static void *preprocess_main(void *arg) {
   (void)arg;
   for (;;) {
     edr_health_beat(EDR_HEALTH_PREPROCESS);
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_EVIDENCE, memory_order_relaxed);
     poll_pending_process_evidence();
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PMFE_RECOVERY, memory_order_relaxed);
     poll_pmfe_followup_recovery();
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_SLOT, memory_order_relaxed);
       process_one_slot(&slot);
+      atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_CREATE, memory_order_relaxed);
       process_pending_process_creates();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
       poll_p0_source_only_durable_retry();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_BATCH, memory_order_relaxed);
       edr_event_batch_poll_timeout();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
       edr_local_evidence_cache_poll_maintenance();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CORRELATION, memory_order_relaxed);
       edr_correlation_poll_maintenance(0); /* 内部节流；同预处理线程，满足契约 */
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_SUMMARY, memory_order_relaxed);
       poll_summary_flush();
+      atomic_fetch_add_explicit(&s_worker_completed_loops, 1u, memory_order_relaxed);
       continue;
     }
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_BATCH, memory_order_relaxed);
     edr_event_batch_poll_timeout();
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_CREATE, memory_order_relaxed);
     process_pending_process_creates();
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
     poll_p0_source_only_durable_retry();
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
     edr_local_evidence_cache_poll_maintenance();
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CORRELATION, memory_order_relaxed);
     edr_correlation_poll_maintenance(0); /* 空闲期兜底排空注入 + 定期清扫 */
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_SUMMARY, memory_order_relaxed);
     poll_summary_flush();
+    atomic_fetch_add_explicit(&s_worker_completed_loops, 1u, memory_order_relaxed);
 #ifdef _WIN32
     if (s_stop_preprocess) {
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_STOP_DRAIN, memory_order_relaxed);
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
+        atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
       }
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
       poll_p0_source_only_durable_retry();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_EVENT_WAIT, memory_order_relaxed);
     (void)edr_event_bus_wait(s_bus, 25u);
 #else
     if (s_stop_preprocess) {
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_STOP_DRAIN, memory_order_relaxed);
       while (edr_event_bus_try_pop(s_bus, &slot)) {
         process_one_slot(&slot);
+        atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
       }
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
       poll_p0_source_only_durable_retry();
+      atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
       edr_local_evidence_cache_poll_maintenance();
       break;
     }
+    atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_EVENT_WAIT, memory_order_relaxed);
     (void)edr_event_bus_wait(s_bus, 10u);
 #endif
   }
   /* Stop may have arrived after this iteration's first completion poll. */
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_STOP_DRAIN, memory_order_relaxed);
   drain_stopping_process_creates();
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_EVIDENCE, memory_order_relaxed);
   poll_pending_process_evidence();
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
   poll_p0_source_only_durable_retry();
 #ifdef _WIN32
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_WORKER_EXIT, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 1);
   return 0;
 #else
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_WORKER_EXIT, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 1);
   return NULL;
 #endif
@@ -1904,6 +1958,9 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   sync_agent_ids_from_cfg(cfg);
   s_bus = bus;
   s_preprocess_joined = 0;
+  atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_NOT_STARTED, memory_order_relaxed);
+  atomic_store_explicit(&s_worker_completed_loops, 0u, memory_order_relaxed);
+  atomic_store_explicit(&s_worker_completed_slots, 0u, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 0);
 #ifdef _WIN32
   s_stop_preprocess = 0;
@@ -1950,12 +2007,28 @@ int edr_preprocess_stop(void) {
   if (!s_preprocess_active) {
     return 1;
   }
+#ifdef _WIN32
+  const unsigned phase_before = atomic_load_explicit(&s_worker_phase, memory_order_relaxed);
+  const uint64_t loops_before = atomic_load_explicit(&s_worker_completed_loops, memory_order_relaxed);
+  const uint64_t slots_before = atomic_load_explicit(&s_worker_completed_slots, memory_order_relaxed);
+#endif
   atomic_store(&s_stop_preprocess, 1);
   edr_event_bus_wake(s_bus);
   if (!s_preprocess_joined) {
 #ifdef _WIN32
-    if (WaitForSingleObject(s_thread, 60000) != WAIT_OBJECT_0) {
+    const DWORD wait_result = WaitForSingleObject(s_thread, 60000);
+    if (wait_result != WAIT_OBJECT_0) {
+      const DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : 0u;
       fprintf(stderr, "[preprocess] shutdown timed out; retaining worker dependencies\n");
+      /* Independent atomic reads, not an atomic all-stack snapshot. */
+      fprintf(stderr, "[preprocess] worker join diagnostic wait_rc=%lu error=%lu phase_before=%u phase_after=%u loops_before=%llu loops_after=%llu slots_before=%llu slots_after=%llu stop=%u exited=%u\n",
+              (unsigned long)wait_result, (unsigned long)wait_error,
+              phase_before, atomic_load_explicit(&s_worker_phase, memory_order_relaxed),
+              (unsigned long long)loops_before,
+              (unsigned long long)atomic_load_explicit(&s_worker_completed_loops, memory_order_relaxed),
+              (unsigned long long)slots_before,
+              (unsigned long long)atomic_load_explicit(&s_worker_completed_slots, memory_order_relaxed),
+              (unsigned)atomic_load(&s_stop_preprocess), (unsigned)atomic_load(&s_preprocess_exited));
       return 0;
     }
     CloseHandle(s_thread);
