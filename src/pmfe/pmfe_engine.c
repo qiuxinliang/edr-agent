@@ -3172,10 +3172,6 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
     return 1;
   }
 #ifdef _WIN32
-  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown && s_run_epoch == run_epoch &&
-         s_admission_enabled && !src->followup.association_id[0]) {
-    SleepConditionVariableCS(&s_q_nonfull, &s_q_mu, 2000);
-  }
   if (s_shutdown || !s_admission_enabled || !edr_pmfe_is_running() ||
       s_run_epoch != run_epoch || s_task_count >= PMFE_TASK_CAP) {
     LeaveCriticalSection(&s_q_mu);
@@ -3189,13 +3185,6 @@ static int pmfe_enqueue_task(const EdrPmfeTask *src) {
   WakeAllConditionVariable(&s_q_nonempty);
   LeaveCriticalSection(&s_q_mu);
 #else
-  while (s_task_count >= PMFE_TASK_CAP && !s_shutdown && s_run_epoch == run_epoch &&
-         s_admission_enabled && !src->followup.association_id[0]) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 2;
-    (void)pthread_cond_timedwait(&s_q_nonfull, &s_q_mu, &ts);
-  }
   if (s_shutdown || !s_admission_enabled || !edr_pmfe_is_running() ||
       s_run_epoch != run_epoch || s_task_count >= PMFE_TASK_CAP) {
     pthread_mutex_unlock(&s_q_mu);
