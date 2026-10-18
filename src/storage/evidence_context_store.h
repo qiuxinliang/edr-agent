@@ -27,6 +27,11 @@ int edr_context_store_begin_upgrade(EdrContextStore *store);
 /* Installed by the cache owner after its additive retention metadata exists.
  * Durable SQL guards keep older maintenance from independently breaking groups. */
 int edr_context_store_install_retention_guards(EdrContextStore *store);
+/* Current schema owners avoid rebuilding an identical named trigger/view. Missing
+ * or changed definitions are replaced inside a nested-safe private savepoint. */
+int edr_context_store_ensure_schema_object(EdrContextStore *store, const char *kind,
+                                      const char *name,
+                                      const char *create_sql);
 /* Caller owns a stopped Agent/exclusive connection. Each batch commits all
  * moves atomically, and never deletes a fact or a candidate for capacity. */
 int edr_context_store_migrate_batch(EdrContextStore *store, unsigned limit,

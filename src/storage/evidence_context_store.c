@@ -76,9 +76,49 @@ static const char compact_schema[] =
     "CREATE INDEX idx_compact_context_fact ON compact_context_refs(fact_key);"
     "CREATE INDEX idx_compact_context_time ON compact_context_refs(created_ns,candidate_key);";
 
+/* SQLite retains CREATE text without its final semicolon. Exact byte matching
+ * is intentional: a same-name old or damaged guard is never accepted merely
+ * because it exists. The caller supplies only its authoritative SQL constant.
+ * SAVEPOINT also makes a standalone replacement atomic on CREATE failure. */
+int edr_context_store_ensure_schema_object(EdrContextStore *s, const char *kind,
+                                      const char *name,
+                                      const char *create_sql) {
+  sqlite3_stmt *st = NULL; char *drop = NULL; int result = -1, matches = 0;
+  if (!s || !s->db || !name || !create_sql || !kind ||
+      (strcmp(kind,"trigger") && strcmp(kind,"view"))) return -1;
+  if (sql(s, "SAVEPOINT startup_schema_object;") != 0) return -1;
+  if (prepare(s, &st, "SELECT sql FROM main.sqlite_schema WHERE type=?1 AND name=?2;") != 0 ||
+      sqlite3_bind_text(st, 1, kind, -1, SQLITE_STATIC) != SQLITE_OK ||
+      sqlite3_bind_text(st, 2, name, -1, SQLITE_STATIC) != SQLITE_OK) goto done;
+  int step = sqlite3_step(st);
+  if (step == SQLITE_ROW) {
+    size_t expected = strlen(create_sql);
+    if (expected && create_sql[expected - 1u] == ';') --expected;
+    const char *stored = (const char *)sqlite3_column_text(st, 0);
+    int bytes = sqlite3_column_bytes(st, 0);
+    matches = sqlite3_column_type(st, 0) == SQLITE_TEXT && stored && bytes >= 0 &&
+        (size_t)bytes == expected && !memcmp(stored, create_sql, expected);
+    if (sqlite3_step(st) != SQLITE_DONE) { fail(s, "read schema definition failed"); goto done; }
+  } else if (step != SQLITE_DONE) { fail(s, "read schema definition failed"); goto done; }
+  sqlite3_finalize(st); st = NULL;
+  if (!matches) {
+    drop = sqlite3_mprintf("DROP %s IF EXISTS \"%w\";", kind, name);
+    if (!drop) { snprintf(s->error,sizeof(s->error),"allocate schema replacement failed"); goto done; }
+    if (sql(s, drop) != 0 || sql(s, create_sql) != 0) goto done;
+  }
+  if (sql(s, "RELEASE startup_schema_object;") != 0) goto done;
+  result = 0;
+done:
+  sqlite3_finalize(st); sqlite3_free(drop);
+  if (result) {
+    /* A quota/FULL error may have rolled back the whole SQLite transaction.
+     * Never replace the original failure with a missing-savepoint diagnostic. */
+    (void)sqlite3_exec(s->db,"ROLLBACK TO startup_schema_object;RELEASE startup_schema_object;",NULL,NULL,NULL);
+  }
+  return result;
+}
+
 static int views(EdrContextStore *s) {
-  if (sql(s, "DROP VIEW IF EXISTS materialized_artifacts;"
-             "DROP VIEW IF EXISTS context_reference_projection;") != 0) return -1;
   const char *projection = s->format ?
       "CREATE VIEW context_reference_projection AS "
       "SELECT artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key "
@@ -89,8 +129,8 @@ static int views(EdrContextStore *s) {
       "JOIN context_candidates c ON c.id=r.candidate_key JOIN context_fact_keys f ON f.id=r.fact_key;"
       : "CREATE VIEW context_reference_projection AS SELECT artifact_id,candidate_id,fact_id,"
         "candidate_id_json,created_ns,upload_status,minio_key FROM candidate_context_refs;";
-  if (sql(s, projection) != 0) return -1;
-  return sql(s,
+  if (edr_context_store_ensure_schema_object(s,"view","context_reference_projection",projection) != 0) return -1;
+  return edr_context_store_ensure_schema_object(s,"view","materialized_artifacts",
       "CREATE VIEW materialized_artifacts AS "
       "SELECT artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,"
       "manifest_json,created_ns,upload_status,minio_key FROM artifacts a "
@@ -145,12 +185,11 @@ int edr_context_store_install_retention_guards(EdrContextStore *s) {
       "BEGIN SELECT RAISE(ABORT,'retained candidate artifact dependency'); END;"
       "CREATE TRIGGER IF NOT EXISTS context_fact_retention_delete BEFORE DELETE ON context_facts "
       "WHEN EXISTS(SELECT 1 FROM context_reference_projection WHERE fact_id=OLD.fact_id) "
-      "BEGIN SELECT RAISE(ABORT,'referenced context fact'); END;"
-      "DROP TRIGGER IF EXISTS context_legacy_ref_retention_delete;") != 0) return -1;
+      "BEGIN SELECT RAISE(ABORT,'referenced context fact'); END;") != 0) return -1;
   /* A migration first writes the exact replacement in the compact layout.
    * The old row then has two identical projected identities in one transaction.
    * No migration or old maintenance can remove the final retained reference. */
-  if (sql(s,s->format ?
+  if (edr_context_store_ensure_schema_object(s,"trigger","context_legacy_ref_retention_delete",s->format ?
       "CREATE TRIGGER context_legacy_ref_retention_delete BEFORE DELETE ON candidate_context_refs "
       "WHEN EXISTS(SELECT 1 FROM p0_candidates WHERE candidate_id=OLD.candidate_id AND local_retention_state!='retirement_eligible') "
       "AND NOT EXISTS(SELECT 1 FROM compact_context_refs r JOIN context_candidates c ON c.id=r.candidate_key JOIN context_fact_keys f ON f.id=r.fact_key "

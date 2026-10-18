@@ -11872,6 +11872,256 @@ static void test_capacity_health_snapshot_preserves_readable_owners(void) {
   cleanup_test_sqlite_path(path); free(record); free(incoming);
 }
 
+
+/* The same public legacy rows as the Windows near-size fixture, at a smaller
+ * logical page budget. No real endpoint data or upload consumer is used. */
+static const char startup_public_legacy_sql[] = "CREATE TABLE process_cache (endpoint_id TEXT NOT NULL,tenant_id TEXT,pid INTEGER NOT NULL,ppid INTEGER,name TEXT,path TEXT,cmdline TEXT,parent_name TEXT,parent_path TEXT,first_seen_ns INTEGER,last_seen_ns INTEGER,PRIMARY KEY(endpoint_id,pid));CREATE TABLE p0_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_id TEXT UNIQUE,endpoint_id TEXT,tenant_id TEXT,event_time_ns INTEGER,type INTEGER,pid INTEGER,ppid INTEGER,process_name TEXT,exe_path TEXT,cmdline TEXT,file_path TEXT,dns_query TEXT,net_dst TEXT,net_dport INTEGER,reg_key_path TEXT,reg_value_name TEXT,reg_op TEXT,detection_context TEXT,context_pre_count INTEGER,context_post_until_ns INTEGER,created_ns INTEGER);CREATE TABLE artifacts (artifact_id TEXT PRIMARY KEY,endpoint_id TEXT,tenant_id TEXT,candidate_id TEXT,artifact_type TEXT,path TEXT,sha256 TEXT,manifest_json TEXT,created_ns INTEGER,upload_status TEXT,minio_key TEXT);INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,manifest_json,created_ns,upload_status,minio_key) VALUES('legacy-a:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ep-legacy-context','tenant','legacy-a','post_context','','','{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-a\",\"event_time_ns\":9007199254740993,\"source_event_id\":\"legacy-source\",\"source_completeness\":\"COMPLETE\"}',9000000000000000100,'local_manifest','');INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,manifest_json,created_ns,upload_status,minio_key) VALUES('legacy-b:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ep-legacy-context','tenant','legacy-b','post_context','','','{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-b\",\"source_event_id\":\"legacy-source\",\"source_completeness\":\"CORRELATION_MISSING\"}',9000000000000000101,'local_manifest','');INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,manifest_json,created_ns,upload_status,minio_key) VALUES('legacy-c:post_context:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','ep-legacy-context','tenant','legacy-c','post_context','','','{\"schema\":\"p0_post_context_event.v1\",\"candidate_id\":\"legacy-c\",\"event_time_ns\":9007199254740993,\"source_event_id\":\"legacy-source\",\"source_completeness\":\"COMPLETE\"}',9000000000000000102,'local_manifest','');INSERT INTO process_cache VALUES('ep-legacy-context','tenant',74501,74500,'synthetic-child.exe','C:/synthetic/child.exe','synthetic-child.exe --public','synthetic-parent.exe','C:/synthetic/parent.exe',9000000000000000100,9000000000000000100);INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,type,pid,ppid,process_name,exe_path,cmdline,context_post_until_ns,created_ns) VALUES('legacy-a','ep-legacy-context','tenant',9000000000000000100,1,74501,74500,'synthetic-child.exe','C:/synthetic/child.exe','synthetic-child.exe --public',9000000000000000100,9000000000000000100),('legacy-b','ep-legacy-context','tenant',9000000000000000100,1,74501,74500,'synthetic-child.exe','C:/synthetic/child.exe','synthetic-child.exe --public',9000000000000000100,9000000000000000100),('legacy-c','ep-legacy-context','tenant',9000000000000000100,1,74501,74500,'synthetic-child.exe','C:/synthetic/child.exe','synthetic-child.exe --public',9000000000000000100,9000000000000000100);UPDATE artifacts SET created_ns=9000000000000000100;";
+
+static void startup_preserve_legacy(sqlite3 *db, int snapshot) {
+  static const char process_cols[]="endpoint_id,tenant_id,pid,ppid,name,path,cmdline,parent_name,parent_path,first_seen_ns,last_seen_ns";
+  static const char candidate_cols[]="id,candidate_id,endpoint_id,tenant_id,event_time_ns,type,pid,ppid,process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,reg_key_path,reg_value_name,reg_op,detection_context,context_pre_count,context_post_until_ns,created_ns";
+  char sql[4096];
+  if(snapshot) {
+    snprintf(sql,sizeof(sql),"CREATE TEMP TABLE startup_expected_process AS SELECT %s FROM process_cache;CREATE TEMP TABLE startup_expected_candidate AS SELECT %s FROM p0_candidates;CREATE TEMP TABLE startup_expected_artifact AS SELECT * FROM artifacts;",process_cols,candidate_cols);
+    compact_exec(db,sql); return;
+  }
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT * FROM startup_expected_process EXCEPT SELECT %s FROM process_cache)",process_cols);
+  assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM process_cache")==1);
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT * FROM startup_expected_candidate EXCEPT SELECT %s FROM p0_candidates)",candidate_cols);
+  assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates")==3);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM startup_expected_artifact EXCEPT SELECT artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,manifest_json,created_ns,upload_status,minio_key FROM artifacts)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='post_context'")==3);
+}
+
+static void startup_fill_pages(sqlite3 *db, sqlite3_int64 target) {
+  sqlite3_int64 size=compact_scalar(db,"PRAGMA page_size");
+  compact_exec(db,"CREATE TABLE startup_padding(payload BLOB);");
+  sqlite3_int64 pages=compact_scalar(db,"PRAGMA page_count"); assert(target>pages+8);
+  if(target>4096) {
+    /* Reuse the public Windows fixture's pointer-map-aware padding strategy.
+     * An exact engine cap prevents the padding itself from overshooting. */
+    sqlite3_int64 prior=compact_scalar(db,"PRAGMA max_page_count"),remain=target-pages;
+    char cap[128];snprintf(cap,sizeof(cap),"PRAGMA max_page_count=%lld;",(long long)target);compact_exec(db,cap);
+    sqlite3_stmt *bulk=NULL;assert(remain>128 && size==4096);
+    assert(sqlite3_prepare_v2(db,"INSERT INTO startup_padding VALUES(zeroblob(?))",-1,&bulk,NULL)==SQLITE_OK);
+    assert(sqlite3_bind_int64(bulk,1,(remain-remain/800-32)*4092)==SQLITE_OK);
+    assert(sqlite3_step(bulk)==SQLITE_DONE);sqlite3_finalize(bulk);
+    for(unsigned turn=0;compact_scalar(db,"PRAGMA page_count")<target && turn<256;turn++) {
+      sqlite3_int64 before=compact_scalar(db,"PRAGMA page_count");int advanced=0;
+      const int amounts[]={-1,512,2048,4092,8192};
+      for(unsigned i=0;i<5;i++) {
+        char statement[160];compact_exec(db,"BEGIN IMMEDIATE;");
+        if(amounts[i]<0)snprintf(statement,sizeof(statement),"CREATE TABLE startup_padding_large_%u(x);",turn);
+        else snprintf(statement,sizeof(statement),"INSERT INTO startup_padding VALUES(zeroblob(%d));",amounts[i]);
+        int rc=sqlite3_exec(db,statement,NULL,NULL,NULL);
+        if(rc==SQLITE_OK) {
+          sqlite3_int64 after=compact_scalar(db,"PRAGMA page_count");
+          if(before<after && after<=target){compact_exec(db,"COMMIT;");advanced=1;break;}
+        } else assert(rc==SQLITE_FULL);
+        if(!sqlite3_get_autocommit(db))compact_exec(db,"ROLLBACK;");
+      }
+      assert(advanced);
+    }
+    assert(compact_scalar(db,"PRAGMA page_count")==target && compact_scalar(db,"PRAGMA freelist_count")==0);
+    snprintf(cap,sizeof(cap),"PRAGMA max_page_count=%lld;",(long long)prior);compact_exec(db,cap);
+    return;
+  }
+  sqlite3_stmt *st=NULL;
+  assert(sqlite3_prepare_v2(db,"INSERT INTO startup_padding VALUES(zeroblob(?))",-1,&st,NULL)==SQLITE_OK);
+  assert(sqlite3_bind_int64(st,1,(target-pages-8)*size)==SQLITE_OK);
+  assert(sqlite3_step(st)==SQLITE_DONE); sqlite3_finalize(st);
+  for(unsigned i=0;compact_scalar(db,"PRAGMA page_count")<target && i<32u;i++) {
+    char sql[128];snprintf(sql,sizeof(sql),"CREATE TABLE startup_padding_page_%u(x);",i);compact_exec(db,sql);
+  }
+  compact_exec(db,"PRAGMA wal_checkpoint(TRUNCATE);");
+  assert(compact_scalar(db,"PRAGMA page_count")==target && compact_scalar(db,"PRAGMA freelist_count")==0);
+}
+
+static void test_startup_logical_budget_legacy(int vacuum_mode, int already_over, uint32_t budget_mb) {
+  char path[512];sqlite3 *db=NULL;EdrEvidenceCacheStatus status;
+  assert(make_test_sqlite_path(path,sizeof(path))==0 && sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,vacuum_mode?"PRAGMA auto_vacuum=INCREMENTAL;":"PRAGMA auto_vacuum=NONE;");
+  compact_exec(db,startup_public_legacy_sql);startup_preserve_legacy(db,1);
+  sqlite3_int64 budget_pages=(sqlite3_int64)budget_mb*256;
+  sqlite3_int64 target=already_over?budget_pages+2:(vacuum_mode?budget_pages-47:budget_pages);
+  startup_fill_pages(db,target);
+  sqlite3_int64 initial=compact_scalar(db,"PRAGMA page_count");
+  fprintf(stderr,"startup_limit_fixture public_only=1 path=%s bytes=%lld\n",path,(long long)(initial*4096));fflush(stderr);
+  int rc=edr_local_evidence_cache_open_with_policy(path,budget_mb,72u,72u);
+  edr_local_evidence_cache_get_status(&status);
+  sqlite3_int64 after=compact_scalar(db,"PRAGMA page_count");
+  fprintf(stderr,"startup_limit_legacy mode=%d already_over=%d before_pages=%lld after_pages=%lld open_rc=%d db_open=%u error=%s\n",vacuum_mode,already_over,(long long)initial,(long long)after,rc,status.db_open,status.last_error);fflush(stderr);
+  assert(rc<0 && !status.db_open && strstr(status.last_error,"startup schema unavailable"));
+  assert(after<=(already_over?initial:budget_pages));startup_preserve_legacy(db,0);
+  /* A failure is explicit and restart-safe, not a claim that the old schema
+   * was queryable through this runtime or that all DDL rolled back. */
+  assert(edr_local_evidence_cache_open_with_policy(path,budget_mb+1u,72u,72u)==0);
+  edr_local_evidence_cache_get_status(&status);assert(status.db_open && status.retention_clock_valid);
+  startup_preserve_legacy(db,0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM startup_expected_artifact EXCEPT SELECT * FROM materialized_artifacts)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE retention_policy_version=0 AND alert_context_protect_until_active_ms=0")==3);
+  edr_local_evidence_cache_close();
+  /* Fully compatible schemas must remain openable even when an old database
+   * already exceeds the new budget. No startup growth, shrink or deletion. */
+  sqlite3_int64 recovered=compact_scalar(db,"PRAGMA page_count");
+  int reopened=edr_local_evidence_cache_open_with_policy(path,budget_mb,72u,72u);
+  edr_local_evidence_cache_get_status(&status);
+  fprintf(stderr,"startup_compatible_reopen path=%s recovered_pages=%lld after_pages=%lld rc=%d cause=%s\n",path,(long long)recovered,(long long)compact_scalar(db,"PRAGMA page_count"),reopened,status.last_error);fflush(stderr);
+  assert(reopened==0);
+  assert(compact_scalar(db,"PRAGMA page_count")<=recovered);
+  startup_preserve_legacy(db,0);edr_local_evidence_cache_close();
+  assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+}
+
+static void test_startup_logical_budget_compatible_parent(void) {
+  const int64_t now=INT64_C(1700000000000000000);
+  char path[512],before[65],after[65];sqlite3 *db=NULL;
+  EdrBehaviorRecord *record=calloc(1,sizeof(*record));assert(record);
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,72u)==0);
+  init_floor_parent(record,now);EdrCommandFacts facts={record->cmdline,record->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(record,&facts)==0);
+  edr_local_evidence_cache_close();assert(sqlite3_open(path,&db)==SQLITE_OK);
+  parent_fixture_owner_hash(db,record->pid,before);startup_fill_pages(db,258);
+  sqlite3_int64 schema_before=compact_scalar(db,"PRAGMA schema_version");
+  for(unsigned i=0;i<2;i++) {
+    assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,72u)==0);
+    assert(compact_scalar(db,"PRAGMA schema_version")==schema_before);
+    EdrEvidenceCacheStatus status;edr_local_evidence_cache_get_status(&status);
+    assert(status.db_open && status.pressure_active && status.retention_clock_valid);
+    assert(compact_scalar(db,"PRAGMA page_count")==258);
+    parent_fixture_owner_hash(db,record->pid,after);assert(!strcmp(before,after));
+    EdrParentContextQuery query=floor_query(record,now);parent_pressure_query(&query,"startup_compatible_over",1);
+    edr_local_evidence_cache_close();
+  }
+  assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);free(record);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
+
+static char *startup_schema_definition(sqlite3 *db,const char *name) {
+  sqlite3_stmt *st=NULL;char *copy=NULL;
+  assert(sqlite3_prepare_v2(db,"SELECT sql FROM sqlite_schema WHERE name=?",-1,&st,NULL)==SQLITE_OK);
+  assert(sqlite3_bind_text(st,1,name,-1,SQLITE_STATIC)==SQLITE_OK);
+  assert(sqlite3_step(st)==SQLITE_ROW && sqlite3_column_type(st,0)==SQLITE_TEXT);
+  copy=sqlite3_mprintf("%s",sqlite3_column_text(st,0));assert(copy && sqlite3_step(st)==SQLITE_DONE);
+  sqlite3_finalize(st);return copy;
+}
+static int startup_deny_create(void *context,int action,const char *one,const char *two,const char *db,const char *source) {
+  (void)context;(void)two;(void)db;(void)source;
+  return action==SQLITE_CREATE_TRIGGER && one && !strcmp(one,"context_legacy_ref_retention_delete")?SQLITE_DENY:SQLITE_OK;
+}
+static void startup_fill_schema_until_full(sqlite3 *db) {
+  unsigned serial=0,full=0;char payload[1025];memset(payload,'x',sizeof(payload)-1);payload[1024]=0;
+  for(unsigned width=1024;width>=16;width/=4) {
+    for(unsigned i=0;i<256;i++) {
+      char statement[1280];snprintf(statement,sizeof(statement),"CREATE VIEW startup_full_%u AS SELECT '%.*s';",serial++,(int)width,payload);
+      int rc=sqlite3_exec(db,statement,NULL,NULL,NULL);
+      if(rc==SQLITE_FULL){full++;break;}
+      assert(rc==SQLITE_OK);
+      assert(i<255); /* The finite fixture must reach a real engine ceiling. */
+    }
+  }
+  assert(full==4 && sqlite3_get_autocommit(db));
+}
+
+static void test_startup_schema_definition_and_rollback(void) {
+  char path[512],before_hash[65],after_hash[65];sqlite3 *db=NULL;
+  const int64_t now=INT64_C(1700000000000000000);
+  EdrBehaviorRecord *record=calloc(1,sizeof(*record));assert(record);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(make_test_sqlite_path(path,sizeof(path))==0 && edr_local_evidence_cache_open(path,2u,72u)==0);
+  init_floor_parent(record,now);EdrCommandFacts facts={record->cmdline,record->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(record,&facts)==0);edr_local_evidence_cache_close();
+  assert(sqlite3_open(path,&db)==SQLITE_OK);parent_fixture_owner_hash(db,record->pid,before_hash);
+  const char *names[]={"candidate_retention_v1_insert","candidate_retention_v1_update","context_legacy_ref_retention_delete","context_reference_projection","materialized_artifacts"};
+  char *expected[5];for(unsigned i=0;i<5;i++)expected[i]=startup_schema_definition(db,names[i]);
+  for(unsigned i=0;i<5;i++) {
+    char *drop=sqlite3_mprintf("DROP %s \"%w\";",i<3?"TRIGGER":"VIEW",names[i]);assert(drop);compact_exec(db,drop);sqlite3_free(drop);
+    assert(edr_local_evidence_cache_open(path,2u,72u)==0);edr_local_evidence_cache_close();
+    char *restored=startup_schema_definition(db,names[i]);assert(!strcmp(expected[i],restored));sqlite3_free(restored);
+  }
+  /* Same-name old/tampered definitions are replaced, not accepted by presence.
+   * Authorizer denial is a real SQLITE_AUTH path, not a successful mock write. */
+  compact_exec(db,"DROP TRIGGER context_legacy_ref_retention_delete;CREATE TRIGGER context_legacy_ref_retention_delete BEFORE DELETE ON candidate_context_refs BEGIN SELECT 1;END;");
+  char *old=startup_schema_definition(db,names[2]);EdrContextStore store;
+  assert(edr_context_store_check_format(&store,db)==0 && sqlite3_set_authorizer(db,startup_deny_create,NULL)==SQLITE_OK);
+  assert(edr_context_store_install_retention_guards(&store)<0);
+  assert(sqlite3_get_autocommit(db));char *unchanged=startup_schema_definition(db,names[2]);assert(!strcmp(old,unchanged));sqlite3_free(unchanged);
+  parent_fixture_owner_hash(db,record->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  assert(sqlite3_set_authorizer(db,NULL,NULL)==SQLITE_OK);
+  compact_exec(db,"DROP TRIGGER candidate_retention_v1_insert;CREATE TRIGGER candidate_retention_v1_insert BEFORE INSERT ON p0_candidates BEGIN SELECT 1;END;");
+  assert(edr_local_evidence_cache_open(path,2u,72u)==0);
+  char *restored=startup_schema_definition(db,names[2]);assert(!strcmp(expected[2],restored));sqlite3_free(restored);sqlite3_free(old);
+  assert(sqlite3_exec(db,"INSERT INTO p0_candidates(candidate_id,retention_policy_version)VALUES('invalid-policy',9);",NULL,NULL,NULL)==SQLITE_CONSTRAINT);
+  assert(sqlite3_exec(db,"DELETE FROM p0_candidates WHERE alert_context_protect_until_active_ms>0;",NULL,NULL,NULL)==SQLITE_CONSTRAINT);
+  EdrParentContextQuery query=floor_query(record,now);parent_pressure_query(&query,"startup_definition_repaired",1);
+  parent_fixture_owner_hash(db,record->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  edr_local_evidence_cache_close();
+  compact_exec(db,"DROP TRIGGER context_legacy_ref_retention_delete;CREATE TRIGGER context_legacy_ref_retention_delete BEFORE DELETE ON candidate_context_refs BEGIN SELECT 1;END;");
+  old=startup_schema_definition(db,names[2]);
+  sqlite3_int64 previous_limit=compact_scalar(db,"PRAGMA max_page_count"),pages=compact_scalar(db,"PRAGMA page_count");
+  char cap_sql[128];snprintf(cap_sql,sizeof(cap_sql),"PRAGMA max_page_count=%lld;",(long long)pages);compact_exec(db,cap_sql);
+  startup_fill_schema_until_full(db);
+  assert(edr_context_store_install_retention_guards(&store)<0 && strstr(store.error,"sqlite=13"));
+  assert(sqlite3_get_autocommit(db));unchanged=startup_schema_definition(db,names[2]);assert(!strcmp(old,unchanged));sqlite3_free(unchanged);sqlite3_free(old);
+  parent_fixture_owner_hash(db,record->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  assert(compact_scalar(db,"PRAGMA page_count")==pages);
+  snprintf(cap_sql,sizeof(cap_sql),"PRAGMA max_page_count=%lld;",(long long)previous_limit);compact_exec(db,cap_sql);
+  assert(edr_local_evidence_cache_open(path,2u,72u)==0);edr_local_evidence_cache_close();
+  restored=startup_schema_definition(db,names[2]);assert(!strcmp(expected[2],restored));sqlite3_free(restored);
+  fprintf(stderr,"startup_definition_replacement SQLAUTH_and_SQLFULL_old_definition_preserved=1 owner_hash_unchanged=1 autocommit_restored=1\n");fflush(stderr);
+  for(unsigned i=0;i<5;i++)sqlite3_free(expected[i]);
+  assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);free(record);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
+static void test_startup_logical_budget_wal_long_reader(void) {
+  char path[512],before_hash[65],after_hash[65];sqlite3 *writer=NULL,*reader=NULL;
+  const int64_t now=INT64_C(1700000000000000000);
+  EdrBehaviorRecord *record=calloc(1,sizeof(*record));assert(record);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(make_test_sqlite_path(path,sizeof(path))==0 && edr_local_evidence_cache_open(path,1u,72u)==0);
+  init_floor_parent(record,now);EdrCommandFacts facts={record->cmdline,record->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(record,&facts)==0);edr_local_evidence_cache_close();
+  assert(sqlite3_open(path,&writer)==SQLITE_OK);startup_fill_pages(writer,258);
+  parent_fixture_owner_hash(writer,record->pid,before_hash);
+  assert(sqlite3_open_v2(path,&reader,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK);
+  compact_exec(reader,"BEGIN;");assert(compact_scalar(reader,"PRAGMA page_count")==258);
+  compact_exec(writer,"PRAGMA wal_autocheckpoint=0;CREATE TABLE startup_wal_public(x);INSERT INTO startup_wal_public VALUES(1);");
+  for(unsigned i=0;i<32;i++)compact_exec(writer,"UPDATE startup_wal_public SET x=x+1;");
+  sqlite3_int64 logical=compact_scalar(writer,"PRAGMA page_count"),version=compact_scalar(writer,"PRAGMA schema_version");
+  assert(logical==259 && compact_scalar(writer,"SELECT x FROM startup_wal_public")==33);
+  assert(edr_local_evidence_cache_open(path,1u,72u)==0);
+  EdrEvidenceCacheStatus status;edr_local_evidence_cache_get_status(&status);
+  assert(status.db_open && status.pressure_active && status.wal_bytes>0);
+  assert(compact_scalar(writer,"PRAGMA page_count")==logical && compact_scalar(writer,"PRAGMA schema_version")==version);
+  assert(compact_scalar(reader,"PRAGMA page_count")==258); /* Original snapshot is intact. */
+  EdrParentContextQuery query=floor_query(record,now);parent_pressure_query(&query,"startup_wal_long_reader",1);
+  parent_fixture_owner_hash(writer,record->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  edr_local_evidence_cache_close();assert(compact_scalar(writer,"SELECT x FROM startup_wal_public")==33);
+  compact_exec(reader,"ROLLBACK;");assert(sqlite3_close(reader)==SQLITE_OK && sqlite3_close(writer)==SQLITE_OK);
+  cleanup_test_sqlite_path(path);free(record);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
+static void test_startup_logical_budget(void) {
+  s_test_pressure=false;
+  test_startup_logical_budget_legacy(1,0,1u);
+  test_startup_logical_budget_legacy(1,1,1u);
+  test_startup_logical_budget_legacy(0,0,1u);
+  test_startup_logical_budget_compatible_parent();
+  test_startup_logical_budget_wal_long_reader();
+  test_startup_schema_definition_and_rollback();
+  char path[512];assert(make_test_sqlite_path(path,sizeof(path))==0);
+  assert(edr_local_evidence_cache_open(path,UINT32_MAX,72u)==0);edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path,1u,72u)==0);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  puts("startup_logical_budget public_rows_preserved=1 schema_failure_explicit=1 recovery_with_headroom=1 compatible_over_queryable=1 startup_growth_bounded=1");
+}
+
 #endif
 
 /* Test EXE only; no production API or arbitrary database path argument.
@@ -12193,6 +12443,12 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--startup-logical-budget-public512") == 0) {
+    test_startup_logical_budget_legacy(1,0,512u); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--startup-logical-budget") == 0) {
+    test_startup_logical_budget(); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--capacity-health-snapshot") == 0) {
     test_capacity_health_snapshot_preserves_readable_owners(); return 0;
   }
@@ -12355,6 +12611,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_delayed_file_actor_with_exact_start_key());
 #if defined(EDR_HAVE_SQLITE)
   RUN_CACHE_CASE("context", test_capacity_health_snapshot_preserves_readable_owners());
+  RUN_CACHE_CASE("context", test_startup_logical_budget());
   RUN_CACHE_CASE("context", test_metric_dispositions_and_resource_failures());
   RUN_CACHE_CASE("context", test_metrics_commit_watermark_restart_and_failure());
   RUN_CACHE_CASE("context", test_metrics_slot_reuse_and_failed_handoff());

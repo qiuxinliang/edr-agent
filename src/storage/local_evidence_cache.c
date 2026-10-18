@@ -2924,16 +2924,18 @@ static int sqlite_retention_metadata_open(void) {
       "CREATE INDEX IF NOT EXISTS idx_artifacts_pmfe_retention ON artifacts(upload_status,created_ns,artifact_id) "
       "WHERE artifact_type='pmfe_followup_local_v1' AND "
       "(upload_status IS NULL OR upload_status NOT IN ('completed','expired','conflict'));"
-      "DROP TRIGGER IF EXISTS candidate_retention_v1_insert;"
+      ) != 0) goto failed;
+  if (edr_context_store_ensure_schema_object(&s_context_store,"trigger","candidate_retention_v1_insert",
       "CREATE TRIGGER candidate_retention_v1_insert BEFORE INSERT ON p0_candidates "
       "WHEN typeof(NEW.retention_policy_version)!='integer' OR NEW.retention_policy_version NOT IN(0,1) "
       "OR NEW.local_retention_state IS NOT 'retained' BEGIN SELECT RAISE(ABORT,'unsupported candidate retention policy'); END;"
-      "DROP TRIGGER IF EXISTS candidate_retention_v1_update;"
+) != 0 ||
+      edr_context_store_ensure_schema_object(&s_context_store,"trigger","candidate_retention_v1_update",
       "CREATE TRIGGER candidate_retention_v1_update BEFORE UPDATE OF retention_policy_version,local_retention_state ON p0_candidates "
       "WHEN NEW.retention_policy_version IS NOT OLD.retention_policy_version OR "
       "NEW.local_retention_state IS NULL OR NEW.local_retention_state NOT IN('retained','retirement_eligible') "
       "OR (NEW.local_retention_state='retirement_eligible' AND NEW.retention_policy_version!=1) "
-      "BEGIN SELECT RAISE(ABORT,'unsupported candidate retention transition'); END;") != 0) goto failed;
+      "BEGIN SELECT RAISE(ABORT,'unsupported candidate retention transition'); END;") != 0) { set_error(s_context_store.error); goto failed; }
   if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_policy_version=0 OR retention_value_class=0;",
       -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) goto failed;
   uint64_t legacy = (uint64_t)sqlite3_column_int64(st, 0);
@@ -3204,6 +3206,50 @@ static int sqlite_database_write_allow(uint64_t work_bytes) {
   uint64_t current=0;
   if(!sqlite_database_page_bytes(&current,NULL)) return 0;
   return sqlite_physical_write_allow(current>UINT64_MAX-work_bytes ? UINT64_MAX : current+work_bytes);
+}
+
+/* A connection-local ceiling covers startup DDL/metadata before runtime
+ * admission exists. It does not resize an already oversized database, count
+ * physical WAL copies as logical pages, or replace the runtime budget owner.
+ * Additive startup statements retain their existing transaction boundaries. */
+static uint64_t sqlite_startup_page_ceiling(uint64_t budget_bytes,
+    uint64_t current_pages, uint64_t page_size) {
+  const uint64_t sqlite_max_pages = UINT64_C(0xfffffffe);
+  if (page_size < 512u || page_size > 65536u || (page_size & (page_size - 1u)) ||
+      current_pages > sqlite_max_pages) return 0u;
+  uint64_t pages = budget_bytes / page_size;
+  if (pages > sqlite_max_pages) pages = sqlite_max_pages;
+  if (pages < current_pages) pages = current_pages;
+  return pages;
+}
+
+static int sqlite_startup_max_pages(uint64_t requested, uint64_t *actual) {
+  char sql[96]; sqlite3_stmt *st = NULL; int result = -1;
+  snprintf(sql, sizeof(sql), "PRAGMA main.max_page_count=%llu;",
+      (unsigned long long)requested);
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK &&
+      sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_INTEGER &&
+      sqlite3_column_int64(st, 0) > 0) {
+    *actual = (uint64_t)sqlite3_column_int64(st, 0);
+    if (sqlite3_step(st) == SQLITE_DONE) result = 0;
+  }
+  sqlite3_finalize(st);
+  if (result) set_error("evidence cache startup page-growth limit unavailable");
+  return result;
+}
+
+static int sqlite_startup_page_limit(uint64_t logical_bytes, uint64_t page_size,
+    uint64_t *previous) {
+  uint64_t budget = (uint64_t)s_status.max_db_mb * UINT64_C(1048576), actual = 0u;
+  if (!page_size || logical_bytes % page_size ||
+      sqlite_startup_max_pages(0u, previous)) return -1;
+  uint64_t ceiling = sqlite_startup_page_ceiling(budget, logical_bytes / page_size, page_size);
+  if (ceiling > *previous) ceiling = *previous; /* Never raise an existing stricter ceiling. */
+  if (!ceiling || sqlite_startup_max_pages(ceiling, &actual) || actual != ceiling) {
+    set_error("evidence cache startup page-growth limit could not be installed");
+    return -1;
+  }
+  return 0;
 }
 
 static uint64_t s_evidence_wal_page_size;
@@ -7390,6 +7436,11 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
     sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
     evidence_cache_unlock(); return -1;
   }
+  uint64_t startup_previous_max_pages=0;
+  if (sqlite_startup_page_limit(startup_logical,startup_page_size,&startup_previous_max_pages)!=0) {
+    sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
+    evidence_cache_unlock(); return -1;
+  }
   s_evidence_wal_page_size=startup_page_size;
   (void)sqlite3_wal_hook(s_db,sqlite_guarded_autocheckpoint,NULL);
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
@@ -7405,9 +7456,7 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   (void)exec_sql("PRAGMA cache_size=-1024;");
   (void)exec_sql("PRAGMA mmap_size=0;");
   if (sqlite_ensure_incremental_vacuum() != 0) {
-    evidence_cache_close_locked();
-    evidence_cache_unlock();
-    return -1;
+    goto startup_failed;
   }
   const char *schema =
       "CREATE TABLE IF NOT EXISTS process_cache ("
@@ -7478,34 +7527,50 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
       "task_id TEXT PRIMARY KEY,status TEXT,evidence_refs TEXT,upload_refs TEXT,error TEXT,"
       "retryable INTEGER,updated_ns INTEGER);";
   if (exec_sql(schema) != 0) {
-    evidence_cache_close_locked();
-    evidence_cache_unlock();
-    return -1;
+    goto startup_failed;
   }
   if (edr_context_store_open(&s_context_store, s_db) != 0) {
     set_error(s_context_store.error);
-    evidence_cache_close_locked();
-    evidence_cache_unlock();
-    return -1;
+    goto startup_failed;
   }
   if (sqlite_ensure_process_cache_generation_columns() != 0 ||
       sqlite_ensure_p0_candidate_columns() != 0 ||
       sqlite_retention_metadata_open() != 0 ||
       sqlite_migrate_legacy_context_artifacts() != 0) {
-    evidence_cache_close_locked();
-    evidence_cache_unlock();
-    return -1;
+    goto startup_failed;
   }
   sqlite_maintenance(0);
   if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES) ||
       exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';") != 0) {
-    evidence_cache_close_locked(); evidence_cache_unlock(); return -1;
+    goto startup_failed;
+  }
+  {
+    uint64_t restored=0;
+    if (sqlite_startup_max_pages(startup_previous_max_pages,&restored)!=0 ||
+        restored!=startup_previous_max_pages) {
+      set_error("evidence cache startup page-growth limit could not be restored");
+      goto startup_failed;
+    }
   }
   evidence_cache_unlock();
   edr_egress_set_pmfe_association_validator(pmfe_association_validate,NULL);
   edr_egress_set_pmfe_receipt_handler(pmfe_receipt_handler,NULL);
   edr_egress_set_pmfe_queue_removed_handler(pmfe_queue_removed_handler,NULL);
   return 0;
+startup_failed:
+  {
+    char cause[sizeof(s_status.last_error)];
+    copy_s(cause,sizeof(cause),s_status.last_error);
+    evidence_cache_close_locked();
+    /* Closing/checkpoint diagnostics must not hide why schema startup failed.
+     * Earlier additive statements or normal maintenance may be committed; this
+     * is not a whole-open rollback. A later open can resume additive startup. */
+    char message[sizeof(s_status.last_error)];
+    snprintf(message,sizeof(message),"evidence cache startup schema unavailable within logical page limit: %.120s",cause);
+    set_error(message);
+  }
+  evidence_cache_unlock();
+  return -1;
 #else
   (void)path;
   set_error("sqlite disabled");
