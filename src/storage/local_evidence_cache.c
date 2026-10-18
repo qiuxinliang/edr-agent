@@ -6480,6 +6480,15 @@ int edr_local_evidence_cache_save_command_fact(const EdrBehaviorRecord *r, const
   set_error("complete command fact unavailable: invalid identity, encoding, or storage");
   if (!s_db || !command_fact_key(r, key) || !n || n >= EDR_PROCESS_COMMAND_FACT_CAP ||
       !manifest_utf8_valid(command) || edr_sha256_hex((const uint8_t *)command, n, hash)) goto done;
+  /* Exact verified reuse performs no write. The cache lock protects this
+   * read just like the public command-fact load; the candidate transaction
+   * independently rechecks its dependency before committing a reference. */
+  char *existing = read_command_fact_locked(r);
+  if (existing) {
+    int equal = !strcmp(existing, command);
+    free(existing);
+    if (equal) { rc = 0; goto done; }
+  }
   /* Pressure work precedes the owner transaction. All subsequent reads and
    * admission serialize with other SQLite writers, including process writes. */
   if (!sqlite_size_budget_allow() || exec_sql("BEGIN IMMEDIATE;")) goto done;

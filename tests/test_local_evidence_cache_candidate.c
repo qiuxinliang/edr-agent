@@ -7730,7 +7730,10 @@ static void test_capacity_progress_with_slow_checkpoint(void) {
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
 }
 
+static void test_command_fact_reuse_under_pressure(void);
+
 static void test_physical_floor_holds_maintenance_and_startup(void) {
+  test_command_fact_reuse_under_pressure();
   char path[512]; sqlite3 *db=NULL,*reader=NULL;
   EdrEvidenceCacheStatus before,after;
   const int64_t now=INT64_C(1700007200000000000),old=now-INT64_C(7200000000000);
@@ -10598,6 +10601,89 @@ static void parent_fixture_owner_hash(sqlite3 *db, uint32_t pid, char hash[65]) 
   int bytes = sqlite3_column_bytes(st, 0); assert(value && bytes > 0);
   assert(edr_sha256_hex(value, (size_t)bytes, hash) == 0);
   assert(sqlite3_step(st) == SQLITE_DONE); sqlite3_finalize(st);
+}
+
+
+/* Reusing a verified command is a read, even while new storage is refused.
+ * The fixed public floor and padding exercise the real guards; neither the
+ * volume observation nor SQLite return codes are fabricated. */
+static void test_command_fact_reuse_under_pressure(void) {
+  const int64_t now=INT64_C(1700000000000000000);
+  char path[512],before_hash[65],after_hash[65];sqlite3 *db=NULL;
+  EdrBehaviorRecord *r=calloc(1u,sizeof(*r)),*other=calloc(1u,sizeof(*other));assert(r&&other);
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;vfs.zName="command-fact-reuse-pressure";vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  s_test_monotonic_ns=UINT64_C(1000000000);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path,16u,1u,1u)==0);
+  init_floor_parent(r,now);strcpy(r->event_id,"command-reuse-protected");
+  EdrCommandFacts facts={r->cmdline,r->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(r,&facts)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  parent_fixture_owner_hash(db,r->pid,before_hash);
+  *other=*r;other->pid++;other->process_start_key++;other->process_creation_filetime_100ns++;
+  EdrEvidenceCacheStatus before,after;edr_local_evidence_cache_get_status(&before);
+  test_setenv("EDR_STORAGE_MIN_FREE_MB","1073741824");
+  uint64_t writes=retention_bench_writes;
+  assert(edr_local_evidence_cache_save_command_fact(r,r->cmdline)==0);
+  edr_local_evidence_cache_get_status(&after);
+  assert(retention_bench_writes==writes && after.physical_refusals==before.physical_refusals);
+  assert(edr_local_evidence_cache_save_command_fact(other,"new --synthetic")<0);
+  assert(edr_local_evidence_cache_save_command_fact(r,"different --synthetic")<0);
+  char *text=edr_local_evidence_cache_read_command_fact(r);assert(text&&!strcmp(text,r->cmdline));free(text);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND upload_status='embedded'")==2);
+  assert(retention_bench_writes==writes);
+  parent_fixture_owner_hash(db,r->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  puts("command_fact_reuse physical: exact existing reused without write; new/conflict remain guarded");
+  test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
+  compact_exec(db,"CREATE TABLE command_reuse_public_padding(payload BLOB);INSERT INTO command_reuse_public_padding VALUES(zeroblob(3145728));");
+  assert(sqlite3_close(db)==SQLITE_OK);db=NULL;edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,1u,1u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  edr_local_evidence_cache_get_status(&before);assert(before.db_bytes+before.wal_bytes>UINT64_C(1048576));
+  writes=retention_bench_writes;
+  assert(edr_local_evidence_cache_save_command_fact(r,r->cmdline)==0);
+  edr_local_evidence_cache_get_status(&after);
+  assert(retention_bench_writes==writes && after.db_budget_dropped==before.db_budget_dropped);
+  assert(after.maintenance_runs==before.maintenance_runs);
+  assert(edr_local_evidence_cache_save_command_fact(other,"new --synthetic")<0);
+  assert(edr_local_evidence_cache_save_command_fact(r,"different --synthetic")<0);
+  text=edr_local_evidence_cache_read_command_fact(r);assert(text&&!strcmp(text,r->cmdline));free(text);
+  parent_fixture_owner_hash(db,r->pid,after_hash);assert(!strcmp(before_hash,after_hash));
+  puts("command_fact_reuse capacity: exact existing reused without write/maintenance; new/conflict remain guarded");
+  assert(sqlite3_close(db)==SQLITE_OK);db=NULL;edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open_with_policy(path,16u,1u,1u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(edr_local_evidence_cache_save_command_fact(other,"new --synthetic")==0);
+  /* Corrupt only a public unreferenced fixture fact. A malformed JSON body
+   * must not be treated as verified reuse, and refusal must not repair it. */
+  compact_exec(db,"CREATE TEMP TABLE command_reuse_saved AS SELECT artifact_id,manifest_json FROM artifacts WHERE artifact_type='process_command_line' AND command_owner_pid=99103;"
+      "UPDATE artifacts SET manifest_json='{' WHERE artifact_type='process_command_line' AND command_owner_pid=99103;");
+  assert(edr_local_evidence_cache_read_command_fact(other)==NULL);
+  test_setenv("EDR_STORAGE_MIN_FREE_MB","1073741824");writes=retention_bench_writes;
+  assert(edr_local_evidence_cache_save_command_fact(other,"new --synthetic")<0);
+  assert(retention_bench_writes==writes);
+  test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
+  compact_exec(db,"UPDATE artifacts SET manifest_json=(SELECT s.manifest_json FROM command_reuse_saved s WHERE s.artifact_id=artifacts.artifact_id) "
+      "WHERE artifact_id IN(SELECT artifact_id FROM command_reuse_saved);DROP TABLE command_reuse_saved;");
+  assert(edr_local_evidence_cache_save_command_fact(other,"new --synthetic")==0);
+  text=edr_local_evidence_cache_read_command_fact(other);assert(text&&!strcmp(text,"new --synthetic"));free(text);
+  assert(edr_local_evidence_cache_save_command_fact(r,"different --synthetic")<0);
+  assert(edr_local_evidence_cache_read_command_fact(r)==NULL);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line' AND upload_status='conflict'")==1);
+  other->pid++;other->process_start_key++;other->process_creation_filetime_100ns++;
+  assert(edr_local_evidence_cache_save_command_fact(other,"after-pressure --synthetic")==0);
+  text=edr_local_evidence_cache_read_command_fact(other);assert(text&&!strcmp(text,"after-pressure --synthetic"));free(text);
+  puts("command_fact_reuse integrity: malformed fact refused; healthy conflict persists; subsequent normal fact stored");
+  assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  s_test_monotonic_ns=UINT64_C(1000000000);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+  free(r);free(other);
 }
 
 /* A finite progress contract under controlled 1ms reads, not a promise that
