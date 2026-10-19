@@ -2086,6 +2086,7 @@ static void test_command_result_copy_budget(void) {
 
 /* A large freelist is reclaimed in bounded page batches without evicting
  * retained evidence just because its physical file is still over the cap. */
+static unsigned incremental_reclaim_startup_slow_boundary(int enabled);
 static void test_incremental_reclaim_is_bounded_and_preserves_evidence(void) {
   char db[512];
   sqlite3 *raw = NULL;
@@ -2103,11 +2104,14 @@ static void test_incremental_reclaim_is_bounded_and_preserves_evidence(void) {
   assert(sqlite3_close(raw) == SQLITE_OK);
   int64_t free_before = sqlite_scalar_integer(db, "PRAGMA freelist_count;");
   assert(free_before > 8192);
+  unsigned slow_startup = incremental_reclaim_startup_slow_boundary(1);
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+  (void)incremental_reclaim_startup_slow_boundary(0);
   int64_t free_after = sqlite_scalar_integer(db, "PRAGMA freelist_count;");
   fprintf(stderr, "bounded reclaim startup: before=%lld after=%lld reclaimed=%lld\n",
       (long long)free_before, (long long)free_after, (long long)(free_before-free_after));
   assert(free_before - free_after >= 0 && free_before - free_after <= 256);
+  if (slow_startup) assert(free_before == free_after);
   if (free_before == free_after) {
     /* The startup checkpoint may exhaust the cooperative time slice. Its
      * already scheduled reclaim must progress on the next owner poll, without
@@ -7542,6 +7546,11 @@ static int retention_raise_floor_on_write;
 static unsigned retention_checkpoint_delay_ms;
 static uint64_t retention_delayed_checkpoint_syncs;
 static unsigned retention_main_read_delay_ms;
+static unsigned incremental_startup_read_delay_ms;
+static unsigned incremental_reclaim_startup_slow_boundary(int enabled) {
+  retention_main_read_delay_ms = enabled ? incremental_startup_read_delay_ms : 0u;
+  return incremental_startup_read_delay_ms;
+}
 static int retention_main_read_high_resolution;
 static uint64_t retention_high_resolution_reads, retention_read_delay_min_ns, retention_read_delay_max_ns;
 static unsigned capacity_checkpoint_delay_ms, capacity_main_read_delay_ms;
@@ -7726,6 +7735,22 @@ static void test_capacity_progress_with_slow_checkpoint(void) {
   test_incremental_reclaim_is_bounded_and_preserves_evidence();
   test_capacity_success_does_not_throttle_next_reclaim();
   retention_checkpoint_delay_ms=0u;
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
+
+/* Only the second startup is slowed. Require the deferred physical-reclaim
+ * branch; keep the original fixed-clock/hot-poll/future-owner assertions. */
+static void test_incremental_reclaim_with_slow_startup(void) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="incremental-reclaim-slow-startup"; vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile); vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  incremental_startup_read_delay_ms=3u;
+  test_incremental_reclaim_is_bounded_and_preserves_evidence();
+  incremental_startup_read_delay_ms=0u;
+  assert(retention_main_read_delay_ms==0u);
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
 }
@@ -12980,6 +13005,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_command_result_copy_budget());
   RUN_CACHE_CASE("retention", test_critical_context_still_honors_database_capacity());
   RUN_CACHE_CASE("retention", test_incremental_reclaim_is_bounded_and_preserves_evidence());
+  RUN_CACHE_CASE("retention", test_incremental_reclaim_with_slow_startup());
   RUN_CACHE_CASE("retention", test_capacity_reclaims_free_pages_before_evicting_candidates());
   RUN_CACHE_CASE("retention", test_capacity_reclaim_bounded_progress_preserves_parent_floor());
   RUN_CACHE_CASE("retention", test_capacity_preserves_unclassified_refs_and_reports_refusal());

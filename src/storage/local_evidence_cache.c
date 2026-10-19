@@ -6037,7 +6037,7 @@ failed:
   s_maintenance_reclaim_pages = 0u;
   sqlite_maintenance_park(MAINTENANCE_BACKOFF);
 finish:
-  if (!s_maintenance_reclaim_pages && s_maintenance_work_state != MAINTENANCE_RUNNABLE)
+  if (!s_maintenance_reclaim_pages)
     s_last_maintenance_ns=edr_monotonic_ns();
   /* An empty reclaim turn must not discard the working set needed by the
    * unfinished pressure slice. Actual reclamation, errors and resource
