@@ -1,10 +1,10 @@
-# Disposable exact 692 → 695 / 697 / 698 recovery cohorts
+# Disposable exact 692 → 695 / 697 / 698 / 699 recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695, 697 and 698 selectors exist; there is no caller source/run/asset URL override.
+695, 697, 698 and 699 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
 
@@ -32,6 +32,26 @@ The native tool manifest remains separate from the product artifact manifest.
 Existing695/697 data and the original builder owner remain unchanged. Missing
 pins are still rejected; negative tests inject each missing pin into temporary
 catalog bytes rather than requiring this actual catalog to remain UNBOUND.
+Cohort699 is now explicitly bound to published Headless3.2.699 for source
+`f00ae9ac5d6ee7b7b10e05179e9e6beb457ebc10`, release416764946/run39175461468/1,
+and the passed ARM64 native tool artifact12152929756/run39172244999/1. All15
+external binding pins come from actual metadata, downloaded/staged bytes, the
+original in-process handler receipt, and the actual original-builder P5 export.
+The P5 SHA `c6a0bd4856b6de00093ae3bc0ca541d365b8872386553cff559e6f506e61c3f9`
+was independently produced and equals the original handler's package identity.
+This receipt proves local `httptest` preflight/export bytes with DBnil/store
+writes0; it does not assert authenticated liveHTTP, import, installation or
+recovery success. Original handler96b52 and builder695c9 owners are unchanged.
+The16KiB catalog cap and all strict source/run/hash/receipt checks remain.
+Missing pins are still rejected before target checkout, product/stage I/O,
+export or recovery; negative tests inject each UNBOUND field into temporary
+catalog bytes so they remain valid after this actual catalog is bound.
+For a later source, bind that source's actual native/release/handler/P5 evidence;
+never reuse old8c3 artifacts as proof or add a caller-selected target override.
+Existing695/697/698 data, normal lifecycle, driver/collector, permissions and
+45/30/900 limits are unchanged.
+No product, latest release, upload or remote-control behavior is changed here.
+
 The workflow first checks out its own QA source to read this data, then resolves
 the closed profile before product checkout. Any missing/UNBOUND pin still refuses
 before product I/O, and never selects695 as a fallback.

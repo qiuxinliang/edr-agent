@@ -61,7 +61,7 @@ on:
         default: 1
         type: number
       cache_recovery_subset:
-        description: 'Manual disposable exact 692-to-695 or bound 697/698 cache subset only; default keeps the existing lifecycle gate'
+        description: 'Manual disposable exact 692-to-695 or bound 697/698/699 cache subset only; default keeps the existing lifecycle gate'
         required: false
         default: false
         type: boolean
@@ -607,7 +607,7 @@ jobs:
           RECOVERY_PACKAGE_SCOPE: ${{ inputs.package_scope }}
           RECOVERY_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
-          if ($env:RECOVERY_TARGET_TAG -cnotin @('win_3.2.695','win_3.2.697','win_3.2.698') -or $env:RECOVERY_BASELINE_TAG -cne 'win_3.2.692' -or $env:RECOVERY_PACKAGE_SCOPE -cne 'headless' -or $env:RECOVERY_ARCHITECTURE -cne 'arm64') { throw 'Manual cache recovery requires an approved target/692 Headless ARM64 cohort' }
+          if ($env:RECOVERY_TARGET_TAG -cnotin @('win_3.2.695','win_3.2.697','win_3.2.698','win_3.2.699') -or $env:RECOVERY_BASELINE_TAG -cne 'win_3.2.692' -or $env:RECOVERY_PACKAGE_SCOPE -cne 'headless' -or $env:RECOVERY_ARCHITECTURE -cne 'arm64') { throw 'Manual cache recovery requires an approved target/692 Headless ARM64 cohort' }
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
