@@ -2011,6 +2011,14 @@ int edr_preprocess_stop(void) {
   const unsigned phase_before = atomic_load_explicit(&s_worker_phase, memory_order_relaxed);
   const uint64_t loops_before = atomic_load_explicit(&s_worker_completed_loops, memory_order_relaxed);
   const uint64_t slots_before = atomic_load_explicit(&s_worker_completed_slots, memory_order_relaxed);
+  EdrEventBusSnapshot bus_before = {0};
+  const int bus_before_known = edr_event_bus_try_snapshot(s_bus, &bus_before);
+  const int pmfe_running_before = edr_pmfe_is_running();
+  unsigned long pmfe_submitted_before, pmfe_completed_before, pmfe_dropped_before;
+  EdrPmfeRuntimeStats pmfe_before;
+  edr_pmfe_get_stats(&pmfe_submitted_before, &pmfe_completed_before, &pmfe_dropped_before);
+  edr_pmfe_get_runtime_stats(&pmfe_before);
+
 #endif
   atomic_store(&s_stop_preprocess, 1);
   edr_event_bus_wake(s_bus);
@@ -2019,6 +2027,14 @@ int edr_preprocess_stop(void) {
     const DWORD wait_result = WaitForSingleObject(s_thread, 60000);
     if (wait_result != WAIT_OBJECT_0) {
       const DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : 0u;
+      EdrEventBusSnapshot bus_after = {0};
+      const int bus_after_known = edr_event_bus_try_snapshot(s_bus, &bus_after);
+      const int pmfe_running_after = edr_pmfe_is_running();
+      unsigned long pmfe_submitted_after, pmfe_completed_after, pmfe_dropped_after;
+      EdrPmfeRuntimeStats pmfe_after;
+      edr_pmfe_get_stats(&pmfe_submitted_after, &pmfe_completed_after, &pmfe_dropped_after);
+      edr_pmfe_get_runtime_stats(&pmfe_after);
+
       fprintf(stderr, "[preprocess] shutdown timed out; retaining worker dependencies\n");
       /* Independent atomic reads, not an atomic all-stack snapshot. */
       fprintf(stderr, "[preprocess] worker join diagnostic wait_rc=%lu error=%lu phase_before=%u phase_after=%u loops_before=%llu loops_after=%llu slots_before=%llu slots_after=%llu stop=%u exited=%u\n",
@@ -2029,6 +2045,19 @@ int edr_preprocess_stop(void) {
               (unsigned long long)slots_before,
               (unsigned long long)atomic_load_explicit(&s_worker_completed_slots, memory_order_relaxed),
               (unsigned)atomic_load(&s_stop_preprocess), (unsigned)atomic_load(&s_preprocess_exited));
+      /* Diagnostic reads only: busy bus snapshots are unknown, PMFE queue
+       * depth is deliberately omitted because its getter waits on a lock. */
+      fprintf(stderr, "[preprocess] stop queue diagnostic bus_before_known=%u bus_after_known=%u bus_before_used=%u bus_after_used=%u bus_before_pushed=%llu bus_after_pushed=%llu bus_before_dropped=%llu bus_after_dropped=%llu pmfe_before_running=%u pmfe_after_running=%u pmfe_before_active=%lu pmfe_after_active=%lu pmfe_before_submitted=%lu pmfe_after_submitted=%lu pmfe_before_completed=%lu pmfe_after_completed=%lu pmfe_before_dropped=%lu pmfe_after_dropped=%lu\n",
+              (unsigned)bus_before_known, (unsigned)bus_after_known,
+              bus_before.used, bus_after.used,
+              (unsigned long long)bus_before.pushed, (unsigned long long)bus_after.pushed,
+              (unsigned long long)bus_before.dropped, (unsigned long long)bus_after.dropped,
+              (unsigned)pmfe_running_before, (unsigned)pmfe_running_after,
+              pmfe_before.active, pmfe_after.active,
+              pmfe_submitted_before, pmfe_submitted_after,
+              pmfe_completed_before, pmfe_completed_after,
+              pmfe_dropped_before, pmfe_dropped_after);
+
       return 0;
     }
     CloseHandle(s_thread);

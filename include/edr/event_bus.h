@@ -56,6 +56,18 @@ uint32_t edr_event_bus_try_pop_many(EdrEventBus *bus, EdrEventSlot *out_slots, u
 
 uint32_t edr_event_bus_capacity(const EdrEventBus *bus);
 uint32_t edr_event_bus_used_approx(EdrEventBus *bus);
+
+/* Stop-failure diagnostics only. Windows uses one non-waiting try-lock;
+ * POSIX reads existing relaxed atomics and is approximate across fields.
+ * False means unavailable (including lock busy), never an empty queue.
+ * On false, out is untouched. This does not seal or alter admission. */
+typedef struct {
+  uint32_t used;
+  uint64_t pushed;
+  uint64_t dropped;
+} EdrEventBusSnapshot;
+bool edr_event_bus_try_snapshot(EdrEventBus *bus, EdrEventBusSnapshot *out);
+
 uint32_t edr_event_bus_p0_reserved_slots(const EdrEventBus *bus);
 uint64_t edr_event_bus_ordinary_reserve_rejected_total(EdrEventBus *bus);
 uint64_t edr_event_bus_p0_reserve_rejected_total(EdrEventBus *bus);

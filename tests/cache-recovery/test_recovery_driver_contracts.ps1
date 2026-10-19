@@ -560,6 +560,30 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_partial_numeric_line_not_projected'
     PublicAppend "`n";ReadStopLogSlice $ctx 6
     Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join') 'join_partial_numeric_line_completed_once';CloseStopLogContext $ctx
+    $queueLine='[preprocess] stop queue diagnostic bus_before_known=1 bus_after_known=1 bus_before_used=4 bus_after_used=8 bus_before_pushed=17 bus_after_pushed=21 bus_before_dropped=0 bus_after_dropped=2 pmfe_before_running=1 pmfe_after_running=1 pmfe_before_active=2 pmfe_after_active=1 pmfe_before_submitted=5 pmfe_after_submitted=6 pmfe_before_completed=3 pmfe_after_completed=4 pmfe_before_dropped=0 pmfe_after_dropped=1'
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($queueLine+"`n");ReadStopLogSlice $ctx 1
+    $q=$ctx.diagnostic.matches[0]
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $q.kind -ceq 'preprocess_stop_queues' -and $q.bus[0].known -and $q.bus[0].used -eq 4 -and $q.bus[1].pushed -eq 21 -and $q.pmfe.running[0] -eq 1 -and $q.pmfe.active[1] -eq 1 -and $q.pmfe.submitted[1] -eq 6 -and -not $q.pmfe.pending_known -and $null -eq $q.pmfe.pending) 'queue_boundary_numeric_projection';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext
+    $unknown=$queueLine.Replace('bus_before_known=1','bus_before_known=0').Replace('bus_before_used=4','bus_before_used=0').Replace('bus_before_pushed=17','bus_before_pushed=0')
+    PublicAppend ($unknown+"`n");ReadStopLogSlice $ctx 2;$q=$ctx.diagnostic.matches[0]
+    Checked (-not $q.bus[0].known -and $null -eq $q.bus[0].used -and $null -eq $q.bus[0].pushed -and $q.bus[1].known) 'queue_busy_is_unknown_not_empty';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($queueLine.Replace('bus_before_pushed=17','bus_before_pushed=18446744073709551615').Replace('pmfe_before_submitted=5','pmfe_before_submitted=4294967295')+"`n");ReadStopLogSlice $ctx 3
+    Checked ($ctx.diagnostic.matches[0].bus[0].pushed -eq [uint64]::MaxValue -and $ctx.diagnostic.matches[0].pmfe.submitted[0] -eq [uint32]::MaxValue) 'queue_uint64_and_windows_ulong_max';CloseStopLogContext $ctx
+    foreach($bad in @($queueLine.Replace('bus_before_used=4','bus_before_used=65537'),$queueLine.Replace('bus_before_known=1','bus_before_known=2'),$queueLine.Replace('pmfe_before_running=1','pmfe_before_running=2'),$queueLine.Replace('bus_before_pushed=17','bus_before_pushed=18446744073709551616'),$queueLine.Replace('pmfe_before_active=2','pmfe_before_active=4294967296'),$queueLine.Replace('bus_before_known=1','bus_before_known=0'))){
+      ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($bad+"`n");Fails {ReadStopLogSlice $ctx 4} 'stop_log_numeric_shape';CloseStopLogContext $ctx
+    }
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ('private-message '+$queueLine+"`n"+$queueLine+' raw-path'+"`n");ReadStopLogSlice $ctx 5
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'queue_near_match_no_raw_export';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend $queueLine;ReadStopLogSlice $ctx 6
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'queue_partial_line_not_projected';PublicAppend "`n";ReadStopLogSlice $ctx 7
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_stop_queues') 'queue_partial_line_completed_once';CloseStopLogContext $ctx
+    # Real reader projection, then Save-equivalent pretty JSON; no cap changes.
+    $queueMaxLine='[preprocess] stop queue diagnostic bus_before_known=1 bus_after_known=1 bus_before_used=65536 bus_after_used=65536 bus_before_pushed=18446744073709551615 bus_after_pushed=18446744073709551615 bus_before_dropped=18446744073709551615 bus_after_dropped=18446744073709551615 pmfe_before_running=1 pmfe_after_running=1 pmfe_before_active=4294967295 pmfe_after_active=4294967295 pmfe_before_submitted=4294967295 pmfe_after_submitted=4294967295 pmfe_before_completed=4294967295 pmfe_after_completed=4294967295 pmfe_before_dropped=4294967295 pmfe_after_dropped=4294967295'
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend (($queueMaxLine+"`n")*64)
+    ReadStopLogSlice $ctx ([long]::MaxValue)
+    $queueMaxBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n")
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_stop_queues' -and $queueMaxBytes.Length -lt 1048576) 'queue_max64_real_projection_within_collector_single_file_cap';CloseStopLogContext $ctx
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'

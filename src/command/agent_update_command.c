@@ -886,7 +886,7 @@ invalid:
   return 0;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(EDR_AGENT_UPDATE_TESTING)
 static int quote_ps(const char *input, char *out, size_t cap) {
   size_t used = 0;
   if (cap < 3u) return 0;
@@ -914,10 +914,29 @@ static int write_update_invocation_script(const char *path, const char *updater,
   for (size_t i = 0; i < 24u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
   FILE *file = fopen(path, "wb");
   if (!file) return 0;
-  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -UpgradeClass %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\nexit $LASTEXITCODE\r\n",
+  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -UpgradeClass %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\n$updaterSucceeded=$?\r\nif ($updaterSucceeded) { exit 0 }\r\nif ((Test-Path variable:LASTEXITCODE) -and $LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\nexit 1\r\n",
           quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], quoted[21], quoted[22], quoted[23], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
   return fclose(file) == 0;
 }
+
+
+#ifdef EDR_AGENT_UPDATE_TESTING
+/* Test target only: exercise the actual writer without staging or launching an update. */
+int edr_agent_update_test_write_invocation(const char *path, const char *updater,
+    const char *staged, const char *manifest, const EdrAgentUpdateRequest *req,
+    const char *command_id, const char *updater_task_name,
+    const char *staging_directory);
+int edr_agent_update_test_write_invocation(const char *path, const char *updater,
+    const char *staged, const char *manifest, const EdrAgentUpdateRequest *req,
+    const char *command_id, const char *updater_task_name,
+    const char *staging_directory) {
+  return write_update_invocation_script(path, updater, staged, manifest, req,
+      command_id, updater_task_name, staging_directory);
+}
+#endif
+#endif
+
+#ifdef _WIN32
 
 static int write_launch_script(const char *path, const char *invocation,
                                const char *updater_task_name) {

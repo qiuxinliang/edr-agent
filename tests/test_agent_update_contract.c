@@ -168,7 +168,148 @@ static int recovery_flush_probe(const char *outbox_dir,
   return probe->flush_rc;
 }
 
-int main(void) {
+/* Fixed public fixture CLI for the native PowerShell caller regression.  This
+ * does not invoke an updater or the live execution dependencies above. */
+int edr_agent_update_test_write_invocation(const char *path, const char *updater,
+    const char *staged, const char *manifest, const EdrAgentUpdateRequest *req,
+    const char *command_id, const char *updater_task_name,
+    const char *staging_directory);
+
+static int write_public_invocation(const char *path, const char *worker,
+                                   const char *kind) {
+  if (strcmp(kind, "success_return") && strcmp(kind, "exit1") &&
+      strcmp(kind, "exit7") && strcmp(kind, "throw") && strcmp(kind, "args_only"))
+    return 2;
+  EdrAgentUpdateRequest req;
+  memset(&req, 0, sizeof(req));
+  memset(req.sha256, 'a', 64u);
+  snprintf(req.target_version, sizeof(req.target_version), "3.2.699-public");
+  snprintf(req.architecture, sizeof(req.architecture), "arm64");
+  snprintf(req.internal_name, sizeof(req.internal_name), "public '\"name\"\\");
+  snprintf(req.publisher_subject, sizeof(req.publisher_subject), "CN=Public '\" subject\\");
+  snprintf(req.max_current_version, sizeof(req.max_current_version), "3.2.999");
+  snprintf(req.upgrade_class, sizeof(req.upgrade_class), "installer_required");
+  snprintf(req.deployment_mode, sizeof(req.deployment_mode), "scheduled_task");
+  snprintf(req.scheduled_task_name, sizeof(req.scheduled_task_name), "public '\" task\\");
+  snprintf(req.scheduled_task_path, sizeof(req.scheduled_task_path), "\\public '\" path\\");
+  snprintf(req.service_name, sizeof(req.service_name), "public service");
+  snprintf(req.task_id, sizeof(req.task_id), "public-task");
+  snprintf(req.operation, sizeof(req.operation), "%s", kind);
+  snprintf(req.artifact_id, sizeof(req.artifact_id), "public-artifact");
+  req.min_free_bytes = UINT64_MAX;
+  req.issued_at_unix_ms = 0u;
+  req.deadline_unix_ms = UINT64_C(9007199254740991);
+  req.health_observe_ms = UINT64_C(9223372036854775808);
+  return edr_agent_update_test_write_invocation(path, worker, "",
+      "C:\\public path\\manifest'\".json", &req, "public-command",
+      "public updater", "") ? 0 : 2;
+}
+
+#ifdef _WIN32
+/* Every fixture PowerShell/native descendant joins this one kill-on-close Job
+ * before its first instruction.  Unknown/timeout/cleanup failure is never an
+ * ordinary child exit receipt.  Only the public script named by this test runs. */
+static int run_public_invocation(const char *script, const char *out,
+                                 const char *err) {
+  HANDLE job = NULL, output = INVALID_HANDLE_VALUE, error = INVALID_HANDLE_VALUE;
+  HANDLE input = INVALID_HANDLE_VALUE;
+  PROCESS_INFORMATION pi;
+  memset(&pi, 0, sizeof(pi));
+  int accepted = 0, cleanup_ok = 1;
+  DWORD code = 0;
+  char executable[MAX_PATH], command[4096];
+  UINT size = GetSystemDirectoryA(executable, (UINT)sizeof(executable));
+  if (!size || size >= sizeof(executable) || strchr(script, '"') ||
+      strchr(script, '\r') || strchr(script, '\n')) goto finish;
+  size_t used = strlen(executable);
+  const char *suffix = "\\WindowsPowerShell\\v1.0\\powershell.exe";
+  if (used + strlen(suffix) >= sizeof(executable)) goto finish;
+  strcat(executable, suffix);
+  int written = snprintf(command, sizeof(command),
+      "\"%s\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%s\"",
+      executable, script);
+  if (written < 0 || (size_t)written >= sizeof(command)) goto finish;
+  SECURITY_ATTRIBUTES sa = { (DWORD)sizeof(sa), NULL, TRUE };
+  output = CreateFileA(out, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_NEW,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+  error = CreateFileA(err, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_NEW,
+                      FILE_ATTRIBUTE_NORMAL, NULL);
+  input = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                      &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (output == INVALID_HANDLE_VALUE || error == INVALID_HANDLE_VALUE ||
+      input == INVALID_HANDLE_VALUE) goto finish;
+  job = CreateJobObjectW(NULL, NULL);
+  if (!job) goto finish;
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit;
+  memset(&limit, 0, sizeof(limit));
+  limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                               &limit, (DWORD)sizeof(limit))) goto finish;
+  STARTUPINFOA si;
+  memset(&si, 0, sizeof(si));
+  si.cb = (DWORD)sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = input; si.hStdOutput = output; si.hStdError = error;
+  if (!CreateProcessA(executable, command, NULL, NULL, TRUE,
+      CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) goto finish;
+  if (!AssignProcessToJobObject(job, pi.hProcess) ||
+      ResumeThread(pi.hThread) != 1u) goto finish;
+  ULONGLONG deadline = GetTickCount64() + 15000u;
+  for (;;) {
+    DWORD waited = WaitForSingleObject(pi.hProcess, 50u);
+    LARGE_INTEGER out_size, err_size;
+    if (!GetFileSizeEx(output, &out_size) || !GetFileSizeEx(error, &err_size) ||
+        out_size.QuadPart > 8192 || err_size.QuadPart > 8192) goto finish;
+    if (waited == WAIT_OBJECT_0) break;
+    if (waited != WAIT_TIMEOUT || GetTickCount64() >= deadline) goto finish;
+  }
+  if (!GetExitCodeProcess(pi.hProcess, &code)) goto finish;
+  deadline = GetTickCount64() + 2000u;
+  for (;;) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation,
+        &accounting, (DWORD)sizeof(accounting), NULL)) goto finish;
+    if (accounting.ActiveProcesses == 0u) break;
+    if (GetTickCount64() >= deadline) goto finish;
+    Sleep(10u);
+  }
+  accepted = 1;
+finish:
+  if (!accepted && pi.hProcess) {
+    /* If assignment failed, the exact still-suspended child remains ours. */
+    if (job && !TerminateJobObject(job, 90u)) cleanup_ok = 0;
+    if (WaitForSingleObject(pi.hProcess, 0u) != WAIT_OBJECT_0 &&
+        !TerminateProcess(pi.hProcess, 90u)) cleanup_ok = 0;
+    if (WaitForSingleObject(pi.hProcess, 2000u) != WAIT_OBJECT_0) cleanup_ok = 0;
+  }
+  if (pi.hThread && !CloseHandle(pi.hThread)) cleanup_ok = 0;
+  if (pi.hProcess && !CloseHandle(pi.hProcess)) cleanup_ok = 0;
+  if (input != INVALID_HANDLE_VALUE && !CloseHandle(input)) cleanup_ok = 0;
+  if (output != INVALID_HANDLE_VALUE && !CloseHandle(output)) cleanup_ok = 0;
+  if (error != INVALID_HANDLE_VALUE && !CloseHandle(error)) cleanup_ok = 0;
+  if (job && !CloseHandle(job)) cleanup_ok = 0;
+  if (!accepted || !cleanup_ok) {
+    fputs("public invocation process/Job receipt is unverified\n", stderr);
+    return 90;
+  }
+  printf("{\"child_exit_code\":%ld,\"job_natural_zero\":true,"
+         "\"termination_attempted\":false}\n", (long)(LONG)code);
+  return 0;
+}
+#endif
+
+int main(int argc, char **argv) {
+  if (argc == 5 && strcmp(argv[1], "--write-public-invocation") == 0)
+    return write_public_invocation(argv[2], argv[3], argv[4]);
+  if (argc == 5 && strcmp(argv[1], "--run-public-invocation") == 0) {
+#ifdef _WIN32
+    return run_public_invocation(argv[2], argv[3], argv[4]);
+#else
+    fputs("public PowerShell invocation requires Windows\n", stderr);
+    return 2;
+#endif
+  }
+  require_true(argc == 1, "unknown Agent update contract test mode");
   test_installed_task_readiness_path();
   const char *valid =
       "{\"schema\":\"edr.agent_update.v1\",\"task_id\":\"task-1\","

@@ -25,6 +25,7 @@ RUNTIME_GATE = ROOT / "cmake" / "AgentRuntimeGate.cmake"
 LABEL = "^windows-release-gate$"
 WINDOWS_EXPECTED = {
     "agent_update_command_contract", "agent_update_packaging_contract",
+    "windows_agent_update_invocation",
     "windows_headless_runtime_contract", "command_registry_and_payload_contract",
     "windows_headless_log_stream_initialization",
     "command_process_identity_and_receipts",
@@ -228,6 +229,56 @@ class WindowsReleaseGateTests(unittest.TestCase):
             source, build, _ = self.fixture(directory, missing_test=name)
             result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
             self.assertIn("Windows release gate test is not registered: " + name, result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, failing_test=name)
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                      "-R", "^" + name + "$", "--no-tests=error", "--output-on-failure", success=False)
+            self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
+            self.assertNotIn("***Not Run", result.stdout)
+
+    def test_update_invocation_uses_actual_contract_target_and_checkout_driver(self):
+        production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
+        start = production.index("  # Run the actual C-generated caller")
+        end = production.index("\nendif()", start)
+        fragment = production[start:end].replace(
+            "${CMAKE_CURRENT_SOURCE_DIR}", (ROOT / "tests").as_posix())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "fixture.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (source / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\nproject(UpdaterInvocationPin C)\nenable_testing()\n"
+                "add_executable(test_agent_update_contract fixture.c)\n" + fragment,
+                encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            listed = self.run_command("ctest", "--test-dir", str(build), "--show-only=json-v1")
+            tests = json.loads(listed.stdout)["tests"]
+            self.assertEqual([test["name"] for test in tests], ["windows_agent_update_invocation"])
+            command = tests[0]["command"]
+            driver = ROOT / "tests/cache-recovery/windows_cache_recovery_ci.ps1"
+            expected = hashlib.sha256(driver.read_bytes()).hexdigest()
+            self.assertIn("--unset=PSModulePath", command)
+            self.assertIn("powershell.exe", command)
+            self.assertIn("-DriverSha256 '" + expected + "'", command[-1])
+            self.assertIn("-DriverSource '" + driver.as_posix() + "'", command[-1])
+            executable = re.search(r"-ContractExe '([^']+)'", command[-1])
+            self.assertIsNotNone(executable)
+            selected = Path(executable.group(1))
+            self.assertEqual(selected.parent.resolve(), build.resolve())
+            self.assertEqual(selected.name, "test_agent_update_contract" + (".exe" if os.name == "nt" else ""))
+            properties = {item["name"]: item["value"] for item in tests[0]["properties"]}
+            self.assertEqual(properties["TIMEOUT"], 90)
+            self.assertEqual(len(properties["ENVIRONMENT"]), 1)
+            self.assertTrue(properties["ENVIRONMENT"][0].startswith("PSModulePath="))
+
+    def test_update_invocation_is_required_and_failure_blocks_windows_gate(self):
+        name = "windows_agent_update_invocation"
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, pairs = self.fixture(directory, missing_test=name)
+            self.assertEqual(dict(pairs)[name], "test_agent_update_contract")
+            result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
+            self.assertIn("Windows release gate test is not registered: " + name, " ".join(result.stderr.split()))
         with tempfile.TemporaryDirectory() as directory:
             source, build, _ = self.fixture(directory, failing_test=name)
             self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")

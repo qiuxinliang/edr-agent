@@ -479,6 +479,18 @@ function ReadStopLogSlice($Context,[long]$ElapsedMs) {
       $counts=@();for($field=4;$field -le 7;$field++){$value=[uint64]0;Need ([uint64]::TryParse($fields[$field],[ref]$value)) 'stop_log_numeric_shape';$counts+=,$value}
       # Independent loads only; this numeric frontier is not an atomic stack.
       $match=@{kind='preprocess_worker_join';wait_rc=[uint32]$fields[0];error=[uint32]$fields[1];phase=@([int]$fields[2],[int]$fields[3]);loops=@($counts[0],$counts[1]);slots=@($counts[2],$counts[3]);stop=[int]$fields[8];exited=[int]$fields[9]}
+    }elseif($line -cmatch '^\[preprocess\] stop queue diagnostic bus_before_known=([0-9]{1,20}) bus_after_known=([0-9]{1,20}) bus_before_used=([0-9]{1,20}) bus_after_used=([0-9]{1,20}) bus_before_pushed=([0-9]{1,20}) bus_after_pushed=([0-9]{1,20}) bus_before_dropped=([0-9]{1,20}) bus_after_dropped=([0-9]{1,20}) pmfe_before_running=([0-9]{1,20}) pmfe_after_running=([0-9]{1,20}) pmfe_before_active=([0-9]{1,20}) pmfe_after_active=([0-9]{1,20}) pmfe_before_submitted=([0-9]{1,20}) pmfe_after_submitted=([0-9]{1,20}) pmfe_before_completed=([0-9]{1,20}) pmfe_after_completed=([0-9]{1,20}) pmfe_before_dropped=([0-9]{1,20}) pmfe_after_dropped=([0-9]{1,20})$'){
+      $fields=@();for($field=1;$field -le 18;$field++){$fields+=,[string]$Matches[$field]}
+      $values=@();foreach($field in $fields){$value=[uint64]0;Need ([uint64]::TryParse($field,[ref]$value)) 'stop_log_numeric_shape';$values+=,$value}
+      Need ($values[0] -le 1 -and $values[1] -le 1 -and $values[2] -le 65536 -and $values[3] -le 65536 -and $values[8] -le 1 -and $values[9] -le 1) 'stop_log_numeric_shape'
+      for($field=10;$field -lt 18;$field++){Need ($values[$field] -le [uint32]::MaxValue) 'stop_log_numeric_shape'}
+      $bus=@();for($side=0;$side -lt 2;$side++){
+        $known=$values[$side] -eq 1
+        if($known){$bus+=,@{known=$true;used=$values[2+$side];pushed=$values[4+$side];dropped=$values[6+$side]}}
+        else{Need ($values[2+$side] -eq 0 -and $values[4+$side] -eq 0 -and $values[6+$side] -eq 0) 'stop_log_numeric_shape';$bus+=,@{known=$false;used=$null;pushed=$null;dropped=$null}}
+      }
+      # Independent stop-boundary loads; no inferred pending count or cause.
+      $match=@{kind='preprocess_stop_queues';bus=$bus;pmfe=@{running=@($values[8],$values[9]);active=@($values[10],$values[11]);submitted=@($values[12],$values[13]);completed=@($values[14],$values[15]);dropped=@($values[16],$values[17]);pending_known=$false;pending=$null}}
     }elseif($line -ceq '[preprocess] shutdown timed out; retaining worker dependencies'){$match=@{kind='preprocess_thread_join_timeout'}}
     elseif($line -ceq '[preprocess] shutdown timed out: AVE still owns the batch sink'){$match=@{kind='preprocess_AVE_drain_timeout'}}
     elseif($line -ceq '[preprocess] shutdown failed: pending batch has no durable owner'){$match=@{kind='preprocess_batch_handoff_failed'}}
@@ -833,7 +845,7 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $paramFile=Join-Path $script:root ($Label+'.parameters.xml');$params | Export-Clixml -LiteralPath $paramFile
     $invoke=Join-Path $script:root ($Label+'.invoke.ps1')
     Need ($Updater -notmatch "['\r\n]" -and $paramFile -notmatch "['\r\n]") 'invocation_path'
-    [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;exit `$LASTEXITCODE"),[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;`$updaterSucceeded=`$?;if(`$updaterSucceeded){exit 0};if((Test-Path variable:LASTEXITCODE) -and `$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0){exit `$LASTEXITCODE};exit 1"),[Text.UTF8Encoding]::new($false))
     Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;runtime_mode=$script:runtimeMode;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
     $diagnostic.phase='launch'
     $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))

@@ -246,6 +246,23 @@ uint32_t edr_event_bus_used_approx(EdrEventBus *bus) {
   return n;
 }
 
+bool edr_event_bus_try_snapshot(EdrEventBus *bus, EdrEventBusSnapshot *out) {
+  if (!bus || !out || !bus->mu_inited || !TryEnterCriticalSection(&bus->mu)) {
+    return false;
+  }
+  out->used = bus->count;
+  out->pushed = bus->pushed;
+  out->dropped = bus->dropped;
+  LeaveCriticalSection(&bus->mu);
+  return true;
+}
+
+#ifdef EDR_EVENT_BUS_TESTING
+/* Compiled only into the existing event-bus test target. */
+void edr_event_bus_test_lock(EdrEventBus *bus) { EnterCriticalSection(&bus->mu); }
+void edr_event_bus_test_unlock(EdrEventBus *bus) { LeaveCriticalSection(&bus->mu); }
+#endif
+
 uint64_t edr_event_bus_dropped_total(EdrEventBus *bus) {
   if (!bus || !bus->mu_inited) {
     return 0u;
@@ -518,6 +535,16 @@ uint32_t edr_event_bus_used_approx(EdrEventBus *bus) {
   }
   const uint64_t u = h - t;
   return (uint32_t)(u > (uint64_t)bus->cap ? (uint64_t)bus->cap : u);
+}
+
+bool edr_event_bus_try_snapshot(EdrEventBus *bus, EdrEventBusSnapshot *out) {
+  if (!bus || !out) {
+    return false;
+  }
+  out->used = edr_event_bus_used_approx(bus);
+  out->pushed = atomic_load_explicit(&bus->pushed, memory_order_relaxed);
+  out->dropped = atomic_load_explicit(&bus->dropped, memory_order_relaxed);
+  return true;
 }
 
 uint64_t edr_event_bus_dropped_total(EdrEventBus *bus) {

@@ -94,6 +94,92 @@ static void make_dummy_slot(EdrEventSlot *o) {
   memcpy(o->data, "ABCD", 4u);
 }
 
+#if defined(_WIN32) && defined(EDR_EVENT_BUS_TESTING)
+/* Test-only owner hooks; no production header or runtime API exposes them. */
+void edr_event_bus_test_lock(EdrEventBus *bus);
+void edr_event_bus_test_unlock(EdrEventBus *bus);
+typedef struct { EdrEventBus *bus; HANDLE locked, release; DWORD held_wait; } SnapshotBusy;
+static DWORD WINAPI snapshot_hold_lock(void *value) {
+  SnapshotBusy *a = (SnapshotBusy *)value;
+  edr_event_bus_test_lock(a->bus);
+  SetEvent(a->locked);
+  a->held_wait = WaitForSingleObject(a->release, 1000u);
+  edr_event_bus_test_unlock(a->bus);
+  return 0;
+}
+static int test_snapshot_busy(EdrEventBus *bus) {
+  SnapshotBusy *a = (SnapshotBusy *)calloc(1, sizeof(*a));
+  HANDLE thread = NULL;
+  int failed = 1;
+  if (!a) return 1;
+  a->bus = bus; a->held_wait = WAIT_FAILED;
+  a->locked = CreateEventW(NULL, TRUE, FALSE, NULL);
+  a->release = CreateEventW(NULL, TRUE, FALSE, NULL);
+  if (!a->locked || !a->release) goto done;
+  thread = CreateThread(NULL, 0, snapshot_hold_lock, a, 0, NULL);
+  if (!thread) goto done;
+  if (WaitForSingleObject(a->locked, 2000u) == WAIT_OBJECT_0) {
+    EdrEventBusSnapshot value = {7u, 999u, 888u};
+    int known = edr_event_bus_try_snapshot(bus, &value);
+    failed = known || value.used != 7u ||
+             value.pushed != 999u || value.dropped != 888u;
+  }
+  SetEvent(a->release);
+  /* Finite holder timeout also makes an accidentally waiting snapshot fail. */
+  if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0) {
+    /* Fail the test process retaining these thread-owned dependencies. */
+    fprintf(stderr, "snapshot holder join unknown\n");
+    return 2;
+  }
+  if (a->held_wait != WAIT_OBJECT_0) failed = 1;
+done:
+  if (thread) CloseHandle(thread);
+  if (a->release) CloseHandle(a->release);
+  if (a->locked) CloseHandle(a->locked);
+  free(a);
+  return failed;
+}
+#endif
+
+static int test_stop_snapshot(void) {
+  EdrEventBusSnapshot value = {7u, 999u, 888u};
+  EdrEventBus *bus = edr_event_bus_create(8u);
+  EdrEventSlot slot, out;
+  int failed = 1;
+  if (!bus) return 1;
+  make_dummy_slot(&slot); slot.p0_critical = 1u;
+  if (edr_event_bus_try_snapshot(NULL, &value) || value.used != 7u ||
+      value.pushed != 999u || value.dropped != 888u ||
+      edr_event_bus_try_snapshot(bus, NULL)) goto done;
+  if (!edr_event_bus_try_snapshot(bus, &value) || value.used ||
+      value.pushed || value.dropped) goto done;
+  for (unsigned i = 0; i < 8u; ++i) {
+    slot.timestamp_ns = i + 1u;
+    if (!edr_event_bus_try_push(bus, &slot)) goto done;
+    if (i == 3u && (!edr_event_bus_try_snapshot(bus, &value) ||
+        value.used != 4u || value.pushed != 4u || value.dropped)) goto done;
+  }
+  if (edr_event_bus_try_push(bus, &slot) ||
+      !edr_event_bus_try_snapshot(bus, &value) || value.used != 8u ||
+      value.pushed != 8u || value.dropped != 1u) goto done;
+#if defined(_WIN32) && defined(EDR_EVENT_BUS_TESTING)
+  int busy_result = test_snapshot_busy(bus);
+  if (busy_result == 2) return 1; /* retain bus until test-process exit */
+  if (busy_result) goto done;
+  if (!edr_event_bus_try_snapshot(bus, &value) || value.used != 8u ||
+      value.pushed != 8u || value.dropped != 1u) goto done;
+#endif
+  for (unsigned i = 0; i < 8u; ++i)
+    if (!edr_event_bus_try_pop(bus, &out) || out.timestamp_ns != i + 1u) goto done;
+  if (!edr_event_bus_try_snapshot(bus, &value) || value.used ||
+      value.pushed != 8u || value.dropped != 1u) goto done;
+  failed = 0;
+done:
+  edr_event_bus_destroy(bus);
+  if (failed) fprintf(stderr, "stop snapshot contract failed\n");
+  return failed;
+}
+
 static int test_rejected_types(void) {
   EdrEventBus *bus = edr_event_bus_create(4u);
   EdrEventSlot s;
@@ -363,6 +449,7 @@ static int run_mpmc(uint32_t duration_ms, int nprod, uint32_t cap) {
 }
 
 int main(int argc, char **argv) {
+  if (test_stop_snapshot() != 0) return 1;
   if (test_rejected_types() != 0) {
     fprintf(stderr, "rejected event type accounting failed\n");
     return 1;

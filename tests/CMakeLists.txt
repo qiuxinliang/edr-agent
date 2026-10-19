@@ -286,6 +286,16 @@ if(WIN32)
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_health.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>' -RepoRoot '${CMAKE_SOURCE_DIR}'")
   set_tests_properties(windows_installer_health_behavior PROPERTIES TIMEOUT 120)
+  # Run the actual C-generated caller and the pinned recovery caller on public scripts.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/cache-recovery/windows_cache_recovery_ci.ps1")
+  file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/cache-recovery/windows_cache_recovery_ci.ps1"
+    _edr_update_invocation_driver_sha256)
+  add_test(NAME windows_agent_update_invocation
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_agent_update_invocation.ps1' -Raw -Encoding UTF8))) -ContractExe '$<TARGET_FILE:test_agent_update_contract>' -DriverSource '${CMAKE_CURRENT_SOURCE_DIR}/cache-recovery/windows_cache_recovery_ci.ps1' -DriverSha256 '${_edr_update_invocation_driver_sha256}'")
+  set_tests_properties(windows_agent_update_invocation PROPERTIES TIMEOUT 90
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
 endif()
 
 add_executable(test_command_executor ${CMAKE_CURRENT_SOURCE_DIR}/test_command_executor.c
@@ -795,6 +805,7 @@ add_executable(test_event_bus_mpmc_stress
   ${CMAKE_CURRENT_SOURCE_DIR}/test_event_bus_mpmc_stress.c
   ${CMAKE_SOURCE_DIR}/src/core/event_bus.c)
 target_include_directories(test_event_bus_mpmc_stress PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_event_bus_mpmc_stress PRIVATE EDR_EVENT_BUS_TESTING=1)
 if(UNIX AND NOT WIN32)
   target_link_libraries(test_event_bus_mpmc_stress PRIVATE Threads::Threads)
 endif()
