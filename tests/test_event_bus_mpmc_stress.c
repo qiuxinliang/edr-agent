@@ -103,7 +103,7 @@ static DWORD WINAPI snapshot_hold_lock(void *value) {
   SnapshotBusy *a = (SnapshotBusy *)value;
   edr_event_bus_test_lock(a->bus);
   SetEvent(a->locked);
-  a->held_wait = WaitForSingleObject(a->release, 1000u);
+  a->held_wait = WaitForMultipleObjects(1u, &a->release, TRUE, 1000u);
   edr_event_bus_test_unlock(a->bus);
   return 0;
 }
@@ -118,7 +118,7 @@ static int test_snapshot_busy(EdrEventBus *bus) {
   if (!a->locked || !a->release) goto done;
   thread = CreateThread(NULL, 0, snapshot_hold_lock, a, 0, NULL);
   if (!thread) goto done;
-  if (WaitForSingleObject(a->locked, 2000u) == WAIT_OBJECT_0) {
+  if (WaitForMultipleObjects(1u, &a->locked, TRUE, 2000u) == WAIT_OBJECT_0) {
     EdrEventBusSnapshot value = {7u, 999u, 888u};
     int known = edr_event_bus_try_snapshot(bus, &value);
     failed = known || value.used != 7u ||
@@ -126,7 +126,7 @@ static int test_snapshot_busy(EdrEventBus *bus) {
   }
   SetEvent(a->release);
   /* Finite holder timeout also makes an accidentally waiting snapshot fail. */
-  if (WaitForSingleObject(thread, 2000u) != WAIT_OBJECT_0) {
+  if (WaitForMultipleObjects(1u, &thread, TRUE, 2000u) != WAIT_OBJECT_0) {
     /* Fail the test process retaining these thread-owned dependencies. */
     fprintf(stderr, "snapshot holder join unknown\n");
     return 2;
