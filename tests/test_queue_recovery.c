@@ -1,4 +1,11 @@
 #include "edr/storage_queue.h"
+#include "edr/behavior_proto.h"
+#include "edr/behavior_record.h"
+#include "edr/ave_sdk.h"
+#include "edr/event_batch.h"
+#include "edr/process_generation.h"
+#include <stdatomic.h>
+#include <time.h>
 #include "edr/egress_batch_policy.h"
 #include "edr/evidence_projection.h"
 #include "edr/report_events_ack.h"
@@ -49,11 +56,14 @@ static void test_path(char *out,size_t cap,const char *name,int suffix) {
 #endif
   assert(used>0 && (size_t)used<cap);
 }
+static int load_active;
+static int load_transport(const char *,const uint8_t *,size_t,const uint8_t *,size_t);
 int edr_ingest_http_configured(void) { return 1; }
 int edr_ingest_http_circuit_open(void) { return 0; }
 int edr_ingest_http_telemetry_deferred(void) { return 0; }
 int edr_transport_v2_report_events(const char *id,const uint8_t *header,size_t hlen,
     const uint8_t *payload,size_t plen) {
+  if(load_active)return load_transport(id,header,hlen,payload,plen);
   char why[96]; assert(hlen==12 && hlen+plen<=sizeof(sent_wire));
   assert(edr_egress_batch_validate(header,hlen,payload,plen,why,sizeof(why)));
   snprintf(sent_id,sizeof(sent_id),"%s",id); sent_len=hlen+plen;
@@ -1172,7 +1182,264 @@ static void local_recovery_audit_capacity_and_handoff(void) {
   puts("local recovery audit: canonical scope/tuple/field proof, finite reserve, terminal20+journal, FULL rollback/handoff, TTL and zero ACK passed");
 }
 
+/* Opt-in synthetic load for the existing real-codec/SQLite target only.
+ * No matcher/action/HTTP runs. Only necessary intent/combined frames can get
+ * synthetic receipts through the production ACK parser. Local sources never do.
+ */
+#define LOAD_OWNERS 64u
+static int load_receipt_mode;
+static unsigned load_attempts,load_exact_acks,load_bad_acks;
+static uint64_t load_started,load_peak_observed;
+static unsigned load_ordinary_rows;
+static const char *load_profile;
+typedef struct {
+  EdrTestP0TerminalFixture f;
+  size_t local_intent_len,command_bytes;
+  EdrStorageQueueLocalEvidenceOwner local;
+  char intent_id[64],source_id[64],combined_id[64];
+  int created,enqueue_result;
+} LoadOwner;
+static LoadOwner load_owners[LOAD_OWNERS+2u];
+static atomic_uint load_ready,load_go;
+static void load_poll(void) {
+  /* The production drain clamps its interval to at least 200ms. */
+#ifdef _WIN32
+  Sleep(210u);
+#else
+  usleep(210000u);
+#endif
+  edr_storage_queue_poll_drain();
+}
+static void load_bound(void) {
+  assert(edr_monotonic_ns()-load_started<UINT64_C(120000000000));
+}
+static int load_transport(const char *id,const uint8_t *header,size_t hlen,const uint8_t *body,size_t len) {
+  if(strncmp(id,"load-i-",7u) && strncmp(id,"load-c-",7u)) return -1;
+  char why[96],sha[65],receipt[640];
+  assert(hlen==12u && len>4u && hlen+len<=EDR_EVENT_BATCH_CAP);
+  assert(edr_egress_batch_validate(header,hlen,body,len,why,sizeof(why)));
+  edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));assert(event);
+  pb_istream_t input=pb_istream_from_buffer(body+4u,len-4u);
+  assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,event));
+  assert(!event->cmdline[0] && !event->process_context.parent_cmdline[0]);free(event);
+  uint8_t *wire=malloc(hlen+len);assert(wire);memcpy(wire,header,hlen);memcpy(wire+hlen,body,len);
+  assert(!edr_sha256_hex(wire,hlen+len,sha));free(wire);load_attempts++;
+  if(!load_receipt_mode)return -1;
+  snprintf(receipt,sizeof(receipt),"{\"code\":\"OK\",\"data\":{\"accepted\":1,\"invalid_frames\":0,\"ack\":{\"version\":1,\"state\":\"processed\",\"endpoint_id\":\"synthetic-endpoint\",\"batch_id\":\"%s\",\"payload_sha256\":\"%s\",\"frame_count\":1}}}",load_receipt_mode==2?"wrong-owned-batch":id,sha);
+  int ok=edr_report_events_acknowledged(receipt,"synthetic-endpoint",id,header,hlen,body,len);
+  if(load_receipt_mode==2){assert(!ok);load_bad_acks++;}else{assert(ok);load_exact_acks++;}
+  return ok?0:-1;
+}
+static uint8_t *load_encode(const EdrBehaviorRecord *r,const AVEBehaviorAlert *a,
+    const char *subject,const char *parent,int outbound,size_t *length) {
+  uint8_t *wire=malloc(EDR_EVENT_BATCH_CAP);assert(wire);
+  size_t n=outbound?edr_behavior_record_encode_protobuf_facts(r,a,subject,parent,wire+16u,EDR_EVENT_BATCH_CAP-16u):
+      edr_behavior_record_encode_protobuf_full_facts(r,a,subject,parent,wire+16u,EDR_EVENT_BATCH_CAP-16u);
+  assert(n>0u);wr(wire,EDR_TRANSPORT_BATCH_MAGIC_RAW);wr(wire+4u,1u);wr(wire+8u,(uint32_t)n+4u);wr(wire+12u,(uint32_t)n);
+  *length=n+16u;return wire;
+}
+static void load_make_owner(LoadOwner *o,unsigned index,size_t command_bytes) {
+  assert(edr_test_p0_terminal_fixture_init(&o->f,10000u+index,"synthetic-tenant","synthetic-endpoint"));
+  o->command_bytes=command_bytes;
+  char *subject=malloc(command_bytes+1u),*parent=malloc(command_bytes+1u);assert(subject && parent);
+  memset(subject,'S',command_bytes);subject[command_bytes]=0;memset(parent,'P',command_bytes);parent[command_bytes]=0;
+  for(unsigned kind=0u;kind<3u;kind++) {
+    edr_v1_BehaviorEvent *event=calloc(1,sizeof(*event));EdrBehaviorRecord *r=calloc(1,sizeof(*r));
+    AVEBehaviorAlert *alert=calloc(1,sizeof(*alert));assert(event && r && alert);
+    pb_istream_t input=pb_istream_from_buffer(o->f.wire[kind]+16u,o->f.length[kind]-16u);
+    assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,event));
+    r->type=(EdrEventType)event->type;r->pid=event->pid;r->ppid=4u;r->event_time_ns=event->event_time_ns;
+    r->priority=0u;r->parent_pid_state=EDR_PARENT_PID_KNOWN;r->process_start_key=event->process_start_key;
+    r->process_creation_filetime_100ns=event->process_creation_filetime_100ns;
+    r->parent_process_start_key=4u;r->parent_process_creation_filetime_100ns=UINT64_C(133444000000000001);
+    r->evidence_projection_version=EDR_EVIDENCE_PROJECTION_VERSION;r->required_evidence_fields=0u;
+    snprintf(r->event_id,sizeof(r->event_id),"%s",event->event_id);
+    snprintf(r->endpoint_id,sizeof(r->endpoint_id),"%s",event->endpoint_id);snprintf(r->tenant_id,sizeof(r->tenant_id),"%s",event->tenant_id);
+    snprintf(r->process_name,sizeof(r->process_name),"synthetic.exe");snprintf(r->parent_name,sizeof(r->parent_name),"parent.exe");
+    snprintf(r->exe_path,sizeof(r->exe_path),"%s",event->exe_path);snprintf(r->image_path_canonical,sizeof(r->image_path_canonical),"%s",event->image_path_canonical);
+    snprintf(r->detection_context,sizeof(r->detection_context),"%s",event->ave_result_json);
+    alert->pid=event->pid;alert->timestamp_ns=event->event_time_ns;alert->anomaly_score=0.9f;
+    snprintf(alert->process_path,sizeof(alert->process_path),"%s",event->behavior_alert.process_path);
+    snprintf(alert->user_subject_json,sizeof(alert->user_subject_json),"%s",event->behavior_alert.user_subject_json);
+    if(kind==0u){size_t n=0u;uint8_t *full=load_encode(r,NULL,subject,parent,0,&n);o->local_intent_len=n;free(full);}
+    free(o->f.wire[kind]);o->f.wire[kind]=load_encode(r,kind==2u?alert:NULL,subject,parent,kind!=1u,&o->f.length[kind]);
+    if(kind==1u) {
+      edr_v1_BehaviorEvent *decoded=calloc(1,sizeof(*decoded));assert(decoded);
+      input=pb_istream_from_buffer(o->f.wire[kind]+16u,o->f.length[kind]-16u);
+      assert(pb_decode(&input,edr_v1_BehaviorEvent_fields,decoded));
+      assert(strlen(decoded->cmdline)==command_bytes && !strcmp(decoded->cmdline,subject));
+      assert(strlen(decoded->process_context.parent_cmdline)==command_bytes && !strcmp(decoded->process_context.parent_cmdline,parent));free(decoded);
+      o->local=(EdrStorageQueueLocalEvidenceOwner){1u,"enforcement_terminal_result","synthetic-endpoint","synthetic-tenant",r->event_time_ns,(uint32_t)r->type,r->pid,r->ppid,r->process_start_key,r->process_creation_filetime_100ns,r->parent_process_start_key,r->parent_process_creation_filetime_100ns};
+    }
+    free(alert);free(r);free(event);
+  }
+  free(subject);free(parent);
+  snprintf(o->intent_id,sizeof(o->intent_id),"load-i-%05u",index);snprintf(o->source_id,sizeof(o->source_id),"load-s-%05u",index);snprintf(o->combined_id,sizeof(o->combined_id),"load-c-%05u",index);
+}
+static uint8_t *load_ordinary(unsigned index,size_t count,size_t *length) {
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);assert(count>0u && count<EDR_PROCESS_COMMAND_FACT_CAP);
+  char *command=malloc(count+1u);assert(command);memset(command,'O',count);command[count]=0;
+  r->type=EDR_EVENT_PROCESS_CREATE;r->pid=1234u;r->ppid=4u;r->event_time_ns=1700000000000000000LL+index;
+  r->process_start_key=1234u;r->process_creation_filetime_100ns=UINT64_C(133444000000000000);
+  snprintf(r->event_id,sizeof(r->event_id),"ordinary-source-%05u",index);strcpy(r->tenant_id,"synthetic-tenant");strcpy(r->endpoint_id,"synthetic-endpoint");
+  uint8_t *wire=load_encode(r,NULL,command,command,0,length);free(command);free(r);return wire;
+}
+static uint64_t load_inventory(const char *path) {
+  assert(!sql_number(path,"SELECT COUNT(*) FROM event_queue WHERE retention_policy_version=2;"));
+  assert(!sql_number(path,"SELECT COUNT(*) FROM p0_deferred_match;"));
+  assert(!sql_number(path,"SELECT COUNT(*) FROM queue_projection_relations;"));
+  uint64_t total=sql_number(path,"SELECT COALESCE(SUM(length(CAST(batch_id AS BLOB))+length(payload)+512+CASE WHEN recovery_version>0 THEN 512 ELSE 0 END),0) FROM event_queue;");
+  total+=sql_number(path,"SELECT COALESCE(SUM(length(CAST(idempotency_key AS BLOB))+length(CAST(source_event_key AS BLOB))+length(CAST(rule_id AS BLOB))+length(CAST(process_generation_key AS BLOB))+15+length(CAST(intent_batch_id AS BLOB))+COALESCE(length(intent_wire),0)+1024+MAX(length(CAST(source_batch_id AS BLOB))+COALESCE(length(source_wire),0)+length(CAST(combined_batch_id AS BLOB))+COALESCE(length(combined_wire),0),reserved_bytes)+CASE WHEN retention_policy_version=3 THEN 2048 ELSE 0 END),0) FROM enforcement_terminal_journal;");
+  EdrStorageQueueCapacityMetrics m;edr_storage_queue_get_capacity_metrics(&m);assert(m.accounting_available && m.used_bytes==total);return total;
+}
+static void load_ordinary_digest(const char *path,char out[65]) {
+  sqlite3 *db=db_open(path);sqlite3_stmt *st=NULL;assert(sqlite3_prepare_v2(db,"SELECT batch_id,payload FROM event_queue WHERE batch_id LIKE 'load-o-%' ORDER BY batch_id;",-1,&st,NULL)==SQLITE_OK);
+  EdrSha256Ctx hash;edr_sha256_init(&hash);unsigned count=0u;int rc;
+  while((rc=sqlite3_step(st))==SQLITE_ROW) {const uint8_t *id=sqlite3_column_text(st,0);size_t n=(size_t)sqlite3_column_bytes(st,1);uint8_t size[8];
+    for(unsigned i=0;i<8u;i++)size[i]=(uint8_t)(n>>(i*8u));edr_sha256_update(&hash,id,strlen((const char *)id)+1u);edr_sha256_update(&hash,size,sizeof(size));edr_sha256_update(&hash,sqlite3_column_blob(st,1),n);count++;}
+  assert(rc==SQLITE_DONE && count==load_ordinary_rows);sqlite3_finalize(st);sqlite3_close(db);
+  uint8_t digest[32];edr_sha256_final(&hash,digest);static const char hex[]="0123456789abcdef";
+  for(unsigned i=0;i<32u;i++){out[2u*i]=hex[digest[i]>>4u];out[2u*i+1u]=hex[digest[i]&15u];}out[64]=0;
+}
+static EdrStorageQueueCapacityMetrics load_point(const char *path,const char *stage,unsigned accepted,unsigned rejected) {
+  load_bound();EdrStorageQueueCapacityMetrics m;edr_storage_queue_get_capacity_metrics(&m);assert(m.used_bytes==load_inventory(path));
+  assert(!m.physical_admission_failures && !m.enqueue_transaction_failures && !m.enqueue_commit_failures);
+  assert(m.used_bytes<=m.max_bytes && m.physical_bytes<=UINT64_C(2147483648));
+  if(m.physical_bytes>load_peak_observed)load_peak_observed=m.physical_bytes;
+  printf("{\"kind\":\"critical_load_point\",\"profile\":\"%s\",\"stage\":\"%s\",\"elapsed_s\":%.6f,\"accepted\":%u,\"rejected\":%u,\"max\":%llu,\"used\":%llu,\"ordinary_limit\":%llu,\"terminal_reserve\":%llu,\"source_reserve\":%llu,\"journal\":%llu,\"db\":%llu,\"wal\":%llu,\"shm\":%llu,\"physical\":%llu,\"intent_acked\":%llu,\"combined_acked\":%llu,\"source_acked\":%llu}\n",load_profile,stage,(double)(edr_monotonic_ns()-load_started)/1e9,accepted,rejected,(unsigned long long)m.max_bytes,(unsigned long long)m.used_bytes,(unsigned long long)m.ordinary_limit_bytes,(unsigned long long)m.terminal_reserve_bytes,(unsigned long long)m.p0_source_only_reserve_bytes,(unsigned long long)m.terminal_journal_bytes,(unsigned long long)m.db_bytes,(unsigned long long)m.wal_bytes,(unsigned long long)m.shm_bytes,(unsigned long long)m.physical_bytes,(unsigned long long)sql_number(path,"SELECT COALESCE(SUM(intent_acked),0) FROM enforcement_terminal_journal;"),(unsigned long long)sql_number(path,"SELECT COALESCE(SUM(combined_acked),0) FROM enforcement_terminal_journal;"),(unsigned long long)sql_number(path,"SELECT COALESCE(SUM(source_acked),0) FROM enforcement_terminal_journal;"));fflush(stdout);return m;
+}
+static void load_source_check(const char *path,LoadOwner *o) {
+  sqlite3 *db=db_open(path);sqlite3_stmt *st=NULL;
+  assert(sqlite3_prepare_v2(db,"SELECT source_wire,source_acked,source_policy_held,retention_policy_version FROM enforcement_terminal_journal WHERE idempotency_key=?;",-1,&st,NULL)==SQLITE_OK);
+  sqlite3_bind_text(st,1,o->f.terminal_key,-1,SQLITE_STATIC);assert(sqlite3_step(st)==SQLITE_ROW);
+  assert(sqlite3_column_bytes(st,0)==(int)o->f.length[1] && !memcmp(sqlite3_column_blob(st,0),o->f.wire[1],o->f.length[1]));
+  assert(!sqlite3_column_int(st,1) && !sqlite3_column_int(st,2) && sqlite3_column_int(st,3)==3);assert(sqlite3_step(st)==SQLITE_DONE);sqlite3_finalize(st);sqlite3_close(db);
+}
+static void load_update(LoadOwner *o) {
+  assert(edr_storage_queue_enforcement_terminal_update_local_source(o->f.terminal_key,o->source_id,o->f.wire[1],o->f.length[1],o->combined_id,o->f.wire[2],o->f.length[2],o->f.source_event_id,&o->local)==EDR_OK);
+  int result=edr_storage_queue_enqueue(o->combined_id,o->f.wire[2],o->f.length[2],0,EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);
+  assert(result==EDR_OK || result==EDR_ERR_QUEUE_FULL);
+}
+#ifdef _WIN32
+static DWORD WINAPI load_producer(void *opaque) {
+#else
+static void *load_producer(void *opaque) {
+#endif
+  unsigned lane=*(unsigned *)opaque;atomic_fetch_add_explicit(&load_ready,1u,memory_order_release);
+  while(!atomic_load_explicit(&load_go,memory_order_acquire)){load_bound();
+#ifdef _WIN32
+    Sleep(1u);
+#else
+    usleep(1000u);
+#endif
+  }
+  for(unsigned i=lane;i<LOAD_OWNERS;i+=4u){LoadOwner *o=&load_owners[i];load_bound();
+    EdrEnforcementTerminalPrecreate result=edr_storage_queue_enforcement_terminal_precreate_local_source_bound(o->f.terminal_key,o->f.source_event_id,o->f.rule_id,o->f.generation_key,o->intent_id,o->f.wire[0],o->f.length[0],o->local_intent_len);
+    assert(result==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED || result==EDR_ENFORCEMENT_TERMINAL_PRECREATE_ERROR);o->created=result==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED;
+    if(o->created){o->enqueue_result=edr_storage_queue_enqueue(o->intent_id,o->f.wire[0],o->f.length[0],0,EDR_STORAGE_QUEUE_SEVERITY_TERMINAL);assert(o->enqueue_result==EDR_OK || o->enqueue_result==EDR_ERR_QUEUE_FULL);}
+    else break;
+  }
+  return 0;
+}
+/* Isolated immutable rule descriptor, as in the existing egress fixture.
+ * This is test authority, not a published/signed production IR evaluation. */
+static int load_rule_authority(const char *rule,const char *bundle,uint64_t mask,const char *operation,void *user) {
+  (void)user;
+  return rule && !strcmp(rule,"synthetic-p0-rule") && bundle &&
+      !strcmp(bundle,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") &&
+      mask==0u && (!operation || !*operation);
+}
+static int critical_reserve_load(const char *profile) {
+  unsigned q=!strcmp(profile,"mixed512")?512u:32u;assert(!strcmp(profile,"short32") || !strcmp(profile,"max32") || !strcmp(profile,"mixed512"));
+  load_profile=profile;load_started=edr_monotonic_ns();load_active=1;load_receipt_mode=0;
+  assert(!load_rule_authority("wrong-rule","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",0u,"",NULL));
+  assert(!load_rule_authority("synthetic-p0-rule","wrong-bundle",0u,"",NULL));
+  assert(!load_rule_authority("synthetic-p0-rule","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",1u,"",NULL));
+  edr_egress_set_rule_projection_validator(load_rule_authority,NULL);
+#ifndef _WIN32
+  assert(!setenv("EDR_QUEUE_DRAIN_INTERVAL_MS","0",1));assert(!setenv("EDR_QUEUE_DRAIN_MAX_ROWS","128",1));
+#else
+  assert(!_putenv_s("EDR_QUEUE_DRAIN_INTERVAL_MS","0"));assert(!_putenv_s("EDR_QUEUE_DRAIN_MAX_ROWS","128"));
+#endif
+  char path[512];test_path(path,sizeof(path),"critical-reserve-load",(int)q);FILE *prior=fopen(path,"rb");assert(!prior);
+  printf("{\"kind\":\"critical_load_begin\",\"profile\":\"%s\",\"database\":\"%s\",\"command_fact_cap\":%u}\n",profile,path,EDR_PROCESS_COMMAND_FACT_CAP);fflush(stdout);
+  edr_storage_queue_configure(q,72u);assert(edr_storage_queue_open(path)==EDR_OK);int64_t delivery=(int64_t)time(NULL);edr_storage_queue_test_set_delivery_time(delivery);
+  EdrStorageQueueCapacityMetrics initial=load_point(path,"empty",0u,0u);assert(initial.terminal_reserve_bytes==4194304u);
+  for(unsigned i=0;i<4096u;i++) {load_bound();size_t n=0u;uint8_t *wire=load_ordinary(i,EDR_PROCESS_COMMAND_FACT_CAP-1u,&n);char id[64];snprintf(id,sizeof(id),"load-o-%05u",i);
+    EdrError result=edr_storage_queue_enqueue(id,wire,n,0,0);free(wire);
+    if(result==EDR_ERR_QUEUE_FULL)break;assert(result==EDR_OK);load_ordinary_rows++;
+    if(!(i%64u)){EdrStorageQueueCapacityMetrics m;edr_storage_queue_get_capacity_metrics(&m);assert(m.physical_bytes<=UINT64_C(2147483648));if(m.physical_bytes>load_peak_observed)load_peak_observed=m.physical_bytes;}
+  }
+  assert(load_ordinary_rows>0u && load_ordinary_rows<4096u);
+  EdrStorageQueueCapacityMetrics large=load_point(path,"large_ordinary_saturated",0u,0u);
+  uint64_t gap=large.ordinary_limit_bytes-large.used_bytes;
+  unsigned low=1u,high=EDR_PROCESS_COMMAND_FACT_CAP-1u,best=0u;
+  char tail_id[64];snprintf(tail_id,sizeof(tail_id),"load-o-%05u",load_ordinary_rows);
+  while(low<=high){unsigned mid=low+(high-low)/2u;size_t n=0u;uint8_t *wire=load_ordinary(load_ordinary_rows,mid,&n);free(wire);
+    uint64_t cost=512u+strlen(tail_id)+n;if(cost<=gap){best=mid;low=mid+1u;}else high=mid-1u;}
+  if(best){size_t n=0u;uint8_t *wire=load_ordinary(load_ordinary_rows,best,&n);
+    assert(edr_storage_queue_enqueue(tail_id,wire,n,0,0)==EDR_OK);free(wire);load_ordinary_rows++;}
+  size_t smallest_len=0u;uint8_t *smallest=load_ordinary(load_ordinary_rows,1u,&smallest_len);
+  snprintf(tail_id,sizeof(tail_id),"load-o-%05u",load_ordinary_rows);
+  assert(edr_storage_queue_enqueue(tail_id,smallest,smallest_len,0,0)==EDR_ERR_QUEUE_FULL);free(smallest);
+  EdrStorageQueueCapacityMetrics saturated=load_point(path,"ordinary_saturated",0u,0u);
+  assert(saturated.ordinary_rejected>0u && saturated.used_bytes<=saturated.ordinary_limit_bytes);
+  char original[65],after[65];load_ordinary_digest(path,original);
+  size_t max=EDR_PROCESS_COMMAND_FACT_CAP-1u;
+  for(unsigned i=0u;i<LOAD_OWNERS+2u;i++){size_t n=!strcmp(profile,"short32")?32u:!strcmp(profile,"max32")?max:(i%2u?max:32u);load_make_owner(&load_owners[i],i,n);}
+  for(unsigned example=0u;example<2u;example++){LoadOwner *o=&load_owners[example];
+    size_t frame=o->local_intent_len+65552u;if(frame>EDR_EVENT_BATCH_CAP)frame=EDR_EVENT_BATCH_CAP;
+    uint64_t precreate=1024u+15u+strlen(o->f.terminal_key)+strlen(o->f.source_event_id)+strlen(o->f.rule_id)+strlen(o->f.generation_key)+strlen(o->intent_id)+o->f.length[0]+2u*(frame+255u)+2048u;
+    printf("{\"kind\":\"critical_load_encoding\",\"profile\":\"%s\",\"command_bytes_each\":%zu,\"intent_wire\":%zu,\"local_intent\":%zu,\"local_source\":%zu,\"combined\":%zu,\"precreate_charged\":%llu,\"immediate_intent_copy_charged\":%llu}\n",profile,o->command_bytes,o->f.length[0],o->local_intent_len,o->f.length[1],o->f.length[2],(unsigned long long)precreate,(unsigned long long)(512u+strlen(o->intent_id)+o->f.length[0]));fflush(stdout);}
+  /* The first rejected command size is derived from the encoder's real cap. */
+  EdrBehaviorRecord *invalid=calloc(1,sizeof(*invalid));char *too_large=malloc(EDR_PROCESS_COMMAND_FACT_CAP+1u);uint8_t *tmp=malloc(EDR_EVENT_BATCH_CAP);assert(invalid && too_large && tmp);
+  memset(too_large,'X',EDR_PROCESS_COMMAND_FACT_CAP);too_large[EDR_PROCESS_COMMAND_FACT_CAP]=0;
+  assert(!edr_behavior_record_encode_protobuf_full_facts(invalid,NULL,too_large,NULL,tmp,EDR_EVENT_BATCH_CAP));free(invalid);free(too_large);free(tmp);
+  unsigned lanes[4]={0u,1u,2u,3u};
+#ifdef _WIN32
+  HANDLE threads[4];for(unsigned i=0;i<4u;i++){threads[i]=CreateThread(NULL,0,load_producer,&lanes[i],0,NULL);assert(threads[i]);}
+#else
+  pthread_t threads[4];for(unsigned i=0;i<4u;i++)assert(!pthread_create(&threads[i],NULL,load_producer,&lanes[i]));
+#endif
+  while(atomic_load_explicit(&load_ready,memory_order_acquire)!=4u){load_bound();}
+  atomic_store_explicit(&load_go,1u,memory_order_release);
+  for(unsigned i=0;i<4u;i++){
+#ifdef _WIN32
+    assert(WaitForMultipleObjects(1u,&threads[i],TRUE,30000u)==WAIT_OBJECT_0);assert(CloseHandle(threads[i]));
+#else
+    assert(!pthread_join(threads[i],NULL));
+#endif
+  }
+  unsigned accepted=0u,rejected=0u,shorts=0u,longs=0u;LoadOwner *retry=NULL;
+  for(unsigned i=0;i<LOAD_OWNERS;i++){LoadOwner *o=&load_owners[i];if(o->created){accepted++;if(o->command_bytes==32u)shorts++;else longs++;}
+    else if(!retry)retry=o;
+  }
+  EdrEnforcementTerminalJournalMetrics jm;edr_storage_queue_enforcement_terminal_get_metrics(&jm);rejected=(unsigned)jm.precreate_rejected;
+  assert(accepted>0u && rejected>0u && accepted<LOAD_OWNERS && jm.precreate_created==accepted && !jm.precreate_transaction_failures && !jm.precreate_commit_failures && !jm.precreate_conflicts && jm.pending==accepted);
+  EdrStorageQueueCapacityMetrics held=load_point(path,"four_producer_intents_held",accepted,rejected);assert(held.high_priority_rejected>=rejected);
+  printf("{\"kind\":\"critical_load_geometry\",\"profile\":\"%s\",\"ordinary_rows\":%u,\"ordinary_remaining_gap\":%llu,\"short_accepted\":%u,\"max_accepted\":%u,\"short_or_max_command_bytes\":%zu,\"intent_wire\":%zu,\"local_intent\":%zu,\"local_source\":%zu,\"combined\":%zu,\"held_used_increment\":%llu}\n",profile,load_ordinary_rows,(unsigned long long)(saturated.ordinary_limit_bytes-saturated.used_bytes),shorts,longs,load_owners[0].command_bytes,load_owners[0].f.length[0],load_owners[0].local_intent_len,load_owners[0].f.length[1],load_owners[0].f.length[2],(unsigned long long)(held.used_bytes-saturated.used_bytes));fflush(stdout);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);assert(load_inventory(path)==held.used_bytes);load_point(path,"held_reopened_no_ack",accepted,rejected);
+  for(unsigned i=0;i<LOAD_OWNERS;i++)if(load_owners[i].created){load_update(&load_owners[i]);load_source_check(path,&load_owners[i]);}
+  load_point(path,"results_ready_no_ack",accepted,rejected);unsigned prior_attempts=load_attempts;
+  for(unsigned poll=0u;poll<(load_ordinary_rows+127u)/128u+3u && load_attempts==prior_attempts;poll++)load_poll();assert(load_attempts>prior_attempts && !load_exact_acks);assert(!sql_number(path,"SELECT COALESCE(SUM(intent_acked+combined_acked+source_acked),0) FROM enforcement_terminal_journal;"));load_point(path,"no_ack_poll_retained",accepted,rejected);
+  load_receipt_mode=2;edr_storage_queue_test_set_delivery_time(delivery+2);load_poll();assert(load_bad_acks>0u && !load_exact_acks);assert(!sql_number(path,"SELECT COALESCE(SUM(intent_acked+combined_acked+source_acked),0) FROM enforcement_terminal_journal;"));load_point(path,"wrong_ack_retained",accepted,rejected);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);load_point(path,"wrong_ack_reopened",accepted,rejected);
+  load_receipt_mode=1;
+  for(unsigned poll=0u;poll<64u && sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE intent_acked=0 OR combined_acked=0;");poll++){load_bound();edr_storage_queue_test_set_delivery_time(delivery+3600+(int64_t)poll*60);load_poll();}
+  assert(sql_number(path,"SELECT COUNT(*) FROM enforcement_terminal_journal WHERE state='local_retained' AND retention_policy_version=3 AND source_acked=0;")==accepted);assert(load_exact_acks==accepted*2u);
+  for(unsigned i=0;i<LOAD_OWNERS;i++)if(load_owners[i].created)load_source_check(path,&load_owners[i]);
+  load_point(path,"delayed_exact_ack_sources_retained",accepted,rejected);
+  assert(retry);assert(edr_storage_queue_enforcement_terminal_precreate_local_source_bound(retry->f.terminal_key,retry->f.source_event_id,retry->f.rule_id,retry->f.generation_key,retry->intent_id,retry->f.wire[0],retry->f.length[0],retry->local_intent_len)==EDR_ENFORCEMENT_TERMINAL_PRECREATE_CREATED);
+  retry->created=1;load_update(retry);load_source_check(path,retry);load_point(path,"rejected_owner_readmitted",accepted+1u,rejected);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);load_source_check(path,retry);load_ordinary_digest(path,after);assert(!strcmp(original,after));load_point(path,"final_reopen_preserved",accepted+1u,rejected);
+  printf("{\"kind\":\"critical_load_end\",\"profile\":\"%s\",\"producers\":4,\"attempts_bound\":64,\"ordinary_rows\":%u,\"accepted_before_results\":%u,\"rejected\":%u,\"readmitted\":1,\"necessary_exact_acks\":%u,\"wrong_acks_rejected\":%u,\"local_sources_acknowledged\":0,\"ordinary_sha256_before_after\":\"%s\",\"physical_observed_peak\":%llu,\"elapsed_s\":%.6f,\"ack_delay_seconds_virtual\":3600,\"network\":false,\"rule_or_action_executed\":false}\n",profile,load_ordinary_rows,accepted,rejected,load_exact_acks,load_bad_acks,original,(unsigned long long)load_peak_observed,(double)(edr_monotonic_ns()-load_started)/1e9);fflush(stdout);
+  edr_storage_queue_close();edr_storage_queue_test_set_delivery_time(-1);for(unsigned i=0;i<LOAD_OWNERS+2u;i++)edr_test_p0_terminal_fixture_free(&load_owners[i].f);
+  /* Preserve the synthetic DB for independent raw inventory/hash review. */
+  return 0;
+}
+
 int main(int argc,char **argv) {
+  if(argc==3 && !strcmp(argv[1],"--critical-reserve-load")) return critical_reserve_load(argv[2]);
   if (argc==4 && !strcmp(argv[1],"--crash-child")) {
     EdrStorageQueueRecoveryReport report;
     EdrStorageQueueRecoveryRequest request=checked(argv[3],&report);
