@@ -17,6 +17,7 @@ on:
       - scripts/stage_retention_native_tools.py
       - tests/test_stage_retention_native_tools.py
       - tests/test_local_evidence_cache_candidate.c
+      - tests/test_queue_recovery.c
       - tests/test_egress_request_policy.c
       - src/storage/local_evidence_cache.c
       - include/edr/local_evidence_cache.h
@@ -215,6 +216,99 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           path: ${{ runner.temp }}/evidence-native-tools/
+      # The earlier passed-tools artifact covers only contracts + sliced gates.
+      # These opt-in profiles independently gate this whole workflow; no retry.
+      - name: Run native critical reserve load profiles
+        id: critical-load
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $env:PATH = (Join-Path $prefix 'bin') + ';' + $env:PATH
+          $probe = @'
+          import datetime, hashlib, json, os, pathlib, subprocess, sys, time
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          logs = pathlib.Path(os.environ['RUNNER_TEMP'])/'queue-critical-load'
+          logs.mkdir(exist_ok=False)
+          exe = root/'contract-build/tests/test_queue_recovery.exe'
+          profiles = ('short32', 'max32', 'mixed512')
+          cap = 8*1024*1024
+
+          def save(path, value):
+              with path.open('x', encoding='utf-8') as output:
+                  json.dump(value, output, sort_keys=True, indent=2)
+                  output.write('\n')
+
+          def digest(raw):
+              return hashlib.sha256(raw).hexdigest()
+
+          identity = dict(source_sha=os.environ['GITHUB_SHA'], run_id=os.environ['GITHUB_RUN_ID'], run_attempt=os.environ['GITHUB_RUN_ATTEMPT'], arch=sys.argv[1], exe_sha256=digest(exe.read_bytes()), test_source_sha256=digest((root/'tests/test_queue_recovery.c').read_bytes()))
+          save(logs/'intent.json', dict(identity, profiles=profiles, maximum_seconds_each=140, combined_log_cap=cap, automatic_retry=False, native_fixture_only=True))
+          for index, profile in enumerate(profiles):
+              case = logs/profile
+              case.mkdir()
+              env = {k:v for k,v in os.environ.items() if not k.upper().startswith('EDR_')}
+              env['TMP'] = env['TEMP'] = str(case)
+              stdout, stderr = logs/(profile+'.stdout.log'), logs/(profile+'.stderr.log')
+              argv = [str(exe), '--critical-reserve-load', profile]
+              child = None
+              code = None
+              failure = None
+              began = time.monotonic()
+              started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              with stdout.open('xb') as output, stderr.open('xb') as error:
+                  try:
+                      child = subprocess.Popen(argv, cwd=case, env=env, stdout=output, stderr=error)
+                      while child.poll() is None:
+                          if time.monotonic()-began >= 140:
+                              failure = 'profile_timeout'
+                              break
+                          if stdout.stat().st_size+stderr.stat().st_size > cap:
+                              failure = 'combined_log_cap'
+                              break
+                          time.sleep(.1)
+                  except BaseException as error:
+                      failure = 'observer_'+type(error).__name__
+                  finally:
+                      if child is not None:
+                          try:
+                              if child.poll() is None:
+                                  child.kill()
+                              code = child.wait(timeout=10)
+                          except BaseException as error:
+                              failure = 'terminal_unknown_'+type(error).__name__
+              streams = {}
+              bodies = {}
+              for name, path in (('stdout',stdout), ('stderr',stderr)):
+                  before = path.stat()
+                  with path.open('rb') as stream:
+                      raw = stream.read(cap+1)
+                  after = path.stat()
+                  stable = (before.st_ino,before.st_size,before.st_mtime_ns)==(after.st_ino,after.st_size,after.st_mtime_ns)
+                  complete = code is not None and stable and after.st_size==len(raw)
+                  streams[name] = dict(bytes=after.st_size, sha256=digest(raw), sha256_scope='complete_file' if complete else 'prefix_or_unverified', stable_after_child=stable)
+                  bodies[name] = raw
+              if failure is None and any(row['sha256_scope']!='complete_file' for row in streams.values()):
+                  failure = 'capture_unverified'
+              if streams['stdout']['bytes']+streams['stderr']['bytes'] > cap:
+                  failure = failure or 'combined_log_cap'
+              if code == 0 and failure is None:
+                  try:
+                      ends = [json.loads(line) for line in bodies['stdout'].splitlines() if line.startswith(b'{"kind":"critical_load_end",')]
+                      if len(ends)!=1 or ends[0].get('profile')!=profile or ends[0].get('producers')!=4 or ends[0].get('local_sources_acknowledged')!=0 or ends[0].get('network') is not False or ends[0].get('rule_or_action_executed') is not False:
+                          failure = 'profile_end_contract'
+                  except (ValueError, UnicodeError):
+                      failure = 'profile_end_invalid'
+              elif failure is None:
+                  failure = 'profile_exit_nonzero_or_unknown'
+              record = dict(identity, profile=profile, argv=argv, started_utc=started_utc, elapsed_seconds=time.monotonic()-began, child_pid=child.pid if child is not None else None, returncode=code, terminal_known=code is not None, failure=failure, streams=streams, unstarted_profiles_after_first_failure=list(profiles[index+1:]) if failure else [], retry=False)
+              save(logs/(profile+'.result.json'), record)
+              print(json.dumps(dict(profile=profile, returncode=code, failure=failure, elapsed_seconds=record['elapsed_seconds'])), flush=True)
+              if failure:
+                  raise SystemExit(1)
+          '@
+          python -B -c $probe '${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Native critical reserve load failed; inspect the preserved profile logs' }
       - name: Equal-input native evidence and pressure comparisons
         id: comparisons
         shell: pwsh
@@ -251,3 +345,5 @@ jobs:
             contract-build/Testing/Temporary/LastTest.log
             contract-build/windows-rule-audit-result.json
             ${{ runner.temp }}/retention-sliced-contract/*.log
+            ${{ runner.temp }}/queue-critical-load/*.log
+            ${{ runner.temp }}/queue-critical-load/*.json
