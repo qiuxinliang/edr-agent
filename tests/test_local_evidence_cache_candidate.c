@@ -9624,8 +9624,16 @@ static void test_metrics_commit_watermark_restart_and_failure(void) {
 
   /* Expired in-memory slots must not resurrect rows deleted by retention. */
   edr_local_evidence_cache_test_set_now_unix_ns((minute + 25 * 60) * 60000000000LL);
-  metric_test_poll();
-  assert(sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics WHERE metric_name!='local_retention_v1_active_ms'") == 0);
+  /* Maintenance may yield its time slice before reaching metrics retention.
+   * Drive a bounded number of due turns and still require complete expiry. */
+  unsigned expiry_turns = 0u;
+  int64_t expired_rows;
+  do {
+    metric_test_poll();
+    ++expiry_turns;
+    expired_rows = sqlite_scalar_integer(path, "SELECT COUNT(*) FROM metrics WHERE metric_name!='local_retention_v1_active_ms'");
+  } while (expired_rows != 0 && expiry_turns < 12u);
+  assert(expired_rows == 0);
   assert(sqlite3_open(path, &raw) == SQLITE_OK);
   compact_exec(raw, "CREATE TRIGGER metrics_deny BEFORE INSERT ON metrics "
                     "BEGIN SELECT RAISE(ABORT,'expired metrics resurrected'); END;");
