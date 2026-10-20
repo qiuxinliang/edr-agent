@@ -78,6 +78,8 @@ $script:publicFailureCodes=@(
   'owned_worker_terminal_unknown',
   'pre_stop_log_binding_unknown',
   'preexisting_agent_or_service',
+  'preflight_progress_file_shape',
+  'preflight_progress_source_shape',
   'preflight_receipt_invalid',
   'private_case_acl_not_protected',
   'private_case_acl_unexpected_principal',
@@ -402,17 +404,30 @@ function PowerShellWorker([string]$Label,[string]$Body,[int]$Milliseconds=5000,[
 function ServicePreflightSource {
   # One read-only query owner, shared with the early WinPS5.1 contract.
   return @'
+$script:preflightProgressPath='__PREFLIGHT_PROGRESS_PATH__'
+function SetPreflightProgress([byte]$Operation){
+  $stream=[IO.File]::Open($script:preflightProgressPath,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+  try{
+    if($stream.Length -ne 1 -or $Operation -lt 1 -or $Operation -gt 5){throw 'preflight_progress_file_shape'}
+    $stream.Position=0;$stream.WriteByte($Operation);$stream.Flush()
+  }finally{$stream.Dispose()}
+}
 $operationId=1
+SetPreflightProgress $operationId
 $s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
 $operationId=2
+SetPreflightProgress $operationId
 $p=@(Get-CimInstance Win32_Process -Property Name -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSensor.exe','edr_agent.exe')})
 if($s.Count -or $p.Count){throw 'preexisting_agent_or_service'}
 $operationId=3
+SetPreflightProgress $operationId
 $m=[Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Machine);$keys=@($m.Keys|Where-Object {[string]$_ -like 'EDR_*'})
 if($keys.Count){throw 'machine_edr_override_present'}
 $operationId=4
+SetPreflightProgress $operationId
 if(@(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop|Where-Object {-not $_.Enabled}).Count){throw 'firewall_profile_disabled'}
 $operationId=5
+SetPreflightProgress $operationId
 [Console]::Out.WriteLine((@{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=$operationId;ps_major=$PSVersionTable.PSVersion.Major;ps_edition=$PSVersionTable.PSEdition}|ConvertTo-Json -Compress));exit 0
 '@
 }
@@ -438,10 +453,38 @@ function ReadPreflightReceipt($Value){
   }catch{return $null}
   finally{if($null -ne $document){$document.Dispose()}}
 }
+function ReadPreflightProgress([string]$Path,$TerminalKnown){
+  $unknown=@{status='unknown';last_operation_id=$null}
+  if($TerminalKnown -isnot [bool] -or -not $TerminalKnown){return $unknown}
+  try{
+    $raw=ReadOwnedBytes $Path 1
+    if($raw.bytes.Length -ne 1 -or $raw.bytes[0] -gt 5){return $unknown}
+    $op=[int]$raw.bytes[0]
+    return @{status=if($op -eq 0){'no_child_progress_observed'}else{'observed'};last_operation_id=$op}
+  }catch{return $unknown}
+}
 function RunServicePreflight([string]$Body){
-  $v=PowerShellWorker 'preflight' ($Body.Replace('__SERVICE__',$script:serviceName)) 8000 4096
-  $accepted=ReadPreflightReceipt $v;Check ($null -ne $accepted) 'preflight_receipt_invalid'
-  return @{worker=$v.receipt;preflight=$accepted}
+  $script:preflightProgressPath=Join-Path $script:case 'preflight-progress.bin'
+  $first=$script:ownedChildren.Count
+  try{
+    Check ([regex]::Matches($Body,"'__PREFLIGHT_PROGRESS_PATH__'").Count -eq 1) 'preflight_progress_source_shape'
+    $stream=[IO.File]::Open($script:preflightProgressPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+    try{$stream.WriteByte(0);$stream.Flush()}finally{$stream.Dispose()}
+    $literal="'"+$script:preflightProgressPath.Replace("'","''")+"'"
+    $bodyWithPath=$Body.Replace("'__PREFLIGHT_PROGRESS_PATH__'",$literal).Replace('__SERVICE__',$script:serviceName)
+    $v=PowerShellWorker 'preflight' $bodyWithPath 8000 4096
+    $accepted=ReadPreflightReceipt $v;Check ($null -ne $accepted) 'preflight_receipt_invalid'
+    return @{worker=$v.receipt;preflight=$accepted}
+  }finally{
+    # No retry or extra wait. Read only after this invocation's held child is
+    # known terminal; a published operation is not a stack or timeout cause.
+    $known=$false
+    if($script:ownedChildren.Count -eq $first + 1){
+      $child=$script:ownedChildren[$first]
+      try{$known=($child.label -ceq 'preflight' -and $null -ne $child.pid -and $null -ne $child.birth -and $child.process.Id -eq $child.pid -and $child.process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $child.birth -and $child.process.HasExited -and $child.process.ExitCode -is [int])}catch{$known=$false}
+    }
+    $script:result.preflight_progress=ReadPreflightProgress $script:preflightProgressPath $known
+  }
 }
 function Snapshot([string]$Label,[switch]$AllowAbsent){
   $body=@'

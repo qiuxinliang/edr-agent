@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 #Requires -PSEdition Core
 <# Pure source-owned projection contracts. No harness top-level, process,
-SCM, Agent, network or generated worker body is executed. #>
+SCM, Agent, network or generated worker body is executed. Only the extracted
+one-byte progress file helper additionally runs against this test's public file. #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$DriverSource,
@@ -36,7 +37,7 @@ foreach($name in @('publicFailureCodes','stageFailureCodes')){
 
 # Loading a function definition does not call it. This fixed inventory excludes
 # StartOwned/RunOwned/SCM/cleanup/main. Reject newly introduced command owners.
-$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','ProjectWorkerFailure','PowerShellWorkerSource','ServicePreflightSource','ReadPreflightReceipt')
+$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','ProjectWorkerFailure','PowerShellWorkerSource','ServicePreflightSource','ReadPreflightReceipt','ReadPreflightProgress')
 $allowedCommands=@('Check','ConvertFrom-Json','ConvertTo-Json','New-Object','ReadOwnedBytes','ForEach-Object')
 foreach($name in $wantedFunctions){
   $defs=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
@@ -206,6 +207,38 @@ try{
   $preflight.stdout=PublicText $success
   foreach($changes in @(@{exit_code=[int]1},@{exit_code=[int]7},@{exit_code=$null},@{exit_code='0'},@{terminal_known=$false},@{exit_known=$false},@{cancelled=$true},@{stderr=(PublicText $script:privateMarker)})){
     $bad=$preflight.Clone();foreach($key in $changes.Keys){$bad[$key]=$changes[$key]};AssertContract ($null -eq (ReadPreflightReceipt $bad)) 'prepared_preflight_nonzero_unknown_or_stderr_never_accepted'
+  }
+  # Actual public byte files through the same bounded-read seam. No child or
+  # SCM call: the terminal-known input is a deliberately explicit test seam.
+  foreach($op in 0..5){
+    $path=PublicFixture ([byte[]]@($op));$value=ReadPreflightProgress $path $true
+    $expectedStatus=if($op -eq 0){'no_child_progress_observed'}else{'observed'}
+    AssertContract ($value.Count -eq 2 -and $value.status -ceq $expectedStatus -and $value.last_operation_id -is [int] -and $value.last_operation_id -eq $op) 'prepared_progress_one_byte_closed_values'
+    AssertContract (-not (($value|ConvertTo-Json -Compress).Contains($path))) 'prepared_progress_path_not_exported'
+  }
+  $badProgress=@((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(0,1))),(PublicFixture ([byte[]]@(6))),(PublicFixture ([byte[]]@(48))),(PublicFixture ([byte[]]@(255))),(Join-Path $script:publicFixtureRoot 'missing-progress.public'))
+  foreach($path in $badProgress){$value=ReadPreflightProgress $path $true;AssertContract ($value.Count -eq 2 -and $value.status -ceq 'unknown' -and $null -eq $value.last_operation_id) 'prepared_progress_bad_length_value_or_missing_unknown'}
+  $path=PublicFixture ([byte[]]@(5))
+  foreach($terminal in @($false,$null,1,'true')){$value=ReadPreflightProgress $path $terminal;AssertContract ($value.status -ceq 'unknown' -and $null -eq $value.last_operation_id) 'prepared_progress_requires_known_terminal_bool'}
+  $progressTokens=$null;$progressErrors=$null
+  $progressAst=[Management.Automation.Language.Parser]::ParseInput((ServicePreflightSource),[ref]$progressTokens,[ref]$progressErrors)
+  AssertContract ($null -eq $progressErrors -or @($progressErrors).Count -eq 0) 'prepared_progress_body_parse_only'
+  $progressDefs=@($progressAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'SetPreflightProgress'},$true))
+  AssertContract ($progressDefs.Count -eq 1 -and @($progressDefs[0].Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true)).Count -eq 0) 'prepared_progress_file_helper_only'
+  Invoke-Expression $progressDefs[0].Extent.Text
+  $script:preflightProgressPath=PublicFixture ([byte[]]@(0))
+  foreach($op in 1..5){
+    SetPreflightProgress $op;$value=ReadPreflightProgress $script:preflightProgressPath $true
+    AssertContract ((Get-Item -LiteralPath $script:preflightProgressPath).Length -eq 1 -and $value.status -ceq 'observed' -and $value.last_operation_id -eq $op) 'prepared_progress_write_overwrites_one_byte'
+  }
+  foreach($op in @(0,6)){
+    Rejects {SetPreflightProgress $op} 'preflight_progress_file_shape'
+    AssertContract ((Get-Item -LiteralPath $script:preflightProgressPath).Length -eq 1 -and [IO.File]::ReadAllBytes($script:preflightProgressPath)[0] -eq 5) 'prepared_progress_invalid_operation_does_not_mutate'
+  }
+  foreach($path in @((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(1,2))))){
+    $script:preflightProgressPath=$path;$beforeLength=(Get-Item -LiteralPath $path).Length;$beforeHash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    Rejects {SetPreflightProgress 1} 'preflight_progress_file_shape'
+    AssertContract ((Get-Item -LiteralPath $path).Length -eq $beforeLength -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ceq $beforeHash) 'prepared_progress_wrong_length_never_expands'
   }
   # Real ErrorRecords, including preparation failures before a bound intent
   # exists. Do not export their messages, target objects or invocation text.

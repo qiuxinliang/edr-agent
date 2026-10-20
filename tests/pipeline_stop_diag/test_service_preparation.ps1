@@ -14,7 +14,8 @@ $probeOldRunnerTemp=$env:RUNNER_TEMP;$probeStatement=$null;$probeParserSelected=
 $script:result=@{preparation_stage_id=0;intent_recorded=$false}
 $script:ownedChildren=New-Object Collections.ArrayList;$script:cleanupErrors=New-Object Collections.ArrayList
 $script:cleanupMode=$false;$script:cleanupDeadline=270000;$script:lastLimitSample=-1000
-$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v2';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;acl_contract=$null;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$false;service_or_agent_started=$false;preflight_worker_started=$false;preflight=$null;failed_control_receipt=$null;worker_cleanup=@();dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
+$script:preflightProgressPath=$null
+$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v2';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;acl_contract=$null;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$false;service_or_agent_started=$false;preflight_worker_started=$false;preflight=$null;preflight_progress=@{status='unknown';last_operation_id=$null};failed_control_receipt=$null;worker_cleanup=@();dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
 function Guard($Value,[string]$Cause){if(-not $Value){throw $Cause}}
 function ReadSource([string]$Path,[string]$Expected){
  $f=Get-Item -LiteralPath $Path -Force
@@ -60,7 +61,7 @@ try{
   Guard ($probeCodes.Count -eq 1 -and $probeCodes[0].Right.Extent.Text -cmatch "(?s)^\s*@\(\s*(?:'[a-z][a-z0-9_]{0,100}'\s*,?\s*)+\)\s*$") 'literal_failure_codes_required'
   Set-Variable -Scope Script -Name $codeName -Value @([regex]::Matches($probeCodes[0].Right.Extent.Text,"'([a-z][a-z0-9_]{0,100})'")|ForEach-Object {$_.Groups[1].Value})
  }
- foreach($probeName in @('Check','Hash','RegularPath','SetDiagnosticCaseAcl','SaveNew','ProjectPrimaryFailure','WritePublic','Remaining','SampleLimits','StartOwned','WaitOwned','FinishOwned','ReadFailureProjection','RunOwned','ProjectWorkerFailure','PowerShellWorkerSource','PowerShellWorker','ServicePreflightSource','ReadPreflightReceipt','RunServicePreflight')){
+ foreach($probeName in @('Check','Hash','RegularPath','SetDiagnosticCaseAcl','SaveNew','ProjectPrimaryFailure','WritePublic','Remaining','SampleLimits','StartOwned','WaitOwned','FinishOwned','ReadFailureProjection','RunOwned','ProjectWorkerFailure','PowerShellWorkerSource','PowerShellWorker','ServicePreflightSource','ReadPreflightReceipt','ReadPreflightProgress','RunServicePreflight')){
   $defs=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $probeName},$true))
   Guard ($defs.Count -eq 1) 'prefix_helper_inventory'
   Invoke-Expression $defs[0].Extent.Text
@@ -71,7 +72,7 @@ try{
  $probePreflightBody=ServicePreflightSource;$pt=$null;$pe=$null
  $pa=[Management.Automation.Language.Parser]::ParseInput($probePreflightBody,[ref]$pt,[ref]$pe)
  Guard ($null -eq $pe -or @($pe).Count -eq 0) 'preflight_source_parse'
- foreach($c in @($pa.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){Guard ($c.GetCommandName() -cin @('Get-CimInstance','Where-Object','Get-NetFirewallProfile','ConvertTo-Json')) 'readonly_preflight_commands_required'}
+ foreach($c in @($pa.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){Guard ($c.GetCommandName() -cin @('Get-CimInstance','Where-Object','Get-NetFirewallProfile','ConvertTo-Json','SetPreflightProgress')) 'readonly_preflight_commands_required'}
  $probeParent=Get-Item -LiteralPath $probeOldRunnerTemp -Force
  Guard ($probeParent.PSIsContainer -and [IO.Path]::IsPathRooted($probeParent.FullName)) 'runner_temp_shape'
  for($d=$probeParent;$null -ne $d;$d=$d.Parent){Guard (($d.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'runner_temp_reparse'}
@@ -135,7 +136,7 @@ try{
  $env:RUNNER_TEMP=$probeOldRunnerTemp
  # Held objects only. Never reopen an arbitrary PID or invoke full SCM cleanup.
  # Unknown identity/exit/EOF retains the public tree and fails this test.
- $workersClean=$true;$script:cleanupMode=$true
+ $workersClean=$true;$preflightTerminal=$false;$script:cleanupMode=$true
  foreach($v in $script:ownedChildren){
   try{
    Guard ($null -ne $v.pid -and $null -ne $v.birth -and $v.process.Id -eq $v.pid -and $v.process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $v.birth) 'public_worker_identity_unknown'
@@ -144,10 +145,12 @@ try{
    Guard ($null -ne $v.out_task -and $null -ne $v.err_task -and $v.out_task.Wait(2000) -and $v.err_task.Wait(2000)) 'public_worker_stream_eof_unknown'
    $v.out_file.Dispose();$v.err_file.Dispose()
    $probe.worker_cleanup+=@{pid=$v.pid;birth_filetime=$v.birth;terminal_known=$true;exit_code=$v.process.ExitCode;cancelled=$v.cancelled;streams_closed=$true}
+   if($v.label -ceq 'preflight'){$preflightTerminal=$true}
    $v.process.Dispose()
   }catch{$workersClean=$false;$probe.cleanup_failure=@{exception_type=$_.Exception.GetType().FullName;hresult=[int]$_.Exception.HResult};$probe.status='failed_or_unknown'}
  }
  if($script:cleanupErrors.Count){$workersClean=$false;$probe.cleanup_failure=@{exception_type='owned_worker_cleanup_reported';hresult=$null};$probe.status='failed_or_unknown'}
+ if($null -ne $script:preflightProgressPath){$probe.preflight_progress=ReadPreflightProgress $script:preflightProgressPath ($workersClean -and $preflightTerminal)}
  if($probeCreated -and $workersClean){
   try{
    $own=Get-Item -LiteralPath $probeRoot -Force

@@ -80,6 +80,25 @@ projection function definition, without running a worker body or its exit.
 These checks distinguish provider/host failures; they do not establish the
 historical failure's CIM status, timeout cause or Service rollback acceptance.
 
+The preflight also publishes one binary operation byte in its own fresh case.
+The parent creates exactly one byte initialized to zero; before each operation
+1..5 the worker overwrites that byte without growing the file. This is a private
+diagnostic file write, not a system-state modification. The same bounded query
+and eight-second worker limits remain in force. The parent reads the fixed file
+only after confirming this invocation's held preflight process is terminal; the
+early contract projects it after its exact-child cleanup. Only `status` and
+`last_operation_id` are exported. Zero means no child progress was observed,
+and says nothing about body entry; bad length/value, missing data or unknown terminal
+state yields unknown/null. This last published operation is not a stack, elapsed
+time, proof that a query is still running, or a timeout cause. Parent post-terminal
+projection does not replace an earlier failure or promote its result. Checkpoint
+I/O can itself fail before a query or consume time within the unchanged limits; a nonzero byte proves
+publication only, not entry into or blockage in that query. Pure contracts load only
+the byte-writer definition from the real preflight source, overwrite an existing
+public one-byte fixture through operations 1..5, and verify that invalid values
+or lengths fail without changing or expanding it. No preflight query or worker
+body runs in that pure test.
+
 The SCM harness requires a clean hosted runner and unique paths/service name.
 It stages and verifies the complete static/delay-import DLL closure beside the
 executable, rejects machine EDR overrides, blocks this exact program's outbound
