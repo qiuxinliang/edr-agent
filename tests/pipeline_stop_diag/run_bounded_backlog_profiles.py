@@ -228,10 +228,13 @@ def collect_profile(case, slots, code, result):
              all(exact_int(row[key]) for key in ('elapsed_ms','stdout_bytes','stderr_bytes',
                  'fixture_sampled_peak_bytes','fixture_final_sample_bytes','fixture_samples','last_error_diagnostic_only'))
              for row in rows), 'parent_closed_fields')
+    # The parent is already terminal and these closed numeric rows are valid
+    # even when a child needed termination. Preserve that failure boundary
+    # before refusing to read any worker streams.
+    result['parent_rows'] = rows
     need(all(row.get('cleanup_verified') is True and row.get('job_natural_zero') is True and
              row.get('child_exit_known') is True and row.get('termination_attempted') is False
              for row in rows), 'parent_worker_quiescence_unknown')
-    result['parent_rows'] = rows
     # Hash all available known worker streams even when an early worker fails.
     # Missing streams are recorded as absent, never fabricated empty success.
     for profile in ('ready', 'missing'):

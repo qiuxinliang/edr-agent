@@ -268,6 +268,43 @@ class ConsumerContracts(unittest.TestCase):
             with self.assertRaisesRegex(m.ContractError,'parent_worker_quiescence_unknown'):
                 m.collect_profile(case,128,0,result)
             self.assertEqual(set(result['streams']),{'parent.stdout.log','parent.stderr.log'})
+            self.assertEqual(result['parent_rows'],rows)
+            self.assertNotIn('workers',result)
+
+    def test_terminated_child_keeps_closed_parent_failure_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case=Path(tmp);raw=write_profile(case,8192)
+            rows=[json.loads(line) for line in raw.splitlines()]
+            rows[1].update(cause='worker_deadline',accepted=False,
+                           termination_attempted=True,job_natural_zero=False,
+                           child_exit_code=90,elapsed_ms=85000)
+            (case/'parent.stdout.log').write_bytes(b''.join(
+                (json.dumps(row)+'\n').encode() for row in rows))
+            (case/'parent.stderr.log').write_bytes(b'')
+            # Failure metadata remains useful without reading either worker.
+            for profile in ('ready','missing'):
+                (case/f'pipeline-stop-8192-{profile}/worker.stdout.log').unlink()
+            result={}
+            with self.assertRaisesRegex(m.ContractError,'parent_worker_quiescence_unknown'):
+                m.collect_profile(case,8192,90,result)
+            self.assertEqual(result['parent_rows'],rows)
+            self.assertEqual(set(result['streams']),{'parent.stdout.log','parent.stderr.log'})
+            self.assertNotIn('workers',result)
+
+    def test_invalid_parent_fields_are_not_preserved(self):
+        for field,value in [('child_exit_known','true'),('child_pid',-1),
+                            ('private_text','not a closed field')]:
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as tmp:
+                case=Path(tmp);rows=[json.loads(line) for line in write_profile(case,128).splitlines()]
+                rows[0][field]=value
+                (case/'parent.stdout.log').write_bytes(b''.join(
+                    (json.dumps(row)+'\n').encode() for row in rows))
+                (case/'parent.stderr.log').write_bytes(b'')
+                result={}
+                with self.assertRaises(m.ContractError):
+                    m.collect_profile(case,128,0,result)
+                self.assertNotIn('parent_rows',result)
+                self.assertNotIn('workers',result)
 
     def test_proof_copy_exact_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
