@@ -121,7 +121,7 @@ try{
  $probeIntentPath=Join-Path $script:case 'intent.json';$probeIntentFile=Get-Item -LiteralPath $probeIntentPath -Force
  Guard ($probeIntentFile.Length -gt 0 -and $probeIntentFile.Length -le 131072) 'public_intent_bound'
  Guard ((Get-FileHash -LiteralPath $probeHarness.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $DriverSha256 -and (Get-FileHash -LiteralPath $probeQA.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $QADriverSha256) 'source_changed'
- $probe.phase='winps51_readonly_preflight'
+ $probe.phase='core7_readonly_preflight'
  $probe.preflight=RunServicePreflight $probePreflightBody
  $probe.preflight_worker_started=($script:ownedChildren.Count -gt 0)
  Guard ((Get-FileHash -LiteralPath $probeHarness.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $DriverSha256 -and (Get-FileHash -LiteralPath $probeQA.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $QADriverSha256) 'source_changed'

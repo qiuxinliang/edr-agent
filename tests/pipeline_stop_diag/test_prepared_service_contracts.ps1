@@ -197,11 +197,11 @@ try{
   AssertContract ($v.cause_code -ceq 'unknown' -and $null -eq $v.cim_native_error -and $null -eq $v.cim_status_code) 'prepared_worker_walk_stops_at_eight'
   foreach($op in @(-1,6,'1',$true,$null)){Rejects {ProjectWorkerFailure $cimRecord $op $script:publicFailureCodes} 'worker_operation_id_invalid'}
 
-  $success='{"schema":"edr.ci-service-preflight.v1","clean_aliases":true,"machine_edr_override_count":0,"firewall_profiles_enabled":true,"operation_id":5,"ps_major":5,"ps_edition":"Desktop"}'
+  $success='{"schema":"edr.ci-service-preflight.v1","clean_aliases":true,"machine_edr_override_count":0,"firewall_profiles_enabled":true,"operation_id":5,"ps_major":7,"ps_edition":"Core"}'
   $preflight=@{stdout=(PublicText $success);stderr=(PublicText '');terminal_known=$true;exit_known=$true;exit_code=[int]0;cancelled=$false}
   $v=ReadPreflightReceipt $preflight
-  AssertContract ($null -ne $v -and $v.Count -eq 7 -and $v.ps_major -eq 5 -and $v.ps_edition -ceq 'Desktop') 'prepared_preflight_normal_exact_receipt'
-  foreach($text in @($success.Replace('"operation_id":5','"operation_id":4'),$success.Replace('"operation_id":5','"operation_id":5.0'),$success.Replace('"ps_major":5','"ps_major":7'),$success.Replace('Desktop','Core'),$success.Replace('"clean_aliases":true','"clean_aliases":false'),$success.Replace('"machine_edr_override_count":0','"machine_edr_override_count":"0"'),$success.Replace('"schema":','"schema":"x","schema":'),$success.Replace('"schema":','"private":1,"schema":'),('['+$success+']'),$known)){
+  AssertContract ($null -ne $v -and $v.Count -eq 7 -and $v.ps_major -eq 7 -and $v.ps_edition -ceq 'Core') 'prepared_preflight_normal_exact_receipt'
+  foreach($text in @($success.Replace('"operation_id":5','"operation_id":4'),$success.Replace('"operation_id":5','"operation_id":5.0'),$success.Replace('"ps_major":7','"ps_major":5'),$success.Replace('Core','Desktop'),$success.Replace('"ps_major":7','"ps_major":5').Replace('Core','Desktop'),$success.Replace('"clean_aliases":true','"clean_aliases":false'),$success.Replace('"machine_edr_override_count":0','"machine_edr_override_count":"0"'),$success.Replace('"schema":','"schema":"x","schema":'),$success.Replace('"schema":','"private":1,"schema":'),('['+$success+']'),$known)){
     $preflight.stdout=PublicText $text;AssertContract ($null -eq (ReadPreflightReceipt $preflight)) 'prepared_preflight_bad_or_failure_frame_rejected'
   }
   $preflight.stdout=PublicText $success

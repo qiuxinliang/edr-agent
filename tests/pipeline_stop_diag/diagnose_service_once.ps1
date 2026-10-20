@@ -348,7 +348,9 @@ function RunOwned([string]$Label,[string]$Exe,[string[]]$Arguments,[int]$Millise
   $receipt=FinishOwned $v $Cap
   $v.receipt=$receipt
   if($receipt.exit_code -ne 0 -and -not $script:result.Contains('failed_control_receipt')){
-    $origin=if($Label -ceq 'stage-runtime'){'python_stage'}elseif($Exe -ieq $script:winPS){'powershell_worker'}else{'unsupported'}
+    $legacyOwner=Get-Variable -Name winPS -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $queryOwner=Get-Variable -Name queryPS -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $origin=if($Label -ceq 'stage-runtime'){'python_stage'}elseif(($legacyOwner -is [string] -and $Exe -ieq $legacyOwner) -or ($queryOwner -is [string] -and $Exe -ieq $queryOwner)){'powershell_worker'}else{'unsupported'}
     $script:result.failed_control_receipt=@{label=$Label;receipt=$receipt;failure=(ReadFailureProjection $v.stdout $origin)}
   }
   Check ($receipt.exit_code -eq 0) 'bounded_worker_nonzero_no_retry';return $v
@@ -399,10 +401,10 @@ __BODY__
 }
 function PowerShellWorker([string]$Label,[string]$Body,[int]$Milliseconds=5000,[int]$Cap=16384){
   $path=WritePublic ($Label+'.ps1') (PowerShellWorkerSource $Body)
-  RunOwned $Label $script:winPS @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$path) $Milliseconds $Cap
+  RunOwned $Label $script:queryPS @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$path) $Milliseconds $Cap
 }
 function ServicePreflightSource {
-  # One read-only query owner, shared with the early WinPS5.1 contract.
+  # One read-only query owner, shared with the early Core7 contract.
   return @'
 $script:preflightProgressPath='__PREFLIGHT_PROGRESS_PATH__'
 function SetPreflightProgress([byte]$Operation){
@@ -444,12 +446,12 @@ function ReadPreflightReceipt($Value){
     foreach($p in $root.EnumerateObject()){if(-not $keys.Add($p.Name) -or $p.Name -cnotin $expected){return $null}}
     if($keys.Count -ne 7){return $null}
     foreach($key in @('schema','ps_edition')){if($root.GetProperty($key).ValueKind -ne [Text.Json.JsonValueKind]::String){return $null}}
-    if($root.GetProperty('schema').GetString() -cne 'edr.ci-service-preflight.v1' -or $root.GetProperty('ps_edition').GetString() -cne 'Desktop'){return $null}
+    if($root.GetProperty('schema').GetString() -cne 'edr.ci-service-preflight.v1' -or $root.GetProperty('ps_edition').GetString() -cne 'Core'){return $null}
     foreach($key in @('clean_aliases','firewall_profiles_enabled')){if($root.GetProperty($key).ValueKind -ne [Text.Json.JsonValueKind]::True){return $null}}
-    foreach($pair in @(@('machine_edr_override_count',0),@('operation_id',5),@('ps_major',5))){
+    foreach($pair in @(@('machine_edr_override_count',0),@('operation_id',5),@('ps_major',7))){
       $v=[int]0;$p=$root.GetProperty($pair[0]);if($p.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $p.TryGetInt32([ref]$v) -or $v -ne $pair[1]){return $null}
     }
-    return @{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=5;ps_major=5;ps_edition='Desktop'}
+    return @{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=5;ps_major=7;ps_edition='Core'}
   }catch{return $null}
   finally{if($null -ne $document){$document.Dispose()}}
 }
@@ -562,6 +564,7 @@ public static class CiServiceBoundedPump {
   SetDiagnosticCaseAcl $script:case
   $script:result.preparation_stage_id=5
   $script:winPS=RegularPath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
+  $script:queryPS=RegularPath (Join-Path $PSHOME 'pwsh.exe')
   $sc=RegularPath (Join-Path $env:WINDIR 'System32\sc.exe')
   $repo=[IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
   $driver=RegularPath (Join-Path $repo 'tests\cache-recovery\windows_cache_recovery_ci.ps1') 131072

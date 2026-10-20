@@ -46,8 +46,8 @@ and durable owners. It is not a candidate package or a rollback acceptance test.
 
 Before dependency builds, the manual ARM64 path runs the pure failure contracts
 and `test_service_preparation.ps1`. The latter executes the original main
-try-prefix, then the same source-owned preflight in a bounded System32 Windows
-PowerShell 5.1 child: read-only service/process, machine EDR-key presence and
+try-prefix, then the same source-owned preflight in a bounded Core7 child from
+the existing `$PSHOME/pwsh.exe`: read-only service/process, machine EDR-key presence and
 active firewall-profile queries. Directory ACLs and pinned QA definitions use
 public unbound Agent inputs and a fresh test-local temporary root. It starts
 no Agent and performs no SCM mutation. The existing one-second CIM query
@@ -58,11 +58,16 @@ all services and the same guard remain covered. This reduces requested fields
 and makes no claim that it resolves the historical stop or provider timeout.
 Exit zero is accepted only with
 the exact success schema, original three safety conditions, operation 5 and
-observed PowerShell major 5 / Desktop edition; structured failure is nonzero.
+observed PowerShell major 7 / Core edition; structured failure is nonzero.
 A failure reports fixed types, numeric positions and a closed stage/cause;
 exception text is excluded. Unknown child identity, terminal state or stream
 EOF fails cleanup and retains the public directory instead of claiming success.
-The earlier eight-second preflight failures remain failures. The temporary
+The earlier WinPS5.1 eight- and twenty-second preflight failures remain failures;
+their CIM/provider mechanism remains unknown. Generic query and environment
+control workers use the already-required Core7 executable, without a fallback
+or download. Actual SCM stop and sampler workers retain their explicit
+System32 WinPS5.1 owner. Changing the query host is not proof of a provider or
+Service rollback fix. The temporary
 20-second preflight budget is for observing the local provider/host response,
 not a change to the 45-second Service stop verdict. The 270-second experiment
 budget checks and existing remaining-budget gates before Service creation
