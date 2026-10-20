@@ -140,6 +140,45 @@ class Contracts(unittest.TestCase):
                     self.collect()
                 self.assertFalse(self.output.exists())
             fixture[key]=original
+    def test_701_each_missing_pin_refuses_before_stage_read_or_output(self):
+        value=json.loads(self.binding.read_bytes());value['cohort_id']='701'
+        value['target']['source_sha']='b6a2c43cf611fe31bc3444fbd08ec3ca10839ab5'
+        pins=('release_run', 'release_id', 'native_run', 'native_artifact_id', 'native_artifact_size', 'native_artifact_sha256', 'native_uncompressed_bytes', 'native_member_count', 'handler_receipt_sha256', 'binary_sha256', 'headless_sha256', 'artifact_manifest_sha256', 'preflight_response_sha256', 'p5_sha256', 'runtime_identity_sha256')
+        catalog=json.loads(M._PROFILE_OWNER.cohort_catalog_raw());fixture=catalog['profiles']['701']
+        for k in pins:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        original_take=M.take
+        def binding_only(path,*args,**kwargs):
+            self.assertEqual(path,self.binding,'701 missing pin must refuse before stage/product I/O')
+            return original_take(path,*args,**kwargs)
+        path=self.root/'temporary-missing701.json'
+        for key in pins:
+            original=fixture[key];fixture[key]='UNBOUND';self.write(path,catalog)
+            value['cohort_catalog_sha256']=M.sha(path.read_bytes())
+            for mode in ('service','scheduled_task'):
+                value['runtime_mode']=mode;self.write(self.binding,value);self.pin=M.sha(self.binding.read_bytes())
+                with self.subTest(pin=key,mode=mode),patch.object(M._PROFILE_OWNER,'PROFILE_FILE',path),patch.object(M,'take',side_effect=binding_only),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                    self.collect()
+                self.assertFalse(self.output.exists())
+            fixture[key]=original
+
+    def test_701_parser_only_bound_collect_roundtrip_is_not_product_proof(self):
+        catalog=json.loads(M._PROFILE_OWNER.cohort_catalog_raw());c=catalog['profiles']['701']
+        pins=('release_run','release_id','native_run','native_artifact_id','native_artifact_size','native_artifact_sha256','native_uncompressed_bytes','native_member_count','handler_receipt_sha256','binary_sha256','headless_sha256','artifact_manifest_sha256','preflight_response_sha256','p5_sha256','runtime_identity_sha256')
+        for key in pins:c[key]='1'*64 if key.endswith('_sha256')else '1'
+        self.assertEqual(c['source'],'b6a2c43cf611fe31bc3444fbd08ec3ca10839ab5')
+        path=self.root/'synthetic-parser-only701.json';self.write(path,catalog);pin=M.sha(path.read_bytes())
+        binding=json.loads(self.binding.read_bytes());binding['cohort_id']='701';binding['cohort_catalog_sha256']=pin;binding['target']['source_sha']=c['source']
+        stage=Path(binding['target']['stage_path']);value=json.loads(stage.read_bytes());value.update(version=c['version'],source_commit=c['source']);self.write(stage,value)
+        binding['target']['stage_sha256']=M.sha(stage.read_bytes());self.write(self.binding,binding);self.pin=M.sha(self.binding.read_bytes())
+        self.mutate('recovery-subset-summary.json','input_sha256',self.pin);self.mutate('recovery-subset-summary.json','target_source',c['source'])
+        for label in M.LABELS:
+            self.mutate(label+'.original-report.json','target_version',c['version'])
+            self.mutate(label+'.original-journal.json','version',c['version'])
+            self.mutate(label+'.original-journal.json','artifact_id','ci-cache-recovery-'+c['version'])
+        with patch.object(M._PROFILE_OWNER,'PROFILE_FILE',path):
+            self.collect();result=json.loads((self.output/'manifest.json').read_bytes())
+        self.assertEqual(result['target_version'],'3.2.701');self.assertEqual(result['target_source'],c['source'])
+        self.assertEqual(len(result['files']),24);self.assertFalse(result['source_terminal_state_proven_by_collector'])
     def test_closed_synthetic_697_has_accurate_artifact_identity(self):
         with self.synthetic_bound_697()as(c,pin):
             self.set_697_fixture(c,pin);self.collect();result=json.loads((self.output/'manifest.json').read_bytes())

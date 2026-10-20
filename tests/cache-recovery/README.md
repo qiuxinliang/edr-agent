@@ -1,10 +1,10 @@
-# Disposable exact 692 → 695 / 697 / 698 / 699 recovery cohorts
+# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695, 697, 698 and 699 selectors exist; there is no caller source/run/asset URL override.
+695, 697, 698, 699 and 701 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
 
@@ -46,6 +46,36 @@ The16KiB catalog cap and all strict source/run/hash/receipt checks remain.
 Missing pins are still rejected before target checkout, product/stage I/O,
 export or recovery; negative tests inject each UNBOUND field into temporary
 catalog bytes so they remain valid after this actual catalog is bound.
+Cohort 701 binds product source
+`b6a2c43cf611fe31bc3444fbd08ec3ca10839ab5` to the published candidate release
+`win_3.2.701`, run `39279000100/1`, release ID `417464097`. Its passed native
+run is `39273349309/1`, ARM64 artifact `12197268927` (1,225,356-byte ZIP,
+3,044,023 expanded bytes across four files). The original Headless staging
+owner verified the ARM64 product and runtime identity. Only the Headless ZIP
+and artifact manifest are downloaded for this recovery input.
+
+The original handler's in-process `httptest` check accepted these exact
+published bytes and returned the expected P5 hash. A separate invocation of
+the original stdlib builder exported the 7,268,311-byte P5 ZIP with that same
+SHA-256. This is local original-handler and builder verification; the receipt
+explicitly records `authenticated_platform_http=false`. It writes no live
+catalog or endpoint task and does not execute the Agent or installer. The
+catalog now contains all eight actual release/product/handler/P5 pins.
+
+Service and Scheduled Task recovery are still separate required runtime
+checks. Published inputs and matching P5 bytes do not prove either mode has
+completed rollback, repair, cache preservation, or process-stop acceptance.
+The current driver retains its updater return-status fix, 18-field stop
+diagnostics, natural readiness checks, and original 45/30/900-second bounds.
+No historical driver is copied over that owner. Cohort 701 remains distinct
+from the preserved cohort 699 Service and Task failures.
+
+Each of the 15 binding fields is separately replaced with `UNBOUND` in
+temporary negative-test catalogs. Temporary fully fake parser/routing
+fixtures exercise only parsing and local file contracts; they are not
+published-product, preflight, P5-export or recovery proof. The original
+handler and builder owners and all four historical profiles are unchanged.
+
 For a later source, bind that source's actual native/release/handler/P5 evidence;
 never reuse old8c3 artifacts as proof or add a caller-selected target override.
 Existing695/697/698 data, normal lifecycle, driver/collector, permissions and
