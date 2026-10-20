@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Pure local function tests: one public PowerShell file-writer child; no SCM, installer, Agent, or network.
+# Pure local function tests: public PowerShell file-writer/Python argv children; no SCM, installer, Agent, or network.
 [CmdletBinding()]
 param(
   [string]$DriverSource=(Join-Path $PSScriptRoot 'windows_cache_recovery_ci.ps1'),
@@ -14,7 +14,7 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_changed'}
-$wanted=@('Need','Regular','SHA','Wait-EmbeddedUpdaterMaterialized','ReadBounded','ConfigBinding','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
+$wanted=@('Need','Regular','SHA','Wait-EmbeddedUpdaterMaterialized','ReadBounded','ConfigBinding','Snapshot','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
 $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
 if ($functions.Count -ne $wanted.Count) {throw 'function_inventory'}
 # Only these source-owned function definitions are loaded, never driver top-level.
@@ -60,11 +60,44 @@ function Get-Item {
   $item=Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
   if(-not $script:metadataMode -or $LiteralPath -cne $script:metadataPath){return $item}
   $script:metadataCalls++
+  # Controlled same-path replacement: construct the genuine FileInfo before
+  # moving this exact public source away, then cache its missing attributes.
+  if(($script:metadataMode -ceq 'before_missing_sentinel' -and $script:metadataCalls -eq 1) -or
+     ($script:metadataMode -ceq 'after_missing_sentinel' -and $script:metadataCalls -eq 2)){
+    $ownedSentinelInfo=[IO.FileInfo]::new($LiteralPath)
+    if($ownedSentinelInfo.FullName -cne $LiteralPath){throw 'public_sentinel_exact_path_required'}
+    $ownedSentinelOriginal=[IO.File]::ReadAllBytes($LiteralPath)
+    $ownedSentinelBackup=Join-Path (Split-Path -Parent $LiteralPath) ('public-sentinel-'+[Guid]::NewGuid().ToString('N')+'.json')
+    if([IO.File]::Exists($ownedSentinelBackup)){throw 'public_sentinel_backup_collision'}
+    $ownedSentinelMoved=$false
+    try{
+      Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $ownedSentinelBackup -ErrorAction Stop
+      $ownedSentinelMoved=$true
+      if([int]$ownedSentinelInfo.Attributes -ne -1){throw 'public_sentinel_missing_cache_required'}
+    }finally{
+      if($ownedSentinelMoved){Microsoft.PowerShell.Management\Move-Item -LiteralPath $ownedSentinelBackup -Destination $LiteralPath -ErrorAction Stop}
+    }
+    $ownedSentinelRestored=[IO.File]::ReadAllBytes($LiteralPath)
+    if($ownedSentinelInfo.FullName -cne $LiteralPath -or [int]$ownedSentinelInfo.Attributes -ne -1 -or
+       [Convert]::ToBase64String($ownedSentinelOriginal) -cne [Convert]::ToBase64String($ownedSentinelRestored) -or
+       [IO.File]::Exists($ownedSentinelBackup)){throw 'public_sentinel_same_path_restore_contract'}
+    $script:metadataSentinelCycles++
+    return $ownedSentinelInfo
+  }
   $v=[pscustomobject]@{PSIsContainer=$item.PSIsContainer;Attributes=$item.Attributes;Length=$item.Length;LastWriteTimeUtc=$item.LastWriteTimeUtc;CreationTimeUtc=$item.CreationTimeUtc}
+  if($script:metadataCalls -eq 1){
+    if($script:metadataMode -ceq 'before_container'){$v.PSIsContainer=$true}
+    if($script:metadataMode -ceq 'before_negative'){$v.Length=[long]-1}
+    if($script:metadataMode -ceq 'before_reparse'){$v.Attributes=$v.Attributes -bor [IO.FileAttributes]::ReparsePoint}
+    if($script:metadataMode -ceq 'before_untyped_minus_one'){$v.Attributes=[IO.FileAttributes](-1)}
+  }
   if($script:metadataMode -ceq 'before_oversize' -and $script:metadataCalls -eq 1){$v.Length=1048577}
   if($script:metadataCalls -eq 2){
     if($script:metadataMode -ceq 'after_oversize'){$v.Length=1048577}
     if($script:metadataMode -ceq 'after_reparse'){$v.Attributes=$v.Attributes -bor [IO.FileAttributes]::ReparsePoint}
+    if($script:metadataMode -ceq 'after_container'){$v.PSIsContainer=$true}
+    if($script:metadataMode -ceq 'after_negative'){$v.Length=[long]-1}
+    if($script:metadataMode -ceq 'after_untyped_minus_one'){$v.Attributes=[IO.FileAttributes](-1)}
     if($script:metadataMode -ceq 'changed'){$v.LastWriteTimeUtc=$v.LastWriteTimeUtc.AddTicks(1)}
   }
   return $v
@@ -188,24 +221,62 @@ Start-Sleep -Milliseconds 300
   PublicText ($reportText.Replace(('"expected_sha256":"'+$owner.hash+'"'),('"expected_sha256":["'+$owner.hash+'"]')))
   Fails {ReadOwnedUpdateJson 'report' $ownedPath $owner} 'owned_report_field_type'
   [IO.File]::WriteAllBytes($ownedPath,(New-Object byte[] 1048577))
-  Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live} 'owned_read_regular_cap_required'
+  Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live} 'owned_read_before_cap_exceeded'
   PublicText $journalText
   $link=Join-Path $dir 'owned-file-symlink.json'
   # The Windows runner is already elevated; no privilege is enabled by this test.
   New-Item -ItemType SymbolicLink -Path $link -Value $ownedPath | Out-Null
-  Fails {ReadOwnedUpdateJson 'journal' $link $owner -Live} 'owned_read_regular_cap_required'
+  Fails {ReadOwnedUpdateJson 'journal' $link $owner -Live} 'owned_read_before_reparse_forbidden'
   $locked=[IO.File]::Open($ownedPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
   try {
     $sharing=ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live
     Checked ($sharing.state -ceq 'transient' -and $sharing.reason -ceq 'sharing') 'sharing_live_not_transient'
     FailsType {ReadOwnedUpdateJson 'journal' $ownedPath $owner} ([IO.IOException])
   }finally{$locked.Dispose()}
-  # These four cases stub metadata races, not a real concurrent writer.
+  # Deterministic metadata seams do not claim an actual concurrent writer race.
   $metadataPath=[IO.Path]::GetFullPath($ownedPath)
-  foreach($mode in @('before_oversize','after_oversize','after_reparse')){
-    $metadataMode=$mode;$metadataCalls=0
-    try{Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live} 'owned_read_regular_cap_required'}finally{$metadataMode=''}
+  foreach($ownedShape in @(
+    @('before_oversize','owned_read_before_cap_exceeded'),
+    @('after_oversize','owned_read_after_cap_exceeded'),
+    @('after_reparse','owned_read_after_reparse_forbidden')
+  )){
+    $metadataMode=$ownedShape[0];$metadataCalls=0
+    try{Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live} $ownedShape[1]}finally{$metadataMode=''}
   }
+  # Only a genuine FileInfo with the documented -1 cache sentinel is transient.
+  $metadataSentinelCycles=0
+  Checked ([IO.File]::Exists($metadataPath)) 'same_owned_path_sentinel_fixture_required'
+  foreach($ownedSentinelPhase in @('before','after')){
+    $metadataMode=$ownedSentinelPhase+'_missing_sentinel';$metadataCalls=0
+    try{
+      $ownedSentinelRead=ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live
+      $ownedSentinelExpectedCalls=if($ownedSentinelPhase -ceq 'before'){1}else{2}
+      Checked ($ownedSentinelRead.state -ceq 'transient' -and $ownedSentinelRead.reason -ceq 'source_changed' -and $metadataCalls -eq $ownedSentinelExpectedCalls) 'exact_missing_sentinel_live_source_changed'
+    }finally{$metadataMode=''}
+    $metadataMode=$ownedSentinelPhase+'_missing_sentinel';$metadataCalls=0
+    try{Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner} 'owned_source_changed'}finally{$metadataMode=''}
+  }
+  if($metadataSentinelCycles -ne 4){throw 'public_sentinel_four_exact_path_cycles_required'}
+  # File/shape/size failures stay hard failures for both live and terminal reads.
+  # An untyped object with Attributes=-1 must not gain missing-file authority.
+  foreach($ownedShape in @(
+    @('before_container','owned_read_before_file_type_required'),
+    @('after_container','owned_read_after_file_type_required'),
+    @('before_negative','owned_read_before_length_negative'),
+    @('after_negative','owned_read_after_length_negative'),
+    @('before_reparse','owned_read_before_reparse_forbidden'),
+    @('before_untyped_minus_one','owned_read_before_reparse_forbidden'),
+    @('after_untyped_minus_one','owned_read_after_reparse_forbidden'),
+    @('before_oversize','owned_read_before_cap_exceeded'),
+    @('after_oversize','owned_read_after_cap_exceeded')
+  )){
+    foreach($ownedShapeLive in @($true,$false)){
+      $metadataMode=$ownedShape[0];$metadataCalls=0
+      try{Fails {ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live:$ownedShapeLive} $ownedShape[1]}finally{$metadataMode=''}
+    }
+  }
+  Fails {ReadOwnedBytes $ownedPath 0} 'owned_read_cap_invalid'
+  Fails {ReadOwnedBytes $ownedPath 1048577} 'owned_read_cap_invalid'
   $metadataMode='changed';$metadataCalls=0
   try{
     $changed=ReadOwnedUpdateJson 'journal' $ownedPath $owner -Live
@@ -238,6 +309,34 @@ Start-Sleep -Milliseconds 300
   Checked (-not $failed -and $d.terminal_known -and $d.exit_known -and $d.exit_code -eq 7 -and $d.originals.report.status -ceq 'captured' -and $d.originals.journal.status -ceq 'captured' -and $d.primary_failure_type -ceq 'public-primary-sentinel') 'terminal_evidence_capture_contract'
   $d=DiagnosticStub;$failed=SaveTransitionFinalEvidence (ChildStub $true ([int]7)) $d $owner 'public-missing-report' $ownedPath $missing
   Checked ($failed -and $d.originals.report.status -ceq 'capture_failed' -and $d.originals.journal.status -ceq 'captured' -and $d.primary_failure_type -ceq 'public-primary-sentinel') 'secondary_capture_masked_primary'
+  # Execute only the actual source-owned Transition primary catch in a public
+  # throw/catch harness. The Transition function/main/SCM/Agent never executes.
+  $ownedTransitionNodes=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Transition'},$false))
+  if($ownedTransitionNodes.Count -ne 1){throw 'owned_transition_inventory'}
+  $ownedTransitionTries=@($ownedTransitionNodes[0].Body.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})
+  if($ownedTransitionTries.Count -ne 1 -or $ownedTransitionTries[0].CatchClauses.Count -ne 1){throw 'owned_transition_primary_catch_inventory'}
+  $ownedPrimaryCatch=$ownedTransitionTries[0].CatchClauses[0].Body
+  $ownedPrimaryCommands=@($ownedPrimaryCatch.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst]},$true))
+  if($ownedPrimaryCommands.Count -ne 0){throw 'owned_transition_primary_catch_not_pure'}
+  $ownedPrimaryHarness=[scriptblock]::Create('param([string]$PublicMessage,$diagnostic) try{throw $PublicMessage}catch'+$ownedPrimaryCatch.Extent.Text)
+  $ownedKnownFailureCodes=@(
+    'owned_read_before_file_type_required','owned_read_before_reparse_forbidden',
+    'owned_read_before_length_negative','owned_read_before_cap_exceeded',
+    'owned_read_after_file_type_required','owned_read_after_reparse_forbidden',
+    'owned_read_after_length_negative','owned_read_after_cap_exceeded',
+    'owned_read_cap_invalid','owned_read_cap_exceeded','owned_source_changed'
+  )
+  foreach($ownedPrimaryMessage in ($ownedKnownFailureCodes+@('unexported-test-message','OWNED_READ_BEFORE_CAP_EXCEEDED','owned_read_before_cap_exceeded;unexported-test-message','prefix_owned_source_changed'))){
+    $ownedPrimaryDiag=@{phase='public_primary_phase';primary_failure_type=$null;primary_failure_code='must-reset'}
+    $ownedPrimaryThrown=$null
+    try{& $ownedPrimaryHarness $ownedPrimaryMessage $ownedPrimaryDiag}catch{$ownedPrimaryThrown=$_}
+    $ownedPrimaryExpected=if($ownedPrimaryMessage -cin $ownedKnownFailureCodes){$ownedPrimaryMessage}else{$null}
+    $ownedPrimaryJson=$ownedPrimaryDiag | ConvertTo-Json -Depth 8 -Compress
+    Checked ($null -ne $ownedPrimaryThrown -and $ownedPrimaryThrown.Exception.Message -ceq $ownedPrimaryMessage -and
+      $ownedPrimaryDiag.primary_failure_code -ceq $ownedPrimaryExpected -and $ownedPrimaryDiag.phase -ceq 'public_primary_phase' -and
+      $ownedPrimaryDiag.primary_failure_phase -ceq 'public_primary_phase' -and $ownedPrimaryDiag.primary_failure_type -is [string] -and
+      -not $ownedPrimaryJson.Contains('unexported-test-message')) 'owned_primary_closed_failure_code_and_original_preserved'
+  }
   $summary=SaveRecoverySummary @{public=$true} $false
   Checked ($summary.saved -and (Test-Path -LiteralPath (Join-Path $dir 'recovery-subset-summary.json'))) 'summary_success_missing'
   # Stub only the output I/O owner; neither driver top-level nor SCM runs here.
@@ -764,6 +863,123 @@ Start-Sleep -Milliseconds 300
     if($null -ne $ctx){CloseStopLogContext $ctx}
     $self.Dispose()
     foreach($name in @('install','agent','configPath','configSha256')){if($originalLogVariables.ContainsKey($name)){Set-Variable -Name $name -Value $originalLogVariables[$name] -Scope Script}else{Remove-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue}}
+  }
+  # Source-owned Snapshot/WaitProcess: a public argv child, then a deterministic
+  # creation seam. No real inspector, Agent, SCM or updater runs.
+  $script:root=Join-Path $dir "snapshot public's fixture";New-Item -ItemType Directory -Path $script:root | Out-Null
+  $script:inspector=Join-Path $script:root "public inspector's.py"
+  $script:db=Join-Path $script:root "public evidence's.db"
+  $script:python=Join-Path $script:root 'public Python.exe'
+  $script:configPath=$null;$script:configSha256=$null
+  $snapshotCalls=0;$snapshotBindingCalls=0;$snapshotBindingFailure=0
+  $snapshotExit=0;$snapshotFirstWait=$true;$snapshotCleanupWait=$true
+  $snapshotErrorText='';$snapshotRemoveError=$false;$snapshotArgumentsSeen=@();$snapshotChild=$null;$snapshotHandle=[IntPtr]1;$snapshotThrowHandle=$false
+  # Real short-lived public Python child verifies Start-Process native quoting
+  # and held-handle exit0, without opening SQLite or importing the inspector.
+  $script:python=(Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+  $publicPythonBody=@'
+import argparse, hashlib, json
+from pathlib import Path
+p=argparse.ArgumentParser()
+p.add_argument('--db', required=True);p.add_argument('--output', required=True)
+p.add_argument('--expected', required=True);p.add_argument('--config', required=True)
+p.add_argument('--config-sha256', required=True)
+a=p.parse_args();root=Path(__file__).parent
+r=dict(schema='edr.ci-snapshot.public-argv.v1',
+       db_bound=a.db==str(root/"public evidence's.db"),
+       expected_bound=a.expected==str(root/"public expected's.json"),
+       config_bound=a.config==str(root/'Program Files'/"public config's.toml"),
+       config_sha_bound=a.config_sha256==hashlib.sha256(Path(a.config).read_bytes()).hexdigest())
+with open(a.output,'x',encoding='utf-8') as f:json.dump(r,f)
+'@
+  [IO.File]::WriteAllText($script:inspector,$publicPythonBody,[Text.UTF8Encoding]::new($false))
+  $publicConfigDir=Join-Path $script:root 'Program Files';New-Item -ItemType Directory -Path $publicConfigDir | Out-Null
+  $script:configPath=Join-Path $publicConfigDir "public config's.toml"
+  $script:expectedConfigPairs=,@('evidence_cache_path',$script:db)
+  [IO.File]::WriteAllText($script:configPath,('evidence_cache_path = "'+$script:db.Replace('\','\\')+'"'+[char]10),[Text.UTF8Encoding]::new($false))
+  $script:configSha256=SHA (Regular $script:configPath 131072)
+  $publicExpected=Join-Path $script:root "public expected's.json"
+  [IO.File]::WriteAllText($publicExpected,'{}',[Text.UTF8Encoding]::new($false))
+  $publicFastSnapshot=Snapshot 'public-fast-child' $publicExpected
+  $publicArgv=ConvertFrom-Json -InputObject (ReadBounded $publicFastSnapshot 4096) -ErrorAction Stop
+  Checked ($publicArgv.schema -ceq 'edr.ci-snapshot.public-argv.v1' -and $publicArgv.db_bound -eq $true -and $publicArgv.expected_bound -eq $true -and $publicArgv.config_bound -eq $true -and $publicArgv.config_sha_bound -eq $true) 'snapshot_real_fast_python_child_native_argv_and_known_zero'
+  $script:python=Join-Path $script:root 'public Python.exe'
+  $script:configPath=$null;$script:configSha256=$null
+  function ConfigBinding {
+    $script:snapshotBindingCalls++
+    if($script:snapshotBindingFailure -eq $script:snapshotBindingCalls){throw 'fixture_configuration_hash_changed'}
+  }
+  function Start-Process {
+    [CmdletBinding()]
+    param([string]$FilePath,[string[]]$ArgumentList,[switch]$PassThru,[string]$RedirectStandardOutput,[string]$RedirectStandardError)
+    $script:snapshotCalls++;$script:snapshotArgumentsSeen=@($ArgumentList)
+    $script:snapshotFilePath=$FilePath;$script:snapshotPassThru=[bool]$PassThru
+    [IO.File]::WriteAllText($RedirectStandardOutput,'',[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($RedirectStandardError,$script:snapshotErrorText,[Text.UTF8Encoding]::new($false))
+    if($script:snapshotRemoveError){Remove-Item -LiteralPath $RedirectStandardError}
+    $p=[pscustomobject]@{Handle=$script:snapshotHandle;ExitCode=$script:snapshotExit;first_wait=$script:snapshotFirstWait;cleanup_wait=$script:snapshotCleanupWait;waits=@();kills=0;refreshes=0}
+    if($script:snapshotThrowHandle){$p.PSObject.Properties.Remove('Handle');$p | Add-Member ScriptProperty Handle {throw 'unexported-test-message'}}
+    $p | Add-Member ScriptMethod WaitForExit {param([int]$Milliseconds) $this.waits+=,$Milliseconds;if($this.waits.Count -eq 1){return $this.first_wait};return $this.cleanup_wait}
+    $p | Add-Member ScriptMethod Kill {$this.kills++}
+    $p | Add-Member ScriptMethod Refresh {$this.refreshes++}
+    $script:snapshotChild=$p;return $p
+  }
+  $snapshotHandle=$null
+  Fails {Snapshot 'public-null-handle'} 'owner_snapshot_child_handle_required'
+  Checked ($snapshotChild.waits.Count -eq 1 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.kills -eq 0) 'snapshot_null_handle_is_reaped_and_cannot_be_success'
+  $snapshotHandle=[IntPtr]::Zero
+  Fails {Snapshot 'public-zero-handle'} 'owner_snapshot_child_handle_required'
+  Checked ($snapshotChild.waits.Count -eq 1 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.kills -eq 0) 'snapshot_zero_handle_is_reaped_and_cannot_be_success'
+  $snapshotHandle=[IntPtr]1;$snapshotThrowHandle=$true
+  Fails {Snapshot 'public-handle-getter'} 'owner_snapshot_child_handle_required'
+  Checked ($snapshotChild.waits.Count -eq 1 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.kills -eq 0) 'snapshot_throwing_handle_is_reaped_and_cannot_be_success'
+  $snapshotThrowHandle=$false;$snapshotCalls=0
+  $seedPath=Snapshot 'public-seed'
+  Checked ($seedPath -ceq (Join-Path $script:root 'public-seed.json') -and $snapshotCalls -eq 1 -and $snapshotBindingCalls -eq 0) 'snapshot_seed_without_config_keeps_original_default'
+  Checked ($snapshotArgumentsSeen.Count -eq 7 -and '--config' -cnotin $snapshotArgumentsSeen -and '--config-sha256' -cnotin $snapshotArgumentsSeen) 'snapshot_seed_no_unbound_config_arguments'
+  Checked ($snapshotFilePath -ceq $script:python -and $snapshotPassThru -and $snapshotChild.waits.Count -eq 1 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.kills -eq 0 -and $snapshotChild.refreshes -eq 1) 'snapshot_known_zero_uses_owned_twenty_second_wait'
+  Checked ($snapshotArgumentsSeen[2] -ceq ('"'+$script:inspector+'"') -and $snapshotArgumentsSeen[4] -ceq ('"'+$script:db+'"') -and $snapshotArgumentsSeen[6] -ceq ('"'+$seedPath+'"')) 'snapshot_paths_with_spaces_and_single_quote_are_quoted'
+  $script:configPath=Join-Path $script:root "Program Files\public config's.toml";$script:configSha256='a'*64
+  $expectedPath=Join-Path $script:root "public expected's.json"
+  $snapshotBindingCalls=0;$configuredPath=Snapshot 'public-configured' $expectedPath
+  Checked ($snapshotBindingCalls -eq 2 -and $snapshotArgumentsSeen.Count -eq 13) 'snapshot_actual_config_checked_before_and_after_known_child'
+  Checked ($snapshotArgumentsSeen[7] -ceq '--expected' -and $snapshotArgumentsSeen[8] -ceq ('"'+$expectedPath+'"') -and $snapshotArgumentsSeen[9] -ceq '--config' -and $snapshotArgumentsSeen[10] -ceq ('"'+$script:configPath+'"') -and $snapshotArgumentsSeen[11] -ceq '--config-sha256' -and $snapshotArgumentsSeen[12] -ceq ('a'*64)) 'snapshot_config_path_and_exact_sha_arguments_bound'
+  foreach($code in @(1,$null,'0')) {
+    $snapshotExit=$code
+    Fails {Snapshot 'public-bad-exit'} 'owner_snapshot_failed_public-bad-exit'
+    Checked ($snapshotChild.waits.Count -eq 1 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.kills -eq 0) 'snapshot_nonzero_or_unknown_exit_never_retried'
+  }
+  $snapshotExit=0;$snapshotFirstWait=$false;$snapshotCleanupWait=$true
+  Fails {Snapshot 'public-timeout'} 'owner_snapshot_timeout_no_retry'
+  Checked ($snapshotChild.waits.Count -eq 2 -and $snapshotChild.waits[0] -eq 20000 -and $snapshotChild.waits[1] -eq 10000 -and $snapshotChild.kills -eq 1) 'snapshot_timeout_retains_existing_owned_kill_and_ten_second_cleanup'
+  $snapshotCleanupWait=$false
+  Fails {Snapshot 'public-unknown-cleanup'} 'owner_snapshot_timeout_no_retry;cleanup_unknown_type=System.TimeoutException'
+  $snapshotFirstWait=$true;$snapshotCleanupWait=$true
+  $snapshotExit=1;$snapshotErrorText='snapshot_input_guard {"role":"db","type":"size","is_regular":true,"is_symlink":false,"bytes":68198400,"cap":67108864}'
+  $snapshotObserved=@();$snapshotCaught=$false
+  try{Snapshot 'public-closed-guard' | ForEach-Object {$script:snapshotObserved+=,$_}}catch{$snapshotCaught=$_.Exception.Message -ceq 'owner_snapshot_failed_public-closed-guard'}
+  Checked ($snapshotCaught -and $snapshotObserved.Count -eq 1 -and $snapshotObserved[0] -ceq $snapshotErrorText) 'snapshot_only_closed_numeric_guard_is_forwarded'
+  foreach($text in @('unexported-test-message',($snapshotErrorText+' raw-path'),$snapshotErrorText.Replace('"size"','"unknown"'),$snapshotErrorText.Replace('"cap":67108864','"cap":67108864,"path":"private"'))) {
+    $snapshotErrorText=$text;$snapshotObserved=@();$snapshotCaught=$false
+    try{Snapshot 'public-untrusted-guard' | ForEach-Object {$script:snapshotObserved+=,$_}}catch{$snapshotCaught=$_.Exception.Message -ceq 'owner_snapshot_failed_public-untrusted-guard'}
+    Checked ($snapshotCaught -and $snapshotObserved.Count -eq 0) 'snapshot_nonclosed_error_text_is_never_exported'
+  }
+  $snapshotRemoveError=$true;$snapshotObserved=@();$snapshotCaught=$false
+  try{Snapshot 'public-missing-stderr' 3>&1 | ForEach-Object {$script:snapshotObserved+=,$_}}catch{$snapshotCaught=$_.Exception.Message -ceq 'owner_snapshot_failed_public-missing-stderr'}
+  Checked ($snapshotCaught -and $snapshotObserved.Count -eq 1 -and $snapshotObserved[0] -is [Management.Automation.WarningRecord] -and $snapshotObserved[0].ToString() -ceq 'snapshot_guard_diagnostic_unavailable') 'snapshot_secondary_diagnostic_failure_preserves_primary'
+  $snapshotRemoveError=$false;$snapshotExit=0;$snapshotErrorText=''
+  $snapshotBindingCalls=0;$snapshotBindingFailure=1;$snapshotBefore=$snapshotCalls
+  Fails {Snapshot 'public-config-before'} 'fixture_configuration_hash_changed'
+  Checked ($snapshotCalls -eq $snapshotBefore) 'snapshot_bad_config_cannot_start_child'
+  $snapshotBindingCalls=0;$snapshotBindingFailure=2
+  Fails {Snapshot 'public-config-after'} 'fixture_configuration_hash_changed'
+  Checked ($snapshotChild.waits.Count -eq 1 -and $snapshotChild.kills -eq 0) 'snapshot_configuration_rechecked_after_child_without_retry'
+  $snapshotBindingFailure=0
+  foreach($bad in @('public"path',("public`npath"),("public`rpath"))) {
+    $snapshotGoodInspector=$script:inspector;$script:inspector=$bad;$snapshotBefore=$snapshotCalls
+    Fails {Snapshot 'public-invalid-argument'} 'snapshot_argument_path'
+    Checked ($snapshotCalls -eq $snapshotBefore) 'snapshot_invalid_native_argument_refused_before_child'
+    $script:inspector=$snapshotGoodInspector
   }
   Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false product_or_service_child_executed=false public_powershell_fixture_child_executed=true')
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import time
 
@@ -42,11 +43,94 @@ def bounded_json(path):
     return json.loads(raw)
 
 
-def inspect(path, expected=None):
+DEFAULT_DB_READ_CAP = 64 * 1024 * 1024
+CONFIG_READ_CAP = 131072
+# Matches src/config/config.c's accepted integer range, with zero explicitly
+# rejected for this QA input rather than borrowing the cache's default.
+MAX_CONFIG_BUDGET_MB = 0x7fffffff
+
+
+class SnapshotInputError(ValueError):
+    def __init__(self, role, kind, details, cap):
+        super().__init__('snapshot_' + role + '_' + kind)
+        self.diagnostic = dict(role=role, type=kind,
+            is_regular=stat.S_ISREG(details.st_mode) if details is not None else None,
+            is_symlink=(stat.S_ISLNK(details.st_mode) or bool(getattr(details, 'st_file_attributes', 0) & 1024)) if details is not None else None,
+            bytes=details.st_size if details is not None else None, cap=cap)
+
+
+def snapshot_input(role, path, cap):
+    try:
+        details = path.lstat()
+    except OSError:
+        raise SnapshotInputError(role, 'unavailable', None, cap) from None
+    if stat.S_ISLNK(details.st_mode) or getattr(details, 'st_file_attributes', 0) & 1024:
+        raise SnapshotInputError(role, 'symlink', details, cap)
+    if not stat.S_ISREG(details.st_mode):
+        raise SnapshotInputError(role, 'not_regular', details, cap)
+    if details.st_size < 0 or details.st_size > cap:
+        raise SnapshotInputError(role, 'size', details, cap)
+    return details
+
+
+def config_db_read_cap(config=None, config_sha256=None, db_path=None):
+    if config is None and config_sha256 is None:
+        return DEFAULT_DB_READ_CAP
+    if config is None or config_sha256 is None:
+        raise SnapshotInputError('config', 'parameters', None, CONFIG_READ_CAP)
+    details = snapshot_input('config', config, CONFIG_READ_CAP)
+    for item in config.parents:
+        try:
+            parent = item.lstat()
+        except OSError:
+            raise SnapshotInputError('config', 'unavailable', None, CONFIG_READ_CAP) from None
+        if stat.S_ISLNK(parent.st_mode) or getattr(parent, 'st_file_attributes', 0) & 1024:
+            raise SnapshotInputError('config', 'symlink', parent, CONFIG_READ_CAP)
+    if not isinstance(config_sha256, str) or not re.fullmatch('[0-9a-f]{64}', config_sha256):
+        raise SnapshotInputError('config', 'sha', details, CONFIG_READ_CAP)
+    try:
+        with config.open('rb') as stream:
+            first = os.fstat(stream.fileno())
+            body = stream.read(CONFIG_READ_CAP + 1)
+            last = os.fstat(stream.fileno())
+        after = snapshot_input('config', config, CONFIG_READ_CAP)
+    except OSError:
+        raise SnapshotInputError('config', 'unavailable', None, CONFIG_READ_CAP) from None
+    # Compare each API with itself: Windows stat/fstat creation-time semantics
+    # differ. SHA binds the exact bytes, without borrowing those timestamps.
+    snap = lambda x: (x.st_dev, x.st_ino, x.st_size, x.st_mtime_ns)
+    if (len(body) != details.st_size or len(body) != first.st_size or
+            snap(details) != snap(after) or snap(first) != snap(last) or
+            not stat.S_ISREG(first.st_mode)):
+        raise SnapshotInputError('config', 'changed', after, CONFIG_READ_CAP)
+    if hashlib.sha256(body).hexdigest() != config_sha256:
+        raise SnapshotInputError('config', 'sha', after, CONFIG_READ_CAP)
+    try:
+        import tomllib
+    except ImportError:
+        raise SnapshotInputError('config', 'stdlib_tomllib_required', after, CONFIG_READ_CAP) from None
+    try:
+        value = tomllib.loads(body.decode('utf-8-sig'))
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        raise SnapshotInputError('config', 'toml', after, CONFIG_READ_CAP) from None
+    offline = value.get('offline')
+    budget = offline.get('evidence_cache_max_size_mb') if type(offline) is dict else None
+    if type(budget) is not int:
+        raise SnapshotInputError('config', 'budget_type', after, CONFIG_READ_CAP)
+    if not 1 <= budget <= MAX_CONFIG_BUDGET_MB:
+        raise SnapshotInputError('config', 'budget_range', after, CONFIG_READ_CAP)
+    configured_path = offline.get('evidence_cache_path')
+    if (type(configured_path) is not str or not configured_path or
+            not Path(configured_path).is_absolute() or db_path is None or
+            os.path.normcase(os.path.abspath(configured_path)) != os.path.normcase(os.path.abspath(db_path))):
+        raise SnapshotInputError('config', 'db_path', after, CONFIG_READ_CAP)
+    return budget * 1024 * 1024
+
+
+def inspect(path, expected=None, db_read_cap=DEFAULT_DB_READ_CAP):
     """Caller owns the disposable fixture path. All SQL is one short ro snapshot."""
     deadline = time.monotonic() + 8
-    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 67108864,
-         'synthetic_database_bound')
+    snapshot_input('db', path, db_read_cap)
     db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=.2)
     db.row_factory = sqlite3.Row
     db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
@@ -240,19 +324,26 @@ def main():
     p.add_argument('--db', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--expected', type=Path)
+    p.add_argument('--config', type=Path)
+    p.add_argument('--config-sha256')
     args = p.parse_args()
     need(os.name == 'nt' and os.environ.get('GITHUB_ACTIONS') == 'true' and
          os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'disposable_ci_only')
+    db_read_cap = config_db_read_cap(args.config, args.config_sha256, args.db)
     root = Path(os.environ['RUNNER_TEMP']).resolve()
     for item in (args.db, *args.db.parents):
-        details=item.lstat()
-        need(not item.is_symlink() and not getattr(details,'st_file_attributes',0)&1024, 'reparse_refused')
+        try:
+            details = item.lstat()
+        except OSError:
+            raise SnapshotInputError('db', 'unavailable', None, db_read_cap) from None
+        if stat.S_ISLNK(details.st_mode) or getattr(details, 'st_file_attributes', 0) & 1024:
+            raise SnapshotInputError('db', 'symlink', details, db_read_cap)
     path = args.db.resolve()
     relative = path.relative_to(root)
     need(len(relative.parts) == 3 and re.fullmatch(r'edr-cache-recovery-[0-9a-f]{32}', relative.parts[0]) and
          relative.parts[1:] == ('evidence', 'cache.db'), 'exact_synthetic_db_path')
     expected = bounded_json(args.expected) if args.expected else None
-    result = inspect(path, expected)
+    result = inspect(path, expected, db_read_cap)
     with args.output.open('x', encoding='utf-8') as f:
         json.dump(result, f, indent=2); f.write('\n')
     print(json.dumps(result))
@@ -262,4 +353,8 @@ if __name__ == '__main__':
     if sys.argv[1:2] == ['--verify-native-tools']:
         validate_tools_main()
     else:
-        main()
+        try:
+            main()
+        except SnapshotInputError as error:
+            print('snapshot_input_guard ' + json.dumps(error.diagnostic, separators=(',', ':')), file=sys.stderr)
+            raise SystemExit(1) from None

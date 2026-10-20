@@ -54,9 +54,13 @@ function ReadBounded([string]$Path,[int]$Cap) {
 function ReadOwnedBytes([string]$Path,[int]$Cap=1048576) {
   Need ($Cap -gt 0 -and $Cap -le 1048576) 'owned_read_cap_invalid'
   $path=[IO.Path]::GetFullPath($Path);$before=Get-Item -LiteralPath $path -Force -ErrorAction Stop
-  Need (-not $before.PSIsContainer -and ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_regular_cap_required'
+  # FileSystemInfo's exact missing-cache sentinel is not a reparse point.
+  if($before -is [IO.FileInfo] -and [int]$before.Attributes -eq -1){throw 'owned_source_changed'}
+  Need (-not $before.PSIsContainer) 'owned_read_before_file_type_required'
+  Need (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_before_reparse_forbidden'
   $beforeLength=[long]$before.Length
-  Need ($beforeLength -ge 0 -and $beforeLength -le $Cap) 'owned_read_regular_cap_required'
+  Need ($beforeLength -ge 0) 'owned_read_before_length_negative'
+  Need ($beforeLength -le $Cap) 'owned_read_before_cap_exceeded'
   $s=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
   try {
     Need ($s.Length -le $Cap) 'owned_read_cap_exceeded'
@@ -67,9 +71,13 @@ function ReadOwnedBytes([string]$Path,[int]$Cap=1048576) {
   } finally {$s.Dispose()}
   # Separate the hard shape/cap check from a legitimate replacement transient.
   $after=Get-Item -LiteralPath $path -Force -ErrorAction Stop
-  Need (-not $after.PSIsContainer -and ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_regular_cap_required'
+  # FileSystemInfo's exact missing-cache sentinel is not a reparse point.
+  if($after -is [IO.FileInfo] -and [int]$after.Attributes -eq -1){throw 'owned_source_changed'}
+  Need (-not $after.PSIsContainer) 'owned_read_after_file_type_required'
+  Need (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'owned_read_after_reparse_forbidden'
   $afterLength=[long]$after.Length
-  Need ($afterLength -ge 0 -and $afterLength -le $Cap) 'owned_read_regular_cap_required'
+  Need ($afterLength -ge 0) 'owned_read_after_length_negative'
+  Need ($afterLength -le $Cap) 'owned_read_after_cap_exceeded'
   if($count -ne $beforeLength -or $streamLength -ne $beforeLength -or $beforeLength -ne $afterLength -or
      $before.LastWriteTimeUtc -ne $after.LastWriteTimeUtc -or $before.CreationTimeUtc -ne $after.CreationTimeUtc){throw 'owned_source_changed'}
   $bytes=New-Object byte[] $count
@@ -834,10 +842,38 @@ function Installed([string]$ExpectedHash,[string]$Version) {
 }
 function Snapshot([string]$Name,[string]$Expected='') {
   $path=Join-Path $script:root ($Name+'.json')
-  $snapshotArguments=@($script:inspector,'--db',$script:db,'--output',$path)
-  if ($Expected) {$snapshotArguments+=@('--expected',$Expected)}
-  & $script:python -I -B @snapshotArguments | Out-Null
-  Need ($LASTEXITCODE -eq 0) ('owner_snapshot_failed_'+$Name)
+  foreach($item in @($script:inspector,$script:db,$path,$Expected,$script:configPath)) {
+    Need ($null -eq $item -or $item -notmatch '["\r\n]') 'snapshot_argument_path'
+  }
+  $snapshotArguments=@('-I','-B',('"'+$script:inspector+'"'),'--db',('"'+$script:db+'"'),'--output',('"'+$path+'"'))
+  if ($Expected) {$snapshotArguments+=@('--expected',('"'+$Expected+'"'))}
+  if ($script:configSha256) {
+    ConfigBinding
+    $snapshotArguments+=@('--config',('"'+$script:configPath+'"'),'--config-sha256',$script:configSha256)
+  }
+  $stdout=Join-Path $script:root ($Name+'.snapshot.stdout.log')
+  $stderr=Join-Path $script:root ($Name+'.snapshot.stderr.log')
+  $child=Start-Process -FilePath $script:python -ArgumentList $snapshotArguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+  # Hold this owned short-lived child; a failed getter still takes the same
+  # bounded wait/reap path and can never become a successful snapshot.
+  $childHandle=[IntPtr]::Zero;$childHandleKnown=$false
+  try {$childHandle=$child.Handle;$childHandleKnown=$true} catch {$childHandleKnown=$false}
+  # SQLite's existing 8s progress deadline plus startup/teardown allowance;
+  # WaitProcess retains its existing owned-child kill + at most 10s cleanup.
+  $code=WaitProcess $child 20 'owner_snapshot_timeout_no_retry'
+  Need ($childHandleKnown -and $childHandle -is [IntPtr] -and $childHandle -ne [IntPtr]::Zero) 'owner_snapshot_child_handle_required'
+  if($code -isnot [int] -or $code -ne 0) {
+    try {
+      $errorFile=Get-Item -LiteralPath $stderr -Force -ErrorAction Stop
+      if(-not $errorFile.PSIsContainer -and ($errorFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $errorFile.Length -le 4096) {
+        $text=(ReadBounded $stderr 4096).Trim()
+        $closed='^snapshot_input_guard \{"role":"(?:db|config)","type":"(?:unavailable|symlink|not_regular|size|parameters|sha|changed|stdlib_tomllib_required|toml|budget_type|budget_range|db_path)","is_regular":(?:true|false|null),"is_symlink":(?:true|false|null),"bytes":(?:null|[0-9]{1,16}),"cap":[1-9][0-9]{0,15}\}$'
+        if($text -cmatch $closed){Write-Output $text}
+      }
+    } catch {Write-Warning 'snapshot_guard_diagnostic_unavailable' -WarningAction Continue}
+    throw ('owner_snapshot_failed_'+$Name)
+  }
+  if($script:configSha256){ConfigBinding}
   return $path
 }
 function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]$Updater) {
@@ -845,7 +881,7 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
   $journal=Join-Path $env:ProgramData ('FDSecurity\state\agent-update-'+$command+'.journal.json')
   $report=Join-Path $env:ProgramData ('FDSecurity\logs\agent-update-'+$command+'-report.json')
   $owner=@{task_id=$id;command_id=$command;hash=$script:target.agent_binary_sha256;version=$script:target.version;operation=$Operation;class=$script:actualClass;artifact_id=('ci-cache-recovery-'+$script:target.version);arch=$script:updateArch;manifest=$script:package}
-  $diagnostic=@{label=$Label;task_id=$id;command_id=$command;phase='prepare';child_pid=$null;child_birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null;poll_attempts=0;poll_transients=@{not_found=0;sharing=0;source_changed=0};primary_failure_type=$null;originals=@{report=@{status='not_attempted'};journal=@{status='not_attempted'}}}
+  $diagnostic=@{label=$Label;task_id=$id;command_id=$command;phase='prepare';child_pid=$null;child_birth_filetime=$null;terminal_known=$false;exit_known=$false;exit_code=$null;poll_attempts=0;poll_transients=@{not_found=0;sharing=0;source_changed=0};primary_failure_type=$null;primary_failure_code=$null;originals=@{report=@{status='not_attempted'};journal=@{status='not_attempted'}}}
   $null=$script:transitionDiagnostics.Add($diagnostic)
   $child=$null;$primaryFailure=$false;$clock=[Diagnostics.Stopwatch]::StartNew()
   try {
@@ -926,6 +962,17 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $diagnostic.primary_failure_phase=$diagnostic.phase
     $diagnostic.primary_failure_type=$_.Exception.GetType().FullName
     $diagnostic.primary_failure_hresult=$_.Exception.HResult
+    $diagnostic.primary_failure_code=$null
+    # Export only a source-owned closed identifier, never exception text.
+    foreach($ownedReadFailureCode in @(
+      'owned_read_before_file_type_required','owned_read_before_reparse_forbidden',
+      'owned_read_before_length_negative','owned_read_before_cap_exceeded',
+      'owned_read_after_file_type_required','owned_read_after_reparse_forbidden',
+      'owned_read_after_length_negative','owned_read_after_cap_exceeded',
+      'owned_read_cap_invalid','owned_read_cap_exceeded','owned_source_changed'
+    )){
+      if($_.Exception.Message -ceq $ownedReadFailureCode){$diagnostic.primary_failure_code=$ownedReadFailureCode;break}
+    }
     throw
   }finally{
     try{$captureFailed=SaveTransitionFinalEvidence $child $diagnostic $owner $Label $journal $report}
@@ -989,6 +1036,7 @@ foreach ($stage in @($baseline,$target)) {
   Need ((SHA (Regular (Join-Path $stage.runtime_dir 'FDSensor.exe') 16777216)) -ceq $stage.agent_binary_sha256) 'staged_agent_hash'
   Need ((SHA (Regular $stage.setup_exe 268435456)) -ceq $stage.setup_exe_sha256) 'staged_headless_setup_hash'
 }
+$script:configPath=$null;$script:configSha256=$null
 $completed=$false;$mainPrimaryFailure=$false
 $transitionDiagnostics=New-Object Collections.ArrayList
 $serviceActionDiagnostics=New-Object Collections.ArrayList
