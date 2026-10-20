@@ -307,6 +307,16 @@ jobs:
                       try: child.kill(); child.wait(timeout=5)
                       except BaseException as problem: failure=failure or 'parent_terminal_unknown_'+type(problem).__name__
           try:
+              # The instrumented producer owns the stage inventory. Read its
+              # generated manifest instead of retaining a second fixed stage count.
+              proof=parse(take(root/'contract-build/tests/pipeline-stop-generated/SOURCE-TRANSFORM-v2.json'))
+              inventory=proof.get('stages') if type(proof) is dict else None
+              need(type(proof) is dict and proof.get('schema')=='edr.private.pipeline-diag-source.v2'
+                   and type(inventory) is list and 28<=len(inventory)<=128
+                   and all(type(item) is dict and type(item.get('id')) is int for item in inventory),
+                   'source_stage_manifest')
+              expected_stages=[item['id'] for item in inventory]
+              need(expected_stages==list(range(1,len(inventory)+1)), 'source_stage_inventory')
               for name in ('parent.stdout.log','parent.stderr.log'):
                   raw=take(case/name); streams[name]=dict(bytes=len(raw),sha256=digest(raw))
                   if name=='parent.stdout.log': rows=[parse(line) for line in raw.splitlines()]
@@ -346,7 +356,7 @@ jobs:
                        and d.get('process_evidence_worker_windows_thread_started') is True
                        and d.get('network_transport_initialized') is False and d.get('source_ack_inferred') is False,
                        'worker_isolated_coverage')
-                  need([record.get('stage') for record in stages]==list(range(1,39)), 'stage_inventory')
+                  need([record.get('stage') for record in stages]==expected_stages, 'stage_inventory')
                   for index in (7,8,27,28):
                       need(type(stages[index-1].get('calls')) is int and stages[index-1]['calls']>0, 'windows_core_branch_not_entered')
               accepted=True

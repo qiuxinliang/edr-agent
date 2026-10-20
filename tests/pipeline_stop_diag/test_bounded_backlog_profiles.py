@@ -1,11 +1,18 @@
 """Host-only contracts; parent/worker JSON and process APIs are explicit fakes."""
 import copy
+import ast
+import contextlib
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
+from unittest import mock
 
 HOME = Path(__file__).resolve().parent
 SOURCE = HOME / 'run_bounded_backlog_profiles.py'
@@ -105,6 +112,89 @@ class Factory:
         self.clock=clock;self.exits=exits;self.durations=durations
         self.timeout=timeout;self.calls=[];self.kills=0
     def __call__(self,*args,**kwargs): return FakeParent(self,*args,**kwargs)
+
+
+class DefaultDiagnosticContracts(unittest.TestCase):
+    """Execute the workflow's real consumer with explicit fake worker logs."""
+
+    def invoke(self, mutate=None, inventory=None):
+        root = HOME.parents[1]
+        workflow = (root / '.github/workflows/evidence-retention-comparison.yml').read_text()
+        section = workflow.split('      - name: Build and run the bounded real pipeline diagnostic\n', 1)[1]
+        probe = textwrap.dedent(section.split("          $probe = @'\n", 1)[1].split("          '@\n", 1)[0])
+        tree = ast.parse((HOME / 'generate_diagnostic_source.py').read_text())
+        producer = next(ast.literal_eval(node.value) for node in tree.body
+                        if isinstance(node, ast.Assign) and
+                        any(isinstance(target, ast.Name) and target.id == 'stages' for target in node.targets))
+        manifest = dict(schema='edr.private.pipeline-diag-source.v2',
+                        stages=[dict(id=i, name=name, kind=kind)
+                                for i, (name, kind) in enumerate(producer, 1)])
+        if inventory:
+            inventory(manifest)
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / 'source'
+            temporary = Path(directory) / 'tmp'
+            temporary.mkdir()
+            generated = workspace / 'contract-build/tests/pipeline-stop-generated'
+            generated.mkdir(parents=True)
+            (generated / 'SOURCE-TRANSFORM-v2.json').write_text(json.dumps(manifest))
+            (generated.parent / 'test_preprocess_stop_boundary.exe').write_bytes(b'explicit fake exe')
+            original_rows = worker_rows
+
+            def rows(n, profile):
+                result = original_rows(n, profile)
+                if mutate:
+                    mutate(result, profile)
+                return result
+
+            def launch(args, cwd, stdout, stderr):
+                stdout.write(write_profile(cwd, 16))
+                return mock.Mock(pid=100, wait=mock.Mock(return_value=0),
+                                 poll=mock.Mock(return_value=0))
+
+            environment = dict(GITHUB_WORKSPACE=str(workspace), RUNNER_TEMP=str(temporary),
+                               GITHUB_SHA='a' * 40, GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='1')
+            with mock.patch.dict(os.environ, environment), mock.patch.object(sys, 'argv', ['probe', 'amd64']), \
+                    mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+                    mock.patch(__name__ + '.worker_rows', side_effect=rows), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as ended:
+                    exec(compile(probe, 'workflow-default-consumer', 'exec'), {})
+            receipt = json.loads((temporary / 'preprocess-stop-boundary-profile/receipt.json').read_text())
+            self.assertEqual(ended.exception.code, 0 if receipt['accepted'] else 1)
+            return receipt
+
+    def test_current_producer_stages_are_accepted(self):
+        self.assertTrue(self.invoke()['accepted'])
+
+    def test_missing_duplicate_or_extra_stage_is_rejected(self):
+        for profile in ('ready', 'missing'):
+            for operation in ('missing', 'duplicate', 'extra'):
+                def mutate(rows, current):
+                    if current != profile:
+                        return
+                    stage = [row for row in rows if row['kind'] == 'pipeline_diag_stage'][-1]
+                    if operation == 'missing':
+                        rows.remove(stage)
+                    else:
+                        extra = dict(stage)
+                        if operation == 'extra':
+                            extra['stage'] += 1
+                        rows.append(extra)
+                with self.subTest(profile=profile, operation=operation):
+                    self.assertEqual(self.invoke(mutate)['failure'], 'RuntimeError:stage_inventory')
+
+    def test_invalid_producer_inventory_is_rejected(self):
+        for corrupt in (lambda proof: proof.update(stages=[]),
+                        lambda proof: proof['stages'][-1].update(id=1),
+                        lambda proof: proof['stages'][0].update(id=True)):
+            with self.subTest(corrupt=corrupt):
+                self.assertFalse(self.invoke(inventory=corrupt)['accepted'])
+
+    def test_required_windows_branch_still_has_to_execute(self):
+        def mutate(rows, profile):
+            next(row for row in rows if row.get('stage') == 7)['calls'] = 0
+        self.assertEqual(self.invoke(mutate)['failure'], 'RuntimeError:windows_core_branch_not_entered')
 
 
 class ConsumerContracts(unittest.TestCase):

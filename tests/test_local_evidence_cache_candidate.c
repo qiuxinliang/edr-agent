@@ -9767,8 +9767,9 @@ static int pmfe_artifact_count(const char *path,const char *state) {
   sqlite3 *db=NULL; sqlite3_stmt *st=NULL; int count=-1;
   assert(sqlite3_open(path,&db)==SQLITE_OK);
   assert(sqlite3_prepare_v2(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='pmfe_followup_local_v1' AND upload_status=?",-1,&st,NULL)==SQLITE_OK);
-  sqlite3_bind_text(st,1,state,-1,SQLITE_TRANSIENT);
-  if (sqlite3_step(st)==SQLITE_ROW) count=sqlite3_column_int(st,0);
+  assert(sqlite3_bind_text(st,1,state,-1,SQLITE_TRANSIENT)==SQLITE_OK);
+  assert(sqlite3_step(st)==SQLITE_ROW);
+  count=sqlite3_column_int(st,0);
   sqlite3_finalize(st); sqlite3_close(db); return count;
 }
 static void pmfe_assert_empty_recovery_query_cost(void) {
@@ -9969,6 +9970,20 @@ static void test_pmfe_durable_followup_binding_and_receipt_lifecycle(void) {
   assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)==1);
   assert(edr_local_evidence_cache_pmfe_queue_removed(frame,n)==1); /* finalization replay is idempotent */
   edr_local_evidence_cache_close(); assert(edr_local_evidence_cache_open(path,32u,24u)==0);
+  /* A bounded maintenance turn may yield before the PMFE TTL stage. Keep the
+   * wall-clock expiry fixed, advance only the normal due cadence, and require
+   * eventual deletion within the same finite bound used for metrics expiry. */
+  unsigned expiry_turns=0u;
+  while (pmfe_artifact_count(path,"completed")!=0 && expiry_turns<12u) {
+    edr_local_evidence_cache_get_status(&health);
+    uint64_t previous_runs=health.maintenance_runs;
+    s_test_monotonic_ns+=UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance();
+    edr_local_evidence_cache_get_status(&health);
+    assert(health.db_open && !health.last_error[0] &&
+        health.maintenance_runs==previous_runs+1u);
+    ++expiry_turns;
+  }
   assert(pmfe_artifact_count(path,"completed")==0); /* queue completion restores normal bounded retention */
   assert(!edr_egress_frame_validate(frame,n,reason,sizeof(reason)));
   edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
