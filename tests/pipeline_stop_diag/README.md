@@ -50,8 +50,13 @@ try-prefix, then the same source-owned preflight in a bounded Core7 child from
 the existing `$PSHOME/pwsh.exe`: read-only service/process, machine EDR-key presence and
 active firewall-profile queries. Directory ACLs and pinned QA definitions use
 public unbound Agent inputs and a fresh test-local temporary root. It starts
-no Agent and performs no SCM mutation. The existing one-second CIM query
-limit is retained; the diagnostic preflight worker is bounded to 20 seconds.
+no Agent and performs no SCM mutation. The diagnostic preflight worker remains
+bounded to 20 seconds. Its all-service enumeration uses the existing QA owner
+pattern without a separate one-second CIM operation timeout; the process query
+and later Snapshot query parameters remain unchanged. This single-variable
+experiment follows an observed generic MI failure at operation 1, not proof
+that the one-second parameter caused it. The same Core7 source previously
+succeeded and failed; a successful experiment cannot establish that cause.
 Service enumeration requests only
 Name and PathName, the two fields consumed by the existing alias/path guard;
 all services and the same guard remain covered. This reduces requested fields
