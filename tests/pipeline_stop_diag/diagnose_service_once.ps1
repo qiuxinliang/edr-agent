@@ -472,7 +472,7 @@ function RunServicePreflight([string]$Body){
     try{$stream.WriteByte(0);$stream.Flush()}finally{$stream.Dispose()}
     $literal="'"+$script:preflightProgressPath.Replace("'","''")+"'"
     $bodyWithPath=$Body.Replace("'__PREFLIGHT_PROGRESS_PATH__'",$literal).Replace('__SERVICE__',$script:serviceName)
-    $v=PowerShellWorker 'preflight' $bodyWithPath 8000 4096
+    $v=PowerShellWorker 'preflight' $bodyWithPath 20000 4096
     $accepted=ReadPreflightReceipt $v;Check ($null -ne $accepted) 'preflight_receipt_invalid'
     return @{worker=$v.receipt;preflight=$accepted}
   }finally{

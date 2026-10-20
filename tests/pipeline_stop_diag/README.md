@@ -50,8 +50,9 @@ try-prefix, then the same source-owned preflight in a bounded System32 Windows
 PowerShell 5.1 child: read-only service/process, machine EDR-key presence and
 active firewall-profile queries. Directory ACLs and pinned QA definitions use
 public unbound Agent inputs and a fresh test-local temporary root. It starts
-no Agent and performs no SCM mutation. The existing one-second CIM query and
-eight-second worker limits remain unchanged. Service enumeration requests only
+no Agent and performs no SCM mutation. The existing one-second CIM query
+limit is retained; the diagnostic preflight worker is bounded to 20 seconds.
+Service enumeration requests only
 Name and PathName, the two fields consumed by the existing alias/path guard;
 all services and the same guard remain covered. This reduces requested fields
 and makes no claim that it resolves the historical stop or provider timeout.
@@ -61,6 +62,11 @@ observed PowerShell major 5 / Desktop edition; structured failure is nonzero.
 A failure reports fixed types, numeric positions and a closed stage/cause;
 exception text is excluded. Unknown child identity, terminal state or stream
 EOF fails cleanup and retains the public directory instead of claiming success.
+The earlier eight-second preflight failures remain failures. The temporary
+20-second preflight budget is for observing the local provider/host response,
+not a change to the 45-second Service stop verdict. The 270-second experiment
+budget checks and existing remaining-budget gates before Service creation
+and stop still apply.
 The intent file records declared inputs before preparation, not verified facts.
 The preparation test also reproduces an extra explicit public-fixture ACE left
 by incremental grants, then exercises the actual Access-only DACL replacement
@@ -88,7 +94,8 @@ The preflight also publishes one binary operation byte in its own fresh case.
 The parent creates exactly one byte initialized to zero; before each operation
 1..5 the worker overwrites that byte without growing the file. This is a private
 diagnostic file write, not a system-state modification. The same bounded query
-and eight-second worker limits remain in force. The parent reads the fixed file
+and 20-second preflight worker limits remain in force. The parent reads the
+fixed file
 only after confirming this invocation's held preflight process is terminal; the
 early contract projects it after its exact-child cleanup. Only `status` and
 `last_operation_id` are exported. Zero means no child progress was observed,
