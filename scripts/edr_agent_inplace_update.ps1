@@ -745,14 +745,21 @@ function Rollback-RuntimeUpdatePlan {
 }
 
 function Get-AgentProcesses {
-  param([Parameter(Mandatory = $true)][string]$ExecutablePath)
+  param([Parameter(Mandatory = $true)][string]$ExecutablePath, [switch]$RequireKnown)
 
   $expected = [System.IO.Path]::GetFullPath($ExecutablePath)
-  return @(Get-CimInstance Win32_Process -Filter "Name='FDSensor.exe'" -ErrorAction SilentlyContinue |
+  $queryErrors = if ($RequireKnown) { 'Stop' } else { 'SilentlyContinue' }
+  return @(Get-CimInstance Win32_Process -Filter "Name='FDSensor.exe'" -ErrorAction $queryErrors |
     Where-Object {
       $actual = [string]$_.ExecutablePath
-      if (-not $actual) { return $false }
-      try { return [System.IO.Path]::GetFullPath($actual) -ieq $expected } catch { return $false }
+      if (-not $actual) {
+        if ($RequireKnown) { throw 'cannot confirm Agent exit: FDSensor.exe process path is unavailable' }
+        return $false
+      }
+      try { return [System.IO.Path]::GetFullPath($actual) -ieq $expected } catch {
+        if ($RequireKnown) { throw }
+        return $false
+      }
     })
 }
 
@@ -823,10 +830,51 @@ function Resolve-DeploymentMode {
 function Stop-AgentRuntime {
   param([string]$Mode, [string]$TaskName, [string]$TaskPath, [string]$WindowsServiceName, [string]$ExecutablePath)
   if ($Mode -eq 'service') {
-    Stop-Service -Name $WindowsServiceName -Force -ErrorAction Stop
-  } else {
-    Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
+    # A health failure may be observed while another owner is already stopping
+    # this service. Do not send a second STOP during StopPending. Stop-Service
+    # also waits internally without our deadline, so use the controller's
+    # asynchronous request and one monotonic budget for SCM and process exit.
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $service = Get-Service -Name $WindowsServiceName -ErrorAction Stop
+    $stopRequested = $false
+    try {
+      do {
+        $service.Refresh()
+        $state = [string]$service.Status
+        if ($watch.ElapsedMilliseconds -ge 30000) { break }
+        if ($state -eq 'StopPending' -or $state -eq 'Stopped') {
+          $stopRequested = $true
+        } elseif (-not $stopRequested -and $state -in @('Running', 'Paused')) {
+          $stopRequested = $true
+          try {
+            $service.Stop()
+          } catch {
+            $requestFailure = $_
+            # Another owner can win between Refresh and Stop. Only an observed
+            # stop transition makes that race safe to join; other errors stand.
+            $service.Refresh()
+            if ([string]$service.Status -notin @('StopPending', 'Stopped')) {
+              throw $requestFailure
+            }
+          }
+          $service.Refresh()
+          $state = [string]$service.Status
+        }
+        if ($state -eq 'Stopped' -and
+            @(Get-AgentProcesses -ExecutablePath $ExecutablePath -RequireKnown).Count -eq 0 -and
+            $watch.ElapsedMilliseconds -lt 30000) {
+          return
+        }
+        $remainingMs = 30000 - $watch.ElapsedMilliseconds
+        if ($remainingMs -le 0) { break }
+        Start-Sleep -Milliseconds ([int][Math]::Min(250, $remainingMs))
+      } while ($watch.ElapsedMilliseconds -lt 30000)
+      throw "timed out waiting for Agent service and process to stop: service=$WindowsServiceName state=$state; runtime files were not restored"
+    } finally {
+      $service.Dispose()
+    }
   }
+  Stop-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
   foreach ($process in @(Get-AgentProcesses -ExecutablePath $ExecutablePath)) {
     Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
   }

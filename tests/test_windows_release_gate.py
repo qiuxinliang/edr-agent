@@ -40,7 +40,7 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
-    "windows_update_physical_guard", "windows_updater_health_clock", "windows_inno_evidence_space",
+    "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_stop", "windows_inno_evidence_space",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
@@ -189,7 +189,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.run_command(*wrapper, *probe, env=inherited)
                     self.assertEqual(inherited["PSModulePath"], test_env["PSModulePath"])
 
-    def test_updater_health_clock_uses_checkout_sha_and_isolated_powershell(self):
+    def test_updater_health_and_stop_use_checkout_sha_and_isolated_powershell(self):
         production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         start = production.index("  # Pin the actual checkout bytes at configure time;")
         end = production.index("  add_test(NAME windows_installer_acl_behavior", start)
@@ -205,37 +205,39 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
             listed = self.run_command("ctest", "--test-dir", str(build), "--show-only=json-v1")
             tests = json.loads(listed.stdout)["tests"]
-            self.assertEqual([test["name"] for test in tests], ["windows_updater_health_clock"])
-            command = tests[0]["command"]
-            expected = hashlib.sha256((ROOT / "scripts/edr_agent_inplace_update.ps1").read_bytes()).hexdigest()
-            self.assertIn("--unset=PSModulePath", command)
-            self.assertIn("powershell.exe", command)
-            self.assertIn("-NonInteractive", command)
-            self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
-            self.assertIn("-UpdaterPath '" + (ROOT / "scripts/edr_agent_inplace_update.ps1").as_posix() + "'", command[-1])
-            properties = {item["name"]: item["value"] for item in tests[0]["properties"]}
-            self.assertEqual(properties["TIMEOUT"], 30)
-            environment = properties["ENVIRONMENT"]
-            self.assertEqual(len(environment), 1)
-            self.assertTrue(environment[0].startswith("PSModulePath="))
-            # CMake can canonicalize a Windows 8.3 temporary-directory alias.
-            selected_modules = Path(environment[0][len("PSModulePath="):])
-            self.assertTrue(selected_modules.is_absolute())
-            self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
+            self.assertEqual([test["name"] for test in tests],
+                             ["windows_updater_health_clock", "windows_updater_stop"])
+            for test, timeout in zip(tests, (30, 120)):
+                command = test["command"]
+                expected = hashlib.sha256((ROOT / "scripts/edr_agent_inplace_update.ps1").read_bytes()).hexdigest()
+                self.assertIn("--unset=PSModulePath", command)
+                self.assertIn("powershell.exe", command)
+                self.assertIn("-NonInteractive", command)
+                self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
+                self.assertIn("-UpdaterPath '" + (ROOT / "scripts/edr_agent_inplace_update.ps1").as_posix() + "'", command[-1])
+                properties = {item["name"]: item["value"] for item in test["properties"]}
+                self.assertEqual(properties["TIMEOUT"], timeout)
+                environment = properties["ENVIRONMENT"]
+                self.assertEqual(len(environment), 1)
+                self.assertTrue(environment[0].startswith("PSModulePath="))
+                # CMake can canonicalize a Windows 8.3 temporary-directory alias.
+                selected_modules = Path(environment[0][len("PSModulePath="):])
+                self.assertTrue(selected_modules.is_absolute())
+                self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
 
-    def test_updater_health_clock_is_required_and_failure_blocks_windows_gate(self):
-        name = "windows_updater_health_clock"
-        with tempfile.TemporaryDirectory() as directory:
-            source, build, _ = self.fixture(directory, missing_test=name)
-            result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
-            self.assertIn("Windows release gate test is not registered: " + name, result.stderr)
-        with tempfile.TemporaryDirectory() as directory:
-            source, build, _ = self.fixture(directory, failing_test=name)
-            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
-            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
-                                      "-R", "^" + name + "$", "--no-tests=error", "--output-on-failure", success=False)
-            self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
-            self.assertNotIn("***Not Run", result.stdout)
+    def test_updater_health_and_stop_are_required_and_failure_blocks_windows_gate(self):
+        for name in ("windows_updater_health_clock", "windows_updater_stop"):
+            with tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, missing_test=name)
+                result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
+                self.assertIn("Windows release gate test is not registered: " + name, result.stderr)
+            with tempfile.TemporaryDirectory() as directory:
+                source, build, _ = self.fixture(directory, failing_test=name)
+                self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+                result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                          "-R", "^" + name + "$", "--no-tests=error", "--output-on-failure", success=False)
+                self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
+                self.assertNotIn("***Not Run", result.stdout)
 
     def test_update_invocation_uses_actual_contract_target_and_checkout_driver(self):
         production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
