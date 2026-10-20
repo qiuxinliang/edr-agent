@@ -1075,7 +1075,10 @@ void edr_collector_register_policy_canary_process(uint32_t pid, const char *comm
   edr_policy_canary_mark_pid(pid, edr_policy_canary_now_ns());
 }
 
-static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
+static int edr_collector_canonicalize_file_path(const char *raw, char *out, size_t out_cap);
+
+static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev,
+                                            const EVENT_RECORD *source, uint64_t event_ns) {
   uint64_t now;
   if (!ev || edr_collector_keep_agent_self_events()) return 0;
   now = edr_policy_canary_now_ns();
@@ -1085,8 +1088,41 @@ static int edr_agent_self_suppress_interest(const EdrSensorInterestEvent *ev) {
     edr_policy_canary_mark_pid(ev->pid, now);
     return 0;
   }
-  return edr_collector_self_identity_matches(&s_agent_self_identity,
-                                              ev->pid, ev->process_start_key);
+  const int exact_self = edr_collector_self_identity_matches(
+      &s_agent_self_identity, ev->pid, ev->process_start_key);
+  int typed_mutation = 0;
+  /* The canonical path and its canary decision above precede this missing
+   * optional StartKey extension. Only these typed actors own the header PID. */
+  if (source && event_ns && ev->path[0] &&
+      ev->pid == source->EventHeader.ProcessId &&
+      memcmp(&source->EventHeader.ProviderId, &EDR_ETW_GUID_KERNEL_FILE,
+             sizeof(GUID)) == 0) {
+    const EVENT_DESCRIPTOR *descriptor = &source->EventHeader.EventDescriptor;
+    typed_mutation =
+        (ev->type == EDR_EVENT_FILE_WRITE && edr_kernel_file_write_descriptor(descriptor)) ||
+        (ev->type == EDR_EVENT_FILE_CREATE && edr_kernel_file_create_new_descriptor(descriptor)) ||
+        (ev->type == EDR_EVENT_FILE_RENAME && descriptor->Id == 27u &&
+         edr_kernel_file_mutation_path_descriptor(descriptor));
+  }
+  const int lifetime_self = typed_mutation && !ev->process_start_key &&
+      edr_collector_self_identity_matches_file_actor(
+          &s_agent_self_identity, ev->pid, event_ns, 0u);
+  if (!exact_self && !lifetime_self) return 0;
+  if (typed_mutation && ev->type == EDR_EVENT_FILE_RENAME) {
+    char target[EDR_BR_STR_LONG], canonical_target[EDR_BR_STR_LONG];
+    /* A bound old path can hide a new canary target. Inspect the same typed
+     * target owner used below, only for an otherwise suppressible Agent actor.
+     * CreateNew already resolved its target before entering this decision. */
+    if (!edr_tdh_kernel_file_extract_mutation_path((PEVENT_RECORD)source,
+                                                   target, sizeof(target)) ||
+        !edr_collector_canonicalize_file_path(target, canonical_target,
+                                               sizeof(canonical_target))) return 0;
+    if (edr_policy_canary_marker(canonical_target)) {
+      edr_policy_canary_mark_pid(ev->pid, now);
+      return 0;
+    }
+  }
+  return 1;
 }
 
 static int edr_agent_self_suppress_record(const EdrBehaviorRecord *br) {
@@ -3585,7 +3621,7 @@ static int edr_agent_self_suppress_file_read_source(const EVENT_RECORD *record,
   pid = record->EventHeader.ProcessId;
   if (edr_policy_canary_pid_seen(pid, edr_policy_canary_now_ns())) return 0;
   (void)edr_collector_event_process_start_key(record, &start_key);
-  if (!edr_collector_self_identity_matches_file_read(
+  if (!edr_collector_self_identity_matches_file_actor(
           &s_agent_self_identity, pid, event_ns, start_key)) return 0;
   edr_agent_self_count_drop_source(EDR_AGENT_SELF_DROP_DIRECT_PID);
   return 1;
@@ -4441,7 +4477,7 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
         }
         memcpy(interest_event.path, file_read_path, file_read_path_len + 1u);
       }
-      if (!is_network && edr_agent_self_suppress_interest(&interest_event)) {
+      if (!is_network && edr_agent_self_suppress_interest(&interest_event, event_record, timestamp_ns)) {
         edr_agent_self_count_drop_source(EDR_AGENT_SELF_DROP_INTEREST);
         return;
       }
@@ -4629,11 +4665,11 @@ uint64_t edr_collector_file_io_test_new_epoch(void) {
 }
 
 void edr_collector_file_io_test_feed(EVENT_RECORD *record, uint64_t event_ns) {
-  (void)edr_collector_kernel_file_track_metadata(record, event_ns);
-  if (edr_kernel_file_read_descriptor(&record->EventHeader.EventDescriptor))
-    edr_collector_decode_mapped_event(record, EDR_EVENT_FILE_READ, "kfile", event_ns);
-  else if (edr_kernel_file_write_descriptor(&record->EventHeader.EventDescriptor))
-    edr_collector_decode_mapped_event(record, EDR_EVENT_FILE_WRITE, "kfile", event_ns);
+  EdrEventType type;
+  const char *tag;
+  if (edr_collector_kernel_file_track_metadata(record, event_ns)) return;
+  if (edr_map_type_and_tag(record, &type, &tag))
+    edr_collector_decode_mapped_event(record, type, tag, event_ns);
 }
 
 int edr_collector_file_io_test_pending(EdrEventSlot *slot) {
@@ -4689,7 +4725,7 @@ int edr_collector_network_test_self_record(const EdrBehaviorRecord *record) {
   return edr_agent_self_suppress_record(record);
 }
 int edr_collector_network_test_self_interest(const EdrSensorInterestEvent *event) {
-  return edr_agent_self_suppress_interest(event);
+  return edr_agent_self_suppress_interest(event, NULL, 0u);
 }
 #endif
 

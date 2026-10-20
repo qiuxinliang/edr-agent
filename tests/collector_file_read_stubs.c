@@ -29,13 +29,15 @@ int edr_p0_rule_ir_file_read_path_may_match(const char *path, uint64_t *epoch) {
 }
 
 int edr_sensor_interest_should_admit(const EdrSensorInterestEvent *event) {
-  assert(event && (event->type == EDR_EVENT_FILE_READ || event->type == EDR_EVENT_FILE_WRITE) && event->path[0]);
+  assert(event && (event->type == EDR_EVENT_FILE_READ || event->type == EDR_EVENT_FILE_WRITE ||
+                   event->type == EDR_EVENT_FILE_CREATE || event->type == EDR_EVENT_FILE_RENAME) && event->path[0]);
   return edr_collector_test_sensor_admit;
 }
 
 void edr_ave_etw_feed_from_event(EVENT_RECORD *record, EdrEventType type,
                                 uint64_t at, const char *ip, const char *domain) {
-  assert(record && (type == EDR_EVENT_FILE_READ || type == EDR_EVENT_FILE_WRITE) && at);
+  assert(record && (type == EDR_EVENT_FILE_READ || type == EDR_EVENT_FILE_WRITE ||
+                    type == EDR_EVENT_FILE_CREATE || type == EDR_EVENT_FILE_RENAME) && at);
   assert(!ip && !domain);
 }
 
@@ -44,7 +46,8 @@ void edr_ave_etw_feed_from_event(EVENT_RECORD *record, EdrEventType type,
 int edr_policy_v2_ransomware_enabled(const char *control) { assert(control); return 0; }
 void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) { abort(); }
 int edr_p0_rule_ir_br_matches_any(const EdrBehaviorRecord *record) {
-  assert(record && record->type == EDR_EVENT_FILE_WRITE);
+  assert(record && (record->type == EDR_EVENT_FILE_WRITE || record->type == EDR_EVENT_FILE_CREATE ||
+                    record->type == EDR_EVENT_FILE_RENAME));
   return edr_collector_test_rule_match;
 }
 int edr_p0_rule_ir_is_ready(void) { return 1; }

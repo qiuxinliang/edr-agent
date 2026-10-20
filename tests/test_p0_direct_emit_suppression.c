@@ -785,14 +785,14 @@ static void test_self_noise_requires_exact_live_owner(void) {
   assert(edr_collector_self_identity_matches(&self, r.pid, r.process_start_key));
   const uint64_t self_event_ns =
       (self.creation_filetime_100ns - UINT64_C(116444736000000000)) * 100u;
-  assert(edr_collector_self_identity_matches_file_read(&self, r.pid, self_event_ns, 0u));
-  assert(edr_collector_self_identity_matches_file_read(
+  assert(edr_collector_self_identity_matches_file_actor(&self, r.pid, self_event_ns, 0u));
+  assert(edr_collector_self_identity_matches_file_actor(
       &self, r.pid, self_event_ns, self.process_start_key));
-  assert(!edr_collector_self_identity_matches_file_read(
+  assert(!edr_collector_self_identity_matches_file_actor(
       &self, r.pid, self_event_ns - 1u, 0u));
-  assert(!edr_collector_self_identity_matches_file_read(
+  assert(!edr_collector_self_identity_matches_file_actor(
       &self, r.pid, self_event_ns, 0x7777u));
-  assert(!edr_collector_self_identity_matches_file_read(
+  assert(!edr_collector_self_identity_matches_file_actor(
       &self, 0u, self_event_ns, self.process_start_key));
   assert(!edr_collector_self_identity_matches(&self, 0u, r.process_start_key));
   unknown.process_start_key = 0u;
@@ -801,7 +801,7 @@ static void test_self_noise_requires_exact_live_owner(void) {
   unknown.creation_filetime_100ns = 0u;
   assert(!edr_collector_self_identity_matches(&unknown, r.pid, r.process_start_key));
   assert(!edr_collector_self_identity_matches(NULL, r.pid, r.process_start_key));
-  assert(!edr_collector_self_identity_matches_file_read(
+  assert(!edr_collector_self_identity_matches_file_actor(
       &unknown, r.pid, self_event_ns, 0u));
 }
 

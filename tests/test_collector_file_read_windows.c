@@ -38,7 +38,8 @@ static const char old_path[] = "C:\\Fixture\\existing.txt";
 static const char new_path[] = "C:\\Fixture\\reused.txt";
 
 bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
-  assert(target == &bus && slot && (slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE));
+  assert(target == &bus && slot && (slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE ||
+                                      slot->type == EDR_EVENT_FILE_CREATE || slot->type == EDR_EVENT_FILE_RENAME));
   assert(slot->size && slot->size <= sizeof(slot->data));
   if (reject_bus) return false;
   bus.last = *slot;
@@ -48,7 +49,8 @@ bool edr_event_bus_try_push(EdrEventBus *target, const EdrEventSlot *slot) {
 
 void edr_collector_file_io_test_before_binding(EdrEventSlot *slot) {
   if (binding_space == SIZE_MAX) return;
-  assert(slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE);
+  assert(slot->type == EDR_EVENT_FILE_READ || slot->type == EDR_EVENT_FILE_WRITE ||
+                                      slot->type == EDR_EVENT_FILE_CREATE || slot->type == EDR_EVENT_FILE_RENAME);
   size_t used = strlen((const char *)slot->data);
   size_t target = sizeof(slot->data) - 1u - binding_space;
   assert(target > used + 10u && target < sizeof(slot->data));
@@ -82,13 +84,15 @@ static void make_event(Fixture *f, unsigned id, unsigned version, size_t width,
   f->record.EventHeader.ProviderId = EDR_ETW_GUID_KERNEL_FILE;
   f->record.EventHeader.Flags = width == 8u ? EVENT_HEADER_FLAG_64_BIT_HEADER
                                            : EVENT_HEADER_FLAG_32_BIT_HEADER;
-  f->record.EventHeader.ProcessId = (id == 15u || id == 16u) ? reader_pid : opener_pid;
+  f->record.EventHeader.ProcessId = (id == 15u || id == 16u || id == 27u || id == 30u)
+                                      ? reader_pid : opener_pid;
   f->record.EventHeader.EventDescriptor.Id = (USHORT)id;
   f->record.EventHeader.EventDescriptor.Task = (USHORT)id;
   f->record.EventHeader.EventDescriptor.Version = (BYTE)(id <= 11u ? 0u : version);
   f->record.EventHeader.EventDescriptor.Level = 4u;
   f->record.EventHeader.EventDescriptor.Keyword = id <= 11u ? 0x10u
-      : id == 12u ? 0xa0u : id == 15u ? 0x120u : id == 16u ? 0x220u : 0x20u;
+      : id == 12u ? 0xa0u : id == 15u ? 0x120u : id == 16u ? 0x220u
+      : id == 27u ? 0x800u : id == 30u ? 0x1000u : 0x20u;
   if (id <= 11u) {
     number(f, &used, key, width);
   } else {
@@ -96,12 +100,15 @@ static void make_event(Fixture *f, unsigned id, unsigned version, size_t width,
     number(f, &used, 1u, width); /* Irp */
     if (version == 0u) number(f, &used, 7u, width); /* ThreadId */
     number(f, &used, object, width);
-    if (id != 12u) number(f, &used, key, width);
+    if (id != 12u && id != 30u) number(f, &used, key, width);
+    if (id == 27u) number(f, &used, 0u, width); /* ExtraInfo */
     if (version == 1u) number(f, &used, 7u, 4u); /* IssuingThreadId */
-    if (id == 12u) {
+    if (id == 12u || id == 30u) {
       number(f, &used, 0u, 4u); /* CreateOptions */
       number(f, &used, 0u, 4u); /* CreateAttributes */
       number(f, &used, 3u, 4u); /* ShareAccess */
+    } else if (id == 27u) {
+      number(f, &used, 0u, 4u); /* InfoClass */
     } else if (id == 15u || id == 16u) {
       number(f, &used, 512u, 4u); /* IOSize */
       number(f, &used, 0u, 4u); /* IOFlags */
@@ -665,6 +672,122 @@ static void test_canary_processing_time(unsigned version, size_t width) {
   edr_collector_file_io_test_canary_clock(0u);
 }
 
+/* The decoder owns real TDH path resolution before the self decision. Never
+ * hide a path canary or metadata merely because its header names the Agent. */
+static void test_self_mutation_lifetime(unsigned version, size_t width) {
+  assert(_putenv_s("EDR_POLICY_CANARY_TTL_S", "120") == 0);
+  const unsigned ids[] = {16u, 30u, 27u};
+  const char *const cases[] = {
+      "self_mutation_missing_key", "self_mutation_matching_key",
+      "self_mutation_conflicting_key", "self_mutation_other_pid",
+      "self_mutation_before_birth", "self_mutation_zero_time",
+      "self_mutation_unknown_key", "self_mutation_unknown_birth",
+      "self_mutation_keep", "self_mutation_path_canary",
+      "self_mutation_registered_canary", "self_mutation_expired_canary",
+      "self_mutation_new_target_canary_missing_key",
+      "self_mutation_new_target_canary_matching_key",
+      "self_rename_missing_target_missing_key", "self_rename_missing_target_matching_key",
+      "self_rename_unknown_target_missing_key", "self_rename_unknown_target_matching_key"};
+  for (size_t kind = 0u; kind < sizeof(ids) / sizeof(ids[0]); ++kind) {
+    for (size_t mode = 0u; mode < sizeof(cases) / sizeof(cases[0]); ++mode) {
+      if ((ids[kind] == 16u && mode >= 12u) ||
+          (ids[kind] != 27u && mode >= 14u)) continue;
+      Fixture open, io;
+      uint64_t key = mode == 2u ? UINT64_C(0x9999) : UINT64_C(0x7211);
+      EVENT_HEADER_EXTENDED_DATA_ITEM extended = {0};
+      EdrLiveProcessGeneration self = {
+          reader_pid, UINT64_C(0x7211), UINT64_C(116444736000000001)};
+      case_version = version; case_width = width;
+      reset(cases[mode]);
+      edr_collector_file_io_test_canary_clock(UINT64_C(1000000000));
+      if (mode == 4u) self.creation_filetime_100ns++;
+      if (mode == 6u) self.process_start_key = 0u;
+      if (mode == 7u) self.creation_filetime_100ns = 0u;
+      edr_collector_file_io_test_self_identity(&self);
+      const WCHAR *path = mode == 9u ? L"C:\\Fixture\\EDR_POLICY_CANARY_mutation.txt" : old_name;
+      make_event(&open, 12u, version, width, 0x721101u, 0u, path);
+      make_event(&io, ids[kind], version, width, 0x721101u, 0x721102u,
+                 mode >= 16u ? L"\\Device\\HarddiskVolume999\\unknown.txt" :
+                 mode >= 12u ? L"C:\\Fixture\\EDR_POLICY_CANARY_new_target.txt" :
+                 ids[kind] == 16u ? NULL : path);
+      if (mode == 14u || mode == 15u)
+        io.record.UserDataLength -= (USHORT)((wcslen(L"C:\\Fixture\\EDR_POLICY_CANARY_new_target.txt") + 1u) * sizeof(WCHAR));
+      if (mode == 3u) io.record.EventHeader.ProcessId = reader_pid + 1u;
+      if (mode == 1u || mode == 2u || mode == 13u || mode == 15u || mode == 17u) {
+        extended.ExtType = 13u;
+        extended.DataSize = sizeof(key);
+        extended.DataPtr = (ULONGLONG)(ULONG_PTR)&key;
+        io.record.ExtendedData = &extended; io.record.ExtendedDataCount = 1u;
+      }
+      if (mode == 8u) assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "1") == 0);
+      if (mode == 10u || mode == 11u)
+        edr_collector_register_policy_canary_process(reader_pid, "EDR_POLICY_CANARY_mutation");
+      if (mode == 11u)
+        edr_collector_file_io_test_canary_clock(UINT64_C(121000000001));
+      feed(&open, 100u);
+      feed(&io, mode == 5u ? 0u : 150u);
+      EdrCollectorHealth health;
+      edr_collector_file_io_test_health(&health);
+      const int suppressed = mode == 0u || mode == 1u || mode == 11u;
+      const unsigned published = !suppressed && mode != 5u && mode < 14u ? 1u : 0u;
+      if (bus.published != published) diagnose();
+      assert(bus.published == published);
+      assert(health.agent_self_interest_suppressed == (unsigned)suppressed);
+      assert(!health.agent_self_direct_pid_suppressed && !health.agent_self_record_suppressed);
+      if (mode >= 14u) assert(health.metadata_dropped > 0u);
+      if (published) {
+        EdrBehaviorRecord br;
+        edr_behavior_from_slot(&bus.last, &br);
+        assert(br.pid == io.record.EventHeader.ProcessId && br.event_time_ns == 150);
+        assert(br.type == (ids[kind] == 16u ? EDR_EVENT_FILE_WRITE :
+                           ids[kind] == 30u ? EDR_EVENT_FILE_CREATE : EDR_EVENT_FILE_RENAME));
+        assert(strcmp(br.file_path, mode >= 12u ? "C:\\Fixture\\EDR_POLICY_CANARY_new_target.txt" :
+                                  mode == 9u ? "C:\\Fixture\\EDR_POLICY_CANARY_mutation.txt" : old_path) == 0);
+      }
+      assert(_putenv_s("EDR_COLLECTOR_KEEP_AGENT_SELF", "0") == 0);
+    }
+  }
+  edr_collector_file_io_test_canary_clock(0u);
+}
+
+static void test_self_metadata_preserves_other_actor(unsigned version, size_t width) {
+  Fixture open, name, close, io;
+  EdrLiveProcessGeneration self = {
+      opener_pid, UINT64_C(0x2048), UINT64_C(116444736000000001)};
+  case_version = version; case_width = width;
+  reset("self_metadata_other_actor_and_object_reuse");
+  edr_collector_file_io_test_self_identity(&self);
+  make_event(&open, 12u, version, width, 0x721101u, 0u, old_name);
+  make_event(&name, 10u, version, width, 0u, 0x721102u, old_name);
+  make_event(&close, 14u, version, width, 0x721101u, 0x721102u, NULL);
+  feed(&open, 100u); feed(&name, 110u);
+  assert(!bus.published);
+  make_event(&io, 16u, version, width, 0x721101u, 0x721102u, NULL);
+  feed(&io, 150u);
+  assert(bus.published == 1u);
+  feed(&close, 200u);
+  assert(bus.published == 1u);
+  make_event(&name, 11u, version, width, 0u, 0x721102u, NULL);
+  feed(&name, 210u);
+  make_event(&open, 12u, version, width, 0x721101u, 0u, new_name);
+  feed(&open, 300u);
+  make_event(&io, 16u, version, width, 0x721101u, 0x721103u, NULL);
+  feed(&io, 350u);
+  assert(bus.published == 2u);
+  EdrBehaviorRecord br;
+  edr_behavior_from_slot(&bus.last, &br);
+  assert(br.pid == reader_pid && strcmp(br.file_path, new_path) == 0);
+  /* Delayed writes retain their original, closed object generation. */
+  make_event(&io, 16u, version, width, 0x721101u, 0x721102u, NULL);
+  feed(&io, 150u);
+  assert(bus.published == 3u);
+  edr_behavior_from_slot(&bus.last, &br);
+  assert(br.pid == reader_pid && strcmp(br.file_path, old_path) == 0);
+  EdrCollectorHealth health;
+  edr_collector_file_io_test_health(&health);
+  assert(!health.agent_self_suppressed);
+}
+
 static DWORD WINAPI register_canary_concurrently(void *context) {
   uint32_t pid = (uint32_t)(ULONG_PTR)context;
   for (unsigned i = 0u; i < 1000u; ++i)
@@ -934,6 +1057,10 @@ int main(void) {
     test_write_accounting(version, 8u);
     test_canary_processing_time(version, 4u);
     test_canary_processing_time(version, 8u);
+    test_self_mutation_lifetime(version, 4u);
+    test_self_mutation_lifetime(version, 8u);
+    test_self_metadata_preserves_other_actor(version, 4u);
+    test_self_metadata_preserves_other_actor(version, 8u);
     test_no_lifetime_diagnostics(version, 4u);
     test_no_lifetime_diagnostics(version, 8u);
     test_open_binding_under_close_pressure(version, 4u);
