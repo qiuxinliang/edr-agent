@@ -414,7 +414,7 @@ function SetPreflightProgress([byte]$Operation){
 }
 $operationId=1
 SetPreflightProgress $operationId
-$s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
+$s=@(Get-CimInstance Win32_Service -Property Name,PathName -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
 $operationId=2
 SetPreflightProgress $operationId
 $p=@(Get-CimInstance Win32_Process -Property Name -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSensor.exe','edr_agent.exe')})

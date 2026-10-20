@@ -51,7 +51,11 @@ PowerShell 5.1 child: read-only service/process, machine EDR-key presence and
 active firewall-profile queries. Directory ACLs and pinned QA definitions use
 public unbound Agent inputs and a fresh test-local temporary root. It starts
 no Agent and performs no SCM mutation. The existing one-second CIM query and
-eight-second worker limits remain unchanged. Exit zero is accepted only with
+eight-second worker limits remain unchanged. Service enumeration requests only
+Name and PathName, the two fields consumed by the existing alias/path guard;
+all services and the same guard remain covered. This reduces requested fields
+and makes no claim that it resolves the historical stop or provider timeout.
+Exit zero is accepted only with
 the exact success schema, original three safety conditions, operation 5 and
 observed PowerShell major 5 / Desktop edition; structured failure is nonzero.
 A failure reports fixed types, numeric positions and a closed stage/cause;
