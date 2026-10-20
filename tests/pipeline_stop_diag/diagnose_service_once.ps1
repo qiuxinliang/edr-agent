@@ -78,7 +78,6 @@ $script:publicFailureCodes=@(
   'owned_worker_terminal_unknown',
   'pre_stop_log_binding_unknown',
   'preexisting_agent_or_service',
-  'private_case_acl_failed',
   'private_case_acl_not_protected',
   'private_case_acl_unexpected_principal',
   'public_worker_source_bound',
@@ -183,6 +182,27 @@ function RegularPath([string]$Path,[long]$Cap=67108864){
   $parent=$p.Directory
   while($null -ne $parent){Check (($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'reparse_parent_refused';$parent=$parent.Parent}
   return $p.FullName
+}
+function SetDiagnosticCaseAcl([string]$Path){
+  $item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  Check ($item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $item.FullName -ceq $script:case) 'private_case_acl_unexpected_principal'
+  # Replace Access only. Incremental grants can retain other explicit ACEs.
+  # Preserve the current owner/group/SACL; grant no additional identity.
+  $acl=Get-Acl -LiteralPath $item.FullName
+  $acl.SetSecurityDescriptorSddlForm('D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)',[Security.AccessControl.AccessControlSections]::Access)
+  Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
+  $acl=Get-Acl -LiteralPath $item.FullName
+  $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+  Check ($acl.AreAccessRulesProtected -and $rules.Count -eq 2) 'private_case_acl_not_protected'
+  $seen=@{};$inherit=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+  foreach($rule in $rules){
+    $sid=$rule.IdentityReference.Value
+    Check ($sid -cin @('S-1-5-18','S-1-5-32-544') -and -not $seen.ContainsKey($sid) -and
+      $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and -not $rule.IsInherited -and
+      $rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl -and
+      $rule.InheritanceFlags -eq $inherit -and $rule.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::None) 'private_case_acl_unexpected_principal'
+    $seen[$sid]=$true
+  }
 }
 function SaveNew([string]$Name,$Value){
   $text=$Value|ConvertTo-Json -Depth 24 -Compress;$bytes=[Text.UTF8Encoding]::new($false).GetBytes($text+"`n")
@@ -414,10 +434,7 @@ public static class CiServiceBoundedPump {
   SaveNew 'intent.json' @{schema='edr.ci-isolated-service-intent.v1';source_sha=$SourceSha;token=$Token;service=$script:serviceName;agent_sha256=$AgentSha256;config_template_sha256=$ConfigTemplateSha256;qa_driver_sha256=$QADriverSha256;budget_profile='match512';stop_ms=45000;observe_max_ms=60000;overall_cooperative_ms=270000;cleanup_reserve_ms=30000;no_installer_or_updater=$true;no_release=$true;no_endpoint=$true}
   $script:result.intent_recorded=$true
   $script:result.preparation_stage_id=4
-  & (Join-Path $env:WINDIR 'System32\icacls.exe') $script:case /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-  Check ($LASTEXITCODE -eq 0) 'private_case_acl_failed'
-  $acl=Get-Acl -LiteralPath $script:case;Check $acl.AreAccessRulesProtected 'private_case_acl_not_protected'
-  foreach($rule in $acl.Access){$sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;Check ($sid -cin @('S-1-5-18','S-1-5-32-544') -and [string]$rule.AccessControlType -ceq 'Allow') 'private_case_acl_unexpected_principal'}
+  SetDiagnosticCaseAcl $script:case
   $script:result.preparation_stage_id=5
   $script:winPS=RegularPath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
   $sc=RegularPath (Join-Path $env:WINDIR 'System32\sc.exe')

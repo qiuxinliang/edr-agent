@@ -12,7 +12,7 @@ $ErrorActionPreference='Stop'
 $probeClock=[Diagnostics.Stopwatch]::StartNew();$probeRoot=$null;$probeCreated=$false;$projectLoaded=$false
 $probeOldRunnerTemp=$env:RUNNER_TEMP;$probeStatement=$null;$probeParserSelected=$false;$errors=$null
 $script:result=@{preparation_stage_id=0;intent_recorded=$false}
-$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v1';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$true;service_or_agent_started=$false;preflight_worker_started=$false;dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
+$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v1';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;acl_contract=$null;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$true;service_or_agent_started=$false;preflight_worker_started=$false;dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
 function Guard($Value,[string]$Cause){if(-not $Value){throw $Cause}}
 function ReadSource([string]$Path,[string]$Expected){
  $f=Get-Item -LiteralPath $Path -Force
@@ -42,13 +42,12 @@ try{
  Guard ($probeBoundary -ge 1 -and $probeBoundary -le 80) 'bounded_prefix_required'
  $probePrefix=@($probeStatements[0..($probeBoundary-1)]);$probe.prefix_statement_count=$probePrefix.Count
  # Check every selected statement before executing any selected statement.
- $probeAllowed=@('Check','Add-Type','Get-Item','Test-Path','Join-Path','New-Item','SaveNew','Out-Null','Get-Acl','RegularPath','Hash','Invoke-Expression','SampleLimits','OriginalReadStopLogSlice')
+ $probeAllowed=@('Check','Add-Type','Get-Item','Test-Path','Join-Path','New-Item','SaveNew','SetDiagnosticCaseAcl','RegularPath','Hash','Invoke-Expression','SampleLimits','OriginalReadStopLogSlice')
  foreach($probeNode in $probePrefix){
   Guard (@($probeNode.FindAll({param($n)$n -is [Management.Automation.Language.ExitStatementAst]},$true)).Count -eq 0) 'prefix_exit_refused'
   foreach($c in @($probeNode.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){
    $cn=$c.GetCommandName()
-   if($null -eq $cn){Guard ($c.Extent.Text.StartsWith("& (Join-Path `$env:WINDIR 'System32\icacls.exe') ",[StringComparison]::Ordinal)) 'prefix_dynamic_command_refused'}
-   else{Guard ($cn -cin $probeAllowed) 'prefix_command_refused'}
+   Guard ($null -ne $cn -and $cn -cin $probeAllowed) 'prefix_command_refused'
   }
  }
  $probeIntent=@($probePrefix|Where-Object {$_.Extent.Text -cmatch "^SaveNew 'intent[.]json' "})
@@ -56,7 +55,7 @@ try{
  $probeCodes=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -ceq 'script:publicFailureCodes'},$true))
  Guard ($probeCodes.Count -eq 1 -and $probeCodes[0].Right.Extent.Text -cmatch "(?s)^\s*@\(\s*(?:'[a-z][a-z0-9_]{0,100}'\s*,?\s*)+\)\s*$") 'literal_failure_codes_required'
  $script:publicFailureCodes=@([regex]::Matches($probeCodes[0].Right.Extent.Text,"'([a-z][a-z0-9_]{0,100})'")|ForEach-Object {$_.Groups[1].Value})
- foreach($probeName in @('Check','Hash','RegularPath','SaveNew','ProjectPrimaryFailure')){
+ foreach($probeName in @('Check','Hash','RegularPath','SetDiagnosticCaseAcl','SaveNew','ProjectPrimaryFailure')){
   $defs=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $probeName},$true))
   Guard ($defs.Count -eq 1) 'prefix_helper_inventory'
   Invoke-Expression $defs[0].Extent.Text
@@ -68,6 +67,29 @@ try{
  $probeRoot=Join-Path $probeParent.FullName ('edr-ci-preparation-contract-'+[guid]::NewGuid().ToString('N'))
  Guard (-not (Test-Path -LiteralPath $probeRoot)) 'public_root_exists'
  $null=New-Item -ItemType Directory -Path $probeRoot -ErrorAction Stop;$probeCreated=$true
+ # A public controlled counterexample, not the unknown historical ACL.
+ # Incremental grants retain an extra explicit ACE; the actual owner must
+ # replace it, preserve owner/group, remain idempotent and protect children.
+ $probe.phase='acl_counterexample'
+ $aclPath=Join-Path $probeRoot 'acl-contract';$null=New-Item -ItemType Directory -Path $aclPath
+ $script:case=$aclPath;$acl=Get-Acl -LiteralPath $aclPath
+ $ownerBefore=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;$groupBefore=$acl.GetGroup([Security.Principal.SecurityIdentifier]).Value
+ $acl.SetSecurityDescriptorSddlForm('D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;AU)',[Security.AccessControl.AccessControlSections]::Access)
+ Set-Acl -LiteralPath $aclPath -AclObject $acl
+ & (Join-Path $env:WINDIR 'System32\icacls.exe') $aclPath /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+ Guard ($LASTEXITCODE -eq 0) 'legacy_grant_failed'
+ $acl=Get-Acl -LiteralPath $aclPath;$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+ Guard ($rules.Count -ge 3 -and @($rules|Where-Object {$_.IdentityReference.Value -ceq 'S-1-5-11' -and -not $_.IsInherited}).Count -eq 1) 'legacy_explicit_ace_counterexample_missing'
+ SetDiagnosticCaseAcl $aclPath;SetDiagnosticCaseAcl $aclPath
+ $acl=Get-Acl -LiteralPath $aclPath
+ Guard ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq $ownerBefore -and $acl.GetGroup([Security.Principal.SecurityIdentifier]).Value -ceq $groupBefore) 'acl_owner_or_group_changed'
+ $child=Join-Path $aclPath 'child';$null=New-Item -ItemType Directory -Path $child
+ $childAcl=Get-Acl -LiteralPath $child;$childRules=@($childAcl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+ Guard ($childRules.Count -eq 2) 'child_acl_rule_count'
+ foreach($rule in $childRules){Guard ($rule.IdentityReference.Value -cin @('S-1-5-18','S-1-5-32-544') -and $rule.IsInherited -and $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) 'child_acl_not_private'}
+ $marker=Join-Path $child 'public.txt';[IO.File]::WriteAllText($marker,'acl-public-fixture',[Text.UTF8Encoding]::new($false))
+ Guard ([IO.File]::ReadAllText($marker) -ceq 'acl-public-fixture') 'private_child_roundtrip'
+ $probe.acl_contract=@{controlled_extra_explicit_ace_preserved_by_legacy_grant=$true;canonical_reset_twice_passed=$true;owner_group_preserved=$true;child_inherits_private_acl=$true;public_marker_roundtrip=$true;historical_acl_replayed=$false}
  $env:RUNNER_TEMP=$probeRoot
  # Only test-local inputs/state. No supplied EXE or product bytes are opened.
  $SourceSha=$env:GITHUB_SHA;$Token=[guid]::NewGuid().ToString('N');$Architecture='arm64'

@@ -51,6 +51,11 @@ function definitions, with public unbound Agent inputs and a fresh test-local
 temporary root. It starts no Agent or SCM service. A failure reports fixed
 types, numeric positions and a closed stage/cause; exception text is excluded.
 The intent file records declared inputs before preparation, not verified facts.
+The preparation test also reproduces an extra explicit public-fixture ACE left
+by incremental grants, then exercises the actual Access-only DACL replacement
+twice and checks private child inheritance and a public marker round trip.
+Only SYSTEM and Administrators receive explicit inheritable FullControl;
+the existing owner, group and SACL are preserved.
 
 The SCM harness requires a clean hosted runner and unique paths/service name.
 It stages and verifies the complete static/delay-import DLL closure beside the
