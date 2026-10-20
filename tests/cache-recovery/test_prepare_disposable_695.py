@@ -14,6 +14,7 @@ P698_PRODUCT_PINS=('release_id','handler_receipt_sha256','binary_sha256','headle
 P699_BINDING_PINS=('release_run', 'release_id', 'native_run', 'native_artifact_id', 'native_artifact_size', 'native_artifact_sha256', 'native_uncompressed_bytes', 'native_member_count', 'handler_receipt_sha256', 'binary_sha256', 'headless_sha256', 'artifact_manifest_sha256', 'preflight_response_sha256', 'p5_sha256', 'runtime_identity_sha256')
 P701_BINDING_PINS=P699_BINDING_PINS
 P702_BINDING_PINS=P699_BINDING_PINS
+P703_BINDING_PINS=P699_BINDING_PINS
 class Contracts(unittest.TestCase):
     def test_closed_runtime_mode_requires_exact_strings_before_io(self):
         for mode in ('service','scheduled_task'):
@@ -298,6 +299,64 @@ class Contracts(unittest.TestCase):
         with tempfile.TemporaryDirectory()as d:
             catalog=Path(d)/'synthetic-parser-only702.json';catalog.write_text(json.dumps(value))
             with patch.object(M,'PROFILE_FILE',catalog):self.assertEqual(M.cohort('702')[0],c)
+
+
+    # 703 parser-only fixtures never supply a published receipt or run recovery.
+    def test_703_known_identity_and_catalog_capacity(self):
+        c,base,pin=M.cohort('703',False)
+        self.assertEqual((c['source'],c['version'],c['tag']),('3710b8800ee43f9f4ac29bc73fb224137a51dab1','3.2.703','win_3.2.703'))
+        self.assertEqual(c['builder_owner_sha256'],M.BUILDER_SHA)
+        self.assertEqual(c['handler_owner_sha256'],M.HANDLER_SHA)
+        self.assertLessEqual(len(M.cohort_catalog_raw()),16384)
+        full=json.loads(M.cohort_catalog_raw());target=full['profiles']['703']
+        for key in P703_BINDING_PINS:
+            if target[key]=='UNBOUND':target[key]='f'*64 if key.endswith('_sha256')else '9'*20
+        self.assertLessEqual(len((json.dumps(full,indent=2)+'\n').encode()),16384)
+        # The same test remains valid after Root binds real published identities.
+        if any(c[k]=='UNBOUND' for k in P703_BINDING_PINS):
+            with self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):M.cohort('703')
+        else:self.assertEqual(M.cohort('703')[0],c)
+
+    def test_703_each_missing_pin_refuses_prepare_and_finalize_before_io(self):
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['703']
+        for k in P703_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('no external'))as call:
+            root=Path(d)/'must-not-exist';catalog=Path(d)/'temporary-missing703.json'
+            for key in P703_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                with patch.object(M,'PROFILE_FILE',catalog):
+                    for mode in ('service','scheduled_task'):
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.prepare(Path(d),root,'UNBOUND','UNBOUND','0','UNBOUND','703',mode)
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.finalize(Path(d),root,'703',mode)
+                fixture[key]=original
+            self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+
+    def test_703_cli_refuses_each_missing_pin_normal_and_optimized(self):
+        import subprocess
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['703']
+        for k in P703_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            script=Path(d)/'prepare_disposable_695.py';script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+            catalog=script.with_name('recovery_cohorts.json')
+            for key in P703_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                for flags in ([],['-O']):
+                    for selection in (['--cohort','703'],['--target-tag','win_3.2.703']):
+                        with self.subTest(pin=key,flags=flags,selection=selection):
+                            r=subprocess.run([sys.executable,'-I','-B',*flags,str(script),'profile',*selection],capture_output=True,timeout=3)
+                            self.assertNotEqual(r.returncode,0);self.assertEqual(r.stdout,b'')
+                            self.assertEqual(r.stderr.decode('utf-8','strict').splitlines(),['disposable_preparation_failed:recovery_cohort_UNBOUND'])
+                fixture[key]=original
+
+    def test_703_parser_only_bound_routing_is_separate_from_actual_proof(self):
+        value=json.loads(M.cohort_catalog_raw());c=value['profiles']['703']
+        for k in P703_BINDING_PINS:c[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            catalog=Path(d)/'synthetic-parser-only703.json';catalog.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',catalog):self.assertEqual(M.cohort('703')[0],c)
+
 
 
     def test_unknown_cohort_never_falls_back(self):

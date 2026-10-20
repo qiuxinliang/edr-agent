@@ -1,10 +1,10 @@
-# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 / 702 recovery cohorts
+# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 / 702 / 703 recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695, 697, 698, 699, 701 and 702 selectors exist; there is no caller source/run/asset URL override.
+695, 697, 698, 699, 701, 702 and 703 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
 
@@ -262,3 +262,18 @@ power-loss recovery, full updater interrupt coverage, real-data migration/deleti
 72-hour retention or whole-Agent load. Existing 695 updater timestamp/time-zone
 and cross-time-zone resume concerns remain separate; successful fresh local
 transitions must not be used to erase that independently confirmed issue.
+
+Cohort 703 binds the bounded stop-group fix at product source
+`3710b8800ee43f9f4ac29bc73fb224137a51dab1`, Headless `3.2.703`, release `418870353`,
+release run `39496449153/1`. Native run `39492309023/1` passed on ARM64 and
+AMD64; its ARM64 test tool artifact `12296609844` contains 1,239,246 ZIP
+bytes and 3,088,567 expanded bytes across four members.
+
+All 15 external pins come from actual release/native metadata, verified bytes,
+the original in-process handler receipt and independent original-builder export.
+The P5 export is 7,271,439 bytes with SHA-256 `9c80ee5e4f9851b9bbbd214a0fd42878683b3b53958ff0216f731fdf60b3fbd7`, matching the
+handler result. Its existing installer transport is derived from Headless; no
+Setup UI release asset was downloaded. The original handler records
+`authenticated_platform_http=false`; this binding proves neither live platform
+authorization nor actual Service recovery. Service and Task transitions still
+require their own actual receipts under unchanged 45/30/900-second bounds.

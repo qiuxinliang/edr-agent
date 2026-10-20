@@ -135,7 +135,7 @@ func p5JSON(raw []byte, out any) error {
 	return typed.Decode(out)
 }
 func p5Cohort(id string) (map[string]string, error) {
-	if id != "695" && id != "697" && id != "698" && id != "699" && id != "701" && id != "702" {
+	if id != "695" && id != "697" && id != "698" && id != "699" && id != "701" && id != "702" && id != "703" {
 		return nil, errors.New("unsupported_recovery_cohort")
 	}
 	var catalog struct {
@@ -146,8 +146,8 @@ func p5Cohort(id string) (map[string]string, error) {
 	if e := p5JSON(p5CohortBytes, &catalog); e != nil {
 		return nil, e
 	}
-	if len(p5CohortBytes) > 16384 || catalog.Schema != "edr.ci-recovery-cohorts.v1" || len(catalog.Profiles) != 6 ||
-		catalog.Profiles["695"] == nil || catalog.Profiles["697"] == nil || catalog.Profiles["698"] == nil || catalog.Profiles["699"] == nil || catalog.Profiles["701"] == nil || catalog.Profiles["702"] == nil {
+	if len(p5CohortBytes) > 16384 || catalog.Schema != "edr.ci-recovery-cohorts.v1" || len(catalog.Profiles) != 7 ||
+		catalog.Profiles["695"] == nil || catalog.Profiles["697"] == nil || catalog.Profiles["698"] == nil || catalog.Profiles["699"] == nil || catalog.Profiles["701"] == nil || catalog.Profiles["702"] == nil || catalog.Profiles["703"] == nil {
 		return nil, errors.New("cohort_catalog_shape")
 	}
 	base := catalog.Baseline
@@ -856,5 +856,67 @@ func TestPrivateP5Cohort702MissingPins(t *testing.T) {
 	bound.Source = p5Source
 	if _, e := p5BindingCohort(bound); e == nil {
 		t.Fatal("702_cross_cohort_source")
+	}
+}
+
+// Temporary routing fixture only; never actual703 artifact/export proof.
+func TestPrivateP5Cohort703MissingPins(t *testing.T) {
+	original := append([]byte(nil), p5CohortBytes...)
+	defer func() { p5CohortBytes = original }()
+	var fixture map[string]any
+	if e := json.Unmarshal(original, &fixture); e != nil {
+		t.Fatal(e)
+	}
+	c := fixture["profiles"].(map[string]any)["703"].(map[string]any)
+	if c["source"] != "3710b8800ee43f9f4ac29bc73fb224137a51dab1" || c["version"] != "3.2.703" || c["tag"] != "win_3.2.703" {
+		t.Fatal("prepared703_identity_changed")
+	}
+	pins := []string{"release_run", "release_id", "native_run", "native_artifact_id", "native_artifact_size", "native_artifact_sha256", "native_uncompressed_bytes", "native_member_count", "handler_receipt_sha256", "binary_sha256", "headless_sha256", "artifact_manifest_sha256", "preflight_response_sha256", "p5_sha256", "runtime_identity_sha256"}
+	// Real catalog may still be partial; only this temporary fixture supplies fake pins.
+
+	unbound := false
+	for _, k := range pins {
+		if c[k] == "UNBOUND" {
+			unbound = true
+		}
+	}
+	if _, e := p5Cohort("703"); unbound && (e == nil || e.Error() != "recovery_cohort_UNBOUND") || !unbound && e != nil {
+		t.Fatal("real703_partial_must_not_be_positive", e)
+	}
+	for _, k := range pins {
+		if strings.HasSuffix(k, "_sha256") {
+			c[k] = strings.Repeat("1", 64)
+		} else {
+			c[k] = "1"
+		}
+	}
+	p5CohortBytes, _ = json.Marshal(fixture)
+	bound := p5Binding{CohortID: "703", Source: c["source"].(string), Version: c["version"].(string), CatalogSHA: p5Hash(p5CohortBytes)}
+	if _, e := p5BindingCohort(bound); e != nil {
+		t.Fatal("synthetic703_routing", e)
+	}
+	for _, k := range pins {
+		value := c[k]
+		c[k] = "UNBOUND"
+		p5CohortBytes, _ = json.Marshal(fixture)
+		if _, e := p5Cohort("703"); e == nil || e.Error() != "recovery_cohort_UNBOUND" {
+			t.Fatal("missing703_not_refused", k, e)
+		}
+		missing := bound
+		missing.CatalogSHA = p5Hash(p5CohortBytes)
+		if _, e := p5BindingCohort(missing); e == nil || e.Error() != "recovery_cohort_UNBOUND" {
+			t.Fatal("missing703_binding_not_refused", k, e)
+		}
+		c[k] = value
+	}
+	p5CohortBytes, _ = json.Marshal(fixture)
+	bound.CatalogSHA = ""
+	if _, e := p5BindingCohort(bound); e == nil {
+		t.Fatal("703_missing_catalog_sha")
+	}
+	bound.CatalogSHA = p5Hash(p5CohortBytes)
+	bound.Source = p5Source
+	if _, e := p5BindingCohort(bound); e == nil {
+		t.Fatal("703_cross_cohort_source")
 	}
 }
