@@ -413,6 +413,8 @@ jobs:
             -AgentPath $agent -AgentSha256 (Pin $agent) -DllRoots @((Join-Path $prefix 'bin'), $redist[0].FullName) `
             -DumpbinPath (Get-Command dumpbin.exe -ErrorAction Stop).Source -PythonPath (Get-Command python.exe -ErrorAction Stop).Source `
             -QADriverSha256 (Pin $driver) -NativeStagerSha256 (Pin $stager) -StageAdapterSha256 (Pin $adapter) `
+            -PipelineSourceSha256 (Pin (Join-Path $env:GITHUB_WORKSPACE 'src/preprocess/preprocess_pipeline.c')) `
+            -CacheSourceSha256 (Pin (Join-Path $env:GITHUB_WORKSPACE 'src/storage/local_evidence_cache.c')) `
             -NativeToolManifestPath $nativeManifest -NativeToolManifestSha256 (Pin $nativeManifest) `
             -ConfigTemplatePath $template -ConfigTemplateSha256 (Pin $template)
           if ($LASTEXITCODE -ne 0) { throw 'Isolated Service stop failed or is unknown; preserve the original result' }

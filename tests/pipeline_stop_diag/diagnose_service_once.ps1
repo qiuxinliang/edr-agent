@@ -20,7 +20,9 @@ param(
   [Parameter(Mandatory)][string]$NativeToolManifestPath,
   [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$NativeToolManifestSha256,
   [Parameter(Mandatory)][string]$ConfigTemplatePath,
-  [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$ConfigTemplateSha256
+  [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$ConfigTemplateSha256,
+  [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$PipelineSourceSha256,
+  [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$CacheSourceSha256
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
@@ -506,6 +508,112 @@ function RunServicePreflight([string]$Body){
     $script:result.preflight_progress=ReadPreflightProgress $script:preflightProgressPath $known
   }
 }
+function ProjectCachePositiveFrame([string]$Line,[int]$ExpectedPid,[string]$ExpectedPathSha,[string]$ExpectedPipelineSha,[string]$ExpectedCacheSha){
+  $prefix='[preprocess] worker cache proof ';$document=$null
+  try{
+    if(-not $Line.StartsWith($prefix,[StringComparison]::Ordinal) -or [Text.Encoding]::UTF8.GetByteCount($Line) -gt 4096){throw 'cache_proof_frame_shape'}
+    try{$document=[Text.Json.JsonDocument]::Parse($Line.Substring($prefix.Length))}catch{throw 'cache_proof_frame_json'}
+    $root=$document.RootElement
+    if($root.ValueKind -ne [Text.Json.JsonValueKind]::Object){throw 'cache_proof_frame_shape'}
+    $expected=@('schema','version','pid','tid','status_getter_calls','db_open','storage_format','path_hash_valid','cache_path_sha256','context_facts_written','context_refs_written','candidate_records_written','retention_clock_valid','pipeline_source_sha256','cache_source_sha256')
+    $keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($property in $root.EnumerateObject()){if(-not $keys.Add($property.Name) -or $property.Name -cnotin $expected){throw 'cache_proof_frame_keys'}}
+    if($keys.Count -ne 15){throw 'cache_proof_frame_keys'}
+    $frame=@{}
+    foreach($key in @('schema','cache_path_sha256','pipeline_source_sha256','cache_source_sha256')){
+      $v=$root.GetProperty($key);if($v.ValueKind -ne [Text.Json.JsonValueKind]::String){throw 'cache_proof_frame_type'};$frame[$key]=$v.GetString()
+    }
+    if($frame.schema -cne 'edr.test.service-cache-positive-proof.v1'){throw 'cache_proof_frame_schema'}
+    foreach($key in @('cache_path_sha256','pipeline_source_sha256','cache_source_sha256')){if($frame[$key] -cnotmatch '^[a-f0-9]{64}$'){throw 'cache_proof_frame_type'}}
+    foreach($key in @('version','pid','tid','status_getter_calls','db_open','storage_format','path_hash_valid','retention_clock_valid')){
+      $v=$root.GetProperty($key);$n=[uint32]0
+      if($v.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $v.TryGetUInt32([ref]$n)){throw 'cache_proof_frame_type'};$frame[$key]=$n
+    }
+    foreach($key in @('context_facts_written','context_refs_written','candidate_records_written')){
+      $v=$root.GetProperty($key);$n=[uint64]0
+      if($v.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $v.TryGetUInt64([ref]$n)){throw 'cache_proof_frame_type'};$frame[$key]=$n
+    }
+    if($frame.version -ne 1 -or $frame.status_getter_calls -ne 1 -or $frame.tid -eq 0 -or $frame.storage_format -gt 2 -or $frame.db_open -gt 1 -or $frame.path_hash_valid -gt 1 -or $frame.retention_clock_valid -gt 1){throw 'cache_proof_frame_domain'}
+    if($ExpectedPid -le 0 -or $frame.pid -ne $ExpectedPid){throw 'cache_proof_pid_mismatch'}
+    if($frame.cache_path_sha256 -cne $ExpectedPathSha){throw 'cache_proof_path_mismatch'}
+    if($frame.pipeline_source_sha256 -cne $ExpectedPipelineSha -or $frame.cache_source_sha256 -cne $ExpectedCacheSha){throw 'cache_proof_source_mismatch'}
+    return $frame
+  }finally{if($null -ne $document){$document.Dispose()}}
+}
+function ReadCachePositiveProof($Context,$Cleanup,[string]$ExpectedCachePath,[string]$ExpectedPipelineSha,[string]$ExpectedCacheSha,[long]$DeadlineMs){
+  $proof=@{schema='edr.ci-service-cache-positive-proof.v1';status='not_collected';cause='context_unbound';phase='prepare';required_for_diagnostic_acceptance=$true;observation_can_change_stop_result=$false;max_log_data_read_bytes=65536;max_line_bytes=4096;read_attempt_bytes=[long]0;bytes_read=[long]0;cumulative_log_data_read_bytes=$null;start_offset=$null;end_offset=$null;data_sha256=$null;expected_cache_path_sha256=$null;frame=$null}
+  $restore=$null
+  $causes=@('cache_proof_frame_shape','cache_proof_frame_json','cache_proof_frame_keys','cache_proof_frame_type','cache_proof_frame_schema','cache_proof_frame_domain','cache_proof_pid_mismatch','cache_proof_path_mismatch','cache_proof_source_mismatch','cache_proof_expected_identity','cache_proof_deadline','cache_proof_log_budget','cache_proof_log_changed','cache_proof_log_line','cache_proof_frame_missing','cache_proof_frame_duplicate','cache_proof_frame_partial','cache_proof_read_changed')
+  try{
+    if($null -eq $Context -or $Context -isnot [hashtable] -or $Context.ready -isnot [bool] -or -not $Context.ready){return $proof}
+    if($Context.ContainsKey('cachePositiveProofAttempted')){$proof.cause='already_attempted';return $proof}
+    $Context.cachePositiveProofAttempted=$true
+    $proof.phase='target';$proof.cause='target_not_naturally_terminal'
+    if($Cleanup.target_terminal_known -isnot [bool] -or -not $Cleanup.target_terminal_known -or $Cleanup.exact_target_kill_attempted -isnot [bool] -or $Cleanup.exact_target_kill_attempted -or $Cleanup.target_exit_code -isnot [int]){return $proof}
+    $guard=$Context.Clone();$guard.diagnostic=$Context.diagnostic.Clone();$guard.diagnostic.held_process=$Context.diagnostic.held_process.Clone()
+    if($guard.diagnostic.held_process.bound_live_before_stop -isnot [bool] -or -not $guard.diagnostic.held_process.bound_live_before_stop){return $proof}
+    StopLogTarget $guard -AllowExited
+    if(-not $guard.exitConfirmed -or $guard.diagnostic.held_process.exit_code_known -isnot [bool] -or -not $guard.diagnostic.held_process.exit_code_known -or $guard.diagnostic.held_process.exit_code -ne $Cleanup.target_exit_code){return $proof}
+    $pidValue=$Context.native.pid
+    if(($pidValue -isnot [int] -and $pidValue -isnot [long] -and $pidValue -isnot [uint32]) -or $pidValue -le 0 -or $pidValue -gt [int]::MaxValue -or -not $ExpectedCachePath -or $ExpectedPipelineSha -cnotmatch '^[a-f0-9]{64}$' -or $ExpectedCacheSha -cnotmatch '^[a-f0-9]{64}$'){throw 'cache_proof_expected_identity'}
+    $expectedPid=[int]$pidValue
+    $pathHasher=[Security.Cryptography.SHA256]::Create();try{$expectedPathSha=([BitConverter]::ToString($pathHasher.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($ExpectedCachePath)))).Replace('-','').ToLowerInvariant()}finally{$pathHasher.Dispose()}
+    $proof.expected_cache_path_sha256=$expectedPathSha
+    if($script:experimentClock.ElapsedMilliseconds -ge $DeadlineMs){throw 'cache_proof_deadline'}
+    $proof.phase='log_binding'
+    StopLogConfig $Context.configPath $Context.native.config_sha256 $Context.logDirectory
+    $path=StopLogOpen $Context.logPath
+    try{if($path.info.Identity -cne $Context.fileIdentity){throw 'cache_proof_log_changed'}}finally{$path.stream.Dispose()}
+    $before=StopLogInfo $Context.stream
+    $start=[long]$Context.diagnostic.start_offset;$already=[long]$Context.readAttemptBytes
+    if($start -lt 0 -or $before.Identity -cne $Context.fileIdentity -or $before.Length -lt $start){throw 'cache_proof_log_changed'}
+    $want=[long]$before.Length-$start
+    if($already -lt 0 -or $already -gt 65536 -or $want -gt 65536-$already){throw 'cache_proof_log_budget'}
+    $proof.cumulative_log_data_read_bytes=$already;$proof.start_offset=$start;$proof.end_offset=[long]$before.Length
+    $restore=[long]$Context.offset;StopLogAnchor $Context
+    if($script:experimentClock.ElapsedMilliseconds -ge $DeadlineMs){throw 'cache_proof_deadline'}
+    # Reserve this fixed window once before any payload I/O; a failed Read
+    # retains its charge. Short reads consume the same reservation, not a new one.
+    $Context.readAttemptBytes=$already+$want;$Context.diagnostic.read_attempt_bytes=$Context.readAttemptBytes
+    $proof.read_attempt_bytes=$want;$proof.cumulative_log_data_read_bytes=$Context.readAttemptBytes
+    $proof.phase='read';$null=$Context.stream.Seek($start,[IO.SeekOrigin]::Begin)
+    $buffer=New-Object byte[] ([int][Math]::Max(1,$want));$used=0
+    while($used -lt $want){
+      $n=$Context.stream.Read($buffer,$used,[int]$want-$used);if($n -le 0){throw 'cache_proof_read_changed'}
+      $used+=$n;$proof.bytes_read+=$n
+    }
+    $after=StopLogInfo $Context.stream
+    StopLogTarget $guard -AllowExited
+    StopLogConfig $Context.configPath $Context.native.config_sha256 $Context.logDirectory
+    $path=StopLogOpen $Context.logPath
+    try{if($path.info.Identity -cne $Context.fileIdentity -or $path.info.Length -ne $before.Length -or $path.info.WriteHigh -ne $before.WriteHigh -or $path.info.WriteLow -ne $before.WriteLow){throw 'cache_proof_log_changed'}}finally{$path.stream.Dispose()}
+    if($after.Identity -cne $Context.fileIdentity -or $after.Length -ne $before.Length -or $after.WriteHigh -ne $before.WriteHigh -or $after.WriteLow -ne $before.WriteLow){throw 'cache_proof_log_changed'}
+    StopLogAnchor $Context
+    if($script:experimentClock.ElapsedMilliseconds -ge $DeadlineMs){throw 'cache_proof_deadline'}
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{$proof.data_sha256=([BitConverter]::ToString($sha.ComputeHash($buffer,0,$used))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+    $proof.phase='frame';$text=[Text.UTF8Encoding]::new($false,$true).GetString($buffer,0,$used);$parts=$text.Split([char]10);$prefix='[preprocess] worker cache proof ';$frames=0;$frame=$null
+    for($i=0;$i -lt $parts.Length;$i++){
+      $line=$parts[$i];if($line.EndsWith("`r",[StringComparison]::Ordinal)){$line=$line.Substring(0,$line.Length-1)}
+      if([Text.Encoding]::UTF8.GetByteCount($line) -gt 4096){throw 'cache_proof_log_line'}
+      if(-not $line.StartsWith($prefix,[StringComparison]::Ordinal)){continue}
+      if($i -eq $parts.Length-1){throw 'cache_proof_frame_partial'}
+      $frames++;if($frames -ne 1){throw 'cache_proof_frame_duplicate'}
+      $frame=ProjectCachePositiveFrame $line $expectedPid $expectedPathSha $ExpectedPipelineSha $ExpectedCacheSha
+    }
+    if($frames -ne 1){throw 'cache_proof_frame_missing'}
+    if($script:experimentClock.ElapsedMilliseconds -ge $DeadlineMs){throw 'cache_proof_deadline'}
+    $proof.frame=$frame;$proof.phase='finished';$proof.status='observed_not_positive'
+    if($frame.db_open -ne 1){$proof.cause='cache_not_open'}
+    elseif($frame.storage_format -notin @(1,2)){$proof.cause='compact_not_enabled'}
+    elseif($frame.path_hash_valid -ne 1){$proof.cause='path_hash_unavailable'}
+    elseif($frame.retention_clock_valid -ne 1){$proof.cause='clock_not_valid'}
+    elseif($frame.context_facts_written -eq 0 -or $frame.context_refs_written -eq 0){$proof.cause='durable_context_not_observed'}
+    else{$proof.status='verified_positive';$proof.cause='single_bound_positive_frame'}
+  }catch{$proof.status='unknown';$proof.cause=if($_.Exception.Message -cin $causes){$_.Exception.Message}else{'cache_proof_read_unknown'};$proof.frame=$null}
+  finally{if($null -ne $restore){try{$null=$Context.stream.Seek($restore,[IO.SeekOrigin]::Begin)}catch{$proof.status='unknown';$proof.cause='cache_proof_stream_restore_failed';$proof.frame=$null}}}
+  return $proof
+}
 function Snapshot([string]$Label,[switch]$AllowAbsent){
   $body=@'
 $s=@(Get-CimInstance Win32_Service -Filter "Name='__SERVICE__'" -Property Name,State,ProcessId,PathName,StartMode,StartName,CheckPoint,WaitHint,ExitCode,ServiceSpecificExitCode -OperationTimeoutSec 1 -ErrorAction Stop)
@@ -576,7 +684,7 @@ public static class CiServiceBoundedPump {
   $createdCase=New-Item -ItemType Directory -Path $candidateCase -ErrorAction Stop;$script:case=$createdCase.FullName;$script:root=$script:case
   # These are declared public inputs, not a claim that preparation or Agent
   # validation succeeded. Preserve them before ACL/owner import can fail.
-  SaveNew 'intent.json' @{schema='edr.ci-isolated-service-intent.v1';source_sha=$SourceSha;token=$Token;service=$script:serviceName;agent_sha256=$AgentSha256;config_template_sha256=$ConfigTemplateSha256;qa_driver_sha256=$QADriverSha256;budget_profile='match512';stop_ms=45000;observe_max_ms=60000;overall_cooperative_ms=270000;cleanup_reserve_ms=30000;no_installer_or_updater=$true;no_release=$true;no_endpoint=$true}
+  SaveNew 'intent.json' @{schema='edr.ci-isolated-service-intent.v1';source_sha=$SourceSha;token=$Token;service=$script:serviceName;agent_sha256=$AgentSha256;config_template_sha256=$ConfigTemplateSha256;qa_driver_sha256=$QADriverSha256;pipeline_source_sha256=$PipelineSourceSha256;cache_source_sha256=$CacheSourceSha256;budget_profile='match512';stop_ms=45000;observe_max_ms=60000;overall_cooperative_ms=270000;cleanup_reserve_ms=30000;no_installer_or_updater=$true;no_release=$true;no_endpoint=$true}
   $script:result.intent_recorded=$true
   $script:result.preparation_stage_id=4
   SetDiagnosticCaseAcl $script:case
@@ -770,12 +878,14 @@ exit 0
       try{if(-not $v.process.HasExited){$v.cancelled=$true;$v.process.Kill();Check ($v.process.WaitForExit(2000)) 'control_worker_still_live'}}catch{$cleanup.unknown_or_errors+=,@{phase='control_worker_cleanup';exception_type=$_.Exception.GetType().FullName}}
       foreach($f in @($v.out_file,$v.err_file)){try{$f.Dispose()}catch{$cleanup.unknown_or_errors+=,@{phase='stream_close';exception_type=$_.Exception.GetType().FullName}}};$v.process.Dispose()
     }
+    $proofPath=$null;if($null -ne $script:context){$proofPath=Join-Path $script:install 'evidence\cache.db'}
+    $script:result.cache_positive_proof=ReadCachePositiveProof $script:context $cleanup $proofPath $PipelineSourceSha256 $CacheSourceSha256 $script:cleanupDeadline
     if($null -ne $script:context){try{CloseStopLogContext $script:context;$script:result.shutdown_log_observation=$script:context.diagnostic}catch{$cleanup.unknown_or_errors+=,@{phase='log_context_close';exception_type=$_.Exception.GetType().FullName}}}
     foreach($lease in $script:leases){try{$lease.Dispose()}catch{$cleanup.unknown_or_errors+=,@{phase='runtime_lease_close';exception_type=$_.Exception.GetType().FullName}}}
     if($null -ne $script:target){$script:target.Dispose()}
     $script:result.cleanup=$cleanup;$script:result.elapsed_ms=$script:experimentClock.ElapsedMilliseconds
     $script:result.within_cooperative_budget=($script:experimentClock.ElapsedMilliseconds -le 270000)
-    $ok=($null -eq $script:primary -and $null -ne $script:result.stop_result -and $script:result.stop_result.status -ceq 'returned_zero' -and $cleanup.scm_stopped_zero_before_delete -and $cleanup.target_terminal_known -and $cleanup.target_exit_code -eq 0 -and -not $cleanup.exact_target_kill_attempted -and $cleanup.service_absent_confirmed -and $cleanup.offline_rule_removed -and $cleanup.unknown_or_errors.Count -eq 0 -and $script:result.within_cooperative_budget)
+    $ok=($null -eq $script:primary -and $null -ne $script:result.stop_result -and $script:result.stop_result.status -ceq 'returned_zero' -and $cleanup.scm_stopped_zero_before_delete -and $cleanup.target_terminal_known -and $cleanup.target_exit_code -eq 0 -and -not $cleanup.exact_target_kill_attempted -and $cleanup.service_absent_confirmed -and $cleanup.offline_rule_removed -and $cleanup.unknown_or_errors.Count -eq 0 -and $script:result.within_cooperative_budget -and $script:result.cache_positive_proof.status -ceq 'verified_positive')
     $script:result.diagnostic_accepted=$ok
     try{SaveNew 'result.json' $script:result}catch{[Console]::Error.WriteLine('isolated_service_receipt_write_failed');$ok=$false}
     WriteDiagnosticSummary $ok

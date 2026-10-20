@@ -47,7 +47,7 @@ and durable owners. It is not a candidate package or a rollback acceptance test.
 Its generated 60-second worker join observes the registered preprocess worker
 at a nominal 10 ms cadence, using an absolute monotonic 60-second deadline and at
 most 6001 samples. It adds no thread or event logging. A single bounded numeric
-version-2 line contains 13 phase buckets and 128 callsite buckets, including
+version-3 line contains 13 phase buckets and 135 callsite buckets, including
 unknown zero. Two raw-byte source proofs bind the unchanged pipeline IDs 1..79,
 cache envelope 80, and 44 direct cache calls 81..124. IDs 125, 126 and 127
 are nested function envelopes for `sqlite_prepare_context_artifacts`,
@@ -73,9 +73,27 @@ histogram is explicit. Observer overhead and low-power/suspension equivalence
 to the original single wait are not validated. A signal first observed when
 the observer resumes at or after its deadline remains a timeout; this can
 conservatively reject a timely worker exit after observer scheduling delay.
-It does not measure the worker's exact exit time. The selected consumer requires
-version 2 and checks each bucket, both sums and the fixed cardinalities; duplicate histogram lines fail instead of expanding
+It does not measure the worker's exact exit time. The selected consumer accepts only the version-2/128 or version-3/135 callsite tuple with 13 phase buckets, and checks each bucket and both sums; duplicate histogram lines fail instead of expanding
 metadata. The original 45-second SCM verdict cannot be promoted by these samples.
+
+Version 3 adds only 27 wrapped existing expressions within the context
+transaction: 128 BEGIN IMMEDIATE; 129 retained-owner SQL (11 expressions);
+130 fact SQL (10); 131 writer statement preparation; 132 reference puts;
+133 writer finalization (two paths); 134 COMMIT, which may include SQLite
+WAL auto-checkpoint work. Each literal has its own saved frontier. Error,
+rollback, clock and other unwrapped gaps still inherit 127. These categories
+are not complete block durations or individual SQL/fsync timing. Existing
+IDs 1..127, SQL, transaction boundaries, synchronous/checkpoint settings,
+sample cadence, sample cap and stop budgets remain unchanged.
+
+Actual isolated source 1457279, run 39418568793/1, still failed the frozen
+45-second stop (45,171ms); later natural exit 1 and successful cleanup do not
+promote it. The worker advanced 2,965 slots and left 3,101 bus entries;
+3,275 of 3,782 samples fell within context transaction 127 (86.594%). Natural
+ETW cohorts differ, so this is no equal-input A/B. The controlled host compact
+layout improvement has not established a successful Service stop. The new
+categories distinguish the remaining transaction boundary before another
+production change; they are not a fix or Service rollback acceptance.
 
 Before dependency builds, the manual ARM64 path runs the pure failure contracts,
 the original source-pinned recovery reader contracts, and
@@ -220,3 +238,72 @@ Agent logs, databases, event bodies, full commands and the runtime directory
 are excluded. Its offline tests use metadata fixtures and make no native or
 Service execution claim. The earlier passed-tools artifact continues to attest
 only its original native gates, even if the later Service diagnosis fails.
+
+
+### Diagnostic cache positive proof (private consumer candidate)
+
+The generated diagnostic Agent emits one fixed `worker cache proof` JSON frame
+from the still-registered preprocessing worker's normal exit tail. The consumer
+only observes it after the original held target process has a known natural
+terminal state, after firewall/control-worker cleanup and before closing the
+original held log context. It uses only the remaining original cleanup deadline;
+insufficient time yields an unknown proof. It adds an AND
+condition to diagnostic acceptance. It does not rewrite `stop-result-frozen.json`,
+45-second status, primary failure, or cleanup receipts. A late positive frame
+cannot promote a failed stop. No frame is invented when observation is unavailable.
+
+`PipelineSourceSha256` and `CacheSourceSha256` are mandatory raw-source SHA-256
+arguments. The existing workflow can pass its `Pin` of the exact checkout files
+`src/preprocess/preprocess_pipeline.c` and `src/storage/local_evidence_cache.c`.
+Use the actual LF/CRLF bytes, matching the generator and transform manifests;
+Git commit SHA is not a substitute. Both values are recorded in intent. The
+preparation contract's isolated public prefix uses explicit dummy zero hashes;
+it does not claim those inputs identify a compiled Agent.
+
+The reader retains the original log stream/FileID, configuration hash, initial
+EOF offset and anchor, and the exact held PID/birth/EXE-bound process object. It
+uses the existing low-level guards, then reads the initial bound offset through
+one stable EOF snapshot once. This is a separate consumer, not another call to
+`ReadStopLogSlice` after that owner's final tail has sealed. Original offsets,
+pending data, hash state and stream position are preserved. A one-attempt flag
+is added. Before payload I/O, the fixed window length is reserved once in the
+original `Context.readAttemptBytes` and diagnostic `read_attempt_bytes` ledger.
+The proof `read_attempt_bytes` is that reservation; `bytes_read` separately counts
+successfully returned bytes. A failed Read retains its charge and is not retried.
+Short reads continue within the one reserved window. The original prior charge
+plus this reservation must stay within the same 65536-byte allowance. Existing
+config/anchor guard reads retain their separate original bounds. There is no second allowance,
+retry, tail enlargement or added wait. Synchronous file operations are cooperative
+with the original cleanup deadline; this is not an interruptible I/O quota.
+
+Only one complete exact-prefix frame is accepted. The parser rejects duplicate,
+missing, unknown or malformed keys, incomplete frame lines, wrong numeric types,
+overflow, mismatched PID, path hash or source hashes. It exports only the closed
+15-field frame plus finite read/provenance metadata and fixed causes. The
+independently computed expected path digest is exported as
+`expected_cache_path_sha256`, enabling the artifact reader to compare it again
+with the validated frame without path text. No raw log,
+path, base64, exception message, command, or unrelated line is exported. It keeps
+the existing 4096-byte line and 128KiB metadata-file bounds.
+
+A structurally valid format0 frame is observed but not positive, with
+`compact_not_enabled`; positive requires format1 or2, db_open1, valid expected
+path hash, retention clock valid, and nonzero committed context-fact/reference
+counters. Candidate count may be zero. Those process-local counters include
+candidate parent facts/references; they do not prove a new candidate, a completed
+post-context drain, a reopen/crash durability check, or per-thread attribution.
+The file/ACL and held-target binding does not supply cryptographic per-line
+writer attribution. They exclude the false inference that Running or a faster
+stop alone proves a healthy cache. Already-format2 performance is not inferred from format0 activation.
+
+The extended `test_prepared_service_contracts.ps1` AST-loads the actual new reader
+and projector definitions, uses real bounded public-file reads/hash/anchor bytes,
+and declares native process/FileID guards as test seams. It covers fixed-frame
+types, source/PID binding (including Core7 Int64 PIDs), format0 refusal, negative
+cache/clock/counters, missing/duplicate/partial frames, shared-cap boundaries,
+no-reread, short reads, charged I/O failures, position-restoration failures,
+natural-terminal requirements, deadline, config/identity/anchor refusal,
+private-text exclusion, frozen-result preservation, and a synthetic maximum
+1-histogram/63-queue projection serialization bound with16KiB headroom. That
+size fixture is not a replacement for the original QA parser tests. PowerShell
+and true Windows held-object behavior remain unrun on this host.

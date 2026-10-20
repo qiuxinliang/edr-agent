@@ -106,6 +106,7 @@ try{
  # Only test-local inputs/state. No supplied EXE or product bytes are opened.
  $SourceSha=$env:GITHUB_SHA;$Token=[guid]::NewGuid().ToString('N');$Architecture='arm64'
  $AgentPath='UNBOUND';$AgentSha256='0'*64;$ConfigTemplateSha256='0'*64
+ $PipelineSourceSha256='0'*64;$CacheSourceSha256='0'*64
  $script:serviceName='FDSecurityAgentCI_'+$Token;$script:case=$null;$script:root=$null
  $script:result=@{preparation_stage_id=0;intent_recorded=$false};$script:experimentClock=[Diagnostics.Stopwatch]::StartNew()
  $probe.phase='actual_main_prefix'

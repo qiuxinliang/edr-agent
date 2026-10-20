@@ -1,6 +1,6 @@
 # A real Agent entry point for one opt-in, disposable SCM diagnosis. It is not
 # built by ALL, registered with CTest, packaged or installed. Production sources
-# and build properties are reused; only pipeline/cache numeric frontiers differ.
+# and build properties are reused; only generated frontiers and one cache snapshot differ.
 if(WIN32 AND TARGET edr_agent AND Python3_EXECUTABLE)
   get_target_property(_sd_agent_dir edr_agent SOURCE_DIR)
   get_target_property(_sd_original edr_agent SOURCES)
@@ -45,6 +45,7 @@ if(WIN32 AND TARGET edr_agent AND Python3_EXECUTABLE)
       "${_sd_agent_dir}/src/storage/local_evidence_cache.c"
       "${_sd_home}/generate_service_source.py"
       "${_sd_home}/service_substage_frontier.inc"
+      "${_sd_home}/service_cache_positive_proof.inc"
     VERBATIM)
   add_executable(test_service_stop_agent EXCLUDE_FROM_ALL ${_sd_sources})
   # Copy the actual product properties rather than the assertion-enabled common

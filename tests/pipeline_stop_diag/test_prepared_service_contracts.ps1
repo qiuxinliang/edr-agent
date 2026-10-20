@@ -2,8 +2,9 @@
 #Requires -PSEdition Core
 <# Pure source-owned projection contracts. No harness top-level, process,
 SCM, Agent, network or generated worker body is executed. The extracted profile
-validator runs on public in-memory fixtures; the one-byte progress file helper
-additionally runs against this test's public file. #>
+validator runs on public in-memory fixtures; the byte helpers and positive-frame
+reader run on public files. Native held-process/FileID guards have explicit test
+seams below; these checks do not prove Windows process or file identity. #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$DriverSource,
@@ -38,8 +39,8 @@ foreach($name in @('publicFailureCodes','stageFailureCodes')){
 
 # Loading a function definition does not call it. This fixed inventory excludes
 # StartOwned/RunOwned/SCM/cleanup/main. Reject newly introduced command owners.
-$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','ProjectWorkerFailure','PowerShellWorkerSource','ServicePreflightSource','ReadPreflightReceipt','ReadPreflightProgress')
-$allowedCommands=@('Check','ConvertFrom-Json','ConvertTo-Json','New-Object','ReadOwnedBytes','ForEach-Object')
+$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','ProjectWorkerFailure','PowerShellWorkerSource','ServicePreflightSource','ReadPreflightReceipt','ReadPreflightProgress','ProjectCachePositiveFrame','ReadCachePositiveProof')
+$allowedCommands=@('Check','ConvertFrom-Json','ConvertTo-Json','New-Object','ReadOwnedBytes','ForEach-Object','StopLogTarget','StopLogConfig','StopLogOpen','StopLogInfo','StopLogAnchor','ProjectCachePositiveFrame')
 foreach($name in $wantedFunctions){
   $defs=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
   if($defs.Count -ne 1){throw 'prepared_pure_function_inventory'}
@@ -82,6 +83,41 @@ function ReadOwnedBytes([string]$Path,[int]$Cap){
   $bytes=[IO.File]::ReadAllBytes($full)
   if($bytes.Length -ne $info.Length -or $bytes.Length -gt $Cap){throw 'prepared_public_read_changed'}
   return @{bytes=$bytes;length=$bytes.Length}
+}
+# Declared test-only seams for the already tested QA native guards. The reader
+# still reads/seeks/hashes real public bytes and enforces its actual budgets.
+function StopLogTarget($Context,[switch]$AllowExited){
+  if(-not $AllowExited -or -not $Context.testNaturalExit){throw 'stop_log_target_generation_not_live'}
+  $Context.exitConfirmed=$true;$Context.diagnostic.held_process.exit_code_known=$true;$Context.diagnostic.held_process.exit_code=$Context.testExitCode
+}
+function StopLogConfig($Path,$Expected,$LogDirectory){if($script:proofConfigChanged){throw 'stop_log_config_hash_changed'}}
+function StopLogInfo($Stream){
+  $f=Get-Item -LiteralPath $Stream.Name -Force;$ticks=[uint64]$f.LastWriteTimeUtc.Ticks
+  return @{Identity=$script:proofFileIdentity;Length=[long]$Stream.Length;WriteHigh=[uint32]($ticks -shr 32);WriteLow=[uint32]($ticks -band 4294967295)}
+}
+function StopLogOpen($Path){
+  $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+  return @{stream=$stream;info=(StopLogInfo $stream)}
+}
+function StopLogAnchor($Context){
+  $null=$Context.stream.Seek($Context.anchorOffset,[IO.SeekOrigin]::Begin);$bytes=New-Object byte[] $Context.anchor.Length;$got=0
+  while($got -lt $bytes.Length){$n=$Context.stream.Read($bytes,$got,$bytes.Length-$got);if($n -le 0){throw 'stop_log_anchor_changed'};$got+=$n}
+  for($i=0;$i -lt $bytes.Length;$i++){if($bytes[$i] -ne $Context.anchor[$i]){throw 'stop_log_anchor_changed'}}
+  $null=$Context.stream.Seek($Context.offset,[IO.SeekOrigin]::Begin)
+}
+function ProofLine($Changes=@{}){
+  $row=[ordered]@{schema='edr.test.service-cache-positive-proof.v1';version=1;pid=4242;tid=99;status_getter_calls=1;db_open=1;storage_format=1;path_hash_valid=1;cache_path_sha256=$script:proofPathSha;context_facts_written=[uint64]2;context_refs_written=[uint64]3;candidate_records_written=[uint64]0;retention_clock_valid=1;pipeline_source_sha256=$script:proofPipelineSha;cache_source_sha256=$script:proofCacheSha}
+  foreach($key in $Changes.Keys){$row[$key]=$Changes[$key]}
+  return '[preprocess] worker cache proof '+($row|ConvertTo-Json -Compress)
+}
+function ProofContext([string]$Body,[long]$Already=0){
+  $header=[Text.UTF8Encoding]::new($false).GetBytes("public-header`n");$path=PublicText ("public-header`n"+$Body)
+  $stream=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete));$null=$stream.Seek($header.Length,[IO.SeekOrigin]::Begin)
+  return @{ready=$true;native=@{pid=4242;config_sha256=('a'*64)};diagnostic=@{start_offset=[long]$header.Length;read_attempt_bytes=$Already;held_process=@{bound_live_before_stop=$true;exit_code_known=$false;exit_code=$null}};stream=$stream;fileIdentity=$script:proofFileIdentity;offset=[long]$header.Length;readAttemptBytes=$Already;anchorOffset=[long]0;anchor=$header;configPath='public-config';logDirectory=$script:publicFixtureRoot;logPath=$path;exitConfirmed=$false;testNaturalExit=$true;testExitCode=[int]0}
+}
+function ProofRead([string]$Body,[long]$Already=0){
+  $context=ProofContext $Body $Already
+  try{return ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000)}finally{$context.stream.Dispose()}
 }
 function SamplerLine($Changes=@{},[string[]]$Drop=@()){
   $row=[ordered]@{schema='edr.service-scm-sample.v1';index=0;state='Running';elapsed_ms=0;checkpoint=1;wait_hint_ms=30000;service_pid=4242;win32_exit_code=0;service_exit_code=0;pid_birth_filetime='134369379834341476'}
@@ -277,6 +313,120 @@ try{
     Rejects {SetPreflightProgress 1} 'preflight_progress_file_shape'
     AssertContract ((Get-Item -LiteralPath $path).Length -eq $beforeLength -and (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ceq $beforeHash) 'prepared_progress_wrong_length_never_expands'
   }
+  # Real source-owned frame parser/reader, real public file IO, explicit native
+  # identity seams. No Agent, query, log body export or generated worker runs.
+  $script:experimentClock=[Diagnostics.Stopwatch]::StartNew();$script:proofConfigChanged=$false
+  $script:proofFileIdentity='00000001:0000000000000002:0000000000000003'
+  $script:proofPipelineSha='d'*64;$script:proofCacheSha='e'*64;$script:proofCachePath='C:\public\cache.db'
+  $sha=[Security.Cryptography.SHA256]::Create();try{$script:proofPathSha=([BitConverter]::ToString($sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($script:proofCachePath)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  $script:proofCleanup=@{target_terminal_known=$true;target_exit_code=[int]0;exact_target_kill_attempted=$false}
+  $line=ProofLine;$frame=ProjectCachePositiveFrame $line 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha
+  AssertContract ($frame.Count -eq 15 -and $frame.context_facts_written -is [uint64] -and $frame.pid -is [uint32] -and $frame.candidate_records_written -eq 0) 'prepared_cache_frame_exact_typed_keys'
+  foreach($key in @('context_facts_written','context_refs_written','candidate_records_written')){
+    $max=ProjectCachePositiveFrame (ProofLine @{$key=[uint64]::MaxValue}) 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha
+    AssertContract ($max[$key] -eq [uint64]::MaxValue) 'prepared_cache_u64_not_rounded'
+  }
+  $max=ProjectCachePositiveFrame (ProofLine @{tid=[uint32]::MaxValue}) 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha
+  AssertContract ($max.tid -eq [uint32]::MaxValue) 'prepared_cache_tid_u32_boundary'
+  foreach($bad in @($line.Replace('"pid":4242','"pid":4242,"pid":4242'),$line.Replace('"pid":4242,',''),(ProofLine @{extra=$script:privateMarker}),(ProofLine @{pid=4243}),(ProofLine @{version=2}),(ProofLine @{status_getter_calls=2}),(ProofLine @{tid=0}),(ProofLine @{storage_format=3}),(ProofLine @{cache_path_sha256=('b'*64)}),(ProofLine @{pipeline_source_sha256=('c'*64)}),(ProofLine @{cache_source_sha256=('c'*64)}),($line+'x'),('['+$line+']'))){Rejects {ProjectCachePositiveFrame $bad 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha}}
+  foreach($bad in @('true','"1"','1.0','-1','4294967296')){Rejects {ProjectCachePositiveFrame ($line.Replace('"db_open":1',('"db_open":'+$bad))) 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha}}
+  foreach($bad in @('true','"2"','2.0','-1','18446744073709551616')){Rejects {ProjectCachePositiveFrame ($line.Replace('"context_facts_written":2',('"context_facts_written":'+$bad))) 4242 $script:proofPathSha $script:proofPipelineSha $script:proofCacheSha}}
+  $positive=ProofRead ($line+"`n")
+  AssertContract ($positive.status -ceq 'verified_positive' -and $positive.frame.candidate_records_written -eq 0 -and $positive.expected_cache_path_sha256 -ceq $script:proofPathSha -and $positive.expected_cache_path_sha256 -ceq $positive.frame.cache_path_sha256 -and $positive.read_attempt_bytes -gt 0 -and -not $positive.observation_can_change_stop_result) 'prepared_cache_positive_actual_public_read'
+  foreach($pidValue in @([int]4242,[long]4242,[uint32]4242)){
+    $context=ProofContext ($line+"`n");$context.native.pid=$pidValue
+    try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'verified_positive') 'prepared_cache_json_pid_integer_width'}finally{$context.stream.Dispose()}
+  }
+  foreach($pidValue in @($true,'4242',[long]0,[long]-1,([long][int]::MaxValue+1))){
+    $context=ProofContext ($line+"`n");$context.native.pid=$pidValue
+    try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'unknown' -and $value.cause -ceq 'cache_proof_expected_identity' -and $value.read_attempt_bytes -eq 0) 'prepared_cache_pid_not_coerced_or_wrapped'}finally{$context.stream.Dispose()}
+  }
+  $positive2=ProofRead ((ProofLine @{storage_format=2})+"`n")
+  AssertContract ($positive2.status -ceq 'verified_positive') 'prepared_cache_format2_positive'
+  foreach($case in @(@{change=@{storage_format=0};cause='compact_not_enabled'},@{change=@{db_open=0};cause='cache_not_open'},@{change=@{retention_clock_valid=0};cause='clock_not_valid'},@{change=@{context_facts_written=[uint64]0};cause='durable_context_not_observed'},@{change=@{context_refs_written=[uint64]0};cause='durable_context_not_observed'})){
+    $negative=ProofRead ((ProofLine $case.change)+"`n")
+    AssertContract ($negative.status -ceq 'observed_not_positive' -and $negative.cause -ceq $case.cause -and $null -ne $negative.frame) 'prepared_cache_actual_negative_not_fabricated_positive'
+  }
+  foreach($case in @(@{body='';cause='cache_proof_frame_missing'},@{body=$line;cause='cache_proof_frame_partial'},@{body=($line+"`n"+$line+"`n");cause='cache_proof_frame_duplicate'},@{body=('[preprocess] worker cache proof {'+"`n");cause='cache_proof_frame_json'})){
+    $negative=ProofRead $case.body
+    AssertContract ($negative.status -ceq 'unknown' -and $negative.cause -ceq $case.cause -and $null -eq $negative.frame) 'prepared_cache_missing_duplicate_partial_or_malformed_unknown'
+  }
+  $length=[Text.Encoding]::UTF8.GetByteCount($line+"`n");$exact=ProofRead ($line+"`n") (65536-$length)
+  AssertContract ($exact.status -ceq 'verified_positive' -and $exact.cumulative_log_data_read_bytes -eq 65536) 'prepared_cache_shared_read_cap_exact'
+  $over=ProofRead ($line+"`n") (65537-$length)
+  AssertContract ($over.status -ceq 'unknown' -and $over.cause -ceq 'cache_proof_log_budget' -and $over.read_attempt_bytes -eq 0) 'prepared_cache_existing_reads_never_reset_budget'
+  $context=ProofContext ("unrelated "+$script:privateMarker+"`n"+$line+"`n")
+  try{
+    $beforeDiagnostic=$context.diagnostic.Clone();$beforePosition=$context.stream.Position;$beforeLedger=$context.readAttemptBytes
+    $script:primary='original_failure';$script:result=@{stop_result=@{status='timed_out_unknown_service_state';wait_ms=45000};primary_failure=@{cause_code='original_failure'}};$beforeResult=$script:result|ConvertTo-Json -Depth 8 -Compress
+    $value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000)
+    AssertContract ($value.status -ceq 'verified_positive' -and -not (($value|ConvertTo-Json -Depth 8 -Compress).Contains($script:privateMarker))) 'prepared_cache_only_selected_metadata_exported'
+    $beforeDiagnostic.read_attempt_bytes=$context.readAttemptBytes
+    AssertContract (($context.diagnostic|ConvertTo-Json -Depth 8 -Compress) -ceq ($beforeDiagnostic|ConvertTo-Json -Depth 8 -Compress) -and $context.stream.Position -eq $beforePosition -and $context.readAttemptBytes -eq $beforeLedger+$value.read_attempt_bytes -and $value.bytes_read -eq $value.read_attempt_bytes) 'prepared_cache_only_shared_ledger_and_position_updated'
+    AssertContract ($script:primary -ceq 'original_failure' -and ($script:result|ConvertTo-Json -Depth 8 -Compress) -ceq $beforeResult) 'prepared_cache_late_positive_cannot_rewrite_frozen_or_primary'
+    $second=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000)
+    AssertContract ($second.status -ceq 'not_collected' -and $second.cause -ceq 'already_attempted' -and $second.read_attempt_bytes -eq 0 -and $context.readAttemptBytes -eq $value.cumulative_log_data_read_bytes) 'prepared_cache_one_attempt_only'
+  }finally{$context.stream.Dispose()}
+  foreach($badCleanup in @(@{target_terminal_known=$false;target_exit_code=[int]0;exact_target_kill_attempted=$false},@{target_terminal_known=$true;target_exit_code=[int]0;exact_target_kill_attempted=$true},@{target_terminal_known=$true;target_exit_code=$null;exact_target_kill_attempted=$false})){
+    $context=ProofContext ($line+"`n")
+    try{$value=ReadCachePositiveProof $context $badCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'not_collected' -and $value.read_attempt_bytes -eq 0) 'prepared_cache_unknown_or_killed_terminal_not_read'}finally{$context.stream.Dispose()}
+  }
+  $context=ProofContext ($line+"`n")
+  try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha 0;AssertContract ($value.status -ceq 'unknown' -and $value.cause -ceq 'cache_proof_deadline' -and $value.read_attempt_bytes -eq 0) 'prepared_cache_no_new_deadline_or_wait'}finally{$context.stream.Dispose()}
+  $context=ProofContext ($line+"`n");$context.fileIdentity='changed';$script:proofConfigChanged=$false
+  try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'unknown' -and $value.read_attempt_bytes -eq 0) 'prepared_cache_replaced_path_identity_refused'}finally{$context.stream.Dispose()}
+  $context=ProofContext ($line+"`n");$context.anchor[0]=0
+  try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'unknown' -and $value.read_attempt_bytes -eq 0) 'prepared_cache_anchor_overwrite_refused'}finally{$context.stream.Dispose()}
+  # Explicit stream seams around real FileStream I/O: short reads, an actual
+  # IOException before the first payload byte, and a final position failure.
+  $context=ProofContext ($line+"`n") (65536-$length)
+  $context.stream|Add-Member -MemberType NoteProperty -Name ProofReadCalls -Value 0
+  $context.stream|Add-Member -MemberType ScriptMethod -Name Read -Force -Value {
+    param([byte[]]$Buffer,[int]$Offset,[int]$Count)
+    $this.ProofReadCalls++;$invokeArguments=[object[]]@($null,$Offset,[Math]::Min(7,$Count));$invokeArguments[0]=$Buffer
+    return [IO.FileStream].GetMethod('Read',[type[]]@([byte[]],[int],[int])).Invoke($this.PSObject.BaseObject,$invokeArguments)
+  }
+  try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'verified_positive' -and $value.read_attempt_bytes -eq $length -and $value.bytes_read -eq $length -and $context.readAttemptBytes -eq 65536 -and $context.diagnostic.read_attempt_bytes -eq 65536 -and $context.stream.ProofReadCalls -gt 1) 'prepared_cache_short_reads_charge_window_once'}finally{$context.stream.Dispose()}
+  $context=ProofContext ($line+"`n");$beforePosition=$context.stream.Position
+  $context.stream|Add-Member -MemberType NoteProperty -Name ProofPayloadStart -Value $beforePosition
+  $context.stream|Add-Member -MemberType ScriptMethod -Name Read -Force -Value {
+    param([byte[]]$Buffer,[int]$Offset,[int]$Count)
+    if($this.Position -ge $this.ProofPayloadStart){throw [IO.IOException]::new('unexported_payload_io_failure')}
+    $invokeArguments=[object[]]@($null,$Offset,$Count);$invokeArguments[0]=$Buffer
+    return [IO.FileStream].GetMethod('Read',[type[]]@([byte[]],[int],[int])).Invoke($this.PSObject.BaseObject,$invokeArguments)
+  }
+  try{
+    $value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000)
+    AssertContract ($value.status -ceq 'unknown' -and $value.read_attempt_bytes -eq $length -and $value.bytes_read -eq 0 -and $context.readAttemptBytes -eq $length -and $context.diagnostic.read_attempt_bytes -eq $length -and $context.stream.Position -eq $beforePosition -and -not (($value|ConvertTo-Json -Depth 8 -Compress).Contains('unexported_payload_io_failure'))) 'prepared_cache_failed_io_retains_reserved_shared_charge'
+    $second=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000)
+    AssertContract ($second.cause -ceq 'already_attempted' -and $second.read_attempt_bytes -eq 0 -and $context.readAttemptBytes -eq $length) 'prepared_cache_failed_io_not_retried_or_ledger_reset'
+  }finally{$context.stream.Dispose()}
+  $context=ProofContext ($line+"`n");$frozenBefore=$script:result|ConvertTo-Json -Depth 8 -Compress;$primaryBefore=$script:primary
+  $context.stream|Add-Member -MemberType NoteProperty -Name ProofSeekCalls -Value 0
+  $context.stream|Add-Member -MemberType ScriptMethod -Name Seek -Force -Value {
+    param([long]$Offset,[IO.SeekOrigin]$Origin)
+    $this.ProofSeekCalls++;if($this.ProofSeekCalls -eq 6){throw [IO.IOException]::new('unexported_restore_io_failure')}
+    return [IO.FileStream].GetMethod('Seek',[type[]]@([long],[IO.SeekOrigin])).Invoke($this.PSObject.BaseObject,[object[]]@($Offset,$Origin))
+  }
+  try{$value=ReadCachePositiveProof $context $script:proofCleanup $script:proofCachePath $script:proofPipelineSha $script:proofCacheSha ($script:experimentClock.ElapsedMilliseconds+5000);AssertContract ($value.status -ceq 'unknown' -and $value.cause -ceq 'cache_proof_stream_restore_failed' -and $null -eq $value.frame -and $script:primary -ceq $primaryBefore -and ($script:result|ConvertTo-Json -Depth 8 -Compress) -ceq $frozenBefore -and $context.readAttemptBytes -eq $length) 'prepared_cache_restore_failure_does_not_override_primary_or_frozen'}finally{$context.stream.Dispose()}
+  $script:proofConfigChanged=$true
+  $negative=ProofRead ($line+"`n");$script:proofConfigChanged=$false
+  AssertContract ($negative.status -ceq 'unknown' -and $negative.read_attempt_bytes -eq 0 -and $null -eq $negative.frame) 'prepared_cache_changed_config_not_read'
+  # Synthetic maximum projection serialization bound. These shapes are an
+  # explicit size fixture; native QA parsing remains covered by its own tests.
+  $maxProof=$positive.Clone();$maxProof.frame=$positive.frame.Clone()
+  foreach($key in @('context_facts_written','context_refs_written','candidate_records_written')){$maxProof.frame[$key]=[uint64]::MaxValue}
+  $maxProof.read_attempt_bytes=65536;$maxProof.bytes_read=65536;$maxProof.cumulative_log_data_read_bytes=65536;$maxProof.start_offset=[long]::MaxValue;$maxProof.end_offset=[long]::MaxValue
+  $hist=@{kind='preprocess_worker_join_samples';version=3;interval_ms=10;samples=6001;capped=$true;phase_hits=@();callsite_hits=@();read_started_elapsed_ms=[long]::MaxValue}
+  for($i=0;$i -lt 13;$i++){$hist.phase_hits+=,[uint32]$(if($i -eq 12){6001}else{0})}
+  for($i=0;$i -lt 135;$i++){$hist.callsite_hits+=,[uint32]$(if($i -eq 134){6001}else{0})}
+  $maxObservation=@{schema='edr.ci-selected-shutdown-log.v1';matches=@($hist)}
+  for($i=0;$i -lt 63;$i++){
+    $maxBus=@();for($side=0;$side -lt 2;$side++){$maxBus+=,@{known=$true;used=[uint64]65536;pushed=[uint64]::MaxValue;dropped=[uint64]::MaxValue}}
+    $maxObservation.matches+=,@{kind='preprocess_stop_queues';bus=$maxBus;pmfe=@{running=@(1,1);active=@([uint32]::MaxValue,[uint32]::MaxValue);submitted=@([uint32]::MaxValue,[uint32]::MaxValue);completed=@([uint32]::MaxValue,[uint32]::MaxValue);dropped=@([uint32]::MaxValue,[uint32]::MaxValue);pending_known=$false;pending=$null};read_started_elapsed_ms=[long]::MaxValue}
+  }
+  $maxMetadata=@{shutdown_log_observation=$maxObservation;cache_positive_proof=$maxProof}
+  AssertContract ([Text.Encoding]::UTF8.GetByteCount(($maxMetadata|ConvertTo-Json -Depth 16)) -lt (131072-16384)) 'prepared_cache_proof_plus_max_numeric_matches_leaves_metadata_headroom'
   # Real ErrorRecords, including preparation failures before a bound intent
   # exists. Do not export their messages, target objects or invocation text.
   try{Check $false 'qa_function_inventory'}catch{$failureRecord=$_}

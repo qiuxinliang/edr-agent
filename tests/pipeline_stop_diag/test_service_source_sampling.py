@@ -61,7 +61,7 @@ static void verify(const PreprocessJoinSamples *s) {
   assert(s->samples <= 6001u && s->capped <= 1u);
   if (s->capped) assert(s->samples == 6001u);
   for (unsigned i = 0u; i < 13u; ++i) { assert(s->phase_hits[i] <= 6001u); phases += s->phase_hits[i]; }
-  for (unsigned i = 0u; i < 128u; ++i) { assert(s->callsite_hits[i] <= 6001u); sites += s->callsite_hits[i]; }
+  for (unsigned i = 0u; i < 135u; ++i) { assert(s->callsite_hits[i] <= 6001u); sites += s->callsite_hits[i]; }
   assert(phases == s->samples && sites == s->samples);
 }
 int main(void) {
@@ -124,6 +124,9 @@ int main(void) {
   reset(5u); atomic_store(&s_worker_phase, 99u); atomic_store(&s_worker_callsite, 200u);
   result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
   assert(result == WAIT_OBJECT_0 && waits == 2u && samples.samples == 1u && samples.phase_hits[0] == 1u && samples.callsite_hits[0] == 1u);
+  reset(5u); atomic_store(&s_worker_phase, 3u); atomic_store(&s_worker_callsite, 134u);
+  result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
+  assert(result == WAIT_OBJECT_0 && samples.samples == 1u && samples.callsite_hits[134] == 1u);
   reset(4u); result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
   assert(result == WAIT_TIMEOUT && waits == 6001u && samples.samples == 6001u && samples.capped == 1u);
   SetLastError(44u); errno = 29; preprocess_join_samples_print(&samples);
@@ -150,6 +153,19 @@ extern void SetLastError(uint32_t error);
 extern unsigned probe_current_site(void);
 extern unsigned probe_is_worker(void);
 static unsigned called;
+static void check(unsigned site);
+#if defined(EDR_HAVE_SQLITE)
+static unsigned transaction_calls[7];
+static int transaction_int(unsigned site, int result) {
+  assert(site >= 128u && site <= 134u); check(site); ++transaction_calls[site-128u];
+  SetLastError(68u); errno=28; return result;
+}
+static void transaction_void(unsigned site) {
+  assert(site == 133u); check(site); ++transaction_calls[site-128u];
+  SetLastError(68u); errno=28;
+}
+#endif
+
 static void check(unsigned site) { assert(probe_current_site() == (probe_is_worker() ? site : 54u)); }
 static int original_int(void) { check(82u); ++called; SetLastError(62u); errno=22; return -17; }
 static uint32_t original_u32(void) { check(85u); ++called; SetLastError(63u); errno=23; return UINT32_C(0xf0000000); }
@@ -176,6 +192,12 @@ NESTED_SHIM_BODIES = {
     'sqlite_record_context_artifacts': r'''
   check(127u); ++nested_calls[2];
   if (!r) { SetLastError(67u); errno=27; return -37; }
+  uint64_t transaction_previous[7];
+  for (unsigned site = 128u; site <= 134u; ++site) {
+    if (site == 133u) SERVICE_TRANSACTION_VOID(133u, transaction_previous[5], transaction_void(133u));
+    else assert(SERVICE_TRANSACTION_INT(site, transaction_previous[site-128u], transaction_int(site, -17)) == -17);
+    check(127u); assert(GetLastError() == 68u && errno == 28);
+  }
   int result = sqlite_prepare_context_artifacts(r, candidate_ids, 1u,
                                               (PreparedContextArtifacts *)prepared);
   check(127u); assert(GetLastError() == 66u && errno == 26);
@@ -187,7 +209,7 @@ NESTED_SHIM_TEST = r'''
 void probe_nested_envelopes(void) {
 #if defined(EDR_HAVE_SQLITE)
   char ids[1][160] = {{0}}; int record = 0; PreparedContextArtifacts prepared = {0};
-  nested_mode = 0; memset(nested_calls, 0, sizeof(nested_calls));
+  nested_mode = 0; memset(nested_calls, 0, sizeof(nested_calls)); memset(transaction_calls, 0, sizeof(transaction_calls));
   assert(sqlite_record_context_artifacts(&record, ids, &prepared) == 3);
   assert(nested_calls[0] == 1u && nested_calls[1] == 1u && nested_calls[2] == 1u);
   assert(GetLastError() == 66u && errno == 26); check(54u);
@@ -203,6 +225,7 @@ void probe_nested_envelopes(void) {
   assert(sqlite_record_context_artifacts(&record, ids, &prepared) == -41);
   assert(GetLastError() == 66u && errno == 26); check(54u);
   assert(nested_calls[0] == 4u && nested_calls[1] == 4u && nested_calls[2] == 3u);
+  for(unsigned i=0u;i<7u;++i) assert(transaction_calls[i] == 2u);
 #endif
 }
 '''
@@ -228,7 +251,8 @@ class ServiceSampling(unittest.TestCase):
         done = subprocess.run([sys.executable, '-B', str(HERE / 'generate_service_source.py'), str(source_root), str(output)], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         receipt = json.loads(done.stdout)
-        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['cache_nested_envelopes'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 3, 127, 128))
+        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['cache_nested_envelopes'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 3, 134, 135))
+        self.assertEqual(receipt['cache_transaction_calls'], 27)
         return [json.loads((output / name).read_bytes()) for name in ('SERVICE-SOURCE-TRANSFORM-v2.json', 'SERVICE-CACHE-SOURCE-TRANSFORM-v2.json')]
 
     def test_raw_reversal_lf_crlf_and_fixed_callsite_map(self):
@@ -252,6 +276,9 @@ class ServiceSampling(unittest.TestCase):
                 self.assertEqual(pipeline['namespace']['cache_envelope'], 80)
                 self.assertEqual(pipeline['namespace']['unassigned_range'], [])
                 self.assertEqual(pipeline['namespace']['cache_nested_range'], [125, 127])
+                self.assertEqual(pipeline['namespace']['cache_transaction_range'], [128, 134])
+                self.assertEqual(pipeline['namespace']['sampling_version'], 3)
+                self.assertEqual({site:sum(c['callsite_id']==site for c in cache['transaction_changes']) for site in range(128,135)}, {128:1,129:11,130:10,131:1,132:1,133:2,134:1})
                 self.assertEqual([(c['callsite_id'], c['name']) for c in cache['nested_envelopes']], [
                     (125, 'sqlite_prepare_context_artifacts'), (126, 'sqlite_size_budget_allow'),
                     (127, 'sqlite_record_context_artifacts')])
@@ -269,6 +296,12 @@ class ServiceSampling(unittest.TestCase):
                     for call in proof['changes']:
                         self.assertEqual(text[call['start']:call['end']], call['old'])
                     generated = generated_raw.decode('utf-8')
+                    delta = proof['positive_cache_proof']
+                    self.assertTrue(delta['proof_delta_inverse_raw_exact'])
+                    for key in (('remove_bridge','remove_call') if proof is pipeline else ('remove_append',)):
+                        self.assertEqual(generated.count(delta[key]), 1)
+                        generated = generated.replace(delta[key], '', 1)
+                    self.assertEqual(hashlib.sha256(generated.encode()).hexdigest(), delta['pre_proof_generated_sha256'])
                     reversal = proof['raw_reversal']
                     if proof is pipeline:
                         remove = ('remove_timeout_log', 'remove_observer_before', 'remove_observer_after', 'remove_wrapper', 'remove_header', 'remove_worker_entry', 'remove_worker_exit')
@@ -277,7 +310,11 @@ class ServiceSampling(unittest.TestCase):
                     else:
                         remove = ('remove_wrapper', 'remove_nested_bridge')
                         replacements = [('generated_header', 'original_header')]
-                        declarations = [reversal['remove_local_declaration']]
+                        declarations = [reversal['remove_local_declaration'], reversal['remove_transaction_declaration']]
+                        for call in reversed(proof['transaction_changes']):
+                            self.assertEqual(text[call['start']:call['end']], call['old'])
+                            self.assertEqual(generated.count(call['new']), 1)
+                            generated = generated.replace(call['new'], call['old'], 1)
                         for envelope in reversal['nested_envelopes']:
                             self.assertEqual(text[envelope['start']:envelope['header_end']], envelope['original_header'])
                             self.assertEqual(text[envelope['end']-1], '}')
@@ -301,7 +338,7 @@ class ServiceSampling(unittest.TestCase):
                         self.assertEqual(generated.count(call['new']), 1)
                         generated = generated.replace(call['new'], call['old'], 1)
                     self.assertEqual(generated.encode('utf-8'), raw)
-                    case_inventory.append([(c['callsite_id'], c['owner'], c['line'], c['old'].replace('\r\n', '\n')) for c in proof['changes']])
+                    case_inventory.append([(c['callsite_id'], c['owner'], c['line'], c['old'].replace('\r\n', '\n')) for c in proof['changes'] + proof.get('transaction_changes',[])])
                 inventories.append(case_inventory)
             self.assertEqual(inventories[0], inventories[1])
             self.assertEqual(inventories[0], inventories[2])
@@ -331,12 +368,12 @@ class ServiceSampling(unittest.TestCase):
             ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             self.assertEqual(ran.stdout, '')
-            match = re.fullmatch(r'\[preprocess\] worker join samples version=2 interval_ms=10 samples=(\d+) capped=([01]) phase_hits=([0-9,]+) callsite_hits=([0-9,]+)\n', ran.stderr)
+            match = re.fullmatch(r'\[preprocess\] worker join samples version=3 interval_ms=10 samples=(\d+) capped=([01]) phase_hits=([0-9,]+) callsite_hits=([0-9,]+)\n', ran.stderr)
             self.assertIsNotNone(match, ran.stderr)
             self.assertLess(len(ran.stderr.encode()), 4096)
             count, capped = map(int, match.group(1, 2))
             phases, sites = ([int(x) for x in match.group(i).split(',')] for i in (3, 4))
-            self.assertEqual((len(phases), len(sites)), (13, 128))
+            self.assertEqual((len(phases), len(sites)), (13, 135))
             self.assertEqual((count, capped), (6001, 1))
             self.assertEqual(sum(phases), count)
             self.assertEqual(sum(sites), count)
@@ -347,6 +384,87 @@ class ServiceSampling(unittest.TestCase):
             self.assertEqual(built.returncode, 0, built.stderr)
             ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
             self.assertEqual(ran.returncode, 0, ran.stderr)
+
+    def test_single_positive_cache_probe_with_explicit_api_and_getter_seams(self):
+        clang = shutil.which('clang')
+        if not clang:
+            self.skipTest('local C compiler unavailable; no real-cache or Windows claim')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pipeline, cache = self.generate(root / 'generated')
+            template = (HERE / 'service_substage_frontier.inc').read_text()
+            begin = template.index('static int preprocess_substage_is_worker(void) {')
+            end = template.index('\n}\n', begin) + 2
+            gate = template[begin:end]
+            (root / 'positive.inc').write_text(cache['positive_cache_proof']['remove_append'])
+            source = r'''
+#include <assert.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdatomic.h>
+#include "edr/local_evidence_cache.h"
+#include "edr/sha256.h"
+#define _WIN32 1
+typedef uint32_t DWORD;
+static DWORD error_value = 73u, thread_id = 8u;
+static unsigned getter_calls;
+static atomic_uint s_worker_probe_thread_id;
+static DWORD GetLastError(void) { return error_value; }
+static void SetLastError(DWORD value) { error_value = value; }
+static DWORD GetCurrentThreadId(void) { errno = 300; error_value = 301u; return thread_id; }
+static DWORD GetCurrentProcessId(void) { errno = 400; error_value = 401u; return 1234u; }
+void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
+  ++getter_calls; memset(out, 0, sizeof(*out));
+  out->db_open = 1; out->storage_format = 1u;
+  out->context_facts_written = 8u; out->context_refs_written = 16u;
+  out->records_written = 3u; out->retention_clock_valid = 1u;
+  strcpy(out->path, "C:\\PublicFixture\\cache.db");
+  errno = 600; error_value = 601u;
+}
+@GATE@
+#include "positive.inc"
+static void normal_worker_tail(void) {
+@CALL@}
+int main(void) {
+  atomic_store(&s_worker_probe_thread_id, 7u);
+  errno = 23; SetLastError(73u);
+  normal_worker_tail();
+  assert(getter_calls == 0u && errno == 23 && GetLastError() == 73u);
+  thread_id = 7u; normal_worker_tail();
+  assert(getter_calls == 1u && errno == 23 && GetLastError() == 73u);
+  return 0;
+}
+'''.replace('@GATE@', gate).replace('@CALL@', pipeline['positive_cache_proof']['remove_call'])
+            path, binary = root / 'positive.c', root / 'positive'
+            path.write_text(source)
+            built = subprocess.run([clang, '-std=c11', '-Wall', '-Wextra', '-Werror',
+                                    '-I', str(ROOT / 'include'), '-I', str(root),
+                                    str(path), str(ROOT / 'src/command/sha256.c'),
+                                    '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            self.assertEqual(ran.stdout, '')
+            rows = ran.stderr.splitlines()
+            self.assertEqual(len(rows), 1)
+            prefix = '[preprocess] worker cache proof '
+            self.assertTrue(rows[0].startswith(prefix))
+            self.assertLess(len(ran.stderr.encode()), 1024)
+            value = json.loads(rows[0][len(prefix):])
+            self.assertEqual(set(value), {'schema','version','pid','tid','status_getter_calls',
+                'db_open','storage_format','path_hash_valid','cache_path_sha256',
+                'context_facts_written','context_refs_written','candidate_records_written',
+                'retention_clock_valid','pipeline_source_sha256','cache_source_sha256'})
+            self.assertEqual(value['schema'], 'edr.test.service-cache-positive-proof.v1')
+            self.assertEqual((value['version'], value['pid'], value['tid'], value['status_getter_calls']), (1,1234,7,1))
+            self.assertEqual((value['db_open'],value['storage_format'],value['path_hash_valid'],value['retention_clock_valid']), (1,1,1,1))
+            self.assertEqual((value['context_facts_written'],value['context_refs_written'],value['candidate_records_written']), (8,16,3))
+            self.assertEqual(value['cache_path_sha256'], hashlib.sha256(b'C:\\PublicFixture\\cache.db').hexdigest())
+            self.assertEqual(value['pipeline_source_sha256'], pipeline['source_sha256'])
+            self.assertEqual(value['cache_source_sha256'], cache['source_sha256'])
+            self.assertNotIn('PublicFixture', ran.stderr)
 
     def test_existing_mingw_headers_syntax_only(self):
         compiler = shutil.which('x86_64-w64-mingw32-gcc')

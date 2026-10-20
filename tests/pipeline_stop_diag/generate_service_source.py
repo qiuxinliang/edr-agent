@@ -134,11 +134,11 @@ manifest = {
     'closed_set': {'0':'unknown','1':'decode','2':'generation','3':'token',
                    '4':'cache','5':'evidence','6':'P0','7':'correlation','8':'record'},
     'callsite_inventory': {'unknown':0,'count':79,'order':'ascending raw decoded source offset',
-                          'phase_bins':13,'callsite_bins':128},
-    'join_sampling': {'version':2,'interval_ms':10,'sample_cap':6001,'absolute_deadline_ns':60000000000,
+                          'phase_bins':13,'callsite_bins':135},
+    'join_sampling': {'version':3,'interval_ms':10,'sample_cap':6001,'absolute_deadline_ns':60000000000,
                       'clock_owner':'stop observer only','new_threads':0,
                       'deadline_boundary':'post-wait now >= deadline returns WAIT_TIMEOUT; WAIT_FAILED preserves original error',
-                      'line_prefix':'[preprocess] worker join samples version=2',
+                      'line_prefix':'[preprocess] worker join samples version=3',
                       'writer_gate':'preprocess_main registered Windows thread ID'},
     'changes': [c for c in changes if not c.get('declaration')],
     'local_previous_arrays': [{'owner': f['name'], 'size':len(f['calls'])}
@@ -261,17 +261,72 @@ for site, name, semantic, arguments in [
                           'start':match.start(), 'end':end, 'header_end':match.end(),
                           'original_header':original_header, 'generated_header':generated_header,
                           'wrapper':wrapper, 'arguments':arguments})
+# Split only existing transaction call expressions into seven fixed categories.
+# Category IDs can recur; each literal call owns its own previous stack value.
+transaction_owner = next(c for c in nested_envelopes if c['callsite_id'] == 127)
+transaction_open = transaction_owner['header_end'] - 1
+transaction_end = transaction_owner['end']
+owner_begin = cache_text.index('  sqlite3_stmt *owner = NULL;', transaction_open, transaction_end)
+fact_begin = cache_text.index('  if (prepared->fact_insert) {', owner_begin, transaction_end)
+writer_begin = cache_text.index('  EdrContextWriter writer;', fact_begin, transaction_end)
+transaction_changes = []
+transaction_names = {
+ 'exec_sql':('INT',128,'begin_immediate'),
+ 'sqlite3_prepare_v2':('INT',None,'sql'), 'sqlite3_bind_text':('INT',None,'sql'),
+ 'sqlite3_step':('INT',None,'sql'), 'sqlite3_reset':('INT',None,'sql'),
+ 'sqlite3_clear_bindings':('INT',None,'sql'), 'sqlite3_finalize':('INT',None,'sql'),
+ 'bind_text':('VOID',130,'fact_sql'), 'sqlite3_bind_int64':('INT',130,'fact_sql'),
+ 'edr_context_writer_open':('INT',131,'writer_open_prepare'),
+ 'edr_context_writer_put':('INT',132,'writer_put_refs'),
+ 'edr_context_writer_close':('VOID',133,'writer_close_finalize'),
+ 'sqlite_commit_candidate_transaction':('INT',134,'commit_may_autocheckpoint')}
+for name,(kind,site,semantic) in transaction_names.items():
+ for match in re.finditer(r'\b'+name+r'\s*\(', cache_masked):
+  if not transaction_open < match.start() < transaction_end: continue
+  depth, end = 1, match.end()
+  while depth:
+   depth += (cache_masked[end] == '(') - (cache_masked[end] == ')');end += 1
+  if site is None:
+   assert owner_begin <= match.start() < writer_begin
+   actual_site = 129 if match.start() < fact_begin else 130
+   actual_semantic = 'retained_owner_sql' if actual_site == 129 else 'fact_sql'
+  else:
+   actual_site, actual_semantic = site, semantic
+  old = cache_text[match.start():end]
+  if actual_site == 128: assert old == 'exec_sql("BEGIN IMMEDIATE;")'
+  transaction_changes.append({'start':match.start(),'end':end,'old':old,'kind':kind,
+      'semantic':actual_semantic,'owner':'sqlite_record_context_artifacts',
+      'line':cache_text.count('\n',0,match.start())+1,'callsite_id':actual_site,'stage':8})
+transaction_changes.sort(key=lambda c:c['start'])
+assert len(transaction_changes) == 27
+assert all(a['end'] <= c['start'] for a,c in zip(transaction_changes,transaction_changes[1:]))
+assert {site:sum(c['callsite_id']==site for c in transaction_changes) for site in range(128,135)} == {128:1,129:11,130:10,131:1,132:1,133:2,134:1}
+for index,c in enumerate(transaction_changes):
+ c['previous'] = f'transaction_previous[{index}]'
+ c['new'] = f"SERVICE_TRANSACTION_{c['kind']}({c['callsite_id']}u, {c['previous']}, {c['old']})"
+transaction_declaration = '\n  uint64_t transaction_previous[27];'
+transaction_bridge = '''
+/* Existing int-leave implementation is below; this exact prototype remains
+ * in the original SQLite branch. No new frontier state or function body. */
+static int service_cache_int_leave(uint64_t previous, int result);
+#define SERVICE_TRANSACTION_VOID(site, previous, call) \\
+  ((previous) = preprocess_substage_enter(8u, site), (call), preprocess_substage_leave(previous))
+#define SERVICE_TRANSACTION_INT(site, previous, call) \\
+  ((previous) = preprocess_substage_enter(8u, site), service_cache_int_leave((previous), (call)))
+'''
 # The first helper precedes record_behavior's existing bridge, inside the
 # original SQLite branch. Declarations introduce no non-SQLite dependency.
 nested_bridge = ('/* Test-only nested helpers share the pipeline-owned frontier. */\n'
                  'extern uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite);\n'
                  'extern void preprocess_substage_leave(uint64_t previous);\n')
+nested_bridge += transaction_bridge
 first_nested = min(c['start'] for c in nested_envelopes)
 cache_changed = cache_text
 cache_edits = cache_changes + [
  {'start':cache_open+1,'end':cache_open+1,'old':'','new':cache_declaration},
  {'start':cache_start,'end':cache_start+len(cache_old_header),'old':cache_old_header,'new':cache_bridge+cache_new_header},
  {'start':cache_end,'end':cache_end,'old':'','new':cache_wrapper}]
+cache_edits += transaction_changes + [{'start':transaction_open+1,'end':transaction_open+1,'old':'','new':transaction_declaration}]
 for c in nested_envelopes:
  cache_edits += [
   {'start':c['start'], 'end':c['header_end'], 'old':c['original_header'],
@@ -279,7 +334,13 @@ for c in nested_envelopes:
   {'start':c['end'], 'end':c['end'], 'old':'', 'new':c['wrapper']}]
 for c in sorted(cache_edits, key=lambda c:c['start'], reverse=True):
  cache_changed = cache_changed[:c['start']] + c['new'] + cache_changed[c['end']:]
-cache_restored = cache_changed.replace(cache_wrapper, '', 1).replace(cache_bridge+cache_new_header, cache_old_header, 1).replace(cache_declaration, '', 1)
+cache_restored = cache_changed
+assert cache_restored.count(transaction_declaration) == 1
+cache_restored = cache_restored.replace(transaction_declaration, '', 1)
+for c in reversed(transaction_changes):
+ assert cache_restored.count(c['new']) == 1
+ cache_restored = cache_restored.replace(c['new'],c['old'],1)
+cache_restored = cache_restored.replace(cache_wrapper, '', 1).replace(cache_bridge+cache_new_header, cache_old_header, 1).replace(cache_declaration, '', 1)
 assert cache_restored.count(nested_bridge) == 1
 cache_restored = cache_restored.replace(nested_bridge, '', 1)
 for c in nested_envelopes:
@@ -295,11 +356,11 @@ assert cache_source.read_bytes() == cache_raw, 'cache source changed during gene
 cache_target = output/'cache.service.instrumented.c'
 cache_target.write_bytes(cache_changed.encode('utf-8'))
 assert cache_target.read_bytes() == cache_changed.encode('utf-8')
-namespace = {'phase_bins':13, 'callsite_bins':128, 'unknown':0,
+namespace = {'phase_bins':13, 'callsite_bins':135, 'unknown':0,
              'pipeline_range':[1,79], 'cache_envelope':80, 'cache_direct_range':[81,124],
-             'cache_nested_range':[125,127], 'max_assigned_id':127, 'unassigned_range':[],
+             'cache_nested_range':[125,127], 'cache_transaction_range':[128,134], 'max_assigned_id':134, 'unassigned_range':[],
              'single_frontier_owner':'generated pipeline registered preprocess worker',
-             'sampling_version':2}
+             'sampling_version':3}
 manifest['namespace'] = namespace
 cache_manifest = {
  'schema':'edr.test.service-cache-source.v2', 'source':str(cache_source), 'output':str(cache_target),
@@ -309,10 +370,11 @@ cache_manifest = {
  'inverse_raw_exact':True, 'generator_sha256':manifest['generator_sha256'],
  'template_sha256':manifest['template_sha256'], 'namespace':namespace,
  'changes':cache_changes,
- 'nested_envelopes':nested_envelopes,
+ 'nested_envelopes':nested_envelopes, 'transaction_changes':transaction_changes,
  'raw_reversal':{'remove_wrapper':cache_wrapper, 'generated_header':cache_bridge+cache_new_header,
                  'original_header':cache_old_header, 'remove_local_declaration':cache_declaration,
-                 'remove_nested_bridge':nested_bridge, 'nested_envelopes':nested_envelopes},
+                 'remove_nested_bridge':nested_bridge, 'nested_envelopes':nested_envelopes,
+                 'remove_transaction_declaration':transaction_declaration},
  'offset_unit':manifest['offset_unit'],
  'limitations':['unshipped diagnostic only; production cache source and API unchanged',
                 'same pipeline thread gate and state; non-owner calls publish nothing',
@@ -324,12 +386,50 @@ cache_manifest = {
                 'function envelopes cover every registered-worker call, including record_alert_context; not only site114',
                 'one frontier identifies the innermost wrapped helper, not its complete caller stack; do not add nested populations',
                 'lock-acquire probe includes existing production lock timing work',
-                'nominal samples are not exact time, SQL attribution or additive nested costs']}
+                'nominal samples are not exact time, SQL attribution or additive nested costs',
+                'transaction128..134 group direct expressions; rollback/error/clock gaps remain127',
+                'multiple owner/fact SQL expressions share category IDs, not unique physical callsite IDs']}
+# Private prototype: a single positive cache snapshot at the normal worker tail.
+# Keep this delta separate from all existing frontier transformations.
+proof_template = (template_base/'service_cache_positive_proof.inc').read_bytes()
+proof_append = proof_template.decode('utf-8').replace('@PIPELINE_SOURCE_SHA256@', manifest['source_sha256']).replace('@CACHE_SOURCE_SHA256@', cache_manifest['source_sha256'])
+proof_bridge = '#ifdef _WIN32\nextern void service_diag_emit_cache_positive_proof(void);\n#endif\n'
+proof_call = '  if (preprocess_substage_is_worker()) service_diag_emit_cache_positive_proof();\n'
+pipeline_before_proof = target.read_bytes()
+cache_before_proof = cache_target.read_bytes()
+proof_pipeline = pipeline_before_proof.decode('utf-8')
+proof_anchor = source_marker('#ifdef _WIN32\nstatic DWORD WINAPI preprocess_main(void *arg) {')
+assert proof_pipeline.count(proof_anchor) == 1
+assert proof_pipeline.count(exit_hook) == 1
+proof_pipeline = proof_pipeline.replace(proof_anchor, proof_bridge+proof_anchor, 1).replace(exit_hook, proof_call+exit_hook, 1)
+proof_cache = cache_before_proof.decode('utf-8')+proof_append
+assert proof_pipeline.replace(proof_bridge, '', 1).replace(proof_call, '', 1).encode('utf-8') == pipeline_before_proof
+assert proof_cache.removesuffix(proof_append).encode('utf-8') == cache_before_proof
+assert manifest['namespace'] == cache_manifest['namespace'] == namespace
+assert namespace['max_assigned_id'] == 134
+assert source.read_bytes() == raw and cache_source.read_bytes() == cache_raw
+target.write_bytes(proof_pipeline.encode('utf-8'))
+cache_target.write_bytes(proof_cache.encode('utf-8'))
+manifest['generated_sha256'] = hashlib.sha256(target.read_bytes()).hexdigest()
+cache_manifest['generated_sha256'] = hashlib.sha256(cache_target.read_bytes()).hexdigest()
+proof_contract = {'schema':'edr.test.service-cache-positive-proof.v1',
+                  'template_sha256':hashlib.sha256(proof_template).hexdigest(),
+                  'injection':'Windows normal worker tail after final P0 retry/WORKER_EXIT and before unregister/exited',
+                  'status_getter_calls_per_tail':1, 'requires_registered_worker':True,
+                  'path_binding':'SHA256 of exact bounded status.path UTF8 bytes, excluding NUL; reader matches fixture path',
+                  'counter_scope':'process-local successful commit counters, not crash/reopen durability',
+                  'observer_get_status_calls':0, 'frontier_namespace_unchanged':True}
+manifest['positive_cache_proof'] = dict(proof_contract, remove_bridge=proof_bridge,
+    remove_call=proof_call, pre_proof_generated_sha256=hashlib.sha256(pipeline_before_proof).hexdigest(),
+    proof_delta_inverse_raw_exact=True)
+cache_manifest['positive_cache_proof'] = dict(proof_contract, remove_append=proof_append,
+    pre_proof_generated_sha256=hashlib.sha256(cache_before_proof).hexdigest(),
+    proof_delta_inverse_raw_exact=True)
 for filename, proof in [('SERVICE-SOURCE-TRANSFORM-v2.json',manifest),
                         ('SERVICE-CACHE-SOURCE-TRANSFORM-v2.json',cache_manifest)]:
  (output/filename).write_bytes((json.dumps(proof, indent=2)+'\n').encode('utf-8'))
 print(json.dumps({'source_count':2,'pipeline_call_transforms':79,'cache_call_transforms':44,
-                  'cache_nested_envelopes':3,
-                  'inverse_raw_exact':True, 'max_assigned_id':127, 'callsite_bins':128,
+                  'cache_nested_envelopes':3, 'cache_transaction_calls':27,
+                  'inverse_raw_exact':True, 'max_assigned_id':134, 'callsite_bins':135,
                   'generated_sha256':manifest['generated_sha256'],
                   'cache_generated_sha256':cache_manifest['generated_sha256']}))
