@@ -72,7 +72,7 @@ try{
  $probePreflightBody=ServicePreflightSource;$pt=$null;$pe=$null
  $pa=[Management.Automation.Language.Parser]::ParseInput($probePreflightBody,[ref]$pt,[ref]$pe)
  Guard ($null -eq $pe -or @($pe).Count -eq 0) 'preflight_source_parse'
- foreach($c in @($pa.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){Guard ($c.GetCommandName() -cin @('Get-CimInstance','Where-Object','Get-NetFirewallProfile','ConvertTo-Json','SetPreflightProgress')) 'readonly_preflight_commands_required'}
+ foreach($c in @($pa.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){Guard ($c.GetCommandName() -cin @('Get-CimInstance','Where-Object','Import-Module','Get-NetFirewallProfile','AssertEffectiveFirewallProfiles','ConvertTo-Json','SetPreflightProgress')) 'readonly_preflight_commands_required'}
  $probeParent=Get-Item -LiteralPath $probeOldRunnerTemp -Force
  Guard ($probeParent.PSIsContainer -and [IO.Path]::IsPathRooted($probeParent.FullName)) 'runner_temp_shape'
  for($d=$probeParent;$null -ne $d;$d=$d.Parent){Guard (($d.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'runner_temp_reparse'}

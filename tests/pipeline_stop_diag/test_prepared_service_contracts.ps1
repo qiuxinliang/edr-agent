@@ -1,8 +1,9 @@
 #Requires -Version 7.0
 #Requires -PSEdition Core
 <# Pure source-owned projection contracts. No harness top-level, process,
-SCM, Agent, network or generated worker body is executed. Only the extracted
-one-byte progress file helper additionally runs against this test's public file. #>
+SCM, Agent, network or generated worker body is executed. The extracted profile
+validator runs on public in-memory fixtures; the one-byte progress file helper
+additionally runs against this test's public file. #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$DriverSource,
@@ -157,8 +158,9 @@ try{
   $null=FailureCase ($python.Replace('"hresult":null','"hresult":0')) python_stage unknown
   $null=FailureCase ($python.Replace('dependency_file_count_cap',$script:privateMarker)) python_stage unknown
 
-  foreach($op in 0..5){$v=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$op))) powershell_worker projected preexisting_agent_or_service;AssertContract ($v.operation_id -is [int] -and $v.operation_id -eq $op) 'prepared_closed_operation_positive'}
-  foreach($bad in @('-1','6','true','"2"','2.0','null')){$null=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$bad))) powershell_worker unknown}
+  foreach($op in 0..7){$v=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$op))) powershell_worker projected preexisting_agent_or_service;AssertContract ($v.operation_id -is [int] -and $v.operation_id -eq $op) 'prepared_closed_operation_positive'}
+  foreach($bad in @('-1','8','true','"2"','2.0','null')){$null=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$bad))) powershell_worker unknown}
+  $null=FailureCase ($known.Replace('preexisting_agent_or_service','firewall_profiles_shape')) powershell_worker projected firewall_profiles_shape
   foreach($field in @('operation_id','cim_native_error','cim_status_code')){
     $null=FailureCase ($known.Replace(('"'+$field+'":'),('"'+$field+'":0,"'+$field+'":'))) powershell_worker unknown
     $null=FailureCase ([regex]::Replace($known,',"'+$field+'":(?:2|null)','')) powershell_worker unknown
@@ -195,13 +197,18 @@ try{
   $r=[Management.Automation.ErrorRecord]::new($deep,'public',[Management.Automation.ErrorCategory]::NotSpecified,$null)
   $v=ProjectWorkerFailure $r 0 $script:publicFailureCodes
   AssertContract ($v.cause_code -ceq 'unknown' -and $null -eq $v.cim_native_error -and $null -eq $v.cim_status_code) 'prepared_worker_walk_stops_at_eight'
-  foreach($op in @(-1,6,'1',$true,$null)){Rejects {ProjectWorkerFailure $cimRecord $op $script:publicFailureCodes} 'worker_operation_id_invalid'}
+  foreach($op in @(6,7)){
+    $v=ProjectWorkerFailure $cimRecord $op $script:publicFailureCodes
+    AssertContract ($v.operation_id -is [int] -and $v.operation_id -eq $op -and $v.cim_native_error -eq $expectedNative -and $v.cim_status_code -eq $expectedStatus) 'prepared_real_cim_import_operations_preserved'
+    $null=FailureCase ($v|ConvertTo-Json -Compress) powershell_worker projected unknown
+  }
+  foreach($op in @(-1,8,'1',$true,$null)){Rejects {ProjectWorkerFailure $cimRecord $op $script:publicFailureCodes} 'worker_operation_id_invalid'}
 
   $success='{"schema":"edr.ci-service-preflight.v1","clean_aliases":true,"machine_edr_override_count":0,"firewall_profiles_enabled":true,"operation_id":5,"ps_major":7,"ps_edition":"Core"}'
   $preflight=@{stdout=(PublicText $success);stderr=(PublicText '');terminal_known=$true;exit_known=$true;exit_code=[int]0;cancelled=$false}
   $v=ReadPreflightReceipt $preflight
   AssertContract ($null -ne $v -and $v.Count -eq 7 -and $v.ps_major -eq 7 -and $v.ps_edition -ceq 'Core') 'prepared_preflight_normal_exact_receipt'
-  foreach($text in @($success.Replace('"operation_id":5','"operation_id":4'),$success.Replace('"operation_id":5','"operation_id":5.0'),$success.Replace('"ps_major":7','"ps_major":5'),$success.Replace('Core','Desktop'),$success.Replace('"ps_major":7','"ps_major":5').Replace('Core','Desktop'),$success.Replace('"clean_aliases":true','"clean_aliases":false'),$success.Replace('"machine_edr_override_count":0','"machine_edr_override_count":"0"'),$success.Replace('"schema":','"schema":"x","schema":'),$success.Replace('"schema":','"private":1,"schema":'),('['+$success+']'),$known)){
+  foreach($text in @($success.Replace('"operation_id":5','"operation_id":4'),$success.Replace('"operation_id":5','"operation_id":6'),$success.Replace('"operation_id":5','"operation_id":7'),$success.Replace('"operation_id":5','"operation_id":5.0'),$success.Replace('"ps_major":7','"ps_major":5'),$success.Replace('Core','Desktop'),$success.Replace('"ps_major":7','"ps_major":5').Replace('Core','Desktop'),$success.Replace('"clean_aliases":true','"clean_aliases":false'),$success.Replace('"machine_edr_override_count":0','"machine_edr_override_count":"0"'),$success.Replace('"schema":','"schema":"x","schema":'),$success.Replace('"schema":','"private":1,"schema":'),('['+$success+']'),$known)){
     $preflight.stdout=PublicText $text;AssertContract ($null -eq (ReadPreflightReceipt $preflight)) 'prepared_preflight_bad_or_failure_frame_rejected'
   }
   $preflight.stdout=PublicText $success
@@ -210,13 +217,13 @@ try{
   }
   # Actual public byte files through the same bounded-read seam. No child or
   # SCM call: the terminal-known input is a deliberately explicit test seam.
-  foreach($op in 0..5){
+  foreach($op in 0..7){
     $path=PublicFixture ([byte[]]@($op));$value=ReadPreflightProgress $path $true
     $expectedProgressStatus=if($op -eq 0){'no_child_progress_observed'}else{'observed'}
     AssertContract ($value.Count -eq 2 -and $value.status -ceq $expectedProgressStatus -and $value.last_operation_id -is [int] -and $value.last_operation_id -eq $op) 'prepared_progress_one_byte_closed_values'
     AssertContract (-not (($value|ConvertTo-Json -Compress).Contains($path))) 'prepared_progress_path_not_exported'
   }
-  $badProgress=@((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(0,1))),(PublicFixture ([byte[]]@(6))),(PublicFixture ([byte[]]@(48))),(PublicFixture ([byte[]]@(255))),(Join-Path $script:publicFixtureRoot 'missing-progress.public'))
+  $badProgress=@((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(0,1))),(PublicFixture ([byte[]]@(8))),(PublicFixture ([byte[]]@(48))),(PublicFixture ([byte[]]@(255))),(Join-Path $script:publicFixtureRoot 'missing-progress.public'))
   foreach($path in $badProgress){$value=ReadPreflightProgress $path $true;AssertContract ($value.Count -eq 2 -and $value.status -ceq 'unknown' -and $null -eq $value.last_operation_id) 'prepared_progress_bad_length_value_or_missing_unknown'}
   $path=PublicFixture ([byte[]]@(5))
   foreach($terminal in @($false,$null,1,'true')){$value=ReadPreflightProgress $path $terminal;AssertContract ($value.status -ceq 'unknown' -and $null -eq $value.last_operation_id) 'prepared_progress_requires_known_terminal_bool'}
@@ -226,14 +233,44 @@ try{
   $progressDefs=@($progressAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'SetPreflightProgress'},$true))
   AssertContract ($progressDefs.Count -eq 1 -and @($progressDefs[0].Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true)).Count -eq 0) 'prepared_progress_file_helper_only'
   Invoke-Expression $progressDefs[0].Extent.Text
+  # Load only the real source-owned in-memory profile validator. No import,
+  # query, generated worker body or firewall setting is executed here.
+  $profileDefs=@($progressAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'AssertEffectiveFirewallProfiles'},$true))
+  AssertContract ($profileDefs.Count -eq 1 -and @($profileDefs[0].Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true)).Count -eq 0) 'prepared_firewall_profile_helper_only'
+  Invoke-Expression $profileDefs[0].Extent.Text
+  $profiles=@([pscustomobject]@{Name='Domain';Enabled=$true},[pscustomobject]@{Name='Private';Enabled=$true},[pscustomobject]@{Name='Public';Enabled=$true})
+  AssertContract (@(AssertEffectiveFirewallProfiles $profiles).Count -eq 0) 'prepared_three_effective_profiles_accepted_without_output'
+  AssertContract (@(AssertEffectiveFirewallProfiles @($profiles[2],$profiles[0],$profiles[1])).Count -eq 0) 'prepared_profile_order_not_a_business_rule'
+  $stringProfiles=@([pscustomobject]@{Name='Domain';Enabled='True'},[pscustomobject]@{Name='Private';Enabled='True'},[pscustomobject]@{Name='Public';Enabled='True'})
+  AssertContract (@(AssertEffectiveFirewallProfiles $stringProfiles).Count -eq 0) 'prepared_profile_true_representation_preserved'
+  Rejects {AssertEffectiveFirewallProfiles $null} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @()} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1])} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],$profiles[2],$profiles[2])} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],$profiles[1])} 'firewall_profiles_shape'
+  foreach($badName in @('Unknown','domain',$script:privateMarker,1,$null)){
+    $badProfile=[pscustomobject]@{Name=$badName;Enabled=$true}
+    Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],$badProfile)} 'firewall_profiles_shape'
+  }
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],$null)} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],[pscustomobject]@{Enabled=$true})} 'firewall_profiles_shape'
+  Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],[pscustomobject]@{Name='Public'})} 'firewall_profiles_shape'
+  foreach($badEnabled in @($false,$null,0,1,'False','NotConfigured','true',$script:privateMarker)){
+    $badProfile=[pscustomobject]@{Name='Public';Enabled=$badEnabled}
+    Rejects {AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],$badProfile)} 'firewall_profile_disabled'
+  }
+  try{AssertEffectiveFirewallProfiles @($profiles[0],$profiles[1],[pscustomobject]@{Name=$script:privateMarker;Enabled=$true})}catch{$profileFailure=$_}
+  $profileProjection=ProjectWorkerFailure $profileFailure 4 $script:publicFailureCodes
+  AssertContract ($profileProjection.cause_code -ceq 'firewall_profiles_shape' -and -not (($profileProjection|ConvertTo-Json -Compress).Contains($script:privateMarker))) 'prepared_profile_rejection_does_not_export_private_name'
+  $null=FailureCase ($profileProjection|ConvertTo-Json -Compress) powershell_worker projected firewall_profiles_shape
   $script:preflightProgressPath=PublicFixture ([byte[]]@(0))
-  foreach($op in 1..5){
+  foreach($op in 1..7){
     SetPreflightProgress $op;$value=ReadPreflightProgress $script:preflightProgressPath $true
     AssertContract ((Get-Item -LiteralPath $script:preflightProgressPath).Length -eq 1 -and $value.status -ceq 'observed' -and $value.last_operation_id -eq $op) 'prepared_progress_write_overwrites_one_byte'
   }
-  foreach($op in @(0,6)){
+  foreach($op in @(0,8,255)){
     Rejects {SetPreflightProgress $op} 'preflight_progress_file_shape'
-    AssertContract ((Get-Item -LiteralPath $script:preflightProgressPath).Length -eq 1 -and [IO.File]::ReadAllBytes($script:preflightProgressPath)[0] -eq 5) 'prepared_progress_invalid_operation_does_not_mutate'
+    AssertContract ((Get-Item -LiteralPath $script:preflightProgressPath).Length -eq 1 -and [IO.File]::ReadAllBytes($script:preflightProgressPath)[0] -eq 7) 'prepared_progress_invalid_operation_does_not_mutate'
   }
   foreach($path in @((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(1,2))))){
     $script:preflightProgressPath=$path;$beforeLength=(Get-Item -LiteralPath $path).Length;$beforeHash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash

@@ -99,6 +99,14 @@ and makes no claim that it resolves the historical stop or provider timeout.
 Exit zero is accepted only with
 the exact success schema, original three safety conditions, operation 5 and
 observed PowerShell major 7 / Core edition; structured failure is nonzero.
+The firewall precondition still reads effective `ActiveStore` profiles. In the
+same child and shared 20-second budget it explicitly imports `NetSecurity` with
+`ErrorAction Stop`, then runs the original profile query. A source-owned pure
+validator requires exactly three unique names, `Domain`, `Private` and `Public`,
+and each `Enabled` value's representation strictly `True`. Empty, duplicate,
+missing, unknown or disabled profiles fail; local COM policy is not a substitute
+for effective policy. Pure fixtures invoke this actual validator without
+importing a module, querying a provider or modifying firewall state.
 A failure reports fixed types, numeric positions and a closed stage/cause;
 exception text is excluded. Unknown child identity, terminal state or stream
 EOF fails cleanup and retains the public directory instead of claiming success.
@@ -122,7 +130,10 @@ the existing owner, group and SACL are preserved.
 PowerShell worker failures use the strict eight-field
 `edr.ci-owned-failure.v2` schema. Operation IDs are 0 (not entered), 1 (service
 query), 2 (process query and alias guard), 3 (machine environment presence),
-4 (firewall query) and 5 (done). Up to eight real exception nodes are inspected.
+4 (firewall query) and 5 (done); the private diagnostic adds 6 (before explicit
+NetSecurity import) and 7 (import returned). Original 1..5 meanings are unchanged.
+The actual order is 1,2,3,6,7,4,5, not a monotone progress counter. Up to eight
+real exception nodes are inspected.
 For real `CimException` nodes, `cim_native_error` preserves an Int32 getter or
 the Int32-backed MI `NativeErrorCode` enum value; `cim_status_code` accepts only
 the actual UInt32 `StatusCode` getter. Missing, other-type or throwing getters
@@ -137,7 +148,7 @@ historical failure's CIM status, timeout cause or Service rollback acceptance.
 
 The preflight also publishes one binary operation byte in its own fresh case.
 The parent creates exactly one byte initialized to zero; before each operation
-1..5 the worker overwrites that byte without growing the file. This is a private
+1..7 the worker overwrites that byte without growing the file. This is a private
 diagnostic file write, not a system-state modification. The same bounded query
 and 20-second preflight worker limits remain in force. The parent reads the
 fixed file
@@ -151,9 +162,14 @@ projection does not replace an earlier failure or promote its result. Checkpoint
 I/O can itself fail before a query or consume time within the unchanged limits; a nonzero byte proves
 publication only, not entry into or blockage in that query. Pure contracts load only
 the byte-writer definition from the real preflight source, overwrite an existing
-public one-byte fixture through operations 1..5, and verify that invalid values
+public one-byte fixture through operations 1..7, and verify that invalid values
 or lengths fail without changing or expanding it. No preflight query or worker
 body runs in that pure test.
+The entire 20-second window includes service/process/environment operations as
+well as module import and the profile query. A last-published 4 does not establish
+that the query used all 20 seconds; 6/7 only separate import boundaries and do
+not prove that cold module loading caused a historical timeout. No prewarming,
+fallback, retry, new output field or increased limit is introduced.
 
 The SCM harness requires a clean hosted runner and unique paths/service name.
 It stages and verifies the complete static/delay-import DLL closure beside the

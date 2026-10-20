@@ -58,6 +58,7 @@ $script:publicFailureCodes=@(
   'experiment_work_deadline_after_sample',
   'firewall_name_exists',
   'firewall_profile_disabled',
+  'firewall_profiles_shape',
   'fixture_scalar_control',
   'fixture_scalar_not_unique',
   'fixture_section_not_unique',
@@ -326,7 +327,7 @@ function ReadFailureProjection([string]$Path,[ValidateSet('powershell_worker','p
       if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer)){throw 'projection_hresult'}
       $hresult=$integer
       $number=$root.GetProperty('operation_id');$integer=[int]0
-      if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer) -or $integer -lt 0 -or $integer -gt 5){throw 'projection_operation'}
+      if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer) -or $integer -lt 0 -or $integer -gt 7){throw 'projection_operation'}
       $operation=$integer
       $number=$root.GetProperty('cim_native_error');$integer=[int]0
       if($number.ValueKind -ne [Text.Json.JsonValueKind]::Null){
@@ -357,7 +358,7 @@ function RunOwned([string]$Label,[string]$Exe,[string[]]$Arguments,[int]$Millise
 }
 function ProjectWorkerFailure {
   param([Management.Automation.ErrorRecord]$Record,$OperationId,[string[]]$Codes)
-  if($OperationId -isnot [int] -or $OperationId -lt 0 -or $OperationId -gt 5){throw 'worker_operation_id_invalid'}
+  if($OperationId -isnot [int] -or $OperationId -lt 0 -or $OperationId -gt 7){throw 'worker_operation_id_invalid'}
   $cause='unknown';$native=$null;$status=$null;$e=$Record.Exception
   $cimType='Microsoft.Management.Infrastructure.CimException' -as [type]
   for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
@@ -410,9 +411,20 @@ $script:preflightProgressPath='__PREFLIGHT_PROGRESS_PATH__'
 function SetPreflightProgress([byte]$Operation){
   $stream=[IO.File]::Open($script:preflightProgressPath,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::Read)
   try{
-    if($stream.Length -ne 1 -or $Operation -lt 1 -or $Operation -gt 5){throw 'preflight_progress_file_shape'}
+    if($stream.Length -ne 1 -or $Operation -lt 1 -or $Operation -gt 7){throw 'preflight_progress_file_shape'}
     $stream.Position=0;$stream.WriteByte($Operation);$stream.Flush()
   }finally{$stream.Dispose()}
+}
+function AssertEffectiveFirewallProfiles($Profiles){
+  $items=@($Profiles)
+  if($items.Count -ne 3){throw 'firewall_profiles_shape'}
+  $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  foreach($profile in $items){
+    if($null -eq $profile -or $null -eq $profile.PSObject.Properties['Name'] -or $null -eq $profile.PSObject.Properties['Enabled']){throw 'firewall_profiles_shape'}
+    $name=$profile.Name
+    if($name -isnot [string] -or $name -cnotin @('Domain','Private','Public') -or -not $names.Add($name)){throw 'firewall_profiles_shape'}
+    if([string]$profile.Enabled -cne 'True'){throw 'firewall_profile_disabled'}
+  }
 }
 $operationId=1
 SetPreflightProgress $operationId
@@ -425,9 +437,15 @@ $operationId=3
 SetPreflightProgress $operationId
 $m=[Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Machine);$keys=@($m.Keys|Where-Object {[string]$_ -like 'EDR_*'})
 if($keys.Count){throw 'machine_edr_override_present'}
+$operationId=6
+SetPreflightProgress $operationId
+Import-Module NetSecurity -ErrorAction Stop
+$operationId=7
+SetPreflightProgress $operationId
 $operationId=4
 SetPreflightProgress $operationId
-if(@(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop|Where-Object {-not $_.Enabled}).Count){throw 'firewall_profile_disabled'}
+$profiles=@(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+AssertEffectiveFirewallProfiles $profiles
 $operationId=5
 SetPreflightProgress $operationId
 [Console]::Out.WriteLine((@{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=$operationId;ps_major=$PSVersionTable.PSVersion.Major;ps_edition=$PSVersionTable.PSEdition}|ConvertTo-Json -Compress));exit 0
@@ -460,7 +478,7 @@ function ReadPreflightProgress([string]$Path,$TerminalKnown){
   if($TerminalKnown -isnot [bool] -or -not $TerminalKnown){return $unknown}
   try{
     $raw=ReadOwnedBytes $Path 1
-    if($raw.bytes.Length -ne 1 -or $raw.bytes[0] -gt 5){return $unknown}
+    if($raw.bytes.Length -ne 1 -or $raw.bytes[0] -gt 7){return $unknown}
     $op=[int]$raw.bytes[0]
     return @{status=if($op -eq 0){'no_child_progress_observed'}else{'observed'};last_operation_id=$op}
   }catch{return $unknown}
