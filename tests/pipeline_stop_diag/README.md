@@ -49,7 +49,15 @@ at a nominal 10 ms cadence, using an absolute monotonic 60-second deadline and a
 most 6001 samples. It adds no thread or event logging. A single bounded numeric
 version-2 line contains 13 phase buckets and 128 callsite buckets, including
 unknown zero. Two raw-byte source proofs bind the unchanged pipeline IDs 1..79,
-cache envelope 80, and 44 direct cache calls 81..124; 125..127 are unassigned.
+cache envelope 80, and 44 direct cache calls 81..124. IDs 125, 126 and 127
+are nested function envelopes for `sqlite_prepare_context_artifacts`,
+`sqlite_size_budget_allow` and `sqlite_record_context_artifacts`, respectively.
+They restore their caller ID after every normal return, including error returns,
+and retain the original SQLite conditional-compilation scope. These envelopes
+cover all calls on the registered worker, including callers such as
+`record_alert_context`, rather than only site 114. One frontier identifies the
+innermost wrapped helper, not its complete caller stack; nested populations must
+not be added together or attributed exclusively to site 114.
 Only the generated cache copy renames the public void body to a private
 implementation and adds a thin ABI-preserving wrapper, so NULL, early return
 and goto-done paths all restore the caller frontier. Its bridge uses the
@@ -176,13 +184,17 @@ prove each owner's raw-byte reversal, including CRLF input. Lock acquisition
 includes the production lock-timing helper; metric/failure recording can flush
 SQLite; candidate budget checks can run maintenance. Context artifact probes
 include preparation, reads and budget checks as well as any transaction; exact
-replay may not write. These boundaries locate the next owner, not a SQLite
-root cause or SQL duration.
+replay may not write. The three nested envelopes distinguish preparation reads,
+capacity admission (which may maintain the cache), and the context transaction;
+they do not measure individual SQL statements or fsync. These boundaries locate
+the next owner, not a SQLite root cause or SQL duration.
 
 `python -B tests/pipeline_stop_diag/test_service_source_sampling.py` checks both
 source inverses and the shared namespace on LF/CRLF inputs, then compiles two
 real C translation units for bridge, non-owner, nested restore and error-code
-contracts. That algorithm body and WinAPI calls are explicit unit seams, not
+contracts, with and without SQLite. The three nested wrappers and signatures
+come from the generated proof; their test algorithm bodies and WinAPI calls
+are explicit unit seams, not
 Agent or SQLite execution. An available MinGW provides a separate header
 syntax check; no tool is installed and missing compilers are reported as skips. Remove this diagnostic target,
 manual workflow path and generator after a focused regression owns the fix.

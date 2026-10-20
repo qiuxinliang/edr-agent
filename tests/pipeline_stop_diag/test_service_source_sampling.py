@@ -49,6 +49,7 @@ unsigned probe_current_site(void) { return atomic_load(&s_worker_callsite); }
 unsigned probe_is_worker(void) { return tid == 7u; }
 typedef int EdrBehaviorRecord;
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *record);
+void probe_nested_envelopes(void);
 static int evaluated;
 static int original_call(void) { ++evaluated; SetLastError(42u); errno = 19; return 17; }
 static void reset(unsigned chosen) {
@@ -93,9 +94,13 @@ int main(void) {
     assert(atomic_load(&s_worker_callsite) == 54u && GetLastError() == 64u && errno == 24);
     edr_local_evidence_cache_record_behavior(&early);
     assert(atomic_load(&s_worker_callsite) == 54u);
+    probe_nested_envelopes();
+    assert(atomic_load(&s_worker_callsite) == 54u);
     tid = 8u; SetLastError(51u); errno = 21;
     edr_local_evidence_cache_record_behavior(&normal);
     assert(atomic_load(&s_worker_callsite) == 54u && GetLastError() == 64u && errno == 24);
+    probe_nested_envelopes();
+    assert(atomic_load(&s_worker_callsite) == 54u);
     tid = 7u;
   }
   preprocess_substage_leave(first);
@@ -133,9 +138,15 @@ CACHE_SHIM_PREFIX = r'''
 #include <assert.h>
 #include <stdint.h>
 #include <errno.h>
+#include <string.h>
 typedef int EdrBehaviorRecord;
+typedef struct { int unused; } PreparedContextArtifacts;
+#if defined(_WIN32)
+#include <windows.h>
+#else
 extern uint32_t GetLastError(void);
 extern void SetLastError(uint32_t error);
+#endif
 extern unsigned probe_current_site(void);
 extern unsigned probe_is_worker(void);
 static unsigned called;
@@ -143,6 +154,57 @@ static void check(unsigned site) { assert(probe_current_site() == (probe_is_work
 static int original_int(void) { check(82u); ++called; SetLastError(62u); errno=22; return -17; }
 static uint32_t original_u32(void) { check(85u); ++called; SetLastError(63u); errno=23; return UINT32_C(0xf0000000); }
 static void original_void(void) { check(81u); ++called; SetLastError(64u); errno=24; }
+'''
+
+# Only algorithm bodies are seams. The signatures, wrapper bytes and bridge
+# below are extracted from the real generated manifest, not reimplemented.
+NESTED_SHIM_BODIES = {
+    'sqlite_size_budget_allow': r'''
+  check(126u); ++nested_calls[1]; SetLastError(66u); errno=26;
+  return nested_mode ? -29 : 7;
+}
+''',
+    'sqlite_prepare_context_artifacts': r'''
+  (void)candidate_ids; (void)candidate_count; (void)prepared;
+  check(125u); ++nested_calls[0];
+  if (!r) { SetLastError(65u); errno=25; return -17; }
+  int result = sqlite_size_budget_allow(); check(125u);
+  assert(GetLastError() == 66u && errno == 26);
+  return result == 7 ? 0 : -31;
+}
+''',
+    'sqlite_record_context_artifacts': r'''
+  check(127u); ++nested_calls[2];
+  if (!r) { SetLastError(67u); errno=27; return -37; }
+  int result = sqlite_prepare_context_artifacts(r, candidate_ids, 1u,
+                                              (PreparedContextArtifacts *)prepared);
+  check(127u); assert(GetLastError() == 66u && errno == 26);
+  return result == 0 ? 3 : -41;
+}
+''',
+}
+NESTED_SHIM_TEST = r'''
+void probe_nested_envelopes(void) {
+#if defined(EDR_HAVE_SQLITE)
+  char ids[1][160] = {{0}}; int record = 0; PreparedContextArtifacts prepared = {0};
+  nested_mode = 0; memset(nested_calls, 0, sizeof(nested_calls));
+  assert(sqlite_record_context_artifacts(&record, ids, &prepared) == 3);
+  assert(nested_calls[0] == 1u && nested_calls[1] == 1u && nested_calls[2] == 1u);
+  assert(GetLastError() == 66u && errno == 26); check(54u);
+  assert(sqlite_prepare_context_artifacts(NULL, ids, 1u, &prepared) == -17);
+  assert(GetLastError() == 65u && errno == 25); check(54u);
+  nested_mode = 1;
+  assert(sqlite_size_budget_allow() == -29);
+  assert(GetLastError() == 66u && errno == 26); check(54u);
+  assert(sqlite_prepare_context_artifacts(&record, ids, 1u, &prepared) == -31);
+  assert(GetLastError() == 66u && errno == 26); check(54u);
+  assert(sqlite_record_context_artifacts(NULL, ids, &prepared) == -37);
+  assert(GetLastError() == 67u && errno == 27); check(54u);
+  assert(sqlite_record_context_artifacts(&record, ids, &prepared) == -41);
+  assert(GetLastError() == 66u && errno == 26); check(54u);
+  assert(nested_calls[0] == 4u && nested_calls[1] == 4u && nested_calls[2] == 3u);
+#endif
+}
 '''
 CACHE_SHIM_BODY = r'''
 static void service_diag_record_behavior_impl(const EdrBehaviorRecord *r) {
@@ -166,7 +228,7 @@ class ServiceSampling(unittest.TestCase):
         done = subprocess.run([sys.executable, '-B', str(HERE / 'generate_service_source.py'), str(source_root), str(output)], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         receipt = json.loads(done.stdout)
-        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 124, 128))
+        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['cache_nested_envelopes'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 3, 127, 128))
         return [json.loads((output / name).read_bytes()) for name in ('SERVICE-SOURCE-TRANSFORM-v2.json', 'SERVICE-CACHE-SOURCE-TRANSFORM-v2.json')]
 
     def test_raw_reversal_lf_crlf_and_fixed_callsite_map(self):
@@ -188,7 +250,11 @@ class ServiceSampling(unittest.TestCase):
                 self.assertEqual([c['callsite_id'] for c in cache['changes']], list(range(81, 125)))
                 self.assertEqual(pipeline['namespace'], cache['namespace'])
                 self.assertEqual(pipeline['namespace']['cache_envelope'], 80)
-                self.assertEqual(pipeline['namespace']['unassigned_range'], [125, 127])
+                self.assertEqual(pipeline['namespace']['unassigned_range'], [])
+                self.assertEqual(pipeline['namespace']['cache_nested_range'], [125, 127])
+                self.assertEqual([(c['callsite_id'], c['name']) for c in cache['nested_envelopes']], [
+                    (125, 'sqlite_prepare_context_artifacts'), (126, 'sqlite_size_budget_allow'),
+                    (127, 'sqlite_record_context_artifacts')])
                 self.assertEqual(len(pipeline['local_previous_arrays']), 18)
                 self.assertEqual({c['old'].split('(')[0] for c in cache['changes'] if c['kind'] == 'U32'}, {'context_window_matches', 'context_before_count'})
                 self.assertNotIn('record_time_ns', {c['old'].split('(')[0] for c in cache['changes']})
@@ -209,9 +275,19 @@ class ServiceSampling(unittest.TestCase):
                         replacements = [('rename_header_from', 'rename_header_to'), ('wait_generated', 'wait_original'), ('error_generated', 'error_original')]
                         declarations = reversal['remove_local_declarations']
                     else:
-                        remove = ('remove_wrapper',)
+                        remove = ('remove_wrapper', 'remove_nested_bridge')
                         replacements = [('generated_header', 'original_header')]
                         declarations = [reversal['remove_local_declaration']]
+                        for envelope in reversal['nested_envelopes']:
+                            self.assertEqual(text[envelope['start']:envelope['header_end']], envelope['original_header'])
+                            self.assertEqual(text[envelope['end']-1], '}')
+                            # The wrapper is inserted in the same original SQLite
+                            # conditional branch; no wrapper appears after its endif.
+                            self.assertLess(envelope['end'], text.index('\n#endif', text.index('static int sqlite_record_budgeted_context_artifacts')))
+                            self.assertEqual(generated.count(envelope['wrapper']), 1)
+                            generated = generated.replace(envelope['wrapper'], '', 1)
+                            self.assertEqual(generated.count(envelope['generated_header']), 1)
+                            generated = generated.replace(envelope['generated_header'], envelope['original_header'], 1)
                     for key in remove:
                         self.assertEqual(generated.count(reversal[key]), 1, key)
                         generated = generated.replace(reversal[key], '', 1)
@@ -230,6 +306,16 @@ class ServiceSampling(unittest.TestCase):
             self.assertEqual(inventories[0], inventories[1])
             self.assertEqual(inventories[0], inventories[2])
 
+    def cache_shim(self, cache):
+        reversal = cache['raw_reversal']
+        bridge = reversal['generated_header'].removesuffix('static void service_diag_record_behavior_impl(const EdrBehaviorRecord *r) {')
+        nested = ['#if defined(EDR_HAVE_SQLITE)\n', reversal['remove_nested_bridge'],
+                  'static unsigned nested_calls[3];\nstatic int nested_mode;\n']
+        for envelope in sorted(cache['nested_envelopes'], key=lambda c: c['start']):
+            nested += [envelope['generated_header'], NESTED_SHIM_BODIES[envelope['name']], envelope['wrapper']]
+        nested += ['#endif\n', NESTED_SHIM_TEST]
+        return CACHE_SHIM_PREFIX + '\n'.join(nested) + bridge + CACHE_SHIM_BODY + reversal['remove_wrapper']
+
     def test_real_c_helpers_with_explicit_winapi_seams(self):
         clang = shutil.which('clang')
         if not clang:
@@ -239,10 +325,8 @@ class ServiceSampling(unittest.TestCase):
             source, cache_source, binary = root / 'test.c', root / 'cache.c', root / 'test'
             source.write_text(SHIM)
             _, cache = self.generate(root / 'generated')
-            reversal = cache['raw_reversal']
-            bridge = reversal['generated_header'].removesuffix('static void service_diag_record_behavior_impl(const EdrBehaviorRecord *r) {')
-            cache_source.write_text(CACHE_SHIM_PREFIX + bridge + CACHE_SHIM_BODY + reversal['remove_wrapper'])
-            built = subprocess.run([clang, '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(HERE), str(source), str(cache_source), '-o', str(binary)], capture_output=True, text=True)
+            cache_source.write_text(self.cache_shim(cache))
+            built = subprocess.run([clang, '-std=c11', '-DEDR_HAVE_SQLITE=1', '-Wall', '-Wextra', '-Werror', '-I', str(HERE), str(source), str(cache_source), '-o', str(binary)], capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr)
             ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
             self.assertEqual(ran.returncode, 0, ran.stderr)
@@ -257,6 +341,12 @@ class ServiceSampling(unittest.TestCase):
             self.assertEqual(sum(phases), count)
             self.assertEqual(sum(sites), count)
             print(ran.stderr, end='')
+            # The same generated helper wrappers must disappear with SQLite's
+            # original branch; the non-SQL cache envelope still links and runs.
+            built = subprocess.run([clang, '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(HERE), str(source), str(cache_source), '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
 
     def test_existing_mingw_headers_syntax_only(self):
         compiler = shutil.which('x86_64-w64-mingw32-gcc')
@@ -267,6 +357,12 @@ class ServiceSampling(unittest.TestCase):
             path.write_text('#include <windows.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n#include <stdatomic.h>\nstatic atomic_uint s_worker_phase;\nstatic uint64_t edr_monotonic_ns(void){return 1;}\n#include "service_substage_frontier.inc"\nint main(void){PreprocessJoinSamples s;DWORD e;preprocess_substage_worker_enter();uint64_t p=preprocess_substage_enter(8,79);preprocess_substage_int_leave(p,0);preprocess_substage_clear();preprocess_join_sampled_wait(0,&e,&s);preprocess_join_samples_print(&s);preprocess_substage_worker_exit();return 0;}\n')
             ran = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsyntax-only', '-I', str(HERE), str(path)], capture_output=True, text=True)
             self.assertEqual(ran.returncode, 0, ran.stderr)
+            _, cache = self.generate(Path(temporary) / 'generated')
+            cache_path = Path(temporary) / 'cache.c'
+            cache_path.write_text(self.cache_shim(cache))
+            for definitions in ([], ['-DEDR_HAVE_SQLITE=1']):
+                ran = subprocess.run([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsyntax-only', *definitions, str(cache_path)], capture_output=True, text=True)
+                self.assertEqual(ran.returncode, 0, ran.stderr)
 
 
 if __name__ == '__main__':

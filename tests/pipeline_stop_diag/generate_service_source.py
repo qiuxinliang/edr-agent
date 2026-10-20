@@ -235,14 +235,58 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   preprocess_substage_leave(previous);
 }
 '''
+# These three function envelopes deliberately cover all invocations, not just
+# record_behavior's direct callsites. Their original conditional-compilation
+# scope and complete return paths remain inside the renamed implementation.
+nested_envelopes = []
+for site, name, semantic, arguments in [
+ (125, 'sqlite_prepare_context_artifacts', 'context_prepare_reads', 'r, candidate_ids, candidate_count, prepared'),
+ (126, 'sqlite_size_budget_allow', 'capacity_admission_may_maintain', ''),
+ (127, 'sqlite_record_context_artifacts', 'context_transaction', 'r, candidate_ids, prepared')]:
+ matches = list(re.finditer(r'(?m)^static int '+name+r'\s*\([^;{}]*\)\s*\{', cache_masked))
+ assert len(matches) == 1, 'nested helper definition must be unique: '+name
+ match = matches[0]
+ opened, end, depth = match.end()-1, match.end(), 1
+ while depth:
+  depth += (cache_masked[end] == '{') - (cache_masked[end] == '}');end += 1
+ original_header = cache_text[match.start():match.end()]
+ generated_header = original_header.replace(name, 'service_diag_'+name+'_impl', 1)
+ wrapper = ('\n/* Nested helper envelope; every original return restores its caller. */\n'+
+            original_header+'\n'+
+            f'  const uint64_t previous = preprocess_substage_enter(8u, {site}u);\n'+
+            f'  const int result = service_diag_{name}_impl({arguments});\n'+
+            '  preprocess_substage_leave(previous);\n  return result;\n}\n')
+ nested_envelopes.append({'callsite_id':site, 'name':name, 'owner':name, 'kind':'INT',
+                          'semantic':semantic, 'line':cache_text.count('\n',0,match.start())+1,
+                          'start':match.start(), 'end':end, 'header_end':match.end(),
+                          'original_header':original_header, 'generated_header':generated_header,
+                          'wrapper':wrapper, 'arguments':arguments})
+# The first helper precedes record_behavior's existing bridge, inside the
+# original SQLite branch. Declarations introduce no non-SQLite dependency.
+nested_bridge = ('/* Test-only nested helpers share the pipeline-owned frontier. */\n'
+                 'extern uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite);\n'
+                 'extern void preprocess_substage_leave(uint64_t previous);\n')
+first_nested = min(c['start'] for c in nested_envelopes)
 cache_changed = cache_text
 cache_edits = cache_changes + [
  {'start':cache_open+1,'end':cache_open+1,'old':'','new':cache_declaration},
  {'start':cache_start,'end':cache_start+len(cache_old_header),'old':cache_old_header,'new':cache_bridge+cache_new_header},
  {'start':cache_end,'end':cache_end,'old':'','new':cache_wrapper}]
+for c in nested_envelopes:
+ cache_edits += [
+  {'start':c['start'], 'end':c['header_end'], 'old':c['original_header'],
+   'new':(nested_bridge if c['start'] == first_nested else '')+c['generated_header']},
+  {'start':c['end'], 'end':c['end'], 'old':'', 'new':c['wrapper']}]
 for c in sorted(cache_edits, key=lambda c:c['start'], reverse=True):
  cache_changed = cache_changed[:c['start']] + c['new'] + cache_changed[c['end']:]
 cache_restored = cache_changed.replace(cache_wrapper, '', 1).replace(cache_bridge+cache_new_header, cache_old_header, 1).replace(cache_declaration, '', 1)
+assert cache_restored.count(nested_bridge) == 1
+cache_restored = cache_restored.replace(nested_bridge, '', 1)
+for c in nested_envelopes:
+ assert cache_restored.count(c['wrapper']) == 1
+ cache_restored = cache_restored.replace(c['wrapper'], '', 1)
+ assert cache_restored.count(c['generated_header']) == 1
+ cache_restored = cache_restored.replace(c['generated_header'], c['original_header'], 1)
 for c in reversed(cache_changes):
  assert cache_restored.count(c['new']) == 1
  cache_restored = cache_restored.replace(c['new'], c['old'], 1)
@@ -253,7 +297,7 @@ cache_target.write_bytes(cache_changed.encode('utf-8'))
 assert cache_target.read_bytes() == cache_changed.encode('utf-8')
 namespace = {'phase_bins':13, 'callsite_bins':128, 'unknown':0,
              'pipeline_range':[1,79], 'cache_envelope':80, 'cache_direct_range':[81,124],
-             'max_assigned_id':124, 'unassigned_range':[125,127],
+             'cache_nested_range':[125,127], 'max_assigned_id':127, 'unassigned_range':[],
              'single_frontier_owner':'generated pipeline registered preprocess worker',
              'sampling_version':2}
 manifest['namespace'] = namespace
@@ -265,8 +309,10 @@ cache_manifest = {
  'inverse_raw_exact':True, 'generator_sha256':manifest['generator_sha256'],
  'template_sha256':manifest['template_sha256'], 'namespace':namespace,
  'changes':cache_changes,
+ 'nested_envelopes':nested_envelopes,
  'raw_reversal':{'remove_wrapper':cache_wrapper, 'generated_header':cache_bridge+cache_new_header,
-                 'original_header':cache_old_header, 'remove_local_declaration':cache_declaration},
+                 'original_header':cache_old_header, 'remove_local_declaration':cache_declaration,
+                 'remove_nested_bridge':nested_bridge, 'nested_envelopes':nested_envelopes},
  'offset_unit':manifest['offset_unit'],
  'limitations':['unshipped diagnostic only; production cache source and API unchanged',
                 'same pipeline thread gate and state; non-owner calls publish nothing',
@@ -274,12 +320,16 @@ cache_manifest = {
                 'site54 also covers work after record_behavior, including should_emit',
                 'metric/failure helpers may flush SQL; budget may run maintenance',
                 'context helper includes reads/budget/transaction and exact replay may not write',
+                'nested125/126/127 cover preparation/capacity/transaction helpers, not individual SQL or fsync',
+                'function envelopes cover every registered-worker call, including record_alert_context; not only site114',
+                'one frontier identifies the innermost wrapped helper, not its complete caller stack; do not add nested populations',
                 'lock-acquire probe includes existing production lock timing work',
                 'nominal samples are not exact time, SQL attribution or additive nested costs']}
 for filename, proof in [('SERVICE-SOURCE-TRANSFORM-v2.json',manifest),
                         ('SERVICE-CACHE-SOURCE-TRANSFORM-v2.json',cache_manifest)]:
  (output/filename).write_bytes((json.dumps(proof, indent=2)+'\n').encode('utf-8'))
 print(json.dumps({'source_count':2,'pipeline_call_transforms':79,'cache_call_transforms':44,
-                  'inverse_raw_exact':True, 'max_assigned_id':124, 'callsite_bins':128,
+                  'cache_nested_envelopes':3,
+                  'inverse_raw_exact':True, 'max_assigned_id':127, 'callsite_bins':128,
                   'generated_sha256':manifest['generated_sha256'],
                   'cache_generated_sha256':cache_manifest['generated_sha256']}))
