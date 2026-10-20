@@ -212,8 +212,8 @@ try{
   # SCM call: the terminal-known input is a deliberately explicit test seam.
   foreach($op in 0..5){
     $path=PublicFixture ([byte[]]@($op));$value=ReadPreflightProgress $path $true
-    $expectedStatus=if($op -eq 0){'no_child_progress_observed'}else{'observed'}
-    AssertContract ($value.Count -eq 2 -and $value.status -ceq $expectedStatus -and $value.last_operation_id -is [int] -and $value.last_operation_id -eq $op) 'prepared_progress_one_byte_closed_values'
+    $expectedProgressStatus=if($op -eq 0){'no_child_progress_observed'}else{'observed'}
+    AssertContract ($value.Count -eq 2 -and $value.status -ceq $expectedProgressStatus -and $value.last_operation_id -is [int] -and $value.last_operation_id -eq $op) 'prepared_progress_one_byte_closed_values'
     AssertContract (-not (($value|ConvertTo-Json -Compress).Contains($path))) 'prepared_progress_path_not_exported'
   }
   $badProgress=@((PublicFixture ([byte[]]@())),(PublicFixture ([byte[]]@(0,1))),(PublicFixture ([byte[]]@(6))),(PublicFixture ([byte[]]@(48))),(PublicFixture ([byte[]]@(255))),(Join-Path $script:publicFixtureRoot 'missing-progress.public'))
