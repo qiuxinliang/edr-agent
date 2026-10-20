@@ -36,8 +36,8 @@ foreach($name in @('publicFailureCodes','stageFailureCodes')){
 
 # Loading a function definition does not call it. This fixed inventory excludes
 # StartOwned/RunOwned/SCM/cleanup/main. Reject newly introduced command owners.
-$wantedFunctions=@('Check','ProjectSampler','ReadFailureProjection','PowerShellWorkerSource')
-$allowedCommands=@('Check','ConvertFrom-Json','New-Object','ReadOwnedBytes','ForEach-Object')
+$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','PowerShellWorkerSource')
+$allowedCommands=@('Check','ConvertFrom-Json','ConvertTo-Json','New-Object','ReadOwnedBytes','ForEach-Object')
 foreach($name in $wantedFunctions){
   $defs=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
   if($defs.Count -ne 1){throw 'prepared_pure_function_inventory'}
@@ -155,6 +155,36 @@ try{
   AssertContract ($null -eq $value.hresult) 'prepared_python_does_not_invent_hresult'
   $null=FailureCase ($python.Replace('"hresult":null','"hresult":0')) python_stage unknown
   $null=FailureCase ($python.Replace('dependency_file_count_cap',$script:privateMarker)) python_stage unknown
+
+  # Real ErrorRecords, including preparation failures before a bound intent
+  # exists. Do not export their messages, target objects or invocation text.
+  try{Check $false 'qa_function_inventory'}catch{$failureRecord=$_}
+  $value=ProjectPrimaryFailure $failureRecord
+  AssertContract ($value.cause_code -ceq 'qa_function_inventory' -and $value.hresult -eq $failureRecord.Exception.HResult -and $null -eq $value.native_error) 'prepared_primary_closed_cause_and_real_hresult'
+  AssertContract ($value.source_line -is [int] -and $value.source_line -gt 0 -and $value.source_column -is [int]) 'prepared_primary_actual_source_position'
+  AssertContract ($value.Count -eq 6 -and @($value.Keys|Where-Object {$_ -cnotin @('exception_type','hresult','native_error','source_line','source_column','cause_code')}).Count -eq 0) 'prepared_primary_fixed_fields'
+  try{throw ($script:privateMarker+' C:\private\invocation target')}catch{$failureRecord=$_}
+  $value=ProjectPrimaryFailure $failureRecord
+  $encoded=$value|ConvertTo-Json -Compress
+  AssertContract ($value.cause_code -ceq 'unclassified_no_message_export' -and -not $encoded.Contains($script:privateMarker) -and -not $encoded.Contains('private')) 'prepared_primary_unknown_message_not_exported'
+  $nativeError=[ComponentModel.Win32Exception]::new(5,$script:privateMarker)
+  $wrapper=[InvalidOperationException]::new($script:privateMarker,$nativeError)
+  $failureRecord=[Management.Automation.ErrorRecord]::new($wrapper,$script:privateMarker,[Management.Automation.ErrorCategory]::NotSpecified,$script:privateMarker)
+  $value=ProjectPrimaryFailure $failureRecord
+  AssertContract ($value.native_error -eq 5 -and $value.hresult -eq $wrapper.HResult -and $null -eq $value.source_line -and $null -eq $value.source_column) 'prepared_primary_win32_error_is_observed_not_hresult_guess'
+  AssertContract (-not (($value|ConvertTo-Json -Compress).Contains($script:privateMarker))) 'prepared_primary_nested_exception_privacy'
+  $deep=$nativeError;for($depth=0;$depth -lt 4;$depth++){$deep=[InvalidOperationException]::new($script:privateMarker,$deep)}
+  $failureRecord=[Management.Automation.ErrorRecord]::new($deep,$script:privateMarker,[Management.Automation.ErrorCategory]::NotSpecified,$null)
+  $value=ProjectPrimaryFailure $failureRecord
+  AssertContract ($null -eq $value.native_error -and $value.cause_code -ceq 'unclassified_no_message_export') 'prepared_primary_exception_walk_is_bounded'
+  $SourceSha='a'*40;$Token='b'*32
+  $script:experimentClock=[Diagnostics.Stopwatch]::StartNew()
+  $script:result=@{stop_result=$null;phase='preflight';preparation_stage_id=4;intent_recorded=$false;primary_failure=$value}
+  $oldOutput=[Console]::Out;$summaryOutput=[IO.StringWriter]::new()
+  try{[Console]::SetOut($summaryOutput);WriteDiagnosticSummary $false}finally{[Console]::SetOut($oldOutput)}
+  $summary=$summaryOutput.ToString();$summaryOutput.Dispose();$summaryValue=$summary|ConvertFrom-Json
+  AssertContract ($summaryValue.schema -ceq 'edr.ci-isolated-service-summary.v1' -and -not $summaryValue.diagnostic_accepted -and -not $summaryValue.whole_recovery_accepted -and $summaryValue.stop_status -ceq 'not_reached' -and $summaryValue.preparation_stage_id -eq 4 -and -not $summaryValue.intent_recorded) 'prepared_primary_console_survives_missing_intent'
+  AssertContract ($summaryValue.primary_failure.cause_code -ceq 'unclassified_no_message_export' -and -not $summary.Contains($script:privateMarker)) 'prepared_primary_console_keeps_safe_first_failure'
 
   # Text generation and ParseInput only. Never invoke the generated try/catch,
   # its body, or its exit statement in this test process or a child process.

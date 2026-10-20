@@ -33,7 +33,7 @@ $script:cleanupMode=$false;$script:cleanupDeadline=270000
 $script:context=$null;$script:primary=$null;$script:cleanupErrors=New-Object Collections.ArrayList
 $script:serviceName='FDSecurityAgentCI_'+$Token
 $script:ruleName='EDR-CI-Service-Offline-'+$Token
-$script:result=[ordered]@{schema='edr.ci-isolated-service-diagnostic.v1';source_sha=$SourceSha;token=$Token;arch=$Architecture;status='prepared_not_run';phase='preflight';primary_failure=$null;stop_result=$null;target=$null;shutdown_log_observation=$null;cleanup=$null;whole_recovery_accepted=$false;actual_original_service_cause_proven=$false;model_or_rule_ready_claimed=$false;all_8192_slots_exercised=$false;framework_parent_job_covers_service=$false;diagnostic_agent_not_release=$true;pipeline_instrumentor_thread_safe_claimed=$false}
+$script:result=[ordered]@{schema='edr.ci-isolated-service-diagnostic.v1';source_sha=$SourceSha;token=$Token;arch=$Architecture;status='prepared_not_run';phase='preflight';preparation_stage_id=0;intent_recorded=$false;primary_failure=$null;stop_result=$null;target=$null;shutdown_log_observation=$null;cleanup=$null;whole_recovery_accepted=$false;actual_original_service_cause_proven=$false;model_or_rule_ready_claimed=$false;all_8192_slots_exercised=$false;framework_parent_job_covers_service=$false;diagnostic_agent_not_release=$true;pipeline_instrumentor_thread_safe_claimed=$false}
 
 $script:publicFailureCodes=@(
   'actual_692_701_template_required',
@@ -156,6 +156,26 @@ $script:stageFailureCodes=@(
   'seed_manifest_sha_mismatch'
 )
 function Check($Value,[string]$Cause){if(-not $Value){throw $Cause}}
+function ProjectPrimaryFailure([Management.Automation.ErrorRecord]$Record){
+  # Only runtime types, closed causes and numeric positions; never exception
+  # messages, invocation text, paths, stack traces or arbitrary error IDs.
+  $exception=$Record.Exception;$kind=$exception.GetType().FullName
+  if($kind -cnotmatch '^[A-Za-z_][A-Za-z0-9_.]{0,255}$'){$kind='unknown'}
+  $native=$null;$inner=$exception
+  for($depth=0;$depth -lt 4 -and $null -ne $inner;$depth++){
+    if($inner -is [ComponentModel.Win32Exception]){$native=[int]$inner.NativeErrorCode;break}
+    $inner=$inner.InnerException
+  }
+  $line=$null;$column=$null;$info=$Record.InvocationInfo
+  if($null -ne $info){
+    if($info.ScriptLineNumber -ge 1 -and $info.ScriptLineNumber -le 100000){$line=[int]$info.ScriptLineNumber}
+    if($info.OffsetInLine -ge 1 -and $info.OffsetInLine -le 16384){$column=[int]$info.OffsetInLine}
+  }
+  return @{exception_type=$kind;hresult=[int]$exception.HResult;native_error=$native;source_line=$line;source_column=$column;cause_code=if($exception.Message -cin $script:publicFailureCodes){$exception.Message}else{'unclassified_no_message_export'}}
+}
+function WriteDiagnosticSummary([bool]$Accepted){
+  [Console]::Out.WriteLine((@{schema='edr.ci-isolated-service-summary.v1';source_sha=$SourceSha;token=$Token;diagnostic_accepted=$Accepted;stop_status=if($null -ne $script:result.stop_result){$script:result.stop_result.status}else{'not_reached'};elapsed_ms=$script:experimentClock.ElapsedMilliseconds;phase=$script:result.phase;preparation_stage_id=$script:result.preparation_stage_id;intent_recorded=$script:result.intent_recorded;primary_failure=$script:result.primary_failure;whole_recovery_accepted=$false}|ConvertTo-Json -Depth 8 -Compress))
+}
 function Hash([string]$Path){(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()}
 function RegularPath([string]$Path,[long]$Cap=67108864){
   $p=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -368,6 +388,7 @@ function ProjectSampler($Child,$Receipt){
 
 try {
   Check ($IsWindows -and $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted' -and $env:GITHUB_SHA -ceq $SourceSha) 'fresh_source_bound_github_hosted_only'
+  $script:result.preparation_stage_id=1
   Add-Type -AssemblyName System.Text.Json -ErrorAction Stop
   Add-Type -TypeDefinition @'
 using System.IO;
@@ -382,24 +403,34 @@ public static class CiServiceBoundedPump {
  }
 }
 '@
+  $script:result.preparation_stage_id=2
   $id=[Security.Principal.WindowsIdentity]::GetCurrent();Check ([Security.Principal.WindowsPrincipal]::new($id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'administrator_required'
+  $script:result.preparation_stage_id=3
   $temp=Get-Item -LiteralPath $env:RUNNER_TEMP -Force;Check ($temp.PSIsContainer -and ($temp.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'runner_temp_invalid'
   $candidateCase=Join-Path $temp.FullName ('edr-ci-service-'+$Token);Check (-not (Test-Path -LiteralPath $candidateCase)) 'fresh_case_required'
   $createdCase=New-Item -ItemType Directory -Path $candidateCase -ErrorAction Stop;$script:case=$createdCase.FullName;$script:root=$script:case
+  # These are declared public inputs, not a claim that preparation or Agent
+  # validation succeeded. Preserve them before ACL/owner import can fail.
+  SaveNew 'intent.json' @{schema='edr.ci-isolated-service-intent.v1';source_sha=$SourceSha;token=$Token;service=$script:serviceName;agent_sha256=$AgentSha256;config_template_sha256=$ConfigTemplateSha256;qa_driver_sha256=$QADriverSha256;budget_profile='match512';stop_ms=45000;observe_max_ms=60000;overall_cooperative_ms=270000;cleanup_reserve_ms=30000;no_installer_or_updater=$true;no_release=$true;no_endpoint=$true}
+  $script:result.intent_recorded=$true
+  $script:result.preparation_stage_id=4
   & (Join-Path $env:WINDIR 'System32\icacls.exe') $script:case /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
   Check ($LASTEXITCODE -eq 0) 'private_case_acl_failed'
   $acl=Get-Acl -LiteralPath $script:case;Check $acl.AreAccessRulesProtected 'private_case_acl_not_protected'
   foreach($rule in $acl.Access){$sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;Check ($sid -cin @('S-1-5-18','S-1-5-32-544') -and [string]$rule.AccessControlType -ceq 'Allow') 'private_case_acl_unexpected_principal'}
+  $script:result.preparation_stage_id=5
   $script:winPS=RegularPath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
   $sc=RegularPath (Join-Path $env:WINDIR 'System32\sc.exe')
   $repo=[IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
   $driver=RegularPath (Join-Path $repo 'tests\cache-recovery\windows_cache_recovery_ci.ps1') 131072
   Check ((Hash $driver) -ceq $QADriverSha256) 'workflow_bound_qa_owner_changed'
+  $script:result.preparation_stage_id=6
   $imports=@('Need','Regular','SHA','ReadOwnedBytes','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
   $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($driver,[ref]$tokens,[ref]$errors);Check ($errors.Count -eq 0) 'qa_owner_parse_failure'
+  $script:result.preparation_stage_id=7
   foreach($name in $imports){$defs=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true));Check ($defs.Count -eq 1) 'qa_function_inventory';if($name -ceq 'ReadStopLogSlice'){Invoke-Expression ($defs[0].Extent.Text.Replace('function ReadStopLogSlice(', 'function OriginalReadStopLogSlice('))}else{Invoke-Expression $defs[0].Extent.Text}}
   function ReadStopLogSlice($Context,[long]$ElapsedMs){SampleLimits;OriginalReadStopLogSlice $Context $ElapsedMs;SampleLimits}
-  SaveNew 'intent.json' @{schema='edr.ci-isolated-service-intent.v1';source_sha=$SourceSha;token=$Token;service=$script:serviceName;agent_sha256=$AgentSha256;config_template_sha256=$ConfigTemplateSha256;qa_driver_sha256=$QADriverSha256;budget_profile='match512';stop_ms=45000;observe_max_ms=60000;overall_cooperative_ms=270000;cleanup_reserve_ms=30000;no_installer_or_updater=$true;no_release=$true;no_endpoint=$true}
+  $script:result.preparation_stage_id=8
   $preflight=@'
 $s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
 $p=@(Get-CimInstance Win32_Process -Property Name -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSensor.exe','edr_agent.exe')})
@@ -537,7 +568,7 @@ exit 0
   $script:result.status=if($frozen.status -ceq 'returned_zero'){'stop_returned_zero_pending_cleanup_verification'}else{'stop_failed_observation_only'}
 } catch {
   $script:primary=$_.Exception.GetType().FullName
-  $script:result.primary_failure=@{exception_type=$script:primary;hresult=$_.Exception.HResult;cause_code=if($_.Exception.Message -cin $script:publicFailureCodes){$_.Exception.Message}else{'unclassified_no_message_export'}}
+  $script:result.primary_failure=ProjectPrimaryFailure $_
   $script:result.status='failed_or_unknown'
 } finally {
   # Independent cleanup never rewrites stop-result-frozen.json or promotes a
@@ -591,8 +622,9 @@ exit 0
     $script:result.within_cooperative_budget=($script:experimentClock.ElapsedMilliseconds -le 270000)
     $ok=($null -eq $script:primary -and $null -ne $script:result.stop_result -and $script:result.stop_result.status -ceq 'returned_zero' -and $cleanup.scm_stopped_zero_before_delete -and $cleanup.target_terminal_known -and $cleanup.target_exit_code -eq 0 -and -not $cleanup.exact_target_kill_attempted -and $cleanup.service_absent_confirmed -and $cleanup.offline_rule_removed -and $cleanup.unknown_or_errors.Count -eq 0 -and $script:result.within_cooperative_budget)
     $script:result.diagnostic_accepted=$ok
-    try{SaveNew 'result.json' $script:result;[Console]::Out.WriteLine((@{schema='edr.ci-isolated-service-summary.v1';source_sha=$SourceSha;token=$Token;diagnostic_accepted=$ok;stop_status=if($null -ne $script:result.stop_result){$script:result.stop_result.status}else{'not_reached'};elapsed_ms=$script:experimentClock.ElapsedMilliseconds;whole_recovery_accepted=$false}|ConvertTo-Json -Compress))}catch{[Console]::Error.WriteLine('isolated_service_receipt_write_failed');$ok=$false}
+    try{SaveNew 'result.json' $script:result}catch{[Console]::Error.WriteLine('isolated_service_receipt_write_failed');$ok=$false}
+    WriteDiagnosticSummary $ok
     if($ok){exit 0}else{exit 2}
-  }
+  }else{WriteDiagnosticSummary $false}
 }
 exit 2

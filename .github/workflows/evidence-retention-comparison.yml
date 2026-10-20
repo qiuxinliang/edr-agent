@@ -90,6 +90,21 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      # Fail before compiler/dependency work if the real preparation prefix
+      # cannot establish its private directory or load the pinned QA owners.
+      - name: Check isolated Service preparation before native builds
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_service_stop && matrix.arch == 'arm64' }}
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $driver = Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/diagnose_service_once.ps1'
+          $qaDriver = Join-Path $env:GITHUB_WORKSPACE 'tests/cache-recovery/windows_cache_recovery_ci.ps1'
+          $driverSha = (Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
+          $qaDriverSha = (Get-FileHash -LiteralPath $qaDriver -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ./tests/pipeline_stop_diag/test_prepared_service_contracts.ps1 -DriverSource $driver -DriverSha256 $driverSha
+          if (-not $?) { throw 'Pure Service failure projection contract failed before native builds' }
+          & ./tests/pipeline_stop_diag/test_service_preparation.ps1 -DriverSource $driver -DriverSha256 $driverSha -QADriverSource $qaDriver -QADriverSha256 $qaDriverSha
+          if (-not $?) { throw 'Service preparation prefix failed before any Agent or SCM execution' }
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12.10'
@@ -365,18 +380,8 @@ jobs:
         timeout-minutes: 5
         shell: pwsh
         run: |
-          $parseTokens = $null; $parseErrors = $null
-          $null = [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/diagnose_service_once.ps1'), [ref]$parseTokens, [ref]$parseErrors)
-          if ($parseErrors.Count -ne 0) {
-            foreach ($parseError in @($parseErrors | Select-Object -First 8)) {
-              @{line=$parseError.Extent.StartLineNumber; column=$parseError.Extent.StartColumnNumber; error_id=$parseError.ErrorId} | ConvertTo-Json -Compress
-            }
-            throw 'Isolated SCM diagnostic script parse failed'
-          }
-          $serviceDriver = Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/diagnose_service_once.ps1'
-          $serviceDriverSha = (Get-FileHash -LiteralPath $serviceDriver -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ./tests/pipeline_stop_diag/test_prepared_service_contracts.ps1 -DriverSource $serviceDriver -DriverSha256 $serviceDriverSha
-          if (-not $?) { throw 'Pure Service diagnostic projection contract failed before any SCM operation' }
+          # The same-source Core7 projection/preparation contracts ran before
+          # dependency work; keep the native-only consumers here.
           python -B tests/pipeline_stop_diag/test_collect_service_diagnostic.py -v
           if ($LASTEXITCODE -ne 0) { throw 'Selected SCM metadata boundary regression failed' }
           python -B tests/pipeline_stop_diag/test_stage_ci_agent.py -v
