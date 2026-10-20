@@ -46,11 +46,11 @@ def cohort_catalog_raw():
 
 def cohort(cohort_id='695',require_bound=True):
     # One checked-in QA data owner; no caller-selected file/source/run/URL.
-    need(cohort_id in ('695','697','698','699','701','702','703'),'unsupported_recovery_cohort')
+    need(cohort_id in ('695','697','698','699','701','702','703','704'),'unsupported_recovery_cohort')
     raw=cohort_catalog_raw()
     catalog=strict_json(raw)
     need(type(catalog)is dict and set(catalog)=={'schema','baseline','profiles'} and catalog['schema']=='edr.ci-recovery-cohorts.v1' and
-         type(catalog['profiles'])is dict and set(catalog['profiles'])=={'695','697','698','699','701','702','703'},'cohort_catalog_shape')
+         type(catalog['profiles'])is dict and set(catalog['profiles'])=={'695','697','698','699','701','702','703','704'},'cohort_catalog_shape')
     c=catalog['profiles'][cohort_id]
     keys={'id','source','version','tag','release_run','release_id','native_run','native_artifact_id','native_artifact_size',
           'native_artifact_sha256','native_uncompressed_bytes','native_member_count','handler_owner_sha256','builder_owner_sha256',
@@ -66,6 +66,13 @@ def cohort(cohort_id='695',require_bound=True):
              all(re.fullmatch('[1-9][0-9]*',c[k]) for k in ('release_run','release_id','native_run','native_artifact_id',
                  'native_artifact_size','native_uncompressed_bytes','native_member_count')),'cohort_pin_shape')
     return c,base,digest(raw)
+
+
+def recovery_scenario(cohort_id, mode=None):
+    need(cohort_id in ('695','697','698','699','701','702','703','704'),'unsupported_recovery_cohort')
+    scenario='installed_target_repair' if cohort_id=='704' else 'legacy692_upgrade'
+    need(scenario!='installed_target_repair' or mode in (None,'service'),'installed_repair_service_only')
+    return scenario
 
 
 # Backward-compatible defaults for existing 695 parser/unit consumers. Execution
@@ -292,6 +299,7 @@ def runtime_mode(value):
 
 def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_id='695',mode='service'):
     mode=runtime_mode(mode)
+    scenario=recovery_scenario(cohort_id,mode)
     profile,baseline_profile,profile_sha=cohort(cohort_id)
     need(not root.exists(),'fresh_private_output_required')
     verification,receipt_raw,d,packages=verified_handler_receipt(receipt,receipt_sha,profile)
@@ -308,7 +316,8 @@ def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_
     snapshot=module(workspace/'tests/cache-recovery/cache_recovery_snapshot.py','original_private_snapshot')
     stage_owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py';tool=native_tools(root,snapshot,stage_owner,profile)
     target,downloads=download_headless(root,checkpoint,profile['tag'],profile['source'],profile['release_run'],profile=profile)
-    baseline,unused=download_headless(root,checkpoint,baseline_profile['tag'],baseline_profile['source'],baseline_profile['release_run'],True,profile)
+    if scenario=='legacy692_upgrade':
+        baseline,unused=download_headless(root,checkpoint,baseline_profile['tag'],baseline_profile['source'],baseline_profile['release_run'],True,profile)
     zip_path=downloads/('edr-agent-'+profile['tag']+'-windows-arm64-exe.zip')
     manifest=downloads/('edr-agent-'+profile['tag']+'-windows-arm64-artifact-manifest.json')
     need(digest(zip_path.read_bytes())==packages['headless'] and target['agent_binary_sha256']==d['binarySha256'] and target['runtime_identity_sha256']==profile['runtime_identity_sha256'] and
@@ -319,7 +328,7 @@ def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_
       'preflight':{'path':str(root/'preflight.json'),'sha256':digest(receipt_raw),'bytes':len(receipt_raw)}}
     json_save(root/'p5-binding.json',binding)
     json_save(root/'overlay.json',{'Replace':{str(owner.with_name('zz_private_p5_export_test.go')):str(workspace/'tests/cache-recovery/verified_headless_p5_export_test.go')}})
-    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','runtime_mode':mode,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'target_run':profile['release_run'],'tool_run':profile['native_run'],
+    json_save(root/'prepared.json',{'schema':'edr.disposable-recovery-prepared.v1','scenario':scenario,'runtime_mode':mode,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'source_sha':profile['source'],'target_run':profile['release_run'],'tool_run':profile['native_run'],
       'verification_origin':'ci_original_handler_verification','authenticated_platform_http':False,
       'original_handler_verification_sha256':receipt_sha,'preflight_sha256':digest(receipt_raw),'builder_owner_sha256':profile['builder_owner_sha256'],'expected_p5_sha256':packages['full_installer'],'requested_min_free_bytes':effective_floor,'catalog_written':False,
       'endpoint_task_created':False,'recovery_started':False,'stage_owner_sha256':digest(stage_owner.read_bytes()),'native_manifest_sha256':digest((tool/'manifest.json').read_bytes())})
@@ -327,31 +336,34 @@ def prepare(workspace,root,receipt,receipt_sha,effective_floor,owner_b64,cohort_
 
 def finalize(workspace,root,cohort_id='695',mode='service'):
     mode=runtime_mode(mode)
+    scenario=recovery_scenario(cohort_id,mode)
     profile,baseline_profile,profile_sha=cohort(cohort_id)
     p=strict_json((root/'prepared.json').read_bytes());need(p['source_sha']==profile['source'] and p['cohort_id']==cohort_id and p['cohort_catalog_sha256']==profile_sha,'prepared_source')
     need(p.get('runtime_mode')==mode,'prepared_runtime_mode')
+    need(p.get('scenario','legacy692_upgrade')==scenario,'prepared_scenario')
     package=root/('verified-p5-'+profile['version']+'-arm64.zip');need(package.is_file() and not package.is_symlink() and package.stat().st_size<=256*1024**2 and
         digest(package.read_bytes())==p['expected_p5_sha256'],'original_builder_output_preflight_hash_required')
     manifest=root/'target-download'/('edr-agent-'+profile['tag']+'-windows-arm64-artifact-manifest.json')
     stage=root/'target-stage.json';baseline=root/'baseline-stage.json';tools=root/'native-tools/manifest.json';owner=workspace/'canonical-agent/scripts/stage_retention_native_tools.py'
-    j={'schema':'edr.ci-cache-recovery-input.v1','runtime_mode':mode,'prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
+    j={'schema':'edr.ci-cache-recovery-input.v1','scenario':scenario,'runtime_mode':mode,'prepared_only':False,'cohort_id':cohort_id,'cohort_catalog_sha256':profile_sha,'arch':'arm64','python_path':sys.executable,'python_sha256':digest(Path(sys.executable).read_bytes()),
        'snapshot_helper_sha256':digest((workspace/'tests/cache-recovery/cache_recovery_snapshot.py').read_bytes()),'requested_min_free_bytes':p['requested_min_free_bytes'],
-       'baseline':{'stage_path':str(baseline),'stage_sha256':digest(baseline.read_bytes())},
        'target':{'source_sha':profile['source'],'stage_path':str(stage),'stage_sha256':digest(stage.read_bytes()),'artifact_manifest_path':str(manifest),'artifact_manifest_sha256':digest(manifest.read_bytes())},
        'protocol5_package':{'path':str(package),'sha256':p['expected_p5_sha256'],'builder_owner':'edr-backend/platform/internal/installer/full_installer.go','builder_output_verified_by_caller':True},
        'native_tools':{'manifest_path':str(tools),'manifest_sha256':digest(tools.read_bytes()),'run_id':profile['native_run'],'validation_owner_path':str(owner),'validation_owner_sha256':digest(owner.read_bytes())}}
+    if scenario=='legacy692_upgrade':
+        j['baseline']={'stage_path':str(baseline),'stage_sha256':digest(baseline.read_bytes())}
     json_save(root/'recovery-input.json',j)
 
 
 def main():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697','698','699','701','702','703'],default='695');selection.add_argument('--target-tag');parser.add_argument('--runtime-mode',choices=['service','scheduled_task'],default='service');args=parser.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['profile','prepare','finalize']);parser.add_argument('--workspace',type=Path);parser.add_argument('--output',type=Path);selection=parser.add_mutually_exclusive_group();selection.add_argument('--cohort',choices=['695','697','698','699','701','702','703','704'],default='695');selection.add_argument('--target-tag');parser.add_argument('--runtime-mode',choices=['service','scheduled_task'],default='service');args=parser.parse_args()
     need(args.mode=='profile' or args.target_tag is None,'target_tag_descriptor_only')
     if args.target_tag is not None:
-        matches=[key for key in ('695','697','698','699','701','702','703')if cohort(key,False)[0]['tag']==args.target_tag]
+        matches=[key for key in ('695','697','698','699','701','702','703','704')if cohort(key,False)[0]['tag']==args.target_tag]
         need(len(matches)==1,'unsupported_recovery_target_tag');args.cohort=matches[0]
     profile,unused,profile_sha=cohort(args.cohort)
     if args.mode=='profile':
-        print(json.dumps({'cohort_id':args.cohort,'source_sha':profile['source'],'tag':profile['tag'],'version':profile['version'],'cohort_catalog_sha256':profile_sha}));return
+        print(json.dumps({'cohort_id':args.cohort,'source_sha':profile['source'],'tag':profile['tag'],'version':profile['version'],'scenario':recovery_scenario(args.cohort),'cohort_catalog_sha256':profile_sha}));return
     need(args.workspace is not None and args.output is not None,'workspace_and_output_required')
     need(os.name=='nt' and os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted','disposable_windows_ci_only')
     args.output.resolve().relative_to(Path(os.environ['RUNNER_TEMP']).resolve())

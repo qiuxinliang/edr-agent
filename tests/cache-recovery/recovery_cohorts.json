@@ -168,6 +168,29 @@
       "preflight_response_sha256": "96c7bbb278db423d2515aa9345f6da9d0e0e4d7fcb5737ee149f1e5a85a4d497",
       "p5_sha256": "9c80ee5e4f9851b9bbbd214a0fd42878683b3b53958ff0216f731fdf60b3fbd7",
       "runtime_identity_sha256": "41cb8990a010f551a88101864be2557d88e86e62b0776690b0ca50a18ead3b80"
+    },
+    "704": {
+      "id": "704",
+      "source": "736655d69474ff097621e3b80c7d43b1e26c360a",
+      "version": "3.2.704",
+      "tag": "win_3.2.704",
+      "release_run": "39509393485",
+      "release_id": "418951053",
+      "native_run": "39505196166",
+      "native_artifact_id": "12304567099",
+      "native_artifact_size": "1239248",
+      "native_artifact_sha256": "a8e1f56063d681f8b514568108ed0c7bbdbef3b1cd875df8983c161bc3f0a9c6",
+      "native_uncompressed_bytes": "3088567",
+      "native_member_count": "4",
+      "handler_owner_sha256": "96b52a37672645e79607a4ed33365abe0d88dada7667237aa6aa59cbd154027f",
+      "builder_owner_sha256": "695c9a0de7d9fe7714918147982aec29aa8061c058702a427a9dee268f2e43a9",
+      "handler_receipt_sha256": "08a3485dd0881be1a2a760145c3704b723d4378ae04a59d06638ad16b904610f",
+      "binary_sha256": "578038c17b427fe61e4516d6d9aed427f5a63256d6237c447801e3083a8cc720",
+      "headless_sha256": "eb11f8b55373c221540288824b78566489ef86ef5344937d4749acdd90245588",
+      "artifact_manifest_sha256": "0f7ea2545b81b363e5b4c0864ba59c86c1454a786537bd1ef96ee620c6230ec0",
+      "preflight_response_sha256": "70b5f92d25600cab6d374d7321b51e25936f0d08b59cce84a92071f50fbb2197",
+      "p5_sha256": "a3e9a6f2ce51a0c54f360bccb08d16ef1028b910f8267cd819bfda2ff7401ace",
+      "runtime_identity_sha256": "6241291c3c41abb51060f366c032c140421e69c32f297f347cbceb25de5bdc77"
     }
   }
 }

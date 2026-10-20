@@ -15,6 +15,7 @@ P699_BINDING_PINS=('release_run', 'release_id', 'native_run', 'native_artifact_i
 P701_BINDING_PINS=P699_BINDING_PINS
 P702_BINDING_PINS=P699_BINDING_PINS
 P703_BINDING_PINS=P699_BINDING_PINS
+P704_BINDING_PINS=P699_BINDING_PINS
 class Contracts(unittest.TestCase):
     def test_closed_runtime_mode_requires_exact_strings_before_io(self):
         for mode in ('service','scheduled_task'):
@@ -37,7 +38,7 @@ class Contracts(unittest.TestCase):
         text=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
         before,job=text.split('  recover-synthetic-owner:',1)
         self.assertNotIn('runtime_mode:',before)
-        self.assertIn('      fail-fast: false\n      matrix:\n        runtime_mode: [service, scheduled_task]\n',job)
+        self.assertIn("runtime_mode: ${{ fromJSON(inputs.target_tag == 'win_3.2.704' && '[\"service\"]' || '[\"service\",\"scheduled_task\"]') }}",job)
         self.assertIn('RECOVERY_RUNTIME_MODE: ${{ matrix.runtime_mode }}',job)
         self.assertEqual(job.count('--runtime-mode "$env:RECOVERY_RUNTIME_MODE"'),2)
         self.assertIn('outputs.id }}-${{ matrix.runtime_mode }}-metadata-',job)
@@ -359,6 +360,92 @@ class Contracts(unittest.TestCase):
 
 
 
+    # 704 parser-only fixtures never supply a published receipt or run recovery.
+    def test_704_known_identity_and_catalog_capacity(self):
+        c,base,pin=M.cohort('704',False)
+        self.assertEqual((c['source'],c['version'],c['tag']),('736655d69474ff097621e3b80c7d43b1e26c360a','3.2.704','win_3.2.704'))
+        self.assertEqual(c['builder_owner_sha256'],M.BUILDER_SHA)
+        self.assertEqual(c['handler_owner_sha256'],M.HANDLER_SHA)
+        self.assertLessEqual(len(M.cohort_catalog_raw()),16384)
+        full=json.loads(M.cohort_catalog_raw());target=full['profiles']['704']
+        for key in P704_BINDING_PINS:
+            if target[key]=='UNBOUND':target[key]='f'*64 if key.endswith('_sha256')else '9'*20
+        self.assertLessEqual(len((json.dumps(full,indent=2)+'\n').encode()),16384)
+        # The same test remains valid after Root binds real published identities.
+        if any(c[k]=='UNBOUND' for k in P704_BINDING_PINS):
+            with self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):M.cohort('704')
+        else:self.assertEqual(M.cohort('704')[0],c)
+
+    def test_704_each_missing_pin_refuses_prepare_and_finalize_before_io(self):
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['704']
+        for k in P704_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('no external'))as call:
+            root=Path(d)/'must-not-exist';catalog=Path(d)/'temporary-missing704.json'
+            for key in P704_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                with patch.object(M,'PROFILE_FILE',catalog):
+                    for mode in ('service',):
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.prepare(Path(d),root,'UNBOUND','UNBOUND','0','UNBOUND','704',mode)
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.finalize(Path(d),root,'704',mode)
+                fixture[key]=original
+            self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+
+    def test_704_cli_refuses_each_missing_pin_normal_and_optimized(self):
+        import subprocess
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['704']
+        for k in P704_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            script=Path(d)/'prepare_disposable_695.py';script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+            catalog=script.with_name('recovery_cohorts.json')
+            for key in P704_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                for flags in ([],['-O']):
+                    for selection in (['--cohort','704'],['--target-tag','win_3.2.704']):
+                        with self.subTest(pin=key,flags=flags,selection=selection):
+                            r=subprocess.run([sys.executable,'-I','-B',*flags,str(script),'profile',*selection],capture_output=True,timeout=3)
+                            self.assertNotEqual(r.returncode,0);self.assertEqual(r.stdout,b'')
+                            self.assertEqual(r.stderr.decode('utf-8','strict').splitlines(),['disposable_preparation_failed:recovery_cohort_UNBOUND'])
+                fixture[key]=original
+
+    def test_704_parser_only_bound_routing_is_separate_from_actual_proof(self):
+        value=json.loads(M.cohort_catalog_raw());c=value['profiles']['704']
+        for k in P704_BINDING_PINS:c[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            catalog=Path(d)/'synthetic-parser-only704.json';catalog.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',catalog):self.assertEqual(M.cohort('704')[0],c)
+
+
+
+    def test_704_scenario_and_mode_refuse_before_io(self):
+        for cid in ('695','697','698','699','701','702','703'):
+            for mode in ('service','scheduled_task'):
+                self.assertEqual(M.recovery_scenario(cid,mode),'legacy692_upgrade')
+        self.assertEqual(M.recovery_scenario('704','service'),'installed_target_repair')
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('no external'))as call:
+            root=Path(d)/'must-not-exist'
+            for function in ('prepare','finalize'):
+                with self.subTest(function=function),self.assertRaisesRegex(ValueError,'installed_repair_service_only'):
+                    if function=='prepare':M.prepare(Path(d),root,'UNBOUND','UNBOUND','0','UNBOUND','704','scheduled_task')
+                    else:M.finalize(Path(d),root,'704','scheduled_task')
+            self.assertFalse(root.exists());call.assert_not_called()
+
+    def test_704_prepared_scenario_cannot_fall_back_to_legacy(self):
+        value=json.loads(M.cohort_catalog_raw());c=value['profiles']['704']
+        for key in P704_BINDING_PINS:c[key]='1'*64 if key.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            root=Path(d);catalog=root/'parser-only704.json';catalog.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',catalog):
+                pin=M.cohort('704')[2]
+                for scenario in (None,'legacy692_upgrade','unknown'):
+                    prepared={'source_sha':c['source'],'cohort_id':'704','cohort_catalog_sha256':pin,'runtime_mode':'service'}
+                    if scenario is not None:prepared['scenario']=scenario
+                    (root/'prepared.json').write_text(json.dumps(prepared))
+                    with self.subTest(scenario=scenario),self.assertRaisesRegex(ValueError,'prepared_scenario'):
+                        M.finalize(root,root,'704','service')
+                self.assertFalse((root/'recovery-input.json').exists())
+
     def test_unknown_cohort_never_falls_back(self):
         for value in ('696','700','win_3.2.697','697;public','',697,None):
             with self.subTest(value=value),self.assertRaisesRegex(ValueError,'unsupported_recovery_cohort'):M.cohort(value)
@@ -467,14 +554,14 @@ class Contracts(unittest.TestCase):
         self.assertIn("'zz_private_p5_export_test.go'",text)
         self.assertIn('retention-days: 7',text)
     def assert_recovery_execution_host(self,text):
-        step=re.search(r'^      - name: Execute only disposable local rollback and normal repair subset\n(.*?)(?=^      - |\Z)',text,re.M|re.S)
+        step=re.search(r'^      - name: Execute the selected disposable recovery scenario\n(.*?)(?=^      - |\Z)',text,re.M|re.S)
         self.assertIsNotNone(step)
         # Native child exit observation is source-verified only under Core.
         self.assertEqual(re.findall(r'^        shell: (.+)$',step[1],re.M),['pwsh'])
     def test_manual_execution_uses_supported_powershell_core_host(self):
         workflow=Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml'
         text=workflow.read_text();self.assert_recovery_execution_host(text)
-        header='      - name: Execute only disposable local rollback and normal repair subset\n'
+        header='      - name: Execute the selected disposable recovery scenario\n'
         selected=header+'        shell: pwsh\n'
         self.assertEqual(text.count(selected),1)
         for replacement in [header,header+'        shell: powershell\n']:
@@ -504,7 +591,7 @@ class Contracts(unittest.TestCase):
         workflow=(Path(__file__).resolve().parents[2]/'.github/workflows/windows-install-upgrade-rollback.yml').read_text()
         check='      - name: Verify process-scoped Windows PowerShell child module environment\n'
         self.assertEqual(workflow.count(check),1)
-        body=workflow[workflow.index(check):workflow.index('      - name: Execute only disposable local rollback and normal repair subset\n')]
+        body=workflow[workflow.index(check):workflow.index('      - name: Execute the selected disposable recovery scenario\n')]
         self.assertIn('        shell: pwsh\n        timeout-minutes: 2\n',body)
         self.assertIn("'tests/cache-recovery/test_windows_powershell_child_environment.ps1'",body)
         self.assertIn('-DriverSource $driver -DriverSha256 $driverSha',body)

@@ -61,7 +61,7 @@ on:
         default: 1
         type: number
       cache_recovery_subset:
-        description: 'Manual disposable exact 692-to-695 or closed 697/698/699/701/702/703 cache subset only; default keeps the existing lifecycle gate'
+        description: 'Manual disposable exact 692-to-695 or closed 697/698/699/701/702/703 cache subset, or installed 704 repair rollback; default keeps the existing lifecycle gate'
         required: false
         default: false
         type: boolean
@@ -591,7 +591,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runtime_mode: [service, scheduled_task]
+        runtime_mode: ${{ fromJSON(inputs.target_tag == 'win_3.2.704' && '["service"]' || '["service","scheduled_task"]') }}
     runs-on: windows-11-arm
     timeout-minutes: 90
     env:
@@ -607,7 +607,9 @@ jobs:
           RECOVERY_PACKAGE_SCOPE: ${{ inputs.package_scope }}
           RECOVERY_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
-          if ($env:RECOVERY_TARGET_TAG -cnotin @('win_3.2.695','win_3.2.697','win_3.2.698','win_3.2.699','win_3.2.701','win_3.2.702','win_3.2.703') -or $env:RECOVERY_BASELINE_TAG -cne 'win_3.2.692' -or $env:RECOVERY_PACKAGE_SCOPE -cne 'headless' -or $env:RECOVERY_ARCHITECTURE -cne 'arm64') { throw 'Manual cache recovery requires an approved target/692 Headless ARM64 cohort' }
+          $legacy = $env:RECOVERY_TARGET_TAG -cin @('win_3.2.695','win_3.2.697','win_3.2.698','win_3.2.699','win_3.2.701','win_3.2.702','win_3.2.703') -and $env:RECOVERY_BASELINE_TAG -ceq 'win_3.2.692'
+          $repair = $env:RECOVERY_TARGET_TAG -ceq 'win_3.2.704' -and $env:RECOVERY_BASELINE_TAG -ceq 'win_3.2.704' -and $env:RECOVERY_RUNTIME_MODE -ceq 'service'
+          if ((-not $legacy -and -not $repair) -or $env:RECOVERY_PACKAGE_SCOPE -cne 'headless' -or $env:RECOVERY_ARCHITECTURE -cne 'arm64') { throw 'Manual recovery requires an approved legacy upgrade or installed 704 Service repair, Headless ARM64 only' }
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
@@ -623,6 +625,8 @@ jobs:
           $profile = $profileJson | ConvertFrom-Json -ErrorAction Stop
           "id=$($profile.cohort_id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "source=$($profile.source_sha)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "scenario=$($profile.scenario)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "RECOVERY_SCENARIO=$($profile.scenario)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/checkout@v6
         with:
           repository: qiuxinliang/edr-agent
@@ -702,7 +706,7 @@ jobs:
           $driverSha=(Get-FileHash -LiteralPath $driver -Algorithm SHA256).Hash.ToLowerInvariant()
           & (Join-Path $PWD 'tests/cache-recovery/test_windows_powershell_child_environment.ps1') -DriverSource $driver -DriverSha256 $driverSha
           if ($LASTEXITCODE -ne 0) { throw 'Process-scoped Windows PowerShell child module environment contract failed' }
-      - name: Execute only disposable local rollback and normal repair subset
+      - name: Execute the selected disposable recovery scenario
         shell: pwsh
         run: |
           $binding=Join-Path $env:EDR_PRIVATE_RECOVERY_PREP 'recovery-input.json'
@@ -717,7 +721,7 @@ jobs:
               $summary=Join-Path $fresh[0].FullName 'recovery-subset-summary.json'
               if (Test-Path -LiteralPath $summary -PathType Leaf) {
                 $meta=Get-Content -Raw -LiteralPath $summary | ConvertFrom-Json -ErrorAction Stop
-                if ($meta.input_sha256 -cne $sha -or $meta.runtime_mode -cne $env:RECOVERY_RUNTIME_MODE) { throw 'Recovery metadata owner binding mismatch' }
+                if ($meta.input_sha256 -cne $sha -or $meta.runtime_mode -cne $env:RECOVERY_RUNTIME_MODE -or $meta.scenario -cne $env:RECOVERY_SCENARIO) { throw 'Recovery metadata owner binding mismatch' }
                 "EDR_PRIVATE_RECOVERY_METADATA=$($fresh[0].FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
               }
             }
@@ -736,6 +740,8 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw 'Private CI fixture raw evidence collection failed; no unverified files uploaded' }
               "directory=$qa" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
               'available=true' | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              $meta=Get-Content -Raw -LiteralPath (Join-Path $qa 'manifest.json') | ConvertFrom-Json -ErrorAction Stop
+              if ($env:RECOVERY_SCENARIO -ceq 'installed_target_repair' -and $meta.recovery_status -ceq 'local_subset_passed' -and $meta.stop_pending_boundary_observed -ne $true) { throw 'Original repair receipts retained; StopPending competition boundary remains unverified' }
             } else {
               'available=false' | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
               Write-Output 'No bound recovery fixture observed; no source directory exported'

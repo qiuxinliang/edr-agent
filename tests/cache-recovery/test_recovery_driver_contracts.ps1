@@ -14,7 +14,7 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($source,[ref]$tokens,[ref]$errors)
 if (@($errors).Count) {throw 'driver_parse_failed'}
 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256) {throw 'driver_source_changed'}
-$wanted=@('Need','Regular','SHA','Wait-EmbeddedUpdaterMaterialized','ReadBounded','ConfigBinding','Snapshot','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
+$wanted=@('Need','RecoveryScenario','Regular','SHA','Wait-EmbeddedUpdaterMaterialized','ReadBounded','ConfigBinding','Snapshot','WaitProcess','ReadOwnedBytes','ReadOwnedUpdateJson','SaveOwnedOriginal','SaveTransitionFinalEvidence','Save','SaveRecoverySummary','ServiceObserverError','ServiceWorkerSource','ServiceSamplerSource','ServiceChildStatus','ServiceRaw','FinishServiceObserver','ServiceAction','StopLogNative','StopLogInfo','StopLogOpen','StopLogConfig','StopLogTarget','NewStopLogContext','StopLogAnchor','ReadStopLogSlice','ObserveStopLog','CloseStopLogContext')
 $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $wanted},$false))
 if ($functions.Count -ne $wanted.Count) {throw 'function_inventory'}
 # Only these source-owned function definitions are loaded, never driver top-level.
@@ -51,6 +51,18 @@ function FailsHard([scriptblock]$Body) {
   if(-not $caught){throw 'malformed_json_became_ready_or_transient'}
   $script:count++
 }
+# This selector runs before any fixture directory, package or machine mutation.
+foreach($id in @('695','697','698','699','701','702','703')){
+  foreach($mode in @('service','scheduled_task')){
+    Checked ((RecoveryScenario ([pscustomobject]@{cohort_id=$id}) $mode) -ceq 'legacy692_upgrade') 'legacy_scenario_preserved'
+  }
+}
+Checked ((RecoveryScenario ([pscustomobject]@{cohort_id='704';scenario='installed_target_repair'}) 'service') -ceq 'installed_target_repair') 'installed_repair_explicit'
+Fails {RecoveryScenario ([pscustomobject]@{cohort_id='704'}) 'service'} 'cohort_scenario_mismatch'
+Fails {RecoveryScenario ([pscustomobject]@{cohort_id='704';scenario='installed_target_repair'}) 'scheduled_task'} 'installed_repair_service_only'
+Fails {RecoveryScenario ([pscustomobject]@{cohort_id='703';scenario='installed_target_repair'}) 'service'} 'cohort_scenario_mismatch'
+Fails {RecoveryScenario ([pscustomobject]@{cohort_id='705';scenario='installed_target_repair'}) 'service'} 'unknown_recovery_cohort'
+Fails {RecoveryScenario ([pscustomobject]@{cohort_id='704';scenario='unknown'}) 'service'} 'unknown_recovery_scenario'
 # Deterministic metadata-race seam only. Every non-stub call still uses the
 # real cmdlet; the underlying file/stream remains a small public temporary file.
 $metadataMode='';$metadataPath='';$metadataCalls=0
@@ -431,6 +443,11 @@ Start-Sleep -Milliseconds 300
   $bytes=[Convert]::FromBase64String($v.worker.stdout.base64);$sha=[Security.Cryptography.SHA256]::Create()
   try{$digest=([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
   Checked ($bytes.Length -eq $v.worker.stdout.bytes -and $digest -ceq $v.worker.stdout.sha256 -and $v.worker.stdout.original_bytes_preserved) 'service_raw_same_bytes_hash'
+  ServiceCase 'repair-health';ServiceAction 'Stop' 'health-failed-repair-health-stop'
+  $v=$serviceActionDiagnostics[0]
+  Checked ($v.sampler.requested -and $v.sampler.cancel_requested -and $v.sampler.terminal_known -and $v.observer_complete -and $serviceWaits[0] -eq 45000) 'repair_health_observes_same_bounded_stop'
+  ServiceCase 'repair-unrelated';ServiceAction 'Stop' 'health-failed-repair-unrelated'
+  Checked (-not $serviceActionDiagnostics[0].sampler.requested -and $serviceWaits.Count -eq 1) 'unrelated_repair_label_no_sampler'
   ServiceCase 'repair';ServiceAction 'Start' 'repair-start'
   Checked (-not $serviceActionDiagnostics[0].sampler.requested -and $serviceWaits.Count -eq 1 -and $serviceWaits[0] -eq 45000) 'repair_no_sampler_or_extra_control'
   ServiceCase 'nonzero';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_control_failed'

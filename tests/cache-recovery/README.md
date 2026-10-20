@@ -1,12 +1,42 @@
-# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 / 702 / 703 recovery cohorts
+# Disposable recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695, 697, 698, 699, 701, 702 and 703 selectors exist; there is no caller source/run/asset URL override.
+695, 697, 698, 699, 701, 702, 703 and 704 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
+
+## Installed 704 repair rollback
+
+Cohort 704 uses the explicit `installed_target_repair` scenario on disposable
+Windows ARM64 Service only. It installs the verified 704 Headless package into
+a clean runner, waits for the actual Agent to materialize its embedded updater,
+and invokes that original updater for one same-version repair with an injected
+health failure. It never downloads or substitutes a 692 updater. Missing product,
+native, original-handler or builder pins refuse execution before product I/O.
+
+Acceptance requires the original report and journal to identify successful
+rollback, the backup hash to identify the previously installed 704, and distinct
+initial, health-trigger and restored process generations with the same fixture
+configuration. The fixed SCM sampler must observe Stop Pending for the exact
+trigger process, and the external stop worker must finish with a known zero exit.
+A missing observation does not prove that the boundary did not occur; it leaves
+this competition test unverified. Deterministic function tests separately verify
+the pending-stop branch; SCM samples do not identify its precise entry time. The four synthetic evidence snapshots must preserve the same
+seed owners. The Service stop retains the existing bounded SCM sampler, 45-second
+external control wait, 30-second updater stop budget and 900-second transition
+limit. This scenario exports exactly 12 fixed fixture receipts plus its manifest,
+with the existing 1 MiB per-file and 8 MiB combined caps. It exports no database,
+configuration, full Agent log or product payload.
+
+This is a new-updater recovery test. It cannot close or relabel the preserved
+692-to-703 failure: an immutable older embedded updater does not acquire this
+fix from a new target package. The seven historical selectors retain their
+`legacy692_upgrade` scenario, separate Service/Task jobs, three transitions and
+24-receipt contract. Current 704 bindings and actual run results must be reviewed
+separately; parser fixtures and candidate publication do not prove rollback.
 
 Cohort 695 retains the original source/run/tool and published Headless/preflight
 pins below. Cohort 697 names source `f672059aec426aafe00b216c482dc151b96226c9`

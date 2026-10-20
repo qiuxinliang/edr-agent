@@ -15,6 +15,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 function Need($Condition,[string]$Cause) { if (-not $Condition) { throw $Cause } }
+function RecoveryScenario([object]$Binding,[string]$Mode) {
+$scenario=if($Binding.PSObject.Properties['scenario']){[string]$Binding.scenario}else{'legacy692_upgrade'}
+Need ($scenario -in @('legacy692_upgrade','installed_target_repair')) 'unknown_recovery_scenario'
+Need ($Binding.cohort_id -in @('695','697','698','699','701','702','703','704')) 'unknown_recovery_cohort'
+Need (($Binding.cohort_id -ceq '704') -eq ($scenario -ceq 'installed_target_repair')) 'cohort_scenario_mismatch'
+Need ($scenario -cne 'installed_target_repair' -or $Mode -ceq 'service') 'installed_repair_service_only'
+return $scenario
+}
 function Regular([string]$Path,[UInt64]$Cap) {
   $p=Get-Item -LiteralPath $Path -Force -ErrorAction Stop
   Need (-not $p.PSIsContainer -and ($p.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $p.Length -le $Cap) 'regular_bounded_file_required'
@@ -573,7 +581,7 @@ function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Lab
   try{
     Need (-not (Test-Path -LiteralPath $worker)) 'service_worker_exists'
     [IO.File]::WriteAllText($worker,(ServiceWorkerSource $Action),[Text.UTF8Encoding]::new($false));$value.worker_source_sha256=SHA $worker
-    if($Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){
+    if($Action -eq 'Stop' -and $Label -cin @('health-failed-upgrade-health-stop','health-failed-repair-health-stop')){
       $value.sampler.requested=$true
       $samplerScript=Join-Path $script:root ($Label+'.service-sampler.ps1');$samplerOut=Join-Path $script:root ($Label+'.service-sampler.stdout.log');$samplerErr=Join-Path $script:root ($Label+'.service-sampler.stderr.log')
       try{
@@ -602,7 +610,7 @@ function ServiceAction([ValidateSet('Stop','Start')][string]$Action,[string]$Lab
     # The original action's decision/timing above is frozen before observation.
     $value.elapsed_ms=$clock.ElapsedMilliseconds;$value.finished_at_utc=[DateTime]::UtcNow.ToString('o');$value.observer_complete=(-not $observerFailed)
     if($null -ne $LogContext){
-      try{if($primary -and $Action -eq 'Stop' -and $Label -ceq 'health-failed-upgrade-health-stop'){ObserveStopLog $LogContext 60000}}
+      try{if($primary -and $Action -eq 'Stop' -and $Label -cin @('health-failed-upgrade-health-stop','health-failed-repair-health-stop')){ObserveStopLog $LogContext 60000}}
       catch{$LogContext.diagnostic.status='unknown';$LogContext.diagnostic.cause='observer_exception';$LogContext.diagnostic.error=ServiceObserverError $_}
       finally{CloseStopLogContext $LogContext}
     }
@@ -819,7 +827,7 @@ function Installed([string]$ExpectedHash,[string]$Version) {
   $actualVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo($script:agent).ProductVersion
   $versionMatch=[regex]::Match($actualVersion,'^([0-9]+\.[0-9]+\.[0-9]+)(?:\.0)?(?:[ +].*)?$')
   Need ($versionMatch.Success -and $versionMatch.Groups[1].Value -eq $Version) 'installed_agent_version'
-  $stage=if($ExpectedHash -ceq $script:baseline.agent_binary_sha256){$script:baseline}else{$script:target}
+  $stage=if($null -ne $script:baseline -and $ExpectedHash -ceq $script:baseline.agent_binary_sha256){$script:baseline}else{$script:target}
   $identity=PinnedJson (Join-Path $script:install 'native-package-integrity.json') $stage.runtime_identity_sha256
   Need ($identity.schema -eq 'edr.windows.native-package-integrity.v1' -and @($identity.files).Count -ge 1 -and @($identity.files).Count -le 64) 'installed_runtime_identity'
   foreach($component in $identity.files) {
@@ -876,7 +884,7 @@ function Snapshot([string]$Name,[string]$Expected='') {
   if($script:configSha256){ConfigBinding}
   return $path
 }
-function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]$Updater) {
+function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]$Updater,[object]$ExpectedPreviousStage=$script:baseline) {
   $id=[Guid]::NewGuid().ToString('N');$command='ci-cache-recovery-'+$id
   $journal=Join-Path $env:ProgramData ('FDSecurity\state\agent-update-'+$command+'.journal.json')
   $report=Join-Path $env:ProgramData ('FDSecurity\logs\agent-update-'+$command+'-report.json')
@@ -905,7 +913,13 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $invoke=Join-Path $script:root ($Label+'.invoke.ps1')
     Need ($Updater -notmatch "['\r\n]" -and $paramFile -notmatch "['\r\n]") 'invocation_path'
     [IO.File]::WriteAllText($invoke,("`$ErrorActionPreference='Stop';`$p=Import-Clixml -LiteralPath '"+$paramFile+"';& '"+$Updater+"' @p;`$updaterSucceeded=`$?;if(`$updaterSucceeded){exit 0};if((Test-Path variable:LASTEXITCODE) -and `$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0){exit `$LASTEXITCODE};exit 1"),[Text.UTF8Encoding]::new($false))
-    Save ($Label+'.intent.json') @{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;runtime_mode=$script:runtimeMode;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
+    $intent=@{task_id=$id;command_id=$command;operation=$Operation;class=$script:actualClass;runtime_mode=$script:runtimeMode;expected_hash=$script:target.agent_binary_sha256;health_failure_requested=$FailHealth;no_automatic_retry=$true}
+    if($script:scenario -ceq 'installed_target_repair'){
+      $intent.scenario=$script:scenario;$intent.updater_sha256=SHA (Regular $Updater 1048576)
+      $intent.updater_version=$script:target.version;$intent.expected_previous_sha256=$ExpectedPreviousStage.agent_binary_sha256
+      $intent.initial_runtime=Installed $ExpectedPreviousStage.agent_binary_sha256 $ExpectedPreviousStage.version
+    }
+    Save ($Label+'.intent.json') $intent
     $diagnostic.phase='launch'
     $child=StartWindowsPowerShellChild $invoke (Join-Path $script:root ($Label+'.stdout.log')) (Join-Path $script:root ($Label+'.stderr.log'))
     $diagnostic.child_pid=$child.Id
@@ -924,7 +938,7 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
           $native=Installed $script:target.agent_binary_sha256 $script:target.version
           Snapshot ($Label+'-before-trigger') $script:seed | Out-Null
           $backup=Join-Path ([string]$j.full_installer_backup_path) 'FDSensor.exe'
-          Need ((SHA (Regular $backup 16777216)) -ceq $script:baseline.agent_binary_sha256) 'actual_previous_backup_not692'
+          Need ((SHA (Regular $backup 16777216)) -ceq $ExpectedPreviousStage.agent_binary_sha256) 'actual_previous_backup_mismatch'
           $again=Installed $script:target.agent_binary_sha256 $script:target.version
           Need ($again.pid -eq $native.pid -and $again.birth_filetime -eq $native.birth_filetime) 'trigger_generation_changed'
           Save ($Label+'.health-trigger.json') @{native=$native;actual_previous_sha256=(SHA $backup);owner_snapshot_sha256=(SHA (Join-Path $script:root ($Label+'-before-trigger.json')));runtime_mode=$script:runtimeMode;action=$(if($script:runtimeMode -ceq 'service'){'stop_exact_owned_service'}else{'stop_exact_owned_task'});fixture_only=$true}
@@ -948,7 +962,11 @@ function Transition([string]$Operation,[string]$Label,[bool]$FailHealth,[string]
     $diagnostic.phase='terminal_contract'
     if ($FailHealth) {
       Need ($triggered -and $code -ne 0 -and $result.status -eq 'failed_rolled_back' -and $result.rollback -eq 'succeeded' -and $j.status -eq 'failed_rolled_back') 'real_automatic_rollback_not_observed'
-      Installed $script:baseline.agent_binary_sha256 '3.2.692' | Out-Null
+      $restored=Installed $ExpectedPreviousStage.agent_binary_sha256 $ExpectedPreviousStage.version
+      if($script:scenario -ceq 'installed_target_repair'){
+        Need ($restored.pid -ne $native.pid -or $restored.birth_filetime -cne $native.birth_filetime) 'rollback_requires_new_runtime_generation'
+        $diagnostic.restored_runtime=$restored
+      }
     } else {
       Need ($code -eq 0 -and $result.status -eq 'succeeded' -and $j.status -eq 'succeeded') 'normal_updater_not_succeeded'
       Installed $script:target.agent_binary_sha256 $script:target.version | Out-Null
@@ -994,11 +1012,20 @@ $principal=New-Object Security.Principal.WindowsPrincipal([Security.Principal.Wi
 Need ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'existing_elevated_ci_owner_required'
 Need ($binding.arch -in @('arm64','amd64')) 'native_arch_required'
 $runtimeMode=RecoveryMode $binding.runtime_mode
-$baseline=PinnedJson $binding.baseline.stage_path $binding.baseline.stage_sha256
+$scenario=RecoveryScenario $binding $runtimeMode
+Need ($scenario -cne 'installed_target_repair' -or $binding.arch -ceq 'arm64') 'installed_repair_arm64_only'
 $target=PinnedJson $binding.target.stage_path $binding.target.stage_sha256
-Need ($baseline.version -eq '3.2.692' -and $baseline.source_commit -ceq 'a978ec83deacf7cd78c273d82630b457c5f39251' -and $baseline.target_arch -eq $binding.arch) 'exact692_stage_required'
+$baseline=$null
+if($scenario -ceq 'legacy692_upgrade'){
+  $baseline=PinnedJson $binding.baseline.stage_path $binding.baseline.stage_sha256
+  Need ($baseline.version -eq '3.2.692' -and $baseline.source_commit -ceq 'a978ec83deacf7cd78c273d82630b457c5f39251' -and $baseline.target_arch -eq $binding.arch) 'exact692_stage_required'
+}else{
+  Need (-not $binding.PSObject.Properties['baseline'] -and $target.version -ceq '3.2.704') 'installed_repair_initial_owner'
+}
+$initialStage=if($scenario -ceq 'installed_target_repair'){$target}else{$baseline}
+$initialTag='win_'+$initialStage.version
 Need ($target.source_commit -ceq $binding.target.source_sha -and $target.source_commit -cmatch '^[a-f0-9]{40}$' -and [version]$target.version -gt [version]'3.2.692' -and $target.target_arch -eq $binding.arch) 'target_stage_required'
-Need ($baseline.package_scope -eq 'headless' -and $target.package_scope -eq 'headless' -and $baseline.validation_scope -eq 'headless_subset' -and $target.validation_scope -eq 'headless_subset') 'verified_headless_stage_scope'
+Need ($initialStage.package_scope -eq 'headless' -and $target.package_scope -eq 'headless' -and $initialStage.validation_scope -eq 'headless_subset' -and $target.validation_scope -eq 'headless_subset') 'verified_headless_stage_scope'
 $manifest=PinnedJson $binding.target.artifact_manifest_path $binding.target.artifact_manifest_sha256
 $raw=@($manifest.artifacts | Where-Object {$_.name -clike '*-FDSensor.exe'})
 Need ($raw.Count -eq 1 -and $raw[0].sha256 -ceq $target.agent_binary_sha256 -and $manifest.build_provenance.commit -ceq $target.source_commit -and $manifest.version -eq $target.version -and $manifest.signature.status -eq 'unsigned') 'actual_headless_artifact_binding'
@@ -1032,7 +1059,7 @@ $token=[Guid]::NewGuid().ToString('N');$root=Join-Path $env:RUNNER_TEMP ('edr-ca
 New-Item -ItemType Directory -Path $root | Out-Null
 $db=Join-Path $root 'evidence\cache.db';$updateArch=if($binding.arch -eq 'arm64'){'arm64'}else{'x64'}
 $targetAgent=Join-Path $target.runtime_dir 'FDSensor.exe'
-foreach ($stage in @($baseline,$target)) {
+foreach ($stage in @($initialStage,$target)) {
   Need ((SHA (Regular (Join-Path $stage.runtime_dir 'FDSensor.exe') 16777216)) -ceq $stage.agent_binary_sha256) 'staged_agent_hash'
   Need ((SHA (Regular $stage.setup_exe 268435456)) -ceq $stage.setup_exe_sha256) 'staged_headless_setup_hash'
 }
@@ -1066,7 +1093,7 @@ try {
   }
   $seed=Snapshot 'seed-owner'
   New-Item -ItemType Directory -Path $install | Out-Null
-  $template=Join-Path $baseline.runtime_dir 'agent_windows_production.example.toml'
+  $template=Join-Path $initialStage.runtime_dir 'agent_windows_production.example.toml'
   $config=ReadBounded $template 131072
   $expectedConfigPairs=@(@('endpoint_id',('ci-cache-recovery-'+$token)),@('tenant_id','ci-cache-recovery'),@('rest_base_url','https://127.0.0.1:9/api/v1'),@('queue_db_path',(Join-Path $root 'queue\edr_queue.db')),@('evidence_cache_path',$db))
   foreach ($pair in $expectedConfigPairs) {
@@ -1093,8 +1120,15 @@ try {
   Save 'storage-floor-proof.json' @{schema='edr.ci-original-storage-floor.v1';native_owner='src/core/storage_space_preflight.h';agent_sha256=$target.agent_binary_sha256;config_sha256=$configSha256;native_output_sha256=(SHA $floorPath);native_floor_bytes=$localFloor;manifest_min_free_bytes=[UInt64]$raw[0].update.min_free_bytes;explicit_higher_override_bytes=[UInt64]$binding.requested_min_free_bytes;effective_min_free_bytes=$effectiveMinFreeBytes;formula='max(native_original_owner_floor,manifest_minimum,explicit_higher_override)';agent_initialized=$false;cache_migrated=$false}
   ConfigBinding
   $installTask=if($runtimeMode -ceq 'service'){'/TASKS="windowsservice"'}else{'/TASKS="windowsautorun"'}
-  $setup=Start-Process -FilePath $baseline.setup_exe -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$install+'"'),$installTask) -PassThru
+  $setup=Start-Process -FilePath $initialStage.setup_exe -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$install+'"'),$installTask) -PassThru
   Need ((WaitProcess $setup 600 'baseline_setup_timeout') -eq 0) 'baseline_setup_failed'
+  if($scenario -ceq 'installed_target_repair'){
+    Installed $target.agent_binary_sha256 $target.version | Out-Null
+    Snapshot '704-before-repair' $seed | Out-Null
+    $newUpdater=Wait-EmbeddedUpdaterMaterialized -Version $target.version -ExpectedScript (Join-Path $target.runtime_dir 'edr_agent_inplace_update.ps1')
+    Need ((SHA (Regular $newUpdater 1048576)) -ceq (SHA (Join-Path $target.runtime_dir 'edr_agent_inplace_update.ps1'))) 'actual_new_embedded_updater_required'
+    Transition 'repair' 'health-failed-repair' $true $newUpdater $target
+  }else{
   Installed $baseline.agent_binary_sha256 '3.2.692' | Out-Null
   Snapshot '692-before-upgrade' $seed | Out-Null
   $oldUpdater=Wait-EmbeddedUpdaterMaterialized -Version '3.2.692' -ExpectedScript (Join-Path $baseline.runtime_dir 'edr_agent_inplace_update.ps1')
@@ -1112,8 +1146,9 @@ try {
   foreach ($name in @('unins000.exe','unins000.dat')) {Remove-Item -LiteralPath (Regular (Join-Path $install $name) 16777216) -Force}
   RuntimeAction 'Start' 'repair-start' $repairNative
   Transition 'repair' 'normal-headless-repair' $false $newUpdater
+  }
   $completed=$true
 } catch {$mainPrimaryFailure=$true;throw} finally {
-  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});baseline='win_3.2.692';target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics);runtime_mode=$runtimeMode;service_action_diagnostics=@($serviceActionDiagnostics);task_action_diagnostics=@($taskActionDiagnostics)} $mainPrimaryFailure | Out-Null
+  SaveRecoverySummary @{schema='edr.ci-cache-recovery-result.v1';status=$(if($completed){'local_subset_passed'}else{'failed_or_unknown'});scenario=$scenario;baseline=$initialTag;target_source=$target.source_commit;input_sha256=$InputSha256;install_dir=$install;fixture_root=$root;automatic_retry=$false;library_prepared_schema=$true;actual_agent_first_migration_proven=$false;actual_agent_alert_admission_proven=$false;signed_control_delivery_proven=$false;power_loss_proven=$false;real_data_touched=$false;transition_diagnostics=@($transitionDiagnostics);runtime_mode=$runtimeMode;service_action_diagnostics=@($serviceActionDiagnostics);task_action_diagnostics=@($taskActionDiagnostics)} $mainPrimaryFailure | Out-Null
 }
 Need $completed 'recovery_subset_incomplete'

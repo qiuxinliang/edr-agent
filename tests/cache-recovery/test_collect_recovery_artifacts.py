@@ -1,5 +1,6 @@
 """Pure synthetic files only; no installer, native process, network or real DB."""
 import hashlib
+import base64
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -455,5 +456,125 @@ class Contracts(unittest.TestCase):
     def test_other_fixture_directory_refused(self):
         other=self.root/'unrelated';other.mkdir()
         with self.assertRaisesRegex(ValueError,'owned_fixture'):M.collect(other,self.binding,self.pin,self.output,self.root)
+
+    @contextmanager
+    def installed_repair_fixture(self):
+        # Parser-only public bytes. No release, updater or endpoint is executed.
+        owner=M._PROFILE_OWNER;catalog=json.loads(owner.cohort_catalog_raw());profile=catalog['profiles']['704']
+        for k in profile:
+            if profile[k]=='UNBOUND':profile[k]='1'*64 if k.endswith('_sha256')else '1'
+        catalog_file=self.root/'parser-only-704.json';self.write(catalog_file,catalog)
+        with patch.object(owner,'PROFILE_FILE',catalog_file):
+            c,unused,pin=owner.cohort('704')
+            for p in self.source.iterdir():p.unlink()
+            runtime=self.root/'public-runtime';runtime.mkdir(exist_ok=True)
+            updater=runtime/'edr_agent_inplace_update.ps1';updater.write_bytes(b'public test bytes; not executable input\n')
+            stage=self.root/'target.json';self.write(stage,{'version':c['version'],'source_commit':c['source'],'target_arch':'arm64','agent_binary_sha256':self.target,'runtime_dir':str(runtime)})
+            binding={'schema':'edr.ci-cache-recovery-input.v1','cohort_id':'704','cohort_catalog_sha256':pin,'scenario':'installed_target_repair','runtime_mode':'service','prepared_only':False,'arch':'arm64','target':{'stage_path':str(stage),'stage_sha256':M.sha(stage.read_bytes()),'source_sha':c['source']},'protocol5_package':{'path':self.package}}
+            self.write(self.binding,binding);self.pin=M.sha(self.binding.read_bytes())
+            def native(pid):return {'pid':pid,'birth_filetime':str(pid*100),'exe_sha256':self.target,'config_sha256':'3'*64,'runtime_mode':'service','fixture_config_binding_verified':True,'service_config_argv_verified':True}
+            transition={'label':'health-failed-repair','phase':'completed','terminal_known':True,'exit_known':True,'exit_code':1,'restored_runtime':native(12)}
+            sample=(json.dumps({'schema':'edr.service-scm-sample.v1','state':'Stop Pending','service_pid':11,'pid_birth_filetime':'1100'})+'\n').encode()
+            receipt={'status':'captured','original_bytes_preserved':True,'bytes':len(sample),'sha256':M.sha(sample),'base64':base64.b64encode(sample).decode()}
+            action={'label':'health-failed-repair-health-stop','action':'Stop','phase':'action_returned','primary_failure':None,'observer_complete':True,'worker':{'terminal_known':True,'exit_known':True,'exit_code':0},'sampler':{'requested':True,'terminal_known':True,'exit_known':True,'exit_code':-1,'cancel_requested':True,'stdout':receipt}}
+            summary={'schema':'edr.ci-cache-recovery-result.v1','input_sha256':self.pin,'target_source':c['source'],'baseline':'win_3.2.704','scenario':'installed_target_repair','status':'local_subset_passed','real_data_touched':False,'library_prepared_schema':True,'runtime_mode':'service','service_action_diagnostics':[action],'task_action_diagnostics':[],'transition_diagnostics':[transition]}
+            for name in M.REPAIR_METADATA:self.write(self.source/name,summary if name=='recovery-subset-summary.json'else{'synthetic_metadata':True})
+            label='health-failed-repair';task='4'*32
+            self.write(self.source/(label+'.intent.json'),{'task_id':task,'command_id':'ci-cache-recovery-'+task,'operation':'repair','class':'installer_required','runtime_mode':'service','expected_hash':self.target,'health_failure_requested':True,'no_automatic_retry':True,'scenario':'installed_target_repair','updater_sha256':M.sha(updater.read_bytes()),'updater_version':'3.2.704','expected_previous_sha256':self.target,'initial_runtime':native(10)})
+            self.write(self.source/(label+'.original-report.json'),{'target_version':'3.2.704','operation':'repair','upgrade_class':'installer_required','expected_architecture':'arm64','expected_sha256':self.target,'runtime_manifest':self.package,'status':'failed_rolled_back','rollback':'succeeded'})
+            self.write(self.source/(label+'.original-journal.json'),{'schema_version':2,'resolved_deployment_mode':'service','task_id':task,'command_id':'ci-cache-recovery-'+task,'hash':self.target,'version':'3.2.704','operation':'repair','upgrade_class':'installer_required','artifact_id':'ci-cache-recovery-3.2.704','status':'failed_rolled_back'})
+            for suffix in ('.stdout.log','.stderr.log'):(self.source/(label+suffix)).write_bytes(b'')
+            self.write(self.source/(label+'.health-trigger.json'),{'runtime_mode':'service','action':'stop_exact_owned_service','fixture_only':True,'actual_previous_sha256':self.target,'native':native(11),'owner_snapshot_sha256':M.sha((self.source/(label+'-before-trigger.json')).read_bytes())})
+            yield binding,summary
+
+    def test_installed704_has_distinct_twelve_file_contract(self):
+        self.assertEqual(len(M.ALLOW),24)
+        with self.installed_repair_fixture():
+            self.collect();m=json.loads((self.output/'manifest.json').read_bytes())
+            self.assertEqual(m['scenario'],'installed_target_repair');self.assertEqual(m['baseline'],'win_3.2.704')
+            self.assertEqual(len(m['files']),12);self.assertTrue(m['complete_file_inventory']);self.assertIs(m['stop_pending_boundary_observed'],True)
+            self.assertEqual({x['name'] for x in m['files']},set(M.REPAIR_METADATA+M.REPAIR_RAW))
+            self.assertFalse(m['evidence_db_or_config_or_product_exported'])
+
+    def test_installed704_rejects_wrong_scenario_and_legacy_stage(self):
+        for key,value,cause in [('scenario','legacy692_upgrade','binding_scenario_mismatch'),('runtime_mode','scheduled_task','installed_repair_service_only'),('baseline',{},'unexpected_legacy_stage')]:
+            with self.subTest(key=key),self.installed_repair_fixture()as(binding,summary):
+                binding[key]=value;self.write(self.binding,binding);self.pin=M.sha(self.binding.read_bytes())
+                with self.assertRaisesRegex(ValueError,cause):self.collect()
+                self.assertFalse(self.output.exists())
+
+    def test_installed704_requires_all_twelve_original_files(self):
+        for name in M.REPAIR_METADATA+M.REPAIR_RAW:
+            with self.subTest(name=name),self.installed_repair_fixture():
+                (self.source/name).unlink()
+                with self.assertRaises(ValueError):self.collect()
+                self.assertFalse(self.output.exists())
+
+    def test_installed704_rejects_wrong_updater_operation_or_previous_owner(self):
+        for name,key,value,cause in [('health-failed-repair.intent.json','updater_version','3.2.692','installed_repair_updater_owner'),('health-failed-repair.intent.json','updater_sha256','0'*64,'installed_repair_updater_owner'),('health-failed-repair.intent.json','operation','upgrade','phase_intent_identity'),('health-failed-repair.health-trigger.json','actual_previous_sha256',self.baseline,'health_trigger_identity'),('health-failed-repair.original-report.json','rollback','failed','installed_repair_original_outcome')]:
+            with self.subTest(key=key),self.installed_repair_fixture():
+                self.mutate(name,key,value)
+                with self.assertRaisesRegex(ValueError,cause):self.collect()
+                self.assertFalse(self.output.exists())
+
+    def test_installed704_requires_new_restored_generation_and_terminal_exit(self):
+        for change,cause in [('generation','installed_repair_three_runtime_generations'),('exit_unknown','installed_repair_terminal'),('config','installed_repair_same_config')]:
+            with self.subTest(change=change),self.installed_repair_fixture()as(binding,summary):
+                t=summary['transition_diagnostics'][0]
+                if change=='generation':t['restored_runtime'].update(pid=11,birth_filetime='1100')
+                elif change=='exit_unknown':t['exit_known']=False
+                else:t['restored_runtime']['config_sha256']='5'*64
+                self.write(self.source/'recovery-subset-summary.json',summary)
+                with self.assertRaisesRegex(ValueError,cause):self.collect()
+                self.assertFalse(self.output.exists())
+
+    def test_installed704_requires_observed_pending_and_exact_stop_terminal(self):
+        for change,cause in [('worker','installed_repair_stop_terminal'),('sampler','installed_repair_sampler_terminal'),('sampler_uncontrolled','installed_repair_sampler_terminal'),('digest','installed_repair_sampler_digest'),('extra','installed_repair_stop_action')]:
+            with self.subTest(change=change),self.installed_repair_fixture()as(binding,summary):
+                action=summary['service_action_diagnostics'][0];receipt=action['sampler']['stdout']
+                if change=='worker':action['worker']['exit_code']=7
+                elif change=='sampler':action['sampler']['terminal_known']=False
+                elif change=='sampler_uncontrolled':action['sampler'].update(exit_code=1,cancel_requested=False)
+                elif change=='digest':receipt['sha256']='0'*64
+                elif change=='extra':summary['service_action_diagnostics'].append(dict(action))
+                else:
+                    sample=json.loads(base64.b64decode(receipt['base64']))
+                    if change=='running':sample['state']='Running'
+                    else:sample['pid_birth_filetime']='999'
+                    raw=(json.dumps(sample)+'\n').encode();receipt.update(bytes=len(raw),sha256=M.sha(raw),base64=base64.b64encode(raw).decode())
+                self.write(self.source/'recovery-subset-summary.json',summary)
+                with self.assertRaisesRegex(ValueError,cause):self.collect()
+                self.assertFalse(self.output.exists())
+
+    def test_installed704_sampler_normal_zero_needs_no_cancel(self):
+        with self.installed_repair_fixture()as(binding,summary):
+            summary['service_action_diagnostics'][0]['sampler'].update(exit_code=0,cancel_requested=False)
+            self.write(self.source/'recovery-subset-summary.json',summary)
+            self.collect();manifest=json.loads((self.output/'manifest.json').read_bytes())
+            self.assertIs(manifest['stop_pending_boundary_observed'],True)
+
+    def test_installed704_missing_pending_preserves_raw_but_is_unverified(self):
+        for change in ('running','birth'):
+            with self.subTest(change=change),self.installed_repair_fixture()as(binding,summary):
+                receipt=summary['service_action_diagnostics'][0]['sampler']['stdout']
+                sample=json.loads(base64.b64decode(receipt['base64']))
+                if change=='running':sample['state']='Running'
+                else:sample['pid_birth_filetime']='999'
+                raw=(json.dumps(sample)+'\n').encode();receipt.update(bytes=len(raw),sha256=M.sha(raw),base64=base64.b64encode(raw).decode())
+                self.write(self.source/'recovery-subset-summary.json',summary)
+                self.collect();manifest=json.loads((self.output/'manifest.json').read_bytes())
+                self.assertIs(manifest['stop_pending_boundary_observed'],False)
+                self.assertEqual(len(manifest['files']),12)
+                for p in self.output.iterdir():p.unlink()
+                self.output.rmdir()
+
+    def test_installed704_failed_or_unknown_preserves_partial_evidence(self):
+        with self.installed_repair_fixture()as(binding,summary):
+            summary['status']='failed_or_unknown';summary['service_action_diagnostics']=[]
+            self.write(self.source/'recovery-subset-summary.json',summary)
+            (self.source/'health-failed-repair-after.json').unlink()
+            self.collect();manifest=json.loads((self.output/'manifest.json').read_bytes())
+            self.assertEqual(manifest['recovery_status'],'failed_or_unknown');self.assertFalse(manifest['complete_file_inventory'])
+            self.assertIn('health-failed-repair-after.json',manifest['not_observed_files'])
 
 if __name__=='__main__':unittest.main(verbosity=2)
