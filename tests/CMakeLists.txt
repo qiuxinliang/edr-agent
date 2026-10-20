@@ -2377,3 +2377,6 @@ if(NOT EDR_P0_TEST_CONFIG_AVAILABLE)
     set_tests_properties(command_fact_transport PROPERTIES DISABLED TRUE)
   endif()
 endif()
+
+# Opt-in synthetic pipeline cost probe; no default CTest registration.
+include(${CMAKE_CURRENT_SOURCE_DIR}/pipeline_stop_diag/Target.cmake)

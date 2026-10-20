@@ -38,6 +38,7 @@ on:
       - tests/run_telemetry_windows_native.ps1
       - tests/test_native_gate_runner.ps1
       - tests/CMakeLists.txt
+      - tests/pipeline_stop_diag/**
       - cmake/AgentRuntimeGate.cmake
       - cmake/WindowsReleaseGate.cmake
       - .github/workflows/evidence-retention-comparison.yml
@@ -216,6 +217,136 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           path: ${{ runner.temp }}/evidence-native-tools/
+      # Independent diagnostic: earlier tools still certify only their original gates.
+      - name: Build and run the bounded real pipeline diagnostic
+        id: pipeline-stop-diag
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          cmake --build contract-build --config Release --target test_preprocess_stop_boundary --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Real pipeline diagnostic target failed to build' }
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $env:PATH = (Join-Path $prefix 'bin') + ';' + $env:PATH
+          $probe = @'
+          import datetime, hashlib, json, os, pathlib, subprocess, sys, time
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          case = pathlib.Path(os.environ['RUNNER_TEMP'])/'preprocess-stop-boundary-profile'
+          case.mkdir(exist_ok=False)
+          exe = root/'contract-build/tests/test_preprocess_stop_boundary.exe'
+          cap = 1024*1024
+          def need(ok, cause):
+              if not ok: raise RuntimeError(cause)
+          def digest(raw): return hashlib.sha256(raw).hexdigest()
+          def save(name, value):
+              raw = (json.dumps(value, sort_keys=True, indent=2)+'\n').encode('ascii')
+              with (case/name).open('xb') as stream:
+                  need(stream.write(raw)==len(raw), 'receipt_short_write')
+          def unique(pairs):
+              value = {}
+              for key, entry in pairs:
+                  need(key not in value, 'duplicate_json_key')
+                  value[key] = entry
+              return value
+          def parse(line):
+              return json.loads(line.decode('utf-8', 'strict'), object_pairs_hook=unique,
+                                parse_constant=lambda value: (_ for _ in ()).throw(ValueError('nonfinite_json')))
+          def take(path):
+              before = path.stat()
+              need(path.is_file() and not path.is_symlink() and 0<=before.st_size<=cap, 'fixed_log_size_or_type')
+              with path.open('rb') as stream: raw=stream.read(cap+1)
+              after = path.stat()
+              need((before.st_ino,before.st_size,before.st_mtime_ns)==(after.st_ino,after.st_size,after.st_mtime_ns)
+                   and len(raw)==after.st_size, 'fixed_log_changed_or_oversize')
+              return raw
+          identity = dict(source_sha=os.environ['GITHUB_SHA'], run_id=os.environ['GITHUB_RUN_ID'],
+                          run_attempt=os.environ['GITHUB_RUN_ATTEMPT'], arch=sys.argv[1],
+                          exe_sha256=digest(exe.read_bytes()), profiles=['ready','missing'],
+                          worker_work_ms=85000, parent_total_ms=90000, automatic_retry=False)
+          save('intent.json', identity)
+          child=None; code=None; failure=None; accepted=False; rows=[]; streams={}
+          started=time.monotonic()
+          with (case/'parent.stdout.log').open('xb') as output, (case/'parent.stderr.log').open('xb') as error:
+              try:
+                  child=subprocess.Popen([str(exe)], cwd=case, stdout=output, stderr=error)
+                  # The C parent owns the pre-resume Job and its shared 85+5s
+                  # budget. Five outer seconds only allow receipt/handle cleanup.
+                  code=child.wait(timeout=95)
+              except BaseException as problem:
+                  failure='parent_'+type(problem).__name__
+              finally:
+                  if child is not None and child.poll() is None:
+                      try: child.kill(); child.wait(timeout=5)
+                      except BaseException as problem: failure=failure or 'parent_terminal_unknown_'+type(problem).__name__
+          try:
+              for name in ('parent.stdout.log','parent.stderr.log'):
+                  raw=take(case/name); streams[name]=dict(bytes=len(raw),sha256=digest(raw))
+                  if name=='parent.stdout.log': rows=[parse(line) for line in raw.splitlines()]
+                  else: need(not raw, 'unexpected_parent_stderr')
+              need(type(code) is int and code==0, 'parent_exit_nonzero_or_unknown')
+              need(len(rows)==2, 'two_parent_receipts_required')
+              combined=0
+              for profile,row in zip(('ready','missing'), rows):
+                  need(type(row) is dict and row.get('schema')=='edr.private.pipeline-parent.v1'
+                       and row.get('profile')==profile and row.get('cause')=='worker_complete', 'parent_profile_identity')
+                  for key in ('accepted','child_exit_known','job_natural_zero','cleanup_verified'):
+                      need(row.get(key) is True, 'parent_'+key)
+                  need(row.get('termination_attempted') is False and row.get('parent_deadline_exceeded') is False
+                       and type(row.get('child_exit_code')) is int and row['child_exit_code']==0
+                       and type(row.get('child_pid')) is int and row['child_pid']>0
+                       and type(row.get('child_birth_filetime')) is int and row['child_birth_filetime']>0,
+                       'parent_terminal_contract')
+                  bodies={}
+                  for stream in ('stdout','stderr'):
+                      name='pipeline-stop-16-'+profile+'/worker.'+stream+'.log'
+                      raw=take(case/name); combined+=len(raw); need(combined<=cap, 'combined_worker_log_cap')
+                      need(len(raw)==row[stream+'_bytes'], 'parent_stream_length_mismatch')
+                      streams[name]=dict(bytes=len(raw),sha256=digest(raw)); bodies[stream]=raw
+                  records=[parse(line) for line in bodies['stdout'].splitlines()]
+                  need(all(type(record) is dict for record in records), 'worker_object_rows')
+                  drain=[record for record in records if record.get('kind')=='pipeline_diag_drain_end']
+                  complete=[record for record in records if record.get('kind')=='pipeline_diag_worker_complete']
+                  stages=[record for record in records if record.get('kind')=='pipeline_diag_stage']
+                  need(len(drain)==len(complete)==1 and complete[0].get('cleanup_returned') is True, 'worker_complete')
+                  d=drain[0]
+                  need(d.get('slots')==16 and d.get('completed_slots')==16 and d.get('real_ir_ready') is (profile=='ready')
+                       and d.get('real_sqlite') is True and d.get('necessary_source_owners_seeded',0)>0
+                       and d.get('necessary_source_bytes_unchanged') is True and d.get('actions_observed')==0
+                       and d.get('process_evidence_worker_windows_thread_started') is True
+                       and d.get('network_transport_initialized') is False and d.get('source_ack_inferred') is False,
+                       'worker_isolated_coverage')
+                  need([record.get('stage') for record in stages]==list(range(1,39)), 'stage_inventory')
+                  for index in (7,8,27,28):
+                      need(type(stages[index-1].get('calls')) is int and stages[index-1]['calls']>0, 'windows_core_branch_not_entered')
+              accepted=True
+          except BaseException as problem:
+              failure=failure or type(problem).__name__+':'+str(problem)
+          save('receipt.json', dict(identity, accepted=accepted and failure is None, parent_pid=child.pid if child else None,
+                                   parent_returncode=code, elapsed_seconds=time.monotonic()-started,
+                                   failure=failure, parent_rows=rows, streams=streams,
+                                   real_service_or_endpoint_executed=False, full_agent_acceptance=False))
+          print(json.dumps(dict(accepted=accepted and failure is None, parent_returncode=code, failure=failure)),flush=True)
+          raise SystemExit(0 if accepted and failure is None else 1)
+          '@
+          python -B -c $probe '${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Bounded pipeline diagnostic failed; fixed raw logs are preserved' }
+      - name: Preserve bounded pipeline diagnostics only
+        if: ${{ always() && (steps.pipeline-stop-diag.outcome == 'success' || steps.pipeline-stop-diag.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: preprocess-stop-boundary-${{ matrix.arch }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/intent.json
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/receipt.json
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/parent.stdout.log
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/parent.stderr.log
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/pipeline-stop-16-ready/worker.stdout.log
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/pipeline-stop-16-ready/worker.stderr.log
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/pipeline-stop-16-missing/worker.stdout.log
+            ${{ runner.temp }}/preprocess-stop-boundary-profile/pipeline-stop-16-missing/worker.stderr.log
+            contract-build/tests/pipeline-stop-generated/SOURCE-TRANSFORM-v2.json
+            contract-build/tests/pipeline-stop-source-closure-*.txt
       # The earlier passed-tools artifact covers only contracts + sliced gates.
       # These opt-in profiles independently gate this whole workflow; no retry.
       - name: Run native critical reserve load profiles
