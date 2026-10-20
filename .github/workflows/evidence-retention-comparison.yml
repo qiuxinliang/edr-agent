@@ -103,6 +103,8 @@ jobs:
           $qaDriverSha = (Get-FileHash -LiteralPath $qaDriver -Algorithm SHA256).Hash.ToLowerInvariant()
           & ./tests/pipeline_stop_diag/test_prepared_service_contracts.ps1 -DriverSource $driver -DriverSha256 $driverSha
           if (-not $?) { throw 'Pure Service failure projection contract failed before native builds' }
+          & ./tests/cache-recovery/test_recovery_driver_contracts.ps1 -DriverSource $qaDriver -DriverSha256 $qaDriverSha
+          if (-not $?) { throw 'Source-owned Service observation contracts failed before native builds' }
           & ./tests/pipeline_stop_diag/test_service_preparation.ps1 -DriverSource $driver -DriverSha256 $driverSha -QADriverSource $qaDriver -QADriverSha256 $qaDriverSha
           if (-not $?) { throw 'Service preparation prefix failed before any Agent or SCM execution' }
       - uses: actions/setup-python@v6

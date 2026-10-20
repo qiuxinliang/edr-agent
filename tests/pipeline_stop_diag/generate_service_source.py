@@ -57,13 +57,17 @@ for name,(stage,kind) in mapping.items():
   while depth:
    depth+=(masked[i]=='(')-(masked[i]==')');i+=1
   index=len(owner['calls']);prior=f'substage_previous[{index}]';old=s[m.start():i]
-  c={'start':m.start(),'end':i,'old':old,'new':f'PREPROCESS_SUBSTAGE_{kind}({stage}u, {prior}, {old})','stage':stage,'kind':kind,'owner':owner['name'],'line':s.count('\n',0,m.start())+1}
+  c={'start':m.start(),'end':i,'old':old,'previous':prior,'stage':stage,'kind':kind,'owner':owner['name'],'line':s.count('\n',0,m.start())+1}
   owner['calls'].append(c);changes.append(c)
 changes.sort(key=lambda c:c['start']);assert all(a['end']<=c['start'] for a,c in zip(changes,changes[1:]))
+assert len(changes) == 79, 'review fixed 80-bin callsite inventory before changing probes'
+for callsite_id,c in enumerate(changes,1):
+ c['callsite_id']=callsite_id
+ c['new']=f"PREPROCESS_SUBSTAGE_{c['kind']}({c['stage']}u, {callsite_id}u, {c['previous']}, {c['old']})"
 insertions=[]
 for f in functions:
  if f['calls']:
-  text='\n  /* Each callsite owns its previous frontier on this worker stack. */\n  unsigned substage_previous['+str(len(f['calls']))+'];'
+  text='\n  /* Each callsite owns its previous frontiers on this worker stack. */\n  uint64_t substage_previous['+str(len(f['calls']))+'];'
   changes.append({'start':f['open']+1,'end':f['open']+1,'old':'','new':text,'declaration':True,'owner':f['name']});insertions.append(text)
 changed=s
 for c in sorted(changes,key=lambda c:c['start'],reverse=True):changed=changed[:c['start']]+c['new']+changed[c['end']:]
@@ -73,17 +77,30 @@ old='static void process_one_slot(const EdrEventSlot *slot) {';new='static void 
 wrapper='''/* Preserve every early-return path in the slot body, and clear its frontier
  * only after that exact invocation returns. No stop or dispatch rule changes. */
 static void process_one_slot(const EdrEventSlot *slot) {
-  atomic_store_explicit(&s_worker_substage, PREPROCESS_SUBSTAGE_UNKNOWN, memory_order_relaxed);
+  preprocess_substage_clear();
   process_one_slot_impl(slot);
-  atomic_store_explicit(&s_worker_substage, PREPROCESS_SUBSTAGE_UNKNOWN, memory_order_relaxed);
+  preprocess_substage_clear();
 }
 
 '''
 needle=source_marker('#ifdef _WIN32\nstatic DWORD WINAPI preprocess_main(void *arg) {');assert changed.count(needle)==1;changed=changed.replace(needle,wrapper+needle)
+entry='#ifdef _WIN32\n  preprocess_substage_worker_enter();\n#endif\n'
+needle=source_marker('  (void)arg;\n  for (;;) {');assert changed.count(needle)==1;changed=changed.replace(needle,entry+needle)
+exit_hook='  preprocess_substage_worker_exit();\n'
+needle=source_marker('  atomic_store(&s_preprocess_exited, 1);\n  return 0;');assert changed.count(needle)==1;changed=changed.replace(needle,exit_hook+needle)
+wait_original=source_marker('    const DWORD wait_result = WaitForSingleObject(s_thread, 60000);')
+wait_generated='''    PreprocessJoinSamples join_samples;
+    DWORD sampled_wait_error;
+    const DWORD wait_result = preprocess_join_sampled_wait(s_thread, &sampled_wait_error, &join_samples);
+    preprocess_join_samples_print(&join_samples);'''
+assert changed.count(wait_original)==1;changed=changed.replace(wait_original,wait_generated)
+error_original='const DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : 0u;'
+error_generated='const DWORD wait_error = sampled_wait_error;'
+assert changed.count(error_original)==1;changed=changed.replace(error_original,error_generated)
 before='  const unsigned substage_before = atomic_load_explicit(&s_worker_substage, memory_order_relaxed);\n'
 needle=source_marker('  const unsigned phase_before = atomic_load_explicit(&s_worker_phase, memory_order_relaxed);\n');assert changed.count(needle)==1;changed=changed.replace(needle,needle+before)
 after='      const unsigned substage_after = atomic_load_explicit(&s_worker_substage, memory_order_relaxed);\n'
-needle=source_marker('      const DWORD wait_error = wait_result == WAIT_FAILED ? GetLastError() : 0u;\n');assert changed.count(needle)==1;changed=changed.replace(needle,needle+after)
+needle='      '+error_generated+source_newline;assert changed.count(needle)==1;changed=changed.replace(needle,needle+after)
 log='''      /* Separate versioned closed-set projection; old join/queue lines stay exact. */
       fprintf(stderr, "[preprocess] worker substage diagnostic version=1 substage_before=%u substage_after=%u\\n",
               substage_before, substage_after);
@@ -91,6 +108,7 @@ log='''      /* Separate versioned closed-set projection; old join/queue lines s
 needle=source_marker('      /* Diagnostic reads only: busy bus snapshots are unknown, PMFE queue\n');assert changed.count(needle)==1;changed=changed.replace(needle,log+needle)
 # Prove all wrapped calls can be stripped to the original byte-exact source.
 restored=changed.replace(log,'',1).replace(before,'',1).replace(after,'',1).replace(wrapper,'',1).replace(new,old,1).replace('\n'+header,'',1)
+restored=restored.replace(entry,'',1).replace(exit_hook,'',1).replace(wait_generated,wait_original,1).replace(error_generated,error_original,1)
 for text in insertions:assert text in restored;restored=restored.replace(text,'',1)
 for c in reversed(sorted((c for c in changes if not c.get('declaration')),key=lambda c:c['start'])):
  assert c['new'] in restored;restored=restored.replace(c['new'],c['old'],1)
@@ -115,6 +133,13 @@ manifest = {
     'template_sha256': hashlib.sha256((template_base/'service_substage_frontier.inc').read_bytes()).hexdigest(),
     'closed_set': {'0':'unknown','1':'decode','2':'generation','3':'token',
                    '4':'cache','5':'evidence','6':'P0','7':'correlation','8':'record'},
+    'callsite_inventory': {'unknown':0,'count':79,'order':'ascending raw decoded source offset',
+                          'phase_bins':13,'callsite_bins':80},
+    'join_sampling': {'version':1,'interval_ms':10,'sample_cap':6001,'absolute_deadline_ns':60000000000,
+                      'clock_owner':'stop observer only','new_threads':0,
+                      'deadline_boundary':'post-wait now >= deadline returns WAIT_TIMEOUT; WAIT_FAILED preserves original error',
+                      'line_prefix':'[preprocess] worker join samples version=1',
+                      'writer_gate':'preprocess_main registered Windows thread ID'},
     'changes': [c for c in changes if not c.get('declaration')],
     'local_previous_arrays': [{'owner': f['name'], 'size':len(f['calls'])}
                               for f in functions if f['calls']],
@@ -122,13 +147,19 @@ manifest = {
                      'rename_header_from':new, 'rename_header_to':old,
                      'remove_local_declarations':insertions,
                      'remove_observer_before':before,'remove_observer_after':after,
-                     'remove_timeout_log':log},
+                     'remove_timeout_log':log,'remove_worker_entry':entry,'remove_worker_exit':exit_hook,
+                     'wait_generated':wait_generated,'wait_original':wait_original,
+                     'error_generated':error_generated,'error_original':error_original},
     'offset_unit': 'Python Unicode code point in exact decoded source, not UTF-8 byte offset',
     'limitations': ['only for EXCLUDE_FROM_ALL diagnostic target; not a release source',
                     'independent relaxed frontier loads, not atomic stack or timing',
                     'same producer/API/owner/timeout/call order, added diagnostic atomics only',
                     'single-writer requires existing static worker-owned caller closure',
-                    'only a normal slot-body return guarantees the wrapper clears zero']}
+                    'only a normal slot-body return guarantees the wrapper clears zero',
+                    'nominal wait samples, not exact durations or an atomic phase/callsite stack',
+                    'observer scheduling after the deadline can conservatively reject an earlier worker exit',
+                    'unwrapped external calls retain their nearest wrapped caller ID',
+                    'non-Windows generated code does not publish Windows callsite frontiers']}
 (output/'SERVICE-SOURCE-TRANSFORM-v1.json').write_bytes((json.dumps(manifest, indent=2)+'\n').encode('utf-8'))
 print(json.dumps({'source_count':1,'call_transforms':len(manifest['changes']),
                   'inverse_raw_exact':manifest['inverse_raw_exact'],

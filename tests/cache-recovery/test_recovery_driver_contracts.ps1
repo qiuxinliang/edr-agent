@@ -571,6 +571,35 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_partial_numeric_line_not_projected'
     PublicAppend "`n";ReadStopLogSlice $ctx 6
     Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join') 'join_partial_numeric_line_completed_once';CloseStopLogContext $ctx
+    # Fixed histogram from the original join window; no names or event fields.
+    $joinSamplePhases=@('0')*13;$joinSamplePhases[3]='3'
+    $joinSampleSites=@('0')*80;$joinSampleSites[17]='1';$joinSampleSites[79]='2'
+    $joinSampleLine='[preprocess] worker join samples version=1 interval_ms=10 samples=3 capped=0 phase_hits='+($joinSamplePhases -join ',')+' callsite_hits='+($joinSampleSites -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleLine+[char]10);ReadStopLogSlice $ctx 1
+    $joinSampleProjected=$ctx.diagnostic.matches[0]
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $joinSampleProjected.kind -ceq 'preprocess_worker_join_samples' -and $joinSampleProjected.samples -eq 3 -and -not $joinSampleProjected.capped -and $joinSampleProjected.phase_hits.Count -eq 13 -and $joinSampleProjected.phase_hits[3] -eq 3 -and $joinSampleProjected.callsite_hits.Count -eq 80 -and $joinSampleProjected.callsite_hits[17] -eq 1 -and $joinSampleProjected.callsite_hits[79] -eq 2) 'join_samples_closed_histogram_projection';CloseStopLogContext $ctx
+    $joinSampleMaxPhases=@('0')*13;$joinSampleMaxPhases[12]='6001'
+    $joinSampleMaxSites=@('0')*80;$joinSampleMaxSites[79]='6001'
+    $joinSampleMaxLine='[preprocess] worker join samples version=1 interval_ms=10 samples=6001 capped=1 phase_hits='+($joinSampleMaxPhases -join ',')+' callsite_hits='+($joinSampleMaxSites -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleMaxLine+[char]10);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches[0].capped -and $ctx.diagnostic.matches[0].samples -eq 6001 -and $ctx.diagnostic.matches[0].callsite_hits[79] -eq 6001) 'join_samples_cap_boundary';CloseStopLogContext $ctx
+    $joinSampleZeroLine='[preprocess] worker join samples version=1 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*80) -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleZeroLine+[char]10);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches[0].samples -eq 0 -and -not $ctx.diagnostic.matches[0].capped) 'join_samples_zero_is_not_unknown_or_failure';CloseStopLogContext $ctx
+    $joinSampleBad=@($joinSampleLine.Replace('version=1','version=2'),$joinSampleLine.Replace('interval_ms=10','interval_ms=9'),$joinSampleLine.Replace('samples=3','samples=6002'),$joinSampleLine.Replace('capped=0','capped=2'),$joinSampleLine.Replace('capped=0','capped=1'),$joinSampleLine.Replace('samples=3','samples=2'))
+    $joinSampleBad+=@('[preprocess] worker join samples version=1 interval_ms=10 samples=3 capped=0 phase_hits='+((@('0')*12) -join ',')+' callsite_hits='+($joinSampleSites -join ','))
+    foreach($joinSampleSiteCount in @(79,81)){$joinSampleBad+=,('[preprocess] worker join samples version=1 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*$joinSampleSiteCount) -join ','))}
+    $joinSampleBad+=$joinSampleMaxLine.Replace('6001','6002')
+    $joinSampleBad+=$joinSampleMaxLine.Replace('phase_hits=0,','phase_hits=,')
+    $joinSampleBad+=$joinSampleMaxLine.Replace('phase_hits=0,','phase_hits=4294967296,')
+    foreach($joinSampleInvalid in $joinSampleBad){ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleInvalid+[char]10);Fails {ReadStopLogSlice $ctx 3} 'stop_log_numeric_shape';CloseStopLogContext $ctx}
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend (($joinSampleLine+[char]10)*2);Fails {ReadStopLogSlice $ctx 4} 'stop_log_join_samples_duplicate';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext
+    PublicAppend ('private-prefix '+$joinSampleLine+[char]10+$joinSampleLine+' raw-command'+[char]10+$joinSampleLine.Replace('samples=3','samples=-1')+[char]10);ReadStopLogSlice $ctx 5
+    Checked ($ctx.diagnostic.matches.Count -eq 0 -and ($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-prefix|raw-command') 'join_samples_near_match_exports_no_raw_text';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend $joinSampleLine;ReadStopLogSlice $ctx 6
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_samples_partial_line_not_projected';PublicAppend ([string][char]10);ReadStopLogSlice $ctx 7
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join_samples') 'join_samples_partial_completed_once';CloseStopLogContext $ctx
     # Independent versioned substage frontier: no raw path/command extension.
     $substageLine='[preprocess] worker substage diagnostic version=1 substage_before=0 substage_after=8'
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($substageLine+"`n");ReadStopLogSlice $ctx 1
@@ -609,6 +638,8 @@ Start-Sleep -Milliseconds 300
     ReadStopLogSlice $ctx ([long]::MaxValue)
     $queueMaxBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n")
     Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_stop_queues' -and $queueMaxBytes.Length -lt 1048576) 'queue_max64_real_projection_within_collector_single_file_cap';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleMaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_samples_plus_max_queue_projection_inside_service_metadata_cap';CloseStopLogContext $ctx
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'
