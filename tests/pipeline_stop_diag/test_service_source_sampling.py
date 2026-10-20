@@ -50,6 +50,7 @@ unsigned probe_is_worker(void) { return tid == 7u; }
 typedef int EdrBehaviorRecord;
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *record);
 void probe_nested_envelopes(void);
+void probe_wal_callback(void);
 static int evaluated;
 static int original_call(void) { ++evaluated; SetLastError(42u); errno = 19; return 17; }
 static void reset(unsigned chosen) {
@@ -61,7 +62,7 @@ static void verify(const PreprocessJoinSamples *s) {
   assert(s->samples <= 6001u && s->capped <= 1u);
   if (s->capped) assert(s->samples == 6001u);
   for (unsigned i = 0u; i < 13u; ++i) { assert(s->phase_hits[i] <= 6001u); phases += s->phase_hits[i]; }
-  for (unsigned i = 0u; i < 135u; ++i) { assert(s->callsite_hits[i] <= 6001u); sites += s->callsite_hits[i]; }
+  for (unsigned i = 0u; i < 138u; ++i) { assert(s->callsite_hits[i] <= 6001u); sites += s->callsite_hits[i]; }
   assert(phases == s->samples && sites == s->samples);
 }
 int main(void) {
@@ -96,10 +97,14 @@ int main(void) {
     assert(atomic_load(&s_worker_callsite) == 54u);
     probe_nested_envelopes();
     assert(atomic_load(&s_worker_callsite) == 54u);
+    probe_wal_callback();
+    assert(atomic_load(&s_worker_callsite) == 54u);
     tid = 8u; SetLastError(51u); errno = 21;
     edr_local_evidence_cache_record_behavior(&normal);
     assert(atomic_load(&s_worker_callsite) == 54u && GetLastError() == 64u && errno == 24);
     probe_nested_envelopes();
+    assert(atomic_load(&s_worker_callsite) == 54u);
+    probe_wal_callback();
     assert(atomic_load(&s_worker_callsite) == 54u);
     tid = 7u;
   }
@@ -127,6 +132,9 @@ int main(void) {
   reset(5u); atomic_store(&s_worker_phase, 3u); atomic_store(&s_worker_callsite, 134u);
   result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
   assert(result == WAIT_OBJECT_0 && samples.samples == 1u && samples.callsite_hits[134] == 1u);
+  reset(5u); atomic_store(&s_worker_phase, 3u); atomic_store(&s_worker_callsite, 137u);
+  result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
+  assert(result == WAIT_OBJECT_0 && samples.samples == 1u && samples.callsite_hits[137] == 1u);
   reset(4u); result = preprocess_join_sampled_wait(NULL, &error, &samples); verify(&samples);
   assert(result == WAIT_TIMEOUT && waits == 6001u && samples.samples == 6001u && samples.capped == 1u);
   SetLastError(44u); errno = 29; preprocess_join_samples_print(&samples);
@@ -155,6 +163,26 @@ extern unsigned probe_is_worker(void);
 static unsigned called;
 static void check(unsigned site);
 #if defined(EDR_HAVE_SQLITE)
+typedef int sqlite3;
+#define SQLITE_OK 0
+#define SQLITE_CHECKPOINT_PASSIVE 0
+static uint64_t s_evidence_wal_page_size = 4096u;
+static unsigned wal_physical_calls, wal_checkpoint_calls, wal_error_calls;
+static int wal_physical_result = 1, wal_checkpoint_result;
+static int sqlite_physical_write_allow(uint64_t bytes) {
+  check(136u); assert(bytes > 0u); ++wal_physical_calls;
+  SetLastError(71u); errno=31; return wal_physical_result;
+}
+static int sqlite3_wal_checkpoint_v2(sqlite3 *db, const char *name, int mode,
+                                     int *log, int *checkpointed) {
+  (void)db; assert(name && !strcmp(name,"main") && mode == SQLITE_CHECKPOINT_PASSIVE);
+  assert(!log && !checkpointed); check(137u); ++wal_checkpoint_calls;
+  SetLastError(72u); errno=32; return wal_checkpoint_result;
+}
+static void set_error(const char *text) {
+  assert(text && !strcmp(text,"automatic evidence checkpoint deferred; committed WAL retained"));
+  check(135u); ++wal_error_calls; SetLastError(74u); errno=34;
+}
 static unsigned transaction_calls[7];
 static int transaction_int(unsigned site, int result) {
   assert(site >= 128u && site <= 134u); check(site); ++transaction_calls[site-128u];
@@ -206,6 +234,29 @@ NESTED_SHIM_BODIES = {
 ''',
 }
 NESTED_SHIM_TEST = r'''
+void probe_wal_callback(void) {
+#if defined(EDR_HAVE_SQLITE)
+  wal_physical_calls=wal_checkpoint_calls=wal_error_calls=0u;
+  wal_physical_result=1; wal_checkpoint_result=SQLITE_OK;
+  SetLastError(81u); errno=41;
+  assert(sqlite_guarded_autocheckpoint(NULL,NULL,"main",999) == SQLITE_OK);
+  assert(wal_physical_calls == 0u && wal_checkpoint_calls == 0u && wal_error_calls == 0u);
+  assert(GetLastError() == 81u && errno == 41); check(54u);
+  const uint64_t outer=preprocess_substage_enter(8u,134u);
+  assert(sqlite_guarded_autocheckpoint(NULL,NULL,"main",1000) == SQLITE_OK);
+  assert(wal_physical_calls == 1u && wal_checkpoint_calls == 1u && wal_error_calls == 0u);
+  assert(GetLastError() == 72u && errno == 32); check(134u);
+  wal_physical_result=0;
+  assert(sqlite_guarded_autocheckpoint(NULL,NULL,"main",1001) == SQLITE_OK);
+  assert(wal_physical_calls == 2u && wal_checkpoint_calls == 1u && wal_error_calls == 0u);
+  assert(GetLastError() == 71u && errno == 31); check(134u);
+  wal_physical_result=1; wal_checkpoint_result=10;
+  assert(sqlite_guarded_autocheckpoint(NULL,NULL,"main",1002) == SQLITE_OK);
+  assert(wal_physical_calls == 3u && wal_checkpoint_calls == 2u && wal_error_calls == 1u);
+  assert(GetLastError() == 74u && errno == 34); check(134u);
+  preprocess_substage_leave(outer); check(54u);
+#endif
+}
 void probe_nested_envelopes(void) {
 #if defined(EDR_HAVE_SQLITE)
   char ids[1][160] = {{0}}; int record = 0; PreparedContextArtifacts prepared = {0};
@@ -251,8 +302,9 @@ class ServiceSampling(unittest.TestCase):
         done = subprocess.run([sys.executable, '-B', str(HERE / 'generate_service_source.py'), str(source_root), str(output)], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         receipt = json.loads(done.stdout)
-        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['cache_nested_envelopes'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 3, 134, 135))
+        self.assertEqual((receipt['source_count'], receipt['cache_call_transforms'], receipt['cache_nested_envelopes'], receipt['max_assigned_id'], receipt['callsite_bins']), (2, 44, 3, 137, 138))
         self.assertEqual(receipt['cache_transaction_calls'], 27)
+        self.assertEqual((receipt['cache_wal_envelopes'],receipt['cache_wal_calls']),(1,2))
         return [json.loads((output / name).read_bytes()) for name in ('SERVICE-SOURCE-TRANSFORM-v2.json', 'SERVICE-CACHE-SOURCE-TRANSFORM-v2.json')]
 
     def test_raw_reversal_lf_crlf_and_fixed_callsite_map(self):
@@ -277,7 +329,10 @@ class ServiceSampling(unittest.TestCase):
                 self.assertEqual(pipeline['namespace']['unassigned_range'], [])
                 self.assertEqual(pipeline['namespace']['cache_nested_range'], [125, 127])
                 self.assertEqual(pipeline['namespace']['cache_transaction_range'], [128, 134])
-                self.assertEqual(pipeline['namespace']['sampling_version'], 3)
+                self.assertEqual(pipeline['namespace']['cache_wal_envelope'],135)
+                self.assertEqual(pipeline['namespace']['cache_wal_range'],[136,137])
+                self.assertEqual([(c['callsite_id'],c['kind']) for c in cache['wal_changes']],[(136,'INT'),(137,'INT')])
+                self.assertEqual(pipeline['namespace']['sampling_version'], 4)
                 self.assertEqual({site:sum(c['callsite_id']==site for c in cache['transaction_changes']) for site in range(128,135)}, {128:1,129:11,130:10,131:1,132:1,133:2,134:1})
                 self.assertEqual([(c['callsite_id'], c['name']) for c in cache['nested_envelopes']], [
                     (125, 'sqlite_prepare_context_artifacts'), (126, 'sqlite_size_budget_allow'),
@@ -310,7 +365,15 @@ class ServiceSampling(unittest.TestCase):
                     else:
                         remove = ('remove_wrapper', 'remove_nested_bridge')
                         replacements = [('generated_header', 'original_header')]
-                        declarations = [reversal['remove_local_declaration'], reversal['remove_transaction_declaration']]
+                        declarations = [reversal['remove_local_declaration'], reversal['remove_transaction_declaration'], reversal['remove_wal_declaration']]
+                        for call in reversed(proof['wal_changes']):
+                            self.assertEqual(text[call['start']:call['end']],call['old'])
+                            self.assertEqual(generated.count(call['new']),1)
+                            generated=generated.replace(call['new'],call['old'],1)
+                        wal=proof['wal_envelope']
+                        self.assertEqual(text[wal['start']:wal['header_end']],wal['original_header'])
+                        self.assertEqual(generated.count(wal['wrapper']),1)
+                        generated=generated.replace(wal['wrapper'],'',1).replace(wal['generated_header'],wal['original_header'],1)
                         for call in reversed(proof['transaction_changes']):
                             self.assertEqual(text[call['start']:call['end']], call['old'])
                             self.assertEqual(generated.count(call['new']), 1)
@@ -338,7 +401,7 @@ class ServiceSampling(unittest.TestCase):
                         self.assertEqual(generated.count(call['new']), 1)
                         generated = generated.replace(call['new'], call['old'], 1)
                     self.assertEqual(generated.encode('utf-8'), raw)
-                    case_inventory.append([(c['callsite_id'], c['owner'], c['line'], c['old'].replace('\r\n', '\n')) for c in proof['changes'] + proof.get('transaction_changes',[])])
+                    case_inventory.append([(c['callsite_id'], c['owner'], c['line'], c['old'].replace('\r\n', '\n')) for c in proof['changes'] + proof.get('transaction_changes',[]) + proof.get('wal_changes',[])])
                 inventories.append(case_inventory)
             self.assertEqual(inventories[0], inventories[1])
             self.assertEqual(inventories[0], inventories[2])
@@ -348,6 +411,17 @@ class ServiceSampling(unittest.TestCase):
         bridge = reversal['generated_header'].removesuffix('static void service_diag_record_behavior_impl(const EdrBehaviorRecord *r) {')
         nested = ['#if defined(EDR_HAVE_SQLITE)\n', reversal['remove_nested_bridge'],
                   'static unsigned nested_calls[3];\nstatic int nested_mode;\n']
+        # Use the actual generated WAL algorithm body. Only its two external
+        # effects, set_error and Windows APIs are explicitly stubbed above.
+        wal = cache['wal_envelope']
+        text = Path(cache['source']).read_bytes().decode('utf-8')
+        body = text[wal['header_end']:wal['end']]
+        for call in sorted(cache['wal_changes'], key=lambda c:c['start'], reverse=True):
+            start,end = call['start']-wal['header_end'],call['end']-wal['header_end']
+            self.assertEqual(body[start:end],call['old'])
+            body = body[:start]+call['new']+body[end:]
+        body = reversal['remove_wal_declaration']+body
+        nested += [wal['generated_header'],body,wal['wrapper']]
         for envelope in sorted(cache['nested_envelopes'], key=lambda c: c['start']):
             nested += [envelope['generated_header'], NESTED_SHIM_BODIES[envelope['name']], envelope['wrapper']]
         nested += ['#endif\n', NESTED_SHIM_TEST]
@@ -368,12 +442,12 @@ class ServiceSampling(unittest.TestCase):
             ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             self.assertEqual(ran.stdout, '')
-            match = re.fullmatch(r'\[preprocess\] worker join samples version=3 interval_ms=10 samples=(\d+) capped=([01]) phase_hits=([0-9,]+) callsite_hits=([0-9,]+)\n', ran.stderr)
+            match = re.fullmatch(r'\[preprocess\] worker join samples version=4 interval_ms=10 samples=(\d+) capped=([01]) phase_hits=([0-9,]+) callsite_hits=([0-9,]+)\n', ran.stderr)
             self.assertIsNotNone(match, ran.stderr)
             self.assertLess(len(ran.stderr.encode()), 4096)
             count, capped = map(int, match.group(1, 2))
             phases, sites = ([int(x) for x in match.group(i).split(',')] for i in (3, 4))
-            self.assertEqual((len(phases), len(sites)), (13, 135))
+            self.assertEqual((len(phases), len(sites)), (13, 138))
             self.assertEqual((count, capped), (6001, 1))
             self.assertEqual(sum(phases), count)
             self.assertEqual(sum(sites), count)

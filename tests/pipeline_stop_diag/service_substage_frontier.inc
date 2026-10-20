@@ -75,7 +75,7 @@ static int preprocess_substage_int_leave(uint64_t previous, int result) {
 #ifdef _WIN32
 #define PREPROCESS_JOIN_SAMPLE_CAP 6001u
 #define PREPROCESS_JOIN_PHASE_BINS 13u
-#define PREPROCESS_JOIN_CALLSITE_BINS 135u
+#define PREPROCESS_JOIN_CALLSITE_BINS 138u
 typedef struct {
   unsigned samples, capped;
   unsigned phase_hits[PREPROCESS_JOIN_PHASE_BINS];
@@ -118,7 +118,7 @@ static void preprocess_join_samples_print(const PreprocessJoinSamples *samples) 
   size_t used;
   int n, saved_errno = errno;
   DWORD saved_error = GetLastError();
-  n = snprintf(line, sizeof(line), "[preprocess] worker join samples version=3 interval_ms=10 samples=%u capped=%u phase_hits=",
+  n = snprintf(line, sizeof(line), "[preprocess] worker join samples version=4 interval_ms=10 samples=%u capped=%u phase_hits=",
                samples->samples, samples->capped);
   if (n < 0 || (size_t)n >= sizeof(line)) goto done;
   used = (size_t)n;

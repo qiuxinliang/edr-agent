@@ -47,7 +47,7 @@ and durable owners. It is not a candidate package or a rollback acceptance test.
 Its generated 60-second worker join observes the registered preprocess worker
 at a nominal 10 ms cadence, using an absolute monotonic 60-second deadline and at
 most 6001 samples. It adds no thread or event logging. A single bounded numeric
-version-3 line contains 13 phase buckets and 135 callsite buckets, including
+version-4 line contains 13 phase buckets and 138 callsite buckets, including
 unknown zero. Two raw-byte source proofs bind the unchanged pipeline IDs 1..79,
 cache envelope 80, and 44 direct cache calls 81..124. IDs 125, 126 and 127
 are nested function envelopes for `sqlite_prepare_context_artifacts`,
@@ -73,7 +73,7 @@ histogram is explicit. Observer overhead and low-power/suspension equivalence
 to the original single wait are not validated. A signal first observed when
 the observer resumes at or after its deadline remains a timeout; this can
 conservatively reject a timely worker exit after observer scheduling delay.
-It does not measure the worker's exact exit time. The selected consumer accepts only the version-2/128 or version-3/135 callsite tuple with 13 phase buckets, and checks each bucket and both sums; duplicate histogram lines fail instead of expanding
+It does not measure the worker's exact exit time. The selected consumer accepts only the version-2/128, version-3/135 or version-4/138 callsite tuple with 13 phase buckets, and checks each bucket and both sums; duplicate histogram lines fail instead of expanding
 metadata. The original 45-second SCM verdict cannot be promoted by these samples.
 
 Version 3 adds only 27 wrapped existing expressions within the context
@@ -86,14 +86,25 @@ are not complete block durations or individual SQL/fsync timing. Existing
 IDs 1..127, SQL, transaction boundaries, synchronous/checkpoint settings,
 sample cadence, sample cap and stop budgets remain unchanged.
 
-Actual isolated source 1457279, run 39418568793/1, still failed the frozen
-45-second stop (45,171ms); later natural exit 1 and successful cleanup do not
-promote it. The worker advanced 2,965 slots and left 3,101 bus entries;
-3,275 of 3,782 samples fell within context transaction 127 (86.594%). Natural
-ETW cohorts differ, so this is no equal-input A/B. The controlled host compact
-layout improvement has not established a successful Service stop. The new
-categories distinguish the remaining transaction boundary before another
-production change; they are not a fix or Service rollback acceptance.
+Version 4 splits the existing guarded WAL callback without changing its work:
+135 wraps `sqlite_guarded_autocheckpoint`; 136 wraps its existing physical-write
+admission expression; 137 wraps its existing PASSIVE checkpoint expression.
+The callback can run synchronously inside COMMIT. Each expression restores its
+own saved frontier, and the callback restores its original caller on every
+normal return. The original 1000-page trigger, overflow/short-circuit checks,
+checkpoint mode, return handling, SQL and synchronization settings are unchanged.
+No second frontier, VFS, connection probe, thread or product path is introduced.
+
+Actual isolated source 9169292, run 39426352395/1, failed the frozen
+45-second stop (45,269ms); later natural exit 1 and successful cleanup do not
+promote it. The worker advanced only 163 slots during the join. Of 3,783 samples,
+3,541 fell within COMMIT helper 134 (93.603%); writer preparation 131 held only
+one. This does not distinguish SQLite commit, its synchronous WAL callback,
+physical admission or checkpoint cost, and does not justify a writer or
+synchronization-policy change. The missing normal-tail cache frame remains
+unknown, not evidence of a closed database. Natural ETW cohorts differ, so this
+is no equal-input A/B. Version 4 isolates these existing boundaries before a
+production change; it is not a fix or Service rollback acceptance.
 
 Before dependency builds, the manual ARM64 path runs the pure failure contracts,
 the original source-pinned recovery reader contracts, and

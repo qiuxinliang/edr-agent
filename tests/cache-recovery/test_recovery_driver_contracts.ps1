@@ -657,6 +657,62 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_v3_partial_line_not_projected';PublicAppend ([string][char]10);ReadStopLogSlice $ctx 7
     Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].version -eq 3) 'join_v3_partial_completed_once';CloseStopLogContext $ctx
     Checked ([Text.Encoding]::UTF8.GetByteCount($joinV3MaxLine) -lt 4096) 'join_v3_fixed_line_inside_original_limit'
+    # v4 adds only guarded-autocheckpoint envelopes 135..137. Old 241
+    # source-owned checks remain unchanged, including rejected wrong tuples.
+    $joinV4Phases=@('0')*13;$joinV4Phases[3]='3'
+    $joinV4Sites=@('0')*138;foreach($joinV4Id in 135..137){$joinV4Sites[$joinV4Id]='1'}
+    $joinV4Line='[preprocess] worker join samples version=4 interval_ms=10 samples=3 capped=0 phase_hits='+($joinV4Phases -join ',')+' callsite_hits='+($joinV4Sites -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4Line+[char]10);ReadStopLogSlice $ctx 1
+    $joinV4Projected=$ctx.diagnostic.matches[0]
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $joinV4Projected.kind -ceq 'preprocess_worker_join_samples' -and $joinV4Projected.version -eq 4 -and $joinV4Projected.samples -eq 3 -and -not $joinV4Projected.capped -and $joinV4Projected.phase_hits.Count -eq 13 -and $joinV4Projected.callsite_hits.Count -eq 138 -and @($joinV4Projected.callsite_hits[135..137]|Where-Object {$_ -ne 1}).Count -eq 0) 'join_v4_checkpoint_envelopes_projected';CloseStopLogContext $ctx
+    $joinV4MaxPhases=@('0')*13;$joinV4MaxPhases[12]='6001'
+    $joinV4MaxSites=@('0')*138;$joinV4MaxSites[137]='6001'
+    $joinV4MaxLine='[preprocess] worker join samples version=4 interval_ms=10 samples=6001 capped=1 phase_hits='+($joinV4MaxPhases -join ',')+' callsite_hits='+($joinV4MaxSites -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4MaxLine+[char]10);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches[0].version -eq 4 -and $ctx.diagnostic.matches[0].capped -and $ctx.diagnostic.matches[0].samples -eq 6001 -and $ctx.diagnostic.matches[0].callsite_hits[137] -eq 6001) 'join_v4_cap_boundary';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4MaxLine.Replace('capped=1','capped=0')+[char]10);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches[0].samples -eq 6001 -and -not $ctx.diagnostic.matches[0].capped) 'join_v4_exact_limit_without_cap_flag';CloseStopLogContext $ctx
+    $joinV4ZeroLine='[preprocess] worker join samples version=4 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*138) -join ',')
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4ZeroLine+[char]10);ReadStopLogSlice $ctx 2
+    Checked ($ctx.diagnostic.matches[0].version -eq 4 -and $ctx.diagnostic.matches[0].samples -eq 0 -and -not $ctx.diagnostic.matches[0].capped -and $ctx.diagnostic.matches[0].callsite_hits.Count -eq 138) 'join_v4_zero_is_observed_zero';CloseStopLogContext $ctx
+    $joinV4Bad=@(
+      $joinV4Line.Replace('version=4','version=0'),
+      $joinV4Line.Replace('version=4','version=1'),
+      $joinV4Line.Replace('version=4','version=2'),
+      $joinV4Line.Replace('version=4','version=3'),
+      $joinV4Line.Replace('version=4','version=5'),
+      $joinV4Line.Replace('version=4','version=4294967296'),
+      $joinV4Line.Replace('interval_ms=10','interval_ms=9'),
+      $joinV4Line.Replace('samples=3','samples=6002'),
+      $joinV4Line.Replace('capped=0','capped=2'),
+      $joinV4Line.Replace('capped=0','capped=1'),
+      $joinV4Line.Replace('samples=3','samples=2'),
+      $joinV4Line.Replace('phase_hits=0,','phase_hits=1,'),
+      $joinV4Line.Replace('callsite_hits=0,','callsite_hits=1,'),
+      $joinV4Line.Replace('phase_hits=0,','phase_hits=,'),
+      $joinV4Line.Replace('callsite_hits=0,','callsite_hits=,'),
+      $joinV4Line.Replace('phase_hits=0,','phase_hits=4294967296,'),
+      $joinV4Line.Replace('callsite_hits=0,','callsite_hits=4294967296,')
+    )
+    foreach($joinV4PhaseCount in @(12,14)){$joinV4Bad+=,('[preprocess] worker join samples version=4 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*$joinV4PhaseCount) -join ',')+' callsite_hits='+((@('0')*138) -join ','))}
+    foreach($joinV4SiteCount in @(128,135,137,139)){$joinV4Bad+=,('[preprocess] worker join samples version=4 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*$joinV4SiteCount) -join ','))}
+    $joinV4Bad+=$joinV4MaxLine.Replace('phase_hits=0,','phase_hits=6002,')
+    $joinV4Bad+=$joinV4MaxLine.Replace('callsite_hits=0,','callsite_hits=6002,')
+    foreach($joinV4Invalid in $joinV4Bad){ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4Invalid+[char]10);Fails {ReadStopLogSlice $ctx 3} 'stop_log_numeric_shape';CloseStopLogContext $ctx}
+    $joinV4Duplicates=@(
+      ($joinV4Line+[char]10+$joinV4Line+[char]10),
+      ($joinSampleLine+[char]10+$joinV4Line+[char]10),
+      ($joinV4Line+[char]10+$joinSampleLine+[char]10),
+      ($joinV3Line+[char]10+$joinV4Line+[char]10),
+      ($joinV4Line+[char]10+$joinV3Line+[char]10)
+    )
+    foreach($joinV4Duplicate in $joinV4Duplicates){ResetPublicLog;$ctx=PublicLogContext;PublicAppend $joinV4Duplicate;Fails {ReadStopLogSlice $ctx 4} 'stop_log_join_samples_duplicate';CloseStopLogContext $ctx}
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ('private-prefix '+$joinV4Line+[char]10+$joinV4Line+' raw-command'+[char]10+$joinV4Line.Replace('version=4','version=-1')+[char]10);ReadStopLogSlice $ctx 5
+    Checked ($ctx.diagnostic.matches.Count -eq 0 -and ($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-prefix|raw-command') 'join_v4_near_match_exports_no_raw';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend $joinV4Line;ReadStopLogSlice $ctx 6
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_v4_partial_line_not_projected';PublicAppend ([string][char]10);ReadStopLogSlice $ctx 7
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].version -eq 4) 'join_v4_partial_completed_once';CloseStopLogContext $ctx
+    Checked ([Text.Encoding]::UTF8.GetByteCount($joinV4MaxLine) -lt 4096) 'join_v4_fixed_line_inside_original_limit'
     # Independent versioned substage frontier: no raw path/command extension.
     $substageLine='[preprocess] worker substage diagnostic version=1 substage_before=0 substage_after=8'
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($substageLine+"`n");ReadStopLogSlice $ctx 1
@@ -699,6 +755,8 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 64 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_samples_plus_max_queue_projection_inside_service_metadata_cap';CloseStopLogContext $ctx
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV3MaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
     Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 3 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_v3_plus_max_queue_inside_original_service_cap';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4MaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 4 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_v4_plus_max_queue_inside_original_service_cap';CloseStopLogContext $ctx
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'
