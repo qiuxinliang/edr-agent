@@ -1074,6 +1074,169 @@ class WindowsReleaseGateTests(unittest.TestCase):
                    "edr_local_evidence_cache_close()", "edr_storage_queue_close()", "edr_agent_destroy(agent)")
         self.assertEqual([tail.index(action) for action in actions], sorted(tail.index(action) for action in actions))
 
+    def test_service_outcome_reaches_scm_and_process_exit(self):
+        """Execute the actual callback and dispatcher branch with SCM I/O adapted."""
+        main = (ROOT / "src/main.c").read_text(encoding="utf-8")
+        start = main.index("static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hint_ms) {")
+        service = main[start:main.index("\n#endif\n\nint main(", start)]
+        start = main.index("  if (run_as_service) {")
+        dispatch = main[start:main.index("\n#else\n  (void)run_as_service", start)]
+        outcome = re.search(r"^static volatile LONG g_service_exit_code = [^;]+;", main, re.MULTILINE)
+        self.assertIsNotNone(outcome)
+        probe = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "edr/agent.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+typedef uint32_t DWORD;
+typedef int32_t LONG;
+typedef int BOOL;
+typedef char *LPSTR;
+typedef void *SERVICE_STATUS_HANDLE;
+typedef pthread_mutex_t SRWLOCK;
+#define SRWLOCK_INIT PTHREAD_MUTEX_INITIALIZER
+#define WINAPI
+#define NO_ERROR 0u
+#define ERROR_SERVICE_SPECIFIC_ERROR 1066u
+#define SERVICE_WIN32_OWN_PROCESS 16u
+#define SERVICE_START_PENDING 2u
+#define SERVICE_STOP_PENDING 3u
+#define SERVICE_STOPPED 1u
+#define SERVICE_RUNNING 4u
+#define SERVICE_ACCEPT_STOP 1u
+#define SERVICE_ACCEPT_SHUTDOWN 4u
+#define SERVICE_CONTROL_STOP 1u
+#define SERVICE_CONTROL_SHUTDOWN 5u
+typedef struct { DWORD dwServiceType, dwCurrentState, dwControlsAccepted,
+  dwWin32ExitCode, dwServiceSpecificExitCode, dwCheckPoint, dwWaitHint; } SERVICE_STATUS;
+typedef struct { LPSTR lpServiceName; void (WINAPI *lpServiceProc)(DWORD, LPSTR *); } SERVICE_TABLE_ENTRYA;
+static void AcquireSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_lock(p) == 0); }
+static void ReleaseSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_unlock(p) == 0); }
+static LONG InterlockedCompareExchange(volatile LONG *p, LONG desired, LONG expected) {
+  __atomic_compare_exchange_n(p, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return expected;
+}
+static LONG InterlockedExchange(volatile LONG *p, LONG desired) {
+  return __atomic_exchange_n(p, desired, __ATOMIC_SEQ_CST);
+}
+#endif
+static EdrAgent *g_agent_for_ctrl;
+static SERVICE_STATUS_HANDLE g_service_status_handle;
+static SERVICE_STATUS g_service_status;
+static SRWLOCK g_service_status_lock = SRWLOCK_INIT;
+OUTCOME_DECLARATION
+static const char *g_service_name = "synthetic-service";
+static const char *g_service_config_path;
+static int run_rc, run_calls, register_ok = 1, dispatcher_ok = 1, invoke_callback = 1;
+static int status_calls, published, reject_status;
+static SERVICE_STATUS attempted[8];
+static int edr_agent_run_main(const char *config);
+void edr_agent_shutdown(EdrAgent *agent) { (void)agent; }
+static SERVICE_STATUS_HANDLE fake_RegisterServiceCtrlHandlerA(const char *name, void (WINAPI *handler)(DWORD)) {
+  assert(strcmp(name, g_service_name) == 0 && handler);
+  return register_ok ? (SERVICE_STATUS_HANDLE)(uintptr_t)1 : NULL;
+}
+static BOOL fake_SetServiceStatus(SERVICE_STATUS_HANDLE handle, SERVICE_STATUS *status) {
+  assert(handle && status_calls < 8);
+  attempted[status_calls++] = *status;
+  if (reject_status) return 0;
+  published++; return 1;
+}
+static BOOL fake_StartServiceCtrlDispatcherA(SERVICE_TABLE_ENTRYA *table) {
+  assert(table[0].lpServiceName && table[0].lpServiceProc && !table[1].lpServiceName && !table[1].lpServiceProc);
+  if (!dispatcher_ok) return 0;
+  if (invoke_callback) table[0].lpServiceProc(0, NULL);
+  return 1;
+}
+#define RegisterServiceCtrlHandlerA fake_RegisterServiceCtrlHandlerA
+#define SetServiceStatus fake_SetServiceStatus
+#define StartServiceCtrlDispatcherA fake_StartServiceCtrlDispatcherA
+#define GetLastError() 5u
+SERVICE_SOURCE
+static int edr_agent_run_main(const char *config) {
+  assert(config && strcmp(config, "synthetic-config") == 0);
+  run_calls++;
+  edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
+  return run_rc;
+}
+static int run_dispatch(void) {
+  const char *config = "synthetic-config";
+  int run_as_service = 1;
+DISPATCH_SOURCE
+  return 99;
+}
+static void reset(void) {
+  run_rc=run_calls=status_calls=published=reject_status=0;
+  register_ok=dispatcher_ok=invoke_callback=1;
+  g_service_status_handle=NULL;
+  memset(&g_service_status, 0, sizeof(g_service_status));
+  memset(attempted, 0, sizeof(attempted));
+  /* The real dispatcher branch must overwrite an earlier successful outcome. */
+  InterlockedExchange(&g_service_exit_code, 0);
+}
+static void verify_run(int rc) {
+  reset(); run_rc=rc;
+  assert(run_dispatch() == rc && run_calls == 1 && status_calls == 3 && published == 3);
+  assert(attempted[0].dwCurrentState == SERVICE_START_PENDING && attempted[0].dwServiceSpecificExitCode == 0);
+  assert(attempted[1].dwCurrentState == SERVICE_RUNNING && attempted[1].dwServiceSpecificExitCode == 0);
+  assert(attempted[2].dwCurrentState == SERVICE_STOPPED);
+  assert(attempted[2].dwWin32ExitCode == (rc == 0 ? NO_ERROR : ERROR_SERVICE_SPECIFIC_ERROR));
+  assert(attempted[2].dwServiceSpecificExitCode == (DWORD)rc);
+}
+int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "--exit") == 0) {
+    reset(); run_rc=atoi(argv[2]); return run_dispatch();
+  }
+  verify_run(0); verify_run(1); verify_run(7);
+  reset(); register_ok=0;
+  assert(run_dispatch() == 1 && run_calls == 0 && status_calls == 0);
+  reset(); invoke_callback=0;
+  assert(run_dispatch() == 1 && run_calls == 0 && status_calls == 0);
+  reset(); dispatcher_ok=0;
+  assert(run_dispatch() == 1 && run_calls == 0 && status_calls == 0);
+  reset(); run_rc=1; reject_status=1;
+  assert(run_dispatch() == 1 && run_calls == 1 && status_calls == 3 && published == 0);
+  /* A later ordinary status must clear a prior service-specific error. */
+  reject_status=0;
+  edr_service_set_status(SERVICE_START_PENDING, NO_ERROR, 30000);
+  assert(g_service_status.dwServiceSpecificExitCode == 0);
+  edr_service_set_status(SERVICE_RUNNING, NO_ERROR, 0);
+  assert(g_service_status.dwServiceSpecificExitCode == 0);
+  edr_service_set_status(SERVICE_STOPPED, NO_ERROR, 0);
+  assert(g_service_status.dwServiceSpecificExitCode == 0);
+  reset(); reject_status=1;
+  assert(run_dispatch() == 0 && run_calls == 1 && status_calls == 3 && published == 0);
+  return 0;
+}
+'''
+        probe = (probe.replace("OUTCOME_DECLARATION", outcome[0])
+                 .replace("SERVICE_SOURCE", service).replace("DISPATCH_SOURCE", dispatch))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            build = source / "build"
+            (source / "probe.c").write_text(probe, encoding="utf-8")
+            (source / "CMakeLists.txt").write_text(
+                'cmake_minimum_required(VERSION 3.20)\nproject(ServiceOutcome C)\n'
+                'set(CMAKE_C_STANDARD 11)\nfind_package(Threads REQUIRED)\n'
+                'add_executable(service_outcome probe.c)\n'
+                f'include_directories("{(ROOT / "include").as_posix()}")\n'
+                'target_link_libraries(service_outcome PRIVATE Threads::Threads)\n'
+                'enable_testing()\nadd_test(NAME service_outcome COMMAND service_outcome)\n', encoding="utf-8")
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            self.run_command("cmake", "--build", str(build))
+            self.run_command("ctest", "--test-dir", str(build), "--output-on-failure", "--no-tests=error")
+            executable = build / ("service_outcome.exe" if os.name == "nt" else "service_outcome")
+            for expected in (0, 1, 7):
+                result = subprocess.run([str(executable), "--exit", str(expected)],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
     def test_shutdown_progress_executes_service_and_collector_owners(self):
         """Execute actual C owners with simulated SCM/ETW I/O, not a service stop."""
         main = (ROOT / "src/main.c").read_text(encoding="utf-8")
@@ -1094,6 +1257,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
 #else
 #include <pthread.h>
 typedef uint32_t DWORD;
+typedef int32_t LONG;
 typedef int BOOL;
 typedef void *HANDLE;
 typedef void *SERVICE_STATUS_HANDLE;
@@ -1101,6 +1265,7 @@ typedef pthread_mutex_t SRWLOCK;
 #define SRWLOCK_INIT PTHREAD_MUTEX_INITIALIZER
 #define WINAPI
 #define NO_ERROR 0u
+#define ERROR_SERVICE_SPECIFIC_ERROR 1066u
 #define SERVICE_WIN32_OWN_PROCESS 16u
 #define SERVICE_START_PENDING 2u
 #define SERVICE_STOP_PENDING 3u
@@ -1116,11 +1281,16 @@ typedef struct { DWORD dwServiceType, dwCurrentState, dwControlsAccepted,
   dwWin32ExitCode, dwServiceSpecificExitCode, dwCheckPoint, dwWaitHint; } SERVICE_STATUS;
 static void AcquireSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_lock(p) == 0); }
 static void ReleaseSRWLockExclusive(SRWLOCK *p) { assert(pthread_mutex_unlock(p) == 0); }
+static LONG InterlockedCompareExchange(volatile LONG *p, LONG desired, LONG expected) {
+  __atomic_compare_exchange_n(p, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return expected;
+}
 #endif
 static EdrAgent *g_agent_for_ctrl;
 static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
 static SRWLOCK g_service_status_lock = SRWLOCK_INIT;
+static volatile LONG g_service_exit_code = 1;
 static int held, attempts, failures, shutdowns;
 static SERVICE_STATUS accepted[512];
 static unsigned accepted_count;

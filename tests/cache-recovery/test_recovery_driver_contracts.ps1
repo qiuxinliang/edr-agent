@@ -315,6 +315,16 @@ Start-Sleep -Milliseconds 300
   Checked ($typed.cause_code -ceq 'stop_log_anchor_changed') 'observer_exact_need_code'
   try{throw 'private-synthetic-path stop_log_anchor_changed private-text'}catch{$typed=ServiceObserverError $_}
   Checked ($typed.cause_code -ceq 'unknown' -and ($typed|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-synthetic-path|private-text') 'observer_unknown_text_never_exported'
+  foreach($cause in @('service_control_unknown_no_retry','task_control_unknown_no_retry')){
+    foreach($suffix in @('',';cleanup_unknown_type=System.TimeoutException')){
+      try{throw ($cause+$suffix)}catch{$typed=ServiceObserverError $_}
+      Checked ($typed.cause_code -ceq $cause -and $null -eq $typed.native_error_code -and ($typed|ConvertTo-Json -Depth 8 -Compress) -notmatch 'cleanup_unknown_type') 'control_timeout_cause_is_fixed_and_native_unknown'
+    }
+    foreach($message in @(('private-text '+$cause),($cause+' private-text'),($cause+';cleanup_error=System.TimeoutException'),($cause+';cleanup_unknown_type='),($cause+';cleanup_unknown_type=System.TimeoutException;private-text'),($cause+";cleanup_unknown_type=System.TimeoutException`nprivate-text"),($cause+';cleanup_unknown_type='+('x'*257)))){
+      try{throw $message}catch{$typed=ServiceObserverError $_}
+      Checked ($typed.cause_code -ceq 'unknown' -and ($typed|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-text|cleanup_unknown_type') 'control_timeout_private_or_malformed_text_not_exported'
+    }
+  }
   ServiceCase 'normal';ServiceAction 'Stop' 'health-failed-upgrade-health-stop'
   $v=$serviceActionDiagnostics[0]
   Checked ($serviceWaits[0] -eq 45000 -and $v.worker.terminal_known -and $v.worker.exit_known -and $v.worker.exit_code -eq 0 -and $v.sampler.cancel_requested -and $v.sampler.terminal_known -and $v.observer_complete) 'observed_stop_exact_wait_and_sampler_cleanup'
@@ -330,6 +340,7 @@ Start-Sleep -Milliseconds 300
   ServiceCase 'timeout_and_sampler_cleanup';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_control_unknown_no_retry'
   $v=$serviceActionDiagnostics[0]
   Checked ($serviceWaits[0] -eq 45000 -and $serviceWaits[1] -eq 10000 -and $null -ne $v.sampler.cleanup_error -and $v.sampler.stdout.status -ceq 'not_captured' -and $null -ne $v.primary_failure) 'cleanup_failure_preserves_primary_and_no_live_read'
+  Checked ($v.primary_failure.cause_code -ceq 'service_control_unknown_no_retry' -and $null -eq $v.primary_failure.native_error_code) 'timeout_primary_cause_survives_observer_cleanup'
   ServiceCase 'sampler_launch';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_action_diagnostic_incomplete'
   Checked ($serviceActionDiagnostics[0].worker.exit_code -eq 0 -and $null -ne $serviceActionDiagnostics[0].sampler.launch_error) 'sampler_launch_unknown_not_pass'
   ServiceCase 'oversize';Fails {ServiceAction 'Stop' 'health-failed-upgrade-health-stop'} 'service_action_diagnostic_incomplete'

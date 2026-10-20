@@ -202,7 +202,11 @@ function ServiceObserverError($Record) {
   for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
     $null=$types.Add($e.GetType().FullName)
     if($e -is [ComponentModel.Win32Exception]){$native=$e.NativeErrorCode}
-    if($causeCode -ceq 'unknown' -and [string]$e.Message -cin $allowed){$causeCode=[string]$e.Message}
+    if($causeCode -ceq 'unknown'){
+      $message=[string]$e.Message
+      if($message -cin $allowed){$causeCode=$message}
+      elseif($message -cmatch '\A(service_control_unknown_no_retry|task_control_unknown_no_retry)(?:;cleanup_unknown_type=[A-Za-z_][A-Za-z0-9_.+`]{0,255})?\z'){$causeCode=$Matches[1]}
+    }
     $e=$e.InnerException
   }
   return @{exception_types=@($types);hresult=$Record.Exception.HResult;native_error_code=$native;cause_code=$causeCode}

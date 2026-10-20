@@ -54,6 +54,8 @@ static EdrAgent *g_agent_for_ctrl;
 static SERVICE_STATUS_HANDLE g_service_status_handle;
 static SERVICE_STATUS g_service_status;
 static SRWLOCK g_service_status_lock = SRWLOCK_INIT;
+/* Dispatcher success does not imply the service callback completed cleanly. */
+static volatile LONG g_service_exit_code = 1;
 static const char *g_service_name = "FDSecurityAgent";
 static const char *g_service_config_path;
 
@@ -764,6 +766,8 @@ static void edr_service_set_status(DWORD state, DWORD win32_exit, DWORD wait_hin
   g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
   g_service_status.dwCurrentState = state;
   g_service_status.dwWin32ExitCode = win32_exit;
+  g_service_status.dwServiceSpecificExitCode = win32_exit == ERROR_SERVICE_SPECIFIC_ERROR
+      ? (DWORD)InterlockedCompareExchange(&g_service_exit_code, 0, 0) : 0;
   g_service_status.dwWaitHint = wait_hint_ms;
   g_service_status.dwControlsAccepted =
       (state == SERVICE_RUNNING) ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
@@ -826,10 +830,14 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
   g_service_status_handle =
       RegisterServiceCtrlHandlerA(g_service_name, edr_service_ctrl_handler);
   if (!g_service_status_handle) {
+    DWORD err = GetLastError();
+    fprintf(stderr, "[service] control handler registration failed error=%lu\n",
+            (unsigned long)err);
     return;
   }
   edr_service_set_status(SERVICE_START_PENDING, NO_ERROR, 30000);
   int rc = edr_agent_run_main(g_service_config_path);
+  InterlockedExchange(&g_service_exit_code, (LONG)rc);
   edr_service_set_status(SERVICE_STOPPED, rc == 0 ? NO_ERROR : ERROR_SERVICE_SPECIFIC_ERROR, 0);
 }
 #endif
@@ -999,12 +1007,13 @@ int main(int argc, char **argv) {
         {NULL, NULL},
     };
     g_service_config_path = config;
+    InterlockedExchange(&g_service_exit_code, 1);
     if (!StartServiceCtrlDispatcherA(table)) {
       DWORD err = GetLastError();
       fprintf(stderr, "StartServiceCtrlDispatcher failed: %lu\n", (unsigned long)err);
       return 1;
     }
-    return 0;
+    return (int)InterlockedCompareExchange(&g_service_exit_code, 0, 0);
   }
 #else
   (void)run_as_service;
