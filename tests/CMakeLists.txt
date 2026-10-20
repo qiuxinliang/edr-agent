@@ -2380,3 +2380,4 @@ endif()
 
 # Opt-in synthetic pipeline cost probe; no default CTest registration.
 include(${CMAKE_CURRENT_SOURCE_DIR}/pipeline_stop_diag/Target.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/pipeline_stop_diag/ServiceTarget.cmake)

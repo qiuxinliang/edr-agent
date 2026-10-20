@@ -477,6 +477,10 @@ function ReadStopLogSlice($Context,[long]$ElapsedMs) {
       $match=@{kind='scm_stage_publication_failed';stage=[int]$Matches[1];error=[uint32]$Matches[2]}
     }elseif($line -cmatch '^\[shutdown\] SCM status publication failed error=([0-9]{1,10})$'){
       Need ([uint64]$Matches[1] -le [uint32]::MaxValue) 'stop_log_numeric_shape';$match=@{kind='scm_status_publication_failed';stage=$null;error=[uint32]$Matches[1]}
+    }elseif($line -cmatch '^\[preprocess\] worker substage diagnostic version=([0-9]{1,10}) substage_before=([0-9]{1,10}) substage_after=([0-9]{1,10})$'){
+      Need ([uint64]$Matches[1] -eq 1 -and [uint64]$Matches[2] -le 8 -and [uint64]$Matches[3] -le 8) 'stop_log_numeric_shape'
+      # Closed diagnostic vocabulary; independent loads are not a causal trace.
+      $match=@{kind='preprocess_worker_substage';version=1;substage=@([int]$Matches[2],[int]$Matches[3])}
     }elseif($line -cmatch '^\[preprocess\] worker join diagnostic wait_rc=([0-9]{1,10}) error=([0-9]{1,10}) phase_before=([0-9]{1,2}) phase_after=([0-9]{1,2}) loops_before=([0-9]{1,20}) loops_after=([0-9]{1,20}) slots_before=([0-9]{1,20}) slots_after=([0-9]{1,20}) stop=([01]) exited=([01])$'){
       $fields=@();for($field=1;$field -le 10;$field++){$fields+=,[string]$Matches[$field]}
       Need ([uint64]$fields[0] -in @([uint64]258,[uint64]4294967295) -and [uint64]$fields[1] -le [uint32]::MaxValue -and ([uint64]$fields[0] -eq 4294967295 -or [uint64]$fields[1] -eq 0) -and [int]$fields[2] -le 12 -and [int]$fields[3] -le 12) 'stop_log_numeric_shape'

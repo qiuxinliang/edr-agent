@@ -571,6 +571,20 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 0) 'join_partial_numeric_line_not_projected'
     PublicAppend "`n";ReadStopLogSlice $ctx 6
     Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join') 'join_partial_numeric_line_completed_once';CloseStopLogContext $ctx
+    # Independent versioned substage frontier: no raw path/command extension.
+    $substageLine='[preprocess] worker substage diagnostic version=1 substage_before=0 substage_after=8'
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($substageLine+"`n");ReadStopLogSlice $ctx 1
+    $sub=$ctx.diagnostic.matches[0]
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $sub.kind -ceq 'preprocess_worker_substage' -and $sub.version -eq 1 -and $sub.substage[0] -eq 0 -and $sub.substage[1] -eq 8) 'substage_closed_numeric_projection';CloseStopLogContext $ctx
+    foreach($bad in @($substageLine.Replace('version=1','version=2'),$substageLine.Replace('version=1','version=0'),$substageLine.Replace('substage_before=0','substage_before=9'),$substageLine.Replace('substage_after=8','substage_after=4294967295'))){
+      ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($bad+"`n");Fails {ReadStopLogSlice $ctx 2} 'stop_log_numeric_shape';CloseStopLogContext $ctx
+    }
+    ResetPublicLog;$ctx=PublicLogContext
+    PublicAppend ('private-prefix '+$substageLine+"`n"+$substageLine+' raw-command'+"`n"+$substageLine.Replace('substage_before=0','substage_before=-1')+"`n");ReadStopLogSlice $ctx 3
+    Checked ($ctx.diagnostic.matches.Count -eq 0 -and ($ctx.diagnostic|ConvertTo-Json -Depth 8 -Compress) -notmatch 'private-prefix|raw-command') 'substage_near_match_no_raw_export';CloseStopLogContext $ctx
+    ResetPublicLog;$ctx=PublicLogContext;PublicAppend $substageLine;ReadStopLogSlice $ctx 4
+    Checked ($ctx.diagnostic.matches.Count -eq 0) 'substage_partial_not_projected';PublicAppend "`n";ReadStopLogSlice $ctx 5
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_substage') 'substage_partial_completed_once';CloseStopLogContext $ctx
     $queueLine='[preprocess] stop queue diagnostic bus_before_known=1 bus_after_known=1 bus_before_used=4 bus_after_used=8 bus_before_pushed=17 bus_after_pushed=21 bus_before_dropped=0 bus_after_dropped=2 pmfe_before_running=1 pmfe_after_running=1 pmfe_before_active=2 pmfe_after_active=1 pmfe_before_submitted=5 pmfe_after_submitted=6 pmfe_before_completed=3 pmfe_after_completed=4 pmfe_before_dropped=0 pmfe_after_dropped=1'
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($queueLine+"`n");ReadStopLogSlice $ctx 1
     $q=$ctx.diagnostic.matches[0]

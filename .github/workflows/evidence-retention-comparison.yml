@@ -1,11 +1,18 @@
 # Native contracts and storage comparisons before a candidate release. Contract
 # dependencies are built; private compiled tools preserve their actual gate outcome.
 # Failed-gate tools are restricted to the two fixed isolated reclaim contracts.
-# No product packaging, installation, release or endpoint access.
+# No product packaging, release or endpoint access. A manual opt-in diagnosis
+# may create one disposable ARM64 SCM service from an unshipped diagnostic build.
 name: Evidence retention native comparison
 
 on:
   workflow_dispatch:
+    inputs:
+      diagnose_service_stop:
+        description: 'Run one isolated ARM64 Service stop diagnosis; no release or endpoint'
+        type: boolean
+        required: false
+        default: false
   push:
     paths:
       - tests/evidence_retention_comparison.c
@@ -352,6 +359,78 @@ jobs:
             contract-build/tests/pipeline-stop-source-closure-*.txt
       # The earlier passed-tools artifact covers only contracts + sliced gates.
       # These opt-in profiles independently gate this whole workflow; no retry.
+      - name: Build the unshipped real Service diagnostic Agent
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_service_stop && matrix.arch == 'arm64' }}
+        id: service-stop-build
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $parseTokens = $null; $parseErrors = $null
+          $null = [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/diagnose_service_once.ps1'), [ref]$parseTokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) {
+            foreach ($parseError in @($parseErrors | Select-Object -First 8)) {
+              @{line=$parseError.Extent.StartLineNumber; column=$parseError.Extent.StartColumnNumber; error_id=$parseError.ErrorId} | ConvertTo-Json -Compress
+            }
+            throw 'Isolated SCM diagnostic script parse failed'
+          }
+          $serviceDriver = Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/diagnose_service_once.ps1'
+          $serviceDriverSha = (Get-FileHash -LiteralPath $serviceDriver -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ./tests/pipeline_stop_diag/test_prepared_service_contracts.ps1 -DriverSource $serviceDriver -DriverSha256 $serviceDriverSha
+          if (-not $?) { throw 'Pure Service diagnostic projection contract failed before any SCM operation' }
+          python -B tests/pipeline_stop_diag/test_collect_service_diagnostic.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Selected SCM metadata boundary regression failed' }
+          python -B tests/pipeline_stop_diag/test_stage_ci_agent.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'Bounded dependency failure projection regression failed' }
+          cmake --build contract-build --config Release --target test_service_stop_agent --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Unshipped real Service diagnostic Agent failed to build' }
+      - name: Run one bounded isolated ARM64 Service diagnosis
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_service_stop && matrix.arch == 'arm64' }}
+        id: service-stop
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          $token = [Guid]::NewGuid().ToString('N')
+          "token=$token" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $agent = Join-Path $env:GITHUB_WORKSPACE 'contract-build/tests/service-stop-agent/FDSensor.exe'
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $redistArch = Join-Path $env:VCToolsRedistDir '${{ matrix.msvc_arch }}'
+          $redist = @(Get-ChildItem -LiteralPath $redistArch -Directory -Filter 'Microsoft.VC*.CRT')
+          if ($redist.Count -ne 1) { throw 'One architecture-specific compiler CRT owner required' }
+          $driver = Join-Path $env:GITHUB_WORKSPACE 'tests/cache-recovery/windows_cache_recovery_ci.ps1'
+          $stager = Join-Path $env:GITHUB_WORKSPACE 'scripts/stage_retention_native_tools.py'
+          $adapter = Join-Path $env:GITHUB_WORKSPACE 'tests/pipeline_stop_diag/stage_ci_agent.py'
+          $template = Join-Path $env:GITHUB_WORKSPACE 'config/agent_windows_production.example.toml'
+          $nativeManifest = Join-Path $env:RUNNER_TEMP 'evidence-native-tools/manifest.json'
+          function Pin([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          & ./tests/pipeline_stop_diag/diagnose_service_once.ps1 -Token $token -SourceSha $env:GITHUB_SHA -Architecture '${{ matrix.arch }}' `
+            -AgentPath $agent -AgentSha256 (Pin $agent) -DllRoots @((Join-Path $prefix 'bin'), $redist[0].FullName) `
+            -DumpbinPath (Get-Command dumpbin.exe -ErrorAction Stop).Source -PythonPath (Get-Command python.exe -ErrorAction Stop).Source `
+            -QADriverSha256 (Pin $driver) -NativeStagerSha256 (Pin $stager) -StageAdapterSha256 (Pin $adapter) `
+            -NativeToolManifestPath $nativeManifest -NativeToolManifestSha256 (Pin $nativeManifest) `
+            -ConfigTemplatePath $template -ConfigTemplateSha256 (Pin $template)
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Service stop failed or is unknown; preserve the original result' }
+      - name: Select bounded Service metadata without Agent logs or databases
+        if: ${{ always() && matrix.arch == 'arm64' && steps.service-stop.outputs.token != '' }}
+        id: service-stop-metadata
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          $token = '${{ steps.service-stop.outputs.token }}'
+          python -B tests/pipeline_stop_diag/collect_service_diagnostic.py `
+            --case "$env:RUNNER_TEMP/edr-ci-service-$token" --output "$env:RUNNER_TEMP/service-stop-qa-$token" `
+            --source $env:GITHUB_SHA --token $token
+          if ($LASTEXITCODE -ne 0) { throw 'Selected SCM metadata collection failed; no raw Agent logs may be substituted' }
+      - name: Preserve only selected Service diagnostic metadata and source proof
+        if: ${{ always() && matrix.arch == 'arm64' && (steps.service-stop-build.outcome == 'success' || steps.service-stop-build.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-service-stop-arm64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/service-stop-qa-${{ steps.service-stop.outputs.token }}/*.json
+            contract-build/tests/service-stop-generated/SERVICE-SOURCE-TRANSFORM-v1.json
+            contract-build/tests/service-stop-source-closure-*.txt
       - name: Run native critical reserve load profiles
         id: critical-load
         timeout-minutes: 8
