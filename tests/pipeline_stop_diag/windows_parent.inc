@@ -87,7 +87,7 @@ fail:
   free(clean); return NULL;
 }
 
-static int diag_windows_supervise_case(const char *profile, ULONGLONG started) {
+static int diag_windows_supervise_case(const char *profile, ULONGLONG started, unsigned input_slots) {
   const wchar_t *wide_profile = !strcmp(profile, "ready") ? L"ready" : L"missing";
   const ULONGLONG work_until = started + 85000u, final_until = started + 90000u;
   HANDLE job = NULL, output = INVALID_HANDLE_VALUE, error = INVALID_HANDLE_VALUE;
@@ -107,14 +107,14 @@ static int diag_windows_supervise_case(const char *profile, ULONGLONG started) {
   if (!n || n >= 4096u) goto finish;
   n = GetCurrentDirectoryW(4096u, work);
   if (!n || n + 40u >= 4096u) goto finish;
-  wcscat(work, L"\\pipeline-stop-16-"); wcscat(work, wide_profile);
+  { wchar_t suffix[64]; swprintf(suffix, 64u, L"\\pipeline-stop-%u-%ls", input_slots, wide_profile); wcscat(work, suffix); }
   cause = "fresh_fixture";
   if (!CreateDirectoryW(work, NULL)) goto finish;
   if (wcslen(work) + 20u >= 4096u) goto finish;
   swprintf(out, 4096u, L"%ls\\worker.stdout.log", work);
   swprintf(err, 4096u, L"%ls\\worker.stderr.log", work);
   if (wcslen(executable) + 32u >= 4096u) goto finish;
-  swprintf(command, 4096u, L"\"%ls\" --worker16-%ls", executable, wide_profile);
+  swprintf(command, 4096u, L"\"%ls\" --worker%u-%ls", executable, input_slots, wide_profile);
   environment = diag_clean_environment(work);
   if (!environment) goto finish;
   SECURITY_ATTRIBUTES sa = { (DWORD)sizeof(sa), NULL, TRUE };
@@ -240,8 +240,16 @@ static int diag_windows_supervise(void) {
   ULONGLONG started = GetTickCount64();
   /* Two distinct inputs, each launched at most once; the second never resets
    * the shared work/cleanup clocks or the combined file/log allowances. */
-  int code = diag_windows_supervise_case("ready", started);
+  int code = diag_windows_supervise_case("ready", started, 16u);
   if (code) return code;
-  return diag_windows_supervise_case("missing", started);
+  return diag_windows_supervise_case("missing", started, 16u);
+}
+static int diag_windows_supervise_backlog(unsigned input_slots) {
+  if (input_slots != 128u && input_slots != 1024u && input_slots != 8192u) return 2;
+  ULONGLONG started = GetTickCount64();
+  /* One explicit backlog selection; both IR cases share the original 85+5s. */
+  int code = diag_windows_supervise_case("ready", started, input_slots);
+  if (code) return code;
+  return diag_windows_supervise_case("missing", started, input_slots);
 }
 #endif

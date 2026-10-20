@@ -13,6 +13,11 @@ on:
         type: boolean
         required: false
         default: false
+      diagnose_pipeline_backlog:
+        description: 'Run bounded ARM64 library backlog profiles; no Service, release or endpoint'
+        type: boolean
+        required: false
+        default: false
   push:
     paths:
       - tests/evidence_retention_comparison.c
@@ -441,6 +446,39 @@ jobs:
             contract-build/tests/service-stop-generated/SERVICE-SOURCE-TRANSFORM-v2.json
             contract-build/tests/service-stop-generated/SERVICE-CACHE-SOURCE-TRANSFORM-v2.json
             contract-build/tests/service-stop-source-closure-*.txt
+      # Separate opt-in library backlog profiles. The original default16 and
+      # SCM measurements above retain their own outcomes and time boundaries.
+      - name: Run three bounded pipeline backlog profiles
+        id: pipeline-stop-backlog
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.diagnose_pipeline_backlog && matrix.arch == 'arm64' && steps.contracts.outcome == 'success' && steps.sliced.outcome == 'success' && steps.pipeline-stop-diag.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          $env:PATH = (Join-Path $prefix 'bin') + ';' + $env:PATH
+          python -B tests/pipeline_stop_diag/run_bounded_backlog_profiles.py `
+            --repo "$env:GITHUB_WORKSPACE" --case "$env:RUNNER_TEMP/preprocess-stop-backlog-profiles" `
+            --arch '${{ matrix.arch }}' --source-sha $env:GITHUB_SHA `
+            --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT
+          if ($LASTEXITCODE -ne 0) { throw 'Bounded backlog profile failed or was not started; first failure and unstarted profiles are retained' }
+      - name: Preserve only bounded backlog profile receipts and source proof
+        if: ${{ always() && (steps.pipeline-stop-backlog.outcome == 'success' || steps.pipeline-stop-backlog.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: preprocess-stop-backlog-arm64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/intent.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/receipt.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/source-transform-v2.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/source-closure-Release.txt
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-128/intent.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-128/receipt.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-1024/intent.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-1024/receipt.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-8192/intent.json
+            ${{ runner.temp }}/preprocess-stop-backlog-profiles/backlog-8192/receipt.json
       - name: Run native critical reserve load profiles
         id: critical-load
         timeout-minutes: 8

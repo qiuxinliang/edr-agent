@@ -15,6 +15,16 @@
 #endif
 static unsigned diag_external_actions;
 static int diag_missing_ir;
+static unsigned diag_input_slots=16u;
+#ifdef _WIN32
+static const struct { unsigned slots; const char *parent_arg,*ready_arg,*missing_arg; } diag_backlog_profiles[] = {
+ {128u,"--backlog128","--worker128-ready","--worker128-missing"},
+ {1024u,"--backlog1024","--worker1024-ready","--worker1024-missing"},
+ {8192u,"--backlog8192","--worker8192-ready","--worker8192-missing"}
+};
+typedef struct { uint64_t kernel_100ns,user_100ns; DWORD error; int known; } DiagThreadCpu;
+static DiagThreadCpu diag_backlog_thread_cpu(void){int prior_errno=errno;DWORD prior_error=GetLastError();DiagThreadCpu value={0};FILETIME created,exited,kernel,user;value.known=GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user)!=0;if(value.known){value.kernel_100ns=((uint64_t)kernel.dwHighDateTime<<32u)|kernel.dwLowDateTime;value.user_100ns=((uint64_t)user.dwHighDateTime<<32u)|user.dwLowDateTime;}else value.error=GetLastError();SetLastError(prior_error);errno=prior_errno;return value;}
+#endif
 static void diag_deny_action(const EdrBehaviorRecord *r,EdrPolicyEnforcementResult *e){(void)r;diag_external_actions++;e->attempted=0;e->succeeded=0;snprintf(e->action,sizeof(e->action),"diagnostic_denied");}
 static void diag_hex(const void *v,size_t n,char out[65]){EdrSha256Ctx h;uint8_t raw[32];edr_sha256_init(&h);edr_sha256_update(&h,v,n);edr_sha256_final(&h,raw);for(unsigned i=0;i<32;i++)snprintf(out+2*i,3,"%02x",raw[i]);}
 static void diag_set_env(const char *k,const char *v){
@@ -32,10 +42,12 @@ static int diag_worker16(void){
  if(diag_missing_ir){assert(fopen("absent-rule.enc","rb")==NULL);diag_set_env("EDR_P0_IR_PATH","absent-rule.enc");}else diag_copy_public_rule();diag_set_env("EDR_P0_DIRECT_EMIT","1");diag_set_env("EDR_P0_MAX_EMITS_PER_MIN","2000");diag_set_env("EDR_AUTO_RECOMMENDED_FORENSICS","0");
  edr_p0_rule_ir_lazy_init();int ir_ready=edr_p0_rule_ir_is_ready();assert(ir_ready==!diag_missing_ir);edr_p0_rule_register_projection_authority();
  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);sqlite3_vfs v=*retention_bench_vfs_parent;v.zName="pipeline-private-real-io";v.pNext=NULL;v.szOsFile+=(int)sizeof(RetentionBenchFile);v.xOpen=retention_bench_open;assert(sqlite3_vfs_register(&v,1)==SQLITE_OK);
- assert(edr_local_evidence_cache_open_with_policy("evidence.db",16u,1u,1u)==0);edr_storage_queue_configure(16u,72u);assert(edr_storage_queue_open("queue.db")==EDR_OK);
+ const unsigned diag_budget_mb=diag_input_slots==16u?16u:512u;
+ assert(edr_local_evidence_cache_open_with_policy("evidence.db",diag_budget_mb,1u,1u)==0);edr_storage_queue_configure(diag_budget_mb,72u);assert(edr_storage_queue_open("queue.db")==EDR_OK);
  EdrConfig *cfg=calloc(1,sizeof(*cfg));assert(cfg);edr_config_apply_defaults(cfg);strcpy(cfg->agent.endpoint_id,"diag-public-endpoint");strcpy(cfg->agent.tenant_id,"diag-public-tenant");cfg->policy_v2.script_mode=EDR_POLICY_MODE_ALERT;edr_policy_v2_configure(cfg);edr_policy_enforcement_test_set_execute_hook(diag_deny_action);
  sync_agent_ids_from_cfg(cfg);edr_dedup_configure(1u,1000u);edr_dedup_init();edr_emit_rules_configure(cfg);edr_pt_cache_init();edr_process_coalescer_reset();assert(edr_process_evidence_worker_start());assert(edr_event_batch_init(1024u*1024u,100u,30)==EDR_OK);
- EdrEventBus *bus=edr_event_bus_create(32u);assert(bus);s_bus=bus;
+ const unsigned diag_bus_slots=diag_input_slots==16u?32u:diag_input_slots;
+ EdrEventBus *bus=edr_event_bus_create(diag_bus_slots);assert(bus);s_bus=bus;
  uint32_t pid=424242u,ppid=4u;uint64_t key=1000001u,ft=UINT64_C(116444736000000000)+EDR_DIAG_PUBLIC_UNIX_NS/100u;char image[4096]="C:\\PublicFixture\\diag-child.exe";
 #ifdef _WIN32
  EdrLiveProcessGeneration live;char reason[96];HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,GetCurrentProcessId());assert(process && process!=INVALID_HANDLE_VALUE);assert(edr_process_generation_query_live(process,&live,reason,sizeof(reason)));pid=live.pid;key=live.process_start_key;ft=live.creation_filetime_100ns;uint8_t state=0;assert(edr_process_parent_pid_query_live(process,&live,&ppid,&state,reason,sizeof(reason)));assert(edr_windows_process_image_path_utf8(process,image,sizeof(image)));assert(CloseHandle(process));
@@ -49,7 +61,7 @@ static int diag_worker16(void){
 FILETIME observed_ft;GetSystemTimeAsFileTime(&observed_ft);observed_now=((((uint64_t)observed_ft.dwHighDateTime<<32u)|observed_ft.dwLowDateTime)-UINT64_C(116444736000000000))*100u;
 #endif
 EdrSha256Ctx offered;edr_sha256_init(&offered);
- for(unsigned i=0;i<16u;i++){EdrEventSlot slot={0};slot.type=(i%4u)==0u?EDR_EVENT_PROCESS_CREATE:(i%4u)==1u?EDR_EVENT_NET_CONNECT:(i%4u)==2u?EDR_EVENT_FILE_WRITE:EDR_EVENT_FILE_READ;slot.priority=3u;slot.p0_critical=1u;slot.timestamp_ns=(slot.type==EDR_EVENT_PROCESS_CREATE?birth:observed_now)+i;int n=snprintf((char*)slot.data,sizeof(slot.data),"ETW1\nprov=%s\npid=%u\nppid=%u\nimg=%s\nprocess_start_key=%llu\nprocess_creation_filetime_100ns=%llu\ndst=192.0.2.1\ndport=443\nfile=C:\\PublicFixture\\ordinary.txt\nfile_key=1\n",(slot.type==EDR_EVENT_FILE_READ||slot.type==EDR_EVENT_FILE_WRITE)?"kfile":slot.type==EDR_EVENT_NET_CONNECT?"tcpip":"kproc",pid,ppid,image,(unsigned long long)key,(unsigned long long)ft);assert(n>0&&(size_t)n<sizeof(slot.data));slot.size=(uint32_t)n;edr_sha256_update(&offered,(const uint8_t*)&slot,sizeof(slot));assert(edr_event_bus_try_push(bus,&slot));}
+ for(unsigned i=0;i<diag_input_slots;i++){EdrEventSlot slot={0};slot.type=(i%4u)==0u?EDR_EVENT_PROCESS_CREATE:(i%4u)==1u?EDR_EVENT_NET_CONNECT:(i%4u)==2u?EDR_EVENT_FILE_WRITE:EDR_EVENT_FILE_READ;slot.priority=3u;slot.p0_critical=1u;slot.timestamp_ns=(slot.type==EDR_EVENT_PROCESS_CREATE?birth:observed_now)+i;int n=snprintf((char*)slot.data,sizeof(slot.data),"ETW1\nprov=%s\npid=%u\nppid=%u\nimg=%s\nprocess_start_key=%llu\nprocess_creation_filetime_100ns=%llu\ndst=192.0.2.1\ndport=443\nfile=C:\\PublicFixture\\ordinary.txt\nfile_key=1\n",(slot.type==EDR_EVENT_FILE_READ||slot.type==EDR_EVENT_FILE_WRITE)?"kfile":slot.type==EDR_EVENT_NET_CONNECT?"tcpip":"kproc",pid,ppid,image,(unsigned long long)key,(unsigned long long)ft);assert(n>0&&(size_t)n<sizeof(slot.data));slot.size=(uint32_t)n;edr_sha256_update(&offered,(const uint8_t*)&slot,sizeof(slot));assert(edr_event_bus_try_push(bus,&slot));}
  /* One true local-v3 source-only durable owner, separately timed before drain. */
  EdrBehaviorRecord *seed=calloc(1,sizeof(*seed));assert(seed);edr_behavior_record_init(seed);seed->type=EDR_EVENT_PROCESS_CREATE;seed->pid=pid;seed->ppid=ppid;seed->priority=0;seed->process_start_key=key;seed->process_creation_filetime_100ns=ft;seed->event_time_ns=(int64_t)birth;strcpy(seed->event_id,"diag-public-necessary-source");strcpy(seed->endpoint_id,cfg->agent.endpoint_id);strcpy(seed->tenant_id,cfg->agent.tenant_id);strcpy(seed->process_name,"diag-public.exe");strcpy(seed->exe_path,image);
  p0_mark_not_evaluable(seed,"process_generation_or_correlation_unavailable");
@@ -58,19 +70,28 @@ EdrSha256Ctx offered;edr_sha256_init(&offered);
  memset(diag_metrics,0,sizeof(diag_metrics));
  uint8_t offered_sha_raw[32];char offered_sha[65];edr_sha256_final(&offered,offered_sha_raw);for(unsigned j=0;j<32u;j++)snprintf(offered_sha+2*j,3,"%02x",offered_sha_raw[j]);
  char owner_ids[16][256],owner_hashes[16][65];unsigned owner_count=0;diag_queue_owners(owner_ids,owner_hashes,&owner_count,0);assert(owner_count>0);
+ EdrP0EmitMetrics diag_p0_before={0};
+ if(diag_input_slots!=16u){edr_p0_rule_get_emit_metrics(&diag_p0_before);printf("{\"kind\":\"pipeline_diag_backlog_input\",\"slots\":%u,\"bus_capacity_slots\":%u,\"slot_size_bytes\":%llu,\"bus_payload_array_bytes\":%llu,\"cache_budget_mb\":%u,\"queue_budget_mb\":%u,\"mixed_type_count_each\":%u,\"input_sha256\":\"%s\",\"all_input_dispositions_verified\":false}\n",diag_input_slots,diag_bus_slots,(unsigned long long)sizeof(EdrEventSlot),(unsigned long long)diag_bus_slots*sizeof(EdrEventSlot),diag_budget_mb,diag_budget_mb,diag_input_slots/4u,offered_sha);}
  assert(fflush(stdout)==0);
+#ifdef _WIN32
+ DiagThreadCpu diag_cpu_before={0};if(diag_input_slots!=16u)diag_cpu_before=diag_backlog_thread_cpu();
+#endif
  uint64_t read0=retention_bench_reads,write0=retention_bench_writes,sync0=retention_bench_syncs;uint64_t started=edr_monotonic_ns();atomic_store(&s_stop_preprocess,1);atomic_store(&s_preprocess_exited,0);diag_enabled=1;
 #ifdef _WIN32
  assert(preprocess_main(NULL)==0);
 #else
  assert(preprocess_main(NULL)==NULL);
 #endif
- diag_enabled=0;uint64_t elapsed=edr_monotonic_ns()-started;assert(!diag_depth && atomic_load(&s_preprocess_exited));
+ diag_enabled=0;uint64_t elapsed=edr_monotonic_ns()-started;
+#ifdef _WIN32
+ if(diag_input_slots!=16u){DiagThreadCpu after=diag_backlog_thread_cpu();int regressed=diag_cpu_before.known && after.known && (after.kernel_100ns<diag_cpu_before.kernel_100ns || after.user_100ns<diag_cpu_before.user_100ns);int known=diag_cpu_before.known && after.known && !regressed;char kernel[32]="null",user[32]="null";if(known){snprintf(kernel,sizeof(kernel),"%llu",(unsigned long long)(after.kernel_100ns-diag_cpu_before.kernel_100ns));snprintf(user,sizeof(user),"%llu",(unsigned long long)(after.user_100ns-diag_cpu_before.user_100ns));}printf("{\"kind\":\"pipeline_diag_backlog_cost\",\"slots\":%u,\"elapsed_ns\":%llu,\"vfs_read_bytes\":%llu,\"vfs_write_bytes\":%llu,\"vfs_syncs\":%llu,\"thread_cpu_known\":%s,\"thread_kernel_100ns\":%s,\"thread_user_100ns\":%s,\"thread_cpu_before_error\":%lu,\"thread_cpu_after_error\":%lu,\"cpu_counter_regressed\":%s,\"scope\":\"same_thread_preprocess_main\"}\n",diag_input_slots,(unsigned long long)elapsed,(unsigned long long)(retention_bench_reads-read0),(unsigned long long)(retention_bench_writes-write0),(unsigned long long)(retention_bench_syncs-sync0),known?"true":"false",kernel,user,(unsigned long)diag_cpu_before.error,(unsigned long)after.error,regressed?"true":"false");}
+#endif
+ assert(!diag_depth && atomic_load(&s_preprocess_exited));
 #ifdef _WIN32
  assert(diag_metrics[27].calls>0u && diag_metrics[28].calls>0u && diag_metrics[7].calls>0u && diag_metrics[8].calls>0u);
 #endif
-assert(edr_event_bus_used_approx(bus)==0u);assert(atomic_load(&s_worker_completed_slots)==16u);diag_queue_owners(owner_ids,owner_hashes,&owner_count,1);assert(!diag_external_actions);EdrStorageQueueCapacityMetrics metrics;edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.accounting_available);
- printf("{\"kind\":\"pipeline_diag_drain_end\",\"slots\":16,\"input_sha256\":\"%s\",\"stop_set_before_worker\":true,\"loop_returned\":true,\"completed_slots\":%llu,\"completed_loops\":%llu,\"elapsed_ns\":%llu,\"vfs_read_bytes\":%llu,\"vfs_write_bytes\":%llu,\"vfs_syncs\":%llu,\"necessary_source_owners_seeded\":%u,\"necessary_source_bytes_unchanged\":true,\"all_input_dispositions_verified\":false,\"source_ack_inferred\":false,\"real_ir_ready\":%s,\"real_sqlite\":true,\"process_evidence_worker_start_api_ok\":true,\"process_evidence_worker_windows_thread_started\":%s,\"actions_observed\":%u,\"network_transport_initialized\":false,\"ave_initialized\":false,\"incoming_slot_type_only\":true,\"timings_inclusive\":true,\"win_actor_branch_compiled\":%s}\n",offered_sha,(unsigned long long)atomic_load(&s_worker_completed_slots),(unsigned long long)atomic_load(&s_worker_completed_loops),(unsigned long long)elapsed,(unsigned long long)(retention_bench_reads-read0),(unsigned long long)(retention_bench_writes-write0),(unsigned long long)(retention_bench_syncs-sync0),owner_count,ir_ready?"true":"false",
+assert(edr_event_bus_used_approx(bus)==0u);assert(atomic_load(&s_worker_completed_slots)==diag_input_slots);diag_queue_owners(owner_ids,owner_hashes,&owner_count,1);assert(!diag_external_actions);EdrStorageQueueCapacityMetrics metrics;edr_storage_queue_get_capacity_metrics(&metrics);assert(metrics.accounting_available);
+ printf("{\"kind\":\"pipeline_diag_drain_end\",\"slots\":%u,\"input_sha256\":\"%s\",\"stop_set_before_worker\":true,\"loop_returned\":true,\"completed_slots\":%llu,\"completed_loops\":%llu,\"elapsed_ns\":%llu,\"vfs_read_bytes\":%llu,\"vfs_write_bytes\":%llu,\"vfs_syncs\":%llu,\"necessary_source_owners_seeded\":%u,\"necessary_source_bytes_unchanged\":true,\"all_input_dispositions_verified\":false,\"source_ack_inferred\":false,\"real_ir_ready\":%s,\"real_sqlite\":true,\"process_evidence_worker_start_api_ok\":true,\"process_evidence_worker_windows_thread_started\":%s,\"actions_observed\":%u,\"network_transport_initialized\":false,\"ave_initialized\":false,\"incoming_slot_type_only\":true,\"timings_inclusive\":true,\"win_actor_branch_compiled\":%s}\n",diag_input_slots,offered_sha,(unsigned long long)atomic_load(&s_worker_completed_slots),(unsigned long long)atomic_load(&s_worker_completed_loops),(unsigned long long)elapsed,(unsigned long long)(retention_bench_reads-read0),(unsigned long long)(retention_bench_writes-write0),(unsigned long long)(retention_bench_syncs-sync0),owner_count,ir_ready?"true":"false",
 #ifdef _WIN32
  "true",
 #else
@@ -84,6 +105,8 @@ assert(edr_event_bus_used_approx(bus)==0u);assert(atomic_load(&s_worker_complete
 #endif
  );
  for(unsigned i=1;i<39;i++)printf("{\"kind\":\"pipeline_diag_stage\",\"stage\":%u,\"calls\":%llu,\"inclusive_total_ns\":%llu,\"max_ns\":%llu}\n",i,(unsigned long long)diag_metrics[i].calls,(unsigned long long)diag_metrics[i].total_ns,(unsigned long long)diag_metrics[i].max_ns);
+ int diag_backlog_owner_unresolved=0;
+ if(diag_input_slots!=16u){EdrP0EmitMetrics p={0};edr_p0_rule_get_emit_metrics(&p);assert(p.source_only_backpressure_failed>=diag_p0_before.source_only_backpressure_failed && p.source_only_retry_capacity_exhausted>=diag_p0_before.source_only_retry_capacity_exhausted);diag_backlog_owner_unresolved=p.source_only_retry_pending!=0u || p.source_only_retry_capacity_exhausted>diag_p0_before.source_only_retry_capacity_exhausted || p.source_only_loss_detected || p.deferred_storage_failures>diag_p0_before.deferred_storage_failures || p.deferred_retry_degraded;printf("{\"kind\":\"pipeline_diag_backlog_source_state\",\"slots\":%u,\"source_only_retry_pending\":%llu,\"source_only_backpressure_failed_delta\":%llu,\"source_only_retry_capacity_exhausted_delta\":%llu,\"source_only_loss_detected\":%d,\"source_only_terminal_unhealthy\":%d,\"source_only_unhealthy_families\":%u,\"deferred_storage_failures\":%llu,\"deferred_retry_degraded\":%d,\"necessary_source_owners_seeded\":%u,\"necessary_source_bytes_unchanged\":true,\"all_input_dispositions_verified\":false,\"required_owner_unresolved\":%s}\n",diag_input_slots,(unsigned long long)p.source_only_retry_pending,(unsigned long long)(p.source_only_backpressure_failed-diag_p0_before.source_only_backpressure_failed),(unsigned long long)(p.source_only_retry_capacity_exhausted-diag_p0_before.source_only_retry_capacity_exhausted),p.source_only_loss_detected,p.source_only_terminal_unhealthy,(unsigned)p.source_only_unhealthy_families,(unsigned long long)p.deferred_storage_failures,p.deferred_retry_degraded,owner_count,diag_backlog_owner_unresolved?"true":"false");}
  assert(edr_event_batch_shutdown()==0);edr_process_evidence_worker_stop();
 #ifdef _WIN32
  EdrProcessEvidenceMetrics stopped_metrics={0};edr_process_evidence_worker_get_metrics(&stopped_metrics);
@@ -91,14 +114,16 @@ assert(edr_event_bus_used_approx(bus)==0u);assert(atomic_load(&s_worker_complete
  assert(fflush(stdout)==0);
  assert(!stopped_metrics.shutdown_timeouts && !stopped_metrics.terminal_unhealthy && !stopped_metrics.slots_used);
 #endif
- edr_local_evidence_cache_close();edr_storage_queue_close();edr_event_bus_destroy(bus);edr_pt_cache_shutdown();edr_p0_rule_ir_shutdown();free(cfg);assert(edr_monotonic_ns()-begun<UINT64_C(90000000000));puts("{\"kind\":\"pipeline_diag_worker_complete\",\"cleanup_returned\":true}");return 0;
+ edr_local_evidence_cache_close();edr_storage_queue_close();edr_event_bus_destroy(bus);edr_pt_cache_shutdown();edr_p0_rule_ir_shutdown();free(cfg);assert(edr_monotonic_ns()-begun<UINT64_C(90000000000));puts("{\"kind\":\"pipeline_diag_worker_complete\",\"cleanup_returned\":true}");return diag_backlog_owner_unresolved?91:0;
 }
 #ifdef _WIN32
 #include "windows_parent.inc"
 #endif
 int main(int argc,char **argv){
 #ifdef _WIN32
- if(argc==1)return diag_windows_supervise();if(argc==2&&!strcmp(argv[1],"--worker16-ready"))return diag_worker16();if(argc==2&&!strcmp(argv[1],"--worker16-missing")){diag_missing_ir=1;return diag_worker16();}return 2;
+ if(argc==1)return diag_windows_supervise();if(argc==2&&!strcmp(argv[1],"--worker16-ready"))return diag_worker16();if(argc==2&&!strcmp(argv[1],"--worker16-missing")){diag_missing_ir=1;return diag_worker16();}
+ if(argc==2){for(unsigned i=0;i<sizeof(diag_backlog_profiles)/sizeof(diag_backlog_profiles[0]);++i){if(!strcmp(argv[1],diag_backlog_profiles[i].parent_arg))return diag_windows_supervise_backlog(diag_backlog_profiles[i].slots);if(!strcmp(argv[1],diag_backlog_profiles[i].ready_arg)||!strcmp(argv[1],diag_backlog_profiles[i].missing_arg)){diag_input_slots=diag_backlog_profiles[i].slots;diag_missing_ir=!strcmp(argv[1],diag_backlog_profiles[i].missing_arg);return diag_worker16();}}}
+ return 2;
 #else
  if(argc==1)return diag_worker16();if(argc==2&&!strcmp(argv[1],"--ir-missing")){diag_missing_ir=1;return diag_worker16();}return 2;
 #endif
