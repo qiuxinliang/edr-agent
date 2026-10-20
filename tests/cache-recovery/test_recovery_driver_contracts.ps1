@@ -89,7 +89,8 @@ function Get-Item {
     if($script:metadataMode -ceq 'before_container'){$v.PSIsContainer=$true}
     if($script:metadataMode -ceq 'before_negative'){$v.Length=[long]-1}
     if($script:metadataMode -ceq 'before_reparse'){$v.Attributes=$v.Attributes -bor [IO.FileAttributes]::ReparsePoint}
-    if($script:metadataMode -ceq 'before_untyped_minus_one'){$v.Attributes=[IO.FileAttributes](-1)}
+    # Keep this untyped: PowerShell rejects an undefined enum cast before the reader runs.
+    if($script:metadataMode -ceq 'before_untyped_minus_one'){$v.Attributes=[int]-1}
   }
   if($script:metadataMode -ceq 'before_oversize' -and $script:metadataCalls -eq 1){$v.Length=1048577}
   if($script:metadataCalls -eq 2){
@@ -97,7 +98,7 @@ function Get-Item {
     if($script:metadataMode -ceq 'after_reparse'){$v.Attributes=$v.Attributes -bor [IO.FileAttributes]::ReparsePoint}
     if($script:metadataMode -ceq 'after_container'){$v.PSIsContainer=$true}
     if($script:metadataMode -ceq 'after_negative'){$v.Length=[long]-1}
-    if($script:metadataMode -ceq 'after_untyped_minus_one'){$v.Attributes=[IO.FileAttributes](-1)}
+    if($script:metadataMode -ceq 'after_untyped_minus_one'){$v.Attributes=[int]-1}
     if($script:metadataMode -ceq 'changed'){$v.LastWriteTimeUtc=$v.LastWriteTimeUtc.AddTicks(1)}
   }
   return $v
@@ -850,12 +851,52 @@ Start-Sleep -Milliseconds 300
     ReadStopLogSlice $ctx ([long]::MaxValue)
     $queueMaxBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n")
     Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_stop_queues' -and $queueMaxBytes.Length -lt 1048576) 'queue_max64_real_projection_within_collector_single_file_cap';CloseStopLogContext $ctx
+    $metadataSerializationProfiles=@()
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleMaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
-    Checked ($ctx.diagnostic.matches.Count -eq 64 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_samples_plus_max_queue_projection_inside_service_metadata_cap';CloseStopLogContext $ctx
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 2) 'join_v2_plus_max_queue_count64_and_version'
+    # Match the existing isolated Service SaveNew encoder, including its LF.
+    $metadataStandaloneBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 24 -Compress)+"`n")
+    Checked ($metadataStandaloneBytes.Length -le 131072) 'join_samples_plus_max_queue_projection_inside_service_metadata_cap'
+    # Exercise the already-loaded recovery Save owner and its real file output.
+    $metadataRecoveryText=($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n"
+    $metadataRecoveryBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataRecoveryText)
+    Save 'public-join-v2-max64-serialized.json' $ctx.diagnostic
+    $metadataSaved=Regular (Join-Path $script:root 'public-join-v2-max64-serialized.json') 1048576
+    $metadataSavedText=ReadBounded $metadataSaved 1048576
+    $metadataSavedBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataSavedText)
+    Checked ($metadataSavedText -ceq $metadataRecoveryText -and $metadataSavedBytes.Length -eq $metadataRecoveryBytes.Length -and $metadataSavedBytes.Length -le 1048576) 'join_v2_actual_recovery_save_inside_collector_file_cap'
+    $metadataSerializationProfiles+=,@{version=2;count=[int]$ctx.diagnostic.matches.Count;pretty_bytes=[int]$metadataRecoveryBytes.Length;compressed_bytes=[int]$metadataStandaloneBytes.Length;saved_bytes=[int]$metadataSavedBytes.Length}
+    CloseStopLogContext $ctx
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV3MaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
-    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 3 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_v3_plus_max_queue_inside_original_service_cap';CloseStopLogContext $ctx
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 3) 'join_v3_plus_max_queue_count64_and_version'
+    # Match the existing isolated Service SaveNew encoder, including its LF.
+    $metadataStandaloneBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 24 -Compress)+"`n")
+    Checked ($metadataStandaloneBytes.Length -le 131072) 'join_v3_plus_max_queue_inside_original_service_cap'
+    # Exercise the already-loaded recovery Save owner and its real file output.
+    $metadataRecoveryText=($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n"
+    $metadataRecoveryBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataRecoveryText)
+    Save 'public-join-v3-max64-serialized.json' $ctx.diagnostic
+    $metadataSaved=Regular (Join-Path $script:root 'public-join-v3-max64-serialized.json') 1048576
+    $metadataSavedText=ReadBounded $metadataSaved 1048576
+    $metadataSavedBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataSavedText)
+    Checked ($metadataSavedText -ceq $metadataRecoveryText -and $metadataSavedBytes.Length -eq $metadataRecoveryBytes.Length -and $metadataSavedBytes.Length -le 1048576) 'join_v3_actual_recovery_save_inside_collector_file_cap'
+    $metadataSerializationProfiles+=,@{version=3;count=[int]$ctx.diagnostic.matches.Count;pretty_bytes=[int]$metadataRecoveryBytes.Length;compressed_bytes=[int]$metadataStandaloneBytes.Length;saved_bytes=[int]$metadataSavedBytes.Length}
+    CloseStopLogContext $ctx
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinV4MaxLine+[char]10+(($queueMaxLine+[char]10)*63));ReadStopLogSlice $ctx 8
-    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 4 -and [Text.Encoding]::UTF8.GetByteCount(($ctx.diagnostic|ConvertTo-Json -Depth 16)) -lt 131072) 'join_v4_plus_max_queue_inside_original_service_cap';CloseStopLogContext $ctx
+    Checked ($ctx.diagnostic.matches.Count -eq 64 -and $ctx.diagnostic.matches[0].version -eq 4) 'join_v4_plus_max_queue_count64_and_version'
+    # Match the existing isolated Service SaveNew encoder, including its LF.
+    $metadataStandaloneBytes=[Text.UTF8Encoding]::new($false).GetBytes(($ctx.diagnostic|ConvertTo-Json -Depth 24 -Compress)+"`n")
+    Checked ($metadataStandaloneBytes.Length -le 131072) 'join_v4_plus_max_queue_inside_original_service_cap'
+    # Exercise the already-loaded recovery Save owner and its real file output.
+    $metadataRecoveryText=($ctx.diagnostic|ConvertTo-Json -Depth 16)+"`n"
+    $metadataRecoveryBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataRecoveryText)
+    Save 'public-join-v4-max64-serialized.json' $ctx.diagnostic
+    $metadataSaved=Regular (Join-Path $script:root 'public-join-v4-max64-serialized.json') 1048576
+    $metadataSavedText=ReadBounded $metadataSaved 1048576
+    $metadataSavedBytes=[Text.UTF8Encoding]::new($false).GetBytes($metadataSavedText)
+    Checked ($metadataSavedText -ceq $metadataRecoveryText -and $metadataSavedBytes.Length -eq $metadataRecoveryBytes.Length -and $metadataSavedBytes.Length -le 1048576) 'join_v4_actual_recovery_save_inside_collector_file_cap'
+    $metadataSerializationProfiles+=,@{version=4;count=[int]$ctx.diagnostic.matches.Count;pretty_bytes=[int]$metadataRecoveryBytes.Length;compressed_bytes=[int]$metadataStandaloneBytes.Length;saved_bytes=[int]$metadataSavedBytes.Length}
+    CloseStopLogContext $ctx
     $max=@{schema='edr.ci-selected-shutdown-log.v1';target=@{pid=4294967295;birth_filetime=('9'*20);exe_sha256=('f'*64);config_sha256=('f'*64)};matches=@()}
     for($i=0;$i -lt 64;$i++){$max.matches+=,@{kind='scm_stage_publication_failed';stage=28;error=[uint32]::MaxValue;read_started_elapsed_ms=60000}}
     Checked ([Text.Encoding]::UTF8.GetByteCount(($max|ConvertTo-Json -Depth 8 -Compress)) -lt 16384) 'log_fixed_max_matches_small_inside_summary_file_cap'
@@ -981,5 +1022,5 @@ with open(a.output,'x',encoding='utf-8') as f:json.dump(r,f)
     Checked ($snapshotCalls -eq $snapshotBefore) 'snapshot_invalid_native_argument_refused_before_child'
     $script:inspector=$snapshotGoodInspector
   }
-  Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false product_or_service_child_executed=false public_powershell_fixture_child_executed=true')
+  Write-Output ('driver_pure_contracts passed='+$count+' source_sha256='+$DriverSha256+' top_level_executed=false product_or_service_child_executed=false public_powershell_fixture_child_executed=true'+' serialization_v2_count='+$metadataSerializationProfiles[0].count+' serialization_v2_pretty_bytes='+$metadataSerializationProfiles[0].pretty_bytes+' serialization_v2_compressed_bytes='+$metadataSerializationProfiles[0].compressed_bytes+' serialization_v2_saved_bytes='+$metadataSerializationProfiles[0].saved_bytes+' serialization_v3_count='+$metadataSerializationProfiles[1].count+' serialization_v3_pretty_bytes='+$metadataSerializationProfiles[1].pretty_bytes+' serialization_v3_compressed_bytes='+$metadataSerializationProfiles[1].compressed_bytes+' serialization_v3_saved_bytes='+$metadataSerializationProfiles[1].saved_bytes+' serialization_v4_count='+$metadataSerializationProfiles[2].count+' serialization_v4_pretty_bytes='+$metadataSerializationProfiles[2].pretty_bytes+' serialization_v4_compressed_bytes='+$metadataSerializationProfiles[2].compressed_bytes+' serialization_v4_saved_bytes='+$metadataSerializationProfiles[2].saved_bytes)
 } finally {Remove-Item -LiteralPath $dir -Recurse -Force}
