@@ -13,6 +13,7 @@ M=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(M)
 P698_PRODUCT_PINS=('release_id','handler_receipt_sha256','binary_sha256','headless_sha256','artifact_manifest_sha256','preflight_response_sha256','p5_sha256','runtime_identity_sha256')
 P699_BINDING_PINS=('release_run', 'release_id', 'native_run', 'native_artifact_id', 'native_artifact_size', 'native_artifact_sha256', 'native_uncompressed_bytes', 'native_member_count', 'handler_receipt_sha256', 'binary_sha256', 'headless_sha256', 'artifact_manifest_sha256', 'preflight_response_sha256', 'p5_sha256', 'runtime_identity_sha256')
 P701_BINDING_PINS=P699_BINDING_PINS
+P702_BINDING_PINS=P699_BINDING_PINS
 class Contracts(unittest.TestCase):
     def test_closed_runtime_mode_requires_exact_strings_before_io(self):
         for mode in ('service','scheduled_task'):
@@ -238,6 +239,65 @@ class Contracts(unittest.TestCase):
         with tempfile.TemporaryDirectory()as d:
             catalog=Path(d)/'synthetic-parser-only701.json';catalog.write_text(json.dumps(value))
             with patch.object(M,'PROFILE_FILE',catalog):self.assertEqual(M.cohort('701')[0],c)
+
+
+    # 702 parser-only fixtures never supply a published receipt or run recovery.
+    def test_702_known_identity_and_catalog_capacity(self):
+        c,base,pin=M.cohort('702',False)
+        self.assertEqual((c['source'],c['version'],c['tag']),('ba634c7bf6a1851519931a95ce1df3a00309d871','3.2.702','win_3.2.702'))
+        self.assertEqual(c['builder_owner_sha256'],M.BUILDER_SHA)
+        self.assertEqual(c['handler_owner_sha256'],M.HANDLER_SHA)
+        self.assertEqual((c['release_run'],c['native_run'],c['native_artifact_id'],c['native_artifact_size']),('39437943738','39433049545','12272800727','1239085'))
+        self.assertEqual((c['native_artifact_sha256'],c['native_uncompressed_bytes'],c['native_member_count']),('a36c6658a396e12f2f4b29d718e6341f68191ea5b751f9641d9500eee476cb59','3089079','4'))
+        self.assertLessEqual(len(M.cohort_catalog_raw()),16384)
+        full=json.loads(M.cohort_catalog_raw());target=full['profiles']['702']
+        for key in P702_BINDING_PINS:
+            if target[key]=='UNBOUND':target[key]='f'*64 if key.endswith('_sha256')else '9'*20
+        self.assertLessEqual(len((json.dumps(full,indent=2)+'\n').encode()),16384)
+        # The same test remains valid after Root binds real published identities.
+        if any(c[k]=='UNBOUND' for k in P702_BINDING_PINS):
+            with self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):M.cohort('702')
+        else:self.assertEqual(M.cohort('702')[0],c)
+
+    def test_702_each_missing_pin_refuses_prepare_and_finalize_before_io(self):
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['702']
+        for k in P702_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d,patch.object(M,'gh',side_effect=AssertionError('no external'))as call:
+            root=Path(d)/'must-not-exist';catalog=Path(d)/'temporary-missing702.json'
+            for key in P702_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                with patch.object(M,'PROFILE_FILE',catalog):
+                    for mode in ('service','scheduled_task'):
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.prepare(Path(d),root,'UNBOUND','UNBOUND','0','UNBOUND','702',mode)
+                        with self.subTest(pin=key,mode=mode),self.assertRaisesRegex(ValueError,'cohort_UNBOUND'):
+                            M.finalize(Path(d),root,'702',mode)
+                fixture[key]=original
+            self.assertFalse(root.exists());self.assertEqual(call.call_count,0)
+
+    def test_702_cli_refuses_each_missing_pin_normal_and_optimized(self):
+        import subprocess
+        value=json.loads(M.cohort_catalog_raw());fixture=value['profiles']['702']
+        for k in P702_BINDING_PINS:fixture[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            script=Path(d)/'prepare_disposable_695.py';script.write_bytes(Path(__file__).with_name(script.name).read_bytes())
+            catalog=script.with_name('recovery_cohorts.json')
+            for key in P702_BINDING_PINS:
+                original=fixture[key];fixture[key]='UNBOUND';catalog.write_text(json.dumps(value))
+                for flags in ([],['-O']):
+                    for selection in (['--cohort','702'],['--target-tag','win_3.2.702']):
+                        with self.subTest(pin=key,flags=flags,selection=selection):
+                            r=subprocess.run([sys.executable,'-I','-B',*flags,str(script),'profile',*selection],capture_output=True,timeout=3)
+                            self.assertNotEqual(r.returncode,0);self.assertEqual(r.stdout,b'')
+                            self.assertEqual(r.stderr.decode('utf-8','strict').splitlines(),['disposable_preparation_failed:recovery_cohort_UNBOUND'])
+                fixture[key]=original
+
+    def test_702_parser_only_bound_routing_is_separate_from_actual_proof(self):
+        value=json.loads(M.cohort_catalog_raw());c=value['profiles']['702']
+        for k in P702_BINDING_PINS:c[k]='1'*64 if k.endswith('_sha256')else '1'
+        with tempfile.TemporaryDirectory()as d:
+            catalog=Path(d)/'synthetic-parser-only702.json';catalog.write_text(json.dumps(value))
+            with patch.object(M,'PROFILE_FILE',catalog):self.assertEqual(M.cohort('702')[0],c)
 
 
     def test_unknown_cohort_never_falls_back(self):

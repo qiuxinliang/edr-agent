@@ -1,10 +1,10 @@
-# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 recovery cohorts
+# Disposable exact 692 → 695 / 697 / 698 / 699 / 701 / 702 recovery cohorts
 
 The existing `prepare_disposable_695.py` filename remains the compatibility entry
 point. Its default remains cohort 695. `recovery_cohorts.json` is the single QA
 pin owner shared by preparation, the manual workflow selector, the original Go
 file-list exporter, and the bounded raw-evidence collector. Only the literal
-695, 697, 698, 699 and 701 selectors exist; there is no caller source/run/asset URL override.
+695, 697, 698, 699, 701 and 702 selectors exist; there is no caller source/run/asset URL override.
 The Go overlay embeds the same JSON bytes copied into its existing source-owner
 directory; this adds no product dependency or runtime component.
 
@@ -61,6 +61,30 @@ SHA-256. This is local original-handler and builder verification; the receipt
 explicitly records `authenticated_platform_http=false`. It writes no live
 catalog or endpoint task and does not execute the Agent or installer. The
 catalog now contains all eight actual release/product/handler/P5 pins.
+
+Cohort 702 binds published Headless product source
+`ba634c7bf6a1851519931a95ce1df3a00309d871`, version `3.2.702`, release
+`418485270`, run `39437943738/1`. Native run `39433049545/1` passed;
+its verified ARM64 tool artifact `12272800727` is 1,239,085 ZIP bytes and
+3,089,079 expanded bytes across four members. These tools are separate from
+the product Headless payload. The original staging owner verified the actual
+ARM64 product/runtime identity; no Setup UI asset was downloaded.
+
+All15 external binding pins now come from actual release/native metadata,
+complete downloaded/staged bytes, the original-handler receipt and independent
+original-builder export. The in-process original handler accepted these exact
+bytes and returned P5 SHA
+`4b868e6e3edd02c4f7e32e7d795b30399dc1cfcdc28620ebdb87147d5e7d85b7`;
+the original stdlib builder separately exported a 7,269,562-byte ZIP with that
+same hash. Its existing transport entries `FDSecuritySetup.exe` and
+`setup-ui-manifest.json` come from the Headless input; they are not a downloaded
+Setup UI package. The receipt records `authenticated_platform_http=false` and
+unsigned-integrity policy; this does not assert product signing, authenticated
+live HTTP, import, installation, actual three-transition recovery or real UTM
+acceptance. The five historical cohorts, original handler96b52/builder695c9,
+default695,16KiB catalog bound, Service/Task matrix and45/30/900 bounds remain.
+Missing-pin negatives inject each UNBOUND field into temporary catalogs so
+they remain valid after actual binding; parser fixtures are not product proof.
 
 Service and Scheduled Task recovery are still separate required runtime
 checks. Published inputs and matching P5 bytes do not prove either mode has
