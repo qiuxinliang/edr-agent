@@ -306,6 +306,9 @@ jobs:
                   drain=[record for record in records if record.get('kind')=='pipeline_diag_drain_end']
                   complete=[record for record in records if record.get('kind')=='pipeline_diag_worker_complete']
                   stages=[record for record in records if record.get('kind')=='pipeline_diag_stage']
+                  evidence_stop=[record for record in records if record.get('kind')=='pipeline_diag_evidence_stop']
+                  need(len(evidence_stop)==1 and all(type(evidence_stop[0].get(key)) is int and evidence_stop[0][key]==0
+                       for key in ('shutdown_timeouts','terminal_unhealthy','slots_used')), 'evidence_worker_stop_unknown_or_unhealthy')
                   need(len(drain)==len(complete)==1 and complete[0].get('cleanup_returned') is True, 'worker_complete')
                   d=drain[0]
                   need(d.get('slots')==16 and d.get('completed_slots')==16 and d.get('real_ir_ready') is (profile=='ready')

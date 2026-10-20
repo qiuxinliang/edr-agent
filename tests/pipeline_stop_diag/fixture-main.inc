@@ -38,7 +38,7 @@ static int diag_worker16(void){
  EdrEventBus *bus=edr_event_bus_create(32u);assert(bus);s_bus=bus;
  uint32_t pid=424242u,ppid=4u;uint64_t key=1000001u,ft=UINT64_C(116444736000000000)+EDR_DIAG_PUBLIC_UNIX_NS/100u;char image[4096]="C:\\PublicFixture\\diag-child.exe";
 #ifdef _WIN32
- EdrLiveProcessGeneration live;char reason[96];HANDLE process=GetCurrentProcess();assert(edr_process_generation_query_live(process,&live,reason,sizeof(reason)));pid=live.pid;key=live.process_start_key;ft=live.creation_filetime_100ns;uint8_t state=0;assert(edr_process_parent_pid_query_live(process,&live,&ppid,&state,reason,sizeof(reason)));assert(edr_windows_process_image_path_utf8(process,image,sizeof(image)));
+ EdrLiveProcessGeneration live;char reason[96];HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,GetCurrentProcessId());assert(process && process!=INVALID_HANDLE_VALUE);assert(edr_process_generation_query_live(process,&live,reason,sizeof(reason)));pid=live.pid;key=live.process_start_key;ft=live.creation_filetime_100ns;uint8_t state=0;assert(edr_process_parent_pid_query_live(process,&live,&ppid,&state,reason,sizeof(reason)));assert(edr_windows_process_image_path_utf8(process,image,sizeof(image)));assert(CloseHandle(process));
  EdrProcessEvidence initial_evidence;diag_enabled=1;int cold_ready=DIAG_INT(33,edr_process_evidence_request(image,key,edr_monotonic_ns(),&initial_evidence));diag_enabled=0;
  unsigned cold_reason=cold_ready?2u:!strcmp(initial_evidence.hash_reason,"queued")?1u:!strcmp(initial_evidence.hash_reason,"identity_revalidation_pending")?3u:0u;
  printf("{\"kind\":\"pipeline_diag_cold_request\",\"calls\":%llu,\"request_sync_ns\":%llu,\"ready\":%d,\"reason_enum\":%u,\"scope\":\"separate_component_first_request_not_loop\",\"async_hash_signature_timed\":false}\n",(unsigned long long)diag_metrics[33].calls,(unsigned long long)diag_metrics[33].total_ns,cold_ready,cold_reason);
@@ -58,6 +58,7 @@ EdrSha256Ctx offered;edr_sha256_init(&offered);
  memset(diag_metrics,0,sizeof(diag_metrics));
  uint8_t offered_sha_raw[32];char offered_sha[65];edr_sha256_final(&offered,offered_sha_raw);for(unsigned j=0;j<32u;j++)snprintf(offered_sha+2*j,3,"%02x",offered_sha_raw[j]);
  char owner_ids[16][256],owner_hashes[16][65];unsigned owner_count=0;diag_queue_owners(owner_ids,owner_hashes,&owner_count,0);assert(owner_count>0);
+ assert(fflush(stdout)==0);
  uint64_t read0=retention_bench_reads,write0=retention_bench_writes,sync0=retention_bench_syncs;uint64_t started=edr_monotonic_ns();atomic_store(&s_stop_preprocess,1);atomic_store(&s_preprocess_exited,0);diag_enabled=1;
 #ifdef _WIN32
  assert(preprocess_main(NULL)==0);
@@ -83,7 +84,14 @@ assert(edr_event_bus_used_approx(bus)==0u);assert(atomic_load(&s_worker_complete
 #endif
  );
  for(unsigned i=1;i<39;i++)printf("{\"kind\":\"pipeline_diag_stage\",\"stage\":%u,\"calls\":%llu,\"inclusive_total_ns\":%llu,\"max_ns\":%llu}\n",i,(unsigned long long)diag_metrics[i].calls,(unsigned long long)diag_metrics[i].total_ns,(unsigned long long)diag_metrics[i].max_ns);
- assert(edr_event_batch_shutdown()==0);edr_process_evidence_worker_stop();edr_local_evidence_cache_close();edr_storage_queue_close();edr_event_bus_destroy(bus);edr_pt_cache_shutdown();edr_p0_rule_ir_shutdown();free(cfg);assert(edr_monotonic_ns()-begun<UINT64_C(90000000000));puts("{\"kind\":\"pipeline_diag_worker_complete\",\"cleanup_returned\":true}");return 0;
+ assert(edr_event_batch_shutdown()==0);edr_process_evidence_worker_stop();
+#ifdef _WIN32
+ EdrProcessEvidenceMetrics stopped_metrics={0};edr_process_evidence_worker_get_metrics(&stopped_metrics);
+ printf("{\"kind\":\"pipeline_diag_evidence_stop\",\"shutdown_timeouts\":%llu,\"terminal_unhealthy\":%u,\"slots_used\":%u}\n",(unsigned long long)stopped_metrics.shutdown_timeouts,(unsigned)stopped_metrics.terminal_unhealthy,(unsigned)stopped_metrics.slots_used);
+ assert(fflush(stdout)==0);
+ assert(!stopped_metrics.shutdown_timeouts && !stopped_metrics.terminal_unhealthy && !stopped_metrics.slots_used);
+#endif
+ edr_local_evidence_cache_close();edr_storage_queue_close();edr_event_bus_destroy(bus);edr_pt_cache_shutdown();edr_p0_rule_ir_shutdown();free(cfg);assert(edr_monotonic_ns()-begun<UINT64_C(90000000000));puts("{\"kind\":\"pipeline_diag_worker_complete\",\"cleanup_returned\":true}");return 0;
 }
 #ifdef _WIN32
 #include "windows_parent.inc"

@@ -15,7 +15,9 @@ canonical authenticated IR ready, then genuinely missing IR. Together they have
 85 seconds of work plus five seconds of terminal cleanup, a sampled cumulative
 256 MiB fixture file-length guard and a combined 1 MiB worker-log guard. These
 are sampled limits, not an OS disk quota. Unknown exit, forced termination,
-missing completion receipts or failed cleanup fail the diagnostic. Artifacts
+missing completion receipts or failed cleanup fail the diagnostic. The Windows
+evidence worker must also report zero shutdown timeouts, terminal-unhealthy
+state and remaining slots; a void stop returning alone is insufficient. Artifacts
 contain fixed numeric logs, hashes and source closure, never SQLite or rules.
 
 Each child offers 16 synthetic process/network/file slots for its own live
